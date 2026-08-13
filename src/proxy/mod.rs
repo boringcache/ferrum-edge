@@ -6061,6 +6061,37 @@ pub struct ProxyState {
     /// release) → SVID material (install, then release) → request epoch
     /// (commit). No helper called inside this boundary reacquires publication.
     pub gateway_trust_publication_lock: Arc<std::sync::Mutex<()>>,
+    /// Whether this process cannot know its namespace's AUTHORITATIVE gateway
+    /// trust state (issue #3727).
+    ///
+    /// Set by exactly one situation: database-mode startup fell back to the
+    /// on-disk config backup (`FERRUM_DB_CONFIG_BACKUP_PATH`) because the
+    /// database was unreachable or returned an unusable snapshot.
+    /// `GatewayConfig.gateway_trust_bundles` is `#[serde(skip)]` — it must never
+    /// ride the ConfigSync `config_json` wire, where a multi-namespace control
+    /// plane would leak every served namespace's trust material to one
+    /// subscriber — so a backup-sourced snapshot deserializes with an EMPTY
+    /// trust vector no matter what the committed database generation held.
+    ///
+    /// Without this flag `resolve_trust_authority` cannot tell that absence
+    /// apart from an operator's explicit revocation, and the process quietly
+    /// falls back to the source-loaded SVID trust: a root the committed
+    /// generation WITHDREW would authenticate gateway-to-mesh peers again for
+    /// as long as the outage lasted. Reading trust out of the backup file
+    /// instead would not fix it either — the file is arbitrarily old, so
+    /// trusting its trust section re-enables a stale root by another route. The
+    /// only sound state is "unknown", and the only sound behaviour for an
+    /// unknown trust anchor is to refuse until an authoritative database load
+    /// settles it.
+    ///
+    /// This is NOT part of the request epoch: the epoch describes the trust an
+    /// accepted generation carried, and this describes the absence of an
+    /// authority to accept one from. It is written at most twice in a process
+    /// (once at backup bootstrap, once at the first authoritative full load)
+    /// and read with an acquire load, so it costs one uncontended atomic read
+    /// on the gateway-to-mesh admission path and shares no cache line with a
+    /// hot mutable counter.
+    pub gateway_trust_authority_unresolved: Arc<AtomicBool>,
     /// Listener-wide compatibility view of the dynamic mesh inbound TLS config.
     /// Mesh HTTP/HBONE accept loops use `mesh_inbound_tls_policy` as the single
     /// authoritative source; this derived slot remains for shared stream TLS
@@ -7380,9 +7411,51 @@ impl ProxyState {
     /// caller holds, which is the mixed generation this gate exists to refuse.
     /// False while a gateway has no workload identity AND for the whole
     /// publication boundary of an accepted trust change.
+    ///
+    /// It is also false while this process cannot know its namespace's
+    /// authoritative database trust state — the backup bootstrap described on
+    /// the `gateway_trust_authority_unresolved` field. That condition cannot be
+    /// expressed in the epoch: the epoch describes the trust an accepted
+    /// generation carried, and a backup-sourced generation carries no
+    /// `gateway_trust_bundles` at all. Publishing it as a live generation would
+    /// silently re-enable the source-loaded roots, including one the committed
+    /// database generation withdrew. The extra read is one uncontended atomic
+    /// load on an otherwise cold flag.
     #[inline]
     pub fn admits_gateway_mesh_identity(&self) -> bool {
         self.request_epoch.admits_gateway_identity()
+            && !self.gateway_trust_authority_is_unresolved()
+    }
+
+    /// Whether gateway-to-mesh identity is refused because the authoritative
+    /// database trust state is still unknown. Named distinctly from the field
+    /// it reads so call sites and doc links stay unambiguous.
+    #[inline]
+    pub fn gateway_trust_authority_is_unresolved(&self) -> bool {
+        self.gateway_trust_authority_unresolved
+            .load(Ordering::Acquire)
+    }
+
+    /// Mark the namespace trust authority unknown because this process
+    /// bootstrapped from the on-disk config backup instead of the database.
+    /// Fails CLOSED until [`Self::resolve_gateway_trust_authority`] reports an
+    /// authoritative load.
+    pub fn mark_gateway_trust_authority_unresolved(&self) {
+        self.gateway_trust_authority_unresolved
+            .store(true, Ordering::Release);
+    }
+
+    /// Report that an AUTHORITATIVE database load settled the namespace trust
+    /// state, re-opening gateway-to-mesh admission.
+    ///
+    /// Only a FULL load read from the database may call this. An incremental
+    /// delta may not: it describes a change to a base this process never read,
+    /// so it cannot establish whether a trust record exists. Returns `true`
+    /// when this call is the one that lifted the refusal, so the caller can log
+    /// the transition exactly once.
+    pub fn resolve_gateway_trust_authority(&self) -> bool {
+        self.gateway_trust_authority_unresolved
+            .swap(false, Ordering::AcqRel)
     }
 
     /// Install the database-sourced gateway trust generation for this process's
@@ -8932,6 +9005,7 @@ impl ProxyState {
             gateway_trust_bundles,
             gateway_svid_update_lock: Arc::new(std::sync::Mutex::new(())),
             gateway_trust_publication_lock: Arc::new(std::sync::Mutex::new(())),
+            gateway_trust_authority_unresolved: Arc::new(AtomicBool::new(false)),
             mesh_inbound_tls,
             mesh_inbound_tls_policy,
             mesh_inbound_spiffe_verifier_active,

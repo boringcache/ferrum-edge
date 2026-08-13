@@ -6503,6 +6503,15 @@ async fn handle_gateway_trust_status(
         &json!({
             "namespace": namespace,
             "configured": published.is_some(),
+            // Distinguishes "this namespace has no trust record" from "this
+            // process cannot know whether it has one" (issue #3727). Only the
+            // database-mode backup bootstrap produces the latter, and it is a
+            // fail-closed state: gateway-to-mesh identity is refused while it
+            // holds. Carries no material and no path — one boolean.
+            "authority_unresolved": state
+                .proxy_state
+                .as_ref()
+                .is_some_and(ProxyState::gateway_trust_authority_is_unresolved),
             "generation": generation,
             "bundle": published.map(|state| state.bundle),
             "process": process,

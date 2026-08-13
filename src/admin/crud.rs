@@ -801,12 +801,24 @@ async fn settle_written_resource<R: AdminResource>(
 /// authoritative read is in flight. In that case the read may describe a later
 /// writer, so fail closed instead of using it for this request's response and
 /// audit after-image.
+///
+/// A resource that has NOT opted into [`AdminResource::REREAD_AFTER_WRITE`]
+/// short-circuits before the lease is observed at all. There is no store read
+/// to fence — settlement is the identity function on a value the caller already
+/// holds — and the write has already COMMITTED by this point. Routing that pure
+/// identity through the admission observation would let a lease that expired
+/// after the commit turn a successful `200`/`201` into a reported failure, for
+/// every generic resource, which is a behaviour change the re-read seam must
+/// not impose on resources that do not use it.
 async fn settle_written_resource_while_held<R: AdminResource>(
     guard: Option<&NamespaceConfigAdmissionGuard>,
     db: &dyn DatabaseBackend,
     namespace: &str,
     written: R,
 ) -> DbResult<R> {
+    if !R::REREAD_AFTER_WRITE {
+        return Ok(written);
+    }
     match run_db_write_while_held(guard, settle_written_resource(db, namespace, written)).await? {
         NamespaceConfigAdmissionCompletion::Held(result) => result,
         NamespaceConfigAdmissionCompletion::Lost { result: _, error } => {

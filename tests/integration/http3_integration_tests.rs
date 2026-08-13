@@ -469,6 +469,7 @@ async fn test_http3_proxy_state_creation() {
         gateway_trust_bundles: Arc::new(arc_swap::ArcSwap::new(Arc::new(None))),
         gateway_svid_update_lock: Arc::new(std::sync::Mutex::new(())),
         gateway_trust_publication_lock: Arc::new(std::sync::Mutex::new(())),
+        gateway_trust_authority_unresolved: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         mesh_inbound_tls: empty_mesh_inbound_tls(),
         mesh_inbound_tls_policy: Arc::new(arc_swap::ArcSwap::from_pointee(
             ferrum_edge::proxy::MeshInboundTlsPolicy::default(),
@@ -784,6 +785,7 @@ async fn test_http3_full_integration() {
         gateway_trust_bundles: Arc::new(arc_swap::ArcSwap::new(Arc::new(None))),
         gateway_svid_update_lock: Arc::new(std::sync::Mutex::new(())),
         gateway_trust_publication_lock: Arc::new(std::sync::Mutex::new(())),
+        gateway_trust_authority_unresolved: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         mesh_inbound_tls: empty_mesh_inbound_tls(),
         mesh_inbound_tls_policy: Arc::new(arc_swap::ArcSwap::from_pointee(
             ferrum_edge::proxy::MeshInboundTlsPolicy::default(),

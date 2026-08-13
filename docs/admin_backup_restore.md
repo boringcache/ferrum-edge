@@ -125,6 +125,54 @@ The whole section is validated **before** the delete phase; any failure returns 
 
 Older backups taken before this contract omit the `api_specs` section entirely. Restoring such a payload against a namespace that currently holds API specs would permanently delete those documents. Ferrum refuses that path with `409 Conflict` unless the operator also passes `?confirm_api_spec_deletion=true` (in addition to `?confirm=true`). When that confirmation is supplied, ownership tags on restored resources are cleared so they become hand-managed rather than pointing at deleted specs. A backup that includes `api_specs` with an empty `items` array is an intentional wipe and does not require the extra flag.
 
+### Gateway trust bundles in backup and restore
+
+The namespace-keyed gateway trust resource (issue #3727) is part of the
+disaster-recovery artifact, with an explicitly three-valued contract so a
+restore can never *accidentally* change trust:
+
+- `GET /backup` on a full, unfiltered database export always emits a
+  `gateway_trust_bundles` array — **possibly empty** — so a restore can tell
+  "this backup recorded that the namespace had no trust resource" apart from
+  "this backup predates the resource". Cached-fallback exports and every
+  `?resources=` filtered export omit the section instead.
+- On `POST /restore`, an **absent** section is a no-op: trust is left exactly as
+  it is. Silently revoking a namespace's roots because an operator restored an
+  older config artifact would be an outage, not a rollback.
+- A **present-but-empty** section is an explicit revocation and deletes the
+  namespace's record.
+- A **present, non-empty** section is authoritative and reconciles to exactly
+  what it lists. The resource is a namespace singleton, so more than one record
+  for the target namespace is refused outright rather than silently reduced to
+  whichever came first.
+
+Namespace isolation and re-validation are not optional on this path. The target
+namespace is the **authenticated** one and is never read from the payload, and
+every record is re-normalized and re-validated through the same admission path
+an admin `POST` uses — so a hand-edited or hostile artifact cannot inject
+oversized, malformed, mis-identified, or duplicate trust material by going
+around the API. Server-owned fields survive the payload: a restored record keeps
+its stored identity and creation time, and `revision` is assigned by the store
+from the durable change sequence rather than adopted from the file, so a
+restored record can never reuse a revision a stale client still holds.
+
+Trust material is exported unredacted, like credentials, so backup artifacts
+must be protected as secrets. The export audit record carries a
+`gateway_trust_bundles` **count** only — never certificate bytes, PEM, subjects,
+or revisions.
+
+> **Not the same file as `FERRUM_DB_CONFIG_BACKUP_PATH`.** The database-outage
+> startup backup is a raw `GatewayConfig` document and carries no trust section
+> at all, because `gateway_trust_bundles` is deliberately not serialized into
+> `GatewayConfig` (it must never ride the ConfigSync `config_json` wire). A
+> process that boots from that file therefore treats its namespace trust state
+> as **unknown** and refuses gateway-to-mesh identity until an authoritative
+> database full reload settles it, rather than falling back to source-loaded
+> SVID trust and possibly re-enabling a root the committed generation had
+> withdrawn. `GET /gateway-trust/status` reports `authority_unresolved: true`
+> for the duration. Use `GET /backup` / `POST /restore` — not the startup backup
+> file — to move trust state between deployments.
+
 ### Safety Guard
 
 The `?confirm=true` query parameter is required. Without it, the endpoint returns `400 Bad Request` with a descriptive error message. This prevents accidental invocation.

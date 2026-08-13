@@ -33,10 +33,7 @@ pub mod db_backend;
 pub mod db_loader;
 pub mod env_config;
 pub mod file_loader;
-/// Namespace-keyed gateway trust-bundle resource (issue #3727). Several
-/// helpers are consumed only by external tests and by the CP/DP publication
-/// paths the bin target does not compile.
-#[allow(dead_code)]
+/// Namespace-keyed gateway trust-bundle resource (issue #3727).
 pub mod gateway_trust;
 pub(crate) mod incremental_apply;
 pub mod migrations;

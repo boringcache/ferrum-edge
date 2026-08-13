@@ -1136,6 +1136,10 @@ pub async fn run(
     // a cursor and force an authoritative DB reload after recovery.
     let backup_path = env_config.db_config_backup_path.clone();
     let mut startup_config_rejected = false;
+    // Set only by the backup fallback below; applied to `ProxyState` right
+    // after construction so gateway-to-mesh identity is refused before any
+    // listener binds (issue #3727).
+    let mut gateway_trust_authority_unresolved = false;
     let initial_load = load_full_config_with_sequence(&db, &env_config.namespace).await;
     let (config, initial_change_sequence) = match initial_load {
         Ok((cfg, sequence)) => {
@@ -1214,9 +1218,26 @@ pub async fn run(
                                 e
                             );
                         }
+                        // The backup carries no gateway trust state, and cannot:
+                        // `GatewayConfig.gateway_trust_bundles` is
+                        // `#[serde(skip)]` so multi-namespace trust material
+                        // never rides the ConfigSync `config_json` wire
+                        // (issue #3727). An empty trust vector here is
+                        // therefore "unknown", not "revoked" — and an
+                        // externally provisioned backup file could not be
+                        // trusted to answer it either, because it is arbitrarily
+                        // old. Refuse gateway-to-mesh identity until an
+                        // authoritative database load settles the namespace's
+                        // trust state, so a root the committed generation
+                        // withdrew cannot be silently re-enabled through the
+                        // source-loaded SVID bundle for the length of the
+                        // outage.
+                        gateway_trust_authority_unresolved = true;
                         warn!(
                             "Starting with backup config ({} proxies, {} consumers). \
-                             Database polling will retry and update when DB recovers.",
+                             Database polling will retry and update when DB recovers. \
+                             Gateway-to-mesh identity is refused until an authoritative \
+                             database load settles this namespace's trust state.",
                             cfg.proxies.len(),
                             cfg.consumers.len()
                         );
@@ -1333,7 +1354,23 @@ pub async fn run(
     // gateway-to-mesh peers with the source-loaded bundle while reporting the
     // persisted generation — and register it so authenticated status reports
     // what this process is actually serving.
-    {
+    //
+    // A backup-bootstrapped snapshot is NOT such a publication. Its
+    // `gateway_trust_bundles` vector is empty because the field is
+    // `#[serde(skip)]`, not because the namespace has no record, so recording
+    // it as a published generation would clear the standing failure reason and
+    // advertise a converged trust state this process never read. The refusal
+    // marked at the backup fallback stands until the first authoritative full
+    // reload, and `GET /gateway-trust/status` reports it as
+    // `authority_unresolved`.
+    if gateway_trust_authority_unresolved {
+        proxy_state.mark_gateway_trust_authority_unresolved();
+        warn!(
+            "Skipping the startup gateway trust publication: this process bootstrapped from the \
+             config backup, so the authoritative namespace trust state is unknown and \
+             gateway-to-mesh identity stays refused until a database full reload settles it"
+        );
+    } else {
         let published = proxy_state.config.load_full();
         proxy_state.publish_gateway_trust_generation(&published);
     }
@@ -2900,13 +2937,31 @@ async fn try_publish_full_reload_after_gate(
         return None;
     }
     let outcome = proxy_state.update_config(new_config);
-    Some(commit_full_reload_poll_state(
+    let committed = commit_full_reload_poll_state(
         commit_context,
         outcome,
         last_change_sequence,
         sequence,
         config_rejected,
-    ))
+    );
+    // This is the ONE chokepoint through which an authoritative database FULL
+    // snapshot reaches the live runtime, so it is the only place that may
+    // settle a trust authority the backup bootstrap left unknown (issue #3727).
+    //
+    // Ordering is load-bearing and is why the call sits here rather than at the
+    // backup-recovery site: `update_config` has already staged, fenced,
+    // installed, and republished this generation's gateway trust, so lifting
+    // the refusal now can only expose material the database actually committed.
+    // A rejected candidate keeps the previous runtime config, so the trust
+    // state is still unknown and the refusal stands.
+    if committed && proxy_state.resolve_gateway_trust_authority() {
+        info!(
+            "Authoritative database full reload settled this namespace's gateway trust state \
+             after a backup bootstrap ({}); gateway-to-mesh identity admission is re-opened",
+            commit_context
+        );
+    }
+    Some(committed)
 }
 
 fn commit_full_reload_poll_state(

@@ -5449,7 +5449,13 @@ paths:
         "408":
           $ref: "#/components/responses/RequestTimeout"
         "409":
-          $ref: "#/components/responses/Conflict"
+          description: |
+            The namespace already holds a record. Same typed body as the `PUT`
+            conflict so a client can decode one shape for both.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/GatewayTrustBundleConflict"
         "503":
           $ref: "#/components/responses/NamespaceAdmissionUnavailable"
 
@@ -5544,6 +5550,8 @@ paths:
       responses:
         "204":
           description: Gateway trust bundle deleted
+        "400":
+          $ref: "#/components/responses/BadRequest"
         "401":
           $ref: "#/components/responses/Unauthorized"
         "403":
@@ -10882,7 +10890,8 @@ components:
 
     GatewayTrustStatus:
       type: object
-      required: [namespace, configured, generation, process]
+      required:
+        [namespace, configured, authority_unresolved, generation, process]
       properties:
         namespace:
           type: string
@@ -10893,6 +10902,21 @@ components:
             the live configuration publication boundary. A committed candidate
             is not reported here until the poller validates and publishes it;
             a rejected candidate leaves the previous value unchanged.
+        authority_unresolved:
+          type: boolean
+          description: >-
+            `true` while this process cannot know the authoritative namespace
+            trust state, which happens only when database mode bootstrapped
+            from the on-disk config backup
+            (`FERRUM_DB_CONFIG_BACKUP_PATH`) because the database was
+            unreachable. A backup snapshot carries no trust resource, so an
+            absent record there means "unknown", not "revoked". While this is
+            `true` the gateway REFUSES gateway-to-mesh identity outright rather
+            than falling back to source-loaded SVID trust, which could
+            otherwise re-enable a root the committed database generation had
+            withdrawn. It clears when an authoritative database full reload
+            publishes; `configured` and `bundle` describe that published state
+            and are not a substitute for this flag.
         generation:
           type: string
           description: >-

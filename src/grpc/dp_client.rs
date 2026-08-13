@@ -1300,6 +1300,29 @@ fn parse_gateway_trust_bundle_update(
     Ok(GatewayTrustBundleUpdate::Unchanged)
 }
 
+/// External-test seam for [`parse_gateway_trust_bundle_update`] (issue #3727).
+///
+/// The parser and its `GatewayTrustBundleUpdate` result are private to this
+/// module and stay that way: the enum carries runtime trust material, and
+/// widening it would make a wire-decoding internal part of the library API. The
+/// wire contract external suites need to pin is the CLASSIFICATION plus the
+/// exact refusal string, so this projects the decision onto a fixed
+/// `"unchanged"` / `"clear"` / `"replace"` label and forwards the error
+/// verbatim. Nothing here relaxes a bound — it is the production parser.
+///
+/// Reached only from `tests/`; the `ferrum-edge` bin target compiles this
+/// module without any such caller.
+#[allow(dead_code)]
+pub fn classify_gateway_trust_side_channel_for_test(
+    trust_bundles_json: &str,
+) -> Result<&'static str, String> {
+    parse_gateway_trust_bundle_update(trust_bundles_json).map(|update| match update {
+        GatewayTrustBundleUpdate::Unchanged => "unchanged",
+        GatewayTrustBundleUpdate::Clear => "clear",
+        GatewayTrustBundleUpdate::Replace(_) => "replace",
+    })
+}
+
 /// Map an accepted trust side-channel update onto the bounded equivalence view.
 ///
 /// `Unchanged` returns `None` so callers leave remembered trust state alone
@@ -2756,7 +2779,6 @@ mod tests {
     use crate::dns::{DnsCache, DnsConfig};
     use crate::proxy::ProxyState;
     use crate::util::backoff::jittered_backoff_with_entropy;
-    use base64::Engine;
     use chrono::Utc;
     use serde_json::json;
 
@@ -2901,19 +2923,6 @@ mod tests {
         }
     }
 
-    fn test_root_ca_der_base64(common_name: &str) -> String {
-        let key = rcgen::KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256)
-            .expect("test CA key generates");
-        let mut params =
-            rcgen::CertificateParams::new(Vec::<String>::new()).expect("test CA params build");
-        params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
-        params
-            .distinguished_name
-            .push(rcgen::DnType::CommonName, common_name);
-        let cert = params.self_signed(&key).expect("test CA self-signs");
-        base64::engine::general_purpose::STANDARD.encode(cert.der())
-    }
-
     #[test]
     fn parse_gateway_trust_bundle_update_treats_empty_side_channel_as_unchanged() {
         let update = parse_gateway_trust_bundle_update("").expect("empty side-channel is valid");
@@ -2927,16 +2936,6 @@ mod tests {
     }
 
     #[test]
-    fn parse_gateway_trust_bundle_update_accepts_a_real_certificate() {
-        let trust_bundles =
-            test_config_trust_bundles(vec![test_root_ca_der_base64("dp-wire-root")]);
-        let json = serde_json::to_string(&trust_bundles).expect("test bundle should serialize");
-        let update = parse_gateway_trust_bundle_update(&json)
-            .expect("a real bounded X.509 authority must be accepted");
-        assert!(matches!(update, GatewayTrustBundleUpdate::Replace(_)));
-    }
-
-    #[test]
     fn parse_gateway_trust_bundle_update_rejects_semantically_invalid_bundle() {
         let trust_bundles = test_config_trust_bundles(Vec::new());
         let json = serde_json::to_string(&trust_bundles).expect("test bundle should serialize");
@@ -2946,102 +2945,6 @@ mod tests {
         assert_eq!(
             err, "gateway trust bundles side-channel failed validation",
             "wire diagnostics must stay bounded and material-free"
-        );
-    }
-
-    #[test]
-    fn parse_gateway_trust_bundle_update_rejects_malformed_and_trailing_der() {
-        let malformed = test_config_trust_bundles(vec![
-            base64::engine::general_purpose::STANDARD.encode(b"not-a-certificate"),
-        ]);
-        let malformed_json = serde_json::to_string(&malformed).expect("fixture serializes");
-        assert!(parse_gateway_trust_bundle_update(&malformed_json).is_err());
-
-        let valid = test_root_ca_der_base64("dp-wire-trailing-root");
-        let mut der = base64::engine::general_purpose::STANDARD
-            .decode(valid)
-            .expect("fixture DER decodes");
-        der.extend_from_slice(b"trailing");
-        let trailing =
-            test_config_trust_bundles(vec![base64::engine::general_purpose::STANDARD.encode(der)]);
-        let trailing_json = serde_json::to_string(&trailing).expect("fixture serializes");
-        assert!(parse_gateway_trust_bundle_update(&trailing_json).is_err());
-    }
-
-    #[test]
-    fn parse_gateway_trust_bundle_update_rejects_duplicate_or_unusable_jwt_keys() {
-        let usable = rcgen::KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256)
-            .expect("test key generates")
-            .public_key_pem();
-        let jwt_bundle = |authorities| ConfigTrustBundleSet {
-            local: crate::modes::mesh::config::TrustBundle {
-                trust_domain: crate::identity::TrustDomain::new("cluster.local")
-                    .expect("test trust domain"),
-                x509_authorities: Vec::new(),
-                jwt_authorities: authorities,
-                refresh_hint_seconds: None,
-            },
-            federated: Vec::new(),
-        };
-        let duplicate = jwt_bundle(vec![
-            crate::modes::mesh::config::JwtAuthority {
-                key_id: "same".to_string(),
-                public_key_pem: usable.clone(),
-            },
-            crate::modes::mesh::config::JwtAuthority {
-                key_id: "same".to_string(),
-                public_key_pem: usable,
-            },
-        ]);
-        assert!(
-            parse_gateway_trust_bundle_update(
-                &serde_json::to_string(&duplicate).expect("fixture serializes")
-            )
-            .is_err()
-        );
-
-        let unusable = jwt_bundle(vec![crate::modes::mesh::config::JwtAuthority {
-            key_id: "bad".to_string(),
-            public_key_pem: "-----BEGIN PUBLIC KEY-----\nAAAA\n-----END PUBLIC KEY-----"
-                .to_string(),
-        }]);
-        assert!(
-            parse_gateway_trust_bundle_update(
-                &serde_json::to_string(&unusable).expect("fixture serializes")
-            )
-            .is_err()
-        );
-    }
-
-    #[test]
-    fn parse_gateway_trust_bundle_update_rejects_wire_and_entry_limits() {
-        let over_count =
-            test_config_trust_bundles(vec![
-                test_root_ca_der_base64("dp-wire-count-root");
-                crate::config::gateway_trust::MAX_X509_AUTHORITIES_PER_BUNDLE
-                    + 1
-            ]);
-        assert!(
-            parse_gateway_trust_bundle_update(
-                &serde_json::to_string(&over_count).expect("fixture serializes")
-            )
-            .is_err()
-        );
-
-        let over_entry = test_config_trust_bundles(vec![
-            "A".repeat(crate::config::gateway_trust::MAX_X509_AUTHORITY_DER_BYTES * 2),
-        ]);
-        assert!(
-            parse_gateway_trust_bundle_update(
-                &serde_json::to_string(&over_entry).expect("fixture serializes")
-            )
-            .is_err()
-        );
-
-        let raw = " ".repeat(crate::config::gateway_trust::MAX_TRUST_BUNDLE_JSON_BYTES + 1);
-        assert_eq!(
-            parse_gateway_trust_bundle_update(&raw).expect_err("raw wire cap must reject first"),
-            "gateway trust bundles side-channel exceeds the wire limit"
         );
     }
 

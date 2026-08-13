@@ -19,6 +19,7 @@
 
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64;
+use crate::unit::gateway_trust_observability_lock::lock_gateway_trust_observability;
 use ferrum_edge::config::env_config::{EnvConfig, OperatingMode};
 use ferrum_edge::config::gateway_trust::GatewayTrustBundleRecord;
 use ferrum_edge::config::types::GatewayConfig;
@@ -159,6 +160,9 @@ fn runtime_bundles(trust_domain: &str, authority: &[u8]) -> RuntimeTrustBundleSe
 
 #[tokio::test]
 async fn source_rotation_cannot_lift_another_publishers_fence_and_keeps_newest_identity() {
+    // Serialize against every other gateway-trust observability test in this
+    // binary: the published-namespace map and the counters are process-global.
+    let _observability = lock_gateway_trust_observability();
     let state = state_in_mode(GatewayConfig::default(), OperatingMode::DataPlane).await;
     state.install_gateway_runtime_svid_bundle(source_loaded_svid_generation(
         "file.local",
@@ -216,6 +220,9 @@ async fn source_rotation_cannot_lift_another_publishers_fence_and_keeps_newest_i
 
 #[tokio::test]
 async fn database_startup_installs_persisted_trust_into_live_verifier() {
+    // Serialize against every other gateway-trust observability test in this
+    // binary: the published-namespace map and the counters are process-global.
+    let _observability = lock_gateway_trust_observability();
     let config = config_with(vec![record("db.local", &[10, 20, 30])]);
     let state = database_mode_state(config.clone()).await;
     seed_source_loaded_svid(&state);
@@ -238,6 +245,9 @@ async fn database_startup_installs_persisted_trust_into_live_verifier() {
 
 #[tokio::test]
 async fn accepted_trust_only_reload_rotates_the_live_verifier() {
+    // Serialize against every other gateway-trust observability test in this
+    // binary: the published-namespace map and the counters are process-global.
+    let _observability = lock_gateway_trust_observability();
     let initial = config_with(vec![record("db-v1.local", &[1])]);
     let state = database_mode_state(initial.clone()).await;
     seed_source_loaded_svid(&state);
@@ -260,6 +270,9 @@ async fn accepted_trust_only_reload_rotates_the_live_verifier() {
 
 #[tokio::test]
 async fn accepted_revocation_withdraws_the_override_and_restores_source_trust() {
+    // Serialize against every other gateway-trust observability test in this
+    // binary: the published-namespace map and the counters are process-global.
+    let _observability = lock_gateway_trust_observability();
     let initial = config_with(vec![record("db.local", &[1])]);
     let state = database_mode_state(initial.clone()).await;
     seed_source_loaded_svid(&state);
@@ -284,6 +297,9 @@ async fn accepted_revocation_withdraws_the_override_and_restores_source_trust() 
 
 #[tokio::test]
 async fn unconvertible_stored_material_retains_last_known_good_and_fails_closed() {
+    // Serialize against every other gateway-trust observability test in this
+    // binary: the published-namespace map and the counters are process-global.
+    let _observability = lock_gateway_trust_observability();
     let initial = config_with(vec![record("db.local", &[1])]);
     let state = database_mode_state(initial.clone()).await;
     seed_source_loaded_svid(&state);
@@ -309,6 +325,9 @@ async fn unconvertible_stored_material_retains_last_known_good_and_fails_closed(
 
 #[tokio::test]
 async fn ambiguous_authority_keeps_the_previous_live_generation() {
+    // Serialize against every other gateway-trust observability test in this
+    // binary: the published-namespace map and the counters are process-global.
+    let _observability = lock_gateway_trust_observability();
     let initial = config_with(vec![record("db.local", &[1])]);
     let state = database_mode_state(initial.clone()).await;
     seed_source_loaded_svid(&state);
@@ -327,6 +346,9 @@ async fn ambiguous_authority_keeps_the_previous_live_generation() {
 
 #[tokio::test]
 async fn non_database_modes_do_not_touch_the_gateway_trust_override() {
+    // Serialize against every other gateway-trust observability test in this
+    // binary: the published-namespace map and the counters are process-global.
+    let _observability = lock_gateway_trust_observability();
     // The CP→DP side channel and the mesh apply loop own this slot in their
     // own modes; database publication must not become a second writer there.
     let config = config_with(vec![record("db.local", &[1])]);
@@ -357,6 +379,9 @@ async fn non_database_modes_do_not_touch_the_gateway_trust_override() {
 
 #[tokio::test]
 async fn rotation_closes_mesh_admission_for_the_whole_publication_boundary() {
+    // Serialize against every other gateway-trust observability test in this
+    // binary: the published-namespace map and the counters are process-global.
+    let _observability = lock_gateway_trust_observability();
     let initial = config_with(vec![record("db-v1.local", &[1])]);
     let state = database_mode_state(initial.clone()).await;
     seed_source_loaded_svid(&state);
@@ -418,6 +443,9 @@ async fn rotation_closes_mesh_admission_for_the_whole_publication_boundary() {
 
 #[tokio::test]
 async fn revocation_closes_mesh_admission_until_the_root_is_withdrawn() {
+    // Serialize against every other gateway-trust observability test in this
+    // binary: the published-namespace map and the counters are process-global.
+    let _observability = lock_gateway_trust_observability();
     let initial = config_with(vec![record("db.local", &[1])]);
     let state = database_mode_state(initial.clone()).await;
     seed_source_loaded_svid(&state);
@@ -453,6 +481,9 @@ async fn revocation_closes_mesh_admission_until_the_root_is_withdrawn() {
 
 #[tokio::test]
 async fn accepted_rotation_through_update_config_publishes_one_coherent_generation() {
+    // Serialize against every other gateway-trust observability test in this
+    // binary: the published-namespace map and the counters are process-global.
+    let _observability = lock_gateway_trust_observability();
     let initial = config_with(vec![record("db-v1.local", &[1])]);
     let state = database_mode_state(initial.clone()).await;
     seed_source_loaded_svid(&state);
@@ -491,6 +522,9 @@ async fn accepted_rotation_through_update_config_publishes_one_coherent_generati
 
 #[tokio::test]
 async fn unconvertible_candidate_rejects_the_apply_and_retains_the_whole_generation() {
+    // Serialize against every other gateway-trust observability test in this
+    // binary: the published-namespace map and the counters are process-global.
+    let _observability = lock_gateway_trust_observability();
     let initial = config_with(vec![record("db.local", &[1])]);
     let state = database_mode_state(initial.clone()).await;
     seed_source_loaded_svid(&state);
@@ -524,6 +558,9 @@ async fn unconvertible_candidate_rejects_the_apply_and_retains_the_whole_generat
 
 #[tokio::test]
 async fn a_reload_that_changes_no_trust_never_closes_mesh_admission() {
+    // Serialize against every other gateway-trust observability test in this
+    // binary: the published-namespace map and the counters are process-global.
+    let _observability = lock_gateway_trust_observability();
     let initial = config_with(vec![record("db.local", &[1])]);
     let state = database_mode_state(initial.clone()).await;
     seed_source_loaded_svid(&state);
@@ -558,6 +595,9 @@ async fn a_reload_that_changes_no_trust_never_closes_mesh_admission() {
 
 #[tokio::test]
 async fn ambiguous_authority_stages_unchanged_and_keeps_the_complete_generation() {
+    // Serialize against every other gateway-trust observability test in this
+    // binary: the published-namespace map and the counters are process-global.
+    let _observability = lock_gateway_trust_observability();
     let initial = config_with(vec![record("db.local", &[1])]);
     let state = database_mode_state(initial.clone()).await;
     seed_source_loaded_svid(&state);
@@ -586,6 +626,9 @@ async fn ambiguous_authority_stages_unchanged_and_keeps_the_complete_generation(
 
 #[tokio::test]
 async fn dp_snapshot_publishes_cp_trust_with_its_own_configuration_generation() {
+    // Serialize against every other gateway-trust observability test in this
+    // binary: the published-namespace map and the counters are process-global.
+    let _observability = lock_gateway_trust_observability();
     let state = state_in_mode(GatewayConfig::default(), OperatingMode::DataPlane).await;
     seed_source_loaded_svid(&state);
     let (config_before, trust_before, _) = published_generations(&state);
@@ -625,6 +668,9 @@ async fn dp_snapshot_publishes_cp_trust_with_its_own_configuration_generation() 
 
 #[tokio::test]
 async fn dp_unchanged_side_channel_leaves_the_live_trust_generation_untouched() {
+    // Serialize against every other gateway-trust observability test in this
+    // binary: the published-namespace map and the counters are process-global.
+    let _observability = lock_gateway_trust_observability();
     let state = state_in_mode(GatewayConfig::default(), OperatingMode::DataPlane).await;
     seed_source_loaded_svid(&state);
     state.update_config_with_gateway_trust(
@@ -651,6 +697,9 @@ async fn dp_unchanged_side_channel_leaves_the_live_trust_generation_untouched() 
 
 #[tokio::test]
 async fn dp_snapshot_clear_withdraws_cp_trust_with_the_accepted_generation() {
+    // Serialize against every other gateway-trust observability test in this
+    // binary: the published-namespace map and the counters are process-global.
+    let _observability = lock_gateway_trust_observability();
     let state = state_in_mode(GatewayConfig::default(), OperatingMode::DataPlane).await;
     seed_source_loaded_svid(&state);
     state.update_config_with_gateway_trust(
@@ -731,6 +780,9 @@ fn empty_delta() -> ferrum_edge::config::db_loader::IncrementalResult {
 
 #[tokio::test]
 async fn a_committed_rotation_advances_the_backend_security_generation_inside_the_fence() {
+    // Serialize against every other gateway-trust observability test in this
+    // binary: the published-namespace map and the counters are process-global.
+    let _observability = lock_gateway_trust_observability();
     let initial = config_with(vec![record("db-v1.local", &[1])]);
     let state = database_mode_state(initial.clone()).await;
     seed_source_loaded_svid(&state);
@@ -779,6 +831,9 @@ async fn a_committed_rotation_advances_the_backend_security_generation_inside_th
 
 #[tokio::test]
 async fn a_committed_revocation_retires_the_withdrawn_generation_exactly_once() {
+    // Serialize against every other gateway-trust observability test in this
+    // binary: the published-namespace map and the counters are process-global.
+    let _observability = lock_gateway_trust_observability();
     let initial = config_with(vec![record("db.local", &[1])]);
     let state = database_mode_state(initial.clone()).await;
     seed_source_loaded_svid(&state);
@@ -807,6 +862,9 @@ async fn a_committed_revocation_retires_the_withdrawn_generation_exactly_once() 
 
 #[tokio::test]
 async fn an_unchanged_commit_never_churns_the_backend_pools() {
+    // Serialize against every other gateway-trust observability test in this
+    // binary: the published-namespace map and the counters are process-global.
+    let _observability = lock_gateway_trust_observability();
     let initial = config_with(vec![record("db.local", &[1])]);
     let state = database_mode_state(initial.clone()).await;
     seed_source_loaded_svid(&state);
@@ -837,6 +895,9 @@ async fn an_unchanged_commit_never_churns_the_backend_pools() {
 
 #[tokio::test]
 async fn the_database_full_apply_advances_the_backend_security_generation_once() {
+    // Serialize against every other gateway-trust observability test in this
+    // binary: the published-namespace map and the counters are process-global.
+    let _observability = lock_gateway_trust_observability();
     let initial = config_with(vec![record("db-v1.local", &[1])]);
     let state = database_mode_state(initial.clone()).await;
     seed_source_loaded_svid(&state);
@@ -871,6 +932,9 @@ async fn the_database_full_apply_advances_the_backend_security_generation_once()
 
 #[tokio::test]
 async fn dp_snapshot_replace_then_clear_each_rotate_the_backend_pools_once() {
+    // Serialize against every other gateway-trust observability test in this
+    // binary: the published-namespace map and the counters are process-global.
+    let _observability = lock_gateway_trust_observability();
     let state = state_in_mode(GatewayConfig::default(), OperatingMode::DataPlane).await;
     seed_source_loaded_svid(&state);
     let before = backend_security_generation(&state);
@@ -918,6 +982,9 @@ async fn dp_snapshot_replace_then_clear_each_rotate_the_backend_pools_once() {
 
 #[tokio::test]
 async fn a_cp_trust_only_delta_rotates_the_backend_pools_once() {
+    // Serialize against every other gateway-trust observability test in this
+    // binary: the published-namespace map and the counters are process-global.
+    let _observability = lock_gateway_trust_observability();
     let state = state_in_mode(GatewayConfig::default(), OperatingMode::DataPlane).await;
     seed_source_loaded_svid(&state);
     let before = backend_security_generation(&state);
@@ -957,6 +1024,9 @@ async fn a_cp_trust_only_delta_rotates_the_backend_pools_once() {
 
 #[tokio::test]
 async fn the_new_generation_is_visible_without_the_rotation_consumer_running() {
+    // Serialize against every other gateway-trust observability test in this
+    // binary: the published-namespace map and the counters are process-global.
+    let _observability = lock_gateway_trust_observability();
     let state = state_in_mode(GatewayConfig::default(), OperatingMode::DataPlane).await;
     seed_source_loaded_svid(&state);
     let before = backend_security_generation(&state);
@@ -1047,6 +1117,9 @@ fn dp_snapshot(version: &str) -> GatewayConfig {
 
 #[tokio::test]
 async fn an_identical_replace_redelivered_by_a_reconnect_never_rotates_the_backend_pools() {
+    // Serialize against every other gateway-trust observability test in this
+    // binary: the published-namespace map and the counters are process-global.
+    let _observability = lock_gateway_trust_observability();
     let state = state_in_mode(GatewayConfig::default(), OperatingMode::DataPlane).await;
     seed_source_loaded_svid(&state);
     state.update_config_with_gateway_trust(
@@ -1075,6 +1148,9 @@ async fn an_identical_replace_redelivered_by_a_reconnect_never_rotates_the_backe
 
 #[tokio::test]
 async fn a_purely_additive_replace_installs_the_root_without_rotating_the_backend_pools() {
+    // Serialize against every other gateway-trust observability test in this
+    // binary: the published-namespace map and the counters are process-global.
+    let _observability = lock_gateway_trust_observability();
     let state = state_in_mode(GatewayConfig::default(), OperatingMode::DataPlane).await;
     seed_source_loaded_svid(&state);
     state.update_config_with_gateway_trust(
@@ -1109,6 +1185,9 @@ async fn a_purely_additive_replace_installs_the_root_without_rotating_the_backen
 
 #[tokio::test]
 async fn a_replace_that_drops_a_root_retires_the_transports_it_authenticated() {
+    // Serialize against every other gateway-trust observability test in this
+    // binary: the published-namespace map and the counters are process-global.
+    let _observability = lock_gateway_trust_observability();
     let state = state_in_mode(GatewayConfig::default(), OperatingMode::DataPlane).await;
     seed_source_loaded_svid(&state);
     state.update_config_with_gateway_trust(
@@ -1137,6 +1216,9 @@ async fn a_replace_that_drops_a_root_retires_the_transports_it_authenticated() {
 
 #[tokio::test]
 async fn a_clear_with_no_installed_override_never_rotates_the_backend_pools() {
+    // Serialize against every other gateway-trust observability test in this
+    // binary: the published-namespace map and the counters are process-global.
+    let _observability = lock_gateway_trust_observability();
     let state = state_in_mode(GatewayConfig::default(), OperatingMode::DataPlane).await;
     seed_source_loaded_svid(&state);
     let before = backend_security_generation(&state);
@@ -1159,5 +1241,255 @@ async fn a_clear_with_no_installed_override_never_rotates_the_backend_pools() {
         active_svid_domain(&state).as_deref(),
         Some("file.local"),
         "the source-loaded gateway trust stays live"
+    );
+}
+
+// ── Mesh staging rejects without mutating live state ────────────────────────
+//
+// Migrated out of `src/modes/mesh/mod.rs` per the repository's external-test
+// policy; it drives the production staging helper through the
+// `stage_gateway_active_trust_bundles_unfederated_for_test` seam rather than a
+// copy of it.
+
+#[tokio::test]
+async fn invalid_effective_mesh_gateway_trust_is_rejected_without_mutating_live_state() {
+    // Serialize against every other gateway-trust observability test in this
+    // binary: the published-namespace map and the counters are process-global.
+    let _observability = lock_gateway_trust_observability();
+    use ferrum_edge::modes::mesh::slice::MeshSlice;
+
+    let state = state_in_mode(GatewayConfig::default(), OperatingMode::Mesh).await;
+    let local_td = TrustDomain::new("invalid-stage.local").expect("test trust domain");
+    let id = SpiffeId::from_parts(&local_td, "ns/foo/sa/bar").expect("test SPIFFE id");
+    state.install_gateway_runtime_svid_bundle(SvidBundle {
+        spiffe_id: id,
+        cert_chain_der: vec![vec![1, 2, 3]],
+        private_key_pkcs8_der: vec![4, 5, 6].into(),
+        trust_bundles: RuntimeTrustBundleSet {
+            local: RuntimeTrustBundle {
+                trust_domain: local_td.clone(),
+                x509_authorities: vec![vec![7, 8, 9]],
+                jwt_authorities: Vec::new(),
+                refresh_hint_seconds: None,
+            },
+            federated: Default::default(),
+        },
+    });
+    let before_svid = state.gateway_svid_bundle.load_full();
+    let before_epoch = state.request_epoch.load();
+
+    // Base64-valid but not an X.509 certificate: structural bounds pass and the
+    // DEEP parser is what refuses it, which is the case that must still leave
+    // the whole generation unpublished.
+    let slice = MeshSlice {
+        version: "invalid-effective-trust".to_string(),
+        trust_bundles: Some(TrustBundleSet {
+            local: TrustBundle {
+                trust_domain: local_td,
+                x509_authorities: vec![BASE64.encode(b"base64-valid-but-not-x509")],
+                jwt_authorities: Vec::new(),
+                refresh_hint_seconds: None,
+            },
+            federated: Vec::new(),
+        }),
+        ..MeshSlice::default()
+    };
+
+    assert!(
+        ferrum_edge::modes::mesh::stage_gateway_active_trust_bundles_unfederated_for_test(
+            &state, &slice,
+        )
+        .is_err(),
+        "deep-invalid DER must reject the complete mesh generation"
+    );
+    assert!(
+        std::sync::Arc::ptr_eq(&state.gateway_svid_bundle.load_full(), &before_svid),
+        "a rejected staging must not touch the live SVID material"
+    );
+    assert!(
+        std::sync::Arc::ptr_eq(&state.request_epoch.load(), &before_epoch),
+        "a rejected staging must not publish a request epoch"
+    );
+    assert!(
+        mesh_admission_open(&state),
+        "the previous generation stays live and admitting"
+    );
+}
+
+// ── Database-outage backup bootstrap fails closed (issue #3727) ─────────────
+//
+// `GatewayConfig.gateway_trust_bundles` is `#[serde(skip)]`, so a snapshot
+// loaded from `FERRUM_DB_CONFIG_BACKUP_PATH` cannot say whether the namespace
+// holds a trust record. Treating that absence as a revocation would silently
+// restore the source-loaded roots — including one the committed database
+// generation withdrew.
+
+#[tokio::test]
+async fn a_backup_bootstrap_refuses_gateway_mesh_identity_until_the_database_settles_it() {
+    // Serialize against every other gateway-trust observability test in this
+    // binary: the published-namespace map and the counters are process-global.
+    let _observability = lock_gateway_trust_observability();
+    let state = database_mode_state(config_with(Vec::new())).await;
+    seed_source_loaded_svid(&state);
+    assert!(
+        mesh_admission_open(&state),
+        "an ordinary database-mode process with a source-loaded SVID admits"
+    );
+
+    // The backup fallback marks the authority unknown before any listener binds.
+    state.mark_gateway_trust_authority_unresolved();
+    assert!(state.gateway_trust_authority_is_unresolved());
+    assert!(
+        !mesh_admission_open(&state),
+        "an unknown trust authority must refuse gateway-to-mesh identity rather \
+         than fall back to the source-loaded roots"
+    );
+
+    // The published epoch itself is untouched: this is an authority gate, not a
+    // trust rotation, so nothing is fenced, withdrawn, or republished.
+    let (_, trust_generation, live) = published_generations(&state);
+    assert!(
+        live,
+        "the epoch's own trust stays live; only the authority gate refuses"
+    );
+
+    // Only an authoritative full load lifts it, and it reports the transition
+    // exactly once.
+    assert!(
+        state.resolve_gateway_trust_authority(),
+        "the first resolve lifts it"
+    );
+    assert!(
+        !state.resolve_gateway_trust_authority(),
+        "a later resolve reports no transition"
+    );
+    assert!(!state.gateway_trust_authority_is_unresolved());
+    assert!(
+        mesh_admission_open(&state),
+        "admission re-opens once the database settled the trust state"
+    );
+    assert_eq!(
+        published_generations(&state).1,
+        trust_generation,
+        "lifting the authority gate is not a trust generation"
+    );
+}
+
+#[tokio::test]
+async fn an_unresolved_backup_authority_refuses_even_with_a_live_database_record() {
+    // Serialize against every other gateway-trust observability test in this
+    // binary: the published-namespace map and the counters are process-global.
+    let _observability = lock_gateway_trust_observability();
+    let config = config_with(vec![record("db.local", &[4, 5, 6])]);
+    let state = database_mode_state(config.clone()).await;
+    seed_source_loaded_svid(&state);
+    state.publish_gateway_trust_generation(&config);
+    assert_eq!(active_svid_domain(&state).as_deref(), Some("db.local"));
+    assert!(mesh_admission_open(&state));
+
+    // Even with a record installed, an unknown authority is a refusal: this
+    // process cannot prove the stored record is the committed one.
+    state.mark_gateway_trust_authority_unresolved();
+    assert!(!mesh_admission_open(&state));
+    assert_eq!(
+        active_svid_domain(&state).as_deref(),
+        Some("db.local"),
+        "the gate refuses admission; it does not withdraw installed material"
+    );
+
+    state.resolve_gateway_trust_authority();
+    assert!(mesh_admission_open(&state));
+}
+
+// ── Concurrent publication must not lose another namespace's state ──────────
+
+#[test]
+fn concurrent_trust_publications_retain_every_namespaces_published_state() {
+    use ferrum_edge::config::gateway_trust::{
+        published_namespace_state, record_trust_generation_published,
+    };
+
+    let _observability = lock_gateway_trust_observability();
+
+    const NAMESPACES: usize = 24;
+    let records: Vec<GatewayTrustBundleRecord> = (0..NAMESPACES)
+        .map(|index| {
+            let namespace = format!("tenant-{index}");
+            GatewayTrustBundleRecord::new(
+                &namespace,
+                &GatewayTrustBundleRecord::default_singleton_id(&namespace),
+                stored_bundle("cluster.local", &[index as u8, 1, 2]),
+            )
+        })
+        .collect();
+
+    // The complete accepted view is published while other threads publish the
+    // same view concurrently. A load → clone → store read-modify-write loses a
+    // namespace here; an atomic exchange cannot.
+    let shared = std::sync::Arc::new(records.clone());
+    let barrier = std::sync::Arc::new(std::sync::Barrier::new(4));
+    let workers: Vec<_> = (0..4)
+        .map(|_| {
+            let shared = shared.clone();
+            let barrier = barrier.clone();
+            std::thread::spawn(move || {
+                barrier.wait();
+                for _ in 0..32 {
+                    record_trust_generation_published(shared.as_slice(), None, 1);
+                }
+            })
+        })
+        .collect();
+    for worker in workers {
+        worker.join().expect("publisher joins");
+    }
+
+    for record in &records {
+        let published = published_namespace_state(&record.namespace).unwrap_or_else(|| {
+            panic!(
+                "namespace {} lost its published state to a concurrent publication",
+                record.namespace
+            )
+        });
+        assert_eq!(published.bundle.namespace, record.namespace);
+    }
+}
+
+#[test]
+fn an_ambiguous_publication_retains_only_namespaces_the_generation_still_carries() {
+    use ferrum_edge::config::gateway_trust::{
+        published_namespace_state, record_trust_generation_published,
+    };
+
+    let _observability = lock_gateway_trust_observability();
+
+    let make = |namespace: &str| {
+        GatewayTrustBundleRecord::new(
+            namespace,
+            &GatewayTrustBundleRecord::default_singleton_id(namespace),
+            stored_bundle("cluster.local", &[9, 9, 9]),
+        )
+    };
+    let kept = make("kept");
+    let revoked = make("revoked");
+
+    // Establish both namespaces, then publish an AMBIGUOUS generation (a
+    // file-sourced value beside the records) that no longer carries `revoked`.
+    record_trust_generation_published(&[kept.clone(), revoked.clone()], None, 1);
+    assert!(published_namespace_state("kept").is_some());
+    assert!(published_namespace_state("revoked").is_some());
+
+    let file_sourced = stored_bundle("file.local", &[1, 2, 3]);
+    record_trust_generation_published(&[kept.clone()], Some(&file_sourced), 2);
+
+    assert!(
+        published_namespace_state("kept").is_some(),
+        "a namespace the ambiguous generation still carries keeps its prior \
+         published state"
+    );
+    assert!(
+        published_namespace_state("revoked").is_none(),
+        "a namespace whose record was revoked must stop advertising a removed \
+         database revision"
     );
 }

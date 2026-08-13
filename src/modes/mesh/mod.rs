@@ -16917,6 +16917,31 @@ fn stage_gateway_active_trust_bundles(
     Ok(proxy_state.stage_runtime_gateway_trust(Some(runtime)))
 }
 
+/// External-test seam for [`stage_gateway_active_trust_bundles`] with federation
+/// disabled — the shape the apply loop uses before any federation poll has
+/// succeeded (issue #3727).
+///
+/// The staging function itself stays private because its `FederationActivation`
+/// argument is a private slice-apply detail; this seam supplies the disabled
+/// activation and an empty federation snapshot so an external suite can assert
+/// the staging contract (a deep-invalid bundle rejects the whole generation and
+/// mutates no live state) against the PRODUCTION helper rather than a copy.
+///
+/// Reached only from `tests/`; the `ferrum-edge` bin target compiles this module
+/// without any such caller.
+#[allow(dead_code)]
+pub fn stage_gateway_active_trust_bundles_unfederated_for_test(
+    proxy_state: &ProxyState,
+    slice: &MeshSlice,
+) -> Result<crate::proxy::GatewayTrustCommit, &'static str> {
+    stage_gateway_active_trust_bundles(
+        proxy_state,
+        slice,
+        Some(&federation::FederationSnapshot::default()),
+        FederationActivation::disabled(),
+    )
+}
+
 /// Build a proxy [`GatewayConfig`] from `base_slice` overlaid with the current
 /// federation + remote-endpoint snapshots and apply it to the live proxy
 /// runtime, running the same TLS / node-waypoint / DNS / outbound-enforcement
@@ -31957,62 +31982,6 @@ mod tests {
             .get(&remote_td)
             .expect("polled remote trust is active");
         assert_eq!(remote.x509_authorities, vec![expected_polled_root]);
-    }
-
-    #[tokio::test(flavor = "current_thread")]
-    async fn invalid_effective_gateway_trust_is_rejected_without_mutating_live_state() {
-        use crate::identity::{SvidBundle, TrustBundle, TrustBundleSet};
-        use base64::Engine;
-
-        let state = make_test_proxy_state(GatewayConfig::default());
-        let local_td = TrustDomain::new("invalid-stage.local").unwrap();
-        let id = SpiffeId::from_parts(&local_td, "ns/foo/sa/bar").unwrap();
-        state.install_gateway_runtime_svid_bundle(SvidBundle {
-            spiffe_id: id,
-            cert_chain_der: vec![vec![1, 2, 3]],
-            private_key_pkcs8_der: vec![4, 5, 6].into(),
-            trust_bundles: TrustBundleSet::local_only(TrustBundle {
-                trust_domain: local_td.clone(),
-                x509_authorities: vec![vec![7, 8, 9]],
-                jwt_authorities: Vec::new(),
-                refresh_hint_seconds: None,
-            }),
-        });
-        let before_svid = state.gateway_svid_bundle.load_full();
-        let before_epoch = state.request_epoch.load();
-        let slice = MeshSlice {
-            version: "invalid-effective-trust".to_string(),
-            trust_bundles: Some(config::TrustBundleSet {
-                local: config::TrustBundle {
-                    trust_domain: local_td,
-                    x509_authorities: vec![
-                        base64::engine::general_purpose::STANDARD
-                            .encode(b"base64-valid-but-not-x509"),
-                    ],
-                    jwt_authorities: Vec::new(),
-                    refresh_hint_seconds: None,
-                },
-                federated: Vec::new(),
-            }),
-            ..MeshSlice::default()
-        };
-
-        assert!(
-            stage_gateway_active_trust_bundles(
-                &state,
-                &slice,
-                Some(&federation::FederationSnapshot::default()),
-                FederationActivation::disabled(),
-            )
-            .is_err(),
-            "deep-invalid DER must reject the complete mesh generation"
-        );
-        assert!(Arc::ptr_eq(
-            &state.gateway_svid_bundle.load_full(),
-            &before_svid
-        ));
-        assert!(Arc::ptr_eq(&state.request_epoch.load(), &before_epoch));
-        assert!(state.admits_gateway_mesh_identity());
     }
 
     #[tokio::test(flavor = "current_thread")]

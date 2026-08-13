@@ -56,7 +56,7 @@ use std::sync::{Arc, LazyLock};
 use x509_parser::prelude::{FromDer, X509Certificate};
 
 use crate::identity::TrustDomain;
-use crate::modes::mesh::config::TrustBundleSet;
+use crate::modes::mesh::config::{MAX_MESH_REMOTE_CLUSTERS, TrustBundleSet};
 
 /// Maximum number of X.509 authorities in any single bundle (local or one
 /// federated entry). Root rotation needs an overlap of two or three; the cap is
@@ -68,7 +68,21 @@ pub const MAX_X509_AUTHORITIES_PER_BUNDLE: usize = 16;
 pub const MAX_JWT_AUTHORITIES_PER_BUNDLE: usize = 16;
 
 /// Maximum number of federated bundles in one record.
-pub const MAX_FEDERATED_BUNDLES: usize = 32;
+///
+/// This is DERIVED from [`MAX_MESH_REMOTE_CLUSTERS`], not chosen independently,
+/// because the two bound the same inventory from opposite ends: mesh
+/// multi-cluster already accepts up to `MAX_MESH_REMOTE_CLUSTERS` remote
+/// clusters, and a federated deployment carries one federated trust domain per
+/// remote cluster. A smaller number here would make a documented, already
+/// admissible remote-cluster inventory unrepresentable as trust — a cluster
+/// count past the cap would reject an entire mesh generation or suppress a CP
+/// broadcast — so the two constants are tied together and cannot drift.
+///
+/// The count bound is not the resource bound. See
+/// [`MAX_TRUST_BUNDLE_JSON_BYTES`] for how counts and total encoded size
+/// compose: the count cap makes the documented inventory *representable*, the
+/// total-byte cap is what actually bounds propagation and deep-parse cost.
+pub const MAX_FEDERATED_BUNDLES: usize = MAX_MESH_REMOTE_CLUSTERS;
 
 /// Maximum DER size of one X.509 authority, in bytes.
 pub const MAX_X509_AUTHORITY_DER_BYTES: usize = 16 * 1024;
@@ -83,7 +97,38 @@ pub const MAX_JWT_AUTHORITY_KEY_ID_BYTES: usize = 256;
 /// is stored in one column/field, replicated through the change log, and
 /// serialized into every `trust_bundles_json` side channel, so it is the bound
 /// that actually matters for propagation cost.
-pub const MAX_TRUST_BUNDLE_JSON_BYTES: usize = 256 * 1024;
+///
+/// # How the bounds compose
+///
+/// The three families are checked in a fixed order and are deliberately NOT
+/// redundant:
+///
+/// 1. **Counts** ([`MAX_FEDERATED_BUNDLES`],
+///    [`MAX_X509_AUTHORITIES_PER_BUNDLE`], [`MAX_JWT_AUTHORITIES_PER_BUNDLE`])
+///    make the documented inventory representable and stop an unbounded
+///    collection walk before it starts.
+/// 2. **Per-entry sizes** ([`MAX_X509_AUTHORITY_DER_BYTES`],
+///    [`MAX_JWT_AUTHORITY_PEM_BYTES`], [`MAX_JWT_AUTHORITY_KEY_ID_BYTES`]) cap
+///    one authority, so a single entry cannot be a blob.
+/// 3. **This total** caps the whole document. It is the BINDING resource bound:
+///    the counts multiply out to far more material than this allows
+///    (`(1 + 256)` bundles × 16 X.509 authorities × 16 KiB is ~64 MiB), and the
+///    total is what a full inventory is actually measured against.
+///
+/// The cheap raw-material sum is evaluated first and short-circuits before any
+/// deep parser runs, so the maximum material a hostile document can push
+/// through base64/DER/PEM decoding is this value, not the product of the counts.
+///
+/// The chosen value admits the documented worst realistic federation: the full
+/// `MAX_FEDERATED_BUNDLES` remote trust domains plus the local one, each
+/// carrying a rotation-overlap PAIR of ordinary ECDSA P-256 roots (~600 base64
+/// bytes each, so ~330 KiB with JSON framing), or one RSA-4096 root each. It
+/// deliberately does NOT admit every trust domain simultaneously holding the
+/// per-bundle authority maximum: that document would be replicated through the
+/// change log and into every subscriber snapshot on every rotation, and the
+/// CP/DP `ConfigUpdate` carries it alongside the full configuration inside one
+/// gRPC message.
+pub const MAX_TRUST_BUNDLE_JSON_BYTES: usize = 512 * 1024;
 
 /// Maximum length of the resource id.
 pub const MAX_TRUST_BUNDLE_ID_BYTES: usize = 255;
@@ -157,6 +202,11 @@ impl GatewayTrustBundleRecord {
     /// persisted: the store stamps the backend-assigned value inside the write
     /// transaction, so no construction site can seed a value that a later
     /// incarnation could repeat.
+    // Reached only from external and inline test suites: production records are
+    // deserialized by the stores or built through the CRUD admission path, so
+    // this constructor reads as dead code in the `ferrum-edge` bin target,
+    // which recompiles this module without any test caller.
+    #[allow(dead_code)]
     pub fn new(namespace: &str, id: &str, bundle: TrustBundleSet) -> Self {
         let now = Utc::now();
         Self {
@@ -507,30 +557,25 @@ impl std::io::Write for JsonSizeCounter {
     }
 }
 
+/// Deep, allocating validation of ONE bundle.
+///
+/// Count bounds are deliberately NOT re-emitted here.
+/// [`collect_structural_limit_errors`] owns them and
+/// [`validate_trust_bundle_set`] returns before this function on any structural
+/// failure, so an over-limit collection can never reach these parsers and a
+/// duplicated diagnostic could only ever be dead work. The skip-deep-parse
+/// property is therefore a property of the caller's early return, and the two
+/// guards below keep it locally true for any future caller: an over-limit
+/// collection is left unwalked rather than silently deep-parsed.
 fn validate_single_bundle(
     bundle: &crate::modes::mesh::config::TrustBundle,
     label: &str,
     errors: &mut Vec<String>,
 ) {
-    let x509_over = bundle.x509_authorities.len() > MAX_X509_AUTHORITIES_PER_BUNDLE;
-    if x509_over {
-        errors.push(format!(
-            "{label} declares {} x509 authorities; the maximum is {MAX_X509_AUTHORITIES_PER_BUNDLE}",
-            bundle.x509_authorities.len()
-        ));
-    }
-    let jwt_over = bundle.jwt_authorities.len() > MAX_JWT_AUTHORITIES_PER_BUNDLE;
-    if jwt_over {
-        errors.push(format!(
-            "{label} declares {} jwt authorities; the maximum is {MAX_JWT_AUTHORITIES_PER_BUNDLE}",
-            bundle.jwt_authorities.len()
-        ));
-    }
-
-    if !x509_over {
+    if bundle.x509_authorities.len() <= MAX_X509_AUTHORITIES_PER_BUNDLE {
         validate_x509_authorities(bundle, label, errors);
     }
-    if !jwt_over {
+    if bundle.jwt_authorities.len() <= MAX_JWT_AUTHORITIES_PER_BUNDLE {
         validate_jwt_authorities(bundle, label, errors);
     }
 }
@@ -1143,10 +1188,19 @@ pub fn record_trust_generation_published_scoped(
             .iter()
             .map(|record| record.namespace.as_str())
             .collect();
-        let mut retained = PUBLISHED_NAMESPACE_STATES.load().as_ref().clone();
-        let revoked_database_state = records.is_empty() && !retained.is_empty();
-        retained.retain(|namespace, _| current_namespaces.contains(namespace.as_str()));
-        PUBLISHED_NAMESPACE_STATES.store(Arc::new(retained));
+        // Read-modify-write through `rcu`, never load → clone → store. This
+        // branch RETAINS part of the map, so a plain load/store pair would drop
+        // a namespace another publisher committed between the two — a lost
+        // update on published trust state. `rcu` re-runs the closure until the
+        // compare-and-swap wins, and returns exactly the map this call
+        // replaced, so `revoked_database_state` is decided from the value that
+        // was actually superseded rather than from a racing snapshot.
+        let previous = PUBLISHED_NAMESPACE_STATES.rcu(|current| {
+            let mut retained = current.as_ref().clone();
+            retained.retain(|namespace, _| current_namespaces.contains(namespace.as_str()));
+            Arc::new(retained)
+        });
+        let revoked_database_state = records.is_empty() && !previous.is_empty();
         if !records.is_empty() {
             // Count the refused generation exactly once at the live swap. The
             // later per-namespace projection can run zero times (no active
@@ -1174,9 +1228,7 @@ pub fn record_trust_generation_published_scoped(
     // empty accepted generation clears every previously published database
     // record even though it deliberately does not increment the
     // database-record publication counter below.
-    let revoked_database_state =
-        records.is_empty() && !PUBLISHED_NAMESPACE_STATES.load().is_empty();
-    let published = records
+    let published: HashMap<String, PublishedGatewayTrustState> = records
         .iter()
         .map(|record| {
             (
@@ -1188,7 +1240,13 @@ pub fn record_trust_generation_published_scoped(
             )
         })
         .collect();
-    PUBLISHED_NAMESPACE_STATES.store(Arc::new(published));
+    // One atomic exchange, not a load followed by a store: `records` is the
+    // COMPLETE accepted view, so the new value does not depend on the old one,
+    // but the revocation test does. Swapping returns the map this call actually
+    // replaced, so a concurrent publication cannot make one publisher observe
+    // the other's map and mis-decide `revoked_database_state`.
+    let previous = PUBLISHED_NAMESPACE_STATES.swap(Arc::new(published));
+    let revoked_database_state = records.is_empty() && !previous.is_empty();
     // An accepted explicit revocation is still a successful trust publication:
     // clear the standing failure even though an empty database generation does
     // not advance the record-bearing generation counter or timestamp. A
@@ -1317,6 +1375,8 @@ pub fn observability_snapshot() -> GatewayTrustObservabilitySnapshot {
 
 /// Reset every counter. Test-support only — the production paths are monotonic
 /// within a process.
+// Test-support by definition; the bin target has no caller.
+#[allow(dead_code)]
 pub fn reset_observability_for_tests() {
     PUBLISHED_GENERATIONS_TOTAL.store(0, Ordering::Relaxed);
     LOAD_REJECTIONS_TOTAL.store(0, Ordering::Relaxed);

@@ -218,8 +218,9 @@ already use — there is no second representation that can drift.
   at most 255 characters, never truncated),
   and `created_at` / `updated_at`.
 - **Bounded, validated material.** Admission caps authority counts (16 X.509 and
-  16 JWT per bundle, 32 federated bundles), per-authority size (16 KiB), and the
-  encoded bundle as a whole (256 KiB). Count and cheap encoded/raw size bounds
+  16 JWT per bundle, 256 federated bundles), per-authority size (16 KiB), and the
+  encoded bundle as a whole (512 KiB) — see
+  [How the trust bounds compose](#how-the-trust-bounds-compose). Count and cheap encoded/raw size bounds
   fail closed before `TrustDomain::new` or any deep parser (mesh validation,
   X.509 DER, JWT public keys, runtime conversion). Every `x509_authorities`
   entry must be valid base64 *and* parse as an X.509 certificate that consumes
@@ -231,6 +232,41 @@ already use — there is no second representation that can drift.
   an unsupported key type is refused rather than stored and published. Duplicate
   trust domains are rejected. The same validation runs on write, on every full
   load, and again before publication.
+
+  <a id="how-the-trust-bounds-compose"></a>
+
+  **How the trust bounds compose.** The three families are checked in a fixed
+  order and are deliberately not redundant:
+
+  | Family | Values | What it is for |
+  | --- | --- | --- |
+  | Counts | 16 X.509 + 16 JWT authorities per bundle; **256** federated bundles | Make the documented inventory *representable*, and stop an unbounded collection walk before it starts |
+  | Per-entry size | 16 KiB per X.509 DER, 16 KiB per JWT PEM, 256 B per `key_id` | Stop one authority from being a blob |
+  | Total encoded | **512 KiB** for the whole `bundle` document | The **binding** resource bound — this is what a full inventory is measured against |
+
+  The federated-bundle count is *derived from* `MAX_MESH_REMOTE_CLUSTERS`, not
+  chosen independently. Mesh multi-cluster already accepts up to 256 remote
+  clusters and a federated deployment carries one federated trust domain per
+  remote cluster, so a smaller trust cap would make an already-admissible
+  cluster inventory unrepresentable — a 33rd trust domain would have rejected an
+  entire mesh generation or suppressed a CP broadcast. The two constants are now
+  tied together in code and cannot drift.
+
+  The count cap is **not** the resource cap: multiplied out, the counts describe
+  roughly 64 MiB of material, which is why the total ceiling exists and is
+  checked as well. The cheap raw-material sum runs first and short-circuits
+  before any deep parser, so the maximum material a hostile document can push
+  through base64/DER/PEM decoding is 512 KiB, not the product of the counts.
+
+  512 KiB is sized from the documented worst realistic federation: 256 remote
+  trust domains plus the local one, each carrying a rotation-overlap **pair** of
+  ordinary ECDSA P-256 roots (~600 base64 bytes each, so ≈330 KiB with JSON
+  framing), or one RSA-4096 root each. It deliberately does **not** admit every
+  trust domain simultaneously holding the per-bundle authority maximum: that
+  document is replicated through `config_changes` and into every subscriber
+  snapshot on every rotation, and the CP/DP `ConfigUpdate` carries it alongside
+  the full configuration inside one gRPC message. A document over the ceiling is
+  refused with a bounded size diagnostic and the previous generation stays live.
 - **Fail-closed stored-row decoding.** Security-relevant stored fields are
   decoded strictly: a missing/non-integer/non-positive `revision`, an
   unreadable `namespace`/`id`/`trust_domain`/`bundle`, or an unparseable
@@ -375,7 +411,7 @@ Every Replace crosses the same `config::gateway_trust` validator at admin/store
 admission, CP encoding, DP decoding, and mesh/federation staging. It enforces
 authority/federation counts, per-entry bounds, unique non-empty JWT key IDs,
 duplicate trust-domain refusal, complete X.509 DER consumption, usable JWT
-public keys, and the exact 256 KiB serialized document ceiling. The DP also
+public keys, and the exact 512 KiB serialized document ceiling. The DP also
 rejects a raw side-channel value over that ceiling before deserialization.
 Diagnostics carry only fixed failure classes or bounded field/index metadata,
 never certificate or key material. Invalid FULL_SNAPSHOT input terminates the
@@ -493,6 +529,49 @@ moment the commit returns. Already-issued handles such as `H2ConnectTunnel`,
 cloned `MeshMtlsSender`, and active gRPC/WebSocket/raw CONNECT streams are **not**
 terminated by this publication; issue #3859 tracks that live-session gap.
 
+###### The admission-refusal window, and what bounds it
+
+Because the retirement is synchronous under the fence, gateway-to-mesh
+admission is **closed for the duration of that work**. This is a real,
+operator-visible window and is documented rather than hidden.
+
+What runs inside it, in order, on the publishing thread — no `.await`, no I/O:
+
+1. one `ArcSwap` store of the trust material;
+2. one atomic advance of the backend security generation;
+3. for each generation in the retired half-open span (normally exactly one, and
+   never more than `MAX_COALESCED_ROTATION_DRAIN_GENERATIONS` = 8): one backend
+   TLS config-cache drain plus one `retain` pass over each of the
+   connection-pool, HTTP/2, gRPC and H3 `DashMap`s;
+4. one `clear()` of each of the HBONE and mesh-mTLS pool maps (entries,
+   creation locks, retired-fingerprint registries).
+
+So the window scales with **pooled occupancy** — the number of live entries
+across those six pools — and, linearly, with the **number of coalesced
+generations** in step 3. It does not scale with trust-material size, with the
+number of federated trust domains, with connected data planes, or with request
+rate. Dropping a pool entry cancels its connection task; the window does not
+wait for a socket close, a TLS shutdown, or a peer round trip.
+
+What a client sees while the window is open is the ordinary fail-closed refusal
+for its protocol, not a hang or a partial state: native gRPC gets a
+Trailers-Only `UNAVAILABLE` with the fixed metadata-free
+`GATEWAY_MESH_IDENTITY_NOT_LIVE` message, HTTP-family mesh dispatch and
+mesh TCP/UDP egress refuse before any dial, and nothing is health-scored or
+circuit-breaker-charged for the refusal. Requests that never touch a mesh-tagged
+target are unaffected — the gate is consulted only on the gateway-to-mesh
+admission path.
+
+The window is entered only by a decision that actually **withdraws** an
+installed authority (see the scoping rules below), so a steady-state gateway,
+an additive overlap root, a reconnect-redelivered identical `Replace`, and a
+redundant `Clear` never pay it. Observability for the event itself is the
+existing label-free `ferrum_gateway_trust_bundle_*` family plus the
+`Cleared pooled backend and mesh entries...` publication log, which names the
+retired generation span; there is deliberately no per-namespace or per-pool
+duration label, because namespace names are tenant-identifying and a
+per-generation label is unbounded.
+
 Retirement is scoped to an actual withdrawal, because it is expensive and
 because a decision that removes no root leaves nothing to bound:
 
@@ -556,6 +635,47 @@ guarantee — fails closed without panicking: the previous generation stays live
 the candidate is not published. On a reload that failure happens at the staging
 step, so the *configuration* apply is rejected too and the candidate never
 becomes live beside the previous trust.
+
+###### A backup bootstrap has no trust authority, and says so
+
+Database mode can start on the externally provisioned on-disk snapshot at
+`FERRUM_DB_CONFIG_BACKUP_PATH` when the database is unreachable or returns an
+unusable snapshot. That snapshot carries **no** trust state and structurally
+cannot: `GatewayConfig.gateway_trust_bundles` is `#[serde(skip)]` precisely so a
+multi-namespace control plane cannot leak every served namespace's trust
+material into one subscriber's `config_json`, so the field deserializes empty no
+matter what the committed database generation held.
+
+An empty vector there is therefore **"unknown"**, not "revoked", and
+`resolve_trust_authority` cannot tell the two apart on its own. Left alone, the
+process would resolve to the file/source authority and quietly authenticate
+gateway-to-mesh peers with the source-loaded SVID trust — including a root the
+committed database generation had *withdrawn*, for as long as the outage lasted.
+Reading the trust state out of the backup file instead would not fix it: the
+file is arbitrarily old, so trusting its trust section re-enables a stale root
+by a different route.
+
+The only sound state is unknown, and the only sound behaviour for an unknown
+trust anchor is to refuse:
+
+- the backup fallback marks the trust authority unresolved before any listener
+  binds, and the startup trust publication is **skipped** rather than recording
+  an empty generation that would clear the standing failure state and advertise
+  a convergence this process never read;
+- while it holds, `ProxyState::admits_gateway_mesh_identity` is false, so native
+  gRPC mesh dispatch answers Trailers-Only `UNAVAILABLE` with the fixed
+  metadata-free message and HTTP-family mesh dispatch and mesh TCP/UDP egress
+  refuse before any dial. Ordinary non-mesh proxying is unaffected — the gate is
+  only consulted on the gateway-to-mesh admission path;
+- `GET /gateway-trust/status` reports `authority_unresolved: true`, which is a
+  distinct signal from `configured: false` (that one means "published, and this
+  namespace has no record");
+- it clears at exactly one place: the single chokepoint through which an
+  authoritative database **full** snapshot reaches the live runtime, and only
+  after that generation's trust has already been staged, fenced, installed, and
+  republished. An incremental delta may not clear it — a delta describes a
+  change to a base this process never read, so it cannot establish whether a
+  trust record exists — and a rejected candidate leaves the refusal standing.
 
 A data plane's configuration never carries the resource, so its trust arrives on
 the ConfigSync side channel — and it is handed to the snapshot/delta

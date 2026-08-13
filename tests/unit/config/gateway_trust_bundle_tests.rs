@@ -18,6 +18,7 @@
 //!    the authoritative reader-side drift check is asserted against a
 //!    deterministic simulator that reproduces the interleaving exactly.
 
+use crate::unit::gateway_trust_observability_lock::lock_gateway_trust_observability;
 use ferrum_edge::config::gateway_trust::{
     AMBIGUOUS_TRUST_AUTHORITY_MESSAGE, GatewayTrustBundleIdentity, GatewayTrustBundleRecord,
     GatewayTrustDriftSource, GatewayTrustFailureReason, GatewayTrustPublication,
@@ -28,7 +29,7 @@ use ferrum_edge::config::gateway_trust::{
     observability_snapshot, project_namespace_trust, published_namespace_generation,
     published_namespace_state, record_ambiguous_authority, record_trust_generation_published,
     record_trust_generation_published_scoped, record_trust_load_rejection,
-    reset_observability_for_tests, resolve_trust_authority, trust_generation_fingerprint,
+    resolve_trust_authority, trust_generation_fingerprint,
 };
 use ferrum_edge::config::types::GatewayConfig;
 use ferrum_edge::identity::TrustDomain;
@@ -768,7 +769,7 @@ fn no_authority_at_all_resolves_to_the_database_with_nothing_to_publish() {
 /// rather than racing each other across cargo's parallel test threads.
 #[test]
 fn observability_counters_are_bounded_and_material_free() {
-    reset_observability_for_tests();
+    let _observability = lock_gateway_trust_observability();
 
     let baseline = observability_snapshot();
     assert_eq!(baseline.published_generations_total, 0);
@@ -958,8 +959,6 @@ fn observability_counters_are_bounded_and_material_free() {
             "process metrics must not carry {forbidden}"
         );
     }
-
-    reset_observability_for_tests();
 }
 
 // ── Configuration identity ──────────────────────────────────────────────────
@@ -1162,7 +1161,7 @@ fn the_default_id_comes_from_the_server_selected_namespace_only() {
 
 #[test]
 fn two_authorities_keep_the_previously_accepted_trust_rather_than_revoking_it() {
-    reset_observability_for_tests();
+    let _observability = lock_gateway_trust_observability();
     let record = valid_record();
     let file_value = bundle_with(vec![root_ca_der_base64("file-root")]);
 
@@ -1187,7 +1186,6 @@ fn two_authorities_keep_the_previously_accepted_trust_rather_than_revoking_it() 
         1,
         "the refusal must be observable even without an active subscriber"
     );
-    reset_observability_for_tests();
 }
 
 #[test]
@@ -1667,5 +1665,209 @@ fn detect_gateway_trust_drift_read_failure_logs_a_bounded_classification_only() 
     assert!(
         body.contains("detail_withheld = true"),
         "drift read failures must withhold backend detail:\n{body}"
+    );
+}
+
+// ── Bound composition: counts vs. total encoded size ────────────────────────
+//
+// The count caps and the total-byte cap answer different questions and are
+// checked in a fixed order. These pin the relationship the operator docs state
+// (`docs/cp_dp_mode.md` → "How the trust bounds compose"), so a future edit
+// cannot silently reintroduce the 32-vs-256 mismatch that made a documented
+// remote-cluster inventory unrepresentable.
+
+#[test]
+fn the_federated_bundle_cap_matches_the_mesh_remote_cluster_cap() {
+    assert_eq!(
+        MAX_FEDERATED_BUNDLES,
+        ferrum_edge::modes::mesh::config::MAX_MESH_REMOTE_CLUSTERS,
+        "a federated deployment carries one federated trust domain per remote \
+         cluster, so a trust cap below the accepted remote-cluster cap would \
+         make an already-admissible inventory unrepresentable and reject the \
+         whole generation"
+    );
+}
+
+#[test]
+fn the_documented_full_cluster_inventory_with_rotation_overlap_is_admissible() {
+    // One rotation-overlap PAIR of real ECDSA P-256 roots per federated trust
+    // domain, at the full documented remote-cluster count. Two certificates are
+    // generated and reused so the fixture stays cheap; the byte accounting is
+    // what the total ceiling is measured against, and identical entries are not
+    // deduplicated anywhere in the encoded document.
+    let outgoing = root_ca_der_base64("inventory-outgoing-root");
+    let incoming = root_ca_der_base64("inventory-incoming-root");
+    let mut record = valid_record();
+    record.bundle.local.x509_authorities = vec![outgoing.clone(), incoming.clone()];
+    record.bundle.federated = (0..MAX_FEDERATED_BUNDLES)
+        .map(|index| TrustBundle {
+            trust_domain: trust_domain(&format!("remote-{index}.example.com")),
+            x509_authorities: vec![outgoing.clone(), incoming.clone()],
+            jwt_authorities: Vec::new(),
+            refresh_hint_seconds: None,
+        })
+        .collect();
+
+    let encoded = serde_json::to_vec(&record.bundle).expect("inventory bundle serializes");
+    assert!(
+        encoded.len() <= MAX_TRUST_BUNDLE_JSON_BYTES,
+        "the documented {MAX_FEDERATED_BUNDLES}-cluster inventory with rotation \
+         overlap must fit the total ceiling; encoded {} bytes against a \
+         {MAX_TRUST_BUNDLE_JSON_BYTES} byte cap",
+        encoded.len()
+    );
+    record
+        .validate_fields()
+        .expect("the documented full inventory must be admissible");
+}
+
+#[test]
+fn the_total_byte_ceiling_binds_before_the_count_caps_are_reached() {
+    // Inside EVERY count cap and inside every per-entry cap, yet far over the
+    // total. This is the case the count caps cannot express, and it must reject
+    // on the cheap raw-material sum without funding a deep parser.
+    //
+    // One under-cap entry (the maximum base64 length that can still decode
+    // within `MAX_X509_AUTHORITY_DER_BYTES`), repeated to the per-bundle count
+    // cap, in the local bundle plus a single federated bundle.
+    let entry = "A".repeat(4 * MAX_X509_AUTHORITY_DER_BYTES.div_ceil(3));
+    let authorities = vec![entry; MAX_X509_AUTHORITIES_PER_BUNDLE];
+    let mut record = valid_record();
+    record.bundle.local.x509_authorities = authorities.clone();
+    record.bundle.federated = vec![TrustBundle {
+        trust_domain: trust_domain("remote.example.com"),
+        x509_authorities: authorities,
+        jwt_authorities: Vec::new(),
+        refresh_hint_seconds: None,
+    }];
+    assert!(
+        record.bundle.federated.len() <= MAX_FEDERATED_BUNDLES
+            && record.bundle.local.x509_authorities.len() <= MAX_X509_AUTHORITIES_PER_BUNDLE,
+        "the fixture must stay inside every count cap so the total is what rejects"
+    );
+
+    let errors = record
+        .validate_fields()
+        .expect_err("an over-total document must be rejected");
+    assert!(
+        errors
+            .iter()
+            .any(|error| error.contains("raw material") && error.contains("bytes")),
+        "expected the total raw-material diagnostic, got {errors:?}"
+    );
+    assert!(
+        errors
+            .iter()
+            .all(|error| !error.contains("authorities; the maximum")),
+        "no count cap was exceeded, so no count diagnostic may appear: {errors:?}"
+    );
+    assert_structural_fail_fast(&errors);
+}
+
+// ── DP trust side-channel wire boundary ─────────────────────────────────────
+//
+// The ConfigSync `trust_bundles_json` side channel decodes through the SAME
+// shared validator as database admission, and its refusal strings are a bounded
+// operator-facing contract. These drive the production parser through
+// `dp_client::classify_gateway_trust_side_channel_for_test`, which projects the
+// decision onto a fixed label without exposing runtime trust material.
+
+fn classify_side_channel(raw: &str) -> Result<&'static str, String> {
+    ferrum_edge::grpc::dp_client::classify_gateway_trust_side_channel_for_test(raw)
+}
+
+fn wire_json(bundle: &TrustBundleSet) -> String {
+    serde_json::to_string(bundle).expect("wire fixture serializes")
+}
+
+#[test]
+fn the_trust_side_channel_accepts_a_real_certificate() {
+    let bundle = bundle_with(vec![root_ca_der_base64("dp-wire-root")]);
+    assert_eq!(
+        classify_side_channel(&wire_json(&bundle))
+            .expect("a real bounded X.509 authority must be accepted"),
+        "replace"
+    );
+}
+
+#[test]
+fn the_trust_side_channel_rejects_malformed_and_trailing_der() {
+    let engine = base64::engine::general_purpose::STANDARD;
+    let malformed = bundle_with(vec![engine.encode(b"not-a-certificate")]);
+    assert!(
+        classify_side_channel(&wire_json(&malformed)).is_err(),
+        "base64 that is not a certificate must not reach the live verifier"
+    );
+
+    let mut der = engine
+        .decode(root_ca_der_base64("dp-wire-trailing-root"))
+        .expect("fixture DER decodes");
+    der.extend_from_slice(b"trailing");
+    let trailing = bundle_with(vec![engine.encode(der)]);
+    assert!(
+        classify_side_channel(&wire_json(&trailing)).is_err(),
+        "a certificate with appended bytes must be refused on the wire too"
+    );
+}
+
+#[test]
+fn the_trust_side_channel_rejects_duplicate_or_unusable_jwt_keys() {
+    let usable = usable_public_key_pem();
+    let jwt_bundle = |authorities: Vec<JwtAuthority>| TrustBundleSet {
+        local: TrustBundle {
+            trust_domain: trust_domain("cluster.local"),
+            x509_authorities: Vec::new(),
+            jwt_authorities: authorities,
+            refresh_hint_seconds: None,
+        },
+        federated: Vec::new(),
+    };
+
+    let duplicate = jwt_bundle(vec![
+        JwtAuthority {
+            key_id: "same".to_string(),
+            public_key_pem: usable.clone(),
+        },
+        JwtAuthority {
+            key_id: "same".to_string(),
+            public_key_pem: usable,
+        },
+    ]);
+    assert!(
+        classify_side_channel(&wire_json(&duplicate)).is_err(),
+        "a repeated key_id makes verification ambiguous and must be refused"
+    );
+
+    let unusable = jwt_bundle(vec![JwtAuthority {
+        key_id: "bad".to_string(),
+        public_key_pem: "-----BEGIN PUBLIC KEY-----\nAAAA\n-----END PUBLIC KEY-----".to_string(),
+    }]);
+    assert!(
+        classify_side_channel(&wire_json(&unusable)).is_err(),
+        "a PEM the JWT-SVID parser cannot use must be refused"
+    );
+}
+
+#[test]
+fn the_trust_side_channel_rejects_wire_and_entry_limits() {
+    let root = root_ca_der_base64("dp-wire-count-root");
+    let over_count = bundle_with(vec![root; MAX_X509_AUTHORITIES_PER_BUNDLE + 1]);
+    assert!(
+        classify_side_channel(&wire_json(&over_count)).is_err(),
+        "the per-bundle authority count cap applies on the wire"
+    );
+
+    let over_entry = bundle_with(vec!["A".repeat(MAX_X509_AUTHORITY_DER_BYTES * 2)]);
+    assert!(
+        classify_side_channel(&wire_json(&over_entry)).is_err(),
+        "the per-authority size cap applies on the wire"
+    );
+
+    // The RAW wire cap is checked before deserialization, so an oversized value
+    // never allocates a document.
+    let raw = " ".repeat(MAX_TRUST_BUNDLE_JSON_BYTES + 1);
+    assert_eq!(
+        classify_side_channel(&raw).expect_err("raw wire cap must reject first"),
+        "gateway trust bundles side-channel exceeds the wire limit"
     );
 }

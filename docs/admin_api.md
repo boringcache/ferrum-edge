@@ -660,8 +660,14 @@ certificate; every JWT authority needs a unique non-empty `key_id` and a
 `public_key_pem` the JWT-SVID validator can actually use — either an SPKI
 `PUBLIC KEY` PEM or a SPIFFE-federation JWK object, each proved by running the
 real parser; duplicate trust domains across `local` + `federated` are
-rejected. Material is bounded (16 X.509 and 16 JWT authorities per bundle, 32
-federated bundles, 16 KiB per authority, 256 KiB encoded). A rejected candidate
+rejected. Material is bounded (16 X.509 and 16 JWT authorities per bundle, 256
+federated bundles, 16 KiB per authority, 512 KiB encoded). The federated-bundle
+count is the same maximum mesh multi-cluster already accepts
+(`MAX_MESH_REMOTE_CLUSTERS`), so a documented remote-cluster inventory is always
+*representable*; the 512 KiB encoded ceiling is the binding resource bound and is
+what a full inventory is measured against. See
+[cp_dp_mode.md](cp_dp_mode.md#how-the-trust-bounds-compose) for how the three
+bound families compose. A rejected candidate
 never replaces the live generation, and the error names field, index, and size
 only — never the material.
 
