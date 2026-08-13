@@ -92,6 +92,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   credential that expired while the response phases were running into the fixed
   pre-commitment terminal, rather than committing a protected head (or
   committing a streaming head only to terminal-error it immediately afterwards).
+  On the buffered H1/H2 path that gate is also the **audit** boundary. The one
+  terminal transaction summary is built from post-gate state, so it records the
+  status the client actually receives and the bounded
+  `authorization.termination_reason` class, and terminal transaction logging is
+  no longer awaited for a request carrying an authorization plan: awaiting it
+  let the credential expire while one logging plugin blocked, after earlier
+  plugins had already emitted the still-protected outcome, and an emitted audit
+  record cannot be retracted. That single summary now goes to the same bounded
+  observability-delivery cleanup the client RPC-deadline path already used —
+  every applicable plugin still receives it, in configured order, exactly once,
+  inside one finite-budget task — so the request task awaits nothing between the
+  gate and the response it hands to hyper. A request with no authorization plan
+  cannot expire there and keeps the historical sequential awaited contract.
   Native HTTP/3 gRPC gets the same gate on its own writer: once before the first
   client-visible terminal it can produce (the declared-size refusal) and once
   after every response-header hook and policy, immediately before the response

@@ -3563,9 +3563,9 @@ impl RequestContext {
     /// them completely unbounded for an ordinary HTTP request, so a slow hook
     /// could carry an admitted credential past its own expiry and then commit a
     /// PROTECTED response head. Composing the authorization deadline here means
-    /// the phase is cancelled instead, and the authoritative gates before
-    /// logging and immediately after the last pre-commitment await turn that
-    /// into the fixed pre-commitment terminal.
+    /// the phase is cancelled instead, and the authoritative gate that runs
+    /// after the last pre-commitment await — and before the terminal summary is
+    /// built — turns that into the fixed pre-commitment terminal.
     ///
     /// The maximum comes from the process-wide value `EnvConfig::validate`
     /// publishes after its `1..=86400` range check, so this needs no config
@@ -7542,6 +7542,14 @@ pub async fn log_with_mirror(
 /// response owns the deadline and logging continues on cloned state under a
 /// finite cleanup bound. This keeps audit delivery best-effort without letting
 /// a blocked sink suppress the terminal response.
+///
+/// The main buffered terminal path of `handle_proxy_request_inner` reaches this
+/// only for a request with NO authorization plan — an unauthenticated request,
+/// whose credential cannot expire behind the wait. An authenticated request goes
+/// through [`spawn_bounded_terminal_summary_log`] directly instead, because
+/// awaiting any logging plugin AFTER that path's authoritative authorization
+/// gate would let the credential expire once earlier plugins had already
+/// recorded the protected outcome (issue #3815).
 pub async fn log_with_mirror_before_buffered_response(
     plugins: &[Arc<dyn Plugin>],
     summary: TransactionSummary,
@@ -7551,7 +7559,30 @@ pub async fn log_with_mirror_before_buffered_response(
         log_with_mirror(plugins, &summary, ctx).await;
         return;
     }
+    spawn_bounded_terminal_summary_log(plugins, summary, ctx);
+}
 
+/// Hand ONE terminal transaction summary to bounded, detached observability
+/// delivery instead of awaiting it (issue #3815).
+///
+/// Every applicable logging plugin still receives exactly this summary, exactly
+/// once, in configured order; the ordering happens inside the single spawned
+/// task rather than on the request task. Nothing is awaited on the caller's
+/// side, so no time passes — and therefore no credential can expire — between an
+/// authorization commitment gate and the client-visible response that gate
+/// selected. The summary handed in is the one that describes that response, so
+/// the audit record and the client-visible security decision cannot disagree.
+///
+/// Delivery is admitted through the shared observability-delivery lifecycle, so
+/// the task counts against `FERRUM_LOG_DELIVERY_MAX_TASKS`, is drained at
+/// shutdown, and is capped by a finite cleanup timeout: nothing detached here is
+/// unbounded. A rejected admission drops the record rather than spawning further
+/// work to report it.
+pub fn spawn_bounded_terminal_summary_log(
+    plugins: &[Arc<dyn Plugin>],
+    summary: TransactionSummary,
+    ctx: &RequestContext,
+) {
     let plugins = plugins.to_vec();
     let ctx = ctx.clone();
     let _ = crate::observability_delivery::spawn_deadline_cleanup(async move {
@@ -10268,10 +10299,16 @@ pub trait Plugin: Send + Sync {
     /// Called for transaction logging.
     ///
     /// Buffered HTTP-family handlers normally await each plugin's hook
-    /// sequentially before returning the response. When an absolute gRPC
-    /// deadline is active, buffered H1/H2 handlers instead move logging to a
-    /// bounded detached cleanup task so a blocked sink cannot suppress the
-    /// terminal RPC response. Native H3 awaits the hooks after it has
+    /// sequentially before returning the response. Buffered H1/H2 handlers
+    /// instead move logging to a bounded detached cleanup task when an absolute
+    /// gRPC deadline is active, so a blocked sink cannot suppress the terminal
+    /// RPC response, and when the request carries an authorization plan, so a
+    /// blocked sink cannot hold the request task past the credential's expiry
+    /// after the authoritative authorization gate has already chosen the
+    /// client-visible response (issue #3815). Either way the hooks still run
+    /// sequentially, in configured order, over exactly one summary — the one
+    /// that describes the response the client receives. Native H3 awaits the
+    /// hooks after it has
     /// synchronously driven the response body to completion. Hyper-owned
     /// streamed H1/H2/gRPC bodies spawn terminal hooks and logging when the body
     /// completes; spawned work can be lost if no runtime remains during

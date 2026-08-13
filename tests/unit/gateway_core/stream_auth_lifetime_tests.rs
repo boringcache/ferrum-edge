@@ -21,10 +21,10 @@ use ferrum_edge::_test_support::{
     compose_dispatch_phase_bound_for_test, compose_h3_upload_bound_for_test,
     direct_h2_upload_join_bound_for_test, dispatch_phase_authorization_expiry_for_test,
     dtls_authorization_expired_before_relay_for_test,
-    dtls_setup_stage_under_authorization_for_test, request_received_at_for_test,
-    request_upload_auth_deadline_for_test, set_grpc_deadline_budget_for_test,
-    set_request_credential_deadline_for_test, settle_dtls_relay_authorization_expiry_for_test,
-    within_stream_auth_deadline_for_test,
+    dtls_setup_stage_under_authorization_for_test, precommit_authorization_gate_for_test,
+    request_received_at_for_test, request_upload_auth_deadline_for_test,
+    set_grpc_deadline_budget_for_test, set_request_credential_deadline_for_test,
+    settle_dtls_relay_authorization_expiry_for_test, within_stream_auth_deadline_for_test,
 };
 use ferrum_edge::config::types::Consumer;
 use ferrum_edge::plugins::{Direction, DisconnectCause, RequestContext};
@@ -1719,13 +1719,15 @@ fn every_buffered_response_collect_is_authorization_bounded() {
     }
 }
 
-/// The pre-log authorization gate immediately before transaction logging.
+/// The AUTHORITATIVE authorization gate, immediately before the terminal
+/// transaction summary is built and the response head is committed.
 ///
 /// The earlier pre-commitment check runs where backend dispatch converges;
 /// every awaited response phase after it can still consume time up to the
-/// deadline, so a protected or streaming head must not be logged or deferred
-/// without this check. It is not the last check before commitment: the
-/// buffered path still awaits logging afterwards.
+/// deadline, so a protected or streaming head must not be logged, deferred, or
+/// committed without this check. This IS the last authorization decision on the
+/// path: nothing after it awaits on a request that carries a plan, which
+/// `buffered_terminal_logging_never_awaits_after_the_authorization_gate` pins.
 #[test]
 fn a_final_authorization_gate_precedes_response_head_commitment() {
     let gate = PROXY_SOURCE
@@ -1758,63 +1760,179 @@ fn a_final_authorization_gate_precedes_response_head_commitment() {
     );
 }
 
-/// The buffered-response logging await is the last await before commitment,
-/// and an authoritative gate runs immediately after it with no further await
-/// before the response builder (issue #3815).
+/// Nothing awaits between the authoritative authorization gate and the
+/// client-visible buffered response, and the ONE terminal summary that reaches
+/// the logging plugins is the post-gate one (issue #3815).
+///
+/// Awaiting terminal transaction logging here reopened exactly the window the
+/// gate closes. The summary is immutable and is built BEFORE the logging chain
+/// runs, so a credential expiring while one logging plugin blocked produced an
+/// audit record of the still-PROTECTED status — after some plugins had already
+/// emitted it — while the client received the fixed authorization terminal.
+/// A later gate can repair the response; it cannot retract an emitted record.
 #[test]
-fn buffered_logging_is_bounded_and_followed_by_the_commitment_gate() {
-    let commitment_marker =
-        "let commitment_authorization_terminal = apply_precommit_authorization_terminal(";
-    let commitment_at = PROXY_SOURCE
-        .find(commitment_marker)
-        .expect("commitment gate present");
+fn buffered_terminal_logging_never_awaits_after_the_authorization_gate() {
+    let gate_marker =
+        "let final_precommit_authorization_terminal = apply_precommit_authorization_terminal(";
+    let gate_at = PROXY_SOURCE.find(gate_marker).expect("final gate present");
     let builder_at = PROXY_SOURCE
         .find("    // Build final response\n    let mut resp_builder = Response::builder()")
         .expect("response builder present");
     assert!(
-        commitment_at < builder_at,
-        "the commitment gate must run BEFORE the response head is built"
+        gate_at < builder_at,
+        "the authorization gate must run BEFORE the response head is built"
     );
 
-    // Walk back from the commitment gate to the buffered-path `} else {` that
-    // owns the logging await, so other `log_with_mirror_before_buffered_response`
-    // call sites cannot satisfy this guard.
-    let before_gate = &PROXY_SOURCE[..commitment_at];
-    let else_at = before_gate
-        .rfind("            } else {\n                // Bound the logging wait by the admitted authorization")
-        .expect("buffered logging else-arm");
-    let logging_arm = &PROXY_SOURCE[else_at..commitment_at];
+    // The summary is built AFTER the gate, so it records the terminal status,
+    // the buffered classification, and the bounded class the gate latched.
+    let summary_at = PROXY_SOURCE[gate_at..builder_at]
+        .find("let summary = TransactionSummary {")
+        .map(|offset| gate_at + offset)
+        .expect("the terminal transaction summary is built between the gate and the builder");
+
+    // The buffered (non-streaming) arm that owns terminal-log delivery.
+    let arm_marker = "// ── Buffered commitment / audit boundary (#3815)";
+    let else_at = PROXY_SOURCE[summary_at..builder_at]
+        .find(arm_marker)
+        .map(|offset| summary_at + offset)
+        .expect("buffered terminal-log delivery arm");
+    let delivery_arm = &PROXY_SOURCE[else_at..builder_at];
+
+    // The detach decision is derived from the gate's OWN plan predicate, taken
+    // between the gate and the arm, so the two cannot disagree about which
+    // requests carry an authorization decision to protect. Nothing in that
+    // window may await either.
+    let between = &PROXY_SOURCE[gate_at..else_at];
     assert!(
-        logging_arm.contains("ctx.precommit_response_phase_bound()"),
-        "the buffered logging wait must run under the composed authorization bound"
+        between.contains("let has_authorization_plan ="),
+        "the detach predicate must be bound between the gate and the delivery arm"
     );
     assert!(
-        logging_arm.contains("await_precommit_response_phase("),
-        "expiry during logging must cancel the wait rather than commit a protected head"
+        between.contains("effective_request_auth_deadline("),
+        "the detach predicate must be the gate's own plan check"
     );
     assert!(
-        logging_arm.contains("log_with_mirror_before_buffered_response("),
-        "the bounded wait is the buffered-response logger"
+        !between.contains(".await"),
+        "nothing between the gate and the terminal-log delivery arm may await"
     );
     assert!(
-        logging_arm.contains("PrecommitPhaseResult::Expired(Some(termination))"),
-        "an authorization expiry during logging must latch so the commitment gate can apply it"
+        delivery_arm.contains("if has_authorization_plan {"),
+        "the buffered terminal-log arm must branch on that predicate"
     );
     assert!(
-        logging_arm.contains("record_authorization_termination_once(termination, family)"),
-        "the shared latch must record the class exactly once"
+        delivery_arm.contains("crate::plugins::spawn_bounded_terminal_summary_log("),
+        "an authenticated buffered response must hand its single terminal summary to bounded \
+         detached delivery instead of awaiting a logging plugin after the gate"
     );
+    assert!(
+        delivery_arm.contains("crate::plugins::log_with_mirror_before_buffered_response("),
+        "a request with no authorization plan keeps the historical awaited contract"
+    );
+    assert!(
+        !delivery_arm.contains("apply_precommit_authorization_terminal("),
+        "a second gate after the summary was built would decide a response the audit record \
+         can no longer describe"
+    );
+
+    // The ONLY await between the gate and the response builder is the
+    // no-authorization-plan branch, whose credential cannot expire behind it.
     assert_eq!(
-        logging_arm.matches(".await").count(),
+        delivery_arm.matches(".await").count(),
         1,
-        "the only await in the logging-to-gate window is the bounded logging wait itself"
+        "no await may separate the authorization gate from the client-visible response"
     );
-
-    let after_gate = &PROXY_SOURCE[commitment_at..builder_at];
+    let await_at = delivery_arm.find(".await").expect("awaited call");
     assert!(
-        !after_gate.contains(".await"),
-        "there must be no await between the last authorization gate and protected response construction"
+        delivery_arm[..await_at]
+            .rsplit_once("crate::plugins::")
+            .is_some_and(|(_, call)| call.starts_with("log_with_mirror_before_buffered_response(")),
+        "the one remaining await must be the unauthenticated buffered logger"
     );
+}
+
+/// The buffered terminal summary is built from POST-GATE state, so the audit
+/// record and the client-visible security decision cannot disagree (#3815).
+///
+/// The gate rewrites the status/headers/body and latches the bounded class into
+/// the request metadata BEFORE `TransactionSummary` is constructed, and the
+/// summary's `metadata` is exactly `clone_log_metadata` of that context. There
+/// is therefore no earlier, still-protected summary that could reach a logging
+/// plugin first.
+#[tokio::test]
+async fn the_gate_publishes_the_terminal_class_before_the_summary_is_built() {
+    let mut ctx = authenticated_ctx();
+    let received_at = request_received_at_for_test(&ctx);
+    // A credential that elapsed while the pre-commitment response phases ran.
+    set_request_credential_deadline_for_test(&mut ctx, Some(received_at));
+
+    let gate =
+        precommit_authorization_gate_for_test(&mut ctx, DEFAULT_MAX, false, 200, b"protected");
+
+    assert_eq!(
+        gate.termination,
+        Some(StreamAuthTermination::CredentialExpired)
+    );
+    // The client-visible response is the fixed pre-commitment terminal, and the
+    // summary built from this state records that status, not the protected one.
+    assert_eq!(gate.status, 401);
+    assert_eq!(gate.body, br#"{"error":"Unauthorized"}"#.to_vec());
+    let reason = gate.log_metadata.get(TERMINATION_REASON_KEY);
+    assert_eq!(reason.map(String::as_str), Some("credential_expired"));
+    // Compiled-in literals only: no token, claim, subject, provider detail, or
+    // absolute expiry reaches the record the gate publishes.
+    for value in gate.log_metadata.values() {
+        assert_eq!(value, "credential_expired");
+    }
+}
+
+/// The same gate on native gRPC selects the legal trailers-only terminal and
+/// still publishes the bounded class for the terminal summary.
+#[tokio::test]
+async fn the_grpc_gate_publishes_the_bounded_class_with_its_trailers_only_terminal() {
+    let mut ctx = authenticated_ctx();
+    let received_at = request_received_at_for_test(&ctx);
+    set_request_credential_deadline_for_test(&mut ctx, Some(received_at));
+
+    let gate =
+        precommit_authorization_gate_for_test(&mut ctx, DEFAULT_MAX, true, 200, b"protected");
+
+    assert_eq!(
+        gate.termination,
+        Some(StreamAuthTermination::CredentialExpired)
+    );
+    // gRPC errors ride HTTP 200 with the status in trailing metadata.
+    assert_eq!(gate.status, 200);
+    let grpc_status = gate.headers.get("grpc-status").map(String::as_str);
+    assert_eq!(grpc_status, Some("16"));
+    assert!(gate.body.is_empty());
+    let reason = gate.log_metadata.get(TERMINATION_REASON_KEY);
+    assert_eq!(reason.map(String::as_str), Some("credential_expired"));
+}
+
+/// A live credential and an unauthenticated request both leave the buffered
+/// terminal summary describing the response the backend actually produced.
+#[tokio::test]
+async fn a_live_or_absent_credential_leaves_the_buffered_terminal_summary_untouched() {
+    let mut live = authenticated_ctx();
+    let received_at = request_received_at_for_test(&live);
+    set_request_credential_deadline_for_test(
+        &mut live,
+        Some(received_at + Duration::from_secs(300)),
+    );
+    let gate = precommit_authorization_gate_for_test(&mut live, DEFAULT_MAX, false, 200, b"body");
+    assert_eq!(gate.termination, None);
+    assert_eq!(gate.status, 200);
+    assert_eq!(gate.body, b"body".to_vec());
+    assert!(!gate.log_metadata.contains_key(TERMINATION_REASON_KEY));
+
+    // An unauthenticated request has no plan and is never gated.
+    let mut anonymous = anonymous_ctx();
+    let gate =
+        precommit_authorization_gate_for_test(&mut anonymous, DEFAULT_MAX, false, 200, b"body");
+    assert_eq!(gate.termination, None);
+    assert_eq!(gate.status, 200);
+    assert_eq!(gate.body, b"body".to_vec());
+    assert!(!gate.log_metadata.contains_key(TERMINATION_REASON_KEY));
 }
 
 /// Every awaited pre-commitment RESPONSE phase runs under the composed bound.
@@ -1831,7 +1949,7 @@ fn every_precommit_response_phase_composes_the_authorization_lifetime() {
         PROXY_SOURCE
             .matches("ctx.precommit_response_phase_bound()")
             .count(),
-        8,
+        7,
         "a pre-commitment response phase lost its authorization bound"
     );
     assert!(
@@ -2337,7 +2455,7 @@ fn the_authorization_expired_rejection_future_is_built_out_of_line() {
 #[test]
 fn the_precommit_authorization_terminal_is_applied_out_of_line() {
     for (callee, expected_calls) in [
-        ("apply_precommit_authorization_terminal(", 3),
+        ("apply_precommit_authorization_terminal(", 2),
         ("install_response_authorization_deadline(", 2),
         ("authorization_expired_backend_dispatch(", 7),
     ] {
@@ -2347,7 +2465,10 @@ fn the_precommit_authorization_terminal_is_applied_out_of_line() {
             .next()
             .expect("the out-of-line helper must remain present");
         assert!(
-            before_definition.ends_with("#[inline(never)]\n"),
+            // A visibility modifier may sit between the attribute and `fn`; the
+            // attribute itself is what must stay attached.
+            before_definition.ends_with("#[inline(never)]\n")
+                || before_definition.ends_with("#[inline(never)]\npub(crate) "),
             "{callee} must stay `#[inline(never)]`: inlining it back into the \
              caller restores the frame slots it exists to remove"
         );

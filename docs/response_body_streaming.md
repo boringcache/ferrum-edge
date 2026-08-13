@@ -580,6 +580,35 @@ deadline and the authorization deadline; a downstream that cannot accept the
 HEADERS by expiry is reset rather than waited on again or misreported as
 `DEADLINE_EXCEEDED`.
 
+#### The buffered terminal summary is the gate's own decision
+
+On the buffered H1/H2 path the gate is also the **audit** boundary, because the
+transaction summary and the client-visible response must describe the same
+outcome. The gate runs before the summary is built, so the summary it feeds
+carries the terminal status, the buffered (non-streamed) classification, and the
+bounded `authorization.termination_reason` the gate latched — there is no earlier
+protected summary to retract.
+
+Terminal transaction logging is therefore **not awaited** for a request that
+carries an authorization plan. Awaiting the logging chain would reopen exactly
+the window the gate closed: the credential could expire while one logging plugin
+blocked, after earlier plugins in the chain had already recorded the still
+protected outcome. A later gate can repair the *response*, but nothing can
+retract an audit record that has already been emitted, so the client would see a
+fixed `401` / `grpc-status: 16` while the audit trail claimed the protected
+status. The single summary is instead handed to the same bounded
+observability-delivery cleanup the client-RPC-deadline path already used: every
+applicable logging plugin receives it, in configured order, **exactly once**,
+inside one finite-budget task that counts against
+`FERRUM_LOG_DELIVERY_MAX_TASKS` and is drained at shutdown. Nothing detached
+here is unbounded, and the request task itself awaits nothing between the gate
+and the response it hands to hyper.
+
+A request with **no** authorization plan has no decision to protect and keeps the
+historical sequential, awaited logging contract byte for byte. The predicate is
+the gate's own `effective_request_auth_deadline`, so the two can never disagree
+about which requests those are.
+
 ### Observability
 
 Expiry is classified as a **policy** termination, not a backend fault, so error
@@ -589,8 +618,11 @@ rate alerts stay meaningful:
   wrong), exactly like a client-chosen `grpc-timeout` expiry.
 - The transaction summary carries a bounded
   `authorization.termination_reason` metadata value — `credential_expired` or
-  `authenticated_stream_max_lifetime` — stamped exactly once inside the
-  single-fire deferred logger.
+  `authenticated_stream_max_lifetime` — stamped exactly once: inside the
+  single-fire deferred logger for a streaming response, and by the
+  pre-commitment gate before the summary is built for a buffered one. Either
+  way one summary is delivered for the exchange, and it is the one that
+  describes the response the client actually received.
 - `GET /metrics/runtime` exposes `authorization_lifetime`, a fixed-cardinality
   counter pair whose only label dimension is a closed protocol family (`http`,
   `grpc`, `grpc_web`, `stream_tcp`, `stream_udp`). WebSocket is deliberately

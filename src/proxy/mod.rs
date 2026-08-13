@@ -35106,19 +35106,26 @@ async fn handle_proxy_request_inner(
     // it, and a buffered response collection may itself have ended at the
     // deadline.
     //
-    // This gate runs BEFORE transaction logging and before `body_will_stream`
-    // is computed, so an already-expired credential cannot be logged or
-    // deferred as a protected/streaming response. It is NOT the last check
-    // before head commitment: the buffered path still awaits
-    // `log_with_mirror_before_buffered_response` below, and that wait is
-    // bounded and followed by the commitment gate. Two failures this gate
-    // closes on its own:
+    // This is the AUTHORITATIVE final authorization decision for this request.
+    // It runs BEFORE the transaction summary is built, before `body_will_stream`
+    // is computed, and before any terminal logging, so an already-expired
+    // credential cannot be logged, deferred, or committed as a
+    // protected/streaming response. Nothing after it awaits on a request that
+    // carries an authorization plan (see the buffered terminal arm below), so
+    // there is no window between this decision and the client-visible response.
+    // Three failures it closes:
     //
     // * a PROTECTED response head committed on a credential that expired while
     //   the response phases were running;
     // * a STREAMING head committed and then immediately terminal-errored by the
     //   body adapter, when the fixed pre-commitment terminal — a clean `401`, or
-    //   trailers-only `grpc-status: 16` — was still available.
+    //   trailers-only `grpc-status: 16` — was still available;
+    // * an audit record that disagrees with the client-visible security
+    //   decision. Because the gate latches the bounded termination class into
+    //   `ctx.metadata` and rewrites the status/body HERE, the single terminal
+    //   summary built below from post-gate state carries the terminal status,
+    //   the buffered (non-streamed) classification, and the bounded
+    //   `authorization.termination_reason`.
     //
     // Idempotent: when the earlier gate already replaced the response, the
     // latch is already set and the same fixed terminal is re-selected. An
@@ -35138,6 +35145,15 @@ async fn handle_proxy_request_inner(
         // derivation below must not describe this as a streamed response.
         is_streaming_response = false;
     }
+    // Whether the gate above could ever have fired for this request. The
+    // buffered terminal-log arm below uses this to decide whether it may await
+    // a logging plugin; the predicate is the gate's OWN, so the two can never
+    // disagree about which requests carry an authorization decision to protect.
+    let has_authorization_plan = crate::proxy::auth_lifetime::effective_request_auth_deadline(
+        &ctx,
+        state.env_config.authenticated_stream_max_lifetime_seconds,
+    )
+    .is_some();
 
     let total_ms = start_time.elapsed().as_secs_f64() * 1000.0;
     let plugin_execution_ms = plugin_execution_ns as f64 / 1_000_000.0;
@@ -35299,41 +35315,40 @@ async fn handle_proxy_request_inner(
                     ),
                 )
             } else {
-                // Bound the logging wait by the admitted authorization
-                // deadline. A blocked sink must not carry a still-protected
-                // buffered response past credential expiry (issue #3815).
-                let bound = ctx.precommit_response_phase_bound();
-                match crate::plugins::await_precommit_response_phase(
-                    bound,
+                // ── Buffered commitment / audit boundary (#3815) ─────────────
+                //
+                // The pre-log gate above is the authoritative authorization
+                // decision for this response, and this arm must not reopen a
+                // window after it.
+                //
+                // `summary` was built from POST-GATE state, so it is the one
+                // terminal summary of this exchange: the status the client will
+                // see, the buffered (non-streamed) classification, and — when
+                // the gate fired — the bounded `credential_expired` /
+                // max-lifetime class the gate latched into the metadata.
+                //
+                // An authenticated request therefore does NOT await terminal
+                // logging. Awaiting it would let the credential expire while one
+                // logging plugin blocks, after earlier plugins had already
+                // recorded the still-protected outcome; a later gate could
+                // repair the response, but nothing can retract an audit record
+                // that has already been emitted. Instead the single summary is
+                // handed to the same bounded observability-delivery cleanup the
+                // client-deadline path uses, which delivers it to every
+                // applicable plugin, in configured order, exactly once, inside
+                // one finite-budget task. Nothing is awaited here, so no time
+                // passes between the gate and the client-visible response.
+                //
+                // A request with NO authorization plan cannot expire here, so it
+                // keeps the historical sequential awaited contract byte for
+                // byte.
+                if has_authorization_plan {
+                    crate::plugins::spawn_bounded_terminal_summary_log(&plugins, summary, &ctx);
+                } else {
                     crate::plugins::log_with_mirror_before_buffered_response(
                         &plugins, summary, &ctx,
-                    ),
-                )
-                .await
-                {
-                    crate::plugins::PrecommitPhaseResult::Completed(()) => {}
-                    crate::plugins::PrecommitPhaseResult::Expired(Some(termination)) => {
-                        let family = request_upload_auth_family(&ctx);
-                        ctx.record_authorization_termination_once(termination, family);
-                    }
-                    crate::plugins::PrecommitPhaseResult::Expired(None) => {}
-                }
-                // Authoritative commitment gate. The logging await above is the
-                // last await before the protected response is built; there is
-                // no await between this gate and `resp_builder`. Expiry during
-                // logging wins over protected commitment. The latch is
-                // consulted first, so a timeout-attributed termination is
-                // applied exactly once and is not logged a second time.
-                let commitment_authorization_terminal = apply_precommit_authorization_terminal(
-                    &mut ctx,
-                    state.env_config.authenticated_stream_max_lifetime_seconds,
-                    request_uses_grpc_content_type,
-                    &mut response_status,
-                    &mut response_headers,
-                    &mut response_body,
-                );
-                if commitment_authorization_terminal.is_some() {
-                    is_streaming_response = false;
+                    )
+                    .await;
                 }
                 None
             }
@@ -42895,7 +42910,7 @@ pub(crate) fn authorization_expired_pre_commitment_response(
 /// written back is the same fixed, redacted one
 /// [`authorization_expired_pre_commitment_response`] selects.
 #[inline(never)]
-fn apply_precommit_authorization_terminal(
+pub(crate) fn apply_precommit_authorization_terminal(
     ctx: &mut RequestContext,
     max_lifetime_seconds: u64,
     request_uses_grpc_content_type: bool,

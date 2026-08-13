@@ -7604,6 +7604,63 @@ pub mod _test_support {
         (status, headers, bytes)
     }
 
+    /// Post-gate state the ONE buffered terminal transaction summary is built
+    /// from (issue #3815).
+    pub struct PrecommitAuthorizationGateForTest {
+        /// The bounded termination class, when the gate fired. `None` when the
+        /// request has no authorization plan, or its plan has not elapsed.
+        pub termination: Option<crate::proxy::auth_lifetime::StreamAuthTermination>,
+        /// The status the client will see and the summary will record.
+        pub status: u16,
+        /// The client-visible response headers after the gate.
+        pub headers: HashMap<String, String>,
+        /// The client-visible buffered response body after the gate.
+        pub body: Vec<u8>,
+        /// Exactly what `TransactionSummary::metadata` receives, including the
+        /// bounded `authorization.termination_reason` the gate latched.
+        pub log_metadata: HashMap<String, String>,
+    }
+
+    /// Apply the AUTHORITATIVE pre-commitment authorization gate the buffered
+    /// H1/H2 terminal path runs immediately before it builds its ONE terminal
+    /// transaction summary (issue #3815).
+    ///
+    /// This is the production gate, applied to a caller-owned context, reporting
+    /// the state the summary is then built from. It exists so an external test
+    /// can prove that the summary describes the TERMINAL response — not the
+    /// protected one the backend produced — and that it carries the bounded
+    /// termination class before any logging plugin can observe it.
+    pub fn precommit_authorization_gate_for_test(
+        ctx: &mut crate::plugins::RequestContext,
+        max_lifetime_seconds: u64,
+        request_uses_grpc_content_type: bool,
+        protected_status: u16,
+        protected_body: &[u8],
+    ) -> PrecommitAuthorizationGateForTest {
+        let mut status = protected_status;
+        let mut headers = HashMap::new();
+        let mut body = crate::retry::ResponseBody::buffered(protected_body.to_vec());
+        let termination = crate::proxy::apply_precommit_authorization_terminal(
+            ctx,
+            max_lifetime_seconds,
+            request_uses_grpc_content_type,
+            &mut status,
+            &mut headers,
+            &mut body,
+        );
+        let body = match body {
+            crate::retry::ResponseBody::Buffered(bytes) => bytes.to_vec(),
+            _ => Vec::new(),
+        };
+        PrecommitAuthorizationGateForTest {
+            termination,
+            status,
+            headers,
+            body,
+            log_metadata: crate::proxy::clone_log_metadata(ctx),
+        }
+    }
+
     /// The authorization-lifetime plan and bounded protocol family every H1/H2
     /// streaming request-upload adapter installs (issue #3815), plus the shared
     /// once-only termination latch it records through. `None` for an
