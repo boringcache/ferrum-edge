@@ -664,7 +664,8 @@ impl StockXdsAccumulator {
         // raw value needed for ACK/NACK; the accumulator's copy is only
         // operator-facing observability (config-drift / slice.version), so it
         // stores a closed-set presence marker rather than any CP bytes.
-        self.versions.insert(label, STOCK_RECEIVED_VERSION.to_string());
+        self.versions
+            .insert(label, STOCK_RECEIVED_VERSION.to_string());
         self.refusals.insert(label, refusals);
         Ok(())
     }

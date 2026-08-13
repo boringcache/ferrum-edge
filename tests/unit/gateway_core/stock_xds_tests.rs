@@ -2348,7 +2348,10 @@ async fn stock_logs_omit_echoed_bearer_from_unsolicited_type_url() {
         .await;
     drop(guard);
     let logs = captured_text(&buffer);
-    assert_eq!(admission, StockResponseAdmission::Closed("unsolicited_type_url"));
+    assert_eq!(
+        admission,
+        StockResponseAdmission::Closed("unsolicited_type_url")
+    );
     assert_no_echoed_bearer(&logs);
     assert!(
         logs.contains("unsolicited_type_url"),
