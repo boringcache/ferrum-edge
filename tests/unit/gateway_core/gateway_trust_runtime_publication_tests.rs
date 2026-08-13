@@ -888,11 +888,7 @@ async fn a_pre_commit_ticket_cannot_register_old_trust_as_the_new_generation() {
     );
     state
         .mesh_trust_registry
-        .register(
-            fresh,
-            MeshTransportKind::MeshMtls,
-            MeshTransportGate::new(),
-        )
+        .register(fresh, MeshTransportKind::MeshMtls, MeshTransportGate::new())
         .expect("a ticket for the published generation is admitted");
 }
 

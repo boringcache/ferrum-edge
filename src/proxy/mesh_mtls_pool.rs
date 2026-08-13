@@ -305,9 +305,7 @@ impl MeshMtlsSender {
         &mut self,
         request: http::Request<MeshMtlsRequestBody>,
     ) -> Result<
-        impl std::future::Future<
-            Output = Result<hyper::Response<hyper::body::Incoming>, hyper::Error>,
-        >,
+        impl std::future::Future<Output = Result<hyper::Response<hyper::body::Incoming>, hyper::Error>>,
         HbonePoolError,
     > {
         if self.gate.is_retired() {

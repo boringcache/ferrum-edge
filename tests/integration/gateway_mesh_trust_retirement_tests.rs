@@ -990,14 +990,14 @@ async fn a_cloned_mesh_mtls_sender_refuses_the_next_stream_synchronously_after_g
             "a cloned mesh-mTLS sender must not open a stream after gate retirement \
              while the underlying H2 sender is still open"
         ),
-        Err(other) => panic!(
-            "cloned send after retirement must be TrustWithdrawn, not {other:?}"
-        ),
+        Err(other) => panic!("cloned send after retirement must be TrustWithdrawn, not {other:?}"),
     }
     match sender.send_request(empty_mesh_mtls_request()) {
         Err(HbonePoolError::TrustWithdrawn) => {}
         Ok(_) => panic!("the original checkout must share the clone's gate"),
-        Err(other) => panic!("original send after retirement must be TrustWithdrawn, not {other:?}"),
+        Err(other) => {
+            panic!("original send after retirement must be TrustWithdrawn, not {other:?}")
+        }
     }
 }
 
