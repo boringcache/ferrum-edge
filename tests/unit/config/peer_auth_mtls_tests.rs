@@ -353,3 +353,41 @@ fn empty_selector_labels_is_namespace_scope() {
     let mode = resolve_effective_mtls_mode(&policies, "default", &labels, 8080);
     assert_eq!(mode, MtlsMode::Strict);
 }
+
+/// Namespace-wide STRICT (TCP/HBONE default) plus a selector-scoped
+/// `portLevelMtls` PERMISSIVE overlay on one UDP/DTLS port: that port must
+/// resolve PERMISSIVE so a NodeWaypoint can start a server-only DTLS listener
+/// without a client CA, while other ports stay STRICT.
+#[test]
+fn workload_port_level_permissive_overrides_namespace_strict_on_that_port() {
+    let policies = vec![
+        peer_auth("default", "default", None, MtlsMode::Strict, HashMap::new()),
+        peer_auth(
+            "dtls-echo",
+            "default",
+            Some(WorkloadSelector {
+                labels: HashMap::from([("app".into(), "dtls-echo".into())]),
+                namespace: None,
+            }),
+            MtlsMode::Strict,
+            HashMap::from([(15354, MtlsMode::Permissive)]),
+        ),
+    ];
+    let labels = HashMap::from([("app".to_string(), "dtls-echo".to_string())]);
+    assert_eq!(
+        resolve_effective_mtls_mode(&policies, "default", &labels, 15354),
+        MtlsMode::Permissive,
+        "dtls-echo:15354 must be PERMISSIVE so live DTLS probes need no client CA"
+    );
+    assert_eq!(
+        resolve_effective_mtls_mode(&policies, "default", &labels, 8080),
+        MtlsMode::Strict,
+        "other ports on the same workload keep namespace STRICT"
+    );
+    let other = HashMap::from([("app".to_string(), "udp-echo".to_string())]);
+    assert_eq!(
+        resolve_effective_mtls_mode(&policies, "default", &other, 15354),
+        MtlsMode::Strict,
+        "a workload the overlay does not select stays STRICT on every port"
+    );
+}

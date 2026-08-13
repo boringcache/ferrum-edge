@@ -259,6 +259,28 @@ spec:
   mtls:
     mode: STRICT
 ---
+# Live DTLS probes are server-only (`openssl s_client -dtls1_2` without a
+# client certificate). Namespace-wide STRICT is the TCP/HBONE mTLS default and
+# would otherwise leave the generated dtls-echo listener deferred: STRICT DTLS
+# requires FERRUM_DTLS_CLIENT_CA_CERT_PATH, which this harness does not set.
+# Pin the dtls-echo port to PERMISSIVE so the listener starts without
+# client-cert verification; TCP STRICT and AuthorizationPolicy are unchanged.
+# DTLS frontend mTLS stays unit/integration.
+apiVersion: security.istio.io/v1beta1
+kind: PeerAuthentication
+metadata:
+  name: dtls-echo
+  namespace: __NAMESPACE__
+spec:
+  selector:
+    matchLabels:
+      app: dtls-echo
+  mtls:
+    mode: STRICT
+  portLevelMtls:
+    "__DTLS_LISTENER_PORT__":
+      mode: PERMISSIVE
+---
 apiVersion: security.istio.io/v1beta1
 kind: AuthorizationPolicy
 metadata:

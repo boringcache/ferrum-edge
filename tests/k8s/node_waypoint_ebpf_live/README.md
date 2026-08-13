@@ -207,6 +207,10 @@ Not exercised live, and therefore not claimed: DTLS frontend
 client-certificate (mTLS) verification, IPv6 DTLS (and IPv6 Service steering),
 kube-proxy `ipvs` and `nftables` modes, headless services, and DTLS across a
 PeerAuthentication live-reload swap. Those stay at unit/integration level.
+The live `dtls-echo` Service port is pinned `PERMISSIVE` via a selector-scoped
+`portLevelMtls` overlay so namespace-wide STRICT (TCP/HBONE) cannot demand a
+DTLS client CA the harness does not mount; AuthorizationPolicy allow/deny is
+unchanged.
 
 Each run writes `target/node-waypoint-ebpf-live/live-assertions.json` using the
 shared live-assertion schema from `tests/k8s/lib/live_assertions.sh`. The current

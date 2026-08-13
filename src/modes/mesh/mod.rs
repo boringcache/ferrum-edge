@@ -17672,12 +17672,15 @@ async fn apply_mesh_inbound_tls_reload(
 ///   Divergent modes across one Service's backing workloads escalate to the
 ///   most restrictive (`client-side DestinationRule` > `Strict` > `Permissive`
 ///   > `Disable`) so a stray invalid mode cannot be masked by a valid policy.
-/// * EVERY required candidate is built here, before the slice is accepted. Any
-///   malformed/truncated CA or CRL, verifier build failure, missing material
-///   for a `Strict` route, or invalid client-side mode returns `Err`, which
-///   rejects the WHOLE candidate slice and retains the complete last-good
-///   routing AND DTLS serving generation for both owners. New routes are never
-///   published beside stale DTLS posture.
+/// * EVERY required candidate is built here, before the slice is accepted. A
+///   malformed/truncated CA or CRL, verifier build failure, or invalid
+///   client-side mode returns `Err`, which rejects the WHOLE candidate slice
+///   and retains the complete last-good routing AND DTLS serving generation
+///   for both owners. A `Strict` route with no configured client CA does NOT
+///   reject the slice: that listener is omitted from the published generation
+///   and stays deferred (fail-closed for DTLS) so TCP/UDP routing and workload
+///   convergence still apply. New routes are never published beside stale DTLS
+///   posture.
 ///
 /// Route identity is forward-derived (`node_waypoint_udp_proxy_id`) from the
 /// same Service/port pair `materialize_node_waypoint_udp_listeners` used, so the
@@ -17748,12 +17751,21 @@ fn build_node_waypoint_dtls_owner_configs(
                 config::MtlsMode::Strict => match client_ca {
                     Some(path) => Some(path),
                     None => {
-                        return Err(format!(
-                            "generated NodeWaypoint DTLS listener on port {} resolves to STRICT \
+                        // STRICT without a client CA cannot be served, but it
+                        // must not take down the node's entire mesh slice —
+                        // TCP capture, UDP listeners, and workload convergence
+                        // are unrelated to DTLS mTLS material. Omit this
+                        // listener from the published generation so it stays
+                        // deferred (fail-closed for DTLS) while the rest of
+                        // the candidate still applies.
+                        warn!(
+                            listen_port = service_port.port,
+                            "Skipping generated NodeWaypoint DTLS listener: it resolves to STRICT \
                              PeerAuthentication but no client CA bundle is configured \
-                             (FERRUM_DTLS_CLIENT_CA_CERT_PATH)",
-                            service_port.port
-                        ));
+                             (FERRUM_DTLS_CLIENT_CA_CERT_PATH). The rest of this mesh slice still \
+                             applies; this listener stays deferred"
+                        );
+                        continue;
                     }
                 },
                 // PERMISSIVE and DISABLE do not require a client certificate.
@@ -18165,12 +18177,15 @@ async fn apply_mesh_slice_generation(
             // Owner-scoped DTLS candidates for every generated NodeWaypoint
             // `dtls` listener on THIS candidate (issue #3858). Built and fully
             // validated BEFORE `update_mesh_config`, so a malformed/truncated
-            // client CA or CRL, a failed verifier build, a STRICT route with
-            // no client CA, or a client-side DestinationRule mTLS mode rejects
-            // the COMPLETE candidate slice and retains the complete last-good
-            // routing AND DTLS serving generation for both ownership classes.
-            // New routes are never published beside stale DTLS posture, and
-            // ordinary operator listeners are never consulted or mutated.
+            // client CA or CRL, a failed verifier build, or a client-side
+            // DestinationRule mTLS mode rejects the COMPLETE candidate slice
+            // and retains the complete last-good routing AND DTLS serving
+            // generation for both ownership classes. A STRICT route with no
+            // client CA omits that listener from the published generation
+            // (deferred, fail-closed for DTLS) rather than rejecting TCP/UDP
+            // routing. New routes are never published beside stale DTLS
+            // posture, and ordinary operator listeners are never consulted or
+            // mutated.
             let node_waypoint_dtls_configs = match build_node_waypoint_dtls_owner_configs(
                 proxy_state,
                 runtime,
