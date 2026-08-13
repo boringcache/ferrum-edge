@@ -1,0 +1,170 @@
+diff --git a/h3/src/connection.rs b/h3/src/connection.rs
+index c90eb0fcc..a593d084d 100644
+--- a/h3/src/connection.rs
++++ b/h3/src/connection.rs
+@@ -1,6 +1,7 @@
+ use std::{
+     convert::TryFrom,
++    future::Future,
+     marker::PhantomData,
+     sync::Arc,
+     task::{Context, Poll},
+ };
+@@ -837,6 +838,17 @@ impl<S, B> RequestStream<S, B> {
+     }
+ }
+ 
++impl<S, B> crate::quic::SendStreamStopped for RequestStream<S, B>
++where
++    S: crate::quic::SendStreamStopped,
++{
++    fn stopped(
++        &self,
++    ) -> impl Future<Output = Result<Option<u64>, StreamErrorIncoming>> + Send + 'static {
++        self.stream.stopped()
++    }
++}
++
+ impl<S, B> ConnectionState for RequestStream<S, B> {
+     fn shared_state(&self) -> &SharedState {
+         &self.conn_state
+diff --git a/h3/src/frame.rs b/h3/src/frame.rs
+index 107e98abb..bb86f25a8 100644
+--- a/h3/src/frame.rs
++++ b/h3/src/frame.rs
+@@ -1,3 +1,4 @@
++use std::future::Future;
+ use std::task::{Context, Poll};
+ 
+ use bytes::Buf;
+@@ -43,6 +44,17 @@ impl<S, B> FrameStream<S, B> {
+     }
+ }
+ 
++impl<S, B> crate::quic::SendStreamStopped for FrameStream<S, B>
++where
++    S: crate::quic::SendStreamStopped,
++{
++    fn stopped(
++        &self,
++    ) -> impl Future<Output = Result<Option<u64>, StreamErrorIncoming>> + Send + 'static {
++        self.stream.stopped()
++    }
++}
++
+ impl<S, B> FrameStream<S, B>
+ where
+     S: RecvStream,
+diff --git a/h3/src/quic.rs b/h3/src/quic.rs
+index f8e57035a..6447fe047 100644
+--- a/h3/src/quic.rs
++++ b/h3/src/quic.rs
+@@ -4,6 +4,7 @@
+ //! QUIC implementation.
+ 
+ use std::fmt::{Debug, Display};
++use std::future::Future;
+ use std::sync::Arc;
+ use std::task::{self, Poll};
+ 
+@@ -185,6 +186,30 @@ pub trait SendStream<B: Buf> {
+     fn send_id(&self) -> StreamId;
+ }
+ 
++/// Observe peer `STOP_SENDING` on the send half without exclusive send-stream
++/// access.
++///
++/// Quinn's `SendStream::stopped` is `&self` and returns a `'static` future, so a
++/// server can race that signal against a backend wait while the same send half
++/// remains available for a later response write. Implementations must not take
++/// `&mut self` on the send stream: that would conflict with a concurrent
++/// receive-half poll on an unsplit bidi stream.
++///
++/// The returned future is statically dispatched and `'static`: it must not
++/// borrow the send stream and must not box a trait object per call. Return-
++/// position `impl Future` is used so this stays on stable Rust.
++pub trait SendStreamStopped {
++    /// Completes when the peer stops this send stream or the connection is lost.
++    ///
++    /// `Ok(Some(code))` is a peer `STOP_SENDING`. `Ok(None)` means the local
++    /// side already finished and the peer acknowledged the stream, after which
++    /// `STOP_SENDING` is no longer meaningful. `Err` is a connection-level
++    /// failure.
++    fn stopped(
++        &self,
++    ) -> impl Future<Output = Result<Option<u64>, StreamErrorIncoming>> + Send + 'static;
++}
++
+ /// Allows sending unframed pure bytes to a stream. Similar to [`AsyncWrite`](https://docs.rs/tokio/latest/tokio/io/trait.AsyncWrite.html)
+ pub trait SendStreamUnframed<B: Buf>: SendStream<B> {
+     /// Attempts to write data into the stream.
+diff --git a/h3/src/server/stream.rs b/h3/src/server/stream.rs
+index d0b3b38cb..ab59b650c 100644
+--- a/h3/src/server/stream.rs
++++ b/h3/src/server/stream.rs
+@@ -8,5 +8,5 @@
+         StreamError,
+     },
+-    quic::{self},
++    quic::{self, StreamErrorIncoming},
+     shared_state::{ConnectionState, SharedState},
+ };
+@@ -17,5 +17,6 @@
+ use std::{
++    future::Future,
+     option::Option,
+     result::Result,
+     task::{Context, Poll},
+ };
+@@ -115,6 +116,22 @@ where
+     }
+ }
+ 
++impl<S, B> crate::quic::SendStreamStopped for RequestStream<S, B>
++where
++    S: crate::quic::SendStreamStopped,
++{
++    /// Observe peer `STOP_SENDING` on the response (send) direction.
++    ///
++    /// The future is `'static` and does not borrow this stream, so a server can
++    /// race it against a backend wait while still using the receive half or a
++    /// later response write on the same send half.
++    fn stopped(
++        &self,
++    ) -> impl Future<Output = Result<Option<u64>, StreamErrorIncoming>> + Send + 'static {
++        crate::quic::SendStreamStopped::stopped(&self.inner)
++    }
++}
++
+ impl<S, B> RequestStream<S, B>
+ where
+     S: quic::SendStream<B>,
+diff --git a/h3/src/stream.rs b/h3/src/stream.rs
+index fc9cea58f..86e68087d 100644
+--- a/h3/src/stream.rs
++++ b/h3/src/stream.rs
+@@ -1,5 +1,6 @@
+ use std::{
++    future::Future,
+     marker::PhantomData,
+     pin::Pin,
+     task::{Context, Poll},
+ };
+@@ -543,6 +544,17 @@ where
+     }
+ }
+ 
++impl<S, B> crate::quic::SendStreamStopped for BufRecvStream<S, B>
++where
++    S: crate::quic::SendStreamStopped,
++{
++    fn stopped(
++        &self,
++    ) -> impl Future<Output = Result<Option<u64>, StreamErrorIncoming>> + Send + 'static {
++        self.stream.stopped()
++    }
++}
++
+ impl<S, B> SendStreamUnframed<B> for BufRecvStream<S, B>
+ where
+     B: Buf,

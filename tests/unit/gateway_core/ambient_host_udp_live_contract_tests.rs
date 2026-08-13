@@ -115,6 +115,28 @@ fn ambient_host_udp_live_workflow_is_unconditional_with_a_trusted_base_relevance
         ),
         "the trusted cross-policy verifier must freeze the Ambient host-UDP relevance contract"
     );
+    for complete_contract in [
+        "AMBIENT_HOST_UDP_LIVE_JOB",
+        "AMBIENT_HOST_UDP_IMAGE_JOB",
+        "AMBIENT_HOST_UDP_GATE_JOB",
+        "AMBIENT_HOST_UDP_TOP_LEVEL_PERMISSIONS",
+        "AMBIENT_HOST_UDP_FORBIDDEN_INHERITED_KEYS",
+    ] {
+        assert!(
+            cross_policy.contains(complete_contract),
+            "the trusted verifier must carry the closed execution contract \
+             `{complete_contract}`"
+        );
+    }
+    assert!(
+        cross_policy.contains("required_check_name_ownership_errors")
+            && cross_policy.contains(
+                "AMBIENT_HOST_UDP_REQUIRED_CHECK_OWNER = \
+                 (\"ambient-host-udp-live.yml\", \"gate\")"
+            ),
+        "the complete workflow collection must have exactly one parsed direct \
+         job owner for the Ambient Host UDP Live required-check name"
+    );
 }
 
 /// The required-CI verifier must pin the workflow's unconditional event

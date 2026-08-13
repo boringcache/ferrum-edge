@@ -537,6 +537,7 @@ fn destination_rule_top_level_connection_pool_http_projects_inherited_fields() {
                         max_requests_per_connection: Some(75),
                         idle_timeout_ms: Some(45_000),
                         http2_max_requests: Some(250),
+                        max_concurrent_streams: None,
                         h2_upgrade_policy: Some(
                             ferrum_edge::config::types::H2UpgradePolicy::DoNotUpgrade,
                         ),
@@ -563,7 +564,7 @@ fn destination_rule_top_level_connection_pool_http_projects_inherited_fields() {
                 .get(&8080)
                 .is_some_and(|o| {
                     o.http_idle_timeout_ms.is_none()
-                        && o.h2_max_concurrent_streams.is_none()
+                        && o.http2_max_requests.is_none()
                         && o.h2_upgrade_policy.is_none()
                         && o.max_retries.is_none()
                         && o.http1_max_pending_requests.is_none()
@@ -580,7 +581,7 @@ fn destination_rule_top_level_connection_pool_http_projects_inherited_fields() {
         "maxRequestsPerConnection is deferred and must not project into the fallback"
     );
     assert_eq!(inherited.http_idle_timeout_ms, Some(45_000));
-    assert_eq!(inherited.h2_max_concurrent_streams, Some(250));
+    assert_eq!(inherited.http2_max_requests, Some(250));
     assert_eq!(
         inherited.h2_upgrade_policy,
         Some(ferrum_edge::config::types::H2UpgradePolicy::DoNotUpgrade)
@@ -651,7 +652,7 @@ fn destination_rule_top_level_connection_pool_http_on_sd_upstream_goes_to_fallba
         .as_ref()
         .expect("SD top-level connectionPool.http must populate the fallback overlay");
     assert_eq!(fallback.http_idle_timeout_ms, Some(45_000));
-    assert_eq!(fallback.h2_max_concurrent_streams, Some(250));
+    assert_eq!(fallback.http2_max_requests, Some(250));
     assert_eq!(fallback.max_retries, Some(2));
     assert!(
         prepared.upstreams[0].port_overrides.is_empty(),
@@ -666,7 +667,7 @@ fn destination_rule_top_level_connection_pool_http_on_sd_upstream_goes_to_fallba
         .as_ref()
         .expect("SD fallback must project onto the referencing proxy");
     assert_eq!(proxy_fallback.http_idle_timeout_ms, Some(45_000));
-    assert_eq!(proxy_fallback.h2_max_concurrent_streams, Some(250));
+    assert_eq!(proxy_fallback.http2_max_requests, Some(250));
     assert_eq!(proxy_fallback.max_retries, Some(2));
 }
 
@@ -801,6 +802,7 @@ fn destination_rule_port_level_connection_pool_http_overrides_top_level_fan_out(
                         max_requests_per_connection: Some(75),
                         idle_timeout_ms: Some(45_000),
                         http2_max_requests: Some(250),
+                        max_concurrent_streams: None,
                         h2_upgrade_policy: None,
                         max_retries: None,
                         http1_max_pending_requests: None,
@@ -823,7 +825,7 @@ fn destination_rule_port_level_connection_pool_http_overrides_top_level_fan_out(
         .get(&8080)
         .expect("per-port overlay present");
     // Per-port wins for the field it sets:
-    assert_eq!(port_override.h2_max_concurrent_streams, Some(999));
+    assert_eq!(port_override.http2_max_requests, Some(999));
     // Supported fields not respecified by per-port stay on the fallback, not
     // the port override slot; maxRequestsPerConnection is deferred.
     assert!(
@@ -839,7 +841,7 @@ fn destination_rule_port_level_connection_pool_http_overrides_top_level_fan_out(
         .as_ref()
         .expect("top-level HTTP fields project as a fallback");
     assert_eq!(fallback.http_idle_timeout_ms, Some(45_000));
-    assert_eq!(fallback.h2_max_concurrent_streams, Some(250));
+    assert_eq!(fallback.http2_max_requests, Some(250));
 }
 
 #[test]
@@ -857,6 +859,7 @@ fn destination_rule_connection_pool_http_only_per_port_no_fan_out() {
                 max_requests_per_connection: Some(10),
                 idle_timeout_ms: Some(30_000),
                 http2_max_requests: Some(20),
+                max_concurrent_streams: None,
                 h2_upgrade_policy: None,
                 max_retries: None,
                 http1_max_pending_requests: None,
@@ -893,7 +896,7 @@ fn destination_rule_connection_pool_http_only_per_port_no_fan_out() {
         "unsupported maxRequestsPerConnection must not project at port level"
     );
     assert_eq!(port_override.http_idle_timeout_ms, Some(30_000));
-    assert_eq!(port_override.h2_max_concurrent_streams, Some(20));
+    assert_eq!(port_override.http2_max_requests, Some(20));
 
     // Phantom-port guard: 9090 isn't on any target, so it must NOT receive
     // the per-port overlay either (would be a phantom-port skip with warn).
@@ -1086,7 +1089,7 @@ fn destination_rule_combined_subset_http_policy_precedence_no_leakage_and_remova
     assert_eq!(stable.max_retries, Some(2));
     assert_eq!(stable.http1_max_pending_requests, Some(1));
     assert_eq!(stable.http_idle_timeout_ms, Some(45_000));
-    assert_eq!(stable.h2_max_concurrent_streams, Some(10));
+    assert_eq!(stable.http2_max_requests, Some(10));
 
     let canary = inherited(&initial, "reviews-canary");
     assert_eq!(canary.h2_upgrade_policy, Some(H2UpgradePolicy::Upgrade));
@@ -1097,14 +1100,14 @@ fn destination_rule_combined_subset_http_policy_precedence_no_leakage_and_remova
         Some(60_000),
         "partial canary overlay inherits top-level idleTimeout"
     );
-    assert_eq!(canary.h2_max_concurrent_streams, Some(40));
+    assert_eq!(canary.http2_max_requests, Some(40));
 
     let unmatched = inherited(&initial, "reviews-unmatched");
     assert_eq!(unmatched.h2_upgrade_policy, Some(H2UpgradePolicy::Upgrade));
     assert_eq!(unmatched.max_retries, Some(9));
     assert_eq!(unmatched.http1_max_pending_requests, Some(90));
     assert_eq!(unmatched.http_idle_timeout_ms, Some(60_000));
-    assert_eq!(unmatched.h2_max_concurrent_streams, Some(200));
+    assert_eq!(unmatched.http2_max_requests, Some(200));
 
     for proxy in &initial.proxies {
         let port = proxy
@@ -1123,7 +1126,7 @@ fn destination_rule_combined_subset_http_policy_precedence_no_leakage_and_remova
             "explicit port-level idleTimeout wins over subset and top-level"
         );
         assert!(
-            port.h2_max_concurrent_streams.is_none(),
+            port.http2_max_requests.is_none(),
             "unrelated port-level idleTimeout must not erase subset/top http2MaxRequests"
         );
     }
@@ -1149,7 +1152,7 @@ fn destination_rule_combined_subset_http_policy_precedence_no_leakage_and_remova
     assert_eq!(updated_stable.max_retries, Some(0));
     assert_eq!(updated_stable.http1_max_pending_requests, Some(6));
     assert_eq!(updated_stable.http_idle_timeout_ms, Some(12_000));
-    assert_eq!(updated_stable.h2_max_concurrent_streams, Some(8));
+    assert_eq!(updated_stable.http2_max_requests, Some(8));
     assert_eq!(stable.max_retries, Some(2), "old snapshot stays coherent");
     assert_eq!(
         stable.http_idle_timeout_ms,
@@ -1164,7 +1167,7 @@ fn destination_rule_combined_subset_http_policy_precedence_no_leakage_and_remova
         assert_eq!(fallback.max_retries, Some(9));
         assert_eq!(fallback.http1_max_pending_requests, Some(90));
         assert_eq!(fallback.http_idle_timeout_ms, Some(60_000));
-        assert_eq!(fallback.h2_max_concurrent_streams, Some(200));
+        assert_eq!(fallback.http2_max_requests, Some(200));
     }
 }
 
@@ -2635,5 +2638,238 @@ fn virtual_service_cors_policy_wildcard_padding_and_predicate_scoping() {
             .map(|mesh| mesh.virtual_service_cors_policies.is_empty())
             .unwrap_or(true),
         "a header-scoped corsPolicy must not be promoted host-wide"
+    );
+}
+
+// ── issue #3775: http2MaxRequests is the destination ACTIVE-REQUEST budget ──
+//
+// Istio's `connectionPool.http.http2MaxRequests` is "the maximum number of
+// active requests to a destination, applicable to both HTTP1.1 and HTTP2", while
+// the neighbouring `maxConcurrentStreams` is the per-HTTP/2-connection stream
+// control. The two must land on DIFFERENT slots: one on the destination-wide
+// admission budget, the other on the H2 transport builder. Projecting the
+// request budget onto the transport knob is the defect #3775 filed — an
+// operator would see the field accepted while ordinary HTTP/1.1 traffic and
+// every extra connection bypassed the ceiling.
+
+#[test]
+fn destination_rule_http2_max_requests_and_max_concurrent_streams_project_to_distinct_slots() {
+    let translated = translate_k8s_objects(
+        &[k8s_object(
+            "DestinationRule",
+            "reviews-dr",
+            serde_json::json!({
+                "host": "reviews.default.svc.cluster.local",
+                "trafficPolicy": {
+                    "connectionPool": {"http": {
+                        "http2MaxRequests": 32,
+                        "maxConcurrentStreams": 128
+                    }}
+                }
+            }),
+        )],
+        k8s_options(),
+    )
+    .expect("DestinationRule translates");
+
+    let http = translated
+        .config
+        .mesh
+        .as_ref()
+        .expect("mesh block")
+        .destination_rules
+        .first()
+        .expect("destination rule")
+        .traffic_policy
+        .as_ref()
+        .expect("traffic policy")
+        .connection_pool_http
+        .as_ref()
+        .expect("http overlay");
+    assert_eq!(
+        http.http2_max_requests,
+        Some(32),
+        "http2MaxRequests must carry the destination active-request budget"
+    );
+    assert_eq!(
+        http.max_concurrent_streams,
+        Some(128),
+        "maxConcurrentStreams must carry the per-connection stream limit"
+    );
+}
+
+#[test]
+fn destination_rule_http2_max_requests_does_not_program_the_h2_stream_knob() {
+    use ferrum_edge::modes::mesh::config::MeshConnectionPoolHttp;
+
+    let mut config = GatewayConfig {
+        proxies: vec![proxy()],
+        upstreams: vec![upstream()],
+        mesh: Some(Box::new(MeshConfig {
+            destination_rules: vec![MeshDestinationRule {
+                name: "reviews-dr".to_string(),
+                namespace: "default".to_string(),
+                host: "reviews.default.svc.cluster.local".to_string(),
+                traffic_policy: Some(MeshTrafficPolicy {
+                    connection_pool_http: Some(MeshConnectionPoolHttp {
+                        http2_max_requests: Some(32),
+                        ..MeshConnectionPoolHttp::default()
+                    }),
+                    ..MeshTrafficPolicy::default()
+                }),
+                port_level_settings: HashMap::new(),
+                subsets: Vec::new(),
+                export_to: vec!["*".to_string()],
+            }],
+            ..MeshConfig::default()
+        })),
+        ..GatewayConfig::default()
+    };
+    config.normalize_fields();
+
+    let prepared = prepare_gateway_config_for_mesh(config, &runtime()).expect("mesh config");
+    let inherited = prepared.proxies[0]
+        .dispatch_port_override_fallback
+        .as_ref()
+        .expect("top-level HTTP fields project as a fallback");
+    assert_eq!(inherited.http2_max_requests, Some(32));
+    assert_eq!(
+        inherited.h2_max_concurrent_streams, None,
+        "http2MaxRequests must NOT be projected as an HTTP/2 per-connection stream cap: a \
+         SETTINGS value is per connection, is replaceable by the peer, and does not apply to \
+         HTTP/1.1 at all (issue #3775)"
+    );
+}
+
+#[test]
+fn destination_rule_max_concurrent_streams_projects_only_to_the_transport_knob() {
+    use ferrum_edge::modes::mesh::config::MeshConnectionPoolHttp;
+
+    let mut port_level_settings = HashMap::new();
+    port_level_settings.insert(
+        8080,
+        MeshTrafficPolicy {
+            connection_pool_http: Some(MeshConnectionPoolHttp {
+                max_concurrent_streams: Some(64),
+                ..MeshConnectionPoolHttp::default()
+            }),
+            ..MeshTrafficPolicy::default()
+        },
+    );
+    let mut config = GatewayConfig {
+        proxies: vec![proxy()],
+        upstreams: vec![upstream()],
+        mesh: Some(Box::new(MeshConfig {
+            destination_rules: vec![MeshDestinationRule {
+                name: "reviews-dr".to_string(),
+                namespace: "default".to_string(),
+                host: "reviews.default.svc.cluster.local".to_string(),
+                traffic_policy: None,
+                port_level_settings,
+                subsets: Vec::new(),
+                export_to: vec!["*".to_string()],
+            }],
+            ..MeshConfig::default()
+        })),
+        ..GatewayConfig::default()
+    };
+    config.normalize_fields();
+
+    let prepared = prepare_gateway_config_for_mesh(config, &runtime()).expect("mesh config");
+    let port_override = prepared.upstreams[0]
+        .port_overrides
+        .get(&8080)
+        .expect("port 8080 override");
+    assert_eq!(port_override.h2_max_concurrent_streams, Some(64));
+    assert_eq!(
+        port_override.http2_max_requests, None,
+        "maxConcurrentStreams must not consume the destination request budget"
+    );
+}
+
+#[test]
+fn destination_rule_http2_max_requests_precedence_is_port_over_subset_over_top_level() {
+    use ferrum_edge::modes::mesh::config::{MeshConnectionPoolHttp, MeshSubset};
+
+    let mut port_level_settings = HashMap::new();
+    port_level_settings.insert(
+        8080,
+        MeshTrafficPolicy {
+            connection_pool_http: Some(MeshConnectionPoolHttp {
+                http2_max_requests: Some(3),
+                ..MeshConnectionPoolHttp::default()
+            }),
+            ..MeshTrafficPolicy::default()
+        },
+    );
+    let mut stable = proxy();
+    stable.id = "reviews-stable".to_string();
+    stable.upstream_subset = Some("stable".to_string());
+    let mut unmatched = proxy();
+    unmatched.id = "reviews-unmatched".to_string();
+
+    let mut config = GatewayConfig {
+        proxies: vec![stable, unmatched],
+        upstreams: vec![upstream()],
+        mesh: Some(Box::new(MeshConfig {
+            destination_rules: vec![MeshDestinationRule {
+                name: "reviews-dr".to_string(),
+                namespace: "default".to_string(),
+                host: "reviews.default.svc.cluster.local".to_string(),
+                traffic_policy: Some(MeshTrafficPolicy {
+                    connection_pool_http: Some(MeshConnectionPoolHttp {
+                        http2_max_requests: Some(100),
+                        ..MeshConnectionPoolHttp::default()
+                    }),
+                    ..MeshTrafficPolicy::default()
+                }),
+                port_level_settings,
+                subsets: vec![MeshSubset {
+                    name: "stable".to_string(),
+                    labels: HashMap::from([("version".to_string(), "stable".to_string())]),
+                    traffic_policy: Some(MeshTrafficPolicy {
+                        connection_pool_http: Some(MeshConnectionPoolHttp {
+                            http2_max_requests: Some(7),
+                            ..MeshConnectionPoolHttp::default()
+                        }),
+                        ..MeshTrafficPolicy::default()
+                    }),
+                }],
+                export_to: vec!["*".to_string()],
+            }],
+            ..MeshConfig::default()
+        })),
+        ..GatewayConfig::default()
+    };
+    config.normalize_fields();
+
+    let prepared = prepare_gateway_config_for_mesh(config, &runtime()).expect("mesh config");
+    let fallback_for = |id: &str| {
+        prepared
+            .proxies
+            .iter()
+            .find(|proxy| proxy.id == id)
+            .and_then(|proxy| proxy.dispatch_port_override_fallback.as_ref())
+            .expect("inherited HTTP policy")
+            .http2_max_requests
+    };
+    assert_eq!(
+        fallback_for("reviews-stable"),
+        Some(7),
+        "the selected subset's budget must overlay the top-level one"
+    );
+    assert_eq!(
+        fallback_for("reviews-unmatched"),
+        Some(100),
+        "an unmatched destination keeps the top-level budget"
+    );
+    assert_eq!(
+        prepared.upstreams[0]
+            .port_overrides
+            .get(&8080)
+            .expect("port 8080 override")
+            .http2_max_requests,
+        Some(3),
+        "an explicit portLevelSettings budget wins for that destination port"
     );
 }

@@ -1255,6 +1255,7 @@ fn test_upstream_mesh_projected_subset_fields_rejected_by_admin_api() {
             max_retries: Some(2),
             http1_max_pending_requests: Some(8),
             http_idle_timeout_ms: Some(30_000),
+            http2_max_requests: Some(16),
             h2_max_concurrent_streams: Some(64),
             passive_health_check: Some(PassiveHealthCheck::default()),
         }),
@@ -1270,6 +1271,7 @@ fn test_upstream_mesh_projected_subset_fields_rejected_by_admin_api() {
         "max_retries",
         "http1_max_pending_requests",
         "http_idle_timeout_ms",
+        "http2_max_requests",
         "h2_max_concurrent_streams",
         "passive_health_check",
     ] {

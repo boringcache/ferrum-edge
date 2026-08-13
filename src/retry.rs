@@ -657,6 +657,19 @@ pub const WS_UNIX_H2C_EXTENDED_CONNECT_UNSUPPORTED: &str = "WebSocket backend di
 pub const WS_UNIX_SOCKET_INADMISSIBLE: &str =
     "WebSocket backend dial refused: unix-socket ingress target failed data-plane admission";
 
+/// Pre-dial refusal for a Unix WebSocket upgrade whose target-effective backend
+/// URL has no safe URI authority.
+///
+/// A Unix socket has no network authority of its own; the parse-only upgrade URI
+/// and the default Host header are derived from that backend URL. A malformed,
+/// authority-less, or unsafe URL must not be rewritten to a substitute local
+/// virtual host (which could select a different local application). Gateway-side
+/// and pre-dial — no admission, no socket, no upgrade byte — so it classifies as
+/// `DispatchPolicyRejected`: non-retryable and neutral to backend health. The
+/// backend URL, socket path, and client Host are never echoed.
+pub const WS_UNIX_BACKEND_AUTHORITY_INVALID: &str =
+    "WebSocket backend dial refused: unix-socket backend URL has no safe authority";
+
 /// Tightened substring fallback for boxed/reqwest errors when the typed
 /// walk is exhausted.
 ///
@@ -689,13 +702,15 @@ fn classify_substring_fallback(error_str: &str, debug_str: &str) -> Option<Error
         return Some(ErrorClass::DispatchPolicyRejected);
     }
     // Gateway-side refusal of a WebSocket upgrade to a Unix ingress socket that
-    // is either h2c-declared (Extended CONNECT unimplemented) or inadmissible
-    // (issue #3732). No dial happened and no upgrade byte was written, so this
-    // is the same non-retryable, backend-health-neutral dispatch class as the
-    // two refusals above — and never a connect/protocol failure attributable to
-    // the application.
+    // is h2c-declared (Extended CONNECT unimplemented), inadmissible (issue
+    // #3732), or whose target-effective backend URL has no safe authority. No
+    // dial happened and no upgrade byte was written, so this is the same
+    // non-retryable, backend-health-neutral dispatch class as the two refusals
+    // above — and never a connect/protocol failure attributable to the
+    // application.
     if error_str.contains(WS_UNIX_H2C_EXTENDED_CONNECT_UNSUPPORTED)
         || error_str.contains(WS_UNIX_SOCKET_INADMISSIBLE)
+        || error_str.contains(WS_UNIX_BACKEND_AUTHORITY_INVALID)
     {
         return Some(ErrorClass::DispatchPolicyRejected);
     }

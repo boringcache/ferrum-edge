@@ -51,6 +51,7 @@ adding, removing, or materially changing a workflow.
 | `fuzz.yml` | Fuzz | Weekly schedule, manual | Sanitizer-backed libFuzzer lane for hostile parser targets; see [fuzz.md](fuzz.md). |
 | `scaling-regression.yml` | Scheduled Scaling Regression | Weekly schedule, manual | Runs the 30k proxy scale and 10k proxy load-stress tests excluded from PR CI. |
 | `protocol-perf-regression.yml` | Protocol Performance Regression | Weekly schedule, manual | Scheduled multi-protocol throughput/latency regression with churn, soak, resource plateaus, reload-under-load, versioned alert-only budgets, and machine-readable trends. Not a required PR check; see [protocol_perf_regression.md](protocol_perf_regression.md). |
+| `mesh-performance-baselines.yml` | Mesh Performance Baselines | Manual (`workflow_dispatch`) and reusable (`workflow_call`) | Provenance-complete collection of mesh Criterion + HBONE/DNS E2E baseline artifacts for [#3332](https://github.com/ferrum-edge/ferrum-edge/issues/3332) on pinned `ubuntu-24.04`. Uploads `mesh-performance-baselines-<sha>`; fails selected-suite acceptance when gates are false (artifacts still upload); does not invent `baseline.md` numbers. |
 | `claude-review.yml` | Claude PR Review | `@claude review` issue comment on PRs | Maintainer-triggered AI review comments. |
 | `cleanup-pending-reviews.yml` | Cleanup Pending Deployment Reviews | Schedule, manual | Clears stale pending deployment review state. |
 | `prune-stale-prs.yml` | Prune Stale PRs and Branches | Schedule, manual | Repository hygiene for stale PRs/branches. |
@@ -137,6 +138,15 @@ the required check fails closed or runs fully.
 
 Concurrency groups include the event name and a PR number or merge-group head
 SHA so a merge-group run cannot cancel an unrelated PR (or another group).
+
+Required-check ownership validation accepts one fail-closed workflow layout:
+the root jobs mapping is spelled as a literal block `jobs:`, job IDs are plain
+mapping keys indented by two spaces, and direct job fields are mapping keys
+indented by four spaces. Flow-form root/job mappings, explicit mapping keys,
+alternate job indentation, and mapping indirection are rejected across the
+complete workflow collection. Quoted, escaped, expression, and block-scalar
+values remain supported inside a canonical direct `name` field; alias and tag
+values are conservatively treated as possible owners.
 
 **`merge_group` runs execute candidate workflow YAML.** GitHub loads workflow
 files for a `merge_group` event from the synthesized queue commit, so unlike

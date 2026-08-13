@@ -410,6 +410,30 @@ pub fn strip_egress_baggage_in_map(
     if key_prefixes.is_empty() {
         return;
     }
+    apply_baggage_filter_in_map(headers, |raw| filter_baggage_header(raw, key_prefixes));
+}
+
+/// Map-shaped sibling of [`strip_egress_baggage_in_map`] that also applies a
+/// static `&str` prefix set in the same filtering pass. Reserved identity
+/// prefixes stay as `&'static str` slices; callers must not clone them into
+/// a `Vec<String>` just to reuse the configured-prefix helper.
+pub fn strip_egress_baggage_in_map_with_static_prefixes(
+    headers: &mut std::collections::HashMap<String, String>,
+    configured_prefixes: &[String],
+    static_prefixes: &[&str],
+) {
+    if configured_prefixes.is_empty() && static_prefixes.is_empty() {
+        return;
+    }
+    apply_baggage_filter_in_map(headers, |raw| {
+        filter_baggage_header_with_static_prefixes(raw, configured_prefixes, static_prefixes)
+    });
+}
+
+fn apply_baggage_filter_in_map(
+    headers: &mut std::collections::HashMap<String, String>,
+    filter: impl Fn(&str) -> Option<String>,
+) {
     let Some(key) = baggage_header_key_in_map(headers) else {
         return;
     };
@@ -417,7 +441,7 @@ pub fn strip_egress_baggage_in_map(
         return;
     };
     let raw_owned = raw.clone();
-    match filter_baggage_header(&raw_owned, key_prefixes) {
+    match filter(&raw_owned) {
         Some(filtered) if filtered != raw_owned => {
             headers.insert(key, filtered);
         }
@@ -497,7 +521,19 @@ pub fn strip_egress_baggage_in_vec(headers: &mut Vec<(String, String)>, key_pref
 /// grammar (RFC 7230) which is also case-sensitive in baggage.
 ///
 pub fn filter_baggage_header(raw: &str, key_prefixes: &[String]) -> Option<String> {
-    if key_prefixes.is_empty() {
+    filter_baggage_header_with_static_prefixes(raw, key_prefixes, &[])
+}
+
+/// Filter a W3C `baggage` header using configured prefixes plus a static
+/// `&str` prefix set in one pass. Used by secured-mesh inner-request hygiene
+/// so reserved identity prefixes do not have to be cloned into a `Vec<String>`
+/// on the proxy hot path.
+pub fn filter_baggage_header_with_static_prefixes(
+    raw: &str,
+    configured_prefixes: &[String],
+    static_prefixes: &[&str],
+) -> Option<String> {
+    if configured_prefixes.is_empty() && static_prefixes.is_empty() {
         return Some(raw.to_string());
     }
     let mut survivors: Vec<&str> = Vec::new();
@@ -515,7 +551,13 @@ pub fn filter_baggage_header(raw: &str, key_prefixes: &[String]) -> Option<Strin
                 continue;
             }
         };
-        if key_prefixes.iter().any(|prefix| key.starts_with(prefix)) {
+        if configured_prefixes
+            .iter()
+            .any(|prefix| key.starts_with(prefix.as_str()))
+            || static_prefixes
+                .iter()
+                .any(|prefix| key.starts_with(*prefix))
+        {
             continue;
         }
         survivors.push(trimmed);

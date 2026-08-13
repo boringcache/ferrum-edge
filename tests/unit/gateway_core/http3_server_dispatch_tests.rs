@@ -2436,6 +2436,167 @@ fn h3_stamps_a_connection_close_watch_so_injected_delays_cannot_outlive_the_peer
     );
 }
 
+/// Issue #3775: destination `http2MaxRequests` is a per-exchange cap. Cancelling
+/// one H3 stream must release the permit even when the multiplexed QUIC
+/// connection stays open. The header-wait race therefore has to observe
+/// per-stream STOP_SENDING (`peer_response_cancelled` / `SendStreamStopped`),
+/// not only `PeerConnectionSignal` (whole-connection close).
+#[test]
+fn h3_plain_header_wait_races_per_stream_stop_sending_not_only_connection_close() {
+    let src = include_str!("../../../src/http3/cross_protocol.rs");
+    let helper = src
+        .split("async fn await_h3_backend_or_peer<")
+        .nth(1)
+        .expect("await_h3_backend_or_peer must exist")
+        .split("\nfn plain_peer_gone_before_response_headers(")
+        .next()
+        .expect("bounded await_h3_backend_or_peer");
+    assert!(
+        helper.contains("stream_cancelled"),
+        "the header-wait helper must take a per-stream cancellation future: {helper}"
+    );
+    assert!(
+        helper.contains("_ = &mut stream_cancelled => H3BackendOrPeer::PeerGone"),
+        "per-stream STOP_SENDING must release the wait as PeerGone: {helper}"
+    );
+    assert!(
+        helper.contains("_ = &mut peer_closed => H3BackendOrPeer::PeerGone"),
+        "whole-connection close must remain a PeerGone arm: {helper}"
+    );
+    assert!(
+        helper.contains("H3BackendOrPeer::Deadline"),
+        "the gRPC-Web absolute deadline race must be preserved: {helper}"
+    );
+
+    let dispatch = src
+        .split("async fn dispatch_plain<S>(")
+        .nth(1)
+        .expect("dispatch_plain must exist")
+        .split("\n#[allow(clippy::too_many_arguments)]\nasync fn dispatch_grpc<S>(")
+        .next()
+        .expect("bounded dispatch_plain");
+    assert!(
+        dispatch.contains("crate::http3::stream_util::peer_response_cancelled(stream)"),
+        "the prebuffered/no-body header wait must watch per-stream STOP_SENDING"
+    );
+    assert!(
+        dispatch.matches("peer_response_cancelled(stream)").count() >= 2,
+        "both prebuffered and streaming-upload header waits must watch per-stream STOP_SENDING"
+    );
+    assert!(
+        dispatch.contains("_ = &mut stream_cancelled =>"),
+        "the streaming-upload select must race STOP_SENDING, not only connection close"
+    );
+    assert!(
+        dispatch.contains("reader_peer_reset"),
+        "streaming-upload request-stream reset must be treated as downstream cancellation"
+    );
+    let send_arm = dispatch
+        .split("result = &mut send_future =>")
+        .nth(1)
+        .expect("streaming send_future arm")
+        .split("_ = &mut reader_future, if !reader_done =>")
+        .next()
+        .expect("bounded streaming send_future arm");
+    assert!(
+        send_arm.contains("reader_peer_reset.load(Ordering::Acquire)"),
+        "biased send_future readiness must honor an already-acquired request reset: {send_arm}"
+    );
+    assert!(
+        send_arm.contains("peer_gone = true"),
+        "a request reset observed on send() readiness must take the client-disconnect path: {send_arm}"
+    );
+    assert!(
+        send_arm.contains("break None"),
+        "a request reset must not classify send() as a backend outcome: {send_arm}"
+    );
+    assert!(
+        !dispatch.contains("hold_client.close()"),
+        "production dispatch must not depend on whole-client close"
+    );
+}
+
+/// The vendored cancellation primitive must be `&self` + `'static` so a header
+/// wait can observe STOP_SENDING without exclusive send-stream access (which
+/// would conflict with a concurrent recv-half poll on an unsplit bidi stream).
+#[test]
+fn h3_quinn_vendored_send_stream_stopped_is_shared_and_static() {
+    let quic = include_str!("../../../vendor/h3-0.0.8-ferrum-patched/src/quic.rs");
+    let trait_src = quic
+        .split("pub trait SendStreamStopped {")
+        .nth(1)
+        .expect("SendStreamStopped trait")
+        .split("\npub trait SendStreamUnframed")
+        .next()
+        .expect("bounded SendStreamStopped");
+    assert!(
+        trait_src.contains("fn stopped(")
+            && trait_src.contains("&self")
+            && !trait_src.contains("fn stopped(&mut self)"),
+        "stopped must take &self, not &mut self: {trait_src}"
+    );
+    assert!(
+        trait_src.contains(
+            "impl Future<Output = Result<Option<u64>, StreamErrorIncoming>> + Send + 'static",
+        ) && !trait_src.contains("type Stopped"),
+        "stopped must return a stable RPITIT 'static Send future, not an associated type: {trait_src}"
+    );
+    assert!(
+        !trait_src.contains("Pin<Box") && !trait_src.contains("dyn Future"),
+        "stopped must not return a boxed trait-object future: {trait_src}"
+    );
+
+    let h3_quinn = include_str!("../../../vendor/h3-quinn-0.0.10-ferrum-patched/src/lib.rs");
+    let send = h3_quinn
+        .split("impl<B> h3::quic::SendStreamStopped for SendStream<B>")
+        .nth(1)
+        .expect("h3-quinn SendStream Stopped impl")
+        .split("\nfn convert_stopped_error(")
+        .next()
+        .expect("bounded h3-quinn SendStream Stopped impl");
+    assert!(
+        send.contains("self.stream.stopped()"),
+        "the impl must forward to quinn::SendStream::stopped (&self, 'static): {send}"
+    );
+    assert!(
+        send.contains(
+            "impl Future<Output = Result<Option<u64>, h3::quic::StreamErrorIncoming>> + Send + 'static"
+        ) && !send.contains("type Stopped")
+            && !send.contains("Box::pin")
+            && !send.contains("dyn Future"),
+        "the impl must return a stable RPITIT future, not an associated type or boxed trait object: {send}"
+    );
+    assert!(
+        h3_quinn.contains("impl<B> h3::quic::SendStreamStopped for BidiStream<B>"),
+        "unsplit bidi streams must expose the same STOP_SENDING watch"
+    );
+
+    let util = include_str!("../../../src/http3/stream_util.rs");
+    let watch = util
+        .split("pub(crate) fn peer_response_cancelled<")
+        .nth(1)
+        .expect("peer_response_cancelled must exist")
+        .split("\npub(crate) fn abort_response_stream<")
+        .next()
+        .expect("bounded peer_response_cancelled");
+    assert!(
+        watch.contains("impl Future<Output = ()> + Send + 'static"),
+        "peer_response_cancelled must return a statically dispatched 'static future: {watch}"
+    );
+    assert!(
+        !watch.contains("Box::pin") && !watch.contains("Pin<Box") && !watch.contains("dyn Future"),
+        "peer_response_cancelled must not box a trait-object future: {watch}"
+    );
+    assert!(
+        watch.contains("Ok(Some(_)) | Err(_) => {}"),
+        "STOP_SENDING and connection loss must complete the cancel watch: {watch}"
+    );
+    assert!(
+        watch.contains("Ok(None) => std::future::pending::<()>().await"),
+        "a local finish acknowledgement must not be treated as cancellation: {watch}"
+    );
+}
+
 /// Regression guard (issue #3284): both H3→gRPC dispatch paths must obtain
 /// their HTTP/2 sender from the RESOLVED transport, never from
 /// `state.grpc_pool` directly.
@@ -2445,6 +2606,20 @@ fn h3_stamps_a_connection_close_watch_so_injected_delays_cannot_outlive_the_peer
 /// under PERMISSIVE PeerAuthentication (the RPC succeeds, just without
 /// SVID-mTLS, identity pinning, and mesh authz identity), so it is worth
 /// freezing structurally.
+fn bounded_h3_grpc_transport_resolve_calls(region: &str) -> Vec<&str> {
+    const RESOLVE_H3_GRPC_TRANSPORT: &str = "resolve_h3_grpc_transport(";
+    region
+        .match_indices(RESOLVE_H3_GRPC_TRANSPORT)
+        .map(|(idx, _)| {
+            let tail = &region[idx..];
+            let close = tail
+                .find(") {")
+                .expect("each H3→gRPC transport resolution must close before its match arm");
+            &tail[..close + 3]
+        })
+        .collect()
+}
+
 #[test]
 fn h3_grpc_dispatch_paths_dial_through_the_resolved_mesh_transport() {
     let source = include_str!("../../../src/http3/cross_protocol.rs");
@@ -2456,10 +2631,22 @@ fn h3_grpc_dispatch_paths_dial_through_the_resolved_mesh_transport() {
         .split("pub(crate) async fn dispatch_grpc_streaming(")
         .next()
         .expect("buffered H3→gRPC dispatcher must remain bounded");
-    assert!(
-        buffered.contains("resolve_h3_grpc_transport(state, current_target.as_deref())"),
-        "the buffered path must resolve a transport for its selected target"
+    let buffered_resolves = bounded_h3_grpc_transport_resolve_calls(buffered);
+    assert_eq!(
+        buffered_resolves.len(),
+        2,
+        "the initial target and every rotated retry target must each be resolved"
     );
+    for (i, call) in buffered_resolves.iter().enumerate() {
+        assert!(
+            call.contains("current_target.as_deref()"),
+            "buffered transport resolution #{i} must pass the selected target"
+        );
+        assert!(
+            call.contains("ctx.peer_spiffe_id.as_ref()"),
+            "buffered transport resolution #{i} must preserve the authenticated frontend identity"
+        );
+    }
     assert!(
         buffered.contains("&initial_grpc_transport,"),
         "the initial attempt must dial through the resolved transport"
@@ -2467,13 +2654,6 @@ fn h3_grpc_dispatch_paths_dial_through_the_resolved_mesh_transport() {
     assert!(
         buffered.contains("&grpc_retry_transport,"),
         "a rotated retry target must dial through ITS OWN re-resolved transport"
-    );
-    assert_eq!(
-        buffered
-            .matches("resolve_h3_grpc_transport(state, current_target.as_deref())")
-            .count(),
-        2,
-        "the initial target and every rotated retry target must each be resolved"
     );
     assert_eq!(
         buffered
@@ -2490,9 +2670,20 @@ fn h3_grpc_dispatch_paths_dial_through_the_resolved_mesh_transport() {
         .split("\nasync fn apply_buffered_plain_plugin_reject")
         .next()
         .expect("streaming H3→gRPC dispatcher must remain bounded");
-    assert!(
-        streaming.contains("resolve_h3_grpc_transport(state, current_target.as_deref())"),
+    let streaming_resolves = bounded_h3_grpc_transport_resolve_calls(streaming);
+    assert_eq!(
+        streaming_resolves.len(),
+        1,
         "the streaming path must resolve a transport for its selected target"
+    );
+    let streaming_resolve = streaming_resolves[0];
+    assert!(
+        streaming_resolve.contains("current_target.as_deref()"),
+        "the streaming path must pass the selected target into transport resolution"
+    );
+    assert!(
+        streaming_resolve.contains("ctx.peer_spiffe_id.as_ref()"),
+        "the streaming path must preserve the authenticated frontend identity when resolving transport"
     );
     assert!(
         streaming.contains("&grpc_transport,"),

@@ -675,3 +675,149 @@ async fn subset_http1_pending_guard_releases_on_cancellation() {
         "RAII drop on cancellation must release the subset lane"
     );
 }
+
+// ============================================================================
+// DestinationRule `connectionPool.http.http2MaxRequests` — destination-wide
+// ACTIVE-REQUEST breaker (issue #3775).
+//
+// Istio: "Maximum number of active requests to a destination. Applicable to
+// both HTTP1.1 and HTTP2." Envoy: cluster circuit breaker `max_requests`. It is
+// NOT an HTTP/2 stream setting — a per-connection SETTINGS value cannot express
+// it (HTTP/1.1 has no streams, every connection and pool shard gets its own
+// allowance, and a peer's SETTINGS frame can replace the local bound).
+// ============================================================================
+
+/// The permit must survive a full request/response exchange, so it can only be
+/// released by RAII drop — including on task cancellation (client disconnect,
+/// deadline, shutdown). A release at response headers would leave a streaming
+/// or long-lived gRPC response occupying backend capacity while uncounted.
+#[tokio::test]
+async fn destination_active_request_permit_releases_on_task_cancellation() {
+    use ferrum_edge::backend_active_request_limit::{
+        BackendActiveRequestLimiter, DestinationScope,
+    };
+
+    let scope = || DestinationScope {
+        namespace: "default",
+        destination: "reviews-u",
+        policy_port: 8080,
+        subset: Some("stable"),
+    };
+    let limiter = Arc::new(BackendActiveRequestLimiter::new());
+    let task_limiter = Arc::clone(&limiter);
+    let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+    let task = tokio::spawn(async move {
+        let _permit = task_limiter
+            .try_acquire(scope(), Some(1))
+            .expect("admitted")
+            .expect("permit");
+        let _ = ready_tx.send(());
+        std::future::pending::<()>().await;
+    });
+    ready_rx.await.expect("permit acquired");
+    assert_eq!(limiter.current(scope()), 1);
+    limiter
+        .try_acquire(scope(), Some(1))
+        .expect_err("the destination is saturated while the exchange is active");
+
+    task.abort();
+    let error = task.await.expect_err("task cancelled");
+    assert!(error.is_cancelled());
+    assert_eq!(
+        limiter.current(scope()),
+        0,
+        "RAII drop on cancellation must release the destination budget"
+    );
+}
+
+/// Wiring contract: the breaker is consulted inside backend admission — the one
+/// funnel every HTTP-family upstream attempt passes through before dispatch
+/// (reqwest H1, reqwest-negotiated H2, direct H2, native gRPC, HBONE/mesh-mTLS,
+/// Unix sidecar ingress, and the H3 bridges) — and it runs BEFORE the admission
+/// plugins so a shed request never reaches a backend socket. Anchoring it here
+/// instead of at each transport is what makes one logical destination have one
+/// budget; a per-transport copy is how the pre-#3775 behavior diverged.
+#[test]
+fn destination_active_request_breaker_is_wired_into_backend_admission() {
+    let source = include_str!("../../src/proxy/backend_dispatch.rs");
+    let admission = source
+        .find("pub(crate) fn run_backend_admission_plugins(")
+        .expect("backend admission funnel");
+    let body = &source[admission..];
+    let plugin_loop = body.find("for plugin in plugins {").expect("plugin loop");
+    let acquisition = body
+        .find("backend_active_request_limit")
+        .expect("destination breaker acquisition");
+    assert!(
+        acquisition < plugin_loop,
+        "the destination active-request breaker must be consulted before admission plugins run"
+    );
+    let gate = &body[..plugin_loop];
+    assert!(
+        gate.contains("resolve_backend_http2_max_requests"),
+        "the cap must come from the DestinationRule http2MaxRequests slot"
+    );
+    assert!(
+        gate.contains("dispatch_policy_port_for_target"),
+        "the lane must be keyed by the DR policy port, not a dial address"
+    );
+    assert!(
+        gate.contains("destination_active_request_scope"),
+        "the lane must be keyed by the effective policy identity"
+    );
+    assert!(
+        gate.contains("record_rejection_warning") && gate.contains("suppressed_rejections"),
+        "destination saturation warnings must be rate-limited and report suppressed rejections"
+    );
+    assert!(
+        gate.contains("status_code: 503"),
+        "a saturated destination must shed with a 503 before any backend attempt"
+    );
+}
+
+/// The permit rides the backend-admission permit set, which the client-visible
+/// response body owns — that is what holds it through streamed bodies, gRPC
+/// trailers, disconnects, and errors instead of releasing at response headers.
+#[test]
+fn destination_active_request_permit_is_held_for_the_response_lifetime() {
+    let limiter_source = include_str!("../../src/backend_active_request_limit.rs");
+    assert!(
+        limiter_source.contains(
+            "impl crate::plugins::BackendAdmissionPermit for DestinationActiveRequestPermit"
+        ),
+        "the guard must be carried by the backend-admission permit set"
+    );
+    let body_source = include_str!("../../src/proxy/body.rs");
+    assert!(
+        body_source.contains(
+            "_backend_admission_permits: Option<crate::plugins::BackendAdmissionPermitSet>"
+        ),
+        "ProxyBody must own the permit set so it drops at body completion"
+    );
+}
+
+/// Istio's per-connection `maxConcurrentStreams` remains the transport knob and
+/// must not be re-fused to the destination budget: only it may program the
+/// hyper H2 builder.
+#[test]
+fn per_connection_stream_cap_stays_separate_from_the_destination_budget() {
+    let mesh_source = include_str!("../../src/modes/mesh/mod.rs");
+    let projection = mesh_source
+        .find("fn apply_connection_pool_http_to_port_override(")
+        .expect("per-port connectionPool.http projection");
+    let body = &mesh_source[projection..];
+    let end = body.find("\nfn ").unwrap_or(body.len());
+    let body = &body[..end];
+    assert!(
+        body.contains("slot.http2_max_requests = Some(max_active);"),
+        "http2MaxRequests must project onto the destination active-request budget"
+    );
+    assert!(
+        body.contains("if let Some(max_streams) = http.max_concurrent_streams {"),
+        "only maxConcurrentStreams may program the per-connection H2 stream cap"
+    );
+    assert!(
+        !body.contains("slot.h2_max_concurrent_streams = Some(max_active)"),
+        "http2MaxRequests must never be projected as an H2 stream setting"
+    );
+}
