@@ -1709,7 +1709,9 @@ fn secure_http_udp_and_tcp_protocol_conflicts_are_candidate_accurate() {
                 "udp",
             );
             assert!(
-                mesh_services.iter().any(|service| service.name == expected_udp),
+                mesh_services
+                    .iter()
+                    .any(|service| service.name == expected_udp),
                 "{secure_protocol} order {:?} must materialize UDP: {:?}",
                 listener_order,
                 mesh_services
