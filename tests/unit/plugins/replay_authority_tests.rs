@@ -7,7 +7,10 @@
 //!
 //! * atomic check-and-insert with exactly one winner under concurrency;
 //! * capacity that prunes only **expired** markers and refuses otherwise —
-//!   never evicting a live marker to admit a new request;
+//!   never evicting a live marker to admit a new request — with each live
+//!   authority enforcing its own admitted cap against the shared lane so an
+//!   equivalent reload that raises or lowers capacity takes effect without
+//!   forgetting history;
 //! * exact TTL boundary semantics;
 //! * lane ownership that survives an equivalent reload and converges for
 //!   equivalent replicas, while isolating distinct namespaces / policies /
@@ -21,7 +24,7 @@ use ferrum_edge::plugins::utils::redis_rate_limiter::{RedisConfig, RedisRateLimi
 use ferrum_edge::plugins::utils::replay_authority::{
     MAX_PROCESS_REPLAY_LANES, ReplayAdmission, ReplayAuthority, ReplayDomain, ReplayScope,
     admit_process_at, counters, monotonic_millis, process_lane, process_lane_registered_for_tests,
-    shared_authority_degraded, shared_health_snapshot, validate_scope_backend,
+    process_max_entries, shared_authority_degraded, shared_health_snapshot, validate_scope_backend,
 };
 
 const PROFILE: &str = "ferrum-replay-authority-tests-v1";
@@ -186,8 +189,9 @@ fn expired_markers_are_reclaimed_to_admit_new_requests() {
     );
 
     let lane = process_lane(&authority).expect("process lane");
+    let cap = process_max_entries(&authority).expect("process capacity");
     assert!(
-        lane.retained_entries() <= lane.max_entries(),
+        lane.retained_entries() <= cap,
         "reclamation must respect the hard capacity bound"
     );
 }
@@ -349,6 +353,149 @@ fn an_existing_marker_keeps_at_least_its_admitted_interval() {
         Some(ReplayAdmission::Replay),
         "a shorter replacement retention must not expire an existing marker early"
     );
+}
+
+/// An equivalent reload that lowers capacity must start refusing new markers
+/// at the new cap without forgetting any live marker or isolating onto a
+/// fresh lane.
+#[test]
+fn equivalent_reload_decrease_enforces_new_capacity_without_forgetting_live_markers() {
+    let first = domain("capacity-decrease").marker(&[b"c", b"first"]);
+    let second = domain("capacity-decrease").marker(&[b"c", b"second"]);
+    let third = domain("capacity-decrease").marker(&[b"c", b"third"]);
+    let now = monotonic_millis();
+
+    let original = process_authority("capacity-decrease", 2);
+    assert_eq!(
+        admit_process_at(&original, &first, now),
+        Some(ReplayAdmission::Admitted)
+    );
+    assert_eq!(
+        admit_process_at(&original, &second, now),
+        Some(ReplayAdmission::Admitted)
+    );
+    drop(original);
+
+    let lowered = process_authority("capacity-decrease", 1);
+    assert_eq!(
+        process_max_entries(&lowered),
+        Some(1),
+        "the replacement generation must enforce its own admitted cap"
+    );
+    assert_eq!(
+        admit_process_at(&lowered, &first, now),
+        Some(ReplayAdmission::Replay),
+        "lowering capacity must not forget a live marker"
+    );
+    assert_eq!(
+        admit_process_at(&lowered, &second, now),
+        Some(ReplayAdmission::Replay),
+        "every live marker from the prior generation must stay claimed"
+    );
+    assert_eq!(
+        admit_process_at(&lowered, &third, now),
+        Some(ReplayAdmission::CapacityRefused),
+        "a lowered cap must refuse new admissions while live markers remain"
+    );
+    let lane = process_lane(&lowered).expect("shared lane");
+    assert_eq!(
+        lane.retained_entries(),
+        2,
+        "live markers must remain even when they exceed the new cap"
+    );
+}
+
+/// An equivalent reload that raises capacity must restore headroom against
+/// the same marker history without reopening an already-claimed proof.
+#[test]
+fn equivalent_reload_increase_restores_headroom_without_reopening_live_markers() {
+    let first = domain("capacity-increase").marker(&[b"c", b"first"]);
+    let second = domain("capacity-increase").marker(&[b"c", b"second"]);
+    let now = monotonic_millis();
+
+    let original = process_authority("capacity-increase", 1);
+    assert_eq!(
+        admit_process_at(&original, &first, now),
+        Some(ReplayAdmission::Admitted)
+    );
+    assert_eq!(
+        admit_process_at(&original, &second, now),
+        Some(ReplayAdmission::CapacityRefused)
+    );
+    drop(original);
+
+    let raised = process_authority("capacity-increase", 2);
+    assert_eq!(
+        process_max_entries(&raised),
+        Some(2),
+        "the replacement generation must enforce the raised cap"
+    );
+    assert_eq!(
+        admit_process_at(&raised, &first, now),
+        Some(ReplayAdmission::Replay),
+        "raising capacity must not reopen an already-claimed proof"
+    );
+    assert_eq!(
+        admit_process_at(&raised, &second, now),
+        Some(ReplayAdmission::Admitted),
+        "raising capacity must restore headroom on the same lane"
+    );
+}
+
+/// Two independently constructed authorities for one domain each enforce the
+/// cap they were admitted with. Construction order must not freeze the first
+/// constructor's cap onto the shared lane.
+#[test]
+fn equivalent_authorities_enforce_their_own_capacity_regardless_of_construction_order() {
+    let now = monotonic_millis();
+
+    for (sub, first_cap, second_cap) in [
+        ("capacity-order-high-first", 4, 2),
+        ("capacity-order-low-first", 2, 4),
+    ] {
+        let first_marker = domain(sub).marker(&[b"c", b"first"]);
+        let second_marker = domain(sub).marker(&[b"c", b"second"]);
+        let third_marker = domain(sub).marker(&[b"c", b"third"]);
+
+        let first = process_authority(sub, first_cap);
+        let second = process_authority(sub, second_cap);
+        assert_eq!(process_max_entries(&first), Some(first_cap));
+        assert_eq!(process_max_entries(&second), Some(second_cap));
+
+        assert_eq!(
+            admit_process_at(&first, &first_marker, now),
+            Some(ReplayAdmission::Admitted)
+        );
+        assert_eq!(
+            admit_process_at(&second, &second_marker, now),
+            Some(ReplayAdmission::Admitted)
+        );
+
+        let (low, high) = if first_cap < second_cap {
+            (&first, &second)
+        } else {
+            (&second, &first)
+        };
+
+        assert_eq!(
+            admit_process_at(low, &third_marker, now),
+            Some(ReplayAdmission::CapacityRefused),
+            "the lower-cap authority must refuse at its own cap (sub={sub})"
+        );
+        assert_eq!(
+            admit_process_at(high, &third_marker, now),
+            Some(ReplayAdmission::Admitted),
+            "the higher-cap authority must still have headroom (sub={sub})"
+        );
+        assert_eq!(
+            admit_process_at(&first, &first_marker, now),
+            Some(ReplayAdmission::Replay)
+        );
+        assert_eq!(
+            admit_process_at(&second, &second_marker, now),
+            Some(ReplayAdmission::Replay)
+        );
+    }
 }
 
 // ── domain isolation ────────────────────────────────────────────────

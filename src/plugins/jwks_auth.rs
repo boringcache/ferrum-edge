@@ -3,6 +3,7 @@ use async_trait::async_trait;
 use http::header::HeaderName;
 use serde_json::Map;
 use serde_json::Value;
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -448,6 +449,13 @@ impl JwksAuth {
 
         let mut providers = Vec::with_capacity(providers_arr.len());
         let mut declared_dpop_scopes: Vec<ReplayScope> = Vec::new();
+        // Equivalent process-scoped DPoP providers converge on one lane. They
+        // may share that lane only when they declare the same capacity;
+        // otherwise matching order would pick which cap applies. Track
+        // (earlier index, cap) per domain digest so a disagreement is refused
+        // at admission, order-independently, without binding capacity into
+        // the replay identity (that would reopen live proofs on a cap edit).
+        let mut process_replay_capacities: HashMap<[u8; 32], (usize, usize)> = HashMap::new();
 
         for (idx, prov_cfg) in providers_arr.iter().enumerate() {
             let prov_obj = prov_cfg.as_object().ok_or_else(|| {
@@ -594,12 +602,31 @@ impl JwksAuth {
                     &policy_config_id,
                     &dpop_provider_identity(
                         issuer.as_deref(),
-                        jwks_uri.as_deref(),
-                        discovery_url.as_deref(),
+                        jwks_endpoint.as_ref().map(|endpoint| &endpoint.parsed),
+                        discovery_endpoint.as_ref().map(|endpoint| &endpoint.parsed),
                         inline_jwks.as_deref(),
                     ),
                 )
             });
+            if let (Some(ReplayScope::Process), Some(domain)) =
+                (declared_scope, dpop_replay_domain.as_ref())
+            {
+                let digest = domain.digest();
+                if let Some((earlier_idx, existing_cap)) =
+                    process_replay_capacities.get(&digest).copied()
+                {
+                    if existing_cap != dpop_replay_max_entries {
+                        return Err(format!(
+                            "jwks_auth: equivalent DPoP providers must declare the same \
+                             'dpop_replay_max_entries'; provider[{earlier_idx}] and \
+                             provider[{idx}] share one replay domain with incompatible \
+                             capacities"
+                        ));
+                    }
+                } else {
+                    process_replay_capacities.insert(digest, (idx, dpop_replay_max_entries));
+                }
+            }
             let dpop_replay = match (declared_scope, dpop_replay_domain.as_ref()) {
                 (Some(ReplayScope::Process), Some(domain)) => {
                     Some(Arc::new(ReplayAuthority::process(
@@ -791,20 +818,17 @@ impl JwksAuth {
 
     /// Per-provider process replay-lane capacities (`None` when DPoP is not
     /// required or the provider claims against the shared authority).
-    /// Test-only visibility for default-contract regressions.
+    /// Test-only visibility for default-contract regressions and for proving
+    /// a reloaded generation enforces its own admitted cap.
     #[doc(hidden)]
     #[allow(dead_code)] // exercised by external unit tests
     pub fn dpop_replay_lane_capacities(&self) -> Vec<Option<usize>> {
         self.providers
             .iter()
             .map(|provider| {
-                provider
-                    .dpop_replay
-                    .as_ref()
-                    .and_then(|authority| {
-                        crate::plugins::utils::replay_authority::process_lane(authority)
-                    })
-                    .map(|lane| lane.max_entries())
+                provider.dpop_replay.as_ref().and_then(|authority| {
+                    crate::plugins::utils::replay_authority::process_max_entries(authority)
+                })
             })
             .collect()
     }
@@ -1777,6 +1801,9 @@ async fn try_validate_with_provider(provider: &JwksProvider, token: &str) -> Opt
 struct ParsedEndpoint {
     url: String,
     hostname: String,
+    /// Already-validated `url::Url`. Used only to derive the canonical remote
+    /// trust-source identity for DPoP replay; fetch still uses [`Self::url`].
+    parsed: Url,
 }
 
 /// Plugin-config id used when no stable resource id is supplied (Admin config
@@ -1963,6 +1990,7 @@ fn parse_url_field(
     Ok(Some(ParsedEndpoint {
         url: url.to_string(),
         hostname,
+        parsed,
     }))
 }
 
@@ -2018,7 +2046,12 @@ fn has_non_empty_authority(url: &str) -> bool {
 /// either are genuinely different admission domains and must not share replay
 /// state; two that agree on both are the same trust anchor and converge on one
 /// lane, so a duplicate/equivalent provider entry cannot be used to launder a
-/// second acceptance of one proof.
+/// second acceptance of one proof. Remote `jwks_uri` / `discovery_url` values
+/// are bound by a canonical parsed endpoint (scheme, host, default-port
+/// normalized port, path, query) so equivalent spellings accepted by
+/// [`url::Url`] — host case, an explicit default port — stay on one lane.
+/// Issuer matching remains exact: an issuer is not a URL endpoint and is not
+/// normalized here.
 ///
 /// # What it deliberately does not bind
 ///
@@ -2030,7 +2063,10 @@ fn has_non_empty_authority(url: &str) -> bool {
 /// strictly worse than the isolation it would buy: an already-claimed `jti` must
 /// stay claimed across a tightened scope list or a widened clock skew. The fixed
 /// retention horizon already dominates the widest admissible skew, so a skew
-/// change can never outrun a marker.
+/// change can never outrun a marker. Capacity is instead enforced by each live
+/// authority against the shared lane; equivalent duplicate providers that
+/// declare incompatible `dpop_replay_max_entries` are refused at admission so
+/// matching order cannot pick which cap applies.
 ///
 /// No raw issuer, JWKS URI, discovery URL, or JWK material is retained: every
 /// field is written through [`PartitionHasher`]'s length-prefixed framing and
@@ -2039,8 +2075,8 @@ fn has_non_empty_authority(url: &str) -> bool {
 /// member-order edit of the same key set is not a different anchor.
 fn dpop_provider_identity(
     issuer: Option<&str>,
-    jwks_uri: Option<&str>,
-    discovery_url: Option<&str>,
+    jwks_uri: Option<&Url>,
+    discovery_url: Option<&Url>,
     inline_jwks: Option<&str>,
 ) -> String {
     let mut hasher = PartitionHasher::new("ferrum-edge/jwks-auth/dpop-provider-identity/v1");
@@ -2049,10 +2085,10 @@ fn dpop_provider_identity(
     // here is only a total function over that invariant.
     if let Some(uri) = jwks_uri {
         hasher.text("provider.jwks_source.kind", "jwks_uri");
-        hasher.text("provider.jwks_source.value", uri);
+        bind_canonical_remote_trust_source(&mut hasher, uri);
     } else if let Some(url) = discovery_url {
         hasher.text("provider.jwks_source.kind", "discovery_url");
-        hasher.text("provider.jwks_source.value", url);
+        bind_canonical_remote_trust_source(&mut hasher, url);
     } else if let Some(jwks) = inline_jwks {
         hasher.text("provider.jwks_source.kind", "inline");
         let canonical = serde_json::from_str::<Value>(jwks)
@@ -2066,6 +2102,28 @@ fn dpop_provider_identity(
         hasher.text("provider.jwks_source.kind", "none");
     }
     hasher.hex()
+}
+
+/// Bind a remote JWKS / discovery endpoint as a canonical parsed identity.
+///
+/// Called only after [`parse_url_field`] has already rejected userinfo,
+/// non-http(s) schemes, empty hosts, and non-loopback http. The original
+/// configured spelling is retained for fetch; only this identity is hashed.
+/// Components are length-framed separately so a path cannot collide with a
+/// query, and no raw credential material is logged or stored.
+fn bind_canonical_remote_trust_source(hasher: &mut PartitionHasher, parsed: &Url) {
+    hasher.text("provider.jwks_source.scheme", parsed.scheme());
+    hasher.text("provider.jwks_source.host", parsed.host_str().unwrap_or(""));
+    match parsed.port_or_known_default() {
+        Some(port) => {
+            hasher.text("provider.jwks_source.port", &port.to_string());
+        }
+        None => {
+            hasher.text("provider.jwks_source.port", "");
+        }
+    }
+    hasher.text("provider.jwks_source.path", parsed.path());
+    hasher.optional_text("provider.jwks_source.query", parsed.query());
 }
 
 fn parse_inline_jwks(

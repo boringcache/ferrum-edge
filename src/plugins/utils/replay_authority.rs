@@ -58,6 +58,16 @@
 //! by generating unique proofs. Capacity degrades into refusal, never into
 //! silent unprotection.
 //!
+//! The shared lane retains markers; each live authority enforces the
+//! `max_entries` *it was admitted with* against that shared count. An equivalent
+//! reload that raises or lowers the configured capacity therefore takes effect
+//! without rebuilding the lane, evicting a live marker, or changing the replay
+//! domain. Lowering the limit refuses new admissions once the shared count meets
+//! the new cap; raising it restores headroom. The first constructor does **not**
+//! freeze a cap onto the lane — that would make a later equivalent generation's
+//! configured capacity silently inert, and would make duplicate equivalent
+//! constructors order-dependent.
+//!
 //! # Retention is fixed, not configured
 //!
 //! Each caller declares one compile-time retention horizon that dominates the
@@ -396,7 +406,6 @@ pub struct ProcessReplayLane {
     /// Marker digest → expiry in monotonic milliseconds since process start.
     entries: DashMap<[u8; 32], u64>,
     entry_count: AtomicUsize,
-    max_entries: usize,
     /// Highest expiry ever written. Reading it is how lane reclamation proves
     /// "no live marker remains" without scanning the map.
     newest_expiry_millis: AtomicU64,
@@ -406,11 +415,10 @@ pub struct ProcessReplayLane {
 }
 
 impl ProcessReplayLane {
-    fn new(max_entries: usize, shard_amount: usize) -> Arc<Self> {
+    fn new(shard_amount: usize) -> Arc<Self> {
         Arc::new(Self {
             entries: DashMap::with_shard_amount(shard_amount),
             entry_count: AtomicUsize::new(0),
-            max_entries: max_entries.max(1),
             newest_expiry_millis: AtomicU64::new(0),
             prune_lock: Mutex::new(()),
         })
@@ -429,6 +437,7 @@ impl ProcessReplayLane {
         &self,
         marker: &ReplayMarker,
         retention: Duration,
+        max_entries: usize,
         now_millis: u64,
     ) -> ReplayAdmission {
         let retention_millis = u64::try_from(retention.as_millis()).unwrap_or(u64::MAX);
@@ -453,7 +462,7 @@ impl ProcessReplayLane {
                     return ReplayAdmission::Admitted;
                 }
                 Entry::Vacant(vacant) => {
-                    if self.try_reserve_slot() {
+                    if self.try_reserve_slot(max_entries) {
                         vacant.insert(expires_at);
                         self.note_expiry(expires_at);
                         return ReplayAdmission::Admitted;
@@ -483,10 +492,10 @@ impl ProcessReplayLane {
             .fetch_max(expires_at, Ordering::AcqRel);
     }
 
-    fn try_reserve_slot(&self) -> bool {
+    fn try_reserve_slot(&self, max_entries: usize) -> bool {
         self.entry_count
             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |count| {
-                (count < self.max_entries).then_some(count + 1)
+                (count < max_entries).then_some(count + 1)
             })
             .is_ok()
     }
@@ -494,8 +503,8 @@ impl ProcessReplayLane {
     /// Reclaim **expired** entries only. Returns how many were reclaimed.
     ///
     /// Serialized by [`Self::prune_lock`] so a burst of saturated requests pays
-    /// for at most one concurrent walk. Bounded by `max_entries`, and reached
-    /// only when the lane is already full.
+    /// for at most one concurrent walk. Bounded by the lane's retained entries,
+    /// and reached only when the calling authority is already at its cap.
     fn prune_expired(&self, now_millis: u64) -> usize {
         let _guard = self
             .prune_lock
@@ -537,11 +546,6 @@ impl ProcessReplayLane {
     pub fn retained_entries(&self) -> usize {
         self.entry_count.load(Ordering::Acquire)
     }
-
-    /// Configured capacity (test support).
-    pub fn max_entries(&self) -> usize {
-        self.max_entries
-    }
 }
 
 /// Process-global lane registry, keyed by protection-domain digest.
@@ -564,10 +568,13 @@ fn process_lane_count() -> usize {
 /// Cold path only — plugin construction, never a request. Creating a new lane
 /// first reclaims retired lanes whose markers have all expired, so deleted
 /// configurations cannot permanently exhaust [`MAX_PROCESS_REPLAY_LANES`].
+///
+/// An existing lane is returned as-is: capacity is enforced by the calling
+/// authority, not frozen onto the lane by the first constructor. Rejoining must
+/// never rebuild, forget, or re-key the lane.
 fn resolve_process_lane(
     plugin: &str,
     domain: &ReplayDomain,
-    max_entries: usize,
     shard_amount: usize,
 ) -> Result<Arc<ProcessReplayLane>, String> {
     let key = domain.lane_key();
@@ -587,7 +594,7 @@ fn resolve_process_lane(
              lanes in one process"
         ));
     }
-    let lane = ProcessReplayLane::new(max_entries, shard_amount);
+    let lane = ProcessReplayLane::new(shard_amount);
     registry.insert(key, Arc::clone(&lane));
     Ok(lane)
 }
@@ -703,6 +710,9 @@ pub enum ReplayAuthority {
     Process {
         lane: Arc<ProcessReplayLane>,
         retention: Duration,
+        /// Cap this generation enforces against the shared lane. Live markers
+        /// already in the lane are never evicted to meet it.
+        max_entries: usize,
     },
     /// Production HA contract: one atomic `SET … NX EX` per marker.
     Shared {
@@ -725,6 +735,10 @@ impl ReplayAuthority {
     ///
     /// `retention` must be the caller's fixed compile-time horizon, not a
     /// configured value — see the module documentation.
+    ///
+    /// `max_entries` is enforced by *this* authority against the shared lane.
+    /// An equivalent reload that changes the cap joins the same lane and
+    /// applies the new cap without forgetting live markers.
     pub fn process(
         plugin: &str,
         domain: &ReplayDomain,
@@ -733,8 +747,9 @@ impl ReplayAuthority {
         shard_amount: usize,
     ) -> Result<Self, String> {
         Ok(Self::Process {
-            lane: resolve_process_lane(plugin, domain, max_entries, shard_amount)?,
+            lane: resolve_process_lane(plugin, domain, shard_amount)?,
             retention,
+            max_entries: max_entries.max(1),
         })
     }
 
@@ -775,9 +790,11 @@ impl ReplayAuthority {
     /// capacity or a shared-backend round trip.
     pub async fn admit(&self, marker: &ReplayMarker) -> ReplayAdmission {
         let outcome = match self {
-            Self::Process { lane, retention } => {
-                lane.admit_at(marker, *retention, monotonic_millis())
-            }
+            Self::Process {
+                lane,
+                retention,
+                max_entries,
+            } => lane.admit_at(marker, *retention, *max_entries, monotonic_millis()),
             Self::Shared { client, retention } => admit_shared(client, *retention, marker).await,
         };
         record_admission(self.mode(), outcome);
@@ -884,12 +901,26 @@ pub fn admit_process_at(
     marker: &ReplayMarker,
     now_millis: u64,
 ) -> Option<ReplayAdmission> {
-    let ReplayAuthority::Process { lane, retention } = authority else {
+    let ReplayAuthority::Process {
+        lane,
+        retention,
+        max_entries,
+    } = authority
+    else {
         return None;
     };
-    let outcome = lane.admit_at(marker, *retention, now_millis);
+    let outcome = lane.admit_at(marker, *retention, *max_entries, now_millis);
     record_admission(authority.mode(), outcome);
     Some(outcome)
+}
+
+/// Process-lane capacity this authority enforces (test support). `None` for a
+/// shared authority, which does not admit against a process lane.
+pub fn process_max_entries(authority: &ReplayAuthority) -> Option<usize> {
+    match authority {
+        ReplayAuthority::Process { max_entries, .. } => Some(*max_entries),
+        ReplayAuthority::Shared { .. } => None,
+    }
 }
 
 /// The process lane behind a process-scoped authority (test support).

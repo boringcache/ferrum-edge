@@ -17281,9 +17281,13 @@ components:
                 minimum: 1
                 default: 100000
                 description: >-
-                  Capacity of a 'process' replay lane. At capacity only expired
-                  markers are reclaimed; if none can be, the request is refused
-                  (503) rather than a live marker evicted. Ignored for 'shared'.
+                  Capacity this process-scoped authority enforces against the
+                  shared replay lane. At capacity only expired markers are
+                  reclaimed; if none can be, the request is refused (503)
+                  rather than a live marker evicted. An equivalent reload
+                  applies the new cap without forgetting live markers.
+                  Duplicate equivalent providers that share a replay domain
+                  must declare the same value. Ignored for 'shared'.
               jwks_max_stale_seconds:
                 type: integer
                 format: uint64
@@ -18109,9 +18113,11 @@ components:
           minimum: 1
           default: 100000
           description: >-
-            Capacity of a 'process' replay lane. At capacity only expired markers
-            are reclaimed; if none can be, the request is refused (503) rather
-            than a live marker evicted. Ignored for 'shared'.
+            Capacity this process-scoped authority enforces against the shared
+            replay lane. At capacity only expired markers are reclaimed; if none
+            can be, the request is refused (503) rather than a live marker
+            evicted. An equivalent reload applies the new cap without forgetting
+            live markers. Ignored for 'shared'.
         sync_mode:
           type: string
           enum: [local, redis]

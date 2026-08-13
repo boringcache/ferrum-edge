@@ -3756,6 +3756,288 @@ fn dpop_provider_identity_isolates_anchors_and_canonicalizes_equivalents() {
     );
 }
 
+/// Equivalent remote URL spellings accepted by `url::Url` must converge on one
+/// replay domain, while genuinely distinct sources stay isolated. Issuer
+/// matching remains exact: host-case on `issuer` is not normalized.
+#[test]
+fn dpop_remote_url_spellings_converge_while_distinct_sources_stay_isolated() {
+    let remote = |uri: &str, issuer: &str| {
+        json!({
+            "jwks_uri": uri,
+            "issuer": issuer,
+            "require_dpop": true,
+            "dpop_replay_scope": "process"
+        })
+    };
+    let discovery = |url: &str, issuer: &str| {
+        json!({
+            "discovery_url": url,
+            "issuer": issuer,
+            "require_dpop": true,
+            "dpop_replay_scope": "process"
+        })
+    };
+    let issuer = "https://idp.example.com";
+
+    // Host case and an explicit default HTTPS port are the same trust source.
+    let equivalent_jwks = dpop_plugin_with_providers(
+        json!([
+            remote("https://idp.example.com/jwks", issuer),
+            remote("https://IDP.EXAMPLE.COM/jwks", issuer),
+            remote("https://idp.example.com:443/jwks", issuer),
+        ]),
+        "dpop-identity-url-jwks",
+    );
+    let markers = equivalent_jwks.dpop_replay_domain_markers("thumbprint", "proof-id");
+    assert_eq!(markers.len(), 3);
+    assert_eq!(
+        markers[0], markers[1],
+        "host-case variants of one JWKS URI must share a replay domain"
+    );
+    assert_eq!(
+        markers[0], markers[2],
+        "an explicit default HTTPS port must not open a fresh replay lane"
+    );
+
+    // Same for discovery URLs, including loopback HTTP default port 80.
+    let equivalent_discovery = dpop_plugin_with_providers(
+        json!([
+            discovery(
+                "https://idp.example.com/.well-known/openid-configuration",
+                issuer
+            ),
+            discovery(
+                "https://IDP.EXAMPLE.COM/.well-known/openid-configuration",
+                issuer
+            ),
+            discovery(
+                "https://idp.example.com:443/.well-known/openid-configuration",
+                issuer
+            ),
+            discovery("http://127.0.0.1/.well-known/openid-configuration", issuer),
+            discovery(
+                "http://127.0.0.1:80/.well-known/openid-configuration",
+                issuer
+            ),
+        ]),
+        "dpop-identity-url-discovery",
+    );
+    let markers = equivalent_discovery.dpop_replay_domain_markers("thumbprint", "proof-id");
+    assert_eq!(
+        markers[0], markers[1],
+        "host-case variants of one discovery URL must share a replay domain"
+    );
+    assert_eq!(
+        markers[0], markers[2],
+        "an explicit default HTTPS port on discovery must not open a fresh lane"
+    );
+    assert_eq!(
+        markers[3], markers[4],
+        "loopback HTTP with and without :80 must share a replay domain"
+    );
+
+    // Genuinely distinct endpoints stay isolated.
+    let distinct = dpop_plugin_with_providers(
+        json!([
+            remote("https://idp.example.com/jwks", issuer),
+            remote("https://idp.example.com:444/jwks", issuer),
+            remote("https://idp.example.com/other", issuer),
+            remote("https://other.example.com/jwks", issuer),
+            remote("https://idp.example.com/jwks?kid=a", issuer),
+        ]),
+        "dpop-identity-url-distinct",
+    );
+    let markers = distinct.dpop_replay_domain_markers("thumbprint", "proof-id");
+    for (left, right) in [(0, 1), (0, 2), (0, 3), (0, 4), (1, 2), (1, 3), (2, 3)] {
+        assert_ne!(
+            markers[left], markers[right],
+            "distinct remote sources must not share a replay domain ({left} vs {right})"
+        );
+    }
+
+    // Issuer matching stays exact: URL-like host-case on issuer is not a
+    // canonicalization of the trust source.
+    let issuer_exact = dpop_plugin_with_providers(
+        json!([
+            remote("https://idp.example.com/jwks", "https://idp.example.com"),
+            remote("https://idp.example.com/jwks", "https://IDP.EXAMPLE.COM"),
+        ]),
+        "dpop-identity-issuer-exact",
+    );
+    let markers = issuer_exact.dpop_replay_domain_markers("thumbprint", "proof-id");
+    assert_ne!(
+        markers[0], markers[1],
+        "issuer matching remains exact; host-case on issuer must not converge"
+    );
+}
+
+/// Filling a provider's replay lane, then reloading with a *lower* cap, must
+/// refuse new proofs at the new cap while every previously admitted marker
+/// stays a replay.
+#[tokio::test]
+async fn dpop_capacity_decrease_across_equivalent_generations_preserves_live_markers() {
+    let (retained_a, jwks) = build_dpop_fixture("dpop-cap-dec-a");
+    let (retained_b, _) = build_dpop_fixture("dpop-cap-dec-b");
+    let (fresh, _) = build_dpop_fixture("dpop-cap-dec-fresh");
+    let consumer_index = ConsumerIndex::new(&[create_consumer("idp-user")]);
+
+    let mut high = dpop_provider(&jwks);
+    high["dpop_replay_max_entries"] = json!(2);
+    let original = dpop_plugin_with_providers(json!([high]), "dpop-cap-decrease");
+    assert_eq!(original.dpop_replay_lane_capacities(), vec![Some(2)]);
+
+    let mut first = dpop_ctx(&retained_a);
+    assert_continue(original.authenticate(&mut first, &consumer_index).await);
+    let mut second = dpop_ctx(&retained_b);
+    assert_continue(original.authenticate(&mut second, &consumer_index).await);
+    drop(original);
+
+    let mut low = dpop_provider(&jwks);
+    low["dpop_replay_max_entries"] = json!(1);
+    let lowered = dpop_plugin_with_providers(json!([low]), "dpop-cap-decrease");
+    assert_eq!(lowered.dpop_replay_lane_capacities(), vec![Some(1)]);
+
+    let mut replay_a = dpop_ctx(&retained_a);
+    assert_reject(
+        lowered.authenticate(&mut replay_a, &consumer_index).await,
+        Some(401),
+    );
+    let mut replay_b = dpop_ctx(&retained_b);
+    assert_reject(
+        lowered.authenticate(&mut replay_b, &consumer_index).await,
+        Some(401),
+    );
+    let mut new_proof = dpop_ctx(&fresh);
+    assert_reject(
+        lowered.authenticate(&mut new_proof, &consumer_index).await,
+        Some(503),
+    );
+}
+
+/// Reloading with a *higher* cap must restore headroom on the same lane
+/// without reopening an already-claimed proof.
+#[tokio::test]
+async fn dpop_capacity_increase_across_equivalent_generations_restores_headroom() {
+    let (retained, jwks) = build_dpop_fixture("dpop-cap-inc-retained");
+    let (fresh, _) = build_dpop_fixture("dpop-cap-inc-fresh");
+    let consumer_index = ConsumerIndex::new(&[create_consumer("idp-user")]);
+
+    let mut low = dpop_provider(&jwks);
+    low["dpop_replay_max_entries"] = json!(1);
+    let original = dpop_plugin_with_providers(json!([low]), "dpop-cap-increase");
+    let mut first = dpop_ctx(&retained);
+    assert_continue(original.authenticate(&mut first, &consumer_index).await);
+    let mut blocked = dpop_ctx(&fresh);
+    assert_reject(
+        original.authenticate(&mut blocked, &consumer_index).await,
+        Some(503),
+    );
+    drop(original);
+
+    let mut high = dpop_provider(&jwks);
+    high["dpop_replay_max_entries"] = json!(2);
+    let raised = dpop_plugin_with_providers(json!([high]), "dpop-cap-increase");
+    assert_eq!(raised.dpop_replay_lane_capacities(), vec![Some(2)]);
+
+    let mut replay = dpop_ctx(&retained);
+    assert_reject(
+        raised.authenticate(&mut replay, &consumer_index).await,
+        Some(401),
+    );
+    let mut new_proof = dpop_ctx(&fresh);
+    assert_continue(raised.authenticate(&mut new_proof, &consumer_index).await);
+}
+
+/// Duplicate equivalent providers with incompatible capacities cannot share a
+/// deterministic process-lane contract: matching order would pick which cap
+/// applies. Admission must refuse that configuration in either order.
+#[test]
+fn duplicate_equivalent_providers_with_incompatible_capacities_are_rejected() {
+    let (_, jwks) = build_dpop_fixture("dpop-cap-dup-reject");
+    let mut low = dpop_provider(&jwks);
+    low["dpop_replay_max_entries"] = json!(1);
+    let mut high = dpop_provider(&jwks);
+    high["dpop_replay_max_entries"] = json!(2);
+
+    for providers in [json!([low.clone(), high.clone()]), json!([high, low])] {
+        let error = JwksAuth::new_with_config_id(
+            &json!({ "providers": providers }),
+            default_client(),
+            Some("dpop-cap-dup-reject"),
+        )
+        .expect_err("incompatible duplicate capacities must be refused");
+        assert!(
+            error.contains("dpop_replay_max_entries") && error.contains("incompatible"),
+            "diagnostic should name the disagreeing cap: {error}"
+        );
+    }
+}
+
+/// Duplicate equivalent providers that agree on capacity stay admitted and
+/// still share one lane, so a duplicated entry cannot launder a second
+/// acceptance. Explicit matching caps must not be mistaken for the
+/// incompatible-cap refusal.
+#[tokio::test]
+async fn duplicate_equivalent_providers_with_matching_capacity_share_one_lane() {
+    let (fixture, jwks) = build_dpop_fixture("dpop-cap-dup-match");
+    let consumer_index = ConsumerIndex::new(&[create_consumer("idp-user")]);
+    let mut provider = dpop_provider(&jwks);
+    provider["dpop_replay_max_entries"] = json!(8);
+
+    let duplicated = dpop_plugin_with_providers(
+        json!([provider.clone(), provider]),
+        "dpop-cap-dup-match",
+    );
+    assert_eq!(
+        duplicated.dpop_replay_lane_capacities(),
+        vec![Some(8), Some(8)]
+    );
+    let markers = duplicated.dpop_replay_domain_markers("thumbprint", "proof-id");
+    assert_eq!(markers[0], markers[1]);
+
+    let mut first = dpop_ctx(&fixture);
+    assert_continue(duplicated.authenticate(&mut first, &consumer_index).await);
+    let mut replay = dpop_ctx(&fixture);
+    assert_reject(
+        duplicated.authenticate(&mut replay, &consumer_index).await,
+        Some(401),
+    );
+}
+
+/// Equivalent remote URL spellings that declare different capacities are still
+/// one trust source, so the incompatible-cap admission rule applies to them
+/// too — otherwise a host-case duplicate could smuggle a second cap.
+#[test]
+fn equivalent_remote_url_spellings_with_incompatible_capacities_are_rejected() {
+    let error = JwksAuth::new_with_config_id(
+        &json!({
+            "providers": [
+                {
+                    "jwks_uri": "https://idp.example.com/jwks",
+                    "issuer": "https://idp.example.com",
+                    "require_dpop": true,
+                    "dpop_replay_scope": "process",
+                    "dpop_replay_max_entries": 1
+                },
+                {
+                    "jwks_uri": "https://IDP.EXAMPLE.COM:443/jwks",
+                    "issuer": "https://idp.example.com",
+                    "require_dpop": true,
+                    "dpop_replay_scope": "process",
+                    "dpop_replay_max_entries": 8
+                }
+            ]
+        }),
+        default_client(),
+        Some("dpop-cap-url-dup"),
+    )
+    .expect_err("canonical URL duplicates with different caps must be refused");
+    assert!(
+        error.contains("dpop_replay_max_entries"),
+        "diagnostic should name the disagreeing cap: {error}"
+    );
+}
+
 /// The removed retention/capacity knobs are rejected with their replacement
 /// named, rather than silently ignored — a config still carrying
 /// `dpop_jti_ttl_secs` was written believing it controls how long a proof stays

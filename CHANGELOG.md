@@ -52,8 +52,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - `jwks_auth`'s `dpop_jti_ttl_secs` and `dpop_jti_cache_max_entries` were
     **removed**, not redefined. Retention is now a fixed 601-second horizon that
     dominates the widest admissible acceptance window, and capacity is
-    `providers[].dpop_replay_max_entries`. Configs carrying the removed keys are
-    rejected with the replacement named.
+    `providers[].dpop_replay_max_entries`. Each process-scoped authority
+    enforces that cap against the shared lane, so an equivalent reload that
+    changes capacity takes effect without forgetting live markers. Duplicate
+    equivalent DPoP providers that share a replay domain must declare the same
+    cap. Remote JWKS/discovery URLs are bound by their canonical parsed form
+    (host case and default ports converge; issuer matching stays exact).
+    Configs carrying the removed keys are rejected with the replacement named.
   - **Redis HA requirement.** Any deployment running more than one gateway
     replica behind a load balancer — including a rolling deployment, where old
     and new processes serve concurrently — must declare `shared` scope and
