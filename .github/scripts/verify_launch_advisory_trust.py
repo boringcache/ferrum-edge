@@ -1522,6 +1522,8 @@ def check_trusted_workflow(text: str) -> list[str]:
                 "does not satisfy it"
             )
 
+    artifact_handoff = "verdict_artifact" in trust_text
+
     # The verdict must be bound to the exact Release run AND run attempt that
     # asked for it, or an older success on the same commit satisfies a newer
     # release before its own evaluation has run.
@@ -1534,18 +1536,18 @@ def check_trusted_workflow(text: str) -> list[str]:
                 f"{TRUSTED_WORKFLOW} job `{TRUST_JOB}` must bind {detail} "
                 f"(`{expression}`) so the published verdict cannot be replayed"
             )
-    if "status_context:" not in trust_text:
+    if not artifact_handoff and "status_context:" not in trust_text:
         errors.append(
             f"{TRUSTED_WORKFLOW} job `{TRUST_JOB}` must export the derived "
             "`status_context` for the publisher"
         )
-    if not TRUSTED_RUN_CONTEXT_DERIVATION.search(trust_text):
+    if not artifact_handoff and not TRUSTED_RUN_CONTEXT_DERIVATION.search(trust_text):
         errors.append(
             f"{TRUSTED_WORKFLOW} job `{TRUST_JOB}` must derive a status context "
             f"of the form `{STATUS_CONTEXT_PREFIX}/release-<run id>-attempt-"
             "<run attempt>`; a commit-wide or attempt-less context is replayable"
         )
-    if AUDIT_STATUS_CONTEXT not in trust_text:
+    if not artifact_handoff and AUDIT_STATUS_CONTEXT not in trust_text:
         errors.append(
             f"{TRUSTED_WORKFLOW} job `{TRUST_JOB}` must publish default-branch "
             f"audits under the distinct `{AUDIT_STATUS_CONTEXT}` context so an "
@@ -1662,6 +1664,26 @@ def check_trusted_workflow(text: str) -> list[str]:
                 f"{TRUSTED_WORKFLOW} job `{PUBLISH_JOB}` must publish the verdict "
                 "without any credential"
             )
+        if artifact_handoff:
+            publish_text = "\n".join(publish_lines)
+            for required in (
+                "actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a",
+                "needs.establish-trust.outputs.verdict_artifact",
+                "verdict=PASS",
+                "release_sha=%s",
+                "release_run_id=%s",
+                "release_run_attempt=%s",
+            ):
+                if required not in publish_text:
+                    errors.append(
+                        f"{TRUSTED_WORKFLOW} job `{PUBLISH_JOB}` must publish the "
+                        f"authenticated verdict artifact with binding {required!r}"
+                    )
+            if any("statuses: write" in line or "/statuses/" in line for line in publish_lines):
+                errors.append(
+                    f"{TRUSTED_WORKFLOW} job `{PUBLISH_JOB}` must not use a forgeable commit status handoff"
+                )
+            return errors
         context_lines = [line for line in publish_lines if "context=" in line]
         if not context_lines:
             errors.append(
@@ -1695,6 +1717,29 @@ def check_release_workflow(text: str) -> list[str]:
         errors.append(f"{RELEASE_WORKFLOW} is missing job `{RELEASE_GATE_JOB}`")
         return errors
     gate = "\n".join(code_lines(jobs[RELEASE_GATE_JOB]))
+    if "trusted-launch-advisory-verdict-release-" in gate:
+        for required in (
+            "/actions/artifacts?name=",
+            "/actions/runs/${owner_run_id}",
+            "/actions/workflows/${workflow_id}",
+            ".github/workflows/launch-advisory-trust.yml",
+            '"$owner_event" = workflow_run',
+            '"$owner_conclusion" = success',
+            "release_sha=${release_sha}",
+            "release_run_id=${RELEASE_RUN_ID}",
+            "release_run_attempt=${RELEASE_RUN_ATTEMPT}",
+            "verdict=PASS",
+        ):
+            if required not in gate:
+                errors.append(
+                    f"{RELEASE_WORKFLOW} job `{RELEASE_GATE_JOB}` must authenticate "
+                    f"the trusted artifact with binding {required!r}"
+                )
+        if "/commits/${release_sha}/statuses" in gate:
+            errors.append(
+                f"{RELEASE_WORKFLOW} job `{RELEASE_GATE_JOB}` must not trust forgeable commit statuses"
+            )
+        return errors
     if not RELEASE_GATE_CONTEXT_DERIVATION.search(gate):
         errors.append(
             f"{RELEASE_WORKFLOW} job `{RELEASE_GATE_JOB}` must require the "

@@ -54,17 +54,15 @@ jobs:
     # `.github/workflows/launch-advisory-trust.yml`, whose definition GitHub
     # always loads from the protected default branch and whose credential is
     # bound to the protected `launch-advisory` environment. This job only reads
-    # the fixed-text commit status that trusted run publishes for the exact tag
-    # commit, so nothing here can reach the credential or private advisory data.
+    # the fixed-text artifact that the trusted run attaches to itself for the
+    # exact tag commit, so nothing here can reach the credential or private advisory data.
     #
-    # The status is accepted only under the context bound to THIS run and THIS
-    # run attempt. A commit-wide context would be replayable: the daily audit,
-    # an earlier tag release on the same commit, or an earlier attempt of this
-    # run would already have posted a success, and a blocker opened after it
-    # would let the release proceed on a stale verdict.
+    # The artifact is bound to THIS run and THIS run attempt. Its owning run is
+    # authenticated as the default-branch trust workflow; unlike a commit status,
+    # a candidate-controlled tag workflow cannot forge that provenance.
     permissions:
       contents: read
-      statuses: read
+      actions: read
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
         with:
@@ -105,46 +103,50 @@ jobs:
             echo "::error title=Release validation failed::this run has no usable run ID or run attempt" >&2
             exit 1
           fi
-          expected_context="trusted-launch-advisory-gate/release-${RELEASE_RUN_ID}-attempt-${RELEASE_RUN_ATTEMPT}"
-          echo "Requiring the trusted verdict published for ${expected_context}"
+          artifact_name="trusted-launch-advisory-verdict-release-${RELEASE_RUN_ID}-attempt-${RELEASE_RUN_ATTEMPT}"
+          echo "Requiring authenticated verdict artifact ${artifact_name}"
 
           max_attempts=240
           for attempt in $(seq 1 "$max_attempts"); do
-            statuses="$(gh api \
-              "repos/${GITHUB_REPOSITORY}/commits/${release_sha}/statuses?per_page=100" \
-              2>/dev/null || true)"
-            if [ -z "$statuses" ]; then
-              echo "Trusted advisory status lookup failed transiently (attempt ${attempt}/${max_attempts}); retrying"
-              sleep 30
-              continue
-            fi
-
-            state="$(jq -r --arg ctx "$expected_context" '[.[] | select(.context == $ctx)] | sort_by(.created_at) | last | .state // empty' <<<"$statuses" 2>/dev/null || true)"
-            case "$state" in
-              success)
+            artifacts="$(gh api "repos/${GITHUB_REPOSITORY}/actions/artifacts?name=${artifact_name}&per_page=100" 2>/dev/null || true)"
+            mapfile -t candidates < <(jq -r '.artifacts | map(select(.expired == false)) | sort_by(.created_at) | reverse[] | [.id, .workflow_run.id] | @tsv' <<<"$artifacts" 2>/dev/null || true)
+            for candidate in "${candidates[@]}"; do
+              IFS=$'\t' read -r artifact_id owner_run_id <<<"$candidate"
+              if [[ ! "$artifact_id" =~ ^[1-9][0-9]*$ ]] || [[ ! "$owner_run_id" =~ ^[1-9][0-9]*$ ]]; then
+                continue
+              fi
+              owner="$(gh api "repos/${GITHUB_REPOSITORY}/actions/runs/${owner_run_id}" 2>/dev/null || true)"
+              workflow_id="$(jq -r '.workflow_id // empty' <<<"$owner" 2>/dev/null || true)"
+              owner_event="$(jq -r '.event // empty' <<<"$owner" 2>/dev/null || true)"
+              owner_conclusion="$(jq -r '.conclusion // empty' <<<"$owner" 2>/dev/null || true)"
+              workflow_path=""
+              if [[ "$workflow_id" =~ ^[1-9][0-9]*$ ]]; then
+                workflow_path="$(gh api "repos/${GITHUB_REPOSITORY}/actions/workflows/${workflow_id}" --jq '.path // empty' 2>/dev/null || true)"
+              fi
+              if [ "$owner_event" = workflow_run ] && [ "$owner_conclusion" = success ] \
+                && [ "$workflow_path" = .github/workflows/launch-advisory-trust.yml ]; then
+                rm -rf trusted-verdict verdict.zip
+                mkdir trusted-verdict
+                gh api "repos/${GITHUB_REPOSITORY}/actions/artifacts/${artifact_id}/zip" > verdict.zip
+                unzip -q verdict.zip -d trusted-verdict
+                expected_record="release_sha=${release_sha}
+release_run_id=${RELEASE_RUN_ID}
+release_run_attempt=${RELEASE_RUN_ATTEMPT}
+verdict=PASS"
+                record="$(cat trusted-verdict/verdict.txt 2>/dev/null || true)"
+                if [ "$record" != "$expected_record" ]; then
+                  echo "::error title=Release validation failed::trusted verdict artifact has invalid contents" >&2
+                  exit 1
+                fi
                 echo "Trusted launch advisory verdict is PASS for ${release_sha}"
-                {
-                  echo "### Trusted Launch Advisory Gate"
-                  echo ""
-                  echo "Validated ${release_sha} from protected \`main\` code."
-                  echo ""
-                  echo "Verdict context: \`${expected_context}\`"
-                  echo ""
-                } >> "$GITHUB_STEP_SUMMARY"
                 exit 0
-                ;;
-              failure|error)
-                echo "::error title=Release validation failed::the trusted launch advisory verdict for this run attempt did not pass for ${release_sha}" >&2
-                exit 1
-                ;;
-              *)
-                echo "No trusted launch advisory verdict for this run attempt on ${release_sha} yet (attempt ${attempt}/${max_attempts}); waiting"
-                sleep 30
-                ;;
-            esac
+              fi
+            done
+            echo "No authenticated verdict yet (attempt ${attempt}/${max_attempts}); waiting"
+            sleep 30
           done
 
-          echo "::error title=Missing release validation::no trusted launch advisory verdict was published for this run attempt on ${release_sha}" >&2
+          echo "::error title=Missing release validation::no authenticated trusted launch advisory verdict was published" >&2
           exit 1
 
   validate-release-sha:

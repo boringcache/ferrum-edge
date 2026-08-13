@@ -34,23 +34,12 @@ name: Trusted Launch Advisory Gate
 #      closed mapping, and this workflow declares no top-level `env:` or
 #      `defaults:`, because the anchored command is only as exact as the
 #      environment that resolves it.
-#   3. `publish-verdict` holds no secret and publishes a fixed-text commit
-#      status on the candidate SHA, under a context bound to the exact Release
-#      run and run attempt that asked for it. `release.yml` consumes only its
-#      own context; it never needs the credential itself.
+#   3. `publish-verdict` holds no secret and uploads a fixed-text artifact
+#      bound to the exact Release run and attempt. `release.yml` authenticates
+#      the artifact's owning workflow ID and path before consuming it. Unlike a
+#      commit status, a tag-controlled workflow cannot forge that provenance.
 #
-# A commit-wide status context would be replayable: the daily audit, an earlier
-# tag release on the same commit, or an earlier attempt of the same Release run
-# would already satisfy a later release before that release's own trusted
-# evaluation finished, so a blocker opened in between would be invisible. Every
-# release verdict is therefore published as
-# `trusted-launch-advisory-gate/release-<run_id>-attempt-<attempt>`, and the
-# scheduled default-branch audit uses a separate `.../main-audit` context that
-# can never satisfy any release.
-#
-# Nothing here prints the credential or any private advisory identifier: the
-# checker refuses to emit advisory fields, and the published status text is a
-# constant.
+# Nothing here prints the credential or any private advisory identifier.
 
 on:
   workflow_run:
@@ -86,7 +75,7 @@ jobs:
       candidate_sha: ${{ steps.candidate.outputs.candidate_sha }}
       candidate_label: ${{ steps.candidate.outputs.candidate_label }}
       trusted_sha: ${{ steps.candidate.outputs.trusted_sha }}
-      status_context: ${{ steps.candidate.outputs.status_context }}
+      verdict_artifact: ${{ steps.candidate.outputs.verdict_artifact }}
     steps:
       # `refs/heads/main` is the protected default branch. It is written as a
       # literal so no event payload field can redirect the checkout. The commit
@@ -186,7 +175,7 @@ jobs:
             label="main"
             # Deliberately not of the release shape: a default-branch audit can
             # never satisfy any release gate.
-            status_context="trusted-launch-advisory-gate/main-audit"
+            verdict_artifact="trusted-launch-advisory-verdict-main-audit-${GITHUB_RUN_ID}-attempt-${GITHUB_RUN_ATTEMPT}"
           else
             if [[ ! "$tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([-.][0-9A-Za-z.]+)?$ ]]; then
               fail "release tag name is not a normalized version tag"
@@ -225,20 +214,20 @@ jobs:
             # Unique per Release run AND per run attempt, so no earlier
             # release, earlier attempt, or scheduled audit on this same commit
             # can ever satisfy a later release.
-            status_context="trusted-launch-advisory-gate/release-${release_run_id}-attempt-${release_run_attempt}"
+            verdict_artifact="trusted-launch-advisory-verdict-release-${release_run_id}-attempt-${release_run_attempt}"
           fi
 
           # Both operands were validated above; re-assert the whole derived
-          # context so nothing unexpected can be published.
-          if [[ ! "$status_context" =~ ^trusted-launch-advisory-gate/(main-audit|release-[1-9][0-9]{0,17}-attempt-[1-9][0-9]{0,17})$ ]]; then
-            fail "derived status context is not of an admitted shape"
+          # artifact name so nothing unexpected can be published.
+          if [[ ! "$verdict_artifact" =~ ^trusted-launch-advisory-verdict-(main-audit-[1-9][0-9]{0,17}-attempt-[1-9][0-9]{0,17}|release-[1-9][0-9]{0,17}-attempt-[1-9][0-9]{0,17})$ ]]; then
+            fail "derived verdict artifact name is not of an admitted shape"
           fi
 
           echo "candidate_sha=${candidate}" >> "$GITHUB_OUTPUT"
           echo "candidate_label=${label}" >> "$GITHUB_OUTPUT"
           echo "trusted_sha=${trusted_sha}" >> "$GITHUB_OUTPUT"
-          echo "status_context=${status_context}" >> "$GITHUB_OUTPUT"
-          echo "trusted anchor ${trusted_sha}; candidate ${candidate} (${label}); context ${status_context}"
+          echo "verdict_artifact=${verdict_artifact}" >> "$GITHUB_OUTPUT"
+          echo "trusted anchor ${trusted_sha}; candidate ${candidate} (${label}); artifact ${verdict_artifact}"
 
       - name: Require successful push CI for the exact candidate SHA
         env:
@@ -368,47 +357,26 @@ jobs:
     if: always() && needs.establish-trust.result == 'success'
     runs-on: ubuntu-latest
     timeout-minutes: 10
-    permissions:
-      statuses: write
     steps:
-      # No checkout: this job runs no repository code at all, and the status
-      # text is a constant so neither the credential nor any advisory
-      # identifier can reach a public commit status.
-      - name: Publish the verdict status on the candidate commit
+      - name: Write fixed verdict record
         env:
-          GH_TOKEN: ${{ github.token }}
           CANDIDATE_SHA: ${{ needs.establish-trust.outputs.candidate_sha }}
-          STATUS_CONTEXT: ${{ needs.establish-trust.outputs.status_context }}
+          VERDICT_ARTIFACT: ${{ needs.establish-trust.outputs.verdict_artifact }}
           VERDICT_RESULT: ${{ needs.advisory-verdict.result }}
+          RELEASE_RUN_ID: ${{ github.event.workflow_run.id || github.run_id }}
+          RELEASE_RUN_ATTEMPT: ${{ github.event.workflow_run.run_attempt || github.run_attempt }}
         run: |
           set -euo pipefail
+          [[ "$CANDIDATE_SHA" =~ ^[0-9a-f]{40}$ ]] || exit 1
+          [[ "$VERDICT_ARTIFACT" =~ ^trusted-launch-advisory-verdict-(main-audit-[1-9][0-9]{0,17}-attempt-[1-9][0-9]{0,17}|release-[1-9][0-9]{0,17}-attempt-[1-9][0-9]{0,17})$ ]] || exit 1
+          [ "$VERDICT_RESULT" = success ] || exit 1
+          printf 'release_sha=%s\nrelease_run_id=%s\nrelease_run_attempt=%s\nverdict=PASS\n' \
+            "$CANDIDATE_SHA" "$RELEASE_RUN_ID" "$RELEASE_RUN_ATTEMPT" > verdict.txt
 
-          if [[ ! "$CANDIDATE_SHA" =~ ^[0-9a-f]{40}$ ]]; then
-            echo "::error title=Launch advisory trust::candidate SHA is missing" >&2
-            exit 1
-          fi
-
-          # Re-assert the run-bound context here too: this job is the only
-          # writer, so a malformed or commit-wide context must never be posted.
-          if [[ ! "$STATUS_CONTEXT" =~ ^trusted-launch-advisory-gate/(main-audit|release-[1-9][0-9]{0,17}-attempt-[1-9][0-9]{0,17})$ ]]; then
-            echo "::error title=Launch advisory trust::status context is missing or not run-bound" >&2
-            exit 1
-          fi
-
-          state="failure"
-          if [ "$VERDICT_RESULT" = "success" ]; then
-            state="success"
-          fi
-
-          gh api --method POST \
-            "repos/${GITHUB_REPOSITORY}/statuses/${CANDIDATE_SHA}" \
-            -f "state=${state}" \
-            -f "context=${STATUS_CONTEXT}" \
-            -f "description=Launch advisory verdict computed from protected main" \
-            -f "target_url=${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}" \
-            > /dev/null
-
-          echo "published ${STATUS_CONTEXT}=${state} for ${CANDIDATE_SHA}"
-          if [ "$state" != "success" ]; then
-            exit 1
-          fi
+      - name: Publish authenticated verdict artifact
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: ${{ needs.establish-trust.outputs.verdict_artifact }}
+          path: verdict.txt
+          if-no-files-found: error
+          retention-days: 1

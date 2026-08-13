@@ -229,55 +229,27 @@ branch or tag ref, so a manual dispatch is not intrinsically trusted code.
    credential even if one were somehow present. The candidate reaches this job
    only as `LAUNCH_TARGET_SHA`; no candidate byte is fetched, imported, or run.
    The credential comes from the protected `launch-advisory` environment.
-5. `publish-verdict` holds no secret and posts a fixed-text commit status on the
-   candidate SHA under the context
-   `trusted-launch-advisory-gate/release-<run id>-attempt-<attempt>`. Neither
-   the credential nor any advisory identifier appears in the status, the logs,
-   or any artifact.
-6. `release.yml`'s `validate-launch-readiness` job derives the identical context
-   from its own `github.run_id` and `github.run_attempt`, waits for **only that
-   context** on the commit its tag resolves to, and fails closed if it is
-   absent, `failure`, or `error`. The release still cannot proceed without a
-   computed `PASS`; the decision simply moved to code a tag cannot rewrite.
+5. `publish-verdict` holds no secret and uploads a fixed-text artifact named
+   `trusted-launch-advisory-verdict-release-<run id>-attempt-<attempt>` to the
+   trusted workflow run. The record binds the candidate SHA, Release run ID,
+   run attempt, and `PASS`; it contains no credential or advisory identifier.
+6. `release.yml` derives that exact artifact name from its own run identity. It
+   verifies the artifact-owning run used the `workflow_run` event, completed
+   successfully, and belongs to `.github/workflows/launch-advisory-trust.yml`
+   before matching the record byte-for-byte. A tag-controlled workflow may
+   upload an artifact with the same name, but cannot make its run acquire that
+   trusted workflow identity, so it cannot satisfy the gate.
 
-### Why the verdict is bound to a run attempt
+### Why the verdict is bound to a run attempt and workflow identity
 
-Commit statuses are commit-wide. A single constant
-`trusted-launch-advisory-gate` context would be replayable: the daily audit of
-protected `main`, an earlier tag release on the same commit, or an earlier
-attempt of the same Release run would already have posted a success, and a
-release started afterwards would consume it before its own trusted evaluation
-had run. A blocker opened in between would be invisible.
-
-So every release verdict carries a context unique to one Release run **and** one
-run attempt:
-
-| Lane | Context |
-|------|---------|
-| Release (`workflow_run: in_progress`) | `trusted-launch-advisory-gate/release-<run id>-attempt-<attempt>` |
-| Scheduled default-branch audit | `trusted-launch-advisory-gate/main-audit` |
-
-Both operands are validated as strict positive decimals (`^[1-9][0-9]{0,17}$`)
-on both sides, and the whole derived context is re-checked against the admitted
-shape before it is published, so no payload or input value can lengthen or
-reshape it. The audit context is not of the release shape, so an audit verdict
-can never satisfy a release gate.
-
-Every one of those preconditions fails closed. If the triggering payload does
-not carry a usable tag name, run ID, or run attempt, if the tag is ambiguous, if
-it moved after the event, or if it is not reachable from protected `main`, no
-credential is released and no verdict is published, so the release times out red
-rather than proceeding.
-
-To recover a stuck evaluation, rerun the trusted workflow itself. To reevaluate
-after a Release rerun, rerun the Release workflow; its new run attempt emits a
-fresh `workflow_run: in_progress` event and receives a distinct verdict context.
-There is no manual-dispatch lane because its caller-selected ref would weaken
-the trusted-code proof.
-
-Because the policy, the exemptions, and `PRODUCTION_READINESS.md` are all read
-from the trusted anchor, the reviewed snapshot compared against the live verdict
-is protected `main`'s — never the candidate's copy of it.
+The artifact name includes the Release run ID and attempt, preventing an older
+verdict for the same commit from being replayed after advisory state changes.
+The release gate does not trust the name alone: artifact names are repository-
+wide and forgeable. It resolves the artifact's owning Actions run and requires
+the immutable workflow path `.github/workflows/launch-advisory-trust.yml`, the
+`workflow_run` event, and a successful conclusion before reading the fixed
+record. The record then independently binds the release SHA, run ID, attempt,
+and `PASS`. Every missing or mismatched field fails closed.
 
 ### The credential job is a closed step sequence, and the verifier checks the whole sequence
 
