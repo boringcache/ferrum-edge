@@ -267,6 +267,12 @@ fn h3_websocket_bridge_source_forks_shared_mesh_egress() {
         loop_tail.contains("select_next_h3_eligible_retry_target("),
         "H3 WS retry must skip Unix-only candidates via the shared helper"
     );
+    assert!(
+        loop_tail.contains("(Some(_), Some(_), None)")
+            && loop_tail.contains("WS_MESH_BACKEND_REQUEST_TARGET_INVALID"),
+        "a mesh WS target with an invalid target-effective URI must fail closed, \
+         not silently substitute `/`"
+    );
 }
 
 #[test]

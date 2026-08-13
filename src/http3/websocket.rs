@@ -1030,32 +1030,48 @@ pub(crate) async fn handle_h3_websocket(
             }
             _ => std::borrow::Cow::Borrowed(current_backend_url.as_str()),
         };
-        let ws_path_and_query: std::borrow::Cow<'_, str> = ws_backend_url_for_parse
-            .parse::<hyper::Uri>()
-            .ok()
-            .and_then(|uri| uri.path_and_query().map(|pq| pq.as_str().to_string()))
-            .map(std::borrow::Cow::Owned)
-            .unwrap_or(std::borrow::Cow::Borrowed("/"));
+        // Keep parse failure distinct from a valid authority with no explicit
+        // path. The latter correctly means `/`; the former must fail a mesh
+        // dispatch closed rather than silently change the authorized backend
+        // request target to `/`.
+        let ws_path_and_query: Option<std::borrow::Cow<'_, str>> =
+            ws_backend_url_for_parse
+                .parse::<hyper::Uri>()
+                .ok()
+                .map(|uri| {
+                    uri.path_and_query()
+                        .map(|pq| std::borrow::Cow::Owned(pq.as_str().to_string()))
+                        .unwrap_or(std::borrow::Cow::Borrowed("/"))
+                });
         let ws_dial_result: Result<
             crate::proxy::WsBackendHandshake,
             Box<dyn std::error::Error + Send + Sync>,
-        > = match (&ws_mesh_egress, current_target.as_deref()) {
-            (Some(egress), Some(target)) => crate::proxy::connect_mesh_websocket_backend(
-                &state,
-                ws_dial_proxy,
-                target,
-                egress,
-                request_host.as_deref(),
-                ws_path_and_query.as_ref(),
-                &client_headers,
-                ws_size_limits.max_frame_bytes,
-                ws_size_limits.max_message_bytes,
-                state.websocket_write_buffer_size,
-                ws_idle_tracker.clone(),
-                ctx.peer_spiffe_id.as_ref(),
-            )
-            .await
-            .map(|handshake| crate::proxy::WsBackendHandshake::Mesh(Box::new(handshake))),
+        > = match (
+            &ws_mesh_egress,
+            current_target.as_deref(),
+            ws_path_and_query.as_deref(),
+        ) {
+            (Some(egress), Some(target), Some(path_and_query)) => {
+                crate::proxy::connect_mesh_websocket_backend(
+                    &state,
+                    ws_dial_proxy,
+                    target,
+                    egress,
+                    request_host.as_deref(),
+                    path_and_query,
+                    &client_headers,
+                    ws_size_limits.max_frame_bytes,
+                    ws_size_limits.max_message_bytes,
+                    state.websocket_write_buffer_size,
+                    ws_idle_tracker.clone(),
+                    ctx.peer_spiffe_id.as_ref(),
+                )
+                .await
+                .map(|handshake| crate::proxy::WsBackendHandshake::Mesh(Box::new(handshake)))
+            }
+            (Some(_), Some(_), None) => {
+                Err(crate::retry::WS_MESH_BACKEND_REQUEST_TARGET_INVALID.into())
+            }
             _ => crate::proxy::connect_websocket_backend(
                 &current_backend_url,
                 ws_dial_proxy,
