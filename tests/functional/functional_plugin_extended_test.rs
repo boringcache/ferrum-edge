@@ -113,48 +113,128 @@ impl PluginExtTestHarness {
         Ok(())
     }
 
-    /// Wait for DB poll to pick up config changes.
-    /// Probes beneath `path` until the gateway returns any non-404 response,
-    /// which proves the route has been registered by the DB poller.
-    async fn wait_for_route(&self, path: &str) {
-        self.wait_for_route_probe(&format!("{path}/wait-for-route-probe"))
-            .await;
+    /// Observe authenticated `/health` poll-freshness fields without touching
+    /// the proxy datapath. Diagnostics are closed-set health fields only —
+    /// never Authorization, tokens, or request bodies.
+    async fn observe_database_poll(&self, client: &reqwest::Client) -> PollObservation {
+        match client
+            .get(format!("{}/health", self.admin_base_url))
+            .header("Authorization", self.auth_header())
+            .send()
+            .await
+        {
+            Err(err) => PollObservation {
+                last_poll_completed_at: None,
+                decoded: false,
+                diagnostic: format!("error={err}"),
+            },
+            Ok(resp) => {
+                let status = resp.status();
+                match resp.json::<serde_json::Value>().await {
+                    Err(err) => PollObservation {
+                        last_poll_completed_at: None,
+                        decoded: false,
+                        diagnostic: format!("http_status={status} decode_error={err}"),
+                    },
+                    Ok(body) => {
+                        let stamp = body
+                            .pointer("/database_polling/last_poll_completed_at")
+                            .and_then(|value| value.as_str())
+                            .map(str::to_owned);
+                        let health_status = body
+                            .get("status")
+                            .and_then(|value| value.as_str())
+                            .unwrap_or("missing");
+                        let ready = body
+                            .get("ready")
+                            .map(|value| value.to_string())
+                            .unwrap_or_else(|| "missing".to_string());
+                        let polling_status = body
+                            .pointer("/database_polling/status")
+                            .and_then(|value| value.as_str())
+                            .unwrap_or("missing");
+                        let loaded_at = body
+                            .pointer("/cached_config/loaded_at")
+                            .and_then(|value| value.as_str())
+                            .unwrap_or("missing");
+                        let proxy_count = body
+                            .pointer("/cached_config/proxy_count")
+                            .map(|value| value.to_string())
+                            .unwrap_or_else(|| "missing".to_string());
+                        let poll_stamp = stamp.as_deref().unwrap_or("none");
+                        let diagnostic = format!(
+                            "http_status={status} health_status={health_status} ready={ready} \
+                             polling_status={polling_status} last_poll_completed_at={poll_stamp} \
+                             loaded_at={loaded_at} proxy_count={proxy_count}"
+                        );
+                        PollObservation {
+                            last_poll_completed_at: stamp,
+                            decoded: true,
+                            diagnostic,
+                        }
+                    }
+                }
+            }
+        }
     }
 
-    /// Wait until an exact request path returns a non-404 response.
-    /// Use when the only successful paths are plugin rule matches (e.g.
-    /// `response_mock` without passthrough) and a child probe would stay 404.
-    async fn wait_for_route_probe(&self, path: &str) {
-        let url = format!("{}{}", self.proxy_base_url, path);
+    /// Wait until a database poll that started after the final config write
+    /// has been consumed.
+    ///
+    /// Authenticated `/health` `database_polling.last_poll_completed_at`
+    /// advances at the end of every poll tick, after that tick has published
+    /// or confirmed the snapshot it loaded. The first completion after the
+    /// two-stage create-then-update may still belong to a poll that began
+    /// before the proxy `plugins` refs were committed and therefore published
+    /// the route-only snapshot. The second completion must have started after
+    /// that first tick finished, so it cannot still be that in-flight read.
+    /// This does not probe the proxy listen path, so it cannot pre-consume a
+    /// cache entry, mock match, or SOAP auth attempt used by the test.
+    async fn wait_for_applied_generation(&self) {
         let client = reqwest::Client::builder()
             .timeout(Duration::from_secs(1))
             .build()
-            .expect("Failed to build route-readiness probe client");
+            .expect("Failed to build poll-generation probe client");
         let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
-        let mut last_observation = None;
+        let mut last_observation = String::from("no attempts completed");
+        let mut seen_stamp: Option<String> = None;
+        let mut have_baseline = false;
+        let mut remaining = 2u8;
 
         loop {
             if tokio::time::Instant::now() >= deadline {
                 panic!(
-                    "Gateway did not register route '{}' within 15 seconds; {}",
-                    path,
-                    last_observation
-                        .as_deref()
-                        .unwrap_or("no attempts completed")
+                    "Gateway did not consume a post-update poll generation within 15 seconds; \
+                     remaining_completions={remaining}; {last_observation}"
                 );
             }
-            match client.get(&url).send().await {
-                Ok(r) if r.status().as_u16() != 404 => return,
-                Ok(r) => {
-                    last_observation = Some(format!("status={}", r.status()));
-                }
-                Err(err) => {
-                    last_observation = Some(format!("error={err}"));
+            let observation = self.observe_database_poll(&client).await;
+            last_observation = observation.diagnostic;
+            if observation.decoded {
+                if !have_baseline {
+                    seen_stamp = observation.last_poll_completed_at;
+                    have_baseline = true;
+                } else if observation.last_poll_completed_at != seen_stamp {
+                    if observation.last_poll_completed_at.is_some() {
+                        remaining -= 1;
+                        seen_stamp = observation.last_poll_completed_at;
+                        if remaining == 0 {
+                            return;
+                        }
+                    } else {
+                        seen_stamp = None;
+                    }
                 }
             }
             tokio::time::sleep(Duration::from_millis(250)).await;
         }
     }
+}
+
+struct PollObservation {
+    last_poll_completed_at: Option<String>,
+    decoded: bool,
+    diagnostic: String,
 }
 
 /// Echo backend that returns request info as JSON.
@@ -240,7 +320,8 @@ async fn start_echo_backend(
     Ok(handle)
 }
 
-/// Helper: set up a proxy with plugins, then wait for route readiness
+/// Helper: create a proxy, attach plugin refs, then wait until a poll
+/// generation that started after that final update has been applied.
 async fn setup_proxy_with_plugins(
     harness: &PluginExtTestHarness,
     client: &reqwest::Client,
@@ -284,6 +365,8 @@ async fn setup_proxy_with_plugins(
             }),
         )
         .await?;
+
+    harness.wait_for_applied_generation().await;
 
     Ok(())
 }
@@ -334,8 +417,6 @@ async fn test_plugin_compression_gzip_response() {
     )
     .await
     .unwrap();
-
-    harness.wait_for_route("/compress").await;
 
     // Send request with Accept-Encoding: gzip
     let resp = client
@@ -416,8 +497,6 @@ async fn test_plugin_compression_no_accept_encoding() {
     .await
     .unwrap();
 
-    harness.wait_for_route("/compress2").await;
-
     // Send request WITHOUT Accept-Encoding — should not compress
     let resp = client
         .get(format!("{}/compress2/test", harness.proxy_base_url))
@@ -478,8 +557,6 @@ async fn test_plugin_response_caching_cache_hit() {
     )
     .await
     .unwrap();
-
-    harness.wait_for_route("/cache").await;
 
     // First request — cache miss
     let resp1 = client
@@ -542,8 +619,6 @@ async fn test_plugin_response_caching_post_bypass() {
     .await
     .unwrap();
 
-    harness.wait_for_route("/cache-post").await;
-
     // POST requests should bypass cache — send with body to verify it reaches backend
     let resp = client
         .post(format!("{}/cache-post/test", harness.proxy_base_url))
@@ -593,8 +668,6 @@ async fn test_plugin_graphql_depth_limiting_reject() {
     )
     .await
     .unwrap();
-
-    harness.wait_for_route("/graphql").await;
 
     // Send a deeply nested query (depth > 2)
     let deep_query = json!({
@@ -658,8 +731,6 @@ async fn test_plugin_graphql_valid_query_allowed() {
     .await
     .unwrap();
 
-    harness.wait_for_route("/graphql2").await;
-
     // Simple query within depth limit
     let simple_query = json!({
         "query": "{ user { name } }"
@@ -714,8 +785,6 @@ async fn test_plugin_graphql_introspection_disabled() {
     )
     .await
     .unwrap();
-
-    harness.wait_for_route("/graphql3").await;
 
     // Introspection query
     let introspection = json!({
@@ -782,9 +851,6 @@ async fn test_plugin_response_mock_returns_mock() {
     )
     .await
     .unwrap();
-
-    // No passthrough: probe the mock rule path so readiness proves plugin + route.
-    harness.wait_for_route_probe("/mock/hello").await;
 
     let resp = client
         .get(format!("{}/mock/hello", harness.proxy_base_url))
@@ -854,8 +920,6 @@ async fn test_plugin_response_mock_fallthrough() {
     .await
     .unwrap();
 
-    harness.wait_for_route("/mock2").await;
-
     // Request to a non-matching path should fall through to the real backend
     let resp = client
         .get(format!("{}/mock2/other-path", harness.proxy_base_url))
@@ -911,9 +975,6 @@ async fn test_plugin_response_mock_path_scoping() {
     )
     .await
     .unwrap();
-
-    // No passthrough: probe the scoped mock rule path, not a child suffix.
-    harness.wait_for_route_probe("/api/v1/users").await;
 
     // Request to /api/v1/users — mock rule path is /users (relative to listen_path)
     let resp = client
@@ -981,8 +1042,6 @@ async fn test_plugin_soap_ws_security_username_token() {
     )
     .await
     .unwrap();
-
-    harness.wait_for_route("/soap").await;
 
     // Valid SOAP request with UsernameToken
     let soap_body = r#"<?xml version="1.0" encoding="UTF-8"?>
@@ -1063,8 +1122,6 @@ async fn test_plugin_soap_ws_security_missing_header() {
     .await
     .unwrap();
 
-    harness.wait_for_route("/soap2").await;
-
     // SOAP request WITHOUT Security header
     let soap_no_security = r#"<?xml version="1.0" encoding="UTF-8"?>
 <soap:Envelope xmlns:soap="http://schemas.xmlsoap.org/soap/envelope/">
@@ -1134,8 +1191,6 @@ async fn test_plugin_soap_ws_security_utf16le_username_token() {
     )
     .await
     .unwrap();
-
-    harness.wait_for_route("/soap-utf16le").await;
 
     let soap_body = r#"<?xml version="1.0" encoding="UTF-16"?>
 <soap:Envelope xmlns:soap="http://schemas.xmlsoap.org/soap/envelope/"
@@ -1256,8 +1311,6 @@ async fn test_plugin_soap_ws_security_utf16be_username_token() {
     .await
     .unwrap();
 
-    harness.wait_for_route("/soap-utf16be").await;
-
     let soap_body = r#"<?xml version="1.0" encoding="UTF-16"?>
 <soap:Envelope xmlns:soap="http://schemas.xmlsoap.org/soap/envelope/">
     <soap:Header>
@@ -1355,8 +1408,6 @@ async fn test_plugin_soap_ws_security_utf16_charset_conflict_rejects() {
     )
     .await
     .unwrap();
-
-    harness.wait_for_route("/soap-utf16-conflict").await;
 
     let soap_body = r#"<?xml version="1.0" encoding="UTF-16"?>
 <soap:Envelope xmlns:soap="http://schemas.xmlsoap.org/soap/envelope/">
