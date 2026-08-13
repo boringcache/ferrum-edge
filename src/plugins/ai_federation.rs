@@ -436,7 +436,9 @@ impl OAuth2Cache {
 
         let req = http_client
             .get()
-            .map_err(|e| AuthFailure::local(format!("ai_federation: OAuth2 token request failed: {e}")))?
+            .map_err(|e| {
+                AuthFailure::local(format!("ai_federation: OAuth2 token request failed: {e}"))
+            })?
             .post(&self.token_uri)
             .header("content-type", "application/x-www-form-urlencoded")
             .body(body);
