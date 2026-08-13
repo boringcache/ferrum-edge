@@ -3059,8 +3059,33 @@ fn jwks_auth_schema_and_cache_guide_match_runtime_contract() {
         json!(ferrum_edge::plugins::jwks_auth::MAX_JWKS_MAX_STALE_SECONDS)
     );
     assert_eq!(
-        schema["properties"]["providers"]["items"]["properties"]["dpop_jti_cache_max_entries"]["default"],
-        json!(ferrum_edge::plugins::jwks_auth::DEFAULT_DPOP_JTI_CACHE_MAX_ENTRIES)
+        schema["properties"]["providers"]["items"]["properties"]["dpop_replay_max_entries"]
+            ["default"],
+        json!(ferrum_edge::plugins::jwks_auth::DEFAULT_DPOP_REPLAY_MAX_ENTRIES)
+    );
+    // The DPoP replay scope has no default: an operator must declare whether
+    // process-local replay state is sufficient. A schema default here would
+    // reinstate silent per-replica replay.
+    assert_eq!(
+        schema["properties"]["providers"]["items"]["properties"]["dpop_replay_scope"]["enum"],
+        json!(["process", "shared"])
+    );
+    assert!(
+        schema["properties"]["providers"]["items"]["properties"]["dpop_replay_scope"]["default"]
+            .is_null()
+    );
+    assert_eq!(
+        schema["properties"]["providers"]["items"]["properties"]["dpop_clock_skew_secs"]["maximum"],
+        json!(ferrum_edge::plugins::utils::dpop::MAX_DPOP_CLOCK_SKEW_SECS)
+    );
+    // The removed replay knobs must not reappear: retention is a fixed horizon
+    // derived from the clock-skew ceiling, not a configured value.
+    assert!(
+        schema["properties"]["providers"]["items"]["properties"]["dpop_jti_ttl_secs"].is_null()
+    );
+    assert!(
+        schema["properties"]["providers"]["items"]["properties"]["dpop_jti_cache_max_entries"]
+            .is_null()
     );
 
     let guide = include_str!("../../docs/cache_management.md");

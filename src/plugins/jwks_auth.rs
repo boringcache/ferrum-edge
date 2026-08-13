@@ -26,7 +26,10 @@ use super::utils::claim_header_fanout::{
 use super::utils::claim_resolver::{
     extract_claim_string, extract_claim_string_exact, parse_claim_path_value,
 };
-use super::utils::dpop::{self, DpopJtiCache, DpopVerifyInput};
+use super::utils::dpop::{
+    self, DPOP_MARKER_RETENTION_SECONDS, DPOP_REPLAY_PROFILE, DpopVerifyInput,
+    MAX_DPOP_CLOCK_SKEW_SECS,
+};
 use super::utils::jwks_cache::{
     DiscoveryStoreCandidate, JwksRefreshRequirement, LateActiveRequirement,
     clear_late_active_requirement, get_or_create_jwks_store, last_discovered_jwks_uri,
@@ -36,6 +39,11 @@ use super::utils::jwks_cache::{
 pub use super::utils::jwks_store::{DEFAULT_JWKS_MAX_STALE_SECONDS, MAX_JWKS_MAX_STALE_SECONDS};
 use super::utils::jwks_store::{JwksKeyStore, redacted_jwks_uri};
 use super::utils::jwt_verifier::{JwtVerifyParams, peek_unverified_issuer, verify_jwt_with_jwks};
+use super::utils::redis_rate_limiter::{REDIS_PLUGIN_CONFIG_KEYS, RedisConfig, RedisRateLimitClient};
+use super::utils::replay_authority::{
+    ReplayAdmission, ReplayAuthority, ReplayDomain, ReplayMarker, ReplayScope,
+    validate_scope_backend,
+};
 use super::utils::response_body::read_response_body_bounded;
 use super::utils::scope_role_check::{self, ScopeRoleRequirements};
 use super::utils::token_extract::{
@@ -48,7 +56,14 @@ use super::{JwtAuthAttributeValue, PluginResult, RequestContext};
 /// Default JWKS refresh interval: 15 minutes.
 pub const DEFAULT_JWKS_REFRESH_INTERVAL_SECS: u64 = 900;
 pub const MAX_JWKS_REFRESH_INTERVAL_SECS: u64 = MAX_JWKS_MAX_STALE_SECONDS;
-pub const DEFAULT_DPOP_JTI_CACHE_MAX_ENTRIES: usize = 10_000;
+/// Default capacity of a `dpop_replay_scope: process` lane.
+///
+/// Markers are retained for the fixed `DPOP_MARKER_RETENTION_SECONDS` horizon,
+/// so this bounds sustained authenticated DPoP throughput on a process lane at
+/// roughly `capacity / retention` proofs per second. Over-provisioning surfaces
+/// as fail-closed `401`s (see `ReplayAdmission::CapacityRefused`), never as a
+/// silently reusable proof; `shared` scope moves the cost into Redis.
+pub const DEFAULT_DPOP_REPLAY_MAX_ENTRIES: usize = 100_000;
 const MAX_DISCOVERY_RESPONSE_BYTES: usize = 128 * 1024;
 const MAX_DISCOVERED_JWKS_URI_BYTES: usize = 8 * 1024;
 const STRIP_AUTHORIZATION_METADATA_KEY: &str = "jwks_auth.strip_authorization";
@@ -166,8 +181,18 @@ struct JwksProvider {
     require_dpop: bool,
     /// Allowed DPoP proof clock skew.
     dpop_clock_skew: Duration,
-    /// Bounded replay cache for DPoP proof JTIs.
-    dpop_jti_cache: Option<Arc<DpopJtiCache>>,
+    /// Stable protection-domain identity for this provider's DPoP proofs.
+    ///
+    /// Precomputed at construction from `{namespace, jwks_auth, config id,
+    /// provider index}` so no request path hashes configuration, and so an
+    /// equivalent reload — and every replica of the same policy — derives the
+    /// same domain and therefore the same replay lane / shared keyspace.
+    dpop_replay_domain: Option<ReplayDomain>,
+    /// Single-use authority this provider's proofs are claimed against.
+    ///
+    /// Owned by the shared registry rather than by this plugin generation, so a
+    /// plugin-cache rebuild inherits live markers instead of starting empty.
+    dpop_replay: Option<Arc<ReplayAuthority>>,
     /// The JWKS key store (shared via global cache).
     jwks_store: Arc<ArcSwap<Option<Arc<JwksKeyStore>>>>,
     /// Maximum monotonic age of the last validated non-empty remote JWKS.
@@ -202,6 +227,17 @@ const CONFIG_FIELDS: &[&str] = &[
     "jwks_max_stale_seconds",
 ];
 
+/// Complete root allowlist: the plugin's own fields plus the shared Redis
+/// fields that back `dpop_replay_scope: shared`.
+///
+/// Unioned rather than duplicated so a new key in
+/// [`REDIS_PLUGIN_CONFIG_KEYS`] cannot silently become an unknown field here.
+fn root_config_fields() -> Vec<&'static str> {
+    let mut allowed = CONFIG_FIELDS.to_vec();
+    allowed.extend_from_slice(REDIS_PLUGIN_CONFIG_KEYS);
+    allowed
+}
+
 const PROVIDER_FIELDS: &[&str] = &[
     "jwks_uri",
     "discovery_url",
@@ -224,9 +260,28 @@ const PROVIDER_FIELDS: &[&str] = &[
     "require_mtls_binding",
     "require_dpop",
     "dpop_clock_skew_secs",
-    "dpop_jti_cache_max_entries",
-    "dpop_jti_ttl_secs",
+    "dpop_replay_scope",
+    "dpop_replay_max_entries",
     "jwks_max_stale_seconds",
+];
+
+/// Provider fields removed by the shared replay-authority migration, with the
+/// replacement named explicitly. Rejected rather than ignored: a config that
+/// still carries `dpop_jti_ttl_secs` was written believing it controls how long
+/// a proof stays single-use, and silently dropping it would leave that operator
+/// with an unexamined retention contract.
+const REMOVED_PROVIDER_FIELDS: &[(&str, &str)] = &[
+    (
+        "dpop_jti_ttl_secs",
+        "replay retention is no longer configurable — every marker is retained for a fixed \
+         horizon that dominates the widest admissible clock skew, so no reload can shorten an \
+         already-admitted proof's protection",
+    ),
+    (
+        "dpop_jti_cache_max_entries",
+        "renamed to 'dpop_replay_max_entries'; it now bounds a process replay lane that never \
+         evicts an unexpired marker (at capacity the request is refused instead)",
+    ),
 ];
 
 impl Drop for JwksAuth {
@@ -276,11 +331,59 @@ impl Drop for JwksAuth {
 }
 
 impl JwksAuth {
+    /// Construct without a stable policy identity.
+    ///
+    /// Admin config validation and direct/test construction take this path. A
+    /// `dpop_replay_scope: process` provider then gets a **private** lane keyed
+    /// by the standalone placeholder id, so a validation call can neither read,
+    /// mutate, nor consume a live proxy's replay history.
     pub fn new(config: &Value, http_client: PluginHttpClient) -> Result<Self, String> {
+        Self::new_with_config_id(config, http_client, None)
+    }
+
+    /// Construct with the configured plugin-config resource id.
+    ///
+    /// That id — together with the namespace and the provider index — is the
+    /// stable protection-domain identity. Production `PluginCache` must pass it:
+    /// with `None`, every reload generation would own a private replay lane and
+    /// a rebuilt plugin would accept a proof it had already admitted.
+    pub fn new_with_config_id(
+        config: &Value,
+        http_client: PluginHttpClient,
+        plugin_config_id: Option<&str>,
+    ) -> Result<Self, String> {
         let config_obj = config
             .as_object()
             .ok_or_else(|| format!("jwks_auth: config must be an object, got: {config}"))?;
-        reject_unknown_fields(config_obj, CONFIG_FIELDS, "config")?;
+        reject_unknown_fields(config_obj, &root_config_fields(), "config")?;
+
+        // A blank id would collapse every jwks_auth config in a namespace onto
+        // one replay domain; fail closed rather than merge them.
+        if plugin_config_id.is_some_and(|config_id| config_id.trim().is_empty()) {
+            return Err("jwks_auth: plugin config id must not be blank".to_string());
+        }
+        let namespace = http_client.namespace().to_string();
+        let policy_config_id = plugin_config_id
+            .unwrap_or(STANDALONE_JWKS_AUTH_CONFIG_ID)
+            .to_string();
+        // Redis fields are parsed and range-validated whether or not a provider
+        // activates them, matching every other Redis-backed plugin: toggling a
+        // provider to `shared` later cannot suddenly activate a malformed URL,
+        // a wrong scalar type, or a zero connection bound.
+        let default_redis_prefix = default_dpop_redis_key_prefix(&namespace, &policy_config_id);
+        let redis_config = RedisConfig::from_plugin_config(config, &default_redis_prefix)?;
+        let redis_configured = redis_config.is_some();
+        // One client per plugin generation, shared by every `shared` provider:
+        // the marker already binds the provider index, so distinct providers
+        // cannot collide inside one keyspace.
+        let shared_replay_client = redis_config.map(|redis_config| {
+            Arc::new(RedisRateLimitClient::new(
+                redis_config,
+                http_client.dns_cache().cloned(),
+                http_client.tls_no_verify(),
+                http_client.tls_ca_bundle_path(),
+            ))
+        });
 
         let refresh_interval_secs = optional_u64(
             config_obj,
@@ -335,11 +438,13 @@ impl JwksAuth {
         }
 
         let mut providers = Vec::with_capacity(providers_arr.len());
+        let mut declared_dpop_scopes: Vec<ReplayScope> = Vec::new();
 
         for (idx, prov_cfg) in providers_arr.iter().enumerate() {
             let prov_obj = prov_cfg.as_object().ok_or_else(|| {
                 format!("jwks_auth: provider[{idx}] must be an object, got: {prov_cfg}")
             })?;
+            reject_removed_provider_fields(prov_obj, idx)?;
             reject_unknown_fields(prov_obj, PROVIDER_FIELDS, &format!("provider[{idx}]"))?;
 
             let jwks_endpoint = parse_url_field(prov_obj, "jwks_uri", idx)?;
@@ -415,33 +520,85 @@ impl JwksAuth {
                 optional_provider_bool(prov_obj, "require_dpop", idx)?.unwrap_or(false);
             let dpop_clock_skew_secs =
                 optional_provider_u64(prov_obj, "dpop_clock_skew_secs", idx)?.unwrap_or(30);
-            if dpop_clock_skew_secs > 300 {
+            if dpop_clock_skew_secs > MAX_DPOP_CLOCK_SKEW_SECS {
                 return Err(format!(
-                    "jwks_auth: 'provider[{idx}].dpop_clock_skew_secs' must be <= 300"
+                    "jwks_auth: 'provider[{idx}].dpop_clock_skew_secs' must be <= {MAX_DPOP_CLOCK_SKEW_SECS}"
                 ));
             }
-            let dpop_jti_ttl_secs =
-                optional_provider_u64(prov_obj, "dpop_jti_ttl_secs", idx)?.unwrap_or(300);
-            if dpop_jti_ttl_secs < dpop_clock_skew_secs.saturating_mul(2) {
+            let dpop_replay_max_entries =
+                optional_provider_usize(prov_obj, "dpop_replay_max_entries", idx)?
+                    .unwrap_or(DEFAULT_DPOP_REPLAY_MAX_ENTRIES);
+            if dpop_replay_max_entries == 0 {
                 return Err(format!(
-                    "jwks_auth: 'provider[{idx}].dpop_jti_ttl_secs' must be at least twice dpop_clock_skew_secs"
+                    "jwks_auth: 'provider[{idx}].dpop_replay_max_entries' must be greater than 0"
                 ));
             }
-            let dpop_jti_cache_max_entries =
-                optional_provider_usize(prov_obj, "dpop_jti_cache_max_entries", idx)?
-                    .unwrap_or(DEFAULT_DPOP_JTI_CACHE_MAX_ENTRIES);
-            if dpop_jti_cache_max_entries == 0 {
+
+            // The replay scope has no default. A gateway cannot observe its own
+            // replica count, so "is process-local replay state sufficient?" is
+            // an explicit, auditable operator declaration. Defaulting it would
+            // reinstate "one replay per replica" for every multi-replica
+            // deployment that simply set `require_dpop: true`.
+            let declared_scope = match optional_provider_string(prov_obj, "dpop_replay_scope", idx)?
+            {
+                Some(value) => Some(ReplayScope::parse(
+                    "jwks_auth",
+                    &format!("provider[{idx}].dpop_replay_scope"),
+                    &value,
+                )?),
+                None => None,
+            };
+            if require_dpop && declared_scope.is_none() {
                 return Err(format!(
-                    "jwks_auth: 'provider[{idx}].dpop_jti_cache_max_entries' must be greater than 0"
+                    "jwks_auth: 'provider[{idx}].dpop_replay_scope' is required when \
+                     'require_dpop' is true — use 'shared' together with sync_mode: 'redis' for \
+                     any deployment running more than one gateway replica, or 'process' to \
+                     declare a single-process deployment whose replay protection is not \
+                     cross-replica"
                 ));
             }
-            let dpop_jti_cache = require_dpop.then(|| {
-                Arc::new(DpopJtiCache::new(
-                    dpop_jti_cache_max_entries,
-                    Duration::from_secs(dpop_jti_ttl_secs),
-                    shard_amount,
-                ))
+            if !require_dpop && declared_scope.is_some() {
+                return Err(format!(
+                    "jwks_auth: 'provider[{idx}].dpop_replay_scope' is only meaningful with \
+                     'require_dpop': true"
+                ));
+            }
+            if let Some(scope) = declared_scope {
+                declared_dpop_scopes.push(scope);
+            }
+
+            let dpop_replay_domain = require_dpop.then(|| {
+                ReplayDomain::new(
+                    DPOP_REPLAY_PROFILE,
+                    &namespace,
+                    "jwks_auth",
+                    &policy_config_id,
+                    &idx.to_string(),
+                )
             });
+            let dpop_replay = match (declared_scope, dpop_replay_domain.as_ref()) {
+                (Some(ReplayScope::Process), Some(domain)) => Some(Arc::new(
+                    ReplayAuthority::process(
+                        "jwks_auth",
+                        domain,
+                        dpop_replay_max_entries,
+                        Duration::from_secs(DPOP_MARKER_RETENTION_SECONDS),
+                        shard_amount,
+                    )?,
+                )),
+                (Some(ReplayScope::Shared), Some(_)) => {
+                    // `validate_scope_backend` below rejects `shared` without a
+                    // Redis backend, so an absent client here cannot silently
+                    // become a process lane.
+                    shared_replay_client.as_ref().map(|client| {
+                        Arc::new(ReplayAuthority::shared(
+                            Arc::clone(client),
+                            Duration::from_secs(DPOP_MARKER_RETENTION_SECONDS),
+                        ))
+                    })
+                }
+                _ => None,
+            };
 
             let mut warmup_hostnames = Vec::new();
             if let Some(endpoint) = jwks_endpoint.as_ref() {
@@ -495,13 +652,34 @@ impl JwksAuth {
                 require_mtls_binding,
                 require_dpop,
                 dpop_clock_skew: Duration::from_secs(dpop_clock_skew_secs),
-                dpop_jti_cache,
+                dpop_replay_domain,
+                dpop_replay,
                 jwks_store: jwks_store_slot,
                 max_stale: provider_max_stale,
                 late_active: Arc::new(Mutex::new(None)),
                 jwks_source,
                 warmup_hostnames,
             });
+        }
+
+        // Scope/backend coherence is a plugin-level decision, not a per-provider
+        // one: one Redis client backs every `shared` provider. `shared` without
+        // a backend would silently be process-local — the exact "multi-replica
+        // production configuration falls back to local acceptance" failure — and
+        // a provisioned backend no provider consults is equally a
+        // misconfiguration.
+        if !declared_dpop_scopes.is_empty() || redis_configured {
+            let effective_scope = if declared_dpop_scopes.contains(&ReplayScope::Shared) {
+                ReplayScope::Shared
+            } else {
+                ReplayScope::Process
+            };
+            validate_scope_backend(
+                "jwks_auth",
+                "provider[].dpop_replay_scope",
+                effective_scope,
+                redis_configured,
+            )?;
         }
 
         let strip_authorization_on_success = providers.iter().any(|provider| {
@@ -587,18 +765,50 @@ impl JwksAuth {
         }
     }
 
-    /// Per-provider DPoP replay-cache capacities (`None` when DPoP is not
-    /// required). Test-only visibility for default-contract regressions.
+    /// Per-provider process replay-lane capacities (`None` when DPoP is not
+    /// required or the provider claims against the shared authority).
+    /// Test-only visibility for default-contract regressions.
     #[doc(hidden)]
     #[allow(dead_code)] // exercised by external unit tests
-    pub fn dpop_jti_cache_capacities(&self) -> Vec<Option<usize>> {
+    pub fn dpop_replay_lane_capacities(&self) -> Vec<Option<usize>> {
         self.providers
             .iter()
             .map(|provider| {
                 provider
-                    .dpop_jti_cache
+                    .dpop_replay
                     .as_ref()
-                    .map(|cache| cache.max_entries())
+                    .and_then(|authority| {
+                        crate::plugins::utils::replay_authority::process_lane(authority)
+                    })
+                    .map(|lane| lane.max_entries())
+            })
+            .collect()
+    }
+
+    /// Per-provider replay-authority modes (`None` when DPoP is not required).
+    /// Test-only visibility for scope/reload contracts.
+    #[doc(hidden)]
+    #[allow(dead_code)] // exercised by external unit tests
+    pub fn dpop_replay_modes(&self) -> Vec<Option<&'static str>> {
+        self.providers
+            .iter()
+            .map(|provider| provider.dpop_replay.as_ref().map(|a| a.mode()))
+            .collect()
+    }
+
+    /// Per-provider protection-domain digests. Test-only visibility for the
+    /// "equivalent reload / equivalent replica converge, distinct policies
+    /// isolate" contracts.
+    #[doc(hidden)]
+    #[allow(dead_code)] // exercised by external unit tests
+    pub fn dpop_replay_domain_markers(&self, jkt: &str, jti: &str) -> Vec<Option<[u8; 32]>> {
+        self.providers
+            .iter()
+            .map(|provider| {
+                provider
+                    .dpop_replay_domain
+                    .as_ref()
+                    .map(|domain| domain.marker(&[jkt.as_bytes(), jti.as_bytes()]).digest())
             })
             .collect()
     }
@@ -729,13 +939,23 @@ impl JwksAuth {
         )
     }
 
+    /// Validate RFC 8705 mTLS binding and RFC 9449 DPoP proof cryptography and
+    /// claims.
+    ///
+    /// Returns the DPoP replay marker still to be claimed, when the provider
+    /// requires a proof. The claim itself is deliberately **not** made here:
+    /// it is an `async` operation against a possibly shared authority and it
+    /// must happen strictly after signature, `htm`/`htu`/`iat`/`exp`/`ath`, and
+    /// token-key binding validation, so unauthenticated garbage can never
+    /// consume replay capacity or a shared-backend round trip. The single
+    /// caller ([`Self::admit_sender_constraints`]) performs it immediately.
     fn check_sender_constraints(
         &self,
         ctx: &RequestContext,
         claims: &Value,
         provider: &JwksProvider,
         token: &str,
-    ) -> Result<(), (u16, String)> {
+    ) -> Result<Option<ReplayMarker>, (u16, String)> {
         if provider.require_mtls_binding {
             let Some(cert_der) = ctx.tls_client_cert_der.as_ref() else {
                 return Err((401, r#"{"error":"mTLS binding mismatch"}"#.to_string()));
@@ -749,47 +969,100 @@ impl JwksAuth {
             }
         }
 
-        if provider.require_dpop {
-            let Some(proof) = ctx.headers.get("dpop") else {
-                return Err((401, r#"{"error":"DPoP proof required"}"#.to_string()));
-            };
-            let Some(cache) = provider.dpop_jti_cache.as_ref() else {
-                return Err((401, r#"{"error":"DPoP proof required"}"#.to_string()));
-            };
-            let Some(host) = ctx
-                .headers
-                .get("host")
-                .or_else(|| ctx.headers.get(":authority"))
-            else {
-                return Err((401, r#"{"error":"DPoP URL mismatch"}"#.to_string()));
-            };
-            let scheme = ctx
-                .metadata
-                .get("ferrum.frontend_scheme")
-                .map(String::as_str)
-                .unwrap_or("http");
-            let Some(htu) = dpop::canonical_htu(scheme, host, &ctx.path) else {
-                return Err((401, r#"{"error":"DPoP URL mismatch"}"#.to_string()));
-            };
-            if let Err(reason) = dpop::verify(DpopVerifyInput {
-                proof,
-                access_token: token,
-                access_token_claims: claims,
-                method: &ctx.method,
-                htu: &htu,
-                clock_skew: provider.dpop_clock_skew,
-                cache,
-            }) {
-                let body = if reason == "DPoP replay" {
-                    r#"{"error":"DPoP replay"}"#
-                } else {
-                    r#"{"error":"DPoP validation failed"}"#
-                };
-                return Err((401, body.to_string()));
-            }
+        if !provider.require_dpop {
+            return Ok(None);
         }
 
-        Ok(())
+        let Some(proof) = ctx.headers.get("dpop") else {
+            return Err((401, r#"{"error":"DPoP proof required"}"#.to_string()));
+        };
+        // A `require_dpop` provider always carries a domain and an authority:
+        // construction rejects the configuration otherwise. Fail closed rather
+        // than admit a proof that would not be made single-use.
+        let Some(domain) = provider.dpop_replay_domain.as_ref() else {
+            return Err((401, r#"{"error":"DPoP proof required"}"#.to_string()));
+        };
+        let Some(host) = ctx
+            .headers
+            .get("host")
+            .or_else(|| ctx.headers.get(":authority"))
+        else {
+            return Err((401, r#"{"error":"DPoP URL mismatch"}"#.to_string()));
+        };
+        let scheme = ctx
+            .metadata
+            .get("ferrum.frontend_scheme")
+            .map(String::as_str)
+            .unwrap_or("http");
+        let Some(htu) = dpop::canonical_htu(scheme, host, &ctx.path) else {
+            return Err((401, r#"{"error":"DPoP URL mismatch"}"#.to_string()));
+        };
+        match dpop::verify(DpopVerifyInput {
+            proof,
+            access_token: token,
+            access_token_claims: claims,
+            method: &ctx.method,
+            htu: &htu,
+            clock_skew: provider.dpop_clock_skew,
+            domain,
+        }) {
+            Ok(marker) => Ok(Some(marker)),
+            Err(_) => Err((401, r#"{"error":"DPoP validation failed"}"#.to_string())),
+        }
+    }
+
+    /// Claim a validated DPoP proof for exactly one request.
+    ///
+    /// The claim is the last admission step, run after signature/claim
+    /// validation *and* after scope/role authorization, so neither
+    /// unauthenticated garbage nor an authorization rejection can consume
+    /// replay capacity. Its outcome maps to fixed client-visible bodies with no
+    /// backend detail: a replay, a capacity refusal, and an unavailable
+    /// authority are all terminal. There is no path from any of them to
+    /// acceptance.
+    async fn admit_dpop_marker(
+        &self,
+        provider: &JwksProvider,
+        marker: ReplayMarker,
+    ) -> Result<(), (u16, String)> {
+        let Some(authority) = provider.dpop_replay.as_ref() else {
+            // Unreachable for an admitted configuration (construction requires a
+            // declared scope and a backend for `shared`), but a missing
+            // authority must refuse rather than accept an unclaimed proof.
+            warn!("jwks_auth: DPoP replay authority is not configured; rejecting proof");
+            return Err((
+                401,
+                r#"{"error":"DPoP replay protection unavailable"}"#.to_string(),
+            ));
+        };
+        match authority.admit(&marker).await {
+            ReplayAdmission::Admitted => Ok(()),
+            ReplayAdmission::Replay => Err((401, r#"{"error":"DPoP replay"}"#.to_string())),
+            ReplayAdmission::CapacityRefused => {
+                warn!(
+                    classification = ReplayAdmission::CapacityRefused.classification(),
+                    mode = authority.mode(),
+                    "jwks_auth: DPoP replay state is at capacity; refusing the request rather \
+                     than discarding a live replay marker"
+                );
+                Err((
+                    503,
+                    r#"{"error":"DPoP replay protection is at capacity"}"#.to_string(),
+                ))
+            }
+            ReplayAdmission::AuthorityUnavailable => {
+                warn!(
+                    classification = ReplayAdmission::AuthorityUnavailable.classification(),
+                    mode = authority.mode(),
+                    "jwks_auth: DPoP replay authority is unavailable; failing closed without \
+                     local fallback"
+                );
+                Err((
+                    503,
+                    r#"{"error":"DPoP replay protection unavailable"}"#.to_string(),
+                ))
+            }
+        }
     }
 
     fn stage_claim_headers(
@@ -845,13 +1118,24 @@ impl JwksAuth {
                 };
 
                 let provider = &self.providers[provider_idx];
-                if let Err((status, body)) =
-                    self.check_sender_constraints(ctx, &claims, provider, &token)
-                {
-                    return reject(status, body);
-                }
+                // Cryptographic + claim validation first, then authorization,
+                // then the single-use claim. Deferring the claim to last means
+                // a request rejected for insufficient scopes never burns the
+                // client's proof, while an unauthenticated proof still never
+                // reaches replay state at all.
+                let pending_dpop_marker =
+                    match self.check_sender_constraints(ctx, &claims, provider, &token) {
+                        Ok(marker) => marker,
+                        Err((status, body)) => return reject(status, body),
+                    };
                 if let Err((status, body)) = self.check_claims_authorization(&claims, provider) {
                     return reject(status, body);
+                }
+                if let Some(marker) = pending_dpop_marker {
+                    let admission = self.admit_dpop_marker(provider, marker).await;
+                    if let Err((status, body)) = admission {
+                        return reject(status, body);
+                    }
                 }
 
                 let mut attempt = AuthenticationAttempt::new();
@@ -1207,6 +1491,16 @@ impl super::Plugin for JwksAuth {
         let mut hosts = Vec::new();
         for prov in &self.providers {
             hosts.extend(prov.warmup_hostnames.iter().cloned());
+            // A shared DPoP replay authority is dialed on the authentication
+            // path, so its endpoint belongs in gateway DNS warmup like any
+            // other plugin egress.
+            if let Some(authority) = prov.dpop_replay.as_ref() {
+                for host in authority.warmup_hostnames() {
+                    if !hosts.iter().any(|known| known == &host) {
+                        hosts.push(host);
+                    }
+                }
+            }
             let guard = prov.jwks_store.load();
             if let Some(ref store) = **guard
                 && store.is_refreshable()
@@ -1445,6 +1739,42 @@ async fn try_validate_with_provider(provider: &JwksProvider, token: &str) -> Opt
 struct ParsedEndpoint {
     url: String,
     hostname: String,
+}
+
+/// Plugin-config id used when no stable resource id is supplied (Admin config
+/// validation and direct/test construction).
+///
+/// Distinct from any real id, so a validation-constructed instance can never
+/// join a live policy's replay lane or Redis keyspace.
+pub const STANDALONE_JWKS_AUTH_CONFIG_ID: &str = "__standalone__";
+
+/// Default Redis key prefix for shared DPoP replay markers:
+/// `{namespace}:jwks_auth:{plugin-config-id}`.
+///
+/// The config-id component isolates independent policies inside one namespace
+/// while every replica of the *same* policy keeps claiming against the same
+/// keyspace — which is the whole point of the shared scope. An explicit
+/// `redis_key_prefix` remains the documented opt-in for deliberately sharing a
+/// keyspace across policies.
+fn default_dpop_redis_key_prefix(namespace: &str, plugin_config_id: &str) -> String {
+    let mut prefix = String::with_capacity(namespace.len() + plugin_config_id.len() + 12);
+    prefix.push_str(namespace);
+    prefix.push_str(":jwks_auth:");
+    prefix.push_str(plugin_config_id);
+    prefix
+}
+
+/// Reject provider fields the shared replay authority removed, naming the
+/// replacement. See [`REMOVED_PROVIDER_FIELDS`].
+fn reject_removed_provider_fields(config: &Map<String, Value>, idx: usize) -> Result<(), String> {
+    for (removed, guidance) in REMOVED_PROVIDER_FIELDS {
+        if config.contains_key(*removed) {
+            return Err(format!(
+                "jwks_auth: 'provider[{idx}].{removed}' was removed — {guidance}"
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn reject_unknown_fields(

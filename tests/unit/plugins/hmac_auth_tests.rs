@@ -22,8 +22,22 @@ const TEST_SECRET: &str = "my-hmac-secret-key-at-least-32-bytes";
 const TEST_USERNAME: &str = "hmacuser";
 const TEST_AUTHORITY: &str = "api.example.com";
 
+/// The legacy `ferrum-hmac-v1` profile, explicitly acknowledged as unsafe.
+///
+/// Most cases in this file predate `ferrum-hmac-v2` and exercise the v1 signing
+/// base, canonical-request binding, digest handling, and parser hardening. They
+/// keep testing exactly that surface; the v2 single-use contract has its own
+/// section at the end of the file.
 fn default_config() -> Value {
-    json!({})
+    json!({
+        "signing_profile": "ferrum-hmac-v1",
+        "allow_unsafe_replayable_v1": true
+    })
+}
+
+/// The default `ferrum-hmac-v2` profile with a process-scoped replay lane.
+fn v2_config() -> Value {
+    json!({"replay_scope": "process"})
 }
 
 /// Create a consumer with hmac_auth credentials.
@@ -257,7 +271,7 @@ fn hmac_auth_header(username: &str, algorithm: Option<&str>, signature: &str) ->
 
 #[tokio::test]
 async fn test_hmac_auth_plugin_creation() {
-    let plugin = HmacAuth::new(&json!({})).unwrap();
+    let plugin = HmacAuth::new(&default_config()).unwrap();
     assert_eq!(plugin.name(), "hmac_auth");
     assert!(plugin.is_auth_plugin());
     assert_eq!(plugin.priority(), priority::HMAC_AUTH);
@@ -272,7 +286,12 @@ async fn test_hmac_auth_plugin_creation() {
 
 #[tokio::test]
 async fn test_hmac_auth_custom_clock_skew() {
-    let plugin = HmacAuth::new(&json!({"clock_skew_seconds": 600})).unwrap();
+    let plugin = HmacAuth::new(&json!({
+        "clock_skew_seconds": 120,
+        "signing_profile": "ferrum-hmac-v1",
+        "allow_unsafe_replayable_v1": true
+    }))
+    .unwrap();
     assert_eq!(plugin.name(), "hmac_auth");
 }
 
@@ -285,6 +304,42 @@ fn test_hmac_auth_rejects_invalid_config() {
         json!({"clock_skew_seconds": -1}),
         json!({"require_digest": "true"}),
         json!({"require_digest": false}),
+        // The default profile is single-use, and single-use requires a declared
+        // replay scope: an empty config must not silently become one that
+        // accepts one replay per replica.
+        json!({}),
+        json!({"replay_scope": "process", "clock_skew_seconds": 0}),
+        json!({"replay_scope": "process", "clock_skew_seconds": 301}),
+        json!({"replay_scope": "prosess"}),
+        json!({"replay_scope": true}),
+        json!({"replay_scope": "process", "replay_max_entries": 0}),
+        // The legacy profile needs its own explicit acknowledgement, and the
+        // acknowledgement is meaningless without it.
+        json!({"signing_profile": "ferrum-hmac-v1"}),
+        json!({"signing_profile": "ferrum-hmac-v3", "allow_unsafe_replayable_v1": true}),
+        json!({"replay_scope": "process", "allow_unsafe_replayable_v1": true}),
+        // The legacy profile has no replay state at all, so replay knobs and a
+        // Redis backend must be refused rather than silently ignored.
+        json!({
+            "signing_profile": "ferrum-hmac-v1",
+            "allow_unsafe_replayable_v1": true,
+            "replay_scope": "process"
+        }),
+        json!({
+            "signing_profile": "ferrum-hmac-v1",
+            "allow_unsafe_replayable_v1": true,
+            "sync_mode": "redis",
+            "redis_url": "redis://127.0.0.1:6379"
+        }),
+        // Scope and backend must agree in both directions.
+        json!({"replay_scope": "shared"}),
+        json!({
+            "replay_scope": "process",
+            "sync_mode": "redis",
+            "redis_url": "redis://127.0.0.1:6379"
+        }),
+        // Closed root key set: a misspelled security field fails admission.
+        json!({"replay_scope": "process", "replay_scop": "shared"}),
     ];
 
     for config in invalid_configs {
@@ -297,7 +352,7 @@ fn test_hmac_auth_rejects_invalid_config() {
 
 #[tokio::test]
 async fn test_hmac_auth_default_requires_digest() {
-    let plugin = HmacAuth::new(&json!({})).unwrap();
+    let plugin = HmacAuth::new(&default_config()).unwrap();
     assert!(plugin.requires_request_body_before_authenticate());
     assert!(plugin.requires_request_body_buffering());
     assert!(!plugin.needs_request_body_bytes());
@@ -1568,7 +1623,7 @@ fn set_request_body(ctx: &mut RequestContext, body: &[u8]) {
 #[tokio::test]
 async fn test_digest_required_valid_signature_with_correct_body() {
     // Default config signs and verifies the request body digest.
-    let plugin = HmacAuth::new(&json!({})).unwrap();
+    let plugin = HmacAuth::new(&default_config()).unwrap();
     let consumer = create_hmac_consumer();
     let consumer_index = ConsumerIndex::new(&[consumer]);
 
@@ -1601,7 +1656,7 @@ async fn test_digest_required_valid_signature_with_correct_body() {
 async fn test_digest_required_modified_body_rejected() {
     // Same Digest header + same HMAC signature, but the body was modified
     // after signing — must be rejected.
-    let plugin = HmacAuth::new(&json!({})).unwrap();
+    let plugin = HmacAuth::new(&default_config()).unwrap();
     let consumer = create_hmac_consumer();
     let consumer_index = ConsumerIndex::new(&[consumer]);
 
@@ -1631,7 +1686,7 @@ async fn test_digest_required_modified_body_rejected() {
 
 #[tokio::test]
 async fn test_digest_required_missing_digest_header_rejected() {
-    let plugin = HmacAuth::new(&json!({})).unwrap();
+    let plugin = HmacAuth::new(&default_config()).unwrap();
     let consumer = create_hmac_consumer();
     let consumer_index = ConsumerIndex::new(&[consumer]);
 
@@ -1686,7 +1741,7 @@ async fn test_digest_required_tampered_digest_header_rejected() {
     // Attacker recomputes a digest matching their tampered body, but lacks
     // the secret to re-sign — the HMAC mismatches because the digest header
     // is part of the signing string.
-    let plugin = HmacAuth::new(&json!({})).unwrap();
+    let plugin = HmacAuth::new(&default_config()).unwrap();
     let consumer = create_hmac_consumer();
     let consumer_index = ConsumerIndex::new(&[consumer]);
 
@@ -1719,7 +1774,7 @@ async fn test_digest_required_tampered_digest_header_rejected() {
 
 #[tokio::test]
 async fn test_digest_required_sha512_digest_accepted() {
-    let plugin = HmacAuth::new(&json!({})).unwrap();
+    let plugin = HmacAuth::new(&default_config()).unwrap();
     let consumer = create_hmac_consumer();
     let consumer_index = ConsumerIndex::new(&[consumer]);
 
@@ -1747,7 +1802,7 @@ async fn test_digest_required_sha512_digest_accepted() {
 #[tokio::test]
 async fn test_digest_required_content_digest_header_accepted() {
     // RFC 9530 Content-Digest structured-field form is accepted.
-    let plugin = HmacAuth::new(&json!({})).unwrap();
+    let plugin = HmacAuth::new(&default_config()).unwrap();
     let consumer = create_hmac_consumer();
     let consumer_index = ConsumerIndex::new(&[consumer]);
 
@@ -1778,7 +1833,7 @@ async fn test_digest_required_content_digest_header_accepted() {
 async fn test_digest_required_empty_body_with_digest() {
     // GET requests with empty body still must include a valid digest header
     // with digest signing enabled.
-    let plugin = HmacAuth::new(&json!({})).unwrap();
+    let plugin = HmacAuth::new(&default_config()).unwrap();
     let consumer = create_hmac_consumer();
     let consumer_index = ConsumerIndex::new(&[consumer]);
 
@@ -1807,3 +1862,485 @@ async fn test_digest_required_empty_body_with_digest() {
 // inline in `src/plugins/hmac_auth.rs::tests` since `tests/` is a separate
 // crate that can't see crate-private items. The end-to-end auth flow is
 // covered above (correct-body vs. tampered-body vs. tampered-digest).
+
+// ────────────────────────────────────────────────────────────────────
+// Issue #3837 — `ferrum-hmac-v2` single-use signed requests
+// ────────────────────────────────────────────────────────────────────
+
+/// Build the v2 signing base: identical to v1 except for the version field and
+/// the trailing bound nonce.
+fn build_v2_signing_string(input: HmacSigningInput<'_>, nonce: &str) -> String {
+    format!(
+        "ferrum-hmac-v2\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}",
+        input.namespace,
+        input.username,
+        input.authority,
+        input.method,
+        input.path,
+        input.query,
+        input.date,
+        input.digest_header,
+        nonce
+    )
+}
+
+fn sign_v2(secret: &str, input: HmacSigningInput<'_>, nonce: &str) -> String {
+    let mut mac = HmacSha256::new_from_slice(secret.as_bytes()).unwrap();
+    mac.update(build_v2_signing_string(input, nonce).as_bytes());
+    base64::engine::general_purpose::STANDARD.encode(mac.finalize().into_bytes())
+}
+
+fn v2_auth_header(username: &str, nonce: &str, signature: &str) -> String {
+    format!(
+        r#"hmac username="{username}", algorithm="hmac-sha256", nonce="{nonce}", signature="{signature}""#
+    )
+}
+
+/// 32 lowercase hex characters — 128 bits, the minimum admissible hex nonce.
+fn test_nonce(seed: u64) -> String {
+    format!("{seed:032x}")
+}
+
+struct V2Request {
+    method: String,
+    path: String,
+    date: String,
+    digest: String,
+    nonce: String,
+    signature: String,
+}
+
+impl V2Request {
+    fn new(nonce: &str) -> Self {
+        let method = "POST".to_string();
+        let path = "/api/orders".to_string();
+        let date = current_date();
+        let digest = sha256_digest_header(b"");
+        let signature = sign_v2(
+            TEST_SECRET,
+            HmacSigningInput {
+                namespace: ferrum_edge::config::types::DEFAULT_NAMESPACE,
+                username: TEST_USERNAME,
+                authority: TEST_AUTHORITY,
+                method: &method,
+                path: &path,
+                query: "",
+                date: &date,
+                digest_header: &digest,
+            },
+            nonce,
+        );
+        Self {
+            method,
+            path,
+            date,
+            digest,
+            nonce: nonce.to_string(),
+            signature,
+        }
+    }
+
+    fn context(&self) -> RequestContext {
+        let mut ctx = make_ctx(&self.method, &self.path);
+        ctx.headers.insert(
+            "authorization".to_string(),
+            v2_auth_header(TEST_USERNAME, &self.nonce, &self.signature),
+        );
+        ctx.headers.insert("date".to_string(), self.date.clone());
+        ctx.headers.insert("digest".to_string(), self.digest.clone());
+        ctx.identified_consumer = None;
+        ctx
+    }
+}
+
+fn v2_plugin_named(config_id: &str) -> HmacAuth {
+    HmacAuth::new_with_http_client_and_config_id(
+        &v2_config(),
+        ferrum_edge::plugins::utils::PluginHttpClient::default(),
+        Some(config_id),
+    )
+    .expect("v2 config with a declared process replay scope")
+}
+
+// ── the default posture is single-use ───────────────────────────────
+
+#[test]
+fn v2_is_the_default_profile_and_requires_a_declared_replay_scope() {
+    let plugin = HmacAuth::new(&v2_config()).expect("declared process scope");
+    assert_eq!(plugin.replay_mode(), Some("process"));
+
+    let error = HmacAuth::new(&json!({}))
+        .expect_err("the single-use default must not silently pick a replay scope");
+    assert!(
+        error.contains("replay_scope"),
+        "diagnostic should name the missing declaration: {error}"
+    );
+}
+
+// ── the acceptance contract ─────────────────────────────────────────
+
+#[tokio::test]
+async fn v2_first_request_succeeds_and_exact_replay_is_rejected() {
+    let plugin = v2_plugin_named("v2-sequential");
+    let consumer_index = ConsumerIndex::new(&[create_hmac_consumer()]);
+    let request = V2Request::new(&test_nonce(1));
+
+    let mut first = request.context();
+    assert_continue(plugin.authenticate(&mut first, &consumer_index).await);
+
+    // Byte-for-byte identical resubmission — a verbatim transport retry is a
+    // replay, not a second legitimate request.
+    let mut replay = request.context();
+    assert_reject(
+        plugin.authenticate(&mut replay, &consumer_index).await,
+        Some(401),
+    );
+}
+
+#[tokio::test]
+async fn v2_fresh_nonce_with_recomputed_signature_succeeds() {
+    let plugin = v2_plugin_named("v2-fresh-nonce");
+    let consumer_index = ConsumerIndex::new(&[create_hmac_consumer()]);
+
+    let mut first = V2Request::new(&test_nonce(10)).context();
+    assert_continue(plugin.authenticate(&mut first, &consumer_index).await);
+
+    let mut second = V2Request::new(&test_nonce(11)).context();
+    assert_continue(plugin.authenticate(&mut second, &consumer_index).await);
+}
+
+#[tokio::test]
+async fn v2_new_nonce_without_recomputed_signature_fails_authentication() {
+    let plugin = v2_plugin_named("v2-unsigned-nonce");
+    let consumer_index = ConsumerIndex::new(&[create_hmac_consumer()]);
+
+    let request = V2Request::new(&test_nonce(20));
+    let mut ctx = request.context();
+    // Swap only the nonce, keeping the signature that covered the original one.
+    ctx.headers.insert(
+        "authorization".to_string(),
+        v2_auth_header(TEST_USERNAME, &test_nonce(21), &request.signature),
+    );
+    assert_reject(
+        plugin.authenticate(&mut ctx, &consumer_index).await,
+        Some(401),
+    );
+}
+
+/// Every field the profile claims to bind must actually be bound: mutating one
+/// without recomputing the signature fails authentication.
+#[tokio::test]
+async fn v2_binds_every_signed_field() {
+    let consumer_index = ConsumerIndex::new(&[create_hmac_consumer()]);
+
+    // Method.
+    let plugin = v2_plugin_named("v2-bind-method");
+    let request = V2Request::new(&test_nonce(30));
+    let mut ctx = request.context();
+    ctx.method = "PUT".to_string();
+    assert_reject(
+        plugin.authenticate(&mut ctx, &consumer_index).await,
+        Some(401),
+    );
+
+    // Path.
+    let plugin = v2_plugin_named("v2-bind-path");
+    let request = V2Request::new(&test_nonce(31));
+    let mut ctx = request.context();
+    ctx.path = "/api/other".to_string();
+    assert_reject(
+        plugin.authenticate(&mut ctx, &consumer_index).await,
+        Some(401),
+    );
+
+    // Raw query.
+    let plugin = v2_plugin_named("v2-bind-query");
+    let request = V2Request::new(&test_nonce(32));
+    let mut ctx = request.context();
+    ctx.set_raw_query_string("admin=1".to_string());
+    assert_reject(
+        plugin.authenticate(&mut ctx, &consumer_index).await,
+        Some(401),
+    );
+
+    // Date.
+    let plugin = v2_plugin_named("v2-bind-date");
+    let request = V2Request::new(&test_nonce(33));
+    let mut ctx = request.context();
+    ctx.headers.insert(
+        "date".to_string(),
+        (Utc::now() - chrono::Duration::seconds(30))
+            .format("%a, %d %b %Y %H:%M:%S GMT")
+            .to_string(),
+    );
+    assert_reject(
+        plugin.authenticate(&mut ctx, &consumer_index).await,
+        Some(401),
+    );
+
+    // Body digest.
+    let plugin = v2_plugin_named("v2-bind-digest");
+    let request = V2Request::new(&test_nonce(34));
+    let mut ctx = request.context();
+    ctx.headers
+        .insert("digest".to_string(), sha256_digest_header(b"tampered"));
+    assert_reject(
+        plugin.authenticate(&mut ctx, &consumer_index).await,
+        Some(401),
+    );
+
+    // Namespace (the protection domain the signature is scoped to).
+    let plugin = v2_plugin_named("v2-bind-namespace");
+    let request = V2Request::new(&test_nonce(35));
+    let mut ctx = request.context();
+    set_ctx_namespace(&mut ctx, "other-namespace");
+    assert_reject(
+        plugin.authenticate(&mut ctx, &consumer_index).await,
+        Some(401),
+    );
+}
+
+/// A v1 signature must not verify under v2 (and the reverse): the profile
+/// version is the signing base's first field, so downgrading the profile does
+/// not downgrade the signature.
+#[tokio::test]
+async fn v1_signature_does_not_verify_under_v2() {
+    let plugin = v2_plugin_named("v2-no-v1-crossover");
+    let consumer_index = ConsumerIndex::new(&[create_hmac_consumer()]);
+
+    let method = "POST";
+    let path = "/api/orders";
+    let date = current_date();
+    let digest = sha256_digest_header(b"");
+    let v1_signature = sign_sha256_with_digest(TEST_SECRET, method, path, &date, &digest);
+
+    let mut ctx = make_ctx(method, path);
+    ctx.headers.insert(
+        "authorization".to_string(),
+        v2_auth_header(TEST_USERNAME, &test_nonce(40), &v1_signature),
+    );
+    ctx.headers.insert("date".to_string(), date);
+    ctx.headers.insert("digest".to_string(), digest);
+    ctx.identified_consumer = None;
+    assert_reject(
+        plugin.authenticate(&mut ctx, &consumer_index).await,
+        Some(401),
+    );
+}
+
+// ── nonce wire form ─────────────────────────────────────────────────
+
+#[tokio::test]
+async fn v2_rejects_a_missing_or_malformed_nonce_before_backend_dispatch() {
+    let plugin = v2_plugin_named("v2-nonce-form");
+    let consumer_index = ConsumerIndex::new(&[create_hmac_consumer()]);
+    let request = V2Request::new(&test_nonce(50));
+
+    // Missing entirely.
+    let mut ctx = request.context();
+    ctx.headers.insert(
+        "authorization".to_string(),
+        hmac_auth_header(TEST_USERNAME, Some("hmac-sha256"), &request.signature),
+    );
+    assert_reject(
+        plugin.authenticate(&mut ctx, &consumer_index).await,
+        Some(401),
+    );
+
+    for malformed in [
+        "",                          // empty
+        "short",                     // far below the entropy floor
+        "0123456789abcdef0123456789abcde", // 31 hex chars: below 128 bits
+        "0123456789abcdef0123456789abcd",   // 30 hex chars: below 128 bits
+        "aaaaaaaaaaaaaaaaaaaaa",     // 21 base64url chars: below 128 bits
+        "aaaa aaaaaaaaaaaaaaaaaaaaa", // whitespace
+        "aaaaaaaaaaaaaaaaaaaaaa\u{7f}", // control byte
+        "AAAAAAAAAAAAAAAAAAAAAA==",  // base64 padding is not base64url-unpadded
+        "AAAAAAAAAAAAAAAAAAAAAA+/",  // standard-base64 alphabet
+        &"a".repeat(87),             // above the length ceiling
+    ] {
+        let mut ctx = request.context();
+        ctx.headers.insert(
+            "authorization".to_string(),
+            v2_auth_header(TEST_USERNAME, malformed, &request.signature),
+        );
+        assert_reject(
+            plugin.authenticate(&mut ctx, &consumer_index).await,
+            Some(401),
+        );
+    }
+}
+
+/// An all-hex value is read as **hex** and held to the 32-character (128-bit)
+/// floor, not to the shorter base64url floor. A 22-character all-hex nonce
+/// satisfies the base64url length rule but carries only 88 bits, so admitting
+/// it because "22 base64url characters would have been enough" would be a real
+/// entropy downgrade.
+#[tokio::test]
+async fn all_hex_nonces_are_held_to_the_hex_entropy_floor() {
+    let plugin = v2_plugin_named("v2-hex-floor");
+    let consumer_index = ConsumerIndex::new(&[create_hmac_consumer()]);
+
+    let short_hex = "0123456789abcdef012345"; // 22 chars, all hex, 88 bits
+    assert_eq!(short_hex.len(), 22);
+    let request = V2Request::new(short_hex);
+    let mut ctx = request.context();
+    assert_reject(
+        plugin.authenticate(&mut ctx, &consumer_index).await,
+        Some(401),
+    );
+
+    // 22 non-hex base64url characters carry 132 bits and are admissible.
+    let base64url = "zzzzzzzzzzzzzzzzzzzzzz";
+    assert_eq!(base64url.len(), 22);
+    let mut ctx = V2Request::new(base64url).context();
+    assert_continue(plugin.authenticate(&mut ctx, &consumer_index).await);
+}
+
+#[tokio::test]
+async fn v1_rejects_a_nonce_rather_than_ignoring_it() {
+    let plugin = HmacAuth::new(&default_config()).unwrap();
+    let consumer_index = ConsumerIndex::new(&[create_hmac_consumer()]);
+
+    let method = "POST";
+    let path = "/api/orders";
+    let date = current_date();
+    let digest = sha256_digest_header(b"");
+    let signature = sign_sha256_with_digest(TEST_SECRET, method, path, &date, &digest);
+
+    let mut ctx = make_ctx(method, path);
+    ctx.headers.insert(
+        "authorization".to_string(),
+        v2_auth_header(TEST_USERNAME, &test_nonce(60), &signature),
+    );
+    ctx.headers.insert("date".to_string(), date);
+    ctx.headers.insert("digest".to_string(), digest);
+    ctx.identified_consumer = None;
+    assert_reject(
+        plugin.authenticate(&mut ctx, &consumer_index).await,
+        Some(401),
+    );
+}
+
+// ── domain identity ─────────────────────────────────────────────────
+
+/// An equivalent reload derives the same protection domain (so the replacement
+/// instance inherits live markers), while a distinct policy id or namespace
+/// isolates.
+#[test]
+fn v2_protection_domains_converge_on_reload_and_isolate_across_policies() {
+    let first = v2_plugin_named("policy-a");
+    let reloaded = v2_plugin_named("policy-a");
+    let other_policy = v2_plugin_named("policy-b");
+    let standalone = HmacAuth::new(&v2_config()).unwrap();
+
+    let marker = first.replay_marker_digest("consumer-1", &test_nonce(70));
+    assert_eq!(marker, reloaded.replay_marker_digest("consumer-1", &test_nonce(70)));
+    assert_ne!(
+        marker,
+        other_policy.replay_marker_digest("consumer-1", &test_nonce(70))
+    );
+    assert_ne!(
+        marker,
+        standalone.replay_marker_digest("consumer-1", &test_nonce(70)),
+        "a validation/standalone instance must not join a live policy's lane"
+    );
+    assert_ne!(
+        marker,
+        first.replay_marker_digest("consumer-2", &test_nonce(70)),
+        "consumers must not burn one another's nonces"
+    );
+    assert!(
+        HmacAuth::new(&default_config())
+            .unwrap()
+            .replay_marker_digest("consumer-1", &test_nonce(70))
+            .is_none(),
+        "the legacy profile has no replay domain at all"
+    );
+}
+
+/// An equivalent reload must not reopen an already-claimed nonce: the
+/// replacement instance joins the same lane rather than starting empty.
+#[tokio::test]
+async fn v2_replay_stays_rejected_after_an_equivalent_reload() {
+    let consumer_index = ConsumerIndex::new(&[create_hmac_consumer()]);
+    let request = V2Request::new(&test_nonce(80));
+
+    let original = v2_plugin_named("v2-reload");
+    let mut first = request.context();
+    assert_continue(original.authenticate(&mut first, &consumer_index).await);
+
+    // Retire the generation that made the claim and rebuild an equivalent one,
+    // exactly as a plugin-cache rebuild does.
+    drop(original);
+    let reloaded = v2_plugin_named("v2-reload");
+    let mut replay = request.context();
+    assert_reject(
+        reloaded.authenticate(&mut replay, &consumer_index).await,
+        Some(401),
+    );
+}
+
+/// Two equivalent replicas (independently constructed, same policy identity)
+/// share one process lane in this single-process test, which is exactly the
+/// convergence a `shared` authority provides across processes.
+#[tokio::test]
+async fn v2_replay_is_rejected_across_equivalent_instances() {
+    let consumer_index = ConsumerIndex::new(&[create_hmac_consumer()]);
+    let request = V2Request::new(&test_nonce(90));
+
+    let replica_a = v2_plugin_named("v2-replicas");
+    let replica_b = v2_plugin_named("v2-replicas");
+
+    let mut first = request.context();
+    assert_continue(replica_a.authenticate(&mut first, &consumer_index).await);
+    let mut replay = request.context();
+    assert_reject(
+        replica_b.authenticate(&mut replay, &consumer_index).await,
+        Some(401),
+    );
+}
+
+/// An isolated policy must not answer from another policy's history.
+#[tokio::test]
+async fn v2_replay_lanes_are_isolated_across_policies() {
+    let consumer_index = ConsumerIndex::new(&[create_hmac_consumer()]);
+    let request = V2Request::new(&test_nonce(100));
+
+    let policy_a = v2_plugin_named("v2-isolation-a");
+    let policy_b = v2_plugin_named("v2-isolation-b");
+
+    let mut first = request.context();
+    assert_continue(policy_a.authenticate(&mut first, &consumer_index).await);
+    let mut second = request.context();
+    assert_continue(
+        policy_b.authenticate(&mut second, &consumer_index).await,
+    );
+}
+
+/// Invalid traffic must never reach replay state: a request whose signature
+/// does not verify is rejected, and the same nonce is then still claimable by
+/// the legitimate signed request.
+#[tokio::test]
+async fn invalid_traffic_does_not_consume_replay_capacity() {
+    let plugin = v2_plugin_named("v2-no-precharge");
+    let consumer_index = ConsumerIndex::new(&[create_hmac_consumer()]);
+    let nonce = test_nonce(110);
+    let request = V2Request::new(&nonce);
+
+    // Same nonce, garbage signature.
+    let mut forged = request.context();
+    forged.headers.insert(
+        "authorization".to_string(),
+        v2_auth_header(TEST_USERNAME, &nonce, "bm90LWEtc2lnbmF0dXJl"),
+    );
+    assert_reject(
+        plugin.authenticate(&mut forged, &consumer_index).await,
+        Some(401),
+    );
+
+    // The legitimate request carrying the same nonce still succeeds, proving
+    // the forged attempt never wrote a marker.
+    let mut legitimate = request.context();
+    assert_continue(plugin.authenticate(&mut legitimate, &consumer_index).await);
+}

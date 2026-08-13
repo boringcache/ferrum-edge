@@ -119,6 +119,48 @@ pub async fn spawn_http_echo() -> std::io::Result<EchoServer> {
     })
 }
 
+/// HTTP echo server that counts the mutating requests it actually receives.
+///
+/// `/health` is excluded so a health probe or pool warmup cannot be mistaken
+/// for application traffic. The counter is what a replay test asserts on:
+/// "the gateway rejected the replay" is weaker than "the backend was contacted
+/// exactly once", because only the second rules out a duplicate side effect.
+pub async fn spawn_http_counting_mutations()
+-> std::io::Result<(EchoServer, Arc<std::sync::atomic::AtomicU32>)> {
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let port = listener.local_addr()?.port();
+    let mutations = Arc::new(std::sync::atomic::AtomicU32::new(0));
+    let counter = Arc::clone(&mutations);
+    let handle = tokio::spawn(async move {
+        loop {
+            match listener.accept().await {
+                Ok((mut stream, _)) => {
+                    let counter = Arc::clone(&counter);
+                    tokio::spawn(async move {
+                        let request = read_request(&mut stream).await;
+                        let path = parse_path(&request);
+                        let (status, body) = if path == "/health" {
+                            (200, r#"{"status":"healthy"}"#.to_string())
+                        } else {
+                            let seen = counter.fetch_add(1, Ordering::SeqCst) + 1;
+                            (200, format!(r#"{{"mutations":{seen}}}"#))
+                        };
+                        write_http_response(&mut stream, status, &body).await;
+                    });
+                }
+                Err(_) => tokio::time::sleep(Duration::from_millis(10)).await,
+            }
+        }
+    });
+    Ok((
+        EchoServer {
+            port,
+            handle: Some(handle),
+        },
+        mutations,
+    ))
+}
+
 /// HTTP server that identifies itself with `name` in the response body.
 ///
 /// Replies with `{"server":"<name>","path":"<path>"}`. Used by

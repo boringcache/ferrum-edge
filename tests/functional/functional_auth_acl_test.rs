@@ -1057,7 +1057,11 @@ async fn test_auth_acl_comprehensive() {
             "scope": "proxy",
             "proxy_id": "proxy-hmacauth",
             "enabled": true,
-            "config": {"clock_skew_seconds": 300}
+            "config": {
+                "clock_skew_seconds": 300,
+                "signing_profile": "ferrum-hmac-v1",
+                "allow_unsafe_replayable_v1": true
+            }
         }),
         json!({
             "id": "plugin-keyauth-acl-allow",
@@ -2620,7 +2624,11 @@ async fn test_hmac_auth_plus_acl() {
                 "scope": "proxy",
                 "proxy_id": "proxy-hmac-allow",
                 "enabled": true,
-                "config": {"clock_skew_seconds": 300}
+                "config": {
+                    "clock_skew_seconds": 300,
+                    "signing_profile": "ferrum-hmac-v1",
+                    "allow_unsafe_replayable_v1": true
+                }
             }),
             acl_plugin_id: "plugin-hmac-allow-acl",
             acl_config: json!({"allowed_consumers": ["hmac-alice"]}),
@@ -2643,7 +2651,11 @@ async fn test_hmac_auth_plus_acl() {
                 "scope": "proxy",
                 "proxy_id": "proxy-hmac-deny",
                 "enabled": true,
-                "config": {"clock_skew_seconds": 300}
+                "config": {
+                    "clock_skew_seconds": 300,
+                    "signing_profile": "ferrum-hmac-v1",
+                    "allow_unsafe_replayable_v1": true
+                }
             }),
             acl_plugin_id: "plugin-hmac-deny-acl",
             acl_config: json!({"disallowed_consumers": ["hmac-mallory"]}),
@@ -2765,5 +2777,202 @@ async fn test_hmac_auth_plus_acl() {
         resp.status().is_success(),
         "alice should pass deny list: {}",
         resp.status()
+    );
+}
+
+
+// ────────────────────────────────────────────────────────────────────
+// Issue #3837 — `ferrum-hmac-v2` single-use signed requests, end to end
+// ────────────────────────────────────────────────────────────────────
+
+/// One accepted `ferrum-hmac-v2` request reaches the backend; its verbatim
+/// replay does not.
+///
+/// The load-bearing assertion is the **backend mutation count**, not the
+/// gateway status: "the gateway answered 401" is weaker than "the origin was
+/// contacted exactly once", because only the second rules out a duplicate side
+/// effect. The counting backend excludes `/health`, so a readiness probe or
+/// pool warmup cannot be mistaken for application traffic.
+/// Send one `ferrum-hmac-v2` request with the supplied Authorization header.
+async fn send_hmac_v2(
+    client: &reqwest::Client,
+    url: &str,
+    authorization: &str,
+    date: &str,
+    digest: &str,
+) -> reqwest::Response {
+    client
+        .post(url)
+        .header("Authorization", authorization)
+        .header("Date", date)
+        .header("Digest", digest)
+        .send()
+        .await
+        .expect("hmac v2 request should complete")
+}
+
+#[tokio::test]
+#[ignore]
+async fn test_hmac_v2_backend_sees_exactly_one_mutation_for_a_replayed_request() {
+    let harness = AuthTestHarness::new()
+        .await
+        .expect("Failed to create test harness");
+
+    let (backend, mutations) = crate::common::spawn_http_counting_mutations()
+        .await
+        .expect("Failed to start counting backend");
+    let backend_port = backend.port;
+
+    let client = reqwest::Client::new();
+    let admin_token = harness
+        .generate_admin_token()
+        .expect("Failed to generate admin token");
+    let auth_header = format!("Bearer {}", admin_token);
+    let admin_url = &harness.admin_base_url;
+    let proxy_url = &harness.proxy_base_url;
+
+    const SECRET: &str = "v2-hmac-shared-secret-at-least-32-bytes";
+    create_consumer(&client, admin_url, &auth_header, "v2-consumer", "v2user")
+        .await
+        .unwrap();
+    add_credential(
+        &client,
+        admin_url,
+        &auth_header,
+        "v2-consumer",
+        "hmac_auth",
+        &json!({"secret": SECRET}),
+    )
+    .await
+    .unwrap();
+
+    create_proxy(
+        &client,
+        admin_url,
+        &auth_header,
+        &json!({
+            "id": "proxy-hmac-v2",
+            "listen_path": "/hmacv2",
+            "backend_scheme": "http",
+            "backend_host": "localhost",
+            "backend_port": backend_port,
+            "strip_listen_path": true,
+            "auth_mode": "single",
+        }),
+    )
+    .await
+    .unwrap();
+    create_plugin_config(
+        &client,
+        admin_url,
+        &auth_header,
+        &json!({
+            "id": "plugin-hmac-v2",
+            "plugin_name": "hmac_auth",
+            "scope": "proxy",
+            "proxy_id": "proxy-hmac-v2",
+            "enabled": true,
+            // No `signing_profile`: `ferrum-hmac-v2` is the default. The replay
+            // scope has no default and must be declared.
+            "config": {
+                "clock_skew_seconds": 300,
+                "replay_scope": "process"
+            }
+        }),
+    )
+    .await
+    .unwrap();
+
+    tokio::time::sleep(Duration::from_secs(4)).await;
+
+    let url = format!("{}/hmacv2", proxy_url);
+    let authority = hmac_authority_from_url(&url);
+    let date = Utc::now().format("%a, %d %b %Y %H:%M:%S GMT").to_string();
+    let digest = empty_digest_header();
+    let nonce = crate::common::hmac_v2_nonce(0x5eed_0001);
+    let request = crate::common::HmacV2Request {
+        method: "POST",
+        path: "/hmacv2",
+        date: &date,
+        username: "v2user",
+        authority: &authority,
+        secret: SECRET,
+        digest_header: &digest,
+        nonce: &nonce,
+    };
+    let authorization = crate::common::hmac_v2_authorization_header(&request, None);
+
+    let first = send_hmac_v2(&client, &url, &authorization, &date, &digest).await;
+    assert_eq!(
+        first.status().as_u16(),
+        200,
+        "a valid ferrum-hmac-v2 request must be accepted"
+    );
+    assert_eq!(
+        mutations.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "the backend must have seen the one accepted mutation"
+    );
+
+    // Byte-for-byte replay — a verbatim transport retry is a replay.
+    let replay = send_hmac_v2(&client, &url, &authorization, &date, &digest).await;
+    assert_eq!(
+        replay.status().as_u16(),
+        401,
+        "the exact replay must be rejected"
+    );
+    let replay_again = send_hmac_v2(&client, &url, &authorization, &date, &digest).await;
+    assert_eq!(replay_again.status().as_u16(), 401);
+    assert_eq!(
+        mutations.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "replays must not reach the backend at all"
+    );
+
+    // A fresh nonce with a recomputed signature is a new request and succeeds.
+    let fresh_nonce = crate::common::hmac_v2_nonce(0x5eed_0002);
+    let fresh_request = crate::common::HmacV2Request {
+        nonce: &fresh_nonce,
+        ..request
+    };
+    let fresh_authorization = crate::common::hmac_v2_authorization_header(&fresh_request, None);
+    let fresh = send_hmac_v2(&client, &url, &fresh_authorization, &date, &digest).await;
+    assert_eq!(
+        fresh.status().as_u16(),
+        200,
+        "a fresh nonce with a recomputed signature must be accepted"
+    );
+    assert_eq!(
+        mutations.load(std::sync::atomic::Ordering::SeqCst),
+        2,
+        "exactly one additional mutation reached the backend"
+    );
+
+    // A new nonce declared on the wire WITHOUT recomputing the signature must
+    // fail authentication and must not reach the backend.
+    let unsigned_nonce = crate::common::hmac_v2_nonce(0x5eed_0003);
+    let mutated_authorization =
+        crate::common::hmac_v2_authorization_header(&fresh_request, Some(&unsigned_nonce));
+    let mutated = send_hmac_v2(&client, &url, &mutated_authorization, &date, &digest).await;
+    assert_eq!(
+        mutated.status().as_u16(),
+        401,
+        "swapping the nonce without re-signing must fail authentication"
+    );
+    assert_eq!(
+        mutations.load(std::sync::atomic::Ordering::SeqCst),
+        2,
+        "an unauthenticated request must never reach the backend"
+    );
+
+    // A malformed nonce is refused before any credential work.
+    let malformed_authorization =
+        r#"hmac username="v2user", algorithm="hmac-sha256", nonce="short", signature="AAAA""#;
+    let malformed = send_hmac_v2(&client, &url, malformed_authorization, &date, &digest).await;
+    assert_eq!(malformed.status().as_u16(), 401);
+    assert_eq!(
+        mutations.load(std::sync::atomic::Ordering::SeqCst),
+        2,
+        "a malformed nonce must never reach the backend"
     );
 }

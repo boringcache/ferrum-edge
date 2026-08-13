@@ -59,6 +59,12 @@ pub struct HmacAuthCredential {
     /// Value of legacy `Digest:` or RFC 9530 `Content-Digest:`
     /// header.
     pub digest_header: String,
+    /// `ferrum-hmac-v2` client nonce from the `Authorization` parameters,
+    /// already validated for wire form. Bound into the v2 signing base and, once
+    /// the signature and body digest verify, claimed exactly once against the
+    /// shared replay authority. `None` under the legacy `ferrum-hmac-v1`
+    /// profile, which accepts no nonce and provides no single-use guarantee.
+    pub nonce: Option<String>,
     /// Hashes of the sole forwarding buffer used to verify `digest_header`
     /// without retaining another full request-body copy.
     pub request_body_sha256: [u8; 32],

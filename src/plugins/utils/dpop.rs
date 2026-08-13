@@ -1,11 +1,32 @@
+//! RFC 9449 DPoP proof validation.
+//!
+//! This module owns the cryptographic and claim checks only. Single-use replay
+//! protection is **not** local state here: it belongs to the shared
+//! [`crate::plugins::utils::replay_authority`], which owns lane identity,
+//! reload stability, cross-replica claims, capacity semantics, and fail-closed
+//! classification for every proof-of-possession admission in the gateway.
+//!
+//! [`verify`] therefore performs signature, `typ`/`alg`, JWK thumbprint /
+//! `cnf.jkt` binding, `htm`, `htu`, `iat`, `exp`, and `ath` validation and then
+//! returns the [`ReplayMarker`] the caller must claim. Ordering is the point:
+//! an unauthenticated proof never reaches replay state, so garbage cannot
+//! consume capacity or a shared-backend round trip.
+//!
+//! ## Retention horizon
+//!
+//! A proof is acceptable only while `|iat - now| <= clock_skew`, so the widest
+//! span over which one unchanged proof can ever be accepted is
+//! `2 * MAX_DPOP_CLOCK_SKEW_SECS`, whatever a provider configures and whatever
+//! a later reload widens it to. [`DPOP_MARKER_RETENTION_SECONDS`] is that span
+//! plus one second for whole-second truncation, is fixed rather than
+//! configurable, and is written identically by every generation and replica —
+//! so a marker always outlives every window in which its proof could be
+//! re-presented.
+
 use crate::fips::approved::Sha256;
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Mutex, MutexGuard};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use base64::Engine;
-use dashmap::DashMap;
-use dashmap::mapref::entry::Entry;
 use jsonwebtoken::jwk::{AlgorithmParameters, Jwk};
 use jsonwebtoken::{Algorithm, DecodingKey, Validation, decode, decode_header};
 use serde::Deserialize;
@@ -13,127 +34,22 @@ use serde_json::Value;
 
 use super::auth_flow::constant_time_eq;
 use super::claim_resolver::extract_claim_string;
+use super::replay_authority::{ReplayDomain, ReplayMarker};
 
-pub struct DpopJtiCache {
-    entries: DashMap<String, DpopJtiEntry>,
-    max_entries: usize,
-    ttl: Duration,
-    entry_count: AtomicUsize,
-    admission_lock: Mutex<()>,
-}
+/// Versioned proof profile bound into every DPoP protection domain.
+pub const DPOP_REPLAY_PROFILE: &str = "ferrum-dpop-proof-v1";
 
-struct DpopJtiEntry {
-    expires_at: Instant,
-}
+/// Widest admissible `dpop_clock_skew_secs`.
+pub const MAX_DPOP_CLOCK_SKEW_SECS: u64 = 300;
 
-impl DpopJtiCache {
-    pub fn new(max_entries: usize, ttl: Duration, shard_amount: usize) -> Self {
-        Self {
-            entries: DashMap::with_shard_amount(shard_amount),
-            max_entries,
-            ttl,
-            entry_count: AtomicUsize::new(0),
-            admission_lock: Mutex::new(()),
-        }
-    }
+/// Fixed retention horizon for an admitted DPoP proof marker.
+///
+/// Dominates `2 * MAX_DPOP_CLOCK_SKEW_SECS` — the widest acceptance span any
+/// admissible provider configuration can open for one unchanged proof — plus
+/// one second for whole-second truncation.
+pub const DPOP_MARKER_RETENTION_SECONDS: u64 = 2 * MAX_DPOP_CLOCK_SKEW_SECS + 1;
 
-    pub fn check_and_insert(&self, jkt: &str, jti: &str, now: Instant) -> bool {
-        let mut key = format!("{jkt}|{jti}");
-        let mut admission_guard = None;
-        loop {
-            match self.entries.entry(key) {
-                Entry::Occupied(mut existing) => {
-                    if existing.get().expires_at > now {
-                        return false;
-                    }
-                    // The proof carrying an expired cache entry has already
-                    // passed its own `exp` check. Replacing that exact key is
-                    // atomic under the DashMap shard lock and does not consume
-                    // another capacity slot.
-                    existing.insert(DpopJtiEntry {
-                        expires_at: now + self.ttl,
-                    });
-                    return true;
-                }
-                Entry::Vacant(vacant) => {
-                    if self.try_reserve_slot() {
-                        vacant.insert(DpopJtiEntry {
-                            expires_at: now + self.ttl,
-                        });
-                        return true;
-                    }
-                    // Do not scan other shards while holding this vacant-entry
-                    // guard. After making room, the loop reacquires the entry
-                    // guard so the replay check and insertion stay atomic.
-                    key = vacant.into_key();
-                }
-            }
-
-            if admission_guard.is_none() {
-                // Serialize only the full-cache path. Recheck the JTI under
-                // this guard before evicting: another request may have inserted
-                // it while this request waited, and a live duplicate must be
-                // rejected without displacing that replay marker.
-                admission_guard = Some(self.admission_guard());
-                continue;
-            }
-            if !self.evict_oldest() {
-                // A zero-capacity cache cannot admit any proof.
-                return false;
-            }
-        }
-    }
-
-    fn try_reserve_slot(&self) -> bool {
-        self.entry_count
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |count| {
-                (count < self.max_entries).then_some(count + 1)
-            })
-            .is_ok()
-    }
-
-    fn admission_guard(&self) -> MutexGuard<'_, ()> {
-        self.admission_lock
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-    }
-
-    fn evict_oldest(&self) -> bool {
-        loop {
-            let victim = self
-                .entries
-                .iter()
-                // Every entry uses the same TTL, so expiry order is insertion
-                // order. The minimum also naturally prefers expired entries
-                // over live entries.
-                .min_by_key(|entry| entry.value().expires_at)
-                .map(|entry| (entry.key().clone(), entry.value().expires_at));
-            let Some((key, expires_at)) = victim else {
-                return self.entry_count.load(Ordering::Acquire) < self.max_entries;
-            };
-            if self
-                .entries
-                // Match the observed expiry as well as the key so a concurrent
-                // remove-and-reinsert cannot make us evict the newer marker.
-                .remove_if(&key, |_, entry| entry.expires_at == expires_at)
-                .is_some()
-            {
-                self.entry_count.fetch_sub(1, Ordering::AcqRel);
-                return true;
-            }
-            // Another request changed the victim. Retry admission when it made
-            // room, or select the current oldest entry while still full.
-            if self.entry_count.load(Ordering::Acquire) < self.max_entries {
-                return true;
-            }
-        }
-    }
-
-    /// Configured capacity, exposed for default-contract regression tests.
-    pub(crate) fn max_entries(&self) -> usize {
-        self.max_entries
-    }
-}
+const _: () = assert!(DPOP_MARKER_RETENTION_SECONDS > 2 * MAX_DPOP_CLOCK_SKEW_SECS);
 
 pub struct DpopVerifyInput<'a> {
     pub proof: &'a str,
@@ -142,7 +58,8 @@ pub struct DpopVerifyInput<'a> {
     pub method: &'a str,
     pub htu: &'a str,
     pub clock_skew: Duration,
-    pub cache: &'a DpopJtiCache,
+    /// Precomputed protection domain for the provider that required this proof.
+    pub domain: &'a ReplayDomain,
 }
 
 #[derive(Debug, Deserialize)]
@@ -156,7 +73,16 @@ struct DpopClaims {
     ath: Option<String>,
 }
 
-pub fn verify(input: DpopVerifyInput<'_>) -> Result<(), &'static str> {
+/// Validate a DPoP proof and return the replay marker the caller must claim.
+///
+/// Returning the marker instead of claiming it here is deliberate: the claim is
+/// an `async` operation against a possibly shared authority, and it must happen
+/// **after** every check below. A caller that drops the returned marker has
+/// validated a proof without making it single-use, which is why the only
+/// production caller feeds it straight into
+/// [`crate::plugins::utils::replay_authority::ReplayAuthority::admit`].
+#[must_use = "a validated DPoP proof is only single-use once its marker is claimed"]
+pub fn verify(input: DpopVerifyInput<'_>) -> Result<ReplayMarker, &'static str> {
     let header = decode_header(input.proof).map_err(|_| "Invalid DPoP proof")?;
     if header.typ.as_deref() != Some("dpop+jwt") {
         return Err("Invalid DPoP proof type");
@@ -216,14 +142,13 @@ pub fn verify(input: DpopVerifyInput<'_>) -> Result<(), &'static str> {
     if !constant_time_eq(ath.as_bytes(), expected.as_bytes()) {
         return Err("DPoP access token hash mismatch");
     }
-    if !input
-        .cache
-        .check_and_insert(&jkt, &claims.jti, Instant::now())
-    {
-        return Err("DPoP replay");
-    }
 
-    Ok(())
+    // Every cryptographic and claim check has passed. The marker binds the
+    // provider's protection domain to the proof's key thumbprint and `jti`;
+    // neither the thumbprint nor the `jti` survives this call.
+    Ok(input
+        .domain
+        .marker(&[jkt.as_bytes(), claims.jti.as_bytes()]))
 }
 
 pub fn canonical_htu(scheme: &str, host: &str, path: &str) -> Option<String> {
@@ -337,31 +262,10 @@ mod tests {
     }
 
     #[test]
-    fn jti_cache_rejects_replay() {
-        let cache = DpopJtiCache::new(10, Duration::from_secs(60), 4);
-        let now = Instant::now();
-        assert!(cache.check_and_insert("jkt", "jti", now));
-        assert!(!cache.check_and_insert("jkt", "jti", now));
-    }
-
-    #[test]
-    fn expired_jti_is_not_treated_as_live_replay() {
-        let cache = DpopJtiCache::new(10, Duration::from_secs(60), 4);
-        let now = Instant::now();
-        assert!(cache.check_and_insert("jkt", "jti", now));
-        // Past the TTL the same jti is accepted again: lazy eviction means the
-        // stale entry may still be present, so the replay check must compare
-        // against `expires_at` rather than mere key presence.
-        assert!(cache.check_and_insert("jkt", "jti", now + Duration::from_secs(61)));
-    }
-
-    #[test]
-    fn jti_cache_evicts_oldest_live_entry_when_full() {
-        let cache = DpopJtiCache::new(2, Duration::from_secs(60), 4);
-        let now = Instant::now();
-        assert!(cache.check_and_insert("jkt", "old", now));
-        assert!(cache.check_and_insert("jkt", "new", now + Duration::from_secs(1)));
-        assert!(cache.check_and_insert("jkt", "third", now + Duration::from_secs(2)));
-        assert!(cache.check_and_insert("jkt", "old", now + Duration::from_secs(3)));
+    fn retention_horizon_dominates_the_widest_admissible_acceptance_window() {
+        // A proof is acceptable only inside `iat ± clock_skew`, so the widest
+        // window any admissible provider (or any later reload that widens the
+        // skew) can open is `2 * MAX_DPOP_CLOCK_SKEW_SECS`.
+        assert!(DPOP_MARKER_RETENTION_SECONDS > 2 * MAX_DPOP_CLOCK_SKEW_SECS);
     }
 }

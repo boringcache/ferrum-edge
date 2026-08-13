@@ -100,6 +100,7 @@ mod request_mirror_tests;
 mod request_size_limiting_tests;
 mod request_termination_tests;
 mod request_transformer_tests;
+mod replay_authority_tests;
 mod response_body_bounded_tests;
 mod response_caching_tests;
 mod response_mock_tests;

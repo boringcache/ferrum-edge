@@ -491,12 +491,13 @@ fn synchronous_validation_of_remote_providers_is_runtime_free() {
 }
 
 #[test]
-fn dpop_replay_cache_uses_published_default_capacity() {
+fn dpop_replay_lane_uses_published_default_capacity() {
     let plugin = JwksAuth::new(
         &json!({
             "providers": [{
                 "jwks": {"keys": []},
-                "require_dpop": true
+                "require_dpop": true,
+                "dpop_replay_scope": "process"
             }]
         }),
         default_client(),
@@ -504,11 +505,12 @@ fn dpop_replay_cache_uses_published_default_capacity() {
     .expect("valid inline provider");
 
     assert_eq!(
-        plugin.dpop_jti_cache_capacities(),
+        plugin.dpop_replay_lane_capacities(),
         vec![Some(
-            ferrum_edge::plugins::jwks_auth::DEFAULT_DPOP_JTI_CACHE_MAX_ENTRIES
+            ferrum_edge::plugins::jwks_auth::DEFAULT_DPOP_REPLAY_MAX_ENTRIES
         )]
     );
+    assert_eq!(plugin.dpop_replay_modes(), vec![Some("process")]);
 }
 
 #[test]
@@ -1766,7 +1768,8 @@ async fn dpop_valid_proof_with_matching_jkt_succeeds() {
         &json!({
             "providers": [{
                 "jwks_uri": jwks_uri,
-                "require_dpop": true
+                "require_dpop": true,
+                "dpop_replay_scope": "process"
             }]
         }),
         default_client(),
@@ -1830,7 +1833,8 @@ async fn dpop_required_but_header_missing_rejects_401() {
         &json!({
             "providers": [{
                 "jwks_uri": jwks_uri,
-                "require_dpop": true
+                "require_dpop": true,
+                "dpop_replay_scope": "process"
             }]
         }),
         default_client(),
@@ -3264,4 +3268,297 @@ async fn shared_discovery_uri_relaxes_only_after_the_stricter_generation_retires
     drop(relaxed);
     assert_eq!(wait_for_active_remote_stores(0).await, 0);
     clear_jwks_cache();
+}
+
+// ────────────────────────────────────────────────────────────────────
+// Issue #3834 — DPoP proofs are single-use across reloads and replicas
+// ────────────────────────────────────────────────────────────────────
+
+/// Everything a DPoP request needs, built once so the reload / replica /
+/// isolation cases can replay byte-identical inputs.
+struct DpopFixture {
+    access_token: String,
+    proof: String,
+}
+
+fn build_dpop_fixture(jti: &str) -> (DpopFixture, serde_json::Value) {
+    use base64::Engine;
+    use ferrum_edge::plugins::utils::dpop::jwk_thumbprint_sha256;
+    use jsonwebtoken::{EncodingKey, Header, encode};
+    use sha2::{Digest, Sha256};
+
+    let private_key_pem = include_bytes!("../../../tests/fixtures/test_rsa_private.pem");
+    let public_key_pem = include_bytes!("../../../tests/fixtures/test_rsa_public.pem");
+    let jwks = build_rsa_jwks_from_pem(public_key_pem);
+    let jwk: jsonwebtoken::jwk::Jwk = serde_json::from_value(jwks["keys"][0].clone()).unwrap();
+    let jkt = jwk_thumbprint_sha256(&jwk).unwrap();
+
+    let access_token = create_rs256_token(
+        &json!({"sub": "idp-user", "cnf": {"jkt": jkt}}),
+        private_key_pem,
+    );
+    let mut hasher = Sha256::new();
+    hasher.update(access_token.as_bytes());
+    let ath = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(hasher.finalize());
+
+    let now = chrono::Utc::now().timestamp();
+    let mut dpop_header = Header::new(jsonwebtoken::Algorithm::RS256);
+    dpop_header.typ = Some("dpop+jwt".to_string());
+    dpop_header.jwk = Some(jwk);
+    let proof = encode(
+        &dpop_header,
+        &json!({
+            "htm": "GET",
+            "htu": "http://example.com/test",
+            "iat": now,
+            "exp": now + 60,
+            "jti": jti,
+            "ath": ath
+        }),
+        &EncodingKey::from_rsa_pem(private_key_pem).unwrap(),
+    )
+    .unwrap();
+
+    (
+        DpopFixture {
+            access_token,
+            proof,
+        },
+        jwks,
+    )
+}
+
+fn dpop_ctx(fixture: &DpopFixture) -> RequestContext {
+    let mut ctx = make_ctx();
+    ctx.headers.insert(
+        "authorization".to_string(),
+        format!("Bearer {}", fixture.access_token),
+    );
+    ctx.headers
+        .insert("dpop".to_string(), fixture.proof.clone());
+    ctx.headers
+        .insert("host".to_string(), "example.com".to_string());
+    ctx.metadata
+        .insert("ferrum.frontend_scheme".to_string(), "http".to_string());
+    ctx
+}
+
+fn dpop_plugin(jwks: &serde_json::Value, config_id: &str) -> JwksAuth {
+    JwksAuth::new_with_config_id(
+        &json!({
+            "providers": [{
+                "jwks": jwks,
+                "require_dpop": true,
+                "dpop_replay_scope": "process"
+            }]
+        }),
+        default_client(),
+        Some(config_id),
+    )
+    .expect("inline-JWKS DPoP provider with a declared replay scope")
+}
+
+#[tokio::test]
+async fn dpop_exact_proof_replay_is_rejected() {
+    let (fixture, jwks) = build_dpop_fixture("dpop-replay-sequential");
+    let plugin = dpop_plugin(&jwks, "dpop-sequential");
+    let consumer_index = ConsumerIndex::new(&[create_consumer("idp-user")]);
+
+    let mut first = dpop_ctx(&fixture);
+    assert_continue(plugin.authenticate(&mut first, &consumer_index).await);
+
+    let mut replay = dpop_ctx(&fixture);
+    assert_reject(
+        plugin.authenticate(&mut replay, &consumer_index).await,
+        Some(401),
+    );
+}
+
+/// The reload opening from issue #3834: a rebuilt plugin generation must
+/// inherit the retired generation's replay markers instead of starting empty.
+#[tokio::test]
+async fn dpop_replay_stays_rejected_after_an_equivalent_plugin_rebuild() {
+    let (fixture, jwks) = build_dpop_fixture("dpop-replay-reload");
+    let consumer_index = ConsumerIndex::new(&[create_consumer("idp-user")]);
+
+    let original = dpop_plugin(&jwks, "dpop-reload");
+    let mut first = dpop_ctx(&fixture);
+    assert_continue(original.authenticate(&mut first, &consumer_index).await);
+
+    // Retire the generation that admitted the proof, exactly as a plugin-cache
+    // rebuild does, and construct an equivalent replacement.
+    drop(original);
+    let reloaded = dpop_plugin(&jwks, "dpop-reload");
+    let mut replay = dpop_ctx(&fixture);
+    assert_reject(
+        reloaded.authenticate(&mut replay, &consumer_index).await,
+        Some(401),
+    );
+}
+
+/// Two equivalent generations alive at once (the rolling-deployment shape)
+/// share one protection domain, so a proof admitted by either is a replay for
+/// the other.
+#[tokio::test]
+async fn dpop_replay_is_rejected_across_equivalent_concurrent_generations() {
+    let (fixture, jwks) = build_dpop_fixture("dpop-replay-rolling");
+    let consumer_index = ConsumerIndex::new(&[create_consumer("idp-user")]);
+
+    let old_generation = dpop_plugin(&jwks, "dpop-rolling");
+    let new_generation = dpop_plugin(&jwks, "dpop-rolling");
+
+    let mut first = dpop_ctx(&fixture);
+    assert_continue(old_generation.authenticate(&mut first, &consumer_index).await);
+    let mut replay = dpop_ctx(&fixture);
+    assert_reject(
+        new_generation
+            .authenticate(&mut replay, &consumer_index)
+            .await,
+        Some(401),
+    );
+}
+
+/// Distinct policies must not suppress one another: the same proof presented to
+/// an unrelated `jwks_auth` policy is that policy's first sighting.
+#[tokio::test]
+async fn dpop_replay_lanes_are_isolated_across_policies() {
+    let (fixture, jwks) = build_dpop_fixture("dpop-replay-isolation");
+    let consumer_index = ConsumerIndex::new(&[create_consumer("idp-user")]);
+
+    let policy_a = dpop_plugin(&jwks, "dpop-isolation-a");
+    let policy_b = dpop_plugin(&jwks, "dpop-isolation-b");
+
+    let mut first = dpop_ctx(&fixture);
+    assert_continue(policy_a.authenticate(&mut first, &consumer_index).await);
+    let mut second = dpop_ctx(&fixture);
+    assert_continue(policy_b.authenticate(&mut second, &consumer_index).await);
+}
+
+/// Filling a provider's replay lane must never make an unexpired proof
+/// reusable: at capacity a NEW proof is refused (503) while the retained one
+/// stays a replay (401).
+#[tokio::test]
+async fn dpop_capacity_refuses_new_proofs_without_freeing_a_live_marker() {
+    let (retained, jwks) = build_dpop_fixture("dpop-capacity-retained");
+    let (fresh, _) = build_dpop_fixture("dpop-capacity-fresh");
+    let consumer_index = ConsumerIndex::new(&[create_consumer("idp-user")]);
+
+    let plugin = JwksAuth::new_with_config_id(
+        &json!({
+            "providers": [{
+                "jwks": jwks,
+                "require_dpop": true,
+                "dpop_replay_scope": "process",
+                "dpop_replay_max_entries": 1
+            }]
+        }),
+        default_client(),
+        Some("dpop-capacity"),
+    )
+    .expect("single-slot DPoP replay lane");
+
+    let mut first = dpop_ctx(&retained);
+    assert_continue(plugin.authenticate(&mut first, &consumer_index).await);
+
+    // The lane is full and the retained marker is live: the new proof is
+    // refused rather than the live marker evicted.
+    let mut new_proof = dpop_ctx(&fresh);
+    assert_reject(
+        plugin.authenticate(&mut new_proof, &consumer_index).await,
+        Some(503),
+    );
+
+    // …and the retained proof is still a replay, so capacity pressure did not
+    // reopen it.
+    let mut replay = dpop_ctx(&retained);
+    assert_reject(
+        plugin.authenticate(&mut replay, &consumer_index).await,
+        Some(401),
+    );
+}
+
+/// `require_dpop` without a declared replay scope is refused at admission: a
+/// gateway cannot observe its own replica count, so the declaration is the
+/// control that prevents silent per-replica replay.
+#[test]
+fn dpop_requires_an_explicitly_declared_replay_scope() {
+    let error = JwksAuth::new(
+        &json!({
+            "providers": [{"jwks": {"keys": []}, "require_dpop": true}]
+        }),
+        default_client(),
+    )
+    .expect_err("require_dpop without a replay scope must be refused");
+    assert!(
+        error.contains("dpop_replay_scope"),
+        "diagnostic should name the missing declaration: {error}"
+    );
+
+    // The scope is meaningless without the feature it protects.
+    assert!(
+        JwksAuth::new(
+            &json!({
+                "providers": [{"jwks": {"keys": []}, "dpop_replay_scope": "process"}]
+            }),
+            default_client(),
+        )
+        .is_err()
+    );
+
+    // `shared` must be backed by Redis, and Redis must be consumed by a
+    // `shared` provider — a scope/backend disagreement is a misconfiguration in
+    // both directions, never a silent degradation to process-local state.
+    assert!(
+        JwksAuth::new(
+            &json!({
+                "providers": [{
+                    "jwks": {"keys": []},
+                    "require_dpop": true,
+                    "dpop_replay_scope": "shared"
+                }]
+            }),
+            default_client(),
+        )
+        .is_err()
+    );
+    assert!(
+        JwksAuth::new(
+            &json!({
+                "providers": [{
+                    "jwks": {"keys": []},
+                    "require_dpop": true,
+                    "dpop_replay_scope": "process"
+                }],
+                "sync_mode": "redis",
+                "redis_url": "redis://127.0.0.1:6379"
+            }),
+            default_client(),
+        )
+        .is_err()
+    );
+}
+
+/// The removed retention/capacity knobs are rejected with their replacement
+/// named, rather than silently ignored — a config still carrying
+/// `dpop_jti_ttl_secs` was written believing it controls how long a proof stays
+/// single-use.
+#[test]
+fn removed_dpop_replay_knobs_are_rejected_with_guidance() {
+    for (removed, expected) in [
+        ("dpop_jti_ttl_secs", "fixed horizon"),
+        ("dpop_jti_cache_max_entries", "dpop_replay_max_entries"),
+    ] {
+        let mut provider = json!({
+            "jwks": {"keys": []},
+            "require_dpop": true,
+            "dpop_replay_scope": "process"
+        });
+        provider[removed] = json!(300);
+        let error = JwksAuth::new(&json!({"providers": [provider]}), default_client())
+            .expect_err("a removed replay knob must be rejected");
+        assert!(
+            error.contains(removed) && error.contains(expected),
+            "diagnostic should name the removal and its replacement: {error}"
+        );
+    }
 }

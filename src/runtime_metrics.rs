@@ -593,6 +593,11 @@ pub struct RuntimeSnapshot {
     /// decision carriers. No labels, no trigger inputs, no route/identity/header
     /// values, and nothing plugin-controlled can reach this object.
     pub plugin_triggers: crate::plugins::trigger::PluginTriggerCarrierCounters,
+    /// Fixed-cardinality counters for the shared single-use replay authority
+    /// (`hmac_auth` `ferrum-hmac-v2` nonces and `jwks_auth` DPoP proofs). No
+    /// labels: no namespace, plugin id, provider, consumer, issuer, thumbprint,
+    /// nonce, marker, route, or backend error text can reach this object.
+    pub replay_authority: crate::plugins::utils::replay_authority::ReplayAuthorityCounters,
     pub overload: Value,
 }
 
@@ -688,6 +693,7 @@ pub fn build_snapshot(
         connections: build_connections_snapshot(&metrics, proxy_state),
         logs: build_logs_snapshot(&metrics),
         plugin_triggers: crate::plugins::trigger::carrier_counters(),
+        replay_authority: crate::plugins::utils::replay_authority::counters(),
         overload: build_overload_snapshot(proxy_state),
     }
 }

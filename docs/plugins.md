@@ -2083,6 +2083,31 @@ Unknown configuration keys, explicit `null` properties, empty configured strings
 
 Every `claim_headers` destination configured on `jwks_auth`, `oauth2_introspection`, or `oidc_relying_party` is **gateway-owned and always sanitized**. After a successful authentication the gateway removes each configured destination header from the request — case-insensitively, so duplicate and case-variant client copies go too — before it installs any verified claim value. A claim that is missing, null, empty or blank, of an unusable type, or absent from the principal that actually authenticated therefore leaves the destination **absent**; a client-supplied value is never forwarded in its place. Backends may treat these headers as gateway assertions. Each plugin instance owns exactly the destinations it configures (including every provider override): it sanitizes only those destinations and installs verified values only for those destinations. One instance therefore never strips another instance's destinations and never consumes a value staged for a destination another instance owns. A destination is sanitized once per request, so an instance sharing a destination cannot erase a value another instance already installed.
 
+### Single-use replay protection (shared)
+
+`jwks_auth`'s DPoP proofs and `hmac_auth`'s `ferrum-hmac-v2` nonces share **one** replay authority so they cannot drift into incompatible ownership, capacity, reload, and HA semantics.
+
+**Nothing off the wire is stored.** A replay marker is a fixed-size SHA-256 digest of a protection domain plus a proof identity. No token, proof JWT, `jti`, nonce, signature, username, subject, issuer, request path, query string, body digest, or secret is retained, keyed, logged, or sent to a shared backend. Every field is length-framed, so an attacker-chosen `jti` or nonce containing a delimiter cannot reproduce another domain's preimage. Redis keys reach `MONITOR`, `SLOWLOG`, and client error logs, so the only thing that becomes a key is a digest.
+
+**Ownership is a stable policy identity, not the plugin object.** A protection domain is `{profile version, namespace, plugin name, plugin-config id, sub-domain}` — never the instance a `PluginCache` rebuild happened to construct. An equivalent reload rejoins the same lane and inherits its live markers; two equivalent replicas derive the same domain and therefore the same shared keyspace. Distinct namespaces, plugin-config ids, providers, consumers, and profile versions are isolated without any unbounded label. A deleted or reconfigured policy leaves its lane behind as a tombstone until every marker it retains has expired; reclamation is cold-path only, bounded, and never touches a live marker. The lane registry is capped, and lane creation fails closed at the cap rather than dropping replay history.
+
+**Scope is an explicit declaration with no default.** A gateway cannot observe its own replica count, so `replay_scope` / `dpop_replay_scope` must be written out:
+
+| Scope | Contract |
+|---|---|
+| `process` | Single-process / development. Stable across equivalent in-process reloads; explicitly **not** cross-replica. Choosing it asserts a single-process deployment. |
+| `shared` | Production HA. Requires `sync_mode: "redis"`. Every replica claims each marker with one atomic Redis `SET … NX EX`, so among any number of concurrent requests on any number of replicas exactly one wins. |
+
+There is deliberately **no fallback between them**. A per-replica fallback would silently reinstate the cross-replica bypass the shared authority exists to close, so a shared-backend timeout, partition, authentication failure, corruption, capacity failure, or proven-unsupported topology rejects the protected request. A configuration whose scope and backend disagree — `shared` with no Redis, or Redis with no `shared` consumer — is refused at admission rather than degraded at runtime.
+
+**Capacity never forgets a live marker.** At capacity the authority prunes **expired** markers only. If no expired slot can be reclaimed, the new protected request is refused with a fixed classification. Evicting an unexpired marker to admit a new request would treat capacity pressure as permission to forget a replay marker, letting one client with a valid credential burn other clients' protection by generating unique proofs. Capacity degrades into refusal, never into silent unprotection.
+
+**Retention is fixed, not configured.** Each caller declares one compile-time horizon that dominates the widest span any admissible configuration can accept one unchanged proof over (`2 × max clock skew`, plus one second). This is not a knob: a later generation that widens its clock skew would otherwise make a captured proof acceptable again after its shorter marker had already been reclaimed, and `SET … NX EX` cannot rewrite the TTL of a key it did not create. Because every generation and every replica writes the same horizon, an existing marker always keeps at least the protection interval it was admitted with, across reloads and rolling deployments alike.
+
+**Observability** is fixed-cardinality and label-free. `/metrics/runtime` exposes `replay_authority` with `replay_rejected`, `capacity_refused`, `authority_unavailable`, `admitted_process`, `admitted_shared`, `legacy_unsafe_profile_accepted`, `shared_authorities`, `shared_authorities_unavailable`, and `process_lanes`. A non-zero `shared_authorities_unavailable` means protected requests on those policies are failing closed. No namespace, plugin id, provider, consumer, issuer, thumbprint, nonce, marker, route, or backend error text reaches any of them, and client-visible errors carry fixed bodies with no backend detail.
+
+**Operational HA requirement.** Any deployment running more than one gateway replica behind a load balancer — including a rolling deployment, where old and new processes serve concurrently — must declare `shared` and provision Redis. `process` scope in a multi-replica deployment means one replay per replica, and the gateway cannot detect that for you; the declaration is the control.
+
 ### `mtls_auth`
 
 Authenticates requests using the client's TLS/DTLS certificate, matching a configurable certificate field against consumer credentials. It supports HTTP/1.1, HTTP/2, HTTP/3, gRPC, WebSocket, terminated TCP+TLS, and UDP+DTLS. Stream proxies must set `frontend_tls: true` and `passthrough: false`; invalid combinations are rejected at configuration admission. On TCP stream proxies, it runs in `on_stream_connect` after the frontend TLS handshake. On UDP stream proxies, it runs after the frontend DTLS handshake completes. In both cases, the client certificate is mapped to a Consumer before later stream plugins run.
@@ -2171,8 +2196,8 @@ Authenticates using Bearer JWTs validated against one or more Identity Provider 
 | `providers[].require_mtls_binding` | Boolean (optional) | Require JWT `cnf.x5t#S256` to match the frontend client certificate SHA-256 thumbprint |
 | `providers[].require_dpop` | Boolean (optional) | Require and validate an RFC 9449 DPoP proof bound to the access token. The proof must carry an `ath` claim matching the SHA-256 of the presented token (§4.3); proofs without `ath` are rejected. The `htu` claim is compared after normalizing scheme/host case and default ports and ignoring query/fragment |
 | `providers[].dpop_clock_skew_secs` | u64 (optional) | DPoP `iat`/`exp` clock skew in seconds (default: `30`, max: `300`) |
-| `providers[].dpop_jti_cache_max_entries` | usize (optional) | Per-provider DPoP replay cache capacity (default: `10000`) |
-| `providers[].dpop_jti_ttl_secs` | u64 (optional) | DPoP `jti` replay cache TTL (default: `300`, must be at least twice clock skew) |
+| `providers[].dpop_replay_scope` | String (**required** with `require_dpop`) | `process` or `shared`. No default — see [Single-use replay protection](#single-use-replay-protection) |
+| `providers[].dpop_replay_max_entries` | usize (optional) | Capacity of a `process` replay lane (default: `100000`). At capacity only expired markers are reclaimed; if none can be, the request is refused |
 | `providers[].jwks_max_stale_seconds` | u64 (optional) | Per-provider maximum age of the last validated non-empty remote JWKS; overrides the plugin default (min `1`, max `86400`; remote sources only) |
 | `scope_claim` | String | Global scope claim path (default: `"scope"`) |
 | `role_claim` | String | Global role claim path (default: `"roles"`) |
@@ -2183,6 +2208,8 @@ Authenticates using Bearer JWTs validated against one or more Identity Provider 
 | `emit_mesh_request_principal_metadata` | Boolean | Emit `mesh.request_principal` plus mesh JWT claim/audience metadata for direct `mesh_authz` request-principal and `when` condition evaluation (default: `false`) |
 | `require_exp` | Boolean | Global default for requiring an `exp` claim (default: `true`) |
 | `jwks_refresh_interval_secs` | u64 | JWKS key refresh interval in seconds (default: `900`, min: `1`, max: `86400`); must not exceed each remote provider's effective maximum-stale value |
+| `sync_mode` | String | `local` or `redis` (default `local`). `redis` is required by, and only valid with, at least one provider declaring `dpop_replay_scope: shared` |
+| `redis_url`, `redis_tls`, `redis_key_prefix`, `redis_pool_size`, `redis_connect_timeout_seconds`, `redis_health_check_interval_seconds`, `redis_username`, `redis_password` | — | Shared Redis connectivity for the DPoP replay authority. Same semantics as every other Redis-backed plugin. The default key prefix is `{FERRUM_NAMESPACE}:jwks_auth:{plugin-config-id}` |
 | `jwks_max_stale_seconds` | u64 | Maximum age of the last validated non-empty remote JWKS (default: `3600`, max: `86400`). `0` is invalid and cannot disable fail-closed expiry |
 
 Claim values are auto-detected as space-delimited strings (OAuth2 standard), JSON arrays, or nested objects via dot-notation paths.
@@ -2192,6 +2219,17 @@ Unknown top-level, provider, and custom-header-location fields are rejected so m
 Remote discovery documents are capped at 128 KiB and JWKS responses at 1 MiB/256 keys, with bounded key components. A valid non-empty JWKS atomically replaces the key map, refreshes the monotonic trust deadline, clears failure state, and can restore authentication after expiry. Empty 200 responses, malformed or oversized bodies, non-2xx status, and transport/DNS/TLS/timeout failures retain last-known-good material only for the finite grace window and use a bounded accelerated retry cadence; after the deadline, verification refuses the retained material without deleting diagnostic/recovery state. JWKs are accepted for signature verification only when `use` is absent or `sig` and `key_ops` is absent or includes `verify`; contradictory operation metadata is rejected.
 
 Authenticated `/metrics` exposes only fixed-cardinality aggregate JWKS state for **active remote** stores: `fresh`, `grace`, or `expired`, maximum trust age per state, and closed refresh-failure classes. It never labels a series with a JWKS/discovery URL, `kid`, token, claim, or key material. Authenticated `/health`/`/status` mirror the same closed-set counts under `jwks_trust`; unauthenticated probes see only coarse readiness effects (grace → degraded+ready, expired → unavailable+not-ready, none → neutral) from an O(1) cached aggregate. Choose the maximum-stale window as an explicit availability-versus-revocation trade-off; production deployments should keep it short enough for emergency key removal to take effect within their incident-response objective.
+
+#### Single-use replay protection
+
+`require_dpop` accepts a proof only once. That guarantee is enforced by the shared replay authority described in [Single-use replay protection (shared)](#single-use-replay-protection-shared) below, which `hmac_auth`'s `ferrum-hmac-v2` profile also uses.
+
+Ordering is load-bearing: signature, `typ`/`alg`, JWK thumbprint / `cnf.jkt` binding, `htm`, `htu`, `iat`, `exp`, and `ath` are all validated first, then scope/role authorization runs, and only then is the proof claimed. Unauthenticated garbage therefore never consumes replay capacity or a shared-backend round trip, and a request rejected for insufficient scopes never burns the client's proof.
+
+The marker is a fixed-size digest of `{profile version, namespace, plugin-config id, provider index}` plus the JWK thumbprint and `jti`. No proof JWT, `jti`, access token, subject, issuer, or key material is stored, keyed, or logged.
+
+Retention is **not** configurable. Every marker is retained for a fixed 601-second horizon — `2 × 300` (the `dpop_clock_skew_secs` ceiling) plus one second — which dominates the widest span any admissible configuration can accept one unchanged proof over. A reload that widens `dpop_clock_skew_secs` therefore cannot make an already-admitted proof acceptable again, and a `SET … NX EX` that declines to touch an existing shared key is exactly correct because that key already carries the full horizon. `dpop_jti_ttl_secs` and `dpop_jti_cache_max_entries` were removed rather than redefined; configs carrying them are rejected with the replacement named.
+
 
 ### `oauth2_introspection`
 
@@ -2401,13 +2439,23 @@ Authenticates requests using Ferrum's versioned HMAC authorization scheme with m
 
 | Parameter | Type | Default | Description |
 |---|---|---|---|
-| `clock_skew_seconds` | u64 | `300` | Maximum allowed skew for the `Date` header freshness window |
+| `clock_skew_seconds` | u64 | `300` | Maximum allowed skew for the `Date` header freshness window (min `1`, max `300`) |
+| `signing_profile` | String | `ferrum-hmac-v2` | `ferrum-hmac-v2` (single-use) or `ferrum-hmac-v1` (freshness-only, unsafe) |
+| `allow_unsafe_replayable_v1` | Boolean | `false` | Required acknowledgement for `ferrum-hmac-v1`; rejected with `ferrum-hmac-v2` |
+| `replay_scope` | String | (**required** for v2) | `process` or `shared`. No default; rejected under v1 |
+| `replay_max_entries` | usize | `100000` | Capacity of a `process` replay lane. At capacity only expired markers are reclaimed; if none can be, the request is refused |
+| `sync_mode` | String | `local` | `redis` is required by, and only valid with, `replay_scope: shared` |
+| `redis_url`, `redis_tls`, `redis_key_prefix`, `redis_pool_size`, `redis_connect_timeout_seconds`, `redis_health_check_interval_seconds`, `redis_username`, `redis_password` | — | — | Shared Redis connectivity for the replay authority. Same semantics as every other Redis-backed plugin. The default key prefix is `{FERRUM_NAMESPACE}:hmac_auth:{plugin-config-id}` |
 
-Expected `Authorization` header format:
+The root key set is closed: a misspelled `replay_scope` or `signing_profile` fails admission rather than leaving the policy on a weaker posture than the operator wrote.
+
+Expected `Authorization` header format (`ferrum-hmac-v2`):
 
 ```text
-hmac username="<username>", algorithm="hmac-sha256", signature="<base64>"
+hmac username="<username>", algorithm="hmac-sha256", nonce="<nonce>", signature="<base64>"
 ```
+
+Under `ferrum-hmac-v1` the `nonce` parameter is **rejected**, not ignored: a client that sends one believes its request is single-use, and the v1 signing base does not cover it.
 
 - `algorithm` is optional and defaults to `hmac-sha256`
 - Supported algorithms: `hmac-sha256`, `hmac-sha512`
@@ -2418,8 +2466,10 @@ hmac username="<username>", algorithm="hmac-sha256", signature="<base64>"
 **Signing string**:
 
 ```text
-ferrum-hmac-v1\n{NAMESPACE}\n{USERNAME}\n{AUTHORITY}\n{METHOD}\n{PATH}\n{QUERY}\n{DATE}\n{DIGEST_HEADER_VALUE}
+ferrum-hmac-v2\n{NAMESPACE}\n{USERNAME}\n{AUTHORITY}\n{METHOD}\n{PATH}\n{QUERY}\n{DATE}\n{DIGEST_HEADER_VALUE}\n{NONCE}
 ```
+
+`ferrum-hmac-v1` is the same base without the trailing `{NONCE}` field. The profile version is the **first** field, so a v1 signature can never verify as v2 (or the reverse) even when every other field matches: downgrading the profile does not downgrade the signature.
 
 `{NAMESPACE}` is the namespace of the matched proxy (the default is `ferrum`) and HMAC Consumer identity lookup is restricted to that namespace. `{USERNAME}` is the decoded username auth-param. `{AUTHORITY}` is the validated request authority with an ASCII-lowercased hostname, no trailing DNS dot, no default `:80`/`:443` port, and any explicit non-default port retained; bracketed IPv6 remains bracketed. `{PATH}` is the request path component exactly as the client sent it on the wire — the raw target, *before* canonicalization — because the client signed those bytes; it is the only surface that reads the raw path, and it never influences routing or policy (see [docs/request_path_canonicalization.md](request_path_canonicalization.md)). `{QUERY}` is the raw query string as received (percent-encoded, without the leading `?`, empty when there is no query). `DIGEST_HEADER_VALUE` is the literal value of the selected digest field. Binding namespace, username, and authority prevents a captured signature from being relabeled to another Consumer, namespace, or virtual host; binding the raw query prevents query alteration.
 
@@ -2429,7 +2479,27 @@ For RFC 9530 `Content-Digest`, use structured-field byte-sequence syntax such as
 
 > **HBONE limitation:** `hmac_auth` is incompatible with HBONE CONNECT and rejects it with 401. Ferrum must preserve CONNECT DATA for tunnel relay and cannot buffer it for digest verification.
 
-> **Replay protection is a freshness window, not single-use.** The signed `Date` header bounds requests to `now ± clock_skew_seconds`; there is no nonce/seen-signature store, so a captured valid request can be replayed verbatim until the window elapses. Keep `clock_skew_seconds` tight for non-idempotent routes and do not rely on `hmac_auth` alone for them.
+#### Single-use replay protection (v2)
+
+A signed `Date` bounds *freshness*; it can never bound *uniqueness*. `ferrum-hmac-v2` requires a client-generated `nonce`, binds it into the signature alongside every other signed field, and claims it exactly once against the shared replay authority described in [Single-use replay protection (shared)](#single-use-replay-protection-shared). The second presentation of the same signed bytes is rejected with `401` **before backend dispatch**.
+
+**Nonce wire form.** Bounded and strictly validated at extraction, before any consumer lookup, HMAC computation, or replay-store interaction — so a malformed marker costs a bounded character scan and can never reach replay storage:
+
+- alphabet is base64url without padding (`A-Za-z0-9-_`), which excludes every whitespace and control byte, `=`, `+`, and `/`;
+- an **all-hex** value is read as hex and needs at least 32 characters (128 bits) with an even length — a 22-character all-hex nonce carries only 88 bits and is refused;
+- anything else is read as base64url and needs at least 22 characters (132 bits);
+- the ceiling is 86 characters either way;
+- one nonce per attempted logical request.
+
+**Ordering.** The replay claim happens only after the `Date` window, the digest header shape, the consumer lookup, the HMAC signature, and the body digest have all verified, and before any consumer identity or `auth_method` is committed. Invalid HMAC traffic therefore cannot fill replay storage.
+
+**Retries.** A verbatim transport retry **is** a replay and is rejected. A client that needs safe retries sends a fresh nonce with a recomputed signature and expresses at-most-once application semantics with its own idempotency key — that is an application/backend contract and is deliberately not conflated with gateway proof uniqueness.
+
+**Retention** is not configurable: every marker is retained for a fixed 601-second horizon (`2 × 300`, the `clock_skew_seconds` ceiling, plus one second), so a reload that widens `clock_skew_seconds` cannot make an already-admitted request acceptable again.
+
+The marker is a fixed-size digest of `{profile version, namespace, plugin-config id}` plus the Consumer's stable resource id and the nonce. No nonce, signature, secret, username, body digest, or raw query is stored, keyed, logged, or exposed in a client error.
+
+> **`ferrum-hmac-v1` is freshness-only and unsafe.** It has no nonce and no replay store: a captured valid request can be replayed verbatim until the `Date` window elapses. It is not the default, cannot be selected by accident (it needs both `signing_profile: "ferrum-hmac-v1"` and `allow_unsafe_replayable_v1: true`), and every acceptance under it increments the unlabeled `legacy_unsafe_profile_accepted` counter on `/metrics/runtime`. Do not use it on non-idempotent routes.
 
 **Consumer credential** (`hmac_auth`) — array. Every secret must contain at least 32 non-whitespace characters and must not be shared by different Consumers within one namespace. Separate namespaces may reuse the same secret:
 ```yaml
