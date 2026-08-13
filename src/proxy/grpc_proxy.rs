@@ -2870,6 +2870,7 @@ impl<'a> GrpcDispatchTransport<'a> {
     ///
     /// `None` (no LB-selected target) keeps the direct pool: the proxy's own
     /// backend host is the destination and no mesh tag exists to honor.
+    #[allow(dead_code)] // External integration tests call this; production uses for_target_with_hbone_context.
     pub fn for_target(
         grpc_pool: &'a GrpcConnectionPool,
         mesh_mtls_pool: &'a crate::proxy::mesh_mtls_pool::MeshMtlsConnectionPool,
@@ -2992,6 +2993,7 @@ impl<'a> GrpcDispatchTransport<'a> {
     /// Authenticated frontend workload identity asserted on HBONE CONNECT.
     /// `None` for non-HBONE transports, and for HBONE when the frontend did not
     /// authenticate a mesh peer (the pool then falls back to the gateway SVID).
+    #[allow(dead_code)] // External unit/integration tests read this diagnostic; the binary target does not.
     pub fn asserted_source_identity(&self) -> Option<&crate::identity::SpiffeId> {
         match self {
             Self::Hbone(hbone) => hbone.asserted_source_identity.as_ref(),

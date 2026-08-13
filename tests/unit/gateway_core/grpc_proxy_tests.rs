@@ -3450,7 +3450,8 @@ async fn native_grpc_hbone_asserts_authenticated_frontend_identity_not_caller_he
     // A forged identity in inner-request baggage must not become the asserted
     // source: stripping happens on dispatch headers, and CONNECT identity is
     // the resolver argument, not a header.
-    let filtered = transport.proxy_headers_for_dispatch(&identity_spoof_baggage_headers());
+    let spoof_headers = identity_spoof_baggage_headers();
+    let filtered = transport.proxy_headers_for_dispatch(&spoof_headers);
     assert_eq!(
         filtered.get("baggage").map(String::as_str),
         Some("trace_id=abc,custom.token=secret"),
@@ -3467,7 +3468,8 @@ async fn native_grpc_hbone_strips_configured_and_reserved_baggage_once_per_dispa
         .resolve_with_hbone_context(Some(&target), None, &prefixes)
         .expect("same-cluster mesh.hbone must resolve");
 
-    let filtered = transport.proxy_headers_for_dispatch(&identity_spoof_baggage_headers());
+    let spoof_headers = identity_spoof_baggage_headers();
+    let filtered = transport.proxy_headers_for_dispatch(&spoof_headers);
     assert_eq!(
         filtered.get("baggage").map(String::as_str),
         Some("trace_id=abc"),
@@ -3541,8 +3543,8 @@ async fn native_grpc_mesh_mtls_strips_identity_and_configured_baggage_without_hb
     let reserved_only = pools
         .resolve_with_hbone_context(Some(&mtls_target), None, &[])
         .expect("same-cluster mesh.mtls must resolve with empty configured prefixes");
-    let reserved_only_headers =
-        reserved_only.proxy_headers_for_dispatch(&identity_spoof_baggage_headers());
+    let spoof_headers = identity_spoof_baggage_headers();
+    let reserved_only_headers = reserved_only.proxy_headers_for_dispatch(&spoof_headers);
     assert_eq!(
         reserved_only_headers.get("baggage").map(String::as_str),
         Some("trace_id=abc,custom.token=secret"),
