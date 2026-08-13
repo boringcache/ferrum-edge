@@ -8,8 +8,9 @@
 //!   unprivileged steady-state host producer is allowed to start.
 //!
 //! The loop only ever deletes state it can prove Ferrum owns: the exact
-//! `FERRUM_MESH_UDP_*` chains/jumps and the exact Ferrum-owned policy rule and
-//! route, for IPv4 and IPv6 alike, in the host namespace and inside every pod
+//! `FERRUM_MESH_UDP_*` chains/jumps, the exact `FERRUM_UDP_FAIL_CLOSED_{A,B}`
+//! pod-netns guard chains, and the exact Ferrum-owned policy rule and route,
+//! for IPv4 and IPv6 alike, in the host namespace and inside every pod
 //! network namespace the node-agent registry enumerates. It never flushes a
 //! table, never removes a chain by pattern, and never touches a co-resident
 //! CNI's or service mesh's state.

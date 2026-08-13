@@ -92,13 +92,40 @@ fn a_stalled_child_is_killed_with_its_process_group_at_deadline() {
         let Ok(pid) = contents.trim().parse::<i32>() else {
             continue;
         };
-        let alive = unsafe { libc::kill(pid, 0) == 0 };
         assert!(
-            !alive,
+            !process_still_owned_after_deadline(pid),
             "{} pid {pid} must not outlive the deadline",
             path.file_name().unwrap_or_default().to_string_lossy()
         );
     }
+}
+
+/// True when `pid` is still running, or is a zombie this process still parents
+/// (an unreaped leak). `kill(pid, 0)` returns success for both live processes
+/// and zombies, so a reaped-by-init grandchild would otherwise look alive.
+#[cfg(unix)]
+fn process_still_owned_after_deadline(pid: i32) -> bool {
+    if unsafe { libc::kill(pid, 0) } != 0 {
+        return false;
+    }
+    #[cfg(target_os = "linux")]
+    {
+        let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat")) else {
+            return false;
+        };
+        let Some((_, after_comm)) = stat.rsplit_once(')') else {
+            return true;
+        };
+        let mut fields = after_comm.split_whitespace();
+        let state = fields.next().unwrap_or("");
+        let Ok(ppid) = fields.next().unwrap_or("").parse::<u32>() else {
+            return true;
+        };
+        if state == "Z" && ppid != std::process::id() {
+            return false;
+        }
+    }
+    true
 }
 
 #[cfg(unix)]

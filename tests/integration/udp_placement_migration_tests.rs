@@ -75,6 +75,34 @@ fn age_crash_temp(path: &std::path::Path) {
         .expect("age crash temp");
 }
 
+/// Closed inventory of chains the dual-stack node-preflight retirement scripts
+/// may flush (`-F`) or delete (`-X`). Exact names only: a prefix/wildcard would
+/// let a co-resident chain be swept, and a missing fail-closed guard would
+/// leave predecessor DROP jumps in place.
+fn is_ferrum_owned_udp_teardown_chain(chain: &str) -> bool {
+    matches!(
+        chain,
+        "FERRUM_MESH_UDP_OUTBOUND"
+            | "FERRUM_MESH_UDP_INBOUND"
+            | "FERRUM_MESH_UDP_OUTPUT_MARK"
+            | "FERRUM_MESH_UDP_REINJECT"
+            | "FERRUM_MESH_UDP_HOST"
+            | "FERRUM_MESH_UDP_HOST_GUARD_A"
+            | "FERRUM_MESH_UDP_HOST_GUARD_B"
+            | "FERRUM_UDP_FAIL_CLOSED_A"
+            | "FERRUM_UDP_FAIL_CLOSED_B"
+    )
+}
+
+/// The chain argument of a whitespace-delimited `-F` / `-X`, if that flag is
+/// present. A missing operand (table-wide flush) is the empty string, which
+/// the closed inventory rejects.
+fn chain_named_by_flush_or_delete(line: &str, token: &str) -> Option<&str> {
+    let mut args = line.split_whitespace();
+    args.find(|&arg| arg == token)?;
+    Some(args.next().unwrap_or(""))
+}
+
 struct MutableSource(Mutex<Vec<PodCaptureTarget>>);
 
 impl PodCaptureSource for MutableSource {
@@ -1767,20 +1795,25 @@ fn the_node_preflight_retires_both_placements_for_ipv4_and_ipv6() {
     for script in [&pod, &host] {
         assert!(script.contains("iptables"), "{script}");
         // Ownership safety: every chain flush/delete names a Ferrum-owned
-        // chain. A bare table flush would take a co-resident CNI's rules down
-        // with it, so it must never appear.
+        // chain from the closed inventory below. A bare table flush would take
+        // a co-resident CNI's rules down with it, so it must never appear.
+        // `FERRUM_UDP_FAIL_CLOSED_{A,B}` are the pod-netns alternating DROP
+        // guards — exact Ferrum-owned names, not a `FERRUM_MESH_UDP_*` prefix.
         for line in script.lines() {
             for token in ["-F", "-X"] {
-                if let Some(rest) = line.split(token).nth(1) {
-                    let chain = rest.split_whitespace().next().unwrap_or("");
+                if let Some(chain) = chain_named_by_flush_or_delete(line, token) {
                     assert!(
-                        chain.starts_with("FERRUM_MESH_UDP"),
+                        is_ferrum_owned_udp_teardown_chain(chain),
                         "{token} must name a Ferrum-owned chain, got {chain:?} in {line}"
                     );
                 }
             }
         }
     }
+    assert!(
+        pod.contains("FERRUM_UDP_FAIL_CLOSED_A") && pod.contains("FERRUM_UDP_FAIL_CLOSED_B"),
+        "pod teardown must reap both fail-closed guard generations: {pod}"
+    );
     assert!(
         pod.contains("ip6tables"),
         "pod teardown must cover IPv6: {pod}"

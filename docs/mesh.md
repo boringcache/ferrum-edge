@@ -4332,7 +4332,8 @@ default `true`). It runs `ferrum-edge ambient-udp-preflight` from the same
    decides from durable node-bound ownership, still consumes an unbound one.
 4. It enumerates every enrolled pod network namespace plus the host namespace
    and retires **both** predecessor placements for **IPv4 and IPv6** by exact
-   Ferrum-owned name: the `FERRUM_MESH_UDP_*` chains and jumps, and the exact
+   Ferrum-owned name: the `FERRUM_MESH_UDP_*` chains and jumps, the
+   `FERRUM_UDP_FAIL_CLOSED_{A,B}` pod-netns guard chains, and the exact
    Ferrum-owned policy rule and route. It never flushes a table, never matches a
    chain by pattern, and never touches a co-resident CNI's or Istio's state. A
    pre-contract node with no durable owner is exactly the conservative
