@@ -45,6 +45,7 @@ adding, removing, or materially changing a workflow.
 | `launch-integrity.yml` | Launch Readiness Integrity | `pull_request_target` for PRs to `main`, `merge_group` | Read-only trusted-base validation that a candidate preserved the launch/release governance contract. Executable gate code (checker, readiness/release/integrity/advisory-trust workflows and verifiers) is byte-frozen to protected `main`; candidate-editable data (blocker policy, exemption schema, document markers, CODEOWNERS coverage) is structurally validated, and check-name/advisory-secret scanning covers every workflow including ones the candidate adds. It never computes a launch verdict, so open launch blockers keep it green. `Launch Readiness Integrity` is directly required. See [launch-readiness.md](launch-readiness.md). |
 | `launch-readiness.yml` | Launch Readiness | PRs, `merge_group`, push to `main`, `v*` tags, daily schedule, manual | Live go/no-go launch verdict (`Launch Readiness Gate`). Expected to stay red while real blockers are open; it is release-blocking, **not** a required PR context. |
 | `node-waypoint-ebpf-live.yml` | NodeWaypoint eBPF Live Datapath | Path-filtered PRs, manual | Live eBPF datapath validation in kind. |
+| `istio-status-cas-live.yml` | Istio Status CAS Live | Path-filtered PRs, manual | Kind/apiserver competing-writer proof that Ferrum's Istio status CAS preserves foreign and Ferrum-owned conditions. Not a required live-suite check. |
 | `multicluster-federation-live.yml` | Multicluster Federation Live Datapath | PRs, `merge_group`, push to `main`, manual | Release-blocking multicluster federation datapath validation; `Multicluster Federation Live` is directly required on PRs and merge-queue groups. |
 | `multicluster-poller-partition-live.yml` | Multicluster Poller Partition Live | PRs, `merge_group`, push to `main`, manual | Release-blocking two-CP/two-DP trust/discovery partition and bounded last-good-retention validation; `Multicluster Poller Partition Live` is directly required. |
 | `dependency-audit.yml` | Dependency Audit | Weekly schedule, manual | Scheduled supply-chain governance beyond the per-PR audit gate. |
@@ -561,6 +562,24 @@ observational while NodeWaypoint remains Experimental; they are not part of the
 release-blocking sidecar GA contract. The workflow uploads Kubernetes
 diagnostics, mesh drift snapshots, pod-registry dumps, live assertions, and
 `bpftool` evidence with 14-day retention.
+
+#### 5a. Istio Status CAS Live Workflow
+
+**Runs**: `ubuntu-24.04`
+
+`istio-status-cas-live.yml` is a path-filtered Kind/apiserver lane for issue #3838.
+It is **not** a required live-suite check and is not wired into the `ci.yml`
+`Tests` aggregate (that aggregate is Cross-frozen). The workflow uses the same
+pinned `.github/actions/setup-kubernetes-tools` Kind/kubectl install as the other
+Kind-capable jobs, applies the checked-in AuthorizationPolicy CRD fixture
+(`tests/fixtures/k8s/istio_authorizationpolicy_status_crd.yaml`), and runs the
+ignored `k8s_istio_status_cas_live` test binary with
+`FERRUM_ISTIO_STATUS_CAS_LIVE=1`. That binary drives Ferrum's real
+`IstioStatusWriter` plus a kube-rs competing status writer; it must observe a
+resourceVersion conflict and keep both the foreign condition and
+`FerrumAccepted`. In-process mock coverage remains in
+`tests/integration/k8s_controller_istio_status_cas_tests.rs` and is not a
+substitute for this lane.
 
 #### 5b. Ambient Host-Network UDP Live-Kernel Workflow
 

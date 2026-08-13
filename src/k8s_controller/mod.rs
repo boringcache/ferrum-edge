@@ -595,6 +595,8 @@ pub async fn start_k8s_controller(
 
     let store_set = Arc::new(tokio::sync::Mutex::new(ResourceStoreSet::new()));
     let metrics = Arc::new(ControllerMetrics::new());
+    crate::plugins::prometheus_metrics::global_registry()
+        .set_k8s_controller_metrics(metrics.clone());
     // Shared by every watch scope (evidence producers) and the reconciler
     // (the single consumer that stamps a published snapshot) — issue #3611.
     let revision = Arc::new(K8sConfigRevisionTracker::new(
@@ -709,7 +711,7 @@ pub async fn start_k8s_controller(
     // overhead of an unused writer carrying a kube client clone.
     let istio_status_writer = controller_config
         .watch_istio
-        .then(|| IstioStatusWriter::new(client.clone()));
+        .then(|| IstioStatusWriter::new(client.clone()).with_metrics(metrics.clone()));
 
     let reconciler_registered = spawn_reconcile_loop(
         store_set.clone(),

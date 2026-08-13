@@ -39,6 +39,7 @@ use crate::config::stable_file::{
 };
 use crate::config::types::{CURRENT_CONFIG_VERSION, GatewayConfig};
 use crate::config::validation_pipeline::{ValidationAction, ValidationPipeline};
+use crate::config::yaml_alias_budget::admit_yaml_alias_expansion;
 use serde::Deserialize;
 use std::path::Path;
 use tracing::{info, warn};
@@ -166,11 +167,15 @@ pub fn load_config_from_file(
     // force an otherwise-current YAML document through JSON and discard
     // YAML-specific tags.
     let (mut value, mut yaml_value): (serde_json::Value, Option<serde_yaml::Value>) = if is_yaml {
+        admit_yaml_alias_expansion(&content)?;
         let yaml_val: serde_yaml::Value = serde_yaml::from_str(&content)?;
         (serde_json::to_value(&yaml_val)?, Some(yaml_val))
     } else {
         (serde_json::from_str(&content)?, None)
     };
+    // The parsed trees own every retained value; release the bounded source
+    // buffer before migration/validation allocates any additional structures.
+    drop(content);
 
     // Optional file-mode integrity seal. Strip before GatewayConfig
     // deserialization so deny_unknown_fields stays authoritative for the
@@ -435,6 +440,10 @@ pub fn decode_and_validate_config_document(
     if content.len() as u64 > MAX_CONFIG_FILE_BYTES {
         anyhow::bail!("config document exceeds maximum size of {MAX_CONFIG_FILE_BYTES} bytes");
     }
+
+    // Admit YAML alias expansion before the detection parse. The detector uses
+    // `serde_yaml::from_str`, which would otherwise materialize aliases first.
+    admit_yaml_alias_expansion(content)?;
 
     let is_yaml = serde_yaml::from_str::<serde_yaml::Value>(content).is_ok()
         && !content.trim_start().starts_with('{');

@@ -22,6 +22,30 @@ pub struct ControllerMetrics {
     /// this counter measures relist *rate*, not error rate. What is diagnostic
     /// is a scope that relists while the cluster is known to be changing.
     pub watch_idle_relists: AtomicU64,
+    /// Istio status JSON Merge Patch 409s observed while applying Ferrum-owned
+    /// conditions. Unlabeled: object identity and API error strings stay out.
+    pub istio_status_conflicts: AtomicU64,
+    /// Istio status writes that succeeded after at least one 409 retry.
+    pub istio_status_retries: AtomicU64,
+    /// Istio status writes that exhausted the bounded conflict retry budget
+    /// without falling back to an unversioned patch.
+    pub istio_status_retry_exhausted: AtomicU64,
+    /// Istio status writes aborted because the live UID no longer matched the
+    /// planned object (delete/recreate under the same name).
+    pub istio_status_recreated: AtomicU64,
+    /// Istio status writes aborted because the status read or write returned
+    /// HTTP 404. Kubernetes answers a CRD that declares no `status` subresource
+    /// with the same ordinary object-not-found response it uses for a deleted
+    /// object, so that case lands here rather than under
+    /// [`Self::istio_status_unsupported`].
+    pub istio_status_not_found: AtomicU64,
+    /// Istio status writes aborted because the API server does not serve the
+    /// resource at all: HTTP 405, or a 404 whose body says the requested
+    /// resource could not be found.
+    pub istio_status_unsupported: AtomicU64,
+    /// Istio status writes refused because the planned watch-snapshot UID was
+    /// missing, so the write could not bind object identity.
+    pub istio_status_missing_uid: AtomicU64,
 }
 
 impl Default for ControllerMetrics {
@@ -39,6 +63,13 @@ impl ControllerMetrics {
             last_reconcile_duration_ms: AtomicU64::new(0),
             gateway_api_status_plan_cursor: AtomicU64::new(0),
             watch_idle_relists: AtomicU64::new(0),
+            istio_status_conflicts: AtomicU64::new(0),
+            istio_status_retries: AtomicU64::new(0),
+            istio_status_retry_exhausted: AtomicU64::new(0),
+            istio_status_recreated: AtomicU64::new(0),
+            istio_status_not_found: AtomicU64::new(0),
+            istio_status_unsupported: AtomicU64::new(0),
+            istio_status_missing_uid: AtomicU64::new(0),
         }
     }
 
@@ -55,6 +86,27 @@ impl ControllerMetrics {
             watch_idle_relists: self
                 .watch_idle_relists
                 .load(std::sync::atomic::Ordering::Relaxed),
+            istio_status_conflicts: self
+                .istio_status_conflicts
+                .load(std::sync::atomic::Ordering::Relaxed),
+            istio_status_retries: self
+                .istio_status_retries
+                .load(std::sync::atomic::Ordering::Relaxed),
+            istio_status_retry_exhausted: self
+                .istio_status_retry_exhausted
+                .load(std::sync::atomic::Ordering::Relaxed),
+            istio_status_recreated: self
+                .istio_status_recreated
+                .load(std::sync::atomic::Ordering::Relaxed),
+            istio_status_not_found: self
+                .istio_status_not_found
+                .load(std::sync::atomic::Ordering::Relaxed),
+            istio_status_unsupported: self
+                .istio_status_unsupported
+                .load(std::sync::atomic::Ordering::Relaxed),
+            istio_status_missing_uid: self
+                .istio_status_missing_uid
+                .load(std::sync::atomic::Ordering::Relaxed),
         }
     }
 }
@@ -66,4 +118,11 @@ pub struct MetricsSnapshot {
     pub errors: u64,
     pub last_reconcile_duration_ms: u64,
     pub watch_idle_relists: u64,
+    pub istio_status_conflicts: u64,
+    pub istio_status_retries: u64,
+    pub istio_status_retry_exhausted: u64,
+    pub istio_status_recreated: u64,
+    pub istio_status_not_found: u64,
+    pub istio_status_unsupported: u64,
+    pub istio_status_missing_uid: u64,
 }
