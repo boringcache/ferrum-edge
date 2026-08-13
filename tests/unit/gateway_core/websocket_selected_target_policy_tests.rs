@@ -774,10 +774,8 @@ fn h3_websocket_mesh_egress_uses_materialized_host_not_routing_host() {
          matching H1/H2 (including an H3 `:authority` back-fill such as `{MATERIALIZED_HOST}`)"
     );
 
-    const MESH_WITH_CLIENT_HOST: &str =
-        "connect_mesh_websocket_backend(&state,ws_dial_proxy,target,egress,ws_client_host.as_deref(),";
-    const MESH_WITH_ROUTING_HOST: &str =
-        "connect_mesh_websocket_backend(&state,ws_dial_proxy,target,egress,request_host.as_deref(),";
+    const MESH_WITH_CLIENT_HOST: &str = "connect_mesh_websocket_backend(&state,ws_dial_proxy,target,egress,ws_client_host.as_deref(),";
+    const MESH_WITH_ROUTING_HOST: &str = "connect_mesh_websocket_backend(&state,ws_dial_proxy,target,egress,request_host.as_deref(),";
     assert!(
         h1_body.contains(MESH_WITH_CLIENT_HOST),
         "H1/H2 must pass the materialized Host verbatim to the shared mesh WS connector"
@@ -801,9 +799,8 @@ fn h3_websocket_mesh_egress_uses_materialized_host_not_routing_host() {
     // `ctx.headers["host"]` for the capture above.
     let h3_server = squeeze(include_str!("../../../src/http3/server.rs"));
     assert!(
-        h3_server.contains(
-            "ctx.headers.insert(\"host\".to_string(),authority.as_str().to_string());"
-        ),
+        h3_server
+            .contains("ctx.headers.insert(\"host\".to_string(),authority.as_str().to_string());"),
         "H3 must materialize a missing Host from `:authority` verbatim, including an explicit port"
     );
 
