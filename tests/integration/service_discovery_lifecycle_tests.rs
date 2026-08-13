@@ -1784,7 +1784,7 @@ async fn wait_for_progress(mut predicate: impl FnMut() -> bool) -> bool {
 /// deadline the way [`wait_for_within`] would.
 async fn wait_for_deadline_action(
     deadline: std::time::Duration,
-    mut predicate: impl FnMut() -> bool,
+    predicate: impl FnMut() -> bool,
 ) -> bool {
     tokio::task::yield_now().await;
     tokio::time::advance(deadline + std::time::Duration::from_millis(1)).await;
