@@ -46,9 +46,10 @@ APPROVED_SETUP = (
 PINNED_SHA = re.compile(r"^[0-9a-f]{40}$")
 HBONE_BACKEND_ALLOW_IPS_VAR = "FERRUM_BACKEND_ALLOW_IPS"
 HBONE_BACKEND_ALLOW_IPS_VALUE = "private"
-ALLOW_IPS_ASSIGN_RE = re.compile(
-    rf"{re.escape(HBONE_BACKEND_ALLOW_IPS_VAR)}="
-    r'(?:"(?P<dq>[^"]*)"|\'(?P<sq>[^\']*)\'|(?P<bare>[^\s\\&|;]+))'
+PHYSICAL_LINE_ASSIGN_RE = re.compile(
+    rf"^\s*{re.escape(HBONE_BACKEND_ALLOW_IPS_VAR)}="
+    r'(?:"(?P<dq>[^"]*)"|\'(?P<sq>[^\']*)\'|(?P<bare>[^\s\\&|;#]+))'
+    r"(?:\s*\\)?\s*(?:#.*)?$"
 )
 
 
@@ -104,19 +105,21 @@ def _logical_shell_lines(text: str) -> list[str]:
 
 
 def _active_backend_allow_ips_assignments(text: str) -> list[str]:
-    """Return values from active ``FERRUM_BACKEND_ALLOW_IPS`` shell assignments."""
+    """Return values from physical-line ``FERRUM_BACKEND_ALLOW_IPS`` env assignments."""
     values: list[str] = []
-    for logical_line in _logical_shell_lines(text):
-        active = _strip_shell_comment(logical_line).strip()
+    for raw_line in text.splitlines():
+        active = _strip_shell_comment(raw_line.rstrip()).strip()
         if not active or active.startswith("#"):
             continue
-        for match in ALLOW_IPS_ASSIGN_RE.finditer(active):
-            value = match.group("dq")
-            if value is None:
-                value = match.group("sq")
-            if value is None:
-                value = match.group("bare")
-            values.append(value)
+        match = PHYSICAL_LINE_ASSIGN_RE.match(active)
+        if match is None:
+            continue
+        value = match.group("dq")
+        if value is None:
+            value = match.group("sq")
+        if value is None:
+            value = match.group("bare")
+        values.append(value)
     return values
 
 
@@ -679,6 +682,31 @@ def _self_test_hbone_backend_allow_ips(failures: list[str]) -> None:
         ./target/release/ferrum-edge
 """,
             "inline comment camouflage",
+        ),
+        (
+            """
+    echo FERRUM_BACKEND_ALLOW_IPS=private
+    env \\
+        ./target/release/ferrum-edge
+""",
+            "echo camouflage",
+        ),
+        (
+            """
+    env \\
+        NOTFERRUM_BACKEND_ALLOW_IPS=private \\
+        FERRUM_BACKEND_ALLOW_IPS="public" \\
+        ./target/release/ferrum-edge
+""",
+            "suffix-name camouflage",
+        ),
+        (
+            """
+    env \\
+        FERRUM_BACKEND_ALLOW_IPS="public" \\
+        ./target/release/ferrum-edge FERRUM_BACKEND_ALLOW_IPS=private
+""",
+            "post-executable camouflage",
         ),
     )
     for sample, label in cases:
