@@ -2130,7 +2130,7 @@ impl DtlsServer {
                 }
             }
 
-            fail_queued_frontend_app_sends(&mut app_in_rx, auth_deadline.get().copied());
+            fail_queued_frontend_app_sends(&mut app_in_rx, auth_deadline.get());
             // Protocol/handshake records may still be flushed. Application
             // ciphertext whose authorization expired is discarded, not written.
             let discard_expired = session_authorization_elapsed(&auth_deadline);
