@@ -1727,14 +1727,8 @@ fn native_rotation_observation_violations(source: &str) -> Vec<String> {
             "capture_native_rotation_baseline",
             "pre-swap accepted-connect baseline for capp",
         ),
-        (
-            "--rotation-count",
-            "helper pre-swap accepted-connect count",
-        ),
-        (
-            "--rotation-fresh",
-            "helper post-swap freshness comparison",
-        ),
+        ("--rotation-count", "helper pre-swap accepted-connect count"),
+        ("--rotation-fresh", "helper post-swap freshness comparison"),
         (
             "NATIVE_ROTATION_BASELINE_CAPTURED",
             "rotation wait must require a captured baseline",
