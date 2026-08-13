@@ -1498,7 +1498,7 @@ fn delegated_udp_listenerset_cannot_withdraw_parent_secure_http_listener() {
             gateway,
             delegated,
         ],
-        options(),
+        options().with_source_namespaces(vec!["platform".to_string(), "tenant".to_string()]),
     )
     .expect("translate");
     let secure_key = GatewayApiListenerKey {
