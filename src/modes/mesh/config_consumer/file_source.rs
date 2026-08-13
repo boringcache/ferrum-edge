@@ -10,8 +10,9 @@
 //! keeping the last good slice when the reload fails.
 //!
 //! Reads go through the shared bounded stable-file primitive (regular-file
-//! open target, Unix `O_NONBLOCK`, 64 MiB ceiling with `limit + 1`, stable
-//! identity/content probes). Initial load and SIGHUP reload perform
+//! open target, Unix `O_NONBLOCK`, 64 MiB ceiling with `limit + 1`, two
+//! identity/content probes separated by a 20ms settle interval). Initial
+//! load and SIGHUP reload perform
 //! filesystem and parse work on `spawn_blocking`, coalesce repeated signals
 //! so only one generation is parsed at a time (with at most one follow-up
 //! after an in-flight load), and refuse to let an older completed load

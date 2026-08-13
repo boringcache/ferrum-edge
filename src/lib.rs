@@ -203,6 +203,27 @@ pub mod _test_support {
         crate::secrets::credential_file::write_sparse_credential_fixture(path, prefix, logical_len)
     }
 
+    /// Drive [`crate::config::stable_file::read_stable_file`] with a hook that
+    /// runs after the first identity/content probe and before the inter-probe
+    /// settle (issue #3881).
+    ///
+    /// Production `read_stable_file` is this same function with an empty
+    /// closure, so a test through here exercises the production path rather
+    /// than a parallel one. The hook observes the first-probe bytes so a
+    /// successor generation can be published in the settle window without
+    /// racing the scheduler.
+    pub fn read_stable_file_with_between_probes_for_test(
+        path: &std::path::Path,
+        options: crate::config::stable_file::StableFileReadOptions<'_>,
+        between_probes: impl FnMut(&[u8]),
+    ) -> Result<String, crate::config::stable_file::StableFileError> {
+        crate::config::stable_file::read_stable_file_with_between_probes(
+            path,
+            options,
+            between_probes,
+        )
+    }
+
     /// Exercise DP's crate-private concurrent listener supervisor without
     /// expanding the production API solely for external regression tests.
     pub async fn await_dp_listener_handles(
