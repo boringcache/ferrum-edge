@@ -294,7 +294,9 @@ enum NodeKind {
         pairs: Vec<(usize, usize)>,
         tag_bytes: usize,
     },
-    Alias { target: usize },
+    Alias {
+        target: usize,
+    },
 }
 
 struct Document {
