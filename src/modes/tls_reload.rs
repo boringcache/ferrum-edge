@@ -156,13 +156,30 @@ pub fn prepare_proxy_frontend_tls(
     // Only the HTTPS/H2 + TCP+TLS family is armed here. The H3 endpoint owns
     // `ProxyH3` and arms it from the exact verifier it installs on its own
     // endpoint, because it applies a reload asynchronously.
+    //
+    // A scope is armed ONLY when the exact accepted candidate actually performs
+    // verified client-certificate authentication (issue #3857). No client-CA
+    // source, or `FERRUM_FRONTEND_TLS_NO_VERIFY`, means no transport on this
+    // listener can ever hold a credential a CRL or client-CA withdrawal could
+    // revoke: arming it would publish an empty baseline, export
+    // retirement metrics for a protection with nothing to protect, and make
+    // `client_trust::capture` return `Some` on every accept — which is what
+    // made TCP+TLS decline the kTLS fast path on listeners that do no client
+    // authentication at all. Certificate/key-only rotation is unaffected; it
+    // simply reloads without a trust generation.
     let client_trust_scopes = match startup_client_trust.as_ref() {
-        Some(startup_client_trust) => {
+        Some(startup_client_trust) if startup_client_trust.verifier.is_some() => {
             client_trust::publish_accepted_material(
                 ClientTrustScope::ProxyFrontend,
                 startup_client_trust.material.clone(),
             );
             vec![ClientTrustScope::ProxyFrontend]
+        }
+        Some(_) => {
+            info!(
+                "Proxy frontend TLS live reload is enabled without verified client-certificate authentication; the proxy client-trust scope stays unarmed"
+            );
+            Vec::new()
         }
         None => {
             warn!(
@@ -384,13 +401,23 @@ pub fn prepare_admin_frontend_tls(
     // (`FERRUM_ADMIN_TLS_CLIENT_CA_BUNDLE_PATH` + the shared CRL source): the
     // baseline is the identity of the load that produced `tls_config`, never a
     // later re-read of the same source.
+    // Same "only when client certificates are actually verified" rule as the
+    // proxy surface (issue #3857): an admin HTTPS listener without
+    // `FERRUM_ADMIN_TLS_CLIENT_CA_BUNDLE_PATH`, or with admin no-verify, owns
+    // no withdrawable client credential and must stay unarmed.
     let client_trust_scopes = match startup_client_trust {
-        Some(startup_client_trust) => {
+        Some(startup_client_trust) if startup_client_trust.verifier.is_some() => {
             client_trust::publish_accepted_material(
                 ClientTrustScope::AdminHttps,
                 startup_client_trust.material,
             );
             vec![ClientTrustScope::AdminHttps]
+        }
+        Some(_) => {
+            info!(
+                "Admin HTTPS live reload is enabled without verified client-certificate authentication; the admin client-trust scope stays unarmed"
+            );
+            Vec::new()
         }
         None => {
             warn!(

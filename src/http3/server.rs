@@ -860,7 +860,18 @@ pub async fn start_http3_listener_with_signal(
     // Only when a reload channel exists: without one no generation can ever
     // advance, so arming would make every accepted connection register a
     // session that nothing could ever retire.
-    if reload_active && let Some(startup_client_trust) = startup_client_trust.as_ref() {
+    //
+    // And only when the accepted candidate actually installs a
+    // client-certificate verifier. A QUIC listener with no client-CA bundle
+    // admits no client certificate at all, so no connection on it can hold a
+    // withdrawable trust decision; arming it would publish an empty baseline
+    // and export retirement metrics for a protection that has nothing to
+    // protect (issue #3857). H3 0-RTT admission is unaffected — it is decided
+    // by `client_auth_configured`, not by whether this scope is armed.
+    if reload_active
+        && let Some(startup_client_trust) = startup_client_trust.as_ref()
+        && startup_client_trust.verifier.is_some()
+    {
         crate::tls::client_trust::publish_accepted_material(
             crate::tls::ClientTrustScope::ProxyH3,
             startup_client_trust.material.clone(),
@@ -980,18 +991,25 @@ pub async fn start_http3_listener_with_signal(
                         // anchors and revocations this endpoint may not be
                         // enforcing yet, falsely advancing the H3 generation
                         // while a revoked certificate could still reconnect.
-                        let publication = crate::tls::client_trust::publish_accepted_material(
-                            crate::tls::ClientTrustScope::ProxyH3,
-                            client_trust.material.clone(),
-                        );
-                        if publication.withdrew() {
-                            warn!(
-                                revision,
-                                generation = publication.generation,
-                                reason = publication.reason.map(|reason| reason.label()),
-                                retired_connections = publication.retired_sessions,
-                                "Frontend client-certificate trust was withdrawn; established HTTP/3 client-certificate connections were retired"
+                        //
+                        // Gated on the candidate actually installing a verifier,
+                        // for the same reason the startup arming is: a listener
+                        // that performs no client-certificate authentication
+                        // must never arm this scope.
+                        if client_trust.verifier.is_some() {
+                            let publication = crate::tls::client_trust::publish_accepted_material(
+                                crate::tls::ClientTrustScope::ProxyH3,
+                                client_trust.material.clone(),
                             );
+                            if publication.withdrew() {
+                                warn!(
+                                    revision,
+                                    generation = publication.generation,
+                                    reason = publication.reason.map(|reason| reason.label()),
+                                    retired_connections = publication.retired_sessions,
+                                    "Frontend client-certificate trust was withdrawn; established HTTP/3 client-certificate connections were retired"
+                                );
+                            }
                         }
                     }
                     Err(error) => {

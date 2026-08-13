@@ -3357,9 +3357,11 @@ async fn handle_tcp_connection_inner(
         // withdrawal could end the session; the buffered rustls relay is
         // fence-aware and is used instead. Nothing is refused and no
         // authentication is skipped — only the optional optimization is
-        // declined, and only in deployments that enabled frontend TLS live
-        // reload. Deciding it here, before the handshake, keeps the socket
-        // pristine.
+        // declined. The scope is armed only when the accepted frontend candidate
+        // actually performs verified client-certificate authentication, so a
+        // listener with no client-CA bundle (or with no-verify) keeps its
+        // existing kTLS eligibility unchanged even under live reload. Deciding
+        // it here, before the handshake, keeps the socket pristine.
         let ktls_eligible = ktls_enabled
             && !is_backend_tls
             && !scan_first_bytes_decrypted

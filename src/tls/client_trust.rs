@@ -16,7 +16,19 @@
 //!
 //! Every frontend listener family that terminates client-certificate
 //! authentication belongs to exactly one [`ClientTrustScope`] — a fixed,
-//! compile-time set. A scope owns one [`ClientTrustDomain`]:
+//! compile-time set.
+//!
+//! A scope is **armed only when the exact accepted candidate that listener
+//! family installed actually performs verified client-certificate
+//! authentication**. A listener with no client-CA source, or with verification
+//! explicitly disabled, can never hold a credential an operator could withdraw:
+//! arming it would publish an empty baseline, export retirement metrics for a
+//! protection with nothing to protect, and make [`capture`] return `Some` on
+//! every accept — which is what made TCP+TLS decline the kTLS fast path on
+//! listeners that do no client authentication at all. Certificate/key-only
+//! rotation is unaffected and simply reloads without a trust generation.
+//!
+//! An armed scope owns one [`ClientTrustDomain`]:
 //!
 //! - `generation` — monotonically advancing, bumped **only** after a validated,
 //!   accepted candidate that *semantically* differs from the last accepted one.
@@ -111,6 +123,14 @@ pub enum ClientTrustScope {
     /// exact accepted candidate it installed, never `ProxyFrontend`'s latest.
     ProxyH3,
     /// The admin HTTPS listener (`FERRUM_ADMIN_TLS_CLIENT_CA_BUNDLE_PATH`).
+    ///
+    /// Both admin accept loops — the static `ServerConfig` one and the
+    /// hot-swappable slot one — capture this scope's generation before they
+    /// select the config for a handshake, register the connection when rustls
+    /// authenticated a peer client certificate, hold the guard for the whole
+    /// admin connection, refuse a request buffered on a retired connection
+    /// before it enters admin routing, and end that connection through hyper's
+    /// own graceful shutdown.
     AdminHttps,
     /// Frontend UDP + DTLS listeners (`FERRUM_DTLS_*`).
     FrontendDtls,

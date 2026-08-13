@@ -198,6 +198,27 @@ pub fn spawn_frontend_tls_reload_task(
             config: new_config,
             client_trust,
         } = rebuilt;
+        // A surface whose scope is armed performs verified client-certificate
+        // authentication, and that mode is fixed configuration: the client-CA
+        // source and the `*_NO_VERIFY` switch are read once at startup and are
+        // not part of what live reload may change. A rebuilt candidate carrying
+        // no verifier would therefore be a silent authentication-mode change,
+        // and publishing its (empty) identity would read as a total client-CA
+        // withdrawal. Refuse the candidate instead and retain the complete
+        // last-good generation, verifier and sessions (issue #3857).
+        if !client_trust_scopes.is_empty()
+            && client_trust
+                .as_ref()
+                .is_none_or(|client_trust| client_trust.verifier.is_none())
+        {
+            for scope in &client_trust_scopes {
+                crate::tls::client_trust::record_rejected_candidate(*scope);
+            }
+            return Err(anyhow::anyhow!(
+                "frontend TLS reload candidate performs no client-certificate authentication on a \
+                 surface configured for it; keeping the previous configuration"
+            ));
+        }
         // Publish the whole accepted candidate before the plain slot, so a
         // consumer that observes the new `ServerConfig` can also observe the
         // verifier and identity that belong to it. The HTTP/3 endpoint reads
