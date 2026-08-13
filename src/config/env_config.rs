@@ -1859,6 +1859,26 @@ pub struct EnvConfig {
     /// using the shared secret, where it is security-equivalent.
     /// CP mode only.
     pub cp_dp_grpc_trust_bundle_path: Option<String>,
+    /// Maximum time (seconds) the CP may keep authorizing under a trust
+    /// generation it has not been able to revalidate
+    /// (`FERRUM_CP_DP_TRUST_MAX_STALE_SECONDS`, issue #3813).
+    ///
+    /// A reload that is unreadable, malformed, times out, or fails scope
+    /// validation deliberately retains the whole previous verifier — but only
+    /// for this long. At the bound the CP refuses to admit new ConfigSync,
+    /// MeshSubscribe, and xDS streams, terminates established ones through the
+    /// shared authorization lease, and reports `ready: false`. Measured on a
+    /// monotonic clock from the last accepted generation; a valid candidate —
+    /// including a semantically unchanged one — resets it. `0` means unbounded
+    /// retention and requires `FERRUM_CP_DP_TRUST_ALLOW_UNBOUNDED_STALE=true`.
+    /// Default: 900 (15 minutes). CP mode with a trust bundle only.
+    pub cp_dp_trust_max_stale_seconds: u64,
+    /// Explicit unsafe opt-in to unbounded stale-verifier retention
+    /// (`FERRUM_CP_DP_TRUST_ALLOW_UNBOUNDED_STALE`). Only meaningful with
+    /// `FERRUM_CP_DP_TRUST_MAX_STALE_SECONDS=0`, which is otherwise refused at
+    /// startup so "retain forever while ready" can never be an implicit
+    /// default.
+    pub cp_dp_trust_allow_unbounded_stale: bool,
     /// JWS `kid` header stamped on tokens this node mints
     /// (`FERRUM_CP_DP_GRPC_JWT_KEY_ID`). Selects which of the CP's trust-bundle
     /// credentials verifies them. DP / mesh / xDS client side; unset reproduces
@@ -3512,6 +3532,8 @@ impl Default for EnvConfig {
             cp_dp_grpc_jwt_secret: None,
             cp_dp_grpc_jwt_issuer: "ferrum-edge-cp-dp".to_string(),
             cp_dp_grpc_trust_bundle_path: None,
+            cp_dp_trust_max_stale_seconds: 900,
+            cp_dp_trust_allow_unbounded_stale: false,
             cp_dp_grpc_jwt_key_id: None,
             dp_cp_grpc_token_file: None,
             dp_cp_grpc_urls: Vec::new(),
@@ -4085,6 +4107,11 @@ impl EnvConfig {
             cp_dp_grpc_jwt_secret: Option<String> = "FERRUM_CP_DP_GRPC_JWT_SECRET";
             cp_dp_grpc_jwt_issuer: String = "FERRUM_CP_DP_GRPC_JWT_ISSUER" => "ferrum-edge-cp-dp".to_string();
             cp_dp_grpc_trust_bundle_path: Option<String> = "FERRUM_CP_DP_GRPC_TRUST_BUNDLE_PATH";
+            // Bounded stale-verifier retention (issue #3813). Nonzero by
+            // default: retaining an unrevalidatable verifier forever is opt-in,
+            // never the silent default.
+            cp_dp_trust_max_stale_seconds: u64 = "FERRUM_CP_DP_TRUST_MAX_STALE_SECONDS" => 900u64;
+            cp_dp_trust_allow_unbounded_stale: bool = "FERRUM_CP_DP_TRUST_ALLOW_UNBOUNDED_STALE" => false;
             cp_dp_grpc_jwt_key_id: Option<String> = "FERRUM_CP_DP_GRPC_JWT_KEY_ID";
             dp_cp_grpc_token_file: Option<String> = "FERRUM_DP_CP_GRPC_TOKEN_FILE";
             dp_cp_grpc_urls: Vec<String> = "FERRUM_DP_CP_GRPC_URLS" => Vec::new();
@@ -4903,6 +4930,8 @@ impl EnvConfig {
             cp_dp_grpc_jwt_secret,
             cp_dp_grpc_jwt_issuer,
             cp_dp_grpc_trust_bundle_path,
+            cp_dp_trust_max_stale_seconds,
+            cp_dp_trust_allow_unbounded_stale,
             cp_dp_grpc_jwt_key_id,
             dp_cp_grpc_token_file,
             dp_cp_grpc_urls,
@@ -5248,6 +5277,53 @@ impl EnvConfig {
     /// `Duration::ZERO` means the bound is disabled.
     pub fn dp_config_max_stale(&self) -> std::time::Duration {
         std::time::Duration::from_secs(self.dp_config_max_stale_seconds)
+    }
+
+    /// Configured maximum age of the CP's last revalidated trust generation
+    /// (issue #3813). `Duration::ZERO` means unbounded retention, which
+    /// [`Self::validate`] admits only behind the explicit unsafe opt-in.
+    pub fn cp_dp_trust_max_stale(&self) -> std::time::Duration {
+        std::time::Duration::from_secs(self.cp_dp_trust_max_stale_seconds)
+    }
+
+    /// Fail closed on a CP stale-trust policy that cannot mean what it says.
+    ///
+    /// Two shapes are refused, both only when a trust bundle is actually
+    /// watched. An unbounded window without the explicit opt-in would silently
+    /// restore "retain a verifier nobody can revalidate, forever, while
+    /// ready". A bound shorter than three poll intervals would latch on a
+    /// perfectly healthy control plane, because the age it measures is reset
+    /// only by a completed reload.
+    fn validate_cp_trust_stale_policy(&self) -> Result<(), String> {
+        if self.cp_dp_grpc_trust_bundle_path.is_none() {
+            return Ok(());
+        }
+        if self.cp_dp_trust_max_stale_seconds == 0 {
+            if !self.cp_dp_trust_allow_unbounded_stale {
+                return Err(
+                    "FERRUM_CP_DP_TRUST_MAX_STALE_SECONDS=0 keeps this control plane authorizing \
+                     with a trust generation it can no longer revalidate for an unbounded time, \
+                     so a credential an operator removed from the bundle stays usable until the \
+                     process restarts. Set a finite bound, or set \
+                     FERRUM_CP_DP_TRUST_ALLOW_UNBOUNDED_STALE=true to accept that risk \
+                     explicitly."
+                        .to_string(),
+                );
+            }
+            return Ok(());
+        }
+        let minimum = self.secret_refresh_interval_seconds.saturating_mul(3);
+        if self.cp_dp_trust_max_stale_seconds < minimum {
+            return Err(format!(
+                "FERRUM_CP_DP_TRUST_MAX_STALE_SECONDS ({}) is below three trust-bundle poll \
+                 intervals ({minimum}s at FERRUM_SECRET_REFRESH_INTERVAL_SECONDS={}). The bound \
+                 is measured from the last accepted reload, so a healthy control plane would \
+                 cross it between polls and refuse its own data planes. Raise the bound or lower \
+                 the poll interval.",
+                self.cp_dp_trust_max_stale_seconds, self.secret_refresh_interval_seconds
+            ));
+        }
+        Ok(())
     }
 
     pub fn proxy_socket_addr(&self, port: u16) -> std::net::SocketAddr {
@@ -6232,6 +6308,12 @@ impl EnvConfig {
                 }
                 if self.db_url.is_none() {
                     return Err("FERRUM_DB_URL is required in database/cp mode".into());
+                }
+                if self.mode == OperatingMode::ControlPlane {
+                    // Fail closed on a stale-trust policy that would either
+                    // retain an unrevalidatable verifier forever or latch on a
+                    // healthy CP (#3813).
+                    self.validate_cp_trust_stale_policy()?;
                 }
             }
             OperatingMode::File => {
