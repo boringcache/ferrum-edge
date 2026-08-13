@@ -113,8 +113,36 @@ impl PluginExtTestHarness {
         Ok(())
     }
 
-    async fn wait_for_poll(&self) {
-        tokio::time::sleep(Duration::from_secs(3)).await;
+    /// Wait for DB poll to pick up config changes.
+    /// Probes beneath `path` until the gateway returns any non-404 response,
+    /// which proves the route has been registered by the DB poller.
+    async fn wait_for_route(&self, path: &str) {
+        let url = format!("{}{}/wait-for-route-probe", self.proxy_base_url, path);
+        let client = reqwest::Client::new();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+        let mut last_observation = None;
+
+        loop {
+            if tokio::time::Instant::now() >= deadline {
+                panic!(
+                    "Gateway did not register route '{}' within 15 seconds; {}",
+                    path,
+                    last_observation
+                        .as_deref()
+                        .unwrap_or("no attempts completed")
+                );
+            }
+            match client.get(&url).send().await {
+                Ok(r) if r.status().as_u16() != 404 => return,
+                Ok(r) => {
+                    last_observation = Some(format!("status={}", r.status()));
+                }
+                Err(err) => {
+                    last_observation = Some(format!("error={err}"));
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(250)).await;
+        }
     }
 }
 
@@ -201,7 +229,7 @@ async fn start_echo_backend(
     Ok(handle)
 }
 
-/// Helper: set up a proxy with plugins, wait for poll
+/// Helper: set up a proxy with plugins, then wait for route readiness
 async fn setup_proxy_with_plugins(
     harness: &PluginExtTestHarness,
     client: &reqwest::Client,
@@ -296,7 +324,7 @@ async fn test_plugin_compression_gzip_response() {
     .await
     .unwrap();
 
-    harness.wait_for_poll().await;
+    harness.wait_for_route("/compress").await;
 
     // Send request with Accept-Encoding: gzip
     let resp = client
@@ -377,7 +405,7 @@ async fn test_plugin_compression_no_accept_encoding() {
     .await
     .unwrap();
 
-    harness.wait_for_poll().await;
+    harness.wait_for_route("/compress2").await;
 
     // Send request WITHOUT Accept-Encoding — should not compress
     let resp = client
@@ -440,7 +468,7 @@ async fn test_plugin_response_caching_cache_hit() {
     .await
     .unwrap();
 
-    harness.wait_for_poll().await;
+    harness.wait_for_route("/cache").await;
 
     // First request — cache miss
     let resp1 = client
@@ -503,7 +531,7 @@ async fn test_plugin_response_caching_post_bypass() {
     .await
     .unwrap();
 
-    harness.wait_for_poll().await;
+    harness.wait_for_route("/cache-post").await;
 
     // POST requests should bypass cache — send with body to verify it reaches backend
     let resp = client
@@ -555,7 +583,7 @@ async fn test_plugin_graphql_depth_limiting_reject() {
     .await
     .unwrap();
 
-    harness.wait_for_poll().await;
+    harness.wait_for_route("/graphql").await;
 
     // Send a deeply nested query (depth > 2)
     let deep_query = json!({
@@ -619,7 +647,7 @@ async fn test_plugin_graphql_valid_query_allowed() {
     .await
     .unwrap();
 
-    harness.wait_for_poll().await;
+    harness.wait_for_route("/graphql2").await;
 
     // Simple query within depth limit
     let simple_query = json!({
@@ -676,7 +704,7 @@ async fn test_plugin_graphql_introspection_disabled() {
     .await
     .unwrap();
 
-    harness.wait_for_poll().await;
+    harness.wait_for_route("/graphql3").await;
 
     // Introspection query
     let introspection = json!({
@@ -744,7 +772,7 @@ async fn test_plugin_response_mock_returns_mock() {
     .await
     .unwrap();
 
-    harness.wait_for_poll().await;
+    harness.wait_for_route("/mock").await;
 
     let resp = client
         .get(format!("{}/mock/hello", harness.proxy_base_url))
@@ -814,7 +842,7 @@ async fn test_plugin_response_mock_fallthrough() {
     .await
     .unwrap();
 
-    harness.wait_for_poll().await;
+    harness.wait_for_route("/mock2").await;
 
     // Request to a non-matching path should fall through to the real backend
     let resp = client
@@ -872,7 +900,7 @@ async fn test_plugin_response_mock_path_scoping() {
     .await
     .unwrap();
 
-    harness.wait_for_poll().await;
+    harness.wait_for_route("/api/v1").await;
 
     // Request to /api/v1/users — mock rule path is /users (relative to listen_path)
     let resp = client
@@ -941,7 +969,7 @@ async fn test_plugin_soap_ws_security_username_token() {
     .await
     .unwrap();
 
-    harness.wait_for_poll().await;
+    harness.wait_for_route("/soap").await;
 
     // Valid SOAP request with UsernameToken
     let soap_body = r#"<?xml version="1.0" encoding="UTF-8"?>
@@ -1022,7 +1050,7 @@ async fn test_plugin_soap_ws_security_missing_header() {
     .await
     .unwrap();
 
-    harness.wait_for_poll().await;
+    harness.wait_for_route("/soap2").await;
 
     // SOAP request WITHOUT Security header
     let soap_no_security = r#"<?xml version="1.0" encoding="UTF-8"?>
@@ -1094,7 +1122,7 @@ async fn test_plugin_soap_ws_security_utf16le_username_token() {
     .await
     .unwrap();
 
-    harness.wait_for_poll().await;
+    harness.wait_for_route("/soap-utf16le").await;
 
     let soap_body = r#"<?xml version="1.0" encoding="UTF-16"?>
 <soap:Envelope xmlns:soap="http://schemas.xmlsoap.org/soap/envelope/"
@@ -1215,7 +1243,7 @@ async fn test_plugin_soap_ws_security_utf16be_username_token() {
     .await
     .unwrap();
 
-    harness.wait_for_poll().await;
+    harness.wait_for_route("/soap-utf16be").await;
 
     let soap_body = r#"<?xml version="1.0" encoding="UTF-16"?>
 <soap:Envelope xmlns:soap="http://schemas.xmlsoap.org/soap/envelope/">
@@ -1315,7 +1343,7 @@ async fn test_plugin_soap_ws_security_utf16_charset_conflict_rejects() {
     .await
     .unwrap();
 
-    harness.wait_for_poll().await;
+    harness.wait_for_route("/soap-utf16-conflict").await;
 
     let soap_body = r#"<?xml version="1.0" encoding="UTF-16"?>
 <soap:Envelope xmlns:soap="http://schemas.xmlsoap.org/soap/envelope/">
