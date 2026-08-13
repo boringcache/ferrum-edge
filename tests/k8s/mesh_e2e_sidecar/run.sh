@@ -83,9 +83,10 @@ set -euo pipefail
 #                                               projected Secret generation
 #                                               swap of CP/DP gRPC TLS
 #                                               material reconnects the native
-#                                               stream without a pod restart
-#                                               and the replacement generation
-#                                               is the one that serves
+#                                               stream without a pod restart;
+#                                               an over-the-wire mTLS handshake
+#                                               to the running CP observes the
+#                                               replacement leaf serial
 #
 # DestinationRule exportTo / lookup probes drive captured client egress against
 # a beta-owned MeshService (`drsvc`) with two labelled sidecar backends. File-mode
@@ -190,15 +191,20 @@ JWT_WRONG_KEY=""
 CP_DP_JWT_SECRET=""
 ADMIN_JWT_SECRET=""
 CP_DP_JWT_SECRET_INVALID=""
-# Ephemeral native MeshSubscribe PKI. Private keys stay in this directory and
-# are shredded on EXIT; they are never copied into ARTIFACT_DIR / RESULTS_DIR.
+# Ephemeral native MeshSubscribe PKI. Controller-host copies live only in this
+# private temporary directory, are normally removed on EXIT, and are never
+# copied into ARTIFACT_DIR / RESULTS_DIR. The fixture transfers the required
+# leaves/keys into ephemeral Kubernetes Secrets for projection.
 NATIVE_MTLS_DIR=""
+NATIVE_OBSERVE_PF_PID=""
 NATIVE_CP_DNS=""
 NATIVE_WRONG_SAN_DNS=""
 NATIVE_SERVER_SERIAL_GEN1=""
 NATIVE_SERVER_SERIAL_GEN2=""
 NATIVE_CLIENT_SERIAL_GEN1=""
 NATIVE_CLIENT_SERIAL_GEN2=""
+NATIVE_CP_SERVED_CLASS=""
+NATIVE_CP_SERVED_REASON=""
 
 LIVE_ASSERTIONS_INITIALIZED=false
 REQUIRED_LIVE_ASSERTIONS=(
@@ -456,11 +462,28 @@ PY
 
 # ── Native MeshSubscribe mTLS PKI (issue #3855) ─────────────────────────────
 #
-# Ephemeral test PKI minted with openssl at run time. Private keys never leave
-# NATIVE_MTLS_DIR (not ARTIFACT_DIR / RESULTS_DIR) and are removed on EXIT.
-# Public serials/CNs are the only identity evidence recorded.
+# Ephemeral test PKI minted with openssl at run time. Controller-host copies
+# live only in NATIVE_MTLS_DIR (not ARTIFACT_DIR / RESULTS_DIR), are normally
+# removed on EXIT, and are never copied into results/artifacts. The fixture
+# transfers the required leaves/keys into ephemeral Kubernetes Secrets for
+# projection. Public serials/CNs/class/reason strings are the only identity
+# evidence recorded.
+
+stop_native_observe_port_forward() {
+  local pid="${1:-${NATIVE_OBSERVE_PF_PID:-}}"
+  if [[ -z "$pid" || "$pid" == "0" ]]; then
+    NATIVE_OBSERVE_PF_PID=""
+    return 0
+  fi
+  kill "$pid" 2>/dev/null || true
+  wait "$pid" 2>/dev/null || true
+  if [[ "${NATIVE_OBSERVE_PF_PID:-}" == "$pid" ]]; then
+    NATIVE_OBSERVE_PF_PID=""
+  fi
+}
 
 native_mtls_cleanup() {
+  stop_native_observe_port_forward
   if [[ -n "${NATIVE_MTLS_DIR:-}" && -d "$NATIVE_MTLS_DIR" ]]; then
     find "$NATIVE_MTLS_DIR" -type f -exec rm -f {} + 2>/dev/null || true
     rm -rf "$NATIVE_MTLS_DIR" 2>/dev/null || true
@@ -1811,11 +1834,181 @@ wait_for_native_rotation_evidence() {
   return 1
 }
 
-secret_server_serial() {
-  kubectl --context "$CONTEXT" -n "$NS" get secret ferrum-native-mtls-cp \
-    -o jsonpath='{.data.server\.pem}' 2>/dev/null |
-    base64 -d 2>/dev/null | openssl x509 -noout -serial 2>/dev/null |
-    awk -F= '{print $2}'
+pick_native_observe_loopback_port() {
+  python3 - <<'PY'
+import socket
+
+with socket.socket() as sock:
+    sock.bind(("127.0.0.1", 0))
+    print(sock.getsockname()[1])
+PY
+}
+
+wait_native_observe_port_forward() {
+  local pf_pid="$1" pf_log="$2" port="$3"
+  local _
+  for _ in $(seq 1 40); do
+    if ! kill -0 "$pf_pid" 2>/dev/null; then
+      return 1
+    fi
+    if grep -Eq "Forwarding from .*:${port}( ->|$)" "$pf_log" 2>/dev/null; then
+      return 0
+    fi
+    sleep 0.25
+  done
+  return 1
+}
+
+write_native_observe_evidence() {
+  local class="$1" reason="$2" serial="${3:-}"
+  NATIVE_CP_SERVED_CLASS="$class"
+  NATIVE_CP_SERVED_REASON="$reason"
+  printf 'class=%s\nreason=%s\nserved_serial=%s\nwant_serial=%s\n' \
+    "$class" "$reason" "$serial" "${NATIVE_SERVER_SERIAL_GEN2:-}" \
+    > "$RESULTS_DIR/native-mtls-served-serial.txt"
+}
+
+classify_native_observe_error() {
+  local err_file="$1" out_file="${2:-}"
+  local files=("$err_file")
+  if [[ -n "$out_file" && -f "$out_file" ]]; then
+    files+=("$out_file")
+  fi
+  if grep -Eqi 'verify (error|return:)|certificate verify failed|hostname mismatch' \
+    "${files[@]}" 2>/dev/null; then
+    printf '%s\n' "tls-verify"
+    return
+  fi
+  if grep -Eqi 'handshake|ssl routines|alert|certificate required' \
+    "${files[@]}" 2>/dev/null; then
+    printf '%s\n' "tls-handshake"
+    return
+  fi
+  if grep -Eqi 'connection refused|connection reset|connect' \
+    "${files[@]}" 2>/dev/null; then
+    printf '%s\n' "connect"
+    return
+  fi
+  printf '%s\n' "observe-failed"
+}
+
+# Over-the-wire observation of the leaf certificate served by the running
+# ferrum-cp after rotation. Connects through kubectl port-forward to the
+# ferrum-cp Service listener (not Secret.data, not a mounted file, not the
+# controller-local expected server cert). Verifies TLS against the gen2
+# server CA, the Kubernetes Service DNS SAN, and presents the gen2 DP client
+# cert because the CP requires mTLS. Prints the peer leaf serial on success.
+# Raw openssl transcripts stay in NATIVE_MTLS_DIR; RESULTS_DIR gets only
+# class/reason/serial evidence.
+observe_native_cp_served_serial() {
+  local port="" pf_pid=0 pf_log="" out_file="" err_file="" serial="" attempt \
+    hs_rc=0 verify_ok=false class reason
+  NATIVE_CP_SERVED_CLASS=""
+  NATIVE_CP_SERVED_REASON=""
+
+  if [[ -z "${NATIVE_MTLS_DIR:-}" || -z "${NATIVE_CP_DNS:-}" \
+    || ! -f "$NATIVE_MTLS_DIR/gen2-ca.pem" \
+    || ! -f "$NATIVE_MTLS_DIR/gen2-client.pem" \
+    || ! -f "$NATIVE_MTLS_DIR/gen2-client-key.pem" ]]; then
+    write_native_observe_evidence missing-material \
+      "gen2 CA/client material or Service DNS is missing"
+    return 1
+  fi
+
+  pf_log="$NATIVE_MTLS_DIR/observe-port-forward.log"
+  out_file="$NATIVE_MTLS_DIR/observe-handshake.out"
+  err_file="$NATIVE_MTLS_DIR/observe-handshake.err"
+
+  for attempt in $(seq 1 5); do
+    stop_native_observe_port_forward "$pf_pid"
+    pf_pid=0
+    port="$(pick_native_observe_loopback_port)"
+    if [[ -z "$port" || "$port" == "0" ]]; then
+      write_native_observe_evidence port-pick-failed \
+        "failed to allocate an ephemeral loopback port"
+      return 1
+    fi
+    : > "$pf_log"
+    kubectl --context "$CONTEXT" -n "$NS" port-forward "svc/ferrum-cp" \
+      "${port}:50051" >"$pf_log" 2>&1 &
+    pf_pid=$!
+    NATIVE_OBSERVE_PF_PID="$pf_pid"
+    if wait_native_observe_port_forward "$pf_pid" "$pf_log" "$port"; then
+      break
+    fi
+    if [[ "$attempt" -eq 5 ]]; then
+      stop_native_observe_port_forward "$pf_pid"
+      write_native_observe_evidence port-forward-failed \
+        "kubectl port-forward to svc/ferrum-cp:50051 did not become ready"
+      return 1
+    fi
+  done
+
+  : > "$out_file"
+  : > "$err_file"
+  set +e
+  python3 - "$out_file" "$err_file" \
+    openssl s_client \
+    -connect "127.0.0.1:${port}" \
+    -servername "$NATIVE_CP_DNS" \
+    -verify_hostname "$NATIVE_CP_DNS" \
+    -CAfile "$NATIVE_MTLS_DIR/gen2-ca.pem" \
+    -cert "$NATIVE_MTLS_DIR/gen2-client.pem" \
+    -key "$NATIVE_MTLS_DIR/gen2-client-key.pem" \
+    -verify_return_error \
+    -alpn h2 <<'PY'
+import subprocess
+import sys
+
+out_path, err_path = sys.argv[1], sys.argv[2]
+cmd = sys.argv[3:]
+try:
+    with open(out_path, "wb") as out, open(err_path, "wb") as err:
+        result = subprocess.run(
+            cmd, stdin=subprocess.DEVNULL, stdout=out, stderr=err, timeout=15
+        )
+    sys.exit(result.returncode)
+except subprocess.TimeoutExpired:
+    sys.exit(124)
+PY
+  hs_rc=$?
+  set -e
+  stop_native_observe_port_forward "$pf_pid"
+  pf_pid=0
+
+  if [[ "$hs_rc" -eq 124 ]]; then
+    write_native_observe_evidence handshake-timeout \
+      "openssl s_client timed out before a verified handshake"
+    return 1
+  fi
+
+  if grep -Fq 'Verify return code: 0 (ok)' "$out_file" "$err_file" 2>/dev/null \
+    || grep -Fq 'Verification: OK' "$out_file" "$err_file" 2>/dev/null; then
+    verify_ok=true
+  fi
+  if [[ "$verify_ok" != "true" ]]; then
+    class="$(classify_native_observe_error "$err_file" "$out_file")"
+    reason="verified mTLS handshake to the running CP failed"
+    write_native_observe_evidence "$class" "$reason"
+    return 1
+  fi
+
+  serial=""
+  serial="$(
+    awk '/BEGIN CERTIFICATE/{keep=1} keep{print} /END CERTIFICATE/{exit}' \
+      "$out_file" 2>/dev/null |
+      openssl x509 -noout -serial 2>/dev/null |
+      awk -F= '{print $2}' |
+      tr -d '[:space:]'
+  )" || serial=""
+  if [[ -z "$serial" ]]; then
+    write_native_observe_evidence empty-serial \
+      "peer leaf serial missing after a verified handshake"
+    return 1
+  fi
+
+  write_native_observe_evidence ok "peer-leaf-serial-observed" "$serial"
+  printf '%s\n' "$serial"
 }
 
 probe_native_mtls_rotation() {
@@ -1825,8 +2018,12 @@ probe_native_mtls_rotation() {
   if wait_for_native_rotation_evidence; then
     rotated=true
   fi
-  local live_serial
-  live_serial="$(secret_server_serial)"
+  local live_serial="" observe_ok=false
+  if live_serial="$(observe_native_cp_served_serial)"; then
+    observe_ok=true
+  else
+    live_serial=""
+  fi
   local out status body traffic_ok=false
   out="$(drive_settle client / "" 200 "$NATIVE_APP_MARKER" "$CAPP_HOST")"
   status="${out%%$'\t'*}"
@@ -1887,10 +2084,11 @@ else:
     --wait=false >/dev/null 2>&1 || true
 
   local outcome
-  outcome="rotated=$rotated live_serial=$live_serial want_serial=$NATIVE_SERVER_SERIAL_GEN2 traffic=$status stale_class=$stale_class $drift_verdict"
+  outcome="rotated=$rotated live_serial=$live_serial want_serial=$NATIVE_SERVER_SERIAL_GEN2 observe_class=${NATIVE_CP_SERVED_CLASS:-} traffic=$status stale_class=$stale_class $drift_verdict"
   printf '%s\n' "$outcome" > "$RESULTS_DIR/native-mtls-rotation.txt"
   log "native TLS rotation: $outcome"
-  if [[ "$rotated" == "true" && "$live_serial" == "$NATIVE_SERVER_SERIAL_GEN2" \
+  if [[ "$rotated" == "true" && "$observe_ok" == "true" \
+    && -n "$live_serial" && "$live_serial" == "$NATIVE_SERVER_SERIAL_GEN2" \
     && "$traffic_ok" == "true" && "$drift_verdict" == native-slice-received* \
     && "$stale_class" =~ ^(tls-handshake|tls-verify)$ ]]; then
     record_live_assertion sidecar.config.native_subscribe_tls_rotation_reconnects pass \
@@ -2349,8 +2547,18 @@ collect_diagnostics() {
   fi
   # Diagnostics referenced by basename from live-assertions.json live in
   # RESULTS_DIR; the workflows upload ARTIFACT_DIR, so mirror them (the JWT
-  # signing keys are throwaway per-run material and intentionally NOT copied).
-  cp "$RESULTS_DIR"/*.txt "$ARTIFACT_DIR/" 2>/dev/null || true
+  # signing keys and native mTLS private keys stay in throwaway per-run
+  # directories and are intentionally NOT copied). Skip any note that grew a
+  # PEM body so raw openssl handshake transcripts cannot be uploaded.
+  local note
+  for note in "$RESULTS_DIR"/*.txt; do
+    [[ -f "$note" ]] || continue
+    if grep -Eq 'BEGIN (CERTIFICATE|PRIVATE KEY|RSA PRIVATE KEY|EC PRIVATE KEY|OPENSSH)' \
+      "$note" 2>/dev/null; then
+      continue
+    fi
+    cp "$note" "$ARTIFACT_DIR/" 2>/dev/null || true
+  done
 }
 
 require_live_assertions() {

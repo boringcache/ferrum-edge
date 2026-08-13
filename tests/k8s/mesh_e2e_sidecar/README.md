@@ -34,8 +34,10 @@ cluster runs SPIRE plus the hand-crafted sidecar workloads (and, since issue
   **mTLS + JWT**. The CP server certificate SAN is the Kubernetes Service
   DNS hostname the DP dials (`https://ferrum-cp.<ns>.svc.cluster.local:50051`);
   `FERRUM_CP_GRPC_TLS_CLIENT_CA_PATH` requires a DP client certificate; JWT
-  remains required on the same stream. Ephemeral PKI is minted per run into
-  projected Secrets (`ferrum-native-mtls-cp` / `ferrum-native-mtls-dp`).
+  remains required on the same stream. Ephemeral PKI is minted per run into a
+  private temporary directory on the controller host (normally removed on
+  EXIT, never copied to results/artifacts) and transferred into projected
+  Secrets (`ferrum-native-mtls-cp` / `ferrum-native-mtls-dp`).
   The release-blocking native leg does not permit plaintext gRPC and does
   not skip server certificate verification.
 - **capp** — a third destination pod shaped like `svc` (inbound REDIRECT
@@ -49,7 +51,8 @@ cluster runs SPIRE plus the hand-crafted sidecar workloads (and, since issue
   foreign-client, untrusted-server-CA, wrong-SAN, and invalid-JWT negatives
   cannot make capp's inbound resolution ambiguous. A projected Secret
   generation swap proves watched CP/DP gRPC TLS rotation reconnects without
-  a pod restart.
+  a pod restart; the replacement leaf serial is observed over mTLS from the
+  running CP listener.
 - **drsvc-a / drsvc-b** — DestinationRule visibility destinations: two
   sidecar-backed workloads (`sa/drsvc-a`, `sa/drsvc-b`, inbound REDIRECT
   `8080 -> :15006`, SPIRE, STRICT) behind MeshService `drsvc` owned by
@@ -84,7 +87,7 @@ shared schema from `tests/k8s/lib/live_assertions.sh` (suite
 | `sidecar.config.native_subscribe_tls_untrusted_server_ca_rejected` | dedicated probe DP trusts the wrong server CA; no slice accepted |
 | `sidecar.config.native_subscribe_tls_wrong_san_rejected` | dedicated probe DP dials `ferrum-cp-wrong-san.<ns>.svc.cluster.local`, a hostname absent from the CP server SAN; no slice accepted |
 | `sidecar.config.native_subscribe_jwt_rejected` | dedicated probe DP completes mTLS then presents an invalid JWT; no slice accepted |
-| `sidecar.config.native_subscribe_tls_rotation_reconnects` | projected Secret generation swap of CP/DP gRPC TLS material reconnects the native stream without a pod restart; the replacement serial is live and a gen-1 client is then rejected |
+| `sidecar.config.native_subscribe_tls_rotation_reconnects` | projected Secret generation swap of CP/DP gRPC TLS material reconnects the native stream without a pod restart; an over-the-wire mTLS handshake to the running CP (Service DNS SAN, gen2 server CA, gen2 DP client cert) observes the replacement leaf serial, and a gen-1 client is then rejected |
 
 Every assertion backs a GA-contract capability row in
 `tests/conformance/ga_contract.yaml` — STRICT mTLS, AuthorizationPolicy

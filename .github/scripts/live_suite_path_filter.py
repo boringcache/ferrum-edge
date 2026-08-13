@@ -354,6 +354,7 @@ def native_mtls_fixture_contract_errors(root: Path) -> list[str]:
         errors.append("run.sh dropped ephemeral native MeshSubscribe PKI minting")
     if "apply_native_mtls_secrets gen2" not in run_text:
         errors.append("run.sh dropped the projected Secret generation swap")
+    errors.extend(native_mtls_rotation_observation_errors(run_text))
     if "serviceAccountName: native-mtls-probe" not in run_text:
         errors.append("run.sh native mTLS probes must not share sa/capp")
 
@@ -395,6 +396,117 @@ def native_mtls_fixture_contract_errors(root: Path) -> list[str]:
     if "CP-DP gRPC TLS is an orthogonal" in contract_text:
         errors.append("ga_contract.yaml still treats CP/DP TLS as orthogonal")
     return errors
+
+
+def native_mtls_rotation_observation_errors(run_text: str) -> list[str]:
+    """Reject a rotation gate that treats Secret.data.server.pem as live.
+
+    The served serial must come from a verified openssl s_client handshake to
+    the running ferrum-cp listener (Service DNS SAN, gen2 CA, gen2 DP client
+    cert). Function names may change; the handshake/verify/serial markers and
+    the Secret-decode prohibition are the contract.
+    """
+
+    errors: list[str] = []
+    if (
+        ".data.server" in run_text
+        or "jsonpath='{.data.server" in run_text
+        or 'jsonpath="{.data.server' in run_text
+        or "get secret ferrum-native-mtls-cp" in run_text
+    ):
+        errors.append(
+            "rotation live serial must not be decoded from Secret.data.server.pem"
+        )
+    if "/transport/server.pem" in run_text:
+        errors.append(
+            "rotation live serial must not be read from the mounted CP server cert"
+        )
+    for line in run_text.splitlines():
+        trimmed = line.strip()
+        if trimmed.startswith("#"):
+            continue
+        if ("live_serial=" in trimmed or 'live_serial="' in trimmed) and (
+            "gen2-server.pem" in trimmed
+            or "/server.pem" in trimmed
+            or "get secret" in trimmed
+            or ".data.server" in trimmed
+        ):
+            errors.append(
+                "live_serial assignment must not use a Secret, mounted file, "
+                "or controller-local expected server cert"
+            )
+    if "pkill" in run_text or "killall" in run_text:
+        errors.append(
+            "native CP observe helper must kill only its port-forward PID, not pkill/killall"
+        )
+
+    required = (
+        ("openssl s_client", "over-the-wire openssl s_client handshake"),
+        ("-verify_return_error", "TLS verification fail-closed"),
+        ("-verify_hostname", "Service DNS SAN verification"),
+        ("gen2-ca.pem", "gen2 server CA"),
+        ("gen2-client.pem", "gen2 DP client cert"),
+        ("gen2-client-key.pem", "gen2 DP client key"),
+        ("port-forward", "kubectl port-forward to the live CP"),
+        ("NATIVE_CP_DNS", "Kubernetes Service DNS name"),
+        ("NATIVE_SERVER_SERIAL_GEN2", "gen2 served-serial gate"),
+        ("Verify return code: 0", "verified-handshake success check"),
+        ("wait_for_native_rotation_evidence", "CP/DP reload-log evidence"),
+    )
+    for needle, desc in required:
+        if needle not in run_text:
+            errors.append(f"native rotation observation missing {desc} (`{needle}`)")
+
+    forwards_cp = "port-forward" in run_text and (
+        "svc/ferrum-cp" in run_text
+        or "service/ferrum-cp" in run_text
+        or "deploy/ferrum-cp" in run_text
+    )
+    if not forwards_cp:
+        errors.append(
+            "rotation observation must port-forward the live ferrum-cp listener"
+        )
+
+    idx = run_text.find("openssl s_client")
+    window = run_text[idx : idx + 5000] if idx >= 0 else ""
+    if not (
+        "openssl x509" in window
+        and "-noout" in window
+        and "-serial" in window
+        and "CAcreateserial" not in window
+    ):
+        errors.append(
+            "peer leaf serial must be extracted from the openssl s_client "
+            "handshake output (openssl x509 -noout -serial)"
+        )
+    if "shred" in run_text.lower():
+        errors.append(
+            "run.sh must not claim keys are shredded unless the fixture shreds them"
+        )
+    return errors
+
+
+def native_mtls_rotation_observation_self_test() -> list[str]:
+    """Pin the false Secret-decode proof so it cannot silently return."""
+
+    failures: list[str] = []
+    secret_false_proof = """
+apply_native_mtls_secrets gen2
+wait_for_native_rotation_evidence
+live_serial="$(kubectl get secret ferrum-native-mtls-cp \\
+  -o jsonpath='{.data.server\\.pem}' | base64 -d | openssl x509 -noout -serial)"
+record_live_assertion sidecar.config.native_subscribe_tls_rotation_reconnects pass
+"""
+    secret_errors = native_mtls_rotation_observation_errors(secret_false_proof)
+    if not secret_errors:
+        failures.append(
+            "rotation observation contract accepted Secret.data.server.pem as live serial"
+        )
+    elif not any("Secret.data.server.pem" in error for error in secret_errors):
+        failures.append(
+            "rotation observation contract must name Secret decoding in the rejection"
+        )
+    return failures
 
 
 def self_test() -> int:
@@ -484,6 +596,7 @@ def self_test() -> int:
                 f"{suite} {changed!r}: expected relevant={expected}, got {relevant}"
             )
     failures.extend(native_mtls_fixture_contract_errors(Path.cwd()))
+    failures.extend(native_mtls_rotation_observation_self_test())
     for failure in failures:
         print(f"::error::{failure}", file=sys.stderr)
     return 1 if failures else 0

@@ -60,7 +60,8 @@ over production mTLS + JWT (`https://ferrum-cp.<ns>.svc.cluster.local:50051`
 with SAN verification, CP client-CA, and DP client cert/key). Dedicated
 probes prove omit-client / foreign-client / untrusted-server-CA / wrong-SAN /
 invalid-JWT fail closed, and a projected Secret generation swap proves watched
-CP/DP gRPC TLS rotation reconnects without a pod restart. `GET /mesh/config-drift`
+CP/DP gRPC TLS rotation reconnects without a pod restart, with the replacement
+leaf serial observed over mTLS from the running CP listener. `GET /mesh/config-drift`
 attributes the accepted slice to the native transport. `coverage.md` lists the currently enrolled rows and required live
 assertion IDs, which are the authoritative answer to "what regression fails
 CI today."

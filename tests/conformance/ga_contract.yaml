@@ -240,8 +240,8 @@ capabilities:
     # already-converged capp pod) prove omit-client, foreign-client,
     # untrusted-server-CA, wrong-SAN, and invalid-JWT each fail closed with
     # no slice accepted. A projected Secret generation swap proves CP/DP
-    # gRPC TLS watchers reconnect without a pod restart and that the
-    # replacement generation is the one that serves.
+    # gRPC TLS watchers reconnect without a pod restart, and an over-the-wire
+    # mTLS handshake to the running CP observes the replacement leaf serial.
     live_assertions:
       - sidecar.config.native_subscribe_delivered
       - sidecar.config.native_subscribe_mtls_omitted_client_rejected

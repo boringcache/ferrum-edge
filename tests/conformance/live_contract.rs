@@ -823,6 +823,10 @@ fn live_contract_sidecar_native_subscribe_fixture_is_mtls_jwt() {
         "run.sh must swap projected Secret generations for the rotation proof"
     );
     assert!(
+        RUN_SH.contains("openssl s_client"),
+        "run.sh must observe the post-rotation CP leaf over a real TLS handshake"
+    );
+    assert!(
         RUN_SH.contains("sidecar.config.native_subscribe_mtls_omitted_client_rejected"),
         "run.sh must emit the omitted-client negative"
     );
@@ -837,6 +841,205 @@ fn live_contract_sidecar_native_subscribe_fixture_is_mtls_jwt() {
     assert!(
         !CONTRACT.contains("CP-DP gRPC TLS is an orthogonal"),
         "ga_contract.yaml must not describe CP/DP TLS as orthogonal to the native live row"
+    );
+}
+
+/// Issue #3855 rotation gate: the live serial must come from the leaf
+/// certificate served by the running CP over a verified mTLS handshake.
+/// Decoding `Secret.data.server.pem` (or a mounted/expected server cert)
+/// only proves the object store changed, not that ferrum-cp reloaded.
+fn native_rotation_observation_violations(source: &str) -> Vec<String> {
+    let mut errors = Vec::new();
+
+    if source.contains(".data.server")
+        || source.contains("jsonpath='{.data.server")
+        || source.contains("jsonpath=\"{.data.server")
+        || source.contains("get secret ferrum-native-mtls-cp")
+    {
+        errors.push(
+            "rotation live serial must not be decoded from Secret.data.server.pem \
+             (that only proves the Secret object changed, not that the running CP \
+             now serves the replacement leaf)"
+                .into(),
+        );
+    }
+    if source.contains("/transport/server.pem") {
+        errors.push(
+            "rotation live serial must not be read from the mounted CP server cert"
+                .into(),
+        );
+    }
+    for line in source.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with('#') {
+            continue;
+        }
+        if (trimmed.contains("live_serial=") || trimmed.contains("live_serial=\""))
+            && (trimmed.contains("gen2-server.pem")
+                || trimmed.contains("/server.pem")
+                || trimmed.contains("get secret")
+                || trimmed.contains(".data.server"))
+        {
+            errors.push(
+                "live_serial assignment must not use a Kubernetes Secret, mounted \
+                 file, or controller-local expected server cert"
+                    .into(),
+            );
+        }
+    }
+    if source.contains("pkill") || source.contains("killall") {
+        errors.push(
+            "native CP observe helper must kill only the port-forward PID it created, \
+             not pkill/killall"
+                .into(),
+        );
+    }
+
+    let required = [
+        (
+            "openssl s_client",
+            "over-the-wire openssl s_client handshake to the running CP",
+        ),
+        (
+            "-verify_return_error",
+            "TLS verification fail-closed (-verify_return_error)",
+        ),
+        (
+            "-verify_hostname",
+            "Kubernetes Service DNS SAN verification (-verify_hostname)",
+        ),
+        ("-CAfile", "verification against the gen2 server CA file"),
+        ("gen2-ca.pem", "gen2 server CA"),
+        ("gen2-client.pem", "gen2 DP client certificate"),
+        ("gen2-client-key.pem", "gen2 DP client key for required mTLS"),
+        ("port-forward", "kubectl port-forward to the live CP listener"),
+        ("50051", "CP gRPC listen port"),
+        ("NATIVE_CP_DNS", "real Kubernetes Service DNS name"),
+        (
+            "NATIVE_SERVER_SERIAL_GEN2",
+            "gate success on the gen2 server serial",
+        ),
+        (
+            "apply_native_mtls_secrets gen2",
+            "projected Secret generation swap",
+        ),
+        (
+            "sidecar.config.native_subscribe_tls_rotation_reconnects",
+            "rotation assertion id",
+        ),
+        (
+            "wait_for_native_rotation_evidence",
+            "independent CP/DP reload-log evidence",
+        ),
+        ("Verify return code: 0", "fail-closed verified-handshake check"),
+    ];
+    for (needle, desc) in required {
+        if !source.contains(needle) {
+            errors.push(format!(
+                "native rotation observation missing {desc} (`{needle}`)"
+            ));
+        }
+    }
+
+    let forwards_cp = source.contains("port-forward")
+        && (source.contains("svc/ferrum-cp")
+            || source.contains("service/ferrum-cp")
+            || source.contains("deploy/ferrum-cp"));
+    if !forwards_cp {
+        errors.push(
+            "rotation observation must port-forward the live ferrum-cp Service or \
+             Deployment listener, not a Secret or file"
+                .into(),
+        );
+    }
+
+    let handshake_feeds_serial = source.find("openssl s_client").is_some_and(|idx| {
+        let window_end = (idx + 5000).min(source.len());
+        let window = &source[idx..window_end];
+        window.contains("openssl x509")
+            && window.contains("-noout")
+            && window.contains("-serial")
+            && !window.contains("CAcreateserial")
+    });
+    if !handshake_feeds_serial {
+        errors.push(
+            "peer leaf serial must be extracted from the openssl s_client handshake \
+             output (openssl x509 -noout -serial), not from a local expected cert"
+                .into(),
+        );
+    }
+
+    errors
+}
+
+#[test]
+fn live_contract_sidecar_native_rotation_observes_served_leaf_serial() {
+    const RUN_SH: &str = include_str!("../k8s/mesh_e2e_sidecar/run.sh");
+    const CONTRACT: &str = include_str!("ga_contract.yaml");
+    const README: &str = include_str!("../k8s/mesh_e2e_sidecar/README.md");
+
+    let violations = native_rotation_observation_violations(RUN_SH);
+    assert!(
+        violations.is_empty(),
+        "mesh-e2e-sidecar rotation gate must observe the served CP leaf over mTLS: \
+         {violations:?}"
+    );
+
+    let secret_false_proof = r#"
+apply_native_mtls_secrets gen2
+wait_for_native_rotation_evidence
+live_serial="$(kubectl get secret ferrum-native-mtls-cp \
+  -o jsonpath='{.data.server\.pem}' | base64 -d | openssl x509 -noout -serial)"
+if [[ "$live_serial" == "$NATIVE_SERVER_SERIAL_GEN2" ]]; then
+  record_live_assertion sidecar.config.native_subscribe_tls_rotation_reconnects pass
+fi
+"#;
+    let false_violations = native_rotation_observation_violations(secret_false_proof);
+    assert!(
+        !false_violations.is_empty(),
+        "rotation observation contract must reject decoding Secret.data.server.pem \
+         as the live served serial"
+    );
+    assert!(
+        false_violations.iter().any(|error| error.contains("Secret")),
+        "false-proof rejection must call out Secret decoding, got {false_violations:?}"
+    );
+
+    let expected_cert_false_proof = r#"
+apply_native_mtls_secrets gen2
+wait_for_native_rotation_evidence
+live_serial="$(cert_serial "$NATIVE_MTLS_DIR/gen2-server.pem")"
+openssl s_client -verify_return_error -verify_hostname "$NATIVE_CP_DNS" \
+  -CAfile gen2-ca.pem -cert gen2-client.pem -key gen2-client-key.pem
+kubectl port-forward svc/ferrum-cp 50051:50051
+Verify return code: 0
+record_live_assertion sidecar.config.native_subscribe_tls_rotation_reconnects pass
+NATIVE_SERVER_SERIAL_GEN2
+"#;
+    let expected_cert_violations =
+        native_rotation_observation_violations(expected_cert_false_proof);
+    assert!(
+        expected_cert_violations
+            .iter()
+            .any(|error| error.contains("live_serial assignment")
+                || error.contains("expected server cert")),
+        "rotation observation contract must reject using the controller-local \
+         gen2-server.pem as live_serial, got {expected_cert_violations:?}"
+    );
+
+    assert!(
+        CONTRACT.contains("over-the-wire") && CONTRACT.contains("replacement leaf serial"),
+        "ga_contract.yaml must describe the rotation proof as an over-the-wire \
+         served leaf serial, not merely a Secret update"
+    );
+    assert!(
+        README.contains("over-the-wire mTLS handshake")
+            && README.contains("replacement leaf serial"),
+        "README must describe the rotation proof as an over-the-wire served leaf serial"
+    );
+    assert!(
+        !RUN_SH.to_ascii_lowercase().contains("shred"),
+        "run.sh must not claim keys are shredded unless the fixture actually shreds them"
     );
 }
 
