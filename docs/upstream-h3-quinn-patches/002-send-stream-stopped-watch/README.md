@@ -21,7 +21,8 @@ the response direction without exclusive send-stream access.
 
 This patch implements `h3::quic::SendStreamStopped` for `SendStream` and
 `BidiStream` by forwarding to `quinn::SendStream::stopped` as a statically
-dispatched associated future.
+dispatched return-position `impl Future`. Associated-type `impl Trait` is
+avoided so the crate stays on stable Rust.
 
 ## Files
 

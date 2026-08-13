@@ -23,6 +23,7 @@ already be borrowed for `poll_data`. Quinn already solved this: `stopped` is
 
 Implement `h3::quic::SendStreamStopped` for `h3_quinn::SendStream` and
 `BidiStream` by forwarding to `quinn::SendStream::stopped` as a `'static`
-associated future (no per-call `Box`). Map
+return-position `impl Future` (no per-call `Box`, no associated-type
+`impl Trait`). Map
 `StoppedError::ConnectionLost` to `StreamErrorIncoming::ConnectionErrorIncoming`
 and `ZeroRttRejected` to `Unknown`.

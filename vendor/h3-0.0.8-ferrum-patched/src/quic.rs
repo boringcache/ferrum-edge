@@ -195,19 +195,19 @@ pub trait SendStream<B: Buf> {
 /// `&mut self` on the send stream: that would conflict with a concurrent
 /// receive-half poll on an unsplit bidi stream.
 ///
-/// The associated future is statically dispatched and `'static`: it must not
-/// borrow the send stream and must not box a trait object per call.
+/// The returned future is statically dispatched and `'static`: it must not
+/// borrow the send stream and must not box a trait object per call. Return-
+/// position `impl Future` is used so this stays on stable Rust.
 pub trait SendStreamStopped {
-    /// `'static` future returned by [`SendStreamStopped::stopped`].
-    type Stopped: Future<Output = Result<Option<u64>, StreamErrorIncoming>> + Send + 'static;
-
     /// Completes when the peer stops this send stream or the connection is lost.
     ///
     /// `Ok(Some(code))` is a peer `STOP_SENDING`. `Ok(None)` means the local
     /// side already finished and the peer acknowledged the stream, after which
     /// `STOP_SENDING` is no longer meaningful. `Err` is a connection-level
     /// failure.
-    fn stopped(&self) -> Self::Stopped;
+    fn stopped(
+        &self,
+    ) -> impl Future<Output = Result<Option<u64>, StreamErrorIncoming>> + Send + 'static;
 }
 
 /// Allows sending unframed pure bytes to a stream. Similar to [`AsyncWrite`](https://docs.rs/tokio/latest/tokio/io/trait.AsyncWrite.html)

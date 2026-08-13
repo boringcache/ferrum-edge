@@ -1,6 +1,6 @@
 # Summary
 
-- add `quic::SendStreamStopped` so transports can expose peer `STOP_SENDING` as a `&self` + `'static` associated future
+- add `quic::SendStreamStopped` so transports can expose peer `STOP_SENDING` as a `&self` + `'static` return-position `impl Future`
 - forward the method through `BufRecvStream`, `FrameStream`, and `server::RequestStream`
 - do not take exclusive send-stream access, so an unsplit bidi stream can still poll the receive half
 - do not box a trait-object future per call

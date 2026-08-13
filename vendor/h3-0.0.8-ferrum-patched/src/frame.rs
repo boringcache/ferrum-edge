@@ -1,3 +1,4 @@
+use std::future::Future;
 use std::task::{Context, Poll};
 
 use bytes::Buf;
@@ -47,9 +48,9 @@ impl<S, B> crate::quic::SendStreamStopped for FrameStream<S, B>
 where
     S: crate::quic::SendStreamStopped,
 {
-    type Stopped = S::Stopped;
-
-    fn stopped(&self) -> Self::Stopped {
+    fn stopped(
+        &self,
+    ) -> impl Future<Output = Result<Option<u64>, StreamErrorIncoming>> + Send + 'static {
         self.stream.stopped()
     }
 }

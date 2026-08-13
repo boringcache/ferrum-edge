@@ -336,9 +336,10 @@ impl<B> h3::quic::SendStreamStopped for BidiStream<B>
 where
     B: Buf + 'static,
 {
-    type Stopped = <SendStream<B> as h3::quic::SendStreamStopped>::Stopped;
-
-    fn stopped(&self) -> Self::Stopped {
+    fn stopped(
+        &self,
+    ) -> impl Future<Output = Result<Option<u64>, h3::quic::StreamErrorIncoming>> + Send + 'static
+    {
         h3::quic::SendStreamStopped::stopped(&self.send)
     }
 }
@@ -536,11 +537,12 @@ where
 {
     /// FERRUM PATCH: expose Quinn's `&self` + `'static` `stopped()` so a server
     /// can observe peer STOP_SENDING without exclusive send-stream access.
-    type Stopped = impl Future<Output = Result<Option<u64>, h3::quic::StreamErrorIncoming>>
-        + Send
-        + 'static;
-
-    fn stopped(&self) -> Self::Stopped {
+    /// Return-position `impl Future` stays on stable Rust; associated-type
+    /// `impl Trait` does not.
+    fn stopped(
+        &self,
+    ) -> impl Future<Output = Result<Option<u64>, h3::quic::StreamErrorIncoming>> + Send + 'static
+    {
         let stopped = self.stream.stopped();
         async move {
             match stopped.await {

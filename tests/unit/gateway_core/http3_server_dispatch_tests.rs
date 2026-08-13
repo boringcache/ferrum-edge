@@ -2530,12 +2530,16 @@ fn h3_quinn_vendored_send_stream_stopped_is_shared_and_static() {
         .next()
         .expect("bounded SendStreamStopped");
     assert!(
-        trait_src.contains("fn stopped(&self) -> Self::Stopped"),
+        trait_src.contains("fn stopped(")
+            && trait_src.contains("&self")
+            && !trait_src.contains("fn stopped(&mut self)"),
         "stopped must take &self, not &mut self: {trait_src}"
     );
     assert!(
-        trait_src.contains("type Stopped:") && trait_src.contains("+ 'static"),
-        "Stopped must be a 'static associated future so it does not borrow the stream: {trait_src}"
+        trait_src.contains(
+            "impl Future<Output = Result<Option<u64>, StreamErrorIncoming>> + Send + 'static",
+        ) && !trait_src.contains("type Stopped"),
+        "stopped must return a stable RPITIT 'static Send future, not an associated type: {trait_src}"
     );
     assert!(
         !trait_src.contains("Pin<Box") && !trait_src.contains("dyn Future"),
@@ -2555,10 +2559,12 @@ fn h3_quinn_vendored_send_stream_stopped_is_shared_and_static() {
         "the impl must forward to quinn::SendStream::stopped (&self, 'static): {send}"
     );
     assert!(
-        send.contains("type Stopped = impl Future")
+        send.contains(
+            "impl Future<Output = Result<Option<u64>, h3::quic::StreamErrorIncoming>> + Send + 'static"
+        ) && !send.contains("type Stopped")
             && !send.contains("Box::pin")
             && !send.contains("dyn Future"),
-        "the impl must return a statically dispatched future, not a boxed trait object: {send}"
+        "the impl must return a stable RPITIT future, not an associated type or boxed trait object: {send}"
     );
     assert!(
         h3_quinn.contains("impl<B> h3::quic::SendStreamStopped for BidiStream<B>"),
