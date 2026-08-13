@@ -93,16 +93,10 @@ impl std::error::Error for YamlAliasBudgetError {}
 impl YamlAliasBudgetError {
     fn message(self) -> &'static str {
         match self {
-            Self::SourceByteLimitExceeded => {
-                "YAML document exceeds source byte limit"
-            }
+            Self::SourceByteLimitExceeded => "YAML document exceeds source byte limit",
             Self::EventLimitExceeded => "YAML document exceeds event limit",
-            Self::CompositionNodeLimitExceeded => {
-                "YAML document exceeds composition node limit"
-            }
-            Self::AnchorLimitExceeded => {
-                "YAML document exceeds anchor bookkeeping limit"
-            }
+            Self::CompositionNodeLimitExceeded => "YAML document exceeds composition node limit",
+            Self::AnchorLimitExceeded => "YAML document exceeds anchor bookkeeping limit",
             Self::ExpandedNodeLimitExceeded => {
                 "YAML document exceeds expanded node limit; reduce alias reuse or nesting"
             }
@@ -280,14 +274,10 @@ fn charge_event(events: &mut usize, budgets: &mut Budgets) -> Result<(), YamlAli
 }
 
 enum NodeKind {
-    Scalar {
-        bytes: usize,
-    },
+    Scalar { bytes: usize },
     Sequence(Vec<usize>),
     Mapping(Vec<(usize, usize)>),
-    Alias {
-        target: usize,
-    },
+    Alias { target: usize },
 }
 
 struct Document {

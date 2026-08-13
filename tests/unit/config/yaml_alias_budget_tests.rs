@@ -12,7 +12,10 @@ use ferrum_edge::config::yaml_alias_budget::{
 
 #[test]
 fn expanded_byte_budget_matches_the_read_ceiling() {
-    assert_eq!(MAX_YAML_EXPANDED_BYTES, MAX_GATEWAY_CONFIG_FILE_BYTES as usize);
+    assert_eq!(
+        MAX_YAML_EXPANDED_BYTES,
+        MAX_GATEWAY_CONFIG_FILE_BYTES as usize
+    );
 }
 
 #[test]
@@ -207,7 +210,10 @@ fn composition_node_exhaustion_fails_before_materialization() {
 
     let err = admit_yaml_alias_expansion(&yaml).expect_err("composition node ceiling");
     assert_eq!(err, YamlAliasBudgetError::CompositionNodeLimitExceeded);
-    assert_eq!(err.to_string(), "YAML document exceeds composition node limit");
+    assert_eq!(
+        err.to_string(),
+        "YAML document exceeds composition node limit"
+    );
 }
 
 #[test]
