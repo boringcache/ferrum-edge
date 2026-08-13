@@ -432,7 +432,10 @@ fn upstream_route_override_rebinds_pending_scope_away_from_source_lane() {
     );
 
     let mut upstreams = HashMap::new();
-    upstreams.insert("upstream-b".to_string(), Arc::clone(&upstream_b));
+    upstreams.insert(
+        ferrum_edge::config::db_backend::namespaced_runtime_key("shop", "upstream-b"),
+        Arc::clone(&upstream_b),
+    );
 
     let mut ctx = RequestContext::new("127.0.0.1".to_string(), "GET".to_string(), "/".to_string());
     ctx.route_override_upstream_id = Some("upstream-b".to_string());

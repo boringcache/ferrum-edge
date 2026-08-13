@@ -5031,7 +5031,13 @@ impl RequestContext {
                 Some(
                     self.route_override_upstream_id
                         .as_deref()
-                        .and_then(|id| upstreams.and_then(|map| map.get(id)))
+                        .and_then(|id| {
+                            let key = crate::config::db_backend::namespaced_runtime_key(
+                                proxy.namespace.as_str(),
+                                id,
+                            );
+                            upstreams.and_then(|map| map.get(&key))
+                        })
                         .and_then(|upstream| upstream.pending_limit_scope.clone()),
                 )
             }
