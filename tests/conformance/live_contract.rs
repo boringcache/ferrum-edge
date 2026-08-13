@@ -736,9 +736,7 @@ fn live_contract_sidecar_run_sh_unquoted_yaml_heredocs_avoid_backticks() {
     for (line_no, line) in RUN_SH.lines().enumerate() {
         let trimmed = line.trim();
         if !in_unquoted_yaml_heredoc {
-            if line.contains("<<YAML")
-                && !line.contains("<<'YAML'")
-                && !line.contains("<<\"YAML\"")
+            if line.contains("<<YAML") && !line.contains("<<'YAML'") && !line.contains("<<\"YAML\"")
             {
                 in_unquoted_yaml_heredoc = true;
             }
@@ -995,10 +993,7 @@ fn native_rotation_observation_violations(source: &str) -> Vec<String> {
         );
     }
     if source.contains("/transport/server.pem") {
-        errors.push(
-            "rotation live serial must not be read from the mounted CP server cert"
-                .into(),
-        );
+        errors.push("rotation live serial must not be read from the mounted CP server cert".into());
     }
     for line in source.lines() {
         let trimmed = line.trim();
@@ -1042,8 +1037,14 @@ fn native_rotation_observation_violations(source: &str) -> Vec<String> {
         ("-CAfile", "verification against the gen2 server CA file"),
         ("gen2-ca.pem", "gen2 server CA"),
         ("gen2-client.pem", "gen2 DP client certificate"),
-        ("gen2-client-key.pem", "gen2 DP client key for required mTLS"),
-        ("port-forward", "kubectl port-forward to the live CP listener"),
+        (
+            "gen2-client-key.pem",
+            "gen2 DP client key for required mTLS",
+        ),
+        (
+            "port-forward",
+            "kubectl port-forward to the live CP listener",
+        ),
         ("50051", "CP gRPC listen port"),
         ("NATIVE_CP_DNS", "real Kubernetes Service DNS name"),
         (
@@ -1074,7 +1075,10 @@ fn native_rotation_observation_violations(source: &str) -> Vec<String> {
             "wait_for_native_rotation_evidence",
             "independent CP/DP reload-log evidence",
         ),
-        ("Verify return code: 0", "fail-closed verified-handshake check"),
+        (
+            "Verify return code: 0",
+            "fail-closed verified-handshake check",
+        ),
     ];
     for (needle, desc) in required {
         if !source.contains(needle) {
@@ -1148,10 +1152,8 @@ fn native_rotation_observation_violations(source: &str) -> Vec<String> {
     if !source.contains("observe_class=${NATIVE_CP_SERVED_CLASS")
         && !source.contains("observe_class=$NATIVE_CP_SERVED_CLASS")
     {
-        errors.push(
-            "rotation outcome must read NATIVE_CP_SERVED_CLASS from the parent shell"
-                .into(),
-        );
+        errors
+            .push("rotation outcome must read NATIVE_CP_SERVED_CLASS from the parent shell".into());
     }
 
     errors
@@ -1186,7 +1188,9 @@ fi
          as the live served serial"
     );
     assert!(
-        false_violations.iter().any(|error| error.contains("Secret")),
+        false_violations
+            .iter()
+            .any(|error| error.contains("Secret")),
         "false-proof rejection must call out Secret decoding, got {false_violations:?}"
     );
 
