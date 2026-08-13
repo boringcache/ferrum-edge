@@ -1051,6 +1051,9 @@ async fn two_live_listeners_sharing_one_secret_refuse_cross_listener_replay() {
     // Every cross-listener replay is dropped before a session exists, so they
     // can all share one socket peer.
     let replayer = UdpSocket::bind("127.0.0.1:0").await.expect("sender bind");
+    // One balancer for listener-B admissions: replay protection is keyed by
+    // authenticated sender_id, so each form must consume the next sequence.
+    let mut balancer_b = Balancer::new(2);
     let mut expected_b_drops = 0u64;
     let mut expected_b_admissions = 0u64;
 
@@ -1100,7 +1103,6 @@ async fn two_live_listeners_sharing_one_secret_refuse_cross_listener_replay() {
         let native = UdpSocket::bind("127.0.0.1:0")
             .await
             .expect("bind a fresh balancer flow");
-        let mut balancer_b = Balancer::new(2);
         let form_b = envelope_form(label, addr_b);
         let for_b = balancer_b.wrap(&gateway_b.binding, form_b, b"native");
         native
