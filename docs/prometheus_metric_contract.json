@@ -2800,9 +2800,35 @@
     "emission": "conditional"
   },
   {
+    "name": "ferrum_mesh_udp_placement_migration_adoption_proof",
+    "type": "gauge",
+    "help": "Node-specific proof that authorized a recordless Ambient UDP placement adoption (one bounded proof is 1).",
+    "labels": [
+      "proof",
+      "gateway_namespace"
+    ],
+    "subsystem": "mesh_udp_migration",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "conditional"
+  },
+  {
+    "name": "ferrum_mesh_udp_placement_migration_adoptions_total",
+    "type": "counter",
+    "help": "Recordless Ambient UDP placement adoptions by bounded node-specific proof.",
+    "labels": [
+      "proof",
+      "gateway_namespace"
+    ],
+    "subsystem": "mesh_udp_migration",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "conditional"
+  },
+  {
     "name": "ferrum_mesh_udp_placement_migration_established_adoptions_total",
     "type": "counter",
-    "help": "Ambient UDP placements adopted from the release-attested established placement without a node-local durable record.",
+    "help": "Ambient UDP placements adopted without a same-incarnation node-local durable record, summed over every node-specific proof; equals the sum of ferrum_mesh_udp_placement_migration_adoptions_total.",
     "labels": [
       "gateway_namespace"
     ],
