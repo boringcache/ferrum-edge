@@ -443,13 +443,14 @@ under an older generation can at worst use trust the operator has already
 committed — the same forward-only contract gateway SVID rotation has always had
 — and never trust the accepted generation withdrew.
 
-##### Committed trust retires the transports it authenticated
+##### Committed trust retires pooled entries for withdrawn roots
 
 Installing the accepted verifier is only half of a rotation or revocation.
-Every backend and mesh transport already in a pool was authenticated under the
-**outgoing** roots, so a `Replace` or `Clear` that WITHDRAWS a root the live
-verifier honoured also advances the shared backend security (SVID) generation
-and retires those transports, in the same fenced publication:
+Every pooled backend and mesh entry was authenticated under the **outgoing**
+roots, so a `Replace` or `Clear` that WITHDRAWS a root the live verifier
+honoured also advances the shared backend security (SVID) generation and
+removes those entries from the pool maps (and clears their generation-keyed
+backend TLS config caches), in the same fenced publication:
 
 - fresh dials and TLS-config construction key on the new generation
   (`|svidg=<n>` pool keys and backend TLS config caches partition on it), so an
@@ -457,35 +458,38 @@ and retires those transports, in the same fenced publication:
 - the outgoing generation's cached backend TLS configs are invalidated, its
   connection-pool / HTTP-2 / gRPC / H3 entries are drained, and active health
   checks are restarted;
-- the HBONE and mesh-mTLS pools are retired **whole**. Their keys embed the leaf
+- the HBONE and mesh-mTLS pool maps are cleared **whole**. Their keys embed the leaf
   SVID *fingerprint*, not the generation, and a trust-only change leaves the leaf
   alone — so every one of their keys is byte-identical across the commit and
-  there is no key partition separating a session verified against the withdrawn
-  roots from one verified against the accepted roots. The cost is a one-time
-  reconnect wave on the mesh pools for a committed withdrawal; the alternative
-  would rest a revocation bound on lazily populated, capped per-pool
-  fingerprint bookkeeping, which a withdrawal bound may not depend on.
+  there is no key partition separating a pooled checkout verified against the
+  withdrawn roots from one verified against the accepted roots. The cost is a
+  one-time reconnect wave on the **next** mesh pool checkout for a committed
+  withdrawal; the alternative would rest a revocation bound on lazily populated,
+  capped per-pool fingerprint bookkeeping, which a withdrawal bound may not depend
+  on.
 
 None of this consults `FERRUM_MESH_SVID_ROTATION_DRAIN_SECONDS`. That window is
 a grace period for an ordinary identity rotation and its default of `0` means
 "no forced drain at all", so leaving a withdrawn root to it would make the
-withdrawal unbounded. Documentation cannot make that safe, so the retirement is
+withdrawal unbounded. Documentation cannot make that safe, so pool retirement is
 unconditional and runs on the publishing thread.
 
-Both the advance and the retirement are **synchronous**, while the epoch is
+Both the advance and the pool retirement are **synchronous**, while the epoch is
 still fenced and before gateway-to-mesh admission is republished live.
 Publishing only on the rotation watch channel and leaving the work to the
 asynchronous rotation consumer would let the fence lift before that task was
 scheduled, and every request admitted in the gap would key its pool and
 TLS-config lookups on the generation the publication had just withdrawn — or
-reuse a mesh transport the withdrawn roots had admitted. The watch send still
-happens (it drives the consumer's own cache invalidation and health-check
+check out a pooled mesh entry the withdrawn roots had admitted. The watch send
+still happens (it drives the consumer's own cache invalidation and health-check
 restart), but no request-visible decision waits on it, and nothing about the
 trust event can be missed or coalesced.
 
 An explicit removal or `Clear` of an installed override is therefore **not
-usable for new validation, and not reusable on an existing transport**, the
-moment the commit returns.
+usable for new validation and not discoverable for a new pool checkout** the
+moment the commit returns. Already-issued handles such as `H2ConnectTunnel`,
+cloned `MeshMtlsSender`, and active gRPC/WebSocket/raw CONNECT streams are **not**
+terminated by this publication; issue #3859 tracks that live-session gap.
 
 Retirement is scoped to an actual withdrawal, because it is expensive and
 because a decision that removes no root leaves nothing to bound:
@@ -493,9 +497,9 @@ because a decision that removes no root leaves nothing to bound:
 - **Adding** a root is overlap — a cross-signed root published alongside the one
   it will replace, or a newly federated trust domain. Every root that could have
   admitted a live transport is still a root, so the material is installed and
-  nothing is retired.
+  nothing is retired from the pools.
 - An unchanged `Replace` **re-delivered by a reconnect** removes no root. A DP
-  re-subscribing must not drop every pooled mesh transport on the node.
+  re-subscribing must not clear every pooled mesh entry on the node.
 - A `Clear` with **no override installed** removes no root. Every full snapshot
   of a gateway that uses no CP trust bundles carries exactly this decision.
 

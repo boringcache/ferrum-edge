@@ -6697,8 +6697,9 @@ impl BackendPoolFamily {
         self.mesh_mtls_pool.force_drain_all();
     }
 
-    /// Retire every pooled transport a committed gateway trust change could
-    /// otherwise leave reusable under the roots that change WITHDREW.
+    /// Remove every pooled entry a committed gateway trust change could
+    /// otherwise leave discoverable for reuse under the roots that change
+    /// WITHDREW.
     ///
     /// Called synchronously from the trust publication (see
     /// [`ProxyState::retire_backend_transports_for_committed_trust`]), never
@@ -6723,10 +6724,10 @@ impl BackendPoolFamily {
     /// - `hbone_pool` / `mesh_mtls_pool` key on the leaf SVID *fingerprint*, not
     ///   the generation. A trust-only `Replace`/`Clear` keeps the same leaf, so
     ///   every one of their keys is byte-identical before and after the commit:
-    ///   there is NO key partition separating a session verified against the
-    ///   withdrawn roots from one verified against the accepted roots, and a
-    ///   generation-scoped drain cannot express the distinction. They are
-    ///   therefore retired WHOLE.
+    ///   there is NO key partition separating a pooled checkout verified against
+    ///   the withdrawn roots from one verified against the accepted roots, and a
+    ///   generation-scoped drain cannot express the distinction. Their pool maps
+    ///   are therefore cleared WHOLE.
     ///
     /// That whole-pool retirement is a deliberate security tradeoff. It costs a
     /// one-time reconnect wave on the mesh pools for every committed trust
@@ -6743,8 +6744,9 @@ impl BackendPoolFamily {
     /// while the request epoch is FENCED, so `admits_gateway_mesh_identity` is
     /// false and no gateway-to-mesh dispatch can add an entry under the accepted
     /// generation. An entry raced in by a dial admitted BEFORE the fence is
-    /// precisely a transport that may have been authenticated under the
-    /// withdrawn roots, so retiring it is the intent rather than collateral.
+    /// precisely a pooled checkout that may have been authenticated under the
+    /// withdrawn roots, so removing it from the pool map is the intent rather
+    /// than collateral.
     fn retire_withdrawn_trust(&self, outgoing: std::ops::Range<u64>) {
         for generation in outgoing {
             self.drain_tls_config_cache(generation);
@@ -6815,7 +6817,7 @@ fn outgoing_generation_span(old: u64, next: u64) -> std::ops::Range<u64> {
 /// — cannot have invalidated a transport the live verifier already admitted:
 /// every root that could have admitted it is still a root. That is the
 /// "adding a root is overlap" case `docs/cp_dp_mode.md` describes, and it is
-/// what separates a decision that must retire pooled transports from one that
+/// what separates a decision that must clear pooled entries from one that
 /// must not (see `ProxyState::withdraws_installed_gateway_trust`).
 ///
 /// Lookup goes through `TrustBundleSet::get`, so a trust domain that
@@ -7167,21 +7169,21 @@ impl ProxyState {
     /// trust change this publication has just committed, and hand the pool
     /// follow-through to the existing rotation consumer.
     ///
-    /// Replacing or withdrawing gateway trust roots retires every backend and
-    /// mesh transport that authenticated under the outgoing roots, exactly as a
-    /// gateway SVID rotation does. Without this the accepted generation would
-    /// install a new verifier while an HBONE / mesh-mTLS / backend-TLS
-    /// connection authenticated under a root the same generation WITHDREW
-    /// stayed poolable until idle pruning — unbounded reuse of revoked trust,
-    /// which is precisely what issue #3727's rotation/revocation criterion
-    /// forbids.
+    /// Replacing or withdrawing gateway trust roots removes every pooled backend
+    /// and mesh entry authenticated under the outgoing roots from the pool maps,
+    /// exactly as a gateway SVID rotation does. Without this the accepted
+    /// generation would install a new verifier while an HBONE / mesh-mTLS /
+    /// backend-TLS pooled entry authenticated under a root the same generation
+    /// WITHDREW stayed discoverable for reuse until idle pruning — unbounded
+    /// checkout of revoked trust, which is precisely what issue #3727's
+    /// rotation/revocation criterion forbids.
     ///
     /// The counter is advanced SYNCHRONOUSLY, on the publishing thread, while
     /// the request epoch is still fenced. Publishing only on the watch channel
     /// and leaving the store to [`spawn_backend_svid_rotation_task`] would let
     /// the fence lift before the consumer task was scheduled, and every request
     /// admitted in that window would key its pool and backend-TLS-config
-    /// lookups on the WITHDRAWN generation and reuse its entries. The watch
+    /// lookups on the WITHDRAWN generation and check out its pooled entries. The watch
     /// send still happens — it is what drives the outgoing generation's TLS
     /// config-cache invalidation, the health-check restart, and the bounded
     /// force-drain — but no request-visible decision depends on when the
@@ -7194,7 +7196,7 @@ impl ProxyState {
     /// already scheduled.
     ///
     /// Returns the half-open span of generations this advance retired, so the
-    /// caller can retire their transports without re-reading a counter a
+    /// caller can clear their pooled entries without re-reading a counter a
     /// concurrent publisher may have moved again.
     fn advance_backend_security_generation(&self) -> std::ops::Range<u64> {
         let previous = self.backend_svid_generation.load(Ordering::Acquire);
@@ -7213,8 +7215,8 @@ impl ProxyState {
             backend_svid_generation = live,
             namespace = %self.env_config.namespace,
             "Advanced the backend security generation for a committed gateway trust change; \
-             new backend and mesh transports build from the accepted trust and the transports \
-             the withdrawn trust authenticated are retired by this publication"
+             new backend and mesh transports build from the accepted trust and pooled entries \
+             keyed under the withdrawn generation are cleared so future pool lookups cannot reuse them"
         );
         // `previous` was read before the send, so a concurrent publisher can
         // only widen this span at its OLD end, never past `live`. The span is
@@ -7222,7 +7224,7 @@ impl ProxyState {
         outgoing_generation_span(previous, live)
     }
 
-    /// Retire the pooled transports a committed gateway trust change withdrew,
+    /// Clear the pooled entries a committed gateway trust change withdrew,
     /// synchronously and independently of the SVID rotation drain window.
     ///
     /// This is the step that makes issue #3727's bounded-withdrawal requirement
@@ -7233,16 +7235,17 @@ impl ProxyState {
     /// consumer's `force_drain` is the only thing that used to remove them, and
     /// it is skipped entirely when `FERRUM_MESH_SVID_ROTATION_DRAIN_SECONDS` is
     /// `0`, which is both the default and what the documentation recommends for
-    /// ordinary rotations. Documentation cannot make that safe: a transport
+    /// ordinary rotations. Documentation cannot make that safe: a pooled entry
     /// authenticated under a root the accepted generation withdrew would stay
-    /// reusable until idle pruning, with no bound.
+    /// discoverable for reuse until idle pruning, with no bound.
     ///
     /// Run on the publishing thread while the epoch is still FENCED, before
     /// [`Self::publish_live_gateway_trust`] re-opens gateway-to-mesh admission.
     /// The guarantee is therefore not "eventually, when a task is scheduled":
     /// the first request that can be admitted under the accepted generation
-    /// already finds no reusable transport from the withdrawn one. Nothing about
-    /// it can be missed or coalesced by a watch channel.
+    /// already finds no discoverable pooled entry from the withdrawn one. Nothing
+    /// about it can be missed or coalesced by a watch channel. Already-issued
+    /// handles and active streams are not terminated here (issue #3859).
     ///
     /// Ordinary SVID rotation semantics are untouched. This path is reached only
     /// from a committed `GatewayTrustCommit::Replace`/`::Clear`; a source SVID
@@ -7259,8 +7262,8 @@ impl ProxyState {
             retiring_from,
             retiring_before,
             namespace = %self.env_config.namespace,
-            "Retired the backend and mesh transports a committed gateway trust change withdrew; \
-             the mesh (HBONE / mesh-mTLS) pools are retired whole because their keys carry the \
+            "Cleared pooled backend and mesh entries a committed gateway trust change withdrew; \
+             the mesh (HBONE / mesh-mTLS) pool maps are cleared whole because their keys carry the \
              leaf SVID fingerprint, which a trust-only change leaves unchanged"
         );
     }
@@ -7278,22 +7281,22 @@ impl ProxyState {
     }
 
     /// Whether committing `commit` WITHDRAWS trust the live gateway verifier
-    /// currently has — the only case in which an already-authenticated transport
-    /// can be left reusable under trust the accepted generation no longer
+    /// currently has — the only case in which a pooled entry can be left
+    /// discoverable for reuse under trust the accepted generation no longer
     /// honours, and therefore the only case that advances the backend security
-    /// generation and retires transports.
+    /// generation and clears pooled entries.
     ///
     /// Must be read BEFORE the material is stored: it compares the accepted
     /// decision against the override that is still installed.
     ///
     /// This is narrower than [`GatewayTrustCommit::changes_live_trust`], which
     /// decides whether to FENCE. Fencing is cheap and must stay conservative;
-    /// retiring every pooled mesh transport is not, and a decision that removes
+    /// clearing every pooled mesh entry is not, and a decision that removes
     /// no root has nothing to bound:
     ///
     /// - `Clear` with no override installed. The CP encodes "this gateway has no
     ///   trust bundles" as an explicit `Clear` on EVERY full snapshot, so
-    ///   treating it as a withdrawal would retire every pooled mesh transport on
+    ///   treating it as a withdrawal would clear every pooled mesh entry on
     ///   each DP reconnect of a deployment that does not use CP trust bundles at
     ///   all.
     /// - `Replace` with material that still trusts every currently trusted
@@ -7624,15 +7627,16 @@ impl ProxyState {
     ///
     /// A decision that WITHDRAWS a currently trusted authority
     /// ([`Self::withdraws_installed_gateway_trust`]) also advances the backend
-    /// security generation EXACTLY ONCE and retires the transports that trust
+    /// security generation EXACTLY ONCE and clears the pooled entries that trust
     /// authenticated, both between the material install and the re-opened
     /// admission. So no request can be admitted under this generation while
     /// still keying pools and backend TLS config caches on the withdrawn one
-    /// (see [`Self::advance_backend_security_generation`]), and none can reuse a
-    /// pooled mesh transport the withdrawn roots admitted — including in the
+    /// (see [`Self::advance_backend_security_generation`]), and none can check out
+    /// a pooled mesh entry the withdrawn roots admitted — including in the
     /// default `FERRUM_MESH_SVID_ROTATION_DRAIN_SECONDS=0` configuration, where
     /// the rotation consumer never force-drains anything (see
-    /// [`Self::retire_backend_transports_for_committed_trust`]). A purely
+    /// [`Self::retire_backend_transports_for_committed_trust`]). Already-issued
+    /// handles and active streams are not terminated here (issue #3859). A purely
     /// additive `Replace` still fences and installs but retires nothing: it
     /// removes no root, so there is no reuse to bound. Exact duplicate Replace
     /// and redundant Clear decisions normalize to `Unchanged` under the outer
