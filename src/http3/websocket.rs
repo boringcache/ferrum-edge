@@ -1034,15 +1034,14 @@ pub(crate) async fn handle_h3_websocket(
         // path. The latter correctly means `/`; the former must fail a mesh
         // dispatch closed rather than silently change the authorized backend
         // request target to `/`.
-        let ws_path_and_query: Option<std::borrow::Cow<'_, str>> =
-            ws_backend_url_for_parse
-                .parse::<hyper::Uri>()
-                .ok()
-                .map(|uri| {
-                    uri.path_and_query()
-                        .map(|pq| std::borrow::Cow::Owned(pq.as_str().to_string()))
-                        .unwrap_or(std::borrow::Cow::Borrowed("/"))
-                });
+        let ws_path_and_query: Option<std::borrow::Cow<'_, str>> = ws_backend_url_for_parse
+            .parse::<hyper::Uri>()
+            .ok()
+            .map(|uri| {
+                uri.path_and_query()
+                    .map(|pq| std::borrow::Cow::Owned(pq.as_str().to_string()))
+                    .unwrap_or(std::borrow::Cow::Borrowed("/"))
+            });
         let ws_dial_result: Result<
             crate::proxy::WsBackendHandshake,
             Box<dyn std::error::Error + Send + Sync>,
