@@ -1,9 +1,14 @@
 //! Atomic request-facing runtime snapshot.
 //!
 //! Request paths load one `RequestEpoch` and use its route table, Gateway
-//! listener admission, plugin cache, consumer index, and load-balancer snapshot
-//! together. Writers build staged inners before publishing, then swap the whole
-//! epoch with one ArcSwap store.
+//! listener admission, plugin cache, consumer index, load-balancer snapshot,
+//! and gateway-to-mesh trust together. Writers build staged inners before
+//! publishing, then swap the whole epoch with one ArcSwap store.
+//!
+//! Gateway trust is part of the epoch rather than a slot beside it precisely
+//! because two independent publications leave an interval where a request pairs
+//! one generation's configuration with another generation's trust roots; see
+//! [`GatewayTrustEpoch`].
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -13,6 +18,7 @@ use arc_swap::ArcSwap;
 use crate::config::types::{GatewayConfig, Proxy};
 use crate::consumer_index::ConsumerIndex;
 use crate::consumer_index::ConsumerIndexInner;
+use crate::identity::SvidBundle;
 use crate::load_balancer::LoadBalancerCache;
 use crate::load_balancer::LoadBalancerCacheInner;
 use crate::plugin_cache::PluginCache;
@@ -33,6 +39,133 @@ thread_local! {
         std::cell::RefCell::new(String::with_capacity(64));
 }
 
+/// Gateway-to-mesh trust and identity bound to exactly one accepted
+/// configuration generation (issue #3727).
+///
+/// A bundle rotation and the configuration that depends on it are two writes,
+/// so publishing them independently leaves an interval in which a request pairs
+/// one generation's configuration with another generation's trust roots. With
+/// the configuration published first that interval is fail-OPEN: a revocation
+/// the accepted generation committed is not yet in the live verifier, so a
+/// withdrawn peer still authenticates. Publishing the trust first only inverts
+/// the mismatch.
+///
+/// This snapshot is what removes the interval. It travels inside
+/// [`RequestEpoch`], so one `ArcSwap` load at admission yields configuration,
+/// routing/admission and gateway trust from the same store, and it carries a
+/// `live` flag that is false for exactly as long as an accepted generation's
+/// trust material has not replaced the live verifier. Gateway-to-mesh
+/// admission gates read [`Self::admits_gateway_identity`], so a fenced
+/// generation fails CLOSED instead of authenticating against the generation it
+/// replaced.
+///
+/// The trust material itself is only ever advanced (never rolled back) after
+/// the fence, so a request admitted under an older generation can at worst use
+/// trust the operator has already committed — the same forward-only contract
+/// gateway SVID rotation has always had — and never trust an accepted
+/// generation withdrew.
+pub struct GatewayTrustEpoch {
+    /// Gateway SVID (leaf, key, and the trust roots mesh peers are verified
+    /// against) exactly as this generation accepted it. `None` means the
+    /// gateway has no workload identity, so gateway-to-mesh dispatch is
+    /// refused.
+    svid: Arc<Option<SvidBundle>>,
+    /// Monotonic gateway trust generation. Advanced by every committed
+    /// trust/identity publication, independent of the config generation.
+    generation: u64,
+    /// Whether `svid` is the material the live verifier actually uses.
+    live: bool,
+}
+
+impl std::fmt::Debug for GatewayTrustEpoch {
+    /// Never renders SVID material: this type is reachable from diagnostics
+    /// that reach operator-facing surfaces.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("GatewayTrustEpoch")
+            .field("generation", &self.generation)
+            .field("live", &self.live)
+            .field("has_svid", &self.svid.is_some())
+            .finish()
+    }
+}
+
+impl GatewayTrustEpoch {
+    /// The first generation of a freshly constructed runtime: whatever the
+    /// startup SVID load produced, already live.
+    pub(crate) fn initial(svid: Arc<Option<SvidBundle>>) -> Arc<Self> {
+        Arc::new(Self {
+            svid,
+            generation: 1,
+            live: true,
+        })
+    }
+
+    /// A runtime with no gateway identity at all.
+    pub(crate) fn absent() -> Arc<Self> {
+        Self::initial(Arc::new(None))
+    }
+
+    /// Monotonic gateway trust generation.
+    #[inline]
+    pub fn generation(&self) -> u64 {
+        self.generation
+    }
+
+    /// Whether the accepted generation's trust material is the live verifier.
+    #[inline]
+    pub fn is_live(&self) -> bool {
+        self.live
+    }
+
+    /// The gateway SVID snapshot this generation was accepted with.
+    #[inline]
+    pub fn svid(&self) -> &Arc<Option<SvidBundle>> {
+        &self.svid
+    }
+
+    /// The single gateway-to-mesh admission predicate.
+    ///
+    /// False both when the gateway has no workload identity and while an
+    /// accepted generation's trust material is still being installed, so every
+    /// caller fails closed for the whole publication boundary rather than
+    /// authenticating peers against the generation this one replaced.
+    #[inline]
+    pub fn admits_gateway_identity(&self) -> bool {
+        self.live && self.svid.is_some()
+    }
+
+    /// Fence this generation: published, but not yet authenticating.
+    pub(crate) fn fenced(&self) -> Arc<Self> {
+        Arc::new(Self {
+            svid: Arc::clone(&self.svid),
+            generation: self.generation,
+            live: false,
+        })
+    }
+
+    /// Commit `svid` as the live verifier for the next trust generation.
+    pub(crate) fn committed(&self, svid: Arc<Option<SvidBundle>>) -> Arc<Self> {
+        Arc::new(Self {
+            svid,
+            generation: self.generation.saturating_add(1),
+            live: true,
+        })
+    }
+}
+
+/// What a configuration publication does to the gateway trust admission it
+/// inherits.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum GatewayTrustStaging {
+    /// This generation changes no gateway trust material; carry the published
+    /// admission forward untouched so ordinary reloads cost nothing and never
+    /// close the mesh admission gate.
+    Carry,
+    /// This generation accepts trust material that is not live yet. Publish it
+    /// fenced; the commit that installs the material republishes it live.
+    Fence,
+}
+
 #[derive(Clone)]
 pub struct RequestEpoch {
     pub(crate) config: Arc<GatewayConfig>,
@@ -51,6 +184,10 @@ pub struct RequestEpoch {
     /// publication installs `pending`; only a reconcile derived from the same
     /// config `Arc` may replace it with a decided refusal set.
     pub(crate) gateway_listener_admission: Arc<GatewayListenerAdmission>,
+    /// Gateway-to-mesh trust/identity for this exact configuration generation.
+    /// Published with the config in ONE store, so no request can pair this
+    /// generation's routing with another generation's trust roots.
+    pub(crate) gateway_trust: Arc<GatewayTrustEpoch>,
     pub(crate) config_generation: u64,
     pub(crate) route_generation: u64,
     pub(crate) lb_generation: u64,
@@ -65,6 +202,28 @@ impl RequestEpoch {
     #[inline]
     pub fn config(&self) -> &GatewayConfig {
         self.config.as_ref()
+    }
+
+    /// Gateway-to-mesh trust/identity published with this exact configuration
+    /// generation.
+    ///
+    /// Every gateway-to-mesh authentication admission gate must read it from
+    /// here rather than from a live slot: a slot read pairs whatever trust is
+    /// current with whatever configuration the caller happens to hold, which is
+    /// precisely the mixed generation this snapshot exists to remove.
+    #[inline]
+    pub fn gateway_trust(&self) -> &Arc<GatewayTrustEpoch> {
+        &self.gateway_trust
+    }
+
+    /// Monotonic configuration generation this epoch publishes.
+    ///
+    /// Exposed so the config/trust pairing is assertable from outside the
+    /// crate: a coherent publication advances this and
+    /// [`GatewayTrustEpoch::generation`] into one live epoch.
+    #[inline]
+    pub fn config_generation(&self) -> u64 {
+        self.config_generation
     }
 
     /// Namespace-qualified proxy lookup.
@@ -264,6 +423,7 @@ mod tests {
             http_tls_listen_ports: Default::default(),
             mesh_revision: None,
             k8s_mesh_overlay: Default::default(),
+            gateway_trust_bundles: Vec::new(),
         }
     }
 
@@ -305,6 +465,7 @@ mod tests {
             consumer_index: Arc::clone(&current.consumer_index),
             load_balancer: Arc::clone(&current.load_balancer),
             gateway_listener_admission: Arc::clone(&current.gateway_listener_admission),
+            gateway_trust: Arc::clone(&current.gateway_trust),
             config_generation: current.config_generation,
             route_generation: current.route_generation,
             lb_generation,
@@ -1616,6 +1777,10 @@ impl RequestEpochStore {
             consumer_index: consumer_index.load_inner(),
             load_balancer: load_balancer_cache.load_inner(),
             gateway_listener_admission: GatewayListenerAdmission::pending(),
+            // Standalone/harness construction has no gateway identity of its
+            // own; production builds the initial epoch in `ProxyState::new`
+            // from the startup SVID load.
+            gateway_trust: GatewayTrustEpoch::absent(),
             proxy_index_by_key: build_proxy_index_by_key(&config),
             config: Arc::new(config),
             config_generation: 1,
@@ -1677,8 +1842,34 @@ impl RequestEpochStore {
         self.current.load_full()
     }
 
+    /// Allocation-free gateway-to-mesh admission read.
+    ///
+    /// Dispatch classification and mesh egress capture ask this per request or
+    /// per session, so it takes the `ArcSwap` guard and reads two fields rather
+    /// than cloning the epoch.
+    #[inline]
+    pub fn admits_gateway_identity(&self) -> bool {
+        self.current.load().gateway_trust.admits_gateway_identity()
+    }
+
     pub(crate) fn update_config(
         &self,
+        build: impl FnOnce(&RequestEpoch) -> Result<Option<StagedRequestEpoch>, String>,
+        mirror: impl FnOnce(&RequestEpoch),
+    ) -> Result<Option<Arc<RequestEpoch>>, String> {
+        self.update_config_with_trust(GatewayTrustStaging::Carry, build, mirror)
+    }
+
+    /// [`Self::update_config`] for a generation that also changes gateway trust.
+    ///
+    /// [`GatewayTrustStaging::Fence`] publishes the configuration with its
+    /// gateway trust admission CLOSED. The caller must follow a successful
+    /// publication with the commit that installs the material and republishes
+    /// the admission live; until it does, gateway-to-mesh authentication is
+    /// refused rather than served from the generation this one replaced.
+    pub(crate) fn update_config_with_trust(
+        &self,
+        trust: GatewayTrustStaging,
         build: impl FnOnce(&RequestEpoch) -> Result<Option<StagedRequestEpoch>, String>,
         mirror: impl FnOnce(&RequestEpoch),
     ) -> Result<Option<Arc<RequestEpoch>>, String> {
@@ -1716,6 +1907,13 @@ impl RequestEpochStore {
             // listener-scoped routing until its exact reconcile acknowledges
             // admission. This publication is atomic with the new route table.
             gateway_listener_admission: GatewayListenerAdmission::pending(),
+            // A generation that changes gateway trust publishes fenced, so the
+            // configuration and its trust roots become authenticating together
+            // rather than one store apart (issue #3727).
+            gateway_trust: match trust {
+                GatewayTrustStaging::Carry => Arc::clone(&current.gateway_trust),
+                GatewayTrustStaging::Fence => current.gateway_trust.fenced(),
+            },
             config_generation: current.config_generation.saturating_add(1),
             route_generation: if staged.route_changed {
                 current.route_generation.saturating_add(1)
@@ -1783,6 +1981,7 @@ impl RequestEpochStore {
             consumer_index: Arc::clone(&current.consumer_index),
             load_balancer: Arc::clone(&current.load_balancer),
             gateway_listener_admission: listener_admission,
+            gateway_trust: Arc::clone(&current.gateway_trust),
             config_generation: current.config_generation,
             // Admission transitions must invalidate both positive and negative
             // route-cache entries without a hot-path cache clear.
@@ -1791,6 +1990,44 @@ impl RequestEpochStore {
         });
         self.current.store(Arc::clone(&next));
         mirror(&next);
+        Some(next)
+    }
+
+    /// Republish the current epoch with a new gateway trust admission.
+    ///
+    /// This is the ONE way the live gateway-to-mesh trust generation becomes
+    /// visible to request paths: the fence that closes admission for an
+    /// accepted configuration generation, the commit that reopens it once the
+    /// material is installed, and the gateway SVID source rotation all go
+    /// through it, so trust is never published beside the epoch.
+    ///
+    /// `build` returns `None` to leave the published epoch untouched, which
+    /// keeps the fence and the commit idempotent. Nothing derived from routing
+    /// changes, so no route/LB generation advances and no wrapper view is
+    /// mirrored — route-cache entries never depend on trust material.
+    pub(crate) fn update_gateway_trust(
+        &self,
+        build: impl FnOnce(&RequestEpoch) -> Option<Arc<GatewayTrustEpoch>>,
+    ) -> Option<Arc<RequestEpoch>> {
+        // Poison only means a previous writer panicked before publishing; the
+        // ArcSwap still holds the last complete epoch, so continuing is safe.
+        let _guard = self.write_lock.lock().unwrap_or_else(|e| e.into_inner());
+        let current = self.current.load_full();
+        let gateway_trust = build(&current)?;
+        let next = Arc::new(RequestEpoch {
+            config: Arc::clone(&current.config),
+            proxy_index_by_key: Arc::clone(&current.proxy_index_by_key),
+            route_table: Arc::clone(&current.route_table),
+            plugin_cache: Arc::clone(&current.plugin_cache),
+            consumer_index: Arc::clone(&current.consumer_index),
+            load_balancer: Arc::clone(&current.load_balancer),
+            gateway_listener_admission: Arc::clone(&current.gateway_listener_admission),
+            gateway_trust,
+            config_generation: current.config_generation,
+            route_generation: current.route_generation,
+            lb_generation: current.lb_generation,
+        });
+        self.current.store(Arc::clone(&next));
         Some(next)
     }
 
@@ -1815,6 +2052,7 @@ impl RequestEpochStore {
             consumer_index: Arc::clone(&current.consumer_index),
             load_balancer,
             gateway_listener_admission: Arc::clone(&current.gateway_listener_admission),
+            gateway_trust: Arc::clone(&current.gateway_trust),
             config_generation: current.config_generation,
             route_generation: current.route_generation,
             lb_generation,
