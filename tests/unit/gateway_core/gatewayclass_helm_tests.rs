@@ -8,9 +8,19 @@ fn chart_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("charts/ferrum-mesh")
 }
 
+fn repo_root() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+}
+
 fn read(rel: &str) -> String {
     std::fs::read_to_string(chart_root().join(rel)).unwrap_or_else(|e| {
         panic!("failed to read charts/ferrum-mesh/{rel}: {e}");
+    })
+}
+
+fn read_repo(rel: &str) -> String {
+    std::fs::read_to_string(repo_root().join(rel)).unwrap_or_else(|e| {
+        panic!("failed to read {rel}: {e}");
     })
 }
 
@@ -35,6 +45,21 @@ fn schema_pins_controller_name_and_allows_non_default_class_name() {
         schema.contains("\"name\"") && schema.contains("\"minLength\": 1"),
         "class name must remain overridable for Ferrum-owned non-default names"
     );
+}
+
+#[test]
+fn conformance_harnesses_disable_helm_gatewayclass_creation() {
+    let harnesses = [
+        "scripts/gateway_api_data_plane_conformance.sh",
+        "scripts/gateway_api_conformance_lab_setup.sh",
+    ];
+    for path in harnesses {
+        let script = read_repo(path);
+        assert!(
+            script.contains("--set gatewayClass.create=false"),
+            "{path} must disable chart GatewayClass creation; the harness applies and deletes/recreates GatewayClass/ferrum out of band"
+        );
+    }
 }
 
 #[test]
