@@ -29,9 +29,13 @@
 //! - Bounded material: authority counts, per-authority size, and total encoded
 //!   size are capped so a hostile or accidental write cannot push an unbounded
 //!   blob through the change log and into every subscriber's snapshot. Count
-//!   and cheap encoded/raw size bounds fail closed before any deep parser
-//!   (`validate_mesh_config`, X.509 DER, JWT public keys, runtime conversion)
-//!   walks the over-limit collections or material.
+//!   and cheap encoded/raw size bounds fail closed before any allocating or
+//!   deep semantic parser (`TrustDomain::new`, `validate_mesh_config`, X.509
+//!   DER, JWT public keys, runtime conversion) walks the over-limit
+//!   collections or material.
+//! - `updated_by` is the verified admin JWT subject, never a client-supplied
+//!   value, and is capped at [`MAX_AUDIT_ACTOR_BYTES`] so every backend rejects
+//!   an overlong actor before persistence. Attribution is never truncated.
 //! - Usable material, not just well-formed wrappers: every `x509_authorities`
 //!   entry must be valid base64 **and** parse as an X.509 certificate that
 //!   consumes the complete DER entry (no accepted trailing bytes); every
@@ -83,6 +87,13 @@ pub const MAX_TRUST_BUNDLE_JSON_BYTES: usize = 256 * 1024;
 
 /// Maximum length of the resource id.
 pub const MAX_TRUST_BUNDLE_ID_BYTES: usize = 255;
+
+/// Maximum UTF-8 byte length of a server-assigned audit actor (`updated_by`).
+///
+/// Matches the MySQL `VARCHAR(255)` column so PostgreSQL/SQLite cannot persist
+/// an overlong JWT subject that MySQL would reject. Attribution is never
+/// truncated: an overlong subject fails admission instead.
+pub const MAX_AUDIT_ACTOR_BYTES: usize = 255;
 
 /// Authoritative, namespace-keyed gateway trust-bundle resource.
 ///
@@ -195,12 +206,15 @@ impl GatewayTrustBundleRecord {
     /// Structural count and cheap encoded/raw size bounds are enforced first
     /// and fail closed. If any of those bounds fail, this returns only the
     /// material-free field, count, and size diagnostics and does not invoke
-    /// [`crate::modes::mesh::config::validate_mesh_config`], X.509 DER parsing,
-    /// JWT public-key parsing, or runtime conversion. That is deliberate
-    /// hostile-input behavior: enumerating unrelated semantic errors would
-    /// require walking and decoding the over-limit material. The restore
-    /// endpoint accepts bodies far larger than [`MAX_TRUST_BUNDLE_JSON_BYTES`],
-    /// so deep parsers must not run against an over-limit record.
+    /// [`TrustDomain::new`], [`crate::modes::mesh::config::validate_mesh_config`],
+    /// X.509 DER parsing, JWT public-key parsing, or runtime conversion. That
+    /// is deliberate hostile-input behavior: enumerating unrelated semantic
+    /// errors would require cloning or decoding the over-limit material. The
+    /// restore endpoint accepts bodies far larger than
+    /// [`MAX_TRUST_BUNDLE_JSON_BYTES`], so allocating or deep parsers must not
+    /// run against an over-limit record. Cheap empty, identity-mismatch, and
+    /// audit-actor diagnostics may still be collected because they do not
+    /// clone or parse the bounded material.
     ///
     /// Once the record is within those bounds, the exact serialized 256 KiB
     /// contract is checked (including JSON escaping overhead) with a counting
@@ -232,11 +246,14 @@ impl GatewayTrustBundleRecord {
                     .to_string(),
             );
         }
-        if TrustDomain::new(local_domain.to_string()).is_err() {
-            errors.push(
-                "gateway trust bundle bundle.local.trust_domain is not a valid SPIFFE trust domain"
-                    .to_string(),
-            );
+        if self
+            .updated_by
+            .as_ref()
+            .is_some_and(|actor| actor.len() > MAX_AUDIT_ACTOR_BYTES)
+        {
+            errors.push(format!(
+                "gateway trust bundle updated_by exceeds {MAX_AUDIT_ACTOR_BYTES} bytes"
+            ));
         }
 
         let mut structural = Vec::new();
@@ -259,6 +276,13 @@ impl GatewayTrustBundleRecord {
                 errors.push("gateway trust bundle could not be serialized".to_string());
                 return finish_validation(errors);
             }
+        }
+
+        if TrustDomain::new(local_domain.to_string()).is_err() {
+            errors.push(
+                "gateway trust bundle bundle.local.trust_domain is not a valid SPIFFE trust domain"
+                    .to_string(),
+            );
         }
 
         // Reuse the mesh validator so a bundle admitted here is exactly a
@@ -307,6 +331,13 @@ impl GatewayTrustBundleRecord {
         }
 
         finish_validation(errors)
+    }
+
+    /// Install a local trust-domain string that did not pass
+    /// [`TrustDomain::new`]. Admission tests use this to prove structural/raw
+    /// bounds run before that parser. Production writers must not call this.
+    pub fn set_unvalidated_local_trust_domain_for_tests(&mut self, value: String) {
+        self.bundle.local.trust_domain = TrustDomain::from_unvalidated(value);
     }
 
     /// Redacted, fixed-shape summary for logs, metrics, and admin status.

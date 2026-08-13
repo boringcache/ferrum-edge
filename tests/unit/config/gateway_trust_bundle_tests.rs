@@ -21,8 +21,8 @@
 use ferrum_edge::config::gateway_trust::{
     AMBIGUOUS_TRUST_AUTHORITY_MESSAGE, GatewayTrustBundleIdentity, GatewayTrustBundleRecord,
     GatewayTrustDriftSource, GatewayTrustFailureReason, GatewayTrustPublication,
-    MAX_FEDERATED_BUNDLES, MAX_JWT_AUTHORITIES_PER_BUNDLE, MAX_JWT_AUTHORITY_PEM_BYTES,
-    MAX_TRUST_BUNDLE_JSON_BYTES, MAX_X509_AUTHORITIES_PER_BUNDLE,
+    MAX_AUDIT_ACTOR_BYTES, MAX_FEDERATED_BUNDLES, MAX_JWT_AUTHORITIES_PER_BUNDLE,
+    MAX_JWT_AUTHORITY_PEM_BYTES, MAX_TRUST_BUNDLE_JSON_BYTES, MAX_X509_AUTHORITIES_PER_BUNDLE,
     MAX_X509_AUTHORITY_DER_BYTES, NamespaceTrustProjection, TrustAuthorityResolution,
     TrustPublicationScope, detect_gateway_trust_drift, gateway_trust_state_drifted,
     observability_snapshot, project_namespace_trust, published_namespace_generation,
@@ -120,6 +120,7 @@ fn assert_structural_fail_fast(errors: &[String]) {
         "has an empty key_id",
         "has no authorities",
         ": no authorities",
+        "not a valid SPIFFE trust domain",
     ] {
         assert!(
             !rendered.contains(needle),
@@ -524,6 +525,60 @@ fn json_escaping_overhead_counts_against_the_whole_bundle_cap() {
         "expected an exact encoded-size error, got {errors:?}"
     );
     assert_structural_fail_fast(&errors);
+}
+
+#[test]
+fn an_oversized_local_trust_domain_is_rejected_before_semantic_parsers() {
+    // A restore body can carry a near-limit `bundle.local.trust_domain`. That
+    // string must trip the raw structural bound and return before
+    // `TrustDomain::new` clones it or any deep parser walks the material.
+    let mut record = valid_record();
+    let oversized = "a".repeat(MAX_TRUST_BUNDLE_JSON_BYTES + 1);
+    record.set_unvalidated_local_trust_domain_for_tests(oversized.clone());
+    record.trust_domain = oversized;
+    record.bundle.local.x509_authorities = vec!["not-a-certificate".to_string()];
+
+    let errors = record
+        .validate_fields()
+        .expect_err("an over-limit local trust domain must be rejected");
+    assert!(
+        errors
+            .iter()
+            .any(|error| error.contains("raw material") && error.contains("the maximum is")),
+        "expected a structural size error, got {errors:?}"
+    );
+    assert_structural_fail_fast(&errors);
+}
+
+#[test]
+fn an_overlong_audit_actor_is_rejected_without_truncation_or_echo() {
+    let mut record = valid_record();
+    let overlong = "a".repeat(MAX_AUDIT_ACTOR_BYTES + 1);
+    record.updated_by = Some(overlong.clone());
+    let errors = record
+        .validate_fields()
+        .expect_err("an overlong audit actor must be rejected");
+    assert!(
+        errors.iter().any(|error| {
+            error.contains("updated_by exceeds")
+                && error.contains(&MAX_AUDIT_ACTOR_BYTES.to_string())
+        }),
+        "expected an audit-actor bound error, got {errors:?}"
+    );
+    let rendered = errors.join("\n");
+    assert!(
+        !rendered.contains(&overlong),
+        "admission diagnostics must not echo the overlong actor"
+    );
+}
+
+#[test]
+fn an_audit_actor_at_the_byte_cap_is_admitted() {
+    let mut record = valid_record();
+    record.updated_by = Some("a".repeat(MAX_AUDIT_ACTOR_BYTES));
+    record
+        .validate_fields()
+        .expect("the audit-actor cap is inclusive");
 }
 
 // ── Redacted summary ────────────────────────────────────────────────────────

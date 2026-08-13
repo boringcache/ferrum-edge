@@ -47,6 +47,15 @@ impl TrustDomain {
         Ok(Self(raw))
     }
 
+    /// Construct without SPIFFE validation.
+    ///
+    /// Gateway-trust admission tests use this to prove structural/raw size
+    /// bounds run before [`Self::new`]. Production parsers must not call this.
+    #[allow(dead_code)] // called from the gateway-trust test fixture helper
+    pub(crate) fn from_unvalidated(value: String) -> Self {
+        Self(value)
+    }
+
     /// View as a `&str`.
     pub fn as_str(&self) -> &str {
         &self.0

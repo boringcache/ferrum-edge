@@ -201,18 +201,21 @@ already use — there is no second representation that can drift.
 - **Stored fields.** Resource `id`, `namespace`, `trust_domain` (must equal
   `bundle.local.trust_domain`), the bounded `bundle`, a backend-assigned
   `revision` (see *Incarnation-safe revisions* below),
-  `updated_by` (the verified admin JWT subject — never a client-supplied value),
+  `updated_by` (the verified admin JWT subject — never a client-supplied value,
+  at most 255 bytes, never truncated),
   and `created_at` / `updated_at`.
 - **Bounded, validated material.** Admission caps authority counts (16 X.509 and
   16 JWT per bundle, 32 federated bundles), per-authority size (16 KiB), and the
-  encoded bundle as a whole (256 KiB). Every `x509_authorities` entry must be
-  valid base64 *and* parse as an X.509 certificate that consumes the complete
-  entry (a certificate with appended bytes is refused); every JWT authority
-  needs a unique non-empty `key_id` and a public key the JWT-SVID authority
-  parser can actually use — the same `is_usable_public_key_material` gate the
-  JWKS path uses, in either accepted encoding (SPKI `PUBLIC KEY` PEM or the
-  SPIFFE-federation JWK form), so a PRIVATE KEY paste, a truncated body, or an
-  unsupported key type is refused rather than stored and published. Duplicate
+  encoded bundle as a whole (256 KiB). Count and cheap encoded/raw size bounds
+  fail closed before `TrustDomain::new` or any deep parser (mesh validation,
+  X.509 DER, JWT public keys, runtime conversion). Every `x509_authorities`
+  entry must be valid base64 *and* parse as an X.509 certificate that consumes
+  the complete entry (a certificate with appended bytes is refused); every JWT
+  authority needs a unique non-empty `key_id` and a public key the JWT-SVID
+  authority parser can actually use — the same `is_usable_public_key_material`
+  gate the JWKS path uses, in either accepted encoding (SPKI `PUBLIC KEY` PEM or
+  the SPIFFE-federation JWK form), so a PRIVATE KEY paste, a truncated body, or
+  an unsupported key type is refused rather than stored and published. Duplicate
   trust domains are rejected. The same validation runs on write, on every full
   load, and again before publication.
 - **Fail-closed stored-row decoding.** Security-relevant stored fields are
@@ -332,7 +335,8 @@ already use — there is no second representation that can drift.
   the destructive clear rather than silently reduced to whichever record came
   first. Server-owned fields survive the payload: `id` and `created_at` come
   from the stored record, `revision` is assigned by the store, and `updated_by`
-  is the restoring admin's verified JWT subject. The namespace clear that
+  is the restoring admin's verified JWT subject (at most 255 bytes; an overlong
+  subject is rejected rather than truncated). The namespace clear that
   precedes an import deliberately does not touch trust, so restoring an older
   config backup can never silently revoke a namespace's roots.
 

@@ -23,8 +23,8 @@ use ferrum_edge::admin::{
 };
 use ferrum_edge::config::db_loader::{DatabaseStore, DbPoolConfig};
 use ferrum_edge::config::gateway_trust::{
-    GatewayTrustBundleRecord, MAX_X509_AUTHORITIES_PER_BUNDLE, record_trust_generation_published,
-    reset_observability_for_tests,
+    GatewayTrustBundleRecord, MAX_AUDIT_ACTOR_BYTES, MAX_X509_AUTHORITIES_PER_BUNDLE,
+    record_trust_generation_published, reset_observability_for_tests,
 };
 use jsonwebtoken::{EncodingKey, Header, encode};
 use serde_json::{Value, json};
@@ -167,9 +167,19 @@ fn root_ca_der_base64(common_name: &str) -> String {
 }
 
 async fn post_json(base: &str, path: &str, namespace: &str, body: Value) -> (u16, Value) {
+    post_json_as(base, path, namespace, "restore-admin", body).await
+}
+
+async fn post_json_as(
+    base: &str,
+    path: &str,
+    namespace: &str,
+    subject: &str,
+    body: Value,
+) -> (u16, Value) {
     let response = reqwest::Client::new()
         .post(format!("{base}{path}"))
-        .bearer_auth(admin_token("restore-admin"))
+        .bearer_auth(admin_token(subject))
         .header("X-Ferrum-Namespace", namespace)
         .json(&body)
         .send()
@@ -274,6 +284,129 @@ async fn a_hostile_body_namespace_influences_neither_the_stored_namespace_nor_th
         0,
         "the body namespace must not have created a record in another tenant"
     );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn an_overlong_jwt_subject_is_rejected_on_create_and_restore_without_truncation() {
+    let dir = TempDir::new().expect("temp dir");
+    let (base, _shutdown) = start_admin(admin_state(make_store(&dir).await)).await;
+    let authority = root_ca_der_base64("root");
+    let at_cap = "a".repeat(MAX_AUDIT_ACTOR_BYTES);
+    let overlong = "a".repeat(MAX_AUDIT_ACTOR_BYTES + 1);
+    let create_body = json!({
+        "trust_domain": "cluster.local",
+        "bundle": bundle_body("cluster.local", &authority),
+    });
+
+    let (status, created) = post_json_as(
+        &base,
+        "/gateway-trust-bundles",
+        "cap-ok",
+        &at_cap,
+        create_body.clone(),
+    )
+    .await;
+    assert_eq!(status, 201, "a 255-byte subject must be admitted: {created}");
+    assert_eq!(
+        created["updated_by"].as_str(),
+        Some(at_cap.as_str()),
+        "attribution at the byte cap must be stored in full"
+    );
+
+    let (status, body) = post_json_as(
+        &base,
+        "/gateway-trust-bundles",
+        "cap-over",
+        &overlong,
+        json!({
+            "trust_domain": "cluster.local",
+            "updated_by": "short-body-actor",
+            "bundle": bundle_body("cluster.local", &authority),
+        }),
+    )
+    .await;
+    assert_eq!(status, 400, "an overlong JWT subject must be refused: {body}");
+    let rendered = body.to_string();
+    assert!(
+        rendered.contains("updated_by exceeds"),
+        "expected an audit-actor bound error, got {body}"
+    );
+    assert!(
+        !rendered.contains(&overlong),
+        "admission diagnostics must not echo the overlong subject"
+    );
+    let (status, listed) = get_json(&base, "/gateway-trust-bundles", "cap-over").await;
+    assert_eq!(status, 200);
+    assert_eq!(
+        listed["data"].as_array().map(Vec::len).unwrap_or_default(),
+        0,
+        "an overlong actor must not persist on any backend"
+    );
+
+    let (status, created) = post_json(
+        &base,
+        "/gateway-trust-bundles",
+        "hostile-body",
+        json!({
+            "trust_domain": "cluster.local",
+            "updated_by": overlong,
+            "bundle": bundle_body("cluster.local", &authority),
+        }),
+    )
+    .await;
+    assert_eq!(
+        status, 201,
+        "a hostile overlong body updated_by must not be authoritative: {created}"
+    );
+    assert_eq!(
+        created["updated_by"], "restore-admin",
+        "attribution must come from the verified JWT subject, not the body"
+    );
+
+    let (status, created) = post_json(
+        &base,
+        "/gateway-trust-bundles",
+        "ferrum",
+        create_body.clone(),
+    )
+    .await;
+    assert_eq!(status, 201, "create must succeed: {created}");
+    let revision = created["revision"].as_u64().expect("numeric revision");
+    let (status, backup) = get_json(&base, "/backup", "ferrum").await;
+    assert_eq!(status, 200);
+
+    let (status, body) = post_json_as(
+        &base,
+        "/restore?confirm=true",
+        "ferrum",
+        &overlong,
+        backup,
+    )
+    .await;
+    assert_eq!(
+        status, 400,
+        "an overlong restoring subject must be refused: {body}"
+    );
+    let rendered = body.to_string();
+    assert!(
+        rendered.contains("updated_by exceeds"),
+        "expected an audit-actor bound error on restore, got {body}"
+    );
+    assert!(
+        !rendered.contains(&overlong),
+        "restore diagnostics must not echo the overlong subject"
+    );
+    assert!(
+        body["error"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("NOT deleted"),
+        "the refusal must happen before the destructive clear: {body}"
+    );
+    let (status, after) = get_json(&base, "/gateway-trust-bundles/ferrum", "ferrum").await;
+    assert_eq!(status, 200, "the refused restore must not revoke trust");
+    assert_eq!(after["revision"].as_u64(), Some(revision));
+    assert_eq!(after["updated_by"], "restore-admin");
 }
 
 // ── Authoritative write responses ───────────────────────────────────────────
