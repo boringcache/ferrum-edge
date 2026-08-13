@@ -735,7 +735,9 @@ async fn a_shared_authority_with_an_unreachable_backend_fails_closed() {
     .expect("redis config parses")
     .expect("sync_mode redis yields a config");
 
-    let client = Arc::new(RedisRateLimitClient::for_replay_authority(config, None, false, None));
+    let client = Arc::new(RedisRateLimitClient::for_replay_authority(
+        config, None, false, None,
+    ));
     let authority = ReplayAuthority::shared(client, RETENTION);
     assert_eq!(authority.mode(), "shared");
 
@@ -772,7 +774,9 @@ async fn an_unavailable_shared_authority_is_visible_in_the_counters() {
     .expect("redis config parses")
     .expect("sync_mode redis yields a config");
 
-    let client = Arc::new(RedisRateLimitClient::for_replay_authority(config, None, false, None));
+    let client = Arc::new(RedisRateLimitClient::for_replay_authority(
+        config, None, false, None,
+    ));
     client.mark_unavailable_for_test();
     let authority = ReplayAuthority::shared(Arc::clone(&client), RETENTION);
 
@@ -824,7 +828,9 @@ fn unreachable_shared_client(prefix: &str) -> Arc<RedisRateLimitClient> {
     )
     .expect("redis config parses")
     .expect("sync_mode redis yields a config");
-    Arc::new(RedisRateLimitClient::for_replay_authority(config, None, false, None))
+    Arc::new(RedisRateLimitClient::for_replay_authority(
+        config, None, false, None,
+    ))
 }
 
 /// The bounded aggregate readiness consumes: an unavailable shared authority is
@@ -1024,7 +1030,9 @@ fn claim_client(port: u16, prefix: &str) -> Arc<RedisRateLimitClient> {
     )
     .expect("redis config parses")
     .expect("sync_mode redis yields a config");
-    Arc::new(RedisRateLimitClient::for_replay_authority(config, None, false, None))
+    Arc::new(RedisRateLimitClient::for_replay_authority(
+        config, None, false, None,
+    ))
 }
 
 /// A connected backend that never answers the claim must produce a fixed
@@ -1082,7 +1090,9 @@ async fn the_shared_claim_primitive_publishes_no_backend_or_key_material() {
     assert!(!redacted.contains("claim-user"));
     assert!(!redacted.contains("claim-password"));
 
-    let client = Arc::new(RedisRateLimitClient::for_replay_authority(config, None, false, None));
+    let client = Arc::new(RedisRateLimitClient::for_replay_authority(
+        config, None, false, None,
+    ));
     let authority = ReplayAuthority::shared(Arc::clone(&client), RETENTION);
     let marker = domain("shared-redaction").marker(&[b"consumer-1", b"nonce-1"]);
 
@@ -1408,7 +1418,9 @@ enum LoggingShape {
     ClusterMoved,
 }
 
-async fn spawn_logging_redis_server(shape: LoggingShape) -> (u16, tokio::sync::oneshot::Sender<()>) {
+async fn spawn_logging_redis_server(
+    shape: LoggingShape,
+) -> (u16, tokio::sync::oneshot::Sender<()>) {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
@@ -1515,7 +1527,11 @@ async fn replay_client_logs_only_classification_and_redacted_endpoint() {
     let _serialized = shared_health_guard_async().await;
 
     for (label, shape, expected_class) in [
-        ("authentication", LoggingShape::AuthReject, "connection_failed"),
+        (
+            "authentication",
+            LoggingShape::AuthReject,
+            "connection_failed",
+        ),
         ("command", LoggingShape::CommandError, "command_failed"),
         (
             "topology_probe",

@@ -2130,8 +2130,8 @@ impl RedisRateLimitClient {
                 // recovery checker must NOT hand an unscreened host to the Redis
                 // client either (a DNS-cache outage or a later rebind/policy denial
                 // would otherwise let the background ping dial a denied address).
-                let url =
-                    match screen_redis_endpoint(&config, dns_cache.as_ref(), log_policy).await {
+                let url = match screen_redis_endpoint(&config, dns_cache.as_ref(), log_policy).await
+                {
                     RedisEndpoint::Url(url) => url,
                     // Still denied or unresolvable this interval — skip the ping
                     // and re-screen next interval (including hostname egress
