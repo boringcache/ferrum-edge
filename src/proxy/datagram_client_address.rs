@@ -1088,7 +1088,12 @@ impl DatagramClientAddressGate {
         datagram: &'a [u8],
         socket_peer: &SocketAddr,
     ) -> Result<DecodedDatagram<'a>, DatagramMetadataError> {
-        self.decode_at(datagram, socket_peer, unix_now_millis())
+        let now_unix_ms = if self.authentication_required {
+            unix_now_millis()
+        } else {
+            0
+        };
+        self.decode_at(datagram, socket_peer, now_unix_ms)
     }
 
     /// Decode one datagram against an explicit receiver clock reading.
@@ -1156,8 +1161,8 @@ impl DatagramClientAddressGate {
     /// tag bytes elided, so the receiving listener's protocol/address/port, the
     /// version/command/family/transport bytes, the forwarded addresses, the
     /// freshness record, every other TLV, and the payload are all bound.
-    /// Eliding rather than zeroing keeps the hot path free of a scratch copy of
-    /// the header.
+    /// Eliding the tag value is the versioned canonical format and avoids
+    /// mutating or copying the borrowed datagram on the hot path.
     fn verify_authentication_tag(
         &self,
         key: &HmacSha256Key,
