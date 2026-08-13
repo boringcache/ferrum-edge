@@ -1280,7 +1280,45 @@ fn tcp_and_udp_gateway_listeners_may_share_a_numeric_port() {
 }
 
 #[test]
-fn secure_http_and_udp_gateway_listeners_fail_closed_on_quic_port() {
+fn http_and_udp_gateway_listeners_may_share_a_numeric_port() {
+    let mut gateway = http_gateway("edge", Some("Same"));
+    gateway.spec["listeners"] = json!([
+        {
+            "name": "http",
+            "port": 9000,
+            "protocol": "HTTP",
+            "allowedRoutes": { "namespaces": { "from": "Same" } }
+        },
+        {
+            "name": "udp",
+            "port": 9000,
+            "protocol": "UDP",
+            "allowedRoutes": {
+                "kinds": [{ "kind": "UDPRoute" }],
+                "namespaces": { "from": "Same" }
+            }
+        }
+    ]);
+    let objects = vec![gateway_class(), gateway];
+    let translation = translate_k8s_objects(&objects, options()).expect("translate");
+
+    assert!(
+        translation.listener_conflicts.is_empty(),
+        "plain HTTP is not QUIC-capable and must coexist with UDP: {:?}",
+        translation.listener_conflicts
+    );
+    assert!(
+        !translation
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("ProtocolConflict")),
+        "HTTP+UDP must not emit ProtocolConflict warnings: {:?}",
+        translation.warnings
+    );
+}
+
+#[test]
+fn secure_http_without_tls_is_not_quic_capable_so_udp_may_share_the_port() {
     for secure_protocol in ["HTTPS", "GRPCS"] {
         let mut gateway = http_gateway("edge", Some("Same"));
         gateway.spec["listeners"] = json!([
@@ -1303,24 +1341,238 @@ fn secure_http_and_udp_gateway_listeners_fail_closed_on_quic_port() {
         let translation =
             translate_k8s_objects(&[gateway_class(), gateway], options()).expect("translate");
 
-        for listener in ["secure-http", "udp"] {
-            let key = GatewayApiListenerKey {
-                namespace: "default".to_string(),
-                parent_kind: GatewayApiListenerParentKind::Gateway,
-                gateway: "edge".to_string(),
-                listener: listener.to_string(),
-            };
-            assert_eq!(
+        assert!(
+            translation.listener_conflicts.is_empty(),
+            "{secure_protocol} without TLS material is not Tls-class/QUIC-capable: {:?}",
+            translation.listener_conflicts
+        );
+    }
+}
+
+/// HTTPS/GRPCS with admitted frontend TLS is QUIC-capable. UDP on that numeric
+/// port must ProtocolConflict both sides, independent of listener order, with
+/// bounded status wording and no route materialization on the withdrawn
+/// HTTPS listener.
+#[test]
+fn secure_http_and_udp_gateway_listeners_fail_closed_on_quic_port() {
+    let expected_message = "Port 9443 is claimed by secure HTTP/QUIC and a UDP stream, so every \
+         conflicting claim on this port is refused (Conflicted).";
+    let orders: [[&str; 2]; 2] = [["secure-http", "udp"], ["udp", "secure-http"]];
+    for secure_protocol in ["HTTPS", "GRPCS"] {
+        for listener_order in orders {
+            let secret = tls_secret("edge-cert", "default");
+            let mut listeners = Vec::new();
+            for name in listener_order {
+                listeners.push(match name {
+                    "secure-http" => json!({
+                        "name": "secure-http",
+                        "port": 9443,
+                        "protocol": secure_protocol,
+                        "hostname": "secure.example.com",
+                        "tls": {
+                            "mode": "Terminate",
+                            "certificateRefs": [{ "name": "edge-cert" }]
+                        },
+                        "allowedRoutes": { "namespaces": { "from": "Same" } }
+                    }),
+                    "udp" => json!({
+                        "name": "udp",
+                        "port": 9443,
+                        "protocol": "UDP",
+                        "allowedRoutes": {
+                            "kinds": [{ "kind": "UDPRoute" }],
+                            "namespaces": { "from": "Same" }
+                        }
+                    }),
+                    other => panic!("unexpected listener fixture {other}"),
+                });
+            }
+            let mut gateway = http_gateway("edge", Some("Same"));
+            gateway.spec["listeners"] = Value::Array(listeners);
+            let route = http_route(
+                "secure-api",
+                json!([{
+                    "kind": "Gateway",
+                    "name": "edge",
+                    "namespace": "default",
+                    "sectionName": "secure-http"
+                }]),
+                "secure.example.com",
+                "/tls",
+            );
+            let translation = translate_k8s_objects(
+                &[gateway_class(), secret, gateway, service("backend"), route],
+                options(),
+            )
+            .expect("translate");
+
+            for listener in ["secure-http", "udp"] {
+                let key = GatewayApiListenerKey {
+                    namespace: "default".to_string(),
+                    parent_kind: GatewayApiListenerParentKind::Gateway,
+                    gateway: "edge".to_string(),
+                    listener: listener.to_string(),
+                };
+                let conflict = translation.listener_conflicts.get(&key).unwrap_or_else(|| {
+                    panic!(
+                        "{secure_protocol}+UDP order {:?} must ProtocolConflict {listener}: {:?}",
+                        listener_order, translation.listener_conflicts
+                    )
+                });
+                assert_eq!(conflict.reason, "ProtocolConflict");
+                assert_eq!(
+                    conflict.message, expected_message,
+                    "{secure_protocol}+UDP status wording must stay bounded"
+                );
+                assert!(
+                    !conflict.message.contains("secure-http")
+                        && !conflict.message.contains("edge-cert")
+                        && !conflict.message.contains("secure.example.com")
+                        && !conflict.message.contains("secure-api"),
+                    "ProtocolConflict must not leak object identifiers: {}",
+                    conflict.message
+                );
+            }
+            assert!(
+                !translation.config.proxies.iter().any(|proxy| {
+                    proxy.hosts.iter().any(|host| host == "secure.example.com")
+                        && proxy
+                            .listen_path
+                            .as_deref()
+                            .is_some_and(|path| path.contains("/tls"))
+                }),
+                "{secure_protocol}+UDP must not materialize the withdrawn HTTPS route: {:?}",
                 translation
-                    .listener_conflicts
-                    .get(&key)
-                    .map(|conflict| conflict.reason),
-                Some("ProtocolConflict"),
-                "{secure_protocol}+UDP must refuse {listener}: {:?}",
-                translation.listener_conflicts
+                    .config
+                    .proxies
+                    .iter()
+                    .map(|proxy| (&proxy.hosts, &proxy.listen_path, proxy.listen_port))
+                    .collect::<Vec<_>>()
             );
         }
     }
+}
+
+/// Black-box shape: HTTP:80 plus HTTPS:443 must still attach and materialize
+/// HTTPRoutes. UDP on a different port is not a QUIC collision. Splitting
+/// SecureHttp for UDP arbitration must not drop HTTPS hostname/path proxies.
+#[test]
+fn secure_http_route_attachment_survives_apart_from_udp_arbitration() {
+    let secret = tls_secret("blackbox-tls", "default");
+    let mut gateway = http_gateway("ferrum-blackbox", Some("Same"));
+    gateway.spec["listeners"] = json!([
+        {
+            "name": "http",
+            "port": 80,
+            "protocol": "HTTP",
+            "allowedRoutes": { "namespaces": { "from": "Same" } }
+        },
+        {
+            "name": "https",
+            "port": 443,
+            "protocol": "HTTPS",
+            "hostname": "tls.blackbox.example",
+            "tls": {
+                "mode": "Terminate",
+                "certificateRefs": [{ "name": "blackbox-tls" }]
+            },
+            "allowedRoutes": { "namespaces": { "from": "Same" } }
+        },
+        {
+            "name": "udp",
+            "port": 9000,
+            "protocol": "UDP",
+            "allowedRoutes": {
+                "kinds": [{ "kind": "UDPRoute" }],
+                "namespaces": { "from": "Same" }
+            }
+        }
+    ]);
+    let http_route_obj = http_route(
+        "blackbox-main",
+        json!([{
+            "kind": "Gateway",
+            "name": "ferrum-blackbox",
+            "namespace": "default",
+            "sectionName": "http"
+        }]),
+        "blackbox.example",
+        "/host",
+    );
+    let https_route_obj = http_route(
+        "blackbox-tls",
+        json!([{
+            "kind": "Gateway",
+            "name": "ferrum-blackbox",
+            "namespace": "default",
+            "sectionName": "https"
+        }]),
+        "tls.blackbox.example",
+        "/tls",
+    );
+    let translation = translate_k8s_objects(
+        &[
+            gateway_class(),
+            secret,
+            gateway,
+            service("backend"),
+            http_route_obj,
+            https_route_obj,
+        ],
+        options(),
+    )
+    .expect("translate");
+
+    assert!(
+        translation.listener_conflicts.is_empty(),
+        "HTTP/HTTPS plus UDP on a different port must not ProtocolConflict: {:?}",
+        translation.listener_conflicts
+    );
+    assert!(
+        translation.config.proxies.iter().any(|proxy| {
+            proxy.hosts.iter().any(|host| host == "blackbox.example")
+                && proxy
+                    .listen_path
+                    .as_deref()
+                    .is_some_and(|path| path.contains("/host"))
+                && proxy.listen_port == Some(80)
+        }),
+        "HTTP listener routes must still materialize: {:?}",
+        translation
+            .config
+            .proxies
+            .iter()
+            .map(|proxy| (&proxy.hosts, &proxy.listen_path, proxy.listen_port))
+            .collect::<Vec<_>>()
+    );
+    assert!(
+        translation.config.proxies.iter().any(|proxy| {
+            proxy
+                .hosts
+                .iter()
+                .any(|host| host == "tls.blackbox.example")
+                && proxy
+                    .listen_path
+                    .as_deref()
+                    .is_some_and(|path| path.contains("/tls"))
+                && proxy.listen_port == Some(443)
+        }),
+        "HTTPS listener routes must still materialize after SecureHttp split: {:?}",
+        translation
+            .config
+            .proxies
+            .iter()
+            .map(|proxy| (&proxy.hosts, &proxy.listen_path, proxy.listen_port))
+            .collect::<Vec<_>>()
+    );
+    assert!(
+        translation
+            .config
+            .http_tls_listen_ports
+            .contains(&("default".to_string(), 443)),
+        "HTTPS listener port must remain TLS-classified: {:?}",
+        translation.config.http_tls_listen_ports
+    );
 }
 
 #[test]
