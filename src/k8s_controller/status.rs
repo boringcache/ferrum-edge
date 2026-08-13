@@ -2448,6 +2448,14 @@ fn merge_status_conditions(status: &mut Value, owned_types: &[&str], desired: Ve
     status_object.insert("conditions".to_string(), Value::Array(conditions));
 }
 
+/// Status-only UDPRoute amplification reason when no `(route, parentRef)`
+/// posture was recorded. Never a translator fallback: `FiniteDefault` is only
+/// truthful for a materialized parent whose proxy actually received the
+/// controller default.
+const UDP_AMPLIFICATION_NOT_PROGRAMMED_REASON: &str = "NotProgrammed";
+const UDP_AMPLIFICATION_NOT_PROGRAMMED_MESSAGE: &str =
+    "Ferrum did not program a UDP response-amplification limit";
+
 fn route_status(
     object: &K8sObject,
     indexes: &GatewayApiStatusIndexes<'_>,
@@ -2757,15 +2765,29 @@ fn route_status(
                 ),
                 Err(_) => None,
             };
-            let posture = posture
-                .unwrap_or(crate::config_sources::k8s::UdpAmplificationPosture::FiniteDefault);
+            // Missing posture (translation failure, unmaterialized parent, or
+            // an unaccepted claim) is not FiniteDefault: no proxy was
+            // programmed. Always emit a replacement condition so merge cannot
+            // retain a stale True from a previous reconcile.
+            let (protected, reason, message) = match posture {
+                Some(posture) => (
+                    posture.condition_status(),
+                    posture.reason(),
+                    posture.message(),
+                ),
+                None => (
+                    false,
+                    UDP_AMPLIFICATION_NOT_PROGRAMMED_REASON,
+                    UDP_AMPLIFICATION_NOT_PROGRAMMED_MESSAGE,
+                ),
+            };
             conditions.push(condition_at(
                 object,
                 existing_parent_status,
                 "UDPAmplificationProtection",
-                posture.condition_status(),
-                posture.reason(),
-                posture.message(),
+                protected,
+                reason,
+                message,
             ));
         }
         let conditions = merge_condition_entries(existing_parent_status, conditions);

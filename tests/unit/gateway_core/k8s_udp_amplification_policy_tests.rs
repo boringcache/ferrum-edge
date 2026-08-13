@@ -313,6 +313,107 @@ fn route_protection_named(objects: &[K8sObject], route: &str) -> (bool, String, 
     .unwrap_or((false, "missing".to_string(), String::new()))
 }
 
+fn route_protection_conditions_named(
+    objects: &[K8sObject],
+    route: &str,
+) -> Vec<(bool, String, String)> {
+    let updates = plan_gateway_api_status_updates(objects, options(), &[]);
+    protection_conditions(
+        updates
+            .iter()
+            .find(|update| update.kind == "UDPRoute" && update.name == route),
+    )
+}
+
+fn protection_conditions(update: Option<&GatewayApiStatusUpdate>) -> Vec<(bool, String, String)> {
+    update
+        .and_then(|update| update.status.get("parents")?.as_array())
+        .into_iter()
+        .flatten()
+        .flat_map(|parent| parent.get("conditions")?.as_array())
+        .flatten()
+        .filter(|entry| {
+            entry.get("type").and_then(Value::as_str) == Some("UDPAmplificationProtection")
+        })
+        .filter_map(|entry| {
+            Some((
+                entry.get("status").and_then(Value::as_str)? == "True",
+                entry.get("reason").and_then(Value::as_str)?.to_string(),
+                entry.get("message").and_then(Value::as_str)?.to_string(),
+            ))
+        })
+        .collect()
+}
+
+fn udp_route_multiple_rules(name: &str) -> K8sObject {
+    object_in(
+        "UDPRoute",
+        "gateway.networking.k8s.io/v1alpha2",
+        "default",
+        name,
+        json!({
+            "parentRefs": [{"name": "edge", "sectionName": "dns"}],
+            "rules": [
+                {"backendRefs": [{"name": "coredns-a", "port": 5353}]},
+                {"backendRefs": [{"name": "coredns-b", "port": 5354}]}
+            ]
+        }),
+    )
+}
+
+fn with_stale_protection_true(mut route: K8sObject) -> K8sObject {
+    let parent_ref = route
+        .spec
+        .get("parentRefs")
+        .and_then(Value::as_array)
+        .and_then(|refs| refs.first())
+        .cloned()
+        .unwrap_or_else(|| json!({"name": "edge", "sectionName": "dns"}));
+    route.status = json!({
+        "parents": [{
+            "parentRef": parent_ref,
+            "controllerName": FERRUM_GATEWAY_CONTROLLER_NAME,
+            "conditions": [{
+                "type": "UDPAmplificationProtection",
+                "status": "True",
+                "reason": "FiniteDefault",
+                "message": "Ferrum applied a finite UDP response-amplification limit",
+                "observedGeneration": 1,
+                "lastTransitionTime": "2020-01-01T00:00:00Z"
+            }]
+        }]
+    });
+    route
+}
+
+fn assert_not_programmed(protected: bool, reason: &str, message: &str) {
+    assert!(
+        !protected,
+        "unprogrammed parent must not claim UDPAmplificationProtection=True"
+    );
+    assert_eq!(reason, "NotProgrammed");
+    assert_eq!(
+        message,
+        "Ferrum did not program a UDP response-amplification limit"
+    );
+    assert_no_numeric_factor(message);
+    for leaked in [
+        "dns",
+        "edge",
+        "coredns",
+        "spec.rules",
+        "UnsupportedValue",
+        "sectionName",
+        "FiniteDefault",
+    ] {
+        assert!(
+            !message.contains(leaked),
+            "UDPAmplificationProtection message must stay fixed/redacted, \
+             leaked {leaked:?}: {message}"
+        );
+    }
+}
+
 #[test]
 fn translated_udproute_gets_finite_controller_default() {
     let objects = [
@@ -324,7 +425,83 @@ fn translated_udproute_gets_finite_controller_default() {
         translated_factor(&objects),
         Some(GATEWAY_API_UDP_AMPLIFICATION_DEFAULT_FACTOR)
     );
-    assert_eq!(route_protection_reason(&objects), "FiniteDefault");
+    let (protected, reason, message) = route_protection_named(&objects, "dns");
+    assert!(protected);
+    assert_eq!(reason, "FiniteDefault");
+    assert_eq!(
+        message,
+        "Ferrum applied a finite UDP response-amplification limit"
+    );
+    assert_no_numeric_factor(&message);
+}
+
+#[test]
+fn translation_failure_reports_amplification_not_programmed() {
+    let objects = [
+        gateway_class(),
+        udp_gateway("edge", "dns", 15353),
+        udp_route_multiple_rules("dns"),
+    ];
+    let (protected, reason, message) = route_protection_named(&objects, "dns");
+    assert_not_programmed(protected, &reason, &message);
+}
+
+#[test]
+fn unmaterialized_parent_reports_amplification_not_programmed() {
+    let objects = [
+        gateway_class(),
+        udp_gateway("edge", "dns", 15353),
+        udp_route_on("dns", "missing"),
+    ];
+    assert_eq!(
+        translate_k8s_objects(&objects, options())
+            .expect("unmatched section still translates")
+            .config
+            .proxies
+            .len(),
+        0
+    );
+    let (protected, reason, message) = route_protection_named(&objects, "dns");
+    assert_not_programmed(protected, &reason, &message);
+}
+
+#[test]
+fn stale_true_amplification_condition_is_replaced_when_unprogrammed() {
+    let failed = [
+        gateway_class(),
+        udp_gateway("edge", "dns", 15353),
+        with_stale_protection_true(udp_route_multiple_rules("dns")),
+    ];
+    let failed_conditions = route_protection_conditions_named(&failed, "dns");
+    assert_eq!(failed_conditions.len(), 1);
+    assert_not_programmed(
+        failed_conditions[0].0,
+        &failed_conditions[0].1,
+        &failed_conditions[0].2,
+    );
+    assert!(
+        failed_conditions.iter().all(|(protected, _, _)| !protected),
+        "stale True must not survive translation failure: {failed_conditions:?}"
+    );
+
+    let unmatched = [
+        gateway_class(),
+        udp_gateway("edge", "dns", 15353),
+        with_stale_protection_true(udp_route_on("dns", "missing")),
+    ];
+    let unmatched_conditions = route_protection_conditions_named(&unmatched, "dns");
+    assert_eq!(unmatched_conditions.len(), 1);
+    assert_not_programmed(
+        unmatched_conditions[0].0,
+        &unmatched_conditions[0].1,
+        &unmatched_conditions[0].2,
+    );
+    assert!(
+        unmatched_conditions
+            .iter()
+            .all(|(protected, _, _)| !protected),
+        "stale True must not survive an unmaterialized parent: {unmatched_conditions:?}"
+    );
 }
 
 #[test]

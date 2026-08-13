@@ -144,7 +144,7 @@ set.
 | Cross-namespace `backendRefs` | Requires an exact `ReferenceGrant` (`from` `gateway.networking.k8s.io`/`UDPRoute`, `to` core `Service`); a missing or mismatched grant fails the **whole rule** closed (the strongest fail-closed outcome) and reports `ResolvedRefs=False` |
 | Cross-namespace `parentRefs` | Rejected, matching `TCPRoute`/`TLSRoute` — Ferrum has no L4 cross-namespace parent materialization yet |
 | `spec.hostnames` | Not a Gateway API `UDPRoute` field, and a datagram carries no name to match on. A hostname supplied through a non-Kubernetes config source is rejected fail closed rather than silently ignored |
-| Status | `status.parents[]` carries Ferrum-authored `Accepted`, `ResolvedRefs`, `Programmed`, `Conflicted`, and `UDPAmplificationProtection` (`FiniteDefault` / `FinitePolicy` / `ExplicitUnlimited`, without echoing the numeric factor), written through the same read-modify-write path as every other route kind. A fully shadowed same-listener UDPRoute loser stays `Accepted=True` / reason `Accepted` (attached) and reports `Programmed=False` with conflict evidence plus `Conflicted=True`; it is not flipped to `Accepted=False` for losing traffic ownership |
+| Status | `status.parents[]` carries Ferrum-authored `Accepted`, `ResolvedRefs`, `Programmed`, `Conflicted`, and `UDPAmplificationProtection` (`FiniteDefault` / `FinitePolicy` / `ExplicitUnlimited` on a materialized parent, or `False` / `NotProgrammed` when that parent was not programmed, without echoing the numeric factor), written through the same read-modify-write path as every other route kind. A fully shadowed same-listener UDPRoute loser stays `Accepted=True` / reason `Accepted` (attached) and reports `Programmed=False` with conflict evidence plus `Conflicted=True`; it is not flipped to `Accepted=False` for losing traffic ownership |
 | Update / delete | Reconciliation regenerates live stream listeners and upstreams from the full snapshot; a changed `backendRefs` or a weight-only change replaces the upstream's target set under the same deterministic id, a deleted `UDPRoute` withdraws both the listener and its upstream, and deleting a conflict winner lets a previously suppressed loser materialize on the next reconcile |
 
 Datagram semantics come from the existing Ferrum UDP data path and are not
@@ -184,10 +184,14 @@ existing idle-timeout path; no extra maps keyed by client or route are added.
 
 `UDPRoute.status.parents[].conditions` includes Ferrum
 `UDPAmplificationProtection` with reasons `FiniteDefault`, `FinitePolicy`, or
-`ExplicitUnlimited`. Condition messages do not echo the numeric factor. When
-one parentRef materializes on several UDP listeners, that parent reports the
-conservative aggregate: `ExplicitUnlimited` if any listener is unlimited,
-`FinitePolicy` only when every listener uses a finite policy, and
+`ExplicitUnlimited` only for a parent whose translator recorded that posture.
+An unprogrammed parent — translation failure, unmatched listener, or any
+parent that never materialized a proxy — reports `False` / `NotProgrammed`
+with a fixed message and never inherits `FiniteDefault`. Condition messages
+do not echo resource names, section names, numeric factors, or translator
+errors. When one parentRef materializes on several UDP listeners, that parent
+reports the conservative aggregate: `ExplicitUnlimited` if any listener is
+unlimited, `FinitePolicy` only when every listener uses a finite policy, and
 `FiniteDefault` when at least one uses the controller default.
 Process-wide unlabeled counters
 `ferrum_udp_amplification_responses_allowed_total`,

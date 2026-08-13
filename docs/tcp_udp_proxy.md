@@ -851,13 +851,16 @@ listener to the finite default on the next reconcile without a process restart.
 
 `UDPRoute.status.parents[].conditions` includes Ferrum
 `UDPAmplificationProtection` (`FiniteDefault` / `FinitePolicy` /
-`ExplicitUnlimited`) without echoing the numeric factor. When one parentRef
-materializes on several UDP listeners, that parent reports the conservative
-aggregate: `ExplicitUnlimited` if any listener is unlimited, `FinitePolicy`
-only when every listener uses a finite policy, and `FiniteDefault` when at
-least one uses the controller default. A missing exact parent does not inherit
-another parentRef's posture. Runtime accounting is
-cumulative per admitted request; see [`docs/tcp_udp_proxy.md`](tcp_udp_proxy.md).
+`ExplicitUnlimited`) without echoing the numeric factor, and only for a parent
+whose translator recorded that posture. An unprogrammed parent reports
+`False` / `NotProgrammed` with a fixed message rather than inheriting
+`FiniteDefault`. When one parentRef materializes on several UDP listeners,
+that parent reports the conservative aggregate: `ExplicitUnlimited` if any
+listener is unlimited, `FinitePolicy` only when every listener uses a finite
+policy, and `FiniteDefault` when at least one uses the controller default. A
+missing exact parent does not inherit another parentRef's posture. Runtime
+accounting is cumulative per admitted request; see
+[`docs/tcp_udp_proxy.md`](tcp_udp_proxy.md).
 
 For a `UDPRoute` the rule's `backendRefs` is a weighted **set**. A single
 serviceable leg becomes a direct backend
