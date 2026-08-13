@@ -1676,8 +1676,16 @@ fn client_facing_sends_are_raced_against_the_authorization_plan() {
         "DTLS frontend client sends must race the same absolute plan"
     );
     assert!(
-        dtls_inner.contains("client_sender.send(&data)"),
-        "the raced operation is the DTLS frontend application send"
+        dtls_inner.contains("client_sender.send_committed("),
+        "the raced operation is the deadline-aware actual-commit DTLS send"
+    );
+    assert!(
+        dtls_inner.contains("bind_authorization_deadline(plan.at)"),
+        "the admitted deadline must be published into the per-client DTLS driver"
+    );
+    assert!(
+        !dtls_inner.contains("client_sender.send(&data)"),
+        "the DTLS frontend send must not use the unauthenticated enqueue-only convenience API"
     );
     assert!(
         !dtls_inner.contains("if client_sender.send(&data).await.is_err()"),

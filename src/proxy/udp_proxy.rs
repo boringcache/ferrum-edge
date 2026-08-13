@@ -4192,7 +4192,10 @@ pub(crate) enum UdpFrontendSendOutcome<T> {
 /// closed (expiry wins over send readiness). `timeout_at` is refused here
 /// because it polls the inner future before the timer. The plan is never
 /// refreshed. The send future is dropped when expiry wins — it is not
-/// detached and cannot outlive the race.
+/// detached and cannot outlive the race. For terminating frontend DTLS the
+/// raced future is `DtlsServerSender::send_committed`: dropping it also
+/// cancels the queued driver request so ciphertext cannot be encrypted or
+/// written after the bound.
 ///
 /// Unauthenticated sessions (`None`) await `send` with no timer, lock, or
 /// clock read — the previous fast path.
@@ -4637,6 +4640,9 @@ async fn handle_dtls_client_inner(
     // Bidirectional forwarding: client (DTLS) ↔ backend (UDP or DTLS)
     // Clone a sender for the backend→client direction before moving client_conn.
     let client_sender = client_conn.clone_sender();
+    if let Some(plan) = auth_deadline {
+        client_sender.bind_authorization_deadline(plan.at);
+    }
     let client_close = client_sender.clone();
     let backend_dtls_write = backend_dtls.clone();
     let backend_udp_write = backend_udp.clone();
@@ -4816,8 +4822,11 @@ async fn handle_dtls_client_inner(
                 }
             }
 
-            match udp_frontend_send_until_expiry(reply_auth_plan, client_sender.send(&data))
-                .await
+            match udp_frontend_send_until_expiry(
+                reply_auth_plan,
+                client_sender.send_committed(&data, reply_auth_plan.map(|plan| plan.at)),
+            )
+            .await
             {
                 UdpFrontendSendOutcome::AuthorizationExpired(termination) => {
                     settle_dtls_auth_expiry(
@@ -4828,6 +4837,14 @@ async fn handle_dtls_client_inner(
                     break;
                 }
                 UdpFrontendSendOutcome::Sent(Err(_)) => {
+                    if let Some(termination) = udp_reply_expired_at_commit(reply_auth_plan) {
+                        settle_dtls_auth_expiry(
+                            termination,
+                            &reply_auth_latch,
+                            dgram_metadata_rev.as_ref(),
+                        );
+                        break;
+                    }
                     debug!(
                         proxy_id = %proxy_id_rev,
                         "DTLS backend→client send failed"

@@ -8776,6 +8776,112 @@ pub mod _test_support {
         crate::dtls::dtls_stale_session_removal_preserves_newer_generation_for_test()
     }
 
+    /// Admission verdict for one terminating-frontend DTLS application send.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum FrontendAppSendAdmitForTest {
+        Proceed,
+        Expired,
+        Cancelled,
+    }
+
+    /// Shutdown / reject reason for a queued frontend DTLS application send.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum FrontendAppSendRejectForTest {
+        Expired,
+        Cancelled,
+        Closed,
+    }
+
+    fn map_frontend_app_send_admit_for_test(
+        admit: crate::dtls::FrontendAppSendAdmit,
+    ) -> FrontendAppSendAdmitForTest {
+        match admit {
+            crate::dtls::FrontendAppSendAdmit::Proceed => FrontendAppSendAdmitForTest::Proceed,
+            crate::dtls::FrontendAppSendAdmit::Reject(
+                crate::dtls::FrontendAppSendReject::Expired,
+            ) => FrontendAppSendAdmitForTest::Expired,
+            crate::dtls::FrontendAppSendAdmit::Reject(
+                crate::dtls::FrontendAppSendReject::Cancelled
+                | crate::dtls::FrontendAppSendReject::Closed,
+            ) => FrontendAppSendAdmitForTest::Cancelled,
+        }
+    }
+
+    fn map_frontend_app_send_reject_for_test(
+        reject: crate::dtls::FrontendAppSendReject,
+    ) -> FrontendAppSendRejectForTest {
+        match reject {
+            crate::dtls::FrontendAppSendReject::Expired => FrontendAppSendRejectForTest::Expired,
+            crate::dtls::FrontendAppSendReject::Cancelled => {
+                FrontendAppSendRejectForTest::Cancelled
+            }
+            crate::dtls::FrontendAppSendReject::Closed => FrontendAppSendRejectForTest::Closed,
+        }
+    }
+
+    /// Pin whether a queued frontend DTLS application send may encrypt or
+    /// poll `socket.send_to`. An already-elapsed deadline never proceeds;
+    /// exact ties fail closed.
+    pub fn admit_frontend_app_send_for_test(
+        cancelled: bool,
+        deadline: Option<tokio::time::Instant>,
+        now: tokio::time::Instant,
+    ) -> FrontendAppSendAdmitForTest {
+        map_frontend_app_send_admit_for_test(crate::dtls::admit_frontend_app_send_for_test(
+            cancelled, deadline, now,
+        ))
+    }
+
+    /// Pin shutdown's refuse-to-flush decision: expired/cancelled keep that
+    /// reason; a still-authorized leftover is closed rather than emitted.
+    pub fn shutdown_queued_frontend_app_send_for_test(
+        cancelled: bool,
+        deadline: Option<tokio::time::Instant>,
+        now: tokio::time::Instant,
+    ) -> FrontendAppSendRejectForTest {
+        map_frontend_app_send_reject_for_test(
+            crate::dtls::shutdown_queued_frontend_app_send_for_test(cancelled, deadline, now),
+        )
+    }
+
+    /// Pin cancel-receiver closed detection used when the proxy send future
+    /// is dropped after channel enqueue.
+    pub fn frontend_app_send_cancel_fired_for_test(
+        cancel: &mut tokio::sync::oneshot::Receiver<()>,
+    ) -> bool {
+        crate::dtls::frontend_app_send_cancel_fired_for_test(cancel)
+    }
+
+    /// Race one application-ciphertext send (or a test double) against the
+    /// admitted deadline and cancel receiver — the exact driver `send_to`
+    /// seam.
+    pub async fn frontend_app_ciphertext_send_until_expiry_for_test<F>(
+        deadline: Option<tokio::time::Instant>,
+        cancel: Option<&mut tokio::sync::oneshot::Receiver<()>>,
+        send: F,
+    ) -> Result<F::Output, FrontendAppSendRejectForTest>
+    where
+        F: std::future::Future,
+    {
+        crate::dtls::frontend_app_ciphertext_send_until_expiry_for_test(deadline, cancel, send)
+            .await
+            .map_err(map_frontend_app_send_reject_for_test)
+    }
+
+    /// Bounded, credential-free reject strings. Must not contain identity,
+    /// certificate, or absolute expiry values.
+    pub fn frontend_app_send_reject_as_str_for_test(
+        reject: FrontendAppSendRejectForTest,
+    ) -> &'static str {
+        crate::dtls::frontend_app_send_reject_as_str_for_test(match reject {
+            FrontendAppSendRejectForTest::Expired => crate::dtls::FrontendAppSendReject::Expired,
+            FrontendAppSendRejectForTest::Cancelled => {
+                crate::dtls::FrontendAppSendReject::Cancelled
+            }
+            FrontendAppSendRejectForTest::Closed => crate::dtls::FrontendAppSendReject::Closed,
+        })
+    }
+
     /// Observe Ferrum-managed DTLS loader key DER after zeroization and before
     /// the backing allocation is released (issue #3224 loader ownership path).
     pub fn load_dtls_certificate_with_rustls_key_drop_hook_for_test(
