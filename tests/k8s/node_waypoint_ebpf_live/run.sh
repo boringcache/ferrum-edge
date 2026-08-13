@@ -40,6 +40,16 @@ DTLS_LISTENER_PORT="${FERRUM_LIVE_DTLS_LISTENER_PORT:-15354}"
 # never binds.
 DTLS_SECRET_NAME="${FERRUM_LIVE_DTLS_SECRET:-ferrum-live-node-waypoint-dtls}"
 DTLS_MOUNT_PATH=/etc/ferrum/dtls
+# Same numeric port for two compatible plain-UDP Services with distinct
+# ClusterIPs (issue #3861). Must not collide with udp-echo (15353) or
+# dtls-echo (15354).
+DEMUX_UDP_PORT="${FERRUM_LIVE_DEMUX_UDP_PORT:-15355}"
+# Ordinary operator-owned DTLS listener in the same NodeWaypoint process
+# (issue #3858). Distinct from generated dtls-echo so a mesh PeerAuthentication
+# reload cannot be mistaken for mutating this socket.
+OPERATOR_DTLS_PORT="${FERRUM_LIVE_OPERATOR_DTLS_PORT:-15356}"
+DTLS_CLIENT_SECRET_NAME="${FERRUM_LIVE_DTLS_CLIENT_SECRET:-ferrum-live-dtls-clients}"
+DTLS_CLIENT_MOUNT_PATH=/etc/ferrum/dtls-clients
 # openssl CLI image for the enrolled DTLS probe pods. Built on the runner and
 # loaded into kind: those pods are mesh-captured, so they cannot `apk add`.
 DTLS_CLIENT_IMAGE="${FERRUM_LIVE_DTLS_CLIENT_IMAGE:-ferrum-live-dtls-client:local}"
@@ -109,6 +119,19 @@ REQUIRED_LIVE_ASSERTIONS=(
   node_waypoint.dtls.service_path_allow_attributed_source
   node_waypoint.dtls.service_path_deny_scoped_policy
   node_waypoint.dtls.service_path_deny_unattributed_source
+  node_waypoint.udp.same_port_demux_serves_a
+  node_waypoint.udp.same_port_demux_serves_b
+  node_waypoint.udp.same_port_demux_isolated
+  node_waypoint.udp.same_port_demux_shared_client_tuple
+  node_waypoint.udp.same_port_demux_retract_a_keeps_b
+  node_waypoint.dtls.operator_listener_bound
+  node_waypoint.dtls.operator_listener_rejects_unauthenticated
+  node_waypoint.dtls.operator_listener_rejects_stale_ca
+  node_waypoint.dtls.reload_permissive_to_strict
+  node_waypoint.dtls.reload_current_ca_admitted
+  node_waypoint.dtls.reload_stale_ca_rejected
+  node_waypoint.dtls.reload_unauthenticated_rejected
+  node_waypoint.dtls.operator_isolated_across_reload
 )
 if [[ "$STALE_IP_REUSE_HOST_LOCAL_PROFILE" == "true" ]]; then
   REQUIRED_LIVE_ASSERTIONS+=(
@@ -1074,7 +1097,7 @@ install_spire_production_identity() {
 # key material leaves the cluster or the run's temp dir, and nothing is echoed
 # to the log.
 create_dtls_listener_secret() {
-  log "minting the NodeWaypoint frontend DTLS material"
+  log "minting the NodeWaypoint frontend DTLS material, client CAs, and operator overlay"
   local dir
   dir="$(mktemp -d)"
   if ! openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes -days 2 \
@@ -1084,10 +1107,100 @@ create_dtls_listener_secret() {
     echo "could not mint the NodeWaypoint frontend DTLS listener certificate" >&2
     exit 1
   fi
+  if ! openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes -days 2 \
+    -subj "/CN=ferrum-live-dtls-current-ca" \
+    -keyout "$dir/current-ca.key" -out "$dir/ca.crt" >/dev/null 2>&1; then
+    rm -rf "$dir"
+    echo "could not mint the current DTLS client CA" >&2
+    exit 1
+  fi
+  if ! openssl req -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes \
+    -subj "/CN=ferrum-live-dtls-current-client" \
+    -keyout "$dir/current.key" -out "$dir/current.csr" >/dev/null 2>&1; then
+    rm -rf "$dir"
+    echo "could not mint the current DTLS client key" >&2
+    exit 1
+  fi
+  printf '%s\n' 'basicConstraints=CA:FALSE' 'keyUsage=digitalSignature' \
+    'extendedKeyUsage=clientAuth' >"$dir/client.ext"
+  if ! openssl x509 -req -in "$dir/current.csr" -CA "$dir/ca.crt" \
+    -CAkey "$dir/current-ca.key" -CAcreateserial -days 2 \
+    -out "$dir/current.crt" -extfile "$dir/client.ext" >/dev/null 2>&1; then
+    rm -rf "$dir"
+    echo "could not sign the current DTLS client certificate" >&2
+    exit 1
+  fi
+  if ! openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes -days 2 \
+    -subj "/CN=ferrum-live-dtls-stale-ca" \
+    -keyout "$dir/stale-ca.key" -out "$dir/stale-ca.crt" >/dev/null 2>&1; then
+    rm -rf "$dir"
+    echo "could not mint the stale DTLS client CA" >&2
+    exit 1
+  fi
+  if ! openssl req -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes \
+    -subj "/CN=ferrum-live-dtls-stale-client" \
+    -keyout "$dir/stale.key" -out "$dir/stale.csr" >/dev/null 2>&1; then
+    rm -rf "$dir"
+    echo "could not mint the stale DTLS client key" >&2
+    exit 1
+  fi
+  if ! openssl x509 -req -in "$dir/stale.csr" -CA "$dir/stale-ca.crt" \
+    -CAkey "$dir/stale-ca.key" -CAcreateserial -days 2 \
+    -out "$dir/stale.crt" -extfile "$dir/client.ext" >/dev/null 2>&1; then
+    rm -rf "$dir"
+    echo "could not sign the stale DTLS client certificate" >&2
+    exit 1
+  fi
+  cat >"$dir/operator-gateway.yaml" <<EOF
+version: "1"
+proxies:
+  - id: operator-dtls-live
+    namespace: ${WORKLOAD_NS}
+    listen_port: ${OPERATOR_DTLS_PORT}
+    backend_scheme: udp
+    backend_host: operator-dtls-echo.${UNMANAGED_NS}.svc.cluster.local
+    backend_port: ${OPERATOR_DTLS_PORT}
+    frontend_tls: true
+    passthrough: false
+consumers: []
+plugin_configs: []
+EOF
   kubectl create namespace "$MESH_NS" --dry-run=client -o yaml | kubectl apply -f -
-  kubectl -n "$MESH_NS" create secret tls "$DTLS_SECRET_NAME" \
-    --cert="$dir/tls.crt" --key="$dir/tls.key" \
+  kubectl -n "$MESH_NS" create secret generic "$DTLS_SECRET_NAME" \
+    --from-file=tls.crt="$dir/tls.crt" \
+    --from-file=tls.key="$dir/tls.key" \
+    --from-file=ca.crt="$dir/ca.crt" \
+    --from-file=operator-gateway.yaml="$dir/operator-gateway.yaml" \
     --dry-run=client -o yaml | kubectl apply -f -
+  kubectl create namespace "$WORKLOAD_NS" --dry-run=client -o yaml | kubectl apply -f -
+  kubectl -n "$WORKLOAD_NS" create secret generic "$DTLS_CLIENT_SECRET_NAME" \
+    --from-file=current.crt="$dir/current.crt" \
+    --from-file=current.key="$dir/current.key" \
+    --from-file=stale.crt="$dir/stale.crt" \
+    --from-file=stale.key="$dir/stale.key" \
+    --dry-run=client -o yaml | kubectl apply -f -
+  kubectl create namespace "$UNMANAGED_NS" --dry-run=client -o yaml | kubectl apply -f -
+  kubectl -n "$UNMANAGED_NS" create secret generic "$DTLS_CLIENT_SECRET_NAME" \
+    --from-file=current.crt="$dir/current.crt" \
+    --from-file=current.key="$dir/current.key" \
+    --from-file=stale.crt="$dir/stale.crt" \
+    --from-file=stale.key="$dir/stale.key" \
+    --dry-run=client -o yaml | kubectl apply -f -
+  kubectl apply -f - <<EOF
+apiVersion: v1
+kind: Service
+metadata:
+  name: operator-dtls-echo
+  namespace: $UNMANAGED_NS
+spec:
+  selector:
+    app: operator-dtls-echo
+  ports:
+    - name: udp
+      port: $OPERATOR_DTLS_PORT
+      targetPort: $OPERATOR_DTLS_PORT
+      protocol: UDP
+EOF
   rm -rf "$dir"
 }
 
@@ -1155,8 +1268,10 @@ install_ferrum() {
     --set ambient.env.FERRUM_MESH_HBONE_LISTEN_ADDR=0.0.0.0:15008 \
     --set-string 'ambient.env.FERRUM_MESH_INBOUND_LISTEN_ADDR=[::]:15006' \
     --set ambient.env.FERRUM_MESH_NODE_WAYPOINT_UDP_LISTENERS_ENABLED=true \
+    --set ambient.env.FERRUM_MESH_PEER_AUTH_LIVE_RELOAD_ENABLED=true \
     --set-string "ambient.env.FERRUM_DTLS_CERT_PATH=$DTLS_MOUNT_PATH/tls.crt" \
     --set-string "ambient.env.FERRUM_DTLS_KEY_PATH=$DTLS_MOUNT_PATH/tls.key" \
+    --set-string "ambient.env.FERRUM_DTLS_CLIENT_CA_CERT_PATH=$DTLS_MOUNT_PATH/ca.crt" \
     --set-json "ambient.extraVolumes=[{\"name\":\"node-waypoint-dtls\",\"secret\":{\"secretName\":\"$DTLS_SECRET_NAME\"}}]" \
     --set-json "ambient.extraVolumeMounts=[{\"name\":\"node-waypoint-dtls\",\"mountPath\":\"$DTLS_MOUNT_PATH\",\"readOnly\":true}]" \
     --set nodeAgent.enabled=true \
@@ -1741,13 +1856,17 @@ apply_workloads() {
   log "applying live traffic workloads"
   awk -v ns="$WORKLOAD_NS" -v td="$TRUST_DOMAIN" -v require_dual="$REQUIRE_DUAL_STACK" \
     -v udp_port="$UDP_LISTENER_PORT" -v dtls_port="$DTLS_LISTENER_PORT" \
-    -v dtls_image="$DTLS_CLIENT_IMAGE" '
+    -v demux_port="$DEMUX_UDP_PORT" -v operator_dtls_port="$OPERATOR_DTLS_PORT" \
+    -v dtls_image="$DTLS_CLIENT_IMAGE" -v dtls_client_secret="$DTLS_CLIENT_SECRET_NAME" '
     {
       gsub(/__NAMESPACE__/, ns)
       gsub(/__TRUST_DOMAIN__/, td)
       gsub(/__UDP_LISTENER_PORT__/, udp_port)
       gsub(/__DTLS_LISTENER_PORT__/, dtls_port)
+      gsub(/__DEMUX_UDP_PORT__/, demux_port)
+      gsub(/__OPERATOR_DTLS_PORT__/, operator_dtls_port)
       gsub(/__DTLS_CLIENT_IMAGE__/, dtls_image)
+      gsub(/__DTLS_CLIENT_CERT_SECRET__/, dtls_client_secret)
       if ($0 ~ /__SERVICE_IP_FAMILY_BLOCK__/) {
         if (require_dual == "true") {
           print "  ipFamilyPolicy: RequireDualStack"
@@ -1769,6 +1888,8 @@ apply_workloads() {
   kubectl -n "$WORKLOAD_NS" rollout status deploy/udp-echo --timeout=3m
   kubectl -n "$WORKLOAD_NS" rollout status deploy/udp-src-a --timeout=3m
   kubectl -n "$WORKLOAD_NS" rollout status deploy/udp-src-b --timeout=3m
+  kubectl -n "$WORKLOAD_NS" rollout status deploy/udp-demux-a --timeout=3m
+  kubectl -n "$WORKLOAD_NS" rollout status deploy/udp-demux-b --timeout=3m
   kubectl -n "$WORKLOAD_NS" rollout status deploy/dtls-echo --timeout=3m
   kubectl -n "$WORKLOAD_NS" rollout status deploy/dtls-src-a --timeout=3m
   kubectl -n "$WORKLOAD_NS" rollout status deploy/dtls-src-b --timeout=3m
@@ -1892,13 +2013,95 @@ spec:
           image: $DTLS_CLIENT_IMAGE
           imagePullPolicy: IfNotPresent
           command: ["sh", "-c", "sleep 365d"]
+---
+# Unenrolled DTLS operator-listener client (issue #3858). Lives outside the
+# mesh namespace so unmarked replies from the ordinary FERRUM_DTLS_* listener
+# are not dropped by the enrolled-pod veth guard. Carries the per-run current
+# and stale client certificates.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: dtls-operator-src
+  namespace: $UNMANAGED_NS
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: dtls-operator-src
+  template:
+    metadata:
+      labels:
+        app: dtls-operator-src
+    spec:
+      nodeSelector:
+        ferrum.io/live-node: a
+      containers:
+        - name: dtls
+          image: $DTLS_CLIENT_IMAGE
+          imagePullPolicy: IfNotPresent
+          command: ["sh", "-c", "sleep 365d"]
+          volumeMounts:
+            - name: dtls-clients
+              mountPath: $DTLS_CLIENT_MOUNT_PATH
+              readOnly: true
+      volumes:
+        - name: dtls-clients
+          secret:
+            secretName: $DTLS_CLIENT_SECRET_NAME
+---
+# Unmanaged plaintext UDP backend for the operator-owned DTLS listener. Not
+# mesh-enrolled, so the NodeWaypoint's unmarked relay is not dropped on the
+# way to the echo pod.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: operator-dtls-echo
+  namespace: $UNMANAGED_NS
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: operator-dtls-echo
+  template:
+    metadata:
+      labels:
+        app: operator-dtls-echo
+    spec:
+      nodeSelector:
+        ferrum.io/live-node: a
+      containers:
+        - name: udp
+          image: python:3.12-alpine
+          ports:
+            - containerPort: $OPERATOR_DTLS_PORT
+              protocol: UDP
+          command:
+            - python
+            - -u
+            - -c
+            - |
+              import socket
+
+              s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+              s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+              s.bind(("0.0.0.0", $OPERATOR_DTLS_PORT))
+              while True:
+                  data, peer = s.recvfrom(2048)
+                  print("recv:" + data.decode("utf-8", "replace").strip(), flush=True)
+                  s.sendto(b"operator-dtls-ok:" + data.strip(), peer)
 EOF
   kubectl -n "$UNMANAGED_NS" rollout status deploy/unmanaged-a --timeout=3m
   kubectl -n "$UNMANAGED_NS" rollout status deploy/unmanaged-b --timeout=3m
   kubectl -n "$UNMANAGED_NS" rollout status deploy/udp-unmanaged --timeout=3m
   kubectl -n "$UNMANAGED_NS" rollout status deploy/dtls-unmanaged --timeout=3m
+  kubectl -n "$UNMANAGED_NS" rollout status deploy/dtls-operator-src --timeout=3m
+  kubectl -n "$UNMANAGED_NS" rollout status deploy/operator-dtls-echo --timeout=3m
   if ! kubectl -n "$UNMANAGED_NS" exec deploy/dtls-unmanaged -c dtls -- openssl version >/dev/null; then
     echo "dtls-unmanaged is missing the openssl CLI; the DTLS live client image did not load" >&2
+    exit 1
+  fi
+  if ! kubectl -n "$UNMANAGED_NS" exec deploy/dtls-operator-src -c dtls -- openssl version >/dev/null; then
+    echo "dtls-operator-src is missing the openssl CLI; the DTLS live client image did not load" >&2
     exit 1
   fi
 }
@@ -2017,6 +2220,35 @@ fetch_node_waypoint_identities_for_node() {
   for _ in $(seq 1 20); do
     if curl -fsS -H "Authorization: Bearer $token" \
       "http://127.0.0.1:$port/node-waypoint/identities" >"$out" 2>"$out.curl"; then
+      fetched=true
+      break
+    fi
+    sleep 0.25
+  done
+  kill "$pf_pid" 2>/dev/null || true
+  wait "$pf_pid" 2>/dev/null || true
+  [[ "$fetched" == "true" ]]
+}
+
+fetch_ambient_admin_json() {
+  local node="$1"
+  local path="$2"
+  local out="$3"
+  local ambient_pod port token pf_log pf_pid fetched
+  ambient_pod="$(ambient_pod_on_node "$node")"
+  if [[ -z "$ambient_pod" ]]; then
+    echo "no ferrum-mesh-ambient pod found on node $node" >&2
+    return 1
+  fi
+  port="$(pick_loopback_port)"
+  token="$(admin_bearer_token)"
+  pf_log="$out.port-forward.log"
+  kubectl -n "$MESH_NS" port-forward "pod/$ambient_pod" "$port:$AMBIENT_ADMIN_PORT" >"$pf_log" 2>&1 &
+  pf_pid=$!
+  fetched=false
+  for _ in $(seq 1 20); do
+    if curl -fsS -H "Authorization: Bearer $token" \
+      "http://127.0.0.1:$port$path" >"$out" 2>"$out.curl"; then
       fetched=true
       break
     fi
@@ -4208,10 +4440,13 @@ import socket
 import sys
 
 target, port, payload, wait = sys.argv[1], int(sys.argv[2]), sys.argv[3], float(sys.argv[4])
-s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+target = target.strip("[]")
+family = socket.AF_INET6 if ":" in target else socket.AF_INET
+s = socket.socket(family, socket.SOCK_DGRAM)
 s.settimeout(wait)
+addr = (target, port, 0, 0) if family == socket.AF_INET6 else (target, port)
 try:
-    s.sendto(payload.encode(), (target, port))
+    s.sendto(payload.encode(), addr)
     data, _ = s.recvfrom(2048)
     sys.stdout.write(data.decode("utf-8", "replace"))
 except socket.timeout:
@@ -4306,14 +4541,18 @@ except OSError:
 ' "$target_ip" "$port" "$spoof_ip" "$payload" "$wait_secs" 2>/dev/null || echo "SPOOF-UNAVAILABLE"
 }
 
+udp_backend_received() {
+  local ns="$1" deploy="$2" payload="$3"
+  kubectl -n "$ns" logs "deploy/$deploy" --tail=-1 2>/dev/null |
+    grep -c "^recv:${payload}$" || true
+}
+
 # How many datagrams carrying `payload` the udp-echo backend actually received.
 # Reply-absence alone is not proof for the spoofed-source case (a spoofed
 # datagram's reply is sent to the FORGED address, so the prober would see a
 # timeout either way); the backend log is.
 udp_echo_backend_received() {
-  local payload="$1"
-  kubectl -n "$WORKLOAD_NS" logs deploy/udp-echo --tail=-1 2>/dev/null |
-    grep -c "^recv:${payload}$" || true
+  udp_backend_received "$WORKLOAD_NS" udp-echo "$1"
 }
 
 ambient_restart_total() {
@@ -4363,11 +4602,11 @@ for raw in cidrs:
 }
 
 # Poll a probe until its reply matches (or stops matching) the expected prefix.
-wait_for_udp_outcome() {
-  local mode="$1" expected="$2" ns="$3" app="$4" listener_ip="$5" payload="$6" budget="${7:-40}"
+wait_for_udp_outcome_on() {
+  local mode="$1" expected="$2" ns="$3" app="$4" listener_ip="$5" port="$6" payload="$7" budget="${8:-40}"
   local attempt reply
   for ((attempt = 0; attempt < budget; attempt++)); do
-    reply="$(udp_probe_from "$ns" "$app" "$listener_ip" "$UDP_LISTENER_PORT" "$payload" 2)"
+    reply="$(udp_probe_from "$ns" "$app" "$listener_ip" "$port" "$payload" 2)"
     case "$mode" in
       match)
         if [[ "$reply" == "$expected"* ]]; then
@@ -4386,6 +4625,10 @@ wait_for_udp_outcome() {
   done
   printf '%s' "$reply"
   return 1
+}
+
+wait_for_udp_outcome() {
+  wait_for_udp_outcome_on "$1" "$2" "$3" "$4" "$5" "$UDP_LISTENER_PORT" "$6" "${7:-40}"
 }
 
 run_node_waypoint_udp_datapath_checks() {
@@ -4657,8 +4900,13 @@ EOF
 # listener bound and which certificate it presented.
 dtls_handshake_report_from() {
   local ns="$1" app="$2" target_ip="$3" port="$4" wait_secs="${5:-15}"
+  local cert="${6:-}" key="${7:-}"
+  local -a extra=()
+  if [[ -n "$cert" && -n "$key" ]]; then
+    extra=(-cert "$cert" -key "$key")
+  fi
   kubectl -n "$ns" exec "deploy/$app" -c dtls -- \
-    timeout "$wait_secs" openssl s_client -dtls1_2 -connect "$target_ip:$port" 2>&1 \
+    timeout "$wait_secs" openssl s_client -dtls1_2 -connect "$target_ip:$port" "${extra[@]}" 2>&1 \
     || true
 }
 
@@ -4669,29 +4917,40 @@ dtls_handshake_report_from() {
 # `timeout` bounds the wait. The server certificate is deliberately NOT
 # verified: this exercises the datagram datapath and its scoped source
 # authorization, not PKI trust, and the material is a per-run throwaway leaf.
+# Optional cert/key (args 7/8) present a client certificate for STRICT mTLS.
 dtls_probe_from() {
   local ns="$1" app="$2" target_ip="$3" port="$4" payload="$5" wait_secs="${6:-8}"
+  local cert="${7:-}" key="${8:-}"
+  local -a extra=()
+  if [[ -n "$cert" && -n "$key" ]]; then
+    extra=(-cert "$cert" -key "$key")
+  fi
   printf '%s\n' "$payload" | kubectl -n "$ns" exec -i "deploy/$app" -c dtls -- \
     timeout "$wait_secs" openssl s_client -dtls1_2 \
-      -connect "$target_ip:$port" -quiet 2>/dev/null \
+      -connect "$target_ip:$port" "${extra[@]}" -quiet 2>/dev/null \
     || true
+}
+
+dtls_backend_received() {
+  local ns="$1" deploy="$2" payload="$3"
+  kubectl -n "$ns" logs "deploy/$deploy" --tail=-1 2>/dev/null |
+    grep -c "^recv:${payload}$" || true
 }
 
 # How many decrypted datagrams carrying `payload` the dtls-echo backend received.
 # Reply-absence alone would not distinguish "denied before the backend" from
 # "reply lost", so the backend log is the authority for the deny case.
 dtls_echo_backend_received() {
-  local payload="$1"
-  kubectl -n "$WORKLOAD_NS" logs deploy/dtls-echo --tail=-1 2>/dev/null |
-    grep -c "^recv:${payload}$" || true
+  dtls_backend_received "$WORKLOAD_NS" dtls-echo "$1"
 }
 
-wait_for_dtls_echo() {
-  local ns="$1" app="$2" listener_ip="$3" payload="$4" budget="${5:-20}"
+wait_for_dtls_echo_on() {
+  local ns="$1" app="$2" listener_ip="$3" port="$4" expected_prefix="$5" payload="$6"
+  local budget="${7:-20}" cert="${8:-}" key="${9:-}"
   local attempt reply
   for ((attempt = 0; attempt < budget; attempt++)); do
-    reply="$(dtls_probe_from "$ns" "$app" "$listener_ip" "$DTLS_LISTENER_PORT" "$payload" 6)"
-    if [[ "$reply" == *"dtls-ok:$payload"* ]]; then
+    reply="$(dtls_probe_from "$ns" "$app" "$listener_ip" "$port" "$payload" 6 "$cert" "$key")"
+    if [[ "$reply" == *"${expected_prefix}${payload}"* ]]; then
       printf '%s' "$reply"
       return 0
     fi
@@ -4699,6 +4958,22 @@ wait_for_dtls_echo() {
   done
   printf '%s' "$reply"
   return 1
+}
+
+wait_for_dtls_echo() {
+  wait_for_dtls_echo_on "$1" "$2" "$3" "$DTLS_LISTENER_PORT" "dtls-ok:" "$4" "${5:-20}"
+}
+
+dtls_handshake_failed() {
+  local report="$1"
+  [[ "$report" == *"handshake failure"* || "$report" == *"unknown ca"* \
+    || "$report" == *"certificate unknown"* || "$report" == *"certificate required"* \
+    || "$report" == *"no certificate returned"* || "$report" == *"sslv3 alert"* \
+    || "$report" == *"tlsv1 alert"* || "$report" == *"tlsv13 alert"* ]]
+}
+
+dtls_report_snippet() {
+  printf '%s' "$1" | sed '/-----BEGIN/,/-----END/d' | tr '\n' ' ' | cut -c1-240
 }
 
 # ── The ORDINARY user path for DTLS: the Service DNS name / ClusterIP ───────
@@ -4873,6 +5148,526 @@ material" "$(spiffe_for_sa src-a)" "$(spiffe_for_sa dst-a)" "node-waypoint-dtls-
     "$(spiffe_for_sa src-b)" "$(spiffe_for_sa dst-a)" "node-waypoint-dtls-listener"
 }
 
+service_cluster_ip() {
+  local ns="$1" svc="$2" family="$3"
+  kubectl -n "$ns" get svc "$svc" -o json | python3 -c '
+import ipaddress
+import json
+import sys
+
+family = int(sys.argv[1])
+svc = json.load(sys.stdin)
+spec = svc.get("spec") or {}
+ips = list(spec.get("clusterIPs") or [])
+cip = spec.get("clusterIP")
+if cip and cip != "None":
+    ips = list(dict.fromkeys(ips + [cip]))
+for raw in ips:
+    try:
+        ip = ipaddress.ip_address(raw)
+    except ValueError:
+        continue
+    if ip.version == family:
+        print(raw)
+        break
+' "$family"
+}
+
+udp_shared_tuple_probe() {
+  local ns="$1" app="$2" ip_a="$3" ip_b="$4" port="$5" payload_a="$6" payload_b="$7" wait_secs="${8:-3}"
+  kubectl -n "$ns" exec "deploy/$app" -c udp -- python -u -c '
+import socket
+import sys
+
+ip_a, ip_b, port, pa, pb, wait = (
+    sys.argv[1], sys.argv[2], int(sys.argv[3]), sys.argv[4], sys.argv[5], float(sys.argv[6])
+)
+ip_a = ip_a.strip("[]")
+ip_b = ip_b.strip("[]")
+family = socket.AF_INET6 if ":" in ip_a else socket.AF_INET
+s = socket.socket(family, socket.SOCK_DGRAM)
+s.bind(("::", 0) if family == socket.AF_INET6 else ("0.0.0.0", 0))
+s.settimeout(wait)
+
+def addr(ip):
+    return (ip, port, 0, 0) if family == socket.AF_INET6 else (ip, port)
+
+out = []
+try:
+    s.sendto(pa.encode(), addr(ip_a))
+    data, _ = s.recvfrom(2048)
+    out.append("A:" + data.decode("utf-8", "replace"))
+except socket.timeout:
+    out.append("A:TIMEOUT")
+except OSError as exc:
+    out.append("A:OSERROR:%s" % exc.errno)
+try:
+    s.sendto(pb.encode(), addr(ip_b))
+    data, _ = s.recvfrom(2048)
+    out.append("B:" + data.decode("utf-8", "replace"))
+except socket.timeout:
+    out.append("B:TIMEOUT")
+except OSError as exc:
+    out.append("B:OSERROR:%s" % exc.errno)
+sys.stdout.write("|".join(out))
+' "$ip_a" "$ip_b" "$port" "$payload_a" "$payload_b" "$wait_secs" 2>/dev/null || echo "EXECFAIL"
+}
+
+# Same-port UDP Service demultiplexing (issue #3861): two compatible plain-UDP
+# Services, distinct ClusterIPs, one numeric port, distinct backends. Proof is
+# the backend logs plus the echo prefix, never reply-absence alone.
+run_node_waypoint_udp_same_port_demux_checks() {
+  log "running NodeWaypoint same-port UDP Service demultiplex checks (issue #3861)"
+  local ip_a ip_b reply hits_a hits_b restarts_before restarts_after
+
+  ip_a="$(service_cluster_ip "$WORKLOAD_NS" udp-demux-a 4)"
+  ip_b="$(service_cluster_ip "$WORKLOAD_NS" udp-demux-b 4)"
+  if [[ -z "$ip_a" || -z "$ip_b" || "$ip_a" == "$ip_b" ]]; then
+    record_live_assertion node_waypoint.udp.same_port_demux_serves_a fail \
+      udp-src-a udp-demux-a "ClusterIPs are missing or not distinct ipv4_a=$ip_a ipv4_b=$ip_b" \
+      "$(spiffe_for_sa src-a)" "$(spiffe_for_sa dst-a)" "node-waypoint-udp-same-port-demux"
+    collect_traffic_failure_diagnostics
+    return 1
+  fi
+  log "same-port UDP demux IPv4 ${ip_a}:${DEMUX_UDP_PORT} vs ${ip_b}:${DEMUX_UDP_PORT}"
+
+  if ! reply="$(wait_for_udp_outcome_on match "demux-a:demux-ping-a" \
+    "$WORKLOAD_NS" udp-src-a "$ip_a" "$DEMUX_UDP_PORT" demux-ping-a 40)"; then
+    record_live_assertion node_waypoint.udp.same_port_demux_serves_a fail \
+      udp-src-a udp-demux-a "observed=$reply cluster_ip=$ip_a" \
+      "$(spiffe_for_sa src-a)" "$(spiffe_for_sa dst-a)" "node-waypoint-udp-same-port-demux"
+    collect_traffic_failure_diagnostics
+    return 1
+  fi
+  hits_a="$(udp_backend_received "$WORKLOAD_NS" udp-demux-a demux-ping-a)"
+  hits_b="$(udp_backend_received "$WORKLOAD_NS" udp-demux-b demux-ping-a)"
+  if [[ "$hits_a" == "0" ]]; then
+    record_live_assertion node_waypoint.udp.same_port_demux_serves_a fail \
+      udp-src-a udp-demux-a "echo arrived but backend A logged no datagram" \
+      "$(spiffe_for_sa src-a)" "$(spiffe_for_sa dst-a)" "node-waypoint-udp-same-port-demux"
+    collect_traffic_failure_diagnostics
+    return 1
+  fi
+  record_live_assertion node_waypoint.udp.same_port_demux_serves_a pass \
+    udp-src-a udp-demux-a "cluster_ip=$ip_a observed=$reply backend_hits=$hits_a" \
+    "$(spiffe_for_sa src-a)" "$(spiffe_for_sa dst-a)" "node-waypoint-udp-same-port-demux"
+
+  if ! reply="$(wait_for_udp_outcome_on match "demux-b:demux-ping-b" \
+    "$WORKLOAD_NS" udp-src-a "$ip_b" "$DEMUX_UDP_PORT" demux-ping-b 40)"; then
+    record_live_assertion node_waypoint.udp.same_port_demux_serves_b fail \
+      udp-src-a udp-demux-b "observed=$reply cluster_ip=$ip_b" \
+      "$(spiffe_for_sa src-a)" "$(spiffe_for_sa dst-a)" "node-waypoint-udp-same-port-demux"
+    collect_traffic_failure_diagnostics
+    return 1
+  fi
+  hits_b="$(udp_backend_received "$WORKLOAD_NS" udp-demux-b demux-ping-b)"
+  hits_a="$(udp_backend_received "$WORKLOAD_NS" udp-demux-a demux-ping-b)"
+  if [[ "$hits_b" == "0" ]]; then
+    record_live_assertion node_waypoint.udp.same_port_demux_serves_b fail \
+      udp-src-a udp-demux-b "echo arrived but backend B logged no datagram" \
+      "$(spiffe_for_sa src-a)" "$(spiffe_for_sa dst-a)" "node-waypoint-udp-same-port-demux"
+    collect_traffic_failure_diagnostics
+    return 1
+  fi
+  record_live_assertion node_waypoint.udp.same_port_demux_serves_b pass \
+    udp-src-a udp-demux-b "cluster_ip=$ip_b observed=$reply backend_hits=$hits_b" \
+    "$(spiffe_for_sa src-a)" "$(spiffe_for_sa dst-a)" "node-waypoint-udp-same-port-demux"
+
+  if [[ "$hits_a" != "0" ]]; then
+    record_live_assertion node_waypoint.udp.same_port_demux_isolated fail \
+      udp-src-a udp-demux-a "payload for B reached backend A hits=$hits_a" \
+      "$(spiffe_for_sa src-a)" "$(spiffe_for_sa dst-a)" "node-waypoint-udp-same-port-demux"
+    collect_traffic_failure_diagnostics
+    return 1
+  fi
+  hits_b="$(udp_backend_received "$WORKLOAD_NS" udp-demux-b demux-ping-a)"
+  if [[ "$hits_b" != "0" ]]; then
+    record_live_assertion node_waypoint.udp.same_port_demux_isolated fail \
+      udp-src-a udp-demux-b "payload for A reached backend B hits=$hits_b" \
+      "$(spiffe_for_sa src-a)" "$(spiffe_for_sa dst-a)" "node-waypoint-udp-same-port-demux"
+    collect_traffic_failure_diagnostics
+    return 1
+  fi
+  record_live_assertion node_waypoint.udp.same_port_demux_isolated pass \
+    udp-src-a udp-demux-a "A payload only on A; B payload only on B" \
+    "$(spiffe_for_sa src-a)" "$(spiffe_for_sa dst-a)" "node-waypoint-udp-same-port-demux"
+
+  local shared
+  if ! shared="$(udp_shared_tuple_probe "$WORKLOAD_NS" udp-src-a "$ip_a" "$ip_b" \
+    "$DEMUX_UDP_PORT" demux-shared-a demux-shared-b 3)"; then
+    shared="EXECFAIL"
+  fi
+  hits_a="$(udp_backend_received "$WORKLOAD_NS" udp-demux-a demux-shared-a)"
+  hits_b="$(udp_backend_received "$WORKLOAD_NS" udp-demux-b demux-shared-b)"
+  local cross_a cross_b
+  cross_a="$(udp_backend_received "$WORKLOAD_NS" udp-demux-b demux-shared-a)"
+  cross_b="$(udp_backend_received "$WORKLOAD_NS" udp-demux-a demux-shared-b)"
+  if [[ "$shared" != *"A:demux-a:demux-shared-a"* || "$shared" != *"B:demux-b:demux-shared-b"* \
+    || "$hits_a" == "0" || "$hits_b" == "0" || "$cross_a" != "0" || "$cross_b" != "0" ]]; then
+    record_live_assertion node_waypoint.udp.same_port_demux_shared_client_tuple fail \
+      udp-src-a udp-demux-a "observed=$shared hits_a=$hits_a hits_b=$hits_b cross_a=$cross_a cross_b=$cross_b" \
+      "$(spiffe_for_sa src-a)" "$(spiffe_for_sa dst-a)" "node-waypoint-udp-same-port-demux"
+    collect_traffic_failure_diagnostics
+    return 1
+  fi
+  record_live_assertion node_waypoint.udp.same_port_demux_shared_client_tuple pass \
+    udp-src-a udp-demux-a "one bound client socket addressed both ClusterIPs without collision" \
+    "$(spiffe_for_sa src-a)" "$(spiffe_for_sa dst-a)" "node-waypoint-udp-same-port-demux"
+
+  restarts_before="$(ambient_restart_total)"
+  kubectl -n "$WORKLOAD_NS" delete svc udp-demux-a --wait=true --timeout=60s
+  if ! reply="$(wait_for_udp_outcome_on refuse "" \
+    "$WORKLOAD_NS" udp-src-a "$ip_a" "$DEMUX_UDP_PORT" demux-retract-a 40)"; then
+    record_live_assertion node_waypoint.udp.same_port_demux_retract_a_keeps_b fail \
+      udp-src-a udp-demux-a "ClusterIP A still answered after Service delete observed=$reply" \
+      "$(spiffe_for_sa src-a)" "$(spiffe_for_sa dst-a)" "node-waypoint-udp-same-port-demux"
+    collect_traffic_failure_diagnostics
+    return 1
+  fi
+  hits_a="$(udp_backend_received "$WORKLOAD_NS" udp-demux-a demux-retract-a)"
+  if [[ "$hits_a" != "0" ]]; then
+    record_live_assertion node_waypoint.udp.same_port_demux_retract_a_keeps_b fail \
+      udp-src-a udp-demux-a "backend A still received demux-retract-a after Service delete" \
+      "$(spiffe_for_sa src-a)" "$(spiffe_for_sa dst-a)" "node-waypoint-udp-same-port-demux"
+    collect_traffic_failure_diagnostics
+    return 1
+  fi
+  if ! reply="$(wait_for_udp_outcome_on match "demux-b:demux-keep-b" \
+    "$WORKLOAD_NS" udp-src-a "$ip_b" "$DEMUX_UDP_PORT" demux-keep-b 40)"; then
+    record_live_assertion node_waypoint.udp.same_port_demux_retract_a_keeps_b fail \
+      udp-src-a udp-demux-b "B stopped serving after A was retracted observed=$reply" \
+      "$(spiffe_for_sa src-a)" "$(spiffe_for_sa dst-a)" "node-waypoint-udp-same-port-demux"
+    collect_traffic_failure_diagnostics
+    return 1
+  fi
+  hits_b="$(udp_backend_received "$WORKLOAD_NS" udp-demux-b demux-keep-b)"
+  hits_a="$(udp_backend_received "$WORKLOAD_NS" udp-demux-a demux-keep-b)"
+  restarts_after="$(ambient_restart_total)"
+  if [[ "$hits_b" == "0" || "$hits_a" != "0" || "$restarts_before" != "$restarts_after" ]]; then
+    record_live_assertion node_waypoint.udp.same_port_demux_retract_a_keeps_b fail \
+      udp-src-a udp-demux-b \
+      "hits_b=$hits_b hits_a=$hits_a restarts_before=$restarts_before restarts_after=$restarts_after" \
+      "$(spiffe_for_sa src-a)" "$(spiffe_for_sa dst-a)" "node-waypoint-udp-same-port-demux"
+    collect_traffic_failure_diagnostics
+    return 1
+  fi
+  record_live_assertion node_waypoint.udp.same_port_demux_retract_a_keeps_b pass \
+    udp-src-a udp-demux-b \
+    "A retracted cluster_ip=$ip_a; B still isolated on $ip_b; ambient restarts unchanged=$restarts_after" \
+    "$(spiffe_for_sa src-a)" "$(spiffe_for_sa dst-a)" "node-waypoint-udp-same-port-demux"
+}
+
+frontend_dtls_reload_generation() {
+  local file="$1"
+  python3 - "$file" <<'PY'
+import json
+import sys
+
+with open(sys.argv[1], encoding="utf-8") as fh:
+    data = json.load(fh)
+gen = ((data.get("stream_listeners") or {}).get("frontend_dtls_reload") or {}).get("generation")
+if gen is None:
+    sys.exit(1)
+print(gen)
+PY
+}
+
+overload_bind_failure_mentions_port() {
+  local file="$1" port="$2"
+  python3 - "$file" "$port" <<'PY'
+import json
+import sys
+
+with open(sys.argv[1], encoding="utf-8") as fh:
+    data = json.load(fh)
+port = int(sys.argv[2])
+for failure in (data.get("stream_listeners") or {}).get("bind_failures") or []:
+    if failure.get("listen_port") == port:
+        sys.exit(0)
+sys.exit(1)
+PY
+}
+
+health_ready() {
+  local file="$1"
+  python3 - "$file" <<'PY'
+import json
+import sys
+
+with open(sys.argv[1], encoding="utf-8") as fh:
+    data = json.load(fh)
+sys.exit(0 if data.get("ready") is True else 1)
+PY
+}
+
+# NodeWaypoint DTLS owner-scoped reload isolation (issue #3858): generated
+# dtls-echo moves PERMISSIVE → STRICT (current client CA required) for NEW
+# sessions; the ordinary operator-owned listener in the same process is not
+# mutated. Positive current-CA handshake plus stale/unauthenticated rejection.
+run_node_waypoint_dtls_reload_isolation_checks() {
+  log "running NodeWaypoint DTLS owner-scoped reload isolation checks (issue #3858)"
+  local listener_ip current_cert current_key stale_cert stale_key
+  local overload_before overload_after health_file report reply hits
+  local gen_before gen_after restarts_before restarts_after attempt payload snippet
+  local ambient_pod
+
+  listener_ip="$(node_waypoint_listener_ip)"
+  if [[ -z "$listener_ip" ]]; then
+    record_live_assertion node_waypoint.dtls.operator_listener_bound fail \
+      dtls-operator-src operator-dtls-echo "could not resolve a trusted node source address" \
+      "" "" "node-waypoint-dtls-operator"
+    return 1
+  fi
+  current_cert="$DTLS_CLIENT_MOUNT_PATH/current.crt"
+  current_key="$DTLS_CLIENT_MOUNT_PATH/current.key"
+  stale_cert="$DTLS_CLIENT_MOUNT_PATH/stale.crt"
+  stale_key="$DTLS_CLIENT_MOUNT_PATH/stale.key"
+  overload_before="$RESULTS_DIR/dtls-operator-overload-before.json"
+  overload_after="$RESULTS_DIR/dtls-operator-overload-after.json"
+  health_file="$RESULTS_DIR/dtls-operator-health.json"
+  ambient_pod="$(ambient_pod_on_node "$NODE_A")"
+  restarts_before="$(ambient_restart_total)"
+
+  if ! fetch_ambient_admin_json "$NODE_A" /health "$health_file" \
+    || ! health_ready "$health_file"; then
+    record_live_assertion node_waypoint.dtls.operator_listener_bound fail \
+      dtls-operator-src operator-dtls-echo "authenticated /health was not ready on $ambient_pod" \
+      "" "" "node-waypoint-dtls-operator"
+    collect_traffic_failure_diagnostics
+    return 1
+  fi
+  if ! fetch_ambient_admin_json "$NODE_A" /overload "$overload_before"; then
+    record_live_assertion node_waypoint.dtls.operator_listener_bound fail \
+      dtls-operator-src operator-dtls-echo "could not fetch authenticated /overload" \
+      "" "" "node-waypoint-dtls-operator"
+    collect_traffic_failure_diagnostics
+    return 1
+  fi
+  if overload_bind_failure_mentions_port "$overload_before" "$OPERATOR_DTLS_PORT"; then
+    record_live_assertion node_waypoint.dtls.operator_listener_bound fail \
+      dtls-operator-src operator-dtls-echo "operator listen_port $OPERATOR_DTLS_PORT is in bind_failures" \
+      "" "" "node-waypoint-dtls-operator"
+    collect_traffic_failure_diagnostics
+    return 1
+  fi
+  gen_before="$(frontend_dtls_reload_generation "$overload_before")" || gen_before=""
+  if [[ -z "$gen_before" ]]; then
+    record_live_assertion node_waypoint.dtls.operator_listener_bound fail \
+      dtls-operator-src operator-dtls-echo "frontend_dtls_reload.generation missing from /overload" \
+      "" "" "node-waypoint-dtls-operator"
+    collect_traffic_failure_diagnostics
+    return 1
+  fi
+
+  report=""
+  for ((attempt = 0; attempt < 20; attempt++)); do
+    report="$(dtls_handshake_report_from "$UNMANAGED_NS" dtls-operator-src "$listener_ip" \
+      "$OPERATOR_DTLS_PORT" 10 "$current_cert" "$current_key")"
+    if [[ "$report" == *ferrum-node-waypoint-dtls* ]]; then
+      break
+    fi
+    sleep 3
+  done
+  if [[ "$report" != *ferrum-node-waypoint-dtls* ]]; then
+    snippet="$(dtls_report_snippet "$report")"
+    record_live_assertion node_waypoint.dtls.operator_listener_bound fail \
+      dtls-operator-src operator-dtls-echo \
+      "no operator DTLS handshake on ${listener_ip}:${OPERATOR_DTLS_PORT}; last probe=${snippet}" \
+      "" "" "node-waypoint-dtls-operator"
+    collect_traffic_failure_diagnostics
+    return 1
+  fi
+  if ! reply="$(wait_for_dtls_echo_on "$UNMANAGED_NS" dtls-operator-src "$listener_ip" \
+    "$OPERATOR_DTLS_PORT" "operator-dtls-ok:" operator-dtls-a 20 \
+    "$current_cert" "$current_key")"; then
+    record_live_assertion node_waypoint.dtls.operator_listener_bound fail \
+      dtls-operator-src operator-dtls-echo "observed=$reply" \
+      "" "" "node-waypoint-dtls-operator"
+    collect_traffic_failure_diagnostics
+    return 1
+  fi
+  hits="$(dtls_backend_received "$UNMANAGED_NS" operator-dtls-echo operator-dtls-a)"
+  if [[ "$hits" == "0" ]]; then
+    record_live_assertion node_waypoint.dtls.operator_listener_bound fail \
+      dtls-operator-src operator-dtls-echo "handshake echoed but operator backend logged nothing" \
+      "" "" "node-waypoint-dtls-operator"
+    collect_traffic_failure_diagnostics
+    return 1
+  fi
+  record_live_assertion node_waypoint.dtls.operator_listener_bound pass \
+    dtls-operator-src operator-dtls-echo \
+    "pod=$ambient_pod generation=$gen_before backend_hits=$hits current-CA handshake presented ferrum-node-waypoint-dtls" \
+    "" "" "node-waypoint-dtls-operator"
+
+  reply="$(dtls_probe_from "$UNMANAGED_NS" dtls-operator-src "$listener_ip" \
+    "$OPERATOR_DTLS_PORT" operator-dtls-unauth 8)"
+  report="$(dtls_handshake_report_from "$UNMANAGED_NS" dtls-operator-src "$listener_ip" \
+    "$OPERATOR_DTLS_PORT" 10)"
+  hits="$(dtls_backend_received "$UNMANAGED_NS" operator-dtls-echo operator-dtls-unauth)"
+  if [[ "$reply" == *"operator-dtls-ok:operator-dtls-unauth"* || "$hits" != "0" ]] \
+    || ! dtls_handshake_failed "$report"; then
+    snippet="$(dtls_report_snippet "$report")"
+    record_live_assertion node_waypoint.dtls.operator_listener_rejects_unauthenticated fail \
+      dtls-operator-src operator-dtls-echo "observed=$reply backend_hits=$hits report=${snippet}" \
+      "" "" "node-waypoint-dtls-operator"
+    collect_traffic_failure_diagnostics
+    return 1
+  fi
+  record_live_assertion node_waypoint.dtls.operator_listener_rejects_unauthenticated pass \
+    dtls-operator-src operator-dtls-echo "unauthenticated client rejected; backend_hits=0" \
+    "" "" "node-waypoint-dtls-operator"
+
+  reply="$(dtls_probe_from "$UNMANAGED_NS" dtls-operator-src "$listener_ip" \
+    "$OPERATOR_DTLS_PORT" operator-dtls-stale 8 "$stale_cert" "$stale_key")"
+  report="$(dtls_handshake_report_from "$UNMANAGED_NS" dtls-operator-src "$listener_ip" \
+    "$OPERATOR_DTLS_PORT" 10 "$stale_cert" "$stale_key")"
+  hits="$(dtls_backend_received "$UNMANAGED_NS" operator-dtls-echo operator-dtls-stale)"
+  if [[ "$reply" == *"operator-dtls-ok:operator-dtls-stale"* || "$hits" != "0" ]] \
+    || ! dtls_handshake_failed "$report"; then
+    snippet="$(dtls_report_snippet "$report")"
+    record_live_assertion node_waypoint.dtls.operator_listener_rejects_stale_ca fail \
+      dtls-operator-src operator-dtls-echo "observed=$reply backend_hits=$hits report=${snippet}" \
+      "" "" "node-waypoint-dtls-operator"
+    collect_traffic_failure_diagnostics
+    return 1
+  fi
+  record_live_assertion node_waypoint.dtls.operator_listener_rejects_stale_ca pass \
+    dtls-operator-src operator-dtls-echo "stale client CA rejected; backend_hits=0" \
+    "" "" "node-waypoint-dtls-operator"
+
+  kubectl -n "$WORKLOAD_NS" get peerauthentication dtls-echo -o json | python3 -c '
+import json
+import sys
+
+obj = json.load(sys.stdin)
+spec = obj.get("spec") or {}
+spec.pop("portLevelMtls", None)
+spec["mtls"] = {"mode": "STRICT"}
+obj["spec"] = spec
+obj.pop("status", None)
+print(json.dumps(obj))
+' | kubectl apply -f -
+
+  payload=""
+  report=""
+  reply=""
+  for ((attempt = 0; attempt < 40; attempt++)); do
+    payload="dtls-reload-unauth-${attempt}"
+    reply="$(dtls_probe_from "$WORKLOAD_NS" dtls-src-a "$listener_ip" \
+      "$DTLS_LISTENER_PORT" "$payload" 6)"
+    hits="$(dtls_echo_backend_received "$payload")"
+    report="$(dtls_handshake_report_from "$WORKLOAD_NS" dtls-src-a "$listener_ip" \
+      "$DTLS_LISTENER_PORT" 8)"
+    if [[ "$reply" != *"dtls-ok:$payload"* && "$hits" == "0" ]] \
+      && dtls_handshake_failed "$report"; then
+      break
+    fi
+    sleep 3
+  done
+  if [[ "$reply" == *"dtls-ok:$payload"* || "$hits" != "0" ]] \
+    || ! dtls_handshake_failed "$report"; then
+    snippet="$(dtls_report_snippet "$report")"
+    record_live_assertion node_waypoint.dtls.reload_permissive_to_strict fail \
+      dtls-src-a dtls-echo "generated listener still admitted unauthenticated traffic observed=$reply hits=$hits report=${snippet}" \
+      "$(spiffe_for_sa src-a)" "$(spiffe_for_sa dst-a)" "node-waypoint-dtls-reload"
+    collect_traffic_failure_diagnostics
+    return 1
+  fi
+  record_live_assertion node_waypoint.dtls.reload_permissive_to_strict pass \
+    dtls-src-a dtls-echo "generated listener moved to STRICT; unauthenticated handshake failed closed" \
+    "$(spiffe_for_sa src-a)" "$(spiffe_for_sa dst-a)" "node-waypoint-dtls-reload"
+  record_live_assertion node_waypoint.dtls.reload_unauthenticated_rejected pass \
+    dtls-src-a dtls-echo "payload=$payload backend_hits=0 handshake failed" \
+    "$(spiffe_for_sa src-a)" "$(spiffe_for_sa dst-a)" "node-waypoint-dtls-reload"
+
+  if ! reply="$(wait_for_dtls_echo_on "$WORKLOAD_NS" dtls-src-a "$listener_ip" \
+    "$DTLS_LISTENER_PORT" "dtls-ok:" dtls-reload-current 20 \
+    "$current_cert" "$current_key")"; then
+    record_live_assertion node_waypoint.dtls.reload_current_ca_admitted fail \
+      dtls-src-a dtls-echo "observed=$reply" \
+      "$(spiffe_for_sa src-a)" "$(spiffe_for_sa dst-a)" "node-waypoint-dtls-reload"
+    collect_traffic_failure_diagnostics
+    return 1
+  fi
+  hits="$(dtls_echo_backend_received dtls-reload-current)"
+  report="$(dtls_handshake_report_from "$WORKLOAD_NS" dtls-src-a "$listener_ip" \
+    "$DTLS_LISTENER_PORT" 10 "$current_cert" "$current_key")"
+  if [[ "$hits" == "0" || "$report" != *ferrum-node-waypoint-dtls* ]]; then
+    snippet="$(dtls_report_snippet "$report")"
+    record_live_assertion node_waypoint.dtls.reload_current_ca_admitted fail \
+      dtls-src-a dtls-echo "backend_hits=$hits report=${snippet}" \
+      "$(spiffe_for_sa src-a)" "$(spiffe_for_sa dst-a)" "node-waypoint-dtls-reload"
+    collect_traffic_failure_diagnostics
+    return 1
+  fi
+  record_live_assertion node_waypoint.dtls.reload_current_ca_admitted pass \
+    dtls-src-a dtls-echo "current-CA handshake admitted; backend_hits=$hits" \
+    "$(spiffe_for_sa src-a)" "$(spiffe_for_sa dst-a)" "node-waypoint-dtls-reload"
+
+  reply="$(dtls_probe_from "$WORKLOAD_NS" dtls-src-a "$listener_ip" \
+    "$DTLS_LISTENER_PORT" dtls-reload-stale 8 "$stale_cert" "$stale_key")"
+  report="$(dtls_handshake_report_from "$WORKLOAD_NS" dtls-src-a "$listener_ip" \
+    "$DTLS_LISTENER_PORT" 10 "$stale_cert" "$stale_key")"
+  hits="$(dtls_echo_backend_received dtls-reload-stale)"
+  if [[ "$reply" == *"dtls-ok:dtls-reload-stale"* || "$hits" != "0" ]] \
+    || ! dtls_handshake_failed "$report"; then
+    snippet="$(dtls_report_snippet "$report")"
+    record_live_assertion node_waypoint.dtls.reload_stale_ca_rejected fail \
+      dtls-src-a dtls-echo "observed=$reply backend_hits=$hits report=${snippet}" \
+      "$(spiffe_for_sa src-a)" "$(spiffe_for_sa dst-a)" "node-waypoint-dtls-reload"
+    collect_traffic_failure_diagnostics
+    return 1
+  fi
+  record_live_assertion node_waypoint.dtls.reload_stale_ca_rejected pass \
+    dtls-src-a dtls-echo "stale client CA rejected on generated listener; backend_hits=0" \
+    "$(spiffe_for_sa src-a)" "$(spiffe_for_sa dst-a)" "node-waypoint-dtls-reload"
+
+  if ! fetch_ambient_admin_json "$NODE_A" /overload "$overload_after"; then
+    record_live_assertion node_waypoint.dtls.operator_isolated_across_reload fail \
+      dtls-operator-src operator-dtls-echo "could not fetch /overload after PeerAuthentication reload" \
+      "" "" "node-waypoint-dtls-operator"
+    collect_traffic_failure_diagnostics
+    return 1
+  fi
+  gen_after="$(frontend_dtls_reload_generation "$overload_after")" || gen_after=""
+  restarts_after="$(ambient_restart_total)"
+  if [[ "$gen_after" != "$gen_before" || "$restarts_before" != "$restarts_after" ]]; then
+    record_live_assertion node_waypoint.dtls.operator_isolated_across_reload fail \
+      dtls-operator-src operator-dtls-echo \
+      "operator generation or ambient restarts changed gen_before=$gen_before gen_after=$gen_after restarts_before=$restarts_before restarts_after=$restarts_after" \
+      "" "" "node-waypoint-dtls-operator"
+    collect_traffic_failure_diagnostics
+    return 1
+  fi
+  if ! reply="$(wait_for_dtls_echo_on "$UNMANAGED_NS" dtls-operator-src "$listener_ip" \
+    "$OPERATOR_DTLS_PORT" "operator-dtls-ok:" operator-dtls-after 20 \
+    "$current_cert" "$current_key")"; then
+    record_live_assertion node_waypoint.dtls.operator_isolated_across_reload fail \
+      dtls-operator-src operator-dtls-echo "operator current-CA handshake failed after mesh reload observed=$reply" \
+      "" "" "node-waypoint-dtls-operator"
+    collect_traffic_failure_diagnostics
+    return 1
+  fi
+  hits="$(dtls_backend_received "$UNMANAGED_NS" operator-dtls-echo operator-dtls-after)"
+  reply="$(dtls_probe_from "$UNMANAGED_NS" dtls-operator-src "$listener_ip" \
+    "$OPERATOR_DTLS_PORT" operator-dtls-after-unauth 8)"
+  local unauth_hits
+  unauth_hits="$(dtls_backend_received "$UNMANAGED_NS" operator-dtls-echo operator-dtls-after-unauth)"
+  if [[ "$hits" == "0" || "$reply" == *"operator-dtls-ok:operator-dtls-after-unauth"* \
+    || "$unauth_hits" != "0" ]]; then
+    record_live_assertion node_waypoint.dtls.operator_isolated_across_reload fail \
+      dtls-operator-src operator-dtls-echo \
+      "operator posture mutated current_hits=$hits unauth_observed=$reply unauth_hits=$unauth_hits" \
+      "" "" "node-waypoint-dtls-operator"
+    collect_traffic_failure_diagnostics
+    return 1
+  fi
+  record_live_assertion node_waypoint.dtls.operator_isolated_across_reload pass \
+    dtls-operator-src operator-dtls-echo \
+    "operator generation=$gen_after unchanged; current-CA still admitted; unauthenticated still rejected; ambient restarts=$restarts_after" \
+    "" "" "node-waypoint-dtls-operator"
+}
+
 cleanup() {
   if [[ "$TOPOLOGY_ROUTE_MUTATED" == "true" && -n "$TOPOLOGY_ROUTE_NODE" \
     && -f "$TOPOLOGY_ROUTE_STATE_FILE" ]]; then
@@ -4909,8 +5704,10 @@ wait_for_node_waypoint_ready_markers
 wait_for_ambient_mesh_slice
 run_traffic_checks
 run_node_waypoint_udp_datapath_checks
+run_node_waypoint_udp_same_port_demux_checks
 run_node_waypoint_dtls_datapath_checks
 run_node_waypoint_dtls_service_path_checks
+run_node_waypoint_dtls_reload_isolation_checks
 run_ipv6_checks
 ferrum_live_assertions_require_all_passed "$LIVE_ASSERTIONS_FILE" "${REQUIRED_LIVE_ASSERTIONS[@]}"
 

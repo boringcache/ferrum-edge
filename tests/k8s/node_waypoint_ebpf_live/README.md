@@ -133,6 +133,30 @@ these datagrams. Assertions, all observed from the datagram outcome:
   DaemonSet's total container restart count unchanged, so recovery is a live
   reload rather than a data-plane restart.
 
+## Same-port UDP Service demultiplexing (issue #3861)
+
+`run_node_waypoint_udp_same_port_demux_checks` drives two compatible plain-UDP
+Services (`udp-demux-a` / `udp-demux-b`) that share one numeric port (default
+`15355`) with distinct ClusterIPs and distinct echo prefixes. The NodeWaypoint
+binds that port once and demultiplexes by the kernel-reported local destination.
+Every assertion requires the matching backend log line; a timeout with no
+backend hit cannot pass.
+
+- `node_waypoint.udp.same_port_demux_serves_a` /
+  `node_waypoint.udp.same_port_demux_serves_b` — each ClusterIP reaches only its
+  own backend through the NodeWaypoint path.
+- `node_waypoint.udp.same_port_demux_isolated` — A's payload never appears on B
+  and B's payload never appears on A.
+- `node_waypoint.udp.same_port_demux_shared_client_tuple` — one bound client
+  socket addresses both ClusterIPs without session/pending collision.
+- `node_waypoint.udp.same_port_demux_retract_a_keeps_b` — deleting Service A
+  retracts A (saved ClusterIP times out, backend A logs nothing for the retract
+  payload) while B continues serving, still isolated, with the ambient restart
+  count unchanged.
+
+IPv6 same-port UDP is not claimed here: stream listeners bind `0.0.0.0` by
+default, and IPv6 Service steering remains a documented residual.
+
 ## NodeWaypoint DTLS listener datapath (issue #3286)
 
 `run_node_waypoint_dtls_datapath_checks` drives a **real DTLS handshake and real
@@ -154,10 +178,11 @@ keeps the original host-netns destination.
 The listener terminates with material the harness mints per run and publishes as
 a TLS Secret mounted through `ambient.extraVolumes` /
 `ambient.extraVolumeMounts`, referenced by `FERRUM_DTLS_CERT_PATH` /
-`FERRUM_DTLS_KEY_PATH` (`FERRUM_LIVE_DTLS_LISTENER_PORT`, default `15354`). The
-server certificate is deliberately not verified by the client: the subject under
-test is the datagram datapath and its scoped source authorization, not PKI
-trust.
+`FERRUM_DTLS_KEY_PATH` / `FERRUM_DTLS_CLIENT_CA_CERT_PATH`
+(`FERRUM_LIVE_DTLS_LISTENER_PORT`, default `15354`). Initial datapath checks
+are still server-only (PERMISSIVE `portLevelMtls` on `dtls-echo`); the reload
+checks below present current/stale client certificates. The server certificate
+is deliberately not verified by the client.
 
 - `node_waypoint.dtls.listener_bound` — a DTLS 1.2 handshake completes against
   `<trusted node source IP>:$FERRUM_LIVE_DTLS_LISTENER_PORT` (same probe address
@@ -203,14 +228,45 @@ arriving from any other address.
   nothing: its datagram takes the pre-existing path and dies at the pod-veth
   guard.
 
-Not exercised live, and therefore not claimed: DTLS frontend
-client-certificate (mTLS) verification, IPv6 DTLS (and IPv6 Service steering),
-kube-proxy `ipvs` and `nftables` modes, headless services, and DTLS across a
-PeerAuthentication live-reload swap. Those stay at unit/integration level.
-The live `dtls-echo` Service port is pinned `PERMISSIVE` via a selector-scoped
-`portLevelMtls` overlay so namespace-wide STRICT (TCP/HBONE) cannot demand a
-DTLS client CA the harness does not mount; AuthorizationPolicy allow/deny is
-unchanged.
+## NodeWaypoint DTLS owner-scoped reload isolation (issue #3858)
+
+`run_node_waypoint_dtls_reload_isolation_checks` runs after the PERMISSIVE
+generated-listener checks. The harness enables
+`FERRUM_MESH_PEER_AUTH_LIVE_RELOAD_ENABLED` and mounts a current client CA plus
+an ordinary operator-owned DTLS listener (`operator-dtls-live` on port `15356`,
+re-injected each slice apply from sibling `operator-gateway.yaml`). The
+operator client and backend live in the unmanaged namespace so unmarked replies
+are not dropped by the enrolled-pod veth guard.
+
+- `node_waypoint.dtls.operator_listener_bound` — current-CA handshake against
+  the operator listener presents `ferrum-node-waypoint-dtls`, the unmanaged
+  backend logs the plaintext datagram, authenticated `/health` is ready, and
+  `/overload` bind_failures do not name the operator port.
+- `node_waypoint.dtls.operator_listener_rejects_unauthenticated` /
+  `node_waypoint.dtls.operator_listener_rejects_stale_ca` — no client cert and a
+  stale-CA client are rejected, with backend_hits=0.
+- `node_waypoint.dtls.reload_permissive_to_strict` /
+  `node_waypoint.dtls.reload_unauthenticated_rejected` — applying the
+  `dtls-echo` PeerAuthentication to STRICT (removing the PERMISSIVE
+  `portLevelMtls` overlay) makes new unauthenticated sessions fail closed on
+  the generated listener.
+- `node_waypoint.dtls.reload_current_ca_admitted` /
+  `node_waypoint.dtls.reload_stale_ca_rejected` — the generated listener admits
+  the current client CA and rejects the stale CA, with backend logs as
+  authority.
+- `node_waypoint.dtls.operator_isolated_across_reload` — operator
+  `frontend_dtls_reload.generation` and ambient restart count are unchanged
+  across that mesh reload; the operator listener still admits current-CA and
+  still rejects unauthenticated clients.
+
+Not exercised live, and therefore not claimed: IPv6 DTLS (and IPv6 Service
+steering), kube-proxy `ipvs` and `nftables` modes, headless services, and
+multiple terminating-DTLS claimants on one port. Those stay at
+unit/integration level or documented residuals.
+The live `dtls-echo` Service port starts `PERMISSIVE` via a selector-scoped
+`portLevelMtls` overlay so the earlier datapath checks can handshake without a
+client cert; the reload sequence then promotes that overlay to STRICT.
+AuthorizationPolicy allow/deny is unchanged.
 
 Each run writes `target/node-waypoint-ebpf-live/live-assertions.json` using the
 shared live-assertion schema from `tests/k8s/lib/live_assertions.sh`. The current

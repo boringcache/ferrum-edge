@@ -407,9 +407,14 @@ need them, or because they are blocked upstream / architecturally:
   `dtls` listener stays visibly deferred (`FrontendDtlsDeferred`) rather than
   binding.
 
-  Still **not** proven live: DTLS client-certificate (mTLS) frontend
-  verification, IPv6 DTLS, and DTLS behavior across a PeerAuthentication
-  live-reload swap. Those remain unit/integration-level only.
+  Still **not** proven live: IPv6 DTLS, kube-proxy `ipvs`/`nftables` DTLS
+  steering, headless UDP/DTLS Services, and multiple terminating-DTLS
+  claimants on one port. DTLS client-certificate (mTLS) frontend verification
+  and PeerAuthentication live-reload isolation for generated vs operator-owned
+  listeners are proven by the `node-waypoint-ebpf-live` assertions
+  `node_waypoint.dtls.reload_*` / `node_waypoint.dtls.operator_*`. Same-port
+  plain-UDP Service demultiplexing is proven by
+  `node_waypoint.udp.same_port_demux_*`.
 - **DR `connectionPool.http.maxRequestsPerConnection`** — parsed and validated
   but **Deferred** in status; backend close-after-N-requests is unsupported, so
   it is not projected as effective policy. Use `maxConcurrentStreams` for

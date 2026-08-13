@@ -1419,8 +1419,9 @@ impl MeshAuthz {
         let relay_policy_superset_condition_keys =
             ConditionAttributeKeys::from_policies(&relay_policy_superset);
         // Whether any namespace/selector-scoped (non-mesh-wide) policy is loaded.
-        // The stream path fails closed on a missing per-pod scope only when such
-        // policies exist; otherwise mesh-wide-only evaluation is complete.
+        // Generated NodeWaypoint UDP/DTLS listeners fail closed on a missing
+        // per-pod scope only when such policies exist; ordinary operator stream
+        // listeners fall through to mesh-wide-only evaluation (issue #3858).
         let has_scoped_policies = per_pod_policy_scoping
             && slice.mesh_policies.iter().any(|policy| {
                 // Only ENFORCING scoped policies justify failing closed on a
@@ -3121,14 +3122,18 @@ impl Plugin for MeshAuthz {
             let scope = ctx.node_waypoint_policy_scope.as_deref();
             if scope.is_none() {
                 metadata.insert("mesh_authz.scope_missing".to_string(), "true".to_string());
-                // Fail closed ONLY when namespace/selector-scoped policies exist:
-                // without the per-pod scope we cannot prove they don't apply, so
-                // rejecting is the safe default. A mesh with only mesh-wide
-                // policies is fully evaluable, so fall through to mesh-wide-only
-                // evaluation (matching the HTTP path) instead of rejecting all
-                // stream traffic. `Reject` is the variant the stream accept loops
-                // honor; `RejectBinary` would be silently dropped by them.
-                if self.has_scoped_policies {
+                // Fail closed ONLY for Ferrum-generated NodeWaypoint UDP/DTLS
+                // listeners (issue #3286 / #3858). Those sockets attribute
+                // source pods from the ingress interface; without a per-pod
+                // scope we cannot prove namespace/selector-scoped policies do
+                // not apply. An ordinary operator `FERRUM_DTLS_*` listener in
+                // the same process has no attribution channel and must not
+                // inherit that gate — missing scope there is expected, and
+                // mesh-wide-only evaluation (the branch below) is the correct
+                // isolation boundary.
+                if self.has_scoped_policies
+                    && crate::modes::mesh::is_node_waypoint_udp_listener_id(&ctx.proxy_id)
+                {
                     metadata.insert(
                         "mesh_authz.deny_policy".to_string(),
                         "scope_missing".to_string(),

@@ -259,13 +259,15 @@ spec:
   mtls:
     mode: STRICT
 ---
-# Live DTLS probes are server-only (`openssl s_client -dtls1_2` without a
-# client certificate). Namespace-wide STRICT is the TCP/HBONE mTLS default and
-# would otherwise leave the generated dtls-echo listener deferred: STRICT DTLS
-# requires FERRUM_DTLS_CLIENT_CA_CERT_PATH, which this harness does not set.
-# Pin the dtls-echo port to PERMISSIVE so the listener starts without
-# client-cert verification; TCP STRICT and AuthorizationPolicy are unchanged.
-# DTLS frontend mTLS stays unit/integration.
+# Initial live DTLS probes are server-only (`openssl s_client -dtls1_2`
+# without a client certificate). Namespace-wide STRICT is the TCP/HBONE mTLS
+# default; pin the dtls-echo port to PERMISSIVE so those checks can bind and
+# handshake without a client cert. The harness DOES mount
+# FERRUM_DTLS_CLIENT_CA_CERT_PATH; `run_node_waypoint_dtls_reload_isolation_checks`
+# later applies this PeerAuthentication to STRICT and proves generated
+# listeners demand the current client CA while the operator-owned DTLS
+# listener in the same process is unchanged. TCP STRICT and AuthorizationPolicy
+# are unchanged.
 apiVersion: security.istio.io/v1beta1
 kind: PeerAuthentication
 metadata:
@@ -446,6 +448,123 @@ spec:
           image: python:3.12-alpine
           command: ["sh", "-c", "sleep 365d"]
 ---
+# ── Same-port UDP Service demultiplexing (issue #3861) ───────────────────────
+#
+# Two compatible plain-UDP Services with DISTINCT ClusterIPs on the SAME
+# numeric port. The NodeWaypoint binds that port once and demultiplexes by the
+# kernel-reported local destination (IP_PKTINFO). Distinct echo prefixes and
+# backend logs make isolation non-vacuous: a datagram to A must reach only A.
+# Both backends sit on node A so the same NodeWaypoint child owns both routes.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: udp-demux-a
+  namespace: __NAMESPACE__
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: udp-demux-a
+  template:
+    metadata:
+      labels:
+        app: udp-demux-a
+        ferrum.io/mesh: enabled
+    spec:
+      serviceAccountName: dst-a
+      nodeSelector:
+        ferrum.io/live-node: a
+      containers:
+        - name: udp
+          image: python:3.12-alpine
+          ports:
+            - containerPort: __DEMUX_UDP_PORT__
+              protocol: UDP
+          command:
+            - python
+            - -u
+            - -c
+            - |
+              import socket
+
+              s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+              s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+              s.bind(("0.0.0.0", __DEMUX_UDP_PORT__))
+              while True:
+                  data, peer = s.recvfrom(2048)
+                  print("recv:" + data.decode("utf-8", "replace"), flush=True)
+                  s.sendto(b"demux-a:" + data, peer)
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: udp-demux-a
+  namespace: __NAMESPACE__
+spec:
+  selector:
+    app: udp-demux-a
+  __SERVICE_IP_FAMILY_BLOCK__
+  ports:
+    - name: udp
+      port: __DEMUX_UDP_PORT__
+      targetPort: __DEMUX_UDP_PORT__
+      protocol: UDP
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: udp-demux-b
+  namespace: __NAMESPACE__
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: udp-demux-b
+  template:
+    metadata:
+      labels:
+        app: udp-demux-b
+        ferrum.io/mesh: enabled
+    spec:
+      serviceAccountName: dst-a
+      nodeSelector:
+        ferrum.io/live-node: a
+      containers:
+        - name: udp
+          image: python:3.12-alpine
+          ports:
+            - containerPort: __DEMUX_UDP_PORT__
+              protocol: UDP
+          command:
+            - python
+            - -u
+            - -c
+            - |
+              import socket
+
+              s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+              s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+              s.bind(("0.0.0.0", __DEMUX_UDP_PORT__))
+              while True:
+                  data, peer = s.recvfrom(2048)
+                  print("recv:" + data.decode("utf-8", "replace"), flush=True)
+                  s.sendto(b"demux-b:" + data, peer)
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: udp-demux-b
+  namespace: __NAMESPACE__
+spec:
+  selector:
+    app: udp-demux-b
+  __SERVICE_IP_FAMILY_BLOCK__
+  ports:
+    - name: udp
+      port: __DEMUX_UDP_PORT__
+      targetPort: __DEMUX_UDP_PORT__
+      protocol: UDP
+---
 # ── NodeWaypoint DTLS listener datapath (issue #3286) ────────────────────────
 #
 # `dtls-echo` is the DTLS counterpart of `udp-echo`: the SAME `protocol: UDP` L4
@@ -550,6 +669,14 @@ spec:
           image: __DTLS_CLIENT_IMAGE__
           imagePullPolicy: IfNotPresent
           command: ["sh", "-c", "sleep 365d"]
+          volumeMounts:
+            - name: dtls-clients
+              mountPath: /etc/ferrum/dtls-clients
+              readOnly: true
+      volumes:
+        - name: dtls-clients
+          secret:
+            secretName: __DTLS_CLIENT_CERT_SECRET__
 ---
 apiVersion: apps/v1
 kind: Deployment
