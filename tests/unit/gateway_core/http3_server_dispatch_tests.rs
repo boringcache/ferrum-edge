@@ -1534,24 +1534,51 @@ fn streaming_h3_grpc_web_dispatch_is_bounded_before_response_headers() {
         .split("async fn dispatch_grpc<S>(")
         .next()
         .expect("bounded cross-protocol plain dispatcher");
+    // The streaming upload/backend-response race runs under the COMPOSED bound
+    // `plain_write_bound` — the client's optional gRPC-Web deadline together
+    // with the admitted credential's authorization lifetime (issue #3815) — so
+    // a plain HTTP client with no RPC deadline is bounded too.
     let bridge = dispatch
-        .split("let send_result = {")
+        .split("let send_result = if plain_write_bound")
         .nth(1)
         .expect("streaming upload/backend response race");
+    // An ALREADY-elapsed composed bound must not poll the race at all: the
+    // backend send and the frontend reader are both dropped, and the owner is
+    // read from the captured composition rather than from a second clock read.
+    let refusal = bridge
+        .split("} else {")
+        .next()
+        .expect("bounded already-elapsed refusal arm");
+    assert!(
+        refusal.contains("tokio::time::Instant::now() >= at"),
+        "an already-elapsed composed bound must refuse before polling the race"
+    );
+    assert!(
+        refusal.contains("plain_write_bound.expired_authorization()"),
+        "the refusal must attribute from the captured composition"
+    );
     let deadline = bridge
-        .find("_ = &mut grpc_web_deadline")
-        .expect("absolute gRPC-Web deadline arm");
+        .find("_ = &mut upload_deadline, if upload_deadline_active =>")
+        .expect("composed authorization/deadline arm");
     let response = bridge
         .find("result = &mut send_future")
         .expect("backend response-header arm");
     assert!(bridge[..deadline].contains("biased;"));
     assert!(
         deadline < response,
-        "a simultaneous backend response must not outlive the RPC deadline"
+        "a simultaneous backend response must not outlive the composed bound"
+    );
+    assert!(
+        bridge[deadline..response].contains("plain_write_bound.expired_authorization()"),
+        "the winning owner must be captured before the race breaks"
     );
     assert!(bridge[deadline..response].contains("drop(pending_slot.take());"));
     assert!(bridge[deadline..response].contains("break None;"));
     assert!(bridge.contains("halt_request_body(stream);"));
+    // No response header was committed, so an authorization expiry takes the
+    // fixed `401` pre-commitment terminal while the client's own gRPC-Web
+    // deadline keeps its own.
+    assert!(bridge.contains("write_plain_authorization_expired_terminal("));
     assert!(bridge.contains("record_plain_grpc_web_client_deadline("));
     assert!(bridge.contains("write_plain_grpc_web_client_deadline("));
 }

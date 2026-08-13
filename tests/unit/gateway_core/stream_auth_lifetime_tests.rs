@@ -2042,9 +2042,38 @@ fn the_authorized_buffered_collect_composes_its_protocol_bound_exactly_once() {
         0,
         "the deadline-composing entry point would compose a second time"
     );
-    // The single parameter, threaded to the unauthenticated wait, the
-    // arm-selection comparison, and the authorized wait — never recomputed.
-    assert_eq!(wait.matches("protocol_bound").count(), 4);
+    // The single parameter, threaded to the unauthenticated wait and to the ONE
+    // authenticated `match` — never recomputed. Three uses, not four: the
+    // arm-selection comparison and the awaited bound are the same `match`, so
+    // they destructure one instant instead of reading the parameter twice.
+    assert_eq!(wait.matches("protocol_bound").count(), 3);
+    // What the count alone cannot show: the instant that is COMPARED against
+    // the credential deadline is literally the instant that is AWAITED. A
+    // second read of the composition (or of the clock) between the two is the
+    // fail-closed race this seam exists to prevent.
+    let authenticated = wait
+        .split("match protocol_bound {")
+        .nth(1)
+        .expect("the authenticated arm selection");
+    assert!(
+        authenticated.contains("Some((at, kind)) if at < plan.at => {"),
+        "arm selection must destructure the composed bound rather than recompose it"
+    );
+    assert!(
+        authenticated.contains("await_deadline_first(Some(at), collect)"),
+        "the protocol-earlier arm must await the very instant it just compared"
+    );
+    assert!(
+        authenticated.contains("await_deadline_first(Some(plan.at), collect)"),
+        "the authorization arm must await the captured credential deadline"
+    );
+    // Expiry-first on BOTH arms: `timeout_at` polls a ready upload before its
+    // timer, so an already-elapsed bound would still accept a buffered FIN.
+    assert_eq!(
+        wait.matches("timeout_at(").count(),
+        0,
+        "an already-elapsed bound must refuse without polling the collect"
+    );
 }
 
 #[test]
@@ -3789,10 +3818,18 @@ fn the_h3_grpc_response_head_write_is_bounded_by_the_composed_deadline() {
 /// A stalled (never-ready) streaming response HEADERS write expires at the
 /// authorization deadline, latches exactly once, and never treats the write as
 /// committed.
+///
+/// Exactly-once is asserted on the REQUEST-OWNED latch rather than on the
+/// process-global termination counters. `record_once` performs its single
+/// increment only for the caller that wins the latch CAS, so the latch is where
+/// the invariant actually lives — and `credential_expired["http"]` is driven
+/// concurrently by other suites in this binary (the body-termination tests
+/// reach it through production paths and never take this file's guard), so an
+/// exact global delta on the `http` family is not this test's to claim. Every
+/// other exact-delta assertion in this file deliberately uses `stream_tcp` or
+/// `stream_udp` for that reason.
 #[tokio::test(start_paused = true)]
 async fn a_stalled_h3_streaming_headers_write_expires_at_the_authorization_deadline() {
-    let _guard = counter_delta_guard().await;
-    let before = counters();
     let now = tokio::time::Instant::now();
     let plan = plan_at(
         now + Duration::from_secs(2),
@@ -3822,14 +3859,18 @@ async fn a_stalled_h3_streaming_headers_write_expires_at_the_authorization_deadl
         latch.observed(),
         Some(StreamAuthTermination::CredentialExpired)
     );
-    let after = counters();
-    assert_eq!(
-        after.credential_expired["http"] - before.credential_expired["http"],
-        1,
-        "HEADERS expiry must record through the request latch exactly once"
+    // The latch started fresh, so the awaited write is what claimed it — and a
+    // claimed latch refuses every further record, which is precisely the one
+    // counter increment `record_once` is allowed to make for this request.
+    assert!(
+        !latch.record_once(
+            StreamAuthTermination::CredentialExpired,
+            StreamAuthProtocolFamily::Http
+        ),
+        "the HEADERS expiry must already own this request's single termination record"
     );
 
-    // A second observer of the same expired bound must not increment again.
+    // A second observer of the same expired bound must not record again.
     let second = await_authorized_headers_write_for_test(
         bound,
         StreamAuthProtocolFamily::Http,
@@ -3841,10 +3882,16 @@ async fn a_stalled_h3_streaming_headers_write_expires_at_the_authorization_deadl
         second,
         H3AuthorizedHeadersWrite::AuthorizationExpired(StreamAuthTermination::CredentialExpired)
     );
-    let after_second = counters();
     assert_eq!(
-        after_second.credential_expired["http"] - after.credential_expired["http"],
-        0,
+        latch.observed(),
+        Some(StreamAuthTermination::CredentialExpired),
+        "a second HEADERS expiry must not relatch a different class"
+    );
+    assert!(
+        !latch.record_once(
+            StreamAuthTermination::CredentialExpired,
+            StreamAuthProtocolFamily::Http
+        ),
         "a second HEADERS expiry on the same latch must not double-count"
     );
 }

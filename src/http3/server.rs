@@ -164,9 +164,9 @@ where
             // expiry; it is never consulted to CHOOSE between the owners.
             match crate::plugins::await_deadline_first(Some(effective_deadline), collect).await {
                 Ok(result) => result.map_err(H3RequestBodyReadError::Read),
-                Err(()) => Err(H3RequestBodyReadError::DeadlineExceeded(
-                    bound.expired_authorization(),
-                )),
+                Err(()) => {
+                    Err(H3RequestBodyReadError::DeadlineExceeded(bound.expired_authorization()))
+                }
             }
         }
         None => collect_h3_request_body_with_timeout(collect, request_body_read_timeout_ms).await,
@@ -12965,12 +12965,9 @@ async fn dispatch_grpc_native_h3(
                     result = backend_recv.recv_trailers() => Ok(result),
                 }
             };
-            let trailer_wait_result = match crate::plugins::await_deadline_first(
-                trailer_wait_at,
-                trailer_fut,
-            )
-            .await
-            {
+            let trailer_waited =
+                crate::plugins::await_deadline_first(trailer_wait_at, trailer_fut).await;
+            let trailer_wait_result = match trailer_waited {
                 Ok(result) => result,
                 Err(()) => match trailer_bound.expired_authorization() {
                     Some(termination) => {
