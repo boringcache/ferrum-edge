@@ -980,10 +980,7 @@ fn native_probe_classifier_contract_violations(
             "is_dns1123_label",
             "Kubernetes-safe pod/node identity validation",
         ),
-        (
-            "is_pod_ip",
-            "Kubernetes-safe pod IP validation",
-        ),
+        ("is_pod_ip", "Kubernetes-safe pod IP validation"),
     ] {
         if !helper.contains(needle) {
             errors.push(format!(
@@ -1047,15 +1044,11 @@ classify_native_probe() {
   fi
 }
 "#;
-    let generic_violations = native_probe_classifier_contract_violations(
-        generic_cp_grep,
-        HELPER,
-        MANIFESTS,
-    );
+    let generic_violations =
+        native_probe_classifier_contract_violations(generic_cp_grep, HELPER, MANIFESTS);
     assert!(
         generic_violations.iter().any(|error| {
-            error.contains("generic CP-log matching")
-                || error.contains("native_probe_classify.py")
+            error.contains("generic CP-log matching") || error.contains("native_probe_classify.py")
         }),
         "contract must reject generic ferrum-cp reason greps, got {generic_violations:?}"
     );
