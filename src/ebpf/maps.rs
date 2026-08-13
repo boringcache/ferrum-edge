@@ -544,10 +544,12 @@ impl BpfMaps {
     /// authorized than intended. The reverse order would let a failed insert
     /// return an error while a revoked ClusterIP stayed live.
     ///
-    /// Absent maps are a **hard error** when there is anything to authorize:
-    /// silently succeeding would let the proxy believe its replies are admitted
-    /// while this node's own guard drops every one of them. Revoking against an
-    /// absent map is a no-op so teardown still succeeds on an older ELF.
+    /// **BOTH families must be present for every generation**, even when the
+    /// complete desired set (or one family's share of it) is empty: the caller
+    /// acknowledges a whole IPv4+IPv6 generation as applied, and an absent map
+    /// means there is no proof that family was scanned and emptied. A v4-only
+    /// set on an ELF missing `FERRUM_UDP_REPLY_SOURCES6`, or an empty generation
+    /// on either missing map, must therefore NOT report success.
     ///
     /// A key-iteration error is likewise a hard error, never skipped: the scan
     /// is what finds the entries to revoke, so swallowing it would report a
@@ -558,6 +560,14 @@ impl BpfMaps {
                 "refusing to publish {} NodeWaypoint UDP reply sources; the map holds at most {}",
                 sources.len(),
                 UDP_REPLY_SOURCE_MAX_ENTRIES
+            ));
+        }
+        if self.udp_reply_sources.is_none() || self.udp_reply_sources6.is_none() {
+            return Err(format!(
+                "refusing to authorize NodeWaypoint UDP/DTLS reply sources: {} and \
+                 {} must both be present, and at least one is absent from the loaded program",
+                BPF_MAP_UDP_REPLY_SOURCES,
+                BPF_MAP_UDP_REPLY_SOURCES6
             ));
         }
 
@@ -729,11 +739,8 @@ where
     K: aya::Pod + PartialEq,
 {
     let Some(map) = map else {
-        if desired.is_empty() {
-            return Ok(());
-        }
         return Err(format!(
-            "{map_name} map is absent; cannot authorize NodeWaypoint UDP/DTLS reply sources"
+            "{map_name} map is absent; cannot apply a NodeWaypoint UDP/DTLS reply-source generation"
         ));
     };
 

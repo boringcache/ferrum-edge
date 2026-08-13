@@ -1382,12 +1382,16 @@ fn a_withdrawn_or_disabled_generation_clears_desired_steering_metadata() {
 // every steered reply — the datapath the live gate's
 // `node_waypoint.udp.service_path_allow_attributed_source` exercises.
 //
-// The repair is an exact, lifecycle-bound authorization: the serving proxy
-// publishes `(address, port)` claims into the pod registry directory, and the
-// node-agent — still the sole writer of every BPF map, because the proxy's
-// bpffs mount is deliberately read-only — reconciles them into
-// `FERRUM_UDP_REPLY_SOURCES` / `FERRUM_UDP_REPLY_SOURCES6`. These tests pin the
-// node-agent half of that contract end to end, against the real publisher.
+// The repair is an exact, lifecycle-bound authorization with a PROOF: the
+// serving proxy publishes one atomically renamed generation into the pod
+// registry directory, and the node-agent — still the sole writer of every BPF
+// map, because the proxy's bpffs mount is deliberately read-only — applies it
+// to `FERRUM_UDP_REPLY_SOURCES` / `FERRUM_UDP_REPLY_SOURCES6` and only then
+// acknowledges THAT generation. Publishing a claim is not evidence that a map
+// holds it; the acknowledgement is what the proxy gates its steering rules on,
+// so a generation this agent refused, narrowed, or could not apply must never
+// carry one. These tests pin the node-agent half of that contract end to end,
+// against the real publisher.
 
 use dashmap::DashMap;
 use ferrum_edge::capture::{CaptureConfig, CaptureMode, NodeWaypointUdpSteerDestination};
@@ -1399,8 +1403,10 @@ use ferrum_edge::modes::node_agent::{
     node_waypoint_udp_reply_source_reconcile_enabled, reconcile_node_waypoint_udp_reply_sources,
 };
 use ferrum_edge::proxy::node_waypoint_udp_reply_source::{
+    NODE_WAYPOINT_UDP_REPLY_SOURCE_APPLIED_FILE, NODE_WAYPOINT_UDP_REPLY_SOURCE_DESIRED_FILE,
     NODE_WAYPOINT_UDP_REPLY_SOURCE_DIR, NodeWaypointUdpReplySourcePublisher,
-    RegistryDirReplySourcePublisher,
+    RegistryDirReplySourcePublisher, ReplySourceGeneration, read_acknowledgement,
+    read_desired_generation,
 };
 
 fn reply_source(ip: &str, port: u16) -> NodeWaypointUdpSteerDestination {
@@ -1453,15 +1459,33 @@ fn authorized(backend: &MockEbpfBackend) -> Vec<(std::net::IpAddr, u16)> {
     sources
 }
 
+/// The generation the proxy is currently asking for, as the node-agent reads it.
+fn desired_generation(registry: &std::path::Path) -> ReplySourceGeneration {
+    read_desired_generation(registry)
+        .expect("read desired generation")
+        .expect("a generation is published")
+        .generation
+}
+
+fn acknowledgement(registry: &std::path::Path) -> Option<ReplySourceGeneration> {
+    read_acknowledgement(registry).expect("read acknowledgement")
+}
+
 /// The reconciliation the live Service path depends on: what the serving proxy
-/// published is exactly what becomes authorized, on BOTH families.
+/// published is exactly what becomes authorized, on BOTH families — and the
+/// generation is acknowledged only once that is true.
 #[test]
-fn published_claims_become_the_authorized_reply_source_set() {
+fn a_published_generation_is_applied_then_acknowledged() {
     let registry = tempfile::tempdir().expect("registry dir");
     let publisher = RegistryDirReplySourcePublisher::new(registry.path());
     let v4 = reply_source("10.96.0.10", 5300);
     let v6 = reply_source("fd00:10:96::a", 5300);
-    publisher.publish(&[v4, v6]).expect("publication");
+    let generation = publisher.publish(&[v4, v6]).expect("publication");
+    assert_eq!(
+        acknowledgement(registry.path()),
+        None,
+        "nothing is acknowledged until the node-agent has run"
+    );
 
     let mut backend = MockEbpfBackend::default();
     let pods = DashMap::new();
@@ -1469,18 +1493,21 @@ fn published_claims_become_the_authorized_reply_source_set() {
     let mut state = NodeWaypointUdpReplySourceState::default();
     reconcile_node_waypoint_udp_reply_sources(&mut backend, &config, &pods, &mut state);
 
-    assert_eq!(authorized(&backend), {
-        let mut expected = vec![(v4.ip, v4.port), (v6.ip, v6.port)];
-        expected.sort();
-        expected
-    });
+    let mut expected = vec![(v4.ip, v4.port), (v6.ip, v6.port)];
+    expected.sort();
+    assert_eq!(authorized(&backend), expected);
+    assert_eq!(
+        acknowledgement(registry.path()),
+        Some(generation),
+        "the acknowledgement names exactly the generation whose whole set is live"
+    );
 }
 
-/// Retraction is the security-relevant half. A listener that stopped serving
-/// must lose its authorization; retaining it would leave a ClusterIP admissible
-/// to enrolled pods with no socket behind it.
+/// The whole point of the manifest: the node-agent applies a coherent SET. A
+/// generation observed mid-rewrite as a partial set would be acknowledged as
+/// complete, which is exactly the steered black hole this channel closes.
 #[test]
-fn withdrawing_a_claim_revokes_its_authorization() {
+fn a_partially_rewritten_generation_is_never_acknowledged() {
     let registry = tempfile::tempdir().expect("registry dir");
     let publisher = RegistryDirReplySourcePublisher::new(registry.path());
     let kept = reply_source("10.96.0.11", 5301);
@@ -1495,27 +1522,82 @@ fn withdrawing_a_claim_revokes_its_authorization() {
     reconcile_node_waypoint_udp_reply_sources(&mut backend, &config, &pods, &mut state);
     assert_eq!(authorized(&backend).len(), 2);
 
-    publisher.publish(&[kept]).expect("withdrawal");
+    // Simulate a torn write: a manifest whose declared count exceeds its body.
+    // A per-file claim directory could not even detect this; here it refuses
+    // the WHOLE generation.
+    let desired = registry
+        .path()
+        .join(NODE_WAYPOINT_UDP_REPLY_SOURCE_DIR)
+        .join(NODE_WAYPOINT_UDP_REPLY_SOURCE_DESIRED_FILE);
+    let body = std::fs::read_to_string(&desired).expect("manifest");
+    let mut lines: Vec<&str> = body.lines().collect();
+    lines.pop();
+    let torn = format!("{}\n", lines.join("\n"));
+    std::fs::write(&desired, torn.as_bytes()).expect("torn manifest");
+
+    reconcile_node_waypoint_udp_reply_sources(&mut backend, &config, &pods, &mut state);
+    assert!(
+        authorized(&backend).is_empty(),
+        "a torn generation authorizes nothing rather than a silently narrowed subset"
+    );
+    assert_eq!(
+        acknowledgement(registry.path()),
+        None,
+        "and it is never acknowledged"
+    );
+}
+
+/// Retraction is the security-relevant half. A listener that stopped serving
+/// must lose its authorization; retaining it would leave a ClusterIP admissible
+/// to enrolled pods with no socket behind it. Each step must also be
+/// acknowledged under its OWN generation.
+#[test]
+fn withdrawing_a_source_revokes_its_authorization_under_a_new_generation() {
+    let registry = tempfile::tempdir().expect("registry dir");
+    let publisher = RegistryDirReplySourcePublisher::new(registry.path());
+    let kept = reply_source("10.96.0.11", 5301);
+    let first = publisher
+        .publish(&[reply_source("10.96.0.10", 5300), kept])
+        .expect("publication");
+
+    let mut backend = MockEbpfBackend::default();
+    let pods = DashMap::new();
+    let config = node_waypoint_config(Some(registry.path()));
+    let mut state = NodeWaypointUdpReplySourceState::default();
+    reconcile_node_waypoint_udp_reply_sources(&mut backend, &config, &pods, &mut state);
+    assert_eq!(authorized(&backend).len(), 2);
+    assert_eq!(acknowledgement(registry.path()), Some(first.clone()));
+
+    let second = publisher.publish(&[kept]).expect("withdrawal");
+    assert_ne!(first, second);
     reconcile_node_waypoint_udp_reply_sources(&mut backend, &config, &pods, &mut state);
     assert_eq!(
         authorized(&backend),
         vec![(kept.ip, kept.port)],
         "a withdrawn reply source must lose its authorization"
     );
+    assert_eq!(acknowledgement(registry.path()), Some(second));
 
-    publisher.publish(&[]).expect("full retraction");
+    let empty = publisher.publish(&[]).expect("full retraction");
     reconcile_node_waypoint_udp_reply_sources(&mut backend, &config, &pods, &mut state);
     assert!(
         authorized(&backend).is_empty(),
         "a full retraction must leave nothing authorized"
     );
+    assert_eq!(
+        acknowledgement(registry.path()),
+        Some(empty),
+        "the empty generation is acknowledged too, so the proxy can prove the withdrawal"
+    );
 }
 
 /// Containment: the relay may authorize a Service address, never a workload's
 /// own. Otherwise a compromised or buggy proxy could authorize itself to answer
-/// enrolled pods AS one of the pods this guard exists to protect.
+/// enrolled pods AS one of the pods this guard exists to protect. The refusal is
+/// of the WHOLE generation — publishing the narrowed remainder and
+/// acknowledging it would tell the proxy a set it never asked for is live.
 #[test]
-fn a_claim_naming_an_enrolled_pod_address_is_refused() {
+fn a_generation_naming_an_enrolled_pod_address_is_refused_whole() {
     let registry = tempfile::tempdir().expect("registry dir");
     let publisher = RegistryDirReplySourcePublisher::new(registry.path());
     let service = reply_source("10.96.0.10", 5300);
@@ -1526,26 +1608,72 @@ fn a_claim_naming_an_enrolled_pod_address_is_refused() {
 
     let mut backend = MockEbpfBackend::default();
     let pods = DashMap::new();
-    pods.insert(
-        POD_A.to_string(),
-        enrolled_pod(POD_A, "10.244.1.7"),
-    );
+    pods.insert(POD_A.to_string(), enrolled_pod(POD_A, "10.244.1.7"));
     let config = node_waypoint_config(Some(registry.path()));
     let mut state = NodeWaypointUdpReplySourceState::default();
     reconcile_node_waypoint_udp_reply_sources(&mut backend, &config, &pods, &mut state);
 
+    assert!(
+        authorized(&backend).is_empty(),
+        "an enrolled pod address must never become an authorized reply source, and the \
+         remainder must not be authorized in its place"
+    );
     assert_eq!(
-        authorized(&backend),
-        vec![(service.ip, service.port)],
-        "an enrolled pod address must never become an authorized reply source"
+        acknowledgement(registry.path()),
+        None,
+        "a refused generation must not be acknowledged"
     );
 }
 
-/// Nothing published means nothing authorized — and a directory that has never
-/// existed is exactly that, not an error that would make the agent retain a
-/// previous generation's set.
+/// An over-bound generation is refused entirely rather than truncated, and — as
+/// with every refusal — carries no acknowledgement.
 #[test]
-fn an_absent_claim_directory_authorizes_nothing() {
+fn an_over_bound_generation_is_refused_and_unacknowledged() {
+    let registry = tempfile::tempdir().expect("registry dir");
+    let publisher = RegistryDirReplySourcePublisher::new(registry.path());
+    let generation = publisher
+        .publish(&[reply_source("10.96.0.10", 5300)])
+        .expect("publication");
+
+    let mut backend = MockEbpfBackend::default();
+    let pods = DashMap::new();
+    let config = node_waypoint_config(Some(registry.path()));
+    let mut state = NodeWaypointUdpReplySourceState::default();
+    reconcile_node_waypoint_udp_reply_sources(&mut backend, &config, &pods, &mut state);
+    assert_eq!(authorized(&backend).len(), 1);
+    assert_eq!(acknowledgement(registry.path()), Some(generation));
+
+    // A manifest declaring more sources than the BPF map can hold. The
+    // publisher refuses to write one, so this is the hostile/corrupt shape the
+    // node-agent must still refuse on its own.
+    let desired = registry
+        .path()
+        .join(NODE_WAYPOINT_UDP_REPLY_SOURCE_DIR)
+        .join(NODE_WAYPOINT_UDP_REPLY_SOURCE_DESIRED_FILE);
+    let owner = desired_generation(registry.path());
+    let mut body = format!(
+        "ferrum-udp-reply-src v1 {} {} 200\n",
+        owner.owner(),
+        owner.sequence() + 1
+    );
+    for index in 0..200u16 {
+        body.push_str(&format!("4-0a60000a-{}\n", 5300 + index));
+    }
+    std::fs::write(&desired, body.as_bytes()).expect("over-bound manifest");
+
+    reconcile_node_waypoint_udp_reply_sources(&mut backend, &config, &pods, &mut state);
+    assert!(
+        authorized(&backend).is_empty(),
+        "an over-bound generation must be refused entirely, never truncated"
+    );
+    assert_eq!(acknowledgement(registry.path()), None);
+}
+
+/// Nothing published means nothing authorized — and a channel that has never
+/// existed is exactly that, not an error that would make the agent retain a
+/// previous generation. The acknowledgement goes with it.
+#[test]
+fn an_absent_channel_authorizes_nothing() {
     let registry = tempfile::tempdir().expect("registry dir");
     let publisher = RegistryDirReplySourcePublisher::new(registry.path());
     publisher
@@ -1558,26 +1686,30 @@ fn an_absent_claim_directory_authorizes_nothing() {
     let mut state = NodeWaypointUdpReplySourceState::default();
     reconcile_node_waypoint_udp_reply_sources(&mut backend, &config, &pods, &mut state);
     assert_eq!(authorized(&backend).len(), 1);
+    assert!(acknowledgement(registry.path()).is_some());
 
-    // The proxy's whole claim directory disappears (a restart wiping its
-    // scratch state, a remount). Authorization must not survive it.
+    // The proxy's whole channel disappears (a restart wiping its scratch state,
+    // a remount). Authorization must not survive it, and neither may the proof.
     std::fs::remove_dir_all(registry.path().join(NODE_WAYPOINT_UDP_REPLY_SOURCE_DIR))
-        .expect("remove claim dir");
+        .expect("remove channel dir");
     reconcile_node_waypoint_udp_reply_sources(&mut backend, &config, &pods, &mut state);
     assert!(
         authorized(&backend).is_empty(),
-        "authorization must not outlive the claims that justified it"
+        "authorization must not outlive the generation that justified it"
     );
+    assert_eq!(acknowledgement(registry.path()), None);
 }
 
 /// A map write that failed is not evidence of anything, so the reconcile must
-/// not record it as converged — the next pass has to rewrite from scratch.
+/// not record it as converged and must NOT acknowledge — the next pass has to
+/// rewrite from scratch, and until it succeeds the proxy keeps the Service path
+/// unsteered.
 #[test]
-fn a_failed_map_write_is_retried_on_the_next_pass() {
+fn a_failed_map_write_is_never_acknowledged_and_is_retried() {
     let registry = tempfile::tempdir().expect("registry dir");
     let publisher = RegistryDirReplySourcePublisher::new(registry.path());
     let service = reply_source("10.96.0.10", 5300);
-    publisher.publish(&[service]).expect("publication");
+    let generation = publisher.publish(&[service]).expect("publication");
 
     let mut backend = MockEbpfBackend {
         fail_replace_udp_reply_sources: true,
@@ -1588,6 +1720,11 @@ fn a_failed_map_write_is_retried_on_the_next_pass() {
     let mut state = NodeWaypointUdpReplySourceState::default();
     reconcile_node_waypoint_udp_reply_sources(&mut backend, &config, &pods, &mut state);
     assert!(authorized(&backend).is_empty());
+    assert_eq!(
+        acknowledgement(registry.path()),
+        None,
+        "a generation that could not be applied must not be acknowledged"
+    );
 
     backend.fail_replace_udp_reply_sources = false;
     reconcile_node_waypoint_udp_reply_sources(&mut backend, &config, &pods, &mut state);
@@ -1596,10 +1733,242 @@ fn a_failed_map_write_is_retried_on_the_next_pass() {
         vec![(service.ip, service.port)],
         "a failed write must be retried rather than recorded as applied"
     );
+    assert_eq!(acknowledgement(registry.path()), Some(generation));
 }
 
-/// The reconcile runs on a 250 ms poll, so an unchanged claim set must issue no
-/// map calls at all.
+/// Success in one address family is not success for the generation. The
+/// acknowledgement appears only after the retry has completed both IPv4 and
+/// IPv6, never while the maps hold a partial family result.
+#[test]
+fn a_partial_family_failure_is_never_acknowledged() {
+    let registry = tempfile::tempdir().expect("registry dir");
+    let publisher = RegistryDirReplySourcePublisher::new(registry.path());
+    let v4 = reply_source("10.96.0.10", 5300);
+    let v6 = reply_source("fd00:10:96::a", 5300);
+    let generation = publisher.publish(&[v4, v6]).expect("publication");
+
+    let mut backend = MockEbpfBackend {
+        fail_replace_udp_reply_sources_after_ipv4: true,
+        ..MockEbpfBackend::default()
+    };
+    let pods = DashMap::new();
+    let config = node_waypoint_config(Some(registry.path()));
+    let mut state = NodeWaypointUdpReplySourceState::default();
+    reconcile_node_waypoint_udp_reply_sources(&mut backend, &config, &pods, &mut state);
+
+    assert_eq!(
+        authorized(&backend),
+        vec![(v4.ip, v4.port)],
+        "the injected backend models IPv4 applied before IPv6 failed"
+    );
+    assert_eq!(
+        acknowledgement(registry.path()),
+        None,
+        "a partial family result must prove nothing"
+    );
+
+    backend.fail_replace_udp_reply_sources_after_ipv4 = false;
+    reconcile_node_waypoint_udp_reply_sources(&mut backend, &config, &pods, &mut state);
+    let mut expected = vec![(v4.ip, v4.port), (v6.ip, v6.port)];
+    expected.sort();
+    assert_eq!(authorized(&backend), expected);
+    assert_eq!(acknowledgement(registry.path()), Some(generation));
+}
+
+/// A map that is absent from the loaded program cannot authorize its family, so
+/// the whole generation stays unapplied and unacknowledged — a dual-stack
+/// waypoint that acknowledged a v4-only apply would black-hole every v6 reply.
+#[test]
+fn an_absent_required_map_never_produces_an_acknowledgement() {
+    let registry = tempfile::tempdir().expect("registry dir");
+    let publisher = RegistryDirReplySourcePublisher::new(registry.path());
+    publisher
+        .publish(&[reply_source("10.96.0.10", 5300)])
+        .expect("publication");
+
+    let mut backend = MockEbpfBackend {
+        udp_reply_source_maps_absent: true,
+        ..MockEbpfBackend::default()
+    };
+    let pods = DashMap::new();
+    let config = node_waypoint_config(Some(registry.path()));
+    let mut state = NodeWaypointUdpReplySourceState::default();
+    reconcile_node_waypoint_udp_reply_sources(&mut backend, &config, &pods, &mut state);
+
+    assert!(authorized(&backend).is_empty());
+    assert_eq!(
+        acknowledgement(registry.path()),
+        None,
+        "an ELF without the reply-source maps must never look converged"
+    );
+
+    publisher.publish(&[]).expect("empty withdrawal generation");
+    reconcile_node_waypoint_udp_reply_sources(&mut backend, &config, &pods, &mut state);
+    assert_eq!(
+        acknowledgement(registry.path()),
+        None,
+        "even an empty generation is unproven when either family map is absent"
+    );
+}
+
+/// A successor can replace `desired` while the node-agent is applying the
+/// predecessor's maps. The agent must re-read the exact manifest before writing
+/// `applied`; otherwise the predecessor receives a late proof after the
+/// successor is already current and can briefly reinstall stale steering.
+#[test]
+fn a_generation_superseded_during_map_apply_is_never_acknowledged() {
+    let registry = tempfile::tempdir().expect("registry dir");
+    let predecessor = RegistryDirReplySourcePublisher::new(registry.path());
+    predecessor
+        .publish(&[reply_source("10.96.0.10", 5300)])
+        .expect("predecessor generation");
+
+    let successor_registry = tempfile::tempdir().expect("successor registry");
+    let successor = RegistryDirReplySourcePublisher::new(successor_registry.path());
+    let successor_source = reply_source("10.96.0.11", 5301);
+    let successor_generation = successor
+        .publish(&[successor_source])
+        .expect("successor generation");
+    let successor_manifest = std::fs::read(
+        successor_registry
+            .path()
+            .join(NODE_WAYPOINT_UDP_REPLY_SOURCE_DIR)
+            .join(NODE_WAYPOINT_UDP_REPLY_SOURCE_DESIRED_FILE),
+    )
+    .expect("successor manifest");
+
+    let desired_path = registry
+        .path()
+        .join(NODE_WAYPOINT_UDP_REPLY_SOURCE_DIR)
+        .join(NODE_WAYPOINT_UDP_REPLY_SOURCE_DESIRED_FILE);
+    let mut backend = MockEbpfBackend {
+        udp_reply_source_desired_replacement: Some((desired_path, successor_manifest)),
+        ..MockEbpfBackend::default()
+    };
+    let pods = DashMap::new();
+    let config = node_waypoint_config(Some(registry.path()));
+    let mut state = NodeWaypointUdpReplySourceState::default();
+
+    reconcile_node_waypoint_udp_reply_sources(&mut backend, &config, &pods, &mut state);
+    assert!(
+        authorized(&backend).is_empty(),
+        "the superseded set must be revoked rather than left live without exact proof"
+    );
+    assert_eq!(
+        acknowledgement(registry.path()),
+        None,
+        "a predecessor superseded during apply must receive no late acknowledgement"
+    );
+
+    reconcile_node_waypoint_udp_reply_sources(&mut backend, &config, &pods, &mut state);
+    assert_eq!(
+        authorized(&backend),
+        vec![(successor_source.ip, successor_source.port)]
+    );
+    assert_eq!(
+        acknowledgement(registry.path()),
+        Some(successor_generation),
+        "the next ordinary poll applies and acknowledges only the successor"
+    );
+}
+
+/// A stale acknowledgement is retracted BEFORE the maps are touched, so the
+/// proxy cannot read an old proof as covering the generation currently being
+/// applied. This is what makes a crash mid-apply fail closed.
+#[test]
+fn a_new_generation_retracts_the_previous_acknowledgement_before_applying() {
+    let registry = tempfile::tempdir().expect("registry dir");
+    let publisher = RegistryDirReplySourcePublisher::new(registry.path());
+    let first = publisher
+        .publish(&[reply_source("10.96.0.10", 5300)])
+        .expect("first");
+
+    let mut backend = MockEbpfBackend::default();
+    let pods = DashMap::new();
+    let config = node_waypoint_config(Some(registry.path()));
+    let mut state = NodeWaypointUdpReplySourceState::default();
+    reconcile_node_waypoint_udp_reply_sources(&mut backend, &config, &pods, &mut state);
+    assert_eq!(acknowledgement(registry.path()), Some(first.clone()));
+
+    // A new generation the agent cannot apply. The old acknowledgement must be
+    // gone even though the new one is never written.
+    publisher
+        .publish(&[reply_source("10.96.0.10", 5300), reply_source("10.96.0.11", 5301)])
+        .expect("second");
+    backend.fail_replace_udp_reply_sources = true;
+    reconcile_node_waypoint_udp_reply_sources(&mut backend, &config, &pods, &mut state);
+    assert_eq!(
+        acknowledgement(registry.path()),
+        None,
+        "the previous generation's acknowledgement must not survive an unapplied change"
+    );
+}
+
+/// An acknowledgement that vanishes underneath a converged agent is rewritten,
+/// so a wiped scratch directory cannot strand the proxy waiting forever for a
+/// proof the agent believes it already gave.
+#[test]
+fn a_lost_acknowledgement_is_rewritten_on_the_next_pass() {
+    let registry = tempfile::tempdir().expect("registry dir");
+    let publisher = RegistryDirReplySourcePublisher::new(registry.path());
+    let generation = publisher
+        .publish(&[reply_source("10.96.0.10", 5300)])
+        .expect("publication");
+
+    let mut backend = MockEbpfBackend::default();
+    let pods = DashMap::new();
+    let config = node_waypoint_config(Some(registry.path()));
+    let mut state = NodeWaypointUdpReplySourceState::default();
+    reconcile_node_waypoint_udp_reply_sources(&mut backend, &config, &pods, &mut state);
+    assert_eq!(acknowledgement(registry.path()), Some(generation.clone()));
+
+    let applied = registry
+        .path()
+        .join(NODE_WAYPOINT_UDP_REPLY_SOURCE_DIR)
+        .join(NODE_WAYPOINT_UDP_REPLY_SOURCE_APPLIED_FILE);
+    std::fs::remove_file(&applied).expect("remove acknowledgement");
+
+    reconcile_node_waypoint_udp_reply_sources(&mut backend, &config, &pods, &mut state);
+    assert_eq!(acknowledgement(registry.path()), Some(generation));
+}
+
+/// A successor process publishes under its OWN owner, so the predecessor's
+/// acknowledgement never covers it: the agent must apply and re-acknowledge.
+#[test]
+fn a_successor_generation_gets_its_own_acknowledgement() {
+    let registry = tempfile::tempdir().expect("registry dir");
+    let destinations = [reply_source("10.96.0.10", 5300)];
+    let mut backend = MockEbpfBackend::default();
+    let pods = DashMap::new();
+    let config = node_waypoint_config(Some(registry.path()));
+    let mut state = NodeWaypointUdpReplySourceState::default();
+
+    let predecessor = RegistryDirReplySourcePublisher::new(registry.path());
+    let old = predecessor.publish(&destinations).expect("predecessor");
+    reconcile_node_waypoint_udp_reply_sources(&mut backend, &config, &pods, &mut state);
+    assert_eq!(acknowledgement(registry.path()), Some(old.clone()));
+    assert_eq!(backend.udp_reply_source_updates.len(), 1);
+
+    let successor = RegistryDirReplySourcePublisher::new(registry.path());
+    let new = successor.publish(&destinations).expect("successor");
+    assert_ne!(old, new);
+
+    reconcile_node_waypoint_udp_reply_sources(&mut backend, &config, &pods, &mut state);
+
+    assert_eq!(
+        acknowledgement(registry.path()),
+        Some(new),
+        "the successor's generation must be acknowledged under its own owner"
+    );
+    assert_eq!(
+        backend.udp_reply_source_updates.len(),
+        2,
+        "even an identical set under a new owner must be freshly applied to both families"
+    );
+}
+
+/// The reconcile runs on a 250 ms poll, so an unchanged, already-acknowledged
+/// generation must issue no map calls at all.
 #[test]
 fn a_quiet_poll_issues_no_map_write() {
     let registry = tempfile::tempdir().expect("registry dir");
@@ -1637,5 +2006,7 @@ fn the_reconcile_is_node_waypoint_and_registry_scoped() {
 
     let mut local_pod = node_waypoint_config(Some(registry.path()));
     local_pod.capture_contract.proxy_mode = NodeAgentProxyMode::LocalPod;
-    assert!(!node_waypoint_udp_reply_source_reconcile_enabled(&local_pod));
+    assert!(!node_waypoint_udp_reply_source_reconcile_enabled(
+        &local_pod
+    ));
 }

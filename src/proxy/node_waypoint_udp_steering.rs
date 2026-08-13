@@ -87,6 +87,28 @@
 //! rather than leaving a steered-but-unanswerable or authorized-but-unserved
 //! datapath.
 //!
+//! # Publishing is not applying: the acknowledgement gate
+//!
+//! The proxy does not write BPF maps — the node-agent does, on its own poll. So
+//! "the claim is published" is not evidence that "the map holds it", and the
+//! interval between the two is precisely the steered-but-unanswerable window
+//! that the Service-path black hole is made of. A node-agent that is wedged,
+//! restarting, missing a map, or refusing the set would leave a new generation's
+//! rules installed indefinitely against a guard that drops every reply.
+//!
+//! So a reconcile installs setup rules only after the node-agent has
+//! acknowledged THAT EXACT generation
+//! ([`crate::proxy::node_waypoint_udp_reply_source::ReplySourceGeneration`]).
+//! Until then the outcome is [`SteerReconcileOutcome::PendingAck`], the rules
+//! stay (or are put back) absent, and the pass returns immediately — the retry
+//! is the next ordinary reconcile tick, never a sleep, a spin, or a blocked
+//! runtime worker. The teardown side is symmetric: a withdrawal is not
+//! [`SteerReconcileOutcome::Removed`] until the node-agent acknowledges the
+//! EMPTY generation, and until then every pass re-publishes and re-checks. An
+//! acknowledgement naming a different owner (a crashed predecessor) or a
+//! different sequence (an earlier set, or a differently ordered rendering of
+//! one) satisfies nothing.
+//!
 //! [`NodeWaypointUdpSteering::reconcile`] applies the pair only when it CHANGED,
 //! tears the datapath down whenever either half is empty, ALWAYS runs one
 //! exact-name teardown before this process trusts the datapath (so objects a
@@ -112,7 +134,9 @@ use arc_swap::ArcSwap;
 use tracing::{debug, info, warn};
 
 use crate::capture::NodeWaypointUdpSteerDestination;
-use crate::proxy::node_waypoint_udp_reply_source::NodeWaypointUdpReplySourcePublisher;
+use crate::proxy::node_waypoint_udp_reply_source::{
+    NodeWaypointUdpReplySourcePublisher, ReplySourceGeneration,
+};
 
 /// The steered Service destinations one mesh generation asks for.
 ///
@@ -251,14 +275,24 @@ impl NodeWaypointUdpSteerBackend for HostNamespaceSteerBackend {
 /// What one reconcile pass decided, for diagnostics and tests.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SteerReconcileOutcome {
-    /// The desired state equals the applied state; nothing was run.
+    /// The desired state equals the applied state AND the node-agent has
+    /// acknowledged exactly that generation; nothing was run.
     Unchanged,
-    /// Steering rules were installed or rebuilt.
+    /// Steering rules were installed or rebuilt, against an acknowledged
+    /// reply-source generation.
     Applied,
-    /// The datapath was torn down (nothing to steer, or a failed apply).
+    /// The datapath was torn down and the empty generation is acknowledged, so
+    /// the withdrawal is PROVEN, not merely requested.
     Removed,
-    /// The plan could not be rendered or applied. The datapath is left torn
-    /// down, so the Service path fails closed rather than half-steered.
+    /// The desired generation is published but the node-agent has not
+    /// acknowledged it (or has acknowledged a different one). No steering rule
+    /// is installed and any previously installed one has been removed, so the
+    /// Service path stays on its pre-existing fail-closed posture. The next
+    /// reconcile retries; nothing waits.
+    PendingAck,
+    /// The plan could not be rendered, published, or applied. The datapath is
+    /// left torn down, so the Service path fails closed rather than
+    /// half-steered.
     Failed,
 }
 
@@ -293,9 +327,10 @@ struct SteeringState {
     /// Latest published attribution interfaces. Paired with
     /// [`Self::desired_destinations`] inside the same critical section.
     desired_ifaces: Vec<String>,
-    /// The reply-source authorization set this process has PROVEN is published
-    /// (`Some(vec![])` = proven withdrawn). `None` means nothing is proven, so
-    /// the next pass must republish or re-withdraw rather than settle.
+    /// The reply-source set this process has PUBLISHED on the channel, with the
+    /// generation naming it (`Some((_, vec![]))` = the empty generation has been
+    /// published). `None` means the channel's content is unknown, so the next
+    /// pass must republish rather than settle.
     ///
     /// Kept separate from [`Self::applied`] because the two datapath halves
     /// fail independently: a successful `iptables` apply whose authorization
@@ -303,7 +338,12 @@ struct SteeringState {
     /// pod-veth guard drops, and a successful withdrawal of the rules whose
     /// authorization withdrawal failed would leave a ClusterIP admissible with
     /// no serving socket. Neither may be recorded as settled by the other.
-    published_reply_sources: Option<Vec<NodeWaypointUdpSteerDestination>>,
+    published_reply_sources: Option<(ReplySourceGeneration, Vec<NodeWaypointUdpSteerDestination>)>,
+    /// The generation the node-agent was last OBSERVED to acknowledge, i.e. to
+    /// have made live in BOTH BPF map families. Publishing is a request; only
+    /// this is evidence, and only when it equals the generation in
+    /// [`Self::published_reply_sources`].
+    acknowledged_reply_sources: Option<ReplySourceGeneration>,
 }
 
 /// Reconciles the NodeWaypoint Service-steering datapath.
@@ -463,29 +503,39 @@ impl NodeWaypointUdpSteering {
             destinations: state.desired_destinations.clone(),
         };
 
+        // Re-observe the node-agent's proof on EVERY pass, BEFORE the settled
+        // short-circuits. It is one bounded read of a small file and never a
+        // command, so a quiet poll stays silent — but an applied generation
+        // whose acknowledgement has since been retracted (a later node-agent
+        // refusal, a lost map, an agent restart) must revert its steering
+        // rather than stay installed on this process's stale belief.
+        if let Err(error) = self.observe_acknowledgement(state) {
+            warn!(
+                %error,
+                "NodeWaypoint UDP/DTLS reply-source acknowledgement could not be read; the \
+                 Service path stays unsteered rather than steering at a generation whose \
+                 authorization cannot be proven"
+            );
+            self.tear_down(state);
+            return SteerReconcileOutcome::Failed;
+        }
+
         if desired.ifaces.is_empty() || desired.destinations.is_empty() {
             // Nothing to steer. Run the exact-name teardown unless this process
             // has already PROVEN the node holds no Ferrum-owned steering
-            // objects AND no reply source is still authorized — which is
-            // exactly what makes the first pass reap a crashed predecessor's
-            // rules and claims while every later quiet poll runs no command at
-            // all.
-            if state.reaped
-                && state.applied.is_none()
-                && state
-                    .published_reply_sources
-                    .as_ref()
-                    .is_some_and(|published| published.is_empty())
-            {
+            // objects AND the node-agent has acknowledged the empty
+            // reply-source generation — which is exactly what makes the first
+            // pass reap a crashed predecessor's rules and authorizations while
+            // every later quiet poll runs no command at all.
+            if state.reaped && state.applied.is_none() && Self::generation_proven(state, &[]) {
                 return SteerReconcileOutcome::Unchanged;
             }
-            self.tear_down(state);
-            return SteerReconcileOutcome::Removed;
+            return self.converge_empty(state);
         }
 
         if state.reaped
             && state.applied.as_ref() == Some(&desired)
-            && state.published_reply_sources.as_ref() == Some(&desired.destinations)
+            && Self::generation_proven(state, &desired.destinations)
         {
             return SteerReconcileOutcome::Unchanged;
         }
@@ -495,10 +545,7 @@ impl NodeWaypointUdpSteering {
             &desired.destinations,
         ) {
             Ok(Some(script)) => script,
-            Ok(None) => {
-                self.tear_down(state);
-                return SteerReconcileOutcome::Removed;
-            }
+            Ok(None) => return self.converge_empty(state),
             Err(error) => {
                 warn!(
                     interfaces = desired.ifaces.len(),
@@ -513,20 +560,21 @@ impl NodeWaypointUdpSteering {
             }
         };
 
-        // Reap whatever may already be installed before installing the new
-        // generation: the previous generation this process applied, or — on the
-        // first pass — a crashed predecessor's objects and reply-source claims,
-        // which may name an address family or a destination this generation
-        // does not.
-        if !state.reaped
-            || state.applied.is_some()
-            || state.published_reply_sources.is_none()
-            || state
-                .published_reply_sources
-                .as_ref()
-                .is_some_and(|published| !published.is_empty())
-        {
-            self.tear_down(state);
+        // Remove whatever rules may already be installed before authorizing the
+        // new generation: the previous generation this process applied, or — on
+        // the first pass — a crashed predecessor's objects, which may name an
+        // address family or a destination this generation does not. This is
+        // also what REVERTS a previously applied generation whose
+        // acknowledgement has since gone stale or missing: falling through to
+        // the pending arm below with its rules still installed would be the
+        // steered-but-unanswerable state itself.
+        if !state.reaped || state.applied.is_some() {
+            if !self.remove_rules(state) {
+                // Do not publish a replacement generation while the outgoing
+                // rules are still unproven. The next reconcile retries the
+                // exact-name teardown first.
+                return SteerReconcileOutcome::Failed;
+            }
         }
 
         // Authorize the exact reply sources BEFORE installing the rules that
@@ -534,16 +582,47 @@ impl NodeWaypointUdpSteering {
         // which a workload's datagram reaches the listener but the listener's
         // source-pinned reply is dropped by this node's own pod-veth guard; the
         // reverse order would make every new generation start with one.
-        if let Err(error) = self.publish_reply_sources(state, &desired.destinations) {
-            warn!(
-                destinations = desired.destinations.len(),
-                %error,
-                "NodeWaypoint UDP/DTLS reply sources could not be authorized; leaving the Service \
-                 path unsteered (and therefore fail-closed at the pod-veth guard) rather than \
-                 steering datagrams at a listener whose replies would be dropped"
-            );
-            self.tear_down(state);
-            return SteerReconcileOutcome::Failed;
+        let generation = match self.publish_reply_sources(state, &desired.destinations) {
+            Ok(generation) => generation,
+            Err(error) => {
+                warn!(
+                    destinations = desired.destinations.len(),
+                    %error,
+                    "NodeWaypoint UDP/DTLS reply sources could not be authorized; leaving the \
+                     Service path unsteered (and therefore fail-closed at the pod-veth guard) \
+                     rather than steering datagrams at a listener whose replies would be dropped"
+                );
+                self.tear_down(state);
+                return SteerReconcileOutcome::Failed;
+            }
+        };
+
+        // Publishing is a request, not proof. The node-agent owns every BPF map
+        // write, so until it has acknowledged THIS generation the maps may hold
+        // an older set, a narrower set, or nothing at all — and steering into
+        // that is the Service-path black hole. No rule is installed until the
+        // acknowledgement is exact.
+        match self.observe_acknowledgement(state) {
+            Ok(Some(acknowledged)) if acknowledged == generation => {}
+            Ok(_) => {
+                debug!(
+                    destinations = desired.destinations.len(),
+                    "NodeWaypoint UDP/DTLS reply-source generation published but not yet \
+                     acknowledged by the node-agent; leaving the Service path unsteered and \
+                     retrying on the next reconcile"
+                );
+                return SteerReconcileOutcome::PendingAck;
+            }
+            Err(error) => {
+                warn!(
+                    %error,
+                    "NodeWaypoint UDP/DTLS reply-source acknowledgement could not be read; the \
+                     Service path stays unsteered rather than steering at a generation whose \
+                     authorization cannot be proven"
+                );
+                self.tear_down(state);
+                return SteerReconcileOutcome::Failed;
+            }
         }
 
         match self.backend.run_script(&script) {
@@ -575,15 +654,98 @@ impl NodeWaypointUdpSteering {
         }
     }
 
+    /// Whether the node-agent has proven that EXACTLY `desired` is live in both
+    /// BPF map families right now.
+    ///
+    /// Two independent conditions, and both are required: the set this process
+    /// published must be the set it currently wants, and the acknowledgement
+    /// must name that publication's own generation. An acknowledgement from a
+    /// crashed predecessor carries a different owner, and one from an earlier
+    /// set — or from a differently ordered rendering of a set, which the
+    /// manifest parser refuses outright — carries a different sequence. Neither
+    /// can be mistaken for proof about this generation.
+    fn generation_proven(
+        state: &SteeringState,
+        desired: &[NodeWaypointUdpSteerDestination],
+    ) -> bool {
+        match (
+            state.published_reply_sources.as_ref(),
+            state.acknowledged_reply_sources.as_ref(),
+        ) {
+            (Some((generation, published)), Some(acknowledged)) => {
+                published.as_slice() == desired && acknowledged == generation
+            }
+            _ => false,
+        }
+    }
+
+    /// Converge on "nothing steered, nothing authorized".
+    ///
+    /// Rules first, then the empty generation, then the proof: a withdrawal is
+    /// only [`SteerReconcileOutcome::Removed`] once the node-agent has
+    /// acknowledged the empty generation. Until then the pass reports
+    /// [`SteerReconcileOutcome::PendingAck`] and the next reconcile re-checks,
+    /// so one lost acknowledgement cannot leave a revoked ClusterIP recorded as
+    /// withdrawn.
+    fn converge_empty(&self, state: &mut SteeringState) -> SteerReconcileOutcome {
+        let rules_removed = if !state.reaped || state.applied.is_some() {
+            self.remove_rules(state)
+        } else {
+            true
+        };
+
+        // Withdraw the authorizations only AFTER the rules are PROVEN gone, so
+        // nothing is steered at an address whose authorization has already
+        // disappeared. A failed teardown retains the outgoing generation and
+        // retries rules-first on the next pass.
+        if !rules_removed {
+            return SteerReconcileOutcome::Failed;
+        }
+
+        let withdrawal = match self.publish_reply_sources(state, &[]) {
+            Ok(generation) => match self.observe_acknowledgement(state) {
+                Ok(Some(acknowledged)) if acknowledged == generation => {
+                    SteerReconcileOutcome::Removed
+                }
+                Ok(_) => SteerReconcileOutcome::PendingAck,
+                Err(error) => {
+                    warn!(
+                        %error,
+                        "NodeWaypoint UDP/DTLS reply-source withdrawal could not be proven; the \
+                         acknowledgement is unreadable, so the withdrawal stays unproven and is \
+                         retried on the next reconcile"
+                    );
+                    SteerReconcileOutcome::Failed
+                }
+            },
+            Err(error) => {
+                warn!(
+                    %error,
+                    "NodeWaypoint UDP/DTLS reply-source withdrawal reported an error; the \
+                     authorizations stay recorded as unproven and are retried on the next reconcile"
+                );
+                SteerReconcileOutcome::Failed
+            }
+        };
+
+        withdrawal
+    }
+
     /// Remove every Ferrum-owned steering object and forget the applied
-    /// generation. The teardown script tolerates missing objects, so it is a
-    /// no-op when nothing is installed.
+    /// generation, leaving the published authorizations alone. The teardown
+    /// script tolerates missing objects, so it is a no-op when nothing is
+    /// installed.
     ///
     /// `reaped` is set ONLY when the script succeeded: a failed teardown has not
     /// proven anything about the node, so the next reconcile must try again
-    /// rather than treat "nothing applied" as settled.
-    fn tear_down(&self, state: &mut SteeringState) {
+    /// rather than treat "nothing applied" as settled. Returns whether the node
+    /// is now proven free of Ferrum-owned steering objects.
+    fn remove_rules(&self, state: &mut SteeringState) -> bool {
         state.applied = None;
+        // A prior successful reap does not prove this later teardown succeeded.
+        // Clear the proof before the command so a failure cannot short-circuit
+        // a retry or allow a replacement generation to install.
+        state.reaped = false;
         if let Err(error) = self
             .backend
             .run_script(&crate::capture::node_waypoint_udp_steer_teardown_script())
@@ -593,51 +755,90 @@ impl NodeWaypointUdpSteering {
                 "NodeWaypoint UDP Service steering teardown reported an error; it will be retried \
                  on the next reconcile"
             );
-        } else {
-            state.reaped = true;
-            debug!("NodeWaypoint UDP Service steering datapath removed");
+            return false;
         }
-        // Withdraw the reply-source authorizations AFTER the rules, so nothing
-        // is steered at an address whose authorization has already gone. A
-        // failed withdrawal is NOT recorded as done — the next reconcile must
-        // retry it rather than leave a ClusterIP admissible with no serving
-        // socket.
+        state.reaped = true;
+        debug!("NodeWaypoint UDP Service steering datapath removed");
+        true
+    }
+
+    /// Rules first, then the empty generation. The recovery path for every hard
+    /// failure, and the shutdown path.
+    fn tear_down(&self, state: &mut SteeringState) {
+        if !self.remove_rules(state) {
+            return;
+        }
         if let Err(error) = self.publish_reply_sources(state, &[]) {
             warn!(
                 %error,
                 "NodeWaypoint UDP/DTLS reply-source withdrawal reported an error; the \
                  authorizations stay recorded as unproven and are retried on the next reconcile"
             );
+            return;
         }
+        // Refresh the observed acknowledgement so the next pass can tell a
+        // proven withdrawal from a pending one without a spurious republish.
+        let _ = self.observe_acknowledgement(state);
     }
 
-    /// Replace the published reply-source authorization set, recording the
-    /// result so a later pass can tell "proven published" from "unknown".
+    /// Publish the reply-source set, recording the generation so a later pass
+    /// can tell "published" from "unknown" — and, with
+    /// [`Self::observe_acknowledgement`], "published" from "applied".
     ///
     /// A publisher-less instance (no registry directory, or a platform with no
-    /// steering datapath) records the set as proven: there is no listener to
-    /// authorize either, so tracking it keeps the quiet-poll `Unchanged`
-    /// short-circuit intact without asserting anything about a node.
+    /// steering datapath) records the set as published AND acknowledged: there
+    /// is no node-agent to ask and no listener to authorize, so the pair is
+    /// trivially coherent and the quiet-poll `Unchanged` short-circuit stays
+    /// intact without asserting anything about a node.
     fn publish_reply_sources(
         &self,
         state: &mut SteeringState,
         sources: &[NodeWaypointUdpSteerDestination],
-    ) -> Result<(), String> {
+    ) -> Result<ReplySourceGeneration, String> {
         let Some(publisher) = self.reply_sources.as_ref() else {
-            state.published_reply_sources = Some(sources.to_vec());
-            return Ok(());
+            let generation = ReplySourceGeneration::inert();
+            state.published_reply_sources = Some((generation.clone(), sources.to_vec()));
+            state.acknowledged_reply_sources = Some(generation.clone());
+            return Ok(generation);
         };
         match publisher.publish(sources) {
-            Ok(()) => {
-                state.published_reply_sources = Some(sources.to_vec());
-                Ok(())
+            Ok(generation) => {
+                state.published_reply_sources = Some((generation.clone(), sources.to_vec()));
+                Ok(generation)
             }
             Err(error) => {
-                // The set on the node is now unknown: some claims may have been
-                // withdrawn and others not. Fail closed by forgetting, so the
-                // next pass republishes from scratch instead of trusting a
-                // half-applied generation.
+                // What the channel now holds is unknown. Fail closed by
+                // forgetting BOTH halves, so the next pass republishes from
+                // scratch and cannot read a stale acknowledgement as proof.
                 state.published_reply_sources = None;
+                state.acknowledged_reply_sources = None;
+                Err(error)
+            }
+        }
+    }
+
+    /// Refresh the observed acknowledgement. Never blocks and never waits: it is
+    /// one bounded read of a small file, and a pending answer is retried by the
+    /// next ordinary reconcile tick.
+    fn observe_acknowledgement(
+        &self,
+        state: &mut SteeringState,
+    ) -> Result<Option<ReplySourceGeneration>, String> {
+        let Some(publisher) = self.reply_sources.as_ref() else {
+            // Nothing to apply, so the published generation is its own proof.
+            state.acknowledged_reply_sources = state
+                .published_reply_sources
+                .as_ref()
+                .map(|(generation, _)| generation.clone());
+            return Ok(state.acknowledged_reply_sources.clone());
+        };
+        match publisher.acknowledged() {
+            Ok(acknowledged) => {
+                state.acknowledged_reply_sources = acknowledged.clone();
+                Ok(acknowledged)
+            }
+            Err(error) => {
+                state.acknowledged_reply_sources = None;
                 Err(error)
             }
         }

@@ -64,6 +64,7 @@ use crate::ebpf::{
 use crate::modes::node_agent_cni_server::{
     self, CniWorkItem, CniWorkReceiver, cni_work_channel, spawn_cni_listener,
 };
+use crate::proxy::node_waypoint_udp_reply_source::ReplySourceGeneration;
 
 const DEFAULT_CGROUP_ROOT: &str = "/sys/fs/cgroup";
 const DEFAULT_BPF_FS_PATH: &str = "/sys/fs/bpf";
@@ -6008,10 +6009,10 @@ fn reap_orphaned_udp_handshake_markers_older_than(
     }
 }
 
-/// Whether this node-agent should reconcile the mesh proxy's NodeWaypoint
-/// UDP/DTLS reply-source claims into the BPF authorization maps (issue #3286).
+/// Whether this node-agent should apply the mesh proxy's NodeWaypoint UDP/DTLS
+/// reply-source generations into the BPF authorization maps (issue #3286).
 ///
-/// NodeWaypoint-only: the claims authorize the source-pinned replies of a
+/// NodeWaypoint-only: the generation authorizes the source-pinned replies of a
 /// NodeWaypoint UDP/DTLS relay, and only that topology has one. Without a
 /// registry directory there is no channel the proxy could have published on.
 pub fn node_waypoint_udp_reply_source_reconcile_enabled(config: &NodeAgentConfig) -> bool {
@@ -6022,9 +6023,13 @@ pub fn node_waypoint_udp_reply_source_reconcile_enabled(config: &NodeAgentConfig
 /// What this node-agent has proven about the reply-source authorization maps.
 #[derive(Debug, Default)]
 pub struct NodeWaypointUdpReplySourceState {
-    /// The set last successfully written, so a quiet poll issues no map calls.
-    /// `None` means unknown — a write failed, so the next pass must rewrite.
+    /// The set last successfully written to BOTH map families, so a quiet poll
+    /// issues no map calls. `None` means unknown — a write failed, so the next
+    /// pass must rewrite before it may acknowledge anything.
     applied: Option<Vec<(std::net::IpAddr, u16)>>,
+    /// The generation this agent has acknowledged on the channel. Only ever set
+    /// after [`Self::applied`] holds that generation's COMPLETE set.
+    acknowledged: Option<ReplySourceGeneration>,
     /// Closed-set reason for the last refusal, so a 250 ms poll cannot turn a
     /// persistent fault into a log flood: the warning fires only on transition.
     last_diagnostic: Option<&'static str>,
@@ -6042,12 +6047,14 @@ impl NodeWaypointUdpReplySourceState {
             (Some(reason), Some(detail)) => warn!(
                 reason,
                 detail,
-                "NodeWaypoint UDP/DTLS reply-source authorization refused; the relay's \
+                "NodeWaypoint UDP/DTLS reply-source authorization refused; the generation stays \
+                 unacknowledged, so the proxy leaves the Service path unsteered and the relay's \
                  source-pinned replies stay denied by the pod-veth guard until it converges"
             ),
             (Some(reason), None) => warn!(
                 reason,
-                "NodeWaypoint UDP/DTLS reply-source authorization refused; the relay's \
+                "NodeWaypoint UDP/DTLS reply-source authorization refused; the generation stays \
+                 unacknowledged, so the proxy leaves the Service path unsteered and the relay's \
                  source-pinned replies stay denied by the pod-veth guard until it converges"
             ),
             (None, _) => debug!("NodeWaypoint UDP/DTLS reply-source authorization converged"),
@@ -6055,46 +6062,57 @@ impl NodeWaypointUdpReplySourceState {
     }
 }
 
-/// Reconcile the proxy's published reply-source claims into
-/// `FERRUM_UDP_REPLY_SOURCES` / `FERRUM_UDP_REPLY_SOURCES6`.
+/// Apply the proxy's published reply-source generation into
+/// `FERRUM_UDP_REPLY_SOURCES` / `FERRUM_UDP_REPLY_SOURCES6`, and acknowledge it
+/// only once the COMPLETE IPv4 + IPv6 set is live in both.
 ///
-/// The claims are a whole-set statement owned by the serving proxy, so this is
-/// a whole-set replacement: a proxy crash, restart, or missed retraction
+/// The generation is a whole-set statement owned by the serving proxy, so this
+/// is a whole-set replacement: a proxy crash, restart, or missed retraction
 /// converges without the node-agent carrying an enumerated removal list.
 ///
-/// Fail-closed at every step. An unreadable claim directory authorizes nothing
-/// rather than retaining the previous set (an inability to prove a claim is not
-/// evidence for it); an unparseable claim name is skipped; a set over the map
-/// bound refuses ENTIRELY rather than truncating to an arbitrary subset; and a
-/// claim naming an ENROLLED POD ADDRESS is refused outright, so the relay can
-/// never authorize itself to answer as one of the workloads this guard protects.
+/// Fail-closed at every step, and the acknowledgement is the fail-closed
+/// signal: it is RETRACTED before the maps are touched and re-written only on
+/// full success, so the proxy can never read a stale acknowledgement as proof
+/// about a generation this agent has not applied. An absent, unreadable,
+/// over-bound, or malformed generation authorizes nothing rather than retaining
+/// the previous set (an inability to prove a claim is not evidence for it); a
+/// set over the map bound refuses ENTIRELY rather than truncating to an
+/// arbitrary subset; and a generation naming an ENROLLED POD ADDRESS is refused
+/// WHOLE — never narrowed and acknowledged, which would tell the proxy a set it
+/// never published is live — so the relay can never authorize itself to answer
+/// as one of the workloads this guard protects.
 pub fn reconcile_node_waypoint_udp_reply_sources(
     backend: &mut dyn EbpfBackend,
     config: &NodeAgentConfig,
     pod_states: &DashMap<String, PodAttachmentState>,
     state: &mut NodeWaypointUdpReplySourceState,
 ) {
+    use crate::proxy::node_waypoint_udp_reply_source as channel;
+
     let Some(registry_dir) = config.node_waypoint_pod_registry_dir.as_deref() else {
         return;
     };
 
-    let (claims, unparsed) =
-        match crate::proxy::node_waypoint_udp_reply_source::read_claims(registry_dir) {
-            Ok(read) => read,
-            Err(error) => {
-                // Withdraw rather than retain: a directory this agent cannot
-                // read is not evidence that anything is still serving.
-                state.report(Some("claim_directory_unreadable"), Some(error.as_str()));
-                apply_node_waypoint_udp_reply_sources(backend, &[], state, false);
-                return;
-            }
-        };
-    if unparsed > 0 {
-        debug!(
-            unparsed,
-            "Skipped unparseable NodeWaypoint UDP/DTLS reply-source claims"
-        );
-    }
+    let desired = match channel::read_desired_generation(registry_dir) {
+        Ok(Some(desired)) => desired,
+        Ok(None) => {
+            // Nothing is published. There is no generation to acknowledge, so
+            // revoke everything and leave no acknowledgement behind.
+            refuse_node_waypoint_udp_reply_sources(backend, registry_dir, state, None);
+            return;
+        }
+        Err(error) => {
+            // Withdraw rather than retain: a channel this agent cannot read (or
+            // cannot parse in full) is not evidence that anything is serving.
+            refuse_node_waypoint_udp_reply_sources(
+                backend,
+                registry_dir,
+                state,
+                Some(("desired_generation_unreadable", Some(error.as_str()))),
+            );
+            return;
+        }
+    };
 
     let mut enrolled_pod_addrs: HashSet<std::net::IpAddr> = HashSet::new();
     for entry in pod_states.iter() {
@@ -6105,59 +6123,193 @@ pub fn reconcile_node_waypoint_udp_reply_sources(
             enrolled_pod_addrs.insert(std::net::IpAddr::V6(ip));
         }
     }
-
-    let mut sources: Vec<(std::net::IpAddr, u16)> = Vec::with_capacity(claims.len());
-    let mut refused_pod_addr = 0usize;
-    for claim in &claims {
-        if enrolled_pod_addrs.contains(&claim.ip) {
-            refused_pod_addr += 1;
-            continue;
-        }
-        sources.push((claim.ip, claim.port));
+    if desired
+        .sources
+        .iter()
+        .any(|source| enrolled_pod_addrs.contains(&source.ip))
+    {
+        refuse_node_waypoint_udp_reply_sources(
+            backend,
+            registry_dir,
+            state,
+            Some(("generation_names_enrolled_pod_address", None)),
+        );
+        return;
     }
 
-    if sources.len() > ferrum_ebpf_common::UDP_REPLY_SOURCE_MAX_ENTRIES as usize {
+    if desired.sources.len() > ferrum_ebpf_common::UDP_REPLY_SOURCE_MAX_ENTRIES as usize {
         // Refuse the whole set: truncating would authorize an arbitrary subset
         // and silently black-hole the rest.
-        state.report(Some("claim_count_exceeds_map_bound"), None);
-        apply_node_waypoint_udp_reply_sources(backend, &[], state, false);
+        refuse_node_waypoint_udp_reply_sources(
+            backend,
+            registry_dir,
+            state,
+            Some(("generation_exceeds_map_bound", None)),
+        );
         return;
     }
-    if refused_pod_addr > 0 {
-        state.report(Some("claim_names_enrolled_pod_address"), None);
-    }
 
-    apply_node_waypoint_udp_reply_sources(backend, &sources, state, refused_pod_addr == 0);
-}
+    let sources: Vec<(std::net::IpAddr, u16)> = desired
+        .sources
+        .iter()
+        .map(|source| (source.ip, source.port))
+        .collect();
 
-/// Write one whole-set replacement, skipping the map calls when the set is
-/// already proven applied. `clear_diagnostic` lets the caller keep a refusal
-/// reason latched while it publishes the narrowed set that refusal implies.
-fn apply_node_waypoint_udp_reply_sources(
-    backend: &mut dyn EbpfBackend,
-    sources: &[(std::net::IpAddr, u16)],
-    state: &mut NodeWaypointUdpReplySourceState,
-    clear_diagnostic: bool,
-) {
-    if state.applied.as_deref() == Some(sources) {
-        if clear_diagnostic {
-            state.report(None, None);
-        }
-        return;
-    }
-    match backend.replace_udp_reply_sources(sources) {
-        Ok(()) => {
-            state.applied = Some(sources.to_vec());
-            if clear_diagnostic {
-                state.report(None, None);
+    let converged = state.applied.as_deref() == Some(sources.as_slice())
+        && state.acknowledged.as_ref() == Some(&desired.generation);
+    if converged {
+        // Quiet poll. Still confirm the acknowledgement is on disk: a wiped
+        // scratch directory would otherwise leave the proxy waiting forever for
+        // a proof this agent believes it already gave.
+        match channel::read_acknowledgement(registry_dir) {
+            Ok(Some(acknowledged)) if acknowledged == desired.generation => {
+                if revalidate_node_waypoint_udp_reply_source_generation(
+                    backend,
+                    registry_dir,
+                    state,
+                    &desired,
+                ) {
+                    state.report(None, None);
+                }
+                return;
+            }
+            Ok(_) => {}
+            Err(error) => {
+                state.acknowledged = None;
+                state.report(Some("acknowledgement_unreadable"), Some(error.as_str()));
+                return;
             }
         }
-        Err(error) => {
-            // The map contents are now unknown, so forget the applied set and
-            // rewrite from scratch on the next pass.
-            state.applied = None;
-            state.report(Some("map_write_failed"), Some(error.as_str()));
+    } else {
+        // A generation this agent has not applied must never be covered by an
+        // acknowledgement, so retract first — including across a crash, since
+        // nothing rewrites it until the whole set is live again.
+        if let Err(error) = channel::clear_acknowledgement(registry_dir) {
+            state.acknowledged = None;
+            state.report(Some("acknowledgement_retraction_failed"), Some(error.as_str()));
+            return;
         }
+        state.acknowledged = None;
+
+        // One fresh whole-set replacement covering BOTH families for every
+        // unacknowledged generation, even when its content matches the last
+        // applied set. This proves both maps still exist and were completely
+        // scanned for this exact generation. Any failure — an absent required
+        // map, a scan error, a remove error, a partial family failure — leaves
+        // the set unproven and unacknowledged.
+        match backend.replace_udp_reply_sources(&sources) {
+            Ok(()) => state.applied = Some(sources),
+            Err(error) => {
+                state.applied = None;
+                state.report(Some("map_write_failed"), Some(error.as_str()));
+                return;
+            }
+        }
+    }
+
+    // `desired` can be atomically replaced while the two map families are being
+    // scanned/removed/inserted. Re-read it before publishing proof: otherwise a
+    // late acknowledgement for a predecessor could appear after a successor's
+    // manifest is already current. A mismatch revokes the just-applied set and
+    // leaves no acknowledgement; the next ordinary poll applies the successor.
+    if !revalidate_node_waypoint_udp_reply_source_generation(
+        backend,
+        registry_dir,
+        state,
+        &desired,
+    ) {
+        return;
+    }
+
+    let written = channel::write_acknowledgement(registry_dir, &desired.generation);
+    match written {
+        Ok(()) => {
+            state.acknowledged = Some(desired.generation);
+            state.report(None, None);
+        }
+        Err(error) => {
+            state.acknowledged = None;
+            state.report(Some("acknowledgement_write_failed"), Some(error.as_str()));
+        }
+    }
+}
+
+/// Confirm that the exact manifest read before map application is still the
+/// proxy's current whole-set request before acknowledging it.
+fn revalidate_node_waypoint_udp_reply_source_generation(
+    backend: &mut dyn EbpfBackend,
+    registry_dir: &std::path::Path,
+    state: &mut NodeWaypointUdpReplySourceState,
+    desired: &crate::proxy::node_waypoint_udp_reply_source::DesiredReplySources,
+) -> bool {
+    use crate::proxy::node_waypoint_udp_reply_source as channel;
+
+    match channel::read_desired_generation(registry_dir) {
+        Ok(Some(current)) if current == *desired => true,
+        Ok(_) => {
+            refuse_node_waypoint_udp_reply_sources(
+                backend,
+                registry_dir,
+                state,
+                Some(("desired_generation_superseded_during_apply", None)),
+            );
+            false
+        }
+        Err(error) => {
+            refuse_node_waypoint_udp_reply_sources(
+                backend,
+                registry_dir,
+                state,
+                Some(("desired_generation_recheck_failed", Some(error.as_str()))),
+            );
+            false
+        }
+    }
+}
+
+/// Refuse the published generation: retract the acknowledgement FIRST, then
+/// revoke every authorization.
+///
+/// Ordered that way because the acknowledgement is what the proxy steers on. A
+/// refusal that revoked the maps while leaving an acknowledgement in place would
+/// hand the proxy proof for a set that is no longer live — exactly the steered
+/// black hole this channel exists to close. `reason` is `None` for the ordinary
+/// "nothing is published" state, which is a posture rather than a fault.
+fn refuse_node_waypoint_udp_reply_sources(
+    backend: &mut dyn EbpfBackend,
+    registry_dir: &std::path::Path,
+    state: &mut NodeWaypointUdpReplySourceState,
+    reason: Option<(&'static str, Option<&str>)>,
+) {
+    use crate::proxy::node_waypoint_udp_reply_source as channel;
+
+    if let Err(error) = channel::clear_acknowledgement(registry_dir) {
+        state.acknowledged = None;
+        state.report(Some("acknowledgement_retraction_failed"), Some(error.as_str()));
+        return;
+    }
+    state.acknowledged = None;
+
+    let already_revoked = state
+        .applied
+        .as_deref()
+        .is_some_and(|applied| applied.is_empty());
+    if !already_revoked {
+        match backend.replace_udp_reply_sources(&[]) {
+            Ok(()) => state.applied = Some(Vec::new()),
+            Err(error) => {
+                // The map contents are now unknown, so forget the applied set
+                // and rewrite from scratch on the next pass.
+                state.applied = None;
+                state.report(Some("map_write_failed"), Some(error.as_str()));
+                return;
+            }
+        }
+    }
+
+    match reason {
+        Some((reason, detail)) => state.report(Some(reason), detail),
+        None => state.report(None, None),
     }
 }
 

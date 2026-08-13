@@ -22,6 +22,10 @@ use ferrum_edge::capture::{
     NodeWaypointUdpSteerDestination, node_waypoint_udp_steer_setup_script,
     node_waypoint_udp_steer_teardown_script,
 };
+use ferrum_edge::proxy::node_waypoint_udp_reply_source::{
+    NodeWaypointUdpReplySourcePublisher, RegistryDirReplySourcePublisher, ReplySourceGeneration,
+    clear_acknowledgement, read_desired_generation, write_acknowledgement,
+};
 use ferrum_edge::proxy::node_waypoint_udp_steering::{
     NodeWaypointUdpSteerBackend, NodeWaypointUdpSteering, SteerReconcileOutcome,
 };
@@ -582,7 +586,7 @@ fn later_full_plan_owns_the_installed_plan_over_an_in_flight_retract() {
     std::mem::forget(steering);
 }
 
-// ── Reply-source authorization lifecycle (issue #3286) ─────────────────────
+// ── Reply-source authorization lifecycle and acknowledgement (issue #3286) ─
 //
 // Steering preserves the Service ClusterIP as the datagram's local address, so
 // the listener's reply is source-pinned to it — and a ClusterIP is never a
@@ -591,38 +595,70 @@ fn later_full_plan_owns_the_installed_plan_over_an_in_flight_retract() {
 // therefore two halves of ONE datapath, and the order they move in is the
 // contract: authorize before steering, withdraw after un-steering, and tear the
 // whole generation down if either half fails.
+//
+// Crucially, PUBLISHING is not APPLYING. The node-agent owns every BPF map
+// write and polls this channel on its own cadence, so a reconcile that
+// installed rules on the strength of its own publication would open a
+// steered-but-unanswerable window on every generation — and would keep the new
+// rules installed indefinitely if the node-agent never converged. These tests
+// pin the acknowledgement gate that closes it, against the REAL manifest /
+// acknowledgement protocol over a temporary registry directory.
 
 /// Records reply-source publications on the SAME log as the scripts, so
-/// ordering between the two halves is observable as one sequence.
+/// ordering between the two halves is observable as one sequence, and models
+/// the node-agent by driving the real acknowledgement file.
 struct RecordingPublisher {
+    inner: RegistryDirReplySourcePublisher,
+    registry: std::path::PathBuf,
     log: Arc<Mutex<Vec<String>>>,
-    fail: Arc<std::sync::atomic::AtomicBool>,
+    fail_publish: Arc<std::sync::atomic::AtomicBool>,
+    fail_read_ack: Arc<std::sync::atomic::AtomicBool>,
+    /// Models a node-agent that has already applied the generation by the time
+    /// the reconcile looks. Off means the generation stays PENDING until a test
+    /// calls [`NodeAgentFake::acknowledge_latest`].
+    auto_acknowledge: Arc<std::sync::atomic::AtomicBool>,
 }
 
-impl ferrum_edge::proxy::node_waypoint_udp_reply_source::NodeWaypointUdpReplySourcePublisher
-    for RecordingPublisher
-{
-    fn publish(&self, sources: &[NodeWaypointUdpSteerDestination]) -> Result<(), String> {
+impl NodeWaypointUdpReplySourcePublisher for RecordingPublisher {
+    fn publish(
+        &self,
+        sources: &[NodeWaypointUdpSteerDestination],
+    ) -> Result<ReplySourceGeneration, String> {
         let entry = if sources.is_empty() {
             "publish:withdraw".to_string()
         } else {
             format!("publish:{}", sources.len())
         };
-        if self.fail.load(std::sync::atomic::Ordering::SeqCst) {
+        if self.fail_publish.load(std::sync::atomic::Ordering::SeqCst) {
             self.log
                 .lock()
                 .expect("publisher log")
                 .push(format!("{entry}:failed"));
             return Err("injected reply-source publication failure".to_string());
         }
+        let generation = self.inner.publish(sources)?;
+        if self
+            .auto_acknowledge
+            .load(std::sync::atomic::Ordering::SeqCst)
+        {
+            write_acknowledgement(&self.registry, &generation).expect("node-agent acknowledgement");
+        }
         self.log.lock().expect("publisher log").push(entry);
-        Ok(())
+        Ok(generation)
+    }
+
+    fn acknowledged(&self) -> Result<Option<ReplySourceGeneration>, String> {
+        if self.fail_read_ack.load(std::sync::atomic::Ordering::SeqCst) {
+            return Err("injected acknowledgement read failure".to_string());
+        }
+        self.inner.acknowledged()
     }
 }
 
 /// Runs scripts onto a shared log so publications and scripts interleave.
 struct SharedLogBackend {
     log: Arc<Mutex<Vec<String>>>,
+    fail_teardown: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl NodeWaypointUdpSteerBackend for SharedLogBackend {
@@ -632,30 +668,91 @@ impl NodeWaypointUdpSteerBackend for SharedLogBackend {
         } else {
             "script:setup"
         };
-        self.log.lock().expect("backend log").push(entry.to_string());
+        self.log
+            .lock()
+            .expect("backend log")
+            .push(entry.to_string());
+        if entry == "script:teardown"
+            && self
+                .fail_teardown
+                .load(std::sync::atomic::Ordering::SeqCst)
+        {
+            return Err("injected steering teardown failure".to_string());
+        }
         Ok(())
     }
 }
 
-fn shared_log_steering(
-    fail_publish: bool,
-) -> (
-    NodeWaypointUdpSteering,
-    Arc<Mutex<Vec<String>>>,
-    Arc<std::sync::atomic::AtomicBool>,
-) {
-    let log = Arc::new(Mutex::new(Vec::new()));
-    let fail = Arc::new(std::sync::atomic::AtomicBool::new(fail_publish));
-    let steering = NodeWaypointUdpSteering::new(Arc::new(SharedLogBackend { log: log.clone() }))
-        .with_reply_source_publisher(Arc::new(RecordingPublisher {
-            log: log.clone(),
-            fail: fail.clone(),
-        }));
-    (steering, log, fail)
+/// The node-agent's half of the channel, driven explicitly by a test.
+struct NodeAgentFake {
+    registry: tempfile::TempDir,
+    auto_acknowledge: Arc<std::sync::atomic::AtomicBool>,
+    fail_publish: Arc<std::sync::atomic::AtomicBool>,
+    fail_read_ack: Arc<std::sync::atomic::AtomicBool>,
+    fail_teardown: Arc<std::sync::atomic::AtomicBool>,
+    log: Arc<Mutex<Vec<String>>>,
 }
 
-fn entries(log: &Arc<Mutex<Vec<String>>>) -> Vec<String> {
-    log.lock().expect("shared log").clone()
+impl NodeAgentFake {
+    /// Apply whatever is published and acknowledge exactly that generation —
+    /// the node-agent's success path.
+    fn acknowledge_latest(&self) {
+        let desired = read_desired_generation(self.registry.path())
+            .expect("read desired generation")
+            .expect("a generation is published");
+        write_acknowledgement(self.registry.path(), &desired.generation)
+            .expect("node-agent acknowledgement");
+    }
+
+    /// Withdraw the acknowledgement without touching the desired generation —
+    /// the node-agent's refusal path (an over-bound set, a missing map, a scan
+    /// or insert error), and also what a wiped scratch directory looks like.
+    fn withdraw_acknowledgement(&self) {
+        clear_acknowledgement(self.registry.path()).expect("clear acknowledgement");
+    }
+
+    fn entries(&self) -> Vec<String> {
+        self.log.lock().expect("shared log").clone()
+    }
+
+    fn take_entries(&self) -> Vec<String> {
+        std::mem::take(&mut *self.log.lock().expect("shared log"))
+    }
+}
+
+fn acknowledged_steering(auto_acknowledge: bool) -> (NodeWaypointUdpSteering, NodeAgentFake) {
+    let registry = tempfile::tempdir().expect("registry dir");
+    let log = Arc::new(Mutex::new(Vec::new()));
+    let auto = Arc::new(std::sync::atomic::AtomicBool::new(auto_acknowledge));
+    let fail_publish = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let fail_read_ack = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let fail_teardown = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let publisher = RecordingPublisher {
+        inner: RegistryDirReplySourcePublisher::new(registry.path()),
+        registry: registry.path().to_path_buf(),
+        log: log.clone(),
+        fail_publish: fail_publish.clone(),
+        fail_read_ack: fail_read_ack.clone(),
+        auto_acknowledge: auto.clone(),
+    };
+    let steering = NodeWaypointUdpSteering::new(Arc::new(SharedLogBackend {
+        log: log.clone(),
+        fail_teardown: fail_teardown.clone(),
+    }))
+    .with_reply_source_publisher(Arc::new(publisher));
+    let agent = NodeAgentFake {
+        registry,
+        auto_acknowledge: auto,
+        fail_publish,
+        fail_read_ack,
+        fail_teardown,
+        log,
+    };
+    (steering, agent)
+}
+
+fn ifaces() -> Vec<String> {
+    vec!["veth0".to_string()]
 }
 
 /// The apply order. A reply source must be authorized BEFORE the rules that
@@ -664,23 +761,26 @@ fn entries(log: &Arc<Mutex<Vec<String>>>) -> Vec<String> {
 /// listener's reply is dropped by this node's own pod-veth guard.
 #[test]
 fn a_generation_authorizes_its_reply_sources_before_it_steers_anything() {
-    let (steering, log, _fail) = shared_log_steering(false);
+    let (steering, agent) = acknowledged_steering(true);
 
     assert_eq!(
         steering.reconcile_with(
-            &["veth0".to_string()],
-            &[destination("10.96.0.10", 5300), destination("fd00::a", 5300)],
+            &ifaces(),
+            &[
+                destination("10.96.0.10", 5300),
+                destination("fd00::a", 5300),
+            ],
         ),
         SteerReconcileOutcome::Applied
     );
 
     assert_eq!(
-        entries(&log),
+        agent.entries(),
         vec![
-            // First pass still reaps a predecessor, which withdraws first.
+            // The first pass still reaps a predecessor's rules.
             "script:teardown".to_string(),
-            "publish:withdraw".to_string(),
-            // Then authorize, and only then steer.
+            // Then authorize, and only then — once the node-agent has proven
+            // both families live — steer.
             "publish:2".to_string(),
             "script:setup".to_string(),
         ],
@@ -689,49 +789,418 @@ fn a_generation_authorizes_its_reply_sources_before_it_steers_anything() {
     forget(steering);
 }
 
+/// The gate this repair exists for. Publishing a claim is a REQUEST; the maps
+/// belong to the node-agent. Until it has acknowledged this exact generation no
+/// steering rule may exist, or every add/update has a window in which the
+/// Service path is steered at a listener whose replies the pod-veth guard drops
+/// — and a node-agent that never converges makes that window permanent.
+#[test]
+fn no_setup_runs_until_the_exact_generation_is_acknowledged() {
+    let (steering, agent) = acknowledged_steering(false);
+    let destinations = [destination("10.96.0.10", 5300)];
+
+    assert_eq!(
+        steering.reconcile_with(&ifaces(), &destinations),
+        SteerReconcileOutcome::PendingAck,
+        "an unacknowledged generation must not install steering rules"
+    );
+    let pending = agent.take_entries();
+    assert!(
+        pending.contains(&"publish:1".to_string()),
+        "the generation must be published so the node-agent can apply it: {pending:?}"
+    );
+    assert!(
+        !pending.contains(&"script:setup".to_string()),
+        "no datagram may be steered before the authorization is proven live: {pending:?}"
+    );
+
+    // The node-agent converges. The very next ordinary reconcile installs.
+    agent.acknowledge_latest();
+    assert_eq!(
+        steering.reconcile_with(&ifaces(), &destinations),
+        SteerReconcileOutcome::Applied
+    );
+    let applied = agent.take_entries();
+    assert!(
+        applied.contains(&"script:setup".to_string()),
+        "an acknowledged generation must install on the next reconcile: {applied:?}"
+    );
+    assert!(
+        !applied.contains(&"script:teardown".to_string()),
+        "the retry must not churn the datapath it already proved absent: {applied:?}"
+    );
+
+    // And it settles: no republish, no command.
+    assert_eq!(
+        steering.reconcile_with(&ifaces(), &destinations),
+        SteerReconcileOutcome::Unchanged
+    );
+    assert!(agent.entries().is_empty());
+    forget(steering);
+}
+
+/// A pending generation must be retried indefinitely WITHOUT walking its
+/// sequence forward, or the acknowledgement could never catch up — and without
+/// blocking: every pass returns immediately.
+#[test]
+fn a_pending_generation_is_retried_without_advancing_it() {
+    let (steering, agent) = acknowledged_steering(false);
+    let destinations = [destination("10.96.0.10", 5300)];
+
+    for _ in 0..4 {
+        assert_eq!(
+            steering.reconcile_with(&ifaces(), &destinations),
+            SteerReconcileOutcome::PendingAck
+        );
+    }
+    assert!(
+        !agent.entries().contains(&"script:setup".to_string()),
+        "no pass may steer while the generation is unproven"
+    );
+
+    agent.acknowledge_latest();
+    assert_eq!(
+        steering.reconcile_with(&ifaces(), &destinations),
+        SteerReconcileOutcome::Applied,
+        "the sequence must not have advanced past the acknowledgement"
+    );
+    forget(steering);
+}
+
+/// An acknowledgement of the PREVIOUS generation is not evidence about this
+/// one. A change of the serving set must re-prove itself, and — because the old
+/// rules steer at addresses the new generation may not authorize — the existing
+/// rules are REVERTED while it does.
+#[test]
+fn a_stale_acknowledgement_never_satisfies_a_new_generation() {
+    let (steering, agent) = acknowledged_steering(false);
+    let first = [destination("10.96.0.10", 5300)];
+    let second = [destination("10.96.0.11", 5301)];
+
+    steering.reconcile_with(&ifaces(), &first);
+    agent.acknowledge_latest();
+    assert_eq!(
+        steering.reconcile_with(&ifaces(), &first),
+        SteerReconcileOutcome::Applied
+    );
+    agent.take_entries();
+
+    // The serving set changes; the node-agent has not caught up.
+    assert_eq!(
+        steering.reconcile_with(&ifaces(), &second),
+        SteerReconcileOutcome::PendingAck,
+        "the previous generation's acknowledgement must not satisfy the new one"
+    );
+    let pending = agent.take_entries();
+    assert_eq!(
+        pending,
+        vec!["script:teardown".to_string(), "publish:1".to_string()],
+        "the outgoing generation's rules must be removed, and no new rule installed"
+    );
+
+    agent.acknowledge_latest();
+    assert_eq!(
+        steering.reconcile_with(&ifaces(), &second),
+        SteerReconcileOutcome::Applied
+    );
+    forget(steering);
+}
+
+/// An acknowledgement that DISAPPEARS (the node-agent refused the set on a
+/// later poll, lost its maps, or restarted without reapplying) must revert the
+/// steering rules rather than leave them installed against an unproven
+/// authorization.
+#[test]
+fn a_withdrawn_acknowledgement_reverts_the_installed_steering() {
+    let (steering, agent) = acknowledged_steering(true);
+    let destinations = [destination("10.96.0.10", 5300)];
+
+    assert_eq!(
+        steering.reconcile_with(&ifaces(), &destinations),
+        SteerReconcileOutcome::Applied
+    );
+    agent.take_entries();
+
+    // The node-agent retracts its proof; the desired generation is unchanged.
+    agent
+        .auto_acknowledge
+        .store(false, std::sync::atomic::Ordering::SeqCst);
+    agent.withdraw_acknowledgement();
+
+    assert_eq!(
+        steering.reconcile_with(&ifaces(), &destinations),
+        SteerReconcileOutcome::PendingAck
+    );
+    let reverted = agent.take_entries();
+    assert!(
+        reverted.contains(&"script:teardown".to_string()),
+        "an unproven authorization must not keep its steering rules: {reverted:?}"
+    );
+    assert!(
+        !reverted.contains(&"script:setup".to_string()),
+        "and must not reinstall them: {reverted:?}"
+    );
+
+    agent.acknowledge_latest();
+    assert_eq!(
+        steering.reconcile_with(&ifaces(), &destinations),
+        SteerReconcileOutcome::Applied
+    );
+    forget(steering);
+}
+
 /// The teardown order is the mirror image: the rules go first, so nothing is
 /// steered at an address whose authorization is about to disappear.
 #[test]
 fn a_teardown_unsteers_before_it_withdraws_authorization() {
-    let (steering, log, _fail) = shared_log_steering(false);
-    let ifaces = vec!["veth0".to_string()];
+    let (steering, agent) = acknowledged_steering(true);
 
     assert_eq!(
-        steering.reconcile_with(&ifaces, &[destination("10.96.0.10", 5300)]),
+        steering.reconcile_with(&ifaces(), &[destination("10.96.0.10", 5300)]),
         SteerReconcileOutcome::Applied
     );
-    log.lock().expect("shared log").clear();
+    agent.take_entries();
 
     // Withdrawing the last destination is the ordinary listener-stop path.
     assert_eq!(
-        steering.reconcile_with(&ifaces, &[]),
+        steering.reconcile_with(&ifaces(), &[]),
         SteerReconcileOutcome::Removed
     );
     assert_eq!(
-        entries(&log),
-        vec!["script:teardown".to_string(), "publish:withdraw".to_string()],
+        agent.entries(),
+        vec![
+            "script:teardown".to_string(),
+            "publish:withdraw".to_string()
+        ],
         "the steering rules must be removed before the authorization they relied on"
     );
     forget(steering);
 }
 
-/// A publication that cannot be applied fails the WHOLE generation closed: no
+/// "Rules first" means a SUCCESSFUL exact-name teardown, not merely an
+/// attempted command. If teardown fails, publishing the empty generation would
+/// let the node-agent revoke reply authorization while stale rules still steer
+/// traffic, recreating the black hole and falsely settling the withdrawal.
+#[test]
+fn a_failed_rule_teardown_does_not_publish_or_settle_the_withdrawal() {
+    let (steering, agent) = acknowledged_steering(true);
+    let destinations = [destination("10.96.0.10", 5300)];
+    assert_eq!(
+        steering.reconcile_with(&ifaces(), &destinations),
+        SteerReconcileOutcome::Applied
+    );
+    agent.take_entries();
+
+    agent
+        .fail_teardown
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    for _ in 0..2 {
+        assert_eq!(
+            steering.reconcile_with(&ifaces(), &[]),
+            SteerReconcileOutcome::Failed
+        );
+        assert_eq!(
+            agent.take_entries(),
+            vec!["script:teardown".to_string()],
+            "an unproven rule removal must retry without publishing the empty generation"
+        );
+    }
+
+    agent
+        .fail_teardown
+        .store(false, std::sync::atomic::Ordering::SeqCst);
+    assert_eq!(
+        steering.reconcile_with(&ifaces(), &[]),
+        SteerReconcileOutcome::Removed
+    );
+    assert_eq!(
+        agent.entries(),
+        vec![
+            "script:teardown".to_string(),
+            "publish:withdraw".to_string()
+        ]
+    );
+    forget(steering);
+}
+
+/// A failed outgoing-generation teardown also fences an update: the replacement
+/// desired generation is not published and setup cannot run until the stale
+/// rules are proven gone.
+#[test]
+fn a_failed_rule_teardown_fences_replacement_publication_and_setup() {
+    let (steering, agent) = acknowledged_steering(true);
+    let first = [destination("10.96.0.10", 5300)];
+    let second = [destination("10.96.0.11", 5301)];
+    assert_eq!(
+        steering.reconcile_with(&ifaces(), &first),
+        SteerReconcileOutcome::Applied
+    );
+    agent.take_entries();
+
+    agent
+        .fail_teardown
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    assert_eq!(
+        steering.reconcile_with(&ifaces(), &second),
+        SteerReconcileOutcome::Failed
+    );
+    assert_eq!(agent.take_entries(), vec!["script:teardown".to_string()]);
+
+    agent
+        .fail_teardown
+        .store(false, std::sync::atomic::Ordering::SeqCst);
+    assert_eq!(
+        steering.reconcile_with(&ifaces(), &second),
+        SteerReconcileOutcome::Applied
+    );
+    assert_eq!(
+        agent.entries(),
+        vec![
+            "script:teardown".to_string(),
+            "publish:1".to_string(),
+            "script:setup".to_string()
+        ]
+    );
+    forget(steering);
+}
+
+/// A withdrawal is not DONE when it is requested — it is done when the
+/// node-agent has proven the empty generation live. Reporting it settled early
+/// would leave a revoked ClusterIP admissible to enrolled pods with no serving
+/// socket for the life of the process, because the quiet-poll short-circuit
+/// would then report `Unchanged` forever.
+#[test]
+fn a_withdrawal_is_not_proven_until_the_empty_generation_is_acknowledged() {
+    let (steering, agent) = acknowledged_steering(false);
+    let destinations = [destination("10.96.0.10", 5300)];
+
+    steering.reconcile_with(&ifaces(), &destinations);
+    agent.acknowledge_latest();
+    assert_eq!(
+        steering.reconcile_with(&ifaces(), &destinations),
+        SteerReconcileOutcome::Applied
+    );
+    agent.take_entries();
+
+    // The listener stops. The rules go immediately; the proof does not.
+    assert_eq!(
+        steering.reconcile_with(&ifaces(), &[]),
+        SteerReconcileOutcome::PendingAck,
+        "an unacknowledged withdrawal must not be reported as removed"
+    );
+    assert_eq!(
+        agent.take_entries(),
+        vec![
+            "script:teardown".to_string(),
+            "publish:withdraw".to_string()
+        ]
+    );
+
+    // Still unproven: the next quiet poll must RE-attempt rather than settle.
+    assert_eq!(
+        steering.reconcile_with(&ifaces(), &[]),
+        SteerReconcileOutcome::PendingAck
+    );
+    let retried = agent.take_entries();
+    assert!(
+        retried.contains(&"publish:withdraw".to_string()),
+        "an unproven withdrawal must be retried on the next reconcile: {retried:?}"
+    );
+    assert!(
+        !retried.contains(&"script:teardown".to_string()),
+        "the rules are already proven gone; only the proof is missing: {retried:?}"
+    );
+
+    // The node-agent proves the empty generation live. The withdrawal is now
+    // settled, so the loop stops issuing commands entirely.
+    agent.acknowledge_latest();
+    assert_eq!(
+        steering.reconcile_with(&ifaces(), &[]),
+        SteerReconcileOutcome::Unchanged
+    );
+    assert!(
+        agent.entries().is_empty(),
+        "a proven withdrawal must run no command at all"
+    );
+    forget(steering);
+}
+
+/// A withdrawal whose PUBLICATION fails is a hard failure, distinct from one
+/// merely waiting for the node-agent — and it is never recorded as done.
+/// Without this, one transient I/O error would leave a revoked ClusterIP
+/// authorized for the life of the process, because the quiet-poll short-circuit
+/// would report `Unchanged` forever.
+#[test]
+fn a_failed_withdrawal_is_retried_rather_than_settled() {
+    let (steering, agent) = acknowledged_steering(true);
+    let destinations = [destination("10.96.0.10", 5300)];
+
+    assert_eq!(
+        steering.reconcile_with(&ifaces(), &destinations),
+        SteerReconcileOutcome::Applied
+    );
+
+    // The listener stops while the channel is unwritable.
+    agent
+        .fail_publish
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    assert_eq!(
+        steering.reconcile_with(&ifaces(), &[]),
+        SteerReconcileOutcome::Failed
+    );
+    agent.take_entries();
+
+    // Still failing: the next quiet poll must RE-attempt the withdrawal instead
+    // of settling.
+    assert_eq!(
+        steering.reconcile_with(&ifaces(), &[]),
+        SteerReconcileOutcome::Failed
+    );
+    let retried = agent.take_entries();
+    assert!(
+        retried
+            .iter()
+            .any(|entry| entry.starts_with("publish:withdraw")),
+        "an unproven withdrawal must be retried on the next reconcile: {retried:?}"
+    );
+
+    // Once it succeeds and is acknowledged, the loop settles.
+    agent
+        .fail_publish
+        .store(false, std::sync::atomic::Ordering::SeqCst);
+    assert_eq!(
+        steering.reconcile_with(&ifaces(), &[]),
+        SteerReconcileOutcome::Removed
+    );
+    agent.take_entries();
+    assert_eq!(
+        steering.reconcile_with(&ifaces(), &[]),
+        SteerReconcileOutcome::Unchanged
+    );
+    assert!(agent.entries().is_empty());
+    forget(steering);
+}
+
+/// A publication that cannot be written fails the WHOLE generation closed: no
 /// steering rules are installed, so the Service path stays on its pre-existing
 /// fail-closed posture (dropped at the pod-veth guard) rather than becoming a
 /// steered black hole.
 #[test]
-fn a_failed_authorization_refuses_the_generation_and_steers_nothing() {
-    let (steering, log, _fail) = shared_log_steering(true);
+fn a_failed_publication_refuses_the_generation_and_steers_nothing() {
+    let (steering, agent) = acknowledged_steering(true);
+    agent
+        .fail_publish
+        .store(true, std::sync::atomic::Ordering::SeqCst);
 
     assert_eq!(
-        steering.reconcile_with(&["veth0".to_string()], &[destination("10.96.0.10", 5300)]),
+        steering.reconcile_with(&ifaces(), &[destination("10.96.0.10", 5300)]),
         SteerReconcileOutcome::Failed
     );
-    let recorded = entries(&log);
+    let recorded = agent.entries();
     assert!(
-        !recorded.iter().any(|entry| entry == "script:setup"),
+        !recorded.contains(&"script:setup".to_string()),
         "no steering rule may be installed for a generation whose reply sources \
-         could not be authorized: {recorded:?}"
+         could not be published: {recorded:?}"
     );
     assert!(
         recorded.iter().any(|entry| entry.ends_with(":failed")),
@@ -740,77 +1209,109 @@ fn a_failed_authorization_refuses_the_generation_and_steers_nothing() {
     forget(steering);
 }
 
-/// A failed WITHDRAWAL is never recorded as done. Without this, one transient
-/// I/O error would leave a revoked ClusterIP authorized for the life of the
-/// process, because the quiet-poll short-circuit would report `Unchanged`
-/// forever.
+/// A hard publication failure is DISTINCT from a pending acknowledgement, and
+/// so is an unreadable acknowledgement: neither may be mistaken for the settled
+/// applied generation, and both keep the datapath torn down.
 #[test]
-fn a_failed_withdrawal_is_retried_rather_than_settled() {
-    let (steering, log, fail) = shared_log_steering(false);
-    let ifaces = vec!["veth0".to_string()];
+fn an_unreadable_acknowledgement_fails_the_generation_closed() {
+    let (steering, agent) = acknowledged_steering(true);
+    agent
+        .fail_read_ack
+        .store(true, std::sync::atomic::Ordering::SeqCst);
 
     assert_eq!(
-        steering.reconcile_with(&ifaces, &[destination("10.96.0.10", 5300)]),
-        SteerReconcileOutcome::Applied
+        steering.reconcile_with(&ifaces(), &[destination("10.96.0.10", 5300)]),
+        SteerReconcileOutcome::Failed,
+        "an acknowledgement that cannot be read proves nothing"
     );
-
-    // The listener stops while the claim directory is unwritable.
-    fail.store(true, std::sync::atomic::Ordering::SeqCst);
-    assert_eq!(
-        steering.reconcile_with(&ifaces, &[]),
-        SteerReconcileOutcome::Removed
-    );
-    log.lock().expect("shared log").clear();
-
-    // Still failing: the next quiet poll must RE-attempt the withdrawal instead
-    // of settling on `Unchanged`.
-    assert_eq!(
-        steering.reconcile_with(&ifaces, &[]),
-        SteerReconcileOutcome::Removed
-    );
+    let recorded = agent.entries();
     assert!(
-        entries(&log)
-            .iter()
-            .any(|entry| entry.starts_with("publish:withdraw")),
-        "an unproven withdrawal must be retried on the next reconcile"
+        !recorded.contains(&"script:setup".to_string()),
+        "an unprovable generation must steer nothing: {recorded:?}"
     );
 
-    // Once it succeeds, the loop settles and stops issuing commands.
-    fail.store(false, std::sync::atomic::Ordering::SeqCst);
+    agent
+        .fail_read_ack
+        .store(false, std::sync::atomic::Ordering::SeqCst);
     assert_eq!(
-        steering.reconcile_with(&ifaces, &[]),
-        SteerReconcileOutcome::Removed
-    );
-    log.lock().expect("shared log").clear();
-    assert_eq!(
-        steering.reconcile_with(&ifaces, &[]),
-        SteerReconcileOutcome::Unchanged
-    );
-    assert!(
-        entries(&log).is_empty(),
-        "a settled empty plan must run no command at all"
+        steering.reconcile_with(&ifaces(), &[destination("10.96.0.10", 5300)]),
+        SteerReconcileOutcome::Applied,
+        "and the recovery is the ordinary next reconcile"
     );
     forget(steering);
 }
 
-/// A quiet poll on an UNCHANGED serving generation must not re-publish either —
-/// the reply-source set is part of the applied generation, not a per-poll write.
+/// A restart republishes from sequence 1 under a NEW owner. The predecessor's
+/// acknowledgement is still on disk naming ITS owner, so it must not satisfy
+/// the successor's first generation — otherwise a fresh process would steer
+/// immediately on a proof about a set the node may no longer hold.
+#[test]
+fn a_predecessor_acknowledgement_does_not_let_a_successor_steer() {
+    let registry = tempfile::tempdir().expect("registry dir");
+    let destinations = [destination("10.96.0.10", 5300)];
+
+    // The predecessor publishes and is acknowledged, then the process dies.
+    let predecessor = RegistryDirReplySourcePublisher::new(registry.path());
+    let old = predecessor.publish(&destinations).expect("predecessor");
+    write_acknowledgement(registry.path(), &old).expect("predecessor acknowledgement");
+
+    let log = Arc::new(Mutex::new(Vec::new()));
+    let auto = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let publisher = RecordingPublisher {
+        inner: RegistryDirReplySourcePublisher::new(registry.path()),
+        registry: registry.path().to_path_buf(),
+        log: log.clone(),
+        fail_publish: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        fail_read_ack: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        auto_acknowledge: auto,
+    };
+    let steering = NodeWaypointUdpSteering::new(Arc::new(SharedLogBackend {
+        log: log.clone(),
+        fail_teardown: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+    }))
+    .with_reply_source_publisher(Arc::new(publisher));
+
+    assert_eq!(
+        steering.reconcile_with(&ifaces(), &destinations),
+        SteerReconcileOutcome::PendingAck,
+        "a predecessor's acknowledgement must not prove the successor's generation"
+    );
+    let recorded = log.lock().expect("shared log").clone();
+    assert!(
+        !recorded.contains(&"script:setup".to_string()),
+        "the successor must wait for its OWN acknowledgement: {recorded:?}"
+    );
+
+    // The live node-agent acknowledges the successor's generation.
+    let desired = read_desired_generation(registry.path())
+        .expect("read desired generation")
+        .expect("a generation is published");
+    write_acknowledgement(registry.path(), &desired.generation).expect("acknowledgement");
+    assert_eq!(
+        steering.reconcile_with(&ifaces(), &destinations),
+        SteerReconcileOutcome::Applied
+    );
+    forget(steering);
+}
+
+/// A quiet poll on an UNCHANGED, ACKNOWLEDGED serving generation must not
+/// re-publish either — the reply-source set is part of the applied generation,
+/// not a per-poll write.
 #[test]
 fn an_unchanged_generation_republishes_nothing() {
-    let (steering, log, _fail) = shared_log_steering(false);
-    let ifaces = vec!["veth0".to_string()];
+    let (steering, agent) = acknowledged_steering(true);
     let destinations = [destination("10.96.0.10", 5300)];
 
     assert_eq!(
-        steering.reconcile_with(&ifaces, &destinations),
+        steering.reconcile_with(&ifaces(), &destinations),
         SteerReconcileOutcome::Applied
     );
-    log.lock().expect("shared log").clear();
+    agent.take_entries();
     assert_eq!(
-        steering.reconcile_with(&ifaces, &destinations),
+        steering.reconcile_with(&ifaces(), &destinations),
         SteerReconcileOutcome::Unchanged
     );
-    assert!(entries(&log).is_empty());
+    assert!(agent.entries().is_empty());
     forget(steering);
 }
 
@@ -819,18 +1320,21 @@ fn an_unchanged_generation_republishes_nothing() {
 /// than it found it.
 #[test]
 fn shutdown_withdraws_every_authorized_reply_source() {
-    let (steering, log, _fail) = shared_log_steering(false);
+    let (steering, agent) = acknowledged_steering(true);
 
     assert_eq!(
-        steering.reconcile_with(&["veth0".to_string()], &[destination("10.96.0.10", 5300)]),
+        steering.reconcile_with(&ifaces(), &[destination("10.96.0.10", 5300)]),
         SteerReconcileOutcome::Applied
     );
-    log.lock().expect("shared log").clear();
+    agent.take_entries();
 
     steering.shutdown();
     assert_eq!(
-        entries(&log),
-        vec!["script:teardown".to_string(), "publish:withdraw".to_string()],
+        agent.entries(),
+        vec![
+            "script:teardown".to_string(),
+            "publish:withdraw".to_string()
+        ],
         "shutdown must un-steer and then withdraw every authorization"
     );
     forget(steering);

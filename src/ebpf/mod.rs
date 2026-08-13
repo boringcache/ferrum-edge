@@ -940,8 +940,8 @@ pub trait EbpfBackend: Send + Sync {
     /// entry.
     ///
     /// Set-valued rather than per-entry for the same reason
-    /// [`Self::update_pod_inbound_ports`] is: the node-agent's only input is a
-    /// directory of claims the mesh proxy owns, so a proxy crash, restart, or
+    /// [`Self::update_pod_inbound_ports`] is: the node-agent's only input is one
+    /// whole-set generation the mesh proxy owns, so a proxy crash, restart, or
     /// missed retraction must converge without the node-agent carrying an
     /// enumerated removal list that can go stale exactly when it matters.
     ///
@@ -1144,6 +1144,20 @@ pub struct MockEbpfBackend {
     /// publication the node-agent could not apply is NOT recorded as converged
     /// and is retried, and that a failed retraction never reports success.
     pub fail_replace_udp_reply_sources: bool,
+    /// When `true`, the reply-source maps are treated as ABSENT from the loaded
+    /// program, mirroring `BpfMaps::replace_udp_reply_sources`: every generation,
+    /// including an empty withdrawal, is a hard error because both families
+    /// must be scanned and applied before it may be acknowledged.
+    pub udp_reply_source_maps_absent: bool,
+    /// When `true`, the IPv4 half of the replacement succeeds and the operation
+    /// then fails before IPv6, mirroring a partial family failure in the real
+    /// remove-before-insert sequence. The generation must remain unacknowledged.
+    pub fail_replace_udp_reply_sources_after_ipv4: bool,
+    /// Test seam: after the next successful reply-source map replacement,
+    /// substitute these bytes at the supplied desired-manifest path.
+    /// This models a successor publication racing the node-agent between map
+    /// application and acknowledgement; the production backend never uses it.
+    pub udp_reply_source_desired_replacement: Option<(std::path::PathBuf, Vec<u8>)>,
     /// When `true`, `clear_pod_inbound_ports` / `clear_pod_inbound_ports6` fail
     /// so removal tests can prove a successful pod-IP map delete that cannot
     /// clear the bounded scope map stays pending and retryable.
@@ -1373,13 +1387,42 @@ impl EbpfBackend for MockEbpfBackend {
                 sources.len()
             ));
         }
+        if self.udp_reply_source_maps_absent {
+            return Err(
+                "injected absent NodeWaypoint UDP reply-source maps; the set cannot be authorized"
+                    .to_string(),
+            );
+        }
+        if self.fail_replace_udp_reply_sources_after_ipv4 {
+            let desired4: HashSet<(IpAddr, u16)> = sources
+                .iter()
+                .copied()
+                .filter(|(ip, _)| ip.is_ipv4())
+                .collect();
+            self.udp_reply_sources
+                .retain(|entry| entry.0.is_ipv6() || desired4.contains(entry));
+            self.udp_reply_sources.extend(desired4);
+            return Err(
+                "injected NodeWaypoint UDP reply-source failure after IPv4 application"
+                    .to_string(),
+            );
+        }
         // Mirror the real backend: stale entries go first, so a partial failure
         // can only narrow the authorized set.
         let desired: HashSet<(IpAddr, u16)> = sources.iter().copied().collect();
-        self.udp_reply_sources.retain(|entry| desired.contains(entry));
+        self.udp_reply_sources
+            .retain(|entry| desired.contains(entry));
         self.udp_reply_sources.extend(desired.iter().copied());
         self.udp_reply_source_updates.push(sources.to_vec());
         self.record_operation(format!("replace_udp_reply_sources:{}", sources.len()));
+        if let Some((path, bytes)) = self.udp_reply_source_desired_replacement.take() {
+            std::fs::write(path, bytes).map_err(|error| {
+                format!(
+                    "injected desired-generation replacement failed: {}",
+                    error.kind()
+                )
+            })?;
+        }
         Ok(())
     }
 
