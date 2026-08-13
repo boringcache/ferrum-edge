@@ -797,6 +797,35 @@ fn a_jwt_shaped_token_reconnects_before_exp_with_the_configured_skew() {
     );
 }
 
+/// Issue #3852. A programmatic policy may set `refresh_skew = 0` so a hosted
+/// test can prove deadline retirement without waiting for the operator 60s
+/// skew. Retirement must still fall strictly before `exp`: otherwise the next
+/// attempt fail-closed-refuses the same token as expired and never reconnects.
+#[test]
+fn a_jwt_with_zero_skew_still_reconnects_strictly_before_exp() {
+    let now = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000);
+    let token = jwt_with_exp(1_000_003);
+    let (lifetime, basis) = credential_lifetime(&token, lifetime_policy(3600, 0), now)
+        .expect("a 3s JWT with zero skew is admissible");
+    assert_eq!(basis, StockCredentialDeadlineBasis::JwtExpirationHint);
+    assert!(
+        lifetime < Duration::from_secs(3),
+        "zero skew must not schedule retirement at exp: {lifetime:?}"
+    );
+    assert!(
+        lifetime > Duration::ZERO,
+        "the scheduled window must stay positive: {lifetime:?}"
+    );
+
+    let at_deadline = now + lifetime;
+    let (remaining, _) = credential_lifetime(&token, lifetime_policy(3600, 0), at_deadline)
+        .expect("the next attempt must still admit the same not-yet-expired token");
+    assert!(
+        remaining > Duration::ZERO,
+        "reconnect at the scheduled deadline must observe a positive remaining window"
+    );
+}
+
 /// Issue #3852 round two. A short-lived JWT is legitimate material and must be
 /// used with a correspondingly short deadline — NOT clamped up to a reconnect
 /// floor, which is what let a stream outlive `exp`.

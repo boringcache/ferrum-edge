@@ -680,12 +680,14 @@ async fn start_stalling_cp(updates: Vec<MeshConfigUpdate>) -> StallingCpHandle {
 async fn a_control_plane_that_never_answers_a_status_report_cannot_suspend_the_receive_loop() {
     let stalling_slice = MeshSlice {
         version: "v-stalling".to_string(),
+        workload_spiffe_id: Some(SPIFFE.to_string()),
         ..bound_slice()
     };
     let stalling = start_stalling_cp(vec![update_for(&stalling_slice), heartbeat()]).await;
 
     let healthy_slice = MeshSlice {
         version: "v-healthy-fallback".to_string(),
+        workload_spiffe_id: Some(SPIFFE.to_string()),
         ..bound_slice()
     };
     let healthy = start_cp(vec![update_for(&healthy_slice)]).await;

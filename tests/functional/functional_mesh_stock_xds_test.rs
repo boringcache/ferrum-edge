@@ -246,6 +246,13 @@ impl AggregatedDiscoveryService for ScriptedThirdPartyAds {
     }
 }
 
+/// Install the repository's compile-time rustls provider at the fixture
+/// boundary. Idempotent and concurrency-safe: `install_default` fails only when
+/// another thread already won, which is the desired process-wide outcome.
+fn ensure_process_crypto_provider() {
+    let _ = ferrum_edge::fips::base_crypto_provider().install_default();
+}
+
 /// Server-side TLS material for the scripted ADS endpoint, plus the CA the
 /// gateway pins (issue #3853: the production stock-xDS gate now refuses h2c).
 struct AdsTransportTls {
@@ -259,6 +266,7 @@ struct AdsTransportTls {
 /// `127.0.0.1`, which is what the data plane dials and therefore what it
 /// verifies.
 fn generate_ads_transport_tls() -> Result<AdsTransportTls, String> {
+    ensure_process_crypto_provider();
     let dir = TempDir::new().map_err(|e| format!("ads tls temp dir: {e}"))?;
     let ca_key = rcgen::KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256)
         .map_err(|e| format!("ads ca key: {e}"))?;
@@ -312,6 +320,7 @@ impl StockAdsHandle {
         seeds: HashMap<String, DiscoveryResponse>,
         tls: &AdsTransportTls,
     ) -> Result<Self, String> {
+        ensure_process_crypto_provider();
         let listener = bind_fixture_listener(loopback_ephemeral())
             .await
             .map_err(|e| format!("bind scripted ADS listener: {e}"))?;
@@ -941,6 +950,7 @@ async fn wait_until_unreachable(outbound_port: u16, host: &str) -> Result<Probe,
 /// believed it was driving), so it is retried with fresh ports, temp dirs,
 /// control planes, and ADS server rather than reported as a datapath result.
 async fn drive_stock_xds_live_datapath() -> Result<StockLiveObservations, String> {
+    ensure_process_crypto_provider();
     ensure_gateway_built().map_err(|e| format!("gateway build: {e}"))?;
 
     let mut last_failure = String::new();
@@ -1734,6 +1744,10 @@ async fn functional_mesh_stock_xds_refuses_plaintext_transport_postures() {
         std::fs::write(&policy_path, stock_policy_document()).expect("write policy document");
         let token_path = temp.path().join("stock-token");
         std::fs::write(&token_path, b"an-external-projected-token\n").expect("write token");
+        // Production mode refuses identity-less mesh before transport admission.
+        // Supply the same file SVID tuple the live datapath uses so validation
+        // reaches the stock-xDS plaintext refusal.
+        let svids = generate_two_gateway_svids(temp.path(), A_SPIFFE, B_SPIFFE);
 
         let mut command = std::process::Command::new(stock_xds_gateway_binary_path());
         command
@@ -1747,6 +1761,13 @@ async fn functional_mesh_stock_xds_refuses_plaintext_transport_postures() {
             )
             .env("FERRUM_MESH_FILE_CONFIG_PATH", &policy_path)
             .env("FERRUM_MESH_ALLOW_NO_CA", "true")
+            .env("FERRUM_MESH_WORKLOAD_SPIFFE_ID", A_SPIFFE)
+            .env("FERRUM_GATEWAY_SVID_CERT_PATH", &svids.a.cert_path)
+            .env("FERRUM_GATEWAY_SVID_KEY_PATH", &svids.a.key_path)
+            .env(
+                "FERRUM_GATEWAY_SVID_TRUST_BUNDLE_PATH",
+                &svids.a.trust_bundle_path,
+            )
             .env(
                 "FERRUM_MESH_STOCK_XDS_ALLOW_PLAINTEXT",
                 if case.allow_plaintext {

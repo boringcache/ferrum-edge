@@ -339,6 +339,13 @@ pub const MAX_STOCK_XDS_TOKEN_MAX_STREAM_LIFETIME_SECS: u64 = 86_400;
 /// is parsed, and hosted tests use the gap between the two to prove the
 /// opaque-token deadline live without sleeping for a production minute.
 const ABSOLUTE_MAX_STREAM_LIFETIME_FLOOR: Duration = Duration::from_secs(1);
+/// When `refresh_skew` is zero, pull a JWT-shaped stream deadline this far
+/// before `exp` so the next attempt can still admit the same not-yet-expired
+/// token. This is a scheduling slack, not a refusal threshold: a token whose
+/// remaining window is already this small keeps that short deadline, matching
+/// the "do not clamp a short JWT up" rule. Operator skew already supplies a
+/// reconnect window when it is set, so slack is not stacked on top of it.
+const JWT_ZERO_SKEW_RECONNECT_SLACK: Duration = Duration::from_secs(1);
 
 /// The configured credential source plus its lifetime policy.
 #[derive(Clone, PartialEq, Eq)]
@@ -584,8 +591,18 @@ pub fn credential_lifetime(
     if before_exp.is_zero() {
         return Err(StockCredentialInvalidReason::ExpiresWithinSkew);
     }
+    // A zero-skew policy would otherwise schedule retirement *at* `exp`. The
+    // next attempt then sees remaining == 0 and fail-closed refuses the same
+    // still-current token, so no second RPC is ever opened. Pull the deadline
+    // forward only when there is slack to spend; do not refuse a shorter JWT.
+    let scheduled = if policy.refresh_skew.is_zero() && before_exp > JWT_ZERO_SKEW_RECONNECT_SLACK
+    {
+        before_exp - JWT_ZERO_SKEW_RECONNECT_SLACK
+    } else {
+        before_exp
+    };
     Ok((
-        before_exp.min(opaque),
+        scheduled.min(opaque),
         StockCredentialDeadlineBasis::JwtExpirationHint,
     ))
 }

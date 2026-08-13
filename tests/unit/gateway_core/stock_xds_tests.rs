@@ -885,7 +885,13 @@ fn stock_refusal_diagnostics_are_bounded_and_free_of_control_characters() {
         "a stored refusal diagnostic must not carry control characters"
     );
     assert!(refusal.resource.ends_with("(truncated)"));
-    assert_eq!(refusal.reason, refusal::UNPARSABLE_CLUSTER_NAME);
+    // Production ordering parses the Istio four-tuple first
+    // (`<direction>|<port>|<subset>|<host>`). This hostile name is well-formed
+    // as that tuple; the host is not a Kubernetes service FQDN (overlong,
+    // control characters), so the closed-set reason is the host classifier,
+    // not `unparsable_cluster_name`. The resource is still refused, bounded,
+    // and stripped of control characters.
+    assert_eq!(refusal.reason, refusal::NON_KUBERNETES_SERVICE_HOST);
     assert_eq!(refusal.type_label, "cds");
 }
 

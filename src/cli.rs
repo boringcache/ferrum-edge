@@ -835,6 +835,16 @@ pub fn execute_validate() -> Result<(), String> {
         println!("Startup security (env TLS/CIDRs/metrics): OK");
     }
 
+    // Mesh runtime admission (stock xDS transport posture, protocol/CP
+    // requirements) lives in `MeshRuntimeConfig::from_env_config` and is what
+    // `run` fail-closes on before dialing. Validate must exercise the same
+    // gate so a production plaintext ADS URL cannot report success.
+    if env_config.mode == OperatingMode::Mesh {
+        crate::modes::mesh::MeshRuntimeConfig::from_env_config(&env_config)
+            .map_err(|e| format!("Mesh runtime validation failed: {e}"))?;
+        println!("Mesh runtime: OK");
+    }
+
     println!("\nValidation passed.");
     Ok(())
 }

@@ -2417,25 +2417,28 @@ impl StockAdsAdmissionProbe {
         let mut credential_rx = watch.receiver();
         let fence = StockCredentialFence::bind(&watch, watch.latest().generation, None, false);
         let (tx, mut rx) = mpsc::channel(32);
-        let mut outbound = StockOutbound {
-            tx: &tx,
-            bound: Duration::from_secs(5),
-            fence: &fence,
-            credential_rx: &mut credential_rx,
-        };
         let recovery = MeshLocalSourceRecovery::new(Arc::new(AtomicBool::new(false)));
-        let result = handle_stock_response(
-            response,
-            config,
-            baseline,
-            None,
-            request,
-            &mut outbound,
-            &mut self.accumulator,
-            &mut self.stream_state,
-        )
-        .await;
-        drop(outbound);
+        // `StockOutbound` only borrows `tx`; ending that borrow by scope (not
+        // `drop`) is what lets the sender close so the probe can drain.
+        let result = {
+            let mut outbound = StockOutbound {
+                tx: &tx,
+                bound: Duration::from_secs(5),
+                fence: &fence,
+                credential_rx: &mut credential_rx,
+            };
+            handle_stock_response(
+                response,
+                config,
+                baseline,
+                None,
+                request,
+                &mut outbound,
+                &mut self.accumulator,
+                &mut self.stream_state,
+            )
+            .await
+        };
         drop(tx);
         while rx.try_recv().is_ok() {}
         match result {
