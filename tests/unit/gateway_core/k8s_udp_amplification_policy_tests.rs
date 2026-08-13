@@ -7,7 +7,8 @@
 
 use ferrum_edge::config::types::BackendScheme;
 use ferrum_edge::config_sources::k8s::{
-    K8sMetadata, K8sObject, K8sTranslationOptions, translate_k8s_objects,
+    GatewayApiUdpAmplificationPolicyStatus, K8sMetadata, K8sObject, K8sTranslationOptions,
+    translate_k8s_objects,
 };
 use ferrum_edge::identity::spiffe::TrustDomain;
 use ferrum_edge::k8s_controller::status::{
@@ -99,14 +100,50 @@ fn udp_gateway(name: &str, listener: &str, port: u16) -> K8sObject {
 }
 
 fn udp_route(name: &str) -> K8sObject {
+    udp_route_on(name, "dns")
+}
+
+fn udp_route_on(name: &str, section: &str) -> K8sObject {
     object_in(
         "UDPRoute",
         "gateway.networking.k8s.io/v1alpha2",
         "default",
         name,
         json!({
-            "parentRefs": [{"name": "edge", "sectionName": "dns"}],
+            "parentRefs": [{"name": "edge", "sectionName": section}],
             "rules": [{"backendRefs": [{"name": "coredns", "port": 5353}]}]
+        }),
+    )
+}
+
+fn udp_gateway_two_listeners(name: &str) -> K8sObject {
+    object_in(
+        "Gateway",
+        "gateway.networking.k8s.io/v1",
+        "default",
+        name,
+        json!({
+            "gatewayClassName": "ferrum",
+            "listeners": [
+                {
+                    "name": "dns",
+                    "port": 15353,
+                    "protocol": "UDP",
+                    "allowedRoutes": {
+                        "kinds": [{"kind": "UDPRoute"}],
+                        "namespaces": {"from": "Same"}
+                    }
+                },
+                {
+                    "name": "alt",
+                    "port": 15354,
+                    "protocol": "UDP",
+                    "allowedRoutes": {
+                        "kinds": [{"kind": "UDPRoute"}],
+                        "namespaces": {"from": "Same"}
+                    }
+                }
+            ]
         }),
     )
 }
@@ -143,14 +180,49 @@ fn finite_route_policy(name: &str, route: &str, factor: f64) -> K8sObject {
 }
 
 fn translated_factor(objects: &[K8sObject]) -> Option<f32> {
+    translated_factor_on_port(objects, 15353)
+}
+
+fn translated_factor_on_port(objects: &[K8sObject], port: u16) -> Option<f32> {
     let result = translate_k8s_objects(objects, options()).expect("translation succeeds");
     let proxy = result
         .config
         .proxies
         .iter()
-        .find(|proxy| proxy.backend_scheme == Some(BackendScheme::Udp))
+        .find(|proxy| {
+            proxy.backend_scheme == Some(BackendScheme::Udp) && proxy.listen_port == Some(port)
+        })
         .expect("UDP proxy");
     proxy.udp_max_response_amplification_factor
+}
+
+fn policy_status_named(
+    objects: &[K8sObject],
+    name: &str,
+) -> GatewayApiUdpAmplificationPolicyStatus {
+    let result = translate_k8s_objects(objects, options()).expect("translation succeeds");
+    result
+        .udp_amplification_policy_statuses
+        .into_iter()
+        .find(|status| status.policy.name == name)
+        .expect("policy status")
+}
+
+fn route_protection_reason_named(objects: &[K8sObject], route: &str) -> String {
+    let updates = plan_gateway_api_status_updates(objects, options(), &[]);
+    updates
+        .iter()
+        .find(|update| update.kind == "UDPRoute" && update.name == route)
+        .and_then(|update| update.status.get("parents")?.as_array()?.first())
+        .and_then(|parent| parent.get("conditions")?.as_array())
+        .into_iter()
+        .flatten()
+        .find(|entry| {
+            entry.get("type").and_then(Value::as_str) == Some("UDPAmplificationProtection")
+        })
+        .and_then(|entry| entry.get("reason").and_then(Value::as_str))
+        .unwrap_or("missing")
+        .to_string()
 }
 
 fn route_protection_reason(objects: &[K8sObject]) -> String {
@@ -510,4 +582,276 @@ fn missing_target_does_not_unprogram_the_route() {
     );
     let result = translate_k8s_objects(&objects, options()).expect("ok");
     assert_eq!(result.config.proxies.len(), 1);
+}
+
+fn finite_route_spec(route: &str, extra: Value) -> Value {
+    let mut spec = json!({
+        "targetRefs": [{
+            "group": "gateway.networking.k8s.io",
+            "kind": "UDPRoute",
+            "name": route
+        }],
+        "mode": "Finite",
+        "maxResponseAmplificationFactor": 2.0
+    });
+    if let Value::Object(spec_map) = &mut spec
+        && let Value::Object(extra_map) = extra
+    {
+        spec_map.extend(extra_map);
+    }
+    spec
+}
+
+fn assert_invalid_policy_falls_back(spec: Value, message: &str, forbidden: &str) {
+    let objects = [
+        gateway_class(),
+        udp_gateway("edge", "dns", 15353),
+        udp_route("dns"),
+        amp_policy("bad", spec),
+    ];
+    assert_eq!(
+        translated_factor(&objects),
+        Some(GATEWAY_API_UDP_AMPLIFICATION_DEFAULT_FACTOR)
+    );
+    assert_eq!(route_protection_reason(&objects), "FiniteDefault");
+    let status = policy_status_named(&objects, "bad");
+    assert!(!status.accepted);
+    assert_eq!(status.accepted_reason, "Invalid");
+    assert_eq!(status.accepted_message, message);
+    assert!(
+        !status.accepted_message.contains(forbidden),
+        "status must not echo hostile input"
+    );
+}
+
+#[test]
+fn malformed_optional_json_types_are_rejected_without_echoing_values() {
+    let hostile = "do-not-echo-this-payload";
+    assert_invalid_policy_falls_back(
+        finite_route_spec(
+            "dns",
+            json!({"targetRefs": [{
+                "group": {"evil": hostile},
+                "kind": "UDPRoute",
+                "name": "dns"
+            }]}),
+        ),
+        "spec.targetRefs.group must be a string",
+        hostile,
+    );
+    assert_invalid_policy_falls_back(
+        finite_route_spec(
+            "dns",
+            json!({"targetRefs": [{
+                "group": "gateway.networking.k8s.io",
+                "kind": "UDPRoute",
+                "name": "dns",
+                "namespace": [hostile]
+            }]}),
+        ),
+        "spec.targetRefs.namespace must be a string",
+        hostile,
+    );
+    assert_invalid_policy_falls_back(
+        json!({
+            "targetRefs": [{
+                "group": "gateway.networking.k8s.io",
+                "kind": "Gateway",
+                "name": "edge",
+                "sectionName": {"evil": hostile}
+            }],
+            "mode": "Finite",
+            "maxResponseAmplificationFactor": 2.0
+        }),
+        "spec.targetRefs.sectionName must be a string",
+        hostile,
+    );
+    assert_invalid_policy_falls_back(
+        finite_route_spec("dns", json!({"mode": 1})),
+        "spec.mode must be a string",
+        "1",
+    );
+    assert_invalid_policy_falls_back(
+        finite_route_spec("dns", json!({"acknowledgeUnsafeAmplification": hostile})),
+        "spec.acknowledgeUnsafeAmplification must be a bool",
+        hostile,
+    );
+}
+
+#[test]
+fn duplicate_canonical_target_refs_are_rejected() {
+    let objects = [
+        gateway_class(),
+        udp_gateway("edge", "dns", 15353),
+        udp_route("dns"),
+        amp_policy(
+            "dup",
+            json!({
+                "targetRefs": [
+                    {
+                        "group": "gateway.networking.k8s.io",
+                        "kind": "UDPRoute",
+                        "name": "dns"
+                    },
+                    {
+                        "kind": "UDPRoute",
+                        "name": "dns",
+                        "namespace": "default"
+                    }
+                ],
+                "mode": "Finite",
+                "maxResponseAmplificationFactor": 2.0
+            }),
+        ),
+    ];
+    assert_eq!(
+        translated_factor(&objects),
+        Some(GATEWAY_API_UDP_AMPLIFICATION_DEFAULT_FACTOR)
+    );
+    let status = policy_status_named(&objects, "dup");
+    assert!(!status.accepted);
+    assert_eq!(status.accepted_reason, "Invalid");
+    assert_eq!(
+        status.accepted_message,
+        "spec.targetRefs entries must be unique by kind, namespace, name, and sectionName"
+    );
+    assert!(
+        status.ancestors.is_empty(),
+        "duplicate targetRefs must not emit duplicate ancestors"
+    );
+}
+
+#[test]
+fn typoed_gateway_section_falls_back_to_finite_default_and_is_rejected() {
+    let objects = [
+        gateway_class(),
+        udp_gateway("edge", "dns", 15353),
+        udp_route("dns"),
+        amp_policy(
+            "typo",
+            json!({
+                "targetRefs": [{
+                    "group": "gateway.networking.k8s.io",
+                    "kind": "Gateway",
+                    "name": "edge",
+                    "sectionName": "dnss"
+                }],
+                "mode": "Finite",
+                "maxResponseAmplificationFactor": 2.0
+            }),
+        ),
+    ];
+    assert_eq!(
+        translated_factor(&objects),
+        Some(GATEWAY_API_UDP_AMPLIFICATION_DEFAULT_FACTOR)
+    );
+    assert_eq!(route_protection_reason(&objects), "FiniteDefault");
+    let status = policy_status_named(&objects, "typo");
+    assert!(!status.accepted);
+    assert_eq!(status.accepted_reason, "TargetNotFound");
+    assert_eq!(
+        status.accepted_message,
+        "UDPResponseAmplificationPolicy targetRef sectionName does not name a listener on the observed Gateway"
+    );
+}
+
+#[test]
+fn valid_gateway_section_policy_still_applies() {
+    let objects = [
+        gateway_class(),
+        udp_gateway("edge", "dns", 15353),
+        udp_route("dns"),
+        amp_policy(
+            "section",
+            json!({
+                "targetRefs": [{
+                    "group": "gateway.networking.k8s.io",
+                    "kind": "Gateway",
+                    "name": "edge",
+                    "sectionName": "dns"
+                }],
+                "mode": "Finite",
+                "maxResponseAmplificationFactor": 3.0
+            }),
+        ),
+    ];
+    assert_eq!(translated_factor(&objects), Some(3.0));
+    assert_eq!(route_protection_reason(&objects), "FinitePolicy");
+    let status = policy_status_named(&objects, "section");
+    assert!(status.accepted);
+}
+
+#[test]
+fn whole_gateway_target_does_not_require_a_section() {
+    let objects = [
+        gateway_class(),
+        udp_gateway("edge", "dns", 15353),
+        udp_route("dns"),
+        amp_policy(
+            "gw",
+            json!({
+                "targetRefs": [{
+                    "group": "gateway.networking.k8s.io",
+                    "kind": "Gateway",
+                    "name": "edge"
+                }],
+                "mode": "Finite",
+                "maxResponseAmplificationFactor": 4.0
+            }),
+        ),
+    ];
+    assert_eq!(translated_factor(&objects), Some(4.0));
+    let status = policy_status_named(&objects, "gw");
+    assert!(status.accepted);
+}
+
+#[test]
+fn conflicted_direct_policy_is_withdrawn_from_gatewayclass_lookup() {
+    let older = amp_policy_at(
+        "older",
+        "2024-01-01T00:00:00Z",
+        json!({
+            "targetRefs": [{
+                "group": "gateway.networking.k8s.io",
+                "kind": "UDPRoute",
+                "name": "dns"
+            }],
+            "mode": "Finite",
+            "maxResponseAmplificationFactor": 2.0
+        }),
+    );
+    let conflicted_class_default = amp_policy_at(
+        "class-default",
+        "2024-06-01T00:00:00Z",
+        json!({
+            "targetRefs": [{
+                "group": "gateway.networking.k8s.io",
+                "kind": "UDPRoute",
+                "name": "dns"
+            }],
+            "mode": "Finite",
+            "maxResponseAmplificationFactor": 32.0
+        }),
+    );
+    let objects = [
+        gateway_class_with_parameters("default", "class-default"),
+        udp_gateway_two_listeners("edge"),
+        udp_route_on("dns", "dns"),
+        udp_route_on("alt", "alt"),
+        older,
+        conflicted_class_default,
+    ];
+    assert_eq!(translated_factor_on_port(&objects, 15353), Some(2.0));
+    assert_eq!(
+        translated_factor_on_port(&objects, 15354),
+        Some(GATEWAY_API_UDP_AMPLIFICATION_DEFAULT_FACTOR)
+    );
+    assert_eq!(route_protection_reason_named(&objects, "dns"), "FinitePolicy");
+    assert_eq!(
+        route_protection_reason_named(&objects, "alt"),
+        "FiniteDefault"
+    );
+    let loser = policy_status_named(&objects, "class-default");
+    assert!(!loser.accepted);
+    assert_eq!(loser.accepted_reason, "Conflicted");
 }

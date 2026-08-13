@@ -13,7 +13,7 @@
 use chrono::{DateTime, Utc};
 use serde_json::Value;
 use std::cmp::Ordering;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use super::gateway_api::{self, parse_k8s_timestamp};
 use super::{
@@ -36,6 +36,10 @@ const REF_NOT_PERMITTED_MESSAGE: &str =
     "Cross-namespace UDPResponseAmplificationPolicy attachment is not permitted by ReferenceGrant";
 const TARGET_NOT_FOUND_MESSAGE: &str =
     "UDPResponseAmplificationPolicy targetRef does not resolve to an observed Gateway or UDPRoute";
+const TARGET_SECTION_NOT_FOUND_MESSAGE: &str =
+    "UDPResponseAmplificationPolicy targetRef sectionName does not name a listener on the observed Gateway";
+const DUPLICATE_TARGET_MESSAGE: &str =
+    "spec.targetRefs entries must be unique by kind, namespace, name, and sectionName";
 
 /// Effective protection posture projected onto a generated UDPRoute proxy and
 /// published on `UDPRoute.status.parents[].conditions`.
@@ -147,6 +151,8 @@ struct TargetRef {
 pub(crate) struct UdpAmplificationPolicyIndex {
     by_attachment: HashMap<AttachmentKey, IndexedPolicy>,
     /// Valid policy bodies keyed by `(namespace, name)` for GatewayClass.parametersRef.
+    /// A Direct policy that lost any named target is withdrawn here as well so
+    /// a Conflicted resource cannot still win through `parametersRef`.
     by_name: HashMap<(String, String), IndexedPolicy>,
 }
 
@@ -184,7 +190,7 @@ pub(crate) fn collect_all(
     acc: &mut K8sAccumulator,
     objects: &[&K8sObject],
 ) -> Result<(), K8sTranslateError> {
-    let observed_udproutes: std::collections::HashSet<(String, String)> = objects
+    let observed_udproutes: HashSet<(String, String)> = objects
         .iter()
         .filter(|object| object.kind == "UDPRoute")
         .map(|object| {
@@ -194,20 +200,51 @@ pub(crate) fn collect_all(
             )
         })
         .collect();
+    let observed_gateway_listeners = authored_gateway_listeners(objects);
 
     for object in objects {
         if object.kind != UDP_AMPLIFICATION_POLICY_KIND {
             continue;
         }
-        collect_one(acc, object, &observed_udproutes);
+        collect_one(acc, object, &observed_udproutes, &observed_gateway_listeners);
     }
     Ok(())
+}
+
+fn authored_gateway_listeners(
+    objects: &[&K8sObject],
+) -> HashMap<(String, String), HashSet<String>> {
+    let mut listeners: HashMap<(String, String), HashSet<String>> = HashMap::new();
+    for object in objects {
+        if object.kind != "Gateway" {
+            continue;
+        }
+        let key = (
+            object.metadata.namespace.clone(),
+            object.metadata.name.clone(),
+        );
+        let names = listeners.entry(key).or_default();
+        let Some(entries) = object.spec.get("listeners").and_then(Value::as_array) else {
+            continue;
+        };
+        for entry in entries {
+            if let Some(name) = entry
+                .get("name")
+                .and_then(Value::as_str)
+                .filter(|name| !name.is_empty())
+            {
+                names.insert(name.to_string());
+            }
+        }
+    }
+    listeners
 }
 
 fn collect_one(
     acc: &mut K8sAccumulator,
     object: &K8sObject,
-    observed_udproutes: &std::collections::HashSet<(String, String)>,
+    observed_udproutes: &HashSet<(String, String)>,
+    observed_gateway_listeners: &HashMap<(String, String), HashSet<String>>,
 ) {
     let parsed_targets = parse_target_refs(object);
     let parsed_body = parse_policy_body(object);
@@ -222,9 +259,13 @@ fn collect_one(
     let mut resolved_error = error;
     if resolved_error.is_none() {
         for target in &targets {
-            if let Some(error) =
-                authorize_and_resolve_target(acc, object, target, observed_udproutes)
-            {
+            if let Some(error) = authorize_and_resolve_target(
+                acc,
+                object,
+                target,
+                observed_udproutes,
+                observed_gateway_listeners,
+            ) {
                 resolved_error = Some(error);
                 break;
             }
@@ -299,8 +340,9 @@ fn collect_one(
     }
 
     // Conflicted losers are finalized after every policy is indexed so status
-    // is stable under input reorder. Record a provisional Accepted here; finish()
-    // flips policies that lost every attachment they named.
+    // is stable under input reorder. Record a provisional Accepted here;
+    // finalize_conflicts flips any policy that lost any named target and
+    // withdraws it from every live lookup, including GatewayClass.parametersRef.
     acc.record_udp_amplification_policy_status(GatewayApiUdpAmplificationPolicyStatus {
         policy: K8sResourceKey::from_object(object),
         accepted: true,
@@ -343,6 +385,14 @@ impl PolicyError {
             message: TARGET_NOT_FOUND_MESSAGE.to_string(),
         }
     }
+
+    fn target_section_not_found() -> Self {
+        Self {
+            accepted_reason: "TargetNotFound",
+            refs_reason: "InvalidKind",
+            message: TARGET_SECTION_NOT_FOUND_MESSAGE.to_string(),
+        }
+    }
 }
 
 fn parse_target_refs(object: &K8sObject) -> Result<Vec<TargetRef>, PolicyError> {
@@ -358,10 +408,41 @@ fn parse_target_refs(object: &K8sObject) -> Result<Vec<TargetRef>, PolicyError> 
         )));
     }
     let mut targets = Vec::with_capacity(entries.len());
+    let mut seen = HashSet::with_capacity(entries.len());
     for entry in entries {
-        targets.push(parse_one_target(object, entry)?);
+        let target = parse_one_target(object, entry)?;
+        let canonical = (
+            target.kind.clone(),
+            target.namespace.clone(),
+            target.name.clone(),
+            target.section_name.clone(),
+        );
+        if !seen.insert(canonical) {
+            return Err(PolicyError::invalid(DUPLICATE_TARGET_MESSAGE));
+        }
+        targets.push(target);
     }
     Ok(targets)
+}
+
+fn optional_string_field<'a>(
+    value: &'a Value,
+    field: &str,
+    path: &str,
+) -> Result<Option<&'a str>, PolicyError> {
+    match value.get(field) {
+        None => Ok(None),
+        Some(Value::String(value)) => Ok(Some(value)),
+        Some(_) => Err(PolicyError::invalid(format!("{path} must be a string"))),
+    }
+}
+
+fn optional_bool_field(value: &Value, field: &str, path: &str) -> Result<Option<bool>, PolicyError> {
+    match value.get(field) {
+        None => Ok(None),
+        Some(Value::Bool(value)) => Ok(Some(*value)),
+        Some(_) => Err(PolicyError::invalid(format!("{path} must be a bool"))),
+    }
 }
 
 fn parse_one_target(object: &K8sObject, entry: &Value) -> Result<TargetRef, PolicyError> {
@@ -370,9 +451,7 @@ fn parse_one_target(object: &K8sObject, entry: &Value) -> Result<TargetRef, Poli
             "spec.targetRefs entries must be objects",
         ));
     }
-    let group = entry
-        .get("group")
-        .and_then(Value::as_str)
+    let group = optional_string_field(entry, "group", "spec.targetRefs.group")?
         .unwrap_or(GATEWAY_API_GROUP);
     if group != GATEWAY_API_GROUP {
         return Err(PolicyError::invalid(
@@ -395,24 +474,23 @@ fn parse_one_target(object: &K8sObject, entry: &Value) -> Result<TargetRef, Poli
     if name.is_empty() {
         return Err(PolicyError::invalid("spec.targetRefs.name must not be empty"));
     }
-    let target_namespace = entry
-        .get("namespace")
-        .and_then(Value::as_str)
+    let target_namespace = optional_string_field(entry, "namespace", "spec.targetRefs.namespace")?
         .unwrap_or(object.metadata.namespace.as_str());
     if target_namespace.is_empty() {
         return Err(PolicyError::invalid(
             "spec.targetRefs.namespace must not be empty",
         ));
     }
-    let section_name = entry
-        .get("sectionName")
-        .and_then(Value::as_str)
-        .map(str::to_string);
-    if section_name.as_ref().is_some_and(|name| name.is_empty()) {
-        return Err(PolicyError::invalid(
-            "spec.targetRefs.sectionName must not be empty when set",
-        ));
-    }
+    let section_name =
+        match optional_string_field(entry, "sectionName", "spec.targetRefs.sectionName")? {
+            None => None,
+            Some("") => {
+                return Err(PolicyError::invalid(
+                    "spec.targetRefs.sectionName must not be empty when set",
+                ));
+            }
+            Some(name) => Some(name.to_string()),
+        };
     if kind == "UDPRoute" && section_name.is_some() {
         return Err(PolicyError::invalid(
             "spec.targetRefs.sectionName is not valid on a UDPRoute target",
@@ -429,7 +507,7 @@ fn parse_one_target(object: &K8sObject, entry: &Value) -> Result<TargetRef, Poli
 }
 
 fn parse_policy_body(object: &K8sObject) -> Result<ValidPolicyBody, PolicyError> {
-    let mode = match object.spec.get("mode").and_then(Value::as_str) {
+    let mode = match optional_string_field(&object.spec, "mode", "spec.mode")? {
         None | Some("Finite") => PolicyMode::Finite,
         Some("Unlimited") => PolicyMode::Unlimited,
         Some(_) => {
@@ -438,11 +516,12 @@ fn parse_policy_body(object: &K8sObject) -> Result<ValidPolicyBody, PolicyError>
             ));
         }
     };
-    let ack = object
-        .spec
-        .get("acknowledgeUnsafeAmplification")
-        .and_then(Value::as_bool)
-        .unwrap_or(false);
+    let ack = optional_bool_field(
+        &object.spec,
+        "acknowledgeUnsafeAmplification",
+        "spec.acknowledgeUnsafeAmplification",
+    )?
+    .unwrap_or(false);
 
     match mode {
         PolicyMode::Unlimited => {
@@ -498,7 +577,8 @@ fn authorize_and_resolve_target(
     acc: &K8sAccumulator,
     object: &K8sObject,
     target: &TargetRef,
-    observed_udproutes: &std::collections::HashSet<(String, String)>,
+    observed_udproutes: &HashSet<(String, String)>,
+    observed_gateway_listeners: &HashMap<(String, String), HashSet<String>>,
 ) -> Option<PolicyError> {
     if target.cross_namespace
         && !acc.reference_grant_allows(
@@ -513,15 +593,27 @@ fn authorize_and_resolve_target(
     {
         return Some(PolicyError::ref_not_permitted());
     }
-    let exists = match target.kind.as_str() {
-        "Gateway" => acc
-            .gateway_class_name_by_gateway
-            .contains_key(&(target.namespace.clone(), target.name.clone())),
-        "UDPRoute" => observed_udproutes.contains(&(target.namespace.clone(), target.name.clone())),
-        _ => false,
-    };
-    if !exists {
-        return Some(PolicyError::target_not_found());
+    match target.kind.as_str() {
+        "Gateway" => {
+            let key = (target.namespace.clone(), target.name.clone());
+            if !acc.gateway_class_name_by_gateway.contains_key(&key) {
+                return Some(PolicyError::target_not_found());
+            }
+            if let Some(section) = target.section_name.as_deref() {
+                let section_exists = observed_gateway_listeners
+                    .get(&key)
+                    .is_some_and(|names| names.contains(section));
+                if !section_exists {
+                    return Some(PolicyError::target_section_not_found());
+                }
+            }
+        }
+        "UDPRoute" => {
+            if !observed_udproutes.contains(&(target.namespace.clone(), target.name.clone())) {
+                return Some(PolicyError::target_not_found());
+            }
+        }
+        _ => return Some(PolicyError::target_not_found()),
     }
     None
 }
@@ -529,7 +621,7 @@ fn authorize_and_resolve_target(
 /// Mark policies that lost any named attachment under GEP-713 oldest-wins
 /// and withdraw them from every slot (atomic Direct attachment).
 pub(crate) fn finalize_conflicts(acc: &mut K8sAccumulator) {
-    let mut lost_any: std::collections::HashSet<K8sResourceKey> = std::collections::HashSet::new();
+    let mut lost_any: HashSet<K8sResourceKey> = HashSet::new();
     for status in &acc.udp_amplification_policy_statuses {
         if !status.accepted || status.ancestors.is_empty() {
             continue;
@@ -559,6 +651,9 @@ pub(crate) fn finalize_conflicts(acc: &mut K8sAccumulator) {
     if !lost_any.is_empty() {
         acc.udp_amplification_policies
             .by_attachment
+            .retain(|_, policy| !lost_any.contains(&policy.resource));
+        acc.udp_amplification_policies
+            .by_name
             .retain(|_, policy| !lost_any.contains(&policy.resource));
         for status in &mut acc.udp_amplification_policy_statuses {
             if lost_any.contains(&status.policy) {
