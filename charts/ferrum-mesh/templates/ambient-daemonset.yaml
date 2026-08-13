@@ -145,8 +145,8 @@
        this node's Kubernetes UID, its current boot id, the incoming target, and
        the release's node-proof generation. Kubernetes hostPID is pod-scoped,
        not container-scoped: enabling this init stage therefore gives the whole
-       pod — init and steady-state — host PID namespace visibility. hostPID does
-       not grant setns. SYS_ADMIN and SYS_PTRACE remain confined to the init
+       pod — init and steady-state — host PID namespace visibility.
+       hostPID does not grant setns. SYS_ADMIN and SYS_PTRACE remain confined to the init
        container; the steady-state container keeps its narrow NET_ADMIN/NET_RAW
        pair after the init stage exits. Clusters that refuse hostPID or those
        init capabilities cannot use this default unchanged; set
