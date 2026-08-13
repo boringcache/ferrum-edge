@@ -285,9 +285,7 @@ fn route_protection_reason(objects: &[K8sObject]) -> String {
         .unwrap_or_else(|| "missing".to_string())
 }
 
-fn protection_condition(
-    update: Option<&GatewayApiStatusUpdate>,
-) -> Option<(bool, String, String)> {
+fn protection_condition(update: Option<&GatewayApiStatusUpdate>) -> Option<(bool, String, String)> {
     update
         .and_then(|update| update.status.get("parents")?.as_array()?.first())
         .and_then(|parent| parent.get("conditions")?.as_array())
