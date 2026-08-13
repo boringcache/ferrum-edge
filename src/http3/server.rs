@@ -12739,7 +12739,11 @@ async fn dispatch_grpc_native_h3(
                         &mut send_half,
                         fault_status,
                         fault_message,
-                        grpc_deadline_at,
+                        // Composed bound, not the optional client `grpc-timeout`
+                        // alone: this gateway-authored trailer/FIN must not park
+                        // on QUIC flow control past an admitted authorization
+                        // deadline when the client supplied no `grpc-timeout`.
+                        downstream_write_bound.deadline(),
                     )
                     .await
                     {
@@ -13120,7 +13124,10 @@ async fn dispatch_grpc_native_h3(
                             &mut send_half,
                             fault_status,
                             fault_message,
-                            grpc_deadline_at,
+                            // Same composed bound as the mid-response non-auth
+                            // upload-fault terminal: trailer/FIN stay
+                            // authorization-bounded when no client deadline exists.
+                            downstream_write_bound.deadline(),
                         )
                         .await
                         {

@@ -3346,6 +3346,81 @@ fn h3_native_grpc_trailer_wait_stays_in_the_upload_cancellation_domain() {
     );
 }
 
+/// Isolate the two non-authorization upload-fault terminal writers. A broad
+/// trailer-phase substring for `downstream_write_bound.deadline()` is satisfied
+/// by the neighboring authorization and backend-trailer FIN calls, so a
+/// regression that rebinds either of these gateway-authored trailer/FIN writes
+/// to the optional client `grpc_deadline_at` would otherwise stay green.
+#[test]
+fn h3_native_grpc_non_auth_upload_fault_terminals_use_the_composed_write_bound() {
+    let relay = native_h3_grpc_relay_source();
+
+    let response_loop = relay
+        .split("'outer: loop")
+        .nth(1)
+        .expect("native response loop");
+    let select = response_loop
+        .split("tokio::select! {")
+        .nth(1)
+        .expect("native response select");
+    let fault = select
+        .find("fault = &mut upload_fault_wait")
+        .expect("terminating upload-fault arm");
+    let data = select
+        .find("backend_recv.recv_data()")
+        .expect("backend DATA arm");
+    let mid_response_non_auth = select[fault..data]
+        .split("let (fault_status, fault_message) = fault.grpc_signal();")
+        .nth(1)
+        .expect("mid-response non-authorization upload-fault branch");
+    assert_non_auth_upload_fault_terminal_uses_composed_bound(
+        mid_response_non_auth,
+        "mid-response non-authorization upload-fault terminal",
+    );
+
+    let trailer_wait_non_auth = relay
+        .split("let trailers_result = match trailer_wait_result {")
+        .nth(1)
+        .expect("terminal trailer wait outcome")
+        .split("match trailers_result {")
+        .next()
+        .expect("bounded terminal trailer upload-fault arm")
+        .split("Err(fault) => {")
+        .nth(1)
+        .expect("trailer-wait non-authorization upload-fault branch");
+    assert_non_auth_upload_fault_terminal_uses_composed_bound(
+        trailer_wait_non_auth,
+        "trailer-wait non-authorization upload-fault terminal",
+    );
+}
+
+fn assert_non_auth_upload_fault_terminal_uses_composed_bound(arm: &str, context: &str) {
+    assert!(
+        arm.contains("fault_status") && arm.contains("fault_message"),
+        "{context} must be the gateway-authored non-authorization fault writer"
+    );
+    assert_eq!(
+        arm.matches("send_h3_grpc_terminal_trailers(").count(),
+        1,
+        "{context} must have exactly one terminal trailer/FIN writer"
+    );
+    let call = arm
+        .split("send_h3_grpc_terminal_trailers(")
+        .nth(1)
+        .expect("terminal trailer call")
+        .split(".await")
+        .next()
+        .expect("awaited terminal trailer write");
+    assert!(
+        call.contains("downstream_write_bound.deadline()"),
+        "{context} must bound send_trailers/finish by the composed downstream write bound"
+    );
+    assert!(
+        !call.contains("grpc_deadline_at"),
+        "{context} must not regress to the optional client grpc-timeout as the sole bound"
+    );
+}
+
 /// Every native-H3 gRPC failure/reject path writes the client's response BEFORE
 /// it tears anything down.
 ///
