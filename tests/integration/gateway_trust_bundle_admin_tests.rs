@@ -23,7 +23,8 @@ use ferrum_edge::admin::{
 };
 use ferrum_edge::config::db_loader::{DatabaseStore, DbPoolConfig};
 use ferrum_edge::config::gateway_trust::{
-    GatewayTrustBundleRecord, record_trust_generation_published, reset_observability_for_tests,
+    GatewayTrustBundleRecord, MAX_X509_AUTHORITIES_PER_BUNDLE, record_trust_generation_published,
+    reset_observability_for_tests,
 };
 use jsonwebtoken::{EncodingKey, Header, encode};
 use serde_json::{Value, json};
@@ -663,6 +664,95 @@ async fn more_than_one_record_is_refused_before_anything_is_deleted() {
         after["revision"], 1,
         "and must not bump the revision either"
     );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn over_count_trust_material_is_refused_before_deep_parser_diagnostics() {
+    let dir = TempDir::new().expect("temp dir");
+    let (base, _shutdown) = start_admin(admin_state(make_store(&dir).await)).await;
+    let authorities = vec!["not-a-certificate"; MAX_X509_AUTHORITIES_PER_BUNDLE + 1];
+
+    let (status, body) = post_json(
+        &base,
+        "/gateway-trust-bundles",
+        "ferrum",
+        json!({
+            "trust_domain": "cluster.local",
+            "bundle": {
+                "local": {
+                    "trust_domain": "cluster.local",
+                    "x509_authorities": authorities,
+                }
+            },
+        }),
+    )
+    .await;
+    assert_eq!(status, 400, "over-count material must be refused: {body}");
+    let error = body["error"].as_str().unwrap_or_default();
+    assert!(
+        error.contains("x509 authorities"),
+        "expected an authority-count error, got {body}"
+    );
+    assert!(
+        !error.contains("parseable X.509")
+            && !error.contains("invalid base64")
+            && !error.contains("TrustBundleSet."),
+        "over-count admission must not invoke deep parsers: {body}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn restore_refuses_over_count_trust_before_clear_and_without_deep_parser_diagnostics() {
+    let dir = TempDir::new().expect("temp dir");
+    let (base, _shutdown) = start_admin(admin_state(make_store(&dir).await)).await;
+    let authority = root_ca_der_base64("root");
+
+    let (status, created) = post_json(
+        &base,
+        "/gateway-trust-bundles",
+        "ferrum",
+        json!({
+            "trust_domain": "cluster.local",
+            "bundle": bundle_body("cluster.local", &authority),
+        }),
+    )
+    .await;
+    assert_eq!(status, 201, "create must succeed: {created}");
+    let revision = created["revision"].as_u64().expect("numeric revision");
+
+    let (status, mut backup) = get_json(&base, "/backup", "ferrum").await;
+    assert_eq!(status, 200);
+    let hostile = vec!["not-a-certificate"; MAX_X509_AUTHORITIES_PER_BUNDLE + 1];
+    backup["gateway_trust_bundles"][0]["bundle"]["local"]["x509_authorities"] = json!(hostile);
+
+    let (status, body) = post_json(&base, "/restore?confirm=true", "ferrum", backup).await;
+    assert_eq!(
+        status, 400,
+        "over-count restore material must be refused: {body}"
+    );
+    let rendered = body.to_string();
+    assert!(
+        rendered.contains("x509 authorities"),
+        "expected an authority-count error, got {body}"
+    );
+    assert!(
+        !rendered.contains("parseable X.509")
+            && !rendered.contains("invalid base64")
+            && !rendered.contains("TrustBundleSet."),
+        "over-count restore must not invoke deep parsers: {body}"
+    );
+    assert!(
+        body["error"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("NOT deleted"),
+        "the refusal must happen before the destructive clear: {body}"
+    );
+
+    let (status, after) = get_json(&base, "/gateway-trust-bundles/ferrum", "ferrum").await;
+    assert_eq!(status, 200, "the refused restore must not revoke trust");
+    assert_eq!(after["revision"].as_u64(), Some(revision));
+    assert_eq!(after["bundle"]["local"]["x509_authorities"][0], authority);
 }
 
 // ── Backup audit evidence ───────────────────────────────────────────────────

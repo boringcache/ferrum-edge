@@ -21,8 +21,9 @@
 use ferrum_edge::config::gateway_trust::{
     AMBIGUOUS_TRUST_AUTHORITY_MESSAGE, GatewayTrustBundleIdentity, GatewayTrustBundleRecord,
     GatewayTrustDriftSource, GatewayTrustFailureReason, GatewayTrustPublication,
-    MAX_FEDERATED_BUNDLES, MAX_JWT_AUTHORITIES_PER_BUNDLE, MAX_TRUST_BUNDLE_JSON_BYTES,
-    MAX_X509_AUTHORITIES_PER_BUNDLE, NamespaceTrustProjection, TrustAuthorityResolution,
+    MAX_FEDERATED_BUNDLES, MAX_JWT_AUTHORITIES_PER_BUNDLE, MAX_JWT_AUTHORITY_PEM_BYTES,
+    MAX_TRUST_BUNDLE_JSON_BYTES, MAX_X509_AUTHORITIES_PER_BUNDLE,
+    MAX_X509_AUTHORITY_DER_BYTES, NamespaceTrustProjection, TrustAuthorityResolution,
     TrustPublicationScope, detect_gateway_trust_drift, gateway_trust_state_drifted,
     observability_snapshot, project_namespace_trust, published_namespace_generation,
     published_namespace_state, record_ambiguous_authority, record_trust_generation_published,
@@ -105,6 +106,34 @@ fn valid_record() -> GatewayTrustBundleRecord {
     )
 }
 
+/// Structural fail-fast must not fund mesh/X.509/JWT/runtime parsers.
+fn assert_structural_fail_fast(errors: &[String]) {
+    let rendered = errors.join("\n");
+    for needle in [
+        "TrustBundleSet.",
+        "invalid base64",
+        "not a parseable X.509 certificate",
+        "trailing bytes after its X.509 certificate",
+        "not a usable PEM public key",
+        "undecodable trust material",
+        "repeats a key_id",
+        "has an empty key_id",
+        "has no authorities",
+        ": no authorities",
+    ] {
+        assert!(
+            !rendered.contains(needle),
+            "structural fail-fast must skip deep parser diagnostics, found {needle:?} in {errors:?}"
+        );
+    }
+    for error in errors {
+        assert!(
+            !error.contains("BEGIN"),
+            "a validation error must never echo PEM content: {error}"
+        );
+    }
+}
+
 // ── Admission validation ────────────────────────────────────────────────────
 
 #[test]
@@ -174,10 +203,10 @@ fn a_bundle_with_no_authorities_is_rejected() {
 }
 
 #[test]
-fn too_many_x509_authorities_are_rejected() {
-    let der = root_ca_der_base64("ferrum-test-root");
+fn too_many_x509_authorities_are_rejected_before_deep_parsers() {
     let mut record = valid_record();
-    record.bundle.local.x509_authorities = vec![der; MAX_X509_AUTHORITIES_PER_BUNDLE + 1];
+    record.bundle.local.x509_authorities =
+        vec!["not-a-certificate".to_string(); MAX_X509_AUTHORITIES_PER_BUNDLE + 1];
     let errors = record
         .validate_fields()
         .expect_err("an unbounded authority list must be rejected");
@@ -187,15 +216,26 @@ fn too_many_x509_authorities_are_rejected() {
             .any(|error| error.contains("x509 authorities")),
         "expected an authority-count error, got {errors:?}"
     );
+    assert_structural_fail_fast(&errors);
 }
 
 #[test]
-fn too_many_federated_bundles_are_rejected() {
+fn max_count_of_valid_x509_authorities_is_admitted() {
+    let der = root_ca_der_base64("ferrum-test-root");
+    let mut record = valid_record();
+    record.bundle.local.x509_authorities = vec![der; MAX_X509_AUTHORITIES_PER_BUNDLE];
+    record
+        .validate_fields()
+        .expect("the x509 authority-count cap is inclusive");
+}
+
+#[test]
+fn too_many_federated_bundles_are_rejected_before_deep_parsers() {
     let mut record = valid_record();
     record.bundle.federated = (0..=MAX_FEDERATED_BUNDLES)
-        .map(|index| TrustBundle {
-            trust_domain: trust_domain(&format!("federated-{index}.local")),
-            x509_authorities: vec![root_ca_der_base64("ferrum-test-root")],
+        .map(|_| TrustBundle {
+            trust_domain: trust_domain("cluster.local"),
+            x509_authorities: vec!["not-a-certificate".to_string()],
             jwt_authorities: Vec::new(),
             refresh_hint_seconds: None,
         })
@@ -209,6 +249,13 @@ fn too_many_federated_bundles_are_rejected() {
             .any(|error| error.contains("federated bundles")),
         "expected a federated-count error, got {errors:?}"
     );
+    assert!(
+        errors
+            .iter()
+            .all(|error| !error.contains("repeats the local trust domain")),
+        "over-count federated entries must not be walked for duplicate-domain diagnostics: {errors:?}"
+    );
+    assert_structural_fail_fast(&errors);
 }
 
 #[test]
@@ -346,13 +393,13 @@ fn duplicate_jwt_key_ids_within_one_bundle_are_rejected() {
 }
 
 #[test]
-fn too_many_jwt_authorities_are_rejected() {
+fn too_many_jwt_authorities_are_rejected_before_deep_parsers() {
     let mut record = valid_record();
-    let pem = usable_public_key_pem();
     record.bundle.local.jwt_authorities = (0..=MAX_JWT_AUTHORITIES_PER_BUNDLE)
         .map(|index| JwtAuthority {
             key_id: format!("key-{index}"),
-            public_key_pem: pem.clone(),
+            public_key_pem: "-----BEGIN PUBLIC KEY-----\nAAAA\n-----END PUBLIC KEY-----"
+                .to_string(),
         })
         .collect();
     let errors = record
@@ -362,41 +409,72 @@ fn too_many_jwt_authorities_are_rejected() {
         errors.iter().any(|error| error.contains("jwt authorities")),
         "expected a JWT authority-count error, got {errors:?}"
     );
+    assert_structural_fail_fast(&errors);
 }
 
 #[test]
-fn an_oversized_bundle_is_rejected_and_the_error_carries_no_material() {
-    // Every individual authority and list stays within its own cap. Max-length
-    // (but valid and unique) JWT key ids make the complete federated document
-    // deterministically exceed the whole-bundle cap even when the generated
-    // P-256 certificate encoding changes size across rcgen versions.
-    let der = root_ca_der_base64("ferrum-test-root");
-    let public_key_pem = usable_public_key_pem();
-    let jwt_authorities = |bundle_index: usize| -> Vec<JwtAuthority> {
-        (0..MAX_JWT_AUTHORITIES_PER_BUNDLE)
-            .map(|authority_index| JwtAuthority {
-                key_id: format!("key-{bundle_index}-{authority_index}-{}", "x".repeat(230)),
-                public_key_pem: public_key_pem.clone(),
-            })
-            .collect()
-    };
+fn max_count_of_valid_jwt_authorities_is_admitted() {
+    let pem = usable_public_key_pem();
     let mut record = valid_record();
-    record.bundle.local.x509_authorities = vec![der.clone(); MAX_X509_AUTHORITIES_PER_BUNDLE];
-    record.bundle.local.jwt_authorities = jwt_authorities(MAX_FEDERATED_BUNDLES);
-    record.bundle.federated = (0..MAX_FEDERATED_BUNDLES)
-        .map(|index| TrustBundle {
-            trust_domain: trust_domain(&format!("federated-{index}.local")),
-            x509_authorities: vec![der.clone(); MAX_X509_AUTHORITIES_PER_BUNDLE],
-            jwt_authorities: jwt_authorities(index),
-            refresh_hint_seconds: None,
+    record.bundle.local.jwt_authorities = (0..MAX_JWT_AUTHORITIES_PER_BUNDLE)
+        .map(|index| JwtAuthority {
+            key_id: format!("key-{index}"),
+            public_key_pem: pem.clone(),
         })
         .collect();
+    record
+        .validate_fields()
+        .expect("the jwt authority-count cap is inclusive");
+}
 
-    let encoded = serde_json::to_string(&record.bundle).expect("fixture serializes");
+#[test]
+fn an_oversized_encoded_x509_authority_is_rejected_before_decode() {
+    let mut record = valid_record();
+    let over_encoded = "A".repeat(4 * MAX_X509_AUTHORITY_DER_BYTES.div_ceil(3) + 4);
+    record.bundle.local.x509_authorities = vec![over_encoded];
+    let errors = record
+        .validate_fields()
+        .expect_err("an encoded value that cannot fit the DER cap must be rejected");
     assert!(
-        encoded.len() > MAX_TRUST_BUNDLE_JSON_BYTES,
-        "fixture must actually exceed the encoded-size cap"
+        errors
+            .iter()
+            .any(|error| error.contains("encoded value cannot decode within")),
+        "expected an encoded-size error, got {errors:?}"
     );
+    assert_structural_fail_fast(&errors);
+}
+
+#[test]
+fn an_oversized_jwt_pem_is_rejected_before_key_parsing() {
+    let mut record = valid_record();
+    record.bundle.local.jwt_authorities = vec![JwtAuthority {
+        key_id: "rotation-1".to_string(),
+        public_key_pem: "A".repeat(MAX_JWT_AUTHORITY_PEM_BYTES + 1),
+    }];
+    let errors = record
+        .validate_fields()
+        .expect_err("an oversized JWT PEM must be rejected");
+    assert!(
+        errors
+            .iter()
+            .any(|error| error.contains("public_key_pem exceeds")),
+        "expected a PEM size error, got {errors:?}"
+    );
+    assert_structural_fail_fast(&errors);
+}
+
+#[test]
+fn an_oversized_bundle_is_rejected_before_deep_parsers_and_the_error_carries_no_material() {
+    // Just over the whole-bundle cap: 16 at-cap dummy PEMs. Individual fields
+    // stay within per-entry limits, so only the aggregate bound should fire,
+    // and the dummy material must not be decoded as keys or certificates.
+    let mut record = valid_record();
+    record.bundle.local.jwt_authorities = (0..MAX_JWT_AUTHORITIES_PER_BUNDLE)
+        .map(|index| JwtAuthority {
+            key_id: format!("key-{index}"),
+            public_key_pem: "A".repeat(MAX_JWT_AUTHORITY_PEM_BYTES),
+        })
+        .collect();
 
     let errors = record
         .validate_fields()
@@ -407,16 +485,45 @@ fn an_oversized_bundle_is_rejected_and_the_error_carries_no_material() {
             .any(|error| error.contains("the maximum is") && error.contains("bytes")),
         "expected a size error, got {errors:?}"
     );
-    for error in &errors {
-        assert!(
-            !error.contains(&der),
-            "a validation error must never echo trust material"
-        );
-        assert!(
-            !error.contains("BEGIN"),
-            "a validation error must never echo PEM content"
-        );
-    }
+    assert_structural_fail_fast(&errors);
+}
+
+#[test]
+fn json_escaping_overhead_counts_against_the_whole_bundle_cap() {
+    // Raw PEM bytes stay under the 256 KiB cap; JSON escaping of backslashes
+    // pushes the serialized document over it. The exact public contract must
+    // still refuse the record without invoking deep parsers.
+    let mut record = valid_record();
+    record.bundle.local.jwt_authorities = (0..MAX_JWT_AUTHORITIES_PER_BUNDLE)
+        .map(|index| JwtAuthority {
+            key_id: format!("key-{index}"),
+            public_key_pem: "\\".repeat(10 * 1024),
+        })
+        .collect();
+
+    let local = &record.bundle.local;
+    let raw = local.trust_domain.as_str().len()
+        + local.x509_authorities.iter().map(String::len).sum::<usize>()
+        + local
+            .jwt_authorities
+            .iter()
+            .map(|authority| authority.key_id.len() + authority.public_key_pem.len())
+            .sum::<usize>();
+    assert!(
+        raw <= MAX_TRUST_BUNDLE_JSON_BYTES,
+        "fixture raw material must stay under the cap so only escaping can trip it"
+    );
+
+    let errors = record
+        .validate_fields()
+        .expect_err("JSON escaping overhead must count against the encoded-size cap");
+    assert!(
+        errors
+            .iter()
+            .any(|error| error.contains("encodes to") && error.contains("the maximum is")),
+        "expected an exact encoded-size error, got {errors:?}"
+    );
+    assert_structural_fail_fast(&errors);
 }
 
 // ── Redacted summary ────────────────────────────────────────────────────────

@@ -28,7 +28,10 @@
 //!   disagree with the material it names.
 //! - Bounded material: authority counts, per-authority size, and total encoded
 //!   size are capped so a hostile or accidental write cannot push an unbounded
-//!   blob through the change log and into every subscriber's snapshot.
+//!   blob through the change log and into every subscriber's snapshot. Count
+//!   and cheap encoded/raw size bounds fail closed before any deep parser
+//!   (`validate_mesh_config`, X.509 DER, JWT public keys, runtime conversion)
+//!   walks the over-limit collections or material.
 //! - Usable material, not just well-formed wrappers: every `x509_authorities`
 //!   entry must be valid base64 **and** parse as an X.509 certificate that
 //!   consumes the complete DER entry (no accepted trailing bytes); every
@@ -189,9 +192,22 @@ impl GatewayTrustBundleRecord {
 
     /// Full syntactic + semantic admission validation.
     ///
-    /// Returns every problem found so an operator repairing a bad rotation sees
-    /// the whole list. No message ever contains trust material — only field
-    /// names, indices, and sizes.
+    /// Structural count and cheap encoded/raw size bounds are enforced first
+    /// and fail closed. If any of those bounds fail, this returns only the
+    /// material-free field, count, and size diagnostics and does not invoke
+    /// [`crate::modes::mesh::config::validate_mesh_config`], X.509 DER parsing,
+    /// JWT public-key parsing, or runtime conversion. That is deliberate
+    /// hostile-input behavior: enumerating unrelated semantic errors would
+    /// require walking and decoding the over-limit material. The restore
+    /// endpoint accepts bodies far larger than [`MAX_TRUST_BUNDLE_JSON_BYTES`],
+    /// so deep parsers must not run against an over-limit record.
+    ///
+    /// Once the record is within those bounds, the exact serialized 256 KiB
+    /// contract is checked (including JSON escaping overhead) with a counting
+    /// writer so the check does not allocate the document. Every remaining
+    /// semantic problem is then collected so an operator repairing a bad
+    /// rotation sees the whole list. No message ever contains trust material —
+    /// only field names, indices, and sizes.
     pub fn validate_fields(&self) -> Result<(), Vec<String>> {
         let mut errors = Vec::new();
 
@@ -223,6 +239,28 @@ impl GatewayTrustBundleRecord {
             );
         }
 
+        let mut structural = Vec::new();
+        collect_structural_limit_errors(&self.bundle, &mut structural);
+        if !structural.is_empty() {
+            errors.extend(structural);
+            return finish_validation(errors);
+        }
+
+        match serialized_bundle_len(&self.bundle) {
+            Ok(encoded_len) => {
+                if encoded_len > MAX_TRUST_BUNDLE_JSON_BYTES {
+                    errors.push(format!(
+                        "gateway trust bundle encodes to {encoded_len} bytes; the maximum is {MAX_TRUST_BUNDLE_JSON_BYTES}"
+                    ));
+                    return finish_validation(errors);
+                }
+            }
+            Err(_) => {
+                errors.push("gateway trust bundle could not be serialized".to_string());
+                return finish_validation(errors);
+            }
+        }
+
         // Reuse the mesh validator so a bundle admitted here is exactly a
         // bundle the mesh/DP side already accepts (empty authorities, base64,
         // duplicate federated trust domains).
@@ -235,13 +273,6 @@ impl GatewayTrustBundleRecord {
             &[],
             Some(&self.bundle),
         ));
-
-        if self.bundle.federated.len() > MAX_FEDERATED_BUNDLES {
-            errors.push(format!(
-                "gateway trust bundle declares {} federated bundles; the maximum is {MAX_FEDERATED_BUNDLES}",
-                self.bundle.federated.len()
-            ));
-        }
 
         validate_single_bundle(&self.bundle.local, "bundle.local", &mut errors);
         for (index, federated) in self.bundle.federated.iter().enumerate() {
@@ -268,18 +299,6 @@ impl GatewayTrustBundleRecord {
             );
         }
 
-        match serde_json::to_string(&self.bundle) {
-            Ok(encoded) => {
-                if encoded.len() > MAX_TRUST_BUNDLE_JSON_BYTES {
-                    errors.push(format!(
-                        "gateway trust bundle encodes to {} bytes; the maximum is {MAX_TRUST_BUNDLE_JSON_BYTES}",
-                        encoded.len()
-                    ));
-                }
-            }
-            Err(_) => errors.push("gateway trust bundle could not be serialized".to_string()),
-        }
-
         // Final gate: the bundle must convert to the runtime representation the
         // proxy actually installs. Anything that fails here would be a bundle
         // that persists but can never be applied.
@@ -287,13 +306,7 @@ impl GatewayTrustBundleRecord {
             errors.push("gateway trust bundle contains undecodable trust material".to_string());
         }
 
-        if errors.is_empty() {
-            Ok(())
-        } else {
-            errors.sort();
-            errors.dedup();
-            Err(errors)
-        }
+        finish_validation(errors)
     }
 
     /// Redacted, fixed-shape summary for logs, metrics, and admin status.
@@ -314,55 +327,236 @@ impl GatewayTrustBundleRecord {
     }
 }
 
-fn validate_single_bundle(
+fn finish_validation(mut errors: Vec<String>) -> Result<(), Vec<String>> {
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        errors.sort();
+        errors.dedup();
+        Err(errors)
+    }
+}
+
+/// STANDARD base64 length of `decoded_bytes` of DER, including padding.
+const fn max_standard_base64_len(decoded_bytes: usize) -> usize {
+    4 * decoded_bytes.div_ceil(3)
+}
+
+fn x509_encoded_exceeds_der_limit(encoded: &str) -> bool {
+    encoded.len() > max_standard_base64_len(MAX_X509_AUTHORITY_DER_BYTES)
+}
+
+/// Counts, per-entry encoded/raw sizes, and a cheap whole-bundle lower bound.
+///
+/// Over-limit collections are not walked for per-entry checks. A failed
+/// structural bound is the caller's signal to skip every deep parser.
+fn collect_structural_limit_errors(
+    bundle: &crate::modes::mesh::config::TrustBundleSet,
+    errors: &mut Vec<String>,
+) {
+    let federated_over = bundle.federated.len() > MAX_FEDERATED_BUNDLES;
+    if federated_over {
+        errors.push(format!(
+            "gateway trust bundle declares {} federated bundles; the maximum is {MAX_FEDERATED_BUNDLES}",
+            bundle.federated.len()
+        ));
+    }
+
+    collect_bundle_count_and_encoded_size_errors(&bundle.local, "bundle.local", errors);
+
+    if federated_over {
+        return;
+    }
+
+    for (index, federated) in bundle.federated.iter().enumerate() {
+        collect_bundle_count_and_encoded_size_errors(
+            federated,
+            &format!("bundle.federated[{index}]"),
+            errors,
+        );
+    }
+
+    if !errors.is_empty() {
+        return;
+    }
+
+    let raw = bundle_raw_material_bytes(bundle);
+    if raw > MAX_TRUST_BUNDLE_JSON_BYTES {
+        errors.push(format!(
+            "gateway trust bundle raw material is {raw} bytes; the maximum is {MAX_TRUST_BUNDLE_JSON_BYTES}"
+        ));
+    }
+}
+
+fn collect_bundle_count_and_encoded_size_errors(
     bundle: &crate::modes::mesh::config::TrustBundle,
     label: &str,
     errors: &mut Vec<String>,
 ) {
-    if bundle.x509_authorities.len() > MAX_X509_AUTHORITIES_PER_BUNDLE {
+    let x509_over = bundle.x509_authorities.len() > MAX_X509_AUTHORITIES_PER_BUNDLE;
+    if x509_over {
         errors.push(format!(
             "{label} declares {} x509 authorities; the maximum is {MAX_X509_AUTHORITIES_PER_BUNDLE}",
             bundle.x509_authorities.len()
         ));
     }
-    if bundle.jwt_authorities.len() > MAX_JWT_AUTHORITIES_PER_BUNDLE {
+    let jwt_over = bundle.jwt_authorities.len() > MAX_JWT_AUTHORITIES_PER_BUNDLE;
+    if jwt_over {
         errors.push(format!(
             "{label} declares {} jwt authorities; the maximum is {MAX_JWT_AUTHORITIES_PER_BUNDLE}",
             bundle.jwt_authorities.len()
         ));
     }
 
-    match bundle.decode_x509_authorities() {
-        Ok(ders) => {
-            for (index, der) in ders.iter().enumerate() {
-                if der.len() > MAX_X509_AUTHORITY_DER_BYTES {
-                    errors.push(format!(
-                        "{label}.x509_authorities[{index}] is {} bytes; the maximum is {MAX_X509_AUTHORITY_DER_BYTES}",
-                        der.len()
-                    ));
-                    continue;
-                }
-                // The certificate must consume the COMPLETE entry. A parser
-                // that stops early would admit an authority whose stored bytes
-                // carry appended material an operator (or a differently-strict
-                // verifier) would read as part of the document.
-                match X509Certificate::from_der(der) {
-                    Ok(([], _)) => {}
-                    Ok(_) => errors.push(format!(
-                        "{label}.x509_authorities[{index}] carries trailing bytes after its X.509 certificate"
-                    )),
-                    Err(_) => errors.push(format!(
-                        "{label}.x509_authorities[{index}] is not a parseable X.509 certificate"
-                    )),
-                }
+    if !x509_over {
+        for (index, encoded) in bundle.x509_authorities.iter().enumerate() {
+            if x509_encoded_exceeds_der_limit(encoded) {
+                errors.push(format!(
+                    "{label}.x509_authorities[{index}] encoded value cannot decode within {MAX_X509_AUTHORITY_DER_BYTES} bytes"
+                ));
             }
-        }
-        Err(_) => {
-            // `validate_mesh_config` already reported the base64 failure with
-            // its index; do not duplicate the message here.
         }
     }
 
+    if !jwt_over {
+        for (index, authority) in bundle.jwt_authorities.iter().enumerate() {
+            if authority.key_id.len() > MAX_JWT_AUTHORITY_KEY_ID_BYTES {
+                errors.push(format!(
+                    "{label}.jwt_authorities[{index}] key_id exceeds {MAX_JWT_AUTHORITY_KEY_ID_BYTES} bytes"
+                ));
+            }
+            if authority.public_key_pem.len() > MAX_JWT_AUTHORITY_PEM_BYTES {
+                errors.push(format!(
+                    "{label}.jwt_authorities[{index}] public_key_pem exceeds {MAX_JWT_AUTHORITY_PEM_BYTES} bytes"
+                ));
+            }
+        }
+    }
+}
+
+fn bundle_raw_material_bytes(bundle: &crate::modes::mesh::config::TrustBundleSet) -> usize {
+    let mut total = trust_bundle_raw_material_bytes(&bundle.local);
+    for federated in &bundle.federated {
+        total = total.saturating_add(trust_bundle_raw_material_bytes(federated));
+    }
+    total
+}
+
+fn trust_bundle_raw_material_bytes(bundle: &crate::modes::mesh::config::TrustBundle) -> usize {
+    let mut total = bundle.trust_domain.as_str().len();
+    for encoded in &bundle.x509_authorities {
+        total = total.saturating_add(encoded.len());
+    }
+    for authority in &bundle.jwt_authorities {
+        total = total
+            .saturating_add(authority.key_id.len())
+            .saturating_add(authority.public_key_pem.len());
+    }
+    total
+}
+
+/// Exact serialized length, including JSON escaping, without retaining the document.
+fn serialized_bundle_len(
+    bundle: &crate::modes::mesh::config::TrustBundleSet,
+) -> Result<usize, serde_json::Error> {
+    let mut counter = JsonSizeCounter { bytes: 0 };
+    serde_json::to_writer(&mut counter, bundle)?;
+    Ok(counter.bytes)
+}
+
+struct JsonSizeCounter {
+    bytes: usize,
+}
+
+impl std::io::Write for JsonSizeCounter {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.bytes = self.bytes.saturating_add(buf.len());
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+fn validate_single_bundle(
+    bundle: &crate::modes::mesh::config::TrustBundle,
+    label: &str,
+    errors: &mut Vec<String>,
+) {
+    let x509_over = bundle.x509_authorities.len() > MAX_X509_AUTHORITIES_PER_BUNDLE;
+    if x509_over {
+        errors.push(format!(
+            "{label} declares {} x509 authorities; the maximum is {MAX_X509_AUTHORITIES_PER_BUNDLE}",
+            bundle.x509_authorities.len()
+        ));
+    }
+    let jwt_over = bundle.jwt_authorities.len() > MAX_JWT_AUTHORITIES_PER_BUNDLE;
+    if jwt_over {
+        errors.push(format!(
+            "{label} declares {} jwt authorities; the maximum is {MAX_JWT_AUTHORITIES_PER_BUNDLE}",
+            bundle.jwt_authorities.len()
+        ));
+    }
+
+    if !x509_over {
+        validate_x509_authorities(bundle, label, errors);
+    }
+    if !jwt_over {
+        validate_jwt_authorities(bundle, label, errors);
+    }
+}
+
+fn validate_x509_authorities(
+    bundle: &crate::modes::mesh::config::TrustBundle,
+    label: &str,
+    errors: &mut Vec<String>,
+) {
+    use base64::Engine;
+    let engine = base64::engine::general_purpose::STANDARD;
+    for (index, encoded) in bundle.x509_authorities.iter().enumerate() {
+        if x509_encoded_exceeds_der_limit(encoded) {
+            errors.push(format!(
+                "{label}.x509_authorities[{index}] encoded value cannot decode within {MAX_X509_AUTHORITY_DER_BYTES} bytes"
+            ));
+            continue;
+        }
+        let der = match engine.decode(encoded.as_bytes()) {
+            Ok(der) => der,
+            Err(_) => {
+                // `validate_mesh_config` already reported the base64 failure
+                // with its index; do not duplicate the message here.
+                continue;
+            }
+        };
+        if der.len() > MAX_X509_AUTHORITY_DER_BYTES {
+            errors.push(format!(
+                "{label}.x509_authorities[{index}] is {} bytes; the maximum is {MAX_X509_AUTHORITY_DER_BYTES}",
+                der.len()
+            ));
+            continue;
+        }
+        // The certificate must consume the COMPLETE entry. A parser that
+        // stops early would admit an authority whose stored bytes carry
+        // appended material an operator (or a differently-strict verifier)
+        // would read as part of the document.
+        match X509Certificate::from_der(&der) {
+            Ok(([], _)) => {}
+            Ok(_) => errors.push(format!(
+                "{label}.x509_authorities[{index}] carries trailing bytes after its X.509 certificate"
+            )),
+            Err(_) => errors.push(format!(
+                "{label}.x509_authorities[{index}] is not a parseable X.509 certificate"
+            )),
+        }
+    }
+}
+
+fn validate_jwt_authorities(
+    bundle: &crate::modes::mesh::config::TrustBundle,
+    label: &str,
+    errors: &mut Vec<String>,
+) {
     let mut seen_key_ids = HashSet::new();
     for (index, authority) in bundle.jwt_authorities.iter().enumerate() {
         if authority.key_id.trim().is_empty() {
