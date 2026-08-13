@@ -333,6 +333,94 @@ fn record_cross_protocol_header_write_disconnect(
     );
 }
 
+enum H3BackendOrPeer<T> {
+    Ready(T),
+    Deadline,
+    PeerGone,
+}
+
+/// Race a backend wait against the H3 client's QUIC connection close and an
+/// optional gRPC-Web deadline.
+///
+/// After the request body is complete the request task is blocked on reqwest
+/// `send()` and is not polling the H3 stream, so a per-stream STOP_SENDING is
+/// not observable through the public `h3` API. `PeerConnectionSignal` watches
+/// the QUIC connection itself; dropping the client endpoint is therefore the
+/// signal that must release destination-admission permits instead of holding
+/// them until the backend answers.
+async fn await_h3_backend_or_peer<F, T>(
+    deadline: Option<tokio::time::Instant>,
+    peer: Option<&crate::plugins::PeerConnectionSignal>,
+    future: F,
+) -> H3BackendOrPeer<T>
+where
+    F: std::future::Future<Output = T>,
+{
+    if peer.is_some_and(crate::plugins::PeerConnectionSignal::is_closed) {
+        return H3BackendOrPeer::PeerGone;
+    }
+    tokio::pin!(future);
+    match (deadline, peer) {
+        (None, None) => H3BackendOrPeer::Ready(future.await),
+        (Some(deadline), None) => match tokio::time::timeout_at(deadline, future).await {
+            Ok(value) => H3BackendOrPeer::Ready(value),
+            Err(_) => H3BackendOrPeer::Deadline,
+        },
+        (None, Some(peer)) => {
+            tokio::select! {
+                value = &mut future => H3BackendOrPeer::Ready(value),
+                _ = peer.closed() => H3BackendOrPeer::PeerGone,
+            }
+        }
+        (Some(deadline), Some(peer)) => {
+            tokio::select! {
+                value = &mut future => H3BackendOrPeer::Ready(value),
+                _ = peer.closed() => H3BackendOrPeer::PeerGone,
+                _ = tokio::time::sleep_until(deadline) => H3BackendOrPeer::Deadline,
+            }
+        }
+    }
+}
+
+fn plain_peer_gone_before_response_headers(
+    state: &ProxyState,
+    proxy: &Proxy,
+    epoch: &RequestEpoch,
+    upstream_balancer: Option<&Arc<LoadBalancer>>,
+    current_target: Option<&Arc<UpstreamTarget>>,
+    cb_target_key: Option<&str>,
+    cb_is_half_open_probe: bool,
+    backend_start: Instant,
+    backend_admission_permits: &mut Option<BackendAdmissionPermitSet>,
+    backend_admission_elapsed: Duration,
+    bytes_sent: u64,
+    current_url: &str,
+    response_streamed: bool,
+) -> CrossProtocolOutcome {
+    record_cross_protocol_header_write_disconnect(
+        state,
+        proxy,
+        epoch,
+        upstream_balancer,
+        current_target,
+        cb_target_key,
+        0,
+        0,
+        cb_is_half_open_probe,
+        backend_start,
+        backend_admission_permits,
+        backend_admission_elapsed,
+    );
+    cross_protocol_header_write_disconnect_outcome(
+        0,
+        response_streamed,
+        bytes_sent,
+        backend_start,
+        Some(strip_query_from_backend_url(current_url)),
+        None,
+    )
+}
+
 fn cross_protocol_header_write_disconnect_outcome(
     response_status: u16,
     response_streamed: bool,
@@ -1979,8 +2067,9 @@ where
                         Err(outcome) => return Ok(outcome),
                     };
 
-                    let send_result = match crate::plugins::await_grpc_deadline(
+                    let send_result = match await_h3_backend_or_peer(
                         grpc_web_deadline_at,
+                        ctx.peer_connection.as_ref(),
                         build_plain_request_builder(
                             &client,
                             state,
@@ -1999,8 +2088,8 @@ where
                     )
                     .await
                     {
-                        Ok(result) => result,
-                        Err(()) => {
+                        H3BackendOrPeer::Ready(result) => result,
+                        H3BackendOrPeer::Deadline => {
                             drop(pending_slot);
                             record_plain_grpc_web_client_deadline(
                                 state,
@@ -2025,6 +2114,24 @@ where
                                 &current_url,
                             )
                             .await;
+                        }
+                        H3BackendOrPeer::PeerGone => {
+                            drop(pending_slot);
+                            return Ok(plain_peer_gone_before_response_headers(
+                                state,
+                                proxy,
+                                epoch,
+                                upstream_balancer,
+                                current_target.as_ref(),
+                                current_cb_target_key.as_deref(),
+                                cb_retry_probe_slot_available,
+                                backend_start,
+                                &mut backend_admission_permits,
+                                backend_admission_start.elapsed(),
+                                bytes_sent,
+                                &current_url,
+                                false,
+                            ));
                         }
                     };
                     drop(pending_slot);
@@ -2647,6 +2754,10 @@ where
                 // immediately, matching the explicit ferrum.conf promise
                 // for FERRUM_H3_REQUEST_BODY_DRAIN_MS.
                 let drain_ms = state.env_config.h3_request_body_drain_ms;
+                let peer_signal = ctx.peer_connection.clone();
+                let mut peer_gone = peer_signal
+                    .as_ref()
+                    .is_some_and(crate::plugins::PeerConnectionSignal::is_closed);
                 let send_result = {
                     tokio::pin!(send_future);
                     tokio::pin!(reader_future);
@@ -2656,6 +2767,14 @@ where
                             tokio::time::Instant::now() + Duration::from_secs(86_400)
                         }));
                     tokio::pin!(grpc_web_deadline);
+                    let peer_closed = async {
+                        if let Some(signal) = peer_signal.as_ref() {
+                            signal.closed().await;
+                        } else {
+                            std::future::pending::<()>().await;
+                        }
+                    };
+                    tokio::pin!(peer_closed);
                     let mut reader_done = false;
                     loop {
                         tokio::select! {
@@ -2668,6 +2787,11 @@ where
                                 // unconditional STOP_SENDING below closes the H3
                                 // receive half without delaying the status-4 writer.
                                 drop(pending_slot.take());
+                                break None;
+                            }
+                            _ = &mut peer_closed => {
+                                drop(pending_slot.take());
+                                peer_gone = true;
                                 break None;
                             }
                             result = &mut send_future => {
@@ -2714,6 +2838,23 @@ where
                 crate::http3::stream_util::halt_request_body(stream);
                 let bytes_sent = bytes_read.load(Ordering::Relaxed);
                 let Some(send_result) = send_result else {
+                    if peer_gone {
+                        return Ok(plain_peer_gone_before_response_headers(
+                            state,
+                            proxy,
+                            epoch,
+                            upstream_balancer,
+                            current_target.as_ref(),
+                            current_cb_target_key.as_deref(),
+                            cb_retry_probe_slot_available,
+                            backend_start,
+                            &mut backend_admission_permits,
+                            backend_admission_start.elapsed(),
+                            bytes_sent,
+                            &current_url,
+                            true,
+                        ));
+                    }
                     record_plain_grpc_web_client_deadline(
                         state,
                         epoch,

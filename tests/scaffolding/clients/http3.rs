@@ -134,6 +134,15 @@ impl Http3Client {
         Ok(Self { endpoint })
     }
 
+    /// Close every QUIC connection owned by this client.
+    ///
+    /// Destination-admission tests use this after cancelling a held stream so
+    /// the gateway observes CONNECTION_CLOSE and releases the permit; aborting
+    /// only the H3 driver can leave the endpoint's connection alive.
+    pub fn close(&self) {
+        self.endpoint.close(0u32.into(), b"test-client-cancel");
+    }
+
     /// Fire a single `GET <url>` via QUIC. `url` must be `https://host:port/path`.
     /// Returns the buffered response.
     pub async fn get(
@@ -850,6 +859,13 @@ impl Http3ResponseStream {
     pub fn cancel_response_download(&mut self) {
         self.stream
             .stop_sending(h3::error::Code::H3_REQUEST_CANCELLED);
+    }
+
+    /// Reset the request-upload direction. Combined with
+    /// [`Self::cancel_response_download`] this is a full stream abort.
+    pub fn cancel_request_upload(&mut self) {
+        self.stream
+            .stop_stream(h3::error::Code::H3_REQUEST_CANCELLED);
     }
 
     /// Await response headers.

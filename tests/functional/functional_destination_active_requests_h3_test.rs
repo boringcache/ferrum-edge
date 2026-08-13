@@ -118,7 +118,14 @@ async fn functional_destination_active_requests_h3_release_on_client_cancellatio
     backend.assert_hits_eq(1, SETTLE).await;
 
     hold_stream.cancel_response_download();
+    hold_stream.cancel_request_upload();
     drop(hold_stream);
+    // The H3 request task is blocked on backend headers and is not polling the
+    // stream, so STOP_SENDING alone is not observed. Closing the QUIC endpoint
+    // is the signal `PeerConnectionSignal` watches; that drops the destination
+    // permit instead of holding it until the backend answers.
+    hold_client.close();
+    drop(hold_client);
 
     let after_client = Http3Client::insecure().expect("post-cancel h3 client");
     let after = tokio::spawn({
