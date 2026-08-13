@@ -7286,15 +7286,16 @@ fn gateway_api_l4_proxy_id(
     )
 }
 
-/// UDP listener ports and parentRefs that survive same-listener conflict loss.
+/// Concrete UDP listener claims that survive same-listener conflict loss.
 ///
 /// Arbitration is per concrete listener: a route that loses on one listener may
-/// still keep another. ParentRefs that retain at least one surviving listener
-/// are recorded as materialized so status `Programmed` tracks live ownership.
-fn udp_route_surviving_materialization(
+/// still keep another. Amplification policy resolves every surviving claim that
+/// a generated physical proxy represents, because Ferrum materializes only one
+/// UDP proxy per route/rule/`listen_port`.
+pub(crate) fn udp_route_surviving_listener_claims(
     object: &K8sObject,
     acc: &K8sAccumulator,
-) -> (Vec<u16>, Vec<String>) {
+) -> Vec<UdpListenerClaim> {
     let losing_conflict_keys: HashSet<GatewayApiRouteConflictKey> = acc
         .gateway_api_conflict_losers
         .get(&K8sResourceKey::from_object(object))
@@ -7302,16 +7303,28 @@ fn udp_route_surviving_materialization(
         .flat_map(|conflicts| conflicts.iter().map(|conflict| conflict.key.clone()))
         .collect();
 
-    let mut ports = Vec::new();
-    let mut parent_refs = Vec::new();
-    for claim in udp_route_listener_claims(object, acc) {
-        let key = udp_route_conflict_key(&claim.parent_ref, &claim.listener, Some(claim.port));
-        if losing_conflict_keys.contains(&key) {
-            continue;
-        }
-        ports.push(claim.port);
-        parent_refs.push(claim.parent_ref);
-    }
+    udp_route_listener_claims(object, acc)
+        .into_iter()
+        .filter(|claim| {
+            let key = udp_route_conflict_key(&claim.parent_ref, &claim.listener, Some(claim.port));
+            !losing_conflict_keys.contains(&key)
+        })
+        .collect()
+}
+
+/// UDP listener ports and parentRefs that survive same-listener conflict loss.
+///
+/// ParentRefs that retain at least one surviving listener are recorded as
+/// materialized so status `Programmed` tracks live ownership. Distinct
+/// Gateways/listeners that share a numeric port collapse to one physical proxy.
+fn udp_route_surviving_materialization(
+    object: &K8sObject,
+    acc: &K8sAccumulator,
+) -> (Vec<u16>, Vec<String>) {
+    let claims = udp_route_surviving_listener_claims(object, acc);
+    let mut ports: Vec<u16> = claims.iter().map(|claim| claim.port).collect();
+    let mut parent_refs: Vec<String> =
+        claims.into_iter().map(|claim| claim.parent_ref).collect();
     ports.sort();
     ports.dedup();
     parent_refs.sort();

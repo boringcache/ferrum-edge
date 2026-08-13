@@ -86,7 +86,7 @@ Follow-up validation on branch `codex/gateway-api-data-plane-conformance` reache
 | Selectorless/headless Services | Yes | With pod discovery enabled, backends resolve ready EndpointSlice addresses directly; a named Service `targetPort` resolves against EndpointSlice port names, but the `backendRef.port` itself is numeric-only — see [backendRef port and zero-weight semantics](#backendref-port-and-zero-weight-semantics) |
 | Backend failure | Yes | Traffic to unavailable generated backends must return an error response rather than falling through |
 | Route update and deletion | Yes | Reconciliation regenerates live proxy/upstream/plugin config; deletion removes the route from live config |
-| `UDPRoute` | Yes, via unit translation/status tests **and** a live UDP data-path integration suite (not upstream `GATEWAY-UDP`; no `kind` black-box step) | A `UDPRoute` attached to a `protocol: UDP` Gateway listener materializes a Ferrum UDP stream proxy on the listener port, preserving datagram semantics from the existing UDP data path (per-client sessions, idle expiry). Response-amplification protection is always engaged: the translator projects a finite controller default of `8.0` unless a Ferrum `UDPResponseAmplificationPolicy` wins (UDPRoute > Gateway listener `sectionName` > Gateway > `GatewayClass.parametersRef` > default). Unlimited requires `mode: Unlimited` and `acknowledgeUnsafeAmplification: true`. Invalid or unauthorized policy never programs an unlimited relay. CI **Unit** Tests cover parent/listener attachment, ReferenceGrant cross-namespace
+| `UDPRoute` | Yes, via unit translation/status tests **and** a live UDP data-path integration suite (not upstream `GATEWAY-UDP`; no `kind` black-box step) | A `UDPRoute` attached to a `protocol: UDP` Gateway listener materializes a Ferrum UDP stream proxy on the listener port, preserving datagram semantics from the existing UDP data path (per-client sessions, idle expiry). Response-amplification protection is always engaged: the translator projects a finite controller default of `8.0` unless a Ferrum `UDPResponseAmplificationPolicy` wins (UDPRoute > Gateway listener `sectionName` > Gateway > `GatewayClass.parametersRef` > default). Distinct Gateways/listeners that share one UDP port share one physical proxy: each claim is resolved independently, then fail-closed aggregated (finite dominates Unlimited; smallest finite wins; Unlimited only if every represented claim is explicitly Unlimited). Unlimited requires `mode: Unlimited` and `acknowledgeUnsafeAmplification: true`. Invalid or unauthorized policy never programs an unlimited relay. CI **Unit** Tests cover parent/listener attachment, ReferenceGrant cross-namespace
 authorization, weighted multi-backend materialization, zero-weight withdrawal,
 mixed valid/invalid weighted blackhole legs, missing/unpermitted backend
 fail-closed behavior, parent status (`Accepted`/`ResolvedRefs`/`Programmed` /
@@ -131,7 +131,7 @@ set.
 | Listener attachment | A `UDPRoute` attaches only to a `protocol: UDP` listener. `allowedRoutes.kinds` may narrow it to `UDPRoute`; naming any other kind for a UDP listener invalidates that kinds list, exactly as for TCP/TLS |
 | Gateway parents | A `UDPRoute` materializes **only** on concrete listener ports that survive Gateway identity, `sectionName`/`port` selection, listener protocol/kind, `allowedRoutes` namespace, and listener materializability. An unknown, mismatched, or wholly ineligible parent opens nothing (`Accepted=False` with `NoMatchingParent` / `NotAllowedByListeners`) — it never falls back to the backend port |
 | Missing / non-Gateway parents | Every `UDPRoute` requires an attached Gateway UDP listener. A route with no `parentRefs`, or whose `parentRefs` name only non-Gateway parents — a GAMMA `Service` parent, a mistyped `kind`, an unrecognized `group` — opens nothing. Present but malformed or explicitly empty `parentRefs` likewise fail closed instead of being reinterpreted as absent. Ferrum implements no non-Gateway parent for `UDPRoute`, and using the backend port would bind an unannounced north-south UDP relay. Parentless `TCPRoute`/`TLSRoute` retain their historical backend-port fallback; `UDPRoute` does not |
-| Materialization | One Ferrum stream proxy per rule per attached listener port, `backend_scheme: udp`. With no valid attached Gateway listener, no proxy or generated upstream is created; backendRefs are still fully validated so suppression cannot bypass hostile-input or `ReferenceGrant` checks |
+| Materialization | One Ferrum stream proxy per rule per attached listener port, `backend_scheme: udp`. Distinct Gateways or listeners that share that numeric port therefore share one physical proxy, and UDP amplification policy is fail-closed aggregated across the represented claims. With no valid attached Gateway listener, no proxy or generated upstream is created; backendRefs are still fully validated so suppression cannot bypass hostile-input or `ReferenceGrant` checks |
 | `spec.rules` | Exactly one rule. The pinned CRD (`apis/v1alpha2/udproute_types.go`: `MinItems=1`, `MaxItems=16`, `listType=atomic`) accepts `1..=16`. Missing, non-array, empty, and over-long (`>16`) `spec.rules` are rejected fail closed as `Accepted=False` / **`Invalid`**. A CRD-valid `2..=16`-rule object is rejected fail closed as `Accepted=False` / **`UnsupportedValue`** (the upstream reason constant), never `Invalid`, with a `UDPRoute spec.rules` diagnostic naming the upstream bound and Ferrum's own. Why unrepresentable rather than merged: a `UDPRouteRule` has only `name` and `backendRefs`, so it carries no match predicate — N rules are N indistinguishable matches on one listener port with no standards-defined precedence, and weights are declared *within* a rule and are not comparable across rules. Merging the sets would silently turn a two-rule object into one weighted split; materializing both would queue competing OS listeners whose winner is bind order. See [`ensure_udp_route_rule_shape`](../src/config_sources/k8s/gateway_api.rs) |
 | `rules[].backendRefs` | Required array with `MinItems=1` / `MaxItems=16`. Missing, non-array, and empty `backendRefs` reject fail closed as `Accepted=False` / **`Invalid`** (same CRD bound as `spec.rules`) |
 | `backendRefs[].port` | **Required** and numeric `1..=65535` on every entry — including `weight: 0` entries; absent or out-of-range fails closed with a `UDPRoute backendRefs[].port` diagnostic |
@@ -175,6 +175,13 @@ default, applies. `mode: Unlimited` is accepted only together with
 `acknowledgeUnsafeAmplification: true`. Factors must be finite, greater than
 zero, and at most 1024; rejected values do not unprogram the route.
 
+Ferrum materializes one physical UDP proxy per rule per attached listener port.
+When one `UDPRoute` attaches to distinct Gateways or listeners sharing that
+port, each surviving claim keeps the precedence above and the proxy fail-closed
+aggregates them: a finite factor dominates Unlimited, the smallest finite factor
+wins, and the proxy is unlimited only when every represented claim is explicitly
+Unlimited. Listener and parentRef order cannot weaken that boundary.
+
 Runtime accounting is **cumulative per admitted client request**. Several
 backend replies that are each under `request_size × factor` still fail closed
 once their sum exceeds the remaining budget. The budget is stored on the UDP
@@ -189,10 +196,13 @@ An unprogrammed parent — translation failure, unmatched listener, or any
 parent that never materialized a proxy — reports `False` / `NotProgrammed`
 with a fixed message and never inherits `FiniteDefault`. Condition messages
 do not echo resource names, section names, numeric factors, or translator
-errors. When one parentRef materializes on several UDP listeners, that parent
-reports the conservative aggregate: `ExplicitUnlimited` if any listener is
-unlimited, `FinitePolicy` only when every listener uses a finite policy, and
-`FiniteDefault` when at least one uses the controller default.
+errors. Shared-port sibling parents each receive the exact physical-proxy
+protection after aggregation, so a materialized parent is never `NotProgrammed`
+because another parentRef sorted first. When one parentRef materializes on
+several UDP listeners (different ports), that parent reports the conservative
+aggregate: `ExplicitUnlimited` if any listener is unlimited, `FinitePolicy` only
+when every listener uses a finite policy, and `FiniteDefault` when at least one
+uses the controller default.
 Process-wide unlabeled counters
 `ferrum_udp_amplification_responses_allowed_total`,
 `ferrum_udp_amplification_responses_dropped_total`,

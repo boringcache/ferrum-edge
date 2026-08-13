@@ -691,96 +691,170 @@ pub(crate) fn finalize_conflicts(acc: &mut K8sAccumulator) {
 }
 
 /// Project the effective amplification policy onto one generated UDPRoute proxy.
+///
+/// Ferrum materializes one physical UDP proxy per route/rule/`listen_port`.
+/// Every surviving concrete listener claim on that port is resolved independently
+/// (route > Gateway section > Gateway > GatewayClass `parametersRef` > default)
+/// and then fail-closed aggregated onto the proxy. Exact posture is recorded for
+/// every represented parentRef from the actual physical protection.
 pub(crate) fn apply_to_generated_proxy(
     acc: &mut K8sAccumulator,
     object: &K8sObject,
     proxy: &mut Proxy,
     listen_port: u16,
 ) {
-    let (factor, posture, parent_ref) = resolve_for_route(acc, object, listen_port);
+    let (factor, posture, parent_refs) = resolve_for_route(acc, object, listen_port);
     proxy.udp_max_response_amplification_factor = factor;
-    acc.udp_amplification_route_postures
-        .push(GatewayApiUdpAmplificationRoutePosture {
-            route: K8sResourceKey::from_object(object),
-            parent_ref,
-            posture,
-        });
+    let route = K8sResourceKey::from_object(object);
+    for parent_ref in parent_refs {
+        acc.udp_amplification_route_postures
+            .push(GatewayApiUdpAmplificationRoutePosture {
+                route: route.clone(),
+                parent_ref,
+                posture,
+            });
+    }
 }
 
 fn resolve_for_route(
     acc: &K8sAccumulator,
     object: &K8sObject,
     listen_port: u16,
-) -> (Option<f32>, UdpAmplificationPosture, String) {
-    let claims = gateway_api::udp_route_listener_claims(object, acc);
-    let claim = claims.iter().find(|claim| claim.port == listen_port);
-    let parent_ref = claim
+) -> (Option<f32>, UdpAmplificationPosture, Vec<String>) {
+    let matching: Vec<_> = gateway_api::udp_route_surviving_listener_claims(object, acc)
+        .into_iter()
+        .filter(|claim| claim.port == listen_port)
+        .collect();
+    if matching.is_empty() {
+        return (
+            Some(GATEWAY_API_UDP_AMPLIFICATION_DEFAULT_FACTOR),
+            UdpAmplificationPosture::FiniteDefault,
+            vec![String::new()],
+        );
+    }
+
+    let mut parent_refs: Vec<String> = matching
+        .iter()
         .map(|claim| claim.parent_ref.clone())
-        .unwrap_or_default();
+        .collect();
+    parent_refs.sort();
+    parent_refs.dedup();
 
     let route_key = AttachmentKey::Route {
         namespace: object.metadata.namespace.clone(),
         name: object.metadata.name.clone(),
     };
     if let Some(policy) = acc.udp_amplification_policies.by_attachment.get(&route_key) {
-        return posture_from_body(&policy.body, parent_ref);
+        let (factor, posture) = posture_from_body(&policy.body);
+        return (factor, posture, parent_refs);
     }
 
-    if let Some(claim) = claim {
-        let (gateway_ns, gateway_name) = match claim.listener.parent_kind {
-            GatewayApiListenerParentKind::Gateway => (
-                claim.listener.namespace.clone(),
-                claim.listener.gateway.clone(),
-            ),
-            GatewayApiListenerParentKind::ListenerSet => acc
-                .gateway_api_listener_policies
-                .get(&claim.listener)
-                .and_then(|policy| policy.parent_gateway.clone())
-                .unwrap_or_else(|| {
-                    (
-                        claim.listener.namespace.clone(),
-                        claim.listener.gateway.clone(),
-                    )
-                }),
-        };
-        let section_key = AttachmentKey::Gateway {
-            namespace: gateway_ns.clone(),
-            name: gateway_name.clone(),
-            section: Some(claim.listener.listener.clone()),
-        };
-        if let Some(policy) = acc
-            .udp_amplification_policies
-            .by_attachment
-            .get(&section_key)
-        {
-            return posture_from_body(&policy.body, parent_ref);
-        }
-        let gateway_key = AttachmentKey::Gateway {
-            namespace: gateway_ns.clone(),
-            name: gateway_name.clone(),
-            section: None,
-        };
-        if let Some(policy) = acc
-            .udp_amplification_policies
-            .by_attachment
-            .get(&gateway_key)
-        {
-            return posture_from_body(&policy.body, parent_ref);
-        }
-        if let Some(class_name) = acc
-            .gateway_class_name_by_gateway
-            .get(&(gateway_ns, gateway_name))
-            && let Some(factor) = class_default_factor(acc, class_name)
-        {
-            return posture_from_body(&ValidPolicyBody { factor }, parent_ref);
-        }
-    }
+    let resolutions: Vec<(Option<f32>, UdpAmplificationPosture)> = matching
+        .iter()
+        .map(|claim| resolve_for_claim(acc, claim))
+        .collect();
+    let (factor, posture) = aggregate_shared_port_policies(&resolutions);
+    (factor, posture, parent_refs)
+}
 
+fn resolve_for_claim(
+    acc: &K8sAccumulator,
+    claim: &gateway_api::UdpListenerClaim,
+) -> (Option<f32>, UdpAmplificationPosture) {
+    let (gateway_ns, gateway_name) = match claim.listener.parent_kind {
+        GatewayApiListenerParentKind::Gateway => (
+            claim.listener.namespace.clone(),
+            claim.listener.gateway.clone(),
+        ),
+        GatewayApiListenerParentKind::ListenerSet => acc
+            .gateway_api_listener_policies
+            .get(&claim.listener)
+            .and_then(|policy| policy.parent_gateway.clone())
+            .unwrap_or_else(|| {
+                (
+                    claim.listener.namespace.clone(),
+                    claim.listener.gateway.clone(),
+                )
+            }),
+    };
+    let section_key = AttachmentKey::Gateway {
+        namespace: gateway_ns.clone(),
+        name: gateway_name.clone(),
+        section: Some(claim.listener.listener.clone()),
+    };
+    if let Some(policy) = acc
+        .udp_amplification_policies
+        .by_attachment
+        .get(&section_key)
+    {
+        return posture_from_body(&policy.body);
+    }
+    let gateway_key = AttachmentKey::Gateway {
+        namespace: gateway_ns.clone(),
+        name: gateway_name.clone(),
+        section: None,
+    };
+    if let Some(policy) = acc
+        .udp_amplification_policies
+        .by_attachment
+        .get(&gateway_key)
+    {
+        return posture_from_body(&policy.body);
+    }
+    if let Some(class_name) = acc
+        .gateway_class_name_by_gateway
+        .get(&(gateway_ns, gateway_name))
+        && let Some(factor) = class_default_factor(acc, class_name)
+    {
+        return posture_from_body(&ValidPolicyBody { factor });
+    }
     (
         Some(GATEWAY_API_UDP_AMPLIFICATION_DEFAULT_FACTOR),
         UdpAmplificationPosture::FiniteDefault,
-        parent_ref,
     )
+}
+
+/// Fail-closed aggregation for one physical UDP proxy shared by several claims.
+///
+/// A finite factor dominates Unlimited. The smallest finite factor wins among
+/// finite candidates. The proxy is unlimited only when every represented claim
+/// is explicitly Unlimited.
+fn aggregate_shared_port_policies(
+    resolutions: &[(Option<f32>, UdpAmplificationPosture)],
+) -> (Option<f32>, UdpAmplificationPosture) {
+    if resolutions.is_empty() {
+        return (
+            Some(GATEWAY_API_UDP_AMPLIFICATION_DEFAULT_FACTOR),
+            UdpAmplificationPosture::FiniteDefault,
+        );
+    }
+    let mut min_finite: Option<f32> = None;
+    let mut min_from_policy = false;
+    for &(factor, posture) in resolutions {
+        let Some(factor) = factor else {
+            continue;
+        };
+        match min_finite {
+            None => {
+                min_finite = Some(factor);
+                min_from_policy = posture == UdpAmplificationPosture::FinitePolicy;
+            }
+            Some(current) => {
+                let from_policy = posture == UdpAmplificationPosture::FinitePolicy;
+                if factor < current {
+                    min_finite = Some(factor);
+                    min_from_policy = from_policy;
+                } else if factor == current && from_policy {
+                    min_from_policy = true;
+                }
+            }
+        }
+    }
+    match min_finite {
+        None => (None, UdpAmplificationPosture::ExplicitUnlimited),
+        Some(factor) if min_from_policy => (Some(factor), UdpAmplificationPosture::FinitePolicy),
+        Some(factor) => (Some(factor), UdpAmplificationPosture::FiniteDefault),
+    }
 }
 
 fn class_default_factor(acc: &K8sAccumulator, class_name: &str) -> Option<Option<f32>> {
@@ -792,28 +866,23 @@ fn class_default_factor(acc: &K8sAccumulator, class_name: &str) -> Option<Option
     Some(policy.body.factor)
 }
 
-fn posture_from_body(
-    body: &ValidPolicyBody,
-    parent_ref: String,
-) -> (Option<f32>, UdpAmplificationPosture, String) {
+fn posture_from_body(body: &ValidPolicyBody) -> (Option<f32>, UdpAmplificationPosture) {
     match body.factor {
-        None => (None, UdpAmplificationPosture::ExplicitUnlimited, parent_ref),
-        Some(factor) => (
-            Some(factor),
-            UdpAmplificationPosture::FinitePolicy,
-            parent_ref,
-        ),
+        None => (None, UdpAmplificationPosture::ExplicitUnlimited),
+        Some(factor) => (Some(factor), UdpAmplificationPosture::FinitePolicy),
     }
 }
 
 /// Aggregate every exact `(route, parent_ref)` posture.
 ///
-/// A wildcard parentRef can materialize on several UDP listeners, each with
-/// its own effective policy. Status is conservative and order-independent:
-/// any `ExplicitUnlimited` makes the parent unprotected; otherwise protection
-/// stays on, with `FinitePolicy` only when every matching listener won a
-/// finite policy and `FiniteDefault` when at least one uses the controller
-/// default. A missing exact parent does not inherit another parentRef.
+/// Shared-port sibling parents are already fail-closed onto one physical proxy
+/// before recording, so each exact parentRef here is the actual protection.
+/// A wildcard parentRef can still materialize on several UDP ports, each with
+/// its own physical proxy. Status for that parent is conservative and
+/// order-independent: any `ExplicitUnlimited` makes the parent unprotected;
+/// otherwise protection stays on, with `FinitePolicy` only when every matching
+/// listener won a finite policy and `FiniteDefault` when at least one uses the
+/// controller default. A missing exact parent does not inherit another parentRef.
 pub(crate) fn lookup_route_posture(
     postures: &[GatewayApiUdpAmplificationRoutePosture],
     route: &K8sResourceKey,

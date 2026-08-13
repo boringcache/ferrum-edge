@@ -3,7 +3,8 @@
 //! Ordinary UDPRoute translation must never silently program unlimited
 //! amplification. These tests pin the finite default, precedence, cross-namespace
 //! authorization, invalid-value rejection, explicit unlimited override, GEP-713
-//! oldest-wins, and update/delete returning to the safe posture.
+//! oldest-wins, update/delete returning to the safe posture, and fail-closed
+//! aggregation when one UDPRoute attaches to distinct Gateways sharing a port.
 
 use ferrum_edge::config::types::BackendScheme;
 use ferrum_edge::config_sources::k8s::{
@@ -228,6 +229,21 @@ fn finite_route_policy(name: &str, route: &str, factor: f64) -> K8sObject {
             }],
             "mode": "Finite",
             "maxResponseAmplificationFactor": factor
+        }),
+    )
+}
+
+fn unlimited_route_policy(name: &str, route: &str) -> K8sObject {
+    amp_policy(
+        name,
+        json!({
+            "targetRefs": [{
+                "group": "gateway.networking.k8s.io",
+                "kind": "UDPRoute",
+                "name": route
+            }],
+            "mode": "Unlimited",
+            "acknowledgeUnsafeAmplification": true
         }),
     )
 }
@@ -1369,4 +1385,263 @@ fn wildcard_parent_all_finite_policies_report_finite_policy() {
             assert_no_numeric_factor(&message);
         }
     }
+}
+
+const SHARED_UDP_PORT: u16 = 15353;
+
+type SharedPortParent = (&'static str, &'static str);
+
+fn udp_route_two_parents(
+    name: &str,
+    first: SharedPortParent,
+    second: SharedPortParent,
+) -> K8sObject {
+    object_in(
+        "UDPRoute",
+        "gateway.networking.k8s.io/v1alpha2",
+        "default",
+        name,
+        json!({
+            "parentRefs": [
+                {"name": first.0, "sectionName": first.1},
+                {"name": second.0, "sectionName": second.1}
+            ],
+            "rules": [{"backendRefs": [{"name": "coredns", "port": 5353}]}]
+        }),
+    )
+}
+
+fn finite_named_gateway_section_policy(
+    name: &str,
+    gateway: &str,
+    section: &str,
+    factor: f64,
+) -> K8sObject {
+    amp_policy(
+        name,
+        json!({
+            "targetRefs": [{
+                "group": "gateway.networking.k8s.io",
+                "kind": "Gateway",
+                "name": gateway,
+                "sectionName": section
+            }],
+            "mode": "Finite",
+            "maxResponseAmplificationFactor": factor
+        }),
+    )
+}
+
+fn unlimited_named_gateway_section_policy(name: &str, gateway: &str, section: &str) -> K8sObject {
+    amp_policy(
+        name,
+        json!({
+            "targetRefs": [{
+                "group": "gateway.networking.k8s.io",
+                "kind": "Gateway",
+                "name": gateway,
+                "sectionName": section
+            }],
+            "mode": "Unlimited",
+            "acknowledgeUnsafeAmplification": true
+        }),
+    )
+}
+
+fn shared_port_parent_orders() -> [[SharedPortParent; 2]; 2] {
+    [
+        [("alpha", "dns"), ("zeta", "alt")],
+        [("zeta", "alt"), ("alpha", "dns")],
+    ]
+}
+
+fn shared_port_gateway_orders() -> [[&'static str; 2]; 2] {
+    [["alpha", "zeta"], ["zeta", "alpha"]]
+}
+
+fn shared_port_objects(
+    parents: [SharedPortParent; 2],
+    gateway_order: [&str; 2],
+    policies: impl IntoIterator<Item = K8sObject>,
+) -> Vec<K8sObject> {
+    let mut listener_by_gateway = HashMap::new();
+    for (gateway, section) in parents {
+        listener_by_gateway.insert(gateway, section);
+    }
+    let mut objects = vec![gateway_class()];
+    for gateway in gateway_order {
+        let section = listener_by_gateway
+            .get(gateway)
+            .copied()
+            .expect("gateway listener");
+        objects.push(udp_gateway(gateway, section, SHARED_UDP_PORT));
+    }
+    objects.push(udp_route_two_parents("shared", parents[0], parents[1]));
+    objects.extend(policies);
+    objects
+}
+
+fn assert_shared_port_proxy_factor(objects: &[K8sObject], expected: Option<f32>, label: &str) {
+    let result = translate_k8s_objects(objects, options()).expect("translation succeeds");
+    let proxies: Vec<_> = result
+        .config
+        .proxies
+        .iter()
+        .filter(|proxy| proxy.backend_scheme == Some(BackendScheme::Udp))
+        .collect();
+    assert_eq!(
+        proxies.len(),
+        1,
+        "{label}: distinct Gateways sharing a UDP port must materialize one physical proxy"
+    );
+    assert_eq!(proxies[0].listen_port, Some(SHARED_UDP_PORT), "{label}");
+    assert_eq!(
+        proxies[0].udp_max_response_amplification_factor,
+        expected,
+        "{label}"
+    );
+}
+
+fn assert_both_shared_parents_protection(
+    objects: &[K8sObject],
+    protected: bool,
+    reason: &str,
+    label: &str,
+) {
+    let conditions = route_protection_conditions_named(objects, "shared");
+    assert_eq!(
+        conditions.len(),
+        2,
+        "{label}: both materialized parents must receive exact amplification posture, got {conditions:?}"
+    );
+    for (on, got_reason, message) in &conditions {
+        assert_eq!(
+            *on, protected,
+            "{label}: parent protection mismatch: {conditions:?}"
+        );
+        assert_eq!(got_reason, reason, "{label}: {conditions:?}");
+        assert_ne!(
+            got_reason.as_str(),
+            "NotProgrammed",
+            "{label}: materialized sibling must not be NotProgrammed: {conditions:?}"
+        );
+        assert_no_numeric_factor(message);
+    }
+}
+
+fn for_each_shared_port_order(
+    policies: impl Fn() -> Vec<K8sObject>,
+    mut check: impl FnMut(&[K8sObject], &str),
+) {
+    let original = policies();
+    let mut reversed = policies();
+    reversed.reverse();
+    let policy_sets = [original, reversed];
+    for parents in shared_port_parent_orders() {
+        for gateways in shared_port_gateway_orders() {
+            for policies in &policy_sets {
+                let objects = shared_port_objects(parents, gateways, policies.clone());
+                check(
+                    &objects,
+                    &format!("parents={parents:?} gateways={gateways:?}"),
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn shared_port_unlimited_plus_finite_stays_finite_regardless_of_order() {
+    for_each_shared_port_order(
+        || {
+            vec![
+                unlimited_named_gateway_section_policy("open", "alpha", "dns"),
+                finite_named_gateway_section_policy("tight", "zeta", "alt", 4.0),
+            ]
+        },
+        |objects, label| {
+            assert_shared_port_proxy_factor(objects, Some(4.0), label);
+            assert_both_shared_parents_protection(objects, true, "FinitePolicy", label);
+        },
+    );
+}
+
+#[test]
+fn shared_port_unlimited_plus_default_stays_finite_default_regardless_of_order() {
+    for_each_shared_port_order(
+        || vec![unlimited_named_gateway_section_policy("open", "alpha", "dns")],
+        |objects, label| {
+            assert_shared_port_proxy_factor(
+                objects,
+                Some(GATEWAY_API_UDP_AMPLIFICATION_DEFAULT_FACTOR),
+                label,
+            );
+            assert_both_shared_parents_protection(objects, true, "FiniteDefault", label);
+        },
+    );
+}
+
+#[test]
+fn shared_port_differing_finite_policies_choose_smaller_factor() {
+    for_each_shared_port_order(
+        || {
+            vec![
+                finite_named_gateway_section_policy("loose", "alpha", "dns", 8.0),
+                finite_named_gateway_section_policy("tight", "zeta", "alt", 2.0),
+            ]
+        },
+        |objects, label| {
+            assert_shared_port_proxy_factor(objects, Some(2.0), label);
+            assert_both_shared_parents_protection(objects, true, "FinitePolicy", label);
+        },
+    );
+}
+
+#[test]
+fn shared_port_all_explicit_unlimited_is_only_none_case() {
+    for_each_shared_port_order(
+        || {
+            vec![
+                unlimited_named_gateway_section_policy("open-alpha", "alpha", "dns"),
+                unlimited_named_gateway_section_policy("open-zeta", "zeta", "alt"),
+            ]
+        },
+        |objects, label| {
+            assert_shared_port_proxy_factor(objects, None, label);
+            assert_both_shared_parents_protection(objects, false, "ExplicitUnlimited", label);
+        },
+    );
+}
+
+#[test]
+fn shared_port_route_policy_overrides_divergent_gateway_policies() {
+    for_each_shared_port_order(
+        || {
+            vec![
+                finite_named_gateway_section_policy("loose", "alpha", "dns", 16.0),
+                finite_named_gateway_section_policy("tight", "zeta", "alt", 2.0),
+                finite_route_policy("route", "shared", 3.0),
+            ]
+        },
+        |objects, label| {
+            assert_shared_port_proxy_factor(objects, Some(3.0), label);
+            assert_both_shared_parents_protection(objects, true, "FinitePolicy", label);
+        },
+    );
+}
+
+#[test]
+fn shared_port_route_unlimited_applies_to_every_claim() {
+    for_each_shared_port_order(
+        || {
+            vec![
+                finite_named_gateway_section_policy("tight", "zeta", "alt", 2.0),
+                unlimited_route_policy("open-route", "shared"),
+            ]
+        },
+        |objects, label| {
+            assert_shared_port_proxy_factor(objects, None, label);
+            assert_both_shared_parents_protection(objects, false, "ExplicitUnlimited", label);
+        },
+    );
 }

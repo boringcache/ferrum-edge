@@ -849,17 +849,26 @@ default). Unlimited is available only with `mode: Unlimited` **and**
 `acknowledgeUnsafeAmplification: true`. Deleting the policy returns the
 listener to the finite default on the next reconcile without a process restart.
 
+Ferrum materializes one physical UDP proxy per route/rule/`listen_port`. When
+one `UDPRoute` attaches to distinct Gateways or listeners that share that port,
+each surviving claim is resolved with the precedence above and then fail-closed
+onto the proxy: a finite factor dominates Unlimited, the smallest finite factor
+wins, and the proxy is unlimited only when every represented claim is explicitly
+Unlimited. Input order and listener names do not change that boundary.
+
 `UDPRoute.status.parents[].conditions` includes Ferrum
 `UDPAmplificationProtection` (`FiniteDefault` / `FinitePolicy` /
 `ExplicitUnlimited`) without echoing the numeric factor, and only for a parent
 whose translator recorded that posture. An unprogrammed parent reports
 `False` / `NotProgrammed` with a fixed message rather than inheriting
-`FiniteDefault`. When one parentRef materializes on several UDP listeners,
-that parent reports the conservative aggregate: `ExplicitUnlimited` if any
-listener is unlimited, `FinitePolicy` only when every listener uses a finite
-policy, and `FiniteDefault` when at least one uses the controller default. A
-missing exact parent does not inherit another parentRef's posture. Runtime
-accounting is cumulative per admitted request; see
+`FiniteDefault`. Shared-port sibling parents each receive that exact physical
+protection, so a materialized parent is never `NotProgrammed` merely because
+another parentRef sorted first. When one parentRef materializes on several UDP
+listeners (different ports), that parent reports the conservative aggregate:
+`ExplicitUnlimited` if any listener is unlimited, `FinitePolicy` only when every
+listener uses a finite policy, and `FiniteDefault` when at least one uses the
+controller default. A missing exact parent does not inherit another parentRef's
+posture. Runtime accounting is cumulative per admitted request; see
 [`docs/tcp_udp_proxy.md`](tcp_udp_proxy.md).
 
 For a `UDPRoute` the rule's `backendRefs` is a weighted **set**. A single
