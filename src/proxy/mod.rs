@@ -7599,7 +7599,7 @@ impl ProxyState {
         match commit {
             GatewayTrustCommit::Replace(candidate)
                 if current.as_ref().is_some_and(|installed| {
-                    runtime_trust_bundle_sets_equal(installed, &candidate)
+                    runtime_trust_bundle_sets_equal(&installed, &candidate)
                 }) =>
             {
                 GatewayTrustCommit::Unchanged

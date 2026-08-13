@@ -1282,9 +1282,7 @@ fn convert_gateway_trust_bundles(
 fn parse_gateway_trust_bundle_update(
     trust_bundles_json: &str,
 ) -> Result<GatewayTrustBundleUpdate, String> {
-    if trust_bundles_json.len()
-        > crate::config::gateway_trust::MAX_TRUST_BUNDLE_JSON_BYTES
-    {
+    if trust_bundles_json.len() > crate::config::gateway_trust::MAX_TRUST_BUNDLE_JSON_BYTES {
         return Err("gateway trust bundles side-channel exceeds the wire limit".to_string());
     }
     let trust_bundles_json = trust_bundles_json.trim();
@@ -1292,8 +1290,9 @@ fn parse_gateway_trust_bundle_update(
         let trust_bundles: Option<ConfigTrustBundleSet> = serde_json::from_str(trust_bundles_json)
             .map_err(|_| "gateway trust bundles side-channel is not valid JSON".to_string())?;
         return match trust_bundles {
-            Some(trust_bundles) => convert_gateway_trust_bundles(trust_bundles)
-                .map(GatewayTrustBundleUpdate::Replace),
+            Some(trust_bundles) => {
+                convert_gateway_trust_bundles(trust_bundles).map(GatewayTrustBundleUpdate::Replace)
+            }
             None => Ok(GatewayTrustBundleUpdate::Clear),
         };
     }
@@ -2963,9 +2962,8 @@ mod tests {
             .decode(valid)
             .expect("fixture DER decodes");
         der.extend_from_slice(b"trailing");
-        let trailing = test_config_trust_bundles(vec![
-            base64::engine::general_purpose::STANDARD.encode(der),
-        ]);
+        let trailing =
+            test_config_trust_bundles(vec![base64::engine::general_purpose::STANDARD.encode(der)]);
         let trailing_json = serde_json::to_string(&trailing).expect("fixture serializes");
         assert!(parse_gateway_trust_bundle_update(&trailing_json).is_err());
     }
@@ -3017,10 +3015,12 @@ mod tests {
 
     #[test]
     fn parse_gateway_trust_bundle_update_rejects_wire_and_entry_limits() {
-        let over_count = test_config_trust_bundles(vec![
-            test_root_ca_der_base64("dp-wire-count-root");
-            crate::config::gateway_trust::MAX_X509_AUTHORITIES_PER_BUNDLE + 1
-        ]);
+        let over_count =
+            test_config_trust_bundles(vec![
+                test_root_ca_der_base64("dp-wire-count-root");
+                crate::config::gateway_trust::MAX_X509_AUTHORITIES_PER_BUNDLE
+                    + 1
+            ]);
         assert!(
             parse_gateway_trust_bundle_update(
                 &serde_json::to_string(&over_count).expect("fixture serializes")
@@ -3028,9 +3028,9 @@ mod tests {
             .is_err()
         );
 
-        let over_entry = test_config_trust_bundles(vec!["A".repeat(
-            crate::config::gateway_trust::MAX_X509_AUTHORITY_DER_BYTES * 2,
-        )]);
+        let over_entry = test_config_trust_bundles(vec![
+            "A".repeat(crate::config::gateway_trust::MAX_X509_AUTHORITY_DER_BYTES * 2),
+        ]);
         assert!(
             parse_gateway_trust_bundle_update(
                 &serde_json::to_string(&over_entry).expect("fixture serializes")

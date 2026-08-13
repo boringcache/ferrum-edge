@@ -911,9 +911,7 @@ impl CpGrpcServer {
         let trust_json = match &projection {
             Projection::KeepPrevious => String::new(),
             Projection::Clear => "null".to_string(),
-            Projection::Replace(_) => {
-                Self::trust_bundles_json(filtered.trust_bundles.as_deref())?
-            }
+            Projection::Replace(_) => Self::trust_bundles_json(filtered.trust_bundles.as_deref())?,
         };
         Ok((filtered, trust_json))
     }
@@ -1790,9 +1788,7 @@ impl CpGrpcServer {
     /// there is nothing to validate and nothing to say. `Replace` runs the same
     /// bounded deep validation as a snapshot. Invalid material fails the whole
     /// publication and never becomes an explicit clear.
-    fn trust_publication_json(
-        trust: &GatewayTrustPublication<'_>,
-    ) -> Result<String, &'static str> {
+    fn trust_publication_json(trust: &GatewayTrustPublication<'_>) -> Result<String, &'static str> {
         match trust {
             GatewayTrustPublication::Unchanged => Ok(String::new()),
             GatewayTrustPublication::Clear => Ok("null".to_string()),
@@ -2037,19 +2033,16 @@ impl ConfigSync for CpGrpcServer {
         // Send initial full config — filtered to the DP's namespace so the
         // initial snapshot matches the per-namespace broadcast stream.
         let config = self.config.load_full();
-        let (filtered, trust_bundles_json) = Self::filter_config_and_trust_for_scope(
-            config.as_ref(),
-            &dp_namespace,
-            &self.scope,
-        )
-        .map_err(|failure_class| {
-            error!(
-                namespace = %dp_namespace,
-                failure_class,
-                "Refusing initial ConfigSync snapshot because gateway trust is unusable"
-            );
-            Status::internal("Failed to prepare configuration snapshot")
-        })?;
+        let (filtered, trust_bundles_json) =
+            Self::filter_config_and_trust_for_scope(config.as_ref(), &dp_namespace, &self.scope)
+                .map_err(|failure_class| {
+                    error!(
+                        namespace = %dp_namespace,
+                        failure_class,
+                        "Refusing initial ConfigSync snapshot because gateway trust is unusable"
+                    );
+                    Status::internal("Failed to prepare configuration snapshot")
+                })?;
         let config_json = Self::config_json_for_dp(&filtered).map_err(|e| {
             error!("Refusing to publish configuration in subscribe: {}", e);
             Status::internal("Failed to serialize configuration")
@@ -2235,19 +2228,16 @@ impl ConfigSync for CpGrpcServer {
             return Err(status);
         }
         let config = self.config.load_full();
-        let (filtered, trust_bundles_json) = Self::filter_config_and_trust_for_scope(
-            config.as_ref(),
-            &req.namespace,
-            &self.scope,
-        )
-        .map_err(|failure_class| {
-            error!(
-                namespace = %req.namespace,
-                failure_class,
-                "Refusing GetFullConfig snapshot because gateway trust is unusable"
-            );
-            Status::internal("Failed to prepare configuration snapshot")
-        })?;
+        let (filtered, trust_bundles_json) =
+            Self::filter_config_and_trust_for_scope(config.as_ref(), &req.namespace, &self.scope)
+                .map_err(|failure_class| {
+                    error!(
+                        namespace = %req.namespace,
+                        failure_class,
+                        "Refusing GetFullConfig snapshot because gateway trust is unusable"
+                    );
+                    Status::internal("Failed to prepare configuration snapshot")
+                })?;
         let config_json = Self::config_json_for_dp(&filtered).map_err(|e| {
             error!(
                 "Refusing to publish configuration in get_full_config: {}",
@@ -2445,7 +2435,10 @@ mod tests {
 
         CpGrpcServer::broadcast_update(&tx, &config);
         assert!(
-            matches!(rx.try_recv(), Err(tokio::sync::broadcast::error::TryRecvError::Empty)),
+            matches!(
+                rx.try_recv(),
+                Err(tokio::sync::broadcast::error::TryRecvError::Empty)
+            ),
             "an invalid Replace must emit no config and no synthetic Clear"
         );
     }

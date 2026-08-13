@@ -693,22 +693,19 @@ async fn test_dp_stores_gateway_trust_bundles_from_delta_side_channel() {
         GatewayTrustPublication::Replace(&trust_bundles),
     );
 
-    let received_trust = timeout(Duration::from_secs(5), async {
-        loop {
-            let loaded = proxy_state.gateway_trust_bundles.load();
-            if loaded
-                .as_ref()
-                .as_ref()
-                .is_some_and(|tb| {
+    let received_trust =
+        timeout(Duration::from_secs(5), async {
+            loop {
+                let loaded = proxy_state.gateway_trust_bundles.load();
+                if loaded.as_ref().as_ref().is_some_and(|tb| {
                     tb.local.x509_authorities == vec![(*TEST_LOCAL_ROOT_DER).clone()]
-                })
-            {
-                break;
+                }) {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
             }
-            tokio::time::sleep(Duration::from_millis(50)).await;
-        }
-    })
-    .await;
+        })
+        .await;
     assert!(
         received_trust.is_ok(),
         "DP should apply gateway trust bundles from delta side-channel"
@@ -799,7 +796,10 @@ async fn invalid_trust_delta_terminates_without_mutating_last_known_good_generat
         &proxy_state.gateway_trust_bundles.load_full(),
         &trust_before
     ));
-    assert!(Arc::ptr_eq(&proxy_state.request_epoch.load(), &epoch_before));
+    assert!(Arc::ptr_eq(
+        &proxy_state.request_epoch.load(),
+        &epoch_before
+    ));
     assert_eq!(proxy_state.config.load().proxies.len(), 1);
 }
 

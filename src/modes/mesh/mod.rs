@@ -17080,11 +17080,8 @@ async fn apply_mesh_slice_generation(
             let dns_slice = dns_proxy.as_ref().and_then(|_| {
                 node_waypoint_dns_slice_for_prepared_config(runtime, base_slice, &config)
             });
-            let outcome = proxy_state.update_mesh_config(
-                config,
-                &trusted_mesh_ids,
-                staged_gateway_trust,
-            );
+            let outcome =
+                proxy_state.update_mesh_config(config, &trusted_mesh_ids, staged_gateway_trust);
             let applied = outcome.applied();
             let accepted = outcome.accepted();
             // Publish the node-waypoint resolver snapshot the instant the proxy
@@ -17800,20 +17797,6 @@ pub mod startup_rollback_test_seams {
 
     fn ensure_crypto_provider() {
         let _ = crate::fips::base_crypto_provider().install_default();
-    }
-
-    fn test_root_ca_der_base64(common_name: &str) -> String {
-        use base64::Engine;
-        let key = rcgen::KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256)
-            .expect("test CA key generates");
-        let mut params =
-            rcgen::CertificateParams::new(Vec::<String>::new()).expect("test CA params build");
-        params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
-        params
-            .distinguished_name
-            .push(rcgen::DnType::CommonName, common_name);
-        let cert = params.self_signed(&key).expect("test CA self-signs");
-        base64::engine::general_purpose::STANDARD.encode(cert.der())
     }
 
     fn probe_runtime_config() -> MeshRuntimeConfig {
@@ -18611,6 +18594,20 @@ mod tests {
 
     fn ensure_crypto_provider() {
         let _ = crate::fips::base_crypto_provider().install_default();
+    }
+
+    fn test_root_ca_der_base64(common_name: &str) -> String {
+        use base64::Engine;
+        let key = rcgen::KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256)
+            .expect("test CA key generates");
+        let mut params =
+            rcgen::CertificateParams::new(Vec::<String>::new()).expect("test CA params build");
+        params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+        params
+            .distinguished_name
+            .push(rcgen::DnType::CommonName, common_name);
+        let cert = params.self_signed(&key).expect("test CA self-signs");
+        base64::engine::general_purpose::STANDARD.encode(cert.der())
     }
 
     /// The SVID slot `load_mesh_frontend_server_identity` resolves the
@@ -31687,9 +31684,7 @@ mod tests {
 
         let mut polled = federation::FederationSnapshot::default();
         let polled_root = test_root_ca_der_base64("mesh-polled-root");
-        let expected_polled_root = engine
-            .decode(&polled_root)
-            .expect("test root decodes");
+        let expected_polled_root = engine.decode(&polled_root).expect("test root decodes");
         polled.bundles.insert(
             remote_td.clone(),
             federation::FederatedBundle {
@@ -31704,13 +31699,8 @@ mod tests {
                 cluster_name: "remote".to_string(),
             },
         );
-        let commit = stage_gateway_active_trust_bundles(
-            &state,
-            &slice,
-            Some(&polled),
-            activation,
-        )
-        .expect("polled trust stages");
+        let commit = stage_gateway_active_trust_bundles(&state, &slice, Some(&polled), activation)
+            .expect("polled trust stages");
         state.update_config_with_gateway_trust(GatewayConfig::default(), commit);
 
         let active = state.gateway_svid_bundle.load_full();
@@ -31771,7 +31761,10 @@ mod tests {
             .is_err(),
             "deep-invalid DER must reject the complete mesh generation"
         );
-        assert!(Arc::ptr_eq(&state.gateway_svid_bundle.load_full(), &before_svid));
+        assert!(Arc::ptr_eq(
+            &state.gateway_svid_bundle.load_full(),
+            &before_svid
+        ));
         assert!(Arc::ptr_eq(&state.request_epoch.load(), &before_epoch));
         assert!(state.admits_gateway_mesh_identity());
     }
@@ -31822,9 +31815,7 @@ mod tests {
         let engine = base64::engine::general_purpose::STANDARD;
         let local_root = test_root_ca_der_base64("mesh-runtime-local-root");
         let partner_root = test_root_ca_der_base64("mesh-runtime-partner-root");
-        let expected_partner_root = engine
-            .decode(&partner_root)
-            .expect("test root decodes");
+        let expected_partner_root = engine.decode(&partner_root).expect("test root decodes");
         mesh_state.install_slice(MeshSlice {
             version: "accepted-trust".to_string(),
             labels: [("trust".to_string(), "published".to_string())].into(),
