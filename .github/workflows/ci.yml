@@ -4918,6 +4918,15 @@ jobs:
           python3 tests/performance/multi_protocol/evaluate_protocol_perf_budgets.py --self-test
           python3 -m py_compile tests/performance/multi_protocol/run_protocol_regression_scenarios.py
 
+      # Lightweight mesh-baseline workflow contracts (no collection): keep
+      # acceptance/runner-pin/interval-evidence wiring on required full-mode PR
+      # CI. helm-chart is path-gated on charts/ and would skip this surface.
+      - name: Verify mesh performance baselines workflow contract
+        run: |
+          set -euo pipefail
+          python3 .github/scripts/verify_mesh_performance_baselines_workflow.py --self-test
+          python3 .github/scripts/verify_mesh_performance_baselines_workflow.py
+
       - name: Detect performance-sensitive changes
         id: perf_changes
         shell: bash
