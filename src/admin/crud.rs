@@ -24,6 +24,7 @@ use crate::config::db_backend::{
     validate_api_spec_restore_inputs,
 };
 use crate::config::db_loader::{is_proxy_plugin_association_load_error, is_row_decode_rejection};
+use crate::config::gateway_trust::GatewayTrustBundleRecord;
 use crate::config::types::{
     Consumer, GatewayConfig, PluginConfig, PluginScope, Proxy, Upstream, validate_resource_id,
 };
@@ -597,7 +598,10 @@ where
     F: Future<Output = DbResult<T>>,
 {
     match guard {
-        Some(guard) => guard.run_to_completion_while_held(future).await,
+        Some(guard) => guard
+            .run_to_completion_while_held(future)
+            .await
+            .map_err(mark_mtls_dns_admission_unavailable),
         None => Ok(NamespaceConfigAdmissionCompletion::Held(future.await)),
     }
 }
@@ -666,10 +670,10 @@ async fn recover_late_resource_write<R: AdminResource>(
     http_client: crate::plugins::PluginHttpClient,
     action: LateResourceWrite<'_>,
     recovery: LateResourceRecovery<'_, R>,
-) -> Result<bool, anyhow::Error> {
+) -> Result<Option<NamespaceConfigAdmissionGuard>, anyhow::Error> {
     let recovery_guard = lock_namespace_config_admission(db.clone(), namespace).await?;
     if recovery_guard.immediately_succeeds_generation(lost_generation) {
-        return Ok(true);
+        return Ok(Some(recovery_guard));
     }
     if matches!(
         &action,
@@ -684,7 +688,7 @@ async fn recover_late_resource_write<R: AdminResource>(
         .await?,
         InterveningWriteRecovery::KeepCurrent
     ) {
-        return Ok(false);
+        return Ok(None);
     }
 
     let compensation = async {
@@ -719,7 +723,7 @@ async fn recover_late_resource_write<R: AdminResource>(
                 if R::db_get_for_write(db.as_ref(), namespace, id)
                     .await?
                     .is_some_and(|current| current.updated_at() == written.updated_at())
-                    && !R::db_update(db.as_ref(), previous).await?
+                    && !R::compensate_late_update(db.as_ref(), previous).await?
                 {
                     anyhow::bail!("late update compensation found no matching resource");
                 }
@@ -758,7 +762,69 @@ async fn recover_late_resource_write<R: AdminResource>(
             return Err(error);
         }
     }
-    Ok(false)
+    Ok(None)
+}
+
+/// Resolve the authoritative post-write view of a committed resource.
+///
+/// For every resource that has not opted into [`AdminResource::REREAD_AFTER_WRITE`]
+/// this is the identity function on the request-side value, so the generic
+/// settlement/late-write behaviour is untouched.
+///
+/// For a resource that HAS opted in, the committed record is re-read by
+/// `(namespace, id)` through the same namespace-predicated store method a `GET`
+/// uses. There is no cached fallback and no "close enough" default: if the
+/// read fails, or the record is gone, the caller must report the write as
+/// failed rather than answer with a revision the store never assigned. Returning
+/// the request-side value in that case is precisely the defect this exists to
+/// remove.
+async fn settle_written_resource<R: AdminResource>(
+    db: &dyn DatabaseBackend,
+    namespace: &str,
+    written: R,
+) -> DbResult<R> {
+    if !R::REREAD_AFTER_WRITE {
+        return Ok(written);
+    }
+    match R::db_get(db, namespace, written.id()).await? {
+        Some(stored) => Ok(stored),
+        None => Err(anyhow::anyhow!(
+            "committed {} could not be re-read for its authoritative stored state",
+            R::RESOURCE_NAME
+        )),
+    }
+}
+
+/// Settle a committed write while continuing to observe namespace admission.
+///
+/// Merely retaining the guard is insufficient: its lease can expire while the
+/// authoritative read is in flight. In that case the read may describe a later
+/// writer, so fail closed instead of using it for this request's response and
+/// audit after-image.
+///
+/// A resource that has NOT opted into [`AdminResource::REREAD_AFTER_WRITE`]
+/// short-circuits before the lease is observed at all. There is no store read
+/// to fence — settlement is the identity function on a value the caller already
+/// holds — and the write has already COMMITTED by this point. Routing that pure
+/// identity through the admission observation would let a lease that expired
+/// after the commit turn a successful `200`/`201` into a reported failure, for
+/// every generic resource, which is a behaviour change the re-read seam must
+/// not impose on resources that do not use it.
+async fn settle_written_resource_while_held<R: AdminResource>(
+    guard: Option<&NamespaceConfigAdmissionGuard>,
+    db: &dyn DatabaseBackend,
+    namespace: &str,
+    written: R,
+) -> DbResult<R> {
+    if !R::REREAD_AFTER_WRITE {
+        return Ok(written);
+    }
+    match run_db_write_while_held(guard, settle_written_resource(db, namespace, written)).await? {
+        NamespaceConfigAdmissionCompletion::Held(result) => result,
+        NamespaceConfigAdmissionCompletion::Lost { result: _, error } => {
+            Err(mark_mtls_dns_admission_unavailable(error))
+        }
+    }
 }
 
 struct OwnedWriteSettlementContext {
@@ -770,10 +836,14 @@ struct OwnedWriteSettlementContext {
     actor: AuditActor,
 }
 
+/// Returns the AUTHORITATIVE committed resource — for a resource that opted
+/// into [`AdminResource::REREAD_AFTER_WRITE`] this is the re-read record, so the
+/// 201 body and the audit after-image both carry the state the store actually
+/// holds; for every other resource it is the request-side value, unchanged.
 async fn persist_create_to_settlement<R: AdminResource>(
     context: OwnedWriteSettlementContext,
     written: R,
-) -> DbResult<()> {
+) -> DbResult<R> {
     let OwnedWriteSettlementContext {
         db,
         namespace,
@@ -808,8 +878,11 @@ async fn persist_create_to_settlement<R: AdminResource>(
                 )
                 .await
                 {
-                    Ok(true) => Ok(()),
-                    Ok(false) => Err(mark_mtls_dns_admission_unavailable(anyhow::anyhow!(
+                    Ok(Some(recovery_guard)) => {
+                        guard = Some(recovery_guard);
+                        Ok(())
+                    }
+                    Ok(None) => Err(mark_mtls_dns_admission_unavailable(anyhow::anyhow!(
                         "namespace config admission was lost during create; the late write was compensated"
                     ))),
                     Err(_recovery_error) => {
@@ -823,27 +896,40 @@ async fn persist_create_to_settlement<R: AdminResource>(
         },
         Err(error) => Err(error),
     };
-    if result.is_ok() {
-        finish_write_success(
-            success_db,
-            &state,
-            &actor,
-            &namespace,
-            &written,
-            None,
-            WriteAction::Create,
-        )
-        .await;
-    }
-    result
+    result?;
+    // Settle BEFORE auditing so the audit after-image and the response body are
+    // the same authoritative record. A failure here is reported as a failed
+    // write: the alternative — auditing and answering with the request-side
+    // revision — is the stale-value defect itself.
+    let settled = settle_written_resource_while_held::<R>(
+        guard.as_ref(),
+        success_db.as_ref(),
+        &namespace,
+        written,
+    )
+    .await?;
+    finish_write_success(
+        success_db,
+        &state,
+        &actor,
+        &namespace,
+        &settled,
+        None,
+        WriteAction::Create,
+    )
+    .await;
+    Ok(settled)
 }
 
+/// `Ok(None)` is the not-found outcome (the row vanished between the precheck
+/// and the write); `Ok(Some(settled))` carries the AUTHORITATIVE committed
+/// resource — see [`persist_create_to_settlement`].
 async fn persist_update_to_settlement<R: AdminResource>(
     context: OwnedWriteSettlementContext,
     id: String,
     written: R,
     previous: R,
-) -> DbResult<bool> {
+) -> DbResult<Option<R>> {
     let OwnedWriteSettlementContext {
         db,
         namespace,
@@ -879,8 +965,11 @@ async fn persist_update_to_settlement<R: AdminResource>(
                 )
                 .await
                 {
-                    Ok(true) => Ok(true),
-                    Ok(false) => Err(mark_mtls_dns_admission_unavailable(anyhow::anyhow!(
+                    Ok(Some(recovery_guard)) => {
+                        guard = Some(recovery_guard);
+                        Ok(true)
+                    }
+                    Ok(None) => Err(mark_mtls_dns_admission_unavailable(anyhow::anyhow!(
                         "namespace config admission was lost during update; the late write was compensated"
                     ))),
                     Err(_recovery_error) => {
@@ -894,19 +983,27 @@ async fn persist_update_to_settlement<R: AdminResource>(
         },
         Err(error) => Err(error),
     };
-    if matches!(&result, Ok(true)) {
-        finish_write_success(
-            success_db,
-            &state,
-            &actor,
-            &namespace,
-            &written,
-            Some(&previous),
-            WriteAction::Update { id: &id },
-        )
-        .await;
+    if !result? {
+        return Ok(None);
     }
-    result
+    let settled = settle_written_resource_while_held::<R>(
+        guard.as_ref(),
+        success_db.as_ref(),
+        &namespace,
+        written,
+    )
+    .await?;
+    finish_write_success(
+        success_db,
+        &state,
+        &actor,
+        &namespace,
+        &settled,
+        Some(&previous),
+        WriteAction::Update { id: &id },
+    )
+    .await;
+    Ok(Some(settled))
 }
 
 /// Issue #2997: DELETE of a reachable-but-undecodable row is the in-band repair
@@ -971,7 +1068,7 @@ async fn persist_undecodable_update_repair<R: AdminResource>(
     context: OwnedWriteSettlementContext,
     id: String,
     written: R,
-) -> DbResult<bool> {
+) -> DbResult<Option<R>> {
     let OwnedWriteSettlementContext {
         db,
         namespace,
@@ -995,19 +1092,23 @@ async fn persist_undecodable_update_repair<R: AdminResource>(
             },
             Err(error) => Err(error),
         };
-    if matches!(&result, Ok(true)) {
-        finish_write_success(
-            db,
-            &state,
-            &actor,
-            &namespace,
-            &written,
-            None,
-            WriteAction::Update { id: &id },
-        )
-        .await;
+    if !result? {
+        return Ok(None);
     }
-    result
+    let settled =
+        settle_written_resource_while_held::<R>(guard.as_ref(), db.as_ref(), &namespace, written)
+            .await?;
+    finish_write_success(
+        db,
+        &state,
+        &actor,
+        &namespace,
+        &settled,
+        None,
+        WriteAction::Update { id: &id },
+    )
+    .await;
+    Ok(Some(settled))
 }
 
 async fn persist_delete_to_settlement<R: AdminResource>(
@@ -1058,8 +1159,8 @@ async fn persist_delete_to_settlement<R: AdminResource>(
                 )
                 .await
                 {
-                    Ok(true) => Ok(true),
-                    Ok(false) => Err(mark_mtls_dns_admission_unavailable(anyhow::anyhow!(
+                    Ok(Some(_recovery_guard)) => Ok(true),
+                    Ok(None) => Err(mark_mtls_dns_admission_unavailable(anyhow::anyhow!(
                         "namespace config admission was lost during delete; the late write was compensated"
                     ))),
                     Err(_recovery_error) => {
@@ -1768,6 +1869,45 @@ pub(crate) trait AdminResource:
     fn validate(&self, ctx: &ValidationCtx<'_>) -> Result<(), ValidationError>;
     fn cached_items(config: &GatewayConfig) -> &[Self];
 
+    /// Stamp the authenticated admin subject onto the resource, for resources
+    /// that persist server-side attribution alongside the durable audit log.
+    ///
+    /// Called after `normalize()` so a client-supplied value can never survive:
+    /// attribution must come from the verified JWT, not the request body.
+    /// Default is a no-op.
+    fn set_actor(&mut self, _actor: &str) {}
+
+    /// Re-read the committed record after a successful create/update and use
+    /// THAT as both the success response body and the audit after-image.
+    ///
+    /// Default `false` keeps every existing resource on the historical
+    /// behaviour of serializing the request-side value, so this changes nothing
+    /// for them. A resource opts in when the store settles server-owned state
+    /// the request body cannot predict — the gateway trust bundle's
+    /// backend-assigned `revision` is exactly that: a `POST` body carries `0`
+    /// and a `PUT` body carries the client's *expectation*, so serializing the
+    /// request-side value would report a revision the store never wrote and
+    /// audit the same wrong number.
+    ///
+    /// The re-read is fail-closed: it runs while the namespace admission guard
+    /// is still relevant, and if it errors or finds nothing the write is
+    /// reported as failed rather than answered with a fabricated revision.
+    const REREAD_AFTER_WRITE: bool = false;
+
+    /// The id a create with an omitted `id` should get, derived from the
+    /// SERVER-selected namespace (`X-Ferrum-Namespace`).
+    ///
+    /// `None` — the default — keeps the historical behaviour of minting a
+    /// UUID. A singleton resource overrides this so its default identity is
+    /// derived from the authenticated namespace rather than from anything the
+    /// request body could influence: `normalize()` runs before
+    /// `set_namespace()`, so a body-derived default would key off the client's
+    /// namespace field.
+    fn default_id_for_namespace(namespace: &str) -> Option<String> {
+        let _ = namespace;
+        None
+    }
+
     fn response_body(resource: &Self) -> Value {
         json!(resource)
     }
@@ -1919,6 +2059,17 @@ pub(crate) trait AdminResource:
         _http_client: crate::plugins::PluginHttpClient,
     ) -> DbResult<()> {
         Self::db_create(db, previous).await
+    }
+
+    /// Put a prior version of the resource back after a late update.
+    ///
+    /// Default delegates to [`Self::db_update`]. A resource whose `db_update`
+    /// derives an optimistic-concurrency expectation from the resource itself
+    /// must override this: the late write already advanced the stored revision,
+    /// so replaying `previous` with its pre-write expectation would always lose
+    /// the compare-and-set and turn a compensable recovery into a hard failure.
+    async fn compensate_late_update(db: &dyn DatabaseBackend, previous: &Self) -> DbResult<bool> {
+        Self::db_update(db, previous).await
     }
 
     async fn intervening_write_recovery(
@@ -2830,6 +2981,201 @@ impl AdminResource for Upstream {
         }
     }
 }
+
+/// Namespace-keyed gateway trust bundles (issue #3727).
+///
+/// The resource is a SINGLETON per namespace: a namespace's projected trust
+/// state must be unambiguous, so a second create in the same namespace is a
+/// 409. That rule is enforced in three places on purpose — here as a friendly
+/// precheck, in the store's transaction, and finally by the SQL `namespace`
+/// primary key / MongoDB `_id`, which is the only tier a concurrent writer on
+/// another admin replica cannot race past.
+///
+/// There is deliberately no cached-config read fallback: trust state gates peer
+/// verification, so answering from a possibly-stale in-memory snapshot when the
+/// database is unreachable would be worse than reporting the outage.
+#[async_trait::async_trait]
+impl AdminResource for GatewayTrustBundleRecord {
+    const RESOURCE_NAME: &'static str = "gateway trust bundle";
+    const RESOURCE_LABEL: &'static str = "Gateway trust bundle";
+    const VALIDATION_ERROR_LABEL: &'static str = "gateway trust bundle fields";
+    const NOT_FOUND_MESSAGE: &'static str = "Gateway trust bundle not found";
+    // Serialize same-namespace writes through the durable namespace config
+    // admission lease so the singleton precheck is authoritative across admin
+    // instances, exactly like upstream name uniqueness.
+    const SERIALIZE_NAMESPACE_CONFIG_ADMISSION: bool = true;
+    // `revision` is assigned by the store from the durable config-change
+    // sequence, so neither a create body (which carries `0`) nor an update body
+    // (which carries the client's *expectation*) knows the committed value. The
+    // success response and the audit after-image are therefore taken from an
+    // authoritative re-read rather than from the request-side resource.
+    const REREAD_AFTER_WRITE: bool = true;
+
+    fn id(&self) -> &str {
+        &self.id
+    }
+
+    fn set_id(&mut self, id: String) {
+        self.id = id;
+    }
+
+    fn namespace(&self) -> &str {
+        &self.namespace
+    }
+
+    fn set_namespace(&mut self, ns: String) {
+        self.namespace = ns;
+    }
+
+    fn set_created_at(&mut self, now: DateTime<Utc>) {
+        self.created_at = now;
+    }
+
+    fn set_updated_at(&mut self, now: DateTime<Utc>) {
+        self.updated_at = now;
+    }
+
+    fn updated_at(&self) -> DateTime<Utc> {
+        self.updated_at
+    }
+
+    fn normalize(&mut self) {
+        // Attribution is server-assigned in `set_actor`; drop anything the
+        // client tried to author so the stored value is always the verified
+        // admin subject.
+        self.updated_by = None;
+        // Trim only. The id default is derived from the SERVER-selected
+        // namespace through `default_id_for_namespace`, because `normalize()`
+        // runs before `set_namespace()` and `self.namespace` is still whatever
+        // the request body claimed at this point.
+        self.trim_fields();
+    }
+
+    fn set_actor(&mut self, actor: &str) {
+        self.updated_by = Some(actor.to_string());
+    }
+
+    fn default_id_for_namespace(namespace: &str) -> Option<String> {
+        Some(GatewayTrustBundleRecord::default_singleton_id(namespace))
+    }
+
+    fn validate(&self, _ctx: &ValidationCtx<'_>) -> Result<(), ValidationError> {
+        self.validate_fields().map_err(ValidationError::Fields)
+    }
+
+    fn cached_items(config: &GatewayConfig) -> &[Self] {
+        &config.gateway_trust_bundles
+    }
+
+    fn allow_cached_read_fallback(_error: &anyhow::Error) -> bool {
+        false
+    }
+
+    fn prepare_for_update(&mut self, existing: &Self) {
+        // `created_at` belongs to the resource, not to this request.
+        self.created_at = existing.created_at;
+    }
+
+    fn map_persist_db_error(
+        error: &anyhow::Error,
+        _action: WriteAction<'_>,
+    ) -> Response<Full<Bytes>> {
+        if is_mtls_dns_admission_unavailable(error) {
+            return super::mtls_dns_admission_unavailable_response();
+        }
+        if let Some(conflict) =
+            crate::config::db_backend::gateway_trust_bundle_revision_conflict(error)
+        {
+            // Render the typed conflict, never the chain's outer message: that
+            // message can carry driver/DSN context.
+            return super::json_response(
+                StatusCode::CONFLICT,
+                &json!({
+                    "error": crate::config::db_backend::GATEWAY_TRUST_BUNDLE_REVISION_CONFLICT_MESSAGE,
+                    "expected_revision": conflict.expected,
+                    "current_revision": conflict.current,
+                }),
+            );
+        }
+        if super::chain_has_unique_constraint_violation(error) {
+            // The namespace primary key rejected a second record: another admin
+            // replica won the create race.
+            return super::json_response(
+                StatusCode::CONFLICT,
+                &json!({"error": GATEWAY_TRUST_BUNDLE_SINGLETON_CONFLICT_MESSAGE}),
+            );
+        }
+        super::json_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &super::db_error_response(error),
+        )
+    }
+
+    async fn db_get(db: &dyn DatabaseBackend, namespace: &str, id: &str) -> DbResult<Option<Self>> {
+        db.get_gateway_trust_bundle(namespace, id).await
+    }
+
+    async fn db_list(
+        db: &dyn DatabaseBackend,
+        namespace: &str,
+        pagination: &super::PaginationParams,
+    ) -> DbResult<PaginatedResult<Self>> {
+        db.list_gateway_trust_bundles_paginated(
+            namespace,
+            pagination.query_limit_i64(),
+            pagination.query_offset_i64(),
+        )
+        .await
+    }
+
+    async fn db_create(db: &dyn DatabaseBackend, resource: &Self) -> DbResult<()> {
+        db.create_gateway_trust_bundle(resource).await
+    }
+
+    async fn db_update(db: &dyn DatabaseBackend, resource: &Self) -> DbResult<bool> {
+        // `revision` on the request body is the client's expectation, not the
+        // value to store: the store assigns the next revision itself. `0` (or
+        // an omitted field) means "no expectation" and skips the compare-and-set
+        // so a first-party tool can still force a write, while any non-zero
+        // value makes a lost race a 409 instead of a silent overwrite.
+        let expected = (resource.revision != 0).then_some(resource.revision);
+        db.update_gateway_trust_bundle(resource, expected).await
+    }
+
+    async fn compensate_late_update(db: &dyn DatabaseBackend, previous: &Self) -> DbResult<bool> {
+        // Undo a late write by restoring the prior MATERIAL, stating no
+        // expectation. `previous.revision` is the revision from before the late
+        // write, so routing this through `db_update` would assert a revision the
+        // store has already moved past and every compensation would fail. The
+        // restored record still receives a fresh backend-assigned revision, so
+        // the rollback is a new incarnation of the material rather than a
+        // resurrection of the old counter value.
+        db.update_gateway_trust_bundle(previous, None).await
+    }
+
+    async fn db_delete(db: &dyn DatabaseBackend, namespace: &str, id: &str) -> DbResult<bool> {
+        db.delete_gateway_trust_bundle(namespace, id).await
+    }
+
+    async fn check_uniqueness(
+        db: &dyn DatabaseBackend,
+        namespace: &str,
+        _resource: &Self,
+        exclude_id: Option<&str>,
+    ) -> DbResult<Option<String>> {
+        match db.get_namespace_gateway_trust_bundle(namespace).await? {
+            Some(existing) if Some(existing.id.as_str()) != exclude_id => Ok(Some(
+                GATEWAY_TRUST_BUNDLE_SINGLETON_CONFLICT_MESSAGE.to_string(),
+            )),
+            _ => Ok(None),
+        }
+    }
+}
+
+/// Operator-facing message when a namespace already holds a trust-bundle
+/// record. Names no ids and no material.
+pub(crate) const GATEWAY_TRUST_BUNDLE_SINGLETON_CONFLICT_MESSAGE: &str =
+    "namespace already has a gateway trust bundle; update or delete the existing resource instead";
 
 #[async_trait::async_trait]
 impl AdminResource for PluginConfig {
@@ -4233,7 +4579,12 @@ async fn handle_write<R: AdminResource>(
     match action {
         WriteAction::Create => {
             if resource.id().is_empty() {
-                resource.set_id(Uuid::new_v4().to_string());
+                // `namespace` here is the authenticated `X-Ferrum-Namespace`
+                // value, never the body's — see `default_id_for_namespace`.
+                resource.set_id(
+                    R::default_id_for_namespace(namespace)
+                        .unwrap_or_else(|| Uuid::new_v4().to_string()),
+                );
             } else if let Err(message) = validate_resource_id(resource.id()) {
                 return Ok(super::json_response(
                     StatusCode::BAD_REQUEST,
@@ -4251,6 +4602,7 @@ async fn handle_write<R: AdminResource>(
 
     resource.normalize();
     resource.set_namespace(namespace.to_string());
+    resource.set_actor(&actor.sub);
 
     let validation_ctx = ValidationCtx::from_state(state);
     if let Err(validation_error) = resource.validate(&validation_ctx) {
@@ -4333,6 +4685,12 @@ async fn handle_write<R: AdminResource>(
         }
     }
 
+    // The resource as the STORE holds it after the write. Identical to
+    // `resource` for every resource that has not opted into
+    // `REREAD_AFTER_WRITE`; for one that has, it carries server-settled state
+    // (the gateway trust bundle's backend-assigned `revision`) that the request
+    // body could not have known.
+    let settled;
     match action {
         WriteAction::Create => {
             let persistence = match audit::spawn_with_request_slot(persist_create_to_settlement(
@@ -4353,8 +4711,9 @@ async fn handle_write<R: AdminResource>(
                     "namespace create persistence task failed: {error}"
                 )),
             };
-            if let Err(error) = persistence {
-                return Ok(R::map_persist_db_error(&error, action));
+            match persistence {
+                Ok(created) => settled = created,
+                Err(error) => return Ok(R::map_persist_db_error(&error, action)),
             }
         }
         WriteAction::Update { id } => {
@@ -4380,8 +4739,8 @@ async fn handle_write<R: AdminResource>(
                         )),
                     };
                 match persistence {
-                    Ok(false) => return Ok(not_found_response::<R>()),
-                    Ok(true) => {}
+                    Ok(None) => return Ok(not_found_response::<R>()),
+                    Ok(Some(updated)) => settled = updated,
                     Err(error) => return Ok(R::map_persist_db_error(&error, action)),
                 }
             } else {
@@ -4416,15 +4775,15 @@ async fn handle_write<R: AdminResource>(
                 // delete). The backend recorded no change — report not-found
                 // rather than a phantom success (issue #2122 DB-M4).
                 match persistence {
-                    Ok(false) => return Ok(not_found_response::<R>()),
-                    Ok(true) => {}
+                    Ok(None) => return Ok(not_found_response::<R>()),
+                    Ok(Some(updated)) => settled = updated,
                     Err(error) => return Ok(R::map_persist_db_error(&error, action)),
                 }
             }
         }
     }
 
-    let body = R::response_body_for_role(&resource, actor.role);
+    let body = R::response_body_for_role(&settled, actor.role);
     let status = match action {
         WriteAction::Create => StatusCode::CREATED,
         WriteAction::Update { .. } => StatusCode::OK,

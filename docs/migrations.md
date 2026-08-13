@@ -629,9 +629,14 @@ The authoritative index and empty-shell collection list lives only in
 `REQUIRED_GUARD_COLLECTIONS`). Do not maintain a second summary of keys or
 options here — it will drift. Collections covered by the baseline plan include
 `proxies`, `consumers`, `consumer_identity_index`, `plugin_configs`,
-`upstreams`, `api_specs`, `audit_events`, `config_changes`, plus the guard
-collections `proxy_route_locks`, `upstream_ref_guards`, and
-`mtls_dns_admission_locks`.
+`upstreams`, `api_specs`, `audit_events`, `config_changes`,
+`gateway_trust_bundles`, plus the guard collections `proxy_route_locks`,
+`upstream_ref_guards`, and `mtls_dns_admission_locks`.
+
+`gateway_trust_bundles` keys documents by namespace (`_id` IS the namespace), so
+the implicit `_id` index is what enforces one trust-bundle record per namespace;
+the plan adds only a `{namespace, id}` compound index for addressed admin reads
+and deletes. See [CP/DP mode](cp_dp_mode.md#trust-bundle-config-store-capabilities).
 
 ### Running MongoDB Migrations
 
