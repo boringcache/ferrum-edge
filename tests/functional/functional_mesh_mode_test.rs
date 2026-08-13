@@ -74,8 +74,8 @@ use crate::scaffolding::clients::{Http3Client, Http3GrpcStream, WebSocketOptions
 use crate::scaffolding::ports::reserve_port;
 
 const GRPC_SECRET: &str = "ferrum-edge-functional-mesh-grpc-secret00";
-const STARTUP_TIMEOUT: Duration = Duration::from_secs(20);
-const RETRY_ATTEMPTS: u32 = 3;
+pub(crate) const STARTUP_TIMEOUT: Duration = Duration::from_secs(20);
+pub(crate) const RETRY_ATTEMPTS: u32 = 3;
 // Cross-cluster gateway A's outbound slice/routes can still be materializing
 // after its listener binds (and, in the live matrix, after the source sidecar
 // consumes its CP slice). Both the positive and negative arms therefore poll for
@@ -195,8 +195,8 @@ impl MeshConfigSync for StaticMeshControlPlane {
     }
 }
 
-struct MeshCpHandle {
-    addr: std::net::SocketAddr,
+pub(crate) struct MeshCpHandle {
+    pub(crate) addr: std::net::SocketAddr,
     request_rx: watch::Receiver<Option<MeshSubscribeRequest>>,
     subscribe_count: Arc<AtomicUsize>,
     shutdown_tx: Option<oneshot::Sender<()>>,
@@ -204,12 +204,12 @@ struct MeshCpHandle {
 }
 
 impl MeshCpHandle {
-    async fn shutdown(mut self) {
+    pub(crate) async fn shutdown(mut self) {
         shutdown_grpc_server(&mut self.shutdown_tx, &mut self.task).await;
     }
 }
 
-async fn start_static_mesh_cp(slice: MeshSlice) -> MeshCpHandle {
+pub(crate) async fn start_static_mesh_cp(slice: MeshSlice) -> MeshCpHandle {
     start_static_mesh_cp_on(
         slice,
         "127.0.0.1:0".parse().expect("loopback CP bind"),
@@ -389,12 +389,12 @@ fn scrub_ferrum_env(cmd: &mut Command) {
     }
 }
 
-struct MeshPorts {
-    inbound: u16,
-    outbound: u16,
-    hbone: u16,
-    egress: u16,
-    east_west: u16,
+pub(crate) struct MeshPorts {
+    pub(crate) inbound: u16,
+    pub(crate) outbound: u16,
+    pub(crate) hbone: u16,
+    pub(crate) egress: u16,
+    pub(crate) east_west: u16,
 }
 
 /// Ports already handed to mesh gateway subprocesses in this test process.
@@ -437,7 +437,7 @@ async fn reserve_unique_mesh_port() -> u16 {
 /// Bind attempts [`bind_fixture_listener_where`] makes before giving up.
 const FIXTURE_BIND_ATTEMPTS: u32 = 32;
 
-fn loopback_ephemeral() -> SocketAddr {
+pub(crate) fn loopback_ephemeral() -> SocketAddr {
     SocketAddr::from(([127, 0, 0, 1], 0))
 }
 
@@ -461,7 +461,7 @@ fn loopback_ephemeral() -> SocketAddr {
 /// readiness gate ([`wait_for_gateway_listener`]) covers the cross-PROCESS case
 /// (another test binding our released port), which no in-process bookkeeping
 /// can see.
-async fn bind_fixture_listener(addr: SocketAddr) -> std::io::Result<TcpListener> {
+pub(crate) async fn bind_fixture_listener(addr: SocketAddr) -> std::io::Result<TcpListener> {
     bind_fixture_listener_where(addr, |port| !mesh_port_is_reserved(port)).await
 }
 
@@ -497,7 +497,7 @@ async fn bind_fixture_listener_where(
     ))
 }
 
-async fn reserve_mesh_ports() -> MeshPorts {
+pub(crate) async fn reserve_mesh_ports() -> MeshPorts {
     MeshPorts {
         inbound: reserve_unique_mesh_port().await,
         outbound: reserve_unique_mesh_port().await,
@@ -585,17 +585,17 @@ fn reserve_mesh_ports_in_netns(pid: u32) -> Result<MeshPorts, String> {
     })
 }
 
-struct MeshGatewaySpawnOptions<'a> {
-    cp_addr: SocketAddr,
-    ports: MeshPorts,
-    node_id: &'a str,
-    config_protocol: &'a str,
-    topology: &'a str,
-    waypoint_name: Option<&'a str>,
-    env_overrides: Vec<(&'a str, String)>,
+pub(crate) struct MeshGatewaySpawnOptions<'a> {
+    pub(crate) cp_addr: SocketAddr,
+    pub(crate) ports: MeshPorts,
+    pub(crate) node_id: &'a str,
+    pub(crate) config_protocol: &'a str,
+    pub(crate) topology: &'a str,
+    pub(crate) waypoint_name: Option<&'a str>,
+    pub(crate) env_overrides: Vec<(&'a str, String)>,
 }
 
-fn spawn_mesh_gateway(temp: &TempDir, options: MeshGatewaySpawnOptions<'_>) -> Child {
+pub(crate) fn spawn_mesh_gateway(temp: &TempDir, options: MeshGatewaySpawnOptions<'_>) -> Child {
     let mut cmd = Command::new(binary_path());
     configure_mesh_gateway_command(&mut cmd, temp, options);
     cmd.spawn().expect("spawn mesh gateway")
@@ -738,7 +738,7 @@ fn configure_mesh_gateway_command(
     }
 }
 
-fn kill_child(child: &mut Child) {
+pub(crate) fn kill_child(child: &mut Child) {
     #[cfg(unix)]
     {
         let pid = child.id();
@@ -766,7 +766,7 @@ async fn wait_for_child_exit(child: &mut Child, timeout: Duration) -> Option<Exi
     }
 }
 
-fn captured_output(temp: &TempDir) -> String {
+pub(crate) fn captured_output(temp: &TempDir) -> String {
     let stderr = std::fs::read_to_string(temp.path().join("mesh.stderr.log")).unwrap_or_default();
     let stdout = std::fs::read_to_string(temp.path().join("mesh.stdout.log")).unwrap_or_default();
     format!("{stderr}\n{stdout}")
@@ -811,7 +811,7 @@ async fn wait_for_tcp_port(port: u16, timeout: Duration) -> bool {
 /// Outcome of waiting for a SPAWNED mesh gateway to bind one of its own
 /// listeners. See [`wait_for_gateway_listener`].
 #[derive(Debug)]
-enum GatewayListenerReadiness {
+pub(crate) enum GatewayListenerReadiness {
     /// The port accepted a connection while the child was still running.
     Ready,
     /// The child exited before the port was proven ready. Whatever may be
@@ -822,12 +822,12 @@ enum GatewayListenerReadiness {
 }
 
 impl GatewayListenerReadiness {
-    fn is_ready(&self) -> bool {
+    pub(crate) fn is_ready(&self) -> bool {
         matches!(self, GatewayListenerReadiness::Ready)
     }
 
     /// One-line diagnostic for a fixture's `last_failure` string.
-    fn describe(&self, label: &str, port: u16) -> String {
+    pub(crate) fn describe(&self, label: &str, port: u16) -> String {
         match self {
             GatewayListenerReadiness::Ready => format!("{label} bound port {port}"),
             GatewayListenerReadiness::ChildExited(status) => format!(
@@ -852,7 +852,7 @@ fn gateway_child_exited(child: &mut Child) -> Option<ExitStatus> {
 /// A fixture whose gateway died mid-run is VOID: its ports were never owned by
 /// the process the driver believed it was talking to, so any observation made
 /// against them — success, failure, or fail-closed rejection — proves nothing.
-fn exited_gateway_diagnostic(children: &mut [(&str, &mut Child)]) -> Option<String> {
+pub(crate) fn exited_gateway_diagnostic(children: &mut [(&str, &mut Child)]) -> Option<String> {
     for (label, child) in children.iter_mut() {
         if let Some(status) = gateway_child_exited(child) {
             return Some(format!("{label} exited during the run ({status})"));
@@ -876,7 +876,7 @@ fn exited_gateway_diagnostic(children: &mut [(&str, &mut Child)]) -> Option<Stri
 /// child that dies at any point during the window is reported as
 /// [`GatewayListenerReadiness::ChildExited`] and the caller can consume its
 /// bounded attempt and retry with fresh ports, temp dirs, and control planes.
-async fn wait_for_gateway_listener(
+pub(crate) async fn wait_for_gateway_listener(
     child: &mut Child,
     port: u16,
     timeout: Duration,
@@ -1956,10 +1956,10 @@ async fn functional_mesh_mode_starts_after_xds_ads() {
 // ── Runtime inbound mTLS fail-closed enforcement (issue #1523) ──────────────
 
 /// Generated gateway SVID file paths (leaf cert + PKCS#8 key + trust bundle).
-struct GeneratedGatewaySvid {
-    cert_path: String,
-    key_path: String,
-    trust_bundle_path: String,
+pub(crate) struct GeneratedGatewaySvid {
+    pub(crate) cert_path: String,
+    pub(crate) key_path: String,
+    pub(crate) trust_bundle_path: String,
 }
 
 /// Write a valid gateway SVID (a SPIFFE-SAN leaf signed by a fresh root, plus
@@ -3226,7 +3226,7 @@ async fn mesh_inbound_http_get(
 /// A plaintext HTTP/1.1 GET (no TLS), returning the response status + full text.
 /// Used to probe the outbound capture listener, which must NOT serve the
 /// materialized inbound routes.
-async fn plaintext_http_get(
+pub(crate) async fn plaintext_http_get(
     port: u16,
     host: &str,
     path: &str,
@@ -3943,12 +3943,12 @@ async fn functional_mesh_sidecar_inbound_multi_port_routes_by_authority_port() {
 /// Two gateway SVID file-sets minted under ONE shared mesh CA, so gateways A
 /// and B mutually verify over the same trust bundle. Mirrors
 /// `generate_gateway_svid`'s leaf shape (SPIFFE URI SAN, client+server EKU).
-struct TwoGatewaySvids {
-    a: GeneratedGatewaySvid,
-    b: GeneratedGatewaySvid,
+pub(crate) struct TwoGatewaySvids {
+    pub(crate) a: GeneratedGatewaySvid,
+    pub(crate) b: GeneratedGatewaySvid,
 }
 
-fn generate_two_gateway_svids(
+pub(crate) fn generate_two_gateway_svids(
     dir: &std::path::Path,
     a_spiffe: &str,
     b_spiffe: &str,
