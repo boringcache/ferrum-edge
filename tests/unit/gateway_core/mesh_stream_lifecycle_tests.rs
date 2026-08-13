@@ -1968,3 +1968,58 @@ async fn an_already_observed_rotation_wins_over_a_ready_outbound_enqueue() {
         "a retired credential must not enqueue even when the channel has capacity"
     );
 }
+
+fn mesh_runtime_env_config() -> ferrum_edge::config::EnvConfig {
+    ferrum_edge::config::EnvConfig {
+        mode: ferrum_edge::config::OperatingMode::Mesh,
+        dp_cp_grpc_urls: vec!["http://127.0.0.1:1".to_string()],
+        ..Default::default()
+    }
+}
+
+#[test]
+fn mesh_runtime_config_rejects_malformed_stock_xds_allow_plaintext() {
+    use ferrum_edge::modes::mesh::MeshRuntimeConfig;
+
+    use crate::unit::env_lock::EnvGuard;
+
+    let env = EnvGuard::new(&["FERRUM_MESH_STOCK_XDS_ALLOW_PLAINTEXT"]);
+    env.set("FERRUM_MESH_STOCK_XDS_ALLOW_PLAINTEXT", "tru");
+
+    let err = MeshRuntimeConfig::from_env_config(&mesh_runtime_env_config())
+        .expect_err("malformed explicit bool must fail closed");
+    assert!(err.contains("FERRUM_MESH_STOCK_XDS_ALLOW_PLAINTEXT"));
+    assert!(err.contains("true, false, 1, or 0"));
+}
+
+#[test]
+fn mesh_runtime_config_parses_stock_xds_allow_plaintext_canonical_forms() {
+    use ferrum_edge::modes::mesh::MeshRuntimeConfig;
+
+    use crate::unit::env_lock::EnvGuard;
+
+    let cases = [
+        (None, false),
+        (Some("   "), false),
+        (Some("false"), false),
+        (Some("0"), false),
+        (Some("TRUE"), true),
+        (Some("1"), true),
+    ];
+
+    for (value, expected) in cases {
+        let env = EnvGuard::new(&["FERRUM_MESH_STOCK_XDS_ALLOW_PLAINTEXT"]);
+        match value {
+            Some(raw) => env.set("FERRUM_MESH_STOCK_XDS_ALLOW_PLAINTEXT", raw),
+            None => env.unset("FERRUM_MESH_STOCK_XDS_ALLOW_PLAINTEXT"),
+        }
+
+        let runtime = MeshRuntimeConfig::from_env_config(&mesh_runtime_env_config())
+            .unwrap_or_else(|err| panic!("canonical form {:?} must parse: {err}", value));
+        assert_eq!(
+            runtime.stock_xds_allow_plaintext, expected,
+            "value {:?}",
+            value
+        );
+    }
+}
