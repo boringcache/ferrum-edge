@@ -17812,9 +17812,9 @@ fn effective_node_waypoint_dtls_peer_auth_mode(
             // Client-side DestinationRule modes are invalid in this server-side
             // policy. Rank them stricter than Strict so a stray value dominates
             // a mixed set and the route-client-CA match refuses the slice.
-            config::MtlsMode::Simple
-            | config::MtlsMode::Mutual
-            | config::MtlsMode::IstioMutual => 3,
+            config::MtlsMode::Simple | config::MtlsMode::Mutual | config::MtlsMode::IstioMutual => {
+                3
+            }
         }
     }
     let mut resolved: Option<config::MtlsMode> = None;
