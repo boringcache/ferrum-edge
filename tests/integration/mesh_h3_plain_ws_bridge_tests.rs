@@ -241,9 +241,8 @@ fn h3_plain_bridge_preserves_mesh_outcomes_across_client_terminals() {
     );
     assert!(
         plain.contains("let admission_error_class = terminal_error_class")
-            && plain.contains(
-                ".or_else(|| (!body_completed).then_some(ErrorClass::ClientDisconnect))"
-            ),
+            && plain
+                .contains(".or_else(|| (!body_completed).then_some(ErrorClass::ClientDisconnect))"),
         "a downstream body failure may supply the admission fallback only when \
          no backend classification already exists"
     );
