@@ -128,14 +128,22 @@ fn guard_ipv4(ctx: &TcContext) -> Result<i32, i64> {
             // published. Both halves are still required; neither the mark alone
             // nor the source alone admits anything. Checked BEFORE the DNS
             // carve-out so a marked relay never depends on port heuristics.
+            //
+            // Node-source and reply-source proofs stay on separate arms.
+            // `source_is_node || reply_source_authorized` is two map-lookup
+            // `.is_some()` results; LLVM lowers that as `pointer |= pointer`,
+            // which the kernel verifier rejects.
             let ports = udp_ports4(ctx);
-            let reply_source_authorized = match ports {
-                Ok((src_port, _)) => udp_reply_source4_allowed(src_ip, src_port),
-                // An unparseable header proves nothing about the source.
-                Err(_) => false,
-            };
-            if enrolled_destination_authorized(ctx, source_is_node || reply_source_authorized) {
+            if enrolled_destination_authorized(ctx, source_is_node) {
                 return Ok(TC_ACT_PIPE);
+            }
+            if let Ok((src_port, _)) = ports {
+                if enrolled_destination_authorized(
+                    ctx,
+                    udp_reply_source4_allowed(src_ip, src_port),
+                ) {
+                    return Ok(TC_ACT_PIPE);
+                }
             }
             match ports {
                 Ok((src_port, dst_port)) if dns_response_allowed(src_port, dst_port) => {
@@ -212,14 +220,19 @@ fn guard_ipv6(ctx: &TcContext) -> Result<i32, i64> {
             // own marked UDP relay is authorized either from a configured node
             // source (the backend dial) or from an exact, live reply-source
             // authorization (the source-pinned reply). A dual-stack waypoint
-            // that admitted only one family would black-hole the other.
+            // that admitted only one family would black-hole the other. Same
+            // separate-arm source proofs as IPv4; do not reintroduce `||`.
             let ports = udp_ports6(ctx);
-            let reply_source_authorized = match ports {
-                Ok((src_port, _)) => udp_reply_source6_allowed(src_ip.addr, src_port),
-                Err(_) => false,
-            };
-            if enrolled_destination_authorized(ctx, source_is_node || reply_source_authorized) {
+            if enrolled_destination_authorized(ctx, source_is_node) {
                 return Ok(TC_ACT_PIPE);
+            }
+            if let Ok((src_port, _)) = ports {
+                if enrolled_destination_authorized(
+                    ctx,
+                    udp_reply_source6_allowed(src_ip.addr, src_port),
+                ) {
+                    return Ok(TC_ACT_PIPE);
+                }
             }
             match ports {
                 Ok((src_port, dst_port)) if dns_response_allowed(src_port, dst_port) => {
@@ -250,11 +263,13 @@ fn guard_enrolled_destination(ctx: &TcContext, source_is_node: bool) -> Result<i
 /// Two-part admission for a packet to an enrolled pod: the NodeWaypoint relay's
 /// socket mark AND an authorized source.
 ///
-/// `source_authorized` is the caller's source-side proof. TCP passes exactly
-/// `source_is_node` (unchanged); the UDP arms additionally accept an exact,
-/// live reply-source authorization, because a NodeWaypoint UDP/DTLS reply's
-/// source is pinned to the address the client addressed rather than chosen by
-/// routing. Neither half admits anything on its own.
+/// `source_authorized` is ONE source-side proof. TCP passes exactly
+/// `source_is_node` (unchanged). The UDP arms call this twice on separate
+/// arms — first the node-source lookup, then an exact live reply-source
+/// authorization — because combining those `.is_some()` results with `||`
+/// is lowered as `pointer |= pointer`. Neither half admits anything on
+/// its own. Unparseable UDP ports skip the reply-source attempt (no
+/// authorization), matching the prior fail-closed parse-miss.
 #[inline(always)]
 fn enrolled_destination_authorized(ctx: &TcContext, source_authorized: bool) -> bool {
     if !source_authorized {
