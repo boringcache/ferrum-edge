@@ -1,0 +1,71 @@
+{{- /* Read-only node lookup for the privileged Ambient UDP node preflight
+       (issue #3809).
+
+       The preflight init stage must resolve THIS node's immutable
+       `Node.metadata.uid` itself: the downward API exposes `spec.nodeName` but
+       not the UID, and the node-agent's published identity file records the
+       current boot id even when a PREVIOUS Kubernetes Node object wrote it, so
+       consuming it could pair a stale identity with the stale cleanup proof
+       written under it and authorize node-name reuse under the wrong immutable
+       UID.
+
+       The grant is read-only `nodes: get` with no list, watch, or write. That
+       cannot enumerate or mutate nodes, but Kubernetes RBAC does not treat a
+       `get` without `resourceNames` as a single-object restriction: a named GET
+       is permitted for any node whose name the caller already knows. The
+       runtime request is what binds the lookup to this pod's `spec.nodeName`
+       (or an explicit `FERRUM_K8S_NODE_UID`). Do not describe this Role as a
+       per-node enforcement boundary Kubernetes does not provide, and do not
+       widen it with list/watch/write or a cluster-wide name grant.
+
+       Rendered only when the settled host-netns node preflight will actually
+       run AND an explicit UID is absent, so a GitOps/client-render pipeline
+       that already supplies `FERRUM_K8S_NODE_UID` does not receive a GET it
+       will not use. */ -}}
+{{- $ambientEnv := default dict .Values.ambient.env -}}
+{{- $ambientTopology := replace "-" "_" (lower (trim (toString (index $ambientEnv "FERRUM_MESH_TOPOLOGY")))) -}}
+{{- $ambientUdpHostNetns := false -}}
+{{- if hasKey $ambientEnv "FERRUM_MESH_CAPTURE_UDP_HOST_NETNS_ENABLED" -}}
+{{- $ambientUdpHostNetns = has (lower (trim (toString (index $ambientEnv "FERRUM_MESH_CAPTURE_UDP_HOST_NETNS_ENABLED")))) (list "true" "1") -}}
+{{- end -}}
+{{- $ambientUdpMigrationPhase := "stable" -}}
+{{- if hasKey $ambientEnv "FERRUM_MESH_CAPTURE_UDP_MIGRATION_PHASE" -}}
+{{- $ambientUdpMigrationPhase = index $ambientEnv "FERRUM_MESH_CAPTURE_UDP_MIGRATION_PHASE" | toString | trim -}}
+{{- end -}}
+{{- $ambientUdpNodePreflight := default dict .Values.ambient.udpNodePreflight -}}
+{{- $ambientUdpNodePreflightEnabled := true -}}
+{{- if hasKey $ambientUdpNodePreflight "enabled" -}}
+{{- $ambientUdpNodePreflightEnabled = eq (lower (toString $ambientUdpNodePreflight.enabled)) "true" -}}
+{{- end -}}
+{{- $ambientUdpLifecycle := and .Values.ambient.enabled (eq $ambientTopology "ambient") .Values.nodeAgent.enabled -}}
+{{- $ambientUdpRunNodePreflight := and $ambientUdpLifecycle $ambientUdpHostNetns (eq $ambientUdpMigrationPhase "stable") $ambientUdpNodePreflightEnabled -}}
+{{- $hasExplicitNodeUid := hasKey $ambientEnv "FERRUM_K8S_NODE_UID" -}}
+{{- if and $ambientUdpRunNodePreflight (not $hasExplicitNodeUid) }}
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: ferrum-mesh-ambient-{{ .Release.Name }}
+  labels:
+    app.kubernetes.io/name: ferrum-mesh-ambient
+    app.kubernetes.io/instance: {{ .Release.Name }}
+rules:
+  - apiGroups: [""]
+    resources: ["nodes"]
+    verbs: ["get"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: ferrum-mesh-ambient-{{ .Release.Name }}
+  labels:
+    app.kubernetes.io/name: ferrum-mesh-ambient
+    app.kubernetes.io/instance: {{ .Release.Name }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: ferrum-mesh-ambient-{{ .Release.Name }}
+subjects:
+  - kind: ServiceAccount
+    name: ferrum-mesh
+    namespace: {{ .Release.Namespace }}
+{{- end }}
