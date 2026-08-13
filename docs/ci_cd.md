@@ -588,7 +588,10 @@ the required workflow. This is the same fail-closed contract used by the other
 required live-datapath gates.
 
 The relevant surfaces are host-UDP capture, mesh UDP serving, capture plan
-generators, Ambient mesh serving, Helm mesh charts, the `Dockerfile` and its
+generators, Ambient mesh serving, the Ambient UDP lifecycle's production entry
+points (`src/cli.rs` and `src/main.rs` for the `ambient-udp-preflight`
+subcommand, and `src/modes/node_agent.rs` for the node-identity publication
+every placement proof binds to), Helm mesh charts, the `Dockerfile` and its
 runtime tool staging, the release publication workflow, the live fixture, and
 related docs. When relevant, the job builds the lib and functional test binaries
 (without running them as the invoking user), preflights `unshare` /
