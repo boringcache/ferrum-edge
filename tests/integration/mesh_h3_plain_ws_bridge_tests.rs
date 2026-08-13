@@ -306,6 +306,29 @@ fn shared_mesh_plain_helper_never_plaintext_falls_back() {
         "the H3-only boxing boundary must be constructed out of line"
     );
     assert!(
+        src.contains("type MeshRetryDispatchOutcome = (")
+            && src.contains("type BoxedMeshRetryDispatchFuture<'a> =")
+            && src.contains(") -> BoxedMeshRetryDispatchFuture<'a> {"),
+        "H3 boxed mesh retry must use the mesh-retry outcome, not the Unix dispatch tuple"
+    );
+    let boxed = src
+        .split("fn boxed_proxy_to_backend_mesh_retry<'a>(")
+        .nth(1)
+        .expect("boxed mesh retry")
+        .split("pub(crate) async fn proxy_h3_plain_http_mesh_buffered(")
+        .next()
+        .expect("bounded boxed mesh retry");
+    assert!(
+        !boxed.contains("BoxedBackendDispatchFuture"),
+        "H3 boxed mesh retry must not reuse the Unix/reqwest BoxedBackendDispatchFuture"
+    );
+    assert!(
+        helper.contains("request_body_exceeded")
+            && helper.contains("streaming_h2_read_timeout_ms")
+            && helper.contains("h3_mesh_buffered_retry_response("),
+        "buffered H3 mesh dispatch must keep mesh-retry overflow and read-timeout fields"
+    );
+    assert!(
         !helper.contains("proxy_to_backend_retry("),
         "helper must never fall back to the plaintext reqwest dial"
     );

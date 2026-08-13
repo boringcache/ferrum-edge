@@ -36521,6 +36521,25 @@ pub(crate) fn target_requires_http_mesh_egress(target: &UpstreamTarget) -> bool 
     hbone_pool::target_hbone_enabled(target) || mesh_mtls_pool::target_mesh_mtls_enabled(target)
 }
 
+/// Outcome of [`proxy_to_backend_mesh_retry`]: backend response, client-upload
+/// overflow flag (health-neutral admission / retryability), and the
+/// target-effective backend read timeout used for StreamingH2 follow-on and
+/// sent-byte accounting after headers.
+///
+/// Distinct from [`BackendDispatchOutcome`], which carries a retained request
+/// body instead of the read timeout. The H3 boxed seam must use this contract
+/// rather than coercing mesh retry into the Unix/reqwest dispatch tuple.
+type MeshRetryDispatchOutcome = (
+    retry::BackendResponse,
+    Option<Arc<std::sync::atomic::AtomicBool>>,
+    u64,
+);
+
+/// One mesh-retry dispatch future, heap-allocated so it is not a frame slot in
+/// the H3 plain bridge. See [`boxed_proxy_to_backend_mesh_retry`].
+type BoxedMeshRetryDispatchFuture<'a> =
+    std::pin::Pin<Box<dyn std::future::Future<Output = MeshRetryDispatchOutcome> + Send + 'a>>;
+
 /// The H3 plain mesh dispatch future, constructed out of line and returned
 /// boxed so its shared HBONE / Sidecar mesh-mTLS retry future is not an inline
 /// frame slot in the H3 bridge.
@@ -36553,7 +36572,7 @@ fn boxed_proxy_to_backend_mesh_retry<'a>(
     xff_append_ip: &'a str,
     request_is_secure: bool,
     ctx_bytes_sent_observed: &'a Arc<std::sync::atomic::AtomicU64>,
-) -> BoxedBackendDispatchFuture<'a> {
+) -> BoxedMeshRetryDispatchFuture<'a> {
     Box::pin(proxy_to_backend_mesh_retry(
         state,
         proxy,
@@ -36640,25 +36659,71 @@ pub(crate) async fn proxy_h3_plain_http_mesh_buffered(
         replay_headers.append(header_name, header_value);
     }
 
-    let (response, _, _) = boxed_proxy_to_backend_mesh_retry(
-        state,
-        proxy,
-        backend_url,
-        method,
-        headers,
-        Some(upstream_target),
-        Some(&body),
-        Some(&replay_headers),
-        dispatch_hbone,
-        plugins,
-        request_ctx,
-        false, // buffered response for the H3 plain writer
-        client_ip,
-        xff_append_ip,
-        request_is_secure,
-        &request_ctx.bytes_sent_observed,
+    let (response, request_body_exceeded, streaming_h2_read_timeout_ms) =
+        boxed_proxy_to_backend_mesh_retry(
+            state,
+            proxy,
+            backend_url,
+            method,
+            headers,
+            Some(upstream_target),
+            Some(&body),
+            Some(&replay_headers),
+            dispatch_hbone,
+            plugins,
+            request_ctx,
+            false, // buffered response for the H3 plain writer
+            client_ip,
+            xff_append_ip,
+            request_is_secure,
+            &request_ctx.bytes_sent_observed,
+        )
+        .await;
+    h3_mesh_buffered_retry_response(
+        response,
+        request_body_exceeded,
+        streaming_h2_read_timeout_ms,
     )
-    .await;
+}
+
+/// Fold the mesh-retry side channel into the buffered H3 response.
+///
+/// H1/H2 threads `request_body_exceeded` into deferred admission and
+/// `streaming_h2_read_timeout_ms` into the StreamingH2 relay. This helper is
+/// buffered (`stream_response = false`): the read deadline was already applied
+/// inside mesh dispatch, and headers have not been committed to the H3 client.
+/// A late upload overflow must not be published as a 2xx, and non-success
+/// outcomes must stay health-neutral `RequestBodyTooLarge` rather than a
+/// backend failure.
+fn h3_mesh_buffered_retry_response(
+    response: retry::BackendResponse,
+    request_body_exceeded: Option<Arc<std::sync::atomic::AtomicBool>>,
+    streaming_h2_read_timeout_ms: u64,
+) -> retry::BackendResponse {
+    // Copy so the target-effective deadline stays on this seam; buffered H3
+    // has no StreamingH2 follow-on that would consume it as a relay budget.
+    let _applied_read_timeout_ms = streaming_h2_read_timeout_ms;
+    if !request_body_exceeded
+        .as_ref()
+        .is_some_and(|flag| flag.load(Ordering::Acquire))
+    {
+        return response;
+    }
+    if (200..300).contains(&response.status_code) {
+        return retry::BackendResponse {
+            status_code: 413,
+            body: ResponseBody::buffered(
+                br#"{"error":"Request body exceeds maximum size"}"#.to_vec(),
+            ),
+            headers: HashMap::new(),
+            connection_error: false,
+            backend_resolved_ip: response.backend_resolved_ip,
+            error_class: Some(retry::ErrorClass::RequestBodyTooLarge),
+        };
+    }
+    let mut response = response;
+    response.error_class = Some(retry::ErrorClass::RequestBodyTooLarge);
+    response.connection_error = false;
     response
 }
 
