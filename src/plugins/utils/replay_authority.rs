@@ -772,10 +772,7 @@ impl ReplayAuthority {
     /// but merely validating configuration cannot change process readiness or
     /// dial the candidate backend. Production plugin construction must use
     /// [`Self::shared`].
-    pub(crate) fn shared_detached(
-        client: Arc<RedisRateLimitClient>,
-        retention: Duration,
-    ) -> Self {
+    pub(crate) fn shared_detached(client: Arc<RedisRateLimitClient>, retention: Duration) -> Self {
         Self::Shared { client, retention }
     }
 

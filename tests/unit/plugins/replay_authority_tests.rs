@@ -1001,13 +1001,12 @@ fn validation_construction_does_not_publish_shared_replay_readiness() {
         "unpublished validation candidates must not affect readiness"
     );
 
-    let live_hmac =
-        ferrum_edge::plugins::hmac_auth::HmacAuth::new_with_http_client_and_config_id(
-            &hmac_config,
-            ferrum_edge::plugins::utils::PluginHttpClient::default(),
-            Some("live-hmac-replay-policy"),
-        )
-        .expect("runtime HMAC construction");
+    let live_hmac = ferrum_edge::plugins::hmac_auth::HmacAuth::new_with_http_client_and_config_id(
+        &hmac_config,
+        ferrum_edge::plugins::utils::PluginHttpClient::default(),
+        Some("live-hmac-replay-policy"),
+    )
+    .expect("runtime HMAC construction");
     let live_jwks = ferrum_edge::plugins::jwks_auth::JwksAuth::new_with_config_id(
         &jwks_config,
         ferrum_edge::plugins::utils::PluginHttpClient::default(),
@@ -1015,7 +1014,10 @@ fn validation_construction_does_not_publish_shared_replay_readiness() {
     )
     .expect("runtime JWKS construction");
     let registered = shared_health_snapshot();
-    assert_eq!(registered.shared_authorities, baseline.shared_authorities + 2);
+    assert_eq!(
+        registered.shared_authorities,
+        baseline.shared_authorities + 2
+    );
     assert_eq!(
         registered.shared_authorities_unavailable,
         baseline.shared_authorities_unavailable + 2,
