@@ -4015,12 +4015,20 @@ attested SPIFFE identity, no published address, an unresolvable interface, or a
 name this path will not place in an `iptables -i` argument (notably a `+` suffix,
 which would be a prefix wildcard).
 
-**Privileges.** The host UDP path needs `NET_ADMIN` plus `iproute2`/`iptables` in
-the image — but **not** `hostPID`, `SYS_ADMIN`, or `SYS_PTRACE`, because no
-namespace is entered. The chart narrows those capabilities automatically when
-this placement is selected while retaining the ambient container's baseline
-`NET_RAW`. The registry hostPath and read-only host cgroup mount stay (the
-enrolled-pod set and interface resolution use them); interface resolution falls
+**Privileges.** The host UDP path's running producer needs `NET_ADMIN` plus
+`iproute2`/`iptables` in the image — but **not** `SYS_ADMIN` or `SYS_PTRACE`,
+because no namespace is entered. The chart narrows those capabilities
+automatically when this placement is selected while retaining the ambient
+container's baseline `NET_RAW`. Kubernetes `hostPID` is pod-scoped, not
+container-scoped: the default settled host-netns preflight still renders
+`hostPID: true` on the DaemonSet, so **both** the init container and the
+steady-state producer see the host PID namespace. That visibility does not
+grant `setns`; `SYS_ADMIN`/`SYS_PTRACE` stay on the init container only. A
+cluster that refuses `hostPID` or those init capabilities cannot use this
+default unchanged — set `ambient.udpNodePreflight.enabled=false` and follow
+the documented fail-closed operator recovery path. With `hostPID` absent,
+the registry hostPath and read-only host cgroup mount stay (the enrolled-pod
+set and interface resolution use them); interface resolution falls
 back to the host route table keyed on the registry-published pod IP when `/proc`
 is not shared. That fallback covers **both families** — `/proc/net/route` for a
 v4 address and `/proc/net/ipv6_route` for a v6 one — which is what lets an
@@ -4195,8 +4203,10 @@ independent of that pipeline gate.
    in a maintenance window sized for complete Ambient data-plane interruption.
    When the predecessor is `pod-netns` (or the conservative
    `disabled` case), the cleanup pod retains `hostPID`, `SYS_ADMIN`,
-   `SYS_PTRACE`, and `NET_ADMIN`; stable/final host placement drops the setns
-   privilege set.
+   `SYS_PTRACE`, and `NET_ADMIN`. Stable/final host placement drops
+   `SYS_ADMIN`/`SYS_PTRACE` from the steady-state container; with the default
+   preflight it still renders pod-wide `hostPID` because Kubernetes applies
+   that field to every container in the same pod.
 2. Wait for every node's authenticated `/health` detail
    `mesh.udp_placement_migration.phase` to become `cleanup_complete` (the HTTP
    status remains 503 because readiness is intentionally false), or for
@@ -4428,16 +4438,20 @@ A proof publication that races the deadline is retracted (or invalidated into a
 record no reader will treat as attestation) before the deadline outcome is
 returned, so a timeout cannot leave a usable cleanup attestation behind. A
 stalled cleanup command cannot pin the current-thread runtime or leave an orphan
-mutating network state after timeout. Only the
-init stage receives `hostPID`, `SYS_ADMIN`, and `SYS_PTRACE`; it has exited
-before the producer starts, so the host placement keeps its narrow
-`NET_ADMIN`/`NET_RAW` steady-state posture. The elevated stage is also narrower
-than the pod default rather than merely additive: it sets
+mutating network state after timeout. Kubernetes `hostPID` is pod-scoped, not
+container-scoped: enabling the preflight therefore gives **both** the init
+container and the steady-state producer host PID namespace visibility. That
+visibility does not itself grant `setns`. `SYS_ADMIN` and `SYS_PTRACE` remain
+confined to the init container; after it exits the host placement keeps its
+narrow `NET_ADMIN`/`NET_RAW` steady-state capability posture. The elevated
+init stage is also narrower than the pod default rather than merely additive:
+it sets
 `allowPrivilegeEscalation: false` and drops `ALL` capabilities before adding
 back exactly `NET_ADMIN`, `NET_RAW`, `SYS_ADMIN`, and `SYS_PTRACE`, so those
 four are its complete, declared privilege surface and it inherits nothing from
-the runtime's ambient or default set — the property that makes it usable
-on clusters that will not grant setns privileges at all.
+the runtime's ambient or default set. This same-pod ordering is **not** usable
+unchanged on a cluster that refuses `hostPID` or the init stage's setns
+capabilities.
 
 On such a cluster, set `ambient.udpNodePreflight.enabled=false` and adopt each
 node explicitly. That does **not** relax the runtime boundary: write

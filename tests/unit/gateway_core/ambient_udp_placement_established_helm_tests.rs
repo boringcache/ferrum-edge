@@ -128,8 +128,9 @@ fn a_settled_host_placement_renders_the_privileged_node_preflight() {
         "the preflight must be a one-shot init container running the dedicated subcommand"
     );
 
-    // Privilege containment: the setns set lives in the INIT stage, and the
-    // steady-state container's own gate is unchanged.
+    // Privilege containment: SYS_ADMIN/SYS_PTRACE live in the INIT stage, and
+    // the steady-state container's own capability gate is unchanged. hostPID is
+    // a PodSpec field (pod-wide visibility), not a container capability.
     let (before_init, after_init) = ambient
         .split_once("initContainers:")
         .expect("init container block");
@@ -179,8 +180,19 @@ fn a_settled_host_placement_renders_the_privileged_node_preflight() {
     );
     assert!(
         before_init.contains("if or $ambientSetnsCapture $ambientUdpRunNodePreflight")
-            && before_init.contains("hostPID: true"),
-        "hostPID is required by the init stage's setns work and must be gated on it"
+            && before_init.contains("hostPID: true")
+            && before_init.contains("Kubernetes applies hostPID to every container"),
+        "hostPID is a PodSpec field gated on setns capture OR the settled-host \
+         preflight; Kubernetes applies it to every container in the pod"
+    );
+    assert!(
+        !init_block.contains("hostPID: true") && !steady_state.contains("hostPID: true"),
+        "hostPID must remain a PodSpec field; it is not container-scoped and \
+         cannot be dropped by the steady-state container"
+    );
+    assert!(
+        ambient.contains("hostPID is pod-scoped") && ambient.contains("does not grant setns"),
+        "the template must record that hostPID is pod-wide visibility, not setns"
     );
 
     // The preflight needs the registry (its proof artifact and pod inventory)
@@ -278,6 +290,13 @@ fn client_render_parity_keeps_an_explicit_env_value_under_the_same_boundary() {
         values.contains("udpNodePreflight")
             && values.contains("does NOT relax the runtime boundary"),
         "values must document that disabling the preflight keeps the runtime fail-closed"
+    );
+    assert!(
+        values.contains("hostPID is pod-scoped")
+            && values.contains("hostPID does not grant setns")
+            && values.contains("will not grant hostPID (pod-wide)"),
+        "values must record that hostPID is pod-wide visibility required by the \
+         init stage, not an init-only capability drop"
     );
 }
 
