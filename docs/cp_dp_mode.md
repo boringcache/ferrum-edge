@@ -233,40 +233,41 @@ already use — there is no second representation that can drift.
   trust domains are rejected. The same validation runs on write, on every full
   load, and again before publication.
 
-  <a id="how-the-trust-bounds-compose"></a>
+##### How the trust bounds compose {#how-the-trust-bounds-compose}
 
-  **How the trust bounds compose.** The three families are checked in a fixed
-  order and are deliberately not redundant:
+The three families are checked in a fixed order and are deliberately not
+redundant:
 
-  | Family | Values | What it is for |
-  | --- | --- | --- |
-  | Counts | 16 X.509 + 16 JWT authorities per bundle; **256** federated bundles | Make the documented inventory *representable*, and stop an unbounded collection walk before it starts |
-  | Per-entry size | 16 KiB per X.509 DER, 16 KiB per JWT PEM, 256 B per `key_id` | Stop one authority from being a blob |
-  | Total encoded | **512 KiB** for the whole `bundle` document | The **binding** resource bound — this is what a full inventory is measured against |
+| Family | Values | What it is for |
+| --- | --- | --- |
+| Counts | 16 X.509 + 16 JWT authorities per bundle; **256** federated bundles | Make the documented inventory *representable*, and stop an unbounded collection walk before it starts |
+| Per-entry size | 16 KiB per X.509 DER, 16 KiB per JWT PEM, 256 B per `key_id` | Stop one authority from being a blob |
+| Total encoded | **512 KiB** for the whole `bundle` document | The **binding** resource bound — this is what a full inventory is measured against |
 
-  The federated-bundle count is *derived from* `MAX_MESH_REMOTE_CLUSTERS`, not
-  chosen independently. Mesh multi-cluster already accepts up to 256 remote
-  clusters and a federated deployment carries one federated trust domain per
-  remote cluster, so a smaller trust cap would make an already-admissible
-  cluster inventory unrepresentable — a 33rd trust domain would have rejected an
-  entire mesh generation or suppressed a CP broadcast. The two constants are now
-  tied together in code and cannot drift.
+The federated-bundle count is *derived from* `MAX_MESH_REMOTE_CLUSTERS`, not
+chosen independently. Mesh multi-cluster already accepts up to 256 remote
+clusters and a federated deployment carries one federated trust domain per
+remote cluster, so a smaller trust cap would make an already-admissible
+cluster inventory unrepresentable — a 33rd trust domain would have rejected an
+entire mesh generation or suppressed a CP broadcast. The two constants are now
+tied together in code and cannot drift.
 
-  The count cap is **not** the resource cap: multiplied out, the counts describe
-  roughly 64 MiB of material, which is why the total ceiling exists and is
-  checked as well. The cheap raw-material sum runs first and short-circuits
-  before any deep parser, so the maximum material a hostile document can push
-  through base64/DER/PEM decoding is 512 KiB, not the product of the counts.
+The count cap is **not** the resource cap: multiplied out, the counts describe
+roughly 64 MiB of material, which is why the total ceiling exists and is
+checked as well. The cheap raw-material sum runs first and short-circuits
+before any deep parser, so the maximum material a hostile document can push
+through base64/DER/PEM decoding is 512 KiB, not the product of the counts.
 
-  512 KiB is sized from the documented worst realistic federation: 256 remote
-  trust domains plus the local one, each carrying a rotation-overlap **pair** of
-  ordinary ECDSA P-256 roots (~600 base64 bytes each, so ≈330 KiB with JSON
-  framing), or one RSA-4096 root each. It deliberately does **not** admit every
-  trust domain simultaneously holding the per-bundle authority maximum: that
-  document is replicated through `config_changes` and into every subscriber
-  snapshot on every rotation, and the CP/DP `ConfigUpdate` carries it alongside
-  the full configuration inside one gRPC message. A document over the ceiling is
-  refused with a bounded size diagnostic and the previous generation stays live.
+512 KiB is sized from the documented worst realistic federation: 256 remote
+trust domains plus the local one, each carrying a rotation-overlap **pair** of
+ordinary ECDSA P-256 roots (~600 base64 bytes each, so ≈330 KiB with JSON
+framing), or one RSA-4096 root each. It deliberately does **not** admit every
+trust domain simultaneously holding the per-bundle authority maximum: that
+document is replicated through `config_changes` and into every subscriber
+snapshot on every rotation, and the CP/DP `ConfigUpdate` carries it alongside
+the full configuration inside one gRPC message. A document over the ceiling is
+refused with a bounded size diagnostic and the previous generation stays live.
+
 - **Fail-closed stored-row decoding.** Security-relevant stored fields are
   decoded strictly: a missing/non-integer/non-positive `revision`, an
   unreadable `namespace`/`id`/`trust_domain`/`bundle`, or an unparseable
