@@ -122,6 +122,15 @@ where
 /// composition rather than re-derived from the clock, so an arbitrarily late
 /// wake cannot reattribute a strictly earlier client deadline to the gateway's
 /// security decision.
+///
+/// That absolute bound is expiry-first. `tokio::time::timeout_at` polls its
+/// inner future before the timer, so a fully-buffered client FIN that is ready
+/// on the first poll would be accepted even when this captured bound has
+/// already elapsed. An already-elapsed bound therefore refuses without polling
+/// the upload, and a biased deadline-first race makes an exact-deadline tie
+/// choose the captured owner. The operator stall guard keeps `timeout_at`
+/// (upload-first): a completed drain is not a stall, and that arm never
+/// attributes authorization.
 pub(crate) async fn collect_h3_request_body_under_authorization<F, T, E>(
     collect: F,
     bound: crate::proxy::auth_lifetime::ComposedAuthBound,
@@ -136,23 +145,34 @@ where
     // is very large. Operator timeout `0` disables only that fresh bound.
     match crate::proxy::compose_early_upload_bound(bound.deadline(), request_body_read_timeout_ms) {
         Some((effective_deadline, crate::proxy::EarlyUploadBoundKind::OperatorTimeout)) => {
+            // Stall-guard semantics: an immediately-ready upload still
+            // completes even if this fresh operator window has already
+            // elapsed. Authorization expiry is not this arm's job.
             tokio::time::timeout_at(effective_deadline, collect)
                 .await
                 .map_err(|_| H3RequestBodyReadError::TimedOut)?
                 .map_err(H3RequestBodyReadError::Read)
         }
         Some((effective_deadline, crate::proxy::EarlyUploadBoundKind::RpcDeadline)) => {
-            tokio::time::timeout_at(effective_deadline, collect)
-                .await
-                // Evaluated only once the bound has actually fired, and only to
-                // read the winner captured at composition time. The clock is
-                // still consulted inside `expired_authorization` so a bound
-                // that fired for some other reason can never fabricate an
-                // expiry; it is never consulted to CHOOSE between the owners.
-                .map_err(|_| {
-                    H3RequestBodyReadError::DeadlineExceeded(bound.expired_authorization())
-                })?
-                .map_err(H3RequestBodyReadError::Read)
+            // Evaluated only once the bound has actually fired, and only to
+            // read the winner captured at composition time. The clock is
+            // still consulted inside `expired_authorization` so a bound
+            // that fired for some other reason can never fabricate an
+            // expiry; it is never consulted to CHOOSE between the owners.
+            if tokio::time::Instant::now() >= effective_deadline {
+                return Err(H3RequestBodyReadError::DeadlineExceeded(
+                    bound.expired_authorization(),
+                ));
+            }
+            tokio::select! {
+                biased;
+                () = tokio::time::sleep_until(effective_deadline) => {
+                    Err(H3RequestBodyReadError::DeadlineExceeded(
+                        bound.expired_authorization(),
+                    ))
+                }
+                result = collect => result.map_err(H3RequestBodyReadError::Read),
+            }
         }
         None => collect_h3_request_body_with_timeout(collect, request_body_read_timeout_ms).await,
     }

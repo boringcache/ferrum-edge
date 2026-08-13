@@ -4013,7 +4013,9 @@ async fn an_h3_seam_with_no_client_deadline_is_owned_by_authorization_alone() {
 // earlier `grpc-timeout` actually bounded.
 //
 // These drive the real collector, so they fail against any seam that re-derives
-// the owner instead of consuming the captured composition.
+// the owner instead of consuming the captured composition. Pending-upload cases
+// cover late-wake attribution; immediately-ready `Ok` futures cover the
+// `timeout_at` fail-open (Tokio 1.52.3 polls the inner future before the timer).
 
 /// Move the paused clock forward so "already elapsed" instants stay
 /// representable without depending on the process's uptime.
@@ -4032,6 +4034,20 @@ fn plan_elapsed(
     termination: StreamAuthTermination,
 ) -> Option<StreamAuthDeadline> {
     Some(plan_at(elapsed_by(now, ago), termination))
+}
+
+/// An immediately-ready `Ok` upload that counts how many times it is polled.
+/// This is the shape `tokio::time::timeout_at` cannot refuse: it polls the
+/// inner future before the timer, so a fully-buffered client FIN would be
+/// accepted even when the captured bound has already elapsed.
+fn ready_ok_h3_upload(
+    polled: &Arc<std::sync::atomic::AtomicUsize>,
+) -> impl std::future::Future<Output = Result<(), ()>> {
+    let polled = Arc::clone(polled);
+    std::future::poll_fn(move |_cx| {
+        polled.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        std::task::Poll::Ready(Ok(()))
+    })
 }
 
 #[tokio::test(start_paused = true)]
@@ -4101,6 +4117,102 @@ async fn an_exact_h3_upload_tie_goes_to_authorization() {
         collect_h3_upload_under_authorization_for_test(upload, bound, 0).await,
         H3UploadWaitOutcomeForTest::AuthorizationExpired(StreamAuthTermination::CredentialExpired),
         "a genuine tie resolves to the security decision, matching every biased select arm"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn an_already_elapsed_h3_upload_bound_never_polls_a_ready_ok_future() {
+    let now = paused_clock_with_history().await;
+    let bound = ComposedBound::compose(
+        None,
+        plan_elapsed(
+            now,
+            Duration::from_secs(60),
+            StreamAuthTermination::CredentialExpired,
+        ),
+    );
+    let polled = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let outcome = collect_h3_upload_under_authorization_for_test(
+        ready_ok_h3_upload(&polled),
+        bound,
+        0,
+    )
+    .await;
+
+    assert_eq!(
+        outcome,
+        H3UploadWaitOutcomeForTest::AuthorizationExpired(StreamAuthTermination::CredentialExpired),
+        "an already-elapsed authorization bound must refuse a fully-buffered upload"
+    );
+    assert_eq!(
+        polled.load(std::sync::atomic::Ordering::SeqCst),
+        0,
+        "an already-elapsed bound must not poll the upload at all; timeout_at would \
+         accept this ready Ok on its first poll"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn an_exact_h3_upload_tie_refuses_a_ready_ok_future_as_authorization() {
+    let now = paused_clock_with_history().await;
+    let bound = ComposedBound::compose(
+        Some(elapsed_by(now, Duration::from_secs(30))),
+        plan_elapsed(
+            now,
+            Duration::from_secs(30),
+            StreamAuthTermination::CredentialExpired,
+        ),
+    );
+    let polled = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let outcome = collect_h3_upload_under_authorization_for_test(
+        ready_ok_h3_upload(&polled),
+        bound,
+        0,
+    )
+    .await;
+
+    assert_eq!(
+        outcome,
+        H3UploadWaitOutcomeForTest::AuthorizationExpired(StreamAuthTermination::CredentialExpired),
+        "an exact-deadline tie must choose the captured authorization bound, not a ready FIN"
+    );
+    assert_eq!(
+        polled.load(std::sync::atomic::Ordering::SeqCst),
+        0,
+        "an exact-deadline tie must not poll the ready upload"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_strictly_earlier_client_deadline_refuses_a_ready_ok_future_as_deadline_exceeded() {
+    let now = paused_clock_with_history().await;
+    let bound = ComposedBound::compose(
+        Some(elapsed_by(now, Duration::from_secs(60))),
+        plan_elapsed(
+            now,
+            Duration::from_secs(30),
+            StreamAuthTermination::CredentialExpired,
+        ),
+    );
+    let polled = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let outcome = collect_h3_upload_under_authorization_for_test(
+        ready_ok_h3_upload(&polled),
+        bound,
+        0,
+    )
+    .await;
+
+    assert_eq!(
+        outcome,
+        H3UploadWaitOutcomeForTest::DeadlineExceeded,
+        "a strictly earlier client RPC deadline must stay DeadlineExceeded even when the \
+         upload is already fully buffered; reporting authorization would change the \
+         client-visible terminal and charge the fixed-cardinality counter"
+    );
+    assert_eq!(
+        polled.load(std::sync::atomic::Ordering::SeqCst),
+        0,
+        "an already-elapsed protocol bound must not poll the ready upload either"
     );
 }
 
@@ -4251,6 +4363,51 @@ fn every_native_h3_upload_site_attributes_from_the_captured_composition() {
     assert!(
         !collector.contains("record_termination(") && !collector.contains("record_once("),
         "the collector only REPORTS an owner; the request's shared latch is what counts it"
+    );
+
+    let operator_arm = collector
+        .split("EarlyUploadBoundKind::OperatorTimeout)) => {")
+        .nth(1)
+        .expect("operator stall-guard arm")
+        .split("EarlyUploadBoundKind::RpcDeadline")
+        .next()
+        .expect("bounded operator stall-guard arm");
+    assert!(
+        operator_arm.contains("timeout_at(") && operator_arm.contains("TimedOut"),
+        "the operator stall guard keeps upload-first timeout_at semantics and TimedOut"
+    );
+
+    let rpc_deadline_arm = collector
+        .split("EarlyUploadBoundKind::RpcDeadline)) => {")
+        .nth(1)
+        .expect("absolute-bound arm")
+        .split("None =>")
+        .next()
+        .expect("bounded absolute-bound arm");
+    assert!(
+        !rpc_deadline_arm.contains("timeout_at("),
+        "timeout_at polls the upload first, so an already-elapsed bound would accept a ready FIN"
+    );
+    let precheck_at = rpc_deadline_arm
+        .find("if tokio::time::Instant::now() >= effective_deadline {")
+        .expect("the already-elapsed refusal");
+    let select_at = rpc_deadline_arm
+        .find("tokio::select! {")
+        .expect("the deadline-biased race");
+    assert!(
+        precheck_at < select_at,
+        "an already-elapsed bound must refuse before select! can pick a ready upload"
+    );
+    let select = &rpc_deadline_arm[select_at..];
+    let biased_at = select.find("biased;").expect("biased select");
+    let sleep_at = select
+        .find("sleep_until(effective_deadline)")
+        .expect("the captured-bound arm");
+    let collect_at = select.find("result = collect").expect("the upload arm");
+    assert!(
+        biased_at < sleep_at && sleep_at < collect_at,
+        "the captured bound must be the FIRST select arm so an exact-deadline tie \
+         chooses the composition, not a simultaneously-ready FIN"
     );
 
     // The no-plan wrapper the cross-protocol bridge uses composes against
