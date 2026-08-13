@@ -246,11 +246,8 @@ impl UdpSession {
     fn authorization_expired_now(
         &self,
     ) -> Option<crate::proxy::auth_lifetime::StreamAuthTermination> {
-        udp_reply_expired_at_commit(
-            self.authorization
-                .as_ref()
-                .map(|authorization| authorization.plan),
-        )
+        let authorization = self.authorization.as_ref();
+        udp_reply_expired_at_commit(authorization.map(|authorization| authorization.plan))
     }
 
     /// Settle this session's authorization expiry exactly once.

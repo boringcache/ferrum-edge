@@ -1357,15 +1357,6 @@ impl DtlsServerSender {
         self.auth_deadline.publish(at);
     }
 
-    /// Send application data through the DTLS tunnel to this client.
-    ///
-    /// Unauthenticated convenience for [`Self::send_committed`] with no
-    /// authorization deadline. Success still means the produced ciphertext
-    /// was accepted by the UDP socket.
-    pub async fn send(&self, data: &[u8]) -> Result<(), anyhow::Error> {
-        self.send_committed(data, None).await
-    }
-
     /// Send application data through the DTLS tunnel, completing only after
     /// every ciphertext datagram produced for this plaintext is accepted by
     /// the UDP socket.

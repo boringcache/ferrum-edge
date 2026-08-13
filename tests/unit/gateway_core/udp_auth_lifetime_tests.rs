@@ -350,7 +350,7 @@ async fn an_elapsed_deadline_refuses_the_next_client_datagram_immediately() {
     );
     let after = stream_udp_terminations();
     assert!(
-        after.0 >= before.0 + 1,
+        after.0 > before.0,
         "the fixed-cardinality stream_udp credential_expired counter records the termination"
     );
     assert!(
@@ -431,7 +431,7 @@ async fn settlement_is_exactly_once_across_a_burst_of_refused_datagrams() {
     }
 
     assert!(
-        stream_udp_terminations().0 >= before.0 + 1,
+        stream_udp_terminations().0 > before.0,
         "the burst recorded the termination"
     );
     assert_eq!(session.metadata().len(), 1, "one bounded metadata stamp");
@@ -839,7 +839,7 @@ async fn a_pending_client_send_to_is_dropped_at_the_authorization_deadline() {
         .expect("this generation owns the removal");
     assert!(summary.connection_error.is_some());
     assert!(
-        stream_udp_terminations().0 >= before.0 + 1,
+        stream_udp_terminations().0 > before.0,
         "send-path expiry records the stream_udp counter once"
     );
     assert!(
@@ -983,7 +983,7 @@ async fn post_hook_expiry_settles_once_and_uses_the_shared_teardown() {
         .expect("this generation owns the removal");
     assert!(summary.connection_error.is_some());
     assert!(
-        stream_udp_terminations().0 >= before.0 + 1,
+        stream_udp_terminations().0 > before.0,
         "the reply-path expiry still records the stream_udp counter once"
     );
     assert!(
@@ -1083,7 +1083,7 @@ async fn a_simultaneous_idle_removal_and_authorization_expiry_release_exactly_on
     assert_eq!(session.overload_active_connections(), 0);
     assert_eq!(session.active_sessions(), 0);
     assert!(
-        stream_udp_terminations().0 >= before.0 + 1,
+        stream_udp_terminations().0 > before.0,
         "the race recorded the termination"
     );
     assert!(
@@ -1226,7 +1226,7 @@ async fn concurrent_directions_settle_one_termination_between_them() {
         "every datagram is refused"
     );
     assert!(
-        stream_udp_terminations().0 >= before.0 + 1,
+        stream_udp_terminations().0 > before.0,
         "the concurrent observers recorded the termination"
     );
     assert!(
@@ -1293,8 +1293,14 @@ fn the_client_to_backend_authorization_gate_stays_on_the_hot_path_budget() {
         .split("\n}\n")
         .next()
         .expect("the commitment predicate body");
+    let unauthenticated = commit
+        .find("let plan = plan?;")
+        .expect("an unauthenticated session must return before any clock read");
+    let clock = commit
+        .find("tokio::time::Instant::now()")
+        .expect("authenticated sessions compare the monotonic clock");
     assert!(
-        commit.contains("let Some(plan) = plan else"),
+        unauthenticated < clock,
         "an unauthenticated session must return before any clock read"
     );
     assert!(
@@ -1650,6 +1656,9 @@ fn client_facing_sends_are_raced_against_the_authorization_plan() {
     let writable_wait = linux_direct
         .find("udp_frontend_writable_until_expiry(")
         .expect("writable race");
+    let would_block = linux_direct
+        .find("ErrorKind::WouldBlock")
+        .expect("WouldBlock path");
     let syscall = linux_direct
         .find("send_with_pktinfo(")
         .expect("the pktinfo syscall");
@@ -1658,7 +1667,7 @@ fn client_facing_sends_are_raced_against_the_authorization_plan() {
         "the pktinfo syscall must be preceded by an authorization recheck"
     );
     assert!(
-        writable_wait < syscall,
+        writable_wait > would_block,
         "writable wait is the authorization-owned helper, not a bare frontend.writable().await"
     );
     assert!(

@@ -515,11 +515,15 @@ fn driver_and_proxy_use_the_deadline_aware_actual_commit_api() {
         !DTLS_SOURCE.contains("Drain any queued replies before"),
         "shutdown must not drain queued application replies onto the wire"
     );
-    let shutdown = DTLS_SOURCE
-        .split("_ = shutdown_rx.recv() => {")
-        .nth(1)
+    // The client-role driver also matches `_ = shutdown_rx.recv() => {`. Pin the
+    // terminating-frontend arm that sits beside the demuxed `incoming_rx`.
+    let shutdown_body = DTLS_SOURCE
+        .split("Some(data) = incoming_rx.recv() => {")
+        .next()
+        .expect("incoming demux arm")
+        .rsplit("_ = shutdown_rx.recv() => {")
+        .next()
         .expect("server shutdown arm");
-    let shutdown_body = shutdown.split("incoming_rx.recv()").next().expect("arm");
     assert!(
         shutdown_body.contains("fail_queued_frontend_app_sends("),
         "shutdown must complete queued sends as expired/cancelled/closed"
