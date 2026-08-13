@@ -2713,6 +2713,7 @@ impl MetricsRegistry {
         self.append_grpc_stream_auth_prometheus(&mut output);
         self.append_udp_placement_migration_prometheus(&mut output);
         self.append_dp_config_freshness_prometheus(&mut output);
+        self.append_cp_dp_trust_reload_prometheus(&mut output);
         self.append_gateway_listener_status_prometheus(&mut output);
         output
     }
@@ -2735,6 +2736,27 @@ impl MetricsRegistry {
             output,
             &ns_label,
             crate::dp_config_freshness::snapshot().as_ref(),
+        );
+    }
+
+    /// Append the bounded CP/DP trust-reload families from live state.
+    ///
+    /// Kept off the render cache for the same reason as the DP families
+    /// (issue #3813): the last-acceptance age, the degraded/stale bits, and
+    /// the stalled-worker gauge come from process-static atomics and the
+    /// passage of time, so a memoized body would report a stale-trust state
+    /// that is wrong by however long the cache has been held — exactly the
+    /// window an operator is watching during a failed rotation.
+    fn append_cp_dp_trust_reload_prometheus(&self, output: &mut String) {
+        let ns_label = self
+            .namespace_label
+            .read()
+            .map(|label| label.clone())
+            .unwrap_or_default();
+        render_cp_dp_trust_reload_prometheus(
+            output,
+            &ns_label,
+            crate::grpc::cp_trust_health::snapshot().as_ref(),
         );
     }
 
@@ -2839,6 +2861,7 @@ impl MetricsRegistry {
         self.append_grpc_stream_auth_prometheus(&mut output);
         self.append_udp_placement_migration_prometheus(&mut output);
         self.append_dp_config_freshness_prometheus(&mut output);
+        self.append_cp_dp_trust_reload_prometheus(&mut output);
         self.append_gateway_listener_status_prometheus(&mut output);
         output
     }
@@ -4914,6 +4937,156 @@ pub fn render_dp_config_freshness_prometheus(
         output,
         "ferrum_dp_config_snapshot_apply_failures_total",
         freshness.apply_failed_total,
+        ns_label,
+    );
+}
+
+/// Render the bounded CP/DP trust-reload families (issue #3813).
+///
+/// A free function taking the projection explicitly so the exact rendered text
+/// is testable without installing the process-global CP status, which would
+/// publish CP-wide state inside a shared test binary.
+///
+/// Present only on a control plane that watches a trust bundle (`status` is
+/// `None` everywhere else). Every series is fixed-cardinality: `namespace` and
+/// the closed [`crate::grpc::cp_trust_health::TrustReloadFailure`] set are the
+/// only labels. No bundle path, `kid`, namespace inventory, credential
+/// identifier, generation identifier, fingerprint, HMAC tag, or any other
+/// value derived from key material is ever a label value or a sample value.
+/// The keyed `active_generation` identifier is authenticated `/health` only.
+pub fn render_cp_dp_trust_reload_prometheus(
+    output: &mut String,
+    ns_label: &str,
+    status: Option<&crate::grpc::cp_trust_health::CpDpTrustReloadSnapshot>,
+) {
+    let Some(status) = status else {
+        return;
+    };
+    output.push_str(
+        "# HELP ferrum_cp_dp_trust_reload_attempts_total CP/DP trust-bundle reload attempts started since process start. A wedged in-flight read is counted here before it produces an acceptance or rejection.\n",
+    );
+    output.push_str("# TYPE ferrum_cp_dp_trust_reload_attempts_total counter\n");
+    render_process_counter(
+        output,
+        "ferrum_cp_dp_trust_reload_attempts_total",
+        status.attempts_total,
+        ns_label,
+    );
+
+    output.push_str(
+        "# HELP ferrum_cp_dp_trust_reload_acceptances_total Reload attempts that produced a usable trust generation (replaced or confirmed unchanged).\n",
+    );
+    output.push_str("# TYPE ferrum_cp_dp_trust_reload_acceptances_total counter\n");
+    render_process_counter(
+        output,
+        "ferrum_cp_dp_trust_reload_acceptances_total",
+        status.acceptances_total,
+        ns_label,
+    );
+
+    output.push_str(
+        "# HELP ferrum_cp_dp_trust_reload_rejections_total Reload candidates refused or reload workers exited unexpectedly, by closed reason. The previous verifier was retained when applicable.\n",
+    );
+    output.push_str("# TYPE ferrum_cp_dp_trust_reload_rejections_total counter\n");
+    for failure in crate::grpc::cp_trust_health::TRUST_RELOAD_FAILURES {
+        let value = status
+            .rejections_by_reason
+            .get(failure.as_str())
+            .copied()
+            .unwrap_or(0);
+        output.push_str(&format!(
+            "ferrum_cp_dp_trust_reload_rejections_total{{reason=\"{}\"{}}} {}\n",
+            failure.as_str(),
+            ns_label,
+            value,
+        ));
+    }
+
+    output.push_str(
+        "# HELP ferrum_cp_dp_trust_reload_recoveries_total Failure episodes ended by a later valid candidate.\n",
+    );
+    output.push_str("# TYPE ferrum_cp_dp_trust_reload_recoveries_total counter\n");
+    render_process_counter(
+        output,
+        "ferrum_cp_dp_trust_reload_recoveries_total",
+        status.recoveries_total,
+        ns_label,
+    );
+
+    output.push_str(
+        "# HELP ferrum_cp_dp_trust_reload_consecutive_failures Consecutive refused reload candidates or fatal worker exits since the last accepted generation.\n",
+    );
+    output.push_str("# TYPE ferrum_cp_dp_trust_reload_consecutive_failures gauge\n");
+    render_process_counter(
+        output,
+        "ferrum_cp_dp_trust_reload_consecutive_failures",
+        status.consecutive_failures,
+        ns_label,
+    );
+
+    output.push_str(
+        "# HELP ferrum_cp_dp_trust_last_acceptance_age_seconds Seconds since the CP last accepted (replaced or confirmed) its trust source, on a monotonic clock.\n",
+    );
+    output.push_str("# TYPE ferrum_cp_dp_trust_last_acceptance_age_seconds gauge\n");
+    render_process_counter(
+        output,
+        "ferrum_cp_dp_trust_last_acceptance_age_seconds",
+        status.last_acceptance_age_seconds.unwrap_or(0),
+        ns_label,
+    );
+
+    output.push_str(
+        "# HELP ferrum_cp_dp_trust_max_stale_seconds Configured maximum unrevalidated trust-generation age before admission fails closed (0 = unbounded, explicit opt-in).\n",
+    );
+    output.push_str("# TYPE ferrum_cp_dp_trust_max_stale_seconds gauge\n");
+    render_process_counter(
+        output,
+        "ferrum_cp_dp_trust_max_stale_seconds",
+        status.max_stale_seconds,
+        ns_label,
+    );
+
+    output.push_str(
+        "# HELP ferrum_cp_dp_trust_degraded Whether the CP is authorizing with a trust generation it could not revalidate, or the reload worker is stalled or failed (1) or not (0).\n",
+    );
+    output.push_str("# TYPE ferrum_cp_dp_trust_degraded gauge\n");
+    render_process_counter(
+        output,
+        "ferrum_cp_dp_trust_degraded",
+        u64::from(status.degraded),
+        ns_label,
+    );
+
+    output.push_str(
+        "# HELP ferrum_cp_dp_trust_stale Whether the active trust generation has aged past its bound, refusing new configuration streams (1) or not (0).\n",
+    );
+    output.push_str("# TYPE ferrum_cp_dp_trust_stale gauge\n");
+    render_process_counter(
+        output,
+        "ferrum_cp_dp_trust_stale",
+        u64::from(status.stale),
+        ns_label,
+    );
+
+    output.push_str(
+        "# HELP ferrum_cp_dp_trust_reload_worker_running Whether the trust-bundle reload worker is alive (1) or stopped/failed (0). A stalled worker is still alive.\n",
+    );
+    output.push_str("# TYPE ferrum_cp_dp_trust_reload_worker_running gauge\n");
+    render_process_counter(
+        output,
+        "ferrum_cp_dp_trust_reload_worker_running",
+        u64::from(status.worker_running),
+        ns_label,
+    );
+
+    output.push_str(
+        "# HELP ferrum_cp_dp_trust_reload_worker_stalled Whether the trust-bundle reload worker is alive but has not completed an attempt inside the stall window (1) or not (0).\n",
+    );
+    output.push_str("# TYPE ferrum_cp_dp_trust_reload_worker_stalled gauge\n");
+    render_process_counter(
+        output,
+        "ferrum_cp_dp_trust_reload_worker_stalled",
+        u64::from(status.worker_state == "stalled"),
         ns_label,
     );
 }

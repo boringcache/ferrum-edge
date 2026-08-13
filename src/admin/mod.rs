@@ -2069,6 +2069,16 @@ async fn handle_admin_request_inner(
         let dp_config_stale = dp_config_freshness
             .as_ref()
             .is_some_and(|freshness| freshness.stale);
+        // Bounded CP/DP trust-reload health (issue #3813). `None` outside a CP
+        // that watches a trust bundle. The unauthenticated probe uses the
+        // lock-free coarse verdict (atomic loads, no heap) so a probe flood
+        // cannot allocate the closed reason map. Readiness fails once the CP
+        // is authorizing under a trust generation it could not revalidate
+        // within the bound, or once the reload worker has died and no
+        // revocation can ever be published again. A stalled worker degrades
+        // immediately but does not fail readiness inside the stale window.
+        let cp_trust_coarse = crate::grpc::cp_trust_health::coarse();
+        let cp_trust_blocked = cp_trust_coarse.is_some_and(|trust| trust.readiness_blocked);
         // Dynamic Gateway API listener realization (issue #3810). One lock-free
         // `ArcSwap` load with no allocation, no I/O, and no lock, so an
         // unauthenticated probe flood cannot drive work. Unlike
@@ -2090,6 +2100,7 @@ async fn handle_admin_request_inner(
             && jwks_ready
             && discovery_ready
             && !dp_config_stale
+            && !cp_trust_blocked
             && !gateway_listeners_not_ready;
         health_status["ready"] = json!(ready);
         if gateway_listeners_degraded {
@@ -2107,6 +2118,22 @@ async fn handle_admin_request_inner(
             // closed-set reason/action labels. Never a CP URL, token,
             // namespace, node id, or config content.
             health_status["dp_config"] = serde_json::to_value(freshness).unwrap_or_default();
+        }
+        if detailed {
+            // Allocates the closed reason map and the keyed generation
+            // identifier. Authenticated detail only — never the coarse probe.
+            if let Some(trust) = crate::grpc::cp_trust_health::snapshot() {
+                // Booleans, seconds, counters, a closed-set reason, and the
+                // keyed HMAC generation identifier. Never a bundle path, key
+                // material, `kid`, namespace, token, or the private fingerprint.
+                health_status["cp_dp_trust"] = serde_json::to_value(trust).unwrap_or_default();
+            }
+        }
+        if let Some(trust) = cp_trust_coarse.as_ref()
+            && trust.degraded
+            && !cp_trust_blocked
+        {
+            health_status["status"] = json!("degraded");
         }
         if jwks_degraded && jwks_ready {
             health_status["status"] = json!("degraded");
@@ -2319,24 +2346,28 @@ async fn handle_admin_request_inner(
             // previously-ready dependency, so it shares `unavailable`. So does
             // a DP whose applied configuration aged past its bound (#3726): it
             // started ready and lost its authority, which is not "starting".
-            // A discovery task with fail-readiness policy, or a failed
-            // fail-closed withdrawal publication, is likewise unavailable.
-            // A dynamic Gateway listener failure is recoverable and partial:
-            // healthy listeners are still serving and the next retry can clear
-            // it. When an operator opted into failing readiness on it, the
-            // status stays `degraded` rather than becoming `unavailable`, so a
-            // recoverable partial outage is never reported as a lost
-            // dependency.
-            health_status["status"] =
-                json!(
-                    if serving_degraded || !jwks_ready || !discovery_ready || dp_config_stale {
-                        "unavailable"
-                    } else if gateway_listeners_not_ready {
-                        "degraded"
-                    } else {
-                        "starting"
-                    }
-                );
+            // A CP that can no longer revalidate its verification trust source
+            // within the bound — or whose reload worker died — is the same
+            // shape (#3813). A discovery task with fail-readiness policy, or a
+            // failed fail-closed withdrawal publication, is likewise
+            // unavailable. A dynamic Gateway listener failure is recoverable
+            // and partial: healthy listeners are still serving and the next
+            // retry can clear it. When an operator opted into failing readiness
+            // on it, the status stays `degraded` rather than becoming
+            // `unavailable`, so a recoverable partial outage is never reported
+            // as a lost dependency.
+            let lost_authority = serving_degraded
+                || !jwks_ready
+                || !discovery_ready
+                || dp_config_stale
+                || cp_trust_blocked;
+            health_status["status"] = json!(if lost_authority {
+                "unavailable"
+            } else if gateway_listeners_not_ready {
+                "degraded"
+            } else {
+                "starting"
+            });
             StatusCode::SERVICE_UNAVAILABLE
         } else {
             StatusCode::OK
