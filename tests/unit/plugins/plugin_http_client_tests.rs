@@ -714,6 +714,216 @@ fn health_check_fallback_propagates_construction_failure_without_panic() {
     );
 }
 
+fn production_plugin_http_client_source() -> &'static str {
+    include_str!("../../../src/plugins/utils/http_client.rs")
+        .split("\n#[cfg(test)]")
+        .next()
+        .expect("production plugin HTTP client source precedes test modules")
+}
+
+fn uncommented_lines(source: &str) -> Vec<&str> {
+    source
+        .lines()
+        .filter(|line| {
+            let trimmed = line.trim_start();
+            !trimmed.starts_with("//") && !trimmed.starts_with("///") && !trimmed.starts_with('*')
+        })
+        .collect()
+}
+
+fn function_region<'a>(source: &'a str, start_needle: &str, end_needle: &str) -> &'a str {
+    let start = source
+        .find(start_needle)
+        .unwrap_or_else(|| panic!("{start_needle} present in plugin HTTP client source"));
+    let rest = &source[start..];
+    let end = rest
+        .find(end_needle)
+        .unwrap_or_else(|| panic!("{end_needle} follows {start_needle}"));
+    &rest[..end]
+}
+
+#[test]
+fn plugin_http_client_production_builder_has_no_panic_or_expect() {
+    let production = production_plugin_http_client_source();
+    let uncommented = uncommented_lines(production).join("\n");
+    assert!(
+        !uncommented.contains("panic!("),
+        "plugin HTTP client production builder must not panic when host CA roots cannot load"
+    );
+    assert!(
+        !uncommented.contains(".expect("),
+        "plugin HTTP client production builder must not expect() on client construction"
+    );
+    assert!(
+        !uncommented.contains("Client::new()"),
+        "plugin HTTP client production builder must not re-enable ambient proxies via Client::new()"
+    );
+}
+
+#[test]
+fn plugin_http_client_terminal_fallback_is_fail_closed_no_proxy_no_redirect() {
+    let production = production_plugin_http_client_source();
+    let fail_closed = function_region(
+        production,
+        "fn apply_fail_closed_empty_trust(",
+        "fn apply_or_inert(",
+    );
+    let uncommented_tls = uncommented_lines(fail_closed).join("\n");
+    assert!(
+        uncommented_tls.contains("tls_danger_accept_invalid_certs(false)"),
+        "fail-closed TLS must keep certificate verification enabled"
+    );
+    assert!(
+        uncommented_tls.contains("tls_certs_only"),
+        "fail-closed TLS must disable ambient native/built-in roots via tls_certs_only"
+    );
+    assert!(
+        !uncommented_tls.contains("danger_accept_invalid_certs(true)"),
+        "fail-closed TLS must not disable certificate verification"
+    );
+
+    let inert = function_region(
+        production,
+        "fn apply_inert_crypto_posture(",
+        "fn apply_terminal_fail_closed_tls(",
+    );
+    let uncommented_inert = uncommented_lines(inert).join("\n");
+    assert!(
+        uncommented_inert.contains("apply_fail_closed_empty_trust"),
+        "FIPS inert posture must reuse the empty-trust fail-closed TLS helper"
+    );
+    assert!(
+        uncommented_inert.contains("https_only(true)"),
+        "FIPS inert posture must keep HTTPS-only so plaintext is not a fallback"
+    );
+
+    let terminal = function_region(
+        production,
+        "fn plugin_client_no_proxy_no_redirect(",
+        "fn build_configured_plugin_client(",
+    );
+    let uncommented_terminal = uncommented_lines(terminal).join("\n");
+    assert!(
+        uncommented_terminal.contains(".no_proxy()"),
+        "terminal fallback must keep .no_proxy()"
+    );
+    assert!(
+        uncommented_terminal.contains("reqwest::redirect::Policy::none()"),
+        "terminal fallback must keep redirects disabled"
+    );
+    assert!(
+        uncommented_terminal.contains("apply_terminal_fail_closed_tls"),
+        "terminal fallback must apply fail-closed empty-trust TLS"
+    );
+    assert!(
+        uncommented_terminal.contains("use_preconfigured_tls"),
+        "terminal reconstruction must use an explicit empty rustls root store"
+    );
+    assert!(
+        uncommented_terminal.contains("RootCertStore::empty()"),
+        "preconfigured reconstruction must install an empty trust store"
+    );
+    assert!(
+        !uncommented_terminal.contains("panic!("),
+        "terminal fallback must not panic"
+    );
+    assert!(
+        !uncommented_terminal.contains(".expect("),
+        "terminal fallback must not expect() on construction"
+    );
+    assert!(
+        !uncommented_terminal.contains("Client::new()"),
+        "terminal fallback must not call Client::new()"
+    );
+    assert!(
+        !uncommented_terminal.contains("danger_accept_invalid_certs(true)"),
+        "terminal fallback must not disable certificate verification"
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn fail_closed_empty_trust_client_ignores_proxy_and_does_not_follow_redirects() {
+    use ferrum_edge::config::{BackendEgressPolicy, PoolConfig};
+    use ferrum_edge::dns::{DnsCache, DnsConfig};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let tempdir = tempfile::tempdir().expect("create tempdir");
+    let ca_path = tempdir.path().join("invalid-ca.pem");
+    std::fs::write(&ca_path, "not a pem certificate").expect("write invalid CA");
+
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind redirect listener");
+    let addr = listener.local_addr().expect("listener address");
+    let hits = Arc::new(AtomicUsize::new(0));
+    let hits_task = hits.clone();
+    tokio::spawn(async move {
+        loop {
+            let Ok((mut socket, _)) = listener.accept().await else {
+                return;
+            };
+            hits_task.fetch_add(1, Ordering::SeqCst);
+            let mut buf = [0u8; 1024];
+            let _ = socket.read(&mut buf).await;
+            let body = "redirected";
+            let response = format!(
+                "HTTP/1.1 302 Found\r\nLocation: http://{addr}/chased\r\n\
+                 Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            let _ = socket.write_all(response.as_bytes()).await;
+        }
+    });
+
+    let proxy = MockServer::start().await;
+    let client = {
+        let _env_lock = crate::unit::env_lock::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _proxy_env = ProxyEnvGuard::point_all_at(&proxy.uri());
+        PluginHttpClient::new(
+            &PoolConfig::default(),
+            DnsCache::new(DnsConfig::default()),
+            1000,
+            0,
+            100,
+            false,
+            ca_path.to_str(),
+            Arc::new(Vec::new()),
+            ferrum_edge::config::types::DEFAULT_NAMESPACE,
+            BackendEgressPolicy::unrestricted(),
+            Arc::new(Vec::new()),
+            0,
+        )
+    };
+
+    let _ = client
+        .get()
+        .get("http://198.51.100.1:9/no-proxy-canary")
+        .timeout(Duration::from_millis(200))
+        .send()
+        .await;
+    assert_eq!(
+        proxy.received_requests().await.unwrap_or_default().len(),
+        0,
+        "fail-closed empty-trust client must ignore ambient proxy variables"
+    );
+
+    let resp = client
+        .get()
+        .get(format!("http://{addr}/"))
+        .timeout(Duration::from_secs(5))
+        .send()
+        .await
+        .expect("HTTP to the local listener must succeed on the fail-closed client");
+    assert_eq!(resp.status().as_u16(), 302, "must surface the 302");
+    assert_eq!(
+        hits.load(Ordering::SeqCst),
+        1,
+        "fail-closed empty-trust client must not follow redirects"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Redacted execution APIs — advisory GHSA-8594-2xhc-8g38
 //
