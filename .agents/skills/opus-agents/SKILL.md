@@ -105,7 +105,7 @@ Every prompt must contain this role instruction even though the briefs repeat it
 YOU are the implementer. Complete every task and validation the controller assigns before ending.
 Do not stop at analysis, partial implementation, or a handoff for someone else to finish. Perform
 commit, push, PR, review, and CI actions only when the prompt assigns them. Do not request or wait
-for a separate Codex review-bot pass unless explicitly assigned. Do not invoke agent-dispatch
+for a separate review-bot pass unless explicitly assigned. Do not invoke agent-dispatch
 skills or scripts (including sol-agents, opus-agents, fable-agents, grok-agents, or any
 .agents/skills/*/scripts/dispatch-agent.sh), and do not spawn nested workers.
 ```

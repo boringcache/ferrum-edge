@@ -65,8 +65,8 @@ by inspection. Remote CI is the normal validator for a parallel fleet.
 ## Finish and report
 
 Follow the exact stopping point in the dispatch prompt. Finish every assigned implementation and
-validation item before ending, then perform only the requested delivery actions. Do not add or wait
-for an independent Codex or review-bot review unless the prompt explicitly assigns one.
+validation item before ending, then perform only the requested delivery actions. Do not request or
+wait for a separate review-bot pass unless the prompt explicitly assigns one.
 
 1. Review `git diff` and `git status`; remove accidental artifacts.
 2. When asked to commit or push, use a concise imperative commit message and push the assigned
