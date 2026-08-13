@@ -1385,9 +1385,7 @@ async fn a_projected_symlink_swap_is_observed_as_a_content_rotation() {
 /// check and `install_slice`.
 #[test]
 fn stock_credential_commit_holds_the_watch_lock_across_install() {
-    use ferrum_edge::modes::mesh::config_consumer::stock_xds_client::{
-        run_under_stock_credential_commit_admission_for_test,
-    };
+    use ferrum_edge::modes::mesh::config_consumer::stock_xds_client::run_under_stock_credential_commit_admission_for_test;
     use ferrum_edge::modes::mesh::runtime::{MeshRuntimeState, MeshSliceInstall};
     use ferrum_edge::modes::mesh::slice::MeshSlice;
 
@@ -1401,7 +1399,9 @@ fn stock_credential_commit_holds_the_watch_lock_across_install() {
 
     std::thread::scope(|scope| {
         let publisher = scope.spawn(|| {
-            entered_rx.recv().expect("commit holds the observation lock");
+            entered_rx
+                .recv()
+                .expect("commit holds the observation lock");
             watch.publish(rotated.observed_state())
         });
 
@@ -1445,9 +1445,7 @@ fn stock_credential_commit_holds_the_watch_lock_across_install() {
 
 #[test]
 fn stock_credential_commit_refuses_a_rotated_generation_without_installing() {
-    use ferrum_edge::modes::mesh::config_consumer::stock_xds_client::{
-        run_under_stock_credential_commit_admission_for_test,
-    };
+    use ferrum_edge::modes::mesh::config_consumer::stock_xds_client::run_under_stock_credential_commit_admission_for_test;
 
     let first = StockBearerCredential::admit("token-a", lifetime_policy(3600, 60)).unwrap();
     let rotated = StockBearerCredential::admit("token-b", lifetime_policy(3600, 60)).unwrap();
@@ -1456,14 +1454,11 @@ fn stock_credential_commit_refuses_a_rotated_generation_without_installing() {
     let opened = watch.latest().generation;
     assert!(watch.publish(rotated.observed_state()));
 
-    let err = run_under_stock_credential_commit_admission_for_test(
-        &watch,
-        opened,
-        None,
-        true,
-        || panic!("a rotated generation must not reach the install callback"),
-    )
-    .expect_err("stale generation is refused");
+    let err =
+        run_under_stock_credential_commit_admission_for_test(&watch, opened, None, true, || {
+            panic!("a rotated generation must not reach the install callback")
+        })
+        .expect_err("stale generation is refused");
     assert_eq!(err, MeshStreamRetirement::CredentialRotated);
 }
 
@@ -1512,10 +1507,7 @@ async fn a_blocked_stock_outbound_enqueue_loses_to_credential_rotation() {
         .await
     });
 
-    parked_rx
-        .changed()
-        .await
-        .expect("send reaches the wait");
+    parked_rx.changed().await.expect("send reaches the wait");
     assert!(
         *parked_rx.borrow(),
         "the production send must signal after admission and before the enqueue wait"
@@ -1559,10 +1551,7 @@ async fn a_blocked_stock_outbound_enqueue_loses_to_credential_invalidation() {
         .await
     });
 
-    parked_rx
-        .changed()
-        .await
-        .expect("send reaches the wait");
+    parked_rx.changed().await.expect("send reaches the wait");
     assert!(watch.publish(StockCredentialState::Invalid {
         reason: StockCredentialInvalidReason::Missing,
     }));

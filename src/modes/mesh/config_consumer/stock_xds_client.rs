@@ -689,10 +689,7 @@ impl StockCredentialFence {
     /// Generation validation plus the absolute deadline, evaluated while the
     /// caller holds a watch observation. The deadline is last so it is as
     /// close to the subsequent synchronous install as possible.
-    fn admit_locked(
-        &self,
-        observed: &StockCredentialObservation,
-    ) -> Option<MeshStreamRetirement> {
+    fn admit_locked(&self, observed: &StockCredentialObservation) -> Option<MeshStreamRetirement> {
         if self.configured {
             if observed.generation != self.generation {
                 return Some(if observed.state.is_invalid() {
@@ -1975,7 +1972,9 @@ fn commit_pending(
     last_logged_refusals: &mut Option<Vec<StockRefusal>>,
     recovery: &MeshLocalSourceRecovery,
 ) -> Result<(), StockCommitFailure> {
-    let _admission = fence.admit_commit().map_err(StockCommitFailure::Retirement)?;
+    let _admission = fence
+        .admit_commit()
+        .map_err(StockCommitFailure::Retirement)?;
     apply_pending(config, state, pending, last_logged_refusals, recovery)
         .map_err(StockCommitFailure::Policy)
 }
