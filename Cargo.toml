@@ -116,8 +116,9 @@ serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["raw_value"] }
 serde_yaml = "0.9"
 # Direct pin of the libyaml event parser already used by serde_yaml so API-spec
-# YAML can compose alias-preserving graphs and expand them under explicit budgets
-# (issue #3307) without relying on serde_yaml's unbounded alias materialization.
+# and file-backed config YAML can compose alias-preserving graphs and traverse
+# them under explicit budgets without relying on serde_yaml's unbounded alias
+# materialization (issue #3307 and PR #3843).
 unsafe-libyaml = "0.2.11"
 jsonschema = { version = "0.46.5", default-features = false }
 roxmltree = "0.20"

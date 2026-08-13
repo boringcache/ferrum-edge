@@ -8,6 +8,10 @@
 use std::path::Path;
 use tracing::{info, warn};
 
+use crate::config::stable_file::{
+    MAX_GATEWAY_CONFIG_FILE_BYTES, StableFileReadOptions, read_stable_file,
+    stable_file_error_anyhow,
+};
 use crate::config::types::CURRENT_CONFIG_VERSION;
 use crate::config::yaml_alias_budget::admit_yaml_alias_expansion;
 
@@ -111,7 +115,7 @@ impl ConfigMigrator {
             anyhow::bail!("Configuration file not found: {}", path);
         }
 
-        let content = std::fs::read_to_string(file_path)?;
+        let content = read_config_migration_file(file_path)?;
         let ext = file_path
             .extension()
             .and_then(|e| e.to_str())
@@ -123,6 +127,7 @@ impl ConfigMigrator {
             "json" => serde_json::from_str(&content)?,
             _ => parse_yaml_value(&content)?,
         };
+        drop(content);
 
         let from_version = value
             .get("version")
@@ -192,7 +197,7 @@ impl ConfigMigrator {
             anyhow::bail!("Configuration file not found: {}", path);
         }
 
-        let content = std::fs::read_to_string(file_path)?;
+        let content = read_config_migration_file(file_path)?;
         let ext = file_path
             .extension()
             .and_then(|e| e.to_str())
@@ -203,6 +208,7 @@ impl ConfigMigrator {
             "json" => serde_json::from_str(&content)?,
             _ => parse_yaml_value(&content)?,
         };
+        drop(content);
 
         let version = value
             .get("version")
@@ -237,6 +243,14 @@ impl ConfigMigrator {
         }
         Ok(steps)
     }
+}
+
+fn read_config_migration_file(path: &Path) -> Result<String, anyhow::Error> {
+    let options = StableFileReadOptions::new(
+        MAX_GATEWAY_CONFIG_FILE_BYTES,
+        "configuration migration file",
+    );
+    read_stable_file(path, options).map_err(|error| stable_file_error_anyhow(path, options, error))
 }
 
 fn parse_yaml_value(content: &str) -> Result<serde_json::Value, anyhow::Error> {

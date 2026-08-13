@@ -6,15 +6,13 @@
 
 use ferrum_edge::config::stable_file::MAX_GATEWAY_CONFIG_FILE_BYTES;
 use ferrum_edge::config::yaml_alias_budget::{
-    MAX_YAML_EXPANDED_BYTES, YamlAliasBudgetError, admit_yaml_alias_expansion,
+    MAX_YAML_COMPOSITION_NODES, MAX_YAML_EXPANDED_BYTES, YamlAliasBudgetError,
+    admit_yaml_alias_expansion,
 };
 
 #[test]
-fn expanded_byte_budget_is_twice_the_read_ceiling() {
-    assert_eq!(
-        MAX_YAML_EXPANDED_BYTES,
-        (MAX_GATEWAY_CONFIG_FILE_BYTES as usize).saturating_mul(2)
-    );
+fn expanded_byte_budget_matches_the_read_ceiling() {
+    assert_eq!(MAX_YAML_EXPANDED_BYTES, MAX_GATEWAY_CONFIG_FILE_BYTES as usize);
 }
 
 #[test]
@@ -48,7 +46,9 @@ fn quoted_scalars_with_anchor_spellings_are_not_aliases() {
         "plain: \"foo &bar *baz\"\n",
         "single: '&anchor'\n",
         "double: \"*alias\"\n",
-        "escaped: \"\\&not-anchor \\*not-alias\"\n",
+        "ampersand: \"&not-anchor\"\n",
+        "star: \"*not-alias\"\n",
+        "escaped: \"\\x26not-anchor \\x2Anot-alias\"\n",
     );
     admit_yaml_alias_expansion(yaml).expect("quoted &/* are scalars");
 }
@@ -101,6 +101,7 @@ fn nested_alias_bomb_fails_closed() {
             err,
             YamlAliasBudgetError::AliasReferenceLimitExceeded
                 | YamlAliasBudgetError::ExpandedByteLimitExceeded
+                | YamlAliasBudgetError::ExpandedNodeLimitExceeded
                 | YamlAliasBudgetError::WorkLimitExceeded
                 | YamlAliasBudgetError::DepthExceeded
         ),
@@ -134,6 +135,7 @@ fn flow_style_alias_bomb_fails_closed() {
             err,
             YamlAliasBudgetError::AliasReferenceLimitExceeded
                 | YamlAliasBudgetError::ExpandedByteLimitExceeded
+                | YamlAliasBudgetError::ExpandedNodeLimitExceeded
                 | YamlAliasBudgetError::WorkLimitExceeded
                 | YamlAliasBudgetError::DepthExceeded
         ),
@@ -158,4 +160,86 @@ fn alias_cycle_fails_closed_without_echoing_anchor_name() {
 fn malformed_yaml_is_left_to_serde_yaml() {
     admit_yaml_alias_expansion("proxies: [\n  not closed")
         .expect("parse failures are serde_yaml's diagnostic");
+}
+
+#[test]
+fn alias_before_later_malformation_fails_closed_and_redacted() {
+    let yaml = concat!(
+        "seed: &private-anchor confidential-value\n",
+        "copy: *private-anchor\n",
+        "broken: [unterminated-secret\n",
+    );
+    let err = admit_yaml_alias_expansion(yaml).expect_err("alias stream must fail closed");
+    assert_eq!(err, YamlAliasBudgetError::InvalidAliasDocument);
+    let rendered = err.to_string();
+    assert_eq!(
+        rendered,
+        "YAML document containing aliases is malformed or unsupported"
+    );
+    assert!(!rendered.contains("private-anchor"));
+    assert!(!rendered.contains("confidential-value"));
+    assert!(!rendered.contains("unterminated-secret"));
+}
+
+#[test]
+fn alias_in_a_multi_document_stream_fails_closed() {
+    let yaml = concat!(
+        "---\n",
+        "seed: &private-anchor value\n",
+        "copy: *private-anchor\n",
+        "---\n",
+        "second: document-secret\n",
+    );
+    let err = admit_yaml_alias_expansion(yaml).expect_err("multi-document alias stream");
+    assert_eq!(err, YamlAliasBudgetError::InvalidAliasDocument);
+    let rendered = err.to_string();
+    assert!(!rendered.contains("private-anchor"));
+    assert!(!rendered.contains("document-secret"));
+}
+
+#[test]
+fn composition_node_exhaustion_fails_before_materialization() {
+    let mut yaml = String::with_capacity(MAX_YAML_COMPOSITION_NODES * 6);
+    yaml.push_str("seed: &seed 0\ncopy: *seed\nitems:\n");
+    for _ in 0..MAX_YAML_COMPOSITION_NODES {
+        yaml.push_str("  - 0\n");
+    }
+
+    let err = admit_yaml_alias_expansion(&yaml).expect_err("composition node ceiling");
+    assert_eq!(err, YamlAliasBudgetError::CompositionNodeLimitExceeded);
+    assert_eq!(err.to_string(), "YAML document exceeds composition node limit");
+}
+
+#[test]
+fn composition_and_expansion_share_one_work_budget() {
+    // Each alias costs one composition lookup plus an alias visit and target
+    // visit during expansion. At this size no node/byte/alias cap is reached,
+    // so only cumulative (not phase-local) work accounting rejects the graph.
+    let alias_count = 400_000;
+    let mut yaml = String::with_capacity(alias_count * 8);
+    yaml.push_str("seed: &seed 0\nitems:\n");
+    for _ in 0..alias_count {
+        yaml.push_str("  - *seed\n");
+    }
+
+    let err = admit_yaml_alias_expansion(&yaml).expect_err("cumulative work ceiling");
+    assert_eq!(err, YamlAliasBudgetError::WorkLimitExceeded);
+    assert_eq!(
+        err.to_string(),
+        "YAML document exceeds admission work limit; reduce alias reuse or nesting"
+    );
+}
+
+#[test]
+fn duplicate_anchor_redefinition_matches_serde_yaml_last_definition() {
+    let yaml = concat!(
+        "first: &same one\n",
+        "before: *same\n",
+        "second: &same two\n",
+        "after: *same\n",
+    );
+    admit_yaml_alias_expansion(yaml).expect("serde_yaml accepts anchor redefinition");
+    let value: serde_yaml::Value = serde_yaml::from_str(yaml).expect("parse redefined anchor");
+    assert_eq!(value["before"].as_str(), Some("one"));
+    assert_eq!(value["after"].as_str(), Some("two"));
 }

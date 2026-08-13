@@ -135,6 +135,9 @@ pub fn read_mesh_config_document(
     } else {
         serde_json::from_str(&content).map_err(|e| anyhow::anyhow!(mesh_doc_parse_error(e)))?
     };
+    // Deserialization owns all retained fields; do not keep the source buffer
+    // alive while slice materialization allocates its runtime structures.
+    drop(content);
 
     if let Some(version) = document.version.as_deref()
         && version != CURRENT_CONFIG_VERSION

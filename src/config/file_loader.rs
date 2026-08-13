@@ -173,6 +173,9 @@ pub fn load_config_from_file(
     } else {
         (serde_json::from_str(&content)?, None)
     };
+    // The parsed trees own every retained value; release the bounded source
+    // buffer before migration/validation allocates any additional structures.
+    drop(content);
 
     // Optional file-mode integrity seal. Strip before GatewayConfig
     // deserialization so deny_unknown_fields stays authoritative for the
