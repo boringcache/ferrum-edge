@@ -100,21 +100,23 @@ pub mod _test_support {
     use crate::plugins::Plugin;
 
     /// Parse-only URI authority and Host header a Unix WebSocket handshake uses.
-    /// The URI authority is always the trusted backend URL; Host follows
-    /// `preserve_host_header` only for a valid client authority.
+    ///
+    /// Returns `None` when the target-effective backend URL is malformed,
+    /// authority-less, or unsafe. The URI authority is always that trusted
+    /// backend URL; Host follows `preserve_host_header` only for a valid client
+    /// authority, returned in validated form (surrounding whitespace stripped).
     pub fn unix_websocket_handshake_authorities_for_test(
         preserve_host_header: bool,
         client_host: Option<&str>,
         backend_url: &str,
-    ) -> (String, String) {
-        (
-            crate::proxy::unix_websocket_url_authority(backend_url),
-            crate::proxy::unix_websocket_backend_authority(
-                preserve_host_header,
-                client_host,
-                backend_url,
-            ),
-        )
+    ) -> Option<(String, String)> {
+        let url_authority = crate::proxy::unix_websocket_url_authority(backend_url)?;
+        let host = crate::proxy::unix_websocket_backend_host(
+            preserve_host_header,
+            client_host,
+            &url_authority,
+        );
+        Some((url_authority, host.into_owned()))
     }
 
     /// Release an xDS node permit through the production last-stream cleanup
