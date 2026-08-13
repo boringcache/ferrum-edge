@@ -1004,10 +1004,9 @@ impl HmacAuth {
 
     /// Validate that the Date header is within the allowed clock skew window.
     ///
-    /// This enforces a bounded freshness window (`now ± clock_skew_seconds`),
-    /// not single-use replay prevention — there is no nonce store, so a
-    /// captured valid request can be replayed within the window. See the
-    /// module-level "Replay protection (limitation)" note.
+    /// This enforces only the bounded freshness window
+    /// (`now ± clock_skew_seconds`). Version 2 separately claims its nonce for
+    /// single use; explicitly acknowledged version 1 has no replay store.
     fn validate_date(&self, date_str: &str) -> bool {
         if date_str.is_empty() {
             // No Date header means no freshness bound at all — reject.
@@ -1016,21 +1015,29 @@ impl HmacAuth {
 
         // Parse HTTP-date format (RFC 7231): "Sun, 06 Nov 1994 08:49:37 GMT"
         if let Ok(parsed) = chrono::DateTime::parse_from_rfc2822(date_str) {
-            let now = chrono::Utc::now();
-            let diff = (now - parsed.with_timezone(&chrono::Utc))
-                .num_seconds()
-                .unsigned_abs();
-            diff <= self.clock_skew_seconds
+            Self::timestamps_within_clock_skew(
+                chrono::Utc::now().timestamp(),
+                parsed.timestamp(),
+                self.clock_skew_seconds,
+            )
         } else if let Ok(parsed) = chrono::DateTime::parse_from_rfc3339(date_str) {
-            let now = chrono::Utc::now();
-            let diff = (now - parsed.with_timezone(&chrono::Utc))
-                .num_seconds()
-                .unsigned_abs();
-            diff <= self.clock_skew_seconds
+            Self::timestamps_within_clock_skew(
+                chrono::Utc::now().timestamp(),
+                parsed.timestamp(),
+                self.clock_skew_seconds,
+            )
         } else {
             warn!("hmac_auth: unparseable Date header: {}", date_str);
             false
         }
+    }
+
+    /// Compare whole-second timestamps so the freshness horizon is exactly
+    /// bounded by `clock_skew_seconds`. Truncating a signed duration would
+    /// otherwise admit nearly one extra second at both ends of the window,
+    /// outliving the fixed replay-marker retention contract.
+    fn timestamps_within_clock_skew(now: i64, signed: i64, clock_skew_seconds: u64) -> bool {
+        now.saturating_sub(signed).unsigned_abs() <= clock_skew_seconds
     }
 
     /// Verify that the `Digest:` header value matches the SHA-256/SHA-512 of
@@ -1813,5 +1820,33 @@ mod tests {
         let b64 = base64::engine::general_purpose::STANDARD.encode(hasher.finalize());
         let digest = format!("sha-256=:{}:", b64);
         assert!(HmacAuth::verify_body_digest(&digest, body));
+    }
+
+    #[test]
+    fn timestamp_freshness_has_exact_whole_second_boundaries() {
+        const SKEW: u64 = 300;
+        const NOW: i64 = 1_800_000_000;
+
+        assert!(HmacAuth::timestamps_within_clock_skew(NOW, NOW, SKEW));
+        assert!(HmacAuth::timestamps_within_clock_skew(
+            NOW,
+            NOW - SKEW as i64,
+            SKEW
+        ));
+        assert!(HmacAuth::timestamps_within_clock_skew(
+            NOW,
+            NOW + SKEW as i64,
+            SKEW
+        ));
+        assert!(!HmacAuth::timestamps_within_clock_skew(
+            NOW,
+            NOW - SKEW as i64 - 1,
+            SKEW
+        ));
+        assert!(!HmacAuth::timestamps_within_clock_skew(
+            NOW,
+            NOW + SKEW as i64 + 1,
+            SKEW
+        ));
     }
 }
