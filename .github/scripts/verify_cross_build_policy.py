@@ -2459,6 +2459,77 @@ LIVE_SUITE_RELEVANCE_CONTRACTS = {
     ),
 }
 
+# The Ambient Host UDP required check is security-sensitive beyond relevance:
+# freeze the privileged kernel test step and the final required-check job so a
+# pull request cannot replace execution with a no-op or report a false success.
+AMBIENT_HOST_UDP_LIVE_STEP = r"""      - name: Run ambient host-UDP live gate as root
+        env:
+          FERRUM_LIVE_TESTS_REQUIRED: "1"
+          FERRUM_HOST_UDP_LIB_TEST_BIN: ${{ steps.build_test_bin.outputs.lib_test_bin }}
+          FERRUM_HOST_UDP_FUNCTIONAL_TEST_BIN: ${{ steps.build_test_bin.outputs.functional_test_bin }}
+          FERRUM_HOST_UDP_LIVE_RESULTS: ${{ github.workspace }}/target/ambient-host-udp-live
+        run: |
+          set -euo pipefail
+          # Explicit hosted disposable outer network-namespace boundary (#3804).
+          # Composes with PR #3800: the trusted relevance / `changes` job above
+          # is untouched; only this live execution step is wrapped. run.sh also
+          # creates its own proven disposable outer netns for every ordinary
+          # root execution (including ad-hoc), so isolation does not depend on
+          # a forgeable environment flag.
+          sudo -E unshare --net -- bash -c '
+            set -euo pipefail
+            ip link set lo up
+            if [[ -w /proc/sys/net/ipv6/conf/all/disable_ipv6 ]]; then
+              printf 0 > /proc/sys/net/ipv6/conf/all/disable_ipv6 || true
+            fi
+            ip -6 link set lo up 2>/dev/null || true
+            exec "$1"
+          ' bash tests/k8s/ambient_host_udp_live/run.sh
+"""
+AMBIENT_HOST_UDP_GATE_JOB = r"""  gate:
+    name: Ambient Host UDP Live
+    needs:
+      - changes
+      - ambient-host-udp-live
+      - ambient-host-udp-image
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Summarize ambient host-UDP live result
+        run: |
+          {
+            echo "## Ambient Host UDP Live"
+            echo ""
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          if [ "${{ needs.changes.result }}" != "success" ]; then
+            echo "Failed before change detection completed." >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
+
+          if [ "${{ needs.changes.outputs.relevant }}" = "false" ]; then
+            echo "Skipped live-kernel validation: no ambient host-UDP capture, mesh UDP, fixture, documentation, or CI workflow surfaces changed." >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+
+          if [ "${{ needs.changes.outputs.relevant }}" != "true" ]; then
+            echo "Change detection returned an invalid relevance result: ${{ needs.changes.outputs.relevant }}." >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
+
+          if [ "${{ needs.ambient-host-udp-live.result }}" != "success" ]; then
+            echo "Live-kernel validation failed or did not complete: ${{ needs.ambient-host-udp-live.result }}." >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
+
+          if [ "${{ needs.ambient-host-udp-image.result }}" != "success" ]; then
+            echo "Production image contract failed or did not complete: ${{ needs.ambient-host-udp-image.result }}." >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
+
+          echo "Live-kernel validation and production image contract passed." >> "$GITHUB_STEP_SUMMARY"
+"""
+
 # Freezing the relevance job alone is not sufficient. A pull request that left
 # the frozen block untouched but rewrote the live job's `needs`/`if` would skip
 # the expensive job just as effectively, so the binding from the trusted
@@ -10441,6 +10512,34 @@ def live_suite_relevance_errors(
                     f"{located} job {live_job!r} must keep {field!r} bound to the "
                     "trusted relevance output; rewriting it skips the live job just "
                     "as effectively as tampering with the relevance decision"
+                )
+
+        if name == "ambient-host-udp-live.yml":
+            actual_step, step_failures = extract_job_step_block(
+                contents,
+                located,
+                live_job,
+                "Run ambient host-UDP live gate as root",
+                required=True,
+            )
+            errors.extend(step_failures)
+            if not step_failures and actual_step != AMBIENT_HOST_UDP_LIVE_STEP:
+                errors.append(
+                    f"{located} must keep the privileged ambient host-UDP live "
+                    "execution step exactly frozen"
+                )
+
+            actual_gate, gate_failures = extract_job_block(
+                contents,
+                located,
+                "gate",
+                required=True,
+            )
+            errors.extend(gate_failures)
+            if not gate_failures and actual_gate != AMBIENT_HOST_UDP_GATE_JOB:
+                errors.append(
+                    f"{located} must keep the Ambient Host UDP Live final gate "
+                    "exactly frozen"
                 )
     return errors
 
@@ -24522,6 +24621,16 @@ pre_build = []
         )
 
     def relevance_workflow(display: str, live_job: str, body: str) -> str:
+        live_step = (
+            AMBIENT_HOST_UDP_LIVE_STEP
+            if live_job == "ambient-host-udp-live"
+            else "      - run: echo live\n"
+        )
+        final_gate = (
+            "\n" + AMBIENT_HOST_UDP_GATE_JOB
+            if live_job == "ambient-host-udp-live"
+            else ""
+        )
         return (
             "name: Self-test live suite\n"
             "on:\n"
@@ -24537,7 +24646,8 @@ pre_build = []
             + "    if: needs.changes.outputs.relevant == 'true'\n"
             + "    runs-on: ubuntu-latest\n"
             + "    steps:\n"
-            + "      - run: echo live\n"
+            + live_step
+            + final_gate
         )
 
     relevance_workflows = {
@@ -24617,6 +24727,20 @@ pre_build = []
     }
     if not live_suite_relevance_errors(renamed_relevance, "self-test workflows"):
         failures.append("a renamed relevance job was not rejected")
+
+    ambient_noop = dict(relevance_workflows)
+    ambient_noop["ambient-host-udp-live.yml"] = ambient_noop[
+        "ambient-host-udp-live.yml"
+    ].replace('            exec "$1"\n', "            true\n", 1)
+    if not live_suite_relevance_errors(ambient_noop, "self-test workflows"):
+        failures.append("a no-op ambient host-UDP live command was not rejected")
+
+    ambient_without_gate = dict(relevance_workflows)
+    ambient_without_gate["ambient-host-udp-live.yml"] = ambient_without_gate[
+        "ambient-host-udp-live.yml"
+    ].replace("\n" + AMBIENT_HOST_UDP_GATE_JOB, "", 1)
+    if not live_suite_relevance_errors(ambient_without_gate, "self-test workflows"):
+        failures.append("a deleted Ambient Host UDP Live final gate was not rejected")
 
     # The relevance contract has to be enforced by the *collection* entry
     # points, not only by `live_suite_relevance_errors` in isolation. The
