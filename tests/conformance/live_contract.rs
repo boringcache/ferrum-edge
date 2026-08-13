@@ -1147,13 +1147,16 @@ record_native_negative sidecar.config.native_subscribe_tls_wrong_san_rejected \
   native-wrong-san 'tls-name|tls-verify|tls-handshake' || failed=true
 stale_class="$(wait_for_native_probe_class native-stale-client 'tls-handshake|tls-verify')"
 "#;
-    let broad_violations = native_mtls_negative_control_contract_violations(broad_negative_proof, HELPER);
+    let broad_violations =
+        native_mtls_negative_control_contract_violations(broad_negative_proof, HELPER);
     assert!(
         !broad_violations.is_empty(),
         "contract must reject broad native negative TLS class alternation"
     );
     assert!(
-        broad_violations.iter().any(|error| error.contains("broad native negative TLS")),
+        broad_violations
+            .iter()
+            .any(|error| error.contains("broad native negative TLS")),
         "broad-pattern rejection must name the alternation, got {broad_violations:?}"
     );
 
@@ -1191,11 +1194,8 @@ get pod -l "app=${deploy}"
 "#;
     let helper_no_slice =
         HELPER.replace("slice-accepted-overrides-cp-reject", "removed-slice-guard");
-    let no_slice_violations = native_probe_classifier_contract_violations(
-        no_slice_guard,
-        &helper_no_slice,
-        MANIFESTS,
-    );
+    let no_slice_violations =
+        native_probe_classifier_contract_violations(no_slice_guard, &helper_no_slice, MANIFESTS);
     assert!(
         no_slice_violations
             .iter()
