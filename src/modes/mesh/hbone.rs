@@ -554,7 +554,9 @@ pub fn filter_baggage_header_with_static_prefixes(
         if configured_prefixes
             .iter()
             .any(|prefix| key.starts_with(prefix.as_str()))
-            || static_prefixes.iter().any(|prefix| key.starts_with(*prefix))
+            || static_prefixes
+                .iter()
+                .any(|prefix| key.starts_with(*prefix))
         {
             continue;
         }

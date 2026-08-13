@@ -3429,10 +3429,9 @@ fn identity_spoof_baggage_headers() -> HashMap<String, String> {
 async fn native_grpc_hbone_asserts_authenticated_frontend_identity_not_caller_headers() {
     let pools = TransportTestPools::new();
     let target = same_cluster_hbone_target();
-    let frontend = ferrum_edge::identity::SpiffeId::new(
-        "spiffe://cluster.local/ns/src/sa/frontend",
-    )
-    .expect("valid frontend SPIFFE");
+    let frontend =
+        ferrum_edge::identity::SpiffeId::new("spiffe://cluster.local/ns/src/sa/frontend")
+            .expect("valid frontend SPIFFE");
     let transport = pools
         .resolve_with_hbone_context(Some(&target), Some(&frontend), &[])
         .expect("same-cluster mesh.hbone must resolve");
@@ -3441,7 +3440,9 @@ async fn native_grpc_hbone_asserts_authenticated_frontend_identity_not_caller_he
     let expected = frontend.as_str().to_string();
     drop(frontend);
     assert_eq!(
-        transport.asserted_source_identity().map(ferrum_edge::identity::SpiffeId::as_str),
+        transport
+            .asserted_source_identity()
+            .map(ferrum_edge::identity::SpiffeId::as_str),
         Some(expected.as_str()),
         "HBONE must keep the authenticated frontend identity after the input borrow ends"
     );
@@ -3484,10 +3485,9 @@ async fn native_grpc_hbone_strips_configured_and_reserved_baggage_once_per_dispa
 #[tokio::test]
 async fn native_grpc_direct_transport_preserves_baggage_and_does_not_assert_identity() {
     let pools = TransportTestPools::new();
-    let frontend = ferrum_edge::identity::SpiffeId::new(
-        "spiffe://cluster.local/ns/src/sa/frontend",
-    )
-    .expect("valid frontend SPIFFE");
+    let frontend =
+        ferrum_edge::identity::SpiffeId::new("spiffe://cluster.local/ns/src/sa/frontend")
+            .expect("valid frontend SPIFFE");
     let prefixes = ["custom.".to_string()];
     let headers = identity_spoof_baggage_headers();
 
@@ -3515,10 +3515,9 @@ async fn native_grpc_direct_transport_preserves_baggage_and_does_not_assert_iden
 #[tokio::test]
 async fn native_grpc_mesh_mtls_strips_identity_and_configured_baggage_without_hbone_identity() {
     let pools = TransportTestPools::new();
-    let frontend = ferrum_edge::identity::SpiffeId::new(
-        "spiffe://cluster.local/ns/src/sa/frontend",
-    )
-    .expect("valid frontend SPIFFE");
+    let frontend =
+        ferrum_edge::identity::SpiffeId::new("spiffe://cluster.local/ns/src/sa/frontend")
+            .expect("valid frontend SPIFFE");
     let prefixes = ["custom.".to_string()];
     let headers = identity_spoof_baggage_headers();
     let mtls_target = same_cluster_mesh_mtls_target();
