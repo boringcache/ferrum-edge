@@ -133,7 +133,7 @@ fn h3_websocket_relay_rejects_impossible_unix_handshake_without_dispatch() {
         .expect("h3_websocket relay must include Unix arm for exhaustiveness");
     let unix_slice = &relay_block[unix_arm..];
     assert!(
-        unix_slice.contains("let handshake = *handshake"),
+        unix_slice.contains("let _handshake = *handshake"),
         "impossible Unix relay arm must own the handshake so its private lease drops at arm end"
     );
     assert!(

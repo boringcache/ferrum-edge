@@ -80,6 +80,8 @@ fn rr_upstream(targets: Vec<UpstreamTarget>) -> Upstream {
         resolved_subset_tls: HashMap::new(),
         dispatch_port_override_fallback: None,
         api_spec_id: None,
+        k8s_service_uid: None,
+        pending_limit_scope: None,
         created_at: now,
         updated_at: now,
     }

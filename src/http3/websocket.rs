@@ -1710,7 +1710,7 @@ pub(crate) async fn handle_h3_websocket(
         // weakening that gate or frame-relaying an admitted socket.
         #[cfg(unix)]
         crate::proxy::WsBackendHandshake::Unix(handshake) => {
-            let handshake = *handshake;
+            let _handshake = *handshake;
             warn!(
                 proxy_id = %proxy_id_for_relay,
                 "H3 WebSocket: refusing Unix socket backend relay (no H3 Unix dialer)"
