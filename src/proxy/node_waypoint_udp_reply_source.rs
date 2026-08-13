@@ -51,8 +51,9 @@
 //!   directory of one file per claim could be — and, on the 250 ms node-agent
 //!   poll, regularly would be — observed mid-rewrite as a partial set.
 //! * `applied` — written ONLY by the node-agent, and only after the COMPLETE
-//!   IPv4 + IPv6 set of that exact generation is live in both BPF maps. It names
-//!   the generation it applied and nothing else.
+//!   IPv4 + IPv6 set of that exact generation is in both BPF maps and their one
+//!   shared classifier gate is enabled. It names that generation and nothing
+//!   else. Map keys are inert while the gate is disabled.
 //!
 //! A generation is `(owner, sequence)`. The owner is a per-process random token
 //! (16 lowercase hex digits, [`RegistryDirReplySourcePublisher::new`]) and the

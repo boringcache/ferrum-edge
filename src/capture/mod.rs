@@ -416,16 +416,56 @@ fn node_waypoint_udp_steer_teardown_for_family(binary: &str, ipv6: bool) -> Vec<
     let table = NODE_WAYPOINT_UDP_STEER_TABLE;
     let notrack = NODE_WAYPOINT_UDP_STEER_NOTRACK_CHAIN;
     let steer = NODE_WAYPOINT_UDP_STEER_CHAIN;
-    let wait = XTABLES_LOCK_WAIT_SECONDS;
+    let mark_arg =
+        format!("0x{NODE_WAYPOINT_UDP_STEER_MARK:x}/0x{NODE_WAYPOINT_UDP_STEER_MARK_MASK:x}");
+    let rule_pattern = format!("fwmark {mark_arg} lookup {table}");
+    let rule_pattern_without_mask =
+        format!("fwmark 0x{NODE_WAYPOINT_UDP_STEER_MARK:x} lookup {table}");
+    let route_pattern = local_route
+        .strip_prefix("local ")
+        .and_then(|route| route.strip_suffix(" dev lo"))
+        .unwrap_or(local_route);
     vec![
-        format!("{binary} -t mangle -w {wait} -D PREROUTING -p udp -j {steer} 2>/dev/null || true"),
-        format!("{binary} -t mangle -w {wait} -F {steer} 2>/dev/null || true"),
-        format!("{binary} -t mangle -w {wait} -X {steer} 2>/dev/null || true"),
-        format!("{binary} -t raw -w {wait} -D PREROUTING -p udp -j {notrack} 2>/dev/null || true"),
-        format!("{binary} -t raw -w {wait} -F {notrack} 2>/dev/null || true"),
-        format!("{binary} -t raw -w {wait} -X {notrack} 2>/dev/null || true"),
-        format!("{ip} rule del priority {priority} lookup {table} 2>/dev/null || true"),
-        format!("{ip} route del {local_route} table {table} 2>/dev/null || true"),
+        // STOP MARKING FIRST, then remove the now-unreferenced chain.
+        format!(
+            "ferrum_delete_xtables_rule {binary} mangle PREROUTING -p udp -j {steer}"
+        ),
+        format!("ferrum_delete_xtables_chain {binary} mangle {steer}"),
+        // Then stop bypassing conntrack and remove its chain.
+        format!(
+            "ferrum_delete_xtables_rule {binary} raw PREROUTING -p udp -j {notrack}"
+        ),
+        format!("ferrum_delete_xtables_chain {binary} raw {notrack}"),
+        // Routing comes last. Inspect first so only genuine absence is an
+        // idempotent success; a failed delete is never reclassified as absent.
+        format!(
+            "ferrum_rule_state=\"$({ip} -o rule show priority {priority})\"\n\
+             case \"$ferrum_rule_state\" in\n\
+               *'{rule_pattern}'*|*'{rule_pattern_without_mask}'*) {ip} rule del priority {priority} fwmark {mark_arg} lookup {table} ;;\n\
+             esac\n\
+             ferrum_rule_state=\"$({ip} -o rule show priority {priority})\"\n\
+             case \"$ferrum_rule_state\" in\n\
+               *'{rule_pattern}'*|*'{rule_pattern_without_mask}'*)\n\
+                 echo 'Ferrum NodeWaypoint UDP steering rule remains after deletion' >&2\n\
+                 exit 1\n\
+                 ;;\n\
+             esac"
+        ),
+        format!(
+            "ferrum_route_state=\"$({ip} route show table {table} type local)\"\n\
+             case \"$ferrum_route_state\" in\n\
+               *'local {route_pattern} dev lo'*)\n\
+                 {ip} route del {local_route} table {table}\n\
+                 ;;\n\
+             esac\n\
+             ferrum_route_state=\"$({ip} route show table {table} type local)\"\n\
+             case \"$ferrum_route_state\" in\n\
+               *'local {route_pattern} dev lo'*)\n\
+                 echo 'Ferrum NodeWaypoint UDP steering route remains after deletion' >&2\n\
+                 exit 1\n\
+                 ;;\n\
+             esac"
+        ),
     ]
 }
 
@@ -496,18 +536,71 @@ pub fn node_waypoint_udp_steer_setup_script(
     Ok(Some(format!("set -e\n{}", chunks.join("\n"))))
 }
 
-/// The NodeWaypoint UDP Service-steering teardown script. Best-effort
-/// throughout: it runs on shutdown, on every unsuccessful setup, and before the
-/// first setup to reap a previous generation, where a missing object is the
-/// expected outcome.
+/// The NodeWaypoint UDP Service-steering teardown script.
+///
+/// Exact-name and idempotent, but strict: a genuinely absent Ferrum-owned
+/// object succeeds, while inspection, permission, resource, delete, and
+/// post-delete verification failures stay nonzero. Both address-family tools
+/// are mandatory because a predecessor may have left state in a family the
+/// current generation does not publish.
 pub fn node_waypoint_udp_steer_teardown_script() -> String {
-    let mut chunks =
-        vec![node_waypoint_udp_steer_teardown_for_family("iptables", false).join("\n")];
-    chunks.push(format!(
-        "if command -v ip6tables >/dev/null 2>&1; then\n  {}\nfi",
-        node_waypoint_udp_steer_teardown_for_family("ip6tables", true).join("\n  ")
-    ));
-    chunks.join("\n")
+    let helpers = format!(
+        "set -e\n\
+         command -v iptables >/dev/null 2>&1 || {{ echo 'iptables is required to reap NodeWaypoint UDP steering' >&2; exit 1; }}\n\
+         command -v ip6tables >/dev/null 2>&1 || {{ echo 'ip6tables is required to reap NodeWaypoint UDP steering' >&2; exit 1; }}\n\
+         command -v ip >/dev/null 2>&1 || {{ echo 'iproute2 (ip) is required to reap NodeWaypoint UDP steering' >&2; exit 1; }}\n\
+         ferrum_delete_xtables_rule() {{\n\
+           ferrum_binary=\"$1\"; ferrum_table=\"$2\"; shift 2\n\
+           if \"$ferrum_binary\" -t \"$ferrum_table\" -w {XTABLES_LOCK_WAIT_SECONDS} -C \"$@\"; then\n\
+             \"$ferrum_binary\" -t \"$ferrum_table\" -w {XTABLES_LOCK_WAIT_SECONDS} -D \"$@\"\n\
+           else\n\
+             ferrum_status=$?\n\
+             if [ \"$ferrum_status\" -ne 1 ]; then\n\
+               echo 'Ferrum NodeWaypoint UDP steering rule inspection failed' >&2\n\
+               return \"$ferrum_status\"\n\
+             fi\n\
+           fi\n\
+           if \"$ferrum_binary\" -t \"$ferrum_table\" -w {XTABLES_LOCK_WAIT_SECONDS} -C \"$@\"; then\n\
+             echo 'Ferrum NodeWaypoint UDP steering jump remains after deletion' >&2\n\
+             return 1\n\
+           else\n\
+             ferrum_status=$?\n\
+             if [ \"$ferrum_status\" -ne 1 ]; then\n\
+               echo 'Ferrum NodeWaypoint UDP steering rule verification failed' >&2\n\
+               return \"$ferrum_status\"\n\
+             fi\n\
+           fi\n\
+         }}\n\
+         ferrum_delete_xtables_chain() {{\n\
+           ferrum_binary=\"$1\"; ferrum_table=\"$2\"; ferrum_chain=\"$3\"\n\
+           if \"$ferrum_binary\" -t \"$ferrum_table\" -w {XTABLES_LOCK_WAIT_SECONDS} -S \"$ferrum_chain\" >/dev/null; then\n\
+             \"$ferrum_binary\" -t \"$ferrum_table\" -w {XTABLES_LOCK_WAIT_SECONDS} -F \"$ferrum_chain\"\n\
+             \"$ferrum_binary\" -t \"$ferrum_table\" -w {XTABLES_LOCK_WAIT_SECONDS} -X \"$ferrum_chain\"\n\
+           else\n\
+             ferrum_status=$?\n\
+             if [ \"$ferrum_status\" -ne 1 ]; then\n\
+               echo 'Ferrum NodeWaypoint UDP steering chain inspection failed' >&2\n\
+               return \"$ferrum_status\"\n\
+             fi\n\
+           fi\n\
+           if \"$ferrum_binary\" -t \"$ferrum_table\" -w {XTABLES_LOCK_WAIT_SECONDS} -S \"$ferrum_chain\" >/dev/null; then\n\
+             echo 'Ferrum NodeWaypoint UDP steering chain remains after deletion' >&2\n\
+             return 1\n\
+           else\n\
+             ferrum_status=$?\n\
+             if [ \"$ferrum_status\" -ne 1 ]; then\n\
+               echo 'Ferrum NodeWaypoint UDP steering chain verification failed' >&2\n\
+               return \"$ferrum_status\"\n\
+             fi\n\
+           fi\n\
+         }}"
+    );
+    [
+        helpers,
+        node_waypoint_udp_steer_teardown_for_family("iptables", false).join("\n"),
+        node_waypoint_udp_steer_teardown_for_family("ip6tables", true).join("\n"),
+    ]
+    .join("\n")
 }
 
 /// Istio-compatible `includeOutboundPorts` annotation. The injector and the

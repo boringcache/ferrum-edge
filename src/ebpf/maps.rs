@@ -13,11 +13,12 @@ use aya::Ebpf;
 #[cfg(all(feature = "ebpf", target_os = "linux"))]
 use aya::maps::lpm_trie::Key as LpmKey;
 #[cfg(all(feature = "ebpf", target_os = "linux"))]
-use aya::maps::{HashMap as BpfHashMap, LpmTrie, MapData};
+use aya::maps::{Array as BpfArray, HashMap as BpfHashMap, LpmTrie, MapData};
 #[cfg(all(feature = "ebpf", target_os = "linux"))]
 use ferrum_ebpf_common::{
     BpfCaptureConfig, FERRUM_CAPTURE_CONFIG_KEY, InboundRedirectKey4, InboundRedirectKey6,
     IncludePortsPolicy, NodeProbePortKey4, NodeProbePortKey6, PodInfo as BpfPodInfo,
+    UDP_REPLY_SOURCE_GATE_DISABLED, UDP_REPLY_SOURCE_GATE_ENABLED, UDP_REPLY_SOURCE_GATE_KEY,
     UDP_REPLY_SOURCE_MAX_ENTRIES, UdpReplySourceKey4, UdpReplySourceKey6, WorkloadIdentity,
 };
 use ferrum_ebpf_common::{CidrKey4, CidrKey6};
@@ -26,8 +27,8 @@ use ferrum_ebpf_common::{CidrKey4, CidrKey6};
 use super::{
     BPF_MAP_CAPTURE_CONFIG, BPF_MAP_NODE_IPS, BPF_MAP_NODE_IPS6, BPF_MAP_NODE_PROBE_PORTS,
     BPF_MAP_NODE_PROBE_PORTS6, BPF_MAP_POD_INBOUND_PORTS, BPF_MAP_POD_INBOUND_PORTS6,
-    BPF_MAP_POD_IPS6, BPF_MAP_UDP_REPLY_SOURCES, BPF_MAP_UDP_REPLY_SOURCES6,
-    BPF_MAP_WORKLOAD_IDENTITY, PodInfo,
+    BPF_MAP_POD_IPS6, BPF_MAP_UDP_REPLY_SOURCE_GATE, BPF_MAP_UDP_REPLY_SOURCES,
+    BPF_MAP_UDP_REPLY_SOURCES6, BPF_MAP_WORKLOAD_IDENTITY, PodInfo,
 };
 
 #[cfg(all(feature = "ebpf", target_os = "linux"))]
@@ -42,6 +43,7 @@ pub struct BpfMaps {
     pod_inbound_ports6: Option<BpfHashMap<MapData, InboundRedirectKey6, u8>>,
     udp_reply_sources: Option<BpfHashMap<MapData, UdpReplySourceKey4, u8>>,
     udp_reply_sources6: Option<BpfHashMap<MapData, UdpReplySourceKey6, u8>>,
+    udp_reply_source_gate: Option<BpfArray<MapData, u8>>,
     bypass_uids: BpfHashMap<MapData, u32, u8>,
     cidr_exclude4: LpmTrie<MapData, CidrKey4, u8>,
     cidr_exclude6: LpmTrie<MapData, CidrKey6, u8>,
@@ -182,6 +184,19 @@ impl BpfMaps {
             }
         };
 
+        let udp_reply_source_gate = match bpf.take_map(BPF_MAP_UDP_REPLY_SOURCE_GATE) {
+            Some(map) => Some(
+                BpfArray::try_from(map)
+                    .map_err(|e| format!("FERRUM_UDP_REPLY_SOURCE_GATE type mismatch: {e}"))?,
+            ),
+            None => {
+                tracing::warn!(
+                    "FERRUM_UDP_REPLY_SOURCE_GATE map not found; startup readiness will reject node-waypoint eBPF capture before reporting ready"
+                );
+                None
+            }
+        };
+
         let bypass_uids = BpfHashMap::try_from(
             bpf.take_map("FERRUM_BYPASS_UIDS")
                 .ok_or("FERRUM_BYPASS_UIDS map not found")?,
@@ -278,6 +293,7 @@ impl BpfMaps {
             pod_inbound_ports6,
             udp_reply_sources,
             udp_reply_sources6,
+            udp_reply_source_gate,
             bypass_uids,
             cidr_exclude4,
             cidr_exclude6,
@@ -327,6 +343,9 @@ impl BpfMaps {
         }
         if require_workload_identity && self.udp_reply_sources6.is_none() {
             missing.push(BPF_MAP_UDP_REPLY_SOURCES6);
+        }
+        if require_workload_identity && self.udp_reply_source_gate.is_none() {
+            missing.push(BPF_MAP_UDP_REPLY_SOURCE_GATE);
         }
         if missing.is_empty() {
             return Ok(());
@@ -536,13 +555,44 @@ impl BpfMaps {
         Ok(())
     }
 
-    /// Replace the whole NodeWaypoint UDP/DTLS reply-source authorization set
-    /// with exactly `sources` (issue #3286). An empty slice revokes everything.
+    /// Open or close the shared BPF-visible reply-source gate. Both classifier
+    /// families read this one value before consulting either family map.
+    pub fn set_udp_reply_sources_enabled(&mut self, enabled: bool) -> Result<(), String> {
+        let Some(gate) = self.udp_reply_source_gate.as_mut() else {
+            return Err(format!(
+                "{BPF_MAP_UDP_REPLY_SOURCE_GATE} map is absent; NodeWaypoint UDP/DTLS reply-source authorization cannot be fenced"
+            ));
+        };
+        let value = if enabled {
+            UDP_REPLY_SOURCE_GATE_ENABLED
+        } else {
+            UDP_REPLY_SOURCE_GATE_DISABLED
+        };
+        gate.set(UDP_REPLY_SOURCE_GATE_KEY, value, 0).map_err(|e| {
+            format!(
+                "Failed to {} NodeWaypoint UDP/DTLS reply-source authorization gate: {e}",
+                if enabled { "enable" } else { "disable" }
+            )
+        })
+    }
+
+    /// Close the gate during backend teardown when this ELF carries it. A
+    /// missing gate is already inert and is rejected separately by NodeWaypoint
+    /// readiness; local-pod cleanup must still support an older irrelevant ELF.
+    pub fn disable_udp_reply_sources_for_cleanup(&mut self) -> Result<(), String> {
+        if self.udp_reply_source_gate.is_none() {
+            return Ok(());
+        }
+        self.set_udp_reply_sources_enabled(false)
+    }
+
+    /// Replace both NodeWaypoint UDP/DTLS reply-source map contents with
+    /// exactly `sources` (issue #3286). The caller closes the shared gate first,
+    /// so every intermediate or failed map state remains inert.
     ///
-    /// **Stale entries are removed before new ones are inserted**, in both
-    /// families, so any partial failure can only ever leave FEWER addresses
-    /// authorized than intended. The reverse order would let a failed insert
-    /// return an error while a revoked ClusterIP stayed live.
+    /// **Stale entries are removed before new ones are inserted**, but this is
+    /// not itself a coherence guarantee: a scan/remove/family failure can leave
+    /// stale entries behind. The shared gate is the authorization boundary.
     ///
     /// **BOTH families must be present for every generation**, even when the
     /// complete desired set (or one family's share of it) is empty: the caller
@@ -756,8 +806,8 @@ where
             stale.push(key);
         }
     }
-    // Revoke first. A failure here aborts before anything new is authorized, so
-    // the map can only ever be narrower than intended, never wider.
+    // Revoke first to minimize stale contents. The shared gate, not this
+    // ordering, supplies fail-closed coherence across partial failures.
     for key in stale {
         tolerate_missing_map_remove(map.remove(&key), || format!("a withdrawn {map_name} entry"))?;
     }

@@ -4,7 +4,7 @@
 //! across program reloads and can be read by the proxy.
 
 use aya_ebpf::macros::map;
-use aya_ebpf::maps::{HashMap, LpmTrie, LruHashMap, PerCpuArray, RingBuf, SockHash};
+use aya_ebpf::maps::{Array, HashMap, LpmTrie, LruHashMap, PerCpuArray, RingBuf, SockHash};
 use ferrum_ebpf_common::{
     AcceptFirstByteState, BpfCaptureConfig, CidrKey4, CidrKey6, ConnTuple4, ConnTuple6,
     InboundRedirectKey4, InboundRedirectKey6, IncludePortsPolicy, NodeProbePortKey4,
@@ -129,6 +129,12 @@ pub static FERRUM_UDP_REPLY_SOURCES: HashMap<UdpReplySourceKey4, u8> =
 #[map]
 pub static FERRUM_UDP_REPLY_SOURCES6: HashMap<UdpReplySourceKey6, u8> =
     HashMap::with_max_entries(UDP_REPLY_SOURCE_MAX_ENTRIES, 0);
+
+/// Shared fail-closed generation gate for both reply-source map families.
+/// Array values initialize to zero (disabled); userspace opens key zero only
+/// after both family maps contain one exact, revalidated generation.
+#[map]
+pub static FERRUM_UDP_REPLY_SOURCE_GATE: Array<u8> = Array::with_max_entries(1, 0);
 
 /// UIDs exempt from outbound capture (proxy UID 1337).
 /// Connect hooks skip rewrite when the calling process matches.

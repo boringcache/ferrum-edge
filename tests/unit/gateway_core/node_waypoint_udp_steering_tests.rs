@@ -76,7 +76,7 @@ fn destination(ip: &str, port: u16) -> NodeWaypointUdpSteerDestination {
 }
 
 fn is_teardown(script: &str) -> bool {
-    script.contains("-D PREROUTING")
+    script.contains("ferrum_delete_xtables_rule")
 }
 
 /// A `Drop` on `NodeWaypointUdpSteering` runs one final teardown, which would
@@ -240,6 +240,50 @@ fn line_index(script: &str, predicate: impl Fn(&str) -> bool) -> usize {
         .lines()
         .position(predicate)
         .unwrap_or_else(|| panic!("expected line not found in script:\n{script}"))
+}
+
+/// Production teardown must not turn tool, permission, or resource failures
+/// into proof. The former rendering appended `2>/dev/null || true` to every
+/// delete and skipped IPv6 when `ip6tables` was absent, so this static contract
+/// deliberately fails against that shape.
+#[test]
+fn teardown_is_strict_for_both_families_and_verifies_exact_absence() {
+    let script = node_waypoint_udp_steer_teardown_script();
+
+    assert!(script.starts_with("set -e\n"), "{script}");
+    assert!(
+        !script.contains("|| true"),
+        "no teardown error may be swallowed:\n{script}"
+    );
+    assert!(
+        !script.contains("if command -v ip6tables"),
+        "IPv6 predecessor state must never be silently skipped:\n{script}"
+    );
+    assert!(
+        script.contains("command -v ip6tables")
+            && script.contains("ferrum_delete_xtables_rule iptables mangle")
+            && script.contains("ferrum_delete_xtables_rule ip6tables mangle"),
+        "both family tools are strict teardown prerequisites:\n{script}"
+    );
+    assert!(
+        script.contains("jump remains after deletion")
+            && script.contains("chain remains after deletion")
+            && script.contains("rule remains after deletion")
+            && script.contains("route remains after deletion"),
+        "every Ferrum-owned object type needs post-delete absence verification:\n{script}"
+    );
+
+    let mark_jump = line_index(&script, |line| {
+        line.contains("ferrum_delete_xtables_rule iptables mangle")
+    });
+    let notrack_jump = line_index(&script, |line| {
+        line.contains("ferrum_delete_xtables_rule iptables raw")
+    });
+    let routing = line_index(&script, |line| line.contains("ip -o rule show priority"));
+    assert!(
+        mark_jump < notrack_jump && notrack_jump < routing,
+        "teardown must stop mark, then notrack, then routing:\n{script}"
+    );
 }
 
 /// The update-order contract (issue #3286 root review). During a generation

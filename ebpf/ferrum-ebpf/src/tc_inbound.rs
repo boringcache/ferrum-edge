@@ -11,9 +11,9 @@
 //! DNS responses from source port 53 to high pod-originated client ports
 //! (>=32768). The UDP arms accept one additional SOURCE proof the TCP arm does
 //! not: an exact `(address, port)` entry in `FERRUM_UDP_REPLY_SOURCES` /
-//! `FERRUM_UDP_REPLY_SOURCES6`, which a serving NodeWaypoint UDP/DTLS listener
-//! publishes for the reply source it pins and retracts before that socket goes
-//! away. A NodeWaypoint UDP/DTLS reply is not route-selected — it is pinned to
+//! `FERRUM_UDP_REPLY_SOURCES6`, consulted only while the one shared
+//! `FERRUM_UDP_REPLY_SOURCE_GATE` is enabled for a complete generation. A
+//! NodeWaypoint UDP/DTLS reply is not route-selected — it is pinned to
 //! the local address the client addressed, which on the Service path is the
 //! Service ClusterIP and therefore never a configured node IP. The relay auth
 //! mark is still required in every case, and TCP semantics are unchanged.
@@ -29,13 +29,13 @@ use aya_ebpf::macros::classifier;
 use aya_ebpf::programs::TcContext;
 use ferrum_ebpf_common::{
     CidrKey6, NodeProbePortKey4, NodeProbePortKey6, UdpReplySourceKey4, UdpReplySourceKey6,
-    FERRUM_CAPTURE_CONFIG_KEY,
+    FERRUM_CAPTURE_CONFIG_KEY, UDP_REPLY_SOURCE_GATE_ENABLED, UDP_REPLY_SOURCE_GATE_KEY,
 };
 
 use crate::maps::{
     FERRUM_CAPTURE_CONFIG, FERRUM_NODE_IPS, FERRUM_NODE_IPS6, FERRUM_NODE_PROBE_PORTS,
     FERRUM_NODE_PROBE_PORTS6, FERRUM_POD_IPS, FERRUM_POD_IPS6, FERRUM_UDP_REPLY_SOURCES,
-    FERRUM_UDP_REPLY_SOURCES6,
+    FERRUM_UDP_REPLY_SOURCE_GATE, FERRUM_UDP_REPLY_SOURCES6,
 };
 
 const ETH_HDR_LEN: usize = 14;
@@ -294,6 +294,9 @@ fn node_probe_port6_allowed(dst_ip: [u32; 4], port: u16) -> bool {
 /// match a live entry; there is no prefix, range, or port-blind form.
 #[inline(always)]
 fn udp_reply_source4_allowed(src_ip: u32, src_port: u16) -> bool {
+    if !udp_reply_sources_enabled() {
+        return false;
+    }
     let key = UdpReplySourceKey4::new(src_ip, src_port);
     unsafe { FERRUM_UDP_REPLY_SOURCES.get(&key) }.is_some()
 }
@@ -301,8 +304,19 @@ fn udp_reply_source4_allowed(src_ip: u32, src_port: u16) -> bool {
 /// IPv6 counterpart to [`udp_reply_source4_allowed`].
 #[inline(always)]
 fn udp_reply_source6_allowed(src_ip: [u32; 4], src_port: u16) -> bool {
+    if !udp_reply_sources_enabled() {
+        return false;
+    }
     let key = UdpReplySourceKey6::new(src_ip, src_port);
     unsafe { FERRUM_UDP_REPLY_SOURCES6.get(&key) }.is_some()
+}
+
+#[inline(always)]
+fn udp_reply_sources_enabled() -> bool {
+    matches!(
+        FERRUM_UDP_REPLY_SOURCE_GATE.get(UDP_REPLY_SOURCE_GATE_KEY),
+        Some(value) if *value == UDP_REPLY_SOURCE_GATE_ENABLED
+    )
 }
 
 #[inline(always)]

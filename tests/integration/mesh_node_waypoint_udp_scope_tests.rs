@@ -35,6 +35,9 @@ use ferrum_edge::proxy::node_waypoint_udp_identity::{
     NodeWaypointUdpDatagramVerdict, NodeWaypointUdpInterfaceResolver, NodeWaypointUdpSourceIndex,
     NodeWaypointUdpSourceIndexManager, NodeWaypointUdpSourceRefusal, NodeWaypointUdpSourceScoping,
 };
+use ferrum_edge::proxy::node_waypoint_udp_steering::{
+    NodeWaypointUdpSteerBackend, NodeWaypointUdpSteering,
+};
 
 const POD_A: &str = "11111111-1111-1111-1111-111111111111";
 const POD_B: &str = "22222222-2222-2222-2222-222222222222";
@@ -734,6 +737,90 @@ async fn manager_task_abort_retracts_the_published_generation() {
     );
 }
 
+#[derive(Default)]
+struct ManagerSteeringBackend {
+    scripts: std::sync::Mutex<Vec<String>>,
+}
+
+impl NodeWaypointUdpSteerBackend for ManagerSteeringBackend {
+    fn run_script(&self, script: &str) -> Result<(), String> {
+        self.scripts
+            .lock()
+            .expect("steering script log")
+            .push(script.to_string());
+        Ok(())
+    }
+}
+
+/// `StreamListenerManager` retains its own `Arc` to steering, so aborting the
+/// source-index manager cannot rely on the steering object's `Drop`. The
+/// manager-future guard must explicitly shut it down as well as clearing the
+/// attribution index.
+#[tokio::test]
+async fn manager_task_abort_retracts_retained_steering_too() {
+    let fixture = Fixture::new();
+    let backend = Arc::new(ManagerSteeringBackend::default());
+    let steering = Arc::new(NodeWaypointUdpSteering::new(backend.clone()));
+    let retained_by_listener_manager = steering.clone();
+    let destination = NodeWaypointUdpSteerDestination {
+        ip: "10.96.0.10".parse().expect("ClusterIP"),
+        port: 5300,
+    };
+    steering.set_bound_destinations(vec![destination], None);
+
+    let manager = NodeWaypointUdpSourceIndexManager::new(
+        fixture.registry.clone(),
+        FakeInterfaceResolver(fixture.interfaces.clone()),
+        fixture.index.clone(),
+        std::time::Duration::from_secs(2),
+    )
+    .with_steering(steering.clone());
+    let before_run = fixture.index.generation();
+    let index = fixture.index.clone();
+    let (_shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+    let handle = tokio::spawn(async move { manager.run(shutdown_rx).await });
+
+    tokio::time::timeout(std::time::Duration::from_secs(1), async {
+        while index.generation() == before_run
+            || !backend
+                .scripts
+                .lock()
+                .expect("steering script log")
+                .iter()
+                .any(|script| script.contains("--set-xmark"))
+        {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("manager should publish attribution and install steering");
+
+    handle.abort();
+    assert!(
+        handle
+            .await
+            .expect_err("aborted manager must not complete")
+            .is_cancelled()
+    );
+    assert_eq!(
+        index
+            .authorize(Some(IFINDEX_A), ip(IP_A))
+            .expect_err("abort retracts attribution"),
+        NodeWaypointUdpSourceRefusal::IndexUnavailable
+    );
+    assert!(
+        retained_by_listener_manager.bound_destinations().is_empty(),
+        "the retained steering owner must hold no serving plan after manager exit"
+    );
+    let scripts = backend.scripts.lock().expect("steering script log");
+    assert!(
+        scripts
+            .last()
+            .is_some_and(|script| script.contains("ferrum_delete_xtables_rule")),
+        "future drop must run exact-name steering shutdown even while another Arc survives"
+    );
+}
+
 // ── NodeWaypoint UDP/DTLS listener materialization (issue #3286) ──────────
 //
 // The attribution channel above is only reachable if a NodeWaypoint can
@@ -1396,7 +1483,8 @@ fn a_withdrawn_or_disabled_generation_clears_desired_steering_metadata() {
 use dashmap::DashMap;
 use ferrum_edge::capture::{CaptureConfig, CaptureMode, NodeWaypointUdpSteerDestination};
 use ferrum_edge::ebpf::{
-    CaptureContract, FallbackMode, MockEbpfBackend, NodeAgentProxyMode, PodAttachmentState,
+    BPF_MAP_UDP_REPLY_SOURCE_GATE, CaptureContract, EbpfBackend, FallbackMode,
+    MockEbpfBackend, NodeAgentProxyMode, PodAttachmentState,
 };
 use ferrum_edge::modes::node_agent::{
     NodeAgentConfig, NodeWaypointUdpReplySourceState,
@@ -1459,6 +1547,13 @@ fn authorized(backend: &MockEbpfBackend) -> Vec<(std::net::IpAddr, u16)> {
     sources
 }
 
+fn effectively_authorized(
+    backend: &MockEbpfBackend,
+    source: (std::net::IpAddr, u16),
+) -> bool {
+    backend.udp_reply_sources_enabled && backend.udp_reply_sources.contains(&source)
+}
+
 /// The generation the proxy is currently asking for, as the node-agent reads it.
 fn desired_generation(registry: &std::path::Path) -> ReplySourceGeneration {
     read_desired_generation(registry)
@@ -1496,6 +1591,19 @@ fn a_published_generation_is_applied_then_acknowledged() {
     let mut expected = vec![(v4.ip, v4.port), (v6.ip, v6.port)];
     expected.sort();
     assert_eq!(authorized(&backend), expected);
+    assert!(
+        backend.udp_reply_sources_enabled,
+        "the shared classifier gate opens only for the complete generation"
+    );
+    assert_eq!(
+        backend.operations,
+        vec![
+            "set_udp_reply_sources_enabled:false".to_string(),
+            "replace_udp_reply_sources:2".to_string(),
+            "set_udp_reply_sources_enabled:true".to_string(),
+        ],
+        "the maps mutate only inside the shared closed-gate window"
+    );
     assert_eq!(
         acknowledgement(registry.path()),
         Some(generation),
@@ -1667,6 +1775,10 @@ fn an_over_bound_generation_is_refused_and_unacknowledged() {
         "an over-bound generation must be refused entirely, never truncated"
     );
     assert_eq!(acknowledgement(registry.path()), None);
+    assert!(
+        !backend.udp_reply_sources_enabled,
+        "an over-bound refusal must close the shared authorization gate"
+    );
 }
 
 /// Nothing published means nothing authorized — and a channel that has never
@@ -1698,6 +1810,10 @@ fn an_absent_channel_authorizes_nothing() {
         "authorization must not outlive the generation that justified it"
     );
     assert_eq!(acknowledgement(registry.path()), None);
+    assert!(
+        !backend.udp_reply_sources_enabled,
+        "an absent channel must close the shared authorization gate"
+    );
 }
 
 /// A map write that failed is not evidence of anything, so the reconcile must
@@ -1747,8 +1863,11 @@ fn a_partial_family_failure_is_never_acknowledged() {
     let v6 = reply_source("fd00:10:96::a", 5300);
     let generation = publisher.publish(&[v4, v6]).expect("publication");
 
+    let stale_v6 = ("fd00:10:96::dead".parse().expect("stale IPv6"), 5353);
     let mut backend = MockEbpfBackend {
         fail_replace_udp_reply_sources_after_ipv4: true,
+        udp_reply_sources: std::collections::HashSet::from([stale_v6]),
+        udp_reply_sources_enabled: true,
         ..MockEbpfBackend::default()
     };
     let pods = DashMap::new();
@@ -1756,11 +1875,18 @@ fn a_partial_family_failure_is_never_acknowledged() {
     let mut state = NodeWaypointUdpReplySourceState::default();
     reconcile_node_waypoint_udp_reply_sources(&mut backend, &config, &pods, &mut state);
 
-    assert_eq!(
-        authorized(&backend),
-        vec![(v4.ip, v4.port)],
-        "the injected backend models IPv4 applied before IPv6 failed"
+    assert!(
+        backend.udp_reply_sources.contains(&(v4.ip, v4.port))
+            && backend.udp_reply_sources.contains(&stale_v6),
+        "the injected backend must retain stale IPv6 storage after IPv4 succeeded"
     );
+    assert!(
+        !backend.udp_reply_sources_enabled
+            && !effectively_authorized(&backend, stale_v6)
+            && !effectively_authorized(&backend, (v4.ip, v4.port)),
+        "one shared closed gate must make both partial IPv4 and stale IPv6 entries inert"
+    );
+    assert_eq!(backend.udp_reply_source_gate_updates.last(), Some(&false));
     assert_eq!(
         acknowledgement(registry.path()),
         None,
@@ -1772,7 +1898,47 @@ fn a_partial_family_failure_is_never_acknowledged() {
     let mut expected = vec![(v4.ip, v4.port), (v6.ip, v6.port)];
     expected.sort();
     assert_eq!(authorized(&backend), expected);
+    assert!(backend.udp_reply_sources_enabled);
     assert_eq!(acknowledgement(registry.path()), Some(generation));
+}
+
+/// Readiness must reject an ELF that has both family maps but lacks their
+/// shared coherence gate. Starting without it would make partial-family map
+/// contents live again.
+#[test]
+fn a_missing_reply_source_gate_fails_node_waypoint_startup_readiness() {
+    let mut contract = CaptureContract::local_pod_defaults();
+    contract.proxy_mode = NodeAgentProxyMode::NodeWaypoint;
+    let backend = MockEbpfBackend {
+        programs_loaded: true,
+        capture_config: Some(contract.bpf_capture_config()),
+        sock_ops_attached_cgroup_root: Some("/sys/fs/cgroup".to_string()),
+        udp_reply_source_gate_absent: true,
+        ..MockEbpfBackend::default()
+    };
+
+    let error = backend
+        .validate_startup_ready(true)
+        .expect_err("a missing shared gate must fail readiness");
+    assert!(
+        error.contains(BPF_MAP_UDP_REPLY_SOURCE_GATE),
+        "the readiness diagnostic must name the missing ABI map: {error}"
+    );
+}
+
+#[test]
+fn backend_cleanup_closes_and_clears_reply_source_authorization() {
+    let source = ("10.96.0.10".parse().expect("source address"), 5300);
+    let mut backend = MockEbpfBackend {
+        udp_reply_sources: std::collections::HashSet::from([source]),
+        udp_reply_sources_enabled: true,
+        ..MockEbpfBackend::default()
+    };
+
+    backend.cleanup_all().expect("cleanup");
+
+    assert!(!backend.udp_reply_sources_enabled);
+    assert!(backend.udp_reply_sources.is_empty());
 }
 
 /// A map that is absent from the loaded program cannot authorize its family, so
@@ -1902,6 +2068,118 @@ fn a_new_generation_retracts_the_previous_acknowledgement_before_applying() {
         None,
         "the previous generation's acknowledgement must not survive an unapplied change"
     );
+}
+
+/// A failed unlink must not preserve BPF authorization. The successor remains
+/// unapplied, the old map contents stay inert behind the closed gate, and the
+/// ordinary next poll retries after the filesystem fault clears.
+#[test]
+fn successor_acknowledgement_unlink_failure_closes_the_gate_and_retries() {
+    let registry = tempfile::tempdir().expect("registry dir");
+    let publisher = RegistryDirReplySourcePublisher::new(registry.path());
+    let old_source = reply_source("10.96.0.10", 5300);
+    publisher.publish(&[old_source]).expect("first");
+
+    let mut backend = MockEbpfBackend::default();
+    let pods = DashMap::new();
+    let config = node_waypoint_config(Some(registry.path()));
+    let mut state = NodeWaypointUdpReplySourceState::default();
+    reconcile_node_waypoint_udp_reply_sources(&mut backend, &config, &pods, &mut state);
+    assert!(backend.udp_reply_sources_enabled);
+
+    let successor = reply_source("10.96.0.11", 5301);
+    let generation = publisher.publish(&[successor]).expect("successor");
+    let applied = registry
+        .path()
+        .join(NODE_WAYPOINT_UDP_REPLY_SOURCE_DIR)
+        .join(NODE_WAYPOINT_UDP_REPLY_SOURCE_APPLIED_FILE);
+    std::fs::remove_file(&applied).expect("remove old acknowledgement");
+    std::fs::create_dir(&applied).expect("inject unlink failure");
+
+    reconcile_node_waypoint_udp_reply_sources(&mut backend, &config, &pods, &mut state);
+    assert!(
+        !backend.udp_reply_sources_enabled
+            && !effectively_authorized(&backend, (old_source.ip, old_source.port)),
+        "unlink failure must close authorization even while old map storage remains"
+    );
+    assert!(
+        !backend.udp_reply_sources.contains(&(successor.ip, successor.port)),
+        "a generation whose acknowledgement could not be retracted must not be mutated in"
+    );
+
+    std::fs::remove_dir(&applied).expect("clear injected fault");
+    reconcile_node_waypoint_udp_reply_sources(&mut backend, &config, &pods, &mut state);
+    assert!(backend.udp_reply_sources_enabled);
+    assert_eq!(authorized(&backend), vec![(successor.ip, successor.port)]);
+    assert_eq!(acknowledgement(registry.path()), Some(generation));
+}
+
+/// Refusal uses the same ordering as replacement. Even when the stale
+/// acknowledgement path cannot be unlinked, an unreadable desired manifest
+/// immediately closes the shared authorization lane and is retried.
+#[test]
+fn refusal_acknowledgement_unlink_failure_closes_the_gate_and_retries() {
+    let registry = tempfile::tempdir().expect("registry dir");
+    let publisher = RegistryDirReplySourcePublisher::new(registry.path());
+    let source = reply_source("10.96.0.10", 5300);
+    publisher.publish(&[source]).expect("publication");
+
+    let mut backend = MockEbpfBackend::default();
+    let pods = DashMap::new();
+    let config = node_waypoint_config(Some(registry.path()));
+    let mut state = NodeWaypointUdpReplySourceState::default();
+    reconcile_node_waypoint_udp_reply_sources(&mut backend, &config, &pods, &mut state);
+
+    let channel_dir = registry.path().join(NODE_WAYPOINT_UDP_REPLY_SOURCE_DIR);
+    let desired = channel_dir.join(NODE_WAYPOINT_UDP_REPLY_SOURCE_DESIRED_FILE);
+    std::fs::write(&desired, b"malformed\n").expect("corrupt desired manifest");
+    let applied = channel_dir.join(NODE_WAYPOINT_UDP_REPLY_SOURCE_APPLIED_FILE);
+    std::fs::remove_file(&applied).expect("remove old acknowledgement");
+    std::fs::create_dir(&applied).expect("inject unlink failure");
+
+    reconcile_node_waypoint_udp_reply_sources(&mut backend, &config, &pods, &mut state);
+    assert!(
+        !backend.udp_reply_sources_enabled
+            && !effectively_authorized(&backend, (source.ip, source.port)),
+        "refusal must close the BPF lane regardless of acknowledgement unlink failure"
+    );
+
+    std::fs::remove_dir(&applied).expect("clear injected fault");
+    reconcile_node_waypoint_udp_reply_sources(&mut backend, &config, &pods, &mut state);
+    assert!(authorized(&backend).is_empty());
+    assert!(!backend.udp_reply_sources_enabled);
+    assert_eq!(acknowledgement(registry.path()), None);
+}
+
+/// If the shared gate itself cannot be closed, the node-agent must surface the
+/// hard residual and stop before mutating or acknowledging a successor.
+#[test]
+fn gate_disable_failure_never_mutates_or_acknowledges_a_successor() {
+    let registry = tempfile::tempdir().expect("registry dir");
+    let publisher = RegistryDirReplySourcePublisher::new(registry.path());
+    let old_source = reply_source("10.96.0.10", 5300);
+    publisher.publish(&[old_source]).expect("first");
+
+    let mut backend = MockEbpfBackend::default();
+    let pods = DashMap::new();
+    let config = node_waypoint_config(Some(registry.path()));
+    let mut state = NodeWaypointUdpReplySourceState::default();
+    reconcile_node_waypoint_udp_reply_sources(&mut backend, &config, &pods, &mut state);
+    let replacements = backend.udp_reply_source_updates.len();
+
+    let successor = reply_source("10.96.0.11", 5301);
+    publisher.publish(&[successor]).expect("successor");
+    backend.fail_disable_udp_reply_sources = true;
+    reconcile_node_waypoint_udp_reply_sources(&mut backend, &config, &pods, &mut state);
+
+    assert_eq!(backend.udp_reply_source_updates.len(), replacements);
+    assert_eq!(authorized(&backend), vec![(old_source.ip, old_source.port)]);
+    assert_eq!(acknowledgement(registry.path()), None);
+
+    backend.fail_disable_udp_reply_sources = false;
+    reconcile_node_waypoint_udp_reply_sources(&mut backend, &config, &pods, &mut state);
+    assert!(backend.udp_reply_sources_enabled);
+    assert_eq!(authorized(&backend), vec![(successor.ip, successor.port)]);
 }
 
 /// An acknowledgement that vanishes underneath a converged agent is rewritten,

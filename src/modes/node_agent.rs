@@ -6023,12 +6023,12 @@ pub fn node_waypoint_udp_reply_source_reconcile_enabled(config: &NodeAgentConfig
 /// What this node-agent has proven about the reply-source authorization maps.
 #[derive(Debug, Default)]
 pub struct NodeWaypointUdpReplySourceState {
-    /// The set last successfully written to BOTH map families, so a quiet poll
-    /// issues no map calls. `None` means unknown — a write failed, so the next
-    /// pass must rewrite before it may acknowledge anything.
+    /// The set last successfully written to BOTH map families and enabled by
+    /// the shared gate, so a quiet poll issues no map calls. `None` means
+    /// unknown or fenced — the next pass must rewrite before acknowledging.
     applied: Option<Vec<(std::net::IpAddr, u16)>>,
     /// The generation this agent has acknowledged on the channel. Only ever set
-    /// after [`Self::applied`] holds that generation's COMPLETE set.
+    /// after [`Self::applied`] holds that generation's complete, gated set.
     acknowledged: Option<ReplySourceGeneration>,
     /// Closed-set reason for the last refusal, so a 250 ms poll cannot turn a
     /// persistent fault into a log flood: the warning fires only on transition.
@@ -6044,18 +6044,25 @@ impl NodeWaypointUdpReplySourceState {
         }
         self.last_diagnostic = reason;
         match (reason, detail) {
+            (Some("authorization_gate_disable_failed"), Some(detail)) => warn!(
+                reason = "authorization_gate_disable_failed",
+                detail,
+                "NodeWaypoint UDP/DTLS reply-source authorization could not be fenced; the \
+                 prior gate state is unknown, no successor map mutation or acknowledgement was \
+                 attempted, and the hard residual will be retried"
+            ),
             (Some(reason), Some(detail)) => warn!(
                 reason,
                 detail,
                 "NodeWaypoint UDP/DTLS reply-source authorization refused; the generation stays \
-                 unacknowledged, so the proxy leaves the Service path unsteered and the relay's \
-                 source-pinned replies stay denied by the pod-veth guard until it converges"
+                 unacknowledged and the shared BPF gate stays closed, so stale or partial map \
+                 entries are inert until the exact generation converges"
             ),
             (Some(reason), None) => warn!(
                 reason,
                 "NodeWaypoint UDP/DTLS reply-source authorization refused; the generation stays \
-                 unacknowledged, so the proxy leaves the Service path unsteered and the relay's \
-                 source-pinned replies stay denied by the pod-veth guard until it converges"
+                 unacknowledged and the shared BPF gate stays closed, so stale or partial map \
+                 entries are inert until the exact generation converges"
             ),
             (None, _) => debug!("NodeWaypoint UDP/DTLS reply-source authorization converged"),
         }
@@ -6070,10 +6077,12 @@ impl NodeWaypointUdpReplySourceState {
 /// is a whole-set replacement: a proxy crash, restart, or missed retraction
 /// converges without the node-agent carrying an enumerated removal list.
 ///
-/// Fail-closed at every step, and the acknowledgement is the fail-closed
-/// signal: it is RETRACTED before the maps are touched and re-written only on
-/// full success, so the proxy can never read a stale acknowledgement as proof
-/// about a generation this agent has not applied. An absent, unreadable,
+/// Fail-closed at every step through TWO ordered gates. The file acknowledgement
+/// is RETRACTED first so the proxy cannot install steering, then one BPF-visible
+/// gate shared by both tc classifier families is disabled before either map is
+/// touched. The gate is enabled only after both family maps are complete and
+/// the exact desired manifest has been revalidated; only then is the file
+/// acknowledgement written. An absent, unreadable,
 /// over-bound, or malformed generation authorizes nothing rather than retaining
 /// the previous set (an inability to prove a claim is not evidence for it); a
 /// set over the map bound refuses ENTIRELY rather than truncating to an
@@ -6173,37 +6182,62 @@ pub fn reconcile_node_waypoint_udp_reply_sources(
                 }
                 return;
             }
+            // Missing or stale acknowledgement is not authorization evidence.
+            // Fall through to the full close-replace-revalidate-open sequence.
             Ok(_) => {}
             Err(error) => {
-                state.acknowledged = None;
-                state.report(Some("acknowledgement_unreadable"), Some(error.as_str()));
+                refuse_node_waypoint_udp_reply_sources(
+                    backend,
+                    registry_dir,
+                    state,
+                    Some(("acknowledgement_unreadable", Some(error.as_str()))),
+                );
                 return;
             }
         }
-    } else {
-        // A generation this agent has not applied must never be covered by an
-        // acknowledgement, so retract first — including across a crash, since
-        // nothing rewrites it until the whole set is live again.
-        if let Err(error) = channel::clear_acknowledgement(registry_dir) {
-            state.acknowledged = None;
-            state.report(Some("acknowledgement_retraction_failed"), Some(error.as_str()));
-            return;
-        }
-        state.acknowledged = None;
+    }
 
-        // One fresh whole-set replacement covering BOTH families for every
-        // unacknowledged generation, even when its content matches the last
-        // applied set. This proves both maps still exist and were completely
-        // scanned for this exact generation. Any failure — an absent required
-        // map, a scan error, a remove error, a partial family failure — leaves
-        // the set unproven and unacknowledged.
-        match backend.replace_udp_reply_sources(&sources) {
-            Ok(()) => state.applied = Some(sources),
-            Err(error) => {
-                state.applied = None;
-                state.report(Some("map_write_failed"), Some(error.as_str()));
-                return;
-            }
+    // A generation being applied must never be covered by a predecessor's
+    // acknowledgement. Retraction comes before the BPF gate for availability:
+    // the proxy first stops installing steering. Even when unlink fails, close
+    // the BPF lane; the failure remains retryable and no map is mutated.
+    if let Err(error) = channel::clear_acknowledgement(registry_dir) {
+        state.acknowledged = None;
+        state.applied = None;
+        match backend.set_udp_reply_sources_enabled(false) {
+            Ok(()) => state.report(
+                Some("acknowledgement_retraction_failed"),
+                Some(error.as_str()),
+            ),
+            Err(gate_error) => state.report(
+                Some("authorization_gate_disable_failed"),
+                Some(gate_error.as_str()),
+            ),
+        }
+        return;
+    }
+    state.acknowledged = None;
+    state.applied = None;
+
+    // This is the coherence boundary. Once closed, stale IPv6 entries left by
+    // a later IPv4-success/IPv6-failure (or any scan/remove/insert failure) are
+    // present only as inert storage and cannot authorize a marked workload.
+    if let Err(error) = backend.set_udp_reply_sources_enabled(false) {
+        state.report(
+            Some("authorization_gate_disable_failed"),
+            Some(error.as_str()),
+        );
+        return;
+    }
+
+    // One fresh whole-set replacement covering BOTH families for every
+    // unacknowledged generation, even when its content matches the last set.
+    match backend.replace_udp_reply_sources(&sources) {
+        Ok(()) => state.applied = Some(sources),
+        Err(error) => {
+            state.applied = None;
+            state.report(Some("map_write_failed"), Some(error.as_str()));
+            return;
         }
     }
 
@@ -6221,6 +6255,24 @@ pub fn reconcile_node_waypoint_udp_reply_sources(
         return;
     }
 
+    if let Err(error) = backend.set_udp_reply_sources_enabled(true) {
+        state.applied = None;
+        // A failed update is not assumed atomic. Re-drive disabled once; if
+        // that too fails, surface the hard residual instead of claiming the
+        // entries are inert.
+        match backend.set_udp_reply_sources_enabled(false) {
+            Ok(()) => state.report(
+                Some("authorization_gate_enable_failed"),
+                Some(error.as_str()),
+            ),
+            Err(gate_error) => state.report(
+                Some("authorization_gate_disable_failed"),
+                Some(gate_error.as_str()),
+            ),
+        }
+        return;
+    }
+
     let written = channel::write_acknowledgement(registry_dir, &desired.generation);
     match written {
         Ok(()) => {
@@ -6228,8 +6280,16 @@ pub fn reconcile_node_waypoint_udp_reply_sources(
             state.report(None, None);
         }
         Err(error) => {
-            state.acknowledged = None;
-            state.report(Some("acknowledgement_write_failed"), Some(error.as_str()));
+            // The gate was opened only after exact revalidation, but a
+            // generation without its exact acknowledgement is not allowed to
+            // remain authorized. Refusal closes the BPF lane and clears the
+            // map contents before the next retry.
+            refuse_node_waypoint_udp_reply_sources(
+                backend,
+                registry_dir,
+                state,
+                Some(("acknowledgement_write_failed", Some(error.as_str()))),
+            );
         }
     }
 }
@@ -6267,8 +6327,8 @@ fn revalidate_node_waypoint_udp_reply_source_generation(
     }
 }
 
-/// Refuse the published generation: retract the acknowledgement FIRST, then
-/// revoke every authorization.
+/// Refuse the published generation: retract the acknowledgement FIRST, close
+/// the shared BPF gate regardless of unlink failure, then clear map storage.
 ///
 /// Ordered that way because the acknowledgement is what the proxy steers on. A
 /// refusal that revoked the maps while leaving an acknowledgement in place would
@@ -6283,12 +6343,26 @@ fn refuse_node_waypoint_udp_reply_sources(
 ) {
     use crate::proxy::node_waypoint_udp_reply_source as channel;
 
-    if let Err(error) = channel::clear_acknowledgement(registry_dir) {
-        state.acknowledged = None;
-        state.report(Some("acknowledgement_retraction_failed"), Some(error.as_str()));
+    let acknowledgement_error = channel::clear_acknowledgement(registry_dir).err();
+    state.acknowledged = None;
+
+    if let Err(error) = backend.set_udp_reply_sources_enabled(false) {
+        state.applied = None;
+        state.report(
+            Some("authorization_gate_disable_failed"),
+            Some(error.as_str()),
+        );
         return;
     }
-    state.acknowledged = None;
+
+    if let Some(error) = acknowledgement_error {
+        state.applied = None;
+        state.report(
+            Some("acknowledgement_retraction_failed"),
+            Some(error.as_str()),
+        );
+        return;
+    }
 
     let already_revoked = state
         .applied

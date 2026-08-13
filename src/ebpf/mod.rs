@@ -78,6 +78,9 @@ pub const BPF_MAP_POD_INBOUND_PORTS6: &str = "FERRUM_POD_INBOUND_PORTS6";
 /// Service ClusterIP rather than a configured node IP.
 pub const BPF_MAP_UDP_REPLY_SOURCES: &str = "FERRUM_UDP_REPLY_SOURCES";
 pub const BPF_MAP_UDP_REPLY_SOURCES6: &str = "FERRUM_UDP_REPLY_SOURCES6";
+/// Shared enable gate consulted by both tc UDP classifier families before
+/// either reply-source map. Key zero is disabled by default.
+pub const BPF_MAP_UDP_REPLY_SOURCE_GATE: &str = "FERRUM_UDP_REPLY_SOURCE_GATE";
 pub const BPF_MAP_BYPASS_UIDS: &str = "FERRUM_BYPASS_UIDS";
 pub const BPF_MAP_CIDR_EXCLUDE4: &str = "FERRUM_CIDR_EXCLUDE4";
 pub const BPF_MAP_CIDR_EXCLUDE6: &str = "FERRUM_CIDR_EXCLUDE6";
@@ -190,6 +193,7 @@ pub struct CaptureBpfMaps {
     pub pod_inbound_ports6: &'static str,
     pub udp_reply_sources: &'static str,
     pub udp_reply_sources6: &'static str,
+    pub udp_reply_source_gate: &'static str,
     pub bypass_uids: &'static str,
     pub cidr_exclude4: &'static str,
     pub cidr_exclude6: &'static str,
@@ -215,6 +219,7 @@ impl Default for CaptureBpfMaps {
             pod_inbound_ports6: BPF_MAP_POD_INBOUND_PORTS6,
             udp_reply_sources: BPF_MAP_UDP_REPLY_SOURCES,
             udp_reply_sources6: BPF_MAP_UDP_REPLY_SOURCES6,
+            udp_reply_source_gate: BPF_MAP_UDP_REPLY_SOURCE_GATE,
             bypass_uids: BPF_MAP_BYPASS_UIDS,
             cidr_exclude4: BPF_MAP_CIDR_EXCLUDE4,
             cidr_exclude6: BPF_MAP_CIDR_EXCLUDE6,
@@ -935,9 +940,15 @@ pub trait EbpfBackend: Send + Sync {
 
     fn clear_pod_inbound_ports6(&mut self, ip: Ipv6Addr) -> Result<(), String>;
 
-    /// Replace the **whole** NodeWaypoint UDP/DTLS reply-source authorization
-    /// set with exactly `sources` (issue #3286). An empty slice revokes every
-    /// entry.
+    /// Open or close the BPF-visible NodeWaypoint UDP/DTLS reply-source gate.
+    /// Both tc classifier families consult this one gate before either family
+    /// map, so closing it makes every entry inert even if a later scan/remove/
+    /// insert fails. Failure to close is a hard fencing failure: callers must
+    /// not mutate or acknowledge a new generation.
+    fn set_udp_reply_sources_enabled(&mut self, enabled: bool) -> Result<(), String>;
+
+    /// Replace both NodeWaypoint UDP/DTLS reply-source map contents with
+    /// exactly `sources` (issue #3286). An empty slice removes every entry.
     ///
     /// Set-valued rather than per-entry for the same reason
     /// [`Self::update_pod_inbound_ports`] is: the node-agent's only input is one
@@ -945,9 +956,10 @@ pub trait EbpfBackend: Send + Sync {
     /// missed retraction must converge without the node-agent carrying an
     /// enumerated removal list that can go stale exactly when it matters.
     ///
-    /// Implementations MUST remove stale entries before inserting new ones, so
-    /// a partial failure can only ever leave FEWER addresses authorized than
-    /// intended — never a revoked one still live.
+    /// The caller MUST close [`Self::set_udp_reply_sources_enabled`] before
+    /// invoking this operation and leave it closed after any error. Partial
+    /// failure may leave stale or incomplete entries in either family, but
+    /// those entries are not authorization while the shared gate is closed.
     fn replace_udp_reply_sources(&mut self, sources: &[(IpAddr, u16)]) -> Result<(), String>;
 
     fn update_node_probe_port(&mut self, ip: Ipv4Addr, port: u16) -> Result<(), String>;
@@ -1054,9 +1066,13 @@ pub struct MockEbpfBackend {
     /// Declared inbound application ports written to the redirect scope maps.
     pub pod_inbound_ports: HashSet<(Ipv4Addr, u16)>,
     pub pod_inbound_ports6: HashSet<(Ipv6Addr, u16)>,
-    /// NodeWaypoint UDP/DTLS reply sources currently authorized, i.e. the live
-    /// contents of `FERRUM_UDP_REPLY_SOURCES` / `FERRUM_UDP_REPLY_SOURCES6`.
+    /// Raw NodeWaypoint UDP/DTLS reply-source map contents. They authorize only
+    /// while [`Self::udp_reply_sources_enabled`] is true.
     pub udp_reply_sources: HashSet<(IpAddr, u16)>,
+    /// Shared gate the tc UDP arms consult before [`Self::udp_reply_sources`].
+    pub udp_reply_sources_enabled: bool,
+    /// Ordered gate transitions for fail-closed sequencing assertions.
+    pub udp_reply_source_gate_updates: Vec<bool>,
     /// Ordered whole-set replacements of [`Self::udp_reply_sources`], so tests
     /// can assert publication/retraction ORDER (not just the final set) across
     /// a listener's serving lifecycle.
@@ -1153,6 +1169,13 @@ pub struct MockEbpfBackend {
     /// then fails before IPv6, mirroring a partial family failure in the real
     /// remove-before-insert sequence. The generation must remain unacknowledged.
     pub fail_replace_udp_reply_sources_after_ipv4: bool,
+    /// Treat the shared reply-source gate map as absent.
+    pub udp_reply_source_gate_absent: bool,
+    /// Inject a hard failure while closing the shared gate. The mock leaves the
+    /// previous value unchanged, matching a failed map update.
+    pub fail_disable_udp_reply_sources: bool,
+    /// Inject a failure while opening the shared gate after map application.
+    pub fail_enable_udp_reply_sources: bool,
     /// Test seam: after the next successful reply-source map replacement,
     /// substitute these bytes at the supplied desired-manifest path.
     /// This models a successor publication racing the node-agent between map
@@ -1380,6 +1403,27 @@ impl EbpfBackend for MockEbpfBackend {
         Ok(())
     }
 
+    fn set_udp_reply_sources_enabled(&mut self, enabled: bool) -> Result<(), String> {
+        if self.udp_reply_source_gate_absent {
+            return Err(
+                "injected absent NodeWaypoint UDP reply-source gate; authorization cannot be fenced"
+                    .to_string(),
+            );
+        }
+        if (!enabled && self.fail_disable_udp_reply_sources)
+            || (enabled && self.fail_enable_udp_reply_sources)
+        {
+            return Err(format!(
+                "injected NodeWaypoint UDP reply-source gate {} failure",
+                if enabled { "enable" } else { "disable" }
+            ));
+        }
+        self.udp_reply_sources_enabled = enabled;
+        self.udp_reply_source_gate_updates.push(enabled);
+        self.record_operation(format!("set_udp_reply_sources_enabled:{enabled}"));
+        Ok(())
+    }
+
     fn replace_udp_reply_sources(&mut self, sources: &[(IpAddr, u16)]) -> Result<(), String> {
         if self.fail_replace_udp_reply_sources {
             return Err(format!(
@@ -1407,8 +1451,8 @@ impl EbpfBackend for MockEbpfBackend {
                     .to_string(),
             );
         }
-        // Mirror the real backend: stale entries go first, so a partial failure
-        // can only narrow the authorized set.
+        // Mirror the real backend's map contents. Coherence is supplied by the
+        // shared gate, which the caller closes before this partial operation.
         let desired: HashSet<(IpAddr, u16)> = sources.iter().copied().collect();
         self.udp_reply_sources
             .retain(|entry| desired.contains(entry));
@@ -1580,6 +1624,7 @@ impl EbpfBackend for MockEbpfBackend {
         // the real backend's maps are destroyed with the program, so the mock
         // must not keep reporting a revoked authorization either.
         self.udp_reply_sources.clear();
+        self.udp_reply_sources_enabled = false;
         self.include_ports.clear();
         self.workload_identities.clear();
         self.sock_ops_attached_cgroup_root = None;
@@ -1612,6 +1657,16 @@ impl EbpfBackend for MockEbpfBackend {
         }
         if self.capture_config.is_none() {
             return Err("BPF capture config map not initialized".to_string());
+        }
+        if require_sock_ops && self.udp_reply_source_maps_absent {
+            return Err(format!(
+                "BPF ELF is missing required map(s) for the selected capture topology: {BPF_MAP_UDP_REPLY_SOURCES}, {BPF_MAP_UDP_REPLY_SOURCES6}"
+            ));
+        }
+        if require_sock_ops && self.udp_reply_source_gate_absent {
+            return Err(format!(
+                "BPF ELF is missing required map(s) for the selected capture topology: {BPF_MAP_UDP_REPLY_SOURCE_GATE}"
+            ));
         }
         if require_sock_ops && self.sock_ops_attached_cgroup_root.is_none() {
             return Err("SOCK_OPS identity bridge is not attached".to_string());

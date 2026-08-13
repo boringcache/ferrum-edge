@@ -481,6 +481,14 @@ impl UdpReplySourceKey6 {
 /// than letting the kernel silently reject the overflow.
 pub const UDP_REPLY_SOURCE_MAX_ENTRIES: u32 = 1024;
 
+/// Single shared enable gate for the IPv4 and IPv6 NodeWaypoint UDP/DTLS
+/// reply-source authorization maps. Both tc classifier families consult this
+/// key before reading either family map, so entries left behind by a failed
+/// whole-set replacement are inert.
+pub const UDP_REPLY_SOURCE_GATE_KEY: u32 = 0;
+pub const UDP_REPLY_SOURCE_GATE_DISABLED: u8 = 0;
+pub const UDP_REPLY_SOURCE_GATE_ENABLED: u8 = 1;
+
 /// Per-cgroup workload identity in the `FERRUM_WORKLOAD_IDENTITY` map, keyed by
 /// cgroup id (`bpf_get_current_cgroup_id`).
 ///

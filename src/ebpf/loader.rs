@@ -579,6 +579,11 @@ impl EbpfBackend for AyaEbpfBackend {
         maps.replace_udp_reply_sources(sources)
     }
 
+    fn set_udp_reply_sources_enabled(&mut self, enabled: bool) -> Result<(), String> {
+        let maps = self.maps.as_mut().ok_or("BPF maps not initialized")?;
+        maps.set_udp_reply_sources_enabled(enabled)
+    }
+
     fn update_node_probe_port(&mut self, ip: Ipv4Addr, port: u16) -> Result<(), String> {
         let maps = self.maps.as_mut().ok_or("BPF maps not initialized")?;
         maps.insert_node_probe_port(ip, port)
@@ -729,6 +734,14 @@ impl EbpfBackend for AyaEbpfBackend {
     }
 
     fn cleanup_all(&mut self) -> Result<(), String> {
+        // Close the shared authorization lane before detaching classifiers or
+        // dropping map ownership. Cleanup continues even if this write fails:
+        // dropping the tc links/program is the stronger revocation, but the
+        // gate failure is still returned rather than hidden.
+        let reply_source_gate_error = self
+            .maps
+            .as_mut()
+            .and_then(|maps| maps.disable_udp_reply_sources_for_cleanup().err());
         // Detach the node-level ingress redirect explicitly and BEFORE dropping
         // `Ebpf`. This is the genuine retry the callers treat it as: the links
         // are owned by this backend (not by the program's link map, which
@@ -761,7 +774,12 @@ impl EbpfBackend for AyaEbpfBackend {
         let _ = fs::remove_file(BPF_ORIG_DST4_PIN_PATH);
         let _ = fs::remove_file(BPF_ORIG_DST6_PIN_PATH);
         info!("BPF programs and maps cleaned up");
-        Ok(())
+        match reply_source_gate_error {
+            Some(error) => Err(format!(
+                "BPF cleanup detached the programs after the NodeWaypoint UDP reply-source gate could not be disabled: {error}"
+            )),
+            None => Ok(()),
+        }
     }
 }
 

@@ -919,17 +919,22 @@ pub struct NodeWaypointUdpSourceIndexManager<R: NodeWaypointUdpInterfaceResolver
     steering: Option<Arc<super::node_waypoint_udp_steering::NodeWaypointUdpSteering>>,
 }
 
-/// Retract attribution evidence whenever the manager future leaves scope — not
-/// only on an orderly shutdown signal. Tokio task abort and panic both drop the
-/// future, so a dead manager cannot leave an indefinitely trusted last-good
-/// index behind while listeners continue draining or serving.
+/// Retract attribution evidence AND the steering plan whenever the manager
+/// future leaves scope — not only on an orderly shutdown signal. Tokio task
+/// abort and panic both drop the future; `StreamListenerManager` retains its own
+/// `Arc` to steering, so relying on `NodeWaypointUdpSteering::drop` would leave
+/// rules and reply-source authorization live after attribution disappeared.
 struct SourceIndexRetractionGuard {
     index: Arc<NodeWaypointUdpSourceIndex>,
+    steering: Option<Arc<super::node_waypoint_udp_steering::NodeWaypointUdpSteering>>,
 }
 
 impl Drop for SourceIndexRetractionGuard {
     fn drop(&mut self) {
         self.index.clear();
+        if let Some(steering) = self.steering.as_ref() {
+            steering.shutdown();
+        }
     }
 }
 
@@ -1020,6 +1025,7 @@ impl<R: NodeWaypointUdpInterfaceResolver> NodeWaypointUdpSourceIndexManager<R> {
     pub async fn run(self, mut shutdown: watch::Receiver<bool>) {
         let retraction = SourceIndexRetractionGuard {
             index: self.index.clone(),
+            steering: self.steering.clone(),
         };
         info!(
             poll_interval_ms = self.poll_interval.as_millis() as u64,
