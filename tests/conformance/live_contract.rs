@@ -969,6 +969,26 @@ fn native_probe_classifier_contract_violations(
             "self-test that wrong-SAN stays a client-side tls-name class",
         ),
         (
+            "hosted-untrusted-ca-native-tls-class",
+            "self-test that hosted native_tls_class=client_tls_verify pins tls-verify",
+        ),
+        (
+            "hosted-wrong-san-native-tls-class",
+            "self-test that hosted native_tls_class=client_tls_name pins tls-name",
+        ),
+        (
+            "flattened-tonic-error-is-not-client-verify-proof",
+            "self-test that a flattened tonic transport error is not tls-verify",
+        ),
+        (
+            "json-error-text-is-not-native-tls-class",
+            "self-test that native_tls_class mentioned only in error text is ignored",
+        ),
+        (
+            "native_tls_class",
+            "classifier consumes the closed-set native_tls_class log field",
+        ),
+        (
             "preserve-client-jwt-negative",
             "self-test that client UNAUTHENTICATED still classifies as jwt",
         ),
@@ -1104,6 +1124,18 @@ fn native_mtls_negative_control_contract_violations(run_sh: &str, helper: &str) 
         (
             "client-jwt-alone-is-not-cp-meshsubscribe-proof",
             "classifier self-test that client UNAUTH alone is not CP JWT proof",
+        ),
+        (
+            "hosted-untrusted-ca-native-tls-class",
+            "classifier self-test for hosted untrusted-CA native_tls_class evidence",
+        ),
+        (
+            "hosted-wrong-san-native-tls-class",
+            "classifier self-test for hosted wrong-SAN native_tls_class evidence",
+        ),
+        (
+            "flattened-tonic-error-is-not-client-verify-proof",
+            "classifier self-test that flattened tonic errors stay handshake",
         ),
     ] {
         if !helper.contains(needle) {

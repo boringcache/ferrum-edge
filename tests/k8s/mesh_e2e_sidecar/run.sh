@@ -120,6 +120,9 @@ LIVE_ASSERTIONS_HELPER="$ROOT_DIR/tests/k8s/lib/live_assertions.sh"
 SPIRE_HELPER="$ROOT_DIR/tests/k8s/lib/spire.sh"
 NATIVE_PROBE_CLASSIFY_HELPER="$ROOT_DIR/tests/k8s/lib/native_probe_classify.py"
 # Classifier --evidence-out labels each negative must pin (not broad TLS classes).
+# Client-side untrusted-CA / wrong-SAN proof is the closed-set native_tls_class
+# field (`client_tls_verify` / `client_tls_name`) emitted by the native
+# MeshSubscribe observing verifier, not a generic handshake or tonic transport error.
 NATIVE_EVID_CP_NO_CERT='cp_tls_rejected ip=.* reason=peer sent no certificates'
 NATIVE_EVID_CP_UNKNOWN_ISSUER='cp_tls_rejected ip=.* reason=invalid peer certificate: UnknownIssuer'
 NATIVE_EVID_CLIENT_SERVER_VERIFY='^client_tls_verify$'
@@ -1593,6 +1596,8 @@ native_probe_running_identity() {
 # Client `Connected to CP` is only a transient transport-attempt signal and
 # must not override exact CP evidence correlated to this probe's pod IP
 # (pre-subscribe TLS) or pod/node name (tenant-subscription JWT reject).
+# Client-side untrusted-CA / wrong-SAN require native_tls_class
+# client_tls_verify / client_tls_name; a generic handshake is not proof.
 classify_native_probe() {
   local deploy="$1"
   local logs identity pod_name="" pod_ip="" client_file cp_file evidence_file st

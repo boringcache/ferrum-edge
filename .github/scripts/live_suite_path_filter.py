@@ -498,6 +498,18 @@ def native_mtls_negative_control_contract_errors(run_text: str, helper_text: str
             "client-jwt-alone-is-not-cp-meshsubscribe-proof",
             "classifier self-test that client UNAUTH alone is not CP JWT proof",
         ),
+        (
+            "hosted-untrusted-ca-native-tls-class",
+            "classifier self-test for hosted untrusted-CA native_tls_class evidence",
+        ),
+        (
+            "hosted-wrong-san-native-tls-class",
+            "classifier self-test for hosted wrong-SAN native_tls_class evidence",
+        ),
+        (
+            "flattened-tonic-error-is-not-client-verify-proof",
+            "classifier self-test that flattened tonic errors stay handshake",
+        ),
     ):
         if needle not in helper_text:
             errors.append(

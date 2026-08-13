@@ -41,6 +41,12 @@ TLS_HANDSHAKE_REASONS = frozenset({"peer sent no certificates"})
 TLS_VERIFY_REASONS = frozenset({"invalid peer certificate: UnknownIssuer"})
 TLS_REASONS = TLS_HANDSHAKE_REASONS | TLS_VERIFY_REASONS
 
+# Closed-set structured field emitted by the native MeshSubscribe client when
+# the observing verifier saw CA verification fail vs hostname/SAN failure.
+NATIVE_TLS_CLASS_FIELD = "native_tls_class"
+NATIVE_TLS_CLASS_VERIFY = "client_tls_verify"
+NATIVE_TLS_CLASS_NAME = "client_tls_name"
+
 # Per-control evidence labels the live fixture must pin (not broad TLS classes).
 CONTROL_EVIDENCE = {
     "omit-client": (
@@ -217,6 +223,29 @@ def client_jwt(client_logs: str) -> bool:
     )
 
 
+def client_native_tls_class(client_logs: str) -> str | None:
+    """Return the closed-set native MeshSubscribe TLS class from structured logs.
+
+    JSON lines are trusted only via the `native_tls_class` field so an error
+    string that happens to mention the label cannot relabel a generic handshake.
+    Compact non-JSON lines use literal field equality.
+    """
+    found: str | None = None
+    for line in client_logs.splitlines():
+        fields = json_fields(line)
+        if fields is not None:
+            value = fields.get(NATIVE_TLS_CLASS_FIELD, "")
+            if value in {NATIVE_TLS_CLASS_VERIFY, NATIVE_TLS_CLASS_NAME}:
+                found = value
+            continue
+        if exact_field_equals(line, NATIVE_TLS_CLASS_FIELD, NATIVE_TLS_CLASS_NAME):
+            found = NATIVE_TLS_CLASS_NAME
+            continue
+        if exact_field_equals(line, NATIVE_TLS_CLASS_FIELD, NATIVE_TLS_CLASS_VERIFY):
+            found = NATIVE_TLS_CLASS_VERIFY
+    return found
+
+
 def client_tls_name(client_logs: str) -> bool:
     lowered = client_logs.lower()
     return (
@@ -261,7 +290,8 @@ def classify_native_probe(
     """Return (class, concise redacted server/client evidence).
 
     Evidence is assembled from closed-set labels plus API-validated identities.
-    It never copies raw log bodies, tokens, or PEM.
+    It never copies raw log bodies, tokens, or PEM. Client-side CA vs SAN proof
+    prefers the structured `native_tls_class` field over generic handshake text.
     """
     if client_leaked_material(client_logs):
         return "leaked-material", "client_leaked_material"
@@ -278,6 +308,12 @@ def classify_native_probe(
             "jwt",
             f"cp_jwt_rejected node_id={pod_name} reason={CP_JWT_REASON}",
         )
+
+    native_tls = client_native_tls_class(client_logs)
+    if native_tls == NATIVE_TLS_CLASS_NAME:
+        return "tls-name", "client_tls_name"
+    if native_tls == NATIVE_TLS_CLASS_VERIFY:
+        return "tls-verify", "client_tls_verify"
 
     if client_jwt(client_logs):
         return "jwt", "client_jwt"
@@ -334,6 +370,25 @@ def _json_tls_line(ip: str, reason: str) -> str:
                 "remote_addr": ip,
                 "error": reason,
             },
+        }
+    )
+
+
+def _json_client_connect_fail(tls_class: str | None, error: str) -> str:
+    """Hosted-shaped native MeshSubscribe client failure (JSON tracing)."""
+    fields: dict[str, str] = {
+        "message": "Native MeshSubscribe connection failed",
+        "cp_url": "https://ferrum-cp.ferrum.svc.cluster.local:50051",
+        "error": error,
+    }
+    if tls_class is not None:
+        fields[NATIVE_TLS_CLASS_FIELD] = tls_class
+    return json.dumps(
+        {
+            "timestamp": "2026-08-13T16:52:06.594260Z",
+            "level": "ERROR",
+            "target": "ferrum_edge::modes::mesh::config_consumer::native_client",
+            "fields": fields,
         }
     )
 
@@ -500,6 +555,87 @@ def self_test() -> None:
         "client_tls_name",
         "wrong-san-stays-client-side",
     )
+
+    flattened = "error trying to connect: connection closed"
+    hosted_verify = connected + _json_client_connect_fail(
+        NATIVE_TLS_CLASS_VERIFY, flattened
+    ) + "\n"
+    hosted_name = connected + _json_client_connect_fail(
+        NATIVE_TLS_CLASS_NAME, flattened
+    ) + "\n"
+    hosted_flat = connected + _json_client_connect_fail(None, flattened) + "\n"
+    _assert_class(
+        hosted_verify,
+        "",
+        "10.244.0.97",
+        "native-untrusted-ca-6fb89f87f5-2ls5k",
+        "tls-verify",
+        "client_tls_verify",
+        "hosted-untrusted-ca-native-tls-class",
+    )
+    _assert_class(
+        hosted_name,
+        "",
+        "10.244.0.98",
+        "native-wrong-san-5c7fd9556f-xf64r",
+        "tls-name",
+        "client_tls_name",
+        "hosted-wrong-san-native-tls-class",
+    )
+    _assert_class(
+        hosted_flat,
+        "",
+        "10.244.0.97",
+        "native-untrusted-ca-6fb89f87f5-2ls5k",
+        "tls-handshake",
+        "client_tls_handshake",
+        "flattened-tonic-error-is-not-client-verify-proof",
+    )
+    _assert_class(
+        hosted_flat,
+        "",
+        "10.244.0.98",
+        "native-wrong-san-5c7fd9556f-xf64r",
+        "tls-handshake",
+        "client_tls_handshake",
+        "flattened-tonic-error-is-not-client-name-proof",
+    )
+    mentioned = connected + _json_client_connect_fail(
+        None, "wanted native_tls_class=client_tls_verify in evidence"
+    ) + "\n"
+    _assert_class(
+        mentioned,
+        "",
+        "10.244.0.97",
+        "native-untrusted-ca-6fb89f87f5-2ls5k",
+        "tls-handshake",
+        "client_tls_handshake",
+        "json-error-text-is-not-native-tls-class",
+    )
+    _assert_class(
+        hosted_verify,
+        _json_tls_line(omit_ip, "peer sent no certificates"),
+        omit_ip,
+        omit_name,
+        "tls-handshake",
+        f"cp_tls_rejected ip={omit_ip} reason=peer sent no certificates",
+        "cp-omit-still-wins-over-client-native-tls-class",
+    )
+    compact_name = (
+        connected
+        + f"{NATIVE_TLS_CLASS_FIELD}={NATIVE_TLS_CLASS_NAME} "
+        + "Native MeshSubscribe connection failed\n"
+    )
+    _assert_class(
+        compact_name,
+        "",
+        "10.244.0.98",
+        "native-wrong-san-5c7fd9556f-xf64r",
+        "tls-name",
+        "client_tls_name",
+        "compact-native-tls-class-name",
+    )
+
     _assert_class(
         connected + "error: gRPC UNAUTHENTICATED\n",
         "",
