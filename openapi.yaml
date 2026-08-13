@@ -11614,11 +11614,21 @@ components:
       type: object
       required:
         - egress_scope
+        - config_stream
         - node_waypoint_observability
         - udp_placement_migration
       properties:
         egress_scope:
           $ref: "#/components/schemas/MeshEgressScopeHealth"
+        config_stream:
+          oneOf:
+            - $ref: "#/components/schemas/MeshConfigStreamStatus"
+            - type: "null"
+          description: |
+            Mesh configuration-stream attempt/liveness status (issue #3854).
+            Authenticated `/health`/`/status` mesh detail. `null` for the
+            localized `file` mesh source, which consumes no stream, and before
+            the active consumer's first publication.
         node_waypoint_observability:
           $ref: "#/components/schemas/NodeWaypointObservabilitySnapshot"
           description: |
@@ -11629,6 +11639,82 @@ components:
             SVID rotation; they reset on NodeWaypoint process restart.
         udp_placement_migration:
           $ref: "#/components/schemas/UdpPlacementMigrationStatusSnapshot"
+
+    MeshConfigStreamStatus:
+      type: object
+      description: |
+        Closed-set status of the mesh configuration stream (native
+        `MeshSubscribe`, Ferrum-private ADS, or third-party stock ADS).
+        Deliberately label-free: no endpoint URL, control-plane host, node id,
+        credential path, token, or decoded claim appears here or in the matching
+        `ferrum_mesh_config_stream_attempts_total{protocol,outcome}` series.
+      required:
+        - protocol
+        - state
+        - last_attempt_outcome
+        - fallback_active
+        - consecutive_failures
+        - credential
+        - liveness_bound_seconds
+      properties:
+        protocol:
+          type: string
+          enum: [native, xds, stock_xds]
+          description: Which consumer owns the stream.
+        state:
+          type: string
+          enum:
+            - connected
+            - never_received_slice
+            - stream_liveness_failed
+            - serving_last_good
+          description: |
+            Readiness classification. `never_received_slice` means startup has
+            never completed; `stream_liveness_failed` means the last attempt
+            ended on a transport-liveness bound (keepalive, first frame, or
+            first complete slice) while a previously installed slice keeps
+            serving; `serving_last_good` means the stream is down or
+            reconnecting for another reason.
+        last_attempt_outcome:
+          type: string
+          enum:
+            - none
+            - shutdown
+            - tls_reload
+            - credential_rotation
+            - primary_retry
+            - remote_clean_eof
+            - transport_failure
+            - first_frame_timeout
+            - first_slice_timeout
+            - keepalive_timeout
+            - policy_rejected
+          description: |
+            How the last completed attempt ended. The first four are intentional
+            LOCAL retirements and never rotate the endpoint or grow backoff; the
+            rest are endpoint failures that do. `none` before the first attempt.
+        fallback_active:
+          type: boolean
+          description: True while attached to a non-primary configured endpoint.
+        consecutive_failures:
+          type: integer
+          format: uint32
+          description: Consecutive endpoint-failure attempts since the last usable state.
+        credential:
+          type: string
+          enum: [not_configured, valid, source_invalid]
+          description: |
+            External bearer-credential posture (issue #3852). `source_invalid`
+            means the configured `FERRUM_MESH_STOCK_XDS_TOKEN_FILE` is missing,
+            empty, non-regular, unreadable, oversized, or not valid ASCII
+            metadata; reconnection is refused while it holds.
+        liveness_bound_seconds:
+          type: integer
+          format: uint64
+          description: |
+            Documented upper bound, in seconds, on detecting a half-open or
+            blackholed ESTABLISHED stream without any application frames
+            (HTTP/2 PING interval plus PING ack timeout).
 
     UdpPlacementMigrationStatusSnapshot:
       type: object

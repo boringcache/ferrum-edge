@@ -63,6 +63,14 @@ use crate::modes::mesh::config::{
 };
 use crate::modes::mesh::config_consumer::native_client::NativeMeshClientConfig;
 use crate::modes::mesh::config_consumer::stock_xds_client::StockXdsClientConfig;
+use crate::modes::mesh::config_consumer::stock_xds_credential::{
+    DEFAULT_STOCK_XDS_TOKEN_MAX_STREAM_LIFETIME_SECS, DEFAULT_STOCK_XDS_TOKEN_REFRESH_SKEW_SECS,
+    DEFAULT_STOCK_XDS_TOKEN_WATCH_INTERVAL_SECS, MAX_STOCK_XDS_TOKEN_MAX_STREAM_LIFETIME_SECS,
+    MIN_STOCK_XDS_TOKEN_MAX_STREAM_LIFETIME_SECS, StockCredentialLifetimePolicy,
+    StockCredentialWatch, StockXdsCredentialSource,
+};
+use crate::modes::mesh::config_consumer::stock_xds_transport::StockXdsTransportPolicy;
+use crate::modes::mesh::config_consumer::stream_lifecycle::MeshStreamTimings;
 use crate::modes::mesh::config_consumer::xds_client::XdsClientConfig;
 use crate::modes::mesh::dns_proxy::MeshDnsProxy;
 use crate::modes::mesh::runtime::MeshRuntimeState;
@@ -421,6 +429,15 @@ pub struct MeshRuntimeConfig {
     /// projected Kubernetes service-account token. `None` sends no
     /// `authorization` metadata.
     pub stock_xds_token_file: Option<String>,
+    /// Finite authorization-lifetime policy for that bearer (issue #3852):
+    /// maximum authenticated stream lifetime, JWT `exp` reconnect skew, and
+    /// credential-source watch cadence.
+    pub stock_xds_credential_policy: StockCredentialLifetimePolicy,
+    /// `FERRUM_MESH_STOCK_XDS_ALLOW_PLAINTEXT` — the explicit, loopback-only,
+    /// default-off development switch that admits an `http://` stock ADS
+    /// endpoint (issue #3853). Never compatible with a bearer credential and
+    /// always refused under `FERRUM_MESH_PRODUCTION_MODE=true`.
+    pub stock_xds_allow_plaintext: bool,
     /// Bounds applied to every stock xDS response before anything reaches the
     /// typed mesh model.
     pub stock_xds_limits: crate::xds::stock::StockXdsLimits,
@@ -646,6 +663,10 @@ impl MeshRuntimeConfig {
             resolve_ferrum_var("FERRUM_MESH_STOCK_XDS_NODE_METADATA").as_deref(),
         )?;
         let stock_xds_limits = parse_stock_xds_limits()?;
+        let stock_xds_allow_plaintext = resolve_ferrum_var("FERRUM_MESH_STOCK_XDS_ALLOW_PLAINTEXT")
+            .map(|v| v.eq_ignore_ascii_case("true") || v.trim() == "1")
+            .unwrap_or(false);
+        let stock_xds_credential_policy = parse_stock_xds_credential_policy()?;
         if config_protocol == MeshConfigProtocol::StockXds {
             if stock_xds_urls.is_empty() {
                 return Err("FERRUM_MESH_STOCK_XDS_URLS is required when \
@@ -660,6 +681,30 @@ impl MeshRuntimeConfig {
                      proxy's whole configuration from DiscoveryRequest.node.id, so Ferrum will \
                      not guess it from the hostname default of FERRUM_MESH_NODE_ID)"
                     .into());
+            }
+            // Issue #3853: admit the COMPLETE primary/fallback endpoint set as
+            // ONE transport-security posture, before anything can dial. A
+            // bearer requires authenticated TLS on every endpoint (including
+            // loopback); production requires TLS with or without a bearer; the
+            // only plaintext path left is the explicit loopback-only
+            // development switch, which is incompatible with a bearer.
+            crate::modes::mesh::config_consumer::stock_xds_transport::admit_stock_xds_endpoints(
+                &stock_xds_urls,
+                StockXdsTransportPolicy {
+                    token_configured: stock_xds_token_file.is_some(),
+                    production_mode: crate::identity::production_mode(),
+                    allow_loopback_plaintext: stock_xds_allow_plaintext,
+                },
+            )
+            .map_err(|refusal| refusal.to_string())?;
+            if stock_xds_allow_plaintext {
+                warn!(
+                    "FERRUM_MESH_STOCK_XDS_ALLOW_PLAINTEXT=true admits plaintext h2c stock xDS \
+                     on loopback only. This is a DEVELOPMENT posture: discovery responses \
+                     carry no transport integrity and the server is not authenticated. It is \
+                     refused outright under FERRUM_MESH_PRODUCTION_MODE=true and can never \
+                     carry a bearer credential."
+                );
             }
         }
 
@@ -865,6 +910,8 @@ impl MeshRuntimeConfig {
             stock_xds_node_id,
             stock_xds_node_metadata,
             stock_xds_token_file,
+            stock_xds_credential_policy,
+            stock_xds_allow_plaintext,
             stock_xds_limits,
             topology,
             inbound_listen_addr,
@@ -922,7 +969,17 @@ impl MeshRuntimeConfig {
             // Same `FERRUM_DP_CP_FAILOVER_PRIMARY_RETRY_SECS` interval the xDS
             // client uses — the knob is protocol-agnostic failover/failback.
             primary_retry_secs: self.xds_primary_retry_secs,
+            timings: MeshStreamTimings::production(),
         }
+    }
+
+    /// The stock bearer-credential source plus its finite authorization
+    /// lifetime policy (issue #3852).
+    fn stock_xds_credential_source(&self) -> StockXdsCredentialSource {
+        StockXdsCredentialSource::new(
+            self.stock_xds_token_file.clone(),
+            self.stock_xds_credential_policy,
+        )
     }
 
     /// Settings for the stock (third-party) ADS consumer. Only meaningful when
@@ -940,11 +997,13 @@ impl MeshRuntimeConfig {
             cluster: self.xds_node_cluster.clone(),
             namespace: self.namespace.clone(),
             node_metadata: self.stock_xds_node_metadata.clone(),
-            token_file: self.stock_xds_token_file.clone(),
+            credential: self.stock_xds_credential_source(),
+            allow_loopback_plaintext: self.stock_xds_allow_plaintext,
             stream_channel_capacity: self.xds_stream_channel_capacity,
             primary_retry_secs: self.xds_primary_retry_secs,
             connect_timeout_seconds: self.xds_connect_timeout_seconds,
             limits: self.stock_xds_limits,
+            timings: MeshStreamTimings::production(),
         }
     }
 
@@ -12065,6 +12124,20 @@ pub async fn run(
         });
 
         let stock_config = runtime.stock_xds_client_config();
+        // Issue #3852: the bearer credential gets its own watcher so a rotated,
+        // removed, or otherwise invalidated projected token retires the ADS
+        // stream instead of letting it outlive the credential that opened it.
+        // The handle joins with the other mesh background tasks, so nothing is
+        // left detached at shutdown.
+        let credential_watch =
+            StockCredentialWatch::new(stock_config.credential.initial_state());
+        background_handles.push(tokio::spawn(
+            config_consumer::stock_xds_credential::start_stock_credential_watcher_with_shutdown(
+                stock_config.credential.clone(),
+                credential_watch.clone(),
+                shutdown_tx.subscribe(),
+            ),
+        ));
         background_handles.push(tokio::spawn(
             config_consumer::stock_xds_client::start_stock_policy_watcher_with_shutdown(
                 policy_path.clone(),
@@ -12083,6 +12156,7 @@ pub async fn run(
                 grpc_tls_reload,
                 policy_rx,
                 local_source_recovery.clone(),
+                credential_watch,
             ),
         ));
         info!(
@@ -12168,6 +12242,7 @@ pub async fn run(
                 shutdown_rx,
                 grpc_tls.clone(),
                 grpc_tls_reload,
+                MeshStreamTimings::production(),
             ));
             background_handles.push(handle);
             info!(
@@ -17808,6 +17883,8 @@ pub mod startup_rollback_test_seams {
             stock_xds_node_id: None,
             stock_xds_node_metadata: BTreeMap::new(),
             stock_xds_token_file: None,
+            stock_xds_credential_policy: Default::default(),
+            stock_xds_allow_plaintext: false,
             stock_xds_limits: crate::xds::stock::StockXdsLimits::default(),
             topology: MeshTopology::Sidecar,
             inbound_listen_addr: "127.0.0.1:0".parse().unwrap(),
@@ -18448,6 +18525,68 @@ fn parse_port(key: &str, raw: &str) -> Result<u16, String> {
 fn parse_duration_seconds(key: &str, raw: &str) -> Result<u64, String> {
     raw.parse::<u64>()
         .map_err(|e| format!("{key} must be a duration in seconds (got '{raw}'): {e}"))
+}
+
+/// Parse the stock xDS bearer-credential authorization-lifetime policy
+/// (issue #3852).
+///
+/// The maximum stream lifetime is deliberately bounded on BOTH sides: `0` (and
+/// anything under a minute) would turn reauthentication into a reconnect storm,
+/// while an unbounded value would reintroduce exactly the defect this policy
+/// exists to close — an opaque bearer whose effective access lifetime is the
+/// lifetime of the TCP/H2 stream. There is no "disabled" spelling.
+fn parse_stock_xds_credential_policy() -> Result<StockCredentialLifetimePolicy, String> {
+    const MAX_LIFETIME_KEY: &str = "FERRUM_MESH_STOCK_XDS_TOKEN_MAX_STREAM_LIFETIME_SECONDS";
+    const SKEW_KEY: &str = "FERRUM_MESH_STOCK_XDS_TOKEN_REFRESH_SKEW_SECONDS";
+    const WATCH_KEY: &str = "FERRUM_MESH_STOCK_XDS_TOKEN_WATCH_INTERVAL_SECONDS";
+
+    let max_lifetime_raw =
+        resolve_ferrum_var(MAX_LIFETIME_KEY).filter(|value| !value.trim().is_empty());
+    let max_stream_lifetime_secs = match max_lifetime_raw {
+        Some(raw) => parse_duration_seconds(MAX_LIFETIME_KEY, raw.trim())?,
+        None => DEFAULT_STOCK_XDS_TOKEN_MAX_STREAM_LIFETIME_SECS,
+    };
+    if max_stream_lifetime_secs < MIN_STOCK_XDS_TOKEN_MAX_STREAM_LIFETIME_SECS
+        || max_stream_lifetime_secs > MAX_STOCK_XDS_TOKEN_MAX_STREAM_LIFETIME_SECS
+    {
+        return Err(format!(
+            "{MAX_LIFETIME_KEY} must be between \
+             {MIN_STOCK_XDS_TOKEN_MAX_STREAM_LIFETIME_SECS} and \
+             {MAX_STOCK_XDS_TOKEN_MAX_STREAM_LIFETIME_SECS} seconds (got \
+             {max_stream_lifetime_secs}); a stock ADS stream authenticated with an external \
+             bearer must have a finite maximum authorization lifetime"
+        ));
+    }
+
+    let skew_raw = resolve_ferrum_var(SKEW_KEY).filter(|value| !value.trim().is_empty());
+    let refresh_skew_secs = match skew_raw {
+        Some(raw) => parse_duration_seconds(SKEW_KEY, raw.trim())?,
+        None => DEFAULT_STOCK_XDS_TOKEN_REFRESH_SKEW_SECS,
+    };
+    if refresh_skew_secs >= max_stream_lifetime_secs {
+        return Err(format!(
+            "{SKEW_KEY} ({refresh_skew_secs}s) must be smaller than {MAX_LIFETIME_KEY} \
+             ({max_stream_lifetime_secs}s)"
+        ));
+    }
+
+    let watch_raw = resolve_ferrum_var(WATCH_KEY).filter(|value| !value.trim().is_empty());
+    let watch_interval_secs = match watch_raw {
+        Some(raw) => parse_duration_seconds(WATCH_KEY, raw.trim())?,
+        None => DEFAULT_STOCK_XDS_TOKEN_WATCH_INTERVAL_SECS,
+    };
+    if watch_interval_secs == 0 || watch_interval_secs > 300 {
+        return Err(format!(
+            "{WATCH_KEY} must be between 1 and 300 seconds (got {watch_interval_secs}); 0 \
+             would disable rotation detection entirely"
+        ));
+    }
+
+    Ok(StockCredentialLifetimePolicy {
+        max_stream_lifetime: std::time::Duration::from_secs(max_stream_lifetime_secs),
+        refresh_skew: std::time::Duration::from_secs(refresh_skew_secs),
+        watch_interval: std::time::Duration::from_secs(watch_interval_secs),
+    })
 }
 
 /// Spawn the SOCK_OPS ringbuf consumer for `__mesh_bpf_metrics`.
@@ -19287,6 +19426,8 @@ mod tests {
             stock_xds_node_id: None,
             stock_xds_node_metadata: BTreeMap::new(),
             stock_xds_token_file: None,
+            stock_xds_credential_policy: Default::default(),
+            stock_xds_allow_plaintext: false,
             stock_xds_limits: crate::xds::stock::StockXdsLimits::default(),
             topology: MeshTopology::Sidecar,
             inbound_listen_addr: "127.0.0.1:0".parse().unwrap(),
@@ -19410,6 +19551,8 @@ mod tests {
             stock_xds_node_id: None,
             stock_xds_node_metadata: BTreeMap::new(),
             stock_xds_token_file: None,
+            stock_xds_credential_policy: Default::default(),
+            stock_xds_allow_plaintext: false,
             stock_xds_limits: crate::xds::stock::StockXdsLimits::default(),
             topology: MeshTopology::Sidecar,
             inbound_listen_addr: "127.0.0.1:0".parse().unwrap(),

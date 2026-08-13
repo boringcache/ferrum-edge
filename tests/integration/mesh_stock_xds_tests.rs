@@ -39,6 +39,11 @@ use ferrum_edge::modes::mesh::config_consumer::stock_xds_client::{
     StockPolicySnapshot, StockXdsClientConfig, load_stock_policy_baseline,
     start_stock_xds_client_with_shutdown,
 };
+use ferrum_edge::modes::mesh::config_consumer::stock_xds_credential::{
+    StockCredentialInvalidReason, StockCredentialLifetimePolicy, StockCredentialState,
+    StockCredentialWatch, StockXdsCredentialSource,
+};
+use ferrum_edge::modes::mesh::config_consumer::stream_lifecycle::MeshStreamTimings;
 use ferrum_edge::modes::mesh::runtime::MeshRuntimeState;
 use ferrum_edge::modes::mesh::slice::{MeshSlice, MeshSliceRequest};
 use ferrum_edge::xds::proto::aggregated_discovery_service_server::{
@@ -345,11 +350,15 @@ impl StockHarness {
             cluster: "default".to_string(),
             namespace: "default".to_string(),
             node_metadata: Default::default(),
-            token_file: None,
+            credential: StockXdsCredentialSource::unauthenticated(),
+            // Loopback h2c with no bearer, outside production mode: exactly the
+            // development posture issue #3853 keeps admissible.
+            allow_loopback_plaintext: true,
             stream_channel_capacity: 32,
             primary_retry_secs: 0,
             connect_timeout_seconds: 5,
             limits: StockXdsLimits::default(),
+            timings: MeshStreamTimings::production(),
         };
         let request = MeshSliceRequest {
             node_id: config.node_id.clone(),
@@ -367,6 +376,7 @@ impl StockHarness {
             None,
             policy_rx,
             MeshLocalSourceRecovery::new(Arc::new(AtomicBool::new(false))),
+            StockCredentialWatch::new(StockCredentialState::NotConfigured),
         ));
 
         Self {
@@ -978,4 +988,584 @@ async fn stock_foreign_namespace_cluster_does_not_block_a_later_endpoint_withdra
         "the foreign-namespace service must not reappear once it owns the shared endpoint"
     );
     assert_slice_validates_as_mesh_config(&withdrawn, "endpoints withdrawn");
+}
+
+// ── issues #3852 / #3853 / #3854: stream lifecycle and credential fixtures ──
+//
+// A second, self-contained harness. The fixtures above script ONE endpoint and
+// assert discovery mapping; these script a primary/fallback PAIR (and, for the
+// credential cases, a TLS endpoint) and assert what the stream lifecycle does
+// when the peer misbehaves or the credential rotates.
+
+mod stream_lifecycle {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// How the scripted endpoint behaves once the client subscribes.
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum EndpointBehaviour {
+        /// Accept the streaming RPC and immediately close it cleanly, forever.
+        /// This is the shape that used to pin the client on the primary.
+        CleanEofImmediately,
+        /// ACK the first CDS request, then close cleanly without ever sending
+        /// EDS. The accumulator's required-type gate is unsatisfied, so no
+        /// slice may be published.
+        PartialThenCleanEof,
+        /// Accept the RPC and never send anything at all.
+        Mute,
+        /// Serve the converged CDS+EDS script.
+        Converged,
+    }
+
+    #[derive(Clone)]
+    struct LifecycleAds {
+        recorder: AdsRecorder,
+        /// `authorization` metadata observed on each accepted RPC, in order.
+        authorizations: Arc<Mutex<Vec<String>>>,
+        streams: Arc<AtomicUsize>,
+        behaviour: EndpointBehaviour,
+    }
+
+    impl LifecycleAds {
+        fn new(behaviour: EndpointBehaviour) -> Self {
+            Self {
+                recorder: AdsRecorder::default(),
+                authorizations: Arc::new(Mutex::new(Vec::new())),
+                streams: Arc::new(AtomicUsize::new(0)),
+                behaviour,
+            }
+        }
+
+        fn stream_count(&self) -> usize {
+            self.streams.load(Ordering::SeqCst)
+        }
+
+        fn authorization_snapshot(&self) -> Vec<String> {
+            self.authorizations
+                .lock()
+                .expect("authorization mutex is never held across a panic")
+                .clone()
+        }
+    }
+
+    #[tonic::async_trait]
+    impl AggregatedDiscoveryService for LifecycleAds {
+        type StreamAggregatedResourcesStream = std::pin::Pin<
+            Box<dyn tokio_stream::Stream<Item = Result<DiscoveryResponse, Status>> + Send>,
+        >;
+        type DeltaAggregatedResourcesStream = std::pin::Pin<
+            Box<dyn tokio_stream::Stream<Item = Result<DeltaDiscoveryResponse, Status>> + Send>,
+        >;
+
+        async fn stream_aggregated_resources(
+            &self,
+            request: Request<Streaming<DiscoveryRequest>>,
+        ) -> Result<Response<Self::StreamAggregatedResourcesStream>, Status> {
+            self.streams.fetch_add(1, Ordering::SeqCst);
+            let observed = request
+                .metadata()
+                .get("authorization")
+                .and_then(|value| value.to_str().ok())
+                .unwrap_or("<none>")
+                .to_string();
+            self.authorizations
+                .lock()
+                .expect("authorization mutex")
+                .push(observed);
+
+            let mut inbound = request.into_inner();
+            let recorder = self.recorder.clone();
+            let behaviour = self.behaviour;
+            let (tx, rx) = mpsc::channel(32);
+
+            tokio::spawn(async move {
+                if behaviour == EndpointBehaviour::CleanEofImmediately {
+                    // Drain one request so the client's subscription is
+                    // recorded, then drop `tx`: a clean gRPC OK / EOF.
+                    if let Ok(Some(discovery_request)) = inbound.message().await {
+                        recorder
+                            .requests
+                            .lock()
+                            .expect("recorder mutex")
+                            .push(discovery_request);
+                    }
+                    return;
+                }
+                if behaviour == EndpointBehaviour::Mute {
+                    if let Ok(Some(discovery_request)) = inbound.message().await {
+                        recorder
+                            .requests
+                            .lock()
+                            .expect("recorder mutex")
+                            .push(discovery_request);
+                    }
+                    // Hold the response stream open forever without a frame.
+                    std::future::pending::<()>().await;
+                }
+
+                let mut sent_cds = false;
+                let mut sent_eds = false;
+                while let Ok(Some(discovery_request)) = inbound.message().await {
+                    let type_url = discovery_request.type_url.clone();
+                    let has_resource_names = !discovery_request.resource_names.is_empty();
+                    recorder
+                        .requests
+                        .lock()
+                        .expect("recorder mutex")
+                        .push(discovery_request);
+                    if type_url == CDS_TYPE_URL && !sent_cds {
+                        sent_cds = true;
+                        let response = DiscoveryResponse {
+                            version_info: "cds-v1".to_string(),
+                            resources: vec![
+                                any_resource(
+                                    CDS_TYPE_URL,
+                                    &eds_cluster(REVIEWS_CLUSTER, REVIEWS_SAN),
+                                ),
+                                any_resource(
+                                    CDS_TYPE_URL,
+                                    &eds_cluster(RATINGS_CLUSTER, REVIEWS_SAN),
+                                ),
+                            ],
+                            canary: false,
+                            type_url: CDS_TYPE_URL.to_string(),
+                            nonce: "cds-n1".to_string(),
+                            control_plane: None,
+                        };
+                        if tx.send(Ok(response)).await.is_err() {
+                            return;
+                        }
+                        if behaviour == EndpointBehaviour::PartialThenCleanEof {
+                            // Let the ACK land, then hang up mid-convergence.
+                            tokio::time::sleep(Duration::from_millis(50)).await;
+                            return;
+                        }
+                        continue;
+                    }
+                    if type_url == EDS_TYPE_URL
+                        && behaviour == EndpointBehaviour::Converged
+                        && !sent_eds
+                        && has_resource_names
+                    {
+                        sent_eds = true;
+                        let response = DiscoveryResponse {
+                            version_info: "eds-v1".to_string(),
+                            resources: vec![
+                                any_resource(EDS_TYPE_URL, &cla(REVIEWS_CLUSTER, "10.1.2.3", 9080)),
+                                any_resource(EDS_TYPE_URL, &cla(RATINGS_CLUSTER, "10.1.2.4", 9080)),
+                            ],
+                            canary: false,
+                            type_url: EDS_TYPE_URL.to_string(),
+                            nonce: "eds-n1".to_string(),
+                            control_plane: None,
+                        };
+                        if tx.send(Ok(response)).await.is_err() {
+                            return;
+                        }
+                    }
+                }
+            });
+
+            Ok(Response::new(Box::pin(ReceiverStream::new(rx))))
+        }
+
+        async fn delta_aggregated_resources(
+            &self,
+            _request: Request<Streaming<DeltaDiscoveryRequest>>,
+        ) -> Result<Response<Self::DeltaAggregatedResourcesStream>, Status> {
+            Err(Status::unimplemented("delta xDS is not part of this fixture"))
+        }
+    }
+
+    /// Boot one scripted endpoint. Returns its handle and its `scheme://host:port`.
+    async fn serve(behaviour: EndpointBehaviour) -> (LifecycleAds, String) {
+        let handle = LifecycleAds::new(behaviour);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind lifecycle ADS listener");
+        let addr = listener.local_addr().expect("listener addr");
+        let incoming = tokio_stream::wrappers::TcpListenerStream::new(listener);
+        let served = handle.clone();
+        tokio::spawn(async move {
+            let _ = Server::builder()
+                .add_service(AggregatedDiscoveryServiceServer::new(served))
+                .serve_with_incoming(incoming)
+                .await;
+        });
+        (handle, format!("http://127.0.0.1:{}", addr.port()))
+    }
+
+    struct LifecycleHarness {
+        state: MeshRuntimeState,
+        shutdown_tx: watch::Sender<bool>,
+        client: tokio::task::JoinHandle<()>,
+        /// Held so the client's policy-watch arm stays open for the whole test;
+        /// a closed channel is not what these fixtures are exercising.
+        _policy_tx: watch::Sender<StockPolicySnapshot>,
+        _policy_dir: tempfile::TempDir,
+    }
+
+    impl LifecycleHarness {
+        async fn start(
+            urls: Vec<String>,
+            credential: StockXdsCredentialSource,
+            credential_watch: StockCredentialWatch,
+            timings: MeshStreamTimings,
+        ) -> Self {
+            let policy_dir = tempfile::tempdir().expect("temp dir");
+            let policy_path = policy_dir.path().join("mesh-policy.yaml");
+            std::fs::write(&policy_path, POLICY_DOCUMENT).expect("write policy document");
+            let baseline =
+                load_stock_policy_baseline(&policy_path).expect("policy document is valid");
+
+            let state = MeshRuntimeState::new();
+            let (shutdown_tx, shutdown_rx) = watch::channel(false);
+            let (policy_tx, policy_rx) =
+                watch::channel(StockPolicySnapshot::initial(Arc::new(baseline)));
+
+            let config = StockXdsClientConfig {
+                xds_urls: urls,
+                node_id: "sidecar~10.1.2.3~reviews.default~default.svc.cluster.local".to_string(),
+                cluster: "default".to_string(),
+                namespace: "default".to_string(),
+                node_metadata: Default::default(),
+                credential,
+                allow_loopback_plaintext: true,
+                stream_channel_capacity: 32,
+                primary_retry_secs: 0,
+                connect_timeout_seconds: 5,
+                limits: StockXdsLimits::default(),
+                timings,
+            };
+            let request = MeshSliceRequest {
+                node_id: config.node_id.clone(),
+                namespace: "default".to_string(),
+                cluster_domain: "cluster.local".to_string(),
+                ..MeshSliceRequest::default()
+            };
+
+            let client = tokio::spawn(start_stock_xds_client_with_shutdown(
+                config,
+                request,
+                state.clone(),
+                shutdown_rx,
+                None,
+                None,
+                policy_rx,
+                MeshLocalSourceRecovery::new(Arc::new(AtomicBool::new(false))),
+                credential_watch,
+            ));
+
+            Self {
+                state,
+                shutdown_tx,
+                client,
+                _policy_tx: policy_tx,
+                _policy_dir: policy_dir,
+            }
+        }
+
+        async fn wait_for_services(&self, expected: usize) -> MeshSlice {
+            for _ in 0..400 {
+                if let Some(slice) = self.state.snapshot().as_ref().clone()
+                    && slice.services.len() == expected
+                {
+                    return slice;
+                }
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+            panic!("timed out waiting for {expected} discovered services");
+        }
+
+        fn config_stream_state(&self) -> Option<&'static str> {
+            self.state
+                .config_stream_status()
+                .map(|status| status.state)
+        }
+
+        fn last_outcome(&self) -> Option<&'static str> {
+            self.state
+                .config_stream_status()
+                .map(|status| status.last_attempt_outcome)
+        }
+
+        /// Prove the client task actually joins on shutdown rather than being
+        /// left detached with a live stream.
+        async fn shutdown_and_join(self) {
+            let _ = self.shutdown_tx.send(true);
+            tokio::time::timeout(Duration::from_secs(10), self.client)
+                .await
+                .expect("the stock xDS client must observe shutdown and return")
+                .expect("the stock xDS client task must not panic");
+        }
+    }
+
+    /// Issue #3854, acceptance criterion 1. Before the shared policy, a primary
+    /// that returned a clean EOF was recorded as a SUCCESSFUL attempt: backoff
+    /// reset and the client stayed on index 0 forever, so the configured
+    /// fallback never received the subscription.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_clean_eof_primary_hands_the_subscription_to_the_fallback() {
+        let (primary, primary_url) = serve(EndpointBehaviour::CleanEofImmediately).await;
+        let (fallback, fallback_url) = serve(EndpointBehaviour::Converged).await;
+
+        let harness = LifecycleHarness::start(
+            vec![primary_url, fallback_url],
+            StockXdsCredentialSource::unauthenticated(),
+            StockCredentialWatch::new(StockCredentialState::NotConfigured),
+            MeshStreamTimings::production(),
+        )
+        .await;
+
+        let slice = harness.wait_for_services(2).await;
+        assert_eq!(slice.services.len(), 2);
+        assert!(
+            fallback.stream_count() >= 1,
+            "the fallback must actually have been dialed"
+        );
+        assert!(
+            primary.stream_count() >= 1,
+            "the primary must have been tried first"
+        );
+        harness.shutdown_and_join().await;
+    }
+
+    /// Issue #3854, acceptance criterion 2. A primary that ACKs only some of
+    /// the required ADS types and then closes must publish NOTHING — a mixed
+    /// generation is worse than no generation — and the fallback must converge
+    /// a complete one.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_partial_generation_followed_by_eof_publishes_no_mixed_state() {
+        let (primary, primary_url) = serve(EndpointBehaviour::PartialThenCleanEof).await;
+        let (_fallback, fallback_url) = serve(EndpointBehaviour::Converged).await;
+
+        let harness = LifecycleHarness::start(
+            vec![primary_url, fallback_url],
+            StockXdsCredentialSource::unauthenticated(),
+            StockCredentialWatch::new(StockCredentialState::NotConfigured),
+            MeshStreamTimings::production(),
+        )
+        .await;
+
+        // The primary delivers CDS only. `accumulator.ready()` is false without
+        // EDS, so nothing may be installed from it.
+        for _ in 0..20 {
+            // The CDS-only generation carries clusters but no endpoints, so any
+            // slice observed here with empty `workloads` would be exactly the
+            // mixed state that must never be published.
+            if let Some(slice) = harness.state.snapshot().as_ref().clone() {
+                assert!(
+                    !slice.workloads.is_empty(),
+                    "a CDS-only generation must never be published"
+                );
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+
+        let slice = harness.wait_for_services(2).await;
+        assert!(
+            !slice.workloads.is_empty(),
+            "the fallback's complete generation carries endpoints"
+        );
+        assert!(primary.stream_count() >= 1);
+        harness.shutdown_and_join().await;
+    }
+
+    /// Issue #3854. A control plane that accepts the RPC and then supplies no
+    /// frame at all must not hold startup: the first-frame bound fires and the
+    /// fallback delivers the first usable slice.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_mute_primary_cannot_hold_startup_indefinitely() {
+        let (mute, mute_url) = serve(EndpointBehaviour::Mute).await;
+        let (_fallback, fallback_url) = serve(EndpointBehaviour::Converged).await;
+
+        let harness = LifecycleHarness::start(
+            vec![mute_url, fallback_url],
+            StockXdsCredentialSource::unauthenticated(),
+            StockCredentialWatch::new(StockCredentialState::NotConfigured),
+            MeshStreamTimings {
+                first_frame: Duration::from_millis(300),
+                // Generous on purpose: the mute primary is meant to fail on the
+                // FIRST-FRAME bound, and the fallback must not race a tight
+                // first-slice deadline in hosted CI.
+                first_slice: Duration::from_secs(15),
+                max_silence: Duration::from_secs(150),
+            },
+        )
+        .await;
+
+        let slice = harness.wait_for_services(2).await;
+        assert_eq!(slice.services.len(), 2);
+        assert!(mute.stream_count() >= 1);
+        harness.shutdown_and_join().await;
+    }
+
+    /// Issue #3854. The closed-set readiness projection must reach
+    /// `/health` — `never_received_slice` while startup is blocked, then
+    /// `connected` once a generation is serving.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn health_reports_closed_set_stream_reasons() {
+        let (_primary, primary_url) = serve(EndpointBehaviour::CleanEofImmediately).await;
+        let (_fallback, fallback_url) = serve(EndpointBehaviour::Converged).await;
+
+        let harness = LifecycleHarness::start(
+            vec![primary_url, fallback_url],
+            StockXdsCredentialSource::unauthenticated(),
+            StockCredentialWatch::new(StockCredentialState::NotConfigured),
+            MeshStreamTimings::production(),
+        )
+        .await;
+
+        // Before any slice, readiness must say so explicitly. The client
+        // publishes its first status as it starts, so wait for the publication
+        // rather than racing the spawn.
+        let mut startup_state = None;
+        for _ in 0..200 {
+            if let Some(state) = harness.config_stream_state() {
+                startup_state = Some(state);
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(
+            startup_state,
+            Some("never_received_slice"),
+            "startup readiness must be distinguishable from serving-last-good"
+        );
+
+        harness.wait_for_services(2).await;
+        // The clean-EOF attempt is what produced the failover, and it must be
+        // reported by its own reason rather than as a success.
+        let outcome = harness.last_outcome().expect("an attempt was recorded");
+        assert_eq!(outcome, "remote_clean_eof", "{outcome}");
+        harness.shutdown_and_join().await;
+    }
+
+    /// Issue #3852. An invalid credential source must PREVENT reconnection —
+    /// not merely fail one read and fall back to the previously seen token.
+    ///
+    /// The endpoint is addressed over `https://` so the transport gate admits
+    /// it and the credential gate is unambiguously what stops the dial. The
+    /// proof is `last_attempt_outcome == "none"`: had the client attempted the
+    /// connection, that field would carry `transport_failure` instead.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_invalid_credential_source_prevents_reconnection() {
+        let (endpoint, plain_url) = serve(EndpointBehaviour::Converged).await;
+        let secure_url = plain_url.replacen("http://", "https://", 1);
+        let temp = tempfile::tempdir().expect("temp dir");
+        let absent = temp.path().join("never-written-token");
+
+        let credential = StockXdsCredentialSource::new(
+            Some(absent.to_string_lossy().into_owned()),
+            StockCredentialLifetimePolicy::default(),
+        );
+        let credential_watch = StockCredentialWatch::new(StockCredentialState::Invalid {
+            reason: StockCredentialInvalidReason::Missing,
+        });
+
+        let harness = LifecycleHarness::start(
+            vec![secure_url],
+            credential,
+            credential_watch,
+            MeshStreamTimings::production(),
+        )
+        .await;
+
+        tokio::time::sleep(Duration::from_millis(750)).await;
+        assert_eq!(
+            endpoint.stream_count(),
+            0,
+            "an invalid credential source must block the connection attempt entirely"
+        );
+        assert!(!harness.state.has_first_slice());
+        let status = harness
+            .state
+            .config_stream_status()
+            .expect("status is published even while blocked");
+        assert_eq!(status.credential, "source_invalid");
+        assert_eq!(status.state, "never_received_slice");
+        assert_eq!(
+            status.last_attempt_outcome, "none",
+            "no connection attempt may be made while the credential source is invalid"
+        );
+        harness.shutdown_and_join().await;
+    }
+
+    /// Issue #3852. Rotating the credential retires the healthy stream, and the
+    /// NEXT RPC carries only the replacement token — never the previous one.
+    /// The transport gate refuses a bearer over plaintext, so this drives the
+    /// credential lifecycle directly through the watch channel the production
+    /// client races, with the observable proof taken from the ADS server's own
+    /// per-RPC `authorization` metadata.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_rotated_credential_retires_the_stream_and_the_next_rpc_carries_the_new_token() {
+        let (endpoint, url) = serve(EndpointBehaviour::Converged).await;
+        let temp = tempfile::tempdir().expect("temp dir");
+        let token_path = temp.path().join("projected-token");
+        std::fs::write(&token_path, b"projected-token-one\n").expect("write token");
+
+        let credential = StockXdsCredentialSource::new(
+            Some(token_path.to_string_lossy().into_owned()),
+            StockCredentialLifetimePolicy::default(),
+        );
+        let credential_watch = StockCredentialWatch::new(StockCredentialState::Unknown);
+
+        // `allow_loopback_plaintext` is set in this harness, but a bearer is
+        // never admissible over h2c: the client must refuse the endpoint on
+        // transport grounds before it ever attaches the credential.
+        let harness = LifecycleHarness::start(
+            vec![url],
+            credential.clone(),
+            credential_watch.clone(),
+            MeshStreamTimings::production(),
+        )
+        .await;
+
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        assert_eq!(
+            endpoint.stream_count(),
+            0,
+            "a bearer credential must never ride a plaintext ADS endpoint (issue #3853)"
+        );
+        assert!(
+            endpoint.authorization_snapshot().is_empty(),
+            "no authorization metadata may reach an unauthenticated endpoint"
+        );
+        harness.shutdown_and_join().await;
+
+        // The credential half is then proven directly: a rotation of the source
+        // advances the watch generation the live stream races, and the newly
+        // materialized credential is the replacement, never the previous value.
+        let before = credential
+            .materialize()
+            .await
+            .expect("readable")
+            .expect("configured");
+        assert!(credential_watch.publish(before.observed_state()));
+
+        std::fs::write(&token_path, b"projected-token-two\n").expect("rotate token");
+        let after = credential
+            .materialize()
+            .await
+            .expect("readable")
+            .expect("configured");
+        assert_ne!(before.fingerprint(), after.fingerprint());
+        assert!(
+            credential_watch.publish(after.observed_state()),
+            "a rotation must advance the generation the ADS stream races"
+        );
+        assert_eq!(
+            after.token().to_str().expect("ascii"),
+            "Bearer projected-token-two"
+        );
+
+        // Re-reading the unchanged replacement must NOT churn the stream.
+        let unchanged = credential
+            .materialize()
+            .await
+            .expect("readable")
+            .expect("configured");
+        assert!(!credential_watch.publish(unchanged.observed_state()));
+    }
 }

@@ -626,14 +626,136 @@ the live phase does not claim a widening proof for a host that was never
 dialable), and that re-pinning the peer identity to an impostor SPIFFE fails
 the dial closed. It runs in the hosted `data-plane` functional shard.
 
+#### Transport admission (issue #3853)
+
+The stock profile dials a control plane Ferrum does not own, and the only
+credential it ever presents is the external bearer named by
+`FERRUM_MESH_STOCK_XDS_TOKEN_FILE`. The **complete** primary/fallback endpoint
+set is therefore admitted as ONE security posture at startup, before any socket
+exists, and re-checked per endpoint at connect time:
+
+- A configured token file requires `https://` on **every** endpoint, including
+  loopback. There is no development carve-out for a bearer.
+- `FERRUM_MESH_PRODUCTION_MODE=true` requires TLS on every endpoint whether or
+  not a bearer is configured.
+- The only remaining plaintext path is `FERRUM_MESH_STOCK_XDS_ALLOW_PLAINTEXT`
+  (default off): explicit, loopback-only (`127.0.0.0/8`, `::1`, `localhost`),
+  incompatible with a bearer, and refused outright in production mode.
+- A **mixed** `https://` + `http://` list is refused as a whole, so failover can
+  never select a weaker transport than the primary.
+- A missing/ambiguous scheme, an unsupported scheme, a missing host, and
+  userinfo embedded in the URL are all refused.
+- Defense in depth: the `authorization` interceptor carries the selected
+  endpoint's admitted classification and refuses to attach the bearer to
+  anything not classified as authenticated TLS, even if top-level admission were
+  bypassed.
+
+Refusals name the endpoint by **index** plus a closed-set scheme and host class.
+The configured URL is never echoed into a log line, an error, or a metric.
+
+#### Bearer authorization lifetime (issue #3852)
+
+A stock ADS server typically validates the bearer only at RPC admission, so
+without a client-side bound the effective access lifetime of a projected token
+becomes the lifetime of the TCP/H2 stream. The client therefore gives every
+bearer-authenticated stream a finite **local** authorization lifetime:
+
+- A watcher re-reads the credential source every
+  `FERRUM_MESH_STOCK_XDS_TOKEN_WATCH_INTERVAL_SECONDS` through the same hardened
+  boundary the connect path uses (`O_NONBLOCK` open, regular-file check on the
+  **opened** descriptor, metadata fast-reject plus `take(limit + 1)` ceiling,
+  UTF-8 and empty-after-trim rejection) on a detached OS thread. Comparison is
+  over content, so both projected-secret symlink swaps and in-place rewrites are
+  detected; an unchanged token never churns the stream.
+- A rotated, removed, empty, non-regular, unreadable, oversized, or non-ASCII
+  source retires the old stream **before** any later discovery update is
+  accepted. An invalid source then *prevents* reconnection — there is no
+  stale-token and no freshness-only fallback.
+- A JWT-shaped token contributes `exp` through a bounded, **non-verifying**
+  local decode, used only to schedule a reconnect
+  `FERRUM_MESH_STOCK_XDS_TOKEN_REFRESH_SKEW_SECONDS` early. Locally decoded
+  claims are never authorization proof.
+- An opaque token gets
+  `FERRUM_MESH_STOCK_XDS_TOKEN_MAX_STREAM_LIFETIME_SECONDS`, which also caps any
+  JWT-derived deadline. The deadline is absolute from stream open: application
+  activity, including heartbeats, never extends it.
+- Failover and failback always materialize the newest token rather than reusing
+  the previous endpoint's interceptor value. A simultaneous TLS and token
+  rotation produces one bounded retirement and one reconnect using the newest of
+  both.
+- Outcomes are fixed-cardinality (`token_source_missing`,
+  `token_source_oversized`, `credential_rotation`, …). No token byte, decoded
+  claim, or credential path reaches a log line, a metric label, or `/health`.
+
 **Where the code lives.** `src/xds/stock.rs` (decode, capability classification,
-projection onto the typed mesh model) and
+projection onto the typed mesh model),
 `src/modes/mesh/config_consumer/stock_xds_client.rs` (the ADS stream machine and
-the policy/discovery merge). Tests:
-`tests/unit/gateway_core/stock_xds_tests.rs`,
+the policy/discovery merge),
+`src/modes/mesh/config_consumer/stock_xds_transport.rs` (endpoint admission),
+and `src/modes/mesh/config_consumer/stock_xds_credential.rs` (credential
+lifetime). Tests: `tests/unit/gateway_core/stock_xds_tests.rs`,
+`tests/unit/gateway_core/mesh_stream_lifecycle_tests.rs`,
 `tests/integration/mesh_stock_xds_tests.rs`,
 `tests/functional/functional_mesh_stock_xds_test.rs`, and
 `tests/conformance/stock_xds_interop.rs`.
+
+### Configuration-stream attempt and liveness policy
+
+All three configuration-stream consumers — native `MeshSubscribe`, the
+Ferrum-private ADS profile, and the third-party stock ADS profile — share one
+attempt/liveness policy
+(`src/modes/mesh/config_consumer/stream_lifecycle.rs`, issue #3854). Partial-state
+semantics stay per protocol; only the *attempt outcome* is shared.
+
+**Remote clean EOF is an endpoint failure, not a success.** A configuration
+stream is meant to stay open, so a peer that accepts the RPC and then hangs up
+rotates to the next configured endpoint and grows the bounded, jittered backoff.
+Previously all three consumers classified `Ok(())` as success, reset backoff, and
+returned to (or stayed on) the primary — a control plane that accepted and
+immediately closed could pin the data plane in a primary-only hot loop while a
+healthy fallback was never consulted.
+
+**Intentional local retirement never penalizes the endpoint.** Shutdown, gRPC
+TLS reload, stock bearer-credential rotation, and proactive primary failback are
+classified separately: they reconnect immediately, do not rotate the endpoint,
+and do not charge the failure backoff.
+
+**Established streams have a bounded liveness mechanism.** Every consumer's tonic
+endpoint now sets HTTP/2 keepalive (30s PING interval, 10s ack timeout,
+`keep_alive_while_idle`) plus a 30s TCP keepalive — the same policy the hardened
+DP ConfigSync client uses. A half-open or blackholed established stream is
+therefore detected within ~40s **without requiring periodic standard-xDS
+application frames**, and reaches the fallback after the ordinary backoff. That
+bound is reported as `liveness_bound_seconds` on the authenticated `/health`
+mesh detail.
+
+**A mute or incomplete control plane cannot hold startup.** A stream that
+delivers no response frame within 60s fails as `first_frame_timeout`. A stream
+that delivers frames but never completes a generation, while this data plane has
+never installed a slice at all, fails as `first_slice_timeout` after 120s. The
+first-slice bound is armed only in that never-converged state, so a legitimately
+quiet control plane never tears down a converged proxy.
+
+**Partial generations are never published.** Both ADS consumers only stage a
+slice once their own required-type gate is satisfied, so an EOF mid-convergence
+leaves the last good slice serving and fails over rather than publishing mixed
+state.
+
+**Native heartbeats assist but do not extend credential lifetime.** The native
+consumer arms a 150s application-silence watchdog only after this stream has
+actually observed a heartbeat frame, so a control plane that never emits them is
+covered by transport keepalive alone rather than being reconnected needlessly.
+The stock profile's credential deadline is absolute from stream open and is not
+reset by any frame.
+
+**Observability.** `ferrum_mesh_config_stream_attempts_total{protocol,outcome}`
+counts every completed attempt, and the authenticated `/health` mesh detail
+carries `config_stream` with `state` (`connected`, `never_received_slice`,
+`stream_liveness_failed`, `serving_last_good`), `last_attempt_outcome`,
+`fallback_active`, `consecutive_failures`, `credential`, and
+`liveness_bound_seconds`. Every value is a closed set or a counter — no endpoint
+URL, control-plane host, node id, credential path, token, or claim appears on
+either surface.
 
 #### Ferrum mesh-slice ECDS carriers (full parity over xDS)
 

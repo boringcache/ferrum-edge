@@ -10,6 +10,10 @@ use super::common::{
     next_backoff_secs, refresh_dp_grpc_tls_config_if_changed, tonic_tls_config, wait_for_shutdown,
     wait_optional_tls_reload,
 };
+use super::stream_lifecycle::{
+    MeshConfigStreamCredential, MeshStreamAttempt, MeshStreamRetirement, MeshStreamTimings,
+    MeshStreamTracker, configure_mesh_config_stream_endpoint,
+};
 use super::update_validation::{
     MeshUpdateConsumer, MeshUpdateExpectation, MeshUpdateRejection, validate_mesh_config_update,
     validate_update_ferrum_version,
@@ -48,7 +52,14 @@ pub struct NativeMeshClientConfig {
     /// reconnects to the primary CP — matching the xDS client and the documented
     /// HA failback model. `0` disables proactive failback (the prior behaviour).
     pub primary_retry_secs: u64,
+    /// Per-invocation stream timing policy (issue #3854). Production uses
+    /// [`MeshStreamTimings::production`]; tests may compress it so first-frame
+    /// and application-silence failover are provable inside bounded CI.
+    pub timings: MeshStreamTimings,
 }
+
+/// Fixed-cardinality protocol label for the shared stream lifecycle.
+pub(crate) const NATIVE_PROTOCOL_LABEL: &str = "native";
 
 impl NativeMeshClientConfig {
     pub fn subscribe_request(&self, ferrum_version: &str) -> MeshSubscribeRequest {
@@ -70,7 +81,13 @@ impl NativeMeshClientConfig {
     }
 }
 
-/// Maintain a live native `MeshSubscribe` stream with simple multi-CP failover.
+/// Maintain a live native `MeshSubscribe` stream with multi-CP failover.
+///
+/// Attempt classification, endpoint rotation, and backoff are the shared
+/// [`super::stream_lifecycle`] policy (issue #3854): a remote clean EOF is an
+/// endpoint failure that rotates to the next configured CP and grows the
+/// bounded, jittered backoff, while shutdown, TLS reload, and proactive primary
+/// failback are intentional local retirements that penalize nothing.
 pub async fn start_native_mesh_client_with_shutdown(
     cp_urls: Vec<String>,
     jwt_secret: GrpcJwtSecret,
@@ -91,11 +108,20 @@ pub async fn start_native_mesh_client_with_shutdown(
         .as_ref()
         .map(|reload| *reload.revision_rx.borrow())
         .unwrap_or(0);
+    // The native consumer's CP credential is minted (or read) fresh on every
+    // connection attempt, so there is no long-lived external credential to
+    // report here.
+    let mut tracker = MeshStreamTracker::new(
+        NATIVE_PROTOCOL_LABEL,
+        MeshConfigStreamCredential::NotConfigured,
+    );
+    state.set_config_stream_status(tracker.status(state.has_first_slice(), false));
 
     info!(
         node_id = %config.node_id,
         namespace = %config.namespace,
         cp_urls = cp_urls.len(),
+        liveness_bound_secs = super::stream_lifecycle::MESH_CONFIG_STREAM_LIVENESS_BOUND_SECS,
         "Native mesh client starting"
     );
 
@@ -114,7 +140,10 @@ pub async fn start_native_mesh_client_with_shutdown(
         let cp_url = &cp_urls[current_cp_index];
         let mut stream_shutdown_rx = shutdown_rx.clone();
         let is_fallback = current_cp_index != 0 && cp_urls.len() > 1;
+        tracker.set_endpoint_index(current_cp_index);
         let should_retry_primary = is_fallback && config.primary_retry_secs > 0;
+        let mut delivered_usable_state = false;
+        let mut force_primary = false;
         // On a fallback CP, arm failback after a first slice is available. The
         // fallback stream may itself deliver that first slice and then stay open
         // indefinitely, so the timer must wait inside this select instead of
@@ -127,28 +156,21 @@ pub async fn start_native_mesh_client_with_shutdown(
                     &config,
                     &state,
                     tls_config.as_ref(),
+                    &mut delivered_usable_state,
                 ) => result,
                 _ = wait_for_first_slice_then_primary_retry(
                     state.clone(),
                     Duration::from_secs(config.primary_retry_secs),
                 ) => {
-                    info!(
-                        primary_retry_secs = config.primary_retry_secs,
-                        cp_url = %cp_url,
-                        "Native primary retry interval elapsed; reconnecting to primary CP"
-                    );
-                    current_cp_index = 0;
-                    backoff_secs = BACKOFF_INITIAL_SECS;
-                    continue;
+                    force_primary = true;
+                    Ok(MeshStreamAttempt::LocalRetirement(MeshStreamRetirement::PrimaryRetry))
                 }
                 _ = wait_for_shutdown(&mut stream_shutdown_rx) => {
                     info!("Native mesh client shutting down");
                     return;
                 }
                 _ = wait_optional_tls_reload(tls_reload.as_ref().map(|reload| reload.revision_rx.clone())) => {
-                    info!("Mesh gRPC TLS source changed; reconnecting native MeshSubscribe stream");
-                    backoff_secs = BACKOFF_INITIAL_SECS;
-                    continue;
+                    Ok(MeshStreamAttempt::LocalRetirement(MeshStreamRetirement::TlsReload))
                 }
             }
         } else {
@@ -159,39 +181,67 @@ pub async fn start_native_mesh_client_with_shutdown(
                     &config,
                     &state,
                     tls_config.as_ref(),
+                    &mut delivered_usable_state,
                 ) => result,
                 _ = wait_for_shutdown(&mut stream_shutdown_rx) => {
                     info!("Native mesh client shutting down");
                     return;
                 }
                 _ = wait_optional_tls_reload(tls_reload.as_ref().map(|reload| reload.revision_rx.clone())) => {
-                    info!("Mesh gRPC TLS source changed; reconnecting native MeshSubscribe stream");
-                    backoff_secs = BACKOFF_INITIAL_SECS;
-                    continue;
+                    Ok(MeshStreamAttempt::LocalRetirement(MeshStreamRetirement::TlsReload))
                 }
             }
         };
 
-        let increase_backoff = match result {
-            Ok(()) => {
-                warn!(
-                    cp_url = %cp_url,
-                    "Native MeshSubscribe stream ended; will reconnect"
-                );
-                current_cp_index = 0;
-                backoff_secs = BACKOFF_INITIAL_SECS;
-                false
+        let attempt = match result {
+            Ok(attempt) => {
+                if attempt.is_endpoint_failure() {
+                    warn!(
+                        cp_url = %cp_url,
+                        outcome = attempt.as_metric_label(),
+                        "Native MeshSubscribe stream ended; rotating to the next configured CP"
+                    );
+                } else {
+                    info!(
+                        outcome = attempt.as_metric_label(),
+                        "Retiring the native MeshSubscribe stream on a local lifecycle event"
+                    );
+                }
+                attempt
             }
             Err(e) => {
+                // A refusal by a fail-closed local gate (subscription binding or
+                // config-revision ordering) is about the CP's CONTENT, not its
+                // transport; both still rotate, but the reason label differs.
+                let attempt = if e.downcast_ref::<MeshApplyError>().is_some() {
+                    MeshStreamAttempt::PolicyRejected
+                } else {
+                    MeshStreamAttempt::TransportFailure {
+                        delivered_usable_state,
+                    }
+                };
                 error!(
                     cp_url = %cp_url,
+                    outcome = attempt.as_metric_label(),
                     error = %e,
-                    "Native MeshSubscribe connection failed"
+                    "Native MeshSubscribe attempt failed"
                 );
-                current_cp_index = (current_cp_index + 1) % cp_urls.len();
-                true
+                attempt
             }
         };
+
+        let disposition = tracker.record(attempt);
+        if force_primary {
+            current_cp_index = 0;
+        } else if disposition.advance_endpoint {
+            current_cp_index = (current_cp_index + 1) % cp_urls.len();
+        }
+        state.set_config_stream_status(tracker.status(state.has_first_slice(), false));
+
+        if !attempt.is_endpoint_failure() {
+            backoff_secs = BACKOFF_INITIAL_SECS;
+            continue;
+        }
 
         let sleep_duration = jittered_backoff(backoff_secs);
         let mut sleep_shutdown_rx = shutdown_rx.clone();
@@ -206,7 +256,7 @@ pub async fn start_native_mesh_client_with_shutdown(
                 continue;
             }
         }
-        backoff_secs = next_backoff_secs(backoff_secs, increase_backoff);
+        backoff_secs = next_backoff_secs(backoff_secs, disposition.increase_backoff);
     }
 }
 
@@ -216,9 +266,13 @@ async fn connect_mesh_subscribe(
     config: &NativeMeshClientConfig,
     state: &MeshRuntimeState,
     tls_config: Option<&DpGrpcTlsConfig>,
-) -> Result<(), anyhow::Error> {
+    delivered_usable_state: &mut bool,
+) -> Result<MeshStreamAttempt, anyhow::Error> {
+    // Bounded transport liveness, shared with the two ADS consumers and with
+    // the hardened DP ConfigSync client: HTTP/2 PING + TCP keepalive, kept alive
+    // while idle so a blackholed established stream fails instead of hanging.
     let mut endpoint =
-        Channel::from_shared(cp_url.to_string())?.connect_timeout(Duration::from_secs(10));
+        configure_mesh_config_stream_endpoint(Channel::from_shared(cp_url.to_string())?, 10);
 
     if let Some(tls) = tls_config {
         let mut client_tls = tonic_tls_config(tls);
@@ -285,7 +339,64 @@ async fn connect_mesh_subscribe(
     // longer admissible, so retrying it can only add load.
     let mut pending_status_report: Option<(MeshSliceStatusReport, u8)> = None;
 
-    while let Some(update) = stream.message().await? {
+    // ── issue #3854: bounded liveness for an ESTABLISHED stream ──
+    let opened_at = tokio::time::Instant::now();
+    let mut awaiting_first_frame = true;
+    let mut awaiting_first_slice = !state.has_first_slice();
+    // Application silence is only a liveness signal once this CP has actually
+    // demonstrated it emits heartbeats. Against a CP that never does, the
+    // stream is legitimately silent while idle and transport keepalive is the
+    // correct (and sufficient) bound. Set true and never cleared.
+    let mut heartbeats_observed = false;
+    let mut last_stream_activity = tokio::time::Instant::now();
+
+    loop {
+        let first_frame_remaining = config
+            .timings
+            .first_frame
+            .saturating_sub(opened_at.elapsed());
+        let first_slice_remaining = config
+            .timings
+            .first_slice
+            .saturating_sub(opened_at.elapsed());
+        let silence_remaining = config
+            .timings
+            .max_silence
+            .saturating_sub(last_stream_activity.elapsed());
+
+        let update = tokio::select! {
+            biased;
+            message = stream.message() => {
+                match message {
+                    Ok(Some(update)) => update,
+                    // A remote clean EOF is an endpoint failure, not success:
+                    // it rotates the CP and grows the bounded backoff.
+                    Ok(None) => return Ok(MeshStreamAttempt::RemoteEof),
+                    Err(status) => return Err(anyhow::Error::new(status)),
+                }
+            }
+            _ = tokio::time::sleep(first_frame_remaining), if awaiting_first_frame => {
+                return Ok(MeshStreamAttempt::FirstFrameTimeout);
+            }
+            _ = tokio::time::sleep(first_slice_remaining), if awaiting_first_slice => {
+                if state.has_first_slice() {
+                    awaiting_first_slice = false;
+                    continue;
+                }
+                return Ok(MeshStreamAttempt::FirstSliceTimeout);
+            }
+            _ = tokio::time::sleep(silence_remaining), if heartbeats_observed => {
+                warn!(
+                    cp_url = %cp_url,
+                    max_silence_secs = config.timings.max_silence.as_secs(),
+                    "Native MeshSubscribe stream went silent past the heartbeat bound; failing over"
+                );
+                return Ok(MeshStreamAttempt::LivenessTimeout);
+            }
+        };
+        awaiting_first_frame = false;
+        last_stream_activity = tokio::time::Instant::now();
+
         if let Some((report, attempts_left)) = pending_status_report.take() {
             let version = report.version.clone();
             let retry_report = report.clone();
@@ -313,6 +424,7 @@ async fn connect_mesh_subscribe(
         // bound only to the CP compatibility contract and never reach the
         // install path.
         let applied = if update.heartbeat {
+            heartbeats_observed = true;
             validate_update_ferrum_version(&update.ferrum_version, MeshUpdateConsumer::Native)
                 .map(|()| None)
                 .map_err(MeshApplyError::Update)
@@ -322,6 +434,8 @@ async fn connect_mesh_subscribe(
 
         match applied {
             Ok(Some(slice)) => {
+                *delivered_usable_state = true;
+                awaiting_first_slice = false;
                 info!(
                     node_id = %slice.node_id,
                     namespace = %slice.namespace,
@@ -391,8 +505,6 @@ async fn connect_mesh_subscribe(
             }
         }
     }
-
-    Ok(())
 }
 
 async fn wait_for_first_slice_then_primary_retry(state: MeshRuntimeState, interval: Duration) {
@@ -498,6 +610,7 @@ mod tests {
             ambient_udp_source_scoping: false,
             node_waypoint_capture_scoping: false,
             primary_retry_secs: 0,
+            timings: MeshStreamTimings::production(),
         }
     }
 
@@ -633,6 +746,7 @@ mod tests {
             ambient_udp_source_scoping: false,
             node_waypoint_capture_scoping: false,
             primary_retry_secs: 300,
+            timings: MeshStreamTimings::production(),
         };
         assert_eq!(config.primary_retry_secs, 300);
     }

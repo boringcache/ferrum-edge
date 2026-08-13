@@ -32,6 +32,7 @@ use ferrum_edge::grpc::proto::{MeshConfigUpdate, MeshSubscribeRequest};
 use ferrum_edge::modes::mesh::config::{
     MeshExtAuthzProvider, MeshPolicy, MeshRule, PolicyAction, PolicyScope,
 };
+use ferrum_edge::modes::mesh::config_consumer::stream_lifecycle::MeshStreamTimings;
 use ferrum_edge::modes::mesh::config_consumer::native_client::{
     NativeMeshClientConfig, NativeMeshConfigConsumer, start_native_mesh_client_with_shutdown,
 };
@@ -63,6 +64,7 @@ fn client_config(waypoint: Option<&str>, spiffe: Option<&str>) -> NativeMeshClie
         ambient_udp_source_scoping: false,
         node_waypoint_capture_scoping: false,
         primary_retry_secs: 0,
+        timings: MeshStreamTimings::production(),
     }
 }
 

@@ -2110,8 +2110,10 @@ fn stock_xds_bearer_token_uses_the_shared_bounded_reader() {
         )
         .await
         .expect_err("stock token must respect the shared 64 KiB ceiling");
+        // Issue #3852 replaced the free-form read error with a closed-set
+        // reason so the same value can label a metric and a health field.
         let rendered = error.to_string();
-        assert!(rendered.contains("maximum of 65536 bytes"), "{rendered}");
+        assert_eq!(rendered, "token_source_oversized", "{rendered}");
         assert!(!rendered.contains(oversized_path.to_str().unwrap()));
         assert!(!rendered.contains(&"s".repeat(128)));
     });
@@ -2159,10 +2161,16 @@ fn stock_xds_reconnects_bound_detached_reader_occupancy() {
 
 #[test]
 fn stock_xds_source_has_no_unbounded_async_token_read() {
-    let source = include_str!("../../../src/modes/mesh/config_consumer/stock_xds_client.rs");
+    // Issue #3852 moved the credential boundary into its own module so the
+    // connect path and the rotation watcher share one hardened reader.
+    let source = include_str!("../../../src/modes/mesh/config_consumer/stock_xds_credential.rs");
+    let client = include_str!("../../../src/modes/mesh/config_consumer/stock_xds_client.rs");
     let secret_registry = include_str!("../../../src/secrets/registry.rs");
     assert!(!source.contains("tokio::fs::read_to_string(path)"));
+    assert!(!client.contains("tokio::fs::read_to_string(path)"));
     assert!(source.contains("read_credential_file_detached_guarded"));
     assert!(source.contains("STOCK_XDS_TOKEN_FILE_READ_LIMIT"));
+    // The client must not have grown its own second reader.
+    assert!(!client.contains("read_credential_file_detached_guarded"));
     assert!(secret_registry.contains("\"FERRUM_MESH_STOCK_XDS_TOKEN_FILE\","));
 }

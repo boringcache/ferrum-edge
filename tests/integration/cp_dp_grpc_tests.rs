@@ -29,6 +29,7 @@ use ferrum_edge::modes::mesh::config::{
     AppProtocol, MeshConfig, MeshService, MeshWaypointBinding, MeshWaypointServiceRef, ServicePort,
     TrustBundle, TrustBundleSet, Workload, WorkloadPort, WorkloadSelector,
 };
+use ferrum_edge::modes::mesh::config_consumer::stream_lifecycle::MeshStreamTimings;
 use ferrum_edge::modes::mesh::config_consumer::native_client::{
     NativeMeshClientConfig, start_native_mesh_client_with_shutdown,
 };
@@ -1021,6 +1022,7 @@ async fn test_native_mesh_client_installs_mesh_slice_from_cp() {
         ambient_udp_source_scoping: false,
         node_waypoint_capture_scoping: false,
         primary_retry_secs: 0,
+        timings: MeshStreamTimings::production(),
     };
     let handle = tokio::spawn(start_native_mesh_client_with_shutdown(
         vec![format!("http://127.0.0.1:{}", addr.port())],

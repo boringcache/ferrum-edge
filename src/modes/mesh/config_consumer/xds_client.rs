@@ -13,6 +13,10 @@ use super::common::{
     next_backoff_secs, refresh_dp_grpc_tls_config_if_changed, should_race_primary_retry,
     tonic_tls_config, wait_for_shutdown, wait_optional_tls_reload,
 };
+use super::stream_lifecycle::{
+    MeshConfigStreamCredential, MeshStreamAttempt, MeshStreamRetirement, MeshStreamTimings,
+    MeshStreamTracker, configure_mesh_config_stream_endpoint,
+};
 use crate::grpc::dp_client::{DpGrpcTlsConfig, DpGrpcTlsReload, GrpcJwtSecret};
 use crate::modes::mesh::config::{
     AppProtocol, MeshDestinationRule, MeshRuntimeOverlay, MeshService, PolicyScope,
@@ -124,6 +128,9 @@ pub struct XdsClientConfig {
     pub connect_timeout_seconds: u64,
     pub labels: BTreeMap<String, String>,
 }
+
+/// Fixed-cardinality protocol label for the shared stream lifecycle.
+pub(crate) const XDS_PROTOCOL_LABEL: &str = "xds";
 
 #[derive(Debug, Clone)]
 struct ClientSubscriptionState {
@@ -571,7 +578,15 @@ fn composite_required_version(accumulator: &ResourceAccumulator) -> String {
         .unwrap_or_default()
 }
 
-/// Maintain a live xDS ADS stream with simple multi-CP failover.
+/// Maintain a live xDS ADS stream with multi-CP failover.
+///
+/// Attempt classification, endpoint rotation, backoff, and transport keepalive
+/// are the shared [`super::stream_lifecycle`] policy (issue #3854). In
+/// particular a remote clean EOF is an endpoint failure — the Ferrum-private
+/// profile previously reset to the primary and the initial delay on `Ok(())`,
+/// which let a CP that accepted and immediately closed pin this data plane in a
+/// primary-only reconnect loop while a healthy fallback went unconsulted.
+#[allow(clippy::too_many_arguments)]
 pub async fn start_xds_client_with_shutdown(
     jwt_secret: GrpcJwtSecret,
     config: XdsClientConfig,
@@ -579,6 +594,7 @@ pub async fn start_xds_client_with_shutdown(
     shutdown_rx: tokio::sync::watch::Receiver<bool>,
     mut tls_config: Option<DpGrpcTlsConfig>,
     tls_reload: Option<DpGrpcTlsReload>,
+    timings: MeshStreamTimings,
 ) {
     let cp_urls = config.cp_urls.clone();
     if cp_urls.is_empty() {
@@ -594,12 +610,18 @@ pub async fn start_xds_client_with_shutdown(
         .as_ref()
         .map(|reload| *reload.revision_rx.borrow())
         .unwrap_or(0);
+    let mut tracker = MeshStreamTracker::new(
+        XDS_PROTOCOL_LABEL,
+        MeshConfigStreamCredential::NotConfigured,
+    );
+    state.set_config_stream_status(tracker.status(state.has_first_slice(), false));
 
     info!(
         node_id = %config.node_id,
         namespace = %config.namespace,
         cluster = %config.cluster,
         cp_urls = cp_urls.len(),
+        liveness_bound_secs = super::stream_lifecycle::MESH_CONFIG_STREAM_LIVENESS_BOUND_SECS,
         "xDS mesh client starting"
     );
 
@@ -629,8 +651,11 @@ pub async fn start_xds_client_with_shutdown(
         }
         let is_primary = current_cp_index == 0;
         let is_fallback = !is_primary && cp_urls.len() > 1;
+        tracker.set_endpoint_index(current_cp_index);
         let mut stream_shutdown_rx = shutdown_rx.clone();
         let should_race_primary = should_race_primary_retry(is_fallback, config.primary_retry_secs);
+        let mut delivered_usable_state = false;
+        let mut force_primary = false;
         let result = if should_race_primary {
             tokio::select! {
                 result = connect_ads(
@@ -640,28 +665,22 @@ pub async fn start_xds_client_with_shutdown(
                     state.clone(),
                     tls_config.as_ref(),
                     &mut stream_state,
+                    timings,
+                    &mut delivered_usable_state,
                 ) => result,
                 _ = wait_for_first_slice_then_primary_retry(
                     state.clone(),
                     Duration::from_secs(config.primary_retry_secs),
                 ) => {
-                    info!(
-                        primary_retry_secs = config.primary_retry_secs,
-                        cp_url = %cp_url,
-                        "xDS primary retry interval elapsed; reconnecting to primary CP"
-                    );
-                    current_cp_index = 0;
-                    backoff_secs = BACKOFF_INITIAL_SECS;
-                    continue;
+                    force_primary = true;
+                    Ok(MeshStreamAttempt::LocalRetirement(MeshStreamRetirement::PrimaryRetry))
                 }
                 _ = wait_for_shutdown(&mut stream_shutdown_rx) => {
                     info!("xDS mesh client shutting down");
                     return;
                 }
                 _ = wait_optional_tls_reload(tls_reload.as_ref().map(|reload| reload.revision_rx.clone())) => {
-                    info!("Mesh gRPC TLS source changed; reconnecting xDS ADS stream");
-                    backoff_secs = BACKOFF_INITIAL_SECS;
-                    continue;
+                    Ok(MeshStreamAttempt::LocalRetirement(MeshStreamRetirement::TlsReload))
                 }
             }
         } else {
@@ -673,41 +692,61 @@ pub async fn start_xds_client_with_shutdown(
                     state.clone(),
                     tls_config.as_ref(),
                     &mut stream_state,
+                    timings,
+                    &mut delivered_usable_state,
                 ) => result,
                 _ = wait_for_shutdown(&mut stream_shutdown_rx) => {
                     info!("xDS mesh client shutting down");
                     return;
                 }
                 _ = wait_optional_tls_reload(tls_reload.as_ref().map(|reload| reload.revision_rx.clone())) => {
-                    info!("Mesh gRPC TLS source changed; reconnecting xDS ADS stream");
-                    backoff_secs = BACKOFF_INITIAL_SECS;
-                    continue;
+                    Ok(MeshStreamAttempt::LocalRetirement(MeshStreamRetirement::TlsReload))
                 }
             }
         };
 
-        let increase_backoff = match result {
-            Ok(()) => {
-                warn!(
-                    cp_url = %cp_url,
-                    "xDS ADS stream ended; will reconnect"
-                );
-                if is_fallback {
-                    current_cp_index = 0;
+        let attempt = match result {
+            Ok(attempt) => {
+                if attempt.is_endpoint_failure() {
+                    warn!(
+                        cp_url = %cp_url,
+                        outcome = attempt.as_metric_label(),
+                        "xDS ADS stream ended; rotating to the next configured CP"
+                    );
+                } else {
+                    info!(
+                        outcome = attempt.as_metric_label(),
+                        "Retiring the xDS ADS stream on a local lifecycle event"
+                    );
                 }
-                backoff_secs = BACKOFF_INITIAL_SECS;
-                false
+                attempt
             }
             Err(e) => {
+                let attempt = MeshStreamAttempt::TransportFailure {
+                    delivered_usable_state,
+                };
                 error!(
                     cp_url = %cp_url,
+                    outcome = attempt.as_metric_label(),
                     error = %e,
-                    "xDS ADS connection failed"
+                    "xDS ADS attempt failed"
                 );
-                current_cp_index = (current_cp_index + 1) % cp_urls.len();
-                true
+                attempt
             }
         };
+
+        let disposition = tracker.record(attempt);
+        if force_primary {
+            current_cp_index = 0;
+        } else if disposition.advance_endpoint {
+            current_cp_index = (current_cp_index + 1) % cp_urls.len();
+        }
+        state.set_config_stream_status(tracker.status(state.has_first_slice(), false));
+
+        if !attempt.is_endpoint_failure() {
+            backoff_secs = BACKOFF_INITIAL_SECS;
+            continue;
+        }
 
         let sleep_duration = jittered_backoff(backoff_secs);
         let mut sleep_shutdown_rx = shutdown_rx.clone();
@@ -722,7 +761,7 @@ pub async fn start_xds_client_with_shutdown(
                 continue;
             }
         }
-        backoff_secs = next_backoff_secs(backoff_secs, increase_backoff);
+        backoff_secs = next_backoff_secs(backoff_secs, disposition.increase_backoff);
     }
 }
 
@@ -731,6 +770,7 @@ async fn wait_for_first_slice_then_primary_retry(state: MeshRuntimeState, interv
     tokio::time::sleep(interval).await;
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn connect_ads(
     cp_url: &str,
     jwt_secret: &GrpcJwtSecret,
@@ -738,11 +778,14 @@ async fn connect_ads(
     state: MeshRuntimeState,
     tls_config: Option<&DpGrpcTlsConfig>,
     stream_state: &mut XdsStreamState,
-) -> Result<(), anyhow::Error> {
-    let mut endpoint = Channel::from_shared(cp_url.to_string())?;
-    if config.connect_timeout_seconds > 0 {
-        endpoint = endpoint.connect_timeout(Duration::from_secs(config.connect_timeout_seconds));
-    }
+    timings: MeshStreamTimings,
+    delivered_usable_state: &mut bool,
+) -> Result<MeshStreamAttempt, anyhow::Error> {
+    // Bounded transport liveness, shared with the native and stock consumers.
+    let mut endpoint = configure_mesh_config_stream_endpoint(
+        Channel::from_shared(cp_url.to_string())?,
+        config.connect_timeout_seconds,
+    );
 
     if let Some(tls) = tls_config {
         let mut client_tls = tonic_tls_config(tls);
@@ -784,7 +827,16 @@ async fn connect_ads(
         "Connected to CP, subscribing for xDS ADS config"
     );
 
-    run_ads_stream_with_auth(channel, Some(auth), config, &consumer, stream_state).await
+    run_ads_stream_with_auth(
+        channel,
+        Some(auth),
+        config,
+        &consumer,
+        stream_state,
+        timings,
+        delivered_usable_state,
+    )
+    .await
 }
 
 async fn run_ads_stream_with_auth(
@@ -793,7 +845,9 @@ async fn run_ads_stream_with_auth(
     config: &XdsClientConfig,
     consumer: &XdsConfigConsumer,
     stream_state: &mut XdsStreamState,
-) -> Result<(), anyhow::Error> {
+    timings: MeshStreamTimings,
+    delivered_usable_state: &mut bool,
+) -> Result<MeshStreamAttempt, anyhow::Error> {
     #[allow(clippy::result_large_err)]
     let mut client = AggregatedDiscoveryServiceClient::with_interceptor(
         channel,
@@ -845,12 +899,29 @@ async fn run_ads_stream_with_auth(
     let mut pending_since: Option<tokio::time::Instant> = None;
     let mut pending_slice: Option<PendingXdsSlice> = None;
 
-    loop {
+    // ── issue #3854: bounded liveness for an ESTABLISHED stream ──
+    // HTTP/2 + TCP keepalive (applied on the endpoint) fail a blackholed
+    // transport without needing application frames. These two deadlines cover a
+    // CP that accepts the RPC and then never supplies a usable frame, or never
+    // completes a coherent required-type generation at all.
+    let opened_at = tokio::time::Instant::now();
+    let first_frame_deadline = tokio::time::sleep_until(opened_at + timings.first_frame);
+    tokio::pin!(first_frame_deadline);
+    let mut awaiting_first_frame = true;
+    let first_slice_deadline = tokio::time::sleep_until(opened_at + timings.first_slice);
+    tokio::pin!(first_slice_deadline);
+    // Armed only while this data plane has never installed a slice.
+    let mut awaiting_first_slice = !consumer.state().has_first_slice();
+
+    let ended = loop {
         tokio::select! {
             response = response_stream.message() => {
                 let Some(response) = response? else {
-                    break;
+                    // Remote clean EOF is an endpoint failure, not success: the
+                    // CP hung up without being asked to.
+                    break MeshStreamAttempt::RemoteEof;
                 };
+                awaiting_first_frame = false;
                 let response_type_url = response.type_url.clone();
                 let nack_count_before = stream_state
                     .nack_circuit_breaker
@@ -918,18 +989,37 @@ async fn run_ads_stream_with_auth(
             _ = &mut debounce, if debounce_active => {
                 if let Some(pending) = pending_slice.take() {
                     apply_pending_xds_slice(consumer, config, pending)?;
+                    *delivered_usable_state = true;
+                    awaiting_first_slice = false;
                 }
                 debounce_active = false;
                 pending_since = None;
             }
+            _ = &mut first_frame_deadline, if awaiting_first_frame => {
+                break MeshStreamAttempt::FirstFrameTimeout;
+            }
+            _ = &mut first_slice_deadline, if awaiting_first_slice => {
+                if consumer.state().has_first_slice() {
+                    awaiting_first_slice = false;
+                } else {
+                    break MeshStreamAttempt::FirstSliceTimeout;
+                }
+            }
         }
-    }
+    };
 
-    if let Some(pending) = pending_slice.take() {
+    // Only a COMPLETE, version-coherent generation ever reaches `pending_slice`
+    // (`try_build_mesh_slice` gates on the required-type versions), so an EOF
+    // mid-convergence leaves the last good slice serving and fails over rather
+    // than publishing a mixed generation.
+    if matches!(ended, MeshStreamAttempt::RemoteEof)
+        && let Some(pending) = pending_slice.take()
+    {
         apply_pending_xds_slice(consumer, config, pending)?;
+        *delivered_usable_state = true;
     }
 
-    Ok(())
+    Ok(ended)
 }
 
 fn discard_pending_xds_slice_after_nack(
@@ -949,12 +1039,15 @@ fn discard_pending_xds_slice_after_nack(
     discarded
 }
 
+/// Publish an already-complete debounced generation before surfacing a stream
+/// error, then fail the attempt. Never returns `Ok` — the return type simply
+/// matches the stream loop's.
 fn flush_pending_xds_slice_before_error(
     consumer: &XdsConfigConsumer,
     config: &XdsClientConfig,
     pending_slice: &mut Option<PendingXdsSlice>,
     error: anyhow::Error,
-) -> Result<(), anyhow::Error> {
+) -> Result<MeshStreamAttempt, anyhow::Error> {
     if let Some(pending) = pending_slice.take() {
         apply_pending_xds_slice(consumer, config, pending)?;
     }

@@ -54,6 +54,8 @@ static MESH_CONFIG_UPDATE_REJECTIONS: LazyLock<DashMap<MeshConfigUpdateRejectKey
     LazyLock::new(DashMap::new);
 static MESH_CONFIG_REVISION_REJECTIONS: LazyLock<DashMap<&'static str, AtomicU64>> =
     LazyLock::new(DashMap::new);
+static MESH_CONFIG_STREAM_ATTEMPTS: LazyLock<DashMap<MeshConfigStreamAttemptKey, AtomicU64>> =
+    LazyLock::new(DashMap::new);
 static MESH_CONFIG_REVISION_ADOPTIONS: AtomicU64 = AtomicU64::new(0);
 static MESH_SUBSCRIBE_AUDIENCE_REJECTIONS: LazyLock<
     DashMap<MeshSubscribeAudienceRejectKey, AtomicU64>,
@@ -506,6 +508,16 @@ struct MeshConfigUpdateRejectKey {
     reason: &'static str,
 }
 
+/// Key for the mesh configuration-stream attempt counter (issue #3854). Both
+/// fields are `&'static str`: the protocol (`native` / `xds` / `stock_xds`) and
+/// a `MeshStreamAttempt::as_metric_label` outcome. No endpoint URL, node id,
+/// credential path, or token-derived value can reach this series.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+struct MeshConfigStreamAttemptKey {
+    protocol: &'static str,
+    outcome: &'static str,
+}
+
 /// Control-plane-side `MeshSubscribe` JWT audience rejections (issue #2475).
 /// Both labels are `&'static str` from closed enums — the subscription class
 /// (`remote_discovery` / `local`) and an `AudienceRejectReason` label — so the
@@ -855,6 +867,24 @@ pub fn increment_mesh_subscribe_audience_rejection(
             subscription,
             reason,
         })
+        .or_insert_with(|| AtomicU64::new(0))
+        .fetch_add(1, Ordering::Relaxed);
+}
+
+/// Count one completed mesh configuration-stream attempt (issue #3854).
+///
+/// `protocol` is `native` / `xds` / `stock_xds`; `outcome` is a
+/// `MeshStreamAttempt::as_metric_label` constant covering intentional local
+/// retirement (shutdown, TLS reload, credential rotation, primary retry),
+/// remote clean EOF, transport failure, the first-frame / first-slice bounds,
+/// keepalive timeout, and policy rejection. Both are `&'static str` precisely so
+/// no endpoint URL, node id, credential path, or claim can become a label — the
+/// clean-EOF-versus-intentional-retirement split is the whole point of the
+/// series, and it must stay scrapeable without disclosing which control plane
+/// misbehaved.
+pub fn increment_mesh_config_stream_attempt(protocol: &'static str, outcome: &'static str) {
+    MESH_CONFIG_STREAM_ATTEMPTS
+        .entry(MeshConfigStreamAttemptKey { protocol, outcome })
         .or_insert_with(|| AtomicU64::new(0))
         .fetch_add(1, Ordering::Relaxed);
 }
@@ -1274,6 +1304,22 @@ pub fn render_mesh_observability_metrics_with_gateway_namespace(
             output.push_str(&format!(
                 "ferrum_mesh_config_revision_rejections_total{{reason=\"{}\"{}}} {}\n",
                 escape_label_value(entry.key()),
+                gateway_ns_label,
+                entry.value().load(Ordering::Relaxed)
+            ));
+        }
+    }
+
+    if !MESH_CONFIG_STREAM_ATTEMPTS.is_empty() {
+        output.push_str(
+            "# HELP ferrum_mesh_config_stream_attempts_total Completed mesh configuration-stream attempts by consumer protocol and closed-set outcome. A remote clean EOF is an endpoint failure, not a success.\n",
+        );
+        output.push_str("# TYPE ferrum_mesh_config_stream_attempts_total counter\n");
+        for entry in MESH_CONFIG_STREAM_ATTEMPTS.iter() {
+            output.push_str(&format!(
+                "ferrum_mesh_config_stream_attempts_total{{protocol=\"{}\",outcome=\"{}\"{}}} {}\n",
+                escape_label_value(entry.key().protocol),
+                escape_label_value(entry.key().outcome),
                 gateway_ns_label,
                 entry.value().load(Ordering::Relaxed)
             ));

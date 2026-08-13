@@ -167,7 +167,7 @@ pub mod _test_support {
     /// Hold the stock-xDS bearer-token reader slot to prove reconnects cannot
     /// accumulate detached readers after an async timeout.
     pub async fn acquire_stock_xds_token_file_read_permit_for_test() -> TestSemaphorePermit {
-        crate::modes::mesh::config_consumer::stock_xds_client::stock_xds_token_file_read_limit()
+        crate::modes::mesh::config_consumer::stock_xds_credential::stock_xds_token_file_read_limit()
             .acquire_owned()
             .await
             .expect("stock xDS token read semaphore is never closed")
@@ -185,9 +185,20 @@ pub mod _test_support {
     /// Exercise the crate-private stock-xDS credential boundary while keeping
     /// its metadata representation out of the public production API.
     pub async fn read_stock_xds_bearer_token_for_test(path: &str) -> Result<String, anyhow::Error> {
-        let token =
-            crate::modes::mesh::config_consumer::stock_xds_client::read_bearer_token(path).await?;
-        token
+        use crate::modes::mesh::config_consumer::stock_xds_credential::{
+            StockCredentialLifetimePolicy, StockXdsCredentialSource,
+        };
+        let source = StockXdsCredentialSource::new(
+            Some(path.to_string()),
+            StockCredentialLifetimePolicy::default(),
+        );
+        let credential = source
+            .materialize()
+            .await
+            .map_err(|reason| anyhow::anyhow!("{reason}"))?
+            .ok_or_else(|| anyhow::anyhow!("no stock xDS bearer credential configured"))?;
+        credential
+            .token()
             .to_str()
             .map(str::to_string)
             .map_err(|_| anyhow::anyhow!("stock xDS bearer token is not valid text metadata"))

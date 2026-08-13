@@ -72,7 +72,8 @@ use prost::Message;
 use tempfile::TempDir;
 use tokio::sync::{broadcast, mpsc};
 use tokio_stream::wrappers::{ReceiverStream, TcpListenerStream};
-use tonic::transport::Server;
+use tonic::transport::server::ServerTlsConfig;
+use tonic::transport::{Identity, Server};
 use tonic::{Request, Response, Status, Streaming};
 
 use ferrum_edge::identity::spiffe::{SpiffeId, TrustDomain};
@@ -226,6 +227,58 @@ impl AggregatedDiscoveryService for ScriptedThirdPartyAds {
     }
 }
 
+/// Server-side TLS material for the scripted ADS endpoint, plus the CA the
+/// gateway pins (issue #3853: the production stock-xDS gate now refuses h2c).
+struct AdsTransportTls {
+    ca_pem_path: String,
+    server_cert_pem: Vec<u8>,
+    server_key_pem: Vec<u8>,
+    _dir: TempDir,
+}
+
+/// Mint a self-signed CA plus a server leaf carrying an IP SAN for
+/// `127.0.0.1`, which is what the data plane dials and therefore what it
+/// verifies.
+fn generate_ads_transport_tls() -> Result<AdsTransportTls, String> {
+    let dir = TempDir::new().map_err(|e| format!("ads tls temp dir: {e}"))?;
+    let ca_key = rcgen::KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256)
+        .map_err(|e| format!("ads ca key: {e}"))?;
+    let mut ca_params = rcgen::CertificateParams::new(vec!["Ferrum Stock xDS Test CA".to_string()])
+        .map_err(|e| format!("ads ca params: {e}"))?;
+    ca_params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+    let ca_cert = ca_params
+        .self_signed(&ca_key)
+        .map_err(|e| format!("ads ca self-sign: {e}"))?;
+    let ca_pem = ca_cert.pem();
+    let ca_issuer = rcgen::Issuer::new(ca_params, ca_key);
+
+    let server_key = rcgen::KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256)
+        .map_err(|e| format!("ads server key: {e}"))?;
+    let mut server_params = rcgen::CertificateParams::new(vec!["localhost".to_string()])
+        .map_err(|e| format!("ads server params: {e}"))?;
+    server_params
+        .subject_alt_names
+        .push(rcgen::SanType::IpAddress(std::net::IpAddr::V4(
+            std::net::Ipv4Addr::new(127, 0, 0, 1),
+        )));
+    let server_cert = server_params
+        .signed_by(&server_key, &ca_issuer)
+        .map_err(|e| format!("ads server sign: {e}"))?;
+
+    let ca_pem_path = dir.path().join("stock-ads-ca.pem");
+    std::fs::write(&ca_pem_path, ca_pem.as_bytes())
+        .map_err(|e| format!("write ads ca pem: {e}"))?;
+    Ok(AdsTransportTls {
+        ca_pem_path: ca_pem_path
+            .to_str()
+            .ok_or("ads ca path is not UTF-8")?
+            .to_string(),
+        server_cert_pem: server_cert.pem().into_bytes(),
+        server_key_pem: server_key.serialize_pem().into_bytes(),
+        _dir: dir,
+    })
+}
+
 struct StockAdsHandle {
     addr: SocketAddr,
     recorder: AdsRecorder,
@@ -235,7 +288,10 @@ struct StockAdsHandle {
 }
 
 impl StockAdsHandle {
-    async fn start(seeds: HashMap<String, DiscoveryResponse>) -> Result<Self, String> {
+    async fn start(
+        seeds: HashMap<String, DiscoveryResponse>,
+        tls: &AdsTransportTls,
+    ) -> Result<Self, String> {
         let listener = bind_fixture_listener(loopback_ephemeral())
             .await
             .map_err(|e| format!("bind scripted ADS listener: {e}"))?;
@@ -250,9 +306,18 @@ impl StockAdsHandle {
             seeds: Arc::clone(&seeds),
             pushes: pushes.clone(),
         };
+        // Issue #3853: the production stock-xDS profile requires authenticated
+        // TLS on every endpoint, so the live gate now runs over TLS rather than
+        // h2c and the data plane verifies this certificate against the pinned
+        // CA.
+        let tls_config = ServerTlsConfig::new().identity(Identity::from_pem(
+            tls.server_cert_pem.clone(),
+            tls.server_key_pem.clone(),
+        ));
         let incoming = TcpListenerStream::new(listener);
         let task = tokio::spawn(async move {
             Server::builder()
+                .tls_config(tls_config)?
                 .add_service(AggregatedDiscoveryServiceServer::new(server))
                 .serve_with_incoming(incoming)
                 .await
@@ -267,7 +332,7 @@ impl StockAdsHandle {
     }
 
     fn url(&self) -> String {
-        format!("http://{}", self.addr)
+        format!("https://{}", self.addr)
     }
 
     /// Publish one state-of-the-world response, and make it the state a
@@ -850,6 +915,7 @@ async fn drive_stock_xds_live_datapath() -> Result<StockLiveObservations, String
         let temp_a = TempDir::new().map_err(|e| format!("temp dir a: {e}"))?;
         let temp_b = TempDir::new().map_err(|e| format!("temp dir b: {e}"))?;
         let svids = generate_two_gateway_svids(temp_b.path(), A_SPIFFE, B_SPIFFE);
+        let ads_tls = generate_ads_transport_tls()?;
         let backend_port = start_stock_echo_backend().await?;
 
         let good_cluster = cluster_name(backend_port, "", SERVICE_HOST);
@@ -863,7 +929,7 @@ async fn drive_stock_xds_live_datapath() -> Result<StockLiveObservations, String
         // The converged initial state a stock control plane would program:
         // one outbound cluster, its endpoint assignment, the listener that
         // classifies the port as HTTP, and the route configuration naming it.
-        let ads = StockAdsHandle::start(HashMap::from([
+        let ads_seeds = HashMap::from([
             (
                 CDS_TYPE_URL.to_string(),
                 response(
@@ -921,8 +987,8 @@ async fn drive_stock_xds_live_datapath() -> Result<StockLiveObservations, String
                     )],
                 ),
             ),
-        ]))
-        .await?;
+        ]);
+        let ads = StockAdsHandle::start(ads_seeds, &ads_tls).await?;
 
         let policy_path = temp_a.path().join("stock-mesh-policy.json");
         std::fs::write(&policy_path, stock_policy_document())
@@ -1001,6 +1067,13 @@ async fn drive_stock_xds_live_datapath() -> Result<StockLiveObservations, String
                     ("FERRUM_LOG_LEVEL", "debug".to_string()),
                     ("FERRUM_POOL_WARMUP_ENABLED", "false".to_string()),
                     ("FERRUM_MESH_STOCK_XDS_URLS", ads.url()),
+                    // The production gate refuses h2c stock xDS, so the data
+                    // plane pins the scripted server's CA and verifies its
+                    // certificate before any discovery is admitted.
+                    (
+                        "FERRUM_DP_GRPC_TLS_CA_CERT_PATH",
+                        ads_tls.ca_pem_path.clone(),
+                    ),
                     (
                         "FERRUM_MESH_STOCK_XDS_NODE_ID",
                         "sidecar~127.0.0.1~client-app.ferrum~ferrum.svc.cluster.local".to_string(),
@@ -1510,4 +1583,137 @@ async fn functional_mesh_stock_xds_live_datapath_matrix() {
          dial closed — {}\n{logs}",
         observed.impostor_pin.describe("impostor-pin probe")
     );
+}
+
+// ── issue #3853: negative transport admission on the real binary ──────────
+
+/// Same resolution order the mesh spawn helper uses.
+fn stock_xds_gateway_binary_path() -> std::path::PathBuf {
+    let debug = std::path::PathBuf::from("./target/debug/ferrum-edge");
+    if debug.exists() {
+        return debug;
+    }
+    std::path::PathBuf::from("./target/release/ferrum-edge")
+}
+
+/// The complete primary/fallback endpoint set is admitted as ONE
+/// transport-security posture before anything can dial. This drives the real
+/// `ferrum-edge` binary through the three refusals that matter most in
+/// production, and asserts each one fails **at startup** rather than after a
+/// plaintext ADS channel has already been opened.
+///
+/// Run with:
+///   cargo test --test functional_tests functional_mesh_stock_xds_plaintext_admission
+///     -- --ignored --nocapture
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires the ferrum-edge binary"]
+async fn functional_mesh_stock_xds_refuses_plaintext_transport_postures() {
+    ensure_gateway_built().expect("gateway build");
+
+    struct Case {
+        name: &'static str,
+        production: bool,
+        token_file: bool,
+        allow_plaintext: bool,
+        urls: &'static str,
+        expected_reason: &'static str,
+    }
+
+    let cases = [
+        Case {
+            name: "production mode refuses h2c even without a bearer",
+            production: true,
+            token_file: false,
+            allow_plaintext: true,
+            urls: "http://127.0.0.1:15012",
+            expected_reason: "plaintext_in_production",
+        },
+        Case {
+            name: "a bearer token refuses h2c on loopback with the dev switch on",
+            production: false,
+            token_file: true,
+            allow_plaintext: true,
+            urls: "http://127.0.0.1:15012",
+            expected_reason: "plaintext_with_bearer_token",
+        },
+        Case {
+            name: "a secure primary may not fail over to a plaintext fallback",
+            production: false,
+            token_file: false,
+            allow_plaintext: true,
+            urls: "https://istiod.istio-system.svc:15012,http://127.0.0.1:15012",
+            expected_reason: "mixed_transport_posture",
+        },
+        Case {
+            name: "plaintext is off by default",
+            production: false,
+            token_file: false,
+            allow_plaintext: false,
+            urls: "http://127.0.0.1:15012",
+            expected_reason: "plaintext_not_enabled",
+        },
+    ];
+
+    for case in cases {
+        let temp = TempDir::new().expect("temp dir");
+        let policy_path = temp.path().join("stock-mesh-policy.json");
+        std::fs::write(&policy_path, stock_policy_document()).expect("write policy document");
+        let token_path = temp.path().join("stock-token");
+        std::fs::write(&token_path, b"an-external-projected-token\n").expect("write token");
+
+        let mut command = std::process::Command::new(stock_xds_gateway_binary_path());
+        command
+            .arg("validate")
+            .env("FERRUM_MODE", "mesh")
+            .env("FERRUM_MESH_CONFIG_PROTOCOL", "stock_xds")
+            .env("FERRUM_MESH_STOCK_XDS_URLS", case.urls)
+            .env(
+                "FERRUM_MESH_STOCK_XDS_NODE_ID",
+                "sidecar~127.0.0.1~client-app.ferrum~ferrum.svc.cluster.local",
+            )
+            .env("FERRUM_MESH_FILE_CONFIG_PATH", &policy_path)
+            .env("FERRUM_MESH_ALLOW_NO_CA", "true")
+            .env(
+                "FERRUM_MESH_STOCK_XDS_ALLOW_PLAINTEXT",
+                if case.allow_plaintext { "true" } else { "false" },
+            )
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped());
+        if case.production {
+            command.env("FERRUM_MESH_PRODUCTION_MODE", "true");
+        }
+        if case.token_file {
+            command.env("FERRUM_MESH_STOCK_XDS_TOKEN_FILE", &token_path);
+        }
+
+        let output = command.output().expect("run ferrum-edge validate");
+        let rendered = format!(
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            !output.status.success(),
+            "{}: startup must fail closed\n{rendered}",
+            case.name
+        );
+        assert!(
+            rendered.contains(case.expected_reason),
+            "{}: expected the closed-set reason '{}'\n{rendered}",
+            case.name,
+            case.expected_reason
+        );
+        // The refusal identifies the endpoint by index and closed-set
+        // classification, never by echoing the configured URL.
+        assert!(
+            !rendered.contains("istiod.istio-system.svc:15012"),
+            "{}: a refusal must not echo the configured endpoint\n{rendered}",
+            case.name
+        );
+        assert!(
+            !rendered.contains("an-external-projected-token"),
+            "{}: a refusal must never carry credential bytes\n{rendered}",
+            case.name
+        );
+    }
 }
