@@ -569,13 +569,11 @@ impl NodeWaypointUdpSteering {
         // acknowledgement has since gone stale or missing: falling through to
         // the pending arm below with its rules still installed would be the
         // steered-but-unanswerable state itself.
-        if !state.reaped || state.applied.is_some() {
-            if !self.remove_rules(state) {
-                // Do not publish a replacement generation while the outgoing
-                // rules are still unproven. The next reconcile retries the
-                // exact-name teardown first.
-                return SteerReconcileOutcome::Failed;
-            }
+        if (!state.reaped || state.applied.is_some()) && !self.remove_rules(state) {
+            // Do not publish a replacement generation while the outgoing
+            // rules are still unproven. The next reconcile retries the
+            // exact-name teardown first.
+            return SteerReconcileOutcome::Failed;
         }
 
         // Authorize the exact reply sources BEFORE installing the rules that
@@ -703,7 +701,7 @@ impl NodeWaypointUdpSteering {
             return SteerReconcileOutcome::Failed;
         }
 
-        let withdrawal = match self.publish_reply_sources(state, &[]) {
+        match self.publish_reply_sources(state, &[]) {
             Ok(generation) => match self.observe_acknowledgement(state) {
                 Ok(Some(acknowledged)) if acknowledged == generation => {
                     SteerReconcileOutcome::Removed
@@ -727,9 +725,7 @@ impl NodeWaypointUdpSteering {
                 );
                 SteerReconcileOutcome::Failed
             }
-        };
-
-        withdrawal
+        }
     }
 
     /// Remove every Ferrum-owned steering object and forget the applied
