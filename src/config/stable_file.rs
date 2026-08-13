@@ -414,8 +414,12 @@ pub fn stable_file_error_anyhow(
 /// path holding an ordinary JSON document still parses — but the parser really
 /// is YAML, and a JSON-only shape YAML rejects (for example a mapping key past
 /// libyaml's 1024-byte simple-key limit) fails closed. There is deliberately no
-/// content sniffing and no JSON fallback: detection must not parse a large
-/// document once to classify it and again to deserialize it.
+/// content sniffing and no JSON fallback: format detection itself never parses
+/// the document. YAML still receives a bounded event preflight before
+/// deserialization so alias materialization cannot bypass resource ceilings.
+///
+/// YAML alias/anchor expansion is bounded separately at the YAML trust
+/// boundary ([`crate::config::yaml_alias_budget`]), not by switching parsers.
 pub fn detect_json_or_yaml_extension(path: &Path) -> bool {
     let ext = path
         .extension()
