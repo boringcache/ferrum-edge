@@ -5491,12 +5491,16 @@ impl ResponseStreamInspector for AuditStreamInspector {
 async fn send_batch(cfg: &HttpFlushConfig, batch: &[QueuedAuditRecord]) -> Result<(), String> {
     let entry_count = batch.len();
     let body = build_batch_body(batch);
-    let mut request = cfg
-        .http_client
-        .get()
-        .post(&cfg.endpoint_url)
-        .header(CONTENT_TYPE, "application/json")
-        .body(body);
+    let mut request = match cfg.http_client.get() {
+        Ok(client) => client
+            .post(&cfg.endpoint_url)
+            .header(CONTENT_TYPE, "application/json")
+            .body(body),
+        Err(err) => {
+            cfg.sink_healthy.store(false, Ordering::Relaxed);
+            return Err(format!("ai_transcript_audit batch failed: {err}"));
+        }
+    };
     // Headers were fully validated and materialized at activation
     // (`materialize_sink_headers`), so there is no per-batch env expansion,
     // template parsing, or fallible construction here — a required header can

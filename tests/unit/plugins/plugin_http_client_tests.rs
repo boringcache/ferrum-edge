@@ -795,6 +795,155 @@ fn plugin_http_client_production_builder_has_no_panic_or_expect() {
 }
 
 #[test]
+fn plugin_http_client_callers_do_not_treat_get_result_as_reqwest_client() {
+    // Compile-blocker regression: after get()/get_http2() started returning
+    // Result, any `.get().post(...)` chain (including across newlines) treats
+    // the Result as a reqwest client. Production callers must bind the Result
+    // first and fail closed.
+    const FORBIDDEN: &[&str] = &[
+        ".get().get(",
+        ".get().post(",
+        ".get().put(",
+        ".get().patch(",
+        ".get().delete(",
+        ".get().head(",
+        ".get().request(",
+        ".get_http2().get(",
+        ".get_http2().post(",
+        ".get_http2().put(",
+        ".get_http2().patch(",
+        ".get_http2().delete(",
+        ".get_http2().head(",
+        ".get_http2().request(",
+        "build_request(client.get()",
+        "http.get().post(",
+        "http.get().put(",
+        "http.get().patch(",
+        "http.get().delete(",
+        "http.get().get(",
+        "http.get().request(",
+    ];
+    for (name, source) in plugin_http_client_caller_sources() {
+        let collapsed = uncommented_lines(production_portion(source))
+            .join("\n")
+            .chars()
+            .filter(|c| !c.is_whitespace())
+            .collect::<String>();
+        for needle in FORBIDDEN {
+            assert!(
+                !collapsed.contains(needle),
+                "{name} still treats get()/get_http2() Result as a reqwest client: {needle}"
+            );
+        }
+    }
+}
+
+fn production_portion(source: &str) -> &str {
+    source.split("\n#[cfg(test)]").next().unwrap_or(source)
+}
+
+fn plugin_http_client_caller_sources() -> &'static [(&'static str, &'static str)] {
+    &[
+        (
+            "src/plugins/utils/http_client.rs",
+            include_str!("../../../src/plugins/utils/http_client.rs"),
+        ),
+        (
+            "src/plugins/request_mirror.rs",
+            include_str!("../../../src/plugins/request_mirror.rs"),
+        ),
+        (
+            "src/service_discovery/mod.rs",
+            include_str!("../../../src/service_discovery/mod.rs"),
+        ),
+        (
+            "src/plugins/api_chargeback_sink.rs",
+            include_str!("../../../src/plugins/api_chargeback_sink.rs"),
+        ),
+        (
+            "src/plugins/otel_tracing.rs",
+            include_str!("../../../src/plugins/otel_tracing.rs"),
+        ),
+        (
+            "src/plugins/utils/jwks_store.rs",
+            include_str!("../../../src/plugins/utils/jwks_store.rs"),
+        ),
+        (
+            "src/plugins/jwks_auth.rs",
+            include_str!("../../../src/plugins/jwks_auth.rs"),
+        ),
+        (
+            "src/plugins/oauth2_introspection.rs",
+            include_str!("../../../src/plugins/oauth2_introspection.rs"),
+        ),
+        (
+            "src/plugins/oidc_relying_party.rs",
+            include_str!("../../../src/plugins/oidc_relying_party.rs"),
+        ),
+        (
+            "src/plugins/serverless_function.rs",
+            include_str!("../../../src/plugins/serverless_function.rs"),
+        ),
+        (
+            "src/plugins/opa.rs",
+            include_str!("../../../src/plugins/opa.rs"),
+        ),
+        (
+            "src/plugins/mesh/ext_authz.rs",
+            include_str!("../../../src/plugins/mesh/ext_authz.rs"),
+        ),
+        (
+            "src/plugins/mcp_gateway.rs",
+            include_str!("../../../src/plugins/mcp_gateway.rs"),
+        ),
+        (
+            "src/plugins/loki_logging.rs",
+            include_str!("../../../src/plugins/loki_logging.rs"),
+        ),
+        (
+            "src/plugins/http_logging.rs",
+            include_str!("../../../src/plugins/http_logging.rs"),
+        ),
+        (
+            "src/plugins/ai_transcript_audit.rs",
+            include_str!("../../../src/plugins/ai_transcript_audit.rs"),
+        ),
+        (
+            "src/plugins/ai_tool_governor.rs",
+            include_str!("../../../src/plugins/ai_tool_governor.rs"),
+        ),
+        (
+            "src/plugins/ai_semantic_firewall.rs",
+            include_str!("../../../src/plugins/ai_semantic_firewall.rs"),
+        ),
+        (
+            "src/plugins/ai_semantic_cache.rs",
+            include_str!("../../../src/plugins/ai_semantic_cache.rs"),
+        ),
+        (
+            "src/plugins/ai_federation.rs",
+            include_str!("../../../src/plugins/ai_federation.rs"),
+        ),
+        (
+            "src/modes/mesh/federation.rs",
+            include_str!("../../../src/modes/mesh/federation.rs"),
+        ),
+        (
+            "src/notifications/channels/mod.rs",
+            include_str!("../../../src/notifications/channels/mod.rs"),
+        ),
+        (
+            "src/notifications/channels/webhook.rs",
+            include_str!("../../../src/notifications/channels/webhook.rs"),
+        ),
+        (
+            "src/plugins/load_testing.rs",
+            include_str!("../../../src/plugins/load_testing.rs"),
+        ),
+    ]
+}
+
+#[test]
 fn plugin_http_client_terminal_fallback_is_fail_closed_no_proxy_no_redirect() {
     let production = production_plugin_http_client_source();
     let fail_closed = function_region(

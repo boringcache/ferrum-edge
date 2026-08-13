@@ -660,10 +660,12 @@ impl Oauth2Introspection {
         if let Some(hint) = &provider.token_hint_param {
             params.push(("token_type_hint".to_string(), hint.clone()));
         }
+        let client = self
+            .http_client
+            .get()
+            .map_err(|_| IntrospectionDecision::Unavailable)?;
         let request = match &provider.client_auth {
-            ClientAuth::Basic { authorization } => self
-                .http_client
-                .get()
+            ClientAuth::Basic { authorization } => client
                 .post(&endpoint)
                 .timeout(provider.request_timeout)
                 .header(AUTHORIZATION, authorization.clone())
@@ -677,8 +679,7 @@ impl Oauth2Introspection {
                     "client_secret".to_string(),
                     client_secret.expose().to_string(),
                 ));
-                self.http_client
-                    .get()
+                client
                     .post(&endpoint)
                     .timeout(provider.request_timeout)
                     .with_form_body(&params)?
@@ -702,15 +703,12 @@ impl Oauth2Introspection {
                     "urn:ietf:params:oauth:client-assertion-type:jwt-bearer".to_string(),
                 ));
                 params.push(("client_assertion".to_string(), assertion));
-                self.http_client
-                    .get()
+                client
                     .post(&endpoint)
                     .timeout(provider.request_timeout)
                     .with_form_body(&params)?
             }
-            ClientAuth::None => self
-                .http_client
-                .get()
+            ClientAuth::None => client
                 .post(&endpoint)
                 .timeout(provider.request_timeout)
                 .with_form_body(&params)?,

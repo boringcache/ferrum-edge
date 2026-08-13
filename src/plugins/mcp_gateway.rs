@@ -1358,6 +1358,9 @@ impl McpGateway {
         let request = self
             .http_client
             .get()
+            .map_err(|error| {
+                format!("failed to initialize upstream MCP server: {error}")
+            })?
             .post(&server.upstream_url)
             .header("content-type", "application/json")
             .header("accept", MCP_STREAMABLE_HTTP_ACCEPT)
@@ -1482,6 +1485,9 @@ impl McpGateway {
         let mut request = self
             .http_client
             .get()
+            .map_err(|error| {
+                format!("failed to send upstream MCP initialized notification: {error}")
+            })?
             .post(&server.upstream_url)
             .header("content-type", "application/json")
             .header("accept", MCP_STREAMABLE_HTTP_ACCEPT)
@@ -1575,6 +1581,9 @@ impl McpGateway {
     /// Issue the upstream `DELETE` for each initialized upstream session of an
     /// already-removed downstream session. Failures are logged, not fatal.
     async fn delete_upstream_sessions(&self, session: DownstreamMcpSession, ctx: &RequestContext) {
+        let Ok(client) = self.http_client.get() else {
+            return;
+        };
         for (server_id, upstream) in session.upstream_sessions {
             let Some(upstream_session_id) = upstream.upstream_session_id.clone() else {
                 continue;
@@ -1585,9 +1594,7 @@ impl McpGateway {
             let Some(server) = self.servers.get(&server_id) else {
                 continue;
             };
-            let request = self
-                .http_client
-                .get()
+            let request = client
                 .delete(&server.upstream_url)
                 .header(&self.sessions.upstream_session_header, upstream_session_id)
                 .header(
@@ -2041,6 +2048,7 @@ impl McpGateway {
         let mut request = self
             .http_client
             .get()
+            .map_err(|error| format!("upstream MCP request failed: {error}"))?
             .post(&server.upstream_url)
             .header("content-type", "application/json")
             .header("accept", MCP_STREAMABLE_HTTP_ACCEPT)
