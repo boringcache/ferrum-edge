@@ -44,6 +44,9 @@ the overhead percent.
 
 cd tests/performance/mesh-dns-e2e
 ./run.sh --skip-build --json --duration 60 --concurrency 100 --protocol both
+
+# Optional EDNS(0) bottleneck / rerun (not the publication default):
+./run.sh --skip-build --json --duration 60 --concurrency 100 --protocol both --edns 1232
 ```
 
 ## Via gateway (127.0.0.1:15053)
@@ -77,16 +80,23 @@ Only the upstream-forward class is meaningful here (mesh-internal / mesh-wildcar
 
 1. Trigger **Mesh Performance Baselines** (`suites=dns` or `all`, `iterations=3–5`).
 2. Download `mesh-performance-baselines-<sha>`.
-3. Require `summary.json` → `dns_complete` and `dns_errors_ok` with every
-   documented gateway row (mesh-internal, mesh-wildcard, upstream-forward ×
-   UDP/TCP) and both direct upstream-forward UDP/TCP rows at 3–5 repetitions.
-4. Require `runner_health_ok` (CPU steal ≤ 5.0% across the pre-collection
-   sample and each per-run workload-interval `/proc/stat` steal delta in
-   `runner_health.json` / `runner_health_probes.jsonl`).
-5. Discard any repetition with unexplained non-zero `total_errors`.
+3. Require `summary.json` → `acceptance_gate.dns_complete` and
+   `acceptance_gate.dns_errors_ok` with every documented gateway row
+   (mesh-internal, mesh-wildcard, upstream-forward × UDP/TCP) and both direct
+   upstream-forward UDP/TCP rows at 3–5 repetitions.
+4. Require `acceptance_gate.runner_health_ok` (CPU steal ≤ 5.0% across the
+   pre-collection sample and each per-run workload-interval `/proc/stat` steal
+   delta in `runner_health.json` / `runner_health_probes.jsonl`).
+5. Discard any repetition with unexplained non-zero `total_errors` or non-zero
+   `total_nxdomain`. NXDOMAIN is a distinct counter and is never folded into
+   `total_errors`; partial NXDOMAIN across a class/repetition and all-NXDOMAIN
+   collections both fail `dns_errors_ok`.
 6. Publish mean qps/latency into the tables and record upstream-forward overhead
    with the formula above.
 7. Link the artifact paths for raw JSON blobs.
+8. To isolate EDNS(0) OPT-echo / UDP payload-size bottlenecks, rerun the harness
+   with `--edns 1232` (or another 512..=4096 size). That option is available on
+   `run.sh` but is not the hosted publication default (`--edns 0`).
 
 ## Bottleneck review
 
@@ -104,6 +114,8 @@ Only the upstream-forward class is meaningful here (mesh-internal / mesh-wildcar
   not these rows.
 - Shared-runner CPU steal can inflate p99; publication fails closed above **5.0%**
   steal — re-run rather than publishing impaired baselines.
+- **EDNS(0):** `./run.sh --edns <512..=4096>` still exists for OPT-echo and UDP
+  payload-size bottleneck reruns. Hosted publication keeps `--edns 0`.
 
 ## Refresh cadence
 

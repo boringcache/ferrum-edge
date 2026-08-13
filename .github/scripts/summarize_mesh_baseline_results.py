@@ -5,8 +5,10 @@ Reads Criterion estimates.json trees and E2E JSON blobs produced by the
 mesh-performance-baselines workflow. Never fabricates measurements: missing
 inputs become explicit null/incomplete entries. Publication gates fail closed
 on undersampling, missing DNS rows, malformed metrics, nonzero errors,
-unexpected target identities, unsupported suite filters, missing or invalid
-workload-interval CPU-steal evidence, or excessive CPU steal.
+nonzero DNS NXDOMAIN counts (kept as a distinct ``total_nxdomain`` counter,
+never folded into ``total_errors``), unexpected target identities, unsupported
+suite filters, missing or invalid workload-interval CPU-steal evidence
+(including each selected mesh Criterion bench window), or excessive CPU steal.
 Repetition evidence counts distinct expected run_N.txt executions with exactly
 one valid gateway/direct identity each — duplicate or partial blobs in a single
 file do not satisfy the repetition gate.
@@ -55,6 +57,7 @@ MIN_E2E_REPETITIONS = 3
 # Ferrum hosted perf workflows. Collections above this are not publication-ready.
 MAX_CPU_STEAL_PERCENT = 5.0
 SUPPORTED_SUITES = frozenset({"all", "mesh", "hbone", "dns"})
+MESH_BENCHES = ("authz_match", "ip_restriction", "slice_apply", "xds_translation")
 DNS_GATEWAY_TARGET = "127.0.0.1:15053"
 DNS_DIRECT_TARGET = "127.0.0.1:17053"
 DNS_CONCURRENCY = 100
@@ -634,9 +637,12 @@ def parse_dns_report(
     p99 = parse_finite_number(report.get("p99_us"), non_negative=True)
     if "total_errors" not in report:
         return None
+    if "total_nxdomain" not in report:
+        return None
     errors = parse_non_negative_int(report.get("total_errors"))
+    nxdomain = parse_non_negative_int(report.get("total_nxdomain"))
     duration_secs = parse_non_negative_int(report.get("duration_secs"))
-    if None in (qps, p50, p90, p99, errors, duration_secs):
+    if None in (qps, p50, p90, p99, errors, nxdomain, duration_secs):
         return None
     if duration_secs != expected_duration_secs:
         return None
@@ -649,6 +655,7 @@ def parse_dns_report(
         "p90_us": p90,
         "p99_us": p99,
         "total_errors": errors,
+        "total_nxdomain": nxdomain,
         "source": source,
     }
 
@@ -830,6 +837,7 @@ def _parse_dns_blob_rows(
             "p90_us": sample["p90_us"],
             "p99_us": sample["p99_us"],
             "total_errors": sample["total_errors"],
+            "total_nxdomain": sample["total_nxdomain"],
             "source": sample["source"],
         }
     if rejected or set(parsed.keys()) != expected_keys:
@@ -910,11 +918,14 @@ def summarize_dns(dns_root: Path, required_reps: int) -> dict[str, Any]:
             direct_rows[key].append(sample)
 
     def aggregate(samples: list[dict[str, Any]]) -> dict[str, Any] | None:
-        return aggregate_throughput_samples(
+        out = aggregate_throughput_samples(
             samples,
             rate_key="qps",
             latency_keys=("p50_us", "p90_us", "p99_us"),
         )
+        if out is not None:
+            out["total_nxdomain_sum"] = sum(s["total_nxdomain"] for s in samples)
+        return out
 
     gateway_summary: dict[str, Any] = {}
     gateway_evidence: dict[str, Any] = {}
@@ -967,11 +978,11 @@ def summarize_dns(dns_root: Path, required_reps: int) -> dict[str, Any]:
         and all(v["ok"] for v in gateway_evidence.values())
         and all(v["ok"] for v in direct_evidence.values())
     )
-    errors_ok = all(
-        (row or {}).get("total_errors_sum", 1) == 0
+    errors_ok = row_complete and all(
+        row.get("total_errors_sum") == 0 and row.get("total_nxdomain_sum") == 0
         for row in list(gateway_summary.values()) + list(direct_summary.values())
         if row is not None
-    ) and row_complete
+    )
 
     return {
         "gateway": gateway_summary,
@@ -1003,6 +1014,9 @@ def expected_health_probe_ids(
 ) -> set[tuple[str, str, int]]:
     normalized = normalize_suites(suites)
     expected: set[tuple[str, str, int]] = set()
+    if normalized in ("all", "mesh"):
+        for bench in MESH_BENCHES:
+            expected.add(("mesh", bench, 1))
     if normalized in ("all", "hbone"):
         for scenario in HBONE_SCENARIOS:
             for repetition in range(1, required_reps + 1):
@@ -1070,8 +1084,8 @@ def load_runner_health(
         steal_values.append(steal)
     max_steal = max(steal_values) if steal_values else None
     # Missing health evidence fails closed: publication requires machine-readable
-    # steal samples from the pre-collection probe and every selected E2E
-    # workload-interval /proc/stat delta.
+    # steal samples from the pre-collection probe and every selected mesh
+    # Criterion and E2E workload-interval /proc/stat delta.
     expected_probe_ids = expected_health_probe_ids(suites, required_reps)
     evidence_ok = (
         pre is not None
@@ -1362,7 +1376,13 @@ def _write_hbone_run(
     )
 
 
-def _dns_blob(*, target: str, rows: list[tuple[str, str, float]], errors: int = 0) -> dict[str, Any]:
+def _dns_blob(
+    *,
+    target: str,
+    rows: list[tuple[str, str, float]],
+    errors: int = 0,
+    nxdomain: int = 0,
+) -> dict[str, Any]:
     return {
         "target": target,
         "concurrency": DNS_CONCURRENCY,
@@ -1377,13 +1397,14 @@ def _dns_blob(*, target: str, rows: list[tuple[str, str, float]], errors: int = 
                 "p90_us": 90,
                 "p99_us": 120,
                 "total_errors": errors,
+                "total_nxdomain": nxdomain,
             }
             for cls, transport, qps in rows
         ],
     }
 
 
-def _write_full_dns_run(path: Path, *, errors: int = 0) -> None:
+def _write_full_dns_run(path: Path, *, errors: int = 0, nxdomain: int = 0) -> None:
     gateway_rows = [
         (cls, transport, 1000.0 + i)
         for i, (cls, transport) in enumerate(DNS_GATEWAY_ROWS)
@@ -1393,9 +1414,23 @@ def _write_full_dns_run(path: Path, *, errors: int = 0) -> None:
         for i, (cls, transport) in enumerate(DNS_DIRECT_ROWS)
     ]
     text = (
-        json.dumps(_dns_blob(target="127.0.0.1:15053", rows=gateway_rows, errors=errors))
+        json.dumps(
+            _dns_blob(
+                target="127.0.0.1:15053",
+                rows=gateway_rows,
+                errors=errors,
+                nxdomain=nxdomain,
+            )
+        )
         + "\n"
-        + json.dumps(_dns_blob(target="127.0.0.1:17053", rows=direct_rows, errors=errors))
+        + json.dumps(
+            _dns_blob(
+                target="127.0.0.1:17053",
+                rows=direct_rows,
+                errors=errors,
+                nxdomain=nxdomain,
+            )
+        )
         + "\n"
     )
     path.write_text(text, encoding="utf-8")
@@ -1535,6 +1570,16 @@ def _self_test_provenance(required_reps: int) -> dict[str, Any]:
 def _self_test_health_probes(required_reps: int) -> str:
     probes = [
         {
+            "phase": "mesh",
+            "scenario": bench,
+            "repetition": 1,
+            "avg_steal_percent": 1.5,
+            "coverage": "workload_interval",
+        }
+        for bench in MESH_BENCHES
+    ]
+    probes.extend(
+        {
             "phase": "hbone",
             "scenario": scenario["key"],
             "repetition": repetition,
@@ -1543,7 +1588,7 @@ def _self_test_health_probes(required_reps: int) -> str:
         }
         for scenario in HBONE_SCENARIOS
         for repetition in range(1, required_reps + 1)
-    ]
+    )
     probes.extend(
         {
             "phase": "dns",
@@ -1977,6 +2022,73 @@ def self_test() -> int:
         assert dns_err_summary["complete"] is True
         assert dns_err_summary["errors_ok"] is False
 
+        # --- nonzero NXDOMAIN fails errors_ok without folding into total_errors ---
+        dns_nx_all = root / "dns_nxdomain_all"
+        dns_nx_all.mkdir()
+        for run in range(1, 4):
+            _write_full_dns_run(dns_nx_all / f"run_{run}.txt", nxdomain=4)
+        dns_nx_all_summary = summarize_dns(dns_nx_all, required_repetitions(3))
+        assert dns_nx_all_summary["complete"] is True
+        assert dns_nx_all_summary["errors_ok"] is False
+        assert (
+            dns_nx_all_summary["gateway"]["mesh-internal/udp"]["total_errors_sum"] == 0
+        )
+        assert (
+            dns_nx_all_summary["gateway"]["mesh-internal/udp"]["total_nxdomain_sum"] == 12
+        )
+
+        dns_nx_partial = root / "dns_nxdomain_partial"
+        dns_nx_partial.mkdir()
+        for run in range(1, 4):
+            gateway_rows = [
+                (cls, transport, 1000.0 + i)
+                for i, (cls, transport) in enumerate(DNS_GATEWAY_ROWS)
+            ]
+            direct_rows = [
+                (cls, transport, 2000.0 + i)
+                for i, (cls, transport) in enumerate(DNS_DIRECT_ROWS)
+            ]
+            gateway_blob = _dns_blob(
+                target="127.0.0.1:15053",
+                rows=gateway_rows,
+            )
+            gateway_blob["reports"][0]["total_nxdomain"] = 1
+            direct_blob = _dns_blob(
+                target="127.0.0.1:17053",
+                rows=direct_rows,
+            )
+            (dns_nx_partial / f"run_{run}.txt").write_text(
+                json.dumps(gateway_blob) + "\n" + json.dumps(direct_blob) + "\n",
+                encoding="utf-8",
+            )
+        dns_nx_partial_summary = summarize_dns(dns_nx_partial, required_repetitions(3))
+        assert dns_nx_partial_summary["complete"] is True
+        assert dns_nx_partial_summary["errors_ok"] is False
+        assert (
+            dns_nx_partial_summary["gateway"]["mesh-internal/udp"]["total_errors_sum"]
+            == 0
+        )
+        assert (
+            dns_nx_partial_summary["gateway"]["mesh-internal/udp"]["total_nxdomain_sum"]
+            == 3
+        )
+        assert (
+            dns_nx_partial_summary["gateway"]["mesh-wildcard/udp"]["total_nxdomain_sum"]
+            == 0
+        )
+
+        missing_nxdomain = {
+            "name_class": "mesh-internal",
+            "transport": "udp",
+            "qps": 1,
+            "p50_us": 1,
+            "p90_us": 2,
+            "p99_us": 3,
+            "total_errors": 0,
+            "duration_secs": DNS_DURATION_SECS,
+        }
+        assert parse_dns_report(missing_nxdomain, "x", DNS_DURATION_SECS) is None
+
         # --- valid three-run shape with healthy steal is publication-ready ---
         valid = root / "valid"
         _populate_valid_mesh(valid / "mesh" / "criterion")
@@ -2063,6 +2175,16 @@ def self_test() -> int:
         )
         zero_probes = [
             {
+                "phase": "mesh",
+                "scenario": bench,
+                "repetition": 1,
+                "avg_steal_percent": 0.0,
+                "coverage": "workload_interval",
+            }
+            for bench in MESH_BENCHES
+        ]
+        zero_probes.extend(
+            {
                 "phase": "hbone",
                 "scenario": scenario["key"],
                 "repetition": repetition,
@@ -2071,7 +2193,7 @@ def self_test() -> int:
             }
             for scenario in HBONE_SCENARIOS
             for repetition in range(1, 4)
-        ]
+        )
         zero_probes.extend(
             {
                 "phase": "dns",
@@ -2164,6 +2286,41 @@ def self_test() -> int:
         )
         assert summary_uncovered["acceptance_gate"]["runner_health_ok"] is False
         assert summary_uncovered["ready_to_publish_baselines"] is False
+        probes_path.write_text(_self_test_health_probes(3), encoding="utf-8")
+
+        # mesh Criterion windows require their own interval evidence
+        hbone_dns_only = [
+            {
+                "phase": "hbone",
+                "scenario": scenario["key"],
+                "repetition": repetition,
+                "avg_steal_percent": 3.0,
+                "coverage": "workload_interval",
+            }
+            for scenario in HBONE_SCENARIOS
+            for repetition in range(1, 4)
+        ]
+        hbone_dns_only.extend(
+            {
+                "phase": "dns",
+                "repetition": repetition,
+                "avg_steal_percent": 2.0,
+                "coverage": "workload_interval",
+            }
+            for repetition in range(1, 4)
+        )
+        probes_path.write_text(
+            "".join(json.dumps(probe) + "\n" for probe in hbone_dns_only),
+            encoding="utf-8",
+        )
+        summary_missing_mesh = build_summary(
+            valid,
+            load_json(valid / "provenance.json") or {},
+            required_repetitions(3),
+            suites="all",
+        )
+        assert summary_missing_mesh["acceptance_gate"]["runner_health_ok"] is False
+        assert summary_missing_mesh["ready_to_publish_baselines"] is False
         probes_path.write_text(_self_test_health_probes(3), encoding="utf-8")
 
         # excessive steal on a workload-interval probe fails publication

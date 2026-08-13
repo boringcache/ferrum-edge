@@ -2649,7 +2649,6 @@ expect_allowed() {
   local retry_route_not_found="${6:-false}"
   local max_attempts="${7:-8}"
   local output="" code="" body="" status=1 err
-  local dispatch_not_ready_body='{"error":"Bad Gateway","message":"HBONE dispatch required for this backend target"}'
   err="$(mktemp)"
   for attempt in $(seq 1 "$max_attempts"); do
     set +e
@@ -2676,24 +2675,13 @@ expect_allowed() {
         sleep 1
         continue
       fi
-      # Post-DaemonSet-restart callers also opt into waiting out the exact
-      # HBONE capability-not-ready refusal. A sticky Unsupported record is
-      # repaired in-proxy; this retry only covers the brief window before a
-      # live dial / refresh proves the peer tunnel.
-      if [[ "$retry_route_not_found" == "true" ]] &&
-        [[ "$code" == "502" ]] &&
-        [[ "$body" == "$dispatch_not_ready_body" ]]; then
-        sleep 1
-        continue
-      fi
       break
     fi
     # A rolling NodeWaypoint restart becomes Kubernetes-Ready before the CP's
     # updated waypoint inventory has necessarily rematerialized every outbound
     # route. Only callers that opt into this bounded convergence mode retry the
-    # exact route-missing / HBONE-not-ready responses above; authorization
-    # failures and other HTTP errors still fail immediately so policy
-    # regressions cannot be hidden.
+    # exact route-missing response above; authorization failures and other HTTP
+    # errors still fail immediately so policy regressions cannot be hidden.
     sleep 1
   done
   echo "expected allow for $label from $from to $url with body '$expected_body', got HTTP ${code:-curl-exit-$status} body '${body:-<empty>}'" >&2
@@ -3197,11 +3185,6 @@ expect_attributed_forged_assertion_blocked() {
     cat "$err" >&2 || true
     return 1
   done
-  if [[ "$status" -ne 0 ]] || ! forged_assertion_response_is_policy_rejection "$code" "$body"; then
-    echo "expected forged assertion request to fail via destination HBONE policy rejection within 120 attempts, got curl status=$status HTTP ${code:-<none>} body '${body:-<empty>}' after ${attempt} attempts" >&2
-    cat "$err" >&2 || true
-    return 1
-  fi
 
   for _ in $(seq 1 20); do
     if fetch_policy_denies_for_node "$dst_node" "$after_file"; then

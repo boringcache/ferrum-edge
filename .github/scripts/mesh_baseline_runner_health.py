@@ -2,12 +2,12 @@
 """Capture machine-readable CPU-steal evidence for mesh baseline collection.
 
 Pre-collection samples `vmstat` with a fixed literal argument vector and
-averages the steal column into `runner_health.json`. E2E probes snapshot
-aggregate `/proc/stat` CPU counters immediately before and after each HBONE
-or DNS workload, then record the finite non-negative delta-steal/delta-total
-percent in `logs/runner_health_probes.jsonl`. Those records are exact
-workload-interval evidence; they are not a short sample of the preceding
-seconds.
+averages the steal column into `runner_health.json`. Interval probes snapshot
+aggregate `/proc/stat` CPU counters immediately before and after each selected
+mesh Criterion bench and each HBONE or DNS workload, then record the finite
+non-negative delta-steal/delta-total percent in `logs/runner_health_probes.jsonl`.
+Those records are exact workload-interval evidence; they are not a short sample
+of the preceding seconds.
 
 Parse failures, missing samples, malformed state, and invalid thresholds are
 emitted as invalid evidence (`avg_steal_percent: null`), never as 0.0%. A
@@ -43,7 +43,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--results-root", type=Path)
     parser.add_argument(
         "--phase",
-        choices=("pre_collection", "hbone", "dns"),
+        choices=("pre_collection", "mesh", "hbone", "dns"),
     )
     parser.add_argument("--scenario", default="")
     parser.add_argument("--repetition", type=int, default=None)
@@ -62,23 +62,28 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         return args
     if args.repetition is None or args.repetition < 1:
         parser.error("--repetition must be a positive integer for E2E probes")
-    if args.phase == "hbone" and not args.scenario:
-        parser.error("--scenario is required for HBONE probes")
+    if args.phase in ("hbone", "mesh") and not args.scenario:
+        parser.error("--scenario is required for HBONE and mesh probes")
     if not args.interval_begin and not args.interval_end:
         parser.error("E2E probes require --interval-begin or --interval-end")
     return args
 
 
-def sample_vmstat() -> str:
-    """Return raw pre-collection vmstat output. The argument vector is literal."""
+def sample_vmstat() -> tuple[str | None, str | None]:
+    """Return (stdout, error). error is a material-free diagnostic on failure."""
 
-    completed = subprocess.run(
-        ["vmstat", "1", "6"],
-        check=True,
-        capture_output=True,
-        text=True,
-    )
-    return completed.stdout
+    try:
+        completed = subprocess.run(
+            ["vmstat", "1", "6"],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+    except OSError:
+        return None, "vmstat pre-collection sample failed"
+    if completed.returncode != 0:
+        return None, "vmstat pre-collection sample failed"
+    return completed.stdout, None
 
 
 def steal_column_index(lines: list[str]) -> int | None:
@@ -383,7 +388,7 @@ def interval_end(
         "coverage": coverage,
         "source": "proc_stat_delta",
     }
-    if phase == "hbone":
+    if phase in ("hbone", "mesh"):
         probe["scenario"] = scenario
     if error is not None:
         probe["error"] = error
@@ -483,6 +488,13 @@ def self_test() -> int:
         assert probe["delta_total"] == 100
         assert probe["scenario"] == "1kib_c50_30s"
 
+        record, status = interval_begin(root, "mesh", "authz_match", 1, (10, 1000))
+        assert status == 0
+        mesh_probe = interval_end(root, "mesh", "authz_match", 1, (12, 1100), 5.0)
+        assert mesh_probe["avg_steal_percent"] == 2.0
+        assert mesh_probe["coverage"] == WORKLOAD_INTERVAL_COVERAGE
+        assert mesh_probe["scenario"] == "authz_match"
+
         # end-without-start evidence
         missing = interval_end(root, "dns", "", 2, (12, 1100), 5.0)
         assert missing["avg_steal_percent"] is None
@@ -546,12 +558,24 @@ def main(argv: list[str] | None = None) -> int:
 
     threshold = threshold_percent()
     if args.phase == "pre_collection":
-        output = sample_vmstat()
-        steal = average_steal_percent(output, PRE_COLLECTION_SAMPLES_KEPT)
+        output, vmstat_error = sample_vmstat()
+        steal = (
+            None
+            if output is None
+            else average_steal_percent(output, PRE_COLLECTION_SAMPLES_KEPT)
+        )
         if threshold is None:
             steal = None
-        record = write_pre_collection(args.results_root, output, steal, threshold)
+        record = write_pre_collection(
+            args.results_root,
+            output or "",
+            steal,
+            threshold,
+        )
         print(json.dumps(record, indent=2))
+        if vmstat_error is not None:
+            print(f"::error::{vmstat_error}")
+            return 1
         _warn_if_excessive("pre-collection", steal, threshold)
         return 0
 

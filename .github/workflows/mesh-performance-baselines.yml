@@ -12,8 +12,10 @@
 # label input). Publication fails closed when selected-suite gates are false,
 # including undersampled E2E rows, missing DNS rows, malformed/duplicate
 # relevant blobs, unexpected DNS target identities, unsupported suite filters,
-# nonzero errors, missing/invalid workload-interval steal evidence, or CPU
-# steal above 5.0%. Artifacts still upload via if: always().
+# nonzero errors, nonzero DNS NXDOMAIN counts, missing/invalid workload-interval
+# steal evidence (mesh Criterion windows and HBONE/DNS repetitions), or CPU
+# steal above 5.0%. Artifacts still upload via if: always(). Overlapping
+# dispatches serialize on github.ref and do not cancel an in-progress collection.
 #
 # Every computation that is not a literal command lives in an approved
 # automation root under .github/scripts/. Keep it that way: inline interpreter
@@ -61,7 +63,7 @@ on:
 
 concurrency:
   group: mesh-performance-baselines-${{ github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: false
 
 permissions:
   contents: read
@@ -109,7 +111,7 @@ jobs:
           set -euo pipefail
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
-            protobuf-compiler libcurl4-openssl-dev lsof sysstat curl
+            protobuf-compiler lsof curl
 
       - name: Prepare results directories + suite command ledger
         env:
@@ -166,10 +168,29 @@ jobs:
           mkdir -p mesh-baseline-results/mesh
           for bench in authz_match ip_restriction slice_apply xds_translation; do
             echo "==== cargo bench --bench ${bench} ===="
+            python3 .github/scripts/mesh_baseline_runner_health.py \
+              --results-root mesh-baseline-results \
+              --phase mesh \
+              --scenario "${bench}" \
+              --repetition 1 \
+              --interval-begin
+            harness_status=1
+            set +e
             cargo bench --manifest-path tests/performance/mesh/Cargo.toml \
               --bench "${bench}" \
               -- --warm-up-time 3 --measurement-time 15 \
               2>&1 | tee "mesh-baseline-results/logs/mesh_${bench}.log"
+            harness_status=${PIPESTATUS[0]}
+            python3 .github/scripts/mesh_baseline_runner_health.py \
+              --results-root mesh-baseline-results \
+              --phase mesh \
+              --scenario "${bench}" \
+              --repetition 1 \
+              --interval-end
+            set -euo pipefail
+            if (( harness_status != 0 )); then
+              exit "${harness_status}"
+            fi
           done
           mkdir -p mesh-baseline-results/mesh/criterion
           if [ -d tests/performance/mesh/target/criterion ]; then
@@ -213,6 +234,8 @@ jobs:
                 --interval-begin
               harness_status=1
               set +e
+              export MESH_BASELINE_DIAG_DIR="mesh-baseline-results/logs/hbone/${KEY}/run_${run}"
+              mkdir -p "${MESH_BASELINE_DIAG_DIR}"
               ./tests/performance/mesh-hbone-e2e/run.sh --skip-build --json \
                 --duration "${DURATION}" \
                 --concurrency "${CONCURRENCY}" \
@@ -258,6 +281,8 @@ jobs:
               --interval-begin
             harness_status=1
             set +e
+            export MESH_BASELINE_DIAG_DIR="mesh-baseline-results/logs/dns/run_${run}"
+            mkdir -p "${MESH_BASELINE_DIAG_DIR}"
             ./tests/performance/mesh-dns-e2e/run.sh --skip-build --json \
               --duration 60 --concurrency 100 --protocol both \
               2>&1 | tee "mesh-baseline-results/dns/run_${run}.txt"

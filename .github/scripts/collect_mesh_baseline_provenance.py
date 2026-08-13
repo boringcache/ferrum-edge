@@ -41,6 +41,27 @@ def parse_meminfo_kib(meminfo: str, key: str) -> int | None:
     return None
 
 
+def parse_e2e_repetitions() -> int | None:
+    raw = os.environ.get("BENCH_ITERATIONS", "3")
+    try:
+        value = int(str(raw).strip())
+    except (TypeError, ValueError):
+        return None
+    if value < 1:
+        return None
+    return value
+
+
+def load_suite_commands(path: Path) -> list[object] | None:
+    try:
+        loaded = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    if not isinstance(loaded, list):
+        return None
+    return loaded
+
+
 def cargo_pkg_version(manifest: Path, package: str) -> str | None:
     if not manifest.is_file():
         return None
@@ -93,9 +114,21 @@ def main() -> int:
     nproc = read_fact(args.host_facts_dir, "nproc.txt")
 
     mem_total_kib = parse_meminfo_kib(meminfo, "MemTotal")
-    suite_commands = []
-    if args.suite_commands and args.suite_commands.is_file():
-        suite_commands = json.loads(args.suite_commands.read_text(encoding="utf-8"))
+    suite_commands: list[object] = []
+    if args.suite_commands is not None:
+        if not args.suite_commands.is_file():
+            print("::error::suite command ledger is missing")
+            return 1
+        loaded = load_suite_commands(args.suite_commands)
+        if loaded is None:
+            print("::error::suite command ledger is malformed")
+            return 1
+        suite_commands = loaded
+
+    e2e_repetitions = parse_e2e_repetitions()
+    if e2e_repetitions is None:
+        print("::error::BENCH_ITERATIONS is missing or malformed")
+        return 1
 
     repo_root = Path(__file__).resolve().parents[2]
     mesh_manifest = repo_root / "tests" / "performance" / "mesh" / "Cargo.toml"
@@ -170,12 +203,13 @@ def main() -> int:
                 "Criterion default warm-up plus configured --warm-up-time / "
                 "--measurement-time flags recorded in suite_commands"
             ),
-            "e2e_repetitions": int(os.environ.get("BENCH_ITERATIONS", "3")),
+            "e2e_repetitions": e2e_repetitions,
             "e2e_policy": (
                 "At least three clean repetitions (configured count, never below "
                 "three); discard/fail publication if any retained row has non-zero "
-                "unexplained errors or if CPU steal exceeds 5.0% on the "
-                "pre-collection sample or any E2E workload-interval /proc/stat delta"
+                "unexplained errors or NXDOMAIN counts, or if CPU steal exceeds 5.0% on the "
+                "pre-collection sample or any selected mesh Criterion / E2E workload-interval "
+                "/proc/stat delta"
             ),
         },
         "suite_commands": suite_commands,
