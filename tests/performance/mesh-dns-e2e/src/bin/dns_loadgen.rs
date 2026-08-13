@@ -157,6 +157,7 @@ async fn run_phase(
         .collect();
 
     let mut per_class: HashMap<NameClass, ClassMetrics> = HashMap::new();
+    let mut worker_join_failed = false;
     for w in workers {
         match w.await {
             Ok(metrics) => {
@@ -164,10 +165,16 @@ async fn run_phase(
                     per_class.entry(class).or_default().merge(&m);
                 }
             }
-            Err(e) => eprintln!("[dns_loadgen] worker join error: {e}"),
+            Err(e) => {
+                eprintln!("[dns_loadgen] worker join error: {e}");
+                worker_join_failed = true;
+            }
         }
     }
     let _ = timer.await;
+    if worker_join_failed {
+        return Err(anyhow!("one or more DNS load-generator workers failed"));
+    }
 
     let mut reports = Vec::with_capacity(per_class.len());
     for class in NameClass::ALL {

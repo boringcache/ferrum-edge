@@ -1109,14 +1109,19 @@ fn annotate_gateway_mesh_metadata(
     }
 }
 
-fn hbone_inner_baggage_strip_prefixes(configured_prefixes: &[String]) -> Vec<String> {
-    let mut prefixes = configured_prefixes.to_vec();
-    for prefix in HBONE_INNER_IDENTITY_BAGGAGE_PREFIXES {
-        if !prefixes.iter().any(|existing| existing == prefix) {
-            prefixes.push((*prefix).to_string());
-        }
-    }
-    prefixes
+/// Strip reserved identity baggage plus any configured egress prefixes from a
+/// secured-mesh inner request. Combines the borrowed configured slice with the
+/// static reserved prefix set in one filtering pass — no per-attempt
+/// `Vec<String>` clone of either list.
+pub(crate) fn strip_secured_mesh_inner_baggage_in_map(
+    headers: &mut HashMap<String, String>,
+    configured_prefixes: &[String],
+) {
+    crate::modes::mesh::hbone::strip_egress_baggage_in_map_with_static_prefixes(
+        headers,
+        configured_prefixes,
+        HBONE_INNER_IDENTITY_BAGGAGE_PREFIXES,
+    );
 }
 
 fn hbone_inner_headers_with_stripped_baggage(
@@ -1128,8 +1133,7 @@ fn hbone_inner_headers_with_stripped_baggage(
     }
 
     let mut owned = headers.clone();
-    let prefixes = hbone_inner_baggage_strip_prefixes(configured_prefixes);
-    crate::modes::mesh::hbone::strip_egress_baggage_in_map(&mut owned, &prefixes);
+    strip_secured_mesh_inner_baggage_in_map(&mut owned, configured_prefixes);
     Some(owned)
 }
 
@@ -6145,6 +6149,20 @@ pub struct ProxyState {
     /// #3775's future active-request breaker). See `docs/mesh.md` and
     /// `src/backend_pending_limit.rs`.
     pub backend_pending_limit: Arc<crate::backend_pending_limit::BackendPendingLimiter>,
+    /// Destination-wide **active-request** breaker enforcing DestinationRule
+    /// `connectionPool.http.http2MaxRequests` across HTTP/1.1 AND HTTP/2 — every
+    /// transport, every connection, every pool shard. Keyed by the effective
+    /// policy identity (`namespace`, logical destination, DestinationRule policy
+    /// port, selected subset), never by a socket address, so
+    /// one destination has ONE budget and two Services sharing endpoints keep
+    /// their own. The permit is taken during backend admission (before any dial)
+    /// and released only when the client-visible response body reaches a
+    /// terminal state, so streaming and long-lived gRPC responses stay counted.
+    /// Istio's separate per-connection `maxConcurrentStreams` remains the
+    /// transport knob (`pool_http2_max_concurrent_streams`). See
+    /// `docs/mesh.md` and `src/backend_active_request_limit.rs`.
+    pub backend_active_request_limit:
+        Arc<crate::backend_active_request_limit::BackendActiveRequestLimiter>,
 }
 
 #[inline]
@@ -7926,6 +7944,11 @@ impl ProxyState {
             reqwest_conn_admission,
             backend_pending_limit: Arc::new(
                 crate::backend_pending_limit::BackendPendingLimiter::with_shard_amount(
+                    pool_shard_amount,
+                ),
+            ),
+            backend_active_request_limit: Arc::new(
+                crate::backend_active_request_limit::BackendActiveRequestLimiter::with_shard_amount(
                     pool_shard_amount,
                 ),
             ),
@@ -12175,6 +12198,7 @@ async fn handle_websocket_request_authenticated(
 
         backend_admission_start = Instant::now();
         backend_admission_permits = match backend_dispatch::run_backend_admission_plugins(
+            &state,
             backend_admission_plugins.as_ref(),
             &ctx,
             &proxy,
@@ -12328,6 +12352,15 @@ async fn handle_websocket_request_authenticated(
         // loopback authority.
         let ws_dial_result: Result<WsBackendHandshake, Box<dyn std::error::Error + Send + Sync>> =
             if let Some(unix_dispatch) = ws_unix_dispatch {
+                // Match ordinary Unix HTTP dispatch: preserve the authenticated
+                // client's Host only when the route explicitly opts in.
+                // Otherwise the target-effective backend authority owns the
+                // local application's virtual-host selection. The parse-only
+                // upgrade URI always uses that backend authority so an
+                // untrusted Host cannot rewrite the request-target. A
+                // malformed, authority-less, or unsafe backend URL fails
+                // closed here — before admission/dial — rather than
+                // substituting a local virtual host.
                 match unix_dispatch {
                     // Boxed: this dial future (admission gate + hyper/tungstenite
                     // H1 upgrade + framer construction) would otherwise be stored
@@ -12338,21 +12371,40 @@ async fn handle_websocket_request_authenticated(
                     // `proxy_to_backend`: the generic future's size is a
                     // whole-gateway stack budget, not a WS-path cost.
                     #[cfg(unix)]
-                    Ok(socket_path) => Box::pin(connect_unix_websocket_backend(
-                        &state.unix_backend_pool,
-                        ws_dial_proxy,
-                        &env_config,
-                        socket_path,
-                        ws_client_host.as_deref().unwrap_or_default(),
-                        ws_path_and_query.as_ref(),
-                        &client_headers,
-                        ws_size_limits.max_frame_bytes,
-                        ws_size_limits.max_message_bytes,
-                        state.websocket_write_buffer_size,
-                        ws_idle_tracker.clone(),
-                    ))
-                    .await
-                    .map(|handshake| WsBackendHandshake::Unix(Box::new(handshake))),
+                    Ok(socket_path) => match unix_websocket_url_authority(&current_backend_url) {
+                        None => {
+                            warn!(
+                                proxy_id = %proxy.id,
+                                "Refusing WebSocket upgrade over unix-socket backend: \
+                                 target-effective URL has no safe authority; failing closed \
+                                 rather than substituting a local virtual host"
+                            );
+                            Err(retry::WS_UNIX_BACKEND_AUTHORITY_INVALID.into())
+                        }
+                        Some(url_authority) => {
+                            let host = unix_websocket_backend_host(
+                                proxy.preserve_host_header,
+                                ws_client_host.as_deref(),
+                                &url_authority,
+                            );
+                            Box::pin(connect_unix_websocket_backend(
+                                &state.unix_backend_pool,
+                                ws_dial_proxy,
+                                &env_config,
+                                socket_path,
+                                &url_authority,
+                                host.as_ref(),
+                                ws_path_and_query.as_ref(),
+                                &client_headers,
+                                ws_size_limits.max_frame_bytes,
+                                ws_size_limits.max_message_bytes,
+                                state.websocket_write_buffer_size,
+                                ws_idle_tracker.clone(),
+                            ))
+                            .await
+                            .map(|handshake| WsBackendHandshake::Unix(Box::new(handshake)))
+                        }
+                    },
                     // Non-Unix builds never produce `Ok` above.
                     #[cfg(not(unix))]
                     Ok(_) => Err(retry::WS_UNIX_SOCKET_INADMISSIBLE.into()),
@@ -14383,8 +14435,12 @@ pub(crate) async fn connect_websocket_backend(
 ///
 /// ## Policy parity with the TCP path
 ///
-/// The caller supplies the same normalized `client_headers` the TCP path
-/// forwards, and tungstenite generates `Upgrade`/`Connection`/
+/// The parse-only upgrade URI uses the target-effective backend authority
+/// (IPv6-bracketed, with port) exactly as Direct TCP WebSocket URLs do; the
+/// Host header is the one Unix HTTP/1.1 dispatch would send under
+/// `preserve_host_header`. The caller supplies the same normalized
+/// `client_headers` the TCP path forwards, and tungstenite generates
+/// `Upgrade`/`Connection`/
 /// `Sec-WebSocket-Key`/`Sec-WebSocket-Version` and validates the backend's
 /// `101 Switching Protocols` + `Sec-WebSocket-Accept` before yielding the
 /// stream. The returned framer carries the identical `WebSocketConfig` bounds
@@ -14402,7 +14458,8 @@ async fn connect_unix_websocket_backend(
     proxy: &Proxy,
     env_config: &crate::config::EnvConfig,
     socket_path: &str,
-    backend_host: &str,
+    url_authority: &str,
+    host_header: &str,
     path_and_query: &str,
     client_headers: &[(String, String)],
     max_websocket_frame_size_bytes: usize,
@@ -14418,15 +14475,22 @@ async fn connect_unix_websocket_backend(
     // (issue #2963). Matches every other backend WebSocket transport.
     ws_config.auto_pong = false;
 
-    // A Unix socket has no network authority, so the request line is built from
-    // the routing host the app matches on plus the preserved client path+query.
-    // The URL is parse-only — nothing is resolved or dialed from it.
-    let host = if backend_host.is_empty() {
-        "localhost"
+    // A Unix socket has no network authority. The caller already parsed the
+    // target-effective backend authority (never the client Host, never the
+    // socket path) and refused unsafe URLs, so request-target and TLS/SNI
+    // derivation stay on the same trusted URL the Direct TCP WebSocket path
+    // dials. Host is applied separately from the preserve-host policy value.
+    let path = if path_and_query.starts_with('/') {
+        path_and_query
     } else {
-        backend_host
+        "/"
     };
-    let ws_url = format!("ws://{host}{path_and_query}");
+    let ws_url = format!("ws://{url_authority}{path}");
+    let host = if host_header.is_empty() {
+        url_authority
+    } else {
+        host_header
+    };
     let mut ws_request = ws_url.into_client_request()?;
     ws_request.headers_mut().insert(
         hyper::header::HOST,
@@ -14547,6 +14611,59 @@ pub(crate) fn websocket_mesh_egress(target: &UpstreamTarget) -> Option<MeshWsEgr
         Some(MeshWsEgress::AmbientHbone)
     } else if mesh_mtls_pool::target_mesh_mtls_enabled(target) {
         Some(MeshWsEgress::SidecarMtls)
+    } else {
+        None
+    }
+}
+
+/// Select the Host sent by an RFC 6455 upgrade over a Unix backend socket.
+///
+/// Mirrors ordinary Unix HTTP/1.1 Host policy: the inbound Host is used only
+/// for an explicit `preserve_host_header` route, and only when it is a valid
+/// RFC 3986 authority (so a client Host cannot inject a request-target,
+/// userinfo, or header separator). Surrounding whitespace is stripped before
+/// validation and the returned value is that normalized authority — never the
+/// original untrimmed representation. Otherwise `url_authority` is used. A
+/// filesystem path is never a valid URI authority, so the socket path cannot
+/// become Host.
+pub(crate) fn unix_websocket_backend_host<'a>(
+    preserve_host_header: bool,
+    client_host: Option<&str>,
+    url_authority: &'a str,
+) -> std::borrow::Cow<'a, str> {
+    if preserve_host_header
+        && let Some(host) = client_host.and_then(unix_websocket_validated_authority)
+    {
+        return std::borrow::Cow::Owned(host.to_string());
+    }
+    std::borrow::Cow::Borrowed(url_authority)
+}
+
+/// Parse-only URI authority for a Unix WebSocket upgrade.
+///
+/// Always taken from the target-effective backend URL, never from the client
+/// Host and never from the socket filesystem path. Direct TCP WebSocket
+/// upgrades derive Host and request-target from that same URL; Unix keeps
+/// the URI on this trusted authority even when the Host header is preserved.
+/// Returns `None` for a malformed, authority-less, or unsafe URL instead of
+/// substituting a local virtual host.
+pub(crate) fn unix_websocket_url_authority(backend_url: &str) -> Option<String> {
+    let uri = backend_url.parse::<hyper::Uri>().ok()?;
+    unix_websocket_validated_authority(uri.authority()?.as_str()).map(str::to_string)
+}
+
+fn unix_websocket_validated_authority(value: &str) -> Option<&str> {
+    // Validate the trimmed form and return that same slice so surrounding
+    // whitespace cannot survive as Host/URI authority after a successful
+    // check. `split_request_authority` rejects empty values, userinfo `@`,
+    // unbracketed IPv6, invalid ports, and non-reg-name hosts (including `/`,
+    // spaces, and CRLF). `HeaderValue` rejects CTL bytes that would otherwise
+    // survive a URI parse.
+    let trimmed = value.trim();
+    if split_request_authority(trimmed).is_some()
+        && hyper::header::HeaderValue::from_str(trimmed).is_ok()
+    {
+        Some(trimmed)
     } else {
         None
     }
@@ -28312,6 +28429,7 @@ async fn handle_proxy_request_inner(
             let admission_proxy =
                 resolve_effective_proxy_for_target(&proxy, upstream_target.as_deref());
             let permits = match backend_dispatch::run_backend_admission_plugins(
+                &state,
                 backend_admission_plugins.as_ref(),
                 &ctx,
                 admission_proxy.as_ref(),
@@ -28989,61 +29107,64 @@ async fn handle_proxy_request_inner(
         // with a Trailers-Only gRPC UNAVAILABLE whose message names the failed
         // contract and never echoes a SPIFFE ID, SNI name, trust domain, or dial
         // address. There is deliberately no direct-dial fallback.
-        let grpc_transport =
-            match resolve_grpc_dispatch_transport(&state, upstream_target.as_deref()) {
-                Ok(transport) => transport,
-                Err(transport_error) => {
-                    let message = transport_error.message();
-                    let diagnostic = transport_error.diagnostic().as_str();
-                    warn!(
-                        proxy_id = %proxy.id,
-                        target_host = %grpc_effective_host,
-                        diagnostic,
-                        refusal = ?transport_error,
+        let grpc_transport = match resolve_grpc_dispatch_transport(
+            &state,
+            upstream_target.as_deref(),
+            ctx.peer_spiffe_id.as_ref(),
+        ) {
+            Ok(transport) => transport,
+            Err(transport_error) => {
+                let message = transport_error.message();
+                let diagnostic = transport_error.diagnostic().as_str();
+                warn!(
+                    proxy_id = %proxy.id,
+                    target_host = %grpc_effective_host,
+                    diagnostic,
+                    refusal = ?transport_error,
+                    message,
+                    "No dispatchable mesh transport for the selected gRPC target; failing \
+                     closed with gRPC UNAVAILABLE instead of an unauthenticated direct dial"
+                );
+                // This reject is AFTER `grpc_probe_guard` exists, so disarm
+                // it before the explicit release (a still-armed Drop would
+                // free a SECOND, unrelated in-flight probe slot).
+                grpc_probe_guard.disarm();
+                release_circuit_breaker_probe_on_admission_reject(
+                    &state,
+                    &proxy,
+                    cb_target_key.as_deref(),
+                    cb_is_half_open_probe,
+                );
+                record_request(&state, 200); // gRPC errors ride HTTP 200 + trailers
+                if let Some(content_type) = grpc_web_response_content_type {
+                    return Ok(build_grpc_web_error_response(
+                        content_type,
+                        14,
                         message,
-                        "No dispatchable mesh transport for the selected gRPC target; failing \
-                         closed with gRPC UNAVAILABLE instead of an unauthenticated direct dial"
-                    );
-                    // This reject is AFTER `grpc_probe_guard` exists, so disarm
-                    // it before the explicit release (a still-armed Drop would
-                    // free a SECOND, unrelated in-flight probe slot).
-                    grpc_probe_guard.disarm();
-                    release_circuit_breaker_probe_on_admission_reject(
-                        &state,
-                        &proxy,
-                        cb_target_key.as_deref(),
-                        cb_is_half_open_probe,
-                    );
-                    record_request(&state, 200); // gRPC errors ride HTTP 200 + trailers
-                    if let Some(content_type) = grpc_web_response_content_type {
-                        return Ok(build_grpc_web_error_response(
-                            content_type,
-                            14,
-                            message,
-                            plugin_cache_view
-                                .initial_response_header_policy_plugins()
-                                .as_ref(),
-                        ));
-                    }
-                    if grpc_request_is_web_translated
-                        && let Some(response) = build_translated_grpc_web_error_response(
-                            &ctx,
-                            14,
-                            message,
-                            plugin_cache_view
-                                .initial_response_header_policy_plugins()
-                                .as_ref(),
-                        )
-                    {
-                        return Ok(response);
-                    }
-                    return Ok(grpc_proxy::build_grpc_error_response_with_policy(
-                        14, // UNAVAILABLE
-                        message,
-                        initial_response_header_policy_plugins.as_ref(),
+                        plugin_cache_view
+                            .initial_response_header_policy_plugins()
+                            .as_ref(),
                     ));
                 }
-            };
+                if grpc_request_is_web_translated
+                    && let Some(response) = build_translated_grpc_web_error_response(
+                        &ctx,
+                        14,
+                        message,
+                        plugin_cache_view
+                            .initial_response_header_policy_plugins()
+                            .as_ref(),
+                    )
+                {
+                    return Ok(response);
+                }
+                return Ok(grpc_proxy::build_grpc_error_response_with_policy(
+                    14, // UNAVAILABLE
+                    message,
+                    initial_response_header_policy_plugins.as_ref(),
+                ));
+            }
+        };
 
         let grpc_effective_port = grpc_dispatch_proxy.backend_port;
         let mut grpc_backend_url = build_backend_url_with_target(
@@ -29408,6 +29529,7 @@ async fn handle_proxy_request_inner(
             // `retry_on_connect_failure` enabled. Mirrors the same
             // single-return contract used by the buffered-request gRPC path.
             backend_admission_permits = match backend_dispatch::run_backend_admission_plugins(
+                &state,
                 backend_admission_plugins.as_ref(),
                 &ctx,
                 &proxy,
@@ -29580,6 +29702,7 @@ async fn handle_proxy_request_inner(
                         None => None,
                     };
                 backend_admission_permits = match backend_dispatch::run_backend_admission_plugins(
+                    &state,
                     backend_admission_plugins.as_ref(),
                     &ctx,
                     &proxy,
@@ -29691,6 +29814,7 @@ async fn handle_proxy_request_inner(
                         );
                         backend_admission_permits =
                             match backend_dispatch::run_backend_admission_plugins(
+                                &state,
                                 backend_admission_plugins.as_ref(),
                                 &ctx,
                                 &proxy,
@@ -30157,6 +30281,7 @@ async fn handle_proxy_request_inner(
                 }
 
                 backend_admission_permits = match backend_dispatch::run_backend_admission_plugins(
+                    &state,
                     backend_admission_plugins.as_ref(),
                     &ctx,
                     &proxy,
@@ -30223,50 +30348,53 @@ async fn handle_proxy_request_inner(
                 // authority, pinned peer, and cross-cluster SNI / trust-domain
                 // scope, so a target that mutated across a live reload fails
                 // closed here instead of being dialed on a stale plan.
-                let grpc_retry_transport =
-                    match resolve_grpc_dispatch_transport(&state, grpc_current_target.as_deref()) {
-                        Ok(transport) => transport,
-                        Err(transport_error) => {
-                            let message = transport_error.message();
-                            warn!(
-                                proxy_id = %proxy.id,
-                                diagnostic = transport_error.diagnostic().as_str(),
-                                refusal = ?transport_error,
+                let grpc_retry_transport = match resolve_grpc_dispatch_transport(
+                    &state,
+                    grpc_current_target.as_deref(),
+                    ctx.peer_spiffe_id.as_ref(),
+                ) {
+                    Ok(transport) => transport,
+                    Err(transport_error) => {
+                        let message = transport_error.message();
+                        warn!(
+                            proxy_id = %proxy.id,
+                            diagnostic = transport_error.diagnostic().as_str(),
+                            refusal = ?transport_error,
+                            message,
+                            "gRPC retry target has no dispatchable mesh transport; failing \
+                             closed with gRPC UNAVAILABLE instead of an unauthenticated \
+                             direct dial"
+                        );
+                        record_request(&state, 200); // gRPC errors ride HTTP 200 + trailers
+                        if let Some(content_type) = grpc_web_response_content_type {
+                            return Ok(build_grpc_web_error_response(
+                                content_type,
+                                14,
                                 message,
-                                "gRPC retry target has no dispatchable mesh transport; failing \
-                                 closed with gRPC UNAVAILABLE instead of an unauthenticated \
-                                 direct dial"
-                            );
-                            record_request(&state, 200); // gRPC errors ride HTTP 200 + trailers
-                            if let Some(content_type) = grpc_web_response_content_type {
-                                return Ok(build_grpc_web_error_response(
-                                    content_type,
-                                    14,
-                                    message,
-                                    plugin_cache_view
-                                        .initial_response_header_policy_plugins()
-                                        .as_ref(),
-                                ));
-                            }
-                            if grpc_request_is_web_translated
-                                && let Some(response) = build_translated_grpc_web_error_response(
-                                    &ctx,
-                                    14,
-                                    message,
-                                    plugin_cache_view
-                                        .initial_response_header_policy_plugins()
-                                        .as_ref(),
-                                )
-                            {
-                                return Ok(response);
-                            }
-                            return Ok(grpc_proxy::build_grpc_error_response_with_policy(
-                                14, // UNAVAILABLE
-                                message,
-                                initial_response_header_policy_plugins.as_ref(),
+                                plugin_cache_view
+                                    .initial_response_header_policy_plugins()
+                                    .as_ref(),
                             ));
                         }
-                    };
+                        if grpc_request_is_web_translated
+                            && let Some(response) = build_translated_grpc_web_error_response(
+                                &ctx,
+                                14,
+                                message,
+                                plugin_cache_view
+                                    .initial_response_header_policy_plugins()
+                                    .as_ref(),
+                            )
+                        {
+                            return Ok(response);
+                        }
+                        return Ok(grpc_proxy::build_grpc_error_response_with_policy(
+                            14, // UNAVAILABLE
+                            message,
+                            initial_response_header_policy_plugins.as_ref(),
+                        ));
+                    }
+                };
                 grpc_final_upstream_target = grpc_current_target.clone();
                 grpc_lb_connection_guard = Some(LoadBalancerConnectionGuard::new(
                     grpc_current_target.clone(),
@@ -32987,6 +33115,7 @@ async fn handle_proxy_request_inner(
             }
 
             backend_admission_permits = match backend_dispatch::run_backend_admission_plugins(
+                &state,
                 backend_admission_plugins.as_ref(),
                 &ctx,
                 &proxy,
@@ -35138,7 +35267,8 @@ pub(crate) fn resolve_effective_proxy_for_target<'a>(
     // are FIELD-MERGED, not wholesale-replaced: a per-port `connectionPool.http`
     // field wins when set, otherwise the selected-subset/top-level value is inherited —
     // so an unrelated per-port field (`connectTimeout`/`tls`) no longer wipes the
-    // inherited top-level `idleTimeout`/`http2MaxRequests`/`maxRetries`. This
+    // inherited top-level `idleTimeout`/`http2MaxRequests`/
+    // `maxConcurrentStreams`/`maxRetries`. This
     // matches the cold-path tiering exactly (inherited fallback, then a partial
     // per-port overlay; see `apply_connection_pool_http_to_port_override` in
     // `src/modes/mesh/mod.rs`). Resolve each field through borrowed references:
@@ -35518,6 +35648,60 @@ pub(crate) fn resolve_backend_http1_max_pending_requests(
                 .as_ref()
                 .and_then(|fallback| fallback.http1_max_pending_requests)
         })
+}
+
+/// Resolve the DestinationRule `connectionPool.http.http2MaxRequests` cap — the
+/// destination-wide ACTIVE-REQUEST budget — for the destination port a backend
+/// attempt will target.
+///
+/// Returns `None` (no cap) in the common case: the proxy has no
+/// `dispatch_port_overrides`, the resolved port has no override, and the
+/// inherited top-level/selected-subset fallback carries no
+/// `http2_max_requests`. Hot-path discipline and FIELD-level fallback semantics
+/// match [`resolve_backend_http1_max_pending_requests`] exactly: one field read
+/// on the precomputed `Proxy.dispatch_port_overrides` map, no `ArcSwap` load,
+/// and a per-port entry that sets an unrelated field does not wipe the
+/// inherited cap.
+///
+/// `dispatch_port` is the DestinationRule policy key, always derived through
+/// [`dispatch_policy_port_for_target`]. Unlike the H1 pending gate this cap is
+/// transport-agnostic: it applies to HTTP/1.1 and HTTP/2 alike, exactly as
+/// Istio specifies.
+pub(crate) fn resolve_backend_http2_max_requests(
+    proxy: &Proxy,
+    dispatch_policy_port: u16,
+) -> Option<u32> {
+    proxy
+        .dispatch_port_overrides
+        .as_ref()
+        .and_then(|overrides| overrides.get(&dispatch_policy_port))
+        .and_then(|override_config| override_config.http2_max_requests)
+        .or_else(|| {
+            proxy
+                .dispatch_port_override_fallback
+                .as_ref()
+                .and_then(|fallback| fallback.http2_max_requests)
+        })
+}
+
+/// The logical destination identity one backend attempt is admitted against for
+/// the `http2MaxRequests` breaker.
+///
+/// The referenced upstream id is the DestinationRule cluster: every endpoint of
+/// one Service shares one budget (so connection count, pool sharding, and LB
+/// rotation cannot multiply the ceiling), while two Services that resolve to the
+/// same pods keep independent budgets. A direct-backend proxy with no upstream
+/// falls back to its own route id, which is that route's logical destination.
+pub(crate) fn destination_active_request_scope<'a>(
+    proxy: &'a Proxy,
+    policy_port: u16,
+) -> crate::backend_active_request_limit::DestinationScope<'a> {
+    crate::backend_active_request_limit::DestinationScope {
+        namespace: proxy.namespace.as_str(),
+        destination: proxy.upstream_id.as_deref().unwrap_or(proxy.id.as_str()),
+        policy_port,
+        subset: proxy.upstream_subset.as_deref(),
+    }
 }
 
 /// Whether the reqwest-backed backend client for this (effective) proxy is
@@ -36783,6 +36967,7 @@ impl PreacquiredBackendAdmission {
 
     fn take_or_run(
         &mut self,
+        state: &ProxyState,
         plugins: &[Arc<dyn crate::plugins::Plugin>],
         ctx: &RequestContext,
         proxy: &Proxy,
@@ -36794,6 +36979,7 @@ impl PreacquiredBackendAdmission {
             Ok(permits)
         } else {
             backend_dispatch::run_backend_admission_plugins(
+                state,
                 plugins,
                 ctx,
                 proxy,
@@ -37825,6 +38011,7 @@ async fn proxy_to_backend(
             Err(response) => return backend_dispatch_response(response, None, None),
         };
         backend_admission_permits = match preacquired_backend_admission.take_or_run(
+            state,
             backend_admission_plugins,
             request_ctx,
             proxy,
@@ -37930,6 +38117,7 @@ async fn proxy_to_backend(
             Err(response) => return backend_dispatch_response(response, None, None),
         };
         backend_admission_permits = match preacquired_backend_admission.take_or_run(
+            state,
             backend_admission_plugins,
             request_ctx,
             proxy,
@@ -38059,6 +38247,7 @@ async fn proxy_to_backend(
             Err(response) => return backend_dispatch_response(response, None, None),
         };
         backend_admission_permits = match preacquired_backend_admission.take_or_run(
+            state,
             backend_admission_plugins,
             request_ctx,
             proxy,
@@ -38136,6 +38325,7 @@ async fn proxy_to_backend(
             return reject;
         }
         backend_admission_permits = match preacquired_backend_admission.take_or_run(
+            state,
             backend_admission_plugins,
             request_ctx,
             proxy,
@@ -38310,6 +38500,7 @@ async fn proxy_to_backend(
             // let a capacity-rejected request still create a connection and
             // would hide get_sender connect failures from the limiter.
             let mut h2_admission_permits = match preacquired_backend_admission.take_or_run(
+                state,
                 backend_admission_plugins,
                 request_ctx,
                 proxy,
@@ -39105,8 +39296,10 @@ async fn proxy_to_backend(
     // (`enable_http2 && (retain_request_body || requires_request_body_buffering)`);
     // an H2 backend must not be capped by an `http1*` knob, so the slot is taken
     // only when the reqwest client is forced/known HTTP/1.1
-    // (`reqwest_dispatch_is_http1_only`). Their concurrency is instead governed
-    // by `http2MaxRequests` → `h2_max_concurrent_streams`.
+    // (`reqwest_dispatch_is_http1_only`). Every transport — this one included —
+    // is separately bounded by the destination-wide `http2MaxRequests`
+    // active-request breaker acquired during backend admission
+    // (`src/backend_active_request_limit.rs`).
     //
     // In-flight reinterpretation (codex r3, finding 3): reqwest's `send()`
     // resolves when RESPONSE HEADERS arrive, not when a connection slot is
@@ -39219,6 +39412,7 @@ async fn proxy_to_backend(
         )
     });
     backend_admission_permits = match preacquired_backend_admission.take_or_run(
+        state,
         backend_admission_plugins,
         request_ctx,
         proxy,
@@ -40443,17 +40637,27 @@ pub(crate) fn mesh_mtls_dispatch_authority<'a>(
 /// gRPC UNAVAILABLE, never an unauthenticated plaintext dial that would bypass
 /// SVID-mTLS, identity pinning, and mesh authz identity.
 ///
-/// `None` (no LB-selected target) keeps the direct pool: the proxy's own backend
-/// host is the destination and no mesh tag exists to honor.
+/// `asserted_source_identity` is the authenticated frontend workload SPIFFE
+/// (`ctx.peer_spiffe_id`). It is cloned into an HBONE transport and is not
+/// borrowed from `RequestContext`, so later `ctx` mutations stay valid. Caller
+/// headers are never consulted. The configured egress baggage-strip list is
+/// borrowed (not cloned) into HBONE and mesh-mTLS transports so dispatch can
+/// combine it with reserved identity prefixes in one filtering pass. Direct
+/// transports do not inherit that secured-mesh hygiene. `None` (no LB-selected
+/// target) keeps the direct pool: the proxy's own backend host is the
+/// destination and no mesh tag exists to honor.
 pub(crate) fn resolve_grpc_dispatch_transport<'a>(
     state: &'a ProxyState,
     target: Option<&'a UpstreamTarget>,
+    asserted_source_identity: Option<&crate::identity::SpiffeId>,
 ) -> Result<grpc_proxy::GrpcDispatchTransport<'a>, grpc_proxy::GrpcTransportError> {
-    grpc_proxy::GrpcDispatchTransport::for_target(
+    grpc_proxy::GrpcDispatchTransport::for_target_with_hbone_context(
         &state.grpc_pool,
         &state.mesh_mtls_pool,
         &state.hbone_pool,
         target,
+        asserted_source_identity,
+        &state.mesh_egress_strip_baggage_keys,
     )
 }
 
@@ -58169,7 +58373,7 @@ mod tests {
     #[test]
     fn resolve_effective_proxy_applies_sd_fallback_by_selected_port() {
         // SD top-level overlay only: any selected port with no explicit per-port
-        // entry picks up the fallback (here `http2MaxRequests` →
+        // entry picks up the fallback (here `maxConcurrentStreams` →
         // `pool_http2_max_concurrent_streams`).
         let mut proxy = proxy_with_port_overrides_for_test(5000, &[]);
         assert!(proxy.dispatch_port_overrides.is_none());
@@ -58266,7 +58470,8 @@ mod tests {
         // codex r1 #1806: a partial per-port `portLevelSettings` entry that sets
         // ONLY an unrelated field (here `connectTimeout`) must NOT wipe the
         // inherited top-level `connectionPool.http` overlay
-        // (`idleTimeout`/`http2MaxRequests`/`maxRetries`/`http1MaxPendingRequests`).
+        // (`idleTimeout`/`http2MaxRequests`/`maxConcurrentStreams`/`maxRetries`/
+        // `http1MaxPendingRequests`).
         // The per-port field wins where set; otherwise the fallback is inherited —
         // exactly the non-SD apply-time layering
         // (`apply_connection_pool_http_to_port_override`).
@@ -58293,11 +58498,11 @@ mod tests {
         let effective = resolve_effective_proxy_for_target(&proxy, Some(&target));
         // Per-port connectTimeout applied.
         assert_eq!(effective.backend_connect_timeout_ms, 750);
-        // Per-port http2MaxRequests wins over the fallback (10, not 64).
+        // Per-port maxConcurrentStreams wins over the fallback (10, not 64).
         assert_eq!(
             effective.pool_http2_max_concurrent_streams,
             Some(10),
-            "per-port http2MaxRequests must win over the inherited fallback"
+            "per-port maxConcurrentStreams must win over the inherited fallback"
         );
         // idleTimeout NOT set per-port → inherited from the fallback (120s).
         assert_eq!(

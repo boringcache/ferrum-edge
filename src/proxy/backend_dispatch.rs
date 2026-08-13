@@ -863,15 +863,99 @@ pub(crate) struct BackendAdmissionRejection {
     pub(crate) headers: HashMap<String, String>,
 }
 
+/// Rejection source recorded for a request shed by the destination-wide
+/// `http2MaxRequests` breaker. A fixed constant: it is logged and would
+/// otherwise be an unbounded label.
+pub(crate) const DESTINATION_ACTIVE_REQUEST_REJECTION_SOURCE: &str =
+    "__destination_active_requests";
+
+/// Body returned for a destination at its `http2MaxRequests` ceiling. Names no
+/// destination, Service, subset, or host.
+const DESTINATION_ACTIVE_REQUEST_OVERFLOW_BODY: &[u8] =
+    br#"{"error":"Destination active request limit reached"}"#;
+
+/// Run backend admission for ONE upstream attempt.
+///
+/// Two gates, in this order:
+///
+/// 1. The DestinationRule `connectionPool.http.http2MaxRequests` destination-wide
+///    ACTIVE-REQUEST breaker (issue #3775). This is the single place every
+///    HTTP-family transport funnels through before dispatch — reqwest HTTP/1.1,
+///    reqwest-negotiated HTTP/2, direct HTTP/2, native gRPC, HBONE / mesh-mTLS,
+///    Unix-socket sidecar ingress, and the HTTP/3 bridges — so one logical
+///    destination has ONE budget no matter how many connections, pool shards, or
+///    frontends serve it, and no peer SETTINGS frame can raise it. The permit
+///    rides the returned [`BackendAdmissionPermitSet`], which the response body
+///    owns, so it is released exactly once when the exchange terminates
+///    (buffered completion, stream EOF, gRPC trailers, client disconnect,
+///    backend reset, deadline, or task cancellation) rather than at response
+///    headers. Every retry attempt runs this function again and therefore
+///    acquires its own permit; the prior attempt's permit set is released first.
+/// 2. Backend-admission plugins (adaptive concurrency and friends).
+///
+/// A saturated destination is shed BEFORE any backend socket is dialed, so the
+/// rejection carries no backend signal: callers route it through
+/// `handle_backend_admission_rejection`, which never records passive health, a
+/// circuit-breaker outcome, or an adaptive-concurrency sample, and preserves the
+/// gRPC / gRPC-Web rejection shape (503 → `UNAVAILABLE`). Nothing is queued
+/// behind the breaker.
 pub(crate) fn run_backend_admission_plugins(
+    state: &ProxyState,
     plugins: &[Arc<dyn Plugin>],
     ctx: &RequestContext,
     proxy: &Proxy,
     upstream_target: Option<&UpstreamTarget>,
     protocol: ProxyProtocol,
 ) -> Result<Option<BackendAdmissionPermitSet>, BackendAdmissionRejection> {
-    if plugins.is_empty() {
+    // Hot path: no configured destination cap is one `Option` read on the
+    // precomputed per-port map (plus the inherited fallback), and no cap plus no
+    // admission plugin returns without touching the limiter map at all.
+    let policy_port = crate::proxy::dispatch_policy_port_for_target(proxy, upstream_target);
+    let destination_cap = crate::proxy::resolve_backend_http2_max_requests(proxy, policy_port);
+    if destination_cap.is_none() && plugins.is_empty() {
         return Ok(None);
+    }
+
+    let mut permits: Vec<Arc<dyn BackendAdmissionPermit>> = Vec::new();
+    if destination_cap.is_some() {
+        let scope = crate::proxy::destination_active_request_scope(proxy, policy_port);
+        match state
+            .backend_active_request_limit
+            .try_acquire(scope, destination_cap)
+        {
+            Ok(Some(guard)) => {
+                permits.push(Arc::new(
+                    crate::backend_active_request_limit::DestinationActiveRequestPermit::new(guard),
+                ));
+            }
+            // Unreachable while `destination_cap.is_some()`; keep the arm total.
+            Ok(None) => {}
+            Err(limit) => {
+                if let Some(suppressed_rejections) = state
+                    .backend_active_request_limit
+                    .record_rejection_warning()
+                {
+                    warn!(
+                        proxy_id = %proxy.id,
+                        policy_port,
+                        active_requests = limit.current,
+                        max_active_requests = limit.cap,
+                        suppressed_rejections,
+                        "Shedding request: DestinationRule http2MaxRequests reached for destination (upstream overflow)"
+                    );
+                }
+                return Err(BackendAdmissionRejection {
+                    plugin_name: DESTINATION_ACTIVE_REQUEST_REJECTION_SOURCE.to_string(),
+                    status_code: 503,
+                    body: Bytes::from_static(DESTINATION_ACTIVE_REQUEST_OVERFLOW_BODY),
+                    headers: HashMap::new(),
+                });
+            }
+        }
+    }
+
+    if plugins.is_empty() {
+        return Ok(BackendAdmissionPermitSet::new(permits));
     }
 
     let admission = BackendAdmissionContext {
@@ -879,7 +963,6 @@ pub(crate) fn run_backend_admission_plugins(
         upstream_target,
         protocol,
     };
-    let mut permits: Vec<Arc<dyn BackendAdmissionPermit>> = Vec::new();
     for plugin in plugins {
         match plugin.try_backend_admission(ctx, &admission) {
             BackendAdmissionDecision::Continue => {}

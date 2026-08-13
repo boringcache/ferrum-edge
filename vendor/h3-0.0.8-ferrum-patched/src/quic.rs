@@ -4,6 +4,7 @@
 //! QUIC implementation.
 
 use std::fmt::{Debug, Display};
+use std::future::Future;
 use std::sync::Arc;
 use std::task::{self, Poll};
 
@@ -183,6 +184,30 @@ pub trait SendStream<B: Buf> {
 
     /// Get QUIC send stream id
     fn send_id(&self) -> StreamId;
+}
+
+/// Observe peer `STOP_SENDING` on the send half without exclusive send-stream
+/// access.
+///
+/// Quinn's `SendStream::stopped` is `&self` and returns a `'static` future, so a
+/// server can race that signal against a backend wait while the same send half
+/// remains available for a later response write. Implementations must not take
+/// `&mut self` on the send stream: that would conflict with a concurrent
+/// receive-half poll on an unsplit bidi stream.
+///
+/// The returned future is statically dispatched and `'static`: it must not
+/// borrow the send stream and must not box a trait object per call. Return-
+/// position `impl Future` is used so this stays on stable Rust.
+pub trait SendStreamStopped {
+    /// Completes when the peer stops this send stream or the connection is lost.
+    ///
+    /// `Ok(Some(code))` is a peer `STOP_SENDING`. `Ok(None)` means the local
+    /// side already finished and the peer acknowledged the stream, after which
+    /// `STOP_SENDING` is no longer meaningful. `Err` is a connection-level
+    /// failure.
+    fn stopped(
+        &self,
+    ) -> impl Future<Output = Result<Option<u64>, StreamErrorIncoming>> + Send + 'static;
 }
 
 /// Allows sending unframed pure bytes to a stream. Similar to [`AsyncWrite`](https://docs.rs/tokio/latest/tokio/io/trait.AsyncWrite.html)
