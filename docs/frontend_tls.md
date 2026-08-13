@@ -511,9 +511,45 @@ connections *and* is present in the verifier a reconnecting client meets. The
 startup baseline works the same way — it is the identity of the load whose
 config the endpoint was built with, not of a later re-read of the same sources.
 
+The `frontend_dtls` scope reads its declared client-CA source **once** through
+the shared `CertSource` abstraction, and derives both the DTLS trust anchors and
+the published identity from those exact bytes. A `file://` path, inline PEM, or
+a provider URI therefore all work for `FERRUM_DTLS_CLIENT_CA_CERT_PATH` /
+`FERRUM_DTLS_CLIENT_CA_CERT_SOURCE`, the shared
+`FERRUM_TLS_MAX_MATERIAL_SIZE_BYTES` ceiling applies, and diagnostics carry only
+the redacted source label — never the configured value, which for an inline
+source is itself certificate material.
+
 Mesh inbound mTLS is deliberately **out of scope**. Its verifier is owned by
 PeerAuthentication / SPIFFE trust-bundle reload, which is a separate trust plane
 with its own rotation contract.
+
+#### When a scope is armed
+
+A scope is armed **only when the exact accepted candidate that listener family
+installed actually performs verified client-certificate authentication**.
+Concretely, `proxy_frontend` and `proxy_h3` arm only with
+`FERRUM_FRONTEND_TLS_CLIENT_CA_BUNDLE_PATH` set and `FERRUM_FRONTEND_TLS_NO_VERIFY`
+off, `admin_https` only with `FERRUM_ADMIN_TLS_CLIENT_CA_BUNDLE_PATH` set and
+admin no-verify off, and `frontend_dtls` only with
+`FERRUM_DTLS_CLIENT_CA_CERT_PATH` set.
+
+A listener that does no client-certificate authentication can never hold a
+credential an operator could withdraw. It therefore:
+
+- publishes no baseline and exports **none** of the series below, rather than
+  reporting a protection with nothing to protect;
+- tracks nothing per connection;
+- keeps its existing kTLS and HTTP/3 0-RTT eligibility exactly as it is without
+  live reload — arming is what declines the TCP+TLS kTLS handoff, and an unarmed
+  listener never does.
+
+Certificate/key-only live reload is unaffected on such a listener: it rotates
+normally, simply without a trust generation. A listener's authentication mode is
+fixed configuration and is not something live reload may change, so a reload
+candidate that would drop client-certificate authentication on an armed surface
+is refused outright and the complete last-good generation, verifier, and
+sessions are retained.
 
 #### What advances a generation, and what retires a connection
 
@@ -558,6 +594,7 @@ client-CA change can revoke. Plaintext listeners are untouched.
 |-----------|-----------|
 | HTTP/1.1 keep-alive | The next request is refused with a fixed `401` before routing and plugins; the connection is closed at end of keep-alive via hyper's graceful shutdown. |
 | HTTP/2 | New streams are refused with the same fixed `401` before routing and plugins, and the connection receives a `GOAWAY`. |
+| Admin HTTPS (HTTP/1.1 or HTTP/2) | Identical: a request already buffered on the connection is refused with a fixed `401` JSON body before it enters admin routing, and the connection ends through hyper's graceful shutdown. The admin connection permit and the slowloris activity accounting release exactly once, on the paths that already own them. |
 | HTTP/3 | The QUIC connection is closed with `H3_REQUEST_REJECTED` (`0x010B`); a request stream that was already ready is refused before its task is spawned. |
 | gRPC | The pre-routing refusal is a `grpc-status: 16` (`UNAUTHENTICATED`) trailers-only response. |
 | WebSocket (H1/H2/H3) | The session's stop arbiter terminates it with the bounded reason `trust_withdrawn`, through the same teardown as drain and maximum-lifetime stops. |
@@ -618,7 +655,9 @@ entry per armed scope.
 
 Nothing is emitted, and nothing is tracked per connection, when no scope has
 accepted client-trust material — which is the default posture with
-`FERRUM_FRONTEND_TLS_LIVE_RELOAD_ENABLED` unset.
+`FERRUM_FRONTEND_TLS_LIVE_RELOAD_ENABLED` unset, and also the posture of any
+listener family that does no client-certificate authentication (see
+"When a scope is armed").
 
 ### Gateway API Multi-Certificate Serving (SNI)
 

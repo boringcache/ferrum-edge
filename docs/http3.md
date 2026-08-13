@@ -33,6 +33,18 @@ FERRUM_FRONTEND_TLS_CERT_PATH=/path/to/cert.pem
 FERRUM_FRONTEND_TLS_KEY_PATH=/path/to/key.pem
 ```
 
+Under `FERRUM_FRONTEND_TLS_LIVE_RELOAD_ENABLED=true`, an mTLS H3 listener owns
+its own client-trust generation (`proxy_h3`). Because the QUIC endpoint applies a
+reload out of band, it adopts one whole accepted candidate — `ServerConfig`,
+client-certificate verifier, and the identity of the exact client-CA bytes and
+CRLs behind it — so the generation it publishes always describes what it is
+enforcing. When the operator withdraws that trust, established
+client-certificate-authenticated QUIC connections are closed with
+`H3_REQUEST_REJECTED` (`0x010B`) and an already-ready request stream is refused
+before its task is spawned. A listener with no client-CA bundle authenticates no
+client and stays unarmed, so nothing is tracked and 0-RTT admission is unchanged.
+See [frontend_tls.md](frontend_tls.md#client-trust-generations-and-established-transport-retirement).
+
 Gateway API TLS-class listener ports follow the same convention: each gets its
 own QUIC socket beside its TCP HTTPS listener when HTTP/3 is enabled. If a raw
 UDP or DTLS stream proxy claims that numeric UDP port in the same config, Ferrum
