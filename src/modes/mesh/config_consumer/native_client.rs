@@ -11,8 +11,8 @@ use super::common::{
     wait_optional_tls_reload,
 };
 use super::stream_lifecycle::{
-    MeshConfigStreamCredential, MeshStreamAttachment, MeshStreamAttempt,
-    MeshStreamAttemptProgress, MeshStreamRetirement, MeshStreamTimings, MeshStreamTracker,
+    MeshConfigStreamCredential, MeshStreamAttachment, MeshStreamAttempt, MeshStreamAttemptProgress,
+    MeshStreamRetirement, MeshStreamTimings, MeshStreamTracker,
     configure_mesh_config_stream_endpoint,
 };
 use super::update_validation::{

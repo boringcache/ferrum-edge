@@ -956,7 +956,7 @@ fn the_opaque_maximum_stays_finite_and_capped() {
         too_large,
         Duration::from_secs(MAX_STOCK_XDS_TOKEN_MAX_STREAM_LIFETIME_SECS)
     );
-    assert!(MIN_STOCK_XDS_TOKEN_MAX_STREAM_LIFETIME_SECS == 60);
+    const { assert!(MIN_STOCK_XDS_TOKEN_MAX_STREAM_LIFETIME_SECS == 60) };
 }
 
 #[test]
@@ -985,7 +985,10 @@ fn jwt_expiration_hint_is_bounded_and_refuses_non_jws_shapes() {
     let zero_exp = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(br#"{"exp":0}"#);
     assert_eq!(jwt_expiration_hint(&format!("a.{zero_exp}.c")), Some(0));
     let negative_exp = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(br#"{"exp":-1}"#);
-    assert_eq!(jwt_expiration_hint(&format!("a.{negative_exp}.c")), Some(-1));
+    assert_eq!(
+        jwt_expiration_hint(&format!("a.{negative_exp}.c")),
+        Some(-1)
+    );
     // An oversized payload segment is not parsed at all.
     let oversized = "A".repeat(9 * 1024);
     assert!(jwt_expiration_hint(&format!("a.{oversized}.c")).is_none());
@@ -1018,11 +1021,7 @@ fn jwt_shaped_tokens_with_zero_or_negative_exp_are_refused_at_admission() {
     for exp in [0_i64, -1, -3_600, i64::MIN] {
         let reason = StockBearerCredential::admit(&jwt_with_exp(exp), lifetime_policy(3600, 0))
             .expect_err("zero/negative NumericDate must not be admitted");
-        assert_eq!(
-            reason,
-            StockCredentialInvalidReason::Expired,
-            "exp={exp}"
-        );
+        assert_eq!(reason, StockCredentialInvalidReason::Expired, "exp={exp}");
     }
 }
 

@@ -14,8 +14,8 @@ use super::common::{
     tonic_tls_config, wait_for_shutdown, wait_optional_tls_reload,
 };
 use super::stream_lifecycle::{
-    MeshConfigStreamCredential, MeshStreamAttachment, MeshStreamAttempt,
-    MeshStreamAttemptProgress, MeshStreamRetirement, MeshStreamTimings, MeshStreamTracker,
+    MeshConfigStreamCredential, MeshStreamAttachment, MeshStreamAttempt, MeshStreamAttemptProgress,
+    MeshStreamRetirement, MeshStreamTimings, MeshStreamTracker,
     configure_mesh_config_stream_endpoint,
 };
 use crate::grpc::dp_client::{DpGrpcTlsConfig, DpGrpcTlsReload, GrpcJwtSecret};
