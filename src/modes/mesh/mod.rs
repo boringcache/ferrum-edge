@@ -3610,11 +3610,13 @@ pub(crate) const MESH_INBOUND_PROXY_ID_PREFIX: &str = "__mesh-inbound-";
 /// [`is_mesh_inbound_route_id`] / [`mesh_route_direction`].
 pub(crate) const MESH_INGRESS_PROXY_ID_PREFIX: &str = "__mesh-ingress-";
 
-/// Reserved sub-prefix for dedicated Sidecar ingress `bind` socket routes
-/// (issue #3266). These remain ingress routes, but are served by a listener
-/// whose accepted port already identifies the one declared listener rather
-/// than by the shared `:15006` capture listener's sibling selector.
-pub(crate) const MESH_INGRESS_BIND_PROXY_ID_PREFIX: &str = "__mesh-ingress-bind-";
+/// Reserved colon-delimited sub-prefix for dedicated Sidecar ingress `bind`
+/// socket routes (issue #3266). These remain ingress routes, but are served by
+/// a listener whose accepted port already identifies the one declared listener
+/// rather than by the shared `:15006` capture listener's sibling selector. The
+/// colon cannot occur in a valid namespace or a normal sanitized ingress id,
+/// keeping the two families disjoint even when a namespace starts with `bind-`.
+pub(crate) const MESH_INGRESS_BIND_PROXY_ID_PREFIX: &str = "__mesh-ingress-bind:";
 
 /// Whether a proxy id names a materialized sidecar inbound route — either a
 /// service-port default inbound route or a Sidecar `ingress[]` custom listener
@@ -36648,7 +36650,7 @@ mod tests {
         let bind_proxy = config
             .proxies
             .iter()
-            .find(|p| p.id.starts_with("__mesh-ingress-bind-"))
+            .find(|p| p.id.starts_with("__mesh-ingress-bind:"))
             .expect("dedicated bind proxy");
         assert_eq!(bind_proxy.listen_port, Some(16379));
         assert_eq!(bind_proxy.backend_host, "127.0.0.1");
@@ -36702,7 +36704,7 @@ mod tests {
             !config
                 .proxies
                 .iter()
-                .any(|p| p.id.starts_with("__mesh-ingress-bind-")),
+                .any(|p| p.id.starts_with("__mesh-ingress-bind:")),
             "conflicting bind must not materialize a socket proxy"
         );
         assert!(
@@ -36820,7 +36822,7 @@ mod tests {
             config_v1
                 .proxies
                 .iter()
-                .any(|p| p.id.starts_with("__mesh-ingress-bind-"))
+                .any(|p| p.id.starts_with("__mesh-ingress-bind:"))
         );
 
         // Withdraw the dedicated bind (shared capture only).
@@ -36847,7 +36849,7 @@ mod tests {
             !config_v2
                 .proxies
                 .iter()
-                .any(|p| p.id.starts_with("__mesh-ingress-bind-")),
+                .any(|p| p.id.starts_with("__mesh-ingress-bind:")),
             "dedicated bind proxy must withdraw when bind is removed"
         );
         assert!(

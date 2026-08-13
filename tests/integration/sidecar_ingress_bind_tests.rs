@@ -14,14 +14,14 @@ use ferrum_edge::modes::mesh::{MeshTopology, prepare_gateway_config_for_mesh};
 
 use super::mesh_test_support::default_mesh_runtime;
 
-fn local_echo(spiffe: &str, app_port: u16) -> (Workload, MeshService) {
+fn local_echo(namespace: &str, spiffe: &str, app_port: u16) -> (Workload, MeshService) {
     let id = SpiffeId::new(spiffe).expect("spiffe");
     let trust = TrustDomain::new("cluster.local").expect("td");
     let workload = Workload {
         spiffe_id: id.clone(),
         selector: WorkloadSelector {
             labels: HashMap::from([("app".to_string(), "echo".to_string())]),
-            namespace: Some("default".to_string()),
+            namespace: Some(namespace.to_string()),
         },
         service_name: "echo".to_string(),
         service_namespace: None,
@@ -32,7 +32,7 @@ fn local_echo(spiffe: &str, app_port: u16) -> (Workload, MeshService) {
             name: Some("tcp".to_string()),
         }],
         trust_domain: trust,
-        namespace: "default".to_string(),
+        namespace: namespace.to_string(),
         network: None,
         cluster: None,
         weight: None,
@@ -45,7 +45,7 @@ fn local_echo(spiffe: &str, app_port: u16) -> (Workload, MeshService) {
     let service = MeshService {
         cluster_ips: Vec::new(),
         name: "echo".to_string(),
-        namespace: "default".to_string(),
+        namespace: namespace.to_string(),
         ports: vec![ServicePort {
             port: app_port,
             protocol: AppProtocol::Tcp,
@@ -59,9 +59,14 @@ fn local_echo(spiffe: &str, app_port: u16) -> (Workload, MeshService) {
     (workload, service)
 }
 
-fn prepare_with_bind(bind: Option<&str>, listener_port: u16, endpoint_port: u16) -> GatewayConfig {
-    let spiffe = "spiffe://cluster.local/ns/default/sa/echo";
-    let (workload, service) = local_echo(spiffe, endpoint_port);
+fn prepare_in_namespace(
+    namespace: &str,
+    bind: Option<&str>,
+    listener_port: u16,
+    endpoint_port: u16,
+) -> GatewayConfig {
+    let spiffe = format!("spiffe://cluster.local/ns/{namespace}/sa/echo");
+    let (workload, service) = local_echo(namespace, &spiffe, endpoint_port);
     let mut runtime = default_mesh_runtime();
     runtime.workload_spiffe_id = Some(spiffe.to_string());
     runtime.sidecar_enforced = true;
@@ -75,7 +80,7 @@ fn prepare_with_bind(bind: Option<&str>, listener_port: u16, endpoint_port: u16)
             services: vec![service],
             sidecars: vec![MeshSidecar {
                 name: "echo-ingress".to_string(),
-                namespace: "default".to_string(),
+                namespace: namespace.to_string(),
                 workload_selector: None,
                 egress_inherits_defaults: true,
                 egress: Vec::new(),
@@ -96,6 +101,10 @@ fn prepare_with_bind(bind: Option<&str>, listener_port: u16, endpoint_port: u16)
     prepare_gateway_config_for_mesh(config, &runtime).expect("prepare")
 }
 
+fn prepare_with_bind(bind: Option<&str>, listener_port: u16, endpoint_port: u16) -> GatewayConfig {
+    prepare_in_namespace("default", bind, listener_port, endpoint_port)
+}
+
 #[test]
 fn dedicated_loopback_bind_materializes_stream_ownership() {
     let prepared = prepare_with_bind(Some("127.0.0.1"), 16379, 6379);
@@ -107,7 +116,7 @@ fn dedicated_loopback_bind_materializes_stream_ownership() {
     let bind_proxy = prepared
         .proxies
         .iter()
-        .find(|p| p.id.starts_with("__mesh-ingress-bind-"))
+        .find(|p| p.id.starts_with("__mesh-ingress-bind:"))
         .expect("dedicated bind proxy");
     assert_eq!(bind_proxy.listen_port, Some(16379));
     assert_eq!(bind_proxy.backend_port, 6379);
@@ -124,9 +133,27 @@ fn omitted_bind_keeps_shared_capture_only() {
         !prepared
             .proxies
             .iter()
-            .any(|p| p.id.starts_with("__mesh-ingress-bind-"))
+            .any(|p| p.id.starts_with("__mesh-ingress-bind:"))
     );
     assert_eq!(mesh.local_inbound_tcp_routes.len(), 1);
+}
+
+#[test]
+fn bind_prefixed_namespace_remains_a_shared_capture_route() {
+    let prepared = prepare_in_namespace("bind-prod", None, 16379, 6379);
+    let ingress_proxy = prepared
+        .proxies
+        .iter()
+        .find(|proxy| proxy.id == "__mesh-ingress-bind-prod-echo-16379")
+        .expect("shared ingress proxy");
+
+    assert_eq!(ingress_proxy.listen_port, None);
+    assert!(
+        !prepared
+            .proxies
+            .iter()
+            .any(|proxy| proxy.id.starts_with("__mesh-ingress-bind:"))
+    );
 }
 
 #[test]
@@ -136,14 +163,14 @@ fn dedicated_bind_withdrawal_clears_ownership() {
         with_bind
             .proxies
             .iter()
-            .any(|p| p.id.starts_with("__mesh-ingress-bind-"))
+            .any(|p| p.id.starts_with("__mesh-ingress-bind:"))
     );
     let withdrawn = prepare_with_bind(None, 16379, 6379);
     assert!(
         !withdrawn
             .proxies
             .iter()
-            .any(|p| p.id.starts_with("__mesh-ingress-bind-"))
+            .any(|p| p.id.starts_with("__mesh-ingress-bind:"))
     );
     assert!(
         withdrawn
