@@ -875,7 +875,17 @@ pub async fn detect_gateway_trust_drift<S: GatewayTrustDriftSource + ?Sized>(
 /// This is the CP-side mirror of the DP's `GatewayTrustBundleUpdate` and the
 /// reason the side channel can express a rotation, a revocation, and "nothing
 /// to say" without any of the three being inferable from the other two.
+///
+/// `Clear`, `Replace`, and the snapshot/delta helpers below are public library
+/// and integration-test seams. The `ferrum-edge` bin target recompiles this
+/// module privately and only constructs [`Self::Unchanged`] on the ordinary
+/// resource-delta path; production full-snapshot encoding stays in
+/// `CpGrpcServer::filter_config_and_trust_for_scope` / `trust_bundles_json` so
+/// deep validation, ambiguity refusal, and fail-closed skip behavior are not
+/// duplicated here. `#[allow(dead_code)]` is therefore scoped to this enum and
+/// its impl, not the module.
 #[derive(Debug, Clone, PartialEq)]
+#[allow(dead_code)]
 pub enum GatewayTrustPublication<'a> {
     /// Emit nothing: the subscriber keeps whatever it already applied. Encoded
     /// as an empty `trust_bundles_json`.
@@ -887,6 +897,7 @@ pub enum GatewayTrustPublication<'a> {
     Replace(&'a TrustBundleSet),
 }
 
+#[allow(dead_code)]
 impl<'a> GatewayTrustPublication<'a> {
     /// Resolve the publication for a full snapshot, where the CP always states
     /// the complete current state so a reconnecting DP can reconstruct it.

@@ -16,12 +16,16 @@
 //! itself while leaving the two racing each other.
 //!
 //! Tokio's async mutex is used so async tests can hold the guard across awaits
-//! without tripping `clippy::await_holding_lock`.
+//! without tripping `clippy::await_holding_lock`. `tokio::sync::Mutex::new` is
+//! not `const`, so the process-wide lock is a `LazyLock` rather than a const
+//! static initializer.
 #![allow(dead_code)] // used by sibling test modules
 
+use std::sync::LazyLock;
 use tokio::sync::{Mutex, MutexGuard};
 
-pub static GATEWAY_TRUST_OBSERVABILITY_LOCK: Mutex<()> = Mutex::new(());
+pub static GATEWAY_TRUST_OBSERVABILITY_LOCK: LazyLock<Mutex<()>> =
+    LazyLock::new(|| Mutex::new(()));
 
 /// Acquire the shared lock and reset every process-global gateway-trust counter
 /// and the published-namespace map, so the caller starts from a known baseline.
