@@ -243,7 +243,10 @@ async fn wait_for_health(base: &str, want_ready: bool, what: &str) -> (u16, Valu
         }
         tokio::time::sleep(Duration::from_millis(25)).await;
     }
-    panic!("timed out waiting until {what}: status={} body={}", last.0, last.1);
+    panic!(
+        "timed out waiting until {what}: status={} body={}",
+        last.0, last.1
+    );
 }
 
 /// The whole lifecycle on the real admin surface: unproven/dead → recovered →
@@ -310,15 +313,15 @@ async fn a_shared_replay_authority_outage_fails_readiness_and_recovery_restores_
     // — must restore `/health`.
     let (port, open, redis_shutdown) = spawn_gated_replay_redis(false).await;
     let redis_url = format!("redis://readiness-user:readiness-password@127.0.0.1:{port}/0");
-    let recovering = shared_client_for_url(
-        "ferrum:replay_readiness:lifecycle-recover",
-        &redis_url,
-        1,
-    );
+    let recovering =
+        shared_client_for_url("ferrum:replay_readiness:lifecycle-recover", &redis_url, 1);
     let recovering_authority = ReplayAuthority::shared(Arc::clone(&recovering), RETENTION);
     let (code, body) = wait_for_health(&base, false, "gated backend starts unproven").await;
     assert_eq!(code, 503);
-    assert_eq!(body["replay_authority"]["shared_authorities_unavailable"], 1);
+    assert_eq!(
+        body["replay_authority"]["shared_authorities_unavailable"],
+        1
+    );
 
     open.store(true, Ordering::Release);
     let (code, body) = wait_for_health(
