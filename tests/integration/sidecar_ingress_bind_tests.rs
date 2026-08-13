@@ -206,8 +206,14 @@ fn hyphenated_namespace_dedicated_bind_id_is_injective() {
 
 #[test]
 fn hyphenated_namespace_http_bind_and_capture_ids_stay_disjoint() {
-    let prepared =
-        prepare_sidecar("bind-prod", "echo", AppProtocol::Http, Some("127.0.0.1"), 16379, 6379);
+    let prepared = prepare_sidecar(
+        "bind-prod",
+        "echo",
+        AppProtocol::Http,
+        Some("127.0.0.1"),
+        16379,
+        6379,
+    );
     let capture = prepared
         .proxies
         .iter()
@@ -222,14 +228,32 @@ fn hyphenated_namespace_http_bind_and_capture_ids_stay_disjoint() {
 
 #[test]
 fn same_name_cross_namespace_dedicated_bind_ids_do_not_collide() {
-    let payments =
-        prepare_sidecar("payments", "echo", AppProtocol::Tcp, Some("127.0.0.1"), 16379, 6379);
-    let checkout =
-        prepare_sidecar("checkout", "echo", AppProtocol::Tcp, Some("127.0.0.1"), 16379, 6379);
+    let payments = prepare_sidecar(
+        "payments",
+        "echo",
+        AppProtocol::Tcp,
+        Some("127.0.0.1"),
+        16379,
+        6379,
+    );
+    let checkout = prepare_sidecar(
+        "checkout",
+        "echo",
+        AppProtocol::Tcp,
+        Some("127.0.0.1"),
+        16379,
+        6379,
+    );
     let payments_ids = dedicated_bind_ids(&payments);
     let checkout_ids = dedicated_bind_ids(&checkout);
-    assert_eq!(payments_ids, vec!["__mesh-ingress-bind:payments-echo-16379"]);
-    assert_eq!(checkout_ids, vec!["__mesh-ingress-bind:checkout-echo-16379"]);
+    assert_eq!(
+        payments_ids,
+        vec!["__mesh-ingress-bind:payments-echo-16379"]
+    );
+    assert_eq!(
+        checkout_ids,
+        vec!["__mesh-ingress-bind:checkout-echo-16379"]
+    );
     assert_ne!(payments_ids, checkout_ids);
 }
 
