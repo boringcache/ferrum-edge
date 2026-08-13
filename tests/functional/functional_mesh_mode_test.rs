@@ -18535,6 +18535,7 @@ async fn functional_h3_plain_dispatches_over_same_cluster_sidecar_mesh_mtls() {
         observed.presented_client_spiffe(H3_MESH_GATEWAY_SPIFFE),
         "peer must verify this gateway's client SVID"
     );
+    assert_eq!(observed.method, "POST");
     assert_eq!(observed.authority, H3_MESH_SERVICE_AUTHORITY);
     assert_eq!(observed.path, H3_MESH_PLAIN_BACKEND_PATH);
     assert_eq!(observed.body, payload);
@@ -18587,6 +18588,7 @@ async fn functional_h3_plain_dispatches_over_same_cluster_ambient_hbone() {
         "CONNECT :authority must name the app; observed {connects:?}"
     );
     let observed = app.wait_for_http(Duration::from_secs(10)).await;
+    assert_eq!(observed.method, "POST");
     assert_eq!(observed.scheme, "http");
     assert_eq!(observed.path, H3_MESH_PLAIN_BACKEND_PATH);
     assert_eq!(observed.body, payload);
@@ -18649,6 +18651,7 @@ async fn functional_h3_plain_mixed_retry_skips_unix_and_uses_mesh_mtls() {
     );
     assert_eq!(result.body_bytes.as_ref(), payload);
     let observed = peer.wait_for_http(Duration::from_secs(10)).await;
+    assert_eq!(observed.method, "POST");
     assert!(observed.presented_client_spiffe(H3_MESH_GATEWAY_SPIFFE));
     assert!(
         !socket_path.exists(),
@@ -18790,13 +18793,15 @@ async fn functional_h3_plain_mesh_transport_follows_reload_and_withdrawal() {
 
     let first = h3_mesh_plain_post(https_port, b"h3-plain-reload").await;
     assert_eq!(first.status.as_u16(), 200);
-    peer_a.wait_for_http(Duration::from_secs(10)).await;
+    let observed_a = peer_a.wait_for_http(Duration::from_secs(10)).await;
+    assert_eq!(observed_a.method, "POST");
 
     let peer_b_tags = h3_mesh_mtls_tags(peer_b.port, H3_MESH_PEER_B_SPIFFE);
     h3_mesh_plain_reload(&gateway, config_for(&peer_b_tags, 1), &peer_b_tags).await;
     let retargeted = h3_mesh_plain_post(https_port, b"h3-plain-reload").await;
     assert_eq!(retargeted.status.as_u16(), 200);
-    peer_b.wait_for_http(Duration::from_secs(10)).await;
+    let observed_b = peer_b.wait_for_http(Duration::from_secs(10)).await;
+    assert_eq!(observed_b.method, "POST");
 
     let peer_b_accepts = peer_b.accept_count();
     h3_mesh_plain_reload(&gateway, config_for(&[], 2), &[]).await;
