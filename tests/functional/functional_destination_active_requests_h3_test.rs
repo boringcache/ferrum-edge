@@ -123,9 +123,10 @@ async fn functional_destination_active_requests_h3_release_on_client_cancellatio
     drop(hold_stream);
 
     let after_url = format!("https://localhost:{https_port}/h3/after-cancel");
-    let after = tokio::spawn(async move {
-        retry_h3_session_until_admitted(&mut session, &after_url).await
-    });
+    let after =
+        tokio::spawn(
+            async move { retry_h3_session_until_admitted(&mut session, &after_url).await },
+        );
     // Reaching the fixture at all proves the permit was released while the
     // first backend exchange is still held. If only whole-connection close
     // were observed, this request would stay shed at 503 and never increment
@@ -188,9 +189,10 @@ async fn functional_destination_active_requests_h3_release_on_streaming_upload_c
     drop(hold_stream);
 
     let after_url = format!("https://localhost:{https_port}/h3/after-cancel");
-    let after = tokio::spawn(async move {
-        retry_h3_session_until_admitted(&mut session, &after_url).await
-    });
+    let after =
+        tokio::spawn(
+            async move { retry_h3_session_until_admitted(&mut session, &after_url).await },
+        );
     backend.wait_for_hits(2, Duration::from_secs(25)).await;
 
     backend.release();
@@ -249,9 +251,10 @@ async fn functional_destination_active_requests_h3_release_on_streaming_request_
     hold_stream.cancel_request_upload();
 
     let after_url = format!("https://localhost:{https_port}/h3/after-reset");
-    let after = tokio::spawn(async move {
-        retry_h3_session_until_admitted(&mut session, &after_url).await
-    });
+    let after =
+        tokio::spawn(
+            async move { retry_h3_session_until_admitted(&mut session, &after_url).await },
+        );
     // Reaching the fixture before backend.release() proves the permit was
     // released by the upload reset, not by waiting for the held backend.
     backend.wait_for_hits(2, Duration::from_secs(25)).await;

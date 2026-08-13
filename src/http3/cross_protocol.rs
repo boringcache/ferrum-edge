@@ -2674,8 +2674,7 @@ where
                 // Capture STOP_SENDING before the reader borrows the stream.
                 // The future is `'static` and does not hold `&mut` on either
                 // half, so the upload pump can keep polling recv_data.
-                let stream_cancelled =
-                    crate::http3::stream_util::peer_response_cancelled(stream);
+                let stream_cancelled = crate::http3::stream_util::peer_response_cancelled(stream);
                 let reader_peer_reset = Arc::new(AtomicBool::new(false));
                 let reader_reset_flag = Arc::clone(&reader_peer_reset);
                 let reader_future = async {
