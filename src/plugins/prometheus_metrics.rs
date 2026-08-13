@@ -2809,9 +2809,7 @@ impl MetricsRegistry {
         output.push_str(
             "# HELP ferrum_k8s_controller_istio_status_conflicts_total Istio status JSON Merge Patch 409 conflicts observed while applying Ferrum-owned conditions.\n",
         );
-        output.push_str(
-            "# TYPE ferrum_k8s_controller_istio_status_conflicts_total counter\n",
-        );
+        output.push_str("# TYPE ferrum_k8s_controller_istio_status_conflicts_total counter\n");
         render_process_counter(
             output,
             "ferrum_k8s_controller_istio_status_conflicts_total",
@@ -2821,9 +2819,7 @@ impl MetricsRegistry {
         output.push_str(
             "# HELP ferrum_k8s_controller_istio_status_missing_uid_total Istio status writes refused because the planned watch-snapshot UID was missing.\n",
         );
-        output.push_str(
-            "# TYPE ferrum_k8s_controller_istio_status_missing_uid_total counter\n",
-        );
+        output.push_str("# TYPE ferrum_k8s_controller_istio_status_missing_uid_total counter\n");
         render_process_counter(
             output,
             "ferrum_k8s_controller_istio_status_missing_uid_total",
@@ -2833,9 +2829,7 @@ impl MetricsRegistry {
         output.push_str(
             "# HELP ferrum_k8s_controller_istio_status_not_found_total Istio status writes aborted because the object was not found.\n",
         );
-        output.push_str(
-            "# TYPE ferrum_k8s_controller_istio_status_not_found_total counter\n",
-        );
+        output.push_str("# TYPE ferrum_k8s_controller_istio_status_not_found_total counter\n");
         render_process_counter(
             output,
             "ferrum_k8s_controller_istio_status_not_found_total",
@@ -2845,9 +2839,7 @@ impl MetricsRegistry {
         output.push_str(
             "# HELP ferrum_k8s_controller_istio_status_recreated_total Istio status writes aborted because the live UID no longer matched the planned object.\n",
         );
-        output.push_str(
-            "# TYPE ferrum_k8s_controller_istio_status_recreated_total counter\n",
-        );
+        output.push_str("# TYPE ferrum_k8s_controller_istio_status_recreated_total counter\n");
         render_process_counter(
             output,
             "ferrum_k8s_controller_istio_status_recreated_total",
@@ -2857,9 +2849,7 @@ impl MetricsRegistry {
         output.push_str(
             "# HELP ferrum_k8s_controller_istio_status_retries_total Istio status writes that succeeded after at least one resourceVersion conflict retry.\n",
         );
-        output.push_str(
-            "# TYPE ferrum_k8s_controller_istio_status_retries_total counter\n",
-        );
+        output.push_str("# TYPE ferrum_k8s_controller_istio_status_retries_total counter\n");
         render_process_counter(
             output,
             "ferrum_k8s_controller_istio_status_retries_total",
@@ -2869,9 +2859,8 @@ impl MetricsRegistry {
         output.push_str(
             "# HELP ferrum_k8s_controller_istio_status_retry_exhausted_total Istio status writes that exhausted the bounded conflict retry budget without an unversioned fallback.\n",
         );
-        output.push_str(
-            "# TYPE ferrum_k8s_controller_istio_status_retry_exhausted_total counter\n",
-        );
+        output
+            .push_str("# TYPE ferrum_k8s_controller_istio_status_retry_exhausted_total counter\n");
         render_process_counter(
             output,
             "ferrum_k8s_controller_istio_status_retry_exhausted_total",
@@ -2881,9 +2870,7 @@ impl MetricsRegistry {
         output.push_str(
             "# HELP ferrum_k8s_controller_istio_status_unsupported_total Istio status writes aborted because the CRD has no status subresource.\n",
         );
-        output.push_str(
-            "# TYPE ferrum_k8s_controller_istio_status_unsupported_total counter\n",
-        );
+        output.push_str("# TYPE ferrum_k8s_controller_istio_status_unsupported_total counter\n");
         render_process_counter(
             output,
             "ferrum_k8s_controller_istio_status_unsupported_total",

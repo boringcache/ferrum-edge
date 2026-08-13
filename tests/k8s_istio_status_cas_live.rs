@@ -148,9 +148,8 @@ async fn apply_foreign_condition(client: Client) {
         .and_then(Value::as_array)
         .cloned()
         .unwrap_or_default();
-    conditions.retain(|condition| {
-        condition.get("type").and_then(Value::as_str) != Some(FOREIGN_TYPE)
-    });
+    conditions
+        .retain(|condition| condition.get("type").and_then(Value::as_str) != Some(FOREIGN_TYPE));
     conditions.push(json!({
         "type": FOREIGN_TYPE,
         "status": "True",
@@ -191,6 +190,7 @@ async fn live_competing_writer_preserves_foreign_and_ferrum_conditions() {
 }
 
 async fn run_live_competing_writer() {
+    let _ = ferrum_edge::fips::base_crypto_provider().install_default();
     let config = Config::infer()
         .await
         .unwrap_or_else(|error| panic!("failed to infer kubeconfig for live API server: {error}"));

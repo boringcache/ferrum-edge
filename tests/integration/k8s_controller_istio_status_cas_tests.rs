@@ -80,16 +80,16 @@ fn supported_kinds() -> &'static [(&'static str, &'static str, &'static str)] {
             "DestinationRule",
             "destinationrules",
         ),
-        ("networking.istio.io/v1", "VirtualService", "virtualservices"),
+        (
+            "networking.istio.io/v1",
+            "VirtualService",
+            "virtualservices",
+        ),
         ("networking.istio.io/v1", "ServiceEntry", "serviceentries"),
         ("networking.istio.io/v1", "WorkloadEntry", "workloadentries"),
         ("networking.istio.io/v1", "Sidecar", "sidecars"),
         ("telemetry.istio.io/v1", "Telemetry", "telemetries"),
-        (
-            "networking.istio.io/v1beta1",
-            "ProxyConfig",
-            "proxyconfigs",
-        ),
+        ("networking.istio.io/v1beta1", "ProxyConfig", "proxyconfigs"),
     ]
 }
 
@@ -264,7 +264,11 @@ fn mock_cas_client(state: Arc<Mutex<CasState>>) -> Client {
                             "the server could not find the requested resource",
                         )
                     } else if state.not_found {
-                        status_failure(404, "NotFound", "authorizationpolicies \"policy\" not found")
+                        status_failure(
+                            404,
+                            "NotFound",
+                            "authorizationpolicies \"policy\" not found",
+                        )
                     } else {
                         let Some(key) = key.as_ref() else {
                             return Ok(status_failure(404, "NotFound", "missing resource"));
@@ -321,7 +325,11 @@ fn mock_cas_client(state: Arc<Mutex<CasState>>) -> Client {
                             "the server could not find the requested resource",
                         )
                     } else if state.not_found {
-                        status_failure(404, "NotFound", "authorizationpolicies \"policy\" not found")
+                        status_failure(
+                            404,
+                            "NotFound",
+                            "authorizationpolicies \"policy\" not found",
+                        )
                     } else {
                         let Some(key) = key.as_ref() else {
                             return Ok(status_failure(404, "NotFound", "missing resource"));
@@ -414,8 +422,7 @@ async fn foreign_update_between_get_and_patch_survives_cas_retry() {
     assert_eq!(first["metadata"]["resourceVersion"].as_str(), Some("1"));
     assert_eq!(first["metadata"]["uid"].as_str(), Some(PLANNED_UID));
     assert_eq!(
-        condition_by_type(&first["status"], "Reconciled")
-            .and_then(|c| c["message"].as_str()),
+        condition_by_type(&first["status"], "Reconciled").and_then(|c| c["message"].as_str()),
         Some("initial"),
         "stale patch must not be resent after conflict"
     );
@@ -426,7 +433,10 @@ async fn foreign_update_between_get_and_patch_survives_cas_retry() {
         .expect("retry must merge the concurrent foreign condition");
     assert_eq!(retried_foreign["status"].as_str(), Some("False"));
     assert_eq!(retried_foreign["reason"].as_str(), Some("Istio"));
-    assert_eq!(retried_foreign["message"].as_str(), Some("concurrent-update"));
+    assert_eq!(
+        retried_foreign["message"].as_str(),
+        Some("concurrent-update")
+    );
     assert!(condition_by_type(&retried["status"], "FerrumAccepted").is_some());
 
     let live = &state
@@ -436,7 +446,10 @@ async fn foreign_update_between_get_and_patch_survives_cas_retry() {
         .status;
     assert_eq!(live["observedGeneration"].as_i64(), Some(7));
     assert_eq!(live["extra"].as_str(), Some("keep-me"));
-    assert_eq!(live["validationMessages"][0]["message"].as_str(), Some("ok"));
+    assert_eq!(
+        live["validationMessages"][0]["message"].as_str(),
+        Some("ok")
+    );
     assert_eq!(live["ferrum"]["translation"]["result"].as_str(), Some("ok"));
 
     let snap = metrics.snapshot();
@@ -448,7 +461,10 @@ async fn foreign_update_between_get_and_patch_survives_cas_retry() {
 #[tokio::test]
 async fn two_writers_on_different_condition_types_converge() {
     let state = Arc::new(Mutex::new(CasState::default()));
-    seed_policy(&mut state.lock().expect("seed"), json!({ "conditions": [] }));
+    seed_policy(
+        &mut state.lock().expect("seed"),
+        json!({ "conditions": [] }),
+    );
     let ferrum_client = mock_cas_client(state.clone());
     let foreign_client = mock_cas_client(state.clone());
     let ferrum = IstioStatusWriter::new(ferrum_client);
@@ -467,9 +483,10 @@ async fn two_writers_on_different_condition_types_converge() {
     });
 
     let ferrum_task = tokio::spawn(async move { ferrum.patch_updates(vec![ferrum_update]).await });
-    let foreign_task = tokio::spawn(async move {
-        write_foreign_condition(foreign_client, foreign_condition).await
-    });
+    let foreign_task =
+        tokio::spawn(
+            async move { write_foreign_condition(foreign_client, foreign_condition).await },
+        );
 
     ferrum_task
         .await
@@ -722,10 +739,7 @@ async fn not_found_and_unsupported_abort_without_unversioned_write() {
             .patch_bodies
             .is_empty()
     );
-    assert_eq!(
-        unsupported_metrics.snapshot().istio_status_unsupported,
-        1
-    );
+    assert_eq!(unsupported_metrics.snapshot().istio_status_unsupported, 1);
 }
 
 #[tokio::test]
@@ -899,13 +913,10 @@ async fn competing_writer_preserves_foreign_updates_for_all_supported_kinds() {
             Some("istio")
         );
     }
-    assert!(
-        state
-            .patch_bodies
-            .iter()
-            .all(|patch| patch["metadata"]["resourceVersion"].as_str().is_some()
-                && patch["metadata"]["uid"].as_str() == Some(PLANNED_UID))
-    );
+    assert!(state.patch_bodies.iter().all(|patch| {
+        patch["metadata"]["resourceVersion"].as_str().is_some()
+            && patch["metadata"]["uid"].as_str() == Some(PLANNED_UID)
+    }));
     let snap = metrics.snapshot();
     assert_eq!(snap.istio_status_conflicts, 10);
     assert_eq!(snap.istio_status_retries, 10);

@@ -194,8 +194,7 @@ impl IstioStatusWriter {
             let namespace = update.namespace.clone();
             let metrics = metrics.clone();
             Some(async move {
-                let result =
-                    patch_istio_status_with_retry(&api, &update, metrics.as_deref()).await;
+                let result = patch_istio_status_with_retry(&api, &update, metrics.as_deref()).await;
                 (kind, namespace, name, result)
             })
         });
@@ -357,9 +356,7 @@ async fn patch_istio_status_with_retry(
             Err(error) if kube_error_is_conflict(&error) => {
                 bump_istio_status_metric(metrics, |m| &m.istio_status_conflicts);
                 let delay = istio_status_retry_delay(attempt);
-                if attempt < ISTIO_STATUS_PATCH_MAX_ATTEMPTS
-                    && Instant::now() + delay < deadline
-                {
+                if attempt < ISTIO_STATUS_PATCH_MAX_ATTEMPTS && Instant::now() + delay < deadline {
                     tokio::time::sleep(delay).await;
                     continue;
                 }
@@ -422,11 +419,9 @@ fn kube_error_is_not_found(error: &kube::Error) -> bool {
 fn kube_error_is_unsupported_status(error: &kube::Error) -> bool {
     match error {
         kube::Error::Api(response) if response.code == 405 => true,
-        kube::Error::Api(response) if response.code == 404 => {
-            response
-                .message
-                .contains("could not find the requested resource")
-        }
+        kube::Error::Api(response) if response.code == 404 => response
+            .message
+            .contains("could not find the requested resource"),
         _ => false,
     }
 }
@@ -544,9 +539,7 @@ pub fn plan_istio_status_updates_budgeted(
 
     let mut eligible: Vec<&K8sObject> = objects
         .iter()
-        .filter(|object| {
-            is_supported_istio_kind(&object.kind) && !object.metadata.uid.is_empty()
-        })
+        .filter(|object| is_supported_istio_kind(&object.kind) && !object.metadata.uid.is_empty())
         .collect();
     eligible.sort_by(|left, right| {
         (

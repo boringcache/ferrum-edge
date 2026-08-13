@@ -8516,8 +8516,7 @@ pub mod _test_support {
         resume: tokio::sync::oneshot::Receiver<()>,
     ) {
         crate::k8s_controller::istio_status::install_istio_status_write_intercept_for_test(
-            after_get,
-            resume,
+            after_get, resume,
         )
     }
 

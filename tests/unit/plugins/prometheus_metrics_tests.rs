@@ -681,7 +681,9 @@ async fn test_registry_renders_k8s_controller_istio_status_counters() {
     let metrics = Arc::new(ControllerMetrics::new());
     metrics.istio_status_conflicts.store(2, Ordering::Relaxed);
     metrics.istio_status_retries.store(1, Ordering::Relaxed);
-    metrics.istio_status_retry_exhausted.store(3, Ordering::Relaxed);
+    metrics
+        .istio_status_retry_exhausted
+        .store(3, Ordering::Relaxed);
     metrics.istio_status_recreated.store(4, Ordering::Relaxed);
     metrics.istio_status_not_found.store(5, Ordering::Relaxed);
     metrics.istio_status_unsupported.store(6, Ordering::Relaxed);
@@ -695,14 +697,8 @@ async fn test_registry_renders_k8s_controller_istio_status_counters() {
     ));
     assert!(output.contains("# TYPE ferrum_k8s_controller_istio_status_conflicts_total counter"));
     let istio_status_families = [
-        (
-            "ferrum_k8s_controller_istio_status_conflicts_total",
-            "2",
-        ),
-        (
-            "ferrum_k8s_controller_istio_status_missing_uid_total",
-            "7",
-        ),
+        ("ferrum_k8s_controller_istio_status_conflicts_total", "2"),
+        ("ferrum_k8s_controller_istio_status_missing_uid_total", "7"),
         ("ferrum_k8s_controller_istio_status_not_found_total", "5"),
         ("ferrum_k8s_controller_istio_status_recreated_total", "4"),
         ("ferrum_k8s_controller_istio_status_retries_total", "1"),
@@ -714,9 +710,8 @@ async fn test_registry_renders_k8s_controller_istio_status_counters() {
     ];
     for (family, value) in istio_status_families {
         assert!(
-            output.contains(&format!(
-                "# HELP {family} Istio status"
-            )) || output.contains(&format!("# HELP {family}")),
+            output.contains(&format!("# HELP {family} Istio status"))
+                || output.contains(&format!("# HELP {family}")),
             "missing HELP for {family}"
         );
         assert!(
