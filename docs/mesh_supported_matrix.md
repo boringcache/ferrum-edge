@@ -162,7 +162,14 @@ need them, or because they are blocked upstream / architecturally:
   does consume standard v3 CDS/EDS/LDS/RDS from a third-party control plane, but
   for **discovery only**: enforcement policy always comes from the mandatory
   local `FERRUM_MESH_FILE_CONFIG_PATH` document, and traffic shaping, subsets,
-  external DNS clusters, SDS, ECDS/RTDS, and delta xDS stay out of scope. See
+  external DNS clusters, SDS, ECDS/RTDS, and delta xDS stay out of scope. That
+  discovery half — including update, deletion, NACK, and capability-refusal
+  behaviour — is proven on the live data path against a scripted third-party ADS
+  server in `tests/functional/functional_mesh_stock_xds_test.rs` (unpinned-peer
+  and subset refusals as reachability transitions; foreign-namespace narrowing
+  and RBAC / weighted-route capability refusals as exact ACK + diagnostic +
+  accepted-service continuity, with semantic unit/integration coverage that
+  those constructs contribute no route). See
   `docs/mesh.md` → "Stock Envoy / third-party Istio xDS interoperability".
 - **`EnvoyFilter` / `WasmPlugin`** — use Ferrum custom plugins (`custom_plugins/`).
 - **`AuthorizationPolicy` `when: experimental.envoy.filters.*`** — the key is
@@ -213,7 +220,12 @@ need them, or because they are blocked upstream / architecturally:
   it is not projected as effective policy. Use `http2MaxRequests`.
   (`http1MaxPendingRequests` IS enforced through Ferrum's documented honest
   reinterpretation — a 503-on-overflow concurrent in-flight-request gate on the
-  HTTP/1.1 dispatch path; see the DR table in `docs/mesh.md`.)
+  HTTP/1.1 dispatch path, keyed by logical destination
+  `(namespace, stable logical upstream/Service identity, optional K8s Service
+  UID when stamped, policy port, selected subset)` rather than selected
+  endpoint host; mesh VIP/service-host and direct-pod routes for one Service
+  share its FQDN identity, while native upstreams retain their resource ids;
+  see the DR table in `docs/mesh.md` and issue #3778.)
 - **DR `subsets[].trafficPolicy.portLevelSettings`** — detected and listed in
   `deferred_fields` with a translate-time warning, but not applied. Ferrum
   honors only top-level `trafficPolicy.portLevelSettings` (Istio's
