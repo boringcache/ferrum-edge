@@ -7,8 +7,8 @@
 
 use ferrum_edge::config::types::BackendScheme;
 use ferrum_edge::config_sources::k8s::{
-    GatewayApiUdpAmplificationPolicyStatus, K8sMetadata, K8sObject, K8sTranslationOptions,
-    translate_k8s_objects,
+    K8sMetadata, K8sObject, K8sTranslationOptions, translate_k8s_objects,
+    udp_amplification_policy::GatewayApiUdpAmplificationPolicyStatus,
 };
 use ferrum_edge::identity::spiffe::TrustDomain;
 use ferrum_edge::k8s_controller::status::{
@@ -1228,7 +1228,10 @@ fn atomic_multi_target_conflict_promotes_next_eligible_candidate() {
     }
 }
 
-fn wildcard_listener_orders() -> [((&'static str, u16), (&'static str, u16)); 2] {
+type WildcardListener = (&'static str, u16);
+type WildcardListenerOrder = (WildcardListener, WildcardListener);
+
+fn wildcard_listener_orders() -> [WildcardListenerOrder; 2] {
     [
         (("dns", 15353), ("alt", 15354)),
         (("alt", 15354), ("dns", 15353)),
@@ -1236,7 +1239,7 @@ fn wildcard_listener_orders() -> [((&'static str, u16), (&'static str, u16)); 2]
 }
 
 fn wildcard_parent_objects(
-    listener_order: ((&str, u16), (&str, u16)),
+    listener_order: WildcardListenerOrder,
     policies: impl IntoIterator<Item = K8sObject>,
 ) -> Vec<K8sObject> {
     let mut objects = vec![

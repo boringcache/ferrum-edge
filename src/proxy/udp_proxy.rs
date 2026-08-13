@@ -55,8 +55,6 @@ fn udp_client_log_addr(client_addr: SocketAddr) -> SocketAddr {
     crate::util::client_identity::canonical_socket_addr(client_addr)
 }
 
-pub use crate::udp_amplification::udp_amplification_response_budget;
-
 /// Admit one backend→client datagram against the session's remaining
 /// per-request amplification budget. Unlimited proxies (`factor == None`) skip
 /// the check. Drops are rate-limited and never log client addresses, sizes,

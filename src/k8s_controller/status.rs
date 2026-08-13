@@ -27,6 +27,10 @@ use crate::config_sources::k8s::{
 use crate::k8s_controller::status_plan::{
     StatusPlanBudget, fair_work_window_iter, select_fair_work_window,
 };
+use crate::udp_amplification::{
+    UDP_AMPLIFICATION_POLICY_KIND, UDP_AMPLIFICATION_POLICY_PLURAL,
+    UDP_AMPLIFICATION_POLICY_VERSION,
+};
 
 pub const FERRUM_GATEWAY_CONTROLLER_NAME: &str = "ferrum.io/gateway-controller";
 /// Stable server-side-apply owner shared by every Ferrum controller replica.
@@ -3892,7 +3896,9 @@ fn api_resource_for_update(update: &GatewayApiStatusUpdate) -> Option<ApiResourc
         // Both channels Ferrum watches. An object served under any other
         // version is skipped rather than patched through a guessed plural.
         ("BackendTLSPolicy", "v1" | "v1alpha3") => "backendtlspolicies",
-        ("UDPResponseAmplificationPolicy", "v1alpha1") => "udpresponseamplificationpolicies",
+        (UDP_AMPLIFICATION_POLICY_KIND, UDP_AMPLIFICATION_POLICY_VERSION) => {
+            UDP_AMPLIFICATION_POLICY_PLURAL
+        }
         ("BackendLBPolicy", "v1alpha2") => "backendlbpolicies",
         ("XBackendTrafficPolicy", "v1alpha1") => "xbackendtrafficpolicies",
         ("ListenerSet", "v1") => "listenersets",

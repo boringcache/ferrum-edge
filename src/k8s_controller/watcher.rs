@@ -21,6 +21,11 @@ use super::resource_store::{CrdResourceStore, ResourceChangeNotifier, ResourceSt
 use super::revision::{K8sConfigRevisionTracker, K8sWatchScopeKey, parse_resource_version};
 use super::{ControllerTaskRegistry, REPROBE_WATCHER_LABEL};
 
+use crate::udp_amplification::{
+    UDP_AMPLIFICATION_POLICY_GROUP, UDP_AMPLIFICATION_POLICY_KIND,
+    UDP_AMPLIFICATION_POLICY_PLURAL, UDP_AMPLIFICATION_POLICY_VERSION,
+};
+
 pub struct CrdSpec {
     pub group: &'static str,
     pub version: &'static str,
@@ -242,10 +247,10 @@ pub const GATEWAY_API_CRDS: &[CrdSpec] = &[
     // Discovery skips cleanly when the CRD is absent; translation still
     // projects the finite controller default onto every UDPRoute.
     CrdSpec {
-        group: "gateway.ferrum.io",
-        version: "v1alpha1",
-        kind: "UDPResponseAmplificationPolicy",
-        plural: "udpresponseamplificationpolicies",
+        group: UDP_AMPLIFICATION_POLICY_GROUP,
+        version: UDP_AMPLIFICATION_POLICY_VERSION,
+        kind: UDP_AMPLIFICATION_POLICY_KIND,
+        plural: UDP_AMPLIFICATION_POLICY_PLURAL,
         namespaced: true,
     },
     // BackendLBPolicy was removed from the Gateway API experimental channel in
