@@ -709,7 +709,7 @@ pub async fn start_k8s_controller(
     // overhead of an unused writer carrying a kube client clone.
     let istio_status_writer = controller_config
         .watch_istio
-        .then(|| IstioStatusWriter::new(client.clone()));
+        .then(|| IstioStatusWriter::new(client.clone()).with_metrics(metrics.clone()));
 
     let reconciler_registered = spawn_reconcile_loop(
         store_set.clone(),

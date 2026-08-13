@@ -1,12 +1,10 @@
 //! Integration tests for the T2-B Istio CRD status writer.
 //!
 //! Covers the `plan_istio_status_updates` planning surface as exercised
-//! against realistic mixes of Istio resources. The actual `patch_status`
-//! call requires a live (or mocked) Kubernetes API server and is out of
-//! scope for CI — kube-rs makes that wiremockable but at the cost of a
-//! large amount of test plumbing. Wiring `patch_status` through is
-//! covered by the unit tests inline in `src/k8s_controller/istio_status.rs`,
-//! the unit tests assert the patch shape directly via `istio_status_patch`.
+//! against realistic mixes of Istio resources. Conflict-safe
+//! GET → merge → PATCH behaviour (resourceVersion/UID CAS, foreign
+//! condition preservation, bounded retry) lives in
+//! `k8s_controller_istio_status_cas_tests.rs` against a mock API server.
 //!
 //! What this file exercises:
 //! - Mixed cluster snapshots: every translated Istio kind in one snapshot

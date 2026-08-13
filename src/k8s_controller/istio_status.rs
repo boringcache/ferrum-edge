@@ -60,16 +60,30 @@
 //! and otherwise no-ops, never panics, never aborts reconcile. The
 //! Gateway API path uses the same defensive pattern; see [`status.rs`].
 //!
-//! ## Field manager
+//! ## Concurrency
 //!
-//! All patches use `field_manager = "ferrum.io/istio-controller"` so the
-//! Kubernetes API server's server-side-apply conflict detector sees
-//! Ferrum as a distinct owner from Istio itself
-//! (`istio.io/galley`/`pilot-discovery`) and from any other controller
-//! that might write to the same `status.conditions[]` array. JSON Merge
-//! Patch (RFC 7396) replaces the whole `conditions[]` array, so the
-//! writer reads the live status first and merges its `Ferrum*` condition
-//! types into whatever already exists.
+//! JSON Merge Patch (RFC 7396) replaces `status.conditions[]` as one
+//! array. `Patch::Merge` is not Server-Side Apply: setting
+//! `field_manager` does not create per-condition SSA ownership or close
+//! the GET → merge → PATCH race. Each attempt therefore:
+//!
+//! 1. reads the live status subresource;
+//! 2. captures `metadata.resourceVersion` and UID;
+//! 3. merges only `Ferrum*` condition types into the latest foreign
+//!    array, leaving unrelated status fields untouched;
+//! 4. writes a merge patch that includes those optimistic-concurrency
+//!    preconditions.
+//!
+//! HTTP 409 triggers a bounded re-read/re-merge/retry. UID change,
+//! delete/recreate, not-found, unsupported status subresource, or
+//! exhausted retries abort without falling back to an unversioned write.
+//! `field_manager = "ferrum.io/istio-controller"` remains an identity
+//! string on the merge patch (distinct from the Gateway API writer), not
+//! an apply-conflict detector.
+
+use std::sync::Arc;
+use std::sync::atomic::Ordering;
+use std::time::{Duration, Instant};
 
 use futures_util::future::join_all;
 use kube::Client;
@@ -84,16 +98,23 @@ use crate::config_sources::k8s::{
     translate_k8s_objects_collecting_skips, workload_entry_service_key_from_host,
     workload_selector_from_istio,
 };
+use crate::k8s_controller::metrics::ControllerMetrics;
 use crate::k8s_controller::status::StatusTranslationReuse;
 use crate::k8s_controller::status_plan::{
     StatusPlanBudget, fair_work_window_iter, select_fair_work_window,
 };
 
-/// Field manager used on every `patch_status` call. Kubernetes uses this
-/// for server-side-apply ownership tracking; distinct from the Gateway API
-/// writer's controller name so the two writers can update the same
-/// resource without stepping on each other's owned condition types (which
-/// also don't overlap by construction).
+const ISTIO_STATUS_PATCH_MAX_ATTEMPTS: usize = 5;
+const ISTIO_STATUS_PATCH_RETRY_BASE_MS: u64 = 10;
+const ISTIO_STATUS_PATCH_RETRY_DEADLINE: Duration = Duration::from_secs(2);
+
+/// Field manager stamped on every Istio status merge patch.
+///
+/// This is an identity string for `PatchParams.field_manager`. It does
+/// **not** enable Server-Side Apply ownership or conflict detection;
+/// concurrency is the resourceVersion/UID precondition on each merge
+/// patch. Distinct from the Gateway API writer's controller name so the
+/// two writers remain identifiable if they ever share a resource.
 pub const FERRUM_ISTIO_CONTROLLER_NAME: &str = "ferrum.io/istio-controller";
 
 /// One Istio CRD status patch. Built by [`plan_istio_status_updates`] and
@@ -104,6 +125,12 @@ pub struct IstioStatusUpdate {
     pub kind: String,
     pub namespace: String,
     pub name: String,
+    /// Planned object UID from the watch-cache snapshot. A live GET with
+    /// a different UID is treated as delete/recreate and aborts the write.
+    /// Empty when the snapshot omitted UID (legacy/test objects); the
+    /// writer still requires a live UID on the GET for the patch
+    /// precondition.
+    pub uid: String,
     /// Desired `status` sub-object. The writer extracts
     /// `status.conditions[]` from this and merges it into the live status.
     pub status: Value,
@@ -116,25 +143,38 @@ pub struct IstioStatusUpdate {
 #[derive(Clone)]
 pub struct IstioStatusWriter {
     client: Client,
+    metrics: Option<Arc<ControllerMetrics>>,
 }
 
 impl IstioStatusWriter {
     pub fn new(client: Client) -> Self {
-        Self { client }
+        Self {
+            client,
+            metrics: None,
+        }
     }
 
-    /// Apply each update via `Api::patch_status`. Failures on individual
-    /// resources (most commonly: the cluster's CRD definition has no
-    /// `status` subresource, or a transient API-server hiccup) are
-    /// logged and skipped — they never abort reconcile. Returns the
-    /// first error so callers can metric / alert on the failure rate
-    /// without losing the rest of the batch.
+    /// Attach unlabeled controller counters for conflict/retry outcomes.
+    pub fn with_metrics(mut self, metrics: Arc<ControllerMetrics>) -> Self {
+        self.metrics = Some(metrics);
+        self
+    }
+
+    /// Apply each update via `Api::patch_status` with a resourceVersion/UID
+    /// compare-and-swap. Failures on individual resources (missing status
+    /// subresource, not-found, recreate, or a transient API-server hiccup)
+    /// are logged and skipped — they never abort reconcile. Exhausted
+    /// conflicts return a retryable error so the caller can alert without
+    /// falling back to an unversioned write. Returns the first error so
+    /// callers can metric / alert on the failure rate without losing the
+    /// rest of the batch.
     pub async fn patch_updates(&self, updates: Vec<IstioStatusUpdate>) -> Result<(), kube::Error> {
         // Take `updates` by value and consume via `into_iter` so the per-
         // update closure / async block owns its `update` rather than
         // capturing `&IstioStatusUpdate`. Otherwise the spawned reconciler
         // future fails rustc's HRTB Send check on `&IstioStatusUpdate`.
         let client = self.client.clone();
+        let metrics = self.metrics.clone();
         let futures = updates.into_iter().filter_map(move |update| {
             let Some(ar) = istio_api_resource(&update) else {
                 warn!(
@@ -152,21 +192,10 @@ impl IstioStatusWriter {
             let name = update.name.clone();
             let kind = update.kind.clone();
             let namespace = update.namespace.clone();
+            let metrics = metrics.clone();
             Some(async move {
-                let result = async {
-                    let live = api.get_status(&name).await?;
-                    let patch = istio_status_patch(&update, live.data.get("status"));
-                    // JSON Merge Patch over server-side apply: matches the
-                    // Gateway API path. See [`status.rs`] for the SSA TODO.
-                    let params = PatchParams {
-                        field_manager: Some(FERRUM_ISTIO_CONTROLLER_NAME.to_string()),
-                        ..PatchParams::default()
-                    };
-                    api.patch_status(&name, &params, &Patch::Merge(&patch))
-                        .await
-                        .map(|_| ())
-                }
-                .await;
+                let result =
+                    patch_istio_status_with_retry(&api, &update, metrics.as_deref()).await;
                 (kind, namespace, name, result)
             })
         });
@@ -222,6 +251,190 @@ fn istio_api_resource(update: &IstioStatusUpdate) -> Option<ApiResource> {
         kind: update.kind.clone(),
         plural: plural.to_string(),
     })
+}
+
+async fn patch_istio_status_with_retry(
+    api: &Api<DynamicObject>,
+    update: &IstioStatusUpdate,
+    metrics: Option<&ControllerMetrics>,
+) -> Result<(), kube::Error> {
+    let deadline = Instant::now() + ISTIO_STATUS_PATCH_RETRY_DEADLINE;
+    let params = istio_status_patch_params();
+    for attempt in 1..=ISTIO_STATUS_PATCH_MAX_ATTEMPTS {
+        let live = match api.get_status(&update.name).await {
+            Ok(live) => live,
+            Err(error) if kube_error_is_unsupported_status(&error) => {
+                bump_istio_status_metric(metrics, |m| &m.istio_status_unsupported);
+                warn!(
+                    api_version = %update.api_version,
+                    kind = %update.kind,
+                    namespace = %update.namespace,
+                    name = %update.name,
+                    "Istio status subresource is unsupported; skipping write"
+                );
+                return Ok(());
+            }
+            Err(error) if kube_error_is_not_found(&error) => {
+                bump_istio_status_metric(metrics, |m| &m.istio_status_not_found);
+                warn!(
+                    api_version = %update.api_version,
+                    kind = %update.kind,
+                    namespace = %update.namespace,
+                    name = %update.name,
+                    "Istio status object was not found; skipping write"
+                );
+                return Ok(());
+            }
+            Err(error) => return Err(error),
+        };
+
+        let Some(resource_version) = live
+            .metadata
+            .resource_version
+            .as_deref()
+            .filter(|value| !value.is_empty())
+        else {
+            warn!(
+                api_version = %update.api_version,
+                kind = %update.kind,
+                namespace = %update.namespace,
+                name = %update.name,
+                "Istio status read returned no resourceVersion; skipping write"
+            );
+            return Ok(());
+        };
+        let Some(uid) = live
+            .metadata
+            .uid
+            .as_deref()
+            .filter(|value| !value.is_empty())
+        else {
+            warn!(
+                api_version = %update.api_version,
+                kind = %update.kind,
+                namespace = %update.namespace,
+                name = %update.name,
+                "Istio status read returned no UID; skipping write"
+            );
+            return Ok(());
+        };
+        if !update.uid.is_empty() && update.uid != uid {
+            bump_istio_status_metric(metrics, |m| &m.istio_status_recreated);
+            warn!(
+                api_version = %update.api_version,
+                kind = %update.kind,
+                namespace = %update.namespace,
+                name = %update.name,
+                "Istio status object UID changed (delete/recreate); aborting stale status plan"
+            );
+            return Ok(());
+        }
+
+        let patch = istio_status_patch(update, live.data.get("status"), resource_version, uid);
+        match api
+            .patch_status(&update.name, &params, &Patch::Merge(&patch))
+            .await
+        {
+            Ok(_) => {
+                if attempt > 1 {
+                    bump_istio_status_metric(metrics, |m| &m.istio_status_retries);
+                }
+                return Ok(());
+            }
+            Err(error) if kube_error_is_conflict(&error) => {
+                bump_istio_status_metric(metrics, |m| &m.istio_status_conflicts);
+                let delay = istio_status_retry_delay(attempt);
+                if attempt < ISTIO_STATUS_PATCH_MAX_ATTEMPTS
+                    && Instant::now() + delay < deadline
+                {
+                    tokio::time::sleep(delay).await;
+                    continue;
+                }
+                bump_istio_status_metric(metrics, |m| &m.istio_status_retry_exhausted);
+                warn!(
+                    api_version = %update.api_version,
+                    kind = %update.kind,
+                    namespace = %update.namespace,
+                    name = %update.name,
+                    attempts = attempt,
+                    "Istio status remained conflicted; leaving newer foreign status intact"
+                );
+                return Err(error);
+            }
+            Err(error) if kube_error_is_unsupported_status(&error) => {
+                bump_istio_status_metric(metrics, |m| &m.istio_status_unsupported);
+                warn!(
+                    api_version = %update.api_version,
+                    kind = %update.kind,
+                    namespace = %update.namespace,
+                    name = %update.name,
+                    "Istio status subresource is unsupported; skipping write"
+                );
+                return Ok(());
+            }
+            Err(error) if kube_error_is_not_found(&error) => {
+                bump_istio_status_metric(metrics, |m| &m.istio_status_not_found);
+                warn!(
+                    api_version = %update.api_version,
+                    kind = %update.kind,
+                    namespace = %update.namespace,
+                    name = %update.name,
+                    "Istio status object was not found; skipping write"
+                );
+                return Ok(());
+            }
+            Err(error) => return Err(error),
+        }
+    }
+
+    Ok(())
+}
+
+fn istio_status_patch_params() -> PatchParams {
+    PatchParams {
+        field_manager: Some(FERRUM_ISTIO_CONTROLLER_NAME.to_string()),
+        ..PatchParams::default()
+    }
+}
+
+fn kube_error_is_conflict(error: &kube::Error) -> bool {
+    matches!(error, kube::Error::Api(response) if response.code == 409)
+}
+
+fn kube_error_is_not_found(error: &kube::Error) -> bool {
+    matches!(error, kube::Error::Api(response) if response.code == 404)
+        && !kube_error_is_unsupported_status(error)
+}
+
+fn kube_error_is_unsupported_status(error: &kube::Error) -> bool {
+    match error {
+        kube::Error::Api(response) if response.code == 405 => true,
+        kube::Error::Api(response) if response.code == 404 => {
+            response
+                .message
+                .contains("could not find the requested resource")
+        }
+        _ => false,
+    }
+}
+
+fn istio_status_retry_delay(attempt: usize) -> Duration {
+    let exponent = attempt.saturating_sub(1).min(6) as u32;
+    let base_ms = ISTIO_STATUS_PATCH_RETRY_BASE_MS
+        .saturating_mul(1_u64 << exponent)
+        .min(100);
+    let jitter_window_ms = (base_ms / 2).max(1);
+    let jitter_ms = crate::util::backoff::random_backoff_entropy() % jitter_window_ms;
+    Duration::from_millis(base_ms.saturating_sub(base_ms / 4) + jitter_ms)
+}
+
+fn bump_istio_status_metric(
+    metrics: Option<&ControllerMetrics>,
+    pick: impl Fn(&ControllerMetrics) -> &std::sync::atomic::AtomicU64,
+) {
+    if let Some(metrics) = metrics {
+        pick(metrics).fetch_add(1, Ordering::Relaxed);
+    }
 }
 
 /// Plan a batch of [`IstioStatusUpdate`]s for the supported Istio CRDs in
@@ -326,6 +539,7 @@ pub fn plan_istio_status_updates_budgeted(
             kind: object.kind.clone(),
             namespace: object.metadata.namespace.clone(),
             name: object.metadata.name.clone(),
+            uid: object.metadata.uid.clone(),
             status,
             ferrum_detail,
         });
@@ -361,7 +575,7 @@ fn is_supported_istio_kind(kind: &str) -> bool {
     )
 }
 
-/// Build the final `status` sub-object to PATCH onto an Istio CRD.
+/// Build the JSON Merge Patch for an Istio CRD status subresource.
 ///
 /// The Istio CRDs' `status` is freeform — Istio writes
 /// `status.observedGeneration` and `status.validationMessages[]`. We
@@ -369,7 +583,14 @@ fn is_supported_istio_kind(kind: &str) -> bool {
 /// next to whatever Istio wrote, plus a `status.ferrum.translation`
 /// block carrying translator detail. The live status is merged
 /// condition-by-condition so we don't clobber Istio's own fields.
-fn istio_status_patch(update: &IstioStatusUpdate, live_status: Option<&Value>) -> Value {
+/// `resource_version` and `uid` are copied into `metadata` so the API
+/// server rejects the write if the object changed since this GET.
+fn istio_status_patch(
+    update: &IstioStatusUpdate,
+    live_status: Option<&Value>,
+    resource_version: &str,
+    uid: &str,
+) -> Value {
     let mut status_patch = serde_json::Map::new();
 
     // Owned conditions from `update.status`, merged with the live array
@@ -409,6 +630,13 @@ fn istio_status_patch(update: &IstioStatusUpdate, live_status: Option<&Value>) -
     }
 
     let mut patch = serde_json::Map::new();
+    patch.insert(
+        "metadata".to_string(),
+        json!({
+            "resourceVersion": resource_version,
+            "uid": uid,
+        }),
+    );
     patch.insert("status".to_string(), Value::Object(status_patch));
     Value::Object(patch)
 }
@@ -2666,12 +2894,16 @@ mod tests {
             kind: "AuthorizationPolicy".to_string(),
             namespace: "default".to_string(),
             name: "test".to_string(),
+            uid: String::new(),
             status: desired,
             ferrum_detail: None,
         };
-        let patch = istio_status_patch(&update, Some(&live_status));
+        let patch = istio_status_patch(&update, Some(&live_status), "42", "uid-test");
+        assert_eq!(patch["metadata"]["resourceVersion"].as_str(), Some("42"));
+        assert_eq!(patch["metadata"]["uid"].as_str(), Some("uid-test"));
+        assert!(patch["status"].get("observedGeneration").is_none());
+        assert!(patch["status"].get("validationMessages").is_none());
         let conditions = patch["status"]["conditions"].as_array().unwrap();
-        // Istio's `Reconciled` condition must be preserved.
         assert!(
             conditions
                 .iter()
@@ -2734,10 +2966,11 @@ mod tests {
             kind: "AuthorizationPolicy".to_string(),
             namespace: "default".to_string(),
             name: "test".to_string(),
+            uid: String::new(),
             status: desired,
             ferrum_detail: None,
         };
-        let patch = istio_status_patch(&update, Some(&live_status));
+        let patch = istio_status_patch(&update, Some(&live_status), "42", "uid-test");
         let conditions = patch["status"]["conditions"].as_array().unwrap();
         let ferrum: Vec<&Value> = conditions
             .iter()
@@ -2760,12 +2993,15 @@ mod tests {
             kind: "PeerAuthentication".to_string(),
             namespace: "default".to_string(),
             name: "test".to_string(),
+            uid: String::new(),
             status: json!({ "conditions": [] }),
             ferrum_detail: Some(json!({
                 "translation": { "scope": "Namespace", "configured_mtls_mode": "STRICT" }
             })),
         };
-        let patch = istio_status_patch(&update, None);
+        let patch = istio_status_patch(&update, None, "42", "uid-test");
+        assert_eq!(patch["metadata"]["resourceVersion"].as_str(), Some("42"));
+        assert_eq!(patch["metadata"]["uid"].as_str(), Some("uid-test"));
         assert_eq!(
             patch["status"]["ferrum"]["translation"]["scope"].as_str(),
             Some("Namespace")
@@ -2809,6 +3045,7 @@ mod tests {
             kind: "ProxyConfig".to_string(),
             namespace: "default".to_string(),
             name: "pc".to_string(),
+            uid: String::new(),
             status: Value::Null,
             ferrum_detail: None,
         };
@@ -2825,6 +3062,7 @@ mod tests {
             kind: "EnvoyFilter".to_string(),
             namespace: "default".to_string(),
             name: "ef".to_string(),
+            uid: String::new(),
             status: Value::Null,
             ferrum_detail: None,
         };
@@ -2897,6 +3135,7 @@ mod tests {
             kind: "AuthorizationPolicy".to_string(),
             namespace: "default".to_string(),
             name: "policy".to_string(),
+            uid: String::new(),
             status: Value::Null,
             ferrum_detail: None,
         };
@@ -4362,6 +4601,7 @@ mod tests {
                 kind: kind.to_string(),
                 namespace: "default".to_string(),
                 name: "x".to_string(),
+                uid: String::new(),
                 status: Value::Null,
                 ferrum_detail: None,
             };
