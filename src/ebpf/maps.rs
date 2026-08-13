@@ -616,8 +616,7 @@ impl BpfMaps {
             return Err(format!(
                 "refusing to authorize NodeWaypoint UDP/DTLS reply sources: {} and \
                  {} must both be present, and at least one is absent from the loaded program",
-                BPF_MAP_UDP_REPLY_SOURCES,
-                BPF_MAP_UDP_REPLY_SOURCES6
+                BPF_MAP_UDP_REPLY_SOURCES, BPF_MAP_UDP_REPLY_SOURCES6
             ));
         }
 

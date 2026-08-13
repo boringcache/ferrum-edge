@@ -6246,12 +6246,8 @@ pub fn reconcile_node_waypoint_udp_reply_sources(
     // late acknowledgement for a predecessor could appear after a successor's
     // manifest is already current. A mismatch revokes the just-applied set and
     // leaves no acknowledgement; the next ordinary poll applies the successor.
-    if !revalidate_node_waypoint_udp_reply_source_generation(
-        backend,
-        registry_dir,
-        state,
-        &desired,
-    ) {
+    if !revalidate_node_waypoint_udp_reply_source_generation(backend, registry_dir, state, &desired)
+    {
         return;
     }
 

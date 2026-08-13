@@ -311,7 +311,9 @@ fn posix_case_glob(text: &str, pattern: &str) -> bool {
 }
 
 fn posix_case_any(text: &str, patterns: &[String]) -> bool {
-    patterns.iter().any(|pattern| posix_case_glob(text, pattern))
+    patterns
+        .iter()
+        .any(|pattern| posix_case_glob(text, pattern))
 }
 
 /// Unquote one POSIX `case` alternative (`*'local default dev lo'*` →
@@ -413,14 +415,22 @@ fn teardown_matches_both_iproute2_spellings_of_the_owned_local_default() {
         "inspect/verify glob drift would false-succeed on a still-live route:\n{script}"
     );
     assert!(
-        v4.inspect_globs.iter().any(|glob| glob.contains("0.0.0.0/0"))
-            && v4.inspect_globs.iter().any(|glob| glob.contains("local default dev lo")),
+        v4.inspect_globs
+            .iter()
+            .any(|glob| glob.contains("0.0.0.0/0"))
+            && v4
+                .inspect_globs
+                .iter()
+                .any(|glob| glob.contains("local default dev lo")),
         "IPv4 must accept both CIDR and `default` spellings: {:?}",
         v4.inspect_globs
     );
     assert!(
         v6.inspect_globs.iter().any(|glob| glob.contains("::/0"))
-            && v6.inspect_globs.iter().any(|glob| glob.contains("local default dev lo")),
+            && v6
+                .inspect_globs
+                .iter()
+                .any(|glob| glob.contains("local default dev lo")),
         "IPv6 must accept both CIDR and `default` spellings: {:?}",
         v6.inspect_globs
     );
@@ -467,7 +477,12 @@ fn teardown_matches_both_iproute2_spellings_of_the_owned_local_default() {
         );
     }
 
-    for dump in ["", leftover_v4, "local default dev eth0 scope host", cidr_v6] {
+    for dump in [
+        "",
+        leftover_v4,
+        "local default dev eth0 scope host",
+        cidr_v6,
+    ] {
         assert!(
             !posix_case_any(dump, &v4.inspect_globs),
             "IPv4 must treat this as absence / not-ours and not delete:\n{dump}"
@@ -477,7 +492,12 @@ fn teardown_matches_both_iproute2_spellings_of_the_owned_local_default() {
             "IPv4 post-delete check must succeed for absence / not-ours:\n{dump}"
         );
     }
-    for dump in ["", leftover_v6, "local default dev eth0 metric 1024", cidr_v4] {
+    for dump in [
+        "",
+        leftover_v6,
+        "local default dev eth0 metric 1024",
+        cidr_v4,
+    ] {
         assert!(
             !posix_case_any(dump, &v6.inspect_globs),
             "IPv6 must treat this as absence / not-ours and not delete:\n{dump}"
@@ -935,9 +955,7 @@ impl NodeWaypointUdpSteerBackend for SharedLogBackend {
             .expect("backend log")
             .push(entry.to_string());
         if entry == "script:teardown"
-            && self
-                .fail_teardown
-                .load(std::sync::atomic::Ordering::SeqCst)
+            && self.fail_teardown.load(std::sync::atomic::Ordering::SeqCst)
         {
             return Err("injected steering teardown failure".to_string());
         }

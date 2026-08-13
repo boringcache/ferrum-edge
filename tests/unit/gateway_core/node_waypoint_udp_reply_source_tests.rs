@@ -522,8 +522,7 @@ fn an_acknowledgement_satisfies_only_the_generation_it_names() {
     assert_ne!(first, second);
     let stale = publisher.acknowledged().expect("read acknowledgement");
     assert_eq!(
-        stale,
-        None,
+        stale, None,
         "a stale acknowledgement must prove nothing about the publisher's current generation"
     );
 }

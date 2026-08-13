@@ -744,8 +744,7 @@ pub fn write_acknowledgement(
     let dir = registry_dir.join(NODE_WAYPOINT_UDP_REPLY_SOURCE_DIR);
     let body = format!(
         "{ACK_MAGIC} {PROTOCOL_VERSION} {} {}\n",
-        generation.owner,
-        generation.sequence
+        generation.owner, generation.sequence
     );
     atomic_write(
         &dir,

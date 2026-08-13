@@ -430,14 +430,10 @@ fn node_waypoint_udp_steer_teardown_for_family(binary: &str, ipv6: bool) -> Vec<
     let route_case = format!("*'local {cidr} dev lo'*|*'local default dev lo'*");
     vec![
         // STOP MARKING FIRST, then remove the now-unreferenced chain.
-        format!(
-            "ferrum_delete_xtables_rule {binary} mangle PREROUTING -p udp -j {steer}"
-        ),
+        format!("ferrum_delete_xtables_rule {binary} mangle PREROUTING -p udp -j {steer}"),
         format!("ferrum_delete_xtables_chain {binary} mangle {steer}"),
         // Then stop bypassing conntrack and remove its chain.
-        format!(
-            "ferrum_delete_xtables_rule {binary} raw PREROUTING -p udp -j {notrack}"
-        ),
+        format!("ferrum_delete_xtables_rule {binary} raw PREROUTING -p udp -j {notrack}"),
         format!("ferrum_delete_xtables_chain {binary} raw {notrack}"),
         // Routing comes last. Inspect first so only genuine absence is an
         // idempotent success; a failed delete is never reclassified as absent.

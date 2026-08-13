@@ -1483,8 +1483,8 @@ fn a_withdrawn_or_disabled_generation_clears_desired_steering_metadata() {
 use dashmap::DashMap;
 use ferrum_edge::capture::{CaptureConfig, CaptureMode, NodeWaypointUdpSteerDestination};
 use ferrum_edge::ebpf::{
-    BPF_MAP_UDP_REPLY_SOURCE_GATE, CaptureContract, EbpfBackend, FallbackMode,
-    MockEbpfBackend, NodeAgentProxyMode, PodAttachmentState,
+    BPF_MAP_UDP_REPLY_SOURCE_GATE, CaptureContract, EbpfBackend, FallbackMode, MockEbpfBackend,
+    NodeAgentProxyMode, PodAttachmentState,
 };
 use ferrum_edge::modes::node_agent::{
     NodeAgentConfig, NodeWaypointUdpReplySourceState,
@@ -1547,10 +1547,7 @@ fn authorized(backend: &MockEbpfBackend) -> Vec<(std::net::IpAddr, u16)> {
     sources
 }
 
-fn effectively_authorized(
-    backend: &MockEbpfBackend,
-    source: (std::net::IpAddr, u16),
-) -> bool {
+fn effectively_authorized(backend: &MockEbpfBackend, source: (std::net::IpAddr, u16)) -> bool {
     backend.udp_reply_sources_enabled && backend.udp_reply_sources.contains(&source)
 }
 
@@ -2059,7 +2056,10 @@ fn a_new_generation_retracts_the_previous_acknowledgement_before_applying() {
     // A new generation the agent cannot apply. The old acknowledgement must be
     // gone even though the new one is never written.
     publisher
-        .publish(&[reply_source("10.96.0.10", 5300), reply_source("10.96.0.11", 5301)])
+        .publish(&[
+            reply_source("10.96.0.10", 5300),
+            reply_source("10.96.0.11", 5301),
+        ])
         .expect("second");
     backend.fail_replace_udp_reply_sources = true;
     reconcile_node_waypoint_udp_reply_sources(&mut backend, &config, &pods, &mut state);
@@ -2103,7 +2103,9 @@ fn successor_acknowledgement_unlink_failure_closes_the_gate_and_retries() {
         "unlink failure must close authorization even while old map storage remains"
     );
     assert!(
-        !backend.udp_reply_sources.contains(&(successor.ip, successor.port)),
+        !backend
+            .udp_reply_sources
+            .contains(&(successor.ip, successor.port)),
         "a generation whose acknowledgement could not be retracted must not be mutated in"
     );
 

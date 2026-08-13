@@ -1447,8 +1447,7 @@ impl EbpfBackend for MockEbpfBackend {
                 .retain(|entry| entry.0.is_ipv6() || desired4.contains(entry));
             self.udp_reply_sources.extend(desired4);
             return Err(
-                "injected NodeWaypoint UDP reply-source failure after IPv4 application"
-                    .to_string(),
+                "injected NodeWaypoint UDP reply-source failure after IPv4 application".to_string(),
             );
         }
         // Mirror the real backend's map contents. Coherence is supplied by the
