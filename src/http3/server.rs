@@ -10280,9 +10280,9 @@ impl H3GrpcUploadFault {
             Self::ClientAbort => Some(H3GrpcTerminatingUploadFault::ClientAbort),
             Self::MalformedTrailers => Some(H3GrpcTerminatingUploadFault::MalformedTrailers),
             Self::Oversize => Some(H3GrpcTerminatingUploadFault::Oversize),
-            Self::AuthorizationExpired(termination) => {
-                Some(H3GrpcTerminatingUploadFault::AuthorizationExpired(termination))
-            }
+            Self::AuthorizationExpired(termination) => Some(
+                H3GrpcTerminatingUploadFault::AuthorizationExpired(termination),
+            ),
             // A gRPC server that has read everything it needs may legitimately
             // STOP_SENDING / reset the request direction while it keeps
             // streaming its response, so this is recorded and left to the
@@ -10625,14 +10625,13 @@ async fn run_h3_grpc_upload_pump(
     auth_deadline_plan: Option<crate::proxy::auth_lifetime::StreamAuthDeadline>,
     auth_latch: crate::proxy::auth_lifetime::StreamAuthTerminationLatch,
 ) {
-    let settle_upload_auth =
-        |termination: crate::proxy::auth_lifetime::StreamAuthTermination| {
-            auth_latch.record_once(
-                termination,
-                crate::proxy::auth_lifetime::StreamAuthProtocolFamily::Grpc,
-            );
-            upload.publish_fault(H3GrpcUploadFault::AuthorizationExpired(termination));
-        };
+    let settle_upload_auth = |termination: crate::proxy::auth_lifetime::StreamAuthTermination| {
+        auth_latch.record_once(
+            termination,
+            crate::proxy::auth_lifetime::StreamAuthProtocolFamily::Grpc,
+        );
+        upload.publish_fault(H3GrpcUploadFault::AuthorizationExpired(termination));
+    };
     let mut total_sent: usize = 0;
     let mut grpc_scanner = grpc_messages
         .as_ref()
@@ -12977,7 +12976,9 @@ async fn dispatch_grpc_native_h3(
                                         "native H3 gRPC stream reached its authorization lifetime \
                                          while awaiting trailers after body bytes; resetting"
                                     );
-                                    crate::http3::stream_util::abort_response_stream(&mut send_half);
+                                    crate::http3::stream_util::abort_response_stream(
+                                        &mut send_half,
+                                    );
                                     body_error_class =
                                         Some(crate::retry::ErrorClass::ClientDisconnect);
                                 }
@@ -13056,8 +13057,7 @@ async fn dispatch_grpc_native_h3(
                                     backend_read_timeout_ms
                                 );
                                 crate::http3::stream_util::abort_response_stream(&mut send_half);
-                                body_error_class =
-                                    Some(crate::retry::ErrorClass::ReadWriteTimeout);
+                                body_error_class = Some(crate::retry::ErrorClass::ReadWriteTimeout);
                                 break;
                             }
                         },
@@ -13221,12 +13221,10 @@ async fn dispatch_grpc_native_h3(
                                     termination,
                                     crate::proxy::auth_lifetime::StreamAuthProtocolFamily::Grpc,
                                 );
-                                body_error_class =
-                                    Some(crate::retry::ErrorClass::ClientDisconnect);
+                                body_error_class = Some(crate::retry::ErrorClass::ClientDisconnect);
                             } else {
                                 client_deadline_expired = true;
-                                body_error_class =
-                                    Some(crate::retry::ErrorClass::ClientDisconnect);
+                                body_error_class = Some(crate::retry::ErrorClass::ClientDisconnect);
                             }
                         }
                         H3GrpcResponseFinish::WriteFailed => {
@@ -13263,12 +13261,10 @@ async fn dispatch_grpc_native_h3(
                                     termination,
                                     crate::proxy::auth_lifetime::StreamAuthProtocolFamily::Grpc,
                                 );
-                                body_error_class =
-                                    Some(crate::retry::ErrorClass::ClientDisconnect);
+                                body_error_class = Some(crate::retry::ErrorClass::ClientDisconnect);
                             } else {
                                 client_deadline_expired = true;
-                                body_error_class =
-                                    Some(crate::retry::ErrorClass::ClientDisconnect);
+                                body_error_class = Some(crate::retry::ErrorClass::ClientDisconnect);
                             }
                         }
                         H3GrpcResponseFinish::WriteFailed => {
@@ -13303,12 +13299,10 @@ async fn dispatch_grpc_native_h3(
                                     termination,
                                     crate::proxy::auth_lifetime::StreamAuthProtocolFamily::Grpc,
                                 );
-                                body_error_class =
-                                    Some(crate::retry::ErrorClass::ClientDisconnect);
+                                body_error_class = Some(crate::retry::ErrorClass::ClientDisconnect);
                             } else {
                                 client_deadline_expired = true;
-                                body_error_class =
-                                    Some(crate::retry::ErrorClass::ClientDisconnect);
+                                body_error_class = Some(crate::retry::ErrorClass::ClientDisconnect);
                             }
                         }
                         H3GrpcResponseFinish::WriteFailed => {

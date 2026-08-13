@@ -3125,7 +3125,8 @@ fn h3_native_grpc_upload_pump_awaits_are_all_cancellable() {
     // authorization plan through the shared helper: frontend DATA, backend
     // DATA, frontend trailers, backend trailers, and the backend FIN.
     assert_eq!(
-        pump.matches("h3_grpc_upload_await_until_authorization(").count(),
+        pump.matches("h3_grpc_upload_await_until_authorization(")
+            .count(),
         5,
         "each pump await must race shutdown and the authorization plan"
     );
@@ -3802,7 +3803,9 @@ fn h3_native_grpc_trailer_phase_composes_the_authorization_plan() {
         .next()
         .expect("bounded native H3 gRPC trailer phase");
     assert!(
-        trailer.contains("let trailer_bound = crate::proxy::auth_lifetime::ComposedAuthBound::compose("),
+        trailer.contains(
+            "let trailer_bound = crate::proxy::auth_lifetime::ComposedAuthBound::compose("
+        ),
         "the trailer wait must compose the captured authorization plan"
     );
     assert!(
@@ -3985,7 +3988,9 @@ async fn a_parked_h3_grpc_trailer_write_expires_under_authorization() {
         termination: StreamAuthTermination::CredentialExpired,
     };
     let bound = ComposedAuthBound::compose(None, Some(plan));
-    let deadline = bound.deadline().expect("authorization supplies the write bound");
+    let deadline = bound
+        .deadline()
+        .expect("authorization supplies the write bound");
     let task = tokio::spawn(async move {
         ferrum_edge::_test_support::stalled_h3_response_write_expires_for_test(deadline).await
     });

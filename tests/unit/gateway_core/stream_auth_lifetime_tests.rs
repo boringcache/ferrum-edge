@@ -780,9 +780,10 @@ fn an_authenticated_plaintext_tcp_session_never_splices() {
         .split("(Some(plan), BackendStream::Plain(bs)) => {")
         .nth(1)
         .expect("authenticated plain-to-plain arm");
-    let some_plain_body = some_plain.split("(None, BackendStream::Tls(bs)) => {").next().expect(
-        "authenticated plain-to-plain arm bounded",
-    );
+    let some_plain_body = some_plain
+        .split("(None, BackendStream::Tls(bs)) => {")
+        .next()
+        .expect("authenticated plain-to-plain arm bounded");
     assert!(
         some_plain_body.contains("bidirectional_copy_with_stream_auth("),
         "an admitted plaintext identity must use the deadline-aware userspace relay"
@@ -894,10 +895,12 @@ async fn an_admitted_plaintext_tcp_identity_relays_then_expires_both_directions(
         1,
         "post-relay accounting must record the session exactly once"
     );
-    assert!(!tcp_plain_splice_eligible_for_test(Some(StreamAuthDeadline {
-        at: deadline_at,
-        termination: StreamAuthTermination::CredentialExpired,
-    })));
+    assert!(!tcp_plain_splice_eligible_for_test(Some(
+        StreamAuthDeadline {
+            at: deadline_at,
+            termination: StreamAuthTermination::CredentialExpired,
+        }
+    )));
 }
 
 /// A session with no authorization deadline is untouched: the wrapper is only

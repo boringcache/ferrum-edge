@@ -3757,11 +3757,7 @@ async fn handle_tcp_connection_inner(
             }
         };
 
-        publish_stream_tcp_auth_termination(
-            stream_auth_deadline,
-            &stream_auth_expired,
-            stream_ctx,
-        );
+        publish_stream_tcp_auth_termination(stream_auth_deadline, &stream_auth_expired, stream_ctx);
 
         // Only feed SUCCESSFUL relay sizes into the adaptive buffer tracker.
         // Failed relays (connect error, TLS failure, mid-stream RST) contribute
@@ -4892,11 +4888,7 @@ async fn handle_tcp_connection_inner(
         }
     };
 
-    publish_stream_tcp_auth_termination(
-        stream_auth_deadline,
-        &stream_auth_expired,
-        stream_ctx,
-    );
+    publish_stream_tcp_auth_termination(stream_auth_deadline, &stream_auth_expired, stream_ctx);
 
     // Record adaptive buffer stats for the TLS/non-passthrough path.
     // Only feed SUCCESSFUL relay sizes into the adaptive buffer tracker — see
