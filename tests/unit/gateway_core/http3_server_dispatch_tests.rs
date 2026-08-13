@@ -75,6 +75,92 @@ fn h3_plain_bridge_dispatches_mesh_through_shared_pools() {
 }
 
 #[test]
+fn h3_plain_mesh_upload_collection_releases_half_open_probe_before_terminal_write() {
+    let source = include_str!("../../../src/http3/cross_protocol.rs");
+    let plain = source
+        .split("async fn dispatch_plain<S>(")
+        .nth(1)
+        .expect("H3→HTTP plain dispatcher must remain present")
+        .split("async fn dispatch_grpc<S>(")
+        .next()
+        .expect("H3→HTTP plain dispatcher must remain bounded");
+    let mesh_block_start = plain
+        .find("target_requires_http_mesh_egress")
+        .expect("mesh force-buffer gate must remain present");
+    let mesh_block = &plain[mesh_block_start..];
+    let mesh_block_end = mesh_block
+        .find("let (response, bytes_sent, mut backend_admission_permits")
+        .expect("mesh force-buffer block must remain bounded");
+    let mesh_collection = &mesh_block[..mesh_block_end];
+
+    assert!(
+        mesh_collection.contains("collect_h3_request_body_with_deadline("),
+        "mesh uploads must force-collect via collect_h3_request_body_with_deadline"
+    );
+    assert_eq!(
+        mesh_collection
+            .matches("release_cross_protocol_circuit_breaker_probe_on_admission_reject(")
+            .count(),
+        3,
+        "mesh upload collection must release the HALF_OPEN probe on each terminal reject branch"
+    );
+
+    let oversize = mesh_collection
+        .split("Ok(None)")
+        .nth(1)
+        .expect("missing mesh collection branch: Ok(None)")
+        .split("H3RequestBodyReadError::DeadlineExceeded")
+        .next()
+        .expect("bounded mesh collection Ok(None) branch");
+    let oversize_release = oversize
+        .find("release_cross_protocol_circuit_breaker_probe_on_admission_reject(")
+        .expect("Ok(None) must release HALF_OPEN probe");
+    let oversize_write = oversize
+        .find("write_plain_gateway_error(")
+        .expect("Ok(None) must write plain gateway error");
+    assert!(
+        oversize_release < oversize_write,
+        "Ok(None) must release probe before terminal write"
+    );
+
+    let deadline = mesh_collection
+        .split("H3RequestBodyReadError::DeadlineExceeded")
+        .nth(1)
+        .expect("missing mesh collection branch: DeadlineExceeded")
+        .split("H3RequestBodyReadError::TimedOut")
+        .next()
+        .expect("bounded mesh collection DeadlineExceeded branch");
+    let deadline_release = deadline
+        .find("release_cross_protocol_circuit_breaker_probe_on_admission_reject(")
+        .expect("DeadlineExceeded must release HALF_OPEN probe");
+    let deadline_write = deadline
+        .find("write_plain_grpc_web_client_deadline(")
+        .expect("DeadlineExceeded must write gRPC-Web deadline response");
+    assert!(
+        deadline_release < deadline_write,
+        "DeadlineExceeded must release probe before terminal write"
+    );
+
+    let timeout = mesh_collection
+        .split("H3RequestBodyReadError::TimedOut")
+        .nth(1)
+        .expect("missing mesh collection branch: TimedOut/Read")
+        .split("} else {")
+        .next()
+        .expect("bounded mesh collection TimedOut/Read branch");
+    let timeout_release = timeout
+        .find("release_cross_protocol_circuit_breaker_probe_on_admission_reject(")
+        .expect("TimedOut/Read must release HALF_OPEN probe");
+    let timeout_write = timeout
+        .find("write_plain_gateway_error(")
+        .expect("TimedOut/Read must write plain gateway error");
+    assert!(
+        timeout_release < timeout_write,
+        "TimedOut/Read must release probe before terminal write"
+    );
+}
+
+#[test]
 fn h3_reject_writer_skips_empty_data_frames() {
     let src = include_str!("../../../src/http3/server.rs");
     let helper = src

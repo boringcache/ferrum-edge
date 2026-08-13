@@ -1946,6 +1946,12 @@ where
                 (Some(body), len)
             }
             Ok(None) => {
+                release_cross_protocol_circuit_breaker_probe_on_admission_reject(
+                    state,
+                    proxy,
+                    cb_target_key,
+                    cb_retry_probe_slot_available,
+                );
                 return write_plain_gateway_error(
                     stream,
                     ctx,
@@ -1958,6 +1964,12 @@ where
                 .await;
             }
             Err(super::server::H3RequestBodyReadError::DeadlineExceeded) => {
+                release_cross_protocol_circuit_breaker_probe_on_admission_reject(
+                    state,
+                    proxy,
+                    cb_target_key,
+                    cb_retry_probe_slot_available,
+                );
                 return write_plain_grpc_web_client_deadline(
                     stream,
                     plugins,
@@ -1972,6 +1984,12 @@ where
             }
             Err(super::server::H3RequestBodyReadError::TimedOut)
             | Err(super::server::H3RequestBodyReadError::Read(_)) => {
+                release_cross_protocol_circuit_breaker_probe_on_admission_reject(
+                    state,
+                    proxy,
+                    cb_target_key,
+                    cb_retry_probe_slot_available,
+                );
                 return write_plain_gateway_error(
                     stream,
                     ctx,
