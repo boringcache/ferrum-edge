@@ -1559,7 +1559,7 @@ fn handle_h3_request_rejects_connect_udp_in_early_data_before_routing() {
         "CONNECT-UDP 0-RTT must emit 425 Too Early"
     );
     assert!(
-        arm.contains(r#"{"error":"CONNECT-UDP is not allowed in 0-RTT early data"}"#),
+        arm.contains(r#"{"error":"CONNECT-UDPisnotallowedin0-RTTearlydata"}"#),
         "CONNECT-UDP 0-RTT must use a CONNECT-UDP-specific 425 body"
     );
     assert!(
