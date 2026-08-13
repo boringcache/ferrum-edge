@@ -6,6 +6,7 @@ usage() {
   printf '%s\n' \
     'Usage: dispatch-agent.sh --worktree ABS_PATH --prompt-file ABS_PATH' \
     '                         [--effort low|medium|high|xhigh|max]' \
+    '                         [--fast]' \
     '                         [--name NAME]' \
     '' \
     'Runs the standalone `cursor-agent` CLI in print mode against composer-2.5.' \
@@ -16,9 +17,9 @@ usage() {
 worktree=''
 prompt_file=''
 effort=''
+fast='false'
 name=''
 
-# Non-Fast SKU: composer-2.5-fast would bill fast credits.
 MODEL='composer-2.5'
 
 while (($#)); do
@@ -49,6 +50,10 @@ while (($#)); do
       fi
       effort=${2-}
       shift 2
+      ;;
+    --fast)
+      fast='true'
+      shift
       ;;
     --name)
       if (($# < 2)); then
@@ -85,6 +90,10 @@ if [[ -n "$effort" ]]; then
   esac
 fi
 
+if [[ "$fast" == 'true' ]]; then
+  MODEL='composer-2.5-fast'
+fi
+
 if [[ "$worktree" != /* || ! -d "$worktree" ]]; then
   printf 'Worktree must be an existing absolute directory: %s\n' "${worktree:-<empty>}" >&2
   exit 2
@@ -115,17 +124,21 @@ fi
 
 # Auth: cursor-agent reads CURSOR_API_KEY from the environment when it is
 # exported, and otherwise uses the CLI's own stored login (`cursor-agent status`).
-# Never pass the key on argv — it would be visible in `ps`.
+# Current Cursor CLI releases can initialize the default macOS credential
+# manager before reaching their environment-key fallback. Force the process-local
+# memory store for API-key runs so they never consult or mutate Keychain. Never
+# pass the key on argv — it would be visible in `ps`.
 if [[ -n "${CURSOR_API_KEY:-}" ]]; then
   auth_source='CURSOR_API_KEY'
+  export AGENT_CLI_CREDENTIAL_STORE=memory
 else
   auth_source='cursor-agent login'
 fi
 
 cd "$physical_worktree"
 
-printf '[composer-agents] dispatch model=%s worktree=%s bin=%s auth=%s%s\n' \
-  "$MODEL" "$physical_worktree" "$cursor_bin" "$auth_source" \
+printf '[composer-agents] dispatch model=%s fast=%s worktree=%s bin=%s auth=%s%s\n' \
+  "$MODEL" "$fast" "$physical_worktree" "$cursor_bin" "$auth_source" \
   "${name:+ name=$name}" >&2
 
 # --print: non-interactive, full tool access (read, write, shell).
