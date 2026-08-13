@@ -302,9 +302,11 @@ fn the_placement_contract_persists_a_non_recurring_node_proof_era() {
     let contract = read("templates/udp-placement-contract.yaml");
 
     assert!(
-        contract.contains("nodeProofEra: {{ $nodeProofEra | toString | quote }}")
+        contract.contains("{{- if $nodeProofGeneration -}}")
+            && contract.contains("nodeProofEra: {{ $nodeProofEra | toString | quote }}")
             && contract.contains("nodeProofGeneration: {{ $nodeProofGeneration | quote }}"),
-        "the installed contract must record the era and its era-qualified token"
+        "a stamped era-qualified token must emit both node-proof keys; pre-contract \
+         installs omit them until cleanup stamps era 1"
     );
     // Starting a migration opens a NEW era; resuming the same cleanup release
     // keeps the one already open, so retries are idempotent while transitions
@@ -440,6 +442,42 @@ fn the_placement_contract_fails_closed_on_a_present_malformed_or_inconsistent_er
         contract.matches("add1 $previousEra").count() == 1,
         "successive cleanup starts must strictly increase the ordinal; only one \
          increment site may exist"
+    );
+}
+
+/// Initial stable pod-netns/disabled installs must not stamp era zero or an empty
+/// generation; that present-but-unstamped pair would strand the first cleanup on
+/// the next upgrade.
+#[test]
+fn the_placement_contract_omits_node_proof_keys_until_cleanup_stamps_era_one() {
+    let contract = read("templates/udp-placement-contract.yaml");
+
+    assert!(
+        contract.contains("{{- if $nodeProofGeneration -}}")
+            && contract.contains("nodeProofEra: {{ $nodeProofEra | toString | quote }}")
+            && contract.contains("nodeProofGeneration: {{ $nodeProofGeneration | quote }}"),
+        "both node-proof keys must be emitted only once a non-empty era-qualified \
+         generation exists"
+    );
+    assert!(
+        contract.contains("both must be absent so cleanup can stamp era 1"),
+        "the installed-pair validator must still treat both-absent as the pre-contract \
+         cleanup entry"
+    );
+    let gate = contract
+        .find("{{- if $nodeProofGeneration -}}")
+        .expect("node-proof generation gate");
+    let era_line = contract
+        .find("nodeProofEra: {{ $nodeProofEra | toString | quote }}")
+        .expect("nodeProofEra emission");
+    assert!(
+        gate < era_line,
+        "nodeProofEra must render only inside the non-empty generation gate"
+    );
+    assert!(
+        contract.contains("{{- $previousEra := 0 -}}")
+            && contract.contains("{{- $nextEra := add1 $previousEra -}}"),
+        "pre-contract absence must still let the first cleanup stamp era 1"
     );
 }
 

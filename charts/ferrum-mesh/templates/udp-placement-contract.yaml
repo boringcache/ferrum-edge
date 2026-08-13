@@ -174,11 +174,12 @@ data:
   from: {{ $from | quote }}
   to: {{ $to | quote }}
   # Migration-era provenance for the node-scoped placement proof (issue #3809).
-  # `nodeProofEra` increments once per migration and is never reused;
-  # `nodeProofGeneration` is the era-qualified token the DaemonSets render and
-  # the runtime validates, carried unchanged through finalize and every settled
-  # release after it so a proof can be bound to the exact era it was earned in.
+  # Both keys stay absent until cleanup stamps a non-empty era-qualified token;
+  # once stamped they are carried unchanged through cleanup retry, finalize, and
+  # every settled release after it.
+{{- if $nodeProofGeneration -}}
   nodeProofEra: {{ $nodeProofEra | toString | quote }}
   nodeProofGeneration: {{ $nodeProofGeneration | quote }}
+{{- end -}}
 {{- end -}}
 {{- end -}}
