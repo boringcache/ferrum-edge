@@ -5038,21 +5038,21 @@ impl RequestContext {
             if direct_backend_override {
                 Some(None)
             } else {
-                Some(
-                    destination_upstream
-                        .and_then(|upstream| upstream.pending_limit_scope.clone()),
-                )
+                Some(destination_upstream.and_then(|upstream| upstream.pending_limit_scope.clone()))
             }
         } else {
             None
         };
-        let pending_limit_scope_changed = pending_limit_scope_override.as_ref().is_some_and(
-            |overridden| match (overridden, &proxy.pending_limit_scope) {
-                (None, None) => false,
-                (Some(next), Some(current)) => !Arc::ptr_eq(next, current),
-                _ => true,
-            },
-        );
+        let pending_limit_scope_changed =
+            pending_limit_scope_override
+                .as_ref()
+                .is_some_and(
+                    |overridden| match (overridden, &proxy.pending_limit_scope) {
+                        (None, None) => false,
+                        (Some(next), Some(current)) => !Arc::ptr_eq(next, current),
+                        _ => true,
+                    },
+                );
         let backend_read_timeout_changed = self
             .route_override_backend_read_timeout_ms
             .is_some_and(|timeout| timeout != proxy.backend_read_timeout_ms);

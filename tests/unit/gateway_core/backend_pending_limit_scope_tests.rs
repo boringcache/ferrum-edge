@@ -885,8 +885,7 @@ fn upstream_route_override_resolves_proxy_namespace_not_colliding_id() {
         "override must clone tenant-a's precomputed scope, not tenant-b's"
     );
     assert!(
-        effective_scope.prefix().contains("uid-a")
-            && !effective_scope.prefix().contains("uid-b"),
+        effective_scope.prefix().contains("uid-a") && !effective_scope.prefix().contains("uid-b"),
         "rebound scope must stay in the proxy namespace"
     );
     assert_eq!(
@@ -988,11 +987,8 @@ fn no_route_override_preserves_proxy_pending_scope_arc() {
     config.resolve_pending_limit_scopes();
 
     let proxy = Arc::new(config.proxies[0].clone());
-    let upstreams = namespaced_snapshot(
-        "shop",
-        "upstream-a",
-        Arc::new(config.upstreams[0].clone()),
-    );
+    let upstreams =
+        namespaced_snapshot("shop", "upstream-a", Arc::new(config.upstreams[0].clone()));
     let ctx = RequestContext::new("127.0.0.1".to_string(), "GET".to_string(), "/".to_string());
     let effective = ctx.apply_route_overrides_with_upstreams(Arc::clone(&proxy), &upstreams);
     assert!(
