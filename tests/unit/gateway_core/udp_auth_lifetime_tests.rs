@@ -23,9 +23,8 @@ use std::time::Duration;
 use ferrum_edge::_test_support::{
     UdpAuthorizationSessionProbe, UdpFrontendSendOutcomeForTest, UdpReplyRecvOutcomeForTest,
     udp_authorization_disconnect_classification_for_test,
-    udp_authorization_expired_before_commit_for_test,
-    udp_frontend_send_until_expiry_for_test, udp_frontend_writable_until_expiry_for_test,
-    udp_setup_stage_under_authorization_for_test,
+    udp_authorization_expired_before_commit_for_test, udp_frontend_send_until_expiry_for_test,
+    udp_frontend_writable_until_expiry_for_test, udp_setup_stage_under_authorization_for_test,
 };
 use ferrum_edge::plugins::{Direction, DisconnectCause};
 use ferrum_edge::proxy::auth_lifetime::{
@@ -141,13 +140,9 @@ async fn the_effective_bound_is_the_earliest_of_credential_and_finite_maximum() 
     let anchor = tokio::time::Instant::now();
 
     // A short-TTL credential wins over the maximum.
-    let credential = effective_stream_auth_deadline(
-        true,
-        Some(anchor + Duration::from_secs(30)),
-        anchor,
-        3_600,
-    )
-    .expect("an authenticated session is bounded");
+    let credential =
+        effective_stream_auth_deadline(true, Some(anchor + Duration::from_secs(30)), anchor, 3_600)
+            .expect("an authenticated session is bounded");
     assert_eq!(
         credential.termination,
         StreamAuthTermination::CredentialExpired
@@ -1621,7 +1616,9 @@ fn client_facing_sends_are_raced_against_the_authorization_plan() {
         .nth(1)
         .expect("the labeled reply loop");
     assert_eq!(
-        reply_loop.matches("udp_frontend_send_until_expiry(").count(),
+        reply_loop
+            .matches("udp_frontend_send_until_expiry(")
+            .count(),
         2,
         "both non-batched frontend.send_to sites (first reply and try_recv drain) \
          must race the send"

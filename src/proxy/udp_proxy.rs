@@ -1434,11 +1434,8 @@ async fn direct_send_to_client(
         _ => None,
     };
     let Some(local) = effective_local else {
-        return udp_frontend_send_until_expiry(
-            authorization,
-            frontend.send_to(data, client_addr),
-        )
-        .await;
+        return udp_frontend_send_until_expiry(authorization, frontend.send_to(data, client_addr))
+            .await;
     };
     let (dest, dest_len) = super::udp_batch::std_to_sockaddr_storage(client_addr);
     loop {
@@ -1454,8 +1451,7 @@ async fn direct_send_to_client(
             None,
         ) {
             Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                match udp_frontend_writable_until_expiry(authorization, frontend.writable()).await
-                {
+                match udp_frontend_writable_until_expiry(authorization, frontend.writable()).await {
                     UdpFrontendSendOutcome::AuthorizationExpired(termination) => {
                         return UdpFrontendSendOutcome::AuthorizationExpired(termination);
                     }
@@ -5551,8 +5547,7 @@ async fn create_session(
                     }
                     UdpReplyDatagramCommit::Commit => {}
                 }
-            } else if let Some(termination) =
-                udp_reply_expired_at_commit(reply_authorization_plan)
+            } else if let Some(termination) = udp_reply_expired_at_commit(reply_authorization_plan)
             {
                 reply_session.settle_authorization_expiry(termination);
                 #[cfg(target_os = "linux")]
@@ -5685,8 +5680,7 @@ async fn create_session(
                     // Expiry during/among try_recv processing must stop accepting
                     // further backend payloads; already-queued client datagrams
                     // are discarded rather than flushed.
-                    if let Some(termination) =
-                        udp_reply_expired_at_commit(reply_authorization_plan)
+                    if let Some(termination) = udp_reply_expired_at_commit(reply_authorization_plan)
                     {
                         reply_session.settle_authorization_expiry(termination);
                         #[cfg(target_os = "linux")]
@@ -5949,8 +5943,7 @@ async fn create_session(
                 }
                 // Flush sendmmsg batch (used when GSO is disabled/failed, or GSO drain).
                 if !send_batch.is_empty() {
-                    if let Some(termination) =
-                        udp_reply_expired_at_commit(reply_authorization_plan)
+                    if let Some(termination) = udp_reply_expired_at_commit(reply_authorization_plan)
                     {
                         reply_session.settle_authorization_expiry(termination);
                         gso_batch.discard();
@@ -6552,8 +6545,7 @@ impl UdpAuthorizationSessionProbe {
         let mut disconnect_cause = None;
         let mut disconnect_direction = None;
         if terminated {
-            let (message, class, cause, direction) =
-                udp_authorization_disconnect_classification();
+            let (message, class, cause, direction) = udp_authorization_disconnect_classification();
             connection_error = Some(message);
             error_class = Some(class);
             disconnect_cause = Some(cause);

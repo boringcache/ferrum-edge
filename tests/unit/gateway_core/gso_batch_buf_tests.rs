@@ -214,7 +214,10 @@ fn discard_drops_queued_datagrams_without_flushing() {
     let sent = buf
         .flush_to(-1, &storage, 0, None)
         .expect("flush of an empty discarded buffer is a no-op");
-    assert_eq!(sent, 0, "discarded GSO payloads must not be counted as sent");
+    assert_eq!(
+        sent, 0,
+        "discarded GSO payloads must not be counted as sent"
+    );
 
     // Capacity is retained: a later push reuses the buffer (allocation-free).
     assert!(buf.push(&[3u8; 40]));

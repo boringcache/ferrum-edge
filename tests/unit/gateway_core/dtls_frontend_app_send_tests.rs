@@ -13,7 +13,8 @@ use std::time::Duration;
 
 use ferrum_edge::_test_support::{
     FrontendAppSendAdmitForTest, FrontendAppSendRejectForTest, admit_frontend_app_send_for_test,
-    earliest_frontend_app_send_deadline_for_test, encode_frontend_session_auth_deadline_offset_for_test,
+    earliest_frontend_app_send_deadline_for_test,
+    encode_frontend_session_auth_deadline_offset_for_test,
     frontend_app_ciphertext_send_until_expiry_for_test, frontend_app_send_cancel_fired_for_test,
     frontend_app_send_reject_as_str_for_test, frontend_session_auth_deadline_for_test,
     publish_frontend_session_auth_deadline_for_test, read_frontend_session_auth_deadline_for_test,
@@ -554,9 +555,7 @@ fn driver_and_proxy_use_the_deadline_aware_actual_commit_api() {
     let expiry = authenticated
         .find("tokio::time::sleep_until(at)")
         .expect("expiry arm");
-    let send_arm = authenticated
-        .find("result = send =>")
-        .expect("send arm");
+    let send_arm = authenticated.find("result = send =>").expect("send arm");
     assert!(
         precheck < helper.find("(Some(at), None) =>").expect("arm"),
         "an elapsed deadline is refused before polling send"

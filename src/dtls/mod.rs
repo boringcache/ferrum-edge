@@ -228,10 +228,7 @@ fn reconstruct_frontend_session_auth_deadline(
     anchor: tokio::time::Instant,
     encoded: u64,
 ) -> tokio::time::Instant {
-    reconstruct_frontend_session_auth_deadline_from_duration(
-        anchor,
-        Duration::from_nanos(encoded),
-    )
+    reconstruct_frontend_session_auth_deadline_from_duration(anchor, Duration::from_nanos(encoded))
 }
 
 impl FrontendSessionAuthDeadline {
@@ -266,7 +263,10 @@ impl FrontendSessionAuthDeadline {
         if encoded == FRONTEND_SESSION_AUTH_DEADLINE_UNSET {
             None
         } else {
-            Some(reconstruct_frontend_session_auth_deadline(self.anchor, encoded))
+            Some(reconstruct_frontend_session_auth_deadline(
+                self.anchor,
+                encoded,
+            ))
         }
     }
 }
@@ -344,8 +344,7 @@ fn fail_queued_frontend_app_sends(
     let now = tokio::time::Instant::now();
     while let Ok(mut pending) = app_in_rx.try_recv() {
         let cancelled = frontend_app_send_cancel_fired(&mut pending.cancel);
-        let deadline =
-            earliest_frontend_app_send_deadline(pending.deadline, session_deadline);
+        let deadline = earliest_frontend_app_send_deadline(pending.deadline, session_deadline);
         let reason = shutdown_queued_frontend_app_send(cancelled, deadline, now);
         let _ = pending.completion.send(Err(reason.as_str().to_string()));
     }
@@ -365,8 +364,7 @@ async fn write_connected_frontend_record(
     session_deadline: Option<tokio::time::Instant>,
 ) -> Result<(), FrontendAppSendReject> {
     if let Some(inflight) = in_flight {
-        let deadline =
-            earliest_frontend_app_send_deadline(inflight.deadline, session_deadline);
+        let deadline = earliest_frontend_app_send_deadline(inflight.deadline, session_deadline);
         match frontend_app_ciphertext_send_until_expiry(
             deadline,
             Some(&mut inflight.cancel),
@@ -424,9 +422,7 @@ pub(crate) fn shutdown_queued_frontend_app_send_for_test(
 
 /// Pin cancel-receiver closed/fired detection for external hosted tests.
 #[allow(dead_code)] // used through library `_test_support`
-pub(crate) fn frontend_app_send_cancel_fired_for_test(
-    cancel: &mut oneshot::Receiver<()>,
-) -> bool {
+pub(crate) fn frontend_app_send_cancel_fired_for_test(cancel: &mut oneshot::Receiver<()>) -> bool {
     frontend_app_send_cancel_fired(cancel)
 }
 
@@ -480,9 +476,7 @@ pub(crate) fn read_frontend_session_auth_deadline_for_test(
 
 /// Encode a nanosecond offset from the session anchor for external tests.
 #[allow(dead_code)] // used through library `_test_support`
-pub(crate) fn encode_frontend_session_auth_deadline_offset_for_test(
-    offset_nanos: u128,
-) -> u64 {
+pub(crate) fn encode_frontend_session_auth_deadline_offset_for_test(offset_nanos: u128) -> u64 {
     encode_frontend_session_auth_deadline_offset(offset_nanos)
 }
 
@@ -2093,10 +2087,7 @@ impl DtlsServer {
                                         FrontendAppSendReject::Closed.as_str().to_string(),
                                     ));
                                 }
-                                fail_queued_frontend_app_sends(
-                                    &mut app_in_rx,
-                                    auth_deadline.get(),
-                                );
+                                fail_queued_frontend_app_sends(&mut app_in_rx, auth_deadline.get());
                                 return;
                             }
                             _ => {
@@ -2121,9 +2112,11 @@ impl DtlsServer {
 
                 if let Some(inflight) = in_flight.take() {
                     if !wrote_ciphertext_datagram {
-                        let _ = inflight.completion.send(Err(
-                            "DTLS application send produced no ciphertext datagram".to_string(),
-                        ));
+                        let _ =
+                            inflight
+                                .completion
+                                .send(Err("DTLS application send produced no ciphertext datagram"
+                                    .to_string()));
                     } else {
                         let _ = inflight.completion.send(Ok(()));
                     }

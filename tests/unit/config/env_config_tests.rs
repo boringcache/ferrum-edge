@@ -3515,8 +3515,7 @@ fn test_rejected_env_config_does_not_mutate_the_process_wide_stream_lifetime() {
         std::env::set_var("FERRUM_AUTHENTICATED_STREAM_MAX_LIFETIME_SECONDS", "120");
         std::env::set_var("FERRUM_MESH_UNIX_INGRESS_MAX_CONNECTIONS", "1000000");
     }
-    let error = EnvConfig::from_env()
-        .expect_err("the later check must reject this configuration");
+    let error = EnvConfig::from_env().expect_err("the later check must reject this configuration");
     assert!(
         error.contains("FERRUM_MESH_UNIX_INGRESS_MAX_CONNECTIONS"),
         "expected the LATER validation to be the rejection reason, got: {error}"

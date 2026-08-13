@@ -8915,8 +8915,8 @@ pub mod _test_support {
     }
 
     /// Allocate a lock-free frontend session authorization deadline for tests.
-    pub fn frontend_session_auth_deadline_for_test(
-    ) -> crate::dtls::FrontendSessionAuthDeadlineForTest {
+    pub fn frontend_session_auth_deadline_for_test()
+    -> crate::dtls::FrontendSessionAuthDeadlineForTest {
         crate::dtls::frontend_session_auth_deadline_for_test()
     }
 
