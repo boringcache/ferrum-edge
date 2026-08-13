@@ -357,7 +357,7 @@ async fn test_http3_proxy_state_creation() {
     );
     connection_pool.attach_reqwest_connection_admission(reqwest_conn_admission.clone());
     let mesh_trust_registry =
-        Arc::new(ferrum_edge::proxy::mesh_trust_registry::MeshTrustRegistry::new());
+        ferrum_edge::proxy::mesh_trust_registry::MeshTrustRegistry::new();
     let hbone_pool = Arc::new(ferrum_edge::proxy::hbone_pool::HboneConnectionPool::new(
         ferrum_edge::config::PoolConfig::default(),
         ferrum_edge::dns::DnsCache::new(ferrum_edge::dns::DnsConfig::default()),
@@ -678,7 +678,7 @@ async fn test_http3_full_integration() {
     );
     connection_pool.attach_reqwest_connection_admission(reqwest_conn_admission.clone());
     let mesh_trust_registry =
-        Arc::new(ferrum_edge::proxy::mesh_trust_registry::MeshTrustRegistry::new());
+        ferrum_edge::proxy::mesh_trust_registry::MeshTrustRegistry::new();
     let hbone_pool = Arc::new(ferrum_edge::proxy::hbone_pool::HboneConnectionPool::new(
         ferrum_edge::config::PoolConfig::default(),
         ferrum_edge::dns::DnsCache::new(ferrum_edge::dns::DnsConfig::default()),
