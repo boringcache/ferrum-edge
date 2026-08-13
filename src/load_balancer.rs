@@ -5761,12 +5761,8 @@ impl LoadBalancer {
         // budget can be spent on an excluded target, and clearing afterward
         // leaves viable retry candidates ejected.
         let scope = HealthBitset::all(n);
-        let (candidate_mask, locality_scope) = split_retry_candidate_and_locality_scope_bitset(
-            &self.targets,
-            filter,
-            contract,
-            scope,
-        );
+        let (candidate_mask, locality_scope) =
+            split_retry_candidate_and_locality_scope_bitset(&self.targets, filter, contract, scope);
         if candidate_mask.is_empty() {
             return None;
         }
@@ -5854,12 +5850,8 @@ impl LoadBalancer {
         }
 
         let scope = bitset_for_indices(&port_state.target_indices);
-        let (candidate_mask, locality_scope) = split_retry_candidate_and_locality_scope_bitset(
-            &self.targets,
-            filter,
-            contract,
-            scope,
-        );
+        let (candidate_mask, locality_scope) =
+            split_retry_candidate_and_locality_scope_bitset(&self.targets, filter, contract, scope);
         if candidate_mask.is_empty() {
             return None;
         }

@@ -347,11 +347,7 @@ fn h3_eligible_retry_port_lane_strict_locality_skips_unix_scope_fallback() {
     let original = remote_plain_target("10.0.0.1", 8080);
     let local_unix = unix_target(2);
     let remote_hbone = remote_hbone_target("10.0.0.99", 8080);
-    let mut up = strict_upstream(vec![
-        original.clone(),
-        local_unix,
-        remote_hbone.clone(),
-    ]);
+    let mut up = strict_upstream(vec![original.clone(), local_unix, remote_hbone.clone()]);
     up.port_overrides
         .insert(8080, UpstreamPortOverride::default());
     let cache = lb_cache_for(up);
