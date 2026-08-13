@@ -599,10 +599,11 @@ fn native_h3_client_deadlines_remain_health_neutral() {
          terminal grpc-status (it would train the adaptive-concurrency limiter)"
     );
 
-    // Trailer-wait timeout is `timeout_at` → `Err(_)` → `expired_authorization()`.
-    // Client-owned gRPC deadline completion is the `None if trailer_timeout_is_deadline`
-    // arm; the following `None =>` arm is a backend read-timeout and must stay out
-    // of this health-neutral region.
+    // Trailer-wait timeout is expiry-first `await_deadline_first` → `Err(())`
+    // → `expired_authorization()`. Client-owned gRPC deadline completion is
+    // the `None if trailer_timeout_is_deadline` arm; the following `None =>`
+    // arm is a backend read-timeout and must stay out of this health-neutral
+    // region.
     let trailer_deadline = source
         .find("None if trailer_timeout_is_deadline =>")
         .expect("native H3 trailer deadline branch must remain present");
@@ -1273,9 +1274,9 @@ fn cross_protocol_plain_authorization_expired_terminal_uses_post_deadline_grace(
         dispatch
             .matches("write_plain_authorization_expired_terminal(")
             .count(),
-        3,
-        "upload-auth-expiry and both pre-commitment response-header expiry arms must share \
-         the bounded 401 writer"
+        8,
+        "upload, acquisition, header-wait, retry-delay, and both pre-commitment response-header \
+         expiry arms must share the bounded 401 writer"
     );
     assert!(
         !dispatch.contains("StatusCode::UNAUTHORIZED"),
@@ -1593,15 +1594,23 @@ fn h3_plain_grpc_web_client_acquisition_is_deadline_bounded() {
     );
     assert_eq!(
         dispatch
-            .matches("let client_result = match crate::plugins::await_grpc_deadline(")
+            .matches("let client_result = match crate::plugins::await_deadline_first(")
             .count(),
         2,
-        "both client acquisitions must use the absolute RPC deadline"
+        "both client acquisitions must use the composed expiry-first bound"
+    );
+    assert!(
+        dispatch.contains("plain_write_bound.deadline()"),
+        "client acquisition must wait under the captured composed bound, not the client deadline alone"
     );
     assert!(dispatch.contains("drop(pending_slot);"));
     assert!(dispatch.contains("halt_request_body(stream);"));
     assert!(dispatch.contains("record_plain_grpc_web_client_deadline("));
     assert!(dispatch.contains("write_plain_grpc_web_client_deadline("));
+    assert!(
+        dispatch.contains("write_plain_authorization_expired_terminal("),
+        "an authorization-owned acquisition expiry must stay on the fixed 401, not the client-deadline writer"
+    );
 }
 
 #[test]
@@ -2600,6 +2609,29 @@ fn h3_plain_header_wait_races_per_stream_stop_sending_not_only_connection_close(
     assert!(
         helper.contains("H3BackendOrPeer::Deadline"),
         "the gRPC-Web absolute deadline race must be preserved: {helper}"
+    );
+    assert!(
+        helper.contains("if let Some(deadline) = deadline")
+            && helper.contains("tokio::time::Instant::now() >= deadline"),
+        "an already-elapsed composed bound must refuse before polling the backend: {helper}"
+    );
+    let bounded = helper
+        .split("Some(deadline) => {")
+        .nth(1)
+        .expect("bounded deadline select")
+        .split("}\n        }")
+        .next()
+        .expect("bounded deadline select body");
+    let biased_at = bounded.find("biased;").expect("deadline-first biased select");
+    let sleep_at = bounded
+        .find("sleep_until(deadline)")
+        .expect("deadline arm");
+    let ready_at = bounded
+        .find("value = &mut future")
+        .expect("backend-ready arm");
+    assert!(
+        biased_at < sleep_at && sleep_at < ready_at,
+        "the composed bound must beat a simultaneously ready backend: {bounded}"
     );
 
     let dispatch = src
@@ -3784,10 +3816,10 @@ fn h3_native_grpc_header_wait_does_not_trust_client_progress() {
         "client-controlled historical progress must not drive backend health attribution"
     );
     let expiry = relay
-        .split("tokio::time::timeout_at(at, header_fut)")
+        .split("await_deadline_first(dispatch_deadline_at, header_fut)")
         .nth(1)
         .expect("header-wait expiry arm")
-        .split("None => header_fut.await")
+        .split("let h3_resp = match head_result")
         .next()
         .expect("bounded header-wait expiry arm");
     assert!(
@@ -3820,6 +3852,14 @@ fn h3_native_grpc_trailer_phase_composes_the_authorization_plan() {
     assert!(
         trailer.contains("trailer_bound.expired_authorization()"),
         "a withheld trailer must be attributed from the captured composition"
+    );
+    assert!(
+        trailer.contains("await_deadline_first(trailer_wait_at, trailer_fut)"),
+        "the trailer wait must refuse an already-elapsed composed bound before polling"
+    );
+    assert!(
+        !trailer.contains("timeout_at(at, trailer_fut)"),
+        "timeout_at polls the trailer future first"
     );
     assert!(
         trailer.contains("downstream_write_bound.deadline()"),

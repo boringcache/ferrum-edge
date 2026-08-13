@@ -10,16 +10,20 @@ use std::time::Duration;
 
 use ferrum_edge::_test_support::{
     BufferedUploadWaitOutcomeForTest, DtlsAuthorizationExpiryForTest, EarlyUploadBoundKind,
-    H3AuthorizedHeadersWrite, H3UploadWaitOutcomeForTest, ProbePumpOutcome, ProbeTransportPoll,
+    H3AuthorizedHeadersWrite, H3BackendOrPeerForTest, H3UploadWaitOutcomeForTest,
+    PrecommitPhaseOutcomeForTest, ProbePumpOutcome, ProbeTransportPoll,
     ResponseCollectBoundForTest, StreamIoSide, UploadPumpProbe,
     attribute_dispatch_phase_bound_for_test, authorization_bounded_header_deadline_for_test,
     authorization_expired_dispatch_placeholder_for_test,
     authorization_expired_pre_commitment_response_for_test,
-    await_authorized_headers_write_for_test, bidirectional_copy_with_authorization_for_test,
+    await_authorized_headers_write_for_test, await_deadline_first_for_test,
+    await_h3_backend_or_peer_for_test, await_precommit_response_phase_for_test,
+    bidirectional_copy_with_authorization_for_test,
     collect_buffered_upload_under_authorization_for_test,
     collect_buffered_upload_under_composed_bound_for_test,
     collect_h3_upload_under_authorization_for_test, compose_buffered_upload_bound_for_test,
     compose_dispatch_phase_bound_for_test, compose_h3_upload_bound_for_test,
+    compose_precommit_response_phase_bound_for_test,
     direct_h2_upload_join_bound_for_test, dispatch_phase_authorization_expiry_for_test,
     dtls_authorization_expired_before_relay_for_test,
     dtls_setup_stage_under_authorization_for_test, precommit_authorization_gate_for_test,
@@ -1310,6 +1314,35 @@ async fn an_already_elapsed_lifetime_refuses_a_setup_stage_outright() {
     );
 }
 
+#[tokio::test(start_paused = true)]
+async fn an_already_elapsed_tcp_setup_bound_never_polls_ready_work() {
+    let now = paused_clock_with_history().await;
+    let plan = plan_at(
+        elapsed_by(now, Duration::from_secs(1)),
+        StreamAuthTermination::CredentialExpired,
+    );
+    let (polled, work) = ready_poll_counter();
+    let result = within_stream_auth_deadline_for_test(Some(plan), work).await;
+    assert_eq!(result, Err(StreamAuthTermination::CredentialExpired));
+    assert_eq!(
+        polled.load(std::sync::atomic::Ordering::SeqCst),
+        0,
+        "an already-elapsed TCP setup bound must not poll a ready stage"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_live_tcp_setup_bound_completes_ready_work() {
+    let plan = plan_at(
+        tokio::time::Instant::now() + Duration::from_secs(30),
+        StreamAuthTermination::CredentialExpired,
+    );
+    let (polled, work) = ready_poll_counter();
+    let result = within_stream_auth_deadline_for_test(Some(plan), work).await;
+    assert_eq!(result, Ok(()));
+    assert_eq!(polled.load(std::sync::atomic::Ordering::SeqCst), 1);
+}
+
 #[tokio::test]
 async fn the_setup_expiry_kind_is_client_side_and_health_neutral() {
     use ferrum_edge::proxy::stream_error::{StreamSetupError, StreamSetupKind};
@@ -1613,6 +1646,37 @@ async fn a_composed_operator_window_is_never_rebased_past_the_credential() {
 }
 
 #[tokio::test(start_paused = true)]
+async fn an_already_elapsed_composed_operator_bound_never_polls_a_ready_upload() {
+    let bound = compose_buffered_upload_bound_for_test(None, 100);
+    assert_eq!(bound.kind(), Some(EarlyUploadBoundKind::OperatorTimeout));
+    let plan = upload_plan(
+        Duration::from_millis(150),
+        StreamAuthTermination::CredentialExpired,
+    );
+    tokio::time::advance(Duration::from_millis(200)).await;
+
+    let polled = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let outcome = collect_buffered_upload_under_composed_bound_for_test(
+        ready_ok_h3_upload(&polled),
+        bound,
+        100,
+        Some(plan),
+    )
+    .await;
+
+    assert_eq!(
+        outcome,
+        BufferedUploadWaitOutcomeForTest::TimedOut,
+        "a strictly earlier composed operator bound stays TimedOut after both instants pass"
+    );
+    assert_eq!(
+        polled.load(std::sync::atomic::Ordering::SeqCst),
+        0,
+        "an already-elapsed operator bound must not poll a ready upload"
+    );
+}
+
+#[tokio::test(start_paused = true)]
 async fn a_credential_earlier_than_the_composed_bound_still_arms_after_a_delay() {
     let start = tokio::time::Instant::now();
     // Operator window at +300ms; a second composition taken 120ms later would
@@ -1685,6 +1749,38 @@ async fn a_composed_rpc_deadline_keeps_its_attribution_across_the_gap() {
     assert_eq!(
         tokio::time::Instant::now(),
         start + Duration::from_millis(120)
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn an_already_elapsed_composed_rpc_deadline_never_polls_a_ready_upload() {
+    let start = tokio::time::Instant::now();
+    let bound =
+        compose_buffered_upload_bound_for_test(Some(start + Duration::from_millis(100)), 5_000);
+    let plan = upload_plan(
+        Duration::from_millis(150),
+        StreamAuthTermination::CredentialExpired,
+    );
+    tokio::time::advance(Duration::from_millis(200)).await;
+
+    let polled = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let outcome = collect_buffered_upload_under_composed_bound_for_test(
+        ready_ok_h3_upload(&polled),
+        bound,
+        5_000,
+        Some(plan),
+    )
+    .await;
+
+    assert_eq!(
+        outcome,
+        BufferedUploadWaitOutcomeForTest::DeadlineExceeded,
+        "a strictly earlier client deadline stays DeadlineExceeded after both instants pass"
+    );
+    assert_eq!(
+        polled.load(std::sync::atomic::Ordering::SeqCst),
+        0,
+        "an already-elapsed protocol bound must not poll a ready upload"
     );
 }
 
@@ -3348,10 +3444,22 @@ fn native_h3_grpc_dispatch_phases_compose_the_authorization_lifetime() {
     // had also passed.
     assert_eq!(
         dispatch
-            .matches("Err(_) => match dispatch_bound.expired_authorization() {")
+            .matches("Err(()) => match dispatch_bound.expired_authorization() {")
             .count(),
         2,
         "a native-H3 gRPC dispatch phase re-derives its owner from the clock"
+    );
+    assert_eq!(
+        dispatch
+            .matches("await_deadline_first(dispatch_deadline_at,")
+            .count(),
+        2,
+        "both pre-commitment native-H3 gRPC waits must use the shared expiry-first primitive"
+    );
+    assert!(
+        !dispatch.contains("timeout_at(at, open_fut)")
+            && !dispatch.contains("timeout_at(at, header_fut)"),
+        "timeout_at polls the protected future first, so an already-elapsed bound would accept it"
     );
     let bounded_phases = dispatch
         .split("let dispatch_bound =")
@@ -3452,13 +3560,19 @@ fn cross_protocol_plain_precommit_401_is_grace_bounded_and_health_neutral() {
         .split("if let Some(termination) = plain_write_bound.expired_authorization() {")
         .skip(1)
         .collect();
-    assert!(
-        header_expiry_arms.len() >= 3,
-        "buffered-header, buffered-body, and streaming-header authorization arms must remain"
+    let header_write_arms: Vec<&str> = header_expiry_arms
+        .iter()
+        .copied()
+        .filter(|arm| arm.contains("write_plain_grpc_web_client_deadline_without_hooks("))
+        .collect();
+    assert_eq!(
+        header_write_arms.len(),
+        2,
+        "buffered and streaming pre-commitment response-header authorization arms must remain"
     );
     for (label, arm) in [
-        ("buffered response-header", header_expiry_arms[0]),
-        ("streaming response-header", header_expiry_arms[2]),
+        ("buffered response-header", header_write_arms[0]),
+        ("streaming response-header", header_write_arms[1]),
     ] {
         let arm = arm
             .split("return write_plain_grpc_web_client_deadline_without_hooks(")
@@ -3477,7 +3591,11 @@ fn cross_protocol_plain_precommit_401_is_grace_bounded_and_health_neutral() {
             "{label} expiry must not use the unbounded reject writer"
         );
     }
-    let postcommit = header_expiry_arms[1]
+    let postcommit = header_expiry_arms
+        .iter()
+        .copied()
+        .find(|arm| arm.contains("append_plain_grpc_web_client_deadline("))
+        .expect("post-commitment buffered-body authorization arm")
         .split("append_plain_grpc_web_client_deadline(")
         .next()
         .expect("bounded post-commitment buffered-body authorization arm");
@@ -4050,6 +4168,16 @@ fn ready_ok_h3_upload(
     })
 }
 
+fn ready_unit(
+    polled: &Arc<std::sync::atomic::AtomicUsize>,
+) -> impl std::future::Future<Output = ()> {
+    let polled = Arc::clone(polled);
+    std::future::poll_fn(move |_cx| {
+        polled.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        std::task::Poll::Ready(())
+    })
+}
+
 #[tokio::test(start_paused = true)]
 async fn a_late_woken_h3_upload_keeps_a_strictly_earlier_client_deadline_as_the_clients_own() {
     let now = paused_clock_with_history().await;
@@ -4235,7 +4363,7 @@ async fn an_operator_upload_timeout_earlier_than_the_composed_bound_stays_timed_
     let task = tokio::spawn(async move {
         collect_h3_upload_under_authorization_for_test(upload, bound, 10).await
     });
-    // Register the `timeout_at` waiter before advancing the paused clock.
+    // Register the waiter before advancing the paused clock.
     tokio::task::yield_now().await;
     tokio::time::advance(Duration::from_millis(10)).await;
     tokio::task::yield_now().await;
@@ -4357,8 +4485,8 @@ fn every_native_h3_upload_site_attributes_from_the_captured_composition() {
     );
     assert!(
         collector.contains("EarlyUploadBoundKind::OperatorTimeout)) => {")
-            && collector.contains("H3RequestBodyReadError::TimedOut)?"),
-        "the operator whole-upload stall guard keeps its own precedence and terminal"
+            && collector.contains("H3RequestBodyReadError::TimedOut"),
+        "the operator whole-upload stall guard keeps its own precedence and TimedOut"
     );
     assert!(
         !collector.contains("record_termination(") && !collector.contains("record_once("),
@@ -4373,8 +4501,12 @@ fn every_native_h3_upload_site_attributes_from_the_captured_composition() {
         .next()
         .expect("bounded operator stall-guard arm");
     assert!(
-        operator_arm.contains("timeout_at(") && operator_arm.contains("TimedOut"),
-        "the operator stall guard keeps upload-first timeout_at semantics and TimedOut"
+        operator_arm.contains("await_deadline_first(") && operator_arm.contains("TimedOut"),
+        "the operator stall guard is expiry-first and keeps TimedOut"
+    );
+    assert!(
+        !operator_arm.contains("timeout_at("),
+        "timeout_at polls the upload first, so an already-elapsed operator bound would accept a ready FIN"
     );
 
     let rpc_deadline_arm = collector
@@ -4385,29 +4517,12 @@ fn every_native_h3_upload_site_attributes_from_the_captured_composition() {
         .next()
         .expect("bounded absolute-bound arm");
     assert!(
+        rpc_deadline_arm.contains("await_deadline_first("),
+        "the absolute bound must use the shared expiry-first wait"
+    );
+    assert!(
         !rpc_deadline_arm.contains("timeout_at("),
         "timeout_at polls the upload first, so an already-elapsed bound would accept a ready FIN"
-    );
-    let precheck_at = rpc_deadline_arm
-        .find("if tokio::time::Instant::now() >= effective_deadline {")
-        .expect("the already-elapsed refusal");
-    let select_at = rpc_deadline_arm
-        .find("tokio::select! {")
-        .expect("the deadline-biased race");
-    assert!(
-        precheck_at < select_at,
-        "an already-elapsed bound must refuse before select! can pick a ready upload"
-    );
-    let select = &rpc_deadline_arm[select_at..];
-    let biased_at = select.find("biased;").expect("biased select");
-    let sleep_at = select
-        .find("sleep_until(effective_deadline)")
-        .expect("the captured-bound arm");
-    let collect_at = select.find("result = collect").expect("the upload arm");
-    assert!(
-        biased_at < sleep_at && sleep_at < collect_at,
-        "the captured bound must be the FIRST select arm so an exact-deadline tie \
-         chooses the composition, not a simultaneously-ready FIN"
     );
 
     // The no-plan wrapper the cross-protocol bridge uses composes against
@@ -4554,6 +4669,408 @@ async fn an_unauthenticated_precommit_phase_never_reports_an_authorization_expir
     assert_eq!(bound.authorization_deadline_at(), None);
     tokio::time::sleep(Duration::from_secs(2)).await;
     assert_eq!(bound.expired_authorization(), None);
+}
+
+fn ready_poll_counter() -> (
+    Arc<std::sync::atomic::AtomicUsize>,
+    impl std::future::Future<Output = ()>,
+) {
+    let polled = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    (Arc::clone(&polled), ready_unit(&polled))
+}
+
+#[tokio::test(start_paused = true)]
+async fn an_elapsed_deadline_first_wait_never_polls_ready_work() {
+    let now = paused_clock_with_history().await;
+    let (polled, work) = ready_poll_counter();
+    assert_eq!(
+        await_deadline_first_for_test(Some(elapsed_by(now, Duration::from_secs(1))), work).await,
+        Err(())
+    );
+    assert_eq!(polled.load(std::sync::atomic::Ordering::SeqCst), 0);
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_live_deadline_first_wait_completes_ready_work() {
+    let (polled, work) = ready_poll_counter();
+    assert_eq!(
+        await_deadline_first_for_test(
+            Some(tokio::time::Instant::now() + Duration::from_secs(30)),
+            work
+        )
+        .await,
+        Ok(())
+    );
+    assert_eq!(polled.load(std::sync::atomic::Ordering::SeqCst), 1);
+}
+
+#[tokio::test(start_paused = true)]
+async fn an_unbounded_deadline_first_wait_keeps_the_no_timer_hot_path() {
+    let (polled, work) = ready_poll_counter();
+    assert_eq!(await_deadline_first_for_test(None, work).await, Ok(()));
+    assert_eq!(polled.load(std::sync::atomic::Ordering::SeqCst), 1);
+}
+
+#[tokio::test(start_paused = true)]
+async fn an_elapsed_precommit_authorization_bound_never_polls_ready_work() {
+    let now = paused_clock_with_history().await;
+    let bound = compose_precommit_response_phase_bound_for_test(
+        None,
+        plan_elapsed(
+            now,
+            Duration::from_secs(60),
+            StreamAuthTermination::CredentialExpired,
+        ),
+    );
+    let (polled, work) = ready_poll_counter();
+    assert_eq!(
+        await_precommit_response_phase_for_test(bound, work).await,
+        PrecommitPhaseOutcomeForTest::ExpiredAuthorization(
+            StreamAuthTermination::CredentialExpired
+        )
+    );
+    assert_eq!(polled.load(std::sync::atomic::Ordering::SeqCst), 0);
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_strictly_earlier_precommit_protocol_bound_never_polls_ready_work() {
+    let now = paused_clock_with_history().await;
+    let bound = compose_precommit_response_phase_bound_for_test(
+        Some(elapsed_by(now, Duration::from_secs(60))),
+        plan_elapsed(
+            now,
+            Duration::from_secs(30),
+            StreamAuthTermination::CredentialExpired,
+        ),
+    );
+    let (polled, work) = ready_poll_counter();
+    assert_eq!(
+        await_precommit_response_phase_for_test(bound, work).await,
+        PrecommitPhaseOutcomeForTest::ExpiredProtocol
+    );
+    assert_eq!(polled.load(std::sync::atomic::Ordering::SeqCst), 0);
+}
+
+#[tokio::test(start_paused = true)]
+async fn an_exact_precommit_tie_never_polls_ready_work_and_goes_to_authorization() {
+    let now = paused_clock_with_history().await;
+    let at = elapsed_by(now, Duration::from_secs(30));
+    let bound = compose_precommit_response_phase_bound_for_test(
+        Some(at),
+        Some(plan_at(at, StreamAuthTermination::CredentialExpired)),
+    );
+    let (polled, work) = ready_poll_counter();
+    assert_eq!(
+        await_precommit_response_phase_for_test(bound, work).await,
+        PrecommitPhaseOutcomeForTest::ExpiredAuthorization(
+            StreamAuthTermination::CredentialExpired
+        )
+    );
+    assert_eq!(polled.load(std::sync::atomic::Ordering::SeqCst), 0);
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_live_precommit_bound_completes_ready_work() {
+    let bound = compose_precommit_response_phase_bound_for_test(
+        Some(tokio::time::Instant::now() + Duration::from_secs(30)),
+        plan_after(
+            Duration::from_secs(60),
+            StreamAuthTermination::CredentialExpired,
+        ),
+    );
+    let (polled, work) = ready_poll_counter();
+    assert_eq!(
+        await_precommit_response_phase_for_test(bound, work).await,
+        PrecommitPhaseOutcomeForTest::Completed(())
+    );
+    assert_eq!(polled.load(std::sync::atomic::Ordering::SeqCst), 1);
+}
+
+#[tokio::test(start_paused = true)]
+async fn an_elapsed_response_collect_authorization_bound_never_polls_ready_work() {
+    let now = paused_clock_with_history().await;
+    let plan = (
+        plan_at(
+            elapsed_by(now, Duration::from_secs(60)),
+            StreamAuthTermination::CredentialExpired,
+        ),
+        StreamAuthProtocolFamily::Http,
+        ferrum_edge::proxy::auth_lifetime::StreamAuthTerminationLatch::default(),
+    );
+    let (polled, work) = ready_poll_counter();
+    let outcome = ferrum_edge::_test_support::collect_response_under_authorization_for_test(
+        work,
+        None,
+        Some(&plan),
+    )
+    .await;
+    assert_eq!(
+        outcome,
+        ResponseCollectBoundForTest::AuthorizationExpired
+    );
+    assert_eq!(polled.load(std::sync::atomic::Ordering::SeqCst), 0);
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_strictly_earlier_response_collect_protocol_bound_never_polls_ready_work() {
+    let now = paused_clock_with_history().await;
+    let plan = (
+        plan_at(
+            elapsed_by(now, Duration::from_secs(30)),
+            StreamAuthTermination::CredentialExpired,
+        ),
+        StreamAuthProtocolFamily::Http,
+        ferrum_edge::proxy::auth_lifetime::StreamAuthTerminationLatch::default(),
+    );
+    let (polled, work) = ready_poll_counter();
+    let outcome = ferrum_edge::_test_support::collect_response_under_authorization_for_test(
+        work,
+        Some(elapsed_by(now, Duration::from_secs(60))),
+        Some(&plan),
+    )
+    .await;
+    assert_eq!(outcome, ResponseCollectBoundForTest::RpcDeadline);
+    assert_eq!(polled.load(std::sync::atomic::Ordering::SeqCst), 0);
+}
+
+#[tokio::test(start_paused = true)]
+async fn an_exact_response_collect_tie_never_polls_ready_work_and_goes_to_authorization() {
+    let now = paused_clock_with_history().await;
+    let at = elapsed_by(now, Duration::from_secs(30));
+    let plan = (
+        plan_at(at, StreamAuthTermination::CredentialExpired),
+        StreamAuthProtocolFamily::Http,
+        ferrum_edge::proxy::auth_lifetime::StreamAuthTerminationLatch::default(),
+    );
+    let (polled, work) = ready_poll_counter();
+    let outcome = ferrum_edge::_test_support::collect_response_under_authorization_for_test(
+        work,
+        Some(at),
+        Some(&plan),
+    )
+    .await;
+    assert_eq!(
+        outcome,
+        ResponseCollectBoundForTest::AuthorizationExpired
+    );
+    assert_eq!(polled.load(std::sync::atomic::Ordering::SeqCst), 0);
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_live_response_collect_bound_completes_ready_work() {
+    let plan = response_plan(
+        Duration::from_secs(30),
+        StreamAuthTermination::CredentialExpired,
+    );
+    let (polled, work) = ready_poll_counter();
+    let outcome = ferrum_edge::_test_support::collect_response_under_authorization_for_test(
+        work,
+        None,
+        Some(&plan),
+    )
+    .await;
+    assert_eq!(outcome, ResponseCollectBoundForTest::Completed);
+    assert_eq!(polled.load(std::sync::atomic::Ordering::SeqCst), 1);
+}
+
+#[tokio::test(start_paused = true)]
+async fn an_elapsed_h3_backend_wait_never_polls_a_ready_backend() {
+    let now = paused_clock_with_history().await;
+    let (polled, work) = ready_poll_counter();
+    let outcome = await_h3_backend_or_peer_for_test(
+        Some(elapsed_by(now, Duration::from_secs(1))),
+        work,
+    )
+    .await;
+    assert_eq!(outcome, H3BackendOrPeerForTest::Deadline);
+    assert_eq!(polled.load(std::sync::atomic::Ordering::SeqCst), 0);
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_live_h3_backend_wait_completes_ready_work() {
+    let (polled, work) = ready_poll_counter();
+    let outcome = await_h3_backend_or_peer_for_test(
+        Some(tokio::time::Instant::now() + Duration::from_secs(30)),
+        work,
+    )
+    .await;
+    assert_eq!(outcome, H3BackendOrPeerForTest::Ready(()));
+    assert_eq!(polled.load(std::sync::atomic::Ordering::SeqCst), 1);
+}
+
+#[tokio::test(start_paused = true)]
+async fn an_unbounded_h3_backend_wait_keeps_the_no_timer_hot_path() {
+    let (polled, work) = ready_poll_counter();
+    let outcome = await_h3_backend_or_peer_for_test(None, work).await;
+    assert_eq!(outcome, H3BackendOrPeerForTest::Ready(()));
+    assert_eq!(polled.load(std::sync::atomic::Ordering::SeqCst), 1);
+}
+
+#[tokio::test(start_paused = true)]
+async fn cross_protocol_owner_composition_keeps_a_strictly_earlier_client_deadline() {
+    let now = paused_clock_with_history().await;
+    let bound = ComposedAuthBound::compose(
+        Some(elapsed_by(now, Duration::from_secs(60))),
+        plan_elapsed(
+            now,
+            Duration::from_secs(30),
+            StreamAuthTermination::CredentialExpired,
+        ),
+    );
+    assert_eq!(
+        bound.expired_authorization(),
+        None,
+        "a strictly earlier client deadline must keep client ownership after both instants pass"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn cross_protocol_owner_composition_gives_an_exact_tie_to_authorization() {
+    let now = paused_clock_with_history().await;
+    let at = elapsed_by(now, Duration::from_secs(30));
+    let bound = ComposedAuthBound::compose(
+        Some(at),
+        Some(plan_at(at, StreamAuthTermination::CredentialExpired)),
+    );
+    assert_eq!(
+        bound.expired_authorization(),
+        Some(StreamAuthTermination::CredentialExpired)
+    );
+}
+
+#[test]
+fn composed_authorization_waits_use_the_shared_expiry_first_primitive() {
+    let plugins = include_str!("../../../src/plugins/mod.rs");
+    let helper = plugins
+        .split("pub(crate) async fn await_deadline_first<F, T>(")
+        .nth(1)
+        .expect("shared expiry-first wait")
+        .split("pub(crate) async fn await_precommit_response_phase<F, T>(")
+        .next()
+        .expect("bounded expiry-first wait");
+    assert!(
+        helper.contains("if tokio::time::Instant::now() >= deadline"),
+        "an already-elapsed bound must refuse before the protected future is polled"
+    );
+    let biased_at = helper.find("biased;").expect("biased select");
+    let sleep_at = helper
+        .find("sleep_until(deadline)")
+        .expect("deadline arm");
+    let future_at = helper.find("result = future").expect("protected-work arm");
+    assert!(
+        biased_at < sleep_at && sleep_at < future_at,
+        "the captured bound must be the first select arm"
+    );
+    assert!(
+        !helper.contains("timeout_at("),
+        "timeout_at polls the inner future first"
+    );
+
+    let precommit = plugins
+        .split("pub(crate) async fn await_precommit_response_phase<F, T>(")
+        .nth(1)
+        .expect("precommit wait")
+        .split("impl PrecommitPhaseResult<PluginResult>")
+        .next()
+        .expect("bounded precommit wait");
+    assert!(
+        precommit.contains("await_deadline_first(bound.deadline(), future)"),
+        "the composed precommit path must use the expiry-first primitive"
+    );
+    assert!(
+        !precommit.contains("await_grpc_deadline("),
+        "request-plugin timeout_at semantics must not leak into the composed precommit path"
+    );
+
+    let proxy = include_str!("../../../src/proxy/mod.rs");
+    let collect = proxy
+        .split("pub(crate) async fn collect_response_under_authorization<F>(")
+        .nth(1)
+        .expect("buffered response collect")
+        .split("pub(crate) fn dispatch_phase_authorization_expiry(")
+        .next()
+        .expect("bounded buffered response collect");
+    assert!(collect.contains("await_deadline_first(bound.at, collect)"));
+    assert!(!collect.contains("timeout_at("));
+
+    assert!(
+        proxy
+            .matches("await_deadline_first(send_bound.at, req_builder.send())")
+            .count()
+            >= 2,
+        "reqwest response-header waits must use the expiry-first primitive"
+    );
+
+    let cross = include_str!("../../../src/http3/cross_protocol.rs");
+    let dispatch = cross
+        .split("async fn dispatch_plain<S>(")
+        .nth(1)
+        .expect("cross-protocol plain dispatcher")
+        .split("async fn dispatch_grpc<S>(")
+        .next()
+        .expect("bounded cross-protocol plain dispatcher");
+    assert_eq!(
+        dispatch
+            .matches("await_deadline_first(\n                        plain_write_bound.deadline()")
+            .count()
+            + dispatch
+                .matches("await_deadline_first(\n                    plain_write_bound.deadline()")
+                .count(),
+        2,
+        "both client acquisitions must wait under the captured composed bound"
+    );
+    assert!(
+        dispatch.contains("plain_write_bound.deadline(),")
+            && dispatch.contains("await_h3_backend_or_peer("),
+        "the buffered header wait must use the captured composed bound"
+    );
+    assert!(
+        dispatch.contains("upload_deadline_active")
+            && dispatch.contains("plain_write_bound.expired_authorization()"),
+        "the streaming upload loop must race the composed earliest bound and keep typed ownership"
+    );
+    assert!(
+        !dispatch.contains("grpc_web_deadline_active")
+            && !dispatch.contains("upload_auth_deadline_active"),
+        "independently ordered authorization and client-deadline arms must not remain"
+    );
+
+    let tcp = include_str!("../../../src/proxy/tcp_proxy.rs");
+    let setup = tcp
+        .split("pub(crate) async fn within_stream_auth_deadline<F>(")
+        .nth(1)
+        .expect("TCP setup wait")
+        .split("pub(crate) async fn retry_backoff_within_stream_auth_deadline(")
+        .next()
+        .expect("bounded TCP setup wait");
+    assert!(setup.contains("await_deadline_first(Some(plan.at), stage)"));
+    assert!(
+        !setup.contains("timeout_at("),
+        "timeout_at polls a ready setup stage after the captured bound elapsed"
+    );
+    let backoff = tcp
+        .split("pub(crate) async fn retry_backoff_within_stream_auth_deadline(")
+        .nth(1)
+        .expect("TCP retry backoff")
+        .split("/// Settle a post-admission setup-phase authorization expiry.")
+        .next()
+        .expect("bounded TCP retry backoff");
+    assert!(
+        backoff.contains("await_deadline_first(Some(plan.at), tokio::time::sleep(delay))"),
+        "retry backoff must refuse an already-elapsed authorization bound"
+    );
+    assert!(!backoff.contains("timeout_at("));
+
+    let util = include_str!("../../../src/http3/stream_util.rs");
+    let headers = util
+        .split("pub(crate) async fn await_response_write_before_deadline<F, T, E>(")
+        .nth(1)
+        .expect("H3 write wait")
+        .split("pub(crate) async fn await_terminal_response_write_before_deadline<F, T, E>(")
+        .next()
+        .expect("bounded H3 write wait");
+    assert!(headers.contains("await_deadline_first(deadline, write)"));
+    assert!(!headers.contains("timeout_at("));
 }
 
 // --- Detached committed-response cleanup ------------------------------------

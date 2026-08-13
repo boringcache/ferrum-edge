@@ -386,17 +386,16 @@ where
     match plan {
         Some(plan) => {
             // `timeout_at` polls the wrapped future ONCE before it consults the
-            // deadline, so an already-elapsed plan would still enter the stage
-            // and let it write a backend byte (DNS lookup, connect, handshake,
-            // outbound PROXY v2 header) on a credential that is no longer
-            // authorizing this session. Refuse outright instead: the stage
-            // future is dropped unpolled.
-            if tokio::time::Instant::now() >= plan.at {
-                return Err(plan.termination);
+            // deadline, so an already-elapsed plan — or a late wake after both
+            // the stage and the deadline are ready — would still enter the
+            // stage and let it write a backend byte (DNS lookup, connect,
+            // handshake, outbound PROXY v2 header) on a credential that is no
+            // longer authorizing this session. The shared expiry-first wait
+            // drops the stage unpolled.
+            match crate::plugins::await_deadline_first(Some(plan.at), stage).await {
+                Ok(output) => Ok(output),
+                Err(()) => Err(plan.termination),
             }
-            tokio::time::timeout_at(plan.at, stage)
-                .await
-                .map_err(|_| plan.termination)
         }
         None => Ok(stage.await),
     }
@@ -427,12 +426,10 @@ pub(crate) async fn retry_backoff_within_stream_auth_deadline(
         tokio::time::sleep(delay).await;
         return Ok(());
     };
-    if tokio::time::Instant::now() >= plan.at {
-        return Err(plan.termination);
+    match crate::plugins::await_deadline_first(Some(plan.at), tokio::time::sleep(delay)).await {
+        Ok(()) => Ok(()),
+        Err(()) => Err(plan.termination),
     }
-    tokio::time::timeout_at(plan.at, tokio::time::sleep(delay))
-        .await
-        .map_err(|_| plan.termination)
 }
 
 /// Settle a post-admission setup-phase authorization expiry.

@@ -3674,25 +3674,29 @@ where
         .await
         .map_err(AuthorizedUploadWaitError::Wait);
     };
-    let protocol_absolute = protocol_bound.map(|(at, _)| at);
-    let bounded = collect_request_body_with_composed_bound(
-        collect,
-        protocol_bound,
-        request_body_read_timeout_ms,
-    );
-    if protocol_absolute.is_some_and(|protocol| protocol < plan.at) {
-        // The protocol's own absolute bound is strictly earlier, so it owns
-        // this phase's terminal no matter how late the wait is observed. This
-        // is the same instant `bounded` will await — never a recomposed one.
-        return bounded.await.map_err(AuthorizedUploadWaitError::Wait);
-    }
-    tokio::select! {
-        biased;
-        () = tokio::time::sleep_until(plan.at) => {
-            latch.record_once(plan.termination, *family);
-            Err(AuthorizedUploadWaitError::AuthorizationExpired(plan.termination))
+    // Authenticated collects are expiry-first against the captured earliest
+    // bound. `timeout_at` would still poll an immediately-ready upload after
+    // that instant elapsed; a strictly earlier protocol bound keeps its own
+    // terminal even when authorization has also passed by the time we wake.
+    match protocol_bound {
+        Some((at, kind)) if at < plan.at => {
+            match crate::plugins::await_deadline_first(Some(at), collect).await {
+                Ok(result) => Ok(result),
+                Err(()) => Err(AuthorizedUploadWaitError::Wait(match kind {
+                    EarlyUploadBoundKind::OperatorTimeout => RequestBodyWaitError::TimedOut,
+                    EarlyUploadBoundKind::RpcDeadline => RequestBodyWaitError::DeadlineExceeded,
+                })),
+            }
         }
-        result = bounded => result.map_err(AuthorizedUploadWaitError::Wait),
+        _ => match crate::plugins::await_deadline_first(Some(plan.at), collect).await {
+            Ok(result) => Ok(result),
+            Err(()) => {
+                latch.record_once(plan.termination, *family);
+                Err(AuthorizedUploadWaitError::AuthorizationExpired(
+                    plan.termination,
+                ))
+            }
+        },
     }
 }
 
@@ -37455,7 +37459,7 @@ pub(crate) async fn proxy_to_backend_retry(
         request_ctx.grpc_deadline_at(),
         send_auth_deadline.as_ref(),
     );
-    let send_future = crate::plugins::await_grpc_deadline(send_bound.at, req_builder.send());
+    let send_future = crate::plugins::await_deadline_first(send_bound.at, req_builder.send());
     let send_result = match send_future.await {
         Ok(result) => result,
         Err(()) => {
@@ -40493,7 +40497,7 @@ async fn proxy_to_backend(
         request_ctx.grpc_deadline_at(),
         send_auth_deadline.as_ref(),
     );
-    let send_future = crate::plugins::await_grpc_deadline(send_bound.at, req_builder.send());
+    let send_future = crate::plugins::await_deadline_first(send_bound.at, req_builder.send());
     let send_result = match send_future.await {
         Ok(result) => result,
         Err(()) => {
@@ -42867,12 +42871,9 @@ where
     F: std::future::Future,
 {
     let bound = compose_dispatch_phase_auth_bound(grpc_deadline_at, auth);
-    let Some(at) = bound.at else {
-        return Ok(collect.await);
-    };
-    match tokio::time::timeout_at(at, collect).await {
+    match crate::plugins::await_deadline_first(bound.at, collect).await {
         Ok(output) => Ok(output),
-        Err(_) => match dispatch_phase_authorization_expiry(bound, auth) {
+        Err(()) => match dispatch_phase_authorization_expiry(bound, auth) {
             Some(_) => Err(ResponseCollectBound::AuthorizationExpired),
             None => Err(ResponseCollectBound::RpcDeadline),
         },
@@ -43850,7 +43851,7 @@ async fn proxy_to_backend_hbone(
     };
     let send_bound = compose_dispatch_phase_auth_bound(read_deadline, send_auth_deadline.as_ref());
     let response = if let Some(send_deadline) = send_bound.at {
-        match tokio::time::timeout_at(send_deadline, send_fut).await {
+        match crate::plugins::await_deadline_first(Some(send_deadline), send_fut).await {
             Ok(Ok(response)) => response,
             Ok(Err(err)) => {
                 if body_size_exceeded.load(Ordering::Acquire) {
@@ -44573,7 +44574,7 @@ async fn proxy_to_backend_unix(
             let send_bound =
                 compose_dispatch_phase_auth_bound(read_deadline, send_auth_deadline.as_ref());
             if let Some(send_deadline) = send_bound.at {
-                match tokio::time::timeout_at(send_deadline, send_fut).await {
+                match crate::plugins::await_deadline_first(Some(send_deadline), send_fut).await {
                     Ok(result) => result,
                     Err(_) => {
                         if body_size_exceeded.load(Ordering::Acquire) {
@@ -45902,7 +45903,7 @@ async fn proxy_to_backend_mesh_mtls(
         send_auth_deadline.as_ref(),
     );
     let send_result = if let Some(deadline) = send_bound.at {
-        match tokio::time::timeout_at(deadline, send_fut).await {
+        match crate::plugins::await_deadline_first(Some(deadline), send_fut).await {
             Ok(result) => result,
             Err(_) => {
                 if body_size_exceeded.load(Ordering::Acquire) {
@@ -46786,7 +46787,7 @@ async fn proxy_to_backend_http2(
         upload_auth_deadline.as_ref(),
     );
     let response = if let Some((deadline, deadline_source)) = header_deadline {
-        match tokio::time::timeout_at(deadline, h2_send_fut).await {
+        match crate::plugins::await_deadline_first(Some(deadline), h2_send_fut).await {
             Ok(Ok(resp)) => resp,
             Ok(Err(e)) => return map_h2_err(e),
             Err(_) => {
@@ -46900,7 +46901,9 @@ async fn proxy_to_backend_http2(
         );
         let outcome = match upload_bound {
             Some((upload_deadline, bound_kind)) => {
-                match tokio::time::timeout_at(upload_deadline, body_completion_rx).await {
+                match crate::plugins::await_deadline_first(Some(upload_deadline), body_completion_rx)
+                    .await
+                {
                     Ok(received) => received.ok(),
                     Err(_) => {
                         // `send_request` has already yielded response headers, so

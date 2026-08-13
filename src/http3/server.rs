@@ -128,9 +128,11 @@ where
 /// on the first poll would be accepted even when this captured bound has
 /// already elapsed. An already-elapsed bound therefore refuses without polling
 /// the upload, and a biased deadline-first race makes an exact-deadline tie
-/// choose the captured owner. The operator stall guard keeps `timeout_at`
-/// (upload-first): a completed drain is not a stall, and that arm never
-/// attributes authorization.
+/// choose the captured owner. The operator stall guard uses the same
+/// expiry-first wait when it is the captured earliest bound: a ready upload
+/// must not complete after that instant, especially once authorization has
+/// also elapsed, and the terminal stays the operator's `TimedOut` rather than
+/// a fabricated authorization expiry.
 pub(crate) async fn collect_h3_request_body_under_authorization<F, T, E>(
     collect: F,
     bound: crate::proxy::auth_lifetime::ComposedAuthBound,
@@ -145,13 +147,14 @@ where
     // is very large. Operator timeout `0` disables only that fresh bound.
     match crate::proxy::compose_early_upload_bound(bound.deadline(), request_body_read_timeout_ms) {
         Some((effective_deadline, crate::proxy::EarlyUploadBoundKind::OperatorTimeout)) => {
-            // Stall-guard semantics: an immediately-ready upload still
-            // completes even if this fresh operator window has already
-            // elapsed. Authorization expiry is not this arm's job.
-            tokio::time::timeout_at(effective_deadline, collect)
-                .await
-                .map_err(|_| H3RequestBodyReadError::TimedOut)?
-                .map_err(H3RequestBodyReadError::Read)
+            // The operator stall is the captured earliest bound. An
+            // already-elapsed window must not poll a ready upload, and a
+            // simultaneous ready still reports TimedOut — never authorization,
+            // even if the later credential deadline has also passed.
+            match crate::plugins::await_deadline_first(Some(effective_deadline), collect).await {
+                Ok(result) => result.map_err(H3RequestBodyReadError::Read),
+                Err(()) => Err(H3RequestBodyReadError::TimedOut),
+            }
         }
         Some((effective_deadline, crate::proxy::EarlyUploadBoundKind::RpcDeadline)) => {
             // Evaluated only once the bound has actually fired, and only to
@@ -159,19 +162,11 @@ where
             // still consulted inside `expired_authorization` so a bound
             // that fired for some other reason can never fabricate an
             // expiry; it is never consulted to CHOOSE between the owners.
-            if tokio::time::Instant::now() >= effective_deadline {
-                return Err(H3RequestBodyReadError::DeadlineExceeded(
+            match crate::plugins::await_deadline_first(Some(effective_deadline), collect).await {
+                Ok(result) => result.map_err(H3RequestBodyReadError::Read),
+                Err(()) => Err(H3RequestBodyReadError::DeadlineExceeded(
                     bound.expired_authorization(),
-                ));
-            }
-            tokio::select! {
-                biased;
-                () = tokio::time::sleep_until(effective_deadline) => {
-                    Err(H3RequestBodyReadError::DeadlineExceeded(
-                        bound.expired_authorization(),
-                    ))
-                }
-                result = collect => result.map_err(H3RequestBodyReadError::Read),
+                )),
             }
         }
         None => collect_h3_request_body_with_timeout(collect, request_body_read_timeout_ms).await,
@@ -11546,41 +11541,38 @@ async fn dispatch_grpc_native_h3(
                 .await
         }
     };
-    let opened = match dispatch_deadline_at {
-        Some(at) => match tokio::time::timeout_at(at, open_fut).await {
-            Ok(result) => Ok(result),
-            // Authorization is checked FIRST: when the composed bound fired
-            // because the admitted credential elapsed, the terminal is the
-            // fixed pre-commitment one, not a backend timeout — and the
-            // capability downgrade below must not run for a gateway policy
-            // decision. A tie between the two bounds is attributed here,
-            // matching every other composed seam.
-            Err(_) => match dispatch_bound.expired_authorization() {
-                Some(termination) => Err(termination),
-                // The COLD connect (QUIC/TLS/H3) was still in flight. Under the
-                // operator `backend_read_timeout_ms` FALLBACK that is a genuine
-                // PRE-WIRE connect failure (`connection_error=true` + capability
-                // downgrade); when the CLIENT's own `grpc-timeout` drove the
-                // expiry the client merely chose a deadline too tight to connect,
-                // which is not a backend capability/health signal.
-                None if client_deadline_present => Ok(Err(
-                    crate::http3::client::H3PoolError::read_timeout(anyhow::anyhow!(
-                        "client grpc-timeout deadline exceeded before the backend stream opened"
-                    )),
+    let opened = match crate::plugins::await_deadline_first(dispatch_deadline_at, open_fut).await {
+        Ok(result) => Ok(result),
+        // Authorization is checked FIRST: when the composed bound fired
+        // because the admitted credential elapsed, the terminal is the
+        // fixed pre-commitment one, not a backend timeout — and the
+        // capability downgrade below must not run for a gateway policy
+        // decision. A tie between the two bounds is attributed here,
+        // matching every other composed seam.
+        Err(()) => match dispatch_bound.expired_authorization() {
+            Some(termination) => Err(termination),
+            // The COLD connect (QUIC/TLS/H3) was still in flight. Under the
+            // operator `backend_read_timeout_ms` FALLBACK that is a genuine
+            // PRE-WIRE connect failure (`connection_error=true` + capability
+            // downgrade); when the CLIENT's own `grpc-timeout` drove the
+            // expiry the client merely chose a deadline too tight to connect,
+            // which is not a backend capability/health signal.
+            None if client_deadline_present => Ok(Err(
+                crate::http3::client::H3PoolError::read_timeout(anyhow::anyhow!(
+                    "client grpc-timeout deadline exceeded before the backend stream opened"
                 )),
-                None => {
-                    state
-                        .backend_capabilities
-                        .mark_h3_unsupported(proxy, upstream_target);
-                    Ok(Err(crate::http3::client::H3PoolError::pre_wire(
-                        anyhow::anyhow!(
-                            "gRPC backend connect/dispatch timed out before the request reached the wire"
-                        ),
-                    )))
-                }
-            },
+            )),
+            None => {
+                state
+                    .backend_capabilities
+                    .mark_h3_unsupported(proxy, upstream_target);
+                Ok(Err(crate::http3::client::H3PoolError::pre_wire(
+                    anyhow::anyhow!(
+                        "gRPC backend connect/dispatch timed out before the request reached the wire"
+                    ),
+                )))
+            }
         },
-        None => Ok(open_fut.await),
     };
     let backend = match opened {
         Err(termination) => {
@@ -11684,42 +11676,42 @@ async fn dispatch_grpc_native_h3(
             }
         }
     };
-    let head_result = match dispatch_deadline_at {
-        Some(at) => match tokio::time::timeout_at(at, header_fut).await {
-            Ok(result) => result,
-            // Authorization first, exactly as on the open arm. A continuously
-            // active upload keeps the pump making progress forever and a
-            // backend that simply withholds its response head keeps this race
-            // parked, so this is the arm that would otherwise let an admitted
-            // credential outlive itself before ANY response head existed.
-            Err(_) => match dispatch_bound.expired_authorization() {
-                Some(termination) => Err(termination),
-                None => {
-                    // Attribute the expiry to whoever the gateway was actually
-                    // waiting on. `BackendStalled` is a real post-wire read timeout
-                    // (504 + `ReadWriteTimeout`, no capability downgrade), so CB /
-                    // passive health / adaptive concurrency / LB fallback all see a
-                    // dead backend; `ClientStalled` means the incomplete upload is
-                    // currently waiting on the client and stays health-neutral. See
-                    // `classify_h3_grpc_header_wait_expiry`.
-                    let expiry = classify_h3_grpc_header_wait_expiry(&upload);
-                    if expiry == H3GrpcHeaderWaitExpiry::BackendStalled {
-                        Ok(Err(crate::http3::client::H3PoolError::read_timeout(
-                            anyhow::anyhow!(
-                                "gRPC backend dispatch timed out before response headers (grpc-timeout / backend_read_timeout)"
-                            ),
-                        )))
-                    } else {
-                        Ok(Err(crate::http3::client::H3PoolError::read_timeout(
-                            anyhow::anyhow!(
-                                "client request upload stalled past the dispatch deadline"
-                            ),
-                        )))
-                    }
+    let head_result = match crate::plugins::await_deadline_first(dispatch_deadline_at, header_fut)
+        .await
+    {
+        Ok(result) => result,
+        // Authorization first, exactly as on the open arm. A continuously
+        // active upload keeps the pump making progress forever and a
+        // backend that simply withholds its response head keeps this race
+        // parked, so this is the arm that would otherwise let an admitted
+        // credential outlive itself before ANY response head existed.
+        Err(()) => match dispatch_bound.expired_authorization() {
+            Some(termination) => Err(termination),
+            None => {
+                // Attribute the expiry to whoever the gateway was actually
+                // waiting on. `BackendStalled` is a real post-wire read timeout
+                // (504 + `ReadWriteTimeout`, no capability downgrade), so CB /
+                // passive health / adaptive concurrency / LB fallback all see a
+                // dead backend; `ClientStalled` means the incomplete upload is
+                // currently waiting on the client and stays health-neutral. See
+                // `classify_h3_grpc_header_wait_expiry`.
+                let expiry = classify_h3_grpc_header_wait_expiry(&upload);
+                if expiry == H3GrpcHeaderWaitExpiry::BackendStalled {
+                    Ok(Err(crate::http3::client::H3PoolError::read_timeout(
+                        anyhow::anyhow!(
+                            "gRPC backend dispatch timed out before response headers (grpc-timeout / backend_read_timeout)"
+                        ),
+                    )))
+                } else {
+                    Ok(Err(crate::http3::client::H3PoolError::read_timeout(
+                        anyhow::anyhow!(
+                            "client request upload stalled past the dispatch deadline"
+                        ),
+                    )))
                 }
-            },
+            }
         },
-        None => header_fut.await,
+    };
     };
     let h3_resp = match head_result {
         Err(termination) => {
@@ -12976,134 +12968,128 @@ async fn dispatch_grpc_native_h3(
                     result = backend_recv.recv_trailers() => Ok(result),
                 }
             };
-            let trailer_wait_result = match trailer_wait_at {
-                Some(at) => {
-                    match tokio::time::timeout_at(at, trailer_fut).await {
-                        Ok(result) => result,
-                        Err(_) => match trailer_bound.expired_authorization() {
-                            Some(termination) => {
-                                coalesce_buf.clear();
-                                if crate::http3::stream_util::grpc_deadline_can_send_terminal_status(
-                                    bytes_streamed,
-                                ) {
-                                    debug!(
-                                        "native H3 gRPC stream reached its authorization lifetime \
-                                         while awaiting trailers before any response body; \
-                                         completing with grpc-status UNAUTHENTICATED"
-                                    );
-                                    if send_h3_grpc_terminal_trailers(
-                                        &mut send_half,
-                                        crate::proxy::grpc_proxy::grpc_status::UNAUTHENTICATED,
-                                        termination.grpc_message(),
-                                        downstream_write_bound.deadline(),
-                                    )
-                                    .await
-                                    {
-                                        body_completed = true;
-                                        body_error_class =
-                                            Some(crate::retry::ErrorClass::ClientDisconnect);
-                                    } else {
-                                        crate::http3::stream_util::abort_response_stream(
-                                            &mut send_half,
-                                        );
-                                        client_disconnected = true;
-                                        body_error_class =
-                                            Some(crate::retry::ErrorClass::ClientDisconnect);
-                                    }
-                                } else {
-                                    debug!(
-                                        "native H3 gRPC stream reached its authorization lifetime \
-                                         while awaiting trailers after body bytes; resetting"
-                                    );
-                                    crate::http3::stream_util::abort_response_stream(
-                                        &mut send_half,
-                                    );
-                                    body_error_class =
-                                        Some(crate::retry::ErrorClass::ClientDisconnect);
-                                }
-                                crate::proxy::insert_grpc_error_metadata(
-                                    &mut ctx.metadata,
+            let trailer_wait_result =
+                match crate::plugins::await_deadline_first(trailer_wait_at, trailer_fut)
+                    .await
+                {
+                    Ok(result) => result,
+                    Err(()) => match trailer_bound.expired_authorization() {
+                        Some(termination) => {
+                            coalesce_buf.clear();
+                            if crate::http3::stream_util::grpc_deadline_can_send_terminal_status(
+                                bytes_streamed,
+                            ) {
+                                debug!(
+                                    "native H3 gRPC stream reached its authorization lifetime \
+                                     while awaiting trailers before any response body; \
+                                     completing with grpc-status UNAUTHENTICATED"
+                                );
+                                if send_h3_grpc_terminal_trailers(
+                                    &mut send_half,
                                     crate::proxy::grpc_proxy::grpc_status::UNAUTHENTICATED,
                                     termination.grpc_message(),
-                                );
-                                ctx.record_authorization_termination_once(
-                                    termination,
-                                    crate::proxy::auth_lifetime::StreamAuthProtocolFamily::Grpc,
-                                );
-                                break;
-                            }
-                            None if trailer_timeout_is_deadline => {
-                                client_deadline_expired = true;
-                                // `stream_done` only proves the H3 DATA stream reached
-                                // FIN — NOT that the last length-prefixed gRPC message
-                                // ended on a frame boundary (a backend can FIN mid-frame).
-                                // So only append a clean `grpc-status: 4` trailer when no
-                                // body bytes were forwarded (empty-body deadline); once
-                                // any body is on the wire, reset instead so a
-                                // possibly-truncated message isn't capped with a clean
-                                // status the client surfaces as a protocol error. Same
-                                // rule as the mid-body deadline arm.
-                                if crate::http3::stream_util::grpc_deadline_can_send_terminal_status(
-                                    bytes_streamed,
-                                ) {
-                                    warn!(
-                                        "gRPC deadline (grpc-timeout) exceeded while awaiting trailers \
-                                         (empty body); completing with grpc-status DEADLINE_EXCEEDED"
-                                    );
-                                    if send_h3_grpc_terminal_trailers(
-                                        &mut send_half,
-                                        crate::proxy::grpc_proxy::grpc_status::DEADLINE_EXCEEDED,
-                                        GATEWAY_DEADLINE_EXCEEDED_MESSAGE_HEADER,
-                                        grpc_deadline_at,
-                                    )
-                                    .await
-                                    {
-                                        grpc_trailer_status = Some(
-                                            crate::proxy::grpc_proxy::grpc_status::DEADLINE_EXCEEDED,
-                                        );
-                                        body_completed = true;
-                                        body_error_class =
-                                            Some(crate::retry::ErrorClass::ClientDisconnect);
-                                    } else {
-                                        crate::http3::stream_util::abort_response_stream(
-                                            &mut send_half,
-                                        );
-                                        client_disconnected = true;
-                                        body_error_class =
-                                            Some(crate::retry::ErrorClass::ClientDisconnect);
-                                    }
+                                    downstream_write_bound.deadline(),
+                                )
+                                .await
+                                {
+                                    body_completed = true;
+                                    body_error_class =
+                                        Some(crate::retry::ErrorClass::ClientDisconnect);
                                 } else {
-                                    warn!(
-                                        "gRPC deadline (grpc-timeout) exceeded while awaiting trailers \
-                                         after body bytes; resetting (gRPC frame completeness unverified)"
-                                    );
                                     crate::http3::stream_util::abort_response_stream(
                                         &mut send_half,
                                     );
+                                    client_disconnected = true;
                                     body_error_class =
                                         Some(crate::retry::ErrorClass::ClientDisconnect);
                                 }
-                                crate::proxy::insert_grpc_error_metadata(
-                                    &mut ctx.metadata,
-                                    crate::proxy::grpc_proxy::grpc_status::DEADLINE_EXCEEDED,
-                                    GATEWAY_DEADLINE_EXCEEDED_MESSAGE,
-                                );
-                                break;
-                            }
-                            None => {
-                                warn!(
-                                    "Backend trailer read timed out ({}ms) during HTTP/3 gRPC streaming response",
-                                    backend_read_timeout_ms
+                            } else {
+                                debug!(
+                                    "native H3 gRPC stream reached its authorization lifetime \
+                                     while awaiting trailers after body bytes; resetting"
                                 );
                                 crate::http3::stream_util::abort_response_stream(&mut send_half);
-                                body_error_class = Some(crate::retry::ErrorClass::ReadWriteTimeout);
-                                break;
+                                body_error_class =
+                                    Some(crate::retry::ErrorClass::ClientDisconnect);
                             }
-                        },
-                    }
-                }
-                None => trailer_fut.await,
-            };
+                            crate::proxy::insert_grpc_error_metadata(
+                                &mut ctx.metadata,
+                                crate::proxy::grpc_proxy::grpc_status::UNAUTHENTICATED,
+                                termination.grpc_message(),
+                            );
+                            ctx.record_authorization_termination_once(
+                                termination,
+                                crate::proxy::auth_lifetime::StreamAuthProtocolFamily::Grpc,
+                            );
+                            break;
+                        }
+                        None if trailer_timeout_is_deadline => {
+                            client_deadline_expired = true;
+                            // `stream_done` only proves the H3 DATA stream reached
+                            // FIN — NOT that the last length-prefixed gRPC message
+                            // ended on a frame boundary (a backend can FIN mid-frame).
+                            // So only append a clean `grpc-status: 4` trailer when no
+                            // body bytes were forwarded (empty-body deadline); once
+                            // any body is on the wire, reset instead so a
+                            // possibly-truncated message isn't capped with a clean
+                            // status the client surfaces as a protocol error. Same
+                            // rule as the mid-body deadline arm.
+                            if crate::http3::stream_util::grpc_deadline_can_send_terminal_status(
+                                bytes_streamed,
+                            ) {
+                                warn!(
+                                    "gRPC deadline (grpc-timeout) exceeded while awaiting trailers \
+                                     (empty body); completing with grpc-status DEADLINE_EXCEEDED"
+                                );
+                                if send_h3_grpc_terminal_trailers(
+                                    &mut send_half,
+                                    crate::proxy::grpc_proxy::grpc_status::DEADLINE_EXCEEDED,
+                                    GATEWAY_DEADLINE_EXCEEDED_MESSAGE_HEADER,
+                                    grpc_deadline_at,
+                                )
+                                .await
+                                {
+                                    grpc_trailer_status = Some(
+                                        crate::proxy::grpc_proxy::grpc_status::DEADLINE_EXCEEDED,
+                                    );
+                                    body_completed = true;
+                                    body_error_class =
+                                        Some(crate::retry::ErrorClass::ClientDisconnect);
+                                } else {
+                                    crate::http3::stream_util::abort_response_stream(
+                                        &mut send_half,
+                                    );
+                                    client_disconnected = true;
+                                    body_error_class =
+                                        Some(crate::retry::ErrorClass::ClientDisconnect);
+                                }
+                            } else {
+                                warn!(
+                                    "gRPC deadline (grpc-timeout) exceeded while awaiting trailers \
+                                     after body bytes; resetting (gRPC frame completeness unverified)"
+                                );
+                                crate::http3::stream_util::abort_response_stream(&mut send_half);
+                                body_error_class =
+                                    Some(crate::retry::ErrorClass::ClientDisconnect);
+                            }
+                            crate::proxy::insert_grpc_error_metadata(
+                                &mut ctx.metadata,
+                                crate::proxy::grpc_proxy::grpc_status::DEADLINE_EXCEEDED,
+                                GATEWAY_DEADLINE_EXCEEDED_MESSAGE,
+                            );
+                            break;
+                        }
+                        None => {
+                            warn!(
+                                "Backend trailer read timed out ({}ms) during HTTP/3 gRPC streaming response",
+                                backend_read_timeout_ms
+                            );
+                            crate::http3::stream_util::abort_response_stream(&mut send_half);
+                            body_error_class = Some(crate::retry::ErrorClass::ReadWriteTimeout);
+                            break;
+                        }
+                    },
+                };
             let trailers_result = match trailer_wait_result {
                 Ok(result) => result,
                 Err(H3GrpcTerminatingUploadFault::AuthorizationExpired(termination)) => {

@@ -333,14 +333,14 @@ fn record_cross_protocol_header_write_disconnect(
     );
 }
 
-enum H3BackendOrPeer<T> {
+pub(crate) enum H3BackendOrPeer<T> {
     Ready(T),
     Deadline,
     PeerGone,
 }
 
 /// Race a backend wait against per-stream H3 cancellation, whole-connection
-/// close, and an optional gRPC-Web deadline.
+/// close, and an optional composed absolute deadline.
 ///
 /// After the request body is complete the request task is blocked on reqwest
 /// `send()` and is not polling H3 frames. Peer `STOP_SENDING` on the gateway
@@ -349,7 +349,15 @@ enum H3BackendOrPeer<T> {
 /// can cancel one multiplexed stream without closing the QUIC connection and
 /// still release destination-admission permits. `PeerConnectionSignal` remains
 /// the whole-connection close path.
-async fn await_h3_backend_or_peer<F, T>(
+///
+/// The deadline is expiry-first. `timeout_at` and an unordered select whose
+/// ready-work arm precedes the timer would still poll an immediately-ready
+/// backend after the captured bound elapsed. An already-elapsed bound therefore
+/// returns [`H3BackendOrPeer::Deadline`] without polling `future`, and a biased
+/// deadline arm wins an exact-deadline tie. No deadline keeps the no-timer
+/// hot path. Callers attribute ownership from the composition they already
+/// captured.
+pub(crate) async fn await_h3_backend_or_peer<F, T>(
     deadline: Option<tokio::time::Instant>,
     peer: Option<&crate::plugins::PeerConnectionSignal>,
     stream_cancelled: impl std::future::Future<Output = ()>,
@@ -360,6 +368,11 @@ where
 {
     if peer.is_some_and(crate::plugins::PeerConnectionSignal::is_closed) {
         return H3BackendOrPeer::PeerGone;
+    }
+    if let Some(deadline) = deadline
+        && tokio::time::Instant::now() >= deadline
+    {
+        return H3BackendOrPeer::Deadline;
     }
     tokio::pin!(future);
     tokio::pin!(stream_cancelled);
@@ -381,10 +394,11 @@ where
         }
         Some(deadline) => {
             tokio::select! {
-                value = &mut future => H3BackendOrPeer::Ready(value),
+                biased;
+                _ = tokio::time::sleep_until(deadline) => H3BackendOrPeer::Deadline,
                 _ = &mut stream_cancelled => H3BackendOrPeer::PeerGone,
                 _ = &mut peer_closed => H3BackendOrPeer::PeerGone,
-                _ = tokio::time::sleep_until(deadline) => H3BackendOrPeer::Deadline,
+                value = &mut future => H3BackendOrPeer::Ready(value),
             }
         }
     }
@@ -2045,8 +2059,8 @@ where
                         None => (dispatch_proxy, current_url.as_str()),
                     };
 
-                    let client_result = match crate::plugins::await_grpc_deadline(
-                        grpc_web_deadline_at,
+                    let client_result = match crate::plugins::await_deadline_first(
+                        plain_write_bound.deadline(),
                         get_cross_protocol_client(
                             state,
                             dial_proxy,
@@ -2068,6 +2082,40 @@ where
                         Ok(result) => result?,
                         Err(()) => {
                             drop(pending_slot);
+                            if let Some(termination) = plain_write_bound.expired_authorization() {
+                                ctx.record_authorization_termination_once(
+                                    termination,
+                                    crate::proxy::auth_lifetime::StreamAuthProtocolFamily::Http,
+                                );
+                                record_cross_protocol_backend_admission_outcome(
+                                    &mut backend_admission_permits,
+                                    401,
+                                    false,
+                                    Some(ErrorClass::ClientDisconnect),
+                                    backend_admission_start.elapsed(),
+                                );
+                                record_backend_outcome(
+                                    state,
+                                    proxy,
+                                    &epoch.load_balancer,
+                                    upstream_balancer,
+                                    current_target.as_deref(),
+                                    current_cb_target_key.as_deref(),
+                                    401,
+                                    false,
+                                    None,
+                                    cb_retry_probe_slot_available,
+                                    false,
+                                    backend_start.elapsed(),
+                                );
+                                return write_plain_authorization_expired_terminal(
+                                    stream,
+                                    ctx,
+                                    backend_start,
+                                    bytes_sent,
+                                )
+                                .await;
+                            }
                             record_plain_grpc_web_client_deadline(
                                 state,
                                 epoch,
@@ -2099,7 +2147,7 @@ where
                     };
 
                     let send_result = match await_h3_backend_or_peer(
-                        grpc_web_deadline_at,
+                        plain_write_bound.deadline(),
                         ctx.peer_connection.as_ref(),
                         crate::http3::stream_util::peer_response_cancelled(stream),
                         build_plain_request_builder(
@@ -2123,6 +2171,40 @@ where
                         H3BackendOrPeer::Ready(result) => result,
                         H3BackendOrPeer::Deadline => {
                             drop(pending_slot);
+                            if let Some(termination) = plain_write_bound.expired_authorization() {
+                                ctx.record_authorization_termination_once(
+                                    termination,
+                                    crate::proxy::auth_lifetime::StreamAuthProtocolFamily::Http,
+                                );
+                                record_cross_protocol_backend_admission_outcome(
+                                    &mut backend_admission_permits,
+                                    401,
+                                    false,
+                                    Some(ErrorClass::ClientDisconnect),
+                                    backend_admission_start.elapsed(),
+                                );
+                                record_backend_outcome(
+                                    state,
+                                    proxy,
+                                    &epoch.load_balancer,
+                                    upstream_balancer,
+                                    current_target.as_deref(),
+                                    current_cb_target_key.as_deref(),
+                                    401,
+                                    false,
+                                    None,
+                                    cb_retry_probe_slot_available,
+                                    false,
+                                    backend_start.elapsed(),
+                                );
+                                return write_plain_authorization_expired_terminal(
+                                    stream,
+                                    ctx,
+                                    backend_start,
+                                    bytes_sent,
+                                )
+                                .await;
+                            }
                             record_plain_grpc_web_client_deadline(
                                 state,
                                 epoch,
@@ -2234,13 +2316,28 @@ where
                                     );
                                     cb_retry_probe_slot_available = false;
                                     let delay = crate::retry::retry_delay(retry_config, attempt);
-                                    if crate::plugins::await_grpc_deadline(
-                                        grpc_web_deadline_at,
+                                    if crate::plugins::await_deadline_first(
+                                        plain_write_bound.deadline(),
                                         tokio::time::sleep(delay),
                                     )
                                     .await
                                     .is_err()
                                     {
+                                        if let Some(termination) =
+                                            plain_write_bound.expired_authorization()
+                                        {
+                                            ctx.record_authorization_termination_once(
+                                                termination,
+                                                crate::proxy::auth_lifetime::StreamAuthProtocolFamily::Http,
+                                            );
+                                            return write_plain_authorization_expired_terminal(
+                                                stream,
+                                                ctx,
+                                                backend_start,
+                                                bytes_sent,
+                                            )
+                                            .await;
+                                        }
                                         return write_plain_grpc_web_client_deadline(
                                             stream,
                                             plugins,
@@ -2341,13 +2438,28 @@ where
                                     );
                                     cb_retry_probe_slot_available = false;
                                     let delay = crate::retry::retry_delay(retry_config, attempt);
-                                    if crate::plugins::await_grpc_deadline(
-                                        grpc_web_deadline_at,
+                                    if crate::plugins::await_deadline_first(
+                                        plain_write_bound.deadline(),
                                         tokio::time::sleep(delay),
                                     )
                                     .await
                                     .is_err()
                                     {
+                                        if let Some(termination) =
+                                            plain_write_bound.expired_authorization()
+                                        {
+                                            ctx.record_authorization_termination_once(
+                                                termination,
+                                                crate::proxy::auth_lifetime::StreamAuthProtocolFamily::Http,
+                                            );
+                                            return write_plain_authorization_expired_terminal(
+                                                stream,
+                                                ctx,
+                                                backend_start,
+                                                bytes_sent,
+                                            )
+                                            .await;
+                                        }
                                         return write_plain_grpc_web_client_deadline(
                                             stream,
                                             plugins,
@@ -2566,8 +2678,8 @@ where
                     None => (dispatch_proxy, current_url.as_str()),
                 };
 
-                let client_result = match crate::plugins::await_grpc_deadline(
-                    grpc_web_deadline_at,
+                let client_result = match crate::plugins::await_deadline_first(
+                    plain_write_bound.deadline(),
                     get_cross_protocol_client(
                         state,
                         dial_proxy,
@@ -2590,6 +2702,40 @@ where
                     Err(()) => {
                         drop(pending_slot);
                         crate::http3::stream_util::halt_request_body(stream);
+                        if let Some(termination) = plain_write_bound.expired_authorization() {
+                            ctx.record_authorization_termination_once(
+                                termination,
+                                crate::proxy::auth_lifetime::StreamAuthProtocolFamily::Http,
+                            );
+                            record_cross_protocol_backend_admission_outcome(
+                                &mut backend_admission_permits,
+                                401,
+                                false,
+                                Some(ErrorClass::ClientDisconnect),
+                                backend_admission_start.elapsed(),
+                            );
+                            record_backend_outcome(
+                                state,
+                                proxy,
+                                &epoch.load_balancer,
+                                upstream_balancer,
+                                current_target.as_deref(),
+                                current_cb_target_key.as_deref(),
+                                401,
+                                false,
+                                None,
+                                cb_is_half_open_probe,
+                                false,
+                                backend_start.elapsed(),
+                            );
+                            return write_plain_authorization_expired_terminal(
+                                stream,
+                                ctx,
+                                backend_start,
+                                0,
+                            )
+                            .await;
+                        }
                         record_plain_grpc_web_client_deadline(
                             state,
                             epoch,
@@ -2793,16 +2939,11 @@ where
                 // for FERRUM_H3_REQUEST_BODY_DRAIN_MS.
                 let drain_ms = state.env_config.h3_request_body_drain_ms;
                 // Authorization lifetime for this admitted upload (issue #3815).
-                // A continuously active H3 request upload cannot extend the
-                // authorization window: the bound is absolute, anchored at
-                // request receipt, and every relayed DATA frame leaves it
-                // unchanged. Response headers are NOT committed in this phase,
-                // so the protocol-correct terminal is a fixed `401`.
-                let upload_auth_deadline_plan =
-                    crate::proxy::auth_lifetime::effective_request_auth_deadline(
-                        ctx,
-                        state.env_config.authenticated_stream_max_lifetime_seconds,
-                    );
+                // Composed ONCE with the client's optional RPC deadline so a
+                // strictly earlier grpc-timeout keeps its own terminal when the
+                // task wakes after both instants. Response headers are NOT
+                // committed in this phase, so the protocol-correct authorization
+                // terminal is a fixed `401`.
                 let mut upload_auth_expired: Option<
                     crate::proxy::auth_lifetime::StreamAuthTermination,
                 > = None;
@@ -2810,24 +2951,26 @@ where
                 let mut peer_gone = peer_signal
                     .as_ref()
                     .is_some_and(crate::plugins::PeerConnectionSignal::is_closed);
-                let send_result = {
+                let send_result = if plain_write_bound
+                    .deadline()
+                    .is_some_and(|at| tokio::time::Instant::now() >= at)
+                {
+                    upload_auth_expired = plain_write_bound.expired_authorization();
+                    drop(pending_slot.take());
+                    drop(send_future);
+                    drop(reader_future);
+                    None
+                } else {
                     tokio::pin!(send_future);
                     tokio::pin!(reader_future);
-                    let grpc_web_deadline_active = grpc_web_deadline_at.is_some();
-                    let grpc_web_deadline =
-                        tokio::time::sleep_until(grpc_web_deadline_at.unwrap_or_else(|| {
+                    let upload_deadline_at = plain_write_bound.deadline();
+                    let upload_deadline_active = upload_deadline_at.is_some();
+                    let upload_deadline = tokio::time::sleep_until(
+                        upload_deadline_at.unwrap_or_else(|| {
                             tokio::time::Instant::now() + Duration::from_secs(86_400)
-                        }));
-                    tokio::pin!(grpc_web_deadline);
-                    let upload_auth_deadline_active = upload_auth_deadline_plan.is_some();
-                    let upload_auth_deadline = tokio::time::sleep_until(
-                        upload_auth_deadline_plan
-                            .map(|plan| plan.at)
-                            .unwrap_or_else(|| {
-                                tokio::time::Instant::now() + Duration::from_secs(86_400)
-                            }),
+                        }),
                     );
-                    tokio::pin!(upload_auth_deadline);
+                    tokio::pin!(upload_deadline);
                     tokio::pin!(stream_cancelled);
                     let peer_closed = async {
                         if let Some(signal) = peer_signal.as_ref() {
@@ -2841,31 +2984,12 @@ where
                     loop {
                         tokio::select! {
                             biased;
-                            // Placed FIRST so an already-elapsed authorization
-                            // bound wins over the client's own RPC ceiling and
-                            // over a simultaneously ready backend response.
-                            // Dropping both borrowed futures cancels the backend
-                            // request and the H3 reader; the unconditional
-                            // STOP_SENDING below closes the receive half, so no
-                            // detached producer is left behind.
-                            _ = &mut upload_auth_deadline, if upload_auth_deadline_active => {
-                                upload_auth_expired = Some(
-                                    upload_auth_deadline_plan
-                                        .map(|plan| plan.termination)
-                                        .unwrap_or(
-                                            crate::proxy::auth_lifetime::StreamAuthTermination::CredentialExpired,
-                                        ),
-                                );
-                                drop(pending_slot.take());
-                                break None;
-                            }
-                            _ = &mut grpc_web_deadline, if grpc_web_deadline_active => {
-                                // The absolute RPC ceiling owns the whole streaming
-                                // dispatch, including an upload that never finishes
-                                // and a backend that withholds response headers.
-                                // Drop both borrowed futures immediately; the
-                                // unconditional STOP_SENDING below closes the H3
-                                // receive half without delaying the status-4 writer.
+                            // The captured earliest bound is FIRST so an already-
+                            // elapsed or exactly-tied deadline wins over a ready
+                            // backend response. Attribution comes from the
+                            // composition, not from arm order between two sleeps.
+                            _ = &mut upload_deadline, if upload_deadline_active => {
+                                upload_auth_expired = plain_write_bound.expired_authorization();
                                 drop(pending_slot.take());
                                 break None;
                             }

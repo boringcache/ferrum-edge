@@ -51,11 +51,12 @@ pub(crate) fn grpc_deadline_can_send_terminal_status(bytes_streamed: u64) -> boo
 /// Race one potentially flow-control-blocked downstream H3 write against the
 /// same absolute deadline that bounds the rest of the RPC.
 ///
-/// The deadline arm is intentionally biased. Once the budget is exhausted, a
-/// simultaneously writable DATA frame must not escape downstream and turn a
-/// clean no-DATA expiry into a partial-message reset. Dropping `write` cancels
-/// the h3 send future; callers then reset the send half and drop/cancel their
-/// upstream response body.
+/// The wait is expiry-first through [`crate::plugins::await_deadline_first`]:
+/// an already-elapsed bound never polls `write`, and a biased deadline arm
+/// wins an exact-deadline tie so a simultaneously writable DATA frame cannot
+/// escape after the budget is spent. Dropping `write` cancels the h3 send
+/// future; callers then reset the send half and drop/cancel their upstream
+/// response body. No deadline keeps the no-timer hot path.
 pub(crate) async fn await_response_write_before_deadline<F, T, E>(
     deadline: Option<tokio::time::Instant>,
     write: F,
@@ -63,17 +64,9 @@ pub(crate) async fn await_response_write_before_deadline<F, T, E>(
 where
     F: std::future::Future<Output = Result<T, E>>,
 {
-    let Some(deadline) = deadline else {
-        return write.await.map_err(H3ResponseWriteError::Write);
-    };
-
-    tokio::pin!(write);
-    let deadline_sleep = tokio::time::sleep_until(deadline);
-    tokio::pin!(deadline_sleep);
-    tokio::select! {
-        biased;
-        () = &mut deadline_sleep => Err(H3ResponseWriteError::DeadlineExceeded),
-        result = &mut write => result.map_err(H3ResponseWriteError::Write),
+    match crate::plugins::await_deadline_first(deadline, write).await {
+        Ok(result) => result.map_err(H3ResponseWriteError::Write),
+        Err(()) => Err(H3ResponseWriteError::DeadlineExceeded),
     }
 }
 

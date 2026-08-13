@@ -7390,6 +7390,89 @@ pub mod _test_support {
         AuthorizationExpired,
     }
 
+    /// Await `future` under an optional absolute deadline using the shared
+    /// expiry-first primitive every composed authorization wait now goes
+    /// through. `Err(())` means the bound fired without polling a ready
+    /// future; `Ok` is completion. Ownership is not decided here.
+    pub async fn await_deadline_first_for_test<F, T>(
+        deadline: Option<tokio::time::Instant>,
+        future: F,
+    ) -> Result<T, ()>
+    where
+        F: std::future::Future<Output = T>,
+    {
+        crate::plugins::await_deadline_first(deadline, future).await
+    }
+
+    /// Outcome of one pre-commitment response-phase wait, as
+    /// [`await_precommit_response_phase_for_test`] reports it.
+    #[derive(Debug, PartialEq, Eq)]
+    pub enum PrecommitPhaseOutcomeForTest<T> {
+        Completed(T),
+        ExpiredAuthorization(crate::proxy::auth_lifetime::StreamAuthTermination),
+        ExpiredProtocol,
+    }
+
+    /// Await one pre-commitment response phase under an already-composed bound,
+    /// so a test can prove an elapsed bound never polls protected work.
+    pub async fn await_precommit_response_phase_for_test<F, T>(
+        bound: PrecommitResponsePhaseBoundForTest,
+        future: F,
+    ) -> PrecommitPhaseOutcomeForTest<T>
+    where
+        F: std::future::Future<Output = T>,
+    {
+        match crate::plugins::await_precommit_response_phase(bound.0, future).await {
+            crate::plugins::PrecommitPhaseResult::Completed(value) => {
+                PrecommitPhaseOutcomeForTest::Completed(value)
+            }
+            crate::plugins::PrecommitPhaseResult::Expired(Some(termination)) => {
+                PrecommitPhaseOutcomeForTest::ExpiredAuthorization(termination)
+            }
+            crate::plugins::PrecommitPhaseResult::Expired(None) => {
+                PrecommitPhaseOutcomeForTest::ExpiredProtocol
+            }
+        }
+    }
+
+    /// Race a backend wait against an optional absolute deadline the same way
+    /// the H3→plain header wait does, without a peer-cancel signal, so a test
+    /// can prove an elapsed composed bound never polls a ready backend.
+    pub async fn await_h3_backend_or_peer_for_test<F, T>(
+        deadline: Option<tokio::time::Instant>,
+        future: F,
+    ) -> H3BackendOrPeerForTest<T>
+    where
+        F: std::future::Future<Output = T>,
+    {
+        match crate::http3::cross_protocol::await_h3_backend_or_peer(
+            deadline,
+            None,
+            std::future::pending::<()>(),
+            future,
+        )
+        .await
+        {
+            crate::http3::cross_protocol::H3BackendOrPeer::Ready(value) => {
+                H3BackendOrPeerForTest::Ready(value)
+            }
+            crate::http3::cross_protocol::H3BackendOrPeer::Deadline => {
+                H3BackendOrPeerForTest::Deadline
+            }
+            crate::http3::cross_protocol::H3BackendOrPeer::PeerGone => {
+                H3BackendOrPeerForTest::PeerGone
+            }
+        }
+    }
+
+    /// Outcome of [`await_h3_backend_or_peer_for_test`].
+    #[derive(Debug, PartialEq, Eq)]
+    pub enum H3BackendOrPeerForTest<T> {
+        Ready(T),
+        Deadline,
+        PeerGone,
+    }
+
     /// Collect a buffered RESPONSE body under the composed bound every buffered
     /// dispatch arm now installs — the earliest of the client RPC deadline and
     /// the admitted stream's authorization deadline (issue #3815).

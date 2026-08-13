@@ -5931,6 +5931,38 @@ pub(crate) enum PrecommitPhaseResult<T> {
     Expired(Option<crate::proxy::auth_lifetime::StreamAuthTermination>),
 }
 
+/// Await `future` under an optional absolute deadline, refusing to poll it
+/// once that deadline has elapsed.
+///
+/// `tokio::time::timeout_at` (Tokio 1.52.3) polls its inner future before the
+/// timer, so an already-elapsed bound still runs immediately-ready protected
+/// work. This helper refuses first: an elapsed bound returns `Err` without
+/// polling `future`, and a biased `sleep_until` arm wins an exact-deadline
+/// tie. No deadline keeps the no-timer hot path.
+///
+/// Ownership of a fired bound is NOT decided here. The caller already captured
+/// a typed composition and attributes from that; this returns only completion
+/// vs bound-fired.
+pub(crate) async fn await_deadline_first<F, T>(
+    deadline: Option<tokio::time::Instant>,
+    future: F,
+) -> Result<T, ()>
+where
+    F: std::future::Future<Output = T>,
+{
+    let Some(deadline) = deadline else {
+        return Ok(future.await);
+    };
+    if tokio::time::Instant::now() >= deadline {
+        return Err(());
+    }
+    tokio::select! {
+        biased;
+        () = tokio::time::sleep_until(deadline) => Err(()),
+        result = future => Ok(result),
+    }
+}
+
 /// Await one pre-commitment response phase under its composed bound, keeping
 /// the provenance of an expiry.
 pub(crate) async fn await_precommit_response_phase<F, T>(
@@ -5940,7 +5972,7 @@ pub(crate) async fn await_precommit_response_phase<F, T>(
 where
     F: std::future::Future<Output = T>,
 {
-    match await_grpc_deadline(bound.deadline(), future).await {
+    match await_deadline_first(bound.deadline(), future).await {
         Ok(value) => PrecommitPhaseResult::Completed(value),
         Err(()) => PrecommitPhaseResult::Expired(bound.expired_authorization()),
     }
