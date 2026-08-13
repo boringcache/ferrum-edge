@@ -5141,10 +5141,10 @@ async fn create_session(
     dns_cache: &DnsCache,
     frontend_socket: &Arc<UdpSocket>,
     client_addr: SocketAddr,
-    /// Exact identity of this session on this listener: the client tuple, the
-    /// selected destination IP, the exact namespaced route owner (issue #3861),
-    /// and the bound socket's spawn generation. Every map insertion and
-    /// identity-aware removal uses this same key.
+    // Exact identity of this session on this listener: the client tuple, the
+    // selected destination IP, the exact namespaced route owner (issue #3861),
+    // and the bound socket's spawn generation. Every map insertion and
+    // identity-aware removal uses this same key.
     session_key: UdpSessionKey,
     sessions: &SessionMap,
     metrics: &Arc<UdpProxyMetrics>,
