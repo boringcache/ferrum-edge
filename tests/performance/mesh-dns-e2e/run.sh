@@ -61,6 +61,7 @@ UPSTREAM_PID=""
 
 cleanup() {
     echo -e "\n${YELLOW}Cleaning up...${NC}"
+    archive_failure_diagnostics
     [ -n "$GATEWAY_PID" ] && kill "$GATEWAY_PID" 2>/dev/null || true
     [ -n "$CP_STUB_PID" ] && kill "$CP_STUB_PID" 2>/dev/null || true
     [ -n "$UPSTREAM_PID" ] && kill "$UPSTREAM_PID" 2>/dev/null || true
@@ -71,6 +72,22 @@ cleanup() {
     echo -e "${GREEN}Cleanup complete${NC}"
 }
 trap cleanup EXIT
+
+archive_failure_diagnostics() {
+    local dest="${MESH_BASELINE_DIAG_DIR:-}"
+    local log
+    # Opt-in copy of process logs for hosted artifact upload. Never copy
+    # credential material; JWT secrets stay in process env, not these files.
+    if [[ -z "$dest" ]]; then
+        return 0
+    fi
+    mkdir -p "$dest"
+    for log in gateway.log upstream.log cp_stub.log; do
+        if [[ -f "$SCRIPT_DIR/$log" ]]; then
+            cp "$SCRIPT_DIR/$log" "$dest/$log" || true
+        fi
+    done
+}
 
 # Kill any stragglers from a previous crashed run
 for port in $GATEWAY_DNS_PORT $UPSTREAM_STUB_PORT $CP_STUB_PORT \

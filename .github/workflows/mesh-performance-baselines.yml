@@ -1,0 +1,334 @@
+# Hosted collection of provenance-complete mesh / HBONE / DNS performance baselines.
+#
+# Populates machine-readable Criterion + E2E artifacts for issue #3332. Does not
+# invent numbers: baseline.md tables stay `_TBD_` until a follow-up commit copies
+# validated hosted results. Trigger manually against the branch under test.
+#
+# Usage:
+#   Actions -> "Mesh Performance Baselines" -> Run workflow
+#   Optional suite filter: all | mesh | hbone | dns
+#
+# Runner is pinned to GitHub-hosted ubuntu-24.04 (no arbitrary / self-hosted
+# label input). Publication fails closed when selected-suite gates are false,
+# including undersampled E2E rows, missing DNS rows, malformed/duplicate
+# relevant blobs, unexpected DNS target identities, unsupported suite filters,
+# nonzero errors, nonzero DNS NXDOMAIN counts, missing/invalid workload-interval
+# steal evidence (mesh Criterion windows and HBONE/DNS repetitions), or CPU
+# steal above 5.0%. Artifacts still upload via if: always(). Overlapping
+# dispatches serialize on github.ref and do not cancel an in-progress collection.
+#
+# Every computation that is not a literal command lives in an approved
+# automation root under .github/scripts/. Keep it that way: inline interpreter
+# bodies (heredoc programs, or a one-liner handed to a non-shell interpreter)
+# in this file would add a dynamic executable surface that the trusted Cross
+# build policy refuses on a newly added workflow.
+
+name: Mesh Performance Baselines
+
+on:
+  workflow_dispatch:
+    inputs:
+      suites:
+        description: "Suites to collect (all, mesh, hbone, dns)"
+        required: false
+        default: "all"
+        type: choice
+        options:
+          - all
+          - mesh
+          - hbone
+          - dns
+      iterations:
+        description: "Clean E2E repetitions (HBONE + DNS); 3 to 5"
+        required: false
+        default: "3"
+        type: choice
+        options:
+          - "3"
+          - "4"
+          - "5"
+  # Retain a reusable entry point for trusted callers after this workflow lands.
+  workflow_call:
+    inputs:
+      suites:
+        description: "Suites to collect (all, mesh, hbone, dns)"
+        required: false
+        default: "all"
+        type: string
+      iterations:
+        description: "Clean E2E repetitions (HBONE + DNS); 3 to 5"
+        required: false
+        default: "3"
+        type: string
+
+concurrency:
+  group: mesh-performance-baselines-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_NET_RETRY: "10"
+  CARGO_HTTP_MULTIPLEXING: "false"
+  BENCH_BUILD_PROFILE: release
+  BENCH_RUNNER_CLASS: ubuntu-24.04
+  BENCH_ITERATIONS: ${{ inputs.iterations || '3' }}
+  BENCH_GATEWAY_FEATURES: default (no --features)
+  BENCH_SUITES: ${{ inputs.suites || 'all' }}
+  BENCH_MAX_CPU_STEAL_PERCENT: "5.0"
+
+jobs:
+  collect:
+    name: Collect mesh / HBONE / DNS baselines
+    runs-on: ubuntu-24.04
+    timeout-minutes: 240
+
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
+
+      - name: Verify summarizer contract (static)
+        run: |
+          python3 .github/scripts/summarize_mesh_baseline_results.py --self-test
+          python3 .github/scripts/mesh_baseline_runner_health.py --self-test
+          python3 -m py_compile \
+            .github/scripts/collect_mesh_baseline_provenance.py \
+            .github/scripts/mesh_baseline_ledger.py \
+            .github/scripts/mesh_baseline_runner_health.py \
+            .github/scripts/mesh_baseline_step_summary.py \
+            .github/scripts/summarize_mesh_baseline_results.py \
+            .github/scripts/verify_mesh_performance_baselines_workflow.py
+          python3 .github/scripts/verify_mesh_performance_baselines_workflow.py --self-test
+          python3 .github/scripts/verify_mesh_performance_baselines_workflow.py
+
+      - uses: ./.github/actions/setup-rust-ci
+        with:
+          shared-key: "ci-mesh-performance-baselines"
+
+      - name: Install system dependencies
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            protobuf-compiler lsof curl
+
+      - name: Prepare results directories + suite command ledger
+        env:
+          SUITES: ${{ env.BENCH_SUITES }}
+        run: |
+          set -euo pipefail
+          case "${SUITES}" in
+            all|mesh|hbone|dns) ;;
+            *)
+              echo "::error::unsupported suites value '${SUITES}' (expected all|mesh|hbone|dns)"
+              exit 1
+              ;;
+          esac
+          mkdir -p mesh-baseline-results/mesh
+          mkdir -p mesh-baseline-results/hbone
+          mkdir -p mesh-baseline-results/dns
+          mkdir -p mesh-baseline-results/drafts
+          mkdir -p mesh-baseline-results/logs
+          printf '' > mesh-baseline-results/logs/runner_health_probes.jsonl
+          python3 .github/scripts/mesh_baseline_ledger.py \
+            --suites "${SUITES}" \
+            --iterations "${BENCH_ITERATIONS}" \
+            --output mesh-baseline-results/suite_commands.json
+
+      - name: Runner health check + provenance capture
+        run: |
+          set -euo pipefail
+          mkdir -p mesh-baseline-results/host-facts
+          lscpu > mesh-baseline-results/host-facts/lscpu.txt
+          uname -a > mesh-baseline-results/host-facts/uname.txt
+          free -h > mesh-baseline-results/host-facts/free.txt
+          cp /proc/meminfo mesh-baseline-results/host-facts/meminfo.txt
+          rustc --version --verbose > mesh-baseline-results/host-facts/rustc-version.txt
+          cargo --version --verbose > mesh-baseline-results/host-facts/cargo-version.txt
+          nproc > mesh-baseline-results/host-facts/nproc.txt
+          uptime > mesh-baseline-results/host-facts/uptime.txt
+          python3 .github/scripts/mesh_baseline_runner_health.py \
+            --results-root mesh-baseline-results \
+            --phase pre_collection
+          python3 .github/scripts/collect_mesh_baseline_provenance.py \
+            --output mesh-baseline-results/provenance.json \
+            --host-facts-dir mesh-baseline-results/host-facts \
+            --suite-commands mesh-baseline-results/suite_commands.json
+
+      - name: Build gateway binary (release)
+        if: env.BENCH_SUITES == 'all' || env.BENCH_SUITES == 'hbone' || env.BENCH_SUITES == 'dns'
+        run: cargo build --release --bin ferrum-edge
+
+      - name: Collect mesh Criterion microbenchmarks
+        if: env.BENCH_SUITES == 'all' || env.BENCH_SUITES == 'mesh'
+        timeout-minutes: 120
+        run: |
+          set -euo pipefail
+          mkdir -p mesh-baseline-results/mesh
+          for bench in authz_match ip_restriction slice_apply xds_translation; do
+            echo "==== cargo bench --bench ${bench} ===="
+            python3 .github/scripts/mesh_baseline_runner_health.py \
+              --results-root mesh-baseline-results \
+              --phase mesh \
+              --scenario "${bench}" \
+              --repetition 1 \
+              --interval-begin
+            harness_status=1
+            set +e
+            cargo bench --manifest-path tests/performance/mesh/Cargo.toml \
+              --bench "${bench}" \
+              -- --warm-up-time 3 --measurement-time 15 \
+              2>&1 | tee "mesh-baseline-results/logs/mesh_${bench}.log"
+            harness_status=${PIPESTATUS[0]}
+            python3 .github/scripts/mesh_baseline_runner_health.py \
+              --results-root mesh-baseline-results \
+              --phase mesh \
+              --scenario "${bench}" \
+              --repetition 1 \
+              --interval-end
+            set -euo pipefail
+            if (( harness_status != 0 )); then
+              exit "${harness_status}"
+            fi
+          done
+          mkdir -p mesh-baseline-results/mesh/criterion
+          if [ -d tests/performance/mesh/target/criterion ]; then
+            cp -a tests/performance/mesh/target/criterion/. mesh-baseline-results/mesh/criterion/
+          else
+            echo "::error::Criterion output tree missing after mesh benches"
+            exit 1
+          fi
+
+      - name: Build HBONE harness
+        if: env.BENCH_SUITES == 'all' || env.BENCH_SUITES == 'hbone'
+        run: |
+          set -euo pipefail
+          (cd tests/performance/mesh-hbone-e2e && cargo build --release)
+
+      - name: Collect HBONE E2E baselines (3+ repetitions)
+        if: env.BENCH_SUITES == 'all' || env.BENCH_SUITES == 'hbone'
+        timeout-minutes: 90
+        run: |
+          set -euo pipefail
+          ITERATIONS="${BENCH_ITERATIONS}"
+          if [[ ! "${ITERATIONS}" =~ ^[0-9]+$ ]] || ((ITERATIONS < 3 || ITERATIONS > 5)); then
+            echo "::error::BENCH_ITERATIONS must be an integer from 3 to 5 (got ${ITERATIONS})"
+            exit 1
+          fi
+          declare -a SCENARIOS=(
+            "1kib_c50_30s:1024:50:30"
+            "16kib_c50_30s:16384:50:30"
+            "256kib_c100_60s:262144:100:60"
+          )
+          for scenario in "${SCENARIOS[@]}"; do
+            IFS=':' read -r KEY PAYLOAD CONCURRENCY DURATION <<<"${scenario}"
+            mkdir -p "mesh-baseline-results/hbone/${KEY}"
+            for run in $(seq 1 "${ITERATIONS}"); do
+              echo "==== HBONE ${KEY} repetition ${run}/${ITERATIONS} ===="
+              python3 .github/scripts/mesh_baseline_runner_health.py \
+                --results-root mesh-baseline-results \
+                --phase hbone \
+                --scenario "${KEY}" \
+                --repetition "${run}" \
+                --interval-begin
+              harness_status=1
+              set +e
+              export MESH_BASELINE_DIAG_DIR="mesh-baseline-results/logs/hbone/${KEY}/run_${run}"
+              mkdir -p "${MESH_BASELINE_DIAG_DIR}"
+              ./tests/performance/mesh-hbone-e2e/run.sh --skip-build --json \
+                --duration "${DURATION}" \
+                --concurrency "${CONCURRENCY}" \
+                --payload-size "${PAYLOAD}" \
+                2>&1 | tee "mesh-baseline-results/hbone/${KEY}/run_${run}.txt"
+              harness_status=${PIPESTATUS[0]}
+              python3 .github/scripts/mesh_baseline_runner_health.py \
+                --results-root mesh-baseline-results \
+                --phase hbone \
+                --scenario "${KEY}" \
+                --repetition "${run}" \
+                --interval-end
+              set -euo pipefail
+              if (( harness_status != 0 )); then
+                exit "${harness_status}"
+              fi
+            done
+          done
+
+      - name: Build DNS harness
+        if: env.BENCH_SUITES == 'all' || env.BENCH_SUITES == 'dns'
+        run: |
+          set -euo pipefail
+          (cd tests/performance/mesh-dns-e2e && cargo build --release)
+
+      - name: Collect DNS E2E baselines (3+ repetitions)
+        if: env.BENCH_SUITES == 'all' || env.BENCH_SUITES == 'dns'
+        timeout-minutes: 90
+        run: |
+          set -euo pipefail
+          ITERATIONS="${BENCH_ITERATIONS}"
+          if [[ ! "${ITERATIONS}" =~ ^[0-9]+$ ]] || ((ITERATIONS < 3 || ITERATIONS > 5)); then
+            echo "::error::BENCH_ITERATIONS must be an integer from 3 to 5 (got ${ITERATIONS})"
+            exit 1
+          fi
+          mkdir -p mesh-baseline-results/dns
+          for run in $(seq 1 "${ITERATIONS}"); do
+            echo "==== DNS E2E repetition ${run}/${ITERATIONS} ===="
+            python3 .github/scripts/mesh_baseline_runner_health.py \
+              --results-root mesh-baseline-results \
+              --phase dns \
+              --repetition "${run}" \
+              --interval-begin
+            harness_status=1
+            set +e
+            export MESH_BASELINE_DIAG_DIR="mesh-baseline-results/logs/dns/run_${run}"
+            mkdir -p "${MESH_BASELINE_DIAG_DIR}"
+            ./tests/performance/mesh-dns-e2e/run.sh --skip-build --json \
+              --duration 60 --concurrency 100 --protocol both \
+              2>&1 | tee "mesh-baseline-results/dns/run_${run}.txt"
+            harness_status=${PIPESTATUS[0]}
+            python3 .github/scripts/mesh_baseline_runner_health.py \
+              --results-root mesh-baseline-results \
+              --phase dns \
+              --repetition "${run}" \
+              --interval-end
+            set -euo pipefail
+            if (( harness_status != 0 )); then
+              exit "${harness_status}"
+            fi
+          done
+
+      - name: Summarize results + draft baseline markdown
+        if: always()
+        run: |
+          set -euo pipefail
+          python3 .github/scripts/summarize_mesh_baseline_results.py \
+            --results-root mesh-baseline-results \
+            --provenance mesh-baseline-results/provenance.json \
+            --output mesh-baseline-results/summary.json \
+            --draft-markdown-dir mesh-baseline-results/drafts \
+            --expected-repetitions "${BENCH_ITERATIONS}" \
+            --suites "${BENCH_SUITES}"
+
+      - name: Post collection summary
+        if: always()
+        run: |
+          python3 .github/scripts/mesh_baseline_step_summary.py \
+            --results-root mesh-baseline-results
+
+      - name: Enforce selected-suite acceptance gates
+        if: always()
+        run: |
+          set -euo pipefail
+          python3 .github/scripts/summarize_mesh_baseline_results.py \
+            --check-acceptance \
+            --summary mesh-baseline-results/summary.json \
+            --suites "${BENCH_SUITES}"
+
+      - name: Upload mesh baseline artifacts
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: mesh-performance-baselines-${{ github.sha }}
+          path: mesh-baseline-results/
+          retention-days: 90

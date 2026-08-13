@@ -46,6 +46,7 @@ BACKEND_PORT=""
 
 cleanup() {
     echo -e "\n${YELLOW}Cleaning up...${NC}"
+    archive_failure_diagnostics
     [ -n "$GATEWAY_PID" ] && kill "$GATEWAY_PID" 2>/dev/null || true
     [ -n "$SIDECAR_PID" ] && kill "$SIDECAR_PID" 2>/dev/null || true
     [ -n "$BACKEND_PID" ] && kill "$BACKEND_PID" 2>/dev/null || true
@@ -57,6 +58,22 @@ cleanup() {
     echo -e "${GREEN}Cleanup complete${NC}"
 }
 trap cleanup EXIT
+
+archive_failure_diagnostics() {
+    local dest="${MESH_BASELINE_DIAG_DIR:-}"
+    local log
+    # Opt-in copy of process logs for hosted artifact upload. Never copy certs
+    # or other secret material from $RUNTIME_DIR.
+    if [[ -z "$dest" ]]; then
+        return 0
+    fi
+    mkdir -p "$dest"
+    for log in backend.log sidecar.log gateway.log; do
+        if [[ -f "$RUNTIME_DIR/$log" ]]; then
+            cp "$RUNTIME_DIR/$log" "$dest/$log" || true
+        fi
+    done
+}
 
 build() {
     if $SKIP_BUILD; then
