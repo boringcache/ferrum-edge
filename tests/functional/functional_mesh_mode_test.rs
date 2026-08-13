@@ -18203,7 +18203,6 @@ const H3_MESH_PLAIN_BACKEND_PATH: &str = "/echo";
 
 #[derive(Clone, Debug)]
 struct H3MeshObservedHttp {
-    scheme: String,
     authority: String,
     path: String,
     method: String,
@@ -18262,7 +18261,6 @@ async fn serve_h3_mesh_http_echo<T>(
         let observations = Arc::clone(&observations);
         let client_cert_der = client_cert_der.clone();
         async move {
-            let scheme = req.uri().scheme_str().unwrap_or("https").to_string();
             let authority = h3_mesh_observed_http_authority(&req);
             let path = req.uri().path().to_string();
             let method = req.method().as_str().to_string();
@@ -18271,7 +18269,6 @@ async fn serve_h3_mesh_http_echo<T>(
                 .lock()
                 .unwrap_or_else(|p| p.into_inner())
                 .push(H3MeshObservedHttp {
-                    scheme,
                     authority,
                     path: path.clone(),
                     method,
@@ -18320,7 +18317,6 @@ where
     let service = service_fn(move |req: hyper::Request<hyper::body::Incoming>| {
         let observations = Arc::clone(&observations);
         async move {
-            let scheme = req.uri().scheme_str().unwrap_or("https").to_string();
             let authority = h3_mesh_observed_http_authority(&req);
             let path = req.uri().path().to_string();
             let method = req.method().as_str().to_string();
@@ -18329,7 +18325,6 @@ where
                 .lock()
                 .unwrap_or_else(|p| p.into_inner())
                 .push(H3MeshObservedHttp {
-                    scheme,
                     authority,
                     path: path.clone(),
                     method,
