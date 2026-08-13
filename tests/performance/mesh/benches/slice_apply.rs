@@ -55,6 +55,7 @@ fn build_gateway_config(n_workloads: usize) -> GatewayConfig {
             }],
             workloads: vec![WorkloadRef { spiffe_id }],
             protocol_overrides: HashMap::new(),
+            cluster_ips: vec![],
             uid: None,
         });
     }

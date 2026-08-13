@@ -232,10 +232,10 @@ fn mesh_file_at_documented_ceiling_constant_is_admitted_by_stable_reader() {
 }
 
 #[test]
-fn unknown_extension_json_object_parses_once_through_yaml_superset() {
+fn unknown_extension_json_object_uses_yaml_without_json_fallback() {
     // Unknown paths use the YAML parser directly. JSON remains accepted because
-    // it is a YAML subset, and YAML flow mappings retain their historical
-    // behavior instead of being misclassified as strict JSON.
+    // it is a YAML subset, not because of a content-classification parse or
+    // JSON fallback. YAML flow mappings retain their historical behavior.
     let json = serde_json::json!({
         "mesh": {
             "services": [{
@@ -261,6 +261,83 @@ fn unknown_extension_json_object_parses_once_through_yaml_superset() {
     let flow_slice = load_mesh_slice_from_file(&flow_yaml, request_for_namespace("ferrum"))
         .expect("YAML flow mapping with unknown extension");
     assert_eq!(flow_slice.services.len(), 1);
+}
+
+#[test]
+fn yaml_alias_bomb_is_rejected_without_echoing_payload() {
+    let yaml = concat!(
+        "version: \"1\"\n",
+        "a: &a [1,2,3,4,5,6,7,8]\n",
+        "b: &b [*a,*a,*a,*a,*a,*a,*a,*a]\n",
+        "c: &c [*b,*b,*b,*b,*b,*b,*b,*b]\n",
+        "d: &d [*c,*c,*c,*c,*c,*c,*c,*c]\n",
+        "e: &e [*d,*d,*d,*d,*d,*d,*d,*d]\n",
+        "f: &f [*e,*e,*e,*e,*e,*e,*e,*e]\n",
+        "g: &g [*f,*f,*f,*f,*f,*f,*f,*f]\n",
+        "mesh:\n",
+        "  services:\n",
+        "    - name: api\n",
+        "      namespace: ferrum\n",
+        "      ports:\n",
+        "        - port: 80\n",
+        "          protocol: http\n",
+        "      extra: *g\n",
+    );
+    let path = write_temp("yaml", yaml);
+    let err = load_mesh_slice_from_file(&path, request_for_namespace("ferrum"))
+        .expect_err("alias bomb must fail closed");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("invalid mesh configuration document"),
+        "got: {msg}"
+    );
+    assert!(
+        msg.contains("exceeds") || msg.contains("limit"),
+        "got: {msg}"
+    );
+    assert!(
+        !msg.contains("[1,2,3") && !msg.contains("*g"),
+        "mesh diagnostics must not echo the hostile graph: {msg}"
+    );
+}
+
+#[test]
+fn yaml_comments_with_ampersands_and_stars_do_not_trip_alias_admission() {
+    let yaml = concat!(
+        "# keep &anchor and *alias in this comment\n",
+        "version: \"1\"\n",
+        "mesh:\n",
+        "  services:\n",
+        "    - name: api\n",
+        "      namespace: ferrum\n",
+        "      ports:\n",
+        "        - port: 80\n",
+        "          protocol: http\n",
+    );
+    let path = write_temp("yaml", yaml);
+    let slice = load_mesh_slice_from_file(&path, request_for_namespace("ferrum"))
+        .expect("comment text must not fail alias admission");
+    assert_eq!(slice.services.len(), 1);
+    assert_eq!(slice.services[0].name, "api");
+}
+
+#[test]
+fn unknown_extension_mesh_loader_rejects_alias_before_later_malformation() {
+    let yaml = concat!(
+        "version: &private-version \"1\"\n",
+        "copy: *private-version\n",
+        "broken: [mesh-secret\n",
+    );
+    let path = write_temp("unknown", yaml);
+    let err = load_mesh_slice_from_file(&path, request_for_namespace("ferrum"))
+        .expect_err("unknown extensions must use guarded YAML without fallback");
+    let rendered = err.to_string();
+    assert!(
+        rendered.contains("YAML document containing aliases is malformed or unsupported"),
+        "got: {rendered}"
+    );
+    assert!(!rendered.contains("private-version"));
+    assert!(!rendered.contains("mesh-secret"));
 }
 
 #[test]
