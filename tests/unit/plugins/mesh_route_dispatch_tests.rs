@@ -912,6 +912,41 @@ fn upstream_override_swaps_arc_and_sets_upstream_id() {
 }
 
 #[test]
+fn upstream_override_without_snapshot_resets_source_tls() {
+    let mut proxy_template = (*upstream_proxy()).clone();
+    proxy_template.resolved_tls = BackendTlsConfig {
+        client_cert_path: Some("/certs/upstream.pem".to_string()),
+        client_key_path: Some("/certs/upstream.key".to_string()),
+        server_ca_cert_path: Some("/certs/upstream-ca.pem".to_string()),
+        verify_server_cert: false,
+        sni: None,
+        san_allow_list: Vec::new(),
+        san_allow_list_key_digest: None,
+    };
+    proxy_template.dispatch_port_overrides = Some(HashMap::from([(
+        8080,
+        ResolvedPortOverride {
+            connect_timeout_ms: Some(1_500),
+            ..Default::default()
+        },
+    )]));
+    let proxy = Arc::new(proxy_template);
+    let mut ctx = ctx();
+    ctx.route_override_upstream_id = Some("canary".to_string());
+
+    let result = ctx.apply_route_overrides(Arc::clone(&proxy));
+    assert_eq!(result.upstream_id.as_deref(), Some("canary"));
+    assert!(
+        result.resolved_tls.client_cert_path.is_none() && result.resolved_tls.verify_server_cert,
+        "convenience helper must fail closed instead of keeping source upstream TLS"
+    );
+    assert!(
+        result.dispatch_port_overrides.is_none(),
+        "convenience helper must clear source per-port overlays without a snapshot"
+    );
+}
+
+#[test]
 fn upstream_override_clears_inherited_subset() {
     let mut proxy_template = (*upstream_proxy()).clone();
     proxy_template.upstream_subset = Some("stable-v1".to_string());
@@ -997,7 +1032,7 @@ fn upstream_override_recomputes_dispatch_port_overrides() {
     )]));
     let proxy = Arc::new(proxy_template);
     let upstreams = HashMap::from([(
-        "canary".to_string(),
+        ferrum_edge::config::db_backend::namespaced_runtime_key(&proxy.namespace, "canary"),
         upstream_with_port_overrides("canary", &[(9090, 250)]),
     )]);
     let mut ctx = ctx();
