@@ -257,6 +257,12 @@ impl V001SqlBuilder {
             // audit_events is admin-only mutation history. It is not loaded into
             // GatewayConfig and is never touched by proxy/runtime hot paths.
             self.create_audit_events_sql(),
+            // gateway_trust_bundles is the authoritative namespace-keyed
+            // gateway/mesh trust resource (issue #3727). It has no foreign keys
+            // in either direction: trust is namespace-scoped, not proxy-scoped,
+            // and must survive a full resource clear so a restore cannot
+            // silently drop a namespace's roots.
+            self.create_gateway_trust_bundles_sql(),
         ] {
             sqlx::query(sql).execute(&mut *connection).await?;
         }
@@ -578,6 +584,54 @@ impl V001SqlBuilder {
                 api_spec_id TEXT,
                 created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
                 updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            )
+            "#
+        }
+    }
+
+    /// Authoritative namespace-keyed gateway trust bundles (issue #3727).
+    ///
+    /// `namespace` is the PRIMARY KEY, not `(namespace, id)`: the resource is a
+    /// singleton per namespace so the trust state a control plane projects into
+    /// a namespace-scoped ConfigSync slice is never ambiguous. `id` stays a
+    /// stable addressable identity for admin CRUD, and the primary key already
+    /// covers every query shape the store issues (`WHERE namespace = ?` and
+    /// `WHERE namespace = ? AND id = ?`), so no secondary index is created.
+    ///
+    /// `revision` is the optimistic-concurrency token. It is NOT a per-record
+    /// counter: the store stamps it from `config_changes.sequence` inside the
+    /// same transaction that writes `bundle`, so two admin replicas rotating
+    /// concurrently cannot both believe they won, AND a record deleted and
+    /// recreated never reuses a revision a stale client still holds. The column
+    /// default exists only so the DDL is well-formed; every write supplies an
+    /// explicit value.
+    fn create_gateway_trust_bundles_sql(&self) -> &'static str {
+        if self.is_mysql() {
+            r#"
+            CREATE TABLE IF NOT EXISTS gateway_trust_bundles (
+                namespace VARCHAR(255) COLLATE utf8mb4_0900_bin NOT NULL,
+                id VARCHAR(255) COLLATE utf8mb4_0900_bin NOT NULL,
+                trust_domain VARCHAR(255) COLLATE utf8mb4_0900_bin NOT NULL,
+                bundle MEDIUMTEXT NOT NULL,
+                revision BIGINT NOT NULL DEFAULT 1,
+                updated_by VARCHAR(255) COLLATE utf8mb4_0900_bin,
+                created_at VARCHAR(64) NOT NULL,
+                updated_at VARCHAR(64) NOT NULL,
+                PRIMARY KEY (namespace)
+            )
+            "#
+        } else {
+            r#"
+            CREATE TABLE IF NOT EXISTS gateway_trust_bundles (
+                namespace TEXT NOT NULL,
+                id TEXT NOT NULL,
+                trust_domain TEXT NOT NULL,
+                bundle TEXT NOT NULL,
+                revision BIGINT NOT NULL DEFAULT 1,
+                updated_by TEXT,
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                PRIMARY KEY (namespace)
             )
             "#
         }

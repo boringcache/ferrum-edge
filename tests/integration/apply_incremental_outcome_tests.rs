@@ -21,11 +21,14 @@ use chrono::{Duration, Utc};
 
 use ferrum_edge::config::db_loader::{IncrementalResult, NamespacedResourceId};
 use ferrum_edge::config::file_loader::load_config_from_file;
+use ferrum_edge::config::gateway_trust::GatewayTrustBundleRecord;
 use ferrum_edge::config::types::{
     AuthMode, BackendScheme, Consumer, DispatchKind, GatewayConfig, LoadBalancerAlgorithm,
     PluginConfig, PluginScope, Proxy, Upstream, UpstreamTarget,
 };
 use ferrum_edge::dns::{DnsCache, DnsConfig};
+use ferrum_edge::identity::TrustDomain;
+use ferrum_edge::modes::mesh::config::{TrustBundle, TrustBundleSet};
 use ferrum_edge::plugins::{PluginResult, ProxyProtocol, REQUEST_ID_METADATA_KEY, RequestContext};
 use ferrum_edge::proxy::{ConfigApplyOutcome, ProxyState};
 use tempfile::TempDir;
@@ -405,6 +408,53 @@ async fn update_config_empty_candidate_returns_unchanged() {
         state.config.load().proxies.is_empty(),
         "unchanged full candidate must not mutate runtime config"
     );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn update_config_publishes_trust_only_create_rotation_and_revocation() {
+    let state = empty_proxy_state();
+    let authority = {
+        let key = rcgen::KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).unwrap();
+        let mut params = rcgen::CertificateParams::new(Vec::<String>::new()).unwrap();
+        params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+        params
+            .distinguished_name
+            .push(rcgen::DnType::CommonName, "trust-only-publication");
+        let cert = params.self_signed(&key).unwrap();
+        base64::engine::general_purpose::STANDARD.encode(cert.der())
+    };
+    let bundle = TrustBundleSet {
+        local: TrustBundle {
+            trust_domain: TrustDomain::new("cluster.local").unwrap(),
+            x509_authorities: vec![authority],
+            jwt_authorities: Vec::new(),
+            refresh_hint_seconds: None,
+        },
+        federated: Vec::new(),
+    };
+    let mut record = GatewayTrustBundleRecord::new("ferrum", "ferrum", bundle);
+    record.revision = 1;
+
+    let created = GatewayConfig {
+        gateway_trust_bundles: vec![record.clone()],
+        ..Default::default()
+    };
+    assert_eq!(state.update_config(created), ConfigApplyOutcome::Applied);
+    assert_eq!(state.config.load().gateway_trust_bundles[0].revision, 1);
+
+    record.revision = 2;
+    let rotated = GatewayConfig {
+        gateway_trust_bundles: vec![record],
+        ..Default::default()
+    };
+    assert_eq!(state.update_config(rotated), ConfigApplyOutcome::Applied);
+    assert_eq!(state.config.load().gateway_trust_bundles[0].revision, 2);
+
+    assert_eq!(
+        state.update_config(GatewayConfig::default()),
+        ConfigApplyOutcome::Applied
+    );
+    assert!(state.config.load().gateway_trust_bundles.is_empty());
 }
 
 #[tokio::test(flavor = "multi_thread")]
