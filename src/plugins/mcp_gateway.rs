@@ -1358,9 +1358,7 @@ impl McpGateway {
         let request = self
             .http_client
             .get()
-            .map_err(|error| {
-                format!("failed to initialize upstream MCP server: {error}")
-            })?
+            .map_err(|error| format!("failed to initialize upstream MCP server: {error}"))?
             .post(&server.upstream_url)
             .header("content-type", "application/json")
             .header("accept", MCP_STREAMABLE_HTTP_ACCEPT)

@@ -158,10 +158,7 @@ impl Plugin for HttpLogging {
 async fn send_batch(cfg: &HttpFlushConfig, batch: &[QueuedSummaryPayload]) -> Result<(), String> {
     let entry_count = batch.len();
     let body = assemble_json_array(batch);
-    let client = cfg
-        .http_client
-        .get()
-        .map_err(|error| error.to_string())?;
+    let client = cfg.http_client.get().map_err(|error| error.to_string())?;
     let mut req = client
         .post(&cfg.endpoint_url)
         .header(http::header::CONTENT_TYPE, "application/json")
