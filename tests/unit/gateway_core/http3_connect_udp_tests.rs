@@ -8,7 +8,7 @@
 //! [`CapsuleDecoder`], and frames target datagrams with
 //! [`encode_udp_datagram_capsule`].
 
-use ferrum_edge::config::types::{GatewayConfig, Proxy, Upstream};
+use ferrum_edge::config::types::{GatewayConfig, HttpFlavor, Proxy, Upstream};
 use ferrum_edge::http3::connect_udp::{
     AdmittedConnectUdpDestination, CONNECT_UDP_MAX_PAYLOAD_BYTES,
     CONNECT_UDP_NON_FRAGMENTATION_ENFORCEABLE, CapsuleDecodeError, CapsuleDecoder, CapsuleEvent,
@@ -21,6 +21,7 @@ use ferrum_edge::http3::connect_udp::{
     strip_forbidden_capsule_protocol_response_fields, validate_connect_udp_request_shape,
 };
 use ferrum_edge::load_balancer::{LoadBalancerCache, LoadBalancerCacheInner};
+use ferrum_edge::proxy::backend_dispatch::detect_http_flavor;
 use ferrum_edge::proxy::hbone_pool::HBONE_TARGET_TAG;
 use ferrum_edge::proxy::mesh_mtls_pool::{MESH_CROSS_CLUSTER_TAG, MESH_MTLS_TARGET_TAG};
 use ferrum_edge::proxy::unix_backend::MESH_UNIX_SOCKET_TAG;
@@ -73,6 +74,25 @@ fn rejects_a_path_without_the_udp_anchor() {
         parse_connect_udp_target("/dns.example/853/"),
         Err(ConnectUdpTargetRejection::TemplateAnchorMissing)
     );
+}
+
+#[test]
+fn rejects_a_case_folded_udp_anchor() {
+    // RFC 9298 §2 expands the literal `udp` segment; URI path matching is
+    // case-sensitive. A case-insensitive compare would admit `/UDP/.../`
+    // which is not template output.
+    for path in [
+        "/UDP/dns.example/53/",
+        "/Udp/dns.example/53/",
+        "/.well-known/masque/UDP/dns.example/53/",
+        "/.well-known/masque/Udp/dns.example/53/",
+    ] {
+        assert_eq!(
+            parse_connect_udp_target(path),
+            Err(ConnectUdpTargetRejection::TemplateAnchorMissing),
+            "{path} must be refused"
+        );
+    }
 }
 
 #[test]
@@ -856,6 +876,41 @@ fn a_bare_connect_and_a_non_connect_request_are_not_extended_connect() {
     assert_eq!(classify_h3_extended_connect(&get), H3ExtendedConnect::None);
 }
 
+#[test]
+fn connect_udp_classification_ignores_spoofed_grpc_content_types() {
+    // The wire classifier keys native gRPC on Content-Type, so a hostile
+    // CONNECT-UDP can look like gRPC until the handler's Extended CONNECT
+    // override forces Plain. Classification itself must still be ConnectUdp
+    // so the RFC 9297 field refusal runs.
+    for content_type in ["application/grpc", "application/grpc-web+proto"] {
+        let mut req = connect_request(Some(h3::ext::Protocol::CONNECT_UDP));
+        req.headers_mut().insert(
+            hyper::header::CONTENT_TYPE,
+            content_type.parse().expect("content-type"),
+        );
+        assert_eq!(
+            classify_h3_extended_connect(&req),
+            H3ExtendedConnect::ConnectUdp,
+            "{content_type} must not hide connect-udp"
+        );
+        if content_type == "application/grpc" {
+            assert_eq!(
+                detect_http_flavor(&req),
+                HttpFlavor::Grpc,
+                "the shared wire classifier still sees native gRPC Content-Type; \
+                 handle_h3_request must override that to Plain"
+            );
+        } else {
+            assert_eq!(
+                detect_http_flavor(&req),
+                HttpFlavor::Plain,
+                "gRPC-Web stays Plain in detect_http_flavor; the handler must \
+                 still suppress gRPC-Web response shaping"
+            );
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // RFC 9298 §3 request shape
 // ---------------------------------------------------------------------------
@@ -1450,4 +1505,128 @@ fn the_rfc9298_profile_is_only_offered_where_non_fragmentation_is_enforceable() 
         "Linux and Apple both expose a do-not-fragment option; losing that would silently \
          disable the whole profile"
     );
+}
+
+/// Collapse whitespace so rustfmt wrapping cannot hide a source-contract needle.
+fn squeeze(source: &str) -> String {
+    let collapsed: String = source.split_whitespace().collect();
+    collapsed.replace(",)", ")")
+}
+
+fn handle_h3_request_source() -> &'static str {
+    let src = include_str!("../../../src/http3/server.rs");
+    let start = src
+        .find("async fn handle_h3_request(")
+        .expect("handle_h3_request must exist");
+    &src[start..]
+}
+
+#[test]
+fn handle_h3_request_rejects_connect_udp_in_early_data_before_routing() {
+    // Functional admission contract of the live H3 handler: every CONNECT-UDP
+    // request in TLS 1.3 early data is 425, regardless of the CONNECT
+    // allowlist, and that refusal is ordered before 501/400, the generic
+    // method gate, routing, plugins, DNS, and the tunnel handler.
+    let squeezed = squeeze(handle_h3_request_source());
+    let connect_udp_425 = squeezed
+        .find("ifis_connect_udp_request&&is_early_data{")
+        .expect("CONNECT-UDP 0-RTT must have a categorical early-data gate");
+    let profile_501 = squeezed
+        .find("connect_udp_profile_available")
+        .expect("disabled-profile 501 must remain present");
+    let malformed = squeezed
+        .find("validate_connect_udp_request_shape")
+        .expect("RFC 9298 shape check must remain present");
+    let generic_425 = squeezed
+        .find("ifis_early_data&&!state.early_data_methods.contains(&method){")
+        .expect("generic 0-RTT method allowlist must remain present");
+    let routing = squeezed
+        .find("state.router_cache.find_proxy_in_epoch(")
+        .expect("route lookup must remain present");
+    let plugins = squeezed
+        .find("letrequest_protocol=h3_plugin_protocol_for_request(")
+        .expect("plugin protocol selection must remain present");
+    let dns = squeezed
+        .find("letbackend_resolved_ip=ifis_connect_udp_request{None}else{")
+        .expect("CONNECT-UDP must skip the ordinary-backend DNS lookup");
+    let tunnel = squeezed
+        .find("crate::http3::connect_udp::handle_h3_connect_udp(")
+        .expect("CONNECT-UDP dispatch must remain present");
+
+    let arm = &squeezed[connect_udp_425..profile_501];
+    assert!(
+        arm.contains("StatusCode::TOO_EARLY"),
+        "CONNECT-UDP 0-RTT must emit 425 Too Early"
+    );
+    assert!(
+        arm.contains(r#"{"error":"CONNECT-UDP is not allowed in 0-RTT early data"}"#),
+        "CONNECT-UDP 0-RTT must use a CONNECT-UDP-specific 425 body"
+    );
+    assert!(
+        !arm.contains("early_data_methods.contains"),
+        "CONNECT-UDP 0-RTT refusal must not consult the generic CONNECT allowlist"
+    );
+    assert!(
+        connect_udp_425 < profile_501
+            && connect_udp_425 < malformed
+            && connect_udp_425 < generic_425
+            && generic_425 < routing
+            && routing < plugins
+            && plugins < dns
+            && dns < tunnel,
+        "CONNECT-UDP 425 must precede 501/400, the generic method gate, routing, \
+         plugins, DNS, and tunnel dispatch"
+    );
+}
+
+#[test]
+fn handle_h3_request_forces_plain_connect_udp_flavor_over_content_type() {
+    let handler = handle_h3_request_source();
+    let squeezed = squeeze(handler);
+    assert!(
+        squeezed.contains("letgrpc_web_response_content_type_owned=ifdetected_http_flavor==HttpFlavor::WebSocket||is_connect_udp_request{None}"),
+        "CONNECT-UDP must suppress gRPC-Web shaping the same way WebSocket does"
+    );
+    assert!(
+        squeezed.contains("lethttp_flavor=ifis_connect_udp_request{HttpFlavor::Plain}elseifgrpc_web_response_content_type.is_some(){HttpFlavor::Grpc}"),
+        "CONNECT-UDP must force Plain rejection/plugin flavor before gRPC-Web promotion"
+    );
+    assert!(
+        squeezed.contains("letrequest_protocol=h3_plugin_protocol_for_request(ifis_connect_udp_request{HttpFlavor::Plain}else{detected_http_flavor}"),
+        "CONNECT-UDP plugin selection must use Plain, not a spoofed gRPC wire flavor"
+    );
+}
+
+#[test]
+fn handle_h3_request_skips_ordinary_backend_dns_for_connect_udp() {
+    let handler = handle_h3_request_source();
+    let squeezed = squeeze(handler);
+    let skip = squeezed
+        .find("letbackend_resolved_ip=ifis_connect_udp_request{None}else{")
+        .expect("CONNECT-UDP must bind backend_resolved_ip to None without resolving");
+    let resolve = squeezed[skip..]
+        .find("state.dns_cache.resolve(")
+        .expect("ordinary H3 dispatch must still resolve the selected backend");
+    let tunnel = squeezed
+        .find("crate::http3::connect_udp::handle_h3_connect_udp(")
+        .expect("CONNECT-UDP dispatch must remain present");
+    assert!(
+        skip < tunnel,
+        "the DNS skip must sit on the CONNECT-UDP path before tunnel dispatch"
+    );
+    assert!(
+        skip + resolve < tunnel,
+        "the ordinary resolve must remain in the else-arm, not run for CONNECT-UDP"
+    );
+}
+
+#[test]
+fn functional_connect_udp_suite_covers_plain_grpc_content_type_rejection() {
+    let src = include_str!("../../functional/functional_http3_connect_udp_test.rs");
+    assert!(
+        src.contains("functional_h3_connect_udp_refuses_spoofed_grpc_content_types_as_plain_400"),
+        "the live suite must pin native-gRPC and gRPC-Web Content-Type as plain 400"
+    );
+    assert!(src.contains("application/grpc-web+proto"));
+    assert!(src.contains("must be a plain malformed CONNECT-UDP rejection, not a gRPC 200"));
 }

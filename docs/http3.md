@@ -774,7 +774,12 @@ pinning the recv task for the QUIC idle-timeout window.
 RFC 9220 Extended CONNECT can in principle be carried in QUIC 0-RTT
 early data, but `FERRUM_TLS_EARLY_DATA_METHODS` does NOT list `CONNECT`
 by default — operators who want WebSocket upgrades via 0-RTT must opt
-in explicitly. When early data is enabled for HTTP/3 without frontend mTLS, the
+in explicitly. **CONNECT-UDP is never admitted in early data**, even
+when that allowlist includes `CONNECT`: UDP has no `Early-Data: 1`
+header boundary for a target to make its own replay-safety decision, so
+the handler rejects every 0-RTT `connect-udp` stream with `425 Too Early`
+before routing, plugins, or any socket work. When early data is enabled for
+HTTP/3 without frontend mTLS, the
 QUIC TLS layer advertises `max_early_data_size = u32::MAX` because quinn/rustls
 reject every other non-zero value; Ferrum's method allowlist is the
 application-layer admission control (there is no finite QUIC TLS byte cap). On
@@ -842,6 +847,16 @@ plain H3 requests continue to route.
 Implementation: `src/http3/connect_udp.rs`. Off by default; enable with
 `FERRUM_HTTP3_CONNECT_UDP_ENABLED=true`.
 
+**Warning — process-wide enablement.** Setting
+`FERRUM_HTTP3_CONNECT_UDP_ENABLED=true` admits RFC 9298 Extended CONNECT on
+**every** HTTP/3 HTTP route whose routing and `allowed_methods` policy already
+allow `CONNECT`. There is no per-route CONNECT-UDP schema. An ordinary route
+with no method filter can match a suffix such as `/udp/host/port/` (the RFC
+9298 template expansion, including under `/.well-known/masque/`). Deploy a
+**dedicated MASQUE route** (distinct `hosts` and/or `listen_path`), require
+authentication and authorization on that route, and set explicit
+`allowed_methods` on every other H3 route that must not expose CONNECT.
+
 ### Interoperability profile
 
 This is the complete profile. Anything outside it is refused; there is no
@@ -850,7 +865,8 @@ private Ferrum framing.
 | Aspect | Behavior |
 | --- | --- |
 | Bootstrap | RFC 9298 §3 over HTTP/3: `:method=CONNECT`, `:protocol=connect-udp`, `:scheme=https`, `:authority` = gateway authority |
-| URI Template | RFC 9298 §2. The default `https://$HOST:$PORT/.well-known/masque/udp/{target_host}/{target_port}/` works verbatim. Any operator prefix is accepted as long as the expanded path ends with `udp/{target_host}/{target_port}/`, trailing slash included |
+| URI Template | RFC 9298 §2. The default `https://$HOST:$PORT/.well-known/masque/udp/{target_host}/{target_port}/` works verbatim. Any operator prefix is accepted as long as the expanded path ends with `udp/{target_host}/{target_port}/`, trailing slash included. The `udp` segment is a case-sensitive URI path literal (`UDP` / `Udp` are refused) |
+| 0-RTT | CONNECT-UDP in TLS 1.3 early data is **always** `425 Too Early`, even when `CONNECT` is listed in `FERRUM_TLS_EARLY_DATA_METHODS`. UDP has no `Early-Data: 1` header for a target to make its own replay-safety decision. Ordinary 1-RTT CONNECT-UDP is unchanged; operator-enabled H3 WebSocket 0-RTT is unchanged |
 | Success response | `200` with `Capsule-Protocol: ?1` (RFC 9297 §3.4), written after response-header policy so no plugin can remove or forge it. `Content-Length` and `Content-Type` are force-removed at the same boundary (RFC 9297 §3.2 forbids them; the hop-by-hop strip already removes `Transfer-Encoding`) |
 | Payload encoding | HTTP Datagrams as RFC 9297 **DATAGRAM capsules** (`Capsule Type = 0x00`) on the CONNECT stream |
 | `SETTINGS_H3_DATAGRAM` | Never negotiated. QUIC DATAGRAM frames are not used in either direction |
@@ -1156,7 +1172,7 @@ The frontend HTTP/2 listener applies the same conservative-by-default philosophy
 | `FERRUM_HTTP3_FLUSH_INTERVAL_MICROS` | `200` | Response coalesce time-based flush interval. H3-specific (the H1/H2-via-reqwest path uses opportunistic Pending-flush instead, so it has no flush-interval knob). |
 | `FERRUM_HTTP3_REQUEST_BODY_CHANNEL_CAPACITY` | `32` | Cross-protocol bridge mpsc capacity (range: 1–1024) |
 | `FERRUM_HTTP3_WEBSOCKET_ENABLED` | `true` | Advertise `SETTINGS_ENABLE_CONNECT_PROTOCOL` and accept RFC 9220 Extended CONNECT WebSocket. See [WebSocket over HTTP/3](#websocket-over-http3-rfc-9220-extended-connect). |
-| `FERRUM_HTTP3_CONNECT_UDP_ENABLED` | `false` | Accept RFC 9298 UDP proxying Extended CONNECT (`:protocol=connect-udp`). Off by default; `501` while disabled. Requires a build target with a do-not-fragment socket option (Linux/Android, macOS) because RFC 9298 §3.1 forbids introducing IP fragmentation — elsewhere `true` is a startup validation error. See [CONNECT-UDP over HTTP/3](#connect-udp-over-http3-rfc-9298). |
+| `FERRUM_HTTP3_CONNECT_UDP_ENABLED` | `false` | Accept RFC 9298 UDP proxying Extended CONNECT (`:protocol=connect-udp`). Off by default; `501` while disabled. **Process-wide:** every H3 HTTP route whose routing and `allowed_methods` policy admits CONNECT can match a `/udp/host/port/` suffix — use a dedicated MASQUE route/host/path, authentication/authorization, and explicit method filters on routes that must not expose CONNECT. Requires a build target with a do-not-fragment socket option (Linux/Android, macOS) because RFC 9298 §3.1 forbids introducing IP fragmentation — elsewhere `true` is a startup validation error. CONNECT-UDP in TLS 1.3 early data is always `425`, even when `CONNECT` is in `FERRUM_TLS_EARLY_DATA_METHODS`. See [CONNECT-UDP over HTTP/3](#connect-udp-over-http3-rfc-9298). |
 | `FERRUM_HTTP3_CONNECT_UDP_MAX_SESSIONS` | `256` | Maximum concurrent CONNECT-UDP tunnels for this process; `503` over the limit. `0` disables the limit. A value above the tokio semaphore permit ceiling is a startup validation error, never a silent clamp or a silent "unlimited". |
 | `FERRUM_HTTP3_CONNECT_UDP_IDLE_TIMEOUT_SECONDS` | `120` | Seconds a tunnel may carry no datagram in either direction (clamped 1–86400). The default is the two minutes RFC 9298 §3.2 says a UDP proxy SHOULD NOT go below. This value is also the floor for the frontend QUIC connection idle timeout while the profile is enabled, so the advertised tunnel lifetime is the one that actually holds. |
 | `FERRUM_HTTP3_CONNECT_UDP_MAX_DATAGRAM_BYTES` | `65,527` | Largest relayed UDP payload (clamped 1–65527, the RFC 9298 §5 Context ID 0 ceiling). Scales every per-session buffer — see [Bounds and lifecycle](#bounds-and-lifecycle). |

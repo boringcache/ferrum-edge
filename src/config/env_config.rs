@@ -2760,6 +2760,12 @@ pub struct EnvConfig {
     /// target of its upstream). Payloads ride RFC 9297 DATAGRAM capsules on
     /// the CONNECT stream; `SETTINGS_H3_DATAGRAM` is never negotiated.
     ///
+    /// This flag is process-wide: every H3 HTTP route whose routing and
+    /// `allowed_methods` policy admits CONNECT can match a suffix such as
+    /// `/udp/host/port/`. Deploy a dedicated MASQUE route (host/path),
+    /// authentication/authorization, and explicit method filters on routes
+    /// that must not expose CONNECT. There is no per-route enablement schema.
+    ///
     /// When `false` (the default) a `connect-udp` Extended CONNECT is refused
     /// with 501, and the setting is not advertised unless the WebSocket
     /// profile is separately enabled. Enabling UDP tunnelling changes what a
@@ -2777,9 +2783,12 @@ pub struct EnvConfig {
     /// before it is closed (default 120). RFC 9298 §3.2 recommends that a UDP
     /// proxy "SHOULD NOT" use an idle timeout shorter than two minutes, so the
     /// default is exactly that; the accepted range stays 1–86400 so an operator
-    /// can deliberately choose a tighter bound. The QUIC connection idle
-    /// timeout (`FERRUM_HTTP3_IDLE_TIMEOUT`) applies independently and may
-    /// close an otherwise-idle connection sooner.
+    /// can deliberately choose a tighter bound. While the profile is enabled,
+    /// this value is also the floor for the frontend QUIC `max_idle_timeout`
+    /// (`EnvConfig::effective_http3_idle_timeout_seconds`): the derivation
+    /// only raises, leaves `FERRUM_HTTP3_IDLE_TIMEOUT=0` (disabled) alone, and
+    /// does not touch H3 backend pools, so the advertised tunnel lifetime is
+    /// the one that actually holds.
     pub http3_connect_udp_idle_timeout_seconds: u64,
     /// Largest UDP payload relayed in either direction (default 65527, the
     /// RFC 9298 §5 ceiling for Context ID 0). Larger datagrams received from

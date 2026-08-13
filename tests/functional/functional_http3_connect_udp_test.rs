@@ -24,7 +24,9 @@
 //!   client FIN in the middle of a capsule doing the same
 //! - the RFC 9298 §3 pseudo-header shape (a non-HTTPS `:scheme` never tunnels)
 //! - the RFC 9297 §3.2 forbidden fields refused on the request and absent from
-//!   the successful response
+//!   the successful response — including spoofed native-gRPC and gRPC-Web
+//!   Content-Type values, which must be a plain 400 rather than a gRPC
+//!   HTTP-200 trailers response
 //! - the concurrent-session limit
 //! - a live tunnel torn down by a SIGHUP reload that withdraws the destination
 //!
@@ -925,6 +927,77 @@ async fn functional_h3_connect_udp_refuses_capsule_protocol_forbidden_fields() {
         Some("?1")
     );
     tunnel.close().await;
+
+    gateway.shutdown();
+}
+
+#[ignore]
+#[tokio::test]
+async fn functional_h3_connect_udp_refuses_spoofed_grpc_content_types_as_plain_400() {
+    // Extended CONNECT classification must win over Content-Type: a CONNECT-UDP
+    // request with forbidden `application/grpc` or `application/grpc-web*` is
+    // still a Capsule Protocol malformed message (RFC 9297 §3.2), not a gRPC
+    // RPC. The 400 must be a plain JSON body, never HTTP 200 + trailers.
+    let echo = UdpEcho::spawn().await;
+    let (mut gateway, https_port) = start_masque_gateway(
+        masque_config(echo.port),
+        &[("FERRUM_HTTP3_CONNECT_UDP_ENABLED", "true")],
+    )
+    .await;
+
+    let client = Http3Client::insecure().expect("H3 client");
+    let url = tunnel_url(https_port, "127.0.0.1", echo.port);
+
+    for content_type in ["application/grpc", "application/grpc-web+proto"] {
+        let mut last_error = None;
+        let deadline = std::time::Instant::now() + Duration::from_secs(40);
+        let mut tunnel = loop {
+            match client
+                .connect_udp_with_headers(&url, &[("content-type", content_type)])
+                .await
+            {
+                Ok(tunnel) => break tunnel,
+                Err(error) if std::time::Instant::now() < deadline => {
+                    last_error = Some(error.to_string());
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                }
+                Err(error) => panic!("request never completed; last={last_error:?}; final={error}"),
+            }
+        };
+        assert_eq!(
+            tunnel.status.as_u16(),
+            400,
+            "{content_type} must be a plain malformed CONNECT-UDP rejection, not a gRPC 200"
+        );
+        assert!(
+            tunnel.headers.get("grpc-status").is_none(),
+            "{content_type} must not be shaped as native gRPC trailers; headers={:?}",
+            tunnel.headers
+        );
+        let response_content_type = tunnel
+            .headers
+            .get("content-type")
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or("");
+        assert!(
+            !response_content_type
+                .to_ascii_lowercase()
+                .starts_with("application/grpc"),
+            "{content_type} must not return a gRPC media type, got {response_content_type}"
+        );
+        let body = tunnel
+            .recv_body_text(Duration::from_secs(5))
+            .await
+            .expect("drain body");
+        assert!(
+            body.contains("Content-Type"),
+            "unexpected body for {content_type}: {body}"
+        );
+        assert!(
+            !body.contains("grpc-status"),
+            "plain 400 must not carry a gRPC status payload for {content_type}: {body}"
+        );
+    }
 
     gateway.shutdown();
 }

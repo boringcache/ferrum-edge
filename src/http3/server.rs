@@ -1360,6 +1360,11 @@ async fn handle_h3_request(
     // same decision. An unregistered `:protocol` token never reaches here: h3
     // fails to parse it and resets the stream with H3_MESSAGE_ERROR.
     let extended_connect = crate::http3::connect_udp::classify_h3_extended_connect(&req);
+    // `classify_h3_extended_connect` already requires CONNECT, so this is the
+    // one Extended CONNECT-UDP flag every later gate (flavor, 0-RTT, 501/400,
+    // dispatch) reads. Computed here so Content-Type cannot win first.
+    let is_connect_udp_request =
+        extended_connect == crate::http3::connect_udp::H3ExtendedConnect::ConnectUdp;
     // Enforce configured HTTP/3 header limits before deriving any gRPC-Web
     // response encoding from request headers. gRPC-Web media negotiation may
     // preserve custom +suffix values in owned response Content-Type strings,
@@ -1424,9 +1429,13 @@ async fn handle_h3_request(
 
     // Extended CONNECT classification takes precedence over Content-Type.
     // Besides selecting the WebSocket plugin chain below, suppress gRPC-Web
-    // rejection shaping so a spoofed header cannot turn a WS policy reject
-    // into a gRPC-Web response.
-    let grpc_web_response_content_type_owned = if detected_http_flavor == HttpFlavor::WebSocket {
+    // rejection shaping so a spoofed header cannot turn a WS or CONNECT-UDP
+    // policy reject into a gRPC-Web response. CONNECT-UDP still refuses the
+    // spoofed Content-Type as an RFC 9297 §3.2 malformed message; this only
+    // stops that 400 from being rewritten as a gRPC-Web HTTP-200 body.
+    let grpc_web_response_content_type_owned = if detected_http_flavor == HttpFlavor::WebSocket
+        || is_connect_udp_request
+    {
         None
     } else {
         req.headers()
@@ -1457,7 +1466,13 @@ async fn handle_h3_request(
     // marker is known. The separate response content type above preserves
     // binary/text + format-suffix encoding for client-facing rejection and
     // response shaping after Accept negotiation.
-    let http_flavor = if grpc_web_response_content_type.is_some() {
+    // CONNECT-UDP is a Capsule Protocol tunnel, never gRPC: a spoofed
+    // `Content-Type: application/grpc` must not select trailers-only
+    // rejection or the gRPC plugin chain. RFC 9297 still forbids that
+    // field; the 400 below is a plain malformed-message response.
+    let http_flavor = if is_connect_udp_request {
+        HttpFlavor::Plain
+    } else if grpc_web_response_content_type.is_some() {
         HttpFlavor::Grpc
     } else {
         detected_http_flavor
@@ -1704,8 +1719,6 @@ async fn handle_h3_request(
     // refused here so no tunnel can be established that bypasses proxy
     // routing. An unregistered `:protocol` token never gets this far: h3
     // treats it as a malformed request and resets the stream.
-    let is_connect_udp_request = method == "CONNECT"
-        && extended_connect == crate::http3::connect_udp::H3ExtendedConnect::ConnectUdp;
     if method == "CONNECT" && http_flavor != HttpFlavor::WebSocket && !is_connect_udp_request {
         warn!("Rejected unsupported HTTP/3 CONNECT request");
         record_h3_flavor_aware_reject(&state, http_flavor, 405);
@@ -1717,6 +1730,29 @@ async fn handle_h3_request(
             r#"{"error":"CONNECT method is not allowed"}"#,
             crate::proxy::grpc_proxy::grpc_status::UNIMPLEMENTED,
             "CONNECT method is not allowed",
+        )
+        .await?;
+        return Ok(());
+    }
+    // CONNECT-UDP in TLS 1.3 early data is always 425 Too Early. UDP has no
+    // `Early-Data: 1` request-header boundary for a target to make its own
+    // replay-safety decision, so a replay would duplicate datagrams and side
+    // effects. The generic CONNECT allowlist (`FERRUM_TLS_EARLY_DATA_METHODS`)
+    // exists for operator-enabled RFC 9220 WebSocket and must not admit a
+    // CONNECT-UDP stream or its capsules. Ordinary 1-RTT CONNECT-UDP is
+    // unchanged. This runs before the 501/400 CONNECT-UDP gates, routing,
+    // plugins, and any socket work so every 0-RTT CONNECT-UDP is categorical.
+    if is_connect_udp_request && is_early_data {
+        warn!("Rejected HTTP/3 CONNECT-UDP request carried in 0-RTT early data");
+        record_h3_flavor_aware_reject(&state, http_flavor, 425);
+        send_h3_error_flavor_aware(
+            &mut stream,
+            http_flavor,
+            grpc_web_response_content_type,
+            StatusCode::TOO_EARLY,
+            r#"{"error":"CONNECT-UDP is not allowed in 0-RTT early data"}"#,
+            crate::proxy::grpc_proxy::grpc_status::UNAVAILABLE,
+            "CONNECT-UDP is not allowed in 0-RTT early data",
         )
         .await?;
         return Ok(());
@@ -2047,7 +2083,11 @@ async fn handle_h3_request(
     // requests still require WebSocket-scoped initial response policy and
     // transport-managed header stripping.
     let request_protocol = h3_plugin_protocol_for_request(
-        detected_http_flavor,
+        if is_connect_udp_request {
+            HttpFlavor::Plain
+        } else {
+            detected_http_flavor
+        },
         grpc_web_response_content_type.is_some(),
     );
     // Fault shaping must retain the immutable wire flavor: recognized
@@ -4886,7 +4926,9 @@ async fn handle_h3_request(
     let sticky_cookie_needed = selection.sticky_cookie_needed;
 
     // Resolve backend IP once from DNS cache (O(1) cached lookup) before dispatch.
-    // Shared across all response paths for TransactionSummary logging.
+    // Shared across all ordinary H3 response paths for TransactionSummary logging.
+    // CONNECT-UDP does not dial this host: no backend member is selected, and
+    // the tunnel handler resolves the client-named destination itself.
     let effective_host = upstream_target
         .as_ref()
         .map(|t| t.host.as_str())
@@ -4948,16 +4990,20 @@ async fn handle_h3_request(
         return Ok(());
     }
 
-    let backend_resolved_ip = state
-        .dns_cache
-        .resolve(
-            effective_host,
-            proxy.dns_override.as_deref(),
-            proxy.dns_cache_ttl_seconds,
-        )
-        .await
-        .ok()
-        .map(|ip| ip.to_string());
+    let backend_resolved_ip = if is_connect_udp_request {
+        None
+    } else {
+        state
+            .dns_cache
+            .resolve(
+                effective_host,
+                proxy.dns_override.as_deref(),
+                proxy.dns_cache_ttl_seconds,
+            )
+            .await
+            .ok()
+            .map(|ip| ip.to_string())
+    };
 
     // Determine if we can stream the request body directly to the backend
     // without buffering into Vec<u8>. Conditions:

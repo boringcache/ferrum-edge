@@ -17,10 +17,18 @@
 //!   is supported verbatim. Operators may host the endpoint under a different
 //!   prefix; the gateway requires only that the expanded path end with the
 //!   three anchored segments `udp/{target_host}/{target_port}/` (trailing
-//!   slash included, exactly as the template produces). Everything before
-//!   `udp` is an ordinary Ferrum `listen_path` and is matched by the ordinary
-//!   router, so CONNECT-UDP requests are routed, authenticated, authorized,
-//!   rate-limited, and logged by the same pipeline as every other request.
+//!   slash included, exactly as the template produces). The `udp` segment is
+//!   a case-sensitive URI path literal — `UDP` / `Udp` are refused. Everything
+//!   before `udp` is an ordinary Ferrum `listen_path` and is matched by the
+//!   ordinary router, so CONNECT-UDP requests are routed, authenticated,
+//!   authorized, rate-limited, and logged by the same pipeline as every other
+//!   request.
+//! * **0-RTT** — a CONNECT-UDP request carried in TLS 1.3 early data is
+//!   refused with 425 Too Early before routing, plugins, or any socket work,
+//!   even when `CONNECT` is in `FERRUM_TLS_EARLY_DATA_METHODS`. UDP has no
+//!   `Early-Data: 1` header for a target to make its own replay-safety
+//!   decision. Ordinary 1-RTT CONNECT-UDP and operator-enabled H3 WebSocket
+//!   0-RTT are unchanged.
 //! * **Payload encoding** — HTTP Datagrams (RFC 9297) carried as **DATAGRAM
 //!   capsules** (`Capsule Type = 0x00`) on the CONNECT stream. The gateway
 //!   does **not** negotiate `SETTINGS_H3_DATAGRAM`, so QUIC DATAGRAM frames
@@ -437,7 +445,10 @@ pub fn parse_connect_udp_target(path: &str) -> Result<ConnectUdpTarget, ConnectU
         return Err(ConnectUdpTargetRejection::TemplateAnchorMissing);
     }
     let anchor = segments[segments.len() - 4];
-    if !anchor.eq_ignore_ascii_case("udp") {
+    // RFC 9298 §2's URI Template expands the literal `udp` segment; URI path
+    // matching is case-sensitive. Anything else — including `UDP` / `Udp` —
+    // is outside this profile.
+    if anchor != "udp" {
         return Err(ConnectUdpTargetRejection::TemplateAnchorMissing);
     }
     let raw_host = segments[segments.len() - 3];

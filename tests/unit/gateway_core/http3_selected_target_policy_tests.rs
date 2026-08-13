@@ -582,9 +582,12 @@ fn h3_grpc_web_policy_flavor_is_separate_from_backend_transport() {
     let websocket_precedence = source
         .find("detected_http_flavor == HttpFlavor::WebSocket")
         .expect("H3 WebSocket classification must suppress gRPC-Web promotion");
+    let connect_udp_precedence = source
+        .find("|| is_connect_udp_request")
+        .expect("H3 CONNECT-UDP classification must suppress gRPC-Web promotion");
     let effective = source
-        .find("let http_flavor = if grpc_web_response_content_type.is_some()")
-        .expect("H3 must derive one effective gRPC flavor for gRPC-Web");
+        .find("let http_flavor = if is_connect_udp_request")
+        .expect("H3 CONNECT-UDP must force Plain before gRPC-Web promotion");
     let post_guard = source
         .find("if matches!(http_flavor, HttpFlavor::Grpc) && method != \"POST\"")
         .expect("H3 POST policy must use the effective flavor");
@@ -608,16 +611,21 @@ fn h3_grpc_web_policy_flavor_is_separate_from_backend_transport() {
 
     assert!(
         detected < websocket_precedence
-            && websocket_precedence < effective
+            && websocket_precedence < connect_udp_precedence
+            && connect_udp_precedence < effective
             && effective < plugin_protocol
             && plugin_protocol < wire_flavor_stamp
             && wire_flavor_stamp < post_guard
             && plugin_protocol < backend_flavor
             && backend_flavor <= translated_marker
             && plugin_protocol < bridge,
-        "wire classification, WebSocket precedence, policy promotion, route policy selection, \
+        "wire classification, WebSocket/CONNECT-UDP precedence, policy promotion, route policy selection, \
          immutable wire-flavor stamping, POST policy, translation-aware backend flavor, and \
          dispatch must stay in that order"
+    );
+    assert!(
+        source[effective..plugin_protocol].contains("HttpFlavor::Plain"),
+        "CONNECT-UDP must force Plain rejection flavor before gRPC-Web promotion"
     );
     assert!(
         source[bridge..].contains("flavor: backend_http_flavor,"),
