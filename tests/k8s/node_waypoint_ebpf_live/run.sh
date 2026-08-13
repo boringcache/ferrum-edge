@@ -5172,13 +5172,13 @@ run_node_waypoint_udp_same_port_demux_checks() {
   fi
   hits_a="$(udp_backend_received "$WORKLOAD_NS" udp-demux-a demux-shared-a)"
   hits_b="$(udp_backend_received "$WORKLOAD_NS" udp-demux-b demux-shared-b)"
-  local cross_a cross_b
-  cross_a="$(udp_backend_received "$WORKLOAD_NS" udp-demux-b demux-shared-a)"
-  cross_b="$(udp_backend_received "$WORKLOAD_NS" udp-demux-a demux-shared-b)"
+  local misroute_a misroute_b
+  misroute_a="$(udp_backend_received "$WORKLOAD_NS" udp-demux-b demux-shared-a)"
+  misroute_b="$(udp_backend_received "$WORKLOAD_NS" udp-demux-a demux-shared-b)"
   if [[ "$shared" != *"A:demux-a:demux-shared-a"* || "$shared" != *"B:demux-b:demux-shared-b"* \
-    || "$hits_a" == "0" || "$hits_b" == "0" || "$cross_a" != "0" || "$cross_b" != "0" ]]; then
+    || "$hits_a" == "0" || "$hits_b" == "0" || "$misroute_a" != "0" || "$misroute_b" != "0" ]]; then
     record_live_assertion node_waypoint.udp.same_port_demux_shared_client_tuple fail \
-      udp-src-a udp-demux-a "observed=$shared hits_a=$hits_a hits_b=$hits_b cross_a=$cross_a cross_b=$cross_b" \
+      udp-src-a udp-demux-a "observed=$shared hits_a=$hits_a hits_b=$hits_b misroute_a=$misroute_a misroute_b=$misroute_b" \
       "$(spiffe_for_sa src-a)" "$(spiffe_for_sa dst-a)" "node-waypoint-udp-same-port-demux"
     collect_traffic_failure_diagnostics
     return 1
