@@ -56,7 +56,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     enforces that cap against the shared lane, so an equivalent reload that
     changes capacity takes effect without forgetting live markers. Duplicate
     equivalent DPoP providers that share a replay domain must declare the same
-    cap. Remote JWKS/discovery URLs are bound by their canonical parsed form
+    `dpop_replay_scope` and the same cap (process scope). A mixed process/shared
+    pair is refused even when Redis is configured, because matching order would
+    otherwise claim the same proof once in the process store and once in Redis.
+    Remote JWKS/discovery URLs are bound by their canonical parsed form
     (host case and default ports converge; issuer matching stays exact).
     Configs carrying the removed keys are rejected with the replacement named.
   - **Redis HA requirement.** Any deployment running more than one gateway

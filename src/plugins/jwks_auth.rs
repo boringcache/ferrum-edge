@@ -452,13 +452,17 @@ impl JwksAuth {
 
         let mut providers = Vec::with_capacity(providers_arr.len());
         let mut declared_dpop_scopes: Vec<ReplayScope> = Vec::new();
-        // Equivalent process-scoped DPoP providers converge on one lane. They
-        // may share that lane only when they declare the same capacity;
-        // otherwise matching order would pick which cap applies. Track
-        // (earlier index, cap) per domain digest so a disagreement is refused
-        // at admission, order-independently, without binding capacity into
-        // the replay identity (that would reopen live proofs on a cap edit).
-        let mut process_replay_capacities: HashMap<[u8; 32], (usize, usize)> = HashMap::new();
+        // Equivalent providers (same issuer + JWKS source) converge on one
+        // replay domain. They may share that domain only when they agree on
+        // `require_dpop`, and when DPoP is required, on replay scope/store and
+        // process-lane capacity. Matching order, a reload, or a rolling replica
+        // would otherwise pick which authority a proof is claimed against and
+        // admit it twice. Track the first admission per identity so a
+        // disagreement is refused order-independently, without binding scope or
+        // capacity into the replay identity (that would reopen live proofs on
+        // an ordinary authorization or cap edit).
+        let mut equivalent_provider_replay: HashMap<String, EquivalentProviderReplayAdmission> =
+            HashMap::new();
 
         for (idx, prov_cfg) in providers_arr.iter().enumerate() {
             let prov_obj = prov_cfg.as_object().ok_or_else(|| {
@@ -596,40 +600,44 @@ impl JwksAuth {
             // when an unrelated provider is inserted or deleted ahead of it.
             //
             // See [`dpop_provider_identity`] for what the identity binds and,
-            // just as importantly, what it deliberately does not.
+            // just as importantly, what it deliberately does not. Identity is
+            // computed for every provider, including those that do not require
+            // DPoP, so a sibling that shares the trust anchor cannot skip the
+            // proof the DPoP provider exists to demand.
+            let provider_identity = dpop_provider_identity(
+                issuer.as_deref(),
+                jwks_endpoint.as_ref().map(|endpoint| &endpoint.parsed),
+                discovery_endpoint.as_ref().map(|endpoint| &endpoint.parsed),
+                inline_jwks.as_deref(),
+            );
+            if let Some(earlier) = equivalent_provider_replay.get(&provider_identity) {
+                reject_equivalent_provider_replay_disagreement(
+                    earlier,
+                    idx,
+                    require_dpop,
+                    declared_scope,
+                    dpop_replay_max_entries,
+                )?;
+            } else {
+                equivalent_provider_replay.insert(
+                    provider_identity.clone(),
+                    EquivalentProviderReplayAdmission {
+                        idx,
+                        require_dpop,
+                        scope: declared_scope,
+                        process_capacity: dpop_replay_max_entries,
+                    },
+                );
+            }
             let dpop_replay_domain = require_dpop.then(|| {
                 ReplayDomain::new(
                     DPOP_REPLAY_PROFILE,
                     &namespace,
                     "jwks_auth",
                     &policy_config_id,
-                    &dpop_provider_identity(
-                        issuer.as_deref(),
-                        jwks_endpoint.as_ref().map(|endpoint| &endpoint.parsed),
-                        discovery_endpoint.as_ref().map(|endpoint| &endpoint.parsed),
-                        inline_jwks.as_deref(),
-                    ),
+                    &provider_identity,
                 )
             });
-            if let (Some(ReplayScope::Process), Some(domain)) =
-                (declared_scope, dpop_replay_domain.as_ref())
-            {
-                let digest = domain.digest();
-                if let Some((earlier_idx, existing_cap)) =
-                    process_replay_capacities.get(&digest).copied()
-                {
-                    if existing_cap != dpop_replay_max_entries {
-                        return Err(format!(
-                            "jwks_auth: equivalent DPoP providers must declare the same \
-                             'dpop_replay_max_entries'; provider[{earlier_idx}] and \
-                             provider[{idx}] share one replay domain with incompatible \
-                             capacities"
-                        ));
-                    }
-                } else {
-                    process_replay_capacities.insert(digest, (idx, dpop_replay_max_entries));
-                }
-            }
             let dpop_replay = match (declared_scope, dpop_replay_domain.as_ref()) {
                 (Some(ReplayScope::Process), Some(domain)) => {
                     Some(Arc::new(ReplayAuthority::process(
@@ -2029,6 +2037,65 @@ fn has_non_empty_authority(url: &str) -> bool {
     authority_end > 0
 }
 
+/// First-seen admission for one semantic provider identity.
+///
+/// Equivalent providers share a replay domain, so a later sibling is admitted
+/// only when it agrees with this record. The earlier index is kept for
+/// diagnostics; scope and capacity stay out of the domain identity.
+struct EquivalentProviderReplayAdmission {
+    idx: usize,
+    require_dpop: bool,
+    scope: Option<ReplayScope>,
+    process_capacity: usize,
+}
+
+/// Refuse an equivalent provider that would split DPoP authority.
+///
+/// A token that verifies against this trust anchor is matched to the first
+/// succeeding provider. If that pair disagrees on `require_dpop`, matching
+/// order is an authentication bypass (one sibling demands a single-use proof
+/// and the other accepts the bearer alone). If both require DPoP but disagree
+/// on `dpop_replay_scope`, the same proof is claimed in the process store by
+/// one sibling and in Redis by the other — exactly the cross-authority replay
+/// the semantic identity exists to prevent. Process-lane capacity stays a
+/// same-scope equality rule so matching order cannot pick which cap applies.
+fn reject_equivalent_provider_replay_disagreement(
+    earlier: &EquivalentProviderReplayAdmission,
+    idx: usize,
+    require_dpop: bool,
+    declared_scope: Option<ReplayScope>,
+    dpop_replay_max_entries: usize,
+) -> Result<(), String> {
+    let earlier_idx = earlier.idx;
+    if earlier.require_dpop != require_dpop {
+        return Err(format!(
+            "jwks_auth: equivalent providers must agree on 'require_dpop'; \
+             provider[{earlier_idx}] and provider[{idx}] share one token trust \
+             anchor with incompatible DPoP requirements"
+        ));
+    }
+    if require_dpop && earlier.scope != declared_scope {
+        return Err(format!(
+            "jwks_auth: equivalent DPoP providers must declare the same \
+             'dpop_replay_scope'; provider[{earlier_idx}] and \
+             provider[{idx}] share one replay domain with incompatible \
+             replay authorities"
+        ));
+    }
+    if require_dpop
+        && declared_scope == Some(ReplayScope::Process)
+        && earlier.process_capacity != dpop_replay_max_entries
+    {
+        return Err(format!(
+            "jwks_auth: equivalent DPoP providers must declare the same \
+             'dpop_replay_max_entries'; provider[{earlier_idx}] and \
+             provider[{idx}] share one replay domain with incompatible \
+             capacities"
+        ));
+    }
+    Ok(())
+}
+
 /// Deterministic, bounded **semantic identity** of one DPoP-requiring provider,
 /// used as its replay protection sub-domain.
 ///
@@ -2066,10 +2133,12 @@ fn has_non_empty_authority(url: &str) -> bool {
 /// strictly worse than the isolation it would buy: an already-claimed `jti` must
 /// stay claimed across a tightened scope list or a widened clock skew. The fixed
 /// retention horizon already dominates the widest admissible skew, so a skew
-/// change can never outrun a marker. Capacity is instead enforced by each live
-/// authority against the shared lane; equivalent duplicate providers that
-/// declare incompatible `dpop_replay_max_entries` are refused at admission so
-/// matching order cannot pick which cap applies.
+/// change can never outrun a marker. Capacity and replay scope are instead
+/// enforced at admission: equivalent providers that disagree on `require_dpop`,
+/// `dpop_replay_scope`, or process-scoped `dpop_replay_max_entries` are refused
+/// so matching order cannot pick which authority a proof is claimed against.
+/// Binding those fields into the identity would reopen live proofs on an
+/// ordinary authorization, scope, or cap edit.
 ///
 /// No raw issuer, JWKS URI, discovery URL, or JWK material is retained: every
 /// field is written through [`PartitionHasher`]'s length-prefixed framing and

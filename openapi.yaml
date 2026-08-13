@@ -17251,7 +17251,10 @@ components:
                 description: >-
                   Require and validate an RFC 9449 DPoP proof. Requires
                   dpop_replay_scope, because an accepted proof must be made
-                  single-use against a declared replay authority.
+                  single-use against a declared replay authority. Equivalent
+                  providers that share one issuer and JWKS source must agree
+                  on this flag; matching order would otherwise let a sibling
+                  skip the proof.
               dpop_clock_skew_secs:
                 type: integer
                 format: uint64
@@ -17275,7 +17278,12 @@ components:
                   protection is stable across equivalent reloads but explicitly
                   not cross-replica. There is no fallback between them — a
                   shared-backend timeout, partition, authentication failure, or
-                  capacity failure rejects the protected request.
+                  capacity failure rejects the protected request. Equivalent
+                  DPoP providers that share a replay domain must declare the
+                  same value; a mixed process/shared pair is refused even when
+                  Redis is configured, because matching order would otherwise
+                  claim the same proof once in the process store and once in
+                  Redis.
               dpop_replay_max_entries:
                 type: integer
                 minimum: 1

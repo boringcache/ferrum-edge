@@ -3560,6 +3560,29 @@ fn dpop_provider(jwks: &serde_json::Value) -> serde_json::Value {
     })
 }
 
+fn dpop_shared_provider(jwks: &serde_json::Value) -> serde_json::Value {
+    json!({
+        "jwks": jwks,
+        "require_dpop": true,
+        "dpop_replay_scope": "shared"
+    })
+}
+
+/// Construction with a configured Redis backend. Used to prove mixed
+/// process/shared equivalent providers are refused even when the plugin-level
+/// effective scope would otherwise be `shared` (the previous hole).
+fn jwks_with_redis(providers: serde_json::Value, config_id: &str) -> Result<JwksAuth, String> {
+    JwksAuth::new_with_config_id(
+        &json!({
+            "providers": providers,
+            "sync_mode": "redis",
+            "redis_url": "redis://127.0.0.1:6379"
+        }),
+        default_client(),
+        Some(config_id),
+    )
+}
+
 /// A provider that requires DPoP but can never validate a token, so it is only
 /// ever an ordinal neighbour of the provider under test.
 fn dpop_decoy_provider() -> serde_json::Value {
@@ -4036,6 +4059,265 @@ fn equivalent_remote_url_spellings_with_incompatible_capacities_are_rejected() {
     assert!(
         error.contains("dpop_replay_max_entries"),
         "diagnostic should name the disagreeing cap: {error}"
+    );
+}
+
+/// Mixed process/shared scopes on the same semantic DPoP provider split the
+/// proof across two stores: the process lane and Redis. Matching order, a
+/// reload, or a rolling replica would then accept the same proof twice.
+/// Admission must refuse that configuration in either order, including when
+/// Redis is configured so the failure cannot be blamed on a missing backend.
+#[test]
+fn equivalent_dpop_providers_with_mixed_process_and_shared_scopes_are_rejected() {
+    let (_, jwks) = build_dpop_fixture("dpop-scope-mix-reject");
+    let process = dpop_provider(&jwks);
+    let shared = dpop_shared_provider(&jwks);
+
+    for providers in [
+        json!([process.clone(), shared.clone()]),
+        json!([shared, process]),
+    ] {
+        let error = jwks_with_redis(providers, "dpop-scope-mix-reject")
+            .map(|_| ())
+            .expect_err(
+                "mixed process/shared equivalent DPoP providers must be refused \
+                 even when Redis is configured",
+            );
+        assert!(
+            error.contains("dpop_replay_scope") && error.contains("incompatible"),
+            "diagnostic should name the disagreeing replay authority: {error}"
+        );
+        assert!(
+            !error.contains("requires sync_mode"),
+            "refusal must be the equivalent-authority contract, not missing Redis: {error}"
+        );
+    }
+}
+
+/// Canonical remote URL spellings are one trust source, so mixing process and
+/// shared on them is the same split-authority hole as a verbatim duplicate.
+#[test]
+fn equivalent_remote_url_spellings_with_mixed_replay_scopes_are_rejected() {
+    for providers in [
+        json!([
+            {
+                "jwks_uri": "https://idp.example.com/jwks",
+                "issuer": "https://idp.example.com",
+                "require_dpop": true,
+                "dpop_replay_scope": "process"
+            },
+            {
+                "jwks_uri": "https://IDP.EXAMPLE.COM:443/jwks",
+                "issuer": "https://idp.example.com",
+                "require_dpop": true,
+                "dpop_replay_scope": "shared"
+            }
+        ]),
+        json!([
+            {
+                "jwks_uri": "https://IDP.EXAMPLE.COM:443/jwks",
+                "issuer": "https://idp.example.com",
+                "require_dpop": true,
+                "dpop_replay_scope": "shared"
+            },
+            {
+                "jwks_uri": "https://idp.example.com/jwks",
+                "issuer": "https://idp.example.com",
+                "require_dpop": true,
+                "dpop_replay_scope": "process"
+            }
+        ]),
+    ] {
+        let error = jwks_with_redis(providers, "dpop-scope-url-mix")
+            .map(|_| ())
+            .expect_err("canonical URL duplicates with mixed replay scopes must be refused");
+        assert!(
+            error.contains("dpop_replay_scope") && error.contains("incompatible"),
+            "diagnostic should name the disagreeing replay authority: {error}"
+        );
+    }
+}
+
+/// Distinct trust anchors may declare different replay scopes in one plugin:
+/// they do not share a domain, so they cannot launder one proof across stores.
+/// Redis is required only because one of them is `shared`.
+#[test]
+fn distinct_dpop_providers_may_mix_process_and_shared_scopes_when_redis_is_configured() {
+    let (_, jwks) = build_dpop_fixture("dpop-scope-mix-distinct");
+    let mut other_keys = jwks.clone();
+    other_keys["keys"][0]["kid"] = json!("a-different-key-id");
+
+    for providers in [
+        json!([dpop_provider(&jwks), dpop_shared_provider(&other_keys)]),
+        json!([dpop_shared_provider(&other_keys), dpop_provider(&jwks)]),
+    ] {
+        let plugin = jwks_with_redis(providers, "dpop-scope-mix-distinct")
+            .expect("non-equivalent providers may disagree on replay scope");
+        let markers = plugin.dpop_replay_domain_markers("thumbprint", "proof-id");
+        assert_ne!(
+            markers[0], markers[1],
+            "distinct trust anchors must not share a replay domain"
+        );
+        let modes = plugin.dpop_replay_modes();
+        assert!(
+            modes.contains(&Some("process")) && modes.contains(&Some("shared")),
+            "distinct anchors keep the scope each declared: {modes:?}"
+        );
+    }
+}
+
+/// Equivalent shared providers still converge on one shared authority in either
+/// order. Reorder therefore cannot move the domain onto a process store.
+#[test]
+fn equivalent_shared_dpop_providers_converge_on_one_shared_authority() {
+    let (_, jwks) = build_dpop_fixture("dpop-shared-dup");
+    let shared = dpop_shared_provider(&jwks);
+
+    for providers in [
+        json!([shared.clone(), shared.clone()]),
+        json!([shared.clone(), dpop_shared_provider(&jwks)]),
+    ] {
+        let plugin = jwks_with_redis(providers, "dpop-shared-dup")
+            .expect("equivalent shared providers with Redis must be admitted");
+        let markers = plugin.dpop_replay_domain_markers("thumbprint", "proof-id");
+        assert_eq!(markers[0], markers[1]);
+        assert_eq!(
+            plugin.dpop_replay_modes(),
+            vec![Some("shared"), Some("shared")]
+        );
+    }
+}
+
+/// A token that verifies against both siblings is matched to the first success.
+/// If one sibling requires DPoP and the other does not, matching order is an
+/// authentication bypass of the single-use proof. Fail closed on that
+/// ambiguous pair; distinct trust anchors may still disagree.
+#[test]
+fn equivalent_providers_that_disagree_on_require_dpop_are_rejected() {
+    let (_, jwks) = build_dpop_fixture("dpop-require-mix-reject");
+    let with_dpop = dpop_provider(&jwks);
+    let without_dpop = json!({ "jwks": jwks });
+
+    for providers in [
+        json!([with_dpop.clone(), without_dpop.clone()]),
+        json!([without_dpop.clone(), with_dpop.clone()]),
+    ] {
+        let error = JwksAuth::new_with_config_id(
+            &json!({ "providers": providers }),
+            default_client(),
+            Some("dpop-require-mix-reject"),
+        )
+        .map(|_| ())
+        .expect_err("equivalent providers must agree on require_dpop");
+        assert!(
+            error.contains("require_dpop") && error.contains("incompatible"),
+            "diagnostic should name the disagreeing DPoP requirement: {error}"
+        );
+    }
+
+    // The same hole with a configured Redis backend and a `shared` DPoP
+    // sibling: refusal must not be attributable to scope/backend admission.
+    let shared = dpop_shared_provider(&jwks);
+    for providers in [
+        json!([shared.clone(), without_dpop.clone()]),
+        json!([without_dpop, shared]),
+    ] {
+        let error = jwks_with_redis(providers, "dpop-require-mix-redis")
+            .map(|_| ())
+            .expect_err(
+                "equivalent require_dpop disagreement must be refused with Redis configured",
+            );
+        assert!(
+            error.contains("require_dpop") && error.contains("incompatible"),
+            "diagnostic should name the disagreeing DPoP requirement: {error}"
+        );
+    }
+}
+
+/// Distinct issuers or JWKS sources are different trust anchors. One may
+/// require DPoP and the other may not; a token matching only one of them is
+/// not an ambiguous DPoP bypass.
+#[test]
+fn non_equivalent_providers_may_disagree_on_require_dpop() {
+    let distinct_issuers = JwksAuth::new(
+        &json!({
+            "providers": [
+                {
+                    "jwks_uri": "https://idp.example.com/jwks",
+                    "issuer": "https://a.example.com",
+                    "require_dpop": true,
+                    "dpop_replay_scope": "process"
+                },
+                {
+                    "jwks_uri": "https://idp.example.com/jwks",
+                    "issuer": "https://b.example.com"
+                }
+            ]
+        }),
+        default_client(),
+    )
+    .expect("distinct issuers may disagree on require_dpop");
+    assert_eq!(
+        distinct_issuers.dpop_replay_modes(),
+        vec![Some("process"), None]
+    );
+
+    let (_, jwks) = build_dpop_fixture("dpop-require-mix-distinct");
+    let mut other_keys = jwks.clone();
+    other_keys["keys"][0]["kid"] = json!("a-different-key-id");
+    let distinct_keys = dpop_plugin_with_providers(
+        json!([dpop_provider(&jwks), json!({ "jwks": other_keys })]),
+        "dpop-require-mix-distinct",
+    );
+    assert_eq!(
+        distinct_keys.dpop_replay_modes(),
+        vec![Some("process"), None]
+    );
+}
+
+/// A claimed process-scoped proof must stay a replay across equivalent reorder
+/// and cannot be reopened by a rolling generation that would move the same
+/// domain onto a shared Redis authority. Mixed process/shared equivalent
+/// configs are refused, so that rolling shape cannot be admitted.
+#[tokio::test]
+async fn claimed_dpop_proof_cannot_move_across_replay_authorities_on_reorder_or_reload() {
+    let (fixture, jwks) = build_dpop_fixture("dpop-authority-move");
+    let consumer_index = ConsumerIndex::new(&[create_consumer("idp-user")]);
+
+    let original = dpop_plugin_with_providers(
+        json!([dpop_provider(&jwks)]),
+        "dpop-authority-move",
+    );
+    let mut first = dpop_ctx(&fixture);
+    assert_continue(original.authenticate(&mut first, &consumer_index).await);
+
+    let process = dpop_provider(&jwks);
+    let shared = dpop_shared_provider(&jwks);
+    for providers in [
+        json!([process.clone(), shared.clone()]),
+        json!([shared, process.clone()]),
+    ] {
+        jwks_with_redis(providers, "dpop-authority-move")
+            .map(|_| ())
+            .expect_err(
+                "a rolling generation must not be able to split one domain across authorities",
+            );
+    }
+
+    let reordered = dpop_plugin_with_providers(
+        json!([dpop_provider(&jwks), dpop_decoy_provider()]),
+        "dpop-authority-move",
+    );
+    assert_eq!(
+        original.dpop_replay_domain_markers("thumbprint", "proof-id")[0],
+        reordered.dpop_replay_domain_markers("thumbprint", "proof-id")[0],
+        "equivalent reorder must keep the claimed domain on the same authority"
+    );
+    assert_eq!(reordered.dpop_replay_modes()[0], Some("process"));
+    let mut replay = dpop_ctx(&fixture);
+    assert_reject(
+        reordered.authenticate(&mut replay, &consumer_index).await,
+        Some(401),
     );
 }
 
