@@ -387,9 +387,8 @@ fn assert_jump_target_probe_retains_original_status(jump_probe: &str) {
         "the -S probe must not invert the iptables status:\n{jump_probe}"
     );
     assert!(
-        jump_probe.contains(
-            "if \"$ferrum_binary\" -t \"$ferrum_table\" -w 5 -S \"$ferrum_jump_target\""
-        ),
+        jump_probe
+            .contains("if \"$ferrum_binary\" -t \"$ferrum_table\" -w 5 -S \"$ferrum_jump_target\""),
         "the -S probe must be the non-inverted if-condition:\n{jump_probe}"
     );
 

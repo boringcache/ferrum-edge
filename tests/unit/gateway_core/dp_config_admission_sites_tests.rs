@@ -17,8 +17,7 @@ const UDP_PROXY: &str = include_str!("../../../src/proxy/udp_proxy.rs");
 
 const GATE: &str = "crate::dp_config_freshness::new_traffic_blocked()";
 
-const SINGLE_DATAGRAM_GATE: &str =
-    "if refuse_new_udp_source(&overload)\n                    && !udp_source_has_established_session(";
+const SINGLE_DATAGRAM_GATE: &str = "if refuse_new_udp_source(&overload)\n                    && !udp_source_has_established_session(";
 
 const DTLS_PRE_ALLOCATION_GATE: &str = "allow_new_session: Some(Arc::new(move || {\n            \
      !refuse_new_udp_source(&admission_overload)";

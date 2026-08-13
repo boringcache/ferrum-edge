@@ -2027,7 +2027,6 @@ impl StreamListenerManager {
         });
     }
 
-
     /// Reconcile active listeners against the current config.
     ///
     /// - Starts listeners for new stream proxies (TCP and UDP)
