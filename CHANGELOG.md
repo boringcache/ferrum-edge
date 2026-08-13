@@ -9,6 +9,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Authenticated UDP/DTLS client-facing sends no longer emit after the
+  authorization deadline (issues #3815, #3816). A pre-send commitment check
+  then `send_to`/`writable().await` could stay pending across the bound and
+  still deliver a packet. Direct and non-batched frontend sends — including
+  the Linux pktinfo writable retry and DTLS frontend application sends — now
+  race the send/writable future against the same absolute plan, with expiry
+  winning exact-deadline ties. Unauthenticated sessions keep the no-timer
+  path. Batching/GSO/sendmmsg discard semantics are unchanged.
+
 - Sidecar inbound now treats one pod selected by multiple Services as the same
   local identity only when those workload records share a SPIFFE and the same
   non-empty pod UID, and materializes one inbound Host route per Service.

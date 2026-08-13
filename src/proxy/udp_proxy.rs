@@ -1411,13 +1411,19 @@ fn flush_gso_batch(
 /// `UdpSocket::send_to` here would bypass pktinfo and let the kernel pick the
 /// source IP, so replies from a wildcard-bound listener could leave with the
 /// wrong source address and be discarded by the client.
+///
+/// Every asynchronous wait (`send_to`, `writable`) is owned by the admitted
+/// absolute authorization plan. After `writable()` reports readiness the plan
+/// is re-read immediately before the pktinfo syscall so expiry wins over send
+/// readiness at that boundary too.
 #[cfg(target_os = "linux")]
 async fn direct_send_to_client(
     frontend: &Arc<UdpSocket>,
     data: &[u8],
     client_addr: SocketAddr,
     local: Option<crate::socket_opts::PktinfoLocal>,
-) -> std::io::Result<usize> {
+    authorization: Option<crate::proxy::auth_lifetime::StreamAuthDeadline>,
+) -> UdpFrontendSendOutcome<std::io::Result<usize>> {
     use std::os::unix::io::AsRawFd;
     // Only honor the local source when its address family matches the
     // destination — mirrors `flush_gso_batch` / `SendMmsgBatch::push_with_local`.
@@ -1428,10 +1434,17 @@ async fn direct_send_to_client(
         _ => None,
     };
     let Some(local) = effective_local else {
-        return frontend.send_to(data, client_addr).await;
+        return udp_frontend_send_until_expiry(
+            authorization,
+            frontend.send_to(data, client_addr),
+        )
+        .await;
     };
     let (dest, dest_len) = super::udp_batch::std_to_sockaddr_storage(client_addr);
     loop {
+        if let Some(termination) = udp_reply_expired_at_commit(authorization) {
+            return UdpFrontendSendOutcome::AuthorizationExpired(termination);
+        }
         match crate::socket_opts::send_with_pktinfo(
             frontend.as_raw_fd(),
             data,
@@ -1441,9 +1454,18 @@ async fn direct_send_to_client(
             None,
         ) {
             Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                frontend.writable().await?;
+                match udp_frontend_writable_until_expiry(authorization, frontend.writable()).await
+                {
+                    UdpFrontendSendOutcome::AuthorizationExpired(termination) => {
+                        return UdpFrontendSendOutcome::AuthorizationExpired(termination);
+                    }
+                    UdpFrontendSendOutcome::Sent(Err(e)) => {
+                        return UdpFrontendSendOutcome::Sent(Err(e));
+                    }
+                    UdpFrontendSendOutcome::Sent(Ok(())) => {}
+                }
             }
-            other => return other,
+            other => return UdpFrontendSendOutcome::Sent(other),
         }
     }
 }
@@ -1488,8 +1510,10 @@ fn flush_sendmmsg_best_effort(
 /// (GSO-incompatible, sendmmsg-oversized, or post-flush refusal).
 ///
 /// Rechecks the admitted absolute authorization plan immediately before the
-/// client send so a prior `await` (writable, hook) cannot smuggle a payload
-/// past expiry. Returns the bounded termination when the send must not happen.
+/// client send so a prior `await` (hook, batch flush) cannot even enter the
+/// escape hatch after expiry. The send itself is then owned by the same plan
+/// (`send_to` / `writable` cannot emit after the deadline). Returns the
+/// bounded termination when the send must not happen.
 #[cfg(target_os = "linux")]
 #[allow(clippy::too_many_arguments)]
 async fn direct_send_reply_or_drop(
@@ -1512,17 +1536,21 @@ async fn direct_send_reply_or_drop(
         reason,
         "UDP reply using direct-send escape hatch"
     );
-    if let Err(e) = direct_send_to_client(frontend, data, client_addr, local_ip).await {
-        send_drops.record_datagram(data.len());
-        warn!(
-            proxy_id = %proxy_id,
-            client = %udp_client_log_addr(client_addr),
-            size = data.len(),
-            error = %e,
-            "UDP fallback direct-send failed; datagram lost"
-        );
+    match direct_send_to_client(frontend, data, client_addr, local_ip, authorization).await {
+        UdpFrontendSendOutcome::AuthorizationExpired(termination) => Some(termination),
+        UdpFrontendSendOutcome::Sent(Err(e)) => {
+            send_drops.record_datagram(data.len());
+            warn!(
+                proxy_id = %proxy_id,
+                client = %udp_client_log_addr(client_addr),
+                size = data.len(),
+                error = %e,
+                "UDP fallback direct-send failed; datagram lost"
+            );
+            None
+        }
+        UdpFrontendSendOutcome::Sent(Ok(_)) => None,
     }
-    None
 }
 
 /// Queue into `send_batch`, flushing once on `Full` and direct-sending on
@@ -4124,6 +4152,12 @@ pub(crate) enum UdpReplyDatagramCommit {
 /// timer, lock, or allocation. Authenticated sessions pay one monotonic
 /// comparison against the SAME absolute plan armed outside the receive loop.
 /// Relayed datagrams never refresh it.
+///
+/// This predicate is the synchronous gate used before enqueue, flush, and the
+/// post-`writable()` syscall. It cannot own an asynchronous client send: a
+/// check followed by `send_to`/`writable().await` can stay pending across the
+/// deadline and still emit. Those awaits go through
+/// [`udp_frontend_send_until_expiry`] / [`udp_frontend_writable_until_expiry`].
 #[inline]
 pub(crate) fn udp_reply_expired_at_commit(
     plan: Option<crate::proxy::auth_lifetime::StreamAuthDeadline>,
@@ -4132,6 +4166,86 @@ pub(crate) fn udp_reply_expired_at_commit(
         return None;
     };
     (tokio::time::Instant::now() >= plan.at).then_some(plan.termination)
+}
+
+/// Outcome of racing one client-facing UDP/DTLS frontend send (or writable
+/// wait) against the admitted absolute authorization plan.
+#[derive(Debug)]
+pub(crate) enum UdpFrontendSendOutcome<T> {
+    /// The send or writable wait completed while the session was still
+    /// authorized. The inner value is the operation's own result.
+    Sent(T),
+    /// The absolute plan elapsed before the operation was allowed to emit.
+    /// The send/writable future was dropped, so it cannot complete afterwards.
+    AuthorizationExpired(crate::proxy::auth_lifetime::StreamAuthTermination),
+}
+
+/// Race one client-facing send against the admitted absolute authorization
+/// plan (issue #3816 / #3820).
+///
+/// A pre-send `udp_reply_expired_at_commit` check is not enough: `send_to`
+/// can remain pending across the deadline and still emit a client-facing
+/// packet. This helper owns the send future for the whole wait.
+///
+/// Authenticated sessions: an already-elapsed plan never polls `send`.
+/// Otherwise the expiry arm is `biased` FIRST so an exact-deadline tie fails
+/// closed (expiry wins over send readiness). `timeout_at` is refused here
+/// because it polls the inner future before the timer. The plan is never
+/// refreshed. The send future is dropped when expiry wins — it is not
+/// detached and cannot outlive the race.
+///
+/// Unauthenticated sessions (`None`) await `send` with no timer, lock, or
+/// clock read — the previous fast path.
+pub(crate) async fn udp_frontend_send_until_expiry<F>(
+    plan: Option<crate::proxy::auth_lifetime::StreamAuthDeadline>,
+    send: F,
+) -> UdpFrontendSendOutcome<F::Output>
+where
+    F: std::future::Future,
+{
+    let Some(plan) = plan else {
+        return UdpFrontendSendOutcome::Sent(send.await);
+    };
+    if tokio::time::Instant::now() >= plan.at {
+        return UdpFrontendSendOutcome::AuthorizationExpired(plan.termination);
+    }
+    tokio::select! {
+        biased;
+        () = tokio::time::sleep_until(plan.at) => {
+            UdpFrontendSendOutcome::AuthorizationExpired(plan.termination)
+        }
+        result = send => UdpFrontendSendOutcome::Sent(result),
+    }
+}
+
+/// Race a client-facing `writable()` wait against the same absolute plan,
+/// then re-read the plan after readiness and before the caller may issue
+/// the send syscall.
+///
+/// `writable()` becoming ready is not permission to emit. Exact-deadline
+/// ties fail closed in the race, and the post-ready recheck catches a clock
+/// that has already reached `plan.at` even if the Sleep arm was not the one
+/// `select!` observed. Unauthenticated sessions skip both the timer and the
+/// clock read.
+pub(crate) async fn udp_frontend_writable_until_expiry<W>(
+    plan: Option<crate::proxy::auth_lifetime::StreamAuthDeadline>,
+    writable: W,
+) -> UdpFrontendSendOutcome<W::Output>
+where
+    W: std::future::Future,
+{
+    match udp_frontend_send_until_expiry(plan, writable).await {
+        UdpFrontendSendOutcome::AuthorizationExpired(termination) => {
+            UdpFrontendSendOutcome::AuthorizationExpired(termination)
+        }
+        UdpFrontendSendOutcome::Sent(ready) => {
+            if let Some(termination) = udp_reply_expired_at_commit(plan) {
+                UdpFrontendSendOutcome::AuthorizationExpired(termination)
+            } else {
+                UdpFrontendSendOutcome::Sent(ready)
+            }
+        }
+    }
 }
 
 /// Run the backend→client `on_udp_datagram` chain, then re-check the admitted
@@ -4639,6 +4753,11 @@ async fn handle_dtls_client_inner(
     // Backend → Client (plain UDP or backend-DTLS): refresh idle only after
     // amplification/plugin admission and successful client delivery.
     let activity_rev = Arc::clone(&shared_activity_ms);
+    // The reply task owns client-facing DTLS sends against the same absolute
+    // plan the outer deadline arm uses. Clone the latch so expiry on a pending
+    // send settles exactly once even if this task exits before that arm fires.
+    let reply_auth_plan = auth_deadline;
+    let reply_auth_latch = auth_termination_latch.clone();
     let backend_to_client = tokio::spawn(async move {
         let mut buf = vec![0u8; MAX_UDP_DATAGRAM_SIZE];
         loop {
@@ -4697,12 +4816,25 @@ async fn handle_dtls_client_inner(
                 }
             }
 
-            if client_sender.send(&data).await.is_err() {
-                debug!(
-                    proxy_id = %proxy_id_rev,
-                    "DTLS backend→client send failed"
-                );
-                break;
+            match udp_frontend_send_until_expiry(reply_auth_plan, client_sender.send(&data))
+                .await
+            {
+                UdpFrontendSendOutcome::AuthorizationExpired(termination) => {
+                    settle_dtls_auth_expiry(
+                        termination,
+                        &reply_auth_latch,
+                        dgram_metadata_rev.as_ref(),
+                    );
+                    break;
+                }
+                UdpFrontendSendOutcome::Sent(Err(_)) => {
+                    debug!(
+                        proxy_id = %proxy_id_rev,
+                        "DTLS backend→client send failed"
+                    );
+                    break;
+                }
+                UdpFrontendSendOutcome::Sent(Ok(())) => {}
             }
 
             metrics_rev.datagrams_out.fetch_add(1, Ordering::Relaxed);
@@ -4759,7 +4891,15 @@ async fn handle_dtls_client_inner(
         dtls.close().await;
     }
 
-    outcome
+    // A pending client-facing send that lost the authorization race settles
+    // the latch and exits the reply task. That completion can win this select
+    // before the deadline arm, so re-read the latch: teardown above still
+    // runs exactly once, and the close reason stays the typed expiry.
+    if outcome.is_ok() && auth_termination_latch.observed().is_some() {
+        Err(DtlsAuthorizationExpired.into())
+    } else {
+        outcome
+    }
 }
 
 /// Create a new UDP session for a client (plain UDP frontend path).
@@ -5473,32 +5613,46 @@ async fn create_session(
                     }
                 }
             } else {
-                if let Some(termination) = udp_reply_expired_at_commit(reply_authorization_plan) {
-                    reply_session.settle_authorization_expiry(termination);
-                    #[cfg(target_os = "linux")]
-                    {
-                        gso_batch.discard();
-                        send_batch.discard();
+                // Non-batched path: Linux DTLS-backend replies, and every
+                // non-Linux frontend send. The send future is owned by the
+                // same absolute plan — a pre-send check cannot cover a
+                // pending `send_to`.
+                match udp_frontend_send_until_expiry(
+                    reply_authorization_plan,
+                    frontend.send_to(send_data, client_addr),
+                )
+                .await
+                {
+                    UdpFrontendSendOutcome::AuthorizationExpired(termination) => {
+                        reply_session.settle_authorization_expiry(termination);
+                        #[cfg(target_os = "linux")]
+                        {
+                            gso_batch.discard();
+                            send_batch.discard();
+                        }
+                        break 'reply;
                     }
-                    break 'reply;
-                }
-                if let Err(e) = frontend.send_to(send_data, client_addr).await {
-                    debug!(
-                        proxy_id = %reply_proxy_id,
-                        client = %udp_client_log_addr(client_addr),
-                        "UDP send to client failed: {}",
-                        e
-                    );
-                    let error_message = e.to_string();
-                    // Client-facing send failure — the backend is healthy, so
-                    // attribute the session teardown to the client recv path.
-                    disconnect_error = Some((
-                        error_message.clone(),
-                        crate::retry::classify_boxed_error(anyhow::anyhow!(error_message).as_ref()),
-                        crate::plugins::DisconnectCause::RecvError,
-                        crate::plugins::Direction::BackendToClient,
-                    ));
-                    break;
+                    UdpFrontendSendOutcome::Sent(Err(e)) => {
+                        debug!(
+                            proxy_id = %reply_proxy_id,
+                            client = %udp_client_log_addr(client_addr),
+                            "UDP send to client failed: {}",
+                            e
+                        );
+                        let error_message = e.to_string();
+                        // Client-facing send failure — the backend is healthy, so
+                        // attribute the session teardown to the client recv path.
+                        disconnect_error = Some((
+                            error_message.clone(),
+                            crate::retry::classify_boxed_error(
+                                anyhow::anyhow!(error_message).as_ref(),
+                            ),
+                            crate::plugins::DisconnectCause::RecvError,
+                            crate::plugins::Direction::BackendToClient,
+                        ));
+                        break;
+                    }
+                    UdpFrontendSendOutcome::Sent(Ok(_)) => {}
                 }
             }
 
@@ -5629,80 +5783,102 @@ async fn create_session(
                                         break 'reply;
                                     }
                                 }
-                            } else if let Err(e) = frontend.send_to(&buf[..len2], client_addr).await
-                            {
-                                debug!(
-                                    proxy_id = %reply_proxy_id,
-                                    client = %udp_client_log_addr(client_addr),
-                                    "UDP send to client failed: {}",
-                                    e
-                                );
-                                reply_session.last_activity.store(now, Ordering::Relaxed);
-                                reply_session
-                                    .bytes_received
-                                    .fetch_add(batch_bytes_received, Ordering::Relaxed);
-                                reply_metrics
-                                    .datagrams_out
-                                    .fetch_add(batch_dgrams, Ordering::Relaxed);
-                                reply_metrics
-                                    .bytes_out
-                                    .fetch_add(batch_bytes, Ordering::Relaxed);
-                                if let Some(ref dtls) = reply_dtls {
-                                    dtls.close().await;
-                                }
-                                // Mark expired BEFORE removal so the recv-loop's
-                                // `last_client` fast-path cache (which checks only
-                                // this flag) stops forwarding through the dead
-                                // session and re-creates one — otherwise a
-                                // single-client listener is blackholed: datagrams
-                                // keep flowing into a session whose reply task is
-                                // gone and which the idle cleaner can no longer
-                                // see (it is out of the map).
-                                reply_session
-                                    .expired
-                                    .store(true, std::sync::atomic::Ordering::Release);
-                                reply_session.close_hook_ingress();
-                                if reply_sessions
-                                    .remove_if(&client_addr, |_, v| Arc::ptr_eq(v, &reply_session))
-                                    .is_some()
+                            } else {
+                                match udp_frontend_send_until_expiry(
+                                    reply_authorization_plan,
+                                    frontend.send_to(&buf[..len2], client_addr),
+                                )
+                                .await
                                 {
-                                    reply_session.release_overload_guard();
-                                    reply_metrics
-                                        .active_sessions
-                                        .fetch_sub(1, Ordering::Relaxed);
-                                    let error_message = e.to_string();
-                                    emit_udp_stream_disconnect(
-                                        &reply_plugins,
-                                        UdpDisconnectContext {
-                                            namespace: &reply_proxy_namespace,
-                                            proxy_id: &reply_proxy_id,
-                                            proxy_name: reply_proxy_name.as_deref(),
-                                            client_addr,
-                                            session: &reply_session,
-                                            backend_scheme: reply_backend_scheme,
-                                            listen_port: reply_listen_port,
-                                            disconnected_ms: now,
-                                            disconnected_wall_at: chrono::Utc::now(),
-                                            connection_error: Some(error_message.clone()),
-                                            error_class: Some(crate::retry::classify_boxed_error(
-                                                anyhow::anyhow!(error_message).as_ref(),
-                                            )),
-                                            disconnect_direction: Some(
-                                                crate::plugins::Direction::BackendToClient,
-                                            ),
-                                            // frontend.send_to failure is a
-                                            // client-facing write — the backend
-                                            // is healthy, so label the cause as
-                                            // a client-side (RecvError) event
-                                            // rather than a backend outage.
-                                            disconnect_cause: Some(
-                                                crate::plugins::DisconnectCause::RecvError,
-                                            ),
-                                        },
-                                    )
-                                    .await;
+                                    UdpFrontendSendOutcome::AuthorizationExpired(termination) => {
+                                        reply_session.settle_authorization_expiry(termination);
+                                        #[cfg(target_os = "linux")]
+                                        {
+                                            gso_batch.discard();
+                                            send_batch.discard();
+                                        }
+                                        break 'reply;
+                                    }
+                                    UdpFrontendSendOutcome::Sent(Ok(_)) => {}
+                                    UdpFrontendSendOutcome::Sent(Err(e)) => {
+                                        debug!(
+                                            proxy_id = %reply_proxy_id,
+                                            client = %udp_client_log_addr(client_addr),
+                                            "UDP send to client failed: {}",
+                                            e
+                                        );
+                                        reply_session.last_activity.store(now, Ordering::Relaxed);
+                                        reply_session
+                                            .bytes_received
+                                            .fetch_add(batch_bytes_received, Ordering::Relaxed);
+                                        reply_metrics
+                                            .datagrams_out
+                                            .fetch_add(batch_dgrams, Ordering::Relaxed);
+                                        reply_metrics
+                                            .bytes_out
+                                            .fetch_add(batch_bytes, Ordering::Relaxed);
+                                        if let Some(ref dtls) = reply_dtls {
+                                            dtls.close().await;
+                                        }
+                                        // Mark expired BEFORE removal so the recv-loop's
+                                        // `last_client` fast-path cache (which checks only
+                                        // this flag) stops forwarding through the dead
+                                        // session and re-creates one — otherwise a
+                                        // single-client listener is blackholed: datagrams
+                                        // keep flowing into a session whose reply task is
+                                        // gone and which the idle cleaner can no longer
+                                        // see (it is out of the map).
+                                        reply_session
+                                            .expired
+                                            .store(true, std::sync::atomic::Ordering::Release);
+                                        reply_session.close_hook_ingress();
+                                        if reply_sessions
+                                            .remove_if(&client_addr, |_, v| {
+                                                Arc::ptr_eq(v, &reply_session)
+                                            })
+                                            .is_some()
+                                        {
+                                            reply_session.release_overload_guard();
+                                            reply_metrics
+                                                .active_sessions
+                                                .fetch_sub(1, Ordering::Relaxed);
+                                            let error_message = e.to_string();
+                                            emit_udp_stream_disconnect(
+                                                &reply_plugins,
+                                                UdpDisconnectContext {
+                                                    namespace: &reply_proxy_namespace,
+                                                    proxy_id: &reply_proxy_id,
+                                                    proxy_name: reply_proxy_name.as_deref(),
+                                                    client_addr,
+                                                    session: &reply_session,
+                                                    backend_scheme: reply_backend_scheme,
+                                                    listen_port: reply_listen_port,
+                                                    disconnected_ms: now,
+                                                    disconnected_wall_at: chrono::Utc::now(),
+                                                    connection_error: Some(error_message.clone()),
+                                                    error_class: Some(
+                                                        crate::retry::classify_boxed_error(
+                                                            anyhow::anyhow!(error_message).as_ref(),
+                                                        ),
+                                                    ),
+                                                    disconnect_direction: Some(
+                                                        crate::plugins::Direction::BackendToClient,
+                                                    ),
+                                                    // frontend.send_to failure is a
+                                                    // client-facing write — the backend
+                                                    // is healthy, so label the cause as
+                                                    // a client-side (RecvError) event
+                                                    // rather than a backend outage.
+                                                    disconnect_cause: Some(
+                                                        crate::plugins::DisconnectCause::RecvError,
+                                                    ),
+                                                },
+                                            )
+                                            .await;
+                                        }
+                                        return;
+                                    }
                                 }
-                                return;
                             }
                         }
                         Err(_) => break, // WouldBlock — socket drained

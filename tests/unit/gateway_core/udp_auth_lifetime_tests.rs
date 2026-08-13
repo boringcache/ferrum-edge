@@ -21,9 +21,10 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::Duration;
 
 use ferrum_edge::_test_support::{
-    UdpAuthorizationSessionProbe, UdpReplyRecvOutcomeForTest,
+    UdpAuthorizationSessionProbe, UdpFrontendSendOutcomeForTest, UdpReplyRecvOutcomeForTest,
     udp_authorization_disconnect_classification_for_test,
     udp_authorization_expired_before_commit_for_test,
+    udp_frontend_send_until_expiry_for_test, udp_frontend_writable_until_expiry_for_test,
     udp_setup_stage_under_authorization_for_test,
 };
 use ferrum_edge::plugins::{Direction, DisconnectCause};
@@ -789,6 +790,174 @@ async fn unauthenticated_commitment_checks_never_expire() {
     );
 }
 
+/// Hold `send` pending until `release` is sent, then mark `emitted`.
+async fn gated_client_emit(
+    release: tokio::sync::oneshot::Receiver<()>,
+    emitted: Arc<AtomicBool>,
+) -> usize {
+    let _ = release.await;
+    emitted.store(true, Ordering::SeqCst);
+    4
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_pending_client_send_to_is_dropped_at_the_authorization_deadline() {
+    // Ordinary non-batched `send_to`: the socket future stays pending across
+    // the deadline, then is released. Expiry must win, the send future must
+    // be dropped (no client-facing packet), and settlement stays exact-once.
+    let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+    let emitted = Arc::new(AtomicBool::new(false));
+    let emitted_send = Arc::clone(&emitted);
+    let plan = future_plan(
+        Duration::from_millis(20),
+        StreamAuthTermination::CredentialExpired,
+    );
+    let latch = StreamAuthTerminationLatch::default();
+    let before = stream_udp_terminations();
+    let session = probe(Some(plan), latch.clone(), false).await;
+
+    let raced = tokio::spawn(async move {
+        udp_frontend_send_until_expiry_for_test(
+            Some(plan),
+            gated_client_emit(release_rx, emitted_send),
+        )
+        .await
+    });
+    tokio::task::yield_now().await;
+    tokio::task::yield_now().await;
+    tokio::time::advance(Duration::from_millis(20)).await;
+    let _ = release_tx.send(());
+    assert_eq!(
+        raced.await.expect("join"),
+        UdpFrontendSendOutcomeForTest::AuthorizationExpired(
+            StreamAuthTermination::CredentialExpired
+        )
+    );
+    assert!(
+        !emitted.load(Ordering::SeqCst),
+        "a send that became ready after the deadline must not emit a client packet"
+    );
+
+    assert!(session.forward(b"post-expiry").await.is_err());
+    let summary = session
+        .run_reply_task_exit_teardown()
+        .expect("this generation owns the removal");
+    assert!(summary.connection_error.is_some());
+    assert!(
+        stream_udp_terminations().0 >= before.0 + 1,
+        "send-path expiry records the stream_udp counter once"
+    );
+    assert!(
+        !latch.record_once(
+            StreamAuthTermination::CredentialExpired,
+            StreamAuthProtocolFamily::StreamUdp,
+        ),
+        "settlement remains exactly once"
+    );
+    assert!(session.run_reply_task_exit_teardown().is_none());
+    assert_eq!(session.overload_active_connections(), 0);
+    assert_eq!(session.active_sessions(), 0);
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_pending_writable_retry_is_dropped_at_the_authorization_deadline() {
+    // Linux pktinfo `WouldBlock` path: `writable()` stays pending across the
+    // deadline, then is released. Expiry must win over send readiness so the
+    // post-writable syscall never runs.
+    let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+    let ready = Arc::new(AtomicBool::new(false));
+    let ready_wait = Arc::clone(&ready);
+    let plan = future_plan(
+        Duration::from_millis(20),
+        StreamAuthTermination::AuthenticatedStreamMaxLifetime,
+    );
+
+    let raced = tokio::spawn(async move {
+        udp_frontend_writable_until_expiry_for_test(Some(plan), async move {
+            let _ = release_rx.await;
+            ready_wait.store(true, Ordering::SeqCst);
+            Ok::<(), std::io::Error>(())
+        })
+        .await
+    });
+    tokio::task::yield_now().await;
+    tokio::task::yield_now().await;
+    tokio::time::advance(Duration::from_millis(20)).await;
+    let _ = release_tx.send(());
+    assert_eq!(
+        raced.await.expect("join"),
+        UdpFrontendSendOutcomeForTest::AuthorizationExpired(
+            StreamAuthTermination::AuthenticatedStreamMaxLifetime
+        )
+    );
+    assert!(
+        !ready.load(Ordering::SeqCst),
+        "writable readiness after the deadline must not reach the pktinfo syscall"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+#[tokio::test(start_paused = true)]
+async fn an_already_elapsed_writable_wait_never_reaches_the_syscall() {
+    // An elapsed plan must refuse before polling writable, so a ready socket
+    // cannot emit. The post-ready recheck is the same predicate; source
+    // inspection pins it immediately before `send_with_pktinfo`.
+    let plan = elapsed_plan(StreamAuthTermination::CredentialExpired);
+    let polled = Arc::new(AtomicBool::new(false));
+    let polled_wait = Arc::clone(&polled);
+    let outcome = udp_frontend_writable_until_expiry_for_test(
+        Some(plan),
+        std::future::poll_fn(move |_| {
+            polled_wait.store(true, Ordering::SeqCst);
+            std::task::Poll::Ready(Ok::<(), std::io::Error>(()))
+        }),
+    )
+    .await;
+    assert_eq!(
+        outcome,
+        UdpFrontendSendOutcomeForTest::AuthorizationExpired(
+            StreamAuthTermination::CredentialExpired
+        )
+    );
+    assert!(
+        !polled.load(Ordering::SeqCst),
+        "an elapsed plan must not poll writable or issue the client-facing syscall"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn an_unauthenticated_pending_send_has_no_deadline() {
+    let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+    let emitted = Arc::new(AtomicBool::new(false));
+    let emitted_send = Arc::clone(&emitted);
+
+    let raced = tokio::spawn(async move {
+        udp_frontend_send_until_expiry_for_test(None, gated_client_emit(release_rx, emitted_send))
+            .await
+    });
+    tokio::task::yield_now().await;
+    tokio::time::advance(Duration::from_secs(86_400)).await;
+    let _ = release_tx.send(());
+    assert_eq!(
+        raced.await.expect("join"),
+        UdpFrontendSendOutcomeForTest::Sent(4)
+    );
+    assert!(
+        emitted.load(Ordering::SeqCst),
+        "an unauthenticated session keeps the no-timer send path"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_send_that_finishes_before_the_deadline_is_delivered() {
+    let plan = future_plan(
+        Duration::from_secs(30),
+        StreamAuthTermination::CredentialExpired,
+    );
+    let outcome = udp_frontend_send_until_expiry_for_test(Some(plan), async { 7usize }).await;
+    assert_eq!(outcome, UdpFrontendSendOutcomeForTest::Sent(7));
+}
+
 #[tokio::test(start_paused = true)]
 async fn post_hook_expiry_settles_once_and_uses_the_shared_teardown() {
     // The new post-receive / post-hook / try_recv / flush checks settle
@@ -1382,5 +1551,136 @@ fn the_reply_task_rechecks_and_discards_at_every_commitment_boundary() {
     assert!(
         !reply_loop.contains("tokio::time::sleep_until("),
         "commitment rechecks must not arm a per-datagram timer"
+    );
+}
+
+/// Client-facing asynchronous sends are owned by the absolute plan: a pre-send
+/// check then `send_to`/`writable().await` is not enough.
+#[test]
+fn client_facing_sends_are_raced_against_the_authorization_plan() {
+    let send = body_of("pub(crate) async fn udp_frontend_send_until_expiry")
+        .split("\n}\n")
+        .next()
+        .expect("the send race body");
+    let precheck_at = send
+        .find("if tokio::time::Instant::now() >= plan.at {")
+        .expect("the already-elapsed pre-check");
+    let select_at = send.find("tokio::select! {").expect("the send race");
+    assert!(
+        precheck_at < select_at,
+        "an already-elapsed plan must not poll the client send"
+    );
+    let none_at = send
+        .find("let Some(plan) = plan else")
+        .expect("the unauthenticated fast path");
+    assert!(
+        none_at < precheck_at,
+        "an unauthenticated session must await send with no timer or clock"
+    );
+    assert!(
+        send[..precheck_at].contains("return UdpFrontendSendOutcome::Sent(send.await)"),
+        "the unauthenticated path is a plain await"
+    );
+    let select = &send[select_at..];
+    let biased_at = select.find("biased;").expect("biased select");
+    let deadline_at = select
+        .find("tokio::time::sleep_until(plan.at)")
+        .expect("the authorization arm");
+    let send_at = select.find("result = send =>").expect("the send arm");
+    assert!(
+        biased_at < deadline_at && deadline_at < send_at,
+        "the expiry arm must be first so exact-deadline ties fail closed"
+    );
+    assert!(
+        !send.contains("timeout_at("),
+        "the timeout helper that polls the inner future first would emit on a tie"
+    );
+    assert!(
+        !send.contains("tokio::spawn"),
+        "the send future must stay owned by the race, not detached"
+    );
+
+    let writable = body_of("pub(crate) async fn udp_frontend_writable_until_expiry")
+        .split("\n}\n")
+        .next()
+        .expect("the writable race body");
+    let race_at = writable
+        .find("udp_frontend_send_until_expiry(plan, writable)")
+        .expect("writable waits through the same race");
+    let recheck_at = writable
+        .find("udp_reply_expired_at_commit(plan)")
+        .expect("post-ready authorization recheck");
+    assert!(
+        race_at < recheck_at,
+        "authorization must be re-read after writable readiness and before the syscall"
+    );
+
+    let create_session = body_of("async fn create_session(");
+    let reply_loop = create_session
+        .split("'reply: loop {")
+        .nth(1)
+        .expect("the labeled reply loop");
+    assert_eq!(
+        reply_loop.matches("udp_frontend_send_until_expiry(").count(),
+        2,
+        "both non-batched frontend.send_to sites (first reply and try_recv drain) \
+         must race the send"
+    );
+    assert!(
+        !reply_loop.contains("frontend.send_to(send_data, client_addr).await"),
+        "the ordinary send_to path must not await the socket future unguarded"
+    );
+    assert!(
+        !reply_loop.contains("frontend.send_to(&buf[..len2], client_addr).await"),
+        "the try_recv send_to path must not await the socket future unguarded"
+    );
+
+    let linux_direct = body_of("async fn direct_send_to_client(")
+        .split("\n}\n")
+        .next()
+        .expect("direct_send_to_client body");
+    assert!(
+        linux_direct.contains("udp_frontend_send_until_expiry("),
+        "the Linux send_to fallback must race the client send"
+    );
+    assert!(
+        linux_direct.contains("frontend.send_to(data, client_addr)"),
+        "the Linux family-mismatch fallback still uses send_to under the race"
+    );
+    assert!(
+        linux_direct.contains("udp_frontend_writable_until_expiry("),
+        "the Linux pktinfo WouldBlock path must race writable()"
+    );
+    let writable_wait = linux_direct
+        .find("udp_frontend_writable_until_expiry(")
+        .expect("writable race");
+    let syscall = linux_direct
+        .find("send_with_pktinfo(")
+        .expect("the pktinfo syscall");
+    assert!(
+        linux_direct[..syscall].contains("udp_reply_expired_at_commit(authorization)"),
+        "the pktinfo syscall must be preceded by an authorization recheck"
+    );
+    assert!(
+        writable_wait < syscall,
+        "writable wait is the authorization-owned helper, not a bare frontend.writable().await"
+    );
+    assert!(
+        !linux_direct.contains("frontend.writable().await"),
+        "writable() must not be awaited outside the authorization race"
+    );
+
+    let dtls_inner = body_of("async fn handle_dtls_client_inner(");
+    assert!(
+        dtls_inner.contains("udp_frontend_send_until_expiry("),
+        "DTLS frontend client sends must race the same absolute plan"
+    );
+    assert!(
+        dtls_inner.contains("client_sender.send(&data)"),
+        "the raced operation is the DTLS frontend application send"
+    );
+    assert!(
+        !dtls_inner.contains("if client_sender.send(&data).await.is_err()"),
+        "the DTLS frontend send must not await unguarded"
     );
 }

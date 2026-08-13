@@ -7719,12 +7719,64 @@ pub mod _test_support {
     /// Recheck the admitted absolute authorization plan at a backend→client
     /// post-receive commitment boundary — the exact predicate the reply task
     /// uses after recv, after hooks, at the top of `try_recv` drain, and
-    /// immediately before GSO/sendmmsg flush.
+    /// immediately before GSO/sendmmsg flush. Asynchronous client sends are
+    /// owned by [`udp_frontend_send_until_expiry_for_test`] instead.
     #[must_use]
     pub fn udp_reply_expired_at_commit_for_test(
         plan: Option<crate::proxy::auth_lifetime::StreamAuthDeadline>,
     ) -> Option<crate::proxy::auth_lifetime::StreamAuthTermination> {
         crate::proxy::udp_proxy::udp_reply_expired_at_commit(plan)
+    }
+
+    /// Outcome of racing a client-facing UDP/DTLS frontend send or writable
+    /// wait against the admitted absolute authorization plan.
+    #[derive(Debug, PartialEq, Eq)]
+    pub enum UdpFrontendSendOutcomeForTest<T> {
+        Sent(T),
+        AuthorizationExpired(crate::proxy::auth_lifetime::StreamAuthTermination),
+    }
+
+    fn map_udp_frontend_send_outcome_for_test<T>(
+        outcome: crate::proxy::udp_proxy::UdpFrontendSendOutcome<T>,
+    ) -> UdpFrontendSendOutcomeForTest<T> {
+        match outcome {
+            crate::proxy::udp_proxy::UdpFrontendSendOutcome::Sent(value) => {
+                UdpFrontendSendOutcomeForTest::Sent(value)
+            }
+            crate::proxy::udp_proxy::UdpFrontendSendOutcome::AuthorizationExpired(termination) => {
+                UdpFrontendSendOutcomeForTest::AuthorizationExpired(termination)
+            }
+        }
+    }
+
+    /// Race a client-facing send against the admitted absolute plan — the
+    /// exact seam the non-batched `send_to` path and the DTLS frontend send
+    /// use. Unauthenticated `None` awaits `send` with no timer.
+    pub async fn udp_frontend_send_until_expiry_for_test<F>(
+        plan: Option<crate::proxy::auth_lifetime::StreamAuthDeadline>,
+        send: F,
+    ) -> UdpFrontendSendOutcomeForTest<F::Output>
+    where
+        F: std::future::Future,
+    {
+        map_udp_frontend_send_outcome_for_test(
+            crate::proxy::udp_proxy::udp_frontend_send_until_expiry(plan, send).await,
+        )
+    }
+
+    /// Race a client-facing `writable()` wait against the same plan, then
+    /// re-read the plan after readiness before the caller may issue the
+    /// send syscall — the exact seam the Linux pktinfo retry loop uses.
+    pub async fn udp_frontend_writable_until_expiry_for_test<W>(
+        plan: Option<crate::proxy::auth_lifetime::StreamAuthDeadline>,
+        writable: W,
+    ) -> UdpFrontendSendOutcomeForTest<W::Output>
+    where
+        W: std::future::Future,
+    {
+        map_udp_frontend_send_outcome_for_test(
+            crate::proxy::udp_proxy::udp_frontend_writable_until_expiry(plan, writable).await,
+        )
     }
 
     /// Outcome of one backend→client datagram after the awaitable hook chain
