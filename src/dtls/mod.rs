@@ -287,16 +287,33 @@ pub fn build_frontend_dtls_config(
 
     let (require_client_cert, client_cert_verifier, client_trust) =
         if let Some(ca_path) = client_ca_cert_path {
-            // Read the bundle once and derive both the trust store and the
-            // client-trust identity from the SAME bytes; a second read could observe
-            // a different rotation and publish a generation for material that was
-            // never verified.
-            let ca_pem = std::fs::read(ca_path).map_err(|e| {
-                anyhow::anyhow!("Failed to read DTLS client CA bundle '{}': {}", ca_path, e)
+            // ONE bounded read of the declared client-CA source, through the
+            // repository's `CertSource` abstraction (issue #3857). Both the
+            // trust anchors the verifier enforces and the semantic identity
+            // published for this generation come out of that single read.
+            //
+            // Reading the path twice — once with `std::fs::read` for the
+            // identity and once through `load_root_store_from_pem` for the
+            // store — could observe a rotation in between and publish identity
+            // A while serving verifier B. Going through `CertSource` also keeps
+            // the hostile-input ceiling (`FERRUM_TLS_MAX_MATERIAL_SIZE_BYTES`)
+            // and makes an inline / non-file client-CA source work at all,
+            // which a raw path read silently could not.
+            let loaded = load_pem_root_store(ca_path)?;
+            let client_trust = crate::tls::ClientTrustMaterial::from_parts(
+                Some(loaded.material.bytes.expose_secret()),
+                crls,
+            )
+            .map_err(|e| {
+                // Source-redacted: a client-CA source may be inline PEM, so the
+                // configured "path" can itself be secret material.
+                anyhow::anyhow!(
+                    "Invalid DTLS client CA bundle from source {}: {}",
+                    loaded.material.display_source_id,
+                    e
+                )
             })?;
-            let client_trust = crate::tls::ClientTrustMaterial::from_parts(Some(&ca_pem), crls)
-                .map_err(|e| anyhow::anyhow!("DTLS client CA bundle '{}': {}", ca_path, e))?;
-            let root_store = load_root_store_from_pem(ca_path)?;
+            let root_store = loaded.roots;
             let mut verifier_builder =
                 rustls::server::WebPkiClientVerifier::builder(Arc::new(root_store));
             if !crls.is_empty() {
@@ -1877,8 +1894,26 @@ pub(crate) fn load_dtls_certificate_with_key_drop_hook(
     .map_err(|error| anyhow::anyhow!("Invalid DTLS certificate chain: {error}"))
 }
 
-/// Load a rustls root store from a PEM file.
-pub fn load_root_store_from_pem(pem_path: &str) -> Result<rustls::RootCertStore, anyhow::Error> {
+/// One bounded read of a declared PEM CA source, keeping BOTH the parsed root
+/// store and the exact bytes it was parsed from (issue #3857).
+///
+/// A caller that must publish the semantic identity of the anchors it installs
+/// has to derive both halves from one read; a second read of the same source
+/// can observe a later rotation and describe material the verifier is not
+/// enforcing.
+pub(crate) struct LoadedPemRootStore {
+    /// Trust anchors parsed from [`Self::material`].
+    pub(crate) roots: rustls::RootCertStore,
+    /// The exact material those anchors came from, with its redacted
+    /// operator-facing source label.
+    pub(crate) material: crate::tls::source::MaterializedMaterial,
+}
+
+/// Read a declared PEM CA source once and parse it into a root store.
+///
+/// Goes through `CertSource`, so `file://`, inline PEM, and provider URIs all
+/// resolve and the shared `FERRUM_TLS_MAX_MATERIAL_SIZE_BYTES` ceiling applies.
+pub(crate) fn load_pem_root_store(pem_path: &str) -> Result<LoadedPemRootStore, anyhow::Error> {
     let source = CertSource::parse(pem_path, MaterialKind::CaBundle);
     let material = load_material_blocking(&source, MaterialKind::CaBundle).map_err(|e| {
         anyhow::anyhow!(
@@ -1887,11 +1922,20 @@ pub fn load_root_store_from_pem(pem_path: &str) -> Result<rustls::RootCertStore,
             e
         )
     })?;
-    crate::tls::root_cert_store_from_pem_bundle(
+    let roots = crate::tls::root_cert_store_from_pem_bundle(
         material.bytes.expose_secret(),
         "DTLS CA bundle",
         &material.display_source_id,
-    )
+    )?;
+    Ok(LoadedPemRootStore { roots, material })
+}
+
+/// Load a rustls root store from a PEM source.
+///
+/// Thin single-read projection of [`load_pem_root_store`] for callers that need
+/// only the anchors.
+pub fn load_root_store_from_pem(pem_path: &str) -> Result<rustls::RootCertStore, anyhow::Error> {
+    load_pem_root_store(pem_path).map(|loaded| loaded.roots)
 }
 
 fn load_backend_root_store(
