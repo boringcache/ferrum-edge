@@ -740,8 +740,7 @@ async fn authenticated_envelope_drives_the_live_dtls_demux_and_binds_identity() 
         "the replay must not allocate a second DTLS association"
     );
 
-    let (relay_addr, relay_task) =
-        spawn_dtls_metadata_relay(server_addr, binding, forwarded).await;
+    let (relay_addr, relay_task) = spawn_dtls_metadata_relay(server_addr, binding, forwarded).await;
     let client_socket = UdpSocket::bind("127.0.0.1:0")
         .await
         .expect("bind DTLS client");
@@ -915,7 +914,9 @@ async fn a_verbatim_replay_reaches_the_backend_exactly_once() {
             .await
             .expect("send verbatim replay");
         assert!(
-            recv_within(&sender, DROP_OBSERVATION_WINDOW).await.is_none(),
+            recv_within(&sender, DROP_OBSERVATION_WINDOW)
+                .await
+                .is_none(),
             "a verbatim replay must not be answered"
         );
     }
@@ -1001,7 +1002,9 @@ async fn in_window_reordering_is_admitted_once_and_stale_sequences_are_dropped()
             .await
             .expect("send refused datagram");
         assert!(
-            recv_within(&sender, DROP_OBSERVATION_WINDOW).await.is_none(),
+            recv_within(&sender, DROP_OBSERVATION_WINDOW)
+                .await
+                .is_none(),
             "{label} must be dropped"
         );
     }
@@ -1164,7 +1167,9 @@ async fn a_stale_envelope_is_refused_before_any_session_or_hook() {
         .await
         .expect("send stale envelope");
     assert!(
-        recv_within(&sender, DROP_OBSERVATION_WINDOW).await.is_none(),
+        recv_within(&sender, DROP_OBSERVATION_WINDOW)
+            .await
+            .is_none(),
         "a stale envelope must be dropped"
     );
     wait_for_drops(&gateway.metrics.client_address_metadata_drops, 1).await;
@@ -1253,7 +1258,9 @@ async fn unauthenticated_and_malformed_datagrams_are_dropped_before_the_backend(
             .await
             .expect("send refused datagram");
         assert!(
-            recv_within(&sender, DROP_OBSERVATION_WINDOW).await.is_none(),
+            recv_within(&sender, DROP_OBSERVATION_WINDOW)
+                .await
+                .is_none(),
             "{label} must be dropped, not forwarded"
         );
     }

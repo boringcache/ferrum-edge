@@ -847,11 +847,8 @@ fn every_authenticated_envelope_form_is_bound_to_the_receiving_listener() {
 #[test]
 fn listener_identity_covers_protocol_and_bind_address_not_just_the_port() {
     let udp = udp_binding(LISTENER_PORT);
-    let dtls = DatagramListenerBinding::new(
-        DatagramListenerProtocol::Dtls,
-        bind_ip(),
-        LISTENER_PORT,
-    );
+    let dtls =
+        DatagramListenerBinding::new(DatagramListenerProtocol::Dtls, bind_ip(), LISTENER_PORT);
     let wildcard_v4 = DatagramListenerBinding::new(
         DatagramListenerProtocol::Udp,
         IpAddr::V4(Ipv4Addr::UNSPECIFIED),
@@ -1132,8 +1129,7 @@ fn all_envelope_forms_share_the_freshness_contract() {
         gate.decode(&datagram, &peer())
             .unwrap_or_else(|error| panic!("{label} must be admitted once: {error}"));
         assert_eq!(
-            gate.decode(&datagram, &peer())
-                .expect_err("replay refused"),
+            gate.decode(&datagram, &peer()).expect_err("replay refused"),
             DatagramMetadataError::ReplayDuplicate,
             "{label} must be replay-protected like every other form"
         );
@@ -1791,10 +1787,7 @@ fn refusal_reasons_are_fixed_cardinality_and_material_free() {
         },
         DatagramMetadataError::UnsupportedAddressFamily(3),
         DatagramMetadataError::NonDatagramTransport(1),
-        DatagramMetadataError::AddressBlockTooShortForFamily {
-            family: 2,
-            len: 12,
-        },
+        DatagramMetadataError::AddressBlockTooShortForFamily { family: 2, len: 12 },
         DatagramMetadataError::MalformedTlv,
         DatagramMetadataError::DuplicateAuthenticationTag,
         DatagramMetadataError::MissingAuthenticationTag,

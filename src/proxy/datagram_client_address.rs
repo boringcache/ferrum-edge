@@ -185,8 +185,8 @@
 //!   `0xE0`.. is reserved for application use.)
 
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
-use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 
 use dashmap::DashMap;
 
@@ -667,16 +667,13 @@ impl std::fmt::Display for DatagramMetadataError {
                 "FERRUM_DATAGRAM_PROXY_PROTOCOL_SECRET is configured but the datagram carried no \
                  freshness TLV, so it cannot be proven to be anything but a replay",
             ),
-            Self::DuplicateFreshness => {
-                f.write_str("more than one datagram freshness TLV present")
-            }
+            Self::DuplicateFreshness => f.write_str("more than one datagram freshness TLV present"),
             Self::MalformedFreshness => {
                 f.write_str("datagram freshness TLV is not the expected fixed length")
             }
-            Self::UnsupportedFreshnessVersion(version) => write!(
-                f,
-                "unsupported datagram freshness record version {version}"
-            ),
+            Self::UnsupportedFreshnessVersion(version) => {
+                write!(f, "unsupported datagram freshness record version {version}")
+            }
             Self::FreshnessOutsideHorizon => f.write_str(
                 "datagram freshness timestamp is outside the accepted horizon from this \
                  receiver's clock",
