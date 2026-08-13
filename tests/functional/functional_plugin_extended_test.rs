@@ -117,7 +117,15 @@ impl PluginExtTestHarness {
     /// Probes beneath `path` until the gateway returns any non-404 response,
     /// which proves the route has been registered by the DB poller.
     async fn wait_for_route(&self, path: &str) {
-        let url = format!("{}{}/wait-for-route-probe", self.proxy_base_url, path);
+        self.wait_for_route_probe(&format!("{path}/wait-for-route-probe"))
+            .await;
+    }
+
+    /// Wait until an exact request path returns a non-404 response.
+    /// Use when the only successful paths are plugin rule matches (e.g.
+    /// `response_mock` without passthrough) and a child probe would stay 404.
+    async fn wait_for_route_probe(&self, path: &str) {
+        let url = format!("{}{}", self.proxy_base_url, path);
         let client = reqwest::Client::builder()
             .timeout(Duration::from_secs(1))
             .build()
@@ -775,7 +783,8 @@ async fn test_plugin_response_mock_returns_mock() {
     .await
     .unwrap();
 
-    harness.wait_for_route("/mock").await;
+    // No passthrough: probe the mock rule path so readiness proves plugin + route.
+    harness.wait_for_route_probe("/mock/hello").await;
 
     let resp = client
         .get(format!("{}/mock/hello", harness.proxy_base_url))
@@ -903,7 +912,8 @@ async fn test_plugin_response_mock_path_scoping() {
     .await
     .unwrap();
 
-    harness.wait_for_route("/api/v1").await;
+    // No passthrough: probe the scoped mock rule path, not a child suffix.
+    harness.wait_for_route_probe("/api/v1/users").await;
 
     // Request to /api/v1/users — mock rule path is /users (relative to listen_path)
     let resp = client
