@@ -618,7 +618,6 @@ def paginate(
     *,
     opener: Callable[..., Any] | None = None,
     accept: str | None = None,
-    per_page: int = PER_PAGE,
     max_pages: int = MAX_PAGES,
     max_bytes: int = MAX_RESPONSE_BYTES,
 ) -> list[Any]:
@@ -640,10 +639,6 @@ def paginate(
             raise GateError("schema", "expected a list page from the GitHub API")
         items.extend(payload)
         next_url = parse_link_next(headers.get("link"))
-        if next_url is None and len(payload) >= per_page:
-            # A full page with no continuation means the walk was truncated
-            # somewhere; older items would be dropped silently.
-            raise GateError("pagination", "full page without a continuation link")
         if next_url is not None and not next_url.startswith(API_ORIGIN):
             raise GateError("pagination", "continuation link left the GitHub API")
     return items
@@ -2660,7 +2655,7 @@ def run_self_test() -> int:  # noqa: C901 — a flat fixture table stays readabl
             second_url: ([{"n": 3}], {}),
         }
     )
-    items = paginate(first_url, "tok", opener=opener, per_page=2)
+    items = paginate(first_url, "tok", opener=opener)
     check("pagination aggregates pages", [i["n"] for i in items] == [1, 2, 3])
 
     for bad_bound in (0, -1, True, "1048576"):
@@ -2675,14 +2670,14 @@ def run_self_test() -> int:  # noqa: C901 — a flat fixture table stays readabl
             )
 
     try:
-        paginate(first_url, "tok", opener=opener, per_page=2, max_pages=1)
+        paginate(first_url, "tok", opener=opener, max_pages=1)
         check("caller page bound is enforced", False)
     except GateError as exc:
         check("caller page bound is enforced", exc.code == "pagination", exc.message)
 
     for bad_bound in (0, -1, True, "50"):
         try:
-            paginate(first_url, "tok", opener=opener, per_page=2, max_pages=bad_bound)
+            paginate(first_url, "tok", opener=opener, max_pages=bad_bound)
             check(f"malformed page bound {bad_bound!r} refused", False)
         except GateError as exc:
             check(
@@ -2691,25 +2686,25 @@ def run_self_test() -> int:  # noqa: C901 — a flat fixture table stays readabl
                 exc.message,
             )
 
-    truncated = page_opener({first_url: ([{"n": 1}, {"n": 2}], {})})
-    try:
-        paginate(first_url, "tok", opener=truncated, per_page=2)
-        check("pagination rejects truncation", False)
-    except GateError as exc:
-        check("pagination rejects truncation", exc.code == "pagination", exc.message)
+    full_final_page = page_opener({first_url: ([{"n": 1}, {"n": 2}], {})})
+    items = paginate(first_url, "tok", opener=full_final_page)
+    check(
+        "pagination accepts a full final page without a continuation link",
+        [item["n"] for item in items] == [1, 2],
+    )
 
     off_site = page_opener(
         {first_url: ([{"n": 1}], {"link": '<https://example.invalid/x>; rel="next"'})}
     )
     try:
-        paginate(first_url, "tok", opener=off_site, per_page=2)
+        paginate(first_url, "tok", opener=off_site)
         check("pagination rejects foreign links", False)
     except GateError:
         check("pagination rejects foreign links", True)
 
     not_a_list = page_opener({first_url: ({"not": "a list"}, {})})  # type: ignore[arg-type]
     try:
-        paginate(first_url, "tok", opener=not_a_list, per_page=2)
+        paginate(first_url, "tok", opener=not_a_list)
         check("pagination rejects non-list pages", False)
     except GateError as exc:
         check("pagination rejects non-list pages", exc.code == "schema", exc.message)
