@@ -2719,16 +2719,34 @@ pub struct Proxy {
     /// (default: 300s / 5 min). Set to 0 to disable (rely on OS TCP timeouts only).
     #[serde(default)]
     pub tcp_idle_timeout_seconds: Option<u64>,
-    /// Enable inbound PROXY protocol (v1 text or v2 binary, auto-detected) on
-    /// this stream proxy listener. When `true`, every inbound TCP connection
-    /// **must** begin with a valid PROXY header; connections that do not are
-    /// closed immediately (fail closed).
+    /// Enable inbound PROXY protocol on this stream proxy listener. The
+    /// framing depends on the scheme:
+    ///
+    /// - `tcp` / `tcp_tls`: PROXY protocol v1 text or v2 binary (auto-detected),
+    ///   read once at the head of each accepted connection. A connection that
+    ///   does not begin with a valid header is closed immediately (fail closed).
+    /// - `udp` / `dtls`: the PROXY protocol v2 DGRAM envelope, present on
+    ///   **every** datagram (a session-scoped header cannot be trusted on an
+    ///   unordered, lossy transport). A datagram that does not decode is
+    ///   dropped; nothing is forwarded and no session is created. When
+    ///   `FERRUM_DATAGRAM_PROXY_PROTOCOL_SECRET` is set, every datagram must
+    ///   also carry a valid HMAC-SHA-256 tag and an authenticated freshness
+    ///   record. The tag covers a versioned domain-separation prefix naming the
+    ///   exact receiving listener (receive-boundary protocol, canonical bind
+    ///   address, port), so a process-global secret cannot make a valid envelope
+    ///   for listener A verify on listener B — for every command and family,
+    ///   `LOCAL` and `AF_UNSPEC` included. The envelope's declared destination
+    ///   port is also compared to this proxy's `listen_port` as defense in
+    ///   depth, and a bounded per-sender replay window admits each authenticated
+    ///   sequence at most once. Ferrum never emits the envelope toward the
+    ///   backend; replies go back to the socket peer unwrapped.
     ///
     /// **Trust requirement**: the forwarded address is honoured only when the
     /// socket peer (the load balancer's own IP) belongs to the
     /// `FERRUM_TRUSTED_PROXIES` CIDR set. A connection from an untrusted peer
-    /// on a PROXY-protocol-enabled listener is also closed, preventing
-    /// direct-connect clients from spoofing their source IP.
+    /// on a PROXY-protocol-enabled listener is also closed (TCP) or dropped
+    /// (UDP/DTLS), preventing direct-connect clients from spoofing their
+    /// source IP.
     ///
     /// After a successful trusted parse, `client_ip` in the
     /// `StreamConnectionContext` (and in stream logs and authz plugins) is
@@ -2736,9 +2754,9 @@ pub struct Proxy {
     /// still the raw socket peer (the LB's own IP). This mirrors how
     /// `FERRUM_TRUSTED_PROXIES` + XFF work on the HTTP path.
     ///
-    /// Only valid for `tcp` / `tcp_tls` stream proxies. Setting it on a UDP,
-    /// DTLS, or HTTP proxy produces a validation error: PROXY protocol is
-    /// TCP-borne and cannot carry UDP session addressing.
+    /// Only valid for `tcp` / `tcp_tls` / `udp` / `dtls` stream proxies.
+    /// Setting it on an HTTP-family proxy produces a validation error (use
+    /// X-Forwarded-For there).
     ///
     /// Default: `false` (PROXY protocol disabled; socket peer is always used).
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -3033,6 +3051,22 @@ pub struct GatewayConfig {
     /// certificates without loading the entire mesh model.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub trust_bundles: Option<Box<crate::modes::mesh::config::TrustBundleSet>>,
+    /// Namespace-keyed gateway trust-bundle resources loaded from the
+    /// authoritative configuration store (issue #3727).
+    ///
+    /// DERIVED, CONTROL-PLANE-IN-MEMORY ONLY: `#[serde(skip)]`, exactly like
+    /// `mesh_config_revision`. It must never ride the ConfigSync `config_json`
+    /// wire — both peers are `deny_unknown_fields`, and more importantly a
+    /// multi-namespace CP holds EVERY served namespace's trust material here.
+    /// Publication is per-subscriber through the `trust_bundles_json` side
+    /// channel, which carries at most the subscribing namespace's own record;
+    /// see `CpGrpcServer::filter_config_to_namespace_for_scope`.
+    ///
+    /// At most one record per namespace (the store enforces it with the
+    /// namespace primary key / `_id`), kept sorted by namespace so snapshot
+    /// comparisons and checksums are stable.
+    #[serde(skip)]
+    pub gateway_trust_bundles: Vec<crate::config::gateway_trust::GatewayTrustBundleRecord>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mesh: Option<Box<crate::modes::mesh::config::MeshConfig>>,
     /// `(namespace, listen_port)` pairs whose Gateway API listener terminates
@@ -3465,6 +3499,28 @@ fn pending_limit_logical_id(upstream: &Upstream) -> &str {
 }
 
 impl GatewayConfig {
+    /// The authoritative gateway trust-bundle record for `namespace`, if the
+    /// configuration store holds one.
+    ///
+    /// The lookup is namespace-exact: a multi-namespace control plane holds
+    /// every served namespace's record in this vector, and every publication
+    /// path must go through here rather than reading index `0`.
+    pub fn gateway_trust_bundle_for(
+        &self,
+        namespace: &str,
+    ) -> Option<&crate::config::gateway_trust::GatewayTrustBundleRecord> {
+        self.gateway_trust_bundles
+            .iter()
+            .find(|record| record.namespace == namespace)
+    }
+
+    /// Keep the trust-bundle vector in a canonical order so two replicas that
+    /// loaded the same store produce byte-identical snapshots and checksums.
+    pub fn sort_gateway_trust_bundles(&mut self) {
+        self.gateway_trust_bundles
+            .sort_by(|a, b| a.namespace.cmp(&b.namespace).then_with(|| a.id.cmp(&b.id)));
+    }
+
     /// Validate that all proxy (host, listen_path, listen_port) combinations are unique.
     ///
     /// HTTP-family proxies can conflict in two ways:
@@ -5042,22 +5098,19 @@ impl GatewayConfig {
                     proxy.id, port
                 ));
             }
-            // stream_proxy_protocol is only valid for TCP/TCP-TLS stream
-            // proxies. UDP/DTLS cannot carry a PROXY protocol header (it is
-            // TCP-borne), and HTTP proxies use XFF instead.
-            if proxy.stream_proxy_protocol == Some(true) {
-                let is_tcp_stream = matches!(
-                    proxy.dispatch_kind,
-                    DispatchKind::TcpRaw | DispatchKind::TcpTls
-                );
-                if !is_tcp_stream {
-                    errors.push(format!(
-                        "Proxy '{}' (scheme {}) sets stream_proxy_protocol but PROXY protocol \
-                         is only valid for tcp/tcp_tls stream proxies",
-                        proxy.id,
-                        proxy.scheme_display()
-                    ));
-                }
+            // `stream_proxy_protocol` is valid on every stream family, with two
+            // different framings: the connection-borne PROXY header on
+            // tcp/tcp_tls, and the per-datagram PROXY v2 DGRAM envelope on
+            // udp/dtls (issue #3289). HTTP proxies use XFF instead and are
+            // still rejected.
+            if proxy.stream_proxy_protocol == Some(true) && !proxy.dispatch_kind.is_stream() {
+                errors.push(format!(
+                    "Proxy '{}' (scheme {}) sets stream_proxy_protocol but PROXY protocol is only \
+                     valid for tcp/tcp_tls/udp/dtls stream proxies — HTTP-family proxies resolve \
+                     the client IP from X-Forwarded-For",
+                    proxy.id,
+                    proxy.scheme_display()
+                ));
             }
             // Outbound PROXY is likewise TCP-borne only.
             if proxy.backend_proxy_protocol.is_some() {
@@ -7335,16 +7388,16 @@ impl Proxy {
         let effective_scheme = self.effective_scheme();
         let is_stream_proxy = effective_scheme.is_stream();
 
-        // Inbound PROXY protocol is TCP-borne: valid only on tcp/tcps stream
-        // proxies. Enforced here (single-proxy admin writes: POST/PUT
+        // Inbound PROXY protocol is a stream-family control: the connection
+        // header on tcp/tcps, the per-datagram DGRAM envelope on udp/dtls
+        // (issue #3289). Enforced here (single-proxy admin writes: POST/PUT
         // /proxies and the API-spec proxy path) in addition to
         // `GatewayConfig::validate_stream_proxies`, so a bad row can never
         // persist and then wedge the next full-config load/reconcile.
-        if self.stream_proxy_protocol == Some(true)
-            && !matches!(effective_scheme, BackendScheme::Tcp | BackendScheme::Tcps)
-        {
+        if self.stream_proxy_protocol == Some(true) && !is_stream_proxy {
             errors.push(
-                "stream_proxy_protocol is only valid for tcp/tcps stream proxies                  (PROXY protocol is TCP-borne)"
+                "stream_proxy_protocol is only valid for tcp/tcps/udp/dtls stream proxies \
+                 (HTTP-family proxies resolve the client IP from X-Forwarded-For)"
                     .to_string(),
             );
         }

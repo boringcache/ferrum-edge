@@ -1973,9 +1973,16 @@ async fn deliver_trace_payload(
     let total_attempts = cfg.max_retries + 1;
 
     for attempt in 1..=total_attempts {
+        let Some(http) = cfg.http_client.get().ok() else {
+            warn!(
+                "{} export batch discarded: plugin HTTP client unavailable ({} spans lost)",
+                cfg.provider_name, entry_count,
+            );
+            return;
+        };
         let request = match cfg.payload_kind {
-            TracePayloadKind::Datadog => cfg.http_client.get().put(&cfg.endpoint),
-            _ => cfg.http_client.get().post(&cfg.endpoint),
+            TracePayloadKind::Datadog => http.put(&cfg.endpoint),
+            _ => http.post(&cfg.endpoint),
         };
         // One bounded serialization, reused across attempts: `bytes()` is a
         // refcount bump on the reserved payload, not another copy.

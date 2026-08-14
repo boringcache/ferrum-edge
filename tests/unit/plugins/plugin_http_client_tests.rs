@@ -57,6 +57,10 @@ fn default_client() -> PluginHttpClient {
     PluginHttpClient::default()
 }
 
+fn live(client: &PluginHttpClient) -> &reqwest::Client {
+    client.get().expect("test plugin HTTP client")
+}
+
 #[tokio::test(flavor = "current_thread")]
 async fn plugin_http_client_ignores_ambient_proxy_environment() {
     let proxy = MockServer::start().await;
@@ -74,6 +78,7 @@ async fn plugin_http_client_ignores_ambient_proxy_environment() {
 
     let _ = client
         .get()
+        .expect("test plugin HTTP client")
         .get("http://198.51.100.1:9/no-proxy-canary")
         .timeout(Duration::from_millis(200))
         .send()
@@ -119,7 +124,7 @@ async fn test_execute_returns_successful_response() {
         .await;
 
     let client = default_client();
-    let req = client.get().post(format!("{}/logs", mock_server.uri()));
+    let req = live(&client).post(format!("{}/logs", mock_server.uri()));
     let resp = client.execute(req, "test_plugin").await.unwrap();
     assert_eq!(resp.status(), 200);
 }
@@ -134,7 +139,7 @@ async fn test_execute_returns_error_response() {
         .await;
 
     let client = default_client();
-    let req = client.get().get(format!("{}/fail", mock_server.uri()));
+    let req = live(&client).get(format!("{}/fail", mock_server.uri()));
     let resp = client.execute(req, "test_plugin").await.unwrap();
     assert_eq!(resp.status(), 500);
 }
@@ -151,7 +156,7 @@ async fn test_execute_screens_denied_literal_ip_endpoint() {
     let policy = BackendEgressPolicy::from_env(BackendAllowIps::Both, "", "", true).unwrap();
     let client = PluginHttpClient::default_with_backend_allow_ips(policy);
 
-    let req = client.get().get("http://169.254.169.254/latest/meta-data/");
+    let req = live(&client).get("http://169.254.169.254/latest/meta-data/");
     let resp = client.execute(req, "test_plugin").await.unwrap();
     assert_eq!(
         resp.status(),
@@ -170,6 +175,7 @@ async fn classified_execute_marks_dns_egress_denial_pre_wire() {
     let external_latency = AtomicU64::new(0);
     let request = client
         .get()
+        .expect("test plugin HTTP client")
         .post("http://localhost/provider")
         .body("non-idempotent");
 
@@ -200,6 +206,7 @@ async fn classified_execute_marks_literal_ip_egress_denial_pre_wire() {
     let external_latency = AtomicU64::new(0);
     let request = client
         .get()
+        .expect("test plugin HTTP client")
         .post("http://169.254.169.254/provider")
         .body("non-idempotent");
 
@@ -230,6 +237,7 @@ async fn classified_execute_preserves_remote_502_as_a_response() {
     let external_latency = AtomicU64::new(0);
     let request = client
         .get()
+        .expect("test plugin HTTP client")
         .post(format!("{}/provider", server.uri()))
         .body("non-idempotent");
 
@@ -269,6 +277,7 @@ async fn test_execute_returns_redirect_response_without_following() {
     let client = default_client();
     let req = client
         .get()
+        .expect("test plugin HTTP client")
         .get(format!("{}/redirect", redirect_server.uri()));
     let resp = client.execute(req, "test_plugin").await.unwrap();
     assert_eq!(resp.status(), 302);
@@ -287,7 +296,7 @@ async fn test_execute_returns_redirect_response_without_following() {
 async fn test_execute_propagates_connection_error() {
     let client = default_client();
     // Port 1 should be unreachable on any test machine
-    let req = client.get().get("http://127.0.0.1:1/unreachable");
+    let req = live(&client).get("http://127.0.0.1:1/unreachable");
     let result = client.execute(req, "test_plugin").await;
     assert!(result.is_err());
 }
@@ -307,7 +316,7 @@ async fn test_execute_logs_slow_call() {
         &ferrum_edge::config::PoolConfig::default(),
         50,
     );
-    let req = client.get().get(format!("{}/slow", mock_server.uri()));
+    let req = live(&client).get(format!("{}/slow", mock_server.uri()));
     // The call should succeed - the warning is logged but doesn't affect the result
     let resp = client.execute(req, "slow_test").await.unwrap();
     assert_eq!(resp.status(), 200);
@@ -327,7 +336,7 @@ async fn test_execute_no_warning_for_fast_call() {
         &ferrum_edge::config::PoolConfig::default(),
         60_000,
     );
-    let req = client.get().get(format!("{}/fast", mock_server.uri()));
+    let req = live(&client).get(format!("{}/fast", mock_server.uri()));
     let resp = client.execute(req, "fast_test").await.unwrap();
     assert_eq!(resp.status(), 200);
 }
@@ -343,7 +352,7 @@ async fn test_execute_retries_safe_method_transport_failures() {
     );
 
     let started = Instant::now();
-    let req = client.get().get(format!("{}/unstable", base_url));
+    let req = live(&client).get(format!("{}/unstable", base_url));
     let result = client.execute(req, "retry_test").await;
 
     assert!(result.is_err());
@@ -370,6 +379,7 @@ async fn test_execute_does_not_retry_http_status_failures() {
     );
     let req = client
         .get()
+        .expect("test plugin HTTP client")
         .get(format!("{}/status-fail", mock_server.uri()));
     let response = client.execute(req, "status_fail_test").await.unwrap();
     assert_eq!(response.status(), 500);
@@ -387,6 +397,7 @@ async fn test_execute_does_not_retry_non_idempotent_methods() {
 
     let req = client
         .get()
+        .expect("test plugin HTTP client")
         .post(format!("{}/write", base_url))
         .body("payload");
     let result = client.execute(req, "post_retry_test").await;
@@ -482,6 +493,7 @@ async fn get_http2_companion_speaks_h2c_prior_knowledge() {
     let url = format!("http://{addr}/grpc");
     let req = client
         .get_http2()
+        .expect("test plugin HTTP/2 client")
         .post(&url)
         .header("content-type", "application/grpc")
         .header("te", "trailers")
@@ -533,7 +545,7 @@ async fn default_get_client_still_speaks_http1_to_plain_sinks() {
 
     let client = default_client();
     let url = format!("http://{addr}/plain");
-    let req = client.get().get(&url);
+    let req = live(&client).get(&url);
     let resp = client.execute(req, "http1_default").await.unwrap();
     assert_eq!(resp.status(), 200);
     let head = rx.await.expect("http1 sink");
@@ -563,6 +575,7 @@ async fn plugin_http2_companion_client_ignores_ambient_proxy_environment() {
 
     let _ = client
         .get_http2()
+        .expect("test plugin HTTP/2 client")
         .get("http://198.51.100.1:9/no-proxy-canary")
         .timeout(Duration::from_millis(200))
         .send()
@@ -594,6 +607,7 @@ async fn plugin_http_client_ignores_ambient_proxy_even_with_non_matching_no_prox
 
     let _ = client
         .get()
+        .expect("test plugin HTTP client")
         .get("http://198.51.100.1:9/no-proxy-canary")
         .timeout(Duration::from_millis(200))
         .send()
@@ -714,6 +728,477 @@ fn health_check_fallback_propagates_construction_failure_without_panic() {
     );
 }
 
+fn production_plugin_http_client_source() -> &'static str {
+    include_str!("../../../src/plugins/utils/http_client.rs")
+        .split("\n#[cfg(test)]")
+        .next()
+        .expect("production plugin HTTP client source precedes test modules")
+}
+
+fn uncommented_lines(source: &str) -> Vec<&str> {
+    source
+        .lines()
+        .filter(|line| {
+            let trimmed = line.trim_start();
+            !trimmed.starts_with("//") && !trimmed.starts_with("///") && !trimmed.starts_with('*')
+        })
+        .collect()
+}
+
+fn function_region<'a>(source: &'a str, start_needle: &str, end_needle: &str) -> &'a str {
+    let start = source
+        .find(start_needle)
+        .unwrap_or_else(|| panic!("{start_needle} present in plugin HTTP client source"));
+    let rest = &source[start..];
+    let end = rest
+        .find(end_needle)
+        .unwrap_or_else(|| panic!("{end_needle} follows {start_needle}"));
+    &rest[..end]
+}
+
+#[test]
+fn plugin_http_client_production_builder_has_no_panic_or_expect() {
+    let production = production_plugin_http_client_source();
+    let uncommented = uncommented_lines(production).join("\n");
+    assert!(
+        !uncommented.contains("panic!("),
+        "plugin HTTP client production builder must not panic when host CA roots cannot load"
+    );
+    assert!(
+        !uncommented.contains(".expect("),
+        "plugin HTTP client production builder must not expect() on client construction"
+    );
+    assert!(
+        !uncommented.contains("Client::new()"),
+        "plugin HTTP client production builder must not re-enable ambient proxies via Client::new()"
+    );
+    assert!(
+        !uncommented.contains("reconstruct_fail_closed_plugin_client"),
+        "plugin HTTP client production builder must not spin reconstructing a reqwest client"
+    );
+    assert!(
+        !uncommented.contains("process::abort") && !uncommented.contains("process::exit"),
+        "plugin HTTP client production builder must not abort the process"
+    );
+    assert!(
+        uncommented.contains("client: Option<Arc<reqwest::Client>>"),
+        "terminal construction failure must be represented as Option, not an assumed-live client"
+    );
+    assert!(
+        uncommented.contains("Result<&reqwest::Client, PluginHttpClientUnavailable>"),
+        "get()/get_http2() must expose terminal construction failure without panicking"
+    );
+}
+
+#[test]
+fn plugin_http_client_callers_do_not_treat_get_result_as_reqwest_client() {
+    // Compile-blocker regression: after get()/get_http2() started returning
+    // Result, any `.get().post(...)` chain (including across newlines) treats
+    // the Result as a reqwest client. Production callers must bind the Result
+    // first and fail closed.
+    const FORBIDDEN: &[&str] = &[
+        ".get().get(",
+        ".get().post(",
+        ".get().put(",
+        ".get().patch(",
+        ".get().delete(",
+        ".get().head(",
+        ".get().request(",
+        ".get_http2().get(",
+        ".get_http2().post(",
+        ".get_http2().put(",
+        ".get_http2().patch(",
+        ".get_http2().delete(",
+        ".get_http2().head(",
+        ".get_http2().request(",
+        "build_request(client.get()",
+        "http.get().post(",
+        "http.get().put(",
+        "http.get().patch(",
+        "http.get().delete(",
+        "http.get().get(",
+        "http.get().request(",
+    ];
+    for (name, source) in plugin_http_client_caller_sources() {
+        let collapsed = uncommented_lines(production_portion(source))
+            .join("\n")
+            .chars()
+            .filter(|c| !c.is_whitespace())
+            .collect::<String>();
+        for needle in FORBIDDEN {
+            assert!(
+                !collapsed.contains(needle),
+                "{name} still treats get()/get_http2() Result as a reqwest client: {needle}"
+            );
+        }
+    }
+}
+
+fn production_portion(source: &str) -> &str {
+    source.split("\n#[cfg(test)]").next().unwrap_or(source)
+}
+
+fn plugin_http_client_caller_sources() -> &'static [(&'static str, &'static str)] {
+    &[
+        (
+            "src/plugins/utils/http_client.rs",
+            include_str!("../../../src/plugins/utils/http_client.rs"),
+        ),
+        (
+            "src/plugins/request_mirror.rs",
+            include_str!("../../../src/plugins/request_mirror.rs"),
+        ),
+        (
+            "src/service_discovery/mod.rs",
+            include_str!("../../../src/service_discovery/mod.rs"),
+        ),
+        (
+            "src/plugins/api_chargeback_sink.rs",
+            include_str!("../../../src/plugins/api_chargeback_sink.rs"),
+        ),
+        (
+            "src/plugins/otel_tracing.rs",
+            include_str!("../../../src/plugins/otel_tracing.rs"),
+        ),
+        (
+            "src/plugins/utils/jwks_store.rs",
+            include_str!("../../../src/plugins/utils/jwks_store.rs"),
+        ),
+        (
+            "src/plugins/jwks_auth.rs",
+            include_str!("../../../src/plugins/jwks_auth.rs"),
+        ),
+        (
+            "src/plugins/oauth2_introspection.rs",
+            include_str!("../../../src/plugins/oauth2_introspection.rs"),
+        ),
+        (
+            "src/plugins/oidc_relying_party.rs",
+            include_str!("../../../src/plugins/oidc_relying_party.rs"),
+        ),
+        (
+            "src/plugins/serverless_function.rs",
+            include_str!("../../../src/plugins/serverless_function.rs"),
+        ),
+        (
+            "src/plugins/opa.rs",
+            include_str!("../../../src/plugins/opa.rs"),
+        ),
+        (
+            "src/plugins/mesh/ext_authz.rs",
+            include_str!("../../../src/plugins/mesh/ext_authz.rs"),
+        ),
+        (
+            "src/plugins/mcp_gateway.rs",
+            include_str!("../../../src/plugins/mcp_gateway.rs"),
+        ),
+        (
+            "src/plugins/loki_logging.rs",
+            include_str!("../../../src/plugins/loki_logging.rs"),
+        ),
+        (
+            "src/plugins/http_logging.rs",
+            include_str!("../../../src/plugins/http_logging.rs"),
+        ),
+        (
+            "src/plugins/ai_transcript_audit.rs",
+            include_str!("../../../src/plugins/ai_transcript_audit.rs"),
+        ),
+        (
+            "src/plugins/ai_tool_governor.rs",
+            include_str!("../../../src/plugins/ai_tool_governor.rs"),
+        ),
+        (
+            "src/plugins/ai_semantic_firewall.rs",
+            include_str!("../../../src/plugins/ai_semantic_firewall.rs"),
+        ),
+        (
+            "src/plugins/ai_semantic_cache.rs",
+            include_str!("../../../src/plugins/ai_semantic_cache.rs"),
+        ),
+        (
+            "src/plugins/ai_federation.rs",
+            include_str!("../../../src/plugins/ai_federation.rs"),
+        ),
+        (
+            "src/modes/mesh/federation.rs",
+            include_str!("../../../src/modes/mesh/federation.rs"),
+        ),
+        (
+            "src/notifications/channels/mod.rs",
+            include_str!("../../../src/notifications/channels/mod.rs"),
+        ),
+        (
+            "src/notifications/channels/webhook.rs",
+            include_str!("../../../src/notifications/channels/webhook.rs"),
+        ),
+        (
+            "src/plugins/load_testing.rs",
+            include_str!("../../../src/plugins/load_testing.rs"),
+        ),
+    ]
+}
+
+#[test]
+fn plugin_http_client_terminal_fallback_is_fail_closed_no_proxy_no_redirect() {
+    let production = production_plugin_http_client_source();
+    let fail_closed = function_region(
+        production,
+        "fn apply_fail_closed_empty_trust(",
+        "fn apply_or_inert(",
+    );
+    let uncommented_tls = uncommented_lines(fail_closed).join("\n");
+    assert!(
+        uncommented_tls.contains("tls_danger_accept_invalid_certs(false)"),
+        "fail-closed TLS must keep certificate verification enabled"
+    );
+    assert!(
+        uncommented_tls.contains("tls_certs_only"),
+        "fail-closed TLS must disable ambient native/built-in roots via tls_certs_only"
+    );
+    assert!(
+        !uncommented_tls.contains("danger_accept_invalid_certs(true)"),
+        "fail-closed TLS must not disable certificate verification"
+    );
+
+    let inert = function_region(
+        production,
+        "fn apply_inert_crypto_posture(",
+        "fn apply_terminal_fail_closed_tls(",
+    );
+    let uncommented_inert = uncommented_lines(inert).join("\n");
+    assert!(
+        uncommented_inert.contains("apply_fail_closed_empty_trust"),
+        "FIPS inert posture must reuse the empty-trust fail-closed TLS helper"
+    );
+    assert!(
+        uncommented_inert.contains("https_only(true)"),
+        "FIPS inert posture must keep HTTPS-only so plaintext is not a fallback"
+    );
+
+    let terminal = function_region(
+        production,
+        "struct PluginHttpClientBuildError",
+        "impl PluginHttpClient {",
+    );
+    let uncommented_terminal = uncommented_lines(terminal).join("\n");
+    assert!(
+        uncommented_terminal.contains(".no_proxy()"),
+        "terminal fallback must keep .no_proxy()"
+    );
+    assert!(
+        uncommented_terminal.contains("reqwest::redirect::Policy::none()"),
+        "terminal fallback must keep redirects disabled"
+    );
+    let preconfigured = function_region(
+        production,
+        "fn try_build_preconfigured_fail_closed_plugin_client(",
+        "/// Bounded fail-closed construction:",
+    );
+    let uncommented_preconfigured = uncommented_lines(preconfigured).join("\n");
+    assert!(
+        uncommented_preconfigured.contains("attach_plugin_client_dns"),
+        "preconfigured terminal fallback must retain the supplied gateway DNS resolver"
+    );
+    assert!(
+        uncommented_preconfigured.contains("attach_plugin_client_http2"),
+        "preconfigured terminal fallback must retain HTTP/2 prior knowledge"
+    );
+    assert!(
+        uncommented_terminal.contains("apply_terminal_fail_closed_tls"),
+        "terminal fallback must apply fail-closed empty-trust TLS"
+    );
+    assert!(
+        uncommented_terminal.contains("use_preconfigured_tls"),
+        "terminal reconstruction must use an explicit empty rustls root store"
+    );
+    assert!(
+        uncommented_terminal.contains("RootCertStore::empty()"),
+        "preconfigured reconstruction must install an empty trust store"
+    );
+    assert!(
+        uncommented_terminal.contains("builder_with_provider"),
+        "preconfigured reconstruction must not panic via rustls ClientConfig::builder()"
+    );
+    assert!(
+        !uncommented_terminal.contains("ClientConfig::builder()"),
+        "preconfigured reconstruction must not use rustls ClientConfig::builder(), \
+         which panics without a process default provider"
+    );
+    assert!(
+        uncommented_terminal.contains("Result<reqwest::Client, PluginHttpClientBuildError>"),
+        "terminal construction must return Result so failure is representable"
+    );
+    assert!(
+        uncommented_terminal.contains("fn accept_plugin_http_client("),
+        "terminal construction failure must convert to an inert Option wrapper"
+    );
+    assert!(
+        !uncommented_terminal.contains("loop {"),
+        "terminal construction must not retry without a bound"
+    );
+    assert!(
+        !uncommented_terminal.contains("unwrap_or_else"),
+        "terminal construction must not unwrap a fallible builder into a \
+         spinning or panicking fallback"
+    );
+    assert!(
+        !uncommented_terminal.contains(".unwrap()"),
+        "terminal construction must not unwrap a fallible builder"
+    );
+    assert!(
+        !uncommented_terminal.contains("panic!("),
+        "terminal fallback must not panic"
+    );
+    assert!(
+        !uncommented_terminal.contains(".expect("),
+        "terminal fallback must not expect() on construction"
+    );
+    assert!(
+        !uncommented_terminal.contains("Client::new()"),
+        "terminal fallback must not call Client::new()"
+    );
+    assert!(
+        !uncommented_terminal.contains("danger_accept_invalid_certs(true)"),
+        "terminal fallback must not disable certificate verification"
+    );
+
+    let execute = function_region(
+        production,
+        "fn unavailable_plugin_http_failure(",
+        "fn classify_plugin_http_failure(",
+    );
+    let uncommented_execute = uncommented_lines(execute).join("\n");
+    assert!(
+        uncommented_execute.contains("ErrorClass::ConnectionPoolError"),
+        "classified execute must report unavailable construction as a pre-wire pool error"
+    );
+    assert!(
+        uncommented_execute.contains("request_reached_wire: false"),
+        "unavailable construction must not be treated as a post-wire failure"
+    );
+    assert!(
+        !uncommented_execute.contains(".build()"),
+        "unavailable execute must not construct another fallible reqwest client per call"
+    );
+    assert!(
+        !uncommented_execute.contains("tracing::"),
+        "terminal construction is logged once; unavailable execute must not warn per call"
+    );
+
+    let fail_closed_builder = function_region(
+        production,
+        "fn build_fail_closed_plugin_client(",
+        "fn build_dns_cached_fallback_client(",
+    );
+    let uncommented_fail_closed_builder = uncommented_lines(fail_closed_builder)
+        .join("\n")
+        .chars()
+        .filter(|c| !c.is_whitespace())
+        .collect::<String>();
+    assert!(
+        uncommented_fail_closed_builder
+            .contains("try_build_plugin_client(dns_cache,http2_prior_knowledge"),
+        "terminal empty-trust construction must keep the caller's DNS resolver"
+    );
+    assert!(
+        !uncommented_fail_closed_builder
+            .contains("try_build_plugin_client(None,http2_prior_knowledge"),
+        "terminal fallback must not drop a supplied DNS resolver"
+    );
+    assert!(
+        uncommented_fail_closed_builder.contains(
+            "try_build_preconfigured_fail_closed_plugin_client(dns_cache,http2_prior_knowledge"
+        ),
+        "preconfigured reconstruction must inherit DNS and HTTP/2 posture"
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn fail_closed_empty_trust_client_ignores_proxy_and_does_not_follow_redirects() {
+    use ferrum_edge::config::{BackendEgressPolicy, PoolConfig};
+    use ferrum_edge::dns::{DnsCache, DnsConfig};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let tempdir = tempfile::tempdir().expect("create tempdir");
+    let ca_path = tempdir.path().join("invalid-ca.pem");
+    std::fs::write(&ca_path, "not a pem certificate").expect("write invalid CA");
+
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind redirect listener");
+    let addr = listener.local_addr().expect("listener address");
+    let hits = Arc::new(AtomicUsize::new(0));
+    let hits_task = hits.clone();
+    tokio::spawn(async move {
+        loop {
+            let Ok((mut socket, _)) = listener.accept().await else {
+                return;
+            };
+            hits_task.fetch_add(1, Ordering::SeqCst);
+            let mut buf = [0u8; 1024];
+            let _ = socket.read(&mut buf).await;
+            let body = "redirected";
+            let response = format!(
+                "HTTP/1.1 302 Found\r\nLocation: http://{addr}/chased\r\n\
+                 Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            let _ = socket.write_all(response.as_bytes()).await;
+        }
+    });
+
+    let proxy = MockServer::start().await;
+    let client = {
+        let _env_lock = crate::unit::env_lock::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _proxy_env = ProxyEnvGuard::point_all_at(&proxy.uri());
+        PluginHttpClient::new(
+            &PoolConfig::default(),
+            DnsCache::new(DnsConfig::default()),
+            1000,
+            0,
+            100,
+            false,
+            ca_path.to_str(),
+            Arc::new(Vec::new()),
+            ferrum_edge::config::types::DEFAULT_NAMESPACE,
+            BackendEgressPolicy::unrestricted(),
+            Arc::new(Vec::new()),
+            0,
+        )
+    };
+
+    let _ = client
+        .get()
+        .expect("test plugin HTTP client")
+        .get("http://198.51.100.1:9/no-proxy-canary")
+        .timeout(Duration::from_millis(200))
+        .send()
+        .await;
+    assert_eq!(
+        proxy.received_requests().await.unwrap_or_default().len(),
+        0,
+        "fail-closed empty-trust client must ignore ambient proxy variables"
+    );
+
+    let resp = client
+        .get()
+        .expect("test plugin HTTP client")
+        .get(format!("http://{addr}/"))
+        .timeout(Duration::from_secs(5))
+        .send()
+        .await
+        .expect("HTTP to the local listener must succeed on the fail-closed client");
+    assert_eq!(resp.status().as_u16(), 302, "must surface the 302");
+    assert_eq!(
+        hits.load(Ordering::SeqCst),
+        1,
+        "fail-closed empty-trust client must not follow redirects"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Redacted execution APIs — advisory GHSA-8594-2xhc-8g38
 //
@@ -749,7 +1234,7 @@ async fn execute_redacted_hides_literal_ip_egress_denial_url() {
     let client = PluginHttpClient::default_with_backend_allow_ips(policy);
 
     let url = sentinel_url("http://169.254.169.254");
-    let req = client.get().post(&url).body("batch");
+    let req = live(&client).post(&url).body("batch");
     let response = client
         .execute_redacted(req, "sink_test", "http://169.254.169.254/redacted")
         .await
@@ -777,7 +1262,7 @@ async fn execute_with_redacted_url_hides_literal_ip_egress_denial_url() {
     let client = PluginHttpClient::default_with_backend_allow_ips(policy);
 
     let url = sentinel_url("http://169.254.169.254");
-    let req = client.get().post(&url).body("rows");
+    let req = live(&client).post(&url).body("rows");
     let response = client
         .execute_with_redacted_url(req, "chargeback_test", "http://169.254.169.254/redacted")
         .await
@@ -813,7 +1298,7 @@ async fn redacted_transport_failure_slow_and_retry_warnings_hide_the_url() {
     let redacted = format!("http://{addr}/redacted");
 
     // GET so the retry path is eligible.
-    let req = client.get().get(&url);
+    let req = live(&client).get(&url);
     let error = client
         .execute_redacted(req, "sink_test", &redacted)
         .await

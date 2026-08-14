@@ -653,8 +653,15 @@ impl ServiceDiscoveryManager {
                         );
                         return false;
                     }
+                    let Some(client) = self.http_client.get().ok() else {
+                        warn!(
+                            "Service discovery: upstream {} plugin HTTP client unavailable; failing closed",
+                            upstream_id
+                        );
+                        return false;
+                    };
                     Arc::new(kubernetes::KubernetesDiscoverer::new(
-                        self.http_client.get().clone(),
+                        client.clone(),
                         k8s_config.namespace.clone(),
                         k8s_config.service_name.clone(),
                         k8s_config.port_name.clone(),
@@ -694,8 +701,15 @@ impl ServiceDiscoveryManager {
                         );
                         return false;
                     }
+                    let Some(client) = self.http_client.get().ok() else {
+                        warn!(
+                            "Service discovery: upstream {} plugin HTTP client unavailable; failing closed",
+                            upstream_id
+                        );
+                        return false;
+                    };
                     Arc::new(consul::ConsulDiscoverer::new(
-                        self.http_client.get().clone(),
+                        client.clone(),
                         consul_config.address.clone(),
                         consul_config.service_name.clone(),
                         consul_config.datacenter.clone(),
@@ -1460,15 +1474,17 @@ enum PreparationOutcome {
 /// provably still pending while the staleness deadline elapses or a reconcile
 /// cancels the task. Real DNS warmup latency is not controllable, so a
 /// deliberately blocked step is the only deterministic way to cover the
-/// contract. Production never installs a hold.
+/// contract. When a hold is installed it *stands in* for warmup: production
+/// never installs one, and tests must not fall through to a real resolver
+/// lookup under a paused clock after release.
 ///
 /// Each install is a generation. Dropping or clearing a stale generation must
 /// not take a newer test's slot or release its waiters: the slot is
 /// process-global, and hosted integration shards run other tests in the same
 /// process. A parked waiter also has to *observe* release under Tokio paused
-/// time — closing a semaphore is invisible to the paused clock, so
-/// `wait_for_within`'s sleeps can auto-advance to exhaustion while the poller
-/// stays parked with no timer.
+/// time — closing a semaphore is invisible to the paused clock, so a sleep
+/// poll can auto-advance to exhaustion while the poller stays parked with no
+/// timer, or while it is in real DNS warmup off the timer wheel.
 #[allow(dead_code)] // reached from the external test crate; dead in the bin target
 pub struct PublicationPreparationHold {
     generation: u64,
@@ -1529,16 +1545,27 @@ impl PublicationPreparationHold {
 
     /// Yield until every waiter that was inside [`Self::park`] has observed
     /// release (or been cancelled). Returns `false` immediately if `release`
-    /// has not been called. Mixes `yield_now` with a 1ms paused-clock tick so
-    /// a waiter whose `select!` waker was stale still notices the flag.
+    /// has not been called.
+    ///
+    /// Mixes `yield_now` with a 1ms paused-clock tick so a waiter whose
+    /// `select!` waker was stale still notices the flag. `waiting == 0` after
+    /// a yield is the idle seam (nobody parked, or every waiter left). When
+    /// anyone entered `park`, `passed` is the production event that they
+    /// observed release rather than being cancelled.
     pub async fn wait_until_release_observed(&self) -> bool {
         if !self.released.load(Ordering::SeqCst) {
             return false;
         }
         for _ in 0..10_000 {
-            if self.waiting.load(Ordering::SeqCst) == 0 {
+            let waiting = self.waiting.load(Ordering::SeqCst);
+            let entered = self.entered.load(Ordering::SeqCst);
+            let passed = self.passed.load(Ordering::SeqCst);
+            if waiting == 0 && (entered == 0 || passed > 0) {
                 tokio::task::yield_now().await;
-                if self.waiting.load(Ordering::SeqCst) == 0 {
+                let waiting = self.waiting.load(Ordering::SeqCst);
+                let entered = self.entered.load(Ordering::SeqCst);
+                let passed = self.passed.load(Ordering::SeqCst);
+                if waiting == 0 && (entered == 0 || passed > 0) {
                     return true;
                 }
             } else {
@@ -1546,7 +1573,9 @@ impl PublicationPreparationHold {
                 tokio::time::sleep(std::time::Duration::from_millis(1)).await;
             }
         }
-        self.waiting.load(Ordering::SeqCst) == 0
+        let waiting = self.waiting.load(Ordering::SeqCst);
+        let entered = self.entered.load(Ordering::SeqCst);
+        waiting == 0 && (entered == 0 || self.passed.load(Ordering::SeqCst) > 0)
     }
 
     /// Park until this generation is released. External tests cover ownership
@@ -1931,10 +1960,13 @@ pub(crate) async fn apply_discovered_snapshot(
         let prepared = prepare_publication_under_deadline(
             async {
                 if let Some(hold) = publication_preparation_hold() {
-                    // Test-only: never installed in production.
+                    // Test-only: never installed in production. The hold is
+                    // the preparation step — after release the poller
+                    // publishes without a real DNS lookup, so paused-time
+                    // tests handshake `passed` / `waiting == 0` instead of
+                    // auto-advancing through resolver timeouts.
                     hold.wait().await;
-                }
-                if !hostnames.is_empty() {
+                } else if !hostnames.is_empty() {
                     dns_cache.warmup(hostnames).await;
                 }
             },

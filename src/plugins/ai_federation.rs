@@ -436,6 +436,9 @@ impl OAuth2Cache {
 
         let req = http_client
             .get()
+            .map_err(|e| {
+                AuthFailure::local(format!("ai_federation: OAuth2 token request failed: {e}"))
+            })?
             .post(&self.token_uri)
             .header("content-type", "application/x-www-form-urlencoded")
             .body(body);
@@ -5001,6 +5004,12 @@ impl AiFederation {
         let mut req = self
             .http_client
             .get()
+            .map_err(|_| ProviderCallFailure {
+                kind: ProviderCallFailureKind::PreWire,
+                error_class: crate::retry::ErrorClass::ConnectionPoolError,
+                headers: HashMap::new(),
+                circuit_failure: false,
+            })?
             .post(url)
             .connect_timeout(provider.connect_timeout)
             .timeout(provider.read_timeout);

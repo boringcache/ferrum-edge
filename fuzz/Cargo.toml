@@ -53,6 +53,13 @@ doc = false
 bench = false
 
 [[bin]]
+name = "datagram_client_address"
+path = "fuzz_targets/datagram_client_address.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
 name = "mesh_udp_frame"
 path = "fuzz_targets/mesh_udp_frame.rs"
 test = false

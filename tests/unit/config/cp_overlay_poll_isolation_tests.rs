@@ -22,6 +22,7 @@ use ferrum_edge::_test_support::{
     store_accepted_k8s_overlay, swap_merged_k8s_translation,
 };
 use ferrum_edge::config::db_backend::{IncrementalResult, NamespacedResourceId};
+use ferrum_edge::config::gateway_trust::TrustPublicationScope;
 use ferrum_edge::config::types::{
     AuthMode, BackendScheme, DispatchKind, GatewayConfig, Proxy, ResponseBodyMode,
 };
@@ -244,6 +245,7 @@ fn full_reload_with_no_refreshed_namespaces_leaves_subscribers_untouched() {
         &harness.overlay_slot,
         db_reload,
         &[],
+        TrustPublicationScope::Complete,
         harness.broadcasts.as_ref(),
         harness.dp_registry.as_ref(),
         &harness.cp_scope,
@@ -472,6 +474,7 @@ impl PublicationHarness {
             &self.overlay_slot,
             db_config,
             &["ferrum".to_string()],
+            TrustPublicationScope::Complete,
             self.broadcasts.as_ref(),
             self.dp_registry.as_ref(),
             &self.cp_scope,

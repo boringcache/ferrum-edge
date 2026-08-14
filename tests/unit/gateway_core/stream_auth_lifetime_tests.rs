@@ -3647,7 +3647,7 @@ fn cross_protocol_plain_precommit_401_is_grace_bounded_and_health_neutral() {
         ("streaming response-header", header_write_arms[1]),
     ] {
         let arm = arm
-            .split("return write_plain_grpc_web_client_deadline_without_hooks(")
+            .split("write_plain_grpc_web_client_deadline_without_hooks(")
             .next()
             .unwrap_or_else(|| panic!("bounded {label} authorization-expiry arm"));
         assert!(

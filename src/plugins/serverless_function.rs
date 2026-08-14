@@ -758,9 +758,10 @@ impl ServerlessFunction {
             )
         })?;
 
-        let mut req_builder = self
-            .http_client
-            .get()
+        let client = self.http_client.get().map_err(|_| {
+            InvocationFailure::pre_wire("invocation_failed", "plugin HTTP client unavailable")
+        })?;
+        let mut req_builder = client
             .post(&self.function_url)
             .header("content-type", "application/json")
             .timeout(std::time::Duration::from_millis(self.timeout_ms));

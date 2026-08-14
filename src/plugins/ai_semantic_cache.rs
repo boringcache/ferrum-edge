@@ -1585,6 +1585,7 @@ impl AiSemanticCache {
         let mut request = self
             .http_client
             .get()
+            .map_err(|err| format!("embedding request failed: {err}"))?
             .post(&semantic.endpoint)
             .timeout(semantic.request_timeout)
             .json(&payload);

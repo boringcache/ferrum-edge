@@ -411,7 +411,10 @@ pub(super) async fn dispatch_json_payload_classified(
     http: &PluginHttpClient,
 ) -> DeliveryAttempt {
     let redacted_url = redacted_endpoint_url(webhook_url);
-    let req = http.get().post(webhook_url).json(payload);
+    let Ok(client) = http.get() else {
+        return client_unavailable(channel, &redacted_url);
+    };
+    let req = client.post(webhook_url).json(payload);
     let resp = match http
         .execute_with_redacted_url(req, client_label, &redacted_url)
         .await
@@ -420,6 +423,15 @@ pub(super) async fn dispatch_json_payload_classified(
         Err(error) => return transport_failure(channel, &error, &redacted_url),
     };
     finalize_dispatch_response_classified(resp, channel, &redacted_url).await
+}
+
+pub(super) fn client_unavailable(channel: &str, redacted_url: &str) -> DeliveryAttempt {
+    DeliveryAttempt::failed(
+        FailureClass::Permanent,
+        format!(
+            "{channel} dispatch failed (plugin HTTP client unavailable) calling {redacted_url}"
+        ),
+    )
 }
 
 pub(super) fn transport_failure(
