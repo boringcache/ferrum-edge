@@ -121,25 +121,26 @@ async fn run(args: Args) -> anyhow::Result<()> {
         algorithm: Algorithm::HS256,
     });
 
-    let mut env_config = EnvConfig::default();
-    env_config.mode = OperatingMode::File;
-    env_config.log_level = args.log_level;
-    env_config.proxy_bind_address = "127.0.0.1".into();
-    env_config.admin_bind_address = "127.0.0.1".into();
-    env_config.proxy_http_port = args.proxy_http_port;
-    env_config.proxy_https_port = 0;
-    env_config.admin_http_port = args.admin_http_port;
-    env_config.admin_https_port = 0;
-    env_config.admin_jwt_secret = Some(jwt_secret);
-    env_config.admin_jwt_issuer = jwt_issuer;
-    env_config.pool_warmup_enabled = true;
-    env_config.backend_allow_ips = BackendEgressPolicy::from_allow_ips(BackendAllowIps::Private);
-    env_config.gateway_svid_cert_path = Some(path_to_string(&args.svid_cert, "--svid-cert")?);
-    env_config.gateway_svid_key_path = Some(path_to_string(&args.svid_key, "--svid-key")?);
-    env_config.gateway_svid_trust_bundle_path =
-        Some(path_to_string(&args.trust_bundle, "--trust-bundle")?);
-    env_config.gateway_spiffe_id = Some(args.spiffe_id);
-    env_config.file_config_path = None;
+    let env_config = EnvConfig {
+        mode: OperatingMode::File,
+        log_level: args.log_level,
+        proxy_bind_address: "127.0.0.1".into(),
+        admin_bind_address: "127.0.0.1".into(),
+        proxy_http_port: args.proxy_http_port,
+        proxy_https_port: 0,
+        admin_http_port: args.admin_http_port,
+        admin_https_port: 0,
+        admin_jwt_secret: Some(jwt_secret),
+        admin_jwt_issuer: jwt_issuer,
+        pool_warmup_enabled: true,
+        backend_allow_ips: BackendEgressPolicy::from_allow_ips(BackendAllowIps::Private),
+        gateway_svid_cert_path: Some(path_to_string(&args.svid_cert, "--svid-cert")?),
+        gateway_svid_key_path: Some(path_to_string(&args.svid_key, "--svid-key")?),
+        gateway_svid_trust_bundle_path: Some(path_to_string(&args.trust_bundle, "--trust-bundle")?),
+        gateway_spiffe_id: Some(args.spiffe_id),
+        file_config_path: None,
+        ..Default::default()
+    };
 
     let opts = ServeOptions {
         proxy_http: Some(proxy_http),
