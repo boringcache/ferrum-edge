@@ -20344,8 +20344,8 @@ async fn handle_tls_connection(
     // registered and never retired. The guard is one strong handle; cloned
     // session handles keep the transport sweepable after this function
     // returns (an upgraded WebSocket outlives `serve_connection_with_upgrades`).
-    let client_trust_guard = client_trust_admission
-        .and_then(|admission| admission.register(client_cert_der.is_some()));
+    let client_trust_guard =
+        client_trust_admission.and_then(|admission| admission.register(client_cert_der.is_some()));
     let client_trust_session = client_trust_guard
         .as_ref()
         .map(|guard| guard.session().clone());
