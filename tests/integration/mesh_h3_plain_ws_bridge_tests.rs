@@ -405,6 +405,54 @@ fn shared_mesh_plain_helper_never_plaintext_falls_back() {
             && src.contains("type BoxedMeshTransportDispatchFuture<'a> ="),
         "HBONE / Sidecar mesh-retry children must be constructed out of line"
     );
+    let sidecar_box = src
+        .split("fn boxed_proxy_to_backend_mesh_mtls<'a>(")
+        .nth(1)
+        .expect("boxed sidecar mesh-mtls factory")
+        .split("fn boxed_mesh_mtls_pool_get_sender<'a>(")
+        .next()
+        .expect("bounded boxed sidecar factory");
+    assert!(
+        sidecar_box.contains("async move {")
+            && sidecar_box.contains("proxy_to_backend_mesh_mtls(")
+            && !sidecar_box.contains("Box::pin(proxy_to_backend_mesh_mtls("),
+        "Sidecar boxing must trampoline so the concrete future is not built in the factory"
+    );
+    assert!(
+        src.contains("#[inline(never)]\nfn boxed_mesh_mtls_pool_get_sender<'a>(")
+            && src.contains("boxed_mesh_mtls_pool_get_sender(")
+            && src.contains("#[inline(never)]\nfn boxed_unix_backend_checkout_h2c<'a>(")
+            && src.contains("boxed_unix_backend_checkout_h2c(")
+            && src.contains("#[inline(never)]\nfn boxed_proxy_to_backend_mesh_mtls_after_ready<'a>(")
+            && src.contains("boxed_proxy_to_backend_mesh_mtls_after_ready("),
+        "Sidecar acquire must box handshake checkout and post-ready send/collect"
+    );
+    let acquire = src
+        .split("async fn proxy_to_backend_mesh_mtls(")
+        .nth(1)
+        .expect("sidecar acquire")
+        .split("fn boxed_proxy_to_backend_mesh_mtls_after_ready<'a>(")
+        .next()
+        .expect("bounded sidecar acquire");
+    assert!(
+        acquire.contains("boxed_mesh_mtls_pool_get_sender(")
+            && !acquire.contains("state.mesh_mtls_pool.get_sender("),
+        "Sidecar acquire must not await get_sender inline"
+    );
+    let pool = include_str!("../../src/proxy/mesh_mtls_pool.rs");
+    let get_or_create = pool
+        .split("async fn get_or_create_sender(")
+        .nth(1)
+        .expect("mesh-mTLS get_or_create_sender")
+        .split("fn boxed_create_sender<'a>(")
+        .next()
+        .expect("bounded mesh-mTLS get_or_create_sender");
+    assert!(
+        pool.contains("#[inline(never)]\n    fn boxed_create_sender<'a>(")
+            && get_or_create.contains("self.boxed_create_sender(")
+            && !get_or_create.contains("self.create_sender("),
+        "mesh-mTLS pool checkout must box the TLS/H2 handshake off get_or_create_sender"
+    );
     let boxed = src
         .split("fn boxed_proxy_to_backend_mesh_retry<'a>(")
         .nth(1)

@@ -39334,6 +39334,18 @@ fn boxed_proxy_to_backend_hbone<'a>(
 /// other child of the shared retry helper. This is the non-Unix Sidecar arm;
 /// Unix h2c ingress keeps [`boxed_proxy_to_backend_unix_h2c`]. The allocation
 /// is confined to a mesh retry that has already selected Sidecar mTLS.
+///
+/// A bare `Box::pin(proxy_to_backend_mesh_mtls(..))` still materializes the
+/// Sidecar future as a stack temporary in this factory. Under the H3 plain
+/// bridge that factory already sits on a deep `opt-level = 0` poll stack, so
+/// constructing the concrete Sidecar state machine there overflows a Tokio
+/// worker before the first await. The thin `async move` trampoline is what
+/// this factory boxes: its frame is only the captured arguments. The Sidecar
+/// future is built later, when that heap-resident trampoline is polled, after
+/// the H3 helper frames have returned through their boxed seams. Handshake
+/// and post-ready dispatch are themselves boxed out of
+/// [`proxy_to_backend_mesh_mtls`] so that poll frame stays comparable to
+/// HBONE.
 #[allow(clippy::too_many_arguments)]
 #[inline(never)]
 fn boxed_proxy_to_backend_mesh_mtls<'a>(
@@ -39357,26 +39369,106 @@ fn boxed_proxy_to_backend_mesh_mtls<'a>(
     route_response_body_limit: Option<usize>,
     unix_socket_path: Option<&'a str>,
 ) -> BoxedMeshTransportDispatchFuture<'a> {
-    Box::pin(proxy_to_backend_mesh_mtls(
-        state,
+    Box::pin(async move {
+        proxy_to_backend_mesh_mtls(
+            state,
+            proxy,
+            backend_url,
+            method,
+            headers,
+            client_request_body,
+            upstream_target,
+            plugins,
+            request_ctx,
+            response_decision_ctx,
+            stream_response,
+            client_ip,
+            xff_append_ip,
+            request_is_secure,
+            resolved_ip,
+            ctx_bytes_sent_observed,
+            route_request_body_limit,
+            route_response_body_limit,
+            unix_socket_path,
+        )
+        .await
+    })
+}
+
+type BoxedMeshMtlsGetSenderFuture<'a> = std::pin::Pin<
+    Box<
+        dyn std::future::Future<
+                Output = Result<mesh_mtls_pool::MeshMtlsSender, hbone_pool::HbonePoolError>,
+            > + Send
+            + 'a,
+    >,
+>;
+
+/// Sidecar pool checkout, constructed out of line so the TLS + hyper HTTP/2
+/// handshake is not a frame slot in [`proxy_to_backend_mesh_mtls`].
+///
+/// Unix h2c already boxed `checkout_h2c` for this reason. The mTLS arm was
+/// still awaiting `get_sender` inline, so an unoptimized H3 plain Sidecar
+/// attempt stacked that handshake under `handle_h3_request` /
+/// `dispatch_plain` and overflowed. Building it in this `#[inline(never)]`
+/// factory keeps the large temporary off the Sidecar poll frame.
+#[allow(clippy::too_many_arguments)]
+#[inline(never)]
+fn boxed_mesh_mtls_pool_get_sender<'a>(
+    state: &'a ProxyState,
+    proxy: &'a Proxy,
+    target_host: &'a str,
+    app_port: u16,
+    app_policy_port: u16,
+    mtls_port: u16,
+    expected_peer: Option<&'a crate::identity::SpiffeId>,
+    expected_trust_domain: Option<&'a crate::identity::spiffe::TrustDomain>,
+    sni_override: Option<&'a str>,
+) -> BoxedMeshMtlsGetSenderFuture<'a> {
+    Box::pin(state.mesh_mtls_pool.get_sender(
         proxy,
-        backend_url,
-        method,
-        headers,
-        client_request_body,
-        upstream_target,
-        plugins,
-        request_ctx,
-        response_decision_ctx,
-        stream_response,
-        client_ip,
-        xff_append_ip,
-        request_is_secure,
-        resolved_ip,
-        ctx_bytes_sent_observed,
-        route_request_body_limit,
-        route_response_body_limit,
-        unix_socket_path,
+        target_host,
+        app_port,
+        app_policy_port,
+        mtls_port,
+        expected_peer,
+        expected_trust_domain,
+        sni_override,
+    ))
+}
+
+type BoxedUnixH2cCheckoutFuture<'a> = std::pin::Pin<
+    Box<
+        dyn std::future::Future<
+                Output = Result<mesh_mtls_pool::MeshMtlsSender, unix_backend::UnixBackendError>,
+            > + Send
+            + 'a,
+    >,
+>;
+
+/// Unix h2c checkout, constructed out of line so `connect(2)` + h2c handshake
+/// is not a frame slot in [`proxy_to_backend_mesh_mtls`].
+///
+/// `Box::pin(checkout_h2c(..))` written in that coroutine still materializes
+/// the handshake as a temporary in its `opt-level = 0` poll frame — charged
+/// to Sidecar mTLS attempts that never take the Unix branch. This factory
+/// keeps that alloca in a never-inlined leaf.
+#[allow(clippy::too_many_arguments)]
+#[inline(never)]
+fn boxed_unix_backend_checkout_h2c<'a>(
+    state: &'a ProxyState,
+    proxy: &'a Proxy,
+    socket_path: &'a str,
+    connect_timeout_ms: u64,
+    allowed_roots: &'a [String],
+    allowed_uids: &'a [u32],
+) -> BoxedUnixH2cCheckoutFuture<'a> {
+    Box::pin(state.unix_backend_pool.checkout_h2c(
+        proxy,
+        socket_path,
+        connect_timeout_ms,
+        allowed_roots,
+        allowed_uids,
     ))
 }
 
@@ -47138,20 +47230,18 @@ async fn proxy_to_backend_mesh_mtls(
         // `proxy`, so the shared mesh-mTLS body is unchanged for non-Unix
         // targets.
         let unix_conn_proxy = resolve_backend_connection_proxy_for_target(proxy, Some(target));
-        // Boxed for the same stack-budget reason as the Unix dispatch in
-        // `proxy_to_backend` (issue #3764): `proxy_to_backend_mesh_mtls` is
-        // awaited inline from THREE sites reachable from the generic
-        // `handle_proxy_request_inner` future, so this pooled checkout (creation
-        // lock + admission gate + `connect(2)` + h2c handshake) would be stored
-        // inline three times over in the future every request is polled through.
-        // One allocation, only on the Unix h2c branch.
-        let dial = Box::pin(state.unix_backend_pool.checkout_h2c(
+        // Constructed out of line — see `boxed_unix_backend_checkout_h2c`.
+        // A bare `Box::pin(checkout_h2c(..))` here still materializes the
+        // handshake in this coroutine's `opt-level = 0` poll frame, including
+        // on Sidecar mTLS attempts that never take this branch.
+        let dial = boxed_unix_backend_checkout_h2c(
+            state,
             unix_conn_proxy.as_ref(),
             socket_path,
             proxy.backend_connect_timeout_ms,
             &state.env_config.mesh_unix_socket_allowed_roots,
             &state.env_config.mesh_unix_socket_allowed_uids,
-        ));
+        );
         // The client's end-to-end RPC deadline caps the dial exactly as it caps
         // the pooled sender acquisition below: a wedged local app must not
         // outlive the deadline the caller already committed to.
@@ -47185,7 +47275,11 @@ async fn proxy_to_backend_mesh_mtls(
         }
     } else {
         let mtls_port = mesh_mtls_pool::target_mesh_mtls_port(target);
-        let get_sender = state.mesh_mtls_pool.get_sender(
+        // Constructed out of line — see `boxed_mesh_mtls_pool_get_sender`.
+        // Awaiting `get_sender` inline kept the TLS + hyper HTTP/2 handshake
+        // in this coroutine, which overflowed the H3 plain Sidecar path.
+        let get_sender = boxed_mesh_mtls_pool_get_sender(
+            state,
             proxy,
             &target.host,
             target.port,
@@ -47368,6 +47462,135 @@ async fn proxy_to_backend_mesh_mtls(
         }
     }
 
+    // Handshake / checkout complete. The send + collect states are a second
+    // large coroutine; box them out of this acquire frame so an unoptimized
+    // H3 plain Sidecar attempt does not hold handshake and dispatch poll
+    // slots at once. See `boxed_proxy_to_backend_mesh_mtls_after_ready`.
+    boxed_proxy_to_backend_mesh_mtls_after_ready(
+        state,
+        proxy,
+        backend_url,
+        method,
+        headers,
+        client_request_body,
+        target,
+        plugins,
+        request_ctx,
+        response_decision_ctx,
+        stream_response,
+        client_ip,
+        xff_append_ip,
+        request_is_secure,
+        resolved_ip,
+        ctx_bytes_sent_observed,
+        unix_socket_path,
+        sender,
+        is_grpc_flavored,
+        is_grpc_web_translated,
+        is_native_grpc,
+        request_body_limit,
+        effective_max_response_body_size_bytes,
+        client_grpc_deadline_at,
+    )
+    .await
+}
+
+/// Post-ready Sidecar dispatch, constructed out of line so send/collect is
+/// not a frame slot in [`proxy_to_backend_mesh_mtls`].
+///
+/// Pool acquisition and `sender.ready()` stay in the acquire coroutine.
+/// Buffering, trailer forwarding, and the authorization-composed read window
+/// are unchanged; only the poll-frame boundary moves.
+#[allow(clippy::too_many_arguments)]
+#[inline(never)]
+fn boxed_proxy_to_backend_mesh_mtls_after_ready<'a>(
+    state: &'a ProxyState,
+    proxy: &'a Proxy,
+    backend_url: &'a str,
+    method: &'a str,
+    headers: &'a HashMap<String, String>,
+    client_request_body: MeshClientRequestBody,
+    target: &'a UpstreamTarget,
+    plugins: &'a [Arc<dyn crate::plugins::Plugin>],
+    request_ctx: &'a RequestContext,
+    response_decision_ctx: Option<&'a RequestContext>,
+    stream_response: bool,
+    client_ip: &'a str,
+    xff_append_ip: &'a str,
+    request_is_secure: bool,
+    resolved_ip: Option<String>,
+    ctx_bytes_sent_observed: &'a Arc<std::sync::atomic::AtomicU64>,
+    unix_socket_path: Option<&'a str>,
+    sender: mesh_mtls_pool::MeshMtlsSender,
+    is_grpc_flavored: bool,
+    is_grpc_web_translated: bool,
+    is_native_grpc: bool,
+    request_body_limit: usize,
+    effective_max_response_body_size_bytes: usize,
+    client_grpc_deadline_at: Option<tokio::time::Instant>,
+) -> BoxedMeshTransportDispatchFuture<'a> {
+    Box::pin(async move {
+        proxy_to_backend_mesh_mtls_after_ready(
+            state,
+            proxy,
+            backend_url,
+            method,
+            headers,
+            client_request_body,
+            target,
+            plugins,
+            request_ctx,
+            response_decision_ctx,
+            stream_response,
+            client_ip,
+            xff_append_ip,
+            request_is_secure,
+            resolved_ip,
+            ctx_bytes_sent_observed,
+            unix_socket_path,
+            sender,
+            is_grpc_flavored,
+            is_grpc_web_translated,
+            is_native_grpc,
+            request_body_limit,
+            effective_max_response_body_size_bytes,
+            client_grpc_deadline_at,
+        )
+        .await
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn proxy_to_backend_mesh_mtls_after_ready(
+    state: &ProxyState,
+    proxy: &Proxy,
+    backend_url: &str,
+    method: &str,
+    headers: &HashMap<String, String>,
+    client_request_body: MeshClientRequestBody,
+    target: &UpstreamTarget,
+    plugins: &[Arc<dyn crate::plugins::Plugin>],
+    request_ctx: &RequestContext,
+    response_decision_ctx: Option<&RequestContext>,
+    stream_response: bool,
+    client_ip: &str,
+    xff_append_ip: &str,
+    request_is_secure: bool,
+    resolved_ip: Option<String>,
+    ctx_bytes_sent_observed: &Arc<std::sync::atomic::AtomicU64>,
+    unix_socket_path: Option<&str>,
+    mut sender: mesh_mtls_pool::MeshMtlsSender,
+    is_grpc_flavored: bool,
+    is_grpc_web_translated: bool,
+    is_native_grpc: bool,
+    request_body_limit: usize,
+    effective_max_response_body_size_bytes: usize,
+    client_grpc_deadline_at: Option<tokio::time::Instant>,
+) -> (
+    retry::BackendResponse,
+    Option<Bytes>,
+    Option<Arc<std::sync::atomic::AtomicBool>>,
+) {
     // Pool acquisition and sender readiness are connect work. Arm the
     // operator response-read window only after both complete; the client RPC
     // deadline remains receipt-anchored and therefore still caps the entire
