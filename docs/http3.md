@@ -246,11 +246,25 @@ mesh-tagged target re-dials over that target's own dial plan (never the previous
 target's session), and rotating onto an undispatchable one fails closed. The
 half-open circuit-breaker probe slot a refusal consumes is released.
 
-The H3→HTTP plain bridge, plain requests selected for the native H3 backend
-pool, and the H3 WebSocket bridge are unchanged and still refuse **any**
-mesh-tagged target before dialing: plain HTTP gets a 502 with
-`gateway-error-reason`, and the WebSocket bridge refuses the upgrade with the
-same 502 shape.
+The H3→HTTP plain bridge and the H3 WebSocket bridge share the same HBONE /
+Sidecar mesh-mTLS egress pools the H1/H2 paths use (issue #3620). Mesh-tagged
+targets are forced off the native QUIC pool onto those bridges; Unix-socket
+targets remain refused because H3 has no Unix dialer. Mixed-upstream retry
+rotation skips H3-ineligible candidates (Unix) and fails closed when no
+eligible secured or plain transport remains — there is never a plaintext
+fallback for a mesh-tagged target.
+
+The mesh egress pools return an already-buffered response rather than a live
+backend body, but that response re-enters the **same** client-facing plain
+pipeline as an ordinary bridged response: `after_proxy`, body normalization,
+`on_response_body`, the representation transform gate, `on_final_response_body`,
+`response_committed`, sticky-cookie provenance, exact `Content-Length` framing,
+and one backend/admission outcome record. Response inspection and security
+policy never depend on whether the selected target happened to be mesh-tagged.
+Because the mesh dispatch is buffered-mode, a streaming response body is
+structurally impossible there; if one appears the bridge fails closed with a
+`502` instead of publishing an uninspected or fabricated body under the
+backend's status.
 
 ## Buffering policy
 
@@ -646,7 +660,7 @@ H3 client                              Gateway                      Backend
 :scheme = https            ─────►
 :authority = example.com               authenticate + authorize
 :path = /chat                          plugin pipeline
-:protocol = websocket                  → connect_websocket_backend()  HTTP/1.1
+:protocol = websocket                  → WsBackendHandshake Direct/Mesh
 sec-websocket-protocol = chat                            Upgrade: websocket  ─────►
                                                          Sec-WebSocket-Key: ...
                                                                               ◄──── 101
@@ -663,10 +677,11 @@ WebSocket backends (Node `ws`, browsers acting as servers, Nginx,
 HAProxy, Envoy when configured as a forward proxy) still bootstrap
 WebSockets over HTTP/1.1 Upgrade or HTTP/2 Extended CONNECT — RFC 9220
 adoption on the server side is still emerging. The H3 frontend therefore
-always bridges to a HTTP/1.1 Upgrade backend connection via the same
-`connect_websocket_backend()` helper the H1/H2 frontends use. From the
-backend's perspective, a WebSocket arriving via H3 is indistinguishable
-from one arriving via any other frontend.
+bridges through the same `WsBackendHandshake` Direct/Mesh enum the H1/H2
+frontends dispatch: plaintext targets use `connect_websocket_backend()`,
+and `mesh.hbone` / `mesh.mtls` targets use `connect_mesh_websocket_backend()`.
+From the backend's perspective, a WebSocket arriving via H3 is
+indistinguishable from one arriving via any other frontend.
 
 ### Frame relay and plugins
 

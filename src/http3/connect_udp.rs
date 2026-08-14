@@ -623,8 +623,16 @@ pub fn admit_connect_udp_destination(
         if target.port != port || !target.host.eq_ignore_ascii_case(host) {
             continue;
         }
+        // CONNECT-UDP dials a direct UDP socket, not the HTTP mesh egress pools
+        // that made `h3_bridge_transport_refusal` Unix-only. Mesh HBONE / sidecar
+        // mTLS / cross-cluster still cannot be tunnelled.
         if let Some(reason) =
-            crate::proxy::backend_dispatch::direct_network_http_transport_refusal(Some(target))
+            crate::proxy::backend_dispatch::direct_http_mesh_transport_refusal(Some(target))
+        {
+            return Err(ConnectUdpDestinationRefusal::TransportRequired(reason));
+        }
+        if let Some(reason) =
+            crate::proxy::backend_dispatch::h3_bridge_transport_refusal(Some(target))
         {
             return Err(ConnectUdpDestinationRefusal::TransportRequired(reason));
         }

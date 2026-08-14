@@ -346,11 +346,11 @@ fn h3_native_retry_loop_resolves_effective_proxy_per_attempt() {
     );
     // Rotated attempt: a rotation can cross from the SD fallback into a policy
     // port with its own per-port override (TLS/SNI/connectTimeout), so the
-    // loop must RE-resolve after `select_next_retry_target` and before the
+    // loop must RE-resolve after the H3-eligible retry selector and before the
     // retried dispatch.
     let rotation = loop_src
-        .find("select_next_retry_target(")
-        .expect("native-H3 retry rotation must remain present");
+        .find("select_next_h3_eligible_retry_target(")
+        .expect("native-H3 retry rotation must retain the H3-eligible selector");
     assert!(
         loop_src.contains("retry_attempt_allowed_for_target("),
         "native-H3 retry must re-check DestinationRule maxRetries for rotated candidates"

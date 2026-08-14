@@ -83,6 +83,20 @@
 //!   here, it returns 501 rather than misbehaving silently. Controlled
 //!   by `FERRUM_HTTP3_WEBSOCKET_ENABLED` (default true).
 //!
+//! - **Mesh-tagged targets share the client-facing pipeline.** A mesh-tagged
+//!   plain target dispatches through the shared HBONE / Sidecar mesh-mTLS
+//!   pools, which return an already-buffered response instead of a live
+//!   `reqwest::Response` (issue #3620). That response re-enters the SAME
+//!   plain-response path as a reqwest-backed one — `after_proxy`, body
+//!   normalization, `on_response_body`, the representation transform gate,
+//!   `on_final_response_body`, `response_committed`, sticky-cookie provenance,
+//!   exact `Content-Length` framing, and outcome recording. Response
+//!   inspection and security policy must never depend on whether the selected
+//!   target happened to be mesh-tagged. Because the mesh dispatch is
+//!   buffered-mode, a streaming body variant is structurally impossible; both
+//!   the dispatch arm and the streaming writer fail closed with a gateway error
+//!   rather than publish an uninspected or fabricated body.
+//!
 //! ## Outcome reporting
 //!
 //! `CrossProtocolOutcome` captures everything the H3 listener needs to
@@ -639,10 +653,13 @@ fn select_next_cross_protocol_retry_target(
         return CrossProtocolRetryTarget::Unchanged;
     };
 
-    // Centralised in `backend_dispatch::select_next_retry_target` —
-    // see that helper for the per-port `hash_on` recomputation contract
-    // shared with the HTTP/H2/gRPC/WS retry sites.
-    let Some(next) = crate::proxy::backend_dispatch::select_next_retry_target(
+    // Shared H3-eligible retry selection (issue #3620): excludes the original
+    // failed identity and drops every Unix-ineligible pool entry inside the one
+    // load-balancer selection pass, so mixed plain+mesh+unix upstreams land on
+    // an eligible target instead of burning the attempt on a guaranteed
+    // fail-closed dial. When no eligible candidate remains the caller sees
+    // Unchanged and the attempt fails closed.
+    let Some(next) = crate::proxy::backend_dispatch::select_next_h3_eligible_retry_target(
         state,
         epoch,
         proxy,
@@ -1319,6 +1336,43 @@ struct PlainAttemptDispatch<'a> {
     sni_dial: Option<(std::borrow::Cow<'a, Proxy>, String)>,
 }
 
+/// Terminal backend response of the H3→HTTP plain bridge, before the shared
+/// client-facing response pipeline runs.
+///
+/// Mesh-tagged targets are dispatched through the shared HBONE / Sidecar
+/// mesh-mTLS pools, which return an already-buffered response instead of a
+/// live `reqwest::Response` (issue #3620). Both arms converge here so response
+/// inspection, body transforms, final client-visible validators,
+/// `response_committed` hooks, and client framing cannot depend on whether the
+/// selected target happened to be mesh-tagged.
+enum PlainBridgeResponse {
+    /// Live response from the shared reqwest client; its body is still on the
+    /// wire and may be buffered or streamed.
+    Reqwest(reqwest::Response),
+    /// Fully buffered response from a mesh-egress dispatch.
+    MeshBuffered(PlainBridgeMeshResponse),
+}
+
+/// Buffered mesh-egress response plus the backend metadata the shared pipeline
+/// needs for outcome recording (passive health, admission classification, and
+/// the transaction record).
+struct PlainBridgeMeshResponse {
+    status: u16,
+    headers: HashMap<String, String>,
+    body: Bytes,
+    connection_error: bool,
+    error_class: Option<ErrorClass>,
+    backend_resolved_ip: Option<String>,
+}
+
+/// Source of the client-visible response body once status/headers have been
+/// extracted. Mesh responses are already buffered; reqwest responses still own
+/// their body.
+enum PlainBridgeBodySource {
+    Reqwest(reqwest::Response),
+    MeshBuffered(Bytes),
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn run_plain_attempt_local_policy_or_reject<'a, S>(
     state: &ProxyState,
@@ -1341,12 +1395,12 @@ async fn run_plain_attempt_local_policy_or_reject<'a, S>(
 where
     S: RecvStream + SendStream<Bytes>,
 {
-    // The H3 plain bridge has no HBONE / mesh-mTLS / east-west / Unix dispatch
-    // path. A direct network dial would either bypass the secured mesh
-    // transport or hit a Unix target's schema-only loopback placeholder, so
-    // fail closed before backend admission or body relay.
+    // The H3 plain bridge shares HBONE / Sidecar mesh-mTLS egress with H1/H2
+    // (issue #3620). A Unix-socket target still has no dialer here — its
+    // host/port is a schema-only loopback placeholder — so fail closed before
+    // backend admission or body relay rather than dialing the placeholder.
     if let Some(reason) =
-        crate::proxy::backend_dispatch::direct_network_http_transport_refusal(current_target)
+        crate::proxy::backend_dispatch::h3_bridge_transport_refusal(current_target)
     {
         warn!(
             proxy_id = %dispatch_proxy.id,
@@ -1532,12 +1586,28 @@ where
     // The lane itself is the precomputed logical destination scope (issue
     // #3778), not the selected endpoint host — matching the H1/reqwest
     // `http1MaxPendingRequests` gate. Direct H2 does not consume this gate.
+    //
+    // Mesh HBONE / Sidecar mesh-mTLS bypass reqwest
+    // (`proxy_h3_plain_http_mesh_buffered`) and later drop any acquired
+    // `pending_slot`. They must never acquire or be shed by this
+    // reqwest-only lane: a typical plaintext mesh app target still
+    // satisfies `reqwest_dispatch_is_http1_only` because that classifier
+    // looks at scheme/ALPN, not transport (issue #3620). Skip the
+    // classifier entirely for those targets so the hot path stays
+    // allocation-free.
+    let mesh_egress_required =
+        current_target.is_some_and(crate::proxy::target_requires_http_mesh_egress);
     let pending_cap = crate::proxy::resolve_backend_http1_max_pending_requests(
         dispatch_proxy,
         dispatch_policy_port,
     )
     .filter(|_| {
-        crate::proxy::reqwest_dispatch_is_http1_only(state, dispatch_proxy, current_target)
+        let reqwest_http1_only = if mesh_egress_required {
+            false
+        } else {
+            crate::proxy::reqwest_dispatch_is_http1_only(state, dispatch_proxy, current_target)
+        };
+        crate::proxy::h3_plain_http1_pending_gate_applies(mesh_egress_required, reqwest_http1_only)
     });
     let pending_slot = if let Some(cap) = pending_cap {
         // Direct-backend route overrides clear both their inherited cap and
@@ -1633,6 +1703,69 @@ fn record_plain_grpc_web_client_deadline(
         StatusCode::OK.as_u16(),
         false,
         Some(ErrorClass::ClientDisconnect),
+        backend_admission_elapsed,
+    );
+}
+
+/// Record a client deadline after the backend has already produced a terminal
+/// response.
+///
+/// The ordinary reqwest arm has no backend transport classification at this
+/// point, so it keeps the existing health-neutral client-deadline accounting.
+/// A mesh dispatch can instead return a buffered gateway error together with a
+/// real backend transport classification. Do not let a later client deadline
+/// erase that already-established backend signal.
+#[allow(clippy::too_many_arguments)]
+fn record_plain_grpc_web_client_deadline_after_backend_response(
+    state: &ProxyState,
+    epoch: &RequestEpoch,
+    proxy: &Proxy,
+    upstream_balancer: Option<&Arc<LoadBalancer>>,
+    current_target: Option<&UpstreamTarget>,
+    current_cb_target_key: Option<&str>,
+    cb_is_half_open_probe: bool,
+    backend_start: Instant,
+    backend_admission_permits: &mut Option<BackendAdmissionPermitSet>,
+    backend_admission_elapsed: Duration,
+    backend_status: u16,
+    backend_connection_error: bool,
+    backend_error_class: Option<ErrorClass>,
+) {
+    if !backend_connection_error && backend_error_class.is_none() {
+        record_plain_grpc_web_client_deadline(
+            state,
+            epoch,
+            proxy,
+            upstream_balancer,
+            current_target,
+            current_cb_target_key,
+            cb_is_half_open_probe,
+            backend_start,
+            backend_admission_permits,
+            backend_admission_elapsed,
+        );
+        return;
+    }
+
+    record_backend_outcome(
+        state,
+        proxy,
+        &epoch.load_balancer,
+        upstream_balancer,
+        current_target,
+        current_cb_target_key,
+        backend_status,
+        backend_connection_error,
+        backend_error_class,
+        cb_is_half_open_probe,
+        false,
+        backend_start.elapsed(),
+    );
+    record_cross_protocol_backend_admission_outcome(
+        backend_admission_permits,
+        backend_status,
+        backend_connection_error,
+        backend_error_class,
         backend_admission_elapsed,
     );
 }
@@ -1913,6 +2046,84 @@ where
             requires_response_body_buffering,
         );
 
+    // Mesh egress needs an exact replayable body for the shared H1/H2 HBONE /
+    // Sidecar mesh-mTLS pools. Force-buffer a streaming upload when the
+    // selected target is mesh-tagged (issue #3620).
+    let (prebuffered_body, raw_prebuffered_body_bytes) = if prebuffered_body.is_none()
+        && upstream_target.is_some_and(crate::proxy::target_requires_http_mesh_egress)
+    {
+        match super::server::collect_h3_request_body_with_deadline(
+            drain_h3_body(stream, effective_max_request_body_size_bytes),
+            grpc_web_deadline_at,
+            proxy.backend_read_timeout_ms,
+        )
+        .await
+        {
+            Ok(Some(body)) => {
+                let len = body.len() as u64;
+                (Some(body), len)
+            }
+            Ok(None) => {
+                release_cross_protocol_circuit_breaker_probe_on_admission_reject(
+                    state,
+                    proxy,
+                    cb_target_key,
+                    cb_retry_probe_slot_available,
+                );
+                return write_plain_gateway_error(
+                    stream,
+                    ctx,
+                    StatusCode::PAYLOAD_TOO_LARGE,
+                    r#"{"error":"Request body too large"}"#,
+                    None,
+                    backend_start,
+                    0,
+                )
+                .await;
+            }
+            Err(super::server::H3RequestBodyReadError::DeadlineExceeded) => {
+                release_cross_protocol_circuit_breaker_probe_on_admission_reject(
+                    state,
+                    proxy,
+                    cb_target_key,
+                    cb_retry_probe_slot_available,
+                );
+                return write_plain_grpc_web_client_deadline(
+                    stream,
+                    plugins,
+                    ctx,
+                    response_committed_plugins,
+                    initial_response_header_policy_plugins,
+                    backend_start,
+                    0,
+                    backend_url,
+                )
+                .await;
+            }
+            Err(super::server::H3RequestBodyReadError::TimedOut)
+            | Err(super::server::H3RequestBodyReadError::Read(_)) => {
+                release_cross_protocol_circuit_breaker_probe_on_admission_reject(
+                    state,
+                    proxy,
+                    cb_target_key,
+                    cb_retry_probe_slot_available,
+                );
+                return write_plain_gateway_error(
+                    stream,
+                    ctx,
+                    StatusCode::REQUEST_TIMEOUT,
+                    r#"{"error":"Request timeout"}"#,
+                    None,
+                    backend_start,
+                    0,
+                )
+                .await;
+            }
+        }
+    } else {
+        (prebuffered_body, raw_prebuffered_body_bytes)
+    };
+
     let (response, bytes_sent, mut backend_admission_permits, backend_admission_elapsed) =
         match prebuffered_body {
             Some(buffered_body) => {
@@ -2025,6 +2236,215 @@ where
                         Some((sni_proxy, sni_url)) => (sni_proxy.as_ref(), sni_url.as_str()),
                         None => (dispatch_proxy, current_url.as_str()),
                     };
+
+                    // Mesh-tagged targets ride the shared H1/H2 HBONE /
+                    // Sidecar mesh-mTLS pools rather than a plaintext
+                    // reqwest dial (issue #3620). Identity pinning, pool
+                    // keys, and fail-closed refusal when the secured
+                    // transport cannot materialize are owned by those
+                    // pools — never fall back to a direct dial here.
+                    if let Some(target) = current_target
+                        .as_deref()
+                        .filter(|target| crate::proxy::target_requires_http_mesh_egress(target))
+                    {
+                        drop(pending_slot);
+                        let attempt_result = crate::proxy::proxy_h3_plain_http_mesh_buffered(
+                            state,
+                            dispatch_proxy,
+                            &current_url,
+                            method,
+                            proxy_headers,
+                            Bytes::from(buffered_body.clone()),
+                            target,
+                            plugins,
+                            ctx,
+                            client_ip,
+                            xff_append_ip,
+                            ctx.request_is_secure,
+                        )
+                        .await;
+                        if let Some(retry_config) = retry_config
+                            && crate::retry::should_retry(
+                                retry_config,
+                                method,
+                                &attempt_result,
+                                attempt,
+                            )
+                            && crate::proxy::current_retry_attempt_allowed(
+                                route_retry_ceiling,
+                                proxy,
+                                current_target.as_deref(),
+                                attempt,
+                            )
+                        {
+                            let retry_target = select_next_cross_protocol_retry_target(
+                                state,
+                                epoch,
+                                proxy,
+                                lb_hash_key,
+                                current_target.as_ref(),
+                                strip_len,
+                                backend_path_is_policy_bound,
+                                path,
+                                query_string,
+                                client_ip,
+                                proxy_headers,
+                                request_authority,
+                                route_retry_ceiling,
+                                attempt,
+                            );
+                            if !matches!(
+                                &retry_target,
+                                CrossProtocolRetryTarget::BackendPathMismatch
+                                    | CrossProtocolRetryTarget::RetryBudgetExceeded
+                            ) {
+                                record_cross_protocol_backend_admission_outcome(
+                                    &mut backend_admission_permits,
+                                    attempt_result.status_code,
+                                    attempt_result.connection_error,
+                                    attempt_result.error_class,
+                                    backend_admission_start.elapsed(),
+                                );
+                                record_cross_protocol_retry_failure(
+                                    state,
+                                    proxy,
+                                    upstream_balancer,
+                                    current_target.as_deref(),
+                                    current_cb_target_key.as_deref(),
+                                    attempt_result.status_code,
+                                    attempt_result.connection_error,
+                                    cb_retry_probe_slot_available,
+                                );
+                                cb_retry_probe_slot_available = false;
+                                let delay = crate::retry::retry_delay(retry_config, attempt);
+                                if let Err(()) = crate::plugins::await_grpc_deadline(
+                                    grpc_web_deadline_at,
+                                    tokio::time::sleep(delay),
+                                )
+                                .await
+                                {
+                                    // This attempt's admission + backend outcome
+                                    // were ALREADY settled just above, and the
+                                    // retry-failure record owns the single
+                                    // least-connections end matching this
+                                    // iteration's connection start. Recording a
+                                    // client deadline here too would end that
+                                    // connection a SECOND time and undercount the
+                                    // target's active connections, so settle only
+                                    // the client-facing write — same as the
+                                    // reqwest retry arms below.
+                                    return write_plain_grpc_web_client_deadline(
+                                        stream,
+                                        plugins,
+                                        ctx,
+                                        response_committed_plugins,
+                                        initial_response_header_policy_plugins,
+                                        backend_start,
+                                        bytes_sent,
+                                        &current_url,
+                                    )
+                                    .await;
+                                }
+                                attempt += 1;
+                                if let CrossProtocolRetryTarget::Selected(
+                                    next_target,
+                                    next_cb_target_key,
+                                    next_url,
+                                ) = retry_target
+                                {
+                                    current_target = Some(next_target);
+                                    current_cb_target_key = Some(next_cb_target_key);
+                                    current_url = next_url;
+                                }
+                                warn!(
+                                    proxy_id = %proxy.id,
+                                    attempt = attempt,
+                                    max_retries = retry_config.max_retries,
+                                    connection_error = attempt_result.connection_error,
+                                    "Retrying cross-protocol H3→HTTP mesh backend request"
+                                );
+                                continue;
+                            }
+                        }
+
+                        // Terminal mesh attempt. `proxy_h3_plain_http_mesh_buffered`
+                        // is a buffered-mode dispatch, so a streaming body variant
+                        // here means that contract broke: fail closed with a
+                        // gateway error instead of publishing a fabricated body
+                        // under the backend's (possibly successful) status. The
+                        // buffered response leaves the loop as
+                        // `PlainBridgeResponse::MeshBuffered` and is handed to the
+                        // shared plain-response pipeline below, which applies the
+                        // identical after_proxy / body-normalization /
+                        // `on_response_body` / transform / `on_final_response_body`
+                        // / `response_committed` policy, sticky-cookie provenance,
+                        // exact framing, and outcome recording as a
+                        // reqwest-backed buffered response (issue #3620).
+                        let crate::retry::BackendResponse {
+                            status_code: mesh_status,
+                            body: mesh_response_body,
+                            headers: mesh_headers,
+                            connection_error: mesh_connection_error,
+                            backend_resolved_ip: mesh_resolved_ip,
+                            error_class: mesh_error_class,
+                        } = attempt_result;
+                        let crate::retry::ResponseBody::Buffered(mesh_body) = mesh_response_body
+                        else {
+                            warn!(
+                                proxy_id = %proxy.id,
+                                status = mesh_status,
+                                "cross-protocol H3→HTTP mesh dispatch returned a streaming \
+                                 response body in buffered mode; failing closed"
+                            );
+                            record_backend_outcome(
+                                state,
+                                proxy,
+                                &epoch.load_balancer,
+                                upstream_balancer,
+                                current_target.as_deref(),
+                                current_cb_target_key.as_deref(),
+                                mesh_status,
+                                mesh_connection_error,
+                                mesh_error_class,
+                                cb_retry_probe_slot_available,
+                                false,
+                                backend_start.elapsed(),
+                            );
+                            record_cross_protocol_backend_admission_outcome(
+                                &mut backend_admission_permits,
+                                mesh_status,
+                                mesh_connection_error,
+                                mesh_error_class,
+                                backend_admission_start.elapsed(),
+                            );
+                            let mut outcome = write_plain_gateway_error(
+                                stream,
+                                ctx,
+                                StatusCode::BAD_GATEWAY,
+                                r#"{"error":"Bad Gateway"}"#,
+                                None,
+                                backend_start,
+                                bytes_sent,
+                            )
+                            .await?;
+                            outcome.backend_target =
+                                Some(strip_query_from_backend_url(&current_url));
+                            outcome.connection_error = mesh_connection_error;
+                            outcome.error_class = mesh_error_class;
+                            outcome.backend_resolved_ip = mesh_resolved_ip;
+                            return Ok(outcome);
+                        };
+                        final_backend_admission_elapsed = backend_admission_start.elapsed();
+                        final_backend_admission_permits = backend_admission_permits;
+                        break PlainBridgeResponse::MeshBuffered(PlainBridgeMeshResponse {
+                            status: mesh_status,
+                            headers: mesh_headers,
+                            body: mesh_body,
+                            connection_error: mesh_connection_error,
+                            error_class: mesh_error_class,
+                            backend_resolved_ip: mesh_resolved_ip,
+                        });
+                    }
 
                     let client_result = match crate::plugins::await_grpc_deadline(
                         grpc_web_deadline_at,
@@ -2257,7 +2677,7 @@ where
                             }
                             final_backend_admission_elapsed = backend_admission_start.elapsed();
                             final_backend_admission_permits = backend_admission_permits;
-                            break response;
+                            break PlainBridgeResponse::Reqwest(response);
                         }
                         Err(e) => {
                             let attempt_result =
@@ -2963,7 +3383,7 @@ where
 
                 match send_result {
                     Ok(response) => (
-                        response,
+                        PlainBridgeResponse::Reqwest(response),
                         bytes_sent,
                         backend_admission_permits,
                         backend_admission_start.elapsed(),
@@ -3027,10 +3447,54 @@ where
             }
         };
 
-    let status = response.status().as_u16();
-    let mut response_headers = collect_reqwest_response_headers(&response);
-    let final_backend_resolved_ip =
-        resolve_cross_protocol_backend_ip(state, proxy, current_target.as_deref()).await;
+    // Both dispatch arms converge on one client-facing pipeline. `terminal_*`
+    // carries the mesh dispatch's backend classification so passive health,
+    // admission, and the transaction record still see what the mesh transport
+    // reported; a reqwest response reaching here already succeeded, so its
+    // classification is the previous unconditional `false` / `None`.
+    let (
+        body_source,
+        status,
+        mut response_headers,
+        terminal_connection_error,
+        terminal_error_class,
+        mesh_backend_resolved_ip,
+    ) = match response {
+        PlainBridgeResponse::Reqwest(response) => {
+            let status = response.status().as_u16();
+            let response_headers = collect_reqwest_response_headers(&response);
+            (
+                PlainBridgeBodySource::Reqwest(response),
+                status,
+                response_headers,
+                false,
+                None,
+                None,
+            )
+        }
+        PlainBridgeResponse::MeshBuffered(mesh) => {
+            let PlainBridgeMeshResponse {
+                status,
+                headers,
+                body,
+                connection_error,
+                error_class,
+                backend_resolved_ip,
+            } = mesh;
+            (
+                PlainBridgeBodySource::MeshBuffered(body),
+                status,
+                headers,
+                connection_error,
+                error_class,
+                backend_resolved_ip,
+            )
+        }
+    };
+    let final_backend_resolved_ip = match mesh_backend_resolved_ip {
+        Some(resolved_ip) => Some(resolved_ip),
+        None => resolve_cross_protocol_backend_ip(state, proxy, current_target.as_deref()).await,
+    };
 
     // Content-Length fast-path limit (mirrors the H3 pool path). Parsed per
     // comma-folded member so a repeated identical declaration is honored rather
@@ -3039,6 +3503,7 @@ where
         &response_headers,
         effective_max_response_body_size_bytes,
     ) {
+        let terminal_backend_failure = terminal_connection_error || terminal_error_class.is_some();
         warn!(
             proxy_id = %proxy.id,
             response_body_bytes = len,
@@ -3052,18 +3517,34 @@ where
             upstream_balancer,
             current_target.as_deref(),
             current_cb_target_key.as_deref(),
-            502,
-            false,
-            None,
+            if terminal_backend_failure {
+                status
+            } else {
+                502
+            },
+            terminal_connection_error,
+            if terminal_backend_failure {
+                terminal_error_class
+            } else {
+                None
+            },
             cb_retry_probe_slot_available,
             false,
             backend_start.elapsed(),
         );
         record_cross_protocol_backend_admission_outcome(
             &mut backend_admission_permits,
-            502,
-            false,
-            Some(ErrorClass::ResponseBodyTooLarge),
+            if terminal_backend_failure {
+                status
+            } else {
+                502
+            },
+            terminal_connection_error,
+            if terminal_backend_failure {
+                terminal_error_class
+            } else {
+                Some(ErrorClass::ResponseBodyTooLarge)
+            },
             backend_admission_elapsed,
         );
         let mut outcome = write_plain_gateway_error(
@@ -3078,6 +3559,8 @@ where
         .await?;
         outcome.backend_target = Some(strip_query_from_backend_url(&current_url));
         outcome.backend_resolved_ip = final_backend_resolved_ip.clone();
+        outcome.connection_error = terminal_connection_error;
+        outcome.error_class = terminal_error_class;
         outcome.body_error_class = Some(ErrorClass::ResponseBodyTooLarge);
         return Ok(outcome);
     }
@@ -3106,8 +3589,8 @@ where
             current_target.as_deref(),
             current_cb_target_key.as_deref(),
             status,
-            false,
-            None,
+            terminal_connection_error,
+            terminal_error_class,
             cb_retry_probe_slot_available,
             false,
             backend_start.elapsed(),
@@ -3115,8 +3598,8 @@ where
         record_cross_protocol_backend_admission_outcome(
             &mut backend_admission_permits,
             status,
-            false,
-            None,
+            terminal_connection_error,
+            terminal_error_class,
             backend_admission_elapsed,
         );
         let reject_status =
@@ -3156,6 +3639,8 @@ where
         };
         outcome.backend_target = Some(strip_query_from_backend_url(&current_url));
         outcome.backend_resolved_ip = final_backend_resolved_ip.clone();
+        outcome.connection_error = terminal_connection_error;
+        outcome.error_class = terminal_error_class;
         return Ok(outcome);
     }
 
@@ -3202,26 +3687,39 @@ where
         );
     let retry_ctx = has_retry.then(|| crate::proxy::retry_response_decision_context(&*ctx));
     let response_decision_ctx = retry_ctx.as_ref().unwrap_or(&*ctx);
-    let should_buffer_response = !crate::proxy::refine_stream_response_for_content_type(
-        !should_buffer_response,
-        proxy,
-        plugins,
-        Some(response_decision_ctx),
-        status,
-        &response_headers,
-    );
+    // A mesh-egress response is already fully retained, so it is pinned to the
+    // buffered pipeline: there is no live body left to stream, and buffering is
+    // the strictly more inspected of the two paths.
+    let should_buffer_response = matches!(body_source, PlainBridgeBodySource::MeshBuffered(_))
+        || !crate::proxy::refine_stream_response_for_content_type(
+            !should_buffer_response,
+            proxy,
+            plugins,
+            Some(response_decision_ctx),
+            status,
+            &response_headers,
+        );
 
     if should_buffer_response {
         let mut response_status = status;
-        let mut response_body = match crate::plugins::await_grpc_deadline(
-            grpc_web_deadline_at,
-            collect_reqwest_response_body_with_limit(
-                response,
-                effective_max_response_body_size_bytes,
-            ),
-        )
-        .await
-        {
+        // A mesh-egress response was retained by the mesh dispatch under the same
+        // response-size ceiling and aggregate retention budget this collector
+        // enforces, so it enters the plugin pipeline directly instead of being
+        // re-collected.
+        let collected_response_body = match body_source {
+            PlainBridgeBodySource::MeshBuffered(body) => Ok(Ok(body)),
+            PlainBridgeBodySource::Reqwest(response) => {
+                crate::plugins::await_grpc_deadline(
+                    grpc_web_deadline_at,
+                    collect_reqwest_response_body_with_limit(
+                        response,
+                        effective_max_response_body_size_bytes,
+                    ),
+                )
+                .await
+            }
+        };
+        let mut response_body = match collected_response_body {
             Ok(Ok(body)) => body,
             Ok(Err((reject_status, error_body, error_class))) => {
                 // `reject_status` distinguishes an origin-attributed refusal
@@ -3433,7 +3931,7 @@ where
             .await
             .is_err()
         {
-            record_plain_grpc_web_client_deadline(
+            record_plain_grpc_web_client_deadline_after_backend_response(
                 state,
                 epoch,
                 proxy,
@@ -3444,8 +3942,11 @@ where
                 backend_start,
                 &mut backend_admission_permits,
                 backend_admission_elapsed,
+                status,
+                terminal_connection_error,
+                terminal_error_class,
             );
-            return write_plain_grpc_web_client_deadline(
+            let mut outcome = write_plain_grpc_web_client_deadline(
                 stream,
                 plugins,
                 ctx,
@@ -3455,7 +3956,11 @@ where
                 bytes_sent,
                 &current_url,
             )
-            .await;
+            .await?;
+            outcome.backend_resolved_ip = final_backend_resolved_ip.clone();
+            outcome.connection_error = terminal_connection_error;
+            outcome.error_class = terminal_error_class;
+            return Ok(outcome);
         }
 
         // Buffered bridge response: `response_body` below IS the wire body, so
@@ -3488,7 +3993,7 @@ where
                 error,
                 crate::http3::stream_util::H3ResponseWriteError::DeadlineExceeded
             ) {
-                record_plain_grpc_web_client_deadline(
+                record_plain_grpc_web_client_deadline_after_backend_response(
                     state,
                     epoch,
                     proxy,
@@ -3499,42 +4004,76 @@ where
                     backend_start,
                     &mut backend_admission_permits,
                     backend_admission_elapsed,
+                    status,
+                    terminal_connection_error,
+                    terminal_error_class,
                 );
-                return write_plain_grpc_web_client_deadline_without_hooks(
+                let mut outcome = write_plain_grpc_web_client_deadline_without_hooks(
                     stream,
                     ctx,
                     backend_start,
                     bytes_sent,
                     &current_url,
                 )
-                .await;
+                .await?;
+                outcome.backend_resolved_ip = final_backend_resolved_ip.clone();
+                outcome.connection_error = terminal_connection_error;
+                outcome.error_class = terminal_error_class;
+                return Ok(outcome);
             }
             debug!(
                 ?error,
                 "cross-protocol H3 buffered response header write failed"
             );
-            record_cross_protocol_header_write_disconnect(
-                state,
-                proxy,
-                epoch,
-                upstream_balancer,
-                current_target.as_ref(),
-                current_cb_target_key.as_deref(),
-                response_status,
-                status,
-                cb_retry_probe_slot_available,
-                backend_start,
-                &mut backend_admission_permits,
-                backend_admission_elapsed,
-            );
-            return Ok(cross_protocol_header_write_disconnect_outcome(
+            if terminal_connection_error || terminal_error_class.is_some() {
+                record_backend_outcome(
+                    state,
+                    proxy,
+                    &epoch.load_balancer,
+                    upstream_balancer,
+                    current_target.as_deref(),
+                    current_cb_target_key.as_deref(),
+                    status,
+                    terminal_connection_error,
+                    terminal_error_class,
+                    cb_retry_probe_slot_available,
+                    false,
+                    backend_start.elapsed(),
+                );
+                record_cross_protocol_backend_admission_outcome(
+                    &mut backend_admission_permits,
+                    status,
+                    terminal_connection_error,
+                    terminal_error_class,
+                    backend_admission_elapsed,
+                );
+            } else {
+                record_cross_protocol_header_write_disconnect(
+                    state,
+                    proxy,
+                    epoch,
+                    upstream_balancer,
+                    current_target.as_ref(),
+                    current_cb_target_key.as_deref(),
+                    response_status,
+                    status,
+                    cb_retry_probe_slot_available,
+                    backend_start,
+                    &mut backend_admission_permits,
+                    backend_admission_elapsed,
+                );
+            }
+            let mut outcome = cross_protocol_header_write_disconnect_outcome(
                 response_status,
                 false,
                 bytes_sent,
                 backend_start,
                 Some(strip_query_from_backend_url(&current_url)),
                 final_backend_resolved_ip.clone(),
-            ));
+            );
+            outcome.connection_error = terminal_connection_error;
+            outcome.error_class = terminal_error_class;
+            return Ok(outcome);
         }
         let bytes_streamed = response_body.len() as u64;
         let buffered_write = async {
@@ -3556,7 +4095,7 @@ where
                     (false, true)
                 }
                 Err(crate::http3::stream_util::H3ResponseWriteError::DeadlineExceeded) => {
-                    record_plain_grpc_web_client_deadline(
+                    record_plain_grpc_web_client_deadline_after_backend_response(
                         state,
                         epoch,
                         proxy,
@@ -3567,6 +4106,9 @@ where
                         backend_start,
                         &mut backend_admission_permits,
                         backend_admission_elapsed,
+                        status,
+                        terminal_connection_error,
+                        terminal_error_class,
                     );
                     let (deadline_bytes, deadline_written) =
                         append_plain_grpc_web_client_deadline(stream, ctx).await;
@@ -3579,8 +4121,8 @@ where
                         backend_resolved_ip: final_backend_resolved_ip.clone(),
                         body_completed: deadline_written,
                         client_disconnected: false,
-                        connection_error: false,
-                        error_class: None,
+                        connection_error: terminal_connection_error,
+                        error_class: terminal_error_class,
                         body_error_class: Some(ErrorClass::ClientDisconnect),
                         backend_total_ms: backend_start.elapsed().as_secs_f64() * 1000.0,
                         backend_ttfb_ms: backend_start.elapsed().as_secs_f64() * 1000.0,
@@ -3597,8 +4139,8 @@ where
             current_target.as_deref(),
             current_cb_target_key.as_deref(),
             response_status,
-            false,
-            None,
+            terminal_connection_error,
+            terminal_error_class,
             cb_retry_probe_slot_available,
             false,
             backend_start.elapsed(),
@@ -3610,15 +4152,13 @@ where
         // adaptive limiter shrink/grow on a signal that does not reflect backend
         // health. Matches the streaming path below and the H1/H2 path, which
         // capture the backend status before response-body hooks run.
+        let admission_error_class = terminal_error_class
+            .or_else(|| (!body_completed).then_some(ErrorClass::ClientDisconnect));
         record_cross_protocol_backend_admission_outcome(
             &mut backend_admission_permits,
             status,
-            false,
-            if body_completed {
-                None
-            } else {
-                Some(ErrorClass::ClientDisconnect)
-            },
+            terminal_connection_error,
+            admission_error_class,
             backend_admission_elapsed,
         );
 
@@ -3631,8 +4171,8 @@ where
             backend_resolved_ip: final_backend_resolved_ip.clone(),
             body_completed,
             client_disconnected,
-            connection_error: false,
-            error_class: None,
+            connection_error: terminal_connection_error,
+            error_class: terminal_error_class,
             body_error_class: if body_completed {
                 None
             } else {
@@ -3643,6 +4183,59 @@ where
             rejection_logged: false,
         });
     }
+
+    // Only a live reqwest body can be streamed. A mesh-egress response is always
+    // buffered and the refinement above pins it to the buffered pipeline, so
+    // reaching here means that invariant broke: fail closed with a gateway error
+    // rather than continue on a path that skips the buffered body-policy phases.
+    // The backend's own classification is still recorded once, so a gateway-side
+    // structural failure is not charged to backend health as a transport error.
+    let response = match body_source {
+        PlainBridgeBodySource::Reqwest(response) => response,
+        PlainBridgeBodySource::MeshBuffered(_) => {
+            warn!(
+                proxy_id = %proxy.id,
+                status = status,
+                "cross-protocol H3→HTTP mesh response reached the streaming path; failing closed"
+            );
+            record_backend_outcome(
+                state,
+                proxy,
+                &epoch.load_balancer,
+                upstream_balancer,
+                current_target.as_deref(),
+                current_cb_target_key.as_deref(),
+                status,
+                terminal_connection_error,
+                terminal_error_class,
+                cb_retry_probe_slot_available,
+                false,
+                backend_start.elapsed(),
+            );
+            record_cross_protocol_backend_admission_outcome(
+                &mut backend_admission_permits,
+                status,
+                terminal_connection_error,
+                terminal_error_class,
+                backend_admission_elapsed,
+            );
+            let mut outcome = write_plain_gateway_error(
+                stream,
+                ctx,
+                StatusCode::BAD_GATEWAY,
+                r#"{"error":"Bad Gateway"}"#,
+                None,
+                backend_start,
+                bytes_sent,
+            )
+            .await?;
+            outcome.backend_target = Some(strip_query_from_backend_url(&current_url));
+            outcome.backend_resolved_ip = final_backend_resolved_ip.clone();
+            outcome.connection_error = terminal_connection_error;
+            outcome.error_class = terminal_error_class;
+            return Ok(outcome);
+        }
+    };
 
     // Resolve a response-stream inspector (e.g. ai_semantic_firewall `inspect`)
     // for this H3-client → non-H3-backend response. Without this, an H3 client

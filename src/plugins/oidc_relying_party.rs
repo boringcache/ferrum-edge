@@ -1067,6 +1067,7 @@ impl OidcRelyingParty {
             .provider
             .http_client
             .get()
+            .map_err(|_| r#"{"error":"Token endpoint request failed"}"#.to_string())?
             .post(token_endpoint)
             .timeout(Duration::from_secs(10));
         match &self.provider.client_auth {
@@ -1199,6 +1200,7 @@ impl OidcRelyingParty {
                 self.provider
                     .http_client
                     .get()
+                    .map_err(|error| format!("userinfo request failed: {error}"))?
                     .get(endpoint)
                     .bearer_auth(access_token),
                 "oidc_rp_userinfo",
@@ -3392,8 +3394,11 @@ async fn fetch_discovery(
     http_client: &PluginHttpClient,
     discovery_url: &str,
 ) -> Result<DiscoveryDoc, String> {
+    let client = http_client
+        .get()
+        .map_err(|e| format!("discovery request failed: {e}"))?;
     let response = http_client
-        .execute(http_client.get().get(discovery_url), "oidc_rp_discovery")
+        .execute(client.get(discovery_url), "oidc_rp_discovery")
         .await
         .map_err(|e| format!("discovery request failed: {e}"))?;
     if !response.status().is_success() {

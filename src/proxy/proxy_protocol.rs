@@ -6,6 +6,12 @@
 //! header carries the original client address so the backend can see the real
 //! source IP rather than the LB's own IP.
 //!
+//! UDP and DTLS listeners use a sibling per-datagram parser in
+//! [`crate::proxy::datagram_client_address`]: same v2 signature, version,
+//! family codes, and 512-byte address-block cap, but a distinct `DGRAM`
+//! transport, auth-TLV, dest-port, and hot-path contract. Keep those constants
+//! aligned; do not merge the parsers.
+//!
 //! Outbound encoding ([`encode_v2_proxy_header`])
 //! prepends the same v2 binary framing to backend TCP connections when a
 //! stream proxy opts in via `backend_proxy_protocol: v2`, so L4 backends
@@ -94,7 +100,8 @@ pub enum ProxyProtocolError {
     Timeout,
 }
 
-// PROXY v2 signature: 12-byte fixed prefix
+// PROXY v2 signature: 12-byte fixed prefix. Keep byte-identical to
+// `datagram_client_address::V2_SIG`; the parsers are deliberately separate.
 const V2_SIG: &[u8; 12] = b"\r\n\r\n\x00\r\nQUIT\n";
 // PROXY v1 prefix
 const V1_PREFIX: &[u8; 6] = b"PROXY ";
@@ -104,11 +111,15 @@ const V1_PREFIX: &[u8; 6] = b"PROXY ";
 // VPC Lattice, HAProxy custom TLVs) that appear after the address pair.
 // Anything longer is rejected to bound memory; per spec the address
 // block can carry arbitrary TLVs after the AF_INET / AF_INET6 portion.
+// Keep equal to `datagram_client_address::MAX_ADDR_BLOCK_LEN`.
 const V2_MAX_ADDR_LEN: u16 = 512;
 // PROXY v1: maximum total line length is 107 bytes + CRLF = 109 bytes.
 // `rest` holds the full line including the 6-byte "PROXY " prefix and the
 // CRLF terminator, so the cap must cover all 109 bytes.
 const V1_MAX_LEN: usize = 109;
+// Fixed address-block sizes shared with the datagram parser.
+const V2_INET_ADDR_LEN: usize = 12;
+const V2_INET6_ADDR_LEN: usize = 36;
 
 /// Parse the PROXY protocol header from `stream`.
 ///
@@ -408,8 +419,8 @@ fn parse_v2_addresses(
             Ok(ProxyProtocolResult::NoAddress)
         }
         0x01 => {
-            // AF_INET (IPv4): 4+4+2+2 = 12 bytes
-            if block.len() < 12 {
+            // AF_INET (IPv4): 4+4+2+2. Keep equal to the datagram parser.
+            if block.len() < V2_INET_ADDR_LEN {
                 return Err(ProxyProtocolError::Malformed(format!(
                     "AF_INET address block too short: {} bytes",
                     block.len()
@@ -430,8 +441,8 @@ fn parse_v2_addresses(
             })
         }
         0x02 => {
-            // AF_INET6 (IPv6): 16+16+2+2 = 36 bytes
-            if block.len() < 36 {
+            // AF_INET6 (IPv6): 16+16+2+2. Keep equal to the datagram parser.
+            if block.len() < V2_INET6_ADDR_LEN {
                 return Err(ProxyProtocolError::Malformed(format!(
                     "AF_INET6 address block too short: {} bytes",
                     block.len()
@@ -522,7 +533,7 @@ pub fn warn_invalid_proxy_header(
 
 /// Maximum encoded PROXY v2 header size this module emits (signature + fixed
 /// header + AF_INET6 address block). Callers may stack-allocate against this.
-pub const V2_ENCODED_MAX_LEN: usize = V2_SIG.len() + 4 + 36;
+pub const V2_ENCODED_MAX_LEN: usize = V2_SIG.len() + 4 + V2_INET6_ADDR_LEN;
 
 /// Build source/destination socket addresses for an outbound PROXY v2 header.
 ///
