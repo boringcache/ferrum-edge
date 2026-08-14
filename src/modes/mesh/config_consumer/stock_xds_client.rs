@@ -98,7 +98,7 @@ use super::file_source::{
 };
 use super::stock_xds_credential::{
     StockBearerCredential, StockCredentialInvalidReason, StockCredentialObservation,
-    StockCredentialState, StockCredentialWatch, StockXdsCredentialSource,
+    StockCredentialReadEpoch, StockCredentialState, StockCredentialWatch, StockXdsCredentialSource,
 };
 use super::stock_xds_transport::{
     StockXdsTransport, StockXdsTransportPolicy, admit_stock_xds_endpoints,
@@ -648,8 +648,10 @@ fn grpc_status_category(status: &tonic::Status) -> &'static str {
 /// The fence is `(generation, deadline)`. `generation` advances only on a real
 /// state change of the configured source, so comparing it answers "is the
 /// credential I materialized still the current observation?" without retaining
-/// a second copy of the secret. `deadline` is absolute and was stamped at
-/// admission, so neither dial latency nor application activity can move it.
+/// a second copy of the secret. The generation bound here is the one captured
+/// when *this* serialized read was admitted; it is never a later observation's
+/// generation. `deadline` is absolute and was stamped at admission, so neither
+/// dial latency nor application activity can move it.
 #[derive(Clone)]
 struct StockCredentialFence {
     generation: u64,
@@ -1188,25 +1190,33 @@ async fn connect_stock_ads(
 
     // The bearer is materialized per connection attempt, so a failover or a
     // failback always presents the NEWEST material rather than a value captured
-    // by an earlier endpoint's interceptor. The result is published so the
-    // watcher's next identical read is not mistaken for a rotation.
-    let credential = match config.credential.materialize().await {
-        Ok(credential) => {
-            let observed = credential
-                .as_ref()
-                .map(StockBearerCredential::observed_state)
-                .unwrap_or(StockCredentialState::NotConfigured);
-            credential_watch.publish(observed);
+    // by an earlier endpoint's interceptor. Publication is last-completed-read:
+    // the epoch stamped under the one-reader permit is what admits this
+    // observation, so a delayed older read cannot overwrite a newer watcher
+    // result or bind a fence to that stale generation.
+    let read = config.credential.observe().await;
+    let observed = read.observed_state();
+    let generation = match admit_stock_credential_observation(
+        credential_watch,
+        read.epoch(),
+        observed,
+    ) {
+        Ok(generation) => {
             // Mark our own publication seen so the live stream does not treat
             // it as a rotation on its very first poll.
             let _ = credential_rx.borrow_and_update();
             tracker.set_credential(observed.health());
-            credential
+            generation
         }
-        Err(reason) => {
-            credential_watch.publish(StockCredentialState::Invalid { reason });
+        Err(retirement) => {
             let _ = credential_rx.borrow_and_update();
-            tracker.set_credential(MeshConfigStreamCredential::SourceInvalid);
+            tracker.set_credential(credential_watch.latest().state.health());
+            return StockAttemptOutcome::local(retirement);
+        }
+    };
+    let credential = match read.into_outcome() {
+        Ok(credential) => credential,
+        Err(reason) => {
             return StockAttemptOutcome::local_with_reason(
                 MeshStreamRetirement::CredentialSourceInvalid,
                 reason.as_metric_label(),
@@ -1214,13 +1224,14 @@ async fn connect_stock_ads(
         }
     };
 
-    // The fence this attempt is bound to. It is captured AFTER the publication
-    // above, so `generation` is exactly the observation the materialized
-    // credential produced, and `deadline` is the absolute instant stamped at
-    // admission — dial latency spends it rather than extending it.
+    // The fence this attempt is bound to. `generation` is the value captured
+    // under the watch send lock when THIS observation was admitted — never
+    // `latest()` after the lock is dropped, which could already be a newer
+    // replacement. `deadline` is the absolute instant stamped at admission —
+    // dial latency spends it rather than extending it.
     let fence = StockCredentialFence::bind(
         credential_watch,
-        credential_rx.borrow().generation,
+        generation,
         credential.as_ref().map(StockBearerCredential::deadline),
         config.credential.is_configured(),
     );
@@ -2372,6 +2383,39 @@ fn map_send_result(
         Ok(Err(_)) => Err(StockOutboundError::Transport("request_stream_closed")),
         Err(_) => Err(StockOutboundError::Transport("request_enqueue_timeout")),
     }
+}
+
+/// Admit a serialized credential read onto the shared watch, or refuse it.
+///
+/// `Ok(generation)` is captured under the watch send lock for *this*
+/// observation and is the only generation a connection fence may be bound to.
+/// `Err` means a newer completed read already won; the caller must not dial or
+/// open with the losing material. Retirement outcomes stay the existing
+/// closed set: invalidation if the winner is unusable, rotation otherwise.
+fn admit_stock_credential_observation(
+    watch: &StockCredentialWatch,
+    epoch: Option<StockCredentialReadEpoch>,
+    state: StockCredentialState,
+) -> Result<u64, MeshStreamRetirement> {
+    match watch.admit_observation(epoch, state) {
+        Ok(generation) => Ok(generation),
+        Err(winning) => Err(if winning.is_invalid() {
+            MeshStreamRetirement::CredentialSourceInvalid
+        } else {
+            MeshStreamRetirement::CredentialRotated
+        }),
+    }
+}
+
+/// Production reconnect admission: publish a serialized read, or refuse to
+/// bind/open if a newer observation already won. Used by external tests to
+/// prove an older credential cannot open a stream after a newer read.
+pub fn admit_stock_credential_observation_for_test(
+    watch: &StockCredentialWatch,
+    epoch: Option<StockCredentialReadEpoch>,
+    state: StockCredentialState,
+) -> Result<u64, MeshStreamRetirement> {
+    admit_stock_credential_observation(watch, epoch, state)
 }
 
 /// Drive the production credential-raced outbound enqueue with a caller-owned

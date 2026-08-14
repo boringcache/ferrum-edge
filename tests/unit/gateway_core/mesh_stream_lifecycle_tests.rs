@@ -12,14 +12,14 @@ use std::time::{Duration, SystemTime};
 use base64::Engine as _;
 
 use ferrum_edge::modes::mesh::config_consumer::stock_xds_client::{
-    BearerToken, attach_stock_authorization,
+    BearerToken, admit_stock_credential_observation_for_test, attach_stock_authorization,
 };
 use ferrum_edge::modes::mesh::config_consumer::stock_xds_credential::{
     DEFAULT_STOCK_XDS_TOKEN_MAX_STREAM_LIFETIME_SECS, MAX_STOCK_XDS_TOKEN_MAX_STREAM_LIFETIME_SECS,
     MIN_STOCK_XDS_TOKEN_MAX_STREAM_LIFETIME_SECS, StockBearerCredential,
     StockCredentialDeadlineBasis, StockCredentialInvalidReason, StockCredentialLifetimePolicy,
-    StockCredentialState, StockCredentialWatch, StockXdsCredentialSource, credential_lifetime,
-    jwt_expiration_hint,
+    StockCredentialPublish, StockCredentialState, StockCredentialWatch, StockXdsCredentialSource,
+    credential_lifetime, jwt_expiration_hint,
 };
 use ferrum_edge::modes::mesh::config_consumer::stock_xds_transport::{
     StockXdsTransport, StockXdsTransportPolicy, StockXdsTransportRefusal,
@@ -1461,6 +1461,259 @@ fn the_credential_watch_only_advances_its_generation_on_a_real_change() {
         watch.latest().state.health(),
         MeshConfigStreamCredential::SourceInvalid
     );
+}
+
+/// The reconnect path can finish an older serialized read, drop the reader
+/// permit, and publish after a newer read has already been published. The
+/// older observation must not resurrect.
+#[tokio::test]
+async fn an_older_serialized_read_cannot_overwrite_a_newer_valid_observation() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let path = temp.path().join("token");
+    std::fs::write(&path, b"token-a").expect("write");
+    let source = StockXdsCredentialSource::new(
+        Some(path.to_string_lossy().into_owned()),
+        StockCredentialLifetimePolicy::default(),
+    );
+    let older = source.observe().await;
+    std::fs::write(&path, b"token-b").expect("write");
+    let newer = source.observe().await;
+    assert_ne!(older.observed_state(), newer.observed_state());
+
+    let watch = StockCredentialWatch::new(StockCredentialState::Unknown);
+    assert!(
+        watch
+            .publish_observed(newer.epoch(), newer.observed_state())
+            .generation_changed()
+    );
+    let generation = watch.latest().generation;
+    let published = watch.latest().state;
+    assert_eq!(
+        watch.publish_observed(older.epoch(), older.observed_state()),
+        StockCredentialPublish::Superseded {
+            state: published,
+            generation,
+        }
+    );
+    assert_eq!(watch.latest().generation, generation);
+    assert_eq!(watch.latest().state, published);
+    assert_eq!(
+        watch.publish_observed(None, older.observed_state()),
+        StockCredentialPublish::Superseded {
+            state: published,
+            generation,
+        }
+    );
+}
+
+#[tokio::test]
+async fn an_older_valid_read_cannot_overwrite_a_newer_invalid_observation() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let path = temp.path().join("token");
+    std::fs::write(&path, b"token-a").expect("write");
+    let source = StockXdsCredentialSource::new(
+        Some(path.to_string_lossy().into_owned()),
+        StockCredentialLifetimePolicy::default(),
+    );
+    let older = source.observe().await;
+    std::fs::remove_file(&path).expect("unlink");
+    let newer = source.observe().await;
+    assert!(
+        matches!(newer.observed_state(), StockCredentialState::Invalid { .. }),
+        "deleting the source must fail closed"
+    );
+
+    let watch = StockCredentialWatch::new(StockCredentialState::Unknown);
+    assert!(
+        watch
+            .publish_observed(newer.epoch(), newer.observed_state())
+            .generation_changed()
+    );
+    let generation = watch.latest().generation;
+    let published = watch.latest().state;
+    assert_eq!(
+        watch.publish_observed(older.epoch(), older.observed_state()),
+        StockCredentialPublish::Superseded {
+            state: published,
+            generation,
+        }
+    );
+    assert_eq!(watch.latest().generation, generation);
+    assert!(watch.latest().state.is_invalid());
+}
+
+#[tokio::test]
+async fn an_older_invalid_read_cannot_overwrite_a_newer_valid_observation() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let path = temp.path().join("token");
+    let source = StockXdsCredentialSource::new(
+        Some(path.to_string_lossy().into_owned()),
+        StockCredentialLifetimePolicy::default(),
+    );
+    let older = source.observe().await;
+    assert!(matches!(
+        older.observed_state(),
+        StockCredentialState::Invalid {
+            reason: StockCredentialInvalidReason::Missing,
+        }
+    ));
+    std::fs::write(&path, b"token-b").expect("write");
+    let newer = source.observe().await;
+    assert!(matches!(
+        newer.observed_state(),
+        StockCredentialState::Valid { .. }
+    ));
+
+    let watch = StockCredentialWatch::new(StockCredentialState::Unknown);
+    assert!(
+        watch
+            .publish_observed(newer.epoch(), newer.observed_state())
+            .generation_changed()
+    );
+    let generation = watch.latest().generation;
+    let published = watch.latest().state;
+    assert_eq!(
+        watch.publish_observed(older.epoch(), older.observed_state()),
+        StockCredentialPublish::Superseded {
+            state: published,
+            generation,
+        }
+    );
+    assert_eq!(watch.latest().generation, generation);
+    assert_eq!(watch.latest().state, published);
+}
+
+#[tokio::test]
+async fn an_older_read_of_the_same_token_does_not_churn_generation() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let path = temp.path().join("token");
+    std::fs::write(&path, b"token-unchanged").expect("write");
+    let source = StockXdsCredentialSource::new(
+        Some(path.to_string_lossy().into_owned()),
+        StockCredentialLifetimePolicy::default(),
+    );
+    let first = source.observe().await;
+    let second = source.observe().await;
+    assert_eq!(first.observed_state(), second.observed_state());
+
+    let watch = StockCredentialWatch::new(StockCredentialState::Unknown);
+    assert!(
+        watch
+            .publish_observed(first.epoch(), first.observed_state())
+            .generation_changed()
+    );
+    let generation = watch.latest().generation;
+    assert!(
+        !watch
+            .publish_observed(second.epoch(), second.observed_state())
+            .generation_changed()
+    );
+    assert_eq!(watch.latest().generation, generation);
+    assert_eq!(
+        watch.publish_observed(first.epoch(), first.observed_state()),
+        StockCredentialPublish::Accepted {
+            generation,
+            generation_changed: false,
+        }
+    );
+    assert_eq!(
+        admit_stock_credential_observation_for_test(
+            &watch,
+            first.epoch(),
+            first.observed_state(),
+        ),
+        Ok(generation)
+    );
+}
+
+#[tokio::test]
+async fn an_older_valid_read_cannot_bind_a_stream_after_a_newer_valid_observation_wins() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let path = temp.path().join("token");
+    std::fs::write(&path, b"token-a").expect("write");
+    let source = StockXdsCredentialSource::new(
+        Some(path.to_string_lossy().into_owned()),
+        StockCredentialLifetimePolicy::default(),
+    );
+    let older = source.observe().await;
+    std::fs::write(&path, b"token-b").expect("write");
+    let newer = source.observe().await;
+
+    let watch = StockCredentialWatch::new(StockCredentialState::Unknown);
+    let opened = admit_stock_credential_observation_for_test(
+        &watch,
+        newer.epoch(),
+        newer.observed_state(),
+    )
+    .expect("the newest valid observation is admitted");
+    assert_eq!(
+        admit_stock_credential_observation_for_test(
+            &watch,
+            older.epoch(),
+            older.observed_state(),
+        ),
+        Err(MeshStreamRetirement::CredentialRotated)
+    );
+    assert_eq!(watch.latest().generation, opened);
+    assert_eq!(watch.latest().state, newer.observed_state());
+}
+
+#[tokio::test]
+async fn an_older_valid_read_cannot_bind_a_stream_after_a_newer_invalid_observation_wins() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let path = temp.path().join("token");
+    std::fs::write(&path, b"token-a").expect("write");
+    let source = StockXdsCredentialSource::new(
+        Some(path.to_string_lossy().into_owned()),
+        StockCredentialLifetimePolicy::default(),
+    );
+    let older = source.observe().await;
+    std::fs::remove_file(&path).expect("unlink");
+    let newer = source.observe().await;
+
+    let watch = StockCredentialWatch::new(StockCredentialState::Unknown);
+    let opened = admit_stock_credential_observation_for_test(
+        &watch,
+        newer.epoch(),
+        newer.observed_state(),
+    )
+    .expect("the newest invalid observation is admitted");
+    assert_eq!(
+        admit_stock_credential_observation_for_test(
+            &watch,
+            older.epoch(),
+            older.observed_state(),
+        ),
+        Err(MeshStreamRetirement::CredentialSourceInvalid)
+    );
+    assert_eq!(watch.latest().generation, opened);
+    assert!(watch.latest().state.is_invalid());
+}
+
+#[tokio::test]
+async fn a_not_configured_observation_still_obeys_read_epoch_order() {
+    let source = StockXdsCredentialSource::unauthenticated();
+    let older = source.observe().await;
+    let newer = source.observe().await;
+    assert_eq!(older.observed_state(), StockCredentialState::NotConfigured);
+    assert_eq!(newer.observed_state(), StockCredentialState::NotConfigured);
+
+    let watch = StockCredentialWatch::new(StockCredentialState::Unknown);
+    assert!(
+        watch
+            .publish_observed(newer.epoch(), newer.observed_state())
+            .generation_changed()
+    );
+    let generation = watch.latest().generation;
+    assert_eq!(
+        watch.publish_observed(older.epoch(), older.observed_state()),
+        StockCredentialPublish::Accepted {
+            generation,
+            generation_changed: false,
+        }
+    );
+    assert_eq!(watch.latest().generation, generation);
+    assert_eq!(watch.latest().state, StockCredentialState::NotConfigured);
 }
 
 #[test]

@@ -50,11 +50,28 @@
 //!    retry (plus the watcher wakeup on replacement material) is what avoids a
 //!    hot loop — never a floor that admits the stale token anyway.
 //!
+//! File reads are serialized by the one-permit semaphore, but publication is
+//! deliberately *not* done while that permit is held (the watch send lock must
+//! not nest with the reader slot or the commit-admission read guard, and the
+//! watch lock must never be held across `.await`). The reconnect path can
+//! therefore finish an older read, drop the permit, and be descheduled while
+//! the watcher completes a newer read and publishes it. An internal monotonic
+//! **read epoch** is stamped the moment a caller becomes the serialized
+//! reader; [`StockCredentialWatch::publish_observed`] then refuses any
+//! observation whose epoch is not strictly newer than the last completed read.
+//! An older valid token cannot resurrect past a newer valid replacement or a
+//! newer invalidation, and the reconnect path will not bind a connection fence
+//! or open an ADS RPC with material that already lost.
+//!
 //! Nothing here ever logs, metrics, or otherwise renders token bytes, decoded
-//! claims, the configured path, or a digest of any of them. The content
-//! fingerprint exists solely for in-process equality and is never exposed.
+//! claims, the configured path, a digest of any of them, or the internal read
+//! epoch. The content fingerprint exists solely for in-process equality and is
+//! never exposed.
 
-use std::sync::Arc;
+use std::sync::{
+    Arc,
+    atomic::{AtomicU64, Ordering},
+};
 use std::time::{Duration, SystemTime};
 
 use tokio::sync::{Semaphore, watch};
@@ -82,6 +99,36 @@ static STOCK_XDS_TOKEN_FILE_READ_LIMIT: std::sync::OnceLock<Arc<Semaphore>> =
 
 pub(crate) fn stock_xds_token_file_read_limit() -> Arc<Semaphore> {
     Arc::clone(STOCK_XDS_TOKEN_FILE_READ_LIMIT.get_or_init(|| Arc::new(Semaphore::new(1))))
+}
+
+/// Monotonic identity of one completed serialized credential read.
+///
+/// Assigned when a caller acquires the one-reader permit — the same order the
+/// authoritative file reads complete — and consumed at publication so a
+/// delayed older result cannot overwrite a newer one. The numeric value is
+/// never logged, exported, or rendered on an admin surface.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub struct StockCredentialReadEpoch(u64);
+
+impl StockCredentialReadEpoch {
+    fn as_u64(self) -> u64 {
+        self.0
+    }
+}
+
+impl std::fmt::Debug for StockCredentialReadEpoch {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("StockCredentialReadEpoch(<redacted>)")
+    }
+}
+
+/// Process-wide counter shared by the serialized reader and by synthetic test
+/// publications. It exists only to totally-order completed reads; the value
+/// is never an authorization input.
+static STOCK_XDS_CREDENTIAL_READ_EPOCH: AtomicU64 = AtomicU64::new(0);
+
+fn alloc_read_epoch() -> StockCredentialReadEpoch {
+    StockCredentialReadEpoch(STOCK_XDS_CREDENTIAL_READ_EPOCH.fetch_add(1, Ordering::AcqRel) + 1)
 }
 
 /// Longest JWT segment this decoder will look at.
@@ -242,19 +289,67 @@ impl StockCredentialState {
 
 /// One published observation. `generation` advances only when `state` actually
 /// changes, so an unchanged token never churns the ADS stream.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+///
+/// `read_epoch` is the internal total order of completed serialized reads. It
+/// is omitted from [`Debug`] and is never a log, metric, or admin field.
+#[derive(Clone, Copy, PartialEq, Eq)]
 pub struct StockCredentialObservation {
     pub generation: u64,
     pub state: StockCredentialState,
+    read_epoch: u64,
+}
+
+impl std::fmt::Debug for StockCredentialObservation {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("StockCredentialObservation")
+            .field("generation", &self.generation)
+            .field("state", &self.state)
+            .finish()
+    }
+}
+
+/// Result of publishing one observation into [`StockCredentialWatch`].
+///
+/// `Accepted` means this material is still the newest authoritative
+/// observation (or an older read of the *same* material, which must not churn).
+/// `Superseded` means a newer completed read already won; the caller must not
+/// bind a fence or open a stream with the losing material.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StockCredentialPublish {
+    Accepted {
+        generation: u64,
+        generation_changed: bool,
+    },
+    Superseded {
+        state: StockCredentialState,
+        generation: u64,
+    },
+}
+
+impl StockCredentialPublish {
+    pub fn generation_changed(self) -> bool {
+        matches!(
+            self,
+            Self::Accepted {
+                generation_changed: true,
+                ..
+            }
+        )
+    }
+
+    pub fn accepted(self) -> bool {
+        matches!(self, Self::Accepted { .. })
+    }
 }
 
 /// Shared change-detection channel for the configured credential source.
 ///
-/// Both the watcher task and the connect path publish into it, so the published
-/// state always reflects the most recent *completed* read from either. That
-/// closes the window where the connect path materializes a newer token than the
-/// watcher last saw and the watcher's next (identical) publication would
-/// otherwise look like a rotation.
+/// Both the watcher task and the connect path publish into it. Publication is
+/// last-completed-read, not last-started: each serialized read carries a
+/// monotonic epoch stamped under the one-reader permit, and an observation
+/// whose epoch is older than the last completed read is dropped rather than
+/// resurrecting stale material. Unchanged content still does not consume a
+/// generation, so an unchanged token never churns the ADS stream.
 #[derive(Clone)]
 pub struct StockCredentialWatch {
     tx: Arc<watch::Sender<StockCredentialObservation>>,
@@ -266,6 +361,7 @@ impl StockCredentialWatch {
         let (tx, rx) = watch::channel(StockCredentialObservation {
             generation: 0,
             state: initial,
+            read_epoch: 0,
         });
         Self {
             tx: Arc::new(tx),
@@ -281,17 +377,93 @@ impl StockCredentialWatch {
         *self.rx.borrow()
     }
 
-    /// Publish an observation. Returns `true` when the state changed and a
-    /// generation was consumed.
+    /// Publish a synthetic observation that is newer than every completed
+    /// read so far. Returns `true` when the state changed and a generation
+    /// was consumed.
+    ///
+    /// Production watcher and connect paths must use
+    /// [`Self::publish_observed`] with the epoch from the serialized read.
+    /// This helper exists for tests that inject a state without going through
+    /// the reader.
     pub fn publish(&self, state: StockCredentialState) -> bool {
+        self.publish_observed(Some(alloc_read_epoch()), state)
+            .generation_changed()
+    }
+
+    /// Publish an observation derived from a serialized read.
+    ///
+    /// Runs under the watch send lock with no `.await`. An epoch that is not
+    /// strictly newer than the last completed read cannot change `state`; if
+    /// the losing material still matches the current observation the publish
+    /// is treated as accepted (unchanged-token no-churn), otherwise it is
+    /// superseded. A missing epoch is a non-authoritative attempt (timed out
+    /// before acquiring the reader permit) and never overwrites.
+    pub fn publish_observed(
+        &self,
+        epoch: Option<StockCredentialReadEpoch>,
+        state: StockCredentialState,
+    ) -> StockCredentialPublish {
+        let Some(epoch) = epoch else {
+            let current = self.latest();
+            return StockCredentialPublish::Superseded {
+                state: current.state,
+                generation: current.generation,
+            };
+        };
+        let mut result = StockCredentialPublish::Superseded {
+            state,
+            generation: 0,
+        };
         self.tx.send_if_modified(|current| {
+            if epoch.as_u64() <= current.read_epoch {
+                result = if current.state == state {
+                    StockCredentialPublish::Accepted {
+                        generation: current.generation,
+                        generation_changed: false,
+                    }
+                } else {
+                    StockCredentialPublish::Superseded {
+                        state: current.state,
+                        generation: current.generation,
+                    }
+                };
+                return false;
+            }
+            current.read_epoch = epoch.as_u64();
             if current.state == state {
+                result = StockCredentialPublish::Accepted {
+                    generation: current.generation,
+                    generation_changed: false,
+                };
                 return false;
             }
             current.generation = current.generation.saturating_add(1);
             current.state = state;
+            result = StockCredentialPublish::Accepted {
+                generation: current.generation,
+                generation_changed: true,
+            };
             true
-        })
+        });
+        result
+    }
+
+    /// Admit a serialized read as the current observation, or report the
+    /// newer observation that already won.
+    ///
+    /// On `Ok(generation)` the caller may bind a connection fence to that
+    /// generation — captured under the send lock, so it cannot be a later
+    /// observation's generation while this material is older. On `Err` the
+    /// caller must refuse to dial or open with the losing material.
+    pub fn admit_observation(
+        &self,
+        epoch: Option<StockCredentialReadEpoch>,
+        state: StockCredentialState,
+    ) -> Result<u64, StockCredentialState> {
+        match self.publish_observed(epoch, state) {
+            StockCredentialPublish::Accepted { generation, .. } => Ok(generation),
+            StockCredentialPublish::Superseded { state, .. } => Err(state),
+        }
     }
 }
 
@@ -410,11 +582,63 @@ impl StockXdsCredentialSource {
     pub async fn materialize(
         &self,
     ) -> Result<Option<StockBearerCredential>, StockCredentialInvalidReason> {
+        self.observe().await.into_outcome()
+    }
+
+    /// Read and admit the configured credential, retaining the serialized-read
+    /// epoch so publication can preserve last-completed-read order.
+    pub async fn observe(&self) -> StockCredentialRead {
         let Some(path) = self.path.as_deref() else {
-            return Ok(None);
+            return StockCredentialRead {
+                epoch: Some(alloc_read_epoch()),
+                outcome: Ok(None),
+            };
         };
-        let raw = read_stock_bearer_token_raw(path).await?;
-        StockBearerCredential::admit(&raw, self.policy).map(Some)
+        let (epoch, raw) = read_stock_bearer_token_raw(path).await;
+        let outcome = match raw {
+            Ok(token) => StockBearerCredential::admit(&token, self.policy).map(Some),
+            Err(reason) => Err(reason),
+        };
+        StockCredentialRead { epoch, outcome }
+    }
+}
+
+/// One serialized credential-source read, with the epoch stamped when this
+/// caller became the single reader (or `None` if it never acquired the permit).
+///
+/// The epoch is omitted from [`Debug`]. Token bytes live only inside
+/// [`StockBearerCredential`], whose own `Debug` is redacted.
+pub struct StockCredentialRead {
+    epoch: Option<StockCredentialReadEpoch>,
+    outcome: Result<Option<StockBearerCredential>, StockCredentialInvalidReason>,
+}
+
+impl StockCredentialRead {
+    pub fn epoch(&self) -> Option<StockCredentialReadEpoch> {
+        self.epoch
+    }
+
+    pub fn into_outcome(
+        self,
+    ) -> Result<Option<StockBearerCredential>, StockCredentialInvalidReason> {
+        self.outcome
+    }
+
+    pub fn observed_state(&self) -> StockCredentialState {
+        match &self.outcome {
+            Ok(Some(credential)) => credential.observed_state(),
+            Ok(None) => StockCredentialState::NotConfigured,
+            Err(reason) => StockCredentialState::Invalid { reason: *reason },
+        }
+    }
+}
+
+impl std::fmt::Debug for StockCredentialRead {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("StockCredentialRead")
+            .field("authoritative", &self.epoch.is_some())
+            .field("state", &self.observed_state())
+            .finish()
     }
 }
 
@@ -942,14 +1166,30 @@ fn signed_floor(negative: bool, magnitude: u64, has_remainder: bool) -> Option<i
 /// runs on a detached OS thread that owns the permit, so a stalled mount can
 /// never pin a Tokio worker and repeated attempts cannot accumulate blocked
 /// readers.
-async fn read_stock_bearer_token_raw(path: &str) -> Result<String, StockCredentialInvalidReason> {
-    let read = async {
+///
+/// The epoch is stamped immediately after the permit is acquired, before the
+/// detached read is spawned, so it follows the same total order as the
+/// serialized reads even if this future later times out. A timeout that fires
+/// *before* the permit is acquired returns `None` for the epoch: that attempt
+/// never became the authoritative reader and must not publish.
+async fn read_stock_bearer_token_raw(
+    path: &str,
+) -> (
+    Option<StockCredentialReadEpoch>,
+    Result<String, StockCredentialInvalidReason>,
+) {
+    let stamped = Arc::new(AtomicU64::new(0));
+    let stamp_slot = Arc::clone(&stamped);
+    let path = path.to_string();
+    let read = async move {
         let permit = stock_xds_token_file_read_limit()
             .acquire_owned()
             .await
             .map_err(|_| StockCredentialInvalidReason::ReaderUnavailable)?;
+        let epoch = alloc_read_epoch();
+        stamp_slot.store(epoch.as_u64(), Ordering::Release);
         read_credential_file_detached_guarded(
-            path,
+            &path,
             DEFAULT_CREDENTIAL_FILE_MAX_BYTES,
             CredentialTrim::Ends,
             "ferrum-stock-xds-token-file",
@@ -958,20 +1198,32 @@ async fn read_stock_bearer_token_raw(path: &str) -> Result<String, StockCredenti
         .await
         .map_err(|error| StockCredentialInvalidReason::from_credential_file_error(&error))
     };
-    match tokio::time::timeout(STOCK_XDS_TOKEN_FILE_READ_TIMEOUT, read).await {
+    let outcome = match tokio::time::timeout(STOCK_XDS_TOKEN_FILE_READ_TIMEOUT, read).await {
         Ok(result) => result,
         Err(_) => Err(StockCredentialInvalidReason::ReadTimeout),
-    }
+    };
+    let epoch = match stamped.load(Ordering::Acquire) {
+        0 => None,
+        n => Some(StockCredentialReadEpoch(n)),
+    };
+    (epoch, outcome)
 }
 
 /// Watch the configured credential source and publish content/validity changes.
 ///
-/// Runs until shutdown and is joined with the other mesh background tasks, so
-/// no detached reader survives retirement. It never publishes the credential
-/// itself — only the closed-set state and a private content fingerprint — and
-/// it never widens the client's authorization: a `Valid` observation is only
-/// permission to *attempt* a connection, which then performs its own
-/// authoritative read.
+/// Runs until shutdown and is joined with the other mesh background tasks.
+/// Joining that async task does **not** join a timed-out detached OS reader: a
+/// stalled mount can keep its OS thread blocked after the async timeout, and
+/// that is intentional. The bounded invariant is the single global reader
+/// permit, which moves into that thread so reconnects and later watcher polls
+/// cannot accumulate more blocked readers.
+///
+/// It never publishes the credential itself — only the closed-set state and a
+/// private content fingerprint — and it never widens the client's
+/// authorization: a `Valid` observation is only permission to *attempt* a
+/// connection, which then performs its own authoritative read. Publications
+/// carry the serialized-read epoch so an older completed read cannot overwrite
+/// a newer one.
 pub async fn start_stock_credential_watcher_with_shutdown(
     source: StockXdsCredentialSource,
     watch_handle: StockCredentialWatch,
@@ -994,16 +1246,17 @@ pub async fn start_stock_credential_watcher_with_shutdown(
 
     let mut observed_valid_before = false;
     loop {
-        let next_state = match source.materialize().await {
-            Ok(Some(credential)) => credential.observed_state(),
-            // `is_configured()` was checked above, so `Ok(None)` is
+        let read = source.observe().await;
+        let next_state = match read.observed_state() {
+            // `is_configured()` was checked above, so `NotConfigured` is
             // unreachable; treat it as unusable rather than silently valid.
-            Ok(None) => StockCredentialState::Invalid {
+            StockCredentialState::NotConfigured => StockCredentialState::Invalid {
                 reason: StockCredentialInvalidReason::Missing,
             },
-            Err(reason) => StockCredentialState::Invalid { reason },
+            state => state,
         };
-        if watch_handle.publish(next_state) {
+        let published = watch_handle.publish_observed(read.epoch(), next_state);
+        if published.generation_changed() {
             match next_state {
                 StockCredentialState::Invalid { reason } => warn!(
                     reason = reason.as_metric_label(),
@@ -1020,7 +1273,9 @@ pub async fn start_stock_credential_watcher_with_shutdown(
                 StockCredentialState::NotConfigured | StockCredentialState::Unknown => {}
             }
         }
-        observed_valid_before |= matches!(next_state, StockCredentialState::Valid { .. });
+        if published.accepted() {
+            observed_valid_before |= matches!(next_state, StockCredentialState::Valid { .. });
+        }
 
         tokio::select! {
             biased;

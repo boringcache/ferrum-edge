@@ -671,7 +671,19 @@ bearer-authenticated stream a finite **local** authorization lifetime:
   **opened** descriptor, metadata fast-reject plus `take(limit + 1)` ceiling,
   UTF-8 and empty-after-trim rejection) on a detached OS thread. Comparison is
   over content, so both projected-secret symlink swaps and in-place rewrites are
-  detected; an unchanged token never churns the stream.
+  detected; an unchanged token never churns the stream. Joining the async
+  watcher task does not join a timed-out detached OS reader: a stalled mount
+  can keep that thread blocked after the async timeout, and that is
+  intentional. The bounded invariant is the single global reader permit, which
+  moves into the detached thread so reconnects and later polls cannot
+  accumulate more blocked readers.
+- File reads are serialized by that permit, but publication is not done while
+  it is held (the watch send lock must not nest with the reader slot or the
+  commit-admission read guard). Each completed read therefore carries a
+  monotonic epoch stamped when it became the serialized reader. An observation
+  derived from an older read cannot overwrite a newer valid, invalid, or
+  not-configured observation, and the reconnect path will not bind a
+  connection fence or open an ADS RPC with material that already lost.
 - A rotated, removed, empty, non-regular, unreadable, oversized, or non-ASCII
   source retires the old stream **before** any later discovery update is
   accepted. An invalid source then *prevents* reconnection — there is no
@@ -713,10 +725,13 @@ bearer-authenticated stream a finite **local** authorization lifetime:
   accumulated discovery and per-type subscription state it produced; only the
   slice already installed in the runtime survives.
 - Failover and failback always materialize the newest token rather than reusing
-  the previous endpoint's interceptor value, and the materialized credential is
-  re-proven to be the current observation after the dial and before the
-  streaming RPC opens. A simultaneous TLS and token rotation produces one
-  bounded retirement and one reconnect using the newest of both.
+  the previous endpoint's interceptor value. The reconnect path re-proves that
+  its materialized credential is still the newest authoritative observation
+  before dialing and again after the dial before the streaming RPC opens: if a
+  newer valid replacement or invalidation won, the attempt retires locally and
+  retries from the current source rather than opening with the stale material.
+  A simultaneous TLS and token rotation produces one bounded retirement and
+  one reconnect using the newest of both.
 - Outcomes are fixed-cardinality (`token_source_missing`,
   `token_source_oversized`, `token_expired`, `token_expires_within_skew`,
   `credential_rotated`, `credential_source_invalid`, `credential_deadline`, …).
