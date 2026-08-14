@@ -923,7 +923,7 @@ async fn frontend_dtls_candidate_binds_its_crls_to_the_same_identity() {
     );
     assert_eq!(
         revoking.withdrawal_relative_to(&baseline),
-        Some(ferrum_edge::tls::ClientTrustRetirementReason::CrlChanged),
+        Some(ferrum_edge::tls::client_trust::ClientTrustRetirementReason::CrlChanged),
         "the added revocation must read as a CRL withdrawal, not a lateral change"
     );
 

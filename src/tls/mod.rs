@@ -48,8 +48,8 @@ mod store_atomicity_tests;
 pub mod spiffe;
 
 pub use client_trust::{
-    ClientTrustAdmission, ClientTrustMaterial, ClientTrustRetirementReason, ClientTrustScope,
-    ClientTrustSession, ClientTrustSessionGuard, TrustFencedStream,
+    ClientTrustAdmission, ClientTrustMaterial, ClientTrustScope, ClientTrustSession,
+    ClientTrustSessionGuard, TrustFencedStream,
 };
 pub use frontend_reload::{
     AcceptedFrontendTls, FrontendTlsRebuildFn, FrontendTlsRebuilt, FrontendTlsReloadConfig,

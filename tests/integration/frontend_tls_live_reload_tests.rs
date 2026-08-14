@@ -874,7 +874,7 @@ async fn admin_https_does_not_register_a_connection_without_a_client_certificate
     ferrum_edge::tls::client_trust::force_withdrawal_fence_for_test(
         ferrum_edge::tls::ClientTrustScope::AdminHttps,
         2,
-        ferrum_edge::tls::ClientTrustRetirementReason::ClientCaWithdrawn,
+        ferrum_edge::tls::client_trust::ClientTrustRetirementReason::ClientCaWithdrawn,
     );
     tokio::time::sleep(Duration::from_millis(200)).await;
     assert_eq!(
@@ -909,7 +909,7 @@ async fn admin_https_captures_the_generation_in_force_before_selecting_its_confi
     ferrum_edge::tls::client_trust::force_withdrawal_fence_for_test(
         ferrum_edge::tls::ClientTrustScope::AdminHttps,
         2,
-        ferrum_edge::tls::ClientTrustRetirementReason::CrlChanged,
+        ferrum_edge::tls::client_trust::ClientTrustRetirementReason::CrlChanged,
     );
 
     let slot: ferrum_edge::tls::SharedFrontendTls =
