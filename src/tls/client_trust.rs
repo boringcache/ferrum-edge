@@ -336,8 +336,8 @@ pub struct ClientTrustMaterial {
     /// SHA-256 over `issuer-key identity || 0x00 || serial DER` for every
     /// revoked entry across every parsed CRL. The issuer-key identity is a
     /// domain-tagged digest of the uniquely verified signer SPKI when that
-    /// key is in the accepted client-CA bundle, or of an unambiguous CRL
-    /// Authority Key Identifier when it is not. Serial numbers are unique
+    /// key is in the accepted client-CA bundle, or of the CRL issuer name plus
+    /// an unambiguous Authority Key Identifier when it is not. Serial numbers are unique
     /// only under one issuing key: two CA keys can share a subject DN and a
     /// leaf serial, so scoping by issuer DN (or a bare serial) would let a
     /// revocation under the second key collide with the first and suppress
@@ -349,9 +349,9 @@ pub struct ClientTrustMaterial {
 /// SubjectPublicKeyInfo. Distinct from [`ISSUER_DOMAIN_AKI`] so an AKI octet
 /// string cannot collide with a raw SPKI.
 const ISSUER_DOMAIN_SPKI: &[u8] = b"spki";
-/// Domain tag mixed into a revocation identity derived from a CRL Authority
-/// Key Identifier, used only when the signer is not in the accepted anchor
-/// bundle.
+/// Domain tag mixed into a revocation identity derived from a CRL issuer name
+/// plus Authority Key Identifier, used only when the signer is not in the
+/// accepted anchor bundle.
 const ISSUER_DOMAIN_AKI: &[u8] = b"aki";
 
 /// A CRL that this module could not parse.
@@ -521,9 +521,11 @@ fn unique_signer_spkis<'a>(certs: &'a [X509Certificate<'a>]) -> Vec<SubjectPubli
 ///
 /// Prefers the digest of a uniquely verified signer SPKI from the accepted
 /// client-CA bundle. Matching the CRL issuer DN is not enough: two CA keys
-/// can share a subject. When no bundle key verifies, an unambiguous Authority
-/// Key Identifier is used under a distinct identity domain. Anything else
-/// fails closed — never fall back to issuer DN.
+/// can share a subject. When no bundle key verifies, the issuer's DER name and
+/// an unambiguous Authority Key Identifier are combined under a distinct
+/// identity domain. AKI alone is not globally unique: two outside-bundle
+/// issuers may deliberately or accidentally carry the same identifier. Anything
+/// else fails closed — never fall back to issuer DN alone.
 fn crl_signer_key_identity(
     crl: &CertificateRevocationList<'_>,
     unique_signers: &[SubjectPublicKeyInfo<'_>],
@@ -574,7 +576,11 @@ fn crl_aki_key_identity(
     let Some(key_id) = key_id else {
         return Err(ClientTrustMaterialError);
     };
-    Ok(digest_of(&[ISSUER_DOMAIN_AKI, key_id]))
+    Ok(digest_of(&[
+        ISSUER_DOMAIN_AKI,
+        crl.issuer().as_raw(),
+        key_id,
+    ]))
 }
 
 /// Per-scope state. One instance per [`ClientTrustScope`], created once.

@@ -327,6 +327,43 @@ fn a_crl_whose_signer_is_not_in_the_bundle_uses_aki_when_unambiguous() {
 }
 
 #[test]
+fn outside_bundle_crl_signers_with_the_same_aki_remain_distinct() {
+    let trusted = generate_ca("trusted-ca");
+    let unknown_a = generate_ca("unknown-a");
+    let unknown_b = generate_ca("unknown-b");
+    let shared_aki = vec![0x42; 20];
+    let first_crl = crl_pem_with_key_id(
+        &unknown_a,
+        &[7],
+        1,
+        rcgen::KeyIdMethod::PreSpecified(shared_aki.clone()),
+    );
+    let reissued_first = crl_pem_with_key_id(
+        &unknown_a,
+        &[7],
+        2,
+        rcgen::KeyIdMethod::PreSpecified(shared_aki.clone()),
+    );
+    let second_crl = crl_pem_with_key_id(
+        &unknown_b,
+        &[7],
+        1,
+        rcgen::KeyIdMethod::PreSpecified(shared_aki),
+    );
+
+    let before = material(&[&trusted.cert_pem], &[&first_crl]);
+    let after = material(
+        &[&trusted.cert_pem],
+        &[&reissued_first, &second_crl],
+    );
+    assert_eq!(
+        after.withdrawal_relative_to(&before),
+        Some(ClientTrustRetirementReason::CrlChanged),
+        "AKI reuse by a distinct outside-bundle issuer must not suppress a new revocation"
+    );
+}
+
+#[test]
 fn a_crl_with_no_identifiable_issuer_key_is_refused() {
     let trusted = generate_ca("trusted-ca");
     let unknown = generate_ca("unknown-ca");
