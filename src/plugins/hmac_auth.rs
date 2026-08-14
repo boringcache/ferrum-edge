@@ -163,7 +163,11 @@ const HMAC_NONCE_MIN_BASE64URL_CHARS: usize = 22;
 const HMAC_NONCE_MIN_HEX_CHARS: usize = 32;
 const HMAC_NONCE_MAX_CHARS: usize = 86;
 
-const HMAC_AUTH_CONFIG_KEYS: &[&str] = &[
+/// Closed root key set owned by this plugin. The complete admissible root is
+/// this unioned with [`REDIS_PLUGIN_CONFIG_KEYS`]; both halves must stay in
+/// exact parity with the `additionalProperties: false` `HmacAuthConfig` schema
+/// in `openapi.yaml`.
+pub const HMAC_AUTH_CONFIG_KEYS: &[&str] = &[
     "clock_skew_seconds",
     "signing_profile",
     "allow_unsafe_replayable_v1",
@@ -697,7 +701,9 @@ impl HmacAuth {
         // Closed root key set: a misspelled `replay_scope` or `signing_profile`
         // must fail admission rather than silently leave a policy on a weaker
         // posture than the operator wrote.
-        reject_unknown_keys(config_obj, "config", &root_config_keys(), "hmac_auth")?;
+        // The prefix carries its own separator: `reject_unknown_keys` renders
+        // `{error_prefix}unknown configuration key(s): …` verbatim.
+        reject_unknown_keys(config_obj, "config", &root_config_keys(), "hmac_auth: ")?;
 
         let clock_skew_seconds = parse_u64_field(
             config_obj.get("clock_skew_seconds"),

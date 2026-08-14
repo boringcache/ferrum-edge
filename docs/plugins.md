@@ -2229,7 +2229,7 @@ Authenticated `/metrics` exposes only fixed-cardinality aggregate JWKS state for
 
 #### Single-use replay protection
 
-`require_dpop` accepts a proof only once. That guarantee is enforced by the shared replay authority described in [Single-use replay protection (shared)](#single-use-replay-protection-shared) below, which `hmac_auth`'s `ferrum-hmac-v2` profile also uses.
+`require_dpop` accepts a proof only once. That guarantee is enforced by the shared replay authority described in [Single-use replay protection (shared)](#single-use-replay-protection-shared), which `hmac_auth`'s `ferrum-hmac-v2` profile also uses.
 
 Ordering is load-bearing: signature, `typ`/`alg`, JWK thumbprint / `cnf.jkt` binding, `htm`, `htu`, `iat`, `exp`, and `ath` are all validated first, then scope/role authorization runs, and only then is the proof claimed. Unauthenticated garbage therefore never consumes replay capacity or a shared-backend round trip, and a request rejected for insufficient scopes never burns the client's proof.
 
@@ -2245,7 +2245,6 @@ The **provider identity** is semantic, not positional. It is a digest of the pro
 Security-irrelevant configuration — JWKS contents and source URL, `audiences`, `required_scopes`, `required_roles`, claim/header mappings, token locations, `forward_original_token`, `jwks_max_stale_seconds`, `dpop_replay_max_entries`, `dpop_replay_scope`, and `dpop_clock_skew_secs` — is deliberately **not** part of the identity. Binding it would make an ordinary authorization, key, or endpoint edit reopen every live proof, which is strictly worse than the isolation it would buy. The fixed retention horizon below already dominates the widest admissible clock skew, so a widened skew can never outrun a marker.
 
 Retention is **not** configurable. Every marker is retained for a fixed 601-second horizon — `2 × 300` (the `dpop_clock_skew_secs` ceiling) plus one second — which dominates the widest span any admissible configuration can accept one unchanged proof over. A reload that widens `dpop_clock_skew_secs` therefore cannot make an already-admitted proof acceptable again, and a `SET … NX EX` that declines to touch an existing shared key is exactly correct because that key already carries the full horizon. `dpop_jti_ttl_secs` and `dpop_jti_cache_max_entries` were removed rather than redefined; configs carrying them are rejected with the replacement named.
-
 
 ### `oauth2_introspection`
 

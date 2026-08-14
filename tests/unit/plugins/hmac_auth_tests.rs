@@ -350,6 +350,34 @@ fn test_hmac_auth_rejects_invalid_config() {
     }
 }
 
+/// The closed-root-key diagnostic must name the plugin and the offending key.
+///
+/// A misspelled security field is exactly the case this refusal exists for, so
+/// the operator has to be able to read which plugin refused and which key it
+/// refused — an unseparated prefix (`hmac_authunknown configuration key(s)`)
+/// buries the plugin name inside the sentence.
+#[test]
+fn test_hmac_auth_unknown_key_diagnostic_names_the_plugin_and_the_key() {
+    let config = json!({"replay_scope": "process", "replay_scop": "shared"});
+    // `HmacAuth` is deliberately not `Debug`, so unwrap the error by pattern
+    // rather than through `expect_err`.
+    let Err(error) = HmacAuth::new(&config) else {
+        panic!("a misspelled root key must be refused");
+    };
+    assert!(
+        error.starts_with("hmac_auth: unknown configuration key(s):"),
+        "diagnostic must be plugin-qualified: {error}"
+    );
+    assert!(
+        error.contains("'config.replay_scop'"),
+        "diagnostic must name the offending key: {error}"
+    );
+    assert!(
+        error.contains("replay_scope"),
+        "diagnostic must suggest the intended key: {error}"
+    );
+}
+
 #[tokio::test]
 async fn test_hmac_auth_default_requires_digest() {
     let plugin = HmacAuth::new(&default_config()).unwrap();

@@ -3090,6 +3090,57 @@ fn health_shared_replay_authority_aggregate_matches_the_runtime_snapshot() {
     );
 }
 
+/// `hmac_auth`'s configuration root became a closed key set with the
+/// single-use replay work (issues #3834 / #3837), so it now carries the same
+/// obligation every other closed plugin root does: exact parity with an
+/// `additionalProperties: false` OpenAPI schema. Without this guard a new
+/// runtime key silently becomes an undocumented field the Admin API rejects,
+/// or a documented field the runtime refuses.
+#[test]
+fn hmac_auth_config_root_is_closed_and_matches_openapi() {
+    use ferrum_edge::plugins::hmac_auth::HMAC_AUTH_CONFIG_KEYS;
+    use ferrum_edge::plugins::utils::redis_rate_limiter::REDIS_PLUGIN_CONFIG_KEYS;
+
+    let spec: serde_json::Value =
+        serde_yaml::from_str(include_str!("../../openapi.yaml")).expect("openapi.yaml parses");
+    let schema = spec
+        .pointer("/components/schemas/HmacAuthConfig")
+        .expect("HmacAuthConfig component exists");
+    assert_eq!(schema["additionalProperties"], json!(false));
+
+    let schema_fields: BTreeSet<&str> = schema["properties"]
+        .as_object()
+        .expect("HmacAuthConfig properties")
+        .keys()
+        .map(String::as_str)
+        .collect();
+    // The runtime allowlist is the plugin's own keys unioned with the shared
+    // Redis connectivity keys that back `replay_scope: shared`.
+    let runtime_fields: BTreeSet<&str> = HMAC_AUTH_CONFIG_KEYS
+        .iter()
+        .chain(REDIS_PLUGIN_CONFIG_KEYS.iter())
+        .copied()
+        .collect();
+    assert_eq!(schema_fields, runtime_fields, "HmacAuthConfig key drift");
+
+    // The replay scope has no default in either surface: an operator must
+    // declare whether process-local replay state is sufficient, and a schema
+    // default would reinstate silent per-replica replay.
+    assert_eq!(
+        schema["properties"]["replay_scope"]["enum"],
+        json!(["process", "shared"])
+    );
+    assert!(schema["properties"]["replay_scope"]["default"].is_null());
+    assert_eq!(
+        schema["properties"]["clock_skew_seconds"]["maximum"],
+        json!(ferrum_edge::plugins::hmac_auth::MAX_HMAC_CLOCK_SKEW_SECONDS)
+    );
+    assert_eq!(
+        schema["properties"]["replay_max_entries"]["default"],
+        json!(ferrum_edge::plugins::hmac_auth::DEFAULT_HMAC_REPLAY_MAX_ENTRIES)
+    );
+}
+
 #[test]
 fn jwks_auth_schema_and_cache_guide_match_runtime_contract() {
     let spec: serde_json::Value =
