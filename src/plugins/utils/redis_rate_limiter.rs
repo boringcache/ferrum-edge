@@ -1699,6 +1699,22 @@ impl SharedReplayRegistrationSample {
     }
 }
 
+/// Interpret the semantic reply to the replay authority's `SET ... NX EX`.
+///
+/// Redis returns exactly `OK` when it stored the marker and a nil reply when
+/// `NX` found an existing marker. Any other string is an invalid claim reply:
+/// treating mere string presence as success would let a malformed or
+/// non-conforming backend admit a request without proving that the marker was
+/// persisted.
+#[doc(hidden)]
+pub fn classify_replay_set_nx_reply(reply: Option<&str>) -> Result<bool, ()> {
+    match reply {
+        Some("OK") => Ok(true),
+        None => Ok(false),
+        Some(_) => Err(()),
+    }
+}
+
 impl RedisRateLimitClient {
     /// Create a new Redis rate limit client.
     ///
@@ -3517,10 +3533,25 @@ impl RedisRateLimitClient {
         };
 
         match response {
-            Ok(value) => {
-                self.note_command_success()?;
-                Ok(value.is_some())
-            }
+            Ok(value) => match classify_replay_set_nx_reply(value.as_deref()) {
+                Ok(admitted) => {
+                    self.note_command_success()?;
+                    Ok(admitted)
+                }
+                Err(()) => {
+                    // Do not render the server-controlled reply. Only exact
+                    // `OK` proves that Redis stored the marker; every other
+                    // string is protocol uncertainty and must fail closed.
+                    warn!(
+                        redis_url = %self.config.redacted_url(),
+                        operation = "SET NX EX",
+                        classification = "malformed_response",
+                        "Redis single-use claim returned an invalid response"
+                    );
+                    self.mark_unavailable();
+                    Err(())
+                }
+            },
             Err(e) => {
                 // `is_cluster_topology_error` inspects the error; nothing it
                 // reads is rendered. The published field is the fixed class.

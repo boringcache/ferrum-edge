@@ -20,6 +20,7 @@
 use std::sync::{Arc, Barrier};
 use std::time::Duration;
 
+use ferrum_edge::_test_support::classify_replay_set_nx_reply;
 use ferrum_edge::plugins::utils::redis_rate_limiter::{RedisConfig, RedisRateLimitClient};
 use ferrum_edge::plugins::utils::replay_authority::{
     MAX_PROCESS_REPLAY_LANES, ReplayAdmission, ReplayAuthority, ReplayDomain, ReplayScope,
@@ -40,6 +41,22 @@ fn domain(sub: &str) -> ReplayDomain {
 fn process_authority(sub: &str, max_entries: usize) -> ReplayAuthority {
     ReplayAuthority::process("test", &domain(sub), max_entries, RETENTION, 8)
         .expect("process lane should be created")
+}
+
+/// The shared authority may admit only on Redis's exact successful `SET NX`
+/// reply. A RESP string with any other contents is semantically malformed and
+/// cannot prove that the marker was persisted.
+#[test]
+fn shared_claim_accepts_only_the_exact_redis_set_success_reply() {
+    assert_eq!(classify_replay_set_nx_reply(Some("OK")), Ok(true));
+    assert_eq!(classify_replay_set_nx_reply(None), Ok(false));
+    for malformed in ["", "ok", "QUEUED", "PONG", "1"] {
+        assert_eq!(
+            classify_replay_set_nx_reply(Some(malformed)),
+            Err(()),
+            "unexpected reply {malformed:?} must fail closed"
+        );
+    }
 }
 
 // ── atomic check-and-insert ─────────────────────────────────────────
