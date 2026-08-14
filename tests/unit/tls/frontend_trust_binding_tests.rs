@@ -1436,17 +1436,15 @@ fn dp_mode_pairs_cp_server_config_with_operator_trust_for_h3() {
     let adoption_end = h3[reload_arm + adoption_start..]
         .find("let Some((new_tls, client_trust)) = adopted")
         .expect("accepted-candidate adoption completes before H3 rebuild");
-    let adoption =
-        &h3[reload_arm + adoption_start..reload_arm + adoption_start + adoption_end];
+    let adoption = &h3[reload_arm + adoption_start..reload_arm + adoption_start + adoption_end];
     let compact_adoption: String = adoption
         .chars()
         .filter(|character| !character.is_whitespace())
         .collect();
     assert!(
         compact_adoption.contains("Some(accepted_slot)=>accepted_slot.load_full()")
-            && compact_adoption.contains(
-                "map(|accepted|(accepted.config.clone(),accepted.client_trust.clone()))"
-            )
+            && compact_adoption
+                .contains("map(|accepted|(accepted.config.clone(),accepted.client_trust.clone()))")
             && compact_adoption.contains("None=>matchconfigured_h3_reload_candidate("),
         "H3 must adopt one accepted candidate rather than independently reading config and startup CRLs"
     );
