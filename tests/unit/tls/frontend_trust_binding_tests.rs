@@ -317,6 +317,68 @@ fn publishing_the_adopted_candidates_identity_reports_the_withdrawal_it_enforces
     );
 }
 
+/// The live handshake verifier is stored before the generation advances, so a
+/// reconnect that still holds a stale `ServerConfig` snapshot is refused by
+/// the published verifier rather than served (issue #3857).
+#[test]
+fn live_verifier_refuses_a_withdrawn_cert_even_if_the_handshake_used_a_stale_snapshot() {
+    let _guard = isolated_registry();
+    let dir = tempfile::tempdir().expect("tempdir");
+    let pki = build_pki();
+
+    let startup_crls = parse_crls(&pki.crl_pem(&[UNRELATED_SERIAL], 1));
+    let before = load_candidate(dir.path(), &pki, &startup_crls).expect("startup candidate");
+    client_trust::publish_accepted_candidate(
+        ClientTrustScope::ProxyH3,
+        before.material.clone(),
+        before.verifier.clone(),
+    );
+    assert!(
+        client_trust::live_peer_still_trusted(ClientTrustScope::ProxyH3, &[pki.client_cert()]),
+        "the live verifier must admit a client no CRL revokes"
+    );
+    client_trust::publish_accepted_candidate(
+        ClientTrustScope::ProxyFrontend,
+        before.material.clone(),
+        before.verifier.clone(),
+    );
+    assert!(
+        client_trust::live_peer_still_trusted(
+            ClientTrustScope::ProxyFrontend,
+            &[pki.client_cert()]
+        ),
+        "the same candidate must arm every rustls scope that publishes it"
+    );
+
+    let rotated_crls = parse_crls(&pki.crl_pem(&[UNRELATED_SERIAL, pki.client_serial], 2));
+    let after = load_candidate(dir.path(), &pki, &rotated_crls).expect("rotated candidate");
+    assert!(!admits_client(&after, &pki));
+    let withdrawn = client_trust::publish_accepted_candidate(
+        ClientTrustScope::ProxyH3,
+        after.material.clone(),
+        after.verifier.clone(),
+    );
+    assert!(withdrawn.withdrew());
+    assert!(
+        !client_trust::live_peer_still_trusted(ClientTrustScope::ProxyH3, &[pki.client_cert()]),
+        "after the accepted withdrawal the live H3 verifier must refuse the revoked cert, \
+         even if a stale QUIC Incoming still completed TLS against the previous snapshot"
+    );
+    client_trust::publish_accepted_candidate(
+        ClientTrustScope::ProxyFrontend,
+        after.material,
+        after.verifier,
+    );
+    assert!(
+        !client_trust::live_peer_still_trusted(
+            ClientTrustScope::ProxyFrontend,
+            &[pki.client_cert()]
+        ),
+        "after the accepted withdrawal the live H1/H2 verifier must refuse the revoked cert, \
+         even if a stale TlsAcceptor snapshot still completed the handshake"
+    );
+}
+
 /// A malformed later candidate never produces an `AcceptedClientTrust`, so the
 /// H3 reload arm has nothing to install or publish and keeps the last-good
 /// verifier, identity, generation and sessions. mTLS is never downgraded.

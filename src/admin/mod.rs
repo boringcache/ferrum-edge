@@ -896,6 +896,7 @@ pub async fn serve_admin_on_listener(
                                     state,
                                     tls_config,
                                     client_trust_admission,
+                                    None,
                                 )
                                 .await
                             } else {
@@ -1018,6 +1019,7 @@ pub async fn serve_admin_on_listener_with_dynamic_tls(
                         // post-withdrawal generation and escape the fence.
                         let client_trust_admission = capture_admin_client_trust();
                         let tls_config = tls_slot.load().as_ref().clone();
+                        let tls_reload_slot = tls_slot.clone();
                         let state = state.clone();
 
                         tokio::spawn(async move {
@@ -1037,6 +1039,7 @@ pub async fn serve_admin_on_listener_with_dynamic_tls(
                                 state,
                                 tls_config,
                                 client_trust_admission,
+                                Some(tls_reload_slot),
                             )
                             .await
                             {
@@ -1394,8 +1397,21 @@ async fn handle_admin_tls_connection(
     state: AdminState,
     tls_config: Arc<rustls::ServerConfig>,
     client_trust_admission: Option<crate::tls::ClientTrustAdmission>,
+    tls_reload_slot: Option<crate::tls::SharedFrontendTls>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     use tokio_rustls::TlsAcceptor;
+
+    let mut tls_config = tls_config;
+    let mut client_trust_admission = client_trust_admission;
+    if let Some(slot) = tls_reload_slot.as_ref() {
+        client_trust_admission = capture_admin_client_trust();
+        match slot.load().as_ref().clone() {
+            Some(current) => tls_config = current,
+            None => {
+                return Err("Admin HTTPS TLS slot is empty".into());
+            }
+        }
+    }
 
     let acceptor = TlsAcceptor::from(tls_config);
     let tls_handshake_timeout = state.admin_tls_handshake_timeout_seconds;
@@ -1415,11 +1431,14 @@ async fn handle_admin_tls_connection(
     // can revoke; an anonymous admin TLS connection registers nothing, is never
     // retired, and pays a single `Option` branch. The guard is held for the
     // whole admin connection lifetime below and deregisters on every exit path.
-    let client_cert_authenticated = tls_stream
-        .get_ref()
-        .1
-        .peer_certificates()
-        .is_some_and(|certs| !certs.is_empty());
+    let peer_certs = tls_stream.get_ref().1.peer_certificates();
+    if let Some(admission) = client_trust_admission
+        && let Some(certs) = peer_certs
+        && !crate::tls::client_trust::live_peer_still_trusted(admission.scope(), certs)
+    {
+        return Err(crate::tls::client_trust::TRUST_WITHDRAWN_REASON.into());
+    }
+    let client_cert_authenticated = peer_certs.is_some_and(|certs| !certs.is_empty());
     let client_trust_guard =
         client_trust_admission.and_then(|admission| admission.register(client_cert_authenticated));
     let client_trust_session = client_trust_guard

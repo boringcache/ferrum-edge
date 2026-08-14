@@ -49,8 +49,9 @@
 //!
 //! Publication is: **(1) the caller applies the new material** (swaps the
 //! `ServerConfig` slot / calls `Endpoint::set_server_config` / swaps the DTLS
-//! generation), **(2)** `publish_accepted_material` bumps `generation`, **(3)**
-//! stores `withdrawal_generation`, **(4)** sweeps registered sessions.
+//! generation), **(2)** the live rustls verifier for that candidate is stored,
+//! **(3)** `publish_accepted_material` bumps `generation`, **(4)** stores
+//! `withdrawal_generation`, **(5)** sweeps registered sessions.
 //!
 //! Admission is the mirror image: a listener [`capture`]s the generation
 //! **before** it loads the config it will hand to the handshake. Because the
@@ -61,6 +62,12 @@
 //! direction. The cost is that a connection handshaking exactly across a
 //! withdrawal can be retired despite already using the new material; the benefit
 //! is that one can never escape the fence.
+//!
+//! A second, independent fail-closed check exists because accept loops spawn
+//! before the handshake, and QUIC `Incoming` objects can pin a `ServerConfig`
+//! snapshot: after TLS completes, a rustls listener re-runs the peer chain
+//! against [`live_peer_still_trusted`]. Generation publication therefore cannot
+//! complete while a reconnect is still being admitted by a stale accepter.
 //!
 //! The registration race is closed the same way, without a lock: a session is
 //! inserted into the domain first and then re-checks the fence. A publication
@@ -97,9 +104,15 @@ use std::task::{Context, Poll};
 use crate::fips::approved::Sha256;
 use arc_swap::ArcSwap;
 use dashmap::DashMap;
-use rustls::pki_types::CertificateRevocationListDer;
+use rustls::pki_types::{CertificateDer, CertificateRevocationListDer, UnixTime};
+use rustls::server::danger::ClientCertVerifier;
 use tokio_util::sync::{CancellationToken, WaitForCancellationFutureOwned};
 use x509_parser::prelude::{FromDer, X509Certificate};
+
+/// Compiled-in close / error reason when a handshake's peer no longer satisfies
+/// the live verifier. Never interpolate a serial, subject, issuer, path, or
+/// digest into this string — it is what goes on the wire and into logs.
+pub const TRUST_WITHDRAWN_REASON: &str = "client certificate trust withdrawn";
 
 /// The closed set of frontend listener families that terminate client
 /// certificates and therefore own a client-trust generation.
@@ -414,6 +427,12 @@ struct ClientTrustDomain {
     last_withdrawal_reason: AtomicU8,
     /// Last accepted semantic material.
     material: ArcSwap<Option<ClientTrustMaterial>>,
+    /// Live rustls client-certificate verifier for this scope, installed
+    /// **before** the generation advances. Handshake paths re-check the peer
+    /// against this object after TLS so a stale `ServerConfig` / QUIC accepter
+    /// snapshot cannot admit a credential the published generation withdrew.
+    /// `None` for DTLS and for tests that publish material without a verifier.
+    live_verifier: ArcSwap<Option<Arc<dyn ClientCertVerifier>>>,
     /// Live client-certificate-authenticated transports, keyed by an internal
     /// session id. Stored as `Weak` so a long-lived clone (an upgraded
     /// WebSocket, a per-request fence handle) that outlives the HTTP
@@ -441,6 +460,7 @@ impl ClientTrustDomain {
             withdrawal_generation: AtomicU64::new(0),
             last_withdrawal_reason: AtomicU8::new(NO_REASON),
             material: ArcSwap::from_pointee(None),
+            live_verifier: ArcSwap::from_pointee(None),
             sessions: DashMap::new(),
             next_session_id: AtomicU64::new(1),
             publish_lock: std::sync::Mutex::new(()),
@@ -511,9 +531,26 @@ fn domain(scope: ClientTrustScope) -> &'static ClientTrustDomain {
 /// the `ServerConfig` slot, applied the QUIC server config, swapped the DTLS
 /// generation) before calling this. See the module docs for why that order is
 /// what makes the captured generation conservative rather than optimistic.
+///
+/// Prefer [`publish_accepted_candidate`] on rustls surfaces so the live
+/// handshake verifier is stored before the generation becomes observable.
 pub fn publish_accepted_material(
     scope: ClientTrustScope,
     material: ClientTrustMaterial,
+) -> ClientTrustPublication {
+    publish_accepted_candidate(scope, material, None)
+}
+
+/// Publish an accepted candidate, installing its rustls verifier (when the
+/// surface has one) **before** the generation advances.
+///
+/// DTLS and material-only tests pass `verifier = None` and skip the live
+/// handshake re-check; rustls listeners must pass the verifier they just
+/// installed so a stale accepter cannot outlive the published withdrawal.
+pub fn publish_accepted_candidate(
+    scope: ClientTrustScope,
+    material: ClientTrustMaterial,
+    verifier: Option<Arc<dyn ClientCertVerifier>>,
 ) -> ClientTrustPublication {
     let domain = domain(scope);
     // Poisoning cannot make the state unsafe (every field is an atomic or an
@@ -523,6 +560,14 @@ pub fn publish_accepted_material(
         .publish_lock
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
+
+    // The live verifier must be observable before `generation` advances. A
+    // reconnect that captures the new generation then re-checks this object
+    // cannot be admitted by a withdrawn credential, even if its handshake
+    // still holds a stale `ServerConfig` snapshot.
+    if let Some(verifier) = verifier {
+        domain.live_verifier.store(Arc::new(Some(verifier)));
+    }
 
     let previous = domain.material.load_full();
     let Some(previous_material) = previous.as_ref().as_ref() else {
@@ -608,6 +653,36 @@ pub fn current_material(scope: ClientTrustScope) -> Option<ClientTrustMaterial> 
     domain(scope).material.load_full().as_ref().clone()
 }
 
+/// Re-check a handshake's peer certificate chain against the live verifier
+/// this scope last published.
+///
+/// Returns `true` when the chain is empty (anonymous) or when this scope has
+/// no rustls verifier (DTLS, material-only tests). Returns `false` when the
+/// published verifier refuses the peer — the fail-closed reconnect fence.
+pub fn live_peer_still_trusted(
+    scope: ClientTrustScope,
+    certificates: &[CertificateDer<'_>],
+) -> bool {
+    let Some((end_entity, intermediates)) = certificates.split_first() else {
+        return true;
+    };
+    let Some(verifier) = domain(scope).live_verifier.load_full().as_ref().clone() else {
+        return true;
+    };
+    verifier
+        .verify_client_cert(end_entity, intermediates, UnixTime::now())
+        .is_ok()
+}
+
+/// [`live_peer_still_trusted`] for a chain held as raw DER buffers.
+pub fn live_peer_der_chain_still_trusted(scope: ClientTrustScope, chain: &[Vec<u8>]) -> bool {
+    let certificates: Vec<CertificateDer<'_>> = chain
+        .iter()
+        .map(|der| CertificateDer::from(der.as_slice()))
+        .collect();
+    live_peer_still_trusted(scope, &certificates)
+}
+
 /// Record that a reload candidate for `scope` was refused.
 ///
 /// The last accepted verifier, generation, material and every live session are
@@ -644,9 +719,6 @@ pub struct ClientTrustAdmission {
 
 impl ClientTrustAdmission {
     /// The scope this admission was captured from.
-    // Introspection surface for external tests; the bin target re-declares the
-    // module tree, so an item used only from `tests/` is dead there.
-    #[allow(dead_code)]
     pub fn scope(self) -> ClientTrustScope {
         self.scope
     }
@@ -1104,6 +1176,7 @@ pub fn reset_for_test() {
             .last_withdrawal_reason
             .store(NO_REASON, Ordering::Release);
         domain.material.store(Arc::new(None));
+        domain.live_verifier.store(Arc::new(None));
         domain.next_session_id.store(1, Ordering::Release);
         for counter in domain.publications.iter() {
             counter.store(0, Ordering::Relaxed);

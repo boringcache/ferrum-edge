@@ -885,9 +885,10 @@ pub async fn start_http3_listener_with_signal(
         && let Some(startup_client_trust) = startup_client_trust.as_ref()
         && startup_client_trust.verifier.is_some()
     {
-        crate::tls::client_trust::publish_accepted_material(
+        crate::tls::client_trust::publish_accepted_candidate(
             crate::tls::ClientTrustScope::ProxyH3,
             startup_client_trust.material.clone(),
+            startup_client_trust.verifier.clone(),
         );
     }
 
@@ -904,7 +905,6 @@ pub async fn start_http3_listener_with_signal(
                             continue;
                         }
                         let state = Arc::clone(&state);
-                        let adopted_quic = Arc::clone(&adopted_quic);
                         tokio::spawn(async move {
                             let _conn_guard =
                                 crate::overload::ConnectionGuard::new(&state.overload);
@@ -915,7 +915,6 @@ pub async fn start_http3_listener_with_signal(
                                 frontend_listen_port,
                                 frontend_destination_ip,
                                 client_auth_configured,
-                                adopted_quic,
                             )
                             .await
                             {
@@ -1014,9 +1013,10 @@ pub async fn start_http3_listener_with_signal(
                         // that performs no client-certificate authentication
                         // must never arm this scope.
                         if client_trust.verifier.is_some() {
-                            let publication = crate::tls::client_trust::publish_accepted_material(
+                            let publication = crate::tls::client_trust::publish_accepted_candidate(
                                 crate::tls::ClientTrustScope::ProxyH3,
                                 client_trust.material.clone(),
+                                client_trust.verifier.clone(),
                             );
                             if publication.withdrew() {
                                 warn!(
@@ -1188,18 +1188,17 @@ fn close_h3_connection_for_trust_withdrawal(connection: &quinn::Connection, peer
     );
 }
 
-/// Bind an HTTP/3 Incoming to the exact `ServerConfig` this listener last
-/// adopted (issue #3857). `accept_with` is what keeps a coalesced reload
-/// wakeup from handshaking against a different generation than the one this
-/// listener published.
+/// Bind an HTTP/3 Incoming to the endpoint's current `ServerConfig`.
+///
+/// The H3 reload arm calls `Endpoint::set_server_config` **before** it
+/// publishes this scope's generation. `Incoming::accept()` starts TLS against
+/// that endpoint config. `accept_with` on a separately stored snapshot can pin
+/// a withdrawn verifier after the generation has already advanced — exactly
+/// the fail-open reconnect the functional tests caught (issue #3857).
 fn accept_h3_incoming(
     incoming: quinn::Incoming,
-    adopted: Option<Arc<quinn::ServerConfig>>,
 ) -> Result<quinn::Connecting, quinn::ConnectionError> {
-    match adopted {
-        Some(server_config) => incoming.accept_with(server_config),
-        None => incoming.accept(),
-    }
+    incoming.accept()
 }
 
 /// Handle a single HTTP/3 connection (may carry multiple streams/requests).
@@ -1210,7 +1209,6 @@ async fn handle_h3_connection(
     frontend_listen_port: Option<u16>,
     frontend_destination_ip: Option<std::net::IpAddr>,
     client_auth_configured: bool,
-    adopted_quic: Arc<arc_swap::ArcSwap<Option<Arc<quinn::ServerConfig>>>>,
 ) -> Result<(), anyhow::Error> {
     // 0-RTT is opt-in via `FERRUM_TLS_EARLY_DATA_METHODS` *and* is refused
     // outright when this listener does frontend client-certificate
@@ -1221,20 +1219,15 @@ async fn handle_h3_connection(
         zero_rtt_admitted(!state.early_data_methods.is_empty(), client_auth_configured);
 
     // Issue #3857. Capture the H3 client-trust generation BEFORE
-    // `Incoming::accept()` / `accept_with`. quinn binds the `ServerConfig` —
-    // and therefore the rustls client-certificate verifier this handshake runs
-    // — inside `accept()`, reading either the explicitly adopted config or
-    // the endpoint's current config under the endpoint state lock. The H3
-    // reload arm applies `set_server_config`, stores that same `Arc` in
-    // `adopted_quic`, and only then publishes the generation, so reading the
-    // generation here and accepting after it means a connection can never
-    // claim a generation newer than the verifier it actually handshakes
-    // against. `accept_with` is what makes a coalesced reload wakeup install
-    // the exact candidate this listener published, rather than whatever the
-    // endpoint happens to hold at packet-decrypt time.
+    // `Incoming::accept()`. quinn binds the `ServerConfig` — and therefore
+    // the rustls client-certificate verifier this handshake runs — inside
+    // `accept()`, reading the endpoint's current config under the endpoint
+    // state lock. The H3 reload arm applies `set_server_config` and only then
+    // publishes the generation, so reading the generation here and accepting
+    // after it means a connection can never claim a generation newer than the
+    // verifier the endpoint is currently advertising.
     let client_trust_admission =
         crate::tls::client_trust::capture(crate::tls::ClientTrustScope::ProxyH3);
-    let adopted_server_config = adopted_quic.load_full().as_ref().clone();
 
     // Single coherent per-connection identity slot. Requests take one lock-free
     // snapshot, so the early-data flag and the peer certificate can never be
@@ -1257,7 +1250,7 @@ async fn handle_h3_connection(
     // (`accept_with_optional_timeout`) and DTLS (`DtlsServerLimits.handshake_timeout`)
     // frontends, all gated by `FERRUM_FRONTEND_TLS_HANDSHAKE_TIMEOUT_SECONDS`.
     let connection = if early_data_enabled {
-        let connecting = accept_h3_incoming(connecting, adopted_server_config)?.into_0rtt();
+        let connecting = accept_h3_incoming(connecting)?.into_0rtt();
         match connecting {
             Ok((conn, zero_rtt_accepted)) => {
                 let remote =
@@ -1328,7 +1321,7 @@ async fn handle_h3_connection(
         // explicit `.accept()?` here both surfaces address-validation errors
         // synchronously and gives us a typed `Connecting` future that
         // `tokio::time::timeout` can wrap directly.
-        let connecting = accept_h3_incoming(connecting, adopted_server_config)?;
+        let connecting = accept_h3_incoming(connecting)?;
         match await_with_optional_timeout(connecting, handshake_timeout).await {
             Ok(result) => result?,
             Err(_elapsed) => {
@@ -1371,6 +1364,20 @@ async fn handle_h3_connection(
     // is consumed in the accept loop after already-ready early streams.
     if handshake_completion_rx.is_none() {
         peer_identity.publish_handshake_result(true, quinn_peer_cert_chain(&connection));
+    }
+    // Fail-closed live-verifier fence (issue #3857): even if this Incoming
+    // completed TLS against a stale endpoint snapshot, the peer chain must
+    // still satisfy the verifier published with the current generation.
+    // Close before stream admission so a reconnect cannot be established.
+    if let Some(admission) = client_trust_admission
+        && let Some(chain) = quinn_peer_cert_chain(&connection)
+        && !crate::tls::client_trust::live_peer_der_chain_still_trusted(admission.scope(), &chain)
+    {
+        close_h3_connection_for_trust_withdrawal(&connection, remote_addr);
+        return Err(anyhow::anyhow!(
+            "{}",
+            crate::tls::client_trust::TRUST_WITHDRAWN_REASON
+        ));
     }
     // Register the established QUIC transport against the H3 client-trust
     // domain. The 0.5-RTT branch cannot be reached with client authentication

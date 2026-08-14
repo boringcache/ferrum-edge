@@ -239,9 +239,10 @@ pub fn spawn_frontend_tls_reload_task(
         slot.store(Arc::new(Some(new_config)));
         if let Some(client_trust) = client_trust {
             for scope in &client_trust_scopes {
-                let publication = crate::tls::client_trust::publish_accepted_material(
+                let publication = crate::tls::client_trust::publish_accepted_candidate(
                     *scope,
                     client_trust.material.clone(),
+                    client_trust.verifier.clone(),
                 );
                 if publication.withdrew() {
                     tracing::warn!(

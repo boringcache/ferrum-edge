@@ -169,9 +169,10 @@ pub fn prepare_proxy_frontend_tls(
     // simply reloads without a trust generation.
     let client_trust_scopes = match startup_client_trust.as_ref() {
         Some(startup_client_trust) if startup_client_trust.verifier.is_some() => {
-            client_trust::publish_accepted_material(
+            client_trust::publish_accepted_candidate(
                 ClientTrustScope::ProxyFrontend,
                 startup_client_trust.material.clone(),
+                startup_client_trust.verifier.clone(),
             );
             vec![ClientTrustScope::ProxyFrontend]
         }
@@ -407,9 +408,10 @@ pub fn prepare_admin_frontend_tls(
     // no withdrawable client credential and must stay unarmed.
     let client_trust_scopes = match startup_client_trust {
         Some(startup_client_trust) if startup_client_trust.verifier.is_some() => {
-            client_trust::publish_accepted_material(
+            client_trust::publish_accepted_candidate(
                 ClientTrustScope::AdminHttps,
                 startup_client_trust.material,
+                startup_client_trust.verifier.clone(),
             );
             vec![ClientTrustScope::AdminHttps]
         }

@@ -19157,6 +19157,19 @@ impl ListenerTlsSource {
             Self::MeshInbound { .. } => None,
         }
     }
+
+    /// Hot-swappable frontend TLS slot, when this listener loads from one.
+    ///
+    /// The accept loop snapshots a `ServerConfig` and then spawns; the
+    /// handshake must re-load this slot immediately before `TlsAcceptor::from`
+    /// so a generation published during that gap cannot describe a verifier
+    /// the connection will not use (issue #3857).
+    fn reload_slot(&self) -> Option<crate::tls::SharedFrontendTls> {
+        match self {
+            Self::Dynamic { slot, .. } => Some(slot.clone()),
+            Self::Static { .. } | Self::MeshInbound { .. } => None,
+        }
+    }
 }
 
 struct ListenerTlsSelection {
@@ -19458,6 +19471,9 @@ struct TlsConnectionMetadata {
     /// domain has never accepted material — the default, live-reload-disabled
     /// posture, which then costs nothing per connection.
     client_trust_admission: Option<crate::tls::ClientTrustAdmission>,
+    /// Dynamic frontend TLS slot to re-load immediately before the handshake.
+    /// `None` for static and mesh-inbound sources.
+    tls_reload_slot: Option<crate::tls::SharedFrontendTls>,
 }
 
 struct NodeWaypointAcceptIdentity {
@@ -19973,6 +19989,7 @@ async fn run_accept_loop(
                             continue;
                         }
                         let record_mesh_mtls_metric = tls_source.record_mesh_mtls_metric();
+                        let tls_reload_slot = tls_source.reload_slot();
                         // Each connection gets its own subscriber so that
                         // shutdown can interrupt the per-connection serve
                         // future (sending GOAWAY on H2 / closing keepalive
@@ -20186,6 +20203,7 @@ async fn run_accept_loop(
                                     destination_ip: connection_destination_ip,
                                     mesh_inbound_pre_handshake_app_port,
                                     client_trust_admission,
+                                    tls_reload_slot,
                                 };
                                 handle_tls_connection(
                                     stream,
@@ -20268,6 +20286,23 @@ async fn handle_tls_connection(
     // Set TCP keepalive on inbound connection
     set_tcp_keepalive(&stream);
 
+    let mut tls_config = tls_config;
+    let mut client_trust_admission = tls_connection_metadata.client_trust_admission;
+    // Re-load the Dynamic slot immediately before the acceptor is built. The
+    // accept loop captured a snapshot and then spawned; a withdrawal published
+    // in that gap would otherwise handshake against the withdrawn verifier
+    // while claiming the new generation (issue #3857).
+    if let Some(slot) = tls_connection_metadata.tls_reload_slot.as_ref() {
+        client_trust_admission =
+            crate::tls::client_trust::capture(crate::tls::ClientTrustScope::ProxyFrontend);
+        match slot.load().as_ref().clone() {
+            Some(current) => tls_config = current,
+            None => {
+                return Err("TLS slot is empty for a TLS-required listener".into());
+            }
+        }
+    }
+
     let acceptor = TlsAcceptor::from(tls_config);
     let tls_stream = crate::tls::accept_with_optional_timeout(
         &acceptor,
@@ -20291,6 +20326,17 @@ async fn handle_tls_connection(
     let client_cert_chain_der: Option<Arc<Vec<Vec<u8>>>> = peer_certs
         .filter(|certs| certs.len() > 1)
         .map(|certs| Arc::new(certs[1..].iter().map(|c| c.to_vec()).collect()));
+    // Fail-closed live-verifier fence (issue #3857): a handshake that still
+    // used a stale `ServerConfig` snapshot must not be served once the
+    // published verifier refuses the peer. Drop before hyper so `establish_h2`
+    // / keep-alive reconnects observe a failed connection, not an authorized
+    // transport.
+    if let Some(admission) = client_trust_admission
+        && let Some(certs) = tls_stream.get_ref().1.peer_certificates()
+        && !crate::tls::client_trust::live_peer_still_trusted(admission.scope(), certs)
+    {
+        return Err(crate::tls::client_trust::TRUST_WITHDRAWN_REASON.into());
+    }
     // Register this transport against the frontend client-trust domain
     // (issue #3857). Only a connection that actually presented a
     // gateway-verified client certificate holds a trust decision a CRL or
@@ -20298,8 +20344,7 @@ async fn handle_tls_connection(
     // registered and never retired. The guard is one strong handle; cloned
     // session handles keep the transport sweepable after this function
     // returns (an upgraded WebSocket outlives `serve_connection_with_upgrades`).
-    let client_trust_guard = tls_connection_metadata
-        .client_trust_admission
+    let client_trust_guard = client_trust_admission
         .and_then(|admission| admission.register(client_cert_der.is_some()));
     let client_trust_session = client_trust_guard
         .as_ref()

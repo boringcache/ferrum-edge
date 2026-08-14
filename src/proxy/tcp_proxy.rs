@@ -1666,7 +1666,7 @@ async fn run_tcp_accept_loop(
                 // this instant. Mesh PeerAuthentication live reload swaps this
                 // slot under us; in-flight handshakes complete with the
                 // snapshot they got.
-                let frontend_tls = state.frontend_tls_slot.load().as_ref().clone();
+                let frontend_tls_slot = state.frontend_tls_slot.clone();
                 let metrics = state.metrics.clone();
                 let backend_tls = state.backend_tls_cache.clone();
                 let cb_cache = state.circuit_breaker_cache.clone();
@@ -1887,6 +1887,7 @@ async fn run_tcp_accept_loop(
                     // `ArcSwap::load()` returns a `Guard` over `Arc<Option<Arc<...>>>`;
                     // pull the inner `Option<Arc<...>>` so the borrow is decoupled from
                     // the guard before the async await suspension.
+                    let frontend_tls = frontend_tls_slot.load().as_ref().clone();
                     let mesh_enforcement_snapshot =
                         mesh_outbound_enforcement.load_full().as_ref().clone();
                     let result = handle_tcp_connection(
@@ -3459,6 +3460,18 @@ async fn handle_tcp_connection_inner(
                 .map(|cert| cert.to_vec())
                 .collect::<Vec<Vec<u8>>>()
         });
+        if let Some(admission) = client_trust_admission
+            && let Some(chain) = peer_chain_der.as_ref()
+            && !crate::tls::client_trust::live_peer_der_chain_still_trusted(
+                admission.scope(),
+                chain,
+            )
+        {
+            return Err(anyhow::anyhow!(
+                "{}",
+                crate::tls::client_trust::TRUST_WITHDRAWN_REASON
+            ));
+        }
         let peer_cert_der = peer_chain_der
             .as_ref()
             .and_then(|certs| certs.first().cloned())
