@@ -81,24 +81,34 @@ always audits the resolved feature graph. `FIPS Build & Test` compiles the
 locked `fips` binary, every claimed feature combination, clippy `-D warnings`,
 and the policy, key-admission, and frontend/backend/CP-DP handshake tests.
 
-Compile artifacts are restored and saved through the local `setup-sccache`
-action plus `Swatinem/rust-cache` with shared key `ci-fips`. rust-cache's
-automatic key covers the installed Rust toolchain and workspace state. A
-separate `fips-contract-${{ hashFiles(...) }}` key component explicitly hashes
+Compile artifacts use two cache layers through the local checksum-pinned
+`setup-sccache` action plus `Swatinem/rust-cache` and `actions/cache`.
+rust-cache's `shared-key` is `ci-fips-contract-${{ hashFiles(...) }}` over
 `Cargo.toml`, `Cargo.lock`, `.cargo/config.toml`, the root `build.rs`, the
 FIPS workflow, the claimed-profile/FIPS feature-policy checker, `src/fips/**`,
-and `vendor/**`, so feature/profile, build-script, FIPS-policy, and
-vendored-patch changes cannot reuse an incompatible AWS-LC/compiler cache
-entry. The cache
+and `vendor/**`. That input is the one the pinned action actually uses; a
+sibling `key:` value is ignored whenever `shared-key` is set and is not
+wired. Automatic toolchain/environment/manifest/lock hashing stays enabled,
+and this layer is not SHA-scoped, so dependency/compiler work remains a warm
+cross-commit fallback. After a successful compile, `fips-compile` publishes
+the full `target/` and `.cache/sccache` tree under
+`fips-producer-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}`.
+`fips-clippy` and `fips-test` restore that exact producer key and do not
+save. Trusted non-cold runs fail closed if the producer channel is missing.
+The cache
 action holds the GitHub Actions cache credential inside the action process;
-PR-controlled `run:` steps never receive that credential. rust-cache `save-if`
-is false when `github.event.pull_request.head.repo.fork` is true, so fork pull
-requests restore `ci-fips` and cannot save. Trusted runs keep `cache-on-failure`
-so ordinary failing jobs can publish compile work when post-job cleanup still
-runs. The successful compile producer publishes before clippy/test start, so a
-downstream runner-loss retry can reuse it; abrupt loss of the producer cannot
-publish that producer's unsaved state. A `workflow_dispatch` input
-`force_cold_cache` skips restore so a hosted cold-cache run still proves every
+PR-controlled `run:` steps never receive that credential. `setup-sccache`
+installs sccache from a checksum-pinned GitHub release and never invokes
+`mozilla-actions/sccache-action` (which would export `ACTIONS_RUNTIME_TOKEN`
+into `GITHUB_ENV`). rust-cache `save-if`
+is false when `github.event.pull_request.head.repo.fork` is true on the
+compile producer, and always false on clippy/test, so fork pull
+requests restore and cannot save. Trusted compile runs keep `cache-on-failure`
+so ordinary failing jobs can publish stable dependency work when post-job
+cleanup still runs. The successful compile producer publishes before
+clippy/test start, so a downstream runner-loss retry can reuse it; abrupt loss
+of the producer cannot publish that producer's unsaved state. A `workflow_dispatch` input
+`force_cold_cache` skips restore and save so a hosted cold-cache run still proves every
 live assertion. Path planning is fail-closed: a missing or unknown trusted
 planner runs the compile gate rather than skipping it. Path planning reads a
 NUL-delimited `git diff --name-only --no-renames -z` listing so a hostile
@@ -106,9 +116,10 @@ filename cannot evade a sensitive prefix. Every compiled `tests/` input is
 sensitive (`cargo clippy --lib --tests` and the handshake binaries). Paths
 that are neither sensitive nor on the explicit non-sensitive allowlist
 force-run; empty, truncated, or unavailable diffs run or fail closed rather
-than skipping. Job summaries record rust-cache hit/miss from the action, but
-measured restored bytes are the sccache-directory subset only; total rust-cache
-archive bytes are not exposed.
+than skipping. Job summaries record rust-cache hit/miss as stable fallback
+and producer restore as exact/partial/miss; measured restored bytes are the
+sccache-directory subset for rust-cache and the on-disk `target/` directory
+for the producer archive. Total rust-cache archive bytes are not exposed.
 
 ## Current capability
 

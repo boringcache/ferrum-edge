@@ -11,12 +11,26 @@ name: FIPS Build Policy
 #    The planner is read from the trusted base; a missing or unknown planner
 #    fails closed toward running the live compile gate.
 # 3. `fips-compile` builds the FIPS binary and every claimed feature combination
-#    once, then rust-cache/sccache persist the AWS-LC + rustc artifacts before
-#    the later clippy/test jobs start. A downstream runner-loss retry therefore
-#    does not start from zero; abrupt loss of the producer itself cannot publish
+#    once, then publishes two cache layers before clippy/test start:
+#    - Stable rust-cache fallback: `shared-key` is
+#      `ci-fips-contract-${{ hashFiles(...) }}` (the input the pinned
+#      Swatinem/rust-cache actually uses; a sibling `key:` input is ignored
+#      whenever `shared-key` is set and must not appear). Automatic
+#      toolchain/env/manifest/lock hashing stays enabled. This layer is NOT
+#      SHA-scoped, so dependency/compiler work stays warm across commits.
+#    - Exact producer channel: `actions/cache` key
+#      `fips-producer-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}`.
+#      Compile saves this after a successful build as a main step, before
+#      rust-cache's post cleanup. A new attempt always gets a fresh key, so
+#      GitHub's immutable exact-hit skip cannot trap newly warmed outputs.
+#    Fork pull requests restore both layers and cannot save. `force_cold_cache`
+#    skips every restore and save. Abrupt loss of the producer cannot publish
 #    that producer's unsaved state.
-#    Fork pull requests restore `ci-fips` but do not save (`save-if`).
-# 4. `fips-clippy` and `fips-test` restore that cache in parallel.
+# 4. `fips-clippy` and `fips-test` restore the same producer key (consumers;
+#    rust-cache `save-if: false` and no producer save). Trusted non-cold runs
+#    fail closed if this-run producer output is missing. restore-keys keep
+#    `fips-producer-${{ github.sha }}-${{ github.run_id }}-` so a failed-job
+#    rerun can reuse a prior attempt of the same run.
 # 5. `fips-build` keeps the `FIPS Build & Test` check name and fails closed.
 #
 # Ferrum Edge is not a validated cryptographic module and is not independently
@@ -49,6 +63,12 @@ env:
   CARGO_NET_RETRY: "10"
   CARGO_HTTP_MULTIPLEXING: "false"
   FERRUM_CI_FORCE_COLD_CACHE: ${{ github.event.inputs.force_cold_cache == 'true' }}
+  # Exact compile-to-consumer channel. Unique per SHA + workflow run + attempt
+  # so a source-only change can publish freshly warmed Cargo/target/AWS-LC/
+  # sccache state. restore-keys use the SHA+run_id prefix (no attempt) so a
+  # failed-job rerun can reuse a prior successful compile in the same run.
+  FIPS_PRODUCER_KEY: fips-producer-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
+  FIPS_PRODUCER_RESTORE_PREFIX: fips-producer-${{ github.sha }}-${{ github.run_id }}-
 
 jobs:
   feature-policy:
@@ -283,14 +303,16 @@ jobs:
 
       - uses: ./.github/actions/setup-fast-linker
 
+      # Stable dependency/compiler fallback. The contract discriminator lives in
+      # `shared-key` because pinned rust-cache ignores `key` whenever
+      # `shared-key` is set. Do not add `key:` or `add-job-id-key`. Automatic
+      # env/manifest/lock hashing remains enabled. This key is not SHA-scoped.
       - name: Cache FIPS Rust, AWS-LC, and sccache outputs
         if: github.event.inputs.force_cold_cache != 'true'
         id: rust-cache
         uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
-          shared-key: ci-fips
-          key: fips-contract-${{ hashFiles('Cargo.toml', 'Cargo.lock', '.cargo/config.toml', 'build.rs', '.github/workflows/fips-build.yml', '.github/scripts/check_fips_feature_policy.py', 'src/fips/**', 'vendor/**') }}
-          add-job-id-key: "false"
+          shared-key: ci-fips-contract-${{ hashFiles('Cargo.toml', 'Cargo.lock', '.cargo/config.toml', 'build.rs', '.github/workflows/fips-build.yml', '.github/scripts/check_fips_feature_policy.py', 'src/fips/**', 'vendor/**') }}
           cache-directories: ${{ github.workspace }}/.cache/sccache
           cache-on-failure: "true"
           save-if: ${{ github.event.pull_request.head.repo.fork != true }}
@@ -305,7 +327,7 @@ jobs:
             --name rust-cache \
             --hit "$CACHE_HIT" \
             --path "${GITHUB_WORKSPACE}/.cache/sccache" \
-            --note "measured=sccache-directory-subset; rust-cache Cargo/target archive bytes are not exposed; shared-key=ci-fips save-if=non-fork fork=${FORK_PR:-false} toolchain+lockfile+aws-lc"
+            --note "layer=stable-fallback; measured=sccache-directory-subset; rust-cache Cargo/target archive bytes are not exposed; shared-key=ci-fips-contract save-if=non-fork fork=${FORK_PR:-false}"
 
       - name: Record cold-cache proof
         if: github.event.inputs.force_cold_cache == 'true'
@@ -314,7 +336,26 @@ jobs:
             --name rust-cache \
             --hit false \
             --bytes 0 \
-            --note "force_cold_cache skipped restore"
+            --note "layer=stable-fallback; force_cold_cache skipped restore"
+          python3 .github/scripts/ci_runtime_telemetry.py cache \
+            --name fips-producer \
+            --hit false \
+            --bytes 0 \
+            --note "layer=producer; force_cold_cache skipped restore and save"
+
+      - name: Assert cache-service credentials are absent
+        run: |
+          set -euo pipefail
+          leaked=0
+          for var in ACTIONS_RUNTIME_TOKEN ACTIONS_RESULTS_URL ACTIONS_CACHE_URL; do
+            if [ -n "${!var:-}" ]; then
+              echo "::error::${var} is present in this run environment; refusing to execute later PR-controlled build steps with a cache-service credential" >&2
+              leaked=1
+            fi
+          done
+          if [ "$leaked" -ne 0 ]; then
+            exit 1
+          fi
 
       - name: Build the FIPS profile
         run: |
@@ -357,6 +398,19 @@ jobs:
           python3 .github/scripts/ci_runtime_telemetry.py end --phase fips-claimed-checks --status "$status"
           exit "$status"
 
+      # Exact producer archive: full workspace target + sccache as left by this
+      # successful compile. Saved as a main step so rust-cache's later post
+      # cleanup (which strips workspace crates) cannot empty it. Unique
+      # sha/run_id/run_attempt avoids immutable exact-hit collisions.
+      - name: Save FIPS producer compile outputs
+        if: github.event.inputs.force_cold_cache != 'true' && github.event.pull_request.head.repo.fork != true
+        uses: actions/cache/save@374a27f26986edd8c430f386d152a856e179c0ae # v4.2.4
+        with:
+          path: |
+            ${{ github.workspace }}/target
+            ${{ github.workspace }}/.cache/sccache
+          key: ${{ env.FIPS_PRODUCER_KEY }}
+
       - name: Record sccache stats
         if: always()
         run: |
@@ -398,12 +452,10 @@ jobs:
         id: rust-cache
         uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
-          shared-key: ci-fips
-          key: fips-contract-${{ hashFiles('Cargo.toml', 'Cargo.lock', '.cargo/config.toml', 'build.rs', '.github/workflows/fips-build.yml', '.github/scripts/check_fips_feature_policy.py', 'src/fips/**', 'vendor/**') }}
-          add-job-id-key: "false"
+          shared-key: ci-fips-contract-${{ hashFiles('Cargo.toml', 'Cargo.lock', '.cargo/config.toml', 'build.rs', '.github/workflows/fips-build.yml', '.github/scripts/check_fips_feature_policy.py', 'src/fips/**', 'vendor/**') }}
           cache-directories: ${{ github.workspace }}/.cache/sccache
           cache-on-failure: "true"
-          save-if: ${{ github.event.pull_request.head.repo.fork != true }}
+          save-if: "false"
 
       - name: Record rust-cache restore
         if: github.event.inputs.force_cold_cache != 'true'
@@ -415,7 +467,86 @@ jobs:
             --name rust-cache \
             --hit "$CACHE_HIT" \
             --path "${GITHUB_WORKSPACE}/.cache/sccache" \
-            --note "measured=sccache-directory-subset; rust-cache Cargo/target archive bytes are not exposed; shared-key=ci-fips save-if=non-fork fork=${FORK_PR:-false}"
+            --note "layer=stable-fallback; measured=sccache-directory-subset; rust-cache Cargo/target archive bytes are not exposed; save-if=false fork=${FORK_PR:-false}"
+
+      - name: Drop stable target before producer restore
+        if: github.event.inputs.force_cold_cache != 'true' && github.event.pull_request.head.repo.fork != true
+        run: |
+          set -euo pipefail
+          rm -rf "${GITHUB_WORKSPACE}/target" "${GITHUB_WORKSPACE}/.cache/sccache"
+
+      - name: Restore FIPS producer compile outputs
+        if: github.event.inputs.force_cold_cache != 'true'
+        id: fips-producer
+        uses: actions/cache/restore@374a27f26986edd8c430f386d152a856e179c0ae # v4.2.4
+        with:
+          path: |
+            ${{ github.workspace }}/target
+            ${{ github.workspace }}/.cache/sccache
+          key: ${{ env.FIPS_PRODUCER_KEY }}
+          restore-keys: |
+            ${{ env.FIPS_PRODUCER_RESTORE_PREFIX }}
+          fail-on-cache-miss: ${{ github.event.pull_request.head.repo.fork != true }}
+
+      - name: Record FIPS producer restore
+        if: github.event.inputs.force_cold_cache != 'true'
+        env:
+          CACHE_HIT: ${{ steps.fips-producer.outputs.cache-hit }}
+          CACHE_MATCHED: ${{ steps.fips-producer.outputs.cache-matched-key }}
+          CACHE_PRIMARY: ${{ steps.fips-producer.outputs.cache-primary-key }}
+        run: |
+          python3 .github/scripts/ci_runtime_telemetry.py classify-restore \
+            --name fips-producer \
+            --hit "$CACHE_HIT" \
+            --matched "$CACHE_MATCHED" \
+            --primary "$CACHE_PRIMARY" \
+            --path "${GITHUB_WORKSPACE}/target" \
+            --note "layer=producer; measured=target-directory; sccache restored with the same producer key"
+
+      - name: Record cold-cache proof
+        if: github.event.inputs.force_cold_cache == 'true'
+        run: |
+          python3 .github/scripts/ci_runtime_telemetry.py cache \
+            --name rust-cache \
+            --hit false \
+            --bytes 0 \
+            --note "layer=stable-fallback; force_cold_cache skipped restore"
+          python3 .github/scripts/ci_runtime_telemetry.py cache \
+            --name fips-producer \
+            --hit false \
+            --bytes 0 \
+            --note "layer=producer; force_cold_cache skipped restore"
+
+      - name: Require this-run FIPS producer cache
+        if: github.event.inputs.force_cold_cache != 'true' && github.event.pull_request.head.repo.fork != true
+        env:
+          MATCHED: ${{ steps.fips-producer.outputs.cache-matched-key }}
+          PREFIX: ${{ env.FIPS_PRODUCER_RESTORE_PREFIX }}
+        run: |
+          set -euo pipefail
+          case "$MATCHED" in
+            "$PREFIX"*)
+              echo "Restored this-run FIPS producer cache."
+              ;;
+            *)
+              echo "::error::fips-compile producer cache was not restored for this github.sha/run_id; refusing to claim compile-to-consumer reuse" >&2
+              exit 1
+              ;;
+          esac
+
+      - name: Assert cache-service credentials are absent
+        run: |
+          set -euo pipefail
+          leaked=0
+          for var in ACTIONS_RUNTIME_TOKEN ACTIONS_RESULTS_URL ACTIONS_CACHE_URL; do
+            if [ -n "${!var:-}" ]; then
+              echo "::error::${var} is present in this run environment; refusing to execute later PR-controlled build steps with a cache-service credential" >&2
+              leaked=1
+            fi
+          done
+          if [ "$leaked" -ne 0 ]; then
+            exit 1
+          fi
 
       - name: Lint the FIPS profile
         run: |
@@ -467,12 +598,10 @@ jobs:
         id: rust-cache
         uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
-          shared-key: ci-fips
-          key: fips-contract-${{ hashFiles('Cargo.toml', 'Cargo.lock', '.cargo/config.toml', 'build.rs', '.github/workflows/fips-build.yml', '.github/scripts/check_fips_feature_policy.py', 'src/fips/**', 'vendor/**') }}
-          add-job-id-key: "false"
+          shared-key: ci-fips-contract-${{ hashFiles('Cargo.toml', 'Cargo.lock', '.cargo/config.toml', 'build.rs', '.github/workflows/fips-build.yml', '.github/scripts/check_fips_feature_policy.py', 'src/fips/**', 'vendor/**') }}
           cache-directories: ${{ github.workspace }}/.cache/sccache
           cache-on-failure: "true"
-          save-if: ${{ github.event.pull_request.head.repo.fork != true }}
+          save-if: "false"
 
       - name: Record rust-cache restore
         if: github.event.inputs.force_cold_cache != 'true'
@@ -484,7 +613,86 @@ jobs:
             --name rust-cache \
             --hit "$CACHE_HIT" \
             --path "${GITHUB_WORKSPACE}/.cache/sccache" \
-            --note "measured=sccache-directory-subset; rust-cache Cargo/target archive bytes are not exposed; shared-key=ci-fips save-if=non-fork fork=${FORK_PR:-false}"
+            --note "layer=stable-fallback; measured=sccache-directory-subset; rust-cache Cargo/target archive bytes are not exposed; save-if=false fork=${FORK_PR:-false}"
+
+      - name: Drop stable target before producer restore
+        if: github.event.inputs.force_cold_cache != 'true' && github.event.pull_request.head.repo.fork != true
+        run: |
+          set -euo pipefail
+          rm -rf "${GITHUB_WORKSPACE}/target" "${GITHUB_WORKSPACE}/.cache/sccache"
+
+      - name: Restore FIPS producer compile outputs
+        if: github.event.inputs.force_cold_cache != 'true'
+        id: fips-producer
+        uses: actions/cache/restore@374a27f26986edd8c430f386d152a856e179c0ae # v4.2.4
+        with:
+          path: |
+            ${{ github.workspace }}/target
+            ${{ github.workspace }}/.cache/sccache
+          key: ${{ env.FIPS_PRODUCER_KEY }}
+          restore-keys: |
+            ${{ env.FIPS_PRODUCER_RESTORE_PREFIX }}
+          fail-on-cache-miss: ${{ github.event.pull_request.head.repo.fork != true }}
+
+      - name: Record FIPS producer restore
+        if: github.event.inputs.force_cold_cache != 'true'
+        env:
+          CACHE_HIT: ${{ steps.fips-producer.outputs.cache-hit }}
+          CACHE_MATCHED: ${{ steps.fips-producer.outputs.cache-matched-key }}
+          CACHE_PRIMARY: ${{ steps.fips-producer.outputs.cache-primary-key }}
+        run: |
+          python3 .github/scripts/ci_runtime_telemetry.py classify-restore \
+            --name fips-producer \
+            --hit "$CACHE_HIT" \
+            --matched "$CACHE_MATCHED" \
+            --primary "$CACHE_PRIMARY" \
+            --path "${GITHUB_WORKSPACE}/target" \
+            --note "layer=producer; measured=target-directory; sccache restored with the same producer key"
+
+      - name: Record cold-cache proof
+        if: github.event.inputs.force_cold_cache == 'true'
+        run: |
+          python3 .github/scripts/ci_runtime_telemetry.py cache \
+            --name rust-cache \
+            --hit false \
+            --bytes 0 \
+            --note "layer=stable-fallback; force_cold_cache skipped restore"
+          python3 .github/scripts/ci_runtime_telemetry.py cache \
+            --name fips-producer \
+            --hit false \
+            --bytes 0 \
+            --note "layer=producer; force_cold_cache skipped restore"
+
+      - name: Require this-run FIPS producer cache
+        if: github.event.inputs.force_cold_cache != 'true' && github.event.pull_request.head.repo.fork != true
+        env:
+          MATCHED: ${{ steps.fips-producer.outputs.cache-matched-key }}
+          PREFIX: ${{ env.FIPS_PRODUCER_RESTORE_PREFIX }}
+        run: |
+          set -euo pipefail
+          case "$MATCHED" in
+            "$PREFIX"*)
+              echo "Restored this-run FIPS producer cache."
+              ;;
+            *)
+              echo "::error::fips-compile producer cache was not restored for this github.sha/run_id; refusing to claim compile-to-consumer reuse" >&2
+              exit 1
+              ;;
+          esac
+
+      - name: Assert cache-service credentials are absent
+        run: |
+          set -euo pipefail
+          leaked=0
+          for var in ACTIONS_RUNTIME_TOKEN ACTIONS_RESULTS_URL ACTIONS_CACHE_URL; do
+            if [ -n "${!var:-}" ]; then
+              echo "::error::${var} is present in this run environment; refusing to execute later PR-controlled build steps with a cache-service credential" >&2
+              leaked=1
+            fi
+          done
+          if [ "$leaked" -ne 0 ]; then
+            exit 1
+          fi
 
       - name: FIPS policy, key-admission, and handshake tests
         # Cargo accepts one TESTNAME filter per invocation. `tls::fips_` selects
@@ -580,6 +788,10 @@ jobs:
             echo ""
             echo "Compile, claimed-profile checks, clippy \`-D warnings\`, and"
             echo "policy/key-admission/handshake tests passed."
+            echo ""
+            echo "Compile published this-run producer cache "
+            echo "(sha + run_id + run_attempt); clippy/test restored that exact "
+            echo "channel. Stable rust-cache remains the cross-commit fallback."
             echo ""
             echo "Warm PR target: <=30 minutes, p95 <=45 minutes, measured on hosted runs."
           } >> "$GITHUB_STEP_SUMMARY"

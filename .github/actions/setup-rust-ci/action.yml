@@ -5,9 +5,10 @@ description: >-
   (strict) and the optional fast linker (best-effort), configures
   setup-fast-linker, sets up the Swatinem rust-cache, and pre-fetches crate
   dependencies.
-  sccache caches compiler outputs in a bounded local directory (the
-  cache-service credential is intentionally not exposed to later PR-controlled
-  steps); rust-cache persists that directory together with Cargo and target
+  sccache is installed by the local checksum-pinned setup-sccache action (not
+  mozilla-actions/sccache-action) into a bounded local directory; the
+  cache-service credential is never exported into later PR-controlled `run:`
+  steps. rust-cache persists that directory together with Cargo and target
   directories using isolated shared keys so incompatible job/profile/target
   artifacts do not mix. rust-cache saves on ordinary later-phase failures
   (`cache-on-failure`) when post-job cleanup still executes. Abrupt runner loss

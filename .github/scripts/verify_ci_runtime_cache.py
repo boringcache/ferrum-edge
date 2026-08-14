@@ -6,7 +6,10 @@ boundaries, pinned actions, fail-closed NUL-delimited planning, preserved live
 contracts, telemetry redaction, evidence-backed cache restore bytes, schema-
 and architecture-scoped BuildKit keys, exact-hit restore-only vs partial/miss
 publish, fail-closed cache-save preparation, fork restore-only / no-save
-steps, and rust-cache save-if so fork PRs cannot save.
+steps, rust-cache save-if so fork PRs cannot save, FIPS producer/consumer key
+equality with unique attempt scoping and stable fallback isolation, rejection
+of ignored rust-cache `key` wiring, checksum-pinned sccache install without
+credential-exporting installers, and hosted cache-token absence assertions.
 """
 
 from __future__ import annotations
@@ -41,6 +44,31 @@ BUILDX = "docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c"
 BUILD_PUSH = "docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a"
 CACHE_RESTORE = "actions/cache/restore@374a27f26986edd8c430f386d152a856e179c0ae"
 CACHE_SAVE = "actions/cache/save@374a27f26986edd8c430f386d152a856e179c0ae"
+FIPS_CONTRACT_HASHFILES = (
+    "hashFiles('Cargo.toml', 'Cargo.lock', '.cargo/config.toml', 'build.rs', "
+    "'.github/workflows/fips-build.yml', "
+    "'.github/scripts/check_fips_feature_policy.py', "
+    "'src/fips/**', 'vendor/**')"
+)
+FIPS_SHARED_KEY = "ci-fips-contract-${{ " + FIPS_CONTRACT_HASHFILES + " }}"
+FIPS_PRODUCER_KEY_EXPR = (
+    "fips-producer-${{ github.sha }}-${{ github.run_id }}-"
+    "${{ github.run_attempt }}"
+)
+FIPS_PRODUCER_RESTORE_PREFIX_EXPR = (
+    "fips-producer-${{ github.sha }}-${{ github.run_id }}-"
+)
+FIPS_PRODUCER_PATHS = (
+    "${{ github.workspace }}/target",
+    "${{ github.workspace }}/.cache/sccache",
+)
+SCCACHE_EXPORTERS = ("mozilla-actions/sccache-action",)
+SCCACHE_PINNED_VERSION = "0.17.0"
+SCCACHE_RELEASE_DOWNLOAD = "https://github.com/mozilla/sccache/releases/download/"
+CREDENTIAL_ASSERT_VARS = (
+    "ACTIONS_RUNTIME_TOKEN",
+    "ACTIONS_RESULTS_URL",
+)
 BUILDKIT_CACHE_SCHEMA = "v1"
 CACHE_KIND_EXACT = "steps.cache-kind.outputs.kind == 'exact'"
 CACHE_KIND_PUBLISH = "steps.cache-kind.outputs.publish == 'true'"
@@ -485,6 +513,15 @@ SAVE_IF_NON_FORK = re.compile(
     r"github\.event\.pull_request\.head\.repo\.fork\s*!=\s*true"
     r"(?:\s*\}\})?(?:['\"]?)\s*(?:#.*)?$"
 )
+SAVE_IF_FALSE = re.compile(
+    r"(?m)^[ \t]*save-if:\s*(?:['\"]?)(?:\$\{\{\s*)?false"
+    r"(?:\s*\}\})?(?:['\"]?)\s*(?:#.*)?$"
+)
+RUST_CACHE_BARE_KEY = re.compile(r"(?m)^[ \t]*key:")
+RUST_CACHE_ADD_JOB_ID = re.compile(r"(?m)^[ \t]*add-job-id-key:")
+TOKEN_ECHO = re.compile(
+    r"""echo\s+["']?\$\{?(?:ACTIONS_RUNTIME_TOKEN|ACTIONS_RESULTS_URL|ACTIONS_CACHE_URL)"""
+)
 
 
 def extract_job(workflow: str, job: str) -> str:
@@ -556,6 +593,260 @@ def rust_cache_with_blocks(text: str) -> list[str]:
         )
         blocks.append(with_match.group(1) if with_match else "")
     return blocks
+
+
+def check_rust_cache_uses_shared_key_only(
+    with_block: str,
+    source: str,
+    failures: list[str],
+    *,
+    expected_shared_key: str,
+) -> None:
+    require(
+        expected_shared_key in with_block,
+        f"{source} rust-cache shared-key must be {expected_shared_key}",
+        failures,
+    )
+    require(
+        RUST_CACHE_BARE_KEY.search(with_block) is None,
+        f"{source} must not set rust-cache `key:` (ignored when shared-key is set)",
+        failures,
+    )
+    require(
+        RUST_CACHE_ADD_JOB_ID.search(with_block) is None,
+        f"{source} must not set rust-cache add-job-id-key (unused with shared-key)",
+        failures,
+    )
+    require(
+        "github.sha" not in with_block
+        and "github.run_id" not in with_block
+        and "github.run_attempt" not in with_block,
+        f"{source} stable rust-cache shared-key must not include sha/run_id/"
+        "run_attempt (those belong on the producer channel)",
+        failures,
+    )
+    require(
+        re.search(
+            r"(?m)^[ \t]*add-rust-environment-hash-key:\s*['\"]?false",
+            with_block,
+        )
+        is None,
+        f"{source} must preserve automatic rust environment/manifest/lock hashing",
+        failures,
+    )
+
+
+def check_credential_absence_assertion(
+    text: str,
+    source: str,
+    failures: list[str],
+) -> None:
+    require(
+        "Assert cache-service credentials are absent" in text,
+        f"{source} must declare a hosted cache-credential absence assertion",
+        failures,
+    )
+    for var in CREDENTIAL_ASSERT_VARS:
+        require(
+            var in text,
+            f"{source} credential assertion must check {var}",
+            failures,
+        )
+    require(
+        '[ -n "${!var:-}" ]' in text or "[ -n \"${!var:-}\" ]" in text,
+        f"{source} must test credential presence via ${{!var:-}} without "
+        "printing values",
+        failures,
+    )
+    require(
+        TOKEN_ECHO.search(text) is None,
+        f"{source} must not print cache-service credential values",
+        failures,
+    )
+    require(
+        "refusing to execute later PR-controlled build steps" in text
+        or "refusing to execute PR-controlled" in text,
+        f"{source} credential assertion must fail closed",
+        failures,
+    )
+
+
+def check_no_sccache_credential_exporter(
+    text: str,
+    source: str,
+    failures: list[str],
+) -> None:
+    for exporter in SCCACHE_EXPORTERS:
+        require(
+            re.search(
+                rf"(?m)^[ \t]*(?:-\s*)?uses:\s*{re.escape(exporter)}@",
+                text,
+            )
+            is None,
+            f"{source} must not invoke credential-exporting installer {exporter}",
+            failures,
+        )
+    require(
+        "core.exportVariable" not in text,
+        f"{source} must not call core.exportVariable (ACTIONS_RUNTIME_TOKEN leak)",
+        failures,
+    )
+
+
+def check_fips_producer_channel(
+    workflow: str,
+    failures: list[str],
+) -> None:
+    require(
+        f"FIPS_PRODUCER_KEY: {FIPS_PRODUCER_KEY_EXPR}" in workflow,
+        "FIPS workflow env must define FIPS_PRODUCER_KEY as "
+        f"{FIPS_PRODUCER_KEY_EXPR}",
+        failures,
+    )
+    require(
+        f"FIPS_PRODUCER_RESTORE_PREFIX: {FIPS_PRODUCER_RESTORE_PREFIX_EXPR}"
+        in workflow,
+        "FIPS workflow env must define FIPS_PRODUCER_RESTORE_PREFIX as "
+        f"{FIPS_PRODUCER_RESTORE_PREFIX_EXPR}",
+        failures,
+    )
+    compile_job = extract_job(workflow, "fips-compile")
+    clippy_job = extract_job(workflow, "fips-clippy")
+    test_job = extract_job(workflow, "fips-test")
+    compile_saves = [
+        step for step in job_steps(compile_job) if step_uses(step).startswith(CACHE_SAVE)
+    ]
+    compile_restores = [
+        step
+        for step in job_steps(compile_job)
+        if step_uses(step).startswith(CACHE_RESTORE)
+    ]
+    require(
+        len(compile_saves) == 1,
+        f"fips-compile must have exactly one pinned actions/cache/save producer "
+        f"step, found {len(compile_saves)}",
+        failures,
+    )
+    require(
+        not compile_restores,
+        "fips-compile must publish the producer archive and not restore it",
+        failures,
+    )
+    if compile_saves:
+        condition = step_if(compile_saves[0])
+        with_block = step_with(compile_saves[0])
+        require(
+            COLD_NOT_TRUE in condition,
+            "fips-compile producer save must skip force_cold_cache",
+            failures,
+        )
+        require(
+            FORK_NOT_TRUE in condition and FORK_IS_TRUE not in condition,
+            "fips-compile producer save must exclude fork PRs",
+            failures,
+        )
+        require(
+            "key: ${{ env.FIPS_PRODUCER_KEY }}" in with_block,
+            "fips-compile producer save must use env.FIPS_PRODUCER_KEY",
+            failures,
+        )
+        for path in FIPS_PRODUCER_PATHS:
+            require(
+                path in with_block,
+                f"fips-compile producer save must include {path}",
+                failures,
+            )
+    for job_body, job_name in (
+        (clippy_job, "fips-clippy"),
+        (test_job, "fips-test"),
+    ):
+        restores = [
+            step
+            for step in job_steps(job_body)
+            if step_uses(step).startswith(CACHE_RESTORE)
+        ]
+        saves = [
+            step for step in job_steps(job_body) if step_uses(step).startswith(CACHE_SAVE)
+        ]
+        require(
+            not saves,
+            f"{job_name} must be a producer-cache consumer and must not save",
+            failures,
+        )
+        require(
+            len(restores) == 1,
+            f"{job_name} must have exactly one pinned actions/cache/restore "
+            f"producer step, found {len(restores)}",
+            failures,
+        )
+        if restores:
+            condition = step_if(restores[0])
+            with_block = step_with(restores[0])
+            require(
+                COLD_NOT_TRUE in condition,
+                f"{job_name} producer restore must skip force_cold_cache",
+                failures,
+            )
+            require(
+                "key: ${{ env.FIPS_PRODUCER_KEY }}" in with_block,
+                f"{job_name} producer restore key must equal compile's "
+                "env.FIPS_PRODUCER_KEY",
+                failures,
+            )
+            require(
+                "restore-keys:" in with_block
+                and "${{ env.FIPS_PRODUCER_RESTORE_PREFIX }}" in with_block,
+                f"{job_name} producer restore-keys must use the sha+run_id prefix",
+                failures,
+            )
+            require(
+                "fail-on-cache-miss:" in with_block
+                and "github.event.pull_request.head.repo.fork != true" in with_block,
+                f"{job_name} must fail closed on a producer miss for non-fork runs",
+                failures,
+            )
+            for path in FIPS_PRODUCER_PATHS:
+                require(
+                    path in with_block,
+                    f"{job_name} producer restore must include {path}",
+                    failures,
+                )
+        require(
+            "Require this-run FIPS producer cache" in job_body,
+            f"{job_name} must fail closed when the this-run producer key is missing",
+            failures,
+        )
+        require(
+            "FIPS_PRODUCER_RESTORE_PREFIX" in job_body
+            and "refusing to claim compile-to-consumer reuse" in job_body,
+            f"{job_name} producer requirement must match the sha+run_id prefix",
+            failures,
+        )
+        require(
+            "Drop stable target before producer restore" in job_body,
+            f"{job_name} must drop rust-cache target/sccache before restoring "
+            "the SHA-scoped producer archive",
+            failures,
+        )
+        require(
+            "layer=producer" in job_body and "classify-restore" in job_body,
+            f"{job_name} must classify producer restore separately from "
+            "stable fallback",
+            failures,
+        )
+        rust_blocks = rust_cache_with_blocks(job_body)
+        if rust_blocks:
+            require(
+                SAVE_IF_FALSE.search(rust_blocks[0]) is not None,
+                f"{job_name} rust-cache must set save-if false so consumers "
+                "cannot publish",
+                failures,
+            )
+            require(
+                SAVE_IF_NON_FORK.search(rust_blocks[0]) is None,
+                f"{job_name} rust-cache must not use the compile producer save-if",
+                failures,
+            )
 
 
 def check_rust_cache_fork_save_if(
@@ -1026,8 +1317,15 @@ def check_fips(workflow: str, failures: list[str]) -> None:
         failures,
     )
     require(
-        "shared-key: ci-fips" in workflow or 'shared-key: "ci-fips"' in workflow,
-        "FIPS compile consumers must share rust-cache key ci-fips",
+        f"shared-key: {FIPS_SHARED_KEY}" in workflow,
+        "FIPS jobs must share rust-cache shared-key ci-fips-contract-${{ hashFiles(...) }}",
+        failures,
+    )
+    require(
+        "shared-key: ci-fips\n" not in workflow
+        and 'shared-key: "ci-fips"' not in workflow
+        and "shared-key: ci-fips\r" not in workflow,
+        "FIPS rust-cache must not use the old ignored shared-key: ci-fips + key: shape",
         failures,
     )
     fips_contract_inputs = (
@@ -1053,10 +1351,11 @@ def check_fips(workflow: str, failures: list[str]) -> None:
         )
         if len(blocks) == 1:
             block = blocks[0]
-            require(
-                "key: fips-contract-${{ hashFiles(" in block,
-                f"{job_name} must namespace its cache with the FIPS contract hash",
+            check_rust_cache_uses_shared_key_only(
+                block,
+                job_name,
                 failures,
+                expected_shared_key=FIPS_SHARED_KEY,
             )
             for contract_input in fips_contract_inputs:
                 require(
@@ -1207,28 +1506,27 @@ def check_fips(workflow: str, failures: list[str]) -> None:
         failures,
         expected_count=1,
     )
-    check_rust_cache_fork_save_if(
-        clippy_job,
-        "fips-clippy",
-        failures,
-        expected_count=1,
-    )
-    check_rust_cache_fork_save_if(
-        test_job,
-        "fips-test",
-        failures,
-        expected_count=1,
-    )
+    check_fips_producer_channel(workflow, failures)
+    check_no_sccache_credential_exporter(workflow, "fips-build.yml", failures)
     for job_body, job_name in (
         (compile_job, "fips-compile"),
         (clippy_job, "fips-clippy"),
         (test_job, "fips-test"),
     ):
+        check_credential_absence_assertion(job_body, job_name, failures)
+        cargo_idx = job_body.find("cargo ")
+        assert_idx = job_body.find("Assert cache-service credentials are absent")
+        require(
+            assert_idx != -1 and cargo_idx != -1 and assert_idx < cargo_idx,
+            f"{job_name} must assert cache credentials are absent before cargo",
+            failures,
+        )
         require(
             "sccache-directory-subset" in job_body
-            and "not exposed" in job_body,
-            f"{job_name} must label measured bytes as the sccache-directory "
-            "subset and state that rust-cache archive bytes are not exposed",
+            and "not exposed" in job_body
+            and "layer=stable-fallback" in job_body,
+            f"{job_name} must label rust-cache as stable-fallback and state that "
+            "archive bytes are not exposed",
             failures,
         )
         require(
@@ -1417,6 +1715,48 @@ def check_shared_actions(failures: list[str]) -> None:
         "setup-rust-ci must expose rust-cache hit/miss as an action output",
         failures,
     )
+    check_no_sccache_credential_exporter(sccache, "setup-sccache", failures)
+    check_credential_absence_assertion(sccache, "setup-sccache", failures)
+    require(
+        SCCACHE_RELEASE_DOWNLOAD in sccache,
+        "setup-sccache must download a pinned mozilla/sccache GitHub release",
+        failures,
+    )
+    require(
+        f'default: "{SCCACHE_PINNED_VERSION}"' in sccache
+        or f"default: '{SCCACHE_PINNED_VERSION}'" in sccache,
+        f"setup-sccache must pin sccache {SCCACHE_PINNED_VERSION}",
+        failures,
+    )
+    for digest_input in (
+        "linux-amd64-sha256",
+        "linux-arm64-sha256",
+        "macos-amd64-sha256",
+        "macos-arm64-sha256",
+        "windows-amd64-sha256",
+    ):
+        require(
+            f"{digest_input}:" in sccache,
+            f"setup-sccache must pin {digest_input}",
+            failures,
+        )
+        require(
+            re.search(
+                rf"{re.escape(digest_input)}:[\s\S]{{0,200}}default: \"[0-9a-f]{{64}}\"",
+                sccache,
+            )
+            is not None,
+            f"setup-sccache {digest_input} must default to a 64-char SHA-256",
+            failures,
+        )
+    require(
+        "Linux-X64" in sccache
+        and "macOS-ARM64" in sccache
+        and "macOS-X64" in sccache
+        and "Windows-X64" in sccache,
+        "setup-sccache must cover Linux/macOS/Windows architectures used by callers",
+        failures,
+    )
     require(
         "ACTIONS_RUNTIME_TOKEN" in sccache and "GITHUB_ENV" in sccache,
         "setup-sccache must keep documenting why the GHA cache token stays out of GITHUB_ENV",
@@ -1425,6 +1765,33 @@ def check_shared_actions(failures: list[str]) -> None:
     require(
         "unset SCCACHE_GHA_ENABLED" in sccache,
         "setup-sccache must keep the GHA backend disabled",
+        failures,
+    )
+    require(
+        "SCCACHE_CACHE_SIZE=2G" in sccache or "SCCACHE_CACHE_SIZE=2G" in sccache,
+        "setup-sccache must keep the 2 GiB local cache cap",
+        failures,
+    )
+    require(
+        "SCCACHE_IDLE_TIMEOUT=0" in sccache,
+        "setup-sccache must keep the idle timeout disabled",
+        failures,
+    )
+    require(
+        "lazily after cache restore" in sccache
+        or "AFTER the cache restore" in sccache
+        or "after cache restore" in sccache,
+        "setup-sccache must still start the server lazily after cache restore",
+        failures,
+    )
+    require(
+        "continue-on-error: true" in sccache,
+        "setup-sccache install must remain a graceful fallback",
+        failures,
+    )
+    require(
+        "CARGO_BUILD_RUSTC_WRAPPER=" in sccache,
+        "setup-sccache must clear the rustc wrapper when sccache is unavailable",
         failures,
     )
     require(
@@ -1467,6 +1834,30 @@ def check_docs_and_coverage(failures: list[str]) -> None:
     require(
         "save-if" in ci_cd and "fork" in ci_cd.lower(),
         "docs/ci_cd.md must document rust-cache save-if for fork pull requests",
+        failures,
+    )
+    require(
+        "fips-producer" in ci_cd
+        and "github.sha" in ci_cd
+        and "run_id" in ci_cd
+        and "run_attempt" in ci_cd,
+        "docs/ci_cd.md must document the SHA/run_id/run_attempt FIPS producer key",
+        failures,
+    )
+    require(
+        "shared-key" in ci_cd and "ignored" in ci_cd.lower(),
+        "docs/ci_cd.md must document that pinned rust-cache ignores key when shared-key is set",
+        failures,
+    )
+    require(
+        "save-if: false" in ci_cd or "save-if: false" in ci_cd.replace("`", ""),
+        "docs/ci_cd.md must document that FIPS clippy/test rust-cache does not save",
+        failures,
+    )
+    require(
+        "mozilla-actions/sccache-action" in ci_cd
+        and "ACTIONS_RUNTIME_TOKEN" in ci_cd,
+        "docs/ci_cd.md must name the rejected sccache installer and token boundary",
         failures,
     )
     require(
@@ -1531,6 +1922,23 @@ def check_docs_and_coverage(failures: list[str]) -> None:
     require(
         "save-if" in fips_doc,
         "docs/fips.md must document rust-cache save-if so fork PRs cannot save",
+        failures,
+    )
+    require(
+        "fips-producer" in fips_doc
+        and "github.sha" in fips_doc
+        and "run_attempt" in fips_doc,
+        "docs/fips.md must document the exact producer cache key",
+        failures,
+    )
+    require(
+        "mozilla-actions/sccache-action" in fips_doc,
+        "docs/fips.md must name the rejected sccache installer",
+        failures,
+    )
+    require(
+        "shared-key" in fips_doc and "ignored" in fips_doc.lower(),
+        "docs/fips.md must document pinned rust-cache shared-key vs ignored key",
         failures,
     )
     require(
@@ -1795,6 +2203,136 @@ def self_test() -> int:
     require(
         any("save-if so fork PRs restore only" in item for item in inverted_failures),
         "self-test: inverted rust-cache save-if must fail",
+        failures,
+    )
+
+    ignored_key_block = (
+        "          shared-key: ci-fips\n"
+        "          key: fips-contract-${{ hashFiles('Cargo.toml') }}\n"
+        "          add-job-id-key: \"false\"\n"
+    )
+    ignored_key_failures: list[str] = []
+    check_rust_cache_uses_shared_key_only(
+        ignored_key_block,
+        "self-test-ignored-key",
+        ignored_key_failures,
+        expected_shared_key=FIPS_SHARED_KEY,
+    )
+    require(
+        any("must not set rust-cache `key:`" in item for item in ignored_key_failures)
+        and any("add-job-id-key" in item for item in ignored_key_failures)
+        and any("shared-key must be" in item for item in ignored_key_failures),
+        "self-test: shared-key plus ignored key/add-job-id-key must fail",
+        failures,
+    )
+
+    sha_in_stable = (
+        f"          shared-key: {FIPS_SHARED_KEY}-${{{{ github.sha }}}}\n"
+    )
+    sha_stable_failures: list[str] = []
+    check_rust_cache_uses_shared_key_only(
+        sha_in_stable,
+        "self-test-sha-in-stable",
+        sha_stable_failures,
+        expected_shared_key=FIPS_SHARED_KEY,
+    )
+    require(
+        any("must not include sha/run_id" in item for item in sha_stable_failures),
+        "self-test: SHA on the stable rust-cache key must fail",
+        failures,
+    )
+
+    good_shared = f"          shared-key: {FIPS_SHARED_KEY}\n"
+    good_shared_failures: list[str] = []
+    check_rust_cache_uses_shared_key_only(
+        good_shared,
+        "self-test-good-shared-key",
+        good_shared_failures,
+        expected_shared_key=FIPS_SHARED_KEY,
+    )
+    require(
+        not good_shared_failures,
+        "self-test: contract shared-key without ignored key should pass: "
+        + "; ".join(good_shared_failures),
+        failures,
+    )
+
+    exporter_failures: list[str] = []
+    check_no_sccache_credential_exporter(
+        "uses: mozilla-actions/sccache-action@1583d6b38d7be47f593cb472781bbb21cab4321e\n",
+        "self-test-sccache-exporter",
+        exporter_failures,
+    )
+    require(
+        any("must not invoke credential-exporting installer" in item for item in exporter_failures),
+        "self-test: mozilla-actions/sccache-action must fail",
+        failures,
+    )
+
+    missing_assert_failures: list[str] = []
+    check_credential_absence_assertion(
+        "run: cargo test\n",
+        "self-test-missing-assert",
+        missing_assert_failures,
+    )
+    require(
+        any("cache-credential absence assertion" in item for item in missing_assert_failures),
+        "self-test: missing credential assertion must fail",
+        failures,
+    )
+
+    echo_token = (
+        "      - name: Assert cache-service credentials are absent\n"
+        "        run: |\n"
+        "          echo \"$ACTIONS_RUNTIME_TOKEN\"\n"
+        "          echo \"$ACTIONS_RESULTS_URL\"\n"
+        '          if [ -n "${!var:-}" ]; then echo refusing to execute later PR-controlled build steps; fi\n'
+    )
+    echo_token_failures: list[str] = []
+    check_credential_absence_assertion(
+        echo_token,
+        "self-test-echo-token",
+        echo_token_failures,
+    )
+    require(
+        any("must not print cache-service credential values" in item for item in echo_token_failures),
+        "self-test: echoing ACTIONS_RUNTIME_TOKEN must fail",
+        failures,
+    )
+
+    consumer_save = (
+        "name: demo\n"
+        "env:\n"
+        f"  FIPS_PRODUCER_KEY: {FIPS_PRODUCER_KEY_EXPR}\n"
+        f"  FIPS_PRODUCER_RESTORE_PREFIX: {FIPS_PRODUCER_RESTORE_PREFIX_EXPR}\n"
+        "jobs:\n"
+        "  fips-compile:\n"
+        "    steps:\n"
+        f"      - uses: {CACHE_SAVE} # v4.2.4\n"
+        f"        if: {COLD_NOT_TRUE} && {FORK_NOT_TRUE}\n"
+        "        with:\n"
+        "          path: |\n"
+        f"            {FIPS_PRODUCER_PATHS[0]}\n"
+        f"            {FIPS_PRODUCER_PATHS[1]}\n"
+        "          key: ${{ env.FIPS_PRODUCER_KEY }}\n"
+        "  fips-clippy:\n"
+        "    steps:\n"
+        f"      - uses: {CACHE_SAVE} # v4.2.4\n"
+        f"        if: {COLD_NOT_TRUE} && {FORK_NOT_TRUE}\n"
+        "        with:\n"
+        "          key: ${{ env.FIPS_PRODUCER_KEY }}\n"
+        "  fips-test:\n"
+        "    steps:\n"
+        f"      - uses: {CACHE_RESTORE} # v4.2.4\n"
+        f"        if: {COLD_NOT_TRUE}\n"
+        "        with:\n"
+        "          key: ${{ env.FIPS_PRODUCER_KEY }}\n"
+    )
+    consumer_save_failures: list[str] = []
+    check_fips_producer_channel(consumer_save, consumer_save_failures)
+    require(
+        any("must be a producer-cache consumer and must not save" in item for item in consumer_save_failures),
+        "self-test: clippy producer save must fail",
         failures,
     )
 

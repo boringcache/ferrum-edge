@@ -272,31 +272,58 @@ inside `<code>` so a hostile name cannot break Markdown.
 
 **FIPS.** `FIPS Feature Policy` stays a cheap always-on graph audit.
 Compile, claimed-profile `cargo check`, clippy `-D warnings`, and the
-policy/key-admission/handshake tests share rust-cache key `ci-fips` and a
-local-disk sccache directory. The compile job saves first; clippy and tests
-restore in parallel. Each site also uses the same explicit FIPS contract hash
-over the manifest/lockfile, Cargo config, root build script, FIPS workflow,
-claimed-profile policy, `src/fips/**`, and `vendor/**`; rust-cache independently
-keys the installed toolchain and workspace state. rust-cache `save-if` is false
-for fork pull requests, so
-those jobs restore `ci-fips` and cannot save. Trusted runs keep
-`cache-on-failure` so ordinary failing jobs can publish compile work when
-post-job cleanup still runs. The successful compile producer publishes before
-clippy/test start, so a downstream runner-loss retry can reuse it; abrupt loss
-of the producer cannot publish that producer's unsaved state. Example plugins
-stay out of the FIPS artifact
-(`FERRUM_CUSTOM_PLUGINS` is unset). Job summaries record rust-cache hit/miss
-from the action output, but measured restored bytes are the sccache-directory
-subset (`.cache/sccache`) only; rust-cache also restores Cargo and
-target state, and those archive bytes are not exposed.
+policy/key-admission/handshake tests share two cache layers:
+
+- **Stable rust-cache fallback.** `shared-key` is
+  `ci-fips-contract-${{ hashFiles(...) }}` over the manifest/lockfile, Cargo
+  config, root build script, FIPS workflow, claimed-profile policy,
+  `src/fips/**`, and `vendor/**`. Pinned `Swatinem/rust-cache` uses `shared-key`
+  and ignores a sibling `key:` input whenever `shared-key` is set, so the
+  contract hash must live in `shared-key` (no ignored `key:` /
+  `add-job-id-key` wiring). Automatic toolchain, environment, manifest, and
+  lockfile hashing stays enabled. This layer is **not** SHA-scoped, so
+  AWS-LC/compiler work stays warm across commits. `fips-compile` may save it
+  (`save-if` false for fork PRs); `fips-clippy` and `fips-test` restore it
+  with `save-if: false` and never publish.
+- **Exact producer channel.** After a successful compile, `fips-compile`
+  saves `${{ github.workspace }}/target` and `.cache/sccache` with
+  `actions/cache/save` under
+  `fips-producer-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}`.
+  That key is unique per head and workflow-run attempt, so GitHub's immutable
+  exact-hit skip cannot trap newly warmed outputs. Clippy/test restore the
+  same key (`restore-keys` keep the SHA+`run_id` prefix so a failed-job rerun
+  can reuse a prior attempt) and never save. Trusted non-cold runs fail closed
+  if this-run producer output is missing. Fork pull requests restore only and
+  cannot save; GitHub confines `pull_request` writes to `refs/pull/.../merge`,
+  not the default branch.
+
+`force_cold_cache` skips every restore and save while still executing the live
+contracts. rust-cache `cache-on-failure` remains on the compile producer so
+ordinary failing jobs can publish stable dependency work when post-job cleanup
+still runs. The producer `actions/cache/save` is a main step after compile and
+before rust-cache's post cleanup, which strips workspace crates from `target/`
+before saving the stable fallback. Example plugins stay out of the FIPS
+artifact (`FERRUM_CUSTOM_PLUGINS` is unset). Job summaries record rust-cache
+hit/miss from the action output as **stable fallback**, and producer restore
+as **exact / partial (same run_id) / miss** via `classify-restore`. Measured
+restored bytes are the sccache-directory subset for rust-cache and the
+on-disk `target/` directory for the producer archive; rust-cache Cargo/target
+archive bytes are not exposed.
 
 **Trust boundary.** Untrusted `run:` steps never receive GitHub Actions cache
-write credentials. `setup-sccache` keeps the sccache GHA backend disabled and
-does not export the cache-service token into `GITHUB_ENV`. Production-image
-cache restore and save stay inside the pinned `actions/cache/*` actions; PR-
-controlled `run:` steps only measure the restored directory and move the
-BuildKit local export. Workflows stay `permissions: contents: read`. Static
-checks live in `.github/scripts/verify_ci_runtime_cache.py`.
+write credentials. `setup-sccache` installs a checksum-pinned
+`mozilla/sccache` GitHub release (Linux/macOS/Windows, the x86_64 and
+aarch64 archives actually used by callers) and does **not** invoke
+`mozilla-actions/sccache-action`, which exports `ACTIONS_RUNTIME_TOKEN` and
+`ACTIONS_RESULTS_URL` into `GITHUB_ENV`. A fail-closed assertion before cargo
+refuses to continue if those variables are present in a `run:` environment
+(values are never printed). The sccache GHA backend stays disabled; compiler
+outputs use a 2 GiB local directory persisted by rust-cache / the FIPS
+producer archive. Production-image cache restore and save stay inside the
+pinned `actions/cache/*` actions; PR-controlled `run:` steps only measure the
+restored directory and move the BuildKit local export. Workflows stay
+`permissions: contents: read`. Static checks live in
+`.github/scripts/verify_ci_runtime_cache.py`.
 
 `node-waypoint-ebpf-live.yml` path-filtered `pull_request.paths` must be a
 **trigger superset** of every `production-dockerfile-smoke` sensitive input in
