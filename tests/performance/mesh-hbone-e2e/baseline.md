@@ -23,7 +23,7 @@ RPS when interpreting regressions.
 | Rust / harness versions | from artifact `provenance.json` |
 | Build profile | `--release` |
 | Feature flags | default (no `--features`) |
-| Non-default Ferrum/env settings | harness `run.sh` file-mode + `FERRUM_GATEWAY_SVID_*` SPIFFE material |
+| Non-default Ferrum/env settings | harness `run.sh` trusted-projection fixture (`hbone_perf_fixture`) + generated SVID/trust-bundle paths; `FERRUM_BACKEND_ALLOW_IPS=private` |
 | Warmup / repetitions | steady-state loadgen after gateway ready; **≥3 clean repetitions** per row |
 | Commands | see below |
 | Raw artifacts | `mesh-performance-baselines-<sha>` → `hbone/**/run_*.txt` + `summary.json` |
@@ -92,7 +92,7 @@ cd tests/performance/mesh-hbone-e2e
 
 Before treating Gateway+HBONE RPS as “gateway capacity”:
 
-- Topology is localhost loadgen → file-mode gateway → stub sidecar → echo backend.
+- Topology is localhost loadgen → trusted-projection fixture → stub sidecar → echo backend.
 - mTLS + H2 CONNECT setup is amortized; numbers are steady-state, not handshake cost.
 - Direct baseline bypasses gateway **and** sidecar; overhead includes tunnel relay,
   not only `ferrum-edge` proxy overhead.
