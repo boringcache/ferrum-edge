@@ -40,7 +40,8 @@
 //! - `CONNECT` method rejection on H1 (non-WebSocket)
 //! - HTTP/1.1 slow/incomplete header timeout, including `0` disable semantics
 //! - `CONNECT` method rejection on H2 unless `:protocol = "websocket"`
-//! - `CONNECT` method rejection on H3 for unsupported Extended CONNECT protocols
+//! - RFC 9298 `connect-udp` Extended CONNECT refused with 501 while the
+//!   profile is disabled (the default); see `functional_http3_connect_udp_test`
 //! - `FERRUM_MAX_REQUEST_BODY_SIZE_BYTES` rejection on H1 and H2
 //! - `FERRUM_MAX_RESPONSE_BODY_SIZE_BYTES` rejection on H1 and H2
 //! - Request-side hop-by-hop header stripping (backend must not see `Transfer-Encoding`)
@@ -1933,7 +1934,7 @@ async fn functional_protocol_validation_h1_single_header_size_limit_rejects_from
 
 #[ignore]
 #[tokio::test]
-async fn functional_protocol_validation_h3_connect_udp_rejected() {
+async fn functional_protocol_validation_h3_connect_udp_disabled_returns_501() {
     let echo_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let echo_port = echo_listener.local_addr().unwrap().port();
     let echo_task = tokio::spawn(start_header_echo_server_on(echo_listener));
@@ -1965,9 +1966,15 @@ async fn functional_protocol_validation_h3_connect_udp_rejected() {
         }
     };
 
-    assert_eq!(resp.status.as_u16(), 405, "body={}", resp.body_text());
+    // The CONNECT-UDP profile is a recognized Extended CONNECT protocol that
+    // this gateway implements but leaves OFF by default
+    // (`FERRUM_HTTP3_CONNECT_UDP_ENABLED`), so the refusal names the profile
+    // instead of the generic "CONNECT is not allowed". Registered-but-
+    // unimplemented protocols (`webtransport`) and bare CONNECT are still 405 —
+    // see `functional_http3_connect_udp_test.rs`.
+    assert_eq!(resp.status.as_u16(), 501, "body={}", resp.body_text());
     assert!(
-        resp.body_text().contains("CONNECT"),
+        resp.body_text().contains("CONNECT-UDP"),
         "unexpected body: {}",
         resp.body_text()
     );

@@ -1891,7 +1891,9 @@ async fn a_crash_looping_poller_still_expires_and_withdraws_during_restart_backo
 //
 // Real DNS latency is not controllable, so these tests block preparation at an
 // exact point instead, and run on a paused clock so the staleness deadline is
-// virtual time rather than seconds of real sleeping.
+// virtual time rather than seconds of real sleeping. Discovered targets in
+// this group are IP literals so the post-hold warmup cannot stall on the
+// network while virtual time races ahead.
 
 /// RAII wrapper: the hold is process-global, so it must not outlive its test.
 /// Drop releases *this* generation only — a stale holder must not clear or
@@ -1966,6 +1968,12 @@ fn lb_has_host(lb_cache: &LoadBalancerCache, upstream_id: &str, host: &str) -> b
 /// Effective staleness window for the tasks below is `max(5, 3 x poll)`.
 const BLOCKED_PREPARATION_POLL_SECONDS: u64 = 1;
 const BLOCKED_PREPARATION_MAX_STALE_SECONDS: u64 = 5;
+/// TEST-NET-1 literal used by paused-clock preparation tests. Publication
+/// preparation DNS-warms every discovered hostname after the test hold; a
+/// name lookup is real I/O and cannot complete while `start_paused` auto-
+/// advances virtual time, so hosted CI observed the post-release publication
+/// waits returning false in ~80ms. An IP takes the literal fast path.
+const PAUSED_PREPARATION_DISCOVERED_HOST: &str = "192.0.2.10";
 const BLOCKED_PREPARATION_STALE_DEADLINE: std::time::Duration =
     std::time::Duration::from_secs(BLOCKED_PREPARATION_MAX_STALE_SECONDS);
 
@@ -1985,7 +1993,7 @@ async fn expiry_withdraws_on_time_while_publication_preparation_is_blocked() {
     )]);
     let lb_cache = Arc::new(LoadBalancerCache::new(&config));
     let discoverer = Arc::new(ScriptedDiscoverer::new(vec![target(
-        "discovered.local",
+        PAUSED_PREPARATION_DISCOVERED_HOST,
         8080,
     )]));
 
@@ -2012,7 +2020,11 @@ async fn expiry_withdraws_on_time_while_publication_preparation_is_blocked() {
         "publication preparation was never reached"
     );
     assert!(
-        !lb_has_host(&lb_cache, "blocked-warmup", "discovered.local"),
+        !lb_has_host(
+            &lb_cache,
+            "blocked-warmup",
+            PAUSED_PREPARATION_DISCOVERED_HOST
+        ),
         "an unprepared snapshot must not already be routable"
     );
 
@@ -2063,8 +2075,14 @@ async fn expiry_withdraws_on_time_while_publication_preparation_is_blocked() {
     let released_at = tokio::time::Instant::now();
     hold.release_and_observe().await;
 
-    let republished =
-        wait_for_progress(|| lb_has_host(&lb_cache, "blocked-warmup", "discovered.local")).await;
+    let republished = wait_for_progress(|| {
+        lb_has_host(
+            &lb_cache,
+            "blocked-warmup",
+            PAUSED_PREPARATION_DISCOVERED_HOST,
+        )
+    })
+    .await;
     assert!(
         republished,
         "a later fresh poll must recover once preparation can complete"
@@ -2094,7 +2112,7 @@ async fn cancellation_stops_a_task_parked_in_publication_preparation() {
     let config = config_with(vec![upstream_with_sd("canceled-warmup", Vec::new(), None)]);
     let lb_cache = Arc::new(LoadBalancerCache::new(&config));
     let discoverer = Arc::new(ScriptedDiscoverer::new(vec![target(
-        "discovered.local",
+        PAUSED_PREPARATION_DISCOVERED_HOST,
         8080,
     )]));
 
@@ -2130,7 +2148,11 @@ async fn cancellation_stops_a_task_parked_in_publication_preparation() {
     );
 
     assert!(
-        !lb_has_host(&lb_cache, "canceled-warmup", "discovered.local"),
+        !lb_has_host(
+            &lb_cache,
+            "canceled-warmup",
+            PAUSED_PREPARATION_DISCOVERED_HOST,
+        ),
         "a canceled task must not publish the snapshot it was preparing"
     );
 }
@@ -2146,7 +2168,7 @@ async fn a_retain_policy_expiry_keeps_a_pending_publication_alive() {
     let config = config_with(vec![upstream_with_sd("retain-warmup", Vec::new(), None)]);
     let lb_cache = Arc::new(LoadBalancerCache::new(&config));
     let discoverer = Arc::new(ScriptedDiscoverer::new(vec![target(
-        "discovered.local",
+        PAUSED_PREPARATION_DISCOVERED_HOST,
         8080,
     )]));
 
@@ -2193,8 +2215,14 @@ async fn a_retain_policy_expiry_keeps_a_pending_publication_alive() {
 
     let released_at = tokio::time::Instant::now();
     hold.release_and_observe().await;
-    let published =
-        wait_for_progress(|| lb_has_host(&lb_cache, "retain-warmup", "discovered.local")).await;
+    let published = wait_for_progress(|| {
+        lb_has_host(
+            &lb_cache,
+            "retain-warmup",
+            PAUSED_PREPARATION_DISCOVERED_HOST,
+        )
+    })
+    .await;
     assert!(
         published,
         "the retained pending publication must complete once preparation is released"
