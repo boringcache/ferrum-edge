@@ -40,7 +40,7 @@ use crate::admin::{self, AdminState};
 use crate::config::EnvConfig;
 use crate::config::conf_file::resolve_ferrum_var;
 use crate::config::db_backend::NamespacedResourceId;
-use crate::config::env_config_macro::EnvValue;
+use crate::config::env_config::EnvValue;
 use crate::config::types::{
     BackendScheme, BackendTlsConfig, DispatchKind, GatewayConfig, HealthCheckConfig,
     LoadBalancerAlgorithm, MAX_BACKEND_TLS_SAN_ALLOW_LIST_ENTRIES,
