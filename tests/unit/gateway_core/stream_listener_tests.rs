@@ -3038,7 +3038,7 @@ async fn node_waypoint_udp_retract_a_keeps_shared_listener_and_b_route() {
     );
     assert_eq!(
         destinations_after,
-        vec!["10.96.0.11".parse().expect("ip b")],
+        vec!["10.96.0.11".parse::<IpAddr>().expect("ip b")],
         "only B's ClusterIP may remain after A is retracted"
     );
     assert_eq!(owners_after_table.len(), 1);
