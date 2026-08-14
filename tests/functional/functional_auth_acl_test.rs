@@ -2831,8 +2831,7 @@ async fn wait_until_hmac_v2_route_and_plugin_active(client: &reqwest::Client, ur
                  observation: activation deadline elapsed before any successful probe"
             );
         }
-        let attempt_deadline =
-            std::cmp::min(deadline, tokio::time::Instant::now() + PER_ATTEMPT);
+        let attempt_deadline = std::cmp::min(deadline, tokio::time::Instant::now() + PER_ATTEMPT);
         let last = match tokio::time::timeout_at(attempt_deadline, client.get(url).send()).await {
             Ok(Ok(resp)) => {
                 let status = resp.status().as_u16();
