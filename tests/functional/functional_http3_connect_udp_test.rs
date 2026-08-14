@@ -29,6 +29,12 @@
 //!   HTTP-200 trailers response
 //! - the concurrent-session limit
 //! - a live tunnel torn down by a SIGHUP reload that withdraws the destination
+//! - the shared authorization-lifetime contract over a live tunnel (issue
+//!   #3860): a continuously active tunnel reset at its credential's `exp`, the
+//!   same at the configured authenticated-stream maximum, a flow-control-stalled
+//!   client that still cannot outlive its credential, and an unauthenticated
+//!   tunnel left completely unaffected. Each asserts the bounded `stream_udp`
+//!   counter incremented exactly once on a freshly spawned gateway
 //!
 //! The client-side capsule codec in `tests/scaffolding/clients/http3.rs` is
 //! written independently of the gateway's, so these assert wire
@@ -36,7 +42,10 @@
 
 use std::time::Duration;
 
+use chrono::Utc;
 use ferrum_edge::config::EnvConfig;
+use jsonwebtoken::{EncodingKey, Header, encode};
+use serde_json::{Value, json};
 use tokio::net::{TcpListener, UdpSocket};
 
 use crate::common::{TestGateway, TrustedProjectedGateway, TrustedProjectedGatewayOptions};
@@ -999,5 +1008,415 @@ async fn functional_h3_connect_udp_refuses_spoofed_grpc_content_types_as_plain_4
         );
     }
 
+    gateway.shutdown();
+}
+
+// ---------------------------------------------------------------------------
+// Authorization lifetime over a live tunnel (issue #3860)
+//
+// The composition of the shared authorization-lifetime contract and this
+// transport: a CONNECT-UDP tunnel opened by an authenticated principal must not
+// outlive the credential that admitted it, and datagram activity — which keeps
+// the tunnel's own idle timer alive indefinitely — must never extend that
+// bound. Each of these runs on a FRESHLY SPAWNED gateway process, so the
+// bounded `stream_udp` counters start at zero and "exactly once" is assertable.
+//
+// The PRE-COMMITMENT arm (a deadline already elapsed when the handler runs, so
+// no session permit, DNS lookup, UDP socket, or 200 happens at all) is pinned
+// in `tests/unit/gateway_core/http3_connect_udp_tests.rs` instead: reaching it
+// live requires the deadline to elapse inside the window between authentication
+// and admission, which is not a deterministic thing to schedule against a real
+// binary.
+// ---------------------------------------------------------------------------
+
+/// Consumer identity and shared HMAC secret for the authenticated MASQUE route.
+const AUTH_CONSUMER: &str = "masque-alice";
+const AUTH_JWT_SECRET: &str = "masque-connect-udp-auth-lifetime-secret-2026";
+
+/// Seconds of credential validity granted to a tunnel.
+///
+/// `credential_deadline_from_unix_seconds` floors `exp - now` to whole seconds,
+/// so the effective monotonic deadline lands `TTL - 1 ..= TTL` after the
+/// request. Long enough to establish the tunnel and prove it carries traffic,
+/// short enough to keep the test quick.
+const AUTH_TOKEN_TTL_SECS: i64 = 6;
+
+/// Bounded grace allowed between the authorization deadline and the observed
+/// termination. Generous for a loaded CI runner, and far below the idle,
+/// session, and QUIC bounds these tests deliberately configure out of the way.
+const AUTH_TERMINATION_GRACE: Duration = Duration::from_secs(25);
+
+/// Mint a real HS256 JWT for [`AUTH_CONSUMER`] with an explicit TTL. The
+/// gateway's `jwt_auth` plugin validates it and publishes the authoritative
+/// credential deadline onto the request.
+fn mint_masque_token(ttl_secs: i64) -> String {
+    let now = Utc::now();
+    let claims = json!({
+        "sub": AUTH_CONSUMER,
+        "iat": now.timestamp(),
+        "exp": (now + chrono::Duration::seconds(ttl_secs)).timestamp(),
+    });
+    encode(
+        &Header::new(jsonwebtoken::Algorithm::HS256),
+        &claims,
+        &EncodingKey::from_secret(AUTH_JWT_SECRET.as_bytes()),
+    )
+    .expect("encode MASQUE consumer JWT")
+}
+
+/// [`masque_config`] behind `jwt_auth`, so a tunnel is opened by an
+/// authenticated principal rather than anonymously.
+fn masque_authenticated_config(target_port: u16) -> String {
+    let config = json!({
+        "version": "1",
+        "proxies": [{
+            "id": "masque",
+            "listen_path": MASQUE_PREFIX,
+            "backend_scheme": "http",
+            "backend_host": "127.0.0.1",
+            "backend_port": target_port,
+            "strip_listen_path": false,
+            "plugins": [{"plugin_config_id": "masque-jwt"}],
+        }],
+        "consumers": [{
+            "id": AUTH_CONSUMER,
+            "username": AUTH_CONSUMER,
+            "credentials": {"jwt": [{"secret": AUTH_JWT_SECRET}]},
+        }],
+        "upstreams": [],
+        "plugin_configs": [{
+            "id": "masque-jwt",
+            "plugin_name": "jwt_auth",
+            "scope": "proxy",
+            "proxy_id": "masque",
+            "enabled": true,
+            "config": {
+                "token_lookup": "header:Authorization",
+                "consumer_claim_field": "sub",
+            },
+        }],
+    });
+    serde_yaml::to_string(&config).expect("yaml serialize")
+}
+
+/// Environment that leaves the authorization lifetime as the ONLY bound that
+/// can end a live tunnel: the idle timer, the QUIC idle timer, and the session
+/// limit are all pushed far beyond the whole test.
+fn auth_lifetime_env(max_lifetime_seconds: &'static str) -> Vec<(&'static str, &'static str)> {
+    vec![
+        ("FERRUM_HTTP3_CONNECT_UDP_ENABLED", "true"),
+        (
+            "FERRUM_AUTHENTICATED_STREAM_MAX_LIFETIME_SECONDS",
+            max_lifetime_seconds,
+        ),
+        ("FERRUM_HTTP3_CONNECT_UDP_IDLE_TIMEOUT_SECONDS", "600"),
+    ]
+}
+
+/// Open an authenticated CONNECT-UDP tunnel, tolerating a QUIC listener that is
+/// not up yet. Mirrors [`open_tunnel`] but carries the bearer credential.
+async fn open_authenticated_connect_udp_tunnel(
+    client: &Http3Client,
+    url: &str,
+    token: &str,
+) -> Http3ConnectUdp {
+    let authorization = format!("Bearer {token}");
+    let mut last_error = None;
+    let deadline = std::time::Instant::now() + Duration::from_secs(40);
+    loop {
+        match client
+            .connect_udp_with_headers(url, &[("authorization", authorization.as_str())])
+            .await
+        {
+            Ok(tunnel) => return tunnel,
+            Err(error) if std::time::Instant::now() < deadline => {
+                last_error = Some(error.to_string());
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+            Err(error) => panic!(
+                "authenticated CONNECT-UDP request never completed; last startup \
+                 error={last_error:?}; final error={error}"
+            ),
+        }
+    }
+}
+
+/// Read one bounded authorization-lifetime counter for the `stream_udp` family
+/// from the authenticated `GET /metrics/runtime` snapshot.
+///
+/// `class` is `credential_expired` or `authenticated_stream_max_lifetime` — the
+/// complete closed set. There is no other label dimension to read.
+async fn stream_udp_terminations(gateway: &TestGateway, class: &str) -> u64 {
+    let http = reqwest::Client::builder()
+        .timeout(Duration::from_secs(10))
+        .build()
+        .expect("build admin client");
+    let body: Value = http
+        .get(gateway.admin_url("/metrics/runtime"))
+        .header("Authorization", gateway.auth_header())
+        .send()
+        .await
+        .expect("GET /metrics/runtime")
+        .json()
+        .await
+        .expect("runtime metrics must be JSON");
+    body["authorization_lifetime"][class]["stream_udp"]
+        .as_u64()
+        .unwrap_or_else(|| {
+            panic!(
+                "runtime snapshot must expose authorization_lifetime.{class}.stream_udp; \
+                 got {body:#?}"
+            )
+        })
+}
+
+/// Poll until the counter reaches `expected`, then prove it does not go past
+/// it. The runtime snapshot is cached (`FERRUM_METRICS_RUNTIME_CACHE_MS`), so a
+/// second read after the cache window is what shows the terminal accounting
+/// fired once for the tunnel rather than once per relayed datagram.
+async fn assert_exactly_one_stream_udp_termination(gateway: &TestGateway, class: &str) {
+    let expected = 1u64;
+    let deadline = std::time::Instant::now() + AUTH_TERMINATION_GRACE;
+    let observed = loop {
+        let value = stream_udp_terminations(gateway, class).await;
+        if value >= expected || std::time::Instant::now() >= deadline {
+            break value;
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    };
+    assert_eq!(
+        observed, expected,
+        "expected exactly {expected} stream_udp {class} termination(s) on a freshly spawned \
+         gateway; observed {observed}"
+    );
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    assert_eq!(
+        stream_udp_terminations(gateway, class).await,
+        expected,
+        "{class} must not keep incrementing after the tunnel ended"
+    );
+}
+
+/// Relay datagrams continuously for `window`, returning how many round trips
+/// completed. Stops early if the gateway ends the tunnel.
+///
+/// This traffic is the point of the test, not scaffolding: it keeps the RFC
+/// 9298 idle timer permanently refreshed, so if activity could also refresh the
+/// authorization deadline the tunnel would survive well past the grace.
+async fn relay_datagrams_for(tunnel: &mut Http3ConnectUdp, window: Duration) -> usize {
+    let until = std::time::Instant::now() + window;
+    let mut round_trips = 0usize;
+    while std::time::Instant::now() < until {
+        if tunnel.send_datagram(b"keepalive").await.is_err() {
+            break;
+        }
+        if tunnel.recv_datagram(Duration::from_secs(2)).await.is_err() {
+            break;
+        }
+        round_trips += 1;
+        tokio::time::sleep(Duration::from_millis(150)).await;
+    }
+    round_trips
+}
+
+#[ignore]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn functional_h3_connect_udp_credential_expiry_terminates_a_continuously_active_tunnel() {
+    let echo = UdpEcho::spawn().await;
+    // The fallback maximum is an hour, so the credential's own `exp` is
+    // provably the bound AND the reported class.
+    let yaml = masque_authenticated_config(echo.port);
+    let env = auth_lifetime_env("3600");
+    let (mut gateway, https_port) = start_masque_gateway(yaml, &env).await;
+
+    let client = Http3Client::insecure().expect("H3 client");
+    let url = tunnel_url(https_port, "127.0.0.1", echo.port);
+    let token = mint_masque_token(AUTH_TOKEN_TTL_SECS);
+    let mut tunnel = open_authenticated_connect_udp_tunnel(&client, &url, &token).await;
+
+    assert_eq!(
+        tunnel.status.as_u16(),
+        200,
+        "an authenticated RFC 9298 tunnel must still be 200"
+    );
+
+    // Bidirectional UDP works while the credential is live.
+    tunnel
+        .send_datagram(b"before-expiry")
+        .await
+        .expect("send datagram before expiry");
+    assert_eq!(
+        tunnel
+            .recv_datagram(Duration::from_secs(10))
+            .await
+            .expect("receive echoed datagram before expiry"),
+        b"before-expiry",
+        "the tunnel must carry UDP payloads before the credential expires"
+    );
+
+    // Traffic right up to (and past) the credential deadline.
+    let window = Duration::from_secs(AUTH_TOKEN_TTL_SECS as u64 + 2);
+    let round_trips = relay_datagrams_for(&mut tunnel, window).await;
+    assert!(
+        round_trips > 0,
+        "the tunnel must have carried traffic before the credential expired"
+    );
+
+    // After the 200 the only honest terminal is a reset: a clean FIN would
+    // present a successfully completed capsule stream at the exact moment the
+    // gateway took the tunnel away from an unauthorized principal.
+    tunnel
+        .expect_stream_reset(AUTH_TERMINATION_GRACE)
+        .await
+        .expect("the tunnel must reset at the credential deadline, never clean-FIN");
+
+    assert_exactly_one_stream_udp_termination(&gateway, "credential_expired").await;
+    assert_eq!(
+        stream_udp_terminations(&gateway, "authenticated_stream_max_lifetime").await,
+        0,
+        "the credential's own expiry — not the fallback maximum — must be the reported class"
+    );
+
+    gateway.shutdown();
+}
+
+#[ignore]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn functional_h3_connect_udp_configured_maximum_lifetime_terminates_an_active_tunnel() {
+    let echo = UdpEcho::spawn().await;
+    // The credential is valid for an hour, so the only remaining bound is the
+    // finite authenticated-stream maximum. A credential with no authoritative
+    // expiry at all reaches the same arm by the same route: `earliest` selects
+    // the maximum whenever it is the earlier instant.
+    let yaml = masque_authenticated_config(echo.port);
+    let env = auth_lifetime_env("6");
+    let (mut gateway, https_port) = start_masque_gateway(yaml, &env).await;
+
+    let client = Http3Client::insecure().expect("H3 client");
+    let url = tunnel_url(https_port, "127.0.0.1", echo.port);
+    let token = mint_masque_token(3_600);
+    let mut tunnel = open_authenticated_connect_udp_tunnel(&client, &url, &token).await;
+    assert_eq!(tunnel.status.as_u16(), 200);
+
+    let round_trips = relay_datagrams_for(&mut tunnel, Duration::from_secs(8)).await;
+    assert!(
+        round_trips > 0,
+        "the tunnel must have carried traffic before the maximum lifetime elapsed"
+    );
+
+    tunnel
+        .expect_stream_reset(AUTH_TERMINATION_GRACE)
+        .await
+        .expect("the tunnel must reset at the configured maximum lifetime, never clean-FIN");
+
+    assert_exactly_one_stream_udp_termination(&gateway, "authenticated_stream_max_lifetime").await;
+    assert_eq!(
+        stream_udp_terminations(&gateway, "credential_expired").await,
+        0,
+        "a live credential must not be reported as expired"
+    );
+
+    gateway.shutdown();
+}
+
+#[ignore]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn functional_h3_connect_udp_flow_control_stalled_client_cannot_outlive_its_credential() {
+    let echo = UdpEcho::spawn().await;
+    let yaml = masque_authenticated_config(echo.port);
+    let env = auth_lifetime_env("3600");
+    let (mut gateway, https_port) = start_masque_gateway(yaml, &env).await;
+
+    // A deliberately tiny per-stream receive window. The echo target returns
+    // every payload, so a client that stops reading parks the gateway's
+    // client-bound relay inside `send_data` on QUIC flow control — the exact
+    // state in which that relay can never return to its own `select!` and can
+    // never consume a supervisor close command.
+    let client = Http3Client::insecure_with_stream_receive_window(16 * 1024).expect("H3 client");
+    let url = tunnel_url(https_port, "127.0.0.1", echo.port);
+    let token = mint_masque_token(AUTH_TOKEN_TTL_SECS);
+    let mut tunnel = open_authenticated_connect_udp_tunnel(&client, &url, &token).await;
+    assert_eq!(tunnel.status.as_u16(), 200);
+
+    // Push far more back through the tunnel than the client's window can hold,
+    // then never read a byte of it.
+    let payload = vec![0xa5u8; 60_000];
+    for _ in 0..40 {
+        if tunnel.send_datagram(&payload).await.is_err() {
+            break;
+        }
+    }
+
+    // The supervisor's own timer must fire on time regardless, and teardown
+    // must abort and join the stalled relay within its bounded grace. The
+    // counter is the observation that does not require reading the stream —
+    // reading would relieve the very flow-control stall under test.
+    assert_exactly_one_stream_udp_termination(&gateway, "credential_expired").await;
+
+    // Only now, once the termination is recorded, read: the stalled tunnel must
+    // still have been reset rather than presented as a completed capsule
+    // stream.
+    tunnel
+        .expect_stream_reset(AUTH_TERMINATION_GRACE)
+        .await
+        .expect("a flow-control-stalled tunnel must still reset at the credential deadline");
+
+    gateway.shutdown();
+}
+
+#[ignore]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn functional_h3_connect_udp_unauthenticated_tunnels_are_untouched_by_the_contract() {
+    let echo = UdpEcho::spawn().await;
+    // The same aggressive maximum the authenticated tunnel above dies to. No
+    // principal is admitted on this route, so this contract does not bound it
+    // and every pre-existing RFC 9298 bound applies unchanged.
+    let yaml = masque_config(echo.port);
+    let env = auth_lifetime_env("3");
+    let (mut gateway, https_port) = start_masque_gateway(yaml, &env).await;
+
+    let client = Http3Client::insecure().expect("H3 client");
+    let url = tunnel_url(https_port, "127.0.0.1", echo.port);
+    let mut tunnel = open_tunnel(&client, &url).await;
+    assert_eq!(tunnel.status.as_u16(), 200);
+
+    // Well past the configured maximum, with continuous traffic throughout.
+    // `relay_datagrams_for` stops the moment the gateway ends the tunnel, so
+    // the ELAPSED window — not the round-trip count — is what proves the
+    // authenticated-stream maximum never applied here.
+    let started = std::time::Instant::now();
+    let round_trips = relay_datagrams_for(&mut tunnel, Duration::from_secs(9)).await;
+    assert!(
+        started.elapsed() >= Duration::from_secs(9),
+        "an unauthenticated tunnel must keep relaying past the authenticated-stream \
+         maximum, but it stopped after {:?} ({round_trips} round trips)",
+        started.elapsed()
+    );
+
+    // Still usable after the window an authenticated tunnel would have died in.
+    tunnel
+        .send_datagram(b"still-open")
+        .await
+        .expect("send datagram after the authenticated-stream maximum");
+    assert_eq!(
+        tunnel
+            .recv_datagram(Duration::from_secs(10))
+            .await
+            .expect("receive echoed datagram after the authenticated-stream maximum"),
+        b"still-open"
+    );
+
+    assert_eq!(
+        stream_udp_terminations(&gateway, "credential_expired").await,
+        0,
+        "an unauthenticated tunnel must never record a credential termination"
+    );
+    assert_eq!(
+        stream_udp_terminations(&gateway, "authenticated_stream_max_lifetime").await,
+        0,
+        "an unauthenticated tunnel must never record a maximum-lifetime termination"
+    );
+
+    tunnel.close().await;
     gateway.shutdown();
 }

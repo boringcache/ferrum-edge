@@ -8,6 +8,9 @@
 //! [`CapsuleDecoder`], and frames target datagrams with
 //! [`encode_udp_datagram_capsule`].
 
+use ferrum_edge::_test_support::{
+    request_received_at_for_test, set_request_credential_deadline_for_test,
+};
 use ferrum_edge::config::types::{GatewayConfig, HttpFlavor, Proxy, Upstream};
 use ferrum_edge::http3::connect_udp::{
     AdmittedConnectUdpDestination, CONNECT_UDP_MAX_PAYLOAD_BYTES,
@@ -18,10 +21,15 @@ use ferrum_edge::http3::connect_udp::{
     classify_relay_join, classify_send_half_teardown, classify_udp_recv_error,
     classify_udp_send_error, destination_is_configured, dns_override_pin_unchanged,
     encode_udp_datagram_capsule, first_forbidden_capsule_protocol_field, parse_connect_udp_target,
-    resolve_send_half_close_command, strip_forbidden_capsule_protocol_response_fields,
-    validate_connect_udp_request_shape,
+    reconcile_authorization_teardown, resolve_send_half_close_command,
+    strip_forbidden_capsule_protocol_response_fields, validate_connect_udp_request_shape,
 };
 use ferrum_edge::load_balancer::{LoadBalancerCache, LoadBalancerCacheInner};
+use ferrum_edge::plugins::RequestContext;
+use ferrum_edge::proxy::auth_lifetime::{
+    StreamAuthProtocolFamily, StreamAuthTermination, StreamAuthTerminationLatch, counters,
+    effective_request_auth_deadline, expired_authorization,
+};
 use ferrum_edge::proxy::backend_dispatch::detect_http_flavor;
 use ferrum_edge::proxy::hbone_pool::HBONE_TARGET_TAG;
 use ferrum_edge::proxy::mesh_mtls_pool::{MESH_CROSS_CLUSTER_TAG, MESH_MTLS_TARGET_TAG};
@@ -1419,7 +1427,7 @@ fn recv_wouldblock_awaits_readability_and_emsgsize_remains_a_datagram_drop() {
 
 /// Every session end, listed once. A new arm that is not classified here fails
 /// this module rather than silently defaulting to a clean FIN somewhere.
-const EVERY_SESSION_END: [SessionEnd; 9] = [
+const EVERY_SESSION_END: [SessionEnd; 11] = [
     SessionEnd::ClientClosed,
     SessionEnd::RelayTaskFailed,
     SessionEnd::TargetSocketUnusable,
@@ -1429,6 +1437,10 @@ const EVERY_SESSION_END: [SessionEnd; 9] = [
     SessionEnd::RouteTargetPinChanged,
     SessionEnd::RouteAuthorizationUnreconstructable,
     SessionEnd::CapsuleProtocolError,
+    // Both bounded authorization-lifetime classes (issue #3860). Listing them
+    // separately is deliberate: each must independently be a non-clean close.
+    SessionEnd::AuthorizationExpired(StreamAuthTermination::CredentialExpired),
+    SessionEnd::AuthorizationExpired(StreamAuthTermination::AuthenticatedStreamMaxLifetime),
 ];
 
 #[test]
@@ -1469,6 +1481,7 @@ fn a_capsule_fault_still_closes_with_the_rfc_9114_message_error() {
             SessionEnd::TargetSocketUnusable
                 | SessionEnd::CapsuleProtocolError
                 | SessionEnd::RelayTaskFailed
+                | SessionEnd::AuthorizationExpired(_)
         );
         assert_eq!(
             end.close_kind() != StreamCloseKind::Clean,
@@ -1477,6 +1490,286 @@ fn a_capsule_fault_still_closes_with_the_rfc_9114_message_error() {
             end.as_str()
         );
     }
+}
+
+// ---------------------------------------------------------------------------
+// Authorization lifetime (issue #3860)
+//
+// A CONNECT-UDP tunnel is a long-lived native H3 relay that owns the request
+// stream and the UDP socket directly, so it cannot inherit the shared
+// authorization-lifetime contract through the ordinary `ProxyBody` wrapper.
+// These pin the pieces the handler plumbs explicitly: the derivation, the
+// pre-commitment predicate, the non-clean post-commitment terminal, once-only
+// attribution under the bounded `StreamUdp` family, and the teardown
+// reconciliation a flow-control-stalled client forces.
+// ---------------------------------------------------------------------------
+
+const CONNECT_UDP_MAX_LIFETIME: u64 = 3_600;
+
+fn authenticated_connect_udp_ctx() -> RequestContext {
+    let mut ctx = RequestContext::new(
+        "127.0.0.1".to_string(),
+        "CONNECT".to_string(),
+        "/.well-known/masque/udp/dns.example/853/".to_string(),
+    );
+    // Any admitted principal. The contract keys on "a principal was accepted",
+    // not on which mechanism accepted it.
+    ctx.authenticated_identity = Some("spiffe://cluster.local/ns/ferrum/sa/masque".to_string());
+    ctx
+}
+
+#[tokio::test]
+async fn an_unauthenticated_connect_udp_tunnel_keeps_its_pre_existing_bounds() {
+    // No principal was admitted, so there is no authorization lifetime to
+    // enforce. The handler derives `None`, the supervisor arm can never fire,
+    // and every RFC 9298 bound the tunnel already had is untouched.
+    let ctx = RequestContext::new(
+        "127.0.0.1".to_string(),
+        "CONNECT".to_string(),
+        "/.well-known/masque/udp/dns.example/853/".to_string(),
+    );
+    let plan = effective_request_auth_deadline(&ctx, CONNECT_UDP_MAX_LIFETIME);
+    assert!(
+        plan.is_none(),
+        "an unauthenticated CONNECT-UDP request must not be bounded by this contract"
+    );
+    assert!(
+        expired_authorization(plan).is_none(),
+        "the pre-commitment gate must never refuse an unauthenticated tunnel"
+    );
+}
+
+#[tokio::test]
+async fn a_short_lived_credential_bounds_the_tunnel_before_the_configured_maximum() {
+    // The JWT `exp` / mTLS `notAfter` shape: authentication published an
+    // authoritative deadline well inside the configured maximum, so the
+    // credential's own expiry is the bound AND the reported class.
+    let mut ctx = authenticated_connect_udp_ctx();
+    let received_at = request_received_at_for_test(&ctx);
+    let credential_at = received_at + std::time::Duration::from_secs(30);
+    set_request_credential_deadline_for_test(&mut ctx, Some(credential_at));
+
+    let plan = effective_request_auth_deadline(&ctx, CONNECT_UDP_MAX_LIFETIME)
+        .expect("an admitted principal must produce a plan");
+    assert_eq!(plan.at, credential_at);
+    assert_eq!(plan.termination, StreamAuthTermination::CredentialExpired);
+}
+
+#[tokio::test]
+async fn a_credential_with_no_authoritative_expiry_still_gets_a_finite_tunnel() {
+    // A credential that carries no expiry does not buy an indefinite tunnel:
+    // the finite configured maximum bounds it, anchored at request RECEIPT so a
+    // slow admission cannot buy extra authorized lifetime.
+    let ctx = authenticated_connect_udp_ctx();
+    let received_at = request_received_at_for_test(&ctx);
+
+    let plan = effective_request_auth_deadline(&ctx, 45)
+        .expect("an admitted principal must produce a plan");
+    assert_eq!(plan.at, received_at + std::time::Duration::from_secs(45));
+    assert_eq!(
+        plan.termination,
+        StreamAuthTermination::AuthenticatedStreamMaxLifetime
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn relayed_datagrams_can_never_move_the_tunnel_deadline() {
+    // The supervisor arms ONE `sleep_until` on the derived instant and never
+    // rearms it. The derivation itself is the proof that nothing later can
+    // move that instant: it is anchored to request receipt and to the accepted
+    // credential, both fixed before the tunnel existed, so re-deriving it after
+    // an arbitrary amount of relayed traffic yields the identical absolute
+    // instant rather than a refreshed one.
+    let mut ctx = authenticated_connect_udp_ctx();
+    let received_at = request_received_at_for_test(&ctx);
+    set_request_credential_deadline_for_test(
+        &mut ctx,
+        Some(received_at + std::time::Duration::from_secs(20)),
+    );
+    let anchored = effective_request_auth_deadline(&ctx, CONNECT_UDP_MAX_LIFETIME)
+        .expect("an admitted principal must produce a plan")
+        .at;
+
+    // Time passes and datagrams cross the tunnel in both directions.
+    tokio::time::advance(std::time::Duration::from_secs(15)).await;
+
+    let after_traffic = effective_request_auth_deadline(&ctx, CONNECT_UDP_MAX_LIFETIME)
+        .expect("an admitted principal must produce a plan")
+        .at;
+    assert_eq!(
+        after_traffic, anchored,
+        "activity must never extend an admitted principal's authorization lifetime"
+    );
+
+    // And once that absolute instant has passed, it stays passed.
+    tokio::time::advance(std::time::Duration::from_secs(10)).await;
+    let elapsed_plan = effective_request_auth_deadline(&ctx, CONNECT_UDP_MAX_LIFETIME);
+    assert_eq!(
+        expired_authorization(elapsed_plan),
+        Some(StreamAuthTermination::CredentialExpired)
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn an_already_elapsed_deadline_is_refused_before_any_tunnel_resource_exists() {
+    // The pre-commitment predicate the handler runs ahead of the session
+    // permit, DNS, the UDP socket, and the 200. A live plan must NOT refuse
+    // (otherwise every authenticated tunnel would be rejected); an elapsed one
+    // must, and must name the bounded class.
+    let mut ctx = authenticated_connect_udp_ctx();
+    let received_at = request_received_at_for_test(&ctx);
+    set_request_credential_deadline_for_test(
+        &mut ctx,
+        Some(received_at + std::time::Duration::from_secs(30)),
+    );
+    let live_plan = effective_request_auth_deadline(&ctx, CONNECT_UDP_MAX_LIFETIME);
+    assert!(
+        expired_authorization(live_plan).is_none(),
+        "a live credential must open the tunnel"
+    );
+
+    tokio::time::advance(std::time::Duration::from_secs(31)).await;
+    let elapsed_plan = effective_request_auth_deadline(&ctx, CONNECT_UDP_MAX_LIFETIME);
+    assert_eq!(
+        expired_authorization(elapsed_plan),
+        Some(StreamAuthTermination::CredentialExpired),
+        "an expired credential must be refused before the tunnel commits"
+    );
+}
+
+#[test]
+fn an_authorization_expiry_never_presents_a_completed_capsule_stream() {
+    // Post-commitment: the 200 is on the wire and capsule DATA may already have
+    // flowed, so the only honest terminal is a reset. A clean FIN would tell
+    // the client its tunnel ended normally at exactly the moment the gateway
+    // took it away from an unauthorized principal.
+    for termination in [
+        StreamAuthTermination::CredentialExpired,
+        StreamAuthTermination::AuthenticatedStreamMaxLifetime,
+    ] {
+        let end = SessionEnd::AuthorizationExpired(termination);
+        assert_eq!(
+            end.close_kind(),
+            StreamCloseKind::InternalError,
+            "{} must reset the capsule stream",
+            termination.as_str()
+        );
+        assert_ne!(end.close_kind(), StreamCloseKind::Clean);
+        // The reason token is the SHARED compiled-in literal, so the session
+        // log, the counter, and the `authorization.termination_reason`
+        // transaction-summary metadata all name the same closed set.
+        assert_eq!(end.as_str(), termination.as_str());
+    }
+    assert_eq!(
+        SessionEnd::AuthorizationExpired(StreamAuthTermination::CredentialExpired).as_str(),
+        "credential_expired"
+    );
+    assert_eq!(
+        SessionEnd::AuthorizationExpired(StreamAuthTermination::AuthenticatedStreamMaxLifetime)
+            .as_str(),
+        "authenticated_stream_max_lifetime"
+    );
+}
+
+#[test]
+fn a_connect_udp_expiry_is_attributed_once_under_the_bounded_stream_udp_family() {
+    // The supervisor's expiry arm and any other authorization exit on the same
+    // request share ONE latch, so a race between them records exactly one
+    // correctly attributed counter rather than two.
+    let latch = StreamAuthTerminationLatch::default();
+    assert!(
+        latch.record_once(
+            StreamAuthTermination::CredentialExpired,
+            StreamAuthProtocolFamily::StreamUdp,
+        ),
+        "the first authorization exit owns the termination"
+    );
+    assert!(
+        !latch.record_once(
+            StreamAuthTermination::AuthenticatedStreamMaxLifetime,
+            StreamAuthProtocolFamily::StreamUdp,
+        ),
+        "a concurrent exit must observe the class, not count a second one"
+    );
+    assert_eq!(
+        latch.observed(),
+        Some(StreamAuthTermination::CredentialExpired),
+        "the winner's class is the one reported"
+    );
+
+    // The family is the existing closed one, deliberately reused rather than
+    // adding a `connect_udp` series: no route, target, or credential label is
+    // created by this transport.
+    assert_eq!(StreamAuthProtocolFamily::StreamUdp.as_str(), "stream_udp");
+    let snapshot = counters();
+    let max_lifetime_families = &snapshot.authenticated_stream_max_lifetime;
+    assert!(snapshot.credential_expired.contains_key("stream_udp"));
+    assert!(max_lifetime_families.contains_key("stream_udp"));
+    assert!(
+        !snapshot.credential_expired.contains_key("connect_udp"),
+        "CONNECT-UDP must not publish a new protocol family"
+    );
+}
+
+#[test]
+fn a_flow_control_stalled_client_cannot_relabel_its_own_expiry_as_a_gateway_fault() {
+    // A client-bound relay parked in QUIC send flow control never returns to
+    // its `select!`, so it cannot consume the supervisor's close command and is
+    // aborted after CLOSE_GRACE — which is how teardown stays bounded. That
+    // abort is the DESIGNED path for an authorization expiry, and the abort
+    // itself resets the stream, so the outcome keeps its own class instead of
+    // being demoted to an internal relay failure the gateway never suffered.
+    for termination in [
+        StreamAuthTermination::CredentialExpired,
+        StreamAuthTermination::AuthenticatedStreamMaxLifetime,
+    ] {
+        let supervisor = SessionEnd::AuthorizationExpired(termination);
+        let reported = reconcile_authorization_teardown(
+            supervisor,
+            classify_send_half_teardown(SendHalfTeardownJoin::Cancelled),
+        );
+        assert_eq!(reported, supervisor);
+        assert_eq!(
+            reported.close_kind(),
+            StreamCloseKind::InternalError,
+            "the terminal is still non-clean"
+        );
+    }
+}
+
+#[test]
+fn only_an_authorization_expiry_survives_an_unapplied_send_half_close() {
+    // The substitution above is narrow. Every other supervisor verdict whose
+    // close never landed stays `RelayTaskFailed`, because the client did not
+    // see the FIN or reset that verdict implied.
+    for supervisor in [
+        SessionEnd::Idle,
+        SessionEnd::Draining,
+        SessionEnd::RouteWithdrawn,
+        SessionEnd::RouteTargetPinChanged,
+        SessionEnd::RouteAuthorizationUnreconstructable,
+        SessionEnd::ClientClosed,
+        SessionEnd::CapsuleProtocolError,
+        SessionEnd::TargetSocketUnusable,
+    ] {
+        assert_eq!(
+            reconcile_authorization_teardown(supervisor, SessionEnd::RelayTaskFailed),
+            SessionEnd::RelayTaskFailed,
+            "{} must not survive a close the client never saw",
+            supervisor.as_str()
+        );
+    }
+    // And the substitution never overrides a send half that DID apply a close.
+    // A relay that reached its own terminal outcome before the supervisor's
+    // command arrived is authoritative about what the client saw, expiry or
+    // not; only an unapplied close is reconciled.
+    let expiry = SessionEnd::AuthorizationExpired(StreamAuthTermination::CredentialExpired);
+    let completed = SendHalfTeardownJoin::Completed(SessionEnd::ClientClosed);
+    assert_eq!(
+        reconcile_authorization_teardown(expiry, classify_send_half_teardown(completed)),
+        SessionEnd::ClientClosed,
+        "a COMPLETED send-half join is authoritative; only an unapplied close is reconciled"
+    );
 }
 
 #[tokio::test]

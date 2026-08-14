@@ -957,6 +957,49 @@ the lookup instead of becoming an unscreened dial.
 | DATAGRAM capsule length | payload ceiling + 8 bytes of Context ID slack |
 | Unknown capsule length | unbounded on the wire; zero bytes retained (streaming skip) |
 | Buffered partial capsule | the decoder's documented hard ceiling, twice one maximum capsule plus header |
+| Authorization lifetime | for an **authenticated** tunnel, the earlier of the admitted credential's own expiry and `FERRUM_AUTHENTICATED_STREAM_MAX_LIFETIME_SECONDS` (below) |
+
+#### Authorization lifetime of an authenticated tunnel
+
+A CONNECT-UDP tunnel opened by an **authenticated** principal is bounded by the
+shared, protocol-neutral authorization lifetime that governs every other
+admitted stream (see `FERRUM_AUTHENTICATED_STREAM_MAX_LIFETIME_SECONDS` in
+[configuration.md](configuration.md)). Without it, the tunnel's own idle timer
+would be refreshed by every relayed datagram, so a client holding a short-TTL
+JWT or an mTLS certificate near `notAfter` could keep a privileged UDP tunnel
+for the lifetime of the QUIC connection rather than for the lifetime of the
+authorization that admitted it.
+
+The effective deadline is the **earlier** of the accepted credential's own
+authoritative expiry and the configured maximum, and it is anchored once, at
+the request-receipt instant, before the tunnel exists:
+
+- **Before commitment.** The deadline is derived before the session permit, the
+  DNS lookup, the UDP socket, and the `200`. A deadline that has already
+  elapsed at that point is a fixed, redacted authorization refusal — the same
+  terminal every other protocol emits pre-commitment — and no session permit is
+  consumed, no address is resolved, and no UDP socket is created or connected.
+- **After commitment.** The relay supervisor arms one exact
+  `sleep_until(deadline)`, biased ahead of its other arms so an expiry that
+  races the idle tick, a route withdrawal, a drain, or a relay halt is the
+  outcome that is reported. Relayed datagrams in either direction can neither
+  refresh nor recompute it.
+- **Terminal shape.** The tunnel ends by **resetting** the capsule stream
+  (`H3_INTERNAL_ERROR`), never by a clean FIN: a client must be able to tell an
+  authorization termination from a tunnel that ran to completion.
+- **Teardown.** A client that stops reading parks the client-bound relay in QUIC
+  send flow control, where it cannot observe the supervisor's close command at
+  all. The existing bounded close grace then aborts and joins both relay tasks,
+  so the socket, session permit, and connection guard are released on time and
+  the abort itself resets the stream.
+- **Accounting.** Exactly one termination is recorded, through the request's
+  shared once-only latch, on the fixed-cardinality `authorization_lifetime`
+  counters under the existing closed `stream_udp` protocol family. No route,
+  target, or credential label is created, and no new family is published.
+
+An **unauthenticated** tunnel admitted no principal, so it has no authorization
+lifetime: no timer is registered for it and every bound above applies exactly as
+before.
 
 #### The tunnel idle timeout and the QUIC connection idle timeout
 

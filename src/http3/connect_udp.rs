@@ -65,6 +65,7 @@
 //! | Unknown capsule length | unbounded on the wire, zero bytes retained (streaming skip) |
 //! | Buffered partial capsule | at most [`CapsuleDecoder::feed_limit`] × 2 (the decoder's documented hard ceiling), reachable when one chunk completes a partial capsule and opens the next |
 //! | Target | must be a configured upstream destination of the matched proxy |
+//! | Authorization lifetime | the admitted credential's own expiry, or `FERRUM_AUTHENTICATED_STREAM_MAX_LIFETIME_SECONDS`, whichever is earlier (authenticated tunnels only) |
 //!
 //! There is no *queue* between the two directions: the client-bound relay
 //! awaits `send_data` (QUIC stream flow control is the backpressure) and the
@@ -107,6 +108,40 @@
 //! fixed to the address admission resolved, so a route that now maps this
 //! destination somewhere else can only be honoured by ending the session — the
 //! established pin is never silently kept.
+//!
+//! # Authorization lifetime (issue #3860)
+//!
+//! A tunnel opened by an authenticated principal is bounded by that principal's
+//! authorization lifetime, through the shared protocol-neutral contract in
+//! [`crate::proxy::auth_lifetime`] — the same one the H1/H2/H3 body relays, the
+//! native gRPC paths, and the TCP/UDP stream proxies use. CONNECT-UDP cannot
+//! inherit it through the ordinary `ProxyBody` wrapper, because after the 200
+//! this module owns the bidirectional H3 stream and writes capsule DATA
+//! directly, so the deadline is plumbed explicitly:
+//!
+//! * the effective deadline (the earlier of the credential's own expiry and
+//!   `FERRUM_AUTHENTICATED_STREAM_MAX_LIFETIME_SECONDS`) is derived ONCE from
+//!   the accepted `RequestContext`, before the session permit, DNS, the tunnel
+//!   socket, or the 200;
+//! * a deadline that has already elapsed at that point is a fixed, redacted
+//!   pre-commitment refusal — no permit is consumed, no address is resolved, no
+//!   UDP socket is created, and no tunnel is committed;
+//! * a live tunnel is supervised by an EXACT `sleep_until` on that absolute
+//!   instant, biased ahead of every other supervisor arm. Datagram activity in
+//!   either direction never refreshes or recomputes it, and it is deliberately
+//!   not folded into the one-second liveness ticker;
+//! * expiry after the 200 is [`SessionEnd::AuthorizationExpired`], which resets
+//!   the capsule stream rather than presenting a completed tunnel, and is
+//!   counted exactly once through the request's shared termination latch under
+//!   the bounded [`crate::proxy::auth_lifetime::StreamAuthProtocolFamily::StreamUdp`]
+//!   family — no route, target, or credential label is created;
+//! * teardown stays bounded even when the client-bound relay is parked in QUIC
+//!   send flow control: the existing `CLOSE_GRACE` abort-and-join is what
+//!   releases the socket, permit, and connection guard on time.
+//!
+//! An UNAUTHENTICATED tunnel admitted no principal, so it has no authorization
+//! lifetime to bound and is unaffected: no timer is registered and every
+//! pre-existing RFC 9298 bound applies exactly as before.
 
 use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
@@ -1230,6 +1265,13 @@ pub enum SessionEnd {
     RouteAuthorizationUnreconstructable,
     /// RFC 9297 capsule-stream fault: a malformed HTTP message.
     CapsuleProtocolError,
+    /// The admitted principal's authorization lifetime elapsed (issue #3860).
+    ///
+    /// The bounded class is the shared
+    /// [`crate::proxy::auth_lifetime::StreamAuthTermination`], so this outcome
+    /// names the same closed set every other transport reports and carries no
+    /// credential, claim, certificate field, or expiry value.
+    AuthorizationExpired(crate::proxy::auth_lifetime::StreamAuthTermination),
 }
 
 impl SessionEnd {
@@ -1245,6 +1287,11 @@ impl SessionEnd {
             Self::RouteTargetPinChanged => "route_target_pin_changed",
             Self::RouteAuthorizationUnreconstructable => "route_authorization_unreconstructable",
             Self::CapsuleProtocolError => "capsule_protocol_error",
+            // The shared compiled-in literal (`credential_expired` /
+            // `authenticated_stream_max_lifetime`), so this reason token cannot
+            // drift from the counter and transaction-summary vocabulary the
+            // rest of the gateway publishes.
+            Self::AuthorizationExpired(termination) => termination.as_str(),
         }
     }
 
@@ -1266,7 +1313,15 @@ impl SessionEnd {
             // A relay that failed to join is the same class of failure: the
             // gateway does not know how much of the tunnel it carried, so it
             // may not claim an orderly end of the capsule stream.
-            Self::TargetSocketUnusable | Self::RelayTaskFailed => StreamCloseKind::InternalError,
+            //
+            // An authorization-lifetime expiry is the same class of claim: the
+            // tunnel is being taken away from a principal that is no longer
+            // authorized, so the client must be able to tell it apart from a
+            // tunnel that ran to completion. A clean FIN here would present a
+            // successfully completed capsule stream (issue #3860).
+            Self::TargetSocketUnusable
+            | Self::RelayTaskFailed
+            | Self::AuthorizationExpired(_) => StreamCloseKind::InternalError,
             Self::ClientClosed
             | Self::Idle
             | Self::Draining
@@ -1377,11 +1432,43 @@ pub fn classify_send_half_teardown(joined: SendHalfTeardownJoin) -> SessionEnd {
     }
 }
 
+/// Reconcile the supervisor's own verdict with the send half's teardown
+/// classification (issue #3860).
+///
+/// [`classify_send_half_teardown`] reports a send half that never applied its
+/// close as [`SessionEnd::RelayTaskFailed`], because for every other outcome
+/// the gateway asked for an orderly close and did not get one. An
+/// authorization-lifetime expiry is different: the whole point of that arm is
+/// that it must fire on time even when the client has parked the client-bound
+/// relay in QUIC send flow control, and a relay parked in `send_data` cannot
+/// observe the supervisor's close command at all. Aborting it after
+/// `CLOSE_GRACE` is therefore the DESIGNED path, not a gateway fault — and the
+/// abort drops the QUIC send half, which resets the stream, which is exactly
+/// the non-clean terminal this outcome requires.
+///
+/// Keeping the supervisor's class here matters twice over: the tunnel is
+/// reported (and logged) as the policy expiry it was, and a client that can
+/// stall a stream cannot turn its own credential's natural expiry into a
+/// gateway-side internal-failure signal on every tunnel it opens.
+///
+/// Only that one substitution is made. A panic, or a failed close on any other
+/// outcome, stays [`SessionEnd::RelayTaskFailed`].
+pub fn reconcile_authorization_teardown(
+    supervisor_verdict: SessionEnd,
+    teardown_verdict: SessionEnd,
+) -> SessionEnd {
+    match (supervisor_verdict, teardown_verdict) {
+        (SessionEnd::AuthorizationExpired(_), SessionEnd::RelayTaskFailed) => supervisor_verdict,
+        _ => teardown_verdict,
+    }
+}
+
 fn observe_send_half_join(
     joined: Result<SessionEnd, tokio::task::JoinError>,
     relay: RelayDirection,
     proxy_id: &str,
     grace_timed_out: bool,
+    supervisor_verdict: SessionEnd,
 ) -> SendHalfTeardownJoin {
     match joined {
         Ok(end) => SendHalfTeardownJoin::Completed(end),
@@ -1393,6 +1480,26 @@ fn observe_send_half_join(
                 "H3 CONNECT-UDP relay task panicked during teardown"
             );
             SendHalfTeardownJoin::Panicked
+        }
+        // Cancelled after an authorization-lifetime expiry. This is the
+        // designed path for a client that stopped reading — the relay was
+        // parked in QUIC send flow control and could not consume the close
+        // command — and the abort itself resets the stream, so the client still
+        // gets a non-clean terminal. It is ordinary, client-triggerable
+        // lifecycle rather than a gateway fault, and an expiry is exactly the
+        // kind of event a client can produce on every tunnel it opens, so it is
+        // `debug!` (see the `Log level` section of `src/proxy/auth_lifetime.rs`).
+        Err(_) if matches!(supervisor_verdict, SessionEnd::AuthorizationExpired(_)) => {
+            debug!(
+                proxy_id = %proxy_id,
+                relay = relay.as_str(),
+                grace_timed_out,
+                reason = supervisor_verdict.as_str(),
+                "H3 CONNECT-UDP client-bound relay was aborted at the authorization \
+                 lifetime; a relay parked in QUIC send flow control cannot apply the \
+                 close itself, and the abort resets the capsule stream"
+            );
+            SendHalfTeardownJoin::Cancelled
         }
         Err(_) => {
             warn!(
@@ -1484,7 +1591,7 @@ pub(crate) async fn handle_h3_connect_udp(
         per_ip_guard,
         epoch,
         proxy,
-        ctx,
+        mut ctx,
         plugins,
         initial_response_header_policy_plugins,
         plugin_execution_ns,
@@ -1529,6 +1636,30 @@ pub(crate) async fn handle_h3_connect_udp(
         )
         .await;
     }
+
+    // ── Authorization lifetime (issue #3860) ────────────────────────────
+    //
+    // Anchored ONCE, here, from the accepted principal: authentication and the
+    // `before_proxy` plugin phase have both finalized `ctx`, so this is the
+    // deadline the admitted credential bought. It is the earliest of that
+    // credential's own authoritative expiry and the finite
+    // `FERRUM_AUTHENTICATED_STREAM_MAX_LIFETIME_SECONDS` fallback, and
+    // `effective_request_auth_deadline` anchors the maximum at the request
+    // RECEIPT instant, so a slow admission cannot buy extra authorized tunnel
+    // lifetime.
+    //
+    // A CONNECT-UDP tunnel cannot inherit the ordinary `ProxyBody` wrapper that
+    // carries this contract on the request/response body paths: after the 200
+    // this handler owns the bidirectional H3 stream and writes capsule DATA
+    // directly. So the plan is carried explicitly — into the pre-commitment
+    // gate below and into the relay supervisor — exactly as the other native-H3
+    // relays carry it. `None` means no principal was admitted; an
+    // unauthenticated tunnel is out of scope for this contract and is bounded
+    // only by the RFC 9298 limits it already had.
+    let auth_deadline = crate::proxy::auth_lifetime::effective_request_auth_deadline(
+        &ctx,
+        state.env_config.authenticated_stream_max_lifetime_seconds,
+    );
 
     // RFC 9297 §3.2 forbids Content-Length, Content-Type, and Transfer-Encoding
     // on a message that uses the Capsule Protocol. The dispatcher already
@@ -1663,6 +1794,46 @@ pub(crate) async fn handle_h3_connect_udp(
             start_time,
             &request_path,
             HashMap::new(),
+        )
+        .await;
+    }
+
+    // Pre-commitment authorization gate (issue #3860). Deliberately ahead of
+    // the session permit, so an expired principal cannot consume a tunnel slot;
+    // ahead of DNS, so it resolves nothing on the credential's behalf; ahead of
+    // the socket, so no UDP socket is ever created or connected for it; and
+    // ahead of the 200, so no tunnel is committed. Nothing here has been
+    // acquired yet — `request_guard`/`per_ip_guard` still own the request
+    // accounting and `reject` releases them on return exactly as every other
+    // refusal above does.
+    //
+    // `expired_authorization` consults the clock only to ask whether the
+    // already-decided plan has elapsed; it never re-derives the plan.
+    if let Some(termination) = crate::proxy::auth_lifetime::expired_authorization(auth_deadline) {
+        // Records the fixed-cardinality counter through the REQUEST's shared
+        // latch, so this counts exactly once even if some other seam on the
+        // same request reaches an authorization exit at the same instant, and
+        // latches the bounded class into the transaction summary.
+        ctx.record_authorization_termination_once(
+            termination,
+            crate::proxy::auth_lifetime::StreamAuthProtocolFamily::StreamUdp,
+        );
+        debug!(
+            proxy_id = %proxy.id,
+            reason = termination.as_str(),
+            "Refused HTTP/3 CONNECT-UDP: the request's authorization lifetime had already \
+             elapsed; no tunnel socket or session permit was taken"
+        );
+        return reject_authorization_expired(
+            &mut stream,
+            &state,
+            &plugins,
+            &ctx,
+            &initial_response_header_policy_plugins,
+            termination,
+            plugin_execution_ns,
+            start_time,
+            &request_path,
         )
         .await;
     }
@@ -1911,6 +2082,14 @@ pub(crate) async fn handle_h3_connect_udp(
         &target,
         start_time,
         route_overrides_applied,
+        // The SAME absolute plan the pre-commitment gate just cleared. It is
+        // passed by value, so the supervisor can neither refresh it from
+        // datagram activity nor recompute it from the clock.
+        auth_deadline,
+        // The REQUEST's shared once-only latch, so the supervisor's expiry and
+        // any concurrent authorization exit on this request record exactly one
+        // correctly attributed counter between them.
+        ctx.authorization_termination_latch(),
     )
     .await;
 
@@ -2012,6 +2191,8 @@ async fn relay(
     target: &ConnectUdpTarget,
     session_start: Instant,
     route_overrides_applied: bool,
+    auth_deadline: Option<crate::proxy::auth_lifetime::StreamAuthDeadline>,
+    auth_latch: crate::proxy::auth_lifetime::StreamAuthTerminationLatch,
 ) -> SessionEnd {
     let max_payload = state.env_config.http3_connect_udp_max_datagram_bytes;
     let idle_seconds = state.env_config.http3_connect_udp_idle_timeout_seconds;
@@ -2241,12 +2422,64 @@ async fn relay(
     // interval from now.
     ticker.tick().await;
 
+    // The admitted principal's absolute authorization deadline (issue #3860).
+    //
+    // An EXACT `sleep_until` on the instant the credential was anchored to —
+    // deliberately not an observation folded into the one-second liveness
+    // ticker, which would round the security bound up to the tick cadence, and
+    // deliberately not recomputed from `auth_deadline` on each pass, which is
+    // what "activity never extends the lifetime" forbids. The timer is armed
+    // once here and never rearmed, so relaying datagrams in either direction
+    // cannot move it.
+    //
+    // An unauthenticated tunnel has no admitted principal and therefore no
+    // authorization lifetime to enforce: it yields a future that never
+    // completes, so its arm can never fire and no timer is registered for it.
+    let authorization_expiry = async move {
+        match auth_deadline {
+            Some(plan) => {
+                tokio::time::sleep_until(plan.at).await;
+                plan.termination
+            }
+            None => std::future::pending().await,
+        }
+    };
+    tokio::pin!(authorization_expiry);
+
     // Which relay, if either, already resolved. A `JoinHandle` panics when
     // polled after completion, so the teardown below must never re-await one.
     let mut to_target_finished = false;
     let mut from_target_finished = false;
     let mut end = loop {
         tokio::select! {
+            // Biased, with the authorization arm FIRST. Several of these arms
+            // can become ready in one poll — an expiry that lands in the same
+            // instant as a relay halt, a drain, or the idle tick — and when
+            // they do, the security decision is the one that must be reported
+            // and counted. Random selection would attribute that race by coin
+            // flip. Every other arm keeps its existing relative order.
+            biased;
+            // The admitted credential's absolute lifetime. `authorization_expiry`
+            // never completes for an unauthenticated tunnel, so this arm cannot
+            // fire on one.
+            termination = &mut authorization_expiry => {
+                // Through the request's SHARED latch: the first authorization
+                // exit on this request performs the single counter increment,
+                // and a concurrent one observes the class instead of counting a
+                // second time.
+                auth_latch.record_once(
+                    termination,
+                    crate::proxy::auth_lifetime::StreamAuthProtocolFamily::StreamUdp,
+                );
+                debug!(
+                    proxy_id = %proxy.id,
+                    reason = termination.as_str(),
+                    "H3 CONNECT-UDP tunnel reached the authorization lifetime of the \
+                     principal that opened it; the capsule stream is reset rather than \
+                     finished"
+                );
+                break SessionEnd::AuthorizationExpired(termination);
+            }
             // Neither handle has been aborted yet — teardown below is the only
             // place that does — so a join failure here is a panic or an
             // unrequested cancellation, never this session's own cancellation.
@@ -2335,6 +2568,16 @@ async fn relay(
     //
     // Order matters: stop reading the client stream first, then let the
     // client-bound relay flush and close within its grace before it is aborted.
+    //
+    // This bound is what makes the authorization arm above enforceable against
+    // a client that stops reading: a client-bound relay parked in QUIC send
+    // flow control never returns to its own `select!`, so it can neither
+    // observe the supervisor's close command nor act on it. The `CLOSE_GRACE`
+    // timeout, the abort, and the awaited cancellation acknowledgement are the
+    // only reason such a tunnel releases its socket clone, session permit, and
+    // connection guard on time rather than lasting as long as the QUIC
+    // connection.
+    let supervisor_verdict = end;
     if !to_target_finished {
         to_target.abort();
     }
@@ -2366,12 +2609,19 @@ async fn relay(
                 (from_target.await, true)
             }
         };
-        end = classify_send_half_teardown(observe_send_half_join(
-            joined,
-            RelayDirection::TargetToClient,
-            &proxy.id,
-            grace_timed_out,
-        ));
+        // An authorization expiry against a stalled client reaches the abort
+        // branch BY DESIGN, so it keeps its own class instead of being demoted
+        // to an internal relay failure the gateway did not actually suffer.
+        end = reconcile_authorization_teardown(
+            supervisor_verdict,
+            classify_send_half_teardown(observe_send_half_join(
+                joined,
+                RelayDirection::TargetToClient,
+                &proxy.id,
+                grace_timed_out,
+                supervisor_verdict,
+            )),
+        );
     }
     if !to_target_finished {
         // Aborted above and never polled to completion, so joining it here is
@@ -2454,6 +2704,72 @@ where
         stream,
         status,
         Bytes::from_static(body.as_bytes()),
+        headers,
+        initial_response_header_policy_plugins,
+    )
+    .await;
+    Ok(())
+}
+
+/// Pre-commitment authorization terminal for a CONNECT-UDP request whose
+/// authorization lifetime had already elapsed (issue #3860).
+///
+/// The status, headers, and body come from the SHARED
+/// [`crate::proxy::authorization_expired_pre_commitment_response`], so this
+/// refusal cannot drift from the one every other protocol emits before it
+/// commits a response. It is fixed and redacted: no expiry value, claim,
+/// subject, certificate field, provider, or destination reaches the client, and
+/// the two termination classes are indistinguishable on the wire.
+///
+/// Reached only before the session permit, DNS, the tunnel socket, and the 200,
+/// so there is nothing tunnel-scoped to release here — this returns through the
+/// same boundary as every other admission refusal.
+#[allow(clippy::too_many_arguments)]
+async fn reject_authorization_expired<S>(
+    stream: &mut RequestStream<S, Bytes>,
+    state: &ProxyState,
+    plugins: &[Arc<dyn Plugin>],
+    ctx: &RequestContext,
+    initial_response_header_policy_plugins: &[Arc<dyn Plugin>],
+    termination: crate::proxy::auth_lifetime::StreamAuthTermination,
+    plugin_execution_ns: u64,
+    start_time: Instant,
+    request_path: &str,
+) -> Result<(), anyhow::Error>
+where
+    S: h3::quic::RecvStream + h3::quic::SendStream<Bytes>,
+{
+    // `false`: a CONNECT-UDP request is never native gRPC. RFC 9297 §3.2 bars
+    // `Content-Type` from a Capsule Protocol message and the dispatcher already
+    // refused one that carried it, so the shared helper resolves to its plain
+    // HTTP arm (401 + fixed JSON body).
+    let (status, headers, body) =
+        crate::proxy::authorization_expired_pre_commitment_response(ctx, termination, false);
+    let status = StatusCode::from_u16(status).unwrap_or(StatusCode::UNAUTHORIZED);
+    let body = match body {
+        crate::retry::ResponseBody::Buffered(bytes) => bytes,
+        // The helper only ever produces a buffered terminal; an empty body is
+        // the fail-closed fallback rather than a panic on the request path.
+        _ => Bytes::new(),
+    };
+    crate::proxy::log_rejected_request_with_path(
+        plugins,
+        ctx,
+        status.as_u16(),
+        start_time,
+        // A compiled-in literal from the closed termination set, matching the
+        // `authorization.termination_reason` metadata the caller already
+        // latched onto this request.
+        termination.as_str(),
+        plugin_execution_ns,
+        Some(request_path),
+    )
+    .await;
+    crate::proxy::record_request(state, status.as_u16());
+    crate::http3::websocket::send_h3_reject_body(
+        stream,
+        status,
+        body,
         headers,
         initial_response_header_policy_plugins,
     )
