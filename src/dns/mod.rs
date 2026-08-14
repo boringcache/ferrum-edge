@@ -1180,6 +1180,30 @@ impl DnsCache {
         &self,
         hostname: &str,
     ) -> Result<Vec<IpAddr>, anyhow::Error> {
+        self.resolve_all_fresh_with_override(hostname, None).await
+    }
+
+    /// [`Self::resolve_all_fresh`] that also honors a per-proxy `dns_override`.
+    ///
+    /// The override has the same precedence as in [`Self::resolve_candidates`]
+    /// — highest, above the global overrides and the resolver — so a dial-time,
+    /// all-candidates lookup cannot silently reach a different address than
+    /// ordinary backend dispatch for the same proxy. The override is still
+    /// screened by the backend IP policy, so a denied literal fails the lookup
+    /// instead of becoming an unscreened dial.
+    ///
+    /// `pub` rather than `pub(crate)` so the override/deny contract can be
+    /// asserted directly from the external unit-test crate; the no-override
+    /// projection stays crate-private.
+    pub async fn resolve_all_fresh_with_override(
+        &self,
+        hostname: &str,
+        per_proxy_override: Option<&str>,
+    ) -> Result<Vec<IpAddr>, anyhow::Error> {
+        if let Some(ip_str) = per_proxy_override {
+            let addr: IpAddr = ip_str.parse()?;
+            return Ok(vec![self.check_backend_ip_policy(addr, hostname)?]);
+        }
         let cache_key = dns_hostname_key(hostname);
         let lookup_hostname = cache_key.as_ref();
 
