@@ -2642,6 +2642,46 @@ fn test_proxy_udp_amplification_factor_negative_rejected() {
 }
 
 #[test]
+fn test_proxy_udp_amplification_factor_nan_rejected() {
+    let mut proxy = make_proxy("test", "/api");
+    proxy.udp_max_response_amplification_factor = Some(f32::NAN);
+    let errs = proxy.validate_fields().unwrap_err();
+    assert!(
+        errs.iter()
+            .any(|e| e.contains("udp_max_response_amplification_factor"))
+    );
+}
+
+#[test]
+fn test_proxy_udp_amplification_factor_infinity_rejected() {
+    let mut proxy = make_proxy("test", "/api");
+    proxy.udp_max_response_amplification_factor = Some(f32::INFINITY);
+    let errs = proxy.validate_fields().unwrap_err();
+    assert!(
+        errs.iter()
+            .any(|e| e.contains("udp_max_response_amplification_factor"))
+    );
+}
+
+#[test]
+fn test_proxy_udp_amplification_factor_at_max_accepted() {
+    let mut proxy = make_proxy("test", "/api");
+    proxy.udp_max_response_amplification_factor = Some(1024.0);
+    assert!(proxy.validate_fields().is_ok());
+}
+
+#[test]
+fn test_proxy_udp_amplification_factor_above_max_rejected() {
+    let mut proxy = make_proxy("test", "/api");
+    proxy.udp_max_response_amplification_factor = Some(1024.1);
+    let errs = proxy.validate_fields().unwrap_err();
+    assert!(
+        errs.iter()
+            .any(|e| e.contains("udp_max_response_amplification_factor"))
+    );
+}
+
+#[test]
 fn test_proxy_dns_override_requires_ip_address() {
     let mut proxy = make_proxy("test", "/api");
     proxy.dns_override = Some("override.internal".to_string());

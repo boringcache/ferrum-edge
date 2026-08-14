@@ -396,6 +396,23 @@ async fn spawn_udp_echo_backend(socket: Arc<tokio::net::UdpSocket>) {
     });
 }
 
+async fn spawn_udp_fixed_response_backend(
+    socket: Arc<tokio::net::UdpSocket>,
+    response: &'static [u8],
+) {
+    tokio::spawn(async move {
+        let mut buf = vec![0u8; 65535];
+        loop {
+            match socket.recv_from(&mut buf).await {
+                Ok((_, peer)) => {
+                    let _ = socket.send_to(response, peer).await;
+                }
+                Err(_) => return,
+            }
+        }
+    });
+}
+
 async fn recv_udp_within(socket: &tokio::net::UdpSocket, window: Duration) -> Option<Vec<u8>> {
     let mut buf = vec![0u8; 65535];
     match tokio::time::timeout(window, socket.recv_from(&mut buf)).await {
@@ -2722,6 +2739,76 @@ async fn udp_stream_proxy_protocol_reload_restarts_listener_and_toggles_gate() {
     assert!(
         wait_until_udp_port_free(frontend_port).await,
         "UDP port {frontend_port} must be released after the proxy is deleted"
+    );
+
+    manager.shutdown_all().await;
+}
+
+/// A UDP session copies the response-amplification factor at admission. A
+/// policy update must therefore restart the listener and retire its session
+/// map; otherwise an already-established unlimited session could keep
+/// forwarding amplified responses after the same proxy becomes finite.
+#[tokio::test]
+async fn udp_amplification_policy_reload_retires_sessions_with_stale_budget() {
+    let backend = Arc::new(
+        tokio::net::UdpSocket::bind("127.0.0.1:0")
+            .await
+            .expect("bind UDP amplification backend"),
+    );
+    let backend_port = backend.local_addr().expect("backend addr").port();
+    let amplified_response = b"amplified";
+    spawn_udp_fixed_response_backend(Arc::clone(&backend), amplified_response).await;
+
+    let frontend_port = ephemeral_port().await;
+    let gateway_addr = SocketAddr::from(([127, 0, 0, 1], frontend_port));
+    let mut unlimited = udp_proxy_for_datagram_reload(frontend_port, backend_port, None);
+    unlimited.udp_max_response_amplification_factor = None;
+    let initial = GatewayConfig {
+        proxies: vec![unlimited],
+        ..empty_config()
+    };
+    assert!(initial.validate_stream_proxies().is_ok());
+
+    let config_arc = Arc::new(ArcSwap::from_pointee(initial.clone()));
+    let runtime = create_datagram_reload_manager_runtime(config_arc.clone(), &initial);
+    let manager = &runtime.manager;
+    let failures = manager.reconcile().await;
+    assert!(
+        failures.is_empty(),
+        "initial unlimited UDP listener should start: {failures:?}"
+    );
+    manager
+        .wait_until_started(Duration::from_secs(5))
+        .await
+        .expect("initial unlimited UDP listener should bind");
+
+    let client = tokio::net::UdpSocket::bind("127.0.0.1:0")
+        .await
+        .expect("bind UDP client");
+    let reply = udp_roundtrip(&client, gateway_addr, b"x")
+        .await
+        .expect("unlimited session must relay the amplified response");
+    assert_eq!(reply, amplified_response);
+
+    let mut finite = udp_proxy_for_datagram_reload(frontend_port, backend_port, None);
+    finite.udp_max_response_amplification_factor = Some(1.0);
+    publish_stream_config(
+        &runtime,
+        &config_arc,
+        GatewayConfig {
+            proxies: vec![finite],
+            ..empty_config()
+        },
+    )
+    .await;
+
+    client
+        .send_to(b"x", gateway_addr)
+        .await
+        .expect("send through the tightened UDP listener");
+    assert!(
+        recv_udp_within(&client, UDP_DROP_WINDOW).await.is_none(),
+        "the same source must not retain its stale unlimited session after policy tightening"
     );
 
     manager.shutdown_all().await;

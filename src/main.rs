@@ -81,6 +81,7 @@ mod system_metrics;
 mod tls;
 #[allow(dead_code)]
 mod tls_offload;
+mod udp_amplification;
 mod util;
 mod xds;
 

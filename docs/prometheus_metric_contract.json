@@ -4298,6 +4298,54 @@
     "emission": "always"
   },
   {
+    "name": "ferrum_udp_amplification_policy_invalid_total",
+    "type": "counter",
+    "help": "UDPResponseAmplificationPolicy objects rejected before listener programming.",
+    "labels": [
+      "namespace"
+    ],
+    "subsystem": "udp",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "always"
+  },
+  {
+    "name": "ferrum_udp_amplification_responses_allowed_total",
+    "type": "counter",
+    "help": "UDP backend responses admitted by the per-request amplification budget.",
+    "labels": [
+      "namespace"
+    ],
+    "subsystem": "udp",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "always"
+  },
+  {
+    "name": "ferrum_udp_amplification_responses_dropped_total",
+    "type": "counter",
+    "help": "UDP backend responses dropped for exceeding the per-request amplification budget.",
+    "labels": [
+      "namespace"
+    ],
+    "subsystem": "udp",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "always"
+  },
+  {
+    "name": "ferrum_udp_amplification_unlimited_total",
+    "type": "counter",
+    "help": "UDP/DTLS sessions admitted without a response-amplification limit.",
+    "labels": [
+      "namespace"
+    ],
+    "subsystem": "udp",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "always"
+  },
+  {
     "name": "ferrum_websocket_bytes_total",
     "type": "counter",
     "help": "WebSocket payload bytes relayed by direction.",

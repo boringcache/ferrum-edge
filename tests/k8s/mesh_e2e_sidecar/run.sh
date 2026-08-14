@@ -52,13 +52,52 @@ set -euo pipefail
 #                                               mesh model over native
 #                                               MeshSubscribe to the capp
 #                                               sidecar (CONFIG_PROTOCOL=
-#                                               native); client traffic
-#                                               reaches capp's app (routes
-#                                               exist ONLY if the CP-delivered
-#                                               slice materialized) AND the
-#                                               sidecar's JWT-authenticated
-#                                               /mesh/config-drift reports a
-#                                               received native slice
+#                                               native) on the production
+#                                               mTLS + JWT channel
+#                                               (https://ferrum-cp.<ns>.svc.cluster.local:50051
+#                                               with SAN verification, CP
+#                                               client-CA, DP client cert);
+#                                               client traffic reaches capp's
+#                                               app AND /mesh/config-drift
+#                                               attributes a native slice
+#   sidecar.config.native_subscribe_mtls_omitted_client_rejected
+#                                               dedicated probe DP omits its
+#                                               client cert; no slice accepted
+#   sidecar.config.native_subscribe_mtls_foreign_client_rejected
+#                                               dedicated probe DP presents a
+#                                               foreign-CA client cert; no
+#                                               slice accepted
+#   sidecar.config.native_subscribe_tls_untrusted_server_ca_rejected
+#                                               dedicated probe DP trusts the
+#                                               wrong server CA; no slice
+#                                               accepted
+#   sidecar.config.native_subscribe_tls_wrong_san_rejected
+#                                               dedicated probe DP dials a
+#                                               hostname absent from the CP
+#                                               server SAN; no slice accepted
+#   sidecar.config.native_subscribe_jwt_rejected
+#                                               dedicated probe DP completes
+#                                               mTLS then presents an invalid
+#                                               JWT; no slice accepted
+#   sidecar.config.native_subscribe_tls_rotation_reconnects
+#                                               projected Secret generation
+#                                               swap of CP/DP gRPC TLS
+#                                               material reconnects the native
+#                                               stream without a pod restart;
+#                                               capp's post-swap TLS handshake
+#                                               plus CP-accepted MeshSubscribe
+#                                               must follow the matching
+#                                               generation-2 TLS reload
+#                                               publication (surface=dp_grpc in
+#                                               capp logs, surface=cp_grpc in
+#                                               CP logs) for that exact
+#                                               pod/node identity, strictly
+#                                               newer than the pre-swap
+#                                               baseline; reload publications
+#                                               are temporal anchors only; an
+#                                               over-the-wire mTLS handshake
+#                                               to the running CP observes the
+#                                               replacement leaf serial
 #
 # DestinationRule exportTo / lookup probes drive captured client egress against
 # a beta-owned MeshService (`drsvc`) with two labelled sidecar backends. File-mode
@@ -90,6 +129,16 @@ MANIFESTS="$ROOT_DIR/tests/k8s/mesh_e2e_sidecar/manifests.yaml"
 
 LIVE_ASSERTIONS_HELPER="$ROOT_DIR/tests/k8s/lib/live_assertions.sh"
 SPIRE_HELPER="$ROOT_DIR/tests/k8s/lib/spire.sh"
+NATIVE_PROBE_CLASSIFY_HELPER="$ROOT_DIR/tests/k8s/lib/native_probe_classify.py"
+# Classifier --evidence-out labels each negative must pin (not broad TLS classes).
+# Client-side untrusted-CA / wrong-SAN proof is the closed-set native_tls_class
+# field (`client_tls_verify` / `client_tls_name`) emitted by the native
+# MeshSubscribe observing verifier, not a generic handshake or tonic transport error.
+NATIVE_EVID_CP_NO_CERT='cp_tls_rejected ip=.* reason=peer sent no certificates'
+NATIVE_EVID_CP_UNKNOWN_ISSUER='cp_tls_rejected ip=.* reason=invalid peer certificate: UnknownIssuer'
+NATIVE_EVID_CLIENT_SERVER_VERIFY='^client_tls_verify$'
+NATIVE_EVID_CLIENT_TLS_NAME='^client_tls_name$'
+NATIVE_EVID_CP_JWT_AUTH_FAILED='cp_jwt_rejected node_id=.* reason=Invalid token: authentication failed'
 # shellcheck source=../lib/live_assertions.sh
 source "$LIVE_ASSERTIONS_HELPER"
 # shellcheck source=../lib/spire.sh
@@ -162,6 +211,27 @@ JWT_WRONG_KEY=""
 # never mints, so run.sh signs the /mesh/config-drift bearer itself).
 CP_DP_JWT_SECRET=""
 ADMIN_JWT_SECRET=""
+CP_DP_JWT_SECRET_INVALID=""
+# Ephemeral native MeshSubscribe PKI. Controller-host copies live only in this
+# private temporary directory, are normally removed on EXIT, and are never
+# copied into ARTIFACT_DIR / RESULTS_DIR. The fixture transfers the required
+# leaves/keys into ephemeral Kubernetes Secrets for projection.
+NATIVE_MTLS_DIR=""
+NATIVE_OBSERVE_PF_PID=""
+NATIVE_CP_DNS=""
+NATIVE_WRONG_SAN_DNS=""
+NATIVE_SERVER_SERIAL_GEN1=""
+NATIVE_SERVER_SERIAL_GEN2=""
+NATIVE_CLIENT_SERIAL_GEN1=""
+NATIVE_CLIENT_SERIAL_GEN2=""
+NATIVE_CP_SERVED_CLASS=""
+NATIVE_CP_SERVED_REASON=""
+NATIVE_CP_SERVED_SERIAL=""
+NATIVE_ROTATION_NODE_ID=""
+NATIVE_ROTATION_POD_IP=""
+NATIVE_ROTATION_BASELINE_CP=0
+NATIVE_ROTATION_BASELINE_CLIENT=0
+NATIVE_ROTATION_BASELINE_CAPTURED=false
 
 LIVE_ASSERTIONS_INITIALIZED=false
 REQUIRED_LIVE_ASSERTIONS=(
@@ -178,6 +248,12 @@ REQUIRED_LIVE_ASSERTIONS=(
   sidecar.destination_rule.tcp_max_connections
   sidecar.virtual_service.cors_policy
   sidecar.config.native_subscribe_delivered
+  sidecar.config.native_subscribe_mtls_omitted_client_rejected
+  sidecar.config.native_subscribe_mtls_foreign_client_rejected
+  sidecar.config.native_subscribe_tls_untrusted_server_ca_rejected
+  sidecar.config.native_subscribe_tls_wrong_san_rejected
+  sidecar.config.native_subscribe_jwt_rejected
+  sidecar.config.native_subscribe_tls_rotation_reconnects
 )
 # NOTE: every id backs a GA-contract capability row in
 # tests/conformance/ga_contract.yaml — keep the id strings in lock-step.
@@ -185,10 +261,11 @@ REQUIRED_LIVE_ASSERTIONS=(
 # SPIFFE identity row `mesh.identity.spire_svid_issuance`;
 # `sidecar.peer_auth.strict_mtls_authenticated` is deliberately shared by the
 # PeerAuthentication and identity rows;
-# `sidecar.config.native_subscribe_delivered` backs the config-transport row
-# `mesh.config_transport.native_subscribe` (issue #2002). No contract row is
-# live-deferred: VS CORS was the last (issue #1973, closed by the mesh-slice
-# CORS carriage this suite now exercises).
+# `sidecar.config.native_subscribe_*` backs the config-transport row
+# `mesh.config_transport.native_subscribe` (issues #2002 / #3855): the
+# release-blocking native assertion is mTLS + JWT + SAN verification, plus
+# fail-closed negatives and watched projected-Secret rotation. A deleted or
+# skipped negative cannot leave that GA row green.
 
 mkdir -p "$ARTIFACT_DIR" "$RESULTS_DIR"
 
@@ -210,6 +287,10 @@ preflight() {
   need curl
   need python3
   need openssl
+  if [[ ! -f "$NATIVE_PROBE_CLASSIFY_HELPER" ]]; then
+    printf 'missing native probe classifier: %s\n' "$NATIVE_PROBE_CLASSIFY_HELPER" >&2
+    exit 1
+  fi
   docker info >/dev/null
   if [[ "${FERRUM_MESH_E2E_LIVE_ACK_DISPOSABLE:-}" != "true" ]]; then
     echo "Refusing to create/destroy a disposable kind cluster without \
@@ -360,9 +441,15 @@ mint_jwt_material() {
 # cluster should `kubectl rollout restart` the ferrum-cp/capp deployments.
 render_shared_secrets() {
   CP_DP_JWT_SECRET="$(openssl rand -hex 32)"
+  CP_DP_JWT_SECRET_INVALID="$(openssl rand -hex 32)"
   ADMIN_JWT_SECRET="$(openssl rand -hex 32)"
+  if [[ "$CP_DP_JWT_SECRET" == "$CP_DP_JWT_SECRET_INVALID" ]]; then
+    echo "CP/DP JWT secret collision while minting the invalid-JWT probe secret" >&2
+    return 1
+  fi
   kubectl --context "$CONTEXT" -n "$NS" create secret generic ferrum-mesh-e2e-secrets \
     --from-literal=cp-dp-grpc-jwt-secret="$CP_DP_JWT_SECRET" \
+    --from-literal=cp-dp-grpc-jwt-secret-invalid="$CP_DP_JWT_SECRET_INVALID" \
     --from-literal=admin-jwt-secret="$ADMIN_JWT_SECRET" \
     --dry-run=client -o yaml | kubectl --context "$CONTEXT" apply -f -
 }
@@ -404,6 +491,158 @@ print(f"{signing_input}.{base64.urlsafe_b64encode(signature).rstrip(b'=').decode
 PY
 }
 
+# ── Native MeshSubscribe mTLS PKI (issue #3855) ─────────────────────────────
+#
+# Ephemeral test PKI minted with openssl at run time. Controller-host copies
+# live only in NATIVE_MTLS_DIR (not ARTIFACT_DIR / RESULTS_DIR), are normally
+# removed on EXIT, and are never copied into results/artifacts. The fixture
+# transfers the required leaves/keys into ephemeral Kubernetes Secrets for
+# projection. Public serials/CNs/class/reason strings are the only identity
+# evidence recorded.
+
+stop_native_observe_port_forward() {
+  local pid="${1:-${NATIVE_OBSERVE_PF_PID:-}}"
+  if [[ -z "$pid" || "$pid" == "0" ]]; then
+    NATIVE_OBSERVE_PF_PID=""
+    return 0
+  fi
+  kill "$pid" 2>/dev/null || true
+  wait "$pid" 2>/dev/null || true
+  if [[ "${NATIVE_OBSERVE_PF_PID:-}" == "$pid" ]]; then
+    NATIVE_OBSERVE_PF_PID=""
+  fi
+}
+
+native_mtls_cleanup() {
+  stop_native_observe_port_forward
+  if [[ -n "${NATIVE_MTLS_DIR:-}" && -d "$NATIVE_MTLS_DIR" ]]; then
+    find "$NATIVE_MTLS_DIR" -type f -exec rm -f {} + 2>/dev/null || true
+    rm -rf "$NATIVE_MTLS_DIR" 2>/dev/null || true
+  fi
+}
+
+cert_serial() {
+  openssl x509 -in "$1" -noout -serial 2>/dev/null | awk -F= '{print $2}'
+}
+
+mint_native_leaf() {
+  local ca_cert="$1" ca_key="$2" cn="$3" out_cert="$4" out_key="$5" extfile="$6"
+  openssl req -newkey rsa:2048 -nodes -subj "/CN=$cn" \
+    -keyout "$out_key" -out "$NATIVE_MTLS_DIR/$cn.csr" >/dev/null 2>&1
+  openssl x509 -req -days 1 -in "$NATIVE_MTLS_DIR/$cn.csr" \
+    -CA "$ca_cert" -CAkey "$ca_key" -CAcreateserial \
+    -extfile "$extfile" -out "$out_cert" >/dev/null 2>&1
+  rm -f "$NATIVE_MTLS_DIR/$cn.csr"
+}
+
+mint_native_mtls_pki() {
+  NATIVE_CP_DNS="ferrum-cp.$NS.svc.cluster.local"
+  NATIVE_WRONG_SAN_DNS="ferrum-cp-wrong-san.$NS.svc.cluster.local"
+  NATIVE_MTLS_DIR="$(mktemp -d "${TMPDIR:-/tmp}/ferrum-native-mtls.XXXXXX")"
+  chmod 700 "$NATIVE_MTLS_DIR"
+  log "minting ephemeral native MeshSubscribe PKI (SAN=$NATIVE_CP_DNS)"
+
+  openssl req -x509 -newkey rsa:2048 -nodes -days 1 \
+    -subj /CN=ferrum-native-mtls-ca-gen1 \
+    -keyout "$NATIVE_MTLS_DIR/ca-key.pem" -out "$NATIVE_MTLS_DIR/ca.pem" \
+    >/dev/null 2>&1
+  openssl req -x509 -newkey rsa:2048 -nodes -days 1 \
+    -subj /CN=ferrum-native-mtls-client-ca-gen1 \
+    -keyout "$NATIVE_MTLS_DIR/client-ca-key.pem" -out "$NATIVE_MTLS_DIR/client-ca.pem" \
+    >/dev/null 2>&1
+  openssl req -x509 -newkey rsa:2048 -nodes -days 1 \
+    -subj /CN=ferrum-native-mtls-foreign-ca \
+    -keyout "$NATIVE_MTLS_DIR/foreign-ca-key.pem" -out "$NATIVE_MTLS_DIR/foreign-ca.pem" \
+    >/dev/null 2>&1
+  openssl req -x509 -newkey rsa:2048 -nodes -days 1 \
+    -subj /CN=ferrum-native-mtls-untrusted-ca \
+    -keyout "$NATIVE_MTLS_DIR/untrusted-ca-key.pem" -out "$NATIVE_MTLS_DIR/untrusted-ca.pem" \
+    >/dev/null 2>&1
+  openssl req -x509 -newkey rsa:2048 -nodes -days 1 \
+    -subj /CN=ferrum-native-mtls-ca-gen2 \
+    -keyout "$NATIVE_MTLS_DIR/gen2-ca-key.pem" -out "$NATIVE_MTLS_DIR/gen2-ca.pem" \
+    >/dev/null 2>&1
+  openssl req -x509 -newkey rsa:2048 -nodes -days 1 \
+    -subj /CN=ferrum-native-mtls-client-ca-gen2 \
+    -keyout "$NATIVE_MTLS_DIR/gen2-client-ca-key.pem" \
+    -out "$NATIVE_MTLS_DIR/gen2-client-ca.pem" >/dev/null 2>&1
+
+  printf 'subjectAltName=DNS:%s\nextendedKeyUsage=serverAuth\n' "$NATIVE_CP_DNS" \
+    > "$NATIVE_MTLS_DIR/server.ext"
+  printf 'extendedKeyUsage=clientAuth\n' > "$NATIVE_MTLS_DIR/client.ext"
+
+  mint_native_leaf "$NATIVE_MTLS_DIR/ca.pem" "$NATIVE_MTLS_DIR/ca-key.pem" \
+    ferrum-native-mtls-cp "$NATIVE_MTLS_DIR/server.pem" \
+    "$NATIVE_MTLS_DIR/server-key.pem" "$NATIVE_MTLS_DIR/server.ext"
+  mint_native_leaf "$NATIVE_MTLS_DIR/client-ca.pem" "$NATIVE_MTLS_DIR/client-ca-key.pem" \
+    ferrum-native-mtls-dp "$NATIVE_MTLS_DIR/client.pem" \
+    "$NATIVE_MTLS_DIR/client-key.pem" "$NATIVE_MTLS_DIR/client.ext"
+  mint_native_leaf "$NATIVE_MTLS_DIR/foreign-ca.pem" "$NATIVE_MTLS_DIR/foreign-ca-key.pem" \
+    ferrum-native-mtls-foreign "$NATIVE_MTLS_DIR/foreign-client.pem" \
+    "$NATIVE_MTLS_DIR/foreign-client-key.pem" "$NATIVE_MTLS_DIR/client.ext"
+  mint_native_leaf "$NATIVE_MTLS_DIR/gen2-ca.pem" "$NATIVE_MTLS_DIR/gen2-ca-key.pem" \
+    ferrum-native-mtls-cp-gen2 "$NATIVE_MTLS_DIR/gen2-server.pem" \
+    "$NATIVE_MTLS_DIR/gen2-server-key.pem" "$NATIVE_MTLS_DIR/server.ext"
+  mint_native_leaf "$NATIVE_MTLS_DIR/gen2-client-ca.pem" \
+    "$NATIVE_MTLS_DIR/gen2-client-ca-key.pem" \
+    ferrum-native-mtls-dp-gen2 "$NATIVE_MTLS_DIR/gen2-client.pem" \
+    "$NATIVE_MTLS_DIR/gen2-client-key.pem" "$NATIVE_MTLS_DIR/client.ext"
+
+  NATIVE_SERVER_SERIAL_GEN1="$(cert_serial "$NATIVE_MTLS_DIR/server.pem")"
+  NATIVE_CLIENT_SERIAL_GEN1="$(cert_serial "$NATIVE_MTLS_DIR/client.pem")"
+  NATIVE_SERVER_SERIAL_GEN2="$(cert_serial "$NATIVE_MTLS_DIR/gen2-server.pem")"
+  NATIVE_CLIENT_SERIAL_GEN2="$(cert_serial "$NATIVE_MTLS_DIR/gen2-client.pem")"
+  if [[ -z "$NATIVE_SERVER_SERIAL_GEN1" || -z "$NATIVE_SERVER_SERIAL_GEN2" \
+    || "$NATIVE_SERVER_SERIAL_GEN1" == "$NATIVE_SERVER_SERIAL_GEN2" ]]; then
+    echo "native MeshSubscribe PKI serials are empty or not distinct across generations" >&2
+    return 1
+  fi
+  printf 'gen1 server serial=%s client serial=%s\ngen2 server serial=%s client serial=%s\n' \
+    "$NATIVE_SERVER_SERIAL_GEN1" "$NATIVE_CLIENT_SERIAL_GEN1" \
+    "$NATIVE_SERVER_SERIAL_GEN2" "$NATIVE_CLIENT_SERIAL_GEN2" \
+    > "$RESULTS_DIR/native-mtls-serials.txt"
+}
+
+apply_native_mtls_secret() {
+  local name="$1"
+  shift
+  kubectl --context "$CONTEXT" -n "$NS" create secret generic "$name" \
+    "$@" --dry-run=client -o yaml | kubectl --context "$CONTEXT" apply -f -
+}
+
+apply_native_mtls_secrets() {
+  local generation="${1:-gen1}"
+  if [[ "$generation" == "gen2" ]]; then
+    apply_native_mtls_secret ferrum-native-mtls-cp \
+      --from-file=server.pem="$NATIVE_MTLS_DIR/gen2-server.pem" \
+      --from-file=server-key.pem="$NATIVE_MTLS_DIR/gen2-server-key.pem" \
+      --from-file=client-ca.pem="$NATIVE_MTLS_DIR/gen2-client-ca.pem"
+    apply_native_mtls_secret ferrum-native-mtls-dp \
+      --from-file=ca.pem="$NATIVE_MTLS_DIR/gen2-ca.pem" \
+      --from-file=client.pem="$NATIVE_MTLS_DIR/gen2-client.pem" \
+      --from-file=client-key.pem="$NATIVE_MTLS_DIR/gen2-client-key.pem"
+  else
+    apply_native_mtls_secret ferrum-native-mtls-cp \
+      --from-file=server.pem="$NATIVE_MTLS_DIR/server.pem" \
+      --from-file=server-key.pem="$NATIVE_MTLS_DIR/server-key.pem" \
+      --from-file=client-ca.pem="$NATIVE_MTLS_DIR/client-ca.pem"
+    apply_native_mtls_secret ferrum-native-mtls-dp \
+      --from-file=ca.pem="$NATIVE_MTLS_DIR/ca.pem" \
+      --from-file=client.pem="$NATIVE_MTLS_DIR/client.pem" \
+      --from-file=client-key.pem="$NATIVE_MTLS_DIR/client-key.pem"
+  fi
+  apply_native_mtls_secret ferrum-native-mtls-foreign \
+    --from-file=ca.pem="$NATIVE_MTLS_DIR/ca.pem" \
+    --from-file=client.pem="$NATIVE_MTLS_DIR/foreign-client.pem" \
+    --from-file=client-key.pem="$NATIVE_MTLS_DIR/foreign-client-key.pem"
+  apply_native_mtls_secret ferrum-native-mtls-untrusted \
+    --from-file=ca.pem="$NATIVE_MTLS_DIR/untrusted-ca.pem" \
+    --from-file=client.pem="$NATIVE_MTLS_DIR/client.pem" \
+    --from-file=client-key.pem="$NATIVE_MTLS_DIR/client-key.pem"
+  apply_native_mtls_secret ferrum-native-mtls-omit-client \
+    --from-file=ca.pem="$NATIVE_MTLS_DIR/ca.pem"
+}
+
 # ── SPIRE ───────────────────────────────────────────────────────────────────
 
 install_spire() {
@@ -413,7 +652,7 @@ install_spire() {
 }
 
 register_spire_workloads() {
-  log "registering SPIRE workload entries (svc, wssvc, client, rogue, capp, drsvc-a/b)"
+  log "registering SPIRE workload entries (svc, wssvc, client, rogue, capp, native-mtls-probe, drsvc-a/b)"
   local registered_ok=true
   local -a spire_nodes
   mapfile -t spire_nodes < <(ferrum_spire_agent_nodes "$CONTEXT" "$SPIRE_NS")
@@ -436,7 +675,7 @@ register_spire_workloads() {
     # client's mesh-mTLS with a SPIRE SVID like every other destination. The
     # ferrum-cp pod is NOT a mesh workload and gets no entry. drsvc-a/b are the
     # DestinationRule visibility backends and need SVIDs for mesh-mTLS.
-    for sa in svc wssvc client rogue capp drsvc-a drsvc-b; do
+    for sa in svc wssvc client rogue capp native-mtls-probe drsvc-a drsvc-b; do
       ferrum_spire_register_k8s_workload \
         "$CONTEXT" "$SPIRE_NS" \
         "spiffe://$TRUST_DOMAIN/ns/$NS/sa/$sa" \
@@ -450,7 +689,7 @@ register_spire_workloads() {
 
   if [[ "$registered_ok" == "true" ]]; then
     record_live_assertion sidecar.spire.workload_entries pass \
-      "" "" "svc-wssvc-client-rogue-capp-drsvc-entries-registered" "spire-entries.txt"
+      "" "" "svc-wssvc-client-rogue-capp-native-mtls-probe-drsvc-entries-registered" "spire-entries.txt"
   else
     record_live_assertion sidecar.spire.workload_entries fail \
       "" "" "workload-entry-registration-failed"
@@ -782,7 +1021,7 @@ YAML
   apply_configmap ferrum-mesh-client "$(cat <<YAML
 mesh:
   istio_root_namespace: $DR_ROOT_NS
-  # Permissive Sidecar so cross-namespace MeshService `beta/drsvc` and its
+  # Permissive Sidecar so cross-namespace MeshService beta/drsvc and its
   # DestinationRules are admitted (integration suite pattern for #2465/#2469).
   sidecars:
     - name: client-egress
@@ -916,7 +1155,7 @@ YAML
 
 wait_for_rollouts() {
   local deploy
-  # ferrum-cp first: its readiness (gRPC :50051 bound) unblocks capp's
+  # ferrum-cp first: its readiness (gRPC :50051 bound, now mTLS) unblocks capp's
   # native-subscribe convergence; capp's POD readiness itself only requires
   # the app container (the sidecar container has no probe and counts as
   # ready while it waits for its first slice).
@@ -1274,7 +1513,7 @@ received = bool(sl.get("last_received_at"))
 protocol = sl.get("source_protocol")
 cp_url = sl.get("source_cp_url") or ""
 services = (sl.get("resources") or {}).get("services") or 0
-if received and protocol == "native" and "ferrum-cp" in cp_url and services >= 1:
+if received and protocol == "native" and "ferrum-cp" in cp_url and cp_url.startswith("https://") and services >= 1:
     print(f"native-slice-received services={services} cp={cp_url}")
 else:
     print(
@@ -1296,6 +1535,730 @@ else:
       "native-config-drift.txt"
     return 1
   fi
+}
+
+# Redact PEM, bearer tokens, and long hex secrets from probe evidence so
+# readiness/diagnostics stay at class/reason level.
+redact_native_transport_evidence() {
+  python3 -c '
+import re, sys
+text = sys.stdin.read()
+text = re.sub(
+    r"-----BEGIN [A-Z0-9 ]+-----.*?-----END [A-Z0-9 ]+-----",
+    "[redacted-pem]",
+    text,
+    flags=re.S,
+)
+text = re.sub(r"(?i)bearer\s+[A-Za-z0-9._\-=]+", "bearer [redacted]", text)
+text = re.sub(r"(?i)(jwt|secret|token)=[A-Za-z0-9+/=._\-]{16,}", r"\1=[redacted]", text)
+print(text[:2000])
+'
+}
+
+native_probe_container_running() {
+  local deploy="$1"
+  kubectl --context "$CONTEXT" -n "$NS" get pod -l "app=$deploy" -o json 2>/dev/null |
+    python3 -c '
+import json, sys
+try:
+    data = json.load(sys.stdin)
+except Exception:
+    sys.exit(1)
+for pod in data.get("items", []):
+    if pod.get("metadata", {}).get("deletionTimestamp"):
+        continue
+    status = pod.get("status", {})
+    if status.get("phase") != "Running":
+        continue
+    for cs in status.get("containerStatuses", []):
+        if cs.get("name") == "ferrum-edge":
+            waiting = (cs.get("state") or {}).get("waiting") or {}
+            if waiting.get("reason") in ("CrashLoopBackOff", "Error", "ImagePullBackOff"):
+                sys.exit(2)
+            if cs.get("ready") is False and (cs.get("restartCount") or 0) > 2:
+                sys.exit(2)
+            if (cs.get("state") or {}).get("running"):
+                sys.exit(0)
+sys.exit(1)
+'
+}
+
+native_probe_logs() {
+  local deploy="$1"
+  kubectl --context "$CONTEXT" -n "$NS" logs "deploy/$deploy" -c ferrum-edge \
+    --tail=200 2>/dev/null || true
+}
+
+native_cp_logs() {
+  kubectl --context "$CONTEXT" -n "$NS" logs deploy/ferrum-cp -c ferrum-edge \
+    --tail=400 2>/dev/null || true
+}
+
+native_probe_running_identity() {
+  local deploy="$1"
+  kubectl --context "$CONTEXT" -n "$NS" get pod -l "app=${deploy}" -o json 2>/dev/null |
+    python3 "$NATIVE_PROBE_CLASSIFY_HELPER" --running-identity --deploy "$deploy"
+}
+
+# Classify a dedicated native-subscribe probe. Distinguishes:
+#   crash            process never stayed up (unrelated startup failure)
+#   slice-accepted   MeshSubscribe delivered a slice (false-positive for a negative)
+#   jwt              mTLS connected, then JWT/UNAUTHENTICATED (client or CP)
+#   tls-name         hostname/SAN verification failed (never connected)
+#   tls-verify       server-certificate trust failed, or CP rejected a foreign client cert
+#   tls-handshake    TLS/mTLS handshake failed before subscribe (never connected)
+#   noop             running but no MeshSubscribe attempt evidence
+#
+# Client `Connected to CP` is only a transient transport-attempt signal and
+# must not override exact CP evidence correlated to this probe's pod IP
+# (pre-subscribe TLS) or pod/node name (tenant-subscription JWT reject).
+# Client-side untrusted-CA / wrong-SAN require native_tls_class
+# client_tls_verify / client_tls_name; a generic handshake is not proof.
+# Classifier --evidence-out writes one line plus newline; joining with tr '\n' ' '
+# leaves a trailing space that breaks anchored evidence greps (^token$).
+normalize_native_evidence_file() {
+  local path="$1"
+  local normalized=""
+  if [[ -f "$path" ]]; then
+    normalized="$(tr '\n' ' ' < "$path")"
+    normalized="${normalized%"${normalized##*[![:space:]]}"}"
+  fi
+  printf '%s' "$normalized"
+}
+
+classify_native_probe() {
+  local deploy="$1"
+  local logs identity pod_name="" pod_ip="" client_file cp_file evidence_file st
+  evidence_file="$RESULTS_DIR/${deploy}.server-evidence.txt"
+  if ! native_probe_container_running "$deploy"; then
+    printf 'none\n' > "$evidence_file" || true
+    printf 'crash'
+    return 0
+  fi
+  logs="$(native_probe_logs "$deploy")"
+  identity="$(native_probe_running_identity "$deploy" 2>/dev/null || true)"
+  if [[ "$identity" == *$'\t'* ]]; then
+    pod_name="${identity%%$'\t'*}"
+    pod_ip="${identity#*$'\t'}"
+    pod_ip="${pod_ip%%$'\n'*}"
+  fi
+  client_file="$RESULTS_DIR/${deploy}.client-log.tmp"
+  cp_file="$RESULTS_DIR/${deploy}.cp-log.tmp"
+  printf '%s\n' "$logs" > "$client_file"
+  native_cp_logs > "$cp_file"
+  st=0
+  python3 "$NATIVE_PROBE_CLASSIFY_HELPER" --classify \
+    --pod-name "$pod_name" \
+    --pod-ip "$pod_ip" \
+    --client-log "$client_file" \
+    --cp-log "$cp_file" \
+    --evidence-out "$evidence_file" || st=$?
+  rm -f "$client_file" "$cp_file"
+  if [[ "$st" -ne 0 ]]; then
+    printf 'noop'
+  fi
+}
+
+wait_for_native_probe_class() {
+  local deploy="$1" want="${2:-}" want_evidence="${3:-}"
+  local class="" server_ev="" _
+  # Client "Connected to CP" is a transient transport-attempt; the helper may
+  # still return connected-without-jwt-class until exact CP evidence for this
+  # probe is visible. A matching class alone is not enough when want_evidence
+  # is set — generic client handshake/verify lines may arrive first. 30*2s
+  # covers image-already-loaded scheduling plus one reconnect.
+  for _ in $(seq 1 30); do
+    if native_probe_container_running "$deploy"; then
+      class="$(classify_native_probe "$deploy")"
+      if [[ "$class" == slice-accepted || "$class" == crash || "$class" == leaked-material ]]; then
+        printf '%s' "$class"
+        return 0
+      fi
+      server_ev="$(normalize_native_evidence_file "$RESULTS_DIR/${deploy}.server-evidence.txt")"
+      if [[ -n "$want" ]]; then
+        if printf '%s' "$class" | grep -Eq "^($want)$"; then
+          if [[ -z "$want_evidence" ]] \
+            || printf '%s' "$server_ev" | grep -Eq "$want_evidence"; then
+            printf '%s' "$class"
+            return 0
+          fi
+        fi
+      elif [[ "$class" != "noop" && "$class" != "connected-without-jwt-class" ]]; then
+        printf '%s' "$class"
+        return 0
+      fi
+    fi
+    sleep 2
+  done
+  if native_probe_container_running "$deploy"; then
+    classify_native_probe "$deploy"
+  else
+    printf 'crash'
+  fi
+}
+
+apply_native_mtls_probe() {
+  local name="$1"
+  local cp_url="$2"
+  local jwt_key="$3"
+  local secret_name="$4"
+  local mount_client="${5:-true}"
+  local client_env="" client_items=""
+  if [[ "$mount_client" == "true" ]]; then
+    client_env=$(cat <<YAML
+            - name: FERRUM_DP_GRPC_TLS_CLIENT_CERT_PATH
+              value: /transport/client.pem
+            - name: FERRUM_DP_GRPC_TLS_CLIENT_KEY_PATH
+              value: /transport/client-key.pem
+YAML
+)
+    client_items=$(cat <<YAML
+                    - key: client.pem
+                      path: client.pem
+                    - key: client-key.pem
+                      path: client-key.pem
+YAML
+)
+  fi
+  kubectl --context "$CONTEXT" -n "$NS" apply -f - <<YAML
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: $name
+  namespace: $NS
+  labels:
+    app: $name
+    ferrum.io/native-mtls-probe: "true"
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: $name
+  template:
+    metadata:
+      labels:
+        app: $name
+        ferrum.io/native-mtls-probe: "true"
+    spec:
+      serviceAccountName: native-mtls-probe
+      securityContext:
+        fsGroup: 1337
+      containers:
+        - name: ferrum-edge
+          image: $IMAGE
+          imagePullPolicy: IfNotPresent
+          args: ["run"]
+          securityContext:
+            runAsUser: 1337
+            runAsNonRoot: true
+            allowPrivilegeEscalation: false
+          env:
+            - name: FERRUM_MODE
+              value: mesh
+            - name: FERRUM_MESH_TOPOLOGY
+              value: sidecar
+            - name: FERRUM_MESH_CONFIG_PROTOCOL
+              value: native
+            - name: FERRUM_DP_CP_GRPC_URLS
+              value: $cp_url
+            - name: FERRUM_DP_GRPC_TLS_CA_CERT_PATH
+              value: /transport/ca.pem
+$client_env
+            - name: FERRUM_CP_DP_GRPC_JWT_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: ferrum-mesh-e2e-secrets
+                  key: $jwt_key
+            - name: FERRUM_NAMESPACE
+              value: $NS
+            - name: FERRUM_MESH_PRODUCTION_MODE
+              value: "true"
+            - name: FERRUM_MESH_CA_BACKEND
+              value: spire_agent
+            - name: FERRUM_MESH_SPIRE_AGENT_SOCKET
+              value: /run/spire/sockets/agent.sock
+            - name: FERRUM_MESH_WORKLOAD_SPIFFE_ID
+              value: spiffe://$TRUST_DOMAIN/ns/$NS/sa/native-mtls-probe
+            - name: FERRUM_ADMIN_HTTP_PORT
+              value: "15020"
+            - name: FERRUM_POOL_WARMUP_ENABLED
+              value: "false"
+            - name: FERRUM_LOG_LEVEL
+              value: info
+          volumeMounts:
+            - name: spire-agent-socket
+              mountPath: /run/spire/sockets
+              readOnly: true
+            - name: transport
+              mountPath: /transport
+              readOnly: true
+      volumes:
+        - name: spire-agent-socket
+          hostPath:
+            path: /run/spire/sockets
+            type: DirectoryOrCreate
+        - name: transport
+          projected:
+            defaultMode: 0440
+            sources:
+              - secret:
+                  name: $secret_name
+                  items:
+                    - key: ca.pem
+                      path: ca.pem
+$client_items
+YAML
+}
+
+delete_native_mtls_probes() {
+  kubectl --context "$CONTEXT" -n "$NS" delete deploy \
+    -l ferrum.io/native-mtls-probe=true --wait=true --timeout=60s \
+    >/dev/null 2>&1 || true
+}
+
+record_native_negative() {
+  local assertion_id="$1" deploy="$2" want_pattern="$3" want_evidence="${4:-}"
+  local class evidence server_ev=""
+  class="$(wait_for_native_probe_class "$deploy" "$want_pattern" "$want_evidence")"
+  server_ev="$(normalize_native_evidence_file "$RESULTS_DIR/${deploy}.server-evidence.txt")"
+  evidence="$(native_probe_logs "$deploy" | redact_native_transport_evidence | tr '\n' ' ')"
+  printf 'class=%s\nserver=%s\nclient=%s\n' "$class" "$server_ev" "$evidence" \
+    > "$RESULTS_DIR/${deploy}.txt"
+  log "$deploy class=$class (want $want_pattern evidence=$want_evidence) server=${server_ev}"
+  if [[ "$class" == slice-accepted || "$class" == crash || "$class" == leaked-material || "$class" == noop ]]; then
+    record_live_assertion "$assertion_id" fail "$deploy" ferrum-cp \
+      "class=$class want=$want_pattern evidence=$want_evidence server=${server_ev}" "${deploy}.txt"
+    return 1
+  fi
+  if printf '%s' "$class" | grep -Eq "^($want_pattern)$" \
+    && { [[ -z "$want_evidence" ]] || printf '%s' "$server_ev" | grep -Eq "$want_evidence"; }; then
+    record_live_assertion "$assertion_id" pass "$deploy" ferrum-cp \
+      "class=$class server=${server_ev}" "${deploy}.txt"
+    return 0
+  fi
+  record_live_assertion "$assertion_id" fail "$deploy" ferrum-cp \
+    "class=$class want=$want_pattern evidence=$want_evidence server=${server_ev}" "${deploy}.txt"
+  return 1
+}
+
+probe_native_mtls_negatives() {
+  local url="https://$NATIVE_CP_DNS:50051"
+  local wrong="https://$NATIVE_WRONG_SAN_DNS:50051"
+  local failed=false
+  log "deploying dedicated native MeshSubscribe mTLS/JWT negative probes"
+  apply_native_mtls_probe native-omit-client "$url" cp-dp-grpc-jwt-secret \
+    ferrum-native-mtls-omit-client false
+  apply_native_mtls_probe native-foreign-client "$url" cp-dp-grpc-jwt-secret \
+    ferrum-native-mtls-foreign true
+  apply_native_mtls_probe native-untrusted-ca "$url" cp-dp-grpc-jwt-secret \
+    ferrum-native-mtls-untrusted true
+  apply_native_mtls_probe native-wrong-san "$wrong" cp-dp-grpc-jwt-secret \
+    ferrum-native-mtls-dp true
+  apply_native_mtls_probe native-jwt-invalid "$url" cp-dp-grpc-jwt-secret-invalid \
+    ferrum-native-mtls-dp true
+
+  record_native_negative sidecar.config.native_subscribe_mtls_omitted_client_rejected \
+    native-omit-client tls-handshake "$NATIVE_EVID_CP_NO_CERT" || failed=true
+  record_native_negative sidecar.config.native_subscribe_mtls_foreign_client_rejected \
+    native-foreign-client tls-verify "$NATIVE_EVID_CP_UNKNOWN_ISSUER" || failed=true
+  record_native_negative sidecar.config.native_subscribe_tls_untrusted_server_ca_rejected \
+    native-untrusted-ca tls-verify "$NATIVE_EVID_CLIENT_SERVER_VERIFY" || failed=true
+  record_native_negative sidecar.config.native_subscribe_tls_wrong_san_rejected \
+    native-wrong-san tls-name "$NATIVE_EVID_CLIENT_TLS_NAME" || failed=true
+  record_native_negative sidecar.config.native_subscribe_jwt_rejected \
+    native-jwt-invalid jwt "$NATIVE_EVID_CP_JWT_AUTH_FAILED" || failed=true
+
+  delete_native_mtls_probes
+  if [[ "$failed" == "true" ]]; then
+    return 1
+  fi
+}
+
+native_rotation_component_logs() {
+  local target="$1"
+  # Full current-container logs so the pre-swap baseline cannot slide out of a
+  # --tail window and later be mistaken for a post-swap increase.
+  kubectl --context "$CONTEXT" -n "$NS" logs "$target" -c ferrum-edge \
+    --tail=-1 2>/dev/null || true
+}
+
+count_native_rotation_observations() {
+  local client_file cp_file
+  client_file="$RESULTS_DIR/native-rotation.client-log.tmp"
+  cp_file="$RESULTS_DIR/native-rotation.cp-log.tmp"
+  native_rotation_component_logs deploy/capp > "$client_file"
+  native_rotation_component_logs deploy/ferrum-cp > "$cp_file"
+  python3 "$NATIVE_PROBE_CLASSIFY_HELPER" --rotation-count \
+    --pod-name "$NATIVE_ROTATION_NODE_ID" \
+    --client-log "$client_file" \
+    --cp-log "$cp_file"
+  rm -f "$client_file" "$cp_file"
+}
+
+capture_native_rotation_baseline() {
+  local identity raw cp_count client_count
+  NATIVE_ROTATION_BASELINE_CAPTURED=false
+  NATIVE_ROTATION_NODE_ID=""
+  NATIVE_ROTATION_POD_IP=""
+  NATIVE_ROTATION_BASELINE_CP=0
+  NATIVE_ROTATION_BASELINE_CLIENT=0
+  identity="$(native_probe_running_identity capp 2>/dev/null || true)"
+  if [[ "$identity" != *$'\t'* ]]; then
+    log "native TLS rotation baseline: failed to read running capp identity"
+    return 1
+  fi
+  NATIVE_ROTATION_NODE_ID="${identity%%$'\t'*}"
+  NATIVE_ROTATION_POD_IP="${identity#*$'\t'}"
+  NATIVE_ROTATION_POD_IP="${NATIVE_ROTATION_POD_IP%%$'\n'*}"
+  raw="$(count_native_rotation_observations 2>/dev/null || true)"
+  if [[ "$raw" != *$'\t'* ]]; then
+    log "native TLS rotation baseline: helper count failed for node_id=$NATIVE_ROTATION_NODE_ID"
+    return 1
+  fi
+  cp_count="${raw%%$'\t'*}"
+  client_count="${raw#*$'\t'}"
+  client_count="${client_count%%$'\n'*}"
+  if [[ ! "$cp_count" =~ ^[0-9]+$ || ! "$client_count" =~ ^[0-9]+$ ]]; then
+    log "native TLS rotation baseline: non-integer counts raw=$raw"
+    return 1
+  fi
+  NATIVE_ROTATION_BASELINE_CP="$cp_count"
+  NATIVE_ROTATION_BASELINE_CLIENT="$client_count"
+  NATIVE_ROTATION_BASELINE_CAPTURED=true
+  log "native TLS rotation baseline: node_id=$NATIVE_ROTATION_NODE_ID pod_ip=$NATIVE_ROTATION_POD_IP cp_accepted=$NATIVE_ROTATION_BASELINE_CP client_tls_connect=$NATIVE_ROTATION_BASELINE_CLIENT"
+}
+
+native_rotation_fresh_now() {
+  local client_file cp_file evidence_file st
+  evidence_file="$RESULTS_DIR/native-mtls-rotation-reconnect.txt"
+  if [[ "$NATIVE_ROTATION_BASELINE_CAPTURED" != "true" \
+    || -z "$NATIVE_ROTATION_NODE_ID" ]]; then
+    printf 'baseline-missing\n' > "$evidence_file" || true
+    return 1
+  fi
+  client_file="$RESULTS_DIR/native-rotation.client-log.tmp"
+  cp_file="$RESULTS_DIR/native-rotation.cp-log.tmp"
+  native_rotation_component_logs deploy/capp > "$client_file"
+  native_rotation_component_logs deploy/ferrum-cp > "$cp_file"
+  st=0
+  python3 "$NATIVE_PROBE_CLASSIFY_HELPER" --rotation-fresh \
+    --pod-name "$NATIVE_ROTATION_NODE_ID" \
+    --client-log "$client_file" \
+    --cp-log "$cp_file" \
+    --baseline-cp "$NATIVE_ROTATION_BASELINE_CP" \
+    --baseline-client "$NATIVE_ROTATION_BASELINE_CLIENT" \
+    --evidence-out "$evidence_file" >/dev/null || st=$?
+  rm -f "$client_file" "$cp_file"
+  return "$st"
+}
+
+wait_for_native_rotation_evidence() {
+  local _
+  # Reload publications are temporal generation anchors only, never proof by
+  # themselves, and reconnect-attempt logs can fire while capp stays on
+  # last-known-good. Require the captured exact capp pod/node identity, a
+  # post-baseline dp_grpc reload in capp logs followed by a subsequent
+  # exact-node Connected-to-CP, and a post-baseline cp_grpc reload in CP
+  # logs followed by a subsequent exact-node Tenant subscription accepted.
+  if [[ "$NATIVE_ROTATION_BASELINE_CAPTURED" != "true" \
+    || -z "$NATIVE_ROTATION_NODE_ID" ]]; then
+    return 1
+  fi
+  # kubelet projected-volume propagation plus FERRUM_BACKEND_TLS_WATCH_INTERVAL_SECONDS=2.
+  # Hosted Kind has observed DP gen2 revision publication past 150s, so 90s is
+  # not a defensible evidence window. Poll every 2s for 240s; keep exact
+  # post-anchor Connected-to-CP / Tenant-accepted proof.
+  for _ in $(seq 1 120); do
+    if native_rotation_fresh_now; then
+      return 0
+    fi
+    sleep 2
+  done
+  native_rotation_fresh_now || true
+  return 1
+}
+
+pick_native_observe_loopback_port() {
+  python3 - <<'PY'
+import socket
+
+with socket.socket() as sock:
+    sock.bind(("127.0.0.1", 0))
+    print(sock.getsockname()[1])
+PY
+}
+
+wait_native_observe_port_forward() {
+  local pf_pid="$1" pf_log="$2" port="$3"
+  local _
+  for _ in $(seq 1 40); do
+    if ! kill -0 "$pf_pid" 2>/dev/null; then
+      return 1
+    fi
+    if grep -Eq "Forwarding from .*:${port}( ->|$)" "$pf_log" 2>/dev/null; then
+      return 0
+    fi
+    sleep 0.25
+  done
+  return 1
+}
+
+write_native_observe_evidence() {
+  local class="$1" reason="$2" serial="${3:-}"
+  NATIVE_CP_SERVED_CLASS="$class"
+  NATIVE_CP_SERVED_REASON="$reason"
+  NATIVE_CP_SERVED_SERIAL="$serial"
+  printf 'class=%s\nreason=%s\nserved_serial=%s\nwant_serial=%s\n' \
+    "$class" "$reason" "$serial" "${NATIVE_SERVER_SERIAL_GEN2:-}" \
+    > "$RESULTS_DIR/native-mtls-served-serial.txt"
+}
+
+classify_native_observe_error() {
+  local err_file="$1" out_file="${2:-}"
+  local files=("$err_file")
+  if [[ -n "$out_file" && -f "$out_file" ]]; then
+    files+=("$out_file")
+  fi
+  if grep -Eqi 'verify (error|return:)|certificate verify failed|hostname mismatch' \
+    "${files[@]}" 2>/dev/null; then
+    printf '%s\n' "tls-verify"
+    return
+  fi
+  if grep -Eqi 'handshake|ssl routines|alert|certificate required' \
+    "${files[@]}" 2>/dev/null; then
+    printf '%s\n' "tls-handshake"
+    return
+  fi
+  if grep -Eqi 'connection refused|connection reset|connect' \
+    "${files[@]}" 2>/dev/null; then
+    printf '%s\n' "connect"
+    return
+  fi
+  printf '%s\n' "observe-failed"
+}
+
+# Over-the-wire observation of the leaf certificate served by the running
+# ferrum-cp after rotation. Connects through kubectl port-forward to the
+# ferrum-cp Service listener (not Secret.data, not a mounted file, not the
+# controller-local expected server cert). Verifies TLS against the gen2
+# server CA, the Kubernetes Service DNS SAN, and presents the gen2 DP client
+# cert because the CP requires mTLS. Publishes the verified peer leaf serial
+# on NATIVE_CP_SERVED_SERIAL in this shell; callers must invoke this helper
+# directly (never via command substitution) so NATIVE_OBSERVE_PF_PID,
+# NATIVE_CP_SERVED_CLASS, and NATIVE_CP_SERVED_SERIAL propagate to the EXIT
+# trap and the rotation probe. Raw openssl transcripts stay in
+# NATIVE_MTLS_DIR; RESULTS_DIR gets only class/reason/serial evidence.
+observe_native_cp_served_serial() {
+  local port="" pf_pid=0 pf_log="" out_file="" err_file="" serial="" attempt \
+    hs_rc=0 verify_ok=false class reason
+  NATIVE_CP_SERVED_CLASS=""
+  NATIVE_CP_SERVED_REASON=""
+  NATIVE_CP_SERVED_SERIAL=""
+
+  if [[ -z "${NATIVE_MTLS_DIR:-}" || -z "${NATIVE_CP_DNS:-}" \
+    || ! -f "$NATIVE_MTLS_DIR/gen2-ca.pem" \
+    || ! -f "$NATIVE_MTLS_DIR/gen2-client.pem" \
+    || ! -f "$NATIVE_MTLS_DIR/gen2-client-key.pem" ]]; then
+    write_native_observe_evidence missing-material \
+      "gen2 CA/client material or Service DNS is missing"
+    return 1
+  fi
+
+  pf_log="$NATIVE_MTLS_DIR/observe-port-forward.log"
+  out_file="$NATIVE_MTLS_DIR/observe-handshake.out"
+  err_file="$NATIVE_MTLS_DIR/observe-handshake.err"
+
+  for attempt in $(seq 1 5); do
+    stop_native_observe_port_forward "$pf_pid"
+    pf_pid=0
+    port="$(pick_native_observe_loopback_port)"
+    if [[ -z "$port" || "$port" == "0" ]]; then
+      write_native_observe_evidence port-pick-failed \
+        "failed to allocate an ephemeral loopback port"
+      return 1
+    fi
+    : > "$pf_log"
+    kubectl --context "$CONTEXT" -n "$NS" port-forward "svc/ferrum-cp" \
+      "${port}:50051" >"$pf_log" 2>&1 &
+    pf_pid=$!
+    NATIVE_OBSERVE_PF_PID="$pf_pid"
+    if wait_native_observe_port_forward "$pf_pid" "$pf_log" "$port"; then
+      break
+    fi
+    if [[ "$attempt" -eq 5 ]]; then
+      stop_native_observe_port_forward "$pf_pid"
+      write_native_observe_evidence port-forward-failed \
+        "kubectl port-forward to svc/ferrum-cp:50051 did not become ready"
+      return 1
+    fi
+  done
+
+  : > "$out_file"
+  : > "$err_file"
+  set +e
+  python3 - "$out_file" "$err_file" \
+    openssl s_client \
+    -connect "127.0.0.1:${port}" \
+    -servername "$NATIVE_CP_DNS" \
+    -verify_hostname "$NATIVE_CP_DNS" \
+    -CAfile "$NATIVE_MTLS_DIR/gen2-ca.pem" \
+    -cert "$NATIVE_MTLS_DIR/gen2-client.pem" \
+    -key "$NATIVE_MTLS_DIR/gen2-client-key.pem" \
+    -verify_return_error \
+    -alpn h2 <<'PY'
+import subprocess
+import sys
+
+out_path, err_path = sys.argv[1], sys.argv[2]
+cmd = sys.argv[3:]
+try:
+    with open(out_path, "wb") as out, open(err_path, "wb") as err:
+        result = subprocess.run(
+            cmd, stdin=subprocess.DEVNULL, stdout=out, stderr=err, timeout=15
+        )
+    sys.exit(result.returncode)
+except subprocess.TimeoutExpired:
+    sys.exit(124)
+PY
+  hs_rc=$?
+  set -e
+  stop_native_observe_port_forward "$pf_pid"
+  pf_pid=0
+
+  if [[ "$hs_rc" -eq 124 ]]; then
+    write_native_observe_evidence handshake-timeout \
+      "openssl s_client timed out before a verified handshake"
+    return 1
+  fi
+
+  if grep -Fq 'Verify return code: 0 (ok)' "$out_file" "$err_file" 2>/dev/null \
+    || grep -Fq 'Verification: OK' "$out_file" "$err_file" 2>/dev/null; then
+    verify_ok=true
+  fi
+  if [[ "$verify_ok" != "true" ]]; then
+    class="$(classify_native_observe_error "$err_file" "$out_file")"
+    reason="verified mTLS handshake to the running CP failed"
+    write_native_observe_evidence "$class" "$reason"
+    return 1
+  fi
+
+  serial=""
+  serial="$(
+    awk '/BEGIN CERTIFICATE/{keep=1} keep{print} /END CERTIFICATE/{exit}' \
+      "$out_file" 2>/dev/null |
+      openssl x509 -noout -serial 2>/dev/null |
+      awk -F= '{print $2}' |
+      tr -d '[:space:]'
+  )" || serial=""
+  if [[ -z "$serial" ]]; then
+    write_native_observe_evidence empty-serial \
+      "peer leaf serial missing after a verified handshake"
+    return 1
+  fi
+
+  write_native_observe_evidence ok "peer-leaf-serial-observed" "$serial"
+}
+
+probe_native_mtls_rotation() {
+  log "rotating native MeshSubscribe TLS material via projected Secret generation"
+  capture_native_rotation_baseline || true
+  apply_native_mtls_secrets gen2
+  local rotated=false
+  if wait_for_native_rotation_evidence; then
+    rotated=true
+  fi
+  local live_serial="" observe_ok=false
+  if observe_native_cp_served_serial; then
+    observe_ok=true
+    live_serial="${NATIVE_CP_SERVED_SERIAL:-}"
+  else
+    live_serial=""
+  fi
+  local out status body traffic_ok=false
+  out="$(drive_settle client / "" 200 "$NATIVE_APP_MARKER" "$CAPP_HOST")"
+  status="${out%%$'\t'*}"
+  body="${out#*$'\t'}"
+  if [[ "$status" == "200" && "$body" == *"$NATIVE_APP_MARKER"* ]]; then
+    traffic_ok=true
+  fi
+
+  local admin_token drift_json drift_verdict
+  admin_token="$(mint_admin_jwt)"
+  # shellcheck disable=SC2016
+  drift_json="$(kubectl --context "$CONTEXT" -n "$NS" exec deploy/capp -c curl -- \
+    sh -c '
+      token="$1"
+      out=""
+      for _ in $(seq 1 15); do
+        out="$(curl -s -m 10 -H "Authorization: Bearer $token" \
+          http://127.0.0.1:15020/mesh/config-drift 2>/dev/null || true)"
+        if [ -n "$out" ]; then
+          printf "%s\n" "$out"
+          exit 0
+        fi
+        sleep 2
+      done
+      printf "%s\n" "$out"
+    ' sh "$admin_token" 2>/dev/null || printf '')"
+  drift_verdict="$(printf '%s' "$drift_json" | python3 -c '
+import json, sys
+try:
+    doc = json.load(sys.stdin)
+except Exception:
+    print("drift-unparseable")
+    sys.exit(0)
+sl = doc.get("slice") or {}
+received = bool(sl.get("last_received_at"))
+protocol = sl.get("source_protocol")
+cp_url = sl.get("source_cp_url") or ""
+services = (sl.get("resources") or {}).get("services") or 0
+if received and protocol == "native" and "ferrum-cp" in cp_url and cp_url.startswith("https://") and services >= 1:
+    print(f"native-slice-received services={services}")
+else:
+    print(f"drift-unexpected received={received} protocol={protocol} services={services}")
+')"
+
+  # Gen1 client must now fail: the CP client CA is the gen2 client CA.
+  apply_native_mtls_secret ferrum-native-mtls-stale-client \
+    --from-file=ca.pem="$NATIVE_MTLS_DIR/gen2-ca.pem" \
+    --from-file=client.pem="$NATIVE_MTLS_DIR/client.pem" \
+    --from-file=client-key.pem="$NATIVE_MTLS_DIR/client-key.pem"
+  apply_native_mtls_probe native-stale-client \
+    "https://$NATIVE_CP_DNS:50051" cp-dp-grpc-jwt-secret \
+    ferrum-native-mtls-stale-client true
+  local stale_class stale_ev=""
+  stale_class="$(wait_for_native_probe_class native-stale-client tls-verify \
+    "$NATIVE_EVID_CP_UNKNOWN_ISSUER")"
+  stale_ev="$(normalize_native_evidence_file "$RESULTS_DIR/native-stale-client.server-evidence.txt")"
+  kubectl --context "$CONTEXT" -n "$NS" delete deploy native-stale-client \
+    --wait=true --timeout=60s >/dev/null 2>&1 || true
+  kubectl --context "$CONTEXT" -n "$NS" delete secret ferrum-native-mtls-stale-client \
+    --wait=false >/dev/null 2>&1 || true
+
+  local reconnect_ev=""
+  reconnect_ev="$(normalize_native_evidence_file "$RESULTS_DIR/native-mtls-rotation-reconnect.txt")"
+  local outcome
+  outcome="rotated=$rotated reconnect=$reconnect_ev live_serial=$live_serial want_serial=$NATIVE_SERVER_SERIAL_GEN2 observe_class=${NATIVE_CP_SERVED_CLASS:-} traffic=$status stale_class=$stale_class stale_evidence=$stale_ev $drift_verdict"
+  printf '%s\n' "$outcome" > "$RESULTS_DIR/native-mtls-rotation.txt"
+  log "native TLS rotation: $outcome"
+  if [[ "$rotated" == "true" && "$observe_ok" == "true" \
+    && -n "$live_serial" && "$live_serial" == "$NATIVE_SERVER_SERIAL_GEN2" \
+    && "$traffic_ok" == "true" && "$drift_verdict" == native-slice-received* \
+    && "$stale_class" == tls-verify ]] \
+    && printf '%s' "$stale_ev" | grep -Eq "$NATIVE_EVID_CP_UNKNOWN_ISSUER" \
+    && printf '%s' "$reconnect_ev" | grep -Fq "cp_subscribe_accepted node_id=" \
+    && printf '%s' "$reconnect_ev" | grep -Fq "client_tls_connect before=" \
+    && printf '%s' "$reconnect_ev" | grep -Fq "dp_grpc_anchor=1" \
+    && printf '%s' "$reconnect_ev" | grep -Fq "cp_grpc_anchor=1" \
+    && printf '%s' "$reconnect_ev" | grep -Fq "client_post_anchor=1" \
+    && printf '%s' "$reconnect_ev" | grep -Fq "cp_post_anchor=1"; then
+    record_live_assertion sidecar.config.native_subscribe_tls_rotation_reconnects pass \
+      capp ferrum-cp "$outcome" "native-mtls-rotation.txt"
+    return 0
+  fi
+  record_live_assertion sidecar.config.native_subscribe_tls_rotation_reconnects fail \
+    capp ferrum-cp "$outcome" "native-mtls-rotation.txt"
+  return 1
 }
 
 # DR maxConnections over a WebSocket flow: maxConnections is enforced on
@@ -1727,7 +2690,9 @@ collect_diagnostics() {
   kubectl --context "$CONTEXT" -n "$NS" get configmap -o yaml \
     > "$ARTIFACT_DIR/configmaps.yaml" 2>&1 || true
   local deploy
-  for deploy in svc wssvc client rogue capp ferrum-cp drsvc-a drsvc-b; do
+  for deploy in svc wssvc client rogue capp ferrum-cp drsvc-a drsvc-b \
+    native-omit-client native-foreign-client native-untrusted-ca \
+    native-wrong-san native-jwt-invalid native-stale-client; do
     kubectl --context "$CONTEXT" -n "$NS" logs "deploy/$deploy" \
       --all-containers --tail=500 \
       > "$ARTIFACT_DIR/${deploy}.log" 2>&1 || true
@@ -1743,8 +2708,18 @@ collect_diagnostics() {
   fi
   # Diagnostics referenced by basename from live-assertions.json live in
   # RESULTS_DIR; the workflows upload ARTIFACT_DIR, so mirror them (the JWT
-  # signing keys are throwaway per-run material and intentionally NOT copied).
-  cp "$RESULTS_DIR"/*.txt "$ARTIFACT_DIR/" 2>/dev/null || true
+  # signing keys and native mTLS private keys stay in throwaway per-run
+  # directories and are intentionally NOT copied). Skip any note that grew a
+  # PEM body so raw openssl handshake transcripts cannot be uploaded.
+  local note
+  for note in "$RESULTS_DIR"/*.txt; do
+    [[ -f "$note" ]] || continue
+    if grep -Eq 'BEGIN (CERTIFICATE|PRIVATE KEY|RSA PRIVATE KEY|EC PRIVATE KEY|OPENSSH)' \
+      "$note" 2>/dev/null; then
+      continue
+    fi
+    cp "$note" "$ARTIFACT_DIR/" 2>/dev/null || true
+  done
 }
 
 require_live_assertions() {
@@ -1758,7 +2733,7 @@ require_live_assertions() {
 }
 
 main() {
-  trap collect_diagnostics EXIT
+  trap 'collect_diagnostics; native_mtls_cleanup' EXIT
   preflight
   init_live_assertions
 
@@ -1769,6 +2744,8 @@ main() {
   ensure_namespace
   mint_jwt_material
   render_shared_secrets
+  mint_native_mtls_pki
+  apply_native_mtls_secrets gen1
   render_dest_config
   render_wsdest_config
   render_drdest_configs
@@ -1802,6 +2779,15 @@ main() {
   probe_request_auth
   probe_vs_cors
   probe_native_subscribe
+  # Every probe records its own pass/fail live assertion and
+  # require_live_assertions is the single fail-closed gate. These two return
+  # non-zero on a recorded failure, so under set -e they would abort the run
+  # and leave the remaining release-blocking rows (DR maxConnections, DR
+  # exportTo/lookup, DR connectTimeout) unexercised — the artifact gate would
+  # then report those ids as MISSING alongside the real native failure.
+  # Swallow the status here; the recorded fail still closes the gate below.
+  probe_native_mtls_negatives || true
+  probe_native_mtls_rotation || true
   probe_ws_max_connections
   probe_destination_rule_namespace_security
   probe_connect_timeout_two_phase

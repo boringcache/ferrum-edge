@@ -234,6 +234,11 @@ fn udp_route_materializes_udp_stream_proxy_on_listener_port() {
     assert_eq!(proxy.listen_path, None);
     assert!(proxy.hosts.is_empty());
     assert!(proxy.udp_idle_timeout_seconds > 0);
+    assert_eq!(
+        proxy.udp_max_response_amplification_factor,
+        Some(8.0),
+        "ordinary UDPRoute translation must project the finite controller default"
+    );
 }
 
 #[test]
