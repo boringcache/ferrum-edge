@@ -56,7 +56,7 @@ use std::io::Read;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use tokio::sync::watch;
 use tracing::{debug, info, warn};
@@ -803,9 +803,35 @@ pub const DEFAULT_PROC_ROOT: &str = "/proc";
 
 /// The maximum number of `<proc_root>/<pid>` entries one subtree resolution may
 /// examine. A bound, not a policy: exceeding it fails closed rather than letting
-/// a hostile or pathological procfs pin the bounded preflight deadline.
+/// a hostile or pathological procfs pin the bounded preflight deadline. The
+/// one-shot preflight also threads a wall-clock deadline through this scan so
+/// `--timeout-seconds` remains a hard ceiling on a large host.
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 const MAX_PROC_PID_SCAN: usize = 262_144;
+
+/// Closed-set diagnostic for an explicit-root procfs scan that hit the
+/// preflight wall-clock ceiling. Contains the procfs root path only — no pid,
+/// cgroup, node UID, or credential material.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn proc_scan_deadline_error(proc_root: &Path) -> std::io::Error {
+    std::io::Error::new(
+        std::io::ErrorKind::TimedOut,
+        format!(
+            "procfs scan under {} exceeded the Ambient UDP preflight deadline",
+            proc_root.display()
+        ),
+    )
+}
+
+/// Whether `error` is the classified deadline outcome from an explicit-root
+/// target-PID scan (already elapsed before the walk, or observed while scanning).
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+pub fn is_proc_scan_deadline(error: &std::io::Error) -> bool {
+    error.kind() == std::io::ErrorKind::TimedOut
+        && error
+            .to_string()
+            .contains("exceeded the Ambient UDP preflight deadline")
+}
 
 /// Whether a `/proc/<pid>/cgroup` file names a cgroup inside `cgroup_path`.
 ///
@@ -880,11 +906,34 @@ fn is_component_aligned_tail(path: &str, tail: &str) -> bool {
 /// returns the first match rather than paying for a full scan. The caller still
 /// re-checks the opened namespace's inode against the reconciled one, so a task
 /// that exits mid-resolution is caught there rather than here.
+///
+/// Unbounded: the ordinary long-running / migration consumers keep this. The
+/// one-shot preflight uses [`first_pid_in_cgroup_via_proc_root_until`].
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 pub fn first_pid_in_cgroup_via_proc_root(
     proc_root: &Path,
     cgroup_path: &str,
 ) -> std::io::Result<u32> {
+    first_pid_in_cgroup_via_proc_root_until(proc_root, cgroup_path, None)
+}
+
+/// [`first_pid_in_cgroup_via_proc_root`] that observes an optional wall-clock
+/// deadline during the walk.
+///
+/// `TimedOut` here is the classified preflight-ceiling outcome, not a kernel
+/// ETIMEDOUT: already-elapsed deadlines return before any pid is considered, and
+/// a deadline that fires mid-scan returns instead of continuing toward
+/// [`MAX_PROC_PID_SCAN`]. Ordinary NotFound / InvalidData failures stay
+/// fail-closed and distinct.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+pub fn first_pid_in_cgroup_via_proc_root_until(
+    proc_root: &Path,
+    cgroup_path: &str,
+    deadline: Option<Instant>,
+) -> std::io::Result<u32> {
+    if super::owned_shell::deadline_elapsed(deadline) {
+        return Err(proc_scan_deadline_error(proc_root));
+    }
     let entries = std::fs::read_dir(proc_root).map_err(|error| {
         std::io::Error::new(
             error.kind(),
@@ -894,6 +943,9 @@ pub fn first_pid_in_cgroup_via_proc_root(
     let mut scanned = 0usize;
     let mut first_read_error: Option<String> = None;
     for entry in entries.flatten() {
+        if super::owned_shell::deadline_elapsed(deadline) {
+            return Err(proc_scan_deadline_error(proc_root));
+        }
         let file_name = entry.file_name();
         let Ok(pid) = file_name.to_string_lossy().parse::<u32>() else {
             continue;
@@ -914,11 +966,17 @@ pub fn first_pid_in_cgroup_via_proc_root(
         let cgroup_file = entry.path().join("cgroup");
         match std::fs::read_to_string(&cgroup_file) {
             Ok(contents) => {
+                if super::owned_shell::deadline_elapsed(deadline) {
+                    return Err(proc_scan_deadline_error(proc_root));
+                }
                 if proc_cgroup_is_in_subtree(&contents, cgroup_path) {
                     return Ok(pid);
                 }
             }
             Err(error) => {
+                if super::owned_shell::deadline_elapsed(deadline) {
+                    return Err(proc_scan_deadline_error(proc_root));
+                }
                 // A task that exited between readdir and read, or one this
                 // process may not inspect, is not evidence of a broken root.
                 let transient = matches!(
@@ -1077,6 +1135,7 @@ mod imp {
     use std::os::fd::AsRawFd;
     use std::os::unix::fs::MetadataExt;
     use std::path::{Path, PathBuf};
+    use std::time::Instant;
 
     use super::DEFAULT_PROC_ROOT;
 
@@ -1098,7 +1157,20 @@ mod imp {
         target_proc_root: &Path,
         cgroup_path: &str,
     ) -> io::Result<u64> {
-        let pid = first_pid_in_cgroup_at(target_proc_root, cgroup_path)?;
+        netns_inode_for_cgroup_at_until(target_proc_root, cgroup_path, None)
+    }
+
+    /// [`netns_inode_for_cgroup_at`] that observes the one-shot preflight
+    /// wall-clock ceiling during explicit-root target-PID resolution.
+    pub(crate) fn netns_inode_for_cgroup_at_until(
+        target_proc_root: &Path,
+        cgroup_path: &str,
+        deadline: Option<Instant>,
+    ) -> io::Result<u64> {
+        let pid = first_pid_in_cgroup_at(target_proc_root, cgroup_path, deadline)?;
+        if crate::proxy::owned_shell::deadline_elapsed(deadline) {
+            return Err(super::proc_scan_deadline_error(target_proc_root));
+        }
         let path = target_proc_root.join(pid.to_string()).join("ns/net");
         let meta = std::fs::metadata(&path).map_err(|error| {
             io::Error::new(
@@ -1111,16 +1183,22 @@ mod imp {
 
     /// Resolve a live PID in `cgroup_path` through `proc_root`.
     ///
-    /// The default root keeps the cheap, unchanged `cgroup.procs` read. An
-    /// explicit root cannot use it: `cgroup.procs` is translated into the
-    /// READER's PID namespace, so a process holding a foreign procfs would read
-    /// an empty or all-zero list. See
-    /// [`super::first_pid_in_cgroup_via_proc_root`].
-    fn first_pid_in_cgroup_at(proc_root: &Path, cgroup_path: &str) -> io::Result<u32> {
+    /// The default root keeps the cheap, unchanged `cgroup.procs` read and
+    /// ignores `deadline`: ordinary long-running and migration consumers are
+    /// not the one-shot preflight. An explicit root cannot use `cgroup.procs`:
+    /// it is translated into the READER's PID namespace, so a process holding a
+    /// foreign procfs would read an empty or all-zero list. See
+    /// [`super::first_pid_in_cgroup_via_proc_root_until`].
+    fn first_pid_in_cgroup_at(
+        proc_root: &Path,
+        cgroup_path: &str,
+        deadline: Option<Instant>,
+    ) -> io::Result<u32> {
         if proc_root == Path::new(DEFAULT_PROC_ROOT) {
+            let _ = deadline;
             return first_pid_in_cgroup(cgroup_path);
         }
-        super::first_pid_in_cgroup_via_proc_root(proc_root, cgroup_path)
+        super::first_pid_in_cgroup_via_proc_root_until(proc_root, cgroup_path, deadline)
     }
 
     /// The inode of the CALLING process's own (host/proxy) network namespace.
@@ -1159,7 +1237,20 @@ mod imp {
         target_proc_root: &Path,
         cgroup_path: &str,
     ) -> io::Result<File> {
-        let pid = first_pid_in_cgroup_at(target_proc_root, cgroup_path)?;
+        open_pod_netns_handle_at_until(target_proc_root, cgroup_path, None)
+    }
+
+    /// [`open_pod_netns_handle_at`] that observes the one-shot preflight
+    /// wall-clock ceiling during explicit-root target-PID resolution.
+    pub(crate) fn open_pod_netns_handle_at_until(
+        target_proc_root: &Path,
+        cgroup_path: &str,
+        deadline: Option<Instant>,
+    ) -> io::Result<File> {
+        let pid = first_pid_in_cgroup_at(target_proc_root, cgroup_path, deadline)?;
+        if crate::proxy::owned_shell::deadline_elapsed(deadline) {
+            return Err(super::proc_scan_deadline_error(target_proc_root));
+        }
         let path = target_proc_root.join(pid.to_string()).join("ns/net");
         File::open(&path).map_err(|error| {
             io::Error::new(
@@ -1371,8 +1462,9 @@ mod imp {
 /// resolution recipe as the TCP node-waypoint capture path.
 #[cfg(target_os = "linux")]
 pub(crate) use imp::{
-    host_netns_inode, netns_inode_for_cgroup, netns_inode_for_cgroup_at, open_pod_netns_handle,
-    open_pod_netns_handle_at, run_in_netns,
+    host_netns_inode, netns_inode_for_cgroup, netns_inode_for_cgroup_at,
+    netns_inode_for_cgroup_at_until, open_pod_netns_handle, open_pod_netns_handle_at,
+    open_pod_netns_handle_at_until, run_in_netns,
 };
 
 #[cfg(test)]

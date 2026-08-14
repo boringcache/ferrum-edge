@@ -261,7 +261,12 @@ ambient:
   # proven by its OWN pod rather than inherited from whatever the node-agent last
   # left on the shared registry path. When the preflight is enabled the chart owns
   # FERRUM_K8S_NODE_NAME from spec.nodeName; ambient.env.FERRUM_K8S_NODE_NAME
-  # fails rendering. Supply FERRUM_K8S_NODE_UID instead to skip the API lookup.
+  # fails rendering. Supply FERRUM_K8S_NODE_UID instead to skip the API lookup;
+  # that path also withholds the projected ServiceAccount token from the
+  # privileged init container. The ambient pod sets
+  # automountServiceAccountToken: false and always projects a short-lived
+  # kube-api-access volume for the steady-state proxy so in-cluster Kubernetes
+  # controller, discovery, and TLS/source identity keep working.
   #
   # Disabling it does NOT relax the runtime boundary: a node with no durable
   # record and no attestation stays fail-closed as `migration_required`. Use it

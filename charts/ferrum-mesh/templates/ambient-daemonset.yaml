@@ -337,6 +337,14 @@ spec:
         app.kubernetes.io/instance: {{ .Release.Name }}
     spec:
       serviceAccountName: ferrum-mesh
+      {{- /* Disable kubelet's automatic pod token projection so the privileged
+             preflight init container is not given a bearer token by default.
+             The short-lived kube-api-access volume below is the replacement:
+             the steady-state proxy always mounts it (in-cluster Kubernetes
+             controller, pod discovery, and TLS/source identity), and the
+             preflight mounts it only when it must perform the bounded nodes:get
+             (no explicit FERRUM_K8S_NODE_UID). */}}
+      automountServiceAccountToken: false
       hostNetwork: true
       {{- if $ambientSetnsCapture }}
       {{- /* PodSpec field: Kubernetes applies hostPID to every container in
@@ -430,6 +438,15 @@ spec:
             - name: preflight-host-proc
               mountPath: {{ $ambientUdpHostProcMountPath }}
               readOnly: true
+            {{- /* The init stage talks to the API only when it must resolve
+                   Node.metadata.uid itself. An explicit UID skips that GET, so
+                   this privileged container must not receive the bearer token
+                   on that path. */}}
+            {{- if not $hasExplicitNodeUid }}
+            - name: kube-api-access
+              mountPath: /var/run/secrets/kubernetes.io/serviceaccount
+              readOnly: true
+            {{- end }}
       {{- end }}
       containers:
         - name: ferrum-edge
@@ -529,8 +546,14 @@ spec:
             - name: {{ $name }}
               value: {{ $value | quote }}
             {{- end }}
-          {{- if or $ambientInNetnsCapture $ambientSpireEnabled }}
           volumeMounts:
+            {{- /* Always mount the projected in-cluster credentials. Pod-level
+                   automountServiceAccountToken is false, so omitting this would
+                   regress the proxy's Kubernetes-backed controller, discovery,
+                   and TLS/source identity defaults. */}}
+            - name: kube-api-access
+              mountPath: /var/run/secrets/kubernetes.io/serviceaccount
+              readOnly: true
             {{- if $nodeWaypointRegistryEnabled }}
             - name: bpf-fs
               mountPath: {{ .Values.nodeAgent.bpfFsPath }}
@@ -548,7 +571,6 @@ spec:
               mountPath: {{ $ambientSpireSocketMountPath }}
               readOnly: true
             {{- end }}
-          {{- end }}
           {{- /* Admin-backed probes when the listener is enabled. NodeWaypoint
                  still requires a non-zero admin port (validated above). Ordinary
                  ambient also probes admin when available so rollouts wait for
@@ -562,8 +584,29 @@ spec:
           {{- $ambientReadyHandler := .Values.ambient.probes.readiness.override | default dict -}}
           {{- if not $ambientReadyHandler }}{{- $ambientReadyHandler = $ambientHandlers.ready | default dict -}}{{- end -}}
           {{- include "ferrum-mesh.renderProbes" (dict "probes" .Values.ambient.probes "liveHandler" $ambientLiveHandler "readyHandler" $ambientReadyHandler) }}
-      {{- if or $ambientInNetnsCapture $ambientSpireEnabled $ambientUdpRunNodePreflight }}
       volumes:
+        {{- /* Always rendered, including when no cgroup/SPIRE/preflight
+               hostPath volumes exist. automountServiceAccountToken is false, so
+               this is the only in-cluster credential surface. expirationSeconds
+               3607 matches kubelet's default projected-token TTL (1h+7s). */}}
+        - name: kube-api-access
+          projected:
+            defaultMode: 420
+            sources:
+              - serviceAccountToken:
+                  expirationSeconds: 3607
+                  path: token
+              - configMap:
+                  name: kube-root-ca.crt
+                  items:
+                    - key: ca.crt
+                      path: ca.crt
+              - downwardAPI:
+                  items:
+                    - fieldRef:
+                        apiVersion: v1
+                        fieldPath: metadata.namespace
+                      path: namespace
         {{- if $nodeWaypointRegistryEnabled }}
         - name: bpf-fs
           hostPath:
@@ -597,5 +640,4 @@ spec:
             path: {{ $ambientSpireSocketHostPath }}
             type: DirectoryOrCreate
         {{- end }}
-      {{- end }}
 {{- end }}

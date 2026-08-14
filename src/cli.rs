@@ -546,9 +546,11 @@ pub fn validate_host_proc_root(root: &std::path::Path) -> Result<PathBuf, String
 ///
 /// `--timeout-seconds` is a hard wall-clock ceiling: stalled `sh`/iptables/ip
 /// children are killed with their process group before this process reports
-/// timeout, stderr collection is bounded so an orphaned grandchild cannot pin
-/// the caller, process-group cleanup failure is reported rather than claimed as
-/// success, and no usable attestation remains after the deadline wins.
+/// timeout, explicit-root host-proc target-PID scans observe the same Instant
+/// during the walk, stderr collection is bounded so an orphaned grandchild
+/// cannot pin the caller, process-group cleanup failure is reported rather than
+/// claimed as success, and no usable attestation remains after the deadline
+/// wins.
 ///
 /// Node identity is resolved AUTHORITATIVELY here from a validated explicit
 /// `FERRUM_K8S_NODE_UID`, or otherwise from this node's own Kubernetes object,

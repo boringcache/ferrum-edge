@@ -4565,7 +4565,13 @@ The init container:
    rendering so the lookup cannot be redirected to another Node object. An
    explicit `FERRUM_K8S_NODE_UID` skips the API lookup. The lookup uses in-cluster
    config only; a missing in-cluster config fails closed unless the explicit
-   UID is set. The chart's `nodes: get` grant
+   UID is set. The ambient pod sets `automountServiceAccountToken: false` and
+   always projects a short-lived `kube-api-access` volume (token, `kube-root-ca.crt`,
+   namespace) at the standard service-account path into the steady-state proxy,
+   so Kubernetes-backed controller, discovery, and TLS/source identity keep
+   working. The privileged init container mounts that volume **only when no
+   explicit `FERRUM_K8S_NODE_UID`** is supplied; the explicit-UID path performs
+   no API call and must not receive the bearer token. The chart's `nodes: get` grant
    has no list/watch/write and no `resourceNames`; Kubernetes therefore permits
    a named GET for any node whose name is already known, and the **runtime
    request** is what binds the lookup to this pod. It republishes only what it
@@ -4608,7 +4614,11 @@ budget is a wall-clock ceiling: the preflight owns every `sh`/iptables/ip child
 it starts, waits with `try_wait`, collects stderr under the same ceiling, and
 SIGKILLs the child's process group if the deadline wins — including when the
 shell has already exited but a grandchild still holds the inherited stderr pipe
-or process state. Process-group cleanup failure is reported rather than claimed
+or process state. Explicit-root target-PID resolution (the host `/proc` scan
+used for both netns-key reconcile and the stable netns handle open) observes
+the same Instant ceiling during the walk and returns a classified deadline
+outcome instead of continuing toward the 262,144-entry scan cap. Process-group
+cleanup failure is reported rather than claimed
 as a successful termination; the caller still fails closed and withholds proof.
 A proof publication that races the deadline is retracted (or invalidated into a
 record no reader will treat as attestation) before the deadline outcome is
@@ -4721,11 +4731,15 @@ placement era, a leftover cleanup proof that cannot skip a new preflight pod's
 retirement, the cleanup-complete/finalize-missed resumption,
 stale/malformed/release-only evidence, and the dual-stack both-domains
 retirement plan). The chart-side ordering and privilege boundary — one
-DaemonSet, the init container ahead of the proxy container, no `hostPID`, and an
-init-only host `/proc` mount and capability set — is pinned in
+DaemonSet, the init container ahead of the proxy container, no `hostPID`, an
+init-only host `/proc` mount and capability set, and ServiceAccount token
+isolation (`automountServiceAccountToken: false`, projected `kube-api-access`
+mounted into the proxy always and into the init container only without an
+explicit UID) — is pinned in
 `tests/unit/gateway_core/ambient_udp_placement_established_helm_tests.rs`, and
 the explicit target-procfs resolution the `hostPID` removal rests on (including
-that the default `/proc` behaviour is unchanged) in
+that the default `/proc` behaviour is unchanged, and that the one-shot scan
+honours `--timeout-seconds`) in
 `tests/unit/gateway_core/ambient_udp_preflight_proc_root_tests.rs`.
 
 The **missed-rollout/rejoin scenario itself is proven on the hosted live

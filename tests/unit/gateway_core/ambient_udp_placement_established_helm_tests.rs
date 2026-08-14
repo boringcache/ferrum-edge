@@ -49,8 +49,8 @@ fn ambient_regions(ambient: &str) -> AmbientRegions {
         .find("\n      containers:")
         .expect("steady-state container list");
     let volumes_gate = ambient
-        .find("\n      {{- if or $ambientInNetnsCapture")
-        .expect("ambient volume gate");
+        .find("\n      volumes:")
+        .expect("ambient volume list");
     assert!(
         pod_spec_start < preflight_gate
             && preflight_gate < init_start
@@ -513,6 +513,14 @@ fn the_operator_docs_describe_the_same_pod_preflight_lifecycle() {
             && !schema.contains("dedicated DaemonSet"),
         "values.schema.json must describe the shipped preflight shape"
     );
+    assert!(
+        mesh.contains("automountServiceAccountToken: false")
+            && mesh.contains("kube-api-access")
+            && mesh.contains("only when no explicit `FERRUM_K8S_NODE_UID`")
+            && node_agent_security.contains("automountServiceAccountToken: false")
+            && node_agent_security.contains("does not receive the projected token"),
+        "operator docs must record ServiceAccount token isolation for the privileged init"
+    );
 }
 
 #[test]
@@ -877,6 +885,88 @@ fn the_preflight_explicit_node_uid_skips_the_name_fieldref_but_rejects_name_over
     assert!(
         values.contains("ambient.env.FERRUM_K8S_NODE_NAME") && values.contains("fails rendering"),
         "values must document that ambient.env.FERRUM_K8S_NODE_NAME is rejected when the preflight is enabled"
+    );
+}
+
+/// Automatic kubelet token projection would hand the privileged init container
+/// a bearer token even when an explicit UID means it never calls the API.
+/// Pod-level automount is off; a short-lived projected volume is mounted into
+/// the proxy always and into the init container only on the lookup path.
+#[test]
+fn the_ambient_pod_isolates_the_service_account_token_from_the_explicit_uid_init() {
+    let ambient = read("templates/ambient-daemonset.yaml");
+    let values = read("values.yaml");
+    let regions = ambient_regions(&ambient);
+    let pod_spec = &ambient[regions.pod_spec.0..regions.pod_spec.1];
+    let init = &ambient[regions.init.0..regions.init.1];
+    let proxy = &ambient[regions.proxy.0..regions.proxy.1];
+    let volumes = &ambient[regions.volumes.0..regions.volumes.1];
+
+    assert!(
+        pod_spec.contains("automountServiceAccountToken: false"),
+        "the ambient pod must disable kubelet automatic token projection"
+    );
+    assert!(
+        !pod_spec.contains("automountServiceAccountToken: true"),
+        "automatic token projection must not be re-enabled on the ambient pod"
+    );
+
+    assert!(
+        volumes.contains("- name: kube-api-access")
+            && volumes.contains("projected:")
+            && volumes.contains("serviceAccountToken:")
+            && volumes.contains("expirationSeconds: 3607")
+            && volumes.contains("path: token")
+            && volumes.contains("name: kube-root-ca.crt")
+            && volumes.contains("path: ca.crt")
+            && volumes.contains("fieldPath: metadata.namespace")
+            && volumes.contains("path: namespace"),
+        "kube-api-access must be a short-lived projected volume with token, CA, and namespace"
+    );
+    assert!(
+        !volumes.contains("{{- if or $ambientInNetnsCapture")
+            && !volumes.contains("{{- if or $ambientInNetnsCapture $ambientSpireEnabled $ambientUdpRunNodePreflight }}"),
+        "the kube-api-access volume must render even when no cgroup/SPIRE/preflight volumes do"
+    );
+
+    let proxy_mount = "- name: kube-api-access\n              mountPath: /var/run/secrets/kubernetes.io/serviceaccount\n              readOnly: true";
+    assert!(
+        proxy.contains(proxy_mount),
+        "the steady-state proxy must always mount the projected token read-only at the standard in-cluster path"
+    );
+    assert!(
+        !proxy.contains("if not $hasExplicitNodeUid")
+            && !proxy.contains("if $hasExplicitNodeUid"),
+        "the proxy mount must not be gated on whether the preflight needs a Node GET"
+    );
+
+    assert!(
+        init.contains("if not $hasExplicitNodeUid")
+            && init.contains("- name: kube-api-access")
+            && init.contains("mountPath: /var/run/secrets/kubernetes.io/serviceaccount")
+            && init.contains("readOnly: true"),
+        "the preflight may mount the projected token only when it must perform the Node GET"
+    );
+    let init_token_gate = init
+        .rfind("{{- if not $hasExplicitNodeUid }}")
+        .expect("init token mount gate");
+    let init_token = &init[init_token_gate..];
+    assert!(
+        init_token.contains("- name: kube-api-access")
+            && init_token.contains("{{- end }}"),
+        "the init-container token mount must sit inside the explicit-UID-absent gate"
+    );
+    assert_eq!(
+        init.matches("- name: kube-api-access").count(),
+        1,
+        "the init container must declare the token mount in exactly one place"
+    );
+
+    assert!(
+        values.contains("automountServiceAccountToken: false")
+            && values.contains("kube-api-access")
+            && values.contains("withholds the projected ServiceAccount token"),
+        "values must document token isolation on the explicit-UID path"
     );
 }
 

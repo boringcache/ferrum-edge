@@ -18,7 +18,8 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use ferrum_edge::proxy::netns_capture::{
-    DEFAULT_PROC_ROOT, first_pid_in_cgroup_via_proc_root, proc_cgroup_is_in_subtree,
+    DEFAULT_PROC_ROOT, first_pid_in_cgroup_via_proc_root,
+    first_pid_in_cgroup_via_proc_root_until, is_proc_scan_deadline, proc_cgroup_is_in_subtree,
 };
 
 /// The pod cgroup as the node-agent registry publishes it: an ABSOLUTE
@@ -151,6 +152,53 @@ fn non_pid_entries_and_vanished_tasks_do_not_break_resolution() {
     assert_eq!(pid.expect("resolution must skip non-pid entries"), 555);
 }
 
+/// An already-elapsed preflight ceiling must fail closed as TimedOut even when
+/// a matching pid exists, so `--timeout-seconds` cannot be bypassed by a hit.
+#[test]
+fn an_already_elapsed_deadline_fails_closed_before_returning_a_match() {
+    use std::time::{Duration, Instant};
+
+    let root = tempfile::tempdir().expect("temp proc root");
+    fake_proc_root(
+        root.path(),
+        &[(4242u32, "0::/kubepods.slice/kubepods-podabc.slice")],
+    );
+
+    let deadline = Instant::now().checked_sub(Duration::from_secs(60));
+    let error = first_pid_in_cgroup_via_proc_root_until(root.path(), POD, deadline)
+        .expect_err("an elapsed deadline must not resolve a pid");
+    assert!(
+        is_proc_scan_deadline(&error),
+        "already-elapsed must be the classified deadline outcome, got {error}"
+    );
+    assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
+}
+
+/// The scan must re-check the ceiling after each numeric pid, not only before
+/// readdir. Otherwise a large host can run past `--timeout-seconds` on the way
+/// to MAX_PROC_PID_SCAN. Non-matching entries plus a short remaining budget
+/// must return TimedOut rather than NotFound after finishing the walk.
+#[test]
+fn a_deadline_that_elapses_during_the_scan_fails_closed_as_timeout() {
+    use std::time::{Duration, Instant};
+
+    let root = tempfile::tempdir().expect("temp proc root");
+    let mut entries = Vec::new();
+    for pid in 1u32..=2048 {
+        entries.push((pid, "0::/system.slice/unrelated.service"));
+    }
+    fake_proc_root(root.path(), &entries);
+
+    let deadline = Some(Instant::now() + Duration::from_millis(1));
+    let error = first_pid_in_cgroup_via_proc_root_until(root.path(), POD, deadline)
+        .expect_err("a mid-scan deadline must not complete as NotFound");
+    assert!(
+        is_proc_scan_deadline(&error),
+        "during-scan expiry must be the classified deadline outcome, got {error}"
+    );
+    assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
+}
+
 // ── The call graph the isolation depends on ─────────────────────────────────
 
 /// The one production consumer that runs under an explicit root is the
@@ -170,11 +218,19 @@ fn the_pod_netns_cleanup_backend_resolves_targets_through_the_explicit_root() {
         .expect("end of the linux cleanup backend impl");
     let backend = &netns_udp[start..end];
 
-    let inode_at = "netns_inode_for_cgroup_at(self.proc_root(), &target.cgroup_path)";
-    let handle_at = "open_pod_netns_handle_at(\n            self.proc_root(),";
+    let inode_at =
+        "netns_inode_for_cgroup_at_until(\n            self.proc_root(),\n            &target.cgroup_path,\n            deadline,";
+    let handle_at =
+        "open_pod_netns_handle_at_until(\n            self.proc_root(),\n            &target.cgroup_path,\n            deadline,";
     assert!(
         backend.contains(inode_at) && backend.contains(handle_at),
-        "both target-pid resolutions must go through the explicit procfs root"
+        "both target-pid resolutions must go through the explicit procfs root under the preflight deadline"
+    );
+    assert!(
+        backend.contains("fn netns_key_until(")
+            && backend.contains("NetnsUdpKeyOutcome::DeadlineElapsed")
+            && backend.contains("is_proc_scan_deadline"),
+        "reconcile netns-key lookup must classify a scan deadline instead of treating it as a retryable miss"
     );
     assert!(
         !backend.contains("netns_inode_for_cgroup(&target")
@@ -239,11 +295,63 @@ fn the_linux_netns_primitives_confine_hardcoded_target_proc_paths() {
     );
     assert!(
         imp.contains("if proc_root == Path::new(DEFAULT_PROC_ROOT) {")
+            && imp.contains("let _ = deadline;")
             && imp.contains("return first_pid_in_cgroup(cgroup_path);"),
         "the default root must keep the original cgroup.procs read unchanged, so \
          the mesh data plane's own cleanup phase is untouched"
     );
     assert_eq!(DEFAULT_PROC_ROOT, "/proc");
+}
+
+/// `--timeout-seconds` is a hard wall-clock ceiling. The one-shot explicit-root
+/// path must observe it in the pid walk, the netns-key lookup, and the stable
+/// handle open. Unrelated backends keep the default trait method.
+#[test]
+fn the_oneshot_explicit_root_path_observes_the_preflight_deadline() {
+    let netns = read_source("src/proxy/netns_capture.rs");
+    let scan_start = netns
+        .find("pub fn first_pid_in_cgroup_via_proc_root_until(")
+        .expect("deadline-aware explicit-root scan");
+    let scan_end = netns[scan_start..]
+        .find("\n/// Production backend:")
+        .map(|offset| scan_start + offset)
+        .expect("end of explicit-root scan");
+    let scan = &netns[scan_start..scan_end];
+    assert!(
+        scan.matches("deadline_elapsed(deadline)").count() >= 3,
+        "the scan must check the ceiling before the walk, on each pid, and after each cgroup read"
+    );
+    assert!(
+        scan.contains("proc_scan_deadline_error(proc_root)")
+            && netns.contains("std::io::ErrorKind::TimedOut"),
+        "deadline expiry must be a classified TimedOut outcome, not NotFound"
+    );
+
+    let imp_start = netns
+        .find("#[cfg(target_os = \"linux\")]\nmod imp {")
+        .expect("linux netns primitives");
+    let imp_end = netns
+        .find("#[cfg(not(target_os = \"linux\"))]\nmod imp {")
+        .expect("non-linux netns primitives");
+    let imp = &netns[imp_start..imp_end];
+    assert!(
+        imp.contains("fn netns_inode_for_cgroup_at_until(")
+            && imp.contains("fn open_pod_netns_handle_at_until(")
+            && imp.contains("first_pid_in_cgroup_at(target_proc_root, cgroup_path, deadline)"),
+        "both explicit-root netns lookups must thread the deadline into pid resolution"
+    );
+
+    let udp = read_source("src/proxy/netns_udp_capture.rs");
+    assert!(
+        udp.contains("fn netns_key_until(")
+            && udp.contains("let _ = deadline;\n        match self.netns_key(target)"),
+        "unrelated cleanup backends must keep a default netns_key_until that ignores the deadline"
+    );
+    assert!(
+        udp.contains("self.backend.netns_key_until(target, self.deadline)")
+            && udp.contains("NetnsUdpKeyOutcome::DeadlineElapsed => {\n                    return 0;"),
+        "cleanup reconcile must stop on a classified deadline instead of scanning remaining targets"
+    );
 }
 
 /// Only the preflight sets the root. The mesh data plane's cleanup phase runs

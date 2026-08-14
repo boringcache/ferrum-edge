@@ -223,7 +223,12 @@ The setns capabilities and the host-proc mount are bounded to an init stage that
 cannot serve traffic, which is strictly narrower than granting the producer
 setns and host PID visibility for its whole lifetime. It is an ordinary init
 container — no container-level `restartPolicy: Always`, so it is not a native
-sidecar that would outlive its one-shot work. This same-pod ordering is **not**
+sidecar that would outlive its one-shot work. The ambient pod also sets
+`automountServiceAccountToken: false` and projects a short-lived
+`kube-api-access` volume at the standard in-cluster path: the steady-state
+proxy always mounts it so Kubernetes-backed TLS/source identity is unchanged,
+and the privileged init container does not receive the projected token when
+`FERRUM_K8S_NODE_UID` is already supplied. This same-pod ordering is **not**
 usable unchanged on a cluster that refuses a host `/proc` hostPath or those init
 capabilities; set
 `ambient.udpNodePreflight.enabled=false` and adopt nodes with explicit
