@@ -691,6 +691,7 @@ async fn a_reply_held_in_a_slow_backend_hook_is_not_committed_after_expiry() {
     struct SlowBackendToClientHook {
         delay: Duration,
         ran: Arc<AtomicUsize>,
+        started: Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
     }
     #[async_trait::async_trait]
     impl ferrum_edge::plugins::Plugin for SlowBackendToClientHook {
@@ -702,15 +703,25 @@ async fn a_reply_held_in_a_slow_backend_hook_is_not_committed_after_expiry() {
             _ctx: &ferrum_edge::plugins::UdpDatagramContext<'_>,
         ) -> ferrum_edge::plugins::UdpDatagramVerdict {
             self.ran.fetch_add(1, Ordering::SeqCst);
+            if let Some(started) = self
+                .started
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .take()
+            {
+                let _ = started.send(());
+            }
             tokio::time::sleep(self.delay).await;
             ferrum_edge::plugins::UdpDatagramVerdict::Forward
         }
     }
 
     let ran = Arc::new(AtomicUsize::new(0));
+    let (started_tx, started_rx) = tokio::sync::oneshot::channel();
     let plugin = Arc::new(SlowBackendToClientHook {
         delay: Duration::from_millis(80),
         ran: Arc::clone(&ran),
+        started: Mutex::new(Some(started_tx)),
     });
     let plugins: Vec<Arc<dyn ferrum_edge::plugins::Plugin>> = vec![plugin];
     let plan = future_plan(
@@ -726,7 +737,10 @@ async fn a_reply_held_in_a_slow_backend_hook_is_not_committed_after_expiry() {
         )
         .await
     });
-    tokio::time::advance(Duration::from_millis(80)).await;
+    started_rx
+        .await
+        .expect("the slow hook must start before paused time advances past expiry");
+    tokio::time::advance(Duration::from_millis(20)).await;
     assert_eq!(
         commit.await.expect("join"),
         ferrum_edge::_test_support::UdpReplyDatagramCommitForTest::AuthorizationExpired(

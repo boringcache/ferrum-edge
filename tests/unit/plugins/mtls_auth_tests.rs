@@ -924,7 +924,18 @@ async fn test_mtls_auth_issuer_rejection_body_is_valid_json_with_control_chars()
             assert_eq!(status_code, 403);
             let parsed: serde_json::Value = serde_json::from_str(&body).unwrap();
             let error = parsed["error"].as_str().unwrap();
-            assert!(error.contains("Internal\nCA"));
+            assert_eq!(
+                error,
+                "Certificate issuer does not match any allowed issuer"
+            );
+            assert_eq!(
+                body,
+                r#"{"error":"Certificate issuer does not match any allowed issuer"}"#
+            );
+            assert!(
+                !body.contains("Internal\nCA") && !body.contains("Internal"),
+                "issuer/control-character material must not reach the client-visible body: {body}"
+            );
         }
         other => panic!("Expected Reject, got {:?}", other),
     }

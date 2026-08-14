@@ -142,38 +142,43 @@ fn h3_plain_mesh_upload_collection_releases_half_open_probe_before_terminal_writ
         "Ok(None) must release probe before terminal write"
     );
 
-    let deadline = mesh_collection
-        .split("H3RequestBodyReadError::DeadlineExceeded")
-        .nth(1)
-        .expect("missing mesh collection branch: DeadlineExceeded")
+    // Bind the exact force-buffer DeadlineExceeded arm, including the typed
+    // capture, then compare ordering in one whitespace-normalized slice so a
+    // rustfmt wrap cannot point the test at a comment or a nested-arm offset.
+    let deadline_start = mesh_collection
+        .find("H3RequestBodyReadError::DeadlineExceeded")
+        .expect("missing mesh collection branch: DeadlineExceeded");
+    let deadline = mesh_collection[deadline_start..]
         .split("H3RequestBodyReadError::TimedOut")
         .next()
         .expect("bounded mesh collection DeadlineExceeded branch");
-    let deadline_release = deadline
+    let deadline_compact: String = deadline
+        .chars()
+        .filter(|c| !c.is_whitespace())
+        .collect();
+    assert!(
+        deadline_compact.contains("DeadlineExceeded(authorization_expiry)")
+            || deadline_compact.contains("DeadlineExceeded(authorization_expiry,)"),
+        "the mesh force-buffer must bind the captured winner rather than a unit variant"
+    );
+    let deadline_release = deadline_compact
         .find("release_cross_protocol_circuit_breaker_probe_on_admission_reject(")
         .expect("DeadlineExceeded must release HALF_OPEN probe");
-    let auth_arm = deadline
-        .split("if let Some(termination) = authorization_expiry {")
-        .nth(1)
-        .expect("missing mesh collection authorization-expiry arm")
-        .split("return write_plain_grpc_web_client_deadline(")
-        .next()
-        .expect("bounded mesh collection authorization-expiry arm");
-    let auth_record = auth_arm
+    let auth_record = deadline_compact
         .find("record_authorization_termination_once(")
         .expect("Some(termination) must record the bounded class");
-    let auth_write = auth_arm
+    let auth_write = deadline_compact
         .find("write_plain_authorization_expired_terminal(")
         .expect("Some(termination) must write the grace-bounded 401");
     assert!(
-        auth_arm.contains("StreamAuthProtocolFamily::Http"),
+        deadline_compact.contains("StreamAuthProtocolFamily::Http"),
         "mesh force-buffer authorization expiry is the HTTP family"
     );
     assert!(
-        !auth_arm.contains("write_plain_gateway_error("),
+        !deadline_compact.contains("write_plain_gateway_error("),
         "mesh force-buffer authorization expiry must not use the unbounded reject writer"
     );
-    let deadline_write = deadline
+    let deadline_write = deadline_compact
         .find("write_plain_grpc_web_client_deadline(")
         .expect("DeadlineExceeded(None) must keep the gRPC-Web/client deadline response");
     assert!(
@@ -1444,9 +1449,11 @@ fn cross_protocol_plain_authorization_expired_terminal_uses_post_deadline_grace(
         dispatch
             .matches("write_plain_authorization_expired_terminal(")
             .count(),
-        9,
-        "upload, acquisition, header-wait, retry-delay, mesh retry-delay, and both \
-         pre-commitment response-header expiry arms must share the bounded 401 writer"
+        10,
+        "mesh force-buffer upload, buffered client acquisition, buffered header-wait, \
+         mesh retry-delay, two reqwest retry-delays, streaming client acquisition, \
+         streaming upload, and both pre-commitment response-header expiry arms \
+         must share the bounded 401 writer"
     );
     assert!(
         !dispatch.contains("StatusCode::UNAUTHORIZED"),
