@@ -5,6 +5,7 @@
 
 use arc_swap::ArcSwap;
 use ferrum_edge::circuit_breaker::CircuitBreakerCache;
+use ferrum_edge::config::db_backend::NamespacedResourceId;
 use ferrum_edge::config::types::{
     BackendScheme, BackendTlsConfig, DispatchKind, GatewayConfig, Proxy,
 };
@@ -19,6 +20,7 @@ use ferrum_edge::proxy::datagram_client_address::{
     DatagramEnvelopeAuth, DatagramEnvelopeForm, DatagramFreshness, DatagramListenerBinding,
     DatagramListenerProtocol, encode_datagram_with_metadata, unix_now_millis,
 };
+use ferrum_edge::proxy::node_waypoint_udp_destination::NodeWaypointUdpDestinationRoute;
 use ferrum_edge::proxy::node_waypoint_udp_steering::{
     NodeWaypointUdpSteerBackend, NodeWaypointUdpSteering,
 };
@@ -538,6 +540,26 @@ async fn wait_until_udp_port_free(port: u16) -> bool {
     })
     .await
     .unwrap_or(false)
+}
+
+/// `wait_until_started` looks up individual proxy runtime keys and does not
+/// observe a shared `__nwudp_{port}` listener. Wait on the exact shared key.
+async fn wait_until_shared_nw_udp_listener_started(
+    manager: &StreamListenerManager,
+    key: &str,
+    timeout: Duration,
+) -> bool {
+    let deadline = tokio::time::Instant::now() + timeout;
+    while tokio::time::Instant::now() < deadline {
+        let owners = manager.node_waypoint_udp_listener_owners_for_test().await;
+        if owners.iter().any(|(listener_key, _, started)| {
+            listener_key == key && started.load(Ordering::Acquire)
+        }) {
+            return true;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    false
 }
 
 // ============================================================================
@@ -2721,13 +2743,55 @@ fn attach_steering(manager: &StreamListenerManager) -> Arc<NodeWaypointUdpSteeri
     steering
 }
 
-fn node_waypoint_udp_proxy(port: u16) -> Proxy {
+fn node_waypoint_udp_proxy_named(service: &str, port: u16) -> Proxy {
     let id = ferrum_edge::modes::mesh::node_waypoint_udp_proxy_id(
         &ferrum_edge::config::types::default_namespace(),
-        "dns",
+        service,
         port,
     );
     create_stream_proxy(&id, BackendScheme::Udp, port)
+}
+
+fn node_waypoint_udp_proxy(port: u16) -> Proxy {
+    node_waypoint_udp_proxy_named("dns", port)
+}
+
+fn nw_udp_destination_route(
+    ip: &str,
+    port: u16,
+    service: &str,
+) -> NodeWaypointUdpDestinationRoute {
+    let namespace = ferrum_edge::config::types::default_namespace();
+    NodeWaypointUdpDestinationRoute::new(
+        ip.parse().expect("destination ip"),
+        port,
+        NamespacedResourceId::new(
+            namespace.clone(),
+            ferrum_edge::modes::mesh::node_waypoint_udp_proxy_id(&namespace, service, port),
+        ),
+        false,
+    )
+}
+
+fn config_with_same_port_nw_udp(port: u16, services: &[(&str, &str)]) -> GatewayConfig {
+    let proxies = services
+        .iter()
+        .map(|(service, _)| node_waypoint_udp_proxy_named(service, port))
+        .collect();
+    let steer_destinations = services
+        .iter()
+        .map(|(_, ip)| steer_destination(ip, port))
+        .collect();
+    let destination_routes = services
+        .iter()
+        .map(|(service, ip)| nw_udp_destination_route(ip, port, service))
+        .collect();
+    GatewayConfig {
+        proxies,
+        node_waypoint_udp_steer_destinations: steer_destinations,
+        node_waypoint_udp_destination_routes: destination_routes,
+        ..empty_config()
+    }
 }
 
 fn steer_destination(ip: &str, port: u16) -> ferrum_edge::capture::NodeWaypointUdpSteerDestination {
@@ -2842,12 +2906,171 @@ async fn node_waypoint_udp_successful_bind_publishes_and_shutdown_retracts() {
         dest,
         "a successful bind must publish the accepted destination"
     );
+    let owners = manager.node_waypoint_udp_listener_owners_for_test().await;
+    assert!(
+        owners
+            .iter()
+            .all(|(key, _, _)| !key.starts_with("__nwudp_")),
+        "a first-time single claimant must stay an individual listener: {owners:?}"
+    );
 
     manager.shutdown_all().await;
     assert!(
         steering.bound_destinations().is_empty(),
         "shutdown must retract the serving plan before sockets go away"
     );
+}
+
+/// Retracting Service A on a shared same-port listener must keep `__nwudp_{port}`
+/// bound and republish only B. Dissolving the group would stop the socket and
+/// race a rebind of B, which hosted live proved can fail `EADDRINUSE`
+/// (`node_waypoint.udp.same_port_demux_retract_a_keeps_b`).
+#[tokio::test]
+async fn node_waypoint_udp_retract_a_keeps_shared_listener_and_b_route() {
+    let mut started = None;
+    let mut last_failures = Vec::new();
+    for _ in 0..8 {
+        let probe = tokio::net::UdpSocket::bind("127.0.0.1:0")
+            .await
+            .expect("udp probe");
+        let port = probe.local_addr().unwrap().port();
+        drop(probe);
+        let initial = config_with_same_port_nw_udp(
+            port,
+            &[("udp-demux-a", "10.96.0.10"), ("udp-demux-b", "10.96.0.11")],
+        );
+        let config_arc = Arc::new(ArcSwap::from_pointee(initial.clone()));
+        let runtime = create_manager_runtime(config_arc.clone(), &initial);
+        let steering = attach_steering(&runtime.manager);
+        let failures = runtime.manager.reconcile().await;
+        let shared_key = format!("__nwudp_{port}");
+        if failures.is_empty()
+            && wait_until_shared_nw_udp_listener_started(
+                &runtime.manager,
+                &shared_key,
+                Duration::from_secs(5),
+            )
+            .await
+        {
+            started = Some((runtime, steering, port, config_arc, shared_key));
+            break;
+        }
+        last_failures = failures;
+        runtime.manager.shutdown_all().await;
+    }
+    let (runtime, steering, port, config_arc, shared_key) = started.unwrap_or_else(|| {
+        panic!("shared NodeWaypoint UDP listener did not start: {last_failures:?}")
+    });
+    let owners_before = runtime
+        .manager
+        .node_waypoint_udp_listener_owners_for_test()
+        .await;
+    assert_eq!(
+        owners_before.len(),
+        1,
+        "two same-port claimants must share one listener: {owners_before:?}"
+    );
+    assert_eq!(owners_before[0].0, shared_key);
+    let generation_before = owners_before[0].1;
+    let (table_generation_before, destinations_before, _) = runtime
+        .manager
+        .node_waypoint_udp_destination_snapshot_for_test(port)
+        .expect("shared destination table must exist");
+    assert_eq!(
+        destinations_before,
+        vec![
+            "10.96.0.10".parse().expect("ip a"),
+            "10.96.0.11".parse().expect("ip b"),
+        ]
+    );
+    assert!(
+        steering
+            .bound_destinations()
+            .iter()
+            .any(|destination| destination.ip.to_string() == "10.96.0.11"),
+        "B must be steered before A is retracted"
+    );
+
+    let only_b = config_with_same_port_nw_udp(port, &[("udp-demux-b", "10.96.0.11")]);
+    runtime
+        .request_epoch
+        .republish_from_runtime_parts_for_test(
+            only_b.clone(),
+            &runtime.plugin_cache,
+            &runtime.consumer_index,
+            &runtime.lb_cache,
+        )
+        .expect("request epoch must republish B after A is retracted");
+    config_arc.store(Arc::new(only_b));
+
+    let failures = runtime.manager.reconcile().await;
+    assert!(
+        failures.is_empty(),
+        "retracting A must not unbind B: {failures:?}"
+    );
+    assert!(
+        wait_until_shared_nw_udp_listener_started(
+            &runtime.manager,
+            &shared_key,
+            Duration::from_secs(5),
+        )
+        .await,
+        "surviving shared listener must stay started"
+    );
+
+    let owners_after = runtime
+        .manager
+        .node_waypoint_udp_listener_owners_for_test()
+        .await;
+    assert_eq!(
+        owners_after.len(),
+        1,
+        "retracting A must not replace the shared listener: {owners_after:?}"
+    );
+    assert_eq!(owners_after[0].0, shared_key);
+    assert_eq!(
+        owners_after[0].1, generation_before,
+        "retracting A must not restart the shared socket"
+    );
+    let (table_generation_after, destinations_after, owners_after_table) = runtime
+        .manager
+        .node_waypoint_udp_destination_snapshot_for_test(port)
+        .expect("shared destination table must survive A's retraction");
+    assert!(
+        table_generation_after > table_generation_before,
+        "A's retraction must republish the destination table in place"
+    );
+    assert_eq!(
+        destinations_after,
+        vec!["10.96.0.11".parse().expect("ip b")],
+        "only B's ClusterIP may remain after A is retracted"
+    );
+    assert_eq!(owners_after_table.len(), 1);
+    assert!(
+        owners_after_table[0].id.contains("udp-demux-b"),
+        "the surviving route owner must be B: {owners_after_table:?}"
+    );
+    assert!(
+        steering
+            .bound_destinations()
+            .iter()
+            .any(|destination| destination.ip.to_string() == "10.96.0.11"),
+        "B must stay steered after A is retracted"
+    );
+    assert!(
+        steering
+            .bound_destinations()
+            .iter()
+            .all(|destination| destination.ip.to_string() != "10.96.0.10"),
+        "A's ClusterIP must leave the serving steer set"
+    );
+    let still_bound = tokio::net::UdpSocket::bind(format!("127.0.0.1:{port}")).await;
+    assert!(
+        still_bound.is_err(),
+        "the shared UDP socket must still own the port after A is retracted"
+    );
+
+    runtime.manager.shutdown_all().await;
 }
 
 #[tokio::test]

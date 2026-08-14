@@ -140,6 +140,14 @@ fn republishing_adds_and_removes_routes_without_disturbing_the_others() {
     );
     assert!(router.resolve(Some(ip("10.96.0.11"))).is_ok());
 
+    let (before_b, _) = router
+        .resolve(Some(ip("10.96.0.11")))
+        .expect("B resolves before A is retracted");
+    let client: SocketAddr = "10.244.3.99:41000".parse().expect("client addr");
+    let key_b_before = UdpSessionKey::for_route(client, before_b.as_ref(), 7);
+    let owner_b = NamespacedResourceId::new("ferrum", "__mesh-nw-udp-team-b-dns-b-5353");
+    assert!(router.revalidate_owner(ip("10.96.0.11"), &owner_b).is_ok());
+
     router
         .publish(vec![route(
             "10.96.0.11",
@@ -151,9 +159,25 @@ fn republishing_adds_and_removes_routes_without_disturbing_the_others() {
         router.resolve(Some(ip("10.96.0.10"))).is_err(),
         "removing A retracts A's route"
     );
+    let (after_b, _) = router
+        .resolve(Some(ip("10.96.0.11")))
+        .expect("removing A must not interrupt B");
+    assert_eq!(
+        UdpSessionKey::for_route(client, after_b.as_ref(), 7),
+        key_b_before,
+        "B's session identity must remain equal across A's retraction"
+    );
     assert!(
-        router.resolve(Some(ip("10.96.0.11"))).is_ok(),
-        "removing A must not interrupt B"
+        router.revalidate_owner(ip("10.96.0.11"), &owner_b).is_ok(),
+        "B's established session must remain valid after A is retracted"
+    );
+    let owner_a = NamespacedResourceId::new("ferrum", "__mesh-nw-udp-team-a-dns-a-5353");
+    let (refusal, _) = router
+        .revalidate_owner(ip("10.96.0.10"), &owner_a)
+        .expect_err("A's established session must retire with A's route");
+    assert_eq!(
+        refusal,
+        NodeWaypointUdpDestinationRefusal::UnknownDestination
     );
 }
 

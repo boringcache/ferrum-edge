@@ -992,11 +992,14 @@ struct DesiredStreamListener {
     sni_ids: Option<Vec<NamespacedResourceId>>,
     /// Members of a shared `__nwudp_{port}` NodeWaypoint UDP destination group
     /// (issue #3861), sorted for determinism. `None` for every other listener,
-    /// including a single-claimant NodeWaypoint UDP listener (which keeps the
-    /// direct-node-address boundary).
+    /// including a first-time single-claimant NodeWaypoint UDP listener (which
+    /// keeps the direct-node-address boundary).
     ///
     /// Deliberately excluded from the listener restart key: a membership change
-    /// republishes the exact destination table under the running socket.
+    /// republishes the exact destination table under the running socket. A
+    /// previously shared port that shrinks to one remaining VIP claimant MUST
+    /// keep this `Some` so the listener key stays `__nwudp_{port}` — dissolving
+    /// the group stops the socket and races a rebind of the survivor.
     node_waypoint_udp_ids: Option<Vec<NamespacedResourceId>>,
 }
 
@@ -1004,6 +1007,22 @@ struct DesiredStreamListener {
 #[inline]
 fn node_waypoint_udp_listener_key(port: u16) -> String {
     format!("__nwudp_{port}")
+}
+
+/// Whether a NodeWaypoint UDP destination-plane port should keep (or form) the
+/// shared `__nwudp_{port}` listener.
+///
+/// More than one claimant always shares. A first-time single claimant stays
+/// individual so the documented direct-node-address boundary remains. Once
+/// that port is already bound under `__nwudp_{port}`, shrinking to one
+/// remaining VIP claimant must keep the shared key: dissolving it stops the
+/// socket and races a rebind that can leave the survivor unbound (`EADDRINUSE`).
+#[inline]
+fn retain_shared_node_waypoint_udp_listener(
+    member_count: usize,
+    shared_listener_already_running: bool,
+) -> bool {
+    member_count > 1 || (member_count == 1 && shared_listener_already_running)
 }
 
 fn udp_amplification_restart_key_for_ids(
@@ -1756,6 +1775,32 @@ impl StreamListenerManager {
             .collect()
     }
 
+    /// Test seam: accepted destination-table generation, destinations, and
+    /// owners for one shared `__nwudp_{port}` router. `None` when that port is
+    /// not currently a shared destination group.
+    #[allow(dead_code)] // External unit tests.
+    pub fn node_waypoint_udp_destination_snapshot_for_test(
+        &self,
+        port: u16,
+    ) -> Option<(
+        u64,
+        Vec<std::net::IpAddr>,
+        Vec<crate::config::db_backend::NamespacedResourceId>,
+    )> {
+        let routers = self
+            .node_waypoint_udp_routers
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        routers.get(&port).map(|router| {
+            let snapshot = router.snapshot();
+            (
+                snapshot.generation(),
+                snapshot.destinations(),
+                snapshot.owners(),
+            )
+        })
+    }
+
     /// Test seam: run the production listener-exit retraction for `generation`
     /// of `key`. A mismatched generation is a no-op so a failed predecessor
     /// cannot retract a replacement.
@@ -2354,11 +2399,28 @@ impl StreamListenerManager {
         // `hostNetwork` node. They form one shared `__nwudp_{port}` listener and
         // are demultiplexed by exact local destination address.
         //
-        // A port with exactly ONE claimant deliberately stays an individual
-        // listener: that is the documented direct-node-address boundary, where a
-        // datagram addressed to a node IP (not to a ClusterIP) is still served
-        // because the port names exactly one Service. Grouping it would refuse
-        // that traffic for lack of an exact Service destination.
+        // A port with exactly ONE claimant that has never been a shared group
+        // stays an individual listener: that is the documented
+        // direct-node-address boundary, where a datagram addressed to a node IP
+        // (not to a ClusterIP) is still served because the port names exactly
+        // one Service. Grouping it would refuse that traffic for lack of an
+        // exact Service destination.
+        //
+        // A port already bound as `__nwudp_{port}` must stay on that key when
+        // membership shrinks to one remaining VIP claimant. Dissolving the
+        // group changes the listener key, stops the shared socket, and races a
+        // rebind of the survivor — hosted NodeWaypoint eBPF live proved that
+        // rebind can fail `EADDRINUSE` and leave Service B unbound after A is
+        // retracted (`node_waypoint.udp.same_port_demux_retract_a_keeps_b`).
+        let existing_shared_node_waypoint_udp_ports: std::collections::HashSet<u16> = listeners
+            .iter()
+            .filter(|(key, handle)| {
+                key == &node_waypoint_udp_listener_key(handle.listen_port)
+                    && handle.scheme.is_udp()
+                    && !handle.join_handle.is_finished()
+            })
+            .map(|(_, handle)| handle.listen_port)
+            .collect();
         let mut node_waypoint_udp_groups: std::collections::HashMap<
             u16,
             Vec<NamespacedResourceId>,
@@ -2372,7 +2434,11 @@ impl StreamListenerManager {
             }
         }
         node_waypoint_udp_groups.retain(|port, ids| {
-            ids.len() > 1
+            let keep_shared = retain_shared_node_waypoint_udp_listener(
+                ids.len(),
+                existing_shared_node_waypoint_udp_ports.contains(port),
+            );
+            keep_shared
                 && !sni_groups.contains_key(port)
                 && !l4_match_groups.contains_key(port)
                 && listener_candidates_compatible(ids)
@@ -2458,7 +2524,8 @@ impl StreamListenerManager {
                         // Deliberately NOT part of the restart key: membership
                         // changes republish the destination table in place, so
                         // adding Service B never withdraws Service A's socket
-                        // and removing A never interrupts B. Amplification
+                        // and removing A never interrupts B — including when
+                        // B is the last remaining claimant. Amplification
                         // factor changes on a still-present member still
                         // retire the shared session map (#3873).
                         node_waypoint_udp_ids: Some(ids.clone()),
@@ -2533,8 +2600,9 @@ impl StreamListenerManager {
         // stopped or restarted, so a socket is never briefly serving from an
         // unpublished or stale table, and so an already-running listener picks
         // up an added/removed/updated Service by table republication instead of
-        // a rebind. Ports that stopped being shared groups are retracted and
-        // their routers dropped.
+        // a rebind. Ports that left the shared group entirely (no remaining
+        // destination-plane member) are retracted and their routers dropped;
+        // shrinking to one remaining claimant keeps the router and republishes.
         let shared_node_waypoint_udp_ports: std::collections::HashSet<u16> = effective_desired
             .values()
             .filter(|entry| entry.node_waypoint_udp_ids.is_some())
@@ -3526,9 +3594,10 @@ impl StreamListenerManager {
     /// `__nwudp_{port}` listener (issue #3861).
     ///
     /// The router outlives an individual listener restart so a rebind cannot
-    /// momentarily serve from an empty table; a port that stops being a shared
-    /// group has its router retracted and dropped by
-    /// [`Self::retire_unused_node_waypoint_udp_routers`].
+    /// momentarily serve from an empty table; a port that loses every
+    /// destination-plane member has its router retracted and dropped by
+    /// [`Self::retire_unused_node_waypoint_udp_routers`]. Shrinking to one
+    /// remaining claimant keeps this router and republishes.
     fn node_waypoint_udp_router(
         &self,
         port: u16,
