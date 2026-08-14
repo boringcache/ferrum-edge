@@ -29,9 +29,9 @@ use jsonwebtoken::{Algorithm, EncodingKey, Header, encode};
 use serde::Serialize;
 use serde_json::json;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
-use tokio::sync::{Notify, Semaphore, watch};
+use tokio::sync::{Mutex, Notify, Semaphore, watch};
 use tonic::metadata::MetadataValue;
 use tonic::transport::channel::ClientTlsConfig;
 use tonic::transport::{Certificate, Channel, Endpoint, Identity};
@@ -420,7 +420,8 @@ impl DpFrontendTlsRuntime {
 }
 
 /// What an operator-candidate publication should do to the H1/H2/TCP listener
-/// slot. H3 is always woken by the caller after the pairing slot is stored.
+/// slot. H3 is always woken by the caller after the coherent candidate,
+/// shared listener slot, and stream-listener publication finishes.
 #[derive(Clone)]
 pub struct DpFrontendListenerUpdate {
     /// Config to expose on the H1/H2/TCP slot when [`Self::replace_listener`]
@@ -438,12 +439,19 @@ pub struct DpFrontendListenerUpdate {
 /// halves as **one** [`crate::tls::AcceptedFrontendTls`]: independently reading
 /// the listener slot and the operator trust slot can pair config generation N
 /// with trust generation M across a coalesced revision or a concurrent CP
-/// update. This type holds a mutex across "snapshot both halves, store one
-/// Arc, return the listener action", and H3 loads only [`Self::h3_accepted_slot`].
+/// update. This type holds an async mutex across pairing state, the shared
+/// listener slot, and the [`crate::proxy::stream_listener::StreamListenerManager`]
+/// update so a descheduled operator reload cannot overwrite TCP stream TLS
+/// after a later CP publication. H3 loads only [`Self::h3_accepted_slot`].
 pub struct DpFrontendH3Pairing {
     lock: Mutex<DpFrontendH3PairingState>,
     /// Exact candidate the H3 listener adopts with one atomic load.
     pub h3_accepted_slot: crate::tls::SharedAcceptedFrontendTls,
+    /// Test-only gate between pairing stores and the StreamListenerManager
+    /// update. Tests hold it to prove a concurrent CP publication cannot
+    /// start until the in-flight operator stream-listener store finishes.
+    #[cfg(test)]
+    test_before_stream_listener: Mutex<()>,
 }
 
 struct DpFrontendH3PairingState {
@@ -463,29 +471,30 @@ impl DpFrontendH3Pairing {
                 operator_candidate: initial.clone(),
             }),
             h3_accepted_slot: crate::tls::accepted_frontend_tls_slot_with(initial),
+            #[cfg(test)]
+            test_before_stream_listener: Mutex::new(()),
         }
     }
 
     /// Record an accepted operator candidate (verifier + semantic material +
     /// the operator server config).
     ///
-    /// When CP material is present the H1/H2/TCP slot is left untouched and
-    /// this trust is paired with the active CP server config into
-    /// [`Self::h3_accepted_slot`]. The caller must still bump the H3 revision
-    /// so ProxyH3 can adopt that one Arc through its rustls transaction.
+    /// When CP material is present the H1/H2/TCP slot and stream-listener TLS
+    /// are left untouched and this trust is paired with the active CP server
+    /// config into [`Self::h3_accepted_slot`]. The caller must still bump the
+    /// H3 revision so ProxyH3 can adopt that one Arc through its rustls
+    /// transaction.
     ///
-    /// When CP material is absent, `listener_slot` is stored under the same
-    /// lock as the H3 candidate so a concurrent CP overlay cannot observe a
-    /// torn pair.
-    pub fn publish_operator_candidate(
+    /// When CP material is absent, `listener_slot` and the stream-listener TLS
+    /// slot are stored under the same lock as the H3 candidate so a concurrent
+    /// CP overlay cannot observe a torn pair or a stale operator overwrite.
+    pub async fn publish_operator_candidate(
         &self,
         candidate: Arc<crate::tls::AcceptedFrontendTls>,
         listener_slot: Option<&crate::tls::SharedFrontendTls>,
+        stream_listeners: Option<&crate::proxy::stream_listener::StreamListenerManager>,
     ) -> DpFrontendListenerUpdate {
-        let mut state = self
-            .lock
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut state = self.lock.lock().await;
         state.operator_candidate = candidate;
         let paired = pair_h3_candidate(&state);
         let replace_listener = state.cp_config.is_none();
@@ -494,10 +503,15 @@ impl DpFrontendH3Pairing {
             slot.store(Arc::new(listener_config.clone()));
         }
         self.h3_accepted_slot.store(Arc::new(Some(paired)));
-        DpFrontendListenerUpdate {
-            listener_config,
-            replace_listener,
-        }
+        self.commit_listener_publication(
+            state,
+            DpFrontendListenerUpdate {
+                listener_config,
+                replace_listener,
+            },
+            stream_listeners,
+        )
+        .await
     }
 
     /// Apply or clear CP-delivered server material.
@@ -505,17 +519,15 @@ impl DpFrontendH3Pairing {
     /// `Some` stores the CP server config as the active certificate and pairs
     /// it with the latest accepted operator trust. `None` restores that latest
     /// operator candidate (config + trust), not a startup snapshot captured
-    /// when CP material first arrived. The listener slot is stored under the
-    /// same lock as the H3 candidate.
-    pub fn publish_cp_server_config(
+    /// when CP material first arrived. The listener slot and stream-listener
+    /// TLS slot are stored under the same lock as the H3 candidate.
+    pub async fn publish_cp_server_config(
         &self,
         cp_config: Option<Arc<rustls::ServerConfig>>,
         listener_slot: Option<&crate::tls::SharedFrontendTls>,
+        stream_listeners: Option<&crate::proxy::stream_listener::StreamListenerManager>,
     ) -> DpFrontendListenerUpdate {
-        let mut state = self
-            .lock
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut state = self.lock.lock().await;
         state.cp_config = cp_config;
         let paired = pair_h3_candidate(&state);
         let listener_config = Some(paired.config.clone());
@@ -523,10 +535,35 @@ impl DpFrontendH3Pairing {
             slot.store(Arc::new(listener_config.clone()));
         }
         self.h3_accepted_slot.store(Arc::new(Some(paired)));
-        DpFrontendListenerUpdate {
-            listener_config,
-            replace_listener: true,
+        self.commit_listener_publication(
+            state,
+            DpFrontendListenerUpdate {
+                listener_config,
+                replace_listener: true,
+            },
+            stream_listeners,
+        )
+        .await
+    }
+
+    /// Finish the publication while still holding [`Self::lock`], including the
+    /// StreamListenerManager store/reconcile. Releasing earlier lets a
+    /// descheduled operator reload overwrite TCP stream TLS after CP is active.
+    async fn commit_listener_publication(
+        &self,
+        state: tokio::sync::MutexGuard<'_, DpFrontendH3PairingState>,
+        update: DpFrontendListenerUpdate,
+        stream_listeners: Option<&crate::proxy::stream_listener::StreamListenerManager>,
+    ) -> DpFrontendListenerUpdate {
+        #[cfg(test)]
+        let _stream_listener_gate = self.test_before_stream_listener.lock().await;
+        if update.replace_listener && let Some(manager) = stream_listeners {
+            manager
+                .set_frontend_tls_config(update.listener_config.clone())
+                .await;
         }
+        drop(state);
+        update
     }
 
     /// Current H3 serving candidate. One atomic load of the paired Arc.
@@ -1695,18 +1732,23 @@ async fn commit_frontend_tls_snapshot(
                 {
                     Some(pairing) => {
                         pairing
-                            .publish_cp_server_config(None, Some(slot))
+                            .publish_cp_server_config(
+                                None,
+                                Some(slot),
+                                Some(proxy_state.stream_listener_manager.as_ref()),
+                            )
+                            .await
                             .listener_config
                     }
                     None => {
                         slot.store(Arc::new(restore_tls_config.clone()));
+                        proxy_state
+                            .stream_listener_manager
+                            .set_frontend_tls_config(restore_tls_config.clone())
+                            .await;
                         restore_tls_config
                     }
                 };
-                proxy_state
-                    .stream_listener_manager
-                    .set_frontend_tls_config(restore_tls_config.clone())
-                    .await;
                 if restore_tls_config.is_some() {
                     info!(
                         "Restored operator frontend TLS material after clearing CP-delivered Gateway frontend TLS"
@@ -1729,15 +1771,22 @@ async fn commit_frontend_tls_snapshot(
                     // Pair the CP server certificate with the latest accepted
                     // operator trust before waking H3, so ProxyH3 never adopts
                     // the CP config beside a startup CRL clone. The listener
-                    // slot is stored under that same lock.
-                    pairing.publish_cp_server_config(Some(tls_config.clone()), Some(slot));
+                    // slot and stream-listener TLS are stored under that same
+                    // lock.
+                    pairing
+                        .publish_cp_server_config(
+                            Some(tls_config.clone()),
+                            Some(slot),
+                            Some(proxy_state.stream_listener_manager.as_ref()),
+                        )
+                        .await;
                 } else {
                     slot.store(Arc::new(Some(tls_config.clone())));
+                    proxy_state
+                        .stream_listener_manager
+                        .set_frontend_tls_config(Some(tls_config))
+                        .await;
                 }
-                proxy_state
-                    .stream_listener_manager
-                    .set_frontend_tls_config(Some(tls_config))
-                    .await;
                 cp_frontend_tls_materialized.store(true, Ordering::Release);
                 bump_frontend_tls_revision(frontend_tls_runtime);
                 info!(
@@ -3065,8 +3114,8 @@ mod tests {
         })
     }
 
-    #[test]
-    fn cp_material_plus_operator_trust_withdrawal_pairs_cp_config_and_wakes_h3() {
+    #[tokio::test]
+    async fn cp_material_plus_operator_trust_withdrawal_pairs_cp_config_and_wakes_h3() {
         let pairing = DpFrontendH3Pairing::from_operator_candidate(test_operator_candidate(
             test_server_config(),
             1,
@@ -3074,11 +3123,15 @@ mod tests {
         let listener = crate::tls::empty_frontend_tls_slot();
         let (revision_tx, revision_rx) = watch::channel(0_u64);
         let cp = test_server_config();
-        pairing.publish_cp_server_config(Some(cp.clone()), Some(&listener));
+        pairing
+            .publish_cp_server_config(Some(cp.clone()), Some(&listener), None)
+            .await;
         revision_tx.send_modify(|revision| *revision = revision.saturating_add(1));
 
         let withdrawn = test_operator_candidate(test_server_config(), 2);
-        let update = pairing.publish_operator_candidate(withdrawn.clone(), Some(&listener));
+        let update = pairing
+            .publish_operator_candidate(withdrawn.clone(), Some(&listener), None)
+            .await;
         revision_tx.send_modify(|revision| *revision = revision.saturating_add(1));
 
         assert!(
@@ -3102,8 +3155,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn operator_server_certificate_is_not_substituted_while_cp_material_is_active() {
+    #[tokio::test]
+    async fn operator_server_certificate_is_not_substituted_while_cp_material_is_active() {
         let operator_config = test_server_config();
         let pairing = DpFrontendH3Pairing::from_operator_candidate(test_operator_candidate(
             operator_config.clone(),
@@ -3111,10 +3164,14 @@ mod tests {
         ));
         let listener = crate::tls::empty_frontend_tls_slot();
         let cp = test_server_config();
-        pairing.publish_cp_server_config(Some(cp.clone()), Some(&listener));
+        pairing
+            .publish_cp_server_config(Some(cp.clone()), Some(&listener), None)
+            .await;
 
         let rotated_operator = test_operator_candidate(test_server_config(), 2);
-        let update = pairing.publish_operator_candidate(rotated_operator.clone(), Some(&listener));
+        let update = pairing
+            .publish_operator_candidate(rotated_operator.clone(), Some(&listener), None)
+            .await;
 
         assert!(!update.replace_listener);
         let listener_config = listener
@@ -3130,13 +3187,15 @@ mod tests {
         assert!(!Arc::ptr_eq(&h3.config, &rotated_operator.config));
     }
 
-    #[test]
-    fn refused_operator_trust_candidate_retains_h3_last_good_pair() {
+    #[tokio::test]
+    async fn refused_operator_trust_candidate_retains_h3_last_good_pair() {
         let startup = test_operator_candidate(test_server_config(), 1);
         let pairing = DpFrontendH3Pairing::from_operator_candidate(startup.clone());
         let listener = crate::tls::empty_frontend_tls_slot();
         let cp = test_server_config();
-        pairing.publish_cp_server_config(Some(cp.clone()), Some(&listener));
+        pairing
+            .publish_cp_server_config(Some(cp.clone()), Some(&listener), None)
+            .await;
         let before = pairing.h3_accepted().expect("paired");
 
         // A malformed/refused operator candidate never updates the accepted
@@ -3153,8 +3212,8 @@ mod tests {
         ));
     }
 
-    #[test]
-    fn clearing_cp_material_restores_latest_accepted_operator_not_startup() {
+    #[tokio::test]
+    async fn clearing_cp_material_restores_latest_accepted_operator_not_startup() {
         let startup_config = test_server_config();
         let pairing = DpFrontendH3Pairing::from_operator_candidate(test_operator_candidate(
             startup_config.clone(),
@@ -3163,10 +3222,16 @@ mod tests {
         let listener = crate::tls::empty_frontend_tls_slot();
         let later_config = test_server_config();
         let later = test_operator_candidate(later_config.clone(), 2);
-        pairing.publish_operator_candidate(later.clone(), Some(&listener));
+        pairing
+            .publish_operator_candidate(later.clone(), Some(&listener), None)
+            .await;
 
-        pairing.publish_cp_server_config(Some(test_server_config()), Some(&listener));
-        let restored = pairing.publish_cp_server_config(None, Some(&listener));
+        pairing
+            .publish_cp_server_config(Some(test_server_config()), Some(&listener), None)
+            .await;
+        let restored = pairing
+            .publish_cp_server_config(None, Some(&listener), None)
+            .await;
 
         assert!(restored.replace_listener);
         let h3 = pairing.h3_accepted().expect("restored operator candidate");
@@ -3190,10 +3255,13 @@ mod tests {
         let pairing = Arc::new(DpFrontendH3Pairing::from_operator_candidate(
             test_operator_candidate(startup_config.clone(), 1),
         ));
-        pairing.publish_operator_candidate(
-            test_operator_candidate(later_config.clone(), 2),
-            None,
-        );
+        pairing
+            .publish_operator_candidate(
+                test_operator_candidate(later_config.clone(), 2),
+                None,
+                None,
+            )
+            .await;
         let listener_slot = crate::tls::empty_frontend_tls_slot();
         let (revision_tx, revision_rx) = watch::channel(0_u64);
         let runtime = DpFrontendTlsRuntime {
@@ -3226,41 +3294,72 @@ mod tests {
         assert!(!Arc::ptr_eq(&h3.config, &startup_config));
         assert_eq!(*revision_rx.borrow(), 1);
         assert!(!runtime.cp_materialized.load(Ordering::Acquire));
+        assert!(
+            Arc::ptr_eq(
+                proxy_state
+                    .stream_listener_manager
+                    .snapshot_frontend_tls_config()
+                    .as_ref()
+                    .expect("restored stream-listener TLS"),
+                &later_config
+            ),
+            "clearing CP must restore stream-listener TLS to the latest accepted operator candidate"
+        );
     }
 
-    #[test]
-    fn coalesced_cp_and_operator_updates_cannot_cross_wire_config_and_trust() {
-        let pairing = DpFrontendH3Pairing::from_operator_candidate(test_operator_candidate(
-            test_server_config(),
-            1,
+    #[tokio::test]
+    async fn coalesced_cp_and_operator_updates_cannot_cross_wire_config_and_trust() {
+        let pairing = Arc::new(DpFrontendH3Pairing::from_operator_candidate(
+            test_operator_candidate(test_server_config(), 1),
         ));
         let listener = crate::tls::empty_frontend_tls_slot();
+        let proxy_state = minimal_proxy_state();
+        let manager = proxy_state.stream_listener_manager.clone();
         let cp_configs: Vec<_> = (0..32).map(|_| test_server_config()).collect();
         let operator_candidates: Vec<_> = (0..32)
             .map(|i| test_operator_candidate(test_server_config(), 10 + i as u8))
             .collect();
-        let barrier = std::sync::Barrier::new(2);
 
-        std::thread::scope(|scope| {
-            scope.spawn(|| {
-                barrier.wait();
+        let cp_task = {
+            let pairing = pairing.clone();
+            let listener = listener.clone();
+            let manager = manager.clone();
+            let cp_configs = cp_configs.clone();
+            tokio::spawn(async move {
                 for config in &cp_configs {
-                    pairing.publish_cp_server_config(Some(config.clone()), Some(&listener));
+                    pairing
+                        .publish_cp_server_config(
+                            Some(config.clone()),
+                            Some(&listener),
+                            Some(manager.as_ref()),
+                        )
+                        .await;
                 }
-            });
-            scope.spawn(|| {
-                barrier.wait();
+            })
+        };
+        let operator_task = {
+            let pairing = pairing.clone();
+            let listener = listener.clone();
+            let manager = manager.clone();
+            tokio::spawn(async move {
                 for candidate in &operator_candidates {
-                    pairing.publish_operator_candidate(candidate.clone(), Some(&listener));
+                    pairing
+                        .publish_operator_candidate(
+                            candidate.clone(),
+                            Some(&listener),
+                            Some(manager.as_ref()),
+                        )
+                        .await;
                 }
-            });
-        });
+            })
+        };
+        cp_task.await.expect("CP publications should complete");
+        operator_task
+            .await
+            .expect("operator publications should complete");
 
         let published = pairing.h3_accepted().expect("paired candidate");
-        let state = pairing
-            .lock
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let state = pairing.lock.lock().await;
         let expected = pair_h3_candidate(&state);
         assert!(
             Arc::ptr_eq(&published.config, &expected.config),
@@ -3269,6 +3368,18 @@ mod tests {
         assert_eq!(
             published.client_trust.material, expected.client_trust.material,
             "published H3 trust must match the locked pairing snapshot"
+        );
+        let listener_config = listener
+            .load_full()
+            .as_ref()
+            .clone()
+            .expect("shared listener slot");
+        let stream_config = manager
+            .snapshot_frontend_tls_config()
+            .expect("stream listener TLS");
+        assert!(
+            Arc::ptr_eq(&listener_config, &stream_config),
+            "shared listener slot and stream-listener TLS must stay coherent"
         );
         if let Some(cp) = state.cp_config.as_ref() {
             assert!(
@@ -3279,7 +3390,114 @@ mod tests {
                 !Arc::ptr_eq(&published.config, &state.operator_candidate.config),
                 "operator server certificate must not win while CP material is active"
             );
+            assert!(
+                Arc::ptr_eq(&stream_config, cp),
+                "stream-listener TLS must keep the CP server certificate while CP material is active"
+            );
         }
+    }
+
+    #[tokio::test]
+    async fn operator_stream_listener_store_cannot_overwrite_later_cp_publication() {
+        let operator_config = test_server_config();
+        let pairing = Arc::new(DpFrontendH3Pairing::from_operator_candidate(
+            test_operator_candidate(operator_config.clone(), 1),
+        ));
+        let listener = crate::tls::empty_frontend_tls_slot();
+        let proxy_state = minimal_proxy_state();
+        let manager = proxy_state.stream_listener_manager.clone();
+        let stall = pairing.test_before_stream_listener.lock().await;
+
+        let operator_task = {
+            let pairing = pairing.clone();
+            let listener = listener.clone();
+            let manager = manager.clone();
+            let candidate = test_operator_candidate(operator_config.clone(), 2);
+            tokio::spawn(async move {
+                pairing
+                    .publish_operator_candidate(
+                        candidate,
+                        Some(&listener),
+                        Some(manager.as_ref()),
+                    )
+                    .await
+            })
+        };
+
+        let mut spins = 0_u32;
+        loop {
+            if listener.load_full().as_ref().is_some() {
+                break;
+            }
+            spins += 1;
+            assert!(
+                spins < 10_000,
+                "operator publication should store the shared listener slot before the stream-listener wait"
+            );
+            tokio::task::yield_now().await;
+        }
+
+        assert!(
+            pairing.lock.try_lock().is_err(),
+            "operator publication must still hold the pairing lock at the stream-listener wait"
+        );
+        assert!(
+            manager.snapshot_frontend_tls_config().is_none(),
+            "stream-listener TLS must not be stored until the stalled publication resumes"
+        );
+        let h3 = pairing.h3_accepted().expect("operator pairing stored");
+        assert!(Arc::ptr_eq(&h3.config, &operator_config));
+
+        let cp = test_server_config();
+        let cp_task = {
+            let pairing = pairing.clone();
+            let listener = listener.clone();
+            let manager = manager.clone();
+            let cp = cp.clone();
+            tokio::spawn(async move {
+                pairing
+                    .publish_cp_server_config(Some(cp), Some(&listener), Some(manager.as_ref()))
+                    .await
+            })
+        };
+
+        assert!(
+            pairing.lock.try_lock().is_err(),
+            "CP publication must not acquire the pairing lock while operator publication is in flight"
+        );
+        assert!(
+            manager.snapshot_frontend_tls_config().is_none(),
+            "CP must not publish stream-listener TLS while operator publication still holds the lock"
+        );
+        let h3 = pairing.h3_accepted().expect("still the operator pair");
+        assert!(
+            Arc::ptr_eq(&h3.config, &operator_config),
+            "CP must not replace pairing state until the in-flight operator publication finishes"
+        );
+
+        drop(stall);
+        operator_task
+            .await
+            .expect("operator publication should complete");
+        cp_task.await.expect("CP publication should complete");
+
+        let stream_config = manager
+            .snapshot_frontend_tls_config()
+            .expect("stream listener TLS after both publications");
+        assert!(
+            Arc::ptr_eq(&stream_config, &cp),
+            "final stream-listener TLS must be the later CP config, not a stale operator overwrite"
+        );
+        let h3 = pairing.h3_accepted().expect("paired after CP");
+        assert!(Arc::ptr_eq(&h3.config, &cp));
+        assert!(Arc::ptr_eq(
+            listener
+                .load_full()
+                .as_ref()
+                .as_ref()
+                .expect("shared listener slot"),
+            &cp
+        ));
     }
 
     #[tokio::test]

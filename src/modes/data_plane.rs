@@ -436,16 +436,13 @@ pub async fn run(
                             else {
                                 continue;
                             };
-                            let update = pairing.publish_operator_candidate(
-                                candidate,
-                                Some(&listener_slot),
-                            );
-                            if update.replace_listener {
-                                bridge_proxy_state
-                                    .stream_listener_manager
-                                    .set_frontend_tls_config(update.listener_config)
-                                    .await;
-                            }
+                            pairing
+                                .publish_operator_candidate(
+                                    candidate,
+                                    Some(&listener_slot),
+                                    Some(bridge_proxy_state.stream_listener_manager.as_ref()),
+                                )
+                                .await;
                             revision_tx.send_modify(|revision| {
                                 *revision = revision.saturating_add(1);
                             });

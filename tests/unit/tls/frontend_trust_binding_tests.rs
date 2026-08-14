@@ -1141,8 +1141,8 @@ fn h3_request_handler_rechecks_withdrawal_before_admission() {
 /// DP mode must pair CP-owned server config with the accepted operator trust
 /// into one H3 candidate. Independently reading the listener slot and a startup
 /// CRL clone is the fail-open the pairing slot exists to close.
-#[test]
-fn dp_h3_pairing_wakes_on_operator_trust_while_cp_owns_the_server_certificate() {
+#[tokio::test]
+async fn dp_h3_pairing_wakes_on_operator_trust_while_cp_owns_the_server_certificate() {
     let dir = tempfile::tempdir().expect("tempdir");
     let pki = build_pki();
     let startup_crls = parse_crls(&pki.crl_pem(&[UNRELATED_SERIAL], 1));
@@ -1161,9 +1161,13 @@ fn dp_h3_pairing_wakes_on_operator_trust_while_cp_owns_the_server_certificate() 
 
     let pairing = DpFrontendH3Pairing::from_operator_candidate(operator_startup);
     let listener = ferrum_edge::tls::empty_frontend_tls_slot();
-    pairing.publish_cp_server_config(Some(cp_startup.config.clone()), Some(&listener));
+    pairing
+        .publish_cp_server_config(Some(cp_startup.config.clone()), Some(&listener), None)
+        .await;
 
-    let update = pairing.publish_operator_candidate(operator_withdrawn.clone(), Some(&listener));
+    let update = pairing
+        .publish_operator_candidate(operator_withdrawn.clone(), Some(&listener), None)
+        .await;
     assert!(
         !update.replace_listener,
         "operator trust must not substitute the operator server certificate while CP material is active"
@@ -1216,15 +1220,44 @@ fn dp_mode_pairs_cp_server_config_with_operator_trust_for_h3() {
         pairing_publish < fallback_skip,
         "CP-owned material must not skip the H3 pairing wakeup; the continue is only the no-pairing fallback"
     );
+    let pairing_arm = &dp[bridge..][..fallback_skip];
+    assert!(
+        pairing_arm.contains("stream_listener_manager"),
+        "operator pairing publication must include the stream-listener manager in the same transaction"
+    );
+    assert!(
+        !pairing_arm.contains("set_frontend_tls_config"),
+        "stream-listener TLS must be stored inside the pairing lock, not after the operator bridge returns"
+    );
 
     let client = include_str!("../../../src/grpc/dp_client.rs");
     assert!(
-        client.contains("publish_cp_server_config(Some(tls_config.clone()), Some(slot))"),
-        "applying CP material must pair it with the latest accepted operator trust before waking H3"
+        client.contains("commit_listener_publication"),
+        "pairing publications must finish StreamListenerManager updates under the same lock"
     );
     assert!(
-        client.contains("publish_cp_server_config(None, Some(slot))"),
+        client.contains("set_frontend_tls_config(update.listener_config.clone())"),
+        "StreamListenerManager must be updated before the pairing lock is released"
+    );
+    let clear_arm = client
+        .find("FrontendTlsSnapshotUpdate::Clear")
+        .expect("CP clear arm");
+    let replace_arm = client
+        .find("FrontendTlsSnapshotUpdate::Replace")
+        .expect("CP replace arm");
+    assert!(
+        client[clear_arm..replace_arm].contains("publish_cp_server_config")
+            && client[clear_arm..replace_arm].contains("None,")
+            && client[clear_arm..replace_arm]
+                .contains("Some(proxy_state.stream_listener_manager.as_ref())"),
         "clearing CP material must restore the latest accepted operator candidate through the pairing slot"
+    );
+    assert!(
+        client[replace_arm..].contains("publish_cp_server_config")
+            && client[replace_arm..].contains("Some(tls_config.clone())")
+            && client[replace_arm..]
+                .contains("Some(proxy_state.stream_listener_manager.as_ref())"),
+        "applying CP material must pair it with the latest accepted operator trust and update stream listeners under that lock"
     );
 
     let h3 = include_str!("../../../src/http3/server.rs");
