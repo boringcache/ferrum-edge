@@ -13,13 +13,23 @@
 //!    `max_bytes + 1` so growth or inaccurate metadata cannot bypass the
 //!    ceiling.
 //! 4. Two independent open/read cycles must observe matching file identity and
-//!    **byte-identical** content. Size/metadata agreement alone is not success.
+//!    **byte-identical** content, and those probes are separated by the
+//!    configured settle interval (the same [`StableFileReadOptions::retry_delay`]
+//!    used between unstable attempts). Size/metadata agreement alone is not
+//!    success. Back-to-back probes can both complete inside one truncate/write
+//!    or delete/recreate torn window and would otherwise accept identical
+//!    partial bytes.
 //! 5. Instability retries a bounded number of times, then fails closed.
 //! 6. Only the FIRST probe's absence is an authoritative [`StableFileError::NotFound`]
 //!    (the `absent_ok` signal). A path that disappears after a probe already
 //!    proved it existed is transient instability, so it takes the bounded retry
 //!    instead of failing closed as a terminal absence.
 //! 7. Errors name the logical source and never include file contents.
+//! 8. Worst-case synchronous sleep is bounded:
+//!    `(2 * max_attempts - 1) * retry_delay` (180ms at the production defaults)
+//!    plus the capped open/read work. This is a cold-path cost (startup,
+//!    SIGHUP, mesh file load), not a per-request or per-byte delay.
+//!    [`Duration::ZERO`] skips both waits and is well-defined.
 
 use std::io::Read;
 use std::path::Path;
@@ -38,7 +48,16 @@ pub const MAX_MESH_CONFIG_FILE_BYTES: u64 = 64 * 1024 * 1024; // 64 MiB
 /// Default open/read/compare cycles before failing closed.
 pub const STABLE_FILE_MAX_ATTEMPTS: usize = 5;
 
-/// Settle delay between unstable attempts.
+/// Settle interval between the two probes of one attempt **and** between
+/// unstable attempts.
+///
+/// Production callers use this 20ms value through [`StableFileReadOptions::new`].
+/// A successful read sleeps once (the inter-probe settle). Exhausting every
+/// attempt sleeps `max_attempts` settle intervals plus
+/// `max_attempts.saturating_sub(1)` retry intervals — 180ms at the defaults —
+/// plus the bounded open/read work. That budget is a cold-path ceiling, not a
+/// per-request or per-byte mechanism. [`Duration::ZERO`] is a well-defined
+/// no-op used by tests that opt out of waiting.
 pub const STABLE_FILE_RETRY_DELAY: Duration = Duration::from_millis(20);
 
 /// Caller-supplied bounds and diagnostics for a stable read.
@@ -50,7 +69,16 @@ pub struct StableFileReadOptions<'a> {
     pub source_name: &'a str,
     /// How many open/read/compare cycles to attempt.
     pub max_attempts: usize,
-    /// Delay between unstable attempts.
+    /// Settle interval used in two places:
+    ///
+    /// 1. Between the two consecutive probes of a single attempt, so a
+    ///    delete/recreate or truncate/write torn window cannot satisfy both
+    ///    probes merely because they ran back-to-back.
+    /// 2. Between unstable attempts, before the next pair of probes.
+    ///
+    /// Production callers use [`STABLE_FILE_RETRY_DELAY`]. [`Duration::ZERO`]
+    /// skips both waits: the two probes still run and still require
+    /// byte-identical content, but they no longer span a settle window.
     pub retry_delay: Duration,
 }
 
@@ -203,6 +231,15 @@ fn map_io(error: std::io::Error) -> StableFileError {
     StableFileError::from(error)
 }
 
+/// Sleep `delay` when it is non-zero. [`Duration::ZERO`] is a well-defined
+/// no-op so custom test options can opt out of the settle window without a
+/// distinct retry policy.
+fn sleep_settle(delay: Duration) {
+    if !delay.is_zero() {
+        std::thread::sleep(delay);
+    }
+}
+
 fn read_opened_file(
     path: &Path,
     file: &mut std::fs::File,
@@ -307,11 +344,28 @@ fn read_snapshot(path: &Path, max_bytes: u64) -> Result<(FileIdentity, Vec<u8>),
 /// Read `path` under the shared bounded stability/atomicity contract.
 ///
 /// Two independent open/read cycles must observe the same file identity and
-/// byte-identical contents. Metadata/size agreement without content equality
-/// is insufficient and is not treated as success.
+/// byte-identical contents, and they are separated by [`StableFileReadOptions::retry_delay`]
+/// so a transient truncate/write or delete/recreate window cannot satisfy both
+/// probes by running back-to-back. Metadata/size agreement without content
+/// equality is insufficient and is not treated as success.
 pub fn read_stable_file(
     path: &Path,
     options: StableFileReadOptions<'_>,
+) -> Result<String, StableFileError> {
+    read_stable_file_with_between_probes(path, options, |_| {})
+}
+
+/// Same contract as [`read_stable_file`], with a hook after the first probe of
+/// each attempt and before the inter-probe settle sleep.
+///
+/// Production [`read_stable_file`] is this function with an empty closure.
+/// External tests use the hook to observe the first-probe bytes and publish a
+/// successor generation in the settle window without racing the scheduler
+/// (issue #3881).
+pub(crate) fn read_stable_file_with_between_probes(
+    path: &Path,
+    options: StableFileReadOptions<'_>,
+    mut between_probes: impl FnMut(&[u8]),
 ) -> Result<String, StableFileError> {
     let display_path = path.display();
     let mut last_reason = "unknown instability";
@@ -319,6 +373,13 @@ pub fn read_stable_file(
     for attempt in 1..=options.max_attempts {
         match (|| -> Result<String, StableFileError> {
             let (first_identity, first_bytes) = read_snapshot(path, options.max_bytes)?;
+            // Consecutive probes must span the settle interval. Back-to-back
+            // reads can both complete inside one torn publication window and
+            // accept identical partial bytes as a "stable" generation. The
+            // hook runs inside that window so tests can publish without a
+            // wall-clock race against the first probe.
+            between_probes(&first_bytes);
+            sleep_settle(options.retry_delay);
             // The first probe already proved the path exists, so a second-probe
             // absence is a replacement window, not a terminal `NotFound`.
             let (second_identity, second_bytes) =
@@ -357,7 +418,7 @@ pub fn read_stable_file(
                     "Configuration file read was unstable; retrying"
                 );
                 if attempt < options.max_attempts {
-                    std::thread::sleep(options.retry_delay);
+                    sleep_settle(options.retry_delay);
                 }
             }
             Err(other) => return Err(other),
@@ -414,8 +475,12 @@ pub fn stable_file_error_anyhow(
 /// path holding an ordinary JSON document still parses — but the parser really
 /// is YAML, and a JSON-only shape YAML rejects (for example a mapping key past
 /// libyaml's 1024-byte simple-key limit) fails closed. There is deliberately no
-/// content sniffing and no JSON fallback: detection must not parse a large
-/// document once to classify it and again to deserialize it.
+/// content sniffing and no JSON fallback: format detection itself never parses
+/// the document. YAML still receives a bounded event preflight before
+/// deserialization so alias materialization cannot bypass resource ceilings.
+///
+/// YAML alias/anchor expansion is bounded separately at the YAML trust
+/// boundary ([`crate::config::yaml_alias_budget`]), not by switching parsers.
 pub fn detect_json_or_yaml_extension(path: &Path) -> bool {
     let ext = path
         .extension()

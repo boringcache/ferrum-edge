@@ -785,7 +785,11 @@ async fn test_admit_write_pins_and_blocks_on_failover_without_opt_in() {
         .expect("admit_non_config_db_write must ignore failover topology");
 }
 
+// This test drives read-only/db-unavailable refusals through `admit_non_config_db_write`,
+// which increments the same process-global rejection counter the observability tests below
+// reset and assert on; it shares their serialization key.
 #[tokio::test]
+#[serial_test::serial(admin_read_only_rejection_observability_lock)]
 async fn test_admit_non_config_db_write_keeps_read_only_and_db_unavailable_gates() {
     let config = TestConfig::default();
     let db_flag = Arc::new(AtomicBool::new(false));
@@ -1100,7 +1104,10 @@ fn admin_mutation_handlers_use_admit_write_not_sync_gate_alone() {
     }
 }
 
+// These tests reset/mutate the process-global read-only rejection observability
+// counter; serialize them for parallel `cargo test` runs.
 #[tokio::test]
+#[serial_test::serial(admin_read_only_rejection_observability_lock)]
 async fn test_admit_write_increments_read_only_rejection_counter() {
     ferrum_edge::admin::reset_read_only_rejection_observability_for_test();
     let config = TestConfig::default();
@@ -1115,6 +1122,7 @@ async fn test_admit_write_increments_read_only_rejection_counter() {
 }
 
 #[tokio::test]
+#[serial_test::serial(admin_read_only_rejection_observability_lock)]
 async fn test_check_write_allowed_does_not_increment_read_only_rejection_counter() {
     ferrum_edge::admin::reset_read_only_rejection_observability_for_test();
     let config = TestConfig::default();
@@ -1126,6 +1134,7 @@ async fn test_check_write_allowed_does_not_increment_read_only_rejection_counter
 }
 
 #[tokio::test]
+#[serial_test::serial(admin_read_only_rejection_observability_lock)]
 async fn test_admit_non_config_db_write_increments_read_only_rejection_counter() {
     ferrum_edge::admin::reset_read_only_rejection_observability_for_test();
     let config = TestConfig::default();
@@ -1160,6 +1169,7 @@ async fn test_read_only_rejection_log_context_uses_request_slot() {
 }
 
 #[test]
+#[serial_test::serial(admin_read_only_rejection_observability_lock)]
 fn test_read_only_rejection_metric_renders_on_prometheus_scrape() {
     ferrum_edge::admin::reset_read_only_rejection_observability_for_test();
     let registry = ferrum_edge::plugins::prometheus_metrics::MetricsRegistry::new();

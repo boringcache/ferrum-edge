@@ -10,8 +10,9 @@
 //! keeping the last good slice when the reload fails.
 //!
 //! Reads go through the shared bounded stable-file primitive (regular-file
-//! open target, Unix `O_NONBLOCK`, 64 MiB ceiling with `limit + 1`, stable
-//! identity/content probes). Initial load and SIGHUP reload perform
+//! open target, Unix `O_NONBLOCK`, 64 MiB ceiling with `limit + 1`, two
+//! identity/content probes separated by a 20ms settle interval). Initial
+//! load and SIGHUP reload perform
 //! filesystem and parse work on `spawn_blocking`, coalesce repeated signals
 //! so only one generation is parsed at a time (with at most one follow-up
 //! after an in-flight load), and refuse to let an older completed load
@@ -38,6 +39,7 @@ use crate::config::stable_file::{
     read_stable_file, stable_file_error_anyhow,
 };
 use crate::config::types::{CURRENT_CONFIG_VERSION, GatewayConfig};
+use crate::config::yaml_alias_budget::admit_yaml_alias_expansion;
 use crate::modes::mesh::revision::MeshRevisionContentIdentity;
 use crate::modes::mesh::runtime::{MeshRuntimeState, MeshSliceInstall, slice_content_identity};
 use crate::modes::mesh::slice::{MeshSlice, MeshSliceRequest};
@@ -128,10 +130,15 @@ pub fn read_mesh_config_document(
     let is_yaml = detect_json_or_yaml_extension(path);
 
     let document: MeshFileDocument = if is_yaml {
+        admit_yaml_alias_expansion(&content)
+            .map_err(|e| anyhow::anyhow!(mesh_doc_parse_error(e)))?;
         serde_yaml::from_str(&content).map_err(|e| anyhow::anyhow!(mesh_doc_parse_error(e)))?
     } else {
         serde_json::from_str(&content).map_err(|e| anyhow::anyhow!(mesh_doc_parse_error(e)))?
     };
+    // Deserialization owns all retained fields; do not keep the source buffer
+    // alive while slice materialization allocates its runtime structures.
+    drop(content);
 
     if let Some(version) = document.version.as_deref()
         && version != CURRENT_CONFIG_VERSION

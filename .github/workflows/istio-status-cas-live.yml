@@ -1,0 +1,69 @@
+name: Istio Status CAS Live
+
+# Hosted Kind/apiserver competing-writer proof for issue #3838.
+# Thin launcher: checkout → Rust CI toolchain → pinned Kind/kubectl →
+# checked-in CRD → ignored live test binary that drives Ferrum's real
+# IstioStatusWriter. Stays outside ci.yml so the Cross-frozen Tests
+# aggregate is untouched. Not a required live-suite check.
+
+on:
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - ".github/workflows/istio-status-cas-live.yml"
+      - ".github/actions/setup-kubernetes-tools/**"
+      - ".github/actions/setup-rust-ci/**"
+      - "src/k8s_controller/istio_status.rs"
+      - "src/k8s_controller/metrics.rs"
+      - "tests/k8s_istio_status_cas_live.rs"
+      - "tests/fixtures/k8s/istio_authorizationpolicy_status_crd.yaml"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: istio-status-cas-live-${{ github.ref }}
+  cancel-in-progress: true
+
+# The kind cluster name is spelled literally in each step below rather than
+# through a workflow-level `env:`, so no step body depends on a rewritten
+# context value.
+
+jobs:
+  istio-status-cas-live:
+    name: Istio Status CAS Live
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout Ferrum Edge
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
+        with:
+          persist-credentials: false
+
+      - uses: ./.github/actions/setup-rust-ci
+        with:
+          shared-key: "ci-istio-status-cas-live"
+
+      - name: Install Kubernetes tools
+        uses: ./.github/actions/setup-kubernetes-tools
+
+      - name: Create kind cluster
+        run: kind create cluster --name ferrum-istio-status-cas --wait 120s
+
+      - name: Install pinned AuthorizationPolicy status CRD
+        run: kubectl apply -f tests/fixtures/k8s/istio_authorizationpolicy_status_crd.yaml
+
+      - name: Wait for CRD to establish
+        run: kubectl wait --for=condition=Established crd/authorizationpolicies.security.istio.io --timeout=60s
+
+      - name: Run Istio status CAS live competing-writer proof
+        env:
+          FERRUM_ISTIO_STATUS_CAS_LIVE: "1"
+          RUST_BACKTRACE: "1"
+        run: cargo test --test k8s_istio_status_cas_live -- --ignored --nocapture --exact live_competing_writer_preserves_foreign_and_ferrum_conditions
+
+      - name: Delete kind cluster
+        if: always()
+        run: kind delete cluster --name ferrum-istio-status-cas

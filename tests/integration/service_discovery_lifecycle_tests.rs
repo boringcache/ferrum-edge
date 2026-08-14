@@ -36,6 +36,9 @@ async fn isolated() -> tokio::sync::MutexGuard<'static, ()> {
     health::reset_for_test();
     // The publication-preparation hold is process-global too; a test that
     // panicked while holding one must not block the next test's publications.
+    // This blanket clear is panic-cleanup at the start of a serialized
+    // lifecycle test. Holder Drop uses the generation-scoped clear so a stale
+    // holder cannot steal a newer test's slot.
     ferrum_edge::service_discovery::clear_discovery_publication_preparation_hold_for_test();
     guard
 }
@@ -1742,7 +1745,10 @@ async fn a_lifecycle_abort_inside_the_withdrawal_fence_claims_nothing() {
 
 // ── #3717 × #3721: expiry during supervisor restart backoff ───────────
 
-/// Bounded variant of [`wait_for`]: at most `polls` × 10ms.
+/// Bounded variant of [`wait_for`]: at most `polls` × 10ms of real or paused
+/// time. Under `start_paused` each sleep auto-advances the clock; use
+/// [`wait_for_progress`] for scheduling seams and [`wait_for_deadline_action`]
+/// for timer-backed production events instead of this helper.
 async fn wait_for_within(polls: u32, mut predicate: impl FnMut() -> bool) -> bool {
     for _ in 0..polls {
         if predicate() {
@@ -1751,6 +1757,38 @@ async fn wait_for_within(polls: u32, mut predicate: impl FnMut() -> bool) -> boo
         tokio::time::sleep(std::time::Duration::from_millis(10)).await;
     }
     predicate()
+}
+
+/// Wait for a scheduling or state-transition predicate without advancing
+/// paused time.
+///
+/// Hosted mesh-protocols shards (jobs 94564143416 / 94550479399) failed
+/// `expiry_withdraws_on_time_while_publication_preparation_is_blocked` and
+/// `a_retain_policy_expiry_keeps_a_pending_publication_alive` in ~0.1s:
+/// `wait_for_within`'s 10ms sleeps auto-advance ~20s of virtual time while
+/// the poller is off the timer wheel (hold watch, or real DNS warmup after
+/// release). The production event after release is that the parked waiter
+/// continues and publishes — yield until that state is visible.
+async fn wait_for_progress(mut predicate: impl FnMut() -> bool) -> bool {
+    for _ in 0..10_000 {
+        if predicate() {
+            return true;
+        }
+        tokio::task::yield_now().await;
+    }
+    predicate()
+}
+
+/// Advance paused time by the production deadline, then yield until the
+/// timer-backed action is visible. Does not keep auto-advancing past that
+/// deadline the way [`wait_for_within`] would.
+async fn wait_for_deadline_action(
+    deadline: std::time::Duration,
+    predicate: impl FnMut() -> bool,
+) -> bool {
+    tokio::task::yield_now().await;
+    tokio::time::advance(deadline + std::time::Duration::from_millis(1)).await;
+    wait_for_progress(predicate).await
 }
 
 #[tokio::test]
@@ -1858,6 +1896,8 @@ async fn a_crash_looping_poller_still_expires_and_withdraws_during_restart_backo
 // network while virtual time races ahead.
 
 /// RAII wrapper: the hold is process-global, so it must not outlive its test.
+/// Drop releases *this* generation only — a stale holder must not clear or
+/// release a newer test's hold.
 struct PreparationHold(Arc<ferrum_edge::service_discovery::PublicationPreparationHold>);
 
 impl PreparationHold {
@@ -1865,15 +1905,50 @@ impl PreparationHold {
         Self(ferrum_edge::service_discovery::hold_discovery_publication_preparation_for_test())
     }
 
+    fn inner(&self) -> Arc<ferrum_edge::service_discovery::PublicationPreparationHold> {
+        Arc::clone(&self.0)
+    }
+
+    fn generation(&self) -> u64 {
+        self.0.generation()
+    }
+
     /// How many publication preparations have parked on this hold.
     fn entered(&self) -> u64 {
         self.0.entered()
+    }
+
+    fn passed(&self) -> u64 {
+        self.0.passed()
+    }
+
+    fn is_released(&self) -> bool {
+        self.0.is_released()
+    }
+
+    fn is_installed(&self) -> bool {
+        self.0.is_installed()
+    }
+
+    /// Release this generation, wait until parked waiters observe it, then let
+    /// Drop clear the slot if we still own it. Required under paused time:
+    /// dropping the hold without this handshake lets a sleep-poll auto-advance
+    /// to exhaustion while the poller is still parked.
+    async fn release_and_observe(self) {
+        self.0.release();
+        assert!(
+            self.0.wait_until_release_observed().await,
+            "parked publication preparation must observe this hold generation's release"
+        );
     }
 }
 
 impl Drop for PreparationHold {
     fn drop(&mut self) {
-        ferrum_edge::service_discovery::clear_discovery_publication_preparation_hold_for_test();
+        self.0.release();
+        ferrum_edge::service_discovery::clear_discovery_publication_preparation_hold_generation_for_test(
+            self.0.generation(),
+        );
     }
 }
 
@@ -1899,6 +1974,8 @@ const BLOCKED_PREPARATION_MAX_STALE_SECONDS: u64 = 5;
 /// advances virtual time, so hosted CI observed the post-release publication
 /// waits returning false in ~80ms. An IP takes the literal fast path.
 const PAUSED_PREPARATION_DISCOVERED_HOST: &str = "192.0.2.10";
+const BLOCKED_PREPARATION_STALE_DEADLINE: std::time::Duration =
+    std::time::Duration::from_secs(BLOCKED_PREPARATION_MAX_STALE_SECONDS);
 
 /// A withdrawing policy must fail closed on time even though the pending
 /// snapshot was already admitted, and must not let that snapshot publish (or
@@ -1939,7 +2016,7 @@ async fn expiry_withdraws_on_time_while_publication_preparation_is_blocked() {
 
     // The first admitted snapshot parks in preparation and never publishes.
     assert!(
-        wait_for_within(2000, || hold.entered() >= 1).await,
+        wait_for_progress(|| hold.entered() >= 1).await,
         "publication preparation was never reached"
     );
     assert!(
@@ -1953,7 +2030,7 @@ async fn expiry_withdraws_on_time_while_publication_preparation_is_blocked() {
 
     // Nothing has ever published, so the anchor is task start and the deadline
     // elapses while preparation is still parked.
-    let withdrew = wait_for_within(2000, || {
+    let withdrew = wait_for_deadline_action(BLOCKED_PREPARATION_STALE_DEADLINE, || {
         task_status(&task.key).is_some_and(|status| status.withdrawn)
     })
     .await;
@@ -1972,10 +2049,18 @@ async fn expiry_withdraws_on_time_while_publication_preparation_is_blocked() {
         "an abandoned snapshot must not advance the staleness anchor"
     );
 
-    // The abandoned snapshot must not surface later either: give the poller
-    // room to loop while preparation is still blocked.
+    // The abandoned snapshot must not surface later either: the next poll
+    // interval is already due (missed ticks while parked), so yield until it
+    // re-enters preparation. Advance one poll only if the interval has not
+    // yet fired.
+    if !wait_for_progress(|| hold.entered() >= 2).await {
+        tokio::time::advance(std::time::Duration::from_secs(
+            BLOCKED_PREPARATION_POLL_SECONDS,
+        ))
+        .await;
+    }
     assert!(
-        wait_for_within(500, || hold.entered() >= 2).await,
+        wait_for_progress(|| hold.entered() >= 2).await,
         "the next poll must re-enter preparation after the withdrawal"
     );
     assert_eq!(
@@ -1984,11 +2069,13 @@ async fn expiry_withdraws_on_time_while_publication_preparation_is_blocked() {
         "a stale pending snapshot must never publish over the withdrawal"
     );
 
-    // Recovery: release preparation and a later poll republishes normally,
-    // clearing stale/withdrawn state without a config reload.
-    drop(hold);
+    // Recovery: release preparation. The parked waiter publishes without a
+    // paused-clock sleep poll (which would auto-advance through DNS timeouts
+    // and exhaust in ~0.1s on hosted CI).
+    let released_at = tokio::time::Instant::now();
+    hold.release_and_observe().await;
 
-    let republished = wait_for_within(2000, || {
+    let republished = wait_for_progress(|| {
         lb_has_host(
             &lb_cache,
             "blocked-warmup",
@@ -2000,7 +2087,11 @@ async fn expiry_withdraws_on_time_while_publication_preparation_is_blocked() {
         republished,
         "a later fresh poll must recover once preparation can complete"
     );
-    let recovered = wait_for_within(2000, || {
+    assert!(
+        released_at.elapsed() < std::time::Duration::from_secs(1),
+        "recovery after release must complete from the parked waiter, not from paused-clock sleep exhaustion"
+    );
+    let recovered = wait_for_progress(|| {
         task_status(&task.key).is_some_and(|status| !status.withdrawn && !status.stale)
     })
     .await;
@@ -2044,7 +2135,7 @@ async fn cancellation_stops_a_task_parked_in_publication_preparation() {
     );
 
     assert!(
-        wait_for_within(2000, || hold.entered() >= 1).await,
+        wait_for_progress(|| hold.entered() >= 1).await,
         "publication preparation was never reached"
     );
 
@@ -2099,10 +2190,10 @@ async fn a_retain_policy_expiry_keeps_a_pending_publication_alive() {
     );
 
     assert!(
-        wait_for_within(2000, || hold.entered() >= 1).await,
+        wait_for_progress(|| hold.entered() >= 1).await,
         "publication preparation was never reached"
     );
-    let claimed = wait_for_within(2000, || {
+    let claimed = wait_for_deadline_action(BLOCKED_PREPARATION_STALE_DEADLINE, || {
         health::expiry_applied_for_test(&task.key) == Some(true)
     })
     .await;
@@ -2122,8 +2213,9 @@ async fn a_retain_policy_expiry_keeps_a_pending_publication_alive() {
          parked rather than being discarded and re-prepared"
     );
 
-    drop(hold);
-    let published = wait_for_within(2000, || {
+    let released_at = tokio::time::Instant::now();
+    hold.release_and_observe().await;
+    let published = wait_for_progress(|| {
         lb_has_host(
             &lb_cache,
             "retain-warmup",
@@ -2135,9 +2227,117 @@ async fn a_retain_policy_expiry_keeps_a_pending_publication_alive() {
         published,
         "the retained pending publication must complete once preparation is released"
     );
+    assert!(
+        released_at.elapsed() < std::time::Duration::from_secs(1),
+        "the retained waiter must publish from the parked preparation, not from paused-clock sleep exhaustion"
+    );
 
     let _ = task.cancel_tx.send(true);
     let _ = task.handle.await;
+}
+
+// ── Preparation-hold generation ownership and paused-clock release ────
+
+/// A stale holder whose slot was replaced must not clear or release the newer
+/// generation. Hosted shards run other tests in the same process; Drop and the
+/// generation-scoped clear have to be no-ops against a slot they no longer own.
+#[tokio::test(start_paused = true)]
+async fn a_stale_holder_does_not_clear_or_release_a_newer_preparation_hold() {
+    let _guard = isolated().await;
+    let first = PreparationHold::install();
+    let first_generation = first.generation();
+    let second = PreparationHold::install();
+
+    assert_ne!(first_generation, second.generation());
+    assert!(
+        second.is_installed(),
+        "installing a replacement must occupy the process-global slot"
+    );
+    assert!(
+        !second.is_released(),
+        "replacing the slot must not release the newer generation"
+    );
+
+    drop(first);
+    assert!(
+        second.is_installed(),
+        "a stale Drop must not take a newer test's hold"
+    );
+    assert!(
+        !second.is_released(),
+        "a stale Drop must not release a newer test's waiters"
+    );
+
+    ferrum_edge::service_discovery::clear_discovery_publication_preparation_hold_generation_for_test(
+        first_generation,
+    );
+    assert!(
+        second.is_installed(),
+        "clearing a stale generation must leave the current hold installed"
+    );
+    assert!(
+        !second.is_released(),
+        "clearing a stale generation must not release the current hold"
+    );
+
+    second.release_and_observe().await;
+}
+
+/// Replacing the process-global hold must unblock waiters parked on the
+/// previous generation without releasing the replacement.
+#[tokio::test(start_paused = true)]
+async fn replacing_a_preparation_hold_releases_the_previous_generation_only() {
+    let _guard = isolated().await;
+    let first = PreparationHold::install();
+    let first_hold = first.inner();
+    let parked = tokio::spawn(async move {
+        first_hold.park().await;
+    });
+    assert!(
+        wait_for_progress(|| first.entered() >= 1).await,
+        "the previous generation never parked"
+    );
+
+    let second = PreparationHold::install();
+    assert!(
+        first.inner().wait_until_release_observed().await,
+        "installing a replacement must release waiters parked on the previous generation"
+    );
+    parked.await.expect("previous waiter");
+    assert!(
+        first.passed() >= 1,
+        "the previous waiter must have observed replacement-release"
+    );
+    assert!(
+        !second.is_released(),
+        "the replacement hold must still block"
+    );
+    assert!(second.is_installed());
+
+    second.release_and_observe().await;
+}
+
+/// Under `start_paused`, releasing the owned generation must let a parked
+/// waiter observe the flag without relying on a sleep-poll that auto-advances
+/// the paused clock to exhaustion. A semaphore close is invisible to the
+/// paused clock; this seam keeps the waiter on the timer wheel and handshakes
+/// `passed` / `waiting == 0`.
+#[tokio::test(start_paused = true)]
+async fn releasing_a_preparation_hold_is_observed_under_paused_time() {
+    let _guard = isolated().await;
+    let hold = PreparationHold::install();
+    let parked_hold = hold.inner();
+    let parked = tokio::spawn(async move {
+        parked_hold.park().await;
+    });
+    assert!(
+        wait_for_progress(|| hold.entered() >= 1).await,
+        "the waiter never parked"
+    );
+    assert_eq!(hold.passed(), 0, "release has not happened yet");
+
+    hold.release_and_observe().await;
+    parked.await.expect("parked waiter");
 }
 
 // ── #3717: the refused unbounded-retention request is reported once ───

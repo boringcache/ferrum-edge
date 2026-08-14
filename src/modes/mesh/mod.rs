@@ -71,7 +71,7 @@ use crate::modes::mesh::slice::{
     index_service_entry_host_owners, mesh_service_identities,
 };
 use crate::modes::startup_security;
-use crate::proxy::{self, ProxyState};
+use crate::proxy::{self, GatewayTrustCommit, ProxyState};
 use crate::startup::wait_for_start_signals;
 use crate::tls::{self, TlsPolicy};
 
@@ -3610,11 +3610,20 @@ pub(crate) const MESH_INBOUND_PROXY_ID_PREFIX: &str = "__mesh-inbound-";
 /// [`is_mesh_inbound_route_id`] / [`mesh_route_direction`].
 pub(crate) const MESH_INGRESS_PROXY_ID_PREFIX: &str = "__mesh-ingress-";
 
-/// Reserved sub-prefix for dedicated Sidecar ingress `bind` socket routes
-/// (issue #3266). These remain ingress routes, but are served by a listener
-/// whose accepted port already identifies the one declared listener rather
-/// than by the shared `:15006` capture listener's sibling selector.
-pub(crate) const MESH_INGRESS_BIND_PROXY_ID_PREFIX: &str = "__mesh-ingress-bind-";
+/// Reserved colon-delimited sub-prefix for dedicated Sidecar ingress `bind`
+/// socket routes (issue #3266). These remain ingress routes, but are served by
+/// a listener whose accepted port already identifies the one declared listener
+/// rather than by the shared `:15006` capture listener's sibling selector.
+///
+/// The colon is the family discriminator: `mesh_ingress_proxy_id` folds `:`,
+/// `/`, and `.` to `-`, so a shared-capture id can never start with this
+/// prefix — including the `bind-prod` namespace that used to match the old
+/// `__mesh-ingress-bind-` hyphen prefix, and a hostile `bind:…` name that
+/// would otherwise forge the colon form. Namespace and service segments after
+/// the colon are encoded with `sanitize_egress_host_id_part`, so the join is
+/// injective across namespaces and cannot collide through `-` delimiter
+/// ambiguity (`a-b`/`c` vs `a`/`b-c`).
+pub(crate) const MESH_INGRESS_BIND_PROXY_ID_PREFIX: &str = "__mesh-ingress-bind:";
 
 /// Whether a proxy id names a materialized sidecar inbound route — either a
 /// service-port default inbound route or a Sidecar `ingress[]` custom listener
@@ -3645,10 +3654,11 @@ pub(crate) fn is_mesh_ingress_bind_route_id(id: &str) -> bool {
 /// SAFE TODAY because every in-scope materializer consumes a SINGLE-namespace
 /// service set (the slice is scoped to one namespace), so the `namespace`
 /// segment is constant and only `name`+`port` vary — and a `name` cannot
-/// borrow a `-` from a fixed `namespace`. Before any MULTI-namespace caller is
-/// added, switch this family to the reversible token scheme used by the egress
-/// ids (`sanitize_egress_host_id_part`) so the id space stays injective. See
-/// #1727.
+/// borrow a `-` from a fixed `namespace`. Dedicated Sidecar ingress bind ids
+/// (`mesh_ingress_bind_proxy_id`) are the exception: they already use the
+/// reversible `sanitize_egress_host_id_part` scheme so the id space stays
+/// injective across namespaces. Before any MULTI-namespace caller is added to
+/// the rest of this family, switch those constructors the same way. See #1727.
 fn mesh_inbound_proxy_id(namespace: &str, name: &str, port: u16) -> String {
     format!("{MESH_INBOUND_PROXY_ID_PREFIX}{namespace}-{name}-{port}").replace(['/', '.'], "-")
 }
@@ -3656,9 +3666,10 @@ fn mesh_inbound_proxy_id(namespace: &str, name: &str, port: u16) -> String {
 /// Id for a materialized Sidecar `ingress[]` listener route, one per declared
 /// listener port. The local workload's namespace + service name scope the id so
 /// it never collides with another local service's ingress siblings; the port
-/// disambiguates listeners. Like the inbound id, sanitized of `/`/`.`.
+/// disambiguates listeners. Like the inbound id, sanitized of `/`/`.`; `:` is
+/// also folded so a hostile name cannot forge [`MESH_INGRESS_BIND_PROXY_ID_PREFIX`].
 fn mesh_ingress_proxy_id(namespace: &str, name: &str, port: u16) -> String {
-    format!("{MESH_INGRESS_PROXY_ID_PREFIX}{namespace}-{name}-{port}").replace(['/', '.'], "-")
+    format!("{MESH_INGRESS_PROXY_ID_PREFIX}{namespace}-{name}-{port}").replace(['/', '.', ':'], "-")
 }
 
 /// Reserved id prefix for materialized mesh OUTBOUND (egress) routes. Like the
@@ -5161,8 +5172,15 @@ fn materialize_sidecar_ingress_listener_proxies(
     );
 }
 
+/// Dedicated Sidecar ingress bind route id. Prefix is the colon family
+/// discriminator; namespace and service are encoded injectively so `-` in
+/// either field cannot collide with another `(namespace, name, port)` tuple.
 fn mesh_ingress_bind_proxy_id(namespace: &str, name: &str, port: u16) -> String {
-    format!("{MESH_INGRESS_BIND_PROXY_ID_PREFIX}{namespace}-{name}-{port}").replace(['/', '.'], "-")
+    format!(
+        "{MESH_INGRESS_BIND_PROXY_ID_PREFIX}{}-{}-{port}",
+        sanitize_egress_host_id_part(namespace),
+        sanitize_egress_host_id_part(name)
+    )
 }
 
 /// Ports already owned by Gateway/stream proxies or the fixed mesh listener
@@ -13285,12 +13303,17 @@ async fn arm_mesh_runtime_startup(
         mesh_ca_svid_slot.as_ref(),
     );
     if let Some(slice) = initial_applied_mesh_slice.as_deref() {
-        publish_gateway_active_trust_bundles(
+        let gateway_trust = stage_gateway_active_trust_bundles(
             &proxy_state,
             slice,
             Some(&initial_federation_snapshot),
             federation_activation,
-        );
+        )
+        .map_err(anyhow::Error::msg)?;
+        // Startup has no bound listeners or admitted requests yet. Runtime
+        // generations instead carry this exact staged decision through
+        // `update_mesh_config`'s request-epoch publication below.
+        proxy_state.commit_gateway_trust_generation(gateway_trust);
         publish_staged_spiffe_bundle(
             &proxy_state,
             stage_gateway_runtime_spiffe_bundle_with_federation(
@@ -16732,27 +16755,56 @@ fn publish_staged_spiffe_bundle(proxy_state: &ProxyState, staged: Option<StagedS
     }
 }
 
-fn publish_gateway_active_trust_bundles(
+/// Stage the exact effective mesh/federation gateway trust decision before any
+/// configuration or accepted-generation side effect is published.
+///
+/// This uses the same bounded deep validator as database admission and the
+/// ConfigSync wire. Conversion errors are intentionally collapsed to a fixed,
+/// material-free diagnostic; the caller rejects the whole mesh generation and
+/// leaves config, trust, admission, resolver/DNS/TLS state, and status intact.
+fn stage_gateway_active_trust_bundles(
     proxy_state: &ProxyState,
     slice: &MeshSlice,
     federation: Option<&federation::FederationSnapshot>,
     activation: FederationActivation,
-) {
+) -> Result<GatewayTrustCommit, &'static str> {
     let Some(serialized) = effective_trust_bundles_for_slice(slice, federation, activation) else {
-        proxy_state.clear_gateway_trust_bundles();
-        return;
+        return Ok(proxy_state.stage_runtime_gateway_trust(None));
     };
-    match serialized.to_runtime() {
-        Ok(runtime) => proxy_state.update_gateway_trust_bundles(runtime),
-        Err(error) => {
-            warn!(
-                %error,
-                mesh_slice_version = %slice.version,
-                "Unable to publish accepted mesh federation trust to gateway SVID slot; \
-                 keeping previous outbound trust bundles"
-            );
-        }
-    }
+    crate::config::gateway_trust::validate_trust_bundle_set(&serialized)
+        .map_err(|_| "effective mesh gateway trust failed validation")?;
+    let runtime = serialized
+        .to_runtime()
+        .map_err(|_| "effective mesh gateway trust failed runtime conversion")?;
+    Ok(proxy_state.stage_runtime_gateway_trust(Some(runtime)))
+}
+
+/// External-test seam for [`stage_gateway_active_trust_bundles`] with federation
+/// disabled — the shape the apply loop uses before any federation poll has
+/// succeeded (issue #3727).
+///
+/// The staging function itself stays private because its `FederationActivation`
+/// argument is a private slice-apply detail; this seam supplies the disabled
+/// activation and an empty federation snapshot so an external suite can assert
+/// the staging contract (a deep-invalid bundle rejects the whole generation and
+/// mutates no live state) against the PRODUCTION helper rather than a copy.
+///
+/// Reached only from `tests/`; the `ferrum-edge` bin target compiles this module
+/// without any such caller.
+#[allow(dead_code)]
+pub fn stage_gateway_active_trust_bundles_unfederated_for_test(
+    proxy_state: &ProxyState,
+    slice: &MeshSlice,
+) -> Result<crate::proxy::GatewayTrustCommit, &'static str> {
+    stage_gateway_active_trust_bundles(
+        proxy_state,
+        slice,
+        Some(&federation::FederationSnapshot::default()),
+        FederationActivation {
+            fail_open: false,
+            poll_enabled: false,
+        },
+    )
 }
 
 /// Build a proxy [`GatewayConfig`] from `base_slice` overlaid with the current
@@ -16816,6 +16868,22 @@ async fn apply_mesh_slice_generation(
     }
 
     let federation_activation = FederationActivation::from_env_config(&proxy_state.env_config);
+    let staged_gateway_trust = match stage_gateway_active_trust_bundles(
+        proxy_state,
+        base_slice,
+        Some(federation_snapshot),
+        federation_activation,
+    ) {
+        Ok(commit) => commit,
+        Err(failure_class) => {
+            warn!(
+                failure_class,
+                "Rejected mesh slice before proxy config apply because effective gateway trust \
+                 was unusable"
+            );
+            return false;
+        }
+    };
     let live_reload = if live_reload_enabled {
         live_reload_inbound_mtls_mode(base_slice, runtime).and_then(|mtls_mode| {
             plan_mesh_inbound_tls_reload_with_federation(
@@ -16917,7 +16985,8 @@ async fn apply_mesh_slice_generation(
             let dns_slice = dns_proxy.as_ref().and_then(|_| {
                 node_waypoint_dns_slice_for_prepared_config(runtime, base_slice, &config)
             });
-            let outcome = proxy_state.update_mesh_config(config, &trusted_mesh_ids);
+            let outcome =
+                proxy_state.update_mesh_config(config, &trusted_mesh_ids, staged_gateway_trust);
             let applied = outcome.applied();
             let accepted = outcome.accepted();
             // Publish the node-waypoint resolver snapshot the instant the proxy
@@ -16949,12 +17018,6 @@ async fn apply_mesh_slice_generation(
                 revision_apply_token,
             );
             if accepted {
-                publish_gateway_active_trust_bundles(
-                    proxy_state,
-                    base_slice,
-                    Some(federation_snapshot),
-                    federation_activation,
-                );
                 // Sidecar ingress routes remain live-reloadable even when
                 // PeerAuthentication TLS rebuilding is disabled. Publish the
                 // listener-port -> backend-app-port demux table for every
@@ -18441,6 +18504,20 @@ mod tests {
 
     fn ensure_crypto_provider() {
         let _ = crate::fips::base_crypto_provider().install_default();
+    }
+
+    fn test_root_ca_der_base64(common_name: &str) -> String {
+        use base64::Engine;
+        let key = rcgen::KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256)
+            .expect("test CA key generates");
+        let mut params =
+            rcgen::CertificateParams::new(Vec::<String>::new()).expect("test CA params build");
+        params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+        params
+            .distinguished_name
+            .push(rcgen::DnType::CommonName, common_name);
+        let cert = params.self_signed(&key).expect("test CA self-signs");
+        base64::engine::general_purpose::STANDARD.encode(cert.der())
     }
 
     /// The SVID slot `load_mesh_frontend_server_identity` resolves the
@@ -31873,7 +31950,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn publish_gateway_active_trust_bundles_updates_outbound_svid_slot() {
+    async fn staged_gateway_active_trust_publishes_with_the_request_epoch() {
         use crate::identity::{SvidBundle, TrustBundle, TrustBundleSet};
         use base64::Engine;
 
@@ -31894,18 +31971,20 @@ mod tests {
         });
 
         let engine = base64::engine::general_purpose::STANDARD;
+        let slice_local_root = test_root_ca_der_base64("mesh-slice-local-root");
+        let bootstrap_root = test_root_ca_der_base64("mesh-bootstrap-root");
         let slice = MeshSlice {
             version: "outbound-trust".to_string(),
             trust_bundles: Some(config::TrustBundleSet {
                 local: config::TrustBundle {
                     trust_domain: local_td,
-                    x509_authorities: vec![engine.encode(b"slice-local")],
+                    x509_authorities: vec![slice_local_root],
                     jwt_authorities: Vec::new(),
                     refresh_hint_seconds: None,
                 },
                 federated: vec![config::TrustBundle {
                     trust_domain: remote_td.clone(),
-                    x509_authorities: vec![engine.encode(b"cp-bootstrap")],
+                    x509_authorities: vec![bootstrap_root],
                     jwt_authorities: Vec::new(),
                     refresh_hint_seconds: None,
                 }],
@@ -31928,26 +32007,44 @@ mod tests {
             poll_enabled: true,
         };
 
-        publish_gateway_active_trust_bundles(
+        let commit = stage_gateway_active_trust_bundles(
             &state,
             &slice,
             Some(&federation::FederationSnapshot::default()),
             activation,
-        );
+        )
+        .expect("effective trust stages");
+        state.update_config_with_gateway_trust(GatewayConfig::default(), commit);
         let active = state.gateway_svid_bundle.load_full();
         let bundle = active.as_ref().as_ref().expect("gateway SVID bundle");
         assert!(
             !bundle.trust_bundles.federated.contains_key(&remote_td),
             "fail-closed bootstrap root must not become outbound active trust before a poll succeeds"
         );
+        let trust_generation = state.request_epoch.load().gateway_trust().generation();
+        let identical = stage_gateway_active_trust_bundles(
+            &state,
+            &slice,
+            Some(&federation::FederationSnapshot::default()),
+            activation,
+        )
+        .expect("identical effective trust stages");
+        state.update_config_with_gateway_trust(GatewayConfig::default(), identical);
+        assert_eq!(
+            state.request_epoch.load().gateway_trust().generation(),
+            trust_generation,
+            "an identical effective mesh trust decision must normalize to Unchanged inside the publication lock"
+        );
 
         let mut polled = federation::FederationSnapshot::default();
+        let polled_root = test_root_ca_der_base64("mesh-polled-root");
+        let expected_polled_root = engine.decode(&polled_root).expect("test root decodes");
         polled.bundles.insert(
             remote_td.clone(),
             federation::FederatedBundle {
                 bundle: config::TrustBundle {
                     trust_domain: remote_td.clone(),
-                    x509_authorities: vec![engine.encode(b"polled-root")],
+                    x509_authorities: vec![polled_root],
                     jwt_authorities: Vec::new(),
                     refresh_hint_seconds: None,
                 },
@@ -31956,7 +32053,9 @@ mod tests {
                 cluster_name: "remote".to_string(),
             },
         );
-        publish_gateway_active_trust_bundles(&state, &slice, Some(&polled), activation);
+        let commit = stage_gateway_active_trust_bundles(&state, &slice, Some(&polled), activation)
+            .expect("polled trust stages");
+        state.update_config_with_gateway_trust(GatewayConfig::default(), commit);
 
         let active = state.gateway_svid_bundle.load_full();
         let bundle = active.as_ref().as_ref().expect("gateway SVID bundle");
@@ -31965,7 +32064,7 @@ mod tests {
             .federated
             .get(&remote_td)
             .expect("polled remote trust is active");
-        assert_eq!(remote.x509_authorities, vec![b"polled-root".to_vec()]);
+        assert_eq!(remote.x509_authorities, vec![expected_polled_root]);
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -32012,19 +32111,22 @@ mod tests {
         );
 
         let engine = base64::engine::general_purpose::STANDARD;
+        let local_root = test_root_ca_der_base64("mesh-runtime-local-root");
+        let partner_root = test_root_ca_der_base64("mesh-runtime-partner-root");
+        let expected_partner_root = engine.decode(&partner_root).expect("test root decodes");
         mesh_state.install_slice(MeshSlice {
             version: "accepted-trust".to_string(),
             labels: [("trust".to_string(), "published".to_string())].into(),
             trust_bundles: Some(config::TrustBundleSet {
                 local: config::TrustBundle {
                     trust_domain: local_td,
-                    x509_authorities: vec![engine.encode(b"slice-local")],
+                    x509_authorities: vec![local_root],
                     jwt_authorities: Vec::new(),
                     refresh_hint_seconds: None,
                 },
                 federated: vec![config::TrustBundle {
                     trust_domain: remote_td.clone(),
-                    x509_authorities: vec![engine.encode(b"partner-root")],
+                    x509_authorities: vec![partner_root],
                     jwt_authorities: Vec::new(),
                     refresh_hint_seconds: None,
                 }],
@@ -32055,7 +32157,7 @@ mod tests {
             .federated
             .get(&remote_td)
             .expect("federated trust published");
-        assert_eq!(remote.x509_authorities, vec![b"partner-root".to_vec()]);
+        assert_eq!(remote.x509_authorities, vec![expected_partner_root]);
 
         let _ = shutdown_tx.send(true);
         tokio::time::timeout(Duration::from_secs(2), apply_task)
@@ -36725,7 +36827,7 @@ mod tests {
         let bind_proxy = config
             .proxies
             .iter()
-            .find(|p| p.id.starts_with("__mesh-ingress-bind-"))
+            .find(|p| p.id.starts_with("__mesh-ingress-bind:"))
             .expect("dedicated bind proxy");
         assert_eq!(bind_proxy.listen_port, Some(16379));
         assert_eq!(bind_proxy.backend_host, "127.0.0.1");
@@ -36779,7 +36881,7 @@ mod tests {
             !config
                 .proxies
                 .iter()
-                .any(|p| p.id.starts_with("__mesh-ingress-bind-")),
+                .any(|p| p.id.starts_with("__mesh-ingress-bind:")),
             "conflicting bind must not materialize a socket proxy"
         );
         assert!(
@@ -36897,7 +36999,7 @@ mod tests {
             config_v1
                 .proxies
                 .iter()
-                .any(|p| p.id.starts_with("__mesh-ingress-bind-"))
+                .any(|p| p.id.starts_with("__mesh-ingress-bind:"))
         );
 
         // Withdraw the dedicated bind (shared capture only).
@@ -36924,7 +37026,7 @@ mod tests {
             !config_v2
                 .proxies
                 .iter()
-                .any(|p| p.id.starts_with("__mesh-ingress-bind-")),
+                .any(|p| p.id.starts_with("__mesh-ingress-bind:")),
             "dedicated bind proxy must withdraw when bind is removed"
         );
         assert!(

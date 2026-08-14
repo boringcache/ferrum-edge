@@ -23,6 +23,8 @@
 //! - `ArcSwap`-based pool swap enables zero-downtime DNS re-resolution on failover
 //! - Batch chunking (`BATCH_CHUNK_SIZE`) for large imports to stay within DB limits
 
+use crate::config::db_backend::GatewayTrustBundleRevisionConflict;
+use crate::config::gateway_trust::GatewayTrustBundleRecord;
 use crate::config::types::{
     AuthMode, BackendScheme, CircuitBreakerConfig, Consumer, DispatchKind, GatewayConfig,
     HealthCheckConfig, LoadBalancerAlgorithm, PluginAssociation, PluginConfig, PluginScope, Proxy,
@@ -74,6 +76,41 @@ pub(crate) const MYSQL_CONFIG_CHANGE_LOCK_INSERT_SQL: &str = "INSERT INTO config
 pub(crate) const MYSQL_PROXY_ROUTE_LOCK_INSERT_SQL: &str = "INSERT INTO proxy_route_locks \
      (namespace, route_key_hash, created_at) VALUES (?, ?, ?) \
      ON DUPLICATE KEY UPDATE created_at = proxy_route_locks.created_at";
+
+// ── Gateway trust bundles (issue #3727) ─────────────────────────────────────
+//
+// `namespace` is the primary key, so `WHERE namespace = ?` is already a unique
+// index seek and the `(namespace, id)` form only narrows it. Every statement
+// carries the namespace: the tenant boundary is in the query, never applied
+// after the read.
+
+/// `config_changes.resource_type` for gateway trust-bundle mutations. The
+/// incremental loaders match on this exact string.
+pub(crate) const GATEWAY_TRUST_BUNDLE_RESOURCE_TYPE: &str = "gateway_trust_bundle";
+
+const GATEWAY_TRUST_BUNDLE_SELECT_BY_NAMESPACE_SQL: &str =
+    "SELECT * FROM gateway_trust_bundles WHERE namespace = ?";
+const GATEWAY_TRUST_BUNDLE_SELECT_BY_ID_SQL: &str =
+    "SELECT * FROM gateway_trust_bundles WHERE namespace = ? AND id = ?";
+const GATEWAY_TRUST_BUNDLE_SELECT_REVISION_SQL: &str =
+    "SELECT revision FROM gateway_trust_bundles WHERE namespace = ? AND id = ?";
+const GATEWAY_TRUST_BUNDLE_COUNT_SQL: &str =
+    "SELECT COUNT(*) AS cnt FROM gateway_trust_bundles WHERE namespace = ?";
+const GATEWAY_TRUST_BUNDLE_PAGE_SQL: &str =
+    "SELECT * FROM gateway_trust_bundles WHERE namespace = ? ORDER BY id LIMIT ? OFFSET ?";
+const GATEWAY_TRUST_BUNDLE_INSERT_SQL: &str = "INSERT INTO gateway_trust_bundles \
+     (namespace, id, trust_domain, bundle, revision, updated_by, created_at, updated_at) \
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?)";
+/// Compare-and-set update. `revision` is in the WHERE clause, so the write is
+/// the compare: two admin replicas that both read revision N issue the same
+/// statement and the database serializes them — the loser matches zero rows
+/// under any isolation level, including plain READ COMMITTED, and reports a
+/// conflict instead of overwriting the winner's rotation.
+const GATEWAY_TRUST_BUNDLE_UPDATE_SQL: &str = "UPDATE gateway_trust_bundles \
+     SET trust_domain = ?, bundle = ?, revision = ?, updated_by = ?, updated_at = ? \
+     WHERE namespace = ? AND id = ? AND revision = ?";
+const GATEWAY_TRUST_BUNDLE_DELETE_SQL: &str =
+    "DELETE FROM gateway_trust_bundles WHERE namespace = ? AND id = ?";
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum FullLoadPurpose {
@@ -2264,6 +2301,46 @@ impl DatabaseStore {
         Ok(())
     }
 
+    /// Validate every loaded gateway trust-bundle record before the snapshot can
+    /// be published (issue #3727).
+    ///
+    /// This is the "validate the complete candidate before the live swap" gate:
+    /// a stored bundle that no longer passes admission (oversized, malformed
+    /// base64, unparseable certificate, identity mismatch) rejects the whole
+    /// load, so the caller keeps its previous valid generation instead of
+    /// swapping in trust it cannot verify with. Messages are already redacted
+    /// by `validate_fields` — field names, indices, and sizes only.
+    pub(crate) fn reject_invalid_gateway_trust_bundles(
+        operation: &str,
+        config: &GatewayConfig,
+    ) -> Result<(), anyhow::Error> {
+        let mut errors = Vec::new();
+        for record in &config.gateway_trust_bundles {
+            if let Err(record_errors) = record.validate_fields() {
+                errors.extend(record_errors);
+            }
+        }
+        if errors.is_empty() {
+            // Deliberately NOT counted as a published generation here: this
+            // candidate still has overlay composition, the `ArcSwap` swap, and
+            // broadcast ahead of it. Acceptance is recorded at the real
+            // publication boundary (`record_trust_generation_published`).
+            return Ok(());
+        }
+        crate::config::gateway_trust::record_trust_load_rejection(
+            crate::config::gateway_trust::GatewayTrustFailureReason::InvalidMaterial,
+        );
+        let context = format!(
+            "operation={operation} resource=gateway_trust_bundle: invalid stored trust material"
+        );
+        Err(ConfigValidationRejection {
+            backend: "Database",
+            errors,
+        }
+        .into_anyhow()
+        .context(context))
+    }
+
     fn reject_invalid_gateway_upstream_references(
         operation: &str,
         config: &GatewayConfig,
@@ -2315,6 +2392,14 @@ impl DatabaseStore {
         let upstreams = self
             .load_upstreams_tx(namespace, FullLoadPurpose::Runtime, &mut tx)
             .await?;
+        // Read trust on the SAME snapshot transaction as the resources: a
+        // rotation committed mid-load must not produce a snapshot that pairs
+        // post-rotation configuration with pre-rotation roots (issue #3727).
+        let gateway_trust_bundles = self
+            .load_gateway_trust_bundle_tx(namespace, &mut tx)
+            .await?
+            .into_iter()
+            .collect::<Vec<_>>();
         tx.commit().await?;
 
         let mut config = GatewayConfig {
@@ -2323,10 +2408,17 @@ impl DatabaseStore {
             consumers,
             plugin_configs,
             upstreams,
+            gateway_trust_bundles,
             loaded_at,
             known_namespaces: Vec::new(),
             ..Default::default()
         };
+
+        // Validate the complete trust candidate before it can be published.
+        // A malformed or oversized stored bundle is rejected here, which leaves
+        // the caller's previous valid generation active (the poll loop keeps
+        // last-known-good on a rejected load) and surfaces a redacted reason.
+        Self::reject_invalid_gateway_trust_bundles("load_full_config", &config)?;
 
         ValidationPipeline::new(&mut config)
             .normalize_fields()
@@ -2448,6 +2540,14 @@ impl DatabaseStore {
             .load_plugin_configs_tx(namespace, purpose, &mut tx)
             .await?;
         let upstreams = self.load_upstreams_tx(namespace, purpose, &mut tx).await?;
+        // Captured WITHOUT validation, like every other resource on this path:
+        // an invalid-but-present bundle is exactly what an operator runs restore
+        // to repair, so it must still snapshot for rollback.
+        let gateway_trust_bundles = self
+            .load_gateway_trust_bundle_tx(namespace, &mut tx)
+            .await?
+            .into_iter()
+            .collect::<Vec<_>>();
         tx.commit().await?;
 
         let mut config = GatewayConfig {
@@ -2456,6 +2556,7 @@ impl DatabaseStore {
             consumers,
             plugin_configs,
             upstreams,
+            gateway_trust_bundles,
             loaded_at,
             known_namespaces: Vec::new(),
             ..Default::default()
@@ -4311,6 +4412,331 @@ impl DatabaseStore {
         })
     }
 
+    // -----------------------------------------------------------------------
+    // Gateway trust bundles (issue #3727)
+    // -----------------------------------------------------------------------
+
+    /// Read the namespace's trust-bundle record inside an existing transaction.
+    ///
+    /// Full loads call this on the same snapshot transaction as the resource
+    /// reads so a rotation committed halfway through a load can never produce a
+    /// snapshot pairing new proxies with the previous generation's roots.
+    async fn load_gateway_trust_bundle_tx(
+        &self,
+        namespace: &str,
+        tx: &mut sqlx::Transaction<'_, sqlx::Any>,
+    ) -> Result<Option<GatewayTrustBundleRecord>, anyhow::Error> {
+        let sql = self.q(GATEWAY_TRUST_BUNDLE_SELECT_BY_NAMESPACE_SQL);
+        let row = sqlx::query(&sql)
+            .bind(namespace)
+            .fetch_optional(&mut **tx)
+            .await?;
+        row.map(|row| row_to_gateway_trust_bundle(&row)).transpose()
+    }
+
+    /// Fetch the record addressed by `(namespace, id)`.
+    ///
+    /// Authoritative primary read: trust state gates peer verification, so it
+    /// must never be answered from a lagging replica.
+    pub async fn get_gateway_trust_bundle(
+        &self,
+        namespace: &str,
+        id: &str,
+    ) -> Result<Option<GatewayTrustBundleRecord>, anyhow::Error> {
+        let start = Instant::now();
+        let sql = self.q(GATEWAY_TRUST_BUNDLE_SELECT_BY_ID_SQL);
+        let row = sqlx::query(&sql)
+            .bind(namespace)
+            .bind(id)
+            .fetch_optional(&self.pool())
+            .await?;
+        self.check_slow_query("get_gateway_trust_bundle", start);
+        row.map(|row| row_to_gateway_trust_bundle(&row)).transpose()
+    }
+
+    /// Fetch the namespace's singleton record regardless of its id. This is the
+    /// projection path used by full loads and control-plane publication.
+    pub async fn get_namespace_gateway_trust_bundle(
+        &self,
+        namespace: &str,
+    ) -> Result<Option<GatewayTrustBundleRecord>, anyhow::Error> {
+        let start = Instant::now();
+        let sql = self.q(GATEWAY_TRUST_BUNDLE_SELECT_BY_NAMESPACE_SQL);
+        let row = sqlx::query(&sql)
+            .bind(namespace)
+            .fetch_optional(&self.pool())
+            .await?;
+        self.check_slow_query("get_namespace_gateway_trust_bundle", start);
+        row.map(|row| row_to_gateway_trust_bundle(&row)).transpose()
+    }
+
+    /// Page the namespace's records (0 or 1 items — the resource is a
+    /// singleton, but the paginated shape keeps the admin surface uniform).
+    pub async fn list_gateway_trust_bundles_paginated(
+        &self,
+        namespace: &str,
+        limit: i64,
+        offset: i64,
+    ) -> Result<PaginatedResult<GatewayTrustBundleRecord>, anyhow::Error> {
+        let start = Instant::now();
+        let pool = self.pool();
+        let count_sql = self.q(GATEWAY_TRUST_BUNDLE_COUNT_SQL);
+        let count_row = sqlx::query(&count_sql)
+            .bind(namespace)
+            .fetch_one(&pool)
+            .await?;
+        let total: i64 = count_row.try_get("cnt")?;
+
+        let page_sql = self.q(GATEWAY_TRUST_BUNDLE_PAGE_SQL);
+        let rows: Vec<AnyRow> = sqlx::query(&page_sql)
+            .bind(namespace)
+            .bind(limit)
+            .bind(offset)
+            .fetch_all(&pool)
+            .await?;
+
+        let mut items = Vec::with_capacity(rows.len());
+        for row in rows {
+            items.push(row_to_gateway_trust_bundle(&row)?);
+        }
+        self.check_slow_query("list_gateway_trust_bundles_paginated", start);
+        Ok(PaginatedResult { items, total })
+    }
+
+    /// Insert a new record and its config-change row in ONE transaction, so a
+    /// poller can never observe a committed bundle with no change to detect
+    /// (or a change pointing at a row that was rolled back).
+    ///
+    /// A namespace that already holds a record fails on the `namespace` primary
+    /// key — that is the cross-process backstop for the singleton rule.
+    ///
+    /// `record.revision` is IGNORED. The stored revision comes from the change
+    /// row this transaction writes, so every incarnation of the namespace
+    /// singleton — including one recreated moments after a delete — starts at a
+    /// value strictly greater than anything the previous incarnation ever held.
+    /// Honouring a caller-supplied revision (or restarting at 1) is what would
+    /// let a stale pre-delete expectation compare-and-set against a new
+    /// incarnation's material.
+    pub async fn create_gateway_trust_bundle(
+        &self,
+        record: &GatewayTrustBundleRecord,
+    ) -> Result<(), anyhow::Error> {
+        let start = Instant::now();
+        let bundle_json = serde_json::to_string(&record.bundle)?;
+
+        let mut tx = self.pool().begin().await?;
+        // Written FIRST so the insert can carry the assigned revision. Both
+        // statements are in one transaction, so a poller can still never see a
+        // committed bundle with no change to detect, or the reverse.
+        let revision = self
+            .record_config_change_returning_sequence_tx(
+                &mut tx,
+                &record.namespace,
+                GATEWAY_TRUST_BUNDLE_RESOURCE_TYPE,
+                &record.id,
+                "upsert",
+            )
+            .await?;
+        let revision = i64::try_from(revision)
+            .map_err(|_| anyhow::anyhow!("gateway trust bundle revision exceeds BIGINT range"))?;
+        let insert_sql = self.q(GATEWAY_TRUST_BUNDLE_INSERT_SQL);
+        sqlx::query(&insert_sql)
+            .bind(&record.namespace)
+            .bind(&record.id)
+            .bind(&record.trust_domain)
+            .bind(&bundle_json)
+            .bind(revision)
+            .bind(&record.updated_by)
+            .bind(record.created_at.to_rfc3339())
+            .bind(record.updated_at.to_rfc3339())
+            .execute(&mut *tx)
+            .await?;
+        self.compact_config_changes_tx(&mut tx, &record.namespace)
+            .await?;
+        tx.commit().await?;
+        self.check_slow_query("create_gateway_trust_bundle", start);
+        Ok(())
+    }
+
+    /// Replace an existing record and its config-change row in one
+    /// transaction, bumping `revision`.
+    ///
+    /// The optimistic-concurrency guard is a REAL compare-and-set: the revision
+    /// the caller expects is a predicate of the `UPDATE` itself
+    /// (`... AND revision = ?`), not a value read first and trusted afterwards.
+    /// A read-then-write would be safe only under a row lock or serializable
+    /// isolation; under ordinary READ COMMITTED two admin replicas could both
+    /// read N and both write N+1, and the second rotation would silently
+    /// destroy the first. With the predicate in the statement the database
+    /// serializes the two writes and the loser matches zero rows.
+    ///
+    /// `expected_revision` is `Some(n)` when a client stated an expectation and
+    /// `None` for restore/import, which is already serialized behind the
+    /// namespace admission lease; `None` compares against the revision this
+    /// transaction just read, so even that path can never blind-overwrite a
+    /// writer that committed in between.
+    ///
+    /// Returns `Ok(false)` when no record exists at `(namespace, id)` so a PUT
+    /// racing a delete surfaces as not-found rather than a phantom success, and
+    /// [`GatewayTrustBundleRevisionConflict`] when the record exists but its
+    /// revision moved.
+    pub async fn update_gateway_trust_bundle(
+        &self,
+        record: &GatewayTrustBundleRecord,
+        expected_revision: Option<u64>,
+    ) -> Result<bool, anyhow::Error> {
+        let start = Instant::now();
+        let bundle_json = serde_json::to_string(&record.bundle)?;
+
+        let mut tx = self.pool().begin().await?;
+        let select_sql = self.q(GATEWAY_TRUST_BUNDLE_SELECT_REVISION_SQL);
+        let existing = sqlx::query(&select_sql)
+            .bind(&record.namespace)
+            .bind(&record.id)
+            .fetch_optional(&mut *tx)
+            .await?;
+        let Some(existing) = existing else {
+            tx.rollback().await?;
+            self.check_slow_query("update_gateway_trust_bundle", start);
+            return Ok(false);
+        };
+        let current_revision = strict_stored_revision(&existing)?;
+        if let Some(expected) = expected_revision
+            && expected != current_revision
+        {
+            tx.rollback().await?;
+            self.check_slow_query("update_gateway_trust_bundle", start);
+            return Err(anyhow::Error::new(GatewayTrustBundleRevisionConflict {
+                expected,
+                current: current_revision,
+            }));
+        }
+        // The revision the CAS asserts. With an expectation it is the client's;
+        // without one it is what this transaction observed.
+        let asserted_revision = expected_revision.unwrap_or(current_revision);
+        let asserted_revision_sql = i64::try_from(asserted_revision)
+            .map_err(|_| anyhow::anyhow!("gateway trust bundle revision exceeds BIGINT range"))?;
+        // The next revision is BACKEND-assigned from the change sequence, not
+        // `asserted + 1`. Both forms are monotonic within one incarnation, but
+        // only the sequence keeps advancing across a delete/recreate, which is
+        // what stops a stale pre-delete expectation from ever matching again.
+        // Recorded before the compare-and-set so the write can carry it; a lost
+        // CAS rolls the whole transaction back, change row included.
+        let next_revision = self
+            .record_config_change_returning_sequence_tx(
+                &mut tx,
+                &record.namespace,
+                GATEWAY_TRUST_BUNDLE_RESOURCE_TYPE,
+                &record.id,
+                "upsert",
+            )
+            .await?;
+        // Fail closed rather than clamp: a source that did not advance past the
+        // revision being replaced is not the monotonic source this contract
+        // requires, and writing a non-increasing revision would resurrect the
+        // reuse window.
+        if next_revision <= current_revision || next_revision <= asserted_revision {
+            tx.rollback().await?;
+            anyhow::bail!("gateway trust bundle revision source is not monotonic");
+        }
+        let next_revision = i64::try_from(next_revision)
+            .map_err(|_| anyhow::anyhow!("gateway trust bundle revision exceeds BIGINT range"))?;
+
+        let update_sql = self.q(GATEWAY_TRUST_BUNDLE_UPDATE_SQL);
+        let result = sqlx::query(&update_sql)
+            .bind(&record.trust_domain)
+            .bind(&bundle_json)
+            .bind(next_revision)
+            .bind(&record.updated_by)
+            .bind(record.updated_at.to_rfc3339())
+            .bind(&record.namespace)
+            .bind(&record.id)
+            .bind(asserted_revision_sql)
+            .execute(&mut *tx)
+            .await?;
+        if result.rows_affected() == 0 {
+            // Lost the compare-and-set. End the failed transaction FIRST, then
+            // re-read: a re-read inside this transaction is not authoritative.
+            // MySQL's default REPEATABLE READ serves every later consistent
+            // read from the snapshot the SELECT above established, so the
+            // in-transaction re-read would return the revision we already know
+            // (reporting `current == expected`, which reads as a fabricated
+            // conflict) and could not observe a concurrent DELETE at all.
+            // PostgreSQL READ COMMITTED and SQLite would have seen the winner,
+            // so the same statement had three different meanings per backend.
+            //
+            // A fresh statement on the pool, after the rollback released this
+            // transaction's snapshot and locks, is authoritative on all three:
+            // it observes committed state at the moment it runs. It is still a
+            // best-effort *report* — another writer may commit between the lost
+            // CAS and this read, so `current` is the newest revision this call
+            // could see, and absence means the record was revoked. Both are
+            // strictly better than echoing the stale pre-race value, and the
+            // CAS predicate is what actually protects the data either way.
+            tx.rollback().await?;
+            let observed = sqlx::query(&select_sql)
+                .bind(&record.namespace)
+                .bind(&record.id)
+                .fetch_optional(&self.pool())
+                .await?;
+            let conflict = match observed {
+                Some(row) => Some(strict_stored_revision(&row)?),
+                None => None,
+            };
+            self.check_slow_query("update_gateway_trust_bundle", start);
+            return match conflict {
+                Some(current) => Err(anyhow::Error::new(GatewayTrustBundleRevisionConflict {
+                    expected: asserted_revision,
+                    current,
+                })),
+                None => Ok(false),
+            };
+        }
+        self.compact_config_changes_tx(&mut tx, &record.namespace)
+            .await?;
+        tx.commit().await?;
+        self.check_slow_query("update_gateway_trust_bundle", start);
+        Ok(true)
+    }
+
+    /// Delete the record addressed by `(namespace, id)` and record the change.
+    ///
+    /// This is the explicit revocation path, and it is distinguishable from "no
+    /// change" downstream: the change-log row makes the next poll observe a
+    /// `delete`, which becomes a `Clear` on the ConfigSync side channel rather
+    /// than an absent field.
+    pub async fn delete_gateway_trust_bundle(
+        &self,
+        namespace: &str,
+        id: &str,
+    ) -> Result<bool, anyhow::Error> {
+        let start = Instant::now();
+        let mut tx = self.pool().begin().await?;
+        let delete_sql = self.q(GATEWAY_TRUST_BUNDLE_DELETE_SQL);
+        let result = sqlx::query(&delete_sql)
+            .bind(namespace)
+            .bind(id)
+            .execute(&mut *tx)
+            .await?;
+        if result.rows_affected() == 0 {
+            tx.rollback().await?;
+            self.check_slow_query("delete_gateway_trust_bundle", start);
+            return Ok(false);
+        }
+        self.record_config_change_tx(
+            &mut tx,
+            namespace,
+            GATEWAY_TRUST_BUNDLE_RESOURCE_TYPE,
+            id,
+            "delete",
+        )
+        .await?;
+        self.compact_config_changes_tx(&mut tx, namespace).await?;
+        tx.commit().await?;
+        self.check_slow_query("delete_gateway_trust_bundle", start);
+        Ok(true)
+    }
+
     /// List upstreams with database-level LIMIT/OFFSET pagination.
     pub async fn list_upstreams_paginated(
         &self,
@@ -5147,6 +5573,7 @@ impl DatabaseStore {
         let mut consumer_ops = HashMap::new();
         let mut plugin_config_ops = HashMap::new();
         let mut upstream_ops = HashMap::new();
+        let mut gateway_trust_bundle_changed = false;
 
         for change in changes {
             if change.operation != "upsert" && change.operation != "delete" {
@@ -5169,6 +5596,9 @@ impl DatabaseStore {
                 "upstream" => {
                     upstream_ops.insert(change.resource_id, change.operation);
                 }
+                GATEWAY_TRUST_BUNDLE_RESOURCE_TYPE => {
+                    gateway_trust_bundle_changed = true;
+                }
                 other => {
                     warn!(
                         "Ignoring config_changes row with unknown resource_type '{}' for id {}",
@@ -5181,6 +5611,18 @@ impl DatabaseStore {
         if !consumer_ops.is_empty() {
             return Err(anyhow::Error::new(
                 crate::config::db_backend::IncrementalFullReloadRequired::for_consumer_changes(
+                    namespace,
+                ),
+            ));
+        }
+
+        // Trust rotations/revocations escalate to a full reload so the snapshot
+        // and its `trust_bundles_json` side channel are published from one
+        // authoritative read (issue #3727). Checked before any point-load so a
+        // trust-only batch costs a single decision, not a round trip.
+        if gateway_trust_bundle_changed {
+            return Err(anyhow::Error::new(
+                crate::config::db_backend::IncrementalFullReloadRequired::for_gateway_trust_bundle_changes(
                     namespace,
                 ),
             ));
@@ -5604,6 +6046,46 @@ impl DatabaseStore {
         .execute(&mut **tx)
         .await?;
         Ok(())
+    }
+
+    /// Record a config change and return the durable sequence the backend
+    /// assigned it (issue #3727).
+    ///
+    /// `config_changes.sequence` is a database-assigned auto-increment key that
+    /// is never reused, and [`Self::lock_config_change_sequence_tx`] — taken
+    /// inside [`Self::record_config_change_tx`] and held for the rest of this
+    /// transaction — is the only way a row reaches the table. No other
+    /// transaction can therefore commit a change row for this namespace between
+    /// the insert above and the read below, which makes `MAX(sequence)` for the
+    /// namespace exactly the row this call just wrote.
+    ///
+    /// This is the monotonic source gateway trust-bundle revisions come from:
+    /// it advances on every mutation *including a delete*, so a delete/recreate
+    /// pair can never hand a recreated record a revision a stale client still
+    /// holds.
+    async fn record_config_change_returning_sequence_tx(
+        &self,
+        tx: &mut sqlx::Transaction<'_, sqlx::Any>,
+        namespace: &str,
+        resource_type: &str,
+        resource_id: &str,
+        operation: &str,
+    ) -> Result<u64, anyhow::Error> {
+        self.record_config_change_tx(tx, namespace, resource_type, resource_id, operation)
+            .await?;
+        let row = sqlx::query(&self.q("SELECT COALESCE(MAX(sequence), 0) AS max_sequence \
+             FROM config_changes WHERE namespace = ?"))
+        .bind(namespace)
+        .fetch_one(&mut **tx)
+        .await?;
+        let sequence: i64 = row.try_get("max_sequence")?;
+        // Checked, never clamped: a sequence that is not a positive signed
+        // BIGINT is not the monotonic key the revision contract assumes, and
+        // substituting a default would reintroduce revision reuse.
+        if sequence < 1 {
+            anyhow::bail!("config change sequence is out of range");
+        }
+        Ok(sequence as u64)
     }
 
     async fn compact_config_changes_tx(
@@ -7281,10 +7763,13 @@ impl DatabaseStore {
         pool: &AnyPool,
     ) -> Result<Vec<String>, anyhow::Error> {
         let start = Instant::now();
+        // Include gateway_trust_bundles so a trust-only namespace still appears
+        // in CP/admin enumeration (issue #3727 / PR #3782).
         let sql = "SELECT DISTINCT namespace FROM proxies \
                    UNION SELECT DISTINCT namespace FROM consumers \
                    UNION SELECT DISTINCT namespace FROM plugin_configs \
                    UNION SELECT DISTINCT namespace FROM upstreams \
+                   UNION SELECT DISTINCT namespace FROM gateway_trust_bundles \
                    ORDER BY 1";
         let rows: Vec<AnyRow> = sqlx::query(sql).fetch_all(pool).await?;
         let mut namespaces = Vec::with_capacity(rows.len());
@@ -7337,12 +7822,14 @@ impl DatabaseStore {
         let start = Instant::now();
         // The union subquery keeps one deterministic ordering for both the
         // count and the page so `total` and the returned slice cannot drift
-        // apart across the four resource tables.
+        // apart across the five resource tables (including trust-only
+        // namespaces that exist solely in gateway_trust_bundles).
         let count_sql = "SELECT COUNT(*) AS cnt FROM (\
                          SELECT DISTINCT namespace FROM proxies \
                          UNION SELECT DISTINCT namespace FROM consumers \
                          UNION SELECT DISTINCT namespace FROM plugin_configs \
-                         UNION SELECT DISTINCT namespace FROM upstreams\
+                         UNION SELECT DISTINCT namespace FROM upstreams \
+                         UNION SELECT DISTINCT namespace FROM gateway_trust_bundles\
                          ) AS ferrum_namespaces";
         let count_row = sqlx::query(count_sql).fetch_one(pool).await?;
         let total: i64 = count_row.try_get("cnt")?;
@@ -7351,6 +7838,7 @@ impl DatabaseStore {
                         UNION SELECT DISTINCT namespace FROM consumers \
                         UNION SELECT DISTINCT namespace FROM plugin_configs \
                         UNION SELECT DISTINCT namespace FROM upstreams \
+                        UNION SELECT DISTINCT namespace FROM gateway_trust_bundles \
                         ORDER BY 1 LIMIT ? OFFSET ?";
         let rows: Vec<AnyRow> = sqlx::query(&self.q(page_sql))
             .bind(limit)
@@ -9638,6 +10126,53 @@ impl DatabaseBackend for DatabaseStore {
         DatabaseStore::list_upstreams_paginated(self, namespace, limit, offset).await
     }
 
+    async fn get_gateway_trust_bundle(
+        &self,
+        namespace: &str,
+        id: &str,
+    ) -> Result<Option<GatewayTrustBundleRecord>, anyhow::Error> {
+        DatabaseStore::get_gateway_trust_bundle(self, namespace, id).await
+    }
+
+    async fn get_namespace_gateway_trust_bundle(
+        &self,
+        namespace: &str,
+    ) -> Result<Option<GatewayTrustBundleRecord>, anyhow::Error> {
+        DatabaseStore::get_namespace_gateway_trust_bundle(self, namespace).await
+    }
+
+    async fn list_gateway_trust_bundles_paginated(
+        &self,
+        namespace: &str,
+        limit: i64,
+        offset: i64,
+    ) -> Result<PaginatedResult<GatewayTrustBundleRecord>, anyhow::Error> {
+        DatabaseStore::list_gateway_trust_bundles_paginated(self, namespace, limit, offset).await
+    }
+
+    async fn create_gateway_trust_bundle(
+        &self,
+        record: &GatewayTrustBundleRecord,
+    ) -> Result<(), anyhow::Error> {
+        DatabaseStore::create_gateway_trust_bundle(self, record).await
+    }
+
+    async fn update_gateway_trust_bundle(
+        &self,
+        record: &GatewayTrustBundleRecord,
+        expected_revision: Option<u64>,
+    ) -> Result<bool, anyhow::Error> {
+        DatabaseStore::update_gateway_trust_bundle(self, record, expected_revision).await
+    }
+
+    async fn delete_gateway_trust_bundle(
+        &self,
+        namespace: &str,
+        id: &str,
+    ) -> Result<bool, anyhow::Error> {
+        DatabaseStore::delete_gateway_trust_bundle(self, namespace, id).await
+    }
+
     async fn check_listen_path_unique(
         &self,
         namespace: &str,
@@ -10540,6 +11075,114 @@ fn row_to_plugin_config_inner(
 }
 
 /// Parse an upstream row into an Upstream struct.
+/// Decode one `gateway_trust_bundles` row (issue #3727).
+///
+/// Failures are reported through the shared row-decode rejection marker so a
+/// corrupt trust row is treated like any other undecodable config row: the load
+/// fails closed and the previous valid generation stays active. The error text
+/// deliberately names the column only — never the stored material.
+fn row_to_gateway_trust_bundle(row: &AnyRow) -> Result<GatewayTrustBundleRecord, anyhow::Error> {
+    // Strict: the namespace column IS the tenant boundary and the document key.
+    // A row whose namespace is unreadable must not silently become the default
+    // namespace's trust.
+    let namespace = required_utf8_text_column(row, "namespace").map_err(|error| {
+        crate::config::gateway_trust::record_trust_load_rejection(
+            crate::config::gateway_trust::GatewayTrustFailureReason::Undecodable,
+        );
+        mark_row_decode_rejection(
+            "gateway_trust_bundle",
+            None,
+            anyhow::anyhow!("gateway trust bundle namespace column is unreadable: {error}"),
+        )
+    })?;
+    row_to_gateway_trust_bundle_inner(row, &namespace).map_err(|error| {
+        crate::config::gateway_trust::record_trust_load_rejection(
+            crate::config::gateway_trust::GatewayTrustFailureReason::Undecodable,
+        );
+        let id = row.try_get::<String, _>("id").ok();
+        mark_row_decode_rejection("gateway_trust_bundle", id, error)
+    })
+}
+
+/// Strictly decode a stored `revision`.
+///
+/// Security metadata must fail closed: a revision that is missing, not an
+/// integer, zero, or negative means the row is not the monotonic record the
+/// optimistic-concurrency contract assumes, and silently substituting `1` (or
+/// clamping a negative to `0`) would let a corrupt row win a compare-and-set or
+/// resurrect an older generation. Never echoes the stored value.
+fn strict_stored_revision(row: &AnyRow) -> Result<u64, anyhow::Error> {
+    let revision: i64 = row
+        .try_get("revision")
+        .map_err(|_| anyhow::anyhow!("gateway trust bundle revision column is unreadable"))?;
+    if revision < 1 {
+        anyhow::bail!("gateway trust bundle revision column is out of range");
+    }
+    Ok(revision as u64)
+}
+
+/// Strictly decode a stored timestamp column.
+///
+/// Unlike the shared [`parse_datetime_column`], this never falls back to
+/// `Utc::now()`: a trust record whose `created_at`/`updated_at` cannot be read
+/// is corrupt security metadata, and inventing "now" would make a corrupted row
+/// look like a fresh rotation on every load. Never echoes the stored value.
+fn strict_datetime_column(
+    row: &AnyRow,
+    column: &'static str,
+) -> Result<chrono::DateTime<Utc>, anyhow::Error> {
+    let raw: String = row
+        .try_get(column)
+        .map_err(|_| anyhow::anyhow!("gateway trust bundle {column} column is unreadable"))?;
+    if let Ok(value) = chrono::DateTime::parse_from_rfc3339(&raw) {
+        return Ok(value.with_timezone(&Utc));
+    }
+    // SQLite `CURRENT_TIMESTAMP` default format.
+    if let Ok(value) = chrono::NaiveDateTime::parse_from_str(&raw, "%Y-%m-%d %H:%M:%S") {
+        return Ok(value.and_utc());
+    }
+    anyhow::bail!("gateway trust bundle {column} column is not a valid timestamp")
+}
+
+fn row_to_gateway_trust_bundle_inner(
+    row: &AnyRow,
+    namespace: &str,
+) -> Result<GatewayTrustBundleRecord, anyhow::Error> {
+    let id = required_utf8_text_column(row, "id").map_err(|error| {
+        anyhow::anyhow!("gateway trust bundle id column is unreadable: {error}")
+    })?;
+    let trust_domain = required_utf8_text_column(row, "trust_domain").map_err(|error| {
+        anyhow::anyhow!("gateway trust bundle trust_domain column is unreadable: {error}")
+    })?;
+    let bundle_json = required_utf8_text_column(row, "bundle").map_err(|error| {
+        anyhow::anyhow!("gateway trust bundle bundle column is unreadable: {error}")
+    })?;
+    if bundle_json.len() > crate::config::gateway_trust::MAX_TRUST_BUNDLE_JSON_BYTES {
+        anyhow::bail!(
+            "gateway trust bundle stored material exceeds the {} byte limit",
+            crate::config::gateway_trust::MAX_TRUST_BUNDLE_JSON_BYTES
+        );
+    }
+    // Never surface serde's message: it can quote the offending document.
+    let bundle: crate::modes::mesh::config::TrustBundleSet = serde_json::from_str(&bundle_json)
+        .map_err(|_| anyhow::anyhow!("gateway trust bundle stored material is not decodable"))?;
+    let revision = strict_stored_revision(row)?;
+    let updated_by = optional_utf8_text_column(row, "updated_by").map_err(|error| {
+        anyhow::anyhow!("gateway trust bundle updated_by column is unreadable: {error}")
+    })?;
+
+    Ok(GatewayTrustBundleRecord {
+        id,
+        namespace: namespace.to_string(),
+        trust_domain,
+        bundle,
+        revision,
+        updated_by,
+        created_at: strict_datetime_column(row, "created_at")?,
+        updated_at: strict_datetime_column(row, "updated_at")?,
+    })
+}
+
 fn row_to_upstream(row: &AnyRow) -> Result<Upstream, anyhow::Error> {
     let id_preview: String = row
         .try_get("id")

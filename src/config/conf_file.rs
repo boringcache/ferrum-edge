@@ -9,9 +9,10 @@
 //!
 //! `ferrum.conf` is an immutable process-startup snapshot. It is loaded once
 //! through the shared bounded stable-file reader (regular-file open target,
-//! Unix `O_NONBLOCK`, 1 MiB ceiling with `limit + 1`, stable identity/content
-//! probes). The accepted result — or a precise load error — is cached for the
-//! process lifetime. A failed load is never converted into an empty fallback.
+//! Unix `O_NONBLOCK`, 1 MiB ceiling with `limit + 1`, two identity/content
+//! probes separated by a 20ms settle interval). The accepted result — or a
+//! precise load error — is cached for the process lifetime. A failed load is
+//! never converted into an empty fallback.
 //!
 //! When `FERRUM_CONF_PATH` is unset — or set to an empty / whitespace-only
 //! value, which configures nothing — and `./ferrum.conf` is genuinely absent,

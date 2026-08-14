@@ -31,7 +31,7 @@ use health::{
 };
 use std::net::IpAddr;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use tokio::task::JoinHandle;
 use tracing::{debug, info, warn};
 
@@ -1460,49 +1460,181 @@ enum PreparationOutcome {
 /// provably still pending while the staleness deadline elapses or a reconcile
 /// cancels the task. Real DNS warmup latency is not controllable, so a
 /// deliberately blocked step is the only deterministic way to cover the
-/// contract. Production never installs a hold.
+/// contract. When a hold is installed it *stands in* for warmup: production
+/// never installs one, and tests must not fall through to a real resolver
+/// lookup under a paused clock after release.
+///
+/// Each install is a generation. Dropping or clearing a stale generation must
+/// not take a newer test's slot or release its waiters: the slot is
+/// process-global, and hosted integration shards run other tests in the same
+/// process. A parked waiter also has to *observe* release under Tokio paused
+/// time — closing a semaphore is invisible to the paused clock, so a sleep
+/// poll can auto-advance to exhaustion while the poller stays parked with no
+/// timer, or while it is in real DNS warmup off the timer wheel.
 #[allow(dead_code)] // reached from the external test crate; dead in the bin target
 pub struct PublicationPreparationHold {
-    gate: tokio::sync::Semaphore,
+    generation: u64,
+    released: AtomicBool,
+    released_tx: tokio::sync::watch::Sender<bool>,
     entered: AtomicU64,
+    waiting: AtomicU64,
+    passed: AtomicU64,
 }
 
 #[allow(dead_code)] // reached from the external test crate; dead in the bin target
 impl PublicationPreparationHold {
+    fn new(generation: u64) -> Self {
+        let (released_tx, _) = tokio::sync::watch::channel(false);
+        Self {
+            generation,
+            released: AtomicBool::new(false),
+            released_tx,
+            entered: AtomicU64::new(0),
+            waiting: AtomicU64::new(0),
+            passed: AtomicU64::new(0),
+        }
+    }
+
+    /// Monotonic generation assigned at install. Stale holders compare against
+    /// this before touching the process-global slot.
+    pub fn generation(&self) -> u64 {
+        self.generation
+    }
+
     /// How many publication preparations have parked on this hold.
     pub fn entered(&self) -> u64 {
         self.entered.load(Ordering::SeqCst)
     }
 
-    /// Let every parked and future preparation through.
+    /// How many waiters have observed this hold's release and left `park`.
+    pub fn passed(&self) -> u64 {
+        self.passed.load(Ordering::SeqCst)
+    }
+
+    /// Whether [`Self::release`] has been called on this generation.
+    pub fn is_released(&self) -> bool {
+        self.released.load(Ordering::SeqCst)
+    }
+
+    /// Whether the process-global slot still points at this generation.
+    pub fn is_installed(&self) -> bool {
+        publication_preparation_hold().is_some_and(|hold| hold.generation == self.generation)
+    }
+
+    /// Let every parked and future waiter through. Idempotent, and does not
+    /// touch the process-global slot — a stale holder may release *its*
+    /// waiters without clearing a newer test's hold.
     pub fn release(&self) {
-        self.gate.close();
+        self.released.store(true, Ordering::SeqCst);
+        let _ = self.released_tx.send(true);
+    }
+
+    /// Yield until every waiter that was inside [`Self::park`] has observed
+    /// release (or been cancelled). Returns `false` immediately if `release`
+    /// has not been called.
+    ///
+    /// Mixes `yield_now` with a 1ms paused-clock tick so a waiter whose
+    /// `select!` waker was stale still notices the flag. `waiting == 0` after
+    /// a yield is the idle seam (nobody parked, or every waiter left). When
+    /// anyone entered `park`, `passed` is the production event that they
+    /// observed release rather than being cancelled.
+    pub async fn wait_until_release_observed(&self) -> bool {
+        if !self.released.load(Ordering::SeqCst) {
+            return false;
+        }
+        for _ in 0..10_000 {
+            let waiting = self.waiting.load(Ordering::SeqCst);
+            let entered = self.entered.load(Ordering::SeqCst);
+            let passed = self.passed.load(Ordering::SeqCst);
+            if waiting == 0 && (entered == 0 || passed > 0) {
+                tokio::task::yield_now().await;
+                let waiting = self.waiting.load(Ordering::SeqCst);
+                let entered = self.entered.load(Ordering::SeqCst);
+                let passed = self.passed.load(Ordering::SeqCst);
+                if waiting == 0 && (entered == 0 || passed > 0) {
+                    return true;
+                }
+            } else {
+                tokio::task::yield_now().await;
+                tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+            }
+        }
+        let waiting = self.waiting.load(Ordering::SeqCst);
+        let entered = self.entered.load(Ordering::SeqCst);
+        waiting == 0 && (entered == 0 || self.passed.load(Ordering::SeqCst) > 0)
+    }
+
+    /// Park until this generation is released. External tests cover ownership
+    /// and paused-clock observation through this method; production publication
+    /// uses the same path via [`Self::wait`].
+    pub async fn park(&self) {
+        self.wait().await;
     }
 
     async fn wait(&self) {
         self.entered.fetch_add(1, Ordering::SeqCst);
-        // `Err` means the hold was released; either way, proceed.
-        let _ = self.gate.acquire().await;
+        self.waiting.fetch_add(1, Ordering::SeqCst);
+        struct WaitingGuard<'a>(&'a AtomicU64);
+        impl Drop for WaitingGuard<'_> {
+            fn drop(&mut self) {
+                self.0.fetch_sub(1, Ordering::SeqCst);
+            }
+        }
+        let _waiting = WaitingGuard(&self.waiting);
+
+        let mut rx = self.released_tx.subscribe();
+        loop {
+            if self.released.load(Ordering::SeqCst) || *rx.borrow_and_update() {
+                break;
+            }
+            tokio::select! {
+                changed = rx.changed() => {
+                    if changed.is_err()
+                        || self.released.load(Ordering::SeqCst)
+                        || *rx.borrow_and_update()
+                    {
+                        break;
+                    }
+                }
+                // Keep this waiter on the paused-time timer wheel. A watch wake
+                // can be lost across `select!` restart in the publication
+                // deadline loop; the next 1ms tick still observes `released`.
+                _ = tokio::time::sleep(std::time::Duration::from_millis(1)) => {}
+            }
+        }
+        self.passed.fetch_add(1, Ordering::SeqCst);
     }
 }
 
+static NEXT_PUBLICATION_PREPARATION_HOLD_GENERATION: AtomicU64 = AtomicU64::new(1);
 static PUBLICATION_PREPARATION_HOLD: std::sync::RwLock<Option<Arc<PublicationPreparationHold>>> =
     std::sync::RwLock::new(None);
 
 /// Install a hold that blocks publication preparation until it is released.
+///
+/// Replacing an existing hold releases the previous generation's waiters so a
+/// crashed or overlapping test cannot leave publication parked forever, but the
+/// previous holder still owns its `Arc` and cannot clear this newer slot.
 #[allow(dead_code)] // reached from the external test crate; dead in the bin target
 pub fn hold_discovery_publication_preparation_for_test() -> Arc<PublicationPreparationHold> {
-    let hold = Arc::new(PublicationPreparationHold {
-        gate: tokio::sync::Semaphore::new(0),
-        entered: AtomicU64::new(0),
-    });
-    if let Ok(mut guard) = PUBLICATION_PREPARATION_HOLD.write() {
-        *guard = Some(Arc::clone(&hold));
+    let generation = NEXT_PUBLICATION_PREPARATION_HOLD_GENERATION.fetch_add(1, Ordering::SeqCst);
+    let hold = Arc::new(PublicationPreparationHold::new(generation));
+    let previous = PUBLICATION_PREPARATION_HOLD
+        .write()
+        .ok()
+        .and_then(|mut guard| guard.replace(Arc::clone(&hold)));
+    if let Some(previous) = previous {
+        previous.release();
     }
     hold
 }
 
 /// Remove any installed hold, releasing whatever is parked on it.
+///
+/// Panic-cleanup for the next serialized lifecycle test. Prefer
+/// [`clear_discovery_publication_preparation_hold_generation_for_test`] from a
+/// holder that still knows its generation, so a stale Drop cannot steal a
+/// newer test's slot.
 #[allow(dead_code)] // reached from the external test crate; dead in the bin target
 pub fn clear_discovery_publication_preparation_hold_for_test() {
     let previous = PUBLICATION_PREPARATION_HOLD
@@ -1510,6 +1642,26 @@ pub fn clear_discovery_publication_preparation_hold_for_test() {
         .ok()
         .and_then(|mut guard| guard.take());
     if let Some(hold) = previous {
+        hold.release();
+    }
+}
+
+/// Release and remove the installed hold only if it is still `generation`.
+///
+/// A stale holder whose slot was replaced is a no-op here: it must not clear
+/// or release a newer test's hold. The stale holder still calls
+/// [`PublicationPreparationHold::release`] on its own `Arc` to unblock
+/// waiters that parked on that older generation.
+#[allow(dead_code)] // reached from the external test crate; dead in the bin target
+pub fn clear_discovery_publication_preparation_hold_generation_for_test(generation: u64) {
+    let taken = PUBLICATION_PREPARATION_HOLD
+        .write()
+        .ok()
+        .and_then(|mut guard| match guard.as_ref() {
+            Some(hold) if hold.generation == generation => guard.take(),
+            _ => None,
+        });
+    if let Some(hold) = taken {
         hold.release();
     }
 }
@@ -1794,10 +1946,13 @@ pub(crate) async fn apply_discovered_snapshot(
         let prepared = prepare_publication_under_deadline(
             async {
                 if let Some(hold) = publication_preparation_hold() {
-                    // Test-only: never installed in production.
+                    // Test-only: never installed in production. The hold is
+                    // the preparation step — after release the poller
+                    // publishes without a real DNS lookup, so paused-time
+                    // tests handshake `passed` / `waiting == 0` instead of
+                    // auto-advancing through resolver timeouts.
                     hold.wait().await;
-                }
-                if !hostnames.is_empty() {
+                } else if !hostnames.is_empty() {
                     dns_cache.warmup(hostnames).await;
                 }
             },

@@ -20,12 +20,18 @@
 //!    are non-blocking so a raced special file cannot wedge the worker).
 //! 2. Reads the opened handle, then re-fstats that handle and re-stats the
 //!    configured path so symlink/rename swaps mid-read fail closed.
-//! 3. Performs a second independent open/read and requires **byte-identical**
-//!    content plus matching file identity. Size/metadata agreement alone is
-//!    not treated as proof of content stability (same-size in-place rewrites
-//!    and paused torn truncations can keep metadata unchanged).
-//! 4. Retries a bounded number of times on instability, then fails closed.
-//!    Reload keeps the last known-good live generation; startup aborts.
+//! 3. Sleeps the configured settle interval (the shared retry delay; 20ms by
+//!    default) then performs a second independent open/read and requires
+//!    **byte-identical** content plus matching file identity. Size/metadata
+//!    agreement alone is not treated as proof of content stability (same-size
+//!    in-place rewrites and paused torn truncations can keep metadata
+//!    unchanged). Back-to-back probes can both fit inside one truncate/write
+//!    window; the settle interval is what makes that window visible.
+//! 4. Retries a bounded number of times on instability, sleeping the same
+//!    interval between attempts, then fails closed. Worst-case synchronous
+//!    sleep is 180ms at the defaults plus the capped I/O — a cold-path cost,
+//!    not a per-request delay. Reload keeps the last known-good live
+//!    generation; startup aborts.
 //!
 //! Operators should publish updates with write-temp → fsync → `rename(2)` (or
 //! an equivalent atomic replace such as a Kubernetes ConfigMap symlink swap).
@@ -39,6 +45,7 @@ use crate::config::stable_file::{
 };
 use crate::config::types::{CURRENT_CONFIG_VERSION, GatewayConfig};
 use crate::config::validation_pipeline::{ValidationAction, ValidationPipeline};
+use crate::config::yaml_alias_budget::admit_yaml_alias_expansion;
 use serde::Deserialize;
 use std::path::Path;
 use tracing::{info, warn};
@@ -166,11 +173,15 @@ pub fn load_config_from_file(
     // force an otherwise-current YAML document through JSON and discard
     // YAML-specific tags.
     let (mut value, mut yaml_value): (serde_json::Value, Option<serde_yaml::Value>) = if is_yaml {
+        admit_yaml_alias_expansion(&content)?;
         let yaml_val: serde_yaml::Value = serde_yaml::from_str(&content)?;
         (serde_json::to_value(&yaml_val)?, Some(yaml_val))
     } else {
         (serde_json::from_str(&content)?, None)
     };
+    // The parsed trees own every retained value; release the bounded source
+    // buffer before migration/validation allocates any additional structures.
+    drop(content);
 
     // Optional file-mode integrity seal. Strip before GatewayConfig
     // deserialization so deny_unknown_fields stays authoritative for the
@@ -435,6 +446,10 @@ pub fn decode_and_validate_config_document(
     if content.len() as u64 > MAX_CONFIG_FILE_BYTES {
         anyhow::bail!("config document exceeds maximum size of {MAX_CONFIG_FILE_BYTES} bytes");
     }
+
+    // Admit YAML alias expansion before the detection parse. The detector uses
+    // `serde_yaml::from_str`, which would otherwise materialize aliases first.
+    admit_yaml_alias_expansion(content)?;
 
     let is_yaml = serde_yaml::from_str::<serde_yaml::Value>(content).is_ok()
         && !content.trim_start().starts_with('{');

@@ -2,12 +2,19 @@ use arc_swap::ArcSwap;
 use bytes::Bytes;
 use chrono::Utc;
 use ferrum_edge::config::PoolConfig;
-use ferrum_edge::config::types::{AuthMode, BackendScheme, DispatchKind, Proxy, ResponseBodyMode};
+use ferrum_edge::config::env_config::{EnvConfig, OperatingMode};
+use ferrum_edge::config::types::{
+    AuthMode, BackendScheme, DispatchKind, GatewayConfig, Proxy, ResponseBodyMode,
+};
 use ferrum_edge::dns::{DnsCache, DnsConfig};
 use ferrum_edge::identity::spiffe::{SpiffeId, TrustDomain, spiffe_id_to_san};
 use ferrum_edge::identity::{SharedSvidBundle, SvidBundle, TrustBundle, TrustBundleSet};
 use ferrum_edge::modes::mesh::hbone::HboneIdentity;
-use ferrum_edge::proxy::hbone_pool::{HBONE_TARGET_TAG, HboneConnectionPool, HbonePoolError};
+use ferrum_edge::proxy::hbone_pool::{
+    H2ConnectTunnel, HBONE_TARGET_TAG, HboneConnectionPool, HbonePoolError,
+};
+use ferrum_edge::proxy::mesh_mtls_pool::MeshMtlsSender;
+use ferrum_edge::proxy::{GatewayTrustCommit, ProxyState};
 use ferrum_edge::tls::spiffe::build_spiffe_inbound_config;
 use http::{Response, StatusCode};
 use rcgen::{
@@ -23,6 +30,7 @@ use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 use tokio::sync::oneshot;
+use tokio::task::JoinHandle;
 use tokio_rustls::TlsAcceptor;
 
 fn synthetic_root(td: &TrustDomain) -> (Vec<u8>, String, String) {
@@ -721,4 +729,282 @@ fn mesh_hbone_tag_constant_matches_documented_target_tag() {
     let mut tags = HashMap::new();
     tags.insert(HBONE_TARGET_TAG.to_string(), "true".to_string());
     assert_eq!(tags.get("mesh.hbone").map(String::as_str), Some("true"));
+}
+
+// ─── A committed gateway trust change must clear pooled entries it withdrew ──
+//
+// The mesh pools key on the leaf SVID *fingerprint*, not on the backend security
+// generation. A gateway trust `Replace`/`Clear` leaves the leaf alone, so every
+// pooled key is byte-identical across the commit and an HBONE / mesh-mTLS
+// pooled entry authenticated under a root the accepted generation WITHDREW keeps
+// matching for pool lookup. The only thing that used to remove it was the rotation
+// consumer's force-drain, which `FERRUM_MESH_SVID_ROTATION_DRAIN_SECONDS` skips entirely at
+// its documented default of `0` — so the withdrawal was unbounded (issue #3727).
+//
+// These tests drive the REAL pools owned by a real `ProxyState`: genuine
+// SPIFFE-mTLS HTTP/2 connections are established through `state.hbone_pool` and
+// `state.mesh_mtls_pool`, then the production publication seam commits the trust
+// decision. The drain window is the default `0`, so the rotation consumer cannot
+// force-drain anything at all; and the assertions run with NO `.await` after the
+// synchronous publishing call, so nothing they observe could have come from
+// another task. Whatever the pools report is what the publication itself did to
+// pool discoverability — not whether already-issued handles terminate (issue #3859).
+
+/// A `ProxyState` in the DOCUMENTED DEFAULT drain configuration whose mesh pools
+/// share `gateway_svid_bundle` and `backend_svid_generation` with the state.
+async fn dp_state_with_gateway_svid(gateway: SvidBundle) -> (ProxyState, Vec<JoinHandle<()>>) {
+    let env_config = EnvConfig {
+        mode: OperatingMode::DataPlane,
+        ..Default::default()
+    };
+    assert_eq!(
+        env_config.mesh_svid_rotation_drain_seconds, 0,
+        "these tests exist for the DEFAULT drain window; a non-zero default would \
+         let the rotation consumer's delayed force-drain do the work instead"
+    );
+    let dns_cache = DnsCache::new(DnsConfig::default());
+    let built = ProxyState::new(GatewayConfig::default(), dns_cache, env_config, None, None);
+    let (state, tasks) = built.expect("test proxy state should build");
+    // Exactly how the SVID source watcher installs an identity: the live slot AND
+    // the published request epoch adopt it together.
+    state.install_gateway_runtime_svid_bundle(gateway);
+    (state, tasks)
+}
+
+/// Establish one real pooled HBONE tunnel and one real pooled mesh-mTLS
+/// connection through the state's own pools, leaving one discoverable entry in
+/// each pool map.
+async fn pool_one_mesh_pooled_entry_each(
+    state: &ProxyState,
+    server_addr: std::net::SocketAddr,
+    server_id: &SpiffeId,
+) -> (H2ConnectTunnel, MeshMtlsSender) {
+    let proxy = proxy_for_test();
+    let tunnel = tokio::time::timeout(
+        Duration::from_secs(15),
+        state.hbone_pool.get_tunnel_via(
+            &proxy,
+            "127.0.0.1",
+            "127.0.0.1",
+            8080,
+            8080,
+            server_addr.port(),
+            Some(server_id),
+            None,
+            None,
+            None,
+        ),
+    )
+    .await
+    .expect("timely hbone dial")
+    .expect("hbone tunnel opens");
+    let sender = tokio::time::timeout(
+        Duration::from_secs(15),
+        state.mesh_mtls_pool.get_sender(
+            &proxy,
+            "127.0.0.1",
+            8080,
+            8080,
+            server_addr.port(),
+            Some(server_id),
+            None,
+            None,
+        ),
+    )
+    .await
+    .expect("timely mesh-mTLS dial")
+    .expect("mesh-mTLS connection opens");
+
+    assert_eq!(
+        state.hbone_pool.pool_size(),
+        1,
+        "the HBONE dial must have left exactly one discoverable pooled entry"
+    );
+    assert_eq!(
+        state.mesh_mtls_pool.pool_size(),
+        1,
+        "the mesh-mTLS dial must have left exactly one discoverable pooled entry"
+    );
+    (tunnel, sender)
+}
+
+fn local_only_trust(td: &TrustDomain, authority: Vec<u8>) -> TrustBundleSet {
+    TrustBundleSet::local_only(TrustBundle {
+        trust_domain: td.clone(),
+        x509_authorities: vec![authority],
+        jwt_authorities: Vec::new(),
+        refresh_hint_seconds: None,
+    })
+}
+
+fn dp_snapshot(version: &str) -> GatewayConfig {
+    GatewayConfig {
+        version: version.to_string(),
+        ..Default::default()
+    }
+}
+
+fn backend_security_generation(state: &ProxyState) -> u64 {
+    state.backend_svid_generation.load(Ordering::Acquire)
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_committed_trust_replace_clears_pooled_mesh_entries_at_the_default_zero_drain() {
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    let td = TrustDomain::new("cluster.local").unwrap();
+    let (root_der, root_pem, root_key_pem) = synthetic_root(&td);
+    let gateway_id = SpiffeId::from_parts(&td, "ns/edge/sa/gateway").unwrap();
+    let server_id = SpiffeId::from_parts(&td, "ns/default/sa/orders").unwrap();
+    let (gateway_leaf, gateway_key) = issue_svid(&gateway_id, &root_pem, &root_key_pem);
+    let (server_leaf, server_key) = issue_svid(&server_id, &root_pem, &root_key_pem);
+
+    let root = root_der.clone();
+    let server_bundle = bundle_for(server_id.clone(), server_leaf, server_key, root);
+    let server_slot = svid_slot(server_bundle);
+    let (server_addr, _connections) = start_hbone_counting_echo_server(server_slot).await;
+
+    let gateway_bundle = bundle_for(gateway_id, gateway_leaf, gateway_key, root_der);
+    let (state, _tasks) = dp_state_with_gateway_svid(gateway_bundle).await;
+    let (_tunnel, _sender) = pool_one_mesh_pooled_entry_each(&state, server_addr, &server_id).await;
+    let before = backend_security_generation(&state);
+
+    // ── The production publication seam. No `.await` past this point. ────────
+    // A CP-delivered Replace that withdraws the root must clear both pooled
+    // entries that were authenticated under it from the pool maps. The rotation
+    // consumer cannot help here: at `drain_seconds == 0` it never calls
+    // `force_drain` at all.
+    let rotated_td = TrustDomain::new("rotated.local").unwrap();
+    state.update_config_with_gateway_trust(
+        dp_snapshot("trust-replace"),
+        GatewayTrustCommit::Replace(local_only_trust(&rotated_td, vec![4, 2])),
+    );
+
+    assert_eq!(
+        state.hbone_pool.pool_size(),
+        0,
+        "an HBONE pooled entry authenticated under the withdrawn root must not \
+         remain discoverable in the pool map — its key embeds the leaf fingerprint, \
+         which the trust change did not touch, so only an explicit pool clear can remove it"
+    );
+    assert_eq!(
+        state.mesh_mtls_pool.pool_size(),
+        0,
+        "the mesh-mTLS pool keys on the same unchanged fingerprint and must be \
+         cleared from the pool map by the same publication"
+    );
+    assert_eq!(
+        backend_security_generation(&state),
+        before + 1,
+        "the generation-keyed HTTP/H2/gRPC/H3 pools must be re-partitioned by the \
+         same publication"
+    );
+    assert!(
+        state.admits_gateway_mesh_identity(),
+        "the accepted generation must be authenticating once the call returns, so \
+         the pool clear provably ran while admission was still fenced"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_committed_trust_clear_clears_pooled_mesh_entries_at_the_default_zero_drain() {
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    let td = TrustDomain::new("cluster.local").unwrap();
+    let (root_der, root_pem, root_key_pem) = synthetic_root(&td);
+    let gateway_id = SpiffeId::from_parts(&td, "ns/edge/sa/gateway").unwrap();
+    let server_id = SpiffeId::from_parts(&td, "ns/default/sa/orders").unwrap();
+    let (gateway_leaf, gateway_key) = issue_svid(&gateway_id, &root_pem, &root_key_pem);
+    let (server_leaf, server_key) = issue_svid(&server_id, &root_pem, &root_key_pem);
+
+    let root = root_der.clone();
+    let server_bundle = bundle_for(server_id.clone(), server_leaf, server_key, root);
+    let server_slot = svid_slot(server_bundle);
+    let (server_addr, _connections) = start_hbone_counting_echo_server(server_slot).await;
+
+    let root = root_der.clone();
+    let gateway_bundle = bundle_for(gateway_id, gateway_leaf, gateway_key, root);
+    let (state, _tasks) = dp_state_with_gateway_svid(gateway_bundle).await;
+
+    // Install a CP override first; the pooled entries below are the ones a
+    // revocation of THAT override must clear from the pool maps.
+    state.update_config_with_gateway_trust(
+        dp_snapshot("trust-install"),
+        GatewayTrustCommit::Replace(local_only_trust(&td, root_der)),
+    );
+    let (_tunnel, _sender) = pool_one_mesh_pooled_entry_each(&state, server_addr, &server_id).await;
+    let before = backend_security_generation(&state);
+
+    // ── Explicit revocation. No `.await` past this point. ────────────────────
+    state.update_config_with_gateway_trust(dp_snapshot("trust-clear"), GatewayTrustCommit::Clear);
+
+    assert_eq!(
+        state.hbone_pool.pool_size(),
+        0,
+        "an explicit revocation must clear the HBONE pooled entries the withdrawn \
+         override authenticated from the pool map"
+    );
+    assert_eq!(
+        state.mesh_mtls_pool.pool_size(),
+        0,
+        "an explicit revocation must clear the mesh-mTLS pooled entries the withdrawn \
+         override authenticated from the pool map"
+    );
+    assert_eq!(backend_security_generation(&state), before + 1);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_commit_that_withdraws_no_root_never_clears_a_pooled_mesh_entry() {
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    let td = TrustDomain::new("cluster.local").unwrap();
+    let (root_der, root_pem, root_key_pem) = synthetic_root(&td);
+    let gateway_id = SpiffeId::from_parts(&td, "ns/edge/sa/gateway").unwrap();
+    let server_id = SpiffeId::from_parts(&td, "ns/default/sa/orders").unwrap();
+    let (gateway_leaf, gateway_key) = issue_svid(&gateway_id, &root_pem, &root_key_pem);
+    let (server_leaf, server_key) = issue_svid(&server_id, &root_pem, &root_key_pem);
+
+    let root = root_der.clone();
+    let server_bundle = bundle_for(server_id.clone(), server_leaf, server_key, root);
+    let server_slot = svid_slot(server_bundle);
+    let (server_addr, _connections) = start_hbone_counting_echo_server(server_slot).await;
+
+    let gateway_bundle = bundle_for(gateway_id, gateway_leaf, gateway_key, root_der);
+    let (state, _tasks) = dp_state_with_gateway_svid(gateway_bundle).await;
+    let (_tunnel, _sender) = pool_one_mesh_pooled_entry_each(&state, server_addr, &server_id).await;
+    let before = backend_security_generation(&state);
+
+    // An ordinary resource reload: the side channel says nothing about trust, so
+    // no root is withdrawn. Clearing pool entries here would be a self-inflicted reconnect
+    // storm on every CP delta.
+    state.update_config_with_gateway_trust(
+        dp_snapshot("ordinary-reload"),
+        GatewayTrustCommit::Unchanged,
+    );
+
+    assert_eq!(
+        state.hbone_pool.pool_size(),
+        1,
+        "an Unchanged commit changes no trust material and must not churn a pool"
+    );
+    assert_eq!(state.mesh_mtls_pool.pool_size(), 1);
+    assert_eq!(
+        backend_security_generation(&state),
+        before,
+        "an Unchanged commit must not advance the backend security generation"
+    );
+
+    // A `Clear` with no override installed is what the CP sends on EVERY full
+    // snapshot of a deployment that uses no gateway trust bundles. It removes no
+    // root, so it must not clear anything either — otherwise a DP reconnect
+    // would drop every pooled mesh entry on the node.
+    state.update_config_with_gateway_trust(
+        dp_snapshot("redundant-clear"),
+        GatewayTrustCommit::Clear,
+    );
+
+    assert_eq!(
+        state.hbone_pool.pool_size(),
+        1,
+        "a Clear that withdraws nothing must not clear a pooled mesh entry"
+    );
+    assert_eq!(state.mesh_mtls_pool.pool_size(), 1);
+    assert_eq!(backend_security_generation(&state), before);
 }
