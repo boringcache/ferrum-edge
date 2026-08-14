@@ -546,8 +546,7 @@ fn live_handshake_wrapper_refuses_after_accepted_withdrawal_even_with_a_stale_in
         "armed admission must fail closed when the handshake exposes no peer certificate"
     );
     assert!(
-        stale_h3.root_hint_subjects().is_empty()
-            && stale_frontend.root_hint_subjects().is_empty(),
+        stale_h3.root_hint_subjects().is_empty() && stale_frontend.root_hint_subjects().is_empty(),
         "live verification must not start advertising snapshot CA names after a withdrawal"
     );
 }
@@ -571,10 +570,8 @@ fn live_handshake_wrapper_exposes_no_stale_ca_name_constraint() {
         .verifier
         .clone()
         .expect("startup candidate installs a verifier");
-    let wrapper = client_trust::bind_live_handshake_verifier(
-        ClientTrustScope::ProxyFrontend,
-        inner.clone(),
-    );
+    let wrapper =
+        client_trust::bind_live_handshake_verifier(ClientTrustScope::ProxyFrontend, inner.clone());
 
     assert!(
         !inner.root_hint_subjects().is_empty(),
@@ -1661,10 +1658,7 @@ async fn dp_h12_tcp_adopts_additive_operator_verifier_while_retaining_cp_server_
         .as_ref()
         .clone()
         .expect("CP config on the H1/H2/TCP slot");
-    assert!(std::sync::Arc::ptr_eq(
-        &listener_before,
-        &cp_startup.config
-    ));
+    assert!(std::sync::Arc::ptr_eq(&listener_before, &cp_startup.config));
     assert!(std::sync::Arc::ptr_eq(
         &listener_before.cert_resolver,
         &cp_startup.config.cert_resolver
