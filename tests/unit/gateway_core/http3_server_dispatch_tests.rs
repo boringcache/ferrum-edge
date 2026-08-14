@@ -152,10 +152,7 @@ fn h3_plain_mesh_upload_collection_releases_half_open_probe_before_terminal_writ
         .split("H3RequestBodyReadError::TimedOut")
         .next()
         .expect("bounded mesh collection DeadlineExceeded branch");
-    let deadline_compact: String = deadline
-        .chars()
-        .filter(|c| !c.is_whitespace())
-        .collect();
+    let deadline_compact: String = deadline.chars().filter(|c| !c.is_whitespace()).collect();
     assert!(
         deadline_compact.contains("DeadlineExceeded(authorization_expiry)")
             || deadline_compact.contains("DeadlineExceeded(authorization_expiry,)"),

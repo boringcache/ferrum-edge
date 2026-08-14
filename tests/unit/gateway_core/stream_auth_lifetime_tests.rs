@@ -4556,10 +4556,7 @@ fn every_native_h3_upload_site_attributes_from_the_captured_composition() {
         collector.contains("compose_early_upload_bound(bound.deadline()"),
         "the awaited instant must be a projection of the captured composition"
     );
-    let collector_compact: String = collector
-        .chars()
-        .filter(|c| !c.is_whitespace())
-        .collect();
+    let collector_compact: String = collector.chars().filter(|c| !c.is_whitespace()).collect();
     assert!(
         collector_compact.contains("DeadlineExceeded(bound.expired_authorization())")
             || collector_compact.contains("DeadlineExceeded(bound.expired_authorization(),)"),
@@ -4630,8 +4627,7 @@ fn every_native_h3_upload_site_attributes_from_the_captured_composition() {
             .matches("Err(H3RequestBodyReadError::DeadlineExceeded(authorization_expiry,))=>{")
             .count();
     assert_eq!(
-        typed_arm_count,
-        7,
+        typed_arm_count, 7,
         "a native-H3 upload site stopped consuming the winner captured at composition"
     );
     let compact = H3_SERVER_SOURCE
