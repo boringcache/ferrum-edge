@@ -4,7 +4,8 @@ use ferrum_edge::config::types::Consumer;
 use ferrum_edge::consumer_index::ConsumerIndex;
 use ferrum_edge::plugins::mtls_auth::{MtlsAuth, MtlsAuthConnectionCache};
 use ferrum_edge::plugins::{
-    HTTP_FAMILY_AND_STREAM_PROTOCOLS, Plugin, RequestContext, StreamConnectionContext, priority,
+    HTTP_FAMILY_AND_STREAM_PROTOCOLS, Plugin, PluginResult, RequestContext,
+    StreamConnectionContext, priority,
 };
 use serde_json::{Map, Value, json};
 use std::collections::HashMap;

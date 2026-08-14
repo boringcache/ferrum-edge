@@ -882,12 +882,13 @@ impl ferrum_edge::plugins::Plugin for ParkedUnauthenticatedHook {
         {
             let _ = entered.send(());
         }
-        if let Some(release) = self
-            .release
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .take()
-        {
+        let release = {
+            self.release
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .take()
+        };
+        if let Some(release) = release {
             let _ = release.await;
         }
         ferrum_edge::plugins::UdpDatagramVerdict::Forward
