@@ -9,8 +9,10 @@ description: >-
   cache-service credential is intentionally not exposed to later PR-controlled
   steps); rust-cache persists that directory together with Cargo and target
   directories using isolated shared keys so incompatible job/profile/target
-  artifacts do not mix. rust-cache saves on failure (`cache-on-failure`) so a
-  runner-loss or later-phase failure can still reuse compile work on retry.
+  artifacts do not mix. rust-cache saves on ordinary later-phase failures
+  (`cache-on-failure`) when post-job cleanup still executes. Abrupt runner loss
+  cannot publish that runner's unsaved state, although retries can still restore
+  an already-published warm cache.
   Fork pull requests restore that cache and do not save (`save-if` is false
   when `github.event.pull_request.head.repo.fork` is true).
   Centralizes the setup block so individual jobs only declare their cache key

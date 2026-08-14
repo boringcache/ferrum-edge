@@ -89,7 +89,10 @@ action holds the GitHub Actions cache credential inside the action process;
 PR-controlled `run:` steps never receive that credential. rust-cache `save-if`
 is false when `github.event.pull_request.head.repo.fork` is true, so fork pull
 requests restore `ci-fips` and cannot save. Trusted runs keep `cache-on-failure`
-so a runner-loss retry can reuse compile work. A `workflow_dispatch` input
+so ordinary failing jobs can publish compile work when post-job cleanup still
+runs. The successful compile producer publishes before clippy/test start, so a
+downstream runner-loss retry can reuse it; abrupt loss of the producer cannot
+publish that producer's unsaved state. A `workflow_dispatch` input
 `force_cold_cache` skips restore so a hosted cold-cache run still proves every
 live assertion. Path planning is fail-closed: a missing or unknown trusted
 planner runs the compile gate rather than skipping it. Path planning reads a

@@ -11,8 +11,10 @@ name: FIPS Build Policy
 #    The planner is read from the trusted base; a missing or unknown planner
 #    fails closed toward running the live compile gate.
 # 3. `fips-compile` builds the FIPS binary and every claimed feature combination
-#    once, then rust-cache/sccache persist the AWS-LC + rustc artifacts so a
-#    later clippy/test job or a runner-loss retry does not start from zero.
+#    once, then rust-cache/sccache persist the AWS-LC + rustc artifacts before
+#    the later clippy/test jobs start. A downstream runner-loss retry therefore
+#    does not start from zero; abrupt loss of the producer itself cannot publish
+#    that producer's unsaved state.
 #    Fork pull requests restore `ci-fips` but do not save (`save-if`).
 # 4. `fips-clippy` and `fips-test` restore that cache in parallel.
 # 5. `fips-build` keeps the `FIPS Build & Test` check name and fails closed.

@@ -1033,7 +1033,7 @@ def check_fips(workflow: str, failures: list[str]) -> None:
     require(
         "cache-on-failure: \"true\"" in workflow or "cache-on-failure: 'true'" in workflow
         or "cache-on-failure: true" in workflow,
-        "FIPS rust-cache must save on failure so runner-loss retries reuse compile work",
+        "FIPS rust-cache must save after ordinary failures when post-job cleanup still runs",
         failures,
     )
     require(
@@ -1375,7 +1375,7 @@ def check_shared_actions(failures: list[str]) -> None:
     sccache = SETUP_SCCACHE.read_text(encoding="utf-8")
     require(
         "cache-on-failure:" in rust_ci and "true" in rust_ci,
-        "setup-rust-ci must save rust-cache on failure for runner-loss retries",
+        "setup-rust-ci must save rust-cache after ordinary failures when post-job cleanup still runs",
         failures,
     )
     require(

@@ -276,8 +276,11 @@ policy/key-admission/handshake tests share rust-cache key `ci-fips` and a
 local-disk sccache directory. The compile job saves first; clippy and tests
 restore in parallel. rust-cache `save-if` is false for fork pull requests, so
 those jobs restore `ci-fips` and cannot save. Trusted runs keep
-`cache-on-failure` so a runner-loss retry (exit 143 after a green suite) can
-reuse compile work. Example plugins stay out of the FIPS artifact
+`cache-on-failure` so ordinary failing jobs can publish compile work when
+post-job cleanup still runs. The successful compile producer publishes before
+clippy/test start, so a downstream runner-loss retry can reuse it; abrupt loss
+of the producer cannot publish that producer's unsaved state. Example plugins
+stay out of the FIPS artifact
 (`FERRUM_CUSTOM_PLUGINS` is unset). Job summaries record rust-cache hit/miss
 from the action output, but measured restored bytes are the sccache-directory
 subset (`.cache/sccache`) only; rust-cache also restores Cargo and
