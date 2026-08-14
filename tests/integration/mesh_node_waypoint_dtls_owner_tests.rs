@@ -196,7 +196,8 @@ fn strict_dtls_without_client_ca_rejects_the_complete_candidate() {
     let runtime = node_waypoint_runtime();
 
     let error = build_node_waypoint_dtls_owner_configs(&state, &runtime, &slice, &config)
-        .expect_err("STRICT without a client CA must reject the complete candidate");
+        .err()
+        .expect("STRICT without a client CA must reject the complete candidate");
     assert!(
         error.contains("STRICT"),
         "diagnostic must name the unservable STRICT posture: {error}"
@@ -271,7 +272,8 @@ async fn permissive_to_strict_without_client_ca_retains_last_good_generation() {
         vec![namespace_peer_auth(MtlsMode::Strict, HashMap::new())],
     );
     let error = build_node_waypoint_dtls_owner_configs(&state, &runtime, &strict_slice, &config)
-        .expect_err("STRICT without a client CA must reject before config apply");
+        .err()
+        .expect("STRICT without a client CA must reject before config apply");
     assert!(
         error.contains("STRICT") && error.contains("FERRUM_DTLS_CLIENT_CA_CERT_PATH"),
         "diagnostic must name STRICT and the missing client CA: {error}"
