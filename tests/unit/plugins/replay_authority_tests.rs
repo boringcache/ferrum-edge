@@ -2402,8 +2402,7 @@ async fn a_silent_recovery_ping_times_out_and_does_not_wedge_retry() {
     let _serialized = shared_health_guard_async().await;
     let baseline = shared_health_snapshot();
     let (port, pings, shutdown) = spawn_ping_silent_then_healthy_redis(1).await;
-    let client =
-        claim_client_with_interval(port, "ferrum:replay_authority_tests:ping-timeout", 1);
+    let client = claim_client_with_interval(port, "ferrum:replay_authority_tests:ping-timeout", 1);
     let authority = shared_live(Arc::clone(&client), RETENTION);
     assert!(!client.is_available());
     assert_eq!(

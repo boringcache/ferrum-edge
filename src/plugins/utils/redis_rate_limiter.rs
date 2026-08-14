@@ -1004,8 +1004,7 @@ fn incomplete_ping_probe_error() -> redis::RedisError {
 }
 
 fn is_incomplete_ping_probe_error(error: &redis::RedisError) -> bool {
-    error.kind() == redis::ErrorKind::Io
-        && error.to_string().contains(RECOVERY_PING_TIMEOUT_DETAIL)
+    error.kind() == redis::ErrorKind::Io && error.to_string().contains(RECOVERY_PING_TIMEOUT_DETAIL)
 }
 
 const REPLAY_MEMORY_UNPROVEN_DETAIL: &str = "Redis replay memory-policy screen did not complete";
