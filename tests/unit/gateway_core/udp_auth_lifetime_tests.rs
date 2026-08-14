@@ -1096,7 +1096,9 @@ async fn unauthenticated_commitment_checks_never_expire() {
         )
         .await
     });
-    entered_rx.await.expect("the unauthenticated hook must start");
+    entered_rx
+        .await
+        .expect("the unauthenticated hook must start");
     tokio::time::advance(Duration::from_secs(86_400)).await;
     assert!(
         !dropped.load(Ordering::SeqCst),

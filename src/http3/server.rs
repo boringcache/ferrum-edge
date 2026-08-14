@@ -164,9 +164,9 @@ where
             // expiry; it is never consulted to CHOOSE between the owners.
             match crate::plugins::await_deadline_first(Some(effective_deadline), collect).await {
                 Ok(result) => result.map_err(H3RequestBodyReadError::Read),
-                Err(()) => {
-                    Err(H3RequestBodyReadError::DeadlineExceeded(bound.expired_authorization()))
-                }
+                Err(()) => Err(H3RequestBodyReadError::DeadlineExceeded(
+                    bound.expired_authorization(),
+                )),
             }
         }
         None => collect_h3_request_body_with_timeout(collect, request_body_read_timeout_ms).await,

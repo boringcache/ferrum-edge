@@ -821,7 +821,9 @@ async fn test_mtls_auth_allowed_issuer_mismatch_reason_is_static_and_redacted() 
     let mut ctx = create_ctx_with_cert(client_der);
 
     match plugin.authenticate(&mut ctx, &index).await {
-        PluginResult::Reject { status_code, body, .. } => {
+        PluginResult::Reject {
+            status_code, body, ..
+        } => {
             assert_eq!(status_code, 403);
             assert_eq!(
                 body,

@@ -7651,8 +7651,8 @@ pub mod _test_support {
     /// Observable fail-closed result for the defensive authenticated-kTLS relay
     /// path (issue #3816). Only available on Linux.
     #[cfg(target_os = "linux")]
-    pub fn authenticated_ktls_relay_fail_closed_for_test(
-    ) -> crate::proxy::tcp_proxy::StreamCopyResult {
+    pub fn authenticated_ktls_relay_fail_closed_for_test()
+    -> crate::proxy::tcp_proxy::StreamCopyResult {
         crate::proxy::tcp_proxy::authenticated_ktls_relay_fail_closed()
     }
 
