@@ -1779,9 +1779,8 @@ impl DtlsServer {
                             // that lands after registration but before this
                             // `Connected` output must fence the session before
                             // the proxy can observe it through `accept()`.
-                            if let Some(session) = client_trust_guard
-                                .as_ref()
-                                .map(|guard| guard.session())
+                            if let Some(session) =
+                                client_trust_guard.as_ref().map(|guard| guard.session())
                                 && session.is_retired()
                             {
                                 session.record_fenced();
@@ -1837,9 +1836,8 @@ impl DtlsServer {
                                 // stop inside the handshake drain rather than waiting
                                 // for the outer select to poll the cancellation arm: an
                                 // already-fenced session must never reach `accept()`.
-                                if let Some(session) = client_trust_guard
-                                    .as_ref()
-                                    .map(|guard| guard.session())
+                                if let Some(session) =
+                                    client_trust_guard.as_ref().map(|guard| guard.session())
                                     && session.is_retired()
                                 {
                                     session.record_fenced();

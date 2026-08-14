@@ -3477,9 +3477,7 @@ async fn handle_tcp_connection_inner(
         // than letting it reach policy evaluation or backend selection.
         let client_trust_guard = client_trust_admission
             .and_then(|admission| admission.register(stream_ctx.tls_client_cert_der.is_some()));
-        if let Some(session) = client_trust_guard
-            .as_ref()
-            .map(|guard| guard.session())
+        if let Some(session) = client_trust_guard.as_ref().map(|guard| guard.session())
             && session.is_retired()
         {
             session.record_fenced();
@@ -3532,9 +3530,7 @@ async fn handle_tcp_connection_inner(
         // stream-connect policy was running. Fence once more before returning
         // to backend selection; the relay wrapper below handles every later
         // withdrawal for the established session.
-        if let Some(session) = client_trust_guard
-            .as_ref()
-            .map(|guard| guard.session())
+        if let Some(session) = client_trust_guard.as_ref().map(|guard| guard.session())
             && session.is_retired()
         {
             session.record_fenced();
