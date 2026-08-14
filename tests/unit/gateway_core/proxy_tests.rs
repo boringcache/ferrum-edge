@@ -2390,23 +2390,44 @@ fn streaming_grpc_deadline_removes_backend_content_length_before_headers_commit(
 #[test]
 fn mesh_mtls_arms_operator_read_window_after_sender_readiness() {
     let source = include_str!("../../../src/proxy/mod.rs");
-    let function = source
-        .split("async fn proxy_to_backend_mesh_mtls")
+    let acquire = source
+        .split("async fn proxy_to_backend_mesh_mtls(")
         .nth(1)
-        .expect("mesh mTLS dispatch function")
-        .split("async fn proxy_to_backend_http2")
+        .expect("mesh mTLS acquire function")
+        .split("fn boxed_proxy_to_backend_mesh_mtls_after_ready<'a>(")
         .next()
-        .expect("mesh mTLS dispatch body");
-    let readiness = function
+        .expect("bounded mesh mTLS acquire body");
+    let readiness = acquire
         .find("sender.ready()")
         .expect("sender readiness boundary");
-    let read_window = function
+    let post_ready_handoff = acquire
+        .find("boxed_proxy_to_backend_mesh_mtls_after_ready(")
+        .expect("post-ready handoff");
+    assert!(
+        readiness < post_ready_handoff,
+        "mesh mTLS acquire must await sender readiness before post-ready handoff"
+    );
+    assert!(
+        !acquire.contains("let backend_read_deadline"),
+        "operator response-read window must not arm during mesh mTLS acquire"
+    );
+
+    let post_ready = source
+        .split("async fn proxy_to_backend_mesh_mtls_after_ready(")
+        .nth(1)
+        .expect("mesh mTLS post-ready function")
+        .split("async fn proxy_to_backend_http2(")
+        .next()
+        .expect("bounded mesh mTLS post-ready body");
+    let read_window = post_ready
         .find("let backend_read_deadline")
         .expect("operator read window");
-
+    let send_request = post_ready
+        .find("sender.send_request(")
+        .expect("mesh mTLS backend send");
     assert!(
-        readiness < read_window,
-        "operator response-read timeout must not include pool acquisition/readiness"
+        read_window < send_request,
+        "operator response-read timeout must arm before backend send/collect"
     );
 }
 
