@@ -536,6 +536,10 @@ fn build_h3_quinn_server_config(
     }
     server_tls_config.session_storage =
         rustls::server::ServerSessionMemoryCache::new(tls_policy.session_cache_size);
+    if client_trust.verifier.is_some() {
+        server_tls_config.send_tls13_tickets = 0;
+        server_tls_config.session_storage = Arc::new(rustls::server::NoServerSessionStorage {});
+    }
 
     let quic_server_config = QuicServerConfig::try_from(server_tls_config)
         .map_err(|e| anyhow::anyhow!("Failed to create QUIC server config: {}", e))?;
@@ -745,7 +749,7 @@ pub async fn start_http3_listener_with_signal(
         )?)
     };
 
-    let endpoint = if start_disabled {
+    let (endpoint, adopted_quic) = if start_disabled {
         let socket = std::net::UdpSocket::bind(addr)?;
         socket.set_nonblocking(true)?;
         let runtime = quinn::default_runtime()
@@ -753,7 +757,12 @@ pub async fn start_http3_listener_with_signal(
         let endpoint =
             quinn::Endpoint::new(quinn::EndpointConfig::default(), None, socket, runtime)?;
         info!("HTTP/3 listener started disabled until frontend TLS material is available");
-        endpoint
+        (
+            endpoint,
+            Arc::new(arc_swap::ArcSwap::from_pointee(
+                None::<Arc<quinn::ServerConfig>>,
+            )),
+        )
     } else {
         let startup_client_trust = startup_client_trust.as_ref().ok_or_else(|| {
             anyhow::anyhow!("internal error: HTTP/3 startup client trust missing")
@@ -774,12 +783,16 @@ pub async fn start_http3_listener_with_signal(
         socket.set_nonblocking(true)?;
         let runtime = quinn::default_runtime()
             .ok_or_else(|| anyhow::anyhow!("HTTP/3 listener requires a Tokio runtime"))?;
-        quinn::Endpoint::new(
+        let adopted_quic = Arc::new(arc_swap::ArcSwap::from_pointee(Some(Arc::new(
+            server_config.clone(),
+        ))));
+        let endpoint = quinn::Endpoint::new(
             quinn::EndpointConfig::default(),
             Some(server_config),
             socket,
             runtime,
-        )?
+        )?;
+        (endpoint, adopted_quic)
     };
     let bound_addr = endpoint.local_addr().ok();
     let local_addr = bound_addr.unwrap_or(addr);
@@ -891,6 +904,7 @@ pub async fn start_http3_listener_with_signal(
                             continue;
                         }
                         let state = Arc::clone(&state);
+                        let adopted_quic = Arc::clone(&adopted_quic);
                         tokio::spawn(async move {
                             let _conn_guard =
                                 crate::overload::ConnectionGuard::new(&state.overload);
@@ -901,6 +915,7 @@ pub async fn start_http3_listener_with_signal(
                                 frontend_listen_port,
                                 frontend_destination_ip,
                                 client_auth_configured,
+                                adopted_quic,
                             )
                             .await
                             {
@@ -978,7 +993,9 @@ pub async fn start_http3_listener_with_signal(
                     &reload_h3_config,
                 ) {
                     Ok(server_config) => {
+                        let adopted = Arc::new(server_config.clone());
                         endpoint.set_server_config(Some(server_config));
+                        adopted_quic.store(Arc::new(Some(adopted)));
                         info!(
                             revision,
                             "HTTP/3 listener server config swapped after frontend TLS reload"
@@ -1171,6 +1188,20 @@ fn close_h3_connection_for_trust_withdrawal(connection: &quinn::Connection, peer
     );
 }
 
+/// Bind an HTTP/3 Incoming to the exact `ServerConfig` this listener last
+/// adopted (issue #3857). `accept_with` is what keeps a coalesced reload
+/// wakeup from handshaking against a different generation than the one this
+/// listener published.
+fn accept_h3_incoming(
+    incoming: quinn::Incoming,
+    adopted: Option<Arc<quinn::ServerConfig>>,
+) -> Result<quinn::Connecting, quinn::ConnectionError> {
+    match adopted {
+        Some(server_config) => incoming.accept_with(server_config),
+        None => incoming.accept(),
+    }
+}
+
 /// Handle a single HTTP/3 connection (may carry multiple streams/requests).
 async fn handle_h3_connection(
     connecting: quinn::Incoming,
@@ -1179,6 +1210,7 @@ async fn handle_h3_connection(
     frontend_listen_port: Option<u16>,
     frontend_destination_ip: Option<std::net::IpAddr>,
     client_auth_configured: bool,
+    adopted_quic: Arc<arc_swap::ArcSwap<Option<Arc<quinn::ServerConfig>>>>,
 ) -> Result<(), anyhow::Error> {
     // 0-RTT is opt-in via `FERRUM_TLS_EARLY_DATA_METHODS` *and* is refused
     // outright when this listener does frontend client-certificate
@@ -1189,16 +1221,20 @@ async fn handle_h3_connection(
         zero_rtt_admitted(!state.early_data_methods.is_empty(), client_auth_configured);
 
     // Issue #3857. Capture the H3 client-trust generation BEFORE
-    // `Incoming::accept()`. quinn binds the `ServerConfig` — and therefore the
-    // rustls client-certificate verifier this handshake runs — inside
-    // `accept()`, reading the endpoint's current config under the endpoint state
-    // lock (`quinn_proto::Endpoint::accept`), not when the Initial packet was
-    // parsed. The H3 reload arm applies `set_server_config` and only then
-    // publishes the generation, so reading the generation here and calling
-    // `accept()` after it means a connection can never claim a generation newer
-    // than the verifier it actually handshakes against.
+    // `Incoming::accept()` / `accept_with`. quinn binds the `ServerConfig` —
+    // and therefore the rustls client-certificate verifier this handshake runs
+    // — inside `accept()`, reading either the explicitly adopted config or
+    // the endpoint's current config under the endpoint state lock. The H3
+    // reload arm applies `set_server_config`, stores that same `Arc` in
+    // `adopted_quic`, and only then publishes the generation, so reading the
+    // generation here and accepting after it means a connection can never
+    // claim a generation newer than the verifier it actually handshakes
+    // against. `accept_with` is what makes a coalesced reload wakeup install
+    // the exact candidate this listener published, rather than whatever the
+    // endpoint happens to hold at packet-decrypt time.
     let client_trust_admission =
         crate::tls::client_trust::capture(crate::tls::ClientTrustScope::ProxyH3);
+    let adopted_server_config = adopted_quic.load_full().as_ref().clone();
 
     // Single coherent per-connection identity slot. Requests take one lock-free
     // snapshot, so the early-data flag and the peer certificate can never be
@@ -1221,7 +1257,7 @@ async fn handle_h3_connection(
     // (`accept_with_optional_timeout`) and DTLS (`DtlsServerLimits.handshake_timeout`)
     // frontends, all gated by `FERRUM_FRONTEND_TLS_HANDSHAKE_TIMEOUT_SECONDS`.
     let connection = if early_data_enabled {
-        let connecting = connecting.accept()?.into_0rtt();
+        let connecting = accept_h3_incoming(connecting, adopted_server_config)?.into_0rtt();
         match connecting {
             Ok((conn, zero_rtt_accepted)) => {
                 let remote =
@@ -1292,7 +1328,7 @@ async fn handle_h3_connection(
         // explicit `.accept()?` here both surfaces address-validation errors
         // synchronously and gives us a typed `Connecting` future that
         // `tokio::time::timeout` can wrap directly.
-        let connecting = connecting.accept()?;
+        let connecting = accept_h3_incoming(connecting, adopted_server_config)?;
         match await_with_optional_timeout(connecting, handshake_timeout).await {
             Ok(result) => result?,
             Err(_elapsed) => {

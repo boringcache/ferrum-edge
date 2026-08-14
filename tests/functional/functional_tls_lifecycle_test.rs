@@ -1069,6 +1069,7 @@ fn mtls_client_config(
         .with_client_auth_cert(client_chain, client_key)
         .expect("client auth cert");
     config.alpn_protocols = alpn.iter().map(|p| p.to_vec()).collect();
+    config.resumption = rustls::client::Resumption::disabled();
     config
 }
 
@@ -1660,10 +1661,15 @@ async fn test_client_ca_withdrawal_retires_established_transport_and_new_handsha
         !outcome.is_authorized(),
         "removing the issuing CA must retire the established transport, got {outcome:?}"
     );
+    fixture
+        .wait_for_accepted_withdrawal("proxy_frontend")
+        .await;
 
     // A brand-new connection must meet the new verifier only. The old client
     // certificate no longer chains to any trusted anchor, so the handshake
-    // itself fails.
+    // itself fails. Session resumption is disabled on this client so a ticket
+    // issued under the withdrawn generation cannot masquerade as a new
+    // handshake.
     let deadline = tokio::time::Instant::now() + RETIREMENT_DEADLINE;
     let mut refused = false;
     while tokio::time::Instant::now() < deadline {
@@ -1930,6 +1936,7 @@ async fn test_h3_streams_are_refused_after_crl_revocation_without_reconnect() {
         retirement.is_some(),
         "a NEW stream on the ORIGINAL H3 connection must not be authorized after the accepted revocation"
     );
+    fixture.wait_for_accepted_withdrawal("proxy_h3").await;
 
     // A brand-new QUIC handshake must meet ONLY the accepted verifier: the
     // revoked client certificate no longer passes revocation checking, so the
@@ -2237,14 +2244,31 @@ async fn test_frontend_dtls_session_is_retired_and_reconnect_refused_after_crl_r
     );
 
     // ...and the withdrawn credential cannot come back through a new handshake.
+    // dimpl may emit local `Connected` before the server has refused the
+    // certificate, so `connect()` Ok is not admission: a handshake the
+    // accepted verifier refused cannot relay.
     let deadline = tokio::time::Instant::now() + RETIREMENT_DEADLINE;
     let mut reconnect_refused = false;
     while tokio::time::Instant::now() < deadline {
-        if fixture.connect_dtls().await.is_err() {
-            reconnect_refused = true;
-            break;
+        match fixture.connect_dtls().await {
+            Err(_) => {
+                reconnect_refused = true;
+                break;
+            }
+            Ok(conn) => {
+                if conn.send(b"dtls-ping").await.is_err() {
+                    reconnect_refused = true;
+                    break;
+                }
+                match tokio::time::timeout(Duration::from_secs(2), conn.recv()).await {
+                    Ok(Ok(_)) => sleep(Duration::from_millis(250)).await,
+                    Ok(Err(_)) | Err(_) => {
+                        reconnect_refused = true;
+                        break;
+                    }
+                }
+            }
         }
-        sleep(Duration::from_millis(250)).await;
     }
     assert!(
         reconnect_refused,

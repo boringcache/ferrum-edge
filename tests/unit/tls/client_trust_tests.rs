@@ -602,6 +602,43 @@ fn dropping_the_guard_deregisters_the_transport() {
 }
 
 #[test]
+fn a_cloned_session_that_outlives_the_guard_is_still_retired() {
+    let _guard = isolated_registry();
+    let ca = generate_ca("trust-ca");
+    client_trust::publish_accepted_material(
+        ClientTrustScope::ProxyFrontend,
+        material(&[&ca.cert_pem], &[]),
+    );
+
+    let clone = {
+        let guard = client_trust::capture(ClientTrustScope::ProxyFrontend)
+            .expect("armed")
+            .register(true)
+            .expect("registered");
+        let clone = guard.session().clone();
+        drop(guard);
+        assert_eq!(
+            scope_row(ClientTrustScope::ProxyFrontend).tracked_sessions,
+            1,
+            "a WebSocket-style clone that outlives the HTTP guard must stay in the retirement domain"
+        );
+        assert!(!clone.is_retired());
+        clone
+    };
+
+    let withdrawn = client_trust::publish_accepted_material(
+        ClientTrustScope::ProxyFrontend,
+        material(&[&generate_ca("replacement-ca").cert_pem], &[]),
+    );
+    assert_eq!(withdrawn.outcome, ClientTrustPublicationOutcome::Withdrawn);
+    assert_eq!(withdrawn.retired_sessions, 1);
+    assert!(
+        clone.is_retired(),
+        "a withdrawal must cancel the clone that outlived the HTTP connection guard"
+    );
+}
+
+#[test]
 fn a_refused_candidate_retains_generation_material_and_sessions() {
     let _guard = isolated_registry();
     let ca = generate_ca("trust-ca");

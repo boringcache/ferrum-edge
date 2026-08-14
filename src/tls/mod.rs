@@ -1230,6 +1230,7 @@ pub(crate) fn finish_frontend_server_config_capturing_trust(
         }
         _ => None,
     };
+    let client_auth_enforced = client_cert_verifier.is_some();
 
     if let Some(out) = client_trust_out {
         // `no_verify` disables client authentication outright, so no transport
@@ -1315,6 +1316,14 @@ pub(crate) fn finish_frontend_server_config_capturing_trust(
     // always set 0 here. Proxy-specific call sites apply early_data_max_size
     // via Arc::get_mut() after this returns — see modes/*.rs.
     config.max_early_data_size = 0;
+    if client_auth_enforced {
+        // TLS 1.3 session tickets and the stateful cache do not re-run client
+        // certificate verification. After a CRL or client-CA withdrawal the
+        // next handshake must meet the accepted verifier, not a ticket issued
+        // under the withdrawn generation.
+        config.send_tls13_tickets = 0;
+        config.session_storage = Arc::new(rustls::server::NoServerSessionStorage {});
+    }
 
     Ok(Arc::new(config))
 }

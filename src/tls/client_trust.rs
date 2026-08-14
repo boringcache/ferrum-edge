@@ -91,7 +91,7 @@ use std::collections::BTreeSet;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, OnceLock, Weak};
 use std::task::{Context, Poll};
 
 use crate::fips::approved::Sha256;
@@ -415,9 +415,11 @@ struct ClientTrustDomain {
     /// Last accepted semantic material.
     material: ArcSwap<Option<ClientTrustMaterial>>,
     /// Live client-certificate-authenticated transports, keyed by an internal
-    /// session id. Only ever touched at connection setup/teardown and at
-    /// publication — never on the request path.
-    sessions: DashMap<u64, ClientTrustSession>,
+    /// session id. Stored as `Weak` so a long-lived clone (an upgraded
+    /// WebSocket, a per-request fence handle) that outlives the HTTP
+    /// connection guard remains sweepable. Only ever touched at connection
+    /// setup/teardown and at publication — never on the request path.
+    sessions: DashMap<u64, Weak<ClientTrustSessionInner>>,
     next_session_id: AtomicU64,
     /// Serializes publications so two concurrent accepted candidates cannot
     /// interleave their read-compare-store-sweep. Publications are rare
@@ -465,10 +467,21 @@ impl ClientTrustDomain {
     }
 
     /// Retire every registered session strictly below `fence`.
+    ///
+    /// Upgrades are collected before any `Inner` can drop so a last-handle
+    /// teardown cannot `remove` from this map while `retain` is iterating it.
     fn sweep(&self, fence: u64, reason: ClientTrustRetirementReason) -> usize {
+        let mut live = Vec::new();
+        self.sessions.retain(|_, weak| match weak.upgrade() {
+            Some(inner) => {
+                live.push(ClientTrustSession { inner });
+                true
+            }
+            None => false,
+        });
         let mut retired = 0usize;
-        for entry in self.sessions.iter() {
-            if entry.value().generation() < fence && entry.value().retire(reason) {
+        for session in &live {
+            if session.generation() < fence && session.retire(reason) {
                 retired += 1;
             }
         }
@@ -652,8 +665,11 @@ impl ClientTrustAdmission {
     /// decision that a CRL or client-CA withdrawal can revoke, so it is neither
     /// tracked nor retired.
     ///
-    /// The returned guard owns deregistration; clone the inner
-    /// [`ClientTrustSession`] for per-request and per-session consumers.
+    /// The returned guard is one strong handle. Clone the inner
+    /// [`ClientTrustSession`] for per-request and per-session consumers; those
+    /// clones keep the transport in the retirement domain until the last one
+    /// drops, which is what lets an upgraded WebSocket outlive
+    /// `serve_connection_with_upgrades` and still be swept.
     pub fn register(self, client_cert_authenticated: bool) -> Option<ClientTrustSessionGuard> {
         if !client_cert_authenticated {
             return None;
@@ -662,13 +678,14 @@ impl ClientTrustAdmission {
         let id = domain.next_session_id.fetch_add(1, Ordering::Relaxed);
         let session = ClientTrustSession {
             inner: Arc::new(ClientTrustSessionInner {
+                id,
                 scope: self.scope,
                 generation: self.generation,
                 token: CancellationToken::new(),
                 retired: AtomicBool::new(false),
             }),
         };
-        domain.sessions.insert(id, session.clone());
+        domain.sessions.insert(id, Arc::downgrade(&session.inner));
         // Publish-then-recheck: a withdrawal that swept before this insert is
         // caught here, so a connection being registered across a publication
         // cannot escape the fence or repopulate the domain after it.
@@ -681,24 +698,33 @@ impl ClientTrustAdmission {
                 domain.retirements[reason.index()].fetch_add(1, Ordering::Relaxed);
             }
         }
-        Some(ClientTrustSessionGuard {
-            id,
-            session: Some(session),
-        })
+        Some(ClientTrustSessionGuard { session })
     }
 }
 
 struct ClientTrustSessionInner {
+    id: u64,
     scope: ClientTrustScope,
     generation: u64,
     token: CancellationToken,
     retired: AtomicBool,
 }
 
+impl Drop for ClientTrustSessionInner {
+    fn drop(&mut self) {
+        let ptr = std::ptr::from_mut(self).cast_const();
+        domain(self.scope)
+            .sessions
+            .remove_if(&self.id, |_, weak| std::ptr::eq(weak.as_ptr(), ptr));
+    }
+}
+
 /// A handle to one registered, client-certificate-authenticated transport.
 ///
 /// Cheap to clone (one `Arc` bump). Clones are handed to per-request admission
-/// gates and to long-lived session relays; none of them owns deregistration.
+/// gates and to long-lived session relays. The last handle to drop removes the
+/// domain entry, so a clone that outlives the HTTP connection guard — an
+/// upgraded WebSocket — is still visible to a later sweep.
 #[derive(Clone)]
 pub struct ClientTrustSession {
     inner: Arc<ClientTrustSessionInner>,
@@ -769,27 +795,17 @@ impl ClientTrustSession {
     }
 }
 
-/// Owns a registered session's presence in its domain. Dropping it deregisters
-/// the transport on every exit path.
+/// One strong handle to a registered session. Dropping it does not by itself
+/// deregister the transport: an upgraded WebSocket (and any other clone)
+/// keeps the session sweepable until the last handle is gone.
 pub struct ClientTrustSessionGuard {
-    id: u64,
-    session: Option<ClientTrustSession>,
+    session: ClientTrustSession,
 }
 
 impl ClientTrustSessionGuard {
     /// The registered session handle. Clone it for request-path consumers.
     pub fn session(&self) -> &ClientTrustSession {
-        self.session
-            .as_ref()
-            .expect("session is only taken in Drop, which consumes the guard")
-    }
-}
-
-impl Drop for ClientTrustSessionGuard {
-    fn drop(&mut self) {
-        if let Some(session) = self.session.take() {
-            domain(session.inner.scope).sessions.remove(&self.id);
-        }
+        &self.session
     }
 }
 
@@ -930,7 +946,11 @@ pub fn snapshot() -> Vec<ClientTrustScopeSnapshot> {
             armed: domain.armed.load(Ordering::Acquire),
             generation: domain.generation.load(Ordering::Acquire),
             withdrawal_generation: domain.withdrawal_generation.load(Ordering::Acquire),
-            tracked_sessions: domain.sessions.len(),
+            tracked_sessions: domain
+                .sessions
+                .iter()
+                .filter(|entry| entry.value().strong_count() > 0)
+                .count(),
             publications: [
                 domain.publications[0].load(Ordering::Relaxed),
                 domain.publications[1].load(Ordering::Relaxed),

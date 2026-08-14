@@ -17482,6 +17482,13 @@ where
         "run_websocket_proxy: tunnel mode is incompatible with unmasked client \
          frames (H3 caller must pass websocket_tunnel_mode=false)"
     );
+    // Issue #3857: the HTTP connection guard is dropped when
+    // `serve_connection_with_upgrades` returns, which for an H1 upgrade is
+    // before this relay ends. The cloned session handle still lives here; wrap
+    // the client IO so a later sweep surfaces as an ordinary transport error
+    // on both the framed path and the tunnel copy, in addition to the stop
+    // arbiter below.
+    let client_io = crate::tls::TrustFencedStream::new(client_io, client_trust.as_ref());
     let websocket_idle_timeout = ws_idle_tracker.as_ref().map(|tracker| tracker.timeout);
 
     // When tunnel mode is enabled and no plugins need parsed framing, bypass
@@ -20221,9 +20228,9 @@ async fn handle_tls_connection(
     // (issue #3857). Only a connection that actually presented a
     // gateway-verified client certificate holds a trust decision a CRL or
     // client-CA withdrawal can revoke, so an anonymous TLS connection is never
-    // registered and never retired. The guard owns deregistration on every exit
-    // path; the cloned session handle is what the per-request fence and the
-    // WebSocket relay consult.
+    // registered and never retired. The guard is one strong handle; cloned
+    // session handles keep the transport sweepable after this function
+    // returns (an upgraded WebSocket outlives `serve_connection_with_upgrades`).
     let client_trust_guard = tls_connection_metadata
         .client_trust_admission
         .and_then(|admission| admission.register(client_cert_der.is_some()));

@@ -1772,6 +1772,13 @@ impl DtlsServer {
                                     client = %peer_addr,
                                     "DTLS frontend mTLS required but client presented no verified certificate; dropping session"
                                 );
+                                abort_dtls_handshake(
+                                    &mut dtls,
+                                    socket.as_ref(),
+                                    peer_addr,
+                                    &mut out_buf,
+                                )
+                                .await;
                                 return;
                             }
                             // Close the interval between certificate-chain
@@ -1812,6 +1819,13 @@ impl DtlsServer {
                             if let Some(verifier) = client_cert_verifier.as_deref() {
                                 if let Err(e) = validate_client_cert(&chain, verifier) {
                                     warn!(client = %peer_addr, "Client cert validation failed: {}", e);
+                                    abort_dtls_handshake(
+                                        &mut dtls,
+                                        socket.as_ref(),
+                                        peer_addr,
+                                        &mut out_buf,
+                                    )
+                                    .await;
                                     return;
                                 }
                                 // A client certificate was presented and verified
@@ -2245,6 +2259,26 @@ fn validate_client_cert(
         .verify_client_cert(&cert, &intermediates, rustls::pki_types::UnixTime::now())
         .map(|_| ())
         .map_err(|e| anyhow::anyhow!("DTLS client certificate verification failed: {}", e))
+}
+
+/// Abort a frontend DTLS handshake so a refused client certificate is visible
+/// on the wire instead of looking like a completed session to a client that
+/// emitted local `Connected` before the server Finished/Alert flight.
+async fn abort_dtls_handshake(
+    dtls: &mut Dtls,
+    socket: &UdpSocket,
+    peer_addr: SocketAddr,
+    out_buf: &mut [u8],
+) {
+    let _ = dtls.close();
+    for _ in 0..MAX_OUTPUTS_PER_DRAIN {
+        match dtls.poll_output(out_buf) {
+            Output::Packet(data) => {
+                let _ = socket.send_to(data, peer_addr).await;
+            }
+            _ => break,
+        }
+    }
 }
 
 // ============================================================================
