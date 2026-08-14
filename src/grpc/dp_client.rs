@@ -809,6 +809,7 @@ pub async fn start_dp_client_with_stream_timings(
             frontend_tls_restore_slot.clone(),
             shutdown_rx.clone(),
             tls_reload.as_ref().map(|reload| reload.revision_rx.clone()),
+            last_tls_revision,
             if is_fallback { primary_retry_secs } else { 0 },
             &mut snapshot_authority,
             divergence_metrics.as_ref(),
@@ -1000,7 +1001,10 @@ pub async fn start_dp_client_with_stream_timings(
                         info!("DP client shutting down");
                         return;
                     }
-                    _ = wait_optional_tls_reload(tls_reload.as_ref().map(|reload| reload.revision_rx.clone())) => {
+                    _ = wait_optional_tls_reload(
+                        tls_reload.as_ref().map(|reload| reload.revision_rx.clone()),
+                        last_tls_revision,
+                    ) => {
                         // TLS material rotated mid-backoff: reconnect immediately
                         // with the new material (rebuilt at the top of the loop),
                         // but PRESERVE accumulated failure backoff. No connection
@@ -1027,7 +1031,10 @@ pub async fn start_dp_client_with_stream_timings(
         } else {
             tokio::select! {
                 _ = tokio::time::sleep(sleep_duration) => {}
-                _ = wait_optional_tls_reload(tls_reload.as_ref().map(|reload| reload.revision_rx.clone())) => {
+                _ = wait_optional_tls_reload(
+                    tls_reload.as_ref().map(|reload| reload.revision_rx.clone()),
+                    last_tls_revision,
+                ) => {
                     // Same as the shutdown-aware arm above: reconnect immediately
                     // with rotated TLS material while preserving accumulated
                     // failure backoff. A TLS source flap is not healthy progress
@@ -1111,14 +1118,34 @@ async fn wait_for_readiness_then_primary_retry(
     tokio::time::sleep(Duration::from_secs(primary_retry_secs)).await;
 }
 
-async fn wait_optional_tls_reload(mut revision_rx: Option<watch::Receiver<u64>>) {
-    let changed = if let Some(revision_rx) = revision_rx.as_mut() {
-        revision_rx.changed().await.is_ok()
-    } else {
-        false
-    };
-    if !changed {
+/// Wait until the TLS reload watch publishes a generation other than `last_revision`.
+///
+/// Native MeshSubscribe, xDS ADS, and ConfigSync clients rebuild to the accepted
+/// generation, then arm this future before the next connect. A fresh
+/// `watch::Receiver` clone is immediately `changed()` after a send when the
+/// stored receiver was only `borrow()`ed, so this future compares the current
+/// generation against `last_revision` instead of waiting on an unmarked clone.
+/// `borrow_and_update()` then `changed()` avoids a lost wakeup between the
+/// generation check and parking.
+///
+/// `None` parks forever so an unconfigured TLS reload cannot fire. A dropped
+/// sender also parks once the last published generation has been accepted, so
+/// a dead watch cannot spin the reconnect loop.
+pub async fn wait_optional_tls_reload(
+    revision_rx: Option<watch::Receiver<u64>>,
+    last_revision: u64,
+) {
+    let Some(mut revision_rx) = revision_rx else {
         std::future::pending::<()>().await;
+        return;
+    };
+    loop {
+        if *revision_rx.borrow_and_update() != last_revision {
+            return;
+        }
+        if revision_rx.changed().await.is_err() {
+            std::future::pending::<()>().await;
+        }
     }
 }
 
@@ -1599,6 +1626,7 @@ pub async fn connect_and_subscribe(
         None,
         None,
         0,
+        0,
         &mut authority,
         &ConfigSyncDivergenceMetrics::default(),
         Arc::new(Notify::new()),
@@ -1655,6 +1683,7 @@ pub async fn connect_and_subscribe_with_startup_ready(
         None,
         None,
         0,
+        0,
         &mut authority,
         &ConfigSyncDivergenceMetrics::default(),
         Arc::new(Notify::new()),
@@ -1702,6 +1731,7 @@ async fn connect_and_subscribe_with_startup_ready_inner(
     frontend_tls_restore_slot: Arc<ArcSwap<Option<Arc<rustls::ServerConfig>>>>,
     shutdown_rx: Option<tokio::sync::watch::Receiver<bool>>,
     tls_revision_rx: Option<watch::Receiver<u64>>,
+    last_tls_revision: u64,
     primary_retry_secs: u64,
     snapshot_authority: &mut Option<AppliedSnapshotAuthority>,
     divergence_metrics: &ConfigSyncDivergenceMetrics,
@@ -1820,7 +1850,7 @@ async fn connect_and_subscribe_with_startup_ready_inner(
     let enable_primary_retry = primary_retry_secs > 0;
     let shutdown_fut = wait_optional_shutdown(shutdown_rx.clone());
     tokio::pin!(shutdown_fut);
-    let tls_reload_fut = wait_optional_tls_reload(tls_revision_rx.clone());
+    let tls_reload_fut = wait_optional_tls_reload(tls_revision_rx.clone(), last_tls_revision);
     tokio::pin!(tls_reload_fut);
 
     // Mark connected while preserving last applied-config age and sticky

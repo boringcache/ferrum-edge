@@ -286,8 +286,9 @@ installs that expose north-south TCP, TLS passthrough, or UDP must publish
 matching `streamPorts` with the matching `protocol` (and `service: true` when
 the Service should expose them). The Gateway API conformance lab exercises the
 TCPRoute and TLSRoute paths with dedicated NodePorts; `UDPRoute` is covered by
-CI Unit Tests plus a live UDP data-path integration suite — see
-[`docs/gateway_api_conformance.md`](../../docs/gateway_api_conformance.md).
+CI Unit Tests plus a live UDP data-path integration suite, including the finite
+response-amplification default and Ferrum `UDPResponseAmplificationPolicy` —
+see [`docs/gateway_api_conformance.md`](../../docs/gateway_api_conformance.md).
 
 Gateway API `GRPCRoute` attaches to HTTP/HTTPS listeners and is release-gated by
 the upstream `GATEWAY-GRPC` profile (same doc).

@@ -63,6 +63,7 @@ pub mod startup;
 pub mod system_metrics;
 pub mod tls;
 pub mod tls_offload;
+pub mod udp_amplification;
 pub mod util;
 pub mod xds;
 
