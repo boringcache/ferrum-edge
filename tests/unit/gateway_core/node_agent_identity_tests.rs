@@ -170,8 +170,7 @@ async fn registry_sync_retraction_failure_still_retracts_identity_before_fencing
 }
 
 #[tokio::test]
-async fn registry_sync_retraction_failure_on_uid_change_still_retracts_identity_before_fencing(
-) {
+async fn registry_sync_retraction_failure_on_uid_change_still_retracts_identity_before_fencing() {
     let journal = IdentityJournal::new();
     let lookups = AtomicUsize::new(0);
     let (_shutdown_tx, mut shutdown) = tokio::sync::watch::channel(false);
