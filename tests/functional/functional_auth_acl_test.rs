@@ -2821,8 +2821,19 @@ async fn send_hmac_v2(
 /// missing route is 404; route without the plugin is 200 from the backend.
 async fn wait_until_hmac_v2_route_and_plugin_active(client: &reqwest::Client, url: &str) {
     let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+    const PER_ATTEMPT: Duration = Duration::from_secs(2);
     loop {
-        let last = match tokio::time::timeout_at(deadline, client.get(url).send()).await {
+        if tokio::time::Instant::now() >= deadline {
+            panic!(
+                "hmac v2 route and plugin did not become active within 15s: \
+                 unsigned GET {url} must converge to 401 (route present and \
+                 hmac_auth enforcing) before the first signed POST; last \
+                 observation: activation deadline elapsed before any successful probe"
+            );
+        }
+        let attempt_deadline =
+            std::cmp::min(deadline, tokio::time::Instant::now() + PER_ATTEMPT);
+        let last = match tokio::time::timeout_at(attempt_deadline, client.get(url).send()).await {
             Ok(Ok(resp)) => {
                 let status = resp.status().as_u16();
                 if status == 401 {
@@ -2831,7 +2842,7 @@ async fn wait_until_hmac_v2_route_and_plugin_active(client: &reqwest::Client, ur
                 format!("HTTP {status}")
             }
             Ok(Err(err)) => format!("request error: {err}"),
-            Err(_) => String::from("request timed out at the activation deadline"),
+            Err(_) => String::from("request timed out on this probe"),
         };
         if tokio::time::Instant::now() >= deadline {
             panic!(
