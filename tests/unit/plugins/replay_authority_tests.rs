@@ -1180,7 +1180,7 @@ async fn wait_until_with_budget(
     panic!("timed out waiting until {what}");
 }
 
-async fn wait_until(mut pred: impl FnMut() -> bool, what: &str) {
+async fn wait_until(pred: impl FnMut() -> bool, what: &str) {
     wait_until_with_budget(DEFAULT_WAIT_BUDGET, pred, what).await;
 }
 
