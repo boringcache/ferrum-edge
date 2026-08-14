@@ -576,8 +576,11 @@ fn admin_no_client_auth_server_config(pki: &AdminMtlsPki) -> Arc<ServerConfig> {
 }
 
 /// Publish the same verifier/config/material transaction production admin TLS
-/// uses, and return the atomically populated serving slot.
-fn publish_admin_mtls_slot(pki: &AdminMtlsPki) -> ferrum_edge::tls::SharedFrontendTls {
+/// uses into an existing serving slot.
+fn publish_admin_mtls_candidate(
+    pki: &AdminMtlsPki,
+    slot: &ferrum_edge::tls::SharedFrontendTls,
+) -> ferrum_edge::tls::client_trust::ClientTrustPublication {
     let verifier: Arc<dyn rustls::server::danger::ClientCertVerifier> =
         rustls::server::WebPkiClientVerifier::builder(pki.client_roots.clone())
             .build()
@@ -597,14 +600,19 @@ fn publish_admin_mtls_slot(pki: &AdminMtlsPki) -> ferrum_edge::tls::SharedFronte
     let material =
         ferrum_edge::tls::ClientTrustMaterial::from_parts(Some(pki.client_ca_pem.as_bytes()), &[])
             .expect("summarize the admin client CA");
-    let slot: ferrum_edge::tls::SharedFrontendTls =
-        Arc::new(ArcSwap::new(Arc::new(None)));
-    let publication = ferrum_edge::tls::client_trust::publish_accepted_rustls_candidate(
+    ferrum_edge::tls::client_trust::publish_accepted_rustls_candidate(
         ferrum_edge::tls::ClientTrustScope::AdminHttps,
         material,
         verifier,
         || slot.store(Arc::new(Some(config))),
-    );
+    )
+}
+
+/// Publish the first accepted admin mTLS candidate and return its serving slot.
+fn publish_admin_mtls_slot(pki: &AdminMtlsPki) -> ferrum_edge::tls::SharedFrontendTls {
+    let slot: ferrum_edge::tls::SharedFrontendTls =
+        Arc::new(ArcSwap::new(Arc::new(None)));
+    let publication = publish_admin_mtls_candidate(pki, &slot);
     assert_eq!(
         publication.outcome,
         ferrum_edge::tls::client_trust::ClientTrustPublicationOutcome::Armed,
@@ -968,7 +976,7 @@ async fn admin_https_established_connections_are_fenced_after_an_accepted_withdr
     // A real rustls publication chain: install the live verifier, expose its
     // bound config, then arm the matching material/generation atomically.
     let slot = publish_admin_mtls_slot(&pki);
-    let (addr, shutdown_tx, listener) = start_admin_https_listener(slot, 10).await;
+    let (addr, shutdown_tx, listener) = start_admin_https_listener(slot.clone(), 10).await;
 
     let (mut keepalive, keepalive_driver) =
         establish_admin_connection(addr, admin_client_config(&pki, true, &[b"http/1.1"]), false)
@@ -987,12 +995,11 @@ async fn admin_https_established_connections_are_fenced_after_an_accepted_withdr
         "both established admin connections must be tracked"
     );
 
-    // Withdraw the only trusted anchor: the empty anchor set is not a superset
+    // Rotate to a different client CA through the same verifier/config/material
+    // transaction production reload uses. The new anchor set is not a superset
     // of the baseline, so this narrows authority.
-    let withdrawal = ferrum_edge::tls::client_trust::publish_accepted_material(
-        ferrum_edge::tls::ClientTrustScope::AdminHttps,
-        ferrum_edge::tls::ClientTrustMaterial::default(),
-    );
+    let replacement_pki = admin_mtls_pki();
+    let withdrawal = publish_admin_mtls_candidate(&replacement_pki, &slot);
     assert!(
         withdrawal.withdrew(),
         "removing the admin client CA must publish a withdrawal"
