@@ -1235,13 +1235,41 @@ fn h3_aggregate_sse_writer_streams_under_a_hard_listener_bound() {
         .find("abort_response_stream(stream)")
         .map(|offset| auth_abort + offset)
         .expect("post-commit authorization expiry must reset");
-    let listener_finish = sse_writer[auth_abort..]
-        .find("stream.finish()")
+    let listener_grace = sse_writer[auth_abort..]
+        .find("await_post_deadline_terminal_response_write(")
         .map(|offset| auth_abort + offset)
-        .expect("listener-lifetime expiry must still finish");
+        .expect("listener-lifetime expiry must finish under the bounded terminal grace");
     assert!(
-        auth_abort_reset < listener_finish,
+        auth_abort_reset < listener_grace,
         "authorization after commitment must reset before the listener-lifetime finish arm"
+    );
+    let listener_else = sse_writer[auth_abort..]
+        .split("} else {")
+        .nth(1)
+        .expect("listener-lifetime else arm")
+        .split("    } else {")
+        .next()
+        .expect("listener-lifetime else arm bounded");
+    assert!(
+        listener_else.contains("await_post_deadline_terminal_response_write("),
+        "listener-lifetime expiry must bound the clean-FIN attempt"
+    );
+    assert!(
+        listener_else.contains("abort_response_stream(stream)"),
+        "listener-lifetime FIN blocked past grace must reset the response stream"
+    );
+    assert!(
+        !listener_else.contains("record_authorization_termination_once("),
+        "listener-lifetime expiry must not increment authorization accounting"
+    );
+    assert!(
+        !listener_else.contains("let _ = stream.finish().await"),
+        "listener-lifetime expiry must not await finish unbounded"
+    );
+    assert_eq!(
+        sse_writer.matches("await_post_deadline_terminal_response_write(").count(),
+        2,
+        "pre-commit authorization terminal and listener-lifetime FIN must both use the bounded grace"
     );
 
     // Dropping the body is what returns the session's single-listener slot, so

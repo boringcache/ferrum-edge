@@ -15398,7 +15398,16 @@ async fn send_h3_aggregate_sse_response(
             ctx.record_authorization_termination_once(termination, auth_family);
             crate::http3::stream_util::abort_response_stream(stream);
         } else {
-            let _ = stream.finish().await;
+            match crate::http3::stream_util::await_post_deadline_terminal_response_write(
+                stream.finish(),
+            )
+            .await
+            {
+                Ok(()) | Err(crate::http3::stream_util::H3ResponseWriteError::Write(_)) => {}
+                Err(crate::http3::stream_util::H3ResponseWriteError::DeadlineExceeded) => {
+                    crate::http3::stream_util::abort_response_stream(stream);
+                }
+            }
         }
     } else {
         match crate::http3::stream_util::await_response_write_before_deadline(

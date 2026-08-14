@@ -4319,6 +4319,36 @@ fn every_native_h3_streaming_response_headers_write_uses_the_shared_helper() {
             && !sse_writer.contains("stream.send_data(data).await"),
         "aggregate MCP SSE still awaits a flow-control-blocked write unbounded"
     );
+    assert!(
+        !sse_writer.contains("let _ = stream.finish().await"),
+        "aggregate MCP SSE listener-lifetime expiry must not await finish unbounded"
+    );
+    let post_pump_auth = sse_writer
+        .split("if composed_deadline_fired {")
+        .nth(1)
+        .expect("composed deadline post-pump branch")
+        .split("} else {")
+        .next()
+        .expect("composed deadline fired arm");
+    let listener_terminal = post_pump_auth
+        .split("} else {")
+        .nth(1)
+        .expect("listener-lifetime else arm")
+        .split("    } else {")
+        .next()
+        .expect("listener-lifetime else arm bounded");
+    assert!(
+        listener_terminal.contains("await_post_deadline_terminal_response_write("),
+        "listener-lifetime post-pump FIN must use the bounded terminal grace"
+    );
+    assert!(
+        listener_terminal.contains("abort_response_stream(stream)"),
+        "listener-lifetime FIN blocked past grace must reset"
+    );
+    assert!(
+        !listener_terminal.contains("record_authorization_termination_once("),
+        "listener-lifetime post-pump expiry must not increment authorization accounting"
+    );
 }
 
 /// Every HTTP/3 authorization exit records through the REQUEST's shared latch,
