@@ -17578,6 +17578,7 @@ components:
         - graceful_remote_close
         - dispatch_policy_rejected
         - backend_connection_limit
+        - trust_withdrawn
         - request_error
       description: |
         Stable classification of a backend dispatch failure. Emitted on
@@ -17604,6 +17605,14 @@ components:
         operator-configured ceiling must never eject a healthy destination —
         while still being pre-wire, so `retry_on_connect_failure` may rotate to
         another load-balanced target with its own admission lane.
+        `trust_withdrawn` is a gateway-to-mesh transport refused because an
+        accepted gateway trust publication withdrew an authority: the connection
+        was dialed under the outgoing trust generation, or a checked-out
+        transport was retired before it could open the next stream. Nothing was
+        sent, so it is health-neutral for the same reason as
+        `backend_connection_limit` — withdrawing a root is gateway policy, not
+        evidence about the destination workload — while staying pre-wire, so a
+        retry re-dials under the freshly published trust generation.
 
     DisconnectCause:
       type: string

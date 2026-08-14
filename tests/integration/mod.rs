@@ -59,6 +59,7 @@ mod gateway_api_listenerset_tests;
 mod gateway_api_udproute_datapath_tests;
 mod gateway_hbone_pool_tests;
 mod gateway_listener_observability_tests;
+mod gateway_mesh_trust_retirement_tests;
 mod gateway_multi_cert_sni_tests;
 mod gateway_svid_identity_tests;
 mod gateway_trust_bundle_admin_tests;

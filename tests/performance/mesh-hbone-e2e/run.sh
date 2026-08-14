@@ -1,8 +1,8 @@
 #!/bin/bash
 # Mesh HBONE end-to-end throughput harness for Ferrum Edge.
 # Topology:
-#   hbone_loadgen ──► ferrum-edge (file mode) ──HBONE──► hbone_sidecar ──► hbone_backend
-#   hbone_loadgen ───────────────────────────────────────────────────────► hbone_backend  (baseline)
+#   hbone_loadgen ──► hbone_perf_fixture (trusted projection) ──HBONE──► hbone_sidecar ──► hbone_backend
+#   hbone_loadgen ──────────────────────────────────────────────────────────────────────► hbone_backend  (baseline)
 
 set -e
 
@@ -38,7 +38,6 @@ GATEWAY_HTTP_PORT=18000
 GATEWAY_ADMIN_PORT=19999
 RUNTIME_DIR="$SCRIPT_DIR/runtime"
 CERTS_DIR="$RUNTIME_DIR/certs"
-
 BACKEND_PID=""
 SIDECAR_PID=""
 GATEWAY_PID=""
@@ -75,14 +74,30 @@ archive_failure_diagnostics() {
     done
 }
 
+require_bin() {
+    local path="$1"
+    local hint="$2"
+    if [[ ! -x "$path" ]]; then
+        echo -e "${RED}missing executable: $path${NC}"
+        echo -e "${RED}${hint}${NC}"
+        exit 1
+    fi
+}
+
 build() {
     if $SKIP_BUILD; then
         echo -e "${YELLOW}Skipping build (--skip-build)${NC}"
+        require_bin "$PROJECT_ROOT/target/release/examples/hbone_perf_fixture" "build with: cargo build --release --example hbone_perf_fixture"
+        require_bin "$SCRIPT_DIR/target/release/hbone_backend" "build with: (cd tests/performance/mesh-hbone-e2e && cargo build --release)"
+        require_bin "$SCRIPT_DIR/target/release/hbone_sidecar" "build with: (cd tests/performance/mesh-hbone-e2e && cargo build --release)"
+        require_bin "$SCRIPT_DIR/target/release/hbone_loadgen" "build with: (cd tests/performance/mesh-hbone-e2e && cargo build --release)"
         return
     fi
-    echo -e "${BLUE}Building gateway and harness binaries...${NC}"
-    (cd "$PROJECT_ROOT" && cargo build --release --bin ferrum-edge 2>&1 | tail -1)
+    echo -e "${BLUE}Building trusted HBONE fixture and harness binaries...${NC}"
+    (cd "$PROJECT_ROOT" && cargo build --release --example hbone_perf_fixture 2>&1 | tail -1)
     (cd "$SCRIPT_DIR" && cargo build --release 2>&1 | tail -1)
+    require_bin "$PROJECT_ROOT/target/release/examples/hbone_perf_fixture" "cargo build --release --example hbone_perf_fixture did not produce the fixture"
+    require_bin "$SCRIPT_DIR/target/release/hbone_loadgen" "harness crate build did not produce hbone_loadgen"
     echo -e "${GREEN}Build complete${NC}"
 }
 
@@ -141,65 +156,29 @@ start_sidecar() {
     exit 1
 }
 
-write_gateway_config() {
-    cat > "$RUNTIME_DIR/gateway.yaml" <<EOF
-version: "1"
-proxies:
-  - id: hbone-edge
-    name: "hbone edge"
-    namespace: ferrum
-    hosts:
-      - "edge.local"
-    listen_path: "/"
-    backend_scheme: http
-    backend_host: "127.0.0.1"
-    backend_port: $SIDECAR_PORT
-    strip_listen_path: false
-    backend_connect_timeout_ms: 5000
-    backend_read_timeout_ms: 30000
-    backend_write_timeout_ms: 30000
-    upstream_id: hbone-upstream
-upstreams:
-  - id: hbone-upstream
-    name: "hbone upstream"
-    namespace: ferrum
-    algorithm: round_robin
-    targets:
-      - host: "127.0.0.1"
-        port: $SIDECAR_PORT
-        weight: 1
-        tags:
-          "mesh.hbone": "true"
-          "mesh.hbone_port": "$SIDECAR_PORT"
-consumers: []
-plugin_configs: []
-EOF
-}
-
 start_gateway() {
-    echo -e "${YELLOW}Starting ferrum-edge in file mode...${NC}"
-    write_gateway_config
+    echo -e "${YELLOW}Starting trusted-projection HBONE fixture...${NC}"
 
-    cd "$PROJECT_ROOT"
     env \
-        FERRUM_MODE=file \
-        FERRUM_FILE_CONFIG_PATH="$RUNTIME_DIR/gateway.yaml" \
-        FERRUM_PROXY_HTTP_PORT="$GATEWAY_HTTP_PORT" \
-        FERRUM_PROXY_HTTPS_PORT=0 \
-        FERRUM_ADMIN_HTTP_PORT="$GATEWAY_ADMIN_PORT" \
-        FERRUM_ADMIN_HTTPS_PORT=0 \
-        FERRUM_LOG_LEVEL=error \
-        FERRUM_POOL_WARMUP_ENABLED=true \
-        FERRUM_GATEWAY_SVID_CERT_PATH="$CERTS_DIR/gateway-cert.pem" \
-        FERRUM_GATEWAY_SVID_KEY_PATH="$CERTS_DIR/gateway-key.pem" \
-        FERRUM_GATEWAY_SVID_TRUST_BUNDLE_PATH="$CERTS_DIR/ca.pem" \
-        FERRUM_GATEWAY_SPIFFE_ID="spiffe://cluster.local/ns/edge/sa/gateway" \
-        FERRUM_BACKEND_ALLOW_IPS="private" \
-        ./target/release/ferrum-edge \
+        FERRUM_BACKEND_ALLOW_IPS=private \
+        "$PROJECT_ROOT/target/release/examples/hbone_perf_fixture" \
+            --proxy-http-port "$GATEWAY_HTTP_PORT" \
+            --admin-http-port "$GATEWAY_ADMIN_PORT" \
+            --sidecar-host 127.0.0.1 \
+            --sidecar-port "$SIDECAR_PORT" \
+            --svid-cert "$CERTS_DIR/gateway-cert.pem" \
+            --svid-key "$CERTS_DIR/gateway-key.pem" \
+            --trust-bundle "$CERTS_DIR/ca.pem" \
+            --spiffe-id "spiffe://cluster.local/ns/edge/sa/gateway" \
         > "$RUNTIME_DIR/gateway.log" 2>&1 &
     GATEWAY_PID=$!
 
     for i in $(seq 1 40); do
+        if ! kill -0 "$GATEWAY_PID" 2>/dev/null; then
+            echo -e "${RED}Gateway fixture exited before becoming ready${NC}"
+            tail -40 "$RUNTIME_DIR/gateway.log"
+            exit 1
+        fi
         if curl -sf "http://127.0.0.1:$GATEWAY_ADMIN_PORT/health" > /dev/null 2>&1; then
             echo -e "${GREEN}Gateway ready (PID $GATEWAY_PID)${NC}"
             return

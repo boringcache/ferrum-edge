@@ -89,7 +89,10 @@ impl SharedPoolCreateKind {
             ErrorClass::PortExhaustion => Self::PortExhaustion,
             ErrorClass::DispatchPolicyRejected => Self::DispatchPolicyRejected,
             ErrorClass::BackendConnectionLimit => Self::MaxConnections,
-            ErrorClass::ConnectionPoolError => Self::Unavailable,
+            // A gateway trust withdrawal is a pre-wire create refusal with no
+            // dedicated structural kind; the stored `ErrorClass` stays
+            // authoritative for classification (issue #3859).
+            ErrorClass::ConnectionPoolError | ErrorClass::TrustWithdrawn => Self::Unavailable,
             ErrorClass::ClientDisconnect
             | ErrorClass::ResponseBodyTooLarge
             | ErrorClass::GatewayBufferCapacity

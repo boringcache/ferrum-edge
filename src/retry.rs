@@ -88,7 +88,9 @@ pub enum ErrorClass {
     /// ([`crate::backend_conn_limit`]).
     ///
     /// This class exists because the refusal is simultaneously **pre-wire** and
-    /// **health-neutral**, and no other class expresses both:
+    /// **health-neutral**, which no general-purpose class expresses (the only
+    /// sibling is [`Self::TrustWithdrawn`], the other gateway-side policy
+    /// refusal):
     ///
     /// * pre-wire — nothing was dialed and no request byte reached the backend,
     ///   so `request_reached_wire` is false and `retry_on_connect_failure` may
@@ -105,6 +107,31 @@ pub enum ErrorClass {
     ///   healthy destination from the load balancer the moment live traffic
     ///   saturated its configured cap.
     BackendConnectionLimit,
+    /// The gateway refused a gateway-to-mesh transport because an accepted
+    /// gateway trust publication withdrew an authority (issue #3859): the
+    /// connection was dialled under the outgoing trust generation and refused at
+    /// registration, or a checked-out transport was retired before it could open
+    /// the next stream ([`crate::proxy::mesh_trust_registry`]).
+    ///
+    /// It shares [`Self::BackendConnectionLimit`]'s reason for existing — it is
+    /// simultaneously **pre-wire** and **health-neutral**, and no other class
+    /// expresses both:
+    ///
+    /// * pre-wire — the refusal happens before any request byte is queued on the
+    ///   transport, so `request_reached_wire` is false and
+    ///   `retry_on_connect_failure` may re-dial. A retry is exactly the right
+    ///   outcome here: the accepted generation has already been published, so
+    ///   the redial builds from the new verifier and succeeds.
+    /// * health-neutral — withdrawing a trust root is the operator's own
+    ///   gateway-side policy, not evidence about the destination workload, so it
+    ///   is a `client_side_no_backend_signal` class: no circuit-breaker failure,
+    ///   no passive-health ding, no load-balancer penalty sample and no
+    ///   adaptive-concurrency shrink. Using the generic `ConnectionPoolError`
+    ///   here would open breakers across every mesh destination the gateway was
+    ///   talking to at the instant of a revocation, turning a millisecond-scale
+    ///   trust rotation into a breaker-length outage for workloads that did
+    ///   nothing wrong.
+    TrustWithdrawn,
     /// Catch-all for unclassified request errors.
     RequestError,
 }
@@ -130,6 +157,7 @@ impl ErrorClass {
             Self::GracefulRemoteClose => "graceful_remote_close",
             Self::DispatchPolicyRejected => "dispatch_policy_rejected",
             Self::BackendConnectionLimit => "backend_connection_limit",
+            Self::TrustWithdrawn => "trust_withdrawn",
             Self::RequestError => "request_error",
         }
     }
@@ -188,6 +216,7 @@ pub fn request_reached_wire(error_class: ErrorClass) -> bool {
             | ErrorClass::PortExhaustion
             | ErrorClass::ConnectionPoolError
             | ErrorClass::BackendConnectionLimit
+            | ErrorClass::TrustWithdrawn
     )
 }
 
@@ -217,6 +246,7 @@ pub fn error_class_log_kind(class: ErrorClass) -> &'static str {
         ErrorClass::GracefulRemoteClose => "graceful_remote_close",
         ErrorClass::DispatchPolicyRejected => "dispatch_policy_rejected",
         ErrorClass::BackendConnectionLimit => "backend_connection_limit",
+        ErrorClass::TrustWithdrawn => "trust_withdrawn",
         ErrorClass::RequestError => "request_error",
     }
 }
@@ -383,6 +413,12 @@ pub fn classify_grpc_proxy_error(e: &crate::proxy::grpc_proxy::GrpcProxyError) -
                 // failure — `request_reached_wire` is false so connect-failure
                 // retry can redial.
                 GrpcBackendUnavailableKind::DispatchCanceled => ErrorClass::ConnectionPoolError,
+                // A trust-generation fence refused the transport before the
+                // request reached the destination. Pre-wire, so retry may
+                // acquire a fresh transport under the newly published authority
+                // set, and health-neutral, because withdrawing a root is
+                // gateway policy rather than evidence about the destination.
+                GrpcBackendUnavailableKind::TrustWithdrawn => ErrorClass::TrustWithdrawn,
                 // Gateway-side `connectionPool.tcp.maxConnections` refusal: the
                 // destination is at its physical-connection ceiling and no new
                 // socket was opened. Pre-wire, so `retry_on_connect_failure`
