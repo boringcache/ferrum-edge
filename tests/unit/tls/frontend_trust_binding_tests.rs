@@ -1243,17 +1243,14 @@ fn dp_mode_pairs_cp_server_config_with_operator_trust_for_h3() {
     assert!(
         client[clear_arm..replace_arm].contains("publish_cp_server_config")
             && client[clear_arm..replace_arm].contains("None,")
-            && client[clear_arm..replace_arm].contains(
-                "Some(proxy_state.stream_listener_manager.as_ref())"
-            ),
+            && client[clear_arm..replace_arm]
+                .contains("Some(proxy_state.stream_listener_manager.as_ref())"),
         "clearing CP material must restore the latest accepted operator candidate through the pairing slot"
     );
     assert!(
         client[replace_arm..].contains("publish_cp_server_config")
             && client[replace_arm..].contains("Some(tls_config.clone())")
-            && client[replace_arm..].contains(
-                "Some(proxy_state.stream_listener_manager.as_ref())"
-            ),
+            && client[replace_arm..].contains("Some(proxy_state.stream_listener_manager.as_ref())"),
         "applying CP material must pair it with the latest accepted operator trust and update stream listeners under that lock"
     );
 

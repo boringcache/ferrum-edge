@@ -2477,8 +2477,8 @@ impl DtlsServer {
             // discarded. Trust withdrawal must not emit any queued packet: the
             // peer is no longer authorized, even if the session deadline has
             // not elapsed.
-            let discard_final_packets = retired_by_trust_withdrawal
-                || session_authorization_elapsed(&auth_deadline);
+            let discard_final_packets =
+                retired_by_trust_withdrawal || session_authorization_elapsed(&auth_deadline);
             for _ in 0..MAX_OUTPUTS_PER_DRAIN {
                 match dtls.poll_output(&mut out_buf) {
                     Output::Packet(data) => {

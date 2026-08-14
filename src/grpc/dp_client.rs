@@ -557,7 +557,9 @@ impl DpFrontendH3Pairing {
     ) -> DpFrontendListenerUpdate {
         #[cfg(test)]
         let _stream_listener_gate = self.test_before_stream_listener.lock().await;
-        if update.replace_listener && let Some(manager) = stream_listeners {
+        if update.replace_listener
+            && let Some(manager) = stream_listeners
+        {
             manager
                 .set_frontend_tls_config(update.listener_config.clone())
                 .await;
@@ -3414,11 +3416,7 @@ mod tests {
             let candidate = test_operator_candidate(operator_config.clone(), 2);
             tokio::spawn(async move {
                 pairing
-                    .publish_operator_candidate(
-                        candidate,
-                        Some(&listener),
-                        Some(manager.as_ref()),
-                    )
+                    .publish_operator_candidate(candidate, Some(&listener), Some(manager.as_ref()))
                     .await
             })
         };
