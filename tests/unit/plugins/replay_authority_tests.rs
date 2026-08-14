@@ -1330,7 +1330,8 @@ fn an_invalid_jwks_candidate_does_not_publish_shared_replay_readiness() {
         ferrum_edge::plugins::utils::PluginHttpClient::default(),
         Some("invalid-jwks-replay-policy"),
     )
-    .expect_err("provider[1] has no usable JWKS source");
+    .err()
+    .expect("provider[1] has no usable JWKS source");
     assert!(
         error.contains("jwks"),
         "the candidate must fail closed on the later provider: {error}"
@@ -1352,7 +1353,8 @@ fn an_invalid_hmac_candidate_does_not_publish_shared_replay_readiness() {
         ferrum_edge::plugins::utils::PluginHttpClient::default(),
         Some("invalid-hmac-replay-policy"),
     )
-    .expect_err("shared HMAC requires Redis");
+    .err()
+    .expect("shared HMAC requires Redis");
     assert!(
         error.contains("shared"),
         "the candidate must fail closed without a Redis backend: {error}"
