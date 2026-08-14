@@ -755,13 +755,8 @@ async fn frontend_dtls_candidate_identity_matches_the_bytes_its_verifier_was_bui
     ensure_crypto_provider();
     let dir = tempfile::tempdir().expect("tempdir");
     let server_ca = generate_test_ca(dir.path(), "coherent-server-ca");
-    let server = generate_signed_material(
-        dir.path(),
-        &server_ca,
-        "coherent-server",
-        &["localhost"],
-        1,
-    );
+    let server =
+        generate_signed_material(dir.path(), &server_ca, "coherent-server", &["localhost"], 1);
 
     let ca_a = generate_test_ca(dir.path(), "coherent-client-ca-a");
     let ca_b = generate_test_ca(dir.path(), "coherent-client-ca-b");

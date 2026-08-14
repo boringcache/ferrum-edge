@@ -755,9 +755,9 @@ pub async fn start_http3_listener_with_signal(
         info!("HTTP/3 listener started disabled until frontend TLS material is available");
         endpoint
     } else {
-        let startup_client_trust = startup_client_trust
-            .as_ref()
-            .ok_or_else(|| anyhow::anyhow!("internal error: HTTP/3 startup client trust missing"))?;
+        let startup_client_trust = startup_client_trust.as_ref().ok_or_else(|| {
+            anyhow::anyhow!("internal error: HTTP/3 startup client trust missing")
+        })?;
         let server_config = build_h3_quinn_server_config(
             &tls_config,
             tls_policy,

@@ -2123,9 +2123,11 @@ pub fn build_client_cert_verifier_candidate(
     )?;
     // Summarized from the same bytes the roots were parsed from, before the
     // buffer is dropped — not from a second read of the source.
-    let material =
-        client_trust::ClientTrustMaterial::from_parts(Some(ca_material.bytes.expose_secret()), crls)
-            .map_err(|error| anyhow::anyhow!("{error}"))?;
+    let material = client_trust::ClientTrustMaterial::from_parts(
+        Some(ca_material.bytes.expose_secret()),
+        crls,
+    )
+    .map_err(|error| anyhow::anyhow!("{error}"))?;
 
     let mut verifier_builder =
         rustls::server::WebPkiClientVerifier::builder(Arc::new(client_auth_roots));

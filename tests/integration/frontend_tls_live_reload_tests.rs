@@ -259,7 +259,9 @@ fn write_client_auth_materials() -> ClientAuthMaterials {
     ca_params
         .distinguished_name
         .push(rcgen::DnType::CommonName, "Frontend Client CA");
-    ca_params.key_usages.push(rcgen::KeyUsagePurpose::KeyCertSign);
+    ca_params
+        .key_usages
+        .push(rcgen::KeyUsagePurpose::KeyCertSign);
     ca_params.key_usages.push(rcgen::KeyUsagePurpose::CrlSign);
     let ca_cert = ca_params.self_signed(&ca_key).expect("self-signed CA");
     let issuer = rcgen::Issuer::new(ca_params, ca_key);
@@ -489,7 +491,9 @@ fn admin_mtls_pki() -> AdminMtlsPki {
     ca_params
         .distinguished_name
         .push(rcgen::DnType::CommonName, "Admin Client CA");
-    ca_params.key_usages.push(rcgen::KeyUsagePurpose::KeyCertSign);
+    ca_params
+        .key_usages
+        .push(rcgen::KeyUsagePurpose::KeyCertSign);
     ca_params.key_usages.push(rcgen::KeyUsagePurpose::CrlSign);
     let ca_cert = ca_params.self_signed(&ca_key).expect("self-signed CA");
     let issuer = rcgen::Issuer::new(ca_params, ca_key);
@@ -848,10 +852,13 @@ async fn admin_https_does_not_register_a_connection_without_a_client_certificate
     ))));
     let (addr, shutdown_tx, listener) = start_admin_https_listener(slot, 10).await;
 
-    let (mut transport, driver) =
-        establish_admin_connection(addr, admin_client_config(&pki, false, &[b"http/1.1"]), false)
-            .await
-            .expect("establish anonymous admin TLS connection");
+    let (mut transport, driver) = establish_admin_connection(
+        addr,
+        admin_client_config(&pki, false, &[b"http/1.1"]),
+        false,
+    )
+    .await
+    .expect("establish anonymous admin TLS connection");
     assert_eq!(
         transport.live_probe().await,
         AdminAttempt::Status(200),
@@ -1078,10 +1085,8 @@ async fn proxy_frontend_without_client_auth_stays_unarmed_and_keeps_ktls_eligibi
     );
     assert_eq!(row.generation, 0, "an unarmed scope has no generation");
     assert!(
-        ferrum_edge::tls::client_trust::capture(
-            ferrum_edge::tls::ClientTrustScope::ProxyFrontend
-        )
-        .is_none(),
+        ferrum_edge::tls::client_trust::capture(ferrum_edge::tls::ClientTrustScope::ProxyFrontend)
+            .is_none(),
         "capture must stay None, which is exactly what keeps the TCP+TLS kTLS fast path eligible"
     );
 
@@ -1223,10 +1228,8 @@ async fn proxy_frontend_with_client_auth_arms_its_scope() {
     let row = trust_snapshot(ferrum_edge::tls::ClientTrustScope::ProxyFrontend);
     assert!(row.armed, "verified client authentication arms the scope");
     assert!(
-        ferrum_edge::tls::client_trust::capture(
-            ferrum_edge::tls::ClientTrustScope::ProxyFrontend
-        )
-        .is_some(),
+        ferrum_edge::tls::client_trust::capture(ferrum_edge::tls::ClientTrustScope::ProxyFrontend)
+            .is_some(),
         "an armed scope hands each accept an admission to carry"
     );
 

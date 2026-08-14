@@ -75,7 +75,9 @@ fn build_pki() -> TestPki {
     ca_params
         .distinguished_name
         .push(rcgen::DnType::CommonName, "Frontend Client CA");
-    ca_params.key_usages.push(rcgen::KeyUsagePurpose::KeyCertSign);
+    ca_params
+        .key_usages
+        .push(rcgen::KeyUsagePurpose::KeyCertSign);
     ca_params.key_usages.push(rcgen::KeyUsagePurpose::CrlSign);
     let ca_cert = ca_params.self_signed(&ca_key).expect("self-signed CA");
     let ca_pem = ca_cert.pem();
@@ -257,10 +259,8 @@ fn publishing_the_adopted_candidates_identity_reports_the_withdrawal_it_enforces
     let startup_crls = parse_crls(&pki.crl_pem(&[UNRELATED_SERIAL], 1));
     let before = load_candidate(dir.path(), &pki, &startup_crls).expect("startup candidate");
     // The H3 listener arms its own scope from the verifier it installed.
-    let armed = client_trust::publish_accepted_material(
-        ClientTrustScope::ProxyH3,
-        before.material.clone(),
-    );
+    let armed =
+        client_trust::publish_accepted_material(ClientTrustScope::ProxyH3, before.material.clone());
     assert_eq!(armed.outcome, ClientTrustPublicationOutcome::Armed);
 
     // A connection admitted under that verifier.

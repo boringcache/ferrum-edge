@@ -950,28 +950,29 @@ pub async fn serve(
     // The candidate carries the client-certificate verifier and trust identity
     // of this same load, so the client-trust baseline armed below describes
     // exactly the material these listeners serve (issue #3857).
-    let tls_startup = match startup_security::try_load_frontend_tls_candidate(
-        &env_config,
-        &tls_policy,
-        &crls,
-    ) {
-        Ok(Some(candidate)) => {
-            let mut config = candidate.config;
-            info!("Loading TLS configuration with client certificate verification...");
-            tls::enable_early_data(&mut config, &tls_policy);
-            if env_config.ktls_enabled.could_be_enabled() {
-                tls::enable_secret_extraction_for_ktls(&mut config);
+    let tls_startup =
+        match startup_security::try_load_frontend_tls_candidate(&env_config, &tls_policy, &crls) {
+            Ok(Some(candidate)) => {
+                let mut config = candidate.config;
+                info!("Loading TLS configuration with client certificate verification...");
+                tls::enable_early_data(&mut config, &tls_policy);
+                if env_config.ktls_enabled.could_be_enabled() {
+                    tls::enable_secret_extraction_for_ktls(&mut config);
+                }
+                Some((config, candidate.client_trust))
             }
-            Some((config, candidate.client_trust))
-        }
-        Ok(None) => None,
-        Err(e) => {
-            error!("TLS configuration validation failed: {:#}", e);
-            shutdown_file_background_startup_tasks(&shutdown_tx, &proxy_state, background_handles)
+            Ok(None) => None,
+            Err(e) => {
+                error!("TLS configuration validation failed: {:#}", e);
+                shutdown_file_background_startup_tasks(
+                    &shutdown_tx,
+                    &proxy_state,
+                    background_handles,
+                )
                 .await;
-            return Err(e);
-        }
-    };
+                return Err(e);
+            }
+        };
 
     // Wire opt-in frontend TLS live reload (see modes/database.rs for full
     // rationale). File-mode listeners participate identically: live reload is
