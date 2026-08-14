@@ -39298,9 +39298,17 @@ type BoxedMeshTransportDispatchFuture<'a> =
 /// healthy H3 plain mesh attempt then stacks those slots under the already-large
 /// H3 request / `dispatch_plain` frames and overflows a Tokio worker;
 /// early Unix and identity refusals return before it and are unaffected.
-/// Building each child in a separate `#[inline(never)]` factory that RETURNS
-/// before anything is awaited keeps the helper's frame to a boxed pointer.
-/// The allocation is confined to a mesh retry that has already selected HBONE.
+///
+/// A bare `Box::pin(proxy_to_backend_hbone(..))` still materializes the HBONE
+/// future as a stack temporary in this factory. Sidecar already trampolines
+/// for that reason; HBONE did not, so a healthy H3 plain Ambient attempt
+/// overflowed a 2 MiB Tokio worker while the adjacent Sidecar / gRPC / WS
+/// cases survived. The thin `async move` trampoline is what this factory
+/// boxes: its frame is only the captured arguments. The HBONE future is built
+/// later, when that heap-resident trampoline is polled, after the H3 helper
+/// frames have returned through their boxed seams. Handshake checkout and
+/// post-tunnel HTTP/1.1 send/collect are themselves boxed out of
+/// [`proxy_to_backend_hbone`] so that poll frame stays comparable to Sidecar.
 #[allow(clippy::too_many_arguments)]
 #[inline(never)]
 fn boxed_proxy_to_backend_hbone<'a>(
@@ -39323,25 +39331,74 @@ fn boxed_proxy_to_backend_hbone<'a>(
     route_request_body_limit: Option<usize>,
     route_response_body_limit: Option<usize>,
 ) -> BoxedMeshTransportDispatchFuture<'a> {
-    Box::pin(proxy_to_backend_hbone(
-        state,
+    Box::pin(async move {
+        proxy_to_backend_hbone(
+            state,
+            proxy,
+            backend_url,
+            method,
+            headers,
+            client_request_body,
+            upstream_target,
+            plugins,
+            source_identity_ctx,
+            ctx,
+            stream_response,
+            client_ip,
+            xff_append_ip,
+            request_is_secure,
+            resolved_ip,
+            ctx_bytes_sent_observed,
+            route_request_body_limit,
+            route_response_body_limit,
+        )
+        .await
+    })
+}
+
+type BoxedHboneGetTunnelViaFuture<'a> = std::pin::Pin<
+    Box<
+        dyn std::future::Future<
+                Output = Result<hbone_pool::H2ConnectTunnel, hbone_pool::HbonePoolError>,
+            > + Send
+            + 'a,
+    >,
+>;
+
+/// HBONE CONNECT checkout, constructed out of line so the TLS + HTTP/2 CONNECT
+/// handshake is not a frame slot in [`proxy_to_backend_hbone`].
+///
+/// Sidecar already boxed `get_sender` for this reason. The Ambient arm was
+/// still awaiting `get_tunnel_via` inline, so an unoptimized H3 plain HBONE
+/// attempt stacked that handshake under `handle_h3_request` / `dispatch_plain`
+/// and overflowed. Building it in this `#[inline(never)]` factory keeps the
+/// large temporary off the acquire poll frame.
+#[allow(clippy::too_many_arguments)]
+#[inline(never)]
+fn boxed_hbone_pool_get_tunnel_via<'a>(
+    state: &'a ProxyState,
+    proxy: &'a Proxy,
+    dial_host: &'a str,
+    app_host: &'a str,
+    app_port: u16,
+    app_policy_port: u16,
+    hbone_port: u16,
+    expected_peer: Option<&'a crate::identity::SpiffeId>,
+    expected_trust_domain: Option<&'a crate::identity::spiffe::TrustDomain>,
+    sni_override: Option<&'a str>,
+    asserted_source_identity: Option<&'a crate::identity::SpiffeId>,
+) -> BoxedHboneGetTunnelViaFuture<'a> {
+    Box::pin(state.hbone_pool.get_tunnel_via(
         proxy,
-        backend_url,
-        method,
-        headers,
-        client_request_body,
-        upstream_target,
-        plugins,
-        source_identity_ctx,
-        ctx,
-        stream_response,
-        client_ip,
-        xff_append_ip,
-        request_is_secure,
-        resolved_ip,
-        ctx_bytes_sent_observed,
-        route_request_body_limit,
-        route_response_body_limit,
+        dial_host,
+        app_host,
+        app_port,
+        app_policy_port,
+        hbone_port,
+        expected_peer,
+        expected_trust_domain,
+        sni_override,
+        asserted_source_identity,
     ))
 }
 
@@ -45404,24 +45461,29 @@ async fn proxy_to_backend_hbone(
         sni_override = sni_override.unwrap_or(""),
         "Proxying request via gateway HBONE tunnel"
     );
-    let tunnel = match state
-        .hbone_pool
-        .get_tunnel_via(
-            proxy,
-            dial_host,
-            // The inner CONNECT `:authority` host = the REAL pod addr (= the
-            // synthetic-host cross-cluster target's `mesh.hbone_authority_host`,
-            // else `target.host`); the network dial uses `dial_host` (gateway).
-            app_host,
-            target.port,
-            target.dispatch_policy_port(),
-            hbone_port,
-            expected_peer.as_ref(),
-            expected_trust_domain.as_ref(),
-            sni_override,
-            source_identity_ctx.and_then(|ctx| ctx.peer_spiffe_id.as_ref()),
-        )
-        .await
+    // Constructed out of line — see `boxed_hbone_pool_get_tunnel_via`.
+    // A bare `.await` of `get_tunnel_via` here still materializes the TLS +
+    // CONNECT handshake in this acquire coroutine's `opt-level = 0` poll
+    // frame. Under the H3 plain bridge that stacks on `handle_h3_request` /
+    // `dispatch_plain`, that handshake is the difference between a healthy
+    // Sidecar attempt (already boxed) and a healthy Ambient HBONE attempt.
+    let tunnel = match boxed_hbone_pool_get_tunnel_via(
+        state,
+        proxy,
+        dial_host,
+        // The inner CONNECT `:authority` host = the REAL pod addr (= the
+        // synthetic-host cross-cluster target's `mesh.hbone_authority_host`,
+        // else `target.host`); the network dial uses `dial_host` (gateway).
+        app_host,
+        target.port,
+        target.dispatch_policy_port(),
+        hbone_port,
+        expected_peer.as_ref(),
+        expected_trust_domain.as_ref(),
+        sni_override,
+        source_identity_ctx.and_then(|ctx| ctx.peer_spiffe_id.as_ref()),
+    )
+    .await
     {
         Ok(tunnel) => tunnel,
         Err(err) => {
@@ -45449,6 +45511,120 @@ async fn proxy_to_backend_hbone(
         }
     };
 
+    // Tunnel checkout complete. The inner HTTP/1.1 send + collect states are a
+    // second large coroutine; box them out of this acquire frame so an
+    // unoptimized H3 plain Ambient HBONE attempt does not hold CONNECT
+    // handshake and dispatch poll slots at once. See
+    // `boxed_proxy_to_backend_hbone_after_ready`.
+    boxed_proxy_to_backend_hbone_after_ready(
+        state,
+        proxy,
+        backend_url,
+        method,
+        headers,
+        client_request_body,
+        target,
+        plugins,
+        ctx,
+        stream_response,
+        client_ip,
+        xff_append_ip,
+        request_is_secure,
+        resolved_ip,
+        ctx_bytes_sent_observed,
+        effective_request_body_size_limit,
+        effective_max_response_body_size_bytes,
+        app_host,
+        cross_cluster,
+        tunnel,
+    )
+    .await
+}
+
+/// Post-tunnel HBONE dispatch, constructed out of line so inner HTTP/1.1
+/// handshake, send, and collect are not frame slots in [`proxy_to_backend_hbone`].
+///
+/// CONNECT checkout stays in the acquire coroutine. Buffering, forwarding
+/// headers, and the authorization-composed read window are unchanged; only
+/// the poll-frame boundary moves.
+#[allow(clippy::too_many_arguments)]
+#[inline(never)]
+fn boxed_proxy_to_backend_hbone_after_ready<'a>(
+    state: &'a ProxyState,
+    proxy: &'a Proxy,
+    backend_url: &'a str,
+    method: &'a str,
+    headers: &'a HashMap<String, String>,
+    client_request_body: MeshClientRequestBody,
+    target: &'a UpstreamTarget,
+    plugins: &'a [Arc<dyn crate::plugins::Plugin>],
+    ctx: Option<&'a RequestContext>,
+    stream_response: bool,
+    client_ip: &'a str,
+    xff_append_ip: &'a str,
+    request_is_secure: bool,
+    resolved_ip: Option<String>,
+    ctx_bytes_sent_observed: &'a Arc<std::sync::atomic::AtomicU64>,
+    effective_request_body_size_limit: usize,
+    effective_max_response_body_size_bytes: usize,
+    app_host: &'a str,
+    cross_cluster: bool,
+    tunnel: hbone_pool::H2ConnectTunnel,
+) -> BoxedMeshTransportDispatchFuture<'a> {
+    Box::pin(async move {
+        proxy_to_backend_hbone_after_ready(
+            state,
+            proxy,
+            backend_url,
+            method,
+            headers,
+            client_request_body,
+            target,
+            plugins,
+            ctx,
+            stream_response,
+            client_ip,
+            xff_append_ip,
+            request_is_secure,
+            resolved_ip,
+            ctx_bytes_sent_observed,
+            effective_request_body_size_limit,
+            effective_max_response_body_size_bytes,
+            app_host,
+            cross_cluster,
+            tunnel,
+        )
+        .await
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn proxy_to_backend_hbone_after_ready(
+    state: &ProxyState,
+    proxy: &Proxy,
+    backend_url: &str,
+    method: &str,
+    headers: &HashMap<String, String>,
+    client_request_body: MeshClientRequestBody,
+    target: &UpstreamTarget,
+    plugins: &[Arc<dyn crate::plugins::Plugin>],
+    ctx: Option<&RequestContext>,
+    stream_response: bool,
+    client_ip: &str,
+    xff_append_ip: &str,
+    request_is_secure: bool,
+    resolved_ip: Option<String>,
+    ctx_bytes_sent_observed: &Arc<std::sync::atomic::AtomicU64>,
+    effective_request_body_size_limit: usize,
+    effective_max_response_body_size_bytes: usize,
+    app_host: &str,
+    cross_cluster: bool,
+    tunnel: hbone_pool::H2ConnectTunnel,
+) -> (
+    retry::BackendResponse,
+    Option<Bytes>,
+    Option<Arc<std::sync::atomic::AtomicBool>>,
+) {
     let io = TokioIo::new(tunnel);
     let (mut sender, connection) = match hyper::client::conn::http1::Builder::new()
         .handshake(io)
