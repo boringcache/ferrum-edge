@@ -284,8 +284,11 @@ impl MeshMtlsSender {
     }
 
     /// Last-safe pre-wire send. A retired gate refuses synchronously —
-    /// `Err(TrustWithdrawn)` — before hyper queues a new stream. Callers must
-    /// treat that as pre-wire and health-neutral ([`HbonePoolError::TrustWithdrawn`]).
+    /// `Err(TrustWithdrawn)` — before hyper queues a new stream.
+    /// [`HbonePoolError::TrustWithdrawn`] classifies as
+    /// [`crate::retry::ErrorClass::TrustWithdrawn`], which is both pre-wire
+    /// (retryable under the freshly published generation) and backend-health
+    /// neutral, so a revocation cannot trip the destination's circuit breaker.
     pub fn send_request(
         &mut self,
         request: http::Request<MeshMtlsRequestBody>,

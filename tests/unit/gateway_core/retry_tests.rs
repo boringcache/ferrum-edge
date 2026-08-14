@@ -1907,3 +1907,63 @@ fn retry_loop_settles_health_neutral_intermediate_attempts_neutrally() {
          settle the breaker neutrally rather than as a failure"
     );
 }
+
+/// A gateway-to-mesh transport refused by a trust withdrawal (issue #3859) is
+/// the SAME shape as an over-cap refusal: pre-wire AND backend-health neutral.
+///
+/// Pre-wire, because nothing was queued on the transport — the accepted
+/// generation is already published when the refusal is raised, so a redial
+/// builds from the new verifier and succeeds. Health-neutral, because
+/// withdrawing a trust root is the operator's own gateway policy, not evidence
+/// about the destination workload. Classifying it as the generic
+/// `ConnectionPoolError` would record a circuit-breaker failure, a
+/// passive-health ding, a load-balancer penalty sample and an
+/// adaptive-concurrency shrink for every mesh destination the gateway happened
+/// to be talking to at the instant of a revocation — turning a
+/// millisecond-scale trust rotation into a breaker-length outage for workloads
+/// that did nothing wrong.
+#[test]
+fn trust_withdrawal_refusal_is_pre_wire_and_health_neutral_on_every_mesh_transport() {
+    use ferrum_edge::_test_support::{
+        error_class_is_backend_failure_for_test, error_class_is_health_neutral_for_test,
+    };
+    use ferrum_edge::proxy::grpc_proxy::GrpcBackendUnavailableKind;
+    use ferrum_edge::proxy::hbone_pool::HbonePoolError;
+
+    // Both mesh pools raise the one shared pool error.
+    let pool = HbonePoolError::TrustWithdrawn.error_class();
+    // Native gRPC over either mesh transport carries its own typed kind.
+    let grpc = classify_grpc_proxy_error(&GrpcProxyError::backend_unavailable(
+        GrpcBackendUnavailableKind::TrustWithdrawn,
+        "mesh transport retired by trust withdrawal".to_string(),
+    ));
+
+    for (transport, class) in [("HBONE / mesh-mTLS", pool), ("native gRPC", grpc)] {
+        assert_eq!(
+            class,
+            ErrorClass::TrustWithdrawn,
+            "{transport}: a trust-withdrawal refusal must carry the dedicated class"
+        );
+        assert!(
+            !ferrum_edge::retry::request_reached_wire(class),
+            "{transport}: the refusal is pre-wire, so a retry must be able to \
+             re-dial under the freshly published trust generation"
+        );
+        assert!(
+            error_class_is_health_neutral_for_test(class),
+            "{transport}: a gateway-side trust withdrawal must not trip the \
+             circuit breaker, ding passive health, penalize the load balancer, \
+             or shrink the adaptive-concurrency permit"
+        );
+        assert!(
+            !error_class_is_backend_failure_for_test(class),
+            "{transport}: a trust-withdrawal refusal is not a post-wire backend failure"
+        );
+    }
+
+    // The refusal must stay distinguishable from the generic pool error, which
+    // IS a backend-health signal.
+    assert!(!error_class_is_health_neutral_for_test(
+        ErrorClass::ConnectionPoolError
+    ));
+}

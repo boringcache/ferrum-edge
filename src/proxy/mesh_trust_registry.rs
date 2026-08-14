@@ -110,8 +110,15 @@ pub const MESH_TRANSPORT_KINDS: [MeshTransportKind; 2] =
 /// Closed set — it is a metric label.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TrustWithdrawalReason {
-    /// An accepted `Replace` no longer carries an authority the effective
-    /// gateway trust previously accepted.
+    /// A publication that REPLACED the effective trust material no longer
+    /// carries an authority the effective gateway trust previously accepted.
+    ///
+    /// Covers both replacement shapes, because they are indistinguishable to
+    /// the live verifier: an accepted `GatewayTrustCommit::Replace`, and a
+    /// source SVID rotation (SPIRE / file / CA backend) whose bundle drops a
+    /// trust anchor while no CP/database override is masking it. Kept as ONE
+    /// closed label rather than split, so the metric's cardinality does not
+    /// grow with the number of trust SOURCES.
     ReplaceRemovedAuthority,
     /// An accepted `Clear` withdrew an installed override whose authorities the
     /// restored startup material does not fully carry.

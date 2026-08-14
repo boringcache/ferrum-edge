@@ -1073,6 +1073,7 @@ fn gateway_hbone_mtls_observed(
                     | retry::ErrorClass::ProtocolError
                     | retry::ErrorClass::DispatchPolicyRejected
                     | retry::ErrorClass::BackendConnectionLimit
+                    | retry::ErrorClass::TrustWithdrawn
                     | retry::ErrorClass::RequestError
                     | retry::ErrorClass::RequestBodyTooLarge
             )

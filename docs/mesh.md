@@ -3768,6 +3768,20 @@ subject, key id, fingerprint, path, or peer identity. A retired pooled mesh-mTLS
 refuses `ready` / `send_request` synchronously by consulting the same gate, even if the
 underlying HTTP/2 sender has not yet observed connection close.
 
+A **source SVID rotation** takes the same path. When no CP/database override masks the
+source trust, `ProxyState::install_gateway_runtime_svid_bundle` compares the rotated
+bundle's anchors against the effective view and, if the rotation DROPS one, fences,
+installs, retires the ownership generation, and advances the backend security generation
+inside the same publication — so a shrinking SPIRE/file/CA-backend trust bundle cannot be
+deferred behind `FERRUM_MESH_SVID_ROTATION_DRAIN_SECONDS`. That rotation publishes the
+backend security generation itself, so the ordinary post-install revision bump is
+suppressed rather than applied twice. An additive or identity-only rotation is unchanged:
+it keeps its configured drain window and churns neither the registry nor the generation.
+A masked rotation (an override installed) changes no effective authority and so is a
+no-op here as well. Both replacement shapes report the same closed
+`replace_removed_authority` reason, because they are indistinguishable to the live
+verifier.
+
 The **creation race** is closed by the same generation stamp: a dial takes an admission
 ticket before connecting, and a connection that completes after the publication is refused
 at registration (`HbonePoolError::TrustWithdrawn`), so it is neither pooled nor returned.

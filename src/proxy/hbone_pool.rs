@@ -270,11 +270,16 @@ impl HbonePoolError {
             | Self::InvalidPeerSpiffeTag { .. }
             | Self::MissingCrossClusterSni
             | Self::MissingCrossClusterTrustDomain
-            | Self::MissingCrossClusterAuthorityHost
+            | Self::MissingCrossClusterAuthorityHost => ErrorClass::ConnectionPoolError,
             // Pre-wire, gateway-side policy refusal: the transport is dropped
             // before any request rides it, so a retry may legitimately re-dial
-            // under the freshly published trust generation.
-            | Self::TrustWithdrawn => ErrorClass::ConnectionPoolError,
+            // under the freshly published trust generation — and the refusal is
+            // health-NEUTRAL, because withdrawing a trust root is the operator's
+            // own gateway policy, not evidence about the destination workload.
+            // The generic `ConnectionPoolError` would open a circuit breaker for
+            // every mesh destination the gateway was talking to at the instant
+            // of the revocation (issue #3859).
+            Self::TrustWithdrawn => ErrorClass::TrustWithdrawn,
             Self::DnsLookup { .. } | Self::InvalidServerName { .. } => ErrorClass::DnsLookupError,
             Self::ConnectTimeout { .. } => ErrorClass::ConnectionTimeout,
             Self::Connect { source, .. } => {

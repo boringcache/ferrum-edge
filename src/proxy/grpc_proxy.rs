@@ -1403,7 +1403,10 @@ pub enum GrpcBackendUnavailableKind {
     /// Gateway trust changed while a mesh transport was being established, or
     /// after a pooled transport was checked out but before it opened a stream.
     /// The request never reached the destination, and the retired transport is
-    /// not reused. Maps to [`crate::retry::ErrorClass::ConnectionPoolError`].
+    /// not reused. Maps to [`crate::retry::ErrorClass::TrustWithdrawn`], which
+    /// is pre-wire (a retry re-dials under the freshly published trust
+    /// generation) and backend-health neutral (withdrawing a root is gateway
+    /// policy, not evidence about the destination workload).
     TrustWithdrawn,
     /// The destination is already at its DestinationRule
     /// `connectionPool.tcp.maxConnections` ceiling, so no NEW physical H2
@@ -1613,6 +1616,9 @@ impl From<crate::pool::SharedPoolCreateError> for GrpcProxyError {
                     ErrorClass::TlsError | ErrorClass::ProtocolError => {
                         GrpcBackendUnavailableKind::TlsHandshake
                     }
+                    // Coalesced waiters must see the SAME typed pre-wire,
+                    // health-neutral refusal the creator produced (issue #3859).
+                    ErrorClass::TrustWithdrawn => GrpcBackendUnavailableKind::TrustWithdrawn,
                     ErrorClass::ConnectionRefused
                     | ErrorClass::ConnectionClosed
                     | ErrorClass::ConnectionReset
