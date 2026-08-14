@@ -2415,7 +2415,7 @@ impl StreamListenerManager {
         let existing_shared_node_waypoint_udp_ports: std::collections::HashSet<u16> = listeners
             .iter()
             .filter(|(key, handle)| {
-                key == &node_waypoint_udp_listener_key(handle.listen_port)
+                *key == &node_waypoint_udp_listener_key(handle.listen_port)
                     && handle.scheme.is_udp()
                     && !handle.join_handle.is_finished()
             })
