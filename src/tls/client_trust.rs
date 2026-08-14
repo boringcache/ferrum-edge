@@ -48,25 +48,27 @@
 //! # Ordering, and why it fails closed
 //!
 //! rustls surfaces that install [`bind_live_handshake_verifier`] (proxy H1/H2
-//! and TCP+TLS, admin HTTPS, H3/QUIC) publish an accepted candidate in this
-//! order, and only after every fallible build/validation step has succeeded:
+//! and TCP+TLS, admin HTTPS, H3/QUIC) publish an accepted candidate through
+//! **one** [`publish_accepted_rustls_candidate`] transaction per scope, and
+//! only after every fallible build/validation step has succeeded. That
+//! transaction holds the scope publication lock continuously across:
 //!
-//! **(1)** [`install_accepted_live_verifier`] stores the candidate's inner
-//! rustls verifier, **(2)** the caller exposes/adopts the new `ServerConfig`
-//! (slot swap / `Endpoint::set_server_config`), **(3)**
-//! [`publish_accepted_candidate`] stores that same verifier again if needed,
-//! bumps `generation`, **(4)** stores `withdrawal_generation` when authority
-//! narrowed, **(5)** sweeps registered sessions.
+//! **(1)** store the candidate's inner rustls verifier, **(2)** run the
+//! already-validated, infallible config exposure/adoption (slot swap /
+//! `Endpoint::set_server_config`), **(3)** store that same candidate's
+//! material, bump `generation`, **(4)** store `withdrawal_generation` when
+//! authority narrowed, **(5)** sweep registered sessions.
 //!
 //! Installing the stricter verifier slightly before its config is conservative:
 //! a handshake that still holds a stale config consults the live object and
 //! refuses withdrawn credentials. A handshake that loads the new config before
 //! the generation advances also consults that live object, so it cannot admit a
-//! credential V2 withdrew while `active()` still saw global V1. Do **not**
-//! install a verifier before a fallible step that could reject the candidate:
-//! that would leave the previous config served against a verifier it was not
-//! built with. A refused candidate never calls
-//! [`install_accepted_live_verifier`] and is recorded with
+//! credential V2 withdrew while `active()` still saw global V1. Holding the
+//! lock across those steps is what keeps concurrent V2/V3 publications from
+//! cross-wiring verifier V3 with config/material V2 (or the converse). Do
+//! **not** expose a config outside this transaction, and do **not** enter it
+//! before a fallible step that could reject the candidate. A refused candidate
+//! never enters the transaction and is recorded with
 //! [`record_rejected_candidate`], retaining last-good material.
 //!
 //! Admission is the mirror image: a listener [`capture`]s the generation
@@ -87,7 +89,11 @@
 //! `ServerConfig` itself was built under a withdrawn generation. A second,
 //! independent fail-closed check re-runs the peer chain against
 //! [`armed_handshake_still_trusted`] after TLS so a missing peer chain (session
-//! resumption does not re-verify) cannot be served either.
+//! resumption does not re-verify) cannot be served either. The wrapper is
+//! installed only at `with_client_cert_verifier` time;
+//! [`AcceptedClientTrust::verifier`](super::AcceptedClientTrust) and
+//! [`publish_accepted_rustls_candidate`] keep the inner WebPki object so the
+//! live slot never points at the wrapper itself.
 //!
 //! DTLS has no rustls live handshake verifier. It keeps the distinct
 //! config-before-generation order: the DTLS generation is published into every
@@ -115,9 +121,10 @@
 //! # Redaction
 //!
 //! Nothing here records or labels a serial, subject, issuer name, fingerprint,
-//! certificate path, or any secret material. The material comparison keys are
-//! SHA-256 digests held in memory only; metric labels are the closed
-//! [`ClientTrustScope`] and [`ClientTrustRetirementReason`] vocabularies.
+//! key identifier, SPKI digest, certificate path, or any secret material. The
+//! material comparison keys are SHA-256 digests held in memory only; metric
+//! labels are the closed [`ClientTrustScope`] and
+//! [`ClientTrustRetirementReason`] vocabularies.
 
 use std::collections::BTreeSet;
 use std::future::Future;
@@ -134,7 +141,9 @@ use rustls::pki_types::{CertificateDer, CertificateRevocationListDer, UnixTime};
 use rustls::server::danger::{ClientCertVerified, ClientCertVerifier};
 use rustls::{DigitallySignedStruct, DistinguishedName, Error, SignatureScheme};
 use tokio_util::sync::{CancellationToken, WaitForCancellationFutureOwned};
-use x509_parser::prelude::{FromDer, X509Certificate};
+use x509_parser::oid_registry::OID_X509_EXT_AUTHORITY_KEY_IDENTIFIER;
+use x509_parser::prelude::{FromDer, ParsedExtension, SubjectPublicKeyInfo, X509Certificate};
+use x509_parser::revocation_list::CertificateRevocationList;
 
 /// Compiled-in close / error reason when a handshake's peer no longer satisfies
 /// the live verifier. Never interpolate a serial, subject, issuer, path, or
@@ -214,8 +223,8 @@ pub enum ClientTrustRetirementReason {
     /// A trust anchor present in the last accepted client-CA bundle is absent
     /// from the accepted candidate.
     ClientCaWithdrawn,
-    /// The accepted candidate revokes at least one (issuer, serial) pair that
-    /// the last accepted CRL set did not.
+    /// The accepted candidate revokes at least one (signer-key, serial) pair
+    /// that the last accepted CRL set did not.
     CrlChanged,
 }
 
@@ -317,13 +326,26 @@ pub struct ClientTrustMaterial {
     /// SHA-256 over each client-CA trust anchor's DER, deduplicated and sorted.
     /// Anchor *order* in the bundle is not authority, so the set is the identity.
     anchors: BTreeSet<[u8; 32]>,
-    /// SHA-256 over `issuer DER || 0x00 || serial DER` for every revoked entry
-    /// across every parsed CRL. Scoping each serial by its issuer is required:
-    /// serial numbers are only unique within an issuer, so a bare-serial set
-    /// would let a revocation under CA A mask the *appearance* of the same
-    /// serial under CA B and suppress a real withdrawal.
+    /// SHA-256 over `issuer-key identity || 0x00 || serial DER` for every
+    /// revoked entry across every parsed CRL. The issuer-key identity is a
+    /// domain-tagged digest of the uniquely verified signer SPKI when that
+    /// key is in the accepted client-CA bundle, or of an unambiguous CRL
+    /// Authority Key Identifier when it is not. Serial numbers are unique
+    /// only under one issuing key: two CA keys can share a subject DN and a
+    /// leaf serial, so scoping by issuer DN (or a bare serial) would let a
+    /// revocation under the second key collide with the first and suppress
+    /// `CrlChanged`.
     revocations: BTreeSet<[u8; 32]>,
 }
+
+/// Domain tag mixed into a revocation identity derived from a verified signer
+/// SubjectPublicKeyInfo. Distinct from [`ISSUER_DOMAIN_AKI`] so an AKI octet
+/// string cannot collide with a raw SPKI.
+const ISSUER_DOMAIN_SPKI: &[u8] = b"spki";
+/// Domain tag mixed into a revocation identity derived from a CRL Authority
+/// Key Identifier, used only when the signer is not in the accepted anchor
+/// bundle.
+const ISSUER_DOMAIN_AKI: &[u8] = b"aki";
 
 /// A CRL that this module could not parse.
 ///
@@ -354,6 +376,7 @@ impl ClientTrustMaterial {
         crls: &[CertificateRevocationListDer<'static>],
     ) -> Result<Self, ClientTrustMaterialError> {
         let mut anchors = BTreeSet::new();
+        let mut anchor_ders = Vec::new();
         if let Some(pem) = client_ca_pem {
             let mut reader = pem;
             let mut parsed_any = false;
@@ -372,7 +395,9 @@ impl ClientTrustMaterial {
                     return Err(ClientTrustMaterialError);
                 }
                 parsed_any = true;
-                anchors.insert(digest_of(&[cert.as_ref()]));
+                let der = cert.as_ref().to_vec();
+                anchors.insert(digest_of(&[&der]));
+                anchor_ders.push(der);
             }
             // `rustls_pemfile::certs` skips PEM sections it cannot recognize.
             // A configured client-CA source containing only malformed material
@@ -386,14 +411,31 @@ impl ClientTrustMaterial {
             }
         }
 
+        let mut parsed_anchors = Vec::with_capacity(anchor_ders.len());
+        for der in &anchor_ders {
+            let (remaining, cert) =
+                X509Certificate::from_der(der).map_err(|_| ClientTrustMaterialError)?;
+            if !remaining.is_empty() {
+                return Err(ClientTrustMaterialError);
+            }
+            parsed_anchors.push(cert);
+        }
+        let unique_signers = unique_signer_spkis(&parsed_anchors);
+
         let mut revocations = BTreeSet::new();
         for crl in crls {
-            let (_rest, parsed) =
-                x509_parser::revocation_list::CertificateRevocationList::from_der(crl.as_ref())
-                    .map_err(|_| ClientTrustMaterialError)?;
-            let issuer = parsed.issuer().as_raw();
+            let (remaining, parsed) = CertificateRevocationList::from_der(crl.as_ref())
+                .map_err(|_| ClientTrustMaterialError)?;
+            if !remaining.is_empty() {
+                return Err(ClientTrustMaterialError);
+            }
+            let issuer_key = crl_signer_key_identity(&parsed, &unique_signers)?;
             for revoked in parsed.iter_revoked_certificates() {
-                revocations.insert(digest_of(&[issuer, &[0x00], revoked.raw_serial()]));
+                revocations.insert(digest_of(&[
+                    issuer_key.as_slice(),
+                    &[0x00],
+                    revoked.raw_serial(),
+                ]));
             }
         }
 
@@ -438,6 +480,80 @@ fn digest_of(parts: &[&[u8]]) -> [u8; 32] {
     hasher.finalize()
 }
 
+/// Deduplicate accepted client-CA anchors by SubjectPublicKeyInfo bytes so a
+/// bundle that repeats the same key (two certificates, one key) is one signer.
+fn unique_signer_spkis<'a>(certs: &[X509Certificate<'a>]) -> Vec<SubjectPublicKeyInfo<'a>> {
+    let mut seen = BTreeSet::new();
+    let mut unique = Vec::new();
+    for cert in certs {
+        let spki = cert.public_key();
+        if seen.insert(digest_of(&[spki.raw])) {
+            unique.push(spki.clone());
+        }
+    }
+    unique
+}
+
+/// Stable identity of the key that signed `crl`.
+///
+/// Prefers the digest of a uniquely verified signer SPKI from the accepted
+/// client-CA bundle. Matching the CRL issuer DN is not enough: two CA keys
+/// can share a subject. When no bundle key verifies, an unambiguous Authority
+/// Key Identifier is used under a distinct identity domain. Anything else
+/// fails closed — never fall back to issuer DN.
+fn crl_signer_key_identity(
+    crl: &CertificateRevocationList<'_>,
+    unique_signers: &[SubjectPublicKeyInfo<'_>],
+) -> Result<[u8; 32], ClientTrustMaterialError> {
+    let mut verified: Option<[u8; 32]> = None;
+    for spki in unique_signers {
+        if crl.verify_signature(spki).is_err() {
+            continue;
+        }
+        let id = digest_of(&[ISSUER_DOMAIN_SPKI, spki.raw]);
+        match verified {
+            None => verified = Some(id),
+            Some(existing) if existing == id => {}
+            Some(_) => return Err(ClientTrustMaterialError),
+        }
+    }
+    if let Some(id) = verified {
+        return Ok(id);
+    }
+    crl_aki_key_identity(crl)
+}
+
+fn crl_aki_key_identity(
+    crl: &CertificateRevocationList<'_>,
+) -> Result<[u8; 32], ClientTrustMaterialError> {
+    let mut key_id: Option<&[u8]> = None;
+    for ext in crl.extensions() {
+        if ext.oid != OID_X509_EXT_AUTHORITY_KEY_IDENTIFIER {
+            continue;
+        }
+        match &ext.parsed_extension {
+            ParsedExtension::AuthorityKeyIdentifier(aki) => {
+                if key_id.is_some() {
+                    // Two AKI extensions: the identifier is not unambiguous.
+                    return Err(ClientTrustMaterialError);
+                }
+                let Some(identifier) = aki.key_identifier.as_ref() else {
+                    return Err(ClientTrustMaterialError);
+                };
+                if identifier.0.is_empty() {
+                    return Err(ClientTrustMaterialError);
+                }
+                key_id = Some(identifier.0);
+            }
+            _ => return Err(ClientTrustMaterialError),
+        }
+    }
+    let Some(key_id) = key_id else {
+        return Err(ClientTrustMaterialError);
+    };
+    Ok(digest_of(&[ISSUER_DOMAIN_AKI, key_id]))
+}
+
 /// Per-scope state. One instance per [`ClientTrustScope`], created once.
 struct ClientTrustDomain {
     scope: ClientTrustScope,
@@ -454,13 +570,13 @@ struct ClientTrustDomain {
     last_withdrawal_reason: AtomicU8,
     /// Last accepted semantic material.
     material: ArcSwap<Option<ClientTrustMaterial>>,
-    /// Live rustls client-certificate verifier for this scope. Installed
-    /// **before** the matching `ServerConfig` is exposed, and again
-    /// (idempotently) before the generation advances. Handshake paths re-check
-    /// the peer against this object after TLS so a stale `ServerConfig` / QUIC
-    /// accepter snapshot cannot admit a credential the published generation
-    /// withdrew. `None` for DTLS and for tests that publish material without a
-    /// verifier.
+    /// Live rustls client-certificate verifier for this scope. Stored as the
+    /// first step of [`publish_accepted_rustls_candidate`], before the matching
+    /// `ServerConfig` is exposed and before the generation advances, under the
+    /// same publication lock. Handshake paths re-check the peer against this
+    /// object after TLS so a stale `ServerConfig` / QUIC accepter snapshot
+    /// cannot admit a credential the published generation withdrew. `None` for
+    /// DTLS and for tests that publish material without a verifier.
     live_verifier: ArcSwap<Option<Arc<dyn ClientCertVerifier>>>,
     /// Live client-certificate-authenticated transports, keyed by an internal
     /// session id. Stored as `Weak` so a long-lived clone (an upgraded
@@ -469,9 +585,11 @@ struct ClientTrustDomain {
     /// setup/teardown and at publication — never on the request path.
     sessions: DashMap<u64, Weak<ClientTrustSessionInner>>,
     next_session_id: AtomicU64,
-    /// Serializes publications so two concurrent accepted candidates cannot
-    /// interleave their read-compare-store-sweep. Publications are rare
-    /// (operator-driven reloads) and never happen on a data path.
+    /// Serializes one accepted-candidate transaction so two concurrent
+    /// publishers cannot interleave verifier install, config exposure, and
+    /// material/generation/fence. Publications are rare (operator-driven
+    /// reloads) and never happen on a data path. The lock is a `std` mutex and
+    /// must not be held across `.await`.
     publish_lock: std::sync::Mutex<()>,
     /// Fixed-cardinality counters.
     publications: [AtomicU64; 4],
@@ -556,44 +674,27 @@ fn domain(scope: ClientTrustScope) -> &'static ClientTrustDomain {
 
 /// Publish one validated, accepted client-trust snapshot into `scope`.
 ///
-/// **The caller must already have applied the corresponding material** (swapped
-/// the `ServerConfig` slot, applied the QUIC server config, swapped the DTLS
-/// generation) before calling this. See the module docs for why that order is
-/// what makes the captured generation conservative rather than optimistic.
-///
-/// Prefer [`publish_accepted_candidate`] on rustls surfaces. Those callers
-/// install the live verifier with [`install_accepted_live_verifier`] *before*
-/// exposing the new config, then call this to advance generation.
+/// DTLS (no rustls live verifier) and material-only tests use this after the
+/// corresponding config is already live. Rustls surfaces must use
+/// [`publish_accepted_rustls_candidate`] so verifier, config, and generation
+/// cannot be published on separate lock acquisitions.
 pub fn publish_accepted_material(
     scope: ClientTrustScope,
     material: ClientTrustMaterial,
 ) -> ClientTrustPublication {
-    publish_accepted_candidate(scope, material, None)
+    let domain = domain(scope);
+    let _publish_guard = lock_publish(domain);
+    publish_locked(domain, material)
 }
 
-/// Store `verifier` as the live rustls handshake object for `scope` **before**
-/// exposing a new `ServerConfig`.
-///
-/// Call this only after every fallible candidate build/validation has
-/// succeeded. Installing a verifier and then refusing the candidate would
-/// leave the previous config served against a verifier it was not built with.
-/// Generation, fence, and session sweep stay in [`publish_accepted_candidate`],
-/// which idempotently stores the same `Arc` before advancing.
-///
-/// DTLS has no rustls live verifier and must not call this.
-pub fn install_accepted_live_verifier(
-    scope: ClientTrustScope,
-    verifier: Arc<dyn ClientCertVerifier>,
-) {
-    let domain = domain(scope);
+fn lock_publish(domain: &ClientTrustDomain) -> std::sync::MutexGuard<'_, ()> {
     // Poisoning cannot make the state unsafe (every field is an atomic or an
-    // `ArcSwap`), and refusing to install on a poisoned lock would leave
-    // handshakes consulting a withdrawn verifier — the fail-open direction.
-    let _publish_guard = domain
+    // `ArcSwap`), and refusing to publish on a poisoned lock would leave the
+    // fence permanently behind the served material — the fail-open direction.
+    domain
         .publish_lock
         .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    store_live_verifier(domain, verifier);
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
 fn store_live_verifier(domain: &ClientTrustDomain, verifier: Arc<dyn ClientCertVerifier>) {
@@ -608,39 +709,51 @@ fn store_live_verifier(domain: &ClientTrustDomain, verifier: Arc<dyn ClientCertV
     domain.live_verifier.store(Arc::new(Some(verifier)));
 }
 
-/// Publish an accepted candidate, storing its rustls verifier (when the
-/// surface has one) **before** the generation advances.
+/// One rustls accepted-candidate transaction for `scope`.
 ///
-/// On rustls reload surfaces the caller has already invoked
-/// [`install_accepted_live_verifier`] and exposed the new `ServerConfig`. This
-/// function stores the same verifier again when the `Arc` is not already in
-/// the slot (startup and one-shot publishers) and is a no-op when it is.
-/// DTLS and material-only tests pass `verifier = None` and skip the live
-/// handshake re-check.
+/// Holds the scope publication lock continuously across: install the accepted
+/// live verifier, run `expose_config` (already-validated, infallible config
+/// exposure/adoption), publish this candidate's material/generation/fence,
+/// and sweep. All fallible load/build/validation must complete before this
+/// call. `expose_config` must not `.await`.
+///
+/// DTLS has no rustls live verifier and must not call this.
+pub fn publish_accepted_rustls_candidate(
+    scope: ClientTrustScope,
+    material: ClientTrustMaterial,
+    verifier: Arc<dyn ClientCertVerifier>,
+    expose_config: impl FnOnce(),
+) -> ClientTrustPublication {
+    let domain = domain(scope);
+    let _publish_guard = lock_publish(domain);
+    store_live_verifier(domain, verifier);
+    expose_config();
+    publish_locked(domain, material)
+}
+
+/// Publish an accepted candidate without a config-exposure callback.
+///
+/// Prefer [`publish_accepted_rustls_candidate`] on rustls surfaces that expose
+/// a `ServerConfig`. This convenience keeps verifier install and
+/// material/generation under one lock for tests and one-shot publishers that
+/// have no slot to swap. Passing `verifier = None` is the DTLS / material-only
+/// path ([`publish_accepted_material`]).
 pub fn publish_accepted_candidate(
     scope: ClientTrustScope,
     material: ClientTrustMaterial,
     verifier: Option<Arc<dyn ClientCertVerifier>>,
 ) -> ClientTrustPublication {
-    let domain = domain(scope);
-    // Poisoning cannot make the state unsafe (every field is an atomic or an
-    // `ArcSwap`), and refusing to publish on a poisoned lock would leave the
-    // fence permanently behind the served material — the fail-open direction.
-    let _publish_guard = domain
-        .publish_lock
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-
-    // The live verifier must be observable before `generation` advances. A
-    // reconnect that captures the new generation then re-checks this object
-    // cannot be admitted by a withdrawn credential, even if its handshake
-    // still holds a stale `ServerConfig` snapshot. When the caller already
-    // installed this same `Arc` before exposing the config, the store is a
-    // no-op.
-    if let Some(verifier) = verifier {
-        store_live_verifier(domain, verifier);
+    match verifier {
+        Some(verifier) => publish_accepted_rustls_candidate(scope, material, verifier, || {}),
+        None => publish_accepted_material(scope, material),
     }
+}
 
+fn publish_locked(
+    domain: &ClientTrustDomain,
+    material: ClientTrustMaterial,
+) -> ClientTrustPublication {
+    let scope = domain.scope;
     let previous = domain.material.load_full();
     let Some(previous_material) = previous.as_ref().as_ref() else {
         // First accepted snapshot for this scope: the baseline. Nothing was
@@ -806,10 +919,9 @@ pub fn armed_handshake_der_chain_still_trusted(
 /// TlsAcceptor or QUIC endpoint that still holds a snapshot built under a
 /// withdrawn generation would otherwise keep admitting the withdrawn
 /// credential. The wrapper is installed **only** at `with_client_cert_verifier`
-/// time; [`AcceptedClientTrust::verifier`](super::AcceptedClientTrust),
-/// [`install_accepted_live_verifier`], and [`publish_accepted_candidate`] keep
-/// the inner WebPki object so the live slot never points at the wrapper
-/// itself.
+/// time; [`AcceptedClientTrust::verifier`](super::AcceptedClientTrust) and
+/// [`publish_accepted_rustls_candidate`] keep the inner WebPki object so the
+/// live slot never points at the wrapper itself.
 pub fn bind_live_handshake_verifier(
     scope: ClientTrustScope,
     inner: Arc<dyn ClientCertVerifier>,

@@ -554,9 +554,19 @@ sessions are retained.
 #### What advances a generation, and what retires a connection
 
 A candidate is summarized into a *semantic* identity — the set of client-CA
-trust anchors, and the set of `(issuer, serial)` revocations across every CRL —
-rather than a byte hash of the source material. A CRL is normally re-issued on a
-schedule with a fresh `thisUpdate` / `nextUpdate` / `crlNumber` and an unchanged
+trust anchors, and the set of `(signer-key, serial)` revocations across every
+CRL — rather than a byte hash of the source material. Each revoked serial is
+scoped by a stable identity of the **CRL signing key**, not the issuer
+distinguished name: two CA keys can share a subject DN and a leaf serial, and
+hashing issuer DN with that serial would let a revocation under the second key
+collide with the first and suppress `CrlChanged`. The signer is the uniquely
+verified SubjectPublicKeyInfo from the accepted client-CA bundle (signature
+verified; matching a DN is not enough; identical SPKIs are deduplicated), or
+an unambiguous Authority Key Identifier when that signer is not in the
+bundle, tagged so an AKI byte string cannot collide with a raw SPKI identity.
+A CRL whose issuer key cannot be identified conservatively is refused; the
+last-good generation is retained. A CRL is normally re-issued on a schedule
+with a fresh `thisUpdate` / `nextUpdate` / `crlNumber` and an unchanged
 revocation set, and treating that as a change would churn every live session on
 every routine re-issue.
 
@@ -616,14 +626,17 @@ only in deployments that enabled frontend TLS live reload.
 #### Race behaviour
 
 On rustls surfaces (proxy HTTPS / HTTP-2 / TCP+TLS, admin HTTPS, HTTP/3), an
-accepted candidate is published fail-closed in this order, and only after every
-fallible rebuild has succeeded: the live handshake verifier is installed first,
-the new `ServerConfig` is exposed second, and the generation / fence / session
-sweep is published last. Installing a stricter verifier slightly before its
-config is conservative — a stale config refuses withdrawn credentials. A
-handshake that loads the new config before the generation advances therefore
-consults that same live verifier, and cannot admit a credential the new
-candidate withdrew. A refused candidate never replaces the live verifier.
+accepted candidate is published as **one transaction per scope**, and only after
+every fallible rebuild has succeeded. That transaction holds the scope
+publication lock continuously across: install the live handshake verifier,
+execute the already-validated infallible config exposure/adoption (slot swap /
+`Endpoint::set_server_config`), then publish that same candidate's material,
+generation, fence, and session sweep. Installing a stricter verifier slightly
+before its config is conservative — a stale config refuses withdrawn
+credentials. Holding the lock across those steps is what keeps concurrent V2/V3
+publications from serving verifier V3 with config/material V2 (or the converse).
+A refused candidate never enters the transaction and never replaces the live
+verifier.
 
 DTLS has no rustls live verifier. It keeps the distinct config-before-generation
 order: the DTLS generation is published into every active `DtlsServer` first,
@@ -649,9 +662,9 @@ and one that arrives afterwards simply wakes the listener again.
 
 All series are fixed-cardinality. The only label dimensions are the closed scope
 vocabulary above and the closed retirement reasons `client_ca_withdrawn` and
-`crl_changed`. No serial, subject, SAN, issuer name, fingerprint, certificate
-path, or generation of any secret appears in a metric label, a log line, or a
-client-visible error.
+`crl_changed`. No serial, subject, SAN, issuer name, key identifier, SPKI
+digest, fingerprint, certificate path, or generation of any secret appears in a
+metric label, a log line, or a client-visible error.
 
 | Metric | Type | Meaning |
 |--------|------|---------|

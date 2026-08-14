@@ -476,7 +476,8 @@ fn live_handshake_wrapper_refuses_after_accepted_withdrawal_even_with_a_stale_in
 
 /// Counterexample for the rustls publication-order race: a ServerConfig built
 /// with candidate V2 must consult live V2 during the window after verifier
-/// install and before generation advances — never the withdrawn V1.
+/// install and before generation advances — never the withdrawn V1. That
+/// window exists only inside the transaction's expose callback.
 #[test]
 fn a_v2_handshake_config_cannot_consult_v1_during_the_pre_generation_window() {
     let _guard = isolated_registry();
@@ -508,9 +509,6 @@ fn a_v2_handshake_config_cannot_consult_v1_during_the_pre_generation_window() {
         let generation_before = client_trust::capture(scope).expect("armed").generation();
         assert_eq!(generation_before, 1);
 
-        // The wrapper a V2 ServerConfig actually installs: inner is V2, but
-        // `active()` reads the live slot. Before pre-exposure install that slot
-        // is still V1 — the fail-open window this API closes.
         let v2_wrapper = client_trust::bind_live_handshake_verifier(scope, v2_inner.clone());
         assert!(
             v2_wrapper
@@ -520,55 +518,59 @@ fn a_v2_handshake_config_cannot_consult_v1_during_the_pre_generation_window() {
             scope,
         );
 
-        client_trust::install_accepted_live_verifier(scope, v2_inner.clone());
-
-        assert_eq!(
-            client_trust::capture(scope)
-                .expect("still armed")
-                .generation(),
-            generation_before,
-            "{:?}: pre-exposure install must not advance generation or the fence",
-            scope,
-        );
-        assert!(
-            v2_wrapper
-                .verify_client_cert(&pki.client_cert(), &[], UnixTime::now())
-                .is_err(),
-            "{:?}: a config built with V2 must consult live V2 and refuse the withdrawn cert \
-             before generation advances",
-            scope,
-        );
-        assert!(
-            !client_trust::live_peer_still_trusted(scope, &[pki.client_cert()]),
-            "{:?}: the post-handshake live check must also see V2 in the pre-generation window",
-            scope,
-        );
-        assert!(
-            !client_trust::armed_handshake_still_trusted(scope, Some(&[pki.client_cert()])),
-            "{:?}: armed admission must fail closed on the withdrawn cert before the fence moves",
-            scope,
-        );
-
-        // Stale V1 configs are conservative: they also consult live V2.
-        let v1_wrapper = client_trust::bind_live_handshake_verifier(
-            scope,
-            before
-                .verifier
-                .clone()
-                .expect("startup candidate installs a verifier"),
-        );
-        assert!(
-            v1_wrapper
-                .verify_client_cert(&pki.client_cert(), &[], UnixTime::now())
-                .is_err(),
-            "{:?}: a stale V1 config must refuse withdrawn credentials once V2 is live",
-            scope,
-        );
-
-        let withdrawn = client_trust::publish_accepted_candidate(
+        let exposed = std::sync::atomic::AtomicBool::new(false);
+        let withdrawn = client_trust::publish_accepted_rustls_candidate(
             scope,
             after.material.clone(),
-            after.verifier.clone(),
+            v2_inner.clone(),
+            || {
+                assert_eq!(
+                    client_trust::capture(scope)
+                        .expect("still armed")
+                        .generation(),
+                    generation_before,
+                    "{:?}: config exposure must happen before generation advances",
+                    scope,
+                );
+                assert!(
+                    v2_wrapper
+                        .verify_client_cert(&pki.client_cert(), &[], UnixTime::now())
+                        .is_err(),
+                    "{:?}: a config built with V2 must consult live V2 and refuse the withdrawn cert \
+                     before generation advances",
+                    scope,
+                );
+                assert!(
+                    !client_trust::live_peer_still_trusted(scope, &[pki.client_cert()]),
+                    "{:?}: the post-handshake live check must also see V2 in the pre-generation window",
+                    scope,
+                );
+                assert!(
+                    !client_trust::armed_handshake_still_trusted(scope, Some(&[pki.client_cert()])),
+                    "{:?}: armed admission must fail closed on the withdrawn cert before the fence moves",
+                    scope,
+                );
+                let v1_wrapper = client_trust::bind_live_handshake_verifier(
+                    scope,
+                    before
+                        .verifier
+                        .clone()
+                        .expect("startup candidate installs a verifier"),
+                );
+                assert!(
+                    v1_wrapper
+                        .verify_client_cert(&pki.client_cert(), &[], UnixTime::now())
+                        .is_err(),
+                    "{:?}: a stale V1 config must refuse withdrawn credentials once V2 is live",
+                    scope,
+                );
+                exposed.store(true, std::sync::atomic::Ordering::SeqCst);
+            },
+        );
+        assert!(
+            exposed.load(std::sync::atomic::Ordering::SeqCst),
+            "{:?}: expose_config must run inside the transaction",
+            scope,
         );
         assert!(
             withdrawn.withdrew(),
@@ -613,7 +615,7 @@ fn a_refused_candidate_never_replaces_the_live_verifier() {
         let generation_before = client_trust::capture(scope).expect("armed").generation();
 
         // Simulate a fallible later rebuild: record the refusal and do not
-        // call `install_accepted_live_verifier`.
+        // enter a rustls publication transaction.
         client_trust::record_rejected_candidate(scope);
 
         let would_be_v2 = client_trust::bind_live_handshake_verifier(scope, v2_inner.clone());
@@ -652,34 +654,42 @@ fn a_refused_candidate_never_replaces_the_live_verifier() {
     }
 }
 
-/// Pin the fail-closed rustls order in the reload surfaces: install live
-/// verifier, then expose config, then publish generation. A refused path
-/// records rejection without installing. DTLS keeps config-before-generation
-/// and must not grow a rustls live-verifier install.
+/// Pin the fail-closed rustls order in the reload surfaces: one transaction
+/// per scope installs the live verifier, exposes config, then publishes
+/// generation. A refused path records rejection without entering that
+/// transaction. DTLS keeps config-before-generation and must not grow a rustls
+/// live-verifier transaction.
 #[test]
 fn rustls_reload_surfaces_install_live_verifier_before_exposing_config() {
     let reload = include_str!("../../../src/tls/frontend_reload.rs");
+    assert!(
+        !reload.contains("install_accepted_live_verifier"),
+        "frontend rustls reload must not use the split install path"
+    );
     assert_source_order(
         reload,
         &[
-            "install_accepted_live_verifier",
-            "slot.store(Arc::new(Some(new_config)))",
-            "publish_accepted_candidate",
+            "publish_accepted_rustls_candidate",
+            "slot.store(Arc::new(Some(new_config.clone())))",
         ],
-        "frontend rustls reload: live verifier, then config swap, then publish",
+        "frontend rustls reload: live-verifier transaction exposes the config inside the callback",
     );
     let first_reject = reload
         .find("record_rejected_candidate")
         .expect("frontend reload records refused candidates");
-    let install = reload
-        .find("install_accepted_live_verifier")
-        .expect("frontend reload installs the live verifier");
+    let publish = reload
+        .find("publish_accepted_rustls_candidate")
+        .expect("frontend reload publishes through the rustls transaction");
     assert!(
-        first_reject < install,
-        "a fallible frontend reload must record rejection before any live-verifier install"
+        first_reject < publish,
+        "a fallible frontend reload must record rejection before any rustls transaction"
     );
 
     let h3 = include_str!("../../../src/http3/server.rs");
+    assert!(
+        !h3.contains("install_accepted_live_verifier"),
+        "H3 must not use the split install path"
+    );
     let reload_arm_start = h3
         .find("&reload_h3_config,")
         .expect("H3 reload arm rebuild");
@@ -687,14 +697,14 @@ fn rustls_reload_surfaces_install_live_verifier_before_exposing_config() {
     assert_source_order(
         reload_arm,
         &[
-            "install_accepted_live_verifier",
-            "endpoint.set_server_config(Some(server_config))",
-            "publish_accepted_candidate",
+            "publish_accepted_rustls_candidate",
+            "endpoint.set_server_config(Some(server_config.clone()))",
+            "adopted_quic.store",
         ],
-        "H3 rustls reload must install the live verifier, then adopt the config, then publish",
+        "H3 rustls reload must expose the exact candidate inside the rustls transaction",
     );
     let publish = reload_arm
-        .find("publish_accepted_candidate")
+        .find("publish_accepted_rustls_candidate")
         .expect("H3 reload publishes generation after adopt");
     let err_arm = reload_arm
         .find("record_rejected_candidate")
@@ -704,37 +714,56 @@ fn rustls_reload_surfaces_install_live_verifier_before_exposing_config() {
         "the H3 Ok arm must not install a verifier on the fallible Err path"
     );
 
-    let startup = include_str!("../../../src/modes/tls_reload.rs");
-    let proxy_fn = startup
+    let startup_h3 = h3
+        .find("pub async fn start_http3_listener_with_signal")
+        .expect("H3 startup");
+    let startup_h3_src = &h3[startup_h3..reload_arm_start];
+    assert_source_order(
+        startup_h3_src,
+        &[
+            "publish_accepted_rustls_candidate",
+            "endpoint.set_server_config(Some(server_config.clone()))",
+        ],
+        "H3 startup must expose the serving config inside the rustls transaction",
+    );
+
+    let modes = include_str!("../../../src/modes/tls_reload.rs");
+    assert!(
+        !modes.contains("install_accepted_live_verifier"),
+        "proxy/admin startup must not use the split install path"
+    );
+    let proxy_fn = modes
         .find("pub fn prepare_proxy_frontend_tls")
         .expect("proxy startup");
-    let admin_fn = startup
+    let admin_fn = modes
         .find("pub fn prepare_admin_frontend_tls")
         .expect("admin startup");
     assert!(proxy_fn < admin_fn);
     assert_source_order(
-        &startup[proxy_fn..admin_fn],
+        &modes[proxy_fn..admin_fn],
         &[
-            "install_accepted_live_verifier",
-            "let slot = frontend_tls_slot_with(tls_config)",
-            "publish_accepted_candidate",
+            "publish_accepted_rustls_candidate",
+            "slot.store(Arc::new(Some(tls_config.clone())))",
         ],
-        "proxy startup must install the live verifier, then expose the slot, then publish",
+        "proxy startup must expose the slot inside the rustls transaction",
     );
     assert_source_order(
-        &startup[admin_fn..],
+        &modes[admin_fn..],
         &[
-            "install_accepted_live_verifier",
-            "let slot = frontend_tls_slot_with(tls_config)",
-            "publish_accepted_candidate",
+            "publish_accepted_rustls_candidate",
+            "slot.store(Arc::new(Some(tls_config.clone())))",
         ],
-        "admin startup must install the live verifier, then expose the slot, then publish",
+        "admin startup must expose the slot inside the rustls transaction",
     );
 
     let dtls = include_str!("../../../src/proxy/stream_listener.rs");
     assert!(
         !dtls.contains("install_accepted_live_verifier"),
         "DTLS has no rustls live verifier and must not grow one"
+    );
+    assert!(
+        !dtls.contains("publish_accepted_rustls_candidate"),
+        "DTLS has no rustls live verifier and must not use the rustls transaction"
     );
     let dtls_fn = dtls
         .find("pub async fn publish_frontend_dtls_generation")
@@ -746,6 +775,87 @@ fn rustls_reload_surfaces_install_live_verifier_before_exposing_config() {
             "publish_accepted_material",
         ],
         "DTLS keeps config-before-generation ordering",
+    );
+}
+
+/// Two accepted rustls publishers racing on one scope cannot leave verifier,
+/// exposed config, and published material describing different candidates.
+#[test]
+fn concurrent_rustls_publishers_cannot_cross_wire_verifier_config_and_material() {
+    let _guard = isolated_registry();
+    let dir = tempfile::tempdir().expect("tempdir");
+    let pki = build_pki();
+
+    let startup_crls = parse_crls(&pki.crl_pem(&[UNRELATED_SERIAL], 1));
+    let v2 = load_candidate(dir.path(), &pki, &startup_crls).expect("V2 candidate");
+    let rotated_crls = parse_crls(&pki.crl_pem(&[UNRELATED_SERIAL, pki.client_serial], 2));
+    let v3 = load_candidate(dir.path(), &pki, &rotated_crls).expect("V3 candidate");
+    assert!(admits_client(&v2, &pki));
+    assert!(!admits_client(&v3, &pki));
+    let v2_verifier = v2.verifier.clone().expect("V2 verifier");
+    let v3_verifier = v3.verifier.clone().expect("V3 verifier");
+
+    let scope = ClientTrustScope::ProxyFrontend;
+    let exposed = std::sync::Arc::new(std::sync::atomic::AtomicU8::new(0));
+    let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+
+    let spawn = |id: u8,
+                 material: ClientTrustMaterial,
+                 verifier: std::sync::Arc<dyn ClientCertVerifier>,
+                 exposed: std::sync::Arc<std::sync::atomic::AtomicU8>,
+                 barrier: std::sync::Arc<std::sync::Barrier>| {
+        std::thread::spawn(move || {
+            barrier.wait();
+            client_trust::publish_accepted_rustls_candidate(scope, material, verifier, || {
+                exposed.store(id, std::sync::atomic::Ordering::SeqCst);
+            })
+        })
+    };
+
+    let handle_v2 = spawn(
+        2,
+        v2.material.clone(),
+        v2_verifier,
+        std::sync::Arc::clone(&exposed),
+        std::sync::Arc::clone(&barrier),
+    );
+    let handle_v3 = spawn(
+        3,
+        v3.material.clone(),
+        v3_verifier,
+        std::sync::Arc::clone(&exposed),
+        barrier,
+    );
+    handle_v2.join().expect("V2 publisher");
+    handle_v3.join().expect("V3 publisher");
+
+    let config_id = exposed.load(std::sync::atomic::Ordering::SeqCst);
+    let published = client_trust::current_material(scope).expect("armed");
+    let live_admits =
+        client_trust::live_peer_still_trusted(scope, &[pki.client_cert()]);
+    let is_v2 = published == v2.material;
+    let is_v3 = published == v3.material;
+    assert!(
+        is_v2 ^ is_v3,
+        "the published material must be exactly one of the two accepted candidates"
+    );
+    assert_eq!(
+        config_id == 2,
+        is_v2,
+        "exposed config id {config_id} must belong to the published material (v2={is_v2})"
+    );
+    assert_eq!(
+        config_id == 3,
+        is_v3,
+        "exposed config id {config_id} must belong to the published material (v3={is_v3})"
+    );
+    assert_eq!(
+        live_admits, is_v2,
+        "live verifier must admit the client iff the published material is V2, not a mix of V2/V3"
+    );
+    assert_eq!(
+        !live_admits, is_v3,
+        "live verifier must refuse the client iff the published material is V3"
     );
 }
 

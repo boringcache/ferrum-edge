@@ -32,8 +32,7 @@ use crate::tls::source::{CertSource, MaterialKind};
 use crate::tls::{
     self, AcceptedClientTrust, AcceptedFrontendTls, CrlList, FrontendTlsRebuildFn,
     FrontendTlsRebuilt, FrontendTlsReloadConfig, SharedAcceptedFrontendTls, SharedFrontendTls,
-    TlsPolicy, accepted_frontend_tls_slot_with, empty_frontend_tls_slot, frontend_tls_slot_with,
-    spawn_frontend_tls_reload_task,
+    TlsPolicy, empty_frontend_tls_slot, spawn_frontend_tls_reload_task,
 };
 
 /// Result of wiring the proxy frontend TLS live-reload path. When live reload
@@ -139,9 +138,9 @@ pub fn prepare_proxy_frontend_tls(
     };
 
     // Arm this listener family's client-trust generation from the material the
-    // caller's `tls_config` was ACTUALLY built from (issue #3857). The live
-    // verifier is installed before the slot is published; generation is
-    // published after. Until a scope is armed, `client_trust::capture` returns
+    // caller's `tls_config` was ACTUALLY built from (issue #3857). One rustls
+    // transaction installs the live verifier, exposes the slot, then publishes
+    // generation. Until a scope is armed, `client_trust::capture` returns
     // `None` and the accept paths pay nothing — which is exactly the default,
     // live-reload disabled posture. Arming here (rather than lazily on the first
     // reload) means the very first accepted connection already carries a
@@ -170,15 +169,6 @@ pub fn prepare_proxy_frontend_tls(
     // simply reloads without a trust generation.
     let client_trust_scopes = match startup_client_trust.as_ref() {
         Some(startup_client_trust) if startup_client_trust.verifier.is_some() => {
-            // Fallible startup load already succeeded. Install the live
-            // verifier before the slot is published so a handshake against
-            // this config cannot consult a missing/stale live object.
-            if let Some(verifier) = startup_client_trust.verifier.clone() {
-                client_trust::install_accepted_live_verifier(
-                    ClientTrustScope::ProxyFrontend,
-                    verifier,
-                );
-            }
             vec![ClientTrustScope::ProxyFrontend]
         }
         Some(_) => {
@@ -198,22 +188,41 @@ pub fn prepare_proxy_frontend_tls(
     // whose trust identity is unknown cannot form one, so the slot stays absent
     // and the H3 listener falls back to its own coherent load rather than
     // pairing a config with an identity that did not come from it.
-    let accepted_slot = startup_client_trust.as_ref().map(|client_trust| {
-        accepted_frontend_tls_slot_with(Arc::new(AcceptedFrontendTls {
-            config: tls_config.clone(),
-            client_trust: client_trust.clone(),
-        }))
+    let accepted_slot = startup_client_trust.as_ref().map(|_| {
+        Arc::new(arc_swap::ArcSwap::from_pointee(
+            None::<Arc<AcceptedFrontendTls>>,
+        ))
     });
 
-    let slot = frontend_tls_slot_with(tls_config);
+    let slot = empty_frontend_tls_slot();
     if let Some(startup_client_trust) = startup_client_trust.as_ref()
+        && let Some(verifier) = startup_client_trust.verifier.clone()
         && !client_trust_scopes.is_empty()
     {
-        client_trust::publish_accepted_candidate(
+        client_trust::publish_accepted_rustls_candidate(
             ClientTrustScope::ProxyFrontend,
             startup_client_trust.material.clone(),
-            startup_client_trust.verifier.clone(),
+            verifier,
+            || {
+                if let Some(accepted_slot) = accepted_slot.as_ref() {
+                    accepted_slot.store(Arc::new(Some(Arc::new(AcceptedFrontendTls {
+                        config: tls_config.clone(),
+                        client_trust: startup_client_trust.clone(),
+                    }))));
+                }
+                slot.store(Arc::new(Some(tls_config.clone())));
+            },
         );
+    } else {
+        if let Some(accepted_slot) = accepted_slot.as_ref()
+            && let Some(startup_client_trust) = startup_client_trust.as_ref()
+        {
+            accepted_slot.store(Arc::new(Some(Arc::new(AcceptedFrontendTls {
+                config: tls_config.clone(),
+                client_trust: startup_client_trust.clone(),
+            }))));
+        }
+        slot.store(Arc::new(Some(tls_config.clone())));
     }
     let (revision_tx, revision_rx) = watch::channel(0u64);
     let interval = material_set_poll_interval(
@@ -423,12 +432,6 @@ pub fn prepare_admin_frontend_tls(
     // no withdrawable client credential and must stay unarmed.
     let client_trust_scopes = match startup_client_trust.as_ref() {
         Some(startup_client_trust) if startup_client_trust.verifier.is_some() => {
-            if let Some(verifier) = startup_client_trust.verifier.clone() {
-                client_trust::install_accepted_live_verifier(
-                    ClientTrustScope::AdminHttps,
-                    verifier,
-                );
-            }
             vec![ClientTrustScope::AdminHttps]
         }
         Some(_) => {
@@ -445,15 +448,21 @@ pub fn prepare_admin_frontend_tls(
         }
     };
 
-    let slot = frontend_tls_slot_with(tls_config);
+    let slot = empty_frontend_tls_slot();
     if let Some(startup_client_trust) = startup_client_trust.as_ref()
+        && let Some(verifier) = startup_client_trust.verifier.clone()
         && !client_trust_scopes.is_empty()
     {
-        client_trust::publish_accepted_candidate(
+        client_trust::publish_accepted_rustls_candidate(
             ClientTrustScope::AdminHttps,
             startup_client_trust.material.clone(),
-            startup_client_trust.verifier.clone(),
+            verifier,
+            || {
+                slot.store(Arc::new(Some(tls_config.clone())));
+            },
         );
+    } else {
+        slot.store(Arc::new(Some(tls_config.clone())));
     }
     let (revision_tx, _revision_rx) = watch::channel(0u64);
     let interval = material_set_poll_interval(
@@ -533,14 +542,6 @@ fn build_admin_rebuild_fn(
             client_trust: Some(candidate.client_trust),
         })
     })
-}
-
-/// Suppress unused-`empty_frontend_tls_slot` lint when none of the modes
-/// touch it in this file.  The slot is exported from `tls::frontend_reload`
-/// and used elsewhere; this stub keeps the import honest.
-#[allow(dead_code)]
-fn _ensure_slot_import_is_live() -> SharedFrontendTls {
-    empty_frontend_tls_slot()
 }
 
 /// Build the H3-listener-side reload subscription from the proxy reload

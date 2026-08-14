@@ -69,6 +69,15 @@ fn generate_ca(cn: &str) -> TestCa {
 }
 
 fn crl_pem(ca: &TestCa, serials: &[u64], crl_number: u64) -> String {
+    crl_pem_with_key_id(ca, serials, crl_number, rcgen::KeyIdMethod::Sha256)
+}
+
+fn crl_pem_with_key_id(
+    ca: &TestCa,
+    serials: &[u64],
+    crl_number: u64,
+    key_identifier_method: rcgen::KeyIdMethod,
+) -> String {
     let now = time::OffsetDateTime::now_utc();
     let revoked_certs = serials
         .iter()
@@ -85,7 +94,7 @@ fn crl_pem(ca: &TestCa, serials: &[u64], crl_number: u64) -> String {
         crl_number: SerialNumber::from(crl_number),
         issuing_distribution_point: None,
         revoked_certs,
-        key_identifier_method: rcgen::KeyIdMethod::Sha256,
+        key_identifier_method,
     }
     .signed_by(&ca.issuer)
     .expect("sign CRL")
@@ -240,6 +249,113 @@ fn revocations_are_scoped_by_issuer_not_by_bare_serial() {
         after.withdrawal_relative_to(&before),
         Some(ClientTrustRetirementReason::CrlChanged),
         "the same serial under a different issuer is a distinct revocation"
+    );
+}
+
+#[test]
+fn revocations_are_scoped_by_signer_key_not_by_issuer_dn() {
+    // Two distinct CA keys that share a subject DN and revoke the same leaf
+    // serial. Hashing issuer DN || serial would collide and suppress the
+    // second key's withdrawal.
+    let ca_a = generate_ca("Shared CA Name");
+    let ca_b = generate_ca("Shared CA Name");
+    let before = material(
+        &[&ca_a.cert_pem, &ca_b.cert_pem],
+        &[&crl_pem(&ca_a, &[7], 1)],
+    );
+    let after = material(
+        &[&ca_a.cert_pem, &ca_b.cert_pem],
+        &[&crl_pem(&ca_a, &[7], 2), &crl_pem(&ca_b, &[7], 1)],
+    );
+
+    assert_ne!(
+        before, after,
+        "the same serial under a second key that shares the issuer DN is a distinct revocation"
+    );
+    assert_eq!(
+        after.withdrawal_relative_to(&before),
+        Some(ClientTrustRetirementReason::CrlChanged),
+        "adding the second issuer's revocation must be observed as a withdrawal"
+    );
+}
+
+#[test]
+fn a_same_signer_crl_reissue_stays_semantically_unchanged() {
+    let ca = generate_ca("trust-ca");
+    let first = material(&[&ca.cert_pem], &[&crl_pem(&ca, &[7], 1)]);
+    let reissued = material(&[&ca.cert_pem], &[&crl_pem(&ca, &[7], 2)]);
+    assert_eq!(first, reissued);
+    assert_eq!(reissued.withdrawal_relative_to(&first), None);
+}
+
+#[test]
+fn identical_signer_spkis_in_the_bundle_are_deduplicated() {
+    let ca = generate_ca("trust-ca");
+    let duplicated = format!("{}{}", ca.cert_pem, ca.cert_pem);
+    let first = material(&[&duplicated], &[&crl_pem(&ca, &[7], 1)]);
+    let reissued = material(&[&duplicated], &[&crl_pem(&ca, &[7], 2)]);
+    assert_eq!(
+        first, reissued,
+        "repeating the same CA key in the bundle must not make a routine reissue look like a change"
+    );
+}
+
+#[test]
+fn a_crl_whose_signer_is_not_in_the_bundle_uses_aki_when_unambiguous() {
+    let trusted = generate_ca("trusted-ca");
+    let unknown = generate_ca("unknown-ca");
+    let first = material(&[&trusted.cert_pem], &[&crl_pem(&unknown, &[7], 1)]);
+    let reissued = material(&[&trusted.cert_pem], &[&crl_pem(&unknown, &[7], 2)]);
+    assert_eq!(
+        first, reissued,
+        "an AKI-identified signer not in the bundle must still treat a same-set reissue as unchanged"
+    );
+
+    let other_unknown = generate_ca("other-unknown-ca");
+    let with_second = material(
+        &[&trusted.cert_pem],
+        &[
+            &crl_pem(&unknown, &[7], 3),
+            &crl_pem(&other_unknown, &[7], 1),
+        ],
+    );
+    assert_eq!(
+        with_second.withdrawal_relative_to(&first),
+        Some(ClientTrustRetirementReason::CrlChanged),
+        "a second unknown signer revoking the same serial is a distinct key-bound revocation"
+    );
+}
+
+#[test]
+fn a_crl_with_no_identifiable_issuer_key_is_refused() {
+    let trusted = generate_ca("trusted-ca");
+    let unknown = generate_ca("unknown-ca");
+    let empty_aki = crl_pem_with_key_id(
+        &unknown,
+        &[7],
+        1,
+        rcgen::KeyIdMethod::PreSpecified(Vec::new()),
+    );
+    assert!(
+        ClientTrustMaterial::from_parts(
+            Some(trusted.cert_pem.as_bytes()),
+            &parse_crls(&empty_aki)
+        )
+        .is_err(),
+        "a CRL whose signer is not in the bundle and whose AKI is empty must fail closed"
+    );
+}
+
+#[test]
+fn a_crl_with_trailing_der_is_refused() {
+    let ca = generate_ca("trust-ca");
+    let mut trailing = parse_crls(&crl_pem(&ca, &[7], 1));
+    let mut der = trailing.remove(0).as_ref().to_vec();
+    der.push(0x00);
+    let broken = vec![CertificateRevocationListDer::from(der)];
+    assert!(
+        ClientTrustMaterial::from_parts(Some(ca.cert_pem.as_bytes()), &broken).is_err(),
+        "trailing unconsumed CRL DER must fail closed"
     );
 }
 
