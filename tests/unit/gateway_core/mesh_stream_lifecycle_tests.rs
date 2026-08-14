@@ -1617,11 +1617,7 @@ async fn an_older_read_of_the_same_token_does_not_churn_generation() {
         }
     );
     assert_eq!(
-        admit_stock_credential_observation_for_test(
-            &watch,
-            first.epoch(),
-            first.observed_state(),
-        ),
+        admit_stock_credential_observation_for_test(&watch, first.epoch(), first.observed_state(),),
         Ok(generation)
     );
 }
@@ -1640,18 +1636,11 @@ async fn an_older_valid_read_cannot_bind_a_stream_after_a_newer_valid_observatio
     let newer = source.observe().await;
 
     let watch = StockCredentialWatch::new(StockCredentialState::Unknown);
-    let opened = admit_stock_credential_observation_for_test(
-        &watch,
-        newer.epoch(),
-        newer.observed_state(),
-    )
-    .expect("the newest valid observation is admitted");
+    let opened =
+        admit_stock_credential_observation_for_test(&watch, newer.epoch(), newer.observed_state())
+            .expect("the newest valid observation is admitted");
     assert_eq!(
-        admit_stock_credential_observation_for_test(
-            &watch,
-            older.epoch(),
-            older.observed_state(),
-        ),
+        admit_stock_credential_observation_for_test(&watch, older.epoch(), older.observed_state(),),
         Err(MeshStreamRetirement::CredentialRotated)
     );
     assert_eq!(watch.latest().generation, opened);
@@ -1672,18 +1661,11 @@ async fn an_older_valid_read_cannot_bind_a_stream_after_a_newer_invalid_observat
     let newer = source.observe().await;
 
     let watch = StockCredentialWatch::new(StockCredentialState::Unknown);
-    let opened = admit_stock_credential_observation_for_test(
-        &watch,
-        newer.epoch(),
-        newer.observed_state(),
-    )
-    .expect("the newest invalid observation is admitted");
+    let opened =
+        admit_stock_credential_observation_for_test(&watch, newer.epoch(), newer.observed_state())
+            .expect("the newest invalid observation is admitted");
     assert_eq!(
-        admit_stock_credential_observation_for_test(
-            &watch,
-            older.epoch(),
-            older.observed_state(),
-        ),
+        admit_stock_credential_observation_for_test(&watch, older.epoch(), older.observed_state(),),
         Err(MeshStreamRetirement::CredentialSourceInvalid)
     );
     assert_eq!(watch.latest().generation, opened);

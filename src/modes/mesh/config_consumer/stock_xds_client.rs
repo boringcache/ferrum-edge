@@ -1196,24 +1196,21 @@ async fn connect_stock_ads(
     // result or bind a fence to that stale generation.
     let read = config.credential.observe().await;
     let observed = read.observed_state();
-    let generation = match admit_stock_credential_observation(
-        credential_watch,
-        read.epoch(),
-        observed,
-    ) {
-        Ok(generation) => {
-            // Mark our own publication seen so the live stream does not treat
-            // it as a rotation on its very first poll.
-            let _ = credential_rx.borrow_and_update();
-            tracker.set_credential(observed.health());
-            generation
-        }
-        Err(retirement) => {
-            let _ = credential_rx.borrow_and_update();
-            tracker.set_credential(credential_watch.latest().state.health());
-            return StockAttemptOutcome::local(retirement);
-        }
-    };
+    let generation =
+        match admit_stock_credential_observation(credential_watch, read.epoch(), observed) {
+            Ok(generation) => {
+                // Mark our own publication seen so the live stream does not treat
+                // it as a rotation on its very first poll.
+                let _ = credential_rx.borrow_and_update();
+                tracker.set_credential(observed.health());
+                generation
+            }
+            Err(retirement) => {
+                let _ = credential_rx.borrow_and_update();
+                tracker.set_credential(credential_watch.latest().state.health());
+                return StockAttemptOutcome::local(retirement);
+            }
+        };
     let credential = match read.into_outcome() {
         Ok(credential) => credential,
         Err(reason) => {
