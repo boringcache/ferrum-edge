@@ -291,6 +291,17 @@ controlled `run:` steps only measure the restored directory and move the
 BuildKit local export. Workflows stay `permissions: contents: read`. Static
 checks live in `.github/scripts/verify_ci_runtime_cache.py`.
 
+`node-waypoint-ebpf-live.yml` path-filtered `pull_request.paths` must be a
+**trigger superset** of every `production-dockerfile-smoke` sensitive input in
+`.github/scripts/ci_runtime_plan.py` (for example `src/**`, `vendor/**`,
+`custom_plugins/**`, `.cargo/**`, and `rust-toolchain.toml`). If a valid Docker
+build input changes but the workflow never starts, the trusted planner cannot
+force the production-image gate. Required aggregate jobs (`Production Dockerfile
+eBPF image smoke`, `FIPS Build & Test`) use an **exact-boolean contract**: skip
+only on `relevant == 'false'`, run expensive jobs only on `relevant == 'true'`,
+and fail closed when planning succeeds but the output is blank or malformed
+(neither exact `true` nor exact `false`).
+
 ## CI Pipeline (ci.yml)
 
 The CI workflow is triggered by every pull request, every merge-queue
@@ -608,7 +619,11 @@ the shared-types test runs on stable Rust.
 **Runs**: `ubuntu-24.04`
 
 `node-waypoint-ebpf-live` runs on PRs that touch eBPF, node-agent, NodeWaypoint
-identity, netns capture, socket option, TCP scope, chart, or live harness files.
+identity, netns capture, socket option, TCP scope, chart, live harness files, or
+any production-Dockerfile build input (`src/**`, `vendor/**`,
+`custom_plugins/**`, `.cargo/**`, `rust-toolchain.toml`, and the other planner
+sensitive paths). Its `pull_request.paths` trigger is a superset of those
+planner inputs so production-image changes always reach the trusted planner.
 It builds the normal runtime Docker image from the host-built binary, builds the
 eBPF userspace binary with `FEATURES=cloud-secrets,ebpf`, builds the
 `ferrum-ebpf` BPF ELF with nightly Rust, and packages the `:<tag>-ebpf` runtime

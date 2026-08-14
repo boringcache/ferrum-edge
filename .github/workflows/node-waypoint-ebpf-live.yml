@@ -13,6 +13,7 @@ on:
       - ".dockerignore"
       - ".github/actions/package-ferrum-runtime-image/**"
       - ".github/actions/setup-kubernetes-tools/**"
+      - ".cargo/**"
       - "Cargo.toml"
       - "Cargo.lock"
       - "Dockerfile"
@@ -23,26 +24,12 @@ on:
       - ".github/scripts/ci_runtime_telemetry.py"
       - ".github/scripts/verify_ci_runtime_cache.py"
       - "build.rs"
+      - "rust-toolchain.toml"
       - "proto/**"
+      - "vendor/**"
+      - "src/**"
+      - "custom_plugins/**"
       - "ebpf/**"
-      - "src/capture/**"
-      - "src/ebpf/**"
-      - "src/grpc/**"
-      - "src/identity/**"
-      - "src/k8s_controller/**"
-      - "src/modes/control_plane.rs"
-      - "src/modes/mesh/**"
-      - "src/modes/node_agent.rs"
-      - "src/plugins/mesh/**"
-      - "src/plugins/prometheus_metrics.rs"
-      - "src/proxy/hbone_pool.rs"
-      - "src/proxy/mesh_tcp_egress.rs"
-      - "src/proxy/mod.rs"
-      - "src/proxy/hbone_proxy.rs"
-      - "src/proxy/netns_capture.rs"
-      - "src/proxy/tcp_proxy.rs"
-      - "src/router_cache.rs"
-      - "src/socket_opts.rs"
       - "charts/ferrum-mesh/**"
       - "tests/k8s/lib/**"
       - "tests/k8s/node_waypoint_ebpf_live/**"
@@ -624,8 +611,12 @@ jobs:
         if: needs.production-dockerfile-plan.result != 'success'
         run: exit 1
 
+      - name: Fail when production-image planner output is unusable
+        if: needs.production-dockerfile-plan.result == 'success' && needs.production-dockerfile-plan.outputs.relevant != 'true' && needs.production-dockerfile-plan.outputs.relevant != 'false'
+        run: exit 1
+
       - name: Skip production-image smoke for unrelated changes
-        if: needs.production-dockerfile-plan.outputs.relevant != 'true'
+        if: needs.production-dockerfile-plan.outputs.relevant == 'false'
         run: |
           {
             echo "## Production Dockerfile eBPF image smoke"

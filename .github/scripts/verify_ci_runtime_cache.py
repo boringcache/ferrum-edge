@@ -16,7 +16,7 @@ import re
 import sys
 from pathlib import Path
 
-from ci_runtime_plan import self_test as plan_self_test
+from ci_runtime_plan import SUITE_PATTERNS, self_test as plan_self_test
 from ci_runtime_telemetry import self_test as telemetry_self_test
 
 
@@ -50,6 +50,159 @@ USES = re.compile(
 PINNED_REMOTE = re.compile(
     r"^(?P<name>(?!\./)[^@\s]+)@(?P<pin>[0-9a-f]{40})$"
 )
+
+
+def extract_pull_request_paths(workflow: str) -> list[str]:
+    match = re.search(
+        r"(?ms)^  pull_request:\n    paths:\n(?P<paths>(?:      - .+\n)+)",
+        workflow,
+    )
+    if match is None:
+        return []
+    paths: list[str] = []
+    for line in match.group("paths").splitlines():
+        stripped = line.strip()
+        if stripped.startswith("- "):
+            paths.append(stripped[2:].strip().strip('"').strip("'"))
+    return paths
+
+
+def gh_path_filter_matches(filter_pattern: str, file_path: str) -> bool:
+    pattern = filter_pattern.strip().lstrip("/")
+    path = file_path.strip().lstrip("/")
+    if pattern.endswith("/**"):
+        prefix = pattern[:-3]
+        return path == prefix or path.startswith(prefix + "/")
+    if pattern.endswith("**"):
+        prefix = pattern[:-2]
+        return path == prefix or path.startswith(prefix)
+    if "**" in pattern or "*" in pattern:
+        escaped = re.escape(pattern).replace(r"\*\*", ".*").replace(r"\*", "[^/]*")
+        return re.fullmatch(escaped, path) is not None
+    return path == pattern
+
+
+def production_dockerfile_probe_paths() -> list[str]:
+    probes: list[str] = []
+    for pattern in SUITE_PATTERNS["production-dockerfile-smoke"]:
+        if pattern == r"^Dockerfile$":
+            probes.append("Dockerfile")
+        elif pattern == r"^\.dockerignore$":
+            probes.append(".dockerignore")
+        elif pattern == r"^Cargo\.(toml|lock)$":
+            probes.extend(["Cargo.toml", "Cargo.lock"])
+        elif pattern == r"^rust-toolchain\.toml$":
+            probes.append("rust-toolchain.toml")
+        elif pattern == r"^\.cargo/":
+            probes.append(".cargo/config.toml")
+        elif pattern == r"^vendor/":
+            probes.append("vendor/foo/lib.rs")
+        elif pattern == r"^build\.rs$":
+            probes.append("build.rs")
+        elif pattern == r"^proto/":
+            probes.append("proto/ferrum.proto")
+        elif pattern == r"^src/":
+            probes.append("src/main.rs")
+        elif pattern == r"^custom_plugins/":
+            probes.append("custom_plugins/foo.rs")
+        elif pattern == r"^ebpf/":
+            probes.append("ebpf/src/lib.rs")
+        elif pattern == r"^\.github/scripts/stage_iproute2_runtime\.sh$":
+            probes.append(".github/scripts/stage_iproute2_runtime.sh")
+        elif pattern == r"^\.github/workflows/node-waypoint-ebpf-live\.yml$":
+            probes.append(".github/workflows/node-waypoint-ebpf-live.yml")
+        elif pattern == r"^\.github/scripts/ci_runtime_plan\.py$":
+            probes.append(".github/scripts/ci_runtime_plan.py")
+        elif pattern == r"^\.github/scripts/ci_runtime_telemetry\.py$":
+            probes.append(".github/scripts/ci_runtime_telemetry.py")
+        elif pattern == r"^\.github/scripts/verify_ci_runtime_cache\.py$":
+            probes.append(".github/scripts/verify_ci_runtime_cache.py")
+        else:
+            probes.append(f"unmapped-production-pattern:{pattern}")
+    return probes
+
+
+def check_production_trigger_superset(
+    workflow: str,
+    source: str,
+    failures: list[str],
+) -> None:
+    trigger_paths = extract_pull_request_paths(workflow)
+    require(
+        bool(trigger_paths),
+        f"{source} must declare pull_request.paths so production-image changes "
+        "can reach the trusted planner",
+        failures,
+    )
+    uncovered: list[str] = []
+    for probe in production_dockerfile_probe_paths():
+        if probe.startswith("unmapped-production-pattern:"):
+            failures.append(
+                f"{source} verifier must map every production-dockerfile-smoke "
+                f"planner pattern ({probe[26:]})"
+            )
+            continue
+        if not any(
+            gh_path_filter_matches(trigger, probe) for trigger in trigger_paths
+        ):
+            uncovered.append(probe)
+    require(
+        not uncovered,
+        f"{source} pull_request.paths must be a superset of production-dockerfile-smoke "
+        f"sensitive inputs; uncovered probes: {', '.join(uncovered)}",
+        failures,
+    )
+
+
+def check_aggregate_planner_contract(
+    aggregate_body: str,
+    planner_job: str,
+    source: str,
+    failures: list[str],
+) -> None:
+    planner_result = f"needs.{planner_job}.result"
+    planner_relevant = f"needs.{planner_job}.outputs.relevant"
+    skip_match = re.search(
+        r"(?ms)- name: Skip[^\n]*\n\s+if:\s*(.+)",
+        aggregate_body,
+    )
+    require(
+        skip_match is not None,
+        f"{source} aggregate must declare a skip step",
+        failures,
+    )
+    if skip_match is not None:
+        skip_if = skip_match.group(1).strip()
+        require(
+            skip_if == f"{planner_relevant} == 'false'",
+            f"{source} aggregate skip must use exact {planner_relevant} == 'false', "
+            f"found: {skip_if}",
+            failures,
+        )
+        require(
+            "!= 'true'" not in skip_if,
+            f"{source} aggregate skip must not use != 'true'",
+            failures,
+        )
+    require(
+        f"{planner_result} != 'success'" in aggregate_body,
+        f"{source} aggregate must fail when planning fails",
+        failures,
+    )
+    require(
+        f"{planner_result} == 'success'" in aggregate_body
+        and f"{planner_relevant} != 'true'" in aggregate_body
+        and f"{planner_relevant} != 'false'" in aggregate_body,
+        f"{source} aggregate must fail closed when planner output is neither "
+        "exact true nor exact false",
+        failures,
+    )
+    require(
+        f"{planner_relevant} == 'true'" in aggregate_body,
+        f"{source} aggregate must gate expensive jobs on exact "
+        f"{planner_relevant} == 'true'",
+        failures,
+    )
 
 
 def require(condition: bool, message: str, failures: list[str]) -> None:
@@ -732,6 +885,12 @@ def check_fips(workflow: str, failures: list[str]) -> None:
         "FIPS Build & Test aggregate must run with if: always()",
         failures,
     )
+    check_aggregate_planner_contract(
+        aggregate,
+        "fips-plan",
+        "FIPS Build & Test",
+        failures,
+    )
     require(
         RUST_CACHE in workflow,
         "FIPS workflow must pin Swatinem/rust-cache",
@@ -917,6 +1076,17 @@ def check_production_smoke(workflow: str, failures: list[str]) -> None:
         "production-image aggregate must run with if: always()",
         failures,
     )
+    check_aggregate_planner_contract(
+        aggregate,
+        "production-dockerfile-plan",
+        "Production Dockerfile eBPF image smoke",
+        failures,
+    )
+    check_production_trigger_superset(
+        workflow,
+        "node-waypoint-ebpf-live.yml",
+        failures,
+    )
     require(
         "python3 -I" in workflow and "ci_runtime_plan.py" in workflow,
         "production-image planner must execute an isolated trusted-base copy",
@@ -1024,6 +1194,16 @@ def check_docs_and_coverage(failures: list[str]) -> None:
     require(
         "--name-only --no-renames -z" in ci_cd or "NUL-delimited" in ci_cd,
         "docs/ci_cd.md must document NUL-delimited trusted path planning",
+        failures,
+    )
+    require(
+        "pull_request.paths" in ci_cd or "trigger superset" in ci_cd.lower(),
+        "docs/ci_cd.md must document production-image trigger superset over planner inputs",
+        failures,
+    )
+    require(
+        "relevant == 'false'" in ci_cd or "exact false" in ci_cd.lower(),
+        "docs/ci_cd.md must document exact-boolean aggregate planner gating",
         failures,
     )
     require(
@@ -1554,6 +1734,144 @@ def self_test() -> int:
         any("must not use line-delimited git diff --name-only" in item for item in line_diff_failures)
         and any("must not pass pathname bytes through sort" in item for item in line_diff_failures),
         "self-test: line-delimited git diff --name-only must fail",
+        failures,
+    )
+
+    incomplete_trigger = (
+        "name: demo\n"
+        "on:\n"
+        "  pull_request:\n"
+        "    paths:\n"
+        "      - Dockerfile\n"
+        "      - Cargo.toml\n"
+    )
+    incomplete_trigger_failures: list[str] = []
+    check_production_trigger_superset(
+        incomplete_trigger,
+        "self-test-incomplete-trigger",
+        incomplete_trigger_failures,
+    )
+    require(
+        any("must be a superset of production-dockerfile-smoke" in item for item in incomplete_trigger_failures),
+        "self-test: incomplete pull_request.paths must fail trigger superset check",
+        failures,
+    )
+
+    good_trigger = (
+        "name: demo\n"
+        "on:\n"
+        "  pull_request:\n"
+        "    paths:\n"
+        "      - Dockerfile\n"
+        "      - .dockerignore\n"
+        "      - Cargo.toml\n"
+        "      - Cargo.lock\n"
+        "      - rust-toolchain.toml\n"
+        "      - .cargo/**\n"
+        "      - vendor/**\n"
+        "      - build.rs\n"
+        "      - proto/**\n"
+        "      - src/**\n"
+        "      - custom_plugins/**\n"
+        "      - ebpf/**\n"
+        "      - .github/scripts/stage_iproute2_runtime.sh\n"
+        "      - .github/workflows/node-waypoint-ebpf-live.yml\n"
+        "      - .github/scripts/ci_runtime_plan.py\n"
+        "      - .github/scripts/ci_runtime_telemetry.py\n"
+        "      - .github/scripts/verify_ci_runtime_cache.py\n"
+    )
+    good_trigger_failures: list[str] = []
+    check_production_trigger_superset(
+        good_trigger,
+        "self-test-good-trigger",
+        good_trigger_failures,
+    )
+    require(
+        not good_trigger_failures,
+        "self-test: complete production trigger superset should pass: "
+        + "; ".join(good_trigger_failures),
+        failures,
+    )
+
+    loose_skip_aggregate = (
+        "    steps:\n"
+        "      - name: Fail when production-image planning fails\n"
+        "        if: needs.production-dockerfile-plan.result != 'success'\n"
+        "        run: exit 1\n"
+        "      - name: Skip production-image smoke for unrelated changes\n"
+        "        if: needs.production-dockerfile-plan.outputs.relevant != 'true'\n"
+        "        run: echo skip\n"
+        "      - name: Fail when the ordinary production image did not succeed\n"
+        "        if: needs.production-dockerfile-plan.outputs.relevant == 'true'\n"
+        "        run: exit 1\n"
+    )
+    loose_skip_failures: list[str] = []
+    check_aggregate_planner_contract(
+        loose_skip_aggregate,
+        "production-dockerfile-plan",
+        "self-test-loose-skip",
+        loose_skip_failures,
+    )
+    require(
+        any("skip must use exact" in item for item in loose_skip_failures)
+        or any("skip must not use != 'true'" in item for item in loose_skip_failures),
+        "self-test: aggregate skip on != 'true' must fail",
+        failures,
+    )
+
+    good_aggregate = (
+        "    steps:\n"
+        "      - name: Fail when production-image planning fails\n"
+        "        if: needs.production-dockerfile-plan.result != 'success'\n"
+        "        run: exit 1\n"
+        "      - name: Fail when production-image planner output is unusable\n"
+        "        if: needs.production-dockerfile-plan.result == 'success' && "
+        "needs.production-dockerfile-plan.outputs.relevant != 'true' && "
+        "needs.production-dockerfile-plan.outputs.relevant != 'false'\n"
+        "        run: exit 1\n"
+        "      - name: Skip production-image smoke for unrelated changes\n"
+        "        if: needs.production-dockerfile-plan.outputs.relevant == 'false'\n"
+        "        run: echo skip\n"
+        "      - name: Fail when the ordinary production image did not succeed\n"
+        "        if: needs.production-dockerfile-plan.outputs.relevant == 'true'\n"
+        "        run: exit 1\n"
+    )
+    good_aggregate_failures: list[str] = []
+    check_aggregate_planner_contract(
+        good_aggregate,
+        "production-dockerfile-plan",
+        "self-test-good-aggregate",
+        good_aggregate_failures,
+    )
+    require(
+        not good_aggregate_failures,
+        "self-test: exact-boolean aggregate contract should pass: "
+        + "; ".join(good_aggregate_failures),
+        failures,
+    )
+
+    missing_unusable_aggregate = (
+        "    steps:\n"
+        "      - name: Fail when production-image planning fails\n"
+        "        if: needs.production-dockerfile-plan.result != 'success'\n"
+        "        run: exit 1\n"
+        "      - name: Skip production-image smoke for unrelated changes\n"
+        "        if: needs.production-dockerfile-plan.outputs.relevant == 'false'\n"
+        "        run: echo skip\n"
+        "      - name: Fail when the ordinary production image did not succeed\n"
+        "        if: needs.production-dockerfile-plan.outputs.relevant == 'true'\n"
+        "        run: exit 1\n"
+    )
+    missing_unusable_failures: list[str] = []
+    check_aggregate_planner_contract(
+        missing_unusable_aggregate,
+        "production-dockerfile-plan",
+        "self-test-missing-unusable",
+        missing_unusable_failures,
+    )
+    require(
+        any("fail closed when planner output is neither" in item for item in missing_unusable_failures),
+        "self-test: aggregate without unusable-output guard must fail",
         failures,
     )
 

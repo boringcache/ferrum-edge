@@ -514,8 +514,12 @@ jobs:
         if: needs.fips-plan.result != 'success'
         run: exit 1
 
+      - name: Fail when FIPS planner output is unusable
+        if: needs.fips-plan.result == 'success' && needs.fips-plan.outputs.relevant != 'true' && needs.fips-plan.outputs.relevant != 'false'
+        run: exit 1
+
       - name: Skip expensive FIPS compile for unrelated changes
-        if: needs.fips-plan.outputs.relevant != 'true'
+        if: needs.fips-plan.outputs.relevant == 'false'
         run: |
           {
             echo "## FIPS Build & Test"
