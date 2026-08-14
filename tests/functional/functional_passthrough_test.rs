@@ -171,6 +171,7 @@ fn mint_observability_token() -> String {
 /// 1. `Child::try_wait` around every probe — a dead child voids the attempt.
 /// 2. Authenticated `/health` detail tier for this attempt's bearer token with
 ///    `ready: true`.
+///
 /// No synthetic stream-port connection is made here: passthrough listeners
 /// treat every accepted socket as real traffic, so such a probe can dial the
 /// configured backend and corrupt backend-accept assertions. Authenticated
