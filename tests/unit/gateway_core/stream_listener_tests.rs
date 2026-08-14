@@ -2756,11 +2756,7 @@ fn node_waypoint_udp_proxy(port: u16) -> Proxy {
     node_waypoint_udp_proxy_named("dns", port)
 }
 
-fn nw_udp_destination_route(
-    ip: &str,
-    port: u16,
-    service: &str,
-) -> NodeWaypointUdpDestinationRoute {
+fn nw_udp_destination_route(ip: &str, port: u16, service: &str) -> NodeWaypointUdpDestinationRoute {
     let namespace = ferrum_edge::config::types::default_namespace();
     NodeWaypointUdpDestinationRoute::new(
         ip.parse().expect("destination ip"),
