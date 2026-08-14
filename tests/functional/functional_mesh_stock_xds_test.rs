@@ -1627,10 +1627,12 @@ async fn functional_mesh_stock_xds_live_datapath_matrix() {
         observed.cluster_restored.describe("restored-cluster probe")
     );
 
-    // Phase 8 — capability refusals ACK with a field-specific diagnostic and
-    // leave the accepted service serving. Semantic coverage that RBAC / weighted
-    // routes contribute no listener or virtual host lives in the unit suite;
-    // this phase does not claim a live widening proof for a never-dialable host.
+    // Phase 8 — capability refusals ACK with a closed-set reason and leave the
+    // accepted service serving. Field details are control-plane-authored bytes
+    // and must not reach gateway logs: a malicious ADS server can copy the
+    // bearer into them. Semantic coverage that RBAC / weighted routes contribute
+    // no listener or virtual host lives in the unit suite; this phase does not
+    // claim a live widening proof for a never-dialable host.
     assert!(
         !observed.lds_nacked,
         "a well-formed listener carrying an unsupported enforcement filter is a CAPABILITY \
@@ -1642,13 +1644,20 @@ async fn functional_mesh_stock_xds_live_datapath_matrix() {
          not a structural NACK\n{logs}"
     );
     assert!(
-        logs.contains("unsupported_http_filter") && logs.contains("envoy.filters.http.rbac"),
-        "the enforcement-filter refusal must name the offending filter field\n{logs}"
+        logs.contains("unsupported_http_filter"),
+        "the enforcement-filter refusal must expose its closed reason code\n{logs}"
     );
     assert!(
-        logs.contains("unsupported_route_action")
-            && logs.contains("routes[].route.weighted_clusters"),
-        "the traffic-shaping refusal must name the offending route field\n{logs}"
+        !logs.contains("envoy.filters.http.rbac"),
+        "the enforcement-filter refusal must not log control-plane-authored detail\n{logs}"
+    );
+    assert!(
+        logs.contains("unsupported_route_action"),
+        "the traffic-shaping refusal must expose its closed reason code\n{logs}"
+    );
+    assert!(
+        !logs.contains("routes[].route.weighted_clusters"),
+        "the traffic-shaping refusal must not log control-plane-authored detail\n{logs}"
     );
     assert!(
         observed
