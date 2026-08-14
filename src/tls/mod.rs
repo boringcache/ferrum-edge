@@ -1160,7 +1160,10 @@ pub(crate) fn finish_frontend_server_config(
 ///
 /// Both halves are derived from the exact client-CA bytes this call loaded and
 /// verified, together with the exact CRL list compiled into the verifier — the
-/// only point where they are known to belong to one accepted generation. The
+/// only point where they are known to belong to one accepted generation. When
+/// no verifier is constructed (`no_verify`, or no client-CA source), the
+/// captured identity is the empty/unarmed one regardless of any globally loaded
+/// CRL list: those CRLs are not compiled into a verifier on this listener. The
 /// captured verifier is the inner WebPki object handed to
 /// `client_trust_out`. When `handshake_scope` is set, the returned
 /// `ServerConfig` installs a live wrapper around that object so a stale
@@ -1247,13 +1250,14 @@ pub(crate) fn finish_frontend_server_config_capturing_trust(
     let client_auth_enforced = client_cert_verifier.is_some();
 
     if let Some(out) = client_trust_out {
-        // `no_verify` disables client authentication outright, so no transport
-        // on this listener can hold a client-certificate trust decision and the
-        // identity is the empty one — which, being a subset of everything, can
-        // never be read as a withdrawal.
-        let material = if no_verify {
-            client_trust::ClientTrustMaterial::default()
-        } else {
+        // Unarmed when `no_verify` is set or no client-CA source was configured:
+        // no transport on this listener can hold a client-certificate trust
+        // decision. Global CRLs then have nothing to bind to — summarizing them
+        // would fail closed on missing signers, or publish revocation identity
+        // the handshake never enforces. The empty identity is a subset of
+        // everything and cannot be read as a withdrawal. Only an actually
+        // constructed verifier may summarize its exact client-CA bytes and CRLs.
+        let material = if client_auth_enforced {
             client_trust::ClientTrustMaterial::from_parts(
                 client_ca_material
                     .as_ref()
@@ -1261,6 +1265,8 @@ pub(crate) fn finish_frontend_server_config_capturing_trust(
                 crls,
             )
             .map_err(|error| anyhow::anyhow!("{error}"))?
+        } else {
+            client_trust::ClientTrustMaterial::default()
         };
         *out = Some(AcceptedClientTrust {
             verifier: client_cert_verifier.clone(),

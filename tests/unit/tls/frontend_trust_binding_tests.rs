@@ -37,7 +37,7 @@ use ferrum_edge::tls::{
     AcceptedClientTrust, AcceptedFrontendTls, ClientTrustMaterial, CrlList, TlsPolicy,
     load_frontend_tls_candidate_from_paths,
 };
-use rustls::pki_types::{CertificateDer, UnixTime};
+use rustls::pki_types::{CertificateDer, CertificateRevocationListDer, UnixTime};
 use rustls::server::danger::ClientCertVerifier;
 
 // The trust registry is process-global and `reset_for_test` clears every scope,
@@ -971,6 +971,83 @@ fn assert_source_order(source: &str, needles: &[&str], message: &str) {
             None => panic!("{message}: missing `{needle}` after prior step"),
         }
     }
+}
+
+/// A listener with no client-CA source installs no verifier, so a globally
+/// loaded CRL list is irrelevant: it must not reject the candidate, and the
+/// captured identity must stay empty rather than summarizing CRLs no handshake
+/// will enforce. The same CRL list remains fail-closed once a client CA is
+/// configured.
+#[test]
+fn no_client_ca_listener_accepts_unrelated_crls_as_an_unarmed_candidate() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let pki = build_pki();
+    let crls = parse_crls(&pki.crl_pem(&[UNRELATED_SERIAL], 1));
+    assert!(
+        !crls.is_empty(),
+        "the globally loaded CRL list under test must be non-empty"
+    );
+
+    let cert_path = dir.path().join("server-cert.pem");
+    let key_path = dir.path().join("server-key.pem");
+    std::fs::write(&cert_path, pki.server_cert_pem.as_bytes()).expect("write server cert");
+    std::fs::write(&key_path, pki.server_key_pem.as_bytes()).expect("write server key");
+
+    let unarmed = load_frontend_tls_candidate_from_paths(
+        cert_path.to_str().expect("utf8 cert path"),
+        key_path.to_str().expect("utf8 key path"),
+        None,
+        None,
+        false,
+        &tls_policy(),
+        30,
+        &crls,
+        None,
+    )
+    .expect("no-client-CA listener must accept a global CRL list");
+    assert!(
+        unarmed.client_trust.verifier.is_none(),
+        "a listener with no client CA must install no client-certificate verifier"
+    );
+    assert_eq!(
+        unarmed.client_trust.material,
+        ClientTrustMaterial::default(),
+        "unarmed identity must stay empty rather than publishing CRLs no verifier enforces"
+    );
+    if let Ok(leaked) = ClientTrustMaterial::from_parts(None, &crls) {
+        assert_ne!(
+            unarmed.client_trust.material, leaked,
+            "summarizing CRLs without a client-CA signer must not become the captured identity"
+        );
+    }
+
+    // The same CRLs with a configured client CA still compile into the verifier
+    // and the captured identity — the armed path is not weakened.
+    let armed = load_candidate(dir.path(), &pki, &crls).expect("armed candidate");
+    assert!(
+        armed.verifier.is_some(),
+        "a configured client CA must still construct a verifier"
+    );
+    assert_eq!(
+        armed.material,
+        ClientTrustMaterial::from_parts(Some(pki.ca_pem.as_bytes()), &crls)
+            .expect("summarize armed material"),
+        "an armed candidate must still summarize the exact client-CA bytes and CRLs"
+    );
+    assert!(
+        admits_client(&armed, &pki),
+        "an unrelated CRL must not revoke the client under the configured CA"
+    );
+
+    // Malformed CRLs still fail closed when client authentication is armed.
+    let mut truncated = crls[0].as_ref().to_vec();
+    truncated.truncate(truncated.len() / 2);
+    let broken: CrlList =
+        std::sync::Arc::new(vec![CertificateRevocationListDer::from(truncated)]);
+    assert!(
+        load_candidate(dir.path(), &pki, &broken).is_err(),
+        "a configured client CA must still refuse unverifiable CRL material"
+    );
 }
 
 /// A malformed later candidate never produces an `AcceptedClientTrust`, so the
