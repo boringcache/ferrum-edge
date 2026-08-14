@@ -1,13 +1,18 @@
 #[test]
-fn h3_native_mesh_refusal_screens_plain_and_grpc_before_dispatch() {
+fn h3_native_forces_mesh_onto_bridge_and_refuses_unix_before_dispatch() {
     let src = include_str!("../../../src/http3/server.rs");
+    assert!(
+        src.contains("target_requires_http_mesh_egress")
+            && src.contains("&& !mesh_egress_required"),
+        "native H3 pool selection must force mesh-tagged targets onto the bridge (issue #3620)"
+    );
     let native_gate = src
         .find("let native_h3_direct_dispatch = use_native_h3_pool || use_native_h3_grpc;")
         .expect("native H3 direct-dispatch gate must remain explicit");
     let after_gate = &src[native_gate..];
     let refusal = after_gate
-        .find("direct_network_http_transport_refusal(")
-        .expect("native H3 dispatch must screen network-only transport refusal");
+        .find("h3_bridge_transport_refusal(")
+        .expect("native H3 dispatch must screen Unix-only bridge refusal");
     let native_grpc = after_gate
         .find("if use_native_h3_grpc")
         .expect("native H3 gRPC dispatch branch must remain present");
@@ -17,24 +22,152 @@ fn h3_native_mesh_refusal_screens_plain_and_grpc_before_dispatch() {
 
     assert!(
         refusal < native_grpc,
-        "mesh- or Unix-transport-tagged gRPC targets must fail closed before native H3 gRPC dispatch can dial the QUIC pool"
+        "Unix-transport-tagged gRPC targets must fail closed before native H3 gRPC dispatch can dial the QUIC pool"
     );
     assert!(
         refusal < native_plain_bridge_bypass,
-        "mesh- or Unix-transport-tagged plain targets must fail closed before native H3 plain dispatch can bypass the bridge"
+        "Unix-transport-tagged plain targets must fail closed before native H3 plain dispatch can bypass the bridge"
     );
 
     let dispatch_src = include_str!("../../../src/proxy/backend_dispatch.rs");
-    let helper = dispatch_src
-        .split("pub(crate) fn direct_network_http_transport_refusal(")
-        .nth(1)
-        .expect("network-only transport refusal helper must remain present")
-        .split("/// Select an upstream target")
-        .next()
-        .expect("network-only transport refusal helper boundary must remain present");
     assert!(
-        helper.contains("direct_http_mesh_transport_refusal(target)"),
-        "the stronger network-only refusal must retain the secured mesh-transport screen"
+        dispatch_src.contains("pub(crate) fn h3_bridge_transport_refusal(")
+            && dispatch_src.contains("pub(crate) fn h3_dispatch_target_eligible("),
+        "issue #3620 helpers for H3 bridge Unix refusal and retry eligibility must remain present"
+    );
+}
+
+#[test]
+fn h3_plain_bridge_dispatches_mesh_through_shared_pools() {
+    let source = include_str!("../../../src/http3/cross_protocol.rs");
+    let plain = source
+        .split("async fn dispatch_plain<S>(")
+        .nth(1)
+        .expect("H3→HTTP plain dispatcher must remain present")
+        .split("async fn dispatch_grpc<S>(")
+        .next()
+        .expect("H3→HTTP plain dispatcher must remain bounded");
+    assert!(
+        plain.contains("run_plain_attempt_local_policy_or_reject("),
+        "every plain attempt must pass through the local transport-policy gate"
+    );
+    assert!(
+        source.contains("async fn run_plain_attempt_local_policy_or_reject")
+            && source.contains("h3_bridge_transport_refusal(current_target)"),
+        "the shared per-attempt policy gate must refuse Unix targets, not all mesh tags"
+    );
+    assert!(
+        plain.contains("proxy_h3_plain_http_mesh_buffered("),
+        "mesh-tagged plain attempts must dial through the shared mesh helper"
+    );
+    assert!(
+        plain.contains("select_next_cross_protocol_retry_target("),
+        "mixed-upstream retry rotation must go through the shared cross-protocol selector"
+    );
+    let retry_selector = source
+        .split("fn select_next_cross_protocol_retry_target(")
+        .nth(1)
+        .expect("cross-protocol retry selector must remain present")
+        .split("async fn resolve_cross_protocol_backend_ip(")
+        .next()
+        .expect("bounded cross-protocol retry selector");
+    assert!(
+        retry_selector.contains("select_next_h3_eligible_retry_target("),
+        "mixed-upstream retry rotation must filter H3-ineligible candidates via the shared helper"
+    );
+    assert!(
+        plain.contains("target_requires_http_mesh_egress"),
+        "streaming mesh uploads must force-buffer for replayable mesh dispatch"
+    );
+    assert!(
+        plain.contains("run_after_proxy_hooks("),
+        "mesh terminal writes must still run after_proxy (issue #3620)"
+    );
+}
+
+#[test]
+fn h3_plain_mesh_upload_collection_releases_half_open_probe_before_terminal_write() {
+    let source = include_str!("../../../src/http3/cross_protocol.rs");
+    let plain = source
+        .split("async fn dispatch_plain<S>(")
+        .nth(1)
+        .expect("H3→HTTP plain dispatcher must remain present")
+        .split("async fn dispatch_grpc<S>(")
+        .next()
+        .expect("H3→HTTP plain dispatcher must remain bounded");
+    let mesh_block_start = plain
+        .find("target_requires_http_mesh_egress")
+        .expect("mesh force-buffer gate must remain present");
+    let mesh_block = &plain[mesh_block_start..];
+    let mesh_block_end = mesh_block
+        .find("let (response, bytes_sent, mut backend_admission_permits")
+        .expect("mesh force-buffer block must remain bounded");
+    let mesh_collection = &mesh_block[..mesh_block_end];
+
+    assert!(
+        mesh_collection.contains("collect_h3_request_body_with_deadline("),
+        "mesh uploads must force-collect via collect_h3_request_body_with_deadline"
+    );
+    assert_eq!(
+        mesh_collection
+            .matches("release_cross_protocol_circuit_breaker_probe_on_admission_reject(")
+            .count(),
+        3,
+        "mesh upload collection must release the HALF_OPEN probe on each terminal reject branch"
+    );
+
+    let oversize = mesh_collection
+        .split("Ok(None)")
+        .nth(1)
+        .expect("missing mesh collection branch: Ok(None)")
+        .split("H3RequestBodyReadError::DeadlineExceeded")
+        .next()
+        .expect("bounded mesh collection Ok(None) branch");
+    let oversize_release = oversize
+        .find("release_cross_protocol_circuit_breaker_probe_on_admission_reject(")
+        .expect("Ok(None) must release HALF_OPEN probe");
+    let oversize_write = oversize
+        .find("write_plain_gateway_error(")
+        .expect("Ok(None) must write plain gateway error");
+    assert!(
+        oversize_release < oversize_write,
+        "Ok(None) must release probe before terminal write"
+    );
+
+    let deadline = mesh_collection
+        .split("H3RequestBodyReadError::DeadlineExceeded")
+        .nth(1)
+        .expect("missing mesh collection branch: DeadlineExceeded")
+        .split("H3RequestBodyReadError::TimedOut")
+        .next()
+        .expect("bounded mesh collection DeadlineExceeded branch");
+    let deadline_release = deadline
+        .find("release_cross_protocol_circuit_breaker_probe_on_admission_reject(")
+        .expect("DeadlineExceeded must release HALF_OPEN probe");
+    let deadline_write = deadline
+        .find("write_plain_grpc_web_client_deadline(")
+        .expect("DeadlineExceeded must write gRPC-Web deadline response");
+    assert!(
+        deadline_release < deadline_write,
+        "DeadlineExceeded must release probe before terminal write"
+    );
+
+    let timeout = mesh_collection
+        .split("H3RequestBodyReadError::TimedOut")
+        .nth(1)
+        .expect("missing mesh collection branch: TimedOut/Read")
+        .split("} else {")
+        .next()
+        .expect("bounded mesh collection TimedOut/Read branch");
+    let timeout_release = timeout
+        .find("release_cross_protocol_circuit_breaker_probe_on_admission_reject(")
+        .expect("TimedOut/Read must release HALF_OPEN probe");
+    let timeout_write = timeout
+        .find("write_plain_gateway_error(")
+        .expect("TimedOut/Read must write plain gateway error");
+    assert!(
+        timeout_release < timeout_write,
+        "TimedOut/Read must release probe before terminal write"
     );
 }
 

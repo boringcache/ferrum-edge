@@ -650,3 +650,49 @@ fn unix_websocket_upgrade_timeout_source_uses_post_wire_variant() {
         "contract is anchored on the tungstenite upgrade helper"
     );
 }
+
+// ── Ambient HBONE WebSocket establishment timeout (issue #3620) ─────────
+//
+// `client_async_with_config` flushes the RFC 6455 upgrade before waiting for
+// 101. The remaining-budget timeout after that write is post-wire.
+// `HbonePoolError::ConnectStream` maps through `classify_boxed_setup_error`
+// to reached-wire `ProtocolError`, so `retry_on_connect_failure` must not
+// replay it. An unknown outer tunnel-phase timeout uses the same class.
+
+#[test]
+fn boxed_hbone_websocket_inner_handshake_timeout_is_reached_wire() {
+    let err: Box<dyn std::error::Error + Send + Sync> = Box::new(HbonePoolError::ConnectStream {
+        authority: "hbone-websocket".to_string(),
+        message: "timed out waiting for HBONE WebSocket inner handshake response".to_string(),
+    });
+    let class = classify_boxed_setup_error(err.as_ref());
+    assert_eq!(class, ErrorClass::ProtocolError);
+    assert!(
+        request_reached_wire(class),
+        "inner handshake timeout is post-wire: the upgrade may already have \
+         reached the application"
+    );
+    let display = err.to_string();
+    assert!(
+        !display.contains("spiffe")
+            && !display.contains("://")
+            && !display.contains("15008")
+            && !display.contains("127.0.0.1"),
+        "timeout display must not echo identities, URLs, or dial metadata: {display}"
+    );
+}
+
+#[test]
+fn boxed_hbone_websocket_unknown_tunnel_timeout_is_reached_wire() {
+    let err: Box<dyn std::error::Error + Send + Sync> = Box::new(HbonePoolError::ConnectStream {
+        authority: "hbone-websocket".to_string(),
+        message: "timed out waiting for HBONE WebSocket tunnel acquisition".to_string(),
+    });
+    let class = classify_boxed_setup_error(err.as_ref());
+    assert_eq!(class, ErrorClass::ProtocolError);
+    assert!(
+        request_reached_wire(class),
+        "an unknown tunnel-phase timeout must fail closed as reached-wire \
+         rather than retry a possibly-sent CONNECT"
+    );
+}

@@ -95,6 +95,7 @@ mod mesh_ext_authz_custom_tests;
 mod mesh_federation_poller_tests;
 mod mesh_file_source_tests;
 mod mesh_grpc_transport_tests;
+mod mesh_h3_plain_ws_bridge_tests;
 mod mesh_hbone_tests;
 // Keep host UDP capture coverage on the existing trusted mesh-platform shard:
 // its filter matches this module-name prefix without changing CI workflow code.
