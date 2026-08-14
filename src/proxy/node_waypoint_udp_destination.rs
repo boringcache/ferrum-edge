@@ -146,6 +146,10 @@ pub enum NodeWaypointUdpDestinationRefusal {
     UnknownDestination,
     /// The listener currently owns no routes (withdrawn generation).
     NoRoutes,
+    /// The destination still exists, but a different namespaced Service now
+    /// owns it. An established session admitted for the previous owner must
+    /// stop before either direction can emit another datagram.
+    OwnerChanged,
 }
 
 impl NodeWaypointUdpDestinationRefusal {
@@ -155,6 +159,7 @@ impl NodeWaypointUdpDestinationRefusal {
             Self::MissingLocalDestination => "missing_local_destination",
             Self::UnknownDestination => "unknown_destination",
             Self::NoRoutes => "no_routes",
+            Self::OwnerChanged => "owner_changed",
         }
     }
 }
@@ -349,6 +354,43 @@ impl NodeWaypointUdpDestinationRouter {
         }
     }
 
+    /// Revalidate the immutable destination + namespaced owner pinned by an
+    /// established session against the current complete table.
+    ///
+    /// Table membership can change without rebinding the shared listener. A
+    /// session therefore cannot treat its admission-time route as a lifetime
+    /// capability: removal and reownership must fence both late client
+    /// forwards and unsolicited backend replies. Equivalent republication of
+    /// the same namespaced owner remains valid even though the route `Arc` is
+    /// new.
+    #[inline]
+    pub fn revalidate_owner(
+        &self,
+        destination: IpAddr,
+        owner: &NamespacedResourceId,
+    ) -> Result<u64, (NodeWaypointUdpDestinationRefusal, u64)> {
+        let table = self.table.load();
+        if table.routes.is_empty() {
+            return Err((
+                NodeWaypointUdpDestinationRefusal::NoRoutes,
+                table.generation,
+            ));
+        }
+        let Some(route) = table.routes.get(&canonical_destination_ip(destination)) else {
+            return Err((
+                NodeWaypointUdpDestinationRefusal::UnknownDestination,
+                table.generation,
+            ));
+        };
+        if route.proxy.as_ref() != owner {
+            return Err((
+                NodeWaypointUdpDestinationRefusal::OwnerChanged,
+                table.generation,
+            ));
+        }
+        Ok(table.generation)
+    }
+
     /// Rate-limited refusal warn (first, then every 100th). Carries only the
     /// listener port, the closed reason, and a counter — never a Service name,
     /// a client address, or a registry-supplied value.
@@ -363,6 +405,28 @@ impl NodeWaypointUdpDestinationRouter {
                 "Refused a NodeWaypoint UDP datagram with no exact Service destination route; \
                  nothing is forwarded and no session, backend socket or policy context is \
                  allocated for it"
+            );
+        }
+    }
+
+    /// Rate-limited retirement warning for an already-admitted session whose
+    /// exact destination ownership is no longer current. Kept separate from
+    /// [`Self::warn_refusal`] so diagnostics never claim that no session was
+    /// allocated when a live session is being fenced.
+    pub fn warn_session_refusal(
+        &self,
+        proxy_id: &str,
+        refusal: NodeWaypointUdpDestinationRefusal,
+    ) {
+        let n = self.refusals.fetch_add(1, Ordering::Relaxed) + 1;
+        if n == 1 || n.is_multiple_of(100) {
+            warn!(
+                proxy_id = %proxy_id,
+                listen_port = self.listen_port,
+                reason = refusal.as_str(),
+                refusals = n,
+                "Retired a NodeWaypoint UDP session whose exact Service destination ownership \
+                 is no longer current; no further client forward or backend reply is emitted"
             );
         }
     }

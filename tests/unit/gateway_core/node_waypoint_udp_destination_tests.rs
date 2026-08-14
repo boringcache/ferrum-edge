@@ -430,6 +430,84 @@ fn equivalent_owner_identity_survives_route_table_republication() {
     );
 }
 
+/// Established sessions are not lifetime capabilities. The current table must
+/// still name their exact destination owner before either direction emits a
+/// datagram; removal or reownership retires the old session, while an
+/// equivalent republication remains valid.
+#[test]
+fn established_destination_owner_is_revalidated_across_publications() {
+    let router = NodeWaypointUdpDestinationRouter::new(5353);
+    let destination = ip("10.96.0.10");
+    let owner_a = NamespacedResourceId::new(
+        "team-a",
+        "__mesh-nw-udp-team-a-dns-a-5353",
+    );
+    let owner_b = NamespacedResourceId::new(
+        "team-b",
+        "__mesh-nw-udp-team-b-dns-b-5353",
+    );
+
+    router
+        .publish(vec![route_in(
+            "team-a",
+            "10.96.0.10",
+            5353,
+            "__mesh-nw-udp-team-a-dns-a-5353",
+        )])
+        .expect("owner A publishes");
+    assert!(router.revalidate_owner(destination, &owner_a).is_ok());
+
+    router
+        .publish(vec![route_in(
+            "team-a",
+            "10.96.0.10",
+            5353,
+            "__mesh-nw-udp-team-a-dns-a-5353",
+        )])
+        .expect("equivalent owner republishes");
+    assert!(
+        router.revalidate_owner(destination, &owner_a).is_ok(),
+        "equivalent namespaced ownership must keep the session valid"
+    );
+
+    router
+        .publish(vec![route_in(
+            "team-b",
+            "10.96.0.10",
+            5353,
+            "__mesh-nw-udp-team-b-dns-b-5353",
+        )])
+        .expect("owner B replaces A");
+    let (refusal, _) = router
+        .revalidate_owner(destination, &owner_a)
+        .expect_err("reownership must retire owner A's session");
+    assert_eq!(refusal, NodeWaypointUdpDestinationRefusal::OwnerChanged);
+    assert_eq!(refusal.as_str(), "owner_changed");
+    assert!(router.revalidate_owner(destination, &owner_b).is_ok());
+
+    router
+        .publish(vec![route_in(
+            "team-c",
+            "10.96.0.11",
+            5353,
+            "__mesh-nw-udp-team-c-dns-c-5353",
+        )])
+        .expect("an unrelated route replaces the destination");
+    let (refusal, _) = router
+        .revalidate_owner(destination, &owner_b)
+        .expect_err("destination removal must retire owner B's session");
+    assert_eq!(
+        refusal,
+        NodeWaypointUdpDestinationRefusal::UnknownDestination
+    );
+
+    router.retract();
+    let (refusal, _) = router
+        .revalidate_owner(destination, &owner_b)
+        .expect_err("route withdrawal must retire owner B's session");
+    assert_eq!(refusal, NodeWaypointUdpDestinationRefusal::NoRoutes);
+}
+
 /// Namespace is part of owner identity: the same proxy id in two namespaces
 /// must never share a session, pending, or last-client key.
 #[test]

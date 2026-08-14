@@ -233,6 +233,11 @@ struct UdpSession {
     /// is disabled, unsupported, or the first datagram did not carry a cmsg
     /// (e.g., it came through tokio's cmsg-less `recv_from`).
     local_addr: std::sync::OnceLock<crate::socket_opts::PktinfoLocal>,
+    /// Exact Service destination ownership pinned at admission for a shared
+    /// NodeWaypoint listener. The router republishes in place, so every late
+    /// client forward and backend reply revalidates this capability against
+    /// the current table before emitting traffic.
+    node_waypoint_destination: Option<NodeWaypointUdpSessionDestination>,
     /// NodeWaypoint source-workload attribution pinned at admission (issue
     /// #3286). `None` only for non-NodeWaypoint listeners. NodeWaypoint sessions
     /// retain state even when mesh-wide-only policy admits an unattributable
@@ -337,6 +342,32 @@ struct NodeWaypointUdpSessionSource {
         Option<crate::proxy::node_waypoint_udp_identity::NodeWaypointUdpSourceRefusal>,
 }
 
+/// Destination evidence pinned by an admitted shared-listener UDP session.
+/// Unlike the source-workload fence, this is absent on ordinary listeners and
+/// on the single-claimant direct-node-address boundary.
+#[derive(Clone)]
+struct NodeWaypointUdpSessionDestination {
+    router:
+        Arc<crate::proxy::node_waypoint_udp_destination::NodeWaypointUdpDestinationRouter>,
+    destination: IpAddr,
+    owner: Arc<NamespacedResourceId>,
+}
+
+impl NodeWaypointUdpSessionDestination {
+    #[inline]
+    fn revalidate(
+        &self,
+    ) -> Result<
+        (),
+        crate::proxy::node_waypoint_udp_destination::NodeWaypointUdpDestinationRefusal,
+    > {
+        self.router
+            .revalidate_owner(self.destination, self.owner.as_ref())
+            .map(|_| ())
+            .map_err(|(refusal, _)| refusal)
+    }
+}
+
 impl NodeWaypointUdpSessionSource {
     fn revalidate(
         &self,
@@ -408,6 +439,28 @@ impl NodeWaypointUdpSessionSource {
 }
 
 impl UdpSession {
+    /// Revalidate destination ownership and retire this session fail-closed on
+    /// removal or reownership. The reply task remains the identity-aware map
+    /// remover and accounting owner; flag + wake prevents any further send.
+    fn revalidate_destination(&self) -> Result<(), anyhow::Error> {
+        let Some(destination) = self.node_waypoint_destination.as_ref() else {
+            return Ok(());
+        };
+        if let Err(refusal) = destination.revalidate() {
+            destination
+                .router
+                .warn_session_refusal(&self.proxy_id, refusal);
+            self.expired.store(true, Ordering::Release);
+            signal_udp_reply_task_stop(&self.stop_reply_task, self.stop_notify.as_ref());
+            self.close_hook_ingress();
+            return Err(anyhow::anyhow!(
+                "NodeWaypoint UDP destination ownership no longer valid ({})",
+                refusal.as_str()
+            ));
+        }
+        Ok(())
+    }
+
     fn release_overload_guard(&self) {
         let mut guard = self
             .overload_guard
@@ -843,6 +896,13 @@ fn spawn_session_hook_ingress_worker(
                 .load(std::sync::atomic::Ordering::Acquire)
                 || session.expired.load(std::sync::atomic::Ordering::Acquire)
             {
+                break;
+            }
+
+            // Route membership republishes without restarting the shared
+            // listener. Do not run plugin side effects for a destination whose
+            // exact namespaced owner has already been removed or replaced.
+            if session.revalidate_destination().is_err() {
                 break;
             }
 
@@ -3298,6 +3358,7 @@ async fn process_datagram(
             Arc::clone(overload),
             Arc::clone(mesh_outbound_enforcement),
             node_waypoint_udp_source.cloned(),
+            destinations.cloned(),
             max_sessions,
             session_key,
         );
@@ -3428,6 +3489,9 @@ fn spawn_new_session_datagram(
     node_waypoint_udp_source: Option<
         crate::proxy::node_waypoint_udp_identity::NodeWaypointUdpSourceScoping,
     >,
+    node_waypoint_udp_destinations: Option<
+        Arc<crate::proxy::node_waypoint_udp_destination::NodeWaypointUdpDestinationRouter>,
+    >,
     max_sessions: usize,
     session_key: UdpSessionKey,
 ) {
@@ -3469,6 +3533,7 @@ fn spawn_new_session_datagram(
             &overload,
             &mesh_outbound_enforcement,
             node_waypoint_udp_source.as_ref(),
+            node_waypoint_udp_destinations,
             max_sessions,
             session_key,
             gate,
@@ -3540,6 +3605,9 @@ async fn process_new_session_datagram(
     node_waypoint_udp_source: Option<
         &crate::proxy::node_waypoint_udp_identity::NodeWaypointUdpSourceScoping,
     >,
+    node_waypoint_udp_destinations: Option<
+        Arc<crate::proxy::node_waypoint_udp_destination::NodeWaypointUdpDestinationRouter>,
+    >,
     max_sessions: usize,
     session_key: UdpSessionKey,
     mut gate: PendingSessionGate,
@@ -3548,6 +3616,25 @@ async fn process_new_session_datagram(
     if sessions.contains_key(&session_key) {
         return Ok(());
     }
+    let node_waypoint_destination = match (
+        node_waypoint_udp_destinations,
+        session_key.destination,
+        session_key.destination_owner.as_ref(),
+    ) {
+        (None, None, None) => None,
+        (Some(router), Some(destination), Some(owner)) => {
+            Some(NodeWaypointUdpSessionDestination {
+                router,
+                destination,
+                owner: Arc::clone(owner),
+            })
+        }
+        _ => {
+            return Err(anyhow::anyhow!(
+                "invalid NodeWaypoint UDP destination ownership state"
+            ));
+        }
+    };
 
     let epoch = request_epoch.load();
     let view = resolve_udp_session_epoch_view(
@@ -3621,6 +3708,20 @@ async fn process_new_session_datagram(
     )
     .await?;
 
+    // Stream admission may await external plugins. Do not run datagram hooks
+    // for a Service route that was removed or reowned during that interval.
+    if let Some(destination) = node_waypoint_destination.as_ref()
+        && let Err(refusal) = destination.revalidate()
+    {
+        destination
+            .router
+            .warn_refusal(view.proxy.id.as_str(), refusal);
+        return Err(anyhow::anyhow!(
+            "NodeWaypoint UDP destination ownership changed during stream admission ({})",
+            refusal.as_str()
+        ));
+    }
+
     // Bind the flow's datagram hooks to the decisions the admission chain just
     // memoized. Evaluated once here; every datagram of this session — starting
     // with this one — consumes the resulting list without re-evaluating a
@@ -3669,6 +3770,17 @@ async fn process_new_session_datagram(
             refusal.as_str()
         ));
     }
+    if let Some(destination) = node_waypoint_destination.as_ref()
+        && let Err(refusal) = destination.revalidate()
+    {
+        destination
+            .router
+            .warn_refusal(view.proxy.id.as_str(), refusal);
+        return Err(anyhow::anyhow!(
+            "NodeWaypoint UDP destination ownership changed while first-datagram policy hooks ran ({})",
+            refusal.as_str()
+        ));
+    }
 
     let mut reservation = reserve_udp_session_slot(metrics, max_sessions)?;
 
@@ -3698,6 +3810,7 @@ async fn process_new_session_datagram(
         admitted_datagram_plugins,
         stream_ctx,
         node_waypoint_session_source,
+        node_waypoint_destination,
     )
     .await?;
     reservation.disarm();
@@ -3847,6 +3960,11 @@ async fn forward_client_datagram_to_backend(
     session: &Arc<UdpSession>,
     data: &[u8],
 ) -> Result<(), anyhow::Error> {
+    // A shared listener stays bound while its Service routes republish. The
+    // admission-time route is not a lifetime capability: fail closed before
+    // every backend side effect if this destination was removed or reowned.
+    session.revalidate_destination()?;
+
     // Publish the response budget before the send. In particular, a loopback
     // backend can receive and answer between the send syscall and this task
     // being polled again; publishing only after send completion lets that first
@@ -5457,6 +5575,7 @@ async fn create_session(
     admitted_datagram_plugins: Arc<[Arc<dyn Plugin>]>,
     mut stream_ctx: StreamConnectionContext,
     node_waypoint_source: Option<NodeWaypointUdpSessionSource>,
+    node_waypoint_destination: Option<NodeWaypointUdpSessionDestination>,
 ) -> Result<Arc<UdpSession>, anyhow::Error> {
     let UdpSessionEpochView {
         proxy,
@@ -5652,6 +5771,15 @@ async fn create_session(
             refusal.as_str()
         ));
     }
+    if let Some(destination) = node_waypoint_destination.as_ref()
+        && let Err(refusal) = destination.revalidate()
+    {
+        destination.router.warn_refusal(proxy_id, refusal);
+        return Err(anyhow::anyhow!(
+            "NodeWaypoint UDP destination ownership changed during session setup ({})",
+            refusal.as_str()
+        ));
+    }
 
     let now = coarse_epoch_millis();
     let connected_wall_at = chrono::Utc::now();
@@ -5704,6 +5832,7 @@ async fn create_session(
         plugin_trigger_decisions: stream_ctx.plugin_trigger_decisions(),
         correlation_ids,
         local_addr: std::sync::OnceLock::new(),
+        node_waypoint_destination,
         node_waypoint_source,
         plugins: Arc::clone(&plugins),
         datagram_plugins: Arc::clone(&datagram_plugins),
@@ -5936,6 +6065,15 @@ async fn create_session(
                 ));
                 break;
             }
+            if let Err(error) = reply_session.revalidate_destination() {
+                disconnect_error = Some((
+                    error.to_string(),
+                    crate::retry::ErrorClass::DispatchPolicyRejected,
+                    crate::plugins::DisconnectCause::RecvError,
+                    crate::plugins::Direction::BackendToClient,
+                ));
+                break;
+            }
 
             // Amplification factor check: drop backend responses that exceed
             // the remaining per-request byte budget (cumulative across replies).
@@ -5992,6 +6130,15 @@ async fn create_session(
                          ran ({})",
                         refusal.as_str()
                     ),
+                    crate::retry::ErrorClass::DispatchPolicyRejected,
+                    crate::plugins::DisconnectCause::RecvError,
+                    crate::plugins::Direction::BackendToClient,
+                ));
+                break;
+            }
+            if let Err(error) = reply_session.revalidate_destination() {
+                disconnect_error = Some((
+                    error.to_string(),
                     crate::retry::ErrorClass::DispatchPolicyRejected,
                     crate::plugins::DisconnectCause::RecvError,
                     crate::plugins::Direction::BackendToClient,
@@ -6104,6 +6251,15 @@ async fn create_session(
                                 ));
                                 break 'reply;
                             }
+                            if let Err(error) = reply_session.revalidate_destination() {
+                                disconnect_error = Some((
+                                    error.to_string(),
+                                    crate::retry::ErrorClass::DispatchPolicyRejected,
+                                    crate::plugins::DisconnectCause::RecvError,
+                                    crate::plugins::Direction::BackendToClient,
+                                ));
+                                break 'reply;
+                            }
                             // Amplification check on batched response datagram
                             if !admit_udp_response(
                                 &reply_session.response_budget_remaining,
@@ -6159,6 +6315,15 @@ async fn create_session(
                                          response policy hooks ran ({})",
                                         refusal.as_str()
                                     ),
+                                    crate::retry::ErrorClass::DispatchPolicyRejected,
+                                    crate::plugins::DisconnectCause::RecvError,
+                                    crate::plugins::Direction::BackendToClient,
+                                ));
+                                break 'reply;
+                            }
+                            if let Err(error) = reply_session.revalidate_destination() {
+                                disconnect_error = Some((
+                                    error.to_string(),
                                     crate::retry::ErrorClass::DispatchPolicyRejected,
                                     crate::plugins::DisconnectCause::RecvError,
                                     crate::plugins::Direction::BackendToClient,
@@ -6282,6 +6447,19 @@ async fn create_session(
             // Flush batched sends after draining all pending replies.
             #[cfg(target_os = "linux")]
             if send_batched {
+                // Buffered replies may have waited while the route table was
+                // republished. Revalidate once more at the final syscall
+                // boundary; breaking drops both batches without emitting
+                // traffic under removed or replaced Service ownership.
+                if let Err(error) = reply_session.revalidate_destination() {
+                    disconnect_error = Some((
+                        error.to_string(),
+                        crate::retry::ErrorClass::DispatchPolicyRejected,
+                        crate::plugins::DisconnectCause::RecvError,
+                        crate::plugins::Direction::BackendToClient,
+                    ));
+                    break;
+                }
                 // Flush GSO batch first (if used).
                 if reply_udp_gso && !gso_failed && !gso_batch.is_empty() {
                     let flush_result =
@@ -6778,6 +6956,7 @@ mod tests {
             )])),
             correlation_ids: Default::default(),
             local_addr: std::sync::OnceLock::new(),
+            node_waypoint_destination: None,
             node_waypoint_source: None,
             plugins: Arc::new(Vec::new()),
             datagram_plugins: Arc::from([]),
@@ -8096,6 +8275,7 @@ backend_tls_verify_server_cert: false
             metadata: std::sync::Mutex::new(HashMap::new()),
             correlation_ids: Default::default(),
             local_addr: std::sync::OnceLock::new(),
+            node_waypoint_destination: None,
             node_waypoint_source: None,
             plugins: Arc::new(Vec::new()),
             datagram_plugins: Arc::from([]),
