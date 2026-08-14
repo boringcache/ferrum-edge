@@ -56,7 +56,7 @@ use std::io::Read;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use tokio::sync::watch;
 use tracing::{debug, info, warn};
@@ -789,6 +789,214 @@ impl<B: NetnsBackend> NetnsCaptureManager<B> {
     }
 }
 
+/// The procfs root a process resolves TARGET pids through by default: its own.
+///
+/// Every long-running consumer keeps this. The ONLY consumer that overrides it
+/// is the one-shot Ambient UDP node preflight (issue #3809), which runs as an
+/// init container WITHOUT pod-scoped `hostPID` and is handed the host's own
+/// procfs on a read-only mount instead. See
+/// [`first_pid_in_cgroup_via_proc_root_until`].
+// Only the Linux netns paths consume these; the bin target compiles this module
+// privately, so they would read as dead code on the macOS/Windows builds.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+pub const DEFAULT_PROC_ROOT: &str = "/proc";
+
+/// The maximum number of `<proc_root>/<pid>` entries one subtree resolution may
+/// examine. A bound, not a policy: exceeding it fails closed rather than letting
+/// a hostile or pathological procfs pin the bounded preflight deadline. The
+/// one-shot preflight also threads a wall-clock deadline through this scan so
+/// `--timeout-seconds` remains a hard ceiling on a large host.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+const MAX_PROC_PID_SCAN: usize = 262_144;
+
+/// Closed-set diagnostic for an explicit-root procfs scan that hit the
+/// preflight wall-clock ceiling. Contains the procfs root path only — no pid,
+/// cgroup, node UID, or credential material.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn proc_scan_deadline_error(proc_root: &Path) -> std::io::Error {
+    std::io::Error::new(
+        std::io::ErrorKind::TimedOut,
+        format!(
+            "procfs scan under {} exceeded the Ambient UDP preflight deadline",
+            proc_root.display()
+        ),
+    )
+}
+
+/// Whether `error` is the classified deadline outcome from an explicit-root
+/// target-PID scan (already elapsed before the walk, or observed while scanning).
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+pub fn is_proc_scan_deadline(error: &std::io::Error) -> bool {
+    error.kind() == std::io::ErrorKind::TimedOut
+        && error
+            .to_string()
+            .contains("exceeded the Ambient UDP preflight deadline")
+}
+
+/// Whether a `/proc/<pid>/cgroup` file names a cgroup inside `cgroup_path`.
+///
+/// The two sides speak different coordinate systems and that is the whole
+/// problem this solves. The node-agent registry publishes a pod's cgroup as an
+/// ABSOLUTE filesystem path under the mounted cgroup root
+/// (`/sys/fs/cgroup/kubepods.slice/…/podX.slice`), while procfs reports a task's
+/// cgroup ROOT-RELATIVE (`0::/kubepods.slice/…/podX.slice/…scope`). Neither
+/// knows where the other's root begins, so membership is decided by the only
+/// invariant that survives both views: some component-aligned PREFIX of the
+/// task's path must be the component-aligned TAIL of the published path.
+///
+/// Component alignment is what makes this safe rather than a substring guess —
+/// every candidate starts with `/`, so `…/xpodA.slice` can never match
+/// `/podA.slice`. Candidates are tried longest-first and the single-component
+/// root (`/`) is never a candidate, so a task in an unrelated sibling slice has
+/// no matching prefix at all.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+pub fn proc_cgroup_is_in_subtree(proc_cgroup_contents: &str, cgroup_path: &str) -> bool {
+    let target = cgroup_path.trim_end_matches('/');
+    if !target.starts_with('/') || target.len() < 2 {
+        return false;
+    }
+    for line in proc_cgroup_contents.lines() {
+        // `<hierarchy-id>:<controllers>:<path>`; cgroup v2 uses `0::<path>`.
+        let Some((_, rest)) = line.split_once(':') else {
+            continue;
+        };
+        let Some((_, path)) = rest.split_once(':') else {
+            continue;
+        };
+        let path = path.trim_end_matches('/');
+        if !path.starts_with('/') || path.len() < 2 {
+            continue;
+        }
+        let mut candidate = path;
+        loop {
+            if is_component_aligned_tail(target, candidate) {
+                return true;
+            }
+            match candidate.rfind('/') {
+                Some(0) | None => break,
+                Some(index) => candidate = &candidate[..index],
+            }
+        }
+    }
+    false
+}
+
+/// `tail` is `path` itself, or its component-aligned trailing portion.
+///
+/// Both are absolute, so `tail` beginning with `/` is what makes a plain
+/// `ends_with` component-aligned: `/a/xb` cannot end with `/b`.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn is_component_aligned_tail(path: &str, tail: &str) -> bool {
+    path == tail || (path.len() > tail.len() && path.ends_with(tail))
+}
+
+/// Resolve a live PID inside `cgroup_path` by scanning `<proc_root>/<pid>/cgroup`
+/// instead of the cgroup's own `cgroup.procs`.
+///
+/// This exists because `cgroup.procs` is TRANSLATED into the READER's PID
+/// namespace: cgroup v1 omits tasks the reader cannot see and cgroup v2 prints
+/// them as `0`. A process that mounted the host's procfs but kept its own PID
+/// namespace would therefore read an empty (or unusable) pod cgroup and resolve
+/// nothing, even though every `<host-proc>/<pid>/ns/net` it needs is right
+/// there. Scanning the supplied procfs root inverts the lookup so the PID
+/// namespace never enters into it.
+///
+/// Any live task in the subtree is an equally good answer — they all share the
+/// pod's network namespace, which is the only thing the caller wants — so this
+/// returns the first match rather than paying for a full scan. The caller still
+/// re-checks the opened namespace's inode against the reconciled one, so a task
+/// that exits mid-resolution is caught there rather than here.
+///
+/// When `deadline` is `None`, the walk is unbounded: ordinary long-running /
+/// migration consumers keep this. The one-shot preflight passes a wall-clock
+/// ceiling so `--timeout-seconds` remains a hard bound on a large host.
+///
+/// `TimedOut` here is the classified preflight-ceiling outcome, not a kernel
+/// ETIMEDOUT: already-elapsed deadlines return before any pid is considered, and
+/// a deadline that fires mid-scan returns instead of continuing toward
+/// [`MAX_PROC_PID_SCAN`]. Ordinary NotFound / InvalidData failures stay
+/// fail-closed and distinct.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+pub fn first_pid_in_cgroup_via_proc_root_until(
+    proc_root: &Path,
+    cgroup_path: &str,
+    deadline: Option<Instant>,
+) -> std::io::Result<u32> {
+    if super::owned_shell::deadline_elapsed(deadline) {
+        return Err(proc_scan_deadline_error(proc_root));
+    }
+    let entries = std::fs::read_dir(proc_root).map_err(|error| {
+        std::io::Error::new(
+            error.kind(),
+            format!(
+                "failed to read procfs root {}: {error}",
+                proc_root.display()
+            ),
+        )
+    })?;
+    let mut scanned = 0usize;
+    let mut first_read_error: Option<String> = None;
+    for entry in entries.flatten() {
+        if super::owned_shell::deadline_elapsed(deadline) {
+            return Err(proc_scan_deadline_error(proc_root));
+        }
+        let file_name = entry.file_name();
+        let Ok(pid) = file_name.to_string_lossy().parse::<u32>() else {
+            continue;
+        };
+        if pid == 0 {
+            continue;
+        }
+        scanned += 1;
+        if scanned > MAX_PROC_PID_SCAN {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!(
+                    "procfs scan under {} exceeded {MAX_PROC_PID_SCAN} entries",
+                    proc_root.display()
+                ),
+            ));
+        }
+        let cgroup_file = entry.path().join("cgroup");
+        match std::fs::read_to_string(&cgroup_file) {
+            Ok(contents) => {
+                if super::owned_shell::deadline_elapsed(deadline) {
+                    return Err(proc_scan_deadline_error(proc_root));
+                }
+                if proc_cgroup_is_in_subtree(&contents, cgroup_path) {
+                    return Ok(pid);
+                }
+            }
+            Err(error) => {
+                if super::owned_shell::deadline_elapsed(deadline) {
+                    return Err(proc_scan_deadline_error(proc_root));
+                }
+                // A task that exited between readdir and read, or one this
+                // process may not inspect, is not evidence of a broken root.
+                let transient = matches!(
+                    error.kind(),
+                    std::io::ErrorKind::NotFound | std::io::ErrorKind::PermissionDenied
+                );
+                if !transient {
+                    first_read_error.get_or_insert_with(|| {
+                        format!("failed to read {}: {error}", cgroup_file.display())
+                    });
+                }
+            }
+        }
+    }
+    let detail = first_read_error
+        .map(|error| format!("; first read error: {error}"))
+        .unwrap_or_default();
+    Err(std::io::Error::new(
+        std::io::ErrorKind::NotFound,
+        format!(
+            "no live PID for cgroup subtree {cgroup_path} under procfs root {}{detail}",
+            proc_root.display()
+        ),
+    ))
+}
+
 /// Production backend: resolves pod netns from its cgroup and opens a real
 /// capture listener inside it, feeding accepted connections into the shared
 /// proxy accept loop.
@@ -920,21 +1128,63 @@ mod imp {
     use std::net::SocketAddr;
     use std::os::fd::AsRawFd;
     use std::os::unix::fs::MetadataExt;
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
+    use std::time::Instant;
+
+    use super::DEFAULT_PROC_ROOT;
 
     /// Resolve the pod's netns identity (the `net` namespace inode) from a live
     /// PID in its cgroup. The inode is stable for the life of the netns and is a
     /// good dedup key across the pod sandbox + container cgroups.
     pub(crate) fn netns_inode_for_cgroup(cgroup_path: &str) -> io::Result<u64> {
-        let pid = first_pid_in_cgroup(cgroup_path)?;
-        let path = format!("/proc/{pid}/ns/net");
+        netns_inode_for_cgroup_at_until(Path::new(DEFAULT_PROC_ROOT), cgroup_path, None)
+    }
+
+    /// [`netns_inode_for_cgroup`] against an EXPLICIT procfs root that observes
+    /// the one-shot preflight wall-clock ceiling during target-PID resolution.
+    ///
+    /// `target_proc_root` names where TARGET pids live, and nothing else: the
+    /// caller's own `/proc/self/ns/net` is deliberately untouched by it (see
+    /// [`host_netns_inode`]). Only the one-shot Ambient UDP node preflight
+    /// passes anything but the default, so it can read the host's pids from a
+    /// read-only mount instead of being given pod-scoped `hostPID`.
+    pub(crate) fn netns_inode_for_cgroup_at_until(
+        target_proc_root: &Path,
+        cgroup_path: &str,
+        deadline: Option<Instant>,
+    ) -> io::Result<u64> {
+        let pid = first_pid_in_cgroup_at(target_proc_root, cgroup_path, deadline)?;
+        if crate::proxy::owned_shell::deadline_elapsed(deadline) {
+            return Err(super::proc_scan_deadline_error(target_proc_root));
+        }
+        let path = target_proc_root.join(pid.to_string()).join("ns/net");
         let meta = std::fs::metadata(&path).map_err(|error| {
             io::Error::new(
                 error.kind(),
-                format!("failed to stat pod netns {path}: {error}"),
+                format!("failed to stat pod netns {}: {error}", path.display()),
             )
         })?;
         Ok(meta.ino())
+    }
+
+    /// Resolve a live PID in `cgroup_path` through `proc_root`.
+    ///
+    /// The default root keeps the cheap, unchanged `cgroup.procs` read and
+    /// ignores `deadline`: ordinary long-running and migration consumers are
+    /// not the one-shot preflight. An explicit root cannot use `cgroup.procs`:
+    /// it is translated into the READER's PID namespace, so a process holding a
+    /// foreign procfs would read an empty or all-zero list. See
+    /// [`super::first_pid_in_cgroup_via_proc_root_until`].
+    fn first_pid_in_cgroup_at(
+        proc_root: &Path,
+        cgroup_path: &str,
+        deadline: Option<Instant>,
+    ) -> io::Result<u32> {
+        if proc_root == Path::new(DEFAULT_PROC_ROOT) {
+            let _ = deadline;
+            return first_pid_in_cgroup(cgroup_path);
+        }
+        super::first_pid_in_cgroup_via_proc_root_until(proc_root, cgroup_path, deadline)
     }
 
     /// The inode of the CALLING process's own (host/proxy) network namespace.
@@ -961,12 +1211,31 @@ mod imp {
     /// per-session reply socket) without re-resolving a live PID each time. Used
     /// by `netns_udp_capture`.
     pub(crate) fn open_pod_netns_handle(cgroup_path: &str) -> io::Result<File> {
-        let pid = first_pid_in_cgroup(cgroup_path)?;
-        let path = format!("/proc/{pid}/ns/net");
+        open_pod_netns_handle_at_until(Path::new(DEFAULT_PROC_ROOT), cgroup_path, None)
+    }
+
+    /// [`open_pod_netns_handle`] against an EXPLICIT procfs root that observes
+    /// the one-shot preflight wall-clock ceiling during target-PID resolution.
+    ///
+    /// `target_proc_root` has the same target-pids-only meaning as
+    /// [`netns_inode_for_cgroup_at_until`]. Opening the handle requires
+    /// `ptrace_may_access` on the target, which is why the preflight still
+    /// carries `SYS_PTRACE` (and `SYS_ADMIN` for the subsequent `setns`) even
+    /// though it no longer needs the host PID namespace.
+    pub(crate) fn open_pod_netns_handle_at_until(
+        target_proc_root: &Path,
+        cgroup_path: &str,
+        deadline: Option<Instant>,
+    ) -> io::Result<File> {
+        let pid = first_pid_in_cgroup_at(target_proc_root, cgroup_path, deadline)?;
+        if crate::proxy::owned_shell::deadline_elapsed(deadline) {
+            return Err(super::proc_scan_deadline_error(target_proc_root));
+        }
+        let path = target_proc_root.join(pid.to_string()).join("ns/net");
         File::open(&path).map_err(|error| {
             io::Error::new(
                 error.kind(),
-                format!("failed to open pod netns {path}: {error}"),
+                format!("failed to open pod netns {}: {error}", path.display()),
             )
         })
     }
@@ -1173,7 +1442,8 @@ mod imp {
 /// resolution recipe as the TCP node-waypoint capture path.
 #[cfg(target_os = "linux")]
 pub(crate) use imp::{
-    host_netns_inode, netns_inode_for_cgroup, open_pod_netns_handle, run_in_netns,
+    host_netns_inode, netns_inode_for_cgroup, netns_inode_for_cgroup_at_until,
+    open_pod_netns_handle, open_pod_netns_handle_at_until, run_in_netns,
 };
 
 #[cfg(test)]

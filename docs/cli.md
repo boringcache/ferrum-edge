@@ -329,6 +329,11 @@ predecessor UDP placements on this node and publishes the node-scoped cleanup
 proof the settled host placement requires. Exits non-zero without publishing
 when it cannot prove completion.
 
+The Helm chart runs it as an **init container in the Ambient DaemonSet's own
+pod**, so Kubernetes guarantees it completes before the steady-state proxy
+container starts. See
+[the privileged node preflight](mesh.md#the-privileged-node-preflight).
+
 `--settings` is materialized before any config read and before worker threads,
 matching `run` / `validate`. The command then installs Ferrum's process-default
 rustls provider through the existing FIPS gate, resolves external secrets,
@@ -346,7 +351,8 @@ ferrum-edge ambient-udp-preflight [OPTIONS]
 | Flag | Short | Description |
 |------|-------|-------------|
 | `--settings <PATH>` | `-s` | Path to `ferrum.conf` (operational settings) |
-| `--timeout-seconds <N>` | | Wall-clock ceiling in seconds (default 300, clamped 1..=3600) |
+| `--timeout-seconds <N>` | | Wall-clock ceiling in seconds (default 300, clamped 1..=3600). Bounds owned `sh`/iptables/ip children **and** explicit-root host-proc target-PID scans used for netns-key reconcile and the stable netns handle open |
+| `--host-proc-root <PATH>` | | Procfs root for **target** pid reads (default: this process's own `/proc`). The chart mounts the host's `/proc` read-only on this init container alone and passes `/host/proc`, which is what lets the settled host-netns placement drop pod-scoped `hostPID` from the long-running proxy. It never redirects `/proc/self/ns/net`. Validated as an absolute, readable directory containing `self/ns/net`; anything else fails closed rather than silently falling back to `/proc` |
 | `--verbose` | `-v` | Increase log verbosity (repeatable: `-v`=info, `-vv`=debug, `-vvv`=trace) |
 
 ## Configuration Precedence

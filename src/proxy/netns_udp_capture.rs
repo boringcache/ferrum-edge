@@ -253,6 +253,21 @@ pub trait NetnsUdpBackend: Send + Sync + 'static {
 pub trait NetnsUdpCleanupBackend: Send + Sync + 'static {
     fn netns_key(&self, target: &PodCaptureTarget) -> Result<u64, String>;
 
+    /// Bounded variant used by the one-shot node preflight. Test mocks have no
+    /// procfs walk and ignore the deadline. Production backends honor it so a
+    /// host-proc PID scan cannot outlive `--timeout-seconds`.
+    fn netns_key_until(
+        &self,
+        target: &PodCaptureTarget,
+        deadline: Option<std::time::Instant>,
+    ) -> NetnsUdpKeyOutcome {
+        let _ = deadline;
+        match self.netns_key(target) {
+            Ok(key) => NetnsUdpKeyOutcome::Resolved(key),
+            Err(error) => NetnsUdpKeyOutcome::Unresolved(error),
+        }
+    }
+
     fn cleanup_udp_capture(&self, target: &PodCaptureTarget, expected_netns: u64) -> bool;
 
     /// Bounded variant used by the one-shot node preflight. Test mocks have no
@@ -271,6 +286,14 @@ pub trait NetnsUdpCleanupBackend: Send + Sync + 'static {
             NetnsUdpCleanupCommandOutcome::Failed
         }
     }
+}
+
+/// Result of one pod-netns identity lookup under an optional preflight deadline.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum NetnsUdpKeyOutcome {
+    Resolved(u64),
+    Unresolved(String),
+    DeadlineElapsed,
 }
 
 /// Result of one pod-netns teardown command.
@@ -1414,8 +1437,11 @@ impl<B: NetnsUdpCleanupBackend> NetnsUdpCleanupManager<B> {
         let mut desired: HashMap<u64, (PodCaptureTarget, HashSet<String>)> = HashMap::new();
         let mut unresolved_uids = HashSet::new();
         for target in &targets {
-            match self.backend.netns_key(target) {
-                Ok(netns) => {
+            if owned_shell::deadline_elapsed(self.deadline) {
+                return 0;
+            }
+            match self.backend.netns_key_until(target, self.deadline) {
+                NetnsUdpKeyOutcome::Resolved(netns) => {
                     if self.unresolved_reasons.remove(&target.pod_uid).is_some() {
                         info!(
                             pod_uid = %target.pod_uid,
@@ -1429,7 +1455,7 @@ impl<B: NetnsUdpCleanupBackend> NetnsUdpCleanupManager<B> {
                         .or_insert_with(|| (target.clone(), HashSet::new()));
                     entry.1.insert(target.pod_uid.clone());
                 }
-                Err(error) => {
+                NetnsUdpKeyOutcome::Unresolved(error) => {
                     unresolved_uids.insert(target.pod_uid.clone());
                     let previous = self
                         .unresolved_reasons
@@ -1449,6 +1475,9 @@ impl<B: NetnsUdpCleanupBackend> NetnsUdpCleanupManager<B> {
                             "Ambient UDP disabled cleanup: pod netns not resolvable; will retry"
                         );
                     }
+                }
+                NetnsUdpKeyOutcome::DeadlineElapsed => {
+                    return 0;
                 }
             }
         }
@@ -1683,18 +1712,72 @@ impl ProxyNetnsUdpBackend {
 /// rules are installed.
 pub struct ProxyNetnsUdpCleanupBackend {
     include_v6: bool,
+    /// Where TARGET pids are resolved from. `None` is this process's own
+    /// `/proc`, which is what the mesh data plane's cleanup phase always uses.
+    ///
+    /// The one-shot Ambient UDP node preflight sets it to a read-only mount of
+    /// the HOST's procfs (issue #3809). That is what lets the preflight run as
+    /// an init container in the ambient pod without pod-scoped `hostPID`, which
+    /// Kubernetes would otherwise hand to the long-running proxy container for
+    /// its whole lifetime. It never affects `/proc/self/ns/net`: the caller's
+    /// own namespace identity and the `setns` save/restore handle both stay on
+    /// this container's own procfs.
+    target_proc_root: Option<PathBuf>,
 }
 
 impl ProxyNetnsUdpCleanupBackend {
     pub fn new(include_v6: bool) -> Self {
-        Self { include_v6 }
+        Self {
+            include_v6,
+            target_proc_root: None,
+        }
+    }
+
+    /// Resolve TARGET pids through `root` instead of this process's own `/proc`.
+    pub fn with_target_proc_root(mut self, root: Option<PathBuf>) -> Self {
+        self.target_proc_root = root;
+        self
+    }
+
+    #[cfg(target_os = "linux")]
+    fn proc_root(&self) -> &Path {
+        self.target_proc_root
+            .as_deref()
+            .unwrap_or_else(|| Path::new(super::netns_capture::DEFAULT_PROC_ROOT))
     }
 }
 
 #[cfg(target_os = "linux")]
 impl NetnsUdpCleanupBackend for ProxyNetnsUdpCleanupBackend {
     fn netns_key(&self, target: &PodCaptureTarget) -> Result<u64, String> {
-        super::netns_capture::netns_inode_for_cgroup(&target.cgroup_path).map_err(|e| e.to_string())
+        match self.netns_key_until(target, None) {
+            NetnsUdpKeyOutcome::Resolved(key) => Ok(key),
+            NetnsUdpKeyOutcome::Unresolved(error) => Err(error),
+            NetnsUdpKeyOutcome::DeadlineElapsed => {
+                Err("procfs scan exceeded the Ambient UDP preflight deadline".to_string())
+            }
+        }
+    }
+
+    fn netns_key_until(
+        &self,
+        target: &PodCaptureTarget,
+        deadline: Option<std::time::Instant>,
+    ) -> NetnsUdpKeyOutcome {
+        if owned_shell::deadline_elapsed(deadline) {
+            return NetnsUdpKeyOutcome::DeadlineElapsed;
+        }
+        match super::netns_capture::netns_inode_for_cgroup_at_until(
+            self.proc_root(),
+            &target.cgroup_path,
+            deadline,
+        ) {
+            Ok(inode) => NetnsUdpKeyOutcome::Resolved(inode),
+            Err(error) if super::netns_capture::is_proc_scan_deadline(&error) => {
+                NetnsUdpKeyOutcome::DeadlineElapsed
+            }
+            Err(error) => NetnsUdpKeyOutcome::Unresolved(error.to_string()),
+        }
     }
 
     fn cleanup_udp_capture(&self, target: &PodCaptureTarget, expected_netns: u64) -> bool {
@@ -1713,8 +1796,15 @@ impl NetnsUdpCleanupBackend for ProxyNetnsUdpCleanupBackend {
         if owned_shell::deadline_elapsed(deadline) {
             return NetnsUdpCleanupCommandOutcome::DeadlineElapsed;
         }
-        let netns = match super::netns_capture::open_pod_netns_handle(&target.cgroup_path) {
+        let netns = match super::netns_capture::open_pod_netns_handle_at_until(
+            self.proc_root(),
+            &target.cgroup_path,
+            deadline,
+        ) {
             Ok(file) => file,
+            Err(error) if super::netns_capture::is_proc_scan_deadline(&error) => {
+                return NetnsUdpCleanupCommandOutcome::DeadlineElapsed;
+            }
             Err(error) => {
                 warn!(
                     pod_uid = %target.pod_uid,
@@ -1797,8 +1887,26 @@ impl NetnsUdpCleanupBackend for ProxyNetnsUdpCleanupBackend {
 #[cfg(not(target_os = "linux"))]
 impl NetnsUdpCleanupBackend for ProxyNetnsUdpCleanupBackend {
     fn netns_key(&self, _target: &PodCaptureTarget) -> Result<u64, String> {
-        let _ = self.include_v6;
-        Err("Ambient UDP disabled cleanup is Linux-only".to_string())
+        match self.netns_key_until(_target, None) {
+            NetnsUdpKeyOutcome::Resolved(key) => Ok(key),
+            NetnsUdpKeyOutcome::Unresolved(error) => Err(error),
+            NetnsUdpKeyOutcome::DeadlineElapsed => {
+                Err("procfs scan exceeded the Ambient UDP preflight deadline".to_string())
+            }
+        }
+    }
+
+    fn netns_key_until(
+        &self,
+        _target: &PodCaptureTarget,
+        deadline: Option<std::time::Instant>,
+    ) -> NetnsUdpKeyOutcome {
+        let _ = (self.include_v6, self.target_proc_root.as_deref());
+        if owned_shell::deadline_elapsed(deadline) {
+            NetnsUdpKeyOutcome::DeadlineElapsed
+        } else {
+            NetnsUdpKeyOutcome::Unresolved("Ambient UDP disabled cleanup is Linux-only".to_string())
+        }
     }
 
     fn cleanup_udp_capture(&self, _target: &PodCaptureTarget, _expected_netns: u64) -> bool {
