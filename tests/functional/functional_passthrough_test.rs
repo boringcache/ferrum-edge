@@ -7,7 +7,8 @@
 //! Run with:
 //!   cargo build --bin ferrum-edge && cargo test --test functional_tests -- functional_passthrough --ignored --nocapture
 
-use std::time::Duration;
+use std::process::Child;
+use std::time::{Duration, Instant};
 use tempfile::TempDir;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
@@ -150,19 +151,99 @@ impl Drop for GatewayProcess {
     }
 }
 
-/// Wait for the gateway health endpoint to respond.
-/// Returns true if healthy, false if timed out.
-async fn wait_for_health(admin_port: u16) -> bool {
-    let health_url = format!("http://127.0.0.1:{}/health", admin_port);
-    let deadline = std::time::SystemTime::now() + Duration::from_secs(30);
+/// Per-spawn `FERRUM_METRICS_BEARER_TOKEN` so authenticated `/health` can prove
+/// this child owns the admin port (issue #3428). Never logged.
+fn mint_observability_token() -> String {
+    format!(
+        "ferrum-edge-passthrough-probe-{}",
+        uuid::Uuid::new_v4().simple()
+    )
+}
+
+/// Wait until `child` owns its admin listener and the stream port is accepting.
+///
+/// Unauthenticated `/health` success is not identity and is not readiness: a
+/// foreign process can answer the released admin port, and that probe does not
+/// require JSON `ready: true`. `ready` flips only after every listener bind,
+/// including the stream listener this file actually dials.
+///
+/// Barrier (same contract as `TestGateway` / `wait_for_owned_gateway`):
+/// 1. `Child::try_wait` around every probe — a dead child voids the attempt.
+/// 2. Authenticated `/health` detail tier for this attempt's bearer token with
+///    `ready: true`.
+/// 3. TCP connect to the stream listen port after identity is proven, with
+///    another `try_wait` so a child that died between the two stages cannot
+///    look ready. This is not a bare port check: identity already bound the
+///    answer to this child, and a dead child consumes the attempt.
+async fn wait_for_owned_gateway(
+    child: &mut Child,
+    admin_port: u16,
+    observability_token: &str,
+    stream_port: u16,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    const STARTUP_TIMEOUT_SECS: u64 = 30;
+    const PROBE_SLICE: Duration = Duration::from_secs(1);
+    let deadline = Instant::now() + Duration::from_secs(STARTUP_TIMEOUT_SECS);
+    let addr = format!("127.0.0.1:{stream_port}");
+
+    let mut last_observation = String::from("no response yet");
     loop {
-        if std::time::SystemTime::now() >= deadline {
-            return false;
+        if let Some(status) = child.try_wait()? {
+            return Err(format!(
+                "passthrough gateway exited during startup with {status} \
+                 (last observation: {last_observation})"
+            )
+            .into());
         }
-        match reqwest::get(&health_url).await {
-            Ok(r) if r.status().is_success() => return true,
-            _ => sleep(Duration::from_millis(500)).await,
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err(format!(
+                "passthrough gateway did not prove ownership of admin port {admin_port} \
+                 within {STARTUP_TIMEOUT_SECS} seconds (last observation: {last_observation})"
+            )
+            .into());
         }
+        match crate::common::probe_gateway_identity(
+            admin_port,
+            observability_token,
+            remaining.min(PROBE_SLICE),
+        )
+        .await
+        {
+            Ok(()) => break,
+            Err(err) => last_observation = err.to_string(),
+        }
+    }
+
+    loop {
+        if let Some(status) = child.try_wait()? {
+            return Err(format!(
+                "passthrough gateway exited after reporting ready with {status}"
+            )
+            .into());
+        }
+        if Instant::now() >= deadline {
+            return Err(format!(
+                "passthrough stream port {stream_port} did not accept TCP connections \
+                 within {STARTUP_TIMEOUT_SECS} seconds (last observation: {last_observation})"
+            )
+            .into());
+        }
+        match tokio::net::TcpStream::connect(&addr).await {
+            Ok(stream) => {
+                drop(stream);
+                if let Some(status) = child.try_wait()? {
+                    return Err(format!(
+                        "passthrough gateway exited after the stream listener accepted \
+                         with {status}"
+                    )
+                    .into());
+                }
+                return Ok(());
+            }
+            Err(err) => last_observation = err.to_string(),
+        }
+        sleep(Duration::from_millis(50)).await;
     }
 }
 
@@ -219,12 +300,16 @@ where
         // them are unaffected.
         let stdout_log = std::fs::File::create(dir.path().join(GATEWAY_STDOUT_LOG)).unwrap();
         let stderr_log = std::fs::File::create(dir.path().join(GATEWAY_STDERR_LOG)).unwrap();
+        let observability_token = mint_observability_token();
 
         let mut cmd = std::process::Command::new(gateway_binary_path());
         cmd.env("FERRUM_MODE", "file")
             .env("FERRUM_FILE_CONFIG_PATH", config_path.to_str().unwrap())
             .env("FERRUM_PROXY_HTTP_PORT", http_port.to_string())
             .env("FERRUM_ADMIN_HTTP_PORT", admin_port.to_string())
+            .env("FERRUM_ADMIN_HTTPS_PORT", "0")
+            .env("FERRUM_ACCEPT_THREADS", "1")
+            .env("FERRUM_POOL_WARMUP_ENABLED", "false")
             .env("FERRUM_LOG_LEVEL", "debug")
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::from(stdout_log))
@@ -232,24 +317,32 @@ where
         for (k, v) in extra_env {
             cmd.env(k, v);
         }
+        // Identity proof is last so extra_env cannot replace this child's token
+        // with a leaked parent-shell credential or CIDR allowlist.
+        cmd.env("FERRUM_METRICS_BEARER_TOKEN", &observability_token)
+            .env_remove("FERRUM_METRICS_ALLOWED_CIDRS");
         let mut child = cmd.spawn().expect("Failed to start gateway");
 
-        if wait_for_health(admin_port).await {
-            return (child, proxy_listen_port, http_port, admin_port, dir);
+        match wait_for_owned_gateway(&mut child, admin_port, &observability_token, proxy_listen_port)
+            .await
+        {
+            Ok(()) => return (child, proxy_listen_port, http_port, admin_port, dir),
+            Err(error) => {
+                eprintln!(
+                    "Gateway startup attempt {attempt}/{MAX_ATTEMPTS} failed \
+                     (ports: stream={proxy_listen_port}, http={http_port}, \
+                     admin={admin_port}): {error}"
+                );
+                let _ = child.kill();
+                let _ = child.wait();
+            }
         }
-
-        eprintln!(
-            "Gateway startup attempt {}/{} failed (ports: stream={}, http={}, admin={})",
-            attempt, MAX_ATTEMPTS, proxy_listen_port, http_port, admin_port
-        );
-        let _ = child.kill();
-        let _ = child.wait();
 
         if attempt < MAX_ATTEMPTS {
             tokio::time::sleep(Duration::from_secs(1)).await;
         }
     }
-    panic!("Gateway did not start after {} attempts", MAX_ATTEMPTS);
+    panic!("Gateway did not start after {MAX_ATTEMPTS} attempts");
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────

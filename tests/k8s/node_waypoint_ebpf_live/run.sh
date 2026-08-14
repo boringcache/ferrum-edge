@@ -4769,18 +4769,47 @@ EOF
 # path — the Service DNS name / ClusterIP — which
 # `run_node_waypoint_dtls_service_path_checks` proves separately.
 
-# Full `openssl s_client` handshake report (stdout+stderr), used to prove the
-# listener bound and which certificate it presented.
+# Machine-classifiable DTLS handshake capture (stdout+stderr+exit).
+#
+# OpenSSL semantics used here (openssl 3 s_client):
+# - `CONNECTED(...)` is printed as soon as the UDP socket is connected. For
+#   DTLS that is a local connect(2) and does NOT prove a peer exists, so it
+#   is not used as listener identity.
+# - `-brief` sets quiet mode (bio_c_out discarded) and prints
+#   `CONNECTION ESTABLISHED` plus `print_ssl_summary` to stderr ONLY after
+#   `SSL_is_init_finished`. That is the positive completed-handshake marker.
+# - `-brief` also sets verify quiet, but the verify callback still prints
+#   `depth=0 CN=...` when verification is NOT ok. The generated listener's
+#   throwaway leaf is self-signed, so CN=ferrum-node-waypoint-dtls remains
+#   visible on an incomplete handshake that reached our Certificate flight.
+# - `-timeout` enables DTLS BIO send/recv timeouts so an unfinished
+#   handshake retransmits instead of blocking on a silent peer forever.
+# - `-no_ign_eof` undoes the `-brief`/`-quiet` ign_eof default so a
+#   completed handshake exits when kubectl exec provides no stdin, instead
+#   of hanging until the outer timeout.
+# - The wrapper `timeout` is the hard bound. Its status is appended as
+#   `FERRUM_DTLS_HS_RC:` locally so kubectl/exec/image failures stay
+#   distinguishable from a finished handshake.
+DTLS_GENERATED_LISTENER_CN="ferrum-node-waypoint-dtls"
+DTLS_HS_RC_MARKER="FERRUM_DTLS_HS_RC:"
+
 dtls_handshake_report_from() {
-  local ns="$1" app="$2" target_ip="$3" port="$4" wait_secs="${5:-15}"
+  local ns="$1" app="$2" target_ip="$3" port="$4" wait_secs="${5:-8}"
   local cert="${6:-}" key="${7:-}"
   local -a extra=()
+  local report rc
   if [[ -n "$cert" && -n "$key" ]]; then
     extra=(-cert "$cert" -key "$key")
   fi
-  kubectl -n "$ns" exec "deploy/$app" -c dtls -- \
-    timeout "$wait_secs" openssl s_client -dtls1_2 -connect "$target_ip:$port" "${extra[@]}" 2>&1 \
-    || true
+  report=""
+  rc=0
+  set +e
+  report="$(kubectl -n "$ns" exec "deploy/$app" -c dtls -- \
+    timeout "$wait_secs" openssl s_client -dtls1_2 -brief -timeout -no_ign_eof \
+      -connect "$target_ip:$port" "${extra[@]}" 2>&1)"
+  rc=$?
+  set -e
+  printf '%s\n%s%s\n' "$report" "$DTLS_HS_RC_MARKER" "$rc"
 }
 
 # Complete a DTLS handshake and send one application datagram; print whatever
@@ -4837,16 +4866,57 @@ wait_for_dtls_echo() {
   wait_for_dtls_echo_on "$1" "$2" "$3" "$DTLS_LISTENER_PORT" "dtls-ok:" "$4" "${5:-20}"
 }
 
-dtls_handshake_failed() {
+dtls_handshake_rc() {
   local report="$1"
-  [[ "$report" == *"handshake failure"* || "$report" == *"unknown ca"* \
-    || "$report" == *"certificate unknown"* || "$report" == *"certificate required"* \
-    || "$report" == *"no certificate returned"* || "$report" == *"sslv3 alert"* \
-    || "$report" == *"tlsv1 alert"* || "$report" == *"tlsv13 alert"* ]]
+  local line
+  line="$(printf '%s\n' "$report" | sed -n "s/^${DTLS_HS_RC_MARKER}//p" | tail -n1)"
+  printf '%s' "${line:-missing}"
+}
+
+# Positive completed-handshake evidence. Seeing the generated CN is NOT enough:
+# the Certificate message arrives before client authentication finishes, which
+# is exactly the hosted false-fail (CN presented, then the remote timeout
+# killed the client with no CONNECTION ESTABLISHED).
+dtls_handshake_completed() {
+  local report="$1"
+  [[ "$report" == *"CONNECTION ESTABLISHED"* \
+    && "$report" == *"Protocol version: DTLS"* \
+    && "$report" == *"${DTLS_GENERATED_LISTENER_CN}"* \
+    && "$report" != *"Ciphersuite: (NONE)"* \
+    && "$report" != *"Cipher is (NONE)"* ]]
+}
+
+# The generated listener presented its throwaway leaf. UDP CONNECTED is not
+# this check: connect(2) on SOCK_DGRAM succeeds with no peer.
+dtls_reached_generated_listener() {
+  local report="$1"
+  [[ "$report" == *"${DTLS_GENERATED_LISTENER_CN}"* ]]
+}
+
+# DNS/connectivity/exec/image/listener outages. Must not count as a STRICT pass.
+# UDP CONNECTED is not identity, so anything that did not present the generated
+# leaf and did not finish the handshake is treated as inconclusive/outage.
+dtls_handshake_outage() {
+  local report="$1"
+  dtls_handshake_completed "$report" && return 1
+  dtls_reached_generated_listener "$report" && return 1
+  return 0
+}
+
+# Handshake started against OUR generated listener and did not finish.
+# Alert strings are sufficient but not required: rustls may drop an
+# unauthenticated STRICT session without printing handshake failure.
+dtls_handshake_incomplete_against_generated_listener() {
+  local report="$1"
+  dtls_reached_generated_listener "$report" || return 1
+  dtls_handshake_completed "$report" && return 1
+  return 0
 }
 
 dtls_report_snippet() {
-  printf '%s' "$1" | sed '/-----BEGIN/,/-----END/d' | tr '\n' ' ' | cut -c1-240
+  local rc
+  rc="$(dtls_handshake_rc "$1")"
+  printf 'rc=%s %s' "$rc" "$(printf '%s' "$1" | sed '/-----BEGIN/,/-----END/d' | tr '\n' ' ' | cut -c1-240)"
 }
 
 # ── The ORDINARY user path for DTLS: the Service DNS name / ClusterIP ───────
@@ -4955,20 +5025,22 @@ run_node_waypoint_dtls_datapath_checks() {
   log "NodeWaypoint DTLS listener target ${listener_ip}:${DTLS_LISTENER_PORT}"
 
   # 1. The materialized `dtls` listener really bound and terminates DTLS with
-  #    the operator-supplied material. A handshake that reaches the server
-  #    certificate can only come from a bound DtlsServer on that port.
+  #    the operator-supplied material. Positive proof is a completed
+  #    `-brief` handshake (`CONNECTION ESTABLISHED`) that presents the
+  #    generated leaf. Seeing the CN alone is the Certificate flight, not
+  #    handshake completion.
   report=""
   for ((attempt = 0; attempt < 20; attempt++)); do
     report="$(dtls_handshake_report_from "$WORKLOAD_NS" dtls-src-a "$listener_ip" \
       "$DTLS_LISTENER_PORT" 10)"
-    if [[ "$report" == *ferrum-node-waypoint-dtls* ]]; then
+    if dtls_handshake_completed "$report"; then
       break
     fi
     sleep 4
   done
-  if [[ "$report" != *ferrum-node-waypoint-dtls* ]]; then
+  if ! dtls_handshake_completed "$report"; then
     local snippet
-    snippet="$(printf '%s' "$report" | sed '/-----BEGIN/,/-----END/d' | tr '\n' ' ' | cut -c1-240)"
+    snippet="$(dtls_report_snippet "$report")"
     record_live_assertion node_waypoint.dtls.listener_bound fail \
       dtls-src-a dtls-echo \
       "no DTLS handshake completed on ${listener_ip}:${DTLS_LISTENER_PORT}, last probe=${snippet}" \
@@ -5272,14 +5344,18 @@ PY
 # Ordinary-slot isolation is the authenticated /overload
 # stream_listeners.frontend_dtls_reload.generation captured before and after
 # that generated-owner publication — not a bound operator listener handshake.
-# Generated success requires a real handshake plus backend log; rejection
-# cases require handshake failure AND backend_hits=0.
+# Generated success requires CONNECTION ESTABLISHED plus backend log.
+# Unauthenticated/stale-CA rejection requires an incomplete handshake against
+# the generated listener PLUS backend_hits=0 and no application reply.
+# Reply-absence plus zero hits alone is not a pass: that is also what an
+# authorization drop after a successful unauthenticated handshake, or a
+# DNS/exec/listener outage, would look like.
 run_node_waypoint_dtls_reload_isolation_checks() {
   log "running NodeWaypoint DTLS owner-scoped reload isolation checks (issue #3858)"
   local listener_ip current_cert current_key stale_cert stale_key
   local overload_before overload_after health_file report reply hits
   local gen_before gen_after restarts_before restarts_after attempt payload snippet
-  local ambient_pod
+  local ambient_pod stale_payload
 
   listener_ip="$(node_waypoint_listener_ip)"
   if [[ -z "$listener_ip" ]]; then
@@ -5339,24 +5415,47 @@ print(json.dumps(obj))
   payload=""
   report=""
   reply=""
-  for ((attempt = 0; attempt < 40; attempt++)); do
+  hits="0"
+  for ((attempt = 0; attempt < 20; attempt++)); do
     payload="dtls-reload-unauth-${attempt}"
-    reply="$(dtls_probe_from "$WORKLOAD_NS" dtls-src-a "$listener_ip" \
-      "$DTLS_LISTENER_PORT" "$payload" 6)"
-    hits="$(dtls_echo_backend_received "$payload")"
     report="$(dtls_handshake_report_from "$WORKLOAD_NS" dtls-src-a "$listener_ip" \
-      "$DTLS_LISTENER_PORT" 8)"
-    if [[ "$reply" != *"dtls-ok:$payload"* && "$hits" == "0" ]] \
-      && dtls_handshake_failed "$report"; then
-      break
+      "$DTLS_LISTENER_PORT" 4)"
+    if dtls_handshake_completed "$report"; then
+      # Still PERMISSIVE: unauthenticated handshake finished. Wait for STRICT.
+      sleep 3
+      continue
+    fi
+    if dtls_handshake_outage "$report"; then
+      sleep 3
+      continue
+    fi
+    if dtls_handshake_incomplete_against_generated_listener "$report"; then
+      # Same conclusive incomplete-handshake state: do not spend another
+      # full quiet-probe timeout before classifying. A short application
+      # probe plus the backend log still prove no plaintext mutation.
+      reply="$(dtls_probe_from "$WORKLOAD_NS" dtls-src-a "$listener_ip" \
+        "$DTLS_LISTENER_PORT" "$payload" 2)"
+      hits="$(dtls_echo_backend_received "$payload")"
+      if [[ "$reply" != *"dtls-ok:$payload"* && "$hits" == "0" ]]; then
+        break
+      fi
     fi
     sleep 3
   done
-  if [[ "$reply" == *"dtls-ok:$payload"* || "$hits" != "0" ]] \
-    || ! dtls_handshake_failed "$report"; then
+  if dtls_handshake_completed "$report"; then
     snippet="$(dtls_report_snippet "$report")"
     record_live_assertion node_waypoint.dtls.reload_permissive_to_strict fail \
       dtls-src-a dtls-echo "generated listener still admitted unauthenticated traffic observed=$reply hits=$hits report=${snippet}" \
+      "$(spiffe_for_sa src-a)" "$(spiffe_for_sa dst-a)" "node-waypoint-dtls-reload"
+    collect_traffic_failure_diagnostics
+    return 1
+  fi
+  if dtls_handshake_outage "$report" \
+    || ! dtls_handshake_incomplete_against_generated_listener "$report" \
+    || [[ "$reply" == *"dtls-ok:$payload"* || "$hits" != "0" ]]; then
+    snippet="$(dtls_report_snippet "$report")"
+    record_live_assertion node_waypoint.dtls.reload_permissive_to_strict fail \
+      dtls-src-a dtls-echo "STRICT unauthenticated rejection was not proved observed=$reply hits=$hits report=${snippet}" \
       "$(spiffe_for_sa src-a)" "$(spiffe_for_sa dst-a)" "node-waypoint-dtls-reload"
     collect_traffic_failure_diagnostics
     return 1
@@ -5365,7 +5464,7 @@ print(json.dumps(obj))
     dtls-src-a dtls-echo "generated listener moved to STRICT, unauthenticated handshake failed closed, backend_hits=0" \
     "$(spiffe_for_sa src-a)" "$(spiffe_for_sa dst-a)" "node-waypoint-dtls-reload"
   record_live_assertion node_waypoint.dtls.reload_unauthenticated_rejected pass \
-    dtls-src-a dtls-echo "payload=$payload backend_hits=0 handshake failed" \
+    dtls-src-a dtls-echo "payload=$payload backend_hits=0 handshake did not complete" \
     "$(spiffe_for_sa src-a)" "$(spiffe_for_sa dst-a)" "node-waypoint-dtls-reload"
 
   if ! reply="$(wait_for_dtls_echo_on "$WORKLOAD_NS" dtls-src-a "$listener_ip" \
@@ -5380,7 +5479,7 @@ print(json.dumps(obj))
   hits="$(dtls_echo_backend_received dtls-reload-current)"
   report="$(dtls_handshake_report_from "$WORKLOAD_NS" dtls-src-a "$listener_ip" \
     "$DTLS_LISTENER_PORT" 10 "$current_cert" "$current_key")"
-  if [[ "$hits" == "0" || "$report" != *ferrum-node-waypoint-dtls* ]]; then
+  if [[ "$hits" == "0" ]] || ! dtls_handshake_completed "$report"; then
     snippet="$(dtls_report_snippet "$report")"
     record_live_assertion node_waypoint.dtls.reload_current_ca_admitted fail \
       dtls-src-a dtls-echo "backend_hits=$hits report=${snippet}" \
@@ -5392,13 +5491,35 @@ print(json.dumps(obj))
     dtls-src-a dtls-echo "current-CA handshake admitted, backend_hits=$hits" \
     "$(spiffe_for_sa src-a)" "$(spiffe_for_sa dst-a)" "node-waypoint-dtls-reload"
 
-  reply="$(dtls_probe_from "$WORKLOAD_NS" dtls-src-a "$listener_ip" \
-    "$DTLS_LISTENER_PORT" dtls-reload-stale 8 "$stale_cert" "$stale_key")"
-  report="$(dtls_handshake_report_from "$WORKLOAD_NS" dtls-src-a "$listener_ip" \
-    "$DTLS_LISTENER_PORT" 10 "$stale_cert" "$stale_key")"
-  hits="$(dtls_echo_backend_received dtls-reload-stale)"
-  if [[ "$reply" == *"dtls-ok:dtls-reload-stale"* || "$hits" != "0" ]] \
-    || ! dtls_handshake_failed "$report"; then
+  report=""
+  reply=""
+  hits="0"
+  stale_payload=""
+  for ((attempt = 0; attempt < 5; attempt++)); do
+    stale_payload="dtls-reload-stale-${attempt}"
+    report="$(dtls_handshake_report_from "$WORKLOAD_NS" dtls-src-a "$listener_ip" \
+      "$DTLS_LISTENER_PORT" 4 "$stale_cert" "$stale_key")"
+    if dtls_handshake_outage "$report"; then
+      sleep 2
+      continue
+    fi
+    if dtls_handshake_completed "$report"; then
+      break
+    fi
+    if dtls_handshake_incomplete_against_generated_listener "$report"; then
+      reply="$(dtls_probe_from "$WORKLOAD_NS" dtls-src-a "$listener_ip" \
+        "$DTLS_LISTENER_PORT" "$stale_payload" 2 "$stale_cert" "$stale_key")"
+      hits="$(dtls_echo_backend_received "$stale_payload")"
+      if [[ "$reply" != *"dtls-ok:$stale_payload"* && "$hits" == "0" ]]; then
+        break
+      fi
+    fi
+    sleep 2
+  done
+  if dtls_handshake_completed "$report" \
+    || dtls_handshake_outage "$report" \
+    || ! dtls_handshake_incomplete_against_generated_listener "$report" \
+    || [[ "$reply" == *"dtls-ok:$stale_payload"* || "$hits" != "0" ]]; then
     snippet="$(dtls_report_snippet "$report")"
     record_live_assertion node_waypoint.dtls.reload_stale_ca_rejected fail \
       dtls-src-a dtls-echo "observed=$reply backend_hits=$hits report=${snippet}" \
