@@ -3739,7 +3739,8 @@ async fn inline_key_rotation_for_the_same_issuer_does_not_reopen_a_proof() {
     let extra = rotated["keys"][0].clone();
     rotated["keys"] = json!([jwks["keys"][0].clone(), extra]);
     rotated["keys"][1]["kid"] = json!("rotated-kid");
-    let reloaded = dpop_plugin_with_providers(json!([dpop_provider(&rotated)]), "dpop-key-rotation");
+    let reloaded =
+        dpop_plugin_with_providers(json!([dpop_provider(&rotated)]), "dpop-key-rotation");
     let mut replay = dpop_ctx(&fixture);
     assert_reject(
         reloaded.authenticate(&mut replay, &consumer_index).await,

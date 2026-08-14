@@ -272,8 +272,7 @@ fn concurrent_insert_during_prune_cannot_forget_a_live_marker() {
             std::thread::spawn(move || {
                 barrier.wait();
                 if idx % 2 == 0 {
-                    let live =
-                        domain("capacity-concurrent-bound").marker(&[b"live", b"kept"]);
+                    let live = domain("capacity-concurrent-bound").marker(&[b"live", b"kept"]);
                     admit_process_at(&authority, &live, after_shorts)
                 } else {
                     let fresh = domain("capacity-concurrent-bound")
@@ -1990,7 +1989,11 @@ fn claim_client(port: u16, prefix: &str) -> Arc<RedisRateLimitClient> {
     claim_client_with_interval(port, prefix, 3600)
 }
 
-fn claim_client_with_interval(port: u16, prefix: &str, interval_seconds: u64) -> Arc<RedisRateLimitClient> {
+fn claim_client_with_interval(
+    port: u16,
+    prefix: &str,
+    interval_seconds: u64,
+) -> Arc<RedisRateLimitClient> {
     let config = RedisConfig::from_plugin_config(
         &serde_json::json!({
             "sync_mode": "redis",
@@ -2744,7 +2747,8 @@ async fn replay_redis_accepts_unlimited_memory_or_noeviction() {
         ("maxmemory-zero", MEMORY_UNLIMITED),
         ("noeviction", MEMORY_NOEVICTION),
     ] {
-        let (port, shutdown) = spawn_memory_policy_redis(MemoryInfoBehavior::Payload(payload)).await;
+        let (port, shutdown) =
+            spawn_memory_policy_redis(MemoryInfoBehavior::Payload(payload)).await;
         let client = claim_client(port, &format!("ferrum:replay_authority_tests:mem-{label}"));
         let authority = ReplayAuthority::shared(Arc::clone(&client), RETENTION);
         wait_until_available(&client).await;
@@ -2765,8 +2769,12 @@ async fn replay_redis_rejects_an_evicting_policy_terminally() {
         ("volatile-lru", MEMORY_VOLATILE),
         ("allkeys-lfu", MEMORY_ALLKEYS),
     ] {
-        let (port, shutdown) = spawn_memory_policy_redis(MemoryInfoBehavior::Payload(payload)).await;
-        let client = claim_client(port, &format!("ferrum:replay_authority_tests:evict-{label}"));
+        let (port, shutdown) =
+            spawn_memory_policy_redis(MemoryInfoBehavior::Payload(payload)).await;
+        let client = claim_client(
+            port,
+            &format!("ferrum:replay_authority_tests:evict-{label}"),
+        );
         let authority = ReplayAuthority::shared(Arc::clone(&client), RETENTION);
         wait_until(
             || client.is_topology_unsupported(),
