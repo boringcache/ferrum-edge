@@ -39525,7 +39525,7 @@ pub(crate) async fn proxy_h3_plain_http_mesh_buffered(
 
 /// One H3 plain mesh helper future, heap-allocated so it is not a frame slot
 /// in the H3 bridge. See [`boxed_proxy_h3_plain_http_mesh_buffered`].
-type BoxedH3PlainHttpMeshBufferedFuture<'a> =
+pub(crate) type BoxedH3PlainHttpMeshBufferedFuture<'a> =
     std::pin::Pin<Box<dyn std::future::Future<Output = retry::BackendResponse> + Send + 'a>>;
 
 /// The H3 plain mesh helper, CONSTRUCTED OUT OF LINE and returned boxed.
