@@ -18,8 +18,8 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use ferrum_edge::proxy::netns_capture::{
-    DEFAULT_PROC_ROOT, first_pid_in_cgroup_via_proc_root_until,
-    is_proc_scan_deadline, proc_cgroup_is_in_subtree,
+    DEFAULT_PROC_ROOT, first_pid_in_cgroup_via_proc_root_until, is_proc_scan_deadline,
+    proc_cgroup_is_in_subtree,
 };
 
 /// The pod cgroup as the node-agent registry publishes it: an ABSOLUTE
