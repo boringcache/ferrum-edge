@@ -217,10 +217,9 @@ async fn wait_for_owned_gateway(
 
     loop {
         if let Some(status) = child.try_wait()? {
-            return Err(format!(
-                "passthrough gateway exited after reporting ready with {status}"
-            )
-            .into());
+            return Err(
+                format!("passthrough gateway exited after reporting ready with {status}").into(),
+            );
         }
         if Instant::now() >= deadline {
             return Err(format!(
@@ -323,8 +322,13 @@ where
             .env_remove("FERRUM_METRICS_ALLOWED_CIDRS");
         let mut child = cmd.spawn().expect("Failed to start gateway");
 
-        match wait_for_owned_gateway(&mut child, admin_port, &observability_token, proxy_listen_port)
-            .await
+        match wait_for_owned_gateway(
+            &mut child,
+            admin_port,
+            &observability_token,
+            proxy_listen_port,
+        )
+        .await
         {
             Ok(()) => return (child, proxy_listen_port, http_port, admin_port, dir),
             Err(error) => {
