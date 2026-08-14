@@ -86,12 +86,13 @@ action plus `Swatinem/rust-cache` with shared key `ci-fips`. Cache keys include
 the Rust toolchain, `Cargo.lock`, workspace config, and the FIPS feature set, so
 AWS-LC source-build outputs invalidate when those inputs change. The cache
 action holds the GitHub Actions cache credential inside the action process;
-PR-controlled `run:` steps never receive that credential, and fork pull requests
-can restore but cannot write. `cache-on-failure` preserves compile work across
-runner-loss retries. A `workflow_dispatch` input `force_cold_cache` skips
-restore so a hosted cold-cache run still proves every live assertion. Path
-planning is fail-closed: a missing or unknown trusted planner runs the compile
-gate rather than skipping it.
+PR-controlled `run:` steps never receive that credential. rust-cache `save-if`
+is false when `github.event.pull_request.head.repo.fork` is true, so fork pull
+requests restore `ci-fips` and cannot save. Trusted runs keep `cache-on-failure`
+so a runner-loss retry can reuse compile work. A `workflow_dispatch` input
+`force_cold_cache` skips restore so a hosted cold-cache run still proves every
+live assertion. Path planning is fail-closed: a missing or unknown trusted
+planner runs the compile gate rather than skipping it.
 
 ## Current capability
 

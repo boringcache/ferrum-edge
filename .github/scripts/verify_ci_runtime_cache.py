@@ -3,7 +3,8 @@
 
 Does not compile Rust or build images. Proves workflow permission/caching
 boundaries, pinned actions, fail-closed planning, preserved live contracts,
-and telemetry redaction.
+telemetry redaction, structurally separate BuildKit cache-to vs fork
+restore-only steps, and rust-cache save-if so fork PRs cannot save.
 """
 
 from __future__ import annotations
@@ -47,6 +48,17 @@ def require(condition: bool, message: str, failures: list[str]) -> None:
         failures.append(message)
 
 
+FORK_IS_TRUE = "github.event.pull_request.head.repo.fork == true"
+FORK_NOT_TRUE = "github.event.pull_request.head.repo.fork != true"
+COLD_IS_TRUE = "github.event.inputs.force_cold_cache == 'true'"
+COLD_NOT_TRUE = "github.event.inputs.force_cold_cache != 'true'"
+SAVE_IF_NON_FORK = re.compile(
+    r"(?m)^[ \t]*save-if:\s*(?:['\"]?)(?:\$\{\{\s*)?"
+    r"github\.event\.pull_request\.head\.repo\.fork\s*!=\s*true"
+    r"(?:\s*\}\})?(?:['\"]?)\s*(?:#.*)?$"
+)
+
+
 def extract_job(workflow: str, job: str) -> str:
     match = re.search(
         rf"(?ms)^  {re.escape(job)}:\n(?P<body>.*?)(?=^  [A-Za-z0-9_-]+:\n|\Z)",
@@ -55,6 +67,180 @@ def extract_job(workflow: str, job: str) -> str:
     if match is None:
         return ""
     return match.group("body")
+
+
+def job_steps(job_body: str) -> list[str]:
+    match = re.search(r"(?ms)^    steps:\n(.*)\Z", job_body)
+    if match is None:
+        return []
+    chunks = re.split(r"(?m)^(?=      - )", match.group(1))
+    return [chunk for chunk in chunks if chunk.lstrip().startswith("- ")]
+
+
+def step_if(step: str) -> str:
+    match = re.search(r"(?m)^      (?:- )?if:\s*(.+)\s*$", step)
+    if match:
+        return match.group(1).strip()
+    match = re.search(r"(?m)^        if:\s*(.+)\s*$", step)
+    if match:
+        return match.group(1).strip()
+    return ""
+
+
+def step_uses(step: str) -> str:
+    match = re.search(r"(?m)^      (?:- )?uses:\s*(\S+)", step)
+    if match is None:
+        match = re.search(r"(?m)^        uses:\s*(\S+)", step)
+    if match is None:
+        return ""
+    return match.group(1).split("#", 1)[0].strip()
+
+
+def step_with(step: str) -> str:
+    match = re.search(r"(?m)^        with:\n", step)
+    if match is None:
+        return ""
+    lines: list[str] = []
+    for line in step[match.end() :].splitlines(keepends=True):
+        if line.strip() == "":
+            lines.append(line)
+            continue
+        indent = len(line) - len(line.lstrip(" "))
+        if indent >= 10:
+            lines.append(line)
+            continue
+        break
+    return "".join(lines)
+
+
+def with_has_key(with_block: str, key: str) -> bool:
+    return re.search(rf"(?m)^[ \t]*{re.escape(key)}:", with_block) is not None
+
+
+def rust_cache_with_blocks(text: str) -> list[str]:
+    blocks: list[str] = []
+    for chunk in re.split(r"(?m)^(?=[ ]{2,}- )", text):
+        if RUST_CACHE not in chunk or not re.search(r"(?m)^[ ]{2,}- ", chunk):
+            continue
+        with_match = re.search(
+            r"(?ms)^[ \t]+with:\n((?:[ \t]+[^\n]*\n)*)",
+            chunk,
+        )
+        blocks.append(with_match.group(1) if with_match else "")
+    return blocks
+
+
+def check_rust_cache_fork_save_if(
+    text: str,
+    source: str,
+    failures: list[str],
+    *,
+    expected_count: int,
+) -> None:
+    blocks = rust_cache_with_blocks(text)
+    require(
+        len(blocks) == expected_count,
+        f"{source} must have exactly {expected_count} pinned rust-cache "
+        f"site(s), found {len(blocks)}",
+        failures,
+    )
+    for index, block in enumerate(blocks, 1):
+        require(
+            SAVE_IF_NON_FORK.search(block) is not None,
+            f"{source} rust-cache site {index} must set save-if so fork PRs "
+            "restore only",
+            failures,
+        )
+        require(
+            "cache-on-failure:" in block and "true" in block,
+            f"{source} rust-cache site {index} must keep cache-on-failure true",
+            failures,
+        )
+
+
+def check_buildkit_cache_boundary(
+    job_body: str,
+    source: str,
+    failures: list[str],
+) -> None:
+    steps = [
+        step
+        for step in job_steps(job_body)
+        if step_uses(step).startswith(BUILD_PUSH)
+    ]
+    trusted = []
+    fork_restore = []
+    cold = []
+    for step in steps:
+        condition = step_if(step)
+        with_block = step_with(step)
+        has_from = with_has_key(with_block, "cache-from")
+        has_to = with_has_key(with_block, "cache-to")
+        if FORK_IS_TRUE in condition and FORK_NOT_TRUE not in condition:
+            require(
+                COLD_NOT_TRUE in condition,
+                f"{source} fork restore-only BuildKit step must not run on "
+                "force_cold_cache",
+                failures,
+            )
+            require(
+                has_from,
+                f"{source} fork restore-only BuildKit step must restore cache-from",
+                failures,
+            )
+            require(
+                not has_to,
+                f"{source} must omit cache-to on the fork restore-only BuildKit step",
+                failures,
+            )
+            fork_restore.append(step)
+        elif has_to:
+            require(
+                FORK_NOT_TRUE in condition and FORK_IS_TRUE not in condition,
+                f"{source} must exclude fork PRs from every cache-to BuildKit step",
+                failures,
+            )
+            require(
+                COLD_NOT_TRUE in condition,
+                f"{source} cache-to BuildKit step must not run on force_cold_cache",
+                failures,
+            )
+            require(
+                has_from,
+                f"{source} trusted-publish BuildKit step must restore cache-from",
+                failures,
+            )
+            trusted.append(step)
+        elif COLD_IS_TRUE in condition:
+            require(
+                not has_from and not has_to,
+                f"{source} force-cold BuildKit step must omit cache-from and cache-to",
+                failures,
+            )
+            cold.append(step)
+        else:
+            failures.append(
+                f"{source} has a pinned build-push step that is not a trusted-publish, "
+                "fork restore-only, or force-cold path"
+            )
+    require(
+        bool(trusted),
+        f"{source} must provide a trusted-publish BuildKit step "
+        "(cache-from + cache-to, excluding fork PRs)",
+        failures,
+    )
+    require(
+        bool(fork_restore),
+        f"{source} must provide a fork restore-only BuildKit step "
+        "(cache-from, no cache-to, fork PRs only)",
+        failures,
+    )
+    require(
+        bool(cold),
+        f"{source} must provide a force-cold BuildKit step with neither cache-from "
+        "nor cache-to",
+        failures,
+    )
 
 
 def remote_uses(text: str) -> list[str]:
@@ -238,6 +424,24 @@ def check_fips(workflow: str, failures: list[str]) -> None:
         "FIPS workflow must pin dtolnay/rust-toolchain",
         failures,
     )
+    check_rust_cache_fork_save_if(
+        compile_job,
+        "fips-compile",
+        failures,
+        expected_count=1,
+    )
+    check_rust_cache_fork_save_if(
+        clippy_job,
+        "fips-clippy",
+        failures,
+        expected_count=1,
+    )
+    check_rust_cache_fork_save_if(
+        test_job,
+        "fips-test",
+        failures,
+        expected_count=1,
+    )
 
 
 def check_production_smoke(workflow: str, failures: list[str]) -> None:
@@ -277,10 +481,23 @@ def check_production_smoke(workflow: str, failures: list[str]) -> None:
         "eBPF production-image job must keep FEATURES=cloud-secrets,ebpf",
         failures,
     )
+    check_buildkit_cache_boundary(
+        default_job,
+        "production-dockerfile-smoke-default",
+        failures,
+    )
+    check_buildkit_cache_boundary(
+        ebpf_job,
+        "production-dockerfile-smoke-ebpf",
+        failures,
+    )
     require(
-        "github.event.pull_request.head.repo.fork" in default_job
-        and "github.event.pull_request.head.repo.fork" in ebpf_job,
-        "production-image jobs must omit cache-to on fork pull requests",
+        "trusted-publish" in default_job
+        and "fork-restore-only" in default_job
+        and "trusted-publish" in ebpf_job
+        and "fork-restore-only" in ebpf_job,
+        "production-image telemetry must name the trusted-publish and "
+        "fork-restore-only cache-to policies",
         failures,
     )
     require(
@@ -365,6 +582,12 @@ def check_shared_actions(failures: list[str]) -> None:
         "setup-rust-ci must keep the pinned rust-cache action",
         failures,
     )
+    check_rust_cache_fork_save_if(
+        rust_ci,
+        "setup-rust-ci",
+        failures,
+        expected_count=1,
+    )
 
 
 def check_docs_and_coverage(failures: list[str]) -> None:
@@ -392,8 +615,23 @@ def check_docs_and_coverage(failures: list[str]) -> None:
         failures,
     )
     require(
+        "save-if" in ci_cd and "fork" in ci_cd.lower(),
+        "docs/ci_cd.md must document rust-cache save-if for fork pull requests",
+        failures,
+    )
+    require(
+        "cache-to" in ci_cd and "restore-only" in ci_cd,
+        "docs/ci_cd.md must document that fork PRs omit BuildKit cache-to",
+        failures,
+    )
+    require(
         "trusted" in fips_doc.lower() and "cache" in fips_doc.lower(),
         "docs/fips.md must describe the FIPS CI cache trust boundary",
+        failures,
+    )
+    require(
+        "save-if" in fips_doc,
+        "docs/fips.md must document rust-cache save-if so fork PRs cannot save",
         failures,
     )
     require(
@@ -469,6 +707,158 @@ def self_test() -> int:
         "self-test: floating tag should fail",
         failures,
     )
+
+    build_push = (
+        f"        uses: {BUILD_PUSH} # v7\n"
+        "        with:\n"
+        "          cache-from: type=gha,scope=production-dockerfile-smoke-default\n"
+    )
+    good_buildkit = (
+        "    steps:\n"
+        "      - name: Build ordinary production runtime\n"
+        f"        if: {COLD_NOT_TRUE} && {FORK_NOT_TRUE}\n"
+        f"{build_push}"
+        "          cache-to: type=gha,mode=max,scope=production-dockerfile-smoke-default\n"
+        "      - name: Build ordinary production runtime (fork restore-only)\n"
+        f"        if: {COLD_NOT_TRUE} && {FORK_IS_TRUE}\n"
+        f"{build_push}"
+        "      - name: Build ordinary production runtime (cold cache)\n"
+        f"        if: {COLD_IS_TRUE}\n"
+        f"        uses: {BUILD_PUSH} # v7\n"
+        "        with:\n"
+        "          provenance: false\n"
+    )
+    good_buildkit_failures: list[str] = []
+    check_buildkit_cache_boundary(
+        good_buildkit,
+        "self-test-good-buildkit",
+        good_buildkit_failures,
+    )
+    require(
+        not good_buildkit_failures,
+        "self-test: structurally split BuildKit cache paths should pass: "
+        + "; ".join(good_buildkit_failures),
+        failures,
+    )
+
+    substring_false_positive = (
+        "    steps:\n"
+        "      - name: Record BuildKit cache restore policy\n"
+        "        env:\n"
+        "          FORK_PR: ${{ github.event.pull_request.head.repo.fork }}\n"
+        "        run: echo telemetry-only\n"
+        "      - name: Build ordinary production runtime\n"
+        f"        if: {COLD_NOT_TRUE}\n"
+        f"{build_push}"
+        "          cache-to: type=gha,mode=max,scope=production-dockerfile-smoke-default\n"
+        "      - name: Build ordinary production runtime (cold cache)\n"
+        f"        if: {COLD_IS_TRUE}\n"
+        f"        uses: {BUILD_PUSH} # v7\n"
+        "        with:\n"
+        "          provenance: false\n"
+    )
+    require(
+        "github.event.pull_request.head.repo.fork" in substring_false_positive,
+        "self-test fixture must include the fork substring the old check trusted",
+        failures,
+    )
+    substring_failures: list[str] = []
+    check_buildkit_cache_boundary(
+        substring_false_positive,
+        "self-test-unconditional-cache-to",
+        substring_failures,
+    )
+    require(
+        any("exclude fork PRs from every cache-to" in item for item in substring_failures)
+        and any("fork restore-only BuildKit step" in item for item in substring_failures),
+        "self-test: fork substring plus unconditional cache-to must fail structurally",
+        failures,
+    )
+
+    fork_cache_to = (
+        "    steps:\n"
+        "      - name: Build ordinary production runtime\n"
+        f"        if: {COLD_NOT_TRUE} && {FORK_NOT_TRUE}\n"
+        f"{build_push}"
+        "          cache-to: type=gha,mode=max,scope=production-dockerfile-smoke-default\n"
+        "      - name: Build ordinary production runtime (fork restore-only)\n"
+        f"        if: {COLD_NOT_TRUE} && {FORK_IS_TRUE}\n"
+        f"{build_push}"
+        "          cache-to: type=gha,mode=max,scope=production-dockerfile-smoke-default\n"
+        "      - name: Build ordinary production runtime (cold cache)\n"
+        f"        if: {COLD_IS_TRUE}\n"
+        f"        uses: {BUILD_PUSH} # v7\n"
+        "        with:\n"
+        "          provenance: false\n"
+    )
+    fork_cache_to_failures: list[str] = []
+    check_buildkit_cache_boundary(
+        fork_cache_to,
+        "self-test-fork-cache-to",
+        fork_cache_to_failures,
+    )
+    require(
+        any(
+            "omit cache-to on the fork restore-only BuildKit step" in item
+            for item in fork_cache_to_failures
+        ),
+        "self-test: reintroducing cache-to on a fork path must fail",
+        failures,
+    )
+
+    rust_step = (
+        "      - name: Cache FIPS Rust\n"
+        f"        uses: {RUST_CACHE} # v2\n"
+        "        with:\n"
+        "          shared-key: ci-fips\n"
+        "          cache-on-failure: \"true\"\n"
+    )
+    good_rust = rust_step + (
+        "          save-if: ${{ github.event.pull_request.head.repo.fork != true }}\n"
+    )
+    good_rust_failures: list[str] = []
+    check_rust_cache_fork_save_if(
+        good_rust,
+        "self-test-good-rust-cache",
+        good_rust_failures,
+        expected_count=1,
+    )
+    require(
+        not good_rust_failures,
+        "self-test: rust-cache save-if for non-fork should pass: "
+        + "; ".join(good_rust_failures),
+        failures,
+    )
+
+    missing_save_if_failures: list[str] = []
+    check_rust_cache_fork_save_if(
+        rust_step,
+        "self-test-missing-save-if",
+        missing_save_if_failures,
+        expected_count=1,
+    )
+    require(
+        any("save-if so fork PRs restore only" in item for item in missing_save_if_failures),
+        "self-test: removing rust-cache save-if must fail",
+        failures,
+    )
+
+    inverted_save_if = rust_step + (
+        "          save-if: ${{ github.event.pull_request.head.repo.fork == true }}\n"
+    )
+    inverted_failures: list[str] = []
+    check_rust_cache_fork_save_if(
+        inverted_save_if,
+        "self-test-inverted-save-if",
+        inverted_failures,
+        expected_count=1,
+    )
+    require(
+        any("save-if so fork PRs restore only" in item for item in inverted_failures),
+        "self-test: inverted rust-cache save-if must fail",
+        failures,
+    )
+
     for failure in failures:
         print(f"::error::{failure}", file=sys.stderr)
     return 1 if failures else 0

@@ -232,15 +232,26 @@ jobs:
       - name: Record BuildKit cache restore policy
         env:
           FORK_PR: ${{ github.event.pull_request.head.repo.fork }}
+          FORCE_COLD: ${{ github.event.inputs.force_cold_cache }}
         run: |
           python3 .github/scripts/ci_runtime_telemetry.py start --phase image-build
+          if [ "${FORCE_COLD:-}" = true ]; then
+            policy=force-cold
+          elif [ "${FORK_PR:-}" = true ]; then
+            policy=fork-restore-only
+          else
+            policy=trusted-publish
+          fi
           python3 .github/scripts/ci_runtime_telemetry.py cache \
             --name buildkit-gha \
             --hit "" \
-            --note "scope=production-dockerfile-smoke-default fork=${FORK_PR:-false}"
+            --note "scope=production-dockerfile-smoke-default policy=${policy} fork=${FORK_PR:-false}"
 
+      # Trusted same-repo PRs and workflow_dispatch restore and publish the
+      # scoped GHA cache. Fork PRs restore that cache and must not set cache-to.
+      # force_cold_cache skips both restore and publish.
       - name: Build ordinary production runtime
-        if: github.event.inputs.force_cold_cache != 'true'
+        if: github.event.inputs.force_cold_cache != 'true' && github.event.pull_request.head.repo.fork != true
         uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7
         with:
           context: .
@@ -250,6 +261,18 @@ jobs:
           tags: ferrum-edge:production-default-smoke
           cache-from: type=gha,scope=production-dockerfile-smoke-default
           cache-to: type=gha,mode=max,scope=production-dockerfile-smoke-default
+          provenance: false
+
+      - name: Build ordinary production runtime (fork restore-only)
+        if: github.event.inputs.force_cold_cache != 'true' && github.event.pull_request.head.repo.fork == true
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7
+        with:
+          context: .
+          file: Dockerfile
+          target: runtime
+          load: true
+          tags: ferrum-edge:production-default-smoke
+          cache-from: type=gha,scope=production-dockerfile-smoke-default
           provenance: false
 
       - name: Build ordinary production runtime (cold cache)
@@ -329,15 +352,26 @@ jobs:
       - name: Record BuildKit cache restore policy
         env:
           FORK_PR: ${{ github.event.pull_request.head.repo.fork }}
+          FORCE_COLD: ${{ github.event.inputs.force_cold_cache }}
         run: |
           python3 .github/scripts/ci_runtime_telemetry.py start --phase image-build
+          if [ "${FORCE_COLD:-}" = true ]; then
+            policy=force-cold
+          elif [ "${FORK_PR:-}" = true ]; then
+            policy=fork-restore-only
+          else
+            policy=trusted-publish
+          fi
           python3 .github/scripts/ci_runtime_telemetry.py cache \
             --name buildkit-gha \
             --hit "" \
-            --note "scope=production-dockerfile-smoke-ebpf fork=${FORK_PR:-false}"
+            --note "scope=production-dockerfile-smoke-ebpf policy=${policy} fork=${FORK_PR:-false}"
 
+      # Trusted same-repo PRs and workflow_dispatch restore and publish the
+      # scoped GHA cache. Fork PRs restore that cache and must not set cache-to.
+      # force_cold_cache skips both restore and publish.
       - name: Build eBPF production runtime
-        if: github.event.inputs.force_cold_cache != 'true'
+        if: github.event.inputs.force_cold_cache != 'true' && github.event.pull_request.head.repo.fork != true
         uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7
         with:
           context: .
@@ -349,6 +383,20 @@ jobs:
           tags: ferrum-edge:production-ebpf-smoke
           cache-from: type=gha,scope=production-dockerfile-smoke-ebpf
           cache-to: type=gha,mode=max,scope=production-dockerfile-smoke-ebpf
+          provenance: false
+
+      - name: Build eBPF production runtime (fork restore-only)
+        if: github.event.inputs.force_cold_cache != 'true' && github.event.pull_request.head.repo.fork == true
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7
+        with:
+          context: .
+          file: Dockerfile
+          target: runtime-ebpf
+          build-args: |
+            FEATURES=cloud-secrets,ebpf
+          load: true
+          tags: ferrum-edge:production-ebpf-smoke
+          cache-from: type=gha,scope=production-dockerfile-smoke-ebpf
           provenance: false
 
       - name: Build eBPF production runtime (cold cache)
@@ -444,7 +492,9 @@ jobs:
             echo "## Production Dockerfile eBPF image smoke"
             echo ""
             echo "Ordinary \`runtime\` and distroless \`runtime-ebpf\` images built in parallel"
-            echo "through BuildKit with a scoped GitHub Actions cache. Distroless inventories passed."
+            echo "through BuildKit. Trusted runs restore and publish a scoped GitHub Actions cache;"
+            echo "fork pull requests restore that cache and do not set \`cache-to\`. Distroless"
+            echo "inventories passed."
             echo ""
             echo "Warm PR target: <=30 minutes, p95 <=45 minutes, measured on hosted runs."
           } >> "$GITHUB_STEP_SUMMARY"

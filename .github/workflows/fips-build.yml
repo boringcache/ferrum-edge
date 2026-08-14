@@ -13,6 +13,7 @@ name: FIPS Build Policy
 # 3. `fips-compile` builds the FIPS binary and every claimed feature combination
 #    once, then rust-cache/sccache persist the AWS-LC + rustc artifacts so a
 #    later clippy/test job or a runner-loss retry does not start from zero.
+#    Fork pull requests restore `ci-fips` but do not save (`save-if`).
 # 4. `fips-clippy` and `fips-test` restore that cache in parallel.
 # 5. `fips-build` keeps the `FIPS Build & Test` check name and fails closed.
 #
@@ -289,17 +290,19 @@ jobs:
           add-job-id-key: "false"
           cache-directories: ${{ github.workspace }}/.cache/sccache
           cache-on-failure: "true"
+          save-if: ${{ github.event.pull_request.head.repo.fork != true }}
 
       - name: Record rust-cache restore
         if: github.event.inputs.force_cold_cache != 'true'
         env:
           CACHE_HIT: ${{ steps.rust-cache.outputs.cache-hit }}
+          FORK_PR: ${{ github.event.pull_request.head.repo.fork }}
         run: |
           python3 .github/scripts/ci_runtime_telemetry.py cache \
             --name rust-cache \
             --hit "$CACHE_HIT" \
             --path "${GITHUB_WORKSPACE}/.cache/sccache" \
-            --note "shared-key=ci-fips toolchain+lockfile+aws-lc"
+            --note "shared-key=ci-fips save-if=non-fork fork=${FORK_PR:-false} toolchain+lockfile+aws-lc"
 
       - name: Record cold-cache proof
         if: github.event.inputs.force_cold_cache == 'true'
@@ -391,17 +394,19 @@ jobs:
           add-job-id-key: "false"
           cache-directories: ${{ github.workspace }}/.cache/sccache
           cache-on-failure: "true"
+          save-if: ${{ github.event.pull_request.head.repo.fork != true }}
 
       - name: Record rust-cache restore
         if: github.event.inputs.force_cold_cache != 'true'
         env:
           CACHE_HIT: ${{ steps.rust-cache.outputs.cache-hit }}
+          FORK_PR: ${{ github.event.pull_request.head.repo.fork }}
         run: |
           python3 .github/scripts/ci_runtime_telemetry.py cache \
             --name rust-cache \
             --hit "$CACHE_HIT" \
             --path "${GITHUB_WORKSPACE}/.cache/sccache" \
-            --note "shared-key=ci-fips"
+            --note "shared-key=ci-fips save-if=non-fork fork=${FORK_PR:-false}"
 
       - name: Lint the FIPS profile
         run: |
@@ -452,17 +457,19 @@ jobs:
           add-job-id-key: "false"
           cache-directories: ${{ github.workspace }}/.cache/sccache
           cache-on-failure: "true"
+          save-if: ${{ github.event.pull_request.head.repo.fork != true }}
 
       - name: Record rust-cache restore
         if: github.event.inputs.force_cold_cache != 'true'
         env:
           CACHE_HIT: ${{ steps.rust-cache.outputs.cache-hit }}
+          FORK_PR: ${{ github.event.pull_request.head.repo.fork }}
         run: |
           python3 .github/scripts/ci_runtime_telemetry.py cache \
             --name rust-cache \
             --hit "$CACHE_HIT" \
             --path "${GITHUB_WORKSPACE}/.cache/sccache" \
-            --note "shared-key=ci-fips"
+            --note "shared-key=ci-fips save-if=non-fork fork=${FORK_PR:-false}"
 
       - name: FIPS policy, key-admission, and handshake tests
         # One unit_tests invocation and one integration_tests invocation so the

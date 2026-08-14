@@ -238,9 +238,11 @@ targets build in parallel with `docker/build-push-action`, sharing a scoped
 BuildKit GitHub Actions cache (`production-dockerfile-smoke-default` /
 `production-dockerfile-smoke-ebpf`). The Dockerfile declares `ARG FEATURES`
 after the shared apt and manifest layers so those two feature sets reuse
-toolchain work. Cache export uses the action process (the same restore/save
-pattern as `ambient-host-udp-live`); fork pull requests cannot write the GitHub
-Actions cache. A trusted-base copy of `.github/scripts/ci_runtime_plan.py`
+toolchain work. Trusted same-repository pull requests and `workflow_dispatch`
+restore and publish that cache (`cache-from` + `cache-to`). Fork pull requests
+use a separate restore-only build step (`cache-from` only; no `cache-to`).
+`force_cold_cache` skips both restore and publish. A trusted-base copy of
+`.github/scripts/ci_runtime_plan.py`
 skips the smoke only when the diff cannot change those images; a missing
 planner fails closed toward running.
 
@@ -248,9 +250,11 @@ planner fails closed toward running.
 Compile, claimed-profile `cargo check`, clippy `-D warnings`, and the
 policy/key-admission/handshake tests share rust-cache key `ci-fips` and a
 local-disk sccache directory. The compile job saves first; clippy and tests
-restore in parallel. `cache-on-failure` keeps that compile work across
-runner-loss retries (exit 143 after a green suite). Example plugins stay out of
-the FIPS artifact (`FERRUM_CUSTOM_PLUGINS` is unset).
+restore in parallel. rust-cache `save-if` is false for fork pull requests, so
+those jobs restore `ci-fips` and cannot save. Trusted runs keep
+`cache-on-failure` so a runner-loss retry (exit 143 after a green suite) can
+reuse compile work. Example plugins stay out of the FIPS artifact
+(`FERRUM_CUSTOM_PLUGINS` is unset).
 
 **Trust boundary.** Untrusted `run:` steps never receive GitHub Actions cache
 write credentials. `setup-sccache` keeps the sccache GHA backend disabled and
@@ -583,7 +587,8 @@ image from those cached host-built artifacts instead of recompiling inside
 Docker. A separate production-Dockerfile smoke builds the ordinary `runtime`
 target (which must omit `ip`) and the privileged `runtime-ebpf` target (which
 must contain `ip`) **in parallel** through BuildKit, restoring a scoped GitHub
-Actions layer cache produced by trusted runs. Each job then checks a normalized
+Actions layer cache produced by trusted runs. Fork pull requests restore that
+cache and do not publish `cache-to`. Each job then checks a normalized
 filesystem inventory for shells and package managers. A trusted-base path
 planner skips the smoke when the diff cannot change those images; uncertain
 classification runs the full gate. It then creates a disposable dual-stack kind cluster with two

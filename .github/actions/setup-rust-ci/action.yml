@@ -11,6 +11,8 @@ description: >-
   directories using isolated shared keys so incompatible job/profile/target
   artifacts do not mix. rust-cache saves on failure (`cache-on-failure`) so a
   runner-loss or later-phase failure can still reuse compile work on retry.
+  Fork pull requests restore that cache and do not save (`save-if` is false
+  when `github.event.pull_request.head.repo.fork` is true).
   Centralizes the setup block so individual jobs only declare their cache key
   and any extra rustup components.
 
@@ -204,6 +206,7 @@ runs:
         shared-key: ${{ inputs.shared-key }}
         cache-directories: ${{ github.workspace }}/.cache/sccache
         cache-on-failure: "true"
+        save-if: ${{ github.event.pull_request.head.repo.fork != true }}
 
     - name: Pre-fetch crate dependencies (isolate transient registry flakes)
       shell: bash
