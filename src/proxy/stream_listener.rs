@@ -1604,8 +1604,8 @@ impl StreamListenerManager {
         // Issue #3857. Publish the client-trust generation AFTER the material is
         // live in every active `DtlsServer`, so a session that reads the new
         // generation provably snapshotted the new verifier. A generation with no
-        // client-certificate verification publishes the empty identity, which is
-        // a subset of everything and therefore never reads as a withdrawal.
+        // client-certificate verification leaves this scope unarmed and publishes
+        // no trust identity.
         if let Some(material) = accepted.config.client_trust.clone() {
             let publication = crate::tls::client_trust::publish_accepted_material(
                 crate::tls::ClientTrustScope::FrontendDtls,
