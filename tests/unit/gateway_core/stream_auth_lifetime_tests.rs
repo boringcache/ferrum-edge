@@ -4651,6 +4651,88 @@ fn every_native_h3_upload_site_attributes_from_the_captured_composition() {
     }
 }
 
+/// The H3→plain mesh force-buffer drain uses the composed authorization bound
+/// and routes a captured authorization winner to the fixed pre-commitment 401.
+#[test]
+fn cross_protocol_mesh_force_buffer_uses_the_composed_authorization_bound() {
+    let cross = include_str!("../../../src/http3/cross_protocol.rs");
+    let dispatch = cross
+        .split("async fn dispatch_plain<S>(")
+        .nth(1)
+        .expect("cross-protocol plain dispatcher")
+        .split("async fn dispatch_grpc<S>(")
+        .next()
+        .expect("bounded cross-protocol plain dispatcher");
+    let bound_at = dispatch
+        .find("let plain_write_bound =")
+        .expect("plain_write_bound must be composed in dispatch_plain");
+    let mesh_block_start = dispatch
+        .find("target_requires_http_mesh_egress")
+        .expect("mesh force-buffer gate");
+    assert!(
+        bound_at < mesh_block_start,
+        "plain_write_bound must be composed before the mesh force-buffer branch"
+    );
+    let mesh_block = &dispatch[mesh_block_start..];
+    let mesh_block_end = mesh_block
+        .find("let (response, bytes_sent, mut backend_admission_permits")
+        .expect("bounded mesh force-buffer");
+    let mesh_collection = &mesh_block[..mesh_block_end];
+    assert!(
+        mesh_collection.contains("collect_h3_request_body_under_authorization(")
+            && mesh_collection.contains("plain_write_bound"),
+        "the mesh force-buffer must drain under the composed authorization bound"
+    );
+    assert!(
+        !mesh_collection.contains("collect_h3_request_body_with_deadline(")
+            && !mesh_collection.contains("grpc_web_deadline_at"),
+        "the mesh force-buffer must not compose against the client RPC deadline alone"
+    );
+    let mesh_deadline = mesh_collection
+        .split("H3RequestBodyReadError::DeadlineExceeded")
+        .nth(1)
+        .expect("mesh force-buffer DeadlineExceeded arm")
+        .split("H3RequestBodyReadError::TimedOut")
+        .next()
+        .expect("bounded mesh force-buffer DeadlineExceeded arm");
+    assert!(
+        mesh_deadline.contains("DeadlineExceeded(\n                authorization_expiry,")
+            || mesh_deadline.contains("DeadlineExceeded(authorization_expiry)"),
+        "the mesh force-buffer must bind the captured winner rather than a unit variant"
+    );
+    let mesh_auth = mesh_deadline
+        .split("if let Some(termination) = authorization_expiry {")
+        .nth(1)
+        .expect("mesh force-buffer Some(termination) arm")
+        .split("return write_plain_grpc_web_client_deadline(")
+        .next()
+        .expect("bounded mesh force-buffer Some(termination) arm");
+    let mesh_record = mesh_auth
+        .find("record_authorization_termination_once(")
+        .expect("mesh force-buffer must latch the termination once");
+    let mesh_write = mesh_auth
+        .find("write_plain_authorization_expired_terminal(")
+        .expect("mesh force-buffer must take the fixed pre-commitment 401");
+    assert!(
+        mesh_record < mesh_write,
+        "fixed-cardinality authorization termination must be recorded before the 401 write"
+    );
+    assert!(
+        mesh_auth.contains("StreamAuthProtocolFamily::Http"),
+        "the mesh force-buffer is the HTTP family on the plain bridge"
+    );
+    assert!(
+        !mesh_auth.contains("write_plain_gateway_error(")
+            && !mesh_auth.contains("warn!(")
+            && !mesh_auth.contains("error!("),
+        "the authorization terminal must stay redacted and must not log identity"
+    );
+    assert!(
+        mesh_deadline.contains("write_plain_grpc_web_client_deadline("),
+        "DeadlineExceeded(None) must keep the client's own gRPC-Web/client deadline terminal"
+    );
+}
+
 // --- Captured attribution for the pre-commitment phase bound ----------------
 //
 // Two very different owners can drive the same instant: the client's own

@@ -2081,13 +2081,15 @@ where
 
     // Mesh egress needs an exact replayable body for the shared H1/H2 HBONE /
     // Sidecar mesh-mTLS pools. Force-buffer a streaming upload when the
-    // selected target is mesh-tagged (issue #3620).
+    // selected target is mesh-tagged (issue #3620). Drain under the composed
+    // authorization bound so an elapsed credential cannot complete a ready
+    // upload (issue #3815); the client-RPC wrapper would ignore that owner.
     let (prebuffered_body, raw_prebuffered_body_bytes) = if prebuffered_body.is_none()
         && upstream_target.is_some_and(crate::proxy::target_requires_http_mesh_egress)
     {
-        match super::server::collect_h3_request_body_with_deadline(
+        match super::server::collect_h3_request_body_under_authorization(
             drain_h3_body(stream, effective_max_request_body_size_bytes),
-            grpc_web_deadline_at,
+            plain_write_bound,
             proxy.backend_read_timeout_ms,
         )
         .await
@@ -2114,13 +2116,31 @@ where
                 )
                 .await;
             }
-            Err(super::server::H3RequestBodyReadError::DeadlineExceeded) => {
+            // The winner was captured where BOTH instants were known, so a late
+            // wake cannot reattribute a strictly earlier client RPC deadline to
+            // the gateway's security decision.
+            Err(super::server::H3RequestBodyReadError::DeadlineExceeded(
+                authorization_expiry,
+            )) => {
                 release_cross_protocol_circuit_breaker_probe_on_admission_reject(
                     state,
                     proxy,
                     cb_target_key,
                     cb_retry_probe_slot_available,
                 );
+                if let Some(termination) = authorization_expiry {
+                    ctx.record_authorization_termination_once(
+                        termination,
+                        crate::proxy::auth_lifetime::StreamAuthProtocolFamily::Http,
+                    );
+                    return write_plain_authorization_expired_terminal(
+                        stream,
+                        ctx,
+                        backend_start,
+                        0,
+                    )
+                    .await;
+                }
                 return write_plain_grpc_web_client_deadline(
                     stream,
                     plugins,

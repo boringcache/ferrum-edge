@@ -105,8 +105,16 @@ fn h3_plain_mesh_upload_collection_releases_half_open_probe_before_terminal_writ
     let mesh_collection = &mesh_block[..mesh_block_end];
 
     assert!(
-        mesh_collection.contains("collect_h3_request_body_with_deadline("),
-        "mesh uploads must force-collect via collect_h3_request_body_with_deadline"
+        mesh_collection.contains("collect_h3_request_body_under_authorization("),
+        "mesh uploads must force-collect via collect_h3_request_body_under_authorization"
+    );
+    assert!(
+        mesh_collection.contains("plain_write_bound"),
+        "mesh force-buffer must drain under the composed authorization bound"
+    );
+    assert!(
+        !mesh_collection.contains("grpc_web_deadline_at"),
+        "mesh force-buffer must not drain under the client RPC deadline wrapper"
     );
     assert_eq!(
         mesh_collection
@@ -144,12 +152,41 @@ fn h3_plain_mesh_upload_collection_releases_half_open_probe_before_terminal_writ
     let deadline_release = deadline
         .find("release_cross_protocol_circuit_breaker_probe_on_admission_reject(")
         .expect("DeadlineExceeded must release HALF_OPEN probe");
+    let auth_arm = deadline
+        .split("if let Some(termination) = authorization_expiry {")
+        .nth(1)
+        .expect("missing mesh collection authorization-expiry arm")
+        .split("return write_plain_grpc_web_client_deadline(")
+        .next()
+        .expect("bounded mesh collection authorization-expiry arm");
+    let auth_record = auth_arm
+        .find("record_authorization_termination_once(")
+        .expect("Some(termination) must record the bounded class");
+    let auth_write = auth_arm
+        .find("write_plain_authorization_expired_terminal(")
+        .expect("Some(termination) must write the grace-bounded 401");
+    assert!(
+        auth_arm.contains("StreamAuthProtocolFamily::Http"),
+        "mesh force-buffer authorization expiry is the HTTP family"
+    );
+    assert!(
+        !auth_arm.contains("write_plain_gateway_error("),
+        "mesh force-buffer authorization expiry must not use the unbounded reject writer"
+    );
     let deadline_write = deadline
         .find("write_plain_grpc_web_client_deadline(")
-        .expect("DeadlineExceeded must write gRPC-Web deadline response");
+        .expect("DeadlineExceeded(None) must keep the gRPC-Web/client deadline response");
+    assert!(
+        deadline_release < auth_record,
+        "DeadlineExceeded must release the probe before recording authorization expiry"
+    );
+    assert!(
+        auth_record < auth_write,
+        "fixed-cardinality authorization termination must be recorded before the 401 write"
+    );
     assert!(
         deadline_release < deadline_write,
-        "DeadlineExceeded must release probe before terminal write"
+        "DeadlineExceeded(None) must release the probe before the client-deadline terminal"
     );
 
     let timeout = mesh_collection

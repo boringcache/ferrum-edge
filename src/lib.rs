@@ -7439,8 +7439,11 @@ pub mod _test_support {
 
     /// Await `future` under an optional absolute deadline using the shared
     /// expiry-first primitive every composed authorization wait now goes
-    /// through. `Err(())` means the bound fired without polling a ready
-    /// future; `Ok` is completion. Ownership is not decided here.
+    /// through. Ambient HBONE WebSocket establishment (issue #3620) uses
+    /// the same race: an already-elapsed deadline and an exact timer/result
+    /// tie expire rather than accepting a ready success. `Err(())` means
+    /// the bound fired without polling a ready future; `Ok` is completion.
+    /// Ownership is not decided here.
     pub async fn await_deadline_first_for_test<F, T>(
         deadline: Option<tokio::time::Instant>,
         future: F,
@@ -9447,20 +9450,6 @@ pub mod _test_support {
             mesh_egress_required,
             reqwest_dispatch_is_http1_only,
         )
-    }
-
-    /// Expiration-first deadline race used by Ambient HBONE WebSocket
-    /// establishment (issue #3620). Unlike `tokio::time::timeout_at`, an
-    /// already-elapsed deadline and an exact timer/result tie expire
-    /// rather than accepting a ready success.
-    pub async fn await_deadline_first_for_test<F, T>(
-        deadline: tokio::time::Instant,
-        fut: F,
-    ) -> Result<T, ()>
-    where
-        F: std::future::Future<Output = T>,
-    {
-        crate::proxy::await_deadline_first(deadline, fut).await
     }
 
     /// Whether the inbound request declared a request body on the wire, as the
