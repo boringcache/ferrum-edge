@@ -1146,25 +1146,17 @@ mod imp {
     /// PID in its cgroup. The inode is stable for the life of the netns and is a
     /// good dedup key across the pod sandbox + container cgroups.
     pub(crate) fn netns_inode_for_cgroup(cgroup_path: &str) -> io::Result<u64> {
-        netns_inode_for_cgroup_at(Path::new(DEFAULT_PROC_ROOT), cgroup_path)
+        netns_inode_for_cgroup_at_until(Path::new(DEFAULT_PROC_ROOT), cgroup_path, None)
     }
 
-    /// [`netns_inode_for_cgroup`] against an EXPLICIT procfs root.
+    /// [`netns_inode_for_cgroup`] against an EXPLICIT procfs root that observes
+    /// the one-shot preflight wall-clock ceiling during target-PID resolution.
     ///
-    /// `proc_root` names where TARGET pids live, and nothing else: the caller's
-    /// own `/proc/self/ns/net` is deliberately untouched by it (see
+    /// `target_proc_root` names where TARGET pids live, and nothing else: the
+    /// caller's own `/proc/self/ns/net` is deliberately untouched by it (see
     /// [`host_netns_inode`]). Only the one-shot Ambient UDP node preflight
     /// passes anything but the default, so it can read the host's pids from a
     /// read-only mount instead of being given pod-scoped `hostPID`.
-    pub(crate) fn netns_inode_for_cgroup_at(
-        target_proc_root: &Path,
-        cgroup_path: &str,
-    ) -> io::Result<u64> {
-        netns_inode_for_cgroup_at_until(target_proc_root, cgroup_path, None)
-    }
-
-    /// [`netns_inode_for_cgroup_at`] that observes the one-shot preflight
-    /// wall-clock ceiling during explicit-root target-PID resolution.
     pub(crate) fn netns_inode_for_cgroup_at_until(
         target_proc_root: &Path,
         cgroup_path: &str,
@@ -1228,23 +1220,17 @@ mod imp {
     /// per-session reply socket) without re-resolving a live PID each time. Used
     /// by `netns_udp_capture`.
     pub(crate) fn open_pod_netns_handle(cgroup_path: &str) -> io::Result<File> {
-        open_pod_netns_handle_at(Path::new(DEFAULT_PROC_ROOT), cgroup_path)
+        open_pod_netns_handle_at_until(Path::new(DEFAULT_PROC_ROOT), cgroup_path, None)
     }
 
-    /// [`open_pod_netns_handle`] against an EXPLICIT procfs root, with the same
-    /// target-pids-only meaning as [`netns_inode_for_cgroup_at`]. Opening the
-    /// handle requires `ptrace_may_access` on the target, which is why the
-    /// preflight still carries `SYS_PTRACE` (and `SYS_ADMIN` for the subsequent
-    /// `setns`) even though it no longer needs the host PID namespace.
-    pub(crate) fn open_pod_netns_handle_at(
-        target_proc_root: &Path,
-        cgroup_path: &str,
-    ) -> io::Result<File> {
-        open_pod_netns_handle_at_until(target_proc_root, cgroup_path, None)
-    }
-
-    /// [`open_pod_netns_handle_at`] that observes the one-shot preflight
-    /// wall-clock ceiling during explicit-root target-PID resolution.
+    /// [`open_pod_netns_handle`] against an EXPLICIT procfs root that observes
+    /// the one-shot preflight wall-clock ceiling during target-PID resolution.
+    ///
+    /// `target_proc_root` has the same target-pids-only meaning as
+    /// [`netns_inode_for_cgroup_at_until`]. Opening the handle requires
+    /// `ptrace_may_access` on the target, which is why the preflight still
+    /// carries `SYS_PTRACE` (and `SYS_ADMIN` for the subsequent `setns`) even
+    /// though it no longer needs the host PID namespace.
     pub(crate) fn open_pod_netns_handle_at_until(
         target_proc_root: &Path,
         cgroup_path: &str,
@@ -1465,9 +1451,8 @@ mod imp {
 /// resolution recipe as the TCP node-waypoint capture path.
 #[cfg(target_os = "linux")]
 pub(crate) use imp::{
-    host_netns_inode, netns_inode_for_cgroup, netns_inode_for_cgroup_at,
-    netns_inode_for_cgroup_at_until, open_pod_netns_handle, open_pod_netns_handle_at,
-    open_pod_netns_handle_at_until, run_in_netns,
+    host_netns_inode, netns_inode_for_cgroup, netns_inode_for_cgroup_at_until,
+    open_pod_netns_handle, open_pod_netns_handle_at_until, run_in_netns,
 };
 
 #[cfg(test)]
