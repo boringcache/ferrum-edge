@@ -3527,7 +3527,8 @@ async fn process_new_session_datagram(
         // client rather than the load balancer's socket address, and include the
         // ClusterIP so one source socket addressing two same-port Services cannot
         // share a Round-Robin slot or consistent-hash bucket.
-        let lb_hash_key = udp_session_lb_hash_key(identity.resolved().ip(), session_key.destination);
+        let lb_hash_key =
+            udp_session_lb_hash_key(identity.resolved().ip(), session_key.destination);
         let (backend_host, backend_port) = resolve_backend_target(
             &view.proxy,
             &epoch.load_balancer,
@@ -6606,13 +6607,9 @@ fn resolve_or_reuse_backend_target(
             }
             Ok(target)
         }
-        None => resolve_backend_target(
-            proxy,
-            lb_snapshot,
-            health_checker,
-            lb_hash_key,
-            destination,
-        ),
+        None => {
+            resolve_backend_target(proxy, lb_snapshot, health_checker, lb_hash_key, destination)
+        }
     }
 }
 
@@ -8180,10 +8177,9 @@ listen_port: 5300
         let mut hosts = std::collections::HashSet::new();
         for i in 1..=64 {
             let key = format!("192.0.2.{i}");
-            let (host, port) = super::resolve_backend_target(
-                &proxy, &snapshot, &HealthChecker::new(), &key, None,
-            )
-            .expect("target selected");
+            let (host, port) =
+                super::resolve_backend_target(&proxy, &snapshot, &HealthChecker::new(), &key, None)
+                    .expect("target selected");
             assert_eq!(port, 5353);
             hosts.insert(host);
         }
@@ -8241,7 +8237,11 @@ listen_port: 5300
         let snapshot = cache.load();
 
         let err = super::resolve_backend_target(
-            &proxy, &snapshot, &HealthChecker::new(), "192.0.2.10", None,
+            &proxy,
+            &snapshot,
+            &HealthChecker::new(),
+            "192.0.2.10",
+            None,
         )
         .expect_err("per-port LEAST_CONN must be rejected explicitly");
         let setup = find_stream_setup_error(&err).expect("typed stream setup error");
@@ -8287,7 +8287,11 @@ listen_port: 5300
         let snapshot = cache.load();
 
         let err = super::resolve_backend_target(
-            &proxy, &snapshot, &HealthChecker::new(), "192.0.2.10", None,
+            &proxy,
+            &snapshot,
+            &HealthChecker::new(),
+            "192.0.2.10",
+            None,
         )
         .expect_err("per-port LEAST_LATENCY must be rejected explicitly");
         let setup = find_stream_setup_error(&err).expect("typed stream setup error");
@@ -8336,7 +8340,11 @@ listen_port: 5300
         let snapshot = cache.load();
 
         let err = super::resolve_backend_target(
-            &proxy, &snapshot, &HealthChecker::new(), "192.0.2.10", None,
+            &proxy,
+            &snapshot,
+            &HealthChecker::new(),
+            "192.0.2.10",
+            None,
         )
         .expect_err("stream hash_on cookie must be rejected explicitly");
         let setup = find_stream_setup_error(&err).expect("typed stream setup error");
@@ -8383,7 +8391,11 @@ listen_port: 5300
         let snapshot = cache.load();
 
         let err = super::resolve_backend_target(
-            &proxy, &snapshot, &HealthChecker::new(), "192.0.2.10", None,
+            &proxy,
+            &snapshot,
+            &HealthChecker::new(),
+            "192.0.2.10",
+            None,
         )
         .expect_err("inherited stream hash_on header must be rejected explicitly");
         let setup = find_stream_setup_error(&err).expect("typed stream setup error");

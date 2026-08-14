@@ -2862,7 +2862,12 @@ mod tests {
         })
         .await;
 
-        server.spawn_session("127.0.0.1:12345".parse().unwrap(), vec![0x16; 32], None, None);
+        server.spawn_session(
+            "127.0.0.1:12345".parse().unwrap(),
+            vec![0x16; 32],
+            None,
+            None,
+        );
 
         assert_eq!(server.active_session_count(), 0);
         assert!(server.sessions.is_empty());
@@ -2876,7 +2881,12 @@ mod tests {
         })
         .await;
 
-        server.spawn_session("127.0.0.1:12346".parse().unwrap(), vec![0x16; 32], None, None);
+        server.spawn_session(
+            "127.0.0.1:12346".parse().unwrap(),
+            vec![0x16; 32],
+            None,
+            None,
+        );
 
         assert_eq!(server.active_session_count(), 0);
         assert!(server.sessions.is_empty());
