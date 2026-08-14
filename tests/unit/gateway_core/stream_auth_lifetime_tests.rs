@@ -4323,14 +4323,11 @@ fn every_native_h3_streaming_response_headers_write_uses_the_shared_helper() {
         !sse_writer.contains("let _ = stream.finish().await"),
         "aggregate MCP SSE listener-lifetime expiry must not await finish unbounded"
     );
-    let post_pump_auth = sse_writer
+    let post_pump = sse_writer
         .split("if composed_deadline_fired {")
         .nth(1)
-        .expect("composed deadline post-pump branch")
-        .split("} else {")
-        .next()
-        .expect("composed deadline fired arm");
-    let listener_terminal = post_pump_auth
+        .expect("composed deadline post-pump branch");
+    let listener_terminal = post_pump
         .split("} else {")
         .nth(1)
         .expect("listener-lifetime else arm")
