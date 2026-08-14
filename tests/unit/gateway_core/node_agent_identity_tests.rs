@@ -170,6 +170,31 @@ async fn registry_sync_retraction_failure_still_retracts_identity_before_fencing
 }
 
 #[tokio::test]
+async fn registry_sync_retraction_failure_on_uid_change_still_retracts_identity_before_fencing(
+) {
+    let journal = IdentityJournal::new();
+    let lookups = AtomicUsize::new(0);
+    let (_shutdown_tx, mut shutdown) = tokio::sync::watch::channel(false);
+
+    let refresh = refresh_node_identity_binding_for_test(
+        Some(NODE_A),
+        &mut shutdown,
+        || {
+            lookups.fetch_add(1, Ordering::SeqCst);
+            async { Ok(NODE_B.to_string()) }
+        },
+        || Err("registry marker is immutable".to_string()),
+        || journal.retract_identity(),
+        |uid| journal.publish(uid),
+    )
+    .await;
+    assert_eq!(refresh, NodeIdentityRefreshForTest::Fenced { uid: None });
+    assert_eq!(journal.identity_retracts.load(Ordering::SeqCst), 1);
+    assert_eq!(lookups.load(Ordering::SeqCst), 1);
+    assert!(journal.publishes.lock().expect("journal").is_empty());
+}
+
+#[tokio::test]
 async fn identity_retraction_failure_does_not_lookup_or_publish() {
     let lookups = AtomicUsize::new(0);
     let (_shutdown_tx, mut shutdown) = tokio::sync::watch::channel(false);
