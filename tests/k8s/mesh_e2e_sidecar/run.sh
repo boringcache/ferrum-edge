@@ -2779,8 +2779,15 @@ main() {
   probe_request_auth
   probe_vs_cors
   probe_native_subscribe
-  probe_native_mtls_negatives
-  probe_native_mtls_rotation
+  # Every probe records its own pass/fail live assertion and
+  # require_live_assertions is the single fail-closed gate. These two return
+  # non-zero on a recorded failure, so under set -e they would abort the run
+  # and leave the remaining release-blocking rows (DR maxConnections, DR
+  # exportTo/lookup, DR connectTimeout) unexercised — the artifact gate would
+  # then report those ids as MISSING alongside the real native failure.
+  # Swallow the status here; the recorded fail still closes the gate below.
+  probe_native_mtls_negatives || true
+  probe_native_mtls_rotation || true
   probe_ws_max_connections
   probe_destination_rule_namespace_security
   probe_connect_timeout_two_phase
