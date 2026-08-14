@@ -8412,7 +8412,7 @@ impl ProxyState {
 
         let (published, swapped) = self
             .stream_listener_manager
-            .publish_frontend_dtls_generation(config)
+            .publish_frontend_dtls_generation(config, true)
             .await;
         info!(
             dtls_generation = published.generation,

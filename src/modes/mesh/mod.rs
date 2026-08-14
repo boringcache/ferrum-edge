@@ -30744,7 +30744,7 @@ mod tests {
         );
         proxy_state
             .stream_listener_manager
-            .set_frontend_dtls_cert_key(dtls_cert, dtls_key, Some(dtls_ca))
+            .set_frontend_dtls_cert_key(dtls_cert, dtls_key, Some(dtls_ca), false)
             .await;
         proxy_state
             .stream_listener_manager

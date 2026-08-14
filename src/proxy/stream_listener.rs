@@ -1431,11 +1431,16 @@ impl StreamListenerManager {
     /// After storing the source identity, validates and publishes one immutable
     /// generation (when the material loads), then reconciles stream listeners so
     /// any previously deferred UDP/DTLS listeners start against that generation.
+    /// `client_trust_reload_enabled` must match the process-wide frontend TLS
+    /// live-reload opt-in. Static DTLS still publishes its crypto generation but
+    /// leaves the retirement scope unarmed because no later trust generation can
+    /// be accepted without a restart.
     pub async fn set_frontend_dtls_cert_key(
         &self,
         cert_path: String,
         key_path: String,
         client_ca_cert_path: Option<String>,
+        client_trust_reload_enabled: bool,
     ) {
         self.frontend_dtls_material.store(Arc::new(Some((
             cert_path.clone(),
@@ -1449,7 +1454,9 @@ impl StreamListenerManager {
             &self.crls.load_full(),
         ) {
             Ok(config) => {
-                let _ = self.publish_frontend_dtls_generation(config).await;
+                let _ = self
+                    .publish_frontend_dtls_generation(config, client_trust_reload_enabled)
+                    .await;
             }
             Err(err) => {
                 warn!(
@@ -1584,10 +1591,18 @@ impl StreamListenerManager {
     /// This method never rebuilds from sources — callers must validate the
     /// complete candidate before invoking it.
     ///
+    /// `client_trust_reload_enabled=false` publishes and swaps the immutable
+    /// DTLS crypto generation without arming per-session client-trust tracking.
+    /// This preserves the documented zero-tracking static posture when frontend
+    /// live reload is disabled. A real reload and its startup baseline pass
+    /// `true`, so the first withdrawal compares against the material originally
+    /// served and retires every older authenticated session.
+    ///
     /// Returns `(generation, swapped_listener_count)`.
     pub async fn publish_frontend_dtls_generation(
         &self,
         config: crate::dtls::FrontendDtlsConfig,
+        client_trust_reload_enabled: bool,
     ) -> (crate::dtls::FrontendDtlsGeneration, usize) {
         let _publish_guard = self.frontend_dtls_publish.lock().await;
         let generation = self
@@ -1613,12 +1628,14 @@ impl StreamListenerManager {
             swapped_dtls_listeners = swapped,
             "Published frontend DTLS material generation; new DTLS sessions use this generation"
         );
-        // Issue #3857. Publish the client-trust generation AFTER the material is
-        // live in every active `DtlsServer`, so a session that reads the new
-        // generation provably snapshotted the new verifier. A generation with no
-        // client-certificate verification leaves this scope unarmed and publishes
-        // no trust identity.
-        if let Some(material) = accepted.config.client_trust.clone() {
+        // Issue #3857. When live reload is enabled, publish the client-trust
+        // generation AFTER the material is live in every active `DtlsServer`, so
+        // a session that reads the new generation provably snapshotted the new
+        // verifier. Static DTLS and a generation with no client-certificate
+        // verification leave this scope unarmed and publish no trust identity.
+        if client_trust_reload_enabled
+            && let Some(material) = accepted.config.client_trust.clone()
+        {
             let publication = crate::tls::client_trust::publish_accepted_material(
                 crate::tls::ClientTrustScope::FrontendDtls,
                 material,
