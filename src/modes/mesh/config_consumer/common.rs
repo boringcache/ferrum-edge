@@ -2,8 +2,8 @@ use std::time::Duration;
 
 use tonic::transport::{Certificate, Identity};
 
-use crate::grpc::dp_client::{DpGrpcTlsConfig, DpGrpcTlsReload, build_dp_grpc_tls_config};
 pub use crate::grpc::dp_client::wait_optional_tls_reload;
+use crate::grpc::dp_client::{DpGrpcTlsConfig, DpGrpcTlsReload, build_dp_grpc_tls_config};
 pub use crate::util::backoff::{BACKOFF_INITIAL_SECS, jittered_backoff, next_backoff_secs};
 #[cfg(test)]
 pub(crate) use crate::util::backoff::{BACKOFF_MAX_SECS, jittered_backoff_with_entropy};
