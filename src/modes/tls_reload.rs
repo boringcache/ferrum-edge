@@ -139,8 +139,9 @@ pub fn prepare_proxy_frontend_tls(
     };
 
     // Arm this listener family's client-trust generation from the material the
-    // caller's `tls_config` was ACTUALLY built from (issue #3857), before the
-    // slot is published. Until a scope is armed, `client_trust::capture` returns
+    // caller's `tls_config` was ACTUALLY built from (issue #3857). The live
+    // verifier is installed before the slot is published; generation is
+    // published after. Until a scope is armed, `client_trust::capture` returns
     // `None` and the accept paths pay nothing — which is exactly the default,
     // live-reload disabled posture. Arming here (rather than lazily on the first
     // reload) means the very first accepted connection already carries a
@@ -169,11 +170,15 @@ pub fn prepare_proxy_frontend_tls(
     // simply reloads without a trust generation.
     let client_trust_scopes = match startup_client_trust.as_ref() {
         Some(startup_client_trust) if startup_client_trust.verifier.is_some() => {
-            client_trust::publish_accepted_candidate(
-                ClientTrustScope::ProxyFrontend,
-                startup_client_trust.material.clone(),
-                startup_client_trust.verifier.clone(),
-            );
+            // Fallible startup load already succeeded. Install the live
+            // verifier before the slot is published so a handshake against
+            // this config cannot consult a missing/stale live object.
+            if let Some(verifier) = startup_client_trust.verifier.clone() {
+                client_trust::install_accepted_live_verifier(
+                    ClientTrustScope::ProxyFrontend,
+                    verifier,
+                );
+            }
             vec![ClientTrustScope::ProxyFrontend]
         }
         Some(_) => {
@@ -193,14 +198,23 @@ pub fn prepare_proxy_frontend_tls(
     // whose trust identity is unknown cannot form one, so the slot stays absent
     // and the H3 listener falls back to its own coherent load rather than
     // pairing a config with an identity that did not come from it.
-    let accepted_slot = startup_client_trust.map(|client_trust| {
+    let accepted_slot = startup_client_trust.as_ref().map(|client_trust| {
         accepted_frontend_tls_slot_with(Arc::new(AcceptedFrontendTls {
             config: tls_config.clone(),
-            client_trust,
+            client_trust: client_trust.clone(),
         }))
     });
 
     let slot = frontend_tls_slot_with(tls_config);
+    if let Some(startup_client_trust) = startup_client_trust.as_ref()
+        && !client_trust_scopes.is_empty()
+    {
+        client_trust::publish_accepted_candidate(
+            ClientTrustScope::ProxyFrontend,
+            startup_client_trust.material.clone(),
+            startup_client_trust.verifier.clone(),
+        );
+    }
     let (revision_tx, revision_rx) = watch::channel(0u64);
     let interval = material_set_poll_interval(
         &watched_sources,
@@ -407,13 +421,14 @@ pub fn prepare_admin_frontend_tls(
     // proxy surface (issue #3857): an admin HTTPS listener without
     // `FERRUM_ADMIN_TLS_CLIENT_CA_BUNDLE_PATH`, or with admin no-verify, owns
     // no withdrawable client credential and must stay unarmed.
-    let client_trust_scopes = match startup_client_trust {
+    let client_trust_scopes = match startup_client_trust.as_ref() {
         Some(startup_client_trust) if startup_client_trust.verifier.is_some() => {
-            client_trust::publish_accepted_candidate(
-                ClientTrustScope::AdminHttps,
-                startup_client_trust.material,
-                startup_client_trust.verifier.clone(),
-            );
+            if let Some(verifier) = startup_client_trust.verifier.clone() {
+                client_trust::install_accepted_live_verifier(
+                    ClientTrustScope::AdminHttps,
+                    verifier,
+                );
+            }
             vec![ClientTrustScope::AdminHttps]
         }
         Some(_) => {
@@ -431,6 +446,15 @@ pub fn prepare_admin_frontend_tls(
     };
 
     let slot = frontend_tls_slot_with(tls_config);
+    if let Some(startup_client_trust) = startup_client_trust.as_ref()
+        && !client_trust_scopes.is_empty()
+    {
+        client_trust::publish_accepted_candidate(
+            ClientTrustScope::AdminHttps,
+            startup_client_trust.material.clone(),
+            startup_client_trust.verifier.clone(),
+        );
+    }
     let (revision_tx, _revision_rx) = watch::channel(0u64);
     let interval = material_set_poll_interval(
         &watched_sources,

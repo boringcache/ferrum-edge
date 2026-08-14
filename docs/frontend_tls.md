@@ -615,15 +615,28 @@ only in deployments that enabled frontend TLS live reload.
 
 #### Race behaviour
 
-Publication applies the new material first and advances the generation second;
-a listener captures the generation first and loads the configuration second. A
-connection can therefore capture a generation that is *older* than the material
-it actually handshakes with — the conservative direction, costing at most one
-unnecessary retirement for a connection handshaking exactly across a withdrawal
-— but never a newer one, so none can escape the fence. A connection being
-registered while a publication sweeps is caught by a post-registration re-check
-against the same fence, so it can neither escape nor repopulate the registry
-after the sweep.
+On rustls surfaces (proxy HTTPS / HTTP-2 / TCP+TLS, admin HTTPS, HTTP/3), an
+accepted candidate is published fail-closed in this order, and only after every
+fallible rebuild has succeeded: the live handshake verifier is installed first,
+the new `ServerConfig` is exposed second, and the generation / fence / session
+sweep is published last. Installing a stricter verifier slightly before its
+config is conservative — a stale config refuses withdrawn credentials. A
+handshake that loads the new config before the generation advances therefore
+consults that same live verifier, and cannot admit a credential the new
+candidate withdrew. A refused candidate never replaces the live verifier.
+
+DTLS has no rustls live verifier. It keeps the distinct config-before-generation
+order: the DTLS generation is published into every active `DtlsServer` first,
+then the trust generation advances.
+
+Admission is the mirror image: a listener captures the generation first and
+loads the configuration second. A connection can therefore capture a generation
+that is *older* than the material it actually handshakes with — the conservative
+direction, costing at most one unnecessary retirement for a connection
+handshaking exactly across a withdrawal — but never a newer one, so none can
+escape the fence. A connection being registered while a publication sweeps is
+caught by a post-registration re-check against the same fence, so it can neither
+escape nor repopulate the registry after the sweep.
 
 The HTTP/3 revision channel is a wakeup, not a queue: several accepted
 candidates can coalesce into one notification, and the sources can rotate again

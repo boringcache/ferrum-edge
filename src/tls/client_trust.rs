@@ -47,11 +47,27 @@
 //!
 //! # Ordering, and why it fails closed
 //!
-//! Publication is: **(1) the caller applies the new material** (swaps the
-//! `ServerConfig` slot / calls `Endpoint::set_server_config` / swaps the DTLS
-//! generation), **(2)** the live rustls verifier for that candidate is stored,
-//! **(3)** `publish_accepted_material` bumps `generation`, **(4)** stores
-//! `withdrawal_generation`, **(5)** sweeps registered sessions.
+//! rustls surfaces that install [`bind_live_handshake_verifier`] (proxy H1/H2
+//! and TCP+TLS, admin HTTPS, H3/QUIC) publish an accepted candidate in this
+//! order, and only after every fallible build/validation step has succeeded:
+//!
+//! **(1)** [`install_accepted_live_verifier`] stores the candidate's inner
+//! rustls verifier, **(2)** the caller exposes/adopts the new `ServerConfig`
+//! (slot swap / `Endpoint::set_server_config`), **(3)**
+//! [`publish_accepted_candidate`] stores that same verifier again if needed,
+//! bumps `generation`, **(4)** stores `withdrawal_generation` when authority
+//! narrowed, **(5)** sweeps registered sessions.
+//!
+//! Installing the stricter verifier slightly before its config is conservative:
+//! a handshake that still holds a stale config consults the live object and
+//! refuses withdrawn credentials. A handshake that loads the new config before
+//! the generation advances also consults that live object, so it cannot admit a
+//! credential V2 withdrew while `active()` still saw global V1. Do **not**
+//! install a verifier before a fallible step that could reject the candidate:
+//! that would leave the previous config served against a verifier it was not
+//! built with. A refused candidate never calls
+//! [`install_accepted_live_verifier`] and is recorded with
+//! [`record_rejected_candidate`], retaining last-good material.
 //!
 //! Admission is the mirror image: a listener [`capture`]s the generation
 //! **before** it loads the config it will hand to the handshake. Because the
@@ -72,6 +88,11 @@
 //! independent fail-closed check re-runs the peer chain against
 //! [`armed_handshake_still_trusted`] after TLS so a missing peer chain (session
 //! resumption does not re-verify) cannot be served either.
+//!
+//! DTLS has no rustls live handshake verifier. It keeps the distinct
+//! config-before-generation order: the DTLS generation is published into every
+//! active `DtlsServer` first, then [`publish_accepted_material`] advances the
+//! trust generation with `verifier = None`.
 //!
 //! The registration race is closed the same way, without a lock: a session is
 //! inserted into the domain first and then re-checks the fence. A publication
@@ -433,11 +454,13 @@ struct ClientTrustDomain {
     last_withdrawal_reason: AtomicU8,
     /// Last accepted semantic material.
     material: ArcSwap<Option<ClientTrustMaterial>>,
-    /// Live rustls client-certificate verifier for this scope, installed
-    /// **before** the generation advances. Handshake paths re-check the peer
-    /// against this object after TLS so a stale `ServerConfig` / QUIC accepter
-    /// snapshot cannot admit a credential the published generation withdrew.
-    /// `None` for DTLS and for tests that publish material without a verifier.
+    /// Live rustls client-certificate verifier for this scope. Installed
+    /// **before** the matching `ServerConfig` is exposed, and again
+    /// (idempotently) before the generation advances. Handshake paths re-check
+    /// the peer against this object after TLS so a stale `ServerConfig` / QUIC
+    /// accepter snapshot cannot admit a credential the published generation
+    /// withdrew. `None` for DTLS and for tests that publish material without a
+    /// verifier.
     live_verifier: ArcSwap<Option<Arc<dyn ClientCertVerifier>>>,
     /// Live client-certificate-authenticated transports, keyed by an internal
     /// session id. Stored as `Weak` so a long-lived clone (an upgraded
@@ -538,8 +561,9 @@ fn domain(scope: ClientTrustScope) -> &'static ClientTrustDomain {
 /// generation) before calling this. See the module docs for why that order is
 /// what makes the captured generation conservative rather than optimistic.
 ///
-/// Prefer [`publish_accepted_candidate`] on rustls surfaces so the live
-/// handshake verifier is stored before the generation becomes observable.
+/// Prefer [`publish_accepted_candidate`] on rustls surfaces. Those callers
+/// install the live verifier with [`install_accepted_live_verifier`] *before*
+/// exposing the new config, then call this to advance generation.
 pub fn publish_accepted_material(
     scope: ClientTrustScope,
     material: ClientTrustMaterial,
@@ -547,12 +571,52 @@ pub fn publish_accepted_material(
     publish_accepted_candidate(scope, material, None)
 }
 
-/// Publish an accepted candidate, installing its rustls verifier (when the
+/// Store `verifier` as the live rustls handshake object for `scope` **before**
+/// exposing a new `ServerConfig`.
+///
+/// Call this only after every fallible candidate build/validation has
+/// succeeded. Installing a verifier and then refusing the candidate would
+/// leave the previous config served against a verifier it was not built with.
+/// Generation, fence, and session sweep stay in [`publish_accepted_candidate`],
+/// which idempotently stores the same `Arc` before advancing.
+///
+/// DTLS has no rustls live verifier and must not call this.
+pub fn install_accepted_live_verifier(
+    scope: ClientTrustScope,
+    verifier: Arc<dyn ClientCertVerifier>,
+) {
+    let domain = domain(scope);
+    // Poisoning cannot make the state unsafe (every field is an atomic or an
+    // `ArcSwap`), and refusing to install on a poisoned lock would leave
+    // handshakes consulting a withdrawn verifier — the fail-open direction.
+    let _publish_guard = domain
+        .publish_lock
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    store_live_verifier(domain, verifier);
+}
+
+fn store_live_verifier(domain: &ClientTrustDomain, verifier: Arc<dyn ClientCertVerifier>) {
+    let current = domain.live_verifier.load_full();
+    if current
+        .as_ref()
+        .as_ref()
+        .is_some_and(|installed| Arc::ptr_eq(installed, &verifier))
+    {
+        return;
+    }
+    domain.live_verifier.store(Arc::new(Some(verifier)));
+}
+
+/// Publish an accepted candidate, storing its rustls verifier (when the
 /// surface has one) **before** the generation advances.
 ///
+/// On rustls reload surfaces the caller has already invoked
+/// [`install_accepted_live_verifier`] and exposed the new `ServerConfig`. This
+/// function stores the same verifier again when the `Arc` is not already in
+/// the slot (startup and one-shot publishers) and is a no-op when it is.
 /// DTLS and material-only tests pass `verifier = None` and skip the live
-/// handshake re-check; rustls listeners must pass the verifier they just
-/// installed so a stale accepter cannot outlive the published withdrawal.
+/// handshake re-check.
 pub fn publish_accepted_candidate(
     scope: ClientTrustScope,
     material: ClientTrustMaterial,
@@ -570,9 +634,11 @@ pub fn publish_accepted_candidate(
     // The live verifier must be observable before `generation` advances. A
     // reconnect that captures the new generation then re-checks this object
     // cannot be admitted by a withdrawn credential, even if its handshake
-    // still holds a stale `ServerConfig` snapshot.
+    // still holds a stale `ServerConfig` snapshot. When the caller already
+    // installed this same `Arc` before exposing the config, the store is a
+    // no-op.
     if let Some(verifier) = verifier {
-        domain.live_verifier.store(Arc::new(Some(verifier)));
+        store_live_verifier(domain, verifier);
     }
 
     let previous = domain.material.load_full();
@@ -740,9 +806,10 @@ pub fn armed_handshake_der_chain_still_trusted(
 /// TlsAcceptor or QUIC endpoint that still holds a snapshot built under a
 /// withdrawn generation would otherwise keep admitting the withdrawn
 /// credential. The wrapper is installed **only** at `with_client_cert_verifier`
-/// time; [`AcceptedClientTrust::verifier`](super::AcceptedClientTrust) and
-/// [`publish_accepted_candidate`] keep the inner WebPki object so the live
-/// slot never points at the wrapper itself.
+/// time; [`AcceptedClientTrust::verifier`](super::AcceptedClientTrust),
+/// [`install_accepted_live_verifier`], and [`publish_accepted_candidate`] keep
+/// the inner WebPki object so the live slot never points at the wrapper
+/// itself.
 pub fn bind_live_handshake_verifier(
     scope: ClientTrustScope,
     inner: Arc<dyn ClientCertVerifier>,

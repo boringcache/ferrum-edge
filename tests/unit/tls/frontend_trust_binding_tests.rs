@@ -474,6 +474,291 @@ fn live_handshake_wrapper_refuses_after_accepted_withdrawal_even_with_a_stale_in
     );
 }
 
+/// Counterexample for the rustls publication-order race: a ServerConfig built
+/// with candidate V2 must consult live V2 during the window after verifier
+/// install and before generation advances — never the withdrawn V1.
+#[test]
+fn a_v2_handshake_config_cannot_consult_v1_during_the_pre_generation_window() {
+    let _guard = isolated_registry();
+    let dir = tempfile::tempdir().expect("tempdir");
+    let pki = build_pki();
+
+    let startup_crls = parse_crls(&pki.crl_pem(&[UNRELATED_SERIAL], 1));
+    let before = load_candidate(dir.path(), &pki, &startup_crls).expect("startup candidate");
+    let rotated_crls = parse_crls(&pki.crl_pem(&[UNRELATED_SERIAL, pki.client_serial], 2));
+    let after = load_candidate(dir.path(), &pki, &rotated_crls).expect("rotated candidate");
+    assert!(admits_client(&before, &pki));
+    assert!(!admits_client(&after, &pki));
+
+    let v2_inner = after
+        .verifier
+        .clone()
+        .expect("rotated candidate installs a verifier");
+    let rustls_scopes = [
+        ClientTrustScope::ProxyFrontend,
+        ClientTrustScope::ProxyH3,
+        ClientTrustScope::AdminHttps,
+    ];
+    for scope in rustls_scopes {
+        client_trust::publish_accepted_candidate(
+            scope,
+            before.material.clone(),
+            before.verifier.clone(),
+        );
+        let generation_before = client_trust::capture(scope).expect("armed").generation();
+        assert_eq!(generation_before, 1);
+
+        // The wrapper a V2 ServerConfig actually installs: inner is V2, but
+        // `active()` reads the live slot. Before pre-exposure install that slot
+        // is still V1 — the fail-open window this API closes.
+        let v2_wrapper = client_trust::bind_live_handshake_verifier(scope, v2_inner.clone());
+        assert!(
+            v2_wrapper
+                .verify_client_cert(&pki.client_cert(), &[], UnixTime::now())
+                .is_ok(),
+            "{:?}: a V2 config that still sees live V1 would admit the withdrawn cert",
+            scope,
+        );
+
+        client_trust::install_accepted_live_verifier(scope, v2_inner.clone());
+
+        assert_eq!(
+            client_trust::capture(scope)
+                .expect("still armed")
+                .generation(),
+            generation_before,
+            "{:?}: pre-exposure install must not advance generation or the fence",
+            scope,
+        );
+        assert!(
+            v2_wrapper
+                .verify_client_cert(&pki.client_cert(), &[], UnixTime::now())
+                .is_err(),
+            "{:?}: a config built with V2 must consult live V2 and refuse the withdrawn cert \
+             before generation advances",
+            scope,
+        );
+        assert!(
+            !client_trust::live_peer_still_trusted(scope, &[pki.client_cert()]),
+            "{:?}: the post-handshake live check must also see V2 in the pre-generation window",
+            scope,
+        );
+        assert!(
+            !client_trust::armed_handshake_still_trusted(scope, Some(&[pki.client_cert()])),
+            "{:?}: armed admission must fail closed on the withdrawn cert before the fence moves",
+            scope,
+        );
+
+        // Stale V1 configs are conservative: they also consult live V2.
+        let v1_wrapper = client_trust::bind_live_handshake_verifier(
+            scope,
+            before
+                .verifier
+                .clone()
+                .expect("startup candidate installs a verifier"),
+        );
+        assert!(
+            v1_wrapper
+                .verify_client_cert(&pki.client_cert(), &[], UnixTime::now())
+                .is_err(),
+            "{:?}: a stale V1 config must refuse withdrawn credentials once V2 is live",
+            scope,
+        );
+
+        let withdrawn = client_trust::publish_accepted_candidate(
+            scope,
+            after.material.clone(),
+            after.verifier.clone(),
+        );
+        assert!(
+            withdrawn.withdrew(),
+            "{:?}: publishing the same already-installed verifier must still record the withdrawal",
+            scope,
+        );
+        assert!(
+            withdrawn.generation > generation_before,
+            "{:?}: generation advances only at publish, after the config would already be exposed",
+            scope,
+        );
+    }
+}
+
+/// A fallible/refused candidate must never replace the live verifier. The
+/// previous config keeps being served against last-good V1.
+#[test]
+fn a_refused_candidate_never_replaces_the_live_verifier() {
+    let _guard = isolated_registry();
+    let dir = tempfile::tempdir().expect("tempdir");
+    let pki = build_pki();
+
+    let startup_crls = parse_crls(&pki.crl_pem(&[UNRELATED_SERIAL], 1));
+    let before = load_candidate(dir.path(), &pki, &startup_crls).expect("startup candidate");
+    let rotated_crls = parse_crls(&pki.crl_pem(&[UNRELATED_SERIAL, pki.client_serial], 2));
+    let after = load_candidate(dir.path(), &pki, &rotated_crls).expect("rotated candidate");
+    let v2_inner = after
+        .verifier
+        .clone()
+        .expect("rotated candidate installs a verifier");
+
+    for scope in [
+        ClientTrustScope::ProxyFrontend,
+        ClientTrustScope::ProxyH3,
+        ClientTrustScope::AdminHttps,
+    ] {
+        client_trust::publish_accepted_candidate(
+            scope,
+            before.material.clone(),
+            before.verifier.clone(),
+        );
+        let generation_before = client_trust::capture(scope).expect("armed").generation();
+
+        // Simulate a fallible later rebuild: record the refusal and do not
+        // call `install_accepted_live_verifier`.
+        client_trust::record_rejected_candidate(scope);
+
+        let would_be_v2 = client_trust::bind_live_handshake_verifier(scope, v2_inner.clone());
+        assert!(
+            would_be_v2
+                .verify_client_cert(&pki.client_cert(), &[], UnixTime::now())
+                .is_ok(),
+            "{:?}: a refused V2 candidate must leave live V1 in place",
+            scope,
+        );
+        assert!(
+            client_trust::live_peer_still_trusted(scope, &[pki.client_cert()]),
+            "{:?}: last-good V1 must still admit the client after a refused candidate",
+            scope,
+        );
+        assert_eq!(
+            client_trust::current_material(scope),
+            Some(before.material.clone()),
+            "{:?}: a refused candidate retains last-good material",
+            scope,
+        );
+        assert_eq!(
+            client_trust::capture(scope)
+                .expect("still armed")
+                .generation(),
+            generation_before,
+            "{:?}: a refused candidate must not advance generation",
+            scope,
+        );
+        let row = client_trust::snapshot()
+            .into_iter()
+            .find(|row| row.scope == scope)
+            .expect("scope present");
+        assert_eq!(row.rejected_candidates, 1);
+        assert_eq!(row.withdrawal_generation, 0);
+    }
+}
+
+/// Pin the fail-closed rustls order in the reload surfaces: install live
+/// verifier, then expose config, then publish generation. A refused path
+/// records rejection without installing. DTLS keeps config-before-generation
+/// and must not grow a rustls live-verifier install.
+#[test]
+fn rustls_reload_surfaces_install_live_verifier_before_exposing_config() {
+    let reload = include_str!("../../../src/tls/frontend_reload.rs");
+    assert_source_order(
+        reload,
+        &[
+            "install_accepted_live_verifier",
+            "slot.store(Arc::new(Some(new_config)))",
+            "publish_accepted_candidate",
+        ],
+        "frontend rustls reload: live verifier, then config swap, then publish",
+    );
+    let first_reject = reload
+        .find("record_rejected_candidate")
+        .expect("frontend reload records refused candidates");
+    let install = reload
+        .find("install_accepted_live_verifier")
+        .expect("frontend reload installs the live verifier");
+    assert!(
+        first_reject < install,
+        "a fallible frontend reload must record rejection before any live-verifier install"
+    );
+
+    let h3 = include_str!("../../../src/http3/server.rs");
+    let reload_arm_start = h3
+        .find("&reload_h3_config,")
+        .expect("H3 reload arm rebuild");
+    let reload_arm = &h3[reload_arm_start..];
+    assert_source_order(
+        reload_arm,
+        &[
+            "install_accepted_live_verifier",
+            "endpoint.set_server_config(Some(server_config))",
+            "publish_accepted_candidate",
+        ],
+        "H3 rustls reload must install the live verifier, then adopt the config, then publish",
+    );
+    let publish = reload_arm
+        .find("publish_accepted_candidate")
+        .expect("H3 reload publishes generation after adopt");
+    let err_arm = reload_arm
+        .find("record_rejected_candidate")
+        .expect("H3 reload records a refused quinn rebuild");
+    assert!(
+        err_arm > publish,
+        "the H3 Ok arm must not install a verifier on the fallible Err path"
+    );
+
+    let startup = include_str!("../../../src/modes/tls_reload.rs");
+    let proxy_fn = startup
+        .find("pub fn prepare_proxy_frontend_tls")
+        .expect("proxy startup");
+    let admin_fn = startup
+        .find("pub fn prepare_admin_frontend_tls")
+        .expect("admin startup");
+    assert!(proxy_fn < admin_fn);
+    assert_source_order(
+        &startup[proxy_fn..admin_fn],
+        &[
+            "install_accepted_live_verifier",
+            "let slot = frontend_tls_slot_with(tls_config)",
+            "publish_accepted_candidate",
+        ],
+        "proxy startup must install the live verifier, then expose the slot, then publish",
+    );
+    assert_source_order(
+        &startup[admin_fn..],
+        &[
+            "install_accepted_live_verifier",
+            "let slot = frontend_tls_slot_with(tls_config)",
+            "publish_accepted_candidate",
+        ],
+        "admin startup must install the live verifier, then expose the slot, then publish",
+    );
+
+    let dtls = include_str!("../../../src/proxy/stream_listener.rs");
+    assert!(
+        !dtls.contains("install_accepted_live_verifier"),
+        "DTLS has no rustls live verifier and must not grow one"
+    );
+    let dtls_fn = dtls
+        .find("pub async fn publish_frontend_dtls_generation")
+        .expect("DTLS publish entry");
+    assert_source_order(
+        &dtls[dtls_fn..],
+        &[
+            "swap_active_dtls_frontend_config",
+            "publish_accepted_material",
+        ],
+        "DTLS keeps config-before-generation ordering",
+    );
+}
+
+fn assert_source_order(source: &str, needles: &[&str], message: &str) {
+    let mut pos = 0usize;
+    for needle in needles {
+        match source[pos..].find(needle) {
+            Some(found) => pos += found + needle.len(),
+            None => panic!("{message}: missing `{needle}` after prior step"),
+        }
+    }
+}
+
 /// A malformed later candidate never produces an `AcceptedClientTrust`, so the
 /// H3 reload arm has nothing to install or publish and keeps the last-good
 /// verifier, identity, generation and sessions. mTLS is never downgraded.

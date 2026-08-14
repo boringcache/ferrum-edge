@@ -118,10 +118,10 @@ pub struct FrontendTlsReloadConfig {
     /// config and emits a `warn!`.
     pub rebuild: FrontendTlsRebuildFn,
     /// Client-trust scope this surface owns (issue #3857). When non-empty, a
-    /// successful rebuild publishes the accompanying
-    /// [`crate::tls::ClientTrustMaterial`] into each scope **after** the slot
-    /// swap, and a refused candidate is recorded against each scope while the
-    /// last accepted generation, verifier and sessions are all retained.
+    /// successful rebuild installs the accepted live verifier, swaps the slot,
+    /// then publishes generation/fence into each scope. A refused candidate is
+    /// recorded against each scope while the last accepted generation, verifier
+    /// and sessions are all retained.
     ///
     /// The HTTP/3 scope is deliberately absent: that endpoint applies its
     /// config out of band and publishes its own generation from
@@ -219,6 +219,18 @@ pub fn spawn_frontend_tls_reload_task(
                  surface configured for it; keeping the previous configuration"
             ));
         }
+        // Every fallible rebuild/validation step has succeeded. Install the
+        // accepted live verifier BEFORE exposing the new ServerConfig so a
+        // handshake that loads V2 while generation is still 1 consults V2, not
+        // the withdrawn V1. A refused candidate never reaches this store.
+        if let Some(verifier) = client_trust
+            .as_ref()
+            .and_then(|client_trust| client_trust.verifier.clone())
+        {
+            for scope in &client_trust_scopes {
+                crate::tls::client_trust::install_accepted_live_verifier(*scope, verifier.clone());
+            }
+        }
         // Publish the whole accepted candidate before the plain slot, so a
         // consumer that observes the new `ServerConfig` can also observe the
         // verifier and identity that belong to it. The HTTP/3 endpoint reads
@@ -232,10 +244,11 @@ pub fn spawn_frontend_tls_reload_task(
                 client_trust: client_trust.clone(),
             }))));
         }
-        // Order is load-bearing (issue #3857): the material must be observable
-        // to a new handshake BEFORE the generation advances, so a listener that
-        // reads the generation first and the config second can never capture a
-        // generation newer than the material it actually handshakes with.
+        // Order is load-bearing (issue #3857): the live verifier is already
+        // installed; the material must be observable to a new handshake BEFORE
+        // the generation advances, so a listener that reads the generation
+        // first and the config second can never capture a generation newer
+        // than the material it actually handshakes with.
         slot.store(Arc::new(Some(new_config)));
         if let Some(client_trust) = client_trust {
             for scope in &client_trust_scopes {

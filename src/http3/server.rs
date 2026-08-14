@@ -500,8 +500,8 @@ fn configured_h3_reload_candidate(
 /// stamps the H3-only ALPN advertisement.
 ///
 /// `client_trust` is the verifier this endpoint will enforce together with the
-/// identity of the material behind it; the caller publishes exactly that
-/// identity once quinn has adopted the returned config.
+/// identity of the material behind it; the caller installs that verifier, then
+/// adopts the returned config, then publishes exactly that identity.
 fn build_h3_quinn_server_config(
     tls_config: &Arc<rustls::ServerConfig>,
     tls_policy: &TlsPolicy,
@@ -901,6 +901,17 @@ pub async fn start_http3_listener_with_signal(
             client_auth_configured,
             &h3_config,
         )?;
+        // Fallible candidate build succeeded. Install the live verifier before
+        // the endpoint can observe this ServerConfig. Generation stays
+        // unpublished until after bind (see the arming block below).
+        if frontend_tls_reload.is_some()
+            && let Some(verifier) = startup_client_trust.verifier.clone()
+        {
+            crate::tls::client_trust::install_accepted_live_verifier(
+                crate::tls::ClientTrustScope::ProxyH3,
+                verifier,
+            );
+        }
         // Quinn's `Endpoint::server` convenience constructor is gated on its
         // `ring` or non-FIPS `aws-lc-rs` feature. The FIPS provider uses the
         // distinct `aws-lc-rs-fips` feature, so construct the same endpoint
@@ -1121,6 +1132,16 @@ pub async fn start_http3_listener_with_signal(
                     &reload_h3_config,
                 ) {
                     Ok(server_config) => {
+                        // Fallible quinn rebuild succeeded. Install the live
+                        // verifier BEFORE exposing the new endpoint config so a
+                        // handshake that loads V2 while generation is still 1
+                        // consults V2, not the withdrawn V1.
+                        if let Some(verifier) = client_trust.verifier.clone() {
+                            crate::tls::client_trust::install_accepted_live_verifier(
+                                crate::tls::ClientTrustScope::ProxyH3,
+                                verifier,
+                            );
+                        }
                         let adopted = Arc::new(server_config.clone());
                         endpoint.set_server_config(Some(server_config));
                         adopted_quic.store(Arc::new(Some(adopted)));
@@ -1320,13 +1341,13 @@ fn close_h3_connection_for_trust_withdrawal(connection: &quinn::Connection, peer
 /// Bind an HTTP/3 Incoming to the endpoint config stored before this scope's
 /// generation was published.
 ///
-/// The H3 reload arm stores `adopted_quic` and calls `Endpoint::set_server_config`
-/// **before** it publishes. Recapturing that slot immediately before
-/// `accept_with` binds the handshake to the candidate whose identity was
-/// published, rather than a QUIC `Incoming` that formed against a withdrawn
-/// snapshot. The rustls verifier inside that config is itself a live wrapper,
-/// so even a stale adopted snapshot still consults the published verifier
-/// (issue #3857).
+/// The H3 reload arm installs the live verifier, then stores `adopted_quic` and
+/// calls `Endpoint::set_server_config`, then publishes generation. Recapturing
+/// that slot immediately before `accept_with` binds the handshake to the
+/// candidate whose identity was published, rather than a QUIC `Incoming` that
+/// formed against a withdrawn snapshot. The rustls verifier inside that config
+/// is itself a live wrapper, so even a stale adopted snapshot still consults
+/// the published verifier (issue #3857).
 fn accept_h3_incoming(
     incoming: quinn::Incoming,
     adopted_quic: &arc_swap::ArcSwap<Option<Arc<quinn::ServerConfig>>>,
