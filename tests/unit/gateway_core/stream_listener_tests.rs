@@ -2975,8 +2975,8 @@ async fn node_waypoint_udp_retract_a_keeps_shared_listener_and_b_route() {
     assert_eq!(
         destinations_before,
         vec![
-            "10.96.0.10".parse().expect("ip a"),
-            "10.96.0.11".parse().expect("ip b"),
+            "10.96.0.10".parse::<IpAddr>().expect("ip a"),
+            "10.96.0.11".parse::<IpAddr>().expect("ip b"),
         ]
     );
     assert!(
