@@ -7947,8 +7947,7 @@ impl ProxyState {
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
 
-            self.gateway_file_svid_bundle
-                .store(Arc::new(Some(bundle)));
+            self.gateway_file_svid_bundle.store(Arc::new(Some(bundle)));
             self.gateway_svid_bundle
                 .store(Arc::new(Some(active_bundle)));
         }

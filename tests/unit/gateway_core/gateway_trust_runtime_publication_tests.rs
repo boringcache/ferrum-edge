@@ -241,9 +241,12 @@ async fn source_trust_withdrawal_retires_live_mesh_transports_before_admission_r
     let backend_before = backend_security_generation(&state);
     let ownership_before = state.mesh_trust_registry.accepted_generation();
 
-    let withdrew = state.install_gateway_runtime_svid_bundle(
-        source_loaded_svid_generation("file.local", &[2], &[11], &[21]),
-    );
+    let withdrew = state.install_gateway_runtime_svid_bundle(source_loaded_svid_generation(
+        "file.local",
+        &[2],
+        &[11],
+        &[21],
+    ));
 
     assert!(withdrew, "replacing the only source root is a withdrawal");
     assert!(
@@ -281,9 +284,12 @@ async fn cp_override_masks_source_trust_changes_from_live_transport_retirement()
         .expect("the override-backed generation admits a live transport");
     let ownership_before = state.mesh_trust_registry.accepted_generation();
 
-    let withdrew = state.install_gateway_runtime_svid_bundle(
-        source_loaded_svid_generation("file.local", &[2], &[11], &[21]),
-    );
+    let withdrew = state.install_gateway_runtime_svid_bundle(source_loaded_svid_generation(
+        "file.local",
+        &[2],
+        &[11],
+        &[21],
+    ));
 
     assert!(
         !withdrew,
