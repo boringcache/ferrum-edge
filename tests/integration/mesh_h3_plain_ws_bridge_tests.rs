@@ -423,7 +423,8 @@ fn shared_mesh_plain_helper_never_plaintext_falls_back() {
             && src.contains("boxed_mesh_mtls_pool_get_sender(")
             && src.contains("#[inline(never)]\nfn boxed_unix_backend_checkout_h2c<'a>(")
             && src.contains("boxed_unix_backend_checkout_h2c(")
-            && src.contains("#[inline(never)]\nfn boxed_proxy_to_backend_mesh_mtls_after_ready<'a>(")
+            && src
+                .contains("#[inline(never)]\nfn boxed_proxy_to_backend_mesh_mtls_after_ready<'a>(")
             && src.contains("boxed_proxy_to_backend_mesh_mtls_after_ready("),
         "Sidecar acquire must box handshake checkout and post-ready send/collect"
     );
