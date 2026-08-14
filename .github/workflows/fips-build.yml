@@ -1,19 +1,20 @@
 name: FIPS Build Policy
 
-# FIPS deployment-mode gate for issue #3510.
+# FIPS deployment-mode gate for issue #3510, with CI runtime caching for #3888.
 #
-# Two jobs, deliberately split by cost and by what they can prove:
+# Jobs:
 #
-# 1. `feature-policy` is the REQUIRED gate. It is cheap, hermetic, and
-#    deterministic: it reads `Cargo.toml` and the *resolved* feature graph for
-#    both profiles and fails when a ring feature could still be in control of a
-#    nominal FIPS build. It also runs the ordinary-profile check, so a change
-#    that quietly moves the default build onto a different backend is caught.
-#
-# 2. `fips-build` compiles and tests the FIPS profile against the real
-#    `aws-lc-fips-sys` module. That needs CMake, Go, and Perl. The committed
-#    lockfile pins both build profiles; listing the FIPS-only package in the
-#    lockfile does not compile or link it into ordinary artifacts.
+# 1. `feature-policy` is the cheap REQUIRED graph audit. It reads `Cargo.toml`
+#    and the resolved feature graph for both profiles and fails when a ring
+#    feature could still be in control of a nominal FIPS build.
+# 2. `fips-plan` decides whether the expensive compile/clippy/test jobs run.
+#    The planner is read from the trusted base; a missing or unknown planner
+#    fails closed toward running the live compile gate.
+# 3. `fips-compile` builds the FIPS binary and every claimed feature combination
+#    once, then rust-cache/sccache persist the AWS-LC + rustc artifacts so a
+#    later clippy/test job or a runner-loss retry does not start from zero.
+# 4. `fips-clippy` and `fips-test` restore that cache in parallel.
+# 5. `fips-build` keeps the `FIPS Build & Test` check name and fails closed.
 #
 # Ferrum Edge is not a validated cryptographic module and is not independently
 # FIPS-certified. A green run here means the FIPS profile builds, links the
@@ -27,6 +28,11 @@ on:
   pull_request:
   merge_group:
   workflow_dispatch:
+    inputs:
+      force_cold_cache:
+        description: Skip cache restore to prove cold-path FIPS contracts
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -39,17 +45,21 @@ env:
   CARGO_TERM_COLOR: always
   CARGO_NET_RETRY: "10"
   CARGO_HTTP_MULTIPLEXING: "false"
-  # These jobs do not install sccache, so clear the checked-in rustc wrapper
-  # from `.cargo/config.toml` rather than exec'ing a missing tool.
-  RUSTC_WRAPPER: ""
-  CARGO_BUILD_RUSTC_WRAPPER: ""
+  FERRUM_CI_FORCE_COLD_CACHE: ${{ github.event.inputs.force_cold_cache == 'true' }}
 
 jobs:
   feature-policy:
     name: FIPS Feature Policy
     runs-on: ubuntu-latest
+    # This job does not install sccache, so clear the checked-in rustc wrapper
+    # from `.cargo/config.toml` rather than exec'ing a missing tool.
+    env:
+      RUSTC_WRAPPER: ""
+      CARGO_BUILD_RUSTC_WRAPPER: ""
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
+        with:
+          persist-credentials: false
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
@@ -98,16 +108,165 @@ jobs:
           done < <(python3 .github/scripts/check_fips_feature_policy.py --list-claimed-profiles)
           exit "$status"
 
-  fips-build:
-    name: FIPS Build & Test
+  fips-plan:
+    name: FIPS compile trigger
     runs-on: ubuntu-latest
+    outputs:
+      relevant: ${{ steps.filter.outputs.relevant }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Check for FIPS compile changes
+        id: filter
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          BASE_REF: ${{ github.base_ref }}
+          MERGE_BASE_SHA: ${{ github.event.merge_group.base_sha }}
+        run: |
+          set -euo pipefail
+
+          filter_path=.github/scripts/ci_runtime_plan.py
+          changed_files="$RUNNER_TEMP/fips-build-changed-files.txt"
+          trusted_filter="$RUNNER_TEMP/fips-build-trusted-filter.py"
+          rm -f -- "$changed_files" "$trusted_filter"
+          : > "$changed_files"
+
+          filter_args=(--suite fips-build --changed-files "$changed_files")
+
+          if [ "$EVENT_NAME" = "pull_request" ]; then
+            if ! printf '%s' "$BASE_REF" | grep -Eq '^[A-Za-z0-9][A-Za-z0-9._/-]{0,200}$'; then
+              echo "::error::refusing to resolve an unsafe base ref" >&2
+              exit 1
+            fi
+            case "$BASE_REF" in
+              *..*|*//*|*/|*.lock|*/.*)
+                echo "::error::refusing to resolve an unsafe base ref" >&2
+                exit 1
+                ;;
+            esac
+            fetched=false
+            for attempt in 1 2 3; do
+              if git fetch --no-tags --no-recurse-submodules origin \
+                "+refs/heads/${BASE_REF}:refs/ferrum/trusted-base"; then
+                fetched=true
+                break
+              fi
+              echo "git fetch of ${BASE_REF} failed (attempt ${attempt}/3); retrying" >&2
+              sleep $(( attempt * 10 ))
+            done
+            if [ "$fetched" != true ]; then
+              echo "::error::git fetch of ${BASE_REF} failed after 3 attempts" >&2
+              exit 1
+            fi
+            trusted_sha="$(git rev-parse --verify --quiet refs/ferrum/trusted-base^{commit} || true)"
+          elif [ "$EVENT_NAME" = "merge_group" ]; then
+            if ! printf '%s' "$MERGE_BASE_SHA" | grep -Eq '^[0-9a-f]{40}$'; then
+              echo "::error::merge_group base_sha missing or malformed" >&2
+              exit 1
+            fi
+            if ! git cat-file -e "${MERGE_BASE_SHA}^{commit}" 2>/dev/null; then
+              fetched=false
+              for attempt in 1 2 3; do
+                if git fetch --no-tags --no-recurse-submodules origin \
+                  "${MERGE_BASE_SHA}"; then
+                  fetched=true
+                  break
+                fi
+                echo "git fetch of merge_group base failed (attempt ${attempt}/3); retrying" >&2
+                sleep $(( attempt * 10 ))
+              done
+              if [ "$fetched" != true ]; then
+                echo "::error::git fetch of merge_group base_sha failed after 3 attempts" >&2
+                exit 1
+              fi
+            fi
+            trusted_sha="$MERGE_BASE_SHA"
+          else
+            trusted_sha="$(git rev-parse --verify --quiet 'HEAD^{commit}' || true)"
+            filter_args+=(--force-run)
+          fi
+
+          if ! printf '%s' "$trusted_sha" | grep -Eq '^[0-9a-f]{40}$'; then
+            echo "::error::trusted base did not resolve to a full commit id" >&2
+            exit 1
+          fi
+
+          if ! git cat-file -e "${trusted_sha}:${filter_path}" 2>/dev/null; then
+            echo "relevant=true" >> "$GITHUB_OUTPUT"
+            echo "trusted base has not adopted ${filter_path}; running the full gate." >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+
+          entry="$(git ls-tree --full-tree "$trusted_sha" -- "$filter_path")"
+          if [ "$(printf '%s\n' "$entry" | grep -c . || true)" != "1" ]; then
+            echo "::error::${filter_path} is not a single tree entry at ${trusted_sha}" >&2
+            exit 1
+          fi
+          entry_mode="$(printf '%s\n' "$entry" | awk '{print $1}')"
+          entry_type="$(printf '%s\n' "$entry" | awk '{print $2}')"
+          entry_object="$(printf '%s\n' "$entry" | awk '{print $3}')"
+          entry_path="$(printf '%s\n' "$entry" | awk -F'\t' '{print $2}')"
+          if [ "$entry_type" != "blob" ] || [ "$entry_path" != "$filter_path" ]; then
+            echo "::error::${filter_path} is not a blob at ${trusted_sha}" >&2
+            exit 1
+          fi
+          case "$entry_mode" in
+            100644|100755) ;;
+            *)
+              echo "::error::${filter_path} has non-regular mode ${entry_mode}" >&2
+              exit 1
+              ;;
+          esac
+          if ! printf '%s' "$entry_object" | grep -Eq '^[0-9a-f]{40}$'; then
+            echo "::error::${filter_path} did not resolve to an object id" >&2
+            exit 1
+          fi
+          if [ "$(git cat-file -s "$entry_object")" -gt 262144 ]; then
+            echo "::error::${filter_path} exceeds the 256 KiB trusted-filter ceiling" >&2
+            exit 1
+          fi
+          git cat-file blob "$entry_object" > "$trusted_filter"
+
+          if [ "$EVENT_NAME" = "pull_request" ] || [ "$EVENT_NAME" = "merge_group" ]; then
+            git diff --name-only --no-renames "${trusted_sha}...HEAD" \
+              | sort > "$changed_files"
+          fi
+
+          python3 -I "$trusted_filter" --self-test
+          plan="$(python3 -I "$trusted_filter" "${filter_args[@]}")"
+          relevant="$(printf '%s\n' "$plan" | sed -n 's/^relevant=//p')"
+          case "$relevant" in
+            true|false) ;;
+            *)
+              echo "::error::trusted relevance filter produced no usable verdict" >&2
+              exit 1
+              ;;
+          esac
+          echo "relevant=$relevant" >> "$GITHUB_OUTPUT"
+          echo "Relevance decided by trusted base ${trusted_sha}." >> "$GITHUB_STEP_SUMMARY"
+          printf '%s\n' "$plan" | sed -n '/^## /,$p' >> "$GITHUB_STEP_SUMMARY"
+
+  fips-compile:
+    name: FIPS compile
+    needs: fips-plan
+    if: needs.fips-plan.outputs.relevant == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
+        with:
+          persist-credentials: false
+
+      - name: Initialize runtime telemetry
+        run: python3 .github/scripts/ci_runtime_telemetry.py init --quiet
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
-        with:
-          components: clippy
+
+      - uses: ./.github/actions/setup-sccache
 
       - name: Install aws-lc-fips-sys build prerequisites
         # The FIPS build of AWS-LC is compiled through the upstream crate's
@@ -117,16 +276,44 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
-            cmake ninja-build golang-go libcurl4-openssl-dev
-
-      - name: Install protoc
-        run: |
-          sudo apt-get install -y --no-install-recommends protobuf-compiler
+            cmake ninja-build golang-go libcurl4-openssl-dev protobuf-compiler
 
       - uses: ./.github/actions/setup-fast-linker
 
+      - name: Cache FIPS Rust, AWS-LC, and sccache outputs
+        if: github.event.inputs.force_cold_cache != 'true'
+        id: rust-cache
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        with:
+          shared-key: ci-fips
+          add-job-id-key: "false"
+          cache-directories: ${{ github.workspace }}/.cache/sccache
+          cache-on-failure: "true"
+
+      - name: Record rust-cache restore
+        if: github.event.inputs.force_cold_cache != 'true'
+        env:
+          CACHE_HIT: ${{ steps.rust-cache.outputs.cache-hit }}
+        run: |
+          python3 .github/scripts/ci_runtime_telemetry.py cache \
+            --name rust-cache \
+            --hit "$CACHE_HIT" \
+            --path "${GITHUB_WORKSPACE}/.cache/sccache" \
+            --note "shared-key=ci-fips toolchain+lockfile+aws-lc"
+
+      - name: Record cold-cache proof
+        if: github.event.inputs.force_cold_cache == 'true'
+        run: |
+          python3 .github/scripts/ci_runtime_telemetry.py cache \
+            --name rust-cache \
+            --hit false \
+            --bytes 0 \
+            --note "force_cold_cache skipped restore"
+
       - name: Build the FIPS profile
-        run: cargo build --locked --no-default-features --features fips --bin ferrum-edge
+        run: |
+          python3 .github/scripts/ci_runtime_telemetry.py run --phase fips-build -- \
+            cargo build --locked --no-default-features --features fips --bin ferrum-edge
 
       - name: Compile every crypto-relevant optional FIPS combination
         # `aws-lc-fips-sys` is already compiled by the step above and lives in
@@ -144,34 +331,205 @@ jobs:
         # `fips_external_secret_tests` proves the refusal itself.
         run: |
           set -euo pipefail
+          python3 .github/scripts/ci_runtime_telemetry.py start --phase fips-claimed-checks
+          status=0
           while IFS=$'\t' read -r label features; do
             [ -n "$features" ] || continue
             echo "::group::cargo check — ${label}"
-            cargo check --locked --no-default-features --features "$features" \
-              --lib --bins
+            if ! cargo check --locked --no-default-features --features "$features" \
+              --lib --bins; then
+              echo "::error::FIPS claimed-profile compile failed for ${label} (--features ${features})"
+              status=1
+            fi
             echo "::endgroup::"
           done < <(python3 .github/scripts/check_fips_feature_policy.py --list-claimed-profiles)
+          python3 .github/scripts/ci_runtime_telemetry.py end --phase fips-claimed-checks --status "$status"
+          exit "$status"
+
+      - name: Record sccache stats
+        if: always()
+        run: |
+          if command -v sccache >/dev/null 2>&1; then
+            sccache --show-stats || true
+          fi
+          python3 .github/scripts/ci_runtime_telemetry.py summarize --title "FIPS compile"
+
+  fips-clippy:
+    name: FIPS clippy
+    needs: fips-compile
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
+        with:
+          persist-credentials: false
+
+      - name: Initialize runtime telemetry
+        run: python3 .github/scripts/ci_runtime_telemetry.py init --quiet
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+        with:
+          components: clippy
+
+      - uses: ./.github/actions/setup-sccache
+
+      - name: Install aws-lc-fips-sys build prerequisites
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            cmake ninja-build golang-go libcurl4-openssl-dev protobuf-compiler
+
+      - uses: ./.github/actions/setup-fast-linker
+
+      - name: Cache FIPS Rust, AWS-LC, and sccache outputs
+        if: github.event.inputs.force_cold_cache != 'true'
+        id: rust-cache
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        with:
+          shared-key: ci-fips
+          add-job-id-key: "false"
+          cache-directories: ${{ github.workspace }}/.cache/sccache
+          cache-on-failure: "true"
+
+      - name: Record rust-cache restore
+        if: github.event.inputs.force_cold_cache != 'true'
+        env:
+          CACHE_HIT: ${{ steps.rust-cache.outputs.cache-hit }}
+        run: |
+          python3 .github/scripts/ci_runtime_telemetry.py cache \
+            --name rust-cache \
+            --hit "$CACHE_HIT" \
+            --path "${GITHUB_WORKSPACE}/.cache/sccache" \
+            --note "shared-key=ci-fips"
 
       - name: Lint the FIPS profile
         run: |
-          cargo clippy --locked --no-default-features --features fips \
+          python3 .github/scripts/ci_runtime_telemetry.py run --phase fips-clippy -- \
+            cargo clippy --locked --no-default-features --features fips \
             --lib --tests -p ferrum-edge -- -D warnings
 
-      - name: FIPS policy and approved-primitive tests
+      - name: Record sccache stats
+        if: always()
         run: |
-          cargo test --locked --no-default-features --features fips \
-            --test unit_tests tls::fips_policy_tests
+          if command -v sccache >/dev/null 2>&1; then
+            sccache --show-stats || true
+          fi
+          python3 .github/scripts/ci_runtime_telemetry.py summarize --title "FIPS clippy"
 
-      - name: FIPS key-admission and peer-verification tests
-        run: |
-          cargo test --locked --no-default-features --features fips \
-            --test unit_tests tls::fips_key_admission_tests
+  fips-test:
+    name: FIPS tests
+    needs: fips-compile
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
+        with:
+          persist-credentials: false
 
-      - name: FIPS frontend, backend, and CP/DP TLS handshakes
+      - name: Initialize runtime telemetry
+        run: python3 .github/scripts/ci_runtime_telemetry.py init --quiet
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+
+      - uses: ./.github/actions/setup-sccache
+
+      - name: Install aws-lc-fips-sys build prerequisites
         run: |
-          cargo test --locked --no-default-features --features fips \
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            cmake ninja-build golang-go libcurl4-openssl-dev protobuf-compiler
+
+      - uses: ./.github/actions/setup-fast-linker
+
+      - name: Cache FIPS Rust, AWS-LC, and sccache outputs
+        if: github.event.inputs.force_cold_cache != 'true'
+        id: rust-cache
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        with:
+          shared-key: ci-fips
+          add-job-id-key: "false"
+          cache-directories: ${{ github.workspace }}/.cache/sccache
+          cache-on-failure: "true"
+
+      - name: Record rust-cache restore
+        if: github.event.inputs.force_cold_cache != 'true'
+        env:
+          CACHE_HIT: ${{ steps.rust-cache.outputs.cache-hit }}
+        run: |
+          python3 .github/scripts/ci_runtime_telemetry.py cache \
+            --name rust-cache \
+            --hit "$CACHE_HIT" \
+            --path "${GITHUB_WORKSPACE}/.cache/sccache" \
+            --note "shared-key=ci-fips"
+
+      - name: FIPS policy, key-admission, and handshake tests
+        # One unit_tests invocation and one integration_tests invocation so the
+        # binaries are compiled once. Filters are OR-matched by cargo.
+        run: |
+          set -euo pipefail
+          python3 .github/scripts/ci_runtime_telemetry.py run --phase fips-unit-tests -- \
+            cargo test --locked --no-default-features --features fips \
+            --test unit_tests tls::fips_policy_tests tls::fips_key_admission_tests
+          python3 .github/scripts/ci_runtime_telemetry.py run --phase fips-handshake-tests -- \
+            cargo test --locked --no-default-features --features fips \
             --test integration_tests \
-            integration::cp_grpc_handshake_admission_tests::frontend_and_backend_builders_complete_a_real_tls_handshake
-          cargo test --locked --no-default-features --features fips \
-            --test integration_tests \
+            integration::cp_grpc_handshake_admission_tests::frontend_and_backend_builders_complete_a_real_tls_handshake \
             integration::cp_grpc_handshake_admission_tests::legitimate_data_plane_connects_once_a_permit_is_released
+
+      - name: Record sccache stats
+        if: always()
+        run: |
+          if command -v sccache >/dev/null 2>&1; then
+            sccache --show-stats || true
+          fi
+          python3 .github/scripts/ci_runtime_telemetry.py summarize --title "FIPS tests"
+
+  fips-build:
+    name: FIPS Build & Test
+    runs-on: ubuntu-latest
+    needs:
+      - fips-plan
+      - fips-compile
+      - fips-clippy
+      - fips-test
+    if: always()
+    steps:
+      - name: Fail when FIPS planning fails
+        if: needs.fips-plan.result != 'success'
+        run: exit 1
+
+      - name: Skip expensive FIPS compile for unrelated changes
+        if: needs.fips-plan.outputs.relevant != 'true'
+        run: |
+          {
+            echo "## FIPS Build & Test"
+            echo ""
+            echo "No FIPS-sensitive paths changed. Feature policy still ran."
+            echo "Compile, clippy, and handshake jobs were skipped."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Fail when FIPS compile did not succeed
+        if: needs.fips-plan.outputs.relevant == 'true' && needs.fips-compile.result != 'success'
+        run: exit 1
+
+      - name: Fail when FIPS clippy did not succeed
+        if: needs.fips-plan.outputs.relevant == 'true' && needs.fips-clippy.result != 'success'
+        run: exit 1
+
+      - name: Fail when FIPS tests did not succeed
+        if: needs.fips-plan.outputs.relevant == 'true' && needs.fips-test.result != 'success'
+        run: exit 1
+
+      - name: Report FIPS compile gate
+        if: needs.fips-plan.outputs.relevant == 'true'
+        run: |
+          {
+            echo "## FIPS Build & Test"
+            echo ""
+            echo "Compile, claimed-profile checks, clippy \`-D warnings\`, and"
+            echo "policy/key-admission/handshake tests passed."
+            echo ""
+            echo "Warm PR target: <=30 minutes, p95 <=45 minutes, measured on hosted runs."
+          } >> "$GITHUB_STEP_SUMMARY"

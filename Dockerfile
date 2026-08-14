@@ -88,11 +88,12 @@ RUN --mount=from=runtime-base,source=/,target=/distroless-root,ro \
 
 # Stage 1: Builder — rust:latest uses trixie (Debian 13), matching distroless/cc-debian13 glibc
 FROM rust:latest AS builder
-ARG FEATURES
 
 # Install build dependencies
 # clang/libclang-dev: required by bindgen (used by zstd-sys)
 # cmake: required by some native C dependencies
+# FEATURES is intentionally not in scope yet: ordinary and eBPF production
+# images share this toolchain layer in BuildKit.
 RUN apt-get update && apt-get install -y \
     pkg-config \
     libssl-dev \
@@ -118,6 +119,10 @@ COPY vendor ./vendor
 # The main crate depends on shared no_std eBPF ABI types via a path dependency,
 # so the Docker build context must include ebpf/ before any Cargo metadata load.
 COPY ebpf ./ebpf
+
+# Declare FEATURES only after the shared apt + manifest layers so the default
+# `cloud-secrets` image and the `cloud-secrets,ebpf` image reuse that work.
+ARG FEATURES
 
 # Create a dummy main.rs to build dependencies only
 RUN mkdir src && \

@@ -7,6 +7,7 @@ Ferrum Edge includes comprehensive CI/CD pipelines for automated testing, buildi
 - [Pipeline Overview](#pipeline-overview)
 - [Workflow Inventory](#workflow-inventory)
 - [CI Pipeline (ci.yml)](#ci-pipeline-ciyml)
+- [CI runtime caching (production images and FIPS)](#ci-runtime-caching-production-images-and-fips)
 - [Release Pipeline (release.yml)](#release-pipeline-releaseyml)
 - [How Releases Work](#how-releases-work)
 - [Creating a New Release](#creating-a-new-release)
@@ -37,6 +38,7 @@ adding, removing, or materially changing a workflow.
 |---|---|---|---|
 | `ci.yml` | CI | PRs, `merge_group`, push to `main`, manual | Required validation gate plus `latest` prerelease and Docker image publishing from `main`. The `Tests` check runs on PRs and merge-queue groups. |
 | `coverage.yml` | Coverage | PRs, `merge_group`, push to `main`, weekly schedule, manual | Coverage planning/reporting and coverage floor enforcement; `Merge Coverage` is directly required on PRs and merge-queue groups. |
+| `fips-build.yml` | FIPS Build Policy | PRs, `merge_group`, push to `main`, manual | Required FIPS feature-graph audit plus compile/clippy/handshake gate. Warm PR target <=30 minutes (p95 <=45); see [CI runtime caching](#ci-runtime-caching-production-images-and-fips). |
 | `release.yml` | Release | `v*` tag push | Versioned binary, GitHub Release, and Docker publishing after CI/Coverage validation. |
 | `gateway-api-conformance.yml` | Gateway API Conformance | PRs, `merge_group`, push to `main`, weekly schedule, manual | Upstream Gateway API conformance lab; `Gateway API Conformance` is directly required on PRs and merge-queue groups. |
 | `mesh-e2e-sidecar-live.yml` | Mesh E2E Sidecar Live Datapath | PRs, `merge_group`, push to `main`, manual | Release-blocking sidecar datapath validation; `Mesh E2E Sidecar Live` is directly required on PRs and merge-queue groups. |
@@ -214,6 +216,47 @@ Push tag v* (e.g., v0.2.0)
                                                 requires attestation success
                                                 (retracts an unverified release)
 ```
+
+## CI runtime caching (production images and FIPS)
+
+Issue #3888 cuts the production-Dockerfile and FIPS PR gates that were taking
+60–83 minutes on cold sequential builds, without dropping distroless, eBPF,
+clippy, claimed-feature, or handshake coverage.
+
+**Warm PR target.** Each of `Production Dockerfile eBPF image smoke` and
+`FIPS Build & Test` should complete in **<=30 minutes** on a warm cache, with a
+documented **p95 <=45 minutes**. Hosted evidence is three consecutive warm
+`pull_request` runs after this change lands (same cache keys, no
+`force_cold_cache`), plus job summaries that record phase durations, cache
+hit/miss, restored bytes, and `github.run_attempt` retry amplification.
+A `workflow_dispatch` input `force_cold_cache` skips restore so a hosted
+cold-cache run still proves every live contract within the existing job
+timeouts.
+
+**Production images.** The ordinary `runtime` and distroless `runtime-ebpf`
+targets build in parallel with `docker/build-push-action`, sharing a scoped
+BuildKit GitHub Actions cache (`production-dockerfile-smoke-default` /
+`production-dockerfile-smoke-ebpf`). The Dockerfile declares `ARG FEATURES`
+after the shared apt and manifest layers so those two feature sets reuse
+toolchain work. Cache export uses the action process (the same restore/save
+pattern as `ambient-host-udp-live`); fork pull requests cannot write the GitHub
+Actions cache. A trusted-base copy of `.github/scripts/ci_runtime_plan.py`
+skips the smoke only when the diff cannot change those images; a missing
+planner fails closed toward running.
+
+**FIPS.** `FIPS Feature Policy` stays a cheap always-on graph audit.
+Compile, claimed-profile `cargo check`, clippy `-D warnings`, and the
+policy/key-admission/handshake tests share rust-cache key `ci-fips` and a
+local-disk sccache directory. The compile job saves first; clippy and tests
+restore in parallel. `cache-on-failure` keeps that compile work across
+runner-loss retries (exit 143 after a green suite). Example plugins stay out of
+the FIPS artifact (`FERRUM_CUSTOM_PLUGINS` is unset).
+
+**Trust boundary.** Untrusted `run:` steps never receive GitHub Actions cache
+write credentials. `setup-sccache` keeps the sccache GHA backend disabled and
+does not export the cache-service token into `GITHUB_ENV`. Workflows stay
+`permissions: contents: read`. Static checks live in
+`.github/scripts/verify_ci_runtime_cache.py`.
 
 ## CI Pipeline (ci.yml)
 
@@ -539,8 +582,11 @@ eBPF userspace binary with `FEATURES=cloud-secrets,ebpf`, builds the
 image from those cached host-built artifacts instead of recompiling inside
 Docker. A separate production-Dockerfile smoke builds the ordinary `runtime`
 target (which must omit `ip`) and the privileged `runtime-ebpf` target (which
-must contain `ip`), then checks normalized filesystem inventories for shells and
-package managers. It then creates a disposable dual-stack kind cluster with two
+must contain `ip`) **in parallel** through BuildKit, restoring a scoped GitHub
+Actions layer cache produced by trusted runs. Each job then checks a normalized
+filesystem inventory for shells and package managers. A trusted-base path
+planner skips the smoke when the diff cannot change those images; uncertain
+classification runs the full gate. It then creates a disposable dual-stack kind cluster with two
 workers, mounts bpffs in each kind node, loads both images into the cluster, and
 installs the Istio policy CRDs. The runner must provide Docker and a Linux kernel
 with cgroup v2 and kernel >= 5.7.

@@ -9,7 +9,8 @@ description: >-
   cache-service credential is intentionally not exposed to later PR-controlled
   steps); rust-cache persists that directory together with Cargo and target
   directories using isolated shared keys so incompatible job/profile/target
-  artifacts do not mix.
+  artifacts do not mix. rust-cache saves on failure (`cache-on-failure`) so a
+  runner-loss or later-phase failure can still reuse compile work on retry.
   Centralizes the setup block so individual jobs only declare their cache key
   and any extra rustup components.
 
@@ -26,6 +27,11 @@ inputs:
       string skips component install — most jobs don't need extras.
     required: false
     default: ""
+
+outputs:
+  cache-hit:
+    description: Whether rust-cache restored an exact key match
+    value: ${{ steps.rust-cache.outputs.cache-hit }}
 
 runs:
   using: composite
@@ -192,10 +198,12 @@ runs:
         install-linux-packages: "false"
 
     - name: Cache Rust dependencies
+      id: rust-cache
       uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
       with:
         shared-key: ${{ inputs.shared-key }}
         cache-directories: ${{ github.workspace }}/.cache/sccache
+        cache-on-failure: "true"
 
     - name: Pre-fetch crate dependencies (isolate transient registry flakes)
       shell: bash

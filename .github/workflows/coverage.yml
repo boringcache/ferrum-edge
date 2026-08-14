@@ -224,9 +224,11 @@ jobs:
         if: matrix.kind == 'lib-unit'
         run: |
           set -euo pipefail
+          # One llvm-cov invocation compiles lib + unit_tests together so a
+          # runner-loss after the library suite does not throw away that compile
+          # and then recompile ferrum-edge for the unit-test target (#3888).
           cargo llvm-cov --no-report \
-            --lib
-          cargo llvm-cov --no-report \
+            --lib \
             --test unit_tests
         env:
           RUST_BACKTRACE: 1
