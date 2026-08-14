@@ -599,6 +599,7 @@ async fn try_spawn_udp_listener(
         udp_gso_enabled: false,
         udp_pktinfo_enabled: false,
         mesh_outbound_enforcement: enforcement,
+        datagram_client_address: None,
     };
     let join = tokio::spawn(async move {
         let _ = start_udp_listener(cfg).await;

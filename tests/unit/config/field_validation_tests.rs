@@ -180,18 +180,42 @@ fn test_proxy_stream_proxy_protocol_rejected_on_http_proxy() {
 }
 
 #[test]
-fn test_proxy_stream_proxy_protocol_rejected_on_udp_proxy() {
+fn test_proxy_stream_proxy_protocol_accepted_on_udp_and_dtls_proxies() {
+    // Issue #3289: `stream_proxy_protocol` selects the per-datagram PROXY v2
+    // DGRAM envelope on udp/dtls (the connection header on tcp/tcps). It is a
+    // stream-family control, not a TCP-only one.
+    for scheme in [BackendScheme::Udp, BackendScheme::Dtls] {
+        let mut proxy = make_proxy("test", "/api");
+        proxy.listen_path = None;
+        proxy.backend_scheme = Some(scheme);
+        proxy.listen_port = Some(5353);
+        proxy.stream_proxy_protocol = Some(true);
+        assert!(
+            proxy.validate_fields().is_ok(),
+            "{scheme:?} stream proxy must accept stream_proxy_protocol: {:?}",
+            proxy.validate_fields()
+        );
+    }
+}
+
+#[test]
+fn test_proxy_stream_proxy_protocol_update_and_clear_are_both_admitted_on_udp() {
+    // Update/delete semantics, not just first-start construction: the admin
+    // write path revalidates the whole proxy on every mutation, so enabling and
+    // later clearing the field must each be admitted on their own.
     let mut proxy = make_proxy("test", "/api");
     proxy.listen_path = None;
     proxy.backend_scheme = Some(BackendScheme::Udp);
     proxy.listen_port = Some(5353);
+
     proxy.stream_proxy_protocol = Some(true);
-    let errs = proxy.validate_fields().unwrap_err();
-    assert!(
-        errs.iter()
-            .any(|e| e.contains("stream_proxy_protocol") && e.contains("TCP-borne")),
-        "expected TCP-only rejection, got: {errs:?}"
-    );
+    assert!(proxy.validate_fields().is_ok(), "enable must be admitted");
+
+    proxy.stream_proxy_protocol = Some(false);
+    assert!(proxy.validate_fields().is_ok(), "disable must be admitted");
+
+    proxy.stream_proxy_protocol = None;
+    assert!(proxy.validate_fields().is_ok(), "clear must be admitted");
 }
 
 #[test]

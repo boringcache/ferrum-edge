@@ -24,6 +24,7 @@ use chrono::Utc;
 use futures_util::{Stream, StreamExt, stream};
 use http_body_util::{BodyExt, Full, StreamBody};
 use hyper::body::Frame;
+use hyper::server::conn::http1::Builder as Http1ServerBuilder;
 use hyper::server::conn::http2::Builder as Http2ServerBuilder;
 use hyper::service::service_fn;
 use hyper_util::rt::{TokioExecutor, TokioIo};
@@ -70,7 +71,7 @@ use crate::common::{
     run_trusted_projected_gateway_test,
 };
 use crate::scaffolding::certs::TestCa;
-use crate::scaffolding::clients::{Http3Client, Http3GrpcStream};
+use crate::scaffolding::clients::{Http3Client, Http3GrpcStream, WebSocketOptions};
 use crate::scaffolding::ports::reserve_port;
 
 const GRPC_SECRET: &str = "ferrum-edge-functional-mesh-grpc-secret00";
@@ -18196,4 +18197,794 @@ async fn h3_mesh_reload(
             }
         }
     }
+}
+
+// ── Live H3 → authenticated mesh-transport plain HTTP / WebSocket (issue #3620) ─
+//
+// Complements the gRPC keystone above (#3284). Plain HTTP and WebSocket ride the
+// same HBONE / Sidecar mesh-mTLS pools through the H3 bridges; these tests drive
+// a real QUIC frontend against live mesh peers and assert authenticated hops,
+// mixed-retry filtering, fail-closed identity / all-ineligible cases, and
+// WebSocket Extended CONNECT over Ambient HBONE.
+
+const H3_MESH_PLAIN_UPSTREAM_ID: &str = "h3-mesh-plain-upstream";
+const H3_MESH_PLAIN_PATH: &str = "/mesh/echo";
+const H3_MESH_PLAIN_BACKEND_PATH: &str = "/echo";
+
+#[derive(Clone, Debug)]
+struct H3MeshObservedHttp {
+    authority: String,
+    path: String,
+    method: String,
+    body: Vec<u8>,
+    client_cert_der: Vec<Vec<u8>>,
+}
+
+impl H3MeshObservedHttp {
+    fn presented_client_spiffe(&self, id: &str) -> bool {
+        self.client_cert_der
+            .iter()
+            .any(|der| der.windows(id.len()).any(|w| w == id.as_bytes()))
+    }
+}
+
+struct H3MeshHttpPeer {
+    port: u16,
+    observations: Arc<Mutex<Vec<H3MeshObservedHttp>>>,
+    accepts: Arc<AtomicUsize>,
+}
+
+impl H3MeshHttpPeer {
+    fn accept_count(&self) -> usize {
+        self.accepts.load(Ordering::SeqCst)
+    }
+
+    async fn wait_for_http(&self, bound: Duration) -> H3MeshObservedHttp {
+        let deadline = Instant::now() + bound;
+        loop {
+            if let Some(obs) = self
+                .observations
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .first()
+                .cloned()
+            {
+                return obs;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "H3 mesh HTTP peer never observed a request"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+}
+
+async fn serve_h3_mesh_http_echo<T>(
+    io: T,
+    client_cert_der: Vec<Vec<u8>>,
+    observations: Arc<Mutex<Vec<H3MeshObservedHttp>>>,
+) where
+    T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+{
+    let service = service_fn(move |req: hyper::Request<hyper::body::Incoming>| {
+        let observations = Arc::clone(&observations);
+        let client_cert_der = client_cert_der.clone();
+        async move {
+            let authority = h3_mesh_observed_http_authority(&req);
+            let path = req.uri().path().to_string();
+            let method = req.method().as_str().to_string();
+            let body = req.collect().await?.to_bytes().to_vec();
+            observations
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .push(H3MeshObservedHttp {
+                    authority,
+                    path: path.clone(),
+                    method,
+                    body: body.clone(),
+                    client_cert_der,
+                });
+            Ok::<_, hyper::Error>(
+                hyper::Response::builder()
+                    .status(200)
+                    .header("content-type", "application/octet-stream")
+                    .header("x-mesh-plain", "ok")
+                    .body(Full::new(Bytes::from(body)))
+                    .expect("build plain mesh echo"),
+            )
+        }
+    });
+    let _ = Http2ServerBuilder::new(TokioExecutor::new())
+        .serve_connection(TokioIo::new(io), service)
+        .await;
+}
+
+/// HTTP/1.1 origin-form has no URI authority; the inner HBONE client puts the
+/// app `host:port` on `Host` (`proxy_to_backend_hbone`). HTTP/2 `:authority`
+/// stays on the URI.
+fn h3_mesh_observed_http_authority(req: &hyper::Request<hyper::body::Incoming>) -> String {
+    req.uri()
+        .authority()
+        .map(|a| a.to_string())
+        .or_else(|| {
+            req.headers()
+                .get(hyper::header::HOST)
+                .and_then(|v| v.to_str().ok())
+                .map(|s| s.to_string())
+        })
+        .unwrap_or_default()
+}
+
+/// Cleartext HTTP/1.1 echo behind an Ambient HBONE relay. Plain HTTP over
+/// HBONE speaks HTTP/1.1 *inside* the CONNECT byte tunnel (the same inner
+/// client as H1/H2 `proxy_to_backend_hbone`); an h2c-only app cannot
+/// handshake and surfaces `{"error":"HBONE backend unavailable"}`.
+async fn serve_h3_mesh_http1_echo<T>(io: T, observations: Arc<Mutex<Vec<H3MeshObservedHttp>>>)
+where
+    T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+{
+    let service = service_fn(move |req: hyper::Request<hyper::body::Incoming>| {
+        let observations = Arc::clone(&observations);
+        async move {
+            let authority = h3_mesh_observed_http_authority(&req);
+            let path = req.uri().path().to_string();
+            let method = req.method().as_str().to_string();
+            let body = req.collect().await?.to_bytes().to_vec();
+            observations
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .push(H3MeshObservedHttp {
+                    authority,
+                    path: path.clone(),
+                    method,
+                    body: body.clone(),
+                    client_cert_der: Vec::new(),
+                });
+            Ok::<_, hyper::Error>(
+                hyper::Response::builder()
+                    .status(200)
+                    .header("content-type", "application/octet-stream")
+                    .header("x-mesh-plain", "ok")
+                    .body(Full::new(Bytes::from(body)))
+                    .expect("build plain mesh echo"),
+            )
+        }
+    });
+    let _ = Http1ServerBuilder::new()
+        .serve_connection(TokioIo::new(io), service)
+        .await;
+}
+
+async fn start_h3_mesh_mtls_http_peer(svid: &GeneratedGatewaySvid) -> H3MeshHttpPeer {
+    let listener = bind_fixture_listener(loopback_ephemeral())
+        .await
+        .expect("bind H3 mesh mTLS HTTP peer");
+    let port = listener.local_addr().expect("mtls http peer addr").port();
+    let observations: Arc<Mutex<Vec<H3MeshObservedHttp>>> = Arc::new(Mutex::new(Vec::new()));
+    let accepts = Arc::new(AtomicUsize::new(0));
+    let snis: Arc<Mutex<Vec<Option<String>>>> = Arc::new(Mutex::new(Vec::new()));
+    let config = h3_mesh_server_config(svid, Arc::clone(&snis));
+    let peer = H3MeshHttpPeer {
+        port,
+        observations: Arc::clone(&observations),
+        accepts: Arc::clone(&accepts),
+    };
+    tokio::spawn(async move {
+        let acceptor = tokio_rustls::TlsAcceptor::from(config);
+        loop {
+            let Ok((tcp, _)) = listener.accept().await else {
+                break;
+            };
+            accepts.fetch_add(1, Ordering::SeqCst);
+            let _ = tcp.set_nodelay(true);
+            let acceptor = acceptor.clone();
+            let observations = Arc::clone(&observations);
+            tokio::spawn(async move {
+                let Ok(tls) = acceptor.accept(tcp).await else {
+                    return;
+                };
+                let client_cert_der = tls
+                    .get_ref()
+                    .1
+                    .peer_certificates()
+                    .map(|chain| chain.iter().map(|cert| cert.as_ref().to_vec()).collect())
+                    .unwrap_or_default();
+                serve_h3_mesh_http_echo(tls, client_cert_der, observations).await;
+            });
+        }
+    });
+    peer
+}
+
+/// Cleartext HTTP/1.1 app the Ambient HBONE relay byte-copies onto. Named
+/// apart from `start_h3_mesh_h2c_app` (gRPC) because plain HTTP over HBONE
+/// is an inner HTTP/1.1 client, not nested h2c.
+async fn start_h3_mesh_http1_http_app() -> H3MeshHttpPeer {
+    let listener = bind_fixture_listener(loopback_ephemeral())
+        .await
+        .expect("bind H3 mesh HTTP/1.1 app");
+    let port = listener.local_addr().expect("http1 app addr").port();
+    let observations: Arc<Mutex<Vec<H3MeshObservedHttp>>> = Arc::new(Mutex::new(Vec::new()));
+    let accepts = Arc::new(AtomicUsize::new(0));
+    let peer = H3MeshHttpPeer {
+        port,
+        observations: Arc::clone(&observations),
+        accepts: Arc::clone(&accepts),
+    };
+    tokio::spawn(async move {
+        loop {
+            let Ok((tcp, _)) = listener.accept().await else {
+                break;
+            };
+            accepts.fetch_add(1, Ordering::SeqCst);
+            let _ = tcp.set_nodelay(true);
+            let observations = Arc::clone(&observations);
+            tokio::spawn(async move {
+                serve_h3_mesh_http1_echo(tcp, observations).await;
+            });
+        }
+    });
+    peer
+}
+
+fn h3_mesh_plain_config(dead_backend_port: u16, targets: &str, retry: bool) -> String {
+    h3_mesh_plain_config_with_generation(dead_backend_port, targets, retry, 0)
+}
+
+fn h3_mesh_plain_config_with_generation(
+    dead_backend_port: u16,
+    targets: &str,
+    retry: bool,
+    generation: u32,
+) -> String {
+    let retry_block = if retry {
+        "    retry:\n      max_retries: 2\n      retryable_status_codes: []\n      \
+         retryable_methods: [\"GET\", \"POST\"]\n      retry_on_connect_failure: true\n      \
+         backoff: !fixed\n        delay_ms: 50\n"
+    } else {
+        ""
+    };
+    let stamp = format!("2026-08-11T00:00:{generation:02}Z");
+    format!(
+        r#"version: "1"
+proxies:
+  - id: "h3-mesh-plain"
+    listen_path: "/mesh"
+    strip_listen_path: true
+    backend_scheme: http
+    backend_host: "127.0.0.1"
+    backend_port: {dead_backend_port}
+    upstream_id: "{H3_MESH_PLAIN_UPSTREAM_ID}"
+    backend_connect_timeout_ms: 3000
+    backend_read_timeout_ms: 8000
+    backend_write_timeout_ms: 8000
+    updated_at: "{stamp}"
+{retry_block}upstreams:
+  - id: "{H3_MESH_PLAIN_UPSTREAM_ID}"
+    algorithm: round_robin
+    updated_at: "{stamp}"
+    targets:
+{targets}consumers: []
+plugin_configs: []
+"#
+    )
+}
+
+async fn h3_mesh_plain_get(https_port: u16) -> crate::scaffolding::clients::Http3Response {
+    let client = Http3Client::insecure().expect("h3 client");
+    let url = format!("https://127.0.0.1:{https_port}{H3_MESH_PLAIN_PATH}");
+    let deadline = Instant::now() + Duration::from_secs(25);
+    loop {
+        match client.get(&url).await {
+            Ok(resp) => return resp,
+            Err(error) => {
+                if Instant::now() >= deadline {
+                    panic!("H3 plain mesh GET never completed: {error}");
+                }
+                tokio::time::sleep(Duration::from_millis(150)).await;
+            }
+        }
+    }
+}
+
+async fn h3_mesh_plain_post(
+    https_port: u16,
+    body: &[u8],
+) -> crate::scaffolding::clients::Http3Response {
+    let client = Http3Client::insecure().expect("h3 client");
+    let url = format!("https://127.0.0.1:{https_port}{H3_MESH_PLAIN_PATH}");
+    let deadline = Instant::now() + Duration::from_secs(25);
+    loop {
+        match client.post_bytes(&url, Bytes::copy_from_slice(body)).await {
+            Ok(resp) => return resp,
+            Err(error) => {
+                if Instant::now() >= deadline {
+                    panic!("H3 plain mesh POST never completed: {error}");
+                }
+                tokio::time::sleep(Duration::from_millis(150)).await;
+            }
+        }
+    }
+}
+
+fn h3_mesh_unix_target_yaml(socket_path: &str) -> String {
+    format!(
+        r#"      - host: "127.0.0.1"
+        port: 1
+        weight: 1
+        tags:
+          mesh.unix_socket: "{socket_path}"
+"#
+    )
+}
+
+async fn h3_mesh_plain_reload(
+    gateway: &TrustedProjectedGateway,
+    config_yaml: String,
+    expected_tags: &[(&'static str, String)],
+) {
+    let outcome = gateway.apply_projected_yaml(&config_yaml);
+    assert!(
+        matches!(outcome, ConfigApplyOutcome::Applied),
+        "trusted projected H3 plain mesh reload must apply, got {outcome:?}"
+    );
+    let expected: HashMap<String, String> = expected_tags
+        .iter()
+        .map(|(key, value)| ((*key).to_string(), value.clone()))
+        .collect();
+    let deadline = Instant::now() + Duration::from_secs(20);
+    loop {
+        match gateway.live_upstream_tags(H3_MESH_PLAIN_UPSTREAM_ID) {
+            Some(live) if live == expected => return,
+            live => {
+                assert!(
+                    Instant::now() < deadline,
+                    "trusted projected plain reload never exposed expected mesh tags \
+                     {expected:?}; live={live:?}"
+                );
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        }
+    }
+}
+
+/// Plain HTTP over same-cluster Sidecar mesh-mTLS through the H3 frontend.
+#[ignore]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn functional_h3_plain_dispatches_over_same_cluster_sidecar_mesh_mtls() {
+    let identities = TempDir::new().expect("h3 plain mtls identity tempdir");
+    let svids = generate_shared_ca_mesh_svid_set(
+        identities.path(),
+        &[H3_MESH_GATEWAY_SPIFFE, H3_MESH_PEER_SPIFFE],
+    );
+    let peer = start_h3_mesh_mtls_http_peer(&svids[1]).await;
+    let dead_backend_port = reserve_unique_mesh_port().await;
+    let declared_app_port = h3_mesh_declared_app_port().await;
+    let frontend = h3_mesh_frontend_certs();
+
+    let targets = h3_mesh_target_yaml(
+        "127.0.0.1",
+        declared_app_port,
+        &h3_mesh_mtls_tags(peer.port, H3_MESH_PEER_SPIFFE),
+    );
+    let (mut gateway, https_port) = spawn_h3_mesh_gateway(
+        h3_mesh_plain_config(dead_backend_port, &targets, false),
+        &svids[0],
+        &frontend,
+        &[dead_backend_port, peer.port, declared_app_port],
+    )
+    .await;
+
+    let payload = b"h3-plain-sidecar-mtls";
+    let result = h3_mesh_plain_post(https_port, payload).await;
+    assert_eq!(
+        result.status.as_u16(),
+        200,
+        "plain mesh-mTLS must succeed: {:?}",
+        result.headers
+    );
+    assert_eq!(result.body_bytes.as_ref(), payload);
+    assert_eq!(
+        result
+            .headers
+            .get("x-mesh-plain")
+            .and_then(|v| v.to_str().ok()),
+        Some("ok")
+    );
+
+    let observed = peer.wait_for_http(Duration::from_secs(10)).await;
+    assert!(
+        observed.presented_client_spiffe(H3_MESH_GATEWAY_SPIFFE),
+        "peer must verify this gateway's client SVID"
+    );
+    assert_eq!(observed.method, "POST");
+    assert_eq!(observed.authority, H3_MESH_SERVICE_AUTHORITY);
+    assert_eq!(observed.path, H3_MESH_PLAIN_BACKEND_PATH);
+    assert_eq!(observed.body, payload);
+
+    gateway.shutdown().await;
+}
+
+/// Source guard: Ambient HBONE plain HTTP is an inner HTTP/1.1 client
+/// (`proxy_to_backend_hbone`). Serving the destination app as h2c-only
+/// yields 502 `{"error":"HBONE backend unavailable"}` after CONNECT succeeds.
+#[test]
+fn h3_plain_ambient_hbone_inner_app_is_http1_not_h2c() {
+    let test = mesh_test_fn_body("functional_h3_plain_dispatches_over_same_cluster_ambient_hbone");
+    assert!(
+        test.contains("start_h3_mesh_http1_http_app("),
+        "plain Ambient HBONE must reach an HTTP/1.1 app through the byte tunnel"
+    );
+    assert!(
+        !test.contains("start_h3_mesh_h2c_http_app(") && !test.contains("start_h3_mesh_h2c_app("),
+        "gRPC h2c fixtures cannot handshake the HTTP/1.1 inner HBONE client"
+    );
+    let app = mesh_test_fn_body("start_h3_mesh_http1_http_app");
+    assert!(
+        app.contains("serve_h3_mesh_http1_echo("),
+        "HBONE inner app must use the HTTP/1.1 echo, not the sidecar mTLS h2 helper"
+    );
+    assert!(
+        MESH_MODE_TEST_SOURCE.contains("async fn serve_h3_mesh_http1_echo<T>("),
+        "HBONE inner echo helper must remain a distinct HTTP/1.1 server"
+    );
+    assert!(
+        MESH_MODE_TEST_SOURCE.contains("Http1ServerBuilder::new()"),
+        "HBONE inner echo must be hyper HTTP/1.1"
+    );
+}
+
+/// Plain HTTP over same-cluster Ambient HBONE through the H3 frontend.
+/// Inner tunnel traffic is HTTP/1.1 (same as H1/H2 `proxy_to_backend_hbone`),
+/// not nested h2c.
+#[ignore]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn functional_h3_plain_dispatches_over_same_cluster_ambient_hbone() {
+    let identities = TempDir::new().expect("h3 plain hbone identity tempdir");
+    let svids = generate_shared_ca_mesh_svid_set(
+        identities.path(),
+        &[H3_MESH_GATEWAY_SPIFFE, H3_MESH_PEER_SPIFFE],
+    );
+    let app = start_h3_mesh_http1_http_app().await;
+    let relay = start_h3_mesh_hbone_relay(&svids[1]).await;
+    let dead_backend_port = reserve_unique_mesh_port().await;
+    let frontend = h3_mesh_frontend_certs();
+
+    let targets = h3_mesh_target_yaml(
+        "127.0.0.1",
+        app.port,
+        &h3_mesh_hbone_tags(relay.port, H3_MESH_PEER_SPIFFE),
+    );
+    let (mut gateway, https_port) = spawn_h3_mesh_gateway(
+        h3_mesh_plain_config(dead_backend_port, &targets, false),
+        &svids[0],
+        &frontend,
+        &[dead_backend_port, relay.port, app.port],
+    )
+    .await;
+
+    let payload = b"h3-plain-ambient-hbone";
+    let result = h3_mesh_plain_post(https_port, payload).await;
+    assert_eq!(
+        result.status.as_u16(),
+        200,
+        "plain Ambient HBONE must succeed: {:?}",
+        result.headers
+    );
+    assert_eq!(result.body_bytes.as_ref(), payload);
+    assert_eq!(
+        result
+            .headers
+            .get("x-mesh-plain")
+            .and_then(|v| v.to_str().ok()),
+        Some("ok")
+    );
+
+    let connects = relay.observed_connects();
+    assert!(
+        connects
+            .iter()
+            .any(|authority| authority == &format!("127.0.0.1:{}", app.port)),
+        "CONNECT :authority must name the app; observed {connects:?}"
+    );
+    let observed = app.wait_for_http(Duration::from_secs(10)).await;
+    assert_eq!(observed.method, "POST");
+    assert_eq!(
+        observed.authority,
+        format!("127.0.0.1:{}", app.port),
+        "inner HTTP/1.1 Host must name the real app, not the dead backend"
+    );
+    assert_eq!(observed.path, H3_MESH_PLAIN_BACKEND_PATH);
+    assert_eq!(observed.body, payload);
+
+    gateway.shutdown().await;
+}
+
+/// Mixed plain-dead + Unix + mesh-mTLS upstream: H3 retry must skip the Unix
+/// candidate after a retryable connect failure and land on the secured mesh
+/// transport.
+#[ignore]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn functional_h3_plain_mixed_retry_skips_unix_and_uses_mesh_mtls() {
+    let identities = TempDir::new().expect("h3 plain mixed retry identity tempdir");
+    let svids = generate_shared_ca_mesh_svid_set(
+        identities.path(),
+        &[H3_MESH_GATEWAY_SPIFFE, H3_MESH_PEER_SPIFFE],
+    );
+    let peer = start_h3_mesh_mtls_http_peer(&svids[1]).await;
+    let dead_backend_port = reserve_unique_mesh_port().await;
+    let closed_plain_port = h3_mesh_declared_app_port().await;
+    let declared_app_port = h3_mesh_declared_app_port().await;
+    let frontend = h3_mesh_frontend_certs();
+    let socket_dir = TempDir::new().expect("unix socket tempdir");
+    let socket_path = socket_dir.path().join("never-dialed.sock");
+
+    let dead_plain = format!(
+        r#"      - host: "127.0.0.1"
+        port: {closed_plain_port}
+        weight: 1
+"#
+    );
+    let unix = h3_mesh_unix_target_yaml(socket_path.to_str().expect("utf8 socket"));
+    let mesh = h3_mesh_target_yaml(
+        "127.0.0.1",
+        declared_app_port,
+        &h3_mesh_mtls_tags(peer.port, H3_MESH_PEER_SPIFFE),
+    );
+    let targets = format!("{dead_plain}{unix}{mesh}");
+    let (mut gateway, https_port) = spawn_h3_mesh_gateway(
+        h3_mesh_plain_config(dead_backend_port, &targets, true),
+        &svids[0],
+        &frontend,
+        &[
+            dead_backend_port,
+            closed_plain_port,
+            peer.port,
+            declared_app_port,
+        ],
+    )
+    .await;
+
+    let payload = b"h3-plain-mixed-retry";
+    let result = h3_mesh_plain_post(https_port, payload).await;
+    assert_eq!(
+        result.status.as_u16(),
+        200,
+        "mixed retry must reach mesh after skipping Unix: {:?}",
+        result.headers
+    );
+    assert_eq!(result.body_bytes.as_ref(), payload);
+    let observed = peer.wait_for_http(Duration::from_secs(10)).await;
+    assert_eq!(observed.method, "POST");
+    assert!(observed.presented_client_spiffe(H3_MESH_GATEWAY_SPIFFE));
+    assert!(
+        !socket_path.exists(),
+        "H3 must never create/dial the Unix socket"
+    );
+
+    gateway.shutdown().await;
+}
+
+/// An upstream of only Unix-socket targets fails closed — no eligible H3
+/// transport remains.
+#[ignore]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn functional_h3_plain_all_unix_targets_fail_closed() {
+    let identities = TempDir::new().expect("h3 plain unix-only identity tempdir");
+    let svids = generate_shared_ca_mesh_svid_set(identities.path(), &[H3_MESH_GATEWAY_SPIFFE]);
+    let dead_backend_port = reserve_unique_mesh_port().await;
+    let frontend = h3_mesh_frontend_certs();
+    let socket_dir = TempDir::new().expect("unix socket tempdir");
+    let socket_path = socket_dir.path().join("ineligible.sock");
+    let targets = h3_mesh_unix_target_yaml(socket_path.to_str().expect("utf8 socket"));
+
+    let (mut gateway, https_port) = spawn_h3_mesh_gateway(
+        h3_mesh_plain_config(dead_backend_port, &targets, false),
+        &svids[0],
+        &frontend,
+        &[dead_backend_port],
+    )
+    .await;
+
+    let result = h3_mesh_plain_get(https_port).await;
+    assert_eq!(
+        result.status.as_u16(),
+        502,
+        "Unix-only H3 upstream must fail closed: {:?}",
+        result.headers
+    );
+    let reason = result
+        .headers
+        .get("gateway-error-reason")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    assert!(
+        reason.contains("Unix socket"),
+        "refusal must name the Unix transport contract: {reason:?}"
+    );
+    assert!(
+        !socket_path.exists(),
+        "fail-closed must not dial the Unix socket"
+    );
+
+    gateway.shutdown().await;
+}
+
+/// Corrupted mesh identity pin fails closed with no plaintext dial.
+#[ignore]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn functional_h3_plain_mesh_identity_failure_fails_closed() {
+    let identities = TempDir::new().expect("h3 plain identity-fail tempdir");
+    let svids = generate_shared_ca_mesh_svid_set(
+        identities.path(),
+        &[H3_MESH_GATEWAY_SPIFFE, H3_MESH_PEER_SPIFFE],
+    );
+    let peer = start_h3_mesh_mtls_http_peer(&svids[1]).await;
+    let dead_backend_port = reserve_unique_mesh_port().await;
+    let declared_app_port = h3_mesh_declared_app_port().await;
+    let frontend = h3_mesh_frontend_certs();
+    let accepts_before = peer.accept_count();
+
+    let targets = h3_mesh_target_yaml(
+        "127.0.0.1",
+        declared_app_port,
+        &[
+            ("mesh.mtls", "true".to_string()),
+            ("mesh.mtls_port", peer.port.to_string()),
+            ("mesh.spiffe_id", "not-a-spiffe-id".to_string()),
+        ],
+    );
+    let (mut gateway, https_port) = spawn_h3_mesh_gateway(
+        h3_mesh_plain_config(dead_backend_port, &targets, false),
+        &svids[0],
+        &frontend,
+        &[dead_backend_port, peer.port, declared_app_port],
+    )
+    .await;
+
+    let result = h3_mesh_plain_get(https_port).await;
+    assert_eq!(
+        result.status.as_u16(),
+        502,
+        "unmaterializable identity must fail closed: {:?}",
+        result.headers
+    );
+    assert_eq!(
+        peer.accept_count(),
+        accepts_before,
+        "identity failure must not dial the peer"
+    );
+
+    gateway.shutdown().await;
+}
+
+/// Trusted projected reload re-points plain mesh tags / withdraws / corrupts.
+#[ignore]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn functional_h3_plain_mesh_transport_follows_reload_and_withdrawal() {
+    let identities = TempDir::new().expect("h3 plain reload identity tempdir");
+    let svids = generate_shared_ca_mesh_svid_set(
+        identities.path(),
+        &[
+            H3_MESH_GATEWAY_SPIFFE,
+            H3_MESH_PEER_SPIFFE,
+            H3_MESH_PEER_B_SPIFFE,
+        ],
+    );
+    let peer_a = start_h3_mesh_mtls_http_peer(&svids[1]).await;
+    let peer_b = start_h3_mesh_mtls_http_peer(&svids[2]).await;
+    let dead_backend_port = reserve_unique_mesh_port().await;
+    let declared_app_port = h3_mesh_declared_app_port().await;
+    let frontend = h3_mesh_frontend_certs();
+
+    let config_for = |tags: &[(&'static str, String)], generation: u32| {
+        let targets = h3_mesh_target_yaml("127.0.0.1", declared_app_port, tags);
+        h3_mesh_plain_config_with_generation(dead_backend_port, &targets, false, generation)
+    };
+
+    let (mut gateway, https_port) = spawn_h3_mesh_gateway(
+        config_for(&h3_mesh_mtls_tags(peer_a.port, H3_MESH_PEER_SPIFFE), 0),
+        &svids[0],
+        &frontend,
+        &[
+            dead_backend_port,
+            peer_a.port,
+            peer_b.port,
+            declared_app_port,
+        ],
+    )
+    .await;
+
+    let first = h3_mesh_plain_post(https_port, b"h3-plain-reload").await;
+    assert_eq!(first.status.as_u16(), 200);
+    let observed_a = peer_a.wait_for_http(Duration::from_secs(10)).await;
+    assert_eq!(observed_a.method, "POST");
+
+    let peer_b_tags = h3_mesh_mtls_tags(peer_b.port, H3_MESH_PEER_B_SPIFFE);
+    h3_mesh_plain_reload(&gateway, config_for(&peer_b_tags, 1), &peer_b_tags).await;
+    let retargeted = h3_mesh_plain_post(https_port, b"h3-plain-reload").await;
+    assert_eq!(retargeted.status.as_u16(), 200);
+    let observed_b = peer_b.wait_for_http(Duration::from_secs(10)).await;
+    assert_eq!(observed_b.method, "POST");
+
+    let peer_b_accepts = peer_b.accept_count();
+    h3_mesh_plain_reload(&gateway, config_for(&[], 2), &[]).await;
+    let withdrawn = h3_mesh_plain_get(https_port).await;
+    assert_ne!(withdrawn.status.as_u16(), 200);
+    assert_eq!(peer_b.accept_count(), peer_b_accepts);
+
+    let peer_a_accepts = peer_a.accept_count();
+    let corrupted_tags = [
+        ("mesh.mtls", "true".to_string()),
+        ("mesh.mtls_port", peer_a.port.to_string()),
+        ("mesh.spiffe_id", "not-a-spiffe-id".to_string()),
+    ];
+    h3_mesh_plain_reload(&gateway, config_for(&corrupted_tags, 3), &corrupted_tags).await;
+    let corrupted = h3_mesh_plain_get(https_port).await;
+    assert_eq!(corrupted.status.as_u16(), 502);
+    assert_eq!(peer_a.accept_count(), peer_a_accepts);
+
+    gateway.shutdown().await;
+}
+
+/// H3 WebSocket over Ambient HBONE: Extended CONNECT on the frontend, byte
+/// tunnel + H1 upgrade to the destination echo app.
+#[ignore]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn functional_h3_websocket_dispatches_over_same_cluster_ambient_hbone() {
+    let identities = TempDir::new().expect("h3 ws hbone identity tempdir");
+    let svids = generate_shared_ca_mesh_svid_set(
+        identities.path(),
+        &[H3_MESH_GATEWAY_SPIFFE, H3_MESH_PEER_SPIFFE],
+    );
+    let app_port = start_websocket_echo_backend().await;
+    let relay = start_h3_mesh_hbone_relay(&svids[1]).await;
+    let dead_backend_port = reserve_unique_mesh_port().await;
+    let frontend = h3_mesh_frontend_certs();
+
+    let targets = h3_mesh_target_yaml(
+        "127.0.0.1",
+        app_port,
+        &h3_mesh_hbone_tags(relay.port, H3_MESH_PEER_SPIFFE),
+    );
+    let config = h3_mesh_plain_config(dead_backend_port, &targets, false);
+    let (mut gateway, https_port) = spawn_h3_mesh_gateway(
+        config,
+        &svids[0],
+        &frontend,
+        &[dead_backend_port, relay.port, app_port],
+    )
+    .await;
+
+    let client = Http3Client::insecure().expect("h3 client");
+    let url = format!("https://127.0.0.1:{https_port}/mesh/");
+    let deadline = Instant::now() + Duration::from_secs(25);
+    let mut ws = loop {
+        match client.websocket(&url, WebSocketOptions::default()).await {
+            Ok(ws) => break ws,
+            Err(error) => {
+                if Instant::now() >= deadline {
+                    panic!("H3 mesh WebSocket never opened: {error}");
+                }
+                tokio::time::sleep(Duration::from_millis(150)).await;
+            }
+        }
+    };
+
+    ws.send_text("h3-ws-hbone").await.expect("send H3 WS text");
+    let reply = ws.recv_text().await.expect("recv H3 WS text");
+    assert_eq!(
+        reply, "backend-ws:h3-ws-hbone",
+        "H3 WS frames must traverse the Ambient HBONE byte tunnel"
+    );
+    let connects = relay.observed_connects();
+    assert!(
+        connects
+            .iter()
+            .any(|authority| authority == &format!("127.0.0.1:{app_port}")),
+        "HBONE CONNECT must name the WS app; observed {connects:?}"
+    );
+
+    gateway.shutdown().await;
 }

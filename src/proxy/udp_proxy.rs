@@ -12,6 +12,16 @@
 //! accepts DTLS-encrypted connections from clients instead of plain UDP. Each
 //! client gets a dedicated DTLS session with transparent encrypt/decrypt.
 //! Decrypted datagrams are forwarded to the backend (plain UDP or DTLS).
+//!
+//! **Datagram client-address metadata**: when the proxy sets
+//! `stream_proxy_protocol: true`, every datagram must arrive wrapped in the
+//! authenticated PROXY v2 DGRAM envelope described in
+//! [`crate::proxy::datagram_client_address`]. The socket peer stays
+//! `direct_client_ip`; the envelope's forwarded address becomes `client_ip`.
+//! Anything that does not decode is dropped (issue #3289) — including an
+//! envelope minted for another listener (issue #3856) and a duplicate or stale
+//! authenticated sequence (issue #3862), both refused at the same single
+//! receive boundary, before any session, hook, or backend effect.
 
 use bytes::Bytes;
 use dashmap::DashMap;
@@ -36,6 +46,9 @@ use crate::plugins::{
     StreamConnectionContext, StreamTransactionSummary, UdpDatagramContext, UdpDatagramDirection,
     UdpDatagramVerdict, UdpMetadataSink,
 };
+use crate::proxy::datagram_client_address::{
+    DatagramClientAddressGate, DatagramClientIdentity, DatagramMetadataError,
+};
 use crate::proxy::stream_error::{StreamSetupError, StreamSetupKind, find_stream_setup_error};
 use crate::request_epoch::{RequestEpoch, RequestEpochStore};
 
@@ -53,6 +66,37 @@ pub fn udp_session_client_ip(client_addr: SocketAddr) -> Arc<str> {
 #[inline]
 fn udp_client_log_addr(client_addr: SocketAddr) -> SocketAddr {
     crate::util::client_identity::canonical_socket_addr(client_addr)
+}
+
+/// Count and (rate-limited) report a datagram refused by the client-address
+/// metadata gate.
+///
+/// The record names the field that failed and the socket peer; it never carries
+/// payload bytes, tag material, or the forwarded address a hostile sender was
+/// trying to assert.
+fn record_client_address_metadata_drop(
+    metrics: &UdpProxyMetrics,
+    proxy_id: &str,
+    listen_port: u16,
+    socket_peer: SocketAddr,
+    error: &DatagramMetadataError,
+) {
+    metrics
+        .client_address_metadata_drops
+        .fetch_add(1, Ordering::Relaxed);
+    if let Some(suppressed) = metrics
+        .client_address_metadata_warn
+        .on_event(coarse_epoch_millis())
+    {
+        warn!(
+            proxy_id = %proxy_id,
+            listen_port = listen_port,
+            peer = %udp_client_log_addr(socket_peer),
+            reason = error.reason(),
+            suppressed = suppressed,
+            "Dropping datagram: client-address metadata refused ({error})"
+        );
+    }
 }
 
 /// Admit one backend→client datagram against the session's remaining
@@ -120,6 +164,19 @@ pub struct UdpProxyMetrics {
     /// in-flight hook awaits for this listener. Used as a listener-wide
     /// admission budget.
     hook_ingress_queued_bytes: AtomicUsize,
+    /// Datagrams dropped by the client-address metadata gate: untrusted peer,
+    /// missing/failed authentication, malformed envelope, a binding that names
+    /// another listener, a duplicate/stale/malformed freshness record, replay
+    /// state exhaustion, or a forwarded client that disagreed with the
+    /// established session. Every one of these is a fail-closed refusal, never a
+    /// fallback
+    /// to the socket peer. This is internal listener-local accounting shared
+    /// with the frontend DTLS demuxer so both datagram paths report one
+    /// counter; it is not an exported Prometheus or admin metric.
+    pub client_address_metadata_drops: Arc<AtomicU64>,
+    /// Bounds the per-listener rate of the metadata-drop warning so a hostile
+    /// flood cannot turn one dropped datagram into one log record.
+    client_address_metadata_warn: crate::util::atomic_log_rate_limiter::AtomicLogRateLimiter,
 }
 
 /// A UDP session tracking a single client's connection to a backend.
@@ -196,6 +253,11 @@ struct UdpSession {
     plugins: Arc<Vec<Arc<dyn Plugin>>>,
     datagram_plugins: Arc<[Arc<dyn Plugin>]>,
     datagram_client_ip: Arc<str>,
+    /// Authenticated forwarded client this session was admitted with, when the
+    /// listener runs the datagram client-address gate. Later datagrams from the
+    /// same socket peer must carry the same value; a different one is dropped
+    /// rather than silently attributed to this session's identity.
+    forwarded_client: Option<SocketAddr>,
     datagram_proxy_id: Arc<str>,
     datagram_proxy_name: Option<Arc<str>>,
     /// Nature of the per-datagram payloads this (plain-UDP-frontend) session
@@ -636,6 +698,11 @@ fn spawn_session_hook_ingress_worker(
 struct PendingDatagramQueue {
     datagrams: Vec<Vec<u8>>,
     queued_bytes: usize,
+    /// Forwarded client the in-flight setup was started for, when the listener
+    /// runs the datagram client-address gate. A follow-up datagram asserting a
+    /// different client is dropped instead of being queued behind an identity
+    /// it does not belong to. Always `None` when the gate is disabled.
+    forwarded_client: Option<SocketAddr>,
 }
 
 impl PendingDatagramQueue {
@@ -861,6 +928,7 @@ fn try_insert_pending_session_gate(
     pending_sessions: &PendingSessionMap,
     client_addr: SocketAddr,
     max_sessions: usize,
+    forwarded_client: Option<SocketAddr>,
 ) -> Result<bool, anyhow::Error> {
     if pending_sessions.len() >= max_sessions {
         return Err(anyhow::anyhow!(
@@ -871,7 +939,10 @@ fn try_insert_pending_session_gate(
     match pending_sessions.entry(client_addr) {
         dashmap::mapref::entry::Entry::Occupied(_) => Ok(false),
         dashmap::mapref::entry::Entry::Vacant(vacant) => {
-            vacant.insert(PendingDatagramQueue::default());
+            vacant.insert(PendingDatagramQueue {
+                forwarded_client,
+                ..Default::default()
+            });
             Ok(true)
         }
     }
@@ -1120,7 +1191,6 @@ struct UdpDisconnectContext<'a> {
     namespace: &'a str,
     proxy_id: &'a str,
     proxy_name: Option<&'a str>,
-    client_addr: SocketAddr,
     session: &'a UdpSession,
     backend_scheme: BackendScheme,
     listen_port: u16,
@@ -1211,7 +1281,10 @@ fn build_udp_stream_summary(context: UdpDisconnectContext<'_>) -> StreamTransact
         // instance stays skipped at disconnect.
         plugin_trigger_decisions: context.session.plugin_trigger_decisions.clone(),
         proxy_name: context.proxy_name.map(|name| name.to_string()),
-        client_ip: crate::util::client_identity::canonical_ip_string(context.client_addr.ip()),
+        // Resolved client identity captured at admission (the authenticated
+        // forwarded client when datagram metadata supplied one, else the socket
+        // peer), so connect and disconnect records agree.
+        client_ip: context.session.datagram_client_ip.to_string(),
         consumer_username: context.session.consumer_username.clone(),
         auth_method: context.session.auth_method,
         backend_target: context.session.backend_target.clone(),
@@ -1255,7 +1328,10 @@ struct DtlsDisconnectContext<'a> {
     proxy_id: &'a str,
     proxy_name: Option<&'a str>,
     proxy_lifecycle_generation: Option<u64>,
-    client_addr: SocketAddr,
+    /// Resolved client endpoint: the authenticated forwarded client when the
+    /// datagram client-address gate supplied one, else the socket peer. This is
+    /// the summary's `client_ip`, matching what `on_stream_connect` saw.
+    resolved_client: SocketAddr,
     consumer_username: Option<String>,
     auth_method: Option<&'static str>,
     backend_target: &'a str,
@@ -1296,7 +1372,7 @@ fn build_dtls_stream_summary(context: DtlsDisconnectContext<'_>) -> StreamTransa
         proxy_lifecycle_generation: context.proxy_lifecycle_generation,
         plugin_trigger_decisions: context.plugin_trigger_decisions,
         proxy_name: context.proxy_name.map(|name| name.to_string()),
-        client_ip: crate::util::client_identity::canonical_ip_string(context.client_addr.ip()),
+        client_ip: crate::util::client_identity::canonical_ip_string(context.resolved_client.ip()),
         consumer_username: context.consumer_username,
         auth_method: context.auth_method,
         backend_target: context.backend_target.to_string(),
@@ -1733,6 +1809,14 @@ pub struct UdpListenerConfig {
     /// destinations are silently dropped (UDP has no RST analogue).
     pub mesh_outbound_enforcement:
         crate::modes::mesh::outbound_enforcement::SharedMeshOutboundEnforcement,
+    /// Datagram client-address metadata gate (issues #3289, #3856, #3862).
+    /// `Some` only when the proxy sets `stream_proxy_protocol: true`; then EVERY
+    /// datagram must carry a trusted, well-formed (and, when a secret is
+    /// configured, listener-bound, authenticated, and fresh) PROXY v2 DGRAM
+    /// envelope or it is dropped. The gate owns this listener's replay window,
+    /// so it is per-listener and rebuilt on reload. `None` keeps ordinary
+    /// UDP/DTLS behavior with the socket peer as the only identity.
+    pub datagram_client_address: Option<Arc<DatagramClientAddressGate>>,
 }
 
 /// Start a UDP proxy listener on the given port.
@@ -1776,7 +1860,31 @@ pub async fn start_udp_listener(cfg: UdpListenerConfig) -> Result<(), anyhow::Er
         udp_gso_enabled,
         udp_pktinfo_enabled,
         mesh_outbound_enforcement,
+        datagram_client_address,
     } = cfg;
+    // An enabled gate with an empty trust set can never admit a datagram. Say
+    // so once here rather than dropping every datagram with only a rate-limited
+    // per-datagram record to explain it.
+    if let Some(gate) = datagram_client_address.as_ref() {
+        if !gate.has_trusted_peers() {
+            warn!(
+                proxy_id = %proxy_id,
+                listen_port = port,
+                "stream_proxy_protocol is enabled on this udp/dtls listener but \
+                 FERRUM_TRUSTED_PROXIES is empty — every datagram will be dropped until a \
+                 trusted datagram load balancer is configured"
+            );
+        } else if !gate.requires_authentication() {
+            warn!(
+                proxy_id = %proxy_id,
+                listen_port = port,
+                "stream_proxy_protocol is enabled on this udp/dtls listener without \
+                 FERRUM_DATAGRAM_PROXY_PROTOCOL_SECRET — forwarded client addresses are trusted \
+                 on the strength of the source address alone, which is spoofable unless the \
+                 network path to the load balancer is protected"
+            );
+        }
+    }
     let session_shard_amount = udp_session_shard_amount(session_shard_amount);
     // so_busy_poll_us and udp_gro_enabled are used in #[cfg(target_os = "linux")] blocks below.
     #[cfg(not(target_os = "linux"))]
@@ -1805,6 +1913,7 @@ pub async fn start_udp_listener(cfg: UdpListenerConfig) -> Result<(), anyhow::Er
             started,
             overload,
             Arc::new(BackendDtlsConfigCacheState::new(backend_tls_reload_epoch)),
+            datagram_client_address,
         )
         .await;
     }
@@ -2042,6 +2151,7 @@ pub async fn start_udp_listener(cfg: UdpListenerConfig) -> Result<(), anyhow::Er
                                                     global_shutdown_rx.as_ref(),
                                                     &overload,
                                                     &mesh_outbound_enforcement,
+                                                    datagram_client_address.as_ref(),
                                                 )
                                                 .await;
                                                 if let Err(e) = result {
@@ -2087,6 +2197,7 @@ pub async fn start_udp_listener(cfg: UdpListenerConfig) -> Result<(), anyhow::Er
                                         global_shutdown_rx.as_ref(),
                                         &overload,
                                         &mesh_outbound_enforcement,
+                                        datagram_client_address.as_ref(),
                                     )
                                     .await;
                                     if let Err(e) = result {
@@ -2173,6 +2284,7 @@ pub async fn start_udp_listener(cfg: UdpListenerConfig) -> Result<(), anyhow::Er
                     global_shutdown_rx.as_ref(),
                     &overload,
                     &mesh_outbound_enforcement,
+                    datagram_client_address.as_ref(),
                 )
                 .await;
                 if let Err(e) = result {
@@ -2270,6 +2382,7 @@ pub async fn start_udp_listener(cfg: UdpListenerConfig) -> Result<(), anyhow::Er
                                                     global_shutdown_rx.as_ref(),
                                                     &overload,
                                                     &mesh_outbound_enforcement,
+                                                    datagram_client_address.as_ref(),
                                                 )
                                                 .await;
                                                 if let Err(e) = result {
@@ -2315,6 +2428,7 @@ pub async fn start_udp_listener(cfg: UdpListenerConfig) -> Result<(), anyhow::Er
                                         global_shutdown_rx.as_ref(),
                                         &overload,
                                         &mesh_outbound_enforcement,
+                                        datagram_client_address.as_ref(),
                                     )
                                     .await;
                                     if let Err(e) = result {
@@ -2380,6 +2494,7 @@ pub async fn start_udp_listener(cfg: UdpListenerConfig) -> Result<(), anyhow::Er
                                     global_shutdown_rx.as_ref(),
                                     &overload,
                                     &mesh_outbound_enforcement,
+                                    datagram_client_address.as_ref(),
                                 )
                                 .await;
                                 if let Err(e) = result {
@@ -2453,8 +2568,52 @@ async fn process_datagram(
     overload: &Arc<crate::overload::OverloadState>,
     mesh_outbound_enforcement:
         &crate::modes::mesh::outbound_enforcement::SharedMeshOutboundEnforcement,
+    datagram_client_address: Option<&Arc<DatagramClientAddressGate>>,
 ) -> Result<(), anyhow::Error> {
+    // Client-address metadata boundary (issue #3289). When the listener runs
+    // the gate, the envelope is stripped here — once, before any session
+    // lookup, queueing, plugin hook, or backend forward — so no later stage can
+    // observe a datagram that failed to authenticate, and no payload byte is
+    // forwarded still wrapped. When the gate is off, `data` and the socket peer
+    // pass through exactly as before.
+    let (data, identity) = match datagram_client_address {
+        None => (data, DatagramClientIdentity::direct(client_addr)),
+        Some(gate) => match gate.decode(data, &client_addr) {
+            Ok(decoded) => (
+                decoded.payload,
+                DatagramClientIdentity {
+                    socket_peer: client_addr,
+                    forwarded: decoded.forwarded,
+                },
+            ),
+            Err(error) => {
+                record_client_address_metadata_drop(
+                    metrics,
+                    proxy_id,
+                    listen_port,
+                    client_addr,
+                    &error,
+                );
+                return Ok(());
+            }
+        },
+    };
+
     if let Some(mut pending) = pending_sessions.get_mut(&client_addr) {
+        // A follow-up datagram must belong to the same client the in-flight
+        // setup was started for. Queueing a different forwarded client here
+        // would hand its payload to a session admitted under another identity.
+        if pending.forwarded_client != identity.forwarded {
+            drop(pending);
+            record_client_address_metadata_drop(
+                metrics,
+                proxy_id,
+                listen_port,
+                client_addr,
+                &DatagramMetadataError::ForwardedClientChanged,
+            );
+            return Ok(());
+        }
         // Session setup for this source is still in flight. Queue the
         // datagram (bounded) so opening flights spanning multiple datagrams
         // (QUIC Initial + 0-RTT, multi-record DTLS ClientHello) survive setup
@@ -2498,18 +2657,35 @@ async fn process_datagram(
                 max_sessions
             ));
         }
-        if !try_insert_pending_session_gate(pending_sessions, client_addr, max_sessions)? {
+        if !try_insert_pending_session_gate(
+            pending_sessions,
+            client_addr,
+            max_sessions,
+            identity.forwarded,
+        )? {
             // Defensive: a gate appeared after the check at the top of this
             // function (not expected — the recv loop is a single task). Treat
-            // this datagram as a follow-up for the in-flight setup.
+            // this datagram as a follow-up for the in-flight setup, subject to
+            // the same forwarded-client agreement as the ordinary queue path.
             if let Some(mut pending) = pending_sessions.get_mut(&client_addr) {
-                let _ = pending.push_bounded(data);
+                if pending.forwarded_client == identity.forwarded {
+                    let _ = pending.push_bounded(data);
+                } else {
+                    drop(pending);
+                    record_client_address_metadata_drop(
+                        metrics,
+                        proxy_id,
+                        listen_port,
+                        client_addr,
+                        &DatagramMetadataError::ForwardedClientChanged,
+                    );
+                }
             }
             return Ok(());
         }
         spawn_new_session_datagram(
             data.to_vec(),
-            client_addr,
+            identity,
             proxy_id.to_string(),
             proxy_namespace.to_string(),
             Arc::clone(request_epoch),
@@ -2537,6 +2713,21 @@ async fn process_datagram(
         );
         return Ok(());
     };
+
+    // The established session was admitted under one authenticated client. A
+    // datagram from the same socket peer asserting a different one is refused:
+    // forwarding it would attribute another client's traffic to this session's
+    // identity for authz, rate limits, and audit.
+    if !identity.matches_session(session.forwarded_client) {
+        record_client_address_metadata_drop(
+            metrics,
+            proxy_id,
+            listen_port,
+            client_addr,
+            &DatagramMetadataError::ForwardedClientChanged,
+        );
+        return Ok(());
+    }
 
     if !session.datagram_plugins.is_empty() {
         // Decouple potentially I/O-bound `on_udp_datagram` hooks from the
@@ -2570,7 +2761,9 @@ async fn process_datagram(
 #[allow(clippy::too_many_arguments)]
 fn spawn_new_session_datagram(
     data: Vec<u8>,
-    client_addr: SocketAddr,
+    // Socket peer plus the authenticated forwarded client, when the listener
+    // runs the datagram client-address gate.
+    identity: DatagramClientIdentity,
     proxy_id: String,
     proxy_namespace: String,
     request_epoch: Arc<RequestEpochStore>,
@@ -2597,6 +2790,7 @@ fn spawn_new_session_datagram(
         crate::modes::mesh::outbound_enforcement::SharedMeshOutboundEnforcement,
     max_sessions: usize,
 ) {
+    let client_addr = identity.socket_peer;
     tokio::spawn(async move {
         // The gate removes the pending entry (dropping any queued follow-up
         // datagrams wholesale) on every path that doesn't complete the
@@ -2609,7 +2803,7 @@ fn spawn_new_session_datagram(
         };
         let result = process_new_session_datagram(
             data,
-            client_addr,
+            identity,
             &proxy_id,
             &proxy_namespace,
             &request_epoch,
@@ -2675,7 +2869,7 @@ fn is_client_or_policy_udp_setup_drop(error: &anyhow::Error) -> bool {
 #[allow(clippy::too_many_arguments)]
 async fn process_new_session_datagram(
     data: Vec<u8>,
-    client_addr: SocketAddr,
+    identity: DatagramClientIdentity,
     proxy_id: &str,
     proxy_namespace: &str,
     request_epoch: &RequestEpochStore,
@@ -2703,6 +2897,7 @@ async fn process_new_session_datagram(
     max_sessions: usize,
     mut gate: PendingSessionGate,
 ) -> Result<(), anyhow::Error> {
+    let client_addr = identity.socket_peer;
     if sessions.contains_key(&client_addr) {
         return Ok(());
     }
@@ -2720,7 +2915,9 @@ async fn process_new_session_datagram(
     let mut preselected_backend_target = None;
     if let Some(enforcement) = mesh_enforcement_snapshot.as_ref() {
         use crate::modes::mesh::outbound_enforcement::{Decision, PROTOCOL_UDP, PROTOCOL_UDP_DTLS};
-        let lb_hash_key = udp_lb_hash_key_for_client_ip(client_addr.ip());
+        // Hash on the resolved client so backend stickiness follows the real
+        // client rather than the load balancer's socket address.
+        let lb_hash_key = udp_lb_hash_key_for_client_ip(identity.resolved().ip());
         let (backend_host, backend_port) = resolve_backend_target(
             &view.proxy,
             &epoch.load_balancer,
@@ -2742,7 +2939,7 @@ async fn process_new_session_datagram(
                 // Same canonical principal the session identity and rate-limit
                 // keys use, so a dropped datagram is attributable to the client
                 // those keys name (GHSA-vjwj-657f-5w9g).
-                let peer_ip = crate::util::client_identity::canonical_ip(client_addr.ip());
+                let peer_ip = crate::util::client_identity::canonical_ip(identity.resolved().ip());
                 warn!(
                     proxy_id = %view.proxy.id,
                     client = %peer_ip,
@@ -2763,7 +2960,7 @@ async fn process_new_session_datagram(
     // unauthenticated clients must not be able to consume that bounded work
     // budget or remain in the pending-session map while stream policy will
     // ultimately reject them.
-    let stream_ctx = admit_plain_udp_stream(&epoch, &view, client_addr, listen_port).await?;
+    let stream_ctx = admit_plain_udp_stream(&epoch, &view, identity, listen_port).await?;
 
     // Bind the flow's datagram hooks to the decisions the admission chain just
     // memoized. Evaluated once here; every datagram of this session — starting
@@ -2778,7 +2975,7 @@ async fn process_new_session_datagram(
         std::sync::Mutex::new(std::collections::HashMap::<String, String>::new());
     if !udp_datagram_allowed(
         &admitted_datagram_plugins,
-        udp_session_client_ip(client_addr),
+        udp_session_client_ip(identity.resolved()),
         Arc::from(view.proxy.id.as_str()),
         view.proxy.name.as_deref().map(Arc::from),
         listen_port,
@@ -2803,7 +3000,7 @@ async fn process_new_session_datagram(
         view,
         dns_cache,
         frontend_socket,
-        client_addr,
+        identity,
         sessions,
         metrics,
         tls_no_verify,
@@ -3000,7 +3197,6 @@ fn spawn_session_cleanup(
                                     namespace: &session.proxy_namespace,
                                     proxy_id: &session.proxy_id,
                                     proxy_name: session.proxy_name.as_deref(),
-                                    client_addr: *addr,
                                     session: &session,
                                     backend_scheme: session.backend_scheme,
                                     listen_port: session.listen_port,
@@ -3139,6 +3335,7 @@ async fn start_dtls_frontend_listener(
     started: Arc<AtomicBool>,
     overload: Arc<crate::overload::OverloadState>,
     backend_dtls_config_cache: BackendDtlsConfigCache,
+    datagram_client_address: Option<Arc<DatagramClientAddressGate>>,
 ) -> Result<(), anyhow::Error> {
     let addr = SocketAddr::new(bind_addr, port);
     let admission_overload = overload.clone();
@@ -3155,6 +3352,14 @@ async fn start_dtls_frontend_listener(
             !refuse_new_udp_source(&admission_overload)
         })),
         active_session_mirror: Some(metrics.dtls_demux_sessions.clone()),
+        // Envelope validation happens inside the demux loop, ahead of any
+        // per-peer allocation, so an unauthenticated datagram never reserves a
+        // session slot.
+        datagram_client_address,
+        datagram_client_address_drops: Some(Arc::clone(&metrics.client_address_metadata_drops)),
+        // Refusal diagnostics on the demux path name the same listener the
+        // plain-UDP path's do. Built once here, never per datagram.
+        datagram_client_address_listener: Some((Arc::from(proxy_id.as_str()), port)),
     };
     let server =
         Arc::new(crate::dtls::DtlsServer::bind_with_limits(addr, dtls_config, dtls_limits).await?);
@@ -3272,15 +3477,24 @@ async fn start_dtls_frontend_listener(
                         .collect();
                     let consumer_index =
                         Arc::new(ConsumerIndex::from_inner(Arc::clone(&epoch.consumer_index)));
-                    let client_ip = udp_session_client_ip(client_addr);
+                    // `client_ip` (remote.ip) follows the authenticated
+                    // forwarded client when the datagram client-address gate
+                    // supplied one; `direct_client_ip` (source.ip) is always
+                    // the socket peer. Without the gate both are the peer,
+                    // which is the historical DTLS behavior.
+                    let identity = DatagramClientIdentity {
+                        socket_peer: client_addr,
+                        forwarded: client_conn.forwarded_client_addr,
+                    };
+                    let client_ip = udp_session_client_ip(identity.resolved());
 
                     // Run on_stream_connect plugins (with DTLS client cert if available)
                     let stream_client_ip = client_ip.to_string();
+                    let stream_direct_client_ip =
+                        udp_session_client_ip(identity.socket_peer).to_string();
                     let mut stream_ctx = StreamConnectionContext::new(
-                        stream_client_ip.clone(),
-                        // PROXY protocol is not supported on UDP/DTLS (TCP-borne only);
-                        // direct_client_ip always equals client_ip for UDP sessions.
                         stream_client_ip,
+                        stream_direct_client_ip,
                         resolved_proxy_id.clone(),
                         proxy_name.clone(),
                         port,
@@ -3380,7 +3594,7 @@ async fn start_dtls_frontend_listener(
 
                     let result = handle_dtls_client(
                         client_conn,
-                        client_addr,
+                        identity,
                         &resolved_proxy_id,
                         &proxy_namespace,
                         &epoch,
@@ -3449,7 +3663,7 @@ async fn start_dtls_frontend_listener(
                             proxy_id: &resolved_proxy_id,
                             proxy_name: proxy_name.as_deref(),
                             proxy_lifecycle_generation: handler_proxy_lifecycle_generation,
-                            client_addr,
+                            resolved_client: identity.resolved(),
                             consumer_username: handler_consumer_username.clone(),
                             auth_method: handler_auth_method,
                             backend_target: &result.backend.backend_target,
@@ -3545,7 +3759,7 @@ struct DtlsHandlerResult {
 #[allow(clippy::too_many_arguments)]
 async fn handle_dtls_client(
     client_conn: crate::dtls::DtlsServerConn,
-    client_addr: SocketAddr,
+    identity: DatagramClientIdentity,
     proxy_id: &str,
     proxy_namespace: &str,
     epoch: &RequestEpoch,
@@ -3575,7 +3789,7 @@ async fn handle_dtls_client(
     let datagram_metadata = Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
     let outcome = handle_dtls_client_inner(
         client_conn,
-        client_addr,
+        identity,
         proxy_id,
         proxy_namespace,
         epoch,
@@ -3718,7 +3932,7 @@ async fn dtls_shared_idle_watchdog(
 #[allow(clippy::too_many_arguments)]
 async fn handle_dtls_client_inner(
     client_conn: crate::dtls::DtlsServerConn,
-    client_addr: SocketAddr,
+    identity: DatagramClientIdentity,
     proxy_id: &str,
     proxy_namespace: &str,
     epoch: &RequestEpoch,
@@ -3749,9 +3963,12 @@ async fn handle_dtls_client_inner(
     if proxy.udp_max_response_amplification_factor.is_none() {
         crate::udp_amplification::record_policy_unlimited();
     }
+    // Socket peer for reply routing and diagnostics; resolved client for
+    // identity-bearing values (backend stickiness, per-datagram hook context).
+    let client_addr = identity.socket_peer;
 
     // Resolve backend target
-    let lb_hash_key = udp_lb_hash_key_for_client_ip(client_addr.ip());
+    let lb_hash_key = udp_lb_hash_key_for_client_ip(identity.resolved().ip());
     let (backend_host, backend_port) =
         resolve_backend_target(&proxy, &epoch.load_balancer, health_checker, &lb_hash_key)?;
     // Populate backend target as soon as it's known — even if DNS or connect fails.
@@ -3904,7 +4121,7 @@ async fn handle_dtls_client_inner(
     let dgram_plugins = Arc::clone(datagram_plugins);
     // Pre-compute context strings as Arc<str> — per-datagram "clone" is a pointer
     // bump (~5ns) instead of heap allocation + memcpy.
-    let dgram_client_ip = udp_session_client_ip(client_addr);
+    let dgram_client_ip = udp_session_client_ip(identity.resolved());
     let dgram_proxy_id: Arc<str> = Arc::from(proxy_id);
     let dgram_proxy_name: Option<Arc<str>> = proxy_name.map(Arc::from);
     let dgram_listen_port = listen_port;
@@ -4116,15 +4333,18 @@ async fn handle_dtls_client_inner(
 async fn admit_plain_udp_stream(
     epoch: &RequestEpoch,
     view: &UdpSessionEpochView,
-    client_addr: SocketAddr,
+    identity: DatagramClientIdentity,
     listen_port: u16,
 ) -> Result<StreamConnectionContext, anyhow::Error> {
-    let client_ip = udp_session_client_ip(client_addr).to_string();
+    // `client_ip` (remote.ip) is the authenticated forwarded client when the
+    // datagram client-address gate supplied one; `direct_client_ip` (source.ip)
+    // is always the socket peer. Without the gate the two are identical, which
+    // is the historical UDP behavior.
+    let client_ip = udp_session_client_ip(identity.resolved()).to_string();
+    let direct_client_ip = udp_session_client_ip(identity.socket_peer).to_string();
     let mut stream_ctx = StreamConnectionContext::new(
-        client_ip.clone(),
-        // PROXY protocol is not supported on plain UDP (TCP-borne only);
-        // direct_client_ip always equals client_ip for UDP sessions.
         client_ip,
+        direct_client_ip,
         view.proxy.id.clone(),
         view.proxy.name.clone(),
         listen_port,
@@ -4159,7 +4379,7 @@ async fn create_session(
     view: UdpSessionEpochView,
     dns_cache: &DnsCache,
     frontend_socket: &Arc<UdpSocket>,
-    client_addr: SocketAddr,
+    identity: DatagramClientIdentity,
     sessions: &SessionMap,
     metrics: &Arc<UdpProxyMetrics>,
     tls_no_verify: bool,
@@ -4195,9 +4415,11 @@ async fn create_session(
     let proxy_namespace = proxy.namespace.clone();
     let backend_scheme = proxy.effective_scheme();
     let is_passthrough = proxy.passthrough;
-    let client_ip = udp_session_client_ip(client_addr);
+    let client_addr = identity.socket_peer;
+    // Session identity strings follow the resolved (authenticated) client.
+    let client_ip = udp_session_client_ip(identity.resolved());
 
-    let lb_hash_key = udp_lb_hash_key_for_client_ip(client_addr.ip());
+    let lb_hash_key = udp_lb_hash_key_for_client_ip(identity.resolved().ip());
     let (backend_host, backend_port) = resolve_or_reuse_backend_target(
         preselected_backend_target,
         &proxy,
@@ -4383,6 +4605,7 @@ async fn create_session(
         plugins: Arc::clone(&plugins),
         datagram_plugins: Arc::clone(&datagram_plugins),
         datagram_client_ip: Arc::clone(&datagram_client_ip),
+        forwarded_client: identity.forwarded,
         datagram_proxy_id: Arc::clone(&datagram_proxy_id),
         datagram_proxy_name: datagram_proxy_name.clone(),
         datagram_payload_kind: if is_passthrough {
@@ -4828,7 +5051,6 @@ async fn create_session(
                                             namespace: &reply_proxy_namespace,
                                             proxy_id: &reply_proxy_id,
                                             proxy_name: reply_proxy_name.as_deref(),
-                                            client_addr,
                                             session: &reply_session,
                                             backend_scheme: reply_backend_scheme,
                                             listen_port: reply_listen_port,
@@ -4993,7 +5215,6 @@ async fn create_session(
                     namespace: &reply_proxy_namespace,
                     proxy_id: &reply_proxy_id,
                     proxy_name: reply_proxy_name.as_deref(),
-                    client_addr,
                     session: &reply_session,
                     backend_scheme: reply_backend_scheme,
                     listen_port: reply_listen_port,
@@ -5211,8 +5432,14 @@ fn ensure_coarse_timer_started() {
 }
 
 /// Get the coarse-grained cached monotonic timestamp (updated every ~100ms).
+///
+/// Shared with the frontend DTLS demuxer so both datagram paths rate-limit
+/// their client-address metadata diagnostics on one clock without adding a
+/// per-datagram `Instant::now()`. Every DTLS listener calls
+/// [`ensure_coarse_timer_started`] before its recv loop runs, so the value is
+/// live wherever the gate can refuse anything.
 #[inline(always)]
-fn coarse_epoch_millis() -> u64 {
+pub(crate) fn coarse_epoch_millis() -> u64 {
     COARSE_EPOCH_MS.load(Ordering::Relaxed)
 }
 
@@ -5278,6 +5505,7 @@ mod tests {
             plugins: Arc::new(Vec::new()),
             datagram_plugins: Arc::from([]),
             datagram_client_ip: Arc::from("127.0.0.1"),
+            forwarded_client: None,
             datagram_proxy_id: Arc::from("udp-proxy"),
             datagram_proxy_name: Some(Arc::from("UDP Proxy")),
             datagram_payload_kind: crate::plugins::StreamBytesKind::PlaintextWire,
@@ -5456,7 +5684,7 @@ backend_tls_verify_server_cert: false
             proxy_id: "dtls-proxy",
             proxy_name: Some("DTLS Proxy"),
             proxy_lifecycle_generation: None,
-            client_addr,
+            resolved_client: client_addr,
             consumer_username: Some("alice".to_string()),
             auth_method: None,
             backend_target: "10.0.0.60:7443",
@@ -5523,7 +5751,7 @@ backend_tls_verify_server_cert: false
             proxy_id: "dtls-proxy",
             proxy_name: Some("DTLS Proxy"),
             proxy_lifecycle_generation: None,
-            client_addr,
+            resolved_client: client_addr,
             consumer_username: Some("alice".to_string()),
             auth_method: Some("mtls_auth"),
             backend_target: "10.0.0.60:7443",
@@ -5576,7 +5804,6 @@ backend_tls_verify_server_cert: false
 
     #[test]
     fn test_build_udp_stream_summary_preserves_bytes_error_and_metadata() {
-        let client_addr: SocketAddr = "127.0.0.1:53000".parse().unwrap();
         let session = make_udp_session();
         let disconnected_wall_at =
             chrono::DateTime::from_timestamp_millis(1_710_000_001_500).unwrap();
@@ -5585,7 +5812,6 @@ backend_tls_verify_server_cert: false
             namespace: "ferrum",
             proxy_id: "udp-proxy",
             proxy_name: Some("UDP Proxy"),
-            client_addr,
             session: &session,
             backend_scheme: BackendScheme::Udp,
             listen_port: 5353,
@@ -5637,7 +5863,6 @@ backend_tls_verify_server_cert: false
     fn test_build_udp_stream_summary_preserves_passthrough_sni() {
         // UDP/DTLS passthrough peeks ClientHello SNI into UdpSession and must
         // surface it on the disconnect summary (parity with terminating DTLS).
-        let client_addr: SocketAddr = "127.0.0.1:53000".parse().unwrap();
         let mut session = make_udp_session();
         session.sni_hostname = Some("passthrough.example".to_string());
         let disconnected_wall_at =
@@ -5647,7 +5872,6 @@ backend_tls_verify_server_cert: false
             namespace: "ferrum",
             proxy_id: "udp-proxy",
             proxy_name: Some("UDP Proxy"),
-            client_addr,
             session: &session,
             backend_scheme: BackendScheme::Udp,
             listen_port: 5353,
@@ -5688,7 +5912,6 @@ backend_tls_verify_server_cert: false
             namespace: "ferrum",
             proxy_id: "udp-proxy",
             proxy_name: Some("UDP Proxy"),
-            client_addr: "127.0.0.1:53000".parse().unwrap(),
             session: &session,
             backend_scheme: BackendScheme::Udp,
             listen_port: 5353,
@@ -5727,7 +5950,6 @@ backend_tls_verify_server_cert: false
             namespace: "ferrum",
             proxy_id: "udp-proxy",
             proxy_name: None,
-            client_addr: "127.0.0.1:53000".parse().unwrap(),
             session: &session,
             backend_scheme: BackendScheme::Udp,
             listen_port: 5353,
@@ -5754,7 +5976,7 @@ backend_tls_verify_server_cert: false
             proxy_id: "dtls-proxy",
             proxy_name: None,
             proxy_lifecycle_generation: None,
-            client_addr: "127.0.0.1:54000".parse().unwrap(),
+            resolved_client: "127.0.0.1:54000".parse().unwrap(),
             consumer_username: None,
             auth_method: None,
             backend_target: "10.0.0.60:7443",
@@ -5803,7 +6025,7 @@ backend_tls_verify_server_cert: false
             proxy_id: "dtls-proxy",
             proxy_name: Some("DTLS Frontend"),
             proxy_lifecycle_generation: None,
-            client_addr: "127.0.0.1:54000".parse().unwrap(),
+            resolved_client: "127.0.0.1:54000".parse().unwrap(),
             consumer_username: None,
             auth_method: None,
             backend_target: "10.0.0.60:7443",
@@ -5852,7 +6074,7 @@ backend_tls_verify_server_cert: false
             proxy_id: "dtls-proxy",
             proxy_name: None,
             proxy_lifecycle_generation: None,
-            client_addr: "127.0.0.1:54000".parse().unwrap(),
+            resolved_client: "127.0.0.1:54000".parse().unwrap(),
             consumer_username: None,
             auth_method: None,
             backend_target: "10.0.0.60:7443",
@@ -5905,7 +6127,6 @@ backend_tls_verify_server_cert: false
 
     #[tokio::test]
     async fn test_emit_udp_stream_disconnect_notifies_plugins() {
-        let client_addr: SocketAddr = "127.0.0.1:53001".parse().unwrap();
         let session = make_udp_session();
         session.bytes_sent.store(512, Ordering::Relaxed);
         session.bytes_received.store(1024, Ordering::Relaxed);
@@ -5921,7 +6142,6 @@ backend_tls_verify_server_cert: false
                 namespace: "ferrum",
                 proxy_id: "udp-proxy",
                 proxy_name: Some("UDP Proxy"),
-                client_addr,
                 session: &session,
                 backend_scheme: BackendScheme::Dtls,
                 listen_port: 7443,
@@ -6446,8 +6666,8 @@ backend_tls_verify_server_cert: false
         let first = test_client_addr();
         let second: SocketAddr = "127.0.0.1:40001".parse().expect("valid addr");
 
-        assert!(super::try_insert_pending_session_gate(&pending, first, 1).unwrap());
-        let err = super::try_insert_pending_session_gate(&pending, second, 1)
+        assert!(super::try_insert_pending_session_gate(&pending, first, 1, None).unwrap());
+        let err = super::try_insert_pending_session_gate(&pending, second, 1, None)
             .expect_err("second pending gate should hit pending limit");
 
         assert!(
@@ -6555,6 +6775,7 @@ backend_tls_verify_server_cert: false
             plugins: Arc::new(Vec::new()),
             datagram_plugins: Arc::from([]),
             datagram_client_ip: Arc::from("127.0.0.1"),
+            forwarded_client: None,
             datagram_proxy_id: Arc::from("udp-proxy"),
             datagram_proxy_name: Some(Arc::from("UDP Proxy")),
             datagram_payload_kind: crate::plugins::StreamBytesKind::PlaintextWire,

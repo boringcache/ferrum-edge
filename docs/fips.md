@@ -174,9 +174,21 @@ reload, which rebuilds through the same constructor.
   an approved FIPS 186-5 scheme, but the `jsonwebtoken/aws_lc_rs` backend this
   profile selects exposes no P-521 JWS path at all, so admitting it would be an
   allow-list entry that fails at first use rather than at admission.
-- `FERRUM_ADMIN_JWT_SECRET`, `FERRUM_CP_DP_GRPC_JWT_SECRET`, and
-  `FERRUM_BASIC_AUTH_HMAC_SECRET` must be at least 32 bytes (SP 800-107 HMAC
-  key strength).
+- `FERRUM_ADMIN_JWT_SECRET`, `FERRUM_CP_DP_GRPC_JWT_SECRET`,
+  `FERRUM_BASIC_AUTH_HMAC_SECRET`, and `FERRUM_DATAGRAM_PROXY_PROTOCOL_SECRET`
+  must be at least 32 bytes (SP 800-107 HMAC key strength). A shorter
+  `FERRUM_DATAGRAM_PROXY_PROTOCOL_SECRET` fails `ferrum-edge validate` and
+  startup; the diagnostic names the variable and does not report the value or
+  its length. An unset or empty value is not a FIPS key-length failure: it
+  leaves datagram listeners in the unauthenticated address-trust posture.
+- The datagram client-address envelope uses **only** HMAC-SHA-256 through
+  `fips::approved::HmacSha256Key`. Its listener-domain binding and its
+  freshness/anti-replay record introduce no new cryptographic construction: the
+  binding is a versioned byte prefix absorbed into the same HMAC input, and
+  freshness is a plaintext authenticated record inside that same MAC. There is
+  no key-derivation function, no per-listener subkey, and no non-approved
+  primitive — the root secret is the one HMAC key, at full configured strength,
+  on every listener.
 
 **Key strengths and forms (Ferrum-enforced, not provider-enforced)**
 

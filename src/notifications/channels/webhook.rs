@@ -17,8 +17,8 @@ use super::super::templating::{
     render_template, render_template_json_string_escaped, validate_template,
 };
 use super::{
-    finalize_dispatch_response_classified, redacted_endpoint_url, resolve_optional_string,
-    transport_failure, validate_notification_url,
+    client_unavailable, finalize_dispatch_response_classified, redacted_endpoint_url,
+    resolve_optional_string, transport_failure, validate_notification_url,
 };
 
 /// Template variable names the webhook channel projects from a generic
@@ -200,16 +200,19 @@ impl WebhookChannel {
             Ok(body) => body,
             Err(message) => return DeliveryAttempt::failed(FailureClass::Permanent, message),
         };
+        let redacted_url = redacted_endpoint_url(&self.url);
+        let Ok(client) = http.get() else {
+            return client_unavailable("webhook", &redacted_url);
+        };
         let mut req = match self.method {
-            HttpMethod::Post => http.get().post(self.url.as_ref()),
-            HttpMethod::Put => http.get().put(self.url.as_ref()),
-            HttpMethod::Patch => http.get().patch(self.url.as_ref()),
+            HttpMethod::Post => client.post(self.url.as_ref()),
+            HttpMethod::Put => client.put(self.url.as_ref()),
+            HttpMethod::Patch => client.patch(self.url.as_ref()),
         };
         for (k, v) in &self.headers {
             req = req.header(k.clone(), v.clone());
         }
         req = req.body(body);
-        let redacted_url = redacted_endpoint_url(&self.url);
         let resp = match http
             .execute_with_redacted_url(req, "notification_webhook", &redacted_url)
             .await

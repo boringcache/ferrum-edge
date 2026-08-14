@@ -204,6 +204,27 @@ pub mod _test_support {
         crate::secrets::credential_file::write_sparse_credential_fixture(path, prefix, logical_len)
     }
 
+    /// Drive [`crate::config::stable_file::read_stable_file`] with a hook that
+    /// runs after the first identity/content probe and before the inter-probe
+    /// settle (issue #3881).
+    ///
+    /// Production `read_stable_file` is this same function with an empty
+    /// closure, so a test through here exercises the production path rather
+    /// than a parallel one. The hook observes the first-probe bytes so a
+    /// successor generation can be published in the settle window without
+    /// racing the scheduler.
+    pub fn read_stable_file_with_between_probes_for_test(
+        path: &std::path::Path,
+        options: crate::config::stable_file::StableFileReadOptions<'_>,
+        between_probes: impl FnMut(&[u8]),
+    ) -> Result<String, crate::config::stable_file::StableFileError> {
+        crate::config::stable_file::read_stable_file_with_between_probes(
+            path,
+            options,
+            between_probes,
+        )
+    }
+
     /// Exercise DP's crate-private concurrent listener supervisor without
     /// expanding the production API solely for external regression tests.
     pub async fn await_dp_listener_handles(
@@ -329,6 +350,31 @@ pub mod _test_support {
         request: RetryTargetRequestForTest<'_>,
     ) -> Option<Arc<crate::config::types::UpstreamTarget>> {
         crate::proxy::backend_dispatch::select_next_retry_target(
+            state,
+            epoch,
+            proxy,
+            prev_target,
+            crate::proxy::backend_dispatch::RetryTargetRequest {
+                base_hash_key: request.base_hash_key,
+                client_ip: request.client_ip,
+                proxy_headers: request.proxy_headers,
+                request_authority: request.request_authority,
+            },
+        )
+    }
+
+    /// Test-only view of shared H3-eligible retry selection (issue #3620).
+    ///
+    /// Excludes the original failed identity and drops every Unix-ineligible
+    /// pool entry inside the single load-balancer selection pass.
+    pub fn select_next_h3_eligible_retry_target_for_test(
+        state: &crate::proxy::ProxyState,
+        epoch: &crate::request_epoch::RequestEpoch,
+        proxy: &crate::config::types::Proxy,
+        prev_target: &crate::config::types::UpstreamTarget,
+        request: RetryTargetRequestForTest<'_>,
+    ) -> Option<Arc<crate::config::types::UpstreamTarget>> {
+        crate::proxy::backend_dispatch::select_next_h3_eligible_retry_target(
             state,
             epoch,
             proxy,
@@ -7472,6 +7518,16 @@ pub mod _test_support {
         crate::dtls::dtls_stale_session_removal_preserves_newer_generation_for_test()
     }
 
+    /// External coverage for the DTLS client-address metadata refusal
+    /// diagnostic (issue #3289): drops are counted per refusal while the
+    /// warning is rate-limited. See
+    /// [`crate::dtls::dtls_datagram_metadata_refusal_accounting_for_test`].
+    pub fn dtls_datagram_metadata_refusal_accounting_for_test(
+        refusals_in_window: u64,
+    ) -> Result<(u64, u64, u64), String> {
+        crate::dtls::dtls_datagram_metadata_refusal_accounting_for_test(refusals_in_window)
+    }
+
     /// Observe Ferrum-managed DTLS loader key DER after zeroization and before
     /// the backing allocation is released (issue #3224 loader ownership path).
     pub fn load_dtls_certificate_with_rustls_key_drop_hook_for_test(
@@ -7704,6 +7760,61 @@ pub mod _test_support {
         target: &crate::config::types::UpstreamTarget,
     ) -> Option<&'static str> {
         crate::proxy::backend_dispatch::direct_http_mesh_transport_refusal(Some(target))
+    }
+
+    /// Unix-only refusal the H3 plain / WebSocket bridges apply after mesh
+    /// egress support (issue #3620). Mesh HBONE / Sidecar mTLS targets return
+    /// `None` here — they are dispatchable through the shared pools.
+    pub fn h3_bridge_transport_refusal_for_test(
+        target: &crate::config::types::UpstreamTarget,
+    ) -> Option<&'static str> {
+        crate::proxy::backend_dispatch::h3_bridge_transport_refusal(Some(target))
+    }
+
+    /// Whether an H3 frontend can safely dispatch `target` (issue #3620).
+    /// Unix-socket targets remain ineligible; mesh-tagged HBONE / Sidecar mTLS
+    /// targets are eligible once the plain and WebSocket bridges share the
+    /// H1/H2 mesh egress pools.
+    pub fn h3_dispatch_target_eligible_for_test(
+        target: &crate::config::types::UpstreamTarget,
+    ) -> bool {
+        crate::proxy::backend_dispatch::h3_dispatch_target_eligible(target)
+    }
+
+    /// Whether a plain-HTTP / WebSocket H3 attempt must ride mesh egress for
+    /// `target` (issue #3620).
+    pub fn target_requires_http_mesh_egress_for_test(
+        target: &crate::config::types::UpstreamTarget,
+    ) -> bool {
+        crate::proxy::target_requires_http_mesh_egress(target)
+    }
+
+    /// Whether the H3→plain bridge should acquire the reqwest-only
+    /// `http1MaxPendingRequests` slot (issue #3620). Mesh egress targets
+    /// must never consult this lane; reqwest HTTP/1.1 direct targets keep
+    /// the existing cap.
+    pub fn h3_plain_http1_pending_gate_applies_for_test(
+        mesh_egress_required: bool,
+        reqwest_dispatch_is_http1_only: bool,
+    ) -> bool {
+        crate::proxy::h3_plain_http1_pending_gate_applies(
+            mesh_egress_required,
+            reqwest_dispatch_is_http1_only,
+        )
+    }
+
+    /// Expiration-first deadline race used by Ambient HBONE WebSocket
+    /// establishment (issue #3620). Unlike `tokio::time::timeout_at`, an
+    /// already-elapsed deadline and an exact timer/result tie expire
+    /// rather than accepting a ready success.
+    pub async fn await_deadline_first_for_test<F, T>(
+        deadline: tokio::time::Instant,
+        fut: F,
+    ) -> Result<T, ()>
+    where
+        F: std::future::Future<Output = T>,
+    {
+        crate::proxy::await_deadline_first(deadline, fut).await
     }
 
     /// Whether the inbound request declared a request body on the wire, as the

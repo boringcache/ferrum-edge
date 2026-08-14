@@ -38,6 +38,7 @@ pub mod backend_capabilities;
 pub mod backend_dispatch;
 pub mod body;
 pub mod client_ip;
+pub mod datagram_client_address;
 pub mod deferred_log;
 pub mod gateway_listener;
 pub mod gateway_listener_status;
@@ -8918,6 +8919,13 @@ impl ProxyState {
         // stays fail-closed, which is the intended default.
         stream_listener_manager
             .set_stream_sni_plaintext_fallback(env_config_arc.stream_sni_plaintext_fallback);
+        // Publish the datagram client-address envelope's MAC key before the
+        // first `reconcile()` so a udp/dtls listener with
+        // `stream_proxy_protocol: true` never binds in the weaker
+        // address-trust-only posture when a secret is configured (issue #3289).
+        stream_listener_manager.set_datagram_client_address_secret(
+            env_config_arc.datagram_proxy_protocol_secret.clone(),
+        );
 
         let state = Self {
             config: config_arc,
@@ -14955,7 +14963,11 @@ fn backend_url_authority_host_is(url: &str, host: &str) -> bool {
 /// not depend on its callers for the property it exists to provide. Bracketed
 /// IPv6 is unaffected: the closing `]` is part of the rendered host, so the
 /// remainder is `` or `:{port}` exactly as for a DNS name.
-fn rewrite_backend_url_authority_host(url: &str, from_host: &str, to_host: &str) -> String {
+pub(crate) fn rewrite_backend_url_authority_host(
+    url: &str,
+    from_host: &str,
+    to_host: &str,
+) -> String {
     let Some(scheme_end) = url.find("://") else {
         return url.to_string();
     };
@@ -15348,7 +15360,7 @@ pub(crate) enum WsBackendHandshake {
 }
 
 impl WsBackendHandshake {
-    fn negotiated_subprotocol(&self) -> Option<&hyper::header::HeaderValue> {
+    pub(crate) fn negotiated_subprotocol(&self) -> Option<&hyper::header::HeaderValue> {
         match self {
             Self::Direct(handshake) => handshake.negotiated_subprotocol.as_ref(),
             Self::Mesh(handshake) => handshake.negotiated_subprotocol.as_ref(),
@@ -15732,7 +15744,7 @@ async fn connect_unix_websocket_backend(
 /// The mesh egress transport a WebSocket upgrade should ride, derived from the
 /// LB-selected upstream target's tags. `None` means the target is not mesh-egress
 /// tagged, so the ordinary direct TCP/TLS WebSocket path is used.
-enum MeshWsEgress {
+pub(crate) enum MeshWsEgress {
     /// Sidecar SVID-mTLS (`mesh.mtls`): dial the peer sidecar's inbound mTLS
     /// listener over a fresh mesh-mTLS H2 connection and RFC 8441 Extended
     /// CONNECT (Sidecar materializes inbound WS routes).
@@ -15756,7 +15768,9 @@ enum MeshWsEgress {
 /// WebSocket analogue of the `supports_mesh_mtls_backend` / `can_attempt_hbone_backend`
 /// fail-closed contract, but the SVID/capability check is deferred to the dial
 /// because returning `None` here would route to the plaintext path.
-fn websocket_mesh_egress(target: &UpstreamTarget) -> Option<MeshWsEgress> {
+///
+/// Shared by the H1/H2 WebSocket path and the H3 WebSocket bridge (issue #3620).
+pub(crate) fn websocket_mesh_egress(target: &UpstreamTarget) -> Option<MeshWsEgress> {
     // HBONE is checked FIRST so a corrupted target carrying BOTH transport tags
     // (`mesh.hbone` + `mesh.mtls`) resolves to the Ambient branch, mirroring the
     // gRPC classifier's HBONE-wins precedence (`classify_grpc_mesh_dispatch`).
@@ -15827,6 +15841,43 @@ fn unix_websocket_validated_authority(value: &str) -> Option<&str> {
     }
 }
 
+/// Race `fut` against an absolute deadline with expiration-first semantics.
+///
+/// [`tokio::time::timeout_at`] is inner-first: when both the future and the
+/// timer are ready, it returns the success. An already-elapsed deadline and
+/// an exact timer/result tie must NOT accept a ready success after the
+/// budget is spent (issue #3620). A biased `select!` with the deadline arm
+/// first is the contract.
+///
+/// Used by Ambient HBONE WebSocket establishment so byte-tunnel acquisition
+/// and the inner H1 upgrade share one connect budget.
+pub(crate) async fn await_deadline_first<F, T>(
+    deadline: tokio::time::Instant,
+    fut: F,
+) -> Result<T, ()>
+where
+    F: std::future::Future<Output = T>,
+{
+    tokio::select! {
+        biased;
+        _ = tokio::time::sleep_until(deadline) => Err(()),
+        result = fut => Ok(result),
+    }
+}
+
+/// Authority token for Ambient HBONE WebSocket establishment timeouts.
+///
+/// [`HbonePoolError::ConnectStream`] interpolates this field into Display.
+/// Timeout paths must not echo identities, dial hosts, or unredacted URLs.
+const HBONE_WEBSOCKET_TIMEOUT_AUTHORITY: &str = "hbone-websocket";
+
+fn hbone_websocket_establishment_timeout(message: &'static str) -> HbonePoolError {
+    HbonePoolError::ConnectStream {
+        authority: String::from(HBONE_WEBSOCKET_TIMEOUT_AUTHORITY),
+        message: String::from(message),
+    }
+}
+
 /// Open a backend WebSocket transport over a mesh egress tunnel for a
 /// `mesh.mtls`-tagged (Sidecar) or `mesh.hbone`-tagged (Ambient) destination.
 /// The returned stream carries raw WebSocket frames over the SVID-mTLS / HBONE
@@ -15854,6 +15905,11 @@ fn unix_websocket_validated_authority(value: &str) -> Option<&str> {
 ///     client WebSocket handshake over it; the destination's transparent HBONE
 ///     relay byte-copies the upgrade to the loopback app, which performs the WS
 ///     handshake. This makes Ambient WS egress actually work end-to-end.
+///     Tunnel acquisition and the inner 101 wait share one
+///     `backend_connect_timeout_ms` budget captured before `get_ws_byte_tunnel`;
+///     a timeout of the inner upgrade (POST-wire: the RFC 6455 request is
+///     written before awaiting 101) or of an unknown tunnel phase is a
+///     reached-wire `ConnectStream` failure, not a connect retry.
 ///
 /// For Sidecar the connection is dialed to the peer's pod address + `:15006`,
 /// while the Extended CONNECT `:authority` is the SERVICE routing key the peer's
@@ -15872,8 +15928,10 @@ fn unix_websocket_validated_authority(value: &str) -> Option<&str> {
 /// absent/invalid pinned identity, a peer that never negotiated Extended CONNECT
 /// (Sidecar), or a relay/handshake failure (Ambient) errors instead of falling
 /// back to a plaintext dial.
+///
+/// Shared by the H1/H2 WebSocket path and the H3 WebSocket bridge (issue #3620).
 #[allow(clippy::too_many_arguments)]
-async fn connect_mesh_websocket_backend(
+pub(crate) async fn connect_mesh_websocket_backend(
     state: &ProxyState,
     proxy: &Proxy,
     target: &UpstreamTarget,
@@ -16102,9 +16160,26 @@ async fn connect_mesh_websocket_backend(
             // addr:port the relay byte-copies to) — NOT an Extended CONNECT (see
             // `get_ws_byte_tunnel`). For cross-cluster the outer TLS dials the
             // gateway with the SNI override + trust-domain scope resolved above.
-            let tunnel = state
-                .hbone_pool
-                .get_ws_byte_tunnel(
+            //
+            // ONE absolute establishment deadline, captured BEFORE tunnel
+            // acquisition. `get_ws_byte_tunnel`'s dial/CONNECT phases already
+            // use connect timeouts; the inner H1 upgrade used to start a
+            // second full `backend_connect_timeout_ms`. Tunnel acquisition
+            // and the inner 101 wait share this budget (issue #3620).
+            let Some(establishment_deadline) = tokio::time::Instant::now()
+                .checked_add(Duration::from_millis(proxy.backend_connect_timeout_ms))
+            else {
+                // Unrepresentable budget: fail closed without panicking.
+                // Nothing has been dialed, so this stays a pre-wire connect
+                // timeout rather than a reached-wire protocol class.
+                return Err(Box::new(HbonePoolError::ConnectTimeout {
+                    addr: String::from(HBONE_WEBSOCKET_TIMEOUT_AUTHORITY),
+                    timeout_ms: proxy.backend_connect_timeout_ms,
+                }));
+            };
+            let tunnel = match await_deadline_first(
+                establishment_deadline,
+                state.hbone_pool.get_ws_byte_tunnel(
                     proxy,
                     dial_host,
                     hbone_port,
@@ -16123,8 +16198,23 @@ async fn connect_mesh_websocket_backend(
                     // egress from an unauthenticated client) falls back to the
                     // gateway SVID inside `get_ws_byte_tunnel` (issue #2010 codex).
                     source_identity,
-                )
-                .await?;
+                ),
+            )
+            .await
+            {
+                Ok(result) => result?,
+                Err(()) => {
+                    // The outer bound cancelled an in-flight tunnel future
+                    // whose phase is unknown (SVID/dial vs CONNECT already
+                    // on the wire). Fail closed as reached-wire
+                    // (`ConnectStream` → `ProtocolError`) rather than
+                    // `ConnectionTimeout`, which would retry a possibly
+                    // non-idempotent upgrade.
+                    return Err(Box::new(hbone_websocket_establishment_timeout(
+                        "timed out waiting for HBONE WebSocket tunnel acquisition",
+                    )));
+                }
+            };
 
             // Speak the WebSocket THROUGH the byte tunnel with an inner H1
             // client handshake (`Sec-WebSocket-Key`/`Upgrade`/`Connection`,
@@ -16169,21 +16259,18 @@ async fn connect_mesh_websocket_backend(
                 }
             }
 
-            // Bound the inner handshake by the per-proxy connect budget: a relay
-            // that wires the tunnel but whose app never answers the upgrade must
-            // not stall the WS dispatch indefinitely. A timeout is a pre-wire
-            // setup failure (the upgrade never completed), surfaced as a
-            // `HbonePoolError::ConnectStream` so the WS failure handler keeps
-            // connect-failure semantics via `classify_boxed_setup_error`'s
-            // `HbonePoolError` downcast.
-            let connect_timeout =
-                std::time::Duration::from_millis(proxy.backend_connect_timeout_ms);
-            // Use `app_host` (real pod addr) for the error surface too — for a
-            // cross-cluster target `target.host` is the synthetic identity, not
-            // a dialable authority; in-cluster this is byte-identical.
-            let handshake_authority = hbone_pool::authority_for_host_port(app_host, target.port);
-            let (stream, response) = match tokio::time::timeout(
-                connect_timeout,
+            // Bound the inner handshake by what REMAINS of the same
+            // establishment deadline. `client_async_with_config` writes and
+            // flushes the RFC 6455 upgrade request BEFORE waiting for the 101
+            // response, so a timeout here is POST-wire: the application may
+            // already have the upgrade. Map it to `HbonePoolError::ConnectStream`
+            // so `classify_boxed_setup_error` keeps the reached-wire
+            // `ProtocolError` class — `retry_on_connect_failure` must not
+            // replay a non-idempotent upgrade. Do not use inner-first
+            // `timeout_at`: an elapsed deadline or exact timer/result tie
+            // must expire.
+            let (stream, response) = match await_deadline_first(
+                establishment_deadline,
                 client_async_with_config(
                     ws_request,
                     WsActivityIo::new(tunnel, idle_tracker),
@@ -16193,15 +16280,10 @@ async fn connect_mesh_websocket_backend(
             .await
             {
                 Ok(result) => result?,
-                Err(_) => {
-                    return Err(Box::new(hbone_pool::HbonePoolError::ConnectStream {
-                        authority: handshake_authority,
-                        message: format!(
-                            "timed out after {}ms waiting for HBONE WebSocket inner handshake \
-                             response",
-                            proxy.backend_connect_timeout_ms
-                        ),
-                    }));
+                Err(()) => {
+                    return Err(Box::new(hbone_websocket_establishment_timeout(
+                        "timed out waiting for HBONE WebSocket inner handshake response",
+                    )));
                 }
             };
 
@@ -37856,6 +37938,238 @@ async fn proxy_to_backend_mesh_retry(
         request_body_exceeded,
         proxy.backend_read_timeout_ms,
     )
+}
+
+/// Whether a plain-HTTP / WebSocket H3 attempt must ride a mesh egress
+/// transport for `target` (issue #3620).
+///
+/// True for Sidecar `mesh.mtls` and Ambient `mesh.hbone` (including
+/// cross-cluster). Unix-socket targets are NOT mesh egress here — they are
+/// refused by [`backend_dispatch::h3_bridge_transport_refusal`].
+pub(crate) fn target_requires_http_mesh_egress(target: &UpstreamTarget) -> bool {
+    hbone_pool::target_hbone_enabled(target) || mesh_mtls_pool::target_mesh_mtls_enabled(target)
+}
+
+/// Whether the H3→plain bridge should acquire the reqwest-only
+/// `http1MaxPendingRequests` slot for this attempt (issue #3620).
+///
+/// True only for a reqwest HTTP/1.1 direct target. Mesh HBONE / Sidecar
+/// mesh-mTLS attempts bypass reqwest and must never acquire or be rejected
+/// by this lane, even when [`reqwest_dispatch_is_http1_only`] would be true
+/// (typical plaintext mesh app targets). Direct reqwest HTTP/1.1 attempts
+/// keep the existing cap.
+#[inline]
+pub(crate) fn h3_plain_http1_pending_gate_applies(
+    mesh_egress_required: bool,
+    reqwest_dispatch_is_http1_only: bool,
+) -> bool {
+    !mesh_egress_required && reqwest_dispatch_is_http1_only
+}
+
+/// Outcome of [`proxy_to_backend_mesh_retry`]: backend response, client-upload
+/// overflow flag (health-neutral admission / retryability), and the
+/// target-effective backend read timeout used for StreamingH2 follow-on and
+/// sent-byte accounting after headers.
+///
+/// Distinct from [`BackendDispatchOutcome`], which carries a retained request
+/// body instead of the read timeout. The H3 boxed seam must use this contract
+/// rather than coercing mesh retry into the Unix/reqwest dispatch tuple.
+type MeshRetryDispatchOutcome = (
+    retry::BackendResponse,
+    Option<Arc<std::sync::atomic::AtomicBool>>,
+    u64,
+);
+
+/// One mesh-retry dispatch future, heap-allocated so it is not a frame slot in
+/// the H3 plain bridge. See [`boxed_proxy_to_backend_mesh_retry`].
+type BoxedMeshRetryDispatchFuture<'a> =
+    std::pin::Pin<Box<dyn std::future::Future<Output = MeshRetryDispatchOutcome> + Send + 'a>>;
+
+/// The H3 plain mesh dispatch future, constructed out of line and returned
+/// boxed so its shared HBONE / Sidecar mesh-mTLS retry future is not an inline
+/// frame slot in the H3 bridge.
+///
+/// This is the same stack-budget invariant as [`boxed_proxy_to_backend_unix`].
+/// In an unoptimized hosted functional-test build, materializing
+/// `proxy_to_backend_mesh_retry` inside `proxy_h3_plain_http_mesh_buffered`
+/// nests both large mesh transport futures beneath the already-large H3 plain
+/// bridge poll frame. A healthy transport reaches that deep poll chain and can
+/// exhaust Tokio's worker stack; early Unix and identity refusals return before
+/// it and are unaffected. Building the future in this `#[inline(never)]`
+/// factory lets the H3 helper retain only a boxed pointer. The allocation is
+/// confined to H3 plain requests that already require a secured mesh bridge.
+#[allow(clippy::too_many_arguments)]
+#[inline(never)]
+fn boxed_proxy_to_backend_mesh_retry<'a>(
+    state: &'a ProxyState,
+    proxy: &'a Proxy,
+    backend_url: &'a str,
+    method: &'a str,
+    headers: &'a HashMap<String, String>,
+    upstream_target: Option<&'a UpstreamTarget>,
+    request_body: Option<&'a Bytes>,
+    replay_headers: Option<&'a hyper::HeaderMap>,
+    dispatch_hbone: bool,
+    plugins: &'a [Arc<dyn Plugin>],
+    request_ctx: &'a RequestContext,
+    stream_response: bool,
+    client_ip: &'a str,
+    xff_append_ip: &'a str,
+    request_is_secure: bool,
+    ctx_bytes_sent_observed: &'a Arc<std::sync::atomic::AtomicU64>,
+) -> BoxedMeshRetryDispatchFuture<'a> {
+    Box::pin(proxy_to_backend_mesh_retry(
+        state,
+        proxy,
+        backend_url,
+        method,
+        headers,
+        upstream_target,
+        request_body,
+        replay_headers,
+        dispatch_hbone,
+        plugins,
+        request_ctx,
+        stream_response,
+        client_ip,
+        xff_append_ip,
+        request_is_secure,
+        ctx_bytes_sent_observed,
+    ))
+}
+
+/// Dispatch a buffered plain-HTTP attempt over the mesh transport required by
+/// `upstream_target` (HBONE or Sidecar mesh-mTLS).
+///
+/// Shared by the H3→HTTP plain bridge and the native-H3 buffered retry
+/// rotation when they land on a mesh-tagged target (issue #3620). Reuses the
+/// same `proxy_to_backend_hbone` / `proxy_to_backend_mesh_mtls` security
+/// plumbing as H1/H2 — identity pinning, pool keys, east-west SNI/trust-
+/// domain scope, and fail-closed refusal when the secured transport cannot
+/// materialize. Never falls back to a plaintext direct dial.
+///
+/// Request bodies are always replayable (`MeshClientRequestBody::Replayable`)
+/// because the H3 frontend does not expose a hyper `Incoming` body. Responses
+/// are collected buffered so the H3 writer can reuse the existing plain
+/// response pipeline.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn proxy_h3_plain_http_mesh_buffered(
+    state: &ProxyState,
+    proxy: &Proxy,
+    backend_url: &str,
+    method: &str,
+    headers: &HashMap<String, String>,
+    body: Bytes,
+    upstream_target: &UpstreamTarget,
+    plugins: &[Arc<dyn Plugin>],
+    request_ctx: &RequestContext,
+    client_ip: &str,
+    xff_append_ip: &str,
+    request_is_secure: bool,
+) -> retry::BackendResponse {
+    let dispatch_hbone = hbone_pool::target_hbone_enabled(upstream_target);
+    let dispatch_mesh_mtls = mesh_mtls_pool::target_mesh_mtls_enabled(upstream_target);
+    // Corrupted BOTH-tags target: prefer HBONE classification so the dial
+    // re-screens mixed tags and fails closed rather than silently picking
+    // Sidecar mTLS (mirrors `classify_grpc_mesh_dispatch` / WS egress).
+    if !dispatch_hbone && !dispatch_mesh_mtls {
+        return retry::BackendResponse {
+            status_code: 502,
+            body: ResponseBody::buffered(
+                br#"{"error":"Bad Gateway","message":"Mesh transport dispatch required for this backend target"}"#
+                    .to_vec(),
+            ),
+            headers: HashMap::from([(
+                "gateway-error-reason".to_string(),
+                "mesh transport dispatch required for this backend target".to_string(),
+            )]),
+            connection_error: false,
+            backend_resolved_ip: None,
+            error_class: Some(retry::ErrorClass::DispatchPolicyRejected),
+        };
+    }
+
+    // Build an exact HeaderMap replay representation from the H3 bridge's
+    // folded string map. Duplicate field lines are already collapsed on the
+    // H3 intake path; mesh merge still applies hop-by-hop stripping and
+    // forwarding-header regeneration at the outbound boundary.
+    let mut replay_headers = hyper::HeaderMap::with_capacity(headers.len());
+    for (name, value) in headers {
+        let Ok(header_name) = hyper::header::HeaderName::from_bytes(name.as_bytes()) else {
+            continue;
+        };
+        let Ok(header_value) = hyper::header::HeaderValue::from_str(value) else {
+            continue;
+        };
+        replay_headers.append(header_name, header_value);
+    }
+
+    let (response, request_body_exceeded, streaming_h2_read_timeout_ms) =
+        boxed_proxy_to_backend_mesh_retry(
+            state,
+            proxy,
+            backend_url,
+            method,
+            headers,
+            Some(upstream_target),
+            Some(&body),
+            Some(&replay_headers),
+            dispatch_hbone,
+            plugins,
+            request_ctx,
+            false, // buffered response for the H3 plain writer
+            client_ip,
+            xff_append_ip,
+            request_is_secure,
+            &request_ctx.bytes_sent_observed,
+        )
+        .await;
+    h3_mesh_buffered_retry_response(
+        response,
+        request_body_exceeded,
+        streaming_h2_read_timeout_ms,
+    )
+}
+
+/// Fold the mesh-retry side channel into the buffered H3 response.
+///
+/// H1/H2 threads `request_body_exceeded` into deferred admission and
+/// `streaming_h2_read_timeout_ms` into the StreamingH2 relay. This helper is
+/// buffered (`stream_response = false`): the read deadline was already applied
+/// inside mesh dispatch, and headers have not been committed to the H3 client.
+/// A late upload overflow must not be published as a 2xx, and non-success
+/// outcomes must stay health-neutral `RequestBodyTooLarge` rather than a
+/// backend failure.
+fn h3_mesh_buffered_retry_response(
+    response: retry::BackendResponse,
+    request_body_exceeded: Option<Arc<std::sync::atomic::AtomicBool>>,
+    streaming_h2_read_timeout_ms: u64,
+) -> retry::BackendResponse {
+    // Copy so the target-effective deadline stays on this seam; buffered H3
+    // has no StreamingH2 follow-on that would consume it as a relay budget.
+    let _applied_read_timeout_ms = streaming_h2_read_timeout_ms;
+    if !request_body_exceeded
+        .as_ref()
+        .is_some_and(|flag| flag.load(Ordering::Acquire))
+    {
+        return response;
+    }
+    if (200..300).contains(&response.status_code) {
+        return retry::BackendResponse {
+            status_code: 413,
+            body: ResponseBody::buffered(
+                br#"{"error":"Request body exceeds maximum size"}"#.to_vec(),
+            ),
+            headers: HashMap::new(),
+            connection_error: false,
+            backend_resolved_ip: response.backend_resolved_ip,
+            error_class: Some(retry::ErrorClass::RequestBodyTooLarge),
+        };
+    }
+    let mut response = response;
+    response.error_class = Some(retry::ErrorClass::RequestBodyTooLarge);
+    response.connection_error = false;
+    response
 }
 
 /// Proxy the request to the backend.

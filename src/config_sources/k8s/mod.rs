@@ -8,6 +8,7 @@ pub(crate) mod backend_ref;
 pub(crate) mod backend_tls_policy;
 mod core;
 mod gateway_api;
+mod gateway_class;
 mod istio;
 pub(crate) mod listenerset;
 mod mesh_config;
@@ -21,6 +22,7 @@ pub(crate) use gateway_api::{
     backend_lb_policy_conflict_losers, backend_lb_policy_status, gateway_api_section_name_is_valid,
     merge_backend_lb_policy_status, namespace_selector_matches, parse_reference_grant_permissions,
 };
+pub use gateway_class::{FERRUM_GATEWAY_CONTROLLER_NAME, GatewayClassAuthority};
 // Re-exported for the integration suite's at-cap/over-cap L4 candidate and
 // projection assertions (`tests/integration/mesh_l7_routing_tests.rs`), which
 // must observe the same constants the translator enforces rather than
@@ -68,8 +70,6 @@ use crate::config::types::{
 use crate::identity::spiffe::TrustDomain;
 use crate::modes::mesh::config::{MeshConfig, WorkloadSelector};
 use crate::plugins::utils::fault_roll::MAX_FAULT_DELAY_MS;
-
-const FERRUM_GATEWAY_CONTROLLER_NAME: &str = "ferrum.io/gateway-controller";
 
 /// Marker phrase carried by a translation error for an object that is **valid**
 /// under the pinned Gateway API CRD schema but names a shape Ferrum does not
@@ -986,17 +986,17 @@ pub(crate) struct K8sAccumulator {
     /// Post-admission explicit-SNI collision losers and their winners.
     pub(crate) gateway_api_frontend_tls_hostname_conflicts:
         std::collections::BTreeMap<GatewayApiListenerKey, GatewayApiListenerKey>,
-    /// Pre-pass index of observed GatewayClass names → whether Ferrum owns the
-    /// class (`controllerName == ferrum.io/gateway-controller`). Presence is
-    /// key membership; the bool is ownership only — interoperable waypoint
-    /// classes (`istio-waypoint` / `ferrum-waypoint`) may be owned by another
-    /// controller and must still count as present for authz targetRefs.
-    gateway_api_gateway_classes: HashMap<String, bool>,
     /// Gateway `(namespace, name)` → `spec.gatewayClassName` for in-scope Gateways.
     pub(crate) gateway_class_name_by_gateway: HashMap<(String, String), String>,
     /// GatewayClass name → namespaced `UDPResponseAmplificationPolicy` referenced
     /// by `spec.parametersRef` when the referent is Ferrum's CRD.
     pub(crate) gateway_class_parameters_ref: HashMap<String, (String, String)>,
+    /// Pre-pass index of observed GatewayClass names → Ferrum authority.
+    /// Presence is key membership ([`GatewayClassAuthority::Missing`] is a
+    /// lookup miss). Interoperable waypoint classes (`istio-waypoint` /
+    /// `ferrum-waypoint`) may be [`GatewayClassAuthority::Foreign`] and must
+    /// still count as present for authz targetRefs.
+    gateway_api_gateway_classes: HashMap<String, GatewayClassAuthority>,
     pub(crate) namespace_labels: HashMap<String, HashMap<String, String>>,
     /// Flat copy of the Gateway API route conflicts computed over the
     /// translator's filtered object set. Reused by the status writer so
@@ -1237,10 +1237,10 @@ impl K8sAccumulator {
     }
 
     pub(crate) fn record_gateway_class(&mut self, object: &K8sObject) {
-        let managed = object.spec.get("controllerName").and_then(Value::as_str)
-            == Some(FERRUM_GATEWAY_CONTROLLER_NAME);
-        self.gateway_api_gateway_classes
-            .insert(object.metadata.name.clone(), managed);
+        self.gateway_api_gateway_classes.insert(
+            object.metadata.name.clone(),
+            GatewayClassAuthority::from_gateway_class(object),
+        );
         if let Some((namespace, name)) = parse_udp_amplification_parameters_ref(&object.spec) {
             self.gateway_class_parameters_ref
                 .insert(object.metadata.name.clone(), (namespace, name));
@@ -1249,19 +1249,31 @@ impl K8sAccumulator {
 
     /// Whether a cluster-scoped GatewayClass object was observed in the
     /// pre-pass index. Allocation-free cold-path presence check — does not
-    /// consult Ferrum-controller ownership (the stored bool).
+    /// consult Ferrum-controller ownership.
     pub(crate) fn gateway_class_exists(&self, name: &str) -> bool {
         self.gateway_api_gateway_classes.contains_key(name)
     }
 
+    /// Shared GatewayClass authority for this Gateway in the current snapshot.
+    /// Translation and status both program only [`GatewayClassAuthority::Owned`].
+    pub(crate) fn gateway_class_authority(&self, object: &K8sObject) -> GatewayClassAuthority {
+        GatewayClassAuthority::for_gateway(object, |class_name| {
+            self.gateway_api_gateway_classes.get(class_name).copied()
+        })
+    }
+
     pub(crate) fn gateway_is_managed_by_ferrum(&self, object: &K8sObject) -> bool {
-        let Some(class_name) = object.spec.get("gatewayClassName").and_then(Value::as_str) else {
-            return false;
-        };
-        self.gateway_api_gateway_classes
-            .get(class_name)
-            .copied()
-            .unwrap_or_else(|| class_name == "ferrum")
+        self.gateway_class_authority(object).is_ferrum_owned()
+    }
+
+    fn note_unresolved_gateway_class(&mut self, class_name: &str) {
+        let warning = format!(
+            "GatewayClass '{class_name}' is not present in the current snapshot; \
+             Gateways that reference it are not Ferrum-managed until an owned GatewayClass is observed"
+        );
+        if !self.warnings.iter().any(|existing| existing == &warning) {
+            self.warnings.push(warning);
+        }
     }
 
     fn record_explicit_workload_service(&mut self, key: K8sServiceKey) {
@@ -1855,8 +1867,18 @@ where
             if gateway_api::is_waypoint_gateway(object) {
                 gateway_api::add_waypoint_binding(&mut acc, object);
             }
-            if acc.gateway_is_managed_by_ferrum(object) {
-                gateway_api::collect_gateway_listener_policy(&mut acc, object)?;
+            match acc.gateway_class_authority(object) {
+                GatewayClassAuthority::Owned => {
+                    gateway_api::collect_gateway_listener_policy(&mut acc, object)?;
+                }
+                GatewayClassAuthority::Missing => {
+                    if let Some(class_name) =
+                        object.spec.get("gatewayClassName").and_then(Value::as_str)
+                    {
+                        acc.note_unresolved_gateway_class(class_name);
+                    }
+                }
+                GatewayClassAuthority::Foreign => {}
             }
             if let Some(class) = object.spec.get("gatewayClassName").and_then(Value::as_str) {
                 acc.gateway_class_name_by_gateway.insert(
@@ -4061,10 +4083,22 @@ mod tests {
         included_route.metadata.creation_timestamp = Some("2026-01-02T00:00:00Z".to_string());
         included_route.spec["rules"][0]["backendRefs"][0]["name"] = serde_json::json!("included");
 
+        let mut gateway_class = object(
+            "GatewayClass",
+            serde_json::json!({"controllerName": "ferrum.io/gateway-controller"}),
+        );
+        gateway_class.api_version = "gateway.networking.k8s.io/v1".to_string();
+        gateway_class.metadata.name = "ferrum".to_string();
+        gateway_class.metadata.namespace.clear();
+
         let result = translate_k8s_objects_with_filter(
-            &[gateway, skipped_route, included_route],
+            &[gateway_class, gateway, skipped_route, included_route],
             options("default"),
-            |object| object.kind == "Gateway" || object.metadata.name == "api-b-included",
+            |object| {
+                object.kind == "GatewayClass"
+                    || object.kind == "Gateway"
+                    || object.metadata.name == "api-b-included"
+            },
         )
         .expect("filtered translation succeeds");
 

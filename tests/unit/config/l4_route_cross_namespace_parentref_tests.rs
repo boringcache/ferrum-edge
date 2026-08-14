@@ -10,8 +10,9 @@ use std::collections::HashMap;
 
 use ferrum_edge::config::types::BackendScheme;
 use ferrum_edge::config_sources::k8s::{
-    K8sMetadata, K8sObject, K8sTranslationOptions, translate_k8s_objects,
-    translate_k8s_objects_collecting_skips,
+    K8sMetadata, K8sObject, K8sResourceKey, K8sTranslateError, K8sTranslation,
+    K8sTranslationOptions, translate_k8s_objects as translate_k8s_objects_raw,
+    translate_k8s_objects_collecting_skips as translate_k8s_objects_collecting_skips_raw,
 };
 use ferrum_edge::identity::spiffe::TrustDomain;
 use ferrum_edge::k8s_controller::status::plan_gateway_api_status_updates;
@@ -55,6 +56,35 @@ fn gateway_class() -> K8sObject {
         "",
         json!({ "controllerName": "ferrum.io/gateway-controller" }),
     )
+}
+
+fn with_observed_ferrum_class(objects: &[K8sObject]) -> Vec<K8sObject> {
+    if objects
+        .iter()
+        .any(|object| object.kind == "GatewayClass" && object.metadata.name == "ferrum")
+    {
+        return objects.to_vec();
+    }
+    let mut snapshot = Vec::with_capacity(objects.len() + 1);
+    snapshot.push(gateway_class());
+    snapshot.extend_from_slice(objects);
+    snapshot
+}
+
+fn translate_k8s_objects(
+    objects: &[K8sObject],
+    options: K8sTranslationOptions,
+) -> Result<K8sTranslation, K8sTranslateError> {
+    let snapshot = with_observed_ferrum_class(objects);
+    translate_k8s_objects_raw(&snapshot, options)
+}
+
+fn translate_k8s_objects_collecting_skips(
+    objects: &[K8sObject],
+    options: K8sTranslationOptions,
+) -> Option<(K8sTranslation, HashMap<K8sResourceKey, K8sTranslateError>)> {
+    let snapshot = with_observed_ferrum_class(objects);
+    translate_k8s_objects_collecting_skips_raw(&snapshot, options)
 }
 
 fn tcp_gateway(allowed_from: &str) -> K8sObject {
