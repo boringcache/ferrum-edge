@@ -2760,8 +2760,7 @@ async fn udp_amplification_policy_reload_retires_sessions_with_stale_budget() {
 
     let frontend_port = ephemeral_port().await;
     let gateway_addr = SocketAddr::from(([127, 0, 0, 1], frontend_port));
-    let mut unlimited =
-        udp_proxy_for_datagram_reload(frontend_port, backend_port, None);
+    let mut unlimited = udp_proxy_for_datagram_reload(frontend_port, backend_port, None);
     unlimited.udp_max_response_amplification_factor = None;
     let initial = GatewayConfig {
         proxies: vec![unlimited],
