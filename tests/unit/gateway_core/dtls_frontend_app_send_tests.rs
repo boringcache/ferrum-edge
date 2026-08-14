@@ -625,8 +625,12 @@ fn trust_withdrawal_suppresses_final_packet_drain_while_deadline_unexpired() {
         .expect("trust-fenced helper body");
     let precheck = wire_fence.find("session.is_retired()").expect("precheck");
     let biased = wire_fence.find("biased;").expect("biased wire race");
-    let retirement = wire_fence.find("session.retired()").expect("retirement race");
-    let send = wire_fence.find("result = bounded_send").expect("bounded send arm");
+    let retirement = wire_fence
+        .find("session.retired()")
+        .expect("retirement race");
+    let send = wire_fence
+        .find("result = bounded_send")
+        .expect("bounded send arm");
     assert!(
         precheck < biased && biased < retirement && retirement < send,
         "trust retirement must fence both an already-retired session and an in-flight socket write"

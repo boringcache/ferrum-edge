@@ -2320,9 +2320,7 @@ impl DtlsServer {
                                     peer_addr,
                                     in_flight.as_mut(),
                                     auth_deadline.get(),
-                                    client_trust_guard
-                                        .as_ref()
-                                        .map(|guard| guard.session()),
+                                    client_trust_guard.as_ref().map(|guard| guard.session()),
                                 )
                                 .await
                                 {
