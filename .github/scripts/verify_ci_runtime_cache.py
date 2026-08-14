@@ -3,9 +3,10 @@
 
 Does not compile Rust or build images. Proves workflow permission/caching
 boundaries, pinned actions, fail-closed NUL-delimited planning, preserved live
-contracts, telemetry redaction, evidence-backed cache restore bytes, structurally
-separate BuildKit local-cache export vs fork restore-only / no-save steps, and
-rust-cache save-if so fork PRs cannot save.
+contracts, telemetry redaction, evidence-backed cache restore bytes, schema-
+and architecture-scoped BuildKit keys, exact-hit restore-only vs partial/miss
+publish, fail-closed cache-save preparation, fork restore-only / no-save
+steps, and rust-cache save-if so fork PRs cannot save.
 """
 
 from __future__ import annotations
@@ -36,6 +37,9 @@ BUILDX = "docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c"
 BUILD_PUSH = "docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a"
 CACHE_RESTORE = "actions/cache/restore@374a27f26986edd8c430f386d152a856e179c0ae"
 CACHE_SAVE = "actions/cache/save@374a27f26986edd8c430f386d152a856e179c0ae"
+BUILDKIT_CACHE_SCHEMA = "v1"
+CACHE_KIND_EXACT = "steps.cache-kind.outputs.kind == 'exact'"
+CACHE_KIND_PUBLISH = "steps.cache-kind.outputs.publish == 'true'"
 NUL_DIFF = 'git diff --name-only --no-renames -z "${trusted_sha}...HEAD"'
 LINE_DIFF = 'git diff --name-only --no-renames "${trusted_sha}...HEAD"'
 SHA40 = re.compile(r"^[0-9a-f]{40}$")
@@ -163,6 +167,20 @@ def check_rust_cache_fork_save_if(
         )
 
 
+def buildkit_cache_key(scope: str) -> str:
+    return (
+        f"{scope}-{BUILDKIT_CACHE_SCHEMA}-"
+        f"${{{{ runner.os }}}}-${{{{ runner.arch }}}}-${{{{ github.sha }}}}"
+    )
+
+
+def buildkit_cache_prefix(scope: str) -> str:
+    return (
+        f"{scope}-{BUILDKIT_CACHE_SCHEMA}-"
+        f"${{{{ runner.os }}}}-${{{{ runner.arch }}}}-"
+    )
+
+
 def check_buildkit_cache_boundary(
     job_body: str,
     source: str,
@@ -173,7 +191,8 @@ def check_buildkit_cache_boundary(
         for step in job_steps(job_body)
         if step_uses(step).startswith(BUILD_PUSH)
     ]
-    trusted = []
+    trusted_publish = []
+    trusted_exact = []
     fork_restore = []
     cold = []
     for step in steps:
@@ -198,7 +217,19 @@ def check_buildkit_cache_boundary(
                 f"{source} must omit cache-to on the fork restore-only BuildKit step",
                 failures,
             )
+            require(
+                CACHE_KIND_EXACT not in condition,
+                f"{source} fork restore-only BuildKit step must not be exact-hit-only",
+                failures,
+            )
             fork_restore.append(step)
+        elif COLD_IS_TRUE in condition and COLD_NOT_TRUE not in condition:
+            require(
+                not has_from and not has_to,
+                f"{source} force-cold BuildKit step must omit cache-from and cache-to",
+                failures,
+            )
+            cold.append(step)
         elif has_to:
             require(
                 FORK_NOT_TRUE in condition and FORK_IS_TRUE not in condition,
@@ -215,23 +246,60 @@ def check_buildkit_cache_boundary(
                 f"{source} trusted-publish BuildKit step must restore cache-from",
                 failures,
             )
-            trusted.append(step)
-        elif COLD_IS_TRUE in condition:
             require(
-                not has_from and not has_to,
-                f"{source} force-cold BuildKit step must omit cache-from and cache-to",
+                CACHE_KIND_PUBLISH in condition,
+                f"{source} trusted-publish BuildKit step must run only on a "
+                "partial match or miss (publish == true)",
                 failures,
             )
-            cold.append(step)
+            require(
+                CACHE_KIND_EXACT not in condition,
+                f"{source} must never export cache-to on an exact github.sha hit",
+                failures,
+            )
+            trusted_publish.append(step)
+        elif has_from and not has_to:
+            require(
+                FORK_NOT_TRUE in condition and FORK_IS_TRUE not in condition,
+                f"{source} trusted exact-hit restore-only BuildKit step must "
+                "exclude fork PRs",
+                failures,
+            )
+            require(
+                COLD_NOT_TRUE in condition,
+                f"{source} trusted exact-hit restore-only BuildKit step must "
+                "not run on force_cold_cache",
+                failures,
+            )
+            require(
+                CACHE_KIND_EXACT in condition,
+                f"{source} trusted exact-hit restore-only BuildKit step must "
+                "require an exact github.sha hit",
+                failures,
+            )
+            require(
+                CACHE_KIND_PUBLISH not in condition,
+                f"{source} trusted exact-hit restore-only BuildKit step must "
+                "not be the publishing path",
+                failures,
+            )
+            trusted_exact.append(step)
         else:
             failures.append(
-                f"{source} has a pinned build-push step that is not a trusted-publish, "
-                "fork restore-only, or force-cold path"
+                f"{source} has a pinned build-push step that is not a trusted "
+                "exact-hit restore-only, trusted-publish, fork restore-only, "
+                "or force-cold path"
             )
     require(
-        bool(trusted),
+        bool(trusted_exact),
+        f"{source} must provide a trusted exact-hit restore-only BuildKit step "
+        "(cache-from, no cache-to, exact github.sha hit)",
+        failures,
+    )
+    require(
+        bool(trusted_publish),
         f"{source} must provide a trusted-publish BuildKit step "
-        "(cache-from + cache-to, excluding fork PRs)",
+        "(cache-from + cache-to, excluding fork PRs and exact hits)",
         failures,
     )
     require(
@@ -296,8 +364,8 @@ def check_local_cache_actions(
         f"found {len(save_steps)}",
         failures,
     )
-    key = f"{scope}-${{{{ runner.os }}}}-${{{{ github.sha }}}}"
-    prefix = f"{scope}-${{{{ runner.os }}}}-"
+    key = buildkit_cache_key(scope)
+    prefix = buildkit_cache_prefix(scope)
     if restore_steps:
         condition = step_if(restore_steps[0])
         with_block = step_with(restore_steps[0])
@@ -322,6 +390,16 @@ def check_local_cache_actions(
             f"{source} cache restore must use restore prefix {prefix}",
             failures,
         )
+        require(
+            "${{ runner.arch }}" in with_block,
+            f"{source} cache restore must be architecture-scoped",
+            failures,
+        )
+        require(
+            BUILDKIT_CACHE_SCHEMA in with_block,
+            f"{source} cache restore must include schema {BUILDKIT_CACHE_SCHEMA}",
+            failures,
+        )
     if save_steps:
         condition = step_if(save_steps[0])
         with_block = step_with(save_steps[0])
@@ -336,10 +414,85 @@ def check_local_cache_actions(
             failures,
         )
         require(
+            CACHE_KIND_PUBLISH in condition,
+            f"{source} cache save must run only after a partial match or miss",
+            failures,
+        )
+        require(
+            CACHE_KIND_EXACT not in condition,
+            f"{source} must never save an immutable cache on an exact github.sha hit",
+            failures,
+        )
+        require(
             f"key: {key}" in with_block,
             f"{source} cache save must use exact key {key}",
             failures,
         )
+
+
+def check_cache_save_preparation(
+    job_body: str,
+    source: str,
+    failures: list[str],
+    *,
+    scope: str,
+) -> None:
+    prepare_steps = [
+        step
+        for step in job_steps(job_body)
+        if "Prepare BuildKit cache for save" in step
+    ]
+    require(
+        len(prepare_steps) == 1,
+        f"{source} must have exactly one Prepare BuildKit cache for save step, "
+        f"found {len(prepare_steps)}",
+        failures,
+    )
+    if not prepare_steps:
+        return
+    step = prepare_steps[0]
+    condition = step_if(step)
+    require(
+        COLD_NOT_TRUE in condition,
+        f"{source} cache-save preparation must skip force_cold_cache",
+        failures,
+    )
+    require(
+        FORK_NOT_TRUE in condition and FORK_IS_TRUE not in condition,
+        f"{source} cache-save preparation must exclude fork PRs",
+        failures,
+    )
+    require(
+        CACHE_KIND_PUBLISH in condition,
+        f"{source} cache-save preparation must run only after a partial match or miss",
+        failures,
+    )
+    require(
+        CACHE_KIND_EXACT not in condition,
+        f"{source} cache-save preparation must not run on an exact github.sha hit",
+        failures,
+    )
+    out_dir = f"{scope}-out"
+    require(
+        out_dir in step,
+        f"{source} cache-save preparation must require the fresh {out_dir} directory",
+        failures,
+    )
+    require(
+        'if [ ! -d "$out" ]' in step or "if [ ! -d \"$out\" ]" in step,
+        f"{source} cache-save preparation must fail when the fresh export is absent",
+        failures,
+    )
+    require(
+        "refusing to save" in step and "stale" in step,
+        f"{source} cache-save preparation must refuse to relabel a stale restore",
+        failures,
+    )
+    require(
+        "present=true" not in step,
+        f"{source} cache-save preparation must not mark a stale destination as present",
+        failures,
+    )
 
 
 def check_cache_telemetry_evidence(job_body: str, source: str, failures: list[str]) -> None:
@@ -359,13 +512,25 @@ def check_cache_telemetry_evidence(job_body: str, source: str, failures: list[st
         failures,
     )
     require(
+        "classify-restore" in job_body,
+        f"{source} must classify actions/cache/restore v4 outputs via classify-restore",
+        failures,
+    )
+    require(
+        "id: cache-kind" in job_body,
+        f"{source} must expose cache-kind outputs for exact vs publish gating",
+        failures,
+    )
+    require(
         "--path" in job_body,
         f"{source} must measure restored bytes from the restored directory",
         failures,
     )
     require(
-        "produced no hit/miss evidence" in job_body,
-        f"{source} must fail closed when restore outputs are missing",
+        "--phase cache-restore" in job_body
+        and "--phase image-build" in job_body
+        and "--phase cache-save" in job_body,
+        f"{source} must time cache-restore, image-build, and cache-save separately",
         failures,
     )
 
@@ -595,6 +760,23 @@ def check_fips(workflow: str, failures: list[str]) -> None:
         failures,
         expected_count=1,
     )
+    for job_body, job_name in (
+        (compile_job, "fips-compile"),
+        (clippy_job, "fips-clippy"),
+        (test_job, "fips-test"),
+    ):
+        require(
+            "sccache-directory-subset" in job_body
+            and "not exposed" in job_body,
+            f"{job_name} must label measured bytes as the sccache-directory "
+            "subset and state that rust-cache archive bytes are not exposed",
+            failures,
+        )
+        require(
+            "--name rust-cache" in job_body,
+            f"{job_name} may still record rust-cache hit/miss from the action output",
+            failures,
+        )
 
 
 def check_production_smoke(workflow: str, failures: list[str]) -> None:
@@ -655,16 +837,16 @@ def check_production_smoke(workflow: str, failures: list[str]) -> None:
     )
     require(
         "type=local" in default_job
-        and "production-dockerfile-smoke-default-${{ runner.os }}-${{ github.sha }}"
-        in default_job,
-        "default production-image job must restore a scoped local BuildKit cache",
+        and buildkit_cache_key("production-dockerfile-smoke-default") in default_job,
+        "default production-image job must restore a schema- and architecture-scoped "
+        "local BuildKit cache",
         failures,
     )
     require(
         "type=local" in ebpf_job
-        and "production-dockerfile-smoke-ebpf-${{ runner.os }}-${{ github.sha }}"
-        in ebpf_job,
-        "eBPF production-image job must restore a scoped local BuildKit cache",
+        and buildkit_cache_key("production-dockerfile-smoke-ebpf") in ebpf_job,
+        "eBPF production-image job must restore a schema- and architecture-scoped "
+        "local BuildKit cache",
         failures,
     )
     check_local_cache_actions(
@@ -674,6 +856,18 @@ def check_production_smoke(workflow: str, failures: list[str]) -> None:
         scope="production-dockerfile-smoke-default",
     )
     check_local_cache_actions(
+        ebpf_job,
+        "production-dockerfile-smoke-ebpf",
+        failures,
+        scope="production-dockerfile-smoke-ebpf",
+    )
+    check_cache_save_preparation(
+        default_job,
+        "production-dockerfile-smoke-default",
+        failures,
+        scope="production-dockerfile-smoke-default",
+    )
+    check_cache_save_preparation(
         ebpf_job,
         "production-dockerfile-smoke-ebpf",
         failures,
@@ -808,6 +1002,21 @@ def check_docs_and_coverage(failures: list[str]) -> None:
         failures,
     )
     require(
+        "runner.arch" in ci_cd and BUILDKIT_CACHE_SCHEMA in ci_cd,
+        "docs/ci_cd.md must document schema- and architecture-scoped BuildKit cache keys",
+        failures,
+    )
+    require(
+        "exact" in ci_cd.lower() and "partial" in ci_cd.lower(),
+        "docs/ci_cd.md must document exact-hit restore-only vs partial/miss publish",
+        failures,
+    )
+    require(
+        "sccache-directory" in ci_cd or "sccache directory subset" in ci_cd.lower(),
+        "docs/ci_cd.md must document that FIPS telemetry measures the sccache subset",
+        failures,
+    )
+    require(
         "type=local" in ci_cd and "restored bytes" in ci_cd.lower(),
         "docs/ci_cd.md must document local BuildKit cache restore-byte measurement",
         failures,
@@ -908,8 +1117,11 @@ def self_test() -> int:
     )
     good_buildkit = (
         "    steps:\n"
+        "      - name: Build ordinary production runtime (trusted exact-hit restore-only)\n"
+        f"        if: {COLD_NOT_TRUE} && {FORK_NOT_TRUE} && {CACHE_KIND_EXACT}\n"
+        f"{build_push}"
         "      - name: Build ordinary production runtime\n"
-        f"        if: {COLD_NOT_TRUE} && {FORK_NOT_TRUE}\n"
+        f"        if: {COLD_NOT_TRUE} && {FORK_NOT_TRUE} && {CACHE_KIND_PUBLISH}\n"
         f"{build_push}"
         "          cache-to: type=local,dest=/tmp/production-dockerfile-smoke-default-out,mode=max\n"
         "      - name: Build ordinary production runtime (fork restore-only)\n"
@@ -970,8 +1182,11 @@ def self_test() -> int:
 
     fork_cache_to = (
         "    steps:\n"
+        "      - name: Build ordinary production runtime (trusted exact-hit restore-only)\n"
+        f"        if: {COLD_NOT_TRUE} && {FORK_NOT_TRUE} && {CACHE_KIND_EXACT}\n"
+        f"{build_push}"
         "      - name: Build ordinary production runtime\n"
-        f"        if: {COLD_NOT_TRUE} && {FORK_NOT_TRUE}\n"
+        f"        if: {COLD_NOT_TRUE} && {FORK_NOT_TRUE} && {CACHE_KIND_PUBLISH}\n"
         f"{build_push}"
         "          cache-to: type=local,dest=/tmp/production-dockerfile-smoke-default-out,mode=max\n"
         "      - name: Build ordinary production runtime (fork restore-only)\n"
@@ -996,6 +1211,40 @@ def self_test() -> int:
             for item in fork_cache_to_failures
         ),
         "self-test: reintroducing cache-to on a fork path must fail",
+        failures,
+    )
+
+    exact_hit_export = (
+        "    steps:\n"
+        "      - name: Build ordinary production runtime (trusted exact-hit restore-only)\n"
+        f"        if: {COLD_NOT_TRUE} && {FORK_NOT_TRUE} && {CACHE_KIND_EXACT}\n"
+        f"{build_push}"
+        "          cache-to: type=local,dest=/tmp/production-dockerfile-smoke-default-out,mode=max\n"
+        "      - name: Build ordinary production runtime\n"
+        f"        if: {COLD_NOT_TRUE} && {FORK_NOT_TRUE} && {CACHE_KIND_PUBLISH}\n"
+        f"{build_push}"
+        "          cache-to: type=local,dest=/tmp/production-dockerfile-smoke-default-out,mode=max\n"
+        "      - name: Build ordinary production runtime (fork restore-only)\n"
+        f"        if: {COLD_NOT_TRUE} && {FORK_IS_TRUE}\n"
+        f"{build_push}"
+        "      - name: Build ordinary production runtime (cold cache)\n"
+        f"        if: {COLD_IS_TRUE}\n"
+        f"        uses: {BUILD_PUSH} # v7\n"
+        "        with:\n"
+        "          provenance: false\n"
+    )
+    exact_hit_export_failures: list[str] = []
+    check_buildkit_cache_boundary(
+        exact_hit_export,
+        "self-test-exact-hit-export",
+        exact_hit_export_failures,
+    )
+    require(
+        any(
+            "never export cache-to on an exact github.sha hit" in item
+            for item in exact_hit_export_failures
+        ),
+        "self-test: exact-hit cache-to/export must fail",
         failures,
     )
 
@@ -1072,17 +1321,17 @@ def self_test() -> int:
         f"        uses: {CACHE_RESTORE} # v4.2.4\n"
         "        with:\n"
         f"          path: /tmp/{scope}\n"
-        f"          key: {scope}-${{{{ runner.os }}}}-${{{{ github.sha }}}}\n"
+        f"          key: {buildkit_cache_key(scope)}\n"
         "          restore-keys: |\n"
-        f"            {scope}-${{{{ runner.os }}}}-\n"
+        f"            {buildkit_cache_prefix(scope)}\n"
     )
     save_step = (
         "      - name: Save BuildKit local cache\n"
-        f"        if: {COLD_NOT_TRUE} && {FORK_NOT_TRUE}\n"
+        f"        if: {COLD_NOT_TRUE} && {FORK_NOT_TRUE} && {CACHE_KIND_PUBLISH}\n"
         f"        uses: {CACHE_SAVE} # v4.2.4\n"
         "        with:\n"
         f"          path: /tmp/{scope}\n"
-        f"          key: {scope}-${{{{ runner.os }}}}-${{{{ github.sha }}}}\n"
+        f"          key: {buildkit_cache_key(scope)}\n"
     )
     good_local = "    steps:\n" + restore_step + save_step
     good_local_failures: list[str] = []
@@ -1100,8 +1349,8 @@ def self_test() -> int:
     )
 
     fork_save = good_local.replace(
-        f"if: {COLD_NOT_TRUE} && {FORK_NOT_TRUE}\n        uses: {CACHE_SAVE}",
-        f"if: {COLD_NOT_TRUE} && {FORK_IS_TRUE}\n        uses: {CACHE_SAVE}",
+        f"if: {COLD_NOT_TRUE} && {FORK_NOT_TRUE} && {CACHE_KIND_PUBLISH}\n        uses: {CACHE_SAVE}",
+        f"if: {COLD_NOT_TRUE} && {FORK_IS_TRUE} && {CACHE_KIND_PUBLISH}\n        uses: {CACHE_SAVE}",
     )
     fork_save_failures: list[str] = []
     check_local_cache_actions(
@@ -1134,8 +1383,8 @@ def self_test() -> int:
     )
 
     cold_save = good_local.replace(
-        f"if: {COLD_NOT_TRUE} && {FORK_NOT_TRUE}\n        uses: {CACHE_SAVE}",
-        f"if: {COLD_IS_TRUE} && {FORK_NOT_TRUE}\n        uses: {CACHE_SAVE}",
+        f"if: {COLD_NOT_TRUE} && {FORK_NOT_TRUE} && {CACHE_KIND_PUBLISH}\n        uses: {CACHE_SAVE}",
+        f"if: {COLD_IS_TRUE} && {FORK_NOT_TRUE} && {CACHE_KIND_PUBLISH}\n        uses: {CACHE_SAVE}",
     )
     cold_save_failures: list[str] = []
     check_local_cache_actions(
@@ -1147,6 +1396,88 @@ def self_test() -> int:
     require(
         any("save must skip force_cold_cache" in item for item in cold_save_failures),
         "self-test: force-cold save must fail",
+        failures,
+    )
+
+    exact_hit_save = good_local.replace(
+        f"if: {COLD_NOT_TRUE} && {FORK_NOT_TRUE} && {CACHE_KIND_PUBLISH}\n        uses: {CACHE_SAVE}",
+        f"if: {COLD_NOT_TRUE} && {FORK_NOT_TRUE} && {CACHE_KIND_EXACT}\n        uses: {CACHE_SAVE}",
+    )
+    exact_hit_save_failures: list[str] = []
+    check_local_cache_actions(
+        exact_hit_save,
+        "self-test-exact-hit-save",
+        exact_hit_save_failures,
+        scope=scope,
+    )
+    require(
+        any(
+            "never save an immutable cache on an exact github.sha hit" in item
+            or "run only after a partial match or miss" in item
+            for item in exact_hit_save_failures
+        ),
+        "self-test: exact-hit cache save must fail",
+        failures,
+    )
+
+    good_prepare = (
+        "    steps:\n"
+        "      - name: Prepare BuildKit cache for save\n"
+        f"        if: {COLD_NOT_TRUE} && {FORK_NOT_TRUE} && {CACHE_KIND_PUBLISH}\n"
+        "        run: |\n"
+        "          set -euo pipefail\n"
+        f'          out="${{RUNNER_TEMP}}/{scope}-out"\n'
+        f'          dest="${{RUNNER_TEMP}}/{scope}"\n'
+        '          if [ ! -d "$out" ]; then\n'
+        '            echo "::error::fresh BuildKit cache export is missing; refusing to save a stale restore" >&2\n'
+        "            exit 1\n"
+        "          fi\n"
+        '          rm -rf "$dest"\n'
+        '          mv "$out" "$dest"\n'
+    )
+    good_prepare_failures: list[str] = []
+    check_cache_save_preparation(
+        good_prepare,
+        "self-test-good-prepare",
+        good_prepare_failures,
+        scope=scope,
+    )
+    require(
+        not good_prepare_failures,
+        "self-test: fail-closed cache-save preparation should pass: "
+        + "; ".join(good_prepare_failures),
+        failures,
+    )
+
+    stale_dest_fallback = (
+        "    steps:\n"
+        "      - name: Prepare BuildKit cache for save\n"
+        f"        if: {COLD_NOT_TRUE} && {FORK_NOT_TRUE} && {CACHE_KIND_PUBLISH}\n"
+        "        run: |\n"
+        "          set -euo pipefail\n"
+        f'          out="${{RUNNER_TEMP}}/{scope}-out"\n'
+        f'          dest="${{RUNNER_TEMP}}/{scope}"\n'
+        '          if [ -d "$out" ]; then\n'
+        '            rm -rf "$dest"\n'
+        '            mv "$out" "$dest"\n'
+        "          fi\n"
+        '          if [ -d "$dest" ]; then\n'
+        '            echo "present=true" >> "$GITHUB_OUTPUT"\n'
+        "          else\n"
+        '            echo "present=false" >> "$GITHUB_OUTPUT"\n'
+        "          fi\n"
+    )
+    stale_dest_failures: list[str] = []
+    check_cache_save_preparation(
+        stale_dest_fallback,
+        "self-test-stale-destination",
+        stale_dest_failures,
+        scope=scope,
+    )
+    require(
+        any("fail when the fresh export is absent" in item for item in stale_dest_failures)
+        and any("stale destination as present" in item for item in stale_dest_failures),
+        "self-test: stale-destination fallback must fail",
         failures,
     )
 

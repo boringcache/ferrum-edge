@@ -302,7 +302,7 @@ jobs:
             --name rust-cache \
             --hit "$CACHE_HIT" \
             --path "${GITHUB_WORKSPACE}/.cache/sccache" \
-            --note "shared-key=ci-fips save-if=non-fork fork=${FORK_PR:-false} toolchain+lockfile+aws-lc"
+            --note "measured=sccache-directory-subset; rust-cache Cargo/target archive bytes are not exposed; shared-key=ci-fips save-if=non-fork fork=${FORK_PR:-false} toolchain+lockfile+aws-lc"
 
       - name: Record cold-cache proof
         if: github.event.inputs.force_cold_cache == 'true'
@@ -406,7 +406,7 @@ jobs:
             --name rust-cache \
             --hit "$CACHE_HIT" \
             --path "${GITHUB_WORKSPACE}/.cache/sccache" \
-            --note "shared-key=ci-fips save-if=non-fork fork=${FORK_PR:-false}"
+            --note "measured=sccache-directory-subset; rust-cache Cargo/target archive bytes are not exposed; shared-key=ci-fips save-if=non-fork fork=${FORK_PR:-false}"
 
       - name: Lint the FIPS profile
         run: |
@@ -469,7 +469,7 @@ jobs:
             --name rust-cache \
             --hit "$CACHE_HIT" \
             --path "${GITHUB_WORKSPACE}/.cache/sccache" \
-            --note "shared-key=ci-fips save-if=non-fork fork=${FORK_PR:-false}"
+            --note "measured=sccache-directory-subset; rust-cache Cargo/target archive bytes are not exposed; shared-key=ci-fips save-if=non-fork fork=${FORK_PR:-false}"
 
       - name: FIPS policy, key-admission, and handshake tests
         # Cargo accepts one TESTNAME filter per invocation. `tls::fips_` selects

@@ -181,6 +181,66 @@ def parse_cache_hit(raw: str | None) -> bool | None:
     raise SystemExit("invalid cache hit value")
 
 
+def format_phase_status(status: object) -> str:
+    """Render a recorded phase status without treating integer 0 as missing.
+
+    `phase.get("status") or 1` is wrong: an explicit 0 is success. Missing or
+    malformed values stay conservative (unknown) rather than looking like ok.
+    """
+    if status is None:
+        return "unknown"
+    if isinstance(status, bool):
+        return "unknown"
+    if isinstance(status, int):
+        return "ok" if status == 0 else "failed"
+    if isinstance(status, str) and SAFE_INT_RE.fullmatch(status.strip()):
+        value = int(status.strip())
+        return "ok" if value == 0 else "failed"
+    return "unknown"
+
+
+def classify_actions_cache_restore(
+    hit_raw: str | None,
+    matched_key: str | None,
+    restored_path: str | None,
+) -> str:
+    """Classify actions/cache/restore v4 outputs.
+
+    Semantics:
+    - cache-hit == 'true' is an exact primary-key hit
+    - cache-hit == 'false' is a restore-key partial match (still a hit)
+    - empty cache-hit is an ordinary miss (first-run / no restore-keys)
+
+    Exact and partial both require a nonempty matched key and an existing
+    restored directory. Empty hit plus empty matched key is a miss.
+    Contradictory or unknown combinations fail closed.
+    """
+    hit_text = (hit_raw or "").strip().lower()
+    matched = (matched_key or "").strip()
+    path = Path(restored_path) if restored_path else None
+    exists = bool(path is not None and path.exists())
+
+    if hit_text == "true":
+        if not matched:
+            raise SystemExit("exact cache hit requires a nonempty matched key")
+        if not exists:
+            raise SystemExit("exact cache hit requires an existing restored directory")
+        return "exact"
+    if hit_text == "false":
+        if not matched:
+            raise SystemExit("partial cache hit requires a nonempty matched key")
+        if not exists:
+            raise SystemExit("partial cache hit requires an existing restored directory")
+        return "partial"
+    if hit_text == "":
+        if matched:
+            raise SystemExit("cache miss cannot include a matched key")
+        return "miss"
+    raise SystemExit(
+        "contradictory or unknown cache restore outputs; produced no hit/miss evidence"
+    )
+
+
 def resolve_restored_bytes(hit: bool | None, args: argparse.Namespace) -> int | None:
     if args.bytes is not None:
         return int(args.bytes)
@@ -218,6 +278,44 @@ def cmd_cache(args: argparse.Namespace) -> int:
         }
     )
     save_state(path, data)
+    return 0
+
+
+def write_github_output(kind: str, publish: bool) -> None:
+    output = os.environ.get("GITHUB_OUTPUT")
+    if not output:
+        return
+    with Path(output).open("a", encoding="utf-8") as handle:
+        handle.write(f"kind={kind}\n")
+        handle.write(f"publish={'true' if publish else 'false'}\n")
+
+
+def cmd_classify_restore(args: argparse.Namespace) -> int:
+    kind = classify_actions_cache_restore(args.hit, args.matched, args.path)
+    publish = kind in {"partial", "miss"}
+    write_github_output(kind, publish)
+    hit_for_row = "false" if kind == "miss" else "true"
+    note_parts = [
+        f"kind={kind}",
+        f"publish={'true' if publish else 'false'}",
+    ]
+    if args.primary:
+        note_parts.append(f"primary={redact(args.primary)}")
+    if args.matched:
+        note_parts.append(f"matched={redact(args.matched)}")
+    if args.note:
+        note_parts.append(args.note)
+    cache_args = argparse.Namespace(
+        name=args.name,
+        hit=hit_for_row,
+        bytes=0 if kind == "miss" else None,
+        path=None if kind == "miss" else args.path,
+        note=" ".join(note_parts),
+    )
+    if cmd_cache(cache_args) != 0:
+        return 1
+    if not args.quiet:
+        print(kind)
     return 0
 
 
@@ -277,7 +375,7 @@ def cmd_summarize(args: argparse.Namespace) -> int:
         for phase in data["phases"]:
             seconds = phase.get("seconds")
             duration = "unknown" if seconds is None else f"{seconds:.1f}s"
-            status = "ok" if int(phase.get("status") or 1) == 0 else "failed"
+            status = format_phase_status(phase.get("status"))
             lines.append(
                 f"| `{redact(str(phase.get('name')))}` | {duration} | {status} |"
             )
@@ -372,6 +470,10 @@ def self_test() -> int:
                 failures.append("explicit telemetry dir must beat RUNNER_TEMP")
             if cmd_init(argparse.Namespace(quiet=True)) != 0:
                 failures.append("init failed")
+            if cmd_start(argparse.Namespace(phase="compile")) != 0:
+                failures.append("start failed")
+            if cmd_end(argparse.Namespace(phase="compile", status=0)) != 0:
+                failures.append("end of successful phase failed")
             if cmd_cache(
                 argparse.Namespace(
                     name="rust-cache",
@@ -401,6 +503,17 @@ def self_test() -> int:
                 failures.append("summary leaked a secret")
             if "rust-cache" not in written or "| hit |" not in written:
                 failures.append("summary omitted cache evidence")
+            if "| `compile` |" not in written or "| ok |" not in written:
+                failures.append("successful status 0 must render as ok, not failed")
+            if "| `compile` |" in written:
+                compile_row = next(
+                    (line for line in written.splitlines() if line.startswith("| `compile` |")),
+                    "",
+                )
+                if "| failed |" in compile_row:
+                    failures.append("status 0 was rendered as failed")
+                if "| ok |" not in compile_row:
+                    failures.append("status 0 row must say ok")
             if "2.0 KiB" not in written:
                 failures.append("summary omitted restored bytes")
             if "`unknown-cache` | unknown | unknown |" not in written:
@@ -432,6 +545,49 @@ def self_test() -> int:
         failures.append("hit without measured bytes must fail rather than invent 0 B")
     except SystemExit:
         pass
+
+    if format_phase_status(0) != "ok":
+        failures.append("integer 0 must render as ok")
+    if format_phase_status(1) != "failed":
+        failures.append("nonzero status must render as failed")
+    if format_phase_status(None) != "unknown":
+        failures.append("missing status must render as unknown")
+    if format_phase_status(True) != "unknown" or format_phase_status(False) != "unknown":
+        failures.append("boolean status must not be treated as 0/1")
+    if format_phase_status("nope") != "unknown":
+        failures.append("malformed status must render as unknown")
+
+    import tempfile as _tempfile
+
+    with _tempfile.TemporaryDirectory() as restore_tmp:
+        restored = Path(restore_tmp) / "cache"
+        restored.mkdir()
+        (restored / "index").write_text("x", encoding="utf-8")
+        missing = Path(restore_tmp) / "missing"
+        try:
+            if classify_actions_cache_restore("true", "scope-v1-Linux-X64-abc", str(restored)) != "exact":
+                failures.append("true + matched key + dir must be exact")
+            if classify_actions_cache_restore("false", "scope-v1-Linux-X64-", str(restored)) != "partial":
+                failures.append("false + matched key + dir must be partial (a hit)")
+            if classify_actions_cache_restore("", "", None) != "miss":
+                failures.append("empty hit + empty matched key must be an ordinary miss")
+            if classify_actions_cache_restore("", "", str(missing)) != "miss":
+                failures.append("first-run empty outputs must be a miss even without a directory")
+        except SystemExit as error:
+            failures.append(f"valid restore tuples must classify: {error}")
+        for label, kwargs in (
+            ("exact-no-key", ("true", "", str(restored))),
+            ("exact-no-dir", ("true", "scope-v1-Linux-X64-abc", str(missing))),
+            ("partial-no-key", ("false", "", str(restored))),
+            ("partial-no-dir", ("false", "scope-v1-Linux-X64-", str(missing))),
+            ("miss-with-key", ("", "scope-v1-Linux-X64-abc", str(restored))),
+            ("unknown-hit", ("maybe", "scope-v1-Linux-X64-abc", str(restored))),
+        ):
+            try:
+                classify_actions_cache_restore(*kwargs)
+                failures.append(f"{label} must fail closed")
+            except SystemExit:
+                pass
 
     for failure in failures:
         print(f"::error::{failure}", file=sys.stderr)
@@ -467,6 +623,16 @@ def main() -> int:
     cache.add_argument("--path", default=None)
     cache.add_argument("--note", default="")
     cache.set_defaults(func=cmd_cache)
+
+    classify = sub.add_parser("classify-restore")
+    classify.add_argument("--name", required=True)
+    classify.add_argument("--hit", default="")
+    classify.add_argument("--matched", default="")
+    classify.add_argument("--primary", default="")
+    classify.add_argument("--path", default=None)
+    classify.add_argument("--note", default="")
+    classify.add_argument("--quiet", action="store_true")
+    classify.set_defaults(func=cmd_classify_restore)
 
     summarize = sub.add_parser("summarize")
     summarize.add_argument("--title", default="CI runtime")

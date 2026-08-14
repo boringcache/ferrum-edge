@@ -94,7 +94,13 @@ so a runner-loss retry can reuse compile work. A `workflow_dispatch` input
 live assertion. Path planning is fail-closed: a missing or unknown trusted
 planner runs the compile gate rather than skipping it. Path planning reads a
 NUL-delimited `git diff --name-only --no-renames -z` listing so a hostile
-filename cannot evade a sensitive prefix.
+filename cannot evade a sensitive prefix. Every compiled `tests/` input is
+sensitive (`cargo clippy --lib --tests` and the handshake binaries). Paths
+that are neither sensitive nor on the explicit non-sensitive allowlist
+force-run; empty, truncated, or unavailable diffs run or fail closed rather
+than skipping. Job summaries record rust-cache hit/miss from the action, but
+measured restored bytes are the sccache-directory subset only; total rust-cache
+archive bytes are not exposed.
 
 ## Current capability
 

@@ -9,6 +9,8 @@ trusted copy, or an unknown suite must run the gate rather than skip it.
 from __future__ import annotations
 
 import argparse
+import html
+import json
 import re
 import sys
 import tempfile
@@ -38,7 +40,8 @@ SUITE_PATTERNS: dict[str, tuple[str, ...]] = {
     ),
     # FIPS compile/clippy/test rebuilds the aws-lc-fips-sys module and the
     # unit/integration binaries that carry the handshake and key-admission
-    # assertions. Feature-policy stays cheap and always runs.
+    # assertions. Feature-policy stays cheap and always runs. Clippy uses
+    # `--lib --tests`, so every compiled tests/ input is sensitive.
     "fips-build": (
         r"^Cargo\.(toml|lock)$",
         r"^rust-toolchain\.toml$",
@@ -49,8 +52,7 @@ SUITE_PATTERNS: dict[str, tuple[str, ...]] = {
         r"^src/",
         r"^custom_plugins/",
         r"^ebpf/",
-        r"^tests/unit/",
-        r"^tests/integration/",
+        r"^tests/",
         r"^docs/fips\.md$",
         r"^\.github/workflows/fips-build\.yml$",
         r"^\.github/scripts/check_fips_feature_policy\.py$",
@@ -63,15 +65,59 @@ SUITE_PATTERNS: dict[str, tuple[str, ...]] = {
     ),
 }
 
+# Known non-sensitive surfaces that may skip when they do not also match a
+# suite's sensitive patterns. Anything neither sensitive nor allowlisted
+# force-runs the live gate. `docs/fips.md` and the FIPS/CI-runtime GitHub
+# paths remain sensitive because those patterns are checked first.
+KNOWN_SAFE_PATTERNS: tuple[str, ...] = (
+    r"^README(\.|$)",
+    r"^CONTRIBUTING",
+    r"^LICENSE",
+    r"^COPYING",
+    r"^NOTICE",
+    r"^AGENTS\.md$",
+    r"^CLAUDE\.md$",
+    r"^CODE_OF_CONDUCT",
+    r"^SECURITY\.md$",
+    r"^docs/",
+    r"^charts/",
+    r"^openapi\.yaml$",
+    r"^perftest/",
+    r"^fuzz/",
+    r"^examples/",
+    r"^deploy/",
+    r"^scripts/",
+    r"^\.agents/",
+    r"^\.claude/",
+    r"^\.vscode/",
+    r"^\.cursor/",
+    r"^\.codex/",
+    r"^\.github/",
+    r"^Dockerfile",
+    r"^ferrum\.conf$",
+    r"^deny\.toml$",
+    r"^\.dockerignore$",
+    r"^\.gitignore$",
+    r"^\.gitattributes$",
+    r"^\.editorconfig$",
+    r"^Makefile$",
+)
+
+# Production images dockerignore `tests/`, so those paths cannot change the
+# image. FIPS clippy/tests compile `tests/`, so FIPS must not allowlist it.
+SUITE_SAFE_PATTERNS: dict[str, tuple[str, ...]] = {
+    "production-dockerfile-smoke": KNOWN_SAFE_PATTERNS + (r"^tests/",),
+    "fips-build": KNOWN_SAFE_PATTERNS,
+}
+
 COMPILED = {
     suite: tuple(re.compile(pattern) for pattern in patterns)
     for suite, patterns in SUITE_PATTERNS.items()
 }
-
-# Tab and newline are valid Git path bytes. Other C0 / DEL controls cannot be
-# trusted for a skip decision: a quoted or split hostile name must never hide a
-# Docker/FIPS-sensitive prefix.
-_ALLOWED_CONTROLS = frozenset({ord("\t"), ord("\n")})
+COMPILED_SAFE = {
+    suite: tuple(re.compile(pattern) for pattern in patterns)
+    for suite, patterns in SUITE_SAFE_PATTERNS.items()
+}
 
 
 class ChangedFilesError(Exception):
@@ -94,9 +140,7 @@ def unsafe_path_reason(path: str) -> str | None:
         return "absolute path"
     for char in path:
         code = ord(char)
-        if code < 32 and code not in _ALLOWED_CONTROLS:
-            return "control character"
-        if code == 127:
+        if code < 32 or code == 127:
             return "control character"
     posix = PurePosixPath(path)
     if posix.is_absolute():
@@ -106,14 +150,23 @@ def unsafe_path_reason(path: str) -> str | None:
     return None
 
 
+def format_path_for_markdown(path: str) -> str:
+    """Render a Git path without giving Markdown/HTML a raw attacker filename.
+
+    JSON-escape (including C0 / non-ASCII) then HTML-escape inside <code>.
+    """
+    encoded = json.dumps(path, ensure_ascii=True)
+    return f"<code>{html.escape(encoded, quote=True)}</code>"
+
+
 def read_changed_files(path: Path) -> list[str]:
     """Parse a NUL-delimited `git diff --name-only --no-renames -z` listing.
 
-    A truncated, undecodable, or unavailable listing fails closed. A decoded
-    but structurally unsafe name (absolute, traversal, disallowed controls)
-    raises UnsafeChangedFiles so the caller can force the suite to run rather
-    than report a successful skip. A valid Git filename containing a newline
-    is one path and is matched against suite prefixes as-is.
+    A truncated or unavailable listing fails closed. Invalid UTF-8, every C0
+    control (including tab/newline), DEL, absolute paths, and traversal names
+    raise UnsafeChangedFiles so the caller force-runs the suite rather than
+    reporting a successful skip. An empty listing is returned as [] and the
+    caller force-runs; it must not skip the expensive gate.
     """
     try:
         raw = path.read_bytes()
@@ -141,9 +194,7 @@ def read_changed_files(path: Path) -> list[str]:
         try:
             text = record.decode("utf-8")
         except UnicodeDecodeError as error:
-            raise ChangedFilesError(
-                f"changed-files is not valid UTF-8: {error}"
-            ) from error
+            raise UnsafeChangedFiles(paths, f"invalid UTF-8: {error}") from error
         reason = unsafe_path_reason(text)
         if reason is not None:
             unsafe_reason = reason
@@ -162,6 +213,67 @@ def matched_files(suite: str, changed_files: list[str]) -> list[str]:
     ]
 
 
+def unknown_files(suite: str, changed_files: list[str]) -> list[str]:
+    if suite not in COMPILED or suite not in COMPILED_SAFE:
+        raise ValueError(f"unknown CI runtime suite: {suite}")
+    sensitive = COMPILED[suite]
+    safe = COMPILED_SAFE[suite]
+    unknown: list[str] = []
+    for path in changed_files:
+        if any(pattern.search(path) for pattern in sensitive):
+            continue
+        if any(pattern.search(path) for pattern in safe):
+            continue
+        unknown.append(path)
+    return unknown
+
+
+def decide_relevance(
+    suite: str,
+    changed: list[str],
+    *,
+    force_run: bool = False,
+    force_unsafe: bool = False,
+    unsafe_reason: str = "",
+) -> tuple[bool, str, list[str]]:
+    matched = matched_files(suite, changed)
+    if force_run:
+        return True, "Forced run (push, merge_group, dispatch, or cold-cache proof).", matched
+    if force_unsafe:
+        return (
+            True,
+            f"Diff contained an unsafe path ({unsafe_reason}); running the live "
+            "gate rather than risking a false skip.",
+            matched,
+        )
+    if not changed:
+        return (
+            True,
+            "Empty diff; running the live gate rather than skipping.",
+            matched,
+        )
+    if matched:
+        return (
+            True,
+            "Diff matches a production-image or FIPS-sensitive path; running the live gate.",
+            matched,
+        )
+    unknown = unknown_files(suite, changed)
+    if unknown:
+        return (
+            True,
+            "Diff contains paths that are neither sensitive nor on the skip "
+            "allowlist; running the live gate.",
+            matched,
+        )
+    return (
+        False,
+        "No sensitive paths matched. The cheap feature-policy / reporting "
+        "jobs still run; the expensive compile/image jobs are skipped.",
+        matched,
+    )
+
+
 def write_summary(
     suite: str, relevant: bool, changed: list[str], matched: list[str], reason: str
 ) -> None:
@@ -176,7 +288,7 @@ def write_summary(
     print()
     if matched:
         for path in matched:
-            print(f"- `{path}`")
+            print(f"- {format_path_for_markdown(path)}")
     else:
         print("(none)")
     print()
@@ -184,7 +296,7 @@ def write_summary(
     print()
     if changed:
         for path in changed:
-            print(f"- `{path}`")
+            print(f"- {format_path_for_markdown(path)}")
     else:
         print("(none)")
 
@@ -229,6 +341,13 @@ def self_test() -> int:
         ("fips-build", ["src/tls/mod.rs"], True),
         ("fips-build", ["tests/unit/tls/fips_policy_tests.rs"], True),
         ("fips-build", ["tests/integration/cp_grpc_handshake_admission_tests.rs"], True),
+        ("fips-build", ["tests/unit_tests.rs"], True),
+        ("fips-build", ["tests/integration_tests.rs"], True),
+        ("fips-build", ["tests/common/mod.rs"], True),
+        ("fips-build", ["tests/scaffolding/harness.rs"], True),
+        ("fips-build", ["tests/fixtures/test_rsa_public.pem"], True),
+        ("fips-build", ["tests/functional/functional_admin_test.rs"], True),
+        ("fips-build", ["tests/k8s/mesh_e2e_sidecar/run.sh"], True),
         ("fips-build", ["Cargo.toml"], True),
         ("fips-build", ["docs/fips.md"], True),
         ("fips-build", [".github/workflows/fips-build.yml"], True),
@@ -236,11 +355,7 @@ def self_test() -> int:
         ("fips-build", [".github/actions/setup-sccache/action.yml"], True),
         ("fips-build", ["docs/ci_cd.md"], False),
         ("fips-build", ["README.md"], False),
-        ("fips-build", ["tests/functional/functional_admin_test.rs"], False),
-        ("fips-build", ["tests/k8s/mesh_e2e_sidecar/run.sh"], False),
         ("fips-build", ["charts/ferrum-mesh/values.yaml"], False),
-        ("production-dockerfile-smoke", [], False),
-        ("fips-build", [], False),
         (
             "production-dockerfile-smoke",
             ["src/\nmain.rs"],
@@ -254,12 +369,12 @@ def self_test() -> int:
         (
             "production-dockerfile-smoke",
             ['"src/main.rs"'],
-            False,
+            True,
         ),
         (
             "production-dockerfile-smoke",
             ['"Dockerfile"'],
-            False,
+            True,
         ),
         (
             "fips-build",
@@ -269,16 +384,53 @@ def self_test() -> int:
     ]
     failures: list[str] = []
     for suite, changed, expected in cases:
-        relevant = bool(matched_files(suite, changed))
+        relevant, _reason, _matched = decide_relevance(suite, changed)
         if relevant != expected:
             failures.append(
                 f"{suite} {changed!r}: expected relevant={expected}, got {relevant}"
             )
+    empty_relevant, empty_reason, _ = decide_relevance("fips-build", [])
+    if not empty_relevant or "Empty diff" not in empty_reason:
+        failures.append("empty diff must force-run, not skip")
+    prod_empty, _, _ = decide_relevance("production-dockerfile-smoke", [])
+    if not prod_empty:
+        failures.append("empty production-image diff must force-run, not skip")
+    unknown_relevant, unknown_reason, _ = decide_relevance(
+        "fips-build", ["brand-new-crate/src/lib.rs"]
+    )
+    if not unknown_relevant or "allowlist" not in unknown_reason:
+        failures.append("unknown valid path must force-run rather than skip")
+    unknown_prod, _, _ = decide_relevance(
+        "production-dockerfile-smoke", ["brand-new-crate/src/lib.rs"]
+    )
+    if not unknown_prod:
+        failures.append("unknown production-image path must force-run rather than skip")
     try:
         matched_files("not-a-suite", ["src/main.rs"])
         failures.append("unknown suite must raise rather than skip")
     except ValueError:
         pass
+
+    rendered = format_path_for_markdown("src/\nmain.rs")
+    if "<code>" not in rendered or "\\n" not in rendered or "\n" in rendered.replace("\\n", ""):
+        failures.append("newline filename must be JSON-escaped inside <code>")
+    tab_rendered = format_path_for_markdown("src/\tmain.rs")
+    if "\\t" not in tab_rendered:
+        failures.append("tab filename must be JSON-escaped")
+    tick_rendered = format_path_for_markdown("src/`rm -rf`/main.rs")
+    if "<code>" not in tick_rendered or "rm -rf" not in tick_rendered:
+        failures.append("backtick filename must stay inside <code>")
+    pipe_rendered = format_path_for_markdown("a|b.md")
+    if "<code>" not in pipe_rendered or "|" not in pipe_rendered:
+        failures.append("pipe filename must be wrapped in <code>")
+    html_rendered = format_path_for_markdown('<img src=x onerror=alert(1)>')
+    if "<img" in html_rendered or "&lt;img" not in html_rendered:
+        failures.append("HTML tag filename must be HTML-escaped")
+    link_rendered = format_path_for_markdown("[click](https://evil.example/)")
+    if "<code>" not in link_rendered or "[click]" not in link_rendered:
+        failures.append("markdown-link filename must be wrapped in <code>")
+    if link_rendered.startswith("[") or "](" in html.unescape(link_rendered).split("<code>", 1)[0]:
+        failures.append("markdown-link filename must not be a raw markdown link")
 
     def _write(payload: bytes) -> Path:
         handle = tempfile.NamedTemporaryFile(delete=False)
@@ -290,21 +442,49 @@ def self_test() -> int:
     try:
         if read_changed_files(empty) != []:
             failures.append("empty diff must parse as no changed files")
+        relevant, reason, _ = decide_relevance("fips-build", read_changed_files(empty))
+        if not relevant:
+            failures.append("empty listing must not yield a successful expensive-gate skip")
+        if "Empty diff" not in reason:
+            failures.append("empty listing reason must say the gate will run")
     finally:
         empty.unlink(missing_ok=True)
 
     newline_path = "src/\nmain.rs"
     newline_file = _write(newline_path.encode("utf-8") + b"\0")
     try:
-        parsed = read_changed_files(newline_file)
-        if parsed != [newline_path]:
-            failures.append(f"newline path must stay one record, got {parsed!r}")
-        elif not matched_files("production-dockerfile-smoke", parsed):
-            failures.append("newline path under src/ must not evade the Docker gate")
-        elif not matched_files("fips-build", parsed):
-            failures.append("newline path under src/ must not evade the FIPS gate")
+        read_changed_files(newline_file)
+        failures.append("newline path must be unsafe and force the gate")
+    except UnsafeChangedFiles as error:
+        if "control" not in error.reason:
+            failures.append(f"newline reason missing: {error.reason}")
+        if error.paths != [newline_path]:
+            failures.append(f"newline path must stay one record, got {error.paths!r}")
+    except ChangedFilesError as error:
+        failures.append(f"newline should force-run, not fail parse: {error}")
     finally:
         newline_file.unlink(missing_ok=True)
+
+    tab_path = "src/\tmain.rs"
+    tab_file = _write(tab_path.encode("utf-8") + b"\0")
+    try:
+        read_changed_files(tab_file)
+        failures.append("tab path must be unsafe and force the gate")
+    except UnsafeChangedFiles as error:
+        if "control" not in error.reason:
+            failures.append(f"tab reason missing: {error.reason}")
+    finally:
+        tab_file.unlink(missing_ok=True)
+
+    del_file = _write(b"src/\x7fmain.rs\0")
+    try:
+        read_changed_files(del_file)
+        failures.append("DEL path must be unsafe and force the gate")
+    except UnsafeChangedFiles as error:
+        if "control" not in error.reason:
+            failures.append(f"DEL reason missing: {error.reason}")
+    finally:
+        del_file.unlink(missing_ok=True)
 
     quoted = _write(b'"src/main.rs"\0')
     try:
@@ -319,9 +499,12 @@ def self_test() -> int:
     invalid_utf8 = _write(b"src/\xffmain.rs\0")
     try:
         read_changed_files(invalid_utf8)
-        failures.append("invalid UTF-8 must fail closed rather than skip")
-    except ChangedFilesError:
-        pass
+        failures.append("invalid UTF-8 must force the gate rather than skip")
+    except UnsafeChangedFiles as error:
+        if "UTF-8" not in error.reason:
+            failures.append(f"invalid UTF-8 reason missing: {error.reason}")
+    except ChangedFilesError as error:
+        failures.append(f"invalid UTF-8 should force-run, not fail parse: {error}")
     finally:
         invalid_utf8.unlink(missing_ok=True)
 
@@ -331,6 +514,8 @@ def self_test() -> int:
         failures.append("missing final NUL must fail closed rather than skip")
     except ChangedFilesError:
         pass
+    except UnsafeChangedFiles:
+        failures.append("truncated NUL stream must fail closed, not look like a decoded path")
     finally:
         truncated.unlink(missing_ok=True)
 
@@ -397,25 +582,16 @@ def main() -> int:
         force_unsafe = True
         unsafe_reason = error.reason
     try:
-        matched = matched_files(args.suite, changed)
+        relevant, reason, matched = decide_relevance(
+            args.suite,
+            changed,
+            force_run=args.force_run,
+            force_unsafe=force_unsafe,
+            unsafe_reason=unsafe_reason,
+        )
     except ValueError as error:
         print(f"::error::{error}", file=sys.stderr)
         return 1
-    relevant = args.force_run or force_unsafe or bool(matched)
-    if args.force_run:
-        reason = "Forced run (push, merge_group, dispatch, or cold-cache proof)."
-    elif force_unsafe:
-        reason = (
-            f"Diff contained an unsafe path ({unsafe_reason}); running the live "
-            "gate rather than risking a false skip."
-        )
-    elif matched:
-        reason = "Diff matches a production-image or FIPS-sensitive path; running the live gate."
-    else:
-        reason = (
-            "No sensitive paths matched. The cheap feature-policy / reporting "
-            "jobs still run; the expensive compile/image jobs are skipped."
-        )
     print(f"relevant={str(relevant).lower()}")
     print(f"matched_count={len(matched)}")
     write_summary(args.suite, relevant, changed, matched, reason)

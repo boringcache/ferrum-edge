@@ -229,18 +229,23 @@ jobs:
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4
 
+      - name: Time cache restore
+        if: github.event.inputs.force_cold_cache != 'true'
+        run: python3 .github/scripts/ci_runtime_telemetry.py start --phase cache-restore
+
       - name: Restore BuildKit local cache
         if: github.event.inputs.force_cold_cache != 'true'
         id: buildkit-cache
         uses: actions/cache/restore@374a27f26986edd8c430f386d152a856e179c0ae # v4.2.4
         with:
           path: ${{ runner.temp }}/production-dockerfile-smoke-default
-          key: production-dockerfile-smoke-default-${{ runner.os }}-${{ github.sha }}
+          key: production-dockerfile-smoke-default-v1-${{ runner.os }}-${{ runner.arch }}-${{ github.sha }}
           restore-keys: |
-            production-dockerfile-smoke-default-${{ runner.os }}-
+            production-dockerfile-smoke-default-v1-${{ runner.os }}-${{ runner.arch }}-
 
-      - name: Record BuildKit cache restore
+      - name: Classify BuildKit cache restore
         if: github.event.inputs.force_cold_cache != 'true'
+        id: cache-kind
         env:
           CACHE_HIT: ${{ steps.buildkit-cache.outputs.cache-hit }}
           CACHE_MATCHED: ${{ steps.buildkit-cache.outputs.cache-matched-key }}
@@ -249,55 +254,53 @@ jobs:
           CACHE_DIR: ${{ runner.temp }}/production-dockerfile-smoke-default
         run: |
           set -euo pipefail
-          python3 .github/scripts/ci_runtime_telemetry.py start --phase image-build
           if [ "${FORK_PR:-}" = true ]; then
             policy=fork-restore-only
           else
             policy=trusted-publish
           fi
-          extra=()
-          if [ "${CACHE_HIT}" = true ]; then
-            hit=true
-            note="exact primary=${CACHE_PRIMARY} fork=${FORK_PR:-false}"
-            extra+=(--path "$CACHE_DIR")
-          elif [ -n "${CACHE_MATCHED}" ]; then
-            hit=true
-            note="prefix matched=${CACHE_MATCHED} primary=${CACHE_PRIMARY} fork=${FORK_PR:-false}"
-            extra+=(--path "$CACHE_DIR")
-          elif [ "${CACHE_HIT}" = false ]; then
-            hit=false
-            note="miss primary=${CACHE_PRIMARY} fork=${FORK_PR:-false}"
-            extra+=(--bytes 0)
-          else
-            echo "::error::BuildKit cache restore produced no hit/miss evidence" >&2
-            exit 1
-          fi
-          if [ "$hit" = true ] && [ ! -e "$CACHE_DIR" ]; then
-            echo "::error::cache hit reported but restore directory is missing" >&2
-            exit 1
-          fi
-          python3 .github/scripts/ci_runtime_telemetry.py cache \
+          python3 .github/scripts/ci_runtime_telemetry.py classify-restore \
             --name buildkit-local \
-            --hit "$hit" \
-            "${extra[@]}" \
-            --note "scope=production-dockerfile-smoke-default policy=${policy} ${note}"
+            --hit "${CACHE_HIT}" \
+            --matched "${CACHE_MATCHED}" \
+            --primary "${CACHE_PRIMARY}" \
+            --path "$CACHE_DIR" \
+            --note "scope=production-dockerfile-smoke-default policy=${policy}"
+
+      - name: Finish cache restore timer
+        if: always() && github.event.inputs.force_cold_cache != 'true'
+        run: python3 .github/scripts/ci_runtime_telemetry.py end --phase cache-restore --status ${{ job.status == 'success' && '0' || '1' }}
 
       - name: Record cold-cache proof
         if: github.event.inputs.force_cold_cache == 'true'
         run: |
-          python3 .github/scripts/ci_runtime_telemetry.py start --phase image-build
           python3 .github/scripts/ci_runtime_telemetry.py cache \
             --name buildkit-local \
             --hit false \
             --bytes 0 \
             --note "scope=production-dockerfile-smoke-default policy=force-cold skipped restore and save"
 
-      # Trusted same-repo PRs and workflow_dispatch restore a scoped local
-      # BuildKit cache and export a replacement for actions/cache/save.
-      # Fork PRs restore that cache and must not export or save.
-      # force_cold_cache skips restore, export, and save.
+      - name: Time image build
+        run: python3 .github/scripts/ci_runtime_telemetry.py start --phase image-build
+
+      # Trusted exact github.sha hits restore cache-from and must not
+      # export or save. Trusted partial matches and misses export mode=max
+      # and save the new exact key. Fork PRs restore and must not export or
+      # save. force_cold_cache skips restore, export, and save.
+      - name: Build ordinary production runtime (trusted exact-hit restore-only)
+        if: github.event.inputs.force_cold_cache != 'true' && github.event.pull_request.head.repo.fork != true && steps.cache-kind.outputs.kind == 'exact'
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7
+        with:
+          context: .
+          file: Dockerfile
+          target: runtime
+          load: true
+          tags: ferrum-edge:production-default-smoke
+          cache-from: type=local,src=${{ runner.temp }}/production-dockerfile-smoke-default
+          provenance: false
+
       - name: Build ordinary production runtime
-        if: github.event.inputs.force_cold_cache != 'true' && github.event.pull_request.head.repo.fork != true
+        if: github.event.inputs.force_cold_cache != 'true' && github.event.pull_request.head.repo.fork != true && steps.cache-kind.outputs.publish == 'true'
         uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7
         with:
           context: .
@@ -332,33 +335,37 @@ jobs:
           tags: ferrum-edge:production-default-smoke
           provenance: false
 
+      - name: Finish image build timer
+        if: always()
+        run: python3 .github/scripts/ci_runtime_telemetry.py end --phase image-build --status ${{ job.status == 'success' && '0' || '1' }}
+
+      - name: Time cache save
+        if: github.event.inputs.force_cold_cache != 'true' && github.event.pull_request.head.repo.fork != true && steps.cache-kind.outputs.publish == 'true'
+        run: python3 .github/scripts/ci_runtime_telemetry.py start --phase cache-save
+
       - name: Prepare BuildKit cache for save
-        if: github.event.inputs.force_cold_cache != 'true' && github.event.pull_request.head.repo.fork != true
-        id: cache-export
+        if: github.event.inputs.force_cold_cache != 'true' && github.event.pull_request.head.repo.fork != true && steps.cache-kind.outputs.publish == 'true'
         run: |
           set -euo pipefail
           out="${RUNNER_TEMP}/production-dockerfile-smoke-default-out"
           dest="${RUNNER_TEMP}/production-dockerfile-smoke-default"
-          if [ -d "$out" ]; then
-            rm -rf "$dest"
-            mv "$out" "$dest"
+          if [ ! -d "$out" ]; then
+            echo "::error::fresh BuildKit cache export is missing; refusing to save a stale restore" >&2
+            exit 1
           fi
-          if [ -d "$dest" ]; then
-            echo "present=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "present=false" >> "$GITHUB_OUTPUT"
-          fi
+          rm -rf "$dest"
+          mv "$out" "$dest"
 
       - name: Save BuildKit local cache
-        if: github.event.inputs.force_cold_cache != 'true' && github.event.pull_request.head.repo.fork != true && steps.cache-export.outputs.present == 'true'
+        if: github.event.inputs.force_cold_cache != 'true' && github.event.pull_request.head.repo.fork != true && steps.cache-kind.outputs.publish == 'true'
         uses: actions/cache/save@374a27f26986edd8c430f386d152a856e179c0ae # v4.2.4
         with:
           path: ${{ runner.temp }}/production-dockerfile-smoke-default
-          key: production-dockerfile-smoke-default-${{ runner.os }}-${{ github.sha }}
+          key: production-dockerfile-smoke-default-v1-${{ runner.os }}-${{ runner.arch }}-${{ github.sha }}
 
-      - name: Finish image build timer
-        if: always()
-        run: python3 .github/scripts/ci_runtime_telemetry.py end --phase image-build --status ${{ job.status == 'success' && '0' || '1' }}
+      - name: Finish cache save timer
+        if: always() && github.event.inputs.force_cold_cache != 'true' && github.event.pull_request.head.repo.fork != true && steps.cache-kind.outputs.publish == 'true'
+        run: python3 .github/scripts/ci_runtime_telemetry.py end --phase cache-save --status ${{ job.status == 'success' && '0' || '1' }}
 
       - name: Verify ordinary distroless runtime contract
         run: |
@@ -419,18 +426,23 @@ jobs:
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4
 
+      - name: Time cache restore
+        if: github.event.inputs.force_cold_cache != 'true'
+        run: python3 .github/scripts/ci_runtime_telemetry.py start --phase cache-restore
+
       - name: Restore BuildKit local cache
         if: github.event.inputs.force_cold_cache != 'true'
         id: buildkit-cache
         uses: actions/cache/restore@374a27f26986edd8c430f386d152a856e179c0ae # v4.2.4
         with:
           path: ${{ runner.temp }}/production-dockerfile-smoke-ebpf
-          key: production-dockerfile-smoke-ebpf-${{ runner.os }}-${{ github.sha }}
+          key: production-dockerfile-smoke-ebpf-v1-${{ runner.os }}-${{ runner.arch }}-${{ github.sha }}
           restore-keys: |
-            production-dockerfile-smoke-ebpf-${{ runner.os }}-
+            production-dockerfile-smoke-ebpf-v1-${{ runner.os }}-${{ runner.arch }}-
 
-      - name: Record BuildKit cache restore
+      - name: Classify BuildKit cache restore
         if: github.event.inputs.force_cold_cache != 'true'
+        id: cache-kind
         env:
           CACHE_HIT: ${{ steps.buildkit-cache.outputs.cache-hit }}
           CACHE_MATCHED: ${{ steps.buildkit-cache.outputs.cache-matched-key }}
@@ -439,55 +451,55 @@ jobs:
           CACHE_DIR: ${{ runner.temp }}/production-dockerfile-smoke-ebpf
         run: |
           set -euo pipefail
-          python3 .github/scripts/ci_runtime_telemetry.py start --phase image-build
           if [ "${FORK_PR:-}" = true ]; then
             policy=fork-restore-only
           else
             policy=trusted-publish
           fi
-          extra=()
-          if [ "${CACHE_HIT}" = true ]; then
-            hit=true
-            note="exact primary=${CACHE_PRIMARY} fork=${FORK_PR:-false}"
-            extra+=(--path "$CACHE_DIR")
-          elif [ -n "${CACHE_MATCHED}" ]; then
-            hit=true
-            note="prefix matched=${CACHE_MATCHED} primary=${CACHE_PRIMARY} fork=${FORK_PR:-false}"
-            extra+=(--path "$CACHE_DIR")
-          elif [ "${CACHE_HIT}" = false ]; then
-            hit=false
-            note="miss primary=${CACHE_PRIMARY} fork=${FORK_PR:-false}"
-            extra+=(--bytes 0)
-          else
-            echo "::error::BuildKit cache restore produced no hit/miss evidence" >&2
-            exit 1
-          fi
-          if [ "$hit" = true ] && [ ! -e "$CACHE_DIR" ]; then
-            echo "::error::cache hit reported but restore directory is missing" >&2
-            exit 1
-          fi
-          python3 .github/scripts/ci_runtime_telemetry.py cache \
+          python3 .github/scripts/ci_runtime_telemetry.py classify-restore \
             --name buildkit-local \
-            --hit "$hit" \
-            "${extra[@]}" \
-            --note "scope=production-dockerfile-smoke-ebpf policy=${policy} ${note}"
+            --hit "${CACHE_HIT}" \
+            --matched "${CACHE_MATCHED}" \
+            --primary "${CACHE_PRIMARY}" \
+            --path "$CACHE_DIR" \
+            --note "scope=production-dockerfile-smoke-ebpf policy=${policy}"
+
+      - name: Finish cache restore timer
+        if: always() && github.event.inputs.force_cold_cache != 'true'
+        run: python3 .github/scripts/ci_runtime_telemetry.py end --phase cache-restore --status ${{ job.status == 'success' && '0' || '1' }}
 
       - name: Record cold-cache proof
         if: github.event.inputs.force_cold_cache == 'true'
         run: |
-          python3 .github/scripts/ci_runtime_telemetry.py start --phase image-build
           python3 .github/scripts/ci_runtime_telemetry.py cache \
             --name buildkit-local \
             --hit false \
             --bytes 0 \
             --note "scope=production-dockerfile-smoke-ebpf policy=force-cold skipped restore and save"
 
-      # Trusted same-repo PRs and workflow_dispatch restore a scoped local
-      # BuildKit cache and export a replacement for actions/cache/save.
-      # Fork PRs restore that cache and must not export or save.
-      # force_cold_cache skips restore, export, and save.
+      - name: Time image build
+        run: python3 .github/scripts/ci_runtime_telemetry.py start --phase image-build
+
+      # Trusted exact github.sha hits restore cache-from and must not
+      # export or save. Trusted partial matches and misses export mode=max
+      # and save the new exact key. Fork PRs restore and must not export or
+      # save. force_cold_cache skips restore, export, and save.
+      - name: Build eBPF production runtime (trusted exact-hit restore-only)
+        if: github.event.inputs.force_cold_cache != 'true' && github.event.pull_request.head.repo.fork != true && steps.cache-kind.outputs.kind == 'exact'
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7
+        with:
+          context: .
+          file: Dockerfile
+          target: runtime-ebpf
+          build-args: |
+            FEATURES=cloud-secrets,ebpf
+          load: true
+          tags: ferrum-edge:production-ebpf-smoke
+          cache-from: type=local,src=${{ runner.temp }}/production-dockerfile-smoke-ebpf
+          provenance: false
+
       - name: Build eBPF production runtime
-        if: github.event.inputs.force_cold_cache != 'true' && github.event.pull_request.head.repo.fork != true
+        if: github.event.inputs.force_cold_cache != 'true' && github.event.pull_request.head.repo.fork != true && steps.cache-kind.outputs.publish == 'true'
         uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7
         with:
           context: .
@@ -528,33 +540,37 @@ jobs:
           tags: ferrum-edge:production-ebpf-smoke
           provenance: false
 
+      - name: Finish image build timer
+        if: always()
+        run: python3 .github/scripts/ci_runtime_telemetry.py end --phase image-build --status ${{ job.status == 'success' && '0' || '1' }}
+
+      - name: Time cache save
+        if: github.event.inputs.force_cold_cache != 'true' && github.event.pull_request.head.repo.fork != true && steps.cache-kind.outputs.publish == 'true'
+        run: python3 .github/scripts/ci_runtime_telemetry.py start --phase cache-save
+
       - name: Prepare BuildKit cache for save
-        if: github.event.inputs.force_cold_cache != 'true' && github.event.pull_request.head.repo.fork != true
-        id: cache-export
+        if: github.event.inputs.force_cold_cache != 'true' && github.event.pull_request.head.repo.fork != true && steps.cache-kind.outputs.publish == 'true'
         run: |
           set -euo pipefail
           out="${RUNNER_TEMP}/production-dockerfile-smoke-ebpf-out"
           dest="${RUNNER_TEMP}/production-dockerfile-smoke-ebpf"
-          if [ -d "$out" ]; then
-            rm -rf "$dest"
-            mv "$out" "$dest"
+          if [ ! -d "$out" ]; then
+            echo "::error::fresh BuildKit cache export is missing; refusing to save a stale restore" >&2
+            exit 1
           fi
-          if [ -d "$dest" ]; then
-            echo "present=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "present=false" >> "$GITHUB_OUTPUT"
-          fi
+          rm -rf "$dest"
+          mv "$out" "$dest"
 
       - name: Save BuildKit local cache
-        if: github.event.inputs.force_cold_cache != 'true' && github.event.pull_request.head.repo.fork != true && steps.cache-export.outputs.present == 'true'
+        if: github.event.inputs.force_cold_cache != 'true' && github.event.pull_request.head.repo.fork != true && steps.cache-kind.outputs.publish == 'true'
         uses: actions/cache/save@374a27f26986edd8c430f386d152a856e179c0ae # v4.2.4
         with:
           path: ${{ runner.temp }}/production-dockerfile-smoke-ebpf
-          key: production-dockerfile-smoke-ebpf-${{ runner.os }}-${{ github.sha }}
+          key: production-dockerfile-smoke-ebpf-v1-${{ runner.os }}-${{ runner.arch }}-${{ github.sha }}
 
-      - name: Finish image build timer
-        if: always()
-        run: python3 .github/scripts/ci_runtime_telemetry.py end --phase image-build --status ${{ job.status == 'success' && '0' || '1' }}
+      - name: Finish cache save timer
+        if: always() && github.event.inputs.force_cold_cache != 'true' && github.event.pull_request.head.repo.fork != true && steps.cache-kind.outputs.publish == 'true'
+        run: python3 .github/scripts/ci_runtime_telemetry.py end --phase cache-save --status ${{ job.status == 'success' && '0' || '1' }}
 
       - name: Verify eBPF distroless runtime contract
         run: |
@@ -632,8 +648,10 @@ jobs:
             echo "## Production Dockerfile eBPF image smoke"
             echo ""
             echo "Ordinary \`runtime\` and distroless \`runtime-ebpf\` images built in parallel"
-            echo "through BuildKit. Trusted runs restore and save a scoped local BuildKit cache"
-            echo "via pinned \`actions/cache/restore\` and \`actions/cache/save\`; fork pull"
+            echo "through BuildKit. Trusted exact \`${{ github.sha }}\` hits restore a scoped"
+            echo "local BuildKit cache and do not export or save. Trusted partial matches"
+            echo "and misses export \`mode=max\` and save the new exact key via pinned"
+            echo "\`actions/cache/restore\` and \`actions/cache/save\`; fork pull"
             echo "requests restore that cache and do not save. Distroless inventories passed."
             echo ""
             echo "Warm PR target: <=30 minutes, p95 <=45 minutes, measured on hosted runs."

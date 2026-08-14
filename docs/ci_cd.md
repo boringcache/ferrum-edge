@@ -235,22 +235,40 @@ timeouts.
 
 **Production images.** The ordinary `runtime` and distroless `runtime-ebpf`
 targets build in parallel with `docker/build-push-action`. Each job restores a
-scoped local BuildKit cache through pinned `actions/cache/restore`
-(`production-dockerfile-smoke-default-${{ runner.os }}-${{ github.sha }}` /
-`production-dockerfile-smoke-ebpf-${{ runner.os }}-${{ github.sha }}`, with
-matching `${{ runner.os }}-` restore prefixes), then exports `type=local`
-layers. Trusted same-repository pull requests and `workflow_dispatch` save that
-directory with pinned `actions/cache/save` using the same exact keys. Fork pull
-requests restore and must not have a save or cache-publication step.
-`force_cold_cache` skips restore and save. Job summaries record the restore
-action's `cache-hit` / `cache-matched-key` outputs and the measured restored
-directory size; unknown is never rendered as a miss or `0 B`. The Dockerfile
-declares `ARG FEATURES` after the shared apt and manifest layers so those two
-feature sets reuse toolchain work. A trusted-base copy of
+schema- and architecture-scoped local BuildKit cache (`type=local`) through pinned
+`actions/cache/restore`. Cache keys are
+`production-dockerfile-smoke-{default,ebpf}-v1-${{ runner.os }}-${{ runner.arch }}-${{ github.sha }}`
+with matching `v1-${{ runner.os }}-${{ runner.arch }}-` restore prefixes. The `v1`
+component is the BuildKit cache schema; bump it only when the exported layout
+changes.
+
+`actions/cache/restore` v4 outputs are classified strictly: `cache-hit == 'true'`
+is an exact primary-key hit; `cache-hit == 'false'` is a restore-key partial
+match (still a hit); empty `cache-hit` plus empty `cache-matched-key` is an
+ordinary miss. Exact and partial hits require a nonempty matched key and an
+existing restored directory; contradictory tuples fail closed.
+
+Trusted same-repository pull requests and `workflow_dispatch` never export or
+save on an exact `${{ github.sha }}` hit: that path builds restore-only with
+`cache-from` and no `cache-to`/`actions/cache/save`, so it does not pay for a
+`mode=max` export or upload. Only a partial match or miss uses the publishing
+BuildKit step, exports a fresh `*-out` directory, and saves the new exact key.
+The cache-save preparation step requires that fresh export and fails rather than
+relabeling the restored/stale destination. Fork pull requests restore and must
+not have a save or cache-publication step. `force_cold_cache` skips restore and
+save. Job summaries time cache-restore, image-build/export, and cache-save
+separately, and record the restore action's classified hit kind plus the
+measured restored directory size; unknown is never rendered as a miss or `0 B`.
+The Dockerfile declares `ARG FEATURES` after the shared apt and manifest layers
+so those two feature sets reuse toolchain work. A trusted-base copy of
 `.github/scripts/ci_runtime_plan.py` reads a NUL-delimited
-`git diff --name-only --no-renames -z` listing and skips the smoke only when
-every decoded path is safe and none can change those images; a missing planner,
-a truncated/undecodable listing, or an unsafe path fails closed toward running.
+`git diff --name-only --no-renames -z` listing. Skip only when every decoded
+path is safe, none is sensitive, and every remaining path is on the explicit
+non-sensitive allowlist; a missing planner, a truncated listing, an empty
+listing, an unknown path, or an unsafe path (every C0 control including
+tab/newline, DEL, invalid UTF-8, absolute, traversal) fails closed toward
+running. Filenames in the plan summary are JSON-escaped then HTML-escaped
+inside `<code>` so a hostile name cannot break Markdown.
 
 **FIPS.** `FIPS Feature Policy` stays a cheap always-on graph audit.
 Compile, claimed-profile `cargo check`, clippy `-D warnings`, and the
@@ -260,7 +278,10 @@ restore in parallel. rust-cache `save-if` is false for fork pull requests, so
 those jobs restore `ci-fips` and cannot save. Trusted runs keep
 `cache-on-failure` so a runner-loss retry (exit 143 after a green suite) can
 reuse compile work. Example plugins stay out of the FIPS artifact
-(`FERRUM_CUSTOM_PLUGINS` is unset).
+(`FERRUM_CUSTOM_PLUGINS` is unset). Job summaries record rust-cache hit/miss
+from the action output, but measured restored bytes are the sccache-directory
+subset (`.cache/sccache`) only; rust-cache also restores Cargo and
+target state, and those archive bytes are not exposed.
 
 **Trust boundary.** Untrusted `run:` steps never receive GitHub Actions cache
 write credentials. `setup-sccache` keeps the sccache GHA backend disabled and
