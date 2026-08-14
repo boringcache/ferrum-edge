@@ -2927,6 +2927,25 @@ async fn test_hmac_v2_backend_sees_exactly_one_mutation_for_a_replayed_request()
     .await
     .unwrap();
 
+    // Populate proxy_plugins so the runtime snapshot attaches hmac_auth.
+    update_proxy(
+        &client,
+        admin_url,
+        &auth_header,
+        &json!({
+            "id": "proxy-hmac-v2",
+            "listen_path": "/hmacv2",
+            "backend_scheme": "http",
+            "backend_host": "localhost",
+            "backend_port": backend_port,
+            "strip_listen_path": true,
+            "auth_mode": "single",
+            "plugins": [{"plugin_config_id": "plugin-hmac-v2"}]
+        }),
+    )
+    .await
+    .unwrap();
+
     let url = format!("{}/hmacv2", proxy_url);
     wait_until_hmac_v2_route_and_plugin_active(&client, &url).await;
 
