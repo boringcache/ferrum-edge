@@ -347,8 +347,7 @@ struct NodeWaypointUdpSessionSource {
 /// on the single-claimant direct-node-address boundary.
 #[derive(Clone)]
 struct NodeWaypointUdpSessionDestination {
-    router:
-        Arc<crate::proxy::node_waypoint_udp_destination::NodeWaypointUdpDestinationRouter>,
+    router: Arc<crate::proxy::node_waypoint_udp_destination::NodeWaypointUdpDestinationRouter>,
     destination: IpAddr,
     owner: Arc<NamespacedResourceId>,
 }
@@ -357,10 +356,8 @@ impl NodeWaypointUdpSessionDestination {
     #[inline]
     fn revalidate(
         &self,
-    ) -> Result<
-        (),
-        crate::proxy::node_waypoint_udp_destination::NodeWaypointUdpDestinationRefusal,
-    > {
+    ) -> Result<(), crate::proxy::node_waypoint_udp_destination::NodeWaypointUdpDestinationRefusal>
+    {
         self.router
             .revalidate_owner(self.destination, self.owner.as_ref())
             .map(|_| ())
@@ -3622,13 +3619,11 @@ async fn process_new_session_datagram(
         session_key.destination_owner.as_ref(),
     ) {
         (None, None, None) => None,
-        (Some(router), Some(destination), Some(owner)) => {
-            Some(NodeWaypointUdpSessionDestination {
-                router,
-                destination,
-                owner: Arc::clone(owner),
-            })
-        }
+        (Some(router), Some(destination), Some(owner)) => Some(NodeWaypointUdpSessionDestination {
+            router,
+            destination,
+            owner: Arc::clone(owner),
+        }),
         _ => {
             return Err(anyhow::anyhow!(
                 "invalid NodeWaypoint UDP destination ownership state"

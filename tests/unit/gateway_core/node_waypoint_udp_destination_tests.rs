@@ -438,14 +438,8 @@ fn equivalent_owner_identity_survives_route_table_republication() {
 fn established_destination_owner_is_revalidated_across_publications() {
     let router = NodeWaypointUdpDestinationRouter::new(5353);
     let destination = ip("10.96.0.10");
-    let owner_a = NamespacedResourceId::new(
-        "team-a",
-        "__mesh-nw-udp-team-a-dns-a-5353",
-    );
-    let owner_b = NamespacedResourceId::new(
-        "team-b",
-        "__mesh-nw-udp-team-b-dns-b-5353",
-    );
+    let owner_a = NamespacedResourceId::new("team-a", "__mesh-nw-udp-team-a-dns-a-5353");
+    let owner_b = NamespacedResourceId::new("team-b", "__mesh-nw-udp-team-b-dns-b-5353");
 
     router
         .publish(vec![route_in(

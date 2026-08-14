@@ -413,11 +413,7 @@ impl NodeWaypointUdpDestinationRouter {
     /// exact destination ownership is no longer current. Kept separate from
     /// [`Self::warn_refusal`] so diagnostics never claim that no session was
     /// allocated when a live session is being fenced.
-    pub fn warn_session_refusal(
-        &self,
-        proxy_id: &str,
-        refusal: NodeWaypointUdpDestinationRefusal,
-    ) {
+    pub fn warn_session_refusal(&self, proxy_id: &str, refusal: NodeWaypointUdpDestinationRefusal) {
         let n = self.refusals.fetch_add(1, Ordering::Relaxed) + 1;
         if n == 1 || n.is_multiple_of(100) {
             warn!(
