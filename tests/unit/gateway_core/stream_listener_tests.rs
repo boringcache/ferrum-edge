@@ -3043,10 +3043,20 @@ async fn node_waypoint_udp_retract_a_keeps_shared_listener_and_b_route() {
         vec!["10.96.0.11".parse::<IpAddr>().expect("ip b")],
         "only B's ClusterIP may remain after A is retracted"
     );
-    assert_eq!(owners_after_table.len(), 1);
-    assert!(
-        owners_after_table[0].id.contains("udp-demux-b"),
-        "the surviving route owner must be B: {owners_after_table:?}"
+    let namespace = ferrum_edge::config::types::default_namespace();
+    let expected_b = NamespacedResourceId::new(
+        namespace.clone(),
+        ferrum_edge::modes::mesh::node_waypoint_udp_proxy_id(
+            &namespace,
+            "udp-demux-b",
+            port,
+        )
+        .expect("test service names are admitted Kubernetes identities"),
+    );
+    assert_eq!(
+        owners_after_table,
+        vec![expected_b],
+        "the surviving route owner must be exactly B"
     );
     assert!(
         steering
