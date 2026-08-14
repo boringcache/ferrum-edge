@@ -140,8 +140,12 @@ fn h3_plain_bridge_source_routes_mesh_through_shared_helper() {
         "the reqwest HTTP/1 pending lane must skip mesh egress via the shared predicate"
     );
     assert!(
-        plain.contains("proxy_h3_plain_http_mesh_buffered("),
-        "mesh-tagged plain attempts must share the H1/H2 mesh helper"
+        plain.contains("boxed_proxy_h3_plain_http_mesh_buffered("),
+        "mesh-tagged plain attempts must share the boxed H1/H2 mesh helper"
+    );
+    assert!(
+        !plain.contains("crate::proxy::proxy_h3_plain_http_mesh_buffered("),
+        "H3 plain mesh dispatch must not materialize the helper in the bridge poll frame"
     );
     assert!(
         plain.contains("select_next_cross_protocol_retry_target("),
@@ -333,8 +337,12 @@ fn native_h3_forces_mesh_tagged_targets_onto_bridge() {
         "native H3 pool selection must force mesh onto the bridge"
     );
     assert!(
-        src.contains("proxy_h3_plain_http_mesh_buffered("),
-        "native buffered retry must dispatch mesh via the shared helper"
+        src.contains("boxed_proxy_h3_plain_http_mesh_buffered("),
+        "native buffered retry must dispatch mesh via the boxed shared helper"
+    );
+    assert!(
+        !src.contains("crate::proxy::proxy_h3_plain_http_mesh_buffered("),
+        "native buffered retry must not materialize the helper in handle_h3_request"
     );
 }
 
@@ -361,10 +369,39 @@ fn shared_mesh_plain_helper_never_plaintext_falls_back() {
         "the H3-only boxing boundary must be constructed out of line"
     );
     assert!(
+        src.contains("#[inline(never)]\npub(crate) fn boxed_proxy_h3_plain_http_mesh_buffered<'a>("),
+        "the H3 plain mesh helper itself must be constructed out of line at the bridge call sites"
+    );
+    assert!(
         src.contains("type MeshRetryDispatchOutcome = (")
             && src.contains("type BoxedMeshRetryDispatchFuture<'a> =")
-            && src.contains(") -> BoxedMeshRetryDispatchFuture<'a> {"),
+            && src.contains(") -> BoxedMeshRetryDispatchFuture<'a> {")
+            && src.contains("type BoxedH3PlainHttpMeshBufferedFuture<'a> =")
+            && src.contains(") -> BoxedH3PlainHttpMeshBufferedFuture<'a> {"),
         "H3 boxed mesh retry must use the mesh-retry outcome, not the Unix dispatch tuple"
+    );
+    let mesh_retry = src
+        .split("async fn proxy_to_backend_mesh_retry(")
+        .nth(1)
+        .expect("mesh retry helper")
+        .split("/// Whether a plain-HTTP / WebSocket H3 attempt must ride a mesh egress")
+        .next()
+        .expect("bounded mesh retry helper");
+    assert!(
+        mesh_retry.contains("boxed_proxy_to_backend_hbone(")
+            && mesh_retry.contains("boxed_proxy_to_backend_mesh_mtls("),
+        "mesh retry must box both HBONE and Sidecar mTLS children out of its poll frame"
+    );
+    assert!(
+        !mesh_retry.contains("\n        proxy_to_backend_hbone(")
+            && !mesh_retry.contains("\n        proxy_to_backend_mesh_mtls("),
+        "mesh retry must not await the large transport futures inline"
+    );
+    assert!(
+        src.contains("#[inline(never)]\nfn boxed_proxy_to_backend_hbone<'a>(")
+            && src.contains("#[inline(never)]\nfn boxed_proxy_to_backend_mesh_mtls<'a>(")
+            && src.contains("type BoxedMeshTransportDispatchFuture<'a> ="),
+        "HBONE / Sidecar mesh-retry children must be constructed out of line"
     );
     let boxed = src
         .split("fn boxed_proxy_to_backend_mesh_retry<'a>(")

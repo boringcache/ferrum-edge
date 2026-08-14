@@ -39160,8 +39160,12 @@ async fn proxy_to_backend_mesh_retry(
     };
     let route_request_body_limit = request_ctx.route_request_body_limit();
     let route_response_body_limit = request_ctx.route_response_body_limit();
-    let (response, _, request_body_exceeded) = if dispatch_hbone {
-        proxy_to_backend_hbone(
+    // Constructed out of line and boxed — see `boxed_proxy_to_backend_hbone`
+    // / `boxed_proxy_to_backend_mesh_mtls`. A `mesh.unix_socket` target is
+    // refused before any retry dispatch, so the Sidecar arm never carries a
+    // Unix path here.
+    let mesh_dispatch = if dispatch_hbone {
+        boxed_proxy_to_backend_hbone(
             state,
             proxy,
             backend_url,
@@ -39181,9 +39185,8 @@ async fn proxy_to_backend_mesh_retry(
             route_request_body_limit,
             route_response_body_limit,
         )
-        .await
     } else {
-        proxy_to_backend_mesh_mtls(
+        boxed_proxy_to_backend_mesh_mtls(
             state,
             proxy,
             backend_url,
@@ -39202,13 +39205,10 @@ async fn proxy_to_backend_mesh_retry(
             ctx_bytes_sent_observed,
             route_request_body_limit,
             route_response_body_limit,
-            // Mesh transport only: this helper is reached exclusively for
-            // `mesh.hbone`/`mesh.mtls` targets. A `mesh.unix_socket` target is
-            // refused before any retry dispatch.
             None,
         )
-        .await
     };
+    let (response, _, request_body_exceeded) = mesh_dispatch.await;
     (
         response,
         request_body_exceeded,
@@ -39261,18 +39261,134 @@ type MeshRetryDispatchOutcome = (
 type BoxedMeshRetryDispatchFuture<'a> =
     std::pin::Pin<Box<dyn std::future::Future<Output = MeshRetryDispatchOutcome> + Send + 'a>>;
 
-/// The H3 plain mesh dispatch future, constructed out of line and returned
-/// boxed so its shared HBONE / Sidecar mesh-mTLS retry future is not an inline
-/// frame slot in the H3 bridge.
+/// One HBONE / Sidecar mesh-mTLS child future, heap-allocated so it is not a
+/// frame slot in [`proxy_to_backend_mesh_retry`]. See
+/// [`boxed_proxy_to_backend_hbone`].
+type BoxedMeshTransportDispatchFuture<'a> =
+    std::pin::Pin<Box<dyn std::future::Future<Output = BackendDispatchOutcome> + Send + 'a>>;
+
+/// The HBONE dispatch future, constructed out of line and returned boxed so it
+/// is not an inline frame slot in [`proxy_to_backend_mesh_retry`].
 ///
 /// This is the same stack-budget invariant as [`boxed_proxy_to_backend_unix`].
-/// In an unoptimized hosted functional-test build, materializing
-/// `proxy_to_backend_mesh_retry` inside `proxy_h3_plain_http_mesh_buffered`
-/// nests both large mesh transport futures beneath the already-large H3 plain
-/// bridge poll frame. A healthy transport reaches that deep poll chain and can
-/// exhaust Tokio's worker stack; early Unix and identity refusals return before
-/// it and are unaffected. Building the future in this `#[inline(never)]`
-/// factory lets the H3 helper retain only a boxed pointer. The allocation is
+/// `proxy_to_backend_mesh_retry` is the shared HBONE / Sidecar retry helper:
+/// H1/H2 awaits it directly, and the H3 plain bridge awaits it through
+/// [`boxed_proxy_to_backend_mesh_retry`]. In an unoptimized hosted
+/// functional-test build (`opt-level = 0`), awaiting `proxy_to_backend_hbone`
+/// and `proxy_to_backend_mesh_mtls` inline in that helper materializes both
+/// large transport futures as poll/construction slots in one coroutine. A
+/// healthy H3 plain mesh attempt then stacks those slots under the already-large
+/// H3 request / `dispatch_plain` frames and overflows a Tokio worker;
+/// early Unix and identity refusals return before it and are unaffected.
+/// Building each child in a separate `#[inline(never)]` factory that RETURNS
+/// before anything is awaited keeps the helper's frame to a boxed pointer.
+/// The allocation is confined to a mesh retry that has already selected HBONE.
+#[allow(clippy::too_many_arguments)]
+#[inline(never)]
+fn boxed_proxy_to_backend_hbone<'a>(
+    state: &'a ProxyState,
+    proxy: &'a Proxy,
+    backend_url: &'a str,
+    method: &'a str,
+    headers: &'a HashMap<String, String>,
+    client_request_body: MeshClientRequestBody,
+    upstream_target: Option<&'a UpstreamTarget>,
+    plugins: &'a [Arc<dyn Plugin>],
+    source_identity_ctx: Option<&'a RequestContext>,
+    ctx: Option<&'a RequestContext>,
+    stream_response: bool,
+    client_ip: &'a str,
+    xff_append_ip: &'a str,
+    request_is_secure: bool,
+    resolved_ip: Option<String>,
+    ctx_bytes_sent_observed: &'a Arc<std::sync::atomic::AtomicU64>,
+    route_request_body_limit: Option<usize>,
+    route_response_body_limit: Option<usize>,
+) -> BoxedMeshTransportDispatchFuture<'a> {
+    Box::pin(proxy_to_backend_hbone(
+        state,
+        proxy,
+        backend_url,
+        method,
+        headers,
+        client_request_body,
+        upstream_target,
+        plugins,
+        source_identity_ctx,
+        ctx,
+        stream_response,
+        client_ip,
+        xff_append_ip,
+        request_is_secure,
+        resolved_ip,
+        ctx_bytes_sent_observed,
+        route_request_body_limit,
+        route_response_body_limit,
+    ))
+}
+
+/// The Sidecar mesh-mTLS dispatch future, constructed out of line and returned
+/// boxed so it is not an inline frame slot in [`proxy_to_backend_mesh_retry`].
+///
+/// Same stack-budget invariant as [`boxed_proxy_to_backend_hbone`], for the
+/// other child of the shared retry helper. This is the non-Unix Sidecar arm;
+/// Unix h2c ingress keeps [`boxed_proxy_to_backend_unix_h2c`]. The allocation
+/// is confined to a mesh retry that has already selected Sidecar mTLS.
+#[allow(clippy::too_many_arguments)]
+#[inline(never)]
+fn boxed_proxy_to_backend_mesh_mtls<'a>(
+    state: &'a ProxyState,
+    proxy: &'a Proxy,
+    backend_url: &'a str,
+    method: &'a str,
+    headers: &'a HashMap<String, String>,
+    client_request_body: MeshClientRequestBody,
+    upstream_target: Option<&'a UpstreamTarget>,
+    plugins: &'a [Arc<dyn Plugin>],
+    request_ctx: &'a RequestContext,
+    response_decision_ctx: Option<&'a RequestContext>,
+    stream_response: bool,
+    client_ip: &'a str,
+    xff_append_ip: &'a str,
+    request_is_secure: bool,
+    resolved_ip: Option<String>,
+    ctx_bytes_sent_observed: &'a Arc<std::sync::atomic::AtomicU64>,
+    route_request_body_limit: Option<usize>,
+    route_response_body_limit: Option<usize>,
+    unix_socket_path: Option<&'a str>,
+) -> BoxedMeshTransportDispatchFuture<'a> {
+    Box::pin(proxy_to_backend_mesh_mtls(
+        state,
+        proxy,
+        backend_url,
+        method,
+        headers,
+        client_request_body,
+        upstream_target,
+        plugins,
+        request_ctx,
+        response_decision_ctx,
+        stream_response,
+        client_ip,
+        xff_append_ip,
+        request_is_secure,
+        resolved_ip,
+        ctx_bytes_sent_observed,
+        route_request_body_limit,
+        route_response_body_limit,
+        unix_socket_path,
+    ))
+}
+
+/// The shared mesh-retry future, constructed out of line and returned boxed so
+/// it is not an inline frame slot in [`proxy_h3_plain_http_mesh_buffered`].
+///
+/// Same stack-budget invariant as [`boxed_proxy_to_backend_unix`]. HBONE /
+/// Sidecar children are themselves boxed out of the retry helper
+/// ([`boxed_proxy_to_backend_hbone`] / [`boxed_proxy_to_backend_mesh_mtls`]).
+/// This factory keeps the helper's remaining retry future off the H3 plain
+/// helper frame; [`boxed_proxy_h3_plain_http_mesh_buffered`] then keeps that
+/// helper off `dispatch_plain` / `handle_h3_request`. The allocation is
 /// confined to H3 plain requests that already require a secured mesh bridge.
 #[allow(clippy::too_many_arguments)]
 #[inline(never)]
@@ -39405,6 +39521,59 @@ pub(crate) async fn proxy_h3_plain_http_mesh_buffered(
         request_body_exceeded,
         streaming_h2_read_timeout_ms,
     )
+}
+
+/// One H3 plain mesh helper future, heap-allocated so it is not a frame slot
+/// in the H3 bridge. See [`boxed_proxy_h3_plain_http_mesh_buffered`].
+type BoxedH3PlainHttpMeshBufferedFuture<'a> =
+    std::pin::Pin<Box<dyn std::future::Future<Output = retry::BackendResponse> + Send + 'a>>;
+
+/// The H3 plain mesh helper, CONSTRUCTED OUT OF LINE and returned boxed.
+///
+/// Same stack-budget invariant as [`boxed_proxy_to_backend_unix`] (issue
+/// #3764). `dispatch_plain` and the native-H3 buffered retry loop in
+/// `handle_h3_request` are the H3 poll frames every plain mesh attempt walks
+/// through. A bare `.await` of [`proxy_h3_plain_http_mesh_buffered`] at those
+/// call sites still materializes the helper into a temporary belonging to
+/// that parent poll frame. In an unoptimized hosted functional-test build
+/// that parent is already large, and a healthy HBONE / Sidecar attempt
+/// reaches the helper; boxing AT the call site is not enough.
+///
+/// Building the future in this `#[inline(never)]` factory that RETURNS before
+/// anything is awaited keeps the large temporary off the deep H3 poll stack:
+/// each call site stores only a pointer. The cost is one allocation, and only
+/// when an H3 plain attempt has already selected secured mesh egress. Do not
+/// fold this back into the call sites without re-measuring those frames.
+#[allow(clippy::too_many_arguments)]
+#[inline(never)]
+pub(crate) fn boxed_proxy_h3_plain_http_mesh_buffered<'a>(
+    state: &'a ProxyState,
+    proxy: &'a Proxy,
+    backend_url: &'a str,
+    method: &'a str,
+    headers: &'a HashMap<String, String>,
+    body: Bytes,
+    upstream_target: &'a UpstreamTarget,
+    plugins: &'a [Arc<dyn Plugin>],
+    request_ctx: &'a RequestContext,
+    client_ip: &'a str,
+    xff_append_ip: &'a str,
+    request_is_secure: bool,
+) -> BoxedH3PlainHttpMeshBufferedFuture<'a> {
+    Box::pin(proxy_h3_plain_http_mesh_buffered(
+        state,
+        proxy,
+        backend_url,
+        method,
+        headers,
+        body,
+        upstream_target,
+        plugins,
+        request_ctx,
+        client_ip,
+        xff_append_ip,
+        request_is_secure,
+    ))
 }
 
 /// Fold the mesh-retry side channel into the buffered H3 response.

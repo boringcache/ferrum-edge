@@ -7730,9 +7730,10 @@ async fn handle_h3_request(
                     .filter(|target| crate::proxy::target_requires_http_mesh_egress(target))
                 {
                     // Mesh-tagged rotation: share the H1/H2 HBONE /
-                    // Sidecar mesh-mTLS pools (issue #3620).
+                    // Sidecar mesh-mTLS pools (issue #3620). Boxed out of
+                    // line — see `boxed_proxy_h3_plain_http_mesh_buffered`.
                     h3_buffered_result_from_backend_response(
-                        crate::proxy::proxy_h3_plain_http_mesh_buffered(
+                        crate::proxy::boxed_proxy_h3_plain_http_mesh_buffered(
                             &state,
                             attempt_dispatch_proxy.as_ref(),
                             &current_url,

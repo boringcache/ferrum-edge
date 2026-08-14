@@ -57,8 +57,12 @@ fn h3_plain_bridge_dispatches_mesh_through_shared_pools() {
         "the shared per-attempt policy gate must refuse Unix targets, not all mesh tags"
     );
     assert!(
-        plain.contains("proxy_h3_plain_http_mesh_buffered("),
-        "mesh-tagged plain attempts must dial through the shared mesh helper"
+        plain.contains("boxed_proxy_h3_plain_http_mesh_buffered("),
+        "mesh-tagged plain attempts must dial through the boxed shared mesh helper"
+    );
+    assert!(
+        !plain.contains("crate::proxy::proxy_h3_plain_http_mesh_buffered("),
+        "H3 plain mesh dispatch must not materialize the helper in the bridge poll frame"
     );
     assert!(
         plain.contains("select_next_cross_protocol_retry_target("),
