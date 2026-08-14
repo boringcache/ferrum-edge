@@ -4568,9 +4568,8 @@ pub mod _test_support {
     pub use crate::plugins::utils::redis_rate_limiter::RedisWindowProgress;
     pub use crate::plugins::utils::redis_rate_limiter::{
         MemoryPolicyScreen, ReplaySetNxReplyError, classify_memory_info,
-        classify_replay_set_nx_reply,
-        is_cluster_topology_code, is_cluster_topology_error, parse_cluster_enabled,
-        parse_memory_policy_fields,
+        classify_replay_set_nx_reply, is_cluster_topology_code, is_cluster_topology_error,
+        parse_cluster_enabled, parse_memory_policy_fields,
     };
 
     // ── plugins/utils/rate_limit (Redis failure policy) ──────────────────────

@@ -1713,9 +1713,7 @@ pub enum ReplaySetNxReplyError {
 }
 
 #[doc(hidden)]
-pub fn classify_replay_set_nx_reply(
-    reply: Option<&str>,
-) -> Result<bool, ReplaySetNxReplyError> {
+pub fn classify_replay_set_nx_reply(reply: Option<&str>) -> Result<bool, ReplaySetNxReplyError> {
     match reply {
         Some("OK") => Ok(true),
         None => Ok(false),
