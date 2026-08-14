@@ -197,8 +197,9 @@ paths:
         `logging`, `kafka_logging`, and `ai_transcript_audit` admitted capture
         ceilings, fixed-cardinality `jwks_trust` aggregates, the bounded
         `gateway_listeners` realization status, and the DP
-        `dp_config` staleness diagnostic, and the CP `cp_dp_trust` reload
-        diagnostic — are
+        `dp_config` staleness diagnostic, the CP `cp_dp_trust` reload
+        diagnostic, and the bounded `replay_authority` shared single-use
+        aggregate — are
         returned only when the caller presents a valid admin JWT, a matching
         `FERRUM_METRICS_BEARER_TOKEN`, or originates from
         `FERRUM_METRICS_ALLOWED_CIDRS`.
@@ -12362,8 +12363,8 @@ components:
         `config_rejected`, `mesh`, `listener_failures`, `gateway_listeners`,
         `logging`,
         `kafka_logging`, `ai_transcript_audit`, `audit_pipeline`, `jwks_trust`,
-        `service_discovery`, `dp_config`, `cp_dp_trust`) are present only when
-        the caller is
+        `service_discovery`, `dp_config`, `cp_dp_trust`, `replay_authority`) are
+        present only when the caller is
         authenticated (admin JWT, metrics bearer token, or allowlisted CIDR).
       required: [status, ready]
       properties:
@@ -12406,7 +12407,12 @@ components:
             or a `withdraw` upstream whose withdrawal publication is still
             retrying, also reports `unavailable`; it clears as soon as a fresh
             snapshot is admitted or the withdrawal publishes, without a config
-            reload.
+            reload. A `shared` single-use replay authority (`jwks_auth`
+            `dpop_replay_scope: shared`, `hmac_auth` `replay_scope: shared`)
+            whose backend is currently unavailable reports `unavailable` too:
+            those policies have no local fallback, so every protected request on
+            them is failing closed. It clears as soon as the backend recovers,
+            with no restart and no config reload — see `replay_authority`.
         ready:
           type: boolean
           description: |
@@ -12416,7 +12422,9 @@ components:
             store is past its maximum-stale deadline AND no service-discovery
             upstream using the `fail_readiness` staleness policy is expired AND
             no expired `withdraw` upstream still has stale targets installed
-            because its withdrawal publication is retrying. A recoverable
+            because its withdrawal publication is retrying AND no live plugin
+            generation's `shared` single-use replay authority is currently
+            unavailable. A recoverable
             dynamic Gateway API listener failure also sets `ready: false` when
             `FERRUM_GATEWAY_LISTENER_FAILURE_FAILS_READINESS=true`; it is ready
             by default. While `false`, the
@@ -12689,6 +12697,50 @@ components:
           $ref: "#/components/schemas/DpConfigFreshnessSnapshot"
         cp_dp_trust:
           $ref: "#/components/schemas/CpDpTrustReloadSnapshot"
+        replay_authority:
+          $ref: "#/components/schemas/SharedReplayAuthorityHealth"
+
+    SharedReplayAuthorityHealth:
+      type: object
+      description: |
+        Detailed observability for the shared single-use replay authority that
+        backs `jwks_auth` `require_dpop` proofs and `hmac_auth`'s
+        `ferrum-hmac-v2` nonces (issues #3834 / #3837). Present only when at
+        least one live plugin generation declared `shared` replay scope.
+
+        Exactly two fixed-cardinality integers. There is deliberately no
+        endpoint, host, namespace, plugin id, provider, key prefix, credential,
+        marker, or backend error text here, and the aggregate does not grow with
+        configuration size.
+
+        A `shared` policy has no local fallback by design, so while
+        `shared_authorities_unavailable` is greater than zero every protected
+        request on those policies fails closed. Readiness therefore fails
+        (`ready: false`, HTTP 503, `status: "unavailable"`) until the backend
+        recovers; the Redis client's background recovery checker republishes
+        availability and the next probe is ready again with no restart and no
+        config reload. Retired plugin generations are not counted: counts are
+        published on lifecycle transitions into a packed atomic that probes
+        load in O(1), so a rebuilt plugin cache neither keeps an old
+        generation's backend in the aggregate nor lets it hold readiness down.
+      required: [shared_authorities, shared_authorities_unavailable]
+      properties:
+        shared_authorities:
+          type: integer
+          format: uint64
+          description: >-
+            Distinct shared replay authorities held by live plugin generations.
+            One `jwks_auth` plugin generation shares one backend across every
+            `shared` provider, so it counts once.
+          example: 1
+        shared_authorities_unavailable:
+          type: integer
+          format: uint64
+          description: >-
+            How many of those are currently unavailable (timed out, partitioned,
+            refused authentication, or proven to be an unsupported topology).
+            Non-zero fails readiness.
+          example: 0
 
     CpDpTrustReloadSnapshot:
       type: object
@@ -14033,7 +14085,7 @@ components:
     # ── Runtime metrics ─────────────────────────────────────────────
     RuntimeMetricsSnapshot:
       type: object
-      required: [timestamp, uptime_seconds, mode, ferrum_version, system, http, errors, dns, connections, logs, plugin_triggers, authorization_lifetime, overload]
+      required: [timestamp, uptime_seconds, mode, ferrum_version, system, http, errors, dns, connections, logs, plugin_triggers, replay_authority, authorization_lifetime, overload]
       properties:
         timestamp:
           type: string
@@ -14060,10 +14112,89 @@ components:
           $ref: "#/components/schemas/RuntimeLogsSnapshot"
         plugin_triggers:
           $ref: "#/components/schemas/RuntimePluginTriggerSnapshot"
+        replay_authority:
+          $ref: "#/components/schemas/RuntimeReplayAuthoritySnapshot"
         authorization_lifetime:
           $ref: "#/components/schemas/RuntimeAuthorizationLifetimeSnapshot"
         overload:
           $ref: "#/components/schemas/OverloadSnapshot"
+
+    RuntimeReplayAuthoritySnapshot:
+      type: object
+      description: |
+        Fixed-cardinality counters for the shared single-use replay authority
+        that backs `hmac_auth` `ferrum-hmac-v2` nonces and `jwks_auth` RFC 9449
+        DPoP proofs. These counters carry no labels: no namespace, plugin id,
+        provider, consumer, issuer, JWK thumbprint, nonce, replay marker, route,
+        or backend error text is ever recorded. All fields are monotonic for the
+        process lifetime except `shared_authorities`, `shared_authorities_unavailable`,
+        and `process_lanes`, which are current cardinalities.
+      required:
+        - replay_rejected
+        - capacity_refused
+        - authority_unavailable
+        - admitted_process
+        - admitted_shared
+        - legacy_unsafe_profile_accepted
+        - shared_authorities_unavailable
+        - shared_authorities
+        - process_lanes
+      properties:
+        replay_rejected:
+          type: integer
+          format: uint64
+          description: |
+            Protected requests refused because the exact proof had already been
+            admitted inside its protection interval.
+        capacity_refused:
+          type: integer
+          format: uint64
+          description: |
+            Protected requests refused because replay state was full and no
+            expired marker slot could be reclaimed. A live (unexpired) marker is
+            never evicted to admit a new request, so capacity pressure degrades
+            into refusal rather than into silent unprotection.
+        authority_unavailable:
+          type: integer
+          format: uint64
+          description: |
+            Protected requests refused because the replay authority timed out,
+            was partitioned, refused authentication, returned corrupt data, or
+            was otherwise uncertain. There is no fallback to local acceptance or
+            to freshness-only acceptance.
+        admitted_process:
+          type: integer
+          format: uint64
+          description: Markers admitted against a process-local (single-process) lane.
+        admitted_shared:
+          type: integer
+          format: uint64
+          description: Markers admitted against the shared (cross-replica) authority.
+        legacy_unsafe_profile_accepted:
+          type: integer
+          format: uint64
+          description: |
+            Requests accepted under an explicitly unsafe legacy freshness-only
+            signing profile (`hmac_auth` `signing_profile: ferrum-hmac-v1` with
+            `allow_unsafe_replayable_v1: true`), which provides no single-use
+            guarantee. A nonzero value means a deployment still depends on it.
+        shared_authorities_unavailable:
+          type: integer
+          format: uint64
+          description: |
+            Registered shared replay authorities whose backend is currently
+            unavailable. Nonzero means protected requests on those policies are
+            failing closed.
+        shared_authorities:
+          type: integer
+          format: uint64
+          description: Registered shared replay authorities.
+        process_lanes:
+          type: integer
+          format: uint64
+          description: |
+            Live process replay lanes. Bounded; lane creation fails closed at the
+            process cap rather than dropping replay history.
 
     RuntimeAuthorizationLifetimeSnapshot:
       type: object
@@ -17695,7 +17826,17 @@ components:
                 description: Inline JWKS JSON string or object
               issuer:
                 type: string
-                description: Expected JWT iss claim — routes tokens to this provider
+                description: >-
+                  Expected JWT iss claim — routes tokens to this provider.
+                  Required and must be nonblank when require_dpop is true: the
+                  DPoP replay realm is this exact issuer, so key-set or JWKS
+                  source rotation cannot reopen a proof. Issuers are compared
+                  exactly and are not URL-canonicalized. Providers in one
+                  policy that share this exact issuer share one replay realm
+                  and must agree on require_dpop; when DPoP is required they
+                  must also agree on dpop_replay_scope and, for process scope,
+                  dpop_replay_max_entries. A non-DPoP sibling for the same
+                  issuer is refused as a bearer-only bypass.
               audience:
                 type: string
                 description: Expected JWT aud claim
@@ -17773,21 +17914,56 @@ components:
               require_dpop:
                 type: boolean
                 default: false
-                description: Require and validate an RFC 9449 DPoP proof
+                description: >-
+                  Require and validate an RFC 9449 DPoP proof. Requires a
+                  nonblank exact issuer (the replay realm) and
+                  dpop_replay_scope, because an accepted proof must be made
+                  single-use against a declared replay authority. Equivalent
+                  providers that share one exact issuer must agree on this
+                  flag; matching order would otherwise let a sibling skip the
+                  proof.
               dpop_clock_skew_secs:
                 type: integer
                 format: uint64
                 default: 30
-                description: DPoP iat/exp clock skew allowance in seconds
-              dpop_jti_cache_max_entries:
+                minimum: 0
+                maximum: 300
+                description: >-
+                  DPoP iat/exp clock skew allowance in seconds. Bounded because
+                  the fixed replay retention horizon (601s) is derived from twice
+                  this ceiling, so no reload can shorten an already-admitted
+                  proof's protection.
+              dpop_replay_scope:
+                type: string
+                enum: [process, shared]
+                description: >-
+                  Required when require_dpop is true; there is no default. Use
+                  'shared' together with sync_mode 'redis' for any deployment
+                  running more than one gateway replica: every replica then
+                  claims each proof through one atomic Redis SET NX EX. Use
+                  'process' to declare a single-process deployment whose replay
+                  protection is stable across equivalent reloads but explicitly
+                  not cross-replica. There is no fallback between them — a
+                  shared-backend timeout, partition, authentication failure, or
+                  capacity failure rejects the protected request. Equivalent
+                  DPoP providers that share a replay domain must declare the
+                  same value; a mixed process/shared pair is refused even when
+                  Redis is configured, because matching order would otherwise
+                  claim the same proof once in the process store and once in
+                  Redis.
+              dpop_replay_max_entries:
                 type: integer
-                default: 10000
-                description: Maximum entries in the per-provider DPoP replay cache
-              dpop_jti_ttl_secs:
-                type: integer
-                format: uint64
-                default: 300
-                description: DPoP jti replay cache TTL in seconds
+                minimum: 1
+                default: 100000
+                description: >-
+                  Capacity this process-scoped authority enforces against the
+                  shared replay lane. At capacity only expired markers are
+                  reclaimed; if none can be, the request is refused (503)
+                  rather than a live marker evicted. Repeated full-live
+                  refusals are O(1) until an expiry is actually due. An
+                  equivalent reload applies the new cap without forgetting live
+                  markers. Duplicate equivalent providers that share a replay
+                  domain must declare the same value. Ignored for 'shared'.
               jwks_max_stale_seconds:
                 type: integer
                 format: uint64
@@ -17856,6 +18032,57 @@ components:
             Maximum monotonic age of the last validated non-empty remote JWKS.
             Cached keys fail closed at this deadline even if refreshes keep
             failing or return empty. Zero is invalid and cannot disable expiry.
+        sync_mode:
+          type: string
+          enum: [local, redis]
+          default: local
+          description: >-
+            DPoP replay-marker storage. 'redis' is required by (and only valid
+            with) at least one provider declaring dpop_replay_scope 'shared'; it
+            is what makes DPoP replay protection cross-replica. Any
+            RESP-compatible single-endpoint server works (Redis Cluster is not
+            supported and is screened, not assumed).
+        redis_url:
+          type: string
+          minLength: 1
+          pattern: '^rediss?://[^/?#\s]+(?:[/?#][^\s]*)?$'
+          description: "Redis connection URL with a redis:// or rediss:// scheme and a non-empty authority/hostname. Required when sync_mode is 'redis'."
+        redis_tls:
+          type: boolean
+          default: false
+          description: "Enable TLS for the Redis connection. CA verification uses gateway-level FERRUM_TLS_CA_BUNDLE_PATH; skip-verify uses FERRUM_TLS_NO_VERIFY."
+        redis_key_prefix:
+          type: string
+          minLength: 1
+          description: >-
+            Key prefix for shared DPoP replay markers. Must be non-empty when
+            supplied. Defaults to
+            `{FERRUM_NAMESPACE}:jwks_auth:{plugin-config-id}`, which isolates
+            independent policies inside a namespace while keeping every replica
+            of one policy claiming against the same keyspace. An explicit prefix
+            is the opt-in for deliberately sharing a keyspace across policies.
+        redis_pool_size:
+          type: integer
+          minimum: 1
+          maximum: 128
+          default: 4
+          description: Number of multiplexed Redis connections. Must be between 1 and 128.
+        redis_connect_timeout_seconds:
+          type: integer
+          minimum: 1
+          default: 5
+          description: Redis connection timeout in seconds. Must be greater than zero.
+        redis_health_check_interval_seconds:
+          type: integer
+          minimum: 1
+          default: 5
+          description: Health check ping interval when Redis is unavailable. Must be greater than zero.
+        redis_username:
+          type: string
+          description: Redis username for ACL authentication
+        redis_password:
+          type: string
+          description: Redis password
 
     Oauth2IntrospectionConfig:
       type: object
@@ -18491,23 +18718,133 @@ components:
 
     HmacAuthConfig:
       type: object
+      additionalProperties: false
       description: >-
         Plugin: hmac_auth — Ferrum-specific versioned HMAC authorization with
         mandatory request-body integrity protection. RFC 9530 defines
         Content-Digest; this is not RFC 9421 HTTP Message Signatures. Requests
         must include Digest or Content-Digest matching the original body.
-        Version 1 signs the matched proxy namespace, credential identity,
-        normalized authority, method, path, raw query, Date, and literal digest
-        value. HBONE CONNECT and
+        The signing base's FIRST field is the profile version, so a signature
+        produced under one profile can never verify under another.
+        `ferrum-hmac-v2` (the default) signs the profile version, matched proxy
+        namespace, credential identity, normalized authority, method, raw path,
+        raw query, Date, literal digest value, and a mandatory client nonce, and
+        makes each accepted request single-use by claiming that nonce against a
+        declared replay authority before backend dispatch. A verbatim transport
+        retry is therefore a replay and is rejected; safe retries send a fresh
+        nonce with a recomputed signature. HBONE CONNECT and
         request-body-transformer compositions fail closed. The
-        pre-authentication body path has a 10 MiB hard ceiling. Date provides a
-        bounded freshness window, not single-use replay prevention.
+        pre-authentication body path has a 10 MiB hard ceiling.
       properties:
         clock_skew_seconds:
           type: integer
           format: uint64
           default: 300
-          description: Maximum allowed clock skew in seconds for the Date header freshness window. The Date header bounds replay to this window but does not prevent in-window replay (no nonce store); keep it tight for non-idempotent routes.
+          minimum: 1
+          maximum: 300
+          description: >-
+            Maximum allowed clock skew in seconds for the Date header freshness
+            window. Bounded because the fixed replay retention horizon (601s) is
+            derived from twice this ceiling, so no reload can shorten an
+            already-admitted request's protection. Under the legacy
+            ferrum-hmac-v1 profile this window is also exactly how long a
+            captured valid request stays replayable.
+        signing_profile:
+          type: string
+          enum: [ferrum-hmac-v2, ferrum-hmac-v1]
+          default: ferrum-hmac-v2
+          description: >-
+            Versioned signing profile. 'ferrum-hmac-v2' requires a client nonce
+            in the Authorization parameters, binds it into the signature, and
+            makes each signed request single-use. 'ferrum-hmac-v1' is
+            freshness-only — a captured valid request can be replayed verbatim
+            for the whole clock_skew_seconds window — and additionally requires
+            allow_unsafe_replayable_v1 true. v1 rejects a nonce parameter
+            outright rather than ignoring one.
+        allow_unsafe_replayable_v1:
+          type: boolean
+          default: false
+          description: >-
+            Explicit acknowledgement that ferrum-hmac-v1 provides no replay
+            protection and is unsuitable for non-idempotent routes. Required
+            with signing_profile 'ferrum-hmac-v1' and rejected otherwise, so the
+            unsafe profile can never be reached by a copied snippet or a typo.
+            Every acceptance under it increments the unlabeled
+            legacy_unsafe_profile_accepted runtime counter.
+        replay_scope:
+          type: string
+          enum: [process, shared]
+          description: >-
+            Required for ferrum-hmac-v2 and rejected for ferrum-hmac-v1; there is
+            no default. Use 'shared' together with sync_mode 'redis' for any
+            deployment running more than one gateway replica: every replica then
+            claims each nonce through one atomic Redis SET NX EX. Use 'process'
+            to declare a single-process deployment whose replay protection is
+            stable across equivalent reloads but explicitly not cross-replica.
+            There is no fallback between them — a shared-backend timeout,
+            partition, authentication failure, or capacity failure rejects the
+            request instead of falling back to freshness-only acceptance.
+        replay_max_entries:
+          type: integer
+          minimum: 1
+          default: 100000
+          description: >-
+            Capacity this process-scoped authority enforces against the shared
+            replay lane. At capacity only expired markers are reclaimed; if none
+            can be, the request is refused (503) rather than a live marker
+            evicted. Repeated full-live refusals are O(1) until an expiry is
+            actually due. An equivalent reload applies the new cap without
+            forgetting live markers. Ignored for 'shared'.
+        sync_mode:
+          type: string
+          enum: [local, redis]
+          default: local
+          description: >-
+            Replay-marker storage. 'redis' is required by (and only valid with)
+            replay_scope 'shared'; it is what makes replay protection
+            cross-replica. Any RESP-compatible single-endpoint server works
+            (Redis Cluster is not supported and is screened, not assumed).
+        redis_url:
+          type: string
+          minLength: 1
+          pattern: '^rediss?://[^/?#\s]+(?:[/?#][^\s]*)?$'
+          description: "Redis connection URL with a redis:// or rediss:// scheme and a non-empty authority/hostname. Required when sync_mode is 'redis'."
+        redis_tls:
+          type: boolean
+          default: false
+          description: "Enable TLS for the Redis connection. CA verification uses gateway-level FERRUM_TLS_CA_BUNDLE_PATH; skip-verify uses FERRUM_TLS_NO_VERIFY."
+        redis_key_prefix:
+          type: string
+          minLength: 1
+          description: >-
+            Key prefix for shared replay markers. Must be non-empty when
+            supplied. Defaults to
+            `{FERRUM_NAMESPACE}:hmac_auth:{plugin-config-id}`, which isolates
+            independent policies inside a namespace while keeping every replica
+            of one policy claiming against the same keyspace. An explicit prefix
+            is the opt-in for deliberately sharing a keyspace across policies.
+        redis_pool_size:
+          type: integer
+          minimum: 1
+          maximum: 128
+          default: 4
+          description: Number of multiplexed Redis connections. Must be between 1 and 128.
+        redis_connect_timeout_seconds:
+          type: integer
+          minimum: 1
+          default: 5
+          description: Redis connection timeout in seconds. Must be greater than zero.
+        redis_health_check_interval_seconds:
+          type: integer
+          minimum: 1
+          default: 5
+          description: Health check ping interval when Redis is unavailable. Must be greater than zero.
+        redis_username:
+          type: string
+          description: Redis username for ACL authentication
+        redis_password:
+          type: string
+          description: Redis password
 
     # ── Mesh / Service-Mesh Plugins ─────────────────────────────────
     # These plugins are primarily auto-injected by mesh mode (sidecar / ambient /
