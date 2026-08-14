@@ -302,6 +302,20 @@ only on `relevant == 'false'`, run expensive jobs only on `relevant == 'true'`,
 and fail closed when planning succeeds but the output is blank or malformed
 (neither exact `true` nor exact `false`).
 
+The same trusted plan job emits a second exact boolean,
+`node_waypoint_relevant`, from the `node-waypoint-ebpf-live` planner suite.
+That suite keeps the pre-#3888 NodeWaypoint path scope (eBPF, node-agent,
+mesh/HBONE, chart, harness, and the original specific `src/` files). Ordinary
+`src/**`, `vendor/**`, `.cargo/**`, `rust-toolchain.toml`, and
+`custom_plugins/**` changes still start the workflow for production-image
+smoke, but skip the 120-minute Kind/eBPF live job unless they also match that
+prior scope. The live job uses `if: always() &&
+needs.production-dockerfile-plan.outputs.node_waypoint_relevant != 'false'`:
+GitHub skip-propagation is defeated with `always()`, and a trustworthy exact
+`false` is the only skip. A missing trusted planner (adoption PR), planner
+failure, unknown path, or blank/malformed NodeWaypoint verdict fails closed
+toward running.
+
 ## CI Pipeline (ci.yml)
 
 The CI workflow is triggered by every pull request, every merge-queue
@@ -618,12 +632,18 @@ the shared-types test runs on stable Rust.
 
 **Runs**: `ubuntu-24.04`
 
-`node-waypoint-ebpf-live` runs on PRs that touch eBPF, node-agent, NodeWaypoint
-identity, netns capture, socket option, TCP scope, chart, live harness files, or
-any production-Dockerfile build input (`src/**`, `vendor/**`,
+`node-waypoint-ebpf-live` still runs on PRs that match its **prior** path
+scope: eBPF, node-agent, NodeWaypoint identity, netns capture, socket option,
+TCP/HBONE mesh, chart, live harness files, and the original specific `src/`
+paths. The workflow `pull_request.paths` trigger remains a **superset** of
+every production-Dockerfile smoke input (`src/**`, `vendor/**`,
 `custom_plugins/**`, `.cargo/**`, `rust-toolchain.toml`, and the other planner
-sensitive paths). Its `pull_request.paths` trigger is a superset of those
-planner inputs so production-image changes always reach the trusted planner.
+sensitive paths) so those changes always reach the trusted planner. The
+expensive Kind/eBPF job is gated separately by `node_waypoint_relevant` from
+that planner: `if: always() &&
+needs.production-dockerfile-plan.outputs.node_waypoint_relevant != 'false'`.
+Unrelated production-image-only paths skip the live cluster; planner failure,
+a missing trusted copy, or a blank/malformed verdict cannot skip it.
 It builds the normal runtime Docker image from the host-built binary, builds the
 eBPF userspace binary with `FEATURES=cloud-secrets,ebpf`, builds the
 `ferrum-ebpf` BPF ELF with nightly Rust, and packages the `:<tag>-ebpf` runtime

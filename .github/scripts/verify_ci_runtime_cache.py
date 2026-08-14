@@ -16,7 +16,11 @@ import re
 import sys
 from pathlib import Path
 
-from ci_runtime_plan import SUITE_PATTERNS, self_test as plan_self_test
+from ci_runtime_plan import (
+    SUITE_PATTERNS,
+    decide_relevance,
+    self_test as plan_self_test,
+)
 from ci_runtime_telemetry import self_test as telemetry_self_test
 
 
@@ -42,6 +46,13 @@ CACHE_KIND_EXACT = "steps.cache-kind.outputs.kind == 'exact'"
 CACHE_KIND_PUBLISH = "steps.cache-kind.outputs.publish == 'true'"
 NUL_DIFF = 'git diff --name-only --no-renames -z "${trusted_sha}...HEAD"'
 LINE_DIFF = 'git diff --name-only --no-renames "${trusted_sha}...HEAD"'
+NODE_WAYPOINT_PLANNER_OUTPUT = (
+    "needs.production-dockerfile-plan.outputs.node_waypoint_relevant"
+)
+NODE_WAYPOINT_LIVE_IF = (
+    "always() && "
+    "needs.production-dockerfile-plan.outputs.node_waypoint_relevant != 'false'"
+)
 SHA40 = re.compile(r"^[0-9a-f]{40}$")
 USES = re.compile(
     r"^\s*(?:-\s*)?uses:\s*(?P<ref>\S+)",
@@ -150,6 +161,255 @@ def check_production_trigger_superset(
         not uncovered,
         f"{source} pull_request.paths must be a superset of production-dockerfile-smoke "
         f"sensitive inputs; uncovered probes: {', '.join(uncovered)}",
+        failures,
+    )
+
+
+def job_if(job_body: str) -> str:
+    match = re.search(r"(?m)^    if:\s*(.+)\s*$", job_body)
+    if match:
+        return match.group(1).strip()
+    return ""
+
+
+def node_waypoint_probe_paths() -> list[str]:
+    probes: list[str] = []
+    for pattern in SUITE_PATTERNS["node-waypoint-ebpf-live"]:
+        if pattern == r"^\.github/workflows/node-waypoint-ebpf-live\.yml$":
+            probes.append(".github/workflows/node-waypoint-ebpf-live.yml")
+        elif pattern == r"^\.dockerignore$":
+            probes.append(".dockerignore")
+        elif pattern == r"^\.github/actions/package-ferrum-runtime-image/":
+            probes.append(".github/actions/package-ferrum-runtime-image/action.yml")
+        elif pattern == r"^\.github/actions/setup-kubernetes-tools/":
+            probes.append(".github/actions/setup-kubernetes-tools/action.yml")
+        elif pattern == r"^Cargo\.(toml|lock)$":
+            probes.extend(["Cargo.toml", "Cargo.lock"])
+        elif pattern == r"^Dockerfile$":
+            probes.append("Dockerfile")
+        elif pattern == r"^Dockerfile\.iproute2-layer$":
+            probes.append("Dockerfile.iproute2-layer")
+        elif pattern == r"^Dockerfile\.release$":
+            probes.append("Dockerfile.release")
+        elif pattern == r"^\.github/scripts/stage_iproute2_runtime\.sh$":
+            probes.append(".github/scripts/stage_iproute2_runtime.sh")
+        elif pattern == r"^build\.rs$":
+            probes.append("build.rs")
+        elif pattern == r"^proto/":
+            probes.append("proto/ferrum.proto")
+        elif pattern == r"^ebpf/":
+            probes.append("ebpf/src/lib.rs")
+        elif pattern == r"^src/capture/":
+            probes.append("src/capture/mod.rs")
+        elif pattern == r"^src/ebpf/":
+            probes.append("src/ebpf/mod.rs")
+        elif pattern == r"^src/grpc/":
+            probes.append("src/grpc/mod.rs")
+        elif pattern == r"^src/identity/":
+            probes.append("src/identity/mod.rs")
+        elif pattern == r"^src/k8s_controller/":
+            probes.append("src/k8s_controller/mod.rs")
+        elif pattern == r"^src/modes/control_plane\.rs$":
+            probes.append("src/modes/control_plane.rs")
+        elif pattern == r"^src/modes/mesh/":
+            probes.append("src/modes/mesh/mod.rs")
+        elif pattern == r"^src/modes/node_agent\.rs$":
+            probes.append("src/modes/node_agent.rs")
+        elif pattern == r"^src/plugins/mesh/":
+            probes.append("src/plugins/mesh/mod.rs")
+        elif pattern == r"^src/plugins/prometheus_metrics\.rs$":
+            probes.append("src/plugins/prometheus_metrics.rs")
+        elif pattern == r"^src/proxy/hbone_pool\.rs$":
+            probes.append("src/proxy/hbone_pool.rs")
+        elif pattern == r"^src/proxy/mesh_tcp_egress\.rs$":
+            probes.append("src/proxy/mesh_tcp_egress.rs")
+        elif pattern == r"^src/proxy/mod\.rs$":
+            probes.append("src/proxy/mod.rs")
+        elif pattern == r"^src/proxy/hbone_proxy\.rs$":
+            probes.append("src/proxy/hbone_proxy.rs")
+        elif pattern == r"^src/proxy/netns_capture\.rs$":
+            probes.append("src/proxy/netns_capture.rs")
+        elif pattern == r"^src/proxy/tcp_proxy\.rs$":
+            probes.append("src/proxy/tcp_proxy.rs")
+        elif pattern == r"^src/router_cache\.rs$":
+            probes.append("src/router_cache.rs")
+        elif pattern == r"^src/socket_opts\.rs$":
+            probes.append("src/socket_opts.rs")
+        elif pattern == r"^charts/ferrum-mesh/":
+            probes.append("charts/ferrum-mesh/values.yaml")
+        elif pattern == r"^tests/k8s/lib/":
+            probes.append("tests/k8s/lib/helpers.sh")
+        elif pattern == r"^tests/k8s/node_waypoint_ebpf_live/":
+            probes.append("tests/k8s/node_waypoint_ebpf_live/run.sh")
+        elif pattern == r"^docs/mesh\.md$":
+            probes.append("docs/mesh.md")
+        elif pattern == r"^docs/mesh_supported_matrix\.md$":
+            probes.append("docs/mesh_supported_matrix.md")
+        elif pattern == r"^docs/node_agent\.md$":
+            probes.append("docs/node_agent.md")
+        elif pattern == r"^docs/ci_cd\.md$":
+            probes.append("docs/ci_cd.md")
+        elif pattern == r"^docs/plans/node_waypoint_transport_adr\.md$":
+            probes.append("docs/plans/node_waypoint_transport_adr.md")
+        else:
+            probes.append(f"unmapped-node-waypoint-pattern:{pattern}")
+    return probes
+
+
+NODE_WAYPOINT_PRODUCTION_ONLY_PROBES = (
+    "src/main.rs",
+    "src/admin/mod.rs",
+    "src/modes/database.rs",
+    "src/plugins/cors.rs",
+    "vendor/foo/src/lib.rs",
+    ".cargo/config.toml",
+    "rust-toolchain.toml",
+    "custom_plugins/foo.rs",
+)
+
+
+def check_node_waypoint_live_job(
+    workflow: str,
+    source: str,
+    failures: list[str],
+) -> None:
+    plan_job = extract_job(workflow, "production-dockerfile-plan")
+    live_job = extract_job(workflow, "node-waypoint-ebpf-live")
+    require(bool(plan_job), f"{source} production-dockerfile-plan job is missing", failures)
+    require(bool(live_job), f"{source} node-waypoint-ebpf-live job is missing", failures)
+    require(
+        "node_waypoint_relevant: ${{ steps.filter.outputs.node_waypoint_relevant }}"
+        in plan_job
+        or "node_waypoint_relevant: ${{ steps.filter.outputs.node_waypoint_relevant }}"
+        in workflow,
+        f"{source} plan job must expose node_waypoint_relevant as a job output",
+        failures,
+    )
+    require(
+        "node_waypoint_relevant=true" in plan_job
+        and "trusted base has not adopted" in plan_job,
+        f"{source} must fail closed toward running NodeWaypoint when the trusted "
+        "planner is missing",
+        failures,
+    )
+    require(
+        "--suite" in plan_job and "node-waypoint-ebpf-live" in plan_job,
+        f"{source} must evaluate the node-waypoint-ebpf-live planner suite from "
+        "the trusted-base copy",
+        failures,
+    )
+    require(
+        "needs: production-dockerfile-plan" in live_job
+        or "needs:\n      - production-dockerfile-plan" in live_job,
+        f"{source} live job must depend on the trusted planner job",
+        failures,
+    )
+    live_condition = job_if(live_job)
+    require(
+        bool(live_condition),
+        f"{source} live job must declare a single-line if condition",
+        failures,
+    )
+    require(
+        live_condition == NODE_WAYPOINT_LIVE_IF,
+        f"{source} live job must skip only on exact {NODE_WAYPOINT_PLANNER_OUTPUT} "
+        f"!= 'false' under always(); found: {live_condition}",
+        failures,
+    )
+    require(
+        "always()" in live_condition,
+        f"{source} live job must use always() so a planner failure cannot skip",
+        failures,
+    )
+    require(
+        f"{NODE_WAYPOINT_PLANNER_OUTPUT} != 'false'" in live_condition,
+        f"{source} live job skip must be exact-false-only",
+        failures,
+    )
+    require(
+        "== 'true'" not in live_condition,
+        f"{source} live job must not treat blank/malformed output as a skip",
+        failures,
+    )
+    require(
+        "result == 'success'" not in live_condition,
+        f"{source} live job must not require planner success to run "
+        "(planner failure must fail closed toward running)",
+        failures,
+    )
+    require(
+        "outputs.relevant" not in live_condition,
+        f"{source} live job must not reuse the production-image relevant output",
+        failures,
+    )
+    require(
+        "kind create cluster" in live_job,
+        f"{source} live job must still create the Kind cluster",
+        failures,
+    )
+    require(
+        "tests/k8s/node_waypoint_ebpf_live/run.sh" in live_job,
+        f"{source} live job must still run the NodeWaypoint harness",
+        failures,
+    )
+    require(
+        'ferrum_mesh_bpf_drops_total{reason="exclude_port_hit"}' in live_job
+        or "ferrum_mesh_bpf_drops_total" in live_job,
+        f"{source} live job must still assert a real BPF bypass metric",
+        failures,
+    )
+    require(
+        "timeout-minutes: 120" in live_job,
+        f"{source} live job must keep the 120-minute Kind/eBPF timeout",
+        failures,
+    )
+    unmapped = [
+        probe
+        for probe in node_waypoint_probe_paths()
+        if probe.startswith("unmapped-node-waypoint-pattern:")
+    ]
+    require(
+        not unmapped,
+        f"{source} verifier must map every node-waypoint-ebpf-live planner "
+        f"pattern ({', '.join(item[32:] for item in unmapped)})",
+        failures,
+    )
+    for probe in node_waypoint_probe_paths():
+        if probe.startswith("unmapped-node-waypoint-pattern:"):
+            continue
+        relevant, _reason, _matched = decide_relevance("node-waypoint-ebpf-live", [probe])
+        require(
+            relevant,
+            f"{source} prior-scope path {probe} must run the NodeWaypoint live job",
+            failures,
+        )
+    for probe in NODE_WAYPOINT_PRODUCTION_ONLY_PROBES:
+        node_relevant, _reason, _matched = decide_relevance(
+            "node-waypoint-ebpf-live", [probe]
+        )
+        prod_relevant, _, _ = decide_relevance("production-dockerfile-smoke", [probe])
+        require(
+            not node_relevant,
+            f"{source} production-only path {probe} must skip the NodeWaypoint live job",
+            failures,
+        )
+        require(
+            prod_relevant,
+            f"{source} production-only path {probe} must still trigger production-image smoke",
+            failures,
+        )
+    empty_relevant, _, _ = decide_relevance("node-waypoint-ebpf-live", [])
+    require(
+        empty_relevant,
+        f"{source} empty NodeWaypoint diff must fail closed toward running",
+        failures,
+    )
+    unknown_relevant, _, _ = decide_relevance(
+        "node-waypoint-ebpf-live", ["brand-new-crate/src/lib.rs"]
+    )
+    require(
+        unknown_relevant,
+        f"{source} unknown NodeWaypoint path must fail closed toward running",
         failures,
     )
 
@@ -1093,6 +1353,11 @@ def check_production_smoke(workflow: str, failures: list[str]) -> None:
         "node-waypoint-ebpf-live.yml",
         failures,
     )
+    check_node_waypoint_live_job(
+        workflow,
+        "node-waypoint-ebpf-live.yml",
+        failures,
+    )
     require(
         "python3 -I" in workflow and "ci_runtime_plan.py" in workflow,
         "production-image planner must execute an isolated trusted-base copy",
@@ -1210,6 +1475,18 @@ def check_docs_and_coverage(failures: list[str]) -> None:
     require(
         "relevant == 'false'" in ci_cd or "exact false" in ci_cd.lower(),
         "docs/ci_cd.md must document exact-boolean aggregate planner gating",
+        failures,
+    )
+    require(
+        "node_waypoint_relevant" in ci_cd and "always()" in ci_cd,
+        "docs/ci_cd.md must document the NodeWaypoint job-level always() exact-false skip",
+        failures,
+    )
+    require(
+        "prior" in ci_cd.lower()
+        and ("nodewaypoint" in ci_cd.lower() or "node-waypoint" in ci_cd.lower()),
+        "docs/ci_cd.md must document NodeWaypoint prior-scope scheduling vs "
+        "the production-image trigger superset",
         failures,
     )
     require(
@@ -1912,6 +2189,106 @@ def self_test() -> int:
     require(
         any("fail closed when planner output is neither" in item for item in missing_unusable_failures),
         "self-test: aggregate without unusable-output guard must fail",
+        failures,
+    )
+
+    def _live_workflow(live_if: str) -> str:
+        return (
+            "  production-dockerfile-plan:\n"
+            "    outputs:\n"
+            "      relevant: ${{ steps.filter.outputs.relevant }}\n"
+            "      node_waypoint_relevant: ${{ steps.filter.outputs.node_waypoint_relevant }}\n"
+            "    steps:\n"
+            "      - name: Check\n"
+            "        run: |\n"
+            '          echo "node_waypoint_relevant=true" >> "$GITHUB_OUTPUT"\n'
+            "          echo trusted base has not adopted filter\n"
+            '          python3 -I "$trusted_filter" --suite "$suite"\n'
+            "          emit_suite_verdict node-waypoint-ebpf-live node_waypoint_relevant\n"
+            "  node-waypoint-ebpf-live:\n"
+            "    name: NodeWaypoint eBPF live datapath\n"
+            "    needs: production-dockerfile-plan\n"
+            f"    if: {live_if}\n"
+            "    runs-on: ubuntu-24.04\n"
+            "    timeout-minutes: 120\n"
+            "    steps:\n"
+            "      - run: kind create cluster --name demo\n"
+            "      - run: tests/k8s/node_waypoint_ebpf_live/run.sh\n"
+            "      - run: echo ferrum_mesh_bpf_drops_total\n"
+            "        if: always()\n"
+        )
+
+    good_live_failures: list[str] = []
+    check_node_waypoint_live_job(
+        _live_workflow(NODE_WAYPOINT_LIVE_IF),
+        "self-test-good-live",
+        good_live_failures,
+    )
+    require(
+        not good_live_failures,
+        "self-test: exact-false NodeWaypoint live skip should pass: "
+        + "; ".join(good_live_failures),
+        failures,
+    )
+
+    exact_true_failures: list[str] = []
+    check_node_waypoint_live_job(
+        _live_workflow(
+            "always() && needs.production-dockerfile-plan.outputs.node_waypoint_relevant == 'true'"
+        ),
+        "self-test-live-exact-true",
+        exact_true_failures,
+    )
+    require(
+        any("must not treat blank/malformed output as a skip" in item for item in exact_true_failures)
+        or any("skip only on exact" in item for item in exact_true_failures),
+        "self-test: NodeWaypoint live job gated on == 'true' must fail",
+        failures,
+    )
+
+    no_always_failures: list[str] = []
+    check_node_waypoint_live_job(
+        _live_workflow(
+            "needs.production-dockerfile-plan.outputs.node_waypoint_relevant != 'false'"
+        ),
+        "self-test-live-no-always",
+        no_always_failures,
+    )
+    require(
+        any("always()" in item for item in no_always_failures),
+        "self-test: NodeWaypoint live job without always() must fail",
+        failures,
+    )
+
+    success_required_failures: list[str] = []
+    check_node_waypoint_live_job(
+        _live_workflow(
+            "always() && needs.production-dockerfile-plan.result == 'success' && "
+            "needs.production-dockerfile-plan.outputs.node_waypoint_relevant != 'false'"
+        ),
+        "self-test-live-success-required",
+        success_required_failures,
+    )
+    require(
+        any("must not require planner success" in item for item in success_required_failures)
+        or any("skip only on exact" in item for item in success_required_failures),
+        "self-test: NodeWaypoint live job requiring planner success must fail",
+        failures,
+    )
+
+    unbound_failures: list[str] = []
+    unbound_workflow = _live_workflow(NODE_WAYPOINT_LIVE_IF).replace(
+        "    needs: production-dockerfile-plan\n",
+        "",
+    )
+    check_node_waypoint_live_job(
+        unbound_workflow,
+        "self-test-live-unbound",
+        unbound_failures,
+    )
+    require(
+        any("must depend on the trusted planner job" in item for item in unbound_failures),
+        "self-test: NodeWaypoint live job without needs must fail",
         failures,
     )
 

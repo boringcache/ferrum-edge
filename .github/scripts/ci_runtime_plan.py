@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Fail-closed path planner for expensive production-image and FIPS CI gates.
+"""Fail-closed path planner for expensive production-image, FIPS, and NodeWaypoint CI gates.
 
 Hosted workflows extract this file from the trusted base commit before
 execution so a pull request cannot widen skip patterns. Uncertainty, a missing
@@ -63,6 +63,49 @@ SUITE_PATTERNS: dict[str, tuple[str, ...]] = {
         r"^\.github/actions/setup-fast-linker/",
         r"^\.github/actions/setup-rust-ci/",
     ),
+    # Kind/eBPF NodeWaypoint live datapath. Sensitive paths are the pre-#3888
+    # `pull_request.paths` set: the workflow trigger is a production-image
+    # superset, but this suite must not inherit that broadening.
+    "node-waypoint-ebpf-live": (
+        r"^\.github/workflows/node-waypoint-ebpf-live\.yml$",
+        r"^\.dockerignore$",
+        r"^\.github/actions/package-ferrum-runtime-image/",
+        r"^\.github/actions/setup-kubernetes-tools/",
+        r"^Cargo\.(toml|lock)$",
+        r"^Dockerfile$",
+        r"^Dockerfile\.iproute2-layer$",
+        r"^Dockerfile\.release$",
+        r"^\.github/scripts/stage_iproute2_runtime\.sh$",
+        r"^build\.rs$",
+        r"^proto/",
+        r"^ebpf/",
+        r"^src/capture/",
+        r"^src/ebpf/",
+        r"^src/grpc/",
+        r"^src/identity/",
+        r"^src/k8s_controller/",
+        r"^src/modes/control_plane\.rs$",
+        r"^src/modes/mesh/",
+        r"^src/modes/node_agent\.rs$",
+        r"^src/plugins/mesh/",
+        r"^src/plugins/prometheus_metrics\.rs$",
+        r"^src/proxy/hbone_pool\.rs$",
+        r"^src/proxy/mesh_tcp_egress\.rs$",
+        r"^src/proxy/mod\.rs$",
+        r"^src/proxy/hbone_proxy\.rs$",
+        r"^src/proxy/netns_capture\.rs$",
+        r"^src/proxy/tcp_proxy\.rs$",
+        r"^src/router_cache\.rs$",
+        r"^src/socket_opts\.rs$",
+        r"^charts/ferrum-mesh/",
+        r"^tests/k8s/lib/",
+        r"^tests/k8s/node_waypoint_ebpf_live/",
+        r"^docs/mesh\.md$",
+        r"^docs/mesh_supported_matrix\.md$",
+        r"^docs/node_agent\.md$",
+        r"^docs/ci_cd\.md$",
+        r"^docs/plans/node_waypoint_transport_adr\.md$",
+    ),
 }
 
 # Known non-sensitive surfaces that may skip when they do not also match a
@@ -105,9 +148,22 @@ KNOWN_SAFE_PATTERNS: tuple[str, ...] = (
 
 # Production images dockerignore `tests/`, so those paths cannot change the
 # image. FIPS clippy/tests compile `tests/`, so FIPS must not allowlist it.
+# NodeWaypoint allowlists the production-image-only broadening (`src/**`,
+# `vendor/**`, `.cargo/**`, `rust-toolchain.toml`, `custom_plugins/**`) so
+# those diffs skip the Kind/eBPF live job unless they also match the prior
+# NodeWaypoint scope above. Unknown paths still force-run.
 SUITE_SAFE_PATTERNS: dict[str, tuple[str, ...]] = {
     "production-dockerfile-smoke": KNOWN_SAFE_PATTERNS + (r"^tests/",),
     "fips-build": KNOWN_SAFE_PATTERNS,
+    "node-waypoint-ebpf-live": KNOWN_SAFE_PATTERNS
+    + (
+        r"^src/",
+        r"^vendor/",
+        r"^\.cargo/",
+        r"^rust-toolchain\.toml$",
+        r"^custom_plugins/",
+        r"^tests/",
+    ),
 }
 
 COMPILED = {
@@ -255,7 +311,7 @@ def decide_relevance(
     if matched:
         return (
             True,
-            "Diff matches a production-image or FIPS-sensitive path; running the live gate.",
+            "Diff matches a suite-sensitive path; running the live gate.",
             matched,
         )
     unknown = unknown_files(suite, changed)
@@ -381,6 +437,93 @@ def self_test() -> int:
             ["README.md"],
             False,
         ),
+        ("node-waypoint-ebpf-live", ["src/ebpf/mod.rs"], True),
+        ("node-waypoint-ebpf-live", ["src/capture/mod.rs"], True),
+        ("node-waypoint-ebpf-live", ["src/grpc/mod.rs"], True),
+        ("node-waypoint-ebpf-live", ["src/identity/mod.rs"], True),
+        ("node-waypoint-ebpf-live", ["src/k8s_controller/mod.rs"], True),
+        ("node-waypoint-ebpf-live", ["src/modes/control_plane.rs"], True),
+        ("node-waypoint-ebpf-live", ["src/modes/mesh/mod.rs"], True),
+        ("node-waypoint-ebpf-live", ["src/modes/node_agent.rs"], True),
+        ("node-waypoint-ebpf-live", ["src/plugins/mesh/mod.rs"], True),
+        ("node-waypoint-ebpf-live", ["src/plugins/prometheus_metrics.rs"], True),
+        ("node-waypoint-ebpf-live", ["src/proxy/hbone_pool.rs"], True),
+        ("node-waypoint-ebpf-live", ["src/proxy/mesh_tcp_egress.rs"], True),
+        ("node-waypoint-ebpf-live", ["src/proxy/mod.rs"], True),
+        ("node-waypoint-ebpf-live", ["src/proxy/hbone_proxy.rs"], True),
+        ("node-waypoint-ebpf-live", ["src/proxy/netns_capture.rs"], True),
+        ("node-waypoint-ebpf-live", ["src/proxy/tcp_proxy.rs"], True),
+        ("node-waypoint-ebpf-live", ["src/router_cache.rs"], True),
+        ("node-waypoint-ebpf-live", ["src/socket_opts.rs"], True),
+        ("node-waypoint-ebpf-live", ["ebpf/src/lib.rs"], True),
+        ("node-waypoint-ebpf-live", ["proto/ferrum.proto"], True),
+        ("node-waypoint-ebpf-live", ["Cargo.toml"], True),
+        ("node-waypoint-ebpf-live", ["Cargo.lock"], True),
+        ("node-waypoint-ebpf-live", ["Dockerfile"], True),
+        ("node-waypoint-ebpf-live", ["Dockerfile.iproute2-layer"], True),
+        ("node-waypoint-ebpf-live", ["Dockerfile.release"], True),
+        ("node-waypoint-ebpf-live", [".dockerignore"], True),
+        ("node-waypoint-ebpf-live", ["build.rs"], True),
+        (
+            "node-waypoint-ebpf-live",
+            [".github/scripts/stage_iproute2_runtime.sh"],
+            True,
+        ),
+        (
+            "node-waypoint-ebpf-live",
+            [".github/workflows/node-waypoint-ebpf-live.yml"],
+            True,
+        ),
+        (
+            "node-waypoint-ebpf-live",
+            [".github/actions/package-ferrum-runtime-image/action.yml"],
+            True,
+        ),
+        (
+            "node-waypoint-ebpf-live",
+            [".github/actions/setup-kubernetes-tools/action.yml"],
+            True,
+        ),
+        ("node-waypoint-ebpf-live", ["charts/ferrum-mesh/values.yaml"], True),
+        (
+            "node-waypoint-ebpf-live",
+            ["tests/k8s/node_waypoint_ebpf_live/run.sh"],
+            True,
+        ),
+        ("node-waypoint-ebpf-live", ["tests/k8s/lib/helpers.sh"], True),
+        ("node-waypoint-ebpf-live", ["docs/mesh.md"], True),
+        ("node-waypoint-ebpf-live", ["docs/mesh_supported_matrix.md"], True),
+        ("node-waypoint-ebpf-live", ["docs/node_agent.md"], True),
+        ("node-waypoint-ebpf-live", ["docs/ci_cd.md"], True),
+        (
+            "node-waypoint-ebpf-live",
+            ["docs/plans/node_waypoint_transport_adr.md"],
+            True,
+        ),
+        ("node-waypoint-ebpf-live", ["src/main.rs"], False),
+        ("node-waypoint-ebpf-live", ["src/admin/mod.rs"], False),
+        ("node-waypoint-ebpf-live", ["src/modes/database.rs"], False),
+        ("node-waypoint-ebpf-live", ["src/plugins/cors.rs"], False),
+        ("node-waypoint-ebpf-live", ["vendor/foo/src/lib.rs"], False),
+        ("node-waypoint-ebpf-live", [".cargo/config.toml"], False),
+        ("node-waypoint-ebpf-live", ["rust-toolchain.toml"], False),
+        ("node-waypoint-ebpf-live", ["custom_plugins/mod.rs"], False),
+        ("node-waypoint-ebpf-live", ["README.md"], False),
+        (
+            "node-waypoint-ebpf-live",
+            [".github/scripts/ci_runtime_plan.py"],
+            False,
+        ),
+        (
+            "node-waypoint-ebpf-live",
+            [".github/scripts/verify_ci_runtime_cache.py"],
+            False,
+        ),
+        (
+            "node-waypoint-ebpf-live",
+            ["src/main.rs", "src/ebpf/mod.rs"],
+            True,
+        ),
     ]
     failures: list[str] = []
     for suite, changed, expected in cases:
@@ -405,6 +548,16 @@ def self_test() -> int:
     )
     if not unknown_prod:
         failures.append("unknown production-image path must force-run rather than skip")
+    node_empty, node_empty_reason, _ = decide_relevance("node-waypoint-ebpf-live", [])
+    if not node_empty or "Empty diff" not in node_empty_reason:
+        failures.append("empty NodeWaypoint diff must force-run, not skip")
+    node_unknown, node_unknown_reason, _ = decide_relevance(
+        "node-waypoint-ebpf-live", ["brand-new-crate/src/lib.rs"]
+    )
+    if not node_unknown or "allowlist" not in node_unknown_reason:
+        failures.append("unknown NodeWaypoint path must force-run rather than skip")
+    if set(SUITE_PATTERNS) != set(SUITE_SAFE_PATTERNS):
+        failures.append("every planner suite must declare skip-allowlist patterns")
     try:
         matched_files("not-a-suite", ["src/main.rs"])
         failures.append("unknown suite must raise rather than skip")
