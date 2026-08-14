@@ -8059,15 +8059,24 @@ components:
           type: [number, "null"]
           format: float
           exclusiveMinimum: 0
+          maximum: 1024
           description: |
             Maximum allowed response amplification factor for UDP proxies.
-            When set, backend→client datagrams are dropped if their size exceeds
-            `payload_size * factor`. A zero-length request receives an explicit
-            one-byte reply allowance so it cannot black-hole the session;
-            nonempty requests retain the exact configured payload ratio. This
-            protects against UDP amplification attacks (e.g., spoofed-source
-            reflection). When omitted (default), no per-datagram amplification
-            cap is applied. Only applicable for `udp` / `dtls` proxies.
+            When set, backend→client datagrams share one remaining payload-byte
+            budget per admitted client request (`payload_size * factor`,
+            cumulative across replies). A zero-length request receives an
+            explicit one-byte reply allowance so it cannot black-hole the
+            session; nonempty requests retain the exact configured payload
+            ratio. Every backend response datagram consumes at least one unit
+            of remaining budget, so a zero-length reply cannot bypass a finite
+            factor. This protects against UDP amplification attacks (e.g.,
+            spoofed-source reflection). Values must be finite, greater than 0,
+            and at most 1024. When omitted (default for hand-authored proxies),
+            no amplification cap is applied. Gateway API `UDPRoute` translation
+            never leaves this unset: it projects a finite controller default
+            of 8.0 unless a Ferrum `UDPResponseAmplificationPolicy` supplies a
+            finite override or an explicit dual-acknowledged unlimited mode.
+            Only applicable for `udp` / `dtls` proxies.
         allowed_methods:
           oneOf:
             - type: array

@@ -194,7 +194,7 @@ start_gateway() {
         FERRUM_GATEWAY_SVID_KEY_PATH="$CERTS_DIR/gateway-key.pem" \
         FERRUM_GATEWAY_SVID_TRUST_BUNDLE_PATH="$CERTS_DIR/ca.pem" \
         FERRUM_GATEWAY_SPIFFE_ID="spiffe://cluster.local/ns/edge/sa/gateway" \
-        FERRUM_BACKEND_ALLOW_IPS="127.0.0.1/32" \
+        FERRUM_BACKEND_ALLOW_IPS="private" \
         ./target/release/ferrum-edge \
         > "$RUNTIME_DIR/gateway.log" 2>&1 &
     GATEWAY_PID=$!

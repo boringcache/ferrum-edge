@@ -1302,6 +1302,35 @@ fn ai_federation_circuit_metrics_are_bounded_and_reload_safe() {
     assert!(output.contains("ferrum_ai_federation_circuits_closed_total 1"));
 }
 
+#[test]
+fn udp_amplification_metrics_are_unlabeled_process_counters() {
+    let registry = MetricsRegistry::new();
+    let output = registry.render_uncached();
+    for name in [
+        "ferrum_udp_amplification_responses_allowed_total",
+        "ferrum_udp_amplification_responses_dropped_total",
+        "ferrum_udp_amplification_policy_invalid_total",
+        "ferrum_udp_amplification_unlimited_total",
+    ] {
+        assert!(
+            output.contains(&format!("# TYPE {name} counter")),
+            "missing unlabeled amplification counter {name}"
+        );
+        for banned in ["route=", "backend=", "source=", "factor=", "error="] {
+            let series: Vec<&str> = output
+                .lines()
+                .filter(|line| line.starts_with(name) && !line.starts_with('#'))
+                .collect();
+            for line in series {
+                assert!(
+                    !line.contains(banned),
+                    "amplification metric carried banned label {banned}: {line}"
+                );
+            }
+        }
+    }
+}
+
 #[tokio::test]
 async fn test_registry_records_mesh_dns_upstream_id_exhaustion() {
     let registry = MetricsRegistry::new();

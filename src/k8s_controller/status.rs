@@ -10,6 +10,7 @@ use tracing::warn;
 use crate::config_sources::k8s::backend_tls_policy::{
     MAX_POLICY_ANCESTORS, policy_status_ancestor_capacity, policy_status_ancestor_services,
 };
+use crate::config_sources::k8s::udp_amplification_policy::lookup_route_posture;
 use crate::config_sources::k8s::{
     GatewayApiAllowedRoutesNamespaces, GatewayApiBackendTlsPolicyStatus, GatewayApiListenerKey,
     GatewayApiListenerParentKind, GatewayApiMaterializedRouteParent, GatewayApiRouteAttachment,
@@ -25,6 +26,10 @@ use crate::config_sources::k8s::{
 };
 use crate::k8s_controller::status_plan::{
     StatusPlanBudget, fair_work_window_iter, select_fair_work_window,
+};
+use crate::udp_amplification::{
+    UDP_AMPLIFICATION_POLICY_KIND, UDP_AMPLIFICATION_POLICY_PLURAL,
+    UDP_AMPLIFICATION_POLICY_VERSION,
 };
 
 pub use crate::config_sources::k8s::FERRUM_GATEWAY_CONTROLLER_NAME;
@@ -233,7 +238,7 @@ fn route_status_kind(kind: &str) -> bool {
 /// Kinds whose status is a Gateway API `PolicyStatus` (`status.ancestors[]`)
 /// rather than a `RouteStatus` (`status.parents[]`).
 fn policy_status_kind(kind: &str) -> bool {
-    matches!(kind, "BackendTLSPolicy")
+    matches!(kind, "BackendTLSPolicy" | "UDPResponseAmplificationPolicy")
 }
 
 fn kube_error_is_conflict(error: &kube::Error) -> bool {
@@ -882,6 +887,9 @@ fn desired_status_for_object(object: &K8sObject, ctx: &DesiredStatusForObject<'_
             ctx.route_keys,
         ),
         "BackendTLSPolicy" => backend_tls_policy_status(object, ctx.translation_result),
+        "UDPResponseAmplificationPolicy" => {
+            udp_amplification_policy_status(object, ctx.translation_result)
+        }
         "BackendLBPolicy" | "XBackendTrafficPolicy" => {
             let conflicted = ctx
                 .backend_lb_conflict_losers
@@ -963,6 +971,100 @@ fn backend_tls_policy_status(
                     verdict.resolved_refs,
                     &verdict.resolved_refs_reason,
                     &verdict.resolved_refs_message,
+                ),
+            ];
+            let conditions = merge_condition_entries(existing_conditions, conditions);
+            ancestors.push(json!({
+                "ancestorRef": ancestor_ref,
+                "controllerName": FERRUM_GATEWAY_CONTROLLER_NAME,
+                "conditions": conditions,
+            }));
+        }
+    }
+
+    let mut status = object.status.clone();
+    ensure_status_object(&mut status).insert("ancestors".to_string(), Value::Array(ancestors));
+    status
+}
+
+/// Desired `status.ancestors` for one Ferrum `UDPResponseAmplificationPolicy`.
+fn udp_amplification_policy_status(
+    object: &K8sObject,
+    result: Result<&K8sTranslation, &K8sTranslateError>,
+) -> Value {
+    let policy_key = K8sResourceKey::from_object(object);
+    let outcome = match result {
+        Ok(translation) => translation
+            .udp_amplification_policy_statuses
+            .iter()
+            .find(|entry| entry.policy == policy_key),
+        Err(_) => None,
+    };
+
+    let existing_ancestors = object.status.get("ancestors");
+    let mut ancestors = retained_non_ferrum_status_entries(&object.status, "ancestors");
+    let ancestor_refs: Vec<(String, String, String, Option<String>)> = outcome
+        .map(|entry| {
+            entry
+                .ancestors
+                .iter()
+                .map(|ancestor| {
+                    (
+                        ancestor.kind.clone(),
+                        ancestor.namespace.clone(),
+                        ancestor.name.clone(),
+                        ancestor.section_name.clone(),
+                    )
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    let representable = ancestor_refs.len() <= policy_status_ancestor_capacity(&object.status);
+    if representable {
+        let accepted = outcome.map(|entry| entry.accepted).unwrap_or(false);
+        let accepted_reason = outcome
+            .map(|entry| entry.accepted_reason.as_str())
+            .unwrap_or("Invalid");
+        let accepted_message = outcome
+            .map(|entry| entry.accepted_message.as_str())
+            .unwrap_or("Ferrum did not evaluate this UDPResponseAmplificationPolicy in the translated configuration scope");
+        let resolved_refs = outcome.map(|entry| entry.resolved_refs).unwrap_or(false);
+        let resolved_refs_reason = outcome
+            .map(|entry| entry.resolved_refs_reason.as_str())
+            .unwrap_or("Invalid");
+        let resolved_refs_message = outcome
+            .map(|entry| entry.resolved_refs_message.as_str())
+            .unwrap_or(accepted_message);
+        for (kind, namespace, name, section_name) in ancestor_refs {
+            let mut ancestor_ref = json!({
+                "group": "gateway.networking.k8s.io",
+                "kind": kind,
+                "namespace": namespace,
+                "name": name,
+            });
+            if let Some(section) = section_name
+                && let Value::Object(map) = &mut ancestor_ref
+            {
+                map.insert("sectionName".to_string(), Value::String(section));
+            }
+            let existing_conditions =
+                existing_ancestor_conditions(existing_ancestors, object, &ancestor_ref);
+            let conditions = vec![
+                condition_at(
+                    object,
+                    existing_conditions,
+                    "Accepted",
+                    accepted,
+                    accepted_reason,
+                    accepted_message,
+                ),
+                condition_at(
+                    object,
+                    existing_conditions,
+                    "ResolvedRefs",
+                    resolved_refs,
+                    resolved_refs_reason,
+                    resolved_refs_message,
                 ),
             ];
             let conditions = merge_condition_entries(existing_conditions, conditions);
@@ -2350,6 +2452,14 @@ fn merge_status_conditions(status: &mut Value, owned_types: &[&str], desired: Ve
     status_object.insert("conditions".to_string(), Value::Array(conditions));
 }
 
+/// Status-only UDPRoute amplification reason when no `(route, parentRef)`
+/// posture was recorded. Never a translator fallback: `FiniteDefault` is only
+/// truthful for a materialized parent whose proxy actually received the
+/// controller default.
+const UDP_AMPLIFICATION_NOT_PROGRAMMED_REASON: &str = "NotProgrammed";
+const UDP_AMPLIFICATION_NOT_PROGRAMMED_MESSAGE: &str =
+    "Ferrum did not program a UDP response-amplification limit";
+
 fn route_status(
     object: &K8sObject,
     indexes: &GatewayApiStatusIndexes<'_>,
@@ -2603,7 +2713,7 @@ fn route_status(
         let conflicted_message = conflict_message
             .as_deref()
             .unwrap_or("No Gateway API conflicts detected by Ferrum");
-        let conditions = vec![
+        let mut conditions = vec![
             condition_at(
                 object,
                 existing_parent_status,
@@ -2649,6 +2759,41 @@ fn route_status(
                 conflicted_message,
             ),
         ];
+        if object.kind == "UDPRoute" {
+            let route_key = K8sResourceKey::from_object(object);
+            let posture = match result {
+                Ok(translation) => lookup_route_posture(
+                    &translation.udp_amplification_route_postures,
+                    &route_key,
+                    &parent_ref_key,
+                ),
+                Err(_) => None,
+            };
+            // Missing posture (translation failure, unmaterialized parent, or
+            // an unaccepted claim) is not FiniteDefault: no proxy was
+            // programmed. Always emit a replacement condition so merge cannot
+            // retain a stale True from a previous reconcile.
+            let (protected, reason, message) = match posture {
+                Some(posture) => (
+                    posture.condition_status(),
+                    posture.reason(),
+                    posture.message(),
+                ),
+                None => (
+                    false,
+                    UDP_AMPLIFICATION_NOT_PROGRAMMED_REASON,
+                    UDP_AMPLIFICATION_NOT_PROGRAMMED_MESSAGE,
+                ),
+            };
+            conditions.push(condition_at(
+                object,
+                existing_parent_status,
+                "UDPAmplificationProtection",
+                protected,
+                reason,
+                message,
+            ));
+        }
         let conditions = merge_condition_entries(existing_parent_status, conditions);
         parents.push(json!({
             "parentRef": parent_ref,
@@ -3261,6 +3406,7 @@ fn status_candidate_is_eligible(object: &K8sObject, indexes: &GatewayApiStatusIn
                 .any(|(namespace, name)| service_is_effectively_routed(indexes, &namespace, &name));
             is_in_scope || has_ferrum_status_entry(&object.status, "ancestors")
         }
+        "UDPResponseAmplificationPolicy" => true,
         "BackendLBPolicy" | "XBackendTrafficPolicy" => true,
         "ListenerSet" => listenerset_status_candidate_is_eligible(object, indexes),
         _ => false,
@@ -3731,6 +3877,7 @@ fn is_status_kind(kind: &str) -> bool {
             | "TLSRoute"
             | "UDPRoute"
             | "BackendTLSPolicy"
+            | "UDPResponseAmplificationPolicy"
             | "BackendLBPolicy"
             | "XBackendTrafficPolicy"
     )
@@ -3749,6 +3896,9 @@ fn api_resource_for_update(update: &GatewayApiStatusUpdate) -> Option<ApiResourc
         // Both channels Ferrum watches. An object served under any other
         // version is skipped rather than patched through a guessed plural.
         ("BackendTLSPolicy", "v1" | "v1alpha3") => "backendtlspolicies",
+        (UDP_AMPLIFICATION_POLICY_KIND, UDP_AMPLIFICATION_POLICY_VERSION) => {
+            UDP_AMPLIFICATION_POLICY_PLURAL
+        }
         ("BackendLBPolicy", "v1alpha2") => "backendlbpolicies",
         ("XBackendTrafficPolicy", "v1alpha1") => "xbackendtrafficpolicies",
         ("ListenerSet", "v1") => "listenersets",
