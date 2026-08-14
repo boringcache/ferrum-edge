@@ -162,6 +162,137 @@ fn capacity_refuses_rather_than_evicting_a_live_marker() {
     );
 }
 
+/// Repeated saturated refusals while every retained marker is still live must
+/// not walk the map again. The conservative earliest-expiry bound makes those
+/// refusals O(1).
+#[test]
+fn repeated_full_live_refusals_do_not_rescan() {
+    let authority = process_authority("capacity-no-rescan", 2);
+    let now = monotonic_millis();
+    let first = domain("capacity-no-rescan").marker(&[b"c", b"first"]);
+    let second = domain("capacity-no-rescan").marker(&[b"c", b"second"]);
+    let third = domain("capacity-no-rescan").marker(&[b"c", b"third"]);
+
+    assert_eq!(
+        admit_process_at(&authority, &first, now),
+        Some(ReplayAdmission::Admitted)
+    );
+    assert_eq!(
+        admit_process_at(&authority, &second, now),
+        Some(ReplayAdmission::Admitted)
+    );
+    let lane = process_lane(&authority).expect("process lane");
+    let scans_after_fill = lane.prune_scans();
+    for _ in 0..64 {
+        assert_eq!(
+            admit_process_at(&authority, &third, now),
+            Some(ReplayAdmission::CapacityRefused)
+        );
+    }
+    assert_eq!(
+        lane.prune_scans(),
+        scans_after_fill,
+        "full-live refusals must not rescan while no marker can yet have expired"
+    );
+    assert_eq!(
+        admit_process_at(&authority, &first, now),
+        Some(ReplayAdmission::Replay),
+        "O(1) refusal must not evict a live marker"
+    );
+}
+
+/// Once the earliest live expiry is due, the capacity path may scan and reclaim
+/// expired slots so a new proof can be admitted.
+#[test]
+fn expiration_triggers_reclamation_after_o1_refusals() {
+    let authority = process_authority("capacity-expire-scan", 2);
+    let now = monotonic_millis();
+    let first = domain("capacity-expire-scan").marker(&[b"c", b"first"]);
+    let second = domain("capacity-expire-scan").marker(&[b"c", b"second"]);
+    let third = domain("capacity-expire-scan").marker(&[b"c", b"third"]);
+
+    assert_eq!(
+        admit_process_at(&authority, &first, now),
+        Some(ReplayAdmission::Admitted)
+    );
+    assert_eq!(
+        admit_process_at(&authority, &second, now),
+        Some(ReplayAdmission::Admitted)
+    );
+    assert_eq!(
+        admit_process_at(&authority, &third, now),
+        Some(ReplayAdmission::CapacityRefused)
+    );
+    let lane = process_lane(&authority).expect("process lane");
+    let scans_before = lane.prune_scans();
+
+    let after_expiry = now + RETENTION.as_millis() as u64 + 1;
+    assert_eq!(
+        admit_process_at(&authority, &third, after_expiry),
+        Some(ReplayAdmission::Admitted),
+        "an expired slot must be reclaimed once expiration is due"
+    );
+    assert!(
+        lane.prune_scans() > scans_before,
+        "expiration must be allowed to scan and reclaim"
+    );
+}
+
+/// Concurrent insertion while a due prune recomputes the earliest bound must
+/// not drop a still-live marker or treat it as expired.
+#[test]
+fn concurrent_insert_during_prune_cannot_forget_a_live_marker() {
+    const WORKERS: usize = 16;
+    let authority = Arc::new(process_authority("capacity-concurrent-bound", 4));
+    let now = monotonic_millis();
+    let shorts: Vec<_> = (0..3)
+        .map(|idx| {
+            domain("capacity-concurrent-bound").marker(&[b"short", idx.to_string().as_bytes()])
+        })
+        .collect();
+    let live = domain("capacity-concurrent-bound").marker(&[b"live", b"kept"]);
+    for marker in &shorts {
+        assert_eq!(
+            admit_process_at(&authority, marker, now),
+            Some(ReplayAdmission::Admitted)
+        );
+    }
+    let later = now + 1_000;
+    assert_eq!(
+        admit_process_at(&authority, &live, later),
+        Some(ReplayAdmission::Admitted)
+    );
+
+    let after_shorts = now + RETENTION.as_millis() as u64 + 1;
+    let barrier = Arc::new(Barrier::new(WORKERS));
+    let workers: Vec<_> = (0..WORKERS)
+        .map(|idx| {
+            let authority = Arc::clone(&authority);
+            let barrier = Arc::clone(&barrier);
+            std::thread::spawn(move || {
+                barrier.wait();
+                if idx % 2 == 0 {
+                    let live =
+                        domain("capacity-concurrent-bound").marker(&[b"live", b"kept"]);
+                    admit_process_at(&authority, &live, after_shorts)
+                } else {
+                    let fresh = domain("capacity-concurrent-bound")
+                        .marker(&[b"fresh", idx.to_string().as_bytes()]);
+                    admit_process_at(&authority, &fresh, after_shorts)
+                }
+            })
+        })
+        .collect();
+    for worker in workers {
+        let _ = worker.join().expect("worker");
+    }
+    assert_eq!(
+        admit_process_at(&authority, &live, after_shorts),
+        Some(ReplayAdmission::Replay),
+        "a still-live marker must survive concurrent prune recomputation"
+    );
+}
+
 /// Once the retained markers expire, their slots are reclaimed and new requests
 /// are admitted again — capacity degrades into refusal, not into a permanent
 /// outage.
@@ -980,6 +1111,7 @@ fn validation_construction_does_not_publish_shared_replay_readiness() {
     let jwks_config = serde_json::json!({
         "providers": [{
             "jwks": {"keys": []},
+            "issuer": "https://idp.example.com",
             "require_dpop": true,
             "dpop_replay_scope": "shared"
         }],
@@ -1607,6 +1739,24 @@ fn stale_reachable_registration_sample_cannot_overwrite_terminal_topology() {
 /// the replay claim or the topology screen.
 const SET_CMD: &[u8] = b"$3\r\nSET\r\n";
 const INFO_CMD: &[u8] = b"$4\r\nINFO\r\n";
+const INFO_MEMORY_ARG: &[u8] = b"$6\r\nMEMORY\r\n";
+const CLUSTER_DISABLED_INFO: &str = "# Cluster\r\ncluster_enabled:0\r\n";
+const SAFE_MEMORY_INFO: &str = "# Memory\r\nmaxmemory:0\r\nmaxmemory_policy:noeviction\r\n";
+
+fn resp_bulk(text: &str) -> Vec<u8> {
+    format!("${}\r\n{text}\r\n", text.len()).into_bytes()
+}
+
+fn replay_info_reply(chunk: &[u8]) -> Option<Vec<u8>> {
+    if !resp_contains(chunk, INFO_CMD) {
+        return None;
+    }
+    if resp_contains(chunk, INFO_MEMORY_ARG) {
+        Some(resp_bulk(SAFE_MEMORY_INFO))
+    } else {
+        Some(resp_bulk(CLUSTER_DISABLED_INFO))
+    }
+}
 
 fn resp_contains(chunk: &[u8], command: &[u8]) -> bool {
     chunk.windows(command.len()).any(|window| window == command)
@@ -1686,9 +1836,8 @@ async fn spawn_claim_redis_server(
                                         }
                                     }
                                 }
-                            } else if resp_contains(chunk, INFO_CMD) {
-                                let text = "# Cluster\r\ncluster_enabled:0\r\n";
-                                format!("${}\r\n{text}\r\n", text.len()).into_bytes()
+                            } else if let Some(reply) = replay_info_reply(chunk) {
+                                reply
                             } else {
                                 // The redis crate pipelines connection setup, so
                                 // reply once per command array in the chunk.
@@ -1751,13 +1900,16 @@ async fn spawn_info_silent_redis_server() -> (u16, tokio::sync::oneshot::Sender<
 }
 
 fn claim_client(port: u16, prefix: &str) -> Arc<RedisRateLimitClient> {
+    claim_client_with_interval(port, prefix, 3600)
+}
+
+fn claim_client_with_interval(port: u16, prefix: &str, interval_seconds: u64) -> Arc<RedisRateLimitClient> {
     let config = RedisConfig::from_plugin_config(
         &serde_json::json!({
             "sync_mode": "redis",
             "redis_url": format!("redis://127.0.0.1:{port}/0"),
-            // The admitted Redis timeout contract, reused as the response bound.
             "redis_connect_timeout_seconds": 1,
-            "redis_health_check_interval_seconds": 3600,
+            "redis_health_check_interval_seconds": interval_seconds,
         }),
         prefix,
     )
@@ -2133,9 +2285,8 @@ async fn spawn_ttl_observing_redis_server() -> (
                                         .push(ttl);
                                 }
                                 b"+OK\r\n".to_vec()
-                            } else if resp_contains(chunk, INFO_CMD) {
-                                let text = "# Cluster\r\ncluster_enabled:0\r\n";
-                                format!("${}\r\n{text}\r\n", text.len()).into_bytes()
+                            } else if let Some(reply) = replay_info_reply(chunk) {
+                                reply
                             } else {
                                 b"+OK\r\n".repeat(resp_command_count(chunk))
                             };
@@ -2253,8 +2404,7 @@ async fn spawn_logging_redis_server(
                                     format!("-ERR {SENTINEL_CMD_ERR}\r\n").into_bytes()
                                 }
                                 _ if resp_contains(chunk, INFO_CMD) => {
-                                    let text = "# Cluster\r\ncluster_enabled:0\r\n";
-                                    format!("${}\r\n{text}\r\n", text.len()).into_bytes()
+                                    replay_info_reply(chunk).expect("INFO chunk")
                                 }
                                 _ => b"+OK\r\n".repeat(resp_command_count(chunk)),
                             };
@@ -2424,5 +2574,234 @@ async fn generic_redis_client_still_logs_backend_error_text() {
         captured.contains(SENTINEL_CMD_ERR),
         "operational Redis clients must still log backend error text: {captured}"
     );
+    let _ = shutdown.send(());
+}
+
+#[derive(Clone, Copy)]
+enum MemoryInfoBehavior {
+    Payload(&'static str),
+    Raw(&'static str),
+    Never,
+    Sequence(&'static [&'static str]),
+}
+
+async fn spawn_memory_policy_redis(
+    memory: MemoryInfoBehavior,
+) -> (u16, tokio::sync::oneshot::Sender<()>) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind fake redis");
+    let port = listener.local_addr().expect("local addr").port();
+    let (shutdown_tx, mut shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+    let screens = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+
+    tokio::spawn(async move {
+        loop {
+            tokio::select! {
+                _ = &mut shutdown_rx => break,
+                accepted = listener.accept() => {
+                    let Ok((mut stream, _)) = accepted else { break };
+                    let screens = Arc::clone(&screens);
+                    tokio::spawn(async move {
+                        let mut buf = vec![0u8; 16 * 1024];
+                        loop {
+                            let read = match stream.read(&mut buf).await {
+                                Ok(0) | Err(_) => break,
+                                Ok(read) => read,
+                            };
+                            let chunk = &buf[..read];
+                            let reply: Vec<u8> = if resp_contains(chunk, INFO_MEMORY_ARG) {
+                                let index = screens.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                                match memory {
+                                    MemoryInfoBehavior::Payload(text) => resp_bulk(text),
+                                    MemoryInfoBehavior::Raw(raw) => raw.as_bytes().to_vec(),
+                                    MemoryInfoBehavior::Never => continue,
+                                    MemoryInfoBehavior::Sequence(texts) => {
+                                        let text = texts
+                                            .get(index)
+                                            .copied()
+                                            .unwrap_or(texts[texts.len() - 1]);
+                                        resp_bulk(text)
+                                    }
+                                }
+                            } else if resp_contains(chunk, INFO_CMD) {
+                                resp_bulk(CLUSTER_DISABLED_INFO)
+                            } else {
+                                b"+OK\r\n".repeat(resp_command_count(chunk))
+                            };
+                            if stream.write_all(&reply).await.is_err() {
+                                break;
+                            }
+                        }
+                    });
+                }
+            }
+        }
+    });
+
+    (port, shutdown_tx)
+}
+
+const MEMORY_UNLIMITED: &str = "# Memory\r\nmaxmemory:0\r\nmaxmemory_policy:allkeys-lru\r\n";
+const MEMORY_NOEVICTION: &str = "# Memory\r\nmaxmemory:1048576\r\nmaxmemory_policy:noeviction\r\n";
+const MEMORY_VOLATILE: &str = "# Memory\r\nmaxmemory:1048576\r\nmaxmemory_policy:volatile-lru\r\n";
+const MEMORY_ALLKEYS: &str = "# Memory\r\nmaxmemory:1048576\r\nmaxmemory_policy:allkeys-lfu\r\n";
+const MEMORY_MALFORMED: &str = "# Memory\r\nmaxmemory_human:1M\r\nused_memory:123\r\n";
+
+#[tokio::test]
+async fn replay_redis_accepts_unlimited_memory_or_noeviction() {
+    let _serialized = shared_health_guard_async().await;
+    for (label, payload) in [
+        ("maxmemory-zero", MEMORY_UNLIMITED),
+        ("noeviction", MEMORY_NOEVICTION),
+    ] {
+        let (port, shutdown) = spawn_memory_policy_redis(MemoryInfoBehavior::Payload(payload)).await;
+        let client = claim_client(port, &format!("ferrum:replay_authority_tests:mem-{label}"));
+        let authority = ReplayAuthority::shared(Arc::clone(&client), RETENTION);
+        wait_until_available(&client).await;
+        assert!(
+            !client.is_topology_unsupported(),
+            "{label}: a safe memory policy is not terminal"
+        );
+        drop(authority);
+        drop(client);
+        let _ = shutdown.send(());
+    }
+}
+
+#[tokio::test]
+async fn replay_redis_rejects_an_evicting_policy_terminally() {
+    let _serialized = shared_health_guard_async().await;
+    for (label, payload) in [
+        ("volatile-lru", MEMORY_VOLATILE),
+        ("allkeys-lfu", MEMORY_ALLKEYS),
+    ] {
+        let (port, shutdown) = spawn_memory_policy_redis(MemoryInfoBehavior::Payload(payload)).await;
+        let client = claim_client(port, &format!("ferrum:replay_authority_tests:evict-{label}"));
+        let authority = ReplayAuthority::shared(Arc::clone(&client), RETENTION);
+        wait_until(
+            || client.is_topology_unsupported(),
+            &format!("{label}: evicting policy must be terminal"),
+        )
+        .await;
+        assert!(
+            !client.is_available(),
+            "{label}: an evicting policy must fail closed"
+        );
+        drop(authority);
+        drop(client);
+        let _ = shutdown.send(());
+    }
+}
+
+#[tokio::test]
+async fn replay_redis_treats_unproven_memory_policy_as_a_recoverable_outage() {
+    let _serialized = shared_health_guard_async().await;
+    for (label, behavior) in [
+        ("malformed", MemoryInfoBehavior::Payload(MEMORY_MALFORMED)),
+        (
+            "acl",
+            MemoryInfoBehavior::Raw(
+                "-NOPERM this user has no permissions to run the 'info' command or its subcommand\r\n",
+            ),
+        ),
+        ("timeout", MemoryInfoBehavior::Never),
+    ] {
+        let (port, shutdown) = spawn_memory_policy_redis(behavior).await;
+        let client = claim_client(
+            port,
+            &format!("ferrum:replay_authority_tests:unproven-{label}"),
+        );
+        let authority = ReplayAuthority::shared(Arc::clone(&client), RETENTION);
+        for _ in 0..80 {
+            assert!(
+                !client.is_available(),
+                "{label}: unproven memory policy must fail closed"
+            );
+            assert!(
+                !client.is_topology_unsupported(),
+                "{label}: unproven memory policy is recoverable, not terminal"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        drop(authority);
+        drop(client);
+        let _ = shutdown.send(());
+    }
+}
+
+#[tokio::test]
+async fn replay_redis_recovers_after_an_unproven_memory_policy_screen() {
+    let _serialized = shared_health_guard_async().await;
+    let (port, shutdown) = spawn_memory_policy_redis(MemoryInfoBehavior::Sequence(&[
+        MEMORY_MALFORMED,
+        MEMORY_NOEVICTION,
+    ]))
+    .await;
+    let client = claim_client_with_interval(port, "ferrum:replay_authority_tests:mem-recover", 1);
+    let authority = ReplayAuthority::shared(Arc::clone(&client), RETENTION);
+    wait_until_available(&client).await;
+    assert!(!client.is_topology_unsupported());
+    drop(authority);
+    drop(client);
+    let _ = shutdown.send(());
+}
+
+#[tokio::test]
+async fn replay_redis_does_not_recover_from_a_proven_evicting_policy() {
+    let _serialized = shared_health_guard_async().await;
+    let (port, shutdown) = spawn_memory_policy_redis(MemoryInfoBehavior::Sequence(&[
+        MEMORY_VOLATILE,
+        MEMORY_NOEVICTION,
+    ]))
+    .await;
+    let client = claim_client(port, "ferrum:replay_authority_tests:mem-terminal");
+    let authority = ReplayAuthority::shared(Arc::clone(&client), RETENTION);
+    wait_until(
+        || client.is_topology_unsupported(),
+        "evicting policy is terminal",
+    )
+    .await;
+    for _ in 0..80 {
+        assert!(
+            !client.is_available(),
+            "a later noeviction reply must not resurrect a proven-unsafe generation"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    drop(authority);
+    drop(client);
+    let _ = shutdown.send(());
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn replay_redis_memory_policy_logs_only_closed_set_classifications() {
+    let _serialized = shared_health_guard_async().await;
+    let (logs, guard) = super::plugin_utils::capture_logs();
+    let (port, shutdown) =
+        spawn_memory_policy_redis(MemoryInfoBehavior::Payload(MEMORY_VOLATILE)).await;
+    let client = claim_client(port, "ferrum:replay_authority_tests:mem-log");
+    let authority = ReplayAuthority::shared(Arc::clone(&client), RETENTION);
+    wait_until(
+        || client.is_topology_unsupported(),
+        "unsafe eviction classification",
+    )
+    .await;
+    drop(guard);
+    let captured = logs.contents();
+    assert!(
+        captured.contains("unsafe_eviction_policy"),
+        "must publish the closed-set classification: {captured}"
+    );
+    assert!(
+        !captured.contains("volatile-lru")
+            && !captured.contains("maxmemory")
+            && !captured.contains(MEMORY_VOLATILE),
+        "must not log raw INFO text: {captured}"
+    );
+    drop(authority);
+    drop(client);
     let _ = shutdown.send(());
 }

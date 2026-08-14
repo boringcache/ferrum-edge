@@ -1503,6 +1503,57 @@ fn parse_cluster_enabled_recognizes_only_a_reported_value() {
 }
 
 #[test]
+fn classify_memory_info_accepts_unlimited_or_noeviction_only() {
+    use ferrum_edge::_test_support::{MemoryPolicyScreen, classify_memory_info};
+
+    assert_eq!(
+        classify_memory_info("# Memory\r\nmaxmemory:0\r\nmaxmemory_policy:allkeys-lru\r\n"),
+        MemoryPolicyScreen::Usable
+    );
+    // Redis INFO MEMORY also emits `maxmemory_human`; that must not clobber the
+    // exact `maxmemory` field or an unlimited server looks unproven/unsafe.
+    assert_eq!(
+        classify_memory_info(
+            "# Memory\r\nmaxmemory:0\r\nmaxmemory_human:0B\r\nmaxmemory_policy:allkeys-lru\r\n"
+        ),
+        MemoryPolicyScreen::Usable
+    );
+    assert_eq!(
+        classify_memory_info("# Memory\r\nmaxmemory:1048576\r\nmaxmemory_policy:noeviction\r\n"),
+        MemoryPolicyScreen::Usable
+    );
+    assert_eq!(
+        classify_memory_info("# Memory\r\nmaxmemory_policy:noeviction\r\n"),
+        MemoryPolicyScreen::Usable
+    );
+    assert_eq!(
+        classify_memory_info("# Memory\r\nmaxmemory:1\r\nmaxmemory_policy:volatile-lru\r\n"),
+        MemoryPolicyScreen::UnsafeEviction
+    );
+    assert_eq!(
+        classify_memory_info("# Memory\r\nmaxmemory:1\r\nmaxmemory_policy:allkeys-lru\r\n"),
+        MemoryPolicyScreen::UnsafeEviction
+    );
+    assert_eq!(
+        classify_memory_info("# Memory\r\nmaxmemory_policy:allkeys-random\r\n"),
+        MemoryPolicyScreen::UnsafeEviction
+    );
+    assert_eq!(
+        classify_memory_info("# Memory\r\nmaxmemory:1\r\n"),
+        MemoryPolicyScreen::Unproven
+    );
+    assert_eq!(
+        classify_memory_info("# Memory\r\nmaxmemory_human:1M\r\n"),
+        MemoryPolicyScreen::Unproven
+    );
+    assert_eq!(classify_memory_info(""), MemoryPolicyScreen::Unproven);
+    assert_eq!(
+        classify_memory_info("maxmemory:\r\nmaxmemory_policy:\r\n"),
+        MemoryPolicyScreen::Unproven
+    );
+}
+
+#[test]
 fn cluster_topology_codes_are_terminal_but_outage_codes_are_not() {
     use ferrum_edge::_test_support::is_cluster_topology_code;
 

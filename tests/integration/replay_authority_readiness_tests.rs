@@ -171,6 +171,9 @@ fn shared_client_for_url(
 }
 
 const INFO_CMD: &[u8] = b"$4\r\nINFO\r\n";
+const INFO_MEMORY_ARG: &[u8] = b"$6\r\nMEMORY\r\n";
+const CLUSTER_DISABLED_INFO: &str = "# Cluster\r\ncluster_enabled:0\r\n";
+const SAFE_MEMORY_INFO: &str = "# Memory\r\nmaxmemory:0\r\nmaxmemory_policy:noeviction\r\n";
 
 fn resp_command_count(chunk: &[u8]) -> usize {
     chunk.iter().filter(|&&byte| byte == b'*').count().max(1)
@@ -181,9 +184,10 @@ fn resp_contains(chunk: &[u8], command: &[u8]) -> bool {
 }
 
 /// Gated RESP peer: when closed, accepted sockets are dropped so the probe
-/// fails fast; when open, handshake/PING succeed and `INFO CLUSTER` reports a
-/// usable non-Cluster topology. Recovery is proven by that screen, not by PING
-/// alone and not by a protected `SET`.
+/// fails fast; when open, handshake/PING succeed, `INFO CLUSTER` reports a
+/// usable non-Cluster topology, and `INFO MEMORY` proves a no-eviction
+/// posture. Recovery is proven by those screens, not by PING alone and not
+/// by a protected `SET`.
 async fn spawn_gated_replay_redis(
     initially_open: bool,
 ) -> (u16, Arc<AtomicBool>, tokio::sync::oneshot::Sender<()>) {
@@ -216,7 +220,11 @@ async fn spawn_gated_replay_redis(
                             };
                             let chunk = &buf[..read];
                             let reply: Vec<u8> = if resp_contains(chunk, INFO_CMD) {
-                                let text = "# Cluster\r\ncluster_enabled:0\r\n";
+                                let text = if resp_contains(chunk, INFO_MEMORY_ARG) {
+                                    SAFE_MEMORY_INFO
+                                } else {
+                                    CLUSTER_DISABLED_INFO
+                                };
                                 format!("${}\r\n{text}\r\n", text.len()).into_bytes()
                             } else {
                                 b"+OK\r\n".repeat(resp_command_count(chunk))

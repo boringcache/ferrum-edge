@@ -35,10 +35,12 @@
 //! cache is exactly the reload replay opening this module exists to close.
 //!
 //! A sub-domain must be *semantic* for the same reason. `jwks_auth` derives one
-//! from each provider's trust anchor rather than from its position in the
-//! `providers` array: an ordinal is not an identity, and reordering an unchanged
-//! list would otherwise strand a provider's live markers in a lane nothing
-//! consults and readmit a proof it had already claimed.
+//! from each provider's exact issuer realm rather than from its JWKS contents,
+//! source URL, or position in the `providers` array: an ordinal is not an
+//! identity, and hashing a key set or endpoint would otherwise reopen live
+//! proofs on an ordinary rotation. Reordering an unchanged list would strand a
+//! provider's live markers in a lane nothing consults and readmit a proof it
+//! had already claimed.
 //!
 //! Lanes live in a process-global registry ([`PROCESS_REPLAY_LANES`]) held by
 //! **strong** reference, so a deleted or renamed policy leaves its lane behind
@@ -56,7 +58,9 @@
 //! behavior — treats capacity pressure as permission to forget a replay marker,
 //! which lets a client with one valid credential burn other clients' protection
 //! by generating unique proofs. Capacity degrades into refusal, never into
-//! silent unprotection.
+//! silent unprotection. Repeated refusals while every retained marker is still
+//! live are O(1): a conservative earliest-expiry lower bound, fenced against
+//! concurrent inserts, skips the map walk until an expiry is actually due.
 //!
 //! The shared lane retains markers; each live authority enforces the
 //! `max_entries` *it was admitted with* against that shared count. An equivalent
@@ -98,7 +102,11 @@
 //! to process-local acceptance when the shared authority is unreachable
 //! reinstates exactly the cross-replica bypass the shared authority exists to
 //! close. A shared-backend timeout, partition, authentication failure,
-//! corruption, or capacity failure rejects the protected request.
+//! corruption, capacity failure, or proven-unsafe Redis eviction policy
+//! rejects the protected request. Replay Redis clients additionally refuse a
+//! server that cannot prove `maxmemory == 0` or `maxmemory_policy == noeviction`,
+//! so `SET … NX EX` cannot silently recreate a still-live marker after Redis
+//! evicted it. Durability and failover remain operator-owned.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
@@ -275,11 +283,11 @@ impl ReplayDomain {
     ///   profile revision cannot be answered from an old profile's history.
     /// * `namespace` / `plugin` / `config_id` — the stable policy identity.
     /// * `sub_domain` — a bounded, configuration-derived discriminator such as
-    ///   a digest of one provider's trust anchor. It must be *semantic*: an
-    ///   ordinal position in a configuration array is not an identity, because
-    ///   reordering an unchanged list would move a policy into a fresh lane and
-    ///   reopen every proof it had already claimed. Never request-controlled
-    ///   data.
+    ///   a digest of one provider's exact issuer realm. It must be *semantic*:
+    ///   an ordinal position, JWKS document, key id, or source URL is not an
+    ///   identity, because reordering or rotating keys would move a policy into
+    ///   a fresh lane and reopen every proof it had already claimed. Never
+    ///   request-controlled data.
     pub fn new(
         profile: &str,
         namespace: &str,
@@ -413,6 +421,19 @@ pub struct ProcessReplayLane {
     /// Highest expiry ever written. Reading it is how lane reclamation proves
     /// "no live marker remains" without scanning the map.
     newest_expiry_millis: AtomicU64,
+    /// Conservative lower bound on the earliest live expiry. Starts at
+    /// [`u64::MAX`] (empty). Inserts and refreshes may only move it earlier
+    /// (`fetch_min`). A later bound is published only after a full scan whose
+    /// seqlock epoch proves no concurrent writer inserted an unseen earlier
+    /// expiry. Capacity refusals compare this bound inside the prune lock and
+    /// skip the map walk while it is still in the future.
+    earliest_expiry_millis: AtomicU64,
+    /// Seqlock around expiry publication. Even = stable; odd = a writer is
+    /// inserting or refreshing an expiry. Prune publishes a later bound only
+    /// when the epoch is even and unchanged across the scan.
+    write_seq: AtomicU64,
+    /// How many times the capacity path actually walked the map (test support).
+    prune_scans: AtomicU64,
     /// Serializes the capacity-pressure prune so concurrent saturated requests
     /// do not each walk the map. Never taken on the ordinary admission path.
     prune_lock: Mutex<()>,
@@ -424,6 +445,9 @@ impl ProcessReplayLane {
             entries: DashMap::with_shard_amount(shard_amount),
             entry_count: AtomicUsize::new(0),
             newest_expiry_millis: AtomicU64::new(0),
+            earliest_expiry_millis: AtomicU64::new(u64::MAX),
+            write_seq: AtomicU64::new(0),
+            prune_scans: AtomicU64::new(0),
             prune_lock: Mutex::new(()),
         })
     }
@@ -463,8 +487,9 @@ impl ProcessReplayLane {
                     // `max_entries`. The stored expiry only ever moves forward.
                     if self.entry_count.load(Ordering::Acquire) <= max_entries {
                         let refreshed = (*existing.get()).max(expires_at);
+                        self.begin_expiry_write();
                         existing.insert(refreshed);
-                        self.note_expiry(refreshed);
+                        self.finish_expiry_write(refreshed);
                         return ReplayAdmission::Admitted;
                     }
                     // Over cap: drop the shard guard and reclaim expired
@@ -474,8 +499,9 @@ impl ProcessReplayLane {
                 }
                 Entry::Vacant(vacant) => {
                     if self.try_reserve_slot(max_entries) {
+                        self.begin_expiry_write();
                         vacant.insert(expires_at);
-                        self.note_expiry(expires_at);
+                        self.finish_expiry_write(expires_at);
                         return ReplayAdmission::Admitted;
                     }
                     // Do not walk other shards while holding a vacant-entry
@@ -507,6 +533,22 @@ impl ProcessReplayLane {
             .fetch_max(expires_at, Ordering::AcqRel);
     }
 
+    /// Record an insert or in-place refresh on the hot path: bump the seqlock
+    /// odd before the map write, move the earliest bound only earlier, then
+    /// release even. AcqRel on the odd epoch keeps the subsequent DashMap
+    /// insert from becoming visible before prune can observe a writer.
+    /// Never takes `prune_lock` and never allocates.
+    fn begin_expiry_write(&self) {
+        self.write_seq.fetch_add(1, Ordering::AcqRel);
+    }
+
+    fn finish_expiry_write(&self, expires_at: u64) {
+        self.note_expiry(expires_at);
+        self.earliest_expiry_millis
+            .fetch_min(expires_at, Ordering::AcqRel);
+        self.write_seq.fetch_add(1, Ordering::Release);
+    }
+
     fn try_reserve_slot(&self, max_entries: usize) -> bool {
         self.entry_count
             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |count| {
@@ -520,30 +562,68 @@ impl ProcessReplayLane {
     /// Serialized by [`Self::prune_lock`] so a burst of saturated requests pays
     /// for at most one concurrent walk. Bounded by the lane's retained entries,
     /// and reached only when the calling authority is already at its cap.
+    /// Repeated refusals while the conservative earliest-expiry bound is still
+    /// in the future return immediately without walking the map.
     fn prune_expired(&self, now_millis: u64) -> usize {
+        if self.earliest_expiry_millis.load(Ordering::Acquire) > now_millis {
+            return 0;
+        }
         let _guard = self
             .prune_lock
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let expired: Vec<[u8; 32]> = self
-            .entries
-            .iter()
-            .filter(|entry| *entry.value() <= now_millis)
-            .map(|entry| *entry.key())
-            .collect();
+        if self.earliest_expiry_millis.load(Ordering::Acquire) > now_millis {
+            return 0;
+        }
+
+        self.prune_scans.fetch_add(1, Ordering::Relaxed);
+        let seq_before = self.write_seq.load(Ordering::Acquire);
+        let writer_in_flight = seq_before % 2 == 1;
+
+        let mut expired: Vec<[u8; 32]> = Vec::new();
+        let mut live_min = u64::MAX;
+        for entry in self.entries.iter() {
+            let expires_at = *entry.value();
+            if expires_at <= now_millis {
+                expired.push(*entry.key());
+            } else {
+                live_min = live_min.min(expires_at);
+            }
+        }
         let mut reclaimed = 0usize;
         for key in expired {
             // Re-check the expiry under the shard guard: a concurrent request
             // may have refreshed this marker between the scan and the removal,
             // and removing it then would drop a live claim.
-            if self
+            match self
                 .entries
                 .remove_if(&key, |_, expires_at| *expires_at <= now_millis)
-                .is_some()
             {
-                self.entry_count.fetch_sub(1, Ordering::AcqRel);
-                reclaimed += 1;
+                Some(_) => {
+                    self.entry_count.fetch_sub(1, Ordering::AcqRel);
+                    reclaimed += 1;
+                }
+                None => {
+                    if let Some(current) = self.entries.get(&key) {
+                        live_min = live_min.min(*current);
+                    }
+                }
             }
+        }
+
+        let seq_after = self.write_seq.load(Ordering::Acquire);
+        if writer_in_flight || seq_before != seq_after {
+            return reclaimed;
+        }
+        // Publish a (possibly later) bound only after a clean exclusive scan.
+        // Re-check the epoch after the store: a writer can insert, fetch_min an
+        // earlier expiry, and finish between the seq_after load and this store,
+        // and overwriting that earlier bound would forget a live marker.
+        self.earliest_expiry_millis
+            .store(live_min, Ordering::Release);
+        let seq_commit = self.write_seq.load(Ordering::Acquire);
+        if seq_before != seq_commit {
+            self.earliest_expiry_millis.store(0, Ordering::Release);
         }
         reclaimed
     }
@@ -561,6 +641,12 @@ impl ProcessReplayLane {
     #[allow(dead_code)] // exercised by external unit tests
     pub fn retained_entries(&self) -> usize {
         self.entry_count.load(Ordering::Acquire)
+    }
+
+    /// How many times the capacity path walked the map (test support).
+    #[allow(dead_code)] // exercised by external unit tests
+    pub fn prune_scans(&self) -> u64 {
+        self.prune_scans.load(Ordering::Acquire)
     }
 }
 

@@ -59,17 +59,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     `dpop_replay_scope` and the same cap (process scope). A mixed process/shared
     pair is refused even when Redis is configured, because matching order would
     otherwise claim the same proof once in the process store and once in Redis.
-    Remote JWKS/discovery URLs are bound by their canonical parsed form
-    (host case and default ports converge; issuer matching stays exact).
-    Configs carrying the removed keys are rejected with the replacement named.
+    `require_dpop` now also requires a nonblank exact `issuer`: the replay realm
+    is that issuer, so equivalent reloads, inline key rotation, and remote
+    source-endpoint changes preserve markers instead of reopening a proof.
+    Providers that share one exact issuer share one realm even when JWKS
+    sources or key sets differ or overlap, and must agree on `require_dpop`
+    (a non-DPoP sibling is a bearer-only bypass). Distinct issuers stay
+    isolated. Configs carrying the removed keys are rejected with the replacement named.
   - **Redis HA requirement.** Any deployment running more than one gateway
     replica behind a load balancer — including a rolling deployment, where old
     and new processes serve concurrently — must declare `shared` scope and
     provision Redis via `sync_mode: "redis"`. `process` scope in a multi-replica
     deployment means one replay per replica. There is deliberately no fallback
     between the two scopes: a shared-backend timeout, partition, authentication
-    failure, capacity failure, or proven-unsupported topology refuses the
-    protected request rather than degrading to local acceptance. Authenticated
+    failure, capacity failure, proven-unsupported topology, or proven-unsafe
+    Redis eviction policy (`allkeys-*` / `volatile-*`) refuses the protected
+    request rather than degrading to local acceptance. Replay Redis clients
+    accept a connection only when `INFO MEMORY` proves `maxmemory == 0` or
+    `maxmemory_policy == noeviction`; an unproven query fails closed and
+    recoverable. Durability and failover remain operator-owned. Authenticated
     `/health` and `/status` fail readiness (`status: "unavailable"`) while a live
     policy's shared backend is unavailable, and publish a bounded
     `replay_authority` aggregate; recovery restores readiness with no restart.
@@ -77,7 +85,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Migration: add `"replay_scope": "process"` (single process) or
   `"replay_scope": "shared"` with `sync_mode: "redis"` and a `redis_url`
   (multi-replica) to every `hmac_auth` config, add
-  `"dpop_replay_scope"` to every `require_dpop` provider, drop
+  `"dpop_replay_scope"` to every `require_dpop` provider, declare a nonblank
+  exact `issuer` on those providers, drop
   `dpop_jti_ttl_secs` / `dpop_jti_cache_max_entries`, lower any
   `clock_skew_seconds` above 300, and update HMAC clients to send and sign a
   nonce. To defer the client change, set the acknowledged v1 profile explicitly

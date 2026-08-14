@@ -192,8 +192,9 @@ struct JwksProvider {
     /// and so an equivalent reload — and every replica of the same policy —
     /// derives the same domain and therefore the same replay lane / shared
     /// keyspace. The sub-domain is [`dpop_provider_identity`], a digest of the
-    /// provider's trust anchor, **not** its position in the `providers` array:
-    /// reordering the list must not move a provider into a fresh replay lane and
+    /// provider's exact `issuer` realm, **not** its JWKS contents, key ids,
+    /// array position, or source URL: reordering, rotating keys, or changing
+    /// a JWKS endpoint must not move a provider into a fresh replay lane and
     /// reopen a proof it already accepted.
     dpop_replay_domain: Option<ReplayDomain>,
     /// Single-use authority this provider's proofs are claimed against.
@@ -354,8 +355,8 @@ impl JwksAuth {
 
     /// Construct with the configured plugin-config resource id.
     ///
-    /// That id — together with the namespace and each provider's semantic
-    /// identity ([`dpop_provider_identity`]) — is the stable protection-domain
+    /// That id — together with the namespace and each provider's exact issuer
+    /// realm ([`dpop_provider_identity`]) — is the stable protection-domain
     /// identity. Production `PluginCache` must pass it:
     /// with `None`, every reload generation would own a private replay lane and
     /// a rebuilt plugin would accept a proof it had already admitted.
@@ -454,15 +455,16 @@ impl JwksAuth {
 
         let mut providers = Vec::with_capacity(providers_arr.len());
         let mut declared_dpop_scopes: Vec<ReplayScope> = Vec::new();
-        // Equivalent providers (same issuer + JWKS source) converge on one
-        // replay domain. They may share that domain only when they agree on
+        // Equivalent providers (same exact issuer) converge on one replay
+        // domain. They may share that domain only when they agree on
         // `require_dpop`, and when DPoP is required, on replay scope/store and
         // process-lane capacity. Matching order, a reload, or a rolling replica
         // would otherwise pick which authority a proof is claimed against and
-        // admit it twice. Track the first admission per identity so a
-        // disagreement is refused order-independently, without binding scope or
-        // capacity into the replay identity (that would reopen live proofs on
-        // an ordinary authorization or cap edit).
+        // admit it twice. Track the first admission per issuer realm so a
+        // disagreement is refused order-independently, without binding JWKS
+        // contents, source URL, scope, or capacity into the replay identity
+        // (that would reopen live proofs on an ordinary key rotation or cap
+        // edit).
         let mut equivalent_provider_replay: HashMap<String, EquivalentProviderReplayAdmission> =
             HashMap::new();
 
@@ -544,6 +546,14 @@ impl JwksAuth {
                 optional_provider_bool(prov_obj, "require_mtls_binding", idx)?.unwrap_or(false);
             let require_dpop =
                 optional_provider_bool(prov_obj, "require_dpop", idx)?.unwrap_or(false);
+            if require_dpop && issuer.is_none() {
+                return Err(format!(
+                    "jwks_auth: 'provider[{idx}].issuer' is required when 'require_dpop' is true \
+                     — DPoP replay is bound to an exact issuer realm, so a blank or omitted \
+                     issuer cannot isolate or preserve single-use proofs across key or source \
+                     rotation"
+                ));
+            }
             let dpop_clock_skew_secs =
                 optional_provider_u64(prov_obj, "dpop_clock_skew_secs", idx)?.unwrap_or(30);
             if dpop_clock_skew_secs > MAX_DPOP_CLOCK_SKEW_SECS {
@@ -593,53 +603,47 @@ impl JwksAuth {
                 declared_dpop_scopes.push(scope);
             }
 
-            // The DPoP protection sub-domain is a **semantic** provider
-            // identity, never the provider's position in the array. An array
-            // index makes reordering an otherwise unchanged provider list a
-            // security event: provider `B` moves from sub-domain `1` to `0`, its
-            // live markers stay behind in a lane nothing consults, and an
-            // already-accepted proof is admitted a second time. The same happens
-            // when an unrelated provider is inserted or deleted ahead of it.
-            //
-            // See [`dpop_provider_identity`] for what the identity binds and,
-            // just as importantly, what it deliberately does not. Identity is
-            // computed for every provider, including those that do not require
-            // DPoP, so a sibling that shares the trust anchor cannot skip the
-            // proof the DPoP provider exists to demand.
-            let provider_identity = dpop_provider_identity(
-                issuer.as_deref(),
-                jwks_endpoint.as_ref().map(|endpoint| &endpoint.parsed),
-                discovery_endpoint.as_ref().map(|endpoint| &endpoint.parsed),
-                inline_jwks.as_deref(),
-            );
-            if let Some(earlier) = equivalent_provider_replay.get(&provider_identity) {
-                reject_equivalent_provider_replay_disagreement(
-                    earlier,
-                    idx,
-                    require_dpop,
-                    declared_scope,
-                    dpop_replay_max_entries,
-                )?;
-            } else {
-                equivalent_provider_replay.insert(
-                    provider_identity.clone(),
-                    EquivalentProviderReplayAdmission {
+            // The DPoP protection sub-domain is a **semantic** issuer realm,
+            // never the provider's position in the array, JWKS document, or
+            // source URL. An array index makes reordering a security event;
+            // hashing JWKS contents or the source endpoint makes an ordinary
+            // key rotation or URI change reopen every live proof. See
+            // [`dpop_provider_identity`]. Identity is computed for every
+            // provider that declares an issuer, including those that do not
+            // require DPoP, so a bearer-only sibling for the same issuer
+            // cannot skip the proof the DPoP provider exists to demand.
+            let provider_identity = issuer.as_deref().map(dpop_provider_identity);
+            if let Some(identity) = provider_identity.as_ref() {
+                if let Some(earlier) = equivalent_provider_replay.get(identity) {
+                    reject_equivalent_provider_replay_disagreement(
+                        earlier,
                         idx,
                         require_dpop,
-                        scope: declared_scope,
-                        process_capacity: dpop_replay_max_entries,
-                    },
-                );
+                        declared_scope,
+                        dpop_replay_max_entries,
+                    )?;
+                } else {
+                    equivalent_provider_replay.insert(
+                        identity.clone(),
+                        EquivalentProviderReplayAdmission {
+                            idx,
+                            require_dpop,
+                            scope: declared_scope,
+                            process_capacity: dpop_replay_max_entries,
+                        },
+                    );
+                }
             }
-            let dpop_replay_domain = require_dpop.then(|| {
-                ReplayDomain::new(
+            let dpop_replay_domain = match (require_dpop, provider_identity.as_ref()) {
+                (true, Some(identity)) => Some(ReplayDomain::new(
                     DPOP_REPLAY_PROFILE,
                     &namespace,
                     "jwks_auth",
                     &policy_config_id,
-                    &provider_identity,
-                )
-            });
+                    identity,
+                )),
+                _ => None,
+            };
             let dpop_replay = match (declared_scope, dpop_replay_domain.as_ref()) {
                 (Some(ReplayScope::Process), Some(domain)) => {
                     Some(Arc::new(ReplayAuthority::process(
@@ -1820,9 +1824,6 @@ async fn try_validate_with_provider(provider: &JwksProvider, token: &str) -> Opt
 struct ParsedEndpoint {
     url: String,
     hostname: String,
-    /// Already-validated `url::Url`. Used only to derive the canonical remote
-    /// trust-source identity for DPoP replay; fetch still uses [`Self::url`].
-    parsed: Url,
 }
 
 /// Plugin-config id used when no stable resource id is supplied (Admin config
@@ -2009,7 +2010,6 @@ fn parse_url_field(
     Ok(Some(ParsedEndpoint {
         url: url.to_string(),
         hostname,
-        parsed,
     }))
 }
 
@@ -2045,11 +2045,12 @@ fn has_non_empty_authority(url: &str) -> bool {
     authority_end > 0
 }
 
-/// First-seen admission for one semantic provider identity.
+/// First-seen admission for one issuer-realm identity.
 ///
 /// Equivalent providers share a replay domain, so a later sibling is admitted
 /// only when it agrees with this record. The earlier index is kept for
-/// diagnostics; scope and capacity stay out of the domain identity.
+/// diagnostics; JWKS contents, source URL, scope, and capacity stay out of
+/// the domain identity.
 struct EquivalentProviderReplayAdmission {
     idx: usize,
     require_dpop: bool,
@@ -2059,13 +2060,13 @@ struct EquivalentProviderReplayAdmission {
 
 /// Refuse an equivalent provider that would split DPoP authority.
 ///
-/// A token that verifies against this trust anchor is matched to the first
+/// A token that verifies against this issuer realm is matched to the first
 /// succeeding provider. If that pair disagrees on `require_dpop`, matching
 /// order is an authentication bypass (one sibling demands a single-use proof
 /// and the other accepts the bearer alone). If both require DPoP but disagree
 /// on `dpop_replay_scope`, the same proof is claimed in the process store by
 /// one sibling and in Redis by the other — exactly the cross-authority replay
-/// the semantic identity exists to prevent. Process-lane capacity stays a
+/// the issuer-realm identity exists to prevent. Process-lane capacity stays a
 /// same-scope equality rule so matching order cannot pick which cap applies.
 fn reject_equivalent_provider_replay_disagreement(
     earlier: &EquivalentProviderReplayAdmission,
@@ -2078,8 +2079,8 @@ fn reject_equivalent_provider_replay_disagreement(
     if earlier.require_dpop != require_dpop {
         return Err(format!(
             "jwks_auth: equivalent providers must agree on 'require_dpop'; \
-             provider[{earlier_idx}] and provider[{idx}] share one token trust \
-             anchor with incompatible DPoP requirements"
+             provider[{earlier_idx}] and provider[{idx}] share one issuer \
+             realm with incompatible DPoP requirements"
         ));
     }
     if require_dpop && earlier.scope != declared_scope {
@@ -2104,7 +2105,7 @@ fn reject_equivalent_provider_replay_disagreement(
     Ok(())
 }
 
-/// Deterministic, bounded **semantic identity** of one DPoP-requiring provider,
+/// Deterministic, bounded **semantic identity** of one DPoP issuer realm,
 /// used as its replay protection sub-domain.
 ///
 /// # Why not the array index
@@ -2117,93 +2118,50 @@ fn reject_equivalent_provider_replay_disagreement(
 /// property `require_dpop` exists to deny. The identity below is stable across
 /// reorder, reload, restart, and every replica of one policy.
 ///
+/// # Why not the JWKS document or source URL
+///
+/// Hashing the inline JWKS, a key id, array position, or remote source
+/// endpoint makes an ordinary trust-source rotation a security event: adding,
+/// removing, or reordering keys, or changing `jwks_uri` / `discovery_url`
+/// while the same previously accepted access token + DPoP proof remains valid
+/// under the replacement provider, creates a fresh replay domain. The exact
+/// proof is then claimable again. Exact-JWKS equality also misses overlapping
+/// providers: two entries with the same issuer and overlapping accepted
+/// signing keys can select different process/shared authorities after reorder.
+///
 /// # What it binds
 ///
-/// The provider's **token trust anchor**: the expected `iss` and the JWKS source
-/// that decides which signing keys are acceptable. Two providers that differ in
-/// either are genuinely different admission domains and must not share replay
-/// state; two that agree on both are the same trust anchor and converge on one
-/// lane, so a duplicate/equivalent provider entry cannot be used to launder a
-/// second acceptance of one proof. Remote `jwks_uri` / `discovery_url` values
-/// are bound by a canonical parsed endpoint (scheme, host, default-port
-/// normalized port, path, query) so equivalent spellings accepted by
-/// [`url::Url`] — host case, an explicit default port — stay on one lane.
-/// Issuer matching remains exact: an issuer is not a URL endpoint and is not
-/// normalized here.
+/// The provider's **exact `issuer` realm**. `require_dpop` providers must
+/// declare a nonblank issuer, so the replay sub-domain has a stable semantic
+/// identity that survives key-set and source-endpoint rotation. Issuer
+/// matching remains exact: an issuer is not a URL endpoint and is not
+/// normalized here. Providers in one policy that share that exact issuer
+/// share one replay realm even when their JWKS sources, audiences, scopes, or
+/// key sets differ or overlap; they must therefore agree on `require_dpop`,
+/// and when DPoP is required they must agree on replay scope and process
+/// capacity. A non-DPoP sibling for the same issuer is refused as a
+/// bearer-only bypass. Different exact issuers remain isolated.
 ///
 /// # What it deliberately does not bind
 ///
-/// Everything else a provider configures — `audiences`, `required_scopes`,
-/// `required_roles`, claim/header mappings, token locations,
-/// `forward_original_token`, `jwks_max_stale_seconds`, `dpop_replay_max_entries`,
-/// `dpop_replay_scope`, and notably `dpop_clock_skew_secs`. Folding those in
-/// would make an ordinary authorization edit *reopen every live proof*, which is
-/// strictly worse than the isolation it would buy: an already-claimed `jti` must
-/// stay claimed across a tightened scope list or a widened clock skew. The fixed
-/// retention horizon already dominates the widest admissible skew, so a skew
-/// change can never outrun a marker. Capacity and replay scope are instead
-/// enforced at admission: equivalent providers that disagree on `require_dpop`,
-/// `dpop_replay_scope`, or process-scoped `dpop_replay_max_entries` are refused
-/// so matching order cannot pick which authority a proof is claimed against.
-/// Binding those fields into the identity would reopen live proofs on an
-/// ordinary authorization, scope, or cap edit.
+/// JWKS contents, key ids, source kind, source URL, `audiences`,
+/// `required_scopes`, `required_roles`, claim/header mappings, token
+/// locations, `forward_original_token`, `jwks_max_stale_seconds`,
+/// `dpop_replay_max_entries`, `dpop_replay_scope`, and
+/// `dpop_clock_skew_secs`. Folding any of those in would reopen live proofs
+/// on an ordinary authorization, key, or endpoint edit. The fixed retention
+/// horizon already dominates the widest admissible skew, so a skew change can
+/// never outrun a marker. Capacity and replay scope are instead enforced at
+/// admission so matching order cannot pick which authority a proof is claimed
+/// against.
 ///
-/// No raw issuer, JWKS URI, discovery URL, or JWK material is retained: every
-/// field is written through [`PartitionHasher`]'s length-prefixed framing and
-/// only the digest leaves this function. Inline JWKS material is canonicalized
-/// through `serde_json` first (its object maps are sorted), so a whitespace or
-/// member-order edit of the same key set is not a different anchor.
-fn dpop_provider_identity(
-    issuer: Option<&str>,
-    jwks_uri: Option<&Url>,
-    discovery_url: Option<&Url>,
-    inline_jwks: Option<&str>,
-) -> String {
-    let mut hasher = PartitionHasher::new("ferrum-edge/jwks-auth/dpop-provider-identity/v1");
-    hasher.optional_text("provider.issuer", issuer);
-    // Construction already proved exactly one source is configured; the order
-    // here is only a total function over that invariant.
-    if let Some(uri) = jwks_uri {
-        hasher.text("provider.jwks_source.kind", "jwks_uri");
-        bind_canonical_remote_trust_source(&mut hasher, uri);
-    } else if let Some(url) = discovery_url {
-        hasher.text("provider.jwks_source.kind", "discovery_url");
-        bind_canonical_remote_trust_source(&mut hasher, url);
-    } else if let Some(jwks) = inline_jwks {
-        hasher.text("provider.jwks_source.kind", "inline");
-        let canonical = serde_json::from_str::<Value>(jwks)
-            .ok()
-            .and_then(|value| serde_json::to_string(&value).ok());
-        hasher.text(
-            "provider.jwks_source.value",
-            canonical.as_deref().unwrap_or(jwks),
-        );
-    } else {
-        hasher.text("provider.jwks_source.kind", "none");
-    }
+/// No raw issuer, JWKS URI, discovery URL, or JWK material is retained: the
+/// issuer is written through [`PartitionHasher`]'s length-prefixed framing
+/// and only the digest leaves this function.
+fn dpop_provider_identity(issuer: &str) -> String {
+    let mut hasher = PartitionHasher::new("ferrum-edge/jwks-auth/dpop-provider-identity/v2");
+    hasher.text("provider.issuer", issuer);
     hasher.hex()
-}
-
-/// Bind a remote JWKS / discovery endpoint as a canonical parsed identity.
-///
-/// Called only after [`parse_url_field`] has already rejected userinfo,
-/// non-http(s) schemes, empty hosts, and non-loopback http. The original
-/// configured spelling is retained for fetch; only this identity is hashed.
-/// Components are length-framed separately so a path cannot collide with a
-/// query, and no raw credential material is logged or stored.
-fn bind_canonical_remote_trust_source(hasher: &mut PartitionHasher, parsed: &Url) {
-    hasher.text("provider.jwks_source.scheme", parsed.scheme());
-    hasher.text("provider.jwks_source.host", parsed.host_str().unwrap_or(""));
-    match parsed.port_or_known_default() {
-        Some(port) => {
-            hasher.text("provider.jwks_source.port", &port.to_string());
-        }
-        None => {
-            hasher.text("provider.jwks_source.port", "");
-        }
-    }
-    hasher.text("provider.jwks_source.path", parsed.path());
-    hasher.optional_text("provider.jwks_source.query", parsed.query());
 }
 
 fn parse_inline_jwks(

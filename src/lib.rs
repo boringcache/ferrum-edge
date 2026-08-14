@@ -4519,7 +4519,8 @@ pub mod _test_support {
     pub use crate::plugins::utils::redis_rate_limiter::RedisRateLimitClient;
     pub use crate::plugins::utils::redis_rate_limiter::RedisWindowProgress;
     pub use crate::plugins::utils::redis_rate_limiter::{
-        is_cluster_topology_code, is_cluster_topology_error, parse_cluster_enabled,
+        MemoryPolicyScreen, classify_memory_info, is_cluster_topology_code,
+        is_cluster_topology_error, parse_cluster_enabled, parse_memory_policy_fields,
     };
 
     // ── plugins/utils/rate_limit (Redis failure policy) ──────────────────────
