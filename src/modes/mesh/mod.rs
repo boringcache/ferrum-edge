@@ -17610,14 +17610,17 @@ async fn apply_mesh_inbound_tls_reload(
 ///   most restrictive (`client-side DestinationRule` > `Strict` > `Permissive`
 ///   > `Disable`) so a stray invalid mode cannot be masked by a valid policy.
 /// * EVERY required candidate is built here, before the slice is accepted. A
-///   malformed/truncated CA or CRL, verifier build failure, or invalid
-///   client-side mode returns `Err`, which rejects the WHOLE candidate slice
-///   and retains the complete last-good routing AND DTLS serving generation
-///   for both owners. A `Strict` route with no configured client CA does NOT
-///   reject the slice: that listener is omitted from the published generation
-///   and stays deferred (fail-closed for DTLS) so TCP/UDP routing and workload
-///   convergence still apply. New routes are never published beside stale DTLS
-///   posture.
+///   malformed/truncated CA or CRL, verifier build failure, invalid
+///   client-side mode, or a `Strict` route with no configured client CA
+///   (`FERRUM_DTLS_CLIENT_CA_CERT_PATH`) returns `Err`, which rejects the WHOLE
+///   candidate slice and retains the complete last-good routing AND DTLS
+///   serving generation for both owners. Omitting an unservable `Strict`
+///   listener and still returning `Ok` is not fail-closed: `update_mesh_config`
+///   would reconcile first, `publish_mesh_node_waypoint_dtls_generation` skips
+///   active listeners missing from the new map, and a Permissive-to-Strict
+///   change would leave the existing listener serving its old Permissive
+///   verifier while routing/policy advanced. New routes are never published
+///   beside stale DTLS posture.
 ///
 /// Route identity is forward-derived (`node_waypoint_udp_proxy_id`) from the
 /// same Service/port pair `materialize_node_waypoint_udp_listeners` used, so the
@@ -17628,7 +17631,7 @@ async fn apply_mesh_inbound_tls_reload(
 /// candidate carries no generated DTLS listener. An empty ACCEPTED generation is
 /// a positive statement — it is what stops a withdrawn-then-re-added listener
 /// from resurrecting stale owner-scoped state.
-fn build_node_waypoint_dtls_owner_configs(
+pub fn build_node_waypoint_dtls_owner_configs(
     proxy_state: &ProxyState,
     runtime: &MeshRuntimeConfig,
     slice: &MeshSlice,
@@ -17688,21 +17691,21 @@ fn build_node_waypoint_dtls_owner_configs(
                 config::MtlsMode::Strict => match client_ca {
                     Some(path) => Some(path),
                     None => {
-                        // STRICT without a client CA cannot be served, but it
-                        // must not take down the node's entire mesh slice —
-                        // TCP capture, UDP listeners, and workload convergence
-                        // are unrelated to DTLS mTLS material. Omit this
-                        // listener from the published generation so it stays
-                        // deferred (fail-closed for DTLS) while the rest of
-                        // the candidate still applies.
-                        warn!(
-                            listen_port = service_port.port,
-                            "Skipping generated NodeWaypoint DTLS listener: it resolves to STRICT \
+                        // STRICT without a client CA cannot be served. Returning
+                        // Ok and omitting this listener would still accept the
+                        // rest of the slice: update_mesh_config reconciles
+                        // before the new generation is published, and
+                        // publish_mesh_node_waypoint_dtls_generation skips
+                        // active listeners missing from that map, so a
+                        // Permissive-to-Strict change would keep serving the
+                        // old Permissive verifier. Reject the complete
+                        // candidate instead (issue #3858).
+                        return Err(format!(
+                            "generated NodeWaypoint DTLS listener on port {} resolved to STRICT \
                              PeerAuthentication but no client CA bundle is configured \
-                             (FERRUM_DTLS_CLIENT_CA_CERT_PATH). The rest of this mesh slice still \
-                             applies; this listener stays deferred"
-                        );
-                        continue;
+                             (FERRUM_DTLS_CLIENT_CA_CERT_PATH)",
+                            service_port.port
+                        ));
                     }
                 },
                 // PERMISSIVE and DISABLE do not require a client certificate.
@@ -18163,13 +18166,13 @@ async fn apply_mesh_slice_generation(
             // Owner-scoped DTLS candidates for every generated NodeWaypoint
             // `dtls` listener on THIS candidate (issue #3858). Built and fully
             // validated BEFORE `update_mesh_config`, so a malformed/truncated
-            // client CA or CRL, a failed verifier build, or a client-side
-            // DestinationRule mTLS mode rejects the COMPLETE candidate slice
-            // and retains the complete last-good routing AND DTLS serving
-            // generation for both ownership classes. A STRICT route with no
-            // client CA omits that listener from the published generation
-            // (deferred, fail-closed for DTLS) rather than rejecting TCP/UDP
-            // routing. New routes are never published beside stale DTLS
+            // client CA or CRL, a failed verifier build, a client-side
+            // DestinationRule mTLS mode, or a STRICT route with no client CA
+            // rejects the COMPLETE candidate slice and retains the complete
+            // last-good routing AND DTLS serving generation for both ownership
+            // classes. Omitting an unservable STRICT listener would still
+            // accept routing and leave an already-running Permissive listener
+            // serving. New routes are never published beside stale DTLS
             // posture, and ordinary operator listeners are never consulted or
             // mutated.
             let node_waypoint_dtls_configs = match build_node_waypoint_dtls_owner_configs(

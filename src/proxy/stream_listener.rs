@@ -178,9 +178,9 @@ impl DtlsListenerOwner {
 /// server identity plus that route's effective `PeerAuthentication` workload /
 /// service scope and the accepted client-CA + CRL snapshot. Publication is
 /// all-or-nothing — the mesh builds and validates every required candidate
-/// BEFORE the slice is accepted, so a malformed CA/CRL or a failed verifier
-/// build rejects the whole slice and both owners retain their complete
-/// last-good serving generation.
+/// BEFORE the slice is accepted, so a malformed CA/CRL, a failed verifier
+/// build, or a Strict route with no client CA rejects the whole slice and
+/// both owners retain their complete last-good serving generation.
 ///
 /// A listener whose key is absent from the accepted map is NOT covered by this
 /// generation and stays deferred rather than falling back to another owner's
