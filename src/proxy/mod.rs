@@ -45855,7 +45855,6 @@ async fn proxy_to_backend_hbone_after_ready(
     }
 
     let backend_req = Request::from_parts(parts, body);
-    let send_fut = sender.send_request(backend_req);
     // Authorization lifetime for the response-header wait (#3815). With
     // `backend_read_timeout_ms = 0` this wait is otherwise unbounded, and the
     // upload adapter installed above has nothing to fire on for a bodyless or
@@ -45871,6 +45870,7 @@ async fn proxy_to_backend_hbone_after_ready(
         None
     };
     let send_bound = compose_dispatch_phase_auth_bound(read_deadline, send_auth_deadline.as_ref());
+    let send_fut = sender.send_request(backend_req);
     let response = if let Some(send_deadline) = send_bound.at {
         match crate::plugins::await_deadline_first(Some(send_deadline), send_fut).await {
             Ok(Ok(response)) => response,
