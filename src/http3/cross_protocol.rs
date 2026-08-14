@@ -2300,22 +2300,21 @@ where
                     {
                         drop(pending_slot);
                         // Boxed out of line — see `boxed_proxy_h3_plain_http_mesh_buffered`.
-                        let attempt_result =
-                            crate::proxy::boxed_proxy_h3_plain_http_mesh_buffered(
-                                state,
-                                dispatch_proxy,
-                                &current_url,
-                                method,
-                                proxy_headers,
-                                Bytes::from(buffered_body.clone()),
-                                target,
-                                plugins,
-                                ctx,
-                                client_ip,
-                                xff_append_ip,
-                                ctx.request_is_secure,
-                            )
-                            .await;
+                        let attempt_result = crate::proxy::boxed_proxy_h3_plain_http_mesh_buffered(
+                            state,
+                            dispatch_proxy,
+                            &current_url,
+                            method,
+                            proxy_headers,
+                            Bytes::from(buffered_body.clone()),
+                            target,
+                            plugins,
+                            ctx,
+                            client_ip,
+                            xff_append_ip,
+                            ctx.request_is_secure,
+                        )
+                        .await;
                         if let Some(retry_config) = retry_config
                             && crate::retry::should_retry(
                                 retry_config,

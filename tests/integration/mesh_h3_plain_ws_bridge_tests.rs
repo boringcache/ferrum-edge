@@ -369,7 +369,9 @@ fn shared_mesh_plain_helper_never_plaintext_falls_back() {
         "the H3-only boxing boundary must be constructed out of line"
     );
     assert!(
-        src.contains("#[inline(never)]\npub(crate) fn boxed_proxy_h3_plain_http_mesh_buffered<'a>("),
+        src.contains(
+            "#[inline(never)]\npub(crate) fn boxed_proxy_h3_plain_http_mesh_buffered<'a>("
+        ),
         "the H3 plain mesh helper itself must be constructed out of line at the bridge call sites"
     );
     assert!(
