@@ -129,6 +129,18 @@ controlPlane:
   extraVolumes: []
   extraVolumeMounts: []
 
+# Cluster-scoped GatewayClass Ferrum actually owns. Programming and status
+# require this object with spec.controllerName == ferrum.io/gateway-controller;
+# the class name spelling alone is never treated as ownership. Disable
+# create only when you manage the object out of band. `name` may be a
+# non-default class; `controllerName` must stay Ferrum's controller identity.
+# Independent ferrum-mesh releases in one cluster must use unique `name`
+# values; Helm will not import another release's GatewayClass.
+gatewayClass:
+  create: true
+  name: ferrum
+  controllerName: ferrum.io/gateway-controller
+
 injector:
   # Disabled by default: the webhook requires a serving-cert Secret and should
   # be enabled only after that Secret and namespace policy are ready.
