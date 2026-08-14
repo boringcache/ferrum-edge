@@ -162,17 +162,23 @@ def check_aggregate_planner_contract(
 ) -> None:
     planner_result = f"needs.{planner_job}.result"
     planner_relevant = f"needs.{planner_job}.outputs.relevant"
-    skip_match = re.search(
-        r"(?ms)- name: Skip[^\n]*\n\s+if:\s*(.+)",
-        aggregate_body,
-    )
+    skip_steps = [
+        step
+        for step in job_steps(aggregate_body)
+        if re.search(r"(?m)^      - name: Skip", step)
+    ]
     require(
-        skip_match is not None,
-        f"{source} aggregate must declare a skip step",
+        len(skip_steps) == 1,
+        f"{source} aggregate must declare exactly one skip step",
         failures,
     )
-    if skip_match is not None:
-        skip_if = skip_match.group(1).strip()
+    skip_if = step_if(skip_steps[0]) if skip_steps else ""
+    require(
+        bool(skip_if),
+        f"{source} aggregate skip step must declare a single-line if condition",
+        failures,
+    )
+    if skip_if:
         require(
             skip_if == f"{planner_relevant} == 'false'",
             f"{source} aggregate skip must use exact {planner_relevant} == 'false', "
@@ -1847,6 +1853,40 @@ def self_test() -> int:
         not good_aggregate_failures,
         "self-test: exact-boolean aggregate contract should pass: "
         + "; ".join(good_aggregate_failures),
+        failures,
+    )
+
+    greedy_skip_capture_aggregate = (
+        "    steps:\n"
+        "      - name: Fail when production-image planning fails\n"
+        "        if: needs.production-dockerfile-plan.result != 'success'\n"
+        "        run: exit 1\n"
+        "      - name: Fail when production-image planner output is unusable\n"
+        "        if: needs.production-dockerfile-plan.result == 'success' && "
+        "needs.production-dockerfile-plan.outputs.relevant != 'true' && "
+        "needs.production-dockerfile-plan.outputs.relevant != 'false'\n"
+        "        run: exit 1\n"
+        "      - name: Skip production-image smoke for unrelated changes\n"
+        "        if: needs.production-dockerfile-plan.outputs.relevant == 'false'\n"
+        "        run: echo skip\n"
+        "      - name: Fail when the ordinary production image did not succeed\n"
+        "        if: needs.production-dockerfile-plan.outputs.relevant == 'true'\n"
+        "        run: exit 1\n"
+        "      - name: Poison for greedy skip-if capture\n"
+        "        if: needs.production-dockerfile-plan.outputs.relevant != 'true'\n"
+        "        run: echo must-not-be-in-skip-if\n"
+    )
+    greedy_skip_capture_failures: list[str] = []
+    check_aggregate_planner_contract(
+        greedy_skip_capture_aggregate,
+        "production-dockerfile-plan",
+        "self-test-greedy-skip-capture",
+        greedy_skip_capture_failures,
+    )
+    require(
+        not greedy_skip_capture_failures,
+        "self-test: post-skip steps must not pollute skip-if extraction: "
+        + "; ".join(greedy_skip_capture_failures),
         failures,
     )
 
