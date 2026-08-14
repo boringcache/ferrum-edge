@@ -315,7 +315,7 @@ fn teardown_is_strict_for_both_families_and_verifies_exact_absence() {
     );
 }
 
-fn teardown_family_block(script: &str, family: &str) -> &str {
+fn teardown_family_block<'a>(script: &'a str, family: &str) -> &'a str {
     let marker = format!("# NodeWaypoint UDP steer teardown: {family}");
     let start = script
         .find(&marker)
