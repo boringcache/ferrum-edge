@@ -73,6 +73,10 @@ pub enum StockXdsTransportRefusal {
     /// credential in a configured URL would be logged by any component that
     /// echoes the endpoint; the token file is the only supported credential.
     EmbeddedCredentials,
+    /// A non-root path or any query component. Stock ADS configuration accepts
+    /// an origin only; allowing opaque path/query bytes would create an
+    /// unsupported credential-bearing URI surface with no protocol meaning.
+    UnsupportedUriShape,
     /// Plaintext refused because `FERRUM_MESH_PRODUCTION_MODE=true`.
     PlaintextInProduction,
     /// Plaintext refused because the development switch is not enabled.
@@ -94,6 +98,7 @@ impl StockXdsTransportRefusal {
             Self::UnsupportedScheme => "unsupported_scheme",
             Self::MissingHost => "missing_host",
             Self::EmbeddedCredentials => "embedded_credentials",
+            Self::UnsupportedUriShape => "unsupported_uri_shape",
             Self::PlaintextInProduction => "plaintext_in_production",
             Self::PlaintextNotEnabled => "plaintext_not_enabled",
             Self::PlaintextNotLoopback => "plaintext_not_loopback",
@@ -114,6 +119,10 @@ impl StockXdsTransportRefusal {
             Self::EmbeddedCredentials => {
                 "remove the userinfo from the URL; use FERRUM_MESH_STOCK_XDS_TOKEN_FILE for the \
                  bearer credential"
+            }
+            Self::UnsupportedUriShape => {
+                "use an origin URL only ('https://host:port'); stock xDS endpoints do not \
+                 support paths or query parameters"
             }
             Self::PlaintextInProduction => {
                 "FERRUM_MESH_PRODUCTION_MODE=true requires 'https://' for every stock xDS endpoint"
@@ -285,6 +294,16 @@ pub fn classify_stock_xds_endpoint(
         .is_some_and(|authority| authority.as_str().contains('@'))
     {
         return Err(refuse(StockXdsTransportRefusal::EmbeddedCredentials));
+    }
+    // A stock ADS endpoint is an origin, not an HTTP resource URL. Tonic
+    // supplies the gRPC service path itself, so a configured path/query has no
+    // protocol meaning and may conceal credential material. Permit the
+    // conventional trailing root slash only.
+    if uri
+        .path_and_query()
+        .is_some_and(|path_and_query| path_and_query.as_str() != "/")
+    {
+        return Err(refuse(StockXdsTransportRefusal::UnsupportedUriShape));
     }
 
     if scheme == "https" {

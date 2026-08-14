@@ -649,8 +649,10 @@ exists, and re-checked per endpoint at connect time:
   incompatible with a bearer, and refused outright in production mode.
 - A **mixed** `https://` + `http://` list is refused as a whole, so failover can
   never select a weaker transport than the primary.
-- A missing/ambiguous scheme, an unsupported scheme, a missing host, and
-  userinfo embedded in the URL are all refused.
+- A missing/ambiguous scheme, an unsupported scheme, a missing host, userinfo,
+  a non-root path, and any query component are all refused. The endpoint is an
+  origin URL only (`https://host:port`, with an optional trailing `/`); tonic
+  supplies the gRPC service path itself.
 - Defense in depth: the `authorization` interceptor carries the selected
   endpoint's admitted classification and refuses to attach the bearer to
   anything not classified as authenticated TLS, even if top-level admission were

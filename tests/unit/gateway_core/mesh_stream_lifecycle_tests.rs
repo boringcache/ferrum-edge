@@ -709,12 +709,30 @@ fn malformed_ambiguous_and_credential_bearing_urls_are_refused() {
             "https://user:secret@istiod:15012",
             StockXdsTransportRefusal::EmbeddedCredentials,
         ),
+        (
+            "https://istiod:15012/ads",
+            StockXdsTransportRefusal::UnsupportedUriShape,
+        ),
+        (
+            "https://istiod:15012/?token=super-secret",
+            StockXdsTransportRefusal::UnsupportedUriShape,
+        ),
     ];
     for (url, expected) in cases {
         let refusal =
             classify_stock_xds_endpoint(0, url, policy(false, false, true)).expect_err(url);
         assert_eq!(refusal.refusal, expected, "{url}");
     }
+
+    assert_eq!(
+        classify_stock_xds_endpoint(
+            0,
+            "https://istiod.istio-system.svc:15012/",
+            policy(false, true, false),
+        )
+        .expect("a conventional root slash is still an origin URL"),
+        StockXdsTransport::AuthenticatedTls,
+    );
 }
 
 /// A configured ADS URL is operator-authored but unbounded, and may carry a
