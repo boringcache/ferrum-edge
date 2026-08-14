@@ -1377,23 +1377,31 @@ fn dp_mode_pairs_cp_server_config_with_operator_trust_for_h3() {
         client.contains("set_frontend_tls_config(update.listener_config.clone())"),
         "StreamListenerManager must be updated before the pairing lock is released"
     );
-    let clear_arm = client
+    let commit = client
+        .find("async fn commit_frontend_tls_snapshot(")
+        .expect("commit function");
+    let commit_end = client[commit..]
+        .find("\nfn bump_frontend_tls_revision(")
+        .expect("commit function ends before the revision bump");
+    let commit_fn = &client[commit..commit + commit_end];
+    let clear_arm = commit_fn
         .find("FrontendTlsSnapshotUpdate::Clear")
         .expect("CP clear arm");
-    let replace_arm = client
+    let replace_arm = commit_fn
         .find("FrontendTlsSnapshotUpdate::Replace")
         .expect("CP replace arm");
     assert!(
-        client[clear_arm..replace_arm].contains("publish_cp_server_config")
-            && client[clear_arm..replace_arm].contains("None,")
-            && client[clear_arm..replace_arm]
+        commit_fn[clear_arm..replace_arm].contains("publish_cp_server_config")
+            && commit_fn[clear_arm..replace_arm].contains("None,")
+            && commit_fn[clear_arm..replace_arm]
                 .contains("Some(proxy_state.stream_listener_manager.as_ref())"),
         "clearing CP material must restore the latest accepted operator candidate through the pairing slot"
     );
     assert!(
-        client[replace_arm..].contains("publish_cp_server_config")
-            && client[replace_arm..].contains("Some(tls_config.clone())")
-            && client[replace_arm..].contains("Some(proxy_state.stream_listener_manager.as_ref())"),
+        commit_fn[replace_arm..].contains("publish_cp_server_config")
+            && commit_fn[replace_arm..].contains("Some(tls_config.clone())")
+            && commit_fn[replace_arm..]
+                .contains("Some(proxy_state.stream_listener_manager.as_ref())"),
         "applying CP material must pair it with the latest accepted operator trust and update stream listeners under that lock"
     );
 
@@ -1583,6 +1591,11 @@ fn mtls_client_config_honoring_ca_hints(
 /// Drive one real rustls handshake through `server_config` and return the
 /// leaf the server presented. The handshake is the only way to observe the
 /// live wrapper baked into a CP `ServerConfig`.
+///
+/// TLS 1.3 verifies client certificates on the server after the client has
+/// already sent Finished, so a rejected client certificate can complete
+/// `connect()` successfully and fail `accept()`. Honor the server outcome;
+/// otherwise fail-closed proofs look like a successful handshake.
 async fn handshake_presented_leaf(
     server_config: std::sync::Arc<rustls::ServerConfig>,
     client_config: ClientConfig,
@@ -1598,9 +1611,14 @@ async fn handshake_presented_leaf(
     let connector = TlsConnector::from(std::sync::Arc::new(client_config));
     let stream = TcpStream::connect(addr).await.expect("connect");
     let name = ServerName::try_from("localhost".to_string()).expect("server name");
-    let result = connector.connect(name, stream).await;
-    let _ = server.await;
-    let tls_stream = result?;
+    let client_result = connector.connect(name, stream).await;
+    let server_result = server
+        .await
+        .unwrap_or_else(|join_err| Err(std::io::Error::other(join_err)));
+    let tls_stream = match (client_result, server_result) {
+        (Ok(tls_stream), Ok(_)) => tls_stream,
+        (Err(err), _) | (_, Err(err)) => return Err(err),
+    };
     Ok(tls_stream
         .get_ref()
         .1
@@ -1689,6 +1707,30 @@ async fn dp_h12_tcp_adopts_additive_operator_verifier_while_retaining_cp_server_
             .is_empty(),
         "the snapshot inner verifier still has CA names; the wrapper must not forward them"
     );
+    assert!(
+        cp_startup
+            .client_trust
+            .verifier
+            .as_ref()
+            .expect("CP inner verifier")
+            .verify_client_cert(
+                &CertificateDer::from(extra.cert_der.clone()),
+                &[],
+                UnixTime::now(),
+            )
+            .is_err(),
+        "the extra CA is not in the snapshot inner verifier until the operator reload publishes"
+    );
+    assert!(
+        wrapper
+            .verify_client_cert(
+                &CertificateDer::from(extra.cert_der.clone()),
+                &[],
+                UnixTime::now(),
+            )
+            .is_err(),
+        "unpublished live wrapper falls back to the inner verifier and must not admit the extra CA"
+    );
     assert_eq!(
         handshake_presented_leaf(listener_before.clone(), ca1_client.clone())
             .await
@@ -1700,7 +1742,7 @@ async fn dp_h12_tcp_adopts_additive_operator_verifier_while_retaining_cp_server_
         handshake_presented_leaf(listener_before.clone(), ca2_client.clone())
             .await
             .is_err(),
-        "the extra CA is not in the snapshot inner verifier until the operator reload publishes"
+        "a hint-honoring extra-CA handshake must fail closed on the retained CP config until the operator reload publishes"
     );
 
     let overlap_pem = format!("{}{}", pki.ca_pem, extra.ca_pem);

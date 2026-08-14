@@ -625,14 +625,17 @@ fn trust_withdrawal_suppresses_final_packet_drain_while_deadline_unexpired() {
     );
 
     let post_loop = DTLS_SOURCE
-        .split("let discard_final_packets = retired_by_trust_withdrawal")
+        .split("let discard_final_packets")
         .nth(1)
         .expect("post-loop drain predicate")
         .split("pub async fn close(")
         .next()
         .expect("final packet drain");
+    let squeezed: String = post_loop.split_whitespace().collect();
     assert!(
-        post_loop.contains("|| session_authorization_elapsed(&auth_deadline)"),
+        squeezed.contains(
+            "=retired_by_trust_withdrawal||session_authorization_elapsed(&auth_deadline)"
+        ),
         "trust withdrawal must suppress the final drain even when the session deadline has not elapsed"
     );
     assert!(
