@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import argparse
 import re
+import shlex
 import sys
 from pathlib import Path
 
@@ -44,6 +45,9 @@ APPROVED_SETUP = (
     "./.github/actions/setup-fast-linker",
 )
 PINNED_SHA = re.compile(r"^[0-9a-f]{40}$")
+HBONE_BACKEND_ALLOW_IPS_VAR = "FERRUM_BACKEND_ALLOW_IPS"
+HBONE_BACKEND_ALLOW_IPS_VALUE = "private"
+HBONE_GATEWAY_EXECUTABLE = "./target/release/ferrum-edge"
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -55,6 +59,154 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 def require(condition: bool, message: str, failures: list[str]) -> None:
     if not condition:
         failures.append(message)
+
+
+def _strip_shell_comment(value: str) -> str:
+    """Remove an unquoted shell comment while preserving quoted ``#`` data."""
+    quote: str | None = None
+    escaped = False
+    for index, character in enumerate(value):
+        if escaped:
+            escaped = False
+            continue
+        if character == "\\" and quote != "'":
+            escaped = True
+            continue
+        if quote is not None:
+            if character == quote:
+                quote = None
+            continue
+        if character in "'\"":
+            quote = character
+            continue
+        if character == "#" and (index == 0 or value[index - 1].isspace()):
+            return value[:index]
+    return value
+
+
+def _logical_shell_lines(text: str) -> list[str]:
+    """Join backslash-continued shell lines into one logical command line."""
+    logical: list[str] = []
+    parts: list[str] = []
+    for raw_line in text.splitlines():
+        line = _strip_shell_comment(raw_line.rstrip())
+        if line.endswith("\\"):
+            parts.append(line[:-1].rstrip())
+            continue
+        parts.append(line)
+        logical.append(" ".join(parts))
+        parts = []
+    if parts:
+        logical.append(" ".join(parts))
+    return logical
+
+
+def _is_env_gateway_launch(line: str) -> bool:
+    """Return whether a logical line launches the HBONE gateway via env."""
+    return HBONE_GATEWAY_EXECUTABLE in line and re.search(r"\benv\b", line) is not None
+
+
+def _parse_env_assignment(token: str) -> tuple[str, str] | None:
+    """Split a single env assignment token into key/value when present."""
+    if "=" not in token:
+        return None
+    key, _, value = token.partition("=")
+    if not key:
+        return None
+    return key, value
+
+
+def _backend_allow_ips_value_invalid(value: str) -> str | None:
+    """Return a rejection reason when the assignment value is not literal private."""
+    if not value:
+        return "empty value"
+    if "$" in value or "`" in value:
+        return "variable or command-substitution value"
+    if value != HBONE_BACKEND_ALLOW_IPS_VALUE:
+        return f"non-private value {value!r}"
+    return None
+
+
+def _check_hbone_backend_allow_ips(hbone_run: str, failures: list[str]) -> None:
+    """Require exactly one pre-executable ``FERRUM_BACKEND_ALLOW_IPS=private`` on the env launch."""
+    candidates = [
+        line.strip()
+        for line in _logical_shell_lines(hbone_run)
+        if line.strip() and _is_env_gateway_launch(line)
+    ]
+    if not candidates:
+        failures.append(
+            f"HBONE harness must contain exactly one logical "
+            f"env ... {HBONE_GATEWAY_EXECUTABLE} launch command"
+        )
+        return
+    if len(candidates) != 1:
+        failures.append(
+            f"HBONE harness must contain exactly one logical "
+            f"env ... {HBONE_GATEWAY_EXECUTABLE} launch command (found {len(candidates)})"
+        )
+        return
+
+    try:
+        tokens = shlex.split(candidates[0], posix=True)
+    except ValueError as exc:
+        failures.append(f"HBONE gateway launch command tokenization failed: {exc}")
+        return
+
+    if not tokens or tokens[0] != "env":
+        failures.append("HBONE gateway launch command must begin with env")
+        return
+
+    executable_hits = [index for index, token in enumerate(tokens) if token == HBONE_GATEWAY_EXECUTABLE]
+    if len(executable_hits) != 1:
+        failures.append(
+            f"HBONE gateway launch command must reference {HBONE_GATEWAY_EXECUTABLE} exactly once"
+        )
+        return
+    exec_idx = executable_hits[0]
+
+    allow_ips_values: list[str] = []
+    for token in tokens[1:exec_idx]:
+        parsed = _parse_env_assignment(token)
+        if parsed is None:
+            failures.append(
+                f"HBONE gateway launch command has unexpected token {token!r} before the executable"
+            )
+            return
+        key, value = parsed
+        if key == HBONE_BACKEND_ALLOW_IPS_VAR:
+            allow_ips_values.append(value)
+
+    for token in tokens[exec_idx + 1:]:
+        parsed = _parse_env_assignment(token)
+        if parsed is not None and parsed[0] == HBONE_BACKEND_ALLOW_IPS_VAR:
+            failures.append(
+                f"HBONE harness must not place {HBONE_BACKEND_ALLOW_IPS_VAR} after "
+                f"{HBONE_GATEWAY_EXECUTABLE}"
+            )
+            return
+
+    if not allow_ips_values:
+        failures.append(
+            f"HBONE gateway launch command must set exactly one pre-executable "
+            f"{HBONE_BACKEND_ALLOW_IPS_VAR}={HBONE_BACKEND_ALLOW_IPS_VALUE}"
+        )
+        return
+    if len(allow_ips_values) != 1:
+        failures.append(
+            f"HBONE gateway launch command must set exactly one pre-executable "
+            f"{HBONE_BACKEND_ALLOW_IPS_VAR} assignment (found {len(allow_ips_values)}: "
+            f"{allow_ips_values!r})"
+        )
+        return
+
+    reason = _backend_allow_ips_value_invalid(allow_ips_values[0])
+    if reason is not None:
+        failures.append(
+            f"HBONE gateway launch command must set pre-executable "
+            f"{HBONE_BACKEND_ALLOW_IPS_VAR}={HBONE_BACKEND_ALLOW_IPS_VALUE} "
+            f"({reason})"
+        )
 
 
 def check_workflow(text: str, failures: list[str]) -> None:
@@ -412,6 +564,7 @@ def check_scripts(failures: list[str]) -> None:
     require("archive_failure_diagnostics" in hbone_run, "HBONE harness must copy logs before deleting runtime", failures)
     require("archive_failure_diagnostics" in dns_run, "DNS harness must copy logs into the artifact destination", failures)
     require("certs" in hbone_run and "Never copy certs" in hbone_run, "HBONE diagnostics must not archive certs", failures)
+    _check_hbone_backend_allow_ips(hbone_run, failures)
 
     hbone_loadgen = HBONE_LOADGEN.read_text(encoding="utf-8")
     dns_loadgen = DNS_LOADGEN.read_text(encoding="utf-8")
@@ -532,6 +685,132 @@ def check_docs_and_baselines(failures: list[str]) -> None:
         )
 
 
+def _self_test_hbone_backend_allow_ips(failures: list[str]) -> None:
+    """Prove launch-command parsing rejects camouflage and widening."""
+    good = """
+    env \\
+        FERRUM_BACKEND_ALLOW_IPS="private" \\
+        ./target/release/ferrum-edge
+"""
+    good_failures: list[str] = []
+    _check_hbone_backend_allow_ips(good, good_failures)
+    require(not good_failures, "active private assignment must pass", failures)
+
+    cases = (
+        (
+            """
+# FERRUM_BACKEND_ALLOW_IPS="private"
+    env \\
+        FERRUM_BACKEND_ALLOW_IPS="public" \\
+        ./target/release/ferrum-edge
+""",
+            "comment camouflage",
+        ),
+        (
+            """
+    env \\
+        FERRUM_BACKEND_ALLOW_IPS="both" \\
+        ./target/release/ferrum-edge
+""",
+            "both widening",
+        ),
+        (
+            """
+    env \\
+        FERRUM_BACKEND_ALLOW_IPS="10.0.0.0/8" \\
+        ./target/release/ferrum-edge
+""",
+            "CIDR literal",
+        ),
+        (
+            """
+    env \\
+        FERRUM_BACKEND_ALLOW_IPS="private" \\
+        FERRUM_BACKEND_ALLOW_IPS="private" \\
+        ./target/release/ferrum-edge
+""",
+            "duplicate assignment",
+        ),
+        (
+            """
+    env \\
+        ./target/release/ferrum-edge
+""",
+            "missing assignment",
+        ),
+        (
+            """
+    env \\
+        FERRUM_BACKEND_ALLOW_IPS="public" # FERRUM_BACKEND_ALLOW_IPS="private"
+        ./target/release/ferrum-edge
+""",
+            "inline comment camouflage",
+        ),
+        (
+            """
+    echo FERRUM_BACKEND_ALLOW_IPS=private
+    env \\
+        ./target/release/ferrum-edge
+""",
+            "echo camouflage",
+        ),
+        (
+            """
+    env \\
+        NOTFERRUM_BACKEND_ALLOW_IPS=private \\
+        FERRUM_BACKEND_ALLOW_IPS="public" \\
+        ./target/release/ferrum-edge
+""",
+            "suffix-name camouflage",
+        ),
+        (
+            """
+    env \\
+        FERRUM_BACKEND_ALLOW_IPS="public" \\
+        ./target/release/ferrum-edge FERRUM_BACKEND_ALLOW_IPS=private
+""",
+            "post-executable camouflage",
+        ),
+        (
+            """
+    FERRUM_BACKEND_ALLOW_IPS=private
+    env \\
+        FERRUM_BACKEND_ALLOW_IPS="public" \\
+        ./target/release/ferrum-edge
+""",
+            "detached good assignment with widened launch",
+        ),
+        (
+            """
+    FERRUM_BACKEND_ALLOW_IPS=private
+    env \\
+        ./target/release/ferrum-edge
+""",
+            "detached good assignment with missing launch assignment",
+        ),
+        (
+            """
+    env \\
+        FERRUM_BACKEND_ALLOW_IPS="$ALLOW_IPS" \\
+        ./target/release/ferrum-edge
+""",
+            "indirect launch value",
+        ),
+        (
+            """
+    env \\
+        FERRUM_BACKEND_ALLOW_IPS=$(echo private) \\
+        ./target/release/ferrum-edge
+""",
+            "command-substitution launch value",
+        ),
+    )
+    for sample, label in cases:
+        case_failures: list[str] = []
+        _check_hbone_backend_allow_ips(sample, case_failures)
+        require(case_failures, f"{label} must be rejected", failures)
+
+
 def self_test() -> int:
     sample = """
 name: Mesh Performance Baselines
@@ -620,6 +899,7 @@ jobs:
 """
     failures: list[str] = []
     check_workflow(sample, failures)
+    _self_test_hbone_backend_allow_ips(failures)
     # Intentionally skip docs checks in self-test.
     if failures:
         print("self-test failures:", *failures, sep="\n- ")

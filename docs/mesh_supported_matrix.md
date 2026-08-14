@@ -46,18 +46,23 @@ peer-SVID verification decision, the fail-closed SVID slot, and `spire_agent`
 backend selection), live-gated by the required `sidecar.spire.workload_entries`
 and `sidecar.peer_auth.strict_mtls_authenticated` assertions. **Native
 `MeshSubscribe` config transport is now enrolled as well**
-(`mesh.config_transport.native_subscribe`, issue #2002): semantics pinned by
+(`mesh.config_transport.native_subscribe`, issue #2002 / #3855): semantics pinned by
 the `mesh_config_transport` conformance module (the namespace-scoped
 `MeshSlice` snapshot build MeshSubscribe serves from, `content_eq`
 update dedupe that ignores the transport version stamp, and the DP-side
 slice apply that fails closed on malformed payloads), live-gated by the
-required `sidecar.config.native_subscribe_delivered` assertion — the
-`mesh-e2e-sidecar` fixture now deploys a Ferrum CP (`cp` mode, sqlite, K8s
+required `sidecar.config.native_subscribe_*` assertions — the
+`mesh-e2e-sidecar` fixture deploys a Ferrum CP (`cp` mode, sqlite, K8s
 pod discovery building the mesh model from the cluster's real Services and
 pods) and a sidecar DP on `FERRUM_MESH_CONFIG_PROTOCOL=native` whose captured
-inbound datapath only serves traffic if the CP-delivered slice materialized,
-with the DP's `GET /mesh/config-drift` attributing the slice to the native
-transport. `coverage.md` lists the currently enrolled rows and required live
+inbound datapath only serves traffic if the CP-delivered slice materialized
+over production mTLS + JWT (`https://ferrum-cp.<ns>.svc.cluster.local:50051`
+with SAN verification, CP client-CA, and DP client cert/key). Dedicated
+probes prove omit-client / foreign-client / untrusted-server-CA / wrong-SAN /
+invalid-JWT fail closed, and a projected Secret generation swap proves watched
+CP/DP gRPC TLS rotation reconnects without a pod restart, with the replacement
+leaf serial observed over mTLS from the running CP listener. `GET /mesh/config-drift`
+attributes the accepted slice to the native transport. `coverage.md` lists the currently enrolled rows and required live
 assertion IDs, which are the authoritative answer to "what regression fails
 CI today."
 
@@ -86,8 +91,10 @@ CI today."
   destination-side authz 403, JWT valid/missing/invalid, DR exportTo visibility
   + lookup hierarchy, DR connectTimeout
   two-phase timing, DR maxConnections=1 WebSocket hold/reject/release, and a
-  CP + native-subscribe leg proving CP-delivered `MeshSubscribe` config end to
-  end) on every relevant PR and every main push, the artifact is
+  CP + native-subscribe leg proving CP-delivered `MeshSubscribe` config over
+  production mTLS + JWT with Service-DNS SAN verification, fail-closed
+  omit-client / foreign-client / untrusted-server-CA / wrong-SAN / invalid-JWT
+  negatives, and watched projected-Secret rotation) on every relevant PR and every main push, the artifact is
   contract-validated, and both the required CI aggregate and `release.yml`
   gate on it.
   An identity-less mesh — no file-based gateway SVID material **and** no CA
