@@ -935,8 +935,7 @@ fn the_ambient_pod_isolates_the_service_account_token_from_the_explicit_uid_init
         "the steady-state proxy must always mount the projected token read-only at the standard in-cluster path"
     );
     assert!(
-        !proxy.contains("if not $hasExplicitNodeUid")
-            && !proxy.contains("if $hasExplicitNodeUid"),
+        !proxy.contains("if not $hasExplicitNodeUid") && !proxy.contains("if $hasExplicitNodeUid"),
         "the proxy mount must not be gated on whether the preflight needs a Node GET"
     );
 
@@ -952,8 +951,7 @@ fn the_ambient_pod_isolates_the_service_account_token_from_the_explicit_uid_init
         .expect("init token mount gate");
     let init_token = &init[init_token_gate..];
     assert!(
-        init_token.contains("- name: kube-api-access")
-            && init_token.contains("{{- end }}"),
+        init_token.contains("- name: kube-api-access") && init_token.contains("{{- end }}"),
         "the init-container token mount must sit inside the explicit-UID-absent gate"
     );
     assert_eq!(

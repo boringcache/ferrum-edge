@@ -18,8 +18,8 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use ferrum_edge::proxy::netns_capture::{
-    DEFAULT_PROC_ROOT, first_pid_in_cgroup_via_proc_root,
-    first_pid_in_cgroup_via_proc_root_until, is_proc_scan_deadline, proc_cgroup_is_in_subtree,
+    DEFAULT_PROC_ROOT, first_pid_in_cgroup_via_proc_root, first_pid_in_cgroup_via_proc_root_until,
+    is_proc_scan_deadline, proc_cgroup_is_in_subtree,
 };
 
 /// The pod cgroup as the node-agent registry publishes it: an ABSOLUTE
@@ -218,10 +218,8 @@ fn the_pod_netns_cleanup_backend_resolves_targets_through_the_explicit_root() {
         .expect("end of the linux cleanup backend impl");
     let backend = &netns_udp[start..end];
 
-    let inode_at =
-        "netns_inode_for_cgroup_at_until(\n            self.proc_root(),\n            &target.cgroup_path,\n            deadline,";
-    let handle_at =
-        "open_pod_netns_handle_at_until(\n            self.proc_root(),\n            &target.cgroup_path,\n            deadline,";
+    let inode_at = "netns_inode_for_cgroup_at_until(\n            self.proc_root(),\n            &target.cgroup_path,\n            deadline,";
+    let handle_at = "open_pod_netns_handle_at_until(\n            self.proc_root(),\n            &target.cgroup_path,\n            deadline,";
     assert!(
         backend.contains(inode_at) && backend.contains(handle_at),
         "both target-pid resolutions must go through the explicit procfs root under the preflight deadline"
@@ -349,7 +347,9 @@ fn the_oneshot_explicit_root_path_observes_the_preflight_deadline() {
     );
     assert!(
         udp.contains("self.backend.netns_key_until(target, self.deadline)")
-            && udp.contains("NetnsUdpKeyOutcome::DeadlineElapsed => {\n                    return 0;"),
+            && udp.contains(
+                "NetnsUdpKeyOutcome::DeadlineElapsed => {\n                    return 0;"
+            ),
         "cleanup reconcile must stop on a classified deadline instead of scanning remaining targets"
     );
 }
@@ -380,8 +380,7 @@ fn only_the_node_preflight_overrides_the_target_proc_root() {
         "the preflight is the only producer of an explicit target procfs root"
     );
     assert!(
-        !cli.contains("FERRUM_MESH_HOST_PROC_ROOT")
-            && !cli.contains("FERRUM_HOST_PROC_ROOT"),
+        !cli.contains("FERRUM_MESH_HOST_PROC_ROOT") && !cli.contains("FERRUM_HOST_PROC_ROOT"),
         "the root is a chart-internal argument, not a public FERRUM_* setting: \
          the ambient env map is copied verbatim into this container"
     );
@@ -426,6 +425,9 @@ fn an_unusable_host_proc_root_fails_closed() {
             "an empty mount point is not a procfs and must be refused"
         );
         let real = validate_host_proc_root(Path::new("/proc"));
-        assert_eq!(real.expect("the real procfs validates"), PathBuf::from("/proc"));
+        assert_eq!(
+            real.expect("the real procfs validates"),
+            PathBuf::from("/proc")
+        );
     }
 }

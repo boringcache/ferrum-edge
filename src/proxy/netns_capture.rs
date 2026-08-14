@@ -937,7 +937,10 @@ pub fn first_pid_in_cgroup_via_proc_root_until(
     let entries = std::fs::read_dir(proc_root).map_err(|error| {
         std::io::Error::new(
             error.kind(),
-            format!("failed to read procfs root {}: {error}", proc_root.display()),
+            format!(
+                "failed to read procfs root {}: {error}",
+                proc_root.display()
+            ),
         )
     })?;
     let mut scanned = 0usize;

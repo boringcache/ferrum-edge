@@ -511,7 +511,10 @@ pub fn validate_host_proc_root(root: &std::path::Path) -> Result<PathBuf, String
         ));
     }
     let metadata = std::fs::metadata(root).map_err(|error| {
-        format!("--host-proc-root {} is not readable: {error}", root.display())
+        format!(
+            "--host-proc-root {} is not readable: {error}",
+            root.display()
+        )
     })?;
     if !metadata.is_dir() {
         return Err(format!(
