@@ -338,6 +338,33 @@ where
     }
 }
 
+/// Add the established frontend client-trust retirement fence to one bounded
+/// ciphertext write. A withdrawal that is already visible never polls `send`;
+/// one that becomes ready together with the socket write wins the biased race
+/// and drops that write future before it can commit a datagram.
+async fn frontend_app_ciphertext_send_until_expiry_and_trust<F>(
+    deadline: Option<tokio::time::Instant>,
+    cancel: Option<&mut oneshot::Receiver<()>>,
+    client_trust: Option<&crate::tls::ClientTrustSession>,
+    send: F,
+) -> Result<F::Output, FrontendAppSendReject>
+where
+    F: std::future::Future,
+{
+    let bounded_send = frontend_app_ciphertext_send_until_expiry(deadline, cancel, send);
+    let Some(session) = client_trust else {
+        return bounded_send.await;
+    };
+    if session.is_retired() {
+        return Err(FrontendAppSendReject::Closed);
+    }
+    tokio::select! {
+        biased;
+        _ = session.retired() => Err(FrontendAppSendReject::Closed),
+        result = bounded_send => result,
+    }
+}
+
 fn fail_queued_frontend_app_sends(
     app_in_rx: &mut mpsc::Receiver<FrontendAppSend>,
     session_deadline: Option<tokio::time::Instant>,
@@ -363,12 +390,14 @@ async fn write_connected_frontend_record(
     peer: SocketAddr,
     in_flight: Option<&mut InFlightFrontendAppSend>,
     session_deadline: Option<tokio::time::Instant>,
+    client_trust: Option<&crate::tls::ClientTrustSession>,
 ) -> Result<(), FrontendAppSendReject> {
     if let Some(inflight) = in_flight {
         let deadline = earliest_frontend_app_send_deadline(inflight.deadline, session_deadline);
-        match frontend_app_ciphertext_send_until_expiry(
+        match frontend_app_ciphertext_send_until_expiry_and_trust(
             deadline,
             Some(&mut inflight.cancel),
+            client_trust,
             socket.send_to(data, peer),
         )
         .await
@@ -378,9 +407,10 @@ async fn write_connected_frontend_record(
             Err(reject) => Err(reject),
         }
     } else {
-        match frontend_app_ciphertext_send_until_expiry(
+        match frontend_app_ciphertext_send_until_expiry_and_trust(
             session_deadline,
             None,
+            client_trust,
             socket.send_to(data, peer),
         )
         .await
@@ -2136,6 +2166,28 @@ impl DtlsServer {
                 let mut in_flight: Option<InFlightFrontendAppSend> = None;
 
                 tokio::select! {
+                    biased;
+                    // Frontend client-certificate trust withdrawn (issue
+                    // #3857). This authority decision is polled before queued
+                    // application data; the socket-write helper below repeats
+                    // the same fence across an in-flight `send_to`.
+                    _ = async {
+                        match client_trust_guard.as_ref() {
+                            Some(guard) => guard.session().retired().await,
+                            None => std::future::pending().await,
+                        }
+                    } => {
+                        warn!(
+                            client = %peer_addr,
+                            "Retiring established DTLS session: frontend client-certificate trust was withdrawn"
+                        );
+                        retired_by_trust_withdrawal = true;
+                        fail_queued_frontend_app_sends(
+                            &mut app_in_rx,
+                            auth_deadline.get(),
+                        );
+                        break;
+                    }
                     // Application data to send back to this client. Success is
                     // reported only after every produced ciphertext datagram is
                     // accepted by the UDP socket, not at channel enqueue.
@@ -2152,6 +2204,22 @@ impl DtlsServer {
                             deadline,
                             session_deadline,
                         );
+                        if let Some(session) = client_trust_guard
+                            .as_ref()
+                            .map(|guard| guard.session())
+                            && session.is_retired()
+                        {
+                            session.record_fenced();
+                            retired_by_trust_withdrawal = true;
+                            let _ = completion.send(Err(
+                                crate::tls::client_trust::TRUST_WITHDRAWN_REASON.to_string(),
+                            ));
+                            fail_queued_frontend_app_sends(
+                                &mut app_in_rx,
+                                auth_deadline.get(),
+                            );
+                            break;
+                        }
                         match admit_frontend_app_send(
                             cancelled,
                             effective,
@@ -2188,32 +2256,6 @@ impl DtlsServer {
                                 }
                             }
                         }
-                    }
-                    // Frontend client-certificate trust withdrawn (issue
-                    // #3857). Ends the session through the same break the
-                    // shutdown arm uses, so the `SessionGuard`, the demux entry,
-                    // the active-session counter and its mirror all release
-                    // exactly once. No reply drain: the peer is no longer
-                    // authorized, so queued application data must not be sent.
-                    // Observing the guard Option here (including the initial
-                    // `None`) is what keeps it a live owner for the whole
-                    // session rather than a dummy assignment overwritten later.
-                    _ = async {
-                        match client_trust_guard.as_ref() {
-                            Some(guard) => guard.session().retired().await,
-                            None => std::future::pending().await,
-                        }
-                    } => {
-                        warn!(
-                            client = %peer_addr,
-                            "Retiring established DTLS session: frontend client-certificate trust was withdrawn"
-                        );
-                        retired_by_trust_withdrawal = true;
-                        fail_queued_frontend_app_sends(
-                            &mut app_in_rx,
-                            auth_deadline.get(),
-                        );
-                        break;
                     }
                     // Shutdown signal — never encrypt or emit expired/cancelled
                     // queued application replies. Handshake/control records
@@ -2278,6 +2320,9 @@ impl DtlsServer {
                                     peer_addr,
                                     in_flight.as_mut(),
                                     auth_deadline.get(),
+                                    client_trust_guard
+                                        .as_ref()
+                                        .map(|guard| guard.session()),
                                 )
                                 .await
                                 {
@@ -2286,6 +2331,12 @@ impl DtlsServer {
                                     }
                                     Err(reject) => {
                                         discard_app_ciphertext = true;
+                                        if client_trust_guard
+                                            .as_ref()
+                                            .is_some_and(|guard| guard.session().is_retired())
+                                        {
+                                            retired_by_trust_withdrawal = true;
+                                        }
                                         if let Some(inflight) = in_flight.take() {
                                             let _ = inflight
                                                 .completion
@@ -2455,6 +2506,11 @@ impl DtlsServer {
                         tokio::task::yield_now().await;
                         continue;
                     }
+                    break;
+                }
+
+                if retired_by_trust_withdrawal {
+                    fail_queued_frontend_app_sends(&mut app_in_rx, auth_deadline.get());
                     break;
                 }
 

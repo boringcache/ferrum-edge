@@ -600,6 +600,42 @@ fn driver_and_proxy_use_the_deadline_aware_actual_commit_api() {
 /// that deadline has elapsed.
 #[test]
 fn trust_withdrawal_suppresses_final_packet_drain_while_deadline_unexpired() {
+    let select_body = DTLS_SOURCE
+        .split("tokio::select! {")
+        .find(|body| body.contains("Frontend client-certificate trust withdrawn (issue"))
+        .expect("DTLS session select");
+    let biased = select_body.find("biased;").expect("biased DTLS select");
+    let retirement = select_body
+        .find("Some(guard) => guard.session().retired().await")
+        .expect("trust-retirement arm");
+    let application = select_body
+        .find("Some(pending) = app_in_rx.recv()")
+        .expect("application-send arm");
+    assert!(
+        biased < retirement && retirement < application,
+        "an already-ready trust withdrawal must win over queued application data"
+    );
+
+    let wire_fence = DTLS_SOURCE
+        .split("async fn frontend_app_ciphertext_send_until_expiry_and_trust")
+        .nth(1)
+        .expect("trust-fenced ciphertext helper")
+        .split("fn fail_queued_frontend_app_sends")
+        .next()
+        .expect("trust-fenced helper body");
+    let precheck = wire_fence.find("session.is_retired()").expect("precheck");
+    let biased = wire_fence.find("biased;").expect("biased wire race");
+    let retirement = wire_fence.find("session.retired()").expect("retirement race");
+    let send = wire_fence.find("result = bounded_send").expect("bounded send arm");
+    assert!(
+        precheck < biased && biased < retirement && retirement < send,
+        "trust retirement must fence both an already-retired session and an in-flight socket write"
+    );
+    assert!(
+        DTLS_SOURCE.contains("frontend_app_ciphertext_send_until_expiry_and_trust("),
+        "the production DTLS wire-commit path must use the trust-fenced helper"
+    );
+
     let established_arm = DTLS_SOURCE
         .split("Frontend client-certificate trust withdrawn")
         .nth(1)
