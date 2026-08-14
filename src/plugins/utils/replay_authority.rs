@@ -59,8 +59,13 @@
 //! which lets a client with one valid credential burn other clients' protection
 //! by generating unique proofs. Capacity degrades into refusal, never into
 //! silent unprotection. Repeated refusals while every retained marker is still
-//! live are O(1): a conservative earliest-expiry lower bound, fenced against
-//! concurrent inserts, skips the map walk until an expiry is actually due.
+//! live are O(1): a conservative earliest-expiry lower bound skips the map walk
+//! until an expiry is actually due. Ordinary admission publishes that bound
+//! only earlier (`fetch_min`) under a lock-free active-writer count plus a
+//! completed-revision counter; prune may store a later bound only after a scan
+//! that observed no active writer and no missed completed revision. An even/odd
+//! seqlock is not used: two writers on different DashMap shards can both be in
+//! flight while a single parity bit looks stable.
 //!
 //! The shared lane retains markers; each live authority enforces the
 //! `max_entries` *it was admitted with* against that shared count. An equivalent
@@ -424,14 +429,19 @@ pub struct ProcessReplayLane {
     /// Conservative lower bound on the earliest live expiry. Starts at
     /// [`u64::MAX`] (empty). Inserts and refreshes may only move it earlier
     /// (`fetch_min`). A later bound is published only after a full scan whose
-    /// seqlock epoch proves no concurrent writer inserted an unseen earlier
-    /// expiry. Capacity refusals compare this bound inside the prune lock and
-    /// skip the map walk while it is still in the future.
+    /// writer epoch proves no writer was active during or racing the
+    /// publication and no completed writer revision was missed. Capacity
+    /// refusals compare this bound inside the prune lock and skip the map walk
+    /// while it is still in the future.
     earliest_expiry_millis: AtomicU64,
-    /// Seqlock around expiry publication. Even = stable; odd = a writer is
-    /// inserting or refreshing an expiry. Prune publishes a later bound only
-    /// when the epoch is even and unchanged across the scan.
-    write_seq: AtomicU64,
+    /// Writers currently between [`Self::begin_expiry_write`] and
+    /// [`Self::end_expiry_write`]. Loaded before [`Self::completed_revisions`]
+    /// so a zero count cannot be paired with a stale revision.
+    active_writers: AtomicUsize,
+    /// Incremented at writer release after the corresponding `fetch_min`.
+    /// Prune snapshots this before the scan and refuses a later store if it
+    /// changed.
+    completed_revisions: AtomicU64,
     /// How many times the capacity path actually walked the map (test support).
     prune_scans: AtomicU64,
     /// Serializes the capacity-pressure prune so concurrent saturated requests
@@ -446,7 +456,8 @@ impl ProcessReplayLane {
             entry_count: AtomicUsize::new(0),
             newest_expiry_millis: AtomicU64::new(0),
             earliest_expiry_millis: AtomicU64::new(u64::MAX),
-            write_seq: AtomicU64::new(0),
+            active_writers: AtomicUsize::new(0),
+            completed_revisions: AtomicU64::new(0),
             prune_scans: AtomicU64::new(0),
             prune_lock: Mutex::new(()),
         })
@@ -533,20 +544,64 @@ impl ProcessReplayLane {
             .fetch_max(expires_at, Ordering::AcqRel);
     }
 
-    /// Record an insert or in-place refresh on the hot path: bump the seqlock
-    /// odd before the map write, move the earliest bound only earlier, then
-    /// release even. AcqRel on the odd epoch keeps the subsequent DashMap
-    /// insert from becoming visible before prune can observe a writer.
-    /// Never takes `prune_lock` and never allocates.
+    /// Record an insert or in-place refresh on the hot path: mark a writer
+    /// active before the map write, move the earliest bound only earlier, then
+    /// publish a completed revision and release the writer. AcqRel on the
+    /// active count keeps the subsequent DashMap insert from becoming visible
+    /// before prune can observe a writer. Never takes `prune_lock` and never
+    /// allocates. Two concurrent writers both stay visible as `active_writers
+    /// >= 2`; a single even/odd sequence cannot hide that.
     fn begin_expiry_write(&self) {
-        self.write_seq.fetch_add(1, Ordering::AcqRel);
+        self.active_writers.fetch_add(1, Ordering::AcqRel);
     }
 
-    fn finish_expiry_write(&self, expires_at: u64) {
+    fn publish_written_expiry(&self, expires_at: u64) {
         self.note_expiry(expires_at);
         self.earliest_expiry_millis
             .fetch_min(expires_at, Ordering::AcqRel);
-        self.write_seq.fetch_add(1, Ordering::Release);
+    }
+
+    fn end_expiry_write(&self) {
+        // Revision first, then the active count: a prune that observes
+        // `active_writers == 0` must also observe every `fetch_min` that
+        // writer published. Incrementing the revision after decrementing
+        // the count would reopen a window where prune sees a stable empty
+        // epoch and overwrites the earlier bound.
+        self.completed_revisions.fetch_add(1, Ordering::AcqRel);
+        self.active_writers.fetch_sub(1, Ordering::Release);
+    }
+
+    fn finish_expiry_write(&self, expires_at: u64) {
+        self.publish_written_expiry(expires_at);
+        self.end_expiry_write();
+    }
+
+    /// Active-writer count loaded first, then completed revisions. A zero
+    /// active count therefore cannot be paired with a revision that still
+    /// omits a writer that has already `fetch_min`'d and retired.
+    fn writer_epoch(&self) -> (usize, u64) {
+        let active = self.active_writers.load(Ordering::Acquire);
+        let completed = self.completed_revisions.load(Ordering::Acquire);
+        (active, completed)
+    }
+
+    fn can_publish_later_bound(&self, epoch: (usize, u64)) -> bool {
+        epoch.0 == 0 && self.writer_epoch() == epoch
+    }
+
+    fn try_publish_later_bound(&self, live_min: u64, epoch: (usize, u64)) {
+        if !self.can_publish_later_bound(epoch) {
+            return;
+        }
+        // Publish a (possibly later) bound only after a clean exclusive scan.
+        // Re-check the epoch after the store: a writer can insert, fetch_min an
+        // earlier expiry, and finish between the last epoch load and this
+        // store, and overwriting that earlier bound would forget a live marker.
+        self.earliest_expiry_millis
+            .store(live_min, Ordering::Release);
+        if !self.can_publish_later_bound(epoch) {
+            self.earliest_expiry_millis.store(0, Ordering::Release);
+        }
     }
 
     fn try_reserve_slot(&self, max_entries: usize) -> bool {
@@ -565,6 +620,10 @@ impl ProcessReplayLane {
     /// Repeated refusals while the conservative earliest-expiry bound is still
     /// in the future return immediately without walking the map.
     fn prune_expired(&self, now_millis: u64) -> usize {
+        self.prune_expired_at(now_millis, || {})
+    }
+
+    fn prune_expired_at(&self, now_millis: u64, after_scan: impl FnOnce()) -> usize {
         if self.earliest_expiry_millis.load(Ordering::Acquire) > now_millis {
             return 0;
         }
@@ -577,8 +636,10 @@ impl ProcessReplayLane {
         }
 
         self.prune_scans.fetch_add(1, Ordering::Relaxed);
-        let seq_before = self.write_seq.load(Ordering::Acquire);
-        let writer_in_flight = seq_before % 2 == 1;
+        // Snapshot before the scan so a writer that inserts on an already
+        // visited shard and completes before publication is visible as a
+        // revision change. Load order is owned by [`Self::writer_epoch`].
+        let epoch = self.writer_epoch();
 
         let mut expired: Vec<[u8; 32]> = Vec::new();
         let mut live_min = u64::MAX;
@@ -611,20 +672,8 @@ impl ProcessReplayLane {
             }
         }
 
-        let seq_after = self.write_seq.load(Ordering::Acquire);
-        if writer_in_flight || seq_before != seq_after {
-            return reclaimed;
-        }
-        // Publish a (possibly later) bound only after a clean exclusive scan.
-        // Re-check the epoch after the store: a writer can insert, fetch_min an
-        // earlier expiry, and finish between the seq_after load and this store,
-        // and overwriting that earlier bound would forget a live marker.
-        self.earliest_expiry_millis
-            .store(live_min, Ordering::Release);
-        let seq_commit = self.write_seq.load(Ordering::Acquire);
-        if seq_before != seq_commit {
-            self.earliest_expiry_millis.store(0, Ordering::Release);
-        }
+        after_scan();
+        self.try_publish_later_bound(live_min, epoch);
         reclaimed
     }
 
@@ -647,6 +696,106 @@ impl ProcessReplayLane {
     #[allow(dead_code)] // exercised by external unit tests
     pub fn prune_scans(&self) -> u64 {
         self.prune_scans.load(Ordering::Acquire)
+    }
+
+    /// Conservative earliest-expiry bound currently published (test support).
+    #[allow(dead_code)] // exercised by external unit tests
+    pub fn earliest_expiry_millis_for_tests(&self) -> u64 {
+        self.earliest_expiry_millis.load(Ordering::Acquire)
+    }
+
+    /// Admit one marker but leave the writer active after `fetch_min`.
+    ///
+    /// Test support for the exact prune-vs-writer interleaving: the caller
+    /// holds the returned guard across prune publication, then releases it.
+    /// Does not take `prune_lock` and does not scan. A full lane returns
+    /// [`ReplayAdmission::CapacityRefused`] rather than pruning.
+    #[allow(dead_code)] // exercised by external unit tests
+    pub fn admit_at_holding_expiry_write_for_tests(
+        &self,
+        marker: &ReplayMarker,
+        retention: Duration,
+        max_entries: usize,
+        now_millis: u64,
+    ) -> Result<HeldExpiryWrite<'_>, ReplayAdmission> {
+        let retention_millis = u64::try_from(retention.as_millis()).unwrap_or(u64::MAX);
+        let expires_at = now_millis.saturating_add(retention_millis);
+        match self.entries.entry(marker.digest) {
+            Entry::Occupied(mut existing) => {
+                if *existing.get() > now_millis {
+                    return Err(ReplayAdmission::Replay);
+                }
+                if self.entry_count.load(Ordering::Acquire) <= max_entries {
+                    let refreshed = (*existing.get()).max(expires_at);
+                    self.begin_expiry_write();
+                    existing.insert(refreshed);
+                    self.publish_written_expiry(refreshed);
+                    return Ok(HeldExpiryWrite {
+                        lane: self,
+                        finished: false,
+                    });
+                }
+                Err(ReplayAdmission::CapacityRefused)
+            }
+            Entry::Vacant(vacant) => {
+                if self.try_reserve_slot(max_entries) {
+                    self.begin_expiry_write();
+                    vacant.insert(expires_at);
+                    self.publish_written_expiry(expires_at);
+                    return Ok(HeldExpiryWrite {
+                        lane: self,
+                        finished: false,
+                    });
+                }
+                Err(ReplayAdmission::CapacityRefused)
+            }
+        }
+    }
+
+    /// Run a due prune, invoke `after_scan` after reclaim and before the later
+    /// bound is published, then apply the writer-epoch publication check.
+    ///
+    /// `after_scan` runs under [`Self::prune_lock`] and must not re-enter prune.
+    /// Ordinary admission from the callback is safe: it never takes that lock.
+    #[allow(dead_code)] // exercised by external unit tests
+    pub fn prune_expired_with_after_scan_for_tests(
+        &self,
+        now_millis: u64,
+        after_scan: impl FnOnce(),
+    ) -> usize {
+        self.prune_expired_at(now_millis, after_scan)
+    }
+}
+
+/// Guard that keeps one expiry writer active until [`Self::finish`] or drop.
+///
+/// Drop releases the writer without panicking so a test that abandons the
+/// guard cannot wedge prune publication. Production admission never constructs
+/// this type.
+#[allow(dead_code)] // exercised by external unit tests
+pub struct HeldExpiryWrite<'a> {
+    lane: &'a ProcessReplayLane,
+    finished: bool,
+}
+
+impl HeldExpiryWrite<'_> {
+    /// Publish the completed revision and release the writer.
+    #[allow(dead_code)] // exercised by external unit tests
+    pub fn finish(mut self) {
+        self.release();
+    }
+
+    fn release(&mut self) {
+        if !self.finished {
+            self.finished = true;
+            self.lane.end_expiry_write();
+        }
+    }
+}
+
+impl Drop for HeldExpiryWrite<'_> {
+    fn drop(&mut self) {
+        self.release();
     }
 }
 

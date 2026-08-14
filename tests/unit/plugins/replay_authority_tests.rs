@@ -293,6 +293,93 @@ fn concurrent_insert_during_prune_cannot_forget_a_live_marker() {
     );
 }
 
+/// Two writers paused after `fetch_min` and before writer release must not
+/// look like a stable even seqlock epoch. The old protocol incremented one
+/// sequence on begin and again on finish; two in-flight writers made that
+/// counter even, so a prune that had already passed their shards could publish
+/// a later bound and never see the earlier markers.
+#[test]
+fn two_held_writers_cannot_hide_an_earlier_expiry_from_prune_publication() {
+    const CAP: usize = 4;
+    let authority = process_authority("capacity-multiwriter-bound", CAP);
+    let lane = process_lane(&authority).expect("process lane");
+    let retention_ms = u64::try_from(RETENTION.as_millis()).expect("retention fits u64");
+    let t_early = 0;
+    let t_writer = 50_000;
+    let t_later = 100_000;
+    let t_prune = retention_ms + 1;
+    let writer_expires_at = t_writer + retention_ms;
+    let later_expires_at = t_later + retention_ms;
+    let t_after_writers_expire = writer_expires_at + 1;
+
+    let first = domain("capacity-multiwriter-bound").marker(&[b"c", b"first"]);
+    let second = domain("capacity-multiwriter-bound").marker(&[b"c", b"second"]);
+    let later_a = domain("capacity-multiwriter-bound").marker(&[b"later", b"a"]);
+    let later_b = domain("capacity-multiwriter-bound").marker(&[b"later", b"b"]);
+    let early_a = domain("capacity-multiwriter-bound").marker(&[b"early", b"a"]);
+    let early_b = domain("capacity-multiwriter-bound").marker(&[b"early", b"b"]);
+    let extra = domain("capacity-multiwriter-bound").marker(&[b"c", b"extra"]);
+
+    assert_eq!(
+        admit_process_at(&authority, &first, t_early),
+        Some(ReplayAdmission::Admitted)
+    );
+    assert_eq!(
+        admit_process_at(&authority, &second, t_early),
+        Some(ReplayAdmission::Admitted)
+    );
+    assert_eq!(
+        admit_process_at(&authority, &later_a, t_later),
+        Some(ReplayAdmission::Admitted)
+    );
+    assert_eq!(
+        admit_process_at(&authority, &later_b, t_later),
+        Some(ReplayAdmission::Admitted)
+    );
+
+    let mut held = Vec::new();
+    let reclaimed = lane.prune_expired_with_after_scan_for_tests(t_prune, || {
+        for marker in [&early_a, &early_b] {
+            held.push(
+                lane.admit_at_holding_expiry_write_for_tests(marker, RETENTION, CAP, t_writer)
+                    .expect("reclaimed slots must admit the held writers"),
+            );
+        }
+    });
+    assert_eq!(reclaimed, 2, "the due prune must reclaim the expired pair");
+    assert_eq!(
+        held.len(),
+        2,
+        "the old even-parity hole requires two concurrent writers"
+    );
+
+    for writer in held {
+        writer.finish();
+    }
+
+    let published = lane.earliest_expiry_millis_for_tests();
+    assert!(
+        published <= writer_expires_at,
+        "prune must not publish a later bound ({published}) than the held writers ({writer_expires_at}); later-only markers expire at {later_expires_at}"
+    );
+
+    let scans_before = lane.prune_scans();
+    assert_eq!(
+        admit_process_at(&authority, &extra, t_after_writers_expire),
+        Some(ReplayAdmission::Admitted),
+        "once the held writers expire, capacity pressure must reclaim them rather than skip until the later bound"
+    );
+    assert!(
+        lane.prune_scans() > scans_before,
+        "reclamation after the held writers expire must walk the map"
+    );
+    assert_eq!(
+        admit_process_at(&authority, &later_a, t_after_writers_expire),
+        Some(ReplayAdmission::Replay),
+        "a still-live later marker must not be evicted to make room"
+    );
+}
+
 /// Once the retained markers expire, their slots are reclaimed and new requests
 /// are admitted again — capacity degrades into refusal, not into a permanent
 /// outage.
