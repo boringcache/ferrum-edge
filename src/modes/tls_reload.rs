@@ -45,7 +45,10 @@ pub struct ProxyFrontendTlsReloadHandles {
     /// Pre-populated accepted-candidate slot the H3 listener adopts wholesale
     /// (issue #3857). `Some` only when live reload is enabled **and** the
     /// startup candidate's client-trust identity is known, because a partial
-    /// snapshot is exactly what this slot exists to prevent.
+    /// snapshot is exactly what this slot exists to prevent. DP mode does not
+    /// feed this slot to H3 directly: it copies each accepted operator
+    /// candidate into a pairing slot so HTTP/3 can keep a CP-delivered server
+    /// certificate while still enforcing this operator trust identity.
     pub accepted_slot: Option<SharedAcceptedFrontendTls>,
     /// Subscribe-able revision channel the H3 listener observes. `Some` only
     /// when live reload is enabled.

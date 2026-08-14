@@ -446,6 +446,22 @@ impl ClientTrustMaterial {
         })
     }
 
+    /// Build a distinguishable identity for pairing tests. **Test seam only.**
+    ///
+    /// Production material always comes from [`Self::from_parts`] over the exact
+    /// client-CA bytes and CRLs behind a verifier. This digest is never a
+    /// certificate fingerprint that could leak into logs or metrics.
+    #[doc(hidden)]
+    #[allow(dead_code)] // External test seam only.
+    pub fn from_test_digest(digest: [u8; 32]) -> Self {
+        let mut anchors = BTreeSet::new();
+        anchors.insert(digest);
+        Self {
+            anchors,
+            revocations: BTreeSet::new(),
+        }
+    }
+
     /// Decide whether moving from `previous` to `self` **narrows** the authority
     /// an already-authenticated peer holds.
     ///

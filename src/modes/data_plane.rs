@@ -337,6 +337,15 @@ pub async fn run(
     let (proxy_frontend_tls_revision_tx, proxy_frontend_tls_revision_rx) =
         tokio::sync::watch::channel(0_u64);
     let cp_frontend_tls_materialized = Arc::new(AtomicBool::new(false));
+    let operator_accepted_slot = proxy_frontend_reload_handles
+        .as_ref()
+        .and_then(|handles| handles.accepted_slot.clone());
+    let h3_pairing = operator_accepted_slot.as_ref().and_then(|slot| {
+        let initial = slot.load_full().as_ref().clone()?;
+        Some(Arc::new(
+            crate::grpc::dp_client::DpFrontendH3Pairing::from_operator_candidate(initial),
+        ))
+    });
     let dp_frontend_tls_runtime =
         proxy_frontend_tls_slot
             .clone()
@@ -345,6 +354,7 @@ pub async fn run(
                 restore_source_slot: operator_frontend_tls_slot.clone(),
                 h3_revision_tx: Some(proxy_frontend_tls_revision_tx.clone()),
                 cp_materialized: cp_frontend_tls_materialized.clone(),
+                h3_pairing: h3_pairing.clone(),
             });
 
     // Set TLS config on stream listener manager for TCP proxies with frontend_tls.
@@ -402,6 +412,8 @@ pub async fn run(
     ) {
         let cp_materialized = cp_frontend_tls_materialized.clone();
         let revision_tx = proxy_frontend_tls_revision_tx.clone();
+        let pairing = h3_pairing.clone();
+        let operator_accepted = operator_accepted_slot.clone();
         let mut bridge_shutdown = shutdown_tx.subscribe();
         let bridge_proxy_state = proxy_state.clone();
         let bridge_handle = tokio::spawn(async move {
@@ -410,6 +422,34 @@ pub async fn run(
                     changed = operator_revision_rx.changed() => {
                         if changed.is_err() {
                             break;
+                        }
+                        if let (Some(pairing), Some(operator_accepted)) =
+                            (pairing.as_ref(), operator_accepted.as_ref())
+                        {
+                            // CP may own the server certificate; still wake H3
+                            // with the paired (CP config, operator trust) Arc.
+                            // A refused operator candidate never updates the
+                            // accepted slot or this revision watch, so last-good
+                            // H3 verifier/config/generation/sessions are retained.
+                            let Some(candidate) =
+                                operator_accepted.load_full().as_ref().clone()
+                            else {
+                                continue;
+                            };
+                            let update = pairing.publish_operator_candidate(
+                                candidate,
+                                Some(&listener_slot),
+                            );
+                            if update.replace_listener {
+                                bridge_proxy_state
+                                    .stream_listener_manager
+                                    .set_frontend_tls_config(update.listener_config)
+                                    .await;
+                            }
+                            revision_tx.send_modify(|revision| {
+                                *revision = revision.saturating_add(1);
+                            });
+                            continue;
                         }
                         if cp_materialized.load(Ordering::Acquire) {
                             continue;
@@ -560,10 +600,13 @@ pub async fn run(
             client_ca_bundle_path: env_config.frontend_tls_client_ca_bundle_path.clone(),
             client_crls: crls.clone(),
             tls_slot: proxy_frontend_tls_slot.clone(),
-            // The DP listener slot is fed by the CP frontend-TLS overlay, not by
-            // the operator reload pipeline, so there is no accepted candidate to
-            // adopt; the H3 listener falls back to its own coherent load.
-            tls_accepted_slot: None,
+            // When the operator reload pipeline publishes accepted candidates,
+            // H3 adopts the DP pairing slot: CP server config (while present)
+            // plus the latest accepted operator client-trust, as one Arc.
+            // Without pairing, H3 falls back to its coherent configured load.
+            tls_accepted_slot: h3_pairing
+                .as_ref()
+                .map(|pairing| pairing.h3_accepted_slot.clone()),
             tls_revision_rx: proxy_frontend_tls_slot
                 .as_ref()
                 .map(|_| proxy_frontend_tls_revision_rx.clone()),
@@ -605,12 +648,15 @@ pub async fn run(
             let h3_reload = proxy_frontend_tls_slot.clone().map(|tls_slot| {
                 crate::http3::server::Http3FrontendTlsReload {
                     tls_slot,
-                    // This slot is fed by the CP frontend-TLS overlay, which
-                    // publishes a `ServerConfig` alone, so there is no accepted
-                    // candidate to adopt (issue #3857). The H3 listener loads
-                    // the configured client-CA bundle and CRLs coherently
-                    // itself, and publishes the identity of that same load.
-                    accepted_slot: None,
+                    // Pairing publishes one Arc of (active server config,
+                    // accepted operator trust). CP material never substitutes
+                    // the operator server certificate into this candidate's
+                    // trust half, and an operator trust reload never replaces
+                    // the CP server certificate. Without pairing, H3 loads
+                    // configured client trust coherently itself.
+                    accepted_slot: h3_pairing
+                        .as_ref()
+                        .map(|pairing| pairing.h3_accepted_slot.clone()),
                     revision_rx: proxy_frontend_tls_revision_rx.clone(),
                 }
             });

@@ -511,6 +511,21 @@ connections *and* is present in the verifier a reconnecting client meets. The
 startup baseline works the same way — it is the identity of the load whose
 config the endpoint was built with, not of a later re-read of the same sources.
 
+In DP mode the control plane owns the active **server certificate** when it has
+delivered Gateway TLS material, and the operator still owns **client trust**
+(the client-CA bundle and CRL). An accepted operator CRL or client-CA reload
+must not substitute the operator server certificate into the H1/H2/TCP slot
+while that CP material is present, but HTTP/3 still has to enforce the new
+trust: the DP publishes one accepted candidate that pairs the live CP server
+config with the same accepted operator verifier and semantic identity, then
+wakes the QUIC listener so `ProxyH3` installs that pair through its one rustls
+transaction (live verifier → `Endpoint::set_server_config` → generation/fence).
+A refused operator candidate never enters that slot, so HTTP/3 keeps its
+last-good verifier, config, generation, and sessions. Clearing CP material
+restores the latest accepted operator candidate — not a startup snapshot
+captured when CP material first arrived. This does not add CP-delivered
+client-CA support.
+
 The `frontend_dtls` scope reads its declared client-CA source **once** through
 the shared `CertSource` abstraction, and derives both the DTLS trust anchors and
 the published identity from those exact bytes. A `file://` path, inline PEM, or

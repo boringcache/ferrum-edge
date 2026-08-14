@@ -45,6 +45,12 @@ before its task is spawned. A listener with no client-CA bundle authenticates no
 client and stays unarmed, so nothing is tracked and 0-RTT admission is unchanged.
 See [frontend_tls.md](frontend_tls.md#client-trust-generations-and-established-transport-retirement).
 
+In DP mode, CP-delivered Gateway TLS owns the active server certificate while
+operator live reload still owns client trust. HTTP/3 adopts a single paired
+candidate (CP server config + accepted operator verifier/identity) rather than
+rebuilding trust from a startup CRL clone beside the CP certificate. Clearing
+CP material restores that latest accepted operator candidate.
+
 Gateway API TLS-class listener ports follow the same convention: each gets its
 own QUIC socket beside its TCP HTTPS listener when HTTP/3 is enabled. If a raw
 UDP or DTLS stream proxy claims that numeric UDP port in the same config, Ferrum

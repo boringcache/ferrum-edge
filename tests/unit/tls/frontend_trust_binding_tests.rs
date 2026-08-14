@@ -29,11 +29,12 @@
 use std::sync::OnceLock;
 
 use ferrum_edge::config::EnvConfig;
+use ferrum_edge::grpc::dp_client::DpFrontendH3Pairing;
 use ferrum_edge::tls::client_trust::{
     self, ClientTrustPublication, ClientTrustPublicationOutcome, ClientTrustScope,
 };
 use ferrum_edge::tls::{
-    AcceptedClientTrust, ClientTrustMaterial, CrlList, TlsPolicy,
+    AcceptedClientTrust, AcceptedFrontendTls, ClientTrustMaterial, CrlList, TlsPolicy,
     load_frontend_tls_candidate_from_paths,
 };
 use rustls::pki_types::{CertificateDer, UnixTime};
@@ -193,6 +194,38 @@ fn load_candidate(
         None,
     )
     .map(|candidate| candidate.client_trust)
+}
+
+fn load_accepted_frontend(
+    dir: &std::path::Path,
+    pki: &TestPki,
+    crls: &CrlList,
+    label: &str,
+) -> Result<std::sync::Arc<AcceptedFrontendTls>, anyhow::Error> {
+    let cert_path = dir.join(format!("{label}-server-cert.pem"));
+    let key_path = dir.join(format!("{label}-server-key.pem"));
+    let ca_path = dir.join(format!("{label}-client-ca.pem"));
+    std::fs::write(&cert_path, pki.server_cert_pem.as_bytes()).expect("write server cert");
+    std::fs::write(&key_path, pki.server_key_pem.as_bytes()).expect("write server key");
+    std::fs::write(&ca_path, pki.ca_pem.as_bytes()).expect("write client CA");
+
+    load_frontend_tls_candidate_from_paths(
+        cert_path.to_str().expect("utf8 cert path"),
+        key_path.to_str().expect("utf8 key path"),
+        Some(ca_path.to_str().expect("utf8 ca path")),
+        None,
+        false,
+        &tls_policy(),
+        30,
+        crls,
+        None,
+    )
+    .map(|candidate| {
+        std::sync::Arc::new(AcceptedFrontendTls {
+            config: candidate.config,
+            client_trust: candidate.client_trust,
+        })
+    })
 }
 
 /// Whether the candidate's verifier admits the client certificate.
@@ -1025,5 +1058,104 @@ fn h3_request_handler_rechecks_withdrawal_before_admission() {
     assert!(
         fence < ordinary_admission,
         "withdrawn trust must be fenced before overload, routing, plugins, and backend dispatch"
+    );
+}
+
+/// DP mode must pair CP-owned server config with the accepted operator trust
+/// into one H3 candidate. Independently reading the listener slot and a startup
+/// CRL clone is the fail-open the pairing slot exists to close.
+#[test]
+fn dp_h3_pairing_wakes_on_operator_trust_while_cp_owns_the_server_certificate() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let pki = build_pki();
+    let startup_crls = parse_crls(&pki.crl_pem(&[UNRELATED_SERIAL], 1));
+    let withdrawn_crls = parse_crls(&pki.crl_pem(&[UNRELATED_SERIAL, pki.client_serial], 2));
+
+    let operator_startup =
+        load_accepted_frontend(dir.path(), &pki, &startup_crls, "operator-startup")
+            .expect("operator startup candidate");
+    let cp_startup =
+        load_accepted_frontend(dir.path(), &pki, &startup_crls, "cp-server").expect("CP candidate");
+    let operator_withdrawn =
+        load_accepted_frontend(dir.path(), &pki, &withdrawn_crls, "operator-withdrawn")
+            .expect("operator CRL withdrawal");
+    assert!(admits_client(&operator_startup.client_trust, &pki));
+    assert!(!admits_client(&operator_withdrawn.client_trust, &pki));
+
+    let pairing = DpFrontendH3Pairing::from_operator_candidate(operator_startup);
+    let listener = ferrum_edge::tls::empty_frontend_tls_slot();
+    pairing.publish_cp_server_config(Some(cp_startup.config.clone()), Some(&listener));
+
+    let update = pairing.publish_operator_candidate(operator_withdrawn.clone(), Some(&listener));
+    assert!(
+        !update.replace_listener,
+        "operator trust must not substitute the operator server certificate while CP material is active"
+    );
+    assert!(std::sync::Arc::ptr_eq(
+        listener.load_full().as_ref().as_ref().expect("CP config"),
+        &cp_startup.config
+    ));
+
+    let h3 = pairing.h3_accepted().expect("paired H3 candidate");
+    assert!(
+        std::sync::Arc::ptr_eq(&h3.config, &cp_startup.config),
+        "H3 must keep the CP server certificate"
+    );
+    assert_eq!(
+        h3.client_trust.material, operator_withdrawn.client_trust.material,
+        "H3 must adopt the accepted operator trust, not the startup CRL clone"
+    );
+    assert!(
+        !admits_client(&h3.client_trust, &pki),
+        "the paired H3 verifier must refuse the newly revoked client certificate"
+    );
+}
+
+#[test]
+fn dp_mode_pairs_cp_server_config_with_operator_trust_for_h3() {
+    let dp = include_str!("../../../src/modes/data_plane.rs");
+    assert!(
+        dp.contains("publish_operator_candidate"),
+        "the DP operator revision bridge must publish into the H3 pairing slot"
+    );
+    assert!(
+        dp.contains("h3_pairing"),
+        "DP must own a pairing slot for the exact H3 serving candidate"
+    );
+    assert!(
+        dp.contains("pairing.h3_accepted_slot.clone()"),
+        "DP H3 and Gateway QUIC listeners must adopt the pairing slot, not accepted_slot: None"
+    );
+    let bridge = dp
+        .find("changed = operator_revision_rx.changed()")
+        .expect("DP operator TLS revision bridge");
+    let pairing_publish = dp[bridge..]
+        .find("publish_operator_candidate")
+        .expect("pairing publish in the operator revision arm");
+    let fallback_skip = dp[bridge..]
+        .find("if cp_materialized.load(Ordering::Acquire)")
+        .expect("legacy skip when pairing is absent");
+    assert!(
+        pairing_publish < fallback_skip,
+        "CP-owned material must not skip the H3 pairing wakeup; the continue is only the no-pairing fallback"
+    );
+
+    let client = include_str!("../../../src/grpc/dp_client.rs");
+    assert!(
+        client.contains("publish_cp_server_config(Some(tls_config.clone()), Some(slot))"),
+        "applying CP material must pair it with the latest accepted operator trust before waking H3"
+    );
+    assert!(
+        client.contains("publish_cp_server_config(None, Some(slot))"),
+        "clearing CP material must restore the latest accepted operator candidate through the pairing slot"
+    );
+
+    let h3 = include_str!("../../../src/http3/server.rs");
+    let reload_arm = h3
+        .find("reload_change = reload_rx.changed()")
+        .expect("H3 reload arm");
+    assert!(
+        h3[reload_arm..].contains("accepted_slot.load_full()"),
+        "H3 must adopt one accepted candidate rather than independently reading config and startup CRLs"
     );
 }

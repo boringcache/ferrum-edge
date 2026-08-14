@@ -378,17 +378,20 @@ pub struct Http3FrontendTlsReload {
     /// Shared frontend TLS slot. The proxy HTTPS / H2 / H3 listeners read
     /// from the same slot so they observe the same rotated cert/key pair.
     ///
-    /// Used only when [`Self::accepted_slot`] is absent — a slot fed by some
-    /// other publisher (the DP's CP-delivered Gateway TLS overlay) carries the
-    /// server config alone.
+    /// Used only when [`Self::accepted_slot`] is absent — a slot that is not
+    /// fed by an accepted-candidate publisher (tests, or a DP without an
+    /// operator live-reload identity) carries the server config alone.
     pub tls_slot: crate::tls::SharedFrontendTls,
-    /// Accepted-candidate slot published by the frontend reload pipeline
-    /// (issue #3857). When present this is the ONLY thing the reload arm reads:
-    /// one atomic load yields the `ServerConfig`, the client-certificate
-    /// verifier compiled into it, and the trust identity of exactly the
-    /// client-CA bytes and CRLs behind that verifier. Reassembling those from
-    /// separate reads is what let this listener install one verifier and
-    /// publish a generation describing another.
+    /// Accepted-candidate slot (issue #3857). When present this is the ONLY
+    /// thing the reload arm reads: one atomic load yields the `ServerConfig`,
+    /// the client-certificate verifier compiled into it, and the trust identity
+    /// of exactly the client-CA bytes and CRLs behind that verifier.
+    /// Reassembling those from separate reads is what let this listener install
+    /// one verifier and publish a generation describing another.
+    ///
+    /// File/database mode publish this from the operator reload pipeline. DP
+    /// mode publishes a pairing slot: CP server config (while CP material is
+    /// present) plus the latest accepted operator client-trust, as one Arc.
     pub accepted_slot: Option<crate::tls::SharedAcceptedFrontendTls>,
     /// Revision counter bumped by the file-watch task after every successful
     /// reload. The H3 listener subscribes so it doesn't poll the slot.
@@ -437,7 +440,7 @@ pub async fn start_http3_listener(
 /// [`crate::tls::AcceptedClientTrust`] (issue #3857).
 ///
 /// Used only when no accepted candidate is published for this listener (H3
-/// startup, and a slot fed by the DP's CP-delivered overlay). The client-CA
+/// startup, and a DP without an operator live-reload pairing slot). The client-CA
 /// source is read once and the verifier and the identity both come out of that
 /// single read, so what this listener installs and what it publishes always
 /// describe the same anchors and the same revocations.
@@ -471,8 +474,7 @@ fn load_configured_h3_client_trust(
 }
 
 /// Resolve the candidate a reload wakeup should adopt on a listener that has no
-/// accepted-candidate slot (the DP's CP-delivered frontend TLS overlay writes
-/// the config slot directly).
+/// accepted-candidate slot (tests, or a DP without operator live-reload pairing).
 ///
 /// The client-CA bundle and CRLs are loaded here, once, so the verifier this
 /// listener installs and the identity it publishes still come from a single
