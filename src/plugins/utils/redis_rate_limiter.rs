@@ -34,6 +34,17 @@
 //!    transaction rather than as the outer error's own code
 //!    ([`is_cluster_topology_error`]).
 //!
+//! Replay-authority clients (`RedisRateLimitClient::for_replay_authority`)
+//! additionally prove the server will not evict a still-live `SET NX EX`
+//! marker. After a usable topology screen they issue bounded `INFO MEMORY` and
+//! accept the connection only when `maxmemory` is `0` (no memory limit, so
+//! eviction cannot run) or `maxmemory_policy` is `noeviction`. An `allkeys-*`
+//! or `volatile-*` policy is terminal for that client generation — the same
+//! sticky refusal as Redis Cluster. ACL denial, malformed or missing fields,
+//! timeout, or a protocol error leave the authority unavailable and
+//! recoverable (`memory_policy_unproven`). Generic rate-limiter clients never
+//! run this screen and keep their existing topology-only behavior.
+//!
 //! The proactive probe is bounded by the configured
 //! `redis_connect_timeout_seconds` (no separate knob): a server can accept and
 //! authenticate a connection and then never answer `INFO`, and an unbounded
@@ -42,6 +53,21 @@
 //! outage — **not** proof of Cluster topology — and the connection is discarded
 //! unscreened rather than carrying a policy command
 //! ([`TopologyScreen::ProbeFailed`]).
+//!
+//! The same bound covers the background recovery checker's `PING` and, for
+//! replay-authority clients, the `INFO MEMORY` screen. That checker is
+//! single-flight (`health_checker_started`): an accepted socket that never
+//! answers `PING` must time out and retry rather than wedging the only
+//! recovery task, or fail-closed consumers could never recover even after the
+//! backend became healthy.
+//!
+//! `redis_connect_timeout_seconds` is likewise the documented bound for a
+//! *server-side reply* on a security-critical single-use claim
+//! ([`RedisRateLimitClient::set_bytes_nx_with_expire_bounded`]): the same
+//! "connected, authenticated, and then silent" endpoint that the screen refuses
+//! must not be able to hold an in-flight protected request open once the
+//! connection has been screened. Reusing this bound keeps one admitted,
+//! range-validated Redis timeout knob instead of adding a second one.
 //!
 //! Topology rejection is **terminal for the life of the client**: unlike an
 //! outage it is not something a `PING` can clear (a Cluster node answers `PING`
@@ -137,8 +163,9 @@
 //! The pooled type is deliberately *not* [`redis::aio::ConnectionManager`].
 //! That type reconnects transparently inside redis-rs, so a screened endpoint
 //! could disconnect and silently acquire a brand-new physical socket without
-//! re-running Ferrum's DNS resolution, egress screen, or `INFO CLUSTER`
-//! topology screen. A [`redis::aio::MultiplexedConnection`] surfaces the I/O
+//! re-running Ferrum's DNS resolution, egress screen, `INFO CLUSTER`
+//! topology screen, or — for replay-authority clients — the `INFO MEMORY`
+//! no-eviction screen. A [`redis::aio::MultiplexedConnection`] surfaces the I/O
 //! failure instead: the operation fails, `clear_connection` drops every cached
 //! slot, and the next operation (or the recovery checker)
 //! establishes a fresh connection through the full resolve → build → connect →
@@ -150,7 +177,9 @@ use crate::tls::source::{CertSource, MaterialKind, load_material_blocking};
 use arc_swap::ArcSwap;
 use std::sync::Arc;
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
+use std::sync::OnceLock;
+use std::sync::Weak;
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::task::AbortHandle;
 use tracing::{info, warn};
@@ -235,8 +264,10 @@ pub struct RedisConfig {
     /// connection path (not only an outer `tokio::time::timeout`)
     /// so values above the crate's one-second default take effect. Covers TCP
     /// connect, TLS handshake when enabled, and Redis protocol handshake on
-    /// cached, dedicated, and health-check paths. Gateway `DnsCache` screening
-    /// happens before this timeout starts (see module-level DNS notes).
+    /// cached, dedicated, and health-check paths, and is the deadline for
+    /// recovery `PING` plus the proactive `INFO CLUSTER` / `INFO MEMORY`
+    /// screens. Gateway `DnsCache` screening happens before this timeout
+    /// starts (see module-level DNS notes).
     pub connect_timeout_seconds: u64,
     /// Interval in seconds for health check pings when Redis is marked unavailable.
     pub health_check_interval_seconds: u64,
@@ -742,6 +773,7 @@ fn push_slot_tag_component(key: &mut String, value: &str) {
 async fn screen_redis_endpoint(
     config: &RedisConfig,
     dns_cache: Option<&DnsCache>,
+    log_policy: RedisClientLogPolicy,
 ) -> RedisEndpoint {
     if let Some(dns_cache) = dns_cache
         && let Some(hostname) = config.hostname()
@@ -750,23 +782,45 @@ async fn screen_redis_endpoint(
             Ok(ip) => return RedisEndpoint::Url(config.url_with_resolved_ip(ip)),
             Err(e) => {
                 if crate::dns::is_egress_policy_denial(&e) {
-                    warn!(
-                        hostname = %hostname,
-                        error = %e,
-                        "Redis hostname currently resolves to an address blocked by backend egress \
-                         policy — centralized Redis unavailable; will re-screen"
-                    );
+                    match log_policy {
+                        RedisClientLogPolicy::Operational => {
+                            warn!(
+                                hostname = %hostname,
+                                error = %e,
+                                "Redis hostname currently resolves to an address blocked by backend egress \
+                                 policy — centralized Redis unavailable; will re-screen"
+                            );
+                        }
+                        RedisClientLogPolicy::ClassificationOnly => {
+                            warn_replay_backend(
+                                &config.redacted_url(),
+                                "connection_failed",
+                                "Redis single-use claim backend failed",
+                            );
+                        }
+                    }
                     return RedisEndpoint::HostnameEgressDenied;
                 }
                 // Fail CLOSED on ANY screen failure (resolver outage / misconfigured
                 // gateway DNS), not just policy denials: handing the unscreened
                 // hostname to the Redis client would let it re-resolve outside the
                 // egress policy and possibly dial a denied address.
-                warn!(
-                    hostname = %hostname,
-                    error = %e,
-                    "DNS cache resolution failed for Redis host — centralized Redis unavailable; will retry"
-                );
+                match log_policy {
+                    RedisClientLogPolicy::Operational => {
+                        warn!(
+                            hostname = %hostname,
+                            error = %e,
+                            "DNS cache resolution failed for Redis host — centralized Redis unavailable; will retry"
+                        );
+                    }
+                    RedisClientLogPolicy::ClassificationOnly => {
+                        warn_replay_backend(
+                            &config.redacted_url(),
+                            "connection_failed",
+                            "Redis single-use claim backend failed",
+                        );
+                    }
+                }
                 return RedisEndpoint::ResolveFailed;
             }
         }
@@ -778,12 +832,23 @@ async fn screen_redis_endpoint(
         && let Some(ip) = config.literal_host_ip()
         && let Some(reason) = dns_cache.backend_allow_ips().deny_reason(&ip)
     {
-        warn!(
-            redis_ip = %ip,
-            reason,
-            "Redis literal host blocked by backend egress policy — centralized Redis unavailable \
-             until configuration changes"
-        );
+        match log_policy {
+            RedisClientLogPolicy::Operational => {
+                warn!(
+                    redis_ip = %ip,
+                    reason,
+                    "Redis literal host blocked by backend egress policy — centralized Redis unavailable \
+                     until configuration changes"
+                );
+            }
+            RedisClientLogPolicy::ClassificationOnly => {
+                warn_replay_backend(
+                    &config.redacted_url(),
+                    "connection_failed",
+                    "Redis single-use claim backend failed",
+                );
+            }
+        }
         return RedisEndpoint::LiteralIpEgressDenied;
     }
     RedisEndpoint::Url(config.effective_url())
@@ -846,6 +911,51 @@ fn screen_from_info_value(value: &redis::Value) -> TopologyScreen {
     }
 }
 
+/// Issue `PING` under a hard `probe_timeout` deadline.
+///
+/// Connection establishment is bounded separately. A server that accepts and
+/// authenticates and then never answers `PING` would otherwise stall the
+/// single-flight recovery checker forever, so fail-closed consumers could
+/// never recover even after the backend became healthy. Timeout is an
+/// ordinary retryable outage: the client stays unpublished and the loop
+/// retries on the next interval.
+///
+/// redis-rs 1.2.1 defaults `AsyncConnectionConfig.response_timeout` to 500ms.
+/// The recovery checker disables that inner cap so this admitted bound is
+/// what fires. An inner I/O timeout is still rewritten to the same classified
+/// error: otherwise a silent PING consumes the first unproven diagnostic as
+/// generic `connection_failed` before Ferrum's admitted bound can publish the
+/// correct class.
+async fn ping_connection(
+    conn: &mut impl redis::aio::ConnectionLike,
+    probe_timeout: Duration,
+) -> Result<String, redis::RedisError> {
+    match tokio::time::timeout(
+        probe_timeout,
+        redis::cmd("PING").query_async::<String>(conn),
+    )
+    .await
+    {
+        Ok(Ok(pong)) => Ok(pong),
+        Ok(Err(error)) if error.is_timeout() => Err(incomplete_ping_probe_error()),
+        Ok(Err(error)) => Err(error),
+        Err(_elapsed) => Err(incomplete_ping_probe_error()),
+    }
+}
+
+/// Recovery-probe connection config: Ferrum's connect timeout, without
+/// redis-rs' default 500ms command response timeout.
+///
+/// `PING` / `INFO` replies are bounded by the caller's `tokio::time::timeout`
+/// so a silent backend is classified against the admitted connect-timeout
+/// bound rather than the crate's shorter command cap. Pooled command paths
+/// keep `async_connection_config`.
+fn recovery_async_connection_config(connect_timeout: Duration) -> redis::AsyncConnectionConfig {
+    redis::AsyncConnectionConfig::new()
+        .set_connection_timeout(Some(connect_timeout))
+        .set_response_timeout(None)
+}
+
 /// Ask a freshly established connection whether it belongs to a Cluster-mode
 /// server, under a hard `probe_timeout` deadline.
 ///
@@ -896,18 +1006,317 @@ fn cluster_topology_probe_error() -> redis::RedisError {
 
 /// Recovery-probe failure for a topology screen that never completed — an
 /// ordinary retryable outage, classified as I/O rather than a config fault.
+const REPLAY_CLUSTER_UNPROVEN_DETAIL: &str =
+    "Redis topology screen did not complete during recovery";
+
 fn incomplete_topology_probe_error() -> redis::RedisError {
+    redis::RedisError::from((redis::ErrorKind::Io, REPLAY_CLUSTER_UNPROVEN_DETAIL))
+}
+
+fn is_incomplete_topology_probe_error(error: &redis::RedisError) -> bool {
+    error.kind() == redis::ErrorKind::Io
+        && error.to_string().contains(REPLAY_CLUSTER_UNPROVEN_DETAIL)
+}
+
+const RECOVERY_PING_TIMEOUT_DETAIL: &str =
+    "Redis health-check PING did not complete during recovery";
+
+fn incomplete_ping_probe_error() -> redis::RedisError {
+    redis::RedisError::from((redis::ErrorKind::Io, RECOVERY_PING_TIMEOUT_DETAIL))
+}
+
+fn is_incomplete_ping_probe_error(error: &redis::RedisError) -> bool {
+    error.kind() == redis::ErrorKind::Io && error.to_string().contains(RECOVERY_PING_TIMEOUT_DETAIL)
+}
+
+const REPLAY_MEMORY_UNPROVEN_DETAIL: &str = "Redis replay memory-policy screen did not complete";
+
+fn unsafe_eviction_probe_error() -> redis::RedisError {
     redis::RedisError::from((
-        redis::ErrorKind::Io,
-        "Redis topology screen did not complete during recovery",
+        redis::ErrorKind::InvalidClientConfig,
+        "Redis endpoint reports an unsafe maxmemory eviction policy",
     ))
+}
+
+fn unproven_memory_probe_error() -> redis::RedisError {
+    redis::RedisError::from((redis::ErrorKind::Io, REPLAY_MEMORY_UNPROVEN_DETAIL))
+}
+
+fn is_unproven_memory_probe_error(error: &redis::RedisError) -> bool {
+    error.kind() == redis::ErrorKind::Io
+        && error.to_string().contains(REPLAY_MEMORY_UNPROVEN_DETAIL)
+}
+
+/// Verdict of the proactive `INFO MEMORY` eviction-policy screen used only by
+/// replay-authority Redis clients.
+///
+/// Distinct from [`TopologyScreen`]: an absent `cluster_enabled` field is
+/// compatible (not proven Cluster), but an absent memory-policy proof cannot
+/// be treated as "eviction is disabled". Unproven stays fail-closed and
+/// recoverable; a proven `allkeys-*` / `volatile-*` policy is terminal.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MemoryPolicyScreen {
+    /// `maxmemory == 0` or `maxmemory_policy == noeviction`.
+    Usable,
+    /// Proven evicting policy while a memory limit is in force. Terminal.
+    UnsafeEviction,
+    /// ACL denial, timeout, protocol error, or malformed/missing fields.
+    Unproven,
+}
+
+/// Read `maxmemory` and `maxmemory_policy` out of an `INFO MEMORY` reply.
+///
+/// Neither field is assumed present. `maxmemory_human` and similar prefixed
+/// keys are ignored. Values are trimmed; empty values are treated as absent.
+pub fn parse_memory_policy_fields(info: &str) -> (Option<u64>, Option<&str>) {
+    let mut maxmemory = None;
+    let mut policy = None;
+    for line in info.lines() {
+        let Some((key, value)) = line.trim().split_once(':') else {
+            continue;
+        };
+        let value = value.trim();
+        if value.is_empty() {
+            continue;
+        }
+        match key {
+            "maxmemory" => {
+                if let Ok(parsed) = value.parse() {
+                    maxmemory = Some(parsed);
+                }
+            }
+            "maxmemory_policy" => policy = Some(value),
+            _ => {}
+        }
+    }
+    (maxmemory, policy)
+}
+
+fn policy_is_noeviction(policy: &str) -> bool {
+    policy.eq_ignore_ascii_case("noeviction")
+}
+
+fn policy_is_evicting(policy: &str) -> bool {
+    let lowered = policy.to_ascii_lowercase();
+    lowered.starts_with("allkeys-") || lowered.starts_with("volatile-")
+}
+
+/// Classify an `INFO MEMORY` payload for replay-authority use.
+///
+/// Usable only when the server proves either unlimited memory (`maxmemory` is
+/// present and `0`) or `noeviction`. A reported `allkeys-*` / `volatile-*`
+/// policy with a non-zero limit (or with `maxmemory` absent, so a limit cannot
+/// be disproven) is unsafe. Everything else is unproven.
+pub fn classify_memory_info(info: &str) -> MemoryPolicyScreen {
+    let (maxmemory, policy) = parse_memory_policy_fields(info);
+    if maxmemory == Some(0) {
+        return MemoryPolicyScreen::Usable;
+    }
+    if let Some(policy) = policy {
+        if policy_is_noeviction(policy) {
+            return MemoryPolicyScreen::Usable;
+        }
+        if policy_is_evicting(policy) {
+            return MemoryPolicyScreen::UnsafeEviction;
+        }
+    }
+    MemoryPolicyScreen::Unproven
+}
+
+fn memory_screen_from_info_value(value: &redis::Value) -> MemoryPolicyScreen {
+    match value {
+        redis::Value::BulkString(bytes) => match std::str::from_utf8(bytes) {
+            Ok(text) => classify_memory_info(text),
+            Err(_) => MemoryPolicyScreen::Unproven,
+        },
+        redis::Value::SimpleString(text) => classify_memory_info(text),
+        redis::Value::VerbatimString { text, .. } => classify_memory_info(text),
+        _ => MemoryPolicyScreen::Unproven,
+    }
+}
+
+/// Ask a freshly topology-screened connection whether it will evict live keys,
+/// under a hard `probe_timeout` deadline. Replay-authority clients only.
+async fn screen_connection_memory_policy(
+    conn: &mut impl redis::aio::ConnectionLike,
+    probe_timeout: Duration,
+) -> MemoryPolicyScreen {
+    let mut probe = redis::cmd("INFO");
+    probe.arg("MEMORY");
+    match tokio::time::timeout(probe_timeout, probe.query_async::<redis::Value>(conn)).await {
+        Ok(Ok(value)) => memory_screen_from_info_value(&value),
+        Ok(Err(_error)) => MemoryPolicyScreen::Unproven,
+        Err(_elapsed) => MemoryPolicyScreen::Unproven,
+    }
+}
+
+/// Packed `(shared_authorities << 32) | shared_authorities_unavailable`.
+///
+/// Published on shared-replay lifecycle transitions and read by `/health`,
+/// `/status`, and `/metrics/runtime` as a single acquire-load. There is no
+/// registry to scan, no mutex, and no work proportional to configured or
+/// historical authorities.
+static SHARED_REPLAY_HEALTH: AtomicU64 = AtomicU64::new(0);
+
+const SHARED_REPLAY_COUNT_SHIFT: u64 = 32;
+const SHARED_REPLAY_COUNT_MASK: u64 = 0xFFFF_FFFF;
+
+/// Packed `(epoch << 8) | state` for availability and for the health
+/// registration word. One acquire-load returns a consistent generation and
+/// semantic state, so a stale registration sample cannot tear across a
+/// concurrent transition.
+const SHARED_REPLAY_EPOCH_SHIFT: u64 = 8;
+const SHARED_REPLAY_STATE_MASK: u64 = 0xFF;
+
+fn pack_epoch_state(state: u8, epoch: u64) -> u64 {
+    (epoch << SHARED_REPLAY_EPOCH_SHIFT) | u64::from(state)
+}
+
+fn unpack_epoch_state(raw: u64) -> (u8, u64) {
+    (
+        (raw & SHARED_REPLAY_STATE_MASK) as u8,
+        raw >> SHARED_REPLAY_EPOCH_SHIFT,
+    )
+}
+
+fn pack_shared_replay_health(authorities: u64, unavailable: u64) -> u64 {
+    (authorities << SHARED_REPLAY_COUNT_SHIFT) | (unavailable & SHARED_REPLAY_COUNT_MASK)
+}
+
+fn unpack_shared_replay_health(raw: u64) -> (u64, u64) {
+    (
+        raw >> SHARED_REPLAY_COUNT_SHIFT,
+        raw & SHARED_REPLAY_COUNT_MASK,
+    )
+}
+
+/// Current `(shared_authorities, shared_authorities_unavailable)` pair.
+///
+/// One acquire-load of the packed word published on registration, availability
+/// transitions, terminal topology, and retirement. The `/health` + `/status`
+/// probe path and `/metrics/runtime` both consume this exact pair.
+pub(crate) fn shared_replay_health_counts() -> (u64, u64) {
+    unpack_shared_replay_health(SHARED_REPLAY_HEALTH.load(Ordering::Acquire))
+}
+
+fn bump_shared_replay_health(authorities_delta: i8, unavailable_delta: i8) {
+    let _ = SHARED_REPLAY_HEALTH.fetch_update(Ordering::AcqRel, Ordering::Acquire, |raw| {
+        let (mut authorities, mut unavailable) = unpack_shared_replay_health(raw);
+        match authorities_delta {
+            1 => authorities = authorities.saturating_add(1),
+            -1 => authorities = authorities.saturating_sub(1),
+            _ => {}
+        }
+        match unavailable_delta {
+            1 => unavailable = unavailable.saturating_add(1),
+            -1 => unavailable = unavailable.saturating_sub(1),
+            _ => {}
+        }
+        Some(pack_shared_replay_health(authorities, unavailable))
+    });
+}
+
+/// Lifecycle registration for one distinct shared replay Redis client.
+///
+/// Holds only the local state machine that publishes into
+/// [`SHARED_REPLAY_HEALTH`]. It does not retain the Redis client, cached
+/// connections, endpoints, credentials, or any other secret-bearing data.
+/// Drop retires this generation's contribution immediately. Concurrent
+/// availability transitions CAS a packed `(epoch, state)` word so a stale
+/// registration sample cannot overwrite a newer notification, and a drop
+/// cannot underflow, double-count, or resurrect a retired generation.
+struct SharedReplayHealthRegistration {
+    /// Packed `(applied_epoch << 8) | state`.
+    word: AtomicU64,
+}
+
+impl SharedReplayHealthRegistration {
+    const UNREGISTERED: u8 = 0;
+    const AVAILABLE: u8 = 1;
+    const UNAVAILABLE: u8 = 2;
+    const RETIRED: u8 = 3;
+
+    fn new() -> Self {
+        Self {
+            word: AtomicU64::new(pack_epoch_state(Self::UNREGISTERED, 0)),
+        }
+    }
+
+    /// Publish `available` at `epoch` if this is the first count or `epoch` is
+    /// strictly newer than the last applied generation.
+    ///
+    /// Linearizability: [`EnforcementAvailability`] increments `epoch` in the
+    /// same CAS that changes semantic state, and notifies with that new epoch
+    /// after the health `Weak` is attached. A sample taken before a transition
+    /// therefore carries a smaller epoch than the notification, and this CAS
+    /// rejects it. Equivalent-provider re-registration is idempotent: the same
+    /// epoch is a no-op. No resample loop is required, and this path never
+    /// waits on backend flapping — a stale apply returns, a newer notify wins.
+    fn apply_availability(&self, available: bool, epoch: u64) {
+        let target = if available {
+            Self::AVAILABLE
+        } else {
+            Self::UNAVAILABLE
+        };
+        loop {
+            let raw = self.word.load(Ordering::Acquire);
+            let (current_state, current_epoch) = unpack_epoch_state(raw);
+            if current_state == Self::RETIRED {
+                return;
+            }
+            if current_state != Self::UNREGISTERED && epoch <= current_epoch {
+                return;
+            }
+            if self
+                .word
+                .compare_exchange(
+                    raw,
+                    pack_epoch_state(target, epoch),
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                )
+                .is_err()
+            {
+                continue;
+            }
+            match (current_state, target) {
+                (Self::UNREGISTERED, Self::AVAILABLE) => bump_shared_replay_health(1, 0),
+                (Self::UNREGISTERED, Self::UNAVAILABLE) => bump_shared_replay_health(1, 1),
+                (Self::AVAILABLE, Self::UNAVAILABLE) => bump_shared_replay_health(0, 1),
+                (Self::UNAVAILABLE, Self::AVAILABLE) => bump_shared_replay_health(0, -1),
+                _ => {}
+            }
+            return;
+        }
+    }
+
+    fn is_live(&self) -> bool {
+        let (state, _) = unpack_epoch_state(self.word.load(Ordering::Acquire));
+        matches!(state, Self::AVAILABLE | Self::UNAVAILABLE)
+    }
+}
+
+impl Drop for SharedReplayHealthRegistration {
+    fn drop(&mut self) {
+        // Swap to RETIRED first so a concurrent apply's CAS cannot land after
+        // we have already subtracted, and cannot resurrect this generation.
+        let (previous, _) = unpack_epoch_state(
+            self.word
+                .swap(pack_epoch_state(Self::RETIRED, 0), Ordering::AcqRel),
+        );
+        match previous {
+            Self::AVAILABLE => bump_shared_replay_health(-1, 0),
+            Self::UNAVAILABLE => bump_shared_replay_health(-1, -1),
+            _ => {}
+        }
+    }
 }
 
 /// Availability of centralized enforcement for one Redis client generation,
 /// shared with the client's recovery checker and with failover health observers.
 ///
-/// Deliberately **one** atomic rather than an `available: AtomicBool` plus a
-/// separate `topology_unsupported: AtomicBool`. With two flags, every
+/// Deliberately **one** packed atomic rather than an `available: AtomicBool`
+/// plus a separate `topology_unsupported: AtomicBool`. With two flags, every
 /// "reachable" publication is a check-then-store: a connection, command, or
 /// recovery probe that completed successfully can observe a not-yet-terminal
 /// topology, then store `available = true` after another task proved Cluster
@@ -916,10 +1325,23 @@ fn incomplete_topology_probe_error() -> redis::RedisError {
 /// makes publishing "reachable" a single read-modify-write that simply cannot
 /// win against a rejection, so terminal really is terminal.
 ///
+/// The same word also carries a monotonic epoch, incremented in the CAS that
+/// changes semantic state. Shared-replay registration samples that pair in one
+/// load and fences stale applies against notifications of a later epoch, so a
+/// bounded resample loop cannot leave `/health` permanently inconsistent with
+/// this word.
+///
 /// Every read is one atomic load, so hot-path callers keep their O(1) check with
-/// no locks.
+/// no locks. Shared-replay health is notified only on a real state change, via
+/// a `Weak` handle that cannot keep a retired client (or its credentials)
+/// alive.
 pub(crate) struct EnforcementAvailability {
-    state: AtomicU8,
+    /// Packed `(epoch << 8) | state`. Hot-path [`Self::is_available`] masks
+    /// the low byte of one acquire-load.
+    state: AtomicU64,
+    /// Weak: the recovery checker holds this `Arc<EnforcementAvailability>`,
+    /// and must not retain a retired generation's health contribution.
+    shared_replay_health: OnceLock<Weak<SharedReplayHealthRegistration>>,
 }
 
 impl EnforcementAvailability {
@@ -931,35 +1353,90 @@ impl EnforcementAvailability {
     const TOPOLOGY_TERMINAL: u8 = 2;
 
     fn new() -> Self {
+        Self::with_state(Self::REACHABLE)
+    }
+
+    /// Unproven: no connection or topology screen has succeeded.
+    ///
+    /// Replay-authority clients start here so `/health` fails closed until a
+    /// screened probe proves the backend. Operational rate-limiter clients keep
+    /// [`Self::new`] (historical "reachable until an error is observed").
+    fn unproven() -> Self {
+        Self::with_state(Self::UNREACHABLE)
+    }
+
+    fn with_state(state: u8) -> Self {
         Self {
-            state: AtomicU8::new(Self::REACHABLE),
+            state: AtomicU64::new(pack_epoch_state(state, 0)),
+            shared_replay_health: OnceLock::new(),
         }
+    }
+
+    fn semantic_state(raw: u64) -> u8 {
+        unpack_epoch_state(raw).0
+    }
+
+    fn notify_shared_replay_health(&self, available: bool, epoch: u64) {
+        let Some(weak) = self.shared_replay_health.get() else {
+            return;
+        };
+        let Some(registration) = weak.upgrade() else {
+            return;
+        };
+        registration.apply_availability(available, epoch);
     }
 
     /// Semantic availability: enforcement may be consulted. False whenever the
     /// topology is terminal, by construction — a caller cannot forget to pair
     /// this load with a separate terminal check.
     pub(crate) fn is_available(&self) -> bool {
-        self.state.load(Ordering::Acquire) == Self::REACHABLE
+        Self::semantic_state(self.state.load(Ordering::Acquire)) == Self::REACHABLE
     }
 
     /// Whether the endpoint was rejected as an unsupported topology.
     fn is_topology_terminal(&self) -> bool {
-        self.state.load(Ordering::Acquire) == Self::TOPOLOGY_TERMINAL
+        Self::semantic_state(self.state.load(Ordering::Acquire)) == Self::TOPOLOGY_TERMINAL
+    }
+
+    /// One acquire-load of `(is_available, epoch)` for shared-replay
+    /// registration. The pair is consistent because epoch and semantic state
+    /// live in the same word.
+    fn health_snapshot(&self) -> (bool, u64) {
+        let (state, epoch) = unpack_epoch_state(self.state.load(Ordering::Acquire));
+        (state == Self::REACHABLE, epoch)
     }
 
     /// Atomically move to `target` unless the topology is already terminal.
     ///
-    /// Returns whether the transition happened. A single read-modify-write is
-    /// what makes the terminal state actually terminal: there is no window
-    /// between "check the flag" and "store availability" for a rejection to slip
-    /// into.
-    fn transition_unless_terminal(&self, target: u8) -> bool {
-        self.state
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
-                (current != Self::TOPOLOGY_TERMINAL).then_some(target)
-            })
-            .is_ok()
+    /// Returns the previous semantic state and the epoch stored in the word
+    /// afterwards. A real change increments the epoch in the same CAS that
+    /// writes `target`, which is what makes a later registration sample of the
+    /// old state strictly stale against the notification. `None` means the
+    /// topology is (or concurrently became) terminal and nothing was written.
+    fn transition_unless_terminal(&self, target: u8) -> Option<(u8, u64)> {
+        loop {
+            let raw = self.state.load(Ordering::Acquire);
+            let (current, epoch) = unpack_epoch_state(raw);
+            if current == Self::TOPOLOGY_TERMINAL {
+                return None;
+            }
+            if current == target {
+                return Some((current, epoch));
+            }
+            let new_epoch = epoch.wrapping_add(1);
+            if self
+                .state
+                .compare_exchange(
+                    raw,
+                    pack_epoch_state(target, new_epoch),
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                )
+                .is_ok()
+            {
+                return Some((current, new_epoch));
+            }
+        }
     }
 
     /// Publish "reachable" — but only if the topology is not terminal.
@@ -969,27 +1446,63 @@ impl EnforcementAvailability {
     /// operation: a command that already mutated Redis is reported as an error
     /// so the consumer's failure policy applies, because over-counting one
     /// operation is safer than admitting traffic against a topology this client
-    /// cannot enforce on.
+    /// cannot enforce on. A terminal state cannot resurrect shared-replay
+    /// health: this path never notifies "available" after a topology rejection.
     fn publish_reachable(&self) -> bool {
-        self.transition_unless_terminal(Self::REACHABLE)
+        match self.transition_unless_terminal(Self::REACHABLE) {
+            Some((previous, epoch)) => {
+                if previous != Self::REACHABLE {
+                    self.notify_shared_replay_health(true, epoch);
+                }
+                true
+            }
+            None => false,
+        }
     }
 
     /// Mark enforcement unreachable, preserving a terminal topology rejection.
     fn mark_unreachable(&self) {
-        self.transition_unless_terminal(Self::UNREACHABLE);
+        if let Some((Self::REACHABLE, epoch)) = self.transition_unless_terminal(Self::UNREACHABLE) {
+            self.notify_shared_replay_health(false, epoch);
+        }
     }
 
     /// Reject the endpoint permanently. Returns `true` the first time only, so
     /// the operator diagnostic is emitted once per client generation rather than
-    /// once per request.
+    /// once per request. Reachable → terminal publishes unavailable exactly
+    /// once; an already-unavailable generation is already counted. The epoch
+    /// still advances from unreachable so a stale reachable sample cannot
+    /// overwrite the terminal word.
     fn reject_topology(&self) -> bool {
-        let previous = self.state.swap(Self::TOPOLOGY_TERMINAL, Ordering::AcqRel);
-        previous != Self::TOPOLOGY_TERMINAL
+        loop {
+            let raw = self.state.load(Ordering::Acquire);
+            let (previous, epoch) = unpack_epoch_state(raw);
+            if previous == Self::TOPOLOGY_TERMINAL {
+                return false;
+            }
+            let new_epoch = epoch.wrapping_add(1);
+            if self
+                .state
+                .compare_exchange(
+                    raw,
+                    pack_epoch_state(Self::TOPOLOGY_TERMINAL, new_epoch),
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                )
+                .is_err()
+            {
+                continue;
+            }
+            if previous == Self::REACHABLE {
+                self.notify_shared_replay_health(false, new_epoch);
+            }
+            return true;
+        }
     }
 
     /// Log-safe rendering for `Debug` (never carries endpoint or credentials).
     fn describe(&self) -> &'static str {
-        match self.state.load(Ordering::Acquire) {
+        match Self::semantic_state(self.state.load(Ordering::Acquire)) {
             Self::REACHABLE => "reachable",
             Self::TOPOLOGY_TERMINAL => "topology_unsupported",
             _ => "unreachable",
@@ -1133,6 +1646,10 @@ pub struct RedisRateLimitClient {
     /// connection, command, or recovery probe completes concurrently: a Cluster
     /// node answers `PING` while still redirecting every key, so nothing may
     /// restore availability afterwards. See [`EnforcementAvailability`].
+    ///
+    /// Replay-authority clients start **unproven** (unreachable) until a
+    /// topology-screened connection or recovery probe succeeds. Operational
+    /// rate-limiter clients keep the historical initial reachable state.
     availability: Arc<EnforcementAvailability>,
     /// Whether the background health checker has been started.
     health_checker_started: AtomicBool,
@@ -1143,6 +1660,67 @@ pub struct RedisRateLimitClient {
     /// Pre-read CA bundle PEM bytes from `FERRUM_TLS_CA_BUNDLE_PATH`.
     /// Loaded once at construction to avoid filesystem reads on every connection.
     tls_ca_bundle_pem: Option<Vec<u8>>,
+    /// How this client publishes operational diagnostics.
+    ///
+    /// Rate-limit / cache / dedup consumers keep historical fields (`error`,
+    /// `key_prefix`). Replay-authority clients publish only a fixed
+    /// classification beside the already-redacted endpoint.
+    log_policy: RedisClientLogPolicy,
+    /// Lifecycle registration for shared-replay readiness/metrics. Present
+    /// only after [`Self::register_as_shared_replay_authority`]; independent of
+    /// connections, endpoints, and credentials. Drop of this client drops the
+    /// registration and retires the precomputed counts immediately.
+    shared_replay_health: OnceLock<Arc<SharedReplayHealthRegistration>>,
+}
+
+/// Logging policy for one Redis client.
+///
+/// The single-use replay authority must never publish raw backend text, key
+/// material, marker material, credentials, or the operator key prefix. Generic
+/// rate-limiter clients retain their existing operational diagnostics.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RedisClientLogPolicy {
+    Operational,
+    ClassificationOnly,
+}
+
+/// Classification-only diagnostic for a Redis client owned by the replay
+/// authority. Never interpolates backend text, keys, prefixes, or credentials.
+fn warn_replay_backend(redacted_url: &str, classification: &'static str, message: &'static str) {
+    warn!(
+        redis_url = %redacted_url,
+        classification,
+        "{message}"
+    );
+}
+
+/// Terminal Cluster rejection. Operational clients keep the historical
+/// `key_prefix` + `reason` fields; replay clients publish only the fixed
+/// classification beside the redacted endpoint.
+fn warn_topology_unsupported(
+    redacted_url: &str,
+    key_prefix: &str,
+    reason: &str,
+    log_policy: RedisClientLogPolicy,
+) {
+    match log_policy {
+        RedisClientLogPolicy::Operational => {
+            warn!(
+                redis_url = %redacted_url,
+                key_prefix = %key_prefix,
+                reason,
+                "Redis endpoint reports an unsupported topology (Redis Cluster is not supported) \
+                 — centralized Redis access is disabled for this configuration until it is changed"
+            );
+        }
+        RedisClientLogPolicy::ClassificationOnly => {
+            warn_replay_backend(
+                redacted_url,
+                "unsupported_topology",
+                "Redis single-use claim failed",
+            );
+        }
+    }
 }
 
 /// Pure floor-at-zero decision for [`RedisRateLimitClient::incrby_with_expire_floor_zero`].
@@ -1171,6 +1749,48 @@ fn clamp_floored_total(floored: i64) -> i64 {
     floored.max(0)
 }
 
+/// Captured `(available, epoch)` pair from
+/// [`RedisRateLimitClient::capture_shared_replay_registration_sample_for_test`].
+///
+/// Used to deterministically replay a stale registration apply after a newer
+/// availability notification. The epoch is opaque so tests cannot forge a
+/// newer generation than the one they sampled.
+#[derive(Clone, Copy, Debug)]
+pub struct SharedReplayRegistrationSample {
+    available: bool,
+    epoch: u64,
+}
+
+impl SharedReplayRegistrationSample {
+    /// Whether this sample observed a reachable backend.
+    #[allow(dead_code)] // public support used by the external unit-test target
+    pub fn available(self) -> bool {
+        self.available
+    }
+}
+
+/// Interpret the semantic reply to the replay authority's `SET ... NX EX`.
+///
+/// Redis returns exactly `OK` when it stored the marker and a nil reply when
+/// `NX` found an existing marker. Any other string is an invalid claim reply:
+/// treating mere string presence as success would let a malformed or
+/// non-conforming backend admit a request without proving that the marker was
+/// persisted.
+#[doc(hidden)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ReplaySetNxReplyError {
+    InvalidClaimReply,
+}
+
+#[doc(hidden)]
+pub fn classify_replay_set_nx_reply(reply: Option<&str>) -> Result<bool, ReplaySetNxReplyError> {
+    match reply {
+        Some("OK") => Ok(true),
+        None => Ok(false),
+        Some(_) => Err(ReplaySetNxReplyError::InvalidClaimReply),
+    }
+}
+
 impl RedisRateLimitClient {
     /// Create a new Redis rate limit client.
     ///
@@ -1188,6 +1808,51 @@ impl RedisRateLimitClient {
         dns_cache: Option<DnsCache>,
         tls_no_verify: bool,
         tls_ca_bundle_path: Option<&str>,
+    ) -> Self {
+        Self::construct(
+            config,
+            dns_cache,
+            tls_no_verify,
+            tls_ca_bundle_path,
+            RedisClientLogPolicy::Operational,
+        )
+    }
+
+    /// Redis client owned by the single-use replay authority.
+    ///
+    /// Starts unproven (not available) until a topology-screened **and**
+    /// no-eviction-screened connection or recovery probe succeeds, so a
+    /// configured `shared` policy cannot publish `/health` ready before Redis
+    /// has been proven safe to retain live markers. A connection is usable only
+    /// when `INFO MEMORY` proves `maxmemory == 0` or
+    /// `maxmemory_policy == noeviction`; an evicting policy is terminal for this
+    /// generation, and an unproven query fails closed and recoverable.
+    /// Connection, authentication, command, topology, memory-policy, and
+    /// recovery diagnostics publish only a fixed classification beside the
+    /// already-redacted endpoint — never raw backend text, `INFO` payloads, key
+    /// material, marker material, credentials, or the operator key prefix.
+    /// Generic rate-limiter clients must keep [`Self::new`].
+    pub fn for_replay_authority(
+        config: RedisConfig,
+        dns_cache: Option<DnsCache>,
+        tls_no_verify: bool,
+        tls_ca_bundle_path: Option<&str>,
+    ) -> Self {
+        Self::construct(
+            config,
+            dns_cache,
+            tls_no_verify,
+            tls_ca_bundle_path,
+            RedisClientLogPolicy::ClassificationOnly,
+        )
+    }
+
+    fn construct(
+        config: RedisConfig,
+        dns_cache: Option<DnsCache>,
+        tls_no_verify: bool,
+        tls_ca_bundle_path: Option<&str>,
+        log_policy: RedisClientLogPolicy,
     ) -> Self {
         let tls_ca_bundle_pem = if !tls_no_verify {
             tls_ca_bundle_path.and_then(|path| {
@@ -1211,12 +1876,153 @@ impl RedisRateLimitClient {
             pool: Arc::new(ConnectionPool::new(config.pool_size)),
             config,
             dns_cache,
-            availability: Arc::new(EnforcementAvailability::new()),
+            availability: Arc::new(match log_policy {
+                RedisClientLogPolicy::ClassificationOnly => EnforcementAvailability::unproven(),
+                RedisClientLogPolicy::Operational => EnforcementAvailability::new(),
+            }),
             health_checker_started: AtomicBool::new(false),
             health_checker_abort: Mutex::new(None),
             tls_no_verify,
             tls_ca_bundle_pem,
+            log_policy,
+            shared_replay_health: OnceLock::new(),
         }
+    }
+
+    /// Count this distinct Redis client as one shared replay authority.
+    ///
+    /// Idempotent: several equivalent `jwks_auth` providers sharing one client
+    /// Arc register once. HMAC and JWKS clients remain distinct authorities
+    /// where they are distinct clients. Generic rate-limiter clients never
+    /// call this, so their availability transitions do not move replay health.
+    ///
+    /// The health `Weak` is attached before the first count so a concurrent
+    /// outage, recovery, or terminal topology notifies with a strictly newer
+    /// epoch than the sample taken here. The registration then publishes the
+    /// newest epoch; a stale sampled apply cannot overwrite that notification,
+    /// so the packed `/health` word cannot remain permanently inconsistent with
+    /// [`EnforcementAvailability`] after the race settles.
+    ///
+    /// A replay-authority client starts unproven, so this sample publishes
+    /// unavailable until a screened probe proves the backend. The bounded
+    /// readiness probe is armed here when a Tokio runtime is present; without
+    /// one this is panic-free and a later call (or a protected-request miss)
+    /// retries the arm.
+    pub(crate) fn register_as_shared_replay_authority(&self) {
+        let registration = self.ensure_shared_replay_health();
+        self.attach_shared_replay_health(&registration);
+        let (available, epoch) = self.availability.health_snapshot();
+        registration.apply_availability(available, epoch);
+        self.start_health_checker_if_needed();
+    }
+
+    /// Whether this client currently contributes to packed shared-replay health.
+    ///
+    /// False until [`Self::register_as_shared_replay_authority`] publishes the
+    /// first count, and false again after retirement. An unpublished candidate
+    /// must not admit, dial, or move readiness.
+    pub(crate) fn is_live_shared_replay_registration(&self) -> bool {
+        self.shared_replay_health
+            .get()
+            .is_some_and(|registration| registration.is_live())
+    }
+
+    fn ensure_shared_replay_health(&self) -> Arc<SharedReplayHealthRegistration> {
+        Arc::clone(
+            self.shared_replay_health
+                .get_or_init(|| Arc::new(SharedReplayHealthRegistration::new())),
+        )
+    }
+
+    fn attach_shared_replay_health(&self, registration: &Arc<SharedReplayHealthRegistration>) {
+        let _ = self
+            .availability
+            .shared_replay_health
+            .set(Arc::downgrade(registration));
+    }
+
+    fn classification_only(&self) -> bool {
+        matches!(self.log_policy, RedisClientLogPolicy::ClassificationOnly)
+    }
+
+    fn warn_connect_failure(
+        &self,
+        pool_slot: Option<usize>,
+        error: &redis::RedisError,
+        operational_message: &'static str,
+    ) {
+        if self.classification_only() {
+            warn_replay_backend(
+                &self.config.redacted_url(),
+                "connection_failed",
+                "Redis single-use claim backend failed",
+            );
+            return;
+        }
+        match pool_slot {
+            Some(idx) => {
+                warn!(
+                    redis_url = %self.config.redacted_url(),
+                    pool_slot = idx,
+                    error = %error,
+                    "{operational_message}"
+                );
+            }
+            None => {
+                warn!(
+                    redis_url = %self.config.redacted_url(),
+                    error = %error,
+                    "{operational_message}"
+                );
+            }
+        }
+    }
+
+    fn warn_connect_timeout(&self, pool_slot: Option<usize>) {
+        if self.classification_only() {
+            warn_replay_backend(
+                &self.config.redacted_url(),
+                "connection_timeout",
+                "Redis single-use claim backend failed",
+            );
+            return;
+        }
+        match pool_slot {
+            Some(idx) => {
+                warn!(
+                    redis_url = %self.config.redacted_url(),
+                    pool_slot = idx,
+                    timeout_seconds = self.config.connect_timeout_seconds,
+                    "Timed out connecting to Redis for rate limiting"
+                );
+            }
+            None => {
+                warn!(
+                    redis_url = %self.config.redacted_url(),
+                    timeout_seconds = self.config.connect_timeout_seconds,
+                    "Timed out connecting dedicated Redis client"
+                );
+            }
+        }
+    }
+
+    fn info_connected(&self, pool_slot: usize) {
+        if self.classification_only() {
+            info!(
+                redis_url = %self.config.redacted_url(),
+                pool_slot,
+                pool_size = self.pool.len(),
+                "Redis single-use claim backend connected"
+            );
+            return;
+        }
+        info!(
+            redis_url = %self.config.redacted_url(),
+            key_prefix = %self.config.key_prefix,
+            pool_slot,
+            pool_size = self.pool.len(),
+            "Redis rate limiting connected"
+        );
     }
 
     /// Whether Redis is currently available.
@@ -1266,6 +2072,40 @@ impl RedisRateLimitClient {
     #[allow(dead_code)] // public support used by the external unit-test target
     pub fn publish_reachable_for_test(&self) -> bool {
         self.availability.publish_reachable()
+    }
+
+    /// Attach the shared-replay health handle and capture the current
+    /// `(available, epoch)` pair **without** publishing it (test support).
+    ///
+    /// Reproduces the registration window where a concurrent transition can
+    /// notify first and a stale sampled apply would otherwise overwrite it.
+    /// Attaching does not move the packed health word; only a later
+    /// [`Self::publish_shared_replay_registration_sample_for_test`] or a
+    /// transition notify publishes counts.
+    #[allow(dead_code)] // public support used by the external unit-test target
+    pub fn capture_shared_replay_registration_sample_for_test(
+        &self,
+    ) -> SharedReplayRegistrationSample {
+        let registration = self.ensure_shared_replay_health();
+        self.attach_shared_replay_health(&registration);
+        let (available, epoch) = self.availability.health_snapshot();
+        SharedReplayRegistrationSample { available, epoch }
+    }
+
+    /// Apply a previously captured registration sample (test support).
+    ///
+    /// A sample whose epoch is older than a notification that already landed
+    /// is rejected, which is the proof that the packed health word cannot stay
+    /// permanently stale after the last registration/availability race settles.
+    #[allow(dead_code)] // public support used by the external unit-test target
+    pub fn publish_shared_replay_registration_sample_for_test(
+        &self,
+        sample: SharedReplayRegistrationSample,
+    ) {
+        let Some(registration) = self.shared_replay_health.get() else {
+            return;
+        };
+        registration.apply_availability(sample.available, sample.epoch);
     }
 
     /// What a failover health observer reads from this client's shared
@@ -1369,8 +2209,9 @@ impl RedisRateLimitClient {
     /// Run one health-check-style multiplexed connect+PING for tests.
     ///
     /// Uses the same Ferrum timeout wiring as the background recovery checker
-    /// (inner `AsyncConnectionConfig` + defensive outer bound). DNS screening
-    /// still happens first and remains outside the connection timeout.
+    /// (inner `AsyncConnectionConfig` + defensive outer connect bound, then a
+    /// `PING` bounded by the same `connect_timeout`). DNS screening still
+    /// happens first and remains outside the connection timeout.
     #[allow(dead_code)] // public support used by the external integration-test target
     pub async fn health_check_connect_for_test(&self) -> bool {
         let url = match self.resolve_url().await {
@@ -1384,7 +2225,7 @@ impl RedisRateLimitClient {
             Err(_) => return false,
         };
         let connect_timeout = self.connect_timeout();
-        let async_config = self.async_connection_config();
+        let async_config = recovery_async_connection_config(connect_timeout);
         let mut conn = match tokio::time::timeout(
             connect_timeout,
             client.get_multiplexed_async_connection_with_config(&async_config),
@@ -1394,10 +2235,7 @@ impl RedisRateLimitClient {
             Ok(Ok(conn)) => conn,
             Ok(Err(_)) | Err(_) => return false,
         };
-        redis::cmd("PING")
-            .query_async::<String>(&mut conn)
-            .await
-            .is_ok()
+        ping_connection(&mut conn, connect_timeout).await.is_ok()
     }
 
     /// Connection-timeout duration installed into redis-rs configs (tests).
@@ -1420,7 +2258,7 @@ impl RedisRateLimitClient {
     /// failures remain distinct unavailable outcomes so neither can fall back to
     /// the Redis crate's unscreened resolver.
     async fn resolve_url(&self) -> RedisEndpoint {
-        screen_redis_endpoint(&self.config, self.dns_cache.as_ref()).await
+        screen_redis_endpoint(&self.config, self.dns_cache.as_ref(), self.log_policy).await
     }
 
     /// Build a Redis client with proper TLS configuration.
@@ -1494,10 +2332,10 @@ impl RedisRateLimitClient {
     /// redis-rs async connection config carrying Ferrum's connection-attempt timeout.
     ///
     /// The crate default is one second; without this, outer `tokio::time::timeout`
-    /// wrappers cannot extend attempts past that inner cap. Used by *every*
-    /// connection path — pooled, dedicated, and health-check — because all three
-    /// dial a plain [`redis::aio::MultiplexedConnection`] and never a
-    /// transparently reconnecting [`redis::aio::ConnectionManager`].
+    /// wrappers cannot extend attempts past that inner cap. Used by pooled and
+    /// dedicated connect paths. Recovery probes use
+    /// [`recovery_async_connection_config`] so redis-rs' 500ms command response
+    /// timeout cannot preempt the admitted PING/INFO bound.
     fn async_connection_config(&self) -> redis::AsyncConnectionConfig {
         redis::AsyncConnectionConfig::new().set_connection_timeout(Some(self.connect_timeout()))
     }
@@ -1593,11 +2431,10 @@ impl RedisRateLimitClient {
         let client = match self.build_client(&url) {
             Ok(c) => c,
             Err(e) => {
-                warn!(
-                    redis_url = %self.config.redacted_url(),
-                    pool_slot = idx,
-                    error = %e,
-                    "Failed to create Redis client for rate limiting"
+                self.warn_connect_failure(
+                    Some(idx),
+                    &e,
+                    "Failed to create Redis client for rate limiting",
                 );
                 self.mark_unavailable();
                 return None;
@@ -1606,9 +2443,11 @@ impl RedisRateLimitClient {
 
         match self.connect_multiplexed(client).await {
             Ok(mut conn) => {
-                // Screen topology before the connection is published to the hot
-                // path: a Cluster endpoint must never serve a policy operation.
-                if !self.screen_topology(&mut conn).await {
+                // Screen topology (and, for replay-authority clients, the
+                // no-eviction memory policy) before the connection is published
+                // to the hot path: a Cluster endpoint or an evicting Redis must
+                // never serve a policy operation.
+                if !self.screen_established_connection(&mut conn).await {
                     return None;
                 }
                 // Re-check at the publication boundary: another task may have
@@ -1618,13 +2457,7 @@ impl RedisRateLimitClient {
                 if !self.availability.publish_reachable() {
                     return None;
                 }
-                info!(
-                    redis_url = %self.config.redacted_url(),
-                    key_prefix = %self.config.key_prefix,
-                    pool_slot = idx,
-                    pool_size = self.pool.len(),
-                    "Redis rate limiting connected"
-                );
+                self.info_connected(idx);
                 self.start_health_checker_if_needed();
                 slot.connection.store(Arc::new(Some(conn.clone())));
                 // Publication race, other direction: a rejection proven between
@@ -1639,22 +2472,16 @@ impl RedisRateLimitClient {
                 Some(conn)
             }
             Err(ConnectAttemptError::Redis(e)) => {
-                warn!(
-                    redis_url = %self.config.redacted_url(),
-                    pool_slot = idx,
-                    error = %e,
-                    "Failed to connect to Redis for rate limiting"
+                self.warn_connect_failure(
+                    Some(idx),
+                    &e,
+                    "Failed to connect to Redis for rate limiting",
                 );
                 self.note_command_failure(&e);
                 None
             }
             Err(ConnectAttemptError::Timeout) => {
-                warn!(
-                    redis_url = %self.config.redacted_url(),
-                    pool_slot = idx,
-                    timeout_seconds = self.config.connect_timeout_seconds,
-                    "Timed out connecting to Redis for rate limiting"
-                );
+                self.warn_connect_timeout(Some(idx));
                 self.mark_unavailable();
                 None
             }
@@ -1715,11 +2542,7 @@ impl RedisRateLimitClient {
         let client = match self.build_client(&url) {
             Ok(client) => client,
             Err(e) => {
-                warn!(
-                    redis_url = %self.config.redacted_url(),
-                    error = %e,
-                    "Failed to create dedicated Redis client"
-                );
+                self.warn_connect_failure(None, &e, "Failed to create dedicated Redis client");
                 self.mark_unavailable();
                 return None;
             }
@@ -1727,8 +2550,9 @@ impl RedisRateLimitClient {
 
         match self.connect_multiplexed(client).await {
             Ok(mut conn) => {
-                // Screen topology before any WATCH/MULTI sequence runs on it.
-                if !self.screen_topology(&mut conn).await {
+                // Screen topology (and replay no-eviction policy) before any
+                // WATCH/MULTI sequence runs on it.
+                if !self.screen_established_connection(&mut conn).await {
                     return None;
                 }
                 // Same publication boundary as the pooled path: a concurrent
@@ -1739,20 +2563,12 @@ impl RedisRateLimitClient {
                 Some(conn)
             }
             Err(ConnectAttemptError::Redis(e)) => {
-                warn!(
-                    redis_url = %self.config.redacted_url(),
-                    error = %e,
-                    "Failed to connect dedicated Redis client"
-                );
+                self.warn_connect_failure(None, &e, "Failed to connect dedicated Redis client");
                 self.note_command_failure(&e);
                 None
             }
             Err(ConnectAttemptError::Timeout) => {
-                warn!(
-                    redis_url = %self.config.redacted_url(),
-                    timeout_seconds = self.config.connect_timeout_seconds,
-                    "Timed out connecting dedicated Redis client"
-                );
+                self.warn_connect_timeout(None);
                 self.mark_unavailable();
                 None
             }
@@ -1810,7 +2626,9 @@ impl RedisRateLimitClient {
         self.clear_connection();
     }
 
-    /// Permanently reject the configured endpoint as an unsupported topology.
+    /// Permanently reject the configured endpoint as proven-bad configuration
+    /// (unsupported Cluster topology, or — for replay-authority clients — an
+    /// evicting `maxmemory` policy).
     ///
     /// Distinct from [`Self::mark_unavailable`] on purpose: this is a
     /// configuration fault, not an outage, so no amount of recovery pinging can
@@ -1818,19 +2636,33 @@ impl RedisRateLimitClient {
     /// [`Self::is_available`] load stays false and the consumer's configured
     /// failure policy governs from here on.
     fn mark_topology_unsupported(&self, reason: &str) {
+        self.mark_endpoint_terminal("unsupported_topology", reason);
+    }
+
+    fn mark_endpoint_terminal(&self, classification: &'static str, reason: &str) {
         let first = self.availability.reject_topology();
         // Drop cached connections so no slot can keep serving the refused
         // endpoint. `reject_topology` already made the state terminal, so this
         // cannot be downgraded back to a plain outage.
         self.clear_connection();
         if first {
-            warn!(
-                redis_url = %self.config.redacted_url(),
-                key_prefix = %self.config.key_prefix,
-                reason,
-                "Redis endpoint reports an unsupported topology (Redis Cluster is not supported) \
-                 — centralized Redis access is disabled for this configuration until it is changed"
-            );
+            match self.log_policy {
+                RedisClientLogPolicy::Operational => {
+                    warn_topology_unsupported(
+                        &self.config.redacted_url(),
+                        &self.config.key_prefix,
+                        reason,
+                        self.log_policy,
+                    );
+                }
+                RedisClientLogPolicy::ClassificationOnly => {
+                    warn_replay_backend(
+                        &self.config.redacted_url(),
+                        classification,
+                        "Redis single-use claim failed",
+                    );
+                }
+            }
         }
     }
 
@@ -1868,18 +2700,59 @@ impl RedisRateLimitClient {
         match screen_connection_topology(conn, self.connect_timeout()).await {
             TopologyScreen::Usable => true,
             TopologyScreen::ClusterProven => {
-                self.mark_topology_unsupported("server reported cluster_enabled");
+                self.mark_endpoint_terminal(
+                    "unsupported_topology",
+                    "server reported cluster_enabled",
+                );
                 false
             }
             TopologyScreen::ProbeFailed => {
                 // Bounded by the configured connect timeout. Never proof of
                 // Cluster topology, and never a licence to run a policy command
                 // on the unscreened connection — an ordinary retryable outage.
-                warn!(
-                    redis_url = %self.config.redacted_url(),
-                    timeout_seconds = self.config.connect_timeout_seconds,
-                    "Redis topology screen did not complete — centralized Redis unavailable; \
-                     will retry"
+                if self.classification_only() {
+                    warn_replay_backend(
+                        &self.config.redacted_url(),
+                        "connection_timeout",
+                        "Redis single-use claim backend failed",
+                    );
+                } else {
+                    warn!(
+                        redis_url = %self.config.redacted_url(),
+                        timeout_seconds = self.config.connect_timeout_seconds,
+                        "Redis topology screen did not complete — centralized Redis unavailable; \
+                         will retry"
+                    );
+                }
+                self.mark_unavailable();
+                false
+            }
+        }
+    }
+
+    /// Replay-authority no-eviction screen. Generic clients skip this.
+    ///
+    /// Must run after a usable topology screen and before any claim command.
+    /// A proven `allkeys-*` / `volatile-*` policy is terminal for this client
+    /// generation; an unproven query is a recoverable outage.
+    async fn screen_memory_policy(&self, conn: &mut impl redis::aio::ConnectionLike) -> bool {
+        if !self.classification_only() {
+            return true;
+        }
+        match screen_connection_memory_policy(conn, self.connect_timeout()).await {
+            MemoryPolicyScreen::Usable => true,
+            MemoryPolicyScreen::UnsafeEviction => {
+                self.mark_endpoint_terminal(
+                    "unsafe_eviction_policy",
+                    "server reported an evicting maxmemory policy",
+                );
+                false
+            }
+            MemoryPolicyScreen::Unproven => {
+                warn_replay_backend(
+                    &self.config.redacted_url(),
+                    "memory_policy_unproven",
+                    "Redis single-use claim backend failed",
                 );
                 self.mark_unavailable();
                 false
@@ -1887,14 +2760,45 @@ impl RedisRateLimitClient {
         }
     }
 
-    /// Start a background task that periodically pings Redis to detect recovery.
+    /// Topology plus, for replay-authority clients, the no-eviction memory
+    /// screen. No command may run on an unscreened replay connection.
+    async fn screen_established_connection(
+        &self,
+        conn: &mut impl redis::aio::ConnectionLike,
+    ) -> bool {
+        self.screen_topology(conn).await && self.screen_memory_policy(conn).await
+    }
+
+    /// Start a background task that periodically probes Redis to detect recovery.
     ///
     /// The task is aborted when this client is dropped so retired plugin
     /// generations cannot keep dialing obsolete Redis endpoints.
-    fn start_health_checker_if_needed(&self) {
+    ///
+    /// `tokio::spawn` panics without a reactor. Plugin construction, sync
+    /// tests, and test-injected outages on ordinary threads can all reach
+    /// [`Self::mark_unavailable`] outside a runtime. Do not latch the started
+    /// flag until a runtime is present: a later request-path transition must
+    /// still arm recovery so fail-closed consumers are not pinned unavailable.
+    ///
+    /// Replay-authority clients probe on the first iteration (no startup sleep)
+    /// so `/health` can recover without protected traffic and without waiting
+    /// a full `redis_health_check_interval_seconds`. That first probe also
+    /// emits one closed-set `connection_failed` classification beside the
+    /// redacted endpoint when authentication or connection fails while the
+    /// client is still unproven — otherwise the unproven-to-unreachable
+    /// transition is silent. Later genuine available-to-unavailable
+    /// transitions keep the same diagnostic; retries while already
+    /// unavailable stay silent. Operational clients keep the historical
+    /// sleep-then-probe cadence and warn only on an availability drop.
+    pub(crate) fn start_health_checker_if_needed(&self) {
+        let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+            return;
+        };
         if self.health_checker_started.swap(true, Ordering::Relaxed) {
             return; // Already started
         }
+
+        let probe_immediately = self.classification_only();
 
         let availability = Arc::clone(&self.availability);
         // Weak, not strong: the checker may drop cached sockets when it proves
@@ -1908,10 +2812,20 @@ impl RedisRateLimitClient {
         let connect_timeout = self.connect_timeout();
         let tls_no_verify = self.tls_no_verify;
         let tls_ca_bundle_pem = self.tls_ca_bundle_pem.clone();
+        let log_policy = self.log_policy;
 
-        let handle = tokio::spawn(async move {
+        let handle = runtime.spawn(async move {
+            let mut delay_before_probe = !probe_immediately;
+            // Consumed by the first probe that actually completes (Ok or Err),
+            // not by a DNS-screen `continue`. Replay clients start unproven, so
+            // `was_available` cannot distinguish that first failure from a
+            // later retry while still unreachable.
+            let mut log_unproven_probe_failure = probe_immediately;
             loop {
-                tokio::time::sleep(interval).await;
+                if delay_before_probe {
+                    tokio::time::sleep(interval).await;
+                }
+                delay_before_probe = true;
 
                 // A rejected topology is a configuration fault, not an outage:
                 // a Cluster node answers PING while still redirecting every
@@ -1926,7 +2840,8 @@ impl RedisRateLimitClient {
                 // recovery checker must NOT hand an unscreened host to the Redis
                 // client either (a DNS-cache outage or a later rebind/policy denial
                 // would otherwise let the background ping dial a denied address).
-                let url = match screen_redis_endpoint(&config, dns_cache.as_ref()).await {
+                let url = match screen_redis_endpoint(&config, dns_cache.as_ref(), log_policy).await
+                {
                     RedisEndpoint::Url(url) => url,
                     // Still denied or unresolvable this interval — skip the ping
                     // and re-screen next interval (including hostname egress
@@ -1975,8 +2890,7 @@ impl RedisRateLimitClient {
                     } else {
                         redis::Client::open(conn_info)?
                     };
-                    let async_config = redis::AsyncConnectionConfig::new()
-                        .set_connection_timeout(Some(connect_timeout));
+                    let async_config = recovery_async_connection_config(connect_timeout);
                     let mut conn = match tokio::time::timeout(
                         connect_timeout,
                         client.get_multiplexed_async_connection_with_config(&async_config),
@@ -1992,7 +2906,10 @@ impl RedisRateLimitClient {
                             )));
                         }
                     };
-                    redis::cmd("PING").query_async::<String>(&mut conn).await?;
+                    // Bound PING by the same connect timeout as establishment
+                    // and the INFO screens: an accepted socket that never
+                    // answers would otherwise wedge this single-flight checker.
+                    ping_connection(&mut conn, connect_timeout).await?;
                     // A PING alone proves nothing about topology, so screen the
                     // recovered endpoint before ever reporting it healthy. The
                     // probe is bounded by the same configured connect timeout as
@@ -2000,7 +2917,7 @@ impl RedisRateLimitClient {
                     // answers INFO cannot stall the recovery loop.
                     let screen = screen_connection_topology(&mut conn, connect_timeout).await;
                     match screen {
-                        TopologyScreen::Usable => Ok::<(), redis::RedisError>(()),
+                        TopologyScreen::Usable => {}
                         TopologyScreen::ClusterProven => {
                             let first = availability.reject_topology();
                             // Terminal state first, cached sockets second — the
@@ -2013,36 +2930,99 @@ impl RedisRateLimitClient {
                                 pool.clear();
                             }
                             if first {
-                                warn!(
-                                    redis_url = %config.redacted_url(),
-                                    key_prefix = %config.key_prefix,
-                                    reason = "server reported cluster topology during recovery",
-                                    "Redis endpoint reports an unsupported topology (Redis Cluster \
-                                     is not supported) — centralized Redis access is disabled for \
-                                     this configuration until it is changed"
+                                warn_topology_unsupported(
+                                    &config.redacted_url(),
+                                    &config.key_prefix,
+                                    "server reported cluster topology during recovery",
+                                    log_policy,
                                 );
                             }
-                            Err(cluster_topology_probe_error())
+                            return Err(cluster_topology_probe_error());
                         }
-                        TopologyScreen::ProbeFailed => Err(incomplete_topology_probe_error()),
+                        TopologyScreen::ProbeFailed => {
+                            return Err(incomplete_topology_probe_error());
+                        }
                     }
+                    if matches!(log_policy, RedisClientLogPolicy::ClassificationOnly) {
+                        match screen_connection_memory_policy(&mut conn, connect_timeout)
+                            .await
+                        {
+                            MemoryPolicyScreen::Usable => {}
+                            MemoryPolicyScreen::UnsafeEviction => {
+                                let first = availability.reject_topology();
+                                if let Some(pool) = pool.upgrade() {
+                                    pool.clear();
+                                }
+                                if first {
+                                    warn_replay_backend(
+                                        &config.redacted_url(),
+                                        "unsafe_eviction_policy",
+                                        "Redis single-use claim failed",
+                                    );
+                                }
+                                return Err(unsafe_eviction_probe_error());
+                            }
+                            MemoryPolicyScreen::Unproven => {
+                                return Err(unproven_memory_probe_error());
+                            }
+                        }
+                    }
+                    Ok::<(), redis::RedisError>(())
                 }
                 .await;
 
                 let was_available = availability.is_available();
                 match result {
                     Ok(()) => {
+                        log_unproven_probe_failure = false;
                         // Publication boundary: a topology rejection proven by
                         // another task while this probe was in flight wins, so a
                         // successful PING/INFO can neither restore availability
                         // nor advertise a recovery an observer would relay.
                         if availability.publish_reachable() && !was_available {
-                            info!("Redis connection recovered — centralized Redis access restored");
+                            match log_policy {
+                                RedisClientLogPolicy::Operational => {
+                                    info!(
+                                        "Redis connection recovered — centralized Redis access restored"
+                                    );
+                                }
+                                RedisClientLogPolicy::ClassificationOnly => {
+                                    info!(
+                                        redis_url = %config.redacted_url(),
+                                        "Redis single-use claim backend recovered"
+                                    );
+                                }
+                            }
                         }
                     }
-                    Err(_) => {
-                        if was_available && !availability.is_topology_terminal() {
+                    Err(error) => {
+                        let topology_terminal = availability.is_topology_terminal();
+                        let log_operational_transition =
+                            matches!(log_policy, RedisClientLogPolicy::Operational)
+                                && was_available
+                                && !topology_terminal;
+                        let log_replay_probe_failure =
+                            matches!(log_policy, RedisClientLogPolicy::ClassificationOnly)
+                                && !topology_terminal
+                                && (was_available || log_unproven_probe_failure);
+                        log_unproven_probe_failure = false;
+                        if log_operational_transition {
                             warn!("Redis health check failed — centralized Redis unavailable");
+                        } else if log_replay_probe_failure {
+                            let classification = if is_unproven_memory_probe_error(&error) {
+                                "memory_policy_unproven"
+                            } else if is_incomplete_topology_probe_error(&error)
+                                || is_incomplete_ping_probe_error(&error)
+                            {
+                                "connection_timeout"
+                            } else {
+                                "connection_failed"
+                            };
+                            warn_replay_backend(
+                                &config.redacted_url(),
+                                classification,
+                                "Redis single-use claim backend failed",
+                            );
                         }
                         availability.mark_unreachable();
                     }
@@ -2569,6 +3549,111 @@ impl RedisRateLimitClient {
                     operation = "SET NX EX",
                     error = %e,
                     "Redis command failed"
+                );
+                self.note_command_failure(&e);
+                Err(())
+            }
+        }
+    }
+
+    /// [`Self::set_bytes_nx_with_expire`] with a **bounded response deadline**
+    /// and **classification-only** logging.
+    ///
+    /// Two properties the general primitive does not provide, both required by
+    /// the single-use replay authority
+    /// ([`crate::plugins::utils::replay_authority`]):
+    ///
+    /// * **Bounded.** `get_connection()` bounds connection setup, but the reply
+    ///   to an already-dispatched command is otherwise awaited forever. A peer
+    ///   that completes the TCP/TLS handshake, passes the topology screen, and
+    ///   then simply stops answering would hold an in-flight protected request
+    ///   open for as long as it keeps the socket. The deadline reuses the
+    ///   documented Redis timeout contract — `redis_connect_timeout_seconds`,
+    ///   the same admitted bound the topology probe already applies to a
+    ///   server-side reply — rather than adding an unbounded new knob.
+    /// * **Redacted.** The claim path may not put backend error TEXT in a log
+    ///   record. A `RedisError` renders server-supplied detail, and the key
+    ///   itself is a replay marker. Only the fixed classification below and the
+    ///   already-redacted endpoint are logged; the key, the value, the marker,
+    ///   and the error text never are.
+    ///
+    /// Timeout, partition, connection failure, authentication rejection, and
+    /// protocol/parse uncertainty all collapse to `Err(())` — the caller's
+    /// fail-closed result. A timeout marks the client unavailable exactly like
+    /// any other command failure, so the background recovery checker owns
+    /// restoring it.
+    pub async fn set_bytes_nx_with_expire_bounded(
+        &self,
+        key: &str,
+        value: &[u8],
+        ttl_seconds: u64,
+    ) -> Result<bool, ()> {
+        let mut conn = self.get_connection().await.ok_or(())?;
+
+        let mut command = redis::cmd("SET");
+        command
+            .arg(key)
+            .arg(value)
+            .arg("NX")
+            .arg("EX")
+            .arg(expire_seconds(ttl_seconds));
+        let response: Result<Option<String>, redis::RedisError> = match tokio::time::timeout(
+            self.connect_timeout(),
+            command.query_async(&mut conn),
+        )
+        .await
+        {
+            Ok(result) => result,
+            Err(_) => {
+                // Connected but unanswered. Never a licence to admit: an
+                // executed-but-unacknowledged `SET NX` leaves the marker in
+                // place, so the retry sees the existing key and stays
+                // fail-closed.
+                warn!(
+                    redis_url = %self.config.redacted_url(),
+                    operation = "SET NX EX",
+                    classification = "response_timeout",
+                    timeout_seconds = self.config.connect_timeout_seconds,
+                    "Redis single-use claim did not answer within the bounded deadline"
+                );
+                self.mark_unavailable();
+                return Err(());
+            }
+        };
+
+        match response {
+            Ok(value) => match classify_replay_set_nx_reply(value.as_deref()) {
+                Ok(admitted) => {
+                    self.note_command_success()?;
+                    Ok(admitted)
+                }
+                Err(ReplaySetNxReplyError::InvalidClaimReply) => {
+                    // Do not render the server-controlled reply. Only exact
+                    // `OK` proves that Redis stored the marker; every other
+                    // string is protocol uncertainty and must fail closed.
+                    warn!(
+                        redis_url = %self.config.redacted_url(),
+                        operation = "SET NX EX",
+                        classification = "malformed_response",
+                        "Redis single-use claim returned an invalid response"
+                    );
+                    self.mark_unavailable();
+                    Err(())
+                }
+            },
+            Err(e) => {
+                // `is_cluster_topology_error` inspects the error; nothing it
+                // reads is rendered. The published field is the fixed class.
+                let classification = if is_cluster_topology_error(&e) {
+                    "unsupported_topology"
+                } else {
+                    "command_failed"
+                };
+                warn!(
+                    redis_url = %self.config.redacted_url(),
+                    operation = "SET NX EX",
+                    classification,
+                    "Redis single-use claim failed"
                 );
                 self.note_command_failure(&e);
                 Err(())

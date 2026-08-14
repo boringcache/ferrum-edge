@@ -128,6 +128,7 @@ mod mesh_xds_stream_lifecycle_tests;
 mod node_agent_topology_metrics_tests;
 mod policy_path_canonicalization_tests;
 mod port_aware_route_traffic_tests;
+mod replay_authority_readiness_tests;
 mod scripted_backend_smoke_tests;
 mod service_discovery_endpointslice_lifecycle_tests;
 mod service_discovery_lifecycle_tests;

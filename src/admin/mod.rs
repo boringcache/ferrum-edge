@@ -2120,12 +2120,30 @@ async fn handle_admin_request_inner(
         // orchestration is told to stop steering new traffic at the replica.
         let gateway_listeners_not_ready =
             gateway_listeners_degraded && state.gateway_listener_failure_fails_readiness;
+        // Shared single-use replay authority (issues #3834 / #3837). A policy
+        // that declared `shared` scope has no local fallback by design: while
+        // its backend is unavailable, every protected request on it fails
+        // closed. That is a lost dependency, not a per-request error, so it must
+        // withdraw the replica rather than let an orchestrator keep steering
+        // authenticated DPoP / `ferrum-hmac-v2` traffic at a gateway that can
+        // only refuse it. The snapshot is one acquire-load of a packed atomic
+        // published on lifecycle transitions — no mutex, no registry scan, no
+        // allocation, no I/O, and no work proportional to configured or
+        // historical authorities — so an unauthenticated probe flood cannot
+        // contend plugin construction or walk reload history. Retired plugin
+        // generations drop their registration immediately and stop contributing.
+        // Recovery is automatic: the client's background recovery checker
+        // republishes availability and the next probe is ready again.
+        let replay_authority_health =
+            crate::plugins::utils::replay_authority::shared_health_snapshot();
+        let replay_authority_unavailable = replay_authority_health.unavailable();
         let ready = startup_ready
             && !serving_degraded
             && jwks_ready
             && discovery_ready
             && !dp_config_stale
             && !cp_trust_blocked
+            && !replay_authority_unavailable
             && !gateway_listeners_not_ready;
         health_status["ready"] = json!(ready);
         if gateway_listeners_degraded {
@@ -2166,6 +2184,17 @@ async fn handle_admin_request_inner(
             && !cp_trust_blocked
         {
             health_status["status"] = json!("degraded");
+        }
+        // Authenticated tier only, and only two integers: how many distinct
+        // shared replay authorities live plugin generations hold, and how many
+        // of those are currently unavailable. Fixed cardinality by construction
+        // — never an endpoint, host, namespace, plugin id, provider, key
+        // prefix, credential, marker, or backend error string. The
+        // unauthenticated body below keeps the repository's coarse
+        // `status` + `ready` contract and carries none of this.
+        if detailed && replay_authority_health.required() {
+            health_status["replay_authority"] =
+                serde_json::to_value(replay_authority_health).unwrap_or_default();
         }
         if jwks_degraded && jwks_ready {
             health_status["status"] = json!("degraded");
@@ -2400,11 +2429,15 @@ async fn handle_admin_request_inner(
             // on it, the status stays `degraded` rather than becoming
             // `unavailable`, so a recoverable partial outage is never reported
             // as a lost dependency.
+            // A shared replay authority that a declared-`shared` policy can no
+            // longer reach is the same shape: the replica started ready and lost
+            // a dependency it has no fallback for.
             let lost_authority = serving_degraded
                 || !jwks_ready
                 || !discovery_ready
                 || dp_config_stale
-                || cp_trust_blocked;
+                || cp_trust_blocked
+                || replay_authority_unavailable;
             health_status["status"] = json!(if lost_authority {
                 "unavailable"
             } else if gateway_listeners_not_ready {
