@@ -1013,10 +1013,10 @@ fn udp_amplification_restart_key_for_ids(
     ids.iter()
         .filter_map(|identity| {
             desired.get(identity).and_then(|candidate| {
-                candidate.scheme.is_udp().then_some((
-                    identity.clone(),
-                    candidate.udp_amplification_factor_bits,
-                ))
+                candidate
+                    .scheme
+                    .is_udp()
+                    .then_some((identity.clone(), candidate.udp_amplification_factor_bits))
             })
         })
         .collect()
