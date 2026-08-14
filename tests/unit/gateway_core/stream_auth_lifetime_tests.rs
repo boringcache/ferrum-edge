@@ -21,10 +21,11 @@ use ferrum_edge::_test_support::{
     bidirectional_copy_with_authorization_for_test,
     collect_buffered_upload_under_authorization_for_test,
     collect_buffered_upload_under_composed_bound_for_test,
-    collect_h3_upload_under_authorization_for_test, compose_buffered_upload_bound_for_test,
-    compose_dispatch_phase_bound_for_test, compose_h3_upload_bound_for_test,
-    compose_precommit_response_phase_bound_for_test, direct_h2_upload_join_bound_for_test,
-    dispatch_phase_authorization_expiry_for_test, dtls_authorization_expired_before_relay_for_test,
+    collect_h3_upload_under_authorization_for_test, compose_aggregate_sse_bound_for_test,
+    compose_buffered_upload_bound_for_test, compose_dispatch_phase_bound_for_test,
+    compose_h3_upload_bound_for_test, compose_precommit_response_phase_bound_for_test,
+    direct_h2_upload_join_bound_for_test, dispatch_phase_authorization_expiry_for_test,
+    dtls_authorization_expired_before_relay_for_test,
     dtls_setup_stage_under_authorization_for_test, precommit_authorization_gate_for_test,
     relay_failure_is_client_facing, request_received_at_for_test,
     request_upload_auth_deadline_for_test, set_grpc_deadline_budget_for_test,
@@ -3975,6 +3976,285 @@ async fn an_elapsed_authorization_bound_never_polls_the_streaming_headers_write(
     );
 }
 
+/// Native-H3 aggregate MCP SSE composes the broker listener lifetime with the
+/// captured authorization plan. Authorization earlier than the listener wins.
+#[tokio::test(start_paused = true)]
+async fn aggregate_sse_authorization_earlier_than_the_listener_wins() {
+    let now = tokio::time::Instant::now();
+    let auth_at = now + Duration::from_secs(2);
+    let listener_at = now + Duration::from_secs(30);
+    let bound = compose_aggregate_sse_bound_for_test(
+        listener_at,
+        Some(plan_at(auth_at, StreamAuthTermination::CredentialExpired)),
+    );
+    assert_eq!(bound.deadline(), Some(auth_at));
+    assert_eq!(bound.expired_authorization(), None);
+    tokio::time::advance(Duration::from_secs(2)).await;
+    assert_eq!(
+        bound.expired_authorization(),
+        Some(StreamAuthTermination::CredentialExpired)
+    );
+}
+
+/// When the listener lifetime is strictly earlier, expiry is the existing
+/// non-authorization outcome even if a late wake also observes the credential
+/// deadline as elapsed.
+#[tokio::test(start_paused = true)]
+async fn aggregate_sse_a_strictly_earlier_listener_is_not_an_authorization_expiry() {
+    let now = tokio::time::Instant::now();
+    let listener_at = now + Duration::from_secs(2);
+    let auth_at = now + Duration::from_secs(30);
+    let bound = compose_aggregate_sse_bound_for_test(
+        listener_at,
+        Some(plan_at(auth_at, StreamAuthTermination::CredentialExpired)),
+    );
+    assert_eq!(bound.deadline(), Some(listener_at));
+    tokio::time::advance(Duration::from_secs(40)).await;
+    assert_eq!(
+        bound.expired_authorization(),
+        None,
+        "a late wake after both instants must not reattribute listener expiry to authorization"
+    );
+}
+
+/// An exact tie between listener lifetime and authorization is attributed to
+/// authorization, matching every other composed seam.
+#[tokio::test(start_paused = true)]
+async fn aggregate_sse_an_exact_tie_is_attributed_to_authorization() {
+    let now = tokio::time::Instant::now();
+    let at = now + Duration::from_secs(5);
+    let bound = compose_aggregate_sse_bound_for_test(
+        at,
+        Some(plan_at(at, StreamAuthTermination::AuthenticatedStreamMaxLifetime)),
+    );
+    assert_eq!(bound.deadline(), Some(at));
+    tokio::time::advance(Duration::from_secs(5)).await;
+    assert_eq!(
+        bound.expired_authorization(),
+        Some(StreamAuthTermination::AuthenticatedStreamMaxLifetime)
+    );
+}
+
+/// Unauthenticated aggregate SSE keeps the listener lifetime and never
+/// produces an authorization termination.
+#[tokio::test(start_paused = true)]
+async fn aggregate_sse_unauthenticated_keeps_the_listener_lifetime() {
+    let now = tokio::time::Instant::now();
+    let listener_at = now + Duration::from_secs(12);
+    let bound = compose_aggregate_sse_bound_for_test(listener_at, None);
+    assert_eq!(bound.deadline(), Some(listener_at));
+    tokio::time::advance(Duration::from_secs(12)).await;
+    assert_eq!(bound.expired_authorization(), None);
+}
+
+/// A stalled aggregate-SSE HEADERS write expires at the authorization
+/// deadline when that plan is earlier than the listener, latches exactly
+/// once, and never treats the protected 200/event-stream head as committed.
+#[tokio::test(start_paused = true)]
+async fn a_stalled_aggregate_sse_headers_write_expires_at_the_authorization_deadline() {
+    let now = tokio::time::Instant::now();
+    let bound = compose_aggregate_sse_bound_for_test(
+        now + Duration::from_secs(30),
+        Some(plan_at(
+            now + Duration::from_secs(2),
+            StreamAuthTermination::CredentialExpired,
+        )),
+    );
+    let latch = StreamAuthTerminationLatch::default();
+    let write = std::future::pending::<Result<(), &'static str>>();
+    let started = tokio::time::Instant::now();
+    let outcome = await_authorized_headers_write_for_test(
+        bound,
+        StreamAuthProtocolFamily::Http,
+        &latch,
+        write,
+    )
+    .await;
+    assert_eq!(
+        tokio::time::Instant::now() - started,
+        Duration::from_secs(2)
+    );
+    assert_eq!(
+        outcome,
+        H3AuthorizedHeadersWrite::AuthorizationExpired(StreamAuthTermination::CredentialExpired)
+    );
+    assert_eq!(
+        latch.observed(),
+        Some(StreamAuthTermination::CredentialExpired)
+    );
+    assert!(
+        !latch.record_once(
+            StreamAuthTermination::CredentialExpired,
+            StreamAuthProtocolFamily::Http
+        ),
+        "the HEADERS expiry must already own this request's single termination record"
+    );
+}
+
+/// A stalled aggregate-SSE HEADERS write that loses to the listener lifetime
+/// is a protocol deadline, not an authorization termination.
+#[tokio::test(start_paused = true)]
+async fn a_stalled_aggregate_sse_headers_write_at_listener_lifetime_is_not_authorization() {
+    let now = tokio::time::Instant::now();
+    let bound = compose_aggregate_sse_bound_for_test(
+        now + Duration::from_secs(2),
+        Some(plan_at(
+            now + Duration::from_secs(30),
+            StreamAuthTermination::CredentialExpired,
+        )),
+    );
+    let latch = StreamAuthTerminationLatch::default();
+    let write = std::future::pending::<Result<(), &'static str>>();
+    let started = tokio::time::Instant::now();
+    let outcome = await_authorized_headers_write_for_test(
+        bound,
+        StreamAuthProtocolFamily::Http,
+        &latch,
+        write,
+    )
+    .await;
+    assert_eq!(
+        tokio::time::Instant::now() - started,
+        Duration::from_secs(2)
+    );
+    assert_eq!(outcome, H3AuthorizedHeadersWrite::ProtocolDeadlineExceeded);
+    assert_eq!(latch.observed(), None);
+}
+
+/// An exact listener/authorization tie on a stalled HEADERS write is the
+/// security decision, and the protected head is never polled once elapsed.
+#[tokio::test(start_paused = true)]
+async fn a_stalled_aggregate_sse_headers_write_on_an_exact_tie_is_authorization() {
+    let now = tokio::time::Instant::now();
+    let at = now + Duration::from_secs(3);
+    let bound = compose_aggregate_sse_bound_for_test(
+        at,
+        Some(plan_at(at, StreamAuthTermination::CredentialExpired)),
+    );
+    let latch = StreamAuthTerminationLatch::default();
+    let write = std::future::pending::<Result<(), &'static str>>();
+    let outcome = await_authorized_headers_write_for_test(
+        bound,
+        StreamAuthProtocolFamily::Http,
+        &latch,
+        write,
+    )
+    .await;
+    assert_eq!(
+        outcome,
+        H3AuthorizedHeadersWrite::AuthorizationExpired(StreamAuthTermination::CredentialExpired)
+    );
+    assert_eq!(
+        latch.observed(),
+        Some(StreamAuthTermination::CredentialExpired)
+    );
+}
+
+/// An already-elapsed authorization bound with a later listener lifetime must
+/// not poll send_response, so the protected 200/event-stream head cannot commit.
+#[tokio::test(start_paused = true)]
+async fn an_elapsed_aggregate_sse_authorization_bound_never_polls_the_protected_head() {
+    let polled = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let flag = Arc::clone(&polled);
+    let write = std::future::poll_fn(move |_cx| {
+        flag.store(true, std::sync::atomic::Ordering::SeqCst);
+        std::task::Poll::Ready(Ok::<(), &'static str>(()))
+    });
+    let now = tokio::time::Instant::now();
+    let bound = compose_aggregate_sse_bound_for_test(
+        now + Duration::from_secs(30),
+        Some(plan_at(
+            now,
+            StreamAuthTermination::AuthenticatedStreamMaxLifetime,
+        )),
+    );
+    let latch = StreamAuthTerminationLatch::default();
+    let outcome = await_authorized_headers_write_for_test(
+        bound,
+        StreamAuthProtocolFamily::Http,
+        &latch,
+        write,
+    )
+    .await;
+    assert_eq!(
+        outcome,
+        H3AuthorizedHeadersWrite::AuthorizationExpired(
+            StreamAuthTermination::AuthenticatedStreamMaxLifetime
+        )
+    );
+    assert!(
+        !polled.load(std::sync::atomic::Ordering::SeqCst),
+        "an already-elapsed authorization bound must not poll send_response"
+    );
+}
+
+/// A stalled post-commit DATA/FIN write is cancelled at the composed deadline
+/// so a non-reading client cannot retain the listener lease or request
+/// accounting past authorization.
+#[tokio::test(start_paused = true)]
+async fn a_stalled_aggregate_sse_body_write_stops_at_the_composed_deadline() {
+    let now = tokio::time::Instant::now();
+    let bound = compose_aggregate_sse_bound_for_test(
+        now + Duration::from_secs(30),
+        Some(plan_at(
+            now + Duration::from_secs(2),
+            StreamAuthTermination::CredentialExpired,
+        )),
+    );
+    let started = tokio::time::Instant::now();
+    let result =
+        await_deadline_first_for_test(bound.deadline(), std::future::pending::<()>()).await;
+    assert_eq!(
+        tokio::time::Instant::now() - started,
+        Duration::from_secs(2)
+    );
+    assert!(result.is_err(), "a stalled DATA write must lose to the bound");
+    assert_eq!(
+        bound.expired_authorization(),
+        Some(StreamAuthTermination::CredentialExpired)
+    );
+}
+
+/// The aggregate-SSE pre-commit terminal is the same fixed redacted 401 every
+/// other plain-HTTP authorization expiry uses: no deadline instant, credential,
+/// claim, identity, session id, or provider detail.
+#[tokio::test]
+async fn aggregate_sse_precommit_terminal_is_the_fixed_redacted_401() {
+    let ctx = authenticated_ctx();
+    let (status, headers, body) = authorization_expired_pre_commitment_response_for_test(
+        &ctx,
+        StreamAuthTermination::CredentialExpired,
+        false,
+    );
+    assert_eq!(status, 401);
+    assert_eq!(body, br#"{"error":"Unauthorized"}"#.to_vec());
+    let rendered = String::from_utf8(body).expect("utf8 terminal");
+    assert!(!rendered.chars().any(|c| c.is_ascii_digit()));
+    let header_blob = headers
+        .values()
+        .map(|value| value.to_ascii_lowercase())
+        .collect::<Vec<_>>()
+        .join(" ");
+    for leaked in [
+        "credential",
+        "exp",
+        "session",
+        "spiffe",
+        "bearer",
+        "alice",
+        "deadline",
+    ] {
+        assert!(
+            !rendered.to_ascii_lowercase().contains(leaked),
+            "pre-commit terminal leaked {leaked}"
+        );
+        assert!(
+            !header_blob.contains(leaked),
+            "pre-commit terminal header leaked {leaked}"
+        );
+    }
+}
+
 /// Every native-H3 streaming HTTP/SSE family races `send_response` through the
 /// shared HEADERS helper, so the three call sites cannot drift apart.
 #[test]
@@ -4018,6 +4298,27 @@ fn every_native_h3_streaming_response_headers_write_uses_the_shared_helper() {
             "{name} still awaits send_response unbounded"
         );
     }
+
+    let sse_writer = H3_SERVER_SOURCE
+        .split("async fn send_h3_aggregate_sse_response(")
+        .nth(1)
+        .expect("native H3 aggregate SSE writer present")
+        .split("async fn send_h3_grpc_error_with_recv_halt(")
+        .next()
+        .expect("native H3 aggregate SSE writer bounded");
+    assert!(
+        sse_writer.contains("await_authorized_headers_write("),
+        "aggregate MCP SSE must race HEADERS through the shared authorized-write helper"
+    );
+    assert!(
+        sse_writer.contains("compose_aggregate_sse_bound("),
+        "aggregate MCP SSE must compose the listener lifetime with the captured plan"
+    );
+    assert!(
+        !sse_writer.contains("stream.send_response(response).await")
+            && !sse_writer.contains("stream.send_data(data).await"),
+        "aggregate MCP SSE still awaits a flow-control-blocked write unbounded"
+    );
 }
 
 /// Every HTTP/3 authorization exit records through the REQUEST's shared latch,
@@ -4069,6 +4370,7 @@ fn every_composed_h3_write_bound_attributes_from_the_captured_composition() {
         ("server", H3_SERVER_SOURCE, "buffered_write_bound"),
         ("server", H3_SERVER_SOURCE, "downstream_write_bound"),
         ("server", H3_SERVER_SOURCE, "trailer_bound"),
+        ("server", H3_SERVER_SOURCE, "aggregate_sse_bound"),
         ("cross", cross, "plain_write_bound"),
         ("cross", cross, "terminal_write_bound"),
         ("cross", cross, "downstream_write_bound"),

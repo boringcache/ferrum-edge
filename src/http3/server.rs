@@ -15127,7 +15127,8 @@ async fn send_h3_plugin_reject_flavor_aware_with_recv_halt(
             && body.is_empty()
             && crate::proxy::response_headers_select_event_stream(headers);
         if representation_intact && let Some(sse_body) = listener.take_body() {
-            return send_h3_aggregate_sse_response(stream, headers, sse_body, halt_recv).await;
+            return send_h3_aggregate_sse_response(stream, ctx, headers, sse_body, halt_recv)
+                .await;
         }
     }
     if terminal_gateway_deadline {
@@ -15251,19 +15252,23 @@ async fn send_h3_plugin_reject_flavor_aware_with_recv_halt(
 /// ownership contract — dropping the body is what releases the session's single
 /// listener slot, so a client disconnect always permits a reattach.
 ///
-/// The stream is bounded by the broker, not by this loop: it ends on session
-/// delete/eviction, on broker retirement (reload / update / delete), at the
-/// configured listener lifetime, or when a QUIC write fails because the peer
-/// went away. Nothing here buffers the stream.
+/// The stream is bounded by the **earliest** of the broker listener lifetime
+/// and the admitted request's captured authorization plan (issue #3815). An
+/// exact tie is attributed to authorization. The plan is taken once from
+/// the request context and never recomputed from events, keepalives, or
+/// flow-control waits. Unauthenticated listeners keep the listener-only bound
+/// they had before.
 ///
-/// The listener lifetime is enforced as a HARD bound around the whole pump
-/// rather than left to the body's own timer. `send_data` awaits QUIC flow
-/// control, so a peer that stops reading can park this task indefinitely — and
-/// a parked task never polls the body, so an in-body deadline alone would never
-/// fire here. Timing out drops the pump (abandoning at most a partial event,
-/// which SSE framing discards) and then releases the listener slot.
+/// `send_response` / `send_data` / `finish` await QUIC flow control, so a peer
+/// that stops reading can park this task indefinitely — and a parked task never
+/// polls the body's own timer. Every potentially blocked write is therefore
+/// raced against the composed deadline. Timing out drops the pump (abandoning
+/// at most a partial event, which SSE framing discards) and then releases the
+/// listener slot. Authorization expiry after the 200/event-stream head has
+/// committed RESETS the stream rather than sending a clean FIN.
 async fn send_h3_aggregate_sse_response(
     stream: &mut RequestStream<h3_quinn::BidiStream<Bytes>, Bytes>,
+    ctx: &mut RequestContext,
     headers: &HashMap<String, String>,
     mut body: crate::plugins::mcp_aggregate_sse::AggregateSseBody,
     halt_recv: bool,
@@ -15276,13 +15281,34 @@ async fn send_h3_aggregate_sse_response(
     let response = builder
         .body(())
         .map_err(|e| anyhow::anyhow!("Failed to build HTTP/3 SSE response: {}", e))?;
-    let deadline = body.deadline();
-    // Header/QPACK writes can wait on the peer too. Keep them inside the same
-    // hard listener lifetime as DATA, otherwise a client that never services
-    // the response stream could pin this task before the bounded pump starts.
-    match tokio::time::timeout_at(deadline, stream.send_response(response)).await {
-        Ok(result) => result?,
-        Err(_) => {
+    // Capture once from the accepted request. Activity never refreshes it.
+    let auth_plan = crate::proxy::auth_lifetime::effective_request_auth_deadline(
+        ctx,
+        crate::proxy::auth_lifetime::authenticated_stream_max_lifetime_seconds(),
+    );
+    let aggregate_sse_bound =
+        crate::http3::stream_util::compose_aggregate_sse_bound(body.deadline(), auth_plan);
+    let deadline = aggregate_sse_bound.deadline().unwrap_or(body.deadline());
+    let auth_latch = ctx.authorization_termination_latch();
+    let auth_family = crate::proxy::auth_lifetime::StreamAuthProtocolFamily::Http;
+
+    match crate::http3::stream_util::await_authorized_headers_write(
+        aggregate_sse_bound,
+        auth_family,
+        &auth_latch,
+        stream.send_response(response),
+    )
+    .await
+    {
+        crate::http3::stream_util::H3AuthorizedHeadersWrite::Written => {}
+        crate::http3::stream_util::H3AuthorizedHeadersWrite::ClientWriteFailed => {
+            drop(body);
+            if halt_recv {
+                crate::http3::stream_util::halt_request_body(stream);
+            }
+            return Ok(());
+        }
+        crate::http3::stream_util::H3AuthorizedHeadersWrite::ProtocolDeadlineExceeded => {
             drop(body);
             crate::http3::stream_util::abort_response_stream(stream);
             if halt_recv {
@@ -15290,7 +15316,46 @@ async fn send_h3_aggregate_sse_response(
             }
             return Ok(());
         }
+        crate::http3::stream_util::H3AuthorizedHeadersWrite::AuthorizationExpired(termination) => {
+            ctx.latch_authorization_termination(termination);
+            drop(body);
+            let (status, terminal_headers, terminal_body) =
+                crate::proxy::authorization_expired_pre_commitment_response(
+                    ctx, termination, false,
+                );
+            let status = StatusCode::from_u16(status).unwrap_or(StatusCode::UNAUTHORIZED);
+            let body_bytes = match terminal_body {
+                crate::retry::ResponseBody::Buffered(bytes) => bytes,
+                _ => Bytes::new(),
+            };
+            let disposition = RejectBodyDisposition::for_request(&ctx.method, status.as_u16());
+            let write = send_h3_finalized_reject_response_with_recv_halt(
+                stream,
+                status,
+                body_bytes,
+                &terminal_headers,
+                false,
+                disposition,
+            );
+            let result = match crate::http3::stream_util::await_post_deadline_terminal_response_write(
+                write,
+            )
+            .await
+            {
+                Ok(()) => Ok(()),
+                Err(crate::http3::stream_util::H3ResponseWriteError::Write(error)) => Err(error),
+                Err(crate::http3::stream_util::H3ResponseWriteError::DeadlineExceeded) => {
+                    crate::http3::stream_util::abort_response_stream(stream);
+                    Ok(())
+                }
+            };
+            if halt_recv {
+                crate::http3::stream_util::halt_request_body(stream);
+            }
+            return result;
+        }
     }
+
     let pump = async {
         while let Some(frame) = body.next().await {
             let Ok(frame) = frame else {
@@ -15304,18 +15369,53 @@ async fn send_h3_aggregate_sse_response(
             if data.is_empty() {
                 continue;
             }
-            // A failed write on a long-lived stream is an ordinary client
-            // disconnect, not a gateway fault: stop and let the body drop.
-            if stream.send_data(data).await.is_err() {
-                break;
+            match crate::http3::stream_util::await_response_write_before_deadline(
+                Some(deadline),
+                stream.send_data(data),
+            )
+            .await
+            {
+                Ok(()) => {}
+                // A failed write on a long-lived stream is an ordinary client
+                // disconnect, not a gateway fault: stop and let the body drop.
+                Err(crate::http3::stream_util::H3ResponseWriteError::Write(_)) => break,
+                Err(crate::http3::stream_util::H3ResponseWriteError::DeadlineExceeded) => {
+                    return true;
+                }
             }
         }
+        false
     };
-    let _ = tokio::time::timeout_at(deadline, pump).await;
+    let composed_deadline_fired = match tokio::time::timeout_at(deadline, pump).await {
+        Ok(fired) => fired,
+        Err(_) => true,
+    };
     // Release the listener slot before the QUIC stream teardown so a client
     // that reconnects immediately is never refused by its own stale lease.
     drop(body);
-    let _ = stream.finish().await;
+    if composed_deadline_fired {
+        if let Some(termination) = aggregate_sse_bound.expired_authorization() {
+            ctx.record_authorization_termination_once(termination, auth_family);
+            crate::http3::stream_util::abort_response_stream(stream);
+        } else {
+            let _ = stream.finish().await;
+        }
+    } else {
+        match crate::http3::stream_util::await_response_write_before_deadline(
+            Some(deadline),
+            stream.finish(),
+        )
+        .await
+        {
+            Ok(()) | Err(crate::http3::stream_util::H3ResponseWriteError::Write(_)) => {}
+            Err(crate::http3::stream_util::H3ResponseWriteError::DeadlineExceeded) => {
+                if let Some(termination) = aggregate_sse_bound.expired_authorization() {
+                    ctx.record_authorization_termination_once(termination, auth_family);
+                }
+                crate::http3::stream_util::abort_response_stream(stream);
+            }
+        }
+    }
     if halt_recv {
         crate::http3::stream_util::halt_request_body(stream);
     }

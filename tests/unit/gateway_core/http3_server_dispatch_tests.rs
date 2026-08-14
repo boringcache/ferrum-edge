@@ -1153,8 +1153,9 @@ fn h3_request_plugin_deadlines_mark_and_bound_terminal_rejections() {
 }
 
 /// The native H3 aggregate MCP SSE writer is a long-lived pump rather than a
-/// buffered representation, so its framing decision, its hard listener bound,
-/// and its listener-slot release order are the properties worth freezing.
+/// buffered representation, so its framing decision, its composed
+/// listener/authorization bound, its fail-closed terminals, and its
+/// listener-slot release order are the properties worth freezing.
 #[test]
 fn h3_aggregate_sse_writer_streams_under_a_hard_listener_bound() {
     let server = include_str!("../../../src/http3/server.rs");
@@ -1182,28 +1183,72 @@ fn h3_aggregate_sse_writer_streams_under_a_hard_listener_bound() {
         "an SSE stream has no exact body length to publish"
     );
 
-    // Both the header write and the DATA pump sit inside the same hard listener
-    // lifetime: `send_response`/`send_data` await QUIC flow control, and a
-    // parked task never polls the body's own timer.
-    assert_eq!(
-        sse_writer
-            .matches("tokio::time::timeout_at(deadline,")
-            .count(),
-        2,
-        "the header write and the DATA pump must share one hard listener bound"
+    // The listener lifetime is composed with the captured authorization plan;
+    // the plan is taken once from the request and never recomputed from activity.
+    assert!(
+        sse_writer.contains("effective_request_auth_deadline("),
+        "the H3 SSE writer must capture the accepted request's authorization plan"
     );
     assert!(
-        sse_writer.contains("let deadline = body.deadline();"),
-        "the hard bound must come from the broker-owned listener lifetime"
+        sse_writer.contains("compose_aggregate_sse_bound(body.deadline(), auth_plan)"),
+        "the H3 SSE writer must compose the listener lifetime with that captured plan"
+    );
+    assert!(
+        sse_writer.contains("await_authorized_headers_write("),
+        "the H3 SSE HEADERS write must race the composed bound"
+    );
+    assert!(
+        sse_writer.contains("await_response_write_before_deadline("),
+        "every flow-control-blocked DATA/FIN write must race the composed bound"
+    );
+    assert!(
+        sse_writer.contains("tokio::time::timeout_at(deadline, pump)"),
+        "waiting for the next event must also sit inside the composed bound"
+    );
+
+    // Authorization before commitment uses the fixed redacted terminal under
+    // grace, otherwise resets. After commitment it resets rather than finishing.
+    assert!(
+        sse_writer.contains("authorization_expired_pre_commitment_response("),
+        "pre-commit authorization expiry must use the fixed redacted terminal"
+    );
+    assert!(
+        sse_writer.contains("await_post_deadline_terminal_response_write("),
+        "the pre-commit authorization terminal must be written under the bounded grace"
+    );
+    assert!(
+        sse_writer.contains("record_authorization_termination_once("),
+        "post-commit authorization expiry must record through the shared once-only latch"
+    );
+    assert!(
+        sse_writer.contains("StreamAuthProtocolFamily::Http"),
+        "aggregate SSE is the HTTP family, not an unbounded label"
+    );
+    assert!(
+        sse_writer.contains("latch_authorization_termination("),
+        "the bounded class must be latched into request/transaction metadata"
+    );
+    let auth_abort = sse_writer
+        .find("if let Some(termination) = aggregate_sse_bound.expired_authorization()")
+        .expect("post-commit authorization attribution");
+    let auth_abort_reset = sse_writer[auth_abort..]
+        .find("abort_response_stream(stream)")
+        .map(|offset| auth_abort + offset)
+        .expect("post-commit authorization expiry must reset");
+    let listener_finish = sse_writer[auth_abort..]
+        .find("stream.finish()")
+        .map(|offset| auth_abort + offset)
+        .expect("listener-lifetime expiry must still finish");
+    assert!(
+        auth_abort_reset < listener_finish,
+        "authorization after commitment must reset before the listener-lifetime finish arm"
     );
 
     // Dropping the body is what returns the session's single-listener slot, so
-    // every exit — the header-write timeout and the ordinary end of the pump —
-    // must release it, and the ordinary path must release it BEFORE the QUIC
-    // stream teardown a reconnecting client races.
-    assert_eq!(
-        sse_writer.matches("drop(body);").count(),
-        2,
+    // every exit must release it, and the ordinary path must release it BEFORE
+    // the QUIC stream teardown a reconnecting client races.
+    assert!(
+        sse_writer.matches("drop(body);").count() >= 4,
         "every H3 SSE exit must release the listener slot"
     );
     let release = sse_writer
@@ -1215,6 +1260,10 @@ fn h3_aggregate_sse_writer_streams_under_a_hard_listener_bound() {
     assert!(
         release < finish,
         "the listener slot must be released before the QUIC stream teardown"
+    );
+    assert!(
+        sse_writer.contains("halt_request_body(stream)"),
+        "every H3 SSE exit must preserve receive-half teardown"
     );
 
     // Nothing here may collect the stream: a buffered SSE body is unbounded.

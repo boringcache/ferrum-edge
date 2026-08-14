@@ -8700,6 +8700,15 @@ pub mod _test_support {
         crate::http3::stream_util::await_authorized_headers_write(bound, family, latch, write).await
     }
 
+    /// Compose the aggregate MCP SSE listener lifetime with a captured
+    /// authorization plan, matching the native-H3 aggregate SSE writer.
+    pub fn compose_aggregate_sse_bound_for_test(
+        listener_deadline: tokio::time::Instant,
+        auth_plan: Option<crate::proxy::auth_lifetime::StreamAuthDeadline>,
+    ) -> crate::proxy::auth_lifetime::ComposedAuthBound {
+        crate::http3::stream_util::compose_aggregate_sse_bound(listener_deadline, auth_plan)
+    }
+
     /// Wait out one connect-retry backoff exactly as the TCP setup loop does,
     /// so an external test can prove the backoff is bounded by the admitted
     /// stream's authorization deadline (issue #3816). Returns the bounded

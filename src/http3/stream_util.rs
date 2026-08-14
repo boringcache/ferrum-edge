@@ -255,10 +255,30 @@ where
     }
 }
 
+/// Compose the aggregate MCP SSE listener's absolute lifetime with the
+/// admitted request's captured authorization plan (issue #3815).
+///
+/// The listener lifetime is a protocol bound, not an authorization bound:
+/// when it is strictly earlier, the stream ends as it does today and the
+/// authorization counters stay untouched. When authorization is earlier —
+/// or the two instants are equal — the security decision wins, so a
+/// short-TTL credential cannot keep receiving protected events until the
+/// later listener lifetime.
+#[inline]
+#[must_use]
+pub(crate) fn compose_aggregate_sse_bound(
+    listener_deadline: tokio::time::Instant,
+    auth_plan: Option<crate::proxy::auth_lifetime::StreamAuthDeadline>,
+) -> crate::proxy::auth_lifetime::ComposedAuthBound {
+    crate::proxy::auth_lifetime::ComposedAuthBound::compose(Some(listener_deadline), auth_plan)
+}
+
 /// Capture the admitted stream's authorization plan, race `send_response`
 /// against that exact plan composed with any client RPC deadline, and latch
 /// an authorization expiry through the request. Used by every native-H3
-/// streaming HTTP/SSE path so the three call sites cannot drift.
+/// streaming HTTP/SSE backend relay so those three call sites cannot drift.
+/// The aggregate MCP SSE listener composes against its broker lifetime
+/// instead and calls [`await_authorized_headers_write`] directly.
 pub(crate) async fn commit_authorized_streaming_response_headers<S>(
     stream: &mut RequestStream<S, Bytes>,
     resp: http::Response<()>,
