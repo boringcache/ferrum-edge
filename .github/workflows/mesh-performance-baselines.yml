@@ -157,7 +157,7 @@ jobs:
             --suite-commands mesh-baseline-results/suite_commands.json
 
       - name: Build gateway binary (release)
-        if: env.BENCH_SUITES == 'all' || env.BENCH_SUITES == 'hbone' || env.BENCH_SUITES == 'dns'
+        if: env.BENCH_SUITES == 'all' || env.BENCH_SUITES == 'dns'
         run: cargo build --release --bin ferrum-edge
 
       - name: Collect mesh Criterion microbenchmarks
@@ -204,6 +204,7 @@ jobs:
         if: env.BENCH_SUITES == 'all' || env.BENCH_SUITES == 'hbone'
         run: |
           set -euo pipefail
+          cargo build --release --example hbone_perf_fixture
           (cd tests/performance/mesh-hbone-e2e && cargo build --release)
 
       - name: Collect HBONE E2E baselines (3+ repetitions)

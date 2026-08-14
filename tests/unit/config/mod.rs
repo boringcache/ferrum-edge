@@ -32,6 +32,7 @@ mod frontend_tls_tests;
 mod gateway_api_frontend_tls_tests;
 mod gateway_class_authority_k8s_tests;
 mod gateway_trust_bundle_tests;
+mod hbone_perf_fixture_contract_tests;
 mod istio_authz_custom_action_tests;
 mod istio_docs_capability_parity_tests;
 mod jwt_secret_separation_tests;
