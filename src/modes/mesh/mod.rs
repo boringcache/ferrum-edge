@@ -14538,8 +14538,9 @@ async fn start_spire_agent_mesh_svid_source(
         let inbound_slot = inbound_slot.clone();
         let trust_overlay_slot = trust_overlay_slot.clone();
         move |bundle| {
-            state.install_gateway_runtime_svid_bundle(bundle);
+            let trust_withdrawn = state.install_gateway_runtime_svid_bundle(bundle);
             publish_runtime_svid_to_inbound_slot(&state, &inbound_slot, &trust_overlay_slot);
+            trust_withdrawn
         }
     });
     let fetch_config = crate::identity::workload_api::FetchLoopConfig {
@@ -15020,9 +15021,9 @@ async fn issue_and_install_mesh_ca_svid(
     crate::tls::spiffe::validate_trust_bundle_set(&bundle.trust_bundles)
         .map_err(anyhow::Error::msg)?;
     let installed_spiffe_id = bundle.spiffe_id.clone();
-    proxy_state.install_gateway_runtime_svid_bundle(bundle);
+    let trust_withdrawn = proxy_state.install_gateway_runtime_svid_bundle(bundle);
     publish_runtime_svid_to_inbound_slot(proxy_state, inbound_slot, trust_overlay_slot);
-    if publish_revision {
+    if publish_revision && !trust_withdrawn {
         proxy_state
             .backend_svid_rotation_tx
             .send_modify(|revision| *revision = revision.saturating_add(1));

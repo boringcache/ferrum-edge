@@ -830,7 +830,15 @@ fn pre_copy_disconnect_cause(
         // stream-family producer is the typed
         // `StreamSetupKind::BackendMaxConnectionsExceeded`, whose
         // `is_client_side()` is false, so the untyped class fallback must agree.
-        ErrorClass::BackendConnectionLimit => DisconnectCause::BackendError,
+        //
+        // A gateway trust withdrawal refuses the mesh egress dial on the same
+        // backend-facing leg (`mesh_tcp_egress` raw-TCP CONNECT tunnels raise
+        // `HbonePoolError::TrustWithdrawn`), so it is attributed the same way.
+        // Attribution is orthogonal to backend-health accounting: the class is
+        // still `client_side_no_backend_signal`.
+        ErrorClass::BackendConnectionLimit | ErrorClass::TrustWithdrawn => {
+            DisconnectCause::BackendError
+        }
     }
 }
 
@@ -863,7 +871,8 @@ fn pre_copy_disconnect_direction(error: &anyhow::Error, class: &ErrorClass) -> D
         | ErrorClass::ConnectionReset
         | ErrorClass::ConnectionClosed
         | ErrorClass::GracefulRemoteClose
-        | ErrorClass::BackendConnectionLimit => Direction::BackendToClient,
+        | ErrorClass::BackendConnectionLimit
+        | ErrorClass::TrustWithdrawn => Direction::BackendToClient,
         // Client-facing classes attribute to the c2b half.
         ErrorClass::ClientDisconnect | ErrorClass::RequestBodyTooLarge => {
             Direction::ClientToBackend
