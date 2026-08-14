@@ -360,7 +360,12 @@ fn node_waypoint_udp_steer_commands_for_family(
         // STOP MARKING FIRST (see the ordering note above).
         format!("{binary} -t mangle -w {wait} -N {steer} 2>/dev/null || {binary} -t mangle -w {wait} -F {steer}"),
         format!("{binary} -t mangle -w {wait} -F {steer}"),
-        ip_delete_best_effort(&format!("{ip} rule del priority {priority} lookup {table}")),
+        // Delete-before-add names Ferrum's exact selector (priority + fwmark
+        // mark/mask + table). A priority/table-only delete would also remove a
+        // co-resident policy rule at 102/33136 whose mark is not ours.
+        ip_delete_best_effort(&format!(
+            "{ip} rule del priority {priority} fwmark {mark_arg} lookup {table}"
+        )),
         format!("{ip} rule add priority {priority} fwmark {mark_arg} lookup {table}"),
         ip_delete_best_effort(&format!("{ip} route del {local_route} table {table}")),
         format!("{ip} route add {local_route} table {table}"),
@@ -399,14 +404,36 @@ fn node_waypoint_udp_steer_commands_for_family(
     commands
 }
 
-/// Per-family removal of EXACTLY the Ferrum-owned steering objects.
+/// Per-family xtables removal of EXACTLY the Ferrum-owned mark and notrack
+/// objects, in that order: the mark jump goes first so nothing new can be
+/// steered, then the conntrack exemption. Routing is a later, dependent step
+/// and is never emitted here — a family whose mark path could not be proven
+/// must retain local delivery.
+fn node_waypoint_udp_steer_teardown_xtables(binary: &str) -> Vec<String> {
+    let notrack = NODE_WAYPOINT_UDP_STEER_NOTRACK_CHAIN;
+    let steer = NODE_WAYPOINT_UDP_STEER_CHAIN;
+    vec![
+        format!("ferrum_delete_xtables_rule {binary} mangle PREROUTING -p udp -j {steer}"),
+        format!("ferrum_delete_xtables_chain {binary} mangle {steer}"),
+        format!("ferrum_delete_xtables_rule {binary} raw PREROUTING -p udp -j {notrack}"),
+        format!("ferrum_delete_xtables_chain {binary} raw {notrack}"),
+    ]
+}
+
+/// Per-family removal of EXACTLY the Ferrum-owned policy rule and local route.
 ///
-/// Removal order is the reverse of installation: the mark jump goes first so
-/// nothing new can be steered, then the conntrack exemption, then the routing.
-/// Every target is named exactly, so this is a no-op when no steering state
-/// exists and it can never disturb the pod-netns TPROXY objects, the tc
-/// ingress-redirect routing, or a co-resident CNI's policy routing.
-fn node_waypoint_udp_steer_teardown_for_family(binary: &str, ipv6: bool) -> Vec<String> {
+/// Inspect first so only genuine absence is an idempotent success; a failed
+/// delete is never reclassified as absent. `ferrum_show_steer_local_routes`
+/// classifies iproute2's missing-table dump (`FIB table does not exist`) as
+/// that absence: `set -e` plus a raw `ip route show table N` aborts first-pass
+/// teardown forever when the Ferrum table has never been created, and the same
+/// dump happens after the last local route is deleted because the kernel then
+/// drops the table. Permission, lock, and other show failures stay nonzero.
+///
+/// Every target is named exactly (priority + Ferrum fwmark/mask + table), so
+/// this can never disturb the pod-netns TPROXY objects, the tc ingress-redirect
+/// routing, or a co-resident CNI's policy routing.
+fn node_waypoint_udp_steer_teardown_routing(ipv6: bool) -> Vec<String> {
     let (ip, local_route, cidr) = if ipv6 {
         ("ip -6", "local ::/0 dev lo", "::/0")
     } else {
@@ -414,8 +441,6 @@ fn node_waypoint_udp_steer_teardown_for_family(binary: &str, ipv6: bool) -> Vec<
     };
     let priority = NODE_WAYPOINT_UDP_STEER_RULE_PRIORITY;
     let table = NODE_WAYPOINT_UDP_STEER_TABLE;
-    let notrack = NODE_WAYPOINT_UDP_STEER_NOTRACK_CHAIN;
-    let steer = NODE_WAYPOINT_UDP_STEER_CHAIN;
     let mark_arg =
         format!("0x{NODE_WAYPOINT_UDP_STEER_MARK:x}/0x{NODE_WAYPOINT_UDP_STEER_MARK_MASK:x}");
     let rule_pattern = format!("fwmark {mark_arg} lookup {table}");
@@ -430,20 +455,6 @@ fn node_waypoint_udp_steer_teardown_for_family(binary: &str, ipv6: bool) -> Vec<
     let route_case = format!("*'local {cidr} dev lo'*|*'local default dev lo'*");
     let family = if ipv6 { 6 } else { 4 };
     vec![
-        // STOP MARKING FIRST, then remove the now-unreferenced chain.
-        format!("ferrum_delete_xtables_rule {binary} mangle PREROUTING -p udp -j {steer}"),
-        format!("ferrum_delete_xtables_chain {binary} mangle {steer}"),
-        // Then stop bypassing conntrack and remove its chain.
-        format!("ferrum_delete_xtables_rule {binary} raw PREROUTING -p udp -j {notrack}"),
-        format!("ferrum_delete_xtables_chain {binary} raw {notrack}"),
-        // Routing comes last. Inspect first so only genuine absence is an
-        // idempotent success; a failed delete is never reclassified as absent.
-        // `ferrum_show_steer_local_routes` classifies iproute2's missing-table
-        // dump (`FIB table does not exist`) as that absence: `set -e` plus a
-        // raw `ip route show table N` aborts first-pass teardown forever when
-        // the Ferrum table has never been created, and the same dump happens
-        // after the last local route is deleted because the kernel then drops
-        // the table. Permission, lock, and other show failures stay nonzero.
         format!(
             "ferrum_rule_state=\"$({ip} -o rule show priority {priority})\"\n\
              case \"$ferrum_rule_state\" in\n\
@@ -473,6 +484,30 @@ fn node_waypoint_udp_steer_teardown_for_family(binary: &str, ipv6: bool) -> Vec<
              esac"
         ),
     ]
+}
+
+/// One address-family teardown attempt, isolated in a subshell so its failure
+/// cannot abort the other family.
+///
+/// Inner `set -e` is load-bearing: the parent invokes this as
+/// `( ... ) || ferrum_overall=$?`, which is an AND-OR list that disables the
+/// outer errexit. Without the inner `set -e`, an xtables failure would fall
+/// through into routing. Routing is emitted only after xtables and after a
+/// present `ip` binary, so an unproven mark path retains local delivery.
+fn node_waypoint_udp_steer_teardown_family_attempt(binary: &str, ipv6: bool) -> String {
+    let family = if ipv6 { "IPv6" } else { "IPv4" };
+    let xtables = node_waypoint_udp_steer_teardown_xtables(binary).join("\n");
+    let routing = node_waypoint_udp_steer_teardown_routing(ipv6).join("\n");
+    format!(
+        "# NodeWaypoint UDP steer teardown: {family}\n\
+         (\n\
+         set -e\n\
+         command -v {binary} >/dev/null 2>&1 || {{ echo '{binary} is required to reap NodeWaypoint UDP steering' >&2; exit 1; }}\n\
+         {xtables}\n\
+         command -v ip >/dev/null 2>&1 || {{ echo 'iproute2 (ip) is required to reap NodeWaypoint UDP steering' >&2; exit 1; }}\n\
+         {routing}\n\
+         ) || ferrum_overall=$?"
+    )
 }
 
 /// The `set -e` NodeWaypoint UDP Service-steering setup script.
@@ -542,7 +577,10 @@ pub fn node_waypoint_udp_steer_setup_script(
     // those datagrams silently take the unsteered path. Under `set -e` each
     // family's own `command -v` guard (emitted first, above) exits non-zero, the
     // reconcile tears every Ferrum-owned object down, and the next reconcile
-    // retries the whole plan.
+    // retries the whole plan. Teardown attempts families independently, so if
+    // family B's tool is absent after family A partly installed, family A can
+    // still be reaped; overall teardown stays unproven until every family is.
+
     let mut chunks = Vec::new();
     if !v4.is_empty() {
         chunks.push(v4.join("\n"));
@@ -557,9 +595,16 @@ pub fn node_waypoint_udp_steer_setup_script(
 ///
 /// Exact-name and idempotent, but strict: a genuinely absent Ferrum-owned
 /// object succeeds, while inspection, permission, resource, delete, and
-/// post-delete verification failures stay nonzero. Both address-family tools
-/// are mandatory because a predecessor may have left state in a family the
-/// current generation does not publish.
+/// post-delete verification failures stay nonzero. IPv4 and IPv6 are attempted
+/// independently because a predecessor may have left state in a family whose
+/// tool is missing on this generation: a broken `ip6tables` must not prevent
+/// live IPv4 cleanup, and vice versa. Overall success still requires every
+/// family to be proven, so a missing family tool or any inspection/delete/
+/// verification failure keeps the script nonzero and must never claim `reaped`
+/// or publish a replacement. Within a family, mark → notrack must be proven
+/// before local routing is removed (inert leftover routing is safer than
+/// marked traffic without local delivery). If shared `ip` is unavailable,
+/// every safe xtables cleanup is still attempted and routing is retained.
 ///
 /// Jump deletion probes the user-chain with `-S` before `-C` of a jump into
 /// it. nft-backed iptables returns 2 for `-C ... -j <missing-chain>` (issue
@@ -581,9 +626,6 @@ pub fn node_waypoint_udp_steer_setup_script(
 pub fn node_waypoint_udp_steer_teardown_script() -> String {
     let helpers = format!(
         "set -e\n\
-         command -v iptables >/dev/null 2>&1 || {{ echo 'iptables is required to reap NodeWaypoint UDP steering' >&2; exit 1; }}\n\
-         command -v ip6tables >/dev/null 2>&1 || {{ echo 'ip6tables is required to reap NodeWaypoint UDP steering' >&2; exit 1; }}\n\
-         command -v ip >/dev/null 2>&1 || {{ echo 'iproute2 (ip) is required to reap NodeWaypoint UDP steering' >&2; exit 1; }}\n\
          ferrum_delete_xtables_rule() {{\n\
            ferrum_binary=\"$1\"; ferrum_table=\"$2\"; shift 2\n\
            ferrum_jump_target=\"\"; ferrum_prev=\"\"\n\
@@ -672,12 +714,15 @@ pub fn node_waypoint_udp_steer_teardown_script() -> String {
            ferrum_route_state=\"$ferrum_show\"\n\
          }}"
     );
-    [
-        helpers,
-        node_waypoint_udp_steer_teardown_for_family("iptables", false).join("\n"),
-        node_waypoint_udp_steer_teardown_for_family("ip6tables", true).join("\n"),
-    ]
-    .join("\n")
+    format!(
+        "{helpers}\n\
+         ferrum_overall=0\n\
+         {}\n\
+         {}\n\
+         exit \"$ferrum_overall\"",
+        node_waypoint_udp_steer_teardown_family_attempt("iptables", false),
+        node_waypoint_udp_steer_teardown_family_attempt("ip6tables", true),
+    )
 }
 
 /// Istio-compatible `includeOutboundPorts` annotation. The injector and the

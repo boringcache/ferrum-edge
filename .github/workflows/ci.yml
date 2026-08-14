@@ -818,6 +818,7 @@ jobs:
               integration::mesh_outbound_registry_stream_tests
               integration::mesh_node_waypoint_stream_scope_tests
               integration::mesh_node_waypoint_udp_scope_tests
+              integration::mesh_node_waypoint_dtls_owner_tests
               integration::mesh_runtime_overlay_consumers_tests
               integration::transformer_runtime_overlay_generation_tests
               integration::mesh_local_reload_observability_tests

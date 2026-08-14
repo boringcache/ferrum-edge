@@ -268,7 +268,8 @@ fn line_index(script: &str, predicate: impl Fn(&str) -> bool) -> usize {
 /// Production teardown must not turn tool, permission, or resource failures
 /// into proof. The former rendering appended `2>/dev/null || true` to every
 /// delete and skipped IPv6 when `ip6tables` was absent, so this static contract
-/// deliberately fails against that shape.
+/// deliberately fails against that shape. Independent family attempts still
+/// fail the script overall when any family is unproven.
 #[test]
 fn teardown_is_strict_for_both_families_and_verifies_exact_absence() {
     let script = node_waypoint_udp_steer_teardown_script();
@@ -286,7 +287,13 @@ fn teardown_is_strict_for_both_families_and_verifies_exact_absence() {
         script.contains("command -v ip6tables")
             && script.contains("ferrum_delete_xtables_rule iptables mangle")
             && script.contains("ferrum_delete_xtables_rule ip6tables mangle"),
-        "both family tools are strict teardown prerequisites:\n{script}"
+        "both families must still be attempted and named exactly:\n{script}"
+    );
+    assert!(
+        script.contains("ferrum_overall=0")
+            && script.contains(") || ferrum_overall=$?")
+            && script.contains("exit \"$ferrum_overall\""),
+        "a family failure must keep the overall script nonzero:\n{script}"
     );
     assert!(
         script.contains("jump remains after deletion")
@@ -307,6 +314,138 @@ fn teardown_is_strict_for_both_families_and_verifies_exact_absence() {
         mark_jump < notrack_jump && notrack_jump < routing,
         "teardown must stop mark, then notrack, then routing:\n{script}"
     );
+}
+
+fn teardown_family_block(script: &str, family: &str) -> &str {
+    let marker = format!("# NodeWaypoint UDP steer teardown: {family}");
+    let start = script
+        .find(&marker)
+        .unwrap_or_else(|| panic!("missing {family} teardown block:\n{script}"));
+    let rest = &script[start..];
+    let end = rest.find(") || ferrum_overall=$?").unwrap_or_else(|| {
+        panic!("{family} attempt must capture status without aborting the sibling:\n{rest}")
+    });
+    &rest[..end]
+}
+
+/// A missing or broken IPv6 tool must not prevent the IPv4 cleanup attempt, and
+/// an IPv4 failure must not prevent the IPv6 attempt. Overall success still
+/// requires both families to be proven, so the script cannot claim `reaped`.
+#[test]
+fn teardown_attempts_each_family_independently_and_stays_unproven_on_either_failure() {
+    let script = node_waypoint_udp_steer_teardown_script();
+    let v4 = teardown_family_block(&script, "IPv4");
+    let v6 = teardown_family_block(&script, "IPv6");
+
+    let v4_at = script
+        .find("# NodeWaypoint UDP steer teardown: IPv4")
+        .expect("IPv4 attempt marker");
+    let v4_status_at = script[v4_at..]
+        .find(") || ferrum_overall=$?")
+        .map(|rel| v4_at + rel)
+        .expect("IPv4 status capture");
+    let v6_at = script
+        .find("# NodeWaypoint UDP steer teardown: IPv6")
+        .expect("IPv6 attempt marker");
+    assert!(
+        v4_at < v4_status_at && v4_status_at < v6_at,
+        "IPv4 status must be captured before the IPv6 attempt starts:\n{script}"
+    );
+
+    let helpers_end = script
+        .find("\nferrum_overall=0")
+        .expect("overall status must start at 0");
+    assert!(
+        !script[..helpers_end].contains("command -v iptables")
+            && !script[..helpers_end].contains("command -v ip6tables")
+            && !script[..helpers_end].contains("command -v ip "),
+        "a global BOTH-tools preflight would block every family:\n{}",
+        &script[..helpers_end]
+    );
+    assert!(
+        !v4.contains("ip6tables") && !v4.contains("ip -6"),
+        "missing IPv6 must not gate the IPv4 attempt:\n{v4}"
+    );
+    assert!(
+        v4.contains("command -v iptables >/dev/null 2>&1 || {")
+            && v4.contains("ferrum_delete_xtables_rule iptables mangle")
+            && v4.contains("set -e"),
+        "the IPv4 attempt must still require iptables and run under errexit:\n{v4}"
+    );
+    assert!(
+        !v6.contains("ferrum_delete_xtables_rule iptables mangle")
+            && !v6.contains("ip -o rule show")
+            && v6.contains("command -v ip6tables >/dev/null 2>&1 || {")
+            && v6.contains("ferrum_delete_xtables_rule ip6tables mangle")
+            && v6.contains("set -e"),
+        "IPv4 failure must not gate the IPv6 attempt:\n{v6}"
+    );
+    assert!(
+        v4.contains("iptables is required to reap NodeWaypoint UDP steering")
+            && v6.contains("ip6tables is required to reap NodeWaypoint UDP steering")
+            && script.contains("exit \"$ferrum_overall\""),
+        "a missing family tool is a failure of that attempt, and of the script:\n{script}"
+    );
+    assert_eq!(
+        script.matches(") || ferrum_overall=$?").count(),
+        2,
+        "each family attempt must be captured independently:\n{script}"
+    );
+}
+
+/// Exact Ferrum fwmark ownership is preserved on teardown, and local routing
+/// is not removed unless that family's mark path was proven. Inert leftover
+/// routing is safer than marked traffic without local delivery.
+#[test]
+fn teardown_retains_routing_when_the_family_mark_path_is_unproven() {
+    let script = node_waypoint_udp_steer_teardown_script();
+    let exact = "priority 102 fwmark 0x736/0xffffffff lookup 33136";
+    for family in ["IPv4", "IPv6"] {
+        let block = teardown_family_block(&script, family);
+        let tool = if family == "IPv6" {
+            "ip6tables"
+        } else {
+            "iptables"
+        };
+        let tool_guard = line_index(block, |line| {
+            line.contains(&format!("command -v {tool} >/dev/null 2>&1 || {{"))
+        });
+        let mark = line_index(block, |line| {
+            line.contains(&format!("ferrum_delete_xtables_rule {tool} mangle"))
+        });
+        let notrack = line_index(block, |line| {
+            line.contains(&format!("ferrum_delete_xtables_rule {tool} raw"))
+        });
+        let ip_guard = line_index(block, |line| {
+            line.contains("command -v ip >/dev/null 2>&1 || {")
+        });
+        let routing = line_index(block, |line| line.contains("rule show priority"));
+        assert!(
+            tool_guard < mark && mark < notrack && notrack < ip_guard && ip_guard < routing,
+            "{family} must prove mark then notrack before considering routing:\n{block}"
+        );
+        assert!(
+            block.contains(exact),
+            "{family} routing delete must name Ferrum's exact mark/mask/table:\n{block}"
+        );
+        assert!(
+            !block.contains("rule del priority 102 lookup 33136")
+                && !block.contains("rule flush")
+                && !block.contains("route flush")
+                && !block.contains("ip rule del lookup"),
+            "{family} must not delete by priority/table alone or flush:\n{block}"
+        );
+        assert!(
+            !block.contains("fwmark 0x733")
+                && !block.contains("fwmark 0x734")
+                && !block.contains("fwmark 0x735"),
+            "{family} must not match a different mark at the same priority/table:\n{block}"
+        );
+        assert!(
+            block.contains("set -e"),
+            "{family} inner errexit is what skips routing after an xtables failure:\n{block}"
+        );
+    }
 }
 
 /// Issue #2084 / NodeWaypoint UDP Service steering: nft-backed iptables
@@ -692,8 +831,8 @@ fn steer_local_routes_helper(script: &str) -> &str {
         .expect("route-show helper must be rendered");
     let rest = &script[start..];
     let end = rest
-        .find("\nferrum_delete_xtables_rule iptables")
-        .expect("IPv4 teardown must follow the route-show helper");
+        .find("\nferrum_overall=")
+        .expect("independent family attempts must follow the route-show helper");
     rest[..end].trim_end()
 }
 
@@ -830,6 +969,74 @@ fn local_delivery_routing_precedes_every_mark_rule() {
     let route_add = line_index(&script, |line| line.contains("route add local 0.0.0.0/0"));
     let mark_rule = line_index(&script, |line| line.contains("-j MARK --set-xmark"));
     assert!(rule_add < mark_rule && route_add < mark_rule, "\n{script}");
+}
+
+/// Delete-before-add must name Ferrum's exact fwmark selector. A
+/// priority/table-only delete would also remove a co-resident policy rule at
+/// 102/33136 whose mark is not 0x736/0xffffffff.
+#[test]
+fn setup_delete_before_add_owns_only_the_ferrum_fwmark_rule() {
+    let v4 = setup_script(&["veth0"], &[destination("10.96.0.10", 5300)]);
+    let v6 = setup_script(&["veth0"], &[destination("fd00::10", 5300)]);
+    let both = setup_script(
+        &["veth0"],
+        &[
+            destination("10.96.0.10", 5300),
+            destination("fd00::10", 5300),
+        ],
+    );
+    let ferrum = "priority 102 fwmark 0x736/0xffffffff lookup 33136";
+    let foreign_same_pri_table = "priority 102 fwmark 0x733/0xffffffff lookup 33136";
+
+    for (label, script, del, add) in [
+        (
+            "IPv4",
+            v4.as_str(),
+            "ip rule del priority 102 fwmark 0x736/0xffffffff lookup 33136",
+            "ip rule add priority 102 fwmark 0x736/0xffffffff lookup 33136",
+        ),
+        (
+            "IPv6",
+            v6.as_str(),
+            "ip -6 rule del priority 102 fwmark 0x736/0xffffffff lookup 33136",
+            "ip -6 rule add priority 102 fwmark 0x736/0xffffffff lookup 33136",
+        ),
+    ] {
+        assert!(
+            script.contains(del) && script.contains(add),
+            "{label} setup must delete then add Ferrum's exact selector:\n{script}"
+        );
+        let del_at = line_index(script, |line| line.contains(del));
+        let add_at = line_index(script, |line| line.contains(add));
+        assert!(
+            del_at < add_at,
+            "{label} exact delete must precede the load-bearing add:\n{script}"
+        );
+        for line in script.lines().filter(|line| line.contains("rule del")) {
+            assert!(
+                line.contains(ferrum),
+                "{label} delete-before-add must carry the exact mark/mask: {line}"
+            );
+            assert!(
+                !line.contains("rule del priority 102 lookup 33136")
+                    && !line.contains("rule flush")
+                    && !line.contains("ip rule del lookup"),
+                "{label} must not delete by priority/table alone: {line}"
+            );
+            assert!(
+                !line.contains(foreign_same_pri_table) && !line.contains("fwmark 0x733"),
+                "{label} rendered delete cannot match a different mark at 102/33136: {line}"
+            );
+        }
+    }
+
+    assert!(
+        both.contains("ip rule del priority 102 fwmark 0x736/0xffffffff lookup 33136")
+            && both.contains("ip -6 rule del priority 102 fwmark 0x736/0xffffffff lookup 33136")
+            && !both.contains("rule del priority 102 lookup 33136")
+            && !both.contains("route flush table 33136"),
+        "dual-family setup must keep both exact deletes and never flush:\n{both}"
+    );
 }
 
 /// A published address family is installed COMPLETELY or the apply fails. The

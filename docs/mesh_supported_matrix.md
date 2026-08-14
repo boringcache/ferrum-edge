@@ -410,9 +410,12 @@ need them, or because they are blocked upstream / architecturally:
   the PeerAuthentication live-reload path rebuilds from. `FERRUM_FRONTEND_TLS_*`
   is deliberately NOT reused: on a mesh proxy that pair is the inbound TCP
   listener's server identity, and sharing it would let configuring a DTLS
-  listener replace a SPIRE-issued inbound identity. Without DTLS material a
-  `dtls` listener stays visibly deferred (`FrontendDtlsDeferred`) rather than
-  binding.
+  listener replace a SPIRE-issued inbound identity. Ordinary (non-generated)
+  DTLS without material stays visibly deferred (`FrontendDtlsDeferred`) rather
+  than binding. When generated NodeWaypoint DTLS listeners are required, a
+  missing dedicated cert/key or a Strict route without
+  `FERRUM_DTLS_CLIENT_CA_CERT_PATH` rejects the complete candidate before apply
+  and retains last-good.
 
   Still **not** proven live: IPv6 DTLS, kube-proxy `ipvs`/`nftables` DTLS
   steering, headless UDP/DTLS Services, multiple terminating-DTLS
