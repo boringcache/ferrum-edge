@@ -180,24 +180,12 @@ impl http_body::Body for MeshMtlsRequestBody {
 /// [`TrustWithdrawn`](Self::TrustWithdrawn) is the gated refusal: a checkout
 /// or clone that still holds a live hyper sender must not open the next stream
 /// after a trust withdrawal, even if the connection driver has not yet dropped
-/// the H2 session. [`Hyper`](Self::Hyper) preserves the prior classification
-/// of ordinary sender-not-ready failures (`is_canceled` / protocol).
+/// the H2 session. [`Hyper`](Self::Hyper) preserves the underlying readiness
+/// error for the caller's standard response classification.
 #[derive(Debug)]
 pub enum MeshMtlsSenderError {
     TrustWithdrawn,
     Hyper(hyper::Error),
-}
-
-impl MeshMtlsSenderError {
-    #[cfg_attr(feature = "fips", allow(dead_code))]
-    pub fn is_canceled(&self) -> bool {
-        matches!(self, Self::Hyper(err) if err.is_canceled())
-    }
-
-    #[cfg_attr(feature = "fips", allow(dead_code))]
-    pub fn is_timeout(&self) -> bool {
-        matches!(self, Self::Hyper(err) if err.is_timeout())
-    }
 }
 
 impl std::fmt::Display for MeshMtlsSenderError {
@@ -276,12 +264,6 @@ impl MeshMtlsSender {
     #[inline]
     pub fn is_closed(&self) -> bool {
         self.gate.is_retired() || self.inner.is_closed()
-    }
-
-    #[inline]
-    #[cfg_attr(feature = "fips", allow(dead_code))]
-    pub fn is_ready(&self) -> bool {
-        !self.gate.is_retired() && self.inner.is_ready()
     }
 
     /// Last-safe pre-wire readiness. A retired gate fails immediately with
