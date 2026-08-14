@@ -29,7 +29,9 @@
 use std::sync::OnceLock;
 
 use ferrum_edge::config::EnvConfig;
-use ferrum_edge::tls::client_trust::{self, ClientTrustPublicationOutcome, ClientTrustScope};
+use ferrum_edge::tls::client_trust::{
+    self, ClientTrustPublication, ClientTrustPublicationOutcome, ClientTrustScope,
+};
 use ferrum_edge::tls::{
     AcceptedClientTrust, ClientTrustMaterial, CrlList, TlsPolicy,
     load_frontend_tls_candidate_from_paths,
@@ -203,6 +205,34 @@ fn admits_client(trust: &AcceptedClientTrust, pki: &TestPki) -> bool {
         .is_ok()
 }
 
+/// Rustls tests must go through the explicit transaction with a simulated
+/// config-exposure callback. An empty `|| {}` would recreate the removed
+/// production bypass. Material-only / DTLS tests use
+/// [`client_trust::publish_accepted_material`] instead.
+fn publish_rustls(
+    scope: ClientTrustScope,
+    trust: &AcceptedClientTrust,
+) -> ClientTrustPublication {
+    let verifier = trust
+        .verifier
+        .clone()
+        .expect("rustls test publishes a live verifier");
+    let exposed = std::sync::atomic::AtomicBool::new(false);
+    let publication = client_trust::publish_accepted_rustls_candidate(
+        scope,
+        trust.material.clone(),
+        verifier,
+        || {
+            exposed.store(true, std::sync::atomic::Ordering::SeqCst);
+        },
+    );
+    assert!(
+        exposed.load(std::sync::atomic::Ordering::SeqCst),
+        "{scope:?}: rustls publication must run an explicit config-exposure callback"
+    );
+    publication
+}
+
 /// The heart of the finding: an accepted CRL rotation must reach the verifier a
 /// reconnecting HTTP/3 client meets, not merely retire the old connection.
 ///
@@ -330,20 +360,12 @@ fn live_verifier_refuses_a_withdrawn_cert_even_if_the_handshake_used_a_stale_sna
 
     let startup_crls = parse_crls(&pki.crl_pem(&[UNRELATED_SERIAL], 1));
     let before = load_candidate(dir.path(), &pki, &startup_crls).expect("startup candidate");
-    client_trust::publish_accepted_candidate(
-        ClientTrustScope::ProxyH3,
-        before.material.clone(),
-        before.verifier.clone(),
-    );
+    publish_rustls(ClientTrustScope::ProxyH3, &before);
     assert!(
         client_trust::live_peer_still_trusted(ClientTrustScope::ProxyH3, &[pki.client_cert()]),
         "the live verifier must admit a client no CRL revokes"
     );
-    client_trust::publish_accepted_candidate(
-        ClientTrustScope::ProxyFrontend,
-        before.material.clone(),
-        before.verifier.clone(),
-    );
+    publish_rustls(ClientTrustScope::ProxyFrontend, &before);
     assert!(
         client_trust::live_peer_still_trusted(
             ClientTrustScope::ProxyFrontend,
@@ -355,22 +377,14 @@ fn live_verifier_refuses_a_withdrawn_cert_even_if_the_handshake_used_a_stale_sna
     let rotated_crls = parse_crls(&pki.crl_pem(&[UNRELATED_SERIAL, pki.client_serial], 2));
     let after = load_candidate(dir.path(), &pki, &rotated_crls).expect("rotated candidate");
     assert!(!admits_client(&after, &pki));
-    let withdrawn = client_trust::publish_accepted_candidate(
-        ClientTrustScope::ProxyH3,
-        after.material.clone(),
-        after.verifier.clone(),
-    );
+    let withdrawn = publish_rustls(ClientTrustScope::ProxyH3, &after);
     assert!(withdrawn.withdrew());
     assert!(
         !client_trust::live_peer_still_trusted(ClientTrustScope::ProxyH3, &[pki.client_cert()]),
         "after the accepted withdrawal the live H3 verifier must refuse the revoked cert, \
          even if a stale QUIC Incoming still completed TLS against the previous snapshot"
     );
-    client_trust::publish_accepted_candidate(
-        ClientTrustScope::ProxyFrontend,
-        after.material,
-        after.verifier,
-    );
+    publish_rustls(ClientTrustScope::ProxyFrontend, &after);
     assert!(
         !client_trust::live_peer_still_trusted(
             ClientTrustScope::ProxyFrontend,
@@ -393,16 +407,8 @@ fn live_handshake_wrapper_refuses_after_accepted_withdrawal_even_with_a_stale_in
 
     let startup_crls = parse_crls(&pki.crl_pem(&[UNRELATED_SERIAL], 1));
     let before = load_candidate(dir.path(), &pki, &startup_crls).expect("startup candidate");
-    client_trust::publish_accepted_candidate(
-        ClientTrustScope::ProxyH3,
-        before.material.clone(),
-        before.verifier.clone(),
-    );
-    client_trust::publish_accepted_candidate(
-        ClientTrustScope::ProxyFrontend,
-        before.material.clone(),
-        before.verifier.clone(),
-    );
+    publish_rustls(ClientTrustScope::ProxyH3, &before);
+    publish_rustls(ClientTrustScope::ProxyFrontend, &before);
     let stale_h3 = client_trust::bind_live_handshake_verifier(
         ClientTrustScope::ProxyH3,
         before
@@ -433,22 +439,8 @@ fn live_handshake_wrapper_refuses_after_accepted_withdrawal_even_with_a_stale_in
     let rotated_crls = parse_crls(&pki.crl_pem(&[UNRELATED_SERIAL, pki.client_serial], 2));
     let after = load_candidate(dir.path(), &pki, &rotated_crls).expect("rotated candidate");
     assert!(!admits_client(&after, &pki));
-    assert!(
-        client_trust::publish_accepted_candidate(
-            ClientTrustScope::ProxyH3,
-            after.material.clone(),
-            after.verifier.clone(),
-        )
-        .withdrew()
-    );
-    assert!(
-        client_trust::publish_accepted_candidate(
-            ClientTrustScope::ProxyFrontend,
-            after.material,
-            after.verifier,
-        )
-        .withdrew()
-    );
+    assert!(publish_rustls(ClientTrustScope::ProxyH3, &after).withdrew());
+    assert!(publish_rustls(ClientTrustScope::ProxyFrontend, &after).withdrew());
     assert!(
         stale_h3
             .verify_client_cert(&pki.client_cert(), &[], UnixTime::now())
@@ -501,11 +493,7 @@ fn a_v2_handshake_config_cannot_consult_v1_during_the_pre_generation_window() {
         ClientTrustScope::AdminHttps,
     ];
     for scope in rustls_scopes {
-        client_trust::publish_accepted_candidate(
-            scope,
-            before.material.clone(),
-            before.verifier.clone(),
-        );
+        publish_rustls(scope, &before);
         let generation_before = client_trust::capture(scope).expect("armed").generation();
         assert_eq!(generation_before, 1);
 
@@ -607,11 +595,7 @@ fn a_refused_candidate_never_replaces_the_live_verifier() {
         ClientTrustScope::ProxyH3,
         ClientTrustScope::AdminHttps,
     ] {
-        client_trust::publish_accepted_candidate(
-            scope,
-            before.material.clone(),
-            before.verifier.clone(),
-        );
+        publish_rustls(scope, &before);
         let generation_before = client_trust::capture(scope).expect("armed").generation();
 
         // Simulate a fallible later rebuild: record the refusal and do not
@@ -654,17 +638,51 @@ fn a_refused_candidate_never_replaces_the_live_verifier() {
     }
 }
 
-/// Pin the fail-closed rustls order in the reload surfaces: one transaction
-/// per scope installs the live verifier, exposes config, then publishes
-/// generation. A refused path records rejection without entering that
-/// transaction. DTLS keeps config-before-generation and must not grow a rustls
-/// live-verifier transaction.
+/// Pin the fail-closed rustls order in the reload surfaces: the singular
+/// scope's one transaction installs the live verifier, exposes config, then
+/// publishes generation. A refused path records rejection without entering
+/// that transaction. DTLS keeps config-before-generation and must not grow a
+/// rustls live-verifier transaction. The production-capable empty-callback
+/// bypass and a multi-scope `Vec` on one rustls family must stay absent.
 #[test]
 fn rustls_reload_surfaces_install_live_verifier_before_exposing_config() {
+    let bypass = concat!("publish_accepted_", "candidate");
+    let multi_scope_field = concat!("client_trust_", "scopes");
+    let empty_rustls_callback = concat!(
+        "publish_accepted_rustls_candidate(scope, material, verifier, ",
+        "|| {})"
+    );
+
+    let trust_src = include_str!("../../../src/tls/client_trust.rs");
+    assert!(
+        !trust_src.contains(&format!("fn {bypass}")),
+        "client_trust must not expose a rustls publication bypass that omits config exposure"
+    );
+    assert!(
+        !trust_src.contains(empty_rustls_callback),
+        "client_trust must not hide an empty-callback rustls convenience"
+    );
+
     let reload = include_str!("../../../src/tls/frontend_reload.rs");
     assert!(
         !reload.contains("install_accepted_live_verifier"),
         "frontend rustls reload must not use the split install path"
+    );
+    assert!(
+        !reload.contains(bypass),
+        "frontend rustls reload must not call the removed rustls publication bypass"
+    );
+    assert!(
+        !reload.contains(multi_scope_field),
+        "frontend reload owns exactly one optional ClientTrustScope, not a Vec"
+    );
+    assert!(
+        !reload.contains("for scope in"),
+        "frontend reload must not loop over client-trust scopes; one family owns one scope"
+    );
+    assert!(
+        reload.contains("client_trust_scope: Option<crate::tls::ClientTrustScope>"),
+        "frontend reload config must type the owned scope as Option<ClientTrustScope>"
     );
     assert_source_order(
         reload,
@@ -689,6 +707,14 @@ fn rustls_reload_surfaces_install_live_verifier_before_exposing_config() {
     assert!(
         !h3.contains("install_accepted_live_verifier"),
         "H3 must not use the split install path"
+    );
+    assert!(
+        !h3.contains(bypass),
+        "H3 must not call the removed rustls publication bypass"
+    );
+    assert!(
+        !h3.contains(multi_scope_field),
+        "H3 must not grow a multi-scope Vec; ProxyH3 is independently owned"
     );
     let reload_arm_start = h3
         .find("&reload_h3_config,")
@@ -732,6 +758,22 @@ fn rustls_reload_surfaces_install_live_verifier_before_exposing_config() {
         !modes.contains("install_accepted_live_verifier"),
         "proxy/admin startup must not use the split install path"
     );
+    assert!(
+        !modes.contains(bypass),
+        "proxy/admin startup must not call the removed rustls publication bypass"
+    );
+    assert!(
+        !modes.contains(multi_scope_field),
+        "proxy/admin startup must not pass a multi-scope Vec into frontend reload"
+    );
+    assert!(
+        !modes.contains("vec![ClientTrustScope"),
+        "proxy/admin startup must not construct a ClientTrustScope Vec"
+    );
+    assert!(
+        !modes.contains("for scope in"),
+        "proxy/admin startup must not loop over client-trust scopes"
+    );
     let proxy_fn = modes
         .find("pub fn prepare_proxy_frontend_tls")
         .expect("proxy startup");
@@ -756,6 +798,20 @@ fn rustls_reload_surfaces_install_live_verifier_before_exposing_config() {
         "admin startup must expose the slot inside the rustls transaction",
     );
 
+    let grpc = include_str!("../../../src/modes/grpc_tls_reload.rs");
+    assert!(
+        grpc.contains("client_trust_scope: None"),
+        "CP gRPC TLS reload is outside the frontend client-trust domain"
+    );
+    assert!(
+        !grpc.contains("publish_accepted_rustls_candidate"),
+        "CP gRPC TLS reload must not publish a frontend rustls trust generation"
+    );
+    assert!(
+        !grpc.contains(bypass) && !grpc.contains(multi_scope_field),
+        "CP gRPC TLS reload must not reintroduce the rustls bypass or a multi-scope Vec"
+    );
+
     let dtls = include_str!("../../../src/proxy/stream_listener.rs");
     assert!(
         !dtls.contains("install_accepted_live_verifier"),
@@ -764,6 +820,10 @@ fn rustls_reload_surfaces_install_live_verifier_before_exposing_config() {
     assert!(
         !dtls.contains("publish_accepted_rustls_candidate"),
         "DTLS has no rustls live verifier and must not use the rustls transaction"
+    );
+    assert!(
+        !dtls.contains(bypass),
+        "DTLS must not call the removed rustls publication bypass"
     );
     let dtls_fn = dtls
         .find("pub async fn publish_frontend_dtls_generation")
@@ -775,6 +835,17 @@ fn rustls_reload_surfaces_install_live_verifier_before_exposing_config() {
             "publish_accepted_material",
         ],
         "DTLS keeps config-before-generation ordering",
+    );
+
+    let binding_tests = include_str!("frontend_trust_binding_tests.rs");
+    let material_tests = include_str!("client_trust_tests.rs");
+    assert!(
+        !binding_tests.contains(bypass) && !material_tests.contains(bypass),
+        "unit tests must not call the removed rustls publication bypass"
+    );
+    assert!(
+        !binding_tests.contains(multi_scope_field) && !material_tests.contains(multi_scope_field),
+        "unit tests must not reintroduce a multi-scope Vec"
     );
 }
 

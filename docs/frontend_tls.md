@@ -625,8 +625,9 @@ only in deployments that enabled frontend TLS live reload.
 
 #### Race behaviour
 
-On rustls surfaces (proxy HTTPS / HTTP-2 / TCP+TLS, admin HTTPS, HTTP/3), an
-accepted candidate is published as **one transaction per scope**, and only after
+On rustls surfaces (proxy HTTPS / HTTP-2 / TCP+TLS, admin HTTPS, HTTP/3), each
+listener family owns exactly one client-trust scope. An accepted candidate is
+published as **one rustls transaction for that singular scope**, and only after
 every fallible rebuild has succeeded. That transaction holds the scope
 publication lock continuously across: install the live handshake verifier,
 execute the already-validated infallible config exposure/adoption (slot swap /
@@ -636,7 +637,8 @@ before its config is conservative — a stale config refuses withdrawn
 credentials. Holding the lock across those steps is what keeps concurrent V2/V3
 publications from serving verifier V3 with config/material V2 (or the converse).
 A refused candidate never enters the transaction and never replaces the live
-verifier.
+verifier. HTTP/3 remains independently owned and published by its own `ProxyH3`
+scope; the HTTPS/H2 reload task never publishes H3's generation.
 
 DTLS has no rustls live verifier. It keeps the distinct config-before-generation
 order: the DTLS generation is published into every active `DtlsServer` first,

@@ -118,7 +118,7 @@ pub fn prepare_cp_grpc_server_tls_reload(
                     client_trust: None,
                 })
             }),
-            client_trust_scopes: Vec::new(),
+            client_trust_scope: None,
             accepted_slot: None,
         },
         shutdown_rx,

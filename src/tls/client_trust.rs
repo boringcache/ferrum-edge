@@ -48,9 +48,10 @@
 //! # Ordering, and why it fails closed
 //!
 //! rustls surfaces that install [`bind_live_handshake_verifier`] (proxy H1/H2
-//! and TCP+TLS, admin HTTPS, H3/QUIC) publish an accepted candidate through
-//! **one** [`publish_accepted_rustls_candidate`] transaction per scope, and
-//! only after every fallible build/validation step has succeeded. That
+//! and TCP+TLS, admin HTTPS, H3/QUIC) each own exactly one
+//! [`ClientTrustScope`] and publish an accepted candidate through **one**
+//! [`publish_accepted_rustls_candidate`] transaction for that singular scope,
+//! and only after every fallible build/validation step has succeeded. That
 //! transaction holds the scope publication lock continuously across:
 //!
 //! **(1)** store the candidate's inner rustls verifier, **(2)** run the
@@ -674,10 +675,12 @@ fn domain(scope: ClientTrustScope) -> &'static ClientTrustDomain {
 
 /// Publish one validated, accepted client-trust snapshot into `scope`.
 ///
-/// DTLS (no rustls live verifier) and material-only tests use this after the
-/// corresponding config is already live. Rustls surfaces must use
+/// This is the DTLS / material-only path: no rustls live verifier is installed.
+/// Callers must already have exposed the corresponding config (DTLS publishes
+/// into every active `DtlsServer` first). Rustls surfaces must use
 /// [`publish_accepted_rustls_candidate`] so verifier, config, and generation
-/// cannot be published on separate lock acquisitions.
+/// cannot be published on separate lock acquisitions. There is no rustls
+/// convenience that omits the exposure callback.
 pub fn publish_accepted_material(
     scope: ClientTrustScope,
     material: ClientTrustMaterial,
@@ -715,9 +718,12 @@ fn store_live_verifier(domain: &ClientTrustDomain, verifier: Arc<dyn ClientCertV
 /// live verifier, run `expose_config` (already-validated, infallible config
 /// exposure/adoption), publish this candidate's material/generation/fence,
 /// and sweep. All fallible load/build/validation must complete before this
-/// call. `expose_config` must not `.await`.
+/// call. `expose_config` must not `.await`. This is the only rustls
+/// publication entry point; there is no overload that installs a verifier
+/// without an explicit exposure callback.
 ///
-/// DTLS has no rustls live verifier and must not call this.
+/// DTLS has no rustls live verifier and must not call this. Use
+/// [`publish_accepted_material`] after the DTLS config is already live.
 pub fn publish_accepted_rustls_candidate(
     scope: ClientTrustScope,
     material: ClientTrustMaterial,
@@ -729,24 +735,6 @@ pub fn publish_accepted_rustls_candidate(
     store_live_verifier(domain, verifier);
     expose_config();
     publish_locked(domain, material)
-}
-
-/// Publish an accepted candidate without a config-exposure callback.
-///
-/// Prefer [`publish_accepted_rustls_candidate`] on rustls surfaces that expose
-/// a `ServerConfig`. This convenience keeps verifier install and
-/// material/generation under one lock for tests and one-shot publishers that
-/// have no slot to swap. Passing `verifier = None` is the DTLS / material-only
-/// path ([`publish_accepted_material`]).
-pub fn publish_accepted_candidate(
-    scope: ClientTrustScope,
-    material: ClientTrustMaterial,
-    verifier: Option<Arc<dyn ClientCertVerifier>>,
-) -> ClientTrustPublication {
-    match verifier {
-        Some(verifier) => publish_accepted_rustls_candidate(scope, material, verifier, || {}),
-        None => publish_accepted_material(scope, material),
-    }
 }
 
 fn publish_locked(

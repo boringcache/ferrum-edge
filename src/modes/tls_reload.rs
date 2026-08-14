@@ -167,21 +167,21 @@ pub fn prepare_proxy_frontend_tls(
     // made TCP+TLS decline the kTLS fast path on listeners that do no client
     // authentication at all. Certificate/key-only rotation is unaffected; it
     // simply reloads without a trust generation.
-    let client_trust_scopes = match startup_client_trust.as_ref() {
+    let client_trust_scope = match startup_client_trust.as_ref() {
         Some(startup_client_trust) if startup_client_trust.verifier.is_some() => {
-            vec![ClientTrustScope::ProxyFrontend]
+            Some(ClientTrustScope::ProxyFrontend)
         }
         Some(_) => {
             info!(
                 "Proxy frontend TLS live reload is enabled without verified client-certificate authentication; the proxy client-trust scope stays unarmed"
             );
-            Vec::new()
+            None
         }
         None => {
             warn!(
                 "Frontend TLS live reload is enabled but the caller supplied no startup client-CA/CRL identity for the served TLS configuration; established-transport trust retirement is disabled for proxy HTTPS"
             );
-            Vec::new()
+            None
         }
     };
     // The H3 endpoint adopts whole accepted candidates. A startup candidate
@@ -195,12 +195,12 @@ pub fn prepare_proxy_frontend_tls(
     });
 
     let slot = empty_frontend_tls_slot();
-    if let Some(startup_client_trust) = startup_client_trust.as_ref()
+    if let Some(scope) = client_trust_scope
+        && let Some(startup_client_trust) = startup_client_trust.as_ref()
         && let Some(verifier) = startup_client_trust.verifier.clone()
-        && !client_trust_scopes.is_empty()
     {
         client_trust::publish_accepted_rustls_candidate(
-            ClientTrustScope::ProxyFrontend,
+            scope,
             startup_client_trust.material.clone(),
             verifier,
             || {
@@ -251,7 +251,7 @@ pub fn prepare_proxy_frontend_tls(
             revision_tx,
             rebuild,
             max_material_bytes: env_config.tls_max_material_size_bytes,
-            client_trust_scopes,
+            client_trust_scope,
             accepted_slot: accepted_slot.clone(),
         },
         shutdown_rx,
@@ -430,31 +430,31 @@ pub fn prepare_admin_frontend_tls(
     // proxy surface (issue #3857): an admin HTTPS listener without
     // `FERRUM_ADMIN_TLS_CLIENT_CA_BUNDLE_PATH`, or with admin no-verify, owns
     // no withdrawable client credential and must stay unarmed.
-    let client_trust_scopes = match startup_client_trust.as_ref() {
+    let client_trust_scope = match startup_client_trust.as_ref() {
         Some(startup_client_trust) if startup_client_trust.verifier.is_some() => {
-            vec![ClientTrustScope::AdminHttps]
+            Some(ClientTrustScope::AdminHttps)
         }
         Some(_) => {
             info!(
                 "Admin HTTPS live reload is enabled without verified client-certificate authentication; the admin client-trust scope stays unarmed"
             );
-            Vec::new()
+            None
         }
         None => {
             warn!(
                 "Frontend TLS live reload is enabled but the caller supplied no startup client-CA/CRL identity for the served admin TLS configuration; established-transport trust retirement is disabled for admin HTTPS"
             );
-            Vec::new()
+            None
         }
     };
 
     let slot = empty_frontend_tls_slot();
-    if let Some(startup_client_trust) = startup_client_trust.as_ref()
+    if let Some(scope) = client_trust_scope
+        && let Some(startup_client_trust) = startup_client_trust.as_ref()
         && let Some(verifier) = startup_client_trust.verifier.clone()
-        && !client_trust_scopes.is_empty()
     {
         client_trust::publish_accepted_rustls_candidate(
-            ClientTrustScope::AdminHttps,
+            scope,
             startup_client_trust.material.clone(),
             verifier,
             || {
@@ -491,7 +491,7 @@ pub fn prepare_admin_frontend_tls(
             revision_tx,
             rebuild,
             max_material_bytes: env_config.tls_max_material_size_bytes,
-            client_trust_scopes,
+            client_trust_scope,
             // No asynchronous second consumer on the admin surface: the admin
             // listener reads the slot on each accept.
             accepted_slot: None,

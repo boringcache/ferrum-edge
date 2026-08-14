@@ -117,16 +117,19 @@ pub struct FrontendTlsReloadConfig {
     /// CA verification, session tickets). A returned `Err` keeps the previous
     /// config and emits a `warn!`.
     pub rebuild: FrontendTlsRebuildFn,
-    /// Client-trust scope this surface owns (issue #3857). When non-empty, a
-    /// successful rebuild publishes one rustls transaction per scope (live
-    /// verifier, config exposure, generation/fence) under that scope's lock.
-    /// A refused candidate is recorded against each scope while the last
-    /// accepted generation, verifier and sessions are all retained.
+    /// Client-trust scope this rustls listener family owns (issue #3857).
+    /// One rustls listener family owns exactly one scope. When `Some`, a
+    /// successful rebuild executes exactly one verifier -> config exposure ->
+    /// material/generation/fence transaction under that scope's lock. When
+    /// `None`, the task performs ordinary slot publication with no trust
+    /// generation. A refused candidate is recorded against that singular
+    /// scope while the last accepted generation, verifier and sessions are
+    /// all retained.
     ///
-    /// The HTTP/3 scope is deliberately absent: that endpoint applies its
-    /// config out of band and publishes its own generation from
-    /// [`accepted_slot`](Self::accepted_slot).
-    pub client_trust_scopes: Vec<crate::tls::ClientTrustScope>,
+    /// HTTP/3 remains independently owned and published by `ProxyH3`
+    /// (`http3::server`); it is never listed here even when
+    /// [`accepted_slot`](Self::accepted_slot) is populated for H3 to adopt.
+    pub client_trust_scope: Option<crate::tls::ClientTrustScope>,
     /// Optional accepted-candidate slot for a consumer that applies the reload
     /// asynchronously (the HTTP/3 endpoint). The task republishes the whole
     /// [`AcceptedFrontendTls`] here on every accepted candidate, so that
@@ -175,7 +178,7 @@ pub fn spawn_frontend_tls_reload_task(
         revision_tx,
         max_material_bytes,
         rebuild,
-        client_trust_scopes,
+        client_trust_scope,
         accepted_slot,
     } = config;
 
@@ -187,9 +190,9 @@ pub fn spawn_frontend_tls_reload_task(
                 // and every live session — including the HTTP/3 endpoint's,
                 // whose accepted slot is left untouched here. Recording it (
                 // rather than at the load site) is what makes "retained, not
-                // silently ignored" observable per scope.
-                for scope in &client_trust_scopes {
-                    crate::tls::client_trust::record_rejected_candidate(*scope);
+                // silently ignored" observable on the singular scope.
+                if let Some(scope) = client_trust_scope {
+                    crate::tls::client_trust::record_rejected_candidate(scope);
                 }
                 return Err(error);
             }
@@ -206,52 +209,49 @@ pub fn spawn_frontend_tls_reload_task(
         // and publishing its (empty) identity would read as a total client-CA
         // withdrawal. Refuse the candidate instead and retain the complete
         // last-good generation, verifier and sessions (issue #3857).
-        if !client_trust_scopes.is_empty()
+        if let Some(scope) = client_trust_scope
             && client_trust
                 .as_ref()
                 .is_none_or(|client_trust| client_trust.verifier.is_none())
         {
-            for scope in &client_trust_scopes {
-                crate::tls::client_trust::record_rejected_candidate(*scope);
-            }
+            crate::tls::client_trust::record_rejected_candidate(scope);
             return Err(anyhow::anyhow!(
                 "frontend TLS reload candidate performs no client-certificate authentication on a \
                  surface configured for it; keeping the previous configuration"
             ));
         }
-        // Every fallible rebuild/validation step has succeeded. One rustls
-        // transaction per scope holds the publication lock across: install the
-        // live verifier, expose this candidate's ServerConfig (and the H3
-        // accepted slot), then publish material/generation/fence. A refused
-        // candidate never reaches this store.
-        if let Some(client_trust) = client_trust.as_ref()
+        // Every fallible rebuild/validation step has succeeded. When this
+        // listener family owns a scope, exactly one rustls transaction holds
+        // the publication lock across: install the live verifier, expose this
+        // candidate's ServerConfig (and the H3 accepted slot), then publish
+        // material/generation/fence. No scope means ordinary slot publication.
+        // A refused candidate never reaches this store.
+        if let Some(scope) = client_trust_scope
+            && let Some(client_trust) = client_trust.as_ref()
             && let Some(verifier) = client_trust.verifier.clone()
-            && !client_trust_scopes.is_empty()
         {
-            for scope in &client_trust_scopes {
-                let publication = crate::tls::client_trust::publish_accepted_rustls_candidate(
-                    *scope,
-                    client_trust.material.clone(),
-                    verifier.clone(),
-                    || {
-                        if let Some(accepted_slot) = accepted_slot.as_ref() {
-                            accepted_slot.store(Arc::new(Some(Arc::new(AcceptedFrontendTls {
-                                config: new_config.clone(),
-                                client_trust: client_trust.clone(),
-                            }))));
-                        }
-                        slot.store(Arc::new(Some(new_config.clone())));
-                    },
+            let publication = crate::tls::client_trust::publish_accepted_rustls_candidate(
+                scope,
+                client_trust.material.clone(),
+                verifier,
+                || {
+                    if let Some(accepted_slot) = accepted_slot.as_ref() {
+                        accepted_slot.store(Arc::new(Some(Arc::new(AcceptedFrontendTls {
+                            config: new_config.clone(),
+                            client_trust: client_trust.clone(),
+                        }))));
+                    }
+                    slot.store(Arc::new(Some(new_config.clone())));
+                },
+            );
+            if publication.withdrew() {
+                tracing::warn!(
+                    scope = publication.scope.label(),
+                    generation = publication.generation,
+                    reason = publication.reason.map(|reason| reason.label()),
+                    retired_connections = publication.retired_sessions,
+                    "Frontend client-certificate trust was withdrawn; established client-certificate transports on this scope were retired"
                 );
-                if publication.withdrew() {
-                    tracing::warn!(
-                        scope = publication.scope.label(),
-                        generation = publication.generation,
-                        reason = publication.reason.map(|reason| reason.label()),
-                        retired_connections = publication.retired_sessions,
-                        "Frontend client-certificate trust was withdrawn; established client-certificate transports on this scope were retired"
-                    );
-                }
             }
         } else {
             if let (Some(accepted_slot), Some(client_trust)) =
@@ -355,7 +355,7 @@ mod tests {
                 interval: Duration::from_millis(50),
                 revision_tx,
                 rebuild,
-                client_trust_scopes: Vec::new(),
+                client_trust_scope: None,
                 accepted_slot: None,
             },
             Some(shutdown_rx),
