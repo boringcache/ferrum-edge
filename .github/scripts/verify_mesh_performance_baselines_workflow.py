@@ -50,7 +50,7 @@ APPROVED_SETUP = (
 PINNED_SHA = re.compile(r"^[0-9a-f]{40}$")
 HBONE_BACKEND_ALLOW_IPS_VAR = "FERRUM_BACKEND_ALLOW_IPS"
 HBONE_BACKEND_ALLOW_IPS_VALUE = "private"
-HBONE_GATEWAY_EXECUTABLE = "./target/release/examples/hbone_perf_fixture"
+HBONE_GATEWAY_EXECUTABLE = "$PROJECT_ROOT/target/release/examples/hbone_perf_fixture"
 HBONE_PRODUCTION_GATEWAY_EXECUTABLE = "./target/release/ferrum-edge"
 
 
@@ -840,7 +840,7 @@ def _self_test_hbone_backend_allow_ips(failures: list[str]) -> None:
     good = """
     env \\
         FERRUM_BACKEND_ALLOW_IPS="private" \\
-        ./target/release/examples/hbone_perf_fixture
+        $PROJECT_ROOT/target/release/examples/hbone_perf_fixture
 """
     good_failures: list[str] = []
     _check_hbone_backend_allow_ips(good, good_failures)
@@ -852,7 +852,7 @@ def _self_test_hbone_backend_allow_ips(failures: list[str]) -> None:
 # FERRUM_BACKEND_ALLOW_IPS="private"
     env \\
         FERRUM_BACKEND_ALLOW_IPS="public" \\
-        ./target/release/examples/hbone_perf_fixture
+        $PROJECT_ROOT/target/release/examples/hbone_perf_fixture
 """,
             "comment camouflage",
         ),
@@ -860,7 +860,7 @@ def _self_test_hbone_backend_allow_ips(failures: list[str]) -> None:
             """
     env \\
         FERRUM_BACKEND_ALLOW_IPS="both" \\
-        ./target/release/examples/hbone_perf_fixture
+        $PROJECT_ROOT/target/release/examples/hbone_perf_fixture
 """,
             "both widening",
         ),
@@ -868,7 +868,7 @@ def _self_test_hbone_backend_allow_ips(failures: list[str]) -> None:
             """
     env \\
         FERRUM_BACKEND_ALLOW_IPS="10.0.0.0/8" \\
-        ./target/release/examples/hbone_perf_fixture
+        $PROJECT_ROOT/target/release/examples/hbone_perf_fixture
 """,
             "CIDR literal",
         ),
@@ -877,14 +877,14 @@ def _self_test_hbone_backend_allow_ips(failures: list[str]) -> None:
     env \\
         FERRUM_BACKEND_ALLOW_IPS="private" \\
         FERRUM_BACKEND_ALLOW_IPS="private" \\
-        ./target/release/examples/hbone_perf_fixture
+        $PROJECT_ROOT/target/release/examples/hbone_perf_fixture
 """,
             "duplicate assignment",
         ),
         (
             """
     env \\
-        ./target/release/examples/hbone_perf_fixture
+        $PROJECT_ROOT/target/release/examples/hbone_perf_fixture
 """,
             "missing assignment",
         ),
@@ -892,7 +892,7 @@ def _self_test_hbone_backend_allow_ips(failures: list[str]) -> None:
             """
     env \\
         FERRUM_BACKEND_ALLOW_IPS="public" # FERRUM_BACKEND_ALLOW_IPS="private"
-        ./target/release/examples/hbone_perf_fixture
+        $PROJECT_ROOT/target/release/examples/hbone_perf_fixture
 """,
             "inline comment camouflage",
         ),
@@ -900,7 +900,7 @@ def _self_test_hbone_backend_allow_ips(failures: list[str]) -> None:
             """
     echo FERRUM_BACKEND_ALLOW_IPS=private
     env \\
-        ./target/release/examples/hbone_perf_fixture
+        $PROJECT_ROOT/target/release/examples/hbone_perf_fixture
 """,
             "echo camouflage",
         ),
@@ -909,7 +909,7 @@ def _self_test_hbone_backend_allow_ips(failures: list[str]) -> None:
     env \\
         NOTFERRUM_BACKEND_ALLOW_IPS=private \\
         FERRUM_BACKEND_ALLOW_IPS="public" \\
-        ./target/release/examples/hbone_perf_fixture
+        $PROJECT_ROOT/target/release/examples/hbone_perf_fixture
 """,
             "suffix-name camouflage",
         ),
@@ -917,7 +917,7 @@ def _self_test_hbone_backend_allow_ips(failures: list[str]) -> None:
             """
     env \\
         FERRUM_BACKEND_ALLOW_IPS="public" \\
-        ./target/release/examples/hbone_perf_fixture FERRUM_BACKEND_ALLOW_IPS=private
+        $PROJECT_ROOT/target/release/examples/hbone_perf_fixture FERRUM_BACKEND_ALLOW_IPS=private
 """,
             "post-executable camouflage",
         ),
@@ -926,7 +926,7 @@ def _self_test_hbone_backend_allow_ips(failures: list[str]) -> None:
     FERRUM_BACKEND_ALLOW_IPS=private
     env \\
         FERRUM_BACKEND_ALLOW_IPS="public" \\
-        ./target/release/examples/hbone_perf_fixture
+        $PROJECT_ROOT/target/release/examples/hbone_perf_fixture
 """,
             "detached good assignment with widened launch",
         ),
@@ -934,7 +934,7 @@ def _self_test_hbone_backend_allow_ips(failures: list[str]) -> None:
             """
     FERRUM_BACKEND_ALLOW_IPS=private
     env \\
-        ./target/release/examples/hbone_perf_fixture
+        $PROJECT_ROOT/target/release/examples/hbone_perf_fixture
 """,
             "detached good assignment with missing launch assignment",
         ),
@@ -942,7 +942,7 @@ def _self_test_hbone_backend_allow_ips(failures: list[str]) -> None:
             """
     env \\
         FERRUM_BACKEND_ALLOW_IPS="$ALLOW_IPS" \\
-        ./target/release/examples/hbone_perf_fixture
+        $PROJECT_ROOT/target/release/examples/hbone_perf_fixture
 """,
             "indirect launch value",
         ),
@@ -950,7 +950,7 @@ def _self_test_hbone_backend_allow_ips(failures: list[str]) -> None:
             """
     env \\
         FERRUM_BACKEND_ALLOW_IPS=$(echo private) \\
-        ./target/release/examples/hbone_perf_fixture
+        $PROJECT_ROOT/target/release/examples/hbone_perf_fixture
 """,
             "command-substitution launch value",
         ),

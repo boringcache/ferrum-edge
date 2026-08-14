@@ -38,11 +38,6 @@ GATEWAY_HTTP_PORT=18000
 GATEWAY_ADMIN_PORT=19999
 RUNTIME_DIR="$SCRIPT_DIR/runtime"
 CERTS_DIR="$RUNTIME_DIR/certs"
-GATEWAY_BIN="$PROJECT_ROOT/target/release/examples/hbone_perf_fixture"
-HARNESS_BACKEND="$SCRIPT_DIR/target/release/hbone_backend"
-HARNESS_SIDECAR="$SCRIPT_DIR/target/release/hbone_sidecar"
-HARNESS_LOADGEN="$SCRIPT_DIR/target/release/hbone_loadgen"
-
 BACKEND_PID=""
 SIDECAR_PID=""
 GATEWAY_PID=""
@@ -92,17 +87,17 @@ require_bin() {
 build() {
     if $SKIP_BUILD; then
         echo -e "${YELLOW}Skipping build (--skip-build)${NC}"
-        require_bin "$GATEWAY_BIN" "build with: cargo build --release --example hbone_perf_fixture"
-        require_bin "$HARNESS_BACKEND" "build with: (cd tests/performance/mesh-hbone-e2e && cargo build --release)"
-        require_bin "$HARNESS_SIDECAR" "build with: (cd tests/performance/mesh-hbone-e2e && cargo build --release)"
-        require_bin "$HARNESS_LOADGEN" "build with: (cd tests/performance/mesh-hbone-e2e && cargo build --release)"
+        require_bin "$PROJECT_ROOT/target/release/examples/hbone_perf_fixture" "build with: cargo build --release --example hbone_perf_fixture"
+        require_bin "$SCRIPT_DIR/target/release/hbone_backend" "build with: (cd tests/performance/mesh-hbone-e2e && cargo build --release)"
+        require_bin "$SCRIPT_DIR/target/release/hbone_sidecar" "build with: (cd tests/performance/mesh-hbone-e2e && cargo build --release)"
+        require_bin "$SCRIPT_DIR/target/release/hbone_loadgen" "build with: (cd tests/performance/mesh-hbone-e2e && cargo build --release)"
         return
     fi
     echo -e "${BLUE}Building trusted HBONE fixture and harness binaries...${NC}"
     (cd "$PROJECT_ROOT" && cargo build --release --example hbone_perf_fixture 2>&1 | tail -1)
     (cd "$SCRIPT_DIR" && cargo build --release 2>&1 | tail -1)
-    require_bin "$GATEWAY_BIN" "cargo build --release --example hbone_perf_fixture did not produce the fixture"
-    require_bin "$HARNESS_LOADGEN" "harness crate build did not produce hbone_loadgen"
+    require_bin "$PROJECT_ROOT/target/release/examples/hbone_perf_fixture" "cargo build --release --example hbone_perf_fixture did not produce the fixture"
+    require_bin "$SCRIPT_DIR/target/release/hbone_loadgen" "harness crate build did not produce hbone_loadgen"
     echo -e "${GREEN}Build complete${NC}"
 }
 
@@ -113,7 +108,7 @@ mkdirs() {
 
 generate_certs() {
     echo -e "${YELLOW}Generating mesh-shaped SPIFFE certs in $CERTS_DIR ...${NC}"
-    "$HARNESS_LOADGEN" \
+    "$SCRIPT_DIR/target/release/hbone_loadgen" \
         generate-certs \
         --out-dir "$CERTS_DIR" \
         --trust-domain cluster.local
@@ -122,7 +117,7 @@ generate_certs() {
 
 start_backend() {
     echo -e "${YELLOW}Starting plaintext echo backend...${NC}"
-    "$HARNESS_BACKEND" --listen 127.0.0.1:0 \
+    "$SCRIPT_DIR/target/release/hbone_backend" --listen 127.0.0.1:0 \
         > "$RUNTIME_DIR/backend.log" 2>&1 &
     BACKEND_PID=$!
     for i in $(seq 1 20); do
@@ -141,7 +136,7 @@ start_backend() {
 
 start_sidecar() {
     echo -e "${YELLOW}Starting stub HBONE sidecar on 127.0.0.1:$SIDECAR_PORT ...${NC}"
-    "$HARNESS_SIDECAR" \
+    "$SCRIPT_DIR/target/release/hbone_sidecar" \
         --listen "127.0.0.1:$SIDECAR_PORT" \
         --cert "$CERTS_DIR/sidecar-cert.pem" \
         --key "$CERTS_DIR/sidecar-key.pem" \
@@ -164,10 +159,9 @@ start_sidecar() {
 start_gateway() {
     echo -e "${YELLOW}Starting trusted-projection HBONE fixture...${NC}"
 
-    cd "$PROJECT_ROOT"
     env \
         FERRUM_BACKEND_ALLOW_IPS=private \
-        ./target/release/examples/hbone_perf_fixture \
+        "$PROJECT_ROOT/target/release/examples/hbone_perf_fixture" \
             --proxy-http-port "$GATEWAY_HTTP_PORT" \
             --admin-http-port "$GATEWAY_ADMIN_PORT" \
             --sidecar-host 127.0.0.1 \
@@ -206,7 +200,7 @@ run_phase() {
     echo -e "${CYAN}  Duration ${DURATION}s · Concurrency $CONCURRENCY · Payload ${PAYLOAD_SIZE}B${NC}"
     echo -e "${CYAN}========================================${NC}"
 
-    "$HARNESS_LOADGEN" \
+    "$SCRIPT_DIR/target/release/hbone_loadgen" \
         run \
         --target "$target" \
         --host-header "edge.local" \
