@@ -2417,10 +2417,8 @@ mod tls_lifecycle {
             // Mint each credential only when its case starts. Constructing the
             // whole table eagerly lets the opaque case consume the JWT case's
             // intentionally short wall-clock lifetime before it is admitted.
-            let token = jwt_lifetime_secs.map_or_else(
-                || "an-opaque-projected-token".to_string(),
-                jwt_expiring_in,
-            );
+            let token = jwt_lifetime_secs
+                .map_or_else(|| "an-opaque-projected-token".to_string(), jwt_expiring_in);
             let material = issue_material(&["localhost"], false);
             let endpoint = serve_tls(TlsBehaviour::Converged, &material, false).await;
             let tokens = tempfile::tempdir().expect("temp dir");
