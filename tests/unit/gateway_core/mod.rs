@@ -48,6 +48,7 @@ mod h3_native_reject_bytes_share_tests;
 mod h3_retry_eligibility_tests;
 mod health_check_tests;
 mod http3_config_tests;
+mod http3_connect_udp_tests;
 mod http3_peer_identity_tests;
 mod http3_selected_target_policy_tests;
 mod http3_server_dispatch_tests;

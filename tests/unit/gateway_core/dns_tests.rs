@@ -1642,3 +1642,56 @@ async fn reqwest_resolver_without_override_uses_cached_answers() {
         vec![SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 0)]
     );
 }
+
+// ============================================================================
+// Dial-time all-candidates resolution with a per-proxy dns_override
+// (RFC 9298 CONNECT-UDP tunnels, and any other fresh-resolution dial path)
+// ============================================================================
+
+#[tokio::test]
+async fn fresh_all_candidates_resolution_honors_the_per_proxy_dns_override() {
+    let cache = DnsCache::new(default_dns_config(HashMap::new()));
+
+    // Without the override this name has no answer at all, so a passing
+    // assertion can only come from the override being honored — not from the
+    // resolver happening to agree.
+    let resolved = cache
+        .resolve_all_fresh_with_override("pinned-backend.invalid", Some("127.0.0.53"))
+        .await
+        .expect("the per-proxy override must be honored on the fresh dial path");
+    assert_eq!(
+        resolved,
+        vec!["127.0.0.53".parse::<std::net::IpAddr>().expect("literal")],
+        "a dial-time lookup must reach the same address ordinary dispatch would"
+    );
+}
+
+#[tokio::test]
+async fn fresh_all_candidates_resolution_screens_a_denied_dns_override() {
+    // Public-only egress policy: a loopback override is denied. The override
+    // must NOT bypass the backend IP policy just because it skips the resolver.
+    let cache = DnsCache::new(public_dns_config(HashMap::new()));
+
+    let error = cache
+        .resolve_all_fresh_with_override("pinned-backend.invalid", Some("127.0.0.53"))
+        .await
+        .expect_err("a denied override must fail the lookup, not become an unscreened dial");
+    let error = error.to_string();
+    assert!(
+        !error.is_empty(),
+        "the policy refusal must surface as an error"
+    );
+}
+
+#[tokio::test]
+async fn fresh_all_candidates_resolution_without_an_override_is_unchanged() {
+    let cache = DnsCache::new(default_dns_config(HashMap::new()));
+    let resolved = cache
+        .resolve_all_fresh_with_override("127.0.0.1", None)
+        .await
+        .expect("literal resolve");
+    assert_eq!(
+        resolved,
+        vec!["127.0.0.1".parse::<std::net::IpAddr>().expect("literal")]
+    );
+}

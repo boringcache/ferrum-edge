@@ -77,6 +77,28 @@ copy. To file the upstream work:
 4. **Open the PR** at https://github.com/hyperium/h3/compare/master...jeremyjpj0916:feat/extended-connect-websocket-protocol — paste `pr-description.md` as the body. Link the issue.
 5. **Update this README** with the issue + PR numbers under "Status" so future readers can find them.
 
+## Ferrum consumers of the patched `:protocol` decoding
+
+Two frontend profiles now read the `Protocol` extension this patch makes
+reachable, so a retirement must keep both working:
+
+- **RFC 9220 WebSocket** (`src/http3/websocket.rs`) — the value this patch
+  adds, `Protocol::WEB_SOCKET`.
+- **RFC 9298 CONNECT-UDP** (`src/http3/connect_udp.rs`, issue #3282) — uses
+  the *stock* `Protocol::CONNECT_UDP` constant, so it does not depend on the
+  patch's new variant. It does depend on the surrounding stock behavior this
+  README documents: `:protocol` surfacing as an `http::Request` extension,
+  and an unregistered token being refused at the HEADERS-frame layer with
+  `H3_MESSAGE_ERROR`. Ferrum treats that refusal as the fail-closed path for
+  unknown Extended CONNECT protocols, so a retirement (or an upstream change
+  that starts surfacing unknown `:protocol` tokens to applications) must be
+  re-checked against
+  `tests/unit/gateway_core/http3_connect_udp_tests.rs` and
+  `tests/functional/functional_http3_connect_udp_test.rs`.
+
+The vendored copy itself is unchanged by #3282 — no new patch hunks, no
+`vendor/VENDOR_INTEGRITY.sha256` movement.
+
 ## Retirement — when upstream merges
 
 Once `hyperium/h3` releases a version with the variant:
