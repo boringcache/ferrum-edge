@@ -648,8 +648,10 @@ impl HmacAuth {
     /// `replay_scope: process` policy then gets a **private** lane keyed by the
     /// standalone placeholder id, so a validation call can neither read,
     /// mutate, nor consume a live proxy's replay history. A `shared` policy
-    /// gets a detached fail-closed authority: validation neither publishes a
-    /// process readiness dependency nor arms a Redis recovery task.
+    /// constructs a detached fail-closed authority: construction never
+    /// publishes a process readiness dependency or arms a Redis recovery task.
+    /// Live readiness is published from
+    /// [`crate::plugins::Plugin::commit_background_tasks`].
     #[allow(dead_code)] // exercised by external unit tests
     pub fn new(config: &Value) -> Result<Self, String> {
         Self::build(config, None, None)
@@ -676,8 +678,8 @@ impl HmacAuth {
     ///
     /// A `replay_scope: shared` config still constructs its Redis client on that
     /// path — the backend is chosen by the config, not by the caller — but the
-    /// client connects lazily and validation never issues a claim, so no
-    /// connection, no recovery task, and no keyspace mutation results.
+    /// client stays detached until commit: no packed-health registration, no
+    /// recovery task, no Redis dial, and no keyspace mutation.
     fn build(
         config: &Value,
         http_client: Option<&PluginHttpClient>,
@@ -870,15 +872,11 @@ impl HmacAuth {
                     http_client.is_some_and(|client| client.tls_no_verify()),
                     http_client.and_then(|client| client.tls_ca_bundle_path()),
                 ));
-                let authority = if plugin_config_id.is_some() {
-                    ReplayAuthority::shared(client, retention)
-                } else {
-                    // Admin/config validation and direct tests must not make an
-                    // unpublished candidate a process readiness dependency or
-                    // arm its Redis recovery task.
-                    ReplayAuthority::shared_detached(client, retention)
-                };
-                Some(Arc::new(authority))
+                // Detached until `commit_background_tasks`: an invalid later
+                // plugin in the same candidate, or this instance if it is never
+                // installed, must not mark live readiness unavailable or dial
+                // Redis.
+                Some(Arc::new(ReplayAuthority::shared(client, retention)))
             }
             _ => None,
         };
@@ -907,6 +905,16 @@ impl HmacAuth {
     #[allow(dead_code)] // exercised by external unit tests
     pub fn replay_mode(&self) -> Option<&'static str> {
         self.replay_authority.as_ref().map(|a| a.mode())
+    }
+
+    /// Whether this instance's shared Redis recovery checker has been armed.
+    /// Test support for proving construction stays detached until commit.
+    #[doc(hidden)]
+    #[allow(dead_code)] // exercised by external unit tests
+    pub fn shared_replay_recovery_started_for_test(&self) -> bool {
+        self.replay_authority
+            .as_ref()
+            .is_some_and(|authority| authority.recovery_checker_started_for_test())
     }
 
     /// Marker this policy would claim for `consumer_id` + `nonce`. Test-only
@@ -1640,6 +1648,13 @@ auth_flow::impl_auth_plugin!(
             .as_ref()
             .map(|authority| authority.warmup_hostnames())
             .unwrap_or_default()
+    }
+
+    /// Publish the shared replay authority after this generation is installed.
+    fn commit_background_tasks(&self) {
+        if let Some(authority) = self.replay_authority.as_ref() {
+            authority.activate();
+        }
     }
 );
 

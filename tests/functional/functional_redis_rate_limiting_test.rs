@@ -3938,7 +3938,11 @@ async fn test_shared_replay_authority_live_redis_admits_exactly_one_winner() {
     let clients: Vec<Arc<RedisRateLimitClient>> = (0..4).map(|_| build_client()).collect();
     let authorities: Vec<Arc<ReplayAuthority>> = clients
         .iter()
-        .map(|client| Arc::new(ReplayAuthority::shared(Arc::clone(client), retention)))
+        .map(|client| {
+            let authority = ReplayAuthority::shared(Arc::clone(client), retention);
+            authority.activate();
+            Arc::new(authority)
+        })
         .collect();
     for (index, client) in clients.iter().enumerate() {
         let deadline = std::time::Instant::now() + Duration::from_secs(5);
@@ -3990,6 +3994,7 @@ async fn test_shared_replay_authority_live_redis_admits_exactly_one_winner() {
         Arc::clone(&short_lived_client),
         Duration::from_secs(5),
     ));
+    short_lived.activate();
     {
         let deadline = std::time::Instant::now() + Duration::from_secs(5);
         while !short_lived_client.is_available() {
@@ -4041,6 +4046,7 @@ async fn test_shared_replay_authority_live_redis_admits_exactly_one_winner() {
         )),
         retention,
     );
+    unreachable_authority.activate();
     let unseen = domain.marker(&[b"consumer-1", b"nonce-never-claimed"]);
     for _ in 0..3 {
         assert_eq!(

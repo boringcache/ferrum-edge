@@ -346,8 +346,10 @@ impl JwksAuth {
     /// `dpop_replay_scope: process` provider then gets a **private** lane keyed
     /// by the standalone placeholder id, so a validation call can neither read,
     /// mutate, nor consume a live proxy's replay history. A `shared` provider
-    /// gets a detached fail-closed authority: validation neither publishes a
-    /// process readiness dependency nor arms a Redis recovery task.
+    /// constructs a detached fail-closed authority: construction never publishes
+    /// a process readiness dependency or arms a Redis recovery task. Live
+    /// readiness is published from
+    /// [`crate::plugins::Plugin::commit_background_tasks`].
     #[allow(dead_code)] // exercised by external unit tests
     pub fn new(config: &Value, http_client: PluginHttpClient) -> Result<Self, String> {
         Self::new_with_config_id(config, http_client, None)
@@ -660,15 +662,10 @@ impl JwksAuth {
                     // become a process lane.
                     shared_replay_client.as_ref().map(|client| {
                         let retention = Duration::from_secs(DPOP_MARKER_RETENTION_SECONDS);
-                        let authority = if plugin_config_id.is_some() {
-                            ReplayAuthority::shared(Arc::clone(client), retention)
-                        } else {
-                            // Shape-only validation/direct construction must
-                            // not publish an unpublished candidate into global
-                            // readiness or arm its Redis recovery task.
-                            ReplayAuthority::shared_detached(Arc::clone(client), retention)
-                        };
-                        Arc::new(authority)
+                        // Detached until `commit_background_tasks`. Later
+                        // providers in this loop may still fail validation, and
+                        // the candidate itself may never be installed.
+                        Arc::new(ReplayAuthority::shared(Arc::clone(client), retention))
                     })
                 }
                 _ => None,
@@ -865,6 +862,19 @@ impl JwksAuth {
             .iter()
             .map(|provider| provider.dpop_replay.as_ref().map(|a| a.mode()))
             .collect()
+    }
+
+    /// Whether any provider's shared Redis recovery checker has been armed.
+    /// Test support for proving construction stays detached until commit.
+    #[doc(hidden)]
+    #[allow(dead_code)] // exercised by external unit tests
+    pub fn shared_replay_recovery_started_for_test(&self) -> bool {
+        self.providers.iter().any(|provider| {
+            provider
+                .dpop_replay
+                .as_ref()
+                .is_some_and(|authority| authority.recovery_checker_started_for_test())
+        })
     }
 
     /// Per-provider protection-domain digests. Test-only visibility for the
@@ -1489,6 +1499,12 @@ impl super::Plugin for JwksAuth {
         self.discovery_owner_committed
             .store(true, Ordering::Release);
         for provider in &self.providers {
+            // Shared replay readiness is a live-state publication: register the
+            // Redis client and arm recovery only after this generation is
+            // installed. Idempotent across providers that share one client.
+            if let Some(authority) = provider.dpop_replay.as_ref() {
+                authority.activate();
+            }
             // Direct and inline sources are already in the slot when the
             // publication reconciliation collects requirements; only an
             // asynchronously resolved store can arrive too late for it.

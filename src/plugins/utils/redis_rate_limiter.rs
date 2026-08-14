@@ -1268,6 +1268,11 @@ impl SharedReplayHealthRegistration {
             return;
         }
     }
+
+    fn is_live(&self) -> bool {
+        let (state, _) = unpack_epoch_state(self.word.load(Ordering::Acquire));
+        matches!(state, Self::AVAILABLE | Self::UNAVAILABLE)
+    }
 }
 
 impl Drop for SharedReplayHealthRegistration {
@@ -1888,6 +1893,17 @@ impl RedisRateLimitClient {
         let (available, epoch) = self.availability.health_snapshot();
         registration.apply_availability(available, epoch);
         self.start_health_checker_if_needed();
+    }
+
+    /// Whether this client currently contributes to packed shared-replay health.
+    ///
+    /// False until [`Self::register_as_shared_replay_authority`] publishes the
+    /// first count, and false again after retirement. An unpublished candidate
+    /// must not admit, dial, or move readiness.
+    pub(crate) fn is_live_shared_replay_registration(&self) -> bool {
+        self.shared_replay_health
+            .get()
+            .is_some_and(|registration| registration.is_live())
     }
 
     fn ensure_shared_replay_health(&self) -> Arc<SharedReplayHealthRegistration> {

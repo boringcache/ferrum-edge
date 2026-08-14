@@ -276,6 +276,7 @@ async fn a_shared_replay_authority_outage_fails_readiness_and_recovery_restores_
 
     let dead = shared_client("ferrum:replay_readiness:lifecycle-dead");
     let dead_authority = ReplayAuthority::shared(Arc::clone(&dead), RETENTION);
+    dead_authority.activate();
     assert_eq!(dead_authority.mode(), "shared");
     assert!(
         !dead.is_available(),
@@ -324,6 +325,7 @@ async fn a_shared_replay_authority_outage_fails_readiness_and_recovery_restores_
     let recovering =
         shared_client_for_url("ferrum:replay_readiness:lifecycle-recover", &redis_url, 1);
     let recovering_authority = ReplayAuthority::shared(Arc::clone(&recovering), RETENTION);
+    recovering_authority.activate();
     let (code, body) = wait_for_health(&base, false, "gated backend starts unproven").await;
     assert_eq!(code, 503);
     assert_eq!(
@@ -378,6 +380,7 @@ async fn the_unauthenticated_probe_sees_readiness_but_not_the_aggregate() {
 
     let client = shared_client("ferrum:replay_readiness:coarse");
     let authority = ReplayAuthority::shared(Arc::clone(&client), RETENTION);
+    authority.activate();
 
     let (code, anonymous) = get(&base, "/health", None).await;
     assert_eq!(code, 503);

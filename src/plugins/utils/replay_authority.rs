@@ -985,30 +985,42 @@ impl ReplayAuthority {
 
     /// Build a shared authority over an existing Redis client.
     ///
+    /// Construction is detached: it does not register packed readiness, start
+    /// the recovery checker, dial Redis, or mutate live process health. Call
+    /// [`Self::activate`] from [`crate::plugins::Plugin::commit_background_tasks`]
+    /// after the containing plugin generation has been atomically installed.
+    /// An unactivated authority stays fail-closed if [`Self::admit`] is reached
+    /// before that commit — there is no local fallback.
+    ///
     /// Callers must pass a client from
     /// [`RedisRateLimitClient::for_replay_authority`] so connection,
     /// authentication, command, topology, and recovery diagnostics stay
-    /// classification-only, the client starts unproven (fail-closed for
-    /// readiness), and a bounded readiness probe is armed when a Tokio runtime
-    /// is present. Generic rate-limiter clients retain
-    /// [`RedisRateLimitClient::new`].
+    /// classification-only and the client starts unproven. Generic rate-limiter
+    /// clients retain [`RedisRateLimitClient::new`].
     pub fn shared(client: Arc<RedisRateLimitClient>, retention: Duration) -> Self {
-        client.register_as_shared_replay_authority();
         Self::Shared { client, retention }
     }
 
-    /// Build a shared authority without publishing it as a live readiness
-    /// dependency.
+    /// Publish this shared authority as a live readiness dependency.
     ///
-    /// This is only for shape-only validation and direct/test plugin
-    /// construction, where the temporary candidate is never installed in a
-    /// runtime plugin cache. It still fails closed if a caller invokes
-    /// [`Self::admit`]: the client starts unproven and a miss may arm recovery,
-    /// but merely validating configuration cannot change process readiness or
-    /// dial the candidate backend. Production plugin construction must use
-    /// [`Self::shared`].
-    pub(crate) fn shared_detached(client: Arc<RedisRateLimitClient>, retention: Duration) -> Self {
-        Self::Shared { client, retention }
+    /// Idempotent: several providers sharing one Redis client register that
+    /// client exactly once, arm recovery at most once, and count the packed
+    /// health aggregate exactly once. Process-scoped authorities are a no-op.
+    /// Must run only after the containing plugin generation is committed.
+    pub fn activate(&self) {
+        if let Self::Shared { client, .. } = self {
+            client.register_as_shared_replay_authority();
+        }
+    }
+
+    /// Whether this shared authority's Redis recovery checker has been armed
+    /// (test support). Process-scoped authorities never start one.
+    #[allow(dead_code)] // exercised by external unit tests
+    pub fn recovery_checker_started_for_test(&self) -> bool {
+        match self {
+            Self::Shared { client, .. } => client.health_checker_started_for_test(),
+            Self::Process { .. } => false,
+        }
     }
 
     /// Fixed-cardinality mode label.
@@ -1098,9 +1110,14 @@ async fn admit_shared(
     retention: Duration,
     marker: &ReplayMarker,
 ) -> ReplayAdmission {
+    if !client.is_live_shared_replay_registration() {
+        // Detached construction must not dial Redis or admit locally if a
+        // request arrives before the containing plugin generation commits.
+        return ReplayAdmission::AuthorityUnavailable;
+    }
     if !client.is_available() {
         // Fail closed without waiting on the backend. Arm (or retry-arm) the
-        // bounded readiness probe so an unproven client constructed without a
+        // bounded readiness probe so an unproven client activated without a
         // runtime can recover once one is present — without turning this
         // request into an unbounded connect.
         client.start_health_checker_if_needed();

@@ -21,6 +21,7 @@ use std::sync::{Arc, Barrier};
 use std::time::Duration;
 
 use ferrum_edge::_test_support::{ReplaySetNxReplyError, classify_replay_set_nx_reply};
+use ferrum_edge::plugins::Plugin;
 use ferrum_edge::plugins::utils::redis_rate_limiter::{RedisConfig, RedisRateLimitClient};
 use ferrum_edge::plugins::utils::replay_authority::{
     MAX_PROCESS_REPLAY_LANES, ReplayAdmission, ReplayAuthority, ReplayDomain, ReplayScope,
@@ -1084,7 +1085,7 @@ async fn a_shared_authority_with_an_unreachable_backend_fails_closed() {
     let client = Arc::new(RedisRateLimitClient::for_replay_authority(
         config, None, false, None,
     ));
-    let authority = ReplayAuthority::shared(client, RETENTION);
+    let authority = shared_live(client, RETENTION);
     assert_eq!(authority.mode(), "shared");
 
     let marker = domain("shared-unreachable").marker(&[b"c", b"proof"]);
@@ -1123,7 +1124,7 @@ async fn an_unavailable_shared_authority_is_visible_in_the_counters() {
     let client = Arc::new(RedisRateLimitClient::for_replay_authority(
         config, None, false, None,
     ));
-    let authority = ReplayAuthority::shared(Arc::clone(&client), RETENTION);
+    let authority = shared_live(Arc::clone(&client), RETENTION);
 
     let marker = domain("shared-observable").marker(&[b"c", b"proof"]);
     let before = counters();
@@ -1144,9 +1145,9 @@ async fn an_unavailable_shared_authority_is_visible_in_the_counters() {
 // ── shared-authority health for readiness ───────────────────────────
 //
 // Shared-replay health counters are process-global, so these cases serialize
-// against each other. Nothing else in this test binary constructs a `shared`
-// authority (every other `shared` configuration in the unit suite is a rejected
-// config), so a serialized case observes only its own registrations.
+// against each other. Other `shared` configurations in the unit suite either
+// fail admission or stay detached until `commit_background_tasks`, so a
+// serialized case observes only its own registrations.
 /// A tokio mutex rather than a `std` one so the async cases can hold it across
 /// their awaits without a `!Send` guard.
 static SHARED_HEALTH_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
@@ -1196,11 +1197,19 @@ fn unreachable_shared_client(prefix: &str) -> Arc<RedisRateLimitClient> {
     ))
 }
 
-/// Shape-only validation constructs the real plugin so config admission stays
-/// aligned with runtime parsing, but that temporary object is not a live
-/// policy. It must neither enter the process readiness aggregate nor arm a
-/// backend probe. Supplying a stable config id is the production boundary and
-/// does register exactly one dependency per plugin-owned Redis client.
+/// Construct and activate a live shared authority, matching a committed plugin
+/// generation. Production construction stays detached until commit.
+fn shared_live(client: Arc<RedisRateLimitClient>, retention: Duration) -> ReplayAuthority {
+    let authority = ReplayAuthority::shared(client, retention);
+    authority.activate();
+    authority
+}
+
+/// Shape-only validation and uncommitted runtime construction both build the
+/// real plugin so config admission stays aligned with runtime parsing, but that
+/// candidate is not a live policy until commit. It must neither enter the
+/// process readiness aggregate nor arm a backend probe. Commit after atomic
+/// installation registers exactly one dependency per plugin-owned Redis client.
 #[test]
 fn validation_construction_does_not_publish_shared_replay_readiness() {
     let _serialized = shared_health_guard();
@@ -1235,19 +1244,41 @@ fn validation_construction_does_not_publish_shared_replay_readiness() {
         baseline,
         "unpublished validation candidates must not affect readiness"
     );
+    assert!(
+        !detached_hmac.shared_replay_recovery_started_for_test(),
+        "shape-only HMAC validation must not arm Redis recovery"
+    );
+    assert!(
+        !detached_jwks.shared_replay_recovery_started_for_test(),
+        "shape-only JWKS validation must not arm Redis recovery"
+    );
 
-    let live_hmac = ferrum_edge::plugins::hmac_auth::HmacAuth::new_with_http_client_and_config_id(
-        &hmac_config,
-        ferrum_edge::plugins::utils::PluginHttpClient::default(),
-        Some("live-hmac-replay-policy"),
-    )
-    .expect("runtime HMAC construction");
-    let live_jwks = ferrum_edge::plugins::jwks_auth::JwksAuth::new_with_config_id(
+    let uncommitted_hmac =
+        ferrum_edge::plugins::hmac_auth::HmacAuth::new_with_http_client_and_config_id(
+            &hmac_config,
+            ferrum_edge::plugins::utils::PluginHttpClient::default(),
+            Some("live-hmac-replay-policy"),
+        )
+        .expect("runtime HMAC construction");
+    let uncommitted_jwks = ferrum_edge::plugins::jwks_auth::JwksAuth::new_with_config_id(
         &jwks_config,
         ferrum_edge::plugins::utils::PluginHttpClient::default(),
         Some("live-jwks-replay-policy"),
     )
     .expect("runtime JWKS construction");
+    assert_eq!(
+        shared_health_snapshot(),
+        baseline,
+        "an uncommitted runtime candidate must not affect readiness"
+    );
+    assert!(
+        !uncommitted_hmac.shared_replay_recovery_started_for_test()
+            && !uncommitted_jwks.shared_replay_recovery_started_for_test(),
+        "uncommitted construction must not arm Redis recovery"
+    );
+
+    uncommitted_hmac.commit_background_tasks();
+    uncommitted_jwks.commit_background_tasks();
     let registered = shared_health_snapshot();
     assert_eq!(
         registered.shared_authorities,
@@ -1256,12 +1287,219 @@ fn validation_construction_does_not_publish_shared_replay_readiness() {
     assert_eq!(
         registered.shared_authorities_unavailable,
         baseline.shared_authorities_unavailable + 2,
-        "both unproven runtime dependencies fail readiness closed"
+        "both unproven committed dependencies fail readiness closed"
     );
 
-    drop((live_hmac, live_jwks));
+    uncommitted_hmac.commit_background_tasks();
+    uncommitted_jwks.commit_background_tasks();
+    assert_eq!(
+        shared_health_snapshot(),
+        registered,
+        "commit must register each plugin-owned Redis client exactly once"
+    );
+
+    drop((uncommitted_hmac, uncommitted_jwks));
     assert_eq!(shared_health_snapshot(), baseline);
     drop((detached_hmac, detached_jwks));
+    assert_eq!(shared_health_snapshot(), baseline);
+}
+
+/// A later provider that fails validation must drop every earlier shared
+/// authority without ever publishing readiness or arming recovery.
+#[test]
+fn an_invalid_jwks_candidate_does_not_publish_shared_replay_readiness() {
+    let _serialized = shared_health_guard();
+    let baseline = shared_health_snapshot();
+    let error = ferrum_edge::plugins::jwks_auth::JwksAuth::new_with_config_id(
+        &serde_json::json!({
+            "providers": [
+                {
+                    "jwks": {"keys": []},
+                    "issuer": "https://idp-a.example.com",
+                    "require_dpop": true,
+                    "dpop_replay_scope": "shared"
+                },
+                {
+                    "issuer": "https://idp-b.example.com"
+                }
+            ],
+            "sync_mode": "redis",
+            "redis_url": "redis://127.0.0.1:1",
+            "redis_health_check_interval_seconds": 3600
+        }),
+        ferrum_edge::plugins::utils::PluginHttpClient::default(),
+        Some("invalid-jwks-replay-policy"),
+    )
+    .expect_err("provider[1] has no usable JWKS source");
+    assert!(
+        error.contains("jwks"),
+        "the candidate must fail closed on the later provider: {error}"
+    );
+    assert_eq!(
+        shared_health_snapshot(),
+        baseline,
+        "a rejected JWKS candidate must not change packed replay health"
+    );
+}
+
+/// An invalid HMAC candidate is refused before any shared client is published.
+#[test]
+fn an_invalid_hmac_candidate_does_not_publish_shared_replay_readiness() {
+    let _serialized = shared_health_guard();
+    let baseline = shared_health_snapshot();
+    let error = ferrum_edge::plugins::hmac_auth::HmacAuth::new_with_http_client_and_config_id(
+        &serde_json::json!({ "replay_scope": "shared" }),
+        ferrum_edge::plugins::utils::PluginHttpClient::default(),
+        Some("invalid-hmac-replay-policy"),
+    )
+    .expect_err("shared HMAC requires Redis");
+    assert!(
+        error.contains("shared"),
+        "the candidate must fail closed without a Redis backend: {error}"
+    );
+    assert_eq!(shared_health_snapshot(), baseline);
+}
+
+/// Several `shared` JWKS providers reuse one Redis client; commit counts it
+/// once, and dropping the uncommitted candidate never decrements health.
+#[test]
+fn committing_jwks_shared_providers_registers_one_client() {
+    let _serialized = shared_health_guard();
+    let baseline = shared_health_snapshot();
+    let plugin = ferrum_edge::plugins::jwks_auth::JwksAuth::new_with_config_id(
+        &serde_json::json!({
+            "providers": [
+                {
+                    "jwks": {"keys": []},
+                    "issuer": "https://idp-a.example.com",
+                    "require_dpop": true,
+                    "dpop_replay_scope": "shared"
+                },
+                {
+                    "jwks": {"keys": []},
+                    "issuer": "https://idp-b.example.com",
+                    "require_dpop": true,
+                    "dpop_replay_scope": "shared"
+                }
+            ],
+            "sync_mode": "redis",
+            "redis_url": "redis://127.0.0.1:1",
+            "redis_health_check_interval_seconds": 3600
+        }),
+        ferrum_edge::plugins::utils::PluginHttpClient::default(),
+        Some("jwks-shared-providers"),
+    )
+    .expect("two shared providers construct");
+    assert_eq!(shared_health_snapshot(), baseline);
+    plugin.commit_background_tasks();
+    let registered = shared_health_snapshot();
+    assert_eq!(
+        registered.shared_authorities,
+        baseline.shared_authorities + 1,
+        "one Redis client is one shared authority"
+    );
+    plugin.commit_background_tasks();
+    assert_eq!(shared_health_snapshot(), registered);
+    drop(plugin);
+    assert_eq!(shared_health_snapshot(), baseline);
+}
+
+/// A detached shared authority fails closed without a local lane, without
+/// moving packed health, and without arming a Redis dial.
+#[tokio::test]
+async fn a_detached_shared_authority_fails_closed_without_local_fallback() {
+    let _serialized = shared_health_guard_async().await;
+    let baseline = shared_health_snapshot();
+    let client = unreachable_shared_client("ferrum:replay_authority_tests:detached-admit");
+    let authority = ReplayAuthority::shared(Arc::clone(&client), RETENTION);
+    assert_eq!(shared_health_snapshot(), baseline);
+    assert!(
+        !authority.recovery_checker_started_for_test(),
+        "detached construction must not start the recovery checker"
+    );
+    assert!(
+        client.publish_reachable_for_test(),
+        "availability without activation must not become a local admit path"
+    );
+    assert!(client.is_available());
+
+    let marker = domain("detached-admit").marker(&[b"c", b"proof"]);
+    assert_eq!(
+        authority.admit(&marker).await,
+        ReplayAdmission::AuthorityUnavailable,
+        "an uncommitted shared authority must reject, never admit locally"
+    );
+    assert!(
+        !authority.recovery_checker_started_for_test(),
+        "a precommit miss must not dial Redis"
+    );
+    assert!(process_lane(&authority).is_none());
+    assert_eq!(shared_health_snapshot(), baseline);
+
+    drop(authority);
+    drop(client);
+    assert_eq!(shared_health_snapshot(), baseline);
+}
+
+/// Commit under a Tokio runtime arms recovery exactly once per plugin-owned
+/// client. Construction still must not.
+#[tokio::test]
+async fn committing_hmac_and_jwks_under_tokio_starts_recovery_exactly_once() {
+    let _serialized = shared_health_guard_async().await;
+    let baseline = shared_health_snapshot();
+    let hmac_config = serde_json::json!({
+        "replay_scope": "shared",
+        "sync_mode": "redis",
+        "redis_url": "redis://127.0.0.1:1",
+        "redis_health_check_interval_seconds": 3600
+    });
+    let jwks_config = serde_json::json!({
+        "providers": [{
+            "jwks": {"keys": []},
+            "issuer": "https://idp.example.com",
+            "require_dpop": true,
+            "dpop_replay_scope": "shared"
+        }],
+        "sync_mode": "redis",
+        "redis_url": "redis://127.0.0.1:1",
+        "redis_health_check_interval_seconds": 3600
+    });
+
+    let hmac = ferrum_edge::plugins::hmac_auth::HmacAuth::new_with_http_client_and_config_id(
+        &hmac_config,
+        ferrum_edge::plugins::utils::PluginHttpClient::default(),
+        Some("tokio-hmac-replay-policy"),
+    )
+    .expect("runtime HMAC construction");
+    let jwks = ferrum_edge::plugins::jwks_auth::JwksAuth::new_with_config_id(
+        &jwks_config,
+        ferrum_edge::plugins::utils::PluginHttpClient::default(),
+        Some("tokio-jwks-replay-policy"),
+    )
+    .expect("runtime JWKS construction");
+    assert_eq!(shared_health_snapshot(), baseline);
+    assert!(
+        !hmac.shared_replay_recovery_started_for_test()
+            && !jwks.shared_replay_recovery_started_for_test(),
+        "construction under Tokio still must not dial Redis"
+    );
+
+    hmac.commit_background_tasks();
+    jwks.commit_background_tasks();
+    assert!(hmac.shared_replay_recovery_started_for_test());
+    assert!(jwks.shared_replay_recovery_started_for_test());
+    let registered = shared_health_snapshot();
+    assert_eq!(
+        registered.shared_authorities,
+        baseline.shared_authorities + 2
+    );
+
+    hmac.commit_background_tasks();
+    jwks.commit_background_tasks();
+    assert_eq!(shared_health_snapshot(), registered);
+
+    drop((hmac, jwks));
+    assert_eq!(shared_health_snapshot(), baseline);
 }
 
 /// The bounded aggregate readiness consumes: an unavailable shared authority is
@@ -1272,7 +1510,7 @@ fn shared_authority_health_tracks_outage_recovery_and_retirement() {
     let baseline = shared_health_snapshot();
 
     let client = unreachable_shared_client("ferrum:replay_authority_tests:health");
-    let authority = ReplayAuthority::shared(Arc::clone(&client), RETENTION);
+    let authority = shared_live(Arc::clone(&client), RETENTION);
 
     let registered = shared_health_snapshot();
     assert_eq!(
@@ -1327,7 +1565,7 @@ fn shared_authority_health_tracks_outage_recovery_and_retirement() {
 async fn registering_a_shared_authority_under_tokio_arms_the_readiness_probe() {
     let _serialized = shared_health_guard_async().await;
     let client = unreachable_shared_client("ferrum:replay_authority_tests:arm-probe");
-    let authority = ReplayAuthority::shared(Arc::clone(&client), RETENTION);
+    let authority = shared_live(Arc::clone(&client), RETENTION);
     assert!(!client.is_available());
     assert!(
         client.health_checker_started_for_test(),
@@ -1337,14 +1575,14 @@ async fn registering_a_shared_authority_under_tokio_arms_the_readiness_probe() {
     drop(client);
 }
 
-/// Construction/validate without a reactor must stay panic-free, and a later
-/// request-path miss under a runtime must still arm recovery.
+/// Activation without a reactor must stay panic-free, and a later request-path
+/// miss under a runtime must still arm recovery.
 #[tokio::test]
 async fn a_runtime_appearing_later_still_arms_the_replay_readiness_probe() {
     let _serialized = shared_health_guard_async().await;
     let (client, authority) = std::thread::spawn(|| {
         let client = unreachable_shared_client("ferrum:replay_authority_tests:later-runtime");
-        let authority = ReplayAuthority::shared(Arc::clone(&client), RETENTION);
+        let authority = shared_live(Arc::clone(&client), RETENTION);
         assert!(
             !client.health_checker_started_for_test(),
             "no reactor: do not latch the started flag"
@@ -1378,9 +1616,9 @@ fn one_backend_shared_by_several_authorities_is_counted_once() {
     let baseline = shared_health_snapshot();
 
     let client = unreachable_shared_client("ferrum:replay_authority_tests:dedupe");
-    let first = ReplayAuthority::shared(Arc::clone(&client), RETENTION);
-    let second = ReplayAuthority::shared(Arc::clone(&client), RETENTION);
-    let third = ReplayAuthority::shared(Arc::clone(&client), RETENTION);
+    let first = shared_live(Arc::clone(&client), RETENTION);
+    let second = shared_live(Arc::clone(&client), RETENTION);
+    let third = shared_live(Arc::clone(&client), RETENTION);
 
     assert_eq!(
         shared_health_snapshot().shared_authorities,
@@ -1427,8 +1665,8 @@ fn distinct_shared_clients_are_counted_separately() {
 
     let hmac = unreachable_shared_client("ferrum:replay_authority_tests:hmac");
     let jwks = unreachable_shared_client("ferrum:replay_authority_tests:jwks");
-    let hmac_authority = ReplayAuthority::shared(Arc::clone(&hmac), RETENTION);
-    let jwks_authority = ReplayAuthority::shared(Arc::clone(&jwks), RETENTION);
+    let hmac_authority = shared_live(Arc::clone(&hmac), RETENTION);
+    let jwks_authority = shared_live(Arc::clone(&jwks), RETENTION);
 
     assert_eq!(
         shared_health_snapshot().shared_authorities,
@@ -1492,7 +1730,7 @@ fn terminal_topology_publishes_unavailable_and_cannot_resurrect() {
     let baseline = shared_health_snapshot();
 
     let client = unreachable_shared_client("ferrum:replay_authority_tests:terminal");
-    let authority = ReplayAuthority::shared(Arc::clone(&client), RETENTION);
+    let authority = shared_live(Arc::clone(&client), RETENTION);
     client.mark_topology_unsupported_for_test();
 
     let terminal = shared_health_snapshot();
@@ -1525,9 +1763,9 @@ fn replacement_generation_clears_the_retired_count() {
 
     let old_client = unreachable_shared_client("ferrum:replay_authority_tests:replace-old");
     old_client.mark_unavailable_for_test();
-    let old = ReplayAuthority::shared(Arc::clone(&old_client), RETENTION);
+    let old = shared_live(Arc::clone(&old_client), RETENTION);
     let new_client = unreachable_shared_client("ferrum:replay_authority_tests:replace-new");
-    let new = ReplayAuthority::shared(Arc::clone(&new_client), RETENTION);
+    let new = shared_live(Arc::clone(&new_client), RETENTION);
 
     assert_eq!(
         shared_health_snapshot().shared_authorities,
@@ -1564,7 +1802,7 @@ fn retired_generations_clear_counts_without_a_later_registration() {
         let client =
             unreachable_shared_client(&format!("ferrum:replay_authority_tests:retire-{idx}"));
         client.mark_unavailable_for_test();
-        let authority = ReplayAuthority::shared(Arc::clone(&client), RETENTION);
+        let authority = shared_live(Arc::clone(&client), RETENTION);
         assert_eq!(
             shared_health_snapshot().shared_authorities,
             baseline.shared_authorities + 1
@@ -1591,7 +1829,7 @@ fn concurrent_transitions_and_drop_keep_exact_counts() {
     let baseline = shared_health_snapshot();
 
     let client = unreachable_shared_client("ferrum:replay_authority_tests:race");
-    let authority = Arc::new(ReplayAuthority::shared(Arc::clone(&client), RETENTION));
+    let authority = Arc::new(shared_live(Arc::clone(&client), RETENTION));
     const WORKERS: usize = 8;
     let barrier = Arc::new(Barrier::new(WORKERS));
 
@@ -1650,7 +1888,7 @@ fn concurrent_registration_and_outage_publish_exact_counts() {
             std::thread::spawn(move || {
                 barrier.wait();
                 let authority = match idx % 3 {
-                    0 => Some(ReplayAuthority::shared(Arc::clone(&client), RETENTION)),
+                    0 => Some(shared_live(Arc::clone(&client), RETENTION)),
                     1 => {
                         client.mark_unavailable_for_test();
                         None
@@ -1734,7 +1972,7 @@ fn stale_reachable_registration_sample_cannot_overwrite_later_unavailable() {
     assert!(settled.unavailable());
     assert!(!client.is_available());
 
-    let authority = ReplayAuthority::shared(Arc::clone(&client), RETENTION);
+    let authority = shared_live(Arc::clone(&client), RETENTION);
     assert_eq!(
         shared_health_snapshot(),
         settled,
@@ -1788,7 +2026,7 @@ fn stale_unavailable_registration_sample_cannot_overwrite_later_recovery() {
     );
     assert!(client.is_available());
 
-    let authority = ReplayAuthority::shared(Arc::clone(&client), RETENTION);
+    let authority = shared_live(Arc::clone(&client), RETENTION);
     assert_eq!(shared_health_snapshot(), recovered);
 
     drop(authority);
@@ -1827,7 +2065,7 @@ fn stale_reachable_registration_sample_cannot_overwrite_terminal_topology() {
     assert!(!client.is_available());
     assert!(!client.publish_reachable_for_test());
 
-    let authority = ReplayAuthority::shared(Arc::clone(&client), RETENTION);
+    let authority = shared_live(Arc::clone(&client), RETENTION);
     assert_eq!(shared_health_snapshot(), terminal);
 
     drop(authority);
@@ -2102,7 +2340,7 @@ async fn a_screened_probe_restores_shared_readiness_without_protected_traffic() 
     let (port, shutdown) = spawn_claim_redis_server(ClaimBehavior::Silent).await;
     let client = claim_client(port, "ferrum:replay_authority_tests:probe-ready");
     assert!(!client.is_available());
-    let authority = ReplayAuthority::shared(Arc::clone(&client), RETENTION);
+    let authority = shared_live(Arc::clone(&client), RETENTION);
     assert_eq!(
         shared_health_snapshot().shared_authorities_unavailable,
         baseline.shared_authorities_unavailable + 1,
@@ -2132,7 +2370,7 @@ async fn a_ping_alone_does_not_publish_replay_readiness() {
     let baseline = shared_health_snapshot();
     let (port, shutdown) = spawn_info_silent_redis_server().await;
     let client = claim_client(port, "ferrum:replay_authority_tests:ping-only");
-    let authority = ReplayAuthority::shared(Arc::clone(&client), RETENTION);
+    let authority = shared_live(Arc::clone(&client), RETENTION);
     for _ in 0..150 {
         assert!(
             !client.is_available(),
@@ -2166,7 +2404,7 @@ async fn a_silent_recovery_ping_times_out_and_does_not_wedge_retry() {
     let (port, pings, shutdown) = spawn_ping_silent_then_healthy_redis(1).await;
     let client =
         claim_client_with_interval(port, "ferrum:replay_authority_tests:ping-timeout", 1);
-    let authority = ReplayAuthority::shared(Arc::clone(&client), RETENTION);
+    let authority = shared_live(Arc::clone(&client), RETENTION);
     assert!(!client.is_available());
     assert_eq!(
         shared_health_snapshot().shared_authorities_unavailable,
@@ -2229,7 +2467,7 @@ async fn a_silent_recovery_ping_logs_only_the_timeout_classification() {
     let (port, pings, shutdown) = spawn_ping_silent_then_healthy_redis(usize::MAX).await;
     let prefix = "ferrum:replay_authority_tests:ping-timeout-log";
     let client = claim_client(port, prefix);
-    let authority = ReplayAuthority::shared(Arc::clone(&client), RETENTION);
+    let authority = shared_live(Arc::clone(&client), RETENTION);
     wait_until(
         || pings.load(Ordering::SeqCst) >= 1,
         "recovery PING dispatched",
@@ -2266,7 +2504,7 @@ async fn a_connected_backend_that_never_answers_fails_closed_within_the_bound() 
     let _serialized = shared_health_guard_async().await;
     let (port, shutdown) = spawn_claim_redis_server(ClaimBehavior::Silent).await;
     let client = claim_client(port, "ferrum:replay_authority_tests:silent");
-    let authority = ReplayAuthority::shared(Arc::clone(&client), RETENTION);
+    let authority = shared_live(Arc::clone(&client), RETENTION);
     wait_until_available(&client).await;
     let marker = domain("shared-silent").marker(&[b"c", b"proof"]);
 
@@ -2318,7 +2556,7 @@ async fn the_shared_claim_primitive_publishes_no_backend_or_key_material() {
     let client = Arc::new(RedisRateLimitClient::for_replay_authority(
         config, None, false, None,
     ));
-    let authority = ReplayAuthority::shared(Arc::clone(&client), RETENTION);
+    let authority = shared_live(Arc::clone(&client), RETENTION);
     let marker = domain("shared-redaction").marker(&[b"consumer-1", b"nonce-1"]);
 
     assert_eq!(
@@ -2383,7 +2621,7 @@ async fn every_shared_backend_uncertainty_class_fails_closed() {
     ] {
         let (port, shutdown) = spawn_claim_redis_server(behavior).await;
         let client = claim_client(port, "ferrum:replay_authority_tests:uncertainty");
-        let authority = ReplayAuthority::shared(Arc::clone(&client), RETENTION);
+        let authority = shared_live(Arc::clone(&client), RETENTION);
         wait_until_available(&client).await;
         let marker = domain("shared-uncertainty").marker(&[b"c", label.as_bytes()]);
 
@@ -2426,7 +2664,7 @@ async fn a_claim_whose_reply_was_lost_stays_fail_closed_on_retry() {
 
     let (port, shutdown) = spawn_claim_redis_server(ClaimBehavior::ExecutedThenLost).await;
     let client = claim_client(port, "ferrum:replay_authority_tests:lost-reply");
-    let authority = ReplayAuthority::shared(Arc::clone(&client), RETENTION);
+    let authority = shared_live(Arc::clone(&client), RETENTION);
     wait_until_available(&client).await;
     let marker = domain("shared-lost-reply").marker(&[b"c", b"nonce"]);
 
@@ -2463,7 +2701,7 @@ fn shared_health_snapshot_cannot_hide_a_live_unavailable_authority() {
 
     let client = unreachable_shared_client("ferrum:replay_authority_tests:visible");
     client.mark_unavailable_for_test();
-    let authority = ReplayAuthority::shared(Arc::clone(&client), RETENTION);
+    let authority = shared_live(Arc::clone(&client), RETENTION);
     let before = shared_health_snapshot();
     assert_eq!(before.shared_authorities, baseline.shared_authorities + 1);
     assert_eq!(
@@ -2485,7 +2723,7 @@ fn shared_health_snapshot_cannot_hide_a_live_unavailable_authority() {
 
     let extra = unreachable_shared_client("ferrum:replay_authority_tests:visible-extra");
     extra.mark_unavailable_for_test();
-    let extra_authority = ReplayAuthority::shared(Arc::clone(&extra), RETENTION);
+    let extra_authority = shared_live(Arc::clone(&extra), RETENTION);
     assert_eq!(
         shared_health_snapshot().shared_authorities,
         before.shared_authorities + 1
@@ -2595,7 +2833,7 @@ async fn shared_claim_writes_the_exact_ceil_ttl_on_the_set_command() {
         ("fractional", Duration::from_millis(600_500), 601u64),
         ("zero", Duration::ZERO, 1u64),
     ] {
-        let authority = ReplayAuthority::shared(Arc::clone(&client), retention);
+        let authority = shared_live(Arc::clone(&client), retention);
         wait_until_available(&client).await;
         let marker = domain("shared-ttl").marker(&[b"c", label.as_bytes()]);
         assert_eq!(
@@ -2772,7 +3010,7 @@ async fn replay_client_logs_only_classification_and_redacted_endpoint() {
         let client = Arc::new(RedisRateLimitClient::for_replay_authority(
             config, None, false, None,
         ));
-        let authority = ReplayAuthority::shared(Arc::clone(&client), RETENTION);
+        let authority = shared_live(Arc::clone(&client), RETENTION);
         let marker = domain("shared-logging").marker(&[b"c", label.as_bytes()]);
         match shape {
             LoggingShape::AuthReject => {
@@ -2938,7 +3176,7 @@ async fn replay_redis_accepts_unlimited_memory_or_noeviction() {
         let (port, shutdown) =
             spawn_memory_policy_redis(MemoryInfoBehavior::Payload(payload)).await;
         let client = claim_client(port, &format!("ferrum:replay_authority_tests:mem-{label}"));
-        let authority = ReplayAuthority::shared(Arc::clone(&client), RETENTION);
+        let authority = shared_live(Arc::clone(&client), RETENTION);
         wait_until_available(&client).await;
         assert!(
             !client.is_topology_unsupported(),
@@ -2963,7 +3201,7 @@ async fn replay_redis_rejects_an_evicting_policy_terminally() {
             port,
             &format!("ferrum:replay_authority_tests:evict-{label}"),
         );
-        let authority = ReplayAuthority::shared(Arc::clone(&client), RETENTION);
+        let authority = shared_live(Arc::clone(&client), RETENTION);
         wait_until(
             || client.is_topology_unsupported(),
             &format!("{label}: evicting policy must be terminal"),
@@ -2997,7 +3235,7 @@ async fn replay_redis_treats_unproven_memory_policy_as_a_recoverable_outage() {
             port,
             &format!("ferrum:replay_authority_tests:unproven-{label}"),
         );
-        let authority = ReplayAuthority::shared(Arc::clone(&client), RETENTION);
+        let authority = shared_live(Arc::clone(&client), RETENTION);
         for _ in 0..80 {
             assert!(
                 !client.is_available(),
@@ -3024,7 +3262,7 @@ async fn replay_redis_recovers_after_an_unproven_memory_policy_screen() {
     ]))
     .await;
     let client = claim_client_with_interval(port, "ferrum:replay_authority_tests:mem-recover", 1);
-    let authority = ReplayAuthority::shared(Arc::clone(&client), RETENTION);
+    let authority = shared_live(Arc::clone(&client), RETENTION);
     wait_until_available(&client).await;
     assert!(!client.is_topology_unsupported());
     drop(authority);
@@ -3041,7 +3279,7 @@ async fn replay_redis_does_not_recover_from_a_proven_evicting_policy() {
     ]))
     .await;
     let client = claim_client(port, "ferrum:replay_authority_tests:mem-terminal");
-    let authority = ReplayAuthority::shared(Arc::clone(&client), RETENTION);
+    let authority = shared_live(Arc::clone(&client), RETENTION);
     wait_until(
         || client.is_topology_unsupported(),
         "evicting policy is terminal",
@@ -3066,7 +3304,7 @@ async fn replay_redis_memory_policy_logs_only_closed_set_classifications() {
     let (port, shutdown) =
         spawn_memory_policy_redis(MemoryInfoBehavior::Payload(MEMORY_VOLATILE)).await;
     let client = claim_client(port, "ferrum:replay_authority_tests:mem-log");
-    let authority = ReplayAuthority::shared(Arc::clone(&client), RETENTION);
+    let authority = shared_live(Arc::clone(&client), RETENTION);
     wait_until(
         || client.is_topology_unsupported(),
         "unsafe eviction classification",
