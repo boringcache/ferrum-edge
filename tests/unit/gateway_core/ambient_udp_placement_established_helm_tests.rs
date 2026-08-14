@@ -109,98 +109,51 @@ fn ambient_env_override_still_wins_over_chart_managed_attestation() {
 // ── Node-specific proof boundary (issue #3809) ──────────────────────────────
 
 #[test]
-fn a_settled_host_placement_renders_the_privileged_node_preflight() {
+fn a_settled_host_placement_isolates_the_privileged_node_preflight() {
     let ambient = read("templates/ambient-daemonset.yaml");
 
-    // The preflight is scoped to exactly the ambiguous case: the SETTLED
-    // (stable-phase) host placement, which is the one that drops setns and
-    // therefore cannot inspect a pod netns for itself.
     assert!(
         ambient.contains(
             "$ambientUdpRunNodePreflight := and $ambientUdpLifecycle $ambientUdpHostNetns (eq $ambientUdpMigrationPhase \"stable\") $ambientUdpNodePreflightEnabled"
         ),
         "the preflight must render only for a settled host-netns Ambient placement"
     );
-    assert!(
-        ambient.contains("initContainers:")
-            && ambient.contains("name: ferrum-udp-node-preflight")
-            && ambient.contains("args: [\"ambient-udp-preflight\", \"-v\"]"),
-        "the preflight must be a one-shot init container running the dedicated subcommand"
-    );
 
-    // Privilege containment: SYS_ADMIN/SYS_PTRACE live in the INIT stage, and
-    // the steady-state container's own capability gate is unchanged. hostPID is
-    // a PodSpec field (pod-wide visibility), not a container capability.
-    let (before_init, after_init) = ambient
-        .split_once("initContainers:")
-        .expect("init container block");
-    let (init_block, steady_state) = after_init
-        .split_once("      containers:")
-        .expect("steady-state container block");
-    for privilege in ["SYS_ADMIN", "SYS_PTRACE"] {
-        assert!(
-            init_block.contains(privilege),
-            "the preflight init stage needs {privilege} to enter pod netns"
-        );
-    }
-    // The one-shot stage's privilege surface is exactly the four declared
-    // capabilities: it drops the runtime's ambient/default set FIRST and cannot
-    // gain more, so the elevated init stage is narrower than the pod default
-    // rather than merely additive.
+    let (preflight, steady_state) = ambient
+        .split_once("---\n{{- end }}\napiVersion: apps/v1")
+        .expect("isolated preflight and steady-state DaemonSet documents");
     assert!(
-        init_block.contains("allowPrivilegeEscalation: false"),
-        "the preflight init stage must forbid privilege escalation"
+        preflight.contains("name: ferrum-mesh-udp-node-preflight")
+            && preflight.contains("name: ferrum-udp-node-preflight")
+            && preflight.contains("args: [\"ambient-udp-preflight\", \"-v\"]"),
+        "the dedicated DaemonSet must run the node preflight"
     );
-    let (init_drop, init_add) = init_block
-        .split_once("              add:")
-        .expect("the preflight capability add list");
     assert!(
-        init_drop.contains("              drop:\n                - ALL\n"),
-        "the preflight init stage must drop ALL capabilities before adding its own"
+        preflight.contains("hostPID: true")
+            && preflight.contains("allowPrivilegeEscalation: false")
+            && preflight.contains("drop:\n                - ALL"),
+        "the isolated preflight pod must declare its complete privilege surface"
     );
     for privilege in ["NET_ADMIN", "NET_RAW", "SYS_ADMIN", "SYS_PTRACE"] {
         assert!(
-            init_add.contains(privilege),
-            "the preflight init stage must re-add {privilege} explicitly after the drop"
+            preflight.contains(privilege),
+            "the preflight needs {privilege} to retire predecessor rules"
         );
     }
-
     assert!(
-        steady_state.contains("{{- if $ambientSetnsCapture }}"),
-        "the steady-state container must keep its own narrow setns gate"
-    );
-    assert!(
-        !steady_state.contains("allowPrivilegeEscalation") && !steady_state.contains("drop:"),
-        "narrowing the one-shot stage must not silently rewrite the steady-state \
-         container's capability contract"
-    );
-    assert!(
-        !steady_state.contains("$ambientUdpRunNodePreflight"),
-        "the preflight must not widen the steady-state container's privileges"
-    );
-    assert!(
-        before_init.contains("if or $ambientSetnsCapture $ambientUdpRunNodePreflight")
-            && before_init.contains("hostPID: true")
-            && before_init.contains("Kubernetes applies hostPID to every container"),
-        "hostPID is a PodSpec field gated on setns capture OR the settled-host \
-         preflight; Kubernetes applies it to every container in the pod"
-    );
-    assert!(
-        !init_block.contains("hostPID: true") && !steady_state.contains("hostPID: true"),
-        "hostPID must remain a PodSpec field; it is not container-scoped and \
-         cannot be dropped by the steady-state container"
-    );
-    assert!(
-        ambient.contains("hostPID is pod-scoped") && ambient.contains("does not grant setns"),
-        "the template must record that hostPID is pod-wide visibility, not setns"
-    );
-
-    // The preflight needs the registry (its proof artifact and pod inventory)
-    // and the host cgroup mount (pod netns resolution).
-    assert!(
-        init_block.contains("name: node-waypoint-pod-registry")
-            && init_block.contains("name: cgroup"),
+        preflight.contains("name: node-waypoint-pod-registry")
+            && preflight.contains("name: cgroup"),
         "the preflight must mount the pod registry and host cgroup"
+    );
+
+    assert!(
+        steady_state.contains("{{- if $ambientSetnsCapture }}\n      hostPID: true"),
+        "the proxy pod must enable hostPID only when its own capture mode needs setns"
+    );
+    assert!(
+        !steady_state.contains("$ambientUdpRunNodePreflight")
+            && !steady_state.contains("name: ferrum-udp-node-preflight"),
+        "the preflight must not widen or share the steady-state proxy pod"
     );
 }
 
@@ -292,11 +245,10 @@ fn client_render_parity_keeps_an_explicit_env_value_under_the_same_boundary() {
         "values must document that disabling the preflight keeps the runtime fail-closed"
     );
     assert!(
-        values.contains("hostPID is pod-scoped")
-            && values.contains("hostPID does not grant setns")
-            && values.contains("will not grant hostPID (pod-wide)"),
-        "values must record that hostPID is pod-wide visibility required by the \
-         init stage, not an init-only capability drop"
+        values.contains("dedicated preflight DaemonSet")
+            && values.contains("capabilities never reach the")
+            && values.contains("will not grant hostPID or the preflight pod's"),
+        "values must document the pod boundary that isolates preflight privileges"
     );
 }
 
@@ -571,12 +523,9 @@ fn the_preflight_binds_its_node_lookup_to_this_pods_node_name() {
         "the preflight must not gate the downward-API fieldRef on ambient.env presence"
     );
 
-    let (_, after_init) = ambient
-        .split_once("initContainers:")
-        .expect("init container block");
-    let (init_block, _) = after_init
-        .split_once("      containers:")
-        .expect("steady-state container block");
+    let (init_block, _) = ambient
+        .split_once("---\n{{- end }}\napiVersion: apps/v1")
+        .expect("isolated preflight DaemonSet");
     assert!(
         init_block.contains("if not $hasExplicitNodeUid")
             && init_block.contains("- name: FERRUM_K8S_NODE_NAME")
@@ -586,7 +535,7 @@ fn the_preflight_binds_its_node_lookup_to_this_pods_node_name() {
     assert_eq!(
         init_block.matches("- name: FERRUM_K8S_NODE_NAME").count(),
         1,
-        "the preflight init container must render exactly one FERRUM_K8S_NODE_NAME env row"
+        "the preflight container must render exactly one FERRUM_K8S_NODE_NAME env row"
     );
     assert_eq!(
         init_block.matches("fieldPath: spec.nodeName").count(),
@@ -669,23 +618,20 @@ fn the_preflight_explicit_node_uid_skips_the_name_fieldref_but_rejects_name_over
     );
 }
 
-/// SPIRE and the preflight are separate containers; each may receive its own
+/// SPIRE and the preflight are in separate pods; each may receive its own
 /// downward-API node name without duplicating env rows inside one container.
 #[test]
 fn spire_and_preflight_each_bind_node_name_in_their_own_container() {
     let ambient = read("templates/ambient-daemonset.yaml");
 
-    let (_, after_init) = ambient
-        .split_once("initContainers:")
-        .expect("init container block");
-    let (init_block, steady_state) = after_init
-        .split_once("      containers:")
-        .expect("steady-state container block");
+    let (init_block, steady_state) = ambient
+        .split_once("---\n{{- end }}\napiVersion: apps/v1")
+        .expect("isolated preflight and steady-state DaemonSets");
 
     assert_eq!(
         init_block.matches("- name: FERRUM_K8S_NODE_NAME").count(),
         1,
-        "the preflight init container must carry exactly one FERRUM_K8S_NODE_NAME row"
+        "the preflight container must carry exactly one FERRUM_K8S_NODE_NAME row"
     );
     assert!(
         steady_state.contains("if $ambientSpireUsesNodeName")

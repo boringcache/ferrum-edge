@@ -139,17 +139,14 @@
        still redirect UDP to the retired predecessor listener.
 
        So the settled host placement additionally runs a PRIVILEGED one-shot
-       preflight init stage that enumerates and retires BOTH predecessor
+       preflight DaemonSet that enumerates and retires BOTH predecessor
        placements (IPv4 and IPv6, host netns and every enrolled pod netns) by
        exact Ferrum-owned name, then publishes a completion attestation bound to
        this node's Kubernetes UID, its current boot id, the incoming target, and
-       the release's node-proof generation. Kubernetes hostPID is pod-scoped,
-       not container-scoped: enabling this init stage therefore gives the whole
-       pod — init and steady-state — host PID namespace visibility.
-       hostPID does not grant setns. SYS_ADMIN and SYS_PTRACE remain confined to the init
-       container; the steady-state container keeps its narrow NET_ADMIN/NET_RAW
-       pair after the init stage exits. Clusters that refuse hostPID or those
-       init capabilities cannot use this default unchanged; set
+       the release's node-proof generation. The preflight has its own pod so
+       pod-scoped hostPID and its elevated capabilities never reach the
+       steady-state proxy pod. Clusters that refuse hostPID or those preflight
+       capabilities cannot use this default unchanged; set
        ambient.udpNodePreflight.enabled=false and follow the documented
        fail-closed operator recovery path. */ -}}
 {{- $ambientUdpNodeProofGeneration := include "ferrum-mesh.ambientUdpNodeProofGeneration" . -}}
@@ -278,6 +275,82 @@
 {{- end -}}
 {{- end -}}
 {{- $ambientImage := printf "%s:%s" $ambientImageRepository $ambientImageTag -}}
+{{- if $ambientUdpRunNodePreflight }}
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: ferrum-mesh-udp-node-preflight
+  namespace: {{ .Release.Namespace }}
+  labels:
+    app.kubernetes.io/name: ferrum-mesh-udp-node-preflight
+    app.kubernetes.io/instance: {{ .Release.Name }}
+spec:
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: ferrum-mesh-udp-node-preflight
+      app.kubernetes.io/instance: {{ .Release.Name }}
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: ferrum-mesh-udp-node-preflight
+        app.kubernetes.io/instance: {{ .Release.Name }}
+    spec:
+      serviceAccountName: ferrum-mesh
+      hostNetwork: true
+      hostPID: true
+      dnsPolicy: ClusterFirstWithHostNet
+      restartPolicy: Always
+      containers:
+        - name: ferrum-udp-node-preflight
+          image: {{ $ambientImage | quote }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          args: ["ambient-udp-preflight", "-v"]
+          securityContext:
+            runAsUser: 0
+            runAsGroup: 0
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+                - ALL
+              add:
+                - NET_ADMIN
+                - NET_RAW
+                - SYS_ADMIN
+                - SYS_PTRACE
+          env:
+            - name: FERRUM_MESH_NODE_WAYPOINT_POD_REGISTRY_DIR
+              value: {{ $nodeWaypointRegistryMountPath | quote }}
+            {{- if not $hasExplicitNodeUid }}
+            - name: FERRUM_K8S_NODE_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+            {{- end }}
+            {{- if not (hasKey $ambientEnv "FERRUM_MESH_CAPTURE_UDP_NODE_PROOF_GENERATION") }}
+            - name: FERRUM_MESH_CAPTURE_UDP_NODE_PROOF_GENERATION
+              value: {{ $ambientUdpNodeProofGeneration | quote }}
+            {{- end }}
+            {{- range $name, $value := $ambientEnv }}
+            - name: {{ $name }}
+              value: {{ $value | quote }}
+            {{- end }}
+          volumeMounts:
+            - name: cgroup
+              mountPath: {{ .Values.nodeAgent.cgroupRoot }}
+              readOnly: true
+            - name: node-waypoint-pod-registry
+              mountPath: {{ $nodeWaypointRegistryMountPath }}
+      volumes:
+        - name: cgroup
+          hostPath:
+            path: {{ .Values.nodeAgent.cgroupRoot }}
+            type: Directory
+        - name: node-waypoint-pod-registry
+          hostPath:
+            path: {{ .Values.nodeAgent.podRegistryDir }}
+            type: DirectoryOrCreate
+---
+{{- end }}
 apiVersion: apps/v1
 kind: DaemonSet
 metadata:
@@ -308,78 +381,10 @@ spec:
     spec:
       serviceAccountName: ferrum-mesh
       hostNetwork: true
-      {{- if or $ambientSetnsCapture $ambientUdpRunNodePreflight }}
-      {{- /* PodSpec field: Kubernetes applies hostPID to every container in
-             this pod. The settled-host preflight needs it to resolve
-             /proc/<pid>/ns/net; the steady-state container therefore also
-             sees host PIDs whenever the preflight is enabled. Visibility is
-             not setns — SYS_ADMIN/SYS_PTRACE stay on the init container. */}}
+      {{- if $ambientSetnsCapture }}
       hostPID: true
       {{- end }}
       dnsPolicy: ClusterFirstWithHostNet
-      {{- if $ambientUdpRunNodePreflight }}
-      initContainers:
-        - name: ferrum-udp-node-preflight
-          image: {{ $ambientImage | quote }}
-          imagePullPolicy: {{ .Values.image.pullPolicy }}
-          args: ["ambient-udp-preflight", "-v"]
-          securityContext:
-            runAsUser: 0
-            runAsGroup: 0
-            {{- /* The one-shot stage runs as root with explicit capabilities, so
-                   it never needs to GAIN privileges, and it must not inherit the
-                   runtime's ambient/default set: dropping ALL first makes the
-                   four capabilities below the complete, declared privilege
-                   surface of this container. */}}
-            allowPrivilegeEscalation: false
-            capabilities:
-              drop:
-                - ALL
-              add:
-                - NET_ADMIN
-                - NET_RAW
-                {{- /* setns(CLONE_NEWNET) + ptrace_may_access on
-                       /proc/<pid>/ns/net, so predecessor rules can be retired
-                       inside every enrolled pod netns. These are granted to the
-                       INIT stage only; it exits before the steady-state
-                       container starts, so the host producer still runs without
-                       them. */}}
-                - SYS_ADMIN
-                - SYS_PTRACE
-          env:
-            - name: FERRUM_MESH_NODE_WAYPOINT_POD_REGISTRY_DIR
-              value: {{ $nodeWaypointRegistryMountPath | quote }}
-            {{- /* The preflight resolves this node's immutable Node.metadata.uid
-                   ITSELF, with one bounded read-only `get` bound to this exact
-                   node name, and never from the node-agent's published identity
-                   file. That file records the CURRENT boot id even when a
-                   PREVIOUS Kubernetes Node object wrote it, so no reader can
-                   tell a stale publication from a live one — and the two
-                   DaemonSets have no startup ordering between them, so the
-                   replacement node-agent may not have retracted it yet. The
-                   downward API cannot supply the UID, only the node name, which
-                   is exactly the binding this lookup needs. */}}
-            {{- if not $hasExplicitNodeUid }}
-            - name: FERRUM_K8S_NODE_NAME
-              valueFrom:
-                fieldRef:
-                  fieldPath: spec.nodeName
-            {{- end }}
-            {{- if not (hasKey $ambientEnv "FERRUM_MESH_CAPTURE_UDP_NODE_PROOF_GENERATION") }}
-            - name: FERRUM_MESH_CAPTURE_UDP_NODE_PROOF_GENERATION
-              value: {{ $ambientUdpNodeProofGeneration | quote }}
-            {{- end }}
-            {{- range $name, $value := $ambientEnv }}
-            - name: {{ $name }}
-              value: {{ $value | quote }}
-            {{- end }}
-          volumeMounts:
-            - name: cgroup
-              mountPath: {{ .Values.nodeAgent.cgroupRoot }}
-              readOnly: true
-            - name: node-waypoint-pod-registry
-              mountPath: {{ $nodeWaypointRegistryMountPath }}
-      {{- end }}
       containers:
         - name: ferrum-edge
           image: {{ $ambientImage | quote }}
