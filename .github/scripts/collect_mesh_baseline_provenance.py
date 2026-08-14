@@ -187,7 +187,9 @@ def main() -> int:
             "non_default_settings_note": (
                 "Suites use each harness run.sh defaults plus the documented "
                 "baseline row parameters. Mesh DNS sets explicit FERRUM_MESH_DNS_* "
-                "env vars inside tests/performance/mesh-dns-e2e/run.sh."
+                "env vars inside tests/performance/mesh-dns-e2e/run.sh and "
+                "benchmark-only FERRUM_MESH_ALLOW_NO_CA=true in start_gateway() "
+                "(no gateway SVID/CA; production mesh must provide identity)."
             ),
         },
         "dependency_harness_versions": {

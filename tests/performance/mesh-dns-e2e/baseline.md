@@ -17,7 +17,7 @@ self-relative trends; do not promote opportunistic laptop numbers into CI floors
 | CPU / RAM / OS / kernel / arch | _TBD_ (see `provenance.json`) |
 | Rust / harness versions | from artifact provenance |
 | Build profile / features | `--release`, default features |
-| Non-default settings | `run.sh` mesh-mode DNS env (`FERRUM_MESH_DNS_*`, stub CP/upstream) |
+| Non-default settings | `run.sh` mesh-mode DNS env (`FERRUM_MESH_DNS_*`, stub CP/upstream); benchmark-only `FERRUM_MESH_ALLOW_NO_CA=true` in `start_gateway()` (no gateway SVID/CA — production mesh must provide identity) |
 | Warmup / repetitions | listener ready then loadgen; **≥3 clean repetitions** |
 | Command | `./run.sh --skip-build --json --duration 60 --concurrency 100 --protocol both` |
 | Raw artifacts | `mesh-performance-baselines-<sha>` → `dns/run_*.txt` + `summary.json` |

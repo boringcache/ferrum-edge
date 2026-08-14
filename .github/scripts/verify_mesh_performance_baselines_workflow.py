@@ -703,6 +703,11 @@ def check_scripts(failures: list[str]) -> None:
     dns_run = (REPO_ROOT / "tests" / "performance" / "mesh-dns-e2e" / "run.sh").read_text(encoding="utf-8")
     require("MESH_BASELINE_DIAG_DIR" in hbone_run, "HBONE harness must honour MESH_BASELINE_DIAG_DIR", failures)
     require("MESH_BASELINE_DIAG_DIR" in dns_run, "DNS harness must honour MESH_BASELINE_DIAG_DIR", failures)
+    require(
+        "FERRUM_MESH_ALLOW_NO_CA=true" in dns_run,
+        "DNS harness start_gateway() must set benchmark-only FERRUM_MESH_ALLOW_NO_CA=true",
+        failures,
+    )
     require("archive_failure_diagnostics" in hbone_run, "HBONE harness must copy logs before deleting runtime", failures)
     require("archive_failure_diagnostics" in dns_run, "DNS harness must copy logs into the artifact destination", failures)
     require("certs" in hbone_run and "Never copy certs" in hbone_run, "HBONE diagnostics must not archive certs", failures)
@@ -815,6 +820,11 @@ def check_docs_and_baselines(failures: list[str]) -> None:
     require(
         "nxdomain" in dns_text.lower(),
         "DNS baseline.md must document NXDOMAIN fail-closed publication",
+        failures,
+    )
+    require(
+        "FERRUM_MESH_ALLOW_NO_CA=true" in dns_text,
+        "DNS baseline.md must document benchmark-only FERRUM_MESH_ALLOW_NO_CA=true",
         failures,
     )
 
