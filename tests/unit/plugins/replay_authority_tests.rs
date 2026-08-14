@@ -1160,14 +1160,28 @@ async fn shared_health_guard_async() -> tokio::sync::MutexGuard<'static, ()> {
     SHARED_HEALTH_LOCK.lock().await
 }
 
-async fn wait_until(mut pred: impl FnMut() -> bool, what: &str) {
-    for _ in 0..500 {
+/// Default poll budget for state-driven waits in this module.
+const DEFAULT_WAIT_BUDGET: Duration = Duration::from_secs(5);
+/// Test-only budget for observing background classification logs under coverage load.
+const CLASSIFICATION_LOG_WAIT_BUDGET: Duration = Duration::from_secs(15);
+
+async fn wait_until_with_budget(
+    budget: Duration,
+    mut pred: impl FnMut() -> bool,
+    what: &str,
+) {
+    let polls = (budget.as_millis() / 10).max(1) as usize;
+    for _ in 0..polls {
         if pred() {
             return;
         }
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
     panic!("timed out waiting until {what}");
+}
+
+async fn wait_until(mut pred: impl FnMut() -> bool, what: &str) {
+    wait_until_with_budget(DEFAULT_WAIT_BUDGET, pred, what).await;
 }
 
 async fn wait_until_available(client: &RedisRateLimitClient) {
@@ -2459,6 +2473,10 @@ async fn a_silent_recovery_ping_times_out_and_does_not_wedge_retry() {
 
 /// A silent recovery PING publishes only the closed-set timeout class, never
 /// Redis error text, the key prefix, or other replay material.
+///
+/// Production PING timeout stays at 1s; log observation uses
+/// [`CLASSIFICATION_LOG_WAIT_BUDGET`] because the background classification can
+/// lag the default module wait under instrumented coverage load.
 #[tokio::test(flavor = "current_thread")]
 async fn a_silent_recovery_ping_logs_only_the_timeout_classification() {
     use std::sync::atomic::Ordering;
@@ -2474,7 +2492,8 @@ async fn a_silent_recovery_ping_logs_only_the_timeout_classification() {
         "recovery PING dispatched",
     )
     .await;
-    wait_until(
+    wait_until_with_budget(
+        CLASSIFICATION_LOG_WAIT_BUDGET,
         || logs.contents().contains("connection_timeout"),
         "PING timeout classification logged",
     )
