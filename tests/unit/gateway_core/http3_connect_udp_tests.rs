@@ -1727,11 +1727,8 @@ fn a_flow_control_stalled_client_cannot_relabel_its_own_expiry_as_a_gateway_faul
         StreamAuthTermination::AuthenticatedStreamMaxLifetime,
     ] {
         let supervisor = SessionEnd::AuthorizationExpired(termination);
-        let reported = reconcile_authorization_teardown(
-            supervisor,
-            SendHalfTeardownJoin::Cancelled,
-            true,
-        );
+        let reported =
+            reconcile_authorization_teardown(supervisor, SendHalfTeardownJoin::Cancelled, true);
         assert_eq!(reported, supervisor);
         assert_eq!(
             reported.close_kind(),
@@ -1752,11 +1749,8 @@ fn a_send_half_panic_after_an_authorization_verdict_stays_a_relay_failure() {
         StreamAuthTermination::AuthenticatedStreamMaxLifetime,
     ] {
         let supervisor = SessionEnd::AuthorizationExpired(termination);
-        let reported = reconcile_authorization_teardown(
-            supervisor,
-            SendHalfTeardownJoin::Panicked,
-            true,
-        );
+        let reported =
+            reconcile_authorization_teardown(supervisor, SendHalfTeardownJoin::Panicked, true);
         assert_eq!(
             reported,
             SessionEnd::RelayTaskFailed,
@@ -1773,13 +1767,9 @@ fn an_unrelated_send_half_cancellation_after_an_authorization_verdict_stays_a_re
     // Cancellation without CLOSE_GRACE timeout is not this session's designed
     // abort of a flow-control-stalled send half. It stays RelayTaskFailed even
     // when the supervisor had already selected AuthorizationExpired.
-    let supervisor =
-        SessionEnd::AuthorizationExpired(StreamAuthTermination::CredentialExpired);
-    let reported = reconcile_authorization_teardown(
-        supervisor,
-        SendHalfTeardownJoin::Cancelled,
-        false,
-    );
+    let supervisor = SessionEnd::AuthorizationExpired(StreamAuthTermination::CredentialExpired);
+    let reported =
+        reconcile_authorization_teardown(supervisor, SendHalfTeardownJoin::Cancelled, false);
     assert_eq!(reported, SessionEnd::RelayTaskFailed);
     assert_eq!(reported.close_kind(), StreamCloseKind::InternalError);
 }
@@ -1800,11 +1790,7 @@ fn only_an_authorization_expiry_survives_an_unapplied_send_half_close() {
         SessionEnd::TargetSocketUnusable,
     ] {
         assert_eq!(
-            reconcile_authorization_teardown(
-                supervisor,
-                SendHalfTeardownJoin::Cancelled,
-                true,
-            ),
+            reconcile_authorization_teardown(supervisor, SendHalfTeardownJoin::Cancelled, true),
             SessionEnd::RelayTaskFailed,
             "{} must not survive a close the client never saw",
             supervisor.as_str()

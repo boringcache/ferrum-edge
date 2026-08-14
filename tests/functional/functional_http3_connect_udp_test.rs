@@ -1701,12 +1701,9 @@ async fn functional_h3_connect_udp_expiry_before_200_is_a_fixed_redacted_401() {
     let authorization = format!("Bearer {token}");
 
     for attempt in 1..=3 {
-        let mut refused = connect_udp_until_headers(
-            &client,
-            &url,
-            &[("authorization", authorization.as_str())],
-        )
-        .await;
+        let mut refused =
+            connect_udp_until_headers(&client, &url, &[("authorization", authorization.as_str())])
+                .await;
         assert_eq!(
             refused.status.as_u16(),
             401,
@@ -1732,8 +1729,7 @@ async fn functional_h3_connect_udp_expiry_before_200_is_a_fixed_redacted_401() {
 
     let deadline = std::time::Instant::now() + AUTH_TERMINATION_GRACE;
     let observed = loop {
-        let value =
-            stream_udp_terminations(&gateway, "authenticated_stream_max_lifetime").await;
+        let value = stream_udp_terminations(&gateway, "authenticated_stream_max_lifetime").await;
         if value >= 3 || std::time::Instant::now() >= deadline {
             break value;
         }

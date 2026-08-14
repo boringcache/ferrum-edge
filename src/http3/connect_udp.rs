@@ -1341,9 +1341,9 @@ impl SessionEnd {
             // authorized, so the client must be able to tell it apart from a
             // tunnel that ran to completion. A clean FIN here would present a
             // successfully completed capsule stream (issue #3860).
-            Self::TargetSocketUnusable
-            | Self::RelayTaskFailed
-            | Self::AuthorizationExpired(_) => StreamCloseKind::InternalError,
+            Self::TargetSocketUnusable | Self::RelayTaskFailed | Self::AuthorizationExpired(_) => {
+                StreamCloseKind::InternalError
+            }
             Self::ClientClosed
             | Self::Idle
             | Self::Draining
