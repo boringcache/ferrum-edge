@@ -1546,9 +1546,7 @@ impl ResolvesClientCert for HintHonoringClientCert {
     ) -> Option<std::sync::Arc<CertifiedKey>> {
         if root_hint_subjects.is_empty()
             || self.issuer_subjects.iter().any(|subject| {
-                root_hint_subjects
-                    .iter()
-                    .any(|hint| *hint == subject.as_slice())
+                root_hint_subjects.contains(&subject.as_slice())
             })
         {
             Some(self.key.clone())
@@ -1649,6 +1647,7 @@ async fn handshake_presented_leaf(
 /// CA-name list: a client that honors those hints still presents a certificate
 /// issued by the newly added CA.
 #[tokio::test]
+#[allow(clippy::await_holding_lock)] // `isolated_registry()` must span awaits to serialize process-global registry state
 async fn dp_h12_tcp_adopts_additive_operator_verifier_while_retaining_cp_server_cert() {
     let _guard = isolated_registry();
     let dir = tempfile::tempdir().expect("tempdir");
@@ -1855,6 +1854,7 @@ async fn dp_h12_tcp_adopts_additive_operator_verifier_while_retaining_cp_server_
 /// slot keeps the last-good CP config and the live wrapper keeps admitting the
 /// last accepted overlap verifier.
 #[tokio::test]
+#[allow(clippy::await_holding_lock)] // `isolated_registry()` must span awaits to serialize process-global registry state
 async fn dp_refused_operator_candidate_retains_cp_config_and_last_good_verifier() {
     let _guard = isolated_registry();
     let dir = tempfile::tempdir().expect("tempdir");
