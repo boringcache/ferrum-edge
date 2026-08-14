@@ -297,8 +297,7 @@ where
             .env_remove("FERRUM_METRICS_ALLOWED_CIDRS");
         let mut child = cmd.spawn().expect("Failed to start gateway");
 
-        match wait_for_owned_gateway(&mut child, admin_port, &observability_token).await
-        {
+        match wait_for_owned_gateway(&mut child, admin_port, &observability_token).await {
             Ok(()) => return (child, proxy_listen_port, http_port, admin_port, dir),
             Err(error) => {
                 eprintln!(
