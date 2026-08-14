@@ -223,17 +223,22 @@ ambient:
   outboundPort: 15001
   hbonePort: 15008
   captureMode: iptables
-  # Privileged one-shot preflight init stage for the SETTLED host-netns UDP
-  # placement (issue #3809). The installed placement ConfigMap is release
-  # desired state and records no node identity, node incarnation, or per-node
-  # cleanup result, so it cannot prove that a recordless node is fresh/rebooted
-  # rather than a pre-contract node whose running workloads still redirect UDP
-  # to a retired listener. The preflight retires BOTH predecessor placements
-  # (IPv4 and IPv6, host netns and every enrolled pod netns) by exact
-  # Ferrum-owned name, then publishes an attestation bound to this node's
-  # Kubernetes UID, current boot id, target, and node-proof generation.
-  # The chart isolates this work in a dedicated preflight DaemonSet. Its
-  # pod-scoped hostPID and SYS_ADMIN/SYS_PTRACE capabilities never reach the
+  # Privileged one-shot preflight for the SETTLED host-netns UDP placement
+  # (issue #3809). The installed placement ConfigMap is release desired state
+  # and records no node identity, node incarnation, or per-node cleanup result,
+  # so it cannot prove that a recordless node is fresh/rebooted rather than a
+  # pre-contract node whose running workloads still redirect UDP to a retired
+  # listener. The preflight retires BOTH predecessor placements (IPv4 and IPv6,
+  # host netns and every enrolled pod netns) by exact Ferrum-owned name, then
+  # publishes an attestation bound to this node's Kubernetes UID, current boot
+  # id, target, and node-proof generation.
+  # The chart isolates this work in a dedicated preflight DaemonSet. Kubernetes
+  # DaemonSet pods require restartPolicy: Always, so the privileged
+  # `ferrum-edge ambient-udp-preflight` command runs as an init container
+  # (failure retries fail-closed; success runs once per preflight pod/template
+  # generation). An inert unprivileged holder then keeps the DaemonSet pod
+  # satisfied without the preflight capabilities, mounts, proof env, or a
+  # privileged shell. Pod-scoped hostPID and SYS_ADMIN/SYS_PTRACE capabilities never reach the
   # steady-state producer, which keeps its narrow NET_ADMIN/NET_RAW pair.
   # Clusters that refuse hostPID or those preflight capabilities cannot use
   # this default unchanged.

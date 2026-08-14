@@ -122,28 +122,101 @@ fn a_settled_host_placement_isolates_the_privileged_node_preflight() {
     let (preflight, steady_state) = ambient
         .split_once("---\n{{- end }}\napiVersion: apps/v1")
         .expect("isolated preflight and steady-state DaemonSet documents");
+    let ds_start = preflight
+        .find("kind: DaemonSet")
+        .expect("preflight DaemonSet kind");
+    let preflight_ds = &preflight[ds_start..];
+    let init_start = preflight_ds
+        .find("initContainers:")
+        .expect("privileged command must be an init container");
+    let regular_start = preflight_ds
+        .find("\n      containers:")
+        .expect("DaemonSet still needs a regular container");
+    let volumes_start = preflight_ds
+        .find("\n      volumes:")
+        .expect("preflight mounts stay on the init container");
+    assert!(
+        init_start < regular_start && regular_start < volumes_start,
+        "init must run before the holder; mounts belong to the init container"
+    );
+    let init = &preflight_ds[init_start..regular_start];
+    let holder = &preflight_ds[regular_start..volumes_start];
+
     assert!(
         preflight.contains("name: ferrum-mesh-udp-node-preflight")
-            && preflight.contains("name: ferrum-udp-node-preflight")
-            && preflight.contains("args: [\"ambient-udp-preflight\", \"-v\"]"),
-        "the dedicated DaemonSet must run the node preflight"
+            && init.contains("name: ferrum-udp-node-preflight")
+            && init.contains("args: [\"ambient-udp-preflight\", \"-v\"]"),
+        "the dedicated DaemonSet must run the node preflight as an init container"
     );
     assert!(
-        preflight.contains("hostPID: true")
-            && preflight.contains("allowPrivilegeEscalation: false")
-            && preflight.contains("drop:\n                - ALL"),
+        !init.contains("restartPolicy:"),
+        "the init container must not be a native sidecar (container-level restartPolicy: Always would keep the privileged process running)"
+    );
+    assert!(
+        !holder.contains("ferrum-udp-node-preflight\n")
+            && !holder.contains("ambient-udp-preflight"),
+        "the ordinary container must not re-run the privileged one-shot command"
+    );
+    assert!(
+        preflight_ds.contains("automountServiceAccountToken: false"),
+        "the inert holder must not inherit a service-account token by default"
+    );
+    assert!(
+        init.contains("name: kube-api-access")
+            && init.contains("mountPath: /var/run/secrets/kubernetes.io/serviceaccount")
+            && preflight_ds.contains("serviceAccountToken:")
+            && !holder.contains("kube-api-access")
+            && !holder.contains("serviceaccount"),
+        "the Node GET token must mount only on the init container"
+    );
+    assert!(
+        !init.contains("hostPID: true")
+            && preflight_ds.contains("hostPID: true")
+            && init.contains("allowPrivilegeEscalation: false")
+            && init.contains("drop:\n                - ALL"),
         "the isolated preflight pod must declare its complete privilege surface"
+    );
+    let exact_caps = "\
+              add:
+                - NET_ADMIN
+                - NET_RAW
+                - SYS_ADMIN
+                - SYS_PTRACE";
+    assert!(
+        init.contains(exact_caps) && init.matches("add:").count() == 1,
+        "the init container's capability list must be exactly NET_ADMIN, NET_RAW, SYS_ADMIN, SYS_PTRACE"
     );
     for privilege in ["NET_ADMIN", "NET_RAW", "SYS_ADMIN", "SYS_PTRACE"] {
         assert!(
-            preflight.contains(privilege),
+            init.contains(privilege),
             "the preflight needs {privilege} to retire predecessor rules"
+        );
+        assert!(
+            !holder.contains(privilege),
+            "the inert holder must not receive {privilege}"
         );
     }
     assert!(
-        preflight.contains("name: node-waypoint-pod-registry")
-            && preflight.contains("name: cgroup"),
-        "the preflight must mount the pod registry and host cgroup"
+        init.contains("name: node-waypoint-pod-registry")
+            && init.contains("name: cgroup")
+            && !holder.contains("volumeMounts:")
+            && !holder.contains("FERRUM_"),
+        "the preflight must mount the pod registry and host cgroup; the holder must not"
+    );
+
+    assert!(
+        holder.contains("name: ferrum-udp-node-preflight-holder")
+            && holder.contains("- /bin/sleep")
+            && holder.contains("- infinity")
+            && holder.contains("runAsNonRoot: true")
+            && holder.contains("runAsUser: 65534")
+            && holder.contains("allowPrivilegeEscalation: false")
+            && holder.contains("readOnlyRootFilesystem: true")
+            && holder.contains("drop:\n                - ALL")
+            && !holder.contains("add:")
+            && !holder.contains("ports:")
+            && !holder.contains("/bin/sh"),
+        "the holder must be an inert unprivileged sleeper, not a privileged shell"
     );
 
     assert!(
@@ -152,7 +225,9 @@ fn a_settled_host_placement_isolates_the_privileged_node_preflight() {
     );
     assert!(
         !steady_state.contains("$ambientUdpRunNodePreflight")
-            && !steady_state.contains("name: ferrum-udp-node-preflight"),
+            && !steady_state.contains("name: ferrum-udp-node-preflight")
+            && !steady_state.contains("ambient-udp-preflight")
+            && !steady_state.contains("initContainers:"),
         "the preflight must not widen or share the steady-state proxy pod"
     );
 }

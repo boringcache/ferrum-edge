@@ -4317,9 +4317,11 @@ independent of that pipeline gate.
    When the predecessor is `pod-netns` (or the conservative
    `disabled` case), the cleanup pod retains `hostPID`, `SYS_ADMIN`,
    `SYS_PTRACE`, and `NET_ADMIN`. Stable/final host placement drops
-   `SYS_ADMIN`/`SYS_PTRACE` from the steady-state container; with the default
-   preflight it still renders pod-wide `hostPID` because Kubernetes applies
-   that field to every container in the same pod.
+   `SYS_ADMIN`/`SYS_PTRACE` and `hostPID` from the steady-state proxy pod. The
+   default preflight keeps those privileges in a dedicated DaemonSet:
+   `hostPID` is pod-scoped there (the inert holder can see host PIDs, without
+   the four preflight capabilities), and `SYS_ADMIN`/`SYS_PTRACE` stay on that
+   DaemonSet's init container only.
 2. Wait for every node's authenticated `/health` detail
    `mesh.udp_placement_migration.phase` to become `cleanup_complete` (the HTTP
    status remains 503 because readiness is intentionally false), or for
@@ -4491,8 +4493,23 @@ operator-supplied value.
 
 The chart renders a dedicated `ferrum-mesh-udp-node-preflight` **DaemonSet**
 for every settled `host-netns` Ambient deployment
-(`ambient.udpNodePreflight.enabled`, default `true`). It runs `ferrum-edge ambient-udp-preflight` from the same
-`-ebpf-tools` image and is the only producer of `node_cleanup` proof:
+(`ambient.udpNodePreflight.enabled`, default `true`). Kubernetes DaemonSet pods
+require `restartPolicy: Always`, so the privileged
+`ferrum-edge ambient-udp-preflight` command is an **init container** in that
+isolated pod — not the ordinary container, and not an init container on the
+steady-state proxy. It uses the same `-ebpf-tools` image and is the only
+producer of `node_cleanup` proof. A non-zero init exit keeps the preflight pod
+non-running and is retried fail-closed; success runs once per preflight
+pod/template generation. An inert unprivileged holder (`/bin/sleep infinity`,
+all capabilities dropped, no preflight mounts or proof env) then keeps the
+DaemonSet pod satisfied without re-executing elevated cleanup or retaining a
+privileged shell. A generation, image, or config change rolls the DaemonSet
+and re-runs the init proof. The unprivileged Ambient proxy is a **separate**
+pod: it never contains this command, never inherits the preflight's `hostPID`
+or setns capabilities, and independently fails closed until the published
+node-bound proof appears.
+
+The init container:
 
 1. It resolves this node's identity **authoritatively**, from this node's own
    Kubernetes object, and never from the node-agent's published
@@ -4542,7 +4559,7 @@ for every settled `host-netns` Ambient deployment
 
 It exits non-zero without publishing anything on any failure or on its
 `--timeout-seconds` budget (default 300), so the unprivileged steady-state
-container remains fail-closed on a node whose retirement could not be proven.
+proxy remains fail-closed on a node whose retirement could not be proven.
 That
 budget is a wall-clock ceiling: the preflight owns every `sh`/iptables/ip child
 it starts, waits with `try_wait`, collects stderr under the same ceiling, and
@@ -4555,9 +4572,11 @@ record no reader will treat as attestation) before the deadline outcome is
 returned, so a timeout cannot leave a usable cleanup attestation behind. A
 stalled cleanup command cannot pin the current-thread runtime or leave an orphan
 mutating network state after timeout. The dedicated preflight DaemonSet alone
-uses pod-scoped `hostPID`, `SYS_ADMIN`, and `SYS_PTRACE`; the steady-state proxy
-pod keeps its narrow `NET_ADMIN`/`NET_RAW` posture and no host PID visibility.
-The elevated preflight container is also narrower than the pod default rather
+uses pod-scoped `hostPID` (so the inert holder can see host PIDs, without the
+preflight capabilities) plus `SYS_ADMIN` and `SYS_PTRACE` on the init
+container; the steady-state proxy pod keeps its narrow `NET_ADMIN`/`NET_RAW`
+posture and no host PID visibility.
+The elevated preflight init container is also narrower than the pod default rather
 than merely additive: it sets
 `allowPrivilegeEscalation: false` and drops `ALL` capabilities before adding
 back exactly `NET_ADMIN`, `NET_RAW`, `SYS_ADMIN`, and `SYS_PTRACE`, so those
@@ -4619,22 +4638,25 @@ enrollment-retry cadence so a recovered API/RBAC grant can publish identity
 later, and so a Node object recreated under the same name cannot keep the old
 UID in memory or on disk.
 
-That is a publisher-side mitigation, and the two DaemonSets have no startup
-ordering between them, so it cannot by itself close the window in which the
-replacement node-agent has not started yet. The **privileged preflight therefore
-does not consume that publication at all**: it performs its own bounded,
-node-name-bound `get` from in-cluster config only (step 1 above) and republishes what it proved, immediately
-before the steady-state container starts in the same pod. Because deleting a Node
-object also deletes the pods bound to it, the ambient pod that runs the producer
-always carries a fresh init stage, so the identity its steady-state container
-reads was established by that same pod. The registry-synchronization marker is
-bound to the node UID the node-agent resolved for the *same* reason, so the
+That is a publisher-side mitigation, and the preflight, proxy, and node-agent
+DaemonSets have no Kubernetes startup ordering between them, so it cannot by
+itself close the window in which the replacement node-agent has not started yet.
+The **privileged preflight therefore does not consume that publication at all**:
+it performs its own bounded, node-name-bound `get` from in-cluster config only
+(step 1 above) and republishes what it proved onto the shared registry hostPath.
+The steady-state proxy is a separate pod and independently fails closed until
+that node-bound proof appears; there is no same-pod init-then-container
+ordering. Because deleting a Node object also deletes the pods bound to it, a
+replacement node starts a new preflight pod whose init container republishes
+identity before any later proxy start can treat leftover files as proof. The
+registry-synchronization marker is bound to the node UID the node-agent resolved
+for the *same* reason, so the
 preflight requires two independent authorities to agree before it retires
 anything: a stale identity and the stale cleanup proof written under it can never
 be self-consistent enough to authorize node-name reuse.
 
 Disabling the preflight (`ambient.udpNodePreflight.enabled=false`) gives up that
-per-pod republication. It does not relax the runtime boundary — a node with no
+preflight republication. It does not relax the runtime boundary — a node with no
 durable record and no attestation still refuses — but on such a cluster you
 should clear `.udp-node-cleanup-proof-v1.json` from the registry directory when
 you turn the preflight off, and drive adoption through the explicit
@@ -4693,7 +4715,8 @@ demonstration all remain in the live module.
 node-local files, so a GitOps/client-render pipeline enforces exactly the same
 contract: a bare `FERRUM_MESH_CAPTURE_UDP_PLACEMENT_ESTABLISHED=<target>` value
 authorizes nothing on its own. Such a pipeline must render the equivalent
-privileged preflight init stage (or supply node-bound exemptions) and must carry
+privileged preflight init container in a dedicated DaemonSet (or supply
+node-bound exemptions) and must carry
 an era-qualified `FERRUM_MESH_CAPTURE_UDP_NODE_PROOF_GENERATION` on the ambient
 pod, the preflight, and the node-agent. The chart injects `FERRUM_K8S_NODE_NAME`
 from `spec.nodeName` on the preflight when it is enabled (a literal

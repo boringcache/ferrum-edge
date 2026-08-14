@@ -263,8 +263,10 @@ pub fn retract_node_identity(registry_dir: &Path) -> Result<(), String> {
 /// published by an earlier run — under a previous Kubernetes Node object, an
 /// earlier era, or an interrupted pass — cannot survive alongside a retirement
 /// this run has not yet completed. Combined with the preflight's own
-/// authoritative node-UID lookup, that means the proof a steady-state container
-/// reads is always the one its OWN pod's init stage published.
+/// authoritative node-UID lookup, that means the proof a steady-state
+/// container reads from the shared registry hostPath is the one the dedicated
+/// preflight DaemonSet's init container published — never a leftover from a
+/// previous Node object or an earlier era.
 pub fn retract_node_cleanup_proof(registry_dir: &Path) -> Result<(), String> {
     retract_registry_file(registry_dir, NODE_PROOF_FILE, "node cleanup proof")
 }
@@ -379,8 +381,9 @@ fn retract_registry_file(registry_dir: &Path, file: &str, description: &str) -> 
 ///
 /// Every unsuccessful path therefore leaves NO published identity, which the
 /// placement guard treats as a fail-closed refusal, and the successful path
-/// leaves an identity this run proved against the API server immediately before
-/// the steady-state container starts.
+/// leaves an identity this run proved against the API server. The separate
+/// steady-state proxy pod reads that publication from the shared registry
+/// hostPath and fail-closes until it exists.
 pub async fn resolve_authoritative_node_identity<F, Fut>(
     registry_dir: &Path,
     explicit_node_uid: Option<&str>,

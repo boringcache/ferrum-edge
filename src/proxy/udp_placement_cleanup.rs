@@ -70,7 +70,7 @@ impl HostUdpCleanupReaper for ProductionHostUdpCleanupReaper {
 /// Run predecessor retirement until it is provably complete.
 ///
 /// `deadline` bounds only the *caller*: the one-shot preflight needs to fail
-/// the init container rather than block pod creation forever, while the mesh
+/// the init container rather than hang the dedicated preflight pod forever, while the mesh
 /// data-plane cleanup phase deliberately retries indefinitely (its readiness
 /// stays false and an operator drives the rollout). The deadline is converted
 /// to a wall-clock instant and threaded into every synchronous `sh`/iptables/ip

@@ -38,13 +38,18 @@ pub enum Command {
     /// Retire Ambient UDP predecessor placements on this node and publish the
     /// node-scoped cleanup proof the steady-state host producer requires.
     ///
-    /// Runs as a privileged init stage beside the Ambient DaemonSet's
-    /// unprivileged steady-state container (issue #3809): a node with no
-    /// durable placement record cannot tell a fresh/rebooted node from a
-    /// pre-contract node whose running workloads still redirect UDP to a
-    /// retired listener, so it proves the distinction by doing the retirement
-    /// rather than by trusting release-level desired state. Exits non-zero
-    /// without publishing anything when it cannot prove completion.
+    /// Runs as a privileged init container in the dedicated
+    /// `ferrum-mesh-udp-node-preflight` DaemonSet (issue #3809). Kubernetes
+    /// DaemonSet pods require `restartPolicy: Always`, so this one-shot command
+    /// cannot be the ordinary container. The unprivileged Ambient proxy is a
+    /// separate pod that fail-closes until the published node-scoped proof
+    /// exists; it never shares this process's `hostPID` or setns capabilities.
+    /// A node with no durable placement record cannot tell a fresh/rebooted
+    /// node from a pre-contract node whose running workloads still redirect UDP
+    /// to a retired listener, so this command proves the distinction by doing
+    /// the retirement rather than by trusting release-level desired state.
+    /// Exits non-zero without publishing anything when it cannot prove
+    /// completion.
     AmbientUdpPreflight(AmbientUdpPreflightArgs),
 }
 
@@ -455,7 +460,8 @@ pub struct AmbientUdpPreflightArgs {
     pub settings: Option<PathBuf>,
 
     /// Maximum seconds to spend proving predecessor retirement before failing
-    /// closed. The init stage must fail rather than block pod creation forever.
+    /// closed. The init container must fail rather than block the preflight
+    /// DaemonSet pod forever; kubelet retries a non-zero exit fail-closed.
     #[arg(long = "timeout-seconds", default_value_t = 300)]
     pub timeout_seconds: u64,
 

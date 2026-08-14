@@ -198,16 +198,24 @@ current boot id. The steady-state **capability** posture is unchanged — the
 narrowed host-placement `NET_ADMIN`/`NET_RAW` set still applies to the running
 container, which does not receive `SYS_ADMIN`/`SYS_PTRACE` — but a settled
 host-netns deployment now also renders a dedicated
-`ferrum-mesh-udp-node-preflight` DaemonSet. Its pod alone holds `hostPID`,
-`SYS_ADMIN`, and `SYS_PTRACE` long enough to retire both predecessor placements
-ownership-safely and publish that proof. That stage sets
+`ferrum-mesh-udp-node-preflight` DaemonSet. Kubernetes DaemonSet pods require
+`restartPolicy: Always`, so the privileged command is an init container in that
+isolated pod — not the ordinary container, and not an init container on the
+proxy. That pod holds `hostPID`; the init container alone adds `SYS_ADMIN` and
+`SYS_PTRACE` long enough to retire both predecessor placements ownership-safely
+and publish that proof; an inert unprivileged holder then keeps the DaemonSet
+pod satisfied without those capabilities, preflight mounts, or proof env.
+`hostPID` is still pod-scoped, so the holder can see host PIDs, but it drops
+`ALL` capabilities, forbids privilege escalation, and runs as non-root. That
+init stage sets
 `allowPrivilegeEscalation: false` and drops `ALL`
 capabilities before adding back exactly `NET_ADMIN`, `NET_RAW`, `SYS_ADMIN`, and
 `SYS_PTRACE`, so its declared four are its complete privilege surface rather
 than an addition on top of whatever the runtime's ambient/default set carries.
-The setns capabilities are bounded to a separate one-shot process that cannot
-serve traffic. The steady-state proxy independently fails closed until the
-node-bound proof appears. This preflight is **not** usable unchanged on a
+The setns capabilities are bounded to that one-shot init process, which cannot
+serve traffic and does not restart after success. The steady-state proxy
+independently fails closed until the node-bound proof appears. This preflight is
+**not** usable unchanged on a
 cluster that refuses `hostPID` or those capabilities; set
 `ambient.udpNodePreflight.enabled=false` and adopt nodes with explicit
 node-bound exemption markers instead.
