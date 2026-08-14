@@ -1842,6 +1842,7 @@ fn stale_reachable_registration_sample_cannot_overwrite_terminal_topology() {
 /// the replay claim or the topology screen.
 const SET_CMD: &[u8] = b"$3\r\nSET\r\n";
 const INFO_CMD: &[u8] = b"$4\r\nINFO\r\n";
+const PING_CMD: &[u8] = b"$4\r\nPING\r\n";
 const INFO_MEMORY_ARG: &[u8] = b"$6\r\nMEMORY\r\n";
 const CLUSTER_DISABLED_INFO: &str = "# Cluster\r\ncluster_enabled:0\r\n";
 const SAFE_MEMORY_INFO: &str = "# Memory\r\nmaxmemory:0\r\nmaxmemory_policy:noeviction\r\n";
@@ -1957,6 +1958,71 @@ async fn spawn_claim_redis_server(
     });
 
     (port, shutdown_tx)
+}
+
+/// Handshake succeeds; the first `silent_pings` PING commands are accepted
+/// and then never answered. Later PINGs return `PONG` and INFO screens are
+/// usable, so a timeout must not permanently prevent recovery.
+async fn spawn_ping_silent_then_healthy_redis(
+    silent_pings: usize,
+) -> (
+    u16,
+    Arc<std::sync::atomic::AtomicUsize>,
+    tokio::sync::oneshot::Sender<()>,
+) {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind fake redis");
+    let port = listener.local_addr().expect("local addr").port();
+    let (shutdown_tx, mut shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+    let pings = Arc::new(AtomicUsize::new(0));
+    let pings_task = Arc::clone(&pings);
+
+    tokio::spawn(async move {
+        loop {
+            tokio::select! {
+                _ = &mut shutdown_rx => break,
+                accepted = listener.accept() => {
+                    let Ok((mut stream, _)) = accepted else { break };
+                    let pings = Arc::clone(&pings_task);
+                    tokio::spawn(async move {
+                        let mut buf = vec![0u8; 16 * 1024];
+                        loop {
+                            let read = match stream.read(&mut buf).await {
+                                Ok(0) | Err(_) => break,
+                                Ok(read) => read,
+                            };
+                            let chunk = &buf[..read];
+                            if resp_contains(chunk, PING_CMD) {
+                                let index = pings.fetch_add(1, Ordering::SeqCst);
+                                if index < silent_pings {
+                                    // Accepted, authenticated, silent PING.
+                                    continue;
+                                }
+                                if stream.write_all(b"+PONG\r\n").await.is_err() {
+                                    break;
+                                }
+                                continue;
+                            }
+                            let reply: Vec<u8> = if let Some(reply) = replay_info_reply(chunk) {
+                                reply
+                            } else {
+                                b"+OK\r\n".repeat(resp_command_count(chunk))
+                            };
+                            if stream.write_all(&reply).await.is_err() {
+                                break;
+                            }
+                        }
+                    });
+                }
+            }
+        }
+    });
+
+    (port, pings, shutdown_tx)
 }
 
 /// Handshake and PING succeed; `INFO CLUSTER` is accepted and then never
@@ -2086,6 +2152,111 @@ async fn a_ping_alone_does_not_publish_replay_readiness() {
     drop(client);
     let _ = shutdown.send(());
     assert_eq!(shared_health_snapshot(), baseline);
+}
+
+/// A backend that accepts/authenticates and then never answers PING must not
+/// publish reachable, and the timeout must not wedge the single-flight
+/// checker: a later healthy PING still recovers packed readiness.
+#[tokio::test]
+async fn a_silent_recovery_ping_times_out_and_does_not_wedge_retry() {
+    use std::sync::atomic::Ordering;
+
+    let _serialized = shared_health_guard_async().await;
+    let baseline = shared_health_snapshot();
+    let (port, pings, shutdown) = spawn_ping_silent_then_healthy_redis(1).await;
+    let client =
+        claim_client_with_interval(port, "ferrum:replay_authority_tests:ping-timeout", 1);
+    let authority = ReplayAuthority::shared(Arc::clone(&client), RETENTION);
+    assert!(!client.is_available());
+    assert_eq!(
+        shared_health_snapshot().shared_authorities_unavailable,
+        baseline.shared_authorities_unavailable + 1,
+        "unproven registration must fail closed"
+    );
+    assert!(client.health_checker_started_for_test());
+
+    wait_until(
+        || pings.load(Ordering::SeqCst) >= 1,
+        "recovery PING dispatched",
+    )
+    .await;
+    let after_ping = std::time::Instant::now();
+    // Unanswered PING is not recovery. Stay fail-closed through most of the
+    // admitted connect timeout (1s) so a hang would miss the later retry.
+    while after_ping.elapsed() < Duration::from_millis(800) {
+        assert!(
+            !client.is_available(),
+            "an unanswered recovery PING must not publish reachable"
+        );
+        assert!(
+            !client.is_topology_unsupported(),
+            "a PING timeout is a retryable outage, not a terminal rejection"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+
+    wait_until_available(&client).await;
+    assert!(
+        after_ping.elapsed() < Duration::from_secs(10),
+        "a PING timeout must not wedge the single-flight recovery checker, took {:?}",
+        after_ping.elapsed()
+    );
+    assert!(
+        pings.load(Ordering::SeqCst) >= 2,
+        "the checker must retry PING after the timeout"
+    );
+    assert!(!client.is_topology_unsupported());
+    assert_eq!(
+        shared_health_snapshot().shared_authorities_unavailable,
+        baseline.shared_authorities_unavailable,
+        "a later healthy PING must restore packed readiness"
+    );
+
+    drop(authority);
+    drop(client);
+    let _ = shutdown.send(());
+    assert_eq!(shared_health_snapshot(), baseline);
+}
+
+/// A silent recovery PING publishes only the closed-set timeout class, never
+/// Redis error text, the key prefix, or other replay material.
+#[tokio::test(flavor = "current_thread")]
+async fn a_silent_recovery_ping_logs_only_the_timeout_classification() {
+    use std::sync::atomic::Ordering;
+
+    let _serialized = shared_health_guard_async().await;
+    let (logs, guard) = super::plugin_utils::capture_logs();
+    let (port, pings, shutdown) = spawn_ping_silent_then_healthy_redis(usize::MAX).await;
+    let prefix = "ferrum:replay_authority_tests:ping-timeout-log";
+    let client = claim_client(port, prefix);
+    let authority = ReplayAuthority::shared(Arc::clone(&client), RETENTION);
+    wait_until(
+        || pings.load(Ordering::SeqCst) >= 1,
+        "recovery PING dispatched",
+    )
+    .await;
+    wait_until(
+        || logs.contents().contains("connection_timeout"),
+        "PING timeout classification logged",
+    )
+    .await;
+    drop(guard);
+    let captured = logs.contents();
+    assert!(
+        captured.contains("connection_timeout"),
+        "PING timeout must use the closed-set classification: {captured}"
+    );
+    assert!(
+        !captured.contains("PING did not complete")
+            && !captured.contains(prefix)
+            && !captured.contains("PONG"),
+        "must not log Redis error text, key prefix, or reply material: {captured}"
+    );
+    assert!(!client.is_available());
+    assert!(!client.is_topology_unsupported());
+    drop(authority);
+    drop(client);
+    let _ = shutdown.send(());
 }
 
 /// A connected backend that never answers the claim must produce a fixed

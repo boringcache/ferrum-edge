@@ -54,6 +54,13 @@
 //! unscreened rather than carrying a policy command
 //! ([`TopologyScreen::ProbeFailed`]).
 //!
+//! The same bound covers the background recovery checker's `PING` and, for
+//! replay-authority clients, the `INFO MEMORY` screen. That checker is
+//! single-flight (`health_checker_started`): an accepted socket that never
+//! answers `PING` must time out and retry rather than wedging the only
+//! recovery task, or fail-closed consumers could never recover even after the
+//! backend became healthy.
+//!
 //! `redis_connect_timeout_seconds` is likewise the documented bound for a
 //! *server-side reply* on a security-critical single-use claim
 //! ([`RedisRateLimitClient::set_bytes_nx_with_expire_bounded`]): the same
@@ -257,8 +264,10 @@ pub struct RedisConfig {
     /// connection path (not only an outer `tokio::time::timeout`)
     /// so values above the crate's one-second default take effect. Covers TCP
     /// connect, TLS handshake when enabled, and Redis protocol handshake on
-    /// cached, dedicated, and health-check paths. Gateway `DnsCache` screening
-    /// happens before this timeout starts (see module-level DNS notes).
+    /// cached, dedicated, and health-check paths, and is the deadline for
+    /// recovery `PING` plus the proactive `INFO CLUSTER` / `INFO MEMORY`
+    /// screens. Gateway `DnsCache` screening happens before this timeout
+    /// starts (see module-level DNS notes).
     pub connect_timeout_seconds: u64,
     /// Interval in seconds for health check pings when Redis is marked unavailable.
     pub health_check_interval_seconds: u64,
@@ -902,6 +911,29 @@ fn screen_from_info_value(value: &redis::Value) -> TopologyScreen {
     }
 }
 
+/// Issue `PING` under a hard `probe_timeout` deadline.
+///
+/// Connection establishment is bounded separately. A server that accepts and
+/// authenticates and then never answers `PING` would otherwise stall the
+/// single-flight recovery checker forever, so fail-closed consumers could
+/// never recover even after the backend became healthy. Timeout is an
+/// ordinary retryable outage: the client stays unpublished and the loop
+/// retries on the next interval.
+async fn ping_connection(
+    conn: &mut impl redis::aio::ConnectionLike,
+    probe_timeout: Duration,
+) -> Result<String, redis::RedisError> {
+    match tokio::time::timeout(
+        probe_timeout,
+        redis::cmd("PING").query_async::<String>(conn),
+    )
+    .await
+    {
+        Ok(result) => result,
+        Err(_elapsed) => Err(incomplete_ping_probe_error()),
+    }
+}
+
 /// Ask a freshly established connection whether it belongs to a Cluster-mode
 /// server, under a hard `probe_timeout` deadline.
 ///
@@ -962,6 +994,18 @@ fn incomplete_topology_probe_error() -> redis::RedisError {
 fn is_incomplete_topology_probe_error(error: &redis::RedisError) -> bool {
     error.kind() == redis::ErrorKind::Io
         && error.to_string().contains(REPLAY_CLUSTER_UNPROVEN_DETAIL)
+}
+
+const RECOVERY_PING_TIMEOUT_DETAIL: &str =
+    "Redis health-check PING did not complete during recovery";
+
+fn incomplete_ping_probe_error() -> redis::RedisError {
+    redis::RedisError::from((redis::ErrorKind::Io, RECOVERY_PING_TIMEOUT_DETAIL))
+}
+
+fn is_incomplete_ping_probe_error(error: &redis::RedisError) -> bool {
+    error.kind() == redis::ErrorKind::Io
+        && error.to_string().contains(RECOVERY_PING_TIMEOUT_DETAIL)
 }
 
 const REPLAY_MEMORY_UNPROVEN_DETAIL: &str = "Redis replay memory-policy screen did not complete";
@@ -2128,8 +2172,9 @@ impl RedisRateLimitClient {
     /// Run one health-check-style multiplexed connect+PING for tests.
     ///
     /// Uses the same Ferrum timeout wiring as the background recovery checker
-    /// (inner `AsyncConnectionConfig` + defensive outer bound). DNS screening
-    /// still happens first and remains outside the connection timeout.
+    /// (inner `AsyncConnectionConfig` + defensive outer connect bound, then a
+    /// `PING` bounded by the same `connect_timeout`). DNS screening still
+    /// happens first and remains outside the connection timeout.
     #[allow(dead_code)] // public support used by the external integration-test target
     pub async fn health_check_connect_for_test(&self) -> bool {
         let url = match self.resolve_url().await {
@@ -2153,10 +2198,7 @@ impl RedisRateLimitClient {
             Ok(Ok(conn)) => conn,
             Ok(Err(_)) | Err(_) => return false,
         };
-        redis::cmd("PING")
-            .query_async::<String>(&mut conn)
-            .await
-            .is_ok()
+        ping_connection(&mut conn, connect_timeout).await.is_ok()
     }
 
     /// Connection-timeout duration installed into redis-rs configs (tests).
@@ -2828,7 +2870,10 @@ impl RedisRateLimitClient {
                             )));
                         }
                     };
-                    redis::cmd("PING").query_async::<String>(&mut conn).await?;
+                    // Bound PING by the same connect timeout as establishment
+                    // and the INFO screens: an accepted socket that never
+                    // answers would otherwise wedge this single-flight checker.
+                    ping_connection(&mut conn, connect_timeout).await?;
                     // A PING alone proves nothing about topology, so screen the
                     // recovered endpoint before ever reporting it healthy. The
                     // probe is bounded by the same configured connect timeout as
@@ -2930,7 +2975,9 @@ impl RedisRateLimitClient {
                         } else if log_replay_probe_failure {
                             let classification = if is_unproven_memory_probe_error(&error) {
                                 "memory_policy_unproven"
-                            } else if is_incomplete_topology_probe_error(&error) {
+                            } else if is_incomplete_topology_probe_error(&error)
+                                || is_incomplete_ping_probe_error(&error)
+                            {
                                 "connection_timeout"
                             } else {
                                 "connection_failed"

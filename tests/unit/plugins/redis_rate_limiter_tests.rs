@@ -370,6 +370,23 @@ fn connect_timeout_is_installed_into_redis_connection_config_above_and_below_one
     );
 }
 
+#[test]
+fn recovery_ping_is_bounded_by_the_connect_timeout() {
+    let source = include_str!("../../../src/plugins/utils/redis_rate_limiter.rs");
+    assert!(
+        source.contains("async fn ping_connection("),
+        "recovery PING must go through a bounded helper"
+    );
+    assert!(
+        source.contains("ping_connection(&mut conn, connect_timeout)"),
+        "the recovery checker must bound PING by redis_connect_timeout_seconds"
+    );
+    assert!(
+        !source.contains("redis::cmd(\"PING\").query_async::<String>(&mut conn).await"),
+        "unbounded recovery PING must not return"
+    );
+}
+
 /// Accept TCP, optionally delay, then answer every RESP array command with +OK.
 ///
 /// Used to simulate a Redis endpoint whose protocol handshake is delayed after
