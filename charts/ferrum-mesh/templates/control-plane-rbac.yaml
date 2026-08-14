@@ -31,6 +31,13 @@ rules:
     resources:
       - xbackendtrafficpolicies
     verbs: ["get", "list", "watch"]
+  # Ferrum-owned UDP response-amplification policy (issue #3836). Discovery
+  # skips when the CRD is absent; without this grant a present CRD 403-loops
+  # the watcher for the life of the process.
+  - apiGroups: ["gateway.ferrum.io"]
+    resources:
+      - udpresponseamplificationpolicies
+    verbs: ["get", "list", "watch"]
   # GEP-1748: MCS ServiceImport backendRef targets (skipped when CRD absent).
   - apiGroups: ["multicluster.x-k8s.io"]
     resources:
@@ -71,6 +78,10 @@ rules:
   - apiGroups: ["gateway.networking.x-k8s.io"]
     resources:
       - xbackendtrafficpolicies/status
+    verbs: ["get", "patch", "update"]
+  - apiGroups: ["gateway.ferrum.io"]
+    resources:
+      - udpresponseamplificationpolicies/status
     verbs: ["get", "patch", "update"]
   {{- end }}
   {{- if .Values.controlPlane.rbac.istio }}

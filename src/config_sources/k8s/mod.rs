@@ -12,6 +12,9 @@ mod gateway_class;
 mod istio;
 pub(crate) mod listenerset;
 mod mesh_config;
+// Public so external tests import translation-status types from this module
+// instead of a binary-unused `pub use` re-export.
+pub mod udp_amplification_policy;
 
 pub(crate) use core::secret_object_is_valid_tls_certificate;
 pub(crate) use gateway_api::{
@@ -392,6 +395,12 @@ pub struct K8sTranslation {
     /// API status writer. Computed during translation (the only place the
     /// ConfigMap/Secret CA index exists) so status planning never retranslates.
     pub backend_tls_policy_statuses: Vec<GatewayApiBackendTlsPolicyStatus>,
+    /// Per-`UDPResponseAmplificationPolicy` translation outcome for status.
+    pub udp_amplification_policy_statuses:
+        Vec<udp_amplification_policy::GatewayApiUdpAmplificationPolicyStatus>,
+    /// Effective UDP amplification posture per generated UDPRoute parentRef.
+    pub udp_amplification_route_postures:
+        Vec<udp_amplification_policy::GatewayApiUdpAmplificationRoutePosture>,
     /// Per-`ListenerSet` attachment/materialization outcome for status.
     /// Computed with listener policy collection so Gateway
     /// `status.attachedListenerSets` and ListenerSet conditions stay aligned
@@ -977,6 +986,11 @@ pub(crate) struct K8sAccumulator {
     /// Post-admission explicit-SNI collision losers and their winners.
     pub(crate) gateway_api_frontend_tls_hostname_conflicts:
         std::collections::BTreeMap<GatewayApiListenerKey, GatewayApiListenerKey>,
+    /// Gateway `(namespace, name)` → `spec.gatewayClassName` for in-scope Gateways.
+    pub(crate) gateway_class_name_by_gateway: HashMap<(String, String), String>,
+    /// GatewayClass name → namespaced `UDPResponseAmplificationPolicy` referenced
+    /// by `spec.parametersRef` when the referent is Ferrum's CRD.
+    pub(crate) gateway_class_parameters_ref: HashMap<String, (String, String)>,
     /// Pre-pass index of observed GatewayClass names → Ferrum authority.
     /// Presence is key membership ([`GatewayClassAuthority::Missing`] is a
     /// lookup miss). Interoperable waypoint classes (`istio-waypoint` /
@@ -995,6 +1009,11 @@ pub(crate) struct K8sAccumulator {
     backend_tls_policies: backend_tls_policy::BackendTlsPolicyIndex,
     /// Per-policy status projections recorded as policies are collected.
     backend_tls_policy_statuses: Vec<GatewayApiBackendTlsPolicyStatus>,
+    udp_amplification_policies: udp_amplification_policy::UdpAmplificationPolicyIndex,
+    udp_amplification_policy_statuses:
+        Vec<udp_amplification_policy::GatewayApiUdpAmplificationPolicyStatus>,
+    udp_amplification_route_postures:
+        Vec<udp_amplification_policy::GatewayApiUdpAmplificationRoutePosture>,
     /// Per-ListenerSet attachment verdicts recorded while collecting ListenerSet
     /// listener policies (and after conflict resolution).
     listenerset_statuses: Vec<GatewayApiListenerSetStatus>,
@@ -1047,12 +1066,18 @@ impl K8sAccumulator {
             gateway_api_listener_conflicts: std::collections::BTreeMap::new(),
             gateway_api_frontend_tls_hostname_conflicts: std::collections::BTreeMap::new(),
             gateway_api_gateway_classes: HashMap::new(),
+            gateway_class_name_by_gateway: HashMap::new(),
+            gateway_class_parameters_ref: HashMap::new(),
             namespace_labels: HashMap::new(),
             gateway_api_route_conflicts: Vec::new(),
             gateway_api_materialized_route_parents: HashSet::new(),
             gateway_api_materialized_gateway_listeners: HashSet::new(),
             backend_tls_policies: backend_tls_policy::BackendTlsPolicyIndex::default(),
             backend_tls_policy_statuses: Vec::new(),
+            udp_amplification_policies:
+                udp_amplification_policy::UdpAmplificationPolicyIndex::default(),
+            udp_amplification_policy_statuses: Vec::new(),
+            udp_amplification_route_postures: Vec::new(),
             listenerset_statuses: Vec::new(),
             gateway_api_backend_session_policies: HashMap::new(),
             gateway_api_backend_session_policy_targets: HashMap::new(),
@@ -1064,6 +1089,13 @@ impl K8sAccumulator {
         status: GatewayApiBackendTlsPolicyStatus,
     ) {
         self.backend_tls_policy_statuses.push(status);
+    }
+
+    pub(crate) fn record_udp_amplification_policy_status(
+        &mut self,
+        status: udp_amplification_policy::GatewayApiUdpAmplificationPolicyStatus,
+    ) {
+        self.udp_amplification_policy_statuses.push(status);
     }
 
     /// Resolve a Service port name to its `port` value. Returns `None` when
@@ -1209,6 +1241,10 @@ impl K8sAccumulator {
             object.metadata.name.clone(),
             GatewayClassAuthority::from_gateway_class(object),
         );
+        if let Some((namespace, name)) = parse_udp_amplification_parameters_ref(&object.spec) {
+            self.gateway_class_parameters_ref
+                .insert(object.metadata.name.clone(), (namespace, name));
+        }
     }
 
     /// Whether a cluster-scoped GatewayClass object was observed in the
@@ -1508,6 +1544,7 @@ impl K8sAccumulator {
     }
 
     fn finish(mut self) -> K8sTranslation {
+        udp_amplification_policy::finalize_conflicts(&mut self);
         // BackendTLSPolicy precedence depends on the complete snapshot. Mark
         // losers only after every policy has been indexed so status is stable
         // under input reordering and matches runtime lookup's winner.
@@ -1588,12 +1625,37 @@ impl K8sAccumulator {
             materialized_route_parents: self.gateway_api_materialized_route_parents,
             materialized_gateway_listeners: self.gateway_api_materialized_gateway_listeners,
             backend_tls_policy_statuses: self.backend_tls_policy_statuses,
+            udp_amplification_policy_statuses: self.udp_amplification_policy_statuses,
+            udp_amplification_route_postures: self.udp_amplification_route_postures,
             listenerset_statuses: self.listenerset_statuses,
             listener_conflicts: self.gateway_api_listener_conflicts,
             frontend_tls_hostname_conflicts: self.gateway_api_frontend_tls_hostname_conflicts,
             refused_route_attachments,
         }
     }
+}
+
+/// Parse `GatewayClass.spec.parametersRef` when it names Ferrum's UDP
+/// amplification policy CRD. Other groups/kinds are ignored so an unrelated
+/// class config object cannot fail closed the UDP default.
+fn parse_udp_amplification_parameters_ref(spec: &Value) -> Option<(String, String)> {
+    let parameters = spec.get("parametersRef")?;
+    let group = parameters.get("group").and_then(Value::as_str)?;
+    let kind = parameters.get("kind").and_then(Value::as_str)?;
+    if group != crate::udp_amplification::UDP_AMPLIFICATION_POLICY_GROUP
+        || kind != crate::udp_amplification::UDP_AMPLIFICATION_POLICY_KIND
+    {
+        return None;
+    }
+    let name = parameters.get("name").and_then(Value::as_str)?;
+    if name.is_empty() {
+        return None;
+    }
+    let namespace = parameters.get("namespace").and_then(Value::as_str)?;
+    if namespace.is_empty() {
+        return None;
+    }
+    Some((namespace.to_string(), name.to_string()))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -1818,6 +1880,15 @@ where
                 }
                 GatewayClassAuthority::Foreign => {}
             }
+            if let Some(class) = object.spec.get("gatewayClassName").and_then(Value::as_str) {
+                acc.gateway_class_name_by_gateway.insert(
+                    (
+                        object.metadata.namespace.clone(),
+                        object.metadata.name.clone(),
+                    ),
+                    class.to_string(),
+                );
+            }
         }
     }
     // ListenerSets attach after Gateway listener policies exist so conflict
@@ -1832,6 +1903,9 @@ where
     // cap withdraw listener traffic atomically and cannot depend on object
     // iteration order.
     gateway_api::finalize_frontend_tls_certificates(&mut acc);
+
+    udp_amplification_policy::collect_all(&mut acc, &included_objects)?;
+    udp_amplification_policy::finalize_conflicts(&mut acc);
 
     let gateway_api_route_conflicts =
         gateway_api::route_conflicts(included_objects.iter().copied(), &acc.options, Some(&acc));
