@@ -1326,6 +1326,30 @@ pub fn prepare_gateway_config_for_mesh(
     prepare_normalized_gateway_config_for_mesh(config, runtime, &mesh_slice)
 }
 
+/// Prepare a gateway snapshot from an already-projected [`MeshSlice`].
+///
+/// This is the CP-driven materialization path: the slice *is* the serving
+/// inventory. File-mode [`prepare_gateway_config_for_mesh`] additionally
+/// filters `MeshConfig` to `runtime.namespace` before this step, which is
+/// why a document that names Services in other namespaces never reaches the
+/// NodeWaypoint UDP materializer on that path.
+#[allow(dead_code)] // Used by tests.
+pub fn prepare_gateway_config_from_mesh_slice(
+    slice: &MeshSlice,
+    runtime: &MeshRuntimeConfig,
+) -> Result<GatewayConfig, anyhow::Error> {
+    gateway_config_from_mesh_slice_with_federation(
+        slice,
+        runtime,
+        None,
+        None,
+        FederationActivation {
+            fail_open: false,
+            poll_enabled: false,
+        },
+    )
+}
+
 fn prepare_gateway_config_for_native_slice(
     mut config: GatewayConfig,
     runtime: &MeshRuntimeConfig,

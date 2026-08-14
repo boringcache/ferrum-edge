@@ -158,8 +158,8 @@ fn listener_key(service: &str, port: u16) -> String {
 /// A mixed Permissive+Strict candidate without a client CA must not return Ok
 /// with the Strict listener omitted. That is the all-candidate atomicity
 /// contract: one unservable required candidate rejects the complete slice.
-#[test]
-fn strict_dtls_without_client_ca_rejects_the_complete_candidate() {
+#[tokio::test]
+async fn strict_dtls_without_client_ca_rejects_the_complete_candidate() {
     ensure_crypto_provider();
     let identity = write_dtls_identity();
     let coap = workload_for(
@@ -314,8 +314,8 @@ async fn permissive_to_strict_without_client_ca_retains_last_good_generation() {
 /// Strict with a configured client CA remains a valid required candidate and
 /// installs a client-certificate verifier. This is the servable counterpart of
 /// the reject path above, not an omit-and-apply shortcut.
-#[test]
-fn strict_dtls_with_client_ca_builds_a_verifier() {
+#[tokio::test]
+async fn strict_dtls_with_client_ca_builds_a_verifier() {
     ensure_crypto_provider();
     let identity = write_dtls_identity();
     let backend = workload_for(

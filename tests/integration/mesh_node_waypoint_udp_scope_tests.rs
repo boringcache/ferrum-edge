@@ -839,12 +839,12 @@ use ferrum_edge::modes::mesh::config::{
 use ferrum_edge::modes::mesh::{
     MESH_NODE_WAYPOINT_UDP_PROXY_ID_PREFIX, MESH_NODE_WAYPOINT_UDP_UPSTREAM_ID_PREFIX,
     MeshRuntimeConfig, MeshTopology, node_waypoint_udp_proxy_id, node_waypoint_udp_upstream_id,
-    prepare_gateway_config_for_mesh,
+    prepare_gateway_config_for_mesh, prepare_gateway_config_from_mesh_slice,
 };
 
 use super::mesh_test_support::{
-    DEFAULT_NAMESPACE, gateway_config_with_mesh, mesh_config_with, runtime_for_topology,
-    workload_for,
+    DEFAULT_NAMESPACE, gateway_config_with_mesh, mesh_config_with, mesh_slice_with,
+    runtime_for_topology, workload_for,
 };
 
 const UDP_LISTENERS_ENV: &str = "FERRUM_MESH_NODE_WAYPOINT_UDP_LISTENERS_ENABLED";
@@ -959,12 +959,8 @@ fn node_waypoint_runtime() -> MeshRuntimeConfig {
     runtime_for_topology(MeshTopology::NodeWaypoint)
 }
 
-fn prepare(
-    runtime: &MeshRuntimeConfig,
-    services: Vec<MeshService>,
-    mut workloads: Vec<Workload>,
-) -> GatewayConfig {
-    for workload in &mut workloads {
+fn attach_local_node_waypoint(workloads: &mut [Workload]) {
+    for workload in workloads {
         if workload.node_waypoint.is_none() {
             workload.node_waypoint = Some(NodeWaypointEndpoint {
                 address: "192.0.2.10".to_string(),
@@ -977,9 +973,33 @@ fn prepare(
             });
         }
     }
+}
+
+fn prepare(
+    runtime: &MeshRuntimeConfig,
+    services: Vec<MeshService>,
+    mut workloads: Vec<Workload>,
+) -> GatewayConfig {
+    attach_local_node_waypoint(&mut workloads);
     let mesh = mesh_config_with(workloads, services, Vec::new());
     let config = gateway_config_with_mesh(Vec::new(), Vec::new(), mesh);
     prepare_gateway_config_for_mesh(config, runtime).expect("mesh config preparation must succeed")
+}
+
+/// File-mode `prepare_gateway_config_for_mesh` filters `MeshSlice` to
+/// `runtime.namespace`, so Services whose Kubernetes namespace is not the
+/// NodeWaypoint subscription namespace never reach the UDP materializer.
+/// This helper drives the CP-driven path with the caller-supplied inventory
+/// already on the serving slice — the same materializers, without that filter.
+fn prepare_serving_slice(
+    runtime: &MeshRuntimeConfig,
+    services: Vec<MeshService>,
+    mut workloads: Vec<Workload>,
+) -> GatewayConfig {
+    attach_local_node_waypoint(&mut workloads);
+    let slice = mesh_slice_with(runtime, workloads, services, Vec::new());
+    prepare_gateway_config_from_mesh_slice(&slice, runtime)
+        .expect("mesh slice preparation must succeed")
 }
 
 fn udp_listeners(config: &GatewayConfig) -> Vec<&ferrum_edge::config::types::Proxy> {
@@ -1322,6 +1342,11 @@ fn two_plain_udp_services_sharing_one_port_both_materialize_exact_routes() {
 /// upstream id. Generated listeners share the NodeWaypoint runtime namespace, so
 /// that collision overwrote one Service's ClusterIP route, backends, and policy
 /// ownership with the other's.
+///
+/// File-mode slice construction drops both Services (namespaces `a-b` and `a`
+/// are not `runtime.namespace`), which is why this proof drives the serving
+/// slice directly rather than `prepare()`. Ordinary routing views stay
+/// namespace-narrow; this does not widen that filter.
 #[test]
 fn hyphenated_namespace_name_pairs_keep_distinct_same_port_resources() {
     let _env = UdpListenerEnvGuard::set(Some("true"));
@@ -1334,7 +1359,7 @@ fn hyphenated_namespace_name_pairs_keep_distinct_same_port_resources() {
     let mut service_b = udp_service_in("a", "b-c", 5353, AppProtocol::Udp, &[&b]);
     service_b.cluster_ips = vec!["10.96.0.11".to_string()];
     service_b.uid = Some("uid-ns-a-svc-b-c".to_string());
-    let config = prepare(&runtime, vec![service_a, service_b], vec![a, b]);
+    let config = prepare_serving_slice(&runtime, vec![service_a, service_b], vec![a, b]);
 
     let proxy_a = nw_udp_proxy_id("a-b", "c", 5353);
     let proxy_b = nw_udp_proxy_id("a", "b-c", 5353);
@@ -1455,8 +1480,9 @@ fn same_port_claimants_are_added_and_removed_independently() {
         .map(|route| route.proxy.id.as_str())
         .collect();
     assert_eq!(remaining.len(), 1);
-    assert!(
-        remaining[0].contains("dns-b"),
+    assert_eq!(
+        remaining[0],
+        nw_udp_proxy_id(DEFAULT_NAMESPACE, "dns-b", 5353),
         "removing Service A retracts only A's route; B keeps serving"
     );
 }
@@ -1507,7 +1533,11 @@ fn duplicate_exact_destination_claims_refuse_every_ambiguous_claimant() {
         1,
         "both claimants of the duplicated exact destination are refused: {ids:?}"
     );
-    assert!(ids[0].contains("dns-c"));
+    assert_eq!(
+        ids[0],
+        nw_udp_proxy_id(DEFAULT_NAMESPACE, "dns-c", 5353),
+        "the unrelated claimant of a distinct ClusterIP keeps serving"
+    );
     assert_eq!(
         config
             .node_waypoint_udp_destination_routes
@@ -1569,7 +1599,11 @@ fn headless_service_is_unique_port_only_and_never_withdraws_its_neighbours() {
         1,
         "expected only the VIP-bearing claimant: {ids:?}"
     );
-    assert!(ids[0].contains("logs"));
+    assert_eq!(
+        ids[0],
+        nw_udp_proxy_id(DEFAULT_NAMESPACE, "logs", 5140),
+        "the VIP-bearing claimant keeps serving on the shared port"
+    );
 }
 
 /// A port whose claimants disagree on frontend posture (plain `udp` beside
@@ -1634,7 +1668,11 @@ fn a_port_mixing_udp_and_dtls_refuses_every_claimant() {
             "the mixed-posture port refuses both claimants; the unrelated port keeps serving: \
              {ids:?}"
         );
-        assert!(ids[0].contains("other"));
+        assert_eq!(
+            ids[0],
+            nw_udp_proxy_id(DEFAULT_NAMESPACE, "other", 5354),
+            "compatible claimants on other ports are untouched"
+        );
     }
 }
 
