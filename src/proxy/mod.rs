@@ -17432,7 +17432,7 @@ where
 /// `true` here so compliant unmasked client frames are accepted.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn run_websocket_proxy<C, B>(
-    mut client_io: C,
+    client_io: C,
     mut backend_ws_stream: WebSocketStream<B>,
     proxy_id: &str,
     connection_id: u64,
@@ -17488,7 +17488,7 @@ where
     // the client IO so a later sweep surfaces as an ordinary transport error
     // on both the framed path and the tunnel copy, in addition to the stop
     // arbiter below.
-    let client_io = crate::tls::TrustFencedStream::new(client_io, client_trust.as_ref());
+    let mut client_io = crate::tls::TrustFencedStream::new(client_io, client_trust.as_ref());
     let websocket_idle_timeout = ws_idle_tracker.as_ref().map(|tracker| tracker.timeout);
 
     // When tunnel mode is enabled and no plugins need parsed framing, bypass
