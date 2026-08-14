@@ -2606,7 +2606,7 @@ fn cached_pool_pins_multiplexed_connection_not_connection_manager() {
         .find("match self.connect_multiplexed(client).await {")
         .expect("pooled establishment site");
     let screen = source[establish..publish]
-        .find("self.screen_topology(&mut conn)")
+        .find("self.screen_established_connection(&mut conn)")
         .expect("pooled path must screen topology before publishing");
     assert!(
         screen > 0,
