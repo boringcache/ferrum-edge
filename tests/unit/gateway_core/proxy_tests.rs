@@ -2432,6 +2432,50 @@ fn mesh_mtls_arms_operator_read_window_after_sender_readiness() {
 }
 
 #[test]
+fn hbone_arms_operator_read_window_after_tunnel_checkout() {
+    let source = include_str!("../../../src/proxy/mod.rs");
+    let acquire = source
+        .split("async fn proxy_to_backend_hbone(")
+        .nth(1)
+        .expect("HBONE acquire function")
+        .split("fn boxed_proxy_to_backend_hbone_after_ready<'a>(")
+        .next()
+        .expect("bounded HBONE acquire body");
+    let checkout = acquire
+        .find("boxed_hbone_pool_get_tunnel_via(")
+        .expect("HBONE CONNECT checkout boundary");
+    let post_tunnel_handoff = acquire
+        .find("boxed_proxy_to_backend_hbone_after_ready(")
+        .expect("post-tunnel handoff");
+    assert!(
+        checkout < post_tunnel_handoff,
+        "HBONE acquire must await CONNECT checkout before post-tunnel handoff"
+    );
+    assert!(
+        !acquire.contains("let read_deadline") && !acquire.contains("sender.send_request("),
+        "operator response-read window must not arm during HBONE acquire"
+    );
+
+    let post_ready = source
+        .split("async fn proxy_to_backend_hbone_after_ready(")
+        .nth(1)
+        .expect("HBONE post-tunnel function")
+        .split("fn unix_backend_dispatch_unavailable_response(")
+        .next()
+        .expect("bounded HBONE post-tunnel body");
+    let read_window = post_ready
+        .find("let read_deadline")
+        .expect("operator read window");
+    let send_request = post_ready
+        .find("sender.send_request(")
+        .expect("HBONE backend send");
+    assert!(
+        read_window < send_request,
+        "operator response-read timeout must arm before HBONE backend send/collect"
+    );
+}
+
+#[test]
 fn grpc_deadline_phase_zero_precedes_request_security_hooks_on_h1_h2_and_h3() {
     let h1_h2 = include_str!("../../../src/proxy/mod.rs")
         .split("async fn handle_proxy_request_inner")

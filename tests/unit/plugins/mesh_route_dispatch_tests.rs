@@ -1135,6 +1135,12 @@ fn has_route_overrides_reflects_field_set() {
     ctx.route_override_upstream_id = None;
     ctx.route_override_backend_port = Some(443);
     assert!(ctx.has_route_overrides());
+    ctx.route_override_backend_port = None;
+    ctx.route_override_backend_scheme = Some(ferrum_edge::config::types::BackendScheme::Https);
+    assert!(
+        ctx.has_route_overrides(),
+        "a scheme-only direct override can clear an upstream and must count"
+    );
 }
 
 #[test]

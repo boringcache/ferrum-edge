@@ -409,7 +409,7 @@ pub(crate) async fn send_h3_error_body<S>(
     .await;
 }
 
-async fn send_h3_reject_body<S>(
+pub(crate) async fn send_h3_reject_body<S>(
     stream: &mut RequestStream<S, Bytes>,
     status: StatusCode,
     body: Bytes,
