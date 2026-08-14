@@ -1267,7 +1267,9 @@ fn h3_aggregate_sse_writer_streams_under_a_hard_listener_bound() {
         "listener-lifetime expiry must not await finish unbounded"
     );
     assert_eq!(
-        sse_writer.matches("await_post_deadline_terminal_response_write(").count(),
+        sse_writer
+            .matches("await_post_deadline_terminal_response_write(")
+            .count(),
         2,
         "pre-commit authorization terminal and listener-lifetime FIN must both use the bounded grace"
     );

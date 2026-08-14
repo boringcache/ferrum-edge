@@ -15127,8 +15127,7 @@ async fn send_h3_plugin_reject_flavor_aware_with_recv_halt(
             && body.is_empty()
             && crate::proxy::response_headers_select_event_stream(headers);
         if representation_intact && let Some(sse_body) = listener.take_body() {
-            return send_h3_aggregate_sse_response(stream, ctx, headers, sse_body, halt_recv)
-                .await;
+            return send_h3_aggregate_sse_response(stream, ctx, headers, sse_body, halt_recv).await;
         }
     }
     if terminal_gateway_deadline {
@@ -15321,7 +15320,9 @@ async fn send_h3_aggregate_sse_response(
             drop(body);
             let (status, terminal_headers, terminal_body) =
                 crate::proxy::authorization_expired_pre_commitment_response(
-                    ctx, termination, false,
+                    ctx,
+                    termination,
+                    false,
                 );
             let status = StatusCode::from_u16(status).unwrap_or(StatusCode::UNAUTHORIZED);
             let body_bytes = match terminal_body {
@@ -15337,18 +15338,19 @@ async fn send_h3_aggregate_sse_response(
                 false,
                 disposition,
             );
-            let result = match crate::http3::stream_util::await_post_deadline_terminal_response_write(
-                write,
-            )
-            .await
-            {
-                Ok(()) => Ok(()),
-                Err(crate::http3::stream_util::H3ResponseWriteError::Write(error)) => Err(error),
-                Err(crate::http3::stream_util::H3ResponseWriteError::DeadlineExceeded) => {
-                    crate::http3::stream_util::abort_response_stream(stream);
-                    Ok(())
-                }
-            };
+            let result =
+                match crate::http3::stream_util::await_post_deadline_terminal_response_write(write)
+                    .await
+                {
+                    Ok(()) => Ok(()),
+                    Err(crate::http3::stream_util::H3ResponseWriteError::Write(error)) => {
+                        Err(error)
+                    }
+                    Err(crate::http3::stream_util::H3ResponseWriteError::DeadlineExceeded) => {
+                        crate::http3::stream_util::abort_response_stream(stream);
+                        Ok(())
+                    }
+                };
             if halt_recv {
                 crate::http3::stream_util::halt_request_body(stream);
             }

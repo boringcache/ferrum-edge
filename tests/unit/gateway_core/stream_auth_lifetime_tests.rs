@@ -4025,7 +4025,10 @@ async fn aggregate_sse_an_exact_tie_is_attributed_to_authorization() {
     let at = now + Duration::from_secs(5);
     let bound = compose_aggregate_sse_bound_for_test(
         at,
-        Some(plan_at(at, StreamAuthTermination::AuthenticatedStreamMaxLifetime)),
+        Some(plan_at(
+            at,
+            StreamAuthTermination::AuthenticatedStreamMaxLifetime,
+        )),
     );
     assert_eq!(bound.deadline(), Some(at));
     tokio::time::advance(Duration::from_secs(5)).await;
@@ -4208,7 +4211,10 @@ async fn a_stalled_aggregate_sse_body_write_stops_at_the_composed_deadline() {
         tokio::time::Instant::now() - started,
         Duration::from_secs(2)
     );
-    assert!(result.is_err(), "a stalled DATA write must lose to the bound");
+    assert!(
+        result.is_err(),
+        "a stalled DATA write must lose to the bound"
+    );
     assert_eq!(
         bound.expired_authorization(),
         Some(StreamAuthTermination::CredentialExpired)
