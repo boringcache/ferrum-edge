@@ -853,6 +853,11 @@ route still materializes with the next valid precedence (ultimately the finite
 default). Unlimited is available only with `mode: Unlimited` **and**
 `acknowledgeUnsafeAmplification: true`. Deleting the policy returns the
 listener to the finite default on the next reconcile without a process restart.
+Any change to the effective factor restarts that physical UDP listener after
+the candidate configuration is accepted. The old listener's shutdown fence
+retires its sessions, and the replacement starts with a fresh session map. An
+established source therefore cannot retain an unlimited or less restrictive
+budget after a policy is tightened, invalidated, or deleted.
 
 Ferrum materializes one physical UDP proxy per route/rule/`listen_port`. When
 one `UDPRoute` attaches to distinct Gateways or listeners that share that port,
