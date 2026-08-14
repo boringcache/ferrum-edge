@@ -674,6 +674,16 @@ pub const WS_UNIX_SOCKET_INADMISSIBLE: &str =
 pub const WS_UNIX_BACKEND_AUTHORITY_INVALID: &str =
     "WebSocket backend dial refused: unix-socket backend URL has no safe authority";
 
+/// Pre-dial refusal for an H3 mesh WebSocket upgrade whose target-effective
+/// backend URL cannot provide the request path carried through the secured
+/// tunnel.
+///
+/// Substituting `/` would silently change the authorized backend request target.
+/// Gateway-side and pre-dial, so this is non-retryable and neutral to backend
+/// health. The URL and its query are never echoed by this fixed error surface.
+pub const WS_MESH_BACKEND_REQUEST_TARGET_INVALID: &str =
+    "WebSocket backend dial refused: mesh backend request target is invalid";
+
 /// Tightened substring fallback for boxed/reqwest errors when the typed
 /// walk is exhausted.
 ///
@@ -715,6 +725,7 @@ fn classify_substring_fallback(error_str: &str, debug_str: &str) -> Option<Error
     if error_str.contains(WS_UNIX_H2C_EXTENDED_CONNECT_UNSUPPORTED)
         || error_str.contains(WS_UNIX_SOCKET_INADMISSIBLE)
         || error_str.contains(WS_UNIX_BACKEND_AUTHORITY_INVALID)
+        || error_str.contains(WS_MESH_BACKEND_REQUEST_TARGET_INVALID)
     {
         return Some(ErrorClass::DispatchPolicyRejected);
     }

@@ -1273,6 +1273,7 @@ impl GovernorEngine {
         let request = self
             .http_client
             .get()
+            .map_err(|e| format!("request failed: {e}"))?
             .post(&approval.endpoint_url)
             .timeout(timeout)
             .json(&body);

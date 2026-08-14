@@ -2923,7 +2923,18 @@ mod tests {
             .metadata
             .labels
             .insert("team".to_string(), "payments".to_string());
+        // Order: GatewayClass (cluster-scoped), Namespace, Gateway, HTTPRoute.
+        // Deletion phases slice by prefix while keeping the authoritative class.
         vec![
+            K8sObject {
+                api_version: "gateway.networking.k8s.io/v1".to_string(),
+                kind: "GatewayClass".to_string(),
+                metadata: metadata("ferrum", ""),
+                spec: json!({
+                    "controllerName": "ferrum.io/gateway-controller"
+                }),
+                status: json!({}),
+            },
             tenant,
             K8sObject {
                 api_version: "gateway.networking.k8s.io/v1".to_string(),
@@ -3001,11 +3012,11 @@ mod tests {
         let restored = merge_k8s_translation(&withdrawn, &recovered.config, &managed);
         assert_eq!(restored.proxies.len(), 1);
 
-        let route_deleted = gateway_selector_translation(&valid_objects[..2]);
+        let route_deleted = gateway_selector_translation(&valid_objects[..3]);
         let after_route_delete = merge_k8s_translation(&restored, &route_deleted.config, &managed);
         assert!(after_route_delete.proxies.is_empty());
 
-        let gateway_deleted = gateway_selector_translation(&valid_objects[..1]);
+        let gateway_deleted = gateway_selector_translation(&valid_objects[..2]);
         let after_gateway_delete =
             merge_k8s_translation(&restored, &gateway_deleted.config, &managed);
         assert!(after_gateway_delete.proxies.is_empty());

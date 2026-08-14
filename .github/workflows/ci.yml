@@ -799,6 +799,7 @@ jobs:
               integration::gateway_api_backend_tls_policy_tests
               integration::gateway_api_listenerset_tests
               integration::k8s_controller_gateway_status_tests
+              integration::k8s_controller_gatewayclass_authority_tests
               integration::k8s_controller_istio_status_cas_tests
               integration::k8s_controller_istio_status_tests
               integration::k8s_controller_shutdown_tests
@@ -859,6 +860,7 @@ jobs:
               integration::connection_pool_tests
               integration::http2_pool_tests
               integration::http3_integration_tests
+              integration::mesh_h3_plain_ws_bridge_tests
               integration::grpc_proxy_tests
               integration::policy_path_canonicalization_tests
               integration::scripted_backend_smoke_tests
@@ -874,6 +876,7 @@ jobs:
               integration::tcp_fast_path_l4_plugins_tests
               integration::udp_hook_concurrency_tests
               integration::udp_fault_injection_tests
+              integration::datagram_client_address_datapath_tests
               integration::gateway_api_udproute_datapath_tests
               integration::gateway_hbone_pool_tests
               integration::gateway_mesh_trust_retirement_tests
@@ -2035,6 +2038,7 @@ jobs:
     timeout-minutes: 45
     env:
       FERRUM_IMAGE: ferrum-edge:helm-chart-ci
+      GATEWAY_API_VERSION: v1.5.1
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
         with:
@@ -3968,6 +3972,20 @@ jobs:
           kind create cluster --name ferrum-helm --wait 120s
           kind load docker-image "$FERRUM_IMAGE" --name ferrum-helm
 
+      - name: Install Gateway API CRDs
+        run: |
+          set -euo pipefail
+          kubectl apply --server-side=true \
+            -f "https://github.com/kubernetes-sigs/gateway-api/releases/download/${GATEWAY_API_VERSION}/standard-install.yaml"
+          for crd in \
+            gatewayclasses.gateway.networking.k8s.io \
+            gateways.gateway.networking.k8s.io \
+            httproutes.gateway.networking.k8s.io \
+            grpcroutes.gateway.networking.k8s.io \
+            referencegrants.gateway.networking.k8s.io; do
+            kubectl wait --for=condition=Established "crd/${crd}" --timeout=120s
+          done
+
       - name: Validate external migrate Job examples
         run: |
           set -euo pipefail
@@ -4100,7 +4118,8 @@ jobs:
             -f ./charts/ferrum-mesh/examples/development-values.yaml \
             --set image.repository=ferrum-edge \
             --set image.tag=helm-chart-ci \
-            --set image.pullPolicy=IfNotPresent
+            --set image.pullPolicy=IfNotPresent \
+            --set gatewayClass.name=ferrum-dev
           kubectl -n ferrum-dev rollout status deployment/ferrum-mesh-control-plane --timeout=180s
           kubectl -n ferrum-dev get pods -o wide > "$RUNNER_TEMP/ferrum-helm-results/development-pods.txt"
           kubectl -n ferrum-dev describe deployment/ferrum-mesh-control-plane > "$RUNNER_TEMP/ferrum-helm-results/development-control-plane-deployment.txt"
@@ -4221,7 +4240,8 @@ jobs:
             --set image.repository=ferrum-edge \
             --set image.tag=helm-chart-ci \
             --set image.pullPolicy=IfNotPresent \
-            --set controlPlane.env.FERRUM_CP_DP_GRPC_ALLOW_PLAINTEXT=true
+            --set controlPlane.env.FERRUM_CP_DP_GRPC_ALLOW_PLAINTEXT=true \
+            --set gatewayClass.name=ferrum-prod
           set +e
           kubectl -n ferrum-prod rollout status deployment/ferrum-mesh-control-plane --timeout=180s
           rollout_rc=$?

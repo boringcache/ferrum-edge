@@ -36,6 +36,7 @@ mod cp_grpc_handshake_admission_tests;
 mod cp_multi_namespace_tests;
 mod cp_tenant_trust_binding_tests;
 mod cp_trust_reload_health_tests;
+mod datagram_client_address_datapath_tests;
 mod db_full_load_snapshot_tests;
 mod db_incremental_poll_tests;
 mod db_mutation_decode_fail_closed_tests;
@@ -69,6 +70,7 @@ mod http2_pool_tests;
 mod http3_integration_tests;
 mod injector_admission_tests;
 mod k8s_controller_gateway_status_tests;
+mod k8s_controller_gatewayclass_authority_tests;
 mod k8s_controller_istio_status_cas_tests;
 mod k8s_controller_istio_status_tests;
 mod k8s_controller_shutdown_tests;
@@ -95,6 +97,7 @@ mod mesh_ext_authz_custom_tests;
 mod mesh_federation_poller_tests;
 mod mesh_file_source_tests;
 mod mesh_grpc_transport_tests;
+mod mesh_h3_plain_ws_bridge_tests;
 mod mesh_hbone_tests;
 // Keep host UDP capture coverage on the existing trusted mesh-platform shard:
 // its filter matches this module-name prefix without changing CI workflow code.

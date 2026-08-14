@@ -3,8 +3,9 @@
 use ferrum_edge::config::types::{BackoffStrategy, RetryConfig};
 use ferrum_edge::proxy::grpc_proxy::{GrpcProxyError, GrpcTimeoutKind};
 use ferrum_edge::retry::{
-    BackendResponse, ErrorClass, ResponseBody, classify_body_error, classify_boxed_error,
-    classify_boxed_setup_error, classify_grpc_proxy_error, retry_delay, should_retry,
+    BackendResponse, ErrorClass, ResponseBody, WS_MESH_BACKEND_REQUEST_TARGET_INVALID,
+    classify_body_error, classify_boxed_error, classify_boxed_setup_error,
+    classify_grpc_proxy_error, retry_delay, should_retry,
 };
 use std::collections::HashMap;
 use std::time::Duration;
@@ -1268,6 +1269,16 @@ fn test_classify_boxed_setup_error_ws_io_econnrefused_stays_pre_wire() {
         !ferrum_edge::retry::request_reached_wire(class),
         "ECONNREFUSED on initial connect must remain pre-wire \
          so retry_on_connect_failure can replay safely"
+    );
+}
+
+#[test]
+fn h3_mesh_websocket_invalid_request_target_is_policy_rejection() {
+    let err: Box<dyn std::error::Error + Send + Sync> =
+        WS_MESH_BACKEND_REQUEST_TARGET_INVALID.into();
+    assert_eq!(
+        classify_boxed_setup_error(err.as_ref()),
+        ErrorClass::DispatchPolicyRejected
     );
 }
 

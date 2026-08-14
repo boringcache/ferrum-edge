@@ -105,6 +105,15 @@ fn https_listener(name: &str, port: u64, hostname: Option<&str>, secrets: &[&str
     listener
 }
 
+fn gateway_class() -> K8sObject {
+    object(
+        "GatewayClass",
+        "",
+        "ferrum",
+        json!({"controllerName": "ferrum.io/gateway-controller"}),
+    )
+}
+
 fn gateway(namespace: &str, name: &str, listeners: Vec<Value>) -> K8sObject {
     object(
         "Gateway",
@@ -130,7 +139,10 @@ fn route(namespace: &str, name: &str, gateway: &str, section: &str, path: &str) 
 }
 
 fn translate(objects: &[K8sObject]) -> K8sTranslation {
-    translate_k8s_objects(objects, options()).expect("translation succeeds")
+    let mut snapshot = Vec::with_capacity(objects.len() + 1);
+    snapshot.push(gateway_class());
+    snapshot.extend(objects.iter().cloned());
+    translate_k8s_objects(&snapshot, options()).expect("translation succeeds")
 }
 
 fn cert_paths(config: &GatewayConfig) -> Vec<String> {
@@ -268,6 +280,7 @@ fn cross_namespace_same_named_listenersets_keep_distinct_runtime_identities() {
     };
     let result = translate_k8s_objects(
         &[
+            gateway_class(),
             parent,
             listenerset("team-a", 8443, "a.example.com", "cert-a"),
             listenerset("team-b", 9443, "b.example.com", "cert-b"),
@@ -597,15 +610,21 @@ fn cross_namespace_secret_requires_a_reference_grant() {
         options().with_source_namespaces(vec!["ferrum".to_string(), "certs".to_string()])
     }
 
-    let denied = translate_k8s_objects(&[gateway_object.clone(), secret.clone()], namespaces())
-        .expect("translation succeeds");
+    let denied = translate_k8s_objects(
+        &[gateway_class(), gateway_object.clone(), secret.clone()],
+        namespaces(),
+    )
+    .expect("translation succeeds");
     assert!(
         denied.config.frontend_tls_certificate_sources.is_empty(),
         "an unauthorized cross-namespace Secret must not be served"
     );
 
-    let allowed = translate_k8s_objects(&[gateway_object, secret, grant], namespaces())
-        .expect("translation succeeds");
+    let allowed = translate_k8s_objects(
+        &[gateway_class(), gateway_object, secret, grant],
+        namespaces(),
+    )
+    .expect("translation succeeds");
     assert_eq!(allowed.config.frontend_tls_certificate_sources.len(), 1);
     assert!(
         allowed.config.frontend_tls_certificate_sources[0]
@@ -768,6 +787,7 @@ fn certificate_cap_is_isolated_per_serving_namespace() {
     // only include `ferrum`, which would silently drop both fixtures.
     let result = translate_k8s_objects(
         &[
+            gateway_class(),
             gateway("aaa-attacker", "edge", attacker_listeners),
             gateway(
                 "zzz-victim",

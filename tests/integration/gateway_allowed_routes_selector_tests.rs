@@ -99,6 +99,15 @@ fn route() -> K8sObject {
     )
 }
 
+fn ferrum_gateway_class() -> K8sObject {
+    object(
+        "GatewayClass",
+        "ferrum",
+        "",
+        json!({ "controllerName": FERRUM_GATEWAY_CONTROLLER_NAME }),
+    )
+}
+
 fn objects(selector: Value) -> Vec<K8sObject> {
     vec![
         namespace(
@@ -108,6 +117,7 @@ fn objects(selector: Value) -> Vec<K8sObject> {
         namespace("platform", &[("team", "platform")]),
         gateway(selector),
         route(),
+        ferrum_gateway_class(),
     ]
 }
 
@@ -275,6 +285,7 @@ fn malformed_mixed_selector_does_not_broaden_cross_namespace_attachment() {
         namespace("platform", &[("team", "platform")]),
         invalid_gateway,
         route(),
+        ferrum_gateway_class(),
     ];
 
     let translation = translate_skipping_rejected_resources(&objects);
@@ -330,6 +341,7 @@ fn unknown_selector_field_does_not_broaden_cross_namespace_attachment() {
         namespace("platform", &[("team", "platform")]),
         invalid_gateway,
         route(),
+        ferrum_gateway_class(),
     ];
 
     let translation = translate_skipping_rejected_resources(&objects);
@@ -448,6 +460,7 @@ fn invalid_listener_does_not_block_valid_sibling_listener() {
         namespace("platform", &[]),
         gateway,
         route,
+        ferrum_gateway_class(),
     ];
 
     let translation =
@@ -564,6 +577,7 @@ fn conformance_objects(route_namespace_labels: &[(&str, &str)]) -> Vec<K8sObject
         namespace(CONFORMANCE_WEB_BACKEND_NS, route_namespace_labels),
         conformance_gateway(),
         conformance_route(),
+        ferrum_gateway_class(),
     ]
 }
 
@@ -653,6 +667,7 @@ fn same_namespace_listener_still_refuses_a_labelled_foreign_namespace() {
         ),
         same_gateway,
         conformance_route(),
+        ferrum_gateway_class(),
     ];
 
     let accepted = route_parent_condition(&objects, "Accepted");
