@@ -2119,9 +2119,7 @@ where
             // The winner was captured where BOTH instants were known, so a late
             // wake cannot reattribute a strictly earlier client RPC deadline to
             // the gateway's security decision.
-            Err(super::server::H3RequestBodyReadError::DeadlineExceeded(
-                authorization_expiry,
-            )) => {
+            Err(super::server::H3RequestBodyReadError::DeadlineExceeded(authorization_expiry)) => {
                 release_cross_protocol_circuit_breaker_probe_on_admission_reject(
                     state,
                     proxy,
