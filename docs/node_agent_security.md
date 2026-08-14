@@ -160,19 +160,20 @@ privilege footprints:
 | Placement | `FERRUM_MESH_CAPTURE_UDP_HOST_NETNS_ENABLED` | Proxy capabilities | Host access |
 |---|---|---|---|
 | Per-pod-netns producer (default) | `false` | `NET_ADMIN`, `NET_RAW`, `SYS_ADMIN`, `SYS_PTRACE` | `hostNetwork`, `hostPID`, host cgroup (ro), registry hostPath |
-| Host-network capture (steady-state) | `true` | `NET_ADMIN`, `NET_RAW` | `hostNetwork`, host cgroup (ro), registry hostPath; **also `hostPID` when the default settled-host preflight is enabled** (pod-scoped visibility, not a capability) |
+| Host-network capture (steady-state) | `true` | `NET_ADMIN`, `NET_RAW` | `hostNetwork`, host cgroup (ro), registry hostPath; no `hostPID` |
 
 The host placement installs its `mangle` rules and binds its transparent socket
 in the proxy's own namespace, so the running producer calls no `setns(CLONE_NEWNET)`
 and never opens another workload's `/proc/{pid}/ns/net`. That removes
 `SYS_ADMIN`/`SYS_PTRACE` from the steady-state container, which is the main
 reason to choose this path: the producer can capture UDP without those setns
-capabilities. Kubernetes `hostPID` is pod-scoped, not container-scoped. With
-the default settled-host preflight enabled, the DaemonSet still renders
-`hostPID: true`, so the steady-state container also sees host PIDs; that
-visibility does not grant `setns`. A cluster whose Pod Security posture
-refuses `hostPID` or the init stage's `SYS_ADMIN`/`SYS_PTRACE` cannot use this
-default unchanged — set `ambient.udpNodePreflight.enabled=false` and adopt
+capabilities. The default settled-host preflight is an init container in the same
+pod, but it never needs `hostPID`: it reads target pids through a read-only host
+`/proc` mount declared on that container alone, so neither the mount nor
+`SYS_ADMIN`/`SYS_PTRACE` reaches the steady-state proxy and the pod renders no
+`hostPID` at all. A cluster whose Pod Security posture refuses a host `/proc`
+hostPath or the init stage's `SYS_ADMIN`/`SYS_PTRACE` cannot use this default
+unchanged — set `ambient.udpNodePreflight.enabled=false` and adopt
 nodes with explicit node-bound exemption markers instead. The chart derives
 the capability narrowing automatically — enabling the placement narrows the
 rendered container capabilities rather than adding to them.
@@ -184,8 +185,8 @@ Ferrum-owned rules inside every predecessor pod netns. The incoming host
 producer does not start in that release. `finalize` is admitted only after the
 node-local durable proof exists, and only then does the chart drop
 `SYS_ADMIN`/`SYS_PTRACE` from the running container. Settled host placement
-with the default preflight still renders pod-wide `hostPID`; that field is not
-removed because the init stage in the same pod needs it. See the [Ambient UDP migration procedure](mesh.md#ambient-udp-placement-migration-enforced-hard-upgrade-guard).
+removes pod-wide `hostPID` entirely; the preflight init stage replaces it with a
+read-only host `/proc` mount that only that container receives. See the [Ambient UDP migration procedure](mesh.md#ambient-udp-placement-migration-enforced-hard-upgrade-guard).
 
 Once that migration has completed, a node with no node-local durable record —
 one that joined the cluster afterwards, or whose registry directory was
@@ -199,18 +200,37 @@ current boot id. The steady-state **capability** posture is unchanged — the
 narrowed host-placement `NET_ADMIN`/`NET_RAW` set still applies to the running
 container, which does not receive `SYS_ADMIN`/`SYS_PTRACE` — but a settled
 host-netns pod now also renders a one-shot `ferrum-udp-node-preflight`
-**init container**. Kubernetes `hostPID` is pod-scoped: enabling that init
-stage therefore gives **both** containers host PID namespace visibility. `hostPID`
-does not grant `setns`; the init container alone holds `SYS_ADMIN`/`SYS_PTRACE`
-long enough to retire both predecessor placements ownership-safely and publish
-that proof, then exits. That stage sets `allowPrivilegeEscalation: false` and drops `ALL`
+**init container**. It runs in the proxy's own pod deliberately: Kubernetes
+orders an init container before the app container only within one pod, and that
+ordering is what stops a replacement proxy reading a leftover
+`.node-identity-v1.json` + `.udp-node-cleanup-proof-v1.json` pair after a
+same-boot, same-name Node recreation. A separate DaemonSet has no such ordering
+and would reintroduce that window.
+
+The init container alone holds `SYS_ADMIN`/`SYS_PTRACE` and a **read-only host
+`/proc` mount** long enough to retire both predecessor placements
+ownership-safely and publish that proof, then exits. It is passed
+`--host-proc-root /host/proc`, which redirects only **target**-pid reads
+(`<root>/<pid>/ns/net` and the cgroup→pid lookup that feeds it);
+`/proc/self/ns/net` still comes from the container's own procfs. That is why the
+pod needs no `hostPID`: the PodSpec field would otherwise apply to the
+long-running proxy for its whole lifetime. That stage sets
+`allowPrivilegeEscalation: false` and drops `ALL`
 capabilities before adding back exactly `NET_ADMIN`, `NET_RAW`, `SYS_ADMIN`, and
 `SYS_PTRACE`, so its declared four are its complete privilege surface rather
 than an addition on top of whatever the runtime's ambient/default set carries.
-The setns capabilities are bounded to an init stage that cannot serve traffic,
-which is strictly narrower than granting the producer setns for its whole
-lifetime. This same-pod ordering is **not** usable unchanged on a cluster that
-refuses `hostPID` or those init capabilities; set
+The setns capabilities and the host-proc mount are bounded to an init stage that
+cannot serve traffic, which is strictly narrower than granting the producer
+setns and host PID visibility for its whole lifetime. It is an ordinary init
+container — no container-level `restartPolicy: Always`, so it is not a native
+sidecar that would outlive its one-shot work. The ambient pod also sets
+`automountServiceAccountToken: false` and projects a short-lived
+`kube-api-access` volume at the standard in-cluster path: the steady-state
+proxy always mounts it so Kubernetes-backed TLS/source identity is unchanged,
+and the privileged init container does not receive the projected token when
+`FERRUM_K8S_NODE_UID` is already supplied. This same-pod ordering is **not**
+usable unchanged on a cluster that refuses a host `/proc` hostPath or those init
+capabilities; set
 `ambient.udpNodePreflight.enabled=false` and adopt nodes with explicit
 node-bound exemption markers instead.
 
