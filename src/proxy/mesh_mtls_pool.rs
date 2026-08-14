@@ -189,10 +189,12 @@ pub enum MeshMtlsSenderError {
 }
 
 impl MeshMtlsSenderError {
+    #[cfg_attr(feature = "fips", allow(dead_code))]
     pub fn is_canceled(&self) -> bool {
         matches!(self, Self::Hyper(err) if err.is_canceled())
     }
 
+    #[cfg_attr(feature = "fips", allow(dead_code))]
     pub fn is_timeout(&self) -> bool {
         matches!(self, Self::Hyper(err) if err.is_timeout())
     }
@@ -277,6 +279,7 @@ impl MeshMtlsSender {
     }
 
     #[inline]
+    #[cfg_attr(feature = "fips", allow(dead_code))]
     pub fn is_ready(&self) -> bool {
         !self.gate.is_retired() && self.inner.is_ready()
     }
