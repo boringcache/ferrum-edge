@@ -504,7 +504,9 @@ fn teardown_retains_routing_when_the_family_mark_path_is_unproven() {
 #[test]
 fn teardown_ipv4_xtables_failure_skips_ipv4_routing_and_still_attempts_ipv6() {
     let script = node_waypoint_udp_steer_teardown_script();
-    for shell in ["bash", "sh"] {
+    // Use absolute shell paths because the child PATH is intentionally limited
+    // to the stub tool directory below.
+    for shell in ["/bin/bash", "/bin/sh"] {
         let (status, log) = run_teardown_with_stubbed_family_tools(shell, &script);
         assert_ne!(
             status, 0,
