@@ -294,7 +294,7 @@ fn teardown_is_strict_for_both_families_and_verifies_exact_absence() {
 fn teardown_probes_jump_target_chain_before_rule_check() {
     let script = node_waypoint_udp_steer_teardown_script();
     let helper = xtables_rule_helper(&script);
-    let jump_probe = jump_target_probe_block(&helper);
+    let jump_probe = jump_target_probe_block(helper);
 
     let chain_probe = helper
         .find("-S \"$ferrum_jump_target\"")
@@ -320,7 +320,7 @@ fn teardown_probes_jump_target_chain_before_rule_check() {
     );
 
     assert_no_bang_inverted_status_capture(&script);
-    assert_jump_target_probe_retains_original_status(&jump_probe);
+    assert_jump_target_probe_retains_original_status(jump_probe);
     assert!(
         helper[rule_check..].contains("-D \"$@\""),
         "a present jump-target chain must still delete via -C/-D:\n{helper}"
