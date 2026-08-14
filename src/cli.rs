@@ -38,13 +38,23 @@ pub enum Command {
     /// Retire Ambient UDP predecessor placements on this node and publish the
     /// node-scoped cleanup proof the steady-state host producer requires.
     ///
-    /// Runs as a privileged init stage beside the Ambient DaemonSet's
-    /// unprivileged steady-state container (issue #3809): a node with no
-    /// durable placement record cannot tell a fresh/rebooted node from a
-    /// pre-contract node whose running workloads still redirect UDP to a
-    /// retired listener, so it proves the distinction by doing the retirement
-    /// rather than by trusting release-level desired state. Exits non-zero
-    /// without publishing anything when it cannot prove completion.
+    /// Runs as a privileged INIT CONTAINER in the Ambient DaemonSet's own pod,
+    /// beside its unprivileged steady-state container (issue #3809). Same-pod
+    /// placement is the point: Kubernetes orders an init container before the
+    /// app container, and orders nothing at all between two DaemonSets, so this
+    /// is what guarantees the steady-state producer cannot read a leftover
+    /// identity/proof pair a same-boot, same-name Node recreation left on the
+    /// shared registry hostPath. A node with no durable placement record cannot
+    /// tell a fresh/rebooted node from a pre-contract node whose running
+    /// workloads still redirect UDP to a retired listener, so it proves the
+    /// distinction by doing the retirement rather than by trusting release-level
+    /// desired state. Exits non-zero without publishing anything when it cannot
+    /// prove completion, which keeps the whole pod non-running.
+    ///
+    /// It takes no pod-scoped `hostPID` for that: `--host-proc-root` points its
+    /// TARGET-pid reads at a read-only host `/proc` mount declared on this
+    /// container alone, so the long-running proxy beside it stays out of the
+    /// host PID namespace. `SYS_ADMIN`/`SYS_PTRACE` are likewise init-only.
     AmbientUdpPreflight(AmbientUdpPreflightArgs),
 }
 
@@ -459,9 +469,69 @@ pub struct AmbientUdpPreflightArgs {
     #[arg(long = "timeout-seconds", default_value_t = 300)]
     pub timeout_seconds: u64,
 
+    /// Procfs root to resolve TARGET pids through (default: this process's own
+    /// `/proc`).
+    ///
+    /// This is what lets the preflight stay an init container in the ambient pod
+    /// — preserving Kubernetes' init-before-container ordering against the
+    /// steady-state proxy — WITHOUT pod-scoped `hostPID`, which Kubernetes would
+    /// apply to the long-running proxy container for its whole lifetime. The
+    /// chart mounts the host's own `/proc` read-only on this container alone and
+    /// points this flag at it.
+    ///
+    /// It redirects nothing else. `/proc/self/ns/net` — the caller's own namespace
+    /// identity and the `setns` save/restore handle — always comes from this
+    /// container's own procfs, because the preflight runs in the host network
+    /// namespace already and must compare pod namespaces against ITS OWN.
+    ///
+    /// Deliberately a flag and not a `FERRUM_*` variable: it is an internal
+    /// contract between one chart-rendered mount and one chart-rendered
+    /// argument, not an operator-tunable runtime setting, and the ambient env
+    /// map is copied verbatim into this container.
+    #[arg(long = "host-proc-root")]
+    pub host_proc_root: Option<PathBuf>,
+
     /// Increase log verbosity (-v=info, -vv=debug, -vvv=trace).
     #[arg(short = 'v', long = "verbose", action = ArgAction::Count)]
     pub verbose: u8,
+}
+
+/// Validate an explicit `--host-proc-root` before anything depends on it.
+///
+/// Fails closed rather than silently degrading to `/proc`: a typo'd or
+/// unmounted root would otherwise send every target-pid read back at the
+/// container's own procfs, where the enrolled pods' pids do not exist, and the
+/// preflight would report "no live PID" for pods that are running fine. A
+/// missing mount is an operator/rendering error, not a node state to interpret.
+pub fn validate_host_proc_root(root: &std::path::Path) -> Result<PathBuf, String> {
+    if !root.is_absolute() {
+        return Err(format!(
+            "--host-proc-root must be an absolute path, got {}",
+            root.display()
+        ));
+    }
+    let metadata = std::fs::metadata(root).map_err(|error| {
+        format!(
+            "--host-proc-root {} is not readable: {error}",
+            root.display()
+        )
+    })?;
+    if !metadata.is_dir() {
+        return Err(format!(
+            "--host-proc-root {} is not a directory",
+            root.display()
+        ));
+    }
+    // `self/ns/net` exists in every procfs instance, including one bind-mounted
+    // from another PID namespace, so it distinguishes a real procfs from an
+    // empty mount point that would resolve nothing.
+    if cfg!(target_os = "linux") && !root.join("self").join("ns").join("net").exists() {
+        return Err(format!(
+            "--host-proc-root {} does not look like a mounted procfs (no self/ns/net)",
+            root.display()
+        ));
+    }
+    Ok(root.to_path_buf())
 }
 
 // ── Subcommand executors ────────────────────────────────────────────────────
@@ -479,18 +549,20 @@ pub struct AmbientUdpPreflightArgs {
 ///
 /// `--timeout-seconds` is a hard wall-clock ceiling: stalled `sh`/iptables/ip
 /// children are killed with their process group before this process reports
-/// timeout, stderr collection is bounded so an orphaned grandchild cannot pin
-/// the caller, process-group cleanup failure is reported rather than claimed as
-/// success, and no usable attestation remains after the deadline wins.
+/// timeout, explicit-root host-proc target-PID scans observe the same Instant
+/// during the walk, stderr collection is bounded so an orphaned grandchild
+/// cannot pin the caller, process-group cleanup failure is reported rather than
+/// claimed as success, and no usable attestation remains after the deadline
+/// wins.
 ///
 /// Node identity is resolved AUTHORITATIVELY here from a validated explicit
 /// `FERRUM_K8S_NODE_UID`, or otherwise from this node's own Kubernetes object,
 /// and never from the node-agent's published `.node-identity-v1.json`. That file
 /// records the CURRENT boot id even when it was written by a PREVIOUS Kubernetes
 /// Node object on this same boot, so no reader can tell a stale publication from
-/// a live one — and the two DaemonSets have no startup ordering between them, so
-/// the replacement node-agent may not have retracted it yet when this stage
-/// runs. Consuming it would let a stale identity and the stale cleanup proof
+/// a live one — and the node-agent DaemonSet has no startup ordering against
+/// this pod, so the replacement node-agent may not have retracted it yet when
+/// this stage runs. Consuming it would let a stale identity and the stale cleanup proof
 /// written under it agree and authorize node-name reuse under the wrong
 /// immutable UID. When no explicit UID is supplied, one bounded `get` on this
 /// node's own object, bound to the node name the downward API gave this pod,
@@ -541,6 +613,11 @@ pub fn execute_ambient_udp_preflight(args: &AmbientUdpPreflightArgs) -> Result<(
     let node_name = resolve_ferrum_var("FERRUM_K8S_NODE_NAME")
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty());
+    let target_proc_root = args
+        .host_proc_root
+        .as_deref()
+        .map(validate_host_proc_root)
+        .transpose()?;
 
     let source = std::sync::Arc::new(crate::proxy::netns_capture::DirectoryCaptureSource::new(
         registry_dir.clone(),
@@ -628,6 +705,7 @@ pub fn execute_ambient_udp_preflight(args: &AmbientUdpPreflightArgs) -> Result<(
 
         let context =
             UdpMigrationContext::for_node_preflight(&registry_dir, target, node, &generation)?;
+        let context = context.with_target_proc_root(target_proc_root);
         let remaining = crate::proxy::owned_shell::remaining(Some(std_deadline))
             .unwrap_or(std::time::Duration::from_secs(0));
         let deadline = tokio::time::Instant::now() + remaining;
