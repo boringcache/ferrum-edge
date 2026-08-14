@@ -610,8 +610,7 @@ fn publish_admin_mtls_candidate(
 
 /// Publish the first accepted admin mTLS candidate and return its serving slot.
 fn publish_admin_mtls_slot(pki: &AdminMtlsPki) -> ferrum_edge::tls::SharedFrontendTls {
-    let slot: ferrum_edge::tls::SharedFrontendTls =
-        Arc::new(ArcSwap::new(Arc::new(None)));
+    let slot: ferrum_edge::tls::SharedFrontendTls = Arc::new(ArcSwap::new(Arc::new(None)));
     let publication = publish_admin_mtls_candidate(pki, &slot);
     assert_eq!(
         publication.outcome,
