@@ -3298,6 +3298,8 @@ fn spawn_file_gateway_lets_harness_allocate_proxy_port_each_attempt() {
 const REPLAY_HMAC_AUTHORITY: &str = "hmac-replay.example.test";
 /// Fixed authority both DPoP replicas present, and the host inside every `htu`.
 const REPLAY_DPOP_AUTHORITY: &str = "dpop-replay.example.test";
+/// Exact issuer realm shared by the DPoP provider and access token.
+const REPLAY_DPOP_ISSUER: &str = "https://dpop-replay.example.test";
 const REPLAY_HMAC_SECRET: &str = "shared-replay-hmac-secret-at-least-32-bytes";
 
 /// A backend that counts mutating application requests.
@@ -3675,7 +3677,12 @@ fn build_dpop_replay_fixture() -> DpopReplayFixture {
     access_header.kid = Some("dpop-replay-key".to_string());
     let access_token = encode(
         &access_header,
-        &json!({"sub": "dpop-user", "cnf": {"jkt": jkt}, "exp": now + 900}),
+        &json!({
+            "sub": "dpop-user",
+            "iss": REPLAY_DPOP_ISSUER,
+            "cnf": {"jkt": jkt},
+            "exp": now + 900
+        }),
         &EncodingKey::from_rsa_pem(private_key_pem).expect("RSA private key"),
     )
     .expect("access token");
@@ -3745,6 +3752,7 @@ plugin_configs:
       redis_key_prefix: "{prefix}"
       providers:
         - jwks: '{jwks_json}'
+          issuer: "{REPLAY_DPOP_ISSUER}"
           require_dpop: true
           dpop_replay_scope: "shared"
 "#,
