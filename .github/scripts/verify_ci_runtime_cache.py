@@ -1030,6 +1030,40 @@ def check_fips(workflow: str, failures: list[str]) -> None:
         "FIPS compile consumers must share rust-cache key ci-fips",
         failures,
     )
+    fips_contract_inputs = (
+        "'Cargo.toml'",
+        "'Cargo.lock'",
+        "'.cargo/config.toml'",
+        "'build.rs'",
+        "'.github/workflows/fips-build.yml'",
+        "'.github/scripts/check_fips_feature_policy.py'",
+        "'src/fips/**'",
+        "'vendor/**'",
+    )
+    for job_body, job_name in (
+        (extract_job(workflow, "fips-compile"), "fips-compile"),
+        (extract_job(workflow, "fips-clippy"), "fips-clippy"),
+        (extract_job(workflow, "fips-test"), "fips-test"),
+    ):
+        blocks = rust_cache_with_blocks(job_body)
+        require(
+            len(blocks) == 1,
+            f"{job_name} must expose one auditable rust-cache contract key",
+            failures,
+        )
+        if len(blocks) == 1:
+            block = blocks[0]
+            require(
+                "key: fips-contract-${{ hashFiles(" in block,
+                f"{job_name} must namespace its cache with the FIPS contract hash",
+                failures,
+            )
+            for contract_input in fips_contract_inputs:
+                require(
+                    contract_input in block,
+                    f"{job_name} FIPS cache contract key must include {contract_input}",
+                    failures,
+                )
     require(
         "cache-on-failure: \"true\"" in workflow or "cache-on-failure: 'true'" in workflow
         or "cache-on-failure: true" in workflow,

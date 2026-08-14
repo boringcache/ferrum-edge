@@ -82,9 +82,14 @@ locked `fips` binary, every claimed feature combination, clippy `-D warnings`,
 and the policy, key-admission, and frontend/backend/CP-DP handshake tests.
 
 Compile artifacts are restored and saved through the local `setup-sccache`
-action plus `Swatinem/rust-cache` with shared key `ci-fips`. Cache keys include
-the Rust toolchain, `Cargo.lock`, workspace config, and the FIPS feature set, so
-AWS-LC source-build outputs invalidate when those inputs change. The cache
+action plus `Swatinem/rust-cache` with shared key `ci-fips`. rust-cache's
+automatic key covers the installed Rust toolchain and workspace state. A
+separate `fips-contract-${{ hashFiles(...) }}` key component explicitly hashes
+`Cargo.toml`, `Cargo.lock`, `.cargo/config.toml`, the root `build.rs`, the
+FIPS workflow, the claimed-profile/FIPS feature-policy checker, `src/fips/**`,
+and `vendor/**`, so feature/profile, build-script, FIPS-policy, and
+vendored-patch changes cannot reuse an incompatible AWS-LC/compiler cache
+entry. The cache
 action holds the GitHub Actions cache credential inside the action process;
 PR-controlled `run:` steps never receive that credential. rust-cache `save-if`
 is false when `github.event.pull_request.head.repo.fork` is true, so fork pull

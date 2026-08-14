@@ -274,7 +274,11 @@ inside `<code>` so a hostile name cannot break Markdown.
 Compile, claimed-profile `cargo check`, clippy `-D warnings`, and the
 policy/key-admission/handshake tests share rust-cache key `ci-fips` and a
 local-disk sccache directory. The compile job saves first; clippy and tests
-restore in parallel. rust-cache `save-if` is false for fork pull requests, so
+restore in parallel. Each site also uses the same explicit FIPS contract hash
+over the manifest/lockfile, Cargo config, root build script, FIPS workflow,
+claimed-profile policy, `src/fips/**`, and `vendor/**`; rust-cache independently
+keys the installed toolchain and workspace state. rust-cache `save-if` is false
+for fork pull requests, so
 those jobs restore `ci-fips` and cannot save. Trusted runs keep
 `cache-on-failure` so ordinary failing jobs can publish compile work when
 post-job cleanup still runs. The successful compile producer publishes before
