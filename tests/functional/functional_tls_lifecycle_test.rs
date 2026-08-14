@@ -1661,9 +1661,7 @@ async fn test_client_ca_withdrawal_retires_established_transport_and_new_handsha
         !outcome.is_authorized(),
         "removing the issuing CA must retire the established transport, got {outcome:?}"
     );
-    fixture
-        .wait_for_accepted_withdrawal("proxy_frontend")
-        .await;
+    fixture.wait_for_accepted_withdrawal("proxy_frontend").await;
 
     // A brand-new connection must meet the new verifier only. The old client
     // certificate no longer chains to any trusted anchor, so the handshake
