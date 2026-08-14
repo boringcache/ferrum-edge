@@ -96,6 +96,9 @@ struct ListenerHandle {
     scheme: BackendScheme,
     frontend_tls: bool,
     passthrough: bool,
+    /// Whether this listener was spawned with the datagram client-address
+    /// metadata gate engaged (issue #3289). Part of the restart key.
+    datagram_client_address: bool,
     backend_tls_reload_key: Option<BackendTlsReloadKey>,
     /// Backend routing snapshot taken when this TCP+TLS listener was spawned
     /// (`None` for non-TcpTls listeners). Compared against the live config in
@@ -755,6 +758,16 @@ struct DesiredStreamProxy {
 }
 
 impl DesiredStreamProxy {
+    /// Whether this proxy asks for the datagram client-address metadata gate.
+    ///
+    /// `stream_proxy_protocol` selects the connection-borne PROXY header on
+    /// tcp/tcp_tls and the per-datagram DGRAM envelope on udp/dtls; only the
+    /// latter is this gate.
+    #[inline]
+    fn runs_datagram_client_address_gate(&self) -> bool {
+        self.stream_proxy_protocol && self.scheme.is_udp()
+    }
+
     /// See [`joins_sni_plane`].
     #[inline]
     fn joins_sni_plane(&self) -> bool {
@@ -792,6 +805,18 @@ struct DesiredStreamListener {
     scheme: BackendScheme,
     frontend_tls: bool,
     passthrough: bool,
+    /// Whether this listener runs the datagram client-address metadata gate:
+    /// `stream_proxy_protocol: true` on a udp/dtls proxy (issue #3289). Part of
+    /// the restart key — the receive loop captures the gate at spawn, so a
+    /// toggle must rebuild the listener rather than keep decoding (or not
+    /// decoding) under the previous decision.
+    ///
+    /// The gate's other inputs — receive-boundary protocol (`frontend_tls` /
+    /// `passthrough`), `bind_addr`, and `port` — are already restart-key fields
+    /// on their own, which is what guarantees a reloaded listener rebuilds the
+    /// correct domain binding (issue #3856) instead of inheriting another
+    /// listener's, and starts from a fresh replay window (issue #3862).
+    datagram_client_address: bool,
     backend_tls_reload_key: Option<BackendTlsReloadKey>,
     sni_ids: Option<Vec<NamespacedResourceId>>,
 }
@@ -984,6 +1009,15 @@ pub struct StreamListenerManager {
     /// this set; untrusted peers are rejected outright to prevent IP spoofing.
     /// Empty when `FERRUM_TRUSTED_PROXIES` is not set.
     trusted_proxies: Arc<crate::proxy::client_ip::TrustedProxies>,
+    /// Shared secret authenticating the datagram client-address envelope
+    /// (`FERRUM_DATAGRAM_PROXY_PROTOCOL_SECRET`, issue #3289), published after
+    /// construction by [`Self::set_datagram_client_address_secret`] because the
+    /// manager is built before that value is threaded in. `None` leaves
+    /// udp/dtls metadata trust resting on `FERRUM_TRUSTED_PROXIES` alone (with
+    /// no authenticity and no freshness); it never disables the envelope itself,
+    /// so a listener can not silently fall back to the socket peer. Published
+    /// once at startup — the secret does not rotate under a live listener.
+    datagram_client_address_secret: arc_swap::ArcSwapOption<String>,
     /// The ONE gateway-wide DestinationRule `connectionPool.tcp.maxConnections`
     /// counter, shared with `ProxyState` and therefore with WebSocket, the
     /// pooled multiplexed transports, and reqwest.
@@ -1233,6 +1267,7 @@ impl StreamListenerManager {
             stream_gateway_ref,
             node_waypoint_identity_resolver: arc_swap::ArcSwap::new(Arc::new(None)),
             trusted_proxies,
+            datagram_client_address_secret: arc_swap::ArcSwapOption::empty(),
             backend_conn_limit: std::sync::OnceLock::new(),
             stream_sni_plaintext_fallback: AtomicBool::new(false),
         }
@@ -1247,6 +1282,22 @@ impl StreamListenerManager {
     pub fn set_stream_sni_plaintext_fallback(&self, enabled: bool) {
         self.stream_sni_plaintext_fallback
             .store(enabled, Ordering::Release);
+    }
+
+    /// Publish the datagram client-address envelope's MAC key.
+    ///
+    /// Must be called after [`Self::new`] and BEFORE the first `reconcile()`, so
+    /// no udp/dtls listener is spawned with a gate that would accept
+    /// unauthenticated metadata this deployment configured a secret for.
+    ///
+    /// The configured bytes are published verbatim. Only an entirely empty
+    /// value is unset: trimming would either key listeners with different bytes
+    /// than `EnvConfig::validate_datagram_proxy_protocol_secret` accepted, or
+    /// turn a whitespace-only secret into no authentication requirement at all.
+    pub fn set_datagram_client_address_secret(&self, secret: Option<String>) {
+        let secret = secret.filter(|value| !value.is_empty());
+        self.datagram_client_address_secret
+            .store(secret.map(Arc::new));
     }
 
     /// Install the ONE gateway-wide `connectionPool.tcp.maxConnections` counter
@@ -1824,6 +1875,7 @@ impl StreamListenerManager {
                     scheme: entry.scheme,
                     frontend_tls: entry.frontend_tls,
                     passthrough: entry.passthrough,
+                    datagram_client_address: entry.runs_datagram_client_address_gate(),
                     backend_tls_reload_key: entry.backend_tls_reload_key.clone(),
                     sni_ids: None,
                 },
@@ -1847,6 +1899,7 @@ impl StreamListenerManager {
                         scheme: entry.scheme,
                         frontend_tls: entry.frontend_tls,
                         passthrough: entry.passthrough,
+                        datagram_client_address: entry.runs_datagram_client_address_gate(),
                         backend_tls_reload_key: entry.backend_tls_reload_key.clone(),
                         sni_ids: Some(ids.clone()),
                     },
@@ -1868,6 +1921,7 @@ impl StreamListenerManager {
                         scheme: entry.scheme,
                         frontend_tls: entry.frontend_tls,
                         passthrough: false,
+                        datagram_client_address: entry.runs_datagram_client_address_gate(),
                         backend_tls_reload_key: entry.backend_tls_reload_key.clone(),
                         // Reuse the candidate-id channel. `tcp_proxy`
                         // distinguishes an L4 match group from an SNI group by
@@ -1935,6 +1989,7 @@ impl StreamListenerManager {
                 scheme,
                 frontend_tls,
                 passthrough,
+                datagram_client_address,
                 backend_tls_reload_key,
                 sni_ids,
             }) = effective_desired.get(key)
@@ -1952,6 +2007,9 @@ impl StreamListenerManager {
                 || handle.scheme != *scheme
                 || handle.frontend_tls != *frontend_tls
                 || handle.passthrough != *passthrough
+                // The datagram client-address gate is captured at spawn, so
+                // enabling or disabling it must restart the listener.
+                || handle.datagram_client_address != *datagram_client_address
                 // SNI-group membership change on a shared passthrough
                 // port: the running listener captured the old candidate
                 // ID list at spawn, so it must be restarted. IDs are
@@ -2062,6 +2120,7 @@ impl StreamListenerManager {
                 scheme,
                 frontend_tls,
                 passthrough,
+                datagram_client_address,
                 backend_tls_reload_key,
                 sni_ids,
             } = desired_listener;
@@ -2246,6 +2305,35 @@ impl StreamListenerManager {
                     None
                 };
                 let metrics = Arc::new(UdpProxyMetrics::default());
+                // Datagram client-address metadata gate (issues #3289, #3856,
+                // #3862), built once per listener from the process-wide trust
+                // boundary, the optional MAC key, and this listener's exact
+                // domain identity: receive-boundary protocol (DTLS-terminating
+                // versus plain UDP), canonical bind address, and port. Every
+                // component of that identity is already part of the listener
+                // restart key, so a reload reconstructs the correct binding —
+                // and a fresh replay window — instead of inheriting the
+                // previous listener's. `None` unless this proxy opted in, so an
+                // ordinary udp/dtls listener keeps its exact prior behavior.
+                let datagram_client_address = datagram_client_address.then(|| {
+                    use crate::proxy::datagram_client_address::{
+                        DatagramClientAddressGate, DatagramListenerBinding,
+                        DatagramListenerProtocol,
+                    };
+                    let protocol = if frontend_dtls_config.is_some() {
+                        DatagramListenerProtocol::Dtls
+                    } else {
+                        DatagramListenerProtocol::Udp
+                    };
+                    let secret = self.datagram_client_address_secret.load();
+                    let gate = DatagramClientAddressGate::new(
+                        self.trusted_proxies.clone(),
+                        secret.as_deref().map(String::as_str),
+                        DatagramListenerBinding::new(protocol, bind_addr, port_val),
+                        self.pool_shard_amount,
+                    );
+                    Arc::new(gate)
+                });
                 let udp_max_sessions = self.udp_max_sessions;
                 let frontend_tls_handshake_timeout = self.frontend_tls_handshake_timeout_seconds;
                 let udp_cleanup_interval = self.udp_cleanup_interval_seconds;
@@ -2313,6 +2401,7 @@ impl StreamListenerManager {
                         udp_gso_enabled,
                         udp_pktinfo_enabled,
                         mesh_outbound_enforcement,
+                        datagram_client_address,
                     })
                     .await
                     {
@@ -2530,6 +2619,7 @@ impl StreamListenerManager {
                     scheme: *scheme,
                     frontend_tls: *frontend_tls,
                     passthrough: *passthrough,
+                    datagram_client_address: *datagram_client_address,
                     backend_tls_reload_key: backend_tls_reload_key.clone(),
                     backend_routing_key,
                     sni_ids: sni_ids.clone(),

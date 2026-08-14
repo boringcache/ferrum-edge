@@ -535,6 +535,10 @@ pub fn check_env_config_enforced(env_config: &EnvConfig) -> Result<(), String> {
             "FERRUM_BASIC_AUTH_HMAC_SECRET",
             env_config.basic_auth_hmac_secret.as_deref(),
         ),
+        (
+            "FERRUM_DATAGRAM_PROXY_PROTOCOL_SECRET",
+            env_config.datagram_proxy_protocol_secret.as_deref(),
+        ),
     ] {
         if let Some(secret) = secret.filter(|s| !s.is_empty())
             && secret.len() < MIN_HMAC_KEY_BYTES

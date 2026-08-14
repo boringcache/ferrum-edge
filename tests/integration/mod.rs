@@ -36,6 +36,7 @@ mod cp_grpc_handshake_admission_tests;
 mod cp_multi_namespace_tests;
 mod cp_tenant_trust_binding_tests;
 mod cp_trust_reload_health_tests;
+mod datagram_client_address_datapath_tests;
 mod db_full_load_snapshot_tests;
 mod db_incremental_poll_tests;
 mod db_mutation_decode_fail_closed_tests;
