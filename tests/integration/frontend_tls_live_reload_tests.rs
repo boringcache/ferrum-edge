@@ -562,22 +562,55 @@ fn admin_mtls_server_config(pki: &AdminMtlsPki) -> Arc<ServerConfig> {
     )
 }
 
-/// Admin `ServerConfig` that verifies a client certificate when one is offered
-/// but does not require one, so the "no client certificate" case can complete a
-/// handshake at all.
-fn admin_optional_mtls_server_config(pki: &AdminMtlsPki) -> Arc<ServerConfig> {
-    let verifier = rustls::server::WebPkiClientVerifier::builder(pki.client_roots.clone())
-        .allow_unauthenticated()
-        .build()
-        .expect("build optional admin client verifier");
+/// Admin `ServerConfig` with no client-certificate authentication, matching an
+/// admin listener without `FERRUM_ADMIN_TLS_CLIENT_CA_BUNDLE_PATH`.
+fn admin_no_client_auth_server_config(pki: &AdminMtlsPki) -> Arc<ServerConfig> {
     Arc::new(
         ServerConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
             .with_safe_default_protocol_versions()
             .expect("default protocol versions")
-            .with_client_cert_verifier(verifier)
+            .with_no_client_auth()
             .with_single_cert(pki.server_certs.clone(), pki.server_key.clone_key())
             .expect("admin server cert"),
     )
+}
+
+/// Publish the same verifier/config/material transaction production admin TLS
+/// uses, and return the atomically populated serving slot.
+fn publish_admin_mtls_slot(pki: &AdminMtlsPki) -> ferrum_edge::tls::SharedFrontendTls {
+    let verifier: Arc<dyn rustls::server::danger::ClientCertVerifier> =
+        rustls::server::WebPkiClientVerifier::builder(pki.client_roots.clone())
+            .build()
+            .expect("build admin client verifier");
+    let bound = ferrum_edge::tls::client_trust::bind_live_handshake_verifier(
+        ferrum_edge::tls::ClientTrustScope::AdminHttps,
+        verifier.clone(),
+    );
+    let config = Arc::new(
+        ServerConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
+            .with_safe_default_protocol_versions()
+            .expect("default protocol versions")
+            .with_client_cert_verifier(bound)
+            .with_single_cert(pki.server_certs.clone(), pki.server_key.clone_key())
+            .expect("admin server cert"),
+    );
+    let material =
+        ferrum_edge::tls::ClientTrustMaterial::from_parts(Some(pki.client_ca_pem.as_bytes()), &[])
+            .expect("summarize the admin client CA");
+    let slot: ferrum_edge::tls::SharedFrontendTls =
+        Arc::new(ArcSwap::new(Arc::new(None)));
+    let publication = ferrum_edge::tls::client_trust::publish_accepted_rustls_candidate(
+        ferrum_edge::tls::ClientTrustScope::AdminHttps,
+        material,
+        verifier,
+        || slot.store(Arc::new(Some(config))),
+    );
+    assert_eq!(
+        publication.outcome,
+        ferrum_edge::tls::client_trust::ClientTrustPublicationOutcome::Armed,
+        "the first accepted admin client-trust candidate must arm its scope"
+    );
+    slot
 }
 
 fn admin_client_config(pki: &AdminMtlsPki, with_client_cert: bool, alpn: &[&[u8]]) -> ClientConfig {
@@ -789,15 +822,7 @@ async fn admin_https_registers_a_client_certificate_authenticated_connection() {
     let _registry = isolated_client_trust_registry().await;
     let pki = admin_mtls_pki();
 
-    // Arm the admin scope. `capture` is `None` until this happens, which is the
-    // default live-reload-disabled posture.
-    ferrum_edge::tls::client_trust::arm_at_generation_for_test(
-        ferrum_edge::tls::ClientTrustScope::AdminHttps,
-        1,
-    );
-
-    let slot: ferrum_edge::tls::SharedFrontendTls =
-        Arc::new(ArcSwap::new(Arc::new(Some(admin_mtls_server_config(&pki)))));
+    let slot = publish_admin_mtls_slot(&pki);
     let (addr, shutdown_tx, listener) = start_admin_https_listener(slot, 10).await;
 
     let (mut transport, driver) =
@@ -842,13 +867,8 @@ async fn admin_https_does_not_register_a_connection_without_a_client_certificate
     let _registry = isolated_client_trust_registry().await;
     let pki = admin_mtls_pki();
 
-    ferrum_edge::tls::client_trust::arm_at_generation_for_test(
-        ferrum_edge::tls::ClientTrustScope::AdminHttps,
-        1,
-    );
-
     let slot: ferrum_edge::tls::SharedFrontendTls = Arc::new(ArcSwap::new(Arc::new(Some(
-        admin_optional_mtls_server_config(&pki),
+        admin_no_client_auth_server_config(&pki),
     ))));
     let (addr, shutdown_tx, listener) = start_admin_https_listener(slot, 10).await;
 
@@ -945,23 +965,9 @@ async fn admin_https_established_connections_are_fenced_after_an_accepted_withdr
     let _registry = isolated_client_trust_registry().await;
     let pki = admin_mtls_pki();
 
-    // A real publication chain: arm a baseline that trusts one anchor, then
-    // publish a candidate that no longer does.
-    let baseline =
-        ferrum_edge::tls::ClientTrustMaterial::from_parts(Some(pki.client_ca_pem.as_bytes()), &[])
-            .expect("summarize the admin client CA");
-    let armed = ferrum_edge::tls::client_trust::publish_accepted_material(
-        ferrum_edge::tls::ClientTrustScope::AdminHttps,
-        baseline,
-    );
-    assert_eq!(
-        armed.outcome,
-        ferrum_edge::tls::client_trust::ClientTrustPublicationOutcome::Armed,
-        "the first publication arms the admin scope"
-    );
-
-    let slot: ferrum_edge::tls::SharedFrontendTls =
-        Arc::new(ArcSwap::new(Arc::new(Some(admin_mtls_server_config(&pki)))));
+    // A real rustls publication chain: install the live verifier, expose its
+    // bound config, then arm the matching material/generation atomically.
+    let slot = publish_admin_mtls_slot(&pki);
     let (addr, shutdown_tx, listener) = start_admin_https_listener(slot, 10).await;
 
     let (mut keepalive, keepalive_driver) =
