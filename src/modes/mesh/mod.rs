@@ -39,8 +39,8 @@ use crate::admin::jwt_auth::create_jwt_manager_from_env;
 use crate::admin::{self, AdminState};
 use crate::config::EnvConfig;
 use crate::config::conf_file::resolve_ferrum_var;
-use crate::config::env_config_macro::EnvValue;
 use crate::config::db_backend::NamespacedResourceId;
+use crate::config::env_config_macro::EnvValue;
 use crate::config::types::{
     BackendScheme, BackendTlsConfig, DispatchKind, GatewayConfig, HealthCheckConfig,
     LoadBalancerAlgorithm, MAX_BACKEND_TLS_SAN_ALLOW_LIST_ENTRIES,
@@ -668,10 +668,7 @@ impl MeshRuntimeConfig {
             match resolve_ferrum_var("FERRUM_MESH_STOCK_XDS_ALLOW_PLAINTEXT") {
                 None => false,
                 Some(raw) if raw.trim().is_empty() => false,
-                Some(raw) => bool::parse_env(
-                    raw.trim(),
-                    "FERRUM_MESH_STOCK_XDS_ALLOW_PLAINTEXT",
-                )?,
+                Some(raw) => bool::parse_env(raw.trim(), "FERRUM_MESH_STOCK_XDS_ALLOW_PLAINTEXT")?,
             };
         let stock_xds_credential_policy = parse_stock_xds_credential_policy()?;
         if config_protocol == MeshConfigProtocol::StockXds {
