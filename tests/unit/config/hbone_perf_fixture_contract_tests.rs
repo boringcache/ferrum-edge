@@ -51,8 +51,7 @@ fn hbone_perf_fixture_uses_trusted_projection_not_operator_file_config() {
 #[test]
 fn hbone_e2e_harness_launches_trusted_fixture_not_production_file_mode() {
     assert!(
-        HBONE_RUN
-            .contains("$PROJECT_ROOT/target/release/examples/hbone_perf_fixture"),
+        HBONE_RUN.contains("$PROJECT_ROOT/target/release/examples/hbone_perf_fixture"),
         "harness must launch the trusted fixture example"
     );
     assert!(

@@ -77,9 +77,7 @@ struct Args {
 
 fn main() -> anyhow::Result<()> {
     ferrum_edge::fips::install_crypto_provider()
-        .map_err(|err| {
-            anyhow::anyhow!("failed to initialize the cryptographic provider: {err}")
-        })?;
+        .map_err(|err| anyhow::anyhow!("failed to initialize the cryptographic provider: {err}"))?;
 
     let args = Args::parse();
     tracing_subscriber::fmt()
@@ -212,8 +210,8 @@ fn projected_hbone_config(sidecar_host: &str, sidecar_port: u16) -> anyhow::Resu
         "plugin_configs": []
     });
 
-    let mut config: GatewayConfig = serde_json::from_value(value)
-        .context("HBONE fixture GatewayConfig must deserialize")?;
+    let mut config: GatewayConfig =
+        serde_json::from_value(value).context("HBONE fixture GatewayConfig must deserialize")?;
     config.normalize_fields();
     Ok(config)
 }
