@@ -1230,12 +1230,6 @@ struct TrustRetirementFixture {
 }
 
 impl TrustRetirementFixture {
-    /// Spawn a gateway with frontend mTLS + live reload. Returns `None` when the
-    /// child failed to become healthy so the caller can retry with fresh ports.
-    async fn try_new() -> Option<Self> {
-        Self::try_new_with(FixtureSurfaces::default()).await
-    }
-
     async fn try_new_with(surfaces: FixtureSurfaces) -> Option<Self> {
         let dir = TempDir::new().unwrap();
         let server_ca = generate_ca("Retirement-Server-CA");
