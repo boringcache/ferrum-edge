@@ -190,6 +190,10 @@ runs:
         export SCCACHE_CACHE_SIZE=2G
         mkdir -p "${SCCACHE_DIR}"
         unset SCCACHE_GHA_ENABLED
+        # `unset` protects this shell. Persist an explicit empty value as the
+        # final GITHUB_ENV assignment so an earlier action or workflow cannot
+        # re-enable the credential-bearing GHA backend in later build steps.
+        echo "SCCACHE_GHA_ENABLED=" >> "$GITHUB_ENV"
 
         # Disable the sccache server idle timeout (default 600s). The release
         # build compiles the large `ferrum-edge` lib crate as a single rustc
