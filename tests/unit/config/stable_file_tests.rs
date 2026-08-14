@@ -1,17 +1,19 @@
-//! Shared bounded stable-file reader (`config::stable_file`) — issue #3776.
+//! Shared bounded stable-file reader (`config::stable_file`) — issues #3776 / #3881.
 //!
 //! Covers exact limit / limit+1, sparse oversized metadata, growth past the
 //! streaming ceiling, FIFO/socket/device/directory rejection, projected-secret
-//! symlink rotation, path replacement / torn content fail-closed behavior, and
-//! UTF-8 refusal without content leakage.
+//! symlink rotation, path replacement / torn content fail-closed behavior, a
+//! coordinated truncate/write settle-window regression, UTF-8 refusal without
+//! content leakage, and well-defined zero-delay custom options.
 
 use std::path::Path;
 use std::time::Duration;
 
 use ferrum_edge::config::stable_file::{
     MAX_FERRUM_CONF_BYTES, MAX_GATEWAY_CONFIG_FILE_BYTES, MAX_MESH_CONFIG_FILE_BYTES,
-    StableFileError, StableFileReadOptions, classify_error_after_first_probe,
-    detect_json_or_yaml_extension, format_stable_file_error, read_stable_file,
+    STABLE_FILE_MAX_ATTEMPTS, STABLE_FILE_RETRY_DELAY, StableFileError, StableFileReadOptions,
+    classify_error_after_first_probe, detect_json_or_yaml_extension, format_stable_file_error,
+    read_stable_file,
 };
 
 const TEST_LIMIT: u64 = 64;
@@ -30,6 +32,8 @@ fn documented_ceilings_match_issue_contract() {
     assert_eq!(MAX_FERRUM_CONF_BYTES, 1024 * 1024);
     assert_eq!(MAX_GATEWAY_CONFIG_FILE_BYTES, 64 * 1024 * 1024);
     assert_eq!(MAX_MESH_CONFIG_FILE_BYTES, 64 * 1024 * 1024);
+    assert_eq!(STABLE_FILE_MAX_ATTEMPTS, 5);
+    assert_eq!(STABLE_FILE_RETRY_DELAY, Duration::from_millis(20));
 }
 
 #[test]
@@ -202,6 +206,119 @@ fn a_disappearance_after_the_first_probe_is_instability_not_terminal_absence() {
     ));
 }
 
+#[test]
+fn zero_retry_delay_is_well_defined_and_still_admits_a_stable_file() {
+    // Duration::ZERO skips both the inter-probe settle and the between-attempt
+    // wait. The two probes still run and still require byte-identical content.
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("stable.conf");
+    std::fs::write(&path, "AAAA").unwrap();
+    let loaded = read_stable_file(
+        &path,
+        StableFileReadOptions {
+            max_bytes: TEST_LIMIT,
+            source_name: "test config",
+            max_attempts: 1,
+            retry_delay: Duration::ZERO,
+        },
+    )
+    .expect("zero-delay options must still admit a stable file");
+    assert_eq!(loaded, "AAAA");
+}
+
+#[test]
+fn held_torn_window_is_not_published_and_complete_generation_converges() {
+    // Issue #3881: back-to-back probes can both complete inside the empty
+    // window `std::fs::write` opens between create/truncate and write. Hold
+    // that truncated generation, prove the first probe observed it, then
+    // publish the complete body in the inter-probe settle. A single attempt
+    // must not return the torn bytes; a later read must converge to the
+    // complete generation. Coordination is a between-probes hook, not a
+    // wall-clock sleep that can lose the first probe on a saturated runner.
+    use std::io::Write;
+    use std::thread;
+
+    use ferrum_edge::_test_support::read_stable_file_with_between_probes_for_test;
+
+    let dir = tempfile::tempdir().unwrap();
+    let live = dir.path().join("torn.conf");
+
+    let (window_held_tx, window_held_rx) = std::sync::mpsc::sync_channel(1);
+    let (release_tx, release_rx) = std::sync::mpsc::sync_channel(1);
+    let (published_tx, published_rx) = std::sync::mpsc::sync_channel(1);
+
+    let writer_path = live.clone();
+    let writer = thread::spawn(move || {
+        let mut file = std::fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .open(&writer_path)
+            .unwrap();
+        window_held_tx.send(()).unwrap();
+        if release_rx.recv_timeout(Duration::from_secs(5)).is_err() {
+            return;
+        }
+        let _ = file.write_all(b"AAAA");
+        let _ = file.sync_all();
+        drop(file);
+        let _ = published_tx.send(());
+    });
+
+    window_held_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("writer must publish the held empty window");
+
+    let mut first_probe_saw_torn = false;
+    let outcome = read_stable_file_with_between_probes_for_test(
+        &live,
+        StableFileReadOptions {
+            max_bytes: TEST_LIMIT,
+            source_name: "test config",
+            max_attempts: 1,
+            retry_delay: Duration::from_millis(1),
+        },
+        |first_probe| {
+            assert!(
+                first_probe.is_empty(),
+                "first probe must observe the held torn window, got {first_probe:?}"
+            );
+            first_probe_saw_torn = true;
+            release_tx
+                .send(())
+                .expect("writer must still be waiting to publish");
+            published_rx
+                .recv_timeout(Duration::from_secs(5))
+                .expect("complete generation must publish during the inter-probe settle");
+        },
+    );
+    let _ = writer.join();
+
+    assert!(
+        first_probe_saw_torn,
+        "reader must complete the first probe against the held torn window"
+    );
+    match outcome {
+        Err(StableFileError::Unstable(_)) => {}
+        Ok(content) => panic!(
+            "must not publish the held torn window from a single straddle attempt, got {content:?}"
+        ),
+        Err(other) => panic!("expected instability across the settle window, got {other}"),
+    }
+
+    let loaded = read_stable_file(
+        &live,
+        StableFileReadOptions {
+            max_bytes: TEST_LIMIT,
+            source_name: "test config",
+            max_attempts: 3,
+            retry_delay: Duration::from_millis(20),
+        },
+    )
+    .expect("complete generation must converge after the torn window closes");
+    assert_eq!(loaded, "AAAA");
+}
+
 #[cfg(unix)]
 mod unix_targets {
     use super::*;
@@ -371,11 +488,13 @@ mod unix_targets {
 
     #[test]
     fn delete_recreate_churn_still_reaches_a_stable_generation() {
-        // Behavioral companion to the classifier test: a publisher that removes
-        // and recreates the path (non-atomic `cp`/editor style) must still be
-        // able to yield a stable generation. Before the disappearance was
-        // classified as instability, a window between probes surfaced a
-        // terminal NotFound that the bounded retry never revisited.
+        // Behavioral companion to the classifier test and to the coordinated
+        // settle-window regression: a publisher that removes and recreates the
+        // path (non-atomic `cp`/editor style) must still be able to yield a
+        // stable generation, and must never return the empty truncate window
+        // as success. Concurrent churn remains useful coverage; the
+        // deterministic torn-window proof lives in
+        // `held_torn_window_is_not_published_and_complete_generation_converges`.
         let dir = tempfile::tempdir().unwrap();
         let live = dir.path().join("churn.conf");
         std::fs::write(&live, "AAAA").unwrap();

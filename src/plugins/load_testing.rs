@@ -1022,8 +1022,15 @@ impl Plugin for LoadTesting {
                 let body = Arc::clone(&request_body);
 
                 tokio::spawn(async move {
+                    let Ok(http) = client.get() else {
+                        tracing::warn!(
+                            remote = %remote_label,
+                            "load_testing: plugin HTTP client unavailable; skipping fan-out"
+                        );
+                        return;
+                    };
                     let Ok(mut req) =
-                        build_request(client.get(), &fanout_method, &fanout_url, &fanout_hdrs)
+                        build_request(http, &fanout_method, &fanout_url, &fanout_hdrs)
                     else {
                         tracing::warn!(
                             remote = %remote_label,

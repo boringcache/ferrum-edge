@@ -4780,7 +4780,15 @@ async fn post_json_each_row_bytes(
 ) -> DeliveryOutcome {
     let start = Instant::now();
     let mut request = match &cfg.http {
-        ClickHouseHttpClient::Shared(client) => client.get().post(&cfg.insert_url),
+        ClickHouseHttpClient::Shared(client) => match client.get() {
+            Ok(shared) => shared.post(&cfg.insert_url),
+            Err(_) => {
+                return DeliveryOutcome::Permanent {
+                    status: 502,
+                    message: "plugin HTTP client unavailable".to_string(),
+                };
+            }
+        },
         ClickHouseHttpClient::Dedicated(client) => client.post(&cfg.insert_url),
     }
     .timeout(cfg.timeout)

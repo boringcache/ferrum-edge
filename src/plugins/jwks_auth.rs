@@ -2399,7 +2399,10 @@ async fn discover_jwks_uri(
     discovery_url: &str,
 ) -> Result<String, String> {
     let redacted_discovery_url = redacted_jwks_uri(discovery_url);
-    let req = http_client.get().get(discovery_url);
+    let client = http_client
+        .get()
+        .map_err(|e| format!("OIDC discovery request failed: {e}"))?;
+    let req = client.get(discovery_url);
     let response = http_client
         .execute_redacted(req, "jwks_auth_oidc_discovery", &redacted_discovery_url)
         .await

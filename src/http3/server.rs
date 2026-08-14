@@ -4393,10 +4393,8 @@ async fn handle_h3_request(
             &state.env_config.backend_allow_ips,
         )
         .is_some()
-        || crate::proxy::backend_dispatch::direct_network_http_transport_refusal(
-            upstream_target.as_deref(),
-        )
-        .is_some();
+        || crate::proxy::backend_dispatch::h3_bridge_transport_refusal(upstream_target.as_deref())
+            .is_some();
     if reevaluate_response_policy_after_request_body
         && !request_body_prepared
         && !preparation_blocked_by_dispatch_policy
@@ -4726,12 +4724,19 @@ async fn handle_h3_request(
             .any(|plugin| plugin.forces_reqwest_dispatch(&ctx));
     let backend_supports_native_h3 =
         crate::proxy::supports_native_http3_backend(&state, &proxy, upstream_target.as_deref());
+    // Mesh-tagged targets cannot ride the native QUIC pool — they need the
+    // shared HBONE / Sidecar mesh-mTLS bridges (issue #3620). Force them onto
+    // the cross-protocol path rather than refusing at the native gate.
+    let mesh_egress_required = upstream_target
+        .as_deref()
+        .is_some_and(crate::proxy::target_requires_http_mesh_egress);
     let retry_response_needs_header_refinement =
         has_retry && crate::proxy::plugins_may_release_response_body_under_retries(&plugins, &ctx);
     let use_native_h3_pool = backend_http_flavor == HttpFlavor::Plain
         && !deadline_bound_grpc_web_pass_through
         && !forces_reqwest_dispatch
-        && backend_supports_native_h3;
+        && backend_supports_native_h3
+        && !mesh_egress_required;
 
     let backend_url = build_h3_backend_url_for_flavor(
         &proxy,
@@ -4830,17 +4835,17 @@ async fn handle_h3_request(
     let use_native_h3_grpc = backend_http_flavor == HttpFlavor::Grpc
         && can_stream_request_body
         && !forces_reqwest_dispatch
-        && backend_supports_native_h3;
+        && backend_supports_native_h3
+        && !mesh_egress_required;
 
     // Native-H3 pool branches (Plain + gRPC flavor, backend probed H3-capable)
-    // are direct QUIC dials with no HBONE / mesh-mTLS / east-west / Unix path,
-    // so fail closed on any target that requires one of those transports BEFORE
+    // are direct QUIC dials with no Unix path. Mesh-tagged targets are forced
+    // onto the bridge above; Unix-socket targets still fail closed here before
     // either native branch can open the H3 backend pool.
     let native_h3_direct_dispatch = use_native_h3_pool || use_native_h3_grpc;
     if native_h3_direct_dispatch
-        && let Some(reason) = crate::proxy::backend_dispatch::direct_network_http_transport_refusal(
-            upstream_target.as_deref(),
-        )
+        && let Some(reason) =
+            crate::proxy::backend_dispatch::h3_bridge_transport_refusal(upstream_target.as_deref())
     {
         warn!(
             proxy_id = %proxy.id,
@@ -7182,18 +7187,19 @@ async fn handle_h3_request(
                 let next_retry_target = if let (Some(_upstream_id), Some(prev_target)) =
                     (&proxy.upstream_id, &current_target)
                     && let Some(ref hash_key) = lb_hash_key
-                    && let Some(next) = crate::proxy::backend_dispatch::select_next_retry_target(
-                        &state,
-                        &epoch,
-                        &proxy,
-                        prev_target,
-                        crate::proxy::backend_dispatch::RetryTargetRequest {
-                            base_hash_key: hash_key,
-                            client_ip: &ctx.client_ip,
-                            proxy_headers: &proxy_headers,
-                            request_authority: request_host.as_deref(),
-                        },
-                    ) {
+                    && let Some(next) =
+                        crate::proxy::backend_dispatch::select_next_h3_eligible_retry_target(
+                            &state,
+                            &epoch,
+                            &proxy,
+                            prev_target,
+                            crate::proxy::backend_dispatch::RetryTargetRequest {
+                                base_hash_key: hash_key,
+                                client_ip: &ctx.client_ip,
+                                proxy_headers: &proxy_headers,
+                                request_authority: request_host.as_deref(),
+                            },
+                        ) {
                     if !crate::proxy::retry_target_preserves_backend_path(
                         backend_path_is_policy_bound,
                         &proxy,
@@ -7288,11 +7294,15 @@ async fn handle_h3_request(
                         // Unsupported both fall through to the buffered
                         // cross-protocol bridge so mixed-capability
                         // upstreams do not burn a doomed QUIC timeout.
+                        // Mesh-tagged targets also leave the native pool and
+                        // ride the shared HBONE / mesh-mTLS path (issue #3620).
                         current_dispatch_h3 = crate::proxy::supports_native_http3_backend(
                             &state,
                             &selected_base_proxy,
                             current_target.as_deref(),
-                        );
+                        ) && !current_target
+                            .as_deref()
+                            .is_some_and(crate::proxy::target_requires_http_mesh_egress);
                     }
                 }
 
@@ -7332,18 +7342,15 @@ async fn handle_h3_request(
                     break;
                 }
 
-                // Retry rotation must re-screen the target's required
-                // transport too. A Unix target's host/port is only a carrier
-                // for its reserved socket tag, and this native-H3 loop has no
-                // Unix dialer; mesh transports likewise have their own
-                // secured dispatch paths. Refuse before admission or any
-                // network dial rather than sending the replay to the
-                // placeholder address.
-                if let Some(reason) =
-                    crate::proxy::backend_dispatch::direct_network_http_transport_refusal(
-                        current_target.as_deref(),
-                    )
-                {
+                // Defensive transport screen after the bounded H3-eligible
+                // selector above. That selector skips Unix-socket candidates,
+                // but retain this fail-closed check so a future eligibility
+                // expansion cannot make a schema-only Unix placeholder dialable
+                // here. Mesh HBONE / Sidecar mTLS targets remain eligible via
+                // the shared mesh pools below (issue #3620).
+                if let Some(reason) = crate::proxy::backend_dispatch::h3_bridge_transport_refusal(
+                    current_target.as_deref(),
+                ) {
                     warn!(
                         proxy_id = %proxy.id,
                         reason,
@@ -7406,7 +7413,30 @@ async fn handle_h3_request(
                     &selected_base_proxy,
                     current_target.as_deref(),
                 );
-                result = if current_dispatch_h3 {
+                result = if let Some(target) = current_target
+                    .as_deref()
+                    .filter(|target| crate::proxy::target_requires_http_mesh_egress(target))
+                {
+                    // Mesh-tagged rotation: share the H1/H2 HBONE /
+                    // Sidecar mesh-mTLS pools (issue #3620).
+                    h3_buffered_result_from_backend_response(
+                        crate::proxy::proxy_h3_plain_http_mesh_buffered(
+                            &state,
+                            attempt_dispatch_proxy.as_ref(),
+                            &current_url,
+                            &method,
+                            &proxy_headers,
+                            Bytes::copy_from_slice(body_data.as_slice()),
+                            target,
+                            &plugins,
+                            &ctx,
+                            &ctx.client_ip,
+                            socket_ip,
+                            ctx.request_is_secure,
+                        )
+                        .await,
+                    )
+                } else if current_dispatch_h3 {
                     proxy_to_backend_h3(
                         &state,
                         attempt_dispatch_proxy.as_ref(),
@@ -14873,7 +14903,8 @@ mod native_h3_retry_refinement_tests {
         assert!(handler.contains("(!has_retry || retry_response_needs_header_refinement)"));
         assert!(handler.contains("backend_http_flavor == HttpFlavor::Plain"));
         assert!(handler.contains("&& !forces_reqwest_dispatch"));
-        assert!(handler.contains("&& backend_supports_native_h3;"));
+        assert!(handler.contains("&& backend_supports_native_h3"));
+        assert!(handler.contains("&& !mesh_egress_required;"));
         assert!(handler.contains("let refined_body_data = if has_retry"));
         assert!(handler.contains("body_data.clone()"));
 
@@ -15829,6 +15860,7 @@ mod build_h3_backend_headers_tests {
             http_tls_listen_ports: Default::default(),
             mesh_revision: None,
             k8s_mesh_overlay: Default::default(),
+            gateway_trust_bundles: Vec::new(),
         };
         ProxyState::new(config, dns_cache, EnvConfig::default(), None, None)
             .expect("minimal ProxyState should construct")

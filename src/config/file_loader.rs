@@ -20,12 +20,18 @@
 //!    are non-blocking so a raced special file cannot wedge the worker).
 //! 2. Reads the opened handle, then re-fstats that handle and re-stats the
 //!    configured path so symlink/rename swaps mid-read fail closed.
-//! 3. Performs a second independent open/read and requires **byte-identical**
-//!    content plus matching file identity. Size/metadata agreement alone is
-//!    not treated as proof of content stability (same-size in-place rewrites
-//!    and paused torn truncations can keep metadata unchanged).
-//! 4. Retries a bounded number of times on instability, then fails closed.
-//!    Reload keeps the last known-good live generation; startup aborts.
+//! 3. Sleeps the configured settle interval (the shared retry delay; 20ms by
+//!    default) then performs a second independent open/read and requires
+//!    **byte-identical** content plus matching file identity. Size/metadata
+//!    agreement alone is not treated as proof of content stability (same-size
+//!    in-place rewrites and paused torn truncations can keep metadata
+//!    unchanged). Back-to-back probes can both fit inside one truncate/write
+//!    window; the settle interval is what makes that window visible.
+//! 4. Retries a bounded number of times on instability, sleeping the same
+//!    interval between attempts, then fails closed. Worst-case synchronous
+//!    sleep is 180ms at the defaults plus the capped I/O — a cold-path cost,
+//!    not a per-request delay. Reload keeps the last known-good live
+//!    generation; startup aborts.
 //!
 //! Operators should publish updates with write-temp → fsync → `rename(2)` (or
 //! an equivalent atomic replace such as a Kubernetes ConfigMap symlink swap).

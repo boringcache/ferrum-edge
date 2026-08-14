@@ -1058,6 +1058,7 @@ async fn fetch_and_install_bundle(
     let endpoint_for_logs = sanitize_endpoint_for_logging(endpoint);
     let request = http_client
         .get()
+        .map_err(|e| format!("HTTP request failed: {e}"))?
         .get(endpoint)
         .header(reqwest::header::ACCEPT, "application/json")
         .timeout(config.request_timeout);

@@ -18,12 +18,12 @@ Returns the entire gateway configuration as a single JSON document. The output f
 ### Key Behaviors
 
 - **Unredacted credentials**: Unlike `GET /consumers` (whose closed ordinary-response projection omits `basicauth` and unknown/custom credential types, drops legacy extra fields, and redacts `hmac_auth.secret`, `jwt.secret`, and `keyauth.key`), the backup endpoint returns raw stored credential values, including custom credential maps. This is necessary for faithful restoration and means backup payloads must be protected as secrets. In the OpenAPI document, backup consumer items use the `ConsumerBackup` schema (`basicauth` entries carry the canonical stored `password_hash`; plaintext passwords are never exported) and restore consumer items use `ConsumerRestore` (which additionally accepts a plaintext `password` per entry, hashed on import). Real `keyauth` backup/restore entries use `KeyAuthCredentialBackup`, which excludes the reserved `[REDACTED]` marker the same way `KeyAuthCredential` does on create/update, because runtime `Consumer::validate_fields()` rejects that placeholder on restore.
-- **Security audit trail**: Every successful export and every authenticated denied/failed attempt is recorded before (or instead of) releasing the body. This security path is unconditional and independent of `FERRUM_ADMIN_AUDIT_ENABLED` (which gates ordinary mutation audit events only). Successful events carry actor, namespace, validated resource filter, data source (`database` / `cached`), resource counts, final byte count, canonical peer `source_address`, bounded `request_id`, and `outcome=success`. Failed/denied events carry only a fixed-cardinality `failure_category` / `outcome` — never raw backend, parser, authorization, or serialization error text, and never credentials, tokens, cookies, JWTs, query/header secrets, or backup payload fragments. The resource filter recorded in audit is closed-cardinality: allow-listed names only, the sentinel `all`, or the fixed sentinel `invalid` when the request contained unknown tokens or a structurally malformed `resources` parameter (raw unknown tokens are never stored or logged). Unknown or malformed `resources` forms are also rejected at the request boundary with `400` and static client text. When an authenticated `GET /backup` presents an invalid `X-Ferrum-Namespace`, the attempt is still audited best-effort under the valid default audit namespace (`ferrum`) with fixed `namespace_status: invalid` metadata — the raw invalid namespace is never persisted or logged, and audit-sink failure never changes the original `400` rejection. Admission prefers a synchronous `audit_events` insert; when the primary store is absent or rejects the insert (including the cached-config path during a database outage), Ferrum appends to the bounded local fallback under `FERRUM_ADMIN_AUDIT_FALLBACK_PATH` on a blocking worker with bounded cross-process exclusion (Unix `flock` `LOCK_NB` retries and Windows exclusive `share_mode(0)` open retries against a shared 5 s deadline with the in-process mutex, sized to absorb whole `fsync`-bearing critical sections queued ahead of a waiter rather than a bare lock handoff), owner-only Unix permissions, same-directory atomic replace of an existing destination (Unix `rename(2)`; Windows `MoveFileExW(MOVEFILE_REPLACE_EXISTING|MOVEFILE_WRITE_THROUGH)` without unlinking the live file first), no-follow open of the data file with opened-handle validation (regular file, owner-only mode, Unix single-link / hard-link rejection before chmod/flock/read), and a 16 MiB (`AUDIT_LOCAL_FALLBACK_MAX_BYTES`) fail-closed size ceiling before parse — lock contention, oversized/corrupt input, or symlink/non-regular/hard-linked targets fail closed rather than waiting or allocating unboundedly. If neither sink admits a successful-export record, `GET /backup` returns `503` and does not emit the attachment. The fallback store is bounded to the newest 4096 events: once full, each append evicts the oldest record and emits a content-free `audit_local_fallback_evicted` warning so rollover is detectable. Fallback records are not returned by `GET /audit` and are not replayed into `audit_events` when the primary store recovers — treat the file as an on-host security log and ship it off the node.
+- **Security audit trail**: Every successful export and every authenticated denied/failed attempt is recorded before (or instead of) releasing the body. This security path is unconditional and independent of `FERRUM_ADMIN_AUDIT_ENABLED` (which gates ordinary mutation audit events only). Successful events carry actor, namespace, validated resource filter, data source (`database` / `cached`), resource counts, final byte count, canonical peer `source_address`, bounded `request_id`, and `outcome=success`. The audit `counts` object mirrors what the emitted payload actually released — `proxies`, `consumers`, `plugin_configs`, `upstreams`, `api_specs`, and `gateway_trust_bundles` — so an export of unredacted trust roots leaves evidence that they left the gateway; the trust entry is a count only (`0` whenever the payload omits the section, as on cached-fallback and `?resources=` exports), and no certificate bytes, PEM, subjects, or revisions are ever placed in an audit field or the success log line. Failed/denied events carry only a fixed-cardinality `failure_category` / `outcome` — never raw backend, parser, authorization, or serialization error text, and never credentials, tokens, cookies, JWTs, query/header secrets, or backup payload fragments. The resource filter recorded in audit is closed-cardinality: allow-listed names only, the sentinel `all`, or the fixed sentinel `invalid` when the request contained unknown tokens or a structurally malformed `resources` parameter (raw unknown tokens are never stored or logged). Unknown or malformed `resources` forms are also rejected at the request boundary with `400` and static client text. When an authenticated `GET /backup` presents an invalid `X-Ferrum-Namespace`, the attempt is still audited best-effort under the valid default audit namespace (`ferrum`) with fixed `namespace_status: invalid` metadata — the raw invalid namespace is never persisted or logged, and audit-sink failure never changes the original `400` rejection. Admission prefers a synchronous `audit_events` insert; when the primary store is absent or rejects the insert (including the cached-config path during a database outage), Ferrum appends to the bounded local fallback under `FERRUM_ADMIN_AUDIT_FALLBACK_PATH` on a blocking worker with bounded cross-process exclusion (Unix `flock` `LOCK_NB` retries and Windows exclusive `share_mode(0)` open retries against a shared 5 s deadline with the in-process mutex, sized to absorb whole `fsync`-bearing critical sections queued ahead of a waiter rather than a bare lock handoff), owner-only Unix permissions, same-directory atomic replace of an existing destination (Unix `rename(2)`; Windows `MoveFileExW(MOVEFILE_REPLACE_EXISTING|MOVEFILE_WRITE_THROUGH)` without unlinking the live file first), no-follow open of the data file with opened-handle validation (regular file, owner-only mode, Unix single-link / hard-link rejection before chmod/flock/read), and a 16 MiB (`AUDIT_LOCAL_FALLBACK_MAX_BYTES`) fail-closed size ceiling before parse — lock contention, oversized/corrupt input, or symlink/non-regular/hard-linked targets fail closed rather than waiting or allocating unboundedly. If neither sink admits a successful-export record, `GET /backup` returns `503` and does not emit the attachment. The fallback store is bounded to the newest 4096 events: once full, each append evicts the oldest record and emits a content-free `audit_local_fallback_evicted` warning so rollover is detectable. Fallback records are not returned by `GET /audit` and are not replayed into `audit_events` when the primary store recovers — treat the file as an on-host security log and ship it off the node.
 - **Canonical JWT credentials**: Consumer `jwt` entries in input, backup, and restore contain exactly one `secret` string (32-4096 characters) for HS256. Algorithm selectors, public keys, and JWKS fields are not Consumer credential forms and are rejected; RSA/EC/JWKS verification belongs to the separate `jwks_auth` plugin configuration. So that a backup taken from a database written before this contract stays restorable, `GET /backup` canonicalizes each exactly-one-field credential entry to that field — `jwt` and `hmac_auth` to `secret`, `mtls_auth` to `identity` — dropping ignored extras such as a `jwt` `algorithm`, and wraps any credential value still stored in the legacy single-object form in a one-element array, because restore requires every credential value to be a non-empty array of objects. This is an export-boundary rewrite only: it never mutates stored values, preserves every rotation entry and its order, leaves an entry without a string value at the canonical field untouched so genuinely unrepresentable data surfaces as a restore error rather than being silently dropped, and copies credential types without a single-field rule — `basicauth`, `keyauth`, and unknown/custom maps — through with their fields verbatim. A resource-filtered export (`GET /backup?resources=...`) that omits `consumers` skips this canonicalization entirely, so filtering by resource type does not pay for credential-heavy consumers it will not serialize.
 - **Credential bounds**: Credential string maxima use Unicode character counts. Basic passwords, API keys, HMAC secrets, JWT secrets, and mTLS identities are limited to 4096 characters and reject disallowed ASCII control bytes; HMAC secrets must contain at least 32 non-whitespace characters on input and restore.
 - **Database-first with cached fallback**: Reads from the database when available. If the database is unreachable, falls back to the in-memory cached config and sets the `X-Data-Source: cached` response header. The backup audit path above does not use that same unavailable database as its sole record sink.
 - **Content-Disposition header**: Includes `attachment; filename="ferrum-backup.json"` for browser-friendly downloads.
-- **Resource filtering**: Use `?resources=proxies,consumers` to export only specific resource types. Valid values: `proxies`, `consumers`, `plugin_configs`, `upstreams`, `api_specs`. Omit the parameter to export everything. The parameter must appear at most once as `resources=<csv>`; a key-only `?resources`, duplicate/ambiguous occurrences, or other structurally malformed forms fail closed with `400` and the static `Unsupported backup resource filter` message (audit records the fixed `invalid` sentinel) — they never widen to an unfiltered credential-bearing export. Unknown tokens are rejected the same way. When the filter includes `api_specs`, it must also include `proxies`, `upstreams`, and `plugin_configs` so the export stays directly restorable (owning proxy plus generated upstream/plugin relationships). Otherwise `GET /backup` fails closed with `400` and does not emit a partial artifact. `consumers` is not required. Filters that omit `api_specs` are unchanged.
+- **Resource filtering**: Use `?resources=proxies,consumers` to export only specific resource types. Valid values: `proxies`, `consumers`, `plugin_configs`, `upstreams`, `api_specs`. Omit the parameter to export everything. The parameter must appear at most once as `resources=<csv>`; a key-only `?resources`, duplicate/ambiguous occurrences, or other structurally malformed forms fail closed with `400` and the static `Unsupported backup resource filter` message (audit records the fixed `invalid` sentinel) — they never widen to an unfiltered credential-bearing export. Unknown tokens are rejected the same way. When the filter includes `api_specs`, it must also include `proxies`, `upstreams`, and `plugin_configs` so the export stays directly restorable (owning proxy plus generated upstream/plugin relationships). Otherwise `GET /backup` fails closed with `400` and does not emit a partial artifact. `consumers` is not required. Gateway trust bundles are included only in full, unfiltered database exports; every `?resources=` export omits that section, so replaying a partial artifact cannot rotate or revoke trust outside the selected resource classes.
 
 ### Example
 
@@ -43,7 +43,8 @@ cat ferrum-backup.json | jq '.counts'
 #   "consumers": 150,
 #   "plugin_configs": 85,
 #   "upstreams": 12,
-#   "api_specs": 3
+#   "api_specs": 3,
+#   "gateway_trust_bundles": 1
 # }
 ```
 
@@ -59,7 +60,8 @@ cat ferrum-backup.json | jq '.counts'
     "consumers": 150,
     "plugin_configs": 85,
     "upstreams": 12,
-    "api_specs": 3
+    "api_specs": 3,
+    "gateway_trust_bundles": 1
   },
   "proxies": [ ... ],
   "consumers": [ ... ],
@@ -122,6 +124,54 @@ The whole section is validated **before** the delete phase; any failure returns 
 #### Legacy backups that omit `api_specs`
 
 Older backups taken before this contract omit the `api_specs` section entirely. Restoring such a payload against a namespace that currently holds API specs would permanently delete those documents. Ferrum refuses that path with `409 Conflict` unless the operator also passes `?confirm_api_spec_deletion=true` (in addition to `?confirm=true`). When that confirmation is supplied, ownership tags on restored resources are cleared so they become hand-managed rather than pointing at deleted specs. A backup that includes `api_specs` with an empty `items` array is an intentional wipe and does not require the extra flag.
+
+### Gateway trust bundles in backup and restore
+
+The namespace-keyed gateway trust resource (issue #3727) is part of the
+disaster-recovery artifact, with an explicitly three-valued contract so a
+restore can never *accidentally* change trust:
+
+- `GET /backup` on a full, unfiltered database export always emits a
+  `gateway_trust_bundles` array — **possibly empty** — so a restore can tell
+  "this backup recorded that the namespace had no trust resource" apart from
+  "this backup predates the resource". Cached-fallback exports and every
+  `?resources=` filtered export omit the section instead.
+- On `POST /restore`, an **absent** section is a no-op: trust is left exactly as
+  it is. Silently revoking a namespace's roots because an operator restored an
+  older config artifact would be an outage, not a rollback.
+- A **present-but-empty** section is an explicit revocation and deletes the
+  namespace's record.
+- A **present, non-empty** section is authoritative and reconciles to exactly
+  what it lists. The resource is a namespace singleton, so more than one record
+  for the target namespace is refused outright rather than silently reduced to
+  whichever came first.
+
+Namespace isolation and re-validation are not optional on this path. The target
+namespace is the **authenticated** one and is never read from the payload, and
+every record is re-normalized and re-validated through the same admission path
+an admin `POST` uses — so a hand-edited or hostile artifact cannot inject
+oversized, malformed, mis-identified, or duplicate trust material by going
+around the API. Server-owned fields survive the payload: a restored record keeps
+its stored identity and creation time, and `revision` is assigned by the store
+from the durable change sequence rather than adopted from the file, so a
+restored record can never reuse a revision a stale client still holds.
+
+Trust material is exported unredacted, like credentials, so backup artifacts
+must be protected as secrets. The export audit record carries a
+`gateway_trust_bundles` **count** only — never certificate bytes, PEM, subjects,
+or revisions.
+
+> **Not the same file as `FERRUM_DB_CONFIG_BACKUP_PATH`.** The database-outage
+> startup backup is a raw `GatewayConfig` document and carries no trust section
+> at all, because `gateway_trust_bundles` is deliberately not serialized into
+> `GatewayConfig` (it must never ride the ConfigSync `config_json` wire). A
+> process that boots from that file therefore treats its namespace trust state
+> as **unknown** and refuses gateway-to-mesh identity until an authoritative
+> database full reload settles it, rather than falling back to source-loaded
+> SVID trust and possibly re-enabling a root the committed generation had
+> withdrawn. `GET /gateway-trust/status` reports `authority_unresolved: true`
+> for the duration. Use `GET /backup` / `POST /restore` — not the startup backup
+> file — to move trust state between deployments.
 
 ### Safety Guard
 
@@ -213,7 +263,8 @@ curl -s -X POST "$TARGET/restore?confirm=true" \
 #     "consumers": 150,
 #     "plugin_configs": 85,
 #     "upstreams": 12,
-#     "api_specs": 3
+#     "api_specs": 3,
+#     "gateway_trust_bundles": 1
 #   }
 # }
 ```

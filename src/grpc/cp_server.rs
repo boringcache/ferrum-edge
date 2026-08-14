@@ -60,6 +60,7 @@ use super::cp_trust::{CpDpVerifier, CpDpVerifierStore, CpGrpcConnectInfo};
 use super::proto::config_sync_server::{ConfigSync, ConfigSyncServer};
 use super::proto::{ConfigUpdate, FullConfigRequest, FullConfigResponse, SubscribeRequest};
 use crate::FERRUM_VERSION;
+use crate::config::gateway_trust::GatewayTrustPublication;
 use crate::config::types::{GatewayConfig, default_namespace};
 use crate::modes::mesh::config::{
     MeshConfig, MeshSidecar, MeshSidecarEgress, PeerAuthentication, PolicyScope,
@@ -817,8 +818,102 @@ impl CpGrpcServer {
         config
             .http_tls_listen_ports
             .retain(|(entry_namespace, _)| entry_namespace == namespace);
+        // Namespace-keyed trust records are tenant material. Pruning them at
+        // this PRIMARY authorization boundary means no later step — projection,
+        // serialization, error text, or a future addition — can observe another
+        // tenant's roots on this subscriber's path (issue #3727).
+        config
+            .gateway_trust_bundles
+            .retain(|record| record.namespace == namespace);
         config.known_namespaces = vec![namespace.to_string()];
         filter_frontend_tls_sources_to_namespace(config, namespace);
+    }
+
+    /// Resolve what this subscriber's snapshot should say about trust
+    /// (issue #3727).
+    ///
+    /// CRITICAL ORDERING: the authorities are classified from the UNFILTERED
+    /// configuration, before [`Self::clear_unpartitioned_trust_material`] has
+    /// removed the unpartitioned value. Classifying afterwards would make a
+    /// deployment that carries both a database record and a file/overlay value
+    /// look database-only, and the ambiguity issue #3727 asks us to reject
+    /// would be silently resolved in favour of one authority per replica.
+    ///
+    /// The three outcomes:
+    ///
+    /// - `Replace` — the single authority's material, which for a
+    ///   claim-requiring scope can only ever be this namespace's own database
+    ///   record;
+    /// - `Clear` — this namespace has no trust to publish, an explicit
+    ///   withdrawal so a reconnecting DP reconstructs the true state;
+    /// - `KeepPrevious` — two authorities disagree. Trust is NOT revoked:
+    ///   subscribers keep the last generation they accepted while the redacted
+    ///   diagnostic surfaces the misconfiguration. The process counter is
+    ///   recorded once at the live publication boundary, not per subscriber.
+    ///   Converting the ambiguity into a clear would take a working fleet
+    ///   offline over a leftover file value.
+    fn resolve_namespace_trust_projection(
+        config: &GatewayConfig,
+        namespace: &str,
+        scope: &CpScope,
+    ) -> crate::config::gateway_trust::NamespaceTrustProjection {
+        let projection = crate::config::gateway_trust::project_namespace_trust(
+            config.gateway_trust_bundle_for(namespace),
+            config.trust_bundles.as_deref(),
+            !scope.requires_namespace_claim_by_default(),
+        );
+        if matches!(
+            projection,
+            crate::config::gateway_trust::NamespaceTrustProjection::KeepPrevious
+        ) {
+            error!(
+                namespace = %namespace,
+                "{}",
+                crate::config::gateway_trust::AMBIGUOUS_TRUST_AUTHORITY_MESSAGE
+            );
+        }
+        projection
+    }
+
+    /// Apply a resolved projection to the filtered snapshot's unpartitioned
+    /// slot. `KeepPrevious` leaves nothing behind: the side channel says
+    /// nothing, so the slot must not carry material either.
+    fn apply_trust_projection(
+        filtered: &mut GatewayConfig,
+        projection: &crate::config::gateway_trust::NamespaceTrustProjection,
+    ) {
+        use crate::config::gateway_trust::NamespaceTrustProjection as Projection;
+        filtered.trust_bundles = match projection {
+            Projection::Replace(bundle) => Some(Box::new(bundle.clone())),
+            Projection::Clear | Projection::KeepPrevious => None,
+        };
+    }
+
+    /// Filter a snapshot to `namespace` AND resolve its trust side channel in
+    /// one step, so the two can never disagree.
+    ///
+    /// Returns the filtered configuration and the exact `trust_bundles_json`
+    /// value: the serialized bundle for a replace, `"null"` for an explicit
+    /// clear, and an EMPTY string when the ambiguity refusal means the
+    /// subscriber must keep what it already applied.
+    /// An invalid or unserializable Replace returns an error so callers skip or
+    /// fail the COMPLETE snapshot; it is never reinterpreted as Clear.
+    /// `pub` so external integration tests can assert the exact side-channel
+    /// encoding of every publication decision, including the ambiguity refusal.
+    pub fn filter_config_and_trust_for_scope(
+        config: &GatewayConfig,
+        namespace: &str,
+        scope: &CpScope,
+    ) -> Result<(GatewayConfig, String), &'static str> {
+        use crate::config::gateway_trust::NamespaceTrustProjection as Projection;
+
+        let (filtered, projection) = Self::filter_config_and_projection(config, namespace, scope);
+        let trust_json = match &projection {
+            Projection::KeepPrevious => String::new(),
+            Projection::Clear => "null".to_string(),
+            Projection::Replace(_) => Self::trust_bundles_json(filtered.trust_bundles.as_deref())?,
+        };
+        Ok((filtered, trust_json))
     }
 
     #[cfg(test)]
@@ -847,9 +942,14 @@ impl CpGrpcServer {
                 bearer_namespaces,
             );
         }
+        // Classify the trust authorities from the UNFILTERED config, then
+        // clear, then apply — see `resolve_namespace_trust_projection`.
+        let projection =
+            Self::resolve_namespace_trust_projection(config, &request.namespace, scope);
         if scope.requires_namespace_claim_by_default() {
             Self::clear_unpartitioned_trust_material(&mut filtered);
         }
+        Self::apply_trust_projection(&mut filtered, &projection);
         filtered
     }
 
@@ -1099,16 +1199,41 @@ impl CpGrpcServer {
             .retain(|extension| visible_namespaces.contains(&extension.namespace));
     }
 
-    pub(crate) fn filter_config_to_namespace_for_scope(
+    /// `pub` so external integration tests can assert the namespace
+    /// projection directly; this is the primary tenant boundary for every
+    /// full-snapshot publication path.
+    #[allow(dead_code)] // Public integration-test seam is unused in the binary target.
+    pub fn filter_config_to_namespace_for_scope(
         config: &GatewayConfig,
         namespace: &str,
         scope: &CpScope,
     ) -> GatewayConfig {
+        Self::filter_config_and_projection(config, namespace, scope).0
+    }
+
+    /// The shared body of every namespace-scoped snapshot projection.
+    ///
+    /// Classifies the trust authorities BEFORE the clear, so a database record
+    /// sitting next to a file/overlay value is still visible as two authorities
+    /// (issue #3727), then partitions, then applies the single resolved
+    /// projection. Callers that need the exact side-channel encoding —
+    /// including the ambiguity refusal, which cannot be expressed as an
+    /// `Option` — use [`Self::filter_config_and_trust_for_scope`].
+    fn filter_config_and_projection(
+        config: &GatewayConfig,
+        namespace: &str,
+        scope: &CpScope,
+    ) -> (
+        GatewayConfig,
+        crate::config::gateway_trust::NamespaceTrustProjection,
+    ) {
+        let projection = Self::resolve_namespace_trust_projection(config, namespace, scope);
         let mut filtered = Self::filter_config_to_namespace(config, namespace);
         if scope.requires_namespace_claim_by_default() {
             Self::clear_unpartitioned_trust_material(&mut filtered);
         }
-        filtered
+        Self::apply_trust_projection(&mut filtered, &projection);
+        (filtered, projection)
     }
 
     fn mesh_visible_namespaces(
@@ -1438,8 +1563,20 @@ impl CpGrpcServer {
         let Some(tx) = broadcasts.try_sender_for(namespace) else {
             return;
         };
-        let filtered = Self::filter_config_to_namespace_for_scope(config, namespace, scope);
-        Self::broadcast_update(&tx, &filtered);
+        let (filtered, trust_json) = match Self::filter_config_and_trust_for_scope(
+            config, namespace, scope,
+        ) {
+            Ok(publication) => publication,
+            Err(failure_class) => {
+                error!(
+                    namespace = %namespace,
+                    failure_class,
+                    "Refusing namespace configuration publication because gateway trust is unusable"
+                );
+                return;
+            }
+        };
+        Self::broadcast_update_with_trust_json(&tx, &filtered, trust_json);
         registry.touch_namespace(namespace);
     }
 
@@ -1452,18 +1589,37 @@ impl CpGrpcServer {
         result: &crate::config::db_loader::IncrementalResult,
         version: &str,
         registry: &DpNodeRegistry,
-        trust_bundles: Option<&crate::modes::mesh::config::TrustBundleSet>,
+        trust: GatewayTrustPublication<'_>,
         scope: &CpScope,
     ) {
         let Some(tx) = broadcasts.try_sender_for(namespace) else {
             return;
         };
-        let trust_bundles = if scope.requires_namespace_claim_by_default() {
-            None
+        if let GatewayTrustPublication::Replace(bundle) = &trust
+            && crate::config::gateway_trust::validate_trust_bundle_set(bundle).is_err()
+        {
+            error!(
+                namespace = %namespace,
+                failure_class = "gateway_trust_validation_failed",
+                "Refusing namespace delta publication because gateway trust is unusable"
+            );
+            return;
+        }
+        // Defense in depth: a multi-namespace CP must never put an
+        // unpartitioned trust value on a namespace-scoped stream. The caller
+        // supplies a namespace-resolved publication, so a `Replace` that
+        // survived to here should already be this namespace's own record; on a
+        // claim-requiring scope we still refuse to forward one, and we refuse it
+        // as `Unchanged` rather than `Clear` so an unrelated resource delta can
+        // never revoke trust the subscriber legitimately holds (issue #3727).
+        let trust = if scope.requires_namespace_claim_by_default()
+            && matches!(trust, GatewayTrustPublication::Replace(_))
+        {
+            GatewayTrustPublication::Unchanged
         } else {
-            trust_bundles
+            trust
         };
-        Self::broadcast_delta_with_trust_bundles(&tx, result, version, trust_bundles);
+        Self::broadcast_delta_with_trust_bundles(&tx, result, version, trust);
         registry.touch_namespace(namespace);
     }
 
@@ -1500,13 +1656,6 @@ impl CpGrpcServer {
 
     /// Broadcast a full config snapshot to all connected DPs.
     pub fn broadcast_update(tx: &broadcast::Sender<ConfigUpdate>, config: &GatewayConfig) {
-        let config_json = match Self::config_json_for_dp(config) {
-            Ok(json) => json,
-            Err(e) => {
-                error!("Refusing to publish configuration to data planes: {}", e);
-                return;
-            }
-        };
         let trust_bundles_json = match Self::trust_bundles_json(config.trust_bundles.as_deref()) {
             Ok(json) => json,
             Err(e) => {
@@ -1514,6 +1663,29 @@ impl CpGrpcServer {
                     "Failed to serialize gateway trust bundles for broadcast; skipping update: {}",
                     e
                 );
+                return;
+            }
+        };
+        Self::broadcast_update_with_trust_json(tx, config, trust_bundles_json);
+    }
+
+    /// Broadcast a full config snapshot with an already-resolved trust side
+    /// channel.
+    ///
+    /// The side channel is passed in rather than re-derived from
+    /// `config.trust_bundles`, because the `Option` in that slot cannot express
+    /// the ambiguous-authority refusal: an empty string means "say nothing, keep
+    /// the trust you already applied", which is distinct from the `"null"` an
+    /// absent slot would otherwise produce (issue #3727).
+    pub(crate) fn broadcast_update_with_trust_json(
+        tx: &broadcast::Sender<ConfigUpdate>,
+        config: &GatewayConfig,
+        trust_bundles_json: String,
+    ) {
+        let config_json = match Self::config_json_for_dp(config) {
+            Ok(json) => json,
+            Err(e) => {
+                error!("Refusing to publish configuration to data planes: {}", e);
                 return;
             }
         };
@@ -1537,9 +1709,9 @@ impl CpGrpcServer {
         result: &crate::config::db_loader::IncrementalResult,
         version: &str,
         registry: &DpNodeRegistry,
-        trust_bundles: Option<&crate::modes::mesh::config::TrustBundleSet>,
+        trust: GatewayTrustPublication<'_>,
     ) {
-        Self::broadcast_delta_with_trust_bundles(tx, result, version, trust_bundles);
+        Self::broadcast_delta_with_trust_bundles(tx, result, version, trust);
         registry.touch_all();
     }
 
@@ -1556,14 +1728,22 @@ impl CpGrpcServer {
         Self::broadcast_delta_with_trust_bundles_json(tx, result, version, String::new());
     }
 
-    /// Broadcast an incremental delta with optional gateway trust bundles.
+    /// Broadcast an incremental delta with an explicit gateway trust
+    /// publication.
+    ///
+    /// The three-way [`GatewayTrustPublication`] is the whole point: before
+    /// issue #3727 this took an `Option`, and `None` encoded as JSON `null` —
+    /// an explicit CLEAR — so every ordinary resource delta silently revoked
+    /// whatever trust the subscriber had been given. `Unchanged` now encodes as
+    /// an empty side channel, which the DP leaves alone, and only a real
+    /// revocation produces `null`.
     pub fn broadcast_delta_with_trust_bundles(
         tx: &broadcast::Sender<ConfigUpdate>,
         result: &crate::config::db_loader::IncrementalResult,
         version: &str,
-        trust_bundles: Option<&crate::modes::mesh::config::TrustBundleSet>,
+        trust: GatewayTrustPublication<'_>,
     ) {
-        let trust_bundles_json = match Self::trust_bundles_json(trust_bundles) {
+        let trust_bundles_json = match Self::trust_publication_json(&trust) {
             Ok(json) => json,
             Err(e) => {
                 error!(
@@ -1602,29 +1782,29 @@ impl CpGrpcServer {
         let _ = tx.send(update);
     }
 
+    /// Encode a [`GatewayTrustPublication`] for the side channel.
+    ///
+    /// `Unchanged` short-circuits to an empty string before any validation:
+    /// there is nothing to validate and nothing to say. `Replace` runs the same
+    /// bounded deep validation as a snapshot. Invalid material fails the whole
+    /// publication and never becomes an explicit clear.
+    fn trust_publication_json(trust: &GatewayTrustPublication<'_>) -> Result<String, &'static str> {
+        match trust {
+            GatewayTrustPublication::Unchanged => Ok(String::new()),
+            GatewayTrustPublication::Clear => Ok("null".to_string()),
+            GatewayTrustPublication::Replace(bundle) => Self::trust_bundles_json(Some(*bundle)),
+        }
+    }
+
     fn trust_bundles_json(
         trust_bundles: Option<&crate::modes::mesh::config::TrustBundleSet>,
-    ) -> Result<String, serde_json::Error> {
+    ) -> Result<String, &'static str> {
         match trust_bundles {
             Some(trust_bundles) => {
-                let validation_errors = crate::modes::mesh::config::validate_mesh_config(
-                    &[],
-                    &[],
-                    &[],
-                    &[],
-                    &[],
-                    &[],
-                    Some(trust_bundles),
-                );
-                if !validation_errors.is_empty() {
-                    error!(
-                        "Clearing invalid gateway trust bundles from CP broadcast: {}",
-                        validation_errors.join("; ")
-                    );
-                    return Ok("null".to_string());
-                }
-
+                crate::config::gateway_trust::validate_trust_bundle_set(trust_bundles)
+                    .map_err(|_| "gateway_trust_validation_failed")?;
                 serde_json::to_string(trust_bundles)
+                    .map_err(|_| "gateway_trust_serialization_failed")
             }
             None => Ok("null".to_string()),
         }
@@ -1647,10 +1827,19 @@ impl CpGrpcServer {
         crate::fips::policy::check_gateway_config(config)
             .map_err(|error| format!("FIPS policy rejected the configuration: {error}"))?;
         let mut snapshot = config.clone();
-        // Trust bundles travel exclusively through `ConfigUpdate.trust_bundles_json`.
-        // Keeping them out of the regular GatewayConfig JSON preserves compatibility
-        // with older DPs whose `GatewayConfig` deserializer denies unknown fields.
+        // Trust material travels exclusively through
+        // `ConfigUpdate.trust_bundles_json`. BOTH trust slots are cleared here:
+        // the unpartitioned `trust_bundles` set and the authoritative
+        // per-namespace `gateway_trust_bundles` resource vector, whose records
+        // carry raw authority material plus server-assigned metadata
+        // (revision, actor, timestamps). Keeping them out of the regular
+        // GatewayConfig JSON preserves compatibility with older DPs whose
+        // `GatewayConfig` deserializer denies unknown fields, and makes the
+        // wire boundary fail closed at the single publication funnel rather
+        // than depending on `gateway_trust_bundles` keeping its `#[serde(skip)]`
+        // attribute.
         snapshot.trust_bundles = None;
+        snapshot.gateway_trust_bundles.clear();
         serde_json::to_string(&snapshot).map_err(|error| error.to_string())
     }
 }
@@ -1836,32 +2025,6 @@ impl ConfigSync for CpGrpcServer {
                 return Err(status);
             }
         };
-        Self::audit_tenant_subscription(
-            "ConfigSync.Subscribe",
-            &node_id,
-            &dp_namespace,
-            "success",
-            "",
-        );
-
-        info!(
-            "DP node '{}' (v{}) subscribed for config updates (namespace='{}', scope={})",
-            node_id,
-            dp_version,
-            dp_namespace,
-            self.scope.describe()
-        );
-
-        // Register the DP in the node registry (removed on stream drop).
-        let now = Utc::now();
-        self.registry.insert(DpNodeInfo {
-            node_id: node_id.clone(),
-            version: dp_version.clone(),
-            namespace: dp_namespace.clone(),
-            connected_at: now,
-            last_update_at: now,
-        });
-
         // Register the receiver before loading the initial snapshot so a
         // concurrent CP broadcast is either captured by this stream or already
         // reflected in the loaded snapshot.
@@ -1870,20 +2033,20 @@ impl ConfigSync for CpGrpcServer {
         // Send initial full config — filtered to the DP's namespace so the
         // initial snapshot matches the per-namespace broadcast stream.
         let config = self.config.load_full();
-        let filtered =
-            Self::filter_config_to_namespace_for_scope(config.as_ref(), &dp_namespace, &self.scope);
+        let (filtered, trust_bundles_json) =
+            Self::filter_config_and_trust_for_scope(config.as_ref(), &dp_namespace, &self.scope)
+                .map_err(|failure_class| {
+                    error!(
+                        namespace = %dp_namespace,
+                        failure_class,
+                        "Refusing initial ConfigSync snapshot because gateway trust is unusable"
+                    );
+                    Status::internal("Failed to prepare configuration snapshot")
+                })?;
         let config_json = Self::config_json_for_dp(&filtered).map_err(|e| {
             error!("Refusing to publish configuration in subscribe: {}", e);
             Status::internal("Failed to serialize configuration")
         })?;
-        let trust_bundles_json = Self::trust_bundles_json(filtered.trust_bundles.as_deref())
-            .map_err(|e| {
-                error!(
-                    "Failed to serialize gateway trust bundles in subscribe: {}",
-                    e
-                );
-                Status::internal("Failed to serialize gateway trust bundles")
-            })?;
         let initial = ConfigUpdate {
             update_type: 0, // FULL_SNAPSHOT
             config_json,
@@ -1899,6 +2062,32 @@ impl ConfigSync for CpGrpcServer {
             heartbeat_negotiated: heartbeats_negotiated,
         };
 
+        // Only a subscriber for which the complete initial config+trust
+        // generation was prepared is registered or audited as successful.
+        // Invalid trust therefore leaves no ghost registry entry behind.
+        Self::audit_tenant_subscription(
+            "ConfigSync.Subscribe",
+            &node_id,
+            &dp_namespace,
+            "success",
+            "",
+        );
+        info!(
+            "DP node '{}' (v{}) subscribed for config updates (namespace='{}', scope={})",
+            node_id,
+            dp_version,
+            dp_namespace,
+            self.scope.describe()
+        );
+        let now = Utc::now();
+        self.registry.insert(DpNodeInfo {
+            node_id: node_id.clone(),
+            version: dp_version.clone(),
+            namespace: dp_namespace.clone(),
+            connected_at: now,
+            last_update_at: now,
+        });
+
         let config_for_recovery = self.config.clone();
         let recovery_namespace = dp_namespace.clone();
         let recovery_scope = self.scope.clone();
@@ -1913,25 +2102,24 @@ impl ConfigSync for CpGrpcServer {
                 // from missed deltas without re-leaking other namespaces'
                 // config.
                 let current = config_for_recovery.load_full();
-                let filtered = Self::filter_config_to_namespace_for_scope(
-                    current.as_ref(),
-                    &recovery_namespace,
-                    &recovery_scope,
-                );
+                let (filtered, trust_bundles_json) =
+                    match Self::filter_config_and_trust_for_scope(
+                        current.as_ref(),
+                        &recovery_namespace,
+                        &recovery_scope,
+                    ) {
+                        Ok(publication) => publication,
+                        Err(failure_class) => {
+                            error!(
+                                namespace = %recovery_namespace,
+                                failure_class,
+                                "Skipping ConfigSync recovery snapshot because gateway trust is unusable"
+                            );
+                            return None;
+                        }
+                    };
                 match Self::config_json_for_dp(&filtered) {
                     Ok(config_json) => {
-                        let trust_bundles_json = match Self::trust_bundles_json(
-                            filtered.trust_bundles.as_deref(),
-                        ) {
-                            Ok(json) => json,
-                            Err(e) => {
-                                error!(
-                                    "Failed to serialize gateway trust bundles for recovery snapshot: {}",
-                                    e
-                                );
-                                return None;
-                            }
-                        };
                         Some(Ok(ConfigUpdate {
                             update_type: 0, // FULL_SNAPSHOT
                             config_json,
@@ -2039,25 +2227,17 @@ impl ConfigSync for CpGrpcServer {
             );
             return Err(status);
         }
-        Self::audit_tenant_subscription(
-            "ConfigSync.GetFullConfig",
-            &req.node_id,
-            &req.namespace,
-            "success",
-            "",
-        );
-
-        info!(
-            "DP '{}' (v{}) requested full config (namespace='{}')",
-            req.node_id, dp_version, req.namespace
-        );
-
         let config = self.config.load_full();
-        let filtered = Self::filter_config_to_namespace_for_scope(
-            config.as_ref(),
-            &req.namespace,
-            &self.scope,
-        );
+        let (filtered, trust_bundles_json) =
+            Self::filter_config_and_trust_for_scope(config.as_ref(), &req.namespace, &self.scope)
+                .map_err(|failure_class| {
+                error!(
+                    namespace = %req.namespace,
+                    failure_class,
+                    "Refusing GetFullConfig snapshot because gateway trust is unusable"
+                );
+                Status::internal("Failed to prepare configuration snapshot")
+            })?;
         let config_json = Self::config_json_for_dp(&filtered).map_err(|e| {
             error!(
                 "Refusing to publish configuration in get_full_config: {}",
@@ -2065,14 +2245,17 @@ impl ConfigSync for CpGrpcServer {
             );
             Status::internal("Failed to serialize configuration")
         })?;
-        let trust_bundles_json = Self::trust_bundles_json(filtered.trust_bundles.as_deref())
-            .map_err(|e| {
-                error!(
-                    "Failed to serialize gateway trust bundles in get_full_config: {}",
-                    e
-                );
-                Status::internal("Failed to serialize gateway trust bundles")
-            })?;
+        Self::audit_tenant_subscription(
+            "ConfigSync.GetFullConfig",
+            &req.node_id,
+            &req.namespace,
+            "success",
+            "",
+        );
+        info!(
+            "DP '{}' (v{}) requested full config (namespace='{}')",
+            req.node_id, dp_version, req.namespace
+        );
 
         Ok(Response::new(FullConfigResponse {
             config_json,
@@ -2087,15 +2270,29 @@ impl ConfigSync for CpGrpcServer {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use base64::Engine;
     use chrono::{TimeZone, Utc};
     use std::collections::HashMap;
+
+    fn test_root_ca_der_base64(common_name: &str) -> String {
+        let key = rcgen::KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256)
+            .expect("test CA key generates");
+        let mut params =
+            rcgen::CertificateParams::new(Vec::<String>::new()).expect("test CA params build");
+        params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+        params
+            .distinguished_name
+            .push(rcgen::DnType::CommonName, common_name);
+        let cert = params.self_signed(&key).expect("test CA self-signs");
+        base64::engine::general_purpose::STANDARD.encode(cert.der())
+    }
 
     fn test_trust_bundles() -> crate::modes::mesh::config::TrustBundleSet {
         crate::modes::mesh::config::TrustBundleSet {
             local: crate::modes::mesh::config::TrustBundle {
                 trust_domain: crate::identity::TrustDomain::new("cluster.local")
                     .expect("test trust domain should be valid"),
-                x509_authorities: vec!["AQIDBA==".to_string()],
+                x509_authorities: vec![test_root_ca_der_base64("cp-side-channel-root")],
                 jwt_authorities: Vec::new(),
                 refresh_hint_seconds: None,
             },
@@ -2114,6 +2311,31 @@ mod tests {
             },
             federated: Vec::new(),
         }
+    }
+
+    /// A fully populated namespace trust record: raw authority material plus
+    /// the server-assigned metadata (revision, actor) a DP must never see on
+    /// the ordinary `config_json` wire. The material is deliberately distinct
+    /// from [`test_trust_bundles`] so an assertion can tell the two apart.
+    fn test_gateway_trust_record(
+        namespace: &str,
+    ) -> crate::config::gateway_trust::GatewayTrustBundleRecord {
+        let bundle = crate::modes::mesh::config::TrustBundleSet {
+            local: crate::modes::mesh::config::TrustBundle {
+                trust_domain: crate::identity::TrustDomain::new("record.internal")
+                    .expect("test trust domain should be valid"),
+                x509_authorities: vec![test_root_ca_der_base64("cp-record-root")],
+                jwt_authorities: Vec::new(),
+                refresh_hint_seconds: None,
+            },
+            federated: Vec::new(),
+        };
+        let mut record = crate::config::gateway_trust::GatewayTrustBundleRecord::new(
+            namespace, namespace, bundle,
+        );
+        record.revision = 4242;
+        record.updated_by = Some("trust-actor@example.test".to_string());
+        record
     }
 
     fn registry_info(node_id: &str, version: &str, connected_at: DateTime<Utc>) -> DpNodeInfo {
@@ -2145,8 +2367,11 @@ mod tests {
     fn config_json_for_dp_strips_gateway_trust_bundles() {
         let mut config = GatewayConfig {
             version: crate::config::types::CURRENT_CONFIG_VERSION.to_string(),
-            loaded_at: Utc::now(),
+            // Fixed so the numeric metadata assertion below cannot collide with
+            // digits from a wall-clock timestamp.
+            loaded_at: Utc.with_ymd_and_hms(2026, 5, 5, 12, 0, 0).unwrap(),
             trust_bundles: Some(Box::new(test_trust_bundles())),
+            gateway_trust_bundles: vec![test_gateway_trust_record("ferrum")],
             ..Default::default()
         };
         config.known_namespaces.push("ferrum".to_string());
@@ -2155,10 +2380,20 @@ mod tests {
         let value: serde_json::Value =
             serde_json::from_str(&json).expect("DP config JSON should parse");
         assert!(value.get("trust_bundles").is_none());
+        assert!(value.get("gateway_trust_bundles").is_none());
+        // Neither trust slot's authority material may appear anywhere in the
+        // ordinary DP document, nor the record's server-assigned metadata.
+        assert!(!json.contains("AQIDBA=="));
+        assert!(!json.contains("BQYHCA=="));
+        assert!(!json.contains("cluster.local"));
+        assert!(!json.contains("record.internal"));
+        assert!(!json.contains("trust-actor@example.test"));
+        assert!(!json.contains("4242"));
 
         let parsed: GatewayConfig =
             serde_json::from_str(&json).expect("stripped DP config should deserialize");
         assert!(parsed.trust_bundles.is_none());
+        assert!(parsed.gateway_trust_bundles.is_empty());
         assert_eq!(parsed.known_namespaces, vec!["ferrum"]);
     }
 
@@ -2168,6 +2403,7 @@ mod tests {
             version: crate::config::types::CURRENT_CONFIG_VERSION.to_string(),
             loaded_at: Utc::now(),
             trust_bundles: Some(Box::new(test_trust_bundles())),
+            gateway_trust_bundles: vec![test_gateway_trust_record("ferrum")],
             ..Default::default()
         };
         let (tx, mut rx) = broadcast::channel(1);
@@ -2178,12 +2414,17 @@ mod tests {
         let value: serde_json::Value =
             serde_json::from_str(&update.config_json).expect("config JSON should parse");
         assert!(value.get("trust_bundles").is_none());
+        assert!(value.get("gateway_trust_bundles").is_none());
+        assert!(!update.config_json.contains("record.internal"));
+        assert!(!update.config_json.contains("BQYHCA=="));
+        assert!(!update.config_json.contains("trust-actor@example.test"));
+        // The side channel is unaffected by the wire-boundary strip.
         assert_ne!(update.trust_bundles_json, "null");
         assert!(update.trust_bundles_json.contains("cluster.local"));
     }
 
     #[test]
-    fn broadcast_update_clears_invalid_trust_bundle_side_channel() {
+    fn broadcast_update_refuses_invalid_trust_bundle_without_emitting_clear() {
         let config = GatewayConfig {
             version: crate::config::types::CURRENT_CONFIG_VERSION.to_string(),
             loaded_at: Utc::now(),
@@ -2193,12 +2434,13 @@ mod tests {
         let (tx, mut rx) = broadcast::channel(1);
 
         CpGrpcServer::broadcast_update(&tx, &config);
-        let update = rx.try_recv().expect("broadcast should deliver update");
-
-        let value: serde_json::Value =
-            serde_json::from_str(&update.config_json).expect("config JSON should parse");
-        assert!(value.get("trust_bundles").is_none());
-        assert_eq!(update.trust_bundles_json, "null");
+        assert!(
+            matches!(
+                rx.try_recv(),
+                Err(tokio::sync::broadcast::error::TryRecvError::Empty)
+            ),
+            "an invalid Replace must emit no config and no synthetic Clear"
+        );
     }
 
     #[test]

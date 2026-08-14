@@ -680,6 +680,9 @@ impl MeshExtAuthzExecutor {
         let Ok(method) = http::Method::from_bytes(request.method.as_bytes()) else {
             return provider.failure(MeshExtAuthzReason::RequestBuildFailed);
         };
+        let Ok(client) = self.http_client.get() else {
+            return provider.failure(MeshExtAuthzReason::RequestBuildFailed);
+        };
         let url = build_check_url(&provider.check_url_base, request.path);
         // Header assembly is ONE map with insert (replace) semantics, not a
         // chain of appends. `includeAdditionalHeadersInCheck` is the operator's
@@ -713,9 +716,7 @@ impl MeshExtAuthzExecutor {
         {
             check_headers.insert(http::header::HOST, value);
         }
-        let mut builder = self
-            .http_client
-            .get()
+        let mut builder = client
             .request(method, url.as_str())
             .timeout(provider.timeout)
             .headers(check_headers);
