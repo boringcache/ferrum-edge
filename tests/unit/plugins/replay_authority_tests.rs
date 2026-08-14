@@ -1165,11 +1165,7 @@ const DEFAULT_WAIT_BUDGET: Duration = Duration::from_secs(5);
 /// Test-only budget for observing background classification logs under coverage load.
 const CLASSIFICATION_LOG_WAIT_BUDGET: Duration = Duration::from_secs(15);
 
-async fn wait_until_with_budget(
-    budget: Duration,
-    mut pred: impl FnMut() -> bool,
-    what: &str,
-) {
+async fn wait_until_with_budget(budget: Duration, mut pred: impl FnMut() -> bool, what: &str) {
     let polls = (budget.as_millis() / 10).max(1) as usize;
     for _ in 0..polls {
         if pred() {
