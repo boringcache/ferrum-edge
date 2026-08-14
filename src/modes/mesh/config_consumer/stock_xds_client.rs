@@ -105,9 +105,8 @@ use super::stock_xds_transport::{
     classify_stock_xds_endpoint,
 };
 use super::stream_lifecycle::{
-    MeshConfigStreamCredential, MeshStreamAttachment, MeshStreamAttempt, MeshStreamRetirement,
-    MeshStreamTimings, MeshStreamTracker, configure_mesh_config_stream_endpoint,
-    reconnect_backoff_after_attempt,
+    MeshStreamAttachment, MeshStreamAttempt, MeshStreamRetirement, MeshStreamTimings,
+    MeshStreamTracker, configure_mesh_config_stream_endpoint, reconnect_backoff_after_attempt,
 };
 use crate::grpc::dp_client::{DpGrpcTlsConfig, DpGrpcTlsReload};
 use crate::modes::mesh::config::MeshConfig;
