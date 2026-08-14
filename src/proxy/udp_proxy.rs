@@ -6153,10 +6153,11 @@ async fn create_session(
 /// selection respects active health checks and passive ejection state recorded
 /// by HTTP-family traffic.
 ///
-/// When `destination` is a literal Service ClusterIP, the chosen backend host
-/// must share that IP family. Dual-stack NodeWaypoint upstreams publish every
-/// pod address; UDP `connect()` to the other family "succeeds" and then ICMP
-/// refuses, which looks like a TIMEOUT with zero backend hits.
+/// When `destination` is a literal Service ClusterIP, destination address
+/// family is an eligibility constraint *inside* that selector: dual-stack
+/// NodeWaypoint upstreams publish every pod address, and UDP `connect()` to
+/// the other family "succeeds" then ICMP-refuses (TIMEOUT, zero backend hits).
+/// Family never bypasses health, locality, weights, or the configured algorithm.
 pub(crate) fn resolve_backend_target(
     proxy: &Proxy,
     lb_snapshot: &LoadBalancerCacheInner,
@@ -6197,52 +6198,54 @@ pub(crate) fn resolve_backend_target(
             health_port_scope,
         );
 
-        let selection = if let Some(port) = port_lane {
-            LoadBalancerCache::select_target_for_port_from(
+        let selection = match (destination, port_lane) {
+            (Some(destination), Some(port)) => {
+                LoadBalancerCache::select_target_for_port_matching_family_from(
+                    lb_snapshot,
+                    &proxy.namespace,
+                    upstream_id,
+                    lb_hash_key,
+                    port,
+                    Some(&health_ctx),
+                    destination,
+                )
+            }
+            (Some(destination), None) => LoadBalancerCache::select_target_matching_family_from(
+                lb_snapshot,
+                &proxy.namespace,
+                upstream_id,
+                lb_hash_key,
+                Some(&health_ctx),
+                destination,
+            ),
+            (None, Some(port)) => LoadBalancerCache::select_target_for_port_from(
                 lb_snapshot,
                 &proxy.namespace,
                 upstream_id,
                 lb_hash_key,
                 port,
                 Some(&health_ctx),
-            )
-        } else {
-            LoadBalancerCache::select_target_from(
+            ),
+            (None, None) => LoadBalancerCache::select_target_from(
                 lb_snapshot,
                 &proxy.namespace,
                 upstream_id,
                 lb_hash_key,
                 Some(&health_ctx),
-            )
+            ),
         }
         .ok_or_else(|| -> anyhow::Error {
-            StreamSetupError::new(
-                StreamSetupKind::NoHealthyTargets,
-                format!("for upstream {upstream_id}"),
-            )
-            .into()
+            let family_gap = destination.is_some()
+                && LoadBalancerCache::get_upstream_from(lb_snapshot, &proxy.namespace, upstream_id)
+                    .is_some();
+            let detail = if family_gap {
+                format!("for upstream {upstream_id}: no backends in destination family")
+            } else {
+                format!("for upstream {upstream_id}")
+            };
+            StreamSetupError::new(StreamSetupKind::NoHealthyTargets, detail).into()
         })?;
-        let selected = (selection.target.host.clone(), selection.target.port);
-        if let Some(destination) = destination
-            && !udp_backend_host_matches_destination_family(&selected.0, destination)
-        {
-            return pick_destination_family_udp_backend(
-                lb_snapshot,
-                &proxy.namespace,
-                upstream_id,
-                destination,
-                lb_hash_key,
-                port_lane,
-            )
-            .ok_or_else(|| {
-                StreamSetupError::new(
-                    StreamSetupKind::NoHealthyTargets,
-                    format!("for upstream {upstream_id}: no backends in destination family"),
-                )
-                .into()
-            });
-        }
-        Ok(selected)
+        Ok((selection.target.host.clone(), selection.target.port))
     } else {
         let host = proxy.backend_host.clone();
         if let Some(destination) = destination
@@ -6281,63 +6284,10 @@ fn udp_lb_hash_key_for_client_ip(ip: IpAddr) -> String {
 
 /// Literal backend IPs must share the session destination family. Hostnames
 /// are admitted here; [`crate::dns::ResolvedAddresses::matching_family`] filters
-/// them after DNS.
+/// them after DNS. Upstream selection applies the same rule as an LB
+/// eligibility constraint via [`crate::load_balancer::backend_host_matches_ip_family`].
 pub(crate) fn udp_backend_host_matches_destination_family(host: &str, destination: IpAddr) -> bool {
-    match host.parse::<IpAddr>() {
-        Ok(ip) => {
-            crate::util::client_identity::canonical_ip(ip).is_ipv4()
-                == crate::util::client_identity::canonical_ip(destination).is_ipv4()
-        }
-        Err(_) => true,
-    }
-}
-
-fn udp_family_target_matches(
-    target: &crate::config::types::UpstreamTarget,
-    destination: IpAddr,
-    port_lane: Option<u16>,
-) -> bool {
-    if let Some(port) = port_lane
-        && target.port != port
-    {
-        return false;
-    }
-    udp_backend_host_matches_destination_family(&target.host, destination)
-}
-
-/// Pick among same-family upstream targets without allocating a filtered Vec.
-/// Session-setup only; the datagram hot path never calls this.
-fn pick_destination_family_udp_backend(
-    snapshot: &LoadBalancerCacheInner,
-    namespace: &str,
-    upstream_id: &str,
-    destination: IpAddr,
-    lb_hash_key: &str,
-    port_lane: Option<u16>,
-) -> Option<(String, u16)> {
-    let upstream = snapshot.upstream(namespace, upstream_id)?;
-    let mut matching = 0usize;
-    for target in &upstream.targets {
-        if udp_family_target_matches(target, destination, port_lane) {
-            matching += 1;
-        }
-    }
-    if matching == 0 {
-        return None;
-    }
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    lb_hash_key.hash(&mut hasher);
-    let mut skip = hasher.finish() as usize % matching;
-    for target in &upstream.targets {
-        if !udp_family_target_matches(target, destination, port_lane) {
-            continue;
-        }
-        if skip == 0 {
-            return Some((target.host.clone(), target.port));
-        }
-        skip -= 1;
-    }
-    None
+    crate::load_balancer::backend_host_matches_ip_family(host, destination)
 }
 
 fn udp_port_lane_selection_supported(

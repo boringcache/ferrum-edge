@@ -743,8 +743,8 @@ pub mod _test_support {
     }
 
     /// UDP backend selection with an optional session destination, so tests can
-    /// prove mixed-family Round-Robin cannot give an IPv4 ClusterIP an IPv6
-    /// backend (hosted NodeWaypoint same-port shared-tuple demux).
+    /// prove destination-family eligibility stays inside load-balancer health,
+    /// algorithm, and port-lane selection (hosted NodeWaypoint same-port demux).
     pub fn resolve_udp_backend_target_for_destination_for_test(
         proxy: &crate::config::types::Proxy,
         snapshot: &crate::load_balancer::LoadBalancerCacheInner,

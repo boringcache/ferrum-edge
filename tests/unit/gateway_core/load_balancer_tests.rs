@@ -9,6 +9,7 @@ use ferrum_edge::load_balancer::{
     HealthContext, LoadBalancer, LoadBalancerCache, target_host_port_key, target_key,
 };
 use std::collections::HashMap;
+use std::net::IpAddr;
 
 const TEST_UPSTREAM: &str = "test-upstream";
 
@@ -3085,4 +3086,308 @@ fn least_latency_passive_recovery_does_not_restore_warmup_bias() {
         b_hits < n,
         "passive recovery must not restore unconditional warm-up preference for B (hits={b_hits})"
     );
+}
+
+fn family_ip_target(host: &str) -> UpstreamTarget {
+    UpstreamTarget {
+        host: host.into(),
+        port: 8080,
+        service_port_policy_key: None,
+        weight: 1,
+        tags: HashMap::new(),
+        locality: None,
+        path: None,
+    }
+}
+
+fn family_dest_v4() -> IpAddr {
+    "10.96.36.42".parse().expect("ipv4 dest")
+}
+
+#[test]
+fn family_eligibility_round_robin_walks_same_family_only() {
+    let targets = vec![
+        family_ip_target("10.244.2.9"),
+        family_ip_target("fd00:10:244:2::9"),
+        family_ip_target("10.244.2.10"),
+    ];
+    let lb = LoadBalancer::new(
+        TEST_UPSTREAM,
+        LoadBalancerAlgorithm::RoundRobin,
+        &targets,
+        None,
+    );
+    let mut seen = std::collections::HashSet::new();
+    for _ in 0..30 {
+        let sel = lb
+            .select_matching_family("client|dest", None, family_dest_v4())
+            .expect("same-family backends exist");
+        assert!(
+            sel.target.host.parse::<IpAddr>().expect("literal").is_ipv4(),
+            "IPv4 dest must not select {}",
+            sel.target.host
+        );
+        seen.insert(sel.target.host.clone());
+    }
+    assert!(seen.contains("10.244.2.9") && seen.contains("10.244.2.10"));
+    assert!(!seen.contains("fd00:10:244:2::9"));
+}
+
+#[test]
+fn family_eligibility_skips_active_unhealthy_same_family_target() {
+    let targets = vec![
+        family_ip_target("10.244.2.9"),
+        family_ip_target("fd00:10:244:2::9"),
+        family_ip_target("10.244.2.10"),
+    ];
+    let lb = LoadBalancer::new(
+        TEST_UPSTREAM,
+        LoadBalancerAlgorithm::RoundRobin,
+        &targets,
+        None,
+    );
+    let active = DashMap::new();
+    active.insert(target_key(TEST_UPSTREAM, &targets[0]), 1);
+    let ctx = active_health_ctx(&active);
+    for _ in 0..12 {
+        let sel = lb
+            .select_matching_family("", Some(&ctx), family_dest_v4())
+            .expect("healthy IPv4 backend remains");
+        assert_eq!(sel.target.host, "10.244.2.10");
+        assert!(!sel.is_fallback);
+    }
+}
+
+#[test]
+fn family_eligibility_skips_passively_ejected_same_family_target() {
+    use ferrum_edge::config::types::PassiveHealthCheck;
+    use ferrum_edge::health_check::HealthChecker;
+
+    let targets = vec![
+        family_ip_target("10.244.2.9"),
+        family_ip_target("fd00:10:244:2::9"),
+        family_ip_target("10.244.2.10"),
+    ];
+    let lb = LoadBalancer::new(
+        TEST_UPSTREAM,
+        LoadBalancerAlgorithm::RoundRobin,
+        &targets,
+        None,
+    );
+    let checker = HealthChecker::new();
+    let config = PassiveHealthCheck {
+        unhealthy_status_codes: vec![500],
+        unhealthy_threshold: 1,
+        unhealthy_window_seconds: 60,
+        healthy_after_seconds: 30,
+        max_ejection_percent: None,
+        gateway_error_codes: None,
+        split_external_local_origin_errors: None,
+    };
+    checker.report_response(
+        "ferrum",
+        "test-proxy",
+        TEST_UPSTREAM,
+        &targets[0],
+        500,
+        false,
+        Some(&config),
+    );
+    let active: DashMap<String, u64> = DashMap::new();
+    let proxy_passive = checker.passive_health.get("ferrum|test-proxy").map(|e| e.clone());
+    let ctx = HealthContext {
+        active_unhealthy: &active,
+        proxy_passive,
+        max_ejection_percent: None,
+    };
+    for _ in 0..12 {
+        let sel = lb
+            .select_matching_family("", Some(&ctx), family_dest_v4())
+            .expect("healthy IPv4 backend remains");
+        assert_eq!(sel.target.host, "10.244.2.10");
+    }
+}
+
+#[test]
+fn family_eligibility_fails_closed_without_same_family_backend() {
+    let targets = vec![family_ip_target("fd00:10:244:2::9")];
+    let lb = LoadBalancer::new(
+        TEST_UPSTREAM,
+        LoadBalancerAlgorithm::RoundRobin,
+        &targets,
+        None,
+    );
+    assert!(
+        lb.select_matching_family("", None, family_dest_v4()).is_none(),
+        "no eligible-family backend must fail closed"
+    );
+}
+
+#[test]
+fn family_eligibility_admits_hostnames_for_later_dns_filter() {
+    let targets = vec![
+        family_ip_target("echo.svc.cluster.local"),
+        family_ip_target("fd00:10:244:2::9"),
+    ];
+    let lb = LoadBalancer::new(
+        TEST_UPSTREAM,
+        LoadBalancerAlgorithm::RoundRobin,
+        &targets,
+        None,
+    );
+    let sel = lb
+        .select_matching_family("", None, family_dest_v4())
+        .expect("hostname stays eligible at selection time");
+    assert_eq!(sel.target.host, "echo.svc.cluster.local");
+}
+
+#[test]
+fn family_eligibility_vec_fallback_honors_health_and_family() {
+    let mut targets: Vec<UpstreamTarget> = (0..128)
+        .map(|i| family_ip_target(&format!("fd00:10::{i}")))
+        .collect();
+    targets.push(family_ip_target("10.244.2.9"));
+    targets.push(family_ip_target("10.244.2.10"));
+    assert!(targets.len() > 128);
+
+    let lb = LoadBalancer::new(
+        TEST_UPSTREAM,
+        LoadBalancerAlgorithm::RoundRobin,
+        &targets,
+        None,
+    );
+    let active = DashMap::new();
+    active.insert(
+        target_key(TEST_UPSTREAM, &family_ip_target("10.244.2.9")),
+        1,
+    );
+    let ctx = active_health_ctx(&active);
+    for _ in 0..8 {
+        let sel = lb
+            .select_matching_family("", Some(&ctx), family_dest_v4())
+            .expect(">128 family pool must still select");
+        assert_eq!(sel.target.host, "10.244.2.10");
+    }
+
+    let v6_only = LoadBalancer::new(
+        TEST_UPSTREAM,
+        LoadBalancerAlgorithm::RoundRobin,
+        &targets[..128],
+        None,
+    );
+    assert!(
+        v6_only
+            .select_matching_family("", None, family_dest_v4())
+            .is_none(),
+        ">128 IPv6-only pool must fail closed for an IPv4 destination"
+    );
+}
+
+#[test]
+fn family_eligibility_port_lane_keeps_port_algorithm_and_family() {
+    let mut upstream = make_upstream(
+        "u1",
+        vec![
+            family_ip_target("10.244.2.9"),
+            UpstreamTarget {
+                host: "fd00:10:244:2::9".into(),
+                port: 8080,
+                service_port_policy_key: None,
+                weight: 1,
+                tags: HashMap::new(),
+                locality: None,
+                path: None,
+            },
+            family_ip_target("10.244.2.10"),
+        ],
+    );
+    upstream.algorithm = LoadBalancerAlgorithm::RoundRobin;
+    upstream.port_overrides = HashMap::from([(
+        8080,
+        UpstreamPortOverride {
+            algorithm: Some(LoadBalancerAlgorithm::ConsistentHashing),
+            ..UpstreamPortOverride::default()
+        },
+    )]);
+    let cache = LoadBalancerCache::new(&GatewayConfig {
+        upstreams: vec![upstream],
+        ..GatewayConfig::default()
+    });
+    let snapshot = cache.load();
+    let dest = family_dest_v4();
+    let first = LoadBalancerCache::select_target_for_port_matching_family_from(
+        &snapshot,
+        "ferrum",
+        "u1",
+        "client|dest",
+        8080,
+        None,
+        dest,
+    )
+    .expect("port∩family pool is non-empty");
+    assert!(
+        first
+            .target
+            .host
+            .parse::<IpAddr>()
+            .expect("literal")
+            .is_ipv4()
+    );
+    for _ in 0..8 {
+        let again = LoadBalancerCache::select_target_for_port_matching_family_from(
+            &snapshot,
+            "ferrum",
+            "u1",
+            "client|dest",
+            8080,
+            None,
+            dest,
+        )
+        .expect("stable hash");
+        assert_eq!(again.target.host, first.target.host);
+    }
+}
+
+#[test]
+fn family_eligibility_port_lane_vec_fallback_stays_in_family() {
+    let mut targets: Vec<UpstreamTarget> = (0..128)
+        .map(|i| family_ip_target(&format!("fd00:10::{i}")))
+        .collect();
+    targets.push(family_ip_target("10.244.2.9"));
+    targets.push(family_ip_target("10.244.2.10"));
+    let mut upstream = make_upstream("u1", targets);
+    upstream.port_overrides = HashMap::from([(
+        8080,
+        UpstreamPortOverride {
+            algorithm: Some(LoadBalancerAlgorithm::RoundRobin),
+            ..UpstreamPortOverride::default()
+        },
+    )]);
+    let cache = LoadBalancerCache::new(&GatewayConfig {
+        upstreams: vec![upstream],
+        ..GatewayConfig::default()
+    });
+    let snapshot = cache.load();
+    let dest = family_dest_v4();
+    let mut seen = std::collections::HashSet::new();
+    for _ in 0..16 {
+        let sel = LoadBalancerCache::select_target_for_port_matching_family_from(
+            &snapshot,
+            "ferrum",
+            "u1",
+            "rr-key",
+            8080,
+            None,
+            dest,
+        )
+        .expect(">128 port∩family pool must select");
+        assert!(
+            sel.target.host.parse::<IpAddr>().expect("literal").is_ipv4(),
+            "port-lane vec fallback must not cross family: {}",
+            sel.target.host
+        );
+        seen.insert(sel.target.host.clone());
+    }
+    assert!(seen.contains("10.244.2.9") && seen.contains("10.244.2.10"));
+    assert_eq!(seen.len(), 2);
 }
