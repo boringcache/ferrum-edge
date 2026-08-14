@@ -1345,6 +1345,7 @@ impl FirewallEngine {
         let mut request = self
             .http_client
             .get()
+            .map_err(|err| format!("embedding request failed: {err}"))?
             .post(&provider.endpoint)
             .timeout(provider.request_timeout)
             .json(&payload);

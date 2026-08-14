@@ -514,7 +514,10 @@ impl JwksKeyStore {
         let redacted_uri = redacted_jwks_uri(&self.jwks_uri);
         debug!("Fetching JWKS keys from {}", redacted_uri);
 
-        let req = self.http_client.get().get(&self.jwks_uri);
+        let Some(client) = self.http_client.get().ok() else {
+            return self.fail_refresh(JwksFailureClass::Transport);
+        };
+        let req = client.get(&self.jwks_uri);
         let response = match self
             .http_client
             .execute_redacted(req, "jwks_fetch", &redacted_uri)

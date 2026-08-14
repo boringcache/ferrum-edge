@@ -653,8 +653,15 @@ impl ServiceDiscoveryManager {
                         );
                         return false;
                     }
+                    let Some(client) = self.http_client.get().ok() else {
+                        warn!(
+                            "Service discovery: upstream {} plugin HTTP client unavailable; failing closed",
+                            upstream_id
+                        );
+                        return false;
+                    };
                     Arc::new(kubernetes::KubernetesDiscoverer::new(
-                        self.http_client.get().clone(),
+                        client.clone(),
                         k8s_config.namespace.clone(),
                         k8s_config.service_name.clone(),
                         k8s_config.port_name.clone(),
@@ -694,8 +701,15 @@ impl ServiceDiscoveryManager {
                         );
                         return false;
                     }
+                    let Some(client) = self.http_client.get().ok() else {
+                        warn!(
+                            "Service discovery: upstream {} plugin HTTP client unavailable; failing closed",
+                            upstream_id
+                        );
+                        return false;
+                    };
                     Arc::new(consul::ConsulDiscoverer::new(
-                        self.http_client.get().clone(),
+                        client.clone(),
                         consul_config.address.clone(),
                         consul_config.service_name.clone(),
                         consul_config.datacenter.clone(),
