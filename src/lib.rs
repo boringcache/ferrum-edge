@@ -723,6 +723,45 @@ pub mod _test_support {
         crate::proxy::udp_proxy::take_udp_last_client_if_live(last_client, &key, is_expired)
     }
 
+    /// Session-setup UDP load-balancer hash key. Destination-routed listeners
+    /// concatenate `client|dest` so one source socket addressing two same-port
+    /// ClusterIPs cannot share a Round-Robin slot.
+    pub fn udp_session_lb_hash_key_for_test(
+        client: std::net::IpAddr,
+        destination: Option<std::net::IpAddr>,
+    ) -> String {
+        crate::proxy::udp_proxy::udp_session_lb_hash_key(client, destination)
+    }
+
+    /// Whether a literal backend host is in the same IP family as the session
+    /// destination. Hostnames are treated as matching (DNS filters later).
+    pub fn udp_backend_host_matches_destination_family_for_test(
+        host: &str,
+        destination: std::net::IpAddr,
+    ) -> bool {
+        crate::proxy::udp_proxy::udp_backend_host_matches_destination_family(host, destination)
+    }
+
+    /// UDP backend selection with an optional session destination, so tests can
+    /// prove mixed-family Round-Robin cannot give an IPv4 ClusterIP an IPv6
+    /// backend (hosted NodeWaypoint same-port shared-tuple demux).
+    pub fn resolve_udp_backend_target_for_destination_for_test(
+        proxy: &crate::config::types::Proxy,
+        snapshot: &crate::load_balancer::LoadBalancerCacheInner,
+        health_checker: &crate::health_check::HealthChecker,
+        lb_hash_key: &str,
+        destination: Option<std::net::IpAddr>,
+    ) -> Result<(String, u16), String> {
+        crate::proxy::udp_proxy::resolve_backend_target(
+            proxy,
+            snapshot,
+            health_checker,
+            lb_hash_key,
+            destination,
+        )
+        .map_err(|err| err.to_string())
+    }
+
     /// Frontend-DTLS / UDP idle-expiry predicate on virtual monotonic timestamps.
     pub fn udp_idle_expired_for_test(
         now_mono_ms: u64,

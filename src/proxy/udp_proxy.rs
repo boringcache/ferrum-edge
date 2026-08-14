@@ -3328,12 +3328,13 @@ async fn process_new_session_datagram(
     let mut preselected_backend_target = None;
     if let Some(enforcement) = mesh_enforcement_snapshot.as_ref() {
         use crate::modes::mesh::outbound_enforcement::{Decision, PROTOCOL_UDP, PROTOCOL_UDP_DTLS};
-        let lb_hash_key = udp_lb_hash_key_for_client_ip(client_addr.ip());
+        let lb_hash_key = udp_session_lb_hash_key(client_addr.ip(), session_key.destination);
         let (backend_host, backend_port) = resolve_backend_target(
             &view.proxy,
             &epoch.load_balancer,
             health_checker,
             &lb_hash_key,
+            session_key.destination,
         )?;
         preselected_backend_target = Some((backend_host.clone(), backend_port));
         let protocol_label = if matches!(view.proxy.effective_scheme(), BackendScheme::Dtls) {
@@ -4587,10 +4588,17 @@ async fn handle_dtls_client_inner(
         ));
     }
 
-    // Resolve backend target
+    // Resolve backend target. Frontend DTLS demux is still client-tuple keyed
+    // and has no destination router here; leave destination unset so undestined
+    // listeners keep the historical client-IP hash.
     let lb_hash_key = udp_lb_hash_key_for_client_ip(client_addr.ip());
-    let (backend_host, backend_port) =
-        resolve_backend_target(&proxy, &epoch.load_balancer, health_checker, &lb_hash_key)?;
+    let (backend_host, backend_port) = resolve_backend_target(
+        &proxy,
+        &epoch.load_balancer,
+        health_checker,
+        &lb_hash_key,
+        None,
+    )?;
     // Populate backend target as soon as it's known — even if DNS or connect fails.
     backend_info.backend_target = format!("{}:{}", backend_host, backend_port);
 
@@ -5184,13 +5192,14 @@ async fn create_session(
     let is_passthrough = proxy.passthrough;
     let client_ip = udp_session_client_ip(client_addr);
 
-    let lb_hash_key = udp_lb_hash_key_for_client_ip(client_addr.ip());
+    let lb_hash_key = udp_session_lb_hash_key(client_addr.ip(), session_key.destination);
     let (backend_host, backend_port) = resolve_or_reuse_backend_target(
         preselected_backend_target,
         &proxy,
         &epoch.load_balancer,
         health_checker,
         &lb_hash_key,
+        session_key.destination,
     )?;
 
     // Circuit breaker check — reject before creating backend socket if open.
@@ -5262,6 +5271,29 @@ async fn create_session(
                 e
             ));
         }
+    };
+    let candidates = match session_key.destination {
+        Some(destination) => {
+            let filtered = candidates.matching_family(destination);
+            if filtered.is_empty() {
+                if let Some(ref cb_config) = proxy.circuit_breaker {
+                    let cb = circuit_breaker_cache.get_or_create(
+                        &proxy.namespace,
+                        proxy_id,
+                        cb_target_key.as_deref(),
+                        cb_config,
+                    );
+                    cb.record_failure(502, true, cb_is_half_open_probe);
+                }
+                return Err(StreamSetupError::new(
+                    StreamSetupKind::NoHealthyTargets,
+                    format!("no backends in destination family for {backend_host}"),
+                )
+                .into());
+            }
+            filtered
+        }
+        None => candidates,
     };
     let use_dtls = proxy.effective_scheme() == BackendScheme::Dtls && !is_passthrough;
     let dtls_params = use_dtls
@@ -6120,11 +6152,17 @@ async fn create_session(
 /// placeholder port must never pin a mixed-port upstream). Stream target
 /// selection respects active health checks and passive ejection state recorded
 /// by HTTP-family traffic.
-fn resolve_backend_target(
+///
+/// When `destination` is a literal Service ClusterIP, the chosen backend host
+/// must share that IP family. Dual-stack NodeWaypoint upstreams publish every
+/// pod address; UDP `connect()` to the other family "succeeds" and then ICMP
+/// refuses, which looks like a TIMEOUT with zero backend hits.
+pub(crate) fn resolve_backend_target(
     proxy: &Proxy,
     lb_snapshot: &LoadBalancerCacheInner,
     health_checker: &HealthChecker,
     lb_hash_key: &str,
+    destination: Option<IpAddr>,
 ) -> Result<(String, u16), anyhow::Error> {
     if let Some(upstream_id) = &proxy.upstream_id {
         // Engage the per-port LB lane only when every upstream target shares a
@@ -6184,14 +6222,122 @@ fn resolve_backend_target(
             )
             .into()
         })?;
-        Ok((selection.target.host.clone(), selection.target.port))
+        let selected = (selection.target.host.clone(), selection.target.port);
+        if let Some(destination) = destination
+            && !udp_backend_host_matches_destination_family(&selected.0, destination)
+        {
+            return pick_destination_family_udp_backend(
+                lb_snapshot,
+                &proxy.namespace,
+                upstream_id,
+                destination,
+                lb_hash_key,
+                port_lane,
+            )
+            .ok_or_else(|| {
+                StreamSetupError::new(
+                    StreamSetupKind::NoHealthyTargets,
+                    format!("for upstream {upstream_id}: no backends in destination family"),
+                )
+                .into()
+            });
+        }
+        Ok(selected)
     } else {
-        Ok((proxy.backend_host.clone(), proxy.backend_port))
+        let host = proxy.backend_host.clone();
+        if let Some(destination) = destination
+            && !udp_backend_host_matches_destination_family(&host, destination)
+        {
+            return Err(StreamSetupError::new(
+                StreamSetupKind::NoHealthyTargets,
+                "no backends in destination family",
+            )
+            .into());
+        }
+        Ok((host, proxy.backend_port))
     }
 }
 
-fn udp_lb_hash_key_for_client_ip(ip: std::net::IpAddr) -> String {
-    crate::util::client_identity::canonical_ip_string(ip)
+/// Session-setup LB hash key. Destination-routed listeners include the
+/// ClusterIP so one source socket addressing two same-port Services cannot
+/// share a Round-Robin slot or consistent-hash bucket. Undestined listeners
+/// keep the historical client-IP-only key.
+pub(crate) fn udp_session_lb_hash_key(client: IpAddr, destination: Option<IpAddr>) -> String {
+    let client = crate::util::client_identity::canonical_ip_string(client);
+    let Some(destination) = destination else {
+        return client;
+    };
+    let dest = crate::util::client_identity::canonical_ip_string(destination);
+    let mut key = String::with_capacity(client.len() + dest.len() + 1);
+    key.push_str(&client);
+    key.push('|');
+    key.push_str(&dest);
+    key
+}
+
+fn udp_lb_hash_key_for_client_ip(ip: IpAddr) -> String {
+    udp_session_lb_hash_key(ip, None)
+}
+
+/// Literal backend IPs must share the session destination family. Hostnames
+/// are admitted here; [`crate::dns::ResolvedAddresses::matching_family`] filters
+/// them after DNS.
+pub(crate) fn udp_backend_host_matches_destination_family(host: &str, destination: IpAddr) -> bool {
+    match host.parse::<IpAddr>() {
+        Ok(ip) => {
+            crate::util::client_identity::canonical_ip(ip).is_ipv4()
+                == crate::util::client_identity::canonical_ip(destination).is_ipv4()
+        }
+        Err(_) => true,
+    }
+}
+
+fn udp_family_target_matches(
+    target: &crate::config::types::UpstreamTarget,
+    destination: IpAddr,
+    port_lane: Option<u16>,
+) -> bool {
+    if let Some(port) = port_lane
+        && target.port != port
+    {
+        return false;
+    }
+    udp_backend_host_matches_destination_family(&target.host, destination)
+}
+
+/// Pick among same-family upstream targets without allocating a filtered Vec.
+/// Session-setup only; the datagram hot path never calls this.
+fn pick_destination_family_udp_backend(
+    snapshot: &LoadBalancerCacheInner,
+    namespace: &str,
+    upstream_id: &str,
+    destination: IpAddr,
+    lb_hash_key: &str,
+    port_lane: Option<u16>,
+) -> Option<(String, u16)> {
+    let upstream = snapshot.upstream(namespace, upstream_id)?;
+    let mut matching = 0usize;
+    for target in &upstream.targets {
+        if udp_family_target_matches(target, destination, port_lane) {
+            matching += 1;
+        }
+    }
+    if matching == 0 {
+        return None;
+    }
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    lb_hash_key.hash(&mut hasher);
+    let mut skip = hasher.finish() as usize % matching;
+    for target in &upstream.targets {
+        if !udp_family_target_matches(target, destination, port_lane) {
+            continue;
+        }
+        if skip == 0 {
+            return Some((target.host.clone(), target.port));
+        }
+        skip -= 1;
+    }
+    None
 }
 
 fn udp_port_lane_selection_supported(
@@ -6265,10 +6411,30 @@ fn resolve_or_reuse_backend_target(
     lb_snapshot: &LoadBalancerCacheInner,
     health_checker: &HealthChecker,
     lb_hash_key: &str,
+    destination: Option<IpAddr>,
 ) -> Result<(String, u16), anyhow::Error> {
     match preselected {
-        Some(target) => Ok(target),
-        None => resolve_backend_target(proxy, lb_snapshot, health_checker, lb_hash_key),
+        Some(target) => {
+            if let Some(destination) = destination
+                && !udp_backend_host_matches_destination_family(&target.0, destination)
+            {
+                return resolve_backend_target(
+                    proxy,
+                    lb_snapshot,
+                    health_checker,
+                    lb_hash_key,
+                    Some(destination),
+                );
+            }
+            Ok(target)
+        }
+        None => resolve_backend_target(
+            proxy,
+            lb_snapshot,
+            health_checker,
+            lb_hash_key,
+            destination,
+        ),
     }
 }
 
@@ -7793,6 +7959,7 @@ listen_port: 5300
             &snapshot,
             &HealthChecker::new(),
             "127.0.0.1",
+            None,
         )
         .unwrap();
 
@@ -7835,9 +8002,10 @@ listen_port: 5300
         let mut hosts = std::collections::HashSet::new();
         for i in 1..=64 {
             let key = format!("192.0.2.{i}");
-            let (host, port) =
-                super::resolve_backend_target(&proxy, &snapshot, &HealthChecker::new(), &key)
-                    .expect("target selected");
+            let (host, port) = super::resolve_backend_target(
+                &proxy, &snapshot, &HealthChecker::new(), &key, None,
+            )
+            .expect("target selected");
             assert_eq!(port, 5353);
             hosts.insert(host);
         }
@@ -7894,9 +8062,10 @@ listen_port: 5300
         let cache = LoadBalancerCache::new(&config);
         let snapshot = cache.load();
 
-        let err =
-            super::resolve_backend_target(&proxy, &snapshot, &HealthChecker::new(), "192.0.2.10")
-                .expect_err("per-port LEAST_CONN must be rejected explicitly");
+        let err = super::resolve_backend_target(
+            &proxy, &snapshot, &HealthChecker::new(), "192.0.2.10", None,
+        )
+        .expect_err("per-port LEAST_CONN must be rejected explicitly");
         let setup = find_stream_setup_error(&err).expect("typed stream setup error");
 
         assert_eq!(setup.kind, StreamSetupKind::UnsupportedStreamPolicy);
@@ -7939,9 +8108,10 @@ listen_port: 5300
         let cache = LoadBalancerCache::new(&config);
         let snapshot = cache.load();
 
-        let err =
-            super::resolve_backend_target(&proxy, &snapshot, &HealthChecker::new(), "192.0.2.10")
-                .expect_err("per-port LEAST_LATENCY must be rejected explicitly");
+        let err = super::resolve_backend_target(
+            &proxy, &snapshot, &HealthChecker::new(), "192.0.2.10", None,
+        )
+        .expect_err("per-port LEAST_LATENCY must be rejected explicitly");
         let setup = find_stream_setup_error(&err).expect("typed stream setup error");
 
         assert_eq!(setup.kind, StreamSetupKind::UnsupportedStreamPolicy);
@@ -7987,9 +8157,10 @@ listen_port: 5300
         let cache = LoadBalancerCache::new(&config);
         let snapshot = cache.load();
 
-        let err =
-            super::resolve_backend_target(&proxy, &snapshot, &HealthChecker::new(), "192.0.2.10")
-                .expect_err("stream hash_on cookie must be rejected explicitly");
+        let err = super::resolve_backend_target(
+            &proxy, &snapshot, &HealthChecker::new(), "192.0.2.10", None,
+        )
+        .expect_err("stream hash_on cookie must be rejected explicitly");
         let setup = find_stream_setup_error(&err).expect("typed stream setup error");
 
         assert_eq!(setup.kind, StreamSetupKind::UnsupportedStreamPolicy);
@@ -8033,9 +8204,10 @@ listen_port: 5300
         let cache = LoadBalancerCache::new(&config);
         let snapshot = cache.load();
 
-        let err =
-            super::resolve_backend_target(&proxy, &snapshot, &HealthChecker::new(), "192.0.2.10")
-                .expect_err("inherited stream hash_on header must be rejected explicitly");
+        let err = super::resolve_backend_target(
+            &proxy, &snapshot, &HealthChecker::new(), "192.0.2.10", None,
+        )
+        .expect_err("inherited stream hash_on header must be rejected explicitly");
         let setup = find_stream_setup_error(&err).expect("typed stream setup error");
 
         assert_eq!(setup.kind, StreamSetupKind::UnsupportedStreamPolicy);

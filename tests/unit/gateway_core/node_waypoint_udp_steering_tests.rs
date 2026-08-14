@@ -717,8 +717,7 @@ fn teardown_treats_a_missing_fib_table_as_genuine_absence() {
         "the hosted iproute2 missing-table dump must classify as empty absence:\n{helper}"
     );
     assert!(
-        helper.contains("route inspection failed")
-            && helper.contains("return \"$ferrum_status\""),
+        helper.contains("route inspection failed") && helper.contains("return \"$ferrum_status\""),
         "permission and other show failures must keep their original status:\n{helper}"
     );
     assert!(
