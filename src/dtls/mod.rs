@@ -2103,6 +2103,13 @@ impl DtlsServer {
                 }
             }
 
+            // Whether this driver is leaving because frontend client-certificate
+            // trust was withdrawn (issue #3857). Distinct from ordinary
+            // shutdown / handshake timeout / max-lifetime: the post-loop drain
+            // must not emit queued packets after this retirement even when the
+            // session authorization deadline has not elapsed.
+            let mut retired_by_trust_withdrawal = false;
+
             loop {
                 // Check the handshake deadline at the top of each iteration so
                 // a sustained datagram flood cannot starve the timeout arm
@@ -2201,6 +2208,7 @@ impl DtlsServer {
                             client = %peer_addr,
                             "Retiring established DTLS session: frontend client-certificate trust was withdrawn"
                         );
+                        retired_by_trust_withdrawal = true;
                         fail_queued_frontend_app_sends(
                             &mut app_in_rx,
                             auth_deadline.get(),
@@ -2464,13 +2472,17 @@ impl DtlsServer {
             }
 
             fail_queued_frontend_app_sends(&mut app_in_rx, auth_deadline.get());
-            // Protocol/handshake records may still be flushed. Application
-            // ciphertext whose authorization expired is discarded, not written.
-            let discard_expired = session_authorization_elapsed(&auth_deadline);
+            // Protocol/handshake records may still be flushed on ordinary
+            // shutdown. Application ciphertext whose authorization expired is
+            // discarded. Trust withdrawal must not emit any queued packet: the
+            // peer is no longer authorized, even if the session deadline has
+            // not elapsed.
+            let discard_final_packets = retired_by_trust_withdrawal
+                || session_authorization_elapsed(&auth_deadline);
             for _ in 0..MAX_OUTPUTS_PER_DRAIN {
                 match dtls.poll_output(&mut out_buf) {
                     Output::Packet(data) => {
-                        if discard_expired {
+                        if discard_final_packets {
                             continue;
                         }
                         let _ = socket.send_to(data, peer_addr).await;

@@ -337,11 +337,8 @@ fn a_crl_with_no_identifiable_issuer_key_is_refused() {
         rcgen::KeyIdMethod::PreSpecified(Vec::new()),
     );
     assert!(
-        ClientTrustMaterial::from_parts(
-            Some(trusted.cert_pem.as_bytes()),
-            &parse_crls(&empty_aki)
-        )
-        .is_err(),
+        ClientTrustMaterial::from_parts(Some(trusted.cert_pem.as_bytes()), &parse_crls(&empty_aki))
+            .is_err(),
         "a CRL whose signer is not in the bundle and whose AKI is empty must fail closed"
     );
 }

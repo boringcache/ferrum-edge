@@ -1727,28 +1727,27 @@ async fn commit_frontend_tls_snapshot(
                 // (config + trust), not the startup snapshot captured when CP
                 // material first arrived. Without pairing, fall back to the
                 // staged operator slot / restore clone.
-                let restore_tls_config = match frontend_tls_runtime
-                    .and_then(|runtime| runtime.h3_pairing.as_ref())
-                {
-                    Some(pairing) => {
-                        pairing
-                            .publish_cp_server_config(
-                                None,
-                                Some(slot),
-                                Some(proxy_state.stream_listener_manager.as_ref()),
-                            )
-                            .await
-                            .listener_config
-                    }
-                    None => {
-                        slot.store(Arc::new(restore_tls_config.clone()));
-                        proxy_state
-                            .stream_listener_manager
-                            .set_frontend_tls_config(restore_tls_config.clone())
-                            .await;
-                        restore_tls_config
-                    }
-                };
+                let restore_tls_config =
+                    match frontend_tls_runtime.and_then(|runtime| runtime.h3_pairing.as_ref()) {
+                        Some(pairing) => {
+                            pairing
+                                .publish_cp_server_config(
+                                    None,
+                                    Some(slot),
+                                    Some(proxy_state.stream_listener_manager.as_ref()),
+                                )
+                                .await
+                                .listener_config
+                        }
+                        None => {
+                            slot.store(Arc::new(restore_tls_config.clone()));
+                            proxy_state
+                                .stream_listener_manager
+                                .set_frontend_tls_config(restore_tls_config.clone())
+                                .await;
+                            restore_tls_config
+                        }
+                    };
                 if restore_tls_config.is_some() {
                     info!(
                         "Restored operator frontend TLS material after clearing CP-delivered Gateway frontend TLS"
@@ -1765,8 +1764,8 @@ async fn commit_frontend_tls_snapshot(
             cert_source,
         } => {
             if let Some(slot) = frontend_tls_slot {
-                if let Some(pairing) = frontend_tls_runtime
-                    .and_then(|runtime| runtime.h3_pairing.as_ref())
+                if let Some(pairing) =
+                    frontend_tls_runtime.and_then(|runtime| runtime.h3_pairing.as_ref())
                 {
                     // Pair the CP server certificate with the latest accepted
                     // operator trust before waking H3, so ProxyH3 never adopts

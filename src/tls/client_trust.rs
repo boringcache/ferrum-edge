@@ -154,9 +154,11 @@ pub const TRUST_WITHDRAWN_REASON: &str = "client certificate trust withdrawn";
 /// The closed set of frontend listener families that terminate client
 /// certificates and therefore own a client-trust generation.
 ///
-/// This is the metric label dimension. It is compile-time closed on purpose:
-/// a per-listener or per-certificate label would be unbounded cardinality and
-/// would leak deployment topology into a scrape.
+/// `scope` is a compile-time closed metric dimension: a per-listener or
+/// per-certificate label would be unbounded cardinality and would leak
+/// deployment topology into a scrape. Trust-specific dimensions (`scope`,
+/// `outcome`, `reason`) stay on closed vocabularies; the rendered registry
+/// also appends the standard configured `namespace` label.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub enum ClientTrustScope {
     /// Proxy HTTPS / HTTP-2 listeners **and** TCP+TLS stream listeners. Both
@@ -499,7 +501,7 @@ fn digest_of(parts: &[&[u8]]) -> [u8; 32] {
 
 /// Deduplicate accepted client-CA anchors by SubjectPublicKeyInfo bytes so a
 /// bundle that repeats the same key (two certificates, one key) is one signer.
-fn unique_signer_spkis<'a>(certs: &[X509Certificate<'a>]) -> Vec<SubjectPublicKeyInfo<'a>> {
+fn unique_signer_spkis<'a>(certs: &'a [X509Certificate<'a>]) -> Vec<SubjectPublicKeyInfo<'a>> {
     let mut seen = BTreeSet::new();
     let mut unique = Vec::new();
     for cert in certs {
@@ -548,7 +550,7 @@ fn crl_aki_key_identity(
         if ext.oid != OID_X509_EXT_AUTHORITY_KEY_IDENTIFIER {
             continue;
         }
-        match &ext.parsed_extension {
+        match ext.parsed_extension() {
             ParsedExtension::AuthorityKeyIdentifier(aki) => {
                 if key_id.is_some() {
                     // Two AKI extensions: the identifier is not unambiguous.
@@ -1372,7 +1374,9 @@ pub fn snapshot() -> Vec<ClientTrustScopeSnapshot> {
 ///
 /// Emits nothing at all when no scope has ever accepted material, so a
 /// deployment without frontend client-certificate live reload pays no scrape
-/// bytes. Every label is from a closed compile-time vocabulary.
+/// bytes. Trust-specific dimensions (`scope`, `outcome`, `reason`) use closed
+/// compile-time vocabularies. `ns_label` is the standard configured registry
+/// `namespace` fragment, not a trust-specific dimension.
 pub fn render_prometheus(output: &mut String, ns_label: &str) {
     let rows = snapshot();
     if !rows.iter().any(|row| row.armed) {

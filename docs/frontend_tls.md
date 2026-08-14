@@ -543,10 +543,12 @@ with its own rotation contract.
 
 A scope is armed **only when the exact accepted candidate that listener family
 installed actually performs verified client-certificate authentication**.
-Concretely, `proxy_frontend` and `proxy_h3` arm only with
-`FERRUM_FRONTEND_TLS_CLIENT_CA_BUNDLE_PATH` set and `FERRUM_FRONTEND_TLS_NO_VERIFY`
-off, `admin_https` only with `FERRUM_ADMIN_TLS_CLIENT_CA_BUNDLE_PATH` set and
-admin no-verify off, and `frontend_dtls` only with
+Concretely, `proxy_frontend` and `proxy_h3` arm only when
+`FERRUM_FRONTEND_TLS_CLIENT_CA_BUNDLE_PATH` is set (there is no frontend
+no-verify switch; without that client-CA source the listener does not request
+a client certificate). `admin_https` arms only with
+`FERRUM_ADMIN_TLS_CLIENT_CA_BUNDLE_PATH` set and admin no-verify
+(`FERRUM_ADMIN_TLS_NO_VERIFY`) off, and `frontend_dtls` only with
 `FERRUM_DTLS_CLIENT_CA_CERT_PATH` set.
 
 A listener that does no client-certificate authentication can never hold a
@@ -677,11 +679,15 @@ and one that arrives afterwards simply wakes the listener again.
 
 #### Observability
 
-All series are fixed-cardinality. The only label dimensions are the closed scope
-vocabulary above and the closed retirement reasons `client_ca_withdrawn` and
-`crl_changed`. No serial, subject, SAN, issuer name, key identifier, SPKI
-digest, fingerprint, certificate path, or generation of any secret appears in a
-metric label, a log line, or a client-visible error.
+All series are fixed-cardinality. Trust-specific dimensions (`scope`,
+`outcome`, `reason`) use closed vocabularies: the scope set above, publication
+outcomes `armed` / `unchanged` / `advanced` / `withdrawn`, and retirement
+reasons `client_ca_withdrawn` and `crl_changed`. The rendered registry also
+appends the standard configured `namespace` label — the same process-wide
+namespace fragment every other Ferrum family carries, not a per-listener or
+per-certificate dimension. No serial, subject, SAN, issuer name, key
+identifier, SPKI digest, fingerprint, certificate path, or generation of any
+secret appears in a metric label, a log line, or a client-visible error.
 
 | Metric | Type | Meaning |
 |--------|------|---------|

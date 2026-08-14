@@ -242,10 +242,7 @@ fn admits_client(trust: &AcceptedClientTrust, pki: &TestPki) -> bool {
 /// config-exposure callback. An empty `|| {}` would recreate the removed
 /// production bypass. Material-only / DTLS tests use
 /// [`client_trust::publish_accepted_material`] instead.
-fn publish_rustls(
-    scope: ClientTrustScope,
-    trust: &AcceptedClientTrust,
-) -> ClientTrustPublication {
+fn publish_rustls(scope: ClientTrustScope, trust: &AcceptedClientTrust) -> ClientTrustPublication {
     let verifier = trust
         .verifier
         .clone()
@@ -935,8 +932,7 @@ fn concurrent_rustls_publishers_cannot_cross_wire_verifier_config_and_material()
 
     let config_id = exposed.load(std::sync::atomic::Ordering::SeqCst);
     let published = client_trust::current_material(scope).expect("armed");
-    let live_admits =
-        client_trust::live_peer_still_trusted(scope, &[pki.client_cert()]);
+    let live_admits = client_trust::live_peer_still_trusted(scope, &[pki.client_cert()]);
     let is_v2 = published == v2.material;
     let is_v3 = published == v3.material;
     assert!(
@@ -1042,8 +1038,7 @@ fn no_client_ca_listener_accepts_unrelated_crls_as_an_unarmed_candidate() {
     // Malformed CRLs still fail closed when client authentication is armed.
     let mut truncated = crls[0].as_ref().to_vec();
     truncated.truncate(truncated.len() / 2);
-    let broken: CrlList =
-        std::sync::Arc::new(vec![CertificateRevocationListDer::from(truncated)]);
+    let broken: CrlList = std::sync::Arc::new(vec![CertificateRevocationListDer::from(truncated)]);
     assert!(
         load_candidate(dir.path(), &pki, &broken).is_err(),
         "a configured client CA must still refuse unverifiable CRL material"
@@ -1248,15 +1243,17 @@ fn dp_mode_pairs_cp_server_config_with_operator_trust_for_h3() {
     assert!(
         client[clear_arm..replace_arm].contains("publish_cp_server_config")
             && client[clear_arm..replace_arm].contains("None,")
-            && client[clear_arm..replace_arm]
-                .contains("Some(proxy_state.stream_listener_manager.as_ref())"),
+            && client[clear_arm..replace_arm].contains(
+                "Some(proxy_state.stream_listener_manager.as_ref())"
+            ),
         "clearing CP material must restore the latest accepted operator candidate through the pairing slot"
     );
     assert!(
         client[replace_arm..].contains("publish_cp_server_config")
             && client[replace_arm..].contains("Some(tls_config.clone())")
-            && client[replace_arm..]
-                .contains("Some(proxy_state.stream_listener_manager.as_ref())"),
+            && client[replace_arm..].contains(
+                "Some(proxy_state.stream_listener_manager.as_ref())"
+            ),
         "applying CP material must pair it with the latest accepted operator trust and update stream listeners under that lock"
     );
 

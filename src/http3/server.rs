@@ -921,12 +921,8 @@ pub async fn start_http3_listener_with_signal(
         let arm_client_trust =
             frontend_tls_reload.is_some() && startup_client_trust.verifier.is_some();
         if arm_client_trust {
-            let endpoint = quinn::Endpoint::new(
-                quinn::EndpointConfig::default(),
-                None,
-                socket,
-                runtime,
-            )?;
+            let endpoint =
+                quinn::Endpoint::new(quinn::EndpointConfig::default(), None, socket, runtime)?;
             let adopted_quic = Arc::new(arc_swap::ArcSwap::from_pointee(
                 None::<Arc<quinn::ServerConfig>>,
             ));

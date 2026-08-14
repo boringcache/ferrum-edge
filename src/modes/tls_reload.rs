@@ -162,9 +162,9 @@ pub fn prepare_proxy_frontend_tls(
     //
     // A scope is armed ONLY when the exact accepted candidate actually performs
     // verified client-certificate authentication (issue #3857). No client-CA
-    // source, or `FERRUM_FRONTEND_TLS_NO_VERIFY`, means no transport on this
-    // listener can ever hold a credential a CRL or client-CA withdrawal could
-    // revoke: arming it would publish an empty baseline, export
+    // source (`FERRUM_FRONTEND_TLS_CLIENT_CA_BUNDLE_PATH`) means no transport
+    // on this listener can ever hold a credential a CRL or client-CA
+    // withdrawal could revoke: arming it would publish an empty baseline, export
     // retirement metrics for a protection with nothing to protect, and make
     // `client_trust::capture` return `Some` on every accept — which is what
     // made TCP+TLS decline the kTLS fast path on listeners that do no client

@@ -593,3 +593,66 @@ fn driver_and_proxy_use_the_deadline_aware_actual_commit_api() {
         "the proxy must pass the admitted deadline into the actual-commit API"
     );
 }
+
+/// Established-session trust withdrawal must not emit the post-loop packet
+/// drain when the session authorization deadline is still in the future
+/// (issue #3857). Ordinary shutdown still flushes protocol records unless
+/// that deadline has elapsed.
+#[test]
+fn trust_withdrawal_suppresses_final_packet_drain_while_deadline_unexpired() {
+    let established_arm = DTLS_SOURCE
+        .split("Frontend client-certificate trust withdrawn")
+        .nth(1)
+        .expect("established-session trust-withdrawal arm")
+        .split("Shutdown signal")
+        .next()
+        .expect("trust-withdrawal arm body");
+    assert!(
+        established_arm.contains("retired_by_trust_withdrawal = true"),
+        "trust withdrawal must record an explicit termination reason before break"
+    );
+    assert!(
+        established_arm.contains("fail_queued_frontend_app_sends("),
+        "trust withdrawal must fail queued application sends rather than encrypt them"
+    );
+    assert!(
+        !established_arm.contains("send_application_data"),
+        "trust withdrawal must not encrypt queued application replies"
+    );
+    assert!(
+        !established_arm.contains("send_to"),
+        "the retirement arm itself must not drain packets onto the wire"
+    );
+
+    let post_loop = DTLS_SOURCE
+        .split("let discard_final_packets = retired_by_trust_withdrawal")
+        .nth(1)
+        .expect("post-loop drain predicate")
+        .split("pub async fn close(")
+        .next()
+        .expect("final packet drain");
+    assert!(
+        post_loop.contains("|| session_authorization_elapsed(&auth_deadline)"),
+        "trust withdrawal must suppress the final drain even when the session deadline has not elapsed"
+    );
+    assert!(
+        post_loop.contains("if discard_final_packets"),
+        "the final drain must honor the combined trust-withdrawal / deadline predicate"
+    );
+    assert!(
+        post_loop.contains("socket.send_to(data, peer_addr)"),
+        "ordinary shutdown still flushes protocol records when the deadline has not elapsed"
+    );
+
+    let shutdown_body = DTLS_SOURCE
+        .split("Some(data) = incoming_rx.recv() => {")
+        .next()
+        .expect("incoming demux arm")
+        .rsplit("_ = shutdown_rx.recv() => {")
+        .next()
+        .expect("server shutdown arm");
+    assert!(
+        !shutdown_body.contains("retired_by_trust_withdrawal = true"),
+        "ordinary shutdown must not reuse the trust-withdrawal termination reason"
+    );
+}
