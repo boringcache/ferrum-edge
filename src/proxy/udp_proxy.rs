@@ -2156,6 +2156,7 @@ fn resolve_udp_session_route(
             None
         }
     }
+}
 
 /// Start a UDP proxy listener on the given port.
 ///

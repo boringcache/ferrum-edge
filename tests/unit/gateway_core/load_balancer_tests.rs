@@ -3123,7 +3123,11 @@ fn family_eligibility_round_robin_walks_same_family_only() {
             .select_matching_family("client|dest", None, family_dest_v4())
             .expect("same-family backends exist");
         assert!(
-            sel.target.host.parse::<IpAddr>().expect("literal").is_ipv4(),
+            sel.target
+                .host
+                .parse::<IpAddr>()
+                .expect("literal")
+                .is_ipv4(),
             "IPv4 dest must not select {}",
             sel.target.host
         );
@@ -3194,7 +3198,10 @@ fn family_eligibility_skips_passively_ejected_same_family_target() {
         Some(&config),
     );
     let active: DashMap<String, u64> = DashMap::new();
-    let proxy_passive = checker.passive_health.get("ferrum|test-proxy").map(|e| e.clone());
+    let proxy_passive = checker
+        .passive_health
+        .get("ferrum|test-proxy")
+        .map(|e| e.clone());
     let ctx = HealthContext {
         active_unhealthy: &active,
         proxy_passive,
@@ -3218,7 +3225,8 @@ fn family_eligibility_fails_closed_without_same_family_backend() {
         None,
     );
     assert!(
-        lb.select_matching_family("", None, family_dest_v4()).is_none(),
+        lb.select_matching_family("", None, family_dest_v4())
+            .is_none(),
         "no eligible-family backend must fail closed"
     );
 }
@@ -3372,17 +3380,15 @@ fn family_eligibility_port_lane_vec_fallback_stays_in_family() {
     let mut seen = std::collections::HashSet::new();
     for _ in 0..16 {
         let sel = LoadBalancerCache::select_target_for_port_matching_family_from(
-            &snapshot,
-            "ferrum",
-            "u1",
-            "rr-key",
-            8080,
-            None,
-            dest,
+            &snapshot, "ferrum", "u1", "rr-key", 8080, None, dest,
         )
         .expect(">128 port∩family pool must select");
         assert!(
-            sel.target.host.parse::<IpAddr>().expect("literal").is_ipv4(),
+            sel.target
+                .host
+                .parse::<IpAddr>()
+                .expect("literal")
+                .is_ipv4(),
             "port-lane vec fallback must not cross family: {}",
             sel.target.host
         );

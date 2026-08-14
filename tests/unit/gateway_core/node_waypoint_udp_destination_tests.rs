@@ -577,22 +577,26 @@ fn udp_backend_host_family_matches_literal_destination() {
     let dest_v6 = ip("fd00:96::42");
     assert!(
         ferrum_edge::_test_support::udp_backend_host_matches_destination_family_for_test(
-            "10.244.2.9", dest_v4,
+            "10.244.2.9",
+            dest_v4,
         )
     );
     assert!(
         !ferrum_edge::_test_support::udp_backend_host_matches_destination_family_for_test(
-            "fd00:10:244:2::9", dest_v4,
+            "fd00:10:244:2::9",
+            dest_v4,
         )
     );
     assert!(
         ferrum_edge::_test_support::udp_backend_host_matches_destination_family_for_test(
-            "fd00:10:244:2::9", dest_v6,
+            "fd00:10:244:2::9",
+            dest_v6,
         )
     );
     assert!(
         ferrum_edge::_test_support::udp_backend_host_matches_destination_family_for_test(
-            "echo.svc.cluster.local", dest_v4,
+            "echo.svc.cluster.local",
+            dest_v4,
         ),
         "hostnames are admitted here; DNS matching_family filters later"
     );
@@ -604,10 +608,8 @@ fn resolve_udp_family_backend(
     health: &ferrum_edge::health_check::HealthChecker,
     dest: IpAddr,
 ) -> Result<(String, u16), String> {
-    let key = ferrum_edge::_test_support::udp_session_lb_hash_key_for_test(
-        ip("10.244.2.6"),
-        Some(dest),
-    );
+    let key =
+        ferrum_edge::_test_support::udp_session_lb_hash_key_for_test(ip("10.244.2.6"), Some(dest));
     ferrum_edge::_test_support::resolve_udp_backend_target_for_destination_for_test(
         proxy,
         snapshot,
@@ -662,10 +664,8 @@ fn mixed_family_round_robin_cannot_give_ipv4_dest_an_ipv6_backend() {
 
 #[test]
 fn mixed_family_round_robin_ipv6_dest_stays_on_ipv6_backends() {
-    let (proxy, cache, health) = mixed_family_udp_upstream(&[
-        ("10.244.2.9", 15355),
-        ("fd00:10:244:2::9", 15355),
-    ]);
+    let (proxy, cache, health) =
+        mixed_family_udp_upstream(&[("10.244.2.9", 15355), ("fd00:10:244:2::9", 15355)]);
     let snapshot = cache.load();
     let (host, _) = resolve_udp_family_backend(&proxy, &snapshot, &health, ip("fd00:96::42"))
         .expect("IPv6 dest must select a backend");
@@ -674,8 +674,7 @@ fn mixed_family_round_robin_ipv6_dest_stays_on_ipv6_backends() {
 
 #[test]
 fn mixed_family_round_robin_fails_closed_without_same_family_backend() {
-    let (proxy, cache, health) =
-        mixed_family_udp_upstream(&[("fd00:10:244:2::9", 15355)]);
+    let (proxy, cache, health) = mixed_family_udp_upstream(&[("fd00:10:244:2::9", 15355)]);
     let snapshot = cache.load();
     let err = resolve_udp_family_backend(&proxy, &snapshot, &health, ip("10.96.36.42"))
         .expect_err("IPv4 dest with only IPv6 backends must fail closed");
@@ -687,8 +686,8 @@ fn mixed_family_round_robin_fails_closed_without_same_family_backend() {
 
 #[test]
 fn mixed_family_direct_backend_fails_closed_on_family_mismatch() {
-    let mut config: ferrum_edge::config::types::GatewayConfig = serde_json::from_value(
-        serde_json::json!({
+    let mut config: ferrum_edge::config::types::GatewayConfig =
+        serde_json::from_value(serde_json::json!({
             "version": "1",
             "proxies": [{
                 "id": "udp-proxy",
@@ -700,9 +699,8 @@ fn mixed_family_direct_backend_fails_closed_on_family_mismatch() {
             "consumers": [],
             "plugin_configs": [],
             "upstreams": []
-        }),
-    )
-    .expect("gateway config should deserialize");
+        }))
+        .expect("gateway config should deserialize");
     config.resolve_dispatch_port_overrides();
     let proxy = config.proxies[0].clone();
     let cache = ferrum_edge::load_balancer::LoadBalancerCache::new(&config);
@@ -739,9 +737,8 @@ fn mixed_family_selection_skips_active_unhealthy_same_family_backend() {
     );
 
     for _ in 0..8 {
-        let (host, _) =
-            resolve_udp_family_backend(&proxy, &snapshot, &health, ip("10.96.36.42"))
-                .expect("healthy same-family backend must remain selectable");
+        let (host, _) = resolve_udp_family_backend(&proxy, &snapshot, &health, ip("10.96.36.42"))
+            .expect("healthy same-family backend must remain selectable");
         assert_eq!(
             host, "10.244.2.10",
             "active-unhealthy IPv4 must not lose to the IPv6 backend"
@@ -782,9 +779,8 @@ fn mixed_family_selection_skips_passively_ejected_same_family_backend() {
     );
 
     for _ in 0..8 {
-        let (host, _) =
-            resolve_udp_family_backend(&proxy, &snapshot, &health, ip("10.96.36.42"))
-                .expect("healthy same-family backend must remain selectable");
+        let (host, _) = resolve_udp_family_backend(&proxy, &snapshot, &health, ip("10.96.36.42"))
+            .expect("healthy same-family backend must remain selectable");
         assert_eq!(
             host, "10.244.2.10",
             "passively ejected IPv4 must not lose to the IPv6 backend"
@@ -794,8 +790,8 @@ fn mixed_family_selection_skips_passively_ejected_same_family_backend() {
 
 #[test]
 fn mixed_family_port_lane_consistent_hash_stays_on_family() {
-    let mut config: ferrum_edge::config::types::GatewayConfig = serde_json::from_value(
-        serde_json::json!({
+    let mut config: ferrum_edge::config::types::GatewayConfig =
+        serde_json::from_value(serde_json::json!({
             "version": "1",
             "proxies": [{
                 "id": "udp-proxy",
@@ -819,9 +815,8 @@ fn mixed_family_port_lane_consistent_hash_stays_on_family() {
                     "15355": { "algorithm": "consistent_hashing" }
                 }
             }]
-        }),
-    )
-    .expect("gateway config should deserialize");
+        }))
+        .expect("gateway config should deserialize");
     config.resolve_dispatch_port_overrides();
     let proxy = config.proxies[0].clone();
     let cache = ferrum_edge::load_balancer::LoadBalancerCache::new(&config);
@@ -833,7 +828,11 @@ fn mixed_family_port_lane_consistent_hash_stays_on_family() {
 
     let (first, port) =
         ferrum_edge::_test_support::resolve_udp_backend_target_for_destination_for_test(
-            &proxy, &snapshot, &health, &key, Some(dest),
+            &proxy,
+            &snapshot,
+            &health,
+            &key,
+            Some(dest),
         )
         .expect("IPv4 dest must select a backend");
     assert_eq!(port, 15355);
@@ -841,7 +840,11 @@ fn mixed_family_port_lane_consistent_hash_stays_on_family() {
     for _ in 0..8 {
         let (again, _) =
             ferrum_edge::_test_support::resolve_udp_backend_target_for_destination_for_test(
-                &proxy, &snapshot, &health, &key, Some(dest),
+                &proxy,
+                &snapshot,
+                &health,
+                &key,
+                Some(dest),
             )
             .expect("stable port-lane hash");
         assert_eq!(
@@ -862,8 +865,8 @@ fn mixed_family_udp_upstream(
         .iter()
         .map(|(host, port)| serde_json::json!({ "host": host, "port": port }))
         .collect();
-    let mut config: ferrum_edge::config::types::GatewayConfig = serde_json::from_value(
-        serde_json::json!({
+    let mut config: ferrum_edge::config::types::GatewayConfig =
+        serde_json::from_value(serde_json::json!({
             "version": "1",
             "proxies": [{
                 "id": "udp-proxy",
@@ -880,9 +883,8 @@ fn mixed_family_udp_upstream(
                 "algorithm": "round_robin",
                 "targets": targets,
             }]
-        }),
-    )
-    .expect("gateway config should deserialize");
+        }))
+        .expect("gateway config should deserialize");
     config.resolve_dispatch_port_overrides();
     let proxy = config.proxies[0].clone();
     let cache = ferrum_edge::load_balancer::LoadBalancerCache::new(&config);
