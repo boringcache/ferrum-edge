@@ -589,19 +589,23 @@ distinguished name: two CA keys can share a subject DN and a leaf serial, and
 hashing issuer DN with that serial would let a revocation under the second key
 collide with the first and suppress `CrlChanged`. The signer is the uniquely
 verified SubjectPublicKeyInfo from the accepted client-CA bundle (signature
-verified; matching a DN is not enough; identical SPKIs are deduplicated), or
-an unambiguous Authority Key Identifier when that signer is not in the
-bundle, tagged so an AKI byte string cannot collide with a raw SPKI identity.
-A CRL whose issuer key cannot be identified conservatively is refused; the
-last-good generation is retained. A CRL is normally re-issued on a schedule
-with a fresh `thisUpdate` / `nextUpdate` / `crlNumber` and an unchanged
-revocation set, and treating that as a change would churn every live session on
-every routine re-issue.
+verified; matching a DN is not enough; identical SPKIs are deduplicated). When
+the signer is not in the accepted bundle, issuer DN and Authority Key
+Identifier cannot prove its key identity: distinct keys can deliberately reuse
+both. Ferrum therefore requires an unambiguous AKI but conservatively includes
+the complete signed CRL in that issuer identity. A reissue from such an
+outside-bundle signer retires established sessions; this availability cost
+prevents colliding issuer metadata from suppressing a new revocation. A CRL
+whose issuer cannot be identified conservatively is refused and the last-good
+generation is retained. For signers whose SPKI is verified from the bundle, a
+routine reissue with a fresh `thisUpdate` / `nextUpdate` / `crlNumber` and an
+unchanged revocation set remains unchanged and does not churn sessions.
 
 | Change | Generation | Established sessions |
 |--------|-----------|----------------------|
 | Server cert/key rotation only | unchanged | untouched |
-| CRL re-issued, same revocation set | unchanged | untouched |
+| CRL re-issued, same revocation set, signer SPKI verified from bundle | unchanged | untouched |
+| CRL re-issued, signer outside bundle | advances, fence moves | retired conservatively |
 | CA **added** to the bundle (additive overlap rotation) | advances | untouched |
 | Revocation **removed** from a CRL | advances | untouched |
 | CA **removed** from the bundle | advances, fence moves | retired |

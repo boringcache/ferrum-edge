@@ -301,14 +301,15 @@ fn identical_signer_spkis_in_the_bundle_are_deduplicated() {
 }
 
 #[test]
-fn a_crl_whose_signer_is_not_in_the_bundle_uses_aki_when_unambiguous() {
+fn an_outside_bundle_crl_reissue_conservatively_retires_sessions() {
     let trusted = generate_ca("trusted-ca");
     let unknown = generate_ca("unknown-ca");
     let first = material(&[&trusted.cert_pem], &[&crl_pem(&unknown, &[7], 1)]);
     let reissued = material(&[&trusted.cert_pem], &[&crl_pem(&unknown, &[7], 2)]);
     assert_eq!(
-        first, reissued,
-        "an AKI-identified signer not in the bundle must still treat a same-set reissue as unchanged"
+        reissued.withdrawal_relative_to(&first),
+        Some(ClientTrustRetirementReason::CrlChanged),
+        "without a verified signer SPKI, a reissue must conservatively retire rather than trust attacker-selectable issuer metadata"
     );
 
     let other_unknown = generate_ca("other-unknown-ca");
@@ -329,8 +330,10 @@ fn a_crl_whose_signer_is_not_in_the_bundle_uses_aki_when_unambiguous() {
 #[test]
 fn outside_bundle_crl_signers_with_the_same_aki_remain_distinct() {
     let trusted = generate_ca("trusted-ca");
-    let unknown_a = generate_ca("unknown-a");
-    let unknown_b = generate_ca("unknown-b");
+    // Distinct keys deliberately share both issuer DN and AKI. Neither field is
+    // a cryptographic key identity, so the second revocation must not collide.
+    let unknown_a = generate_ca("shared outside-bundle issuer");
+    let unknown_b = generate_ca("shared outside-bundle issuer");
     let shared_aki = vec![0x42; 20];
     let first_crl = crl_pem_with_key_id(
         &unknown_a,
@@ -356,7 +359,7 @@ fn outside_bundle_crl_signers_with_the_same_aki_remain_distinct() {
     assert_eq!(
         after.withdrawal_relative_to(&before),
         Some(ClientTrustRetirementReason::CrlChanged),
-        "AKI reuse by a distinct outside-bundle issuer must not suppress a new revocation"
+        "issuer-DN and AKI reuse by a distinct outside-bundle key must not suppress a new revocation"
     );
 }
 

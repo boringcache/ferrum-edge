@@ -336,23 +336,27 @@ pub struct ClientTrustMaterial {
     /// SHA-256 over `issuer-key identity || 0x00 || serial DER` for every
     /// revoked entry across every parsed CRL. The issuer-key identity is a
     /// domain-tagged digest of the uniquely verified signer SPKI when that
-    /// key is in the accepted client-CA bundle, or of the CRL issuer name plus
-    /// an unambiguous Authority Key Identifier when it is not. Serial numbers are unique
-    /// only under one issuing key: two CA keys can share a subject DN and a
-    /// leaf serial, so scoping by issuer DN (or a bare serial) would let a
-    /// revocation under the second key collide with the first and suppress
+    /// key is in the accepted client-CA bundle. When the signer is not in the
+    /// bundle, the complete signed CRL is included in the conservative issuer
+    /// identity because issuer DN and Authority Key Identifier are both
+    /// attacker-selectable and cannot prove key identity on their own. Serial
+    /// numbers are unique only under one issuing key: two CA keys can share a
+    /// subject DN, AKI, and leaf serial, so scoping by any of those fields would
+    /// let a revocation under the second key collide with the first and suppress
     /// `CrlChanged`.
     revocations: BTreeSet<[u8; 32]>,
 }
 
 /// Domain tag mixed into a revocation identity derived from a verified signer
-/// SubjectPublicKeyInfo. Distinct from [`ISSUER_DOMAIN_AKI`] so an AKI octet
-/// string cannot collide with a raw SPKI.
+/// SubjectPublicKeyInfo. Distinct from [`ISSUER_DOMAIN_UNVERIFIED_CRL`] so an
+/// unverified CRL digest cannot collide with a raw SPKI.
 const ISSUER_DOMAIN_SPKI: &[u8] = b"spki";
-/// Domain tag mixed into a revocation identity derived from a CRL issuer name
-/// plus Authority Key Identifier, used only when the signer is not in the
-/// accepted anchor bundle.
-const ISSUER_DOMAIN_AKI: &[u8] = b"aki";
+/// Domain tag mixed into a conservative per-CRL identity when the signer is
+/// not in the accepted anchor bundle and its SPKI therefore cannot be verified
+/// here. Reissues conservatively produce a new identity and retire established
+/// sessions; that availability cost avoids trusting attacker-selectable issuer
+/// names or Authority Key Identifiers as cryptographic key identities.
+const ISSUER_DOMAIN_UNVERIFIED_CRL: &[u8] = b"unverified-crl";
 
 /// A CRL that this module could not parse.
 ///
@@ -520,12 +524,13 @@ fn unique_signer_spkis<'a>(certs: &'a [X509Certificate<'a>]) -> Vec<SubjectPubli
 /// Stable identity of the key that signed `crl`.
 ///
 /// Prefers the digest of a uniquely verified signer SPKI from the accepted
-/// client-CA bundle. Matching the CRL issuer DN is not enough: two CA keys
-/// can share a subject. When no bundle key verifies, the issuer's DER name and
-/// an unambiguous Authority Key Identifier are combined under a distinct
-/// identity domain. AKI alone is not globally unique: two outside-bundle
-/// issuers may deliberately or accidentally carry the same identifier. Anything
-/// else fails closed — never fall back to issuer DN alone.
+/// client-CA bundle. Matching the CRL issuer DN or Authority Key Identifier is
+/// not enough: two CA keys can deliberately share both. When no bundle key
+/// verifies, require one syntactically unambiguous AKI but include the complete
+/// signed CRL in a distinct conservative identity domain. That makes routine
+/// outside-bundle reissues retire sessions, but prevents a second signing key
+/// with colliding metadata from suppressing `CrlChanged`. Anything else fails
+/// closed — never fall back to issuer DN or AKI alone.
 fn crl_signer_key_identity(
     crl: &CertificateRevocationList<'_>,
     unique_signers: &[SubjectPublicKeyInfo<'_>],
@@ -545,10 +550,10 @@ fn crl_signer_key_identity(
     if let Some(id) = verified {
         return Ok(id);
     }
-    crl_aki_key_identity(crl)
+    conservative_unverified_crl_identity(crl)
 }
 
-fn crl_aki_key_identity(
+fn conservative_unverified_crl_identity(
     crl: &CertificateRevocationList<'_>,
 ) -> Result<[u8; 32], ClientTrustMaterialError> {
     let mut key_id: Option<&[u8]> = None;
@@ -577,9 +582,10 @@ fn crl_aki_key_identity(
         return Err(ClientTrustMaterialError);
     };
     Ok(digest_of(&[
-        ISSUER_DOMAIN_AKI,
+        ISSUER_DOMAIN_UNVERIFIED_CRL,
         crl.issuer().as_raw(),
         key_id,
+        crl.as_raw(),
     ]))
 }
 
