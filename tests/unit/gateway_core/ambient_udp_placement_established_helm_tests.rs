@@ -523,8 +523,7 @@ fn the_operator_docs_describe_the_same_pod_preflight_lifecycle() {
     assert!(
         mesh.contains("automountServiceAccountToken: false")
             && mesh.contains("kube-api-access")
-            && mesh_normalized
-                .contains("only when no explicit `FERRUM_K8S_NODE_UID`")
+            && mesh_normalized.contains("only when no explicit `FERRUM_K8S_NODE_UID`")
             && node_agent_security.contains("automountServiceAccountToken: false")
             && node_agent_security.contains("does not receive the projected token"),
         "operator docs must record ServiceAccount token isolation for the privileged init"
