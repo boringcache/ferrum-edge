@@ -336,9 +336,12 @@ need them, or because they are blocked upstream / architecturally:
   default-OFF because a NodeWaypoint runs on the host network and enabling it
   claims node-wide port numbers. Fail-closed refusals, each with a
   field-specific log line and no inert leftovers: a port already claimed by a
-  mesh runtime listener or another stream proxy, a port claimed by two
-  different services (BOTH refused — a datagram carries no host or SNI), a
-  service port with no reachable same-node endpoint, and port `0`. A
+  mesh runtime listener or another stream proxy, incompatible same-port
+  frontend postures (mixed `udp`/`dtls` or multiple `dtls` claimants), an
+  ambiguous duplicate `(ClusterIP, port)` owner, a service port with no
+  reachable same-node endpoint, and port `0`. Compatible plain-`udp` Services
+  with distinct ClusterIPs share one listener and are demultiplexed by exact
+  destination. A
   `dtls` port with no usable frontend DTLS material, or a scoped listener whose
   socket cannot report ingress interfaces, fails the BIND and is reported as a
   `StreamBindFailure` in readiness/status rather than starting a black-hole
