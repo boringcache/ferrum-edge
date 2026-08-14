@@ -263,10 +263,9 @@ pub fn retract_node_identity(registry_dir: &Path) -> Result<(), String> {
 /// published by an earlier run — under a previous Kubernetes Node object, an
 /// earlier era, or an interrupted pass — cannot survive alongside a retirement
 /// this run has not yet completed. Combined with the preflight's own
-/// authoritative node-UID lookup, that means the proof a steady-state
-/// container reads from the shared registry hostPath is the one the dedicated
-/// preflight DaemonSet's init container published — never a leftover from a
-/// previous Node object or an earlier era.
+/// authoritative node-UID lookup and its placement as an init container in the
+/// steady-state container's OWN pod, that means the proof a steady-state
+/// container reads is always the one its OWN pod's init stage published.
 pub fn retract_node_cleanup_proof(registry_dir: &Path) -> Result<(), String> {
     retract_registry_file(registry_dir, NODE_PROOF_FILE, "node cleanup proof")
 }
@@ -381,9 +380,8 @@ fn retract_registry_file(registry_dir: &Path, file: &str, description: &str) -> 
 ///
 /// Every unsuccessful path therefore leaves NO published identity, which the
 /// placement guard treats as a fail-closed refusal, and the successful path
-/// leaves an identity this run proved against the API server. The separate
-/// steady-state proxy pod reads that publication from the shared registry
-/// hostPath and fail-closes until it exists.
+/// leaves an identity this run proved against the API server immediately before
+/// the steady-state container in the same pod starts.
 pub async fn resolve_authoritative_node_identity<F, Fut>(
     registry_dir: &Path,
     explicit_node_uid: Option<&str>,
@@ -1050,6 +1048,12 @@ pub struct UdpMigrationContext {
     /// leaves the placement record for the steady-state process to write, so an
     /// interrupted preflight can never strand a pending migration.
     node_preflight: Option<UdpNodeIdentity>,
+    /// Procfs root the pod-netns cleanup backend resolves TARGET pids through.
+    /// `None` is this process's own `/proc` and is what the mesh data plane's
+    /// cleanup phase always uses. Only the one-shot node preflight sets it, so
+    /// it can run as an init container in the ambient pod against a read-only
+    /// mount of the host's procfs instead of pod-scoped `hostPID` (issue #3809).
+    target_proc_root: Option<PathBuf>,
 }
 
 impl UdpMigrationContext {
@@ -1082,7 +1086,28 @@ impl UdpMigrationContext {
             },
             cleanup_both: true,
             node_preflight: Some(node),
+            target_proc_root: None,
         })
+    }
+
+    /// Resolve pod-netns TARGET pids through `root` instead of this process's
+    /// own `/proc`.
+    ///
+    /// Set ONLY by the privileged node preflight, and only because a preflight
+    /// that keeps same-pod init-before-container ordering with the steady-state
+    /// proxy cannot also take pod-scoped `hostPID` — that field would follow the
+    /// long-running proxy container for its whole lifetime. A read-only mount of
+    /// the host's procfs, declared on the init container alone, gives the
+    /// one-shot stage the same target-pid view and disappears when it exits.
+    pub fn with_target_proc_root(mut self, root: Option<PathBuf>) -> Self {
+        self.target_proc_root = root;
+        self
+    }
+
+    /// The procfs root pod-netns cleanup resolves TARGET pids through, if the
+    /// caller overrode it.
+    pub fn target_proc_root(&self) -> Option<&Path> {
+        self.target_proc_root.as_deref()
     }
 
     pub const fn is_node_preflight(&self) -> bool {
@@ -1431,6 +1456,7 @@ pub fn prepare_placement(
                 transition,
                 cleanup_both,
                 node_preflight: None,
+                target_proc_root: None,
             }))
         }
         UdpMigrationPhase::Finalize => {

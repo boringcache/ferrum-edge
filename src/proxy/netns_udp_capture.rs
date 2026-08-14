@@ -1683,18 +1683,46 @@ impl ProxyNetnsUdpBackend {
 /// rules are installed.
 pub struct ProxyNetnsUdpCleanupBackend {
     include_v6: bool,
+    /// Where TARGET pids are resolved from. `None` is this process's own
+    /// `/proc`, which is what the mesh data plane's cleanup phase always uses.
+    ///
+    /// The one-shot Ambient UDP node preflight sets it to a read-only mount of
+    /// the HOST's procfs (issue #3809). That is what lets the preflight run as
+    /// an init container in the ambient pod without pod-scoped `hostPID`, which
+    /// Kubernetes would otherwise hand to the long-running proxy container for
+    /// its whole lifetime. It never affects `/proc/self/ns/net`: the caller's
+    /// own namespace identity and the `setns` save/restore handle both stay on
+    /// this container's own procfs.
+    target_proc_root: Option<PathBuf>,
 }
 
 impl ProxyNetnsUdpCleanupBackend {
     pub fn new(include_v6: bool) -> Self {
-        Self { include_v6 }
+        Self {
+            include_v6,
+            target_proc_root: None,
+        }
+    }
+
+    /// Resolve TARGET pids through `root` instead of this process's own `/proc`.
+    pub fn with_target_proc_root(mut self, root: Option<PathBuf>) -> Self {
+        self.target_proc_root = root;
+        self
+    }
+
+    #[cfg(target_os = "linux")]
+    fn proc_root(&self) -> &Path {
+        self.target_proc_root
+            .as_deref()
+            .unwrap_or_else(|| Path::new(super::netns_capture::DEFAULT_PROC_ROOT))
     }
 }
 
 #[cfg(target_os = "linux")]
 impl NetnsUdpCleanupBackend for ProxyNetnsUdpCleanupBackend {
     fn netns_key(&self, target: &PodCaptureTarget) -> Result<u64, String> {
-        super::netns_capture::netns_inode_for_cgroup(&target.cgroup_path).map_err(|e| e.to_string())
+        super::netns_capture::netns_inode_for_cgroup_at(self.proc_root(), &target.cgroup_path)
+            .map_err(|e| e.to_string())
     }
 
     fn cleanup_udp_capture(&self, target: &PodCaptureTarget, expected_netns: u64) -> bool {
@@ -1713,7 +1741,10 @@ impl NetnsUdpCleanupBackend for ProxyNetnsUdpCleanupBackend {
         if owned_shell::deadline_elapsed(deadline) {
             return NetnsUdpCleanupCommandOutcome::DeadlineElapsed;
         }
-        let netns = match super::netns_capture::open_pod_netns_handle(&target.cgroup_path) {
+        let netns = match super::netns_capture::open_pod_netns_handle_at(
+            self.proc_root(),
+            &target.cgroup_path,
+        ) {
             Ok(file) => file,
             Err(error) => {
                 warn!(
@@ -1797,7 +1828,7 @@ impl NetnsUdpCleanupBackend for ProxyNetnsUdpCleanupBackend {
 #[cfg(not(target_os = "linux"))]
 impl NetnsUdpCleanupBackend for ProxyNetnsUdpCleanupBackend {
     fn netns_key(&self, _target: &PodCaptureTarget) -> Result<u64, String> {
-        let _ = self.include_v6;
+        let _ = (self.include_v6, self.target_proc_root.as_deref());
         Err("Ambient UDP disabled cleanup is Linux-only".to_string())
     }
 

@@ -4134,12 +4134,15 @@ which would be a prefix wildcard).
 `iproute2`/`iptables` in the image — but **not** `SYS_ADMIN` or `SYS_PTRACE`,
 because no namespace is entered. The chart narrows those capabilities
 automatically when this placement is selected while retaining the ambient
-container's baseline `NET_RAW`. The default settled host-netns preflight runs
-in a separate DaemonSet, so its pod-scoped `hostPID` and
-`SYS_ADMIN`/`SYS_PTRACE` privileges are not shared with the steady-state
-producer. A cluster that refuses `hostPID` or those preflight capabilities
-cannot use this default unchanged — set
-`ambient.udpNodePreflight.enabled=false` and follow the documented fail-closed operator recovery path. With `hostPID` absent,
+container's baseline `NET_RAW`. The settled host-netns placement renders **no**
+`hostPID` at all. The default preflight is an init container in the same pod,
+but it resolves target pids through a read-only host `/proc` mount declared on
+that container alone rather than through the pod-scoped host PID namespace, so
+neither the mount nor `SYS_ADMIN`/`SYS_PTRACE` survives into the steady-state
+producer. A cluster that refuses a host `/proc` hostPath or those init
+capabilities cannot use this default unchanged — set
+`ambient.udpNodePreflight.enabled=false` and follow the documented fail-closed
+operator recovery path. With `hostPID` absent,
 the registry hostPath and read-only host cgroup mount stay (the enrolled-pod
 set and interface resolution use them); interface resolution falls
 back to the host route table keyed on the registry-published pod IP when `/proc`
@@ -4317,11 +4320,10 @@ independent of that pipeline gate.
    When the predecessor is `pod-netns` (or the conservative
    `disabled` case), the cleanup pod retains `hostPID`, `SYS_ADMIN`,
    `SYS_PTRACE`, and `NET_ADMIN`. Stable/final host placement drops
-   `SYS_ADMIN`/`SYS_PTRACE` and `hostPID` from the steady-state proxy pod. The
-   default preflight keeps those privileges in a dedicated DaemonSet:
-   `hostPID` is pod-scoped there (the inert holder can see host PIDs, without
-   the four preflight capabilities), and `SYS_ADMIN`/`SYS_PTRACE` stay on that
-   DaemonSet's init container only.
+   `SYS_ADMIN`/`SYS_PTRACE` and `hostPID` from the pod entirely. The default
+   preflight keeps `SYS_ADMIN`/`SYS_PTRACE` and its read-only host `/proc`
+   mount on the init container only; it needs no `hostPID`, which is why the
+   settled pod can drop that pod-scoped field while still running the stage.
 2. Wait for every node's authenticated `/health` detail
    `mesh.udp_placement_migration.phase` to become `cleanup_complete` (the HTTP
    status remains 503 because readiness is intentionally false), or for
@@ -4491,23 +4493,65 @@ operator-supplied value.
 
 #### The privileged node preflight
 
-The chart renders a dedicated `ferrum-mesh-udp-node-preflight` **DaemonSet**
-for every settled `host-netns` Ambient deployment
-(`ambient.udpNodePreflight.enabled`, default `true`). Kubernetes DaemonSet pods
-require `restartPolicy: Always`, so the privileged
-`ferrum-edge ambient-udp-preflight` command is an **init container** in that
-isolated pod — not the ordinary container, and not an init container on the
-steady-state proxy. It uses the same `-ebpf-tools` image and is the only
-producer of `node_cleanup` proof. A non-zero init exit keeps the preflight pod
-non-running and is retried fail-closed; success runs once per preflight
-pod/template generation. An inert unprivileged holder (`/bin/sleep infinity`,
-all capabilities dropped, no preflight mounts or proof env) then keeps the
-DaemonSet pod satisfied without re-executing elevated cleanup or retaining a
-privileged shell. A generation, image, or config change rolls the DaemonSet
-and re-runs the init proof. The unprivileged Ambient proxy is a **separate**
-pod: it never contains this command, never inherits the preflight's `hostPID`
-or setns capabilities, and independently fails closed until the published
-node-bound proof appears.
+The chart renders a one-shot `ferrum-udp-node-preflight` **init container** on
+every settled `host-netns` Ambient pod (`ambient.udpNodePreflight.enabled`,
+default `true`). It runs `ferrum-edge ambient-udp-preflight` from the same
+`-ebpf-tools` image and is the only producer of `node_cleanup` proof.
+
+##### Why it lives in the proxy's own pod
+
+Same-pod placement is the ordering guarantee, not a packaging convenience.
+Kubernetes runs an init container to completion before the app container starts
+**within one pod**, and provides no startup ordering at all between two
+DaemonSets. Both `.node-identity-v1.json` and
+`.udp-node-cleanup-proof-v1.json` live on the shared registry hostPath, and both
+survive a Kubernetes Node object being deleted and recreated under the **same
+name on the same boot** — the runtime accepts a published identity whose boot id
+is this incarnation's, and the proof written under it matches. A preflight in
+its own DaemonSet could therefore be scheduled *after* a replacement proxy had
+already read that stale old-UID pair and adopted the host placement; eventual
+retraction by the preflight or the node-agent does not close that window,
+because the adoption already happened. Because deleting a Node object also
+deletes the pods bound to it, keeping the init container in the proxy pod means
+every replacement proxy carries its own preflight, which retracts the leftover
+publication and republishes only what it proved **before** the steady-state
+container can start. Do not split this into a separate DaemonSet.
+
+A non-zero exit keeps the whole pod non-running and is retried fail-closed by
+the kubelet; a successful exit runs once for that pod, and a generation, image,
+or config change rolls the DaemonSet and re-runs it. It is an ordinary init
+container: it has no container-level `restartPolicy: Always` (which would make
+it a native sidecar and keep the privileged process alive beside the proxy), and
+it is never an ordinary container (which would restart the one-shot forever).
+
+##### Why it needs no `hostPID`
+
+`hostPID` is a PodSpec field, so granting it for the init stage would leave the
+long-running proxy container in the host PID namespace for its whole lifetime.
+Instead the chart mounts the host's own `/proc` **read-only at `/host/proc` on
+the init container alone** and passes `--host-proc-root /host/proc`. That flag
+redirects only **target**-pid reads: pod cgroup membership and the resulting
+`<root>/<pid>/ns/net` handle. `/proc/self/ns/net` — the stage's own namespace
+identity and the `setns` save/restore handle — always comes from the container's
+own procfs, because the preflight already runs in the host network namespace and
+must compare pod namespaces against its own.
+
+The redirect also changes *how* a pod's pid is found. `cgroup.procs` is
+translated into the reading process's PID namespace (cgroup v1 omits invisible
+tasks, cgroup v2 prints them as `0`), so a container that mounted the host's
+procfs but kept its own PID namespace cannot use it. With an explicit root the
+lookup is inverted: `<root>/<pid>/cgroup` is scanned and matched against the
+registry-published cgroup path by component-aligned suffix, which no PID
+namespace can distort. The default (`/proc`) path keeps the original
+`cgroup.procs` read unchanged, so the mesh data plane's own cleanup phase is
+byte-for-byte unaffected.
+
+The mount, `SYS_ADMIN`, and `SYS_PTRACE` are all declared on the init container
+only. The steady-state container has no host `/proc` mount, no host PID
+visibility, no preflight command, and keeps its narrow `NET_ADMIN`/`NET_RAW`
+pair.
+
+##### What it does
 
 The init container:
 
@@ -4559,8 +4603,7 @@ The init container:
 
 It exits non-zero without publishing anything on any failure or on its
 `--timeout-seconds` budget (default 300), so the unprivileged steady-state
-proxy remains fail-closed on a node whose retirement could not be proven.
-That
+container never starts on a node whose retirement could not be proven. That
 budget is a wall-clock ceiling: the preflight owns every `sh`/iptables/ip child
 it starts, waits with `try_wait`, collects stderr under the same ceiling, and
 SIGKILLs the child's process group if the deadline wins — including when the
@@ -4571,18 +4614,18 @@ A proof publication that races the deadline is retracted (or invalidated into a
 record no reader will treat as attestation) before the deadline outcome is
 returned, so a timeout cannot leave a usable cleanup attestation behind. A
 stalled cleanup command cannot pin the current-thread runtime or leave an orphan
-mutating network state after timeout. The dedicated preflight DaemonSet alone
-uses pod-scoped `hostPID` (so the inert holder can see host PIDs, without the
-preflight capabilities) plus `SYS_ADMIN` and `SYS_PTRACE` on the init
-container; the steady-state proxy pod keeps its narrow `NET_ADMIN`/`NET_RAW`
-posture and no host PID visibility.
-The elevated preflight init container is also narrower than the pod default rather
+mutating network state after timeout. `SYS_ADMIN`, `SYS_PTRACE`, and the
+read-only host `/proc` mount are confined to the init container; after it exits
+the host placement keeps its narrow `NET_ADMIN`/`NET_RAW` steady-state
+capability posture, with no host-proc mount and no host PID namespace anywhere
+in the pod. The elevated init stage is also narrower than the pod default rather
 than merely additive: it sets
 `allowPrivilegeEscalation: false` and drops `ALL` capabilities before adding
 back exactly `NET_ADMIN`, `NET_RAW`, `SYS_ADMIN`, and `SYS_PTRACE`, so those
 four are its complete, declared privilege surface and it inherits nothing from
-the runtime's ambient or default set. This preflight is **not** usable unchanged
-on a cluster that refuses `hostPID` or its setns capabilities.
+the runtime's ambient or default set. This same-pod ordering is **not** usable
+unchanged on a cluster that refuses a host `/proc` hostPath or the init stage's
+setns capabilities.
 
 On such a cluster, set `ambient.udpNodePreflight.enabled=false` and adopt each
 node explicitly. That does **not** relax the runtime boundary: write
@@ -4638,25 +4681,26 @@ enrollment-retry cadence so a recovered API/RBAC grant can publish identity
 later, and so a Node object recreated under the same name cannot keep the old
 UID in memory or on disk.
 
-That is a publisher-side mitigation, and the preflight, proxy, and node-agent
-DaemonSets have no Kubernetes startup ordering between them, so it cannot by
-itself close the window in which the replacement node-agent has not started yet.
-The **privileged preflight therefore does not consume that publication at all**:
-it performs its own bounded, node-name-bound `get` from in-cluster config only
-(step 1 above) and republishes what it proved onto the shared registry hostPath.
-The steady-state proxy is a separate pod and independently fails closed until
-that node-bound proof appears; there is no same-pod init-then-container
-ordering. Because deleting a Node object also deletes the pods bound to it, a
-replacement node starts a new preflight pod whose init container republishes
-identity before any later proxy start can treat leftover files as proof. The
-registry-synchronization marker is bound to the node UID the node-agent resolved
-for the *same* reason, so the
+That is a publisher-side mitigation, and the ambient and node-agent DaemonSets
+have no Kubernetes startup ordering between them, so it cannot by itself close
+the window in which the replacement node-agent has not started yet. The
+**privileged preflight therefore does not consume that publication at all**: it
+performs its own bounded, node-name-bound `get` from in-cluster config only
+(step 1 above) and republishes what it proved, immediately before the
+steady-state container starts in the same pod. Because deleting a Node object
+also deletes the pods bound to it, the ambient pod that runs the producer always
+carries a fresh init stage, so the identity its steady-state container reads was
+established by that same pod. This is exactly the ordering a preflight in its
+own DaemonSet would forfeit: Kubernetes would then be free to start the
+replacement proxy first, and the leftover same-boot identity/proof pair would
+already be sufficient. The registry-synchronization marker is bound to the node
+UID the node-agent resolved for the *same* reason, so the
 preflight requires two independent authorities to agree before it retires
 anything: a stale identity and the stale cleanup proof written under it can never
 be self-consistent enough to authorize node-name reuse.
 
 Disabling the preflight (`ambient.udpNodePreflight.enabled=false`) gives up that
-preflight republication. It does not relax the runtime boundary — a node with no
+per-pod republication. It does not relax the runtime boundary — a node with no
 durable record and no attestation still refuses — but on such a cluster you
 should clear `.udp-node-cleanup-proof-v1.json` from the registry directory when
 you turn the preflight off, and drive adoption through the explicit
@@ -4676,7 +4720,13 @@ registry-synchronization publication from another node, a recurring
 placement era, a leftover cleanup proof that cannot skip a new preflight pod's
 retirement, the cleanup-complete/finalize-missed resumption,
 stale/malformed/release-only evidence, and the dual-stack both-domains
-retirement plan).
+retirement plan). The chart-side ordering and privilege boundary — one
+DaemonSet, the init container ahead of the proxy container, no `hostPID`, and an
+init-only host `/proc` mount and capability set — is pinned in
+`tests/unit/gateway_core/ambient_udp_placement_established_helm_tests.rs`, and
+the explicit target-procfs resolution the `hostPID` removal rests on (including
+that the default `/proc` behaviour is unchanged) in
+`tests/unit/gateway_core/ambient_udp_preflight_proc_root_tests.rs`.
 
 The **missed-rollout/rejoin scenario itself is proven on the hosted live
 kernel** by the required `ambient-host-udp-live` gate
@@ -4715,8 +4765,10 @@ demonstration all remain in the live module.
 node-local files, so a GitOps/client-render pipeline enforces exactly the same
 contract: a bare `FERRUM_MESH_CAPTURE_UDP_PLACEMENT_ESTABLISHED=<target>` value
 authorizes nothing on its own. Such a pipeline must render the equivalent
-privileged preflight init container in a dedicated DaemonSet (or supply
-node-bound exemptions) and must carry
+privileged preflight init stage **in the proxy's own pod** (or supply node-bound
+exemptions) — moving it to a separate workload silently forfeits the
+init-before-container ordering the same-boot Node-recreation boundary rests on —
+and must carry
 an era-qualified `FERRUM_MESH_CAPTURE_UDP_NODE_PROOF_GENERATION` on the ambient
 pod, the preflight, and the node-agent. The chart injects `FERRUM_K8S_NODE_NAME`
 from `spec.nodeName` on the preflight when it is enabled (a literal

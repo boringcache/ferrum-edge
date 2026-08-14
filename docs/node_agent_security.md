@@ -167,11 +167,13 @@ in the proxy's own namespace, so the running producer calls no `setns(CLONE_NEWN
 and never opens another workload's `/proc/{pid}/ns/net`. That removes
 `SYS_ADMIN`/`SYS_PTRACE` from the steady-state container, which is the main
 reason to choose this path: the producer can capture UDP without those setns
-capabilities. The default settled-host preflight runs in its own DaemonSet, so
-its pod-scoped `hostPID` and `SYS_ADMIN`/`SYS_PTRACE` privileges never reach the
-steady-state proxy. A cluster whose Pod Security posture refuses `hostPID` or
-the preflight pod's `SYS_ADMIN`/`SYS_PTRACE` cannot use this default unchanged —
-set `ambient.udpNodePreflight.enabled=false` and adopt
+capabilities. The default settled-host preflight is an init container in the same
+pod, but it never needs `hostPID`: it reads target pids through a read-only host
+`/proc` mount declared on that container alone, so neither the mount nor
+`SYS_ADMIN`/`SYS_PTRACE` reaches the steady-state proxy and the pod renders no
+`hostPID` at all. A cluster whose Pod Security posture refuses a host `/proc`
+hostPath or the init stage's `SYS_ADMIN`/`SYS_PTRACE` cannot use this default
+unchanged — set `ambient.udpNodePreflight.enabled=false` and adopt
 nodes with explicit node-bound exemption markers instead. The chart derives
 the capability narrowing automatically — enabling the placement narrows the
 rendered container capabilities rather than adding to them.
@@ -183,8 +185,8 @@ Ferrum-owned rules inside every predecessor pod netns. The incoming host
 producer does not start in that release. `finalize` is admitted only after the
 node-local durable proof exists, and only then does the chart drop
 `SYS_ADMIN`/`SYS_PTRACE` from the running container. Settled host placement
-keeps the preflight's pod-wide `hostPID` isolated in the separate preflight
-DaemonSet. See the [Ambient UDP migration procedure](mesh.md#ambient-udp-placement-migration-enforced-hard-upgrade-guard).
+removes pod-wide `hostPID` entirely; the preflight init stage replaces it with a
+read-only host `/proc` mount that only that container receives. See the [Ambient UDP migration procedure](mesh.md#ambient-udp-placement-migration-enforced-hard-upgrade-guard).
 
 Once that migration has completed, a node with no node-local durable record —
 one that joined the cluster afterwards, or whose registry directory was
@@ -197,31 +199,37 @@ also carry node-specific proof bound to its immutable `Node.metadata.uid` and
 current boot id. The steady-state **capability** posture is unchanged — the
 narrowed host-placement `NET_ADMIN`/`NET_RAW` set still applies to the running
 container, which does not receive `SYS_ADMIN`/`SYS_PTRACE` — but a settled
-host-netns deployment now also renders a dedicated
-`ferrum-mesh-udp-node-preflight` DaemonSet. Kubernetes DaemonSet pods require
-`restartPolicy: Always`, so the privileged command is an init container in that
-isolated pod — not the ordinary container, and not an init container on the
-proxy. That pod holds `hostPID`; the init container alone adds `SYS_ADMIN` and
-`SYS_PTRACE` long enough to retire both predecessor placements ownership-safely
-and publish that proof; an inert unprivileged holder then keeps the DaemonSet
-pod satisfied without those capabilities, preflight mounts, or proof env.
-`hostPID` is still pod-scoped, so the holder can see host PIDs, but it drops
-`ALL` capabilities, forbids privilege escalation, and runs as non-root. That
-init stage sets
+host-netns pod now also renders a one-shot `ferrum-udp-node-preflight`
+**init container**. It runs in the proxy's own pod deliberately: Kubernetes
+orders an init container before the app container only within one pod, and that
+ordering is what stops a replacement proxy reading a leftover
+`.node-identity-v1.json` + `.udp-node-cleanup-proof-v1.json` pair after a
+same-boot, same-name Node recreation. A separate DaemonSet has no such ordering
+and would reintroduce that window.
+
+The init container alone holds `SYS_ADMIN`/`SYS_PTRACE` and a **read-only host
+`/proc` mount** long enough to retire both predecessor placements
+ownership-safely and publish that proof, then exits. It is passed
+`--host-proc-root /host/proc`, which redirects only **target**-pid reads
+(`<root>/<pid>/ns/net` and the cgroup→pid lookup that feeds it);
+`/proc/self/ns/net` still comes from the container's own procfs. That is why the
+pod needs no `hostPID`: the PodSpec field would otherwise apply to the
+long-running proxy for its whole lifetime. That stage sets
 `allowPrivilegeEscalation: false` and drops `ALL`
 capabilities before adding back exactly `NET_ADMIN`, `NET_RAW`, `SYS_ADMIN`, and
 `SYS_PTRACE`, so its declared four are its complete privilege surface rather
 than an addition on top of whatever the runtime's ambient/default set carries.
-The setns capabilities are bounded to that one-shot init process, which cannot
-serve traffic and does not restart after success. The steady-state proxy
-independently fails closed until the node-bound proof appears. This preflight is
-**not** usable unchanged on a
-cluster that refuses `hostPID` or those capabilities; set
+The setns capabilities and the host-proc mount are bounded to an init stage that
+cannot serve traffic, which is strictly narrower than granting the producer
+setns and host PID visibility for its whole lifetime. It is an ordinary init
+container — no container-level `restartPolicy: Always`, so it is not a native
+sidecar that would outlive its one-shot work. This same-pod ordering is **not**
+usable unchanged on a cluster that refuses a host `/proc` hostPath or those init
+capabilities; set
 `ambient.udpNodePreflight.enabled=false` and adopt nodes with explicit
 node-bound exemption markers instead.
 
-That preflight DaemonSet also carries one **read-only** Kubernetes grant:
-`nodes: get` on
+That init stage also carries one **read-only** Kubernetes grant: `nodes: get` on
 the `ferrum-mesh` service account, with no list, watch, or write verb, and only
 when the settled host-netns node preflight will actually run **and** an explicit
 `FERRUM_K8S_NODE_UID` is absent. That

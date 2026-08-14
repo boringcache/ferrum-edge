@@ -16,6 +16,7 @@
 //! CNI's or service mesh's state.
 
 use std::future::pending;
+use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -70,7 +71,7 @@ impl HostUdpCleanupReaper for ProductionHostUdpCleanupReaper {
 /// Run predecessor retirement until it is provably complete.
 ///
 /// `deadline` bounds only the *caller*: the one-shot preflight needs to fail
-/// the init container rather than hang the dedicated preflight pod forever, while the mesh
+/// the init container rather than block pod creation forever, while the mesh
 /// data-plane cleanup phase deliberately retries indefinitely (its readiness
 /// stays false and an operator drives the rollout). The deadline is converted
 /// to a wall-clock instant and threaded into every synchronous `sh`/iptables/ip
@@ -105,10 +106,14 @@ pub async fn run_udp_placement_cleanup_with_host_reaper<R: HostUdpCleanupReaper>
 ) -> UdpCleanupOutcome {
     let std_deadline = deadline.map(owned_shell::std_deadline_from_tokio);
     let ready_dir = context.registry_dir().join(".udp-ready");
+    // Only the node preflight overrides this; the mesh data plane's cleanup
+    // phase runs in the steady-state pod and keeps its own `/proc`.
+    let target_proc_root = context.target_proc_root().map(Path::to_path_buf);
     let mut pod_cleanup = context.cleanup_pod_netns().then(|| {
         super::netns_udp_capture::NetnsUdpCleanupManager::new(
             source,
-            super::netns_udp_capture::ProxyNetnsUdpCleanupBackend::new(true),
+            super::netns_udp_capture::ProxyNetnsUdpCleanupBackend::new(true)
+                .with_target_proc_root(target_proc_root),
             Duration::from_secs(2),
         )
         .with_ready_dir(Some(ready_dir.clone()))

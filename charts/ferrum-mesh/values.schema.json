@@ -357,7 +357,7 @@
         },
         "udpNodePreflight": {
           "type": "object",
-          "description": "Privileged one-shot Ambient UDP node preflight for the settled host-netns placement. Rendered as an init container in a dedicated DaemonSet plus an inert unprivileged holder. Disabling it never relaxes the runtime proof boundary.",
+          "description": "Privileged one-shot Ambient UDP node preflight init container for the settled host-netns placement. It runs in the ambient pod itself so Kubernetes orders it before the steady-state proxy container, and reads target pids through a read-only host /proc mount instead of pod-scoped hostPID. Disabling it never relaxes the runtime proof boundary.",
           "additionalProperties": false,
           "properties": {
             "enabled": {

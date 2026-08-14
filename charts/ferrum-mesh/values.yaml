@@ -232,30 +232,42 @@ ambient:
   # host netns and every enrolled pod netns) by exact Ferrum-owned name, then
   # publishes an attestation bound to this node's Kubernetes UID, current boot
   # id, target, and node-proof generation.
-  # The chart isolates this work in a dedicated preflight DaemonSet. Kubernetes
-  # DaemonSet pods require restartPolicy: Always, so the privileged
-  # `ferrum-edge ambient-udp-preflight` command runs as an init container
-  # (failure retries fail-closed; success runs once per preflight pod/template
-  # generation). An inert unprivileged holder then keeps the DaemonSet pod
-  # satisfied without the preflight capabilities, mounts, proof env, or a
-  # privileged shell. Pod-scoped hostPID and SYS_ADMIN/SYS_PTRACE capabilities never reach the
-  # steady-state producer, which keeps its narrow NET_ADMIN/NET_RAW pair.
-  # Clusters that refuse hostPID or those preflight capabilities cannot use
-  # this default unchanged.
+  # `ferrum-edge ambient-udp-preflight` runs as an INIT CONTAINER in the ambient
+  # pod itself, and that placement is the security boundary rather than a
+  # packaging choice. Kubernetes orders an init container before the app
+  # container only WITHIN one pod and orders nothing between two DaemonSets.
+  # Both `.node-identity-v1.json` and `.udp-node-cleanup-proof-v1.json` live on
+  # the shared registry hostPath and survive a Node object deleted and recreated
+  # under the SAME name on the SAME boot, so a preflight in its own DaemonSet
+  # could be scheduled AFTER a replacement proxy had already read that stale
+  # old-UID pair. Deleting a Node object deletes the pods bound to it, so
+  # same-pod placement means every replacement proxy carries its own init stage.
+  # A non-zero init exit keeps the pod non-running and is retried fail-closed;
+  # a successful exit runs once for that pod.
+  #
+  # The init container takes no pod-scoped hostPID for this: it mounts the host's
+  # own /proc read-only at /host/proc and is passed
+  # `--host-proc-root /host/proc` so its TARGET-pid reads see host pids, while
+  # /proc/self/ns/net still comes from its own procfs. That mount and
+  # SYS_ADMIN/SYS_PTRACE are declared on the init container alone, so the
+  # steady-state producer keeps its narrow NET_ADMIN/NET_RAW pair, no host PID
+  # visibility, and no host-proc mount. Clusters that refuse a host /proc
+  # hostPath or those init capabilities cannot use this default unchanged.
   #
   # The preflight is also the pod's own node-identity boundary: it resolves this
   # node's Node.metadata.uid with one bounded read-only `get` (bound to the node
-  # name the downward API supplies) and republishes it for the fail-closed
-  # steady-state startup gate, rather than trusting whatever the node-agent last
+  # name the downward API supplies) and republishes it immediately before the
+  # steady-state container starts, so the identity that container reads was
+  # proven by its OWN pod rather than inherited from whatever the node-agent last
   # left on the shared registry path. When the preflight is enabled the chart owns
   # FERRUM_K8S_NODE_NAME from spec.nodeName; ambient.env.FERRUM_K8S_NODE_NAME
   # fails rendering. Supply FERRUM_K8S_NODE_UID instead to skip the API lookup.
   #
   # Disabling it does NOT relax the runtime boundary: a node with no durable
   # record and no attestation stays fail-closed as `migration_required`. Use it
-  # only on clusters that will not grant hostPID or the preflight pod's
-  # SYS_ADMIN/SYS_PTRACE capabilities, together with the documented per-node
-  # operator exemption marker in docs/mesh.md.
+  # only on clusters that will not grant the read-only host /proc mount or the
+  # init stage's SYS_ADMIN/SYS_PTRACE capabilities, together with the documented
+  # per-node operator exemption marker in docs/mesh.md.
   # Understand the trade-off first: with the preflight off, nothing in the
   # ambient pod republishes the node identity, so a node whose Kubernetes Node
   # object was deleted and recreated on the SAME boot depends on the replacement

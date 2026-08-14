@@ -18,6 +18,55 @@ fn read(rel: &str) -> String {
     })
 }
 
+fn read_repo(rel: &str) -> String {
+    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(rel);
+    std::fs::read_to_string(&path).unwrap_or_else(|e| {
+        panic!("failed to read {rel}: {e}");
+    })
+}
+
+/// The four regions of the single ambient DaemonSet that the privilege boundary
+/// is stated in: pod-level fields, the preflight init container, the
+/// steady-state proxy container, and the volume list.
+struct AmbientRegions {
+    pod_spec: (usize, usize),
+    init: (usize, usize),
+    proxy: (usize, usize),
+    volumes: (usize, usize),
+}
+
+fn ambient_regions(ambient: &str) -> AmbientRegions {
+    let pod_spec_start = ambient
+        .find("      serviceAccountName: ferrum-mesh")
+        .expect("ambient pod spec");
+    let preflight_gate = ambient
+        .find("      {{- if $ambientUdpRunNodePreflight }}")
+        .expect("preflight render gate");
+    let init_start = ambient
+        .find("      initContainers:")
+        .expect("preflight must be an init container in the ambient pod");
+    let proxy_start = ambient
+        .find("\n      containers:")
+        .expect("steady-state container list");
+    let volumes_gate = ambient
+        .find("\n      {{- if or $ambientInNetnsCapture")
+        .expect("ambient volume gate");
+    assert!(
+        pod_spec_start < preflight_gate
+            && preflight_gate < init_start
+            && init_start < proxy_start
+            && proxy_start < volumes_gate,
+        "the preflight init container must be rendered between the pod fields and the \
+         steady-state container: Kubernetes only orders init-before-container WITHIN one pod"
+    );
+    AmbientRegions {
+        pod_spec: (pod_spec_start, preflight_gate),
+        init: (init_start, proxy_start),
+        proxy: (proxy_start, volumes_gate),
+        volumes: (volumes_gate, ambient.len()),
+    }
+}
+
 #[test]
 fn values_document_installed_contract_attestation() {
     let values = read("values.yaml");
@@ -108,8 +157,19 @@ fn ambient_env_override_still_wins_over_chart_managed_attestation() {
 
 // ── Node-specific proof boundary (issue #3809) ──────────────────────────────
 
+/// The preflight must stay an init container in the PROXY'S OWN POD.
+///
+/// That is the ordering fence the whole node-proof boundary rests on. Kubernetes
+/// runs an init container to completion before the app container starts within
+/// one pod, and orders nothing at all between two DaemonSets. Both
+/// `.node-identity-v1.json` and `.udp-node-cleanup-proof-v1.json` live on the
+/// shared registry hostPath and survive a Node object deleted and recreated
+/// under the same name on the same boot, so a preflight in its own workload
+/// could be scheduled AFTER a replacement proxy had already accepted that stale
+/// old-UID pair. Eventual retraction does not undo an adoption that already
+/// happened.
 #[test]
-fn a_settled_host_placement_isolates_the_privileged_node_preflight() {
+fn the_privileged_node_preflight_runs_before_the_proxy_in_the_same_pod() {
     let ambient = read("templates/ambient-daemonset.yaml");
 
     assert!(
@@ -119,117 +179,185 @@ fn a_settled_host_placement_isolates_the_privileged_node_preflight() {
         "the preflight must render only for a settled host-netns Ambient placement"
     );
 
-    let (preflight, steady_state) = ambient
-        .split_once("---\n{{- end }}\napiVersion: apps/v1")
-        .expect("isolated preflight and steady-state DaemonSet documents");
-    let ds_start = preflight
-        .find("kind: DaemonSet")
-        .expect("preflight DaemonSet kind");
-    let preflight_ds = &preflight[ds_start..];
-    let init_start = preflight_ds
-        .find("initContainers:")
-        .expect("privileged command must be an init container");
-    let regular_start = preflight_ds
-        .find("\n      containers:")
-        .expect("DaemonSet still needs a regular container");
-    let volumes_start = preflight_ds
-        .find("\n      volumes:")
-        .expect("preflight mounts stay on the init container");
-    assert!(
-        init_start < regular_start && regular_start < volumes_start,
-        "init must run before the holder; mounts belong to the init container"
+    assert_eq!(
+        ambient.matches("kind: DaemonSet").count(),
+        1,
+        "the ambient template must render exactly ONE DaemonSet: a second workload for the \
+         preflight has no Kubernetes startup ordering against the proxy it must precede"
     );
-    let init = &preflight_ds[init_start..regular_start];
-    let holder = &preflight_ds[regular_start..volumes_start];
-
-    assert!(
-        preflight.contains("name: ferrum-mesh-udp-node-preflight")
-            && init.contains("name: ferrum-udp-node-preflight")
-            && init.contains("args: [\"ambient-udp-preflight\", \"-v\"]"),
-        "the dedicated DaemonSet must run the node preflight as an init container"
-    );
-    assert!(
-        !init.contains("restartPolicy:"),
-        "the init container must not be a native sidecar (container-level restartPolicy: Always would keep the privileged process running)"
-    );
-    assert!(
-        !holder.contains("ferrum-udp-node-preflight\n")
-            && !holder.contains("ambient-udp-preflight"),
-        "the ordinary container must not re-run the privileged one-shot command"
-    );
-    assert!(
-        preflight_ds.contains("automountServiceAccountToken: false"),
-        "the inert holder must not inherit a service-account token by default"
-    );
-    assert!(
-        init.contains("name: kube-api-access")
-            && init.contains("mountPath: /var/run/secrets/kubernetes.io/serviceaccount")
-            && preflight_ds.contains("serviceAccountToken:")
-            && !holder.contains("kube-api-access")
-            && !holder.contains("serviceaccount"),
-        "the Node GET token must mount only on the init container"
-    );
-    assert!(
-        !init.contains("hostPID: true")
-            && preflight_ds.contains("hostPID: true")
-            && init.contains("allowPrivilegeEscalation: false")
-            && init.contains("drop:\n                - ALL"),
-        "the isolated preflight pod must declare its complete privilege surface"
-    );
-    let exact_caps = "\
-              add:
-                - NET_ADMIN
-                - NET_RAW
-                - SYS_ADMIN
-                - SYS_PTRACE";
-    assert!(
-        init.contains(exact_caps) && init.matches("add:").count() == 1,
-        "the init container's capability list must be exactly NET_ADMIN, NET_RAW, SYS_ADMIN, SYS_PTRACE"
-    );
-    for privilege in ["NET_ADMIN", "NET_RAW", "SYS_ADMIN", "SYS_PTRACE"] {
+    for forbidden in [
+        "ferrum-mesh-udp-node-preflight",
+        "ferrum-udp-node-preflight-holder",
+        "/bin/sleep",
+        "restartPolicy:",
+    ] {
         assert!(
-            init.contains(privilege),
-            "the preflight needs {privilege} to retire predecessor rules"
-        );
-        assert!(
-            !holder.contains(privilege),
-            "the inert holder must not receive {privilege}"
+            !ambient.contains(forbidden),
+            "a separate preflight workload (and its inert privileged-pod holder) must not \
+             come back: found {forbidden}"
         );
     }
+
+    let regions = ambient_regions(&ambient);
+    let init = &ambient[regions.init.0..regions.init.1];
+
     assert!(
-        init.contains("name: node-waypoint-pod-registry")
-            && init.contains("name: cgroup")
-            && !holder.contains("volumeMounts:")
-            && !holder.contains("FERRUM_"),
-        "the preflight must mount the pod registry and host cgroup; the holder must not"
+        init.contains("- name: ferrum-udp-node-preflight")
+            && init.contains(
+                "args: [\"ambient-udp-preflight\", \"--host-proc-root\", {{ $ambientUdpHostProcMountPath | quote }}, \"-v\"]"
+            ),
+        "the ambient pod's init container must run the node preflight against the explicit \
+         host procfs root"
+    );
+    assert!(
+        !init.contains("restartPolicy"),
+        "the init container must not be a native sidecar: a container-level \
+         restartPolicy: Always would keep the privileged process alive beside the proxy"
+    );
+    assert!(
+        init.contains("{{- end }}"),
+        "the preflight init container must close its own render gate before the \
+         steady-state container list"
+    );
+}
+
+/// Settled host-netns renders NO `hostPID`. The preflight replaces it with a
+/// read-only host `/proc` mount that only the init container receives, because
+/// `hostPID` is a PodSpec field and would follow the long-running proxy.
+#[test]
+fn the_settled_host_placement_renders_no_host_pid_for_the_preflight() {
+    let ambient = read("templates/ambient-daemonset.yaml");
+    let regions = ambient_regions(&ambient);
+    let pod_spec = &ambient[regions.pod_spec.0..regions.pod_spec.1];
+
+    assert_eq!(
+        ambient.matches("hostPID: true").count(),
+        1,
+        "hostPID must be rendered in exactly one place, and only for setns capture"
+    );
+    assert!(
+        pod_spec.contains("{{- if $ambientSetnsCapture }}")
+            && pod_spec.contains("hostPID: true")
+            && !pod_spec.contains("$ambientUdpRunNodePreflight"),
+        "hostPID must be gated on the steady-state producer's own setns capture mode, \
+         never on the preflight"
+    );
+    assert!(
+        !ambient.contains("or $ambientSetnsCapture $ambientUdpRunNodePreflight")
+            && !ambient.contains("or $ambientUdpRunNodePreflight $ambientSetnsCapture"),
+        "the preflight must never widen the pod-scoped hostPID gate again"
+    );
+}
+
+/// The host-proc mount and all four elevated capabilities are declared on the
+/// init container only, so they are gone before the proxy process exists.
+#[test]
+fn the_preflight_host_proc_mount_and_capabilities_are_init_only() {
+    let ambient = read("templates/ambient-daemonset.yaml");
+    let regions = ambient_regions(&ambient);
+    let init = &ambient[regions.init.0..regions.init.1];
+    let proxy = &ambient[regions.proxy.0..regions.proxy.1];
+    let volumes = &ambient[regions.volumes.0..regions.volumes.1];
+
+    assert!(
+        ambient.contains("{{- $ambientUdpHostProcMountPath := \"/host/proc\" -}}"),
+        "the mount path and the --host-proc-root argument must come from ONE chart value, \
+         or a mismatch would silently send target-pid reads back at the container's own /proc"
+    );
+    assert!(
+        init.contains("- name: preflight-host-proc")
+            && init.contains("mountPath: {{ $ambientUdpHostProcMountPath }}")
+            && init.contains("readOnly: true"),
+        "the preflight init container must mount the host procfs read-only"
+    );
+    assert!(
+        volumes.contains("{{- if $ambientUdpRunNodePreflight }}")
+            && volumes.contains("- name: preflight-host-proc")
+            && volumes.contains("path: /proc"),
+        "the host procfs volume must render only when the preflight runs"
+    );
+    assert_eq!(
+        ambient.matches("preflight-host-proc").count(),
+        2,
+        "the host procfs must appear exactly twice: one init-container mount and one volume"
+    );
+    assert!(
+        !proxy.contains("preflight-host-proc") && !proxy.contains("host/proc"),
+        "the steady-state container must never receive the host procfs mount"
     );
 
     assert!(
-        holder.contains("name: ferrum-udp-node-preflight-holder")
-            && holder.contains("- /bin/sleep")
-            && holder.contains("- infinity")
-            && holder.contains("runAsNonRoot: true")
-            && holder.contains("runAsUser: 65534")
-            && holder.contains("allowPrivilegeEscalation: false")
-            && holder.contains("readOnlyRootFilesystem: true")
-            && holder.contains("drop:\n                - ALL")
-            && !holder.contains("add:")
-            && !holder.contains("ports:")
-            && !holder.contains("/bin/sh"),
-        "the holder must be an inert unprivileged sleeper, not a privileged shell"
+        init.contains("allowPrivilegeEscalation: false")
+            && init.contains("drop:\n                - ALL"),
+        "the init container must declare its complete privilege surface"
     );
+    assert_eq!(
+        init.matches("add:").count(),
+        1,
+        "the init container must declare exactly one capability add list"
+    );
+    let added = &init[init.find("add:").expect("capability add list")..];
+    for privilege in ["NET_ADMIN", "NET_RAW", "SYS_ADMIN", "SYS_PTRACE"] {
+        let entry = format!("\n                - {privilege}\n");
+        assert_eq!(
+            added.matches(&entry).count(),
+            1,
+            "the preflight needs exactly one {privilege} entry"
+        );
+    }
+    assert_eq!(
+        added.matches("\n                - ").count(),
+        4,
+        "the init container's capability list must be exactly NET_ADMIN, NET_RAW, SYS_ADMIN, SYS_PTRACE"
+    );
+    assert!(
+        init.contains("name: node-waypoint-pod-registry") && init.contains("name: cgroup"),
+        "the preflight must still mount the pod registry and host cgroup"
+    );
+}
+
+/// The steady-state proxy container carries no part of the preflight.
+#[test]
+fn the_steady_state_proxy_container_carries_no_preflight_surface() {
+    let ambient = read("templates/ambient-daemonset.yaml");
+    let regions = ambient_regions(&ambient);
+    let proxy = &ambient[regions.proxy.0..regions.proxy.1];
 
     assert!(
-        steady_state.contains("{{- if $ambientSetnsCapture }}\n      hostPID: true"),
-        "the proxy pod must enable hostPID only when its own capture mode needs setns"
+        proxy.contains("- name: ferrum-edge") && proxy.contains("args: [\"run\"]"),
+        "the ambient pod's only ordinary container is the proxy"
     );
-    assert!(
-        !steady_state.contains("$ambientUdpRunNodePreflight")
-            && !steady_state.contains("name: ferrum-udp-node-preflight")
-            && !steady_state.contains("ambient-udp-preflight")
-            && !steady_state.contains("initContainers:"),
-        "the preflight must not widen or share the steady-state proxy pod"
-    );
+    for forbidden in [
+        "$ambientUdpRunNodePreflight",
+        "ambient-udp-preflight",
+        "host-proc",
+        "initContainers",
+        "allowPrivilegeEscalation",
+    ] {
+        assert!(
+            !proxy.contains(forbidden),
+            "the steady-state proxy container must not carry {forbidden}"
+        );
+    }
+
+    // SYS_ADMIN/SYS_PTRACE still exist for the setns capture modes whose RUNNING
+    // producer enters pod netns; they must never be reachable through the
+    // preflight gate.
+    let setns_gate = proxy
+        .find("{{- if $ambientSetnsCapture }}")
+        .expect("steady-state setns capability gate");
+    for privilege in ["SYS_ADMIN", "SYS_PTRACE"] {
+        assert_eq!(
+            proxy.matches(privilege).count(),
+            1,
+            "{privilege} must appear exactly once in the steady-state container"
+        );
+        let at = proxy.find(privilege).expect("privilege position");
+        assert!(
+            setns_gate < at,
+            "{privilege} must sit inside the setns-capture gate, not the preflight one"
+        );
+    }
 }
 
 #[test]
@@ -320,10 +448,70 @@ fn client_render_parity_keeps_an_explicit_env_value_under_the_same_boundary() {
         "values must document that disabling the preflight keeps the runtime fail-closed"
     );
     assert!(
-        values.contains("dedicated preflight DaemonSet")
-            && values.contains("capabilities never reach the")
-            && values.contains("will not grant hostPID or the preflight pod's"),
-        "values must document the pod boundary that isolates preflight privileges"
+        values.contains("runs as an INIT CONTAINER in the ambient")
+            && values.contains("orders nothing between two DaemonSets")
+            && values.contains("--host-proc-root /host/proc")
+            && values.contains("no host PID"),
+        "values must document the same-pod ordering fence and the host-proc mount that \
+         replaces pod-scoped hostPID"
+    );
+}
+
+/// The operator-facing lifecycle prose must describe the shipped shape: a
+/// same-pod init container, a host-proc mount instead of hostPID, and WHY a
+/// separate workload would reopen the stale same-boot proof window.
+#[test]
+fn the_operator_docs_describe_the_same_pod_preflight_lifecycle() {
+    let mesh = read_repo("docs/mesh.md");
+    let node_agent_security = read_repo("docs/node_agent_security.md");
+    let configuration = read_repo("docs/configuration.md");
+    let cli = read_repo("docs/cli.md");
+    let schema = read("values.schema.json");
+
+    for (name, doc) in [
+        ("docs/mesh.md", &mesh),
+        ("docs/node_agent_security.md", &node_agent_security),
+        ("docs/configuration.md", &configuration),
+    ] {
+        assert!(
+            !doc.contains("ferrum-mesh-udp-node-preflight")
+                && !doc.contains("dedicated preflight DaemonSet")
+                && !doc.contains("inert unprivileged holder"),
+            "{name} must not describe a separate preflight DaemonSet or its holder"
+        );
+    }
+
+    assert!(
+        mesh.contains("init container** on")
+            && mesh.contains("Why it lives in the proxy's own pod")
+            && mesh.contains("name on the same boot**")
+            && mesh.contains("Do not split this into a separate DaemonSet."),
+        "docs/mesh.md must state the same-pod ordering fence and the stale same-boot pair \
+         it exists to refuse"
+    );
+    assert!(
+        mesh.contains("Why it needs no `hostPID`")
+            && mesh.contains("--host-proc-root /host/proc")
+            && mesh.contains("translated into the reading process's PID")
+            && mesh.contains("`/proc/self/ns/net` — the stage's own namespace"),
+        "docs/mesh.md must explain the host-proc redirect, including why cgroup.procs \
+         cannot be used through a foreign procfs and what stays on the own procfs"
+    );
+    assert!(
+        node_agent_security.contains("read-only host\n`/proc` mount**")
+            && node_agent_security.contains("no `hostPID`")
+            && node_agent_security.contains("A separate DaemonSet has no such ordering"),
+        "docs/node_agent_security.md must record the init-only host-proc mount and the \
+         ordering the separate-workload shape would forfeit"
+    );
+    assert!(
+        cli.contains("--host-proc-root <PATH>") && cli.contains("fails closed"),
+        "docs/cli.md must document the flag and its fail-closed validation"
+    );
+    assert!(
+        schema.contains("read-only host /proc mount instead of pod-scoped hostPID")
+            && !schema.contains("dedicated DaemonSet"),
+        "values.schema.json must describe the shipped preflight shape"
     );
 }
 
@@ -598,9 +786,8 @@ fn the_preflight_binds_its_node_lookup_to_this_pods_node_name() {
         "the preflight must not gate the downward-API fieldRef on ambient.env presence"
     );
 
-    let (init_block, _) = ambient
-        .split_once("---\n{{- end }}\napiVersion: apps/v1")
-        .expect("isolated preflight DaemonSet");
+    let regions = ambient_regions(&ambient);
+    let init_block = &ambient[regions.init.0..regions.init.1];
     assert!(
         init_block.contains("if not $hasExplicitNodeUid")
             && init_block.contains("- name: FERRUM_K8S_NODE_NAME")
@@ -693,15 +880,16 @@ fn the_preflight_explicit_node_uid_skips_the_name_fieldref_but_rejects_name_over
     );
 }
 
-/// SPIRE and the preflight are in separate pods; each may receive its own
-/// downward-API node name without duplicating env rows inside one container.
+/// SPIRE and the preflight bind the downward-API node name in DIFFERENT
+/// containers of the same pod, so neither duplicates an env row inside one
+/// container's env list.
 #[test]
 fn spire_and_preflight_each_bind_node_name_in_their_own_container() {
     let ambient = read("templates/ambient-daemonset.yaml");
 
-    let (init_block, steady_state) = ambient
-        .split_once("---\n{{- end }}\napiVersion: apps/v1")
-        .expect("isolated preflight and steady-state DaemonSets");
+    let regions = ambient_regions(&ambient);
+    let init_block = &ambient[regions.init.0..regions.init.1];
+    let steady_state = &ambient[regions.proxy.0..regions.proxy.1];
 
     assert_eq!(
         init_block.matches("- name: FERRUM_K8S_NODE_NAME").count(),
