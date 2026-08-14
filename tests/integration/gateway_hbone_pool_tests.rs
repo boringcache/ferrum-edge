@@ -748,7 +748,8 @@ fn mesh_hbone_tag_constant_matches_documented_target_tag() {
 // force-drain anything at all; and the assertions run with NO `.await` after the
 // synchronous publishing call, so nothing they observe could have come from
 // another task. Whatever the pools report is what the publication itself did to
-// pool discoverability — not whether already-issued handles terminate (issue #3859).
+// pool discoverability. `gateway_mesh_trust_retirement_tests` owns the separate
+// assertions that already-issued handles are signalled and terminate.
 
 /// A `ProxyState` in the DOCUMENTED DEFAULT drain configuration whose mesh pools
 /// share `gateway_svid_bundle` and `backend_svid_generation` with the state.
@@ -906,7 +907,7 @@ async fn a_committed_trust_replace_clears_pooled_mesh_entries_at_the_default_zer
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn a_committed_trust_clear_clears_pooled_mesh_entries_at_the_default_zero_drain() {
+async fn a_clear_that_restores_the_same_authority_keeps_pooled_mesh_entries() {
     let _ = rustls::crypto::ring::default_provider().install_default();
     let td = TrustDomain::new("cluster.local").unwrap();
     let (root_der, root_pem, root_key_pem) = synthetic_root(&td);
@@ -924,8 +925,9 @@ async fn a_committed_trust_clear_clears_pooled_mesh_entries_at_the_default_zero_
     let gateway_bundle = bundle_for(gateway_id, gateway_leaf, gateway_key, root);
     let (state, _tasks) = dp_state_with_gateway_svid(gateway_bundle).await;
 
-    // Install a CP override first; the pooled entries below are the ones a
-    // revocation of THAT override must clear from the pool maps.
+    // Install a real CP override whose effective authority is byte-identical to
+    // the source-loaded bundle. Clearing it restores the same verifier: no root
+    // is withdrawn, so #3859's no-churn contract must preserve live transports.
     state.update_config_with_gateway_trust(
         dp_snapshot("trust-install"),
         GatewayTrustCommit::Replace(local_only_trust(&td, root_der)),
@@ -933,22 +935,24 @@ async fn a_committed_trust_clear_clears_pooled_mesh_entries_at_the_default_zero_
     let (_tunnel, _sender) = pool_one_mesh_pooled_entry_each(&state, server_addr, &server_id).await;
     let before = backend_security_generation(&state);
 
-    // ── Explicit revocation. No `.await` past this point. ────────────────────
+    // ── Overlap-only Clear. No `.await` past this point. ─────────────────────
     state.update_config_with_gateway_trust(dp_snapshot("trust-clear"), GatewayTrustCommit::Clear);
 
     assert_eq!(
         state.hbone_pool.pool_size(),
-        0,
-        "an explicit revocation must clear the HBONE pooled entries the withdrawn \
-         override authenticated from the pool map"
+        1,
+        "restoring the same authority must not churn the HBONE pooled entry"
     );
     assert_eq!(
         state.mesh_mtls_pool.pool_size(),
-        0,
-        "an explicit revocation must clear the mesh-mTLS pooled entries the withdrawn \
-         override authenticated from the pool map"
+        1,
+        "restoring the same authority must not churn the mesh-mTLS pooled entry"
     );
-    assert_eq!(backend_security_generation(&state), before + 1);
+    assert_eq!(
+        backend_security_generation(&state),
+        before,
+        "an overlap-only Clear must not advance the backend security generation"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]

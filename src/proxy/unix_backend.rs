@@ -694,7 +694,10 @@ pub async fn handshake_unix_h2c_sender(
             tracing::debug!("unix_backend: h2c connection closed: {}", e);
         }
     });
-    Ok((sender, driver))
+    Ok((
+        crate::proxy::mesh_mtls_pool::MeshMtlsSender::ungoverned(sender),
+        driver,
+    ))
 }
 
 /// Dial a co-located Unix-domain STREAM socket and complete an **h2c

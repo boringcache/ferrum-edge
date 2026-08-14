@@ -291,7 +291,7 @@ pub struct TrustBundle {
 ///
 /// `PartialEq` is the "is this the same authority" predicate the gateway trust
 /// publication uses to tell an ADDED root from a WITHDRAWN one
-/// (`proxy::runtime_trust_retains_every_authority`), so it must stay a
+/// (`proxy::mesh_trust_registry::trust_withdrawal_reason`), so it must stay a
 /// comparison of the material itself, never of the key id alone.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct JwtAuthority {

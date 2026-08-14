@@ -1692,6 +1692,31 @@
     "emission": "when_process_initialized"
   },
   {
+    "name": "ferrum_gateway_trust_accepted_generation",
+    "type": "gauge",
+    "help": "Monotonic accepted gateway-to-mesh trust generation. It advances only when an accepted publication withdraws an authority.",
+    "labels": [
+      "namespace"
+    ],
+    "subsystem": "gateway_trust",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "always"
+  },
+  {
+    "name": "ferrum_gateway_trust_admission_refusals_total",
+    "type": "counter",
+    "help": "Gateway-to-mesh connections refused because the accepted trust generation advanced while they were being established, by transport class.",
+    "labels": [
+      "transport",
+      "namespace"
+    ],
+    "subsystem": "gateway_trust",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "always"
+  },
+  {
     "name": "ferrum_gateway_trust_bundle_ambiguous_authority_total",
     "type": "counter",
     "help": "Publications that found both a database record and a file-sourced trust value and kept the previously accepted trust.",
@@ -1726,6 +1751,32 @@
     "type": "counter",
     "help": "Gateway trust-bundle generations carrying a database-sourced record that reached the live configuration swap; a generation refused by the ambiguous-authority rule is not counted.",
     "labels": [],
+    "subsystem": "gateway_trust",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "always"
+  },
+  {
+    "name": "ferrum_gateway_trust_retired_transports_total",
+    "type": "counter",
+    "help": "Live gateway-to-mesh transports terminated by a trust withdrawal, by transport class. Counts connections, not requests or streams.",
+    "labels": [
+      "transport",
+      "namespace"
+    ],
+    "subsystem": "gateway_trust",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "always"
+  },
+  {
+    "name": "ferrum_gateway_trust_withdrawals_total",
+    "type": "counter",
+    "help": "Accepted gateway trust publications that removed an authority and retired the outgoing generation, by closed reason.",
+    "labels": [
+      "reason",
+      "namespace"
+    ],
     "subsystem": "gateway_trust",
     "export_surface": "/metrics",
     "bundled": "documented_only",

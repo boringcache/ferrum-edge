@@ -2729,6 +2729,7 @@ impl MetricsRegistry {
         self.append_destination_active_request_prometheus(&mut output);
         self.append_dp_config_freshness_prometheus(&mut output);
         self.append_cp_dp_trust_reload_prometheus(&mut output);
+        self.append_gateway_trust_retirement_prometheus(&mut output);
         self.append_gateway_listener_status_prometheus(&mut output);
         self.append_k8s_controller_prometheus(&mut output);
         output
@@ -2773,6 +2774,26 @@ impl MetricsRegistry {
             output,
             &ns_label,
             crate::grpc::cp_trust_health::snapshot().as_ref(),
+        );
+    }
+
+    /// Append the bounded gateway-trust live-retirement families (issue #3859).
+    ///
+    /// Kept off the render cache for the same reason as the families above: the
+    /// accepted generation and the retirement counters are the CURRENT
+    /// withdrawal state, and a memoized body would keep reporting a gateway as
+    /// still serving the outgoing trust generation for the whole cache window —
+    /// exactly the moment an operator is watching after revoking a root.
+    fn append_gateway_trust_retirement_prometheus(&self, output: &mut String) {
+        let ns_label = self
+            .namespace_label
+            .read()
+            .map(|label| label.clone())
+            .unwrap_or_default();
+        render_gateway_trust_retirement_prometheus(
+            output,
+            &ns_label,
+            &crate::proxy::mesh_trust_registry::metrics_snapshot(),
         );
     }
 
@@ -2974,6 +2995,7 @@ impl MetricsRegistry {
         self.append_destination_active_request_prometheus(&mut output);
         self.append_dp_config_freshness_prometheus(&mut output);
         self.append_cp_dp_trust_reload_prometheus(&mut output);
+        self.append_gateway_trust_retirement_prometheus(&mut output);
         self.append_gateway_listener_status_prometheus(&mut output);
         self.append_k8s_controller_prometheus(&mut output);
         output
@@ -5294,6 +5316,74 @@ pub fn render_cp_dp_trust_reload_prometheus(
         u64::from(status.worker_state == "stalled"),
         ns_label,
     );
+}
+
+/// Render the bounded gateway-trust live-retirement families (issue #3859).
+///
+/// A free function taking the projection explicitly so the exact rendered text
+/// is testable without installing a process-global gateway trust registry.
+///
+/// Every series is fixed-cardinality: `namespace`, the closed
+/// [`crate::proxy::mesh_trust_registry::TrustWithdrawalReason`] set, and the
+/// closed [`crate::proxy::mesh_trust_registry::MeshTransportKind`] set are the
+/// only labels. No trust material, trust domain, certificate subject, key id,
+/// fingerprint, source path, or peer identity is ever a label value or a sample
+/// value; the generation counter is a local monotonic integer that identifies no
+/// authority.
+pub fn render_gateway_trust_retirement_prometheus(
+    output: &mut String,
+    ns_label: &str,
+    metrics: &crate::proxy::mesh_trust_registry::MeshTrustRetirementMetrics,
+) {
+    output.push_str(
+        "# HELP ferrum_gateway_trust_accepted_generation Monotonic accepted gateway-to-mesh trust generation. It advances only when an accepted publication withdraws an authority.\n",
+    );
+    output.push_str("# TYPE ferrum_gateway_trust_accepted_generation gauge\n");
+    render_process_counter(
+        output,
+        "ferrum_gateway_trust_accepted_generation",
+        metrics.accepted_generation,
+        ns_label,
+    );
+
+    output.push_str(
+        "# HELP ferrum_gateway_trust_withdrawals_total Accepted gateway trust publications that removed an authority and retired the outgoing generation, by closed reason.\n",
+    );
+    output.push_str("# TYPE ferrum_gateway_trust_withdrawals_total counter\n");
+    for reason in crate::proxy::mesh_trust_registry::TRUST_WITHDRAWAL_REASONS {
+        output.push_str(&format!(
+            "ferrum_gateway_trust_withdrawals_total{{reason=\"{}\"{}}} {}\n",
+            reason.as_str(),
+            ns_label,
+            metrics.withdrawals_for(reason),
+        ));
+    }
+
+    output.push_str(
+        "# HELP ferrum_gateway_trust_retired_transports_total Live gateway-to-mesh transports terminated by a trust withdrawal, by transport class. Counts connections, not requests or streams.\n",
+    );
+    output.push_str("# TYPE ferrum_gateway_trust_retired_transports_total counter\n");
+    for kind in crate::proxy::mesh_trust_registry::MESH_TRANSPORT_KINDS {
+        output.push_str(&format!(
+            "ferrum_gateway_trust_retired_transports_total{{transport=\"{}\"{}}} {}\n",
+            kind.as_str(),
+            ns_label,
+            metrics.retired_for(kind),
+        ));
+    }
+
+    output.push_str(
+        "# HELP ferrum_gateway_trust_admission_refusals_total Gateway-to-mesh connections refused because the accepted trust generation advanced while they were being established, by transport class.\n",
+    );
+    output.push_str("# TYPE ferrum_gateway_trust_admission_refusals_total counter\n");
+    for kind in crate::proxy::mesh_trust_registry::MESH_TRANSPORT_KINDS {
+        output.push_str(&format!(
+            "ferrum_gateway_trust_admission_refusals_total{{transport=\"{}\"{}}} {}\n",
+            kind.as_str(),
+            ns_label,
+            metrics.refused_for(kind),
+        ));
+    }
 }
 
 fn render_process_counter(output: &mut String, metric_name: &str, value: u64, ns_label: &str) {

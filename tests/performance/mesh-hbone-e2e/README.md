@@ -8,7 +8,7 @@ End-to-end throughput harness for Ferrum Edge's **gateway-to-mesh HBONE outbound
 hbone_loadgen (plain HTTP/1.1)
         │
         ▼
-  ferrum-edge (file mode)
+  hbone_perf_fixture (trusted projection → file::serve / ProxyState)
         │  opens HBONE tunnel (H2 CONNECT over mTLS)
         ▼
   hbone_sidecar (stub ambient sidecar — H2 CONNECT terminator)
@@ -24,13 +24,13 @@ hbone_loadgen ──► hbone_backend  (no gateway, no sidecar, no tunnel)
 
 ## Why this shape
 
-Mesh mode (`FERRUM_MODE=mesh`) requires a live native `MeshSubscribe` gRPC consumer and currently produces a `GatewayConfig` with empty `proxies`, so the inbound HBONE listener has nothing to route to without a production-code hatch. The **gateway-to-mesh HBONE outbound pool** (`src/proxy/hbone_pool.rs`) is the same H2-CONNECT-over-mTLS + tunnel-relay code path, but it's driven by an ordinary `Proxy` whose `UpstreamTarget.tags["mesh.hbone"] = "true"`, so it runs in plain file mode with `FERRUM_GATEWAY_SVID_*` only. This is the path edge-gateway users hit when their backend services are deployed behind an ambient mesh.
+Mesh mode (`FERRUM_MODE=mesh`) requires a live native `MeshSubscribe` gRPC consumer and currently produces a `GatewayConfig` with empty `proxies`, so the inbound HBONE listener has nothing to route to without a production-code hatch. The **gateway-to-mesh HBONE outbound pool** (`src/proxy/hbone_pool.rs`) is the same H2-CONNECT-over-mTLS + tunnel-relay code path, driven by an `UpstreamTarget` whose reserved `mesh.hbone` / `mesh.hbone_port` tags are projected internally. Operator file/admin admission rejects those tags (`GatewayConfig::validate_operator_provided_fields`), so this harness launches the performance-only `hbone_perf_fixture` example: it constructs the fixture config in-process, normalizes it, and calls `file::serve` / `ProxyState` the same way mesh materialization does. That is the path edge-gateway users hit when their backend services are deployed behind an ambient mesh, without forging operator YAML.
 
 ## Quickstart
 
 ```bash
 # From the repo root:
-cargo build --release --bin ferrum-edge
+cargo build --release --example hbone_perf_fixture
 
 # From this directory:
 ./run.sh --duration 30 --concurrency 50 --payload-size 1024
