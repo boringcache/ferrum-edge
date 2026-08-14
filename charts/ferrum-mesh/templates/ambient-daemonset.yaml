@@ -43,7 +43,9 @@
        it needs NET_ADMIN (always granted below) but NOT SYS_ADMIN/SYS_PTRACE
        the per-pod-netns producer requires. Kubernetes hostPID is a separate
        PodSpec field (pod-scoped visibility, not a capability and not setns);
-       the settled-host preflight below may still render it for the whole pod.
+       the settled-host placement deliberately does NOT render it, because the
+       one-shot preflight init container reads target PIDs through its own
+       read-only host `/proc` mount instead of the host PID namespace.
        Same strict `true`/`1` predicate as the capture switch. */ -}}
 {{- $ambientUdpHostNetns := false -}}
 {{- if hasKey $ambientEnv "FERRUM_MESH_CAPTURE_UDP_HOST_NETNS_ENABLED" -}}
@@ -98,8 +100,9 @@
        capabilities. Note the disabled-cleanup manager still enters pod netns
        to reap predecessor rules, so the lifecycle term keeps them when UDP
        capture is off. hostPID is not part of this capability gate: it is a
-       PodSpec field rendered below when setns capture OR the settled-host
-       preflight needs host PID visibility. */ -}}
+       PodSpec field rendered ONLY when setns capture needs host PID
+       visibility. The settled host-netns preflight does not require it — its
+       init container mounts the host's own /proc read-only instead. */ -}}
 {{- /* Release-level attestation that the rendered placement was already
        established by a COMPLETED earlier migration release (#3703). The
        node-local durable record lives in the pod-registry hostPath, which on the
@@ -139,18 +142,38 @@
        still redirect UDP to the retired predecessor listener.
 
        So the settled host placement additionally runs a PRIVILEGED one-shot
-       preflight init stage that enumerates and retires BOTH predecessor
-       placements (IPv4 and IPv6, host netns and every enrolled pod netns) by
-       exact Ferrum-owned name, then publishes a completion attestation bound to
-       this node's Kubernetes UID, its current boot id, the incoming target, and
-       the release's node-proof generation. Kubernetes hostPID is pod-scoped,
-       not container-scoped: enabling this init stage therefore gives the whole
-       pod — init and steady-state — host PID namespace visibility.
-       hostPID does not grant setns. SYS_ADMIN and SYS_PTRACE remain confined to the init
-       container; the steady-state container keeps its narrow NET_ADMIN/NET_RAW
-       pair after the init stage exits. Clusters that refuse hostPID or those
-       init capabilities cannot use this default unchanged; set
-       ambient.udpNodePreflight.enabled=false and follow the documented
+       preflight INIT CONTAINER in THIS pod that enumerates and retires BOTH
+       predecessor placements (IPv4 and IPv6, host netns and every enrolled pod
+       netns) by exact Ferrum-owned name, then publishes a completion
+       attestation bound to this node's Kubernetes UID, its current boot id, the
+       incoming target, and the release's node-proof generation.
+
+       Same-pod placement is the SECURITY BOUNDARY, not a packaging choice.
+       Kubernetes guarantees init-before-container ordering only inside one pod;
+       between two DaemonSets it guarantees nothing. Both `.node-identity-v1.json`
+       and `.udp-node-cleanup-proof-v1.json` live on the shared registry hostPath
+       and survive a Node object being deleted and recreated under the SAME name
+       on the SAME boot, and the runtime accepts a published identity whose boot
+       id is current. A preflight in a separate DaemonSet could therefore be
+       scheduled AFTER a replacement proxy pod had already read that stale
+       old-UID pair and adopted the host placement. Because deleting a Node
+       object also deletes the pods bound to it, keeping the preflight in the
+       proxy pod means every replacement proxy carries its own init stage, which
+       retracts the leftover identity/proof and republishes only what it proved
+       against the API server BEFORE the steady-state container can start. Do
+       not split this into its own DaemonSet.
+
+       hostPID is NOT used for this. It is pod-scoped, so it would hand the
+       steady-state proxy host PID visibility for the whole pod lifetime. The
+       init container instead mounts the host's own /proc read-only at
+       /host/proc and is told to resolve TARGET pids there
+       (`--host-proc-root`); /proc/self/ns/net still comes from the container's
+       own procfs. Both the mount and SYS_ADMIN/SYS_PTRACE are declared on the
+       init container only, so they are gone before the proxy starts. A non-zero
+       init exit keeps the pod non-running and is retried fail-closed; a
+       successful exit runs once for this pod. Clusters that refuse the host
+       /proc mount or those init capabilities cannot use this default unchanged;
+       set ambient.udpNodePreflight.enabled=false and follow the documented
        fail-closed operator recovery path. */ -}}
 {{- $ambientUdpNodeProofGeneration := include "ferrum-mesh.ambientUdpNodeProofGeneration" . -}}
 {{- $ambientUdpNodePreflight := default dict .Values.ambient.udpNodePreflight -}}
@@ -159,6 +182,13 @@
 {{- $ambientUdpNodePreflightEnabled = eq (lower (toString $ambientUdpNodePreflight.enabled)) "true" -}}
 {{- end -}}
 {{- $ambientUdpRunNodePreflight := and $ambientUdpLifecycle $ambientUdpHostNetns (eq $ambientUdpMigrationPhase "stable") $ambientUdpNodePreflightEnabled -}}
+{{- /* Where the host's own procfs is mounted for the preflight init container,
+       and the exact value passed to `ambient-udp-preflight --host-proc-root`.
+       Deliberately a chart constant, not a value: it is an internal contract
+       between one mount and one argument, and a mismatch would silently send
+       target-PID reads back at the container's own /proc. Never mounted on the
+       steady-state container. */ -}}
+{{- $ambientUdpHostProcMountPath := "/host/proc" -}}
 {{- $hasExplicitNodeUid := hasKey $ambientEnv "FERRUM_K8S_NODE_UID" -}}
 {{- if and $ambientUdpRunNodePreflight (hasKey $ambientEnv "FERRUM_K8S_NODE_NAME") -}}
 {{- fail "ambient.env.FERRUM_K8S_NODE_NAME is chart-managed when the settled host-netns UDP preflight is enabled; the chart injects spec.nodeName from the downward API so the preflight's read-only nodes:get stays bound to this pod" -}}
@@ -307,22 +337,48 @@ spec:
         app.kubernetes.io/instance: {{ .Release.Name }}
     spec:
       serviceAccountName: ferrum-mesh
+      {{- /* Disable kubelet's automatic pod token projection so the privileged
+             preflight init container is not given a bearer token by default.
+             The short-lived kube-api-access volume below is the replacement:
+             the steady-state proxy always mounts it (in-cluster Kubernetes
+             controller, pod discovery, and TLS/source identity), and the
+             preflight mounts it only when it must perform the bounded nodes:get
+             (no explicit FERRUM_K8S_NODE_UID). */}}
+      automountServiceAccountToken: false
       hostNetwork: true
-      {{- if or $ambientSetnsCapture $ambientUdpRunNodePreflight }}
+      {{- if $ambientSetnsCapture }}
       {{- /* PodSpec field: Kubernetes applies hostPID to every container in
-             this pod. The settled-host preflight needs it to resolve
-             /proc/<pid>/ns/net; the steady-state container therefore also
-             sees host PIDs whenever the preflight is enabled. Visibility is
-             not setns — SYS_ADMIN/SYS_PTRACE stay on the init container. */}}
+             this pod, so it is rendered ONLY for the setns capture modes whose
+             STEADY-STATE producer needs host PID visibility for its whole
+             lifetime. The settled host-netns preflight deliberately does not
+             use it: an init-only, read-only host /proc mount gives the one-shot
+             stage the same target-PID view without leaving the long-running
+             proxy in the host PID namespace. */}}
       hostPID: true
       {{- end }}
       dnsPolicy: ClusterFirstWithHostNet
       {{- if $ambientUdpRunNodePreflight }}
+      {{- /* Same-pod init-before-container ordering is the fence (issue #3809).
+             Kubernetes runs this to completion before `ferrum-edge` starts and
+             never starts `ferrum-edge` at all while it keeps failing, so the
+             steady-state producer can only ever read an identity/proof pair
+             THIS pod's init stage just proved. A preflight in any other pod —
+             including its own DaemonSet — has no ordering against this
+             container and would let a same-boot, same-name Node recreation hand
+             the replacement proxy the previous Node object's leftover
+             `.node-identity-v1.json` + `.udp-node-cleanup-proof-v1.json` pair
+             from the shared hostPath. */}}
       initContainers:
         - name: ferrum-udp-node-preflight
           image: {{ $ambientImage | quote }}
           imagePullPolicy: {{ .Values.image.pullPolicy }}
-          args: ["ambient-udp-preflight", "-v"]
+          {{- /* `--host-proc-root` is what removes the pod-wide hostPID need:
+                 the stage resolves TARGET pids (cgroup membership, then
+                 <root>/<pid>/ns/net) through the read-only host procfs mounted
+                 below, while its own /proc/self/ns/net still comes from this
+                 container's own procfs. The mount is declared here only, so the
+                 steady-state container never receives it. */}}
+          args: ["ambient-udp-preflight", "--host-proc-root", {{ $ambientUdpHostProcMountPath | quote }}, "-v"]
           securityContext:
             runAsUser: 0
             runAsGroup: 0
@@ -339,9 +395,9 @@ spec:
                 - NET_ADMIN
                 - NET_RAW
                 {{- /* setns(CLONE_NEWNET) + ptrace_may_access on
-                       /proc/<pid>/ns/net, so predecessor rules can be retired
-                       inside every enrolled pod netns. These are granted to the
-                       INIT stage only; it exits before the steady-state
+                       <host-proc>/<pid>/ns/net, so predecessor rules can be
+                       retired inside every enrolled pod netns. These are granted
+                       to the INIT stage only; it exits before the steady-state
                        container starts, so the host producer still runs without
                        them. */}}
                 - SYS_ADMIN
@@ -354,8 +410,8 @@ spec:
                    node name, and never from the node-agent's published identity
                    file. That file records the CURRENT boot id even when a
                    PREVIOUS Kubernetes Node object wrote it, so no reader can
-                   tell a stale publication from a live one — and the two
-                   DaemonSets have no startup ordering between them, so the
+                   tell a stale publication from a live one — and the node-agent
+                   DaemonSet has no startup ordering against this pod, so the
                    replacement node-agent may not have retracted it yet. The
                    downward API cannot supply the UID, only the node name, which
                    is exactly the binding this lookup needs. */}}
@@ -379,6 +435,18 @@ spec:
               readOnly: true
             - name: node-waypoint-pod-registry
               mountPath: {{ $nodeWaypointRegistryMountPath }}
+            - name: preflight-host-proc
+              mountPath: {{ $ambientUdpHostProcMountPath }}
+              readOnly: true
+            {{- /* The init stage talks to the API only when it must resolve
+                   Node.metadata.uid itself. An explicit UID skips that GET, so
+                   this privileged container must not receive the bearer token
+                   on that path. */}}
+            {{- if not $hasExplicitNodeUid }}
+            - name: kube-api-access
+              mountPath: /var/run/secrets/kubernetes.io/serviceaccount
+              readOnly: true
+            {{- end }}
       {{- end }}
       containers:
         - name: ferrum-edge
@@ -430,8 +498,9 @@ spec:
                    This is DESIRED STATE, not authorization (issue #3809). On its
                    own it can no longer admit a recordless node: the runtime also
                    requires node-specific proof bound to this node's Kubernetes
-                   UID and current boot id, which the preflight init stage above
-                   publishes. A bare `FERRUM_MESH_CAPTURE_UDP_PLACEMENT_ESTABLISHED`
+                   UID and current boot id, which the init stage above publishes
+                   in this same pod before this container can start.
+                   A bare `FERRUM_MESH_CAPTURE_UDP_PLACEMENT_ESTABLISHED`
                    supplied by a client-render pipeline is therefore held to the
                    same boundary as the Helm-rendered one. */ -}}
             {{- if and $ambientUdpEstablished (not (hasKey $ambientEnv "FERRUM_MESH_CAPTURE_UDP_PLACEMENT_ESTABLISHED")) }}
@@ -477,8 +546,14 @@ spec:
             - name: {{ $name }}
               value: {{ $value | quote }}
             {{- end }}
-          {{- if or $ambientInNetnsCapture $ambientSpireEnabled }}
           volumeMounts:
+            {{- /* Always mount the projected in-cluster credentials. Pod-level
+                   automountServiceAccountToken is false, so omitting this would
+                   regress the proxy's Kubernetes-backed controller, discovery,
+                   and TLS/source identity defaults. */}}
+            - name: kube-api-access
+              mountPath: /var/run/secrets/kubernetes.io/serviceaccount
+              readOnly: true
             {{- if $nodeWaypointRegistryEnabled }}
             - name: bpf-fs
               mountPath: {{ .Values.nodeAgent.bpfFsPath }}
@@ -496,7 +571,6 @@ spec:
               mountPath: {{ $ambientSpireSocketMountPath }}
               readOnly: true
             {{- end }}
-          {{- end }}
           {{- /* Admin-backed probes when the listener is enabled. NodeWaypoint
                  still requires a non-zero admin port (validated above). Ordinary
                  ambient also probes admin when available so rollouts wait for
@@ -510,8 +584,29 @@ spec:
           {{- $ambientReadyHandler := .Values.ambient.probes.readiness.override | default dict -}}
           {{- if not $ambientReadyHandler }}{{- $ambientReadyHandler = $ambientHandlers.ready | default dict -}}{{- end -}}
           {{- include "ferrum-mesh.renderProbes" (dict "probes" .Values.ambient.probes "liveHandler" $ambientLiveHandler "readyHandler" $ambientReadyHandler) }}
-      {{- if or $ambientInNetnsCapture $ambientSpireEnabled }}
       volumes:
+        {{- /* Always rendered, including when no cgroup/SPIRE/preflight
+               hostPath volumes exist. automountServiceAccountToken is false, so
+               this is the only in-cluster credential surface. expirationSeconds
+               3607 matches kubelet's default projected-token TTL (1h+7s). */}}
+        - name: kube-api-access
+          projected:
+            defaultMode: 420
+            sources:
+              - serviceAccountToken:
+                  expirationSeconds: 3607
+                  path: token
+              - configMap:
+                  name: kube-root-ca.crt
+                  items:
+                    - key: ca.crt
+                      path: ca.crt
+              - downwardAPI:
+                  items:
+                    - fieldRef:
+                        apiVersion: v1
+                        fieldPath: metadata.namespace
+                      path: namespace
         {{- if $nodeWaypointRegistryEnabled }}
         - name: bpf-fs
           hostPath:
@@ -528,11 +623,21 @@ spec:
             path: {{ .Values.nodeAgent.podRegistryDir }}
             type: DirectoryOrCreate
         {{- end }}
+        {{- if $ambientUdpRunNodePreflight }}
+        {{- /* The host's own procfs, mounted read-only and consumed ONLY by the
+               preflight init container's volumeMounts above. This replaces the
+               pod-scoped hostPID the settled host placement used to need: it
+               gives the one-shot stage the host's target-PID view without
+               putting the long-running proxy in the host PID namespace. */}}
+        - name: preflight-host-proc
+          hostPath:
+            path: /proc
+            type: Directory
+        {{- end }}
         {{- if $ambientSpireEnabled }}
         - name: spire-agent-socket
           hostPath:
             path: {{ $ambientSpireSocketHostPath }}
             type: DirectoryOrCreate
         {{- end }}
-      {{- end }}
 {{- end }}
