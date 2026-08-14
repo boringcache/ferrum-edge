@@ -6712,9 +6712,9 @@ impl EnvConfig {
                         );
                     }
                     // (FERRUM_DP_GRPC_TLS_NO_VERIFY is rejected unconditionally by
-                    // validate_cp_dp_grpc_transport_security() — it is not honored
-                    // on the tonic-managed CP/DP gRPC client, so it can never
-                    // silently disable verification under remote discovery either.)
+                    // validate_cp_dp_grpc_transport_security() — it is intentionally
+                    // not honored, so it can never silently disable verification
+                    // under remote discovery either.)
                     if self.mesh_remote_discovery_poll_interval_seconds > 0
                         && self.mesh_remote_discovery_max_stale_seconds == 0
                     {
@@ -7601,10 +7601,9 @@ impl EnvConfig {
 
     /// Enforce the secure-by-default CP/DP gRPC transport policy.
     ///
-    /// 1. `FERRUM_DP_GRPC_TLS_NO_VERIFY=true` is rejected outright: the
-    ///    tonic-managed CP/DP gRPC client exposes no hook to skip server
-    ///    verification, so the flag never actually disabled it — keeping it
-    ///    would only grant false confidence. Pin the CP CA via
+    /// 1. `FERRUM_DP_GRPC_TLS_NO_VERIFY=true` is rejected outright because
+    ///    disabling server certificate verification is an unsafe transport mode
+    ///    that Ferrum Edge does not support. Pin the CP CA via
     ///    `FERRUM_DP_GRPC_TLS_CA_CERT_PATH` for self-signed test certs instead.
     /// 2. In CP mode, a plaintext gRPC listener bound to a non-loopback address
     ///    is refused unless `FERRUM_CP_DP_GRPC_ALLOW_PLAINTEXT=true`.
@@ -7618,8 +7617,8 @@ impl EnvConfig {
     fn validate_cp_dp_grpc_transport_security(&self) -> Result<(), String> {
         if self.dp_grpc_tls_no_verify {
             return Err(
-                "FERRUM_DP_GRPC_TLS_NO_VERIFY=true is not supported: the CP/DP gRPC client cannot \
-                 skip server certificate verification, so the flag offers only false confidence. \
+                "FERRUM_DP_GRPC_TLS_NO_VERIFY=true is not supported: disabling server certificate \
+                 verification is unsafe. \
                  To connect to a CP with a self-signed certificate, pin its CA via \
                  FERRUM_DP_GRPC_TLS_CA_CERT_PATH (one-way TLS) or supply the full \
                  FERRUM_DP_GRPC_TLS_CLIENT_CERT_PATH/KEY_PATH (mTLS)."
@@ -7913,8 +7912,8 @@ mod tests {
 
     #[test]
     fn dp_grpc_tls_no_verify_is_rejected() {
-        // The flag is not honored by the tonic-managed client, so it must fail
-        // closed rather than provide false confidence — in any mode.
+        // The unsafe flag is intentionally not honored, so it must fail closed
+        // rather than disable server identity verification — in any mode.
         let config = EnvConfig {
             dp_grpc_tls_no_verify: true,
             ..file_mode_config()

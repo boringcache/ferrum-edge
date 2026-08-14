@@ -99,16 +99,48 @@ fn record_client_address_metadata_drop(
     }
 }
 
-/// Maximum response payload allowed by the UDP amplification guard.
-///
-/// A zero-length request receives an explicit one-byte reply allowance so the
-/// legal datagram does not create a black-holed session. Nonempty requests keep
-/// the configured payload ratio exactly.
-pub fn udp_amplification_response_budget(request_size: u64, factor: f32) -> u64 {
-    if request_size == 0 {
-        1
+/// Admit one backend→client datagram against the session's remaining
+/// per-request amplification budget. Unlimited proxies (`factor == None`) skip
+/// the check. Empty responses still consume one unit of remaining budget
+/// (plain UDP, DTLS, and batched paths share this helper). Drops are
+/// rate-limited and never log client addresses, sizes, factors, or payload.
+fn admit_udp_response(
+    remaining: &AtomicU64,
+    factor: Option<f32>,
+    len: u64,
+    proxy_id: &str,
+    listen_port: u16,
+) -> bool {
+    if factor.is_none() {
+        return true;
+    }
+    if crate::udp_amplification::charge_response_budget(remaining, len) {
+        crate::udp_amplification::record_response_allowed();
+        true
     } else {
-        (request_size as f64 * factor as f64) as u64
+        let n = crate::udp_amplification::record_response_dropped();
+        if n == 1 || n.is_multiple_of(100) {
+            warn!(
+                proxy_id = %proxy_id,
+                listen_port,
+                drops = n,
+                "UDP response dropped: exceeds amplification budget"
+            );
+        }
+        false
+    }
+}
+
+fn publish_session_request_budget(session: &UdpSession, request_size: u64) {
+    session
+        .last_request_size
+        .store(request_size, Ordering::Release);
+    if let Some(factor) = session.amplification_factor {
+        crate::udp_amplification::publish_request_budget(
+            &session.response_budget_remaining,
+            request_size,
+            factor,
+        );
     }
 }
 
@@ -180,6 +212,13 @@ struct UdpSession {
     /// cannot race ahead of the response budget.
     /// Updated on each policy-accepted request; read on each backend→client response.
     last_request_size: AtomicU64,
+    /// Remaining backend→client payload bytes for the current admitted request.
+    /// Charged by every response datagram until the next client request resets
+    /// it. Lives on the session (not the backend) so weighted multi-backend
+    /// selection cannot reset or multiply the budget.
+    response_budget_remaining: AtomicU64,
+    /// Copied from the proxy at session admission. `None` skips the guard.
+    amplification_factor: Option<f32>,
     /// Backend target for logging (e.g., "10.0.2.10:5353").
     backend_target: String,
     /// DNS-resolved IP address of the backend for logging.
@@ -3350,9 +3389,7 @@ where
     // being polled again; publishing only after send completion lets that first
     // response bypass the amplification guard. A failed send still leaves a
     // conservative budget based on bytes accepted from the client.
-    session
-        .last_request_size
-        .store(data.len() as u64, Ordering::Release);
+    publish_session_request_budget(session, data.len() as u64);
 
     let plan = session
         .authorization
@@ -4057,6 +4094,7 @@ async fn handle_dtls_client(
     let bytes_sent = Arc::new(AtomicU64::new(0));
     let bytes_received = Arc::new(AtomicU64::new(0));
     let last_request_size = Arc::new(AtomicU64::new(0));
+    let response_budget_remaining = Arc::new(AtomicU64::new(0));
     // Shared sink for per-datagram WAF metadata recorded by the forwarding tasks
     // inside `handle_dtls_client_inner`; drained into the disconnect summary
     // below so DTLS hits are observable by default (parity with plain UDP/TCP).
@@ -4077,6 +4115,7 @@ async fn handle_dtls_client(
         Arc::clone(&bytes_sent),
         Arc::clone(&bytes_received),
         Arc::clone(&last_request_size),
+        Arc::clone(&response_budget_remaining),
         Arc::clone(&datagram_metadata),
         datagram_plugins,
         proxy_name,
@@ -4736,6 +4775,7 @@ async fn handle_dtls_client_inner(
     bytes_sent: Arc<AtomicU64>,
     bytes_received: Arc<AtomicU64>,
     last_request_size: Arc<AtomicU64>,
+    response_budget_remaining: Arc<AtomicU64>,
     datagram_metadata: Arc<std::sync::Mutex<std::collections::HashMap<String, String>>>,
     datagram_plugins: &Arc<[Arc<dyn Plugin>]>,
     proxy_name: Option<&str>,
@@ -4750,6 +4790,9 @@ async fn handle_dtls_client_inner(
         .ok_or_else(|| anyhow::anyhow!("Proxy {proxy_namespace}/{proxy_id} not found"))?
         .clone();
     let idle_timeout = Duration::from_secs(proxy.udp_idle_timeout_seconds.max(1));
+    if proxy.udp_max_response_amplification_factor.is_none() {
+        crate::udp_amplification::record_policy_unlimited();
+    }
     // Socket peer for reply routing and diagnostics; resolved client for
     // identity-bearing values (backend stickiness, per-datagram hook context).
     let client_addr = identity.socket_peer;
@@ -4947,6 +4990,8 @@ async fn handle_dtls_client_inner(
     let proxy_id_fwd = proxy_id.to_string();
     let bytes_sent_fwd = Arc::clone(&bytes_sent);
     let last_request_size_fwd = Arc::clone(&last_request_size);
+    let remaining_fwd = Arc::clone(&response_budget_remaining);
+    let amplification_factor_fwd = proxy.udp_max_response_amplification_factor;
     // Pre-compute datagram plugin list once, share between both direction tasks.
     // Arc<[...]> avoids the per-session filter+collect being done twice.
     let dgram_plugins = Arc::clone(datagram_plugins);
@@ -5043,6 +5088,13 @@ async fn handle_dtls_client_inner(
             // Publish before sending so a fast backend reply cannot observe a
             // zero or stale amplification budget.
             last_request_size_fwd.store(len as u64, Ordering::Release);
+            if let Some(factor) = amplification_factor_fwd {
+                crate::udp_amplification::publish_request_budget(
+                    remaining_fwd.as_ref(),
+                    len as u64,
+                    factor,
+                );
+            }
             let send = async {
                 if let Some(ref dtls) = backend_dtls_write {
                     dtls.send(&data).await.map_err(|e| e.to_string())
@@ -5091,7 +5143,8 @@ async fn handle_dtls_client_inner(
     let proxy_id_rev = dgram_proxy_id_rev.to_string();
     let bytes_received_rev = Arc::clone(&bytes_received);
     let amplification_factor_rev = proxy.udp_max_response_amplification_factor;
-    let last_request_size_rev = Arc::clone(&last_request_size);
+    let remaining_rev = Arc::clone(&response_budget_remaining);
+    let listen_port_rev = listen_port;
 
     // Backend → Client (plain UDP or backend-DTLS): refresh idle only after
     // amplification/plugin admission and successful client delivery.
@@ -5124,13 +5177,16 @@ async fn handle_dtls_client_inner(
                 .bytes_in
                 .fetch_add(len as u64, Ordering::Relaxed);
 
-            // Amplification factor check for DTLS path
-            if let Some(factor) = amplification_factor_rev {
-                let req_size = last_request_size_rev.load(Ordering::Acquire);
-                let max_response = udp_amplification_response_budget(req_size, factor);
-                if len as u64 > max_response {
-                    continue; // Drop oversized response
-                }
+            // Amplification factor check for DTLS path — cumulative remaining
+            // budget, same contract as plain UDP.
+            if !admit_udp_response(
+                remaining_rev.as_ref(),
+                amplification_factor_rev,
+                len as u64,
+                &proxy_id_rev,
+                listen_port_rev,
+            ) {
+                continue; // Drop oversized / over-budget response
             }
 
             // Backend→client plugin hooks share the raced helper: a pending
@@ -5561,6 +5617,9 @@ async fn create_session(
         (Some(tx), Some(rx))
     };
     let hook_ingress_queued_bytes = Arc::new(AtomicUsize::new(0));
+    if proxy.udp_max_response_amplification_factor.is_none() {
+        crate::udp_amplification::record_policy_unlimited();
+    }
     let session = Arc::new(UdpSession {
         backend_socket: backend_socket.clone(),
         dtls_conn: dtls_conn.clone(),
@@ -5573,6 +5632,18 @@ async fn create_session(
         // Establish the first response budget before the reply task is spawned.
         // The caller has already accepted this datagram through policy hooks.
         last_request_size: AtomicU64::new(initial_data.len() as u64),
+        response_budget_remaining: AtomicU64::new(
+            proxy
+                .udp_max_response_amplification_factor
+                .map(|factor| {
+                    crate::udp_amplification::udp_amplification_response_budget(
+                        initial_data.len() as u64,
+                        factor,
+                    )
+                })
+                .unwrap_or(0),
+        ),
+        amplification_factor: proxy.udp_max_response_amplification_factor,
         backend_target: format!("{}:{}", backend_host, backend_port),
         backend_resolved_ip: resolved_ip.to_string(),
         sni_hostname: stream_ctx.sni_hostname.clone(),
@@ -5856,21 +5927,15 @@ async fn create_session(
             }
 
             // Amplification factor check: drop backend responses that exceed
-            // the configured ratio relative to the last client request size.
-            if let Some(factor) = reply_amplification_factor {
-                let req_size = reply_session.last_request_size.load(Ordering::Acquire);
-                let max_response = udp_amplification_response_budget(req_size, factor);
-                if len as u64 > max_response {
-                    warn!(
-                        proxy_id = %reply_proxy_id,
-                        client = %udp_client_log_addr(client_addr),
-                        response_size = len,
-                        request_size = req_size,
-                        factor = factor,
-                        "UDP response dropped: exceeds amplification factor"
-                    );
-                    continue; // Drop this response datagram, continue receiving
-                }
+            // the remaining per-request byte budget (cumulative across replies).
+            if !admit_udp_response(
+                &reply_session.response_budget_remaining,
+                reply_amplification_factor,
+                len as u64,
+                &reply_proxy_id,
+                reply_listen_port,
+            ) {
+                continue; // Drop this response datagram, continue receiving
             }
 
             // Run backend→client per-datagram plugin hooks raced against the
@@ -6053,14 +6118,14 @@ async fn create_session(
                     match sock.try_recv(&mut buf) {
                         Ok(len2) => {
                             // Amplification check on batched response datagram
-                            if let Some(factor) = reply_amplification_factor {
-                                let req_size =
-                                    reply_session.last_request_size.load(Ordering::Acquire);
-                                let max_response =
-                                    udp_amplification_response_budget(req_size, factor);
-                                if len2 as u64 > max_response {
-                                    continue; // Drop oversized response
-                                }
+                            if !admit_udp_response(
+                                &reply_session.response_budget_remaining,
+                                reply_amplification_factor,
+                                len2 as u64,
+                                &reply_proxy_id,
+                                reply_listen_port,
+                            ) {
+                                continue; // Drop oversized / over-budget response
                             }
                             // Backend→client plugin hooks on batched datagram,
                             // raced against the same absolute plan.
@@ -7064,6 +7129,8 @@ mod tests {
             bytes_sent: AtomicU64::new(128),
             bytes_received: AtomicU64::new(256),
             last_request_size: AtomicU64::new(64),
+            response_budget_remaining: AtomicU64::new(0),
+            amplification_factor: None,
             backend_target: "10.0.0.50:5353".to_string(),
             backend_resolved_ip: "10.0.0.50".to_string(),
             sni_hostname: None,
@@ -7108,6 +7175,10 @@ mod tests {
         let socket = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
         let mut raw_session = make_udp_session();
         raw_session.backend_socket = Some(socket);
+        // A guarded session is what makes the "publish before send" invariant
+        // observable: the remaining budget, not `last_request_size`, is what
+        // the backend→client path now charges.
+        raw_session.amplification_factor = Some(2.0);
         raw_session
             .last_activity
             .store(1_710_000_000_500, Ordering::Relaxed);
@@ -7135,7 +7206,12 @@ mod tests {
         assert_eq!(
             session.last_request_size.load(Ordering::Relaxed),
             b"payload".len() as u64,
-            "accepted client datagrams must establish the amplification budget before send"
+            "accepted client datagrams must record their request size before send"
+        );
+        assert_eq!(
+            session.response_budget_remaining.load(Ordering::Acquire),
+            b"payload".len() as u64 * 2,
+            "a failed send must still leave the earned response budget"
         );
     }
 
@@ -8338,6 +8414,8 @@ backend_tls_verify_server_cert: false
             bytes_sent: AtomicU64::new(0),
             bytes_received: AtomicU64::new(0),
             last_request_size: AtomicU64::new(0),
+            response_budget_remaining: AtomicU64::new(0),
+            amplification_factor: None,
             backend_target: "10.0.0.50:5353".to_string(),
             backend_resolved_ip: "10.0.0.50".to_string(),
             sni_hostname: None,

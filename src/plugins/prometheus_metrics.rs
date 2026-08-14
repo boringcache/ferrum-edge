@@ -3883,6 +3883,34 @@ impl MetricsRegistry {
             render_process_counter(&mut output, name, value, &ns_label);
         }
 
+        let amp = crate::udp_amplification::metrics_snapshot();
+        for (name, help, value) in [
+            (
+                "ferrum_udp_amplification_responses_allowed_total",
+                "UDP backend responses admitted by the per-request amplification budget.",
+                amp.responses_allowed,
+            ),
+            (
+                "ferrum_udp_amplification_responses_dropped_total",
+                "UDP backend responses dropped for exceeding the per-request amplification budget.",
+                amp.responses_dropped,
+            ),
+            (
+                "ferrum_udp_amplification_policy_invalid_total",
+                "UDPResponseAmplificationPolicy objects rejected before listener programming.",
+                amp.policy_invalid,
+            ),
+            (
+                "ferrum_udp_amplification_unlimited_total",
+                "UDP/DTLS sessions admitted without a response-amplification limit.",
+                amp.policy_unlimited,
+            ),
+        ] {
+            output.push_str(&format!("# HELP {name} {help}\n"));
+            output.push_str(&format!("# TYPE {name} counter\n"));
+            render_process_counter(&mut output, name, value, &ns_label);
+        }
+
         // Stream connection counter
         if !self.stream_connection_counter.is_empty() {
             output.push_str(

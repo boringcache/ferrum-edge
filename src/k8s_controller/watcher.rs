@@ -21,6 +21,11 @@ use super::resource_store::{CrdResourceStore, ResourceChangeNotifier, ResourceSt
 use super::revision::{K8sConfigRevisionTracker, K8sWatchScopeKey, parse_resource_version};
 use super::{ControllerTaskRegistry, REPROBE_WATCHER_LABEL};
 
+use crate::udp_amplification::{
+    UDP_AMPLIFICATION_POLICY_GROUP, UDP_AMPLIFICATION_POLICY_KIND, UDP_AMPLIFICATION_POLICY_PLURAL,
+    UDP_AMPLIFICATION_POLICY_VERSION,
+};
+
 pub struct CrdSpec {
     pub group: &'static str,
     pub version: &'static str,
@@ -236,6 +241,16 @@ pub const GATEWAY_API_CRDS: &[CrdSpec] = &[
         version: "v1alpha3",
         kind: "BackendTLSPolicy",
         plural: "backendtlspolicies",
+        namespaced: true,
+    },
+    // Ferrum-owned UDP response-amplification Direct Policy Attachment.
+    // Discovery skips cleanly when the CRD is absent; translation still
+    // projects the finite controller default onto every UDPRoute.
+    CrdSpec {
+        group: UDP_AMPLIFICATION_POLICY_GROUP,
+        version: UDP_AMPLIFICATION_POLICY_VERSION,
+        kind: UDP_AMPLIFICATION_POLICY_KIND,
+        plural: UDP_AMPLIFICATION_POLICY_PLURAL,
         namespaced: true,
     },
     // BackendLBPolicy was removed from the Gateway API experimental channel in
@@ -1736,6 +1751,17 @@ mod tests {
             resource.kind == "BackendTLSPolicy"
                 && resource.version == "v1alpha3"
                 && resource.plural == "backendtlspolicies"
+                && resource.namespaced
+        }));
+    }
+
+    #[test]
+    fn gateway_api_watches_udp_response_amplification_policy() {
+        assert!(GATEWAY_API_CRDS.iter().any(|resource| {
+            resource.kind == "UDPResponseAmplificationPolicy"
+                && resource.group == "gateway.ferrum.io"
+                && resource.version == "v1alpha1"
+                && resource.plural == "udpresponseamplificationpolicies"
                 && resource.namespaced
         }));
     }

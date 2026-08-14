@@ -1810,7 +1810,7 @@ fn every_client_to_backend_path_is_gated() {
         .find("session.refuse_if_authorization_expired().is_some()")
         .expect("the forward gate");
     let publish_at = commit
-        .find("last_request_size")
+        .find("publish_session_request_budget(")
         .expect("the amplification budget publish");
     let race_at = commit
         .find("udp_frontend_send_until_expiry(")
@@ -2056,6 +2056,16 @@ fn client_facing_sends_are_raced_against_the_authorization_plan() {
     assert!(
         dtls_inner.contains("dtls_c2b_until_expiry("),
         "DTLS client→backend receive, hooks, and backend commits must race the plan"
+    );
+    let dtls_c2b_publish = dtls_inner
+        .find("publish_request_budget(")
+        .expect("DTLS client→backend must publish the cumulative amplification budget");
+    let dtls_c2b_send = dtls_inner[dtls_c2b_publish..]
+        .find("dtls_c2b_until_expiry(")
+        .expect("the DTLS backend send must race the plan after the budget publish");
+    assert!(
+        dtls_c2b_send > 0,
+        "the remaining-budget publish must precede the authorization-raced backend send"
     );
     assert!(
         dtls_inner.contains("bind_authorization_deadline(plan.at)"),
