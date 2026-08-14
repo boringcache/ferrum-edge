@@ -357,7 +357,9 @@ fn assert_family_status_is_captured_outside_conditional_context(script: &str) {
         "each family must disable outer errexit immediately before a simple subshell that re-enables it:\n{script}"
     );
     assert_eq!(
-        script.matches(")\nferrum_family_status=$?\nset -e\n").count(),
+        script
+            .matches(")\nferrum_family_status=$?\nset -e\n")
+            .count(),
         2,
         "each family status must be captured on the next line, then outer errexit restored:\n{script}"
     );

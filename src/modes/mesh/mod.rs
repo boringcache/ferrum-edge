@@ -1924,16 +1924,13 @@ fn materialize_node_waypoint_udp_listeners(
                 continue;
             }
 
-            let Some((proxy_id, upstream_id)) = node_waypoint_udp_proxy_id(
-                &service.namespace,
-                &service.name,
-                service_port.port,
-            )
-            .zip(node_waypoint_udp_upstream_id(
-                &service.namespace,
-                &service.name,
-                service_port.port,
-            ))
+            let Some((proxy_id, upstream_id)) =
+                node_waypoint_udp_proxy_id(&service.namespace, &service.name, service_port.port)
+                    .zip(node_waypoint_udp_upstream_id(
+                        &service.namespace,
+                        &service.name,
+                        service_port.port,
+                    ))
             else {
                 warn!(
                     service_len = service.name.len(),

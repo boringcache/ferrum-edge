@@ -1008,10 +1008,7 @@ fn a_udp_service_port_materializes_a_node_waypoint_datagram_listener() {
         "exactly one NodeWaypoint UDP listener must materialize"
     );
     let proxy = listeners[0];
-    assert_eq!(
-        proxy.id,
-        nw_udp_proxy_id(DEFAULT_NAMESPACE, "dns", 5353)
-    );
+    assert_eq!(proxy.id, nw_udp_proxy_id(DEFAULT_NAMESPACE, "dns", 5353));
     assert_eq!(proxy.listen_port, Some(5353));
     assert_eq!(
         proxy.dispatch_kind,
@@ -1343,7 +1340,10 @@ fn hyphenated_namespace_name_pairs_keep_distinct_same_port_resources() {
     let proxy_b = nw_udp_proxy_id("a", "b-c", 5353);
     let upstream_a = nw_udp_upstream_id("a-b", "c", 5353);
     let upstream_b = nw_udp_upstream_id("a", "b-c", 5353);
-    assert_ne!(proxy_a, proxy_b, "lossy hyphen join must not collide proxy ids");
+    assert_ne!(
+        proxy_a, proxy_b,
+        "lossy hyphen join must not collide proxy ids"
+    );
     assert_ne!(
         upstream_a, upstream_b,
         "lossy hyphen join must not collide upstream ids"

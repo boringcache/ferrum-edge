@@ -46,7 +46,9 @@ fn write_dtls_identity() -> DtlsIdentity {
     let dir = tempfile::TempDir::new().expect("dtls identity tempdir");
     let key_pair = KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).expect("ECDSA P-256 key");
     let params = CertificateParams::new(vec!["localhost".to_string()]).expect("dtls cert params");
-    let cert = params.self_signed(&key_pair).expect("self-signed DTLS cert");
+    let cert = params
+        .self_signed(&key_pair)
+        .expect("self-signed DTLS cert");
     let cert_path = dir.path().join("dtls.crt");
     let key_path = dir.path().join("dtls.key");
     std::fs::write(&cert_path, cert.pem()).expect("write DTLS cert");
@@ -160,7 +162,12 @@ fn listener_key(service: &str, port: u16) -> String {
 fn strict_dtls_without_client_ca_rejects_the_complete_candidate() {
     ensure_crypto_provider();
     let identity = write_dtls_identity();
-    let coap = workload_for("coap", DEFAULT_NAMESPACE, [("app", "coap")], ["10.244.3.12"]);
+    let coap = workload_for(
+        "coap",
+        DEFAULT_NAMESPACE,
+        [("app", "coap")],
+        ["10.244.3.12"],
+    );
     let secure = workload_for(
         "secure",
         DEFAULT_NAMESPACE,
@@ -212,7 +219,12 @@ fn strict_dtls_without_client_ca_rejects_the_complete_candidate() {
 async fn permissive_to_strict_without_client_ca_retains_last_good_generation() {
     ensure_crypto_provider();
     let identity = write_dtls_identity();
-    let backend = workload_for("coap", DEFAULT_NAMESPACE, [("app", "coap")], ["10.244.3.12"]);
+    let backend = workload_for(
+        "coap",
+        DEFAULT_NAMESPACE,
+        [("app", "coap")],
+        ["10.244.3.12"],
+    );
     let services = vec![dtls_service("coap", PERMISSIVE_PORT, &backend)];
     let workloads = vec![backend];
     let config = GatewayConfig {
@@ -304,7 +316,12 @@ async fn permissive_to_strict_without_client_ca_retains_last_good_generation() {
 fn strict_dtls_with_client_ca_builds_a_verifier() {
     ensure_crypto_provider();
     let identity = write_dtls_identity();
-    let backend = workload_for("coap", DEFAULT_NAMESPACE, [("app", "coap")], ["10.244.3.12"]);
+    let backend = workload_for(
+        "coap",
+        DEFAULT_NAMESPACE,
+        [("app", "coap")],
+        ["10.244.3.12"],
+    );
     let slice = dtls_slice(
         vec![dtls_service("coap", STRICT_PORT, &backend)],
         vec![backend],
