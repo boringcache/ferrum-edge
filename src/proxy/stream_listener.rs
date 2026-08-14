@@ -99,6 +99,11 @@ struct ListenerHandle {
     /// Whether this listener was spawned with the datagram client-address
     /// metadata gate engaged (issue #3289). Part of the restart key.
     datagram_client_address: bool,
+    /// Exact amplification posture captured by every UDP candidate served by
+    /// this listener. A factor change must retire the listener's session map:
+    /// each `UdpSession` copies its factor at admission, so keeping the listener
+    /// would let an established unlimited session outlive a tightened policy.
+    udp_amplification_restart_key: Vec<(NamespacedResourceId, Option<u32>)>,
     backend_tls_reload_key: Option<BackendTlsReloadKey>,
     /// Backend routing snapshot taken when this TCP+TLS listener was spawned
     /// (`None` for non-TcpTls listeners). Compared against the live config in
@@ -754,6 +759,9 @@ struct DesiredStreamProxy {
     /// Whether the proxy carries compiled L4 stream_match predicates. Shared
     /// non-passthrough ports with stream_match form an L4 match group.
     has_stream_match: bool,
+    /// Validated amplification factor encoded losslessly for cold-path listener
+    /// drift detection. `None` is the explicit unlimited posture.
+    udp_amplification_factor_bits: Option<u32>,
     backend_tls_reload_key: Option<BackendTlsReloadKey>,
 }
 
@@ -817,6 +825,10 @@ struct DesiredStreamListener {
     /// correct domain binding (issue #3856) instead of inheriting another
     /// listener's, and starts from a fresh replay window (issue #3862).
     datagram_client_address: bool,
+    /// Ordered candidate identity + amplification posture. Empty for TCP.
+    /// Included in restart identity so policy update/delete retires every
+    /// session admitted under the old response budget.
+    udp_amplification_restart_key: Vec<(NamespacedResourceId, Option<u32>)>,
     backend_tls_reload_key: Option<BackendTlsReloadKey>,
     sni_ids: Option<Vec<NamespacedResourceId>>,
 }
@@ -1699,6 +1711,9 @@ impl StreamListenerManager {
                                     .stream_match
                                     .as_ref()
                                     .is_some_and(|m| !m.is_empty()),
+                                udp_amplification_factor_bits: p
+                                    .udp_max_response_amplification_factor
+                                    .map(f32::to_bits),
                                 backend_tls_reload_key,
                             },
                         )
@@ -1866,6 +1881,11 @@ impl StreamListenerManager {
             if grouped_proxy_ids.contains(identity) {
                 continue; // Handled as part of a group below
             }
+            let udp_amplification_restart_key = if entry.scheme.is_udp() {
+                vec![(identity.clone(), entry.udp_amplification_factor_bits)]
+            } else {
+                Vec::new()
+            };
             effective_desired.insert(
                 identity.runtime_key(),
                 DesiredStreamListener {
@@ -1876,6 +1896,7 @@ impl StreamListenerManager {
                     frontend_tls: entry.frontend_tls,
                     passthrough: entry.passthrough,
                     datagram_client_address: entry.runs_datagram_client_address_gate(),
+                    udp_amplification_restart_key,
                     backend_tls_reload_key: entry.backend_tls_reload_key.clone(),
                     sni_ids: None,
                 },
@@ -1890,6 +1911,17 @@ impl StreamListenerManager {
                 continue;
             };
             if let Some(entry) = desired.get(representative) {
+                let udp_amplification_restart_key = ids
+                    .iter()
+                    .filter_map(|identity| {
+                        desired.get(identity).and_then(|candidate| {
+                            candidate.scheme.is_udp().then_some((
+                                identity.clone(),
+                                candidate.udp_amplification_factor_bits,
+                            ))
+                        })
+                    })
+                    .collect();
                 effective_desired.insert(
                     key,
                     DesiredStreamListener {
@@ -1900,6 +1932,7 @@ impl StreamListenerManager {
                         frontend_tls: entry.frontend_tls,
                         passthrough: entry.passthrough,
                         datagram_client_address: entry.runs_datagram_client_address_gate(),
+                        udp_amplification_restart_key,
                         backend_tls_reload_key: entry.backend_tls_reload_key.clone(),
                         sni_ids: Some(ids.clone()),
                     },
@@ -1922,6 +1955,7 @@ impl StreamListenerManager {
                         frontend_tls: entry.frontend_tls,
                         passthrough: false,
                         datagram_client_address: entry.runs_datagram_client_address_gate(),
+                        udp_amplification_restart_key: Vec::new(),
                         backend_tls_reload_key: entry.backend_tls_reload_key.clone(),
                         // Reuse the candidate-id channel. `tcp_proxy`
                         // distinguishes an L4 match group from an SNI group by
@@ -1990,6 +2024,7 @@ impl StreamListenerManager {
                 frontend_tls,
                 passthrough,
                 datagram_client_address,
+                udp_amplification_restart_key,
                 backend_tls_reload_key,
                 sni_ids,
             }) = effective_desired.get(key)
@@ -2010,6 +2045,12 @@ impl StreamListenerManager {
                 // The datagram client-address gate is captured at spawn, so
                 // enabling or disabling it must restart the listener.
                 || handle.datagram_client_address != *datagram_client_address
+                // UDP sessions copy their amplification factor at admission.
+                // Retire the whole listener/session map when any served
+                // candidate's factor changes so policy tightening or deletion
+                // applies to the next datagram even from an existing source.
+                || handle.udp_amplification_restart_key
+                    != *udp_amplification_restart_key
                 // SNI-group membership change on a shared passthrough
                 // port: the running listener captured the old candidate
                 // ID list at spawn, so it must be restarted. IDs are
@@ -2121,6 +2162,7 @@ impl StreamListenerManager {
                 frontend_tls,
                 passthrough,
                 datagram_client_address,
+                udp_amplification_restart_key,
                 backend_tls_reload_key,
                 sni_ids,
             } = desired_listener;
@@ -2620,6 +2662,7 @@ impl StreamListenerManager {
                     frontend_tls: *frontend_tls,
                     passthrough: *passthrough,
                     datagram_client_address: *datagram_client_address,
+                    udp_amplification_restart_key: udp_amplification_restart_key.clone(),
                     backend_tls_reload_key: backend_tls_reload_key.clone(),
                     backend_routing_key,
                     sni_ids: sni_ids.clone(),

@@ -433,7 +433,7 @@ resource_counts:
 | `FERRUM_DP_GRPC_TLS_CLIENT_CERT_SOURCE` | No | — | Source override for `FERRUM_DP_GRPC_TLS_CLIENT_CERT_PATH`; accepts path, `file://`, inline PEM, or provider URI |
 | `FERRUM_DP_GRPC_TLS_CLIENT_KEY_PATH` | No | — | DP client private key for CP mTLS |
 | `FERRUM_DP_GRPC_TLS_CLIENT_KEY_SOURCE` | No | — | Source override for `FERRUM_DP_GRPC_TLS_CLIENT_KEY_PATH`; accepts path, `file://`, inline PEM, or provider URI |
-| `FERRUM_DP_GRPC_TLS_NO_VERIFY` | No | `false` | **Not supported — rejected at startup when `true`.** The tonic-managed CP/DP gRPC client exposes no hook to skip server certificate verification, so the flag only ever offered false confidence. To connect to a CP presenting a self-signed certificate, pin its CA via `FERRUM_DP_GRPC_TLS_CA_CERT_PATH` (one-way TLS) or supply `FERRUM_DP_GRPC_TLS_CLIENT_CERT_PATH`/`KEY_PATH` (mTLS) |
+| `FERRUM_DP_GRPC_TLS_NO_VERIFY` | No | `false` | **Not supported — rejected at startup when `true`.** Disabling server certificate verification is unsafe. To connect to a CP presenting a self-signed certificate, pin its CA via `FERRUM_DP_GRPC_TLS_CA_CERT_PATH` (one-way TLS) or supply `FERRUM_DP_GRPC_TLS_CLIENT_CERT_PATH`/`KEY_PATH` (mTLS) |
 
 See [cp_dp_mode.md](cp_dp_mode.md) for CP/DP TLS environment variables (`FERRUM_CP_GRPC_TLS_*`, `FERRUM_DP_GRPC_TLS_*`) and [multi_region_ha.md](multi_region_ha.md) for multi-region deployment patterns.
 
