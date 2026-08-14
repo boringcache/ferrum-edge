@@ -20,7 +20,7 @@
 use std::sync::{Arc, Barrier};
 use std::time::Duration;
 
-use ferrum_edge::_test_support::classify_replay_set_nx_reply;
+use ferrum_edge::_test_support::{ReplaySetNxReplyError, classify_replay_set_nx_reply};
 use ferrum_edge::plugins::utils::redis_rate_limiter::{RedisConfig, RedisRateLimitClient};
 use ferrum_edge::plugins::utils::replay_authority::{
     MAX_PROCESS_REPLAY_LANES, ReplayAdmission, ReplayAuthority, ReplayDomain, ReplayScope,
@@ -53,7 +53,7 @@ fn shared_claim_accepts_only_the_exact_redis_set_success_reply() {
     for malformed in ["", "ok", "QUEUED", "PONG", "1"] {
         assert_eq!(
             classify_replay_set_nx_reply(Some(malformed)),
-            Err(()),
+            Err(ReplaySetNxReplyError::InvalidClaimReply),
             "unexpected reply {malformed:?} must fail closed"
         );
     }

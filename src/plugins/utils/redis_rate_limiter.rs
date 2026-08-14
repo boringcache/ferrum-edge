@@ -1707,11 +1707,19 @@ impl SharedReplayRegistrationSample {
 /// non-conforming backend admit a request without proving that the marker was
 /// persisted.
 #[doc(hidden)]
-pub fn classify_replay_set_nx_reply(reply: Option<&str>) -> Result<bool, ()> {
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ReplaySetNxReplyError {
+    InvalidClaimReply,
+}
+
+#[doc(hidden)]
+pub fn classify_replay_set_nx_reply(
+    reply: Option<&str>,
+) -> Result<bool, ReplaySetNxReplyError> {
     match reply {
         Some("OK") => Ok(true),
         None => Ok(false),
-        Some(_) => Err(()),
+        Some(_) => Err(ReplaySetNxReplyError::InvalidClaimReply),
     }
 }
 
@@ -3538,7 +3546,7 @@ impl RedisRateLimitClient {
                     self.note_command_success()?;
                     Ok(admitted)
                 }
-                Err(()) => {
+                Err(ReplaySetNxReplyError::InvalidClaimReply) => {
                     // Do not render the server-controlled reply. Only exact
                     // `OK` proves that Redis stored the marker; every other
                     // string is protocol uncertainty and must fail closed.
