@@ -418,6 +418,19 @@ fn shared_mesh_plain_helper_never_plaintext_falls_back() {
             && !sidecar_box.contains("Box::pin(proxy_to_backend_mesh_mtls("),
         "Sidecar boxing must trampoline so the concrete future is not built in the factory"
     );
+    let hbone_box = src
+        .split("fn boxed_proxy_to_backend_hbone<'a>(")
+        .nth(1)
+        .expect("boxed hbone factory")
+        .split("fn boxed_hbone_pool_get_tunnel_via<'a>(")
+        .next()
+        .expect("bounded boxed hbone factory");
+    assert!(
+        hbone_box.contains("async move {")
+            && hbone_box.contains("proxy_to_backend_hbone(")
+            && !hbone_box.contains("Box::pin(proxy_to_backend_hbone("),
+        "HBONE boxing must trampoline so the concrete future is not built in the factory"
+    );
     assert!(
         src.contains("#[inline(never)]\nfn boxed_mesh_mtls_pool_get_sender<'a>(")
             && src.contains("boxed_mesh_mtls_pool_get_sender(")
@@ -427,6 +440,13 @@ fn shared_mesh_plain_helper_never_plaintext_falls_back() {
                 .contains("#[inline(never)]\nfn boxed_proxy_to_backend_mesh_mtls_after_ready<'a>(")
             && src.contains("boxed_proxy_to_backend_mesh_mtls_after_ready("),
         "Sidecar acquire must box handshake checkout and post-ready send/collect"
+    );
+    assert!(
+        src.contains("#[inline(never)]\nfn boxed_hbone_pool_get_tunnel_via<'a>(")
+            && src.contains("boxed_hbone_pool_get_tunnel_via(")
+            && src.contains("#[inline(never)]\nfn boxed_proxy_to_backend_hbone_after_ready<'a>(")
+            && src.contains("boxed_proxy_to_backend_hbone_after_ready("),
+        "HBONE acquire must box CONNECT checkout and post-tunnel send/collect"
     );
     let acquire = src
         .split("async fn proxy_to_backend_mesh_mtls(")
@@ -439,6 +459,20 @@ fn shared_mesh_plain_helper_never_plaintext_falls_back() {
         acquire.contains("boxed_mesh_mtls_pool_get_sender(")
             && !acquire.contains("state.mesh_mtls_pool.get_sender("),
         "Sidecar acquire must not await get_sender inline"
+    );
+    let hbone_acquire = src
+        .split("async fn proxy_to_backend_hbone(")
+        .nth(1)
+        .expect("hbone acquire")
+        .split("fn boxed_proxy_to_backend_hbone_after_ready<'a>(")
+        .next()
+        .expect("bounded hbone acquire");
+    assert!(
+        hbone_acquire.contains("boxed_hbone_pool_get_tunnel_via(")
+            && !hbone_acquire.contains("state.hbone_pool.get_tunnel_via(")
+            && hbone_acquire.contains("boxed_proxy_to_backend_hbone_after_ready(")
+            && !hbone_acquire.contains("TokioIo::new(tunnel)"),
+        "HBONE acquire must not await get_tunnel_via or inner HTTP/1.1 send inline"
     );
     let pool = include_str!("../../src/proxy/mesh_mtls_pool.rs");
     let get_or_create = pool

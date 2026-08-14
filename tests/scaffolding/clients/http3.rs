@@ -656,6 +656,103 @@ impl Http3Client {
             headers,
         })
     }
+
+    /// Open an RFC 9298 CONNECT-UDP tunnel. `url` must already be the URI
+    /// Template expansion (`…/udp/{target_host}/{target_port}/`); the caller
+    /// owns that so malformed-template cases stay expressible.
+    ///
+    /// Returns the handle for any status, so a refusal body can be drained.
+    pub async fn connect_udp(
+        &self,
+        url: &str,
+    ) -> Result<Http3ConnectUdp, Box<dyn std::error::Error + Send + Sync>> {
+        self.connect_udp_with_protocol(url, h3::ext::Protocol::CONNECT_UDP)
+            .await
+    }
+
+    /// [`Self::connect_udp`] with extra request header fields.
+    ///
+    /// Used to prove the gateway refuses the RFC 9297 §3.2 fields
+    /// (`Content-Length`, `Content-Type`, `Transfer-Encoding`) that a Capsule
+    /// Protocol message may not carry.
+    pub async fn connect_udp_with_headers(
+        &self,
+        url: &str,
+        headers: &[(&str, &str)],
+    ) -> Result<Http3ConnectUdp, Box<dyn std::error::Error + Send + Sync>> {
+        self.connect_udp_inner(url, h3::ext::Protocol::CONNECT_UDP, headers)
+            .await
+    }
+
+    /// [`Self::connect_udp`] with a caller-selected `:protocol`, for
+    /// unsupported-profile assertions.
+    pub async fn connect_udp_with_protocol(
+        &self,
+        url: &str,
+        protocol: h3::ext::Protocol,
+    ) -> Result<Http3ConnectUdp, Box<dyn std::error::Error + Send + Sync>> {
+        self.connect_udp_inner(url, protocol, &[]).await
+    }
+
+    async fn connect_udp_inner(
+        &self,
+        url: &str,
+        protocol: h3::ext::Protocol,
+        extra_headers: &[(&str, &str)],
+    ) -> Result<Http3ConnectUdp, Box<dyn std::error::Error + Send + Sync>> {
+        let parsed: http::Uri = url.parse()?;
+        let host = parsed.host().ok_or("missing host in url")?.to_string();
+        let port = parsed.port_u16().unwrap_or(443);
+        let addr = resolve_loopback(&host, port)?;
+
+        let conn =
+            tokio::time::timeout(Duration::from_secs(15), self.endpoint.connect(addr, &host)?)
+                .await
+                .map_err(|_| "QUIC handshake timed out")??;
+        let h3_conn = h3_quinn::Connection::new(conn);
+        let (mut driver, mut send_request) = h3::client::new(h3_conn)
+            .await
+            .map_err(|e| format!("h3 new: {e}"))?;
+        let driver_task = tokio::spawn(async move {
+            let _ = std::future::poll_fn(|cx| driver.poll_close(cx)).await;
+        });
+
+        let mut builder = Request::builder()
+            .method(http::Method::CONNECT)
+            .version(http::Version::HTTP_3)
+            .uri(url)
+            .header("capsule-protocol", "?1")
+            .header("user-agent", "ferrum-test-h3-connect-udp/1.0");
+        for (name, value) in extra_headers {
+            builder = builder.header(*name, *value);
+        }
+        let mut req = builder
+            .body(())
+            .map_err(|e| format!("build request: {e}"))?;
+        req.extensions_mut().insert(protocol);
+
+        let mut stream =
+            tokio::time::timeout(Duration::from_secs(15), send_request.send_request(req))
+                .await
+                .map_err(|_| "send_request timed out")?
+                .map_err(|e| format!("send_request: {e}"))?;
+
+        let resp = tokio::time::timeout(Duration::from_secs(15), stream.recv_response())
+            .await
+            .map_err(|_| "recv_response timed out")?
+            .map_err(|e| format!("recv_response: {e}"))?;
+        let status = resp.status();
+        let headers = resp.headers().clone();
+
+        Ok(Http3ConnectUdp {
+            stream,
+            _send_request: send_request,
+            driver_task,
+            read_buf: Vec::new(),
+            status,
+            headers,
+        })
+    }
 }
 
 /// Resolve a host into a `SocketAddr`, pinning it to loopback for test use.
@@ -1124,6 +1221,267 @@ impl WebSocketOptions {
 }
 
 /// Minimal RFC 9220 WebSocket stream over HTTP/3 DATA frames.
+/// A live RFC 9298 CONNECT-UDP tunnel over HTTP/3, carrying UDP payloads as
+/// RFC 9297 DATAGRAM capsules on the CONNECT stream. Returned by
+/// [`Http3Client::connect_udp`].
+///
+/// The capsule encoder/decoder here is written independently of the gateway's
+/// so the functional suite proves wire interoperability rather than agreement
+/// between two copies of one implementation.
+pub struct Http3ConnectUdp {
+    stream: h3::client::RequestStream<h3_quinn::BidiStream<Bytes>, Bytes>,
+    _send_request: h3::client::SendRequest<h3_quinn::OpenStreams, Bytes>,
+    driver_task: JoinHandle<()>,
+    read_buf: Vec<u8>,
+    pub status: StatusCode,
+    pub headers: HeaderMap,
+}
+
+/// How a CONNECT-UDP capsule stream ended, as the client observed it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ConnectUdpStreamEnd {
+    /// Orderly end of the capsule stream (HTTP/3 FIN).
+    CleanFin,
+    /// The gateway reset the stream; the payload is the client-side error text
+    /// so an assertion can report which code arrived.
+    Reset(String),
+}
+
+/// Encode a QUIC varint (RFC 9000 §16).
+fn put_varint(out: &mut Vec<u8>, value: u64) {
+    if value < 1 << 6 {
+        out.push(value as u8);
+    } else if value < 1 << 14 {
+        out.extend_from_slice(&(0x4000u16 | value as u16).to_be_bytes());
+    } else if value < 1 << 30 {
+        out.extend_from_slice(&(0x8000_0000u32 | value as u32).to_be_bytes());
+    } else {
+        out.extend_from_slice(&(0xc000_0000_0000_0000u64 | value).to_be_bytes());
+    }
+}
+
+/// Decode a QUIC varint; `None` when the buffer holds only a prefix.
+fn take_varint(buf: &[u8], pos: &mut usize) -> Option<u64> {
+    let first = *buf.get(*pos)?;
+    let len = 1usize << (first >> 6);
+    if buf.len() - *pos < len {
+        return None;
+    }
+    let mut value = u64::from(first & 0x3f);
+    for offset in 1..len {
+        value = (value << 8) | u64::from(buf[*pos + offset]);
+    }
+    *pos += len;
+    Some(value)
+}
+
+impl Http3ConnectUdp {
+    /// Send a UDP payload as a Context ID 0 DATAGRAM capsule (RFC 9298 §5).
+    pub async fn send_datagram(
+        &mut self,
+        payload: &[u8],
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let mut value = Vec::with_capacity(payload.len() + 1);
+        put_varint(&mut value, 0); // Context ID 0
+        value.extend_from_slice(payload);
+        self.send_capsule(0x00, &value).await
+    }
+
+    /// Send a UDP payload under a caller-chosen Context ID. Used to prove the
+    /// gateway drops unregistered contexts instead of proxying them.
+    pub async fn send_datagram_with_context(
+        &mut self,
+        context_id: u64,
+        payload: &[u8],
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let mut value = Vec::with_capacity(payload.len() + 8);
+        put_varint(&mut value, context_id);
+        value.extend_from_slice(payload);
+        self.send_capsule(0x00, &value).await
+    }
+
+    /// Send an arbitrary capsule so tests can exercise unknown types and
+    /// oversized declarations.
+    pub async fn send_capsule(
+        &mut self,
+        capsule_type: u64,
+        value: &[u8],
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let mut wire = Vec::with_capacity(value.len() + 16);
+        put_varint(&mut wire, capsule_type);
+        put_varint(&mut wire, value.len() as u64);
+        wire.extend_from_slice(value);
+        self.send_raw(&wire).await
+    }
+
+    /// Write raw bytes onto the CONNECT stream without capsule framing.
+    pub async fn send_raw(
+        &mut self,
+        bytes: &[u8],
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        tokio::time::timeout(
+            Duration::from_secs(15),
+            self.stream.send_data(Bytes::copy_from_slice(bytes)),
+        )
+        .await
+        .map_err(|_| "connect-udp send_data timed out")?
+        .map_err(|e| format!("connect-udp send_data: {e}"))?;
+        Ok(())
+    }
+
+    /// Read the next Context ID 0 UDP payload, skipping any other capsule.
+    pub async fn recv_datagram(
+        &mut self,
+        timeout: Duration,
+    ) -> Result<Vec<u8>, Box<dyn std::error::Error + Send + Sync>> {
+        let deadline = tokio::time::Instant::now() + timeout;
+        loop {
+            if let Some(payload) = self.take_buffered_datagram()? {
+                return Ok(payload);
+            }
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if remaining.is_zero() {
+                return Err("timed out waiting for a CONNECT-UDP datagram".into());
+            }
+            match tokio::time::timeout(remaining, self.stream.recv_data()).await {
+                Ok(Ok(Some(mut chunk))) => {
+                    while chunk.has_remaining() {
+                        let piece = chunk.chunk().to_vec();
+                        self.read_buf.extend_from_slice(&piece);
+                        chunk.advance(piece.len());
+                    }
+                }
+                Ok(Ok(None)) => return Err("CONNECT-UDP stream ended".into()),
+                Ok(Err(error)) => return Err(format!("CONNECT-UDP recv_data: {error}").into()),
+                Err(_) => return Err("timed out waiting for a CONNECT-UDP datagram".into()),
+            }
+        }
+    }
+
+    /// Half-close the client's send direction without tearing down the QUIC
+    /// connection, so a gateway-side reaction to the FIN stays observable.
+    pub async fn half_close(&mut self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        tokio::time::timeout(Duration::from_secs(15), self.stream.finish())
+            .await
+            .map_err(|_| "connect-udp finish timed out")?
+            .map_err(|e| format!("connect-udp finish: {e}"))?;
+        Ok(())
+    }
+
+    /// How the gateway ended the capsule stream.
+    ///
+    /// The distinction is the whole point of the RFC 9297 §3.3/§3.5 assertions:
+    /// a malformed capsule stream must NOT be indistinguishable from a
+    /// successful end of response, so tests assert one arm or the other and
+    /// never "either is fine".
+    pub async fn await_stream_end(
+        &mut self,
+        timeout: Duration,
+    ) -> Result<ConnectUdpStreamEnd, Box<dyn std::error::Error + Send + Sync>> {
+        let deadline = tokio::time::Instant::now() + timeout;
+        loop {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if remaining.is_zero() {
+                return Err("CONNECT-UDP stream stayed open".into());
+            }
+            match tokio::time::timeout(remaining, self.stream.recv_data()).await {
+                Ok(Ok(None)) => return Ok(ConnectUdpStreamEnd::CleanFin),
+                Ok(Err(error)) => return Ok(ConnectUdpStreamEnd::Reset(error.to_string())),
+                Ok(Ok(Some(_))) => continue,
+                Err(_) => return Err("CONNECT-UDP stream stayed open".into()),
+            }
+        }
+    }
+
+    /// The gateway must FIN the capsule stream (ordinary end of tunnel).
+    pub async fn expect_clean_stream_end(
+        &mut self,
+        timeout: Duration,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        match self.await_stream_end(timeout).await? {
+            ConnectUdpStreamEnd::CleanFin => Ok(()),
+            ConnectUdpStreamEnd::Reset(error) => {
+                Err(format!("expected a clean FIN, got a stream reset: {error}").into())
+            }
+        }
+    }
+
+    /// The gateway must RESET the capsule stream — a clean FIN here would make
+    /// a malformed capsule stream look like a successful end of response.
+    pub async fn expect_stream_reset(
+        &mut self,
+        timeout: Duration,
+    ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+        match self.await_stream_end(timeout).await? {
+            ConnectUdpStreamEnd::Reset(error) => Ok(error),
+            ConnectUdpStreamEnd::CleanFin => {
+                Err("expected a stream reset (RFC 9297 malformed message), got a clean FIN".into())
+            }
+        }
+    }
+
+    /// Drain a non-2xx CONNECT-UDP response body.
+    pub async fn recv_body_text(
+        &mut self,
+        timeout: Duration,
+    ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+        let deadline = tokio::time::Instant::now() + timeout;
+        loop {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if remaining.is_zero() {
+                break;
+            }
+            match tokio::time::timeout(remaining, self.stream.recv_data()).await {
+                Ok(Ok(Some(mut chunk))) => {
+                    while chunk.has_remaining() {
+                        let piece = chunk.chunk().to_vec();
+                        self.read_buf.extend_from_slice(&piece);
+                        chunk.advance(piece.len());
+                    }
+                }
+                _ => break,
+            }
+        }
+        Ok(String::from_utf8_lossy(&self.read_buf).to_string())
+    }
+
+    fn take_buffered_datagram(
+        &mut self,
+    ) -> Result<Option<Vec<u8>>, Box<dyn std::error::Error + Send + Sync>> {
+        loop {
+            let mut cursor = 0usize;
+            let Some(capsule_type) = take_varint(&self.read_buf, &mut cursor) else {
+                return Ok(None);
+            };
+            let Some(length) = take_varint(&self.read_buf, &mut cursor) else {
+                return Ok(None);
+            };
+            let length = length as usize;
+            if self.read_buf.len() - cursor < length {
+                return Ok(None);
+            }
+            let value: Vec<u8> = self.read_buf[cursor..cursor + length].to_vec();
+            self.read_buf.drain(..cursor + length);
+            if capsule_type != 0x00 {
+                continue;
+            }
+            let mut value_cursor = 0usize;
+            let Some(context_id) = take_varint(&value, &mut value_cursor) else {
+                return Err("gateway sent a DATAGRAM capsule with no Context ID".into());
+            };
+            if context_id != 0 {
+                continue;
+            }
+            return Ok(Some(value[value_cursor..].to_vec()));
+        }
+    }
+
+    pub async fn close(mut self) {
+        let _ = self.stream.finish().await;
+        self.driver_task.abort();
+    }
+}
+
 pub struct Http3WebSocket {
     stream: h3::client::RequestStream<h3_quinn::BidiStream<Bytes>, Bytes>,
     _send_request: h3::client::SendRequest<h3_quinn::OpenStreams, Bytes>,

@@ -650,9 +650,23 @@ fn build_h3_quinn_server_config(
 
     let mut transport_config = quinn::TransportConfig::default();
     transport_config.initial_mtu(h3_config.initial_mtu);
+    // The FRONTEND idle timeout, which the RFC 9298 CONNECT-UDP profile raises
+    // to at least its own tunnel idle bound when enabled: a tunnel carrying no
+    // datagram generates no QUIC activity either, so a smaller connection idle
+    // limit would close it before its configured idle window elapsed. The
+    // derivation only ever raises; it is logged so it is never a silent
+    // override of an operator's `FERRUM_HTTP3_IDLE_TIMEOUT`.
+    if h3_config.connect_udp_raised_frontend_idle_timeout() {
+        info!(
+            configured_idle_timeout_seconds = h3_config.idle_timeout.as_secs(),
+            effective_idle_timeout_seconds = h3_config.frontend_idle_timeout.as_secs(),
+            "HTTP/3 frontend QUIC idle timeout raised to the configured RFC 9298 CONNECT-UDP \
+             tunnel idle timeout; a shorter connection idle limit would close idle tunnels first"
+        );
+    }
     transport_config.max_idle_timeout(Some(
         h3_config
-            .idle_timeout
+            .frontend_idle_timeout
             .try_into()
             .map_err(|e| anyhow::anyhow!("Invalid idle timeout: {}", e))?,
     ));
@@ -1566,14 +1580,25 @@ async fn handle_h3_connection(
         crate::plugins::PeerConnectionSignal::new(std::sync::Arc::new(QuicPeerConnectionWatch {
             connection: connection.clone(),
         }));
-    // RFC 9220: advertise SETTINGS_ENABLE_CONNECT_PROTOCOL so H3 clients can
-    // bootstrap a WebSocket via Extended CONNECT (:method=CONNECT,
-    // :protocol=websocket). Mirrors the H2 listener's `enable_connect_protocol()`
-    // call. Gated by `FERRUM_HTTP3_WEBSOCKET_ENABLED` so operators can disable
-    // the path without disabling HTTP/3 entirely; the dispatch site still
-    // returns 501 if a client manages to send the Extended CONNECT anyway.
+    // RFC 9220 / RFC 9298: advertise SETTINGS_ENABLE_CONNECT_PROTOCOL so H3
+    // clients can bootstrap an Extended CONNECT profile (:method=CONNECT plus
+    // :protocol=websocket or :protocol=connect-udp). Mirrors the H2 listener's
+    // `enable_connect_protocol()` call. Advertised when EITHER profile is
+    // enabled, so disabling one does not silently disable the other; each
+    // dispatch site still refuses its own disabled profile as defense in
+    // depth. SETTINGS_H3_DATAGRAM is deliberately left unnegotiated: the
+    // CONNECT-UDP profile carries HTTP Datagrams as RFC 9297 DATAGRAM capsules
+    // on the CONNECT stream (see `crate::http3::connect_udp`).
+    //
+    // CONNECT-UDP counts as enabled only through
+    // `connect_udp_profile_available`, which also requires this build target to
+    // be able to enforce the RFC 9298 §3.1 non-fragmentation guarantee. A build
+    // that cannot must not advertise the capability it would then have to
+    // refuse.
+    let extended_connect_enabled = state.env_config.http3_websocket_enabled
+        || crate::http3::connect_udp::connect_udp_profile_available(&state.env_config);
     let mut h3_conn = h3::server::builder()
-        .enable_extended_connect(state.env_config.http3_websocket_enabled)
+        .enable_extended_connect(extended_connect_enabled)
         .build(h3_quinn::Connection::new(connection))
         .await?;
 
@@ -1814,6 +1839,16 @@ async fn handle_h3_request(
     // flavor around lets every dispatch and rejection stay flavor-aware
     // (trailers-only gRPC status vs JSON).
     let detected_http_flavor = crate::proxy::backend_dispatch::detect_http_flavor(&req);
+    // Classify the Extended CONNECT `:protocol` once, alongside the flavor, so
+    // both the CONNECT admission gate and the dispatch site below read the
+    // same decision. An unregistered `:protocol` token never reaches here: h3
+    // fails to parse it and resets the stream with H3_MESSAGE_ERROR.
+    let extended_connect = crate::http3::connect_udp::classify_h3_extended_connect(&req);
+    // `classify_h3_extended_connect` already requires CONNECT, so this is the
+    // one Extended CONNECT-UDP flag every later gate (flavor, 0-RTT, 501/400,
+    // dispatch) reads. Computed here so Content-Type cannot win first.
+    let is_connect_udp_request =
+        extended_connect == crate::http3::connect_udp::H3ExtendedConnect::ConnectUdp;
     // Enforce configured HTTP/3 header limits before deriving any gRPC-Web
     // response encoding from request headers. gRPC-Web media negotiation may
     // preserve custom +suffix values in owned response Content-Type strings,
@@ -1878,29 +1913,32 @@ async fn handle_h3_request(
 
     // Extended CONNECT classification takes precedence over Content-Type.
     // Besides selecting the WebSocket plugin chain below, suppress gRPC-Web
-    // rejection shaping so a spoofed header cannot turn a WS policy reject
-    // into a gRPC-Web response.
-    let grpc_web_response_content_type_owned = if detected_http_flavor == HttpFlavor::WebSocket {
-        None
-    } else {
-        req.headers()
-            .get(hyper::header::CONTENT_TYPE)
-            .and_then(|value| value.to_str().ok())
-            .and_then(|content_type| {
-                if !crate::plugins::grpc_web::is_grpc_web_content_type(content_type) {
-                    return None;
-                }
-                let negotiated =
-                    crate::plugins::grpc_web::negotiate_response_media_type_from_headers(
-                        content_type,
-                        req.headers(),
-                        state.max_header_size_bytes,
-                    );
-                Some(negotiated.unwrap_or_else(|_| {
-                    crate::plugins::grpc_web::response_content_type(content_type)
-                }))
-            })
-    };
+    // rejection shaping so a spoofed header cannot turn a WS or CONNECT-UDP
+    // policy reject into a gRPC-Web response. CONNECT-UDP still refuses the
+    // spoofed Content-Type as an RFC 9297 §3.2 malformed message; this only
+    // stops that 400 from being rewritten as a gRPC-Web HTTP-200 body.
+    let grpc_web_response_content_type_owned =
+        if detected_http_flavor == HttpFlavor::WebSocket || is_connect_udp_request {
+            None
+        } else {
+            req.headers()
+                .get(hyper::header::CONTENT_TYPE)
+                .and_then(|value| value.to_str().ok())
+                .and_then(|content_type| {
+                    if !crate::plugins::grpc_web::is_grpc_web_content_type(content_type) {
+                        return None;
+                    }
+                    let negotiated =
+                        crate::plugins::grpc_web::negotiate_response_media_type_from_headers(
+                            content_type,
+                            req.headers(),
+                            state.max_header_size_bytes,
+                        );
+                    Some(negotiated.unwrap_or_else(|_| {
+                        crate::plugins::grpc_web::response_content_type(content_type)
+                    }))
+                })
+        };
     let grpc_web_response_content_type = grpc_web_response_content_type_owned.as_deref();
     // gRPC-Web remains Plain in the shared wire classifier so the grpc_web
     // plugin retains ownership of body translation. Once its content type is
@@ -1911,7 +1949,13 @@ async fn handle_h3_request(
     // marker is known. The separate response content type above preserves
     // binary/text + format-suffix encoding for client-facing rejection and
     // response shaping after Accept negotiation.
-    let http_flavor = if grpc_web_response_content_type.is_some() {
+    // CONNECT-UDP is a Capsule Protocol tunnel, never gRPC: a spoofed
+    // `Content-Type: application/grpc` must not select trailers-only
+    // rejection or the gRPC plugin chain. RFC 9297 still forbids that
+    // field; the 400 below is a plain malformed-message response.
+    let http_flavor = if is_connect_udp_request {
+        HttpFlavor::Plain
+    } else if grpc_web_response_content_type.is_some() {
         HttpFlavor::Grpc
     } else {
         detected_http_flavor
@@ -2179,14 +2223,17 @@ async fn handle_h3_request(
         return Ok(());
     }
 
-    // Block non-WebSocket CONNECT requests. HTTP/3 Extended CONNECT for
-    // WebSocket (RFC 9220) is classified above as `HttpFlavor::WebSocket`
-    // and falls through to the dedicated bridge later in this handler. Other
-    // CONNECT-style protocols (for example CONNECT-UDP) are not supported by
-    // this proxy and must be rejected to prevent tunnel establishment that
-    // bypasses proxy routing.
-    if method == "CONNECT" && http_flavor != HttpFlavor::WebSocket {
-        warn!("Rejected non-WebSocket HTTP/3 CONNECT request");
+    // Extended CONNECT admission. Exactly two profiles are dispatchable:
+    // RFC 9220 WebSocket (classified above as `HttpFlavor::WebSocket`, handled
+    // by the bridge later in this handler) and RFC 9298 CONNECT-UDP (handled
+    // by `crate::http3::connect_udp`, and only when the operator enabled it).
+    // Every other CONNECT — plain CONNECT with no `:protocol`, or a registered
+    // `:protocol` this gateway does not implement such as `webtransport` — is
+    // refused here so no tunnel can be established that bypasses proxy
+    // routing. An unregistered `:protocol` token never gets this far: h3
+    // treats it as a malformed request and resets the stream.
+    if method == "CONNECT" && http_flavor != HttpFlavor::WebSocket && !is_connect_udp_request {
+        warn!("Rejected unsupported HTTP/3 CONNECT request");
         record_h3_flavor_aware_reject(&state, http_flavor, 405);
         send_h3_error_flavor_aware(
             &mut stream,
@@ -2199,6 +2246,90 @@ async fn handle_h3_request(
         )
         .await?;
         return Ok(());
+    }
+    // CONNECT-UDP in TLS 1.3 early data is always 425 Too Early. UDP has no
+    // `Early-Data: 1` request-header boundary for a target to make its own
+    // replay-safety decision, so a replay would duplicate datagrams and side
+    // effects. The generic CONNECT allowlist (`FERRUM_TLS_EARLY_DATA_METHODS`)
+    // exists for operator-enabled RFC 9220 WebSocket and must not admit a
+    // CONNECT-UDP stream or its capsules. Ordinary 1-RTT CONNECT-UDP is
+    // unchanged. This runs before the 501/400 CONNECT-UDP gates, routing,
+    // plugins, and any socket work so every 0-RTT CONNECT-UDP is categorical.
+    if is_connect_udp_request && is_early_data {
+        warn!("Rejected HTTP/3 CONNECT-UDP request carried in 0-RTT early data");
+        record_h3_flavor_aware_reject(&state, http_flavor, 425);
+        send_h3_error_flavor_aware(
+            &mut stream,
+            http_flavor,
+            grpc_web_response_content_type,
+            StatusCode::TOO_EARLY,
+            r#"{"error":"CONNECT-UDP is not allowed in 0-RTT early data"}"#,
+            crate::proxy::grpc_proxy::grpc_status::UNAVAILABLE,
+            "CONNECT-UDP is not allowed in 0-RTT early data",
+        )
+        .await?;
+        return Ok(());
+    }
+    // The CONNECT-UDP profile is off by default: enabling UDP tunnelling
+    // changes what a route can reach. Refuse before routing, plugins, or any
+    // socket work, and name the profile so a client can tell "not implemented
+    // here" from "not a valid request". The same 501 covers a build target that
+    // cannot enforce RFC 9298 §3.1 non-fragmentation: the profile is
+    // unavailable there, not degraded (startup already refuses the combination,
+    // so reaching this is defence in depth).
+    if is_connect_udp_request
+        && !crate::http3::connect_udp::connect_udp_profile_available(&state.env_config)
+    {
+        warn!("Rejected HTTP/3 CONNECT-UDP request: profile not available on this gateway");
+        record_h3_flavor_aware_reject(&state, http_flavor, 501);
+        send_h3_error_flavor_aware(
+            &mut stream,
+            http_flavor,
+            grpc_web_response_content_type,
+            StatusCode::NOT_IMPLEMENTED,
+            r#"{"error":"CONNECT-UDP over HTTP/3 is disabled on this gateway"}"#,
+            crate::proxy::grpc_proxy::grpc_status::UNIMPLEMENTED,
+            "CONNECT-UDP over HTTP/3 is disabled on this gateway",
+        )
+        .await?;
+        return Ok(());
+    }
+    // RFC 9298 §3 request shape and RFC 9297 §3.2 forbidden fields, both
+    // decided before routing, plugins, or any socket work.
+    //
+    // The classifier above reads only `:method` and `:protocol`, so without
+    // this the handler would silently *assume* HTTPS and open a tunnel for a
+    // request whose `:scheme` was absent, empty, or something else entirely.
+    // RFC 9297 §3.2 additionally forbids `Content-Length`, `Content-Type`, and
+    // `Transfer-Encoding` on a Capsule Protocol message; this is the raw
+    // client header block, and the handler repeats the check over the
+    // plugin-finalized outbound map so neither side can violate the boundary.
+    if is_connect_udp_request {
+        let malformed = crate::http3::connect_udp::validate_connect_udp_request_shape(req.uri())
+            .err()
+            .or_else(|| {
+                crate::http3::connect_udp::first_forbidden_capsule_protocol_field(
+                    req.headers().keys().map(|name| name.as_str()),
+                )
+            });
+        if let Some(rejection) = malformed {
+            warn!(
+                reason = rejection.reason(),
+                "Rejected HTTP/3 CONNECT-UDP request: malformed message"
+            );
+            record_h3_flavor_aware_reject(&state, http_flavor, 400);
+            send_h3_error_flavor_aware(
+                &mut stream,
+                http_flavor,
+                grpc_web_response_content_type,
+                StatusCode::BAD_REQUEST,
+                rejection.client_error_body(),
+                crate::proxy::grpc_proxy::grpc_status::INVALID_ARGUMENT,
+                "CONNECT-UDP request is malformed",
+            )
+            .await?;
+            return Ok(());
+        }
     }
 
     // Reject disallowed methods on 0-RTT early data connections (RFC 8470).
@@ -2465,7 +2596,11 @@ async fn handle_h3_request(
     // requests still require WebSocket-scoped initial response policy and
     // transport-managed header stripping.
     let request_protocol = h3_plugin_protocol_for_request(
-        detected_http_flavor,
+        if is_connect_udp_request {
+            HttpFlavor::Plain
+        } else {
+            detected_http_flavor
+        },
         grpc_web_response_content_type.is_some(),
     );
     // Fault shaping must retain the immutable wire flavor: recognized
@@ -2579,8 +2714,12 @@ async fn handle_h3_request(
             .entry("request_protocol".to_string())
             .or_insert_with(|| "grpc".to_string());
     }
-    let allows_request_body_buffering =
-        crate::proxy::http_flavor_allows_request_body_buffering(http_flavor);
+    // A CONNECT-UDP request has no request body: the DATA frames after the 200
+    // are RFC 9297 capsules. Draining them as a body would consume the tunnel,
+    // exactly as it would for a WebSocket Extended CONNECT (which
+    // `http_flavor_allows_request_body_buffering` already excludes).
+    let allows_request_body_buffering = !is_connect_udp_request
+        && crate::proxy::http_flavor_allows_request_body_buffering(http_flavor);
 
     // Load plugin-cache values once for this request. Every plugin list,
     // capability bitset, and buffering flag below is derived from the same
@@ -4087,15 +4226,28 @@ async fn handle_h3_request(
     // provider claim can rebind them against the route-override base (not the
     // DestinationRule-effective `proxy`) before query capture / dial. Keep the
     // gated rebind below in sync with `handle_proxy_request_inner`.
+    //
+    // RFC 9298 CONNECT-UDP deliberately selects nothing. Its destination is
+    // client-named and merely ADMITTED against the route's configured set
+    // (`connect_udp::admit_connect_udp_destination`), so balancing here would
+    // both perturb round-robin / least-connections accounting for a request
+    // that dials no HTTP backend and hand every selected-target gate below an
+    // arbitrary member the client never named — whose breaker state could
+    // refuse a valid tunnel and whose transport tags describe a different
+    // destination entirely.
     let mut routing_proxy = Arc::clone(&proxy);
-    let mut selection = crate::proxy::backend_dispatch::select_upstream_target(
-        &proxy,
-        &state,
-        &epoch,
-        &ctx.client_ip,
-        &proxy_headers,
-        None,
-    );
+    let mut selection = if is_connect_udp_request {
+        crate::proxy::backend_dispatch::UpstreamSelection::unselected()
+    } else {
+        crate::proxy::backend_dispatch::select_upstream_target(
+            &proxy,
+            &state,
+            &epoch,
+            &ctx.client_ip,
+            &proxy_headers,
+            None,
+        )
+    };
     // Fields are moved out with `Option::take` so the deferred-override rebind
     // can replace the whole selection (balancer / sticky) rather than only the
     // target text.
@@ -4391,14 +4543,23 @@ async fn handle_h3_request(
             // `balancer` and `sticky_cookie_needed` are read after this point,
             // so same-generation load-balancer accounting and sticky-cookie
             // issuance must describe the target that is actually dialed.
-            selection = crate::proxy::backend_dispatch::select_upstream_target(
-                &routing_proxy,
-                &state,
-                &epoch,
-                &ctx.client_ip,
-                &proxy_headers,
-                None,
-            );
+            // Still unselected for CONNECT-UDP: a deferred hook can move the
+            // ROUTE (and therefore the admitted destination set, which is
+            // recomputed from this rebound proxy), but it must not introduce a
+            // load-balanced member into a tunnel that is admitted, never
+            // balanced.
+            selection = if is_connect_udp_request {
+                crate::proxy::backend_dispatch::UpstreamSelection::unselected()
+            } else {
+                crate::proxy::backend_dispatch::select_upstream_target(
+                    &routing_proxy,
+                    &state,
+                    &epoch,
+                    &ctx.client_ip,
+                    &proxy_headers,
+                    None,
+                )
+            };
             lb_hash_key = selection.lb_hash_key.take();
             upstream_target =
                 crate::proxy::backend_dispatch::concretize_wildcard_target_for_request(
@@ -4817,12 +4978,25 @@ async fn handle_h3_request(
     // H3 records the circuit-breaker outcome at header time (it does not defer the
     // dispatch outcome like the direct-H2 path), so the admission open-epoch is
     // unused here.
+    //
+    // CONNECT-UDP is exempt: it dials no HTTP backend, so it can neither
+    // confirm nor refute a breaker cycle, and no upstream member was selected
+    // for it. Consulting the breaker anyway would let an unrelated backend's
+    // failure history refuse a tunnel to a destination the client named and the
+    // route already admits, while a claimed HALF_OPEN probe slot would have to
+    // be released again untested a few lines into the handler.
+    let circuit_breaker_admission: Result<(Option<String>, bool, u64), ()> =
+        if is_connect_udp_request {
+            Ok((None, false, 0))
+        } else {
+            crate::proxy::backend_dispatch::check_circuit_breaker(
+                &proxy,
+                &state,
+                upstream_target.as_deref(),
+            )
+        };
     let (cb_target_key, cb_is_half_open_probe, _cb_admission_open_epoch) =
-        match crate::proxy::backend_dispatch::check_circuit_breaker(
-            &proxy,
-            &state,
-            upstream_target.as_deref(),
-        ) {
+        match circuit_breaker_admission {
             Ok(result) => result,
             Err(()) => {
                 let phase_start = std::time::Instant::now();
@@ -4937,7 +5111,13 @@ async fn handle_h3_request(
         .is_some()
         || crate::proxy::backend_dispatch::h3_bridge_transport_refusal(upstream_target.as_deref())
             .is_some();
+    // Never for CONNECT-UDP: the DATA frames after the 200 are RFC 9297
+    // capsules, so draining them here as a request body would consume the
+    // tunnel. That exclusion has to be explicit rather than inherited from the
+    // selected-target dispatch-policy gate above, which is now a no-op for
+    // CONNECT-UDP precisely because no target is selected for it.
     if reevaluate_response_policy_after_request_body
+        && !is_connect_udp_request
         && !request_body_prepared
         && !preparation_blocked_by_dispatch_policy
     {
@@ -5299,7 +5479,9 @@ async fn handle_h3_request(
     let sticky_cookie_needed = selection.sticky_cookie_needed;
 
     // Resolve backend IP once from DNS cache (O(1) cached lookup) before dispatch.
-    // Shared across all response paths for TransactionSummary logging.
+    // Shared across all ordinary H3 response paths for TransactionSummary logging.
+    // CONNECT-UDP does not dial this host: no backend member is selected, and
+    // the tunnel handler resolves the client-named destination itself.
     let effective_host = upstream_target
         .as_ref()
         .map(|t| t.host.as_str())
@@ -5311,11 +5493,18 @@ async fn handle_h3_request(
     // client could still dial a denied literal (e.g. a DB row load only warned
     // about) that H1/H2 clients are already blocked from. Hostname backends are
     // screened by the resolver at dial time on every H3 dispatch path.
-    if let Some(reason) = crate::proxy::denied_literal_backend_or_dns_override(
-        effective_host,
-        &proxy,
-        &state.env_config.backend_allow_ips,
-    ) {
+    //
+    // CONNECT-UDP is screened against its own client-named destination inside
+    // `handle_h3_connect_udp` instead: `effective_host` here is the route's
+    // `backend_host` (nothing is selected for a tunnel), which is not the host
+    // a CONNECT-UDP session dials and would refuse or admit the wrong one.
+    if !is_connect_udp_request
+        && let Some(reason) = crate::proxy::denied_literal_backend_or_dns_override(
+            effective_host,
+            &proxy,
+            &state.env_config.backend_allow_ips,
+        )
+    {
         warn!(
             proxy_id = %proxy.id,
             backend = %effective_host,
@@ -5354,16 +5543,20 @@ async fn handle_h3_request(
         return Ok(());
     }
 
-    let backend_resolved_ip = state
-        .dns_cache
-        .resolve(
-            effective_host,
-            proxy.dns_override.as_deref(),
-            proxy.dns_cache_ttl_seconds,
-        )
-        .await
-        .ok()
-        .map(|ip| ip.to_string());
+    let backend_resolved_ip = if is_connect_udp_request {
+        None
+    } else {
+        state
+            .dns_cache
+            .resolve(
+                effective_host,
+                proxy.dns_override.as_deref(),
+                proxy.dns_cache_ttl_seconds,
+            )
+            .await
+            .ok()
+            .map(|ip| ip.to_string())
+    };
 
     // Determine if we can stream the request body directly to the backend
     // without buffering into Vec<u8>. Conditions:
@@ -5479,6 +5672,64 @@ async fn handle_h3_request(
     // response streamed) and why that matches the rest of the codebase's two-tier
     // buffering logic. A non-H3-capable gRPC backend (h2/h2c only) still routes
     // through this bridge to the H2 gRPC pool.
+    // RFC 9298: HTTP/3 Extended CONNECT for UDP proxying. Admitted by the gate
+    // near the top of this handler, so reaching here means the operator
+    // enabled the profile. Dispatch takes ownership of the QUIC stream so the
+    // capsule relay can `.split()` it into independent halves. Routing,
+    // authentication, authorization, admission/overload, rate limiting, and
+    // the `before_proxy` plugin phase have all already run — a CONNECT-UDP
+    // tunnel is an ordinary Ferrum request until this point, and the handler
+    // additionally requires the client-named destination to be one the matched
+    // proxy is already configured to reach.
+    if is_connect_udp_request {
+        // Whether `apply_route_overrides_with_upstreams` shaped the proxy this
+        // request was admitted against. Deliberately conservative — an override
+        // that resolved to a no-op still counts — because the reload re-check
+        // can only look the proxy up by `(namespace, id)`, which recovers the
+        // BASE shape and can therefore neither confirm nor reconstruct the
+        // effective authorization. The tunnel fails closed on a generation
+        // change instead of being re-admitted against a different route.
+        // Use the shared whole-shape predicate. In particular, a scheme-only
+        // direct-backend override can clear an upstream and therefore change
+        // the admitted destination set even when host and port are untouched.
+        // Omitting that (or another effective override field) would let a
+        // reload re-authorize the tunnel against the unoverridden base route.
+        let route_overrides_applied = ctx.has_route_overrides();
+        // Boxed out of line — see `boxed_handle_h3_connect_udp`. A bare
+        // `.await` of `handle_h3_connect_udp` here still materializes the
+        // capsule-relay future into `handle_h3_request`'s poll frame and is
+        // charged to every H3 request, including ordinary Plain over HBONE.
+        return crate::http3::connect_udp::boxed_handle_h3_connect_udp(
+            stream,
+            crate::http3::connect_udp::ConnectUdpRequest {
+                state,
+                request_guard,
+                per_ip_guard,
+                epoch,
+                // The route-override-effective BASE proxy, not the per-target
+                // effective overlay: the destination allow-list and the reload
+                // re-check both read route configuration, while the per-target
+                // overlay is a dispatch-time concern. Note this IS shaped by
+                // plugin route overrides, which is why
+                // `route_overrides_applied` travels with it — the live
+                // re-lookup by (namespace, id) recovers only the unoverridden
+                // shape.
+                proxy: Arc::clone(&selected_base_proxy),
+                ctx,
+                plugins,
+                initial_response_header_policy_plugins,
+                plugin_execution_ns,
+                start_time,
+                request_path: original_request_path.clone(),
+                proxy_headers,
+                cb_target_key,
+                cb_is_half_open_probe,
+                route_overrides_applied,
+            },
+        )
+        .await;
+    }
+
     // RFC 9220: HTTP/3 Extended CONNECT for WebSocket. The request was
     // classified as `HttpFlavor::WebSocket` by `detect_http_flavor` (which
     // accepts both H2 and H3 Extended CONNECT). Dispatch into the
