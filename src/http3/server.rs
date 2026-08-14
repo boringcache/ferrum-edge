@@ -1755,6 +1755,32 @@ async fn handle_h3_request(
         detected_http_flavor
     };
 
+    // Frontend client-trust admission fence (HTTP/3, issue #3857). The
+    // connection accept loop checks immediately after accepting a ready stream,
+    // but resolving its request headers is asynchronous and the task is spawned
+    // independently. Re-check here to close the interval in which a withdrawal
+    // can land after that first check but before this handler starts routing or
+    // running plugins. The connection-level retirement concurrently closes QUIC;
+    // this response is best-effort and, either way, no withdrawn credential can
+    // reach policy or backend dispatch.
+    if let Some(session) = client_trust_session.as_ref()
+        && session.is_retired()
+    {
+        session.record_fenced();
+        record_h3_flavor_aware_reject(&state, http_flavor, 401);
+        send_h3_error_flavor_aware(
+            &mut stream,
+            http_flavor,
+            grpc_web_response_content_type,
+            http::StatusCode::UNAUTHORIZED,
+            r#"{"error":"Client certificate trust withdrawn"}"#,
+            crate::proxy::grpc_proxy::grpc_status::UNAUTHENTICATED,
+            "Client certificate trust withdrawn",
+        )
+        .await?;
+        return Ok(());
+    }
+
     // Global request admission control (HTTP/3). Single atomic load (~1ns).
     if state
         .overload

@@ -369,3 +369,37 @@ fn a_malformed_later_candidate_retains_the_last_good_trust() {
     );
     assert!(!session.session().is_retired());
 }
+
+/// A ready H3 stream is resolved in a spawned task after the connection loop's
+/// first retirement check. Pin the second, request-handler fence ahead of every
+/// ordinary admission and routing surface so that asynchronous resolution can
+/// never reopen the withdrawn credential.
+#[test]
+fn h3_request_handler_rechecks_withdrawal_before_admission() {
+    let source = include_str!("../../../src/http3/server.rs");
+    let handler_start = source
+        .find("async fn handle_h3_request(")
+        .expect("H3 request handler");
+    let handler_tail = &source[handler_start..];
+    let handler_end = handler_tail
+        .find("\nfn build_h3_backend_url_for_flavor")
+        .expect("end of H3 request handler");
+    let handler = &handler_tail[..handler_end];
+
+    let fence = handler
+        .find("Frontend client-trust admission fence (HTTP/3")
+        .expect("request-handler client-trust fence");
+    assert!(
+        handler[fence..].contains("client_trust_session.as_ref()")
+            && handler[fence..].contains("session.is_retired()")
+            && handler[fence..].contains("session.record_fenced()"),
+        "the H3 request task must consult and account the connection trust fence"
+    );
+    let ordinary_admission = handler
+        .find("Global request admission control (HTTP/3)")
+        .expect("ordinary H3 request admission");
+    assert!(
+        fence < ordinary_admission,
+        "withdrawn trust must be fenced before overload, routing, plugins, and backend dispatch"
+    );
+}
