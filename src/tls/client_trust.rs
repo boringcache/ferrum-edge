@@ -87,11 +87,15 @@
 //! TlsAcceptor / QUIC endpoint config already in hand. Every rustls listener
 //! therefore installs [`bind_live_handshake_verifier`]: handshake-time
 //! `verify_client_cert` reads the live published verifier, even when the
-//! `ServerConfig` itself was built under a withdrawn generation. A second,
-//! independent fail-closed check re-runs the peer chain against
-//! [`armed_handshake_still_trusted`] after TLS so a missing peer chain (session
-//! resumption does not re-verify) cannot be served either. The wrapper is
-//! installed only at `with_client_cert_verifier` time;
+//! `ServerConfig` itself was built under a withdrawn generation. Certificate
+//! Request CA-name hints are generation-neutral (an empty list, so rustls
+//! omits or does not constrain `certificate_authorities`); advertising the
+//! snapshot inner verifier's names would let a client that honors those hints
+//! withhold a certificate issued by a CA added after this `ServerConfig` was
+//! built. A second, independent fail-closed check re-runs the peer chain
+//! against [`armed_handshake_still_trusted`] after TLS so a missing peer chain
+//! (session resumption does not re-verify) cannot be served either. The
+//! wrapper is installed only at `with_client_cert_verifier` time;
 //! [`AcceptedClientTrust::verifier`](super::AcceptedClientTrust) and
 //! [`publish_accepted_rustls_candidate`] keep the inner WebPki object so the
 //! live slot never points at the wrapper itself.
@@ -924,8 +928,13 @@ pub fn armed_handshake_der_chain_still_trusted(
 /// rustls stores the `ClientCertVerifier` inside each `ServerConfig`. A
 /// TlsAcceptor or QUIC endpoint that still holds a snapshot built under a
 /// withdrawn generation would otherwise keep admitting the withdrawn
-/// credential. The wrapper is installed **only** at `with_client_cert_verifier`
-/// time; [`AcceptedClientTrust::verifier`](super::AcceptedClientTrust) and
+/// credential. The wrapper's CertificateRequest hints are generation-neutral
+/// (empty), so a client that honors `certificate_authorities` can still
+/// present a certificate issued by a CA added after this snapshot was built;
+/// the presented chain is then verified only by the currently published
+/// fail-closed verifier. The wrapper is installed **only** at
+/// `with_client_cert_verifier` time;
+/// [`AcceptedClientTrust::verifier`](super::AcceptedClientTrust) and
 /// [`publish_accepted_rustls_candidate`] keep the inner WebPki object so the
 /// live slot never points at the wrapper itself.
 pub fn bind_live_handshake_verifier(
@@ -936,8 +945,9 @@ pub fn bind_live_handshake_verifier(
 }
 
 /// Handshake-time rustls verifier that reads the live published verifier for
-/// `scope` on every `verify_client_cert`. Debug omits the inner verifier so a
-/// `ServerConfig` dump cannot leak trust material.
+/// `scope` on every `verify_client_cert`. CertificateRequest CA-name hints are
+/// empty so they cannot pin a snapshot generation. Debug omits the inner
+/// verifier so a `ServerConfig` dump cannot leak trust material.
 struct LiveHandshakeVerifier {
     scope: ClientTrustScope,
     inner: Arc<dyn ClientCertVerifier>,
@@ -964,9 +974,18 @@ impl std::fmt::Debug for LiveHandshakeVerifier {
 
 impl ClientCertVerifier for LiveHandshakeVerifier {
     fn root_hint_subjects(&self) -> &[DistinguishedName] {
-        // Must return a reference from `self`. Stale hints are acceptable;
-        // `verify_client_cert` still consults the live verifier.
-        self.inner.root_hint_subjects()
+        // rustls requires a borrow from `&self`. Forwarding the snapshot
+        // inner verifier's CA names would advertise a stale CertificateRequest
+        // constraint: a client that honors `certificate_authorities` can then
+        // withhold a certificate issued by a CA added after this ServerConfig
+        // was built, even though `verify_client_cert` consults the live
+        // verifier. An empty list is generation-neutral and does not broaden
+        // trust: TLS 1.3 omits the extension (`authority_names: None`), TLS
+        // 1.2 sends empty `canames`, and rustls documents that the client
+        // should then present any certificate it has. The presented chain is
+        // still verified only through the currently published fail-closed
+        // verifier.
+        &[]
     }
 
     fn verify_client_cert(

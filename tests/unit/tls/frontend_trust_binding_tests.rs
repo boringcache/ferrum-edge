@@ -38,10 +38,12 @@ use ferrum_edge::tls::{
     load_frontend_tls_candidate_from_paths,
 };
 use rustls::ClientConfig;
+use rustls::client::ResolvesClientCert;
 use rustls::pki_types::{
     CertificateDer, CertificateRevocationListDer, PrivateKeyDer, ServerName, UnixTime,
 };
 use rustls::server::danger::ClientCertVerifier;
+use rustls::sign::CertifiedKey;
 use tokio::net::{TcpListener, TcpStream};
 use tokio_rustls::{TlsAcceptor, TlsConnector};
 
@@ -466,19 +468,41 @@ fn live_handshake_wrapper_refuses_after_accepted_withdrawal_even_with_a_stale_in
     let before = load_candidate(dir.path(), &pki, &startup_crls).expect("startup candidate");
     publish_rustls(ClientTrustScope::ProxyH3, &before);
     publish_rustls(ClientTrustScope::ProxyFrontend, &before);
+    let stale_h3_inner = before
+        .verifier
+        .clone()
+        .expect("startup candidate installs a verifier");
+    let stale_frontend_inner = before
+        .verifier
+        .clone()
+        .expect("startup candidate installs a verifier");
     let stale_h3 = client_trust::bind_live_handshake_verifier(
         ClientTrustScope::ProxyH3,
-        before
-            .verifier
-            .clone()
-            .expect("startup candidate installs a verifier"),
+        stale_h3_inner.clone(),
     );
     let stale_frontend = client_trust::bind_live_handshake_verifier(
         ClientTrustScope::ProxyFrontend,
-        before
-            .verifier
-            .clone()
-            .expect("startup candidate installs a verifier"),
+        stale_frontend_inner.clone(),
+    );
+    assert!(
+        !stale_h3_inner.root_hint_subjects().is_empty(),
+        "the snapshot inner verifier still has CA names; the wrapper must not forward them"
+    );
+    assert!(
+        stale_h3.root_hint_subjects().is_empty(),
+        "live wrapper must expose no snapshot CertificateRequest CA-name constraint"
+    );
+    assert!(
+        stale_frontend.root_hint_subjects().is_empty(),
+        "H1/H2 wrapper must expose no snapshot CertificateRequest CA-name constraint"
+    );
+    assert!(
+        stale_h3.client_auth_mandatory() && stale_h3.offer_client_auth(),
+        "generation-neutral hints must still require and offer client authentication"
+    );
+    assert!(
+        !stale_h3.requires_raw_public_keys(),
+        "the wrapper must preserve the inner verifier's raw-key posture"
     );
     assert!(
         stale_h3
@@ -520,6 +544,101 @@ fn live_handshake_wrapper_refuses_after_accepted_withdrawal_even_with_a_stale_in
     assert!(
         !client_trust::armed_handshake_still_trusted(ClientTrustScope::ProxyH3, None),
         "armed admission must fail closed when the handshake exposes no peer certificate"
+    );
+    assert!(
+        stale_h3.root_hint_subjects().is_empty()
+            && stale_frontend.root_hint_subjects().is_empty(),
+        "live verification must not start advertising snapshot CA names after a withdrawal"
+    );
+}
+
+/// CertificateRequest CA names must stay generation-neutral on the live
+/// wrapper: rustls omits or does not constrain `certificate_authorities` for
+/// an empty list, so an additive CA is not filtered by a stale snapshot
+/// (issue #3857). Trust itself is unchanged — the inner verifier still has
+/// names, client auth stays mandatory, and verification is still fail-closed.
+#[test]
+fn live_handshake_wrapper_exposes_no_stale_ca_name_constraint() {
+    let _guard = isolated_registry();
+    let dir = tempfile::tempdir().expect("tempdir");
+    let pki = build_pki();
+    let extra = issue_client_under_new_ca("overlap-client", 0x3858);
+
+    let startup_crls = parse_crls(&pki.crl_pem(&[UNRELATED_SERIAL], 1));
+    let before = load_candidate(dir.path(), &pki, &startup_crls).expect("startup candidate");
+    publish_rustls(ClientTrustScope::ProxyFrontend, &before);
+    let inner = before
+        .verifier
+        .clone()
+        .expect("startup candidate installs a verifier");
+    let wrapper = client_trust::bind_live_handshake_verifier(
+        ClientTrustScope::ProxyFrontend,
+        inner.clone(),
+    );
+
+    assert!(
+        !inner.root_hint_subjects().is_empty(),
+        "the snapshot inner verifier still has CA names; the wrapper must not forward them"
+    );
+    assert!(
+        wrapper.root_hint_subjects().is_empty(),
+        "live wrapper must expose no snapshot CertificateRequest CA-name constraint"
+    );
+    assert_eq!(
+        wrapper.client_auth_mandatory(),
+        inner.client_auth_mandatory(),
+    );
+    assert_eq!(wrapper.offer_client_auth(), inner.offer_client_auth());
+    assert_eq!(
+        wrapper.requires_raw_public_keys(),
+        inner.requires_raw_public_keys(),
+    );
+    assert!(
+        wrapper.client_auth_mandatory() && wrapper.offer_client_auth(),
+        "generation-neutral hints must still require and offer client authentication"
+    );
+    assert!(
+        wrapper
+            .verify_client_cert(&pki.client_cert(), &[], UnixTime::now())
+            .is_ok(),
+        "live wrapper must still admit the original CA through the published verifier"
+    );
+    assert!(
+        wrapper
+            .verify_client_cert(
+                &CertificateDer::from(extra.cert_der.clone()),
+                &[],
+                UnixTime::now(),
+            )
+            .is_err(),
+        "empty hints must not broaden trust to a CA the live verifier does not admit"
+    );
+
+    let overlap_pem = format!("{}{}", pki.ca_pem, extra.ca_pem);
+    let overlap = load_accepted_frontend_parts(
+        dir.path(),
+        "wrapper-overlap",
+        &pki.server_cert_pem,
+        &pki.server_key_pem,
+        &overlap_pem,
+        &startup_crls,
+        None,
+    )
+    .expect("additive overlap candidate");
+    publish_rustls(ClientTrustScope::ProxyFrontend, &overlap.client_trust);
+    assert!(
+        wrapper.root_hint_subjects().is_empty(),
+        "an additive live publish must not start advertising snapshot CA names"
+    );
+    assert!(
+        wrapper
+            .verify_client_cert(
+                &CertificateDer::from(extra.cert_der.clone()),
+                &[],
+                UnixTime::now(),
+            )
+            .is_ok(),
+        "after the additive publish the live wrapper must admit the new CA"
     );
 }
 
@@ -1385,6 +1504,85 @@ fn mtls_client_config(cert_der: &[u8], key_pem: &str) -> ClientConfig {
     config
 }
 
+/// A client that withholds its certificate unless CertificateRequest CA names
+/// are unconstrained (empty) or include this certificate's issuer. rustls
+/// `with_client_auth_cert` ignores those hints, so it cannot prove the live
+/// wrapper stopped advertising a stale snapshot CA list.
+struct HintHonoringClientCert {
+    key: std::sync::Arc<CertifiedKey>,
+    issuer_subjects: Vec<Vec<u8>>,
+}
+
+impl std::fmt::Debug for HintHonoringClientCert {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("HintHonoringClientCert").finish()
+    }
+}
+
+impl ResolvesClientCert for HintHonoringClientCert {
+    fn resolve(
+        &self,
+        root_hint_subjects: &[&[u8]],
+        _sigschemes: &[rustls::SignatureScheme],
+    ) -> Option<std::sync::Arc<CertifiedKey>> {
+        if root_hint_subjects.is_empty()
+            || self.issuer_subjects.iter().any(|subject| {
+                root_hint_subjects
+                    .iter()
+                    .any(|hint| *hint == subject.as_slice())
+            })
+        {
+            Some(self.key.clone())
+        } else {
+            None
+        }
+    }
+
+    fn has_certs(&self) -> bool {
+        true
+    }
+}
+
+fn mtls_client_config_honoring_ca_hints(
+    cert_der: &[u8],
+    key_pem: &str,
+    issuer_ca_pem: &str,
+) -> ClientConfig {
+    let certified = std::sync::Arc::new(
+        CertifiedKey::from_der(
+            vec![CertificateDer::from(cert_der.to_vec())],
+            parse_client_key(key_pem),
+            &rustls::crypto::ring::default_provider(),
+        )
+        .expect("client certified key"),
+    );
+    let certs = rustls_pemfile::certs(&mut issuer_ca_pem.as_bytes())
+        .collect::<Result<Vec<_>, _>>()
+        .expect("parse issuer CA");
+    let mut roots = rustls::RootCertStore::empty();
+    for cert in certs {
+        roots.add(cert).expect("issuer CA is a trust anchor");
+    }
+    let issuer_subjects: Vec<Vec<u8>> = roots
+        .subjects()
+        .into_iter()
+        .map(|dn| dn.as_ref().to_vec())
+        .collect();
+    assert!(
+        !issuer_subjects.is_empty(),
+        "hint-honoring client must know its issuer subject"
+    );
+    let mut config = ClientConfig::builder()
+        .dangerous()
+        .with_custom_certificate_verifier(std::sync::Arc::new(ferrum_edge::tls::NoVerifier))
+        .with_client_cert_resolver(std::sync::Arc::new(HintHonoringClientCert {
+            key: certified,
+            issuer_subjects,
+        }));
+    config.alpn_protocols = vec![b"http/1.1".to_vec()];
+    config
+}
+
 /// Drive one real rustls handshake through `server_config` and return the
 /// leaf the server presented. The handshake is the only way to observe the
 /// live wrapper baked into a CP `ServerConfig`.
@@ -1417,7 +1615,10 @@ async fn handshake_presented_leaf(
 
 /// Under active CP server material, an accepted additive operator CA overlap
 /// must be what a new H1/H2/TCP handshake verifies against, while the exact CP
-/// server certificate/resolver stays in the listener slot (issue #3857).
+/// server certificate/resolver stays in the listener slot (issue #3857). The
+/// retained CP `ServerConfig` must not advertise a stale CertificateRequest
+/// CA-name list: a client that honors those hints still presents a certificate
+/// issued by the newly added CA.
 #[tokio::test]
 async fn dp_h12_tcp_adopts_additive_operator_verifier_while_retaining_cp_server_cert() {
     let _guard = isolated_registry();
@@ -1470,7 +1671,30 @@ async fn dp_h12_tcp_adopts_additive_operator_verifier_while_retaining_cp_server_
     ));
 
     let ca1_client = mtls_client_config(&pki.client_der, &pki.client_key_pem);
-    let ca2_client = mtls_client_config(&extra.cert_der, &extra.key_pem);
+    let ca2_client =
+        mtls_client_config_honoring_ca_hints(&extra.cert_der, &extra.key_pem, &extra.ca_pem);
+    let wrapper = client_trust::bind_live_handshake_verifier(
+        ClientTrustScope::ProxyFrontend,
+        cp_startup
+            .client_trust
+            .verifier
+            .clone()
+            .expect("CP candidate installs a verifier"),
+    );
+    assert!(
+        wrapper.root_hint_subjects().is_empty(),
+        "live wrapper must expose no snapshot CertificateRequest CA-name constraint"
+    );
+    assert!(
+        !cp_startup
+            .client_trust
+            .verifier
+            .as_ref()
+            .expect("CP inner verifier")
+            .root_hint_subjects()
+            .is_empty(),
+        "the snapshot inner verifier still has CA names; the wrapper must not forward them"
+    );
     assert_eq!(
         handshake_presented_leaf(listener_before.clone(), ca1_client.clone())
             .await
@@ -1554,9 +1778,7 @@ async fn dp_h12_tcp_adopts_additive_operator_verifier_while_retaining_cp_server_
 
     let presented = handshake_presented_leaf(listener_after.clone(), ca2_client)
         .await
-        .expect(
-            "a connection established after the accepted reload must use the new operator verifier",
-        );
+        .expect("hint-honoring additive CA client must complete the retained-CP handshake");
     assert_eq!(
         presented, cp_cert_der,
         "the additive handshake must still present the CP server certificate"
@@ -1671,10 +1893,10 @@ async fn dp_refused_operator_candidate_retains_cp_config_and_last_good_verifier(
     assert_eq!(
         handshake_presented_leaf(
             listener_before,
-            mtls_client_config(&extra.cert_der, &extra.key_pem)
+            mtls_client_config_honoring_ca_hints(&extra.cert_der, &extra.key_pem, &extra.ca_pem),
         )
         .await
-        .expect("last-good overlap verifier must still admit the extra CA"),
+        .expect("last-good overlap verifier must still admit a hint-honoring extra-CA client"),
         cp_cert_der
     );
 }

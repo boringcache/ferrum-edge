@@ -454,7 +454,9 @@ pub struct DpFrontendListenerUpdate {
 /// [`crate::tls::ClientTrustScope::ProxyFrontend`]'s live handshake wrapper, so
 /// an accepted operator trust reload is visible to new handshakes on those
 /// listeners without substituting CP server generation N with an operator
-/// server certificate.
+/// server certificate. The wrapper advertises no snapshot CA-name constraint
+/// on CertificateRequest, so an additive CA client is not filtered by the
+/// names compiled into that retained CP config.
 pub struct DpFrontendH3Pairing {
     lock: Mutex<DpFrontendH3PairingState>,
     /// Exact candidate the H3 listener adopts with one atomic load.
@@ -497,7 +499,9 @@ impl DpFrontendH3Pairing {
     /// [`crate::tls::ClientTrustScope::ProxyFrontend`]'s live handshake
     /// wrapper, so new H1/H2/TCP handshakes consult this accepted operator
     /// verifier (additive CA overlap and CRL unrevocation as well as
-    /// withdrawals) without substituting operator server material. This trust
+    /// withdrawals) without substituting operator server material. Certificate
+    /// Request hints on that wrapper are generation-neutral, so an additive
+    /// CA is not excluded by names from the retained CP snapshot. This trust
     /// is paired with the active CP server config into
     /// [`Self::h3_accepted_slot`]. The caller must still bump the H3 revision
     /// so ProxyH3 can adopt that one Arc through its rustls transaction.
@@ -1649,8 +1653,11 @@ fn stage_frontend_tls_snapshot(
             // certificate/resolver; the operator owns client trust. Without this
             // wrapper the snapshot bakes in the operator verifier from this
             // instant, and an accepted additive CA/CRL reload would keep
-            // rejecting new H1/H2/TCP handshakes (issue #3857). Withdrawals
-            // already fail closed via post-handshake revalidation.
+            // rejecting new H1/H2/TCP handshakes (issue #3857). The wrapper's
+            // CertificateRequest CA-name hints are empty so they cannot pin
+            // that snapshot generation; verification still uses the live
+            // fail-closed operator verifier. Withdrawals already fail closed
+            // via post-handshake revalidation.
             let handshake_scope = Some(crate::tls::ClientTrustScope::ProxyFrontend);
             let mut tls_config = if !certificates.is_empty() {
                 load_gateway_multi_cert_tls_config_with_handshake_scope(

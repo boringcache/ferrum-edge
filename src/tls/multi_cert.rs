@@ -187,8 +187,9 @@ pub fn load_gateway_multi_cert_tls_config(
 /// CP-delivered Gateway snapshots must pass
 /// [`crate::tls::ClientTrustScope::ProxyFrontend`]: the resulting `ServerConfig`
 /// keeps this resolver (the CP server certificate) while handshake-time
-/// client-certificate verification reads the live operator verifier. Without
-/// the wrapper, an accepted additive CA/CRL reload would keep rejecting new
+/// client-certificate verification reads the live operator verifier and
+/// CertificateRequest CA-name hints stay generation-neutral. Without the
+/// wrapper, an accepted additive CA/CRL reload would keep rejecting new
 /// H1/H2/TCP handshakes against the snapshot's stale inner verifier (issue
 /// #3857).
 #[allow(clippy::too_many_arguments)]

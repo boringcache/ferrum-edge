@@ -520,16 +520,22 @@ configs therefore keep the CP server certificate/resolver and bind
 `ClientTrustScope::ProxyFrontend`'s live handshake wrapper, so a new connection
 after the accepted reload uses only the new operator verifier — including an
 additive CA overlap or a CRL unrevocation, which post-handshake revalidation
-cannot admit on its own. HTTP/3 still has to install the new trust through its
-asynchronous endpoint apply: the DP publishes one accepted candidate that pairs
-the live CP server config with the same accepted operator verifier and semantic
-identity, then wakes the QUIC listener so `ProxyH3` installs that pair through
-its one rustls transaction (live verifier → `Endpoint::set_server_config` →
-generation/fence). A refused operator candidate never enters that slot and
-never replaces the live verifier, so every family keeps its last-good verifier,
-config, generation, and sessions. Clearing CP material restores the latest
-accepted operator candidate — not a startup snapshot captured when CP material
-first arrived. This does not add CP-delivered client-CA support.
+cannot admit on its own. The wrapper's CertificateRequest CA-name hints are
+generation-neutral (empty): rustls then omits or does not constrain the
+`certificate_authorities` hint, so a client that honors those names can still
+present a certificate issued by a CA added after that CP `ServerConfig` was
+built. The presented chain is verified only by the currently published
+fail-closed operator verifier; empty hints do not broaden trust. HTTP/3 still
+has to install the new trust through its asynchronous endpoint apply: the DP
+publishes one accepted candidate that pairs the live CP server config with the
+same accepted operator verifier and semantic identity, then wakes the QUIC
+listener so `ProxyH3` installs that pair through its one rustls transaction
+(live verifier → `Endpoint::set_server_config` → generation/fence). A refused
+operator candidate never enters that slot and never replaces the live verifier,
+so every family keeps its last-good verifier, config, generation, and sessions.
+Clearing CP material restores the latest accepted operator candidate — not a
+startup snapshot captured when CP material first arrived. This does not add
+CP-delivered client-CA support.
 
 The `frontend_dtls` scope reads its declared client-CA source **once** through
 the shared `CertSource` abstraction, and derives both the DTLS trust anchors and

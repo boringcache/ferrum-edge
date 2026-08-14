@@ -999,7 +999,8 @@ pub fn load_tls_config_with_client_auth_from_sources_and_ocsp(
 /// reuse a startup CRL clone must take both halves from one value of this type.
 /// The captured verifier is the inner WebPki object; rustls `ServerConfig`s
 /// for armed scopes wrap it with [`client_trust::bind_live_handshake_verifier`]
-/// so handshake-time verification reads the live published verifier.
+/// so handshake-time verification reads the live published verifier and
+/// CertificateRequest CA-name hints stay generation-neutral.
 #[derive(Clone)]
 pub struct AcceptedClientTrust {
     /// The verifier installed for this candidate, or `None` when the surface
@@ -1168,7 +1169,8 @@ pub(crate) fn finish_frontend_server_config(
 /// captured verifier is the inner WebPki object handed to
 /// `client_trust_out`. When `handshake_scope` is set, the returned
 /// `ServerConfig` installs a live wrapper around that object so a stale
-/// snapshot still consults the published verifier at handshake time. A second
+/// snapshot still consults the published verifier at handshake time, with
+/// generation-neutral CertificateRequest CA-name hints. A second
 /// family that adopts the inner verifier (the HTTP/3 endpoint) wraps it for
 /// its own scope instead of rebuilding one from an independently re-read source.
 #[allow(clippy::too_many_arguments)]
