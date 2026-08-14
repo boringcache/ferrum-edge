@@ -2594,13 +2594,8 @@ impl DtlsServer {
                                     // session's pinned reply source on a scoped
                                     // listener. Ordinary listeners pass None
                                     // and keep send_to byte for byte.
-                                    let _ = send_dtls_record(
-                                        &socket,
-                                        data,
-                                        peer_addr,
-                                        reply_local,
-                                    )
-                                    .await;
+                                    let _ = send_dtls_record(&socket, data, peer_addr, reply_local)
+                                        .await;
                                     drain_round_exhausted = false;
                                     continue;
                                 }
