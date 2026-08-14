@@ -1160,24 +1160,14 @@ async fn shared_health_guard_async() -> tokio::sync::MutexGuard<'static, ()> {
     SHARED_HEALTH_LOCK.lock().await
 }
 
-/// Default poll budget for state-driven waits in this module.
-const DEFAULT_WAIT_BUDGET: Duration = Duration::from_secs(5);
-/// Test-only budget for observing background classification logs under coverage load.
-const CLASSIFICATION_LOG_WAIT_BUDGET: Duration = Duration::from_secs(15);
-
-async fn wait_until_with_budget(budget: Duration, mut pred: impl FnMut() -> bool, what: &str) {
-    let polls = (budget.as_millis() / 10).max(1) as usize;
-    for _ in 0..polls {
+async fn wait_until(mut pred: impl FnMut() -> bool, what: &str) {
+    for _ in 0..500 {
         if pred() {
             return;
         }
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
     panic!("timed out waiting until {what}");
-}
-
-async fn wait_until(pred: impl FnMut() -> bool, what: &str) {
-    wait_until_with_budget(DEFAULT_WAIT_BUDGET, pred, what).await;
 }
 
 async fn wait_until_available(client: &RedisRateLimitClient) {
@@ -2470,9 +2460,11 @@ async fn a_silent_recovery_ping_times_out_and_does_not_wedge_retry() {
 /// A silent recovery PING publishes only the closed-set timeout class, never
 /// Redis error text, the key prefix, or other replay material.
 ///
-/// Production PING timeout stays at 1s; log observation uses
-/// [`CLASSIFICATION_LOG_WAIT_BUDGET`] because the background classification can
-/// lag the default module wait under instrumented coverage load.
+/// The fake server counting the PING only proves the command was accepted.
+/// Classification is a separate signal: redis-rs' default 500ms response
+/// timeout must not be logged as `connection_failed`, and the admitted
+/// one-second PING bound must emit `connection_timeout` beside the redacted
+/// endpoint.
 #[tokio::test(flavor = "current_thread")]
 async fn a_silent_recovery_ping_logs_only_the_timeout_classification() {
     use std::sync::atomic::Ordering;
@@ -2488,8 +2480,7 @@ async fn a_silent_recovery_ping_logs_only_the_timeout_classification() {
         "recovery PING dispatched",
     )
     .await;
-    wait_until_with_budget(
-        CLASSIFICATION_LOG_WAIT_BUDGET,
+    wait_until(
         || logs.contents().contains("connection_timeout"),
         "PING timeout classification logged",
     )
@@ -2501,7 +2492,12 @@ async fn a_silent_recovery_ping_logs_only_the_timeout_classification() {
         "PING timeout must use the closed-set classification: {captured}"
     );
     assert!(
+        !captured.contains("connection_failed"),
+        "a silent PING must not be classified as a generic connect failure: {captured}"
+    );
+    assert!(
         !captured.contains("PING did not complete")
+            && !captured.contains("timed out")
             && !captured.contains(prefix)
             && !captured.contains("PONG"),
         "must not log Redis error text, key prefix, or reply material: {captured}"

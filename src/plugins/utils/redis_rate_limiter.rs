@@ -919,6 +919,12 @@ fn screen_from_info_value(value: &redis::Value) -> TopologyScreen {
 /// never recover even after the backend became healthy. Timeout is an
 /// ordinary retryable outage: the client stays unpublished and the loop
 /// retries on the next interval.
+///
+/// redis-rs 1.2.1 defaults `AsyncConnectionConfig.response_timeout` to 500ms.
+/// The recovery checker disables that inner cap so this admitted bound is
+/// what fires. An inner I/O timeout is still rewritten to the same classified
+/// error: otherwise a silent PING is logged as generic `connection_failed`
+/// and can leak crate timeout text.
 async fn ping_connection(
     conn: &mut impl redis::aio::ConnectionLike,
     probe_timeout: Duration,
@@ -929,9 +935,24 @@ async fn ping_connection(
     )
     .await
     {
-        Ok(result) => result,
+        Ok(Ok(pong)) => Ok(pong),
+        Ok(Err(error)) if error.is_timeout() => Err(incomplete_ping_probe_error()),
+        Ok(Err(error)) => Err(error),
         Err(_elapsed) => Err(incomplete_ping_probe_error()),
     }
+}
+
+/// Recovery-probe connection config: Ferrum's connect timeout, without
+/// redis-rs' default 500ms command response timeout.
+///
+/// `PING` / `INFO` replies are bounded by the caller's `tokio::time::timeout`
+/// so a silent backend is classified against the admitted connect-timeout
+/// bound rather than the crate's shorter command cap. Pooled command paths
+/// keep `async_connection_config`.
+fn recovery_async_connection_config(connect_timeout: Duration) -> redis::AsyncConnectionConfig {
+    redis::AsyncConnectionConfig::new()
+        .set_connection_timeout(Some(connect_timeout))
+        .set_response_timeout(None)
 }
 
 /// Ask a freshly established connection whether it belongs to a Cluster-mode
@@ -2203,7 +2224,7 @@ impl RedisRateLimitClient {
             Err(_) => return false,
         };
         let connect_timeout = self.connect_timeout();
-        let async_config = self.async_connection_config();
+        let async_config = recovery_async_connection_config(connect_timeout);
         let mut conn = match tokio::time::timeout(
             connect_timeout,
             client.get_multiplexed_async_connection_with_config(&async_config),
@@ -2310,10 +2331,10 @@ impl RedisRateLimitClient {
     /// redis-rs async connection config carrying Ferrum's connection-attempt timeout.
     ///
     /// The crate default is one second; without this, outer `tokio::time::timeout`
-    /// wrappers cannot extend attempts past that inner cap. Used by *every*
-    /// connection path — pooled, dedicated, and health-check — because all three
-    /// dial a plain [`redis::aio::MultiplexedConnection`] and never a
-    /// transparently reconnecting [`redis::aio::ConnectionManager`].
+    /// wrappers cannot extend attempts past that inner cap. Used by pooled and
+    /// dedicated connect paths. Recovery probes use
+    /// [`recovery_async_connection_config`] so redis-rs' 500ms command response
+    /// timeout cannot preempt the admitted PING/INFO bound.
     fn async_connection_config(&self) -> redis::AsyncConnectionConfig {
         redis::AsyncConnectionConfig::new().set_connection_timeout(Some(self.connect_timeout()))
     }
@@ -2868,8 +2889,7 @@ impl RedisRateLimitClient {
                     } else {
                         redis::Client::open(conn_info)?
                     };
-                    let async_config = redis::AsyncConnectionConfig::new()
-                        .set_connection_timeout(Some(connect_timeout));
+                    let async_config = recovery_async_connection_config(connect_timeout);
                     let mut conn = match tokio::time::timeout(
                         connect_timeout,
                         client.get_multiplexed_async_connection_with_config(&async_config),

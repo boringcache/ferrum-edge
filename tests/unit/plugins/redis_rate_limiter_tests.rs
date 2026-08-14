@@ -382,6 +382,14 @@ fn recovery_ping_is_bounded_by_the_connect_timeout() {
         "the recovery checker must bound PING by redis_connect_timeout_seconds"
     );
     assert!(
+        source.contains(".set_response_timeout(None)"),
+        "recovery connections must disable redis-rs' 500ms response timeout"
+    );
+    assert!(
+        source.contains("error.is_timeout()"),
+        "an inner I/O timeout on recovery PING must use the classified ping-timeout error"
+    );
+    assert!(
         !source.contains("redis::cmd(\"PING\").query_async::<String>(&mut conn).await"),
         "unbounded recovery PING must not return"
     );
