@@ -923,8 +923,9 @@ fn screen_from_info_value(value: &redis::Value) -> TopologyScreen {
 /// redis-rs 1.2.1 defaults `AsyncConnectionConfig.response_timeout` to 500ms.
 /// The recovery checker disables that inner cap so this admitted bound is
 /// what fires. An inner I/O timeout is still rewritten to the same classified
-/// error: otherwise a silent PING is logged as generic `connection_failed`
-/// and can leak crate timeout text.
+/// error: otherwise a silent PING consumes the first unproven diagnostic as
+/// generic `connection_failed` before Ferrum's admitted bound can publish the
+/// correct class.
 async fn ping_connection(
     conn: &mut impl redis::aio::ConnectionLike,
     probe_timeout: Duration,
