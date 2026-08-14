@@ -21,6 +21,7 @@ use crate::config::types::{
 use crate::health_check::HealthChecker;
 use crate::load_balancer::{
     HashOnStrategy, HealthContext, LoadBalancer, LoadBalancerCache, LoadBalancerCacheInner,
+    RetryCandidateFilter,
 };
 use crate::plugins::{
     BackendAdmissionContext, BackendAdmissionDecision, BackendAdmissionPermit,
@@ -215,22 +216,27 @@ pub(crate) fn direct_http_mesh_transport_refusal(
     }
 }
 
-/// Whether a network-only HTTP dispatch surface must refuse this target.
+/// Whether an H3 frontend can safely dispatch this target over a network
+/// transport it owns (plain, HBONE, or Sidecar mesh-mTLS).
 ///
-/// HTTP/3's native, cross-protocol, and WebSocket backend paths can dial only
-/// network transports. In addition to the secured mesh transports screened by
-/// [`direct_http_mesh_transport_refusal`], they must therefore refuse a
-/// `mesh.unix_socket` target rather than dialing its schema-only loopback
-/// placeholder. Keep this helper scoped to those network-only surfaces: the
-/// H1/H2 proxy has a real Unix-stream dispatch path and must not reject it.
-pub(crate) fn direct_network_http_transport_refusal(
-    target: Option<&UpstreamTarget>,
-) -> Option<&'static str> {
-    direct_http_mesh_transport_refusal(target).or_else(|| {
-        target
-            .is_some_and(crate::proxy::unix_backend::target_is_unix_backend)
-            .then_some("Unix socket dispatch required for this backend target")
-    })
+/// Unix-socket targets remain ineligible because H3 has no Unix dialer
+/// (issue #3620). Mesh-tagged HBONE / Sidecar mTLS targets ARE eligible once
+/// the plain and WebSocket bridges share the H1/H2 mesh egress pools.
+pub(crate) fn h3_dispatch_target_eligible(target: &UpstreamTarget) -> bool {
+    !crate::proxy::unix_backend::target_is_unix_backend(target)
+}
+
+/// Refusal for targets the H3 plain / WebSocket bridges still cannot dispatch
+/// after mesh egress support (issue #3620).
+///
+/// Mesh HBONE and Sidecar mTLS are dispatchable through the shared pools;
+/// only a `mesh.unix_socket` target remains refused (its host/port is a
+/// schema-only loopback placeholder). Native H3 QUIC dispatch uses this same
+/// Unix refusal after forcing mesh-tagged targets onto a bridge.
+pub(crate) fn h3_bridge_transport_refusal(target: Option<&UpstreamTarget>) -> Option<&'static str> {
+    target
+        .is_some_and(crate::proxy::unix_backend::target_is_unix_backend)
+        .then_some("Unix socket dispatch required for this backend target")
 }
 
 /// Select an upstream target for the given proxy using load balancing with
@@ -1447,6 +1453,7 @@ pub(crate) fn resolve_hash_key(
 }
 
 /// Request-derived inputs shared by every retry-target selection path.
+#[derive(Clone, Copy)]
 pub(crate) struct RetryTargetRequest<'a> {
     pub(crate) base_hash_key: &'a str,
     pub(crate) client_ip: &'a str,
@@ -1509,18 +1516,44 @@ pub(crate) fn select_next_retry_target(
     prev_target: &UpstreamTarget,
     request: RetryTargetRequest<'_>,
 ) -> Option<Arc<UpstreamTarget>> {
+    select_next_retry_target_filtered(state, epoch, proxy, prev_target, None, request)
+}
+
+/// Like [`select_next_retry_target`], but additionally requires `eligible` of
+/// every candidate.
+///
+/// Retry-only. `prev_target` still drives per-port lane / hash recomputation
+/// and remains the excluded identity; `eligible` is handed to the load balancer
+/// so it is applied in the SAME bounded pass that builds the candidate lane.
+/// One selection runs regardless of how many pool entries are ineligible.
+/// `None` for `eligible` is identical to [`select_next_retry_target`].
+fn select_next_retry_target_filtered(
+    state: &ProxyState,
+    epoch: &RequestEpoch,
+    proxy: &Proxy,
+    prev_target: &UpstreamTarget,
+    eligible: Option<&dyn Fn(&UpstreamTarget) -> bool>,
+    request: RetryTargetRequest<'_>,
+) -> Option<Arc<UpstreamTarget>> {
     let upstream_id = proxy.upstream_id.as_deref()?;
 
     // Configured selection identity for exclusion — not the dial clone.
-    let exclude_target = LoadBalancerCache::configured_sticky_identity_target_from(
+    let primary_exclude = LoadBalancerCache::configured_sticky_identity_target_from(
         &epoch.load_balancer,
         &proxy.namespace,
         upstream_id,
         prev_target,
     );
 
+    // Stack-only: a borrowed exclude plus an optional borrowed predicate. No
+    // heap allocation on the ordinary single-exclusion retry path.
+    let filter = match eligible {
+        Some(eligible) => RetryCandidateFilter::excluding_eligible(primary_exclude, eligible),
+        None => RetryCandidateFilter::excluding(primary_exclude),
+    };
+
     let retry_override_port =
-        crate::proxy::retry_port_override_dispatch_port(proxy, exclude_target).filter(|port| {
+        crate::proxy::retry_port_override_dispatch_port(proxy, primary_exclude).filter(|port| {
             LoadBalancerCache::has_port_override_state_from(
                 &epoch.load_balancer,
                 &proxy.namespace,
@@ -1566,50 +1599,104 @@ pub(crate) fn select_next_retry_target(
 
     let selected = if let Some(subset_name) = proxy.upstream_subset.as_deref() {
         if let Some(port) = retry_override_port {
-            LoadBalancerCache::select_next_target_for_port_subset_from(
+            LoadBalancerCache::select_next_target_for_port_subset_filtered_from(
                 &epoch.load_balancer,
                 &proxy.namespace,
                 upstream_id,
                 retry_key,
                 port,
                 subset_name,
-                exclude_target,
+                filter,
                 Some(&health_ctx),
             )
         } else {
-            LoadBalancerCache::select_next_target_subset_from(
+            LoadBalancerCache::select_next_target_subset_filtered_from(
                 &epoch.load_balancer,
                 &proxy.namespace,
                 upstream_id,
                 retry_key,
                 subset_name,
-                exclude_target,
+                filter,
                 Some(&health_ctx),
             )
         }
     } else if let Some(port) = retry_override_port {
-        LoadBalancerCache::select_next_target_for_port_from(
+        LoadBalancerCache::select_next_target_for_port_filtered_from(
             &epoch.load_balancer,
             &proxy.namespace,
             upstream_id,
             retry_key,
             port,
-            exclude_target,
+            filter,
             Some(&health_ctx),
         )
     } else {
-        LoadBalancerCache::select_next_target_from(
+        LoadBalancerCache::select_next_target_filtered_from(
             &epoch.load_balancer,
             &proxy.namespace,
             upstream_id,
             retry_key,
-            exclude_target,
+            filter,
             Some(&health_ctx),
         )
     }?;
 
     // Return a DIAL target. Never hand callers a literal wildcard host.
     concretize_retry_dial_target(selected, request.request_authority)
+}
+
+/// Select the next retry dial target that satisfies `is_eligible`.
+///
+/// Shared by the H3→HTTP plain and H3 WebSocket retry paths (issue #3620).
+/// Preserves the ordinary retry contract (LB algorithm, health/ejection,
+/// locality, subset / per-port lanes, per-port `hash_on` recomputation,
+/// wildcard concretization) while excluding the original failed identity.
+///
+/// `is_eligible` is pushed DOWN into load-balancer selection so ineligible
+/// pool entries are dropped in the same bounded pass that already builds the
+/// candidate mask. Exactly one selection runs, costing one scan of the target
+/// lane and no additional allocation, regardless of how many entries are
+/// ineligible. An all-ineligible lane therefore fails closed (`None`)
+/// immediately rather than re-running selection per skipped target.
+///
+/// The predicate sees CONFIGURED pool entries, before wildcard concretization.
+/// That is sound for transport eligibility, which reads only tags / port /
+/// policy lane — fields concretization preserves — and it is what keeps the
+/// filter inside the single selection pass. Do not reintroduce an outer
+/// probe loop with a growing exclusion set: with
+/// [`crate::config::types::MAX_TARGETS_PER_UPSTREAM`] configured targets that
+/// is quadratic work plus a per-probe allocation on a request path.
+pub(crate) fn select_next_eligible_retry_target(
+    state: &ProxyState,
+    epoch: &RequestEpoch,
+    proxy: &Proxy,
+    prev_target: &UpstreamTarget,
+    request: RetryTargetRequest<'_>,
+    is_eligible: &dyn Fn(&UpstreamTarget) -> bool,
+) -> Option<Arc<UpstreamTarget>> {
+    let eligible: Option<&dyn Fn(&UpstreamTarget) -> bool> = Some(is_eligible);
+    select_next_retry_target_filtered(state, epoch, proxy, prev_target, eligible, request)
+}
+
+/// H3-eligible variant of [`select_next_eligible_retry_target`].
+///
+/// Unix-socket candidates are filtered; mesh HBONE / Sidecar mTLS targets
+/// remain eligible once the plain and WebSocket bridges share those pools.
+pub(crate) fn select_next_h3_eligible_retry_target(
+    state: &ProxyState,
+    epoch: &RequestEpoch,
+    proxy: &Proxy,
+    prev_target: &UpstreamTarget,
+    request: RetryTargetRequest<'_>,
+) -> Option<Arc<UpstreamTarget>> {
+    select_next_eligible_retry_target(
+        state,
+        epoch,
+        proxy,
+        prev_target,
+        request,
+        &h3_dispatch_target_eligible,
+    )
 }
 
 /// Concretize a CONFIGURED retry candidate into a DIAL target.
@@ -1709,7 +1796,7 @@ mod tests {
     }
 
     #[test]
-    fn direct_network_http_transport_refusal_rejects_unix_targets() {
+    fn h3_bridge_transport_refusal_rejects_unix_targets() {
         let unix = target_with_tags(&[(
             crate::proxy::unix_backend::MESH_UNIX_SOCKET_TAG,
             "/run/ferrum/app.sock",
@@ -1720,9 +1807,21 @@ mod tests {
             "the H1/H2 mesh-only guard must leave Unix dispatch to its real socket path"
         );
         assert_eq!(
-            direct_network_http_transport_refusal(Some(&unix)),
+            h3_bridge_transport_refusal(Some(&unix)),
             Some("Unix socket dispatch required for this backend target")
         );
+        assert!(!h3_dispatch_target_eligible(&unix));
+    }
+
+    #[test]
+    fn h3_bridge_transport_refusal_allows_mesh_tagged_targets() {
+        let hbone = target_with_tags(&[(crate::proxy::hbone_pool::HBONE_TARGET_TAG, "true")]);
+        let mtls =
+            target_with_tags(&[(crate::proxy::mesh_mtls_pool::MESH_MTLS_TARGET_TAG, "true")]);
+        assert_eq!(h3_bridge_transport_refusal(Some(&hbone)), None);
+        assert_eq!(h3_bridge_transport_refusal(Some(&mtls)), None);
+        assert!(h3_dispatch_target_eligible(&hbone));
+        assert!(h3_dispatch_target_eligible(&mtls));
     }
 
     #[test]

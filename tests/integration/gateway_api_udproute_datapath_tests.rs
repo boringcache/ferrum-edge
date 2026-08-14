@@ -390,6 +390,7 @@ async fn try_serve_translated_config(
             udp_gso_enabled: false,
             udp_pktinfo_enabled: false,
             mesh_outbound_enforcement: empty_slot(),
+            datagram_client_address: None,
         };
         let join = tokio::spawn(async move {
             let _ = start_udp_listener(cfg).await;
