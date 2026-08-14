@@ -35,6 +35,7 @@ use ferrum_edge::tls::{
     load_frontend_tls_candidate_from_paths,
 };
 use rustls::pki_types::{CertificateDer, UnixTime};
+use rustls::server::danger::ClientCertVerifier;
 
 // The trust registry is process-global and `reset_for_test` clears every scope,
 // so this file shares the sibling suite's lock rather than taking its own.
@@ -187,6 +188,7 @@ fn load_candidate(
         &tls_policy(),
         30,
         crls,
+        None,
     )
     .map(|candidate| candidate.client_trust)
 }
@@ -379,6 +381,99 @@ fn live_verifier_refuses_a_withdrawn_cert_even_if_the_handshake_used_a_stale_sna
     );
 }
 
+/// rustls bakes the client-cert verifier into each `ServerConfig`. A wrapper
+/// around a *stale* inner verifier must still refuse after the accepted
+/// candidate is published, which is what new H1/H3 handshakes actually run
+/// (issue #3857).
+#[test]
+fn live_handshake_wrapper_refuses_after_accepted_withdrawal_even_with_a_stale_inner() {
+    let _guard = isolated_registry();
+    let dir = tempfile::tempdir().expect("tempdir");
+    let pki = build_pki();
+
+    let startup_crls = parse_crls(&pki.crl_pem(&[UNRELATED_SERIAL], 1));
+    let before = load_candidate(dir.path(), &pki, &startup_crls).expect("startup candidate");
+    client_trust::publish_accepted_candidate(
+        ClientTrustScope::ProxyH3,
+        before.material.clone(),
+        before.verifier.clone(),
+    );
+    client_trust::publish_accepted_candidate(
+        ClientTrustScope::ProxyFrontend,
+        before.material.clone(),
+        before.verifier.clone(),
+    );
+    let stale_h3 = client_trust::bind_live_handshake_verifier(
+        ClientTrustScope::ProxyH3,
+        before
+            .verifier
+            .clone()
+            .expect("startup candidate installs a verifier"),
+    );
+    let stale_frontend = client_trust::bind_live_handshake_verifier(
+        ClientTrustScope::ProxyFrontend,
+        before
+            .verifier
+            .clone()
+            .expect("startup candidate installs a verifier"),
+    );
+    assert!(
+        stale_h3
+            .verify_client_cert(&pki.client_cert(), &[], UnixTime::now())
+            .is_ok(),
+        "before withdrawal the live wrapper must still admit through the published verifier"
+    );
+    assert!(
+        stale_frontend
+            .verify_client_cert(&pki.client_cert(), &[], UnixTime::now())
+            .is_ok(),
+        "before withdrawal the H1/H2 wrapper must still admit through the published verifier"
+    );
+
+    let rotated_crls = parse_crls(&pki.crl_pem(&[UNRELATED_SERIAL, pki.client_serial], 2));
+    let after = load_candidate(dir.path(), &pki, &rotated_crls).expect("rotated candidate");
+    assert!(!admits_client(&after, &pki));
+    assert!(
+        client_trust::publish_accepted_candidate(
+            ClientTrustScope::ProxyH3,
+            after.material.clone(),
+            after.verifier.clone(),
+        )
+        .withdrew()
+    );
+    assert!(
+        client_trust::publish_accepted_candidate(
+            ClientTrustScope::ProxyFrontend,
+            after.material,
+            after.verifier,
+        )
+        .withdrew()
+    );
+    assert!(
+        stale_h3
+            .verify_client_cert(&pki.client_cert(), &[], UnixTime::now())
+            .is_err(),
+        "a stale H3 ServerConfig snapshot must consult the live verifier and refuse the revoked cert"
+    );
+    assert!(
+        stale_frontend
+            .verify_client_cert(&pki.client_cert(), &[], UnixTime::now())
+            .is_err(),
+        "a stale H1/H2 ServerConfig snapshot must consult the live verifier and refuse the withdrawn cert"
+    );
+    assert!(
+        !client_trust::armed_handshake_still_trusted(
+            ClientTrustScope::ProxyH3,
+            Some(&[pki.client_cert()])
+        ),
+        "armed admission must also refuse the revoked cert after the accepted withdrawal"
+    );
+    assert!(
+        !client_trust::armed_handshake_still_trusted(ClientTrustScope::ProxyH3, None),
+        "armed admission must fail closed when the handshake exposes no peer certificate"
+    );
+}
+
 /// A malformed later candidate never produces an `AcceptedClientTrust`, so the
 /// H3 reload arm has nothing to install or publish and keeps the last-good
 /// verifier, identity, generation and sessions. mTLS is never downgraded.
@@ -414,6 +509,7 @@ fn a_malformed_later_candidate_retains_the_last_good_trust() {
         &tls_policy(),
         30,
         &rotated_crls,
+        None,
     );
     assert!(
         refused.is_err(),

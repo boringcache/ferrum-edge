@@ -63,11 +63,15 @@
 //! withdrawal can be retired despite already using the new material; the benefit
 //! is that one can never escape the fence.
 //!
-//! A second, independent fail-closed check exists because accept loops spawn
-//! before the handshake, and QUIC `Incoming` objects can pin a `ServerConfig`
-//! snapshot: after TLS completes, a rustls listener re-runs the peer chain
-//! against [`live_peer_still_trusted`]. Generation publication therefore cannot
-//! complete while a reconnect is still being admitted by a stale accepter.
+//! rustls bakes the `ClientCertVerifier` into each `ServerConfig` snapshot, so
+//! swapping a slot or calling `Endpoint::set_server_config` does not rewrite a
+//! TlsAcceptor / QUIC endpoint config already in hand. Every rustls listener
+//! therefore installs [`bind_live_handshake_verifier`]: handshake-time
+//! `verify_client_cert` reads the live published verifier, even when the
+//! `ServerConfig` itself was built under a withdrawn generation. A second,
+//! independent fail-closed check re-runs the peer chain against
+//! [`armed_handshake_still_trusted`] after TLS so a missing peer chain (session
+//! resumption does not re-verify) cannot be served either.
 //!
 //! The registration race is closed the same way, without a lock: a session is
 //! inserted into the domain first and then re-checks the fence. A publication
@@ -105,7 +109,9 @@ use crate::fips::approved::Sha256;
 use arc_swap::ArcSwap;
 use dashmap::DashMap;
 use rustls::pki_types::{CertificateDer, CertificateRevocationListDer, UnixTime};
-use rustls::server::danger::ClientCertVerifier;
+use rustls::client::danger::HandshakeSignatureValid;
+use rustls::server::danger::{ClientCertVerified, ClientCertVerifier};
+use rustls::{DigitallySignedStruct, DistinguishedName, Error, SignatureScheme};
 use tokio_util::sync::{CancellationToken, WaitForCancellationFutureOwned};
 use x509_parser::prelude::{FromDer, X509Certificate};
 
@@ -658,7 +664,10 @@ pub fn current_material(scope: ClientTrustScope) -> Option<ClientTrustMaterial> 
 ///
 /// Returns `true` when the chain is empty (anonymous) or when this scope has
 /// no rustls verifier (DTLS, material-only tests). Returns `false` when the
-/// published verifier refuses the peer — the fail-closed reconnect fence.
+/// published verifier refuses the peer. Armed rustls admission uses
+/// [`armed_handshake_still_trusted`], which fails closed on a missing chain.
+// Introspection / test seam; production admission uses `armed_handshake_*`.
+#[allow(dead_code)]
 pub fn live_peer_still_trusted(
     scope: ClientTrustScope,
     certificates: &[CertificateDer<'_>],
@@ -675,12 +684,149 @@ pub fn live_peer_still_trusted(
 }
 
 /// [`live_peer_still_trusted`] for a chain held as raw DER buffers.
+#[allow(dead_code)]
 pub fn live_peer_der_chain_still_trusted(scope: ClientTrustScope, chain: &[Vec<u8>]) -> bool {
     let certificates: Vec<CertificateDer<'_>> = chain
         .iter()
         .map(|der| CertificateDer::from(der.as_slice()))
         .collect();
     live_peer_still_trusted(scope, &certificates)
+}
+
+/// Fail-closed reconnect fence for an armed rustls handshake.
+///
+/// A missing or empty peer chain is untrusted: TLS session tickets do not
+/// re-run client-certificate verification, and an armed listener must not
+/// serve a reconnect that cannot be checked against the live verifier. A
+/// missing live verifier is likewise untrusted — publication stores the
+/// verifier before the generation becomes observable.
+pub fn armed_handshake_still_trusted(
+    scope: ClientTrustScope,
+    certificates: Option<&[CertificateDer<'_>]>,
+) -> bool {
+    let Some(certificates) = certificates.filter(|certs| !certs.is_empty()) else {
+        return false;
+    };
+    let Some(verifier) = domain(scope).live_verifier.load_full().as_ref().clone() else {
+        return false;
+    };
+    let Some((end_entity, intermediates)) = certificates.split_first() else {
+        return false;
+    };
+    verifier
+        .verify_client_cert(end_entity, intermediates, UnixTime::now())
+        .is_ok()
+}
+
+/// [`armed_handshake_still_trusted`] for a chain held as raw DER buffers.
+pub fn armed_handshake_der_chain_still_trusted(
+    scope: ClientTrustScope,
+    chain: Option<&[Vec<u8>]>,
+) -> bool {
+    let Some(chain) = chain.filter(|certs| !certs.is_empty()) else {
+        return false;
+    };
+    let certificates: Vec<CertificateDer<'_>> = chain
+        .iter()
+        .map(|der| CertificateDer::from(der.as_slice()))
+        .collect();
+    armed_handshake_still_trusted(scope, Some(&certificates))
+}
+
+/// Wrap `inner` so handshake-time rustls verification consults the live
+/// published verifier for `scope`.
+///
+/// rustls stores the `ClientCertVerifier` inside each `ServerConfig`. A
+/// TlsAcceptor or QUIC endpoint that still holds a snapshot built under a
+/// withdrawn generation would otherwise keep admitting the withdrawn
+/// credential. The wrapper is installed **only** at `with_client_cert_verifier`
+/// time; [`AcceptedClientTrust::verifier`](super::AcceptedClientTrust) and
+/// [`publish_accepted_candidate`] keep the inner WebPki object so the live
+/// slot never points at the wrapper itself.
+pub fn bind_live_handshake_verifier(
+    scope: ClientTrustScope,
+    inner: Arc<dyn ClientCertVerifier>,
+) -> Arc<dyn ClientCertVerifier> {
+    Arc::new(LiveHandshakeVerifier { scope, inner })
+}
+
+/// Handshake-time rustls verifier that reads the live published verifier for
+/// `scope` on every `verify_client_cert`. Debug omits the inner verifier so a
+/// `ServerConfig` dump cannot leak trust material.
+struct LiveHandshakeVerifier {
+    scope: ClientTrustScope,
+    inner: Arc<dyn ClientCertVerifier>,
+}
+
+impl LiveHandshakeVerifier {
+    fn active(&self) -> Arc<dyn ClientCertVerifier> {
+        domain(self.scope)
+            .live_verifier
+            .load_full()
+            .as_ref()
+            .clone()
+            .unwrap_or_else(|| self.inner.clone())
+    }
+}
+
+impl std::fmt::Debug for LiveHandshakeVerifier {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LiveHandshakeVerifier")
+            .field("scope", &self.scope.label())
+            .finish()
+    }
+}
+
+impl ClientCertVerifier for LiveHandshakeVerifier {
+    fn root_hint_subjects(&self) -> &[DistinguishedName] {
+        // Must return a reference from `self`. Stale hints are acceptable;
+        // `verify_client_cert` still consults the live verifier.
+        self.inner.root_hint_subjects()
+    }
+
+    fn verify_client_cert(
+        &self,
+        end_entity: &CertificateDer<'_>,
+        intermediates: &[CertificateDer<'_>],
+        now: UnixTime,
+    ) -> Result<ClientCertVerified, Error> {
+        self.active()
+            .verify_client_cert(end_entity, intermediates, now)
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, Error> {
+        self.active().verify_tls12_signature(message, cert, dss)
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, Error> {
+        self.active().verify_tls13_signature(message, cert, dss)
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
+        self.active().supported_verify_schemes()
+    }
+
+    fn client_auth_mandatory(&self) -> bool {
+        self.inner.client_auth_mandatory()
+    }
+
+    fn offer_client_auth(&self) -> bool {
+        self.inner.offer_client_auth()
+    }
+
+    fn requires_raw_public_keys(&self) -> bool {
+        self.inner.requires_raw_public_keys()
+    }
 }
 
 /// Record that a reload candidate for `scope` was refused.

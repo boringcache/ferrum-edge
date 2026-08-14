@@ -1433,8 +1433,7 @@ async fn handle_admin_tls_connection(
     // whole admin connection lifetime below and deregisters on every exit path.
     let peer_certs = tls_stream.get_ref().1.peer_certificates();
     if let Some(admission) = client_trust_admission
-        && let Some(certs) = peer_certs
-        && !crate::tls::client_trust::live_peer_still_trusted(admission.scope(), certs)
+        && !crate::tls::client_trust::armed_handshake_still_trusted(admission.scope(), peer_certs)
     {
         return Err(crate::tls::client_trust::TRUST_WITHDRAWN_REASON.into());
     }

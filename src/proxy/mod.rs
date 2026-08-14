@@ -20539,12 +20539,14 @@ async fn handle_tls_connection(
         .map(|certs| Arc::new(certs[1..].iter().map(|c| c.to_vec()).collect()));
     // Fail-closed live-verifier fence (issue #3857): a handshake that still
     // used a stale `ServerConfig` snapshot must not be served once the
-    // published verifier refuses the peer. Drop before hyper so `establish_h2`
-    // / keep-alive reconnects observe a failed connection, not an authorized
-    // transport.
+    // published verifier refuses the peer. A missing chain on an armed
+    // listener is untrusted. Drop before hyper so `establish_h2` / keep-alive
+    // reconnects observe a failed connection, not an authorized transport.
     if let Some(admission) = client_trust_admission
-        && let Some(certs) = tls_stream.get_ref().1.peer_certificates()
-        && !crate::tls::client_trust::live_peer_still_trusted(admission.scope(), certs)
+        && !crate::tls::client_trust::armed_handshake_still_trusted(
+            admission.scope(),
+            tls_stream.get_ref().1.peer_certificates(),
+        )
     {
         return Err(crate::tls::client_trust::TRUST_WITHDRAWN_REASON.into());
     }

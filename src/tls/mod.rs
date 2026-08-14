@@ -887,6 +887,7 @@ pub fn load_tls_config_with_client_auth_and_ocsp(
         tls_policy,
         cert_expiry_warning_days,
         crls,
+        None,
     )
     .map(|candidate| candidate.config)
 }
@@ -909,6 +910,7 @@ pub fn load_frontend_tls_candidate_from_paths(
     tls_policy: &TlsPolicy,
     cert_expiry_warning_days: u64,
     crls: &[CertificateRevocationListDer<'static>],
+    handshake_scope: Option<client_trust::ClientTrustScope>,
 ) -> Result<FrontendTlsCandidate, anyhow::Error> {
     let cert_source = CertSource::parse(cert_path, MaterialKind::Cert);
     let key_source = CertSource::parse(key_path, MaterialKind::Key);
@@ -926,6 +928,7 @@ pub fn load_frontend_tls_candidate_from_paths(
         tls_policy,
         cert_expiry_warning_days,
         crls,
+        handshake_scope,
     )
 }
 
@@ -981,6 +984,7 @@ pub fn load_tls_config_with_client_auth_from_sources_and_ocsp(
         tls_policy,
         cert_expiry_warning_days,
         crls,
+        None,
     )
     .map(|candidate| candidate.config)
 }
@@ -993,6 +997,9 @@ pub fn load_tls_config_with_client_auth_from_sources_and_ocsp(
 /// publishes `material` cannot describe a generation it is not actually
 /// enforcing. Any consumer that would otherwise re-read the client-CA source or
 /// reuse a startup CRL clone must take both halves from one value of this type.
+/// The captured verifier is the inner WebPki object; rustls `ServerConfig`s
+/// for armed scopes wrap it with [`client_trust::bind_live_handshake_verifier`]
+/// so handshake-time verification reads the live published verifier.
 #[derive(Clone)]
 pub struct AcceptedClientTrust {
     /// The verifier installed for this candidate, or `None` when the surface
@@ -1042,6 +1049,7 @@ pub fn load_frontend_tls_candidate(
     tls_policy: &TlsPolicy,
     cert_expiry_warning_days: u64,
     crls: &[CertificateRevocationListDer<'static>],
+    handshake_scope: Option<client_trust::ClientTrustScope>,
 ) -> Result<FrontendTlsCandidate, anyhow::Error> {
     let cert_material = load_material_blocking(cert_source, MaterialKind::Cert)?;
 
@@ -1097,6 +1105,7 @@ pub fn load_frontend_tls_candidate(
         crls,
         &cert_material.display_source_id,
         &key_source_id,
+        handshake_scope,
         Some(&mut client_trust),
     )?;
     // The capture is unconditional inside the builder, so the only way this is
@@ -1141,6 +1150,7 @@ pub(crate) fn finish_frontend_server_config(
         cert_source_display,
         key_source_display,
         None,
+        None,
     )
 }
 
@@ -1151,9 +1161,12 @@ pub(crate) fn finish_frontend_server_config(
 /// Both halves are derived from the exact client-CA bytes this call loaded and
 /// verified, together with the exact CRL list compiled into the verifier — the
 /// only point where they are known to belong to one accepted generation. The
-/// captured verifier is the very object installed in the returned
-/// `ServerConfig`, so a second listener family (HTTP/3) can adopt it instead of
-/// rebuilding one from an independently re-read source.
+/// captured verifier is the inner WebPki object handed to
+/// `client_trust_out`. When `handshake_scope` is set, the returned
+/// `ServerConfig` installs a live wrapper around that object so a stale
+/// snapshot still consults the published verifier at handshake time. A second
+/// family that adopts the inner verifier (the HTTP/3 endpoint) wraps it for
+/// its own scope instead of rebuilding one from an independently re-read source.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn finish_frontend_server_config_capturing_trust(
     cert_resolver: Arc<dyn rustls::server::ResolvesServerCert>,
@@ -1164,6 +1177,7 @@ pub(crate) fn finish_frontend_server_config_capturing_trust(
     crls: &[CertificateRevocationListDer<'static>],
     cert_source_display: &str,
     key_source_display: &str,
+    handshake_scope: Option<client_trust::ClientTrustScope>,
     client_trust_out: Option<&mut Option<AcceptedClientTrust>>,
 ) -> Result<Arc<ServerConfig>, anyhow::Error> {
     let builder = ServerConfig::builder_with_provider(tls_policy.crypto_provider.clone())
@@ -1265,8 +1279,12 @@ pub(crate) fn finish_frontend_server_config_capturing_trust(
             .with_no_client_auth()
             .with_cert_resolver(cert_resolver)
     } else if let Some(client_cert_verifier) = client_cert_verifier {
+        let installed = match handshake_scope {
+            Some(scope) => client_trust::bind_live_handshake_verifier(scope, client_cert_verifier),
+            None => client_cert_verifier,
+        };
         builder
-            .with_client_cert_verifier(client_cert_verifier)
+            .with_client_cert_verifier(installed)
             .with_cert_resolver(cert_resolver)
     } else {
         // No client certificate verification

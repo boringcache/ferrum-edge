@@ -272,6 +272,7 @@ fn build_proxy_rebuild_fn(
             &policy,
             warning_days,
             &active_crls,
+            Some(ClientTrustScope::ProxyFrontend),
         )?;
         let mut config = candidate.config;
         // Reapply the proxy-frontend-specific opt-ins so rotated configs
@@ -501,6 +502,7 @@ fn build_admin_rebuild_fn(
             &policy,
             warning_days,
             &active_crls,
+            Some(ClientTrustScope::AdminHttps),
         )?;
         Ok(FrontendTlsRebuilt {
             config: candidate.config,

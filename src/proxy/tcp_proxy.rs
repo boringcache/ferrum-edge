@@ -4037,10 +4037,9 @@ async fn handle_tcp_connection_inner(
                 .collect::<Vec<Vec<u8>>>()
         });
         if let Some(admission) = client_trust_admission
-            && let Some(chain) = peer_chain_der.as_ref()
-            && !crate::tls::client_trust::live_peer_der_chain_still_trusted(
+            && !crate::tls::client_trust::armed_handshake_der_chain_still_trusted(
                 admission.scope(),
-                chain,
+                peer_chain_der.as_deref(),
             )
         {
             return Err(anyhow::anyhow!(

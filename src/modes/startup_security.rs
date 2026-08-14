@@ -313,6 +313,7 @@ pub fn try_load_frontend_tls_candidate(
         tls_policy,
         env_config.tls_cert_expiry_warning_days,
         crls,
+        Some(tls::ClientTrustScope::ProxyFrontend),
     )
     .map(Some)
     .map_err(|e| anyhow::anyhow!("Invalid TLS configuration: {}", e))
@@ -377,6 +378,7 @@ pub fn load_admin_tls_candidate(
         tls_policy,
         env_config.tls_cert_expiry_warning_days,
         crls,
+        Some(tls::ClientTrustScope::AdminHttps),
     )
     .map_err(|e| anyhow::anyhow!("{}: {}", error_label, e))
 }
