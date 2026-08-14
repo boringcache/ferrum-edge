@@ -5189,18 +5189,28 @@ run_node_waypoint_udp_same_port_demux_checks() {
 
   restarts_before="$(ambient_restart_total)"
   kubectl -n "$WORKLOAD_NS" delete svc udp-demux-a --wait=true --timeout=60s
+  # Convergence polls use a dedicated payload so pre-convergence datagrams that
+  # still reach backend A cannot pollute the post-convergence backend evidence.
   if ! reply="$(wait_for_udp_outcome_on refuse "" \
-    "$WORKLOAD_NS" udp-src-a "$ip_a" "$DEMUX_UDP_PORT" demux-retract-a 40)"; then
+    "$WORKLOAD_NS" udp-src-a "$ip_a" "$DEMUX_UDP_PORT" demux-retract-converge-a 40)"; then
     record_live_assertion node_waypoint.udp.same_port_demux_retract_a_keeps_b fail \
       udp-src-a udp-demux-a "ClusterIP A still answered after Service delete observed=$reply" \
       "$(spiffe_for_sa src-a)" "$(spiffe_for_sa dst-a)" "node-waypoint-udp-same-port-demux"
     collect_traffic_failure_diagnostics
     return 1
   fi
-  hits_a="$(udp_backend_received "$WORKLOAD_NS" udp-demux-a demux-retract-a)"
+  reply="$(udp_probe_from "$WORKLOAD_NS" udp-src-a "$ip_a" "$DEMUX_UDP_PORT" demux-retract-proof-a 2)"
+  if [[ "$reply" != "TIMEOUT" ]]; then
+    record_live_assertion node_waypoint.udp.same_port_demux_retract_a_keeps_b fail \
+      udp-src-a udp-demux-a "ClusterIP A still answered after convergence observed=$reply" \
+      "$(spiffe_for_sa src-a)" "$(spiffe_for_sa dst-a)" "node-waypoint-udp-same-port-demux"
+    collect_traffic_failure_diagnostics
+    return 1
+  fi
+  hits_a="$(udp_backend_received "$WORKLOAD_NS" udp-demux-a demux-retract-proof-a)"
   if [[ "$hits_a" != "0" ]]; then
     record_live_assertion node_waypoint.udp.same_port_demux_retract_a_keeps_b fail \
-      udp-src-a udp-demux-a "backend A still received demux-retract-a after Service delete" \
+      udp-src-a udp-demux-a "backend A still received demux-retract-proof-a after Service delete" \
       "$(spiffe_for_sa src-a)" "$(spiffe_for_sa dst-a)" "node-waypoint-udp-same-port-demux"
     collect_traffic_failure_diagnostics
     return 1

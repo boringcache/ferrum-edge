@@ -150,9 +150,10 @@ backend hit cannot pass.
 - `node_waypoint.udp.same_port_demux_shared_client_tuple` — one bound client
   socket addresses both ClusterIPs without session/pending collision.
 - `node_waypoint.udp.same_port_demux_retract_a_keeps_b` — deleting Service A
-  retracts A (saved ClusterIP times out, backend A logs nothing for the retract
-  payload) while B continues serving, still isolated, with the ambient restart
-  count unchanged.
+  retracts A (convergence polls time out on a dedicated probe payload; a fresh
+  post-convergence proof payload also times out and backend A logs nothing for
+  it) while B continues serving, still isolated, with the ambient restart count
+  unchanged.
 
 IPv6 same-port UDP is not claimed here: stream listeners bind `0.0.0.0` by
 default, and IPv6 Service steering remains a documented residual.
