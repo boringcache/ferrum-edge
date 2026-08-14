@@ -6831,6 +6831,8 @@ impl UdpAuthorizationSessionProbe {
             bytes_sent: AtomicU64::new(0),
             bytes_received: AtomicU64::new(0),
             last_request_size: AtomicU64::new(0),
+            response_budget_remaining: AtomicU64::new(0),
+            amplification_factor: None,
             backend_target: backend_addr.to_string(),
             backend_resolved_ip: backend_addr.ip().to_string(),
             sni_hostname: None,
