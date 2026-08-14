@@ -3046,12 +3046,8 @@ async fn node_waypoint_udp_retract_a_keeps_shared_listener_and_b_route() {
     let namespace = ferrum_edge::config::types::default_namespace();
     let expected_b = NamespacedResourceId::new(
         namespace.clone(),
-        ferrum_edge::modes::mesh::node_waypoint_udp_proxy_id(
-            &namespace,
-            "udp-demux-b",
-            port,
-        )
-        .expect("test service names are admitted Kubernetes identities"),
+        ferrum_edge::modes::mesh::node_waypoint_udp_proxy_id(&namespace, "udp-demux-b", port)
+            .expect("test service names are admitted Kubernetes identities"),
     );
     assert_eq!(
         owners_after_table,
