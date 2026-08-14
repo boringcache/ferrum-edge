@@ -184,8 +184,10 @@ Unlimited. Listener and parentRef order cannot weaken that boundary.
 
 Runtime accounting is **cumulative per admitted client request**. Several
 backend replies that are each under `request_size × factor` still fail closed
-once their sum exceeds the remaining budget. The budget is stored on the UDP
-session, so weighted multi-backend selection cannot reset or multiply it.
+once their sum exceeds the remaining budget. A zero-length response consumes
+one unit of remaining budget (payload bytes are charged exactly when nonempty)
+so packet count stays finite under a finite factor. The budget is stored on the
+UDP session, so weighted multi-backend selection cannot reset or multiply it.
 Idle cleanup and listener/route deletion tear the session map down with the
 existing idle-timeout path; no extra maps keyed by client or route are added.
 

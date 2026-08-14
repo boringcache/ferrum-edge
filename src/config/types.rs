@@ -2713,11 +2713,13 @@ pub struct Proxy {
     #[serde(default = "default_udp_idle_timeout")]
     pub udp_idle_timeout_seconds: u64,
     /// Maximum allowed response amplification factor for UDP proxies.
-    /// When set, backend→client datagrams share one remaining byte budget per
-    /// admitted client request (`payload_size * factor`, cumulative across
-    /// replies). A zero-length request receives a one-byte reply allowance so
-    /// it cannot black-hole the session; nonempty requests retain the exact
-    /// configured payload ratio. `None` (default for hand-authored proxies) =
+    /// When set, backend→client datagrams share one remaining payload-byte
+    /// budget per admitted client request (`payload_size * factor`, cumulative
+    /// across replies). A zero-length request receives a one-byte reply
+    /// allowance so it cannot black-hole the session; nonempty requests retain
+    /// the exact configured payload ratio. Every response datagram consumes at
+    /// least one unit of remaining budget, so a zero-length reply cannot
+    /// bypass a finite factor. `None` (default for hand-authored proxies) =
     /// no limit. Gateway API `UDPRoute` translation never leaves this unset:
     /// it projects a finite controller default unless an explicit unsafe
     /// override is attached.

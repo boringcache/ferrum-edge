@@ -1,16 +1,20 @@
 //! UDP response-amplification budget and fixed-cardinality observability.
 //!
 //! Accounting is **cumulative per admitted client request**: every backend
-//! response datagram charges the same remaining byte budget until the next
-//! policy-admitted client datagram resets it. A per-datagram size check is not
-//! sufficient — several in-budget replies to one small request would otherwise
-//! amplify without bound.
+//! response datagram charges the same remaining payload-byte budget until the
+//! next policy-admitted client datagram resets it. A per-datagram size check
+//! is not sufficient — several in-budget replies to one small request would
+//! otherwise amplify without bound. A zero-length response still consumes one
+//! unit of remaining budget so a finite factor cannot admit an unbounded
+//! packet count.
 //!
 //! Metrics are process-wide and unlabeled except for the Prometheus plugin's
 //! own gateway-namespace series. They never carry route, backend, source,
 //! factor, or error-text labels.
 
 use std::sync::atomic::{AtomicU64, Ordering};
+
+use crossbeam_utils::CachePadded;
 
 /// Finite controller default projected onto every Gateway API `UDPRoute`
 /// listener that has no more specific valid policy.
@@ -30,10 +34,12 @@ pub const UDP_AMPLIFICATION_POLICY_KIND: &str = "UDPResponseAmplificationPolicy"
 /// Plural resource name.
 pub const UDP_AMPLIFICATION_POLICY_PLURAL: &str = "udpresponseamplificationpolicies";
 
-static RESPONSES_ALLOWED: AtomicU64 = AtomicU64::new(0);
-static RESPONSES_DROPPED: AtomicU64 = AtomicU64::new(0);
-static POLICY_INVALID: AtomicU64 = AtomicU64::new(0);
-static POLICY_UNLIMITED: AtomicU64 = AtomicU64::new(0);
+/// Independently cache-line padded so allowed/drop/policy counters do not
+/// false-share on the UDP response path.
+static RESPONSES_ALLOWED: CachePadded<AtomicU64> = CachePadded::new(AtomicU64::new(0));
+static RESPONSES_DROPPED: CachePadded<AtomicU64> = CachePadded::new(AtomicU64::new(0));
+static POLICY_INVALID: CachePadded<AtomicU64> = CachePadded::new(AtomicU64::new(0));
+static POLICY_UNLIMITED: CachePadded<AtomicU64> = CachePadded::new(AtomicU64::new(0));
 
 /// Snapshot of the unlabeled amplification counters.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -110,17 +116,22 @@ pub fn publish_request_budget(remaining: &AtomicU64, request_size: u64, factor: 
 
 /// Atomically charge `bytes` against a remaining per-request response budget.
 ///
-/// Returns `true` when the datagram is admitted. Several in-budget datagrams
-/// still fail closed once their cumulative size exceeds the request budget.
+/// Nonempty datagrams charge their payload size exactly. A zero-length
+/// datagram still consumes one unit so a finite budget cannot admit an
+/// unbounded number of empty replies. Returns `true` when the datagram is
+/// admitted. The check is fail-closed: insufficient remaining refuses without
+/// partial consumption. Several in-budget datagrams still fail closed once
+/// their cumulative charge exceeds the request budget.
 pub fn charge_response_budget(remaining: &AtomicU64, bytes: u64) -> bool {
+    let charge = bytes.max(1);
     loop {
         let current = remaining.load(Ordering::Acquire);
-        if current < bytes {
+        if current < charge {
             return false;
         }
         match remaining.compare_exchange_weak(
             current,
-            current - bytes,
+            current - charge,
             Ordering::AcqRel,
             Ordering::Acquire,
         ) {

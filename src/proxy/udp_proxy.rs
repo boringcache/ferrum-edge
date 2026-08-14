@@ -57,8 +57,9 @@ fn udp_client_log_addr(client_addr: SocketAddr) -> SocketAddr {
 
 /// Admit one backend→client datagram against the session's remaining
 /// per-request amplification budget. Unlimited proxies (`factor == None`) skip
-/// the check. Drops are rate-limited and never log client addresses, sizes,
-/// factors, or payload.
+/// the check. Empty responses still consume one unit of remaining budget
+/// (plain UDP, DTLS, and batched paths share this helper). Drops are
+/// rate-limited and never log client addresses, sizes, factors, or payload.
 fn admit_udp_response(
     remaining: &AtomicU64,
     factor: Option<f32>,

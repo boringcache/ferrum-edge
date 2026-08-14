@@ -57,3 +57,38 @@ fn oversize_datagram_does_not_partially_consume_budget() {
     assert!(charge_response_budget(&remaining, 100));
     assert_eq!(remaining.load(Ordering::Acquire), 0);
 }
+
+#[test]
+fn finite_budget_admits_only_a_finite_number_of_zero_length_responses() {
+    let remaining = AtomicU64::new(3);
+    assert!(charge_response_budget(&remaining, 0));
+    assert!(charge_response_budget(&remaining, 0));
+    assert!(charge_response_budget(&remaining, 0));
+    assert!(!charge_response_budget(&remaining, 0));
+    assert_eq!(remaining.load(Ordering::Acquire), 0);
+}
+
+#[test]
+fn zero_remaining_budget_refuses_a_zero_length_response() {
+    let remaining = AtomicU64::new(0);
+    assert!(!charge_response_budget(&remaining, 0));
+    assert_eq!(remaining.load(Ordering::Acquire), 0);
+}
+
+#[test]
+fn zero_length_request_allowance_admits_one_empty_response() {
+    let remaining = AtomicU64::new(udp_amplification_response_budget(0, 8.0));
+    assert_eq!(remaining.load(Ordering::Acquire), 1);
+    assert!(charge_response_budget(&remaining, 0));
+    assert!(!charge_response_budget(&remaining, 0));
+    assert_eq!(remaining.load(Ordering::Acquire), 0);
+}
+
+#[test]
+fn nonempty_response_still_charges_exact_payload_bytes() {
+    let remaining = AtomicU64::new(10);
+    assert!(charge_response_budget(&remaining, 4));
+    assert_eq!(remaining.load(Ordering::Acquire), 6);
+    assert!(charge_response_budget(&remaining, 6));
+    assert_eq!(remaining.load(Ordering::Acquire), 0);
+}
