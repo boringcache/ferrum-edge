@@ -12,7 +12,6 @@ import argparse
 import json
 import os
 import re
-import subprocess
 import sys
 import time
 from pathlib import Path
@@ -140,34 +139,6 @@ def cmd_end(args: argparse.Namespace) -> int:
     )
     save_state(path, data)
     return 0
-
-
-def cmd_run(args: argparse.Namespace) -> int:
-    name = require_name(args.phase, "phase")
-    if not args.command:
-        raise SystemExit("run requires a command after --")
-    cmd_start(argparse.Namespace(phase=name))
-    started = time.monotonic()
-    try:
-        completed = subprocess.run(args.command, check=False)
-        status = int(completed.returncode)
-    except OSError:
-        status = 127
-    duration = max(0.0, time.monotonic() - started)
-    path = state_path()
-    data = load_state(path)
-    data.setdefault("starts", {}).pop(name, None)
-    if len(data["phases"]) >= MAX_PHASES:
-        raise SystemExit("too many telemetry phases")
-    data["phases"].append(
-        {
-            "name": name,
-            "seconds": round(duration, 1),
-            "status": status,
-        }
-    )
-    save_state(path, data)
-    return status
 
 
 def parse_cache_hit(raw: str | None) -> bool | None:
@@ -611,11 +582,6 @@ def main() -> int:
     end.add_argument("--status", type=int, default=0)
     end.set_defaults(func=cmd_end)
 
-    run = sub.add_parser("run")
-    run.add_argument("--phase", required=True)
-    run.add_argument("command", nargs=argparse.REMAINDER)
-    run.set_defaults(func=cmd_run)
-
     cache = sub.add_parser("cache")
     cache.add_argument("--name", required=True)
     cache.add_argument("--hit", default="")
@@ -643,8 +609,6 @@ def main() -> int:
     test.set_defaults(func=lambda _args: self_test())
 
     args = parser.parse_args()
-    if args.command_name == "run" and args.command and args.command[0] == "--":
-        args.command = args.command[1:]
     return int(args.func(args))
 
 
