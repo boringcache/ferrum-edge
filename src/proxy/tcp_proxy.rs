@@ -3470,6 +3470,24 @@ async fn handle_tcp_connection_inner(
             .server_name()
             .map(str::to_ascii_lowercase);
 
+        // Register immediately after the handshake exposes its verified peer
+        // certificate, before decrypted first-byte inspection or stream-connect
+        // plugins can admit work. Registration re-checks a withdrawal that
+        // raced the handshake; fail that already-retired admission here rather
+        // than letting it reach policy evaluation or backend selection.
+        let client_trust_guard = client_trust_admission
+            .and_then(|admission| admission.register(stream_ctx.tls_client_cert_der.is_some()));
+        if let Some(session) = client_trust_guard
+            .as_ref()
+            .map(|guard| guard.session())
+            && session.is_retired()
+        {
+            session.record_fenced();
+            return Err(anyhow::anyhow!(
+                "frontend client-certificate trust withdrawn during TLS admission"
+            ));
+        }
+
         // Mark the connection as TLS-terminated for any first-bytes-aware
         // plugin, even when we don't read application bytes below. This lets a
         // transport-shape guard like `tcp_require_tls` recognize the stream as
@@ -3510,16 +3528,28 @@ async fn handle_tcp_connection_inner(
             .await?;
         }
 
-        // Register the established TCP+TLS transport against the frontend
-        // client-trust domain and wrap the client leg so a withdrawal surfaces
-        // as an ordinary client-side transport failure (issue #3857). Routing it
-        // through the relay's own error path means byte counters, first-failure
-        // attribution, circuit-breaker classification, `on_stream_disconnect`,
-        // and the stream summary all complete exactly once through paths that
-        // already exist. A connection with no verified client certificate
-        // registers nothing and the wrapper is a pass-through.
-        let client_trust_guard = client_trust_admission
-            .and_then(|admission| admission.register(stream_ctx.tls_client_cert_der.is_some()));
+        // A withdrawal may have landed while bounded first-byte inspection or
+        // stream-connect policy was running. Fence once more before returning
+        // to backend selection; the relay wrapper below handles every later
+        // withdrawal for the established session.
+        if let Some(session) = client_trust_guard
+            .as_ref()
+            .map(|guard| guard.session())
+            && session.is_retired()
+        {
+            session.record_fenced();
+            return Err(anyhow::anyhow!(
+                "frontend client-certificate trust withdrawn during TLS admission"
+            ));
+        }
+
+        // Wrap the client leg so a withdrawal surfaces as an ordinary
+        // client-side transport failure (issue #3857). Routing it through the
+        // relay's own error path means byte counters, first-failure attribution,
+        // circuit-breaker classification, `on_stream_disconnect`, and the
+        // stream summary all complete exactly once through paths that already
+        // exist. A connection with no verified client certificate registered
+        // nothing above, so the wrapper is a pass-through.
         let fenced = crate::tls::TrustFencedStream::new(
             tls_stream,
             client_trust_guard.as_ref().map(|guard| guard.session()),

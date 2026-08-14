@@ -1774,6 +1774,19 @@ impl DtlsServer {
                                 );
                                 return;
                             }
+                            // Close the interval between certificate-chain
+                            // validation and connection delivery. A withdrawal
+                            // that lands after registration but before this
+                            // `Connected` output must fence the session before
+                            // the proxy can observe it through `accept()`.
+                            if let Some(session) = client_trust_guard
+                                .as_ref()
+                                .map(|guard| guard.session())
+                                && session.is_retired()
+                            {
+                                session.record_fenced();
+                                return;
+                            }
                             // Deliver accepted connection (take app_out_rx — only happens once)
                             let Some(rx) = app_out_rx.take() else {
                                 continue; // Already connected — should not happen
@@ -1818,6 +1831,19 @@ impl DtlsServer {
                                 if client_trust_guard.is_none() {
                                     client_trust_guard = client_trust_admission
                                         .and_then(|admission| admission.register(true));
+                                }
+                                // Registration re-checks the withdrawal fence after
+                                // inserting this session. If that re-check retired us,
+                                // stop inside the handshake drain rather than waiting
+                                // for the outer select to poll the cancellation arm: an
+                                // already-fenced session must never reach `accept()`.
+                                if let Some(session) = client_trust_guard
+                                    .as_ref()
+                                    .map(|guard| guard.session())
+                                    && session.is_retired()
+                                {
+                                    session.record_fenced();
+                                    return;
                                 }
                             }
                             peer_cert_chain_der =
