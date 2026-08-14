@@ -15388,10 +15388,7 @@ async fn send_h3_aggregate_sse_response(
         }
         false
     };
-    let composed_deadline_fired = match tokio::time::timeout_at(deadline, pump).await {
-        Ok(fired) => fired,
-        Err(_) => true,
-    };
+    let composed_deadline_fired = tokio::time::timeout_at(deadline, pump).await.unwrap_or(true);
     // Release the listener slot before the QUIC stream teardown so a client
     // that reconnects immediately is never refused by its own stale lease.
     drop(body);
