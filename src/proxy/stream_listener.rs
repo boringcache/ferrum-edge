@@ -1633,8 +1633,7 @@ impl StreamListenerManager {
         // a session that reads the new generation provably snapshotted the new
         // verifier. Static DTLS and a generation with no client-certificate
         // verification leave this scope unarmed and publish no trust identity.
-        if client_trust_reload_enabled
-            && let Some(material) = accepted.config.client_trust.clone()
+        if client_trust_reload_enabled && let Some(material) = accepted.config.client_trust.clone()
         {
             let publication = crate::tls::client_trust::publish_accepted_material(
                 crate::tls::ClientTrustScope::FrontendDtls,

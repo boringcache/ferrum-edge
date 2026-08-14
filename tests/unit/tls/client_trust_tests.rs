@@ -352,10 +352,7 @@ fn outside_bundle_crl_signers_with_the_same_aki_remain_distinct() {
     );
 
     let before = material(&[&trusted.cert_pem], &[&first_crl]);
-    let after = material(
-        &[&trusted.cert_pem],
-        &[&reissued_first, &second_crl],
-    );
+    let after = material(&[&trusted.cert_pem], &[&reissued_first, &second_crl]);
     assert_eq!(
         after.withdrawal_relative_to(&before),
         Some(ClientTrustRetirementReason::CrlChanged),
