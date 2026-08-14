@@ -1610,9 +1610,51 @@ pub(crate) struct ConnectUdpRequest {
     pub(crate) route_overrides_applied: bool,
 }
 
-/// RFC 9298 entry point, called from `handle_h3_request` once routing,
-/// authentication, authorization, admission, and the `before_proxy` plugin
-/// phase have all run.
+/// One CONNECT-UDP handler future, heap-allocated so it is not a frame slot in
+/// `handle_h3_request`. See [`boxed_handle_h3_connect_udp`].
+type BoxedConnectUdpHandlerFuture =
+    std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), anyhow::Error>> + Send>>;
+
+/// The RFC 9298 handler, CONSTRUCTED OUT OF LINE and returned boxed.
+///
+/// This indirection is a stack-budget invariant, not a style choice (the same
+/// one issue #3764 established for `boxed_proxy_to_backend_unix`, and the
+/// same H3-plain trampoline `boxed_proxy_to_backend_mesh_mtls` uses).
+/// `handle_h3_request` is THE generic HTTP/3 request future every H3 stream
+/// is polled through — Plain, gRPC, WebSocket, and CONNECT-UDP. An
+/// unoptimized hosted functional-test build (`opt-level = 0`) gives every
+/// future it awaits inline a fixed `alloca` in that one poll frame, charged
+/// to every request, branch taken or not. `handle_h3_connect_udp` owns
+/// precommit authorization, the capsule relay, and bounded abort/join
+/// teardown, so awaiting it inline made ordinary H3 Plain over ambient
+/// HBONE construct a CONNECT-UDP-sized state machine under the already-large
+/// `dispatch_plain` / mesh frames and overflow a 2 MiB Tokio worker.
+///
+/// A bare `Box::pin(handle_h3_connect_udp(..))` still materializes that
+/// future as a stack temporary in this factory. Under `handle_h3_request`
+/// that factory already sits on a deep `opt-level = 0` poll stack, so
+/// constructing the concrete CONNECT-UDP state machine there can overflow
+/// before the first await. The thin `async move` trampoline is what this
+/// factory boxes: its frame is only the captured arguments. The handler
+/// future is built later, when that heap-resident trampoline is polled,
+/// after `handle_h3_request` has stored only a pointer. The allocation is
+/// confined to a request that has already been classified as CONNECT-UDP.
+/// Do not fold this back into `handle_h3_request` without re-measuring that
+/// generic future's stack frame.
+#[inline(never)]
+pub(crate) fn boxed_handle_h3_connect_udp(
+    stream: RequestStream<h3_quinn::BidiStream<Bytes>, Bytes>,
+    request: ConnectUdpRequest,
+) -> BoxedConnectUdpHandlerFuture {
+    Box::pin(async move {
+        handle_h3_connect_udp(stream, request).await
+    })
+}
+
+/// RFC 9298 entry point, called from `handle_h3_request` through
+/// [`boxed_handle_h3_connect_udp`] once routing, authentication,
+/// authorization, admission, and the `before_proxy` plugin phase have all
+/// run.
 pub(crate) async fn handle_h3_connect_udp(
     mut stream: RequestStream<h3_quinn::BidiStream<Bytes>, Bytes>,
     request: ConnectUdpRequest,

@@ -2470,7 +2470,7 @@ fn handle_h3_request_rejects_connect_udp_in_early_data_before_routing() {
         .find("letbackend_resolved_ip=ifis_connect_udp_request{None}else{")
         .expect("CONNECT-UDP must skip the ordinary-backend DNS lookup");
     let tunnel = squeezed
-        .find("crate::http3::connect_udp::handle_h3_connect_udp(")
+        .find("crate::http3::connect_udp::boxed_handle_h3_connect_udp(")
         .expect("CONNECT-UDP dispatch must remain present");
 
     let arm = &squeezed[connect_udp_425..profile_501];
@@ -2528,7 +2528,7 @@ fn handle_h3_request_skips_ordinary_backend_dns_for_connect_udp() {
         .find("state.dns_cache.resolve(")
         .expect("ordinary H3 dispatch must still resolve the selected backend");
     let tunnel = squeezed
-        .find("crate::http3::connect_udp::handle_h3_connect_udp(")
+        .find("crate::http3::connect_udp::boxed_handle_h3_connect_udp(")
         .expect("CONNECT-UDP dispatch must remain present");
     assert!(
         skip < tunnel,
@@ -2537,6 +2537,42 @@ fn handle_h3_request_skips_ordinary_backend_dns_for_connect_udp() {
     assert!(
         skip + resolve < tunnel,
         "the ordinary resolve must remain in the else-arm, not run for CONNECT-UDP"
+    );
+}
+
+#[test]
+fn handle_h3_request_boxes_connect_udp_off_the_generic_h3_poll_frame() {
+    // Stack-budget invariant: `handle_h3_request` is polled for every H3
+    // stream, including ordinary Plain over ambient HBONE. Awaiting
+    // `handle_h3_connect_udp` inline charges that capsule-relay future to
+    // every request. The never-inlined trampoline must be the only dispatch
+    // from the generic handler.
+    let handler = handle_h3_request_source();
+    assert!(
+        handler.contains("crate::http3::connect_udp::boxed_handle_h3_connect_udp("),
+        "CONNECT-UDP must leave handle_h3_request through the boxed factory"
+    );
+    assert!(
+        !handler.contains("crate::http3::connect_udp::handle_h3_connect_udp("),
+        "handle_h3_request must not materialize handle_h3_connect_udp in its poll frame"
+    );
+
+    let src = include_str!("../../../src/http3/connect_udp.rs");
+    let factory = src
+        .split("pub(crate) fn boxed_handle_h3_connect_udp(")
+        .nth(1)
+        .expect("boxed_handle_h3_connect_udp must exist")
+        .split("pub(crate) async fn handle_h3_connect_udp(")
+        .next()
+        .expect("boxed factory must precede handle_h3_connect_udp");
+    assert!(
+        src.contains("#[inline(never)]\npub(crate) fn boxed_handle_h3_connect_udp("),
+        "the CONNECT-UDP factory must be a never-inlined leaf"
+    );
+    let squeezed_factory = squeeze(factory);
+    assert!(
+        squeezed_factory.contains("Box::pin(asyncmove{handle_h3_connect_udp(stream,request).await})"),
+        "the factory must box a trampoline, not construct handle_h3_connect_udp in its own frame"
     );
 }
 

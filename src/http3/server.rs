@@ -5305,7 +5305,11 @@ async fn handle_h3_request(
         // Omitting that (or another effective override field) would let a
         // reload re-authorize the tunnel against the unoverridden base route.
         let route_overrides_applied = ctx.has_route_overrides();
-        return crate::http3::connect_udp::handle_h3_connect_udp(
+        // Boxed out of line — see `boxed_handle_h3_connect_udp`. A bare
+        // `.await` of `handle_h3_connect_udp` here still materializes the
+        // capsule-relay future into `handle_h3_request`'s poll frame and is
+        // charged to every H3 request, including ordinary Plain over HBONE.
+        return crate::http3::connect_udp::boxed_handle_h3_connect_udp(
             stream,
             crate::http3::connect_udp::ConnectUdpRequest {
                 state,
