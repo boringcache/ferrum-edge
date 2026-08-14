@@ -914,10 +914,20 @@ fn udp_service(
     protocol: AppProtocol,
     workloads: &[&Workload],
 ) -> MeshService {
+    udp_service_in(DEFAULT_NAMESPACE, name, port, protocol, workloads)
+}
+
+fn udp_service_in(
+    namespace: &str,
+    name: &str,
+    port: u16,
+    protocol: AppProtocol,
+    workloads: &[&Workload],
+) -> MeshService {
     MeshService {
         cluster_ips: vec!["10.96.0.10".to_string()],
         name: name.to_string(),
-        namespace: DEFAULT_NAMESPACE.to_string(),
+        namespace: namespace.to_string(),
         ports: vec![ServicePort {
             port,
             protocol,
@@ -933,6 +943,16 @@ fn udp_service(
         protocol_overrides: HashMap::new(),
         uid: None,
     }
+}
+
+fn nw_udp_proxy_id(namespace: &str, name: &str, port: u16) -> String {
+    node_waypoint_udp_proxy_id(namespace, name, port)
+        .expect("test identities are admitted Kubernetes namespace/service names")
+}
+
+fn nw_udp_upstream_id(namespace: &str, name: &str, port: u16) -> String {
+    node_waypoint_udp_upstream_id(namespace, name, port)
+        .expect("test identities are admitted Kubernetes namespace/service names")
 }
 
 fn node_waypoint_runtime() -> MeshRuntimeConfig {
@@ -990,7 +1010,7 @@ fn a_udp_service_port_materializes_a_node_waypoint_datagram_listener() {
     let proxy = listeners[0];
     assert_eq!(
         proxy.id,
-        node_waypoint_udp_proxy_id(DEFAULT_NAMESPACE, "dns", 5353)
+        nw_udp_proxy_id(DEFAULT_NAMESPACE, "dns", 5353)
     );
     assert_eq!(proxy.listen_port, Some(5353));
     assert_eq!(
@@ -1012,7 +1032,7 @@ fn a_udp_service_port_materializes_a_node_waypoint_datagram_listener() {
         "a datagram listener carries neither SNI hosts nor an L4 matcher"
     );
 
-    let upstream_id = node_waypoint_udp_upstream_id(DEFAULT_NAMESPACE, "dns", 5353);
+    let upstream_id = nw_udp_upstream_id(DEFAULT_NAMESPACE, "dns", 5353);
     assert_eq!(proxy.upstream_id.as_deref(), Some(upstream_id.as_str()));
     let upstream = config
         .upstreams
@@ -1166,7 +1186,7 @@ fn node_waypoint_udp_targets_are_restricted_to_this_exact_node() {
         vec![local, remote, unowned],
     );
 
-    let upstream_id = node_waypoint_udp_upstream_id(DEFAULT_NAMESPACE, "dns", 5353);
+    let upstream_id = nw_udp_upstream_id(DEFAULT_NAMESPACE, "dns", 5353);
     let upstream = config
         .upstreams
         .iter()
@@ -1298,6 +1318,95 @@ fn two_plain_udp_services_sharing_one_port_both_materialize_exact_routes() {
             "destination {destination} must reach only its own Service's backend"
         );
     }
+}
+
+/// Issue #3286/#3861: the lossy `{namespace}-{name}-{port}` join collapsed
+/// distinct Kubernetes identities `a-b/c` and `a/b-c` onto one proxy id and one
+/// upstream id. Generated listeners share the NodeWaypoint runtime namespace, so
+/// that collision overwrote one Service's ClusterIP route, backends, and policy
+/// ownership with the other's.
+#[test]
+fn hyphenated_namespace_name_pairs_keep_distinct_same_port_resources() {
+    let _env = UdpListenerEnvGuard::set(Some("true"));
+    let runtime = node_waypoint_runtime();
+    let a = workload_for("c", "a-b", [("app", "udp")], ["10.244.3.11"]);
+    let b = workload_for("b-c", "a", [("app", "udp")], ["10.244.3.12"]);
+    let mut service_a = udp_service_in("a-b", "c", 5353, AppProtocol::Udp, &[&a]);
+    service_a.cluster_ips = vec!["10.96.0.10".to_string()];
+    service_a.uid = Some("uid-ns-a-b-svc-c".to_string());
+    let mut service_b = udp_service_in("a", "b-c", 5353, AppProtocol::Udp, &[&b]);
+    service_b.cluster_ips = vec!["10.96.0.11".to_string()];
+    service_b.uid = Some("uid-ns-a-svc-b-c".to_string());
+    let config = prepare(&runtime, vec![service_a, service_b], vec![a, b]);
+
+    let proxy_a = nw_udp_proxy_id("a-b", "c", 5353);
+    let proxy_b = nw_udp_proxy_id("a", "b-c", 5353);
+    let upstream_a = nw_udp_upstream_id("a-b", "c", 5353);
+    let upstream_b = nw_udp_upstream_id("a", "b-c", 5353);
+    assert_ne!(proxy_a, proxy_b, "lossy hyphen join must not collide proxy ids");
+    assert_ne!(
+        upstream_a, upstream_b,
+        "lossy hyphen join must not collide upstream ids"
+    );
+
+    let listeners = udp_listeners(&config);
+    assert_eq!(
+        listeners.len(),
+        2,
+        "both hyphen-ambiguous Services must keep their own listener proxy"
+    );
+    let listener_ids: Vec<&str> = listeners.iter().map(|proxy| proxy.id.as_str()).collect();
+    assert!(listener_ids.contains(&proxy_a.as_str()));
+    assert!(listener_ids.contains(&proxy_b.as_str()));
+
+    let mut routes: Vec<(String, String, String)> = config
+        .node_waypoint_udp_destination_routes
+        .iter()
+        .map(|route| {
+            (
+                route.destination.to_string(),
+                route.proxy.id.clone(),
+                config
+                    .proxies
+                    .iter()
+                    .find(|proxy| proxy.id == route.proxy.id)
+                    .and_then(|proxy| proxy.upstream_id.clone())
+                    .unwrap_or_default(),
+            )
+        })
+        .collect();
+    routes.sort();
+    assert_eq!(routes.len(), 2);
+    assert_eq!(routes[0].0, "10.96.0.10");
+    assert_eq!(routes[0].1, proxy_a);
+    assert_eq!(routes[0].2, upstream_a);
+    assert_eq!(routes[1].0, "10.96.0.11");
+    assert_eq!(routes[1].1, proxy_b);
+    assert_eq!(routes[1].2, upstream_b);
+
+    let owned = |upstream_id: &str, backend: &str, uid: &str| {
+        let upstream = config
+            .upstreams
+            .iter()
+            .find(|upstream| upstream.id == upstream_id)
+            .expect("owning upstream must be materialized");
+        assert_eq!(
+            upstream
+                .targets
+                .iter()
+                .map(|target| target.host.as_str())
+                .collect::<Vec<_>>(),
+            vec![backend],
+            "each hyphen-ambiguous Service must keep its own backend"
+        );
+        assert_eq!(
+            upstream.k8s_service_uid.as_deref(),
+            Some(uid),
+            "each hyphen-ambiguous Service must keep its own policy ownership uid"
+        );
+    };
+    owned(&upstream_a, "10.244.3.11", "uid-ns-a-b-svc-c");
+    owned(&upstream_b, "10.244.3.12", "uid-ns-a-svc-b-c");
 }
 
 /// Adding a second compatible claimant must not withdraw the first, and removing
@@ -1653,7 +1762,7 @@ fn ipv6_workload_addresses_materialize_listener_targets() {
         vec![udp_service("dns", 5353, AppProtocol::Udp, &[&backend])],
         vec![backend],
     );
-    let upstream_id = node_waypoint_udp_upstream_id(DEFAULT_NAMESPACE, "dns", 5353);
+    let upstream_id = nw_udp_upstream_id(DEFAULT_NAMESPACE, "dns", 5353);
     let upstream = config
         .upstreams
         .iter()
@@ -1700,7 +1809,7 @@ fn a_reload_updates_endpoints_and_withdraws_a_removed_service() {
         )],
         vec![replaced_backend],
     );
-    let upstream_id = node_waypoint_udp_upstream_id(DEFAULT_NAMESPACE, "dns", 5353);
+    let upstream_id = nw_udp_upstream_id(DEFAULT_NAMESPACE, "dns", 5353);
     assert_eq!(
         updated
             .upstreams

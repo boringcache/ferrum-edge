@@ -1615,10 +1615,25 @@ pub const MESH_NODE_WAYPOINT_UDP_PROXY_ID_PREFIX: &str = "__mesh-nw-udp-";
 /// Reserved id prefix for the upstreams backing those listeners.
 pub const MESH_NODE_WAYPOINT_UDP_UPSTREAM_ID_PREFIX: &str = "__mesh-nw-udp-upstream-";
 
+/// Kubernetes DNS-1123 label / Service `metadata.name` byte ceiling. Native
+/// MeshService validation and some ConfigSync/xDS paths only require non-empty
+/// names, so oversized or empty identities can still reach the id constructors
+/// and must fail closed there rather than emit a truncated or colliding id.
+const NODE_WAYPOINT_UDP_ID_COMPONENT_MAX_BYTES: usize = 63;
+
 /// Forward-derived listener proxy id. Never parsed back.
-pub fn node_waypoint_udp_proxy_id(namespace: &str, name: &str, port: u16) -> String {
-    format!("{MESH_NODE_WAYPOINT_UDP_PROXY_ID_PREFIX}{namespace}-{name}-{port}")
-        .replace(['/', '.'], "-")
+///
+/// Returns `None` when `namespace` or `name` is outside the admitted Kubernetes
+/// identity bound, so a hostile ConfigSync/xDS/file MeshService cannot mint an
+/// invalid or colliding resource. Distinct `(namespace, name, port)` tuples —
+/// including `a-b`/`c` vs `a`/`b-c` — always produce distinct ids.
+pub fn node_waypoint_udp_proxy_id(namespace: &str, name: &str, port: u16) -> Option<String> {
+    node_waypoint_udp_resource_id(
+        MESH_NODE_WAYPOINT_UDP_PROXY_ID_PREFIX,
+        namespace,
+        name,
+        port,
+    )
 }
 
 /// True when `id` is a Ferrum-generated NodeWaypoint UDP/DTLS **listener**
@@ -1630,9 +1645,57 @@ pub fn is_node_waypoint_udp_listener_id(id: &str) -> bool {
 }
 
 /// Forward-derived listener upstream id. Never parsed back.
-pub fn node_waypoint_udp_upstream_id(namespace: &str, name: &str, port: u16) -> String {
-    format!("{MESH_NODE_WAYPOINT_UDP_UPSTREAM_ID_PREFIX}{namespace}-{name}-{port}")
-        .replace(['/', '.'], "-")
+///
+/// Same encoding and admission bound as [`node_waypoint_udp_proxy_id`], with
+/// the distinct reserved upstream prefix.
+pub fn node_waypoint_udp_upstream_id(namespace: &str, name: &str, port: u16) -> Option<String> {
+    node_waypoint_udp_resource_id(
+        MESH_NODE_WAYPOINT_UDP_UPSTREAM_ID_PREFIX,
+        namespace,
+        name,
+        port,
+    )
+}
+
+fn node_waypoint_udp_identity_is_admitted(value: &str) -> bool {
+    let len = value.len();
+    len > 0 && len <= NODE_WAYPOINT_UDP_ID_COMPONENT_MAX_BYTES
+}
+
+/// Unpadded URL-safe base64 of length-prefixed `(namespace, name, port)`.
+/// Forward-only: the payload is never decoded on a serving path. `/` and `.`
+/// stay inside the framed bytes, and `-` cannot jump across a length prefix, so
+/// `a-b`/`c` and `a`/`b-c` cannot collapse the way a hyphen join did.
+fn encode_node_waypoint_udp_identity(namespace: &str, name: &str, port: u16) -> Option<String> {
+    use base64::Engine;
+    if !node_waypoint_udp_identity_is_admitted(namespace)
+        || !node_waypoint_udp_identity_is_admitted(name)
+    {
+        return None;
+    }
+    let namespace_len = u16::try_from(namespace.len()).ok()?;
+    let name_len = u16::try_from(name.len()).ok()?;
+    let mut payload = Vec::with_capacity(2 + namespace.len() + 2 + name.len() + 2);
+    payload.extend_from_slice(&namespace_len.to_be_bytes());
+    payload.extend_from_slice(namespace.as_bytes());
+    payload.extend_from_slice(&name_len.to_be_bytes());
+    payload.extend_from_slice(name.as_bytes());
+    payload.extend_from_slice(&port.to_be_bytes());
+    Some(base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(payload))
+}
+
+fn node_waypoint_udp_resource_id(
+    prefix: &str,
+    namespace: &str,
+    name: &str,
+    port: u16,
+) -> Option<String> {
+    let encoded = encode_node_waypoint_udp_identity(namespace, name, port)?;
+    let id = format!("{prefix}{encoded}");
+    if id.len() > crate::config::types::MAX_ID_LENGTH {
+        return None;
+    }
+    Some(id)
 }
 
 /// Materialize NodeWaypoint UDP and DTLS **service listeners** from the mesh
@@ -1685,6 +1748,9 @@ pub fn node_waypoint_udp_upstream_id(namespace: &str, name: &str, port: u16) -> 
 ///
 /// **Fail-closed admission.** Every rejection drops the affected route and logs
 /// a field-specific reason; nothing is silently inert:
+/// - a service whose namespace or name is empty or longer than the 63-byte
+///   Kubernetes identity bound (the generated proxy/upstream id would be
+///   invalid or another collision class),
 /// - a port already claimed by a mesh runtime listener (`listener_plan()`),
 /// - a port already claimed by another stream proxy in this generation,
 /// - a port whose claimants disagree on frontend posture (`udp` beside `dtls`):
@@ -1858,10 +1924,28 @@ fn materialize_node_waypoint_udp_listeners(
                 continue;
             }
 
-            let upstream_id =
-                node_waypoint_udp_upstream_id(&service.namespace, &service.name, service_port.port);
-            let proxy_id =
-                node_waypoint_udp_proxy_id(&service.namespace, &service.name, service_port.port);
+            let Some((proxy_id, upstream_id)) = node_waypoint_udp_proxy_id(
+                &service.namespace,
+                &service.name,
+                service_port.port,
+            )
+            .zip(node_waypoint_udp_upstream_id(
+                &service.namespace,
+                &service.name,
+                service_port.port,
+            ))
+            else {
+                warn!(
+                    service_len = service.name.len(),
+                    namespace_len = service.namespace.len(),
+                    service_port = service_port.port,
+                    reason = "unencodable_service_identity",
+                    "Skipping NodeWaypoint UDP/DTLS listener: namespace and service name must \
+                     each be a non-empty identity of at most 63 bytes so the generated proxy \
+                     and upstream ids stay unique and within the 254-byte resource-id ceiling"
+                );
+                continue;
+            };
             by_port
                 .entry(service_port.port)
                 .or_default()
@@ -17625,7 +17709,8 @@ async fn apply_mesh_inbound_tls_reload(
 /// Route identity is forward-derived (`node_waypoint_udp_proxy_id`) from the
 /// same Service/port pair `materialize_node_waypoint_udp_listeners` used, so the
 /// two can never disagree about which listener a config belongs to. Ids are
-/// never parsed back.
+/// never parsed back. An unencodable Service identity cannot have been
+/// materialized, so skipping it here is the same fail-closed admission.
 ///
 /// Returns an empty map outside NodeWaypoint topology and whenever the accepted
 /// candidate carries no generated DTLS listener. An empty ACCEPTED generation is
@@ -17680,8 +17765,11 @@ pub fn build_node_waypoint_dtls_owner_configs(
             if node_waypoint_udp_listener_terminates_dtls(protocol) != Some(true) {
                 continue;
             }
-            let proxy_id =
-                node_waypoint_udp_proxy_id(&service.namespace, &service.name, service_port.port);
+            let Some(proxy_id) =
+                node_waypoint_udp_proxy_id(&service.namespace, &service.name, service_port.port)
+            else {
+                continue;
+            };
             if !generated.contains(&(runtime.namespace.as_str(), proxy_id.as_str())) {
                 continue;
             }

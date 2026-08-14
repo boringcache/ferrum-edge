@@ -2748,7 +2748,8 @@ fn node_waypoint_udp_proxy_named(service: &str, port: u16) -> Proxy {
         &ferrum_edge::config::types::default_namespace(),
         service,
         port,
-    );
+    )
+    .expect("test service names are admitted Kubernetes identities");
     create_stream_proxy(&id, BackendScheme::Udp, port)
 }
 
@@ -2763,7 +2764,8 @@ fn nw_udp_destination_route(ip: &str, port: u16, service: &str) -> NodeWaypointU
         port,
         NamespacedResourceId::new(
             namespace.clone(),
-            ferrum_edge::modes::mesh::node_waypoint_udp_proxy_id(&namespace, service, port),
+            ferrum_edge::modes::mesh::node_waypoint_udp_proxy_id(&namespace, service, port)
+                .expect("test service names are admitted Kubernetes identities"),
         ),
         false,
     )

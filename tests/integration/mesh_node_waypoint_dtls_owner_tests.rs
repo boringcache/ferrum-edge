@@ -82,7 +82,8 @@ fn node_waypoint_runtime() -> MeshRuntimeConfig {
 
 fn generated_dtls_proxy(service: &str, port: u16) -> ferrum_edge::config::types::Proxy {
     let mut proxy = http_proxy("unused", "example.invalid", 9);
-    proxy.id = node_waypoint_udp_proxy_id(DEFAULT_NAMESPACE, service, port);
+    proxy.id = node_waypoint_udp_proxy_id(DEFAULT_NAMESPACE, service, port)
+        .expect("test service names are admitted Kubernetes identities");
     proxy.namespace = DEFAULT_NAMESPACE.to_string();
     proxy.name = Some(service.to_string());
     proxy.hosts = Vec::new();
@@ -146,7 +147,8 @@ fn dtls_slice(
 fn listener_key(service: &str, port: u16) -> String {
     NamespacedResourceId::new(
         DEFAULT_NAMESPACE.to_string(),
-        node_waypoint_udp_proxy_id(DEFAULT_NAMESPACE, service, port),
+        node_waypoint_udp_proxy_id(DEFAULT_NAMESPACE, service, port)
+            .expect("test service names are admitted Kubernetes identities"),
     )
     .runtime_key()
 }
