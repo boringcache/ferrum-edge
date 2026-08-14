@@ -290,11 +290,10 @@ fn teardown_is_strict_for_both_families_and_verifies_exact_absence() {
         "both families must still be attempted and named exactly:\n{script}"
     );
     assert!(
-        script.contains("ferrum_overall=0")
-            && script.contains(") || ferrum_overall=$?")
-            && script.contains("exit \"$ferrum_overall\""),
+        script.contains("ferrum_overall=0") && script.contains("exit \"$ferrum_overall\""),
         "a family failure must keep the overall script nonzero:\n{script}"
     );
+    assert_family_status_is_captured_outside_conditional_context(&script);
     assert!(
         script.contains("jump remains after deletion")
             && script.contains("chain remains after deletion")
@@ -321,11 +320,54 @@ fn teardown_family_block(script: &str, family: &str) -> &str {
     let start = script
         .find(&marker)
         .unwrap_or_else(|| panic!("missing {family} teardown block:\n{script}"));
-    let rest = &script[start..];
-    let end = rest.find(") || ferrum_overall=$?").unwrap_or_else(|| {
-        panic!("{family} attempt must capture status without aborting the sibling:\n{rest}")
-    });
-    &rest[..end]
+    let after = start + marker.len();
+    let end = if family == "IPv4" {
+        script[after..]
+            .find("# NodeWaypoint UDP steer teardown: IPv6")
+            .map(|rel| after + rel)
+            .unwrap_or_else(|| {
+                panic!("IPv4 attempt must end before the IPv6 attempt starts:\n{script}")
+            })
+    } else {
+        script[after..]
+            .find("\nexit \"$ferrum_overall\"")
+            .map(|rel| after + rel)
+            .unwrap_or_else(|| {
+                panic!("IPv6 attempt must capture status before the overall exit:\n{script}")
+            })
+    };
+    script[start..end].trim_end()
+}
+
+/// `( set -e; ... ) || ferrum_overall=$?` is a conditional context: Bash and
+/// dash disable errexit for commands inside that subshell, so an xtables
+/// failure can fall through into routing and a later success can wipe the
+/// status. The rendered shape must keep the family body as a simple subshell
+/// whose `$?` is captured on the next line.
+fn assert_family_status_is_captured_outside_conditional_context(script: &str) {
+    assert!(
+        !script.contains(") || ferrum_overall")
+            && !script.contains(") && ferrum_overall")
+            && !script.contains("if (\n"),
+        "a family subshell in if/&&/|| disables errexit even after inner set -e:\n{script}"
+    );
+    assert_eq!(
+        script.matches("set +e\n(\nset -e\n").count(),
+        2,
+        "each family must disable outer errexit immediately before a simple subshell that re-enables it:\n{script}"
+    );
+    assert_eq!(
+        script.matches(")\nferrum_family_status=$?\nset -e\n").count(),
+        2,
+        "each family status must be captured on the next line, then outer errexit restored:\n{script}"
+    );
+    assert_eq!(
+        script
+            .matches("if [ \"$ferrum_family_status\" -ne 0 ]; then")
+            .count(),
+        2,
+        "each family must accumulate a nonzero status without resetting overall on success:\n{script}"
+    );
 }
 
 /// A missing or broken IPv6 tool must not prevent the IPv4 cleanup attempt, and
@@ -341,7 +383,7 @@ fn teardown_attempts_each_family_independently_and_stays_unproven_on_either_fail
         .find("# NodeWaypoint UDP steer teardown: IPv4")
         .expect("IPv4 attempt marker");
     let v4_status_at = script[v4_at..]
-        .find(") || ferrum_overall=$?")
+        .find("ferrum_family_status=$?")
         .map(|rel| v4_at + rel)
         .expect("IPv4 status capture");
     let v6_at = script
@@ -369,15 +411,19 @@ fn teardown_attempts_each_family_independently_and_stays_unproven_on_either_fail
     assert!(
         v4.contains("command -v iptables >/dev/null 2>&1 || {")
             && v4.contains("ferrum_delete_xtables_rule iptables mangle")
-            && v4.contains("set -e"),
-        "the IPv4 attempt must still require iptables and run under errexit:\n{v4}"
+            && v4.contains("set +e")
+            && v4.contains("set -e")
+            && v4.contains("ferrum_family_status=$?"),
+        "the IPv4 attempt must still require iptables and capture status outside a conditional context:\n{v4}"
     );
     assert!(
         !v6.contains("ferrum_delete_xtables_rule iptables mangle")
             && !v6.contains("ip -o rule show")
             && v6.contains("command -v ip6tables >/dev/null 2>&1 || {")
             && v6.contains("ferrum_delete_xtables_rule ip6tables mangle")
-            && v6.contains("set -e"),
+            && v6.contains("set +e")
+            && v6.contains("set -e")
+            && v6.contains("ferrum_family_status=$?"),
         "IPv4 failure must not gate the IPv6 attempt:\n{v6}"
     );
     assert!(
@@ -386,11 +432,7 @@ fn teardown_attempts_each_family_independently_and_stays_unproven_on_either_fail
             && script.contains("exit \"$ferrum_overall\""),
         "a missing family tool is a failure of that attempt, and of the script:\n{script}"
     );
-    assert_eq!(
-        script.matches(") || ferrum_overall=$?").count(),
-        2,
-        "each family attempt must be captured independently:\n{script}"
-    );
+    assert_family_status_is_captured_outside_conditional_context(&script);
 }
 
 /// Exact Ferrum fwmark ownership is preserved on teardown, and local routing
@@ -442,10 +484,137 @@ fn teardown_retains_routing_when_the_family_mark_path_is_unproven() {
             "{family} must not match a different mark at the same priority/table:\n{block}"
         );
         assert!(
-            block.contains("set -e"),
-            "{family} inner errexit is what skips routing after an xtables failure:\n{block}"
+            block.contains("set +e")
+                && block.contains("set -e")
+                && block.contains("ferrum_family_status=$?")
+                && !block.contains(") || ")
+                && !block.contains(") && ")
+                && !block.contains("if ("),
+            "{family} must fail-fast in a simple subshell and capture status on the next line:\n{block}"
         );
     }
+}
+
+/// `( set -e; ... ) || ferrum_overall=$?` continues into IPv4 routing after an
+/// xtables failure, and a later successful command can make that subshell
+/// return 0. The rendered script must skip IPv4 routing, still attempt IPv6,
+/// and exit nonzero. Exercised under Bash (the shell with the documented
+/// suppression) and `sh` (the production `sh -c` path).
+#[cfg(unix)]
+#[test]
+fn teardown_ipv4_xtables_failure_skips_ipv4_routing_and_still_attempts_ipv6() {
+    let script = node_waypoint_udp_steer_teardown_script();
+    for shell in ["bash", "sh"] {
+        let (status, log) = run_teardown_with_stubbed_family_tools(shell, &script);
+        assert_ne!(
+            status, 0,
+            "{shell}: IPv4 xtables failure must keep overall teardown unproven\n{log}"
+        );
+
+        let mut saw_iptables = false;
+        let mut saw_ip6tables = false;
+        let mut ipv4_routing = Vec::new();
+        let mut ipv6_routing = Vec::new();
+        for line in log.lines() {
+            if line == "iptables" || line.starts_with("iptables ") {
+                saw_iptables = true;
+            } else if line == "ip6tables" || line.starts_with("ip6tables ") {
+                saw_ip6tables = true;
+            } else if let Some(rest) = line.strip_prefix("ip ") {
+                if rest == "-6" || rest.starts_with("-6 ") {
+                    ipv6_routing.push(line);
+                } else {
+                    ipv4_routing.push(line);
+                }
+            }
+        }
+        assert!(
+            saw_iptables,
+            "{shell}: IPv4 xtables must run so the failure is a real inspection error:\n{log}"
+        );
+        assert!(
+            ipv4_routing.is_empty(),
+            "{shell}: an IPv4 xtables failure must not reach IPv4 routing: {ipv4_routing:?}\n{log}"
+        );
+        assert!(
+            saw_ip6tables,
+            "{shell}: IPv6 must still be attempted after the IPv4 failure:\n{log}"
+        );
+        assert!(
+            !ipv6_routing.is_empty(),
+            "{shell}: a proven IPv6 xtables path must still consider IPv6 routing:\n{log}"
+        );
+    }
+}
+
+#[cfg(unix)]
+fn run_teardown_with_stubbed_family_tools(shell: &str, script: &str) -> (i32, String) {
+    let dir = tempfile::tempdir().expect("stub bin dir");
+    let log_path = dir.path().join("stub.log");
+    write_exec(
+        &dir.path().join("iptables"),
+        concat!(
+            "#!/bin/sh\n",
+            "log=\"${FERRUM_STEER_STUB_LOG:?}\"\n",
+            "printf 'iptables' >>\"$log\"\n",
+            "for arg in \"$@\"; do printf ' %s' \"$arg\" >>\"$log\"; done\n",
+            "printf '\\n' >>\"$log\"\n",
+            "exit 2\n"
+        ),
+    );
+    write_exec(
+        &dir.path().join("ip6tables"),
+        concat!(
+            "#!/bin/sh\n",
+            "log=\"${FERRUM_STEER_STUB_LOG:?}\"\n",
+            "printf 'ip6tables' >>\"$log\"\n",
+            "for arg in \"$@\"; do printf ' %s' \"$arg\" >>\"$log\"; done\n",
+            "printf '\\n' >>\"$log\"\n",
+            "for arg in \"$@\"; do\n",
+            "  if [ \"$arg\" = \"-S\" ] || [ \"$arg\" = \"-C\" ]; then exit 1; fi\n",
+            "done\n",
+            "exit 0\n"
+        ),
+    );
+    write_exec(
+        &dir.path().join("ip"),
+        concat!(
+            "#!/bin/sh\n",
+            "log=\"${FERRUM_STEER_STUB_LOG:?}\"\n",
+            "printf 'ip' >>\"$log\"\n",
+            "for arg in \"$@\"; do printf ' %s' \"$arg\" >>\"$log\"; done\n",
+            "printf '\\n' >>\"$log\"\n",
+            "exit 0\n"
+        ),
+    );
+
+    let output = std::process::Command::new(shell)
+        .arg("-c")
+        .arg(script)
+        .env("PATH", dir.path())
+        .env("FERRUM_STEER_STUB_LOG", &log_path)
+        .output()
+        .unwrap_or_else(|error| panic!("failed to exec {shell}: {error}"));
+    let log = std::fs::read_to_string(&log_path).unwrap_or_default();
+    let status = output.status.code().unwrap_or_else(|| {
+        panic!(
+            "{shell} was terminated by a signal; stderr={}\n{log}",
+            String::from_utf8_lossy(&output.stderr)
+        )
+    });
+    (status, log)
+}
+
+#[cfg(unix)]
+fn write_exec(path: &std::path::Path, body: &str) {
+    use std::os::unix::fs::PermissionsExt;
+
+    std::fs::write(path, body).expect("write stub binary");
+    let mut permissions = std::fs::metadata(path)
+        .expect("stat stub binary")
+        .permissions();
+    permissions.set_mode(0o700);
+    std::fs::set_permissions(path, permissions).expect("chmod stub binary");
 }
 
 /// Issue #2084 / NodeWaypoint UDP Service steering: nft-backed iptables

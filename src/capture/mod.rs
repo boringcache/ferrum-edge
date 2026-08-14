@@ -489,10 +489,15 @@ fn node_waypoint_udp_steer_teardown_routing(ipv6: bool) -> Vec<String> {
 /// One address-family teardown attempt, isolated in a subshell so its failure
 /// cannot abort the other family.
 ///
-/// Inner `set -e` is load-bearing: the parent invokes this as
-/// `( ... ) || ferrum_overall=$?`, which is an AND-OR list that disables the
-/// outer errexit. Without the inner `set -e`, an xtables failure would fall
-/// through into routing. Routing is emitted only after xtables and after a
+/// The family body is a simple subshell, never the left-hand side of `&&` /
+/// `||` and never an `if` test. Bash and dash disable `set -e` for every
+/// command inside a compound command that is in a conditional context,
+/// including after an inner `set -e`: `( set -e; ... ) || ferrum_overall=$?`
+/// lets an xtables failure fall through into routing, and a later successful
+/// command can make the subshell return 0 and erase the failure. Outer
+/// `set +e` is required so the subshell's nonzero status does not abort the
+/// parent before `$?` is captured and the sibling family runs; inner `set -e`
+/// then fail-fasts for real. Routing is emitted only after xtables and after a
 /// present `ip` binary, so an unproven mark path retains local delivery.
 fn node_waypoint_udp_steer_teardown_family_attempt(binary: &str, ipv6: bool) -> String {
     let family = if ipv6 { "IPv6" } else { "IPv4" };
@@ -500,13 +505,19 @@ fn node_waypoint_udp_steer_teardown_family_attempt(binary: &str, ipv6: bool) -> 
     let routing = node_waypoint_udp_steer_teardown_routing(ipv6).join("\n");
     format!(
         "# NodeWaypoint UDP steer teardown: {family}\n\
+         set +e\n\
          (\n\
          set -e\n\
          command -v {binary} >/dev/null 2>&1 || {{ echo '{binary} is required to reap NodeWaypoint UDP steering' >&2; exit 1; }}\n\
          {xtables}\n\
          command -v ip >/dev/null 2>&1 || {{ echo 'iproute2 (ip) is required to reap NodeWaypoint UDP steering' >&2; exit 1; }}\n\
          {routing}\n\
-         ) || ferrum_overall=$?"
+         )\n\
+         ferrum_family_status=$?\n\
+         set -e\n\
+         if [ \"$ferrum_family_status\" -ne 0 ]; then\n\
+           ferrum_overall=$ferrum_family_status\n\
+         fi"
     )
 }
 
@@ -605,6 +616,10 @@ pub fn node_waypoint_udp_steer_setup_script(
 /// before local routing is removed (inert leftover routing is safer than
 /// marked traffic without local delivery). If shared `ip` is unavailable,
 /// every safe xtables cleanup is still attempted and routing is retained.
+/// Each family runs in a simple subshell with inner errexit; the parent
+/// captures that exact status on the next line without wrapping the subshell
+/// in `if`/`&&`/`||`, then restores outer errexit and still attempts the
+/// sibling family.
 ///
 /// Jump deletion probes the user-chain with `-S` before `-C` of a jump into
 /// it. nft-backed iptables returns 2 for `-C ... -j <missing-chain>` (issue
