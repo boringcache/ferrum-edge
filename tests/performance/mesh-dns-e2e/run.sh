@@ -165,6 +165,7 @@ start_gateway() {
         FERRUM_MESH_DNS_MAX_CONCURRENT_QUERIES=4096 \
         FERRUM_MESH_DNS_RESPONSE_CACHE_MAX_ENTRIES=4096 \
         FERRUM_MESH_CLUSTER_DOMAIN=cluster.local \
+        FERRUM_MESH_ALLOW_NO_CA=true \
         ./target/release/ferrum-edge run \
         > "$SCRIPT_DIR/gateway.log" 2>&1 &
     GATEWAY_PID=$!
