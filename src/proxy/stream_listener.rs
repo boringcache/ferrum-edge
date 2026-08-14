@@ -2388,6 +2388,7 @@ impl StreamListenerManager {
                         scheme: entry.scheme,
                         frontend_tls: entry.frontend_tls,
                         passthrough: false,
+                        datagram_client_address: entry.runs_datagram_client_address_gate(),
                         backend_tls_reload_key: entry.backend_tls_reload_key.clone(),
                         sni_ids: None,
                         // Deliberately NOT part of the restart key: membership
