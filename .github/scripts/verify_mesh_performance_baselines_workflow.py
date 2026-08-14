@@ -31,6 +31,9 @@ DNS_BASELINE = REPO_ROOT / "tests" / "performance" / "mesh-dns-e2e" / "baseline.
 HBONE_LOADGEN = (
     REPO_ROOT / "tests" / "performance" / "mesh-hbone-e2e" / "src" / "bin" / "hbone_loadgen.rs"
 )
+HBONE_RUN = REPO_ROOT / "tests" / "performance" / "mesh-hbone-e2e" / "run.sh"
+HBONE_FIXTURE = REPO_ROOT / "examples" / "hbone_perf_fixture.rs"
+ROOT_CARGO_TOML = REPO_ROOT / "Cargo.toml"
 DNS_LOADGEN = (
     REPO_ROOT / "tests" / "performance" / "mesh-dns-e2e" / "src" / "bin" / "dns_loadgen.rs"
 )
@@ -47,7 +50,8 @@ APPROVED_SETUP = (
 PINNED_SHA = re.compile(r"^[0-9a-f]{40}$")
 HBONE_BACKEND_ALLOW_IPS_VAR = "FERRUM_BACKEND_ALLOW_IPS"
 HBONE_BACKEND_ALLOW_IPS_VALUE = "private"
-HBONE_GATEWAY_EXECUTABLE = "./target/release/ferrum-edge"
+HBONE_GATEWAY_EXECUTABLE = "./target/release/examples/hbone_perf_fixture"
+HBONE_PRODUCTION_GATEWAY_EXECUTABLE = "./target/release/ferrum-edge"
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -207,6 +211,139 @@ def _check_hbone_backend_allow_ips(hbone_run: str, failures: list[str]) -> None:
             f"{HBONE_BACKEND_ALLOW_IPS_VAR}={HBONE_BACKEND_ALLOW_IPS_VALUE} "
             f"({reason})"
         )
+
+
+def _hbone_example_manifest_block(cargo_toml: str) -> str:
+    """Return the `[[example]]` block that declares `hbone_perf_fixture`."""
+    marker = 'name = "hbone_perf_fixture"'
+    start = cargo_toml.find(marker)
+    if start == -1:
+        return ""
+    block_start = cargo_toml.rfind("[[example]]", 0, start)
+    if block_start == -1:
+        return ""
+    nxt = cargo_toml.find("\n[[", start)
+    if nxt == -1:
+        return cargo_toml[block_start:]
+    return cargo_toml[block_start:nxt]
+
+
+def _check_hbone_trusted_fixture_contract(
+    hbone_run: str,
+    fixture_src: str,
+    cargo_toml: str,
+    workflow: str,
+    ledger: str,
+    failures: list[str],
+) -> None:
+    """Pin the trusted fixture launch and reject operator file-mode mesh tags."""
+    require(HBONE_FIXTURE.is_file(), "HBONE trusted fixture example source missing", failures)
+    require(
+        HBONE_GATEWAY_EXECUTABLE in hbone_run,
+        "HBONE harness must launch the trusted fixture example",
+        failures,
+    )
+    require(
+        HBONE_PRODUCTION_GATEWAY_EXECUTABLE not in hbone_run,
+        "HBONE harness must not launch production ferrum-edge",
+        failures,
+    )
+    require(
+        "FERRUM_FILE_CONFIG_PATH" not in hbone_run,
+        "HBONE harness must not load operator file config",
+        failures,
+    )
+    require(
+        "FERRUM_MODE=file" not in hbone_run,
+        "HBONE harness must not start production file mode",
+        failures,
+    )
+    require(
+        "write_gateway_config" not in hbone_run,
+        "HBONE harness must not write operator gateway YAML",
+        failures,
+    )
+    require(
+        '"mesh.hbone"' not in hbone_run and "'mesh.hbone'" not in hbone_run,
+        "HBONE harness must not stamp reserved mesh.* tags into operator file config",
+        failures,
+    )
+    require(
+        "cargo build --release --example hbone_perf_fixture" in hbone_run,
+        "HBONE harness must build the trusted fixture example",
+        failures,
+    )
+    require(
+        "--example hbone_perf_fixture" in workflow,
+        "hosted HBONE collection must build the trusted fixture example",
+        failures,
+    )
+    require(
+        "cargo build --release --example hbone_perf_fixture" in ledger,
+        "ledger HBONE commands must build the trusted fixture example",
+        failures,
+    )
+    require(
+        ledger.count("cargo build --release --bin ferrum-edge") == 1,
+        "ledger ferrum-edge build must remain DNS-only",
+        failures,
+    )
+
+    require("normalize_fields" in fixture_src, "HBONE fixture must normalize projected config", failures)
+    require(
+        "serve(" in fixture_src and "ServeOptions" in fixture_src,
+        "HBONE fixture must call file::serve with ServeOptions",
+        failures,
+    )
+    require(
+        "install_crypto_provider" in fixture_src,
+        "HBONE fixture must install the rustls crypto provider",
+        failures,
+    )
+    require("JwtManager" in fixture_src, "HBONE fixture must supply an explicit admin JWT manager", failures)
+    require(
+        '"mesh.hbone"' in fixture_src and '"mesh.hbone_port"' in fixture_src,
+        "HBONE fixture must construct reserved mesh.* tags internally",
+        failures,
+    )
+    require(
+        ".validate_operator_provided_fields(" not in fixture_src
+        and "validate_operator_provided_fields()" not in fixture_src,
+        "HBONE fixture must not call operator-field validation",
+        failures,
+    )
+    require(
+        "file_loader" not in fixture_src,
+        "HBONE fixture must not use the operator file loader",
+        failures,
+    )
+    require(
+        "FERRUM_FILE_CONFIG_PATH" not in fixture_src,
+        "HBONE fixture must not expose a file-config path",
+        failures,
+    )
+    require(
+        "general-purpose trusted config loader" in fixture_src.lower(),
+        "HBONE fixture must document that it is not a general-purpose trusted loader",
+        failures,
+    )
+    require(
+        "config-file path argument" in fixture_src or "There is no config-file path argument" in fixture_src,
+        "HBONE fixture must refuse a config-file path argument",
+        failures,
+    )
+
+    example_block = _hbone_example_manifest_block(cargo_toml)
+    require(
+        'path = "examples/hbone_perf_fixture.rs"' in example_block,
+        "root Cargo.toml must declare the hbone_perf_fixture example path",
+        failures,
+    )
+    require(
+        "test = false" in example_block,
+        "hbone_perf_fixture example must set test = false",
+        failures,
+    )
 
 
 def check_workflow(text: str, failures: list[str]) -> None:
@@ -450,6 +587,11 @@ def check_scripts(failures: list[str]) -> None:
         failures,
     )
     require(
+        "cargo build --release --example hbone_perf_fixture" in ledger,
+        "ledger HBONE commands must build the trusted fixture example",
+        failures,
+    )
+    require(
         "./tests/performance/mesh-dns-e2e/run.sh" in ledger,
         "ledger DNS commands must invoke the harness by repository-root path",
         failures,
@@ -557,7 +699,7 @@ def check_scripts(failures: list[str]) -> None:
     require("payload_size" in summary, "summarizer must validate HBONE scenario parameters", failures)
     require("DNS_DURATION_SECS" in summary, "summarizer must validate DNS scenario parameters", failures)
 
-    hbone_run = (REPO_ROOT / "tests" / "performance" / "mesh-hbone-e2e" / "run.sh").read_text(encoding="utf-8")
+    hbone_run = HBONE_RUN.read_text(encoding="utf-8")
     dns_run = (REPO_ROOT / "tests" / "performance" / "mesh-dns-e2e" / "run.sh").read_text(encoding="utf-8")
     require("MESH_BASELINE_DIAG_DIR" in hbone_run, "HBONE harness must honour MESH_BASELINE_DIAG_DIR", failures)
     require("MESH_BASELINE_DIAG_DIR" in dns_run, "DNS harness must honour MESH_BASELINE_DIAG_DIR", failures)
@@ -565,6 +707,14 @@ def check_scripts(failures: list[str]) -> None:
     require("archive_failure_diagnostics" in dns_run, "DNS harness must copy logs into the artifact destination", failures)
     require("certs" in hbone_run and "Never copy certs" in hbone_run, "HBONE diagnostics must not archive certs", failures)
     _check_hbone_backend_allow_ips(hbone_run, failures)
+    _check_hbone_trusted_fixture_contract(
+        hbone_run,
+        HBONE_FIXTURE.read_text(encoding="utf-8") if HBONE_FIXTURE.is_file() else "",
+        ROOT_CARGO_TOML.read_text(encoding="utf-8"),
+        WORKFLOW_PATH.read_text(encoding="utf-8"),
+        ledger,
+        failures,
+    )
 
     hbone_loadgen = HBONE_LOADGEN.read_text(encoding="utf-8")
     dns_loadgen = DNS_LOADGEN.read_text(encoding="utf-8")
@@ -690,7 +840,7 @@ def _self_test_hbone_backend_allow_ips(failures: list[str]) -> None:
     good = """
     env \\
         FERRUM_BACKEND_ALLOW_IPS="private" \\
-        ./target/release/ferrum-edge
+        ./target/release/examples/hbone_perf_fixture
 """
     good_failures: list[str] = []
     _check_hbone_backend_allow_ips(good, good_failures)
@@ -702,7 +852,7 @@ def _self_test_hbone_backend_allow_ips(failures: list[str]) -> None:
 # FERRUM_BACKEND_ALLOW_IPS="private"
     env \\
         FERRUM_BACKEND_ALLOW_IPS="public" \\
-        ./target/release/ferrum-edge
+        ./target/release/examples/hbone_perf_fixture
 """,
             "comment camouflage",
         ),
@@ -710,7 +860,7 @@ def _self_test_hbone_backend_allow_ips(failures: list[str]) -> None:
             """
     env \\
         FERRUM_BACKEND_ALLOW_IPS="both" \\
-        ./target/release/ferrum-edge
+        ./target/release/examples/hbone_perf_fixture
 """,
             "both widening",
         ),
@@ -718,7 +868,7 @@ def _self_test_hbone_backend_allow_ips(failures: list[str]) -> None:
             """
     env \\
         FERRUM_BACKEND_ALLOW_IPS="10.0.0.0/8" \\
-        ./target/release/ferrum-edge
+        ./target/release/examples/hbone_perf_fixture
 """,
             "CIDR literal",
         ),
@@ -727,14 +877,14 @@ def _self_test_hbone_backend_allow_ips(failures: list[str]) -> None:
     env \\
         FERRUM_BACKEND_ALLOW_IPS="private" \\
         FERRUM_BACKEND_ALLOW_IPS="private" \\
-        ./target/release/ferrum-edge
+        ./target/release/examples/hbone_perf_fixture
 """,
             "duplicate assignment",
         ),
         (
             """
     env \\
-        ./target/release/ferrum-edge
+        ./target/release/examples/hbone_perf_fixture
 """,
             "missing assignment",
         ),
@@ -742,7 +892,7 @@ def _self_test_hbone_backend_allow_ips(failures: list[str]) -> None:
             """
     env \\
         FERRUM_BACKEND_ALLOW_IPS="public" # FERRUM_BACKEND_ALLOW_IPS="private"
-        ./target/release/ferrum-edge
+        ./target/release/examples/hbone_perf_fixture
 """,
             "inline comment camouflage",
         ),
@@ -750,7 +900,7 @@ def _self_test_hbone_backend_allow_ips(failures: list[str]) -> None:
             """
     echo FERRUM_BACKEND_ALLOW_IPS=private
     env \\
-        ./target/release/ferrum-edge
+        ./target/release/examples/hbone_perf_fixture
 """,
             "echo camouflage",
         ),
@@ -759,7 +909,7 @@ def _self_test_hbone_backend_allow_ips(failures: list[str]) -> None:
     env \\
         NOTFERRUM_BACKEND_ALLOW_IPS=private \\
         FERRUM_BACKEND_ALLOW_IPS="public" \\
-        ./target/release/ferrum-edge
+        ./target/release/examples/hbone_perf_fixture
 """,
             "suffix-name camouflage",
         ),
@@ -767,7 +917,7 @@ def _self_test_hbone_backend_allow_ips(failures: list[str]) -> None:
             """
     env \\
         FERRUM_BACKEND_ALLOW_IPS="public" \\
-        ./target/release/ferrum-edge FERRUM_BACKEND_ALLOW_IPS=private
+        ./target/release/examples/hbone_perf_fixture FERRUM_BACKEND_ALLOW_IPS=private
 """,
             "post-executable camouflage",
         ),
@@ -776,7 +926,7 @@ def _self_test_hbone_backend_allow_ips(failures: list[str]) -> None:
     FERRUM_BACKEND_ALLOW_IPS=private
     env \\
         FERRUM_BACKEND_ALLOW_IPS="public" \\
-        ./target/release/ferrum-edge
+        ./target/release/examples/hbone_perf_fixture
 """,
             "detached good assignment with widened launch",
         ),
@@ -784,7 +934,7 @@ def _self_test_hbone_backend_allow_ips(failures: list[str]) -> None:
             """
     FERRUM_BACKEND_ALLOW_IPS=private
     env \\
-        ./target/release/ferrum-edge
+        ./target/release/examples/hbone_perf_fixture
 """,
             "detached good assignment with missing launch assignment",
         ),
@@ -792,7 +942,7 @@ def _self_test_hbone_backend_allow_ips(failures: list[str]) -> None:
             """
     env \\
         FERRUM_BACKEND_ALLOW_IPS="$ALLOW_IPS" \\
-        ./target/release/ferrum-edge
+        ./target/release/examples/hbone_perf_fixture
 """,
             "indirect launch value",
         ),
@@ -800,7 +950,7 @@ def _self_test_hbone_backend_allow_ips(failures: list[str]) -> None:
             """
     env \\
         FERRUM_BACKEND_ALLOW_IPS=$(echo private) \\
-        ./target/release/ferrum-edge
+        ./target/release/examples/hbone_perf_fixture
 """,
             "command-substitution launch value",
         ),
@@ -809,6 +959,53 @@ def _self_test_hbone_backend_allow_ips(failures: list[str]) -> None:
         case_failures: list[str] = []
         _check_hbone_backend_allow_ips(sample, case_failures)
         require(case_failures, f"{label} must be rejected", failures)
+
+
+def _self_test_hbone_trusted_fixture_contract(failures: list[str]) -> None:
+    """Prove a production file-mode launch with reserved mesh tags is rejected."""
+    fixture = HBONE_FIXTURE.read_text(encoding="utf-8") if HBONE_FIXTURE.is_file() else ""
+    cargo = ROOT_CARGO_TOML.read_text(encoding="utf-8") if ROOT_CARGO_TOML.is_file() else ""
+    workflow = "cargo build --release --example hbone_perf_fixture"
+    ledger = (
+        "cargo build --release --example hbone_perf_fixture && "
+        "(cd tests/performance/mesh-hbone-e2e && cargo build --release)\n"
+        "cargo build --release --bin ferrum-edge && "
+        "(cd tests/performance/mesh-dns-e2e && cargo build --release)\n"
+    )
+    forged = """
+write_gateway_config() {
+  cat > gateway.yaml <<EOF
+          "mesh.hbone": "true"
+EOF
+}
+    env \\
+        FERRUM_MODE=file \\
+        FERRUM_FILE_CONFIG_PATH=gateway.yaml \\
+        FERRUM_BACKEND_ALLOW_IPS=private \\
+        ./target/release/ferrum-edge
+"""
+    forged_failures: list[str] = []
+    _check_hbone_trusted_fixture_contract(
+        forged, fixture, cargo, workflow, ledger, forged_failures
+    )
+    require(
+        forged_failures,
+        "forged operator file-mode launch with reserved mesh.* tags must be rejected",
+        failures,
+    )
+
+    prod_launch = """
+    env \\
+        FERRUM_BACKEND_ALLOW_IPS=private \\
+        ./target/release/ferrum-edge
+"""
+    prod_failures: list[str] = []
+    _check_hbone_backend_allow_ips(prod_launch, prod_failures)
+    require(
+        prod_failures,
+        "production ferrum-edge launch must not satisfy the trusted fixture pin",
+        failures,
+    )
 
 
 def self_test() -> int:
@@ -900,6 +1097,7 @@ jobs:
     failures: list[str] = []
     check_workflow(sample, failures)
     _self_test_hbone_backend_allow_ips(failures)
+    _self_test_hbone_trusted_fixture_contract(failures)
     # Intentionally skip docs checks in self-test.
     if failures:
         print("self-test failures:", *failures, sep="\n- ")

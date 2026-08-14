@@ -39,6 +39,17 @@ publish = false
 name = "ferrum-edge"
 path = "src/main.rs"
 
+# Performance-only HBONE E2E fixture (issue #3332). Constructs the harness
+# GatewayConfig in-process and feeds it to `file::serve` / `ProxyState` the
+# same way mesh materialization does. This is not a production binary and
+# not a general-purpose trusted config loader. `test = false` so `cargo test`
+# does not execute this long-running process.
+[[example]]
+name = "hbone_perf_fixture"
+path = "examples/hbone_perf_fixture.rs"
+test = false
+bench = false
+
 # Functional tests for external secret-provider integrations. Lives in a
 # subdirectory (not a single tests/*.rs file) so it can carry shared helper
 # modules, which requires an explicit target declaration. Provider-specific
