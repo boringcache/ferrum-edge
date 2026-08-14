@@ -6778,6 +6778,7 @@ impl UdpAuthorizationSessionProbe {
             plugins: Arc::new(Vec::new()),
             datagram_plugins: Arc::from([]),
             datagram_client_ip: Arc::from("127.0.0.1"),
+            forwarded_client: None,
             datagram_proxy_id: Arc::from("udp-proxy"),
             datagram_proxy_name: Some(Arc::from("UDP Proxy")),
             datagram_payload_kind: StreamBytesKind::PlaintextWire,
