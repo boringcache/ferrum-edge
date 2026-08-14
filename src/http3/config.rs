@@ -97,8 +97,22 @@ pub(crate) fn quic_varint_or_default(value: u64, default_value: u64) -> quinn::V
 pub struct Http3ServerConfig {
     /// Maximum concurrent bidirectional streams per connection
     pub max_concurrent_streams: u32,
-    /// Connection idle timeout
+    /// Connection idle timeout exactly as `FERRUM_HTTP3_IDLE_TIMEOUT`
+    /// configures it. This is the value the H3 **backend** pools use.
     pub idle_timeout: Duration,
+    /// The QUIC `max_idle_timeout` the HTTP/3 **frontend** listener installs.
+    ///
+    /// Identical to [`Self::idle_timeout`] except when the RFC 9298 CONNECT-UDP
+    /// profile is enabled, where it is raised to at least
+    /// `FERRUM_HTTP3_CONNECT_UDP_IDLE_TIMEOUT_SECONDS`. A CONNECT-UDP tunnel
+    /// lives on a stream of one QUIC connection and an idle tunnel generates no
+    /// QUIC activity, so a smaller connection idle limit would close the tunnel
+    /// before its own idle bound could ever be reached — with the shipped
+    /// defaults, a 120-second tunnel terminated at 30 by a different
+    /// gateway-owned timer. The derivation only ever raises, never lowers, and
+    /// leaves the "0 disables the idle timer" semantic intact; see
+    /// [`crate::config::EnvConfig::effective_http3_idle_timeout_seconds`].
+    pub frontend_idle_timeout: Duration,
     /// Maximum time a QUIC handshake may take before the in-progress connection
     /// is aborted. Mirrors the TCP/TLS and DTLS frontend handshake bounds and
     /// is sourced from `FERRUM_FRONTEND_TLS_HANDSHAKE_TIMEOUT_SECONDS`.
@@ -144,12 +158,24 @@ impl Http3ServerConfig {
         Self {
             max_concurrent_streams: env.http3_max_streams,
             idle_timeout: Duration::from_secs(env.http3_idle_timeout),
+            frontend_idle_timeout: Duration::from_secs(env.effective_http3_idle_timeout_seconds()),
             stream_receive_window: env.http3_stream_receive_window,
             receive_window: env.http3_receive_window,
             send_window: env.http3_send_window,
             initial_mtu: env.http3_initial_mtu,
             handshake_timeout: Duration::from_secs(env.frontend_tls_handshake_timeout_seconds),
         }
+    }
+
+    /// Whether the RFC 9298 CONNECT-UDP idle bound actually raised the
+    /// frontend's QUIC idle timeout above the configured
+    /// `FERRUM_HTTP3_IDLE_TIMEOUT`.
+    ///
+    /// The listener logs this so the derivation is never silent: an operator
+    /// who set a smaller QUIC idle timeout is told which value the transport
+    /// installed and why.
+    pub fn connect_udp_raised_frontend_idle_timeout(&self) -> bool {
+        self.frontend_idle_timeout > self.idle_timeout
     }
 }
 
@@ -158,6 +184,9 @@ impl Default for Http3ServerConfig {
         Self {
             max_concurrent_streams: 1000,
             idle_timeout: Duration::from_secs(30),
+            // CONNECT-UDP defaults to off, so the frontend value defaults to
+            // the configured one.
+            frontend_idle_timeout: Duration::from_secs(30),
             stream_receive_window: H3_FRONTEND_STREAM_RECEIVE_WINDOW,
             receive_window: H3_FRONTEND_RECEIVE_WINDOW,
             send_window: H3_FRONTEND_SEND_WINDOW,
