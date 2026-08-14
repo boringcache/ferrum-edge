@@ -49,6 +49,7 @@ use crate::config::db_backend::{
     is_mtls_dns_admission_unavailable, mtls_dns_identity_conflict,
     tcp_connection_throttle_attachment_conflict,
 };
+use crate::config::gateway_trust::GatewayTrustBundleRecord;
 use crate::config::types::{
     ApiSpec, Consumer, GatewayConfig, PluginConfig, PluginScope, Proxy, Upstream,
     max_credentials_per_type,
@@ -1699,6 +1700,8 @@ fn paginated_get_list_route_role(method: &Method, segments: &[&str]) -> Option<O
         ["proxies"] | ["consumers"] | ["upstreams"] | ["plugins", "config"] | ["namespaces"] => {
             Some(None)
         }
+        // Trust material is security state: even the list shape is Operator-gated.
+        ["gateway-trust-bundles"] => Some(Some(AdminRole::Operator)),
         ["audit"] => Some(Some(AdminRole::Admin)),
         ["admin", "tls", "inventory"]
         | ["admin", "tls", "events"]
@@ -1759,6 +1762,10 @@ fn body_consuming_route_role(method: &Method, segments: &[&str]) -> Option<Optio
         ["plugins", "config", _] if is_put => Some(Some(AdminRole::Operator)),
         ["upstreams"] if is_post => Some(Some(AdminRole::Operator)),
         ["upstreams", _] if is_put => Some(Some(AdminRole::Operator)),
+        // Writing gateway trust roots is an Admin-only operation: it changes
+        // which peer identities the fleet will accept.
+        ["gateway-trust-bundles"] if is_post => Some(Some(AdminRole::Admin)),
+        ["gateway-trust-bundles", _] if is_put => Some(Some(AdminRole::Admin)),
         ["batch"] | ["restore"] if is_post => Some(Some(AdminRole::Admin)),
         ["mesh", "egress-scope", "test"] if is_post => Some(Some(AdminRole::Operator)),
         ["admin", "tls", "acme", "certificates"] if is_post => tls_role(),
@@ -1936,8 +1943,16 @@ fn extract_namespace(headers: &hyper::HeaderMap) -> Result<String, Response<Full
 fn is_namespace_scoped_route(segments: &[&str]) -> bool {
     match segments.first().copied() {
         Some(
-            "proxies" | "consumers" | "upstreams" | "api-specs" | "batch" | "backup" | "restore"
-            | "audit",
+            "proxies"
+            | "consumers"
+            | "upstreams"
+            | "api-specs"
+            | "batch"
+            | "backup"
+            | "restore"
+            | "audit"
+            | "gateway-trust-bundles"
+            | "gateway-trust",
         ) => true,
         // `GET /plugins` lists available plugin *types* (global metadata);
         // `/plugins/config[...]` is the namespace-scoped PluginConfig CRUD.
@@ -3207,6 +3222,68 @@ async fn handle_admin_request_inner(
                 return Ok(resp);
             }
             crud::handle_delete::<Upstream>(&state, &auth, id, &namespace).await
+        }
+
+        // Gateway trust bundles CRUD (issue #3727).
+        //
+        // Reads are Operator-gated and writes are Admin-only: a write here
+        // changes which peer identities the whole fleet will accept. Every arm
+        // is namespace-scoped through `X-Ferrum-Namespace`, and
+        // `is_namespace_scoped_route` includes this prefix so
+        // `FERRUM_ADMIN_REQUIRE_NAMESPACE_CLAIM` enforces the `ns` claim here
+        // exactly as it does for proxies and consumers.
+        (Method::GET, ["gateway-trust-bundles"]) => {
+            if let Some(resp) = require_admin_role(&auth, AdminRole::Operator) {
+                return Ok(resp);
+            }
+            let pagination = route_pagination!();
+            crud::handle_list::<GatewayTrustBundleRecord>(
+                &state,
+                &pagination,
+                auth.role,
+                &namespace,
+            )
+            .await
+        }
+        (Method::POST, ["gateway-trust-bundles"]) => {
+            if let Some(resp) = require_admin_role(&auth, AdminRole::Admin) {
+                return Ok(resp);
+            }
+            crud::handle_create::<GatewayTrustBundleRecord>(&state, &auth, &body_bytes, &namespace)
+                .await
+        }
+        // Process-wide load/convergence status. Placed BEFORE the `{id}` arm is
+        // unnecessary — it is a distinct path prefix, so no id can shadow it.
+        (Method::GET, ["gateway-trust", "status"]) => {
+            if let Some(resp) = require_admin_role(&auth, AdminRole::Operator) {
+                return Ok(resp);
+            }
+            handle_gateway_trust_status(&state, &namespace).await
+        }
+        (Method::GET, ["gateway-trust-bundles", id]) => {
+            if let Some(resp) = require_admin_role(&auth, AdminRole::Operator) {
+                return Ok(resp);
+            }
+            crud::handle_get::<GatewayTrustBundleRecord>(&state, id, auth.role, &namespace).await
+        }
+        (Method::PUT, ["gateway-trust-bundles", id]) => {
+            if let Some(resp) = require_admin_role(&auth, AdminRole::Admin) {
+                return Ok(resp);
+            }
+            crud::handle_update::<GatewayTrustBundleRecord>(
+                &state,
+                &auth,
+                id,
+                &body_bytes,
+                &namespace,
+            )
+            .await
+        }
+        (Method::DELETE, ["gateway-trust-bundles", id]) => {
+            if let Some(resp) = require_admin_role(&auth, AdminRole::Admin) {
+                return Ok(resp);
+            }
+            crud::handle_delete::<GatewayTrustBundleRecord>(&state, &auth, id, &namespace).await
         }
 
         // Batch create
@@ -5009,6 +5086,10 @@ fn restore_payload_from_config(config: GatewayConfig) -> RestorePayload {
         plugin_configs: config.plugin_configs,
         upstreams: config.upstreams,
         api_specs: None,
+        // Captured so a failed restore rolls trust back to exactly the prior
+        // generation rather than leaving whatever the failed import wrote
+        // (issue #3727).
+        gateway_trust_bundles: Some(config.gateway_trust_bundles),
     }
 }
 
@@ -5046,6 +5127,7 @@ impl RestoreSnapshot {
             plugin_configs: self.payload.plugin_configs.clone(),
             upstreams: self.payload.upstreams.clone(),
             api_specs: None,
+            gateway_trust_bundles: self.payload.gateway_trust_bundles.clone(),
         };
         if !self.api_specs.is_empty() || self.payload.api_specs.is_some() {
             payload.api_specs = Some(ApiSpecsBackupSection::from_specs(&self.api_specs));
@@ -5085,6 +5167,7 @@ struct PersistCounts {
     plugin_configs: usize,
     upstreams: usize,
     api_specs: usize,
+    gateway_trust_bundles: usize,
 }
 
 const DATABASE_OPERATION_FAILED_MESSAGE: &str = "Database unavailable — operation failed";
@@ -5125,6 +5208,10 @@ pub(crate) fn payload_persist_error_message(error: &anyhow::Error) -> String {
 async fn persist_payload_resources(
     db: &dyn DatabaseBackend,
     payload: &RestorePayload,
+    // The AUTHENTICATED target namespace. Gateway trust bundles are keyed by
+    // namespace and are a singleton, so the target cannot be inferred from the
+    // payload — it is passed explicitly (issue #3727).
+    namespace: &str,
     halt_on_error: bool,
     mode: &BatchConfigWriteMode,
 ) -> (PersistCounts, Vec<String>, bool) {
@@ -5225,7 +5312,127 @@ async fn persist_payload_resources(
         }
     }
 
+    // Gateway trust bundles (issue #3727).
+    //
+    // Reconciled explicitly rather than through the namespace clear: the clear
+    // deliberately leaves trust alone, so restoring a config backup can never
+    // silently revoke a namespace's roots. An ABSENT section means "the backup
+    // says nothing about trust" and is a no-op; a PRESENT section is
+    // authoritative and reconciles to exactly what it lists, including the
+    // empty case, which revokes.
+    if should_continue(&errors)
+        && let Some(records) = payload.gateway_trust_bundles.as_ref()
+    {
+        match reconcile_restored_gateway_trust_bundles(db, namespace, records).await {
+            Ok(persisted) => counts.gateway_trust_bundles = persisted,
+            Err(message) => errors.push(format!("gateway_trust_bundles: {message}")),
+        }
+    }
+
     (counts, errors, admission_unavailable)
+}
+
+/// Refusal when a restore payload carries more than one trust record for the
+/// target namespace. Names no ids and no material.
+pub(crate) const GATEWAY_TRUST_BUNDLE_RESTORE_NOT_SINGLETON_MESSAGE: &str = "restore payload declares more than one gateway trust bundle for the target namespace; the \
+     resource is a namespace singleton";
+
+/// Apply the restore payload's trust section to `namespace`.
+///
+/// Contract (issue #3727):
+///
+/// - the section is namespace-scoped and the target namespace is the
+///   AUTHENTICATED one, passed in — never read from the payload;
+/// - the resource is a singleton, so more than one record is refused outright
+///   rather than silently reduced to whichever came first;
+/// - a PRESENT-but-empty section is an explicit revocation and deletes the
+///   namespace's record;
+/// - an ABSENT section never reaches here at all (the caller skips), so a
+///   backup that predates the resource leaves trust untouched.
+///
+/// Every record is re-normalized and re-validated through the SAME admission
+/// path an admin `POST` uses, so a hand-edited or hostile backup cannot inject
+/// oversized or malformed trust material by going around the API. Errors are
+/// already redacted by `validate_fields`.
+///
+/// Returns the number of records persisted (0 for a revoke).
+async fn reconcile_restored_gateway_trust_bundles(
+    db: &dyn DatabaseBackend,
+    namespace: &str,
+    records: &[GatewayTrustBundleRecord],
+) -> Result<usize, String> {
+    if records.len() > 1 {
+        return Err(GATEWAY_TRUST_BUNDLE_RESTORE_NOT_SINGLETON_MESSAGE.to_string());
+    }
+
+    let desired = match records.first() {
+        Some(record) => {
+            let mut record = record.clone();
+            // The target namespace is server-selected; a payload namespace is
+            // never authoritative and never even consulted.
+            record.namespace = namespace.to_string();
+            record.normalize_fields();
+            record.validate_fields().map_err(|e| e.join("; "))?;
+            Some(record)
+        }
+        None => None,
+    };
+
+    let existing = db
+        .get_namespace_gateway_trust_bundle(namespace)
+        .await
+        .map_err(|error| redacted_persistence_error_message("restore", &error).to_string())?;
+
+    match (existing, desired) {
+        (Some(existing), Some(mut desired)) => {
+            // Server-owned fields survive the payload: the record keeps its
+            // stored identity and creation time, and `revision` is assigned by
+            // the store rather than adopted from a file an operator could edit.
+            desired.id = existing.id.clone();
+            desired.created_at = existing.created_at;
+            desired.updated_at = Utc::now();
+            // A payload revision is never an expectation and never a stored
+            // value; the store assigns the next one from the change sequence.
+            desired.revision = 0;
+            // Restore runs under the namespace admission lease, so it does not
+            // compete with a concurrent admin write and states no revision
+            // expectation; the store still compare-and-sets against the
+            // revision it reads inside the write transaction.
+            db.update_gateway_trust_bundle(&desired, None)
+                .await
+                .map_err(|error| {
+                    redacted_persistence_error_message("restore", &error).to_string()
+                })?;
+            Ok(1)
+        }
+        (Some(existing), None) => {
+            // Present-but-empty section: an explicit revocation.
+            db.delete_gateway_trust_bundle(namespace, &existing.id)
+                .await
+                .map_err(|error| {
+                    redacted_persistence_error_message("restore", &error).to_string()
+                })?;
+            Ok(0)
+        }
+        (None, Some(mut desired)) => {
+            // `revision` is deliberately NOT seeded here. The store assigns it
+            // from the durable change sequence, so a physically recreated record
+            // is always strictly newer than the incarnation the restore
+            // replaced; replaying a revision out of the payload (or restarting
+            // at 1) would let a client that read the previous incarnation
+            // compare-and-set against the restored one.
+            desired.revision = 0;
+            desired.created_at = Utc::now();
+            desired.updated_at = desired.created_at;
+            db.create_gateway_trust_bundle(&desired)
+                .await
+                .map_err(|error| {
+                    redacted_persistence_error_message("restore", &error).to_string()
+                })?;
+            Ok(1)
+        }
+        (None, None) => Ok(0),
+    }
 }
 
 /// Refuse `POST /batch` on a deployment that cannot persist a whole graph
@@ -5312,7 +5519,8 @@ async fn rollback_failed_restore(
         ));
     } else {
         let payload = snapshot.restore_payload_with_api_specs();
-        let (_, persist_errors, _) = persist_payload_resources(db, &payload, false, &mode).await;
+        let (_, persist_errors, _) =
+            persist_payload_resources(db, &payload, namespace, false, &mode).await;
         errors.extend(persist_errors);
     }
     if errors.is_empty() {
@@ -5373,6 +5581,11 @@ fn snapshot_resources_missing_after_intervening_write(
             .cloned()
             .collect(),
         api_specs: None,
+        // This compensation replays only resources an intervening writer
+        // removed. Trust is a namespace singleton with its own optimistic
+        // concurrency, so replaying it here could clobber a rotation that
+        // intervening writer committed; leave it to the explicit rollback path.
+        gateway_trust_bundles: None,
     }
 }
 
@@ -5497,7 +5710,7 @@ async fn restore_snapshot_after_intervening_clear(
     let mode = BatchConfigWriteMode::RestoreRollbackReplay {
         guard_owner: guard_owner.to_string(),
     };
-    let (_, mut errors, _) = persist_payload_resources(db, &missing, false, &mode).await;
+    let (_, mut errors, _) = persist_payload_resources(db, &missing, namespace, false, &mode).await;
     // Report an incomplete recovery rather than a silent success: the operator
     // must reconcile these by hand. Counts only — no resource ids, which may be
     // attacker-influenced payload values.
@@ -6402,6 +6615,59 @@ async fn handle_delete_credential_by_index(
     Ok(response)
 }
 
+// ---- Gateway trust bundles (issue #3727) ----
+
+/// `GET /gateway-trust/status` — namespace trust state that reached the live
+/// publication boundary, plus process-wide load/convergence counters.
+///
+/// Redaction contract: the payload carries the trust domain (already public
+/// configuration), authority COUNTS, the monotonic revision, timestamps, and a
+/// bounded failure-reason enum. It never carries PEM/DER/JWKS bytes, key ids,
+/// secret or provider URIs, or any unbounded identifier — an operator can see
+/// that a rotation converged without being handed the material.
+async fn handle_gateway_trust_status(
+    state: &AdminState,
+    namespace: &str,
+) -> Result<Response<Full<Bytes>>, hyper::Error> {
+    let process = crate::config::gateway_trust::observability_snapshot();
+    if state.db.is_none() {
+        return Ok(json_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            &json!({"error": "No database"}),
+        ));
+    }
+
+    // Read the per-namespace snapshot recorded at the SAME ArcSwap boundary as
+    // the live configuration. Reading the database here would let a freshly
+    // committed (or invalid out-of-band) revision appear as published before
+    // the poller had validated and swapped it, while an unrelated increment of
+    // the process-wide counter made the two values look converged.
+    let published = crate::config::gateway_trust::published_namespace_state(namespace);
+    let generation = published
+        .as_ref()
+        .map(|state| state.generation.clone())
+        .unwrap_or_else(|| crate::config::gateway_trust::published_namespace_generation(namespace));
+    Ok(json_response(
+        StatusCode::OK,
+        &json!({
+            "namespace": namespace,
+            "configured": published.is_some(),
+            // Distinguishes "this namespace has no trust record" from "this
+            // process cannot know whether it has one" (issue #3727). Only the
+            // database-mode backup bootstrap produces the latter, and it is a
+            // fail-closed state: gateway-to-mesh identity is refused while it
+            // holds. Carries no material and no path — one boolean.
+            "authority_unresolved": state
+                .proxy_state
+                .as_ref()
+                .is_some_and(ProxyState::gateway_trust_authority_is_unresolved),
+            "generation": generation,
+            "bundle": published.map(|state| state.bundle),
+            "process": process,
+        }),
+    ))
+}
+
 // ---- Plugin CRUD ----
 
 async fn handle_list_plugin_types() -> Result<Response<Full<Bytes>>, hyper::Error> {
@@ -7164,12 +7430,19 @@ fn backup_audit_admit_failed_response() -> Response<Full<Bytes>> {
     )
 }
 
+/// Sanitized export counts for the backup success audit record.
+///
+/// `gateway_trust_bundles` is a count only: exported trust roots are
+/// unredacted material, so the audit trail must record that they left the
+/// gateway without ever carrying certificate bytes, PEM, subjects, or
+/// revisions into an audit field.
 fn backup_counts_audit_value(
     proxy_count: usize,
     consumer_count: usize,
     plugin_config_count: usize,
     upstream_count: usize,
     api_specs_count: usize,
+    gateway_trust_bundles_count: usize,
 ) -> Value {
     json!({
         "proxies": proxy_count,
@@ -7177,6 +7450,7 @@ fn backup_counts_audit_value(
         "plugin_configs": plugin_config_count,
         "upstreams": upstream_count,
         "api_specs": api_specs_count,
+        "gateway_trust_bundles": gateway_trust_bundles_count,
     })
 }
 
@@ -7189,6 +7463,7 @@ struct BackupExportPayload<'filter, 'value> {
     plugin_config_count: usize,
     upstream_count: usize,
     api_specs_count: usize,
+    gateway_trust_bundles_count: usize,
 }
 
 async fn finalize_backup_export(
@@ -7207,6 +7482,7 @@ async fn finalize_backup_export(
         plugin_config_count,
         upstream_count,
         api_specs_count,
+        gateway_trust_bundles_count,
     } = payload;
     let resources = audit::backup_resources_audit_value(resource_filter);
     let event = audit::AuditEvent::new(
@@ -7224,6 +7500,7 @@ async fn finalize_backup_export(
                 plugin_config_count,
                 upstream_count,
                 api_specs_count,
+                gateway_trust_bundles_count,
             ),
             body_bytes.len(),
         ),
@@ -7240,12 +7517,13 @@ async fn finalize_backup_export(
     {
         Ok(_) => {
             info!(
-                "Backup: {} proxies, {} consumers, {} plugin_configs, {} upstreams, {} api_specs ({} bytes)",
+                "Backup: {} proxies, {} consumers, {} plugin_configs, {} upstreams, {} api_specs, {} gateway_trust_bundles ({} bytes)",
                 proxy_count,
                 consumer_count,
                 plugin_config_count,
                 upstream_count,
                 api_specs_count,
+                gateway_trust_bundles_count,
                 body_bytes.len()
             );
             backup_attachment_response(body_bytes, source)
@@ -7324,6 +7602,7 @@ enum ConsistentApiSpecsBackup {
         plugin_config_count: usize,
         upstream_count: usize,
         api_specs_count: usize,
+        gateway_trust_bundles_count: usize,
     },
     /// Authoritative config load failed; caller may use labeled cached fallback.
     ConfigUnavailable,
@@ -7339,12 +7618,17 @@ fn backup_resource_includes(resource_filter: Option<&HashSet<&str>>, name: &str)
 ///
 /// `export_carries_api_specs` must be true only when `api_specs` is present and
 /// the caller proved a single generation (admission guard for database exports).
+///
+/// Returns `(body_bytes, proxies, consumers, plugin_configs, upstreams,
+/// api_specs, gateway_trust_bundles)`. The trailing counts are what the backup
+/// success audit record reports, so they must describe what this payload
+/// actually carries — an omitted trust section counts `0`.
 fn serialize_backup_payload(
     mut config: GatewayConfig,
     source: &'static str,
     resource_filter: Option<&HashSet<&str>>,
     api_specs_owned: Option<ApiSpecsBackupSection>,
-) -> (Vec<u8>, usize, usize, usize, usize, usize) {
+) -> (Vec<u8>, usize, usize, usize, usize, usize, usize) {
     let include_proxies = backup_resource_includes(resource_filter, "proxies");
     let include_consumers = backup_resource_includes(resource_filter, "consumers");
     let include_plugin_configs = backup_resource_includes(resource_filter, "plugin_configs");
@@ -7419,6 +7703,24 @@ fn serialize_backup_payload(
         .map(|section| section.items.len())
         .unwrap_or(0);
 
+    // Gateway trust bundles (issue #3727). Full authoritative exports carry the
+    // section. A cached-fallback export cannot prove trust rows, and a
+    // resource-filtered export must contain ONLY the classes the caller named;
+    // both therefore omit the section entirely. This is especially important
+    // for partial backups later sent to `POST /batch`: unexpectedly carrying
+    // trust there would let `?resources=proxies` rotate a namespace's roots.
+    // Absence is the documented no-op on restore/import, so omission preserves
+    // trust rather than revoking it.
+    let gateway_trust_bundles: Option<&[GatewayTrustBundleRecord]> =
+        if source == "database" && resource_filter.is_none() {
+            Some(config.gateway_trust_bundles.as_slice())
+        } else {
+            None
+        };
+    // Omission counts as zero: the audit record must report what this payload
+    // actually released, never what the namespace happens to hold.
+    let gateway_trust_bundles_count = gateway_trust_bundles.map(<[_]>::len).unwrap_or(0);
+
     let backup = BackupPayload {
         version: &config.version,
         ferrum_version: crate::FERRUM_VERSION,
@@ -7430,11 +7732,13 @@ fn serialize_backup_payload(
             plugin_configs: plugin_configs.len(),
             upstreams: upstreams.len(),
             api_specs: api_specs_count,
+            gateway_trust_bundles: gateway_trust_bundles_count,
         },
         proxies,
         consumers,
         plugin_configs,
         upstreams,
+        gateway_trust_bundles,
         api_specs: api_specs_section,
     };
 
@@ -7446,6 +7750,7 @@ fn serialize_backup_payload(
         plugin_configs.len(),
         upstreams.len(),
         api_specs_count,
+        gateway_trust_bundles_count,
     )
 }
 
@@ -7502,6 +7807,7 @@ async fn build_consistent_api_specs_backup(
         plugin_config_count,
         upstream_count,
         api_specs_count,
+        gateway_trust_bundles_count,
     ) = serialize_backup_payload(
         config,
         "database",
@@ -7516,6 +7822,7 @@ async fn build_consistent_api_specs_backup(
         plugin_config_count,
         upstream_count,
         api_specs_count,
+        gateway_trust_bundles_count,
     }
 }
 
@@ -7670,6 +7977,7 @@ async fn handle_backup(
                 plugin_config_count,
                 upstream_count,
                 api_specs_count,
+                gateway_trust_bundles_count,
             } => {
                 return Ok(finalize_backup_export(
                     state,
@@ -7685,6 +7993,7 @@ async fn handle_backup(
                         plugin_config_count,
                         upstream_count,
                         api_specs_count,
+                        gateway_trust_bundles_count,
                     },
                 )
                 .await);
@@ -7800,6 +8109,7 @@ async fn handle_backup(
         plugin_config_count,
         upstream_count,
         api_specs_count,
+        gateway_trust_bundles_count,
     ) = serialize_backup_payload(config, source, resource_filter.as_ref(), None);
 
     Ok(finalize_backup_export(
@@ -7816,6 +8126,7 @@ async fn handle_backup(
             plugin_config_count,
             upstream_count,
             api_specs_count,
+            gateway_trust_bundles_count,
         },
     )
     .await)
@@ -8085,6 +8396,45 @@ async fn handle_restore(
     payload.consumers = candidate.consumers;
     payload.plugin_configs = candidate.plugin_configs;
     payload.upstreams = candidate.upstreams;
+
+    // Gateway trust bundles are namespace-keyed, and the target namespace comes
+    // from `X-Ferrum-Namespace`, not from the payload. Force it (as every other
+    // resource does above) so a backup taken in namespace A cannot write a
+    // record into namespace B, then validate the whole section BEFORE the
+    // destructive clear so an invalid rotation aborts with config intact
+    // (issue #3727).
+    if let Some(records) = payload.gateway_trust_bundles.as_mut() {
+        let mut trust_errors = Vec::new();
+        // The resource is a namespace singleton. Forcing several records into
+        // one namespace and letting the reconciler take whichever came first
+        // would make the restored trust state depend on payload order, so more
+        // than one is refused before anything is deleted.
+        if records.len() > 1 {
+            trust_errors.push(GATEWAY_TRUST_BUNDLE_RESTORE_NOT_SINGLETON_MESSAGE.to_string());
+        }
+        for record in records.iter_mut() {
+            record.namespace = namespace.to_string();
+            // Attribution is server-owned: the restoring admin subject, never
+            // whatever the backup file claimed.
+            record.updated_by = Some(actor.sub.clone());
+            // A backup file's revision is not authority: the store assigns a
+            // fresh backend-monotonic revision to whatever it physically writes.
+            record.revision = 0;
+            record.normalize_fields();
+            if let Err(errors) = record.validate_fields() {
+                trust_errors.extend(errors);
+            }
+        }
+        if !trust_errors.is_empty() {
+            return Ok(json_response(
+                StatusCode::BAD_REQUEST,
+                &json!({
+                    "error": "Restore payload validation failed — existing config was NOT deleted",
+                    "validation_errors": trust_errors
+                }),
+            ));
+        }
+    }
 
     // Validate or prepare the versioned api_specs section before any durable
     // mutation. Legacy backups that omit the section entirely require an
@@ -8514,6 +8864,7 @@ async fn handle_restore(
         .run_to_completion_while_held(import_operation.run_mutation(persist_payload_resources(
             db.as_ref(),
             &payload,
+            namespace,
             false,
             &restore_mode,
         )))
@@ -8650,6 +9001,7 @@ async fn handle_restore(
             "plugin_configs": created.plugin_configs,
             "upstreams": created.upstreams,
             "api_specs": created.api_specs,
+            "gateway_trust_bundles": created.gateway_trust_bundles,
         }
     });
 

@@ -13,9 +13,9 @@ use crate::config_sources::k8s::backend_tls_policy::{
 use crate::config_sources::k8s::{
     GatewayApiAllowedRoutesNamespaces, GatewayApiBackendTlsPolicyStatus, GatewayApiListenerKey,
     GatewayApiListenerParentKind, GatewayApiMaterializedRouteParent, GatewayApiRouteAttachment,
-    GatewayApiRouteConflict, GatewayApiRouteConflictKey, K8sObject, K8sResourceKey,
-    K8sTranslateError, K8sTranslation, K8sTranslationOptions, UNSUPPORTED_SHAPE_MARKER,
-    backend_lb_policy_conflict_losers, backend_lb_policy_status,
+    GatewayApiRouteConflict, GatewayApiRouteConflictKey, GatewayClassAuthority, K8sObject,
+    K8sResourceKey, K8sTranslateError, K8sTranslation, K8sTranslationOptions,
+    UNSUPPORTED_SHAPE_MARKER, backend_lb_policy_conflict_losers, backend_lb_policy_status,
     gateway_api_route_conflict_keys_with_acc, gateway_api_section_name_is_valid,
     gateway_api_status_conflict_context, merge_backend_lb_policy_status,
     namespace_selector_matches, parse_gateway_listener_allowed_route_namespaces,
@@ -27,12 +27,12 @@ use crate::k8s_controller::status_plan::{
     StatusPlanBudget, fair_work_window_iter, select_fair_work_window,
 };
 
-pub const FERRUM_GATEWAY_CONTROLLER_NAME: &str = "ferrum.io/gateway-controller";
+pub use crate::config_sources::k8s::FERRUM_GATEWAY_CONTROLLER_NAME;
+
 /// Stable server-side-apply owner shared by every Ferrum controller replica.
 /// Using the Gateway API controller name keeps ownership stable across restarts
 /// and replicas without inventing a pod- or process-specific identity.
 const GATEWAY_API_STATUS_FIELD_MANAGER: &str = FERRUM_GATEWAY_CONTROLLER_NAME;
-const DEFAULT_FERRUM_GATEWAY_CLASS_NAME: &str = "ferrum";
 const GATEWAY_API_STATUS_PATCH_PARALLELISM: usize = 32;
 const ROUTE_STATUS_PATCH_MAX_ATTEMPTS: usize = 5;
 const ROUTE_STATUS_PATCH_RETRY_BASE_MS: u64 = 10;
@@ -681,13 +681,13 @@ fn gateway_is_managed_by_ferrum_indexed(
     gateway: &K8sObject,
     gateway_classes_by_name: &HashMap<&str, &K8sObject>,
 ) -> bool {
-    let Some(class_name) = gateway.spec.get("gatewayClassName").and_then(Value::as_str) else {
-        return false;
-    };
-    if let Some(class) = gateway_classes_by_name.get(class_name) {
-        return gateway_class_is_managed_by_ferrum(class);
-    }
-    class_name == DEFAULT_FERRUM_GATEWAY_CLASS_NAME
+    GatewayClassAuthority::for_gateway(gateway, |class_name| {
+        gateway_classes_by_name
+            .get(class_name)
+            .copied()
+            .map(GatewayClassAuthority::from_gateway_class)
+    })
+    .is_ferrum_owned()
 }
 
 pub fn plan_gateway_api_status_updates(
@@ -3765,8 +3765,7 @@ fn api_resource_for_update(update: &GatewayApiStatusUpdate) -> Option<ApiResourc
 }
 
 fn gateway_class_is_managed_by_ferrum(object: &K8sObject) -> bool {
-    object.spec.get("controllerName").and_then(Value::as_str)
-        == Some(FERRUM_GATEWAY_CONTROLLER_NAME)
+    GatewayClassAuthority::from_gateway_class(object).is_ferrum_owned()
 }
 
 #[cfg(test)]
@@ -3958,7 +3957,7 @@ mod tests {
     }
 
     #[test]
-    fn gateway_status_uses_builtin_ferrum_class_when_unobserved() {
+    fn gateway_status_skips_unobserved_class_named_ferrum() {
         let gateway = object(
             "Gateway",
             "edge",
@@ -3970,10 +3969,12 @@ mod tests {
 
         let updates = plan_status_updates(&[gateway], options());
 
-        let gateway_update = update_for(&updates, "Gateway", "edge");
-        let conditions = gateway_update.status["conditions"].as_array().unwrap();
-        assert_condition(conditions, "Accepted", "True");
-        assert_condition(conditions, "Programmed", "True");
+        assert!(
+            !updates
+                .iter()
+                .any(|update| update.kind == "Gateway" && update.name == "edge"),
+            "an unobserved GatewayClass must not plan Gateway Accepted/Programmed status"
+        );
     }
 
     #[test]
@@ -3998,7 +3999,7 @@ mod tests {
     }
 
     #[test]
-    fn route_status_uses_builtin_ferrum_class_when_unobserved() {
+    fn route_status_skips_unobserved_class_named_ferrum() {
         let gateway = ferrum_gateway("edge");
         let route = object(
             "HTTPRoute",
@@ -4011,11 +4012,18 @@ mod tests {
 
         let updates = plan_status_updates(&[gateway, route], options());
 
-        let route_update = update_for(&updates, "HTTPRoute", "api");
-        let parents = route_update.status["parents"].as_array().unwrap();
-        let conditions = parents[0]["conditions"].as_array().unwrap();
-        assert_condition(conditions, "Accepted", "True");
-        assert_condition(conditions, "Programmed", "True");
+        assert!(
+            !updates
+                .iter()
+                .any(|update| update.kind == "Gateway" && update.name == "edge"),
+            "an unobserved GatewayClass must not plan Gateway status"
+        );
+        assert!(
+            !updates
+                .iter()
+                .any(|update| update.kind == "HTTPRoute" && update.name == "api"),
+            "an unobserved GatewayClass must not plan new route Accepted/Programmed status"
+        );
     }
 
     #[test]

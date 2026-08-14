@@ -10,14 +10,19 @@ use ferrum_edge::config::types::{
 };
 use ferrum_edge::consumer_index::ConsumerIndex;
 use ferrum_edge::dns::{DnsCache, DnsConfig};
+use ferrum_edge::fips::approved::HmacSha256Key;
 use ferrum_edge::load_balancer::LoadBalancerCache;
 use ferrum_edge::modes::mesh::config::MeshConfig;
 use ferrum_edge::plugin_cache::PluginCache;
 use ferrum_edge::proxy::client_ip::TrustedProxies;
+use ferrum_edge::proxy::datagram_client_address::{
+    DatagramEnvelopeAuth, DatagramEnvelopeForm, DatagramFreshness, DatagramListenerBinding,
+    DatagramListenerProtocol, encode_datagram_with_metadata, unix_now_millis,
+};
 use ferrum_edge::proxy::stream_listener::{StreamListenerDegradation, StreamListenerManager};
 use ferrum_edge::proxy::stream_match::{StreamMatchArm, StreamMatchCriteria};
 use ferrum_edge::request_epoch::RequestEpochStore;
-use std::net::IpAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::AsyncWriteExt;
@@ -316,6 +321,200 @@ fn empty_config() -> GatewayConfig {
         known_namespaces: Vec::new(),
         ..Default::default()
     }
+}
+
+const DATAGRAM_RELOAD_SECRET: &str = "0123456789abcdef0123456789abcdef";
+const UDP_RECV_WINDOW: Duration = Duration::from_millis(500);
+const UDP_DROP_WINDOW: Duration = Duration::from_millis(250);
+const UDP_PORT_FREE_TIMEOUT: Duration = Duration::from_secs(3);
+
+fn datagram_hmac_key() -> HmacSha256Key {
+    HmacSha256Key::new_from_slice(DATAGRAM_RELOAD_SECRET.as_bytes()).expect("hmac key")
+}
+
+/// The domain identity `StreamListenerManager` builds for a plain-UDP listener
+/// bound on loopback: receive-boundary protocol, canonical bind address, port.
+/// A reload must reconstruct exactly this, or nothing the balancer mints would
+/// verify (issue #3856).
+fn datagram_binding(port: u16) -> DatagramListenerBinding {
+    DatagramListenerBinding::new(
+        DatagramListenerProtocol::Udp,
+        "127.0.0.1".parse().expect("loopback bind addr"),
+        port,
+    )
+}
+
+/// Mint one authenticated envelope for `binding`, declaring `destination` and
+/// carrying the freshness record the gate requires (issue #3862).
+fn datagram_envelope(
+    binding: &DatagramListenerBinding,
+    destination: SocketAddr,
+    payload: &[u8],
+    sequence: u64,
+) -> Vec<u8> {
+    let key = datagram_hmac_key();
+    let freshness = DatagramFreshness {
+        sender_id: 1,
+        epoch: 1,
+        sequence,
+        timestamp_ms: unix_now_millis(),
+    };
+    let auth = DatagramEnvelopeAuth {
+        key: &key,
+        binding,
+        freshness,
+    };
+    let form = DatagramEnvelopeForm::Forwarded {
+        source: "203.0.113.9:41234".parse().expect("forwarded client"),
+        destination,
+    };
+    encode_datagram_with_metadata(form, payload, Some(&auth))
+}
+
+fn udp_proxy_for_datagram_reload(
+    listen_port: u16,
+    backend_port: u16,
+    stream_proxy_protocol: Option<bool>,
+) -> Proxy {
+    let mut proxy = create_stream_proxy("udp-dgram-reload", BackendScheme::Udp, listen_port);
+    proxy.backend_port = backend_port;
+    proxy.stream_proxy_protocol = stream_proxy_protocol;
+    proxy
+}
+
+async fn spawn_udp_echo_backend(socket: Arc<tokio::net::UdpSocket>) {
+    tokio::spawn(async move {
+        let mut buf = vec![0u8; 65535];
+        loop {
+            match socket.recv_from(&mut buf).await {
+                Ok((n, peer)) => {
+                    let _ = socket.send_to(&buf[..n], peer).await;
+                }
+                Err(_) => return,
+            }
+        }
+    });
+}
+
+async fn recv_udp_within(socket: &tokio::net::UdpSocket, window: Duration) -> Option<Vec<u8>> {
+    let mut buf = vec![0u8; 65535];
+    match tokio::time::timeout(window, socket.recv_from(&mut buf)).await {
+        Ok(Ok((n, _))) => Some(buf[..n].to_vec()),
+        _ => None,
+    }
+}
+
+async fn udp_roundtrip(
+    socket: &tokio::net::UdpSocket,
+    target: SocketAddr,
+    payload: &[u8],
+) -> Option<Vec<u8>> {
+    socket.send_to(payload, target).await.ok()?;
+    recv_udp_within(socket, UDP_RECV_WINDOW).await
+}
+
+fn create_datagram_reload_manager_runtime(
+    config_arc: Arc<ArcSwap<GatewayConfig>>,
+    config: &GatewayConfig,
+) -> StreamManagerRuntime {
+    let dns_cache = DnsCache::new(DnsConfig::default());
+    let lb_cache = Arc::new(LoadBalancerCache::new(config));
+    let consumer_index = Arc::new(ConsumerIndex::new(&config.consumers));
+    let plugin_cache = Arc::new(PluginCache::new(config).expect("PluginCache::new failed"));
+    let request_epoch = Arc::new(RequestEpochStore::from_runtime_parts(
+        (*config).clone(),
+        &plugin_cache,
+        &consumer_index,
+        &lb_cache,
+    ));
+    let cb_cache = Arc::new(CircuitBreakerCache::new());
+    let trusted_proxies =
+        Arc::new(TrustedProxies::parse_strict("127.0.0.1", "test").expect("trust list"));
+
+    let manager = StreamListenerManager::new(
+        "127.0.0.1".parse::<IpAddr>().unwrap(),
+        config_arc,
+        dns_cache,
+        request_epoch.clone(),
+        cb_cache,
+        None,
+        false,
+        None,
+        300,
+        300,
+        10,
+        10_000,
+        10,
+        None,
+        Arc::new(Vec::new()),
+        Arc::new(ferrum_edge::adaptive_buffer::AdaptiveBufferTracker::new(
+            true, true, 300, 8192, 262_144, 65_536, 6000,
+        )),
+        64,
+        true,
+        2048,
+        1,
+        256,
+        Arc::new(ferrum_edge::overload::OverloadState::new()),
+        false,
+        false,
+        false,
+        0,
+        false,
+        false,
+        false,
+        trusted_proxies,
+    );
+    manager.set_datagram_client_address_secret(Some(DATAGRAM_RELOAD_SECRET.to_string()));
+
+    StreamManagerRuntime {
+        manager,
+        request_epoch,
+        plugin_cache,
+        consumer_index,
+        lb_cache,
+    }
+}
+
+async fn publish_stream_config(
+    runtime: &StreamManagerRuntime,
+    config_arc: &Arc<ArcSwap<GatewayConfig>>,
+    config: GatewayConfig,
+) {
+    assert!(config.validate_stream_proxies().is_ok());
+    runtime
+        .request_epoch
+        .republish_from_runtime_parts_for_test(
+            config.clone(),
+            &runtime.plugin_cache,
+            &runtime.consumer_index,
+            &runtime.lb_cache,
+        )
+        .expect("request epoch must republish the reloaded stream route table");
+    config_arc.store(Arc::new(config));
+    let failures = runtime.manager.reconcile().await;
+    assert!(
+        failures.is_empty(),
+        "stream listener reconcile failed: {failures:?}"
+    );
+    runtime
+        .manager
+        .wait_until_started(Duration::from_secs(5))
+        .await
+        .expect("stream listener should start after reconcile");
+}
+
+async fn wait_until_udp_port_free(port: u16) -> bool {
+    tokio::time::timeout(UDP_PORT_FREE_TIMEOUT, async {
+        loop {
+            match tokio::net::UdpSocket::bind(format!("127.0.0.1:{port}")).await {
+                Ok(_) => return true,
+                Err(_) => tokio::time::sleep(Duration::from_millis(20)).await,
+            }
+        }
+    })
+    .await
+    .unwrap_or(false)
 }
 
 // ============================================================================
@@ -2363,6 +2562,167 @@ async fn test_reconcile_restarts_on_dedicated_bind_address_change() {
     tokio::net::TcpStream::connect((second, port))
         .await
         .expect("new dedicated bind must accept after rebind");
+
+    manager.shutdown_all().await;
+}
+
+// ============================================================================
+// Tests: datagram client-address gate reload (issue #3289)
+// ============================================================================
+
+/// `stream_proxy_protocol` is part of the UDP listener restart identity. A
+/// reconcile that toggles it must stop the old recv loop and bind a replacement
+/// with the new gate decision — not merely validate config or leave a stale
+/// listener serving the previous posture.
+#[tokio::test]
+async fn udp_stream_proxy_protocol_reload_restarts_listener_and_toggles_gate() {
+    let backend = Arc::new(
+        tokio::net::UdpSocket::bind("127.0.0.1:0")
+            .await
+            .expect("bind UDP echo backend"),
+    );
+    let backend_port = backend.local_addr().expect("backend addr").port();
+    spawn_udp_echo_backend(Arc::clone(&backend)).await;
+
+    let frontend_port = ephemeral_port().await;
+    let gateway_addr = SocketAddr::from(([127, 0, 0, 1], frontend_port));
+
+    let initial = GatewayConfig {
+        proxies: vec![udp_proxy_for_datagram_reload(
+            frontend_port,
+            backend_port,
+            None,
+        )],
+        ..empty_config()
+    };
+    assert!(initial.validate_stream_proxies().is_ok());
+
+    let config_arc = Arc::new(ArcSwap::from_pointee(initial.clone()));
+    let runtime = create_datagram_reload_manager_runtime(config_arc.clone(), &initial);
+    let manager = &runtime.manager;
+
+    let failures = manager.reconcile().await;
+    assert!(
+        failures.is_empty(),
+        "initial UDP listener should start: {failures:?}"
+    );
+    manager
+        .wait_until_started(Duration::from_secs(5))
+        .await
+        .expect("initial UDP listener should bind");
+
+    let client = tokio::net::UdpSocket::bind("127.0.0.1:0")
+        .await
+        .expect("bind UDP client");
+
+    // Envelope disabled: bare payloads follow ordinary UDP proxy behavior.
+    let reply = udp_roundtrip(&client, gateway_addr, b"bare-phase1")
+        .await
+        .expect("bare UDP must reach the echo backend before the gate is enabled");
+    assert_eq!(reply, b"bare-phase1");
+
+    // Enable the datagram client-address gate; reconcile must restart the listener.
+    publish_stream_config(
+        &runtime,
+        &config_arc,
+        GatewayConfig {
+            proxies: vec![udp_proxy_for_datagram_reload(
+                frontend_port,
+                backend_port,
+                Some(true),
+            )],
+            ..empty_config()
+        },
+    )
+    .await;
+
+    client
+        .send_to(b"bare-phase2", gateway_addr)
+        .await
+        .expect("send bare datagram on gated listener");
+    assert!(
+        recv_udp_within(&client, UDP_DROP_WINDOW).await.is_none(),
+        "bare UDP must be dropped after stream_proxy_protocol is enabled"
+    );
+
+    // A correctly shaped, authenticated envelope proves the replacement listener
+    // is serving rather than merely down after the restart — and that the
+    // reconstructed gate rebuilt this listener's exact domain binding.
+    let binding = datagram_binding(frontend_port);
+    let envelope = datagram_envelope(&binding, gateway_addr, b"gated-envelope", 0);
+    client
+        .send_to(&envelope, gateway_addr)
+        .await
+        .expect("send authenticated envelope");
+    let reply = recv_udp_within(&client, UDP_RECV_WINDOW)
+        .await
+        .expect("the restarted gated listener must admit an authenticated envelope");
+    assert_eq!(reply, b"gated-envelope");
+
+    // The reconstructed gate carries a live replay window, not just a key: the
+    // same bytes again are dropped (issue #3862).
+    client
+        .send_to(&envelope, gateway_addr)
+        .await
+        .expect("replay the authenticated envelope");
+    assert!(
+        recv_udp_within(&client, UDP_DROP_WINDOW).await.is_none(),
+        "a verbatim replay must be dropped by the reconstructed listener's replay window"
+    );
+
+    // And the reconstructed binding is this listener's: an envelope minted for
+    // another listener's binding under the same root secret is refused before a
+    // session is allocated (issue #3856).
+    let other_port = frontend_port.wrapping_add(1).max(1);
+    let other_binding = datagram_binding(other_port);
+    let other_addr = SocketAddr::from(([127, 0, 0, 1], other_port));
+    let portable = datagram_envelope(&other_binding, other_addr, b"wrong-listener", 1);
+    client
+        .send_to(&portable, gateway_addr)
+        .await
+        .expect("send portable envelope");
+    assert!(
+        recv_udp_within(&client, UDP_DROP_WINDOW).await.is_none(),
+        "an authenticated envelope for another listener must be dropped after reload"
+    );
+
+    // A fresh sequence still works, so neither refusal wedged the listener.
+    let fresh = datagram_envelope(&binding, gateway_addr, b"still-serving", 2);
+    client
+        .send_to(&fresh, gateway_addr)
+        .await
+        .expect("send a fresh sequence");
+    let reply = recv_udp_within(&client, UDP_RECV_WINDOW)
+        .await
+        .expect("a fresh sequence must still round-trip");
+    assert_eq!(reply, b"still-serving");
+
+    // Clearing the field must restart again and restore bare UDP behavior.
+    publish_stream_config(
+        &runtime,
+        &config_arc,
+        GatewayConfig {
+            proxies: vec![udp_proxy_for_datagram_reload(
+                frontend_port,
+                backend_port,
+                None,
+            )],
+            ..empty_config()
+        },
+    )
+    .await;
+
+    let reply = udp_roundtrip(&client, gateway_addr, b"bare-phase3")
+        .await
+        .expect("bare UDP must round-trip again after the gate is cleared");
+    assert_eq!(reply, b"bare-phase3");
+
+    // Deleting the proxy must withdraw the listener and release the port.
+    publish_stream_config(&runtime, &config_arc, empty_config()).await;
+    assert!(
+        wait_until_udp_port_free(frontend_port).await,
+        "UDP port {frontend_port} must be released after the proxy is deleted"
+    );
 
     manager.shutdown_all().await;
 }

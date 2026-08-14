@@ -154,6 +154,8 @@ tags:
     description: Submit, retrieve, replace, and delete OpenAPI/Swagger spec bundles that create proxy + upstream + plugin resources atomically
   - name: TLS
     description: TLS inventory/events/validation/forced reload require operator; persisted certificate, key, trust, JWKS, and ACME state mutations require admin
+  - name: Gateway Trust
+    description: Namespace-keyed gateway/mesh trust bundles distributed to data planes through CP/DP ConfigSync; reads require operator, writes require admin
 
 paths:
   # ── Health ──────────────────────────────────────────────────────────
@@ -5421,6 +5423,228 @@ paths:
         "503":
           $ref: "#/components/responses/NamespaceAdmissionUnavailable"
 
+  # ── Gateway trust bundles ───────────────────────────────────────────
+  /gateway-trust-bundles:
+    parameters:
+      - $ref: "#/components/parameters/XFerrumNamespace"
+    get:
+      operationId: listGatewayTrustBundles
+      summary: List the namespace's gateway trust bundle (paginated)
+      description: |
+        Returns a paginated envelope with `data` and `pagination` fields. The
+        resource is a singleton per namespace, so `data` holds either zero or
+        one item. Requires the `operator` role.
+
+        Only the namespace selected by `X-Ferrum-Namespace` is ever returned.
+        When `FERRUM_ADMIN_REQUIRE_NAMESPACE_CLAIM=true` the token's `ns` claim
+        must authorize that namespace.
+      tags: [Gateway Trust]
+      parameters:
+        - $ref: "#/components/parameters/PaginationOffset"
+        - $ref: "#/components/parameters/PaginationLimit"
+      responses:
+        "200":
+          description: Paginated gateway trust bundle records
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data, pagination]
+                properties:
+                  data:
+                    type: array
+                    items:
+                      $ref: "#/components/schemas/GatewayTrustBundle"
+                  pagination:
+                    $ref: "#/components/schemas/Pagination"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "503":
+          $ref: "#/components/responses/ServiceUnavailable"
+    post:
+      operationId: createGatewayTrustBundle
+      summary: Create the namespace's gateway trust bundle
+      description: |
+        Creates the namespace's single gateway trust-bundle resource. Requires
+        the `admin` role. A namespace that already holds a record returns `409`.
+
+        Server-owned identity: the stored `namespace` is always the
+        `X-Ferrum-Namespace` value and an omitted `id` defaults to that same
+        value. A `namespace`, `revision`, or `updated_by` field in the body is
+        ignored — attribution is the verified JWT subject and `revision` is
+        assigned by the store.
+
+        The `201` body is read back from the committed record, so its
+        `revision` is the value the store assigned and is the same value a
+        following `GET` returns.
+      tags: [Gateway Trust]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/GatewayTrustBundleCreate"
+      responses:
+        "201":
+          description: Created gateway trust bundle
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/GatewayTrustBundle"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/ReadOnly"
+        "408":
+          $ref: "#/components/responses/RequestTimeout"
+        "409":
+          description: |
+            The namespace already holds a record. Same typed body as the `PUT`
+            conflict so a client can decode one shape for both.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/GatewayTrustBundleConflict"
+        "503":
+          $ref: "#/components/responses/NamespaceAdmissionUnavailable"
+
+  /gateway-trust-bundles/{id}:
+    parameters:
+      - $ref: "#/components/parameters/ResourceId"
+      - $ref: "#/components/parameters/XFerrumNamespace"
+    get:
+      operationId: getGatewayTrustBundle
+      summary: Get the gateway trust bundle by ID
+      tags: [Gateway Trust]
+      responses:
+        "200":
+          description: Gateway trust bundle record
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/GatewayTrustBundle"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "503":
+          $ref: "#/components/responses/ServiceUnavailable"
+    put:
+      operationId: updateGatewayTrustBundle
+      summary: Rotate or replace the gateway trust bundle
+      description: |
+        Replaces the stored trust material. Requires the `admin` role.
+
+        Optimistic concurrency: send the `revision` you read. A mismatch returns
+        `409` with `expected_revision` and `current_revision` and writes
+        nothing. Omitting `revision` (or sending `0`) skips the check.
+
+        The store assigns the next revision itself; the value in the request
+        body is only the expectation. The `200` body is read back from the
+        committed record, so its `revision` is the newly assigned value, not the
+        expectation that was sent.
+
+        Revisions come from the backend's durable config-change sequence rather
+        than a per-record counter that restarts at 1, and a `DELETE` advances
+        that sequence too. A record that is deleted and recreated therefore
+        never reuses a revision, so a `PUT` carrying an expectation read before
+        the delete returns `409` (or `404` when the record is absent) instead of
+        overwriting the replacement.
+      tags: [Gateway Trust]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/GatewayTrustBundleCreate"
+      responses:
+        "200":
+          description: Updated gateway trust bundle
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/GatewayTrustBundle"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/ReadOnly"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "408":
+          $ref: "#/components/responses/RequestTimeout"
+        "409":
+          description: |
+            The namespace already holds a record (create), or the supplied
+            `revision` no longer matches the stored one (update).
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/GatewayTrustBundleConflict"
+        "503":
+          $ref: "#/components/responses/NamespaceAdmissionUnavailable"
+    delete:
+      operationId: deleteGatewayTrustBundle
+      summary: Revoke the namespace's gateway trust bundle
+      description: |
+        Explicit revocation. Requires the `admin` role. This is distinguishable
+        from "no change" on the wire: subscribed data planes receive an explicit
+        clear on the ConfigSync trust side channel and withdraw the roots.
+      tags: [Gateway Trust]
+      responses:
+        "204":
+          description: Gateway trust bundle deleted
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/ReadOnly"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "503":
+          $ref: "#/components/responses/NamespaceAdmissionUnavailable"
+
+  /gateway-trust/status:
+    parameters:
+      - $ref: "#/components/parameters/XFerrumNamespace"
+    get:
+      operationId: getGatewayTrustStatus
+      summary: Gateway trust load and convergence status
+      description: |
+        Namespace trust summary plus process-wide load/convergence counters.
+        Requires the `operator` role.
+
+        Redaction contract: the payload carries the trust domain, authority
+        counts, this namespace's revision, a digest `generation` identity,
+        timestamps, and a bounded failure-reason enum. It never carries
+        PEM/DER/JWKS bytes, key ids, or secret/provider URIs.
+      tags: [Gateway Trust]
+      responses:
+        "200":
+          description: Gateway trust status
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/GatewayTrustStatus"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "503":
+          $ref: "#/components/responses/ServiceUnavailable"
+
   # ── Namespaces ──────────────────────────────────────────────────────
   /namespaces:
     get:
@@ -7776,22 +8000,48 @@ components:
         stream_proxy_protocol:
           type: [boolean, "null"]
           description: |
-            Enable inbound PROXY protocol (v1 text or v2 binary, auto-detected) on this
-            stream proxy listener. When true, every inbound TCP connection must begin with a
-            valid PROXY header; connections that do not are closed immediately (fail closed).
+            Enable inbound PROXY protocol on this stream proxy listener. The framing
+            depends on the scheme:
+
+            * tcp / tcp_tls: PROXY protocol v1 text or v2 binary (auto-detected), read once
+              at the head of each accepted connection. A connection that does not begin with
+              a valid header is closed immediately (fail closed).
+            * udp / dtls: the PROXY protocol v2 DGRAM envelope, present on EVERY datagram
+              (a session-scoped header cannot be trusted on an unordered, lossy transport).
+              A datagram that does not decode is dropped; nothing is forwarded and no
+              session is created. When FERRUM_DATAGRAM_PROXY_PROTOCOL_SECRET is set, the
+              HMAC-SHA-256 tag is computed over a versioned domain-separation prefix
+              naming the exact receiving listener (receive-boundary protocol, canonical
+              bind address, port), so an envelope minted for listener A can never
+              authenticate on listener B under one process-global root secret — for every
+              command and family, LOCAL and AF_UNSPEC included. The envelope's declared
+              destination port is compared to this proxy's listen_port as defense in
+              depth. Each authenticated envelope also carries an authenticated freshness
+              record (sender id, epoch, monotonic sequence, timestamp), and the receiver
+              keeps a bounded per-sender sliding replay window, so a duplicate or stale
+              datagram is dropped before any session, plugin, or backend work. LOCAL and
+              AF_UNSPEC still never set a forwarded identity. Ferrum never emits the
+              envelope toward the backend, and replies are sent back to the socket peer
+              unwrapped.
 
             Trust requirement: the forwarded address is honoured only when the socket peer
             (the load balancer's own IP) belongs to the FERRUM_TRUSTED_PROXIES CIDR set. A
             connection from an untrusted peer on a PROXY-protocol-enabled listener is also
-            closed to prevent direct-connect clients from spoofing their source IP.
+            closed (TCP) or dropped (UDP/DTLS) to prevent direct-connect clients from
+            spoofing their source IP. On udp / dtls, set
+            FERRUM_DATAGRAM_PROXY_PROTOCOL_SECRET to additionally require an HMAC-SHA-256
+            tag and a freshness record on every datagram; source addresses are spoofable on
+            UDP, so that secret is what makes datagram metadata trustworthy off a protected
+            path. Without it the listener stays in the address-trust posture, which has
+            neither cryptographic authenticity nor freshness.
 
             After a trusted parse, client_ip in the stream context (and in stream logs and
-            authz plugins) is the forwarded source IP from the PROXY header; direct_client_ip
-            retains the raw socket peer (the LB's own IP). This mirrors XFF + FERRUM_TRUSTED_PROXIES
+            authz plugins) is the forwarded source IP; direct_client_ip retains the raw
+            socket peer (the LB's own IP). This mirrors XFF + FERRUM_TRUSTED_PROXIES
             on the HTTP path.
 
-            Only valid for tcp / tcp_tls stream proxies. Setting it on UDP, DTLS, or HTTP
-            proxies produces a validation error (PROXY protocol is TCP-borne).
+            Only valid for tcp / tcp_tls / udp / dtls stream proxies. Setting it on an
+            HTTP-family proxy produces a validation error (use X-Forwarded-For there).
 
             Default: null / false (disabled; socket peer is always used as client_ip).
         backend_proxy_protocol:
@@ -10534,6 +10784,282 @@ components:
         - $ref: "#/components/schemas/Upstream"
       required:
         - targets
+
+    GatewayTrustBundle:
+      type: object
+      description: |
+        Authoritative, namespace-keyed gateway/mesh trust-bundle resource
+        (issue #3727). At most one record exists per namespace.
+      required: [id, namespace, trust_domain, bundle, revision]
+      properties:
+        id:
+          type: string
+          maxLength: 255
+          description: >-
+            Stable resource identity. Defaults to the namespace when omitted on
+            create.
+        namespace:
+          type: string
+          description: >-
+            Owning namespace. Always forced to the `X-Ferrum-Namespace` value;
+            a value in the body is ignored.
+        trust_domain:
+          type: string
+          description: >-
+            Bundle identity. Must equal `bundle.local.trust_domain`; a
+            conflicting value is rejected rather than silently corrected.
+        bundle:
+          $ref: "#/components/schemas/GatewayTrustBundleSet"
+        revision:
+          type: integer
+          format: int64
+          minimum: 0
+          description: >-
+            Backend-assigned monotonic revision, taken from the durable
+            config-change sequence — never a per-record counter that restarts at
+            1, so it is never reused across a delete and recreate. On update, the
+            value sent is the expected current revision (`0` or omitted = no
+            expectation); the stored value is always assigned by the server.
+        updated_by:
+          type: [string, "null"]
+          maxLength: 255
+          description: >-
+            Admin JWT subject that last wrote the record. Server-assigned from
+            the verified token and capped at 255 characters so every backend
+            rejects an overlong subject before persistence. A value in the
+            request body is discarded. Attribution is never truncated.
+        created_at:
+          type: string
+          format: date-time
+        updated_at:
+          type: string
+          format: date-time
+
+    GatewayTrustBundleCreate:
+      type: object
+      required: [trust_domain, bundle]
+      properties:
+        id:
+          type: string
+          maxLength: 255
+          description: >-
+            Optional. Defaults to the authenticated `X-Ferrum-Namespace` value;
+            it is never derived from a `namespace` field in the body.
+        trust_domain:
+          type: string
+        bundle:
+          $ref: "#/components/schemas/GatewayTrustBundleSet"
+        revision:
+          type: integer
+          format: int64
+          minimum: 0
+          description: >-
+            Expected current revision for optimistic concurrency on update.
+            Ignored on create, and never stored — the store assigns the revision
+            from its durable change sequence.
+
+    GatewayTrustBundleSet:
+      type: object
+      description: |
+        SPIFFE trust material for gateway trust-bundle resources (issue #3727),
+        in the same shape the mesh configuration model uses. Bounded on
+        admission: at most 16 X.509 authorities and 16 JWT authorities per
+        bundle, at most 256 federated bundles (derived from
+        `MAX_MESH_REMOTE_CLUSTERS`), at most 16 KiB per authority, and at most
+        512 KiB for the encoded value as a whole. Each X.509 authority must
+        parse as a certificate that consumes the complete entry, and each JWT
+        authority's `public_key_pem` must parse as a public key the JWT-SVID
+        validator can actually use (SPKI `PUBLIC KEY` PEM or a SPIFFE-federation
+        JWK object).
+      required: [local]
+      properties:
+        local:
+          $ref: "#/components/schemas/TrustBundle"
+        federated:
+          type: array
+          maxItems: 256
+          items:
+            $ref: "#/components/schemas/TrustBundle"
+
+    TrustBundle:
+      type: object
+      description: |
+        One trust domain's authorities. Every `x509_authorities` entry must be
+        valid base64 AND parse as an X.509 certificate; every
+        `jwt_authorities.public_key_pem` must parse as a public key the JWT-SVID
+        validator can actually use — either an SPKI `PUBLIC KEY` PEM or a
+        SPIFFE-federation JWK object, matching `TrustBundleSet`. At least one
+        authority is required.
+      required: [trust_domain]
+      properties:
+        trust_domain:
+          type: string
+          description: SPIFFE trust domain (no `spiffe://` scheme).
+        x509_authorities:
+          type: array
+          maxItems: 16
+          items:
+            type: string
+            description: Base64-encoded DER certificate.
+        jwt_authorities:
+          type: array
+          maxItems: 16
+          items:
+            type: object
+            required: [key_id, public_key_pem]
+            properties:
+              key_id:
+                type: string
+                maxLength: 256
+              public_key_pem:
+                type: string
+                description: |
+                  SPKI `PUBLIC KEY` PEM, or a SPIFFE-federation JWK object
+                  preserved verbatim from a JWKS document. Both are proved by
+                  running the real parser, so a private-key paste, a truncated
+                  body, or an unsupported key type is rejected.
+        refresh_hint_seconds:
+          type: integer
+          format: int64
+          minimum: 0
+
+    GatewayTrustBundleConflict:
+      type: object
+      required: [error]
+      properties:
+        error:
+          type: string
+        expected_revision:
+          type: integer
+          format: int64
+          description: Present on a lost optimistic-concurrency race.
+        current_revision:
+          type: integer
+          format: int64
+          description: Present on a lost optimistic-concurrency race.
+
+    GatewayTrustBundleSummary:
+      type: object
+      description: >-
+        Material-free description of a namespace's trust state. Counts and
+        identity only — never PEM/DER/JWKS bytes.
+      required:
+        [
+          namespace,
+          trust_domain,
+          revision,
+          x509_authority_count,
+          jwt_authority_count,
+          federated_count,
+          updated_at,
+        ]
+      properties:
+        namespace:
+          type: string
+        trust_domain:
+          type: string
+        revision:
+          type: integer
+          format: int64
+        x509_authority_count:
+          type: integer
+        jwt_authority_count:
+          type: integer
+        federated_count:
+          type: integer
+        updated_at:
+          type: string
+          format: date-time
+
+    GatewayTrustStatus:
+      type: object
+      required:
+        [namespace, configured, authority_unresolved, generation, process]
+      properties:
+        namespace:
+          type: string
+        configured:
+          type: boolean
+          description: >-
+            Whether this namespace has a database trust-bundle generation at
+            the live configuration publication boundary. A committed candidate
+            is not reported here until the poller validates and publishes it;
+            a rejected candidate leaves the previous value unchanged.
+        authority_unresolved:
+          type: boolean
+          description: >-
+            `true` while this process cannot know the authoritative namespace
+            trust state, which happens only when database mode bootstrapped
+            from the on-disk config backup
+            (`FERRUM_DB_CONFIG_BACKUP_PATH`) because the database was
+            unreachable. A backup snapshot carries no trust resource, so an
+            absent record there means "unknown", not "revoked". While this is
+            `true` the gateway REFUSES gateway-to-mesh identity outright rather
+            than falling back to source-loaded SVID trust, which could
+            otherwise re-enable a root the committed database generation had
+            withdrawn. It clears when an authoritative database full reload
+            publishes; `configured` and `bundle` describe that published state
+            and are not a substitute for this flag.
+        generation:
+          type: string
+          description: >-
+            Namespace-safe configuration identity for trust: a SHA-256 digest
+            over (namespace, id, trust domain, revision, canonical material).
+            This identifies the live-published state, not merely the newest
+            database row. Two control-plane replicas that published the same
+            committed state report the same value, and any published rotation
+            or revocation changes it. Being a digest, it carries no trust
+            material.
+        bundle:
+          oneOf:
+            - $ref: "#/components/schemas/GatewayTrustBundleSummary"
+            - type: "null"
+          description: >-
+            Material-free summary of the live-published namespace generation.
+            Use the gateway-trust-bundle CRUD endpoints to inspect a persisted
+            candidate that has not yet reached publication.
+        process:
+          type: object
+          description: >-
+            Process-wide, label-free counters. Reset on process restart. There
+            is deliberately no process-wide revision: revisions are per
+            namespace and a single process value would be last-writer-wins on a
+            multi-namespace control plane. Use `bundle.revision` (this
+            namespace) or `generation`.
+          required:
+            [
+              published_generations_total,
+              load_rejections_total,
+              ambiguous_authority_total,
+              last_published_unix_seconds,
+              last_failure_reason,
+            ]
+          properties:
+            published_generations_total:
+              type: integer
+              format: int64
+              description: >-
+                Trust generations that reached the live-configuration swap, not
+                candidates that merely loaded. Publications carrying no
+                database trust record are not counted.
+            load_rejections_total:
+              type: integer
+              format: int64
+              description: >-
+                Candidates refused before the live swap; the previous valid
+                generation stayed active.
+            ambiguous_authority_total:
+              type: integer
+              format: int64
+              description: >-
+                Publications that found two authorities and kept the previously
+                accepted trust instead of publishing either.
+            last_published_unix_seconds:
+              type: integer
+              format: int64
+            last_failure_reason:
+              type: string
+              enum: [none, invalid_material, undecodable, ambiguous_authority]
 
     Upstream:
       type: object
@@ -14804,7 +15330,15 @@ components:
           description: Where the config was read from
         counts:
           type: object
-          required: [proxies, consumers, plugin_configs, upstreams, api_specs]
+          required:
+            [
+              proxies,
+              consumers,
+              plugin_configs,
+              upstreams,
+              api_specs,
+              gateway_trust_bundles,
+            ]
           properties:
             proxies:
               type: integer
@@ -14815,6 +15349,8 @@ components:
             upstreams:
               type: integer
             api_specs:
+              type: integer
+            gateway_trust_bundles:
               type: integer
         proxies:
           type: array
@@ -14832,6 +15368,21 @@ components:
           type: array
           items:
             $ref: "#/components/schemas/Upstream"
+        gateway_trust_bundles:
+          type: array
+          description: |
+            Namespace-keyed gateway trust bundles (issue #3727). Present on
+            full, unfiltered database-backed exports (possibly empty). ABSENT on
+            resource-filtered exports, cached-fallback exports, and backups that
+            predate the resource — restore treats an absent section as "say
+            nothing about trust" and leaves the namespace's existing roots in
+            place, while a present section is authoritative and reconciles to
+            exactly what it lists (an empty array revokes). Omitting this section
+            from every `?resources=` response prevents a partial artifact later
+            submitted to `POST /batch` from mutating trust outside the resource
+            classes the caller selected.
+          items:
+            $ref: "#/components/schemas/GatewayTrustBundle"
         api_specs:
           $ref: "#/components/schemas/ApiSpecsBackupSection"
 
@@ -14983,7 +15534,15 @@ components:
       properties:
         restored:
           type: object
-          required: [proxies, consumers, plugin_configs, upstreams, api_specs]
+          required:
+            [
+              proxies,
+              consumers,
+              plugin_configs,
+              upstreams,
+              api_specs,
+              gateway_trust_bundles,
+            ]
           properties:
             proxies:
               type: integer
@@ -15000,6 +15559,17 @@ components:
             api_specs:
               type: integer
               description: Number of API specs restored
+            gateway_trust_bundles:
+              type: integer
+              description: >-
+                Number of gateway trust-bundle records reconciled from the
+                payload's `gateway_trust_bundles` section (`0` or `1` — the
+                resource is a namespace singleton). `0` when the backup omits
+                the section, which leaves existing trust untouched, and also
+                `0` for a present-but-empty section, which is an explicit
+                revocation. A section carrying more than one record for the
+                target namespace is rejected with `400` before any existing
+                configuration is deleted.
     # ── Shared: Transaction-Log Schema Customization ──────────────────
     # Shape of the `schema:` block (and the entries inside
     # `transaction_log_schema.schemas`). See docs/log_schema.md for the

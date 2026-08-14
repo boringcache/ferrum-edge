@@ -547,9 +547,13 @@ impl Plugin for Opa {
                 body: self.body_input(ctx),
             },
         };
-        let mut request = self
-            .http_client
-            .get()
+        let Ok(client) = self.http_client.get() else {
+            return self.on_error(
+                "opa_call_failed",
+                "plugin HTTP client unavailable".to_string(),
+            );
+        };
+        let mut request = client
             .post(&self.decision_url)
             .timeout(self.timeout)
             .json(&payload);

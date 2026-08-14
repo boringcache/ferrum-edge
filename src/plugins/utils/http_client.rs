@@ -21,11 +21,22 @@
 //!   followed — SSRF defense-in-depth
 //! - **No ambient proxies**: `HTTP_PROXY`, `HTTPS_PROXY`, and related process
 //!   variables cannot redirect plugin traffic around gateway egress policy
+//! - **Fail-closed without host CA roots**: if rustls cannot load OS/native
+//!   trust anchors (a minimal image without `ca-certificates`), construction
+//!   does not abort or spin. The shared client is built with native roots
+//!   disabled and an empty trust store so TLS peers cannot authenticate.
+//!   Certificate verification is never turned off. If even that bounded
+//!   empty-trust construction fails, the wrapper stays inert (`get()` /
+//!   `get_http2()` return `Err`) and outbound calls fail closed without
+//!   panicking, hanging, or restoring ambient proxy, redirects, or an
+//!   unapproved crypto provider.
 //!
 //! # Usage for plugin authors
 //!
 //! If your plugin makes outbound HTTP calls, accept a `PluginHttpClient` in
-//! your constructor and use `client.get()` to get the shared `reqwest::Client`:
+//! your constructor and use `client.get()` to get the shared `reqwest::Client`.
+//! `get()` returns `Err` when terminal construction failed closed; fail closed
+//! rather than substituting `reqwest::Client::new()`.
 //!
 //! ```ignore
 //! pub struct MyPlugin {
@@ -45,9 +56,10 @@
 //!         // Uses pooled connections + gateway DNS cache - no per-call overhead.
 //!         // execute() automatically logs slow calls and can retry
 //!         // safe/idempotent requests on transport failures.
-//!         let req = self.http_client.get()
-//!             .post(&self.endpoint)
-//!             .json(summary);
+//!         let Ok(client) = self.http_client.get() else {
+//!             return;
+//!         };
+//!         let req = client.post(&self.endpoint).json(summary);
 //!         let _ = self.http_client.execute(req, "my_plugin").await;
 //!     }
 //! }
@@ -72,6 +84,42 @@ use std::time::Duration;
 pub struct PluginHttpFailure {
     pub error_class: ErrorClass,
     pub request_reached_wire: bool,
+}
+
+/// Terminal construction of the shared `reqwest` clients failed.
+///
+/// The gateway stays up. Callers must fail closed and must not substitute
+/// `reqwest::Client::new()` or restore ambient proxies, redirects, host roots,
+/// plaintext, or an unapproved crypto provider.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PluginHttpClientUnavailable;
+
+impl std::fmt::Display for PluginHttpClientUnavailable {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("plugin HTTP client unavailable")
+    }
+}
+
+impl std::error::Error for PluginHttpClientUnavailable {}
+
+fn unavailable_plugin_http_failure() -> PluginHttpFailure {
+    PluginHttpFailure {
+        error_class: ErrorClass::ConnectionPoolError,
+        request_reached_wire: false,
+    }
+}
+
+/// Return an inert local response when no shared client could be constructed.
+///
+/// This path never creates another client, dials, or logs per call. Terminal
+/// construction already emits one diagnostic; traffic must not turn that
+/// condition into repeated fallible builders or a warning storm.
+fn unavailable_reqwest_execute_result() -> Result<reqwest::Response, reqwest::Error> {
+    let mut denied = http::Response::new(reqwest::Body::from(
+        r#"{"error":"plugin HTTP client unavailable"}"#,
+    ));
+    *denied.status_mut() = http::StatusCode::BAD_GATEWAY;
+    Ok(reqwest::Response::from(denied))
 }
 
 /// Whether one execution may use the shared `FERRUM_PLUGIN_HTTP_MAX_RETRIES`
@@ -112,13 +160,15 @@ fn classify_plugin_http_failure(error: &reqwest::Error) -> PluginHttpFailure {
 /// the elapsed time and a caller-provided label.
 #[derive(Clone)]
 pub struct PluginHttpClient {
-    client: Arc<reqwest::Client>,
+    /// `None` when every bounded construction attempt failed. The gateway
+    /// remains up; [`Self::get`] / execute paths fail closed.
+    client: Option<Arc<reqwest::Client>>,
     /// HTTP/2-only companion built with `http2_prior_knowledge()` so cleartext
     /// destinations speak h2c and TLS destinations negotiate ALPN `h2`. Shares
     /// the same DNS resolver, TLS posture, pool/keepalive tuning, redirect, and
     /// no-proxy invariants as [`Self::client`]. Used by native gRPC mirror
     /// traffic; ordinary plugin HTTP continues to use [`Self::client`].
-    http2_client: Arc<reqwest::Client>,
+    http2_client: Option<Arc<reqwest::Client>>,
     /// Threshold above which outbound plugin HTTP calls are logged as slow.
     /// Configured via `FERRUM_PLUGIN_HTTP_SLOW_THRESHOLD_MS` (default: 1000ms).
     slow_threshold: Duration,
@@ -197,6 +247,8 @@ pub struct PluginHttpClient {
 impl std::fmt::Debug for PluginHttpClient {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("PluginHttpClient")
+            .field("has_shared_client", &self.client.is_some())
+            .field("has_http2_client", &self.http2_client.is_some())
             .field("slow_threshold", &self.slow_threshold)
             .field("max_retries", &self.max_retries)
             .field("retry_delay", &self.retry_delay)
@@ -266,6 +318,25 @@ impl PluginTlsPosture {
         Self::FailClosedCaBundle { source_id, reason }
     }
 
+    /// Fail-closed TLS when host/native roots cannot be loaded.
+    ///
+    /// reqwest 0.13's rustls backend calls `rustls_platform_verifier::Verifier::new`
+    /// unless `tls_certs_only` is set. On Linux that loads OS CA files via
+    /// `rustls_native_certs` and returns `Err` when the store is empty (a
+    /// container image without `ca-certificates`, a missing `SSL_CERT_FILE`).
+    /// `tls_certs_only([])` is the constructible closed posture for that gap:
+    /// it disables ambient native/built-in roots and installs an empty
+    /// `RootCertStore` while leaving certificate verification enabled.
+    /// rustls `with_root_certificates` uses `WebPkiServerVerifier::new_without_revocation`,
+    /// which does not reject an empty store at construction; handshake
+    /// verification then fails for every peer. This does **not** call
+    /// `danger_accept_invalid_certs(true)`.
+    fn apply_fail_closed_empty_trust(builder: reqwest::ClientBuilder) -> reqwest::ClientBuilder {
+        builder
+            .tls_danger_accept_invalid_certs(false)
+            .tls_certs_only(Vec::<reqwest::Certificate>::new())
+    }
+
     /// Reduce a builder to a posture that can complete no request.
     ///
     /// Reached only when [`crate::fips::ensure_internal_client_crypto_provider`]
@@ -289,10 +360,22 @@ impl PluginTlsPosture {
     /// request. Certificate verification is therefore re-asserted explicitly
     /// too, so a future reordering cannot silently reopen either hole.
     fn apply_inert_crypto_posture(builder: reqwest::ClientBuilder) -> reqwest::ClientBuilder {
-        builder
-            .tls_danger_accept_invalid_certs(false)
-            .https_only(true)
-            .tls_certs_only(Vec::<reqwest::Certificate>::new())
+        Self::apply_fail_closed_empty_trust(builder).https_only(true)
+    }
+
+    /// Terminal TLS for a builder that already failed with the configured
+    /// posture. A FIPS provider mismatch stays on the inert HTTPS-only
+    /// empty-store path; every other failure disables native roots without
+    /// weakening verification.
+    fn apply_terminal_fail_closed_tls(
+        builder: reqwest::ClientBuilder,
+        provider_mismatch: bool,
+    ) -> reqwest::ClientBuilder {
+        if provider_mismatch {
+            Self::apply_inert_crypto_posture(builder)
+        } else {
+            Self::apply_fail_closed_empty_trust(builder)
+        }
     }
 
     /// Apply the configured posture, or the inert one when the process-default
@@ -320,34 +403,12 @@ impl PluginTlsPosture {
                     error = %reason,
                     "Applying empty trust store for invalid plugin HTTP CA bundle"
                 );
-                builder.tls_certs_only(Vec::<reqwest::Certificate>::new())
+                Self::apply_fail_closed_empty_trust(builder)
             }
         }
     }
 }
 
-/// Build a minimal `reqwest::Client` that still uses the gateway's DNS cache
-/// when available.
-///
-/// Used as a fallback when a fully-configured builder fails (e.g., due to
-/// unsupported pool/keep-alive settings). Keeps the DNS cache attached so
-/// plugin outbound calls do not silently fall through to system DNS — every
-/// call would otherwise burn an ephemeral port through a fresh OS resolver,
-/// which CLAUDE.md explicitly forbids ("DnsCacheResolver must be plugged into
-/// every reqwest::Client in production").
-///
-/// TLS posture is already resolved by the startup-only caller and is applied
-/// again here so falling back never widens trust from a configured custom CA
-/// bundle to platform/webpki roots.
-///
-/// When `http2_prior_knowledge` is true, the fallback retains HTTP/2-only
-/// negotiation (h2c / ALPN h2) so a degraded build path cannot silently
-/// downgrade native gRPC mirror traffic to HTTP/1.1.
-///
-/// If even this minimal builder fails, build a no-DNS fallback that still keeps
-/// redirects and ambient proxies disabled and applies the caller's TLS posture.
-/// If that cannot be constructed either, drop custom TLS posture but retain
-/// those two non-negotiable egress controls.
 /// Parse a `FERRUM_*` boolean gate that defaults to enabled when unset.
 pub fn parse_ferrum_flag_default_true(value: Option<&str>) -> bool {
     match value {
@@ -370,22 +431,173 @@ pub fn parse_max_request_body_size_bytes_from_resolved(value: Option<&str>) -> u
         .unwrap_or(10_485_760)
 }
 
+#[derive(Debug)]
+struct PluginHttpClientBuildError {
+    message: String,
+}
+
+impl PluginHttpClientBuildError {
+    fn from_reqwest(error: reqwest::Error) -> Self {
+        Self {
+            message: error.to_string(),
+        }
+    }
+
+    fn from_rustls(error: rustls::Error) -> Self {
+        Self {
+            message: error.to_string(),
+        }
+    }
+}
+
+impl std::fmt::Display for PluginHttpClientBuildError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+fn plugin_client_no_proxy_no_redirect() -> reqwest::ClientBuilder {
+    reqwest::Client::builder()
+        .no_proxy()
+        .redirect(reqwest::redirect::Policy::none())
+}
+
+fn attach_plugin_client_dns(
+    builder: reqwest::ClientBuilder,
+    dns_cache: Option<&DnsCache>,
+) -> reqwest::ClientBuilder {
+    match dns_cache {
+        Some(dns_cache) => builder.dns_resolver(Arc::new(DnsCacheResolver::new(dns_cache.clone()))),
+        None => builder,
+    }
+}
+
+fn attach_plugin_client_http2(
+    builder: reqwest::ClientBuilder,
+    http2_prior_knowledge: bool,
+) -> reqwest::ClientBuilder {
+    if http2_prior_knowledge {
+        builder.http2_prior_knowledge()
+    } else {
+        builder
+    }
+}
+
+fn try_build_plugin_client(
+    dns_cache: Option<&DnsCache>,
+    http2_prior_knowledge: bool,
+    apply_tls: impl FnOnce(reqwest::ClientBuilder) -> reqwest::ClientBuilder,
+) -> Result<reqwest::Client, reqwest::Error> {
+    let builder = plugin_client_no_proxy_no_redirect();
+    let builder = attach_plugin_client_dns(builder, dns_cache);
+    let builder = apply_tls(builder);
+    let builder = attach_plugin_client_http2(builder, http2_prior_knowledge);
+    builder.build()
+}
+
+fn fail_closed_rustls_client_config(
+    http2_prior_knowledge: bool,
+) -> Result<rustls::ClientConfig, rustls::Error> {
+    let provider = Arc::new(crate::fips::base_crypto_provider());
+    let builder = match rustls::ClientConfig::builder_with_provider(provider.clone())
+        .with_safe_default_protocol_versions()
+    {
+        Ok(builder) => builder,
+        Err(_) => rustls::ClientConfig::builder_with_provider(provider)
+            .with_protocol_versions(&[&rustls::version::TLS13, &rustls::version::TLS12])?,
+    };
+    let mut tls = builder
+        .with_root_certificates(rustls::RootCertStore::empty())
+        .with_no_client_auth();
+    tls.alpn_protocols = if http2_prior_knowledge {
+        vec![b"h2".to_vec()]
+    } else {
+        vec![b"h2".to_vec(), b"http/1.1".to_vec()]
+    };
+    Ok(tls)
+}
+
+fn try_build_preconfigured_fail_closed_plugin_client(
+    dns_cache: Option<&DnsCache>,
+    http2_prior_knowledge: bool,
+    provider_mismatch: bool,
+) -> Result<reqwest::Client, PluginHttpClientBuildError> {
+    let tls = fail_closed_rustls_client_config(http2_prior_knowledge)
+        .map_err(PluginHttpClientBuildError::from_rustls)?;
+    let builder = attach_plugin_client_dns(plugin_client_no_proxy_no_redirect(), dns_cache);
+    let mut builder = builder
+        .use_preconfigured_tls(tls)
+        .tls_danger_accept_invalid_certs(false);
+    if provider_mismatch {
+        builder = builder.https_only(true);
+    }
+    builder = attach_plugin_client_http2(builder, http2_prior_knowledge);
+    builder
+        .build()
+        .map_err(PluginHttpClientBuildError::from_reqwest)
+}
+
+/// Bounded fail-closed construction: empty rustls roots, verification on,
+/// ambient proxies and redirects disabled. Reqwest's `BuiltRustls` path does
+/// not consult host CA files. Each step is attempted at most once. Terminal
+/// failure is returned as `Err` so callers can stay inert without panicking,
+/// hanging, or restoring ambient proxy routing.
+fn build_fail_closed_plugin_client(
+    dns_cache: Option<&DnsCache>,
+    http2_prior_knowledge: bool,
+    provider_mismatch: bool,
+) -> Result<reqwest::Client, PluginHttpClientBuildError> {
+    match try_build_plugin_client(dns_cache, http2_prior_knowledge, |builder| {
+        PluginTlsPosture::apply_terminal_fail_closed_tls(builder, provider_mismatch)
+    }) {
+        Ok(client) => return Ok(client),
+        Err(error) => tracing::error!(
+            error = %error,
+            http2_prior_knowledge,
+            has_gateway_dns_resolver = dns_cache.is_some(),
+            "Fail-closed empty-trust plugin HTTP client failed; using a preconfigured \
+             empty rustls root store with the same DNS and protocol posture"
+        ),
+    }
+
+    try_build_preconfigured_fail_closed_plugin_client(
+        dns_cache,
+        http2_prior_knowledge,
+        provider_mismatch,
+    )
+}
+
+/// Build a minimal `reqwest::Client` that still uses the gateway's DNS cache
+/// when available.
+///
+/// Used as a fallback when a fully-configured builder fails (e.g., due to
+/// unsupported pool/keep-alive settings). Keeps the DNS cache attached so
+/// plugin outbound calls do not silently fall through to system DNS — every
+/// call would otherwise burn an ephemeral port through a fresh OS resolver,
+/// which CLAUDE.md explicitly forbids ("DnsCacheResolver must be plugged into
+/// every reqwest::Client in production").
+///
+/// TLS posture is already resolved by the startup-only caller and is applied
+/// again here so falling back never widens trust from a configured custom CA
+/// bundle to platform/webpki roots.
+///
+/// When `http2_prior_knowledge` is true, the fallback retains HTTP/2-only
+/// negotiation (h2c / ALPN h2) so a degraded build path cannot silently
+/// downgrade native gRPC mirror traffic to HTTP/1.1.
+///
+/// If even this minimal builder fails, construct a fail-closed empty-trust
+/// client rather than aborting the process. A supplied gateway DNS resolver is
+/// retained on every attempt so fallback cannot bypass hostname egress policy.
+/// Terminal construction is a bounded `Result`: it never panics, never retries
+/// without a limit, and never restores ambient proxy, redirects, weakened TLS,
+/// system-DNS egress, or a downgraded HTTP/2 companion.
 fn build_dns_cached_fallback_client(
     dns_cache: Option<DnsCache>,
     tls_posture: &PluginTlsPosture,
     http2_prior_knowledge: bool,
-) -> reqwest::Client {
+) -> Result<reqwest::Client, PluginHttpClientBuildError> {
     let crypto_provider = crate::fips::ensure_internal_client_crypto_provider();
     let provider_mismatch = crypto_provider.is_err();
-    // Never auto-follow redirects on a shared outbound client (SSRF posture,
-    // matches src/connection_pool.rs and the configured clients above).
-    let mut builder = reqwest::Client::builder()
-        .no_proxy()
-        .redirect(reqwest::redirect::Policy::none());
-    if let Some(dns_cache) = dns_cache {
-        let resolver = DnsCacheResolver::new(dns_cache);
-        builder = builder.dns_resolver(Arc::new(resolver));
-    }
     if let Err(error) = &crypto_provider {
         tracing::error!(
             %error,
@@ -394,60 +606,36 @@ fn build_dns_cached_fallback_client(
              unable to establish any connection."
         );
     }
-    builder = tls_posture.apply_or_inert(builder, provider_mismatch);
-    if http2_prior_knowledge {
-        builder = builder.http2_prior_knowledge();
+
+    match try_build_plugin_client(dns_cache.as_ref(), http2_prior_knowledge, |builder| {
+        tls_posture.apply_or_inert(builder, provider_mismatch)
+    }) {
+        Ok(client) => return Ok(client),
+        Err(error) => tracing::error!(
+            error = %error,
+            http2_prior_knowledge,
+            "Failed to build minimal DNS-cached fallback plugin client; \
+             retrying with fail-closed empty-trust TLS while keeping the DNS cache"
+        ),
     }
-    builder.build().unwrap_or_else(|e| {
-        tracing::error!(
-            "Failed to build minimal DNS-cached fallback plugin client: {}. \
-             Falling back to a no-redirect minimal plugin client with the same \
-             TLS posture as a last resort.",
-            e
-        );
-        let mut builder = tls_posture.apply_or_inert(
-            reqwest::Client::builder()
-                .no_proxy()
-                .redirect(reqwest::redirect::Policy::none()),
-            provider_mismatch,
-        );
-        if http2_prior_knowledge {
-            builder = builder.http2_prior_knowledge();
+
+    build_fail_closed_plugin_client(dns_cache.as_ref(), http2_prior_knowledge, provider_mismatch)
+}
+
+fn accept_plugin_http_client(
+    result: Result<reqwest::Client, PluginHttpClientBuildError>,
+    context: &'static str,
+) -> Option<Arc<reqwest::Client>> {
+    match result {
+        Ok(client) => Some(Arc::new(client)),
+        Err(error) => {
+            tracing::error!(
+                error = %error,
+                "{context}; outbound plugin HTTP will fail closed without aborting the gateway"
+            );
+            None
         }
-        match builder.build() {
-            Ok(client) => client,
-            Err(e2) => {
-                tracing::error!(
-                    "Failed to build fallback plugin client with redirect and TLS policy set: {}. \
-                     Retrying without custom TLS posture while keeping redirects disabled.",
-                    e2
-                );
-                let mut builder = reqwest::Client::builder()
-                    .no_proxy()
-                    .redirect(reqwest::redirect::Policy::none());
-                if provider_mismatch {
-                    builder = PluginTlsPosture::apply_inert_crypto_posture(builder);
-                }
-                if http2_prior_knowledge {
-                    builder = builder.http2_prior_knowledge();
-                }
-                builder.build().unwrap_or_else(|e3| {
-                    // The production gateway builds this shared client
-                    // before its initial plugin cache. Full and delta
-                    // cache rebuilds clone that existing client and never
-                    // re-enter this builder.
-                    //
-                    // Invariant: a bare reqwest builder with no custom
-                    // resolver, TLS material, proxy, or redirect policy
-                    // has no fallible operator input. If reqwest ever
-                    // breaks that invariant, aborting client construction
-                    // is safer than silently re-enabling ambient proxy
-                    // routing.
-                    panic!("Failed to build fail-closed minimal plugin HTTP client: {e3}")
-                })
-            }
-        }
-    })
+    }
 }
 
 /// Build a fully-configured plugin `reqwest::Client`, optionally forcing
@@ -457,7 +645,7 @@ fn build_configured_plugin_client(
     dns_cache: Option<DnsCache>,
     tls_posture: &PluginTlsPosture,
     http2_prior_knowledge: bool,
-) -> reqwest::Client {
+) -> Result<reqwest::Client, PluginHttpClientBuildError> {
     let crypto_provider = crate::fips::ensure_internal_client_crypto_provider();
     let mut builder = reqwest::Client::builder()
         .no_proxy()
@@ -520,17 +708,21 @@ fn build_configured_plugin_client(
             ));
     }
 
-    builder.build().unwrap_or_else(|e| {
-        tracing::error!(
-            http2_prior_knowledge,
-            "Failed to build fully-configured plugin HTTP client: {e}. Retrying a \
-             minimal builder that preserves the TLS trust posture (custom CA / \
-             no-verify), DNS cache, and HTTP/2 preference, dropping only \
-             pool/keepalive tuning — a custom CA configured for exclusivity must \
-             not be silently widened to platform/webpki roots."
-        );
-        build_dns_cached_fallback_client(dns_cache, tls_posture, http2_prior_knowledge)
-    })
+    match builder.build() {
+        Ok(client) => Ok(client),
+        Err(error) => {
+            tracing::error!(
+                http2_prior_knowledge,
+                error = %error,
+                "Failed to build fully-configured plugin HTTP client. Retrying a \
+                 minimal builder that preserves the TLS trust posture (custom CA / \
+                 no-verify), DNS cache, and HTTP/2 preference, dropping only \
+                 pool/keepalive tuning — a custom CA configured for exclusivity must \
+                 not be silently widened to platform/webpki roots."
+            );
+            build_dns_cached_fallback_client(dns_cache, tls_posture, http2_prior_knowledge)
+        }
+    }
 }
 
 impl PluginHttpClient {
@@ -569,18 +761,23 @@ impl PluginHttpClient {
         let dns_cache_clone = dns_cache.clone();
         let tls_posture = PluginTlsPosture::from_config(tls_no_verify, tls_ca_bundle_path);
 
-        let client = build_configured_plugin_client(
-            pool_config,
-            Some(dns_cache.clone()),
-            &tls_posture,
-            false,
+        let client = accept_plugin_http_client(
+            build_configured_plugin_client(
+                pool_config,
+                Some(dns_cache.clone()),
+                &tls_posture,
+                false,
+            ),
+            "Failed to build the shared plugin HTTP client",
         );
-        let http2_client =
-            build_configured_plugin_client(pool_config, Some(dns_cache), &tls_posture, true);
+        let http2_client = accept_plugin_http_client(
+            build_configured_plugin_client(pool_config, Some(dns_cache), &tls_posture, true),
+            "Failed to build the HTTP/2 plugin HTTP companion client",
+        );
 
         Self {
-            client: Arc::new(client),
-            http2_client: Arc::new(http2_client),
+            client,
+            http2_client,
             slow_threshold: Duration::from_millis(slow_threshold_ms),
             max_retries,
             retry_delay: Duration::from_millis(retry_delay_ms),
@@ -631,12 +828,18 @@ impl PluginHttpClient {
     /// to share the gateway's DNS cache across all plugins.
     pub fn from_pool_config(config: &PoolConfig) -> Self {
         let tls_posture = PluginTlsPosture::PlatformRoots;
-        let client = build_configured_plugin_client(config, None, &tls_posture, false);
-        let http2_client = build_configured_plugin_client(config, None, &tls_posture, true);
+        let client = accept_plugin_http_client(
+            build_configured_plugin_client(config, None, &tls_posture, false),
+            "Failed to build the shared plugin HTTP client",
+        );
+        let http2_client = accept_plugin_http_client(
+            build_configured_plugin_client(config, None, &tls_posture, true),
+            "Failed to build the HTTP/2 plugin HTTP companion client",
+        );
 
         Self {
-            client: Arc::new(client),
-            http2_client: Arc::new(http2_client),
+            client,
+            http2_client,
             slow_threshold: Duration::from_millis(1000),
             max_retries: 0,
             retry_delay: Duration::from_millis(100),
@@ -905,6 +1108,11 @@ impl PluginHttpClient {
 
     /// Get the underlying `reqwest::Client` for building requests.
     ///
+    /// Returns `Err` when every bounded construction attempt failed closed.
+    /// Callers must fail closed and must not substitute `reqwest::Client::new()`
+    /// or restore ambient proxies, redirects, host roots, plaintext, or an
+    /// unapproved crypto provider.
+    ///
     /// The returned client uses pooled connections - no per-call overhead.
     /// Prefer [`execute`] over calling `.send()` directly so that slow
     /// outbound calls are automatically logged with the destination URL.
@@ -913,11 +1121,14 @@ impl PluginHttpClient {
     ///
     /// For native gRPC / cleartext HTTP/2 destinations, use [`get_http2`]
     /// instead so the request is built on the HTTP/2-prior-knowledge companion.
-    pub fn get(&self) -> &reqwest::Client {
-        &self.client
+    pub fn get(&self) -> Result<&reqwest::Client, PluginHttpClientUnavailable> {
+        self.client.as_deref().ok_or(PluginHttpClientUnavailable)
     }
 
     /// Get the HTTP/2-prior-knowledge companion client.
+    ///
+    /// Returns `Err` when companion construction failed closed. Callers must
+    /// fail closed without substituting an ambient-proxy-aware default client.
     ///
     /// Cleartext destinations use h2c; TLS destinations negotiate ALPN `h2`
     /// only. Shares DNS, TLS posture, pool/keepalive, redirect, and no-proxy
@@ -925,8 +1136,10 @@ impl PluginHttpClient {
     /// [`execute_http2_redacted`] so redaction and egress screening still run.
     /// The ordinary execute helpers deliberately remain pinned to the default
     /// shared client.
-    pub fn get_http2(&self) -> &reqwest::Client {
-        &self.http2_client
+    pub fn get_http2(&self) -> Result<&reqwest::Client, PluginHttpClientUnavailable> {
+        self.http2_client
+            .as_deref()
+            .ok_or(PluginHttpClientUnavailable)
     }
 
     /// Send a pre-built request with automatic slow-call logging.
@@ -1016,8 +1229,14 @@ impl PluginHttpClient {
             let error_class = classify_reqwest_error(&e);
             format!("{error_class} building request to {redacted_url}")
         })?;
+        let Some(client) = self.http2_client.as_ref() else {
+            return Err(format!(
+                "{} calling {redacted_url}",
+                ErrorClass::ConnectionPoolError
+            ));
+        };
         self.execute_request_with_client(
-            &self.http2_client,
+            client,
             request,
             label,
             None,
@@ -1089,6 +1308,9 @@ impl PluginHttpClient {
             error_class: classify_reqwest_error(&error),
             request_reached_wire: false,
         })?;
+        if self.client.is_none() {
+            return Err(unavailable_plugin_http_failure());
+        }
         if let Some(reason) = self.denied_literal_ip_reason(&request) {
             tracing::warn!(
                 plugin = label,
@@ -1135,6 +1357,9 @@ impl PluginHttpClient {
             error_class: classify_reqwest_error(&error),
             request_reached_wire: false,
         })?;
+        let Some(client) = self.client.as_ref() else {
+            return Err(unavailable_plugin_http_failure());
+        };
         if let Some(reason) = self.denied_literal_ip_reason(&request) {
             tracing::warn!(
                 plugin = label,
@@ -1148,7 +1373,7 @@ impl PluginHttpClient {
             });
         }
         self.execute_request_with_client(
-            &self.client,
+            client,
             request,
             label,
             Some(accumulator),
@@ -1166,8 +1391,11 @@ impl PluginHttpClient {
         accumulator: Option<&AtomicU64>,
         log_url_override: Option<&str>,
     ) -> Result<reqwest::Response, reqwest::Error> {
+        let Some(client) = self.client.as_ref() else {
+            return unavailable_reqwest_execute_result();
+        };
         self.execute_request_with_client(
-            &self.client,
+            client,
             request,
             label,
             accumulator,
@@ -1422,13 +1650,15 @@ mod fallback_tests {
             Some(dns_cache),
             &PluginTlsPosture::PlatformRoots,
             false,
-        );
+        )
+        .expect("fallback client builds with DNS cache");
     }
 
     #[test]
     fn fallback_client_builds_without_dns_cache() {
         let _client =
-            build_dns_cached_fallback_client(None, &PluginTlsPosture::PlatformRoots, false);
+            build_dns_cached_fallback_client(None, &PluginTlsPosture::PlatformRoots, false)
+                .expect("fallback client builds without DNS cache");
     }
 
     #[test]
@@ -1437,13 +1667,29 @@ mod fallback_tests {
             source_id: "invalid-ca.pem".to_string(),
             reason: "test invalid CA".to_string(),
         };
-        let _client = build_dns_cached_fallback_client(None, &posture, false);
+        let _client = build_dns_cached_fallback_client(None, &posture, false)
+            .expect("fail-closed TLS fallback client builds");
     }
 
     #[test]
     fn fallback_http2_prior_knowledge_companion_builds() {
         let _client =
-            build_dns_cached_fallback_client(None, &PluginTlsPosture::PlatformRoots, true);
+            build_dns_cached_fallback_client(None, &PluginTlsPosture::PlatformRoots, true)
+                .expect("HTTP/2 fallback client builds");
+    }
+
+    #[test]
+    fn fail_closed_preconfigured_client_is_constructible() {
+        try_build_preconfigured_fail_closed_plugin_client(None, false, false)
+            .expect("empty rustls root store client must be constructible");
+        try_build_preconfigured_fail_closed_plugin_client(None, true, true)
+            .expect("HTTPS-only empty rustls root store client must be constructible");
+    }
+
+    #[test]
+    fn fail_closed_construction_returns_result_without_spinning() {
+        build_fail_closed_plugin_client(None, false, false)
+            .expect("bounded fail-closed construction must terminate with a Result");
     }
 
     #[test]
@@ -1503,7 +1749,8 @@ mod fallback_tests {
             Some(dns_cache),
             &PluginTlsPosture::PlatformRoots,
             false,
-        );
+        )
+        .expect("fallback client with DNS override builds");
 
         let server = tokio::spawn(async move {
             let (mut socket, _) = tokio::time::timeout(Duration::from_secs(30), listener.accept())
@@ -1597,6 +1844,7 @@ mod redirect_tests {
         let (url, count) = spawn_redirecting_server().await;
         let resp = client
             .get()
+            .expect("plugin HTTP client")
             .get(&url)
             .timeout(Duration::from_secs(5))
             .send()

@@ -3,6 +3,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 
 use crate::config::db_backend::validate_api_spec_proxy_plugin_association;
+use crate::config::gateway_trust::GatewayTrustBundleRecord;
 use crate::config::types::{
     ApiSpec, Consumer, GatewayConfig, PluginConfig, Proxy, SpecFormat, Upstream,
 };
@@ -160,6 +161,15 @@ pub(crate) struct BackupPayload<'a> {
     pub(crate) consumers: &'a [Consumer],
     pub(crate) plugin_configs: &'a [PluginConfig],
     pub(crate) upstreams: &'a [Upstream],
+    /// Namespace-keyed gateway trust bundles (issue #3727).
+    ///
+    /// Always emitted (possibly empty) on database-backed exports so a restore
+    /// can tell "this backup had no trust resource" from "this backup predates
+    /// the resource". Restore treats an ABSENT section as "leave trust alone":
+    /// silently revoking a namespace's roots because an operator restored an
+    /// older config backup would be an outage, not a rollback.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) gateway_trust_bundles: Option<&'a [GatewayTrustBundleRecord]>,
     /// Versioned admin-only API spec section. Always present on database-backed
     /// full exports (possibly with an empty `items` array). Omitted on
     /// cached-fallback exports, whose resources carry no ownership tags and so
@@ -175,6 +185,7 @@ pub(crate) struct BackupCounts {
     pub(crate) plugin_configs: usize,
     pub(crate) upstreams: usize,
     pub(crate) api_specs: usize,
+    pub(crate) gateway_trust_bundles: usize,
 }
 
 /// Versioned backup/restore section for raw API spec documents and ownership
@@ -378,6 +389,12 @@ pub(crate) struct RestorePayload {
     /// `None` means a legacy backup that omitted the section entirely.
     #[serde(default)]
     pub api_specs: Option<ApiSpecsBackupSection>,
+    /// Gateway trust bundles (issue #3727). `None` means the backup predates
+    /// the resource (or was a cached-fallback export) and trust must be left
+    /// exactly as it is; `Some(vec![])` is an explicit "this namespace had no
+    /// trust resource" and revokes.
+    #[serde(default)]
+    pub gateway_trust_bundles: Option<Vec<GatewayTrustBundleRecord>>,
 }
 
 pub(crate) fn filter_config_by_namespace(config: &GatewayConfig, namespace: &str) -> GatewayConfig {
@@ -405,6 +422,14 @@ pub(crate) fn filter_config_by_namespace(config: &GatewayConfig, namespace: &str
             .upstreams
             .iter()
             .filter(|upstream| upstream.namespace == namespace)
+            .cloned()
+            .collect(),
+        // Namespace-keyed trust bundles are tenant material: a namespace-scoped
+        // backup must carry its own record and nothing else (issue #3727).
+        gateway_trust_bundles: config
+            .gateway_trust_bundles
+            .iter()
+            .filter(|record| record.namespace == namespace)
             .cloned()
             .collect(),
         ..config.clone()

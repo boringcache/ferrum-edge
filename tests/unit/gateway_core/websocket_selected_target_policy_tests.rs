@@ -691,9 +691,14 @@ fn websocket_retry_rotation_rechecks_destination_rule_max_retries() {
             body.contains("route_retry_ceiling"),
             "{label} WebSocket retry must authorize against the original route ceiling"
         );
-        let selection = body
-            .find("select_next_retry_target(")
-            .unwrap_or_else(|| panic!("{label} WebSocket retry rotation must remain present"));
+        let selection_needle = if label == "H3" {
+            "select_next_h3_eligible_retry_target("
+        } else {
+            "select_next_retry_target("
+        };
+        let selection = body.find(selection_needle).unwrap_or_else(|| {
+            panic!("{label} WebSocket retry rotation must remain present ({selection_needle})")
+        });
         let candidate_cap = body
             .find("retry_attempt_allowed_for_target(")
             .unwrap_or_else(|| {
@@ -704,4 +709,180 @@ fn websocket_retry_rotation_rechecks_destination_rule_max_retries() {
             "{label} WebSocket must re-resolve maxRetries after selecting the retry candidate"
         );
     }
+}
+
+/// Bounded source of `handle_h3_websocket` so rustfmt wrapping and the inline
+/// test module cannot satisfy the Host/authority parity needles below.
+fn h3_ws_handler() -> &'static str {
+    let start = H3_WS_SOURCE
+        .find("pub(crate) async fn handle_h3_websocket(")
+        .expect("H3 WebSocket handler must remain present");
+    let end = H3_WS_SOURCE[start..]
+        .find("#[cfg(test)]")
+        .map(|offset| start + offset)
+        .unwrap_or(H3_WS_SOURCE.len());
+    &H3_WS_SOURCE[start..end]
+}
+
+fn h1_h2_ws_handler() -> &'static str {
+    let start = PROXY_SOURCE
+        .find("async fn handle_websocket_request_authenticated(")
+        .expect("H1/H2 WebSocket handler must remain present");
+    let end = PROXY_SOURCE[start..]
+        .find("\nasync fn ")
+        .map(|offset| start + offset)
+        .unwrap_or(PROXY_SOURCE.len());
+    &PROXY_SOURCE[start..end]
+}
+
+fn mesh_ws_connector() -> &'static str {
+    let start = PROXY_SOURCE
+        .find("pub(crate) async fn connect_mesh_websocket_backend(")
+        .expect("shared mesh WebSocket connector must remain present");
+    let end = PROXY_SOURCE[start..]
+        .find("\npub(crate) async fn ")
+        .map(|offset| start + offset)
+        .unwrap_or(PROXY_SOURCE.len());
+    &PROXY_SOURCE[start..end]
+}
+
+/// H3 WebSocket mesh egress must pass the materialized client Host (including
+/// an explicit port such as `Example.COM:8443`) into the shared connector, just
+/// as H1/H2 does. The normalized `request_host` stays the routing / retry key.
+#[test]
+fn h3_websocket_mesh_egress_uses_materialized_host_not_routing_host() {
+    const MATERIALIZED_HOST: &str = "Example.COM:8443";
+
+    // Routing / retry hashing is intentionally portless and lowercased.
+    assert_eq!(
+        ferrum_edge::proxy::normalize_request_host_for_routing(MATERIALIZED_HOST).as_deref(),
+        Some("example.com"),
+        "retry selection and wildcard concretization keep the normalized routing host"
+    );
+
+    let h1_body = squeeze(h1_h2_ws_handler());
+    let h3_body = squeeze(h3_ws_handler());
+
+    const HOST_CAPTURE: &str = "letws_client_host=ctx.headers.get(\"host\").cloned();";
+    assert!(
+        h1_body.contains(HOST_CAPTURE),
+        "H1/H2 WebSocket mesh egress must read the client Host from the materialized header map"
+    );
+    assert!(
+        h3_body.contains(HOST_CAPTURE),
+        "H3 WebSocket mesh egress must read the client Host from the materialized header map, \
+         matching H1/H2 (including an H3 `:authority` back-fill such as `{MATERIALIZED_HOST}`)"
+    );
+
+    const MESH_WITH_CLIENT_HOST: &str = "connect_mesh_websocket_backend(&state,ws_dial_proxy,target,egress,ws_client_host.as_deref(),";
+    const MESH_WITH_ROUTING_HOST: &str = "connect_mesh_websocket_backend(&state,ws_dial_proxy,target,egress,request_host.as_deref(),";
+    assert!(
+        h1_body.contains(MESH_WITH_CLIENT_HOST),
+        "H1/H2 must pass the materialized Host verbatim to the shared mesh WS connector"
+    );
+    assert!(
+        h3_body.contains(MESH_WITH_CLIENT_HOST),
+        "H3 must pass the materialized Host (e.g. `{MATERIALIZED_HOST}`) verbatim to the \
+         shared mesh WS connector"
+    );
+    assert!(
+        !h3_body.contains(MESH_WITH_ROUTING_HOST),
+        "H3 must not substitute the port-stripped routing host into the mesh WS connector"
+    );
+    assert!(
+        h3_body.contains("request_authority:request_host.as_deref()"),
+        "H3 WebSocket retry selection must keep using the normalized routing host"
+    );
+
+    // H3 synthesizes a missing Host from `:authority` without stripping the
+    // explicit port or lowercasing, so `{MATERIALIZED_HOST}` survives into
+    // `ctx.headers["host"]` for the capture above.
+    let h3_server = squeeze(include_str!("../../../src/http3/server.rs"));
+    assert!(
+        h3_server
+            .contains("ctx.headers.insert(\"host\".to_string(),authority.as_str().to_string());"),
+        "H3 must materialize a missing Host from `:authority` verbatim, including an explicit port"
+    );
+
+    // Service-authority-tag branch: when `mesh.mtls_authority_host` replaces
+    // Host, the shared connector stamps `x-forwarded-host` from `client_host`.
+    // H3 must not duplicate that rewrite; passing the materialized Host is
+    // enough for `{MATERIALIZED_HOST}` to appear on `x-forwarded-host`.
+    let connector = squeeze(mesh_ws_connector());
+    let service_tag = connector
+        .find("target_mesh_mtls_authority_host(target)")
+        .expect("sidecar service-authority tag must still select the peer :authority");
+    let xfh = connector[service_tag..]
+        .find("augmented.push((\"x-forwarded-host\".to_string(),host.to_string()));")
+        .expect(
+            "service-authority tag must stamp x-forwarded-host from the connector's client_host",
+        );
+    let host_from_client = connector[service_tag..]
+        .find("client_host.filter(|host|!host.is_empty())")
+        .expect("x-forwarded-host must be sourced from the connector client_host argument");
+    assert!(
+        host_from_client < xfh,
+        "x-forwarded-host must be copied from client_host before the service-authority rewrite"
+    );
+    assert!(
+        !h3_body.contains("x-forwarded-host"),
+        "H3 must not duplicate the shared connector's x-forwarded-host rewrite"
+    );
+}
+
+/// Ambient HBONE WebSocket establishment captures one absolute deadline
+/// before tunnel acquisition and reuses it for the inner H1 101 wait
+/// (issue #3620). A fresh relative `timeout` after the tunnel would give
+/// one establishment two full connect budgets.
+#[test]
+fn ambient_hbone_websocket_reuses_one_establishment_deadline() {
+    let connector = mesh_ws_connector();
+    let ambient = connector
+        .split("MeshWsEgress::AmbientHbone =>")
+        .nth(1)
+        .expect("Ambient HBONE WebSocket branch must remain present");
+
+    let deadline = ambient
+        .find("establishment_deadline")
+        .expect("one absolute establishment deadline must be captured");
+    let tunnel = ambient
+        .find("get_ws_byte_tunnel(")
+        .expect("HBONE byte-tunnel acquisition must remain present");
+    let handshake = ambient
+        .find("client_async_with_config(")
+        .expect("inner H1 WebSocket handshake must remain present");
+    assert!(
+        deadline < tunnel,
+        "the establishment deadline must be captured before tunnel acquisition"
+    );
+    assert!(
+        tunnel < handshake,
+        "the inner handshake must follow tunnel acquisition"
+    );
+
+    let first_helper = ambient
+        .find("await_deadline_first(")
+        .expect("tunnel acquisition must race the expiration-first helper");
+    let second_helper = ambient[first_helper + 1..]
+        .find("await_deadline_first(")
+        .map(|offset| first_helper + 1 + offset)
+        .expect("the inner handshake must reuse the same expiration-first helper");
+    assert!(
+        first_helper < tunnel && tunnel < second_helper && second_helper < handshake,
+        "both tunnel acquisition and the inner handshake must be bounded by \
+         await_deadline_first on the shared deadline"
+    );
+    assert!(
+        !ambient.contains("tokio::time::timeout("),
+        "Ambient establishment must not start a second full relative connect budget"
+    );
+    assert!(
+        !ambient.contains("timeout_at("),
+        "Ambient establishment must not use inner-first timeout_at ordering"
+    );
+    assert!(
+        ambient.contains("POST-wire"),
+        "the inner handshake timeout must be documented as POST-wire: the \
+         RFC 6455 upgrade is written before awaiting 101"
+    );
 }

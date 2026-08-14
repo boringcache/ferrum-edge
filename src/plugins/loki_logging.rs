@@ -1476,9 +1476,10 @@ async fn send_batch_once(
     body_bytes: Bytes,
     content_encoding: Option<&'static str>,
 ) -> LokiAttemptOutcome {
-    let mut req = cfg
-        .http_client
-        .get()
+    let Ok(client) = cfg.http_client.get() else {
+        return LokiAttemptOutcome::Terminal("plugin HTTP client unavailable".to_string());
+    };
+    let mut req = client
         .post(&cfg.endpoint_url)
         .header("Content-Type", "application/json")
         .body(body_bytes);

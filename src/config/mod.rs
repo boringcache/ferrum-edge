@@ -7,6 +7,7 @@
 //! - `batch_atomicity` — Graph-level all-or-nothing vocabulary for `POST /batch`
 //! - `db_loader` — Database config loader with incremental polling
 //! - `file_loader` — YAML/JSON file loader with version migration
+//! - `gateway_trust` — Namespace-keyed gateway trust-bundle resource
 //! - `config_backup` — On-disk JSON backup for DB-unreachable startup failover
 //! - `config_change_watch` — Coalesced wake-up signal for backend-native
 //!   config-change watchers (MongoDB replica-set change streams)
@@ -32,6 +33,8 @@ pub mod db_backend;
 pub mod db_loader;
 pub mod env_config;
 pub mod file_loader;
+/// Namespace-keyed gateway trust-bundle resource (issue #3727).
+pub mod gateway_trust;
 pub(crate) mod incremental_apply;
 pub mod migrations;
 pub mod mongo_index_plan;

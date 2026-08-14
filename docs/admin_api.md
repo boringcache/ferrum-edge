@@ -588,6 +588,133 @@ Supported algorithms: `round_robin`, `weighted_round_robin`, `least_connections`
 
 To use an upstream with a proxy, set the proxy's `upstream_id` field. When set, the upstream's targets override the proxy's `backend_host`/`backend_port`. Each target may also specify an optional `path` field which overrides the proxy's `backend_path` when that target is selected.
 
+## Gateway Trust Bundles
+
+Namespace-keyed gateway/mesh trust roots that the control plane distributes to
+its data planes through the ConfigSync `trust_bundles_json` side channel
+(issue #3727). The resource is a **singleton per namespace** and is selected by
+`X-Ferrum-Namespace` like every other namespace-scoped surface — when
+`FERRUM_ADMIN_REQUIRE_NAMESPACE_CLAIM=true`, the token's `ns` claim must
+authorize that namespace.
+
+Reads require the `operator` role; writes require `admin`, because a write here
+changes which peer identities the whole fleet will accept. There is no
+cached-config read fallback: if the database is unreachable these endpoints
+report the outage rather than answering from a possibly-stale snapshot.
+
+```bash
+# Read the namespace's trust bundle (list returns 0 or 1 items)
+curl -H "Authorization: Bearer $TOKEN" \
+  -H "X-Ferrum-Namespace: production" \
+  http://localhost:9000/gateway-trust-bundles
+
+# Create it
+curl -X POST -H "Authorization: Bearer $TOKEN" \
+  -H "X-Ferrum-Namespace: production" -H "Content-Type: application/json" \
+  -d '{
+        "id": "production",
+        "trust_domain": "cluster.local",
+        "bundle": {
+          "local": {
+            "trust_domain": "cluster.local",
+            "x509_authorities": ["<base64 DER root>"]
+          }
+        }
+      }' \
+  http://localhost:9000/gateway-trust-bundles
+
+# Rotate: add the new root alongside the old one, echoing the revision you read
+curl -X PUT -H "Authorization: Bearer $TOKEN" \
+  -H "X-Ferrum-Namespace: production" -H "Content-Type: application/json" \
+  -d '{
+        "trust_domain": "cluster.local",
+        "revision": 3,
+        "bundle": {
+          "local": {
+            "trust_domain": "cluster.local",
+            "x509_authorities": ["<base64 old root>", "<base64 new root>"]
+          }
+        }
+      }' \
+  http://localhost:9000/gateway-trust-bundles/production
+
+# Revoke (explicit clear — data planes withdraw the roots)
+curl -X DELETE -H "Authorization: Bearer $TOKEN" \
+  -H "X-Ferrum-Namespace: production" \
+  http://localhost:9000/gateway-trust-bundles/production
+
+# Load / convergence status (material-free)
+curl -H "Authorization: Bearer $TOKEN" \
+  -H "X-Ferrum-Namespace: production" \
+  http://localhost:9000/gateway-trust/status
+```
+
+**Optimistic concurrency.** `PUT` treats the request body's `revision` as the
+expected *current* revision. A mismatch returns `409` with `expected_revision`
+and `current_revision` and writes nothing, so a rotation from a second admin
+replica cannot be silently overwritten. Omit `revision` (or send `0`) to skip
+the check. The store assigns the next revision itself, and the successful
+`POST`/`PUT` response body carries that assigned revision — the same value a
+following `GET` returns — rather than echoing what the request sent.
+
+Revisions come from the backend's durable config-change sequence, not from a
+per-record counter that restarts at 1. That is what makes the check safe across
+a `DELETE` + re-`POST`: the delete advances the sequence too, so a recreated
+record is always strictly newer than the incarnation it replaced. A client that
+read the old record and later `PUT`s with the revision it saw gets `409` (or
+`404` if the record is simply gone) instead of overwriting trust material it
+never read.
+
+**Singleton.** A `POST` into a namespace that already holds a record returns
+`409`. Rotate with `PUT`, or `DELETE` first.
+
+**Validation.** `trust_domain` must equal `bundle.local.trust_domain`; every
+`x509_authorities` entry must be valid base64 *and* parse as an X.509
+certificate; every JWT authority needs a unique non-empty `key_id` and a
+`public_key_pem` the JWT-SVID validator can actually use — either an SPKI
+`PUBLIC KEY` PEM or a SPIFFE-federation JWK object, each proved by running the
+real parser; duplicate trust domains across `local` + `federated` are
+rejected. Material is bounded (16 X.509 and 16 JWT authorities per bundle, 256
+federated bundles, 16 KiB per authority, 512 KiB encoded). The federated-bundle
+count is the same maximum mesh multi-cluster already accepts
+(`MAX_MESH_REMOTE_CLUSTERS`), so a documented remote-cluster inventory is always
+*representable*; the 512 KiB encoded ceiling is the binding resource bound and is
+what a full inventory is measured against. See
+[cp_dp_mode.md](cp_dp_mode.md#how-the-trust-bounds-compose) for how the three
+bound families compose. A rejected candidate
+never replaces the live generation, and the error names field, index, and size
+only — never the material.
+
+**Rotation and revocation.** An added root overlaps for rollout: keep both
+entries in `x509_authorities` until every workload presents a certificate from
+the new root, then `PUT` again with only the new one. A removed root stops being
+accepted on the next control-plane poll cycle
+(`FERRUM_DB_POLL_INTERVAL`, default 30s), which is the bounded schedule — no
+restart, and certificate/key generations are never mixed because the resources
+and the trust side channel publish from one snapshot.
+
+**Status payload.** `GET /gateway-trust/status` returns the trust domain,
+authority counts, this namespace's **live published** revision, timestamps, a bounded
+failure-reason enum (`none`, `invalid_material`, `undecodable`,
+`ambiguous_authority`), and a `generation` digest — a stable configuration
+identity for the namespace's trust state that two control-plane replicas
+reconstruct identically and that changes on every rotation or revocation. It
+also returns label-free process counters
+(`published_generations_total`, `load_rejections_total`,
+`ambiguous_authority_total`, `last_published_unix_seconds`), which count
+generations that reached the live-configuration swap rather than candidates
+that merely loaded. There is no process-wide revision: revisions are per
+namespace. The payload never returns PEM/DER/JWKS bytes, key ids, or
+secret/provider URIs. `configured` and `bundle` describe the generation that
+actually reached that swap, not the newest database row: a freshly committed
+candidate remains absent/at the prior revision until the poller validates and
+publishes it, and a rejected candidate never replaces the reported
+last-known-good generation. Use the CRUD endpoints to inspect persisted
+candidate state.
+
+See [CP/DP mode](cp_dp_mode.md#the-gateway_trust_bundles-resource-issue-3727)
+for the storage shape, propagation semantics, precedence rule, and metrics.
+
 ## Backup & Restore
 
 ```bash
@@ -607,6 +734,28 @@ curl -X POST -H "Authorization: Bearer $TOKEN" \
 ```
 
 The backup output is directly compatible with `POST /batch` (additive) and `POST /restore` (full replacement). Successful exports and authenticated denied/failed attempts are always audited with request context before (or instead of) releasing unredacted bytes — independent of `FERRUM_ADMIN_AUDIT_ENABLED`, which gates ordinary mutation audit events only — see [Audit Log](#audit-log) and [admin_backup_restore.md](admin_backup_restore.md). Before replacement, restore acquires a persistent namespace guard and snapshots the current namespace with a non-validating raw load from the primary, so an already-invalid-but-present config still snapshots and keeps rollback available while it is repaired. If that snapshot cannot be taken at all — a genuine database/connectivity failure — restore **aborts with `503` before deleting anything** and leaves the prior config intact (retry once the database is reachable). Database inserts are chunked into 1,000-record transactions for large-scale imports. Conditional mTLS DNS-identity uniqueness is checked under the same namespace-scoped datastore admission guard used by ordinary Consumer, plugin, proxy-association, upstream, and API-spec writes, so a concurrent admin process cannot race a batch/restore policy activation with a case-variant credential. Restore retains one persistent guard owner from before its snapshot through the clear and every import or compensating-replay batch. All non-owning namespace resource writers and replays fail closed for that full interval, so no concurrent resource can be lost merely because it was absent from the restore payload. The compensating replay intentionally does not apply newly introduced mTLS DNS admission to the old snapshot: otherwise a pre-existing ambiguity would be deleted successfully and then become impossible to restore. Normal batch/restore admission never receives this rollback-only bypass. The endpoint returns `500 Internal Server Error` with a `rollback` field (`completed` / `incomplete` / `not_needed` / `unknown_outcome`). `not_needed` means the clear definitively aborted atomically (SQL / replica-set MongoDB), so nothing was deleted and the prior config was retained without any re-import. An unknown MongoDB commit remains `unknown_outcome` with the guard retained even when immediate verification still sees the prior counts, because the clear can become visible later. API specs are included in backup and restore as a versioned `api_specs` section (`section_version: "2"`). Legacy backups that omit the section require `?confirm_api_spec_deletion=true` (in addition to `?confirm=true`) when the target namespace still holds specs. `api_specs_not_restored` / `api_specs_note` appear only when rollback is `incomplete` and the prior namespace carried specs — see [admin_backup_restore.md](admin_backup_restore.md).
+
+Gateway trust bundles ride along as a `gateway_trust_bundles` array on full,
+unfiltered database-backed exports (possibly empty). Resource-filtered and
+cached-fallback exports omit the array, so a partial artifact never carries a
+hidden trust mutation outside the resource classes the caller selected.
+Restore treats an **absent** array as
+"this backup says nothing about trust" and leaves the namespace's existing roots
+in place — the destructive namespace clear deliberately does not touch trust, so
+restoring an older config backup can never silently revoke roots. A **present**
+array is authoritative and reconciles exactly to what it lists against the
+authenticated target namespace, including the empty case, which revokes. The
+resource is a namespace singleton, so an array carrying more than one record is
+rejected with `400` — the reconciler never silently takes the first, which would
+make the restored trust state depend on payload order. Records are
+re-normalized, forced into the target namespace, and re-validated through the
+same admission path an admin `POST` uses *before* the clear, so a hand-edited or
+hostile backup cannot inject oversized or malformed trust material by going
+around the API, and an invalid section aborts with `400` and nothing deleted.
+Server-owned fields survive the payload: `id` and `created_at` come from the
+stored record, `revision` is assigned by the store, and `updated_by` is the
+restoring admin's verified JWT subject (at most 255 characters; an overlong subject
+is rejected rather than truncated).
 
 See [admin_backup_restore.md](admin_backup_restore.md) for details.
 

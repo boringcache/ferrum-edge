@@ -32,6 +32,7 @@ use crate::admin::{self, AdminState};
 use crate::config::EnvConfig;
 use crate::config::db_backend::{self, DatabaseBackend, FullConfigLoadPurpose, IncrementalResult};
 use crate::config::db_loader::{DatabaseStore, DbPoolConfig};
+use crate::config::gateway_trust::{TrustPublicationScope, detect_gateway_trust_drift};
 use crate::config::incremental_apply::apply_incremental_to_config_snapshot as apply_incremental_to_config;
 use crate::config::types::GatewayConfig;
 use crate::config::validation_pipeline::{
@@ -566,6 +567,12 @@ fn namespaces_referenced_by_config(config: &GatewayConfig) -> Vec<String> {
     namespaces.extend(config.consumers.iter().map(|c| c.namespace.clone()));
     namespaces.extend(config.plugin_configs.iter().map(|pc| pc.namespace.clone()));
     namespaces.extend(config.upstreams.iter().map(|u| u.namespace.clone()));
+    namespaces.extend(
+        config
+            .gateway_trust_bundles
+            .iter()
+            .map(|record| record.namespace.clone()),
+    );
     normalize_namespace_list(&namespaces)
 }
 
@@ -831,6 +838,8 @@ impl MultiNsFullLoadAcc {
                 acc.consumers.append(&mut next.consumers);
                 acc.plugin_configs.append(&mut next.plugin_configs);
                 acc.upstreams.append(&mut next.upstreams);
+                acc.gateway_trust_bundles
+                    .append(&mut next.gateway_trust_bundles);
             }
         }
     }
@@ -880,6 +889,9 @@ impl MultiNsFullLoadAcc {
         // Preserve non-namespaced mesh overlay ownership: mesh comes from the
         // K8s overlay re-merge at publication time, not from DB full loads.
         config.mesh = None;
+        // Canonical ordering so two CP replicas that loaded the same store
+        // produce byte-identical snapshots (issue #3727).
+        config.sort_gateway_trust_bundles();
         Ok(FullLoadMultiOutcome {
             config,
             rejected_namespaces: self.rejected_namespaces,
@@ -909,6 +921,15 @@ fn clear_namespaced_resources(config: &mut GatewayConfig) {
     config.consumers.clear();
     config.plugin_configs.clear();
     config.upstreams.clear();
+    // Gateway trust bundles are namespace-keyed resources, so they are rebuilt
+    // per namespace exactly like the four above (issue #3727). Leaving a stale
+    // record here would let a namespace that failed to reload keep publishing
+    // trust it no longer owns.
+    config.gateway_trust_bundles.clear();
+    // The unpartitioned slot is a per-subscriber PROJECTION, never combined-CP
+    // state: a multi-namespace snapshot must not carry any namespace's trust in
+    // it. `filter_config_to_namespace_for_scope` re-derives it per subscriber.
+    config.trust_bundles = None;
 }
 
 fn remove_namespace_resources(config: &mut GatewayConfig, namespace: &str) {
@@ -916,6 +937,9 @@ fn remove_namespace_resources(config: &mut GatewayConfig, namespace: &str) {
     config.consumers.retain(|c| c.namespace != namespace);
     config.plugin_configs.retain(|pc| pc.namespace != namespace);
     config.upstreams.retain(|u| u.namespace != namespace);
+    config
+        .gateway_trust_bundles
+        .retain(|record| record.namespace != namespace);
 }
 
 fn append_namespace_resources_from(
@@ -949,6 +973,13 @@ fn append_namespace_resources_from(
             .upstreams
             .iter()
             .filter(|u| u.namespace == namespace)
+            .cloned(),
+    );
+    target.gateway_trust_bundles.extend(
+        source
+            .gateway_trust_bundles
+            .iter()
+            .filter(|record| record.namespace == namespace)
             .cloned(),
     );
     if !target.known_namespaces.iter().any(|ns| ns == namespace) {
@@ -1375,6 +1406,26 @@ async fn settle_full_reload_rejection_state(
     crate::modes::clear_config_rejected_after_accepted_full_reload(config_rejected, context);
 }
 
+/// Classify a full reload's coverage for the gateway-trust publication
+/// boundary (#3727).
+///
+/// A namespace that was REJECTED kept its previous generation, and one whose
+/// load merely FAILED was not re-read at all, so neither can be said to have
+/// resolved a standing trust refusal. Both make the publication partial: the
+/// accepted namespaces still publish and count, but the bounded failure reason
+/// stands until a reload covers everything. This deliberately mirrors
+/// [`settle_full_reload_rejection_state`]'s rule for `config_rejected`.
+fn trust_publication_scope(
+    rejected_namespaces: &[(String, String)],
+    failed_namespaces: &[String],
+) -> TrustPublicationScope {
+    if rejected_namespaces.is_empty() && failed_namespaces.is_empty() {
+        TrustPublicationScope::Complete
+    } else {
+        TrustPublicationScope::Partial
+    }
+}
+
 /// Publish a DB full-reload snapshot with K8s overlay re-merge + CAS, then
 /// broadcast only namespaces that successfully refreshed (#2982 / #2983 / #2984).
 ///
@@ -1386,6 +1437,11 @@ async fn settle_full_reload_rejection_state(
 /// When `refreshed_namespaces` is empty, nothing is committed or broadcast —
 /// callers still settle rejection/failure state from the load outcome, and
 /// subscribers keep last-known-good.
+///
+/// `trust_scope` says whether this reload covered every namespace it polled.
+/// A reload that left a rejected or unreachable namespace on last-known-good
+/// must not clear the standing gateway-trust failure while publishing the
+/// namespaces that did load — see [`TrustPublicationScope`].
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn publish_cp_full_reload(
     publication_gate: &CpPublicationGate,
@@ -1393,6 +1449,7 @@ pub(crate) fn publish_cp_full_reload(
     overlay_slot: &K8sOverlaySlot,
     db_config: GatewayConfig,
     refreshed_namespaces: &[String],
+    trust_scope: TrustPublicationScope,
     broadcasts: &crate::grpc::cp_server::NamespaceBroadcasts,
     dp_registry: &crate::grpc::cp_server::DpNodeRegistry,
     cp_scope: &CpScope,
@@ -1405,6 +1462,25 @@ pub(crate) fn publish_cp_full_reload(
     publication_gate.publish(move || {
         let published =
             cas_publish_db_snapshot_with_k8s_overlay(config_arc, overlay_slot, db_config);
+        // The ACTUAL publication boundary: the snapshot is now live in the
+        // `ArcSwap` and is about to be broadcast. Trust acceptance is recorded
+        // here rather than inside each namespace's database load, which still
+        // had validation, overlay composition, and this swap ahead of it
+        // (issue #3727).
+        //
+        // The unpartitioned file/overlay slot is passed in because the
+        // per-namespace ambiguity refusal is resolved BELOW this point, during
+        // `broadcast_namespace_update`. Without it this counter would claim a
+        // successful trust publication for a generation whose every database
+        // record the projection was about to refuse. That slot is one value
+        // compared against every namespace, so the refusal is all-or-nothing
+        // and a genuinely accepted multi-namespace generation still counts once.
+        crate::config::gateway_trust::record_trust_generation_published_scoped(
+            &published.gateway_trust_bundles,
+            published.trust_bundles.as_deref(),
+            chrono::Utc::now().timestamp().max(0) as u64,
+            trust_scope,
+        );
         for namespace in refreshed_namespaces {
             CpGrpcServer::broadcast_namespace_update(
                 broadcasts,
@@ -1512,7 +1588,13 @@ pub(crate) fn publish_cp_incremental(
                 namespace_delta,
                 version,
                 dp_registry,
-                None,
+                // Resource deltas say nothing about trust. A trust rotation or
+                // revocation escalates to a full reload
+                // (`IncrementalFullReloadReason::GatewayTrustBundleChanges`) and
+                // is published as a FULL_SNAPSHOT whose side channel carries the
+                // complete new state, so an incremental tick must leave the
+                // subscriber's applied trust untouched (issue #3727).
+                crate::config::gateway_trust::GatewayTrustPublication::Unchanged,
                 cp_scope,
             );
         }
@@ -1981,6 +2063,18 @@ pub async fn run(
     );
 
     let config_arc = Arc::new(ArcSwap::new(Arc::new(config)));
+    // The startup full load is already validated and becomes the CP's live
+    // snapshot at this ArcSwap construction. Poll-time full reloads record at
+    // `publish_cp_full_reload`, but a restarted replica with no subsequent DB
+    // change would otherwise advertise an empty trust publication forever.
+    {
+        let published = config_arc.load_full();
+        crate::config::gateway_trust::record_trust_generation_published(
+            &published.gateway_trust_bundles,
+            published.trust_bundles.as_deref(),
+            chrono::Utc::now().timestamp().max(0) as u64,
+        );
+    }
     // Independently owned K8s overlay slot shared by the reconciler (writer)
     // and the DB poll loop (reader/composer). Empty until the first accepted
     // reconcile; full DB reloads re-merge through this slot (#2982).
@@ -2960,21 +3054,57 @@ pub async fn run(
                         .await;
                     }
 
-                    if force_full_reload {
-                        // Re-resolve the namespace list every full reload so
-                        // CpScope::All picks up newly created namespaces
-                        // without dropping namespaces still present in the
-                        // current snapshot if discovery temporarily shrinks.
-                        let current_snapshot = config_poll.load_full();
-                        let retained_namespaces = retained_polled_namespaces(&current_snapshot);
-                        let nslist = resolve_polled_namespaces(
+                    // Resolve the polled namespace list ONCE per tick, before
+                    // the reload decision. For `Single`/`Set` this is the
+                    // explicit list (no DB call). For `All`, authoritative
+                    // namespace discovery runs once per tick — bounded cost vs.
+                    // the per-resource queries that dominate poll time — and
+                    // every full reload re-resolves so `CpScope::All` picks up
+                    // newly created namespaces without dropping namespaces
+                    // still present in the current snapshot if discovery
+                    // temporarily shrinks.
+                    let current_snapshot = config_poll.load_full();
+                    let retained_namespaces = retained_polled_namespaces(&current_snapshot);
+                    let nslist = resolve_polled_namespaces(
+                        db_poll.as_ref(),
+                        &poll_scope,
+                        &poll_fallback_namespace,
+                        &retained_namespaces,
+                        Some(&last_polled_namespaces),
+                    )
+                    .await;
+
+                    // Authoritative gateway trust drift check (issue #3727). A
+                    // no-op on every backend whose trust document mutation and
+                    // `config_changes` signal commit atomically (all SQL,
+                    // replica-set MongoDB). On standalone MongoDB they are
+                    // separate commits, so this poller can consume a signal,
+                    // complete a full reload that still reads the old document,
+                    // advance its cursor, and only then see the document commit
+                    // with no later signal — and a revocation is the same race
+                    // with the revoked roots left installed on every
+                    // subscriber. Comparing the stored identity against the
+                    // trust state the CURRENT published snapshot was built from
+                    // detects both, per namespace, without depending on write
+                    // ordering or on the writer surviving. It runs BEFORE the
+                    // reload decision so the drifted generation is repaired
+                    // through the one authoritative full-reload publication
+                    // path in THIS tick rather than the next, and it is skipped
+                    // when a full reload is already pending because that reload
+                    // republishes trust anyway.
+                    if !force_full_reload {
+                        let trust_drifted = detect_gateway_trust_drift(
                             db_poll.as_ref(),
-                            &poll_scope,
-                            &poll_fallback_namespace,
-                            &retained_namespaces,
-                            Some(&last_polled_namespaces),
+                            &nslist,
+                            current_snapshot.as_ref(),
                         )
                         .await;
+                        if !trust_drifted.is_empty() {
+                            force_full_reload = true;
+                        }
+                    }
+
+                    if force_full_reload {
                         match load_full_config_multi_with_sequence(
                             db_poll.as_ref(),
                             &nslist,
@@ -3012,6 +3142,10 @@ pub async fn run(
                                     &overlay_poll,
                                     outcome.config,
                                     &outcome.refreshed_namespaces,
+                                    trust_publication_scope(
+                                        &outcome.rejected_namespaces,
+                                        &outcome.failed_namespaces,
+                                    ),
                                     poll_broadcasts.as_ref(),
                                     &dp_registry_poll,
                                     &poll_scope,
@@ -3067,21 +3201,6 @@ pub async fn run(
                             }
                         }
                     } else {
-                        // Resolve the polled namespace list. For `Single`
-                        // / `Set` this is the explicit list (no DB call).
-                        // For `All`, authoritative namespace discovery runs
-                        // once per tick — bounded cost vs. the per-resource
-                        // queries that dominate poll time.
-                        let current_snapshot = config_poll.load_full();
-                        let retained_namespaces = retained_polled_namespaces(&current_snapshot);
-                        let nslist = resolve_polled_namespaces(
-                            db_poll.as_ref(),
-                            &poll_scope,
-                            &poll_fallback_namespace,
-                            &retained_namespaces,
-                            Some(&last_polled_namespaces),
-                        )
-                        .await;
                         // Incremental poll — only fetch changes since last poll
                         match load_incremental_config_multi(
                             db_poll.as_ref(),
@@ -3314,6 +3433,10 @@ pub async fn run(
                                                     &overlay_poll,
                                                     outcome.config,
                                                     &outcome.refreshed_namespaces,
+                                                    trust_publication_scope(
+                                                        &outcome.rejected_namespaces,
+                                                        &outcome.failed_namespaces,
+                                                    ),
                                                     poll_broadcasts.as_ref(),
                                                     &dp_registry_poll,
                                                     &poll_scope,
@@ -3459,6 +3582,10 @@ pub async fn run(
                                             &overlay_poll,
                                             outcome.config,
                                             &outcome.refreshed_namespaces,
+                                            trust_publication_scope(
+                                                &outcome.rejected_namespaces,
+                                                &outcome.failed_namespaces,
+                                            ),
                                             poll_broadcasts.as_ref(),
                                             &dp_registry_poll,
                                             &poll_scope,
@@ -3548,6 +3675,10 @@ pub async fn run(
                                                             &overlay_poll,
                                                             outcome.config,
                                                             &outcome.refreshed_namespaces,
+                                                            trust_publication_scope(
+                                                                &outcome.rejected_namespaces,
+                                                                &outcome.failed_namespaces,
+                                                            ),
                                                             poll_broadcasts.as_ref(),
                                                             &dp_registry_poll,
                                                             &poll_scope,
@@ -4373,14 +4504,29 @@ mod tests {
     fn retained_polled_namespaces_includes_resources_and_known_namespaces() {
         let mut proxy = make_proxy("p1");
         proxy.namespace = "tenant-a".to_string();
+        let trust_domain = crate::identity::TrustDomain::new("tenant-c.local").unwrap();
+        let trust_record = crate::config::gateway_trust::GatewayTrustBundleRecord::new(
+            "tenant-c",
+            "tenant-c",
+            crate::modes::mesh::config::TrustBundleSet {
+                local: crate::modes::mesh::config::TrustBundle {
+                    trust_domain,
+                    x509_authorities: Vec::new(),
+                    jwt_authorities: Vec::new(),
+                    refresh_hint_seconds: None,
+                },
+                federated: Vec::new(),
+            },
+        );
         let config = GatewayConfig {
             proxies: vec![proxy],
             known_namespaces: vec!["tenant-b".to_string()],
+            gateway_trust_bundles: vec![trust_record],
             ..Default::default()
         };
 
         let retained = retained_polled_namespaces(&config);
-        assert_eq!(retained, vec!["tenant-a", "tenant-b"]);
+        assert_eq!(retained, vec!["tenant-a", "tenant-b", "tenant-c"]);
     }
 
     #[test]

@@ -57,8 +57,55 @@ fn trust_domain_rejects_too_long() {
     let raw = "a".repeat(MAX_TRUST_DOMAIN_LEN + 1);
     assert!(matches!(
         TrustDomain::new(raw),
-        Err(TrustDomainError::TooLong(_, _, _))
+        Err(TrustDomainError::TooLong(_, _))
     ));
+}
+
+#[test]
+fn trust_domain_too_long_error_is_material_free() {
+    // A restore or mesh body can present a multi-hundred-KiB trust-domain
+    // string. The length check must fail closed without cloning that value
+    // into the error or echoing it from Display/Debug.
+    const CANARY: &str = "hostile-trust-domain-canary";
+    let raw = format!("{CANARY}{}", "a".repeat(256 * 1024));
+    let actual_len = raw.len();
+    assert!(actual_len > MAX_TRUST_DOMAIN_LEN);
+
+    let err = TrustDomain::new(raw.clone()).expect_err("overlong trust domain must be rejected");
+    assert_eq!(
+        err,
+        TrustDomainError::TooLong(MAX_TRUST_DOMAIN_LEN, actual_len)
+    );
+
+    let rendered = err.to_string();
+    let debug = format!("{err:?}");
+    assert!(
+        !rendered.contains(CANARY) && !rendered.contains(&raw),
+        "TooLong diagnostic must not echo the hostile value: {rendered}"
+    );
+    assert!(
+        !debug.contains(CANARY) && !debug.contains(&raw),
+        "TooLong debug must not leak the hostile value: {debug}"
+    );
+    assert!(
+        rendered.contains(&MAX_TRUST_DOMAIN_LEN.to_string())
+            && rendered.contains(&actual_len.to_string()),
+        "TooLong must report max and actual length only: {rendered}"
+    );
+    assert!(
+        rendered.len() < 128,
+        "TooLong diagnostic must stay material-free, got {} bytes: {rendered}",
+        rendered.len()
+    );
+
+    let json = serde_json::to_string(&raw).expect("hostile domain encodes as JSON");
+    let serde_err = serde_json::from_str::<TrustDomain>(&json)
+        .expect_err("overlong trust domain must fail deserialization")
+        .to_string();
+    assert!(
+        !serde_err.contains(CANARY),
+        "deserializing an overlong trust domain must not leak the value: {serde_err}"
+    );
 }
 
 #[test]
