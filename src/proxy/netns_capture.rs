@@ -795,7 +795,7 @@ impl<B: NetnsBackend> NetnsCaptureManager<B> {
 /// is the one-shot Ambient UDP node preflight (issue #3809), which runs as an
 /// init container WITHOUT pod-scoped `hostPID` and is handed the host's own
 /// procfs on a read-only mount instead. See
-/// [`first_pid_in_cgroup_via_proc_root`].
+/// [`first_pid_in_cgroup_via_proc_root_until`].
 // Only the Linux netns paths consume these; the bin target compiles this module
 // privately, so they would read as dead code on the macOS/Windows builds.
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
@@ -907,18 +907,9 @@ fn is_component_aligned_tail(path: &str, tail: &str) -> bool {
 /// re-checks the opened namespace's inode against the reconciled one, so a task
 /// that exits mid-resolution is caught there rather than here.
 ///
-/// Unbounded: the ordinary long-running / migration consumers keep this. The
-/// one-shot preflight uses [`first_pid_in_cgroup_via_proc_root_until`].
-#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
-pub fn first_pid_in_cgroup_via_proc_root(
-    proc_root: &Path,
-    cgroup_path: &str,
-) -> std::io::Result<u32> {
-    first_pid_in_cgroup_via_proc_root_until(proc_root, cgroup_path, None)
-}
-
-/// [`first_pid_in_cgroup_via_proc_root`] that observes an optional wall-clock
-/// deadline during the walk.
+/// When `deadline` is `None`, the walk is unbounded: ordinary long-running /
+/// migration consumers keep this. The one-shot preflight passes a wall-clock
+/// ceiling so `--timeout-seconds` remains a hard bound on a large host.
 ///
 /// `TimedOut` here is the classified preflight-ceiling outcome, not a kernel
 /// ETIMEDOUT: already-elapsed deadlines return before any pid is considered, and

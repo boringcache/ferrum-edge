@@ -18,7 +18,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use ferrum_edge::proxy::netns_capture::{
-    DEFAULT_PROC_ROOT, first_pid_in_cgroup_via_proc_root, first_pid_in_cgroup_via_proc_root_until,
+    DEFAULT_PROC_ROOT, first_pid_in_cgroup_via_proc_root_until,
     is_proc_scan_deadline, proc_cgroup_is_in_subtree,
 };
 
@@ -112,7 +112,7 @@ fn an_explicit_proc_root_resolves_a_task_in_the_pod_cgroup() {
     ];
     fake_proc_root(root.path(), &entries);
 
-    let pid = first_pid_in_cgroup_via_proc_root(root.path(), POD);
+    let pid = first_pid_in_cgroup_via_proc_root_until(root.path(), POD, None);
     assert_eq!(pid.expect("the enrolled pod's pid must resolve"), 4242);
 }
 
@@ -124,13 +124,13 @@ fn an_explicit_proc_root_with_no_matching_task_fails_closed() {
     let entries = [(1u32, "0::/init.scope"), (9, "0::/other.slice")];
     fake_proc_root(root.path(), &entries);
 
-    let error = first_pid_in_cgroup_via_proc_root(root.path(), POD);
+    let error = first_pid_in_cgroup_via_proc_root_until(root.path(), POD, None);
     let error = error.expect_err("no member task must be an error");
     assert_eq!(error.kind(), std::io::ErrorKind::NotFound);
 
     let missing = root.path().join("definitely-missing");
     assert!(
-        first_pid_in_cgroup_via_proc_root(&missing, POD).is_err(),
+        first_pid_in_cgroup_via_proc_root_until(&missing, POD, None).is_err(),
         "an unreadable procfs root must fail rather than resolve"
     );
 }
@@ -148,7 +148,7 @@ fn non_pid_entries_and_vanished_tasks_do_not_break_resolution() {
     let entries = [(555u32, "0::/kubepods.slice/kubepods-podabc.slice")];
     fake_proc_root(root.path(), &entries);
 
-    let pid = first_pid_in_cgroup_via_proc_root(root.path(), POD);
+    let pid = first_pid_in_cgroup_via_proc_root_until(root.path(), POD, None);
     assert_eq!(pid.expect("resolution must skip non-pid entries"), 555);
 }
 
