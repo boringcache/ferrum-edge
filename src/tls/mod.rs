@@ -1139,6 +1139,7 @@ pub(crate) fn finish_frontend_server_config(
     crls: &[CertificateRevocationListDer<'static>],
     cert_source_display: &str,
     key_source_display: &str,
+    handshake_scope: Option<client_trust::ClientTrustScope>,
 ) -> Result<Arc<ServerConfig>, anyhow::Error> {
     finish_frontend_server_config_capturing_trust(
         cert_resolver,
@@ -1149,7 +1150,7 @@ pub(crate) fn finish_frontend_server_config(
         crls,
         cert_source_display,
         key_source_display,
-        None,
+        handshake_scope,
         None,
     )
 }

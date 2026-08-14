@@ -37,8 +37,13 @@ use ferrum_edge::tls::{
     AcceptedClientTrust, AcceptedFrontendTls, ClientTrustMaterial, CrlList, TlsPolicy,
     load_frontend_tls_candidate_from_paths,
 };
-use rustls::pki_types::{CertificateDer, CertificateRevocationListDer, UnixTime};
+use rustls::ClientConfig;
+use rustls::pki_types::{
+    CertificateDer, CertificateRevocationListDer, PrivateKeyDer, ServerName, UnixTime,
+};
 use rustls::server::danger::ClientCertVerifier;
+use tokio::net::{TcpListener, TcpStream};
+use tokio_rustls::{TlsAcceptor, TlsConnector};
 
 // The trust registry is process-global and `reset_for_test` clears every scope,
 // so this file shares the sibling suite's lock rather than taking its own.
@@ -64,6 +69,7 @@ fn tls_policy() -> TlsPolicy {
 struct TestPki {
     ca_pem: String,
     client_der: Vec<u8>,
+    client_key_pem: String,
     client_serial: u64,
     issuer: rcgen::Issuer<'static, rcgen::KeyPair>,
     server_cert_pem: String,
@@ -123,6 +129,7 @@ fn build_pki() -> TestPki {
     TestPki {
         ca_pem,
         client_der,
+        client_key_pem: client_key.serialize_pem(),
         client_serial,
         issuer,
         server_cert_pem: server_cert.pem(),
@@ -202,12 +209,32 @@ fn load_accepted_frontend(
     crls: &CrlList,
     label: &str,
 ) -> Result<std::sync::Arc<AcceptedFrontendTls>, anyhow::Error> {
+    load_accepted_frontend_parts(
+        dir,
+        label,
+        &pki.server_cert_pem,
+        &pki.server_key_pem,
+        &pki.ca_pem,
+        crls,
+        None,
+    )
+}
+
+fn load_accepted_frontend_parts(
+    dir: &std::path::Path,
+    label: &str,
+    server_cert_pem: &str,
+    server_key_pem: &str,
+    ca_pem: &str,
+    crls: &CrlList,
+    handshake_scope: Option<ClientTrustScope>,
+) -> Result<std::sync::Arc<AcceptedFrontendTls>, anyhow::Error> {
     let cert_path = dir.join(format!("{label}-server-cert.pem"));
     let key_path = dir.join(format!("{label}-server-key.pem"));
     let ca_path = dir.join(format!("{label}-client-ca.pem"));
-    std::fs::write(&cert_path, pki.server_cert_pem.as_bytes()).expect("write server cert");
-    std::fs::write(&key_path, pki.server_key_pem.as_bytes()).expect("write server key");
-    std::fs::write(&ca_path, pki.ca_pem.as_bytes()).expect("write client CA");
+    std::fs::write(&cert_path, server_cert_pem.as_bytes()).expect("write server cert");
+    std::fs::write(&key_path, server_key_pem.as_bytes()).expect("write server key");
+    std::fs::write(&ca_path, ca_pem.as_bytes()).expect("write client CA");
 
     load_frontend_tls_candidate_from_paths(
         cert_path.to_str().expect("utf8 cert path"),
@@ -218,7 +245,7 @@ fn load_accepted_frontend(
         &tls_policy(),
         30,
         crls,
-        None,
+        handshake_scope,
     )
     .map(|candidate| {
         std::sync::Arc::new(AcceptedFrontendTls {
@@ -1254,6 +1281,27 @@ fn dp_mode_pairs_cp_server_config_with_operator_trust_for_h3() {
         "applying CP material must pair it with the latest accepted operator trust and update stream listeners under that lock"
     );
 
+    let stage = client
+        .find("fn stage_frontend_tls_snapshot")
+        .expect("CP frontend TLS staging");
+    let stage_end = client[stage..]
+        .find("async fn commit_frontend_tls_snapshot")
+        .expect("commit follows stage");
+    let staged = &client[stage..][..stage_end];
+    assert!(
+        staged.contains("ClientTrustScope::ProxyFrontend"),
+        "CP-delivered frontend TLS must bind ProxyFrontend's live handshake wrapper"
+    );
+    assert!(
+        staged.contains("load_gateway_multi_cert_tls_config_with_handshake_scope")
+            && staged.contains("load_frontend_tls_candidate_from_paths"),
+        "both Gateway multi-cert and single-cert CP paths must bind the live wrapper"
+    );
+    assert!(
+        !staged.contains("load_tls_config_with_client_auth_and_ocsp"),
+        "the no-handshake-scope loader must not build CP frontend TLS"
+    );
+
     let h3 = include_str!("../../../src/http3/server.rs");
     let reload_arm = h3
         .find("reload_change = reload_rx.changed()")
@@ -1261,5 +1309,372 @@ fn dp_mode_pairs_cp_server_config_with_operator_trust_for_h3() {
     assert!(
         h3[reload_arm..].contains("accepted_slot.load_full()"),
         "H3 must adopt one accepted candidate rather than independently reading config and startup CRLs"
+    );
+}
+
+struct IssuedClient {
+    ca_pem: String,
+    cert_der: Vec<u8>,
+    key_pem: String,
+}
+
+fn issue_client_under_new_ca(cn: &str, serial: u64) -> IssuedClient {
+    ensure_crypto_provider();
+    let ca_key = rcgen::KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).expect("CA key");
+    let mut ca_params = rcgen::CertificateParams::new(Vec::<String>::new()).expect("CA params");
+    ca_params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+    ca_params
+        .distinguished_name
+        .push(rcgen::DnType::CommonName, format!("{cn} CA"));
+    ca_params
+        .key_usages
+        .push(rcgen::KeyUsagePurpose::KeyCertSign);
+    ca_params.key_usages.push(rcgen::KeyUsagePurpose::CrlSign);
+    let ca_cert = ca_params.self_signed(&ca_key).expect("self-signed CA");
+    let issuer = rcgen::Issuer::new(ca_params, ca_key);
+
+    let client_key =
+        rcgen::KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).expect("client key");
+    let mut client_params =
+        rcgen::CertificateParams::new(Vec::<String>::new()).expect("client params");
+    client_params
+        .distinguished_name
+        .push(rcgen::DnType::CommonName, cn);
+    client_params
+        .extended_key_usages
+        .push(rcgen::ExtendedKeyUsagePurpose::ClientAuth);
+    client_params
+        .key_usages
+        .push(rcgen::KeyUsagePurpose::DigitalSignature);
+    client_params.serial_number = Some(rcgen::SerialNumber::from(serial));
+    let client_cert = client_params
+        .signed_by(&client_key, &issuer)
+        .expect("client cert");
+
+    IssuedClient {
+        ca_pem: ca_cert.pem(),
+        cert_der: client_cert.der().to_vec(),
+        key_pem: client_key.serialize_pem(),
+    }
+}
+
+fn self_signed_server(cn: &str) -> (String, String, Vec<u8>) {
+    ensure_crypto_provider();
+    let key = rcgen::KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).expect("server key");
+    let params = rcgen::CertificateParams::new(vec![cn.to_string()]).expect("server params");
+    let cert = params.self_signed(&key).expect("self-signed server cert");
+    (cert.pem(), key.serialize_pem(), cert.der().to_vec())
+}
+
+fn parse_client_key(pem: &str) -> PrivateKeyDer<'static> {
+    rustls_pemfile::private_key(&mut pem.as_bytes())
+        .expect("read client key")
+        .expect("client key present")
+}
+
+fn mtls_client_config(cert_der: &[u8], key_pem: &str) -> ClientConfig {
+    let mut config = ClientConfig::builder()
+        .dangerous()
+        .with_custom_certificate_verifier(std::sync::Arc::new(ferrum_edge::tls::NoVerifier))
+        .with_client_auth_cert(
+            vec![CertificateDer::from(cert_der.to_vec())],
+            parse_client_key(key_pem),
+        )
+        .expect("client auth cert");
+    config.alpn_protocols = vec![b"http/1.1".to_vec()];
+    config
+}
+
+/// Drive one real rustls handshake through `server_config` and return the
+/// leaf the server presented. The handshake is the only way to observe the
+/// live wrapper baked into a CP `ServerConfig`.
+async fn handshake_presented_leaf(
+    server_config: std::sync::Arc<rustls::ServerConfig>,
+    client_config: ClientConfig,
+) -> Result<Vec<u8>, std::io::Error> {
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+    let addr = listener.local_addr().expect("local addr");
+    let acceptor = TlsAcceptor::from(server_config);
+    let server = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.expect("accept");
+        acceptor.accept(stream).await
+    });
+
+    let connector = TlsConnector::from(std::sync::Arc::new(client_config));
+    let stream = TcpStream::connect(addr).await.expect("connect");
+    let name = ServerName::try_from("localhost".to_string()).expect("server name");
+    let result = connector.connect(name, stream).await;
+    let _ = server.await;
+    let tls_stream = result?;
+    Ok(tls_stream
+        .get_ref()
+        .1
+        .peer_certificates()
+        .and_then(|certificates| certificates.first())
+        .map(|cert| cert.as_ref().to_vec())
+        .expect("server presented a certificate"))
+}
+
+/// Under active CP server material, an accepted additive operator CA overlap
+/// must be what a new H1/H2/TCP handshake verifies against, while the exact CP
+/// server certificate/resolver stays in the listener slot (issue #3857).
+#[tokio::test]
+async fn dp_h12_tcp_adopts_additive_operator_verifier_while_retaining_cp_server_cert() {
+    let _guard = isolated_registry();
+    let dir = tempfile::tempdir().expect("tempdir");
+    let pki = build_pki();
+    let extra = issue_client_under_new_ca("overlap-client", 0x3858);
+    let (cp_cert_pem, cp_key_pem, cp_cert_der) = self_signed_server("cp.example.test");
+    let (operator_cert_pem, operator_key_pem, _) = self_signed_server("operator.example.test");
+    let startup_crls = parse_crls(&pki.crl_pem(&[UNRELATED_SERIAL], 1));
+
+    let cp_startup = load_accepted_frontend_parts(
+        dir.path(),
+        "cp-server",
+        &cp_cert_pem,
+        &cp_key_pem,
+        &pki.ca_pem,
+        &startup_crls,
+        Some(ClientTrustScope::ProxyFrontend),
+    )
+    .expect("CP candidate with live wrapper");
+    let operator_startup = load_accepted_frontend_parts(
+        dir.path(),
+        "operator-startup",
+        &operator_cert_pem,
+        &operator_key_pem,
+        &pki.ca_pem,
+        &startup_crls,
+        None,
+    )
+    .expect("operator startup candidate");
+
+    let pairing = DpFrontendH3Pairing::from_operator_candidate(operator_startup);
+    let listener = ferrum_edge::tls::empty_frontend_tls_slot();
+    pairing
+        .publish_cp_server_config(Some(cp_startup.config.clone()), Some(&listener), None)
+        .await;
+
+    let listener_before = listener
+        .load_full()
+        .as_ref()
+        .clone()
+        .expect("CP config on the H1/H2/TCP slot");
+    assert!(std::sync::Arc::ptr_eq(
+        &listener_before,
+        &cp_startup.config
+    ));
+    assert!(std::sync::Arc::ptr_eq(
+        &listener_before.cert_resolver,
+        &cp_startup.config.cert_resolver
+    ));
+
+    let ca1_client = mtls_client_config(&pki.client_der, &pki.client_key_pem);
+    let ca2_client = mtls_client_config(&extra.cert_der, &extra.key_pem);
+    assert_eq!(
+        handshake_presented_leaf(listener_before.clone(), ca1_client.clone())
+            .await
+            .expect("CA1 client is admitted by the snapshot verifier"),
+        cp_cert_der,
+        "the CP server certificate must be the one presented"
+    );
+    assert!(
+        handshake_presented_leaf(listener_before.clone(), ca2_client.clone())
+            .await
+            .is_err(),
+        "the extra CA is not in the snapshot inner verifier until the operator reload publishes"
+    );
+
+    let overlap_pem = format!("{}{}", pki.ca_pem, extra.ca_pem);
+    let operator_overlap = load_accepted_frontend_parts(
+        dir.path(),
+        "operator-overlap",
+        &operator_cert_pem,
+        &operator_key_pem,
+        &overlap_pem,
+        &startup_crls,
+        None,
+    )
+    .expect("additive operator candidate");
+    assert!(
+        operator_overlap
+            .client_trust
+            .verifier
+            .as_ref()
+            .expect("overlap verifier")
+            .verify_client_cert(
+                &CertificateDer::from(extra.cert_der.clone()),
+                &[],
+                UnixTime::now()
+            )
+            .is_ok(),
+        "the accepted operator verifier must admit the extra CA"
+    );
+
+    // Production publishes the live ProxyFrontend verifier before pairing.
+    let publication = publish_rustls(
+        ClientTrustScope::ProxyFrontend,
+        &operator_overlap.client_trust,
+    );
+    assert!(
+        publication.outcome == ClientTrustPublicationOutcome::Armed
+            || publication.outcome == ClientTrustPublicationOutcome::Advanced,
+        "additive overlap must arm or advance, never withdraw: {:?}",
+        publication.outcome
+    );
+
+    let update = pairing
+        .publish_operator_candidate(operator_overlap.clone(), Some(&listener), None)
+        .await;
+    assert!(
+        !update.replace_listener,
+        "an additive operator trust reload must not substitute the operator server certificate"
+    );
+
+    let listener_after = listener
+        .load_full()
+        .as_ref()
+        .clone()
+        .expect("CP config retained");
+    assert!(
+        std::sync::Arc::ptr_eq(&listener_after, &cp_startup.config),
+        "H1/H2/TCP must keep the exact CP ServerConfig Arc"
+    );
+    assert!(
+        std::sync::Arc::ptr_eq(
+            &listener_after.cert_resolver,
+            &cp_startup.config.cert_resolver
+        ),
+        "H1/H2/TCP must keep the exact CP server certificate resolver"
+    );
+    assert!(!std::sync::Arc::ptr_eq(
+        &listener_after,
+        &operator_overlap.config
+    ));
+
+    let presented = handshake_presented_leaf(listener_after.clone(), ca2_client)
+        .await
+        .expect(
+            "a connection established after the accepted reload must use the new operator verifier",
+        );
+    assert_eq!(
+        presented, cp_cert_der,
+        "the additive handshake must still present the CP server certificate"
+    );
+    assert_eq!(
+        handshake_presented_leaf(listener_after, ca1_client)
+            .await
+            .expect("original CA remains trusted under additive overlap"),
+        cp_cert_der
+    );
+
+    let h3 = pairing.h3_accepted().expect("paired H3 candidate");
+    assert!(
+        std::sync::Arc::ptr_eq(&h3.config, &cp_startup.config),
+        "H3 must keep the CP server certificate"
+    );
+    assert_eq!(
+        h3.client_trust.material, operator_overlap.client_trust.material,
+        "H3 must adopt the accepted additive operator trust"
+    );
+}
+
+/// A refused later operator candidate never reaches pairing, so the H1/H2/TCP
+/// slot keeps the last-good CP config and the live wrapper keeps admitting the
+/// last accepted overlap verifier.
+#[tokio::test]
+async fn dp_refused_operator_candidate_retains_cp_config_and_last_good_verifier() {
+    let _guard = isolated_registry();
+    let dir = tempfile::tempdir().expect("tempdir");
+    let pki = build_pki();
+    let extra = issue_client_under_new_ca("overlap-client", 0x3858);
+    let (cp_cert_pem, cp_key_pem, cp_cert_der) = self_signed_server("cp.example.test");
+    let startup_crls = parse_crls(&pki.crl_pem(&[UNRELATED_SERIAL], 1));
+
+    let cp_startup = load_accepted_frontend_parts(
+        dir.path(),
+        "cp-server",
+        &cp_cert_pem,
+        &cp_key_pem,
+        &pki.ca_pem,
+        &startup_crls,
+        Some(ClientTrustScope::ProxyFrontend),
+    )
+    .expect("CP candidate");
+    let operator_startup = load_accepted_frontend_parts(
+        dir.path(),
+        "operator-startup",
+        &pki.server_cert_pem,
+        &pki.server_key_pem,
+        &pki.ca_pem,
+        &startup_crls,
+        None,
+    )
+    .expect("operator startup");
+
+    let pairing = DpFrontendH3Pairing::from_operator_candidate(operator_startup);
+    let listener = ferrum_edge::tls::empty_frontend_tls_slot();
+    pairing
+        .publish_cp_server_config(Some(cp_startup.config.clone()), Some(&listener), None)
+        .await;
+
+    let overlap_pem = format!("{}{}", pki.ca_pem, extra.ca_pem);
+    let operator_overlap = load_accepted_frontend_parts(
+        dir.path(),
+        "operator-overlap",
+        &pki.server_cert_pem,
+        &pki.server_key_pem,
+        &overlap_pem,
+        &startup_crls,
+        None,
+    )
+    .expect("additive operator candidate");
+    publish_rustls(
+        ClientTrustScope::ProxyFrontend,
+        &operator_overlap.client_trust,
+    );
+    pairing
+        .publish_operator_candidate(operator_overlap.clone(), Some(&listener), None)
+        .await;
+
+    let before = pairing.h3_accepted().expect("paired");
+    let listener_before = listener.load_full().as_ref().clone().expect("CP config");
+
+    // Production never calls publish_operator_candidate for a refused load.
+    let refused = load_frontend_tls_candidate_from_paths(
+        dir.path()
+            .join("operator-overlap-server-cert.pem")
+            .to_str()
+            .expect("utf8"),
+        dir.path()
+            .join("operator-overlap-server-key.pem")
+            .to_str()
+            .expect("utf8"),
+        Some("this-is-not-a-certificate"),
+        None,
+        false,
+        &tls_policy(),
+        30,
+        &startup_crls,
+        None,
+    );
+    assert!(
+        refused.is_err(),
+        "a malformed client-CA path must fail closed rather than publishing"
+    );
+    let after = pairing.h3_accepted().expect("retained");
+    assert!(std::sync::Arc::ptr_eq(&before, &after));
+    assert!(std::sync::Arc::ptr_eq(
+        listener.load_full().as_ref().as_ref().expect("retained CP"),
+        &listener_before
+    ));
+    assert_eq!(
+        handshake_presented_leaf(
+            listener_before,
+            mtls_client_config(&extra.cert_der, &extra.key_pem)
+        )
+        .await
+        .expect("last-good overlap verifier must still admit the extra CA"),
+        cp_cert_der
     );
 }

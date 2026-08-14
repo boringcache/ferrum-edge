@@ -62,7 +62,9 @@ use crate::config::types::GatewayConfig;
 use crate::identity::TrustBundleSet as RuntimeTrustBundleSet;
 use crate::modes::mesh::config::TrustBundleSet as ConfigTrustBundleSet;
 use crate::proxy::{ConfigApplyOutcome, GatewayTrustCommit, ProxyState};
-use crate::tls::multi_cert::{GatewayCertificateInput, load_gateway_multi_cert_tls_config};
+use crate::tls::multi_cert::{
+    GatewayCertificateInput, load_gateway_multi_cert_tls_config_with_handshake_scope,
+};
 use crate::tls::source::{CertSource, MaterialKind, load_material_blocking};
 use crate::util::backoff::jittered_backoff;
 
@@ -428,7 +430,10 @@ pub struct DpFrontendListenerUpdate {
     /// is true. `None` clears that slot.
     pub listener_config: Option<Arc<rustls::ServerConfig>>,
     /// When false, CP material still owns the listener slot: do not substitute
-    /// the operator server certificate. Stream listeners keep the CP config.
+    /// the operator server certificate. Stream listeners keep the CP config,
+    /// which binds [`crate::tls::ClientTrustScope::ProxyFrontend`]'s live
+    /// handshake wrapper so new H1/H2/TCP handshakes consult the accepted
+    /// operator verifier.
     pub replace_listener: bool,
 }
 
@@ -443,6 +448,13 @@ pub struct DpFrontendListenerUpdate {
 /// listener slot, and the [`crate::proxy::stream_listener::StreamListenerManager`]
 /// update so a descheduled operator reload cannot overwrite TCP stream TLS
 /// after a later CP publication. H3 loads only [`Self::h3_accepted_slot`].
+///
+/// H1/H2/TCP keep that same CP `ServerConfig` while CP material is active
+/// (never the operator server certificate). CP snapshots bind
+/// [`crate::tls::ClientTrustScope::ProxyFrontend`]'s live handshake wrapper, so
+/// an accepted operator trust reload is visible to new handshakes on those
+/// listeners without substituting CP server generation N with an operator
+/// server certificate.
 pub struct DpFrontendH3Pairing {
     lock: Mutex<DpFrontendH3PairingState>,
     /// Exact candidate the H3 listener adopts with one atomic load.
@@ -480,10 +492,15 @@ impl DpFrontendH3Pairing {
     /// the operator server config).
     ///
     /// When CP material is present the H1/H2/TCP slot and stream-listener TLS
-    /// are left untouched and this trust is paired with the active CP server
-    /// config into [`Self::h3_accepted_slot`]. The caller must still bump the
-    /// H3 revision so ProxyH3 can adopt that one Arc through its rustls
-    /// transaction.
+    /// keep the CP-owned server certificate/resolver — never the operator
+    /// server certificate. Those CP configs bind
+    /// [`crate::tls::ClientTrustScope::ProxyFrontend`]'s live handshake
+    /// wrapper, so new H1/H2/TCP handshakes consult this accepted operator
+    /// verifier (additive CA overlap and CRL unrevocation as well as
+    /// withdrawals) without substituting operator server material. This trust
+    /// is paired with the active CP server config into
+    /// [`Self::h3_accepted_slot`]. The caller must still bump the H3 revision
+    /// so ProxyH3 can adopt that one Arc through its rustls transaction.
     ///
     /// When CP material is absent, `listener_slot` and the stream-listener TLS
     /// slot are stored under the same lock as the H3 candidate so a concurrent
@@ -1628,8 +1645,15 @@ fn stage_frontend_tls_snapshot(
             // control plane that predates the field) still resolves to
             // exactly the single-certificate behavior it had before.
             let certificates = gateway_certificate_inputs(config);
+            // Bind ProxyFrontend's live handshake wrapper. CP owns the server
+            // certificate/resolver; the operator owns client trust. Without this
+            // wrapper the snapshot bakes in the operator verifier from this
+            // instant, and an accepted additive CA/CRL reload would keep
+            // rejecting new H1/H2/TCP handshakes (issue #3857). Withdrawals
+            // already fail closed via post-handshake revalidation.
+            let handshake_scope = Some(crate::tls::ClientTrustScope::ProxyFrontend);
             let mut tls_config = if !certificates.is_empty() {
-                load_gateway_multi_cert_tls_config(
+                load_gateway_multi_cert_tls_config_with_handshake_scope(
                     &certificates,
                     proxy_state
                         .env_config
@@ -1642,6 +1666,7 @@ fn stage_frontend_tls_snapshot(
                     tls_policy,
                     proxy_state.env_config.tls_cert_expiry_warning_days,
                     proxy_state.crls.as_ref().as_slice(),
+                    handshake_scope,
                 )
                 .map_err(|error| {
                     anyhow::anyhow!(
@@ -1651,7 +1676,7 @@ fn stage_frontend_tls_snapshot(
                     )
                 })?
             } else {
-                crate::tls::load_tls_config_with_client_auth_and_ocsp(
+                crate::tls::load_frontend_tls_candidate_from_paths(
                     cert_path,
                     key_path,
                     proxy_state
@@ -1666,7 +1691,9 @@ fn stage_frontend_tls_snapshot(
                     tls_policy,
                     proxy_state.env_config.tls_cert_expiry_warning_days,
                     proxy_state.crls.as_ref().as_slice(),
+                    handshake_scope,
                 )
+                .map(|candidate| candidate.config)
                 .map_err(|error| {
                     anyhow::anyhow!(
                         "failed to materialize frontend TLS certificate source {}: {}",

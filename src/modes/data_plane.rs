@@ -428,6 +428,10 @@ pub async fn run(
                         {
                             // CP may own the server certificate; still wake H3
                             // with the paired (CP config, operator trust) Arc.
+                            // H1/H2/TCP keep that CP config, which binds the
+                            // ProxyFrontend live wrapper, so new handshakes
+                            // consult the accepted operator verifier without
+                            // substituting the operator server certificate.
                             // A refused operator candidate never updates the
                             // accepted slot or this revision watch, so last-good
                             // H3 verifier/config/generation/sessions are retained.
