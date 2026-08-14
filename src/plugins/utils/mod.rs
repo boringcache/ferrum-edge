@@ -33,6 +33,7 @@ pub mod policy_digest;
 pub mod query;
 pub mod rate_limit;
 pub mod redis_rate_limiter;
+pub mod replay_authority;
 pub mod replay_partition;
 pub mod response_body;
 pub mod route_header_transform;

@@ -370,6 +370,31 @@ fn connect_timeout_is_installed_into_redis_connection_config_above_and_below_one
     );
 }
 
+#[test]
+fn recovery_ping_is_bounded_by_the_connect_timeout() {
+    let source = include_str!("../../../src/plugins/utils/redis_rate_limiter.rs");
+    assert!(
+        source.contains("async fn ping_connection("),
+        "recovery PING must go through a bounded helper"
+    );
+    assert!(
+        source.contains("ping_connection(&mut conn, connect_timeout)"),
+        "the recovery checker must bound PING by redis_connect_timeout_seconds"
+    );
+    assert!(
+        source.contains(".set_response_timeout(None)"),
+        "recovery connections must disable redis-rs' 500ms response timeout"
+    );
+    assert!(
+        source.contains("error.is_timeout()"),
+        "an inner I/O timeout on recovery PING must use the classified ping-timeout error"
+    );
+    assert!(
+        !source.contains("redis::cmd(\"PING\").query_async::<String>(&mut conn).await"),
+        "unbounded recovery PING must not return"
+    );
+}
+
 /// Accept TCP, optionally delay, then answer every RESP array command with +OK.
 ///
 /// Used to simulate a Redis endpoint whose protocol handshake is delayed after
@@ -1503,6 +1528,57 @@ fn parse_cluster_enabled_recognizes_only_a_reported_value() {
 }
 
 #[test]
+fn classify_memory_info_accepts_unlimited_or_noeviction_only() {
+    use ferrum_edge::_test_support::{MemoryPolicyScreen, classify_memory_info};
+
+    assert_eq!(
+        classify_memory_info("# Memory\r\nmaxmemory:0\r\nmaxmemory_policy:allkeys-lru\r\n"),
+        MemoryPolicyScreen::Usable
+    );
+    // Redis INFO MEMORY also emits `maxmemory_human`; that must not clobber the
+    // exact `maxmemory` field or an unlimited server looks unproven/unsafe.
+    assert_eq!(
+        classify_memory_info(
+            "# Memory\r\nmaxmemory:0\r\nmaxmemory_human:0B\r\nmaxmemory_policy:allkeys-lru\r\n"
+        ),
+        MemoryPolicyScreen::Usable
+    );
+    assert_eq!(
+        classify_memory_info("# Memory\r\nmaxmemory:1048576\r\nmaxmemory_policy:noeviction\r\n"),
+        MemoryPolicyScreen::Usable
+    );
+    assert_eq!(
+        classify_memory_info("# Memory\r\nmaxmemory_policy:noeviction\r\n"),
+        MemoryPolicyScreen::Usable
+    );
+    assert_eq!(
+        classify_memory_info("# Memory\r\nmaxmemory:1\r\nmaxmemory_policy:volatile-lru\r\n"),
+        MemoryPolicyScreen::UnsafeEviction
+    );
+    assert_eq!(
+        classify_memory_info("# Memory\r\nmaxmemory:1\r\nmaxmemory_policy:allkeys-lru\r\n"),
+        MemoryPolicyScreen::UnsafeEviction
+    );
+    assert_eq!(
+        classify_memory_info("# Memory\r\nmaxmemory_policy:allkeys-random\r\n"),
+        MemoryPolicyScreen::UnsafeEviction
+    );
+    assert_eq!(
+        classify_memory_info("# Memory\r\nmaxmemory:1\r\n"),
+        MemoryPolicyScreen::Unproven
+    );
+    assert_eq!(
+        classify_memory_info("# Memory\r\nmaxmemory_human:1M\r\n"),
+        MemoryPolicyScreen::Unproven
+    );
+    assert_eq!(classify_memory_info(""), MemoryPolicyScreen::Unproven);
+    assert_eq!(
+        classify_memory_info("maxmemory:\r\nmaxmemory_policy:\r\n"),
+        MemoryPolicyScreen::Unproven
+    );
+}
+
+#[test]
 fn cluster_topology_codes_are_terminal_but_outage_codes_are_not() {
     use ferrum_edge::_test_support::is_cluster_topology_code;
 
@@ -2555,7 +2631,7 @@ fn cached_pool_pins_multiplexed_connection_not_connection_manager() {
         .find("match self.connect_multiplexed(client).await {")
         .expect("pooled establishment site");
     let screen = source[establish..publish]
-        .find("self.screen_topology(&mut conn)")
+        .find("self.screen_established_connection(&mut conn)")
         .expect("pooled path must screen topology before publishing");
     assert!(
         screen > 0,

@@ -76,8 +76,9 @@ pub use config_builder::{
     write_yaml_value,
 };
 pub use echo_servers::{
-    EchoServer, spawn_http_echo, spawn_http_flapping, spawn_http_identifying,
-    spawn_http_slow_identifying, spawn_http_status, spawn_tcp_echo, spawn_udp_echo,
+    EchoServer, spawn_http_counting_mutations, spawn_http_echo, spawn_http_flapping,
+    spawn_http_identifying, spawn_http_slow_identifying, spawn_http_status, spawn_tcp_echo,
+    spawn_udp_echo,
 };
 pub use gateway_harness::{
     DbType, GatewayMode, GatewaySpawnFailure, TestGateway, TestGatewayBuilder,
@@ -86,8 +87,9 @@ pub use gateway_harness::{
     scrub_gateway_capture_for_diagnostics, shutdown_gateway_child,
 };
 pub use hmac_helpers::{
-    empty_digest_header, generate_hmac_signature, generate_hmac_signature_with_digest,
-    generate_hmac_signature_with_query, hmac_authority_from_url,
+    HmacV2Request, empty_digest_header, generate_hmac_signature,
+    generate_hmac_signature_with_digest, generate_hmac_signature_with_query,
+    hmac_authority_from_url, hmac_v2_authorization_header, hmac_v2_nonce,
 };
 pub use isolated_audit_fallback::isolated_audit_fallback_dir;
 pub use trusted_projected_gateway::{

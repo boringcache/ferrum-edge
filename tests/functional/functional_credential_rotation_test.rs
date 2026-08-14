@@ -723,7 +723,11 @@ async fn test_credential_rotation_hmac() {
             "scope": "proxy",
             "proxy_id": "rot-hmac-proxy",
             "enabled": true,
-            "config": {"clock_skew_seconds": 300}
+            "config": {
+                "clock_skew_seconds": 300,
+                "signing_profile": "ferrum-hmac-v1",
+                "allow_unsafe_replayable_v1": true
+            }
         }),
     )
     .await
