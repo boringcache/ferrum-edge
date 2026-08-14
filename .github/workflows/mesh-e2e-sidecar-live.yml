@@ -296,7 +296,9 @@ jobs:
           kubectl --context "$ctx" -n spire-system get all -o wide > "$results/spire-all.txt" 2>&1
           kubectl --context "$ctx" -n spire-system logs statefulset/spire-server --all-containers --tail=500 > "$results/spire-server.log" 2>&1
           kubectl --context "$ctx" -n spire-system logs daemonset/spire-agent --all-containers --tail=500 > "$results/spire-agent.log" 2>&1
-          for deploy in svc client rogue; do
+          for deploy in svc client rogue capp ferrum-cp \
+            native-omit-client native-foreign-client native-untrusted-ca \
+            native-wrong-san native-jwt-invalid native-stale-client; do
             kubectl --context "$ctx" -n ferrum logs "deploy/$deploy" --all-containers --tail=500 > "$results/${deploy}.log" 2>&1
           done
           kubectl --context "$ctx" -n ferrum logs deploy/svc -c ferrum-edge-init --tail=50 > "$results/svc-iptables.txt" 2>&1

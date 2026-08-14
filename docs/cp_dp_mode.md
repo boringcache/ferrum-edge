@@ -83,7 +83,9 @@ The gRPC channel supports three security modes:
 
 **Mutual TLS (recommended for production)**: In addition to server verification, the CP requires a client certificate from the DP (`FERRUM_DP_GRPC_TLS_CLIENT_CERT_PATH` + `_KEY_PATH`), verified against a trusted CA (`FERRUM_CP_GRPC_TLS_CLIENT_CA_PATH`). This adds certificate-based DP identity on top of JWT authentication, so a leaked JWT secret alone cannot impersonate a DP.
 
-> **`FERRUM_DP_GRPC_TLS_NO_VERIFY` is not supported** and is rejected at startup when `true`: the tonic-managed gRPC client exposes no hook to skip server certificate verification, so the flag only ever provided false confidence. To test against a CP with a self-signed certificate, pin its CA via `FERRUM_DP_GRPC_TLS_CA_CERT_PATH`.
+The release-blocking `mesh-e2e-sidecar` native `MeshSubscribe` assertion proves this production posture end to end: the DP dials `https://ferrum-cp.<namespace>.svc.cluster.local:50051` so hostname/SAN verification is real Kubernetes Service DNS, the CP requires a client certificate, JWT remains required on the same stream, dedicated probe Deployments fail closed for omit-client / foreign-client / untrusted-server-CA / wrong-SAN / invalid-JWT, and a projected Secret generation swap proves the watched CP/DP gRPC TLS sources reconnect without a pod restart. That gate does not permit plaintext gRPC and does not skip server certificate verification.
+
+> **`FERRUM_DP_GRPC_TLS_NO_VERIFY` is not supported** and is rejected at startup when `true`: disabling server certificate verification is unsafe. To test against a CP with a self-signed certificate, pin its CA via `FERRUM_DP_GRPC_TLS_CA_CERT_PATH`.
 
 ### Pre-authentication connection admission
 
@@ -525,10 +527,16 @@ restart), but no request-visible decision waits on it, and nothing about the
 trust event can be missed or coalesced.
 
 An explicit removal or `Clear` of an installed override is therefore **not
-usable for new validation and not discoverable for a new pool checkout** the
-moment the commit returns. Already-issued handles such as `H2ConnectTunnel`,
-cloned `MeshMtlsSender`, and active gRPC/WebSocket/raw CONNECT streams are **not**
-terminated by this publication; issue #3859 tracks that live-session gap.
+usable for new validation, not discoverable for a new pool checkout, and not
+usable by an already-issued gateway-to-mesh transport** the moment the commit
+returns. The ownership registry synchronously marks and signals issued
+`H2ConnectTunnel` and `MeshMtlsSender` handles plus active
+WebSocket/datagram/raw-CONNECT bridges. A retired HBONE tunnel's next poll,
+read, or write fails with the fixed material-free `gateway trust authority
+withdrawn` error. A retired pooled mesh-mTLS sender consults the same gate in
+`ready` / `send_request` and refuses the next stream synchronously, without
+waiting for driver scheduling or socket-close propagation. In-flight streams
+still terminate through driver/socket teardown.
 
 ###### The admission-refusal window, and what bounds it
 
@@ -538,21 +546,34 @@ operator-visible window and is documented rather than hidden.
 
 What runs inside it, in order, on the publishing thread — no `.await`, no I/O:
 
-1. one `ArcSwap` store of the trust material;
-2. one atomic advance of the backend security generation;
-3. for each generation in the retired half-open span (normally exactly one, and
+1. the request-facing gateway trust epoch is already fenced;
+2. one `ArcSwap` store of the accepted trust material into every verifier slot it
+   governs;
+3. one ownership-registry generation advance, followed by a `retain` pass that
+   marks and notifies every registered HBONE or mesh-mTLS physical transport in
+   the outgoing generation;
+4. one atomic advance of the backend security generation;
+5. for each generation in the retired half-open span (normally exactly one, and
    never more than `MAX_COALESCED_ROTATION_DRAIN_GENERATIONS` = 8): one backend
    TLS config-cache drain plus one `retain` pass over each of the
    connection-pool, HTTP/2, gRPC and H3 `DashMap`s;
-4. one `clear()` of each of the HBONE and mesh-mTLS pool maps (entries,
-   creation locks, retired-fingerprint registries).
+6. one `clear()` of each of the HBONE and mesh-mTLS pool maps (entries,
+   creation locks, retired-fingerprint registries), followed by publication of
+   the accepted trust as live.
 
-So the window scales with **pooled occupancy** — the number of live entries
-across those six pools — and, linearly, with the **number of coalesced
-generations** in step 3. It does not scale with trust-material size, with the
-number of federated trust domains, with connected data planes, or with request
-rate. Dropping a pool entry cancels its connection task; the window does not
-wait for a socket close, a TLS shutdown, or a peer round trip.
+Material is stored before the ownership generation advances so a dial that passed
+the live check immediately before fencing cannot take a *new* registry ticket and
+still load the *old* verifier. A ticket stamped before step 3 is refused at
+registration; a ticket stamped after step 3 can only load the material already
+stored in step 2.
+
+So the window scales with the number of **registered live gateway-to-mesh
+physical transports**, with **pooled occupancy** across the six pools, and,
+linearly, with the **number of coalesced generations** in step 5. It does not
+scale with trust-material size, with the number of federated trust domains,
+with connected data planes, or with request rate. Signalling a registered
+transport and dropping a pool entry wake or cancel their connection tasks; the
+window does not wait for a socket close, a TLS shutdown, or a peer round trip.
 
 What a client sees while the window is open is the ordinary fail-closed refusal
 for its protocol, not a hang or a partial state: native gRPC gets a
@@ -969,7 +990,7 @@ in a failover set must use the same value.
 | `FERRUM_DP_GRPC_TLS_CA_CERT_PATH` | No | PEM CA cert for verifying CP server cert |
 | `FERRUM_DP_GRPC_TLS_CLIENT_CERT_PATH` | No | PEM client cert for mTLS |
 | `FERRUM_DP_GRPC_TLS_CLIENT_KEY_PATH` | No | PEM client key for mTLS |
-| `FERRUM_DP_GRPC_TLS_NO_VERIFY` | No | **Not supported — rejected at startup when `true`.** The client cannot skip server verification; pin the CP CA via `FERRUM_DP_GRPC_TLS_CA_CERT_PATH` for self-signed test certs instead |
+| `FERRUM_DP_GRPC_TLS_NO_VERIFY` | No | **Not supported — rejected at startup when `true`.** Disabling server certificate verification is unsafe; pin the CP CA via `FERRUM_DP_GRPC_TLS_CA_CERT_PATH` for self-signed test certs instead |
 | `FERRUM_ADMIN_JWT_SECRET` | Yes | JWT secret for the read-only Admin API |
 | `FERRUM_PROXY_HTTP_PORT` | No | HTTP proxy port (default: 8000). Set to `0` to disable the plaintext HTTP proxy listener |
 | `FERRUM_PROXY_HTTPS_PORT` | No | HTTPS proxy port (default: 8443) |

@@ -86,7 +86,7 @@ fn udp_session_admission_canonicalizes_mapped_client_identity() {
 
 #[test]
 fn zero_length_udp_request_retains_bounded_response_budget() {
-    use ferrum_edge::proxy::udp_proxy::udp_amplification_response_budget;
+    use ferrum_edge::udp_amplification::udp_amplification_response_budget;
 
     assert_eq!(udp_amplification_response_budget(0, 1.0), 1);
     assert_eq!(udp_amplification_response_budget(0, 0.25), 1);

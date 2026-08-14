@@ -356,6 +356,23 @@ async fn test_http3_proxy_state_creation() {
         ),
     );
     connection_pool.attach_reqwest_connection_admission(reqwest_conn_admission.clone());
+    let mesh_trust_registry = ferrum_edge::proxy::mesh_trust_registry::MeshTrustRegistry::new();
+    let hbone_pool = Arc::new(ferrum_edge::proxy::hbone_pool::HboneConnectionPool::new(
+        ferrum_edge::config::PoolConfig::default(),
+        ferrum_edge::dns::DnsCache::new(ferrum_edge::dns::DnsConfig::default()),
+        Arc::new(arc_swap::ArcSwap::new(Arc::new(None))),
+        64,
+    ));
+    hbone_pool.attach_mesh_trust_registry(mesh_trust_registry.clone());
+    let mesh_mtls_pool = Arc::new(
+        ferrum_edge::proxy::mesh_mtls_pool::MeshMtlsConnectionPool::new(
+            ferrum_edge::config::PoolConfig::default(),
+            ferrum_edge::dns::DnsCache::new(ferrum_edge::dns::DnsConfig::default()),
+            Arc::new(arc_swap::ArcSwap::new(Arc::new(None))),
+            64,
+        ),
+    );
+    mesh_mtls_pool.attach_mesh_trust_registry(mesh_trust_registry.clone());
     let proxy_state = ProxyState {
         config: gateway_config,
         request_epoch,
@@ -369,20 +386,8 @@ async fn test_http3_proxy_state_creation() {
         status_counts: Arc::new(dashmap::DashMap::new()),
         grpc_pool: Arc::new(ferrum_edge::proxy::grpc_proxy::GrpcConnectionPool::default()),
         http2_pool: Arc::new(ferrum_edge::proxy::http2_pool::Http2ConnectionPool::default()),
-        hbone_pool: Arc::new(ferrum_edge::proxy::hbone_pool::HboneConnectionPool::new(
-            ferrum_edge::config::PoolConfig::default(),
-            ferrum_edge::dns::DnsCache::new(ferrum_edge::dns::DnsConfig::default()),
-            Arc::new(arc_swap::ArcSwap::new(Arc::new(None))),
-            64,
-        )),
-        mesh_mtls_pool: Arc::new(
-            ferrum_edge::proxy::mesh_mtls_pool::MeshMtlsConnectionPool::new(
-                ferrum_edge::config::PoolConfig::default(),
-                ferrum_edge::dns::DnsCache::new(ferrum_edge::dns::DnsConfig::default()),
-                Arc::new(arc_swap::ArcSwap::new(Arc::new(None))),
-                64,
-            ),
-        ),
+        hbone_pool,
+        mesh_mtls_pool,
         unix_backend_pool: Arc::new(
             ferrum_edge::proxy::unix_backend_pool::UnixBackendConnectionPool::new(
                 ferrum_edge::config::PoolConfig::default(),
@@ -469,6 +474,7 @@ async fn test_http3_proxy_state_creation() {
         gateway_file_svid_bundle: Arc::new(arc_swap::ArcSwap::new(Arc::new(None))),
         gateway_trust_bundles: Arc::new(arc_swap::ArcSwap::new(Arc::new(None))),
         gateway_svid_update_lock: Arc::new(std::sync::Mutex::new(())),
+        mesh_trust_registry,
         gateway_trust_publication_lock: Arc::new(std::sync::Mutex::new(())),
         gateway_trust_authority_unresolved: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         mesh_inbound_tls: empty_mesh_inbound_tls(),
@@ -673,6 +679,23 @@ async fn test_http3_full_integration() {
         ),
     );
     connection_pool.attach_reqwest_connection_admission(reqwest_conn_admission.clone());
+    let mesh_trust_registry = ferrum_edge::proxy::mesh_trust_registry::MeshTrustRegistry::new();
+    let hbone_pool = Arc::new(ferrum_edge::proxy::hbone_pool::HboneConnectionPool::new(
+        ferrum_edge::config::PoolConfig::default(),
+        ferrum_edge::dns::DnsCache::new(ferrum_edge::dns::DnsConfig::default()),
+        Arc::new(arc_swap::ArcSwap::new(Arc::new(None))),
+        64,
+    ));
+    hbone_pool.attach_mesh_trust_registry(mesh_trust_registry.clone());
+    let mesh_mtls_pool = Arc::new(
+        ferrum_edge::proxy::mesh_mtls_pool::MeshMtlsConnectionPool::new(
+            ferrum_edge::config::PoolConfig::default(),
+            ferrum_edge::dns::DnsCache::new(ferrum_edge::dns::DnsConfig::default()),
+            Arc::new(arc_swap::ArcSwap::new(Arc::new(None))),
+            64,
+        ),
+    );
+    mesh_mtls_pool.attach_mesh_trust_registry(mesh_trust_registry.clone());
     let proxy_state = ProxyState {
         config: gateway_config,
         request_epoch,
@@ -686,20 +709,8 @@ async fn test_http3_full_integration() {
         status_counts: Arc::new(dashmap::DashMap::new()),
         grpc_pool: Arc::new(ferrum_edge::proxy::grpc_proxy::GrpcConnectionPool::default()),
         http2_pool: Arc::new(ferrum_edge::proxy::http2_pool::Http2ConnectionPool::default()),
-        hbone_pool: Arc::new(ferrum_edge::proxy::hbone_pool::HboneConnectionPool::new(
-            ferrum_edge::config::PoolConfig::default(),
-            ferrum_edge::dns::DnsCache::new(ferrum_edge::dns::DnsConfig::default()),
-            Arc::new(arc_swap::ArcSwap::new(Arc::new(None))),
-            64,
-        )),
-        mesh_mtls_pool: Arc::new(
-            ferrum_edge::proxy::mesh_mtls_pool::MeshMtlsConnectionPool::new(
-                ferrum_edge::config::PoolConfig::default(),
-                ferrum_edge::dns::DnsCache::new(ferrum_edge::dns::DnsConfig::default()),
-                Arc::new(arc_swap::ArcSwap::new(Arc::new(None))),
-                64,
-            ),
-        ),
+        hbone_pool,
+        mesh_mtls_pool,
         unix_backend_pool: Arc::new(
             ferrum_edge::proxy::unix_backend_pool::UnixBackendConnectionPool::new(
                 ferrum_edge::config::PoolConfig::default(),
@@ -786,6 +797,7 @@ async fn test_http3_full_integration() {
         gateway_file_svid_bundle: Arc::new(arc_swap::ArcSwap::new(Arc::new(None))),
         gateway_trust_bundles: Arc::new(arc_swap::ArcSwap::new(Arc::new(None))),
         gateway_svid_update_lock: Arc::new(std::sync::Mutex::new(())),
+        mesh_trust_registry,
         gateway_trust_publication_lock: Arc::new(std::sync::Mutex::new(())),
         gateway_trust_authority_unresolved: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         mesh_inbound_tls: empty_mesh_inbound_tls(),

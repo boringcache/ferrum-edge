@@ -127,7 +127,19 @@ pub enum GrpcBody {
     /// observe `bytes_seen` from another task after `into_reqwest_body()`
     /// moves ownership — `GrpcBody` has no such cross-task read path.
     Streaming {
-        incoming: Incoming,
+        /// The client body, or — for an AUTHENTICATED request — a bounded
+        /// bridge fed by a gateway-owned pump task (issue #3815).
+        ///
+        /// Native gRPC keeps its full-duplex semantics: the pump is a
+        /// capacity-1 bridge, not a buffer-first collect, so a bidirectional
+        /// RPC still commits each request message as it arrives. What it adds
+        /// is an absolute authorization bound owned by a task the GATEWAY
+        /// schedules, so it fires even while hyper's HTTP/2 pipe is parked on
+        /// backend send capacity and is polling nothing. On expiry the client
+        /// body is dropped and this body ends in an ERROR, so hyper emits
+        /// RST_STREAM — never a clean END_STREAM the backend could mistake for
+        /// a complete request stream.
+        incoming: crate::proxy::body::UploadSource,
         bytes_seen: usize,
         max_bytes: usize,
         exceeded: Arc<AtomicBool>,
@@ -233,7 +245,7 @@ impl http_body::Body for GrpcBody {
                 grpc_messages,
                 grpc_scanner,
                 ..
-            } => match Pin::new(incoming).poll_frame(cx) {
+            } => match incoming.poll_frame(cx) {
                 Poll::Ready(Some(Ok(frame))) => {
                     if let Some(data) = frame.data_ref() {
                         if *max_bytes > 0 {
@@ -258,7 +270,7 @@ impl http_body::Body for GrpcBody {
                     }
                     Poll::Ready(Some(Ok(frame)))
                 }
-                Poll::Ready(Some(Err(e))) => Poll::Ready(Some(Err(Box::new(e)))),
+                Poll::Ready(Some(Err(e))) => Poll::Ready(Some(Err(e))),
                 Poll::Ready(None) => Poll::Ready(None),
                 Poll::Pending => Poll::Pending,
             },
@@ -1400,6 +1412,14 @@ pub enum GrpcBackendUnavailableKind {
     /// keep [`Self::BackendRequest`] even on `is_canceled` because the
     /// upload may already be unreplayable.
     DispatchCanceled,
+    /// Gateway trust changed while a mesh transport was being established, or
+    /// after a pooled transport was checked out but before it opened a stream.
+    /// The request never reached the destination, and the retired transport is
+    /// not reused. Maps to [`crate::retry::ErrorClass::TrustWithdrawn`], which
+    /// is pre-wire (a retry re-dials under the freshly published trust
+    /// generation) and backend-health neutral (withdrawing a root is gateway
+    /// policy, not evidence about the destination workload).
+    TrustWithdrawn,
     /// The destination is already at its DestinationRule
     /// `connectionPool.tcp.maxConnections` ceiling, so no NEW physical H2
     /// connection may be opened. Nothing was dialed — pre-wire, and mapped to
@@ -1432,6 +1452,7 @@ impl GrpcBackendUnavailableKind {
             | Self::H2cHandshake
             | Self::InvalidServerName
             | Self::DispatchCanceled
+            | Self::TrustWithdrawn
             // Over-cap refusal happens before any dial, so it is pre-wire and
             // `retry_on_connect_failure` may rotate to another LB target (with
             // its own admission lane) — the same posture the raw-TCP path takes.
@@ -1495,13 +1516,25 @@ pub(crate) enum GrpcRequestBodyCollectError {
     Proxy(GrpcProxyError),
     TimedOut,
     DeadlineExceeded,
+    /// The admitted stream's authorization lifetime elapsed while the gateway was
+    /// still collecting the buffered client upload (issue #3815). Already latched
+    /// and counted exactly once for the request; the caller emits the fixed
+    /// pre-commitment gRPC terminal.
+    AuthorizationExpired(crate::proxy::auth_lifetime::StreamAuthTermination),
 }
 
-fn map_request_body_wait_error(error: super::RequestBodyWaitError) -> GrpcRequestBodyCollectError {
+fn map_authorized_upload_wait_error(
+    error: super::AuthorizedUploadWaitError,
+) -> GrpcRequestBodyCollectError {
     match error {
-        super::RequestBodyWaitError::TimedOut => GrpcRequestBodyCollectError::TimedOut,
-        super::RequestBodyWaitError::DeadlineExceeded => {
+        super::AuthorizedUploadWaitError::Wait(super::RequestBodyWaitError::TimedOut) => {
+            GrpcRequestBodyCollectError::TimedOut
+        }
+        super::AuthorizedUploadWaitError::Wait(super::RequestBodyWaitError::DeadlineExceeded) => {
             GrpcRequestBodyCollectError::DeadlineExceeded
+        }
+        super::AuthorizedUploadWaitError::AuthorizationExpired(termination) => {
+            GrpcRequestBodyCollectError::AuthorizationExpired(termination)
         }
     }
 }
@@ -1607,6 +1640,9 @@ impl From<crate::pool::SharedPoolCreateError> for GrpcProxyError {
                     ErrorClass::TlsError | ErrorClass::ProtocolError => {
                         GrpcBackendUnavailableKind::TlsHandshake
                     }
+                    // Coalesced waiters must see the SAME typed pre-wire,
+                    // health-neutral refusal the creator produced (issue #3859).
+                    ErrorClass::TrustWithdrawn => GrpcBackendUnavailableKind::TrustWithdrawn,
                     ErrorClass::ConnectionRefused
                     | ErrorClass::ConnectionClosed
                     | ErrorClass::ConnectionReset
@@ -3339,27 +3375,67 @@ pub(crate) enum GrpcDispatchSender {
     MeshMtls(crate::proxy::mesh_mtls_pool::MeshMtlsSender),
 }
 
+/// Pre-wire vs hyper send failure for [`GrpcDispatchSender::send_request`].
+enum GrpcDispatchSendError {
+    TrustWithdrawn,
+    Hyper(hyper::Error),
+}
+
+impl std::fmt::Display for GrpcDispatchSendError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::TrustWithdrawn => {
+                formatter.write_str(crate::proxy::mesh_trust_registry::MESH_TRUST_WITHDRAWN_MESSAGE)
+            }
+            Self::Hyper(err) => write!(formatter, "{err}"),
+        }
+    }
+}
+
 impl GrpcDispatchSender {
     /// Send the outbound gRPC request. The mesh-mTLS arm wraps the SHARED
     /// [`GrpcBody`] rather than re-encoding it, so request framing (DATA plus a
     /// terminal TRAILERS frame), inline receive-limit accounting, upload
     /// cancellation, and gRPC message counting are byte-identical across
     /// transports; the HBONE arm hands the very same `GrpcBody` to hyper.
+    ///
+    /// Mesh-mTLS consults the transport retirement gate synchronously before
+    /// hyper queues a stream, so a trust withdrawal is
+    /// `GrpcDispatchSendError::TrustWithdrawn` (pre-wire) rather than a
+    /// post-wire hyper error.
     async fn send_request(
         &mut self,
         request: Request<GrpcBody>,
-    ) -> Result<hyper::Response<Incoming>, hyper::Error> {
+    ) -> Result<hyper::Response<Incoming>, GrpcDispatchSendError> {
         match self {
-            Self::H2(sender) => sender.send_request(request).await,
+            Self::H2(sender) => sender
+                .send_request(request)
+                .await
+                .map_err(GrpcDispatchSendError::Hyper),
             Self::MeshMtls(sender) => {
                 let (parts, body) = request.into_parts();
                 let request = Request::from_parts(
                     parts,
                     crate::proxy::mesh_mtls_pool::MeshMtlsRequestBody::Grpc(body),
                 );
-                sender.send_request(request).await
+                match sender.send_request(request) {
+                    Err(_) => Err(GrpcDispatchSendError::TrustWithdrawn),
+                    Ok(fut) => fut.await.map_err(GrpcDispatchSendError::Hyper),
+                }
             }
         }
+    }
+}
+
+fn map_grpc_dispatch_send_error(
+    error: GrpcDispatchSendError,
+    on_hyper: impl FnOnce(hyper::Error) -> GrpcProxyError,
+) -> GrpcProxyError {
+    match error {
+        GrpcDispatchSendError::TrustWithdrawn => {
+            mesh_mtls_pool_error_to_grpc(HbonePoolError::TrustWithdrawn)
+        }
+        GrpcDispatchSendError::Hyper(err) => on_hyper(err),
     }
 }
 
@@ -3424,6 +3500,11 @@ fn mesh_mtls_pool_error_to_grpc(error: HbonePoolError) -> GrpcProxyError {
         ),
         E::MaxConnectionsExceeded { .. } => GrpcProxyError::backend_unavailable_with_source(
             GrpcBackendUnavailableKind::MaxConnections,
+            message,
+            error,
+        ),
+        E::TrustWithdrawn => GrpcProxyError::backend_unavailable_with_source(
+            GrpcBackendUnavailableKind::TrustWithdrawn,
             message,
             error,
         ),
@@ -3715,6 +3796,7 @@ pub async fn proxy_grpc_request_streaming(
     grpc_deadline_at: Option<tokio::time::Instant>,
     held_frontend_upload: &mut Option<GrpcBody>,
     grpc_request_messages: Option<Arc<AtomicU64>>,
+    auth: Option<&crate::proxy::RequestAuthLifetimePlan>,
 ) -> Result<GrpcResponseKind, GrpcProxyError> {
     let (parts, body) = req.into_parts();
     let (grpc_messages, grpc_scanner) = match grpc_request_messages {
@@ -3724,6 +3806,13 @@ pub async fn proxy_grpc_request_streaming(
         ),
         None => (None, None),
     };
+    // Authorization lifetime for the fully-streamed native-gRPC upload (issue
+    // #3815). The join point is released rather than awaited: this dispatch
+    // returns while the RPC's response side is still streaming, so the upload's
+    // lifetime is the transport body's — `UploadPumpSource`'s abort guard ends
+    // the task when hyper drops that body, and the pump self-terminates at the
+    // deadline regardless of what the backend is doing.
+    let (body, _upload_pump) = crate::proxy::body::UploadSource::for_streaming_upload(body, auth);
     let grpc_body = GrpcBody::Streaming {
         incoming: body,
         bytes_seen: 0,
@@ -3964,24 +4053,26 @@ async fn proxy_grpc_streaming_dispatch(
                 )
             })?
             .map_err(|e| {
-                if body_size_exceeded.load(Ordering::Acquire) {
-                    return GrpcProxyError::ResourceExhausted(format!(
-                        "gRPC request payload size exceeds maximum of {} bytes",
-                        max_grpc_recv_size_bytes
-                    ));
-                }
-                // Streaming / channel uploads are unreplayable — keep post-wire
-                // classification even when hyper reports `is_canceled`, but still
-                // drop the stale pooled sender so the next RPC dials fresh.
-                if e.is_canceled() {
-                    transport.invalidate_on_pre_wire_cancel(proxy);
-                }
-                error!("gRPC backend request failed (streaming body): {}", e);
-                GrpcProxyError::backend_unavailable_with_source(
-                    GrpcBackendUnavailableKind::BackendRequest,
-                    format!("Backend request failed: {}", e),
-                    e,
-                )
+                map_grpc_dispatch_send_error(e, |e| {
+                    if body_size_exceeded.load(Ordering::Acquire) {
+                        return GrpcProxyError::ResourceExhausted(format!(
+                            "gRPC request payload size exceeds maximum of {} bytes",
+                            max_grpc_recv_size_bytes
+                        ));
+                    }
+                    // Streaming / channel uploads are unreplayable — keep post-wire
+                    // classification even when hyper reports `is_canceled`, but still
+                    // drop the stale pooled sender so the next RPC dials fresh.
+                    if e.is_canceled() {
+                        transport.invalidate_on_pre_wire_cancel(proxy);
+                    }
+                    error!("gRPC backend request failed (streaming body): {}", e);
+                    GrpcProxyError::backend_unavailable_with_source(
+                        GrpcBackendUnavailableKind::BackendRequest,
+                        format!("Backend request failed: {}", e),
+                        e,
+                    )
+                })
             })?
     } else if let Some(timeout_ms) = effective_timeout_ms {
         let read_timeout = Duration::from_millis(timeout_ms);
@@ -3998,6 +4089,27 @@ async fn proxy_grpc_streaming_dispatch(
                 }
             })?
             .map_err(|e| {
+                map_grpc_dispatch_send_error(e, |e| {
+                    if body_size_exceeded.load(Ordering::Acquire) {
+                        return GrpcProxyError::ResourceExhausted(format!(
+                            "gRPC request payload size exceeds maximum of {} bytes",
+                            max_grpc_recv_size_bytes
+                        ));
+                    }
+                    if e.is_canceled() {
+                        transport.invalidate_on_pre_wire_cancel(proxy);
+                    }
+                    error!("gRPC backend request failed (streaming body): {}", e);
+                    GrpcProxyError::backend_unavailable_with_source(
+                        GrpcBackendUnavailableKind::BackendRequest,
+                        format!("Backend request failed: {}", e),
+                        e,
+                    )
+                })
+            })?
+    } else {
+        sender.send_request(backend_req).await.map_err(|e| {
+            map_grpc_dispatch_send_error(e, |e| {
                 if body_size_exceeded.load(Ordering::Acquire) {
                     return GrpcProxyError::ResourceExhausted(format!(
                         "gRPC request payload size exceeds maximum of {} bytes",
@@ -4013,24 +4125,7 @@ async fn proxy_grpc_streaming_dispatch(
                     format!("Backend request failed: {}", e),
                     e,
                 )
-            })?
-    } else {
-        sender.send_request(backend_req).await.map_err(|e| {
-            if body_size_exceeded.load(Ordering::Acquire) {
-                return GrpcProxyError::ResourceExhausted(format!(
-                    "gRPC request payload size exceeds maximum of {} bytes",
-                    max_grpc_recv_size_bytes
-                ));
-            }
-            if e.is_canceled() {
-                transport.invalidate_on_pre_wire_cancel(proxy);
-            }
-            error!("gRPC backend request failed (streaming body): {}", e);
-            GrpcProxyError::backend_unavailable_with_source(
-                GrpcBackendUnavailableKind::BackendRequest,
-                format!("Backend request failed: {}", e),
-                e,
-            )
+            })
         })?
     };
 
@@ -4096,22 +4191,29 @@ async fn proxy_grpc_streaming_dispatch(
 /// This is used when plugins or retry replay require request body buffering for
 /// gRPC proxies. The body bytes, method, and headers are returned so the caller
 /// can run plugin hooks before dispatching via `proxy_grpc_request_core`.
+///
+/// `auth` is the admitted stream's authorization-lifetime plan (issue #3815).
+/// A buffered gRPC upload never reaches the streaming upload adapters, so this
+/// collect is the only seam that can stop a continuously active client-streaming
+/// RPC on a buffering route from outliving the credential that admitted it.
 pub(crate) async fn collect_grpc_request_body(
     req: Request<Incoming>,
     max_grpc_recv_size_bytes: usize,
     request_body_read_timeout_ms: u64,
     grpc_deadline_at: Option<tokio::time::Instant>,
+    auth: Option<&crate::proxy::RequestAuthLifetimePlan>,
 ) -> Result<(hyper::Method, hyper::HeaderMap, Bytes), GrpcRequestBodyCollectError> {
     let (parts, body) = req.into_parts();
     let body_bytes = if max_grpc_recv_size_bytes > 0 {
         let limited = http_body_util::Limited::new(body, max_grpc_recv_size_bytes);
-        let collected = super::collect_request_body_with_deadline(
+        let collected = super::collect_request_body_under_authorization(
             BodyExt::collect(limited),
             grpc_deadline_at,
             request_body_read_timeout_ms,
+            auth,
         )
         .await
-        .map_err(map_request_body_wait_error)?;
+        .map_err(map_authorized_upload_wait_error)?;
         match collected {
             Ok(collected) => collected.to_bytes(),
             Err(e) => {
@@ -4129,13 +4231,14 @@ pub(crate) async fn collect_grpc_request_body(
             }
         }
     } else {
-        super::collect_request_body_with_deadline(
+        super::collect_request_body_under_authorization(
             BodyExt::collect(body),
             grpc_deadline_at,
             request_body_read_timeout_ms,
+            auth,
         )
         .await
-        .map_err(map_request_body_wait_error)?
+        .map_err(map_authorized_upload_wait_error)?
         .map_err(|e| {
             GrpcRequestBodyCollectError::Proxy(GrpcProxyError::Internal(format!(
                 "Failed to read request body: {}",
@@ -4315,35 +4418,37 @@ pub(crate) async fn proxy_grpc_request_core(
         crate::plugins::grpc_deadline::duration_millis_ceil_saturating(remaining).unwrap_or(1)
     });
     let send_fut = sender.send_request(backend_req);
-    let map_send_err = |e: hyper::Error| {
-        // Buffered unary/client bodies are fully held — hyper `is_canceled`
-        // proves the request never hit the wire, so classify pre-wire and
-        // drop the stale pooled sender for the next attempt / RPC.
-        if e.is_canceled() {
-            transport.invalidate_on_pre_wire_cancel(proxy);
-        }
-        error!(
-            transport = transport.label(),
-            error = %e,
-            "gRPC: backend request failed"
-        );
-        if e.is_timeout() {
-            GrpcProxyError::BackendTimeout {
-                kind: GrpcTimeoutKind::Read,
-                message: format!("Backend timeout: {}", e),
+    let map_send_err = |e: GrpcDispatchSendError| {
+        map_grpc_dispatch_send_error(e, |e| {
+            // Buffered unary/client bodies are fully held — hyper `is_canceled`
+            // proves the request never hit the wire, so classify pre-wire and
+            // drop the stale pooled sender for the next attempt / RPC.
+            if e.is_canceled() {
+                transport.invalidate_on_pre_wire_cancel(proxy);
             }
-        } else {
-            let kind = if e.is_canceled() {
-                GrpcBackendUnavailableKind::DispatchCanceled
+            error!(
+                transport = transport.label(),
+                error = %e,
+                "gRPC: backend request failed"
+            );
+            if e.is_timeout() {
+                GrpcProxyError::BackendTimeout {
+                    kind: GrpcTimeoutKind::Read,
+                    message: format!("Backend timeout: {}", e),
+                }
             } else {
-                GrpcBackendUnavailableKind::BackendRequest
-            };
-            GrpcProxyError::backend_unavailable_with_source(
-                kind,
-                format!("Backend error: {}", e),
-                e,
-            )
-        }
+                let kind = if e.is_canceled() {
+                    GrpcBackendUnavailableKind::DispatchCanceled
+                } else {
+                    GrpcBackendUnavailableKind::BackendRequest
+                };
+                GrpcProxyError::backend_unavailable_with_source(
+                    kind,
+                    format!("Backend error: {}", e),
+                    e,
+                )
+            }
+        })
     };
     // When a client deadline exists, compute ONE absolute effective response
     // deadline shared via timeout_at by both the header wait here and the body

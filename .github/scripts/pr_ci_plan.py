@@ -546,6 +546,7 @@ FULL_CI_DOCUMENTATION_PATHS = frozenset(
     {
         "docs/ci_cd.md",
         "docs/configuration.md",
+        "docs/cp_dp_mode.md",
         "docs/mesh.md",
         "docs/mesh_multicluster_federation_runbook.md",
         "docs/mesh_supported_matrix.md",
@@ -767,6 +768,7 @@ def self_test() -> int:
         ("pull_request", [".agents/skills/opus-agents/scripts/dispatch-agent.sh"], "light"),
         ("pull_request", [".claude/rules/testing.md"], "light"),
         ("pull_request", ["docs/mesh.md"], "full"),
+        ("pull_request", ["docs/cp_dp_mode.md"], "full"),
         ("pull_request", ["docs/configuration.md"], "full"),
         ("pull_request", ["docs/plans/node_waypoint_transport_adr.md"], "full"),
         ("pull_request", ["docs/prometheus_metric_contract.json"], "full"),
@@ -846,6 +848,16 @@ def self_test() -> int:
         (
             "pull_request",
             ["src/backend_conn_limit.rs"],
+            {"run_mesh_sidecar_smoke": True},
+        ),
+        (
+            "pull_request",
+            ["docs/cp_dp_mode.md"],
+            {"run_mesh_sidecar_smoke": True},
+        ),
+        (
+            "pull_request",
+            ["src/modes/grpc_tls_reload.rs"],
             {"run_mesh_sidecar_smoke": True},
         ),
         (

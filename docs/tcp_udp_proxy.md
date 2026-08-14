@@ -76,7 +76,7 @@ proxies:
 | `tcp_idle_timeout_seconds` | `u64` | (global) | TCP idle timeout override. When omitted, uses `FERRUM_TCP_IDLE_TIMEOUT_SECONDS` (default 300s). 0 = disabled |
 | `stream_proxy_protocol` | `bool` | `false` | Enable inbound PROXY protocol: the v1/v2 connection header on `tcp`/`tcp_tls` (see [Inbound PROXY Protocol](#inbound-proxy-protocol)), or the per-datagram v2 DGRAM envelope on `udp`/`dtls` (see [Datagram Client-Address Metadata](#datagram-client-address-metadata-udp--dtls)). |
 | `udp_idle_timeout_seconds` | `u64` | `60` | UDP session idle timeout before cleanup |
-| `udp_max_response_amplification_factor` | `f32` | unset | Drop backend response datagrams larger than `request_payload_size × factor`. A zero-length request receives only a one-byte response allowance; nonempty requests retain the exact configured payload ratio. |
+| `udp_max_response_amplification_factor` | `f32` | unset (hand-authored) / `8.0` (Gateway API UDPRoute) | Cumulative per-request backend→client payload-byte budget of `request_payload_size × factor`. A zero-length request receives only a one-byte response allowance; nonempty requests retain the exact configured payload ratio. Every backend response datagram consumes at least one unit of remaining budget, so a zero-length reply cannot bypass a finite factor. Finite values must be `> 0` and `≤ 1024`. `None` disables the guard (hand-authored only, or an explicit Gateway API unsafe override). |
 
 ### Synthetic `listen_path`
 
@@ -778,12 +778,13 @@ UDP is connectionless, so the gateway tracks sessions by client source address (
 
 - **Session creation**: First datagram from a new client creates a session
 - **Session cleanup**: Background task runs every `FERRUM_UDP_CLEANUP_INTERVAL_SECONDS` (default 10s), removing sessions idle longer than `udp_idle_timeout_seconds`. Idle activity and session `duration_ms` use a coarse process-monotonic clock (~100 ms resolution), not UTC/`SystemTime`, so NTP or administrator wall-clock corrections neither freeze nor prematurely expire sessions. Human-readable connect/disconnect timestamps remain civil-clock values and may diverge from `duration_ms` after a clock step. The idle watermark advances only for **policy-admitted** application datagrams that are successfully forwarded client→backend or delivered backend→client (plain UDP and frontend-DTLS, including both plain and DTLS backends). Decrypted receives that `on_udp_datagram` plugins drop (for example `udp_rate_limiting`) do **not** refresh the watermark, so rejected traffic cannot retain sessions, relay tasks, sockets, or `FERRUM_UDP_MAX_SESSIONS` slots indefinitely. DTLS handshake/control remains on the crypto stack before the application relay and is unaffected.
+- **Authorization lifetime (authenticated sessions only)**: A UDP/DTLS listener runs the full `on_stream_connect` admission chain, so a session can admit a gateway Consumer or an external identity together with that credential's own expiry. `on_stream_connect` runs **once**, at admission, and is never repeated, so an admitted session is bounded by the earliest of that credential's authoritative deadline and the finite `FERRUM_AUTHENTICATED_STREAM_MAX_LIFETIME_SECONDS` maximum. For plain UDP the maximum is anchored at **first-datagram session admission** — before the epoch resolve, the mesh egress decision, and the admission chain — so slow admission work consumes the session's own lifetime rather than extending it. Every awaitable post-admission setup stage runs under that bound (the first-datagram `on_udp_datagram` policy hooks, DNS resolution, the backend bind/connect, the backend DTLS handshake), and the plan is re-read before the session is committed: before any backend success is recorded, before the session map insert, before the reply task exists, and before the first backend send. Both directions are then enforced — the client→backend forward (inline path, `last_client` fast path, and the bounded hook-ingress worker) and the backend reply task. Relayed datagrams never refresh the deadline. Terminating frontend DTLS application replies complete only after the produced ciphertext datagrams are accepted by the UDP socket: the per-client driver owns every pending application `send_to` against the same absolute plan, drops that wait on expiry or cancellation (exact-deadline ties fail closed), and never flushes expired or cancelled queued application replies on shutdown. Enqueue into the DTLS driver is not a wire commit. At expiry the session's generation is marked expired before any cache or map reuse, only that exact generation is removed, sockets/tasks/channels are closed (cancelling an in-flight datagram hook), and the overload connection guard plus the listener's active-session slot are released exactly once. A setup-phase expiry releases a claimed HALF_OPEN circuit-breaker probe slot **neutrally**, so no backend is scored. The disconnect summary reports a client-side, backend-health-neutral decision carrying only the bounded `authorization.termination_reason` class (`credential_expired` or `authenticated_stream_max_lifetime`) — never an identity, credential, certificate field, expiry instant, or source address — and the same class increments the fixed-cardinality `authorization_lifetime` counters under the `stream_udp` family. **Unauthenticated UDP sessions are unaffected**: no principal was admitted, so no plan exists, no clock is read on the datagram path, and behavior is unchanged. See [response_body_streaming.md](response_body_streaming.md#authorization-lifetime-of-an-admitted-stream).
 - **Max sessions**: Limit of `FERRUM_UDP_MAX_SESSIONS` (default 10,000) concurrent sessions per proxy to prevent resource exhaustion
 - **Adaptive batching**: When `FERRUM_ADAPTIVE_BATCH_LIMIT_ENABLED=true` (default), the per-proxy recv drain limit moves across fixed internal tiers (64 / 256 / 2000 / 6000 datagrams) by observed per-proxy traffic via an EWMA — independent of `FERRUM_ADAPTIVE_BATCH_LIMIT_DEFAULT`, which only sets the limit used when adaptation is disabled or before a proxy's first sample. TCP/WebSocket tunnel copy buffers similarly adapt between `FERRUM_ADAPTIVE_BUFFER_MIN_SIZE` (8 KiB) and `FERRUM_ADAPTIVE_BUFFER_MAX_SIZE` (256 KiB) when `FERRUM_ADAPTIVE_BUFFER_ENABLED=true`. See [configuration.md](configuration.md) for the full `FERRUM_ADAPTIVE_*` set.
 - **Reply routing**: Each session spawns a receiver task that forwards backend replies back to the correct client
 - **Datagram hook concurrency / backpressure**: When any plugin opts into `on_udp_datagram`, each established session gets one bounded client→backend ingress worker (not one task per datagram). The shared listener recv/drain loop only enqueues onto that per-session FIFO and never awaits potentially I/O-bound hooks (for example Redis-backed `udp_rate_limiting` or `fault_injection` delays). Per-session ordering is preserved. Queue depth is capped at 256 datagrams and retained payload is capped at 256 KiB per session, with an additional 16 MiB retained-payload cap across the listener; both byte budgets remain charged while a dequeued payload is held by an in-flight hook/forward future, so one slow hook per session cannot escape the aggregate limit. Overload **fails closed** by dropping the datagram (it is never forwarded without running required hooks). Drops increment the listener's `hook_ingress_drops` counter and emit a rate-limited warning (first drop, then every 100th) without per-client label cardinality. Session stop/expiry wakes an idle worker by dropping the ingress sender, cancels an in-flight hook through a dedicated notification, and drains any residual queue without running hooks or forwarding. It also re-checks stop/expired after each receive and after the hook await so a late plugin return cannot forward into an expired session. Sessions without datagram hooks keep the inline forward path. Backend→client hooks remain on the existing per-session reply task.
 - **Reply send buffers (Linux)**: Each plain-UDP session keeps a `sendmmsg` fallback batch and an optional GSO accumulator. `sendmmsg` slot buffers are allocated lazily at a 2 KiB preferred size (`SEND_MMSG_SLOT_SIZE`) instead of eagerly reserving `64 × 65535` (~4.2 MiB) per session. Datagrams larger than the slot size — including the full valid UDP maximum — use the existing pktinfo-aware direct-send path; GSO same-size batching and sendmmsg fallback remain unchanged for ordinary traffic.
-- **Response amplification guard**: When `udp_max_response_amplification_factor` is set, each backend datagram is limited to the latest client request payload size multiplied by the factor. A legal zero-length request gets an explicit one-byte reply allowance instead of an unusable zero budget; positive-length requests receive no floor or extra allowance.
+- **Response amplification guard**: When `udp_max_response_amplification_factor` is set, every backend→client datagram **charges** a remaining payload-byte budget established by the latest admitted client request (`request_payload_size × factor`). Several replies that are each under that product still fail closed once their **sum** exceeds it. A legal zero-length request gets an explicit one-byte reply allowance instead of an unusable zero budget; positive-length requests receive no floor or extra allowance. A zero-length response still consumes one unit of remaining budget so a finite factor cannot admit an unbounded packet count; nonempty responses charge their payload size exactly. The budget lives on the UDP session (not the selected backend), so weighted multi-backend selection cannot reset or multiply it. Invalid, zero, negative, non-finite, and factors above 1024 are rejected at config admission. `None` means unlimited and is valid only for hand-authored proxies or an explicit Gateway API unsafe override.
 - **Reply-source selection (`FERRUM_UDP_PKTINFO_ENABLED=auto`, Linux)**: On wildcard / multi-homed binds, `IP_PKTINFO` / `IPV6_PKTINFO` captures the per-datagram local destination address (and interface index) on recv and reuses it as the reply source on send. This saves one kernel routing lookup per `sendmsg` flush (combined with `UDP_SEGMENT`/GSO in a single cmsg buffer) and ensures replies exit the same interface the client targeted — important for NAT-sensitive middleboxes, anycast, and scoped IPv6 (link-local `fe80::/10`, where the ifindex is required to disambiguate the source zone). The captured address is stored per-session via `OnceLock` on the first datagram that exposes pktinfo; subsequent datagrams reuse it lock-free. When pktinfo is active, the recv loop uses `readable() + recvmmsg` instead of `recv_from`, so the first datagram of each wakeup also surfaces cmsg — one-shot UDP flows (e.g. DNS) get the correct reply source even when the drain loop never fires.
 
 ### Mesh UDP capture is a separate datapath
@@ -827,12 +828,60 @@ on this page — session management, idle timeout, stream plugins, metrics —
 applies unchanged to those generated proxies; the route only decides the listen
 port and the backend.
 
-The one exception is the response amplification guard. It is opt-in through the
-per-proxy `udp_max_response_amplification_factor` above, Gateway API defines no
-field that maps onto it, and the translator leaves it unset — so a generated
-`UDPRoute` proxy runs without a response-size ceiling, and a hand-applied
-override cannot survive, because the proxy is regenerated from the route on
-every reconcile.
+The response amplification guard is always engaged for a generated `UDPRoute`
+proxy. Ferrum projects a finite controller default of `8.0` unless a Ferrum
+`UDPResponseAmplificationPolicy` (`gateway.ferrum.io/v1alpha1`) wins:
+
+1. UDPRoute-targeted policy
+2. Gateway listener (`sectionName`) policy
+3. Gateway-targeted policy
+4. `GatewayClass.spec.parametersRef` pointing at this CRD
+5. Controller default `8.0`
+
+A `sectionName` target names a listener on the Gateway's own `spec.listeners`,
+so a listener contributed by a `ListenerSet` attached to that Gateway is
+governed by the Gateway-wide policy (or the class default) and never by a
+`sectionName` policy that merely shares its listener name.
+
+Same attachment level uses GEP-713 oldest-wins (`creationTimestamp`, then
+`{namespace}/{name}`). A Direct policy that loses any named target is
+`Conflicted` and occupies none of its targets, so a later eligible policy can
+still govern a remaining target. `GatewayClass.parametersRef` ignores a
+conflicted Direct policy. Cross-namespace `targetRefs` require a `ReferenceGrant`
+from `gateway.ferrum.io`/`UDPResponseAmplificationPolicy`. Invalid, zero,
+negative, non-finite, or factors above 1024 never program the listener; the
+route still materializes with the next valid precedence (ultimately the finite
+default). Unlimited is available only with `mode: Unlimited` **and**
+`acknowledgeUnsafeAmplification: true`. Deleting the policy returns the
+listener to the finite default on the next reconcile without a process restart.
+Any change to the effective factor restarts that physical UDP listener after
+the candidate configuration is accepted. The old listener's shutdown fence
+retires its sessions, and the replacement starts with a fresh session map. An
+established source therefore cannot retain an unlimited or less restrictive
+budget after a policy is tightened, invalidated, or deleted.
+
+Ferrum materializes one physical UDP proxy per route/rule/`listen_port`. When
+one `UDPRoute` attaches to distinct Gateways or listeners that share that port,
+each surviving claim is resolved with the precedence above and then fail-closed
+onto the proxy: a finite factor dominates Unlimited, the smallest finite factor
+wins, and the proxy is unlimited only when every represented claim is explicitly
+Unlimited. Input order and listener names do not change that boundary.
+
+`UDPRoute.status.parents[].conditions` includes Ferrum
+`UDPAmplificationProtection` (`FiniteDefault` / `FinitePolicy` /
+`ExplicitUnlimited`) without echoing the numeric factor, and only for a parent
+whose translator recorded that posture. An unprogrammed parent reports
+`False` / `NotProgrammed` with a fixed message rather than inheriting
+`FiniteDefault`. Shared-port sibling parents each receive that exact physical
+protection, so a materialized parent is never `NotProgrammed` merely because
+another parentRef sorted first. When one parentRef materializes on several UDP
+listeners (different ports), that parent reports the conservative aggregate:
+`ExplicitUnlimited` if any listener is unlimited, `FinitePolicy` only when every
+listener uses a finite policy, and `FiniteDefault` when at least one uses the
+controller default. A missing exact parent does not inherit another parentRef's
+posture. Runtime accounting is cumulative per admitted request; a zero-length
+response consumes one unit of remaining budget. See
+[`docs/tcp_udp_proxy.md`](tcp_udp_proxy.md).
 
 For a `UDPRoute` the rule's `backendRefs` is a weighted **set**. A single
 serviceable leg becomes a direct backend

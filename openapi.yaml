@@ -8058,15 +8058,24 @@ components:
           type: [number, "null"]
           format: float
           exclusiveMinimum: 0
+          maximum: 1024
           description: |
             Maximum allowed response amplification factor for UDP proxies.
-            When set, backend→client datagrams are dropped if their size exceeds
-            `payload_size * factor`. A zero-length request receives an explicit
-            one-byte reply allowance so it cannot black-hole the session;
-            nonempty requests retain the exact configured payload ratio. This
-            protects against UDP amplification attacks (e.g., spoofed-source
-            reflection). When omitted (default), no per-datagram amplification
-            cap is applied. Only applicable for `udp` / `dtls` proxies.
+            When set, backend→client datagrams share one remaining payload-byte
+            budget per admitted client request (`payload_size * factor`,
+            cumulative across replies). A zero-length request receives an
+            explicit one-byte reply allowance so it cannot black-hole the
+            session; nonempty requests retain the exact configured payload
+            ratio. Every backend response datagram consumes at least one unit
+            of remaining budget, so a zero-length reply cannot bypass a finite
+            factor. This protects against UDP amplification attacks (e.g.,
+            spoofed-source reflection). Values must be finite, greater than 0,
+            and at most 1024. When omitted (default for hand-authored proxies),
+            no amplification cap is applied. Gateway API `UDPRoute` translation
+            never leaves this unset: it projects a finite controller default
+            of 8.0 unless a Ferrum `UDPResponseAmplificationPolicy` supplies a
+            finite override or an explicit dual-acknowledged unlimited mode.
+            Only applicable for `udp` / `dtls` proxies.
         allowed_methods:
           oneOf:
             - type: array
@@ -14024,7 +14033,7 @@ components:
     # ── Runtime metrics ─────────────────────────────────────────────
     RuntimeMetricsSnapshot:
       type: object
-      required: [timestamp, uptime_seconds, mode, ferrum_version, system, http, errors, dns, connections, logs, plugin_triggers, overload]
+      required: [timestamp, uptime_seconds, mode, ferrum_version, system, http, errors, dns, connections, logs, plugin_triggers, authorization_lifetime, overload]
       properties:
         timestamp:
           type: string
@@ -14051,8 +14060,43 @@ components:
           $ref: "#/components/schemas/RuntimeLogsSnapshot"
         plugin_triggers:
           $ref: "#/components/schemas/RuntimePluginTriggerSnapshot"
+        authorization_lifetime:
+          $ref: "#/components/schemas/RuntimeAuthorizationLifetimeSnapshot"
         overload:
           $ref: "#/components/schemas/OverloadSnapshot"
+
+    RuntimeAuthorizationLifetimeSnapshot:
+      type: object
+      description: |
+        Fixed-cardinality counters for authenticated streams terminated by the
+        authorization-lifetime contract. Each map is keyed by a closed
+        compile-time protocol family (`http`, `grpc`, `grpc_web`, `stream_tcp`,
+        `stream_udp`) and every family is always present. WebSocket is
+        deliberately absent: WebSocket sessions are bounded by their own
+        `FERRUM_WEBSOCKET_MAX_LIFETIME_SECONDS` policy and reported through
+        `websocket.termination_reason`, not by this contract. No route,
+        consumer, identity, token, claim, certificate field, provider, or
+        absolute expiry is ever recorded. Monotonic for the process lifetime.
+      required: [credential_expired, authenticated_stream_max_lifetime]
+      properties:
+        credential_expired:
+          type: object
+          description: |
+            Streams terminated because the accepted credential's own
+            authoritative deadline elapsed, by protocol family.
+          additionalProperties:
+            type: integer
+            format: uint64
+        authenticated_stream_max_lifetime:
+          type: object
+          description: |
+            Streams terminated because the finite
+            `FERRUM_AUTHENTICATED_STREAM_MAX_LIFETIME_SECONDS` fallback maximum
+            elapsed (the accepted credential carried no earlier authoritative
+            expiry), by protocol family.
+          additionalProperties:
+            type: integer
+            format: uint64
 
     RuntimePluginTriggerSnapshot:
       type: object
@@ -17407,6 +17451,7 @@ components:
         - graceful_remote_close
         - dispatch_policy_rejected
         - backend_connection_limit
+        - trust_withdrawn
         - request_error
       description: |
         Stable classification of a backend dispatch failure. Emitted on
@@ -17433,6 +17478,14 @@ components:
         operator-configured ceiling must never eject a healthy destination —
         while still being pre-wire, so `retry_on_connect_failure` may rotate to
         another load-balanced target with its own admission lane.
+        `trust_withdrawn` is a gateway-to-mesh transport refused because an
+        accepted gateway trust publication withdrew an authority: the connection
+        was dialed under the outgoing trust generation, or a checked-out
+        transport was retired before it could open the next stream. Nothing was
+        sent, so it is health-neutral for the same reason as
+        `backend_connection_limit` — withdrawing a root is gateway policy, not
+        evidence about the destination workload — while staying pre-wire, so a
+        retry re-dials under the freshly published trust generation.
 
     DisconnectCause:
       type: string

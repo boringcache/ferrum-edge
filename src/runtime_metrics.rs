@@ -106,7 +106,7 @@ const LOG_LEVELS: [LogLevel; 5] = [
     LogLevel::Error,
 ];
 
-const ERROR_CLASSES: [&str; 18] = [
+const ERROR_CLASSES: [&str; 19] = [
     "connection_timeout",
     "connection_refused",
     "connection_reset",
@@ -124,6 +124,7 @@ const ERROR_CLASSES: [&str; 18] = [
     "graceful_remote_close",
     "dispatch_policy_rejected",
     "backend_connection_limit",
+    "trust_withdrawn",
     "request_error",
 ];
 
@@ -593,6 +594,11 @@ pub struct RuntimeSnapshot {
     /// decision carriers. No labels, no trigger inputs, no route/identity/header
     /// values, and nothing plugin-controlled can reach this object.
     pub plugin_triggers: crate::plugins::trigger::PluginTriggerCarrierCounters,
+    /// Fixed-cardinality counters for streams terminated by the authenticated
+    /// stream authorization-lifetime contract. The only label dimension is a
+    /// closed compile-time protocol family; no route, identity, consumer,
+    /// token, claim, certificate field, provider, or expiry value is recorded.
+    pub authorization_lifetime: crate::proxy::auth_lifetime::StreamAuthLifetimeCounters,
     pub overload: Value,
 }
 
@@ -688,6 +694,7 @@ pub fn build_snapshot(
         connections: build_connections_snapshot(&metrics, proxy_state),
         logs: build_logs_snapshot(&metrics),
         plugin_triggers: crate::plugins::trigger::carrier_counters(),
+        authorization_lifetime: crate::proxy::auth_lifetime::counters(),
         overload: build_overload_snapshot(proxy_state),
     }
 }
@@ -1487,6 +1494,7 @@ mod tests {
             ErrorClass::GracefulRemoteClose,
             ErrorClass::DispatchPolicyRejected,
             ErrorClass::BackendConnectionLimit,
+            ErrorClass::TrustWithdrawn,
             ErrorClass::RequestError,
         ];
 

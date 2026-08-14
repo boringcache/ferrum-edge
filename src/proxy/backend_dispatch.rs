@@ -1131,6 +1131,14 @@ pub(crate) fn record_backend_outcome_no_conn_end(
 ///   reason; this keeps the HTTP-family pooled transports identical. Unlike the
 ///   classes above it is still pre-wire, so `retry_on_connect_failure` may
 ///   rotate to another target with its own admission lane.
+/// * `TrustWithdrawn` — an accepted gateway trust publication withdrew an
+///   authority, so a gateway-to-mesh transport dialled under the outgoing
+///   generation was refused at registration, or a checked-out one was retired
+///   before it could open the next stream (issue #3859). Same shape as
+///   `BackendConnectionLimit`: pre-wire (the redial builds from the already
+///   published verifier and succeeds) and gateway policy rather than evidence
+///   about the destination. Counting it would open breakers across every mesh
+///   destination live at the instant of a revocation.
 #[inline]
 pub(crate) fn client_side_no_backend_signal(error_class: Option<ErrorClass>) -> bool {
     matches!(
@@ -1141,6 +1149,7 @@ pub(crate) fn client_side_no_backend_signal(error_class: Option<ErrorClass>) -> 
                 | ErrorClass::DispatchPolicyRejected
                 | ErrorClass::GatewayBufferCapacity
                 | ErrorClass::BackendConnectionLimit
+                | ErrorClass::TrustWithdrawn
         )
     )
 }

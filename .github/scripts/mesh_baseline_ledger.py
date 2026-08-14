@@ -76,7 +76,7 @@ def build_ledger(suites: str, iterations: int) -> list[dict[str, object]]:
             {
                 "suite": "hbone",
                 "command": (
-                    "cargo build --release --bin ferrum-edge && "
+                    "cargo build --release --example hbone_perf_fixture && "
                     "(cd tests/performance/mesh-hbone-e2e && cargo build --release)"
                 ),
             }
