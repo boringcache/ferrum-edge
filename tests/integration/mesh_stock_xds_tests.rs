@@ -2397,10 +2397,10 @@ mod tls_lifecycle {
     /// second RPC with no external stimulus at all.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn a_finite_authorization_deadline_reconnects_without_any_external_stimulus() {
-        for (label, token, policy, must_reconnect_within) in [
+        for (label, jwt_lifetime_secs, policy, must_reconnect_within) in [
             (
                 "opaque",
-                "an-opaque-projected-token".to_string(),
+                None,
                 // Below the operator-facing 60s minimum on purpose: that floor
                 // is enforced where an operator can set it, so a programmatic
                 // policy can prove the deadline live without a production wait.
@@ -2409,11 +2409,18 @@ mod tls_lifecycle {
             ),
             (
                 "short-lived JWT",
-                jwt_expiring_in(3),
+                Some(3),
                 fast_policy(Duration::from_secs(3600)),
                 Duration::from_secs(25),
             ),
         ] {
+            // Mint each credential only when its case starts. Constructing the
+            // whole table eagerly lets the opaque case consume the JWT case's
+            // intentionally short wall-clock lifetime before it is admitted.
+            let token = jwt_lifetime_secs.map_or_else(
+                || "an-opaque-projected-token".to_string(),
+                jwt_expiring_in,
+            );
             let material = issue_material(&["localhost"], false);
             let endpoint = serve_tls(TlsBehaviour::Converged, &material, false).await;
             let tokens = tempfile::tempdir().expect("temp dir");
