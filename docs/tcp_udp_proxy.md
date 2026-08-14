@@ -837,6 +837,11 @@ proxy. Ferrum projects a finite controller default of `8.0` unless a Ferrum
 4. `GatewayClass.spec.parametersRef` pointing at this CRD
 5. Controller default `8.0`
 
+A `sectionName` target names a listener on the Gateway's own `spec.listeners`,
+so a listener contributed by a `ListenerSet` attached to that Gateway is
+governed by the Gateway-wide policy (or the class default) and never by a
+`sectionName` policy that merely shares its listener name.
+
 Same attachment level uses GEP-713 oldest-wins (`creationTimestamp`, then
 `{namespace}/{name}`). A Direct policy that loses any named target is
 `Conflicted` and occupies none of its targets, so a later eligible policy can

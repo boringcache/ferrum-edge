@@ -158,7 +158,9 @@ materialized UDP listener. Operators override that default with the Ferrum
 GEP-713 Direct Policy Attachment:
 
 1. UDPRoute `targetRefs` (highest)
-2. Gateway + `sectionName` (one listener)
+2. Gateway + `sectionName` (one listener on that Gateway's own
+   `spec.listeners`; a `ListenerSet`-contributed listener is never selected by
+   `sectionName`, only by the Gateway-wide tier below)
 3. Gateway (all UDP listeners on that Gateway)
 4. `GatewayClass.spec.parametersRef` naming this CRD
 5. Controller default `8.0`

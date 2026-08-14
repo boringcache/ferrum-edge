@@ -5532,6 +5532,10 @@ mod tests {
         let socket = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
         let mut raw_session = make_udp_session();
         raw_session.backend_socket = Some(socket);
+        // A guarded session is what makes the "publish before send" invariant
+        // observable: the remaining budget, not `last_request_size`, is what
+        // the backend→client path now charges.
+        raw_session.amplification_factor = Some(2.0);
         raw_session
             .last_activity
             .store(1_710_000_000_500, Ordering::Relaxed);
@@ -5559,7 +5563,12 @@ mod tests {
         assert_eq!(
             session.last_request_size.load(Ordering::Relaxed),
             b"payload".len() as u64,
-            "accepted client datagrams must establish the amplification budget before send"
+            "accepted client datagrams must record their request size before send"
+        );
+        assert_eq!(
+            session.response_budget_remaining.load(Ordering::Acquire),
+            b"payload".len() as u64 * 2,
+            "a failed send must still leave the earned response budget"
         );
     }
 

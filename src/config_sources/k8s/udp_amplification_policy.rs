@@ -777,17 +777,29 @@ fn resolve_for_claim(
                 )
             }),
     };
-    let section_key = AttachmentKey::Gateway {
-        namespace: gateway_ns.clone(),
-        name: gateway_name.clone(),
-        section: Some(claim.listener.listener.clone()),
-    };
-    if let Some(policy) = acc
-        .udp_amplification_policies
-        .by_attachment
-        .get(&section_key)
-    {
-        return posture_from_body(&policy.body);
+    // A section-scoped target is admitted only when `sectionName` names a
+    // listener on the Gateway's own `spec.listeners`
+    // (`authorize_and_resolve_target`), so it can never legitimately select a
+    // ListenerSet-contributed listener. Consulting the section key for one
+    // would silently widen a Gateway-listener policy — including an
+    // `ExplicitUnlimited` one — onto a ListenerSet listener that merely shares
+    // the name. ListenerSet claims fall through to the Gateway-wide key.
+    if matches!(
+        claim.listener.parent_kind,
+        GatewayApiListenerParentKind::Gateway
+    ) {
+        let section_key = AttachmentKey::Gateway {
+            namespace: gateway_ns.clone(),
+            name: gateway_name.clone(),
+            section: Some(claim.listener.listener.clone()),
+        };
+        if let Some(policy) = acc
+            .udp_amplification_policies
+            .by_attachment
+            .get(&section_key)
+        {
+            return posture_from_body(&policy.body);
+        }
     }
     let gateway_key = AttachmentKey::Gateway {
         namespace: gateway_ns.clone(),
