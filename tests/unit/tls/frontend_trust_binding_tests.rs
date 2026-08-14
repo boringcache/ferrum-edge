@@ -1545,9 +1545,10 @@ impl ResolvesClientCert for HintHonoringClientCert {
         _sigschemes: &[rustls::SignatureScheme],
     ) -> Option<std::sync::Arc<CertifiedKey>> {
         if root_hint_subjects.is_empty()
-            || self.issuer_subjects.iter().any(|subject| {
-                root_hint_subjects.contains(&subject.as_slice())
-            })
+            || self
+                .issuer_subjects
+                .iter()
+                .any(|subject| root_hint_subjects.contains(&subject.as_slice()))
         {
             Some(self.key.clone())
         } else {
