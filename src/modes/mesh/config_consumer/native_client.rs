@@ -7,8 +7,10 @@ use tracing::{error, info, warn};
 
 use super::common::{
     BACKOFF_INITIAL_SECS, MESH_CONFIG_GRPC_MAX_DECODING_MESSAGE_SIZE, jittered_backoff,
-    refresh_dp_grpc_tls_config_if_changed, tonic_tls_config, wait_for_shutdown,
-    wait_optional_tls_reload,
+    refresh_dp_grpc_tls_config_if_changed, wait_for_shutdown, wait_optional_tls_reload,
+};
+use super::native_tls::{
+    annotate_connect_error, observed_class_from_error, prepare_native_mesh_tls,
 };
 use super::stream_lifecycle::{
     MeshConfigStreamCredential, MeshStreamAttachment, MeshStreamAttempt, MeshStreamAttemptProgress,
@@ -181,7 +183,10 @@ pub async fn start_native_mesh_client_with_shutdown(
                     shutting_down = true;
                     Ok(MeshStreamAttempt::LocalRetirement(MeshStreamRetirement::Shutdown))
                 }
-                _ = wait_optional_tls_reload(tls_reload.as_ref().map(|reload| reload.revision_rx.clone())) => {
+                _ = wait_optional_tls_reload(
+                    tls_reload.as_ref().map(|reload| reload.revision_rx.clone()),
+                    last_tls_revision,
+                ) => {
                     Ok(MeshStreamAttempt::LocalRetirement(MeshStreamRetirement::TlsReload))
                 }
             }
@@ -204,7 +209,10 @@ pub async fn start_native_mesh_client_with_shutdown(
                     shutting_down = true;
                     Ok(MeshStreamAttempt::LocalRetirement(MeshStreamRetirement::Shutdown))
                 }
-                _ = wait_optional_tls_reload(tls_reload.as_ref().map(|reload| reload.revision_rx.clone())) => {
+                _ = wait_optional_tls_reload(
+                    tls_reload.as_ref().map(|reload| reload.revision_rx.clone()),
+                    last_tls_revision,
+                ) => {
                     Ok(MeshStreamAttempt::LocalRetirement(MeshStreamRetirement::TlsReload))
                 }
             }
@@ -242,12 +250,28 @@ pub async fn start_native_mesh_client_with_shutdown(
                         after_established: stream_established,
                     }
                 };
-                error!(
-                    cp_url = %cp_url,
-                    outcome = attempt.as_metric_label(),
-                    error = %e,
-                    "Native MeshSubscribe attempt failed"
-                );
+                // Keep the live native mTLS classifier's closed-set
+                // `native_tls_class` field and connection-failed message while
+                // still recording the shared stream-lifecycle outcome.
+                match observed_class_from_error(&e) {
+                    Some(class) => {
+                        error!(
+                            cp_url = %cp_url,
+                            outcome = attempt.as_metric_label(),
+                            native_tls_class = class.as_str(),
+                            error = %e,
+                            "Native MeshSubscribe connection failed"
+                        );
+                    }
+                    None => {
+                        error!(
+                            cp_url = %cp_url,
+                            outcome = attempt.as_metric_label(),
+                            error = %e,
+                            "Native MeshSubscribe connection failed"
+                        );
+                    }
+                }
                 attempt
             }
         };
@@ -281,7 +305,10 @@ pub async fn start_native_mesh_client_with_shutdown(
                 info!("Native mesh client shutting down");
                 return;
             }
-            _ = wait_optional_tls_reload(tls_reload.as_ref().map(|reload| reload.revision_rx.clone())) => {
+            _ = wait_optional_tls_reload(
+                tls_reload.as_ref().map(|reload| reload.revision_rx.clone()),
+                last_tls_revision,
+            ) => {
                 backoff_secs = BACKOFF_INITIAL_SECS;
                 continue;
             }
@@ -313,17 +340,24 @@ async fn connect_mesh_subscribe(
         config.timings,
     );
 
+    let mut tls_observer = None;
     if let Some(tls) = tls_config {
-        let mut client_tls = tonic_tls_config(tls);
-        if let Ok(uri) = cp_url.parse::<http::Uri>()
-            && let Some(host) = uri.host()
-        {
-            client_tls = client_tls.domain_name(host);
-        }
-        endpoint = endpoint.tls_config(client_tls)?;
+        let host = cp_url
+            .parse::<http::Uri>()
+            .ok()
+            .and_then(|uri| uri.host().map(str::to_owned));
+        let prepared = prepare_native_mesh_tls(tls, host.as_deref())?;
+        let (next_endpoint, observer) = prepared.apply(endpoint)?;
+        endpoint = next_endpoint;
+        tls_observer = observer;
     }
 
-    let channel = endpoint.connect().await?;
+    let channel = match endpoint.connect().await {
+        Ok(channel) => channel,
+        Err(error) => {
+            return Err(annotate_connect_error(error, tls_observer.as_deref()));
+        }
+    };
     // With an externally issued token (`FERRUM_DP_CP_GRPC_TOKEN_FILE`) the
     // issuer — not this node — decides the `ns` and `aud` claims, so a mesh
     // node's token must be minted for the local-mesh subscribe audience by

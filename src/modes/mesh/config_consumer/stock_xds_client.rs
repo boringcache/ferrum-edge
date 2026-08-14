@@ -936,7 +936,8 @@ pub async fn start_stock_xds_client_with_shutdown(
                     &mut tracker,
                 ) => outcome,
                 _ = wait_optional_tls_reload(
-                    tls_reload.as_ref().map(|reload| reload.revision_rx.clone())
+                    tls_reload.as_ref().map(|reload| reload.revision_rx.clone()),
+                    last_tls_revision,
                 ) => coalesce_outer_lifecycle(
                     MeshStreamRetirement::TlsReload,
                     &mut credential_rx,
@@ -981,7 +982,8 @@ pub async fn start_stock_xds_client_with_shutdown(
                     &mut tracker,
                 ) => outcome,
                 _ = wait_optional_tls_reload(
-                    tls_reload.as_ref().map(|reload| reload.revision_rx.clone())
+                    tls_reload.as_ref().map(|reload| reload.revision_rx.clone()),
+                    last_tls_revision,
                 ) => coalesce_outer_lifecycle(
                     MeshStreamRetirement::TlsReload,
                     &mut credential_rx,
@@ -1079,7 +1081,8 @@ pub async fn start_stock_xds_client_with_shutdown(
                 return;
             }
             _ = wait_optional_tls_reload(
-                tls_reload.as_ref().map(|reload| reload.revision_rx.clone())
+                tls_reload.as_ref().map(|reload| reload.revision_rx.clone()),
+                last_tls_revision,
             ) => {
                 backoff_secs = BACKOFF_INITIAL_SECS;
                 continue;

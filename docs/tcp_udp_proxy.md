@@ -74,9 +74,9 @@ proxies:
 | `backend_scheme` | `string` | (required) | One of: `tcp`, `tcps`, `udp`, `dtls` |
 | `frontend_tls` | `bool` | `false` | Terminate TLS (TCP) or DTLS (UDP) on incoming connections |
 | `tcp_idle_timeout_seconds` | `u64` | (global) | TCP idle timeout override. When omitted, uses `FERRUM_TCP_IDLE_TIMEOUT_SECONDS` (default 300s). 0 = disabled |
-| `stream_proxy_protocol` | `bool` | `false` | Enable inbound PROXY protocol (v1 or v2) on this `tcp`/`tcp_tls` listener. See [Inbound PROXY Protocol](#inbound-proxy-protocol) below. |
+| `stream_proxy_protocol` | `bool` | `false` | Enable inbound PROXY protocol: the v1/v2 connection header on `tcp`/`tcp_tls` (see [Inbound PROXY Protocol](#inbound-proxy-protocol)), or the per-datagram v2 DGRAM envelope on `udp`/`dtls` (see [Datagram Client-Address Metadata](#datagram-client-address-metadata-udp--dtls)). |
 | `udp_idle_timeout_seconds` | `u64` | `60` | UDP session idle timeout before cleanup |
-| `udp_max_response_amplification_factor` | `f32` | unset | Drop backend response datagrams larger than `request_payload_size × factor`. A zero-length request receives only a one-byte response allowance; nonempty requests retain the exact configured payload ratio. |
+| `udp_max_response_amplification_factor` | `f32` | unset (hand-authored) / `8.0` (Gateway API UDPRoute) | Cumulative per-request backend→client payload-byte budget of `request_payload_size × factor`. A zero-length request receives only a one-byte response allowance; nonempty requests retain the exact configured payload ratio. Every backend response datagram consumes at least one unit of remaining budget, so a zero-length reply cannot bypass a finite factor. Finite values must be `> 0` and `≤ 1024`. `None` disables the guard (hand-authored only, or an explicit Gateway API unsafe override). |
 
 ### Synthetic `listen_path`
 
@@ -783,7 +783,7 @@ UDP is connectionless, so the gateway tracks sessions by client source address (
 - **Reply routing**: Each session spawns a receiver task that forwards backend replies back to the correct client
 - **Datagram hook concurrency / backpressure**: When any plugin opts into `on_udp_datagram`, each established session gets one bounded client→backend ingress worker (not one task per datagram). The shared listener recv/drain loop only enqueues onto that per-session FIFO and never awaits potentially I/O-bound hooks (for example Redis-backed `udp_rate_limiting` or `fault_injection` delays). Per-session ordering is preserved. Queue depth is capped at 256 datagrams and retained payload is capped at 256 KiB per session, with an additional 16 MiB retained-payload cap across the listener; both byte budgets remain charged while a dequeued payload is held by an in-flight hook/forward future, so one slow hook per session cannot escape the aggregate limit. Overload **fails closed** by dropping the datagram (it is never forwarded without running required hooks). Drops increment the listener's `hook_ingress_drops` counter and emit a rate-limited warning (first drop, then every 100th) without per-client label cardinality. Session stop/expiry wakes an idle worker by dropping the ingress sender, cancels an in-flight hook through a dedicated notification, and drains any residual queue without running hooks or forwarding. It also re-checks stop/expired after each receive and after the hook await so a late plugin return cannot forward into an expired session. Sessions without datagram hooks keep the inline forward path. Backend→client hooks remain on the existing per-session reply task.
 - **Reply send buffers (Linux)**: Each plain-UDP session keeps a `sendmmsg` fallback batch and an optional GSO accumulator. `sendmmsg` slot buffers are allocated lazily at a 2 KiB preferred size (`SEND_MMSG_SLOT_SIZE`) instead of eagerly reserving `64 × 65535` (~4.2 MiB) per session. Datagrams larger than the slot size — including the full valid UDP maximum — use the existing pktinfo-aware direct-send path; GSO same-size batching and sendmmsg fallback remain unchanged for ordinary traffic.
-- **Response amplification guard**: When `udp_max_response_amplification_factor` is set, each backend datagram is limited to the latest client request payload size multiplied by the factor. A legal zero-length request gets an explicit one-byte reply allowance instead of an unusable zero budget; positive-length requests receive no floor or extra allowance.
+- **Response amplification guard**: When `udp_max_response_amplification_factor` is set, every backend→client datagram **charges** a remaining payload-byte budget established by the latest admitted client request (`request_payload_size × factor`). Several replies that are each under that product still fail closed once their **sum** exceeds it. A legal zero-length request gets an explicit one-byte reply allowance instead of an unusable zero budget; positive-length requests receive no floor or extra allowance. A zero-length response still consumes one unit of remaining budget so a finite factor cannot admit an unbounded packet count; nonempty responses charge their payload size exactly. The budget lives on the UDP session (not the selected backend), so weighted multi-backend selection cannot reset or multiply it. Invalid, zero, negative, non-finite, and factors above 1024 are rejected at config admission. `None` means unlimited and is valid only for hand-authored proxies or an explicit Gateway API unsafe override.
 - **Reply-source selection (`FERRUM_UDP_PKTINFO_ENABLED=auto`, Linux)**: On wildcard / multi-homed binds, `IP_PKTINFO` / `IPV6_PKTINFO` captures the per-datagram local destination address (and interface index) on recv and reuses it as the reply source on send. This saves one kernel routing lookup per `sendmsg` flush (combined with `UDP_SEGMENT`/GSO in a single cmsg buffer) and ensures replies exit the same interface the client targeted — important for NAT-sensitive middleboxes, anycast, and scoped IPv6 (link-local `fe80::/10`, where the ifindex is required to disambiguate the source zone). The captured address is stored per-session via `OnceLock` on the first datagram that exposes pktinfo; subsequent datagrams reuse it lock-free. When pktinfo is active, the recv loop uses `readable() + recvmmsg` instead of `recv_from`, so the first datagram of each wakeup also surfaces cmsg — one-shot UDP flows (e.g. DNS) get the correct reply source even when the drain loop never fires.
 
 ### Mesh UDP capture is a separate datapath
@@ -827,12 +827,60 @@ on this page — session management, idle timeout, stream plugins, metrics —
 applies unchanged to those generated proxies; the route only decides the listen
 port and the backend.
 
-The one exception is the response amplification guard. It is opt-in through the
-per-proxy `udp_max_response_amplification_factor` above, Gateway API defines no
-field that maps onto it, and the translator leaves it unset — so a generated
-`UDPRoute` proxy runs without a response-size ceiling, and a hand-applied
-override cannot survive, because the proxy is regenerated from the route on
-every reconcile.
+The response amplification guard is always engaged for a generated `UDPRoute`
+proxy. Ferrum projects a finite controller default of `8.0` unless a Ferrum
+`UDPResponseAmplificationPolicy` (`gateway.ferrum.io/v1alpha1`) wins:
+
+1. UDPRoute-targeted policy
+2. Gateway listener (`sectionName`) policy
+3. Gateway-targeted policy
+4. `GatewayClass.spec.parametersRef` pointing at this CRD
+5. Controller default `8.0`
+
+A `sectionName` target names a listener on the Gateway's own `spec.listeners`,
+so a listener contributed by a `ListenerSet` attached to that Gateway is
+governed by the Gateway-wide policy (or the class default) and never by a
+`sectionName` policy that merely shares its listener name.
+
+Same attachment level uses GEP-713 oldest-wins (`creationTimestamp`, then
+`{namespace}/{name}`). A Direct policy that loses any named target is
+`Conflicted` and occupies none of its targets, so a later eligible policy can
+still govern a remaining target. `GatewayClass.parametersRef` ignores a
+conflicted Direct policy. Cross-namespace `targetRefs` require a `ReferenceGrant`
+from `gateway.ferrum.io`/`UDPResponseAmplificationPolicy`. Invalid, zero,
+negative, non-finite, or factors above 1024 never program the listener; the
+route still materializes with the next valid precedence (ultimately the finite
+default). Unlimited is available only with `mode: Unlimited` **and**
+`acknowledgeUnsafeAmplification: true`. Deleting the policy returns the
+listener to the finite default on the next reconcile without a process restart.
+Any change to the effective factor restarts that physical UDP listener after
+the candidate configuration is accepted. The old listener's shutdown fence
+retires its sessions, and the replacement starts with a fresh session map. An
+established source therefore cannot retain an unlimited or less restrictive
+budget after a policy is tightened, invalidated, or deleted.
+
+Ferrum materializes one physical UDP proxy per route/rule/`listen_port`. When
+one `UDPRoute` attaches to distinct Gateways or listeners that share that port,
+each surviving claim is resolved with the precedence above and then fail-closed
+onto the proxy: a finite factor dominates Unlimited, the smallest finite factor
+wins, and the proxy is unlimited only when every represented claim is explicitly
+Unlimited. Input order and listener names do not change that boundary.
+
+`UDPRoute.status.parents[].conditions` includes Ferrum
+`UDPAmplificationProtection` (`FiniteDefault` / `FinitePolicy` /
+`ExplicitUnlimited`) without echoing the numeric factor, and only for a parent
+whose translator recorded that posture. An unprogrammed parent reports
+`False` / `NotProgrammed` with a fixed message rather than inheriting
+`FiniteDefault`. Shared-port sibling parents each receive that exact physical
+protection, so a materialized parent is never `NotProgrammed` merely because
+another parentRef sorted first. When one parentRef materializes on several UDP
+listeners (different ports), that parent reports the conservative aggregate:
+`ExplicitUnlimited` if any listener is unlimited, `FinitePolicy` only when every
+listener uses a finite policy, and `FiniteDefault` when at least one uses the
+controller default. A missing exact parent does not inherit another parentRef's
+posture. Runtime accounting is cumulative per admitted request; a zero-length
+response consumes one unit of remaining budget. See
+[`docs/tcp_udp_proxy.md`](tcp_udp_proxy.md).
 
 For a `UDPRoute` the rule's `backendRefs` is a weighted **set**. A single
 serviceable leg becomes a direct backend
@@ -937,7 +985,7 @@ These Linux-specific options auto-detect kernel support at startup when set to `
 
 ## Inbound PROXY Protocol
 
-Ferrum supports inbound [PROXY protocol](https://www.haproxy.org/download/1.8/doc/proxy-protocol.txt) (v1 text and v2 binary, auto-detected by prefix) on TCP and TCP+TLS stream listeners. This lets a front-end load balancer (AWS NLB, HAProxy, etc.) prepend the real client address to each accepted connection so the gateway sees the originating source IP instead of the LB's own IP.
+Ferrum supports inbound [PROXY protocol](https://www.haproxy.org/download/1.8/doc/proxy-protocol.txt) (v1 text and v2 binary, auto-detected by prefix) on TCP and TCP+TLS stream listeners. The UDP/DTLS equivalent is [Datagram Client-Address Metadata](#datagram-client-address-metadata-udp--dtls). This lets a front-end load balancer (AWS NLB, HAProxy, etc.) prepend the real client address to each accepted connection so the gateway sees the originating source IP instead of the LB's own IP.
 
 ### Enabling PROXY Protocol
 
@@ -992,9 +1040,168 @@ This mirrors the HTTP-path semantics of `X-Forwarded-For` + `FERRUM_TRUSTED_PROX
 
 ### Limitations
 
-- **TCP and TCP+TLS only.** PROXY protocol is a TCP-borne framing; it cannot be used on `udp` or `dtls` proxies. Setting `stream_proxy_protocol: true` on a non-TCP proxy produces a validation error.
+- **Connection framing is TCP-only.** The v1/v2 header described above is read once at the head of a connection. UDP and DTLS use the datagram envelope described in [Datagram Client-Address Metadata](#datagram-client-address-metadata-udp--dtls) instead — the same `stream_proxy_protocol` field, a different wire framing.
 - **Shared (SNI-passthrough) ports must agree.** The PROXY header is read from the raw stream before the TLS ClientHello, so SNI-based proxy resolution has not happened yet — the accept loop applies one per-listener decision. Every passthrough proxy sharing a `listen_port` must set the same `stream_proxy_protocol` value; mixing is a validation error.
 - **Not supported on mesh inbound relay paths.** Mesh tunnel peers (Sidecar mTLS, Ambient HBONE) carry cryptographic peer identity rather than PROXY headers; mesh inbound TCP relay never reads PROXY protocol headers.
+
+## Datagram Client-Address Metadata (UDP / DTLS)
+
+Behind a datagram load balancer, a `udp` or `dtls` listener would otherwise only ever see the balancer's address. Setting `stream_proxy_protocol: true` on a `udp` / `dtls` proxy turns on the datagram equivalent of the connection header: a **PROXY protocol v2 envelope carrying the `DGRAM` transport byte, prepended to every datagram** (issue #3289).
+
+```yaml
+proxies:
+  - id: dns-proxy
+    name: DNS
+    backend_scheme: udp
+    listen_port: 5353
+    targets:
+      - host: resolver.internal
+        port: 53
+    stream_proxy_protocol: true   # expect the DGRAM envelope on every datagram
+```
+
+### Wire format
+
+```text
+ 0                12      13      14          16
+ +----------------+-------+-------+-----------+----------------+---------+
+ | v2 signature   |ver_cmd|fam_tp | addr_len  |  address block | payload |
+ |   (12 bytes)   |  1 B  |  1 B  |  u16 BE   |  addr_len B    |    …    |
+ +----------------+-------+-------+-----------+----------------+---------+
+```
+
+- `ver_cmd` is `0x21` (version 2, `PROXY`) or `0x20` (version 2, `LOCAL`).
+- `fam_tp` is `0x12` (`AF_INET` + `DGRAM`) or `0x22` (`AF_INET6` + `DGRAM`). A `PROXY` command must declare the `DGRAM` transport whatever family it uses, so the address-less `AF_UNSPEC` shape is `0x02` — `0x00` there would be a TCP header replayed onto the datagram path. A `LOCAL` command keeps the spec's convention (`0x00` is fine) because it never sets a client identity.
+- The address block holds the fixed source/destination addresses and ports, optionally followed by TLVs. `addr_len` covers both; the payload begins immediately after. When a secret is configured the block carries exactly one freshness TLV (`0xE1`) and exactly one authentication TLV (`0xE0`).
+- Everything after the address block is the application payload, forwarded to the backend verbatim.
+
+**Every** datagram must carry the envelope. A first-datagram-only contract would let any later datagram from the same 4-tuple inherit an identity it never proved, and datagram delivery is unordered and lossy, so there is no dependable "first" datagram.
+
+### Three separate properties
+
+An authenticated envelope provides three *distinct* guarantees. They are described separately below because they fail separately:
+
+| Property | What it proves | Mechanism |
+|----------|----------------|-----------|
+| **Authenticity** | the envelope and payload were minted by a holder of the root secret | HMAC-SHA-256 tag, TLV `0xE0` |
+| **Listener-domain binding** | it was minted for *this* listener and no other | versioned domain-separation prefix inside the MAC input |
+| **Freshness / anti-replay** | Ferrum has not already acted on these exact bytes | authenticated freshness record (TLV `0xE1`) plus a bounded per-sender replay window |
+
+### Authentication
+
+Source addresses are trivially spoofable on UDP. Set `FERRUM_DATAGRAM_PROXY_PROTOCOL_SECRET` (at least 32 bytes) to require an HMAC-SHA-256 tag and a freshness record on every datagram:
+
+- The tag is TLV type `0xE0` (the PROXY v2 application-reserved range), value length 32.
+- It is computed over the listener's canonical domain prefix (below) **plus** the complete datagram with the 32 tag bytes elided — so the receiving listener's identity, the command, family, transport, addresses, the freshness record, every other TLV, and the payload are all bound to it.
+- A datagram with a missing, malformed, duplicated, or non-verifying tag is dropped.
+- The configured value is the key **verbatim** — it is never trimmed or normalized, so leading/trailing whitespace is key material and any nonempty value makes authentication mandatory. Only an unset or empty variable leaves the listener in the address-trust posture, and startup rejects a value shorter than 32 bytes without reporting the value or its length.
+- The root secret is read once at startup. Rotating it requires a process restart; it does not rotate under a live listener.
+
+With no secret configured, trust rests on `FERRUM_TRUSTED_PROXIES` alone, and the envelope has **neither cryptographic authenticity nor freshness** — a spoofed source address or a captured datagram is indistinguishable from a genuine one. That is sufficient only where the network path between the balancer and the gateway cannot carry spoofed source addresses; the listener logs a warning at startup so the weaker posture is visible.
+
+### Listener-domain binding
+
+One process-global root secret must not make a valid envelope portable between listeners. The MAC input therefore begins with a versioned domain-separation prefix built from *configured/bound listener properties only* — never from envelope bytes:
+
+```text
+"ferrum-datagram-proxy-v1" | binding_version | protocol_tag
+                           | family_tag | bind_addr octets | listen_port
+```
+
+- `protocol_tag` distinguishes the **plain-UDP receive boundary** from the **DTLS-terminating** one, so the same numeric port cannot be crossed between a plain `udp` listener and a DTLS frontend.
+- `family_tag` + `bind_addr` is the listener's **canonical bind address** (an IPv4-mapped IPv6 bind is folded to IPv4). A wildcard bind (`0.0.0.0` / `::`) and a specific-address bind on the same numeric port are therefore different domains, as are two specific addresses on one port.
+- `listen_port` is the exact receiving port.
+
+Because the binding is inside the MAC input, this holds for **every** command and family — `LOCAL` and `AF_UNSPEC` included, even though they carry no forwarded identity and therefore no declared destination to compare. An envelope minted for listener A and replayed byte-for-byte at listener B (changing only the outer UDP destination, which is outside the envelope) fails as `authentication_tag_mismatch`.
+
+The envelope's declared destination port is *additionally* compared to the listener's `listen_port` as defense in depth. That check runs first, so an address-bearing cross-listener envelope reports the more specific `listener_binding_mismatch`. Neither check is sufficient alone: the declared destination cannot cover the address-less forms, and the MAC alone cannot produce a distinguishable reason.
+
+A listener reload rebuilds the binding from the live protocol, bind address, and port. Every component is already part of the stream-listener restart key, so a reloaded listener can never keep a previous listener's binding.
+
+### Freshness and anti-replay
+
+Authentication proves *who could have created* the bytes, not *whether Ferrum has already acted on them*. Each authenticated envelope therefore carries exactly one freshness TLV:
+
+- TLV type `0xE1`, value length 29:
+
+  ```text
+  version u8 | sender_id u32 BE | epoch u64 BE | sequence u64 BE | timestamp_ms u64 BE
+  ```
+
+- `sender_id` is a stable, bounded identifier the balancer picks for itself (it doubles as the key identifier). `epoch` must strictly increase across a balancer restart or key rotation. `sequence` is monotonic within `(sender_id, epoch)`; `u64::MAX` is reserved, so a sender rolls its epoch rather than wrapping. `timestamp_ms` is Unix milliseconds at send time.
+- Every field is inside the MAC input, so an observer can neither mint nor renumber one.
+- The receiver keeps one bounded record per authenticated `sender_id` **per listener**: the highest admitted sequence for that sender's current epoch, plus a 64-bit bitmap of the sequences immediately below it. Check-and-mark happens under a single sharded-map write guard, so two receive workers can never both admit one sequence.
+
+| Freshness outcome | Result |
+|-------------------|--------|
+| unique sequence at or ahead of the window | admitted, marked |
+| unique sequence within 64 of the highest (bounded reordering) | admitted once, marked |
+| sequence equal to the highest, or already marked | `replay_duplicate` |
+| sequence more than 64 behind the highest | `replay_stale` |
+| epoch below the sender's current admitted epoch | `replay_epoch_stale` |
+| `sequence == u64::MAX` | `replay_sequence_exhausted` |
+| `timestamp_ms` more than 30s from the receiver's clock, either direction | `freshness_outside_horizon` |
+| no freshness TLV while a secret is configured | `missing_freshness` |
+| two freshness TLVs, or a wrong-length value | `duplicate_freshness` / `malformed_freshness` |
+| unknown freshness version | `unsupported_freshness_version` |
+| replay state at capacity with nothing reclaimable | `replay_state_capacity` |
+
+The 30-second horizon is a fixed constant, not an operator knob: it is the bound the lifecycle guarantees below are stated in, and a deployment that could widen it could silently widen the cross-restart replay window. Senders and receivers must agree on wall-clock time to within it (ordinary NTP synchronization is orders of magnitude tighter).
+
+**State is bounded.** At most 1024 senders per listener. At capacity the listener first reclaims records idle longer than 120s (four times the horizon) and, if that frees nothing, refuses with `replay_state_capacity` rather than evicting live protection. The idle threshold deliberately exceeds *twice* the horizon: an envelope that could still be inside the horizon after a reclaim would need a timestamp both newer than `now − 30s` and no newer than `last_activity + 30s`, which cannot both hold, so reclaiming can never make an old sequence valid again. Sequence jumps, epoch churn, and far-future sequences cost no extra state — one record per sender, whatever the numbers are.
+
+### Lifecycle: exactly what is guaranteed
+
+- **Within one Ferrum process, per listener** — every authenticated envelope is admitted **at most once**. A byte-for-byte replay is dropped before session lookup or creation, before pending-queue admission, before DTLS demux and handshake allocation, before `on_stream_connect` / `on_udp_datagram`, before backend selection or send, before byte/amplification accounting, and without refreshing idle activity.
+- **Across a listener reload, a receiver process restart, or a second Ferrum replica** — replay state is process-local and listener-scoped, so a fresh gate has a fresh window. Exposure is therefore **bounded to the 30-second horizon**: a captured envelope older than that is refused by *any* receiver, restarted or not. Ferrum does **not** claim cluster-wide anti-replay.
+- **Supported multi-replica model** — per-flow sender stickiness (a datagram balancer already pins one client flow to one Ferrum socket) plus that horizon. If you need envelope-level exactly-once across replicas, terminate the metadata at a single receiver.
+- **Sender restart** — publish a strictly higher `epoch`. Reusing an old epoch with restarted sequence numbers is refused as `replay_epoch_stale`.
+- **Secret / key rotation** — restart the process; the new secret invalidates every envelope minted under the old one, and the fresh replay state starts empty.
+
+### Sender contract
+
+`proxy::datagram_client_address::encode_datagram_with_metadata` is the normative encoder (Ferrum only ever decodes). An authenticated sender supplies the listener binding it is addressing and a `(sender_id, epoch, sequence, timestamp_ms)` record; an unauthenticated sender supplies neither and gets the address-trust posture. There is no compatibility switch that accepts a tagged envelope *without* freshness: that shape is refused as `missing_freshness`, because a per-deployment opt-out would make the whole anti-replay contract opt-out on the wire.
+
+### Fail-closed behavior
+
+| Scenario | Result |
+|----------|--------|
+| Trusted peer + valid envelope (+ valid tag and fresh sequence when a secret is set) | `client_ip` = forwarded address; `direct_client_ip` = balancer socket peer |
+| Untrusted peer (not in `FERRUM_TRUSTED_PROXIES`) | Datagram **dropped** |
+| Missing / truncated / oversized / malformed envelope | Datagram **dropped** |
+| Any transport but `DGRAM` on a `PROXY` command, `AF_UNSPEC` included (a TCP PROXY header replayed onto the datagram path) | Datagram **dropped** |
+| Unsupported address family (including `AF_UNIX`) | Datagram **dropped** |
+| Missing, duplicated, wrong-length, or invalid authentication tag | Datagram **dropped** |
+| Envelope minted for another listener's binding (any command or family) | Datagram **dropped** |
+| Envelope whose declared destination port is not this listener's `listen_port` | Datagram **dropped** |
+| Missing, duplicated, malformed, or unsupported-version freshness record | Datagram **dropped** |
+| Duplicate, stale, epoch-stale, or exhausted sequence; timestamp outside the horizon | Datagram **dropped** |
+| Replay state at capacity for a new sender | Datagram **dropped** |
+| Forwarded client differs from the established session's | Datagram **dropped** |
+| `LOCAL` command, or `PROXY` + `AF_UNSPEC` + `DGRAM` (balancer health probe) | `client_ip` = `direct_client_ip` = balancer socket peer |
+
+A drop is silent on the wire (UDP has no reset). Each one increments an internal listener-local `client_address_metadata_drops` counter (shared by the UDP receive path and the DTLS demuxer on that listener) and emits a rate-limited structured warning carrying a fixed-cardinality reason and the direct socket peer only; payload bytes, tag material, the secret, sequence-cache contents, and rejected forwarded addresses are never logged. That counter is **not** an exported Prometheus or admin metric — it is in-process accounting for tests and the listener's own drop path.
+
+### Session and reply semantics
+
+- Ferrum keys UDP sessions by the **socket peer**, so a balancer must allocate a distinct source port per client flow (ordinary per-flow NAT). All datagrams on one socket peer must therefore carry the same forwarded client; one that does not is dropped rather than attributed to the established session's identity.
+- **Identity pinning is fail-closed and does not refresh activity on mismatch.** Once a 4-tuple is admitted, a later datagram asserting a different forwarded identity is dropped and does not extend the idle watermark. That is the correct security behavior. The availability consequence is that an **unauthenticated** spoof winning the fresh-flow race can occupy the session slot and **blackhole the genuine flow until the idle window**, after which the association expires and the genuine flow self-heals. Do not weaken the pin to recover faster. With a secret configured this race is no longer reachable by replaying captured bytes: the replay window refuses the duplicate before a session is created, so an attacker would have to forge a fresh authenticated envelope, which requires the root secret.
+- **Replies are sent to the socket peer unwrapped.** Ferrum does not emit the envelope on the return path — the balancer demultiplexes by its own 4-tuple.
+- The envelope is stripped before anything else runs: before session lookup, before `on_stream_connect` / `on_udp_datagram` plugins, before the DTLS record layer on a `dtls` listener, and before any backend send. The backend never sees envelope bytes.
+- Backend load-balancer stickiness (`hash_on` ip-hash lanes) follows the resolved client, so one real client keeps one backend across the balancer's ports.
+
+### Client IP resolution
+
+Identical to the TCP path: `client_ip` (mesh authz `remote.ip` / `remoteIpBlocks`, stream logs, rate-limit keys) is the authenticated forwarded address, while `direct_client_ip` (`source.ip` / `ipBlocks`) always stays the socket peer. With the feature disabled both remain the socket peer, which is the historical UDP/DTLS behavior.
+
+### Limitations (datagram)
+
+- **Inbound only.** Ferrum never emits the datagram envelope toward a backend; `backend_proxy_protocol` remains TCP-only.
+- **Anti-replay is process-local, bounded by the horizon.** Exactly-once holds within one Ferrum process per listener. Across a listener reload, a receiver restart, or a second replica, a captured envelope stays usable for at most 30 seconds — see [Lifecycle](#lifecycle-exactly-what-is-guaranteed). Ferrum does not claim cluster-wide anti-replay.
+- **Freshness requires a configured secret.** Without `FERRUM_DATAGRAM_PROXY_PROTOCOL_SECRET` there is no authenticity and no replay protection at all; the address-trust posture accepts a verbatim repeat exactly as plain UDP does.
+- **Bounded clock-skew contract.** Sender and receiver wall clocks must agree to within 30 seconds, or authenticated datagrams are refused as `freshness_outside_horizon`.
+- **Identity-pinning availability.** See [Session and reply semantics](#session-and-reply-semantics): in the unauthenticated posture a spoof that wins a fresh-flow race can blackhole the genuine client until idle timeout, then self-heals. The pin is not relaxed.
+- **Not supported on mesh capture paths.** Ambient/sidecar UDP capture carries its own metadata; the envelope applies to configured `udp` / `dtls` stream listeners.
 
 ## Outbound PROXY Protocol
 
@@ -1042,7 +1249,7 @@ Outbound PROXY can be combined with inbound `stream_proxy_protocol: true`: Ferru
 - `listen_port` must not conflict with gateway reserved ports — the proxy HTTP/HTTPS ports (`FERRUM_PROXY_HTTP_PORT`, `FERRUM_PROXY_HTTPS_PORT`), admin HTTP/HTTPS ports (`FERRUM_ADMIN_HTTP_PORT`, `FERRUM_ADMIN_HTTPS_PORT`), or CP gRPC port (`FERRUM_CP_GRPC_LISTEN_ADDR`)
 - `listen_port` is optional for HTTP-family proxies; when present it scopes the route to that frontend port and does not join stream-port sharing
 - A TCP/TLS stream `listen_port` still collides with an HTTP-family Gateway listener on that port (whole-listener refusal). A UDP/DTLS stream may share the numeric port with an HTTP-family listener: plaintext is unaffected, and a TLS-class listener with HTTP/3 enabled keeps TCP/H1/H2 while refusing only QUIC/H3 for that port (see [gateway_api_conformance.md](gateway_api_conformance.md) and [http3.md](http3.md))
-- `stream_proxy_protocol` may only be set on `tcp` / `tcp_tls` proxies; setting it on `udp`, `dtls`, or HTTP proxies is a validation error
+- `stream_proxy_protocol` may only be set on stream proxies (`tcp` / `tcp_tls` use the connection header, `udp` / `dtls` use the per-datagram envelope); setting it on an HTTP-family proxy is a validation error
 - `backend_proxy_protocol` may only be set on `tcp` / `tcps` proxies; setting it on `udp`, `dtls`, or HTTP proxies is a validation error
 - Stream proxies are excluded from the HTTP router (routed by port, not path)
 

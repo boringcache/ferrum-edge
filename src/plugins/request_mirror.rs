@@ -2199,6 +2199,22 @@ impl Plugin for RequestMirror {
             } else {
                 http_client.get()
             };
+            let outbound = match outbound {
+                Ok(client) => client,
+                Err(_) => {
+                    task_guard.settle(MirrorTaskOutcome::RequestFailure);
+                    warn!(
+                        "request_mirror: plugin HTTP client unavailable; failing closed for {}",
+                        mirror_url_for_log
+                    );
+                    let _ = tx.send(Some(mirror_failure_meta(
+                        mirror_plugin_id,
+                        mirror_url_for_log,
+                        "plugin HTTP client unavailable",
+                    )));
+                    return;
+                }
+            };
 
             let mut req_builder = match method.as_str() {
                 "GET" => outbound.get(&mirror_url),

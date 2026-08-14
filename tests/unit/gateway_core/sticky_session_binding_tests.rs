@@ -2396,48 +2396,95 @@ async fn cookie_reissue_after_wildcard_retry_rotation_names_configured_backend()
 #[test]
 fn all_six_retry_callers_pass_request_authority_to_shared_helper() {
     // Anti-drift: every retry transport must thread the validated inbound
-    // authority into select_next_retry_target and must not open-code a literal
-    // wildcard dial around that helper.
+    // authority into select_next_retry_target (or the H3-eligible wrapper that
+    // preserves that contract) and must not open-code a literal wildcard dial
+    // around that helper.
     let proxy_src = include_str!("../../../src/proxy/mod.rs");
     let h3_server = include_str!("../../../src/http3/server.rs");
     let h3_cross = include_str!("../../../src/http3/cross_protocol.rs");
     let h3_ws = include_str!("../../../src/http3/websocket.rs");
 
     // Three call sites in proxy/mod.rs (HTTP/H2, direct gRPC, WebSocket) and
-    // one each in the three H3 retry paths.
+    // one each in the three H3 retry paths. All H3 paths use the eligibility
+    // wrapper so Unix-only targets cannot consume a retry or be dialed through
+    // a schema placeholder.
     assert_eq!(
         proxy_src.matches("select_next_retry_target(").count(),
         3,
         "proxy/mod.rs must keep exactly the three retry call sites"
     );
-    assert_eq!(h3_server.matches("select_next_retry_target(").count(), 1);
+    assert_eq!(
+        h3_server
+            .matches("select_next_h3_eligible_retry_target(")
+            .count(),
+        1,
+        "native H3 must funnel through one shared H3-eligible helper call"
+    );
+    assert_eq!(
+        h3_cross
+            .matches("select_next_h3_eligible_retry_target(")
+            .count(),
+        1,
+        "cross-protocol must funnel through one shared H3-eligible helper call"
+    );
+    assert_eq!(
+        h3_ws
+            .matches("select_next_h3_eligible_retry_target(")
+            .count(),
+        1,
+        "H3 WebSocket must funnel through one shared H3-eligible helper call"
+    );
     assert_eq!(
         h3_cross.matches("select_next_retry_target(").count(),
-        1,
-        "cross-protocol must funnel through one shared wrapper call"
+        0,
+        "cross-protocol must not open-code select_next_retry_target beside the eligibility wrapper"
     );
-    assert_eq!(h3_ws.matches("select_next_retry_target(").count(), 1);
+    assert_eq!(
+        h3_ws.matches("select_next_retry_target(").count(),
+        0,
+        "H3 WebSocket must not open-code select_next_retry_target beside the eligibility wrapper"
+    );
+    assert_eq!(
+        h3_server.matches("select_next_retry_target(").count(),
+        0,
+        "native H3 must not open-code select_next_retry_target beside the eligibility wrapper"
+    );
 
     // Every production call passes the validated inbound host near the helper.
-    for (label, source, expected_calls) in [
-        ("proxy/mod.rs", proxy_src, 3usize),
-        ("http3/server.rs", h3_server, 1),
-        ("http3/websocket.rs", h3_ws, 1),
+    for (label, source, needle, expected_calls) in [
+        (
+            "proxy/mod.rs",
+            proxy_src,
+            "select_next_retry_target(",
+            3usize,
+        ),
+        (
+            "http3/server.rs",
+            h3_server,
+            "select_next_h3_eligible_retry_target(",
+            1,
+        ),
+        (
+            "http3/websocket.rs",
+            h3_ws,
+            "select_next_h3_eligible_retry_target(",
+            1,
+        ),
     ] {
         let mut remaining = source;
         let mut seen = 0usize;
-        while let Some(idx) = remaining.find("select_next_retry_target(") {
+        while let Some(idx) = remaining.find(needle) {
             let window: String = remaining[idx..].chars().take(600).collect();
             assert!(
                 window.contains("request_host.as_deref()"),
-                "{label} select_next_retry_target call must pass request_host.as_deref(): {window}"
+                "{label} {needle} call must pass request_host.as_deref(): {window}"
             );
             seen += 1;
-            remaining = &remaining[idx + "select_next_retry_target(".len()..];
+            remaining = &remaining[idx + needle.len()..];
         }
         assert_eq!(
             seen, expected_calls,
-            "{label} must keep {expected_calls} select_next_retry_target call(s)"
+            "{label} must keep {expected_calls} {needle} call(s)"
         );
     }
 
@@ -2446,9 +2493,9 @@ fn all_six_retry_callers_pass_request_authority_to_shared_helper() {
         "CrossProtocolRequest must carry the validated inbound authority"
     );
     let cross_call = h3_cross
-        .split("crate::proxy::backend_dispatch::select_next_retry_target(")
+        .split("crate::proxy::backend_dispatch::select_next_h3_eligible_retry_target(")
         .nth(1)
-        .expect("cross-protocol shared helper call")
+        .expect("cross-protocol shared H3-eligible helper call")
         .split(')')
         .next()
         .expect("call close");
@@ -2460,21 +2507,29 @@ fn all_six_retry_callers_pass_request_authority_to_shared_helper() {
     // No dispatch path may open-code dialing a literal configured wildcard
     // beside the shared helper (the helper is the only place allowed to turn a
     // configured `*.` into a concrete dial host for retries).
-    for (label, source) in [
-        ("proxy/mod.rs", proxy_src),
-        ("http3/server.rs", h3_server),
-        ("http3/cross_protocol.rs", h3_cross),
-        ("http3/websocket.rs", h3_ws),
+    for (label, source, needle) in [
+        ("proxy/mod.rs", proxy_src, "select_next_retry_target("),
+        ("http3/server.rs", h3_server, "select_next_retry_target("),
+        (
+            "http3/cross_protocol.rs",
+            h3_cross,
+            "select_next_h3_eligible_retry_target(",
+        ),
+        (
+            "http3/websocket.rs",
+            h3_ws,
+            "select_next_h3_eligible_retry_target(",
+        ),
     ] {
         let mut remaining = source;
-        while let Some(idx) = remaining.find("select_next_retry_target(") {
+        while let Some(idx) = remaining.find(needle) {
             let after = &remaining[idx..];
             let window: String = after.chars().take(800).collect();
             assert!(
                 !window.contains("starts_with(\"*.\")"),
-                "{label} must not open-code wildcard dial logic beside select_next_retry_target"
+                "{label} must not open-code wildcard dial logic beside {needle}"
             );
-            remaining = &after["select_next_retry_target(".len()..];
+            remaining = &after[needle.len()..];
         }
     }
 }

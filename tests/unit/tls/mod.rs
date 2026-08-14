@@ -8,6 +8,7 @@ mod inventory_public_metadata_tests;
 mod managed_store_ha_tests;
 mod material_size_cap_tests;
 mod material_size_config_tests;
+mod native_mesh_tls_observer_tests;
 mod pem_bundle_redaction_tests;
 #[cfg(feature = "pkcs11")]
 mod pkcs11_key_encoding_tests;

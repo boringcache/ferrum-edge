@@ -14,19 +14,19 @@ use crate::modes::mesh::config::{
 use crate::plugins::utils::route_header_transform::route_header_transform_rules_to_json;
 
 use super::{
-    GatewayApiAllowedRoutesNamespaces, GatewayApiListenerConflict, GatewayApiListenerKey,
-    GatewayApiListenerParentKind, GatewayApiListenerPolicy, GatewayApiListenerValidationError,
-    GatewayApiNamespaceSelector, GatewayApiNamespaceSelectorExpression,
-    GatewayApiNamespaceSelectorOperator, GatewayApiRouteConflict, GatewayApiRouteConflictKey,
-    GatewayApiRouteSlot, GatewaySessionPersistence, K8sAccumulator, K8sObject, K8sResourceKey,
-    K8sTranslateError, K8sTranslationOptions, MeshRouteDispatchDestination, RouteBackend,
-    RouteProxySpec, SourceKind, UNSUPPORTED_SHAPE_MARKER, attach_route_plugins_to_proxy,
-    exact_path_listen_path, invalid_resource, mesh_route_dispatch_plugin_from_rules,
-    namespaced_resource_key, optional_port_field, optional_target_weight_field,
-    parse_istio_duration_ms, port_from_u64, proxy_for_route, resource_id,
-    route_backends_require_node_waypoint_authz, route_request_transformer_plugin_for_proxy,
-    service_dns_name, string_array, string_field, upstream_for_route,
-    upstream_for_route_with_session,
+    FERRUM_GATEWAY_CONTROLLER_NAME, GatewayApiAllowedRoutesNamespaces, GatewayApiListenerConflict,
+    GatewayApiListenerKey, GatewayApiListenerParentKind, GatewayApiListenerPolicy,
+    GatewayApiListenerValidationError, GatewayApiNamespaceSelector,
+    GatewayApiNamespaceSelectorExpression, GatewayApiNamespaceSelectorOperator,
+    GatewayApiRouteConflict, GatewayApiRouteConflictKey, GatewayApiRouteSlot,
+    GatewaySessionPersistence, K8sAccumulator, K8sObject, K8sResourceKey, K8sTranslateError,
+    K8sTranslationOptions, MeshRouteDispatchDestination, RouteBackend, RouteProxySpec, SourceKind,
+    UNSUPPORTED_SHAPE_MARKER, attach_route_plugins_to_proxy, exact_path_listen_path,
+    invalid_resource, mesh_route_dispatch_plugin_from_rules, namespaced_resource_key,
+    optional_port_field, optional_target_weight_field, parse_istio_duration_ms, port_from_u64,
+    proxy_for_route, resource_id, route_backends_require_node_waypoint_authz,
+    route_request_transformer_plugin_for_proxy, service_dns_name, string_array, string_field,
+    upstream_for_route, upstream_for_route_with_session,
 };
 use crate::config::db_backend::NamespacedResourceId;
 use crate::config::types::{HashOnCookieConfig, PluginConfig, Proxy};
@@ -361,18 +361,18 @@ pub(super) fn translate(
         // connection state, per-session idle expiry) are preserved by the
         // existing UDP data path.
         //
-        // The response-amplification guard is NOT engaged here: it is the
-        // opt-in per-proxy `udp_max_response_amplification_factor`, Gateway
-        // API defines no field that maps onto it, and `proxy_for_route`
-        // leaves it unset — the same default a hand-authored UDP proxy gets.
-        // Do not describe it as in force for a generated UDPRoute proxy.
+        // Response-amplification protection is always engaged: the translator
+        // projects a finite controller default (8.0) unless a valid Ferrum
+        // `UDPResponseAmplificationPolicy` wins, including an explicit
+        // dual-acknowledged unlimited override. Ordinary translation never
+        // leaves `udp_max_response_amplification_factor` unset.
         "UDPRoute" => {
             for proxy in l4_route_proxies(object, acc, BackendScheme::Udp)? {
                 acc.upsert_proxy(proxy, SourceKind::GatewayApi);
             }
             Ok(true)
         }
-        "ReferenceGrant" | "BackendTLSPolicy" => Ok(true),
+        "ReferenceGrant" | "BackendTLSPolicy" | "UDPResponseAmplificationPolicy" => Ok(true),
         // Collected in the pre-pass; acknowledged here so the main translate
         // loop does not warn about an "unsupported" kind.
         "BackendLBPolicy" | "XBackendTrafficPolicy" => Ok(true),
@@ -961,9 +961,6 @@ fn scope_cookie_session_to_route(
 /// Fixed Accepted=False / Conflicted message for GEP-713 None-merge losers.
 /// Must not echo policy identity, Service names, or operator-authored values.
 const BACKEND_LB_POLICY_CONFLICTED_MESSAGE: &str = "Another BackendLBPolicy or XBackendTrafficPolicy already targets one or more of the same Services and merging is not supported";
-
-/// Controller name stamped on every `status.ancestors` entry Ferrum owns.
-const FERRUM_GATEWAY_CONTROLLER_NAME: &str = "ferrum.io/gateway-controller";
 
 /// Gateway API `PolicyStatus.ancestors` upper bound (`+kubebuilder:validation:MaxItems=16`).
 ///
@@ -3061,15 +3058,18 @@ fn udp_route_conflict_key(
 
 /// One concrete UDP Gateway listener a UDPRoute attaches to.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
-struct UdpListenerClaim {
-    parent_ref: String,
-    listener: GatewayApiListenerKey,
-    port: u16,
+pub(crate) struct UdpListenerClaim {
+    pub parent_ref: String,
+    pub listener: GatewayApiListenerKey,
+    pub port: u16,
 }
 
 /// Resolve every materializable UDP listener a UDPRoute attaches to, preserving
 /// the authored parentRef spelling that selected it.
-fn udp_route_listener_claims(object: &K8sObject, acc: &K8sAccumulator) -> Vec<UdpListenerClaim> {
+pub(crate) fn udp_route_listener_claims(
+    object: &K8sObject,
+    acc: &K8sAccumulator,
+) -> Vec<UdpListenerClaim> {
     let mut claims = Vec::new();
     for parent_ref in object
         .spec
@@ -7205,22 +7205,33 @@ fn l4_route_proxies_for_namespace(
                     &suffix,
                 )
             };
-            proxies.push(proxy_for_route(RouteProxySpec {
-                id,
-                // The parent Gateway namespace owns the stream listener.
-                namespace: config_namespace.to_string(),
-                hosts: hosts.clone(),
-                listen_path: None,
-                strip_listen_path: false,
-                preserve_host_header: false,
-                backend_host: backend_host.clone(),
-                backend_port,
-                upstream_id: upstream_id.clone(),
-                backend_scheme: scheme,
-                listen_port: Some(*listen_port),
-                retry: None,
-                backend_read_timeout_ms: None,
-            }));
+            proxies.push({
+                let mut proxy = proxy_for_route(RouteProxySpec {
+                    id,
+                    // The parent Gateway namespace owns the stream listener.
+                    namespace: config_namespace.to_string(),
+                    hosts: hosts.clone(),
+                    listen_path: None,
+                    strip_listen_path: false,
+                    preserve_host_header: false,
+                    backend_host: backend_host.clone(),
+                    backend_port,
+                    upstream_id: upstream_id.clone(),
+                    backend_scheme: scheme,
+                    listen_port: Some(*listen_port),
+                    retry: None,
+                    backend_read_timeout_ms: None,
+                });
+                if scheme.is_udp() {
+                    super::udp_amplification_policy::apply_to_generated_proxy(
+                        acc,
+                        object,
+                        &mut proxy,
+                        *listen_port,
+                    );
+                }
+                proxy
+            });
         }
     }
     if !proxies.is_empty() {
@@ -7272,15 +7283,16 @@ fn gateway_api_l4_proxy_id(
     )
 }
 
-/// UDP listener ports and parentRefs that survive same-listener conflict loss.
+/// Concrete UDP listener claims that survive same-listener conflict loss.
 ///
 /// Arbitration is per concrete listener: a route that loses on one listener may
-/// still keep another. ParentRefs that retain at least one surviving listener
-/// are recorded as materialized so status `Programmed` tracks live ownership.
-fn udp_route_surviving_materialization(
+/// still keep another. Amplification policy resolves every surviving claim that
+/// a generated physical proxy represents, because Ferrum materializes only one
+/// UDP proxy per route/rule/`listen_port`.
+pub(crate) fn udp_route_surviving_listener_claims(
     object: &K8sObject,
     acc: &K8sAccumulator,
-) -> (Vec<u16>, Vec<String>) {
+) -> Vec<UdpListenerClaim> {
     let losing_conflict_keys: HashSet<GatewayApiRouteConflictKey> = acc
         .gateway_api_conflict_losers
         .get(&K8sResourceKey::from_object(object))
@@ -7288,16 +7300,27 @@ fn udp_route_surviving_materialization(
         .flat_map(|conflicts| conflicts.iter().map(|conflict| conflict.key.clone()))
         .collect();
 
-    let mut ports = Vec::new();
-    let mut parent_refs = Vec::new();
-    for claim in udp_route_listener_claims(object, acc) {
-        let key = udp_route_conflict_key(&claim.parent_ref, &claim.listener, Some(claim.port));
-        if losing_conflict_keys.contains(&key) {
-            continue;
-        }
-        ports.push(claim.port);
-        parent_refs.push(claim.parent_ref);
-    }
+    udp_route_listener_claims(object, acc)
+        .into_iter()
+        .filter(|claim| {
+            let key = udp_route_conflict_key(&claim.parent_ref, &claim.listener, Some(claim.port));
+            !losing_conflict_keys.contains(&key)
+        })
+        .collect()
+}
+
+/// UDP listener ports and parentRefs that survive same-listener conflict loss.
+///
+/// ParentRefs that retain at least one surviving listener are recorded as
+/// materialized so status `Programmed` tracks live ownership. Distinct
+/// Gateways/listeners that share a numeric port collapse to one physical proxy.
+fn udp_route_surviving_materialization(
+    object: &K8sObject,
+    acc: &K8sAccumulator,
+) -> (Vec<u16>, Vec<String>) {
+    let claims = udp_route_surviving_listener_claims(object, acc);
+    let mut ports: Vec<u16> = claims.iter().map(|claim| claim.port).collect();
+    let mut parent_refs: Vec<String> = claims.into_iter().map(|claim| claim.parent_ref).collect();
     ports.sort();
     ports.dedup();
     parent_refs.sort();
@@ -7876,8 +7899,9 @@ fn listener_allowed_route_kind<'a>(kind: &Value, protocol_kinds: &'a [&str]) -> 
 mod tests {
     use super::*;
     use crate::config_sources::k8s::{
-        K8sMetadata, K8sTranslationOptions, gateway_api_status_conflict_context,
-        translate_k8s_objects,
+        K8sMetadata, K8sTranslation,
+        gateway_api_status_conflict_context as gateway_api_status_conflict_context_raw,
+        translate_k8s_objects as translate_k8s_objects_raw,
     };
     use crate::identity::spiffe::TrustDomain;
 
@@ -7886,6 +7910,48 @@ mod tests {
             "default".to_string(),
             TrustDomain::new("cluster.local").expect("test trust domain"),
         )
+    }
+
+    fn ferrum_owned_gateway_class() -> K8sObject {
+        let mut class = object(
+            "GatewayClass",
+            json!({ "controllerName": FERRUM_GATEWAY_CONTROLLER_NAME }),
+        );
+        class.metadata.name = "ferrum".to_string();
+        class.metadata.namespace.clear();
+        class
+    }
+
+    /// Fixtures historically omitted `GatewayClass/ferrum` because translation
+    /// inferred ownership from the class name. Inject the owned object unless
+    /// the snapshot already contains that cluster-scoped name (owned or foreign).
+    fn with_observed_ferrum_class(objects: &[K8sObject]) -> Vec<K8sObject> {
+        if objects
+            .iter()
+            .any(|object| object.kind == "GatewayClass" && object.metadata.name == "ferrum")
+        {
+            return objects.to_vec();
+        }
+        let mut snapshot = Vec::with_capacity(objects.len() + 1);
+        snapshot.push(ferrum_owned_gateway_class());
+        snapshot.extend_from_slice(objects);
+        snapshot
+    }
+
+    fn translate_k8s_objects(
+        objects: &[K8sObject],
+        options: K8sTranslationOptions,
+    ) -> Result<K8sTranslation, K8sTranslateError> {
+        let snapshot = with_observed_ferrum_class(objects);
+        translate_k8s_objects_raw(&snapshot, options)
+    }
+
+    fn gateway_api_status_conflict_context(
+        objects: &[K8sObject],
+        options: K8sTranslationOptions,
+    ) -> K8sAccumulator {
+        let snapshot = with_observed_ferrum_class(objects);
+        gateway_api_status_conflict_context_raw(&snapshot, options)
     }
 
     fn object(kind: &str, spec: Value) -> K8sObject {

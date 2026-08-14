@@ -772,7 +772,10 @@ pub async fn start_xds_client_with_shutdown(
                     shutting_down = true;
                     Ok(MeshStreamAttempt::LocalRetirement(MeshStreamRetirement::Shutdown))
                 }
-                _ = wait_optional_tls_reload(tls_reload.as_ref().map(|reload| reload.revision_rx.clone())) => {
+                _ = wait_optional_tls_reload(
+                    tls_reload.as_ref().map(|reload| reload.revision_rx.clone()),
+                    last_tls_revision,
+                ) => {
                     Ok(MeshStreamAttempt::LocalRetirement(MeshStreamRetirement::TlsReload))
                 }
             }
@@ -795,7 +798,10 @@ pub async fn start_xds_client_with_shutdown(
                     shutting_down = true;
                     Ok(MeshStreamAttempt::LocalRetirement(MeshStreamRetirement::Shutdown))
                 }
-                _ = wait_optional_tls_reload(tls_reload.as_ref().map(|reload| reload.revision_rx.clone())) => {
+                _ = wait_optional_tls_reload(
+                    tls_reload.as_ref().map(|reload| reload.revision_rx.clone()),
+                    last_tls_revision,
+                ) => {
                     Ok(MeshStreamAttempt::LocalRetirement(MeshStreamRetirement::TlsReload))
                 }
             }
@@ -868,7 +874,10 @@ pub async fn start_xds_client_with_shutdown(
                 info!("xDS mesh client shutting down");
                 return;
             }
-            _ = wait_optional_tls_reload(tls_reload.as_ref().map(|reload| reload.revision_rx.clone())) => {
+            _ = wait_optional_tls_reload(
+                tls_reload.as_ref().map(|reload| reload.revision_rx.clone()),
+                last_tls_revision,
+            ) => {
                 backoff_secs = BACKOFF_INITIAL_SECS;
                 continue;
             }

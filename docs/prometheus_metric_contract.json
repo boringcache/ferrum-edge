@@ -1692,6 +1692,46 @@
     "emission": "when_process_initialized"
   },
   {
+    "name": "ferrum_gateway_trust_bundle_ambiguous_authority_total",
+    "type": "counter",
+    "help": "Publications that found both a database record and a file-sourced trust value and kept the previously accepted trust.",
+    "labels": [],
+    "subsystem": "gateway_trust",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "always"
+  },
+  {
+    "name": "ferrum_gateway_trust_bundle_last_published_unix_seconds",
+    "type": "gauge",
+    "help": "Unix time of the most recently published gateway trust-bundle generation; 0 when none.",
+    "labels": [],
+    "subsystem": "gateway_trust",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "always"
+  },
+  {
+    "name": "ferrum_gateway_trust_bundle_load_rejections_total",
+    "type": "counter",
+    "help": "Gateway trust-bundle candidates refused before the live swap; the previous valid generation stays active.",
+    "labels": [],
+    "subsystem": "gateway_trust",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "always"
+  },
+  {
+    "name": "ferrum_gateway_trust_bundle_published_generations_total",
+    "type": "counter",
+    "help": "Gateway trust-bundle generations carrying a database-sourced record that reached the live configuration swap; a generation refused by the ambiguous-authority rule is not counted.",
+    "labels": [],
+    "subsystem": "gateway_trust",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "always"
+  },
+  {
     "name": "ferrum_grpc_config_stream_terminations_total",
     "type": "counter",
     "help": "Authenticated configuration streams ended by fixed surface and reason.",
@@ -4174,6 +4214,54 @@
       "namespace"
     ],
     "subsystem": "tls",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "always"
+  },
+  {
+    "name": "ferrum_udp_amplification_policy_invalid_total",
+    "type": "counter",
+    "help": "UDPResponseAmplificationPolicy objects rejected before listener programming.",
+    "labels": [
+      "namespace"
+    ],
+    "subsystem": "udp",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "always"
+  },
+  {
+    "name": "ferrum_udp_amplification_responses_allowed_total",
+    "type": "counter",
+    "help": "UDP backend responses admitted by the per-request amplification budget.",
+    "labels": [
+      "namespace"
+    ],
+    "subsystem": "udp",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "always"
+  },
+  {
+    "name": "ferrum_udp_amplification_responses_dropped_total",
+    "type": "counter",
+    "help": "UDP backend responses dropped for exceeding the per-request amplification budget.",
+    "labels": [
+      "namespace"
+    ],
+    "subsystem": "udp",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "always"
+  },
+  {
+    "name": "ferrum_udp_amplification_unlimited_total",
+    "type": "counter",
+    "help": "UDP/DTLS sessions admitted without a response-amplification limit.",
+    "labels": [
+      "namespace"
+    ],
+    "subsystem": "udp",
     "export_surface": "/metrics",
     "bundled": "documented_only",
     "emission": "always"

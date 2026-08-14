@@ -102,6 +102,8 @@ deploy_control_plane() {
   # new Gateway lose that slot and withholds its HTTPS listener routes (404, not
   # 502). Keep the window well inside the 120s black-box probe budget rather than
   # at the 300s production default.
+  # Harness owns GatewayClass/ferrum create/delete/recreate out of band; Helm must
+  # not claim or recreate the cluster-scoped object (chart default is create=true).
   helm upgrade --install ferrum "$ROOT_DIR/charts/ferrum-mesh" \
     --namespace "$CP_NAMESPACE" \
     --set image.repository=ferrum-edge \
@@ -109,6 +111,7 @@ deploy_control_plane() {
     --set image.pullPolicy=IfNotPresent \
     --set injector.enabled=false \
     --set ca.enabled=false \
+    --set gatewayClass.create=false \
     --set controlPlane.enabled=true \
     --set controlPlane.rbac.create=true \
     --set controlPlane.rbac.gatewayApi=true \

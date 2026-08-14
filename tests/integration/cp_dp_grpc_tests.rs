@@ -6,15 +6,19 @@
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::sync::LazyLock;
 use std::time::Duration;
 
 use arc_swap::ArcSwap;
+use base64::Engine;
+use base64::engine::general_purpose::STANDARD as BASE64;
 use chrono::Utc;
 use tokio::time::timeout;
 use tonic::transport::server::ServerTlsConfig;
 use tonic::transport::{Certificate, Identity, Server};
 
 use ferrum_edge::config::db_loader::{IncrementalResult, NamespacedResourceId};
+use ferrum_edge::config::gateway_trust::GatewayTrustPublication;
 use ferrum_edge::config::types::{
     AuthMode, BackendScheme, Consumer, DispatchKind, GatewayConfig, LoadBalancerAlgorithm,
     PluginConfig, PluginScope, Proxy, Upstream, UpstreamTarget,
@@ -158,17 +162,35 @@ fn create_test_trust_bundles() -> TrustBundleSet {
     TrustBundleSet {
         local: TrustBundle {
             trust_domain: TrustDomain::new("cluster.local").unwrap(),
-            x509_authorities: vec!["AQIDBA==".to_string()],
+            x509_authorities: vec![BASE64.encode(TEST_LOCAL_ROOT_DER.as_slice())],
             jwt_authorities: Vec::new(),
             refresh_hint_seconds: Some(300),
         },
         federated: vec![TrustBundle {
             trust_domain: TrustDomain::new("remote.local").unwrap(),
-            x509_authorities: vec!["BQYH".to_string()],
+            x509_authorities: vec![BASE64.encode(TEST_REMOTE_ROOT_DER.as_slice())],
             jwt_authorities: Vec::new(),
             refresh_hint_seconds: None,
         }],
     }
+}
+
+static TEST_LOCAL_ROOT_DER: LazyLock<Vec<u8>> =
+    LazyLock::new(|| test_root_ca_der("cp-dp-local-root"));
+static TEST_REMOTE_ROOT_DER: LazyLock<Vec<u8>> =
+    LazyLock::new(|| test_root_ca_der("cp-dp-remote-root"));
+
+fn test_root_ca_der(common_name: &str) -> Vec<u8> {
+    let key = rcgen::KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256)
+        .expect("test CA key generates");
+    let mut params =
+        rcgen::CertificateParams::new(Vec::<String>::new()).expect("test CA params build");
+    params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+    params
+        .distinguished_name
+        .push(rcgen::DnType::CommonName, common_name);
+    let cert = params.self_signed(&key).expect("test CA self-signs");
+    cert.der().to_vec()
 }
 
 fn create_test_mesh_config() -> GatewayConfig {
@@ -606,7 +628,10 @@ async fn test_dp_stores_gateway_trust_bundles_from_initial_snapshot() {
     let loaded = proxy_state.gateway_trust_bundles.load_full();
     let trust_bundles = loaded.as_ref().as_ref().expect("trust bundles stored");
     assert_eq!(trust_bundles.local.trust_domain.as_str(), "cluster.local");
-    assert_eq!(trust_bundles.local.x509_authorities, vec![vec![1, 2, 3, 4]]);
+    assert_eq!(
+        trust_bundles.local.x509_authorities,
+        vec![(*TEST_LOCAL_ROOT_DER).clone()]
+    );
     assert_eq!(trust_bundles.federated.len(), 1);
     assert!(
         proxy_state.config.load().trust_bundles.is_none(),
@@ -666,29 +691,117 @@ async fn test_dp_stores_gateway_trust_bundles_from_delta_side_channel() {
         &update_tx,
         &delta,
         &version,
-        Some(&trust_bundles),
+        GatewayTrustPublication::Replace(&trust_bundles),
     );
 
-    let received_trust = timeout(Duration::from_secs(5), async {
-        loop {
-            let loaded = proxy_state.gateway_trust_bundles.load();
-            if loaded
-                .as_ref()
-                .as_ref()
-                .is_some_and(|tb| tb.local.x509_authorities == vec![vec![1, 2, 3, 4]])
-            {
-                break;
+    let received_trust =
+        timeout(Duration::from_secs(5), async {
+            loop {
+                let loaded = proxy_state.gateway_trust_bundles.load();
+                if loaded.as_ref().as_ref().is_some_and(|tb| {
+                    tb.local.x509_authorities == vec![(*TEST_LOCAL_ROOT_DER).clone()]
+                }) {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
             }
-            tokio::time::sleep(Duration::from_millis(50)).await;
-        }
-    })
-    .await;
+        })
+        .await;
     assert!(
         received_trust.is_ok(),
         "DP should apply gateway trust bundles from delta side-channel"
     );
 
     client_handle.abort();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn invalid_trust_delta_terminates_without_mutating_last_known_good_generation() {
+    let mut cp_config = create_test_config(1);
+    cp_config.trust_bundles = Some(Box::new(create_test_trust_bundles()));
+    let (addr, update_tx, _server_handle) = start_test_cp_server(cp_config).await;
+
+    let proxy_state = create_test_proxy_state();
+    let cp_url = format!("http://127.0.0.1:{}", addr.port());
+    let ps = proxy_state.clone();
+    let client_handle = tokio::spawn(async move {
+        dp_client::connect_and_subscribe(
+            &cp_url,
+            &test_secret(),
+            "invalid-trust-delta-node",
+            &ps,
+            None,
+            "ferrum",
+        )
+        .await
+    });
+
+    timeout(Duration::from_secs(5), async {
+        loop {
+            if proxy_state.config.load().proxies.len() == 1
+                && proxy_state.gateway_trust_bundles.load().is_some()
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("initial config and trust should become live");
+
+    let config_before = proxy_state.config.load_full();
+    let trust_before = proxy_state.gateway_trust_bundles.load_full();
+    let epoch_before = proxy_state.request_epoch.load();
+    let delta = IncrementalResult {
+        added_or_modified_proxies: vec![create_test_proxy("must-not-apply", "/rejected")],
+        removed_proxy_ids: vec![],
+        added_or_modified_consumers: vec![],
+        removed_consumer_ids: vec![],
+        added_or_modified_plugin_configs: vec![],
+        removed_plugin_config_ids: vec![],
+        added_or_modified_upstreams: vec![],
+        removed_upstream_ids: vec![],
+        sequence_cursor: 0,
+        poll_timestamp: Utc::now(),
+    };
+    let invalid_trust = TrustBundleSet {
+        local: TrustBundle {
+            trust_domain: TrustDomain::new("cluster.local").unwrap(),
+            x509_authorities: vec![BASE64.encode(b"base64-valid-but-not-x509")],
+            jwt_authorities: Vec::new(),
+            refresh_hint_seconds: None,
+        },
+        federated: Vec::new(),
+    };
+    let update = ferrum_edge::grpc::proto::ConfigUpdate {
+        update_type: 1,
+        config_json: serde_json::to_string(&delta).expect("delta serializes"),
+        version: delta.poll_timestamp.to_rfc3339(),
+        timestamp: Utc::now().timestamp(),
+        ferrum_version: ferrum_edge::FERRUM_VERSION.to_string(),
+        trust_bundles_json: serde_json::to_string(&invalid_trust)
+            .expect("invalid trust fixture serializes"),
+        heartbeat: false,
+        heartbeat_negotiated: false,
+    };
+    update_tx.send(update).expect("test subscriber is live");
+
+    timeout(Duration::from_secs(5), client_handle)
+        .await
+        .expect("invalid trust should terminate the subscription")
+        .expect("client task should join")
+        .expect("invalid trust uses the bounded resync disposition");
+
+    assert!(Arc::ptr_eq(&proxy_state.config.load_full(), &config_before));
+    assert!(Arc::ptr_eq(
+        &proxy_state.gateway_trust_bundles.load_full(),
+        &trust_before
+    ));
+    assert!(Arc::ptr_eq(
+        &proxy_state.request_epoch.load(),
+        &epoch_before
+    ));
+    assert_eq!(proxy_state.config.load().proxies.len(), 1);
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -753,7 +866,7 @@ async fn test_dp_rejects_gateway_trust_bundles_from_rejected_delta() {
         &update_tx,
         &delta,
         &version,
-        Some(&trust_bundles),
+        GatewayTrustPublication::Replace(&trust_bundles),
     );
 
     // The CP fixes only the bad member in a later delta. Because the original
@@ -4747,7 +4860,7 @@ async fn dp_blackholed_configsync_stream_fails_over_to_fallback_cp() {
 #[tokio::test(flavor = "multi_thread")]
 async fn dp_snapshot_apply_is_never_detached_by_a_lifecycle_select_arm() {
     // Issue #2969 acceptance: a slow/in-flight FULL_SNAPSHOT apply must not be
-    // detachable by a lifecycle select! arm. `update_config_off_thread` is a
+    // detachable by a lifecycle select! arm. `update_config_off_thread_with_gateway_trust` is a
     // `spawn_blocking`, so cancelling the await would leave the swap running
     // detached and able to land after the DP has moved on — silently
     // overwriting a newer snapshot with an older one.

@@ -26,8 +26,9 @@
 //! The *runtime* half of this row (a real CP in a kind cluster serving the
 //! K8s-built mesh model over MeshSubscribe to a sidecar DP whose captured
 //! inbound datapath then serves traffic) is live-gated by
-//! `sidecar.config.native_subscribe_delivered` in the `mesh-e2e-sidecar`
-//! suite (issue #2002).
+//! `sidecar.config.native_subscribe_delivered` plus the mTLS/JWT/SAN
+//! negatives and projected-Secret rotation assertions in the
+//! `mesh-e2e-sidecar` suite (issues #2002 / #3855).
 
 use std::collections::HashMap;
 
@@ -131,7 +132,7 @@ fn namespace_scoped_slice_snapshot_build() {
                  serves snapshots and broadcasts from — admits only the subscriber namespace's \
                  workloads/services for a plain sidecar request; a meshless config yields an \
                  empty versioned slice. Live-gated via \
-                 sidecar.config.native_subscribe_delivered in mesh-e2e-sidecar.",
+                 sidecar.config.native_subscribe_* in mesh-e2e-sidecar.",
     );
 
     let config = gateway_config_with_mesh(two_namespace_mesh("ferrum", "other"));
@@ -194,7 +195,7 @@ fn subscribe_update_dedupe_ignores_version_stamp() {
         notes = "MeshSlice::content_eq ignores the transport version stamp (loaded_at) so \
                  no-op broadcasts are suppressed, and detects workload/service content \
                  changes so real model updates always push. Live-gated via \
-                 sidecar.config.native_subscribe_delivered in mesh-e2e-sidecar.",
+                 sidecar.config.native_subscribe_* in mesh-e2e-sidecar.",
     );
 
     let mut config_a = gateway_config_with_mesh(two_namespace_mesh("ferrum", "other"));
@@ -295,7 +296,7 @@ fn native_slice_apply_and_malformed_update_fail_closed() {
                  ferrum_version) and only then installs the parsed MeshSlice into \
                  MeshRuntimeState (same install_slice as the file source); malformed, empty, \
                  or unbound payloads return Err and retain the last accepted slice. \
-                 Live-gated via sidecar.config.native_subscribe_delivered in mesh-e2e-sidecar.",
+                 Live-gated via sidecar.config.native_subscribe_* in mesh-e2e-sidecar.",
     );
 
     let consumer = capp_consumer("ferrum");

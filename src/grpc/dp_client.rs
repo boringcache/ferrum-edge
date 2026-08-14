@@ -61,7 +61,7 @@ use crate::config::db_loader::IncrementalResult;
 use crate::config::types::GatewayConfig;
 use crate::identity::TrustBundleSet as RuntimeTrustBundleSet;
 use crate::modes::mesh::config::TrustBundleSet as ConfigTrustBundleSet;
-use crate::proxy::{ConfigApplyOutcome, ProxyState};
+use crate::proxy::{ConfigApplyOutcome, GatewayTrustCommit, ProxyState};
 use crate::tls::multi_cert::{GatewayCertificateInput, load_gateway_multi_cert_tls_config};
 use crate::tls::source::{CertSource, MaterialKind, load_material_blocking};
 use crate::util::backoff::jittered_backoff;
@@ -809,6 +809,7 @@ pub async fn start_dp_client_with_stream_timings(
             frontend_tls_restore_slot.clone(),
             shutdown_rx.clone(),
             tls_reload.as_ref().map(|reload| reload.revision_rx.clone()),
+            last_tls_revision,
             if is_fallback { primary_retry_secs } else { 0 },
             &mut snapshot_authority,
             divergence_metrics.as_ref(),
@@ -1000,7 +1001,10 @@ pub async fn start_dp_client_with_stream_timings(
                         info!("DP client shutting down");
                         return;
                     }
-                    _ = wait_optional_tls_reload(tls_reload.as_ref().map(|reload| reload.revision_rx.clone())) => {
+                    _ = wait_optional_tls_reload(
+                        tls_reload.as_ref().map(|reload| reload.revision_rx.clone()),
+                        last_tls_revision,
+                    ) => {
                         // TLS material rotated mid-backoff: reconnect immediately
                         // with the new material (rebuilt at the top of the loop),
                         // but PRESERVE accumulated failure backoff. No connection
@@ -1027,7 +1031,10 @@ pub async fn start_dp_client_with_stream_timings(
         } else {
             tokio::select! {
                 _ = tokio::time::sleep(sleep_duration) => {}
-                _ = wait_optional_tls_reload(tls_reload.as_ref().map(|reload| reload.revision_rx.clone())) => {
+                _ = wait_optional_tls_reload(
+                    tls_reload.as_ref().map(|reload| reload.revision_rx.clone()),
+                    last_tls_revision,
+                ) => {
                     // Same as the shutdown-aware arm above: reconnect immediately
                     // with rotated TLS material while preserving accumulated
                     // failure backoff. A TLS source flap is not healthy progress
@@ -1111,14 +1118,34 @@ async fn wait_for_readiness_then_primary_retry(
     tokio::time::sleep(Duration::from_secs(primary_retry_secs)).await;
 }
 
-async fn wait_optional_tls_reload(mut revision_rx: Option<watch::Receiver<u64>>) {
-    let changed = if let Some(revision_rx) = revision_rx.as_mut() {
-        revision_rx.changed().await.is_ok()
-    } else {
-        false
-    };
-    if !changed {
+/// Wait until the TLS reload watch publishes a generation other than `last_revision`.
+///
+/// Native MeshSubscribe, xDS ADS, and ConfigSync clients rebuild to the accepted
+/// generation, then arm this future before the next connect. A fresh
+/// `watch::Receiver` clone is immediately `changed()` after a send when the
+/// stored receiver was only `borrow()`ed, so this future compares the current
+/// generation against `last_revision` instead of waiting on an unmarked clone.
+/// `borrow_and_update()` then `changed()` avoids a lost wakeup between the
+/// generation check and parking.
+///
+/// `None` parks forever so an unconfigured TLS reload cannot fire. A dropped
+/// sender also parks once the last published generation has been accepted, so
+/// a dead watch cannot spin the reconnect loop.
+pub async fn wait_optional_tls_reload(
+    revision_rx: Option<watch::Receiver<u64>>,
+    last_revision: u64,
+) {
+    let Some(mut revision_rx) = revision_rx else {
         std::future::pending::<()>().await;
+        return;
+    };
+    loop {
+        if *revision_rx.borrow_and_update() != last_revision {
+            return;
+        }
+        if revision_rx.changed().await.is_err() {
+            std::future::pending::<()>().await;
+        }
     }
 }
 
@@ -1265,54 +1292,62 @@ enum GatewayTrustBundleUpdate {
     Clear,
 }
 
-fn validate_gateway_trust_bundles(
-    trust_bundles: &ConfigTrustBundleSet,
-    source: &str,
-) -> Result<(), String> {
-    let errors = crate::modes::mesh::config::validate_mesh_config(
-        &[],
-        &[],
-        &[],
-        &[],
-        &[],
-        &[],
-        Some(trust_bundles),
-    );
-    if errors.is_empty() {
-        Ok(())
-    } else {
-        Err(format!(
-            "gateway trust bundles {source} failed validation: {}",
-            errors.join("; ")
-        ))
-    }
+fn validate_gateway_trust_bundles(trust_bundles: &ConfigTrustBundleSet) -> Result<(), String> {
+    crate::config::gateway_trust::validate_trust_bundle_set(trust_bundles)
+        .map_err(|_| "gateway trust bundles side-channel failed validation".to_string())
 }
 
 fn convert_gateway_trust_bundles(
     trust_bundles: ConfigTrustBundleSet,
-    source: &str,
 ) -> Result<RuntimeTrustBundleSet, String> {
-    validate_gateway_trust_bundles(&trust_bundles, source)?;
+    validate_gateway_trust_bundles(&trust_bundles)?;
     trust_bundles
         .to_runtime()
-        .map_err(|e| format!("gateway trust bundles {source} contains invalid trust material: {e}"))
+        .map_err(|_| "gateway trust bundles side-channel failed runtime conversion".to_string())
 }
 
 fn parse_gateway_trust_bundle_update(
     trust_bundles_json: &str,
 ) -> Result<GatewayTrustBundleUpdate, String> {
+    if trust_bundles_json.len() > crate::config::gateway_trust::MAX_TRUST_BUNDLE_JSON_BYTES {
+        return Err("gateway trust bundles side-channel exceeds the wire limit".to_string());
+    }
     let trust_bundles_json = trust_bundles_json.trim();
     if !trust_bundles_json.is_empty() {
         let trust_bundles: Option<ConfigTrustBundleSet> = serde_json::from_str(trust_bundles_json)
-            .map_err(|e| format!("gateway trust bundles side-channel is not valid JSON: {e}"))?;
+            .map_err(|_| "gateway trust bundles side-channel is not valid JSON".to_string())?;
         return match trust_bundles {
-            Some(trust_bundles) => convert_gateway_trust_bundles(trust_bundles, "side-channel")
-                .map(GatewayTrustBundleUpdate::Replace),
+            Some(trust_bundles) => {
+                convert_gateway_trust_bundles(trust_bundles).map(GatewayTrustBundleUpdate::Replace)
+            }
             None => Ok(GatewayTrustBundleUpdate::Clear),
         };
     }
 
     Ok(GatewayTrustBundleUpdate::Unchanged)
+}
+
+/// External-test seam for [`parse_gateway_trust_bundle_update`] (issue #3727).
+///
+/// The parser and its `GatewayTrustBundleUpdate` result are private to this
+/// module and stay that way: the enum carries runtime trust material, and
+/// widening it would make a wire-decoding internal part of the library API. The
+/// wire contract external suites need to pin is the CLASSIFICATION plus the
+/// exact refusal string, so this projects the decision onto a fixed
+/// `"unchanged"` / `"clear"` / `"replace"` label and forwards the error
+/// verbatim. Nothing here relaxes a bound — it is the production parser.
+///
+/// Reached only from `tests/`; the `ferrum-edge` bin target compiles this
+/// module without any such caller.
+#[allow(dead_code)]
+pub fn classify_gateway_trust_side_channel_for_test(
+    trust_bundles_json: &str,
+) -> Result<&'static str, String> {
+    parse_gateway_trust_bundle_update(trust_bundles_json).map(|update| match update {
+        GatewayTrustBundleUpdate::Unchanged => "unchanged",
+        GatewayTrustBundleUpdate::Clear => "clear",
+        GatewayTrustBundleUpdate::Replace(_) => "replace",
+    })
 }
 
 /// Map an accepted trust side-channel update onto the bounded equivalence view.
@@ -1334,27 +1369,28 @@ fn gateway_trust_equivalence_after_update(
     }
 }
 
-fn apply_gateway_trust_bundle_update(
-    proxy_state: &ProxyState,
-    update: GatewayTrustBundleUpdate,
-) -> bool {
+/// Project an accepted side-channel decision onto the runtime commit the config
+/// publication carries with it (issue #3727).
+///
+/// The DP used to apply the configuration and then the trust, which left the
+/// accepted snapshot live beside the CP trust roots it replaced. Handing the
+/// decision to the publication instead makes both halves one generation:
+/// `Unchanged` changes nothing, and `Replace`/`Clear` are installed inside the
+/// publication's own fence.
+fn gateway_trust_commit_for(update: GatewayTrustBundleUpdate) -> GatewayTrustCommit {
     match update {
-        GatewayTrustBundleUpdate::Unchanged => false,
+        GatewayTrustBundleUpdate::Unchanged => GatewayTrustCommit::Unchanged,
         GatewayTrustBundleUpdate::Replace(trust_bundles) => {
-            let trust_domain = trust_bundles.local.trust_domain.clone();
-            let federated_count = trust_bundles.federated.len();
-            proxy_state.update_gateway_trust_bundles(trust_bundles);
             info!(
-                %trust_domain,
-                federated_count,
-                "Updated gateway SPIFFE trust bundles from CP"
+                trust_domain = %trust_bundles.local.trust_domain,
+                federated_count = trust_bundles.federated.len(),
+                "Staged gateway SPIFFE trust bundles from CP for the accepted generation"
             );
-            true
+            GatewayTrustCommit::Replace(trust_bundles)
         }
         GatewayTrustBundleUpdate::Clear => {
-            proxy_state.clear_gateway_trust_bundles();
-            info!("Cleared CP-delivered gateway SPIFFE trust bundles");
-            true
+            info!("Staged clear of CP-delivered gateway SPIFFE trust bundles");
+            GatewayTrustCommit::Clear
         }
     }
 }
@@ -1590,6 +1626,7 @@ pub async fn connect_and_subscribe(
         None,
         None,
         0,
+        0,
         &mut authority,
         &ConfigSyncDivergenceMetrics::default(),
         Arc::new(Notify::new()),
@@ -1646,6 +1683,7 @@ pub async fn connect_and_subscribe_with_startup_ready(
         None,
         None,
         0,
+        0,
         &mut authority,
         &ConfigSyncDivergenceMetrics::default(),
         Arc::new(Notify::new()),
@@ -1693,6 +1731,7 @@ async fn connect_and_subscribe_with_startup_ready_inner(
     frontend_tls_restore_slot: Arc<ArcSwap<Option<Arc<rustls::ServerConfig>>>>,
     shutdown_rx: Option<tokio::sync::watch::Receiver<bool>>,
     tls_revision_rx: Option<watch::Receiver<u64>>,
+    last_tls_revision: u64,
     primary_retry_secs: u64,
     snapshot_authority: &mut Option<AppliedSnapshotAuthority>,
     divergence_metrics: &ConfigSyncDivergenceMetrics,
@@ -1811,7 +1850,7 @@ async fn connect_and_subscribe_with_startup_ready_inner(
     let enable_primary_retry = primary_retry_secs > 0;
     let shutdown_fut = wait_optional_shutdown(shutdown_rx.clone());
     tokio::pin!(shutdown_fut);
-    let tls_reload_fut = wait_optional_tls_reload(tls_revision_rx.clone());
+    let tls_reload_fut = wait_optional_tls_reload(tls_revision_rx.clone(), last_tls_revision);
     tokio::pin!(tls_reload_fut);
 
     // Mark connected while preserving last applied-config age and sticky
@@ -2173,7 +2212,21 @@ async fn connect_and_subscribe_with_startup_ready_inner(
                 // Await apply to completion before returning to the
                 // select! above so primary-retry / TLS / shutdown arms
                 // cannot cancel a detached spawn_blocking mid-apply.
-                match proxy_state.update_config_off_thread(config).await {
+                //
+                // The CP trust side channel rides WITH the snapshot rather than
+                // after it: applying the configuration first would publish the
+                // accepted snapshot beside the previous CP trust roots, so a
+                // request could pair the new configuration with a root this
+                // very update revoked (issue #3727). A rejected apply returns
+                // before the publication, so the trust decision is discarded
+                // with it and the previous complete generation stays live.
+                let next_trust =
+                    gateway_trust_equivalence_after_update(&gateway_trust_bundle_update);
+                let gateway_trust_commit = gateway_trust_commit_for(gateway_trust_bundle_update);
+                match proxy_state
+                    .update_config_off_thread_with_gateway_trust(config, gateway_trust_commit)
+                    .await
+                {
                     ConfigApplyOutcome::Applied | ConfigApplyOutcome::Unchanged => {
                         commit_frontend_tls_snapshot(
                             frontend_tls_update,
@@ -2183,9 +2236,6 @@ async fn connect_and_subscribe_with_startup_ready_inner(
                             cp_frontend_tls_materialized.as_ref(),
                         )
                         .await;
-                        let next_trust =
-                            gateway_trust_equivalence_after_update(&gateway_trust_bundle_update);
-                        apply_gateway_trust_bundle_update(proxy_state, gateway_trust_bundle_update);
                         update_state_config_received(connection_state);
                         received_config = true;
                         // Watermark is the monotonic value from fencing policy
@@ -2420,15 +2470,28 @@ async fn connect_and_subscribe_with_startup_ready_inner(
                         let cp_version = update.ferrum_version.clone();
                         let update_version = update.version;
 
-                        match proxy_state.apply_incremental(result).await {
+                        // Same one-generation rule as FULL_SNAPSHOT: the trust
+                        // decision is committed inside the resource delta's own
+                        // publication fence, never as a second apply afterwards
+                        // (issue #3727). `trust_applied` reproduces exactly what
+                        // the previous standalone apply returned, so the
+                        // trust-only acceptance branch below is unchanged.
+                        let next_trust =
+                            gateway_trust_equivalence_after_update(&gateway_trust_bundle_update);
+                        let trust_applied = !matches!(
+                            &gateway_trust_bundle_update,
+                            GatewayTrustBundleUpdate::Unchanged
+                        );
+                        let gateway_trust_commit =
+                            gateway_trust_commit_for(gateway_trust_bundle_update);
+                        match proxy_state
+                            .apply_incremental_with_gateway_trust(
+                                result,
+                                Some(gateway_trust_commit),
+                            )
+                            .await
+                        {
                             ConfigApplyOutcome::Applied => {
-                                let next_trust = gateway_trust_equivalence_after_update(
-                                    &gateway_trust_bundle_update,
-                                );
-                                apply_gateway_trust_bundle_update(
-                                    proxy_state,
-                                    gateway_trust_bundle_update,
-                                );
                                 if let Some(trust) = next_trust {
                                     record_applied_gateway_trust(snapshot_authority, trust);
                                 }
@@ -2448,13 +2511,7 @@ async fn connect_and_subscribe_with_startup_ready_inner(
                                 info!("Incremental config delta applied from CP");
                             }
                             ConfigApplyOutcome::Unchanged => {
-                                let next_trust = gateway_trust_equivalence_after_update(
-                                    &gateway_trust_bundle_update,
-                                );
-                                if apply_gateway_trust_bundle_update(
-                                    proxy_state,
-                                    gateway_trust_bundle_update,
-                                ) {
+                                if trust_applied {
                                     if let Some(trust) = next_trust {
                                         // Keep identical-fallback equivalence in
                                         // sync after accepted trust-only updates.
@@ -2503,8 +2560,11 @@ async fn connect_and_subscribe_with_startup_ready_inner(
                             ConfigApplyOutcome::Rejected { errors } => {
                                 // Rejected resource deltas must not advance
                                 // freshness authority or last_config_received_at.
-                                // Do not apply trust from a rejected resource batch.
-                                let _ = gateway_trust_bundle_update;
+                                // Trust from a rejected resource batch is
+                                // discarded by construction now: the decision
+                                // was handed to the publication, which returns
+                                // before committing anything when the apply is
+                                // rejected (issue #3727).
                                 // Admitted then failed to apply, empty body or
                                 // not: this is `snapshot_apply_failed`, never a
                                 // refused-before-apply rejection (#3726).
@@ -2912,10 +2972,9 @@ mod tests {
         let err = parse_gateway_trust_bundle_update(&json)
             .expect_err("empty authority bundle should be rejected");
 
-        assert!(err.contains("failed validation"), "unexpected error: {err}");
-        assert!(
-            err.contains("has no authorities"),
-            "unexpected error: {err}"
+        assert_eq!(
+            err, "gateway trust bundles side-channel failed validation",
+            "wire diagnostics must stay bounded and material-free"
         );
     }
 
@@ -2999,6 +3058,7 @@ mod tests {
             http_tls_listen_ports: Default::default(),
             mesh_revision: None,
             k8s_mesh_overlay: Default::default(),
+            gateway_trust_bundles: Vec::new(),
         };
 
         let filtered = filter_config_to_namespace(&mut cfg, "production");
@@ -3041,6 +3101,7 @@ mod tests {
             .collect(),
             mesh_revision: None,
             k8s_mesh_overlay: Default::default(),
+            gateway_trust_bundles: Vec::new(),
         };
 
         assert_eq!(
@@ -3075,6 +3136,7 @@ mod tests {
             http_tls_listen_ports: Default::default(),
             mesh_revision: None,
             k8s_mesh_overlay: Default::default(),
+            gateway_trust_bundles: Vec::new(),
         };
         assert_eq!(filter_config_to_namespace(&mut cfg, "production"), 0);
         assert_eq!(cfg.proxies.len(), 1);

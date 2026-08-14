@@ -168,6 +168,7 @@ fn udp_service(name: &str, port: u16) -> K8sObject {
 }
 
 /// One Gateway listener plus the `UDPRoute` attached to it.
+#[derive(Clone)]
 struct RouteSpec {
     gateway: &'static str,
     section: &'static str,
@@ -210,6 +211,7 @@ struct LabSnapshot {
     services: Vec<(String, u16)>,
     /// One entry per Gateway listener; index N takes reserved port N.
     routes: Vec<RouteSpec>,
+    extra_objects: Vec<K8sObject>,
 }
 
 impl LabSnapshot {
@@ -223,6 +225,7 @@ impl LabSnapshot {
             objects.push(udp_gateway_object(route, port));
             objects.push(udp_route_object(route));
         }
+        objects.extend(self.extra_objects.clone());
         objects
     }
 }
@@ -390,6 +393,7 @@ async fn try_serve_translated_config(
             udp_gso_enabled: false,
             udp_pktinfo_enabled: false,
             mesh_outbound_enforcement: empty_slot(),
+            datagram_client_address: None,
         };
         let join = tokio::spawn(async move {
             let _ = start_udp_listener(cfg).await;
@@ -488,6 +492,7 @@ async fn translated_udp_route_carries_a_datagram_to_its_declared_backend() {
             route: "dns",
             backend_refs: json!([{"name": service.as_str(), "port": backend_port}]),
         }],
+        extra_objects: Vec::new(),
     };
 
     let overrides = dns_overrides(&[&backend]);
@@ -499,6 +504,11 @@ async fn translated_udp_route_carries_a_datagram_to_its_declared_backend() {
     assert_eq!(proxy.backend_host, backend.dns_name());
     assert_eq!(proxy.backend_port, backend_port);
     assert_eq!(proxy.upstream_id, None);
+    assert_eq!(
+        proxy.udp_max_response_amplification_factor,
+        Some(8.0),
+        "Gateway API UDPRoute must never program an unlimited amplification relay"
+    );
 
     let client = UdpSocket::bind("127.0.0.1:0").await.expect("client bind");
     let reply = round_trip(&client, lab.gateway_addr(0), b"gwapi-udp").await;
@@ -537,6 +547,7 @@ async fn each_translated_udp_route_reaches_only_its_own_declared_backend() {
                 backend_refs: json!([{"name": beta_service.as_str(), "port": beta_port}]),
             },
         ],
+        extra_objects: Vec::new(),
     };
 
     let overrides = dns_overrides(&[&alpha, &beta]);
@@ -583,6 +594,7 @@ async fn translated_weighted_udp_route_serves_each_session_from_one_leg() {
             route: "split",
             backend_refs: legs,
         }],
+        extra_objects: Vec::new(),
     };
 
     let overrides = dns_overrides(&[&alpha, &beta]);
@@ -648,6 +660,7 @@ async fn translated_udp_route_with_an_unresolved_backend_drops_the_datagram() {
             route: "absent",
             backend_refs: json!([{"name": "udp-echo-absent", "port": 5353}]),
         }],
+        extra_objects: Vec::new(),
     };
 
     let overrides = dns_overrides(&[&observed]);
@@ -662,4 +675,198 @@ async fn translated_udp_route_with_an_unresolved_backend_drops_the_datagram() {
     expect_no_reply(&client, lab.gateway_addr(0), b"dropped").await;
 
     lab.shutdown().await;
+}
+
+/// A backend that replies `count` times with a fixed payload for every request.
+/// Used to prove cumulative multi-datagram amplification accounting.
+struct BurstBackend {
+    port: u16,
+    _join: tokio::task::JoinHandle<()>,
+}
+
+impl BurstBackend {
+    async fn start(payload: Vec<u8>, count: usize) -> Self {
+        let socket = UdpSocket::bind("127.0.0.1:0").await.expect("backend bind");
+        let port = socket.local_addr().expect("backend addr").port();
+        let join = tokio::spawn(async move {
+            let mut buf = vec![0u8; 65535];
+            loop {
+                match socket.recv_from(&mut buf).await {
+                    Ok((_, peer)) => {
+                        for _ in 0..count {
+                            let _ = socket.send_to(&payload, peer).await;
+                        }
+                    }
+                    Err(_) => return,
+                }
+            }
+        });
+        Self { port, _join: join }
+    }
+
+    fn service() -> String {
+        "udp-burst".to_string()
+    }
+
+    fn dns_name() -> String {
+        format!("{}.{ROUTE_NS}.svc.{CLUSTER_DOMAIN}", Self::service())
+    }
+}
+
+fn amp_policy(route: &str, factor: f64) -> K8sObject {
+    object(
+        "UDPResponseAmplificationPolicy",
+        "gateway.ferrum.io/v1alpha1",
+        ROUTE_NS,
+        "tight",
+        json!({
+            "targetRefs": [{
+                "group": "gateway.networking.k8s.io",
+                "kind": "UDPRoute",
+                "name": route
+            }],
+            "mode": "Finite",
+            "maxResponseAmplificationFactor": factor
+        }),
+    )
+}
+
+async fn recv_n(client: &UdpSocket, max: usize, window: Duration) -> Vec<Vec<u8>> {
+    let mut out = Vec::new();
+    let deadline = Instant::now() + window;
+    let mut buf = vec![0u8; 65535];
+    while out.len() < max {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            break;
+        }
+        match tokio::time::timeout(remaining, client.recv_from(&mut buf)).await {
+            Ok(Ok((n, _))) => out.push(buf[..n].to_vec()),
+            _ => break,
+        }
+    }
+    out
+}
+
+#[tokio::test]
+async fn default_factor_drops_a_single_over_budget_reply() {
+    let backend = BurstBackend::start(vec![b'x'; 900], 1).await;
+    let service = BurstBackend::service();
+    let snapshot = LabSnapshot {
+        services: vec![(service.clone(), backend.port)],
+        routes: vec![RouteSpec {
+            gateway: "edge",
+            section: "dns",
+            route: "dns",
+            backend_refs: json!([{"name": service.as_str(), "port": backend.port}]),
+        }],
+        extra_objects: Vec::new(),
+    };
+    let mut overrides = HashMap::new();
+    overrides.insert(BurstBackend::dns_name(), "127.0.0.1".to_string());
+    let lab = start_translated_udp_lab(&snapshot, overrides).await;
+    assert_eq!(
+        lab.sole_udp_proxy().udp_max_response_amplification_factor,
+        Some(8.0)
+    );
+
+    let client = UdpSocket::bind("127.0.0.1:0").await.expect("client bind");
+    let request = vec![b'r'; 100];
+    client
+        .send_to(&request, lab.gateway_addr(0))
+        .await
+        .expect("send");
+    let replies = recv_n(&client, 4, NO_REPLY_WINDOW).await;
+    assert!(
+        replies.is_empty(),
+        "900-byte reply must exceed the default 800-byte budget"
+    );
+    lab.shutdown().await;
+}
+
+#[tokio::test]
+async fn cumulative_multi_datagram_replies_share_one_request_budget() {
+    let backend = BurstBackend::start(vec![b'y'; 300], 3).await;
+    let service = BurstBackend::service();
+    let snapshot = LabSnapshot {
+        services: vec![(service.clone(), backend.port)],
+        routes: vec![RouteSpec {
+            gateway: "edge",
+            section: "dns",
+            route: "dns",
+            backend_refs: json!([{"name": service.as_str(), "port": backend.port}]),
+        }],
+        extra_objects: Vec::new(),
+    };
+    let mut overrides = HashMap::new();
+    overrides.insert(BurstBackend::dns_name(), "127.0.0.1".to_string());
+    let lab = start_translated_udp_lab(&snapshot, overrides).await;
+
+    let client = UdpSocket::bind("127.0.0.1:0").await.expect("client bind");
+    let request = vec![b'r'; 100];
+    client
+        .send_to(&request, lab.gateway_addr(0))
+        .await
+        .expect("send");
+    // Each 300-byte reply is under the 800-byte per-datagram product; the
+    // third must still drop once 600 bytes have been charged.
+    let replies = recv_n(&client, 4, REPLY_TIMEOUT).await;
+    assert_eq!(replies.len(), 2, "third 300-byte reply must be dropped");
+    assert!(replies.iter().all(|reply| reply.len() == 300));
+    lab.shutdown().await;
+}
+
+#[tokio::test]
+async fn route_policy_tightens_then_delete_restores_default() {
+    let backend = BurstBackend::start(vec![b'z'; 200], 1).await;
+    let service = BurstBackend::service();
+    let route = RouteSpec {
+        gateway: "edge",
+        section: "dns",
+        route: "dns",
+        backend_refs: json!([{"name": service.as_str(), "port": backend.port}]),
+    };
+    let with_policy = LabSnapshot {
+        services: vec![(service.clone(), backend.port)],
+        routes: vec![route.clone()],
+        extra_objects: vec![amp_policy("dns", 1.0)],
+    };
+    let without_policy = LabSnapshot {
+        services: vec![(service.clone(), backend.port)],
+        routes: vec![route],
+        extra_objects: Vec::new(),
+    };
+    let mut overrides = HashMap::new();
+    overrides.insert(BurstBackend::dns_name(), "127.0.0.1".to_string());
+
+    let tight = start_translated_udp_lab(&with_policy, overrides.clone()).await;
+    assert_eq!(
+        tight.sole_udp_proxy().udp_max_response_amplification_factor,
+        Some(1.0)
+    );
+    let client = UdpSocket::bind("127.0.0.1:0").await.expect("client bind");
+    let request = vec![b'r'; 100];
+    client
+        .send_to(&request, tight.gateway_addr(0))
+        .await
+        .expect("send");
+    let dropped = recv_n(&client, 2, NO_REPLY_WINDOW).await;
+    assert!(dropped.is_empty(), "factor 1 must drop a 200-byte reply");
+    tight.shutdown().await;
+
+    let restored = start_translated_udp_lab(&without_policy, overrides).await;
+    assert_eq!(
+        restored
+            .sole_udp_proxy()
+            .udp_max_response_amplification_factor,
+        Some(8.0)
+    );
+    client
+        .send_to(&request, restored.gateway_addr(0))
+        .await
+        .expect("send");
+    let replies = recv_n(&client, 2, REPLY_TIMEOUT).await;
+    assert_eq!(replies.len(), 1);
+    assert_eq!(replies[0].len(), 200);
+    restored.shutdown().await;
 }

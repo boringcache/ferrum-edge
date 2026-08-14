@@ -540,6 +540,33 @@ pub fn tls_acme_terminal_order_history_from_env() -> Result<usize, String> {
     )
 }
 
+/// Reject a `FERRUM_DATAGRAM_PROXY_PROTOCOL_SECRET` that is too short to be an
+/// HMAC-SHA-256 key (issue #3289).
+///
+/// This key is what makes a datagram client-address envelope trustworthy on a
+/// path where the source address can be spoofed, so a weak value is a startup
+/// error rather than a warning. The value is judged exactly as configured —
+/// never trimmed, because the listener keys itself with those same bytes and a
+/// validator that disagreed with the gate would admit a shorter effective key.
+/// Only an absent or empty value is "not configured".
+///
+/// The diagnostic reports the requirement only — never the configured value,
+/// and never its length, which is a property of the secret itself.
+pub fn validate_datagram_proxy_protocol_secret_value(secret: Option<&str>) -> Result<(), String> {
+    let Some(secret) = secret.filter(|value| !value.is_empty()) else {
+        return Ok(());
+    };
+    if secret.len() < crate::proxy::datagram_client_address::MIN_DATAGRAM_SECRET_BYTES {
+        return Err(format!(
+            "FERRUM_DATAGRAM_PROXY_PROTOCOL_SECRET must be at least {} bytes — it is the \
+             HMAC-SHA-256 key authenticating datagram client-address metadata on udp/dtls \
+             listeners.",
+            crate::proxy::datagram_client_address::MIN_DATAGRAM_SECRET_BYTES
+        ));
+    }
+    Ok(())
+}
+
 fn validate_discovery_body_limits(limits: DiscoveryBodyLimits) -> Result<(), String> {
     if limits.max_response_bytes == 0
         || limits.max_error_bytes == 0
@@ -3064,6 +3091,21 @@ pub struct EnvConfig {
     #[allow(dead_code)]
     pub basic_auth_hmac_secret: Option<String>,
 
+    /// Shared secret authenticating the datagram client-address envelope on
+    /// `udp` / `dtls` listeners that set `stream_proxy_protocol: true`.
+    ///
+    /// When set, every such datagram must carry a valid HMAC-SHA-256 tag over a
+    /// versioned domain-separation prefix naming the exact receiving listener
+    /// plus the complete envelope and payload, **and** an authenticated
+    /// freshness record the receiver checks against a bounded per-sender replay
+    /// window; unauthenticated, cross-listener, duplicate, and stale datagrams
+    /// are dropped. When unset, trust rests on the socket peer being inside
+    /// `FERRUM_TRUSTED_PROXIES` alone — sufficient only on a network path where
+    /// source addresses cannot be spoofed, and with no freshness protection at
+    /// all. Must be at least 32 bytes. Read once at startup: rotating it
+    /// requires a process restart.
+    pub datagram_proxy_protocol_secret: Option<String>,
+
     /// Threshold in milliseconds for logging slow plugin outbound HTTP calls.
     /// When a plugin HTTP request (e.g. http_logging, JWKS fetch,
     /// OIDC discovery, OTLP export) exceeds this duration, a warning is logged.
@@ -3784,6 +3826,7 @@ impl Default for EnvConfig {
             add_forwarded_header: false,
             real_ip_header: None,
             basic_auth_hmac_secret: None,
+            datagram_proxy_protocol_secret: None,
             plugin_http_slow_threshold_ms: 1000,
             plugin_http_max_retries: 0,
             plugin_http_retry_delay_ms: 100,
@@ -4426,6 +4469,7 @@ impl EnvConfig {
             via_pseudonym: String = "FERRUM_VIA_PSEUDONYM" => "ferrum-edge".to_string();
             add_forwarded_header: bool = "FERRUM_ADD_FORWARDED_HEADER" => false;
             basic_auth_hmac_secret: Option<String> = "FERRUM_BASIC_AUTH_HMAC_SECRET";
+            datagram_proxy_protocol_secret: Option<String> = "FERRUM_DATAGRAM_PROXY_PROTOCOL_SECRET";
             plugin_http_slow_threshold_ms: u64 = "FERRUM_PLUGIN_HTTP_SLOW_THRESHOLD_MS" => 1000u64;
             plugin_http_max_retries: u32 = "FERRUM_PLUGIN_HTTP_MAX_RETRIES" => 0u32;
             plugin_http_retry_delay_ms: u64 = "FERRUM_PLUGIN_HTTP_RETRY_DELAY_MS" => 100u64;
@@ -5166,6 +5210,7 @@ impl EnvConfig {
             add_forwarded_header,
             real_ip_header,
             basic_auth_hmac_secret,
+            datagram_proxy_protocol_secret,
             plugin_http_slow_threshold_ms,
             plugin_http_max_retries,
             plugin_http_retry_delay_ms,
@@ -6608,9 +6653,9 @@ impl EnvConfig {
                         );
                     }
                     // (FERRUM_DP_GRPC_TLS_NO_VERIFY is rejected unconditionally by
-                    // validate_cp_dp_grpc_transport_security() — it is not honored
-                    // on the tonic-managed CP/DP gRPC client, so it can never
-                    // silently disable verification under remote discovery either.)
+                    // validate_cp_dp_grpc_transport_security() — it is intentionally
+                    // not honored, so it can never silently disable verification
+                    // under remote discovery either.)
                     if self.mesh_remote_discovery_poll_interval_seconds > 0
                         && self.mesh_remote_discovery_max_stale_seconds == 0
                     {
@@ -7159,7 +7204,18 @@ impl EnvConfig {
         // rather than quietly shrinking the trust set at runtime.
         self.validate_trusted_proxies()?;
 
+        // The datagram client-address envelope's MAC key (issue #3289).
+        self.validate_datagram_proxy_protocol_secret()?;
+
         Ok(())
+    }
+
+    /// Reject a `FERRUM_DATAGRAM_PROXY_PROTOCOL_SECRET` that is too short to be
+    /// an HMAC-SHA-256 key. See
+    /// [`validate_datagram_proxy_protocol_secret_value`].
+    fn validate_datagram_proxy_protocol_secret(&self) -> Result<(), String> {
+        let secret = self.datagram_proxy_protocol_secret.as_deref();
+        validate_datagram_proxy_protocol_secret_value(secret)
     }
 
     /// Reject a `FERRUM_TRUSTED_PROXIES` list that is not entirely valid.
@@ -7486,10 +7542,9 @@ impl EnvConfig {
 
     /// Enforce the secure-by-default CP/DP gRPC transport policy.
     ///
-    /// 1. `FERRUM_DP_GRPC_TLS_NO_VERIFY=true` is rejected outright: the
-    ///    tonic-managed CP/DP gRPC client exposes no hook to skip server
-    ///    verification, so the flag never actually disabled it — keeping it
-    ///    would only grant false confidence. Pin the CP CA via
+    /// 1. `FERRUM_DP_GRPC_TLS_NO_VERIFY=true` is rejected outright because
+    ///    disabling server certificate verification is an unsafe transport mode
+    ///    that Ferrum Edge does not support. Pin the CP CA via
     ///    `FERRUM_DP_GRPC_TLS_CA_CERT_PATH` for self-signed test certs instead.
     /// 2. In CP mode, a plaintext gRPC listener bound to a non-loopback address
     ///    is refused unless `FERRUM_CP_DP_GRPC_ALLOW_PLAINTEXT=true`.
@@ -7503,8 +7558,8 @@ impl EnvConfig {
     fn validate_cp_dp_grpc_transport_security(&self) -> Result<(), String> {
         if self.dp_grpc_tls_no_verify {
             return Err(
-                "FERRUM_DP_GRPC_TLS_NO_VERIFY=true is not supported: the CP/DP gRPC client cannot \
-                 skip server certificate verification, so the flag offers only false confidence. \
+                "FERRUM_DP_GRPC_TLS_NO_VERIFY=true is not supported: disabling server certificate \
+                 verification is unsafe. \
                  To connect to a CP with a self-signed certificate, pin its CA via \
                  FERRUM_DP_GRPC_TLS_CA_CERT_PATH (one-way TLS) or supply the full \
                  FERRUM_DP_GRPC_TLS_CLIENT_CERT_PATH/KEY_PATH (mTLS)."
@@ -7798,8 +7853,8 @@ mod tests {
 
     #[test]
     fn dp_grpc_tls_no_verify_is_rejected() {
-        // The flag is not honored by the tonic-managed client, so it must fail
-        // closed rather than provide false confidence — in any mode.
+        // The unsafe flag is intentionally not honored, so it must fail closed
+        // rather than disable server identity verification — in any mode.
         let config = EnvConfig {
             dp_grpc_tls_no_verify: true,
             ..file_mode_config()

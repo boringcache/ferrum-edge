@@ -230,6 +230,13 @@ jobs:
           GATEWAY_API_VERSION: ${{ steps.inputs.outputs.gateway_api_version }}
         run: bash scripts/gateway_api_listenerset_conformance.sh blackbox
 
+      - name: Run Ferrum GatewayClass authority black-box checks
+        # Proves a listener appears when the owned GatewayClass is created and
+        # withdraws when that class is deleted, without restarting Ferrum.
+        env:
+          GATEWAY_API_VERSION: ${{ steps.inputs.outputs.gateway_api_version }}
+        run: bash scripts/gateway_api_gatewayclass_authority_conformance.sh blackbox
+
       - name: Collect diagnostics
         if: always()
         env:
@@ -249,6 +256,10 @@ jobs:
       - name: Collect ListenerSet diagnostics
         if: always()
         run: bash scripts/gateway_api_listenerset_conformance.sh diagnostics
+
+      - name: Collect GatewayClass authority diagnostics
+        if: always()
+        run: bash scripts/gateway_api_gatewayclass_authority_conformance.sh diagnostics
 
       - name: Upload conformance artifacts
         if: always()
