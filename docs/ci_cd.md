@@ -234,17 +234,23 @@ cold-cache run still proves every live contract within the existing job
 timeouts.
 
 **Production images.** The ordinary `runtime` and distroless `runtime-ebpf`
-targets build in parallel with `docker/build-push-action`, sharing a scoped
-BuildKit GitHub Actions cache (`production-dockerfile-smoke-default` /
-`production-dockerfile-smoke-ebpf`). The Dockerfile declares `ARG FEATURES`
-after the shared apt and manifest layers so those two feature sets reuse
-toolchain work. Trusted same-repository pull requests and `workflow_dispatch`
-restore and publish that cache (`cache-from` + `cache-to`). Fork pull requests
-use a separate restore-only build step (`cache-from` only; no `cache-to`).
-`force_cold_cache` skips both restore and publish. A trusted-base copy of
-`.github/scripts/ci_runtime_plan.py`
-skips the smoke only when the diff cannot change those images; a missing
-planner fails closed toward running.
+targets build in parallel with `docker/build-push-action`. Each job restores a
+scoped local BuildKit cache through pinned `actions/cache/restore`
+(`production-dockerfile-smoke-default-${{ runner.os }}-${{ github.sha }}` /
+`production-dockerfile-smoke-ebpf-${{ runner.os }}-${{ github.sha }}`, with
+matching `${{ runner.os }}-` restore prefixes), then exports `type=local`
+layers. Trusted same-repository pull requests and `workflow_dispatch` save that
+directory with pinned `actions/cache/save` using the same exact keys. Fork pull
+requests restore and must not have a save or cache-publication step.
+`force_cold_cache` skips restore and save. Job summaries record the restore
+action's `cache-hit` / `cache-matched-key` outputs and the measured restored
+directory size; unknown is never rendered as a miss or `0 B`. The Dockerfile
+declares `ARG FEATURES` after the shared apt and manifest layers so those two
+feature sets reuse toolchain work. A trusted-base copy of
+`.github/scripts/ci_runtime_plan.py` reads a NUL-delimited
+`git diff --name-only --no-renames -z` listing and skips the smoke only when
+every decoded path is safe and none can change those images; a missing planner,
+a truncated/undecodable listing, or an unsafe path fails closed toward running.
 
 **FIPS.** `FIPS Feature Policy` stays a cheap always-on graph audit.
 Compile, claimed-profile `cargo check`, clippy `-D warnings`, and the
@@ -258,9 +264,11 @@ reuse compile work. Example plugins stay out of the FIPS artifact
 
 **Trust boundary.** Untrusted `run:` steps never receive GitHub Actions cache
 write credentials. `setup-sccache` keeps the sccache GHA backend disabled and
-does not export the cache-service token into `GITHUB_ENV`. Workflows stay
-`permissions: contents: read`. Static checks live in
-`.github/scripts/verify_ci_runtime_cache.py`.
+does not export the cache-service token into `GITHUB_ENV`. Production-image
+cache restore and save stay inside the pinned `actions/cache/*` actions; PR-
+controlled `run:` steps only measure the restored directory and move the
+BuildKit local export. Workflows stay `permissions: contents: read`. Static
+checks live in `.github/scripts/verify_ci_runtime_cache.py`.
 
 ## CI Pipeline (ci.yml)
 
@@ -586,11 +594,14 @@ eBPF userspace binary with `FEATURES=cloud-secrets,ebpf`, builds the
 image from those cached host-built artifacts instead of recompiling inside
 Docker. A separate production-Dockerfile smoke builds the ordinary `runtime`
 target (which must omit `ip`) and the privileged `runtime-ebpf` target (which
-must contain `ip`) **in parallel** through BuildKit, restoring a scoped GitHub
-Actions layer cache produced by trusted runs. Fork pull requests restore that
-cache and do not publish `cache-to`. Each job then checks a normalized
+must contain `ip`) **in parallel** through BuildKit, restoring a scoped local
+BuildKit cache (`type=local`) via pinned `actions/cache/restore` and measuring
+restored bytes from the restored directory. Trusted runs save that cache with
+pinned `actions/cache/save`; fork pull requests restore-only and do not save.
+Each job then checks a normalized
 filesystem inventory for shells and package managers. A trusted-base path
-planner skips the smoke when the diff cannot change those images; uncertain
+planner reads a NUL-delimited `git diff --name-only --no-renames -z` listing and
+skips the smoke when the diff cannot change those images; uncertain
 classification runs the full gate. It then creates a disposable dual-stack kind cluster with two
 workers, mounts bpffs in each kind node, loads both images into the cluster, and
 installs the Istio policy CRDs. The runner must provide Docker and a Linux kernel

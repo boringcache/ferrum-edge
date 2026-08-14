@@ -232,8 +232,8 @@ jobs:
           git cat-file blob "$entry_object" > "$trusted_filter"
 
           if [ "$EVENT_NAME" = "pull_request" ] || [ "$EVENT_NAME" = "merge_group" ]; then
-            git diff --name-only --no-renames "${trusted_sha}...HEAD" \
-              | sort > "$changed_files"
+            git diff --name-only --no-renames -z "${trusted_sha}...HEAD" \
+              > "$changed_files"
           fi
 
           python3 -I "$trusted_filter" --self-test
@@ -472,17 +472,24 @@ jobs:
             --note "shared-key=ci-fips save-if=non-fork fork=${FORK_PR:-false}"
 
       - name: FIPS policy, key-admission, and handshake tests
-        # One unit_tests invocation and one integration_tests invocation so the
-        # binaries are compiled once. Filters are OR-matched by cargo.
+        # Cargo accepts one TESTNAME filter per invocation. `tls::fips_` selects
+        # tls::fips_policy_tests and tls::fips_key_admission_tests (the only
+        # tls::fips_* unit modules). Handshake coverage is two named tests in
+        # the same integration_tests binary, so the second invocation reuses
+        # the compiled artifact: frontend_and_backend_builders_complete_a_real_tls_handshake
+        # and legitimate_data_plane_connects_once_a_permit_is_released.
         run: |
           set -euo pipefail
           python3 .github/scripts/ci_runtime_telemetry.py run --phase fips-unit-tests -- \
             cargo test --locked --no-default-features --features fips \
-            --test unit_tests tls::fips_policy_tests tls::fips_key_admission_tests
+            --test unit_tests tls::fips_
           python3 .github/scripts/ci_runtime_telemetry.py run --phase fips-handshake-tests -- \
             cargo test --locked --no-default-features --features fips \
             --test integration_tests \
-            integration::cp_grpc_handshake_admission_tests::frontend_and_backend_builders_complete_a_real_tls_handshake \
+            integration::cp_grpc_handshake_admission_tests::frontend_and_backend_builders_complete_a_real_tls_handshake
+          python3 .github/scripts/ci_runtime_telemetry.py run --phase fips-handshake-permit-tests -- \
+            cargo test --locked --no-default-features --features fips \
+            --test integration_tests \
             integration::cp_grpc_handshake_admission_tests::legitimate_data_plane_connects_once_a_permit_is_released
 
       - name: Record sccache stats

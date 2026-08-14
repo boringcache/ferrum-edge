@@ -27,10 +27,24 @@ MAX_PHASES = 64
 
 
 def state_path() -> Path:
-    root = os.environ.get("RUNNER_TEMP") or os.environ.get("CI_RUNTIME_TELEMETRY_DIR")
+    # Explicit override must win over the hosted runner temp so a self-test
+    # (or any isolated invocation) cannot mutate live job state.
+    root = os.environ.get("CI_RUNTIME_TELEMETRY_DIR") or os.environ.get("RUNNER_TEMP")
     if root:
         return Path(root) / "ci-runtime-telemetry.json"
     return Path.cwd() / ".ci-runtime-telemetry.json"
+
+
+def snapshot_env(names: tuple[str, ...]) -> dict[str, str | None]:
+    return {name: os.environ.get(name) for name in names}
+
+
+def restore_env(snapshot: dict[str, str | None]) -> None:
+    for name, value in snapshot.items():
+        if value is None:
+            os.environ.pop(name, None)
+        else:
+            os.environ[name] = value
 
 
 def redact(value: str) -> str:
@@ -156,28 +170,50 @@ def cmd_run(args: argparse.Namespace) -> int:
     return status
 
 
+def parse_cache_hit(raw: str | None) -> bool | None:
+    text = (raw or "").strip().lower()
+    if text in {"true", "yes", "1"}:
+        return True
+    if text in {"false", "no", "0"}:
+        return False
+    if text == "":
+        return None
+    raise SystemExit("invalid cache hit value")
+
+
+def resolve_restored_bytes(hit: bool | None, args: argparse.Namespace) -> int | None:
+    if args.bytes is not None:
+        return int(args.bytes)
+    measured: int | None = None
+    if args.path:
+        cache_path = Path(args.path)
+        if cache_path.exists():
+            measured = directory_size(cache_path)
+    if hit is True:
+        if measured is None:
+            raise SystemExit(
+                "cache hit requires measured restored bytes (--bytes or an "
+                "existing --path); refusing to invent 0 B"
+            )
+        return measured
+    if hit is False:
+        return 0 if measured is None else measured
+    return measured
+
+
 def cmd_cache(args: argparse.Namespace) -> int:
     name = require_name(args.name, "cache name")
     path = state_path()
     data = load_state(path)
-    hit_raw = (args.hit or "").strip().lower()
-    if hit_raw in {"true", "yes", "1"}:
-        hit = True
-    elif hit_raw in {"false", "no", "0", ""}:
-        hit = False
-    else:
-        hit = False
-    restored_bytes = args.bytes
-    if restored_bytes is None and args.path:
-        cache_path = Path(args.path)
-        restored_bytes = directory_size(cache_path) if cache_path.exists() else 0
+    hit = parse_cache_hit(args.hit)
+    restored_bytes = resolve_restored_bytes(hit, args)
     if len(data["caches"]) >= MAX_PHASES:
         raise SystemExit("too many telemetry cache rows")
     data["caches"].append(
         {
             "name": name,
             "hit": hit,
-            "restored_bytes": int(restored_bytes or 0),
+            "restored_bytes": restored_bytes,
             "note": redact(args.note or ""),
         }
     )
@@ -252,8 +288,19 @@ def cmd_summarize(args: argparse.Namespace) -> int:
         lines.append("| Cache | Hit | Restored | Notes |")
         lines.append("|---|---|---:|---|")
         for cache in data["caches"]:
-            hit = "hit" if cache.get("hit") else "miss"
-            restored = format_bytes(int(cache.get("restored_bytes") or 0))
+            hit_value = cache.get("hit")
+            if hit_value is True:
+                hit = "hit"
+            elif hit_value is False:
+                hit = "miss"
+            else:
+                hit = "unknown"
+            restored_value = cache.get("restored_bytes")
+            restored = (
+                "unknown"
+                if restored_value is None
+                else format_bytes(int(restored_value))
+            )
             note = redact(str(cache.get("note") or "")) or "—"
             lines.append(
                 f"| `{redact(str(cache.get('name')))}` | {hit} | {restored} | {note} |"
@@ -291,12 +338,38 @@ def self_test() -> int:
         failures.append("ordinary phase names must not be redacted")
     if parse_attempt("3") != 3 or parse_attempt("nope") != 1:
         failures.append("run attempt parsing is wrong")
-    previous = os.environ.get("CI_RUNTIME_TELEMETRY_DIR")
+    if parse_cache_hit("") is not None or parse_cache_hit("true") is not True:
+        failures.append("empty cache hit must stay unknown, not miss")
+    if parse_cache_hit("false") is not False:
+        failures.append("false cache hit must remain a miss")
     import tempfile
 
+    touched = (
+        "CI_RUNTIME_TELEMETRY_DIR",
+        "RUNNER_TEMP",
+        "GITHUB_STEP_SUMMARY",
+        "GITHUB_RUN_ATTEMPT",
+        "GITHUB_EVENT_NAME",
+        "GITHUB_JOB",
+        "FERRUM_CI_FORCE_COLD_CACHE",
+    )
+    previous = snapshot_env(touched)
+
     with tempfile.TemporaryDirectory() as tmp:
-        os.environ["CI_RUNTIME_TELEMETRY_DIR"] = tmp
+        isolated = Path(tmp) / "telemetry"
+        isolated.mkdir()
+        live_runner = Path(tmp) / "live-runner-temp"
+        live_runner.mkdir()
+        live_state = live_runner / "ci-runtime-telemetry.json"
+        live_state.write_text('{"sentinel": true}\n', encoding="utf-8")
+        live_summary = Path(tmp) / "live-summary.md"
+        live_summary.write_text("pre-existing summary\n", encoding="utf-8")
+        os.environ["CI_RUNTIME_TELEMETRY_DIR"] = str(isolated)
+        os.environ["RUNNER_TEMP"] = str(live_runner)
+        os.environ["GITHUB_STEP_SUMMARY"] = str(live_summary)
         try:
+            if state_path() != isolated / "ci-runtime-telemetry.json":
+                failures.append("explicit telemetry dir must beat RUNNER_TEMP")
             if cmd_init(argparse.Namespace(quiet=True)) != 0:
                 failures.append("init failed")
             if cmd_cache(
@@ -309,22 +382,57 @@ def self_test() -> int:
                 )
             ) != 0:
                 failures.append("cache record failed")
-            os.environ["GITHUB_STEP_SUMMARY"] = str(Path(tmp) / "summary.md")
+            if cmd_cache(
+                argparse.Namespace(
+                    name="unknown-cache",
+                    hit="",
+                    bytes=None,
+                    path=None,
+                    note="no evidence",
+                )
+            ) != 0:
+                failures.append("unknown cache record failed")
+            test_summary = isolated / "summary.md"
+            os.environ["GITHUB_STEP_SUMMARY"] = str(test_summary)
             if cmd_summarize(argparse.Namespace(title="Test", quiet=True)) != 0:
                 failures.append("summarize failed")
-            written = Path(tmp).joinpath("summary.md").read_text(encoding="utf-8")
+            written = test_summary.read_text(encoding="utf-8")
             if "ghp_" in written or "Bearer" in written:
                 failures.append("summary leaked a secret")
-            if "rust-cache" not in written or "hit" not in written:
+            if "rust-cache" not in written or "| hit |" not in written:
                 failures.append("summary omitted cache evidence")
             if "2.0 KiB" not in written:
                 failures.append("summary omitted restored bytes")
+            if "`unknown-cache` | unknown | unknown |" not in written:
+                failures.append("unknown cache evidence must not become miss / 0 B")
+            if "| miss |" in written.split("unknown-cache", 1)[-1][:80]:
+                failures.append("unknown cache row was rendered as a miss")
+            if "0 B" in written:
+                failures.append("unknown cache row invented 0 B")
+            if live_state.read_text(encoding="utf-8") != '{"sentinel": true}\n':
+                failures.append("self-test mutated live RUNNER_TEMP job state")
+            if live_summary.read_text(encoding="utf-8") != "pre-existing summary\n":
+                failures.append("self-test mutated the live GITHUB_STEP_SUMMARY")
+            if (live_runner / "summary.md").exists():
+                failures.append("self-test wrote a summary into RUNNER_TEMP")
+        except SystemExit as error:
+            failures.append(f"self-test aborted: {error}")
         finally:
-            if previous is None:
-                os.environ.pop("CI_RUNTIME_TELEMETRY_DIR", None)
-            else:
-                os.environ["CI_RUNTIME_TELEMETRY_DIR"] = previous
-            os.environ.pop("GITHUB_STEP_SUMMARY", None)
+            restore_env(previous)
+
+    after = snapshot_env(touched)
+    if after != previous:
+        failures.append("self-test did not restore every touched environment variable")
+
+    try:
+        resolve_restored_bytes(
+            True,
+            argparse.Namespace(bytes=None, path="/nonexistent/ci-runtime-cache"),
+        )
+        failures.append("hit without measured bytes must fail rather than invent 0 B")
+    except SystemExit:
+        pass
+
     for failure in failures:
         print(f"::error::{failure}", file=sys.stderr)
     return 1 if failures else 0

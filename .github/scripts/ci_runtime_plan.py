@@ -11,7 +11,8 @@ from __future__ import annotations
 import argparse
 import re
 import sys
-from pathlib import Path
+import tempfile
+from pathlib import Path, PurePosixPath
 
 SUITE_PATTERNS: dict[str, tuple[str, ...]] = {
     # Production Dockerfile smoke builds the ordinary `runtime` image and the
@@ -67,13 +68,89 @@ COMPILED = {
     for suite, patterns in SUITE_PATTERNS.items()
 }
 
+# Tab and newline are valid Git path bytes. Other C0 / DEL controls cannot be
+# trusted for a skip decision: a quoted or split hostile name must never hide a
+# Docker/FIPS-sensitive prefix.
+_ALLOWED_CONTROLS = frozenset({ord("\t"), ord("\n")})
+
+
+class ChangedFilesError(Exception):
+    """Malformed or unavailable diff. The planner must fail closed."""
+
+
+class UnsafeChangedFiles(Exception):
+    """Decoded paths that cannot be skipped. Force the live gate to run."""
+
+    def __init__(self, paths: list[str], reason: str) -> None:
+        super().__init__(reason)
+        self.paths = paths
+        self.reason = reason
+
+
+def unsafe_path_reason(path: str) -> str | None:
+    if not path:
+        return "empty path"
+    if path.startswith(("/", "\\")):
+        return "absolute path"
+    for char in path:
+        code = ord(char)
+        if code < 32 and code not in _ALLOWED_CONTROLS:
+            return "control character"
+        if code == 127:
+            return "control character"
+    posix = PurePosixPath(path)
+    if posix.is_absolute():
+        return "absolute path"
+    if ".." in posix.parts:
+        return "path traversal"
+    return None
+
 
 def read_changed_files(path: Path) -> list[str]:
-    return [
-        line.strip()
-        for line in path.read_text(encoding="utf-8").splitlines()
-        if line.strip()
-    ]
+    """Parse a NUL-delimited `git diff --name-only --no-renames -z` listing.
+
+    A truncated, undecodable, or unavailable listing fails closed. A decoded
+    but structurally unsafe name (absolute, traversal, disallowed controls)
+    raises UnsafeChangedFiles so the caller can force the suite to run rather
+    than report a successful skip. A valid Git filename containing a newline
+    is one path and is matched against suite prefixes as-is.
+    """
+    try:
+        raw = path.read_bytes()
+    except OSError as error:
+        raise ChangedFilesError(f"cannot read changed-files: {error}") from error
+
+    if raw == b"":
+        return []
+    if not raw.endswith(b"\0"):
+        raise ChangedFilesError(
+            "changed-files NUL stream is truncated (missing final NUL)"
+        )
+
+    records = raw.split(b"\0")
+    if records and records[-1] == b"":
+        records = records[:-1]
+    if not records:
+        return []
+
+    paths: list[str] = []
+    unsafe_reason: str | None = None
+    for record in records:
+        if record == b"":
+            raise ChangedFilesError("changed-files contains an empty NUL record")
+        try:
+            text = record.decode("utf-8")
+        except UnicodeDecodeError as error:
+            raise ChangedFilesError(
+                f"changed-files is not valid UTF-8: {error}"
+            ) from error
+        reason = unsafe_path_reason(text)
+        if reason is not None:
+            unsafe_reason = reason
+        paths.append(text)
+    if unsafe_reason is not None:
+        raise UnsafeChangedFiles(paths, unsafe_reason)
+    return paths
 
 
 def matched_files(suite: str, changed_files: list[str]) -> list[str]:
@@ -164,6 +241,31 @@ def self_test() -> int:
         ("fips-build", ["charts/ferrum-mesh/values.yaml"], False),
         ("production-dockerfile-smoke", [], False),
         ("fips-build", [], False),
+        (
+            "production-dockerfile-smoke",
+            ["src/\nmain.rs"],
+            True,
+        ),
+        (
+            "fips-build",
+            ["src/\nmain.rs"],
+            True,
+        ),
+        (
+            "production-dockerfile-smoke",
+            ['"src/main.rs"'],
+            False,
+        ),
+        (
+            "production-dockerfile-smoke",
+            ['"Dockerfile"'],
+            False,
+        ),
+        (
+            "fips-build",
+            ["README.md"],
+            False,
+        ),
     ]
     failures: list[str] = []
     for suite, changed, expected in cases:
@@ -177,6 +279,92 @@ def self_test() -> int:
         failures.append("unknown suite must raise rather than skip")
     except ValueError:
         pass
+
+    def _write(payload: bytes) -> Path:
+        handle = tempfile.NamedTemporaryFile(delete=False)
+        handle.write(payload)
+        handle.close()
+        return Path(handle.name)
+
+    empty = _write(b"")
+    try:
+        if read_changed_files(empty) != []:
+            failures.append("empty diff must parse as no changed files")
+    finally:
+        empty.unlink(missing_ok=True)
+
+    newline_path = "src/\nmain.rs"
+    newline_file = _write(newline_path.encode("utf-8") + b"\0")
+    try:
+        parsed = read_changed_files(newline_file)
+        if parsed != [newline_path]:
+            failures.append(f"newline path must stay one record, got {parsed!r}")
+        elif not matched_files("production-dockerfile-smoke", parsed):
+            failures.append("newline path under src/ must not evade the Docker gate")
+        elif not matched_files("fips-build", parsed):
+            failures.append("newline path under src/ must not evade the FIPS gate")
+    finally:
+        newline_file.unlink(missing_ok=True)
+
+    quoted = _write(b'"src/main.rs"\0')
+    try:
+        parsed = read_changed_files(quoted)
+        if parsed != ['"src/main.rs"']:
+            failures.append(f"Git quote-like text must stay literal, got {parsed!r}")
+        elif matched_files("production-dockerfile-smoke", parsed):
+            failures.append("quoted src/ text must not be unquoted into a sensitive path")
+    finally:
+        quoted.unlink(missing_ok=True)
+
+    invalid_utf8 = _write(b"src/\xffmain.rs\0")
+    try:
+        read_changed_files(invalid_utf8)
+        failures.append("invalid UTF-8 must fail closed rather than skip")
+    except ChangedFilesError:
+        pass
+    finally:
+        invalid_utf8.unlink(missing_ok=True)
+
+    truncated = _write(b"src/main.rs")
+    try:
+        read_changed_files(truncated)
+        failures.append("missing final NUL must fail closed rather than skip")
+    except ChangedFilesError:
+        pass
+    finally:
+        truncated.unlink(missing_ok=True)
+
+    traversal = _write(b"../Dockerfile\0")
+    try:
+        read_changed_files(traversal)
+        failures.append("traversal path must not parse as a skippable listing")
+    except UnsafeChangedFiles as error:
+        if "traversal" not in error.reason:
+            failures.append(f"traversal reason missing: {error.reason}")
+    except ChangedFilesError as error:
+        failures.append(f"traversal should force-run, not fail parse: {error}")
+    finally:
+        traversal.unlink(missing_ok=True)
+
+    absolute = _write(b"/etc/passwd\0")
+    try:
+        read_changed_files(absolute)
+        failures.append("absolute path must not parse as a skippable listing")
+    except UnsafeChangedFiles as error:
+        if "absolute" not in error.reason:
+            failures.append(f"absolute reason missing: {error.reason}")
+    except ChangedFilesError as error:
+        failures.append(f"absolute should force-run, not fail parse: {error}")
+    finally:
+        absolute.unlink(missing_ok=True)
+
+    missing = Path(tempfile.mkdtemp()) / "missing-changed-files"
+    try:
+        read_changed_files(missing)
+        failures.append("unavailable diff must fail closed rather than skip")
+    except ChangedFilesError:
+        pass
+
     for failure in failures:
         print(f"::error::{failure}", file=sys.stderr)
     return 1 if failures else 0
@@ -197,15 +385,30 @@ def main() -> int:
             "--suite and --changed-files are required unless --self-test is used"
         )
 
-    changed = read_changed_files(args.changed_files)
+    force_unsafe = False
+    unsafe_reason = ""
+    try:
+        changed = read_changed_files(args.changed_files)
+    except ChangedFilesError as error:
+        print(f"::error::{error}", file=sys.stderr)
+        return 1
+    except UnsafeChangedFiles as error:
+        changed = error.paths
+        force_unsafe = True
+        unsafe_reason = error.reason
     try:
         matched = matched_files(args.suite, changed)
     except ValueError as error:
         print(f"::error::{error}", file=sys.stderr)
         return 1
-    relevant = args.force_run or bool(matched)
+    relevant = args.force_run or force_unsafe or bool(matched)
     if args.force_run:
         reason = "Forced run (push, merge_group, dispatch, or cold-cache proof)."
+    elif force_unsafe:
+        reason = (
+            f"Diff contained an unsafe path ({unsafe_reason}); running the live "
+            "gate rather than risking a false skip."
+        )
     elif matched:
         reason = "Diff matches a production-image or FIPS-sensitive path; running the live gate."
     else:

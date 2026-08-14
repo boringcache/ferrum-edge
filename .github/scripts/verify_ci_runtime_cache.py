@@ -2,9 +2,10 @@
 """Static contract checks for production-image and FIPS CI runtime caching (#3888).
 
 Does not compile Rust or build images. Proves workflow permission/caching
-boundaries, pinned actions, fail-closed planning, preserved live contracts,
-telemetry redaction, structurally separate BuildKit cache-to vs fork
-restore-only steps, and rust-cache save-if so fork PRs cannot save.
+boundaries, pinned actions, fail-closed NUL-delimited planning, preserved live
+contracts, telemetry redaction, evidence-backed cache restore bytes, structurally
+separate BuildKit local-cache export vs fork restore-only / no-save steps, and
+rust-cache save-if so fork PRs cannot save.
 """
 
 from __future__ import annotations
@@ -33,6 +34,10 @@ RUST_TOOLCHAIN = "dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb
 RUST_CACHE = "Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6"
 BUILDX = "docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c"
 BUILD_PUSH = "docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a"
+CACHE_RESTORE = "actions/cache/restore@374a27f26986edd8c430f386d152a856e179c0ae"
+CACHE_SAVE = "actions/cache/save@374a27f26986edd8c430f386d152a856e179c0ae"
+NUL_DIFF = 'git diff --name-only --no-renames -z "${trusted_sha}...HEAD"'
+LINE_DIFF = 'git diff --name-only --no-renames "${trusted_sha}...HEAD"'
 SHA40 = re.compile(r"^[0-9a-f]{40}$")
 USES = re.compile(
     r"^\s*(?:-\s*)?uses:\s*(?P<ref>\S+)",
@@ -241,6 +246,128 @@ def check_buildkit_cache_boundary(
         "nor cache-to",
         failures,
     )
+    require(
+        "type=gha" not in job_body,
+        f"{source} must not use the BuildKit GHA cache backend",
+        failures,
+    )
+
+
+def check_nul_delimited_plan(plan_job: str, source: str, failures: list[str]) -> None:
+    require(
+        NUL_DIFF in plan_job,
+        f"{source} must generate a NUL-delimited trusted diff",
+        failures,
+    )
+    require(
+        LINE_DIFF not in plan_job,
+        f"{source} must not use line-delimited git diff --name-only",
+        failures,
+    )
+    require(
+        "| sort" not in plan_job,
+        f"{source} must not pass pathname bytes through sort",
+        failures,
+    )
+
+
+def check_local_cache_actions(
+    job_body: str,
+    source: str,
+    failures: list[str],
+    *,
+    scope: str,
+) -> None:
+    restore_steps = [
+        step for step in job_steps(job_body) if step_uses(step).startswith(CACHE_RESTORE)
+    ]
+    save_steps = [
+        step for step in job_steps(job_body) if step_uses(step).startswith(CACHE_SAVE)
+    ]
+    require(
+        len(restore_steps) == 1,
+        f"{source} must have exactly one pinned actions/cache/restore step, "
+        f"found {len(restore_steps)}",
+        failures,
+    )
+    require(
+        len(save_steps) == 1,
+        f"{source} must have exactly one pinned actions/cache/save step, "
+        f"found {len(save_steps)}",
+        failures,
+    )
+    key = f"{scope}-${{{{ runner.os }}}}-${{{{ github.sha }}}}"
+    prefix = f"{scope}-${{{{ runner.os }}}}-"
+    if restore_steps:
+        condition = step_if(restore_steps[0])
+        with_block = step_with(restore_steps[0])
+        require(
+            COLD_NOT_TRUE in condition,
+            f"{source} cache restore must skip force_cold_cache",
+            failures,
+        )
+        require(
+            FORK_IS_TRUE not in condition or FORK_NOT_TRUE in condition,
+            f"{source} cache restore may run for forks but must not be fork-only "
+            "in a way that skips trusted restores",
+            failures,
+        )
+        require(
+            f"key: {key}" in with_block,
+            f"{source} cache restore must use exact key {key}",
+            failures,
+        )
+        require(
+            "restore-keys:" in with_block and prefix in with_block,
+            f"{source} cache restore must use restore prefix {prefix}",
+            failures,
+        )
+    if save_steps:
+        condition = step_if(save_steps[0])
+        with_block = step_with(save_steps[0])
+        require(
+            COLD_NOT_TRUE in condition,
+            f"{source} cache save must skip force_cold_cache",
+            failures,
+        )
+        require(
+            FORK_NOT_TRUE in condition and FORK_IS_TRUE not in condition,
+            f"{source} must exclude fork PRs from cache save / publication",
+            failures,
+        )
+        require(
+            f"key: {key}" in with_block,
+            f"{source} cache save must use exact key {key}",
+            failures,
+        )
+
+
+def check_cache_telemetry_evidence(job_body: str, source: str, failures: list[str]) -> None:
+    require(
+        '--hit ""' not in job_body and "--hit ''" not in job_body,
+        f"{source} must not pass empty --hit (unknown is not a miss)",
+        failures,
+    )
+    require(
+        "--hit true" not in job_body,
+        f"{source} must not fabricate a cache hit literal",
+        failures,
+    )
+    require(
+        "cache-hit" in job_body and "cache-matched-key" in job_body,
+        f"{source} must record restore evidence from action outputs",
+        failures,
+    )
+    require(
+        "--path" in job_body,
+        f"{source} must measure restored bytes from the restored directory",
+        failures,
+    )
+    require(
+        "produced no hit/miss evidence" in job_body,
+        f"{source} must fail closed when restore outputs are missing",
+        failures,
+    )
 
 
 def remote_uses(text: str) -> list[str]:
@@ -363,6 +490,20 @@ def check_fips(workflow: str, failures: list[str]) -> None:
         failures,
     )
     require(
+        re.search(r"(?m)--test unit_tests tls::fips_\s*$", workflow) is not None,
+        "FIPS unit tests must use one tls::fips_ TESTNAME prefix",
+        failures,
+    )
+    require(
+        re.search(
+            r"cargo test[^\n]*tls::fips_policy_tests[^\n]+tls::fips_key_admission_tests",
+            workflow,
+        )
+        is None,
+        "FIPS unit tests must not pass two Cargo TESTNAME filters to one invocation",
+        failures,
+    )
+    require(
         "frontend_and_backend_builders_complete_a_real_tls_handshake" in workflow,
         "FIPS frontend/backend handshake coverage must remain",
         failures,
@@ -373,10 +514,22 @@ def check_fips(workflow: str, failures: list[str]) -> None:
         failures,
     )
     require(
+        re.search(
+            r"cargo test[^\n]*frontend_and_backend_builders_complete_a_real_tls_handshake"
+            r"[^\n]+legitimate_data_plane_connects_once_a_permit_is_released",
+            workflow,
+        )
+        is None,
+        "FIPS handshake tests must not pass two Cargo TESTNAME filters to one invocation",
+        failures,
+    )
+    require(
         "python3 -I" in workflow and "ci_runtime_plan.py" in workflow,
         "FIPS planner must execute an isolated trusted-base copy",
         failures,
     )
+    plan_job = extract_job(workflow, "fips-plan")
+    check_nul_delimited_plan(plan_job, "FIPS planner", failures)
     require(
         "relevant=true" in workflow and "trusted base has not adopted" in workflow,
         "FIPS planner must fail closed toward running when the trusted copy is missing",
@@ -501,15 +654,43 @@ def check_production_smoke(workflow: str, failures: list[str]) -> None:
         failures,
     )
     require(
-        "cache-from:" in default_job and "type=gha,scope=production-dockerfile-smoke" in default_job,
-        "default production-image job must restore a scoped BuildKit GHA cache",
+        "type=local" in default_job
+        and "production-dockerfile-smoke-default-${{ runner.os }}-${{ github.sha }}"
+        in default_job,
+        "default production-image job must restore a scoped local BuildKit cache",
         failures,
     )
     require(
-        "type=gha,scope=production-dockerfile-smoke" in ebpf_job,
-        "eBPF production-image job must restore a scoped BuildKit GHA cache",
+        "type=local" in ebpf_job
+        and "production-dockerfile-smoke-ebpf-${{ runner.os }}-${{ github.sha }}"
+        in ebpf_job,
+        "eBPF production-image job must restore a scoped local BuildKit cache",
         failures,
     )
+    check_local_cache_actions(
+        default_job,
+        "production-dockerfile-smoke-default",
+        failures,
+        scope="production-dockerfile-smoke-default",
+    )
+    check_local_cache_actions(
+        ebpf_job,
+        "production-dockerfile-smoke-ebpf",
+        failures,
+        scope="production-dockerfile-smoke-ebpf",
+    )
+    check_cache_telemetry_evidence(
+        default_job,
+        "production-dockerfile-smoke-default",
+        failures,
+    )
+    check_cache_telemetry_evidence(
+        ebpf_job,
+        "production-dockerfile-smoke-ebpf",
+        failures,
+    )
+    plan_job = extract_job(workflow, "production-dockerfile-plan")
+    check_nul_delimited_plan(plan_job, "production-image planner", failures)
     require(
         "run: |\n          docker build" not in default_job
         and "run: |\n          docker build" not in ebpf_job,
@@ -620,8 +801,20 @@ def check_docs_and_coverage(failures: list[str]) -> None:
         failures,
     )
     require(
-        "cache-to" in ci_cd and "restore-only" in ci_cd,
-        "docs/ci_cd.md must document that fork PRs omit BuildKit cache-to",
+        "actions/cache/restore" in ci_cd
+        and "actions/cache/save" in ci_cd
+        and "restore-only" in ci_cd,
+        "docs/ci_cd.md must document pinned cache restore/save and fork restore-only",
+        failures,
+    )
+    require(
+        "type=local" in ci_cd and "restored bytes" in ci_cd.lower(),
+        "docs/ci_cd.md must document local BuildKit cache restore-byte measurement",
+        failures,
+    )
+    require(
+        "--name-only --no-renames -z" in ci_cd or "NUL-delimited" in ci_cd,
+        "docs/ci_cd.md must document NUL-delimited trusted path planning",
         failures,
     )
     require(
@@ -711,14 +904,14 @@ def self_test() -> int:
     build_push = (
         f"        uses: {BUILD_PUSH} # v7\n"
         "        with:\n"
-        "          cache-from: type=gha,scope=production-dockerfile-smoke-default\n"
+        "          cache-from: type=local,src=/tmp/production-dockerfile-smoke-default\n"
     )
     good_buildkit = (
         "    steps:\n"
         "      - name: Build ordinary production runtime\n"
         f"        if: {COLD_NOT_TRUE} && {FORK_NOT_TRUE}\n"
         f"{build_push}"
-        "          cache-to: type=gha,mode=max,scope=production-dockerfile-smoke-default\n"
+        "          cache-to: type=local,dest=/tmp/production-dockerfile-smoke-default-out,mode=max\n"
         "      - name: Build ordinary production runtime (fork restore-only)\n"
         f"        if: {COLD_NOT_TRUE} && {FORK_IS_TRUE}\n"
         f"{build_push}"
@@ -780,11 +973,11 @@ def self_test() -> int:
         "      - name: Build ordinary production runtime\n"
         f"        if: {COLD_NOT_TRUE} && {FORK_NOT_TRUE}\n"
         f"{build_push}"
-        "          cache-to: type=gha,mode=max,scope=production-dockerfile-smoke-default\n"
+        "          cache-to: type=local,dest=/tmp/production-dockerfile-smoke-default-out,mode=max\n"
         "      - name: Build ordinary production runtime (fork restore-only)\n"
         f"        if: {COLD_NOT_TRUE} && {FORK_IS_TRUE}\n"
         f"{build_push}"
-        "          cache-to: type=gha,mode=max,scope=production-dockerfile-smoke-default\n"
+        "          cache-to: type=local,dest=/tmp/production-dockerfile-smoke-default-out,mode=max\n"
         "      - name: Build ordinary production runtime (cold cache)\n"
         f"        if: {COLD_IS_TRUE}\n"
         f"        uses: {BUILD_PUSH} # v7\n"
@@ -856,6 +1049,180 @@ def self_test() -> int:
     require(
         any("save-if so fork PRs restore only" in item for item in inverted_failures),
         "self-test: inverted rust-cache save-if must fail",
+        failures,
+    )
+
+    gha_backend = good_buildkit.replace("type=local", "type=gha")
+    gha_failures: list[str] = []
+    check_buildkit_cache_boundary(
+        gha_backend,
+        "self-test-gha-backend",
+        gha_failures,
+    )
+    require(
+        any("must not use the BuildKit GHA cache backend" in item for item in gha_failures),
+        "self-test: reintroducing type=gha must fail",
+        failures,
+    )
+
+    scope = "production-dockerfile-smoke-default"
+    restore_step = (
+        "      - name: Restore BuildKit local cache\n"
+        f"        if: {COLD_NOT_TRUE}\n"
+        f"        uses: {CACHE_RESTORE} # v4.2.4\n"
+        "        with:\n"
+        f"          path: /tmp/{scope}\n"
+        f"          key: {scope}-${{{{ runner.os }}}}-${{{{ github.sha }}}}\n"
+        "          restore-keys: |\n"
+        f"            {scope}-${{{{ runner.os }}}}-\n"
+    )
+    save_step = (
+        "      - name: Save BuildKit local cache\n"
+        f"        if: {COLD_NOT_TRUE} && {FORK_NOT_TRUE}\n"
+        f"        uses: {CACHE_SAVE} # v4.2.4\n"
+        "        with:\n"
+        f"          path: /tmp/{scope}\n"
+        f"          key: {scope}-${{{{ runner.os }}}}-${{{{ github.sha }}}}\n"
+    )
+    good_local = "    steps:\n" + restore_step + save_step
+    good_local_failures: list[str] = []
+    check_local_cache_actions(
+        good_local,
+        "self-test-good-local-cache",
+        good_local_failures,
+        scope=scope,
+    )
+    require(
+        not good_local_failures,
+        "self-test: pinned restore/save should pass: "
+        + "; ".join(good_local_failures),
+        failures,
+    )
+
+    fork_save = good_local.replace(
+        f"if: {COLD_NOT_TRUE} && {FORK_NOT_TRUE}\n        uses: {CACHE_SAVE}",
+        f"if: {COLD_NOT_TRUE} && {FORK_IS_TRUE}\n        uses: {CACHE_SAVE}",
+    )
+    fork_save_failures: list[str] = []
+    check_local_cache_actions(
+        fork_save,
+        "self-test-fork-save",
+        fork_save_failures,
+        scope=scope,
+    )
+    require(
+        any("exclude fork PRs from cache save" in item for item in fork_save_failures),
+        "self-test: fork cache publication must fail",
+        failures,
+    )
+
+    cold_restore = good_local.replace(
+        f"if: {COLD_NOT_TRUE}\n        uses: {CACHE_RESTORE}",
+        f"if: {COLD_IS_TRUE}\n        uses: {CACHE_RESTORE}",
+    )
+    cold_restore_failures: list[str] = []
+    check_local_cache_actions(
+        cold_restore,
+        "self-test-cold-restore",
+        cold_restore_failures,
+        scope=scope,
+    )
+    require(
+        any("restore must skip force_cold_cache" in item for item in cold_restore_failures),
+        "self-test: force-cold restore must fail",
+        failures,
+    )
+
+    cold_save = good_local.replace(
+        f"if: {COLD_NOT_TRUE} && {FORK_NOT_TRUE}\n        uses: {CACHE_SAVE}",
+        f"if: {COLD_IS_TRUE} && {FORK_NOT_TRUE}\n        uses: {CACHE_SAVE}",
+    )
+    cold_save_failures: list[str] = []
+    check_local_cache_actions(
+        cold_save,
+        "self-test-cold-save",
+        cold_save_failures,
+        scope=scope,
+    )
+    require(
+        any("save must skip force_cold_cache" in item for item in cold_save_failures),
+        "self-test: force-cold save must fail",
+        failures,
+    )
+
+    empty_hit = (
+        "    steps:\n"
+        "      - name: Record BuildKit cache restore\n"
+        "        run: python3 .github/scripts/ci_runtime_telemetry.py cache --hit \"\"\n"
+    )
+    empty_hit_failures: list[str] = []
+    check_cache_telemetry_evidence(
+        empty_hit,
+        "self-test-empty-hit",
+        empty_hit_failures,
+    )
+    require(
+        any("must not pass empty --hit" in item for item in empty_hit_failures),
+        "self-test: empty --hit must fail",
+        failures,
+    )
+
+    fabricated_hit = (
+        "    steps:\n"
+        "      - name: Record BuildKit cache restore\n"
+        "        run: python3 .github/scripts/ci_runtime_telemetry.py cache --hit true --bytes 12\n"
+    )
+    fabricated_failures: list[str] = []
+    check_cache_telemetry_evidence(
+        fabricated_hit,
+        "self-test-fabricated-hit",
+        fabricated_failures,
+    )
+    require(
+        any("must not fabricate a cache hit literal" in item for item in fabricated_failures),
+        "self-test: fabricated --hit true must fail",
+        failures,
+    )
+
+    missing_measurement = (
+        "    steps:\n"
+        "      - name: Record BuildKit cache restore\n"
+        "        env:\n"
+        "          CACHE_HIT: ${{ steps.buildkit-cache.outputs.cache-hit }}\n"
+        "          CACHE_MATCHED: ${{ steps.buildkit-cache.outputs.cache-matched-key }}\n"
+        "        run: |\n"
+        "          python3 .github/scripts/ci_runtime_telemetry.py cache --hit \"$CACHE_HIT\"\n"
+        "          echo produced no hit/miss evidence\n"
+    )
+    missing_measurement_failures: list[str] = []
+    check_cache_telemetry_evidence(
+        missing_measurement,
+        "self-test-missing-bytes",
+        missing_measurement_failures,
+    )
+    require(
+        any("must measure restored bytes" in item for item in missing_measurement_failures),
+        "self-test: missing restored-byte measurement must fail",
+        failures,
+    )
+
+    line_diff_plan = (
+        "    steps:\n"
+        "      - name: Check for production Dockerfile smoke changes\n"
+        "        run: |\n"
+        '            git diff --name-only --no-renames "${trusted_sha}...HEAD" \\\n'
+        '              | sort > "$changed_files"\n'
+    )
+    line_diff_failures: list[str] = []
+    check_nul_delimited_plan(
+        line_diff_plan,
+        "self-test-line-diff",
+        line_diff_failures,
+    )
+    require(
+        any("must not use line-delimited git diff --name-only" in item for item in line_diff_failures)
+        and any("must not pass pathname bytes through sort" in item for item in line_diff_failures),
+        "self-test: line-delimited git diff --name-only must fail",
         failures,
     )
 

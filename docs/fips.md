@@ -92,7 +92,9 @@ requests restore `ci-fips` and cannot save. Trusted runs keep `cache-on-failure`
 so a runner-loss retry can reuse compile work. A `workflow_dispatch` input
 `force_cold_cache` skips restore so a hosted cold-cache run still proves every
 live assertion. Path planning is fail-closed: a missing or unknown trusted
-planner runs the compile gate rather than skipping it.
+planner runs the compile gate rather than skipping it. Path planning reads a
+NUL-delimited `git diff --name-only --no-renames -z` listing so a hostile
+filename cannot evade a sensitive prefix.
 
 ## Current capability
 
