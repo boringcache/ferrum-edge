@@ -2571,7 +2571,8 @@ fn handle_h3_request_boxes_connect_udp_off_the_generic_h3_poll_frame() {
     );
     let squeezed_factory = squeeze(factory);
     assert!(
-        squeezed_factory.contains("Box::pin(asyncmove{handle_h3_connect_udp(stream,request).await})"),
+        squeezed_factory
+            .contains("Box::pin(asyncmove{handle_h3_connect_udp(stream,request).await})"),
         "the factory must box a trampoline, not construct handle_h3_connect_udp in its own frame"
     );
 }

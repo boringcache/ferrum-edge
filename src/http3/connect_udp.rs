@@ -1646,9 +1646,7 @@ pub(crate) fn boxed_handle_h3_connect_udp(
     stream: RequestStream<h3_quinn::BidiStream<Bytes>, Bytes>,
     request: ConnectUdpRequest,
 ) -> BoxedConnectUdpHandlerFuture {
-    Box::pin(async move {
-        handle_h3_connect_udp(stream, request).await
-    })
+    Box::pin(async move { handle_h3_connect_udp(stream, request).await })
 }
 
 /// RFC 9298 entry point, called from `handle_h3_request` through
