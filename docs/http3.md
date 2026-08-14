@@ -974,11 +974,24 @@ The effective deadline is the **earlier** of the accepted credential's own
 authoritative expiry and the configured maximum, and it is anchored once, at
 the request-receipt instant, before the tunnel exists:
 
-- **Before commitment.** The deadline is derived before the session permit, the
-  DNS lookup, the UDP socket, and the `200`. A deadline that has already
-  elapsed at that point is a fixed, redacted authorization refusal — the same
-  terminal every other protocol emits pre-commitment — and no session permit is
-  consumed, no address is resolved, and no UDP socket is created or connected.
+- **Before commitment.** The deadline is derived once, as a single captured
+  `StreamAuthDeadline`, before the session permit, the DNS lookup, the UDP
+  socket, and the `200`. An already-elapsed deadline is a fixed, redacted
+  authorization refusal — the same terminal every other protocol emits
+  pre-commitment — and no session permit is consumed, no address is resolved,
+  and no UDP socket is created or connected.
+- **Pre-commitment waits.** DNS resolution and the tunnel-socket connect are
+  raced with that same captured plan through `ComposedAuthBound`.
+  Authorization wins a tie; a strictly earlier protocol bound (the existing
+  connect-budget DNS timeout) keeps its existing 504 behaviour. The last
+  instant before a `200` is offered re-checks the captured plan, so a
+  credential that expired during that work still cannot commit a tunnel.
+- **HEADERS write.** The H3 response-header write is bounded by
+  `await_authorized_headers_write` against the same plan. A successful `200`
+  is counted only after that write actually succeeds. If authorization expires
+  while the write is parked in QUIC flow control or QPACK, the termination is
+  recorded once, the stream is aborted/reset, and the socket, session permit,
+  and guards are released — no second blocking terminal write is attempted.
 - **After commitment.** The relay supervisor arms one exact
   `sleep_until(deadline)`, biased ahead of its other arms so an expiry that
   races the idle tick, a route withdrawal, a drain, or a relay halt is the
@@ -991,11 +1004,17 @@ the request-receipt instant, before the tunnel exists:
   send flow control, where it cannot observe the supervisor's close command at
   all. The existing bounded close grace then aborts and joins both relay tasks,
   so the socket, session permit, and connection guard are released on time and
-  the abort itself resets the stream.
+  the abort itself resets the stream. That designed abort stays classified as
+  the authorization expiry only when the send half was cancelled after the
+  grace timeout; a panic or any unrelated cancellation is reported as an
+  internal relay failure.
 - **Accounting.** Exactly one termination is recorded, through the request's
   shared once-only latch, on the fixed-cardinality `authorization_lifetime`
   counters under the existing closed `stream_udp` protocol family. No route,
-  target, or credential label is created, and no new family is published.
+  target, or credential label is created, and no new family is published. The
+  established-tunnel `TransactionSummary` is emitted once, after the `200`
+  HEADERS write succeeds; a pre-commitment refusal logs through the ordinary
+  rejection path instead, never both.
 
 An **unauthenticated** tunnel admitted no principal, so it has no authorization
 lifetime: no timer is registered for it and every bound above applies exactly as

@@ -9,7 +9,9 @@
 //! [`encode_udp_datagram_capsule`].
 
 use ferrum_edge::_test_support::{
-    request_received_at_for_test, set_request_credential_deadline_for_test,
+    H3AuthorizedHeadersWrite, await_authorized_headers_write_for_test,
+    await_deadline_first_for_test, request_received_at_for_test,
+    set_request_credential_deadline_for_test,
 };
 use ferrum_edge::config::types::{GatewayConfig, HttpFlavor, Proxy, Upstream};
 use ferrum_edge::http3::connect_udp::{
@@ -27,8 +29,8 @@ use ferrum_edge::http3::connect_udp::{
 use ferrum_edge::load_balancer::{LoadBalancerCache, LoadBalancerCacheInner};
 use ferrum_edge::plugins::RequestContext;
 use ferrum_edge::proxy::auth_lifetime::{
-    StreamAuthProtocolFamily, StreamAuthTermination, StreamAuthTerminationLatch, counters,
-    effective_request_auth_deadline, expired_authorization,
+    ComposedAuthBound, StreamAuthDeadline, StreamAuthProtocolFamily, StreamAuthTermination,
+    StreamAuthTerminationLatch, counters, effective_request_auth_deadline, expired_authorization,
 };
 use ferrum_edge::proxy::backend_dispatch::detect_http_flavor;
 use ferrum_edge::proxy::hbone_pool::HBONE_TARGET_TAG;
@@ -1716,9 +1718,10 @@ fn a_flow_control_stalled_client_cannot_relabel_its_own_expiry_as_a_gateway_faul
     // A client-bound relay parked in QUIC send flow control never returns to
     // its `select!`, so it cannot consume the supervisor's close command and is
     // aborted after CLOSE_GRACE — which is how teardown stays bounded. That
-    // abort is the DESIGNED path for an authorization expiry, and the abort
-    // itself resets the stream, so the outcome keeps its own class instead of
-    // being demoted to an internal relay failure the gateway never suffered.
+    // abort is the DESIGNED path for an authorization expiry only when the
+    // join is a cancellation AND the grace timed out. The abort itself resets
+    // the stream, so the outcome keeps its own class instead of being demoted
+    // to an internal relay failure the gateway never suffered.
     for termination in [
         StreamAuthTermination::CredentialExpired,
         StreamAuthTermination::AuthenticatedStreamMaxLifetime,
@@ -1726,7 +1729,8 @@ fn a_flow_control_stalled_client_cannot_relabel_its_own_expiry_as_a_gateway_faul
         let supervisor = SessionEnd::AuthorizationExpired(termination);
         let reported = reconcile_authorization_teardown(
             supervisor,
-            classify_send_half_teardown(SendHalfTeardownJoin::Cancelled),
+            SendHalfTeardownJoin::Cancelled,
+            true,
         );
         assert_eq!(reported, supervisor);
         assert_eq!(
@@ -1735,6 +1739,49 @@ fn a_flow_control_stalled_client_cannot_relabel_its_own_expiry_as_a_gateway_faul
             "the terminal is still non-clean"
         );
     }
+}
+
+#[test]
+fn a_send_half_panic_after_an_authorization_verdict_stays_a_relay_failure() {
+    // classify_send_half_teardown maps both Panicked and Cancelled to
+    // RelayTaskFailed. Reconciliation must NOT then relabel a panic as
+    // AuthorizationExpired: a genuine task failure is warning/internal, not
+    // ordinary client-triggerable credential expiry.
+    for termination in [
+        StreamAuthTermination::CredentialExpired,
+        StreamAuthTermination::AuthenticatedStreamMaxLifetime,
+    ] {
+        let supervisor = SessionEnd::AuthorizationExpired(termination);
+        let reported = reconcile_authorization_teardown(
+            supervisor,
+            SendHalfTeardownJoin::Panicked,
+            true,
+        );
+        assert_eq!(
+            reported,
+            SessionEnd::RelayTaskFailed,
+            "a panicked send half must not be relabeled as {}",
+            termination.as_str()
+        );
+        assert_eq!(reported.close_kind(), StreamCloseKind::InternalError);
+        assert_eq!(reported.as_str(), "relay_task_failed");
+    }
+}
+
+#[test]
+fn an_unrelated_send_half_cancellation_after_an_authorization_verdict_stays_a_relay_failure() {
+    // Cancellation without CLOSE_GRACE timeout is not this session's designed
+    // abort of a flow-control-stalled send half. It stays RelayTaskFailed even
+    // when the supervisor had already selected AuthorizationExpired.
+    let supervisor =
+        SessionEnd::AuthorizationExpired(StreamAuthTermination::CredentialExpired);
+    let reported = reconcile_authorization_teardown(
+        supervisor,
+        SendHalfTeardownJoin::Cancelled,
+        false,
+    );
+    assert_eq!(reported, SessionEnd::RelayTaskFailed);
+    assert_eq!(reported.close_kind(), StreamCloseKind::InternalError);
 }
 
 #[test]
@@ -1753,7 +1800,11 @@ fn only_an_authorization_expiry_survives_an_unapplied_send_half_close() {
         SessionEnd::TargetSocketUnusable,
     ] {
         assert_eq!(
-            reconcile_authorization_teardown(supervisor, SessionEnd::RelayTaskFailed),
+            reconcile_authorization_teardown(
+                supervisor,
+                SendHalfTeardownJoin::Cancelled,
+                true,
+            ),
             SessionEnd::RelayTaskFailed,
             "{} must not survive a close the client never saw",
             supervisor.as_str()
@@ -1766,10 +1817,261 @@ fn only_an_authorization_expiry_survives_an_unapplied_send_half_close() {
     let expiry = SessionEnd::AuthorizationExpired(StreamAuthTermination::CredentialExpired);
     let completed = SendHalfTeardownJoin::Completed(SessionEnd::ClientClosed);
     assert_eq!(
-        reconcile_authorization_teardown(expiry, classify_send_half_teardown(completed)),
+        reconcile_authorization_teardown(expiry, completed, true),
         SessionEnd::ClientClosed,
         "a COMPLETED send-half join is authoritative; only an unapplied close is reconciled"
     );
+}
+
+fn connect_udp_handler_source() -> &'static str {
+    let src = include_str!("../../../src/http3/connect_udp.rs");
+    let start = src
+        .find("pub(crate) async fn handle_h3_connect_udp(")
+        .expect("handle_h3_connect_udp must exist");
+    let rest = &src[start..];
+    let end = rest
+        .find("\n/// Feed one client DATA chunk")
+        .expect("handler must end before relay_client_chunk");
+    &rest[..end]
+}
+
+#[test]
+fn connect_udp_precommit_gates_and_header_write_follow_the_captured_plan() {
+    // Resource ordering without test-only production instrumentation: the
+    // early elapsed gate is before the session permit / DNS / socket, the
+    // awaited setup is composed against the captured plan, the final gate
+    // sits at the last instant before the 200 is offered, and the HEADERS
+    // write uses the shared H3 utility. A successful 200 is counted only
+    // after that write actually succeeds.
+    let squeezed = squeeze(connect_udp_handler_source());
+    let early = squeezed
+        .find("ifletSome(termination)=crate::proxy::auth_lifetime::expired_authorization(auth_deadline)")
+        .expect("early elapsed gate");
+    let permit = squeezed
+        .find("state.h3_connect_udp_sessions.as_ref()")
+        .expect("session permit");
+    let dns = squeezed
+        .find("letdns_bound=crate::proxy::auth_lifetime::ComposedAuthBound::compose(")
+        .expect("composed DNS bound");
+    let dns_wait = squeezed
+        .find("crate::plugins::await_deadline_first(dns_bound.deadline(),")
+        .expect("DNS wait must use await_deadline_first");
+    let socket = squeezed
+        .find("bind_tunnel_socket(bind_addr)")
+        .expect("tunnel socket");
+    let connect = squeezed
+        .find("letconnect_bound=crate::proxy::auth_lifetime::ComposedAuthBound::compose(None,auth_deadline)")
+        .expect("composed connect bound");
+    let final_gate = squeezed
+        .rfind("ifletSome(termination)=crate::proxy::auth_lifetime::expired_authorization(auth_deadline)")
+        .expect("final pre-200 gate");
+    let header_write = squeezed
+        .find("crate::http3::stream_util::await_authorized_headers_write(")
+        .expect("HEADERS write must use the shared H3 utility");
+    let written = squeezed
+        .find("H3AuthorizedHeadersWrite::Written")
+        .expect("successful HEADERS write arm");
+    let counted = squeezed
+        .find("crate::proxy::record_request(&state,200)")
+        .expect("200 must be counted");
+    let abort = squeezed
+        .find("crate::http3::stream_util::abort_response_stream(&mutstream)")
+        .expect("stalled 200 write must abort/reset");
+    let summary = squeezed
+        .find("emit_session_summary(")
+        .expect("established-tunnel summary");
+
+    assert!(
+        early < permit && permit < dns && dns < dns_wait && dns_wait < socket && socket < connect,
+        "already-expired requests must be refused before permit, DNS, and the socket"
+    );
+    assert!(
+        connect < final_gate
+            && final_gate < header_write
+            && header_write < written
+            && written < counted,
+        "the final gate must precede the HEADERS write, and a 200 must be counted only after Written"
+    );
+    assert!(
+        header_write < abort && abort < summary && counted < summary,
+        "an expired stalled HEADERS write must abort before any session summary; the \
+         established-tunnel summary is emitted only after a successful 200"
+    );
+    assert_eq!(
+        squeezed.matches("emit_session_summary(").count(),
+        1,
+        "the established-tunnel TransactionSummary is the intentional single summary"
+    );
+    assert_eq!(
+        squeezed
+            .matches("crate::proxy::record_request(&state,200)")
+            .count(),
+        1,
+        "a 200 must be counted exactly once, and only after Written"
+    );
+    assert!(
+        squeezed.contains("H3AuthorizedHeadersWrite::AuthorizationExpired(termination)"),
+        "authorization expiry during the 200 write must be a distinct arm"
+    );
+    assert!(
+        !squeezed[abort..summary].contains("send_h3_reject_body"),
+        "an expired stalled 200 write must not attempt another blocking terminal write"
+    );
+    let abort_log = squeezed[abort..summary]
+        .find("crate::proxy::log_rejected_request_with_path(")
+        .expect("stalled 200 expiry must still complete the rejection access log");
+    let abort_return = squeezed[abort..summary]
+        .find("returnOk(())")
+        .expect("stalled 200 expiry must return before the established-tunnel summary");
+    assert!(
+        abort_log < abort_return,
+        "the rejection summary must be the only access-log completion on a stalled 200 expiry"
+    );
+}
+
+#[test]
+fn connect_udp_supervisor_attributes_authorization_first_on_a_tie() {
+    // Scheduler-tie classification is the production supervisor: biased
+    // select with the authorization arm first, so idle / drain / withdrawal /
+    // relay halt that become ready in the same poll lose to the security
+    // decision. This inspects the production loop rather than restating it.
+    let src = include_str!("../../../src/http3/connect_udp.rs");
+    let relay = src
+        .split("async fn relay(")
+        .nth(1)
+        .expect("relay")
+        .split("\n/// Log a receive-half teardown join")
+        .next()
+        .expect("relay body");
+    let squeezed = squeeze(relay);
+    let biased = squeezed
+        .find("tokio::select!{biased;")
+        .expect("supervisor must be biased");
+    let auth = squeezed
+        .find("termination=&mutauthorization_expiry=>")
+        .expect("authorization arm");
+    let idle = squeezed.find("breakSessionEnd::Idle").expect("idle arm");
+    let drain = squeezed
+        .find("breakSessionEnd::Draining")
+        .expect("drain arm");
+    let withdrawn = squeezed
+        .find("breakSessionEnd::RouteWithdrawn")
+        .expect("route-withdrawal arm");
+    let pin = squeezed
+        .find("breakSessionEnd::RouteTargetPinChanged")
+        .expect("target-pin arm");
+    let relay_join = squeezed
+        .find("breakclassify_relay_join(")
+        .expect("relay-join arm");
+    assert!(
+        biased < auth
+            && auth < relay_join
+            && auth < drain
+            && auth < idle
+            && auth < pin
+            && auth < withdrawn,
+        "authorization must be the first biased arm so idle, drain, withdrawal, \
+         target-pin, and relay halt lose a same-poll tie to the security decision"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn connect_udp_dns_composition_is_authorization_first_on_a_tie() {
+    // Production `ComposedAuthBound` + `await_deadline_first`: a DNS-like wait
+    // that shares an instant with the captured plan never polls the lookup,
+    // and the expiry is attributed to authorization. A strictly earlier
+    // protocol bound keeps protocol-timeout attribution.
+    let now = tokio::time::Instant::now();
+    let plan = StreamAuthDeadline {
+        at: now,
+        termination: StreamAuthTermination::CredentialExpired,
+    };
+    let auth_bound = ComposedAuthBound::compose(Some(now), Some(plan));
+    assert_eq!(
+        auth_bound.expired_authorization(),
+        Some(StreamAuthTermination::CredentialExpired)
+    );
+    let mut polled = false;
+    let outcome = await_deadline_first_for_test(auth_bound.deadline(), async {
+        polled = true;
+        "resolved"
+    })
+    .await;
+    assert_eq!(outcome, Err(()));
+    assert!(!polled, "an elapsed authorization bound must not poll DNS");
+
+    let protocol_at = now + std::time::Duration::from_secs(1);
+    let later_plan = StreamAuthDeadline {
+        at: now + std::time::Duration::from_secs(5),
+        termination: StreamAuthTermination::CredentialExpired,
+    };
+    let protocol_bound = ComposedAuthBound::compose(Some(protocol_at), Some(later_plan));
+    assert_eq!(
+        protocol_bound.expired_authorization(),
+        None,
+        "a strictly earlier protocol bound must not be reported as authorization"
+    );
+
+    let unauthenticated = ComposedAuthBound::compose(Some(protocol_at), None);
+    assert_eq!(unauthenticated.expired_authorization(), None);
+    assert_eq!(unauthenticated.deadline(), Some(protocol_at));
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_stalled_connect_udp_headers_write_expires_under_stream_udp() {
+    // Production `await_authorized_headers_write` with the CONNECT-UDP family:
+    // a never-ready HEADERS write expires at the captured plan, records
+    // exactly once under stream_udp, and does not treat the write as committed.
+    let now = tokio::time::Instant::now();
+    let plan = StreamAuthDeadline {
+        at: now + std::time::Duration::from_secs(1),
+        termination: StreamAuthTermination::CredentialExpired,
+    };
+    let bound = ComposedAuthBound::compose(None, Some(plan));
+    let latch = StreamAuthTerminationLatch::default();
+    let started = tokio::time::Instant::now();
+    let outcome = await_authorized_headers_write_for_test(
+        bound,
+        StreamAuthProtocolFamily::StreamUdp,
+        &latch,
+        std::future::pending::<Result<(), ()>>(),
+    )
+    .await;
+    assert_eq!(
+        tokio::time::Instant::now() - started,
+        std::time::Duration::from_secs(1)
+    );
+    assert_eq!(
+        outcome,
+        H3AuthorizedHeadersWrite::AuthorizationExpired(StreamAuthTermination::CredentialExpired)
+    );
+    assert_eq!(
+        latch.observed(),
+        Some(StreamAuthTermination::CredentialExpired)
+    );
+    assert!(
+        !latch.record_once(
+            StreamAuthTermination::AuthenticatedStreamMaxLifetime,
+            StreamAuthProtocolFamily::StreamUdp,
+        ),
+        "the HEADERS-write expiry must occupy the once-only latch"
+    );
+}
+
+#[tokio::test]
+async fn an_unauthenticated_connect_udp_headers_write_never_registers_a_timer() {
+    let bound = ComposedAuthBound::compose(None, None);
+    assert_eq!(bound.deadline(), None);
+    let latch = StreamAuthTerminationLatch::default();
+    let outcome = await_authorized_headers_write_for_test(
+        bound,
+        StreamAuthProtocolFamily::StreamUdp,
+        &latch,
+        async { Ok::<(), ()>(()) },
+    )
+    .await;
+    assert_eq!(outcome, H3AuthorizedHeadersWrite::Written);
+    assert_eq!(latch.observed(), None);
 }
 
 #[tokio::test]
@@ -1993,8 +2295,10 @@ fn send_half_teardown_wires_the_joined_outcome_as_authoritative() {
         "teardown must send the supervisor SessionEnd, not only its close-kind"
     );
     assert!(
-        squeezed.contains("end=classify_send_half_teardown(observe_send_half_join("),
-        "teardown must take the send-half join as the authoritative SessionEnd"
+        squeezed.contains(
+            "end=reconcile_authorization_teardown(supervisor_verdict,observe_send_half_join("
+        ),
+        "teardown must reconcile the send-half join against the supervisor verdict"
     );
     assert!(
         !squeezed.contains("join_panicked(joined,RelayDirection::TargetToClient"),
@@ -2259,4 +2563,24 @@ fn functional_connect_udp_suite_covers_plain_grpc_content_type_rejection() {
     );
     assert!(src.contains("application/grpc-web+proto"));
     assert!(src.contains("must be a plain malformed CONNECT-UDP rejection, not a gRPC 200"));
+    assert!(
+        src.contains("functional_h3_connect_udp_mtls_not_after_terminates_a_live_tunnel"),
+        "the hosted H3 shard must cover mTLS notAfter as the CONNECT-UDP deadline"
+    );
+    assert!(
+        src.contains("functional_h3_connect_udp_expiry_before_200_is_a_fixed_redacted_401"),
+        "the hosted H3 shard must cover expiry before 200 commitment"
+    );
+    assert!(src.contains(
+        "functional_h3_connect_udp_credential_expiry_terminates_a_continuously_active_tunnel"
+    ));
+    assert!(src.contains(
+        "functional_h3_connect_udp_configured_maximum_lifetime_terminates_an_active_tunnel"
+    ));
+    assert!(src.contains(
+        "functional_h3_connect_udp_flow_control_stalled_client_cannot_outlive_its_credential"
+    ));
+    assert!(src.contains(
+        "functional_h3_connect_udp_unauthenticated_tunnels_are_untouched_by_the_contract"
+    ));
 }

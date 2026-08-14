@@ -32,9 +32,13 @@
 //! - the shared authorization-lifetime contract over a live tunnel (issue
 //!   #3860): a continuously active tunnel reset at its credential's `exp`, the
 //!   same at the configured authenticated-stream maximum, a flow-control-stalled
-//!   client that still cannot outlive its credential, and an unauthenticated
-//!   tunnel left completely unaffected. Each asserts the bounded `stream_udp`
-//!   counter incremented exactly once on a freshly spawned gateway
+//!   client that still cannot outlive its credential, an unauthenticated
+//!   tunnel left completely unaffected, a frontend-mTLS leaf whose `notAfter`
+//!   is the authoritative deadline, and a request-receipt-anchored maximum
+//!   that expires during a pre-handler delay so the 200 is never committed.
+//!   Each asserts the bounded `stream_udp` counter on a freshly spawned
+//!   gateway; the precommit case also proves the fixed redacted 401 and that
+//!   repeated refusals under a one-session limit never degrade to 503.
 //!
 //! The client-side capsule codec in `tests/scaffolding/clients/http3.rs` is
 //! written independently of the gateway's, so these assert wire
@@ -45,7 +49,12 @@ use std::time::Duration;
 use chrono::Utc;
 use ferrum_edge::config::EnvConfig;
 use jsonwebtoken::{EncodingKey, Header, encode};
+use rcgen::{
+    BasicConstraints, CertificateParams, ExtendedKeyUsagePurpose, IsCa, Issuer, KeyPair,
+    KeyUsagePurpose,
+};
 use serde_json::{Value, json};
+use tempfile::TempDir;
 use tokio::net::{TcpListener, UdpSocket};
 
 use crate::common::{TestGateway, TrustedProjectedGateway, TrustedProjectedGatewayOptions};
@@ -1021,12 +1030,13 @@ async fn functional_h3_connect_udp_refuses_spoofed_grpc_content_types_as_plain_4
 // bound. Each of these runs on a FRESHLY SPAWNED gateway process, so the
 // bounded `stream_udp` counters start at zero and "exactly once" is assertable.
 //
-// The PRE-COMMITMENT arm (a deadline already elapsed when the handler runs, so
-// no session permit, DNS lookup, UDP socket, or 200 happens at all) is pinned
-// in `tests/unit/gateway_core/http3_connect_udp_tests.rs` instead: reaching it
-// live requires the deadline to elapse inside the window between authentication
-// and admission, which is not a deterministic thing to schedule against a real
-// binary.
+// The PRE-COMMITMENT arm is covered live below
+// (`functional_h3_connect_udp_expiry_before_200_is_a_fixed_redacted_401`): a
+// request-receipt-anchored maximum plus a `fault_injection` before_proxy delay
+// makes the captured plan elapsed before the handler offers a 200. Unit tests
+// in `tests/unit/gateway_core/http3_connect_udp_tests.rs` additionally pin the
+// resource-ordering (early gate before permit/DNS/socket, final gate before
+// the HEADERS write) without test-only production instrumentation.
 // ---------------------------------------------------------------------------
 
 /// Consumer identity and shared HMAC secret for the authenticated MASQUE route.
@@ -1418,5 +1428,326 @@ async fn functional_h3_connect_udp_unauthenticated_tunnels_are_untouched_by_the_
     );
 
     tunnel.close().await;
+    gateway.shutdown();
+}
+
+/// The authenticated MASQUE route plus a `before_proxy` delay so a
+/// request-receipt-anchored maximum can elapse before the handler commits a
+/// 200. `jwt_auth` still admits the principal; `fault_injection` only consumes
+/// time.
+fn masque_authenticated_config_with_precommit_delay(target_port: u16, delay_ms: u64) -> String {
+    let config = json!({
+        "version": "1",
+        "proxies": [{
+            "id": "masque",
+            "listen_path": MASQUE_PREFIX,
+            "backend_scheme": "http",
+            "backend_host": "127.0.0.1",
+            "backend_port": target_port,
+            "strip_listen_path": false,
+            "plugins": [
+                {"plugin_config_id": "masque-jwt"},
+                {"plugin_config_id": "masque-delay"},
+            ],
+        }],
+        "consumers": [{
+            "id": AUTH_CONSUMER,
+            "username": AUTH_CONSUMER,
+            "credentials": {"jwt": [{"secret": AUTH_JWT_SECRET}]},
+        }],
+        "upstreams": [],
+        "plugin_configs": [{
+            "id": "masque-jwt",
+            "plugin_name": "jwt_auth",
+            "scope": "proxy",
+            "proxy_id": "masque",
+            "enabled": true,
+            "config": {
+                "token_lookup": "header:Authorization",
+                "consumer_claim_field": "sub",
+            },
+        }, {
+            "id": "masque-delay",
+            "plugin_name": "fault_injection",
+            "scope": "proxy",
+            "proxy_id": "masque",
+            "enabled": true,
+            "config": {
+                "delay": {"duration_ms": delay_ms, "percentage": 100.0},
+            },
+        }],
+    });
+    serde_yaml::to_string(&config).expect("yaml serialize")
+}
+
+const MTLS_CONSUMER: &str = "alice.h3.local";
+
+struct GeneratedCa {
+    cert_pem: String,
+    issuer: Issuer<'static, KeyPair>,
+}
+
+struct GeneratedCert {
+    cert_pem: String,
+    key_pem: String,
+}
+
+fn generate_ca(cn: &str) -> GeneratedCa {
+    let key_pair = KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).expect("generate CA key");
+    let mut params = CertificateParams::new(Vec::<String>::new()).expect("CA params");
+    params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+    params
+        .distinguished_name
+        .push(rcgen::DnType::CommonName, cn);
+    params.key_usages.push(KeyUsagePurpose::KeyCertSign);
+    params.key_usages.push(KeyUsagePurpose::CrlSign);
+    let cert = params.self_signed(&key_pair).expect("self-sign CA");
+    GeneratedCa {
+        cert_pem: cert.pem(),
+        issuer: Issuer::new(params, key_pair),
+    }
+}
+
+fn generate_short_lived_client_cert(
+    ca: &GeneratedCa,
+    cn: &str,
+    ttl: time::Duration,
+) -> GeneratedCert {
+    let key_pair =
+        KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).expect("generate client key");
+    let mut params = CertificateParams::new(Vec::<String>::new()).expect("client params");
+    params
+        .distinguished_name
+        .push(rcgen::DnType::CommonName, cn);
+    params
+        .extended_key_usages
+        .push(ExtendedKeyUsagePurpose::ClientAuth);
+    let now = time::OffsetDateTime::now_utc();
+    params.not_before = now - time::Duration::seconds(5);
+    params.not_after = now + ttl;
+    let cert = params.signed_by(&key_pair, &ca.issuer).expect("sign leaf");
+    GeneratedCert {
+        cert_pem: cert.pem(),
+        key_pem: key_pair.serialize_pem(),
+    }
+}
+
+fn write_pem(dir: &TempDir, name: &str, data: &str) -> String {
+    let path = dir.path().join(name);
+    std::fs::write(&path, data).expect("write PEM");
+    path.to_str().expect("PEM path is UTF-8").to_string()
+}
+
+fn masque_mtls_config(target_port: u16) -> String {
+    let config = json!({
+        "version": "1",
+        "proxies": [{
+            "id": "masque",
+            "listen_path": MASQUE_PREFIX,
+            "backend_scheme": "http",
+            "backend_host": "127.0.0.1",
+            "backend_port": target_port,
+            "strip_listen_path": false,
+            "plugins": [{"plugin_config_id": "masque-mtls"}],
+        }],
+        "consumers": [{
+            "id": "alice",
+            "username": "alice",
+            "credentials": {"mtls_auth": [{"identity": MTLS_CONSUMER}]},
+        }],
+        "upstreams": [],
+        "plugin_configs": [{
+            "id": "masque-mtls",
+            "plugin_name": "mtls_auth",
+            "scope": "proxy",
+            "proxy_id": "masque",
+            "enabled": true,
+            "config": {"cert_field": "subject_cn"},
+        }],
+    });
+    serde_yaml::to_string(&config).expect("yaml serialize")
+}
+
+/// Open a CONNECT-UDP request, retrying only transport/startup failures. A
+/// completed response — including a 401 — is returned as-is so precommit
+/// refusals are not retried into a 200.
+async fn connect_udp_until_headers(
+    client: &Http3Client,
+    url: &str,
+    extra_headers: &[(&str, &str)],
+) -> Http3ConnectUdp {
+    let mut last_error = None;
+    let deadline = std::time::Instant::now() + Duration::from_secs(40);
+    loop {
+        match client.connect_udp_with_headers(url, extra_headers).await {
+            Ok(tunnel) => return tunnel,
+            Err(error) if std::time::Instant::now() < deadline => {
+                last_error = Some(error.to_string());
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+            Err(error) => panic!(
+                "CONNECT-UDP request never completed; last startup error={last_error:?}; \
+                 final error={error}"
+            ),
+        }
+    }
+}
+
+async fn start_masque_gateway_owned(
+    config: String,
+    extra_env: &[(String, String)],
+) -> (TestGateway, u16) {
+    let extra: Vec<(&str, &str)> = extra_env
+        .iter()
+        .map(|(k, v)| (k.as_str(), v.as_str()))
+        .collect();
+    start_masque_gateway(config, &extra).await
+}
+
+#[ignore]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn functional_h3_connect_udp_mtls_not_after_terminates_a_live_tunnel() {
+    let echo = UdpEcho::spawn().await;
+    let dir = TempDir::new().expect("temp dir");
+    let ca = generate_ca("H3-CONNECT-UDP-MTLS-CA");
+    let ca_path = write_pem(&dir, "client-ca.pem", &ca.cert_pem);
+
+    let yaml = masque_mtls_config(echo.port);
+    let extra = vec![
+        (
+            "FERRUM_HTTP3_CONNECT_UDP_ENABLED".to_string(),
+            "true".to_string(),
+        ),
+        (
+            "FERRUM_AUTHENTICATED_STREAM_MAX_LIFETIME_SECONDS".to_string(),
+            "3600".to_string(),
+        ),
+        (
+            "FERRUM_HTTP3_CONNECT_UDP_IDLE_TIMEOUT_SECONDS".to_string(),
+            "600".to_string(),
+        ),
+        (
+            "FERRUM_FRONTEND_TLS_CLIENT_CA_BUNDLE_PATH".to_string(),
+            ca_path,
+        ),
+    ];
+    let (mut gateway, https_port) = start_masque_gateway_owned(yaml, &extra).await;
+
+    // Mint the leaf AFTER the gateway is up so `notAfter` is measured from
+    // the moment we will actually handshake, not from process startup.
+    let alice = generate_short_lived_client_cert(&ca, MTLS_CONSUMER, time::Duration::seconds(15));
+    let client = Http3Client::insecure_with_client_auth(&alice.cert_pem, &alice.key_pem)
+        .expect("mTLS H3 client");
+    let url = tunnel_url(https_port, "127.0.0.1", echo.port);
+    let mut tunnel = connect_udp_until_headers(&client, &url, &[]).await;
+    assert_eq!(
+        tunnel.status.as_u16(),
+        200,
+        "a live mTLS CONNECT-UDP tunnel must still be 200 while notAfter is in the future"
+    );
+
+    tunnel
+        .send_datagram(b"before-not-after")
+        .await
+        .expect("send datagram before notAfter");
+    assert_eq!(
+        tunnel
+            .recv_datagram(Duration::from_secs(10))
+            .await
+            .expect("receive echoed datagram before notAfter"),
+        b"before-not-after"
+    );
+
+    let round_trips = relay_datagrams_for(&mut tunnel, Duration::from_secs(8)).await;
+    assert!(
+        round_trips > 0,
+        "the tunnel must have carried traffic before the leaf notAfter elapsed"
+    );
+
+    tunnel
+        .expect_stream_reset(AUTH_TERMINATION_GRACE)
+        .await
+        .expect("the tunnel must reset at the mtls_auth leaf notAfter, never clean-FIN");
+
+    assert_exactly_one_stream_udp_termination(&gateway, "credential_expired").await;
+    assert_eq!(
+        stream_udp_terminations(&gateway, "authenticated_stream_max_lifetime").await,
+        0,
+        "the leaf notAfter — not the fallback maximum — must be the reported class"
+    );
+
+    gateway.shutdown();
+}
+
+#[ignore]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn functional_h3_connect_udp_expiry_before_200_is_a_fixed_redacted_401() {
+    let echo = UdpEcho::spawn().await;
+    // Maximum of 2s, anchored at request receipt. A 4s before_proxy delay
+    // consumes that budget before the handler can offer a 200. The JWT itself
+    // is valid for an hour, so the reported class is the maximum.
+    let yaml = masque_authenticated_config_with_precommit_delay(echo.port, 4_000);
+    let env = [
+        ("FERRUM_HTTP3_CONNECT_UDP_ENABLED", "true"),
+        ("FERRUM_AUTHENTICATED_STREAM_MAX_LIFETIME_SECONDS", "2"),
+        ("FERRUM_HTTP3_CONNECT_UDP_IDLE_TIMEOUT_SECONDS", "600"),
+        ("FERRUM_HTTP3_CONNECT_UDP_MAX_SESSIONS", "1"),
+    ];
+    let (mut gateway, https_port) = start_masque_gateway(yaml, &env).await;
+
+    let client = Http3Client::insecure().expect("H3 client");
+    let url = tunnel_url(https_port, "127.0.0.1", echo.port);
+    let token = mint_masque_token(3_600);
+    let authorization = format!("Bearer {token}");
+
+    for attempt in 1..=3 {
+        let mut refused = connect_udp_until_headers(
+            &client,
+            &url,
+            &[("authorization", authorization.as_str())],
+        )
+        .await;
+        assert_eq!(
+            refused.status.as_u16(),
+            401,
+            "attempt {attempt}: expiry before the 200 must be the fixed 401, not a tunnel"
+        );
+        let body = refused
+            .recv_body_text(Duration::from_secs(5))
+            .await
+            .expect("drain 401 body");
+        assert!(
+            body.contains("Unauthorized"),
+            "attempt {attempt}: the 401 body must be the shared redacted terminal, got {body}"
+        );
+        assert!(
+            !body.contains("session limit"),
+            "attempt {attempt}: a precommit expiry must not consume a session permit"
+        );
+        assert!(
+            !body.contains(&token),
+            "attempt {attempt}: the 401 must not echo the credential"
+        );
+    }
+
+    let deadline = std::time::Instant::now() + AUTH_TERMINATION_GRACE;
+    let observed = loop {
+        let value =
+            stream_udp_terminations(&gateway, "authenticated_stream_max_lifetime").await;
+        if value >= 3 || std::time::Instant::now() >= deadline {
+            break value;
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    };
+    assert_eq!(
+        observed, 3,
+        "each precommit refusal must record exactly one stream_udp maximum-lifetime termination"
+    );
+    assert_eq!(
+        stream_udp_terminations(&gateway, "credential_expired").await,
+        0,
+        "a live JWT must not be reported as expired when the maximum is the bound"
+    );
+
     gateway.shutdown();
 }

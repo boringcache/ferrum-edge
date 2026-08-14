@@ -121,11 +121,29 @@
 //!
 //! * the effective deadline (the earlier of the credential's own expiry and
 //!   `FERRUM_AUTHENTICATED_STREAM_MAX_LIFETIME_SECONDS`) is derived ONCE from
-//!   the accepted `RequestContext`, before the session permit, DNS, the tunnel
-//!   socket, or the 200;
-//! * a deadline that has already elapsed at that point is a fixed, redacted
-//!   pre-commitment refusal — no permit is consumed, no address is resolved, no
-//!   UDP socket is created, and no tunnel is committed;
+//!   the accepted `RequestContext` as a single captured
+//!   [`crate::proxy::auth_lifetime::StreamAuthDeadline`]; it is never refreshed
+//!   and never re-derived;
+//! * an already-elapsed deadline is refused at the early gate, before the
+//!   session permit, DNS, or the UDP socket, with the shared fixed/redacted
+//!   pre-commitment 401 — already-expired requests never acquire those
+//!   resources;
+//! * every awaited pre-commitment setup stage that can span the captured
+//!   instant (DNS, the tunnel-socket connect) runs under
+//!   [`crate::proxy::auth_lifetime::ComposedAuthBound`] with that same plan:
+//!   authorization wins on a tie, and a strictly earlier protocol bound (the
+//!   existing connect-budget DNS timeout) keeps its existing 504/timeout
+//!   behaviour;
+//! * the last instant before a `200` is offered re-checks the captured plan.
+//!   Expiry here is still the fixed/redacted 401; the session permit and
+//!   socket are released on return and no tunnel is committed;
+//! * the H3 response HEADERS write itself is raced with
+//!   [`crate::http3::stream_util::await_authorized_headers_write`]. A
+//!   successful `200` is counted only after that write actually succeeds. If
+//!   authorization expires while the write is parked in QUIC flow control or
+//!   QPACK, the termination is recorded exactly once, the send half is
+//!   aborted/reset, and the socket/permit/guards are released — no second
+//!   blocking terminal write is attempted;
 //! * a live tunnel is supervised by an EXACT `sleep_until` on that absolute
 //!   instant, biased ahead of every other supervisor arm. Datagram activity in
 //!   either direction never refreshes or recomputes it, and it is deliberately
@@ -138,6 +156,10 @@
 //! * teardown stays bounded even when the client-bound relay is parked in QUIC
 //!   send flow control: the existing `CLOSE_GRACE` abort-and-join is what
 //!   releases the socket, permit, and connection guard on time.
+//!   [`reconcile_authorization_teardown`] keeps that designed abort classified
+//!   as the expiry it was only when the send half was cancelled after the
+//!   grace timeout; a panic or any unrelated cancellation stays
+//!   [`SessionEnd::RelayTaskFailed`].
 //!
 //! An UNAUTHENTICATED tunnel admitted no principal, so it has no authorization
 //! lifetime to bound and is unaffected: no timer is registered and every
@@ -1420,9 +1442,13 @@ pub fn resolve_send_half_close_command(
 ///
 /// A completed task's outcome is taken verbatim: that is the close it applied,
 /// whether it consumed a supervisor command or decided for itself. A panic or
-/// a cancellation — including abort after `CLOSE_GRACE` — means the intended
-/// close was not applied, so the session is [`SessionEnd::RelayTaskFailed`]
-/// rather than a clean supervisor verdict the client never saw.
+/// a cancellation means the intended close was not applied, so the session is
+/// [`SessionEnd::RelayTaskFailed`] rather than a supervisor verdict the client
+/// never saw. The one designed exception — aborting a flow-control-stalled
+/// send half after `CLOSE_GRACE` on an authorization expiry — is applied by
+/// [`reconcile_authorization_teardown`], which requires the join to be a
+/// cancellation AND the grace to have timed out. This helper does not itself
+/// preserve [`SessionEnd::AuthorizationExpired`].
 pub fn classify_send_half_teardown(joined: SendHalfTeardownJoin) -> SessionEnd {
     match joined {
         SendHalfTeardownJoin::Completed(end) => end,
@@ -1432,8 +1458,8 @@ pub fn classify_send_half_teardown(joined: SendHalfTeardownJoin) -> SessionEnd {
     }
 }
 
-/// Reconcile the supervisor's own verdict with the send half's teardown
-/// classification (issue #3860).
+/// Reconcile the supervisor's own verdict with the send half's teardown join
+/// (issue #3860).
 ///
 /// [`classify_send_half_teardown`] reports a send half that never applied its
 /// close as [`SessionEnd::RelayTaskFailed`], because for every other outcome
@@ -1446,20 +1472,23 @@ pub fn classify_send_half_teardown(joined: SendHalfTeardownJoin) -> SessionEnd {
 /// abort drops the QUIC send half, which resets the stream, which is exactly
 /// the non-clean terminal this outcome requires.
 ///
-/// Keeping the supervisor's class here matters twice over: the tunnel is
-/// reported (and logged) as the policy expiry it was, and a client that can
-/// stall a stream cannot turn its own credential's natural expiry into a
-/// gateway-side internal-failure signal on every tunnel it opens.
-///
-/// Only that one substitution is made. A panic, or a failed close on any other
-/// outcome, stays [`SessionEnd::RelayTaskFailed`].
+/// That preservation is deliberately narrow. It requires all three:
+/// the supervisor's own verdict is [`SessionEnd::AuthorizationExpired`], the
+/// send-half join is a cancellation (not a panic), AND `CLOSE_GRACE` actually
+/// timed out so this session is the one that aborted the stalled task. A panic
+/// after an authorization verdict, or any cancellation that was not this
+/// session's bounded abort, stays [`SessionEnd::RelayTaskFailed`] so a genuine
+/// task failure cannot be relabeled as ordinary credential expiry.
 pub fn reconcile_authorization_teardown(
     supervisor_verdict: SessionEnd,
-    teardown_verdict: SessionEnd,
+    teardown: SendHalfTeardownJoin,
+    grace_timed_out: bool,
 ) -> SessionEnd {
-    match (supervisor_verdict, teardown_verdict) {
-        (SessionEnd::AuthorizationExpired(_), SessionEnd::RelayTaskFailed) => supervisor_verdict,
-        _ => teardown_verdict,
+    match (supervisor_verdict, teardown, grace_timed_out) {
+        (SessionEnd::AuthorizationExpired(_), SendHalfTeardownJoin::Cancelled, true) => {
+            supervisor_verdict
+        }
+        (_, teardown, _) => classify_send_half_teardown(teardown),
     }
 }
 
@@ -1481,15 +1510,18 @@ fn observe_send_half_join(
             );
             SendHalfTeardownJoin::Panicked
         }
-        // Cancelled after an authorization-lifetime expiry. This is the
-        // designed path for a client that stopped reading — the relay was
-        // parked in QUIC send flow control and could not consume the close
-        // command — and the abort itself resets the stream, so the client still
-        // gets a non-clean terminal. It is ordinary, client-triggerable
-        // lifecycle rather than a gateway fault, and an expiry is exactly the
-        // kind of event a client can produce on every tunnel it opens, so it is
+        // Designed abort after CLOSE_GRACE on an authorization expiry: the
+        // relay was parked in QUIC send flow control and could not consume the
+        // close command, and THIS session is the one that timed out the grace
+        // and aborted it. The abort itself resets the stream. It is ordinary,
+        // client-triggerable lifecycle rather than a gateway fault, so it is
         // `debug!` (see the `Log level` section of `src/proxy/auth_lifetime.rs`).
-        Err(_) if matches!(supervisor_verdict, SessionEnd::AuthorizationExpired(_)) => {
+        // A panic is already classified above; a cancellation that was not
+        // this session's grace abort falls through to the warning arm.
+        Err(_)
+            if grace_timed_out
+                && matches!(supervisor_verdict, SessionEnd::AuthorizationExpired(_)) =>
+        {
             debug!(
                 proxy_id = %proxy_id,
                 relay = relay.as_str(),
@@ -1881,8 +1913,18 @@ pub(crate) async fn handle_h3_connect_udp(
     // unscreened dial. `proxy` is the route-override-effective shape, so an
     // override installed by a plugin route override is the one honoured.
     let connect_budget = Duration::from_millis(proxy.backend_connect_timeout_ms.max(1));
-    let resolved = match tokio::time::timeout(
-        connect_budget,
+    // Compose the existing connect-budget timeout with the captured
+    // authorization plan. An unauthenticated request has no plan, so this is
+    // exactly the protocol timeout the lookup already had and registers no
+    // authorization timer. A tie, or an earlier credential deadline, is
+    // attributed to authorization from the captured composition rather than
+    // from a second clock read.
+    let dns_bound = crate::proxy::auth_lifetime::ComposedAuthBound::compose(
+        Some(tokio::time::Instant::now() + connect_budget),
+        auth_deadline,
+    );
+    let resolved = match crate::plugins::await_deadline_first(
+        dns_bound.deadline(),
         state
             .dns_cache
             .resolve_all_fresh_with_override(&target.host, proxy.dns_override.as_deref()),
@@ -1912,7 +1954,31 @@ pub(crate) async fn handle_h3_connect_udp(
             )
             .await;
         }
-        Err(_) => {
+        Err(()) => {
+            if let Some(termination) = dns_bound.expired_authorization() {
+                ctx.record_authorization_termination_once(
+                    termination,
+                    crate::proxy::auth_lifetime::StreamAuthProtocolFamily::StreamUdp,
+                );
+                debug!(
+                    proxy_id = %proxy.id,
+                    reason = termination.as_str(),
+                    "Refused HTTP/3 CONNECT-UDP: the request's authorization lifetime \
+                     elapsed during target DNS resolution"
+                );
+                return reject_authorization_expired(
+                    &mut stream,
+                    &state,
+                    &plugins,
+                    &ctx,
+                    &initial_response_header_policy_plugins,
+                    termination,
+                    plugin_execution_ns,
+                    start_time,
+                    &request_path,
+                )
+                .await;
+            }
             warn!(
                 proxy_id = %proxy.id,
                 "HTTP/3 CONNECT-UDP: target DNS resolution timed out"
@@ -1986,34 +2052,89 @@ pub(crate) async fn handle_h3_connect_udp(
             .await;
         }
     };
-    if let Err(error) = socket.connect(target_addr).await {
-        warn!(
-            proxy_id = %proxy.id,
-            error = %error,
-            "HTTP/3 CONNECT-UDP: failed to connect tunnel socket"
-        );
-        return reject(
-            &mut stream,
-            &state,
-            &plugins,
-            &ctx,
-            &initial_response_header_policy_plugins,
-            StatusCode::BAD_GATEWAY,
-            r#"{"error":"CONNECT-UDP tunnel socket could not be created"}"#,
-            "connect_udp_socket_error",
-            plugin_execution_ns,
-            start_time,
-            &request_path,
-            proxy_status_headers("destination_unavailable"),
-        )
-        .await;
+    // Bound the connect await by the captured authorization plan. An
+    // unauthenticated request composes `None` and so remains an unbounded
+    // `connect` — byte for byte the previous behaviour, with no authorization
+    // timer registered. Authenticated requests cannot park here past the
+    // credential that admitted them.
+    let connect_bound =
+        crate::proxy::auth_lifetime::ComposedAuthBound::compose(None, auth_deadline);
+    match crate::plugins::await_deadline_first(
+        connect_bound.deadline(),
+        socket.connect(target_addr),
+    )
+    .await
+    {
+        Ok(Ok(())) => {}
+        Ok(Err(error)) => {
+            warn!(
+                proxy_id = %proxy.id,
+                error = %error,
+                "HTTP/3 CONNECT-UDP: failed to connect tunnel socket"
+            );
+            return reject(
+                &mut stream,
+                &state,
+                &plugins,
+                &ctx,
+                &initial_response_header_policy_plugins,
+                StatusCode::BAD_GATEWAY,
+                r#"{"error":"CONNECT-UDP tunnel socket could not be created"}"#,
+                "connect_udp_socket_error",
+                plugin_execution_ns,
+                start_time,
+                &request_path,
+                proxy_status_headers("destination_unavailable"),
+            )
+            .await;
+        }
+        Err(()) => {
+            if let Some(termination) = connect_bound.expired_authorization() {
+                ctx.record_authorization_termination_once(
+                    termination,
+                    crate::proxy::auth_lifetime::StreamAuthProtocolFamily::StreamUdp,
+                );
+                debug!(
+                    proxy_id = %proxy.id,
+                    reason = termination.as_str(),
+                    "Refused HTTP/3 CONNECT-UDP: the request's authorization lifetime \
+                     elapsed while connecting the tunnel socket"
+                );
+                return reject_authorization_expired(
+                    &mut stream,
+                    &state,
+                    &plugins,
+                    &ctx,
+                    &initial_response_header_policy_plugins,
+                    termination,
+                    plugin_execution_ns,
+                    start_time,
+                    &request_path,
+                )
+                .await;
+            }
+            warn!(
+                proxy_id = %proxy.id,
+                "HTTP/3 CONNECT-UDP: tunnel socket connect timed out"
+            );
+            return reject(
+                &mut stream,
+                &state,
+                &plugins,
+                &ctx,
+                &initial_response_header_policy_plugins,
+                StatusCode::BAD_GATEWAY,
+                r#"{"error":"CONNECT-UDP tunnel socket could not be created"}"#,
+                "connect_udp_socket_error",
+                plugin_execution_ns,
+                start_time,
+                &request_path,
+                proxy_status_headers("destination_unavailable"),
+            )
+            .await;
+        }
     }
     let socket = Arc::new(socket);
-
-    // Accounting handoff: the request becomes a long-lived connection so
-    // graceful drain waits for it and it is not double-counted as a request.
-    let session_guard = crate::overload::ConnectionGuard::new(&state.overload);
-    drop(request_guard);
 
     // ── 200 + Capsule-Protocol (RFC 9297 §3.4) ──────────────────────────
     let mut response_headers: HashMap<String, String> = HashMap::new();
@@ -2044,12 +2165,107 @@ pub(crate) async fn handle_h3_connect_udp(
             ));
         }
     };
-    crate::proxy::record_request(&state, 200);
-    if let Err(error) = stream.send_response(response).await {
-        return Err(anyhow::anyhow!(
-            "H3 CONNECT-UDP send_response failed: {error}"
-        ));
+
+    // Final pre-commitment gate: the last instant before a 200 is offered.
+    // DNS, socket connect, and response-header policy all ran under the
+    // captured plan; this re-check is what stops a credential that expired
+    // during that work from committing a protected tunnel. The session permit
+    // and socket drop on return; `request_guard` is still held so this is
+    // still an in-flight request, not a long-lived connection.
+    if let Some(termination) = crate::proxy::auth_lifetime::expired_authorization(auth_deadline) {
+        ctx.record_authorization_termination_once(
+            termination,
+            crate::proxy::auth_lifetime::StreamAuthProtocolFamily::StreamUdp,
+        );
+        debug!(
+            proxy_id = %proxy.id,
+            reason = termination.as_str(),
+            "Refused HTTP/3 CONNECT-UDP: the request's authorization lifetime elapsed \
+             before the 200 was offered; no tunnel was committed"
+        );
+        return reject_authorization_expired(
+            &mut stream,
+            &state,
+            &plugins,
+            &ctx,
+            &initial_response_header_policy_plugins,
+            termination,
+            plugin_execution_ns,
+            start_time,
+            &request_path,
+        )
+        .await;
     }
+
+    // The HEADERS write itself can park in QPACK / QUIC flow control. Race it
+    // with the SAME captured plan the gates above used. An unauthenticated
+    // request composes `None` and takes the no-timer hot path, so this write
+    // stays byte-for-byte the previous unbounded `send_response`.
+    let response_header_write_bound =
+        crate::proxy::auth_lifetime::ComposedAuthBound::compose(None, auth_deadline);
+    let auth_latch = ctx.authorization_termination_latch();
+    let header_write = crate::http3::stream_util::await_authorized_headers_write(
+        response_header_write_bound,
+        crate::proxy::auth_lifetime::StreamAuthProtocolFamily::StreamUdp,
+        &auth_latch,
+        stream.send_response(response),
+    )
+    .await;
+    match header_write {
+        crate::http3::stream_util::H3AuthorizedHeadersWrite::Written => {}
+        crate::http3::stream_util::H3AuthorizedHeadersWrite::AuthorizationExpired(termination) => {
+            // The helper already recorded the counter through the request latch.
+            // Latch the class into the summary, abort/reset without attempting
+            // another blocking terminal write, and release permit/socket/guards
+            // on return. A 200 was never committed, so it is not counted.
+            ctx.record_authorization_termination_once(
+                termination,
+                crate::proxy::auth_lifetime::StreamAuthProtocolFamily::StreamUdp,
+            );
+            debug!(
+                proxy_id = %proxy.id,
+                reason = termination.as_str(),
+                "HTTP/3 CONNECT-UDP 200 HEADERS could not be written before the \
+                 authorization lifetime elapsed; resetting the stream"
+            );
+            crate::http3::stream_util::abort_response_stream(&mut stream);
+            crate::proxy::log_rejected_request_with_path(
+                &plugins,
+                &ctx,
+                StatusCode::UNAUTHORIZED.as_u16(),
+                start_time,
+                termination.as_str(),
+                plugin_execution_ns,
+                Some(&request_path),
+            )
+            .await;
+            drop(session_permit);
+            drop(request_guard);
+            drop(per_ip_guard);
+            drop(socket);
+            return Ok(());
+        }
+        crate::http3::stream_util::H3AuthorizedHeadersWrite::ClientWriteFailed => {
+            return Err(anyhow::anyhow!(
+                "H3 CONNECT-UDP send_response failed: client write failed"
+            ));
+        }
+        crate::http3::stream_util::H3AuthorizedHeadersWrite::ProtocolDeadlineExceeded => {
+            // compose(None, auth_deadline) never produces a protocol-only bound:
+            // either authorization owns the instant, or there is no deadline at
+            // all. Treat this as a failed write rather than counting a 200.
+            crate::http3::stream_util::abort_response_stream(&mut stream);
+            return Err(anyhow::anyhow!(
+                "H3 CONNECT-UDP send_response failed: protocol deadline exceeded"
+            ));
+        }
+    }
+
+    // The 200 is on the wire. Count it only now, then hand the request off to
+    // a long-lived connection so graceful drain waits for the tunnel.
+    crate::proxy::record_request(&state, 200);
+    let session_guard = crate::overload::ConnectionGuard::new(&state.overload);
+    drop(request_guard);
     // The tunnel is established; per-IP *request* accounting ends here exactly
     // as it does for an H3 WebSocket upgrade.
     drop(per_ip_guard);
@@ -2610,17 +2826,19 @@ async fn relay(
             }
         };
         // An authorization expiry against a stalled client reaches the abort
-        // branch BY DESIGN, so it keeps its own class instead of being demoted
-        // to an internal relay failure the gateway did not actually suffer.
+        // branch BY DESIGN, so it keeps its own class only when the join is a
+        // cancellation after CLOSE_GRACE. A panic, or any other cancellation,
+        // stays RelayTaskFailed.
         end = reconcile_authorization_teardown(
             supervisor_verdict,
-            classify_send_half_teardown(observe_send_half_join(
+            observe_send_half_join(
                 joined,
                 RelayDirection::TargetToClient,
                 &proxy.id,
                 grace_timed_out,
                 supervisor_verdict,
-            )),
+            ),
+            grace_timed_out,
         );
     }
     if !to_target_finished {
@@ -2721,9 +2939,12 @@ where
 /// subject, certificate field, provider, or destination reaches the client, and
 /// the two termination classes are indistinguishable on the wire.
 ///
-/// Reached only before the session permit, DNS, the tunnel socket, and the 200,
-/// so there is nothing tunnel-scoped to release here — this returns through the
-/// same boundary as every other admission refusal.
+/// Reached from every pre-commitment expiry seam: the early gate (before the
+/// session permit, DNS, and socket), an expiry that wins a composed DNS or
+/// socket-connect wait, and the final gate immediately before the 200 is
+/// offered. Anything acquired on those later seams (permit, socket) is
+/// released by RAII on return. Never used after a 200 has been committed —
+/// that path aborts/resets instead of writing a second terminal.
 #[allow(clippy::too_many_arguments)]
 async fn reject_authorization_expired<S>(
     stream: &mut RequestStream<S, Bytes>,
