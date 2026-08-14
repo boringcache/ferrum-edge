@@ -13,7 +13,10 @@
 //!    new backend source-address being allocated on subsequent traffic.
 //! 2. [`udp_amplification_bound_enforced`] — oversized backend replies
 //!    are dropped per `udp_max_response_amplification_factor`.
-//! 3. [`dtls_passthrough_sni_routes_to_correct_backend`] — passthrough
+//! 3. [`udp_amplification_cumulative_multi_datagram_budget`] — several
+//!    in-budget replies still fail closed once their sum exceeds the
+//!    per-request remaining budget.
+//! 4. [`dtls_passthrough_sni_routes_to_correct_backend`] — passthrough
 //!    DTLS proxy routes clients by SNI peeked from the DTLS
 //!    ClientHello.
 
@@ -515,6 +518,68 @@ plugin_configs: []
     assert!(
         backend.packets_sent() >= 90,
         "backend should have attempted all 100 sends; got {}",
+        backend.packets_sent()
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore]
+async fn udp_amplification_cumulative_multi_datagram_budget() {
+    let reservation = reserve_udp_port().await.expect("reserve");
+    let backend_port = reservation.port;
+    let reply_payload = vec![b'x'; 80];
+    let backend = ScriptedUdpBackend::builder(reservation.into_socket())
+        .step(UdpStep::ExpectDatagram(DatagramMatcher::any()))
+        .step(UdpStep::ReplyN {
+            payload: reply_payload.clone(),
+            count: 3,
+        })
+        .spawn()
+        .expect("spawn backend");
+
+    let build_yaml = move |listen_port: u16| {
+        format!(
+            r#"
+version: "1"
+proxies:
+  - id: "udp-amp-cumulative"
+    listen_port: {listen_port}
+    backend_scheme: udp
+    backend_host: "127.0.0.1"
+    backend_port: {backend_port}
+    udp_max_response_amplification_factor: 2
+    udp_idle_timeout_seconds: 30
+
+consumers: []
+upstreams: []
+plugin_configs: []
+"#
+        )
+    };
+    let fx = start_gateway_with_retry(build_yaml, Vec::new(), false).await;
+    let gateway_addr: SocketAddr = format!("127.0.0.1:{}", fx.udp_port).parse().unwrap();
+    let client = UdpClient::connect(gateway_addr).await.expect("client");
+
+    // Request 100 bytes, factor 2 → remaining budget 200. Each reply is 80
+    // bytes (under the per-datagram product) so a per-datagram-only check
+    // would forward all three. Cumulative accounting must deliver two and
+    // drop the third.
+    let request = vec![b'r'; 100];
+    client.send_datagram(&request).await.expect("send");
+    let received = client
+        .recv_batch_with_deadline(8, Duration::from_millis(1500))
+        .await;
+    assert_eq!(
+        received.len(),
+        2,
+        "third in-budget datagram must still exhaust the remaining request budget; got {} replies",
+        received.len()
+    );
+    assert!(received.iter().all(|d| d.len() == 80));
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert!(
+        backend.packets_sent() >= 3,
+        "backend should have attempted all three sends; got {}",
         backend.packets_sent()
     );
 }

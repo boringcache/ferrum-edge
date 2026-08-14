@@ -508,6 +508,10 @@ Sorted by family name. Optional namespace labels are listed when the emitter sup
 | `ferrum_tls_store_oversized_total` | counter | `store`, `direction`, `namespace` | `tls` | `documented_only` | `always` | Oversized persistent TLS store document refusals by store and direction. |
 | `ferrum_tls_store_pruned_total` | counter | `namespace` | `tls` | `documented_only` | `always` | Terminal ACME order history entries pruned under the exclusive mutation lock. |
 | `ferrum_tls_store_record_count` | gauge | `store`, `namespace` | `tls` | `documented_only` | `always` | Current logical record count in a persistent TLS store. |
+| `ferrum_udp_amplification_policy_invalid_total` | counter | `namespace` | `udp` | `documented_only` | `always` | UDPResponseAmplificationPolicy objects rejected before listener programming. |
+| `ferrum_udp_amplification_responses_allowed_total` | counter | `namespace` | `udp` | `documented_only` | `always` | UDP backend responses admitted by the per-request amplification budget. |
+| `ferrum_udp_amplification_responses_dropped_total` | counter | `namespace` | `udp` | `documented_only` | `always` | UDP backend responses dropped for exceeding the per-request amplification budget. |
+| `ferrum_udp_amplification_unlimited_total` | counter | `namespace` | `udp` | `documented_only` | `always` | UDP/DTLS sessions admitted without a response-amplification limit. |
 | `ferrum_websocket_bytes_total` | counter | `proxy_id`, `direction`, `namespace` | `websocket` | `documented_only` | `conditional` | WebSocket payload bytes relayed by direction. |
 | `ferrum_websocket_frames_total` | counter | `proxy_id`, `direction`, `namespace` | `websocket` | `documented_only` | `conditional` | WebSocket frames relayed by direction. |
 | `ferrum_websocket_session_duration_ms` | histogram | `proxy_id`, `result`, `direction`, `io_side`, `error_class`, `termination_reason`, `le`, `namespace` | `websocket` | `documented_only` | `conditional` | WebSocket session duration in milliseconds. |

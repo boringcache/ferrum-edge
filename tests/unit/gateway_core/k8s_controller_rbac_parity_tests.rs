@@ -31,6 +31,7 @@ const STATUS_WRITTEN_PLURALS: &[&str] = &[
     "backendlbpolicies",
     "xbackendtrafficpolicies",
     "listenersets",
+    "udpresponseamplificationpolicies",
 ];
 
 fn rule_grants(group: &str, plural: &str) -> bool {
