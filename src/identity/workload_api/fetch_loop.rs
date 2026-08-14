@@ -20,15 +20,20 @@ use tracing::{debug, error, info, warn};
 use super::client::WorkloadApiClient;
 use crate::identity::{SpiffeId, SvidBundle};
 
-type SvidInstaller = Arc<dyn Fn(SvidBundle) + Send + Sync + 'static>;
+/// Returns whether the installer already published the backend SVID rotation.
+/// A trust-withdrawing `ProxyState` installer must do so inside its admission
+/// fence; the fetch loop then skips its ordinary post-install bump.
+type SvidInstaller = Arc<dyn Fn(SvidBundle) -> bool + Send + Sync + 'static>;
 
 /// Handle returned by [`spawn_fetch_loop`]. Holds the shared `ArcSwap` and
 /// the "first SVID arrived" notifier.
 ///
 /// `revision_tx`, when set, is bumped on every `install` call after the first
 /// so backend TLS pools subscribed to the matching `watch::Receiver` can drain
-/// stale identity material. Production callers pass a clone of
-/// `ProxyState.backend_svid_rotation_tx`; tests can leave it unset.
+/// stale identity material. An installer that already published the same bump
+/// inside a trust-withdrawal fence returns `true` to suppress a duplicate.
+/// Production callers pass a clone of `ProxyState.backend_svid_rotation_tx`;
+/// tests can leave it unset.
 #[derive(Clone)]
 pub struct SvidFetchHandle {
     pub current: Arc<ArcSwap<Option<SvidBundle>>>,
@@ -82,10 +87,11 @@ impl SvidFetchHandle {
     /// Mesh mode uses this to publish SPIRE rotations through
     /// `ProxyState::install_gateway_runtime_svid_bundle`, preserving CP/slice
     /// trust overlays instead of overwriting the shared slot with the raw SPIRE
-    /// bundle.
+    /// bundle. The callback returns whether it already published the backend
+    /// rotation as part of a fenced trust withdrawal.
     pub fn with_installer<F>(self, installer: F) -> Self
     where
-        F: Fn(SvidBundle) + Send + Sync + 'static,
+        F: Fn(SvidBundle) -> bool + Send + Sync + 'static,
     {
         if self.installer.set(Arc::new(installer)).is_err() {
             warn!("SVID fetch handle installer already configured; keeping existing installer");
@@ -127,17 +133,18 @@ impl SvidFetchHandle {
 
     fn install(&self, bundle: SvidBundle, metrics_source: FetchLoopMetricsSource) {
         record_fetch_bundle_metrics(&bundle, metrics_source);
-        if let Some(installer) = self.installer.get() {
-            installer(bundle);
+        let rotation_already_published = if let Some(installer) = self.installer.get() {
+            installer(bundle)
         } else {
             self.current.store(Arc::new(Some(bundle)));
-        }
+            false
+        };
         let was_first = self
             .has_first
             .swap(true, std::sync::atomic::Ordering::AcqRel);
         if !was_first {
             self.first_ready.notify_waiters();
-        } else if let Some(tx) = self.revision_tx.get() {
+        } else if !rotation_already_published && let Some(tx) = self.revision_tx.get() {
             // Skip bumping on the very first install: the gateway starts at
             // generation 0 with no traffic in flight, so there is nothing to
             // drain. Every later install reflects a rotation.

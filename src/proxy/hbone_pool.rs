@@ -2124,6 +2124,13 @@ pub(crate) async fn open_h2_connect_stream(
             authority: authority.clone(),
             message: e.to_string(),
         })?;
+    // `ready()` yields to the connection driver. A withdrawal can land after
+    // the checkout-time check above but before readiness resolves; refuse at
+    // the final pre-wire boundary so a retained sender cannot open a fresh
+    // CONNECT stream during that interval.
+    if gate.is_retired() {
+        return Err(HbonePoolError::TrustWithdrawn);
+    }
     let (response_fut, send_stream) =
         sender
             .send_request(request, false)
@@ -2296,6 +2303,12 @@ pub(crate) async fn open_h2_ws_connect_stream(
         if !negotiated {
             return Err(HbonePoolError::ExtendedConnectUnsupported { authority });
         }
+    }
+    // The bounded SETTINGS wait above yields. Re-check immediately before
+    // `send_request` so a trust withdrawal cannot race that wait and enqueue a
+    // new Extended CONNECT stream on the retired TLS session.
+    if gate.is_retired() {
+        return Err(HbonePoolError::TrustWithdrawn);
     }
     let (response_fut, send_stream) =
         sender

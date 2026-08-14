@@ -7912,11 +7912,35 @@ impl ProxyState {
     /// This is the ONE way a rotated SVID becomes both the material the mesh
     /// pools originate from and the identity the published generation admits;
     /// storing into `gateway_svid_bundle` directly leaves the two disagreeing.
-    pub fn install_gateway_runtime_svid_bundle(&self, bundle: SvidBundle) {
+    /// Returns `true` when the source update withdrew effective trust and
+    /// therefore already published the backend-security rotation itself.
+    pub fn install_gateway_runtime_svid_bundle(&self, bundle: SvidBundle) -> bool {
         let _publication = self
             .gateway_trust_publication_lock
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let before = self.effective_gateway_trust_bundles();
+        let trust_snapshot = self.gateway_trust_bundles.load_full();
+        let mut active_bundle = bundle.clone();
+        if let Some(trust_bundles) = trust_snapshot.as_ref() {
+            active_bundle.trust_bundles = trust_bundles.clone();
+        }
+        // A source-backed bundle can rotate its trust anchors as well as its
+        // leaf/key. When no CP/database override masks those anchors, removing
+        // one is the same live-verifier withdrawal as an accepted Replace or
+        // Clear and must retire already-issued transports immediately. Ordinary
+        // additive/identity-only source rotations keep their configured grace
+        // window and do not churn the ownership registry.
+        let withdrawal_reason = before.as_ref().and_then(|before| {
+            mesh_trust_registry::trust_withdrawal_reason(
+                Some(before),
+                Some(&active_bundle.trust_bundles),
+                false,
+            )
+        });
+        if withdrawal_reason.is_some() {
+            self.fence_gateway_trust_generation();
+        }
         {
             let _guard = self
                 .gateway_svid_update_lock
@@ -7924,28 +7948,38 @@ impl ProxyState {
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
 
             self.gateway_file_svid_bundle
-                .store(Arc::new(Some(bundle.clone())));
-
-            let mut active_bundle = bundle;
-            let trust_snapshot = self.gateway_trust_bundles.load_full();
-            if let Some(trust_bundles) = trust_snapshot.as_ref() {
-                active_bundle.trust_bundles = trust_bundles.clone();
-            }
+                .store(Arc::new(Some(bundle)));
             self.gateway_svid_bundle
                 .store(Arc::new(Some(active_bundle)));
         }
+        let retirement = withdrawal_reason.map(|reason| {
+            (
+                reason,
+                self.mesh_trust_registry.retire_for_trust_withdrawal(reason),
+            )
+        });
+        if retirement.is_some() {
+            let outgoing = self.advance_backend_security_generation();
+            self.retire_backend_transports_for_committed_trust(outgoing);
+        }
+        if let Some((reason, outcome)) = retirement {
+            self.log_gateway_trust_withdrawal(reason, outcome);
+        }
         // A source rotation replaces the whole SVID (leaf, key, and its trust
-        // roots) in ONE store, so there is nothing to fence. The OUTER
-        // publication lock nevertheless remains held until the epoch adopts
-        // the new snapshot: a config/trust publisher can be entirely before or
-        // entirely after this rotation, never between its material store and
-        // live admission commit. Published after the SVID guard is released so
-        // the epoch writer lock is never nested inside `gateway_svid_update_lock`.
+        // roots) in one material store. The OUTER publication lock remains held
+        // until the epoch adopts the new snapshot: a config/trust publisher can
+        // be entirely before or entirely after this rotation, never between its
+        // material store and live admission commit. A withdrawing source
+        // rotation is fenced above; an additive/identity-only rotation needs no
+        // request-facing trust fence. Published after the SVID guard is released
+        // so the epoch writer lock is never nested inside
+        // `gateway_svid_update_lock`.
         self.publish_live_gateway_trust();
+        withdrawal_reason.is_some()
     }
 
-    fn install_gateway_file_svid_bundle(&self, file_bundle: SvidBundle) {
-        self.install_gateway_runtime_svid_bundle(file_bundle);
+    fn install_gateway_file_svid_bundle(&self, file_bundle: SvidBundle) -> bool {
+        self.install_gateway_runtime_svid_bundle(file_bundle)
     }
 
     /// Force a gateway SVID reload from the currently configured sources.
@@ -7974,9 +8008,11 @@ impl ProxyState {
         )
         .map_err(|error| anyhow::anyhow!("failed to reload gateway SVID sources: {error}"))?;
         let spiffe_id = bundle.spiffe_id.to_string();
-        self.install_gateway_file_svid_bundle(bundle);
-        self.backend_svid_rotation_tx
-            .send_modify(|revision| *revision = revision.saturating_add(1));
+        let trust_withdrawn = self.install_gateway_file_svid_bundle(bundle);
+        if !trust_withdrawn {
+            self.backend_svid_rotation_tx
+                .send_modify(|revision| *revision = revision.saturating_add(1));
+        }
         let revision = *self.backend_svid_rotation_tx.borrow();
 
         info!(
@@ -8304,8 +8340,11 @@ impl ProxyState {
     /// fully inline-PEM triple makes the watcher exit at once. The publish
     /// closure is the same pipeline `POST /admin/tls/rotate/svid` drives:
     /// install the validated bundle into the SVID slot (preserving any
-    /// CP-delivered trust override), then bump the backend SVID generation so
-    /// pool keys, pool drains, and health probes observe one coherent update.
+    /// CP-delivered trust override), then ensure the backend SVID generation is
+    /// bumped exactly once so pool keys, pool drains, and health probes observe
+    /// one coherent update. A source trust withdrawal performs that bump inside
+    /// its fenced publication; an identity-only/additive rotation performs it
+    /// immediately afterwards.
     ///
     /// `primed` carries the source set together with the baseline
     /// [`prime_gateway_svid_rotation_baseline`] already established, so the
@@ -8323,10 +8362,12 @@ impl ProxyState {
         let publish: GatewaySvidPublishFn = Box::new(move |bundle| {
             // Slot first, then the generation bump the backend pools, pool
             // keys, and health probes key off — never the other way round.
-            state.install_gateway_file_svid_bundle(bundle);
-            state
-                .backend_svid_rotation_tx
-                .send_modify(|revision| *revision = revision.saturating_add(1));
+            let trust_withdrawn = state.install_gateway_file_svid_bundle(bundle);
+            if !trust_withdrawn {
+                state
+                    .backend_svid_rotation_tx
+                    .send_modify(|revision| *revision = revision.saturating_add(1));
+            }
             *state.backend_svid_rotation_tx.borrow()
         });
         let config = GatewaySvidWatchConfig {

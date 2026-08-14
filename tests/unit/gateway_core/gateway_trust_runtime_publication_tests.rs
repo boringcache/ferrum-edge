@@ -220,6 +220,85 @@ async fn source_rotation_cannot_lift_another_publishers_fence_and_keeps_newest_i
 }
 
 #[tokio::test]
+async fn source_trust_withdrawal_retires_live_mesh_transports_before_admission_reopens() {
+    let _observability = lock_gateway_trust_observability().await;
+    let state = state_in_mode(GatewayConfig::default(), OperatingMode::DataPlane).await;
+    state.install_gateway_runtime_svid_bundle(source_loaded_svid_generation(
+        "file.local",
+        &[1],
+        &[10],
+        &[20],
+    ));
+    let gate = MeshTransportGate::new();
+    let registration = state
+        .mesh_trust_registry
+        .register(
+            state.mesh_trust_registry.admission_ticket(),
+            MeshTransportKind::Hbone,
+            gate.clone(),
+        )
+        .expect("the source-backed generation admits a live transport");
+    let backend_before = backend_security_generation(&state);
+    let ownership_before = state.mesh_trust_registry.accepted_generation();
+
+    let withdrew = state.install_gateway_runtime_svid_bundle(
+        source_loaded_svid_generation("file.local", &[2], &[11], &[21]),
+    );
+
+    assert!(withdrew, "replacing the only source root is a withdrawal");
+    assert!(
+        gate.is_retired(),
+        "a transport authenticated under the removed source root must be retired"
+    );
+    assert!(
+        state.mesh_trust_registry.accepted_generation() > ownership_before,
+        "the source publication must advance the transport ownership generation"
+    );
+    assert_eq!(
+        backend_security_generation(&state),
+        backend_before + 1,
+        "source trust withdrawal must synchronously retire pooled discoverability"
+    );
+    assert_eq!(scheduled_rotation_revision(&state), backend_before + 1);
+    assert!(mesh_admission_open(&state));
+    drop(registration);
+}
+
+#[tokio::test]
+async fn cp_override_masks_source_trust_changes_from_live_transport_retirement() {
+    let _observability = lock_gateway_trust_observability().await;
+    let state = state_in_mode(GatewayConfig::default(), OperatingMode::DataPlane).await;
+    state.install_gateway_runtime_svid_bundle(source_loaded_svid("file.local", &[1]));
+    state.update_gateway_trust_bundles(runtime_bundles("cp.local", &[7]));
+    let gate = MeshTransportGate::new();
+    let registration = state
+        .mesh_trust_registry
+        .register(
+            state.mesh_trust_registry.admission_ticket(),
+            MeshTransportKind::MeshMtls,
+            gate.clone(),
+        )
+        .expect("the override-backed generation admits a live transport");
+    let ownership_before = state.mesh_trust_registry.accepted_generation();
+
+    let withdrew = state.install_gateway_runtime_svid_bundle(
+        source_loaded_svid_generation("file.local", &[2], &[11], &[21]),
+    );
+
+    assert!(
+        !withdrew,
+        "a hidden source-root change must not withdraw the unchanged effective override"
+    );
+    assert!(!gate.is_retired());
+    assert_eq!(
+        state.mesh_trust_registry.accepted_generation(),
+        ownership_before
+    );
+    assert_eq!(active_svid_domain(&state).as_deref(), Some("cp.local"));
+    drop(registration);
+}
+
+#[tokio::test]
 async fn database_startup_installs_persisted_trust_into_live_verifier() {
     // Serialize against every other gateway-trust observability test in this
     // binary: the published-namespace map and the counters are process-global.
