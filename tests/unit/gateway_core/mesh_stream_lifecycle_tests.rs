@@ -1725,6 +1725,11 @@ fn stock_credential_commit_holds_the_watch_lock_across_install() {
     let opened = watch.latest().generation;
     let state = MeshRuntimeState::new();
     let (entered_tx, entered_rx) = std::sync::mpsc::sync_channel(0);
+    // Completion is observed on this channel, not via a nested `watch.latest()`
+    // inside the guarded commit. The production admission guard already holds
+    // the watch read lock; a queued `publish` writer plus a second borrow can
+    // deadlock under writer-preferring RwLock behavior.
+    let (done_tx, done_rx) = std::sync::mpsc::channel();
 
     std::thread::scope(|scope| {
         let publisher_watch = &watch;
@@ -1732,7 +1737,9 @@ fn stock_credential_commit_holds_the_watch_lock_across_install() {
             entered_rx
                 .recv()
                 .expect("commit holds the observation lock");
-            publisher_watch.publish(rotated.observed_state())
+            let published = publisher_watch.publish(rotated.observed_state());
+            let _ = done_tx.send(published);
+            published
         });
 
         let installed = run_under_stock_credential_commit_admission_for_test(
@@ -1743,14 +1750,20 @@ fn stock_credential_commit_holds_the_watch_lock_across_install() {
             || {
                 entered_tx.send(()).expect("publisher may attempt publish");
                 assert_eq!(
-                    watch.latest().generation,
-                    opened,
-                    "a concurrent publish must not become visible until the commit returns"
+                    done_rx.try_recv(),
+                    Err(std::sync::mpsc::TryRecvError::Empty),
+                    "a concurrent publish must not complete while the commit guard is held"
                 );
-                state.install_slice(MeshSlice {
+                let installed = state.install_slice(MeshSlice {
                     version: "v-committed".to_string(),
                     ..MeshSlice::default()
-                })
+                });
+                assert_eq!(
+                    done_rx.try_recv(),
+                    Err(std::sync::mpsc::TryRecvError::Empty),
+                    "a concurrent publish must not complete while the commit guard is held"
+                );
+                installed
             },
         )
         .expect("the opened generation is still current");
