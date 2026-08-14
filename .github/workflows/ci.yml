@@ -881,6 +881,7 @@ jobs:
               integration::gateway_hbone_pool_tests
               integration::gateway_mesh_trust_retirement_tests
               integration::gateway_listener_observability_tests
+              integration::replay_authority_readiness_tests
               integration::gateway_listener_quic_udp_collision_tests
               integration::gateway_multi_cert_sni_tests
               integration::mesh_grpc_transport_tests
@@ -1926,6 +1927,29 @@ jobs:
           FERRUM_REDIS_REQUIRED: "1"
           RUST_BACKTRACE: 1
 
+      - name: Run shared single-use replay authority Redis regressions
+        # Issues #3834 / #3837. `replay_scope: shared` exists so two gateway
+        # replicas cannot each accept one proof once, and that is only provable
+        # against a real shared store: these cases run two independently spawned
+        # gateway processes over one Redis and one counting backend, and assert
+        # the BACKEND mutation count rather than only the gateway status.
+        run: |
+          set -euo pipefail
+          archive_file="functional-tests-${RUNNER_OS}-${RUNNER_ARCH}.tar.zst"
+          cargo nextest run \
+            --archive-file "$archive_file" \
+            --workspace-remap . \
+            --run-ignored=all \
+            --no-fail-fast \
+            -j 1 \
+            test_hmac_v2_shared_redis_admits_one_backend_mutation_across_replicas \
+            test_dpop_shared_redis_admits_one_proof_across_replicas \
+            test_shared_replay_authority_live_redis_admits_exactly_one_winner
+        env:
+          FERRUM_SKIP_GATEWAY_BUILD: "1"
+          FERRUM_REDIS_REQUIRED: "1"
+          RUST_BACKTRACE: 1
+
       - name: Summarize plugin hardening Redis regression
         if: always()
         run: |
@@ -1935,6 +1959,9 @@ jobs:
           echo "- test_request_deduplication_redis_same_proxy_sibling_instances_do_not_self_conflict" >> $GITHUB_STEP_SUMMARY
           echo "- test_request_deduplication_redis_distinct_header_instances_complete_independently" >> $GITHUB_STEP_SUMMARY
           echo "- test_request_deduplication_redis_finalized_empty_synthetic_successes_release_locks" >> $GITHUB_STEP_SUMMARY
+          echo "- test_hmac_v2_shared_redis_admits_one_backend_mutation_across_replicas" >> $GITHUB_STEP_SUMMARY
+          echo "- test_dpop_shared_redis_admits_one_proof_across_replicas" >> $GITHUB_STEP_SUMMARY
+          echo "- test_shared_replay_authority_live_redis_admits_exactly_one_winner" >> $GITHUB_STEP_SUMMARY
 
   mesh-multicluster-federation:
     name: Mesh Multicluster Federation

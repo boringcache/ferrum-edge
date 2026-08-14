@@ -3819,7 +3819,7 @@ async fn plugin_delete_rejects_revealing_global_body_transformer_beside_hmac() {
                 "scope": "proxy",
                 "proxy_id": "delete-shadow-proxy",
                 "enabled": true,
-                "config": {"clock_skew_seconds": 300}
+                "config": {"clock_skew_seconds": 300, "replay_scope": "process"}
             }
         ]
     });
@@ -3871,7 +3871,7 @@ async fn hmac_composition_admission_is_namespace_scoped() {
             "plugin_name": "hmac_auth",
             "scope": "global",
             "enabled": true,
-            "config": {"clock_skew_seconds": 300}
+            "config": {"clock_skew_seconds": 300, "replay_scope": "process"}
         }))
         .send()
         .await
@@ -3936,7 +3936,7 @@ async fn admin_rejects_custom_request_body_transformer_beside_hmac() {
                 "scope": "proxy",
                 "proxy_id": "custom-transform-proxy",
                 "enabled": true,
-                "config": {"clock_skew_seconds": 300}
+                "config": {"clock_skew_seconds": 300, "replay_scope": "process"}
             },
             {
                 "id": "custom-transform-plugin",
@@ -4206,7 +4206,7 @@ async fn restore_rejects_hmac_request_body_transformer_before_delete() {
                 "scope": "proxy",
                 "proxy_id": "restore-composition-new",
                 "enabled": true,
-                "config": {"clock_skew_seconds": 300}
+                "config": {"clock_skew_seconds": 300, "replay_scope": "process"}
             },
             {
                 "id": "restore-composition-transformer",

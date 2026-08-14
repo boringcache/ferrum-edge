@@ -2061,6 +2061,10 @@ fn plugin_config_fixture(plugin_name: &str, dispatch_upstream_id: &str) -> Value
             "ldap_url": "ldaps://ldap.example.com:636",
             "bind_dn_template": "uid={username},ou=users,dc=example,dc=com"
         }),
+        "hmac_auth" => json!({
+            "clock_skew_seconds": 300,
+            "replay_scope": "process"
+        }),
         "opa" => json!({
             "opa_host": "http://127.0.0.1:8181",
             "policy_path": "ferrum/authz/allow"
