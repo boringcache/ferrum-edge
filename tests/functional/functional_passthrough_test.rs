@@ -160,7 +160,7 @@ fn mint_observability_token() -> String {
     )
 }
 
-/// Wait until `child` owns its admin listener and the stream port is accepting.
+/// Wait until `child` owns its admin listener and reports fully ready.
 ///
 /// Unauthenticated `/health` success is not identity and is not readiness: a
 /// foreign process can answer the released admin port, and that probe does not
@@ -171,21 +171,18 @@ fn mint_observability_token() -> String {
 /// 1. `Child::try_wait` around every probe — a dead child voids the attempt.
 /// 2. Authenticated `/health` detail tier for this attempt's bearer token with
 ///    `ready: true`.
-/// 3. TCP connect to the stream listen port after identity is proven, with
-///    another `try_wait` so a child that died between the two stages cannot
-///    look ready. This is not a bare port check: identity already bound the
-///    answer to this child, and a dead child consumes the attempt.
+/// No synthetic stream-port connection is made here: passthrough listeners
+/// treat every accepted socket as real traffic, so such a probe can dial the
+/// configured backend and corrupt backend-accept assertions. Authenticated
+/// `ready: true` is already published only after every required listener bind.
 async fn wait_for_owned_gateway(
     child: &mut Child,
     admin_port: u16,
     observability_token: &str,
-    stream_port: u16,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     const STARTUP_TIMEOUT_SECS: u64 = 30;
     const PROBE_SLICE: Duration = Duration::from_secs(1);
     let deadline = Instant::now() + Duration::from_secs(STARTUP_TIMEOUT_SECS);
-    let addr = format!("127.0.0.1:{stream_port}");
-
     let mut last_observation = String::from("no response yet");
     loop {
         if let Some(status) = child.try_wait()? {
@@ -210,31 +207,10 @@ async fn wait_for_owned_gateway(
         )
         .await
         {
-            Ok(()) => break,
-            Err(err) => last_observation = err.to_string(),
-        }
-    }
-
-    loop {
-        if let Some(status) = child.try_wait()? {
-            return Err(
-                format!("passthrough gateway exited after reporting ready with {status}").into(),
-            );
-        }
-        if Instant::now() >= deadline {
-            return Err(format!(
-                "passthrough stream port {stream_port} did not accept TCP connections \
-                 within {STARTUP_TIMEOUT_SECS} seconds (last observation: {last_observation})"
-            )
-            .into());
-        }
-        match tokio::net::TcpStream::connect(&addr).await {
-            Ok(stream) => {
-                drop(stream);
+            Ok(()) => {
                 if let Some(status) = child.try_wait()? {
                     return Err(format!(
-                        "passthrough gateway exited after the stream listener accepted \
-                         with {status}"
+                        "passthrough gateway exited after reporting ready with {status}"
                     )
                     .into());
                 }
@@ -242,7 +218,6 @@ async fn wait_for_owned_gateway(
             }
             Err(err) => last_observation = err.to_string(),
         }
-        sleep(Duration::from_millis(50)).await;
     }
 }
 
@@ -322,13 +297,7 @@ where
             .env_remove("FERRUM_METRICS_ALLOWED_CIDRS");
         let mut child = cmd.spawn().expect("Failed to start gateway");
 
-        match wait_for_owned_gateway(
-            &mut child,
-            admin_port,
-            &observability_token,
-            proxy_listen_port,
-        )
-        .await
+        match wait_for_owned_gateway(&mut child, admin_port, &observability_token).await
         {
             Ok(()) => return (child, proxy_listen_port, http_port, admin_port, dir),
             Err(error) => {
