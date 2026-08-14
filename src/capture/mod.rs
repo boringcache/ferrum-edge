@@ -507,11 +507,22 @@ pub fn node_waypoint_udp_steer_setup_script(
                     .to_string(),
             );
         }
-        if destination.ip.is_unspecified() || destination.ip.is_loopback() {
+        let inadmissible = match destination.ip {
+            std::net::IpAddr::V4(ip) => {
+                ip.is_unspecified()
+                    || ip.is_loopback()
+                    || ip.is_multicast()
+                    || ip == std::net::Ipv4Addr::BROADCAST
+            }
+            std::net::IpAddr::V6(ip) => {
+                ip.is_unspecified() || ip.is_loopback() || ip.is_multicast()
+            }
+        };
+        if inadmissible {
             return Err(
-                "NodeWaypoint UDP Service steering refuses an unspecified or loopback \
-                        destination address: it would steer traffic that never belonged to a \
-                        Service"
+                "NodeWaypoint UDP Service steering refuses an unspecified, loopback, multicast, \
+                        or IPv4 broadcast destination address: it would steer traffic that never \
+                        belonged to a Service"
                     .to_string(),
             );
         }

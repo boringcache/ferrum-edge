@@ -75,6 +75,29 @@ fn destination(ip: &str, port: u16) -> NodeWaypointUdpSteerDestination {
     }
 }
 
+#[test]
+fn steering_refuses_non_unicast_service_destinations() {
+    for address in [
+        "0.0.0.0",
+        "127.0.0.1",
+        "224.0.0.1",
+        "255.255.255.255",
+        "::",
+        "::1",
+        "ff02::1",
+    ] {
+        let error = node_waypoint_udp_steer_setup_script(
+            &["veth0".to_string()],
+            &[destination(address, 5353)],
+        )
+        .expect_err("a non-unicast address must refuse the whole steering plan");
+        assert!(
+            error.contains("refuses an unspecified, loopback, multicast, or IPv4 broadcast"),
+            "unexpected refusal for {address}: {error}"
+        );
+    }
+}
+
 fn is_teardown(script: &str) -> bool {
     script.contains("ferrum_delete_xtables_rule")
 }

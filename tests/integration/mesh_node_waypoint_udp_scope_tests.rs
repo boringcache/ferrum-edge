@@ -1614,6 +1614,36 @@ fn a_udp_service_port_with_no_reachable_endpoint_materializes_no_listener() {
 }
 
 #[test]
+fn inadmissible_cluster_ips_materialize_no_listener_or_steering() {
+    let _env = UdpListenerEnvGuard::set(Some("true"));
+    let runtime = node_waypoint_runtime();
+    let backend = workload_for("dns", DEFAULT_NAMESPACE, [("app", "udp")], ["10.244.3.11"]);
+    let mut service = udp_service("dns", 5353, AppProtocol::Udp, &[&backend]);
+    service.cluster_ips = vec![
+        "0.0.0.0".to_string(),
+        "127.0.0.1".to_string(),
+        "224.0.0.1".to_string(),
+        "255.255.255.255".to_string(),
+        "::".to_string(),
+        "::1".to_string(),
+        "ff02::1".to_string(),
+    ];
+
+    let config = prepare(&runtime, vec![service], vec![backend]);
+
+    assert!(
+        udp_listeners(&config).is_empty(),
+        "an explicitly inadmissible ClusterIP must refuse the listener instead of becoming the \
+         unique-port headless/direct-address surface"
+    );
+    assert!(
+        config.node_waypoint_udp_steer_destinations.is_empty()
+            && config.node_waypoint_udp_destination_routes.is_empty(),
+        "an inadmissible Service destination must authorize and steer nothing"
+    );
+}
+
+#[test]
 fn ipv6_workload_addresses_materialize_listener_targets() {
     let _env = UdpListenerEnvGuard::set(Some("true"));
     let runtime = node_waypoint_runtime();

@@ -1836,6 +1836,28 @@ fn materialize_node_waypoint_udp_listeners(
                 continue;
             }
 
+            let cluster_ips: Vec<std::net::IpAddr> = service
+                .cluster_ips
+                .iter()
+                .filter_map(|raw| raw.parse::<std::net::IpAddr>().ok())
+                .filter(|ip| {
+                    crate::proxy::node_waypoint_udp_destination::destination_ip_is_admissible(*ip)
+                })
+                .collect();
+            if !service.cluster_ips.is_empty() && cluster_ips.len() != service.cluster_ips.len() {
+                warn!(
+                    service = %service.name,
+                    namespace = %service.namespace,
+                    service_port = service_port.port,
+                    reason = "inadmissible_cluster_ip",
+                    "Skipping NodeWaypoint UDP/DTLS listener: every declared ClusterIP must be a \
+                     valid unicast Service destination; unspecified, loopback, multicast, and \
+                     IPv4 broadcast addresses are refused rather than treated as headless or \
+                     rendered into host steering rules"
+                );
+                continue;
+            }
+
             let upstream_id =
                 node_waypoint_udp_upstream_id(&service.namespace, &service.name, service_port.port);
             let proxy_id =
@@ -1863,12 +1885,7 @@ fn materialize_node_waypoint_udp_listeners(
                     service: service.name.clone(),
                     namespace: service.namespace.clone(),
                     terminates_dtls,
-                    cluster_ips: service
-                        .cluster_ips
-                        .iter()
-                        .filter_map(|raw| raw.parse::<std::net::IpAddr>().ok())
-                        .filter(|ip| !ip.is_unspecified() && !ip.is_loopback())
-                        .collect(),
+                    cluster_ips,
                 });
         }
     }
