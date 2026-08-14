@@ -9,7 +9,9 @@
 use ferrum_edge::modes::mesh::config::{
     MtlsMode, PeerAuthentication, PolicyScope, WorkloadSelector,
 };
-use ferrum_edge::modes::mesh::slice::{MeshSlice, resolve_effective_mtls_mode};
+use ferrum_edge::modes::mesh::slice::{
+    MeshSlice, node_waypoint_destination_peer_authentications, resolve_effective_mtls_mode,
+};
 use std::collections::{BTreeMap, HashMap};
 
 fn peer_auth(
@@ -389,5 +391,60 @@ fn workload_port_level_permissive_overrides_namespace_strict_on_that_port() {
         resolve_effective_mtls_mode(&policies, "default", &other, 15354),
         MtlsMode::Strict,
         "a workload the overlay does not select stays STRICT on every port"
+    );
+}
+
+/// Hosted live failure (PR #3799 / run 31772379258): the NodeWaypoint's own
+/// inbound `peer_authentications` view keeps only policies that match the
+/// waypoint pod, so the destination `dtls-echo` `portLevelMtls` PERMISSIVE
+/// overlay is stripped. Resolving DTLS client-cert demand against that view
+/// alone forces STRICT (empty application-data reply after a completed
+/// handshake). The destination capture inventory still carries the overlay;
+/// the owner-scoped union must use it.
+#[test]
+fn node_waypoint_destination_peer_auths_keep_selector_port_overlay() {
+    let namespace_strict = peer_auth("default", "default", None, MtlsMode::Strict, HashMap::new());
+    let dtls_overlay = peer_auth(
+        "dtls-echo",
+        "default",
+        Some(WorkloadSelector {
+            labels: HashMap::from([("app".into(), "dtls-echo".into())]),
+            namespace: None,
+        }),
+        MtlsMode::Strict,
+        HashMap::from([(15354, MtlsMode::Permissive)]),
+    );
+    let slice = MeshSlice {
+        namespace: "default".into(),
+        labels: BTreeMap::from([("app".to_string(), "ferrum-mesh".to_string())]),
+        peer_authentications: vec![namespace_strict.clone()],
+        node_waypoint_capture_peer_authentications: vec![
+            namespace_strict.clone(),
+            dtls_overlay.clone(),
+        ],
+        ..MeshSlice::default()
+    };
+    let dtls_labels = HashMap::from([("app".to_string(), "dtls-echo".to_string())]);
+    assert_eq!(
+        resolve_effective_mtls_mode(&slice.peer_authentications, "default", &dtls_labels, 15354),
+        MtlsMode::Strict,
+        "the waypoint's own inbound view must not see the destination overlay"
+    );
+    let destination_auths = node_waypoint_destination_peer_authentications(&slice);
+    assert_eq!(
+        resolve_effective_mtls_mode(&destination_auths, "default", &dtls_labels, 15354),
+        MtlsMode::Permissive,
+        "generated DTLS must honour the destination portLevelMtls overlay"
+    );
+    assert_eq!(
+        resolve_effective_mtls_mode(&destination_auths, "default", &dtls_labels, 8080),
+        MtlsMode::Strict,
+        "other ports on the destination stay STRICT"
+    );
+    let waypoint_labels = HashMap::from([("app".to_string(), "ferrum-mesh".to_string())]);
+    assert_eq!(
+        resolve_effective_mtls_mode(&destination_auths, "default", &waypoint_labels, 15354),
+        MtlsMode::Strict,
+        "the NodeWaypoint's own inbound identity is unchanged by the destination overlay"
     );
 }

@@ -369,7 +369,7 @@ Ownership remains split: the node-agent is the sole BPF-map writer, while the pr
 
 *DTLS material for those listeners, and who may change it (issue #3858).* A `dtls` listener terminates with the DTLS-specific `FERRUM_DTLS_CERT_PATH` / `FERRUM_DTLS_KEY_PATH` (plus optional `FERRUM_DTLS_CLIENT_CA_CERT_PATH` for frontend client-certificate verification), which mesh mode loads at startup — the same sources the database/file/dp serving paths use, so a listener that binds at startup and one that binds after a policy change always handshake with the same certificate.
 
-DTLS frontend configuration and reload are **listener- and owner-scoped**. Every terminating DTLS listener carries an explicit ownership class: an ordinary operator listener configured from `FERRUM_DTLS_*`, or a Ferrum-generated `MeshNodeWaypoint` listener identified by its stable namespaced listener id. The two have SEPARATE accepted generations and separate publish entry points, and there is no process-wide DTLS fanout for either to reach the other through — a mesh slice can never live-swap an operator-owned DTLS listener, and an ordinary `FERRUM_DTLS_*` rotation can never replace the accepted mesh generation. During mesh slice preparation Ferrum derives each generated route's COMPLETE frontend config from the dedicated DTLS server identity plus that route's effective `PeerAuthentication` workload/service scope (resolved against the Service's backing workloads, escalating to the most restrictive when they diverge — `Strict` requires and verifies a client certificate, `Permissive` and `Disable` do not) and the accepted client-CA + CRL snapshot. Every required candidate is built and validated **before** the slice is accepted: a malformed or truncated CA/CRL or a failed verifier build rejects the WHOLE candidate slice and retains the complete last-good routing AND DTLS serving generation for both owners — new routes are never published beside stale DTLS posture. A `Strict` route with no configured client CA does **not** reject the slice: that generated listener is omitted from the published generation and stays deferred (fail-closed for DTLS) so TCP/UDP routing and workload convergence still apply. The accepted generation is stored before it is swapped into active servers, so a generated listener created or restarted after a successful slice receives exactly the generation already live on its peers, and an accepted EMPTY generation is a positive statement that stops a withdrawn-then-re-added listener from resurrecting stale owner-scoped state. `FERRUM_DTLS_*` generation behavior in database / file / DP mode is unchanged. `FERRUM_FRONTEND_TLS_CERT_PATH` / `_KEY_PATH` are deliberately NOT reused: on a mesh proxy that pair is the operator override for the INBOUND TCP listener's server identity, so sharing it would make configuring a DTLS listener silently replace a SPIRE-issued inbound identity. Expiry is validated at startup with the same gate the other serving modes use; when no DTLS material is configured a `dtls` listener stays visibly deferred (`FrontendDtlsDeferred`) instead of binding. In Helm, mount the material with `ambient.extraVolumes` / `ambient.extraVolumeMounts`.
+DTLS frontend configuration and reload are **listener- and owner-scoped**. Every terminating DTLS listener carries an explicit ownership class: an ordinary operator listener configured from `FERRUM_DTLS_*`, or a Ferrum-generated `MeshNodeWaypoint` listener identified by its stable namespaced listener id. The two have SEPARATE accepted generations and separate publish entry points, and there is no process-wide DTLS fanout for either to reach the other through — a mesh slice can never live-swap an operator-owned DTLS listener, and an ordinary `FERRUM_DTLS_*` rotation can never replace the accepted mesh generation. During mesh slice preparation Ferrum derives each generated route's COMPLETE frontend config from the dedicated DTLS server identity plus that route's effective `PeerAuthentication` workload/service scope (resolved against the Service's backing workloads using the destination capture PeerAuthentication inventory unioned with the waypoint's own inbound view — a selector-scoped `portLevelMtls` overlay does not match the NodeWaypoint pod, so it is stripped from `peer_authentications` and would otherwise force `STRICT` client certificates on every generated DTLS session after a completed handshake — escalating to the most restrictive when they diverge — `Strict` requires and verifies a client certificate, `Permissive` and `Disable` do not) and the accepted client-CA + CRL snapshot. Every required candidate is built and validated **before** the slice is accepted: a malformed or truncated CA/CRL or a failed verifier build rejects the WHOLE candidate slice and retains the complete last-good routing AND DTLS serving generation for both owners — new routes are never published beside stale DTLS posture. A `Strict` route with no configured client CA does **not** reject the slice: that generated listener is omitted from the published generation and stays deferred (fail-closed for DTLS) so TCP/UDP routing and workload convergence still apply. The accepted generation is stored before it is swapped into active servers, so a generated listener created or restarted after a successful slice receives exactly the generation already live on its peers, and an accepted EMPTY generation is a positive statement that stops a withdrawn-then-re-added listener from resurrecting stale owner-scoped state. `FERRUM_DTLS_*` generation behavior in database / file / DP mode is unchanged. `FERRUM_FRONTEND_TLS_CERT_PATH` / `_KEY_PATH` are deliberately NOT reused: on a mesh proxy that pair is the operator override for the INBOUND TCP listener's server identity, so sharing it would make configuring a DTLS listener silently replace a SPIRE-issued inbound identity. Expiry is validated at startup with the same gate the other serving modes use; when no DTLS material is configured a `dtls` listener stays visibly deferred (`FrontendDtlsDeferred`) instead of binding. In Helm, mount the material with `ambient.extraVolumes` / `ambient.extraVolumeMounts`.
 
 *Where the old suppression still applies.* Slice preparation's blanket fail-closed removal of NodeWaypoint UDP/DTLS service ports, proxies, synthesized outbound UDP upstreams, and mesh-DNS visibility now runs ONLY where the attribution channel cannot exist — a non-Linux build, which has neither `IP_PKTINFO` attribution nor sysfs interface resolution. Both worlds are fail-closed; the difference is that attributable workloads keep working instead of the whole surface being disabled. Mesh-wide policies still evaluate normally, and scoped `AUDIT`-only policies are non-enforcing and never force suppression. NodeWaypoint remains Experimental.
 
@@ -3777,6 +3777,94 @@ Non-mesh gateway modes (`database`, `file`, `cp`, `dp`) can route traffic into t
 
 The Control Plane distributes gateway SPIFFE trust bundles to Data Planes via a `trust_bundles_json` side channel on the `ConfigUpdate` proto message. DPs hot-swap received bundles into the gateway SVID identity slot, enabling mutual TLS with mesh sidecars without requiring the DP to independently obtain certificates.
 
+### Live Trust Withdrawal
+
+Withdrawing a gateway trust authority retires **connection ownership**, not only pool
+discoverability. Clearing the HBONE / mesh-mTLS pool maps stops future lookups from
+finding a connection, but an already-issued `H2ConnectTunnel` owns its HTTP/2 streams
+directly, a cloned sender can open fresh streams on the established TLS session, and the
+one-connection-per-session WebSocket / datagram / raw-CONNECT bridges were never in the
+map at all. Every one of those would otherwise keep carrying traffic authenticated under
+the withdrawn root until its own EOF or idle timeout.
+
+Every gateway-to-mesh TLS transport — pooled and 1:1 alike — registers with the
+per-process gateway trust registry (`src/proxy/mesh_trust_registry.rs`) when its
+connection driver is spawned, under the accepted trust generation, and hands its driver a
+retirement gate that travels with every cloned sender and the tunnel rather than living
+in the pool. Pooled mesh-mTLS checkout returns that gated handle; `ready` and
+`send_request` consult it synchronously before a new stream is queued.
+
+When an accepted `Replace` or `Clear` removes any authority from the **effective**
+gateway trust view (the material `build_spiffe_outbound_config` verifies peers against —
+so a `Clear` is judged against the startup material it restores), the centralized
+`ProxyState::commit_gateway_trust_generation_locked` publication runs one ordered
+sequence:
+
+1. fence new gateway-to-mesh request admission;
+2. install the accepted trust material into every verifier source/slot it governs;
+3. advance the ownership-registry generation, mark the outgoing generation retired, and
+   synchronously signal every transport registered under it;
+4. advance the backend security generation, drain its TLS-config caches and
+   generation-keyed pools, clear the HBONE and mesh-mTLS pool maps, and publish the
+   accepted gateway trust as live, reopening request admission.
+
+The request-epoch fence is a point-in-time admission check, not a lock held across a
+backend dial. A request that passed the live check immediately before fencing can still
+reach `dial_h2_connect_sender` / mesh-mTLS `create_sender` during publication and take an
+admission ticket. Installing material before advancing the generation makes that race
+fail closed: a dial whose ticket was stamped before step 3 still carries the outgoing
+generation and is refused at registration if it completes afterwards; a dial that
+receives the new ticket can only load the already-stored accepted verifier. Advancing
+the generation first would let that in-flight dial take a NEW ticket, still load OLD
+trust, and register as the published generation — escaping the outgoing-generation sweep.
+
+Signalling is synchronous — the gate is set before the ownership-registry fence is
+released — and the outer request-admission fence remains closed until material, caches,
+and pool maps all reflect the accepted generation. Completing
+the teardown (dropping the HTTP/2 connection, which closes the socket and errors every
+stream on it) is a bounded task wake, not a drain timer: it does not wait on peer behaviour,
+backend liveness, or `FERRUM_SHUTDOWN_DRAIN_SECONDS`. A retired tunnel's next read or write
+fails with a fixed `gateway trust authority withdrawn` error that names no trust material,
+subject, key id, fingerprint, path, or peer identity. A retired pooled mesh-mTLS sender
+refuses `ready` / `send_request` synchronously by consulting the same gate, even if the
+underlying HTTP/2 sender has not yet observed connection close.
+
+A **source SVID rotation** takes the same path. When no CP/database override masks the
+source trust, `ProxyState::install_gateway_runtime_svid_bundle` compares the rotated
+bundle's anchors against the effective view and, if the rotation DROPS one, fences,
+installs, retires the ownership generation, and advances the backend security generation
+inside the same publication — so a shrinking SPIRE/file/CA-backend trust bundle cannot be
+deferred behind `FERRUM_MESH_SVID_ROTATION_DRAIN_SECONDS`. That rotation publishes the
+backend security generation itself, so the ordinary post-install revision bump is
+suppressed rather than applied twice. An additive or identity-only rotation is unchanged:
+it keeps its configured drain window and churns neither the registry nor the generation.
+A masked rotation (an override installed) changes no effective authority and so is a
+no-op here as well. Both replacement shapes report the same closed
+`replace_removed_authority` reason, because they are indistinguishable to the live
+verifier.
+
+The **creation race** is closed by the same generation stamp: a dial takes an admission
+ticket before connecting, and a connection that completes after the publication is refused
+at registration (`HbonePoolError::TrustWithdrawn`), so it is neither pooled nor returned.
+Pool insertion re-checks the gate for the same reason. Because accepted material is stored
+before the generation advances, a ticket for the new generation cannot authenticate with
+the withdrawn verifier.
+
+No-churn behaviour is preserved exactly. An identical `Replace`, an additive overlap
+(`before ⊆ after`), an `Unchanged` side channel, a `Clear` with no installed override, a
+`Clear` whose restored startup material still carries every authority, and every rejected
+candidate leave the generation, the registry, and every live session untouched — a rejected
+candidate never reaches the publication path at all, so it keeps the last-good generation
+and its sessions. A JWT authority swapped in place under one `kid` **is** a withdrawal.
+
+Observability is four fixed-cardinality families over closed label sets
+(`ferrum_gateway_trust_accepted_generation`, `ferrum_gateway_trust_withdrawals_total{reason}`,
+`ferrum_gateway_trust_retired_transports_total{transport}`,
+`ferrum_gateway_trust_admission_refusals_total{transport}`; `reason` ∈
+`replace_removed_authority`, `cleared_override`; `transport` ∈ `hbone`, `mesh_mtls`). The
+generation is a local monotonic counter that identifies no authority, and no metric label,
+sample value, log field, or client-visible error carries trust material.
+
 ### HBONE Outbound Pool
 
 When an upstream target is tagged with `mesh.hbone=true` metadata, the gateway routes requests through an HBONE HTTP/2 CONNECT pool (`HboneOutboundPool`) instead of direct HTTP. The pool uses the gateway's SPIFFE identity for mTLS and keys connections by SVID fingerprint so certificate rotation triggers fresh connections. DNS resolution uses the shared `DnsCacheResolver`. A target may optionally carry `mesh.hbone_dial_host` to separate the outer TCP/TLS destination from the inner CONNECT authority host, and `mesh.hbone_peer_spiffe_id` to pin a waypoint/relay peer identity while leaving `mesh.spiffe_id` as destination workload metadata.
@@ -5292,7 +5380,7 @@ Mesh-specific environment variables are listed below. For the full reference of 
 | `FERRUM_MESH_NODE_WAYPOINT_IDLE_GC_INTERVAL_SECS` | `30` | NodeWaypoint lazy identity GC interval for identities enrolled without a cgroup binding. Set to `0` only when another component explicitly removes lazy identities |
 | `FERRUM_MESH_REQUEST_AUTH_REQUIRE_EXP` | `true` | Whether the auto-injected mesh `RequestAuthentication` (`jwks_auth`) plugin requires the JWT `exp` claim. Secure default `true` rejects `exp`-less tokens. Set `false` only for issuers that legitimately omit `exp`; a present-but-expired `exp` is always rejected regardless |
 | `FERRUM_MESH_PEER_AUTH_LIVE_RELOAD_ENABLED` | `false` | Opt in to live reload of the PeerAuthentication-derived listener-wide and per-app-port inbound mTLS configs, client CA verifier, and federated SVID bundle slot on slice apply. Does not rotate frontend cert/key material (use `FERRUM_FRONTEND_TLS_LIVE_RELOAD_ENABLED`) |
-| `FERRUM_MESH_SVID_ROTATION_DRAIN_SECONDS` | `0` | Seconds to wait after a backend client SVID rotation before force-draining old-generation backend pool entries. `0` keeps existing connections until normal idle/health cleanup. SVID rotations only — a committed gateway **trust** replace/withdraw fences new admission, synchronously evicts affected idle/cached pool entries, and stops accepting removed roots for new handshakes. Gateway-to-mesh admission is refused for that synchronous eviction window, whose duration scales with pooled occupancy rather than with trust-material size or peer count (`docs/cp_dp_mode.md` documents the bound); already-issued long-lived transport handles are not forcibly terminated (issue #3859). Does not consult this window (see `docs/cp_dp_mode.md`) |
+| `FERRUM_MESH_SVID_ROTATION_DRAIN_SECONDS` | `0` | Seconds to wait after a backend client SVID rotation before force-draining old-generation backend pool entries. `0` keeps existing connections until normal idle/health cleanup. SVID rotations only — a committed gateway **trust** replace/withdraw fences new admission, synchronously marks and notifies every registered already-issued HBONE/mesh-mTLS transport in the outgoing trust generation, evicts affected idle/cached pool entries, and stops accepting removed roots for new handshakes. A retired handle's next poll, read, or write fails with a fixed material-free error; driver teardown completes through a bounded task wake. Gateway-to-mesh admission is refused for that synchronous retirement window, whose duration scales with registered live gateway-to-mesh physical transports and pooled occupancy rather than with trust-material size or peer count (`docs/cp_dp_mode.md` documents the bound). Does not consult this window (see `docs/cp_dp_mode.md`) |
 | `FERRUM_MESH_FEDERATION_POLL_INTERVAL_SECONDS` | `300` | SPIFFE trust-bundle federation poll interval (fetches `RemoteCluster.federation_endpoint` and overlays `TrustBundleSet.federated`). `0` disables; bundles then come only from the CP slice. `remote_clusters` is capped at 256 entries |
 | `FERRUM_MESH_FEDERATION_POLL_TIMEOUT_SECONDS` | `30` | Per-request HTTP timeout for a single federation bundle fetch |
 | `FERRUM_MESH_FEDERATION_MAX_STALE_SECONDS` | `3600` | Maximum age for a last-good polled federation bundle after poll failures. Once exceeded, the bundle is withdrawn and the effective trust set is recomputed. `0` means indefinite retention for dev/test only; production mode rejects `0` while polling is enabled |

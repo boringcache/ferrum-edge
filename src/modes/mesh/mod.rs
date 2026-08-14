@@ -15507,8 +15507,9 @@ async fn start_spire_agent_mesh_svid_source(
         let inbound_slot = inbound_slot.clone();
         let trust_overlay_slot = trust_overlay_slot.clone();
         move |bundle| {
-            state.install_gateway_runtime_svid_bundle(bundle);
+            let trust_withdrawn = state.install_gateway_runtime_svid_bundle(bundle);
             publish_runtime_svid_to_inbound_slot(&state, &inbound_slot, &trust_overlay_slot);
+            trust_withdrawn
         }
     });
     let fetch_config = crate::identity::workload_api::FetchLoopConfig {
@@ -15989,9 +15990,9 @@ async fn issue_and_install_mesh_ca_svid(
     crate::tls::spiffe::validate_trust_bundle_set(&bundle.trust_bundles)
         .map_err(anyhow::Error::msg)?;
     let installed_spiffe_id = bundle.spiffe_id.clone();
-    proxy_state.install_gateway_runtime_svid_bundle(bundle);
+    let trust_withdrawn = proxy_state.install_gateway_runtime_svid_bundle(bundle);
     publish_runtime_svid_to_inbound_slot(proxy_state, inbound_slot, trust_overlay_slot);
-    if publish_revision {
+    if publish_revision && !trust_withdrawn {
         proxy_state
             .backend_svid_rotation_tx
             .send_modify(|revision| *revision = revision.saturating_add(1));
@@ -17597,8 +17598,11 @@ async fn apply_mesh_inbound_tls_reload(
 ///   mesh proxy is the inbound TCP listener's server identity).
 /// * The client verifier comes from that route's EFFECTIVE
 ///   `PeerAuthentication` workload/service scope resolved against the backing
-///   workloads this NodeWaypoint actually serves, plus the accepted client-CA
-///   bundle and the live CRL snapshot. `Strict` requires and verifies a client
+///   workloads this NodeWaypoint actually serves — using
+///   [`slice::node_waypoint_destination_peer_authentications`], not the
+///   waypoint's own inbound `peer_authentications` view, so a selector-scoped
+///   destination overlay still applies — plus the accepted client-CA bundle and
+///   the live CRL snapshot. `Strict` requires and verifies a client
 ///   certificate; `Permissive` and `Disable` do not. DestinationRule client-side
 ///   modes (`Simple`, `Mutual`, `IstioMutual`) are invalid here and reject the
 ///   complete candidate — they must never become a no-client-auth listener.
@@ -17754,11 +17758,14 @@ fn build_node_waypoint_dtls_owner_configs(
 /// Resolved against the Service's backing workloads' own namespaces and labels —
 /// the workload/service scope that policy actually targets — never against the
 /// port-keyed `mesh_inbound_tls_policy`, which would let one Service's posture
-/// decide another's on a shared app port. Divergent modes escalate to the most
-/// restrictive; invalid client-side DestinationRule modes outrank `Strict` so a
-/// mixed set reaches the refusing branch instead of being masked. A Service
-/// with no resolvable backing workload keeps the mesh-wide answer for its own
-/// namespace.
+/// decide another's on a shared app port. The policy *set* is
+/// [`slice::node_waypoint_destination_peer_authentications`]: selector-scoped
+/// destination overlays do not match the NodeWaypoint pod, so they are absent
+/// from `slice.peer_authentications` and must be read from the capture
+/// inventory. Divergent modes escalate to the most restrictive; invalid
+/// client-side DestinationRule modes outrank `Strict` so a mixed set reaches
+/// the refusing branch instead of being masked. A Service with no resolvable
+/// backing workload keeps the mesh-wide answer for its own namespace.
 fn effective_node_waypoint_dtls_peer_auth_mode(
     slice: &MeshSlice,
     service: &crate::modes::mesh::config::MeshService,
@@ -17777,12 +17784,13 @@ fn effective_node_waypoint_dtls_peer_auth_mode(
             }
         }
     }
+    let peer_auths = slice::node_waypoint_destination_peer_authentications(slice);
     let mut resolved: Option<config::MtlsMode> = None;
     for workload in
         matched_local_service_workloads(service, &slice.workloads, slice.multi_cluster.as_ref())
     {
         let mode = slice::resolve_effective_mtls_mode(
-            &slice.peer_authentications,
+            &peer_auths,
             &workload.namespace,
             &workload.selector.labels,
             port,
@@ -17794,7 +17802,7 @@ fn effective_node_waypoint_dtls_peer_auth_mode(
     }
     resolved.unwrap_or_else(|| {
         slice::resolve_effective_mtls_mode(
-            &slice.peer_authentications,
+            &peer_auths,
             &service.namespace,
             &HashMap::<String, String>::new(),
             port,
