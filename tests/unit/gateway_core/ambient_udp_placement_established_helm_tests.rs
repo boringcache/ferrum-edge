@@ -25,6 +25,12 @@ fn read_repo(rel: &str) -> String {
     })
 }
 
+/// Collapse Markdown line wraps so prose substring checks stay semantic, not
+/// sensitive to ordinary reflow whitespace.
+fn normalize_markdown_whitespace(s: &str) -> String {
+    s.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
 /// The four regions of the single ambient DaemonSet that the privilege boundary
 /// is stated in: pod-level fields, the preflight init container, the
 /// steady-state proxy container, and the volume list.
@@ -513,10 +519,12 @@ fn the_operator_docs_describe_the_same_pod_preflight_lifecycle() {
             && !schema.contains("dedicated DaemonSet"),
         "values.schema.json must describe the shipped preflight shape"
     );
+    let mesh_normalized = normalize_markdown_whitespace(&mesh);
     assert!(
         mesh.contains("automountServiceAccountToken: false")
             && mesh.contains("kube-api-access")
-            && mesh.contains("only when no explicit `FERRUM_K8S_NODE_UID`")
+            && mesh_normalized
+                .contains("only when no explicit `FERRUM_K8S_NODE_UID`")
             && node_agent_security.contains("automountServiceAccountToken: false")
             && node_agent_security.contains("does not receive the projected token"),
         "operator docs must record ServiceAccount token isolation for the privileged init"
