@@ -468,7 +468,10 @@ failover. There is deliberately **no** cross-type version-coherence gate: a
 stock CP versions each type independently and carries no Ferrum security
 carriers a skew could leave stale. Warming waits for CDS, and for EDS only when
 some accepted cluster actually needs it. Convergence is visible on the
-JWT-gated `GET /mesh/config-drift`.
+JWT-gated `GET /mesh/config-drift`. Stock xDS reports closed-set type
+presence (`cds=received`, …) there rather than remote `version_info`: a
+third-party CP can copy the bearer into that field, and truncation is not
+redaction.
 
 **Deletion follows the SotW rule for each type, not the response contents.**
 `Cluster` and `Listener` are the two types a state-of-the-world server must send
@@ -497,8 +500,10 @@ legitimately programs Envoy features Ferrum has no counterpart for and NACKing
 would leave the data plane permanently unconverged. A refusal always narrows:
 it contributes no route, no endpoint, and no identity, so the worst case is
 traffic that is not routed. Refusals are logged (bounded, and only when the set
-changes) with a stable reason code and the offending field path — never a
-resource payload.
+changes) with a stable reason code, a short type label, and counts — never a
+resource name, field path, version, nonce, or other CP-authored string.
+Truncation is not redaction: those values can carry a bearer the control plane
+echoed from the authenticated request.
 
 **The extension-escape closure.** Every field through which an Envoy extension,
 a filesystem path, credential material, an enforcement filter, or a second
@@ -627,14 +632,316 @@ the live phase does not claim a widening proof for a host that was never
 dialable), and that re-pinning the peer identity to an impostor SPIFFE fails
 the dial closed. It runs in the hosted `data-plane` functional shard.
 
+#### Transport admission (issue #3853)
+
+The stock profile dials a control plane Ferrum does not own, and the only
+credential it ever presents is the external bearer named by
+`FERRUM_MESH_STOCK_XDS_TOKEN_FILE`. The **complete** primary/fallback endpoint
+set is therefore admitted as ONE security posture at startup, before any socket
+exists, and re-checked per endpoint at connect time:
+
+- A configured token file requires `https://` on **every** endpoint, including
+  loopback. There is no development carve-out for a bearer.
+- `FERRUM_MESH_PRODUCTION_MODE=true` requires TLS on every endpoint whether or
+  not a bearer is configured.
+- The only remaining plaintext path is `FERRUM_MESH_STOCK_XDS_ALLOW_PLAINTEXT`
+  (default off): explicit, loopback-only (`127.0.0.0/8`, `::1`, `localhost`),
+  incompatible with a bearer, and refused outright in production mode.
+- A **mixed** `https://` + `http://` list is refused as a whole, so failover can
+  never select a weaker transport than the primary.
+- A missing/ambiguous scheme, an unsupported scheme, a missing host, userinfo,
+  a non-root path, and any query component are all refused. The endpoint is an
+  origin URL only (`https://host:port`, with an optional trailing `/`); tonic
+  supplies the gRPC service path itself.
+- Defense in depth: the `authorization` interceptor carries the selected
+  endpoint's admitted classification and refuses to attach the bearer to
+  anything not classified as authenticated TLS, even if top-level admission were
+  bypassed.
+
+Refusals name the endpoint by **index** plus a closed-set scheme and host class.
+The configured URL is never echoed into a log line, an error, or a metric.
+
+#### Bearer authorization lifetime (issue #3852)
+
+A stock ADS server typically validates the bearer only at RPC admission, so
+without a client-side bound the effective access lifetime of a projected token
+becomes the lifetime of the TCP/H2 stream. The client therefore gives every
+bearer-authenticated stream a finite **local** authorization lifetime:
+
+- A watcher re-reads the credential source every
+  `FERRUM_MESH_STOCK_XDS_TOKEN_WATCH_INTERVAL_SECONDS` through the same hardened
+  boundary the connect path uses (`O_NONBLOCK` open, regular-file check on the
+  **opened** descriptor, metadata fast-reject plus `take(limit + 1)` ceiling,
+  UTF-8 and empty-after-trim rejection) on a detached OS thread. Comparison is
+  over content, so both projected-secret symlink swaps and in-place rewrites are
+  detected; an unchanged token never churns the stream. Joining the async
+  watcher task does not join a timed-out detached OS reader: a stalled mount
+  can keep that thread blocked after the async timeout, and that is
+  intentional. The bounded invariant is the single global reader permit, which
+  moves into the detached thread so reconnects and later polls cannot
+  accumulate more blocked readers.
+- File reads are serialized by that permit, but publication is not done while
+  it is held (the watch send lock must not nest with the reader slot or the
+  commit-admission read guard). Each completed read therefore carries a
+  monotonic epoch stamped when it became the serialized reader. An observation
+  derived from an older read cannot overwrite a newer valid, invalid, or
+  not-configured observation, and the reconnect path will not bind a
+  connection fence or open an ADS RPC with material that already lost.
+- A rotated, removed, empty, non-regular, unreadable, oversized, or non-ASCII
+  source retires the old stream **before** any later discovery update is
+  accepted. An invalid source then *prevents* reconnection — there is no
+  stale-token and no freshness-only fallback.
+- A JWT-shaped token contributes `exp` through a bounded, **non-verifying**
+  local decode, used only to schedule a reconnect
+  `FERRUM_MESH_STOCK_XDS_TOKEN_REFRESH_SKEW_SECONDS` early. Locally decoded
+  claims are never authorization proof — but they are also never allowed to
+  schedule *past* `exp`. RFC 7519 NumericDate may be a non-integer JSON
+  number; a present numeric `exp` is floored to whole seconds so the deadline
+  cannot fall after the mathematical expiration. A token that is already
+  expired — including a syntactically valid NumericDate of zero, a negative
+  value, or a fractional value that floors to Unix epoch zero or earlier
+  (those are plainly expired, not "no hint") — or whose remaining lifetime
+  cannot leave a positive window once the skew is subtracted, is **refused**:
+  it becomes an invalid credential source (`token_expired` /
+  `token_expires_within_skew`) rather than being clamped up to some reconnect
+  floor. Recovery is the operator replacing the material, which the watcher
+  observes; the bounded invalid-source retry is what prevents a hot loop.
+- An opaque token gets
+  `FERRUM_MESH_STOCK_XDS_TOKEN_MAX_STREAM_LIFETIME_SECONDS`, which also caps any
+  JWT-derived deadline.
+- **The deadline is absolute and is stamped when the credential is ADMITTED,
+  not when the stream opens.** Materialization happens before the channel is
+  dialed, so deriving it from stream-open time would silently extend a JWT past
+  `exp` by the connect, TLS-handshake, and RPC-setup latency. Connect latency
+  therefore *spends* the deadline, and a credential whose deadline is already
+  reached refuses to be attached to a streaming RPC at all. Application
+  activity, including heartbeats on other protocols, never extends it.
+- The credential fence is checked with PRIORITY before any response may be
+  admitted, again immediately before every install/commit, and once more before
+  the end-of-stream flush. The same fence races the initial ADS RPC-open
+  (response-headers) await: a control plane that accepts the authenticated
+  request and then withholds headers cannot keep that pending open past
+  rotation, source invalidation, or the absolute monotonic deadline. An
+  already-observed or simultaneously-ready retirement wins, drops the
+  in-flight open, and is returned as that local retirement. A stream retired
+  for rotation, invalidation, or deadline additionally DISCARDS the
+  accumulated discovery and per-type subscription state it produced; only the
+  slice already installed in the runtime survives.
+- Failover and failback always materialize the newest token rather than reusing
+  the previous endpoint's interceptor value. The reconnect path re-proves that
+  its materialized credential is still the newest authoritative observation
+  before dialing and again after the dial before the streaming RPC opens: if a
+  newer valid replacement or invalidation won, the attempt retires locally and
+  retries from the current source rather than opening with the stale material.
+  A simultaneous TLS and token rotation produces one bounded retirement and
+  one reconnect using the newest of both.
+- Outcomes are fixed-cardinality (`token_source_missing`,
+  `token_source_oversized`, `token_expired`, `token_expires_within_skew`,
+  `credential_rotated`, `credential_source_invalid`, `credential_deadline`, …).
+  No token byte, decoded claim, or credential path reaches a log line, a metric
+  label, or `/health`. Third-party gRPC failures are rendered as the canonical
+  code only (`grpc_unauthenticated`, `grpc_unavailable`, …): a control plane
+  authors `Status::message()`, so echoing it could write the bearer straight
+  into Ferrum's own logs. Transport errors are reported as `connect_failed` /
+  `tls_config_rejected` / `endpoint_uri_invalid` rather than rendered, because
+  tonic's transport error can echo the configured URI or host. The same rule
+  covers every other ADS response field: remote `type_url`, `version_info`,
+  `nonce`, resource names, NACK error text, and refusal detail are omitted from
+  Ferrum logs. Operators see closed-set type labels (`cds`/`eds`/`lds`/`rds`/
+  `sds`/`unsolicited`), reason codes, counts, booleans, and endpoint indexes.
+  Truncating an arbitrary CP string is not redaction. The control plane may
+  still receive its own bounded NACK `error_detail`; that echo is not a Ferrum
+  log disclosure.
+
 **Where the code lives.** `src/xds/stock.rs` (decode, capability classification,
-projection onto the typed mesh model) and
+projection onto the typed mesh model),
 `src/modes/mesh/config_consumer/stock_xds_client.rs` (the ADS stream machine and
-the policy/discovery merge). Tests:
-`tests/unit/gateway_core/stock_xds_tests.rs`,
+the policy/discovery merge),
+`src/modes/mesh/config_consumer/stock_xds_transport.rs` (endpoint admission),
+and `src/modes/mesh/config_consumer/stock_xds_credential.rs` (credential
+lifetime). Tests: `tests/unit/gateway_core/stock_xds_tests.rs`,
+`tests/unit/gateway_core/mesh_stream_lifecycle_tests.rs`,
 `tests/integration/mesh_stock_xds_tests.rs`,
+`tests/integration/mesh_xds_stream_lifecycle_tests.rs`,
+`tests/integration/mesh_subscribe_validation_tests.rs`,
 `tests/functional/functional_mesh_stock_xds_test.rs`, and
 `tests/conformance/stock_xds_interop.rs`.
+
+### Configuration-stream attempt and liveness policy
+
+All three configuration-stream consumers — native `MeshSubscribe`, the
+Ferrum-private ADS profile, and the third-party stock ADS profile — share one
+attempt/liveness policy
+(`src/modes/mesh/config_consumer/stream_lifecycle.rs`, issue #3854). Partial-state
+semantics stay per protocol; only the *attempt outcome* is shared.
+
+**Remote clean EOF is an endpoint failure, not a success.** A configuration
+stream is meant to stay open, so a peer that accepts the RPC and then hangs up
+rotates to the next configured endpoint and grows the bounded, jittered backoff.
+Previously all three consumers classified `Ok(())` as success, reset backoff, and
+returned to (or stayed on) the primary — a control plane that accepted and
+immediately closed could pin the data plane in a primary-only hot loop while a
+healthy fallback was never consulted. A usable install on the attempt that just
+ended resets the reconnect delay *before* the next sleep, even when earlier
+no-progress failures grew the shared backoff to its cap. Repeated no-progress
+remote EOF or failure still grows that bounded, jittered delay. The progress bit
+is per-attempt, not inferred from last-good state left by another stream.
+
+**Intentional local retirement never penalizes the endpoint.** Shutdown, gRPC
+TLS reload, the three stock bearer-credential events (`credential_rotated`,
+`credential_source_invalid`, `credential_deadline`), and proactive primary
+failback are classified separately: they reconnect immediately, do not rotate
+the endpoint, and do not charge the failure backoff. The three credential
+outcomes stay distinct because collapsing them would tell an operator their
+token changed when in fact the source went missing, or when the stream simply
+reached its maximum authorized lifetime.
+
+**Established streams have a bounded liveness mechanism.** Every consumer's tonic
+endpoint now sets HTTP/2 keepalive (30s PING interval, 10s ack timeout,
+`keep_alive_while_idle`) plus a 30s TCP keepalive — the same policy the hardened
+DP ConfigSync client uses. A half-open or blackholed established stream is
+therefore detected within ~40s **without requiring periodic standard-xDS
+application frames**, and reaches the fallback after the ordinary backoff. That
+bound is reported as `liveness_bound_seconds` on the authenticated `/health`
+mesh detail; it is computed from the timing policy the consumer is actually
+running, which is ordinary per-invocation stack state with no environment or
+global override.
+
+A failure produced this way surfaces through tonic as a generic status, so it is
+reported honestly as `established_transport_failure` — "an already-open stream
+went dark" — rather than being labelled a keepalive timeout Ferrum cannot prove.
+An ordinary dial refusal stays `transport_failure`. Only the former projects as
+`stream_liveness_failed` on `/health`.
+
+**A mute or incomplete control plane cannot hold startup.** The 60s
+`first_frame_timeout` bound is one absolute attempt clock: it starts at the
+streaming RPC-open await and continues until the first response frame. Headers
+do not reset it. A control plane that accepts the
+authenticated request, keeps HTTP/2 healthy, and never returns headers is
+therefore the same mute peer as one that returns headers and then stays silent.
+Dropping the pending open future cancels it; no task is detached. On stock xDS
+the credential fence still outranks that clock: an already-ready or
+simultaneous generation, invalidation, or absolute credential deadline wins and
+resets retired-credential discovery state as before. A stream that delivers
+frames but never completes a generation, while this data plane has never
+installed a slice at all, fails as `first_slice_timeout` after 120s. The
+first-slice bound is armed only in that never-converged state, so a legitimately
+quiet control plane never tears down a converged proxy.
+
+Receive loops poll already-expired first-frame, first-slice, silence, and stock
+credential clocks before admitting a ready response, so a primary that
+continuously sends heartbeats or incomplete frames cannot hold startup forever.
+Debounce commit still outranks the next message so a complete generation is
+published before another frame is admitted; simultaneous clock vs.
+message/debounce boundaries fail closed.
+
+**Policy refusal is not transport liveness.** A Ferrum-private ADS stream that
+the local revision gate or NACK circuit breaker refuses is `policy_rejected`.
+That is a content failure: `/health` does not label it
+`established_transport_failure` or `stream_liveness_failed`. Dial, RPC-open,
+status, and outbound enqueue failures stay transport.
+
+**Partial generations are never published.** Both ADS consumers only stage a
+slice once their own required-type gate is satisfied, so an EOF mid-convergence
+leaves the last good slice serving and fails over rather than publishing mixed
+state.
+
+**Native heartbeats assist but do not extend credential lifetime.** The native
+consumer arms a 150s application-silence watchdog only after this stream has
+actually observed a heartbeat frame, so a control plane that never emits them is
+covered by transport keepalive alone rather than being reconnected needlessly.
+That bound is an APPLICATION-layer signal and is labelled
+`heartbeat_silence_timeout`, never as an HTTP/2 keepalive timeout. The stock
+profile's credential deadline is absolute from credential admission and is not
+reset by any frame.
+
+**No awaited work inside a stream loop may outrank retirement.** The native
+consumer's `ReportMeshSliceStatus` ACK/NACK RPC and both ADS consumers' outbound
+request enqueues are bounded (15s in production). Without those bounds a control
+plane that simply never answered a best-effort status report, or never opened its
+HTTP/2 receive window, suspended the consumer's own receive loop — and every
+liveness and credential deadline above stopped being evaluated. A bounded status
+report surfaces as `DeadlineExceeded`, which the existing transient-retry
+classification already handles, so ACK/NACK ordering through the single-slot
+pending-report is unchanged. Stock ADS outbound enqueues (initial CDS/LDS
+subscriptions and response-driven ACK/NACK/dependency sends) are also
+credential-aware: an already-observed or newly arriving generation, invalidation,
+or absolute deadline wins over the send and is returned as that local retirement
+rather than as a transport failure, so the next stream discards discovery state
+touched under the retired credential. The same fence races the initial ADS
+RPC-open (response-headers) await together with the first-frame bound, so a
+control plane that accepts the request and withholds headers cannot hold the
+pending open past credential retirement *or* the first-frame clock. Credential
+generation, invalidation, and deadline still win when they are already ready or
+simultaneous with first-frame or open success. No task is detached.
+
+The stock client's outer lifecycle `select` is `biased` with shutdown first and
+the inner ADS future next, so a simultaneously ready TLS-reload or primary-retry
+arm cannot mask a credential retirement or drop its required discovery-state
+reset. A credential-fence commit holds the watch observation across the
+synchronous install so a concurrent credential publish cannot land between the
+check and `install_slice`.
+
+**Observability.** `ferrum_mesh_config_stream_attempts_total{protocol,outcome}`
+counts every completed attempt, and the authenticated `/health` mesh detail
+carries `config_stream` with `state`, `last_attempt_outcome`, `fallback_active`,
+`consecutive_failures`, `credential`, and `liveness_bound_seconds`. Every value
+is a closed set or a counter — no endpoint URL, control-plane host, node id,
+credential path, token, or claim appears on either surface.
+
+`state` is published from real stream attachment, not inferred:
+
+- `connected` — an RPC stream is currently established AND usable configuration
+  exists AND no sticky liveness failure is outstanding. Publishing it is what
+  makes a healthy consumer distinguishable from a quietly broken one, and
+  installing usable state on that exact stream is what resets
+  `consecutive_failures` and clears `stream_liveness_failed`. An intentional
+  local retirement does not reset `consecutive_failures`: the counter is
+  consecutive endpoint-failure attempts since the last usable state, not
+  since the last attempt.
+- `stream_liveness_failed` — an established stream stopped being usable
+  (first-frame, first-slice, heartbeat-silence, or established-transport
+  failure). It OUTRANKS both `connected` and `never_received_slice`: a bounded
+  liveness failure stays visible even when no slice has ever arrived, and it
+  stays visible after a replacement RPC is accepted while last-good state still
+  exists. It is sticky until a stream installs usable state; merely attaching a
+  new RPC does not report `connected`.
+- `never_received_slice` — startup has never completed and no liveness bound has
+  been hit.
+- `serving_last_good` — a previously installed slice keeps serving while the
+  stream is down or reconnecting for an ordinary, non-liveness reason.
+
+`fallback_active` is true only while a stream is actually established on a
+non-primary endpoint; selecting a fallback index while connecting or backing off
+does not raise it. `credential` distinguishes `not_configured` (no token file at
+all) from `unobserved` (one is configured but has not been read yet) — reporting
+a configured source as "not configured" would misstate the operator's own
+posture.
+
+**Hosted proof.** The policy table (attempt classification, disposition, label
+closure, readiness precedence, credential lifetime arithmetic, transport
+admission, and the authorization-insertion boundary) is
+`tests/unit/gateway_core/mesh_stream_lifecycle_tests.rs`. The live behaviour is
+`tests/integration/mesh_stock_xds_tests.rs`: a loopback-h2c module for clean-EOF
+failover, partial-generation EOF, a mute primary, a TCP blackhole that stops
+forwarding an ESTABLISHED transport without FIN or RST, and a healthy
+application-idle stream that stays connected while PING acks succeed; plus a
+real TLS ADS module (rcgen CA + `ServerTlsConfig`) for projected-token rotation,
+source invalidation and recovery, the JWT and opaque authorization deadlines,
+a control plane that accepts the authenticated RPC and withholds response
+headers until rotation/invalidation/deadline cancel the still-pending open,
+failover with the newest material, coalesced TLS + token rotation, and the
+untrusted-CA / SAN-mismatch / expired-certificate / missing-client-certificate
+refusals. The native consumer's bounded status report is
+`tests/integration/mesh_subscribe_validation_tests.rs`. The production binary's
+transport refusals and the token-over-TLS happy path are
+`tests/functional/functional_mesh_stock_xds_test.rs`, whose scripted TLS ADS
+server asserts the exact `authorization` metadata it received.
+
+Every hosted test that compresses a bound does so through `MeshStreamTimings`,
+which is ordinary per-invocation stack state passed down the call chain. There
+is no environment variable, global, or `cfg` that can reach it, so a compressed
+test value has no path into a production data plane.
 
 #### Ferrum mesh-slice ECDS carriers (full parity over xDS)
 
