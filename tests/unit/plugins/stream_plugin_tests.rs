@@ -927,7 +927,7 @@ fn test_ws_only_plugins() {
 async fn test_http_family_plugins_complete_coverage() {
     // Plugins missing from the base test: hmac_auth, jwks_auth, jwt_auth
     let plugins = vec![
-        ("hmac_auth", json!({})),
+        ("hmac_auth", json!({"replay_scope": "process"})),
         (
             "jwks_auth",
             json!({"providers": [{"issuer": "test", "jwks_uri": "http://127.0.0.1:9/.well-known/jwks.json"}]}),

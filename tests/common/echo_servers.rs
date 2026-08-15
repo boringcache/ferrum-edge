@@ -78,6 +78,23 @@ fn parse_path(request: &str) -> String {
         .to_string()
 }
 
+/// Parse the request method from the first line of an HTTP/1.x request.
+fn parse_method(request: &str) -> String {
+    request
+        .lines()
+        .next()
+        .and_then(|l| l.split_whitespace().next())
+        .unwrap_or("")
+        .to_string()
+}
+
+fn is_mutating_method(method: &str) -> bool {
+    method.eq_ignore_ascii_case("POST")
+        || method.eq_ignore_ascii_case("PUT")
+        || method.eq_ignore_ascii_case("PATCH")
+        || method.eq_ignore_ascii_case("DELETE")
+}
+
 async fn read_request(stream: &mut tokio::net::TcpStream) -> String {
     let mut buf = vec![0u8; 4096];
     let n = stream.read(&mut buf).await.unwrap_or(0);
@@ -117,6 +134,52 @@ pub async fn spawn_http_echo() -> std::io::Result<EchoServer> {
         port,
         handle: Some(handle),
     })
+}
+
+/// HTTP echo server that counts the mutating requests it actually receives.
+///
+/// `/health` is excluded so a health probe cannot be mistaken for application
+/// traffic. `HEAD`/`GET` are also excluded: pool warmup and capability probes
+/// issue `HEAD /` even when `FERRUM_POOL_WARMUP_ENABLED=false` in some
+/// harness paths, and counting those would inflate a replay mutation
+/// assertion. The counter is what a replay test asserts on: "the gateway
+/// rejected the replay" is weaker than "the backend was contacted exactly
+/// once", because only the second rules out a duplicate side effect.
+pub async fn spawn_http_counting_mutations()
+-> std::io::Result<(EchoServer, Arc<std::sync::atomic::AtomicU32>)> {
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let port = listener.local_addr()?.port();
+    let mutations = Arc::new(std::sync::atomic::AtomicU32::new(0));
+    let counter = Arc::clone(&mutations);
+    let handle = tokio::spawn(async move {
+        loop {
+            match listener.accept().await {
+                Ok((mut stream, _)) => {
+                    let counter = Arc::clone(&counter);
+                    tokio::spawn(async move {
+                        let request = read_request(&mut stream).await;
+                        let path = parse_path(&request);
+                        let method = parse_method(&request);
+                        let (status, body) = if path == "/health" || !is_mutating_method(&method) {
+                            (200, r#"{"status":"healthy"}"#.to_string())
+                        } else {
+                            let seen = counter.fetch_add(1, Ordering::SeqCst) + 1;
+                            (200, format!(r#"{{"mutations":{seen}}}"#))
+                        };
+                        write_http_response(&mut stream, status, &body).await;
+                    });
+                }
+                Err(_) => tokio::time::sleep(Duration::from_millis(10)).await,
+            }
+        }
+    });
+    Ok((
+        EchoServer {
+            port,
+            handle: Some(handle),
+        },
+        mutations,
+    ))
 }
 
 /// HTTP server that identifies itself with `name` in the response body.

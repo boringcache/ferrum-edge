@@ -77,6 +77,7 @@ use ferrum_edge::modes::control_plane::{
 use ferrum_edge::modes::mesh::config_consumer::native_client::{
     NativeMeshClientConfig, NativeMeshConfigConsumer, start_native_mesh_client_with_shutdown,
 };
+use ferrum_edge::modes::mesh::config_consumer::stream_lifecycle::MeshStreamTimings;
 use ferrum_edge::modes::mesh::config_consumer::update_validation::{
     MeshUpdateConsumer, MeshUpdateExpectation, MeshUpdateRejectReason, validate_mesh_config_update,
 };
@@ -170,6 +171,7 @@ fn client_config() -> NativeMeshClientConfig {
         ambient_udp_source_scoping: false,
         node_waypoint_capture_scoping: false,
         primary_retry_secs: 0,
+        timings: MeshStreamTimings::production(),
     }
 }
 

@@ -10,15 +10,15 @@
 //!     :80/:443 ports, query/fragment) before comparison, so a conformant
 //!     client whose `htu` differs only cosmetically is still accepted.
 
-use std::sync::{Arc, Barrier};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use base64::Engine;
 use base64::engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD};
 use ferrum_edge::plugins::utils::dpop::{
-    self, DpopJtiCache, DpopVerifyInput, canonical_htu, canonical_htu_from_url,
-    jwk_thumbprint_sha256,
+    self, DPOP_MARKER_RETENTION_SECONDS, DPOP_REPLAY_PROFILE, DpopVerifyInput,
+    MAX_DPOP_CLOCK_SKEW_SECS, canonical_htu, canonical_htu_from_url, jwk_thumbprint_sha256,
 };
+use ferrum_edge::plugins::utils::replay_authority::ReplayDomain;
 use jsonwebtoken::jwk::Jwk;
 use jsonwebtoken::{Algorithm, EncodingKey, Header, encode};
 use serde_json::{Value, json};
@@ -85,8 +85,7 @@ fn base_proof_claims() -> Value {
     })
 }
 
-/// Cheap unique-ish jti so independent verify() calls do not collide in the
-/// shared replay cache.
+/// Cheap unique-ish jti so independent verify() calls stay distinguishable.
 fn uuid_like() -> String {
     use std::sync::atomic::{AtomicU64, Ordering};
     static COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -103,23 +102,38 @@ fn uuid_like() -> String {
 struct Harness {
     jwk: Jwk,
     jkt: String,
-    cache: DpopJtiCache,
+    domain: ReplayDomain,
 }
 
 impl Harness {
     fn new() -> Self {
+        Self::with_domain(ReplayDomain::new(
+            DPOP_REPLAY_PROFILE,
+            "ferrum",
+            "jwks_auth",
+            "dpop-tests",
+            "0",
+        ))
+    }
+
+    fn with_domain(domain: ReplayDomain) -> Self {
         let jwk = rsa_jwk();
         let jkt = jwk_thumbprint_sha256(&jwk).expect("thumbprint");
-        Self {
-            jwk,
-            jkt,
-            cache: DpopJtiCache::new(64, Duration::from_secs(300), 4),
-        }
+        Self { jwk, jkt, domain }
     }
 
     /// Verify a proof carrying `claims`, signed with the harness key, against
     /// the given canonical server reference `htu` and presented `access_token`.
-    fn verify(&self, claims: &Value, htu: &str, access_token: &str) -> Result<(), &'static str> {
+    ///
+    /// `verify()` no longer owns replay state: it validates and returns the
+    /// marker the caller must claim. The tests below therefore compare either
+    /// the error, or the marker digest, rather than a unit success.
+    fn verify(
+        &self,
+        claims: &Value,
+        htu: &str,
+        access_token: &str,
+    ) -> Result<[u8; 32], &'static str> {
         let proof = sign_proof(claims, &self.jwk);
         let token_claims = token_claims_for(&self.jkt);
         dpop::verify(DpopVerifyInput {
@@ -129,8 +143,14 @@ impl Harness {
             method: "GET",
             htu,
             clock_skew: Duration::from_secs(30),
-            cache: &self.cache,
+            domain: &self.domain,
         })
+        .map(|marker| marker.digest())
+    }
+
+    fn verify_ok(&self, claims: &Value, htu: &str, access_token: &str) -> [u8; 32] {
+        self.verify(claims, htu, access_token)
+            .expect("proof should validate")
     }
 }
 
@@ -155,10 +175,9 @@ fn proof_with_correct_ath_is_accepted() {
     let token = "access-token-abc";
     let mut claims = base_proof_claims();
     claims["ath"] = json!(access_token_hash(token));
-    let result = h.verify(&claims, "https://api.example.com/resource", token);
-    assert_eq!(
-        result,
-        Ok(()),
+    assert!(
+        h.verify(&claims, "https://api.example.com/resource", token)
+            .is_ok(),
         "a proof with the correct `ath` for the presented token must be accepted"
     );
 }
@@ -201,10 +220,8 @@ fn proof_htu_variants_are_normalized_before_comparison() {
         let mut claims = base_proof_claims();
         claims["htu"] = json!(variant);
         claims["ath"] = json!(access_token_hash(token));
-        let result = h.verify(&claims, &server_htu, token);
-        assert_eq!(
-            result,
-            Ok(()),
+        assert!(
+            h.verify(&claims, &server_htu, token).is_ok(),
             "proof htu `{variant}` should normalize to the server reference and be accepted"
         );
     }
@@ -312,76 +329,129 @@ fn canonical_htu_from_url_rejects_userinfo() {
     );
 }
 
+// ── issue #3834: the marker, not a local cache, is what `verify` produces ────
+
+/// The same proof always produces the same marker inside one domain, which is
+/// what makes a replay detectable across reload generations and replicas.
 #[test]
-fn concurrent_identical_jti_at_capacity_admits_exactly_one_request() {
-    const WORKERS: usize = 32;
-    let cache = Arc::new(DpopJtiCache::new(1, Duration::from_secs(300), 4));
-    let barrier = Arc::new(Barrier::new(WORKERS));
-    let now = Instant::now();
-    assert!(cache.check_and_insert("old-jkt", "old-jti", now));
+fn identical_proof_produces_a_stable_marker_within_one_domain() {
+    let h = Harness::new();
+    let token = "access-token-abc";
+    let mut claims = base_proof_claims();
+    claims["ath"] = json!(access_token_hash(token));
 
-    let workers = (0..WORKERS)
-        .map(|_| {
-            let cache = Arc::clone(&cache);
-            let barrier = Arc::clone(&barrier);
-            std::thread::spawn(move || {
-                barrier.wait();
-                cache.check_and_insert("same-jkt", "same-jti", now)
-            })
-        })
-        .collect::<Vec<_>>();
-
-    let admitted = workers
-        .into_iter()
-        .map(|worker| worker.join().expect("worker should not panic"))
-        .filter(|admitted| *admitted)
-        .count();
-    assert_eq!(admitted, 1);
-}
-
-#[test]
-fn full_replay_cache_rejects_live_duplicate_before_evicting() {
-    let cache = DpopJtiCache::new(1, Duration::from_secs(60), 4);
-    let now = Instant::now();
-    assert!(cache.check_and_insert("jkt-a", "jti-a", now));
-    assert!(
-        !cache.check_and_insert("jkt-a", "jti-a", now + Duration::from_secs(1)),
-        "a live duplicate must be rejected before capacity eviction"
+    let first = h.verify_ok(&claims, "https://api.example.com/resource", token);
+    let second = h.verify_ok(&claims, "https://api.example.com/resource", token);
+    assert_eq!(
+        first, second,
+        "the same jkt/jti inside one protection domain must map to one marker"
     );
-    assert!(cache.check_and_insert("jkt-b", "jti-b", now + Duration::from_secs(1)));
-    assert!(!cache.check_and_insert("jkt-b", "jti-b", now + Duration::from_secs(2)));
 }
 
+/// A different `jti` under the same key is a different proof and must not
+/// collide with the first marker.
 #[test]
-fn concurrent_expired_evictions_admit_fresh_proofs_without_false_replays() {
-    const WORKERS: usize = 32;
-    let cache = Arc::new(DpopJtiCache::new(WORKERS, Duration::from_secs(1), 4));
-    let inserted_at = Instant::now();
-    for idx in 0..WORKERS {
-        assert!(cache.check_and_insert("jkt", &format!("expired-{idx}"), inserted_at));
+fn distinct_jti_produces_a_distinct_marker() {
+    let h = Harness::new();
+    let token = "access-token-abc";
+    let mut first_claims = base_proof_claims();
+    first_claims["ath"] = json!(access_token_hash(token));
+    let mut second_claims = base_proof_claims(); // fresh jti
+    second_claims["ath"] = json!(access_token_hash(token));
+
+    assert_ne!(
+        h.verify_ok(&first_claims, "https://api.example.com/resource", token),
+        h.verify_ok(&second_claims, "https://api.example.com/resource", token),
+    );
+}
+
+/// Two equivalent replicas (same namespace, plugin-config id, provider index)
+/// derive the same domain and therefore the same marker — that convergence is
+/// what makes a shared claim meaningful. A different namespace, a different
+/// plugin-config id, or a different provider index isolates.
+#[test]
+fn protection_domains_converge_for_replicas_and_isolate_across_policies() {
+    let token = "access-token-abc";
+    let mut claims = base_proof_claims();
+    claims["ath"] = json!(access_token_hash(token));
+    let htu = "https://api.example.com/resource";
+
+    let replica_a = Harness::with_domain(ReplayDomain::new(
+        DPOP_REPLAY_PROFILE,
+        "ferrum",
+        "jwks_auth",
+        "policy-1",
+        "0",
+    ));
+    let replica_b = Harness::with_domain(ReplayDomain::new(
+        DPOP_REPLAY_PROFILE,
+        "ferrum",
+        "jwks_auth",
+        "policy-1",
+        "0",
+    ));
+    assert_eq!(
+        replica_a.verify_ok(&claims, htu, token),
+        replica_b.verify_ok(&claims, htu, token),
+        "equivalent replicas must derive the same marker"
+    );
+
+    for isolated in [
+        ReplayDomain::new(
+            DPOP_REPLAY_PROFILE,
+            "other-ns",
+            "jwks_auth",
+            "policy-1",
+            "0",
+        ),
+        ReplayDomain::new(DPOP_REPLAY_PROFILE, "ferrum", "jwks_auth", "policy-2", "0"),
+        ReplayDomain::new(DPOP_REPLAY_PROFILE, "ferrum", "jwks_auth", "policy-1", "1"),
+        ReplayDomain::new(
+            "ferrum-dpop-proof-v2",
+            "ferrum",
+            "jwks_auth",
+            "policy-1",
+            "0",
+        ),
+    ] {
+        assert_ne!(
+            replica_a.verify_ok(&claims, htu, token),
+            Harness::with_domain(isolated).verify_ok(&claims, htu, token),
+            "a distinct namespace/policy/provider/profile must not share a marker"
+        );
     }
+}
 
-    let barrier = Arc::new(Barrier::new(WORKERS));
-    let workers = (0..WORKERS)
-        .map(|idx| {
-            let cache = Arc::clone(&cache);
-            let barrier = Arc::clone(&barrier);
-            std::thread::spawn(move || {
-                barrier.wait();
-                cache.check_and_insert(
-                    "jkt",
-                    &format!("fresh-{idx}"),
-                    inserted_at + Duration::from_secs(2),
-                )
-            })
-        })
-        .collect::<Vec<_>>();
-
-    assert!(
-        workers
-            .into_iter()
-            .all(|worker| worker.join().expect("worker should not panic"))
+/// A domain component boundary cannot be forged by a `jti` containing a
+/// delimiter: every field is length-framed.
+#[test]
+fn marker_fields_are_length_framed_against_delimiter_forgery() {
+    let domain = ReplayDomain::new(DPOP_REPLAY_PROFILE, "ferrum", "jwks_auth", "policy-1", "0");
+    assert_ne!(
+        domain.marker(&[b"ab", b"c"]).digest(),
+        domain.marker(&[b"a", b"bc"]).digest(),
+        "a shifted field boundary must not produce the same marker"
     );
+    assert_ne!(
+        domain.marker(&[b"a|b", b""]).digest(),
+        domain.marker(&[b"a", b"b"]).digest(),
+        "an embedded delimiter must not impersonate a field boundary"
+    );
+}
+
+/// The retention horizon is not configurable and must dominate the widest
+/// acceptance window any admissible provider — or any later reload that widens
+/// `dpop_clock_skew_secs` — can open for one unchanged proof.
+#[test]
+fn retention_horizon_dominates_the_widest_admissible_clock_skew() {
+    const {
+        assert!(
+            DPOP_MARKER_RETENTION_SECONDS > 2 * MAX_DPOP_CLOCK_SKEW_SECS,
+            "a proof stays acceptable across `iat ± skew`, so retention must exceed 2 * max skew"
+        );
+    }
+    assert_eq!(MAX_DPOP_CLOCK_SKEW_SECS, 300);
+    assert_eq!(DPOP_MARKER_RETENTION_SECONDS, 601);
 }
 
 // ── minimal RSA public-key DER parsing (SPKI) for building the test JWK ─────

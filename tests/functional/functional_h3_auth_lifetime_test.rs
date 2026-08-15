@@ -344,6 +344,26 @@ async fn wait_for_h3_supported(harness: &GatewayHarness, timeout: Duration) -> O
     }
 }
 
+/// Wait until an H2/TLS-only backend is ready for the cross-protocol bridge.
+/// `unknown` and `unsupported` both keep native-H3 backend dispatch disabled;
+/// requiring H2/TLS support proves the capability refresh itself has settled.
+async fn wait_for_h2_bridge_ready(harness: &GatewayHarness, timeout: Duration) -> Option<Value> {
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        if let Some(entry) = fetch_capability_entry(harness).await {
+            let h3 = entry["plain_http"]["h3"].as_str();
+            let h2_tls = entry["plain_http"]["h2_tls"].as_str();
+            if h2_tls == Some("supported") && matches!(h3, Some("unsupported") | Some("unknown")) {
+                return Some(entry);
+            }
+        }
+        if std::time::Instant::now() >= deadline {
+            return None;
+        }
+        tokio::time::sleep(Duration::from_millis(150)).await;
+    }
+}
+
 /// A backend script that keeps producing response DATA for `count` rounds
 /// spaced by `gap`. Activity must never extend the authorization deadline.
 fn h3_chatty_stream(count: usize, gap: Duration) -> Vec<H3Step> {
@@ -824,6 +844,10 @@ async fn h3_auth_lifetime_grpc_web_expiry_emits_bounded_trailer_frame() {
 //    EARLIEST of the client `grpc-timeout` and the authorization deadline
 //    around every downstream write — and this test sets no `grpc-timeout` at
 //    all, so the authorization bound is the only one that can fire.
+//
+//    A tiny first gRPC message is committed before the bulk stall so expiry
+//    cannot race onto the pre-DATA trailers-only path: once DATA has been
+//    offered, a clean EOF is unsafe for a possibly partial message.
 // ────────────────────────────────────────────────────────────────────────────
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore]
@@ -833,12 +857,19 @@ async fn h3_auth_lifetime_stalled_downstream_cannot_outlive_the_credential() {
     let reservation = reserve_port().await.expect("backend port");
     let backend_port = reservation.port;
 
-    // Each message is far larger than the client's receive window below, so the
-    // gateway's very first downstream `send_data` parks in flow control.
+    // A tiny first message fits in the stalled client's 4 KiB window so the
+    // gateway offers (and completes) DATA before the bulk frames park
+    // `send_data`. That pins expiry onto the post-offer RESET path instead of
+    // racing the pre-DATA trailers-only completion.
+    let primed = Bytes::from(vec![b'y'; 64]);
     let big = Bytes::from(vec![b'x'; 64 * 1024]);
     let mut steps = vec![
         GrpcStep::AcceptStreamingRpc(MatchRpc::any()),
         GrpcStep::SendInitialHeaders,
+        GrpcStep::RespondMessage(primed.clone()),
+        // Let the gateway flush the priming frame separately before the first
+        // bulk frame parks on the client's tiny receive window.
+        GrpcStep::Sleep(Duration::from_millis(100)),
     ];
     for _ in 0..40 {
         steps.push(GrpcStep::RespondMessage(big.clone()));
@@ -851,6 +882,13 @@ async fn h3_auth_lifetime_stalled_downstream_cannot_outlive_the_credential() {
         .expect("spawn bulk grpc backend");
 
     let (harness, https_port) = spawn_h3_gateway(protected_proxy_yaml(backend_port), false).await;
+    let capability = wait_for_h2_bridge_ready(&harness, Duration::from_secs(20)).await;
+    assert!(
+        capability.is_some(),
+        "the H2/TLS backend must be classified for the cross-protocol bridge before the \
+         short-lived credential is minted; logs:\n{}",
+        harness.captured_combined().unwrap_or_default()
+    );
 
     // A deliberately tiny per-stream receive window makes the backpressure
     // deterministic instead of depending on Quinn's default.
@@ -870,17 +908,36 @@ async fn h3_auth_lifetime_stalled_downstream_cannot_outlive_the_credential() {
     let (status, _headers) = stream.recv_response().await.expect("response headers");
     assert_eq!(status.as_u16(), 200);
 
-    // From here the client NEVER reads a DATA frame. The gateway's downstream
-    // write parks, and only the authorization bound can end the exchange.
+    // Prove the post-DATA precondition before deliberately stalling. Reading
+    // this 69-byte gRPC frame restores only its small amount of flow-control
+    // credit; the following 64 KiB frame still cannot complete in a 4 KiB
+    // stream window.
+    let first = stream
+        .recv_data()
+        .await
+        .expect("priming gRPC DATA must arrive before credential expiry")
+        .expect("priming gRPC response must not end before DATA");
+    assert_eq!(first.len(), primed.len() + 5, "complete priming gRPC frame");
+    assert!(first.ends_with(&primed), "priming gRPC payload must match");
+
+    // From here the client NEVER reads a DATA frame. The tiny first message
+    // has established the post-DATA state, the bulk `send_data` parks, and
+    // only the authorization bound can end the exchange. Expiry after offered
+    // DATA must RESET: a clean EOF would hide a potentially partial gRPC
+    // message.
     assert_credential_expired_exactly(&harness, "grpc", 1).await;
 
     // The stream must be terminated on the wire too, not merely counted.
     match tokio::time::timeout(TERMINATION_GRACE, stream.recv_data()).await {
         Ok(Err(_)) => {}
-        Ok(Ok(other)) => {
+        Ok(Ok(None)) => panic!(
+            "a stalled-downstream expiry must reset the stream, never close it cleanly; logs:\n{}",
+            harness.captured_combined().unwrap_or_default()
+        ),
+        Ok(Ok(Some(_))) => {
             // Buffered credit may release a bounded prefix before the reset is
-            // observed; drain until the reset surfaces.
-            let _ = other;
+            // observed; drain until the reset surfaces. A subsequent clean EOF
+            // is still a failure: DATA was already client-visible.
             let started = std::time::Instant::now();
             loop {
                 match stream.recv_data().await {
@@ -890,7 +947,7 @@ async fn h3_auth_lifetime_stalled_downstream_cannot_outlive_the_credential() {
                     ),
                     Ok(None) => panic!(
                         "a stalled-downstream expiry must reset the stream, never close it \
-                         cleanly; logs:\n{}",
+                         cleanly after offered DATA; logs:\n{}",
                         harness.captured_combined().unwrap_or_default()
                     ),
                     Err(_) => break,

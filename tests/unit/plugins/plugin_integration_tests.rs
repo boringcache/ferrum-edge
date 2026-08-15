@@ -263,6 +263,9 @@ async fn test_plugin_creation_all_plugins() {
             "jwks_auth" => {
                 json!({"providers": [{"jwks_uri": "http://127.0.0.1:9/.well-known/jwks.json"}]})
             }
+            // `hmac_auth` defaults to the single-use `ferrum-hmac-v2` profile,
+            // which requires an explicit replay-scope declaration.
+            "hmac_auth" => json!({"replay_scope": "process"}),
             "oauth2_introspection" => json!({
                 "providers": [{
                     // Loopback endpoint so client_auth "none" is accepted.

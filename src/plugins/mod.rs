@@ -10996,9 +10996,14 @@ pub fn create_plugin_with_http_client_and_config_id(
         "transaction_debugger" => Ok(Some(Arc::new(
             transaction_debugger::TransactionDebugger::new(config)?,
         ))),
-        "jwks_auth" => Ok(Some(Arc::new(jwks_auth::JwksAuth::new(
+        // The stable plugin-config id is the DPoP replay protection domain: it
+        // is what lets a reload generation inherit the previous generation's
+        // proof markers instead of starting from an empty store, and what keys
+        // a shared (Redis) replay keyspace to one policy.
+        "jwks_auth" => Ok(Some(Arc::new(jwks_auth::JwksAuth::new_with_config_id(
             config,
             http_client.clone(),
+            plugin_config_id,
         )?))),
         "oauth2_introspection" => Ok(Some(Arc::new(
             oauth2_introspection::Oauth2Introspection::new(config, http_client.clone())?,
@@ -11014,7 +11019,15 @@ pub fn create_plugin_with_http_client_and_config_id(
             config,
             http_client,
         )?))),
-        "hmac_auth" => Ok(Some(Arc::new(hmac_auth::HmacAuth::new(config)?))),
+        // Same reasoning as `jwks_auth`: the stable plugin-config id is the
+        // `ferrum-hmac-v2` nonce protection domain.
+        "hmac_auth" => Ok(Some(Arc::new(
+            hmac_auth::HmacAuth::new_with_http_client_and_config_id(
+                config,
+                http_client.clone(),
+                plugin_config_id,
+            )?,
+        ))),
         "mtls_auth" => Ok(Some(Arc::new(mtls_auth::MtlsAuth::new(config)?))),
         "spiffe_identity" => Ok(Some(Arc::new(mesh::spiffe_identity::SpiffeIdentity::new(
             config,
