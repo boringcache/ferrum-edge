@@ -12,11 +12,11 @@ use serde_json::json;
 mod scheduled_scaling;
 
 use scheduled_scaling::{
-    BatchProvisionDecision, NAMESPACE_FENCE_DEFAULT_RETRY_AFTER_SECS,
-    NAMESPACE_FENCE_MAX_ATTEMPTS, NAMESPACE_FENCE_MAX_RETRY_AFTER_SECS,
-    NAMESPACE_FENCE_RETRY_MESSAGE, SCHEDULED_SCALING_ADMIN_JWT_TTL_SECS,
-    classify_admin_batch_response, documented_namespace_fence_body,
-    namespace_fence_retry_after_delay, scheduled_scaling_admin_jwt_max_ttl_value,
+    BatchProvisionDecision, NAMESPACE_FENCE_DEFAULT_RETRY_AFTER_SECS, NAMESPACE_FENCE_MAX_ATTEMPTS,
+    NAMESPACE_FENCE_MAX_RETRY_AFTER_SECS, NAMESPACE_FENCE_RETRY_MESSAGE,
+    SCHEDULED_SCALING_ADMIN_JWT_TTL_SECS, classify_admin_batch_response,
+    documented_namespace_fence_body, namespace_fence_retry_after_delay,
+    scheduled_scaling_admin_jwt_max_ttl_value,
 };
 
 const WORKFLOW: &str = include_str!("../../../.github/workflows/scaling-regression.yml");

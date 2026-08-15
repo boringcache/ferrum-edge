@@ -437,7 +437,10 @@ impl LoadTestHarness {
             .env("FERRUM_MODE", "database")
             .env("FERRUM_ADMIN_JWT_SECRET", &jwt_secret)
             .env("FERRUM_ADMIN_JWT_ISSUER", &jwt_issuer)
-            .env("FERRUM_ADMIN_JWT_MAX_TTL", scheduled_scaling_admin_jwt_max_ttl_value())
+            .env(
+                "FERRUM_ADMIN_JWT_MAX_TTL",
+                scheduled_scaling_admin_jwt_max_ttl_value(),
+            )
             .env("FERRUM_DB_TYPE", db_type)
             .env("FERRUM_DB_URL", db_url)
             .env("FERRUM_DB_POLL_INTERVAL", "2")

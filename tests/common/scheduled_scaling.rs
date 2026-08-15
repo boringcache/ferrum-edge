@@ -132,10 +132,9 @@ pub async fn post_admin_batch(
         let body_text = match response.text().await {
             Ok(text) => text,
             Err(err) => {
-                return Err(format!(
-                    "{operation} failed: {status} (unreadable body: {err})"
-                )
-                .into());
+                return Err(
+                    format!("{operation} failed: {status} (unreadable body: {err})").into(),
+                );
             }
         };
 
