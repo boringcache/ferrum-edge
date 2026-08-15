@@ -52516,6 +52516,11 @@ mod tests {
         polled: Arc<AtomicBool>,
     }
 
+    struct ExpiringFinalHeaderPolicyPlugin {
+        polls: Arc<AtomicU64>,
+        expire_on_poll: u64,
+    }
+
     struct CommittedHeaderProbePlugin;
 
     struct CustomNoTransformHeaderPlugin;
@@ -52774,6 +52779,37 @@ mod tests {
             _response_headers: &HashMap<String, String>,
         ) -> PluginResult {
             self.polled.store(true, Ordering::Release);
+            PluginResult::Reject {
+                status_code: 418,
+                body: "late final-header rejection".to_string(),
+                headers: HashMap::from([("x-final-replaced".to_string(), "true".to_string())]),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl Plugin for ExpiringFinalHeaderPolicyPlugin {
+        fn name(&self) -> &str {
+            "expiring_final_header_policy_plugin"
+        }
+
+        fn enforces_final_client_visible_response_headers(&self, _ctx: &RequestContext) -> bool {
+            true
+        }
+
+        async fn finalize_client_visible_response_headers(
+            &self,
+            ctx: &mut RequestContext,
+            _response_status: u16,
+            _response_headers: &HashMap<String, String>,
+        ) -> PluginResult {
+            let poll = self.polls.fetch_add(1, Ordering::AcqRel) + 1;
+            if poll == self.expire_on_poll {
+                ctx.record_authorization_termination_once(
+                    crate::proxy::auth_lifetime::StreamAuthTermination::CredentialExpired,
+                    crate::proxy::auth_lifetime::StreamAuthProtocolFamily::Http,
+                );
+            }
             PluginResult::Reject {
                 status_code: 418,
                 body: "late final-header rejection".to_string(),
@@ -53151,6 +53187,57 @@ mod tests {
         assert_eq!(status_code, StatusCode::UNAUTHORIZED.as_u16());
         assert_eq!(&*body, br#"{"error":"Unauthorized"}"#);
         assert!(!final_header_policy_polled.load(Ordering::Acquire));
+    }
+
+    #[tokio::test]
+    async fn authorization_expiry_during_final_policy_keeps_the_canonical_terminal() {
+        let termination = crate::proxy::auth_lifetime::StreamAuthTermination::CredentialExpired;
+
+        for buffered in [false, true] {
+            let polls = Arc::new(AtomicU64::new(0));
+            let plugins: Vec<Arc<dyn Plugin>> =
+                vec![Arc::new(ExpiringFinalHeaderPolicyPlugin {
+                    polls: Arc::clone(&polls),
+                    expire_on_poll: 2,
+                })];
+            let mut ctx = RequestContext::new(
+                "203.0.113.10".into(),
+                "GET".into(),
+                "/protected".into(),
+            );
+            let mut status_code = StatusCode::OK.as_u16();
+            let mut headers =
+                HashMap::from([("content-type".to_string(), "text/plain".to_string())]);
+            let mut body = Bytes::from_static(b"protected response");
+
+            let replaced = if buffered {
+                enforce_buffered_final_client_visible_response_header_policy(
+                    &plugins,
+                    &mut ctx,
+                    &mut status_code,
+                    &mut headers,
+                    &mut body,
+                )
+                .await
+            } else {
+                enforce_final_client_visible_response_header_policy(
+                    &plugins,
+                    &mut ctx,
+                    &mut status_code,
+                    &mut headers,
+                    &mut body,
+                    false,
+                )
+                .await
+            };
+
+            assert!(replaced);
+            assert_eq!(polls.load(Ordering::Acquire), 2);
+            assert_eq!(ctx.authorization_termination(), Some(termination));
+            assert_eq!(status_code, StatusCode::UNAUTHORIZED.as_u16());
+            assert_eq!(&*body, br#"{"error":"Unauthorized"}"#);
+            assert!(!headers.contains_key("x-final-replaced"));
+        }
     }
 
     #[tokio::test]
