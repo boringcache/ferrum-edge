@@ -35,6 +35,8 @@ fn test_runtime() -> MeshRuntimeConfig {
         stock_xds_node_id: None,
         stock_xds_node_metadata: Default::default(),
         stock_xds_token_file: None,
+        stock_xds_credential_policy: Default::default(),
+        stock_xds_allow_plaintext: false,
         stock_xds_limits: Default::default(),
         topology: MeshTopology::Sidecar,
         inbound_listen_addr: test_addr("127.0.0.1:15006"),

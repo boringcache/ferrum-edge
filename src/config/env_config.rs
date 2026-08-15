@@ -27,6 +27,8 @@ use std::sync::Arc;
 #[path = "env_config_macro.rs"]
 mod env_config_macro;
 
+pub(crate) use env_config_macro::EnvValue;
+
 pub const DEFAULT_TLS_MANAGED_STORE_PATH: &str = "./ferrum-managed-tls";
 
 pub fn tls_managed_store_path_from_env() -> String {

@@ -829,7 +829,7 @@ fn h3_cross_protocol_streaming_grpc_consumes_deadline_and_read_bounds() {
             .count(),
         3,
         "write-bound client expiry plus the authorization and client select arms must all use \
-         client-visible DATA"
+         offered DATA"
     );
     assert!(relay.contains("abort_response_stream(stream)"));
     assert!(relay.contains("_ = &mut read_deadline"));
@@ -1748,11 +1748,11 @@ fn h3_native_and_cross_protocol_cancel_writers_use_post_deadline_grace() {
 fn h3_grpc_deadline_terminal_status_depends_on_client_visible_data() {
     assert!(
         ferrum_edge::_test_support::grpc_deadline_can_send_terminal_status_for_test(0),
-        "the first blocked DATA write may still be replaced by clean status-4 trailers"
+        "clean trailers are legal only while no DATA has been offered to the H3 send half"
     );
     assert!(
         !ferrum_edge::_test_support::grpc_deadline_can_send_terminal_status_for_test(1),
-        "once any DATA is client-visible the stream must reset instead of hiding a partial message"
+        "once any DATA is offered the stream must reset instead of hiding a partial message"
     );
 
     let native = include_str!("../../../src/http3/server.rs");
@@ -1797,6 +1797,70 @@ fn h3_grpc_deadline_terminal_status_depends_on_client_visible_data() {
     assert!(bridge.contains("grpc_deadline_can_send_terminal_status("));
     assert!(bridge.contains("trailers = Some(deadline_trailers);"));
     assert!(bridge.contains("abort_response_stream(stream);"));
+}
+
+#[test]
+fn h3_grpc_relays_charge_offered_data_before_awaiting_send_data() {
+    fn assert_offer_is_charged_before_await(relay: &str, macro_name: &str) {
+        let macro_body = relay
+            .split(&format!("macro_rules! {macro_name}"))
+            .nth(1)
+            .unwrap_or_else(|| panic!("{macro_name} must remain the downstream-write seam"))
+            .split("'outer: loop")
+            .next()
+            .unwrap_or_else(|| panic!("{macro_name} must be declared before the relay loop"));
+        let offer = macro_body
+            .find("bytes_offered = bytes_offered.saturating_add")
+            .unwrap_or_else(|| {
+                panic!("{macro_name} must charge offered DATA when send_data is polled")
+            });
+        let raced = macro_body.find("let write = async").unwrap_or_else(|| {
+            panic!("{macro_name} must race a polled wrapper so unpolled writes stay pre-DATA")
+        });
+        assert!(
+            raced < offer,
+            "{macro_name} must charge offered DATA inside the raced write future, not before it \
+             is polled"
+        );
+        let write_await = macro_body[offer..]
+            .find(".await")
+            .map(|at| offer + at)
+            .unwrap_or_else(|| panic!("{macro_name} must still await the H3 send_data"));
+        assert!(
+            offer < write_await,
+            "{macro_name} must charge offered DATA before h3 queues the frame and poll_ready parks"
+        );
+        let after_helper = macro_body
+            .split("grpc_deadline_can_send_terminal_status(")
+            .nth(1)
+            .unwrap_or_else(|| {
+                panic!("{macro_name} client-deadline branch must keep the message-safe rule")
+            });
+        assert!(
+            after_helper.trim_start().starts_with("bytes_offered"),
+            "{macro_name} client-deadline branch must use offered DATA after a cancelled write"
+        );
+    }
+
+    let native = include_str!("../../../src/http3/server.rs");
+    let native = native
+        .split("async fn dispatch_grpc_native_h3(")
+        .nth(1)
+        .expect("native H3 gRPC relay")
+        .split("async fn log_h3_grpc_transaction(")
+        .next()
+        .expect("bounded native H3 gRPC relay");
+    assert_offer_is_charged_before_await(native, "await_downstream_grpc_write");
+
+    let bridge = include_str!("../../../src/http3/cross_protocol.rs");
+    let bridge = bridge
+        .split("async fn stream_hyper_incoming<S>(")
+        .nth(1)
+        .expect("H3-to-H2 gRPC response relay")
+        .split("fn should_finish_h3_stream_without_trailers(")
+        .next()
+        .expect("bounded H3-to-H2 gRPC response relay");
+    assert_offer_is_charged_before_await(bridge, "await_downstream_write");
 }
 
 #[test]
@@ -4370,7 +4434,7 @@ fn h3_native_grpc_zero_data_trailer_uses_the_message_safe_rule() {
         .next()
         .expect("bounded message-safe rule helper");
     assert!(
-        helper.contains("bytes_streamed == 0"),
+        helper.contains("bytes_offered == 0"),
         "zero-DATA vs post-DATA trailer termination stays on the shared message-safe rule"
     );
     let relay = native_h3_grpc_relay_source();
