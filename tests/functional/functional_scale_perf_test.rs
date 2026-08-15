@@ -418,7 +418,7 @@ async fn create_batch(
     // This ensures referential integrity: consumers exist before ACL plugins reference them,
     // proxies exist before plugin_configs reference proxy_id.
 
-    // `POST /batch` is all-or-nothing: any non-2xx means nothing was applied,
+    // `POST /batch` is all-or-nothing: any non-201 means nothing was applied,
     // so there is no partial-success status to tolerate. Only the documented
     // namespace-fence 503 is retried, and retries repeat the same atomic body.
     for chunk in all_consumers.chunks(API_BATCH_CHUNK) {
