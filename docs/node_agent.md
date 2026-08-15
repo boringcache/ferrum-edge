@@ -182,8 +182,10 @@ BPF map read are gated behind `#[cfg(all(feature = "ebpf", target_os = "linux"))
 >   `ip6tables-save`, and the Debian platform CA bundle at
 >   `/etc/ssl/certs/ca-certificates.crt` (required for plugin `reqwest` TLS
 >   verification; the distroless `-ebpf` base already carries a CA store). Use it
->   for the two paths that shell out: the Ambient UDP
->   capture lifecycle (the mesh chart selects this tag automatically) and
+>   for the paths that shell out: the Ambient UDP capture lifecycle, the
+>   NodeWaypoint UDP/DTLS Service-path steering enabled by
+>   `FERRUM_MESH_NODE_WAYPOINT_UDP_LISTENERS_ENABLED=true` (the mesh chart
+>   selects this tag automatically for both), and
 >   `FERRUM_NODE_AGENT_FALLBACK_MODE=iptables`. It is **not distroless**, has a
 >   package manager, and runs as **root**, so prefer `-ebpf` wherever the tool
 >   contract is not required.
