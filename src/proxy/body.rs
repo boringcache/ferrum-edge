@@ -1924,7 +1924,8 @@ where
 /// * The fixed-cardinality counter is recorded through the request's shared
 ///   latch, so an upload and a response body racing the same plan on a
 ///   bidirectional stream still count exactly one termination.
-pub(crate) struct UploadAuthDeadline {
+#[doc(hidden)]
+pub struct UploadAuthDeadline {
     sleep: Pin<Box<tokio::time::Sleep>>,
     termination: crate::proxy::auth_lifetime::StreamAuthTermination,
     family: crate::proxy::auth_lifetime::StreamAuthProtocolFamily,
