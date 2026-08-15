@@ -71,12 +71,28 @@ fn mesh_supported_matrix_product_deferral_index_is_current() {
         !MESH_SUPPORTED_MATRIX.contains("remains part of #2038"),
         "closed #2038 must not be cited as pending enrolled-destination work"
     );
-    for issue in ["#3228", "#3331", "#3334", "#3621"] {
+    for issue in ["#3228", "#3331", "#3334"] {
         assert!(
             MESH_SUPPORTED_MATRIX.contains(issue),
             "product deferral index must cite live tracker {issue}"
         );
     }
+    assert!(
+        !MESH_SUPPORTED_MATRIX.contains("issues/3621"),
+        "closed #3621 must not remain in the canonical open product deferral index"
+    );
+    assert!(
+        MESH_SUPPORTED_MATRIX.contains(
+            "Ambient UDP capture producer + privileged live source-capture **and enrolled-destination** e2e (#2013 / #2038 / #3621"
+        ),
+        "completed #3621 must stay recorded in the completed historical rows"
+    );
+    assert!(
+        MESH_SUPPORTED_MATRIX.contains(
+            "functional_mesh_live_source_capture_udp_manager_hbone_round_trip"
+        ),
+        "completed enrolled-destination coverage must name the live source-capture gate"
+    );
     // #3263 shipped: external UDP ServiceEntry ports now materialize a
     // datagram-over-mesh destination allowlist on the EgressGateway. It must be
     // recorded as completed, never re-listed as an open deferral row.
@@ -95,18 +111,18 @@ fn mesh_supported_matrix_product_deferral_index_is_current() {
 }
 
 #[test]
-fn node_agent_udp_live_coverage_cites_closed_trackers_and_3621_residual() {
+fn node_agent_udp_live_coverage_cites_closed_trackers_and_enrolled_destination_gate() {
     assert!(
         !NODE_AGENT.contains("remains part of #2038"),
         "closed #2038 must not be cited as pending live UDP verification"
     );
     assert!(
-        NODE_AGENT.contains("#3621"),
-        "enrolled-destination UDP round-trip residual must cite live tracker #3621"
+        !NODE_AGENT.contains("not yet live-gated"),
+        "enrolled-destination UDP round trip must not remain a live residual"
     );
     assert!(
         NODE_AGENT.contains("functional_mesh_live_source_capture_udp_manager_hbone_round_trip"),
-        "node_agent must name the live source-capture gate that closed #2013/#2038"
+        "node_agent must name the live source-capture gate that closed #2013/#2038/#3621"
     );
 }
 
@@ -159,7 +175,7 @@ fn issue_2110_register_maps_completed_work_and_live_trackers() {
         "k8s status ownership must document the intentional RMW+SSA mixed strategy"
     );
     for issue in [
-        "#3228", "#3299", "#3302", "#3304", "#3331", "#3332", "#3621",
+        "#3228", "#3299", "#3302", "#3304", "#3331", "#3332",
     ] {
         assert!(
             ISSUE_2110_REGISTER.contains(issue),
@@ -171,6 +187,17 @@ fn issue_2110_register_maps_completed_work_and_live_trackers() {
         ISSUE_2110_REGISTER
             .contains("| EgressGateway UDP `ServiceEntry` materialization | Implemented"),
         "completed #3263 must be recorded as implemented, not as a live residual"
+    );
+    assert!(
+        ISSUE_2110_REGISTER
+            .contains("| Ambient UDP enrolled-destination round trip | Implemented"),
+        "completed #3621 must be recorded as implemented, not as a live residual"
+    );
+    assert!(
+        ISSUE_2110_REGISTER.contains(
+            "functional_mesh_live_source_capture_udp_manager_hbone_round_trip"
+        ),
+        "completed #3621 must name the live source-capture gate"
     );
     assert!(
         ISSUE_2110_REGISTER.contains("EnvoyFilter / WasmPlugin"),
