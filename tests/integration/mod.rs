@@ -124,6 +124,7 @@ mod mesh_telemetry_k8s_provider_lookup_tests;
 mod mesh_telemetry_tracing_tests;
 mod mesh_test_support;
 mod mesh_topology_hbone_tests;
+mod mesh_xds_stream_lifecycle_tests;
 mod node_agent_topology_metrics_tests;
 mod policy_path_canonicalization_tests;
 mod port_aware_route_traffic_tests;

@@ -7,11 +7,15 @@ use tracing::{error, info, warn};
 
 use super::common::{
     BACKOFF_INITIAL_SECS, MESH_CONFIG_GRPC_MAX_DECODING_MESSAGE_SIZE, jittered_backoff,
-    next_backoff_secs, refresh_dp_grpc_tls_config_if_changed, wait_for_shutdown,
-    wait_optional_tls_reload,
+    refresh_dp_grpc_tls_config_if_changed, wait_for_shutdown, wait_optional_tls_reload,
 };
 use super::native_tls::{
     annotate_connect_error, observed_class_from_error, prepare_native_mesh_tls,
+};
+use super::stream_lifecycle::{
+    MeshConfigStreamCredential, MeshStreamAttachment, MeshStreamAttempt, MeshStreamAttemptProgress,
+    MeshStreamRetirement, MeshStreamTimings, MeshStreamTracker,
+    configure_mesh_config_stream_endpoint, reconnect_backoff_after_attempt,
 };
 use super::update_validation::{
     MeshUpdateConsumer, MeshUpdateExpectation, MeshUpdateRejection, validate_mesh_config_update,
@@ -51,7 +55,14 @@ pub struct NativeMeshClientConfig {
     /// reconnects to the primary CP — matching the xDS client and the documented
     /// HA failback model. `0` disables proactive failback (the prior behaviour).
     pub primary_retry_secs: u64,
+    /// Per-invocation stream timing policy (issue #3854). Production uses
+    /// [`MeshStreamTimings::production`]; tests may compress it so first-frame
+    /// and application-silence failover are provable inside bounded CI.
+    pub timings: MeshStreamTimings,
 }
+
+/// Fixed-cardinality protocol label for the shared stream lifecycle.
+pub(crate) const NATIVE_PROTOCOL_LABEL: &str = "native";
 
 impl NativeMeshClientConfig {
     pub fn subscribe_request(&self, ferrum_version: &str) -> MeshSubscribeRequest {
@@ -73,7 +84,13 @@ impl NativeMeshClientConfig {
     }
 }
 
-/// Maintain a live native `MeshSubscribe` stream with simple multi-CP failover.
+/// Maintain a live native `MeshSubscribe` stream with multi-CP failover.
+///
+/// Attempt classification, endpoint rotation, and backoff are the shared
+/// [`super::stream_lifecycle`] policy (issue #3854): a remote clean EOF is an
+/// endpoint failure that rotates to the next configured CP and grows the
+/// bounded, jittered backoff, while shutdown, TLS reload, and proactive primary
+/// failback are intentional local retirements that penalize nothing.
 pub async fn start_native_mesh_client_with_shutdown(
     cp_urls: Vec<String>,
     jwt_secret: GrpcJwtSecret,
@@ -94,11 +111,21 @@ pub async fn start_native_mesh_client_with_shutdown(
         .as_ref()
         .map(|reload| *reload.revision_rx.borrow())
         .unwrap_or(0);
+    // The native consumer's CP credential is minted (or read) fresh on every
+    // connection attempt, so there is no long-lived external credential to
+    // report here.
+    let mut tracker = MeshStreamTracker::new(
+        NATIVE_PROTOCOL_LABEL,
+        MeshConfigStreamCredential::NotConfigured,
+        config.timings,
+    );
+    state.set_config_stream_status(tracker.status(state.has_first_slice()));
 
     info!(
         node_id = %config.node_id,
         namespace = %config.namespace,
         cp_urls = cp_urls.len(),
+        liveness_bound_secs = config.timings.liveness_bound_seconds(),
         "Native mesh client starting"
     );
 
@@ -117,7 +144,15 @@ pub async fn start_native_mesh_client_with_shutdown(
         let cp_url = &cp_urls[current_cp_index];
         let mut stream_shutdown_rx = shutdown_rx.clone();
         let is_fallback = current_cp_index != 0 && cp_urls.len() > 1;
+        tracker.set_endpoint_index(current_cp_index);
         let should_retry_primary = is_fallback && config.primary_retry_secs > 0;
+        let mut delivered_usable_state = false;
+        let mut stream_established = false;
+        let mut force_primary = false;
+        // Shutdown is recorded as an intentional retirement rather than an
+        // unobserved `return`, so `/metrics` distinguishes a clean stop from a
+        // stream that simply vanished.
+        let mut shutting_down = false;
         // On a fallback CP, arm failback after a first slice is available. The
         // fallback stream may itself deliver that first slice and then stay open
         // indefinitely, so the timer must wait inside this select instead of
@@ -130,31 +165,29 @@ pub async fn start_native_mesh_client_with_shutdown(
                     &config,
                     &state,
                     tls_config.as_ref(),
+                    MeshStreamAttemptProgress {
+                        tracker: &mut tracker,
+                        delivered_usable_state: &mut delivered_usable_state,
+                        stream_established: &mut stream_established,
+                    },
                 ) => result,
                 _ = wait_for_first_slice_then_primary_retry(
                     state.clone(),
                     Duration::from_secs(config.primary_retry_secs),
                 ) => {
-                    info!(
-                        primary_retry_secs = config.primary_retry_secs,
-                        cp_url = %cp_url,
-                        "Native primary retry interval elapsed; reconnecting to primary CP"
-                    );
-                    current_cp_index = 0;
-                    backoff_secs = BACKOFF_INITIAL_SECS;
-                    continue;
+                    force_primary = true;
+                    Ok(MeshStreamAttempt::LocalRetirement(MeshStreamRetirement::PrimaryRetry))
                 }
                 _ = wait_for_shutdown(&mut stream_shutdown_rx) => {
                     info!("Native mesh client shutting down");
-                    return;
+                    shutting_down = true;
+                    Ok(MeshStreamAttempt::LocalRetirement(MeshStreamRetirement::Shutdown))
                 }
                 _ = wait_optional_tls_reload(
                     tls_reload.as_ref().map(|reload| reload.revision_rx.clone()),
                     last_tls_revision,
                 ) => {
-                    info!("Mesh gRPC TLS source changed; reconnecting native MeshSubscribe stream");
-                    backoff_secs = BACKOFF_INITIAL_SECS;
-                    continue;
+                    Ok(MeshStreamAttempt::LocalRetirement(MeshStreamRetirement::TlsReload))
                 }
             }
         } else {
@@ -165,37 +198,66 @@ pub async fn start_native_mesh_client_with_shutdown(
                     &config,
                     &state,
                     tls_config.as_ref(),
+                    MeshStreamAttemptProgress {
+                        tracker: &mut tracker,
+                        delivered_usable_state: &mut delivered_usable_state,
+                        stream_established: &mut stream_established,
+                    },
                 ) => result,
                 _ = wait_for_shutdown(&mut stream_shutdown_rx) => {
                     info!("Native mesh client shutting down");
-                    return;
+                    shutting_down = true;
+                    Ok(MeshStreamAttempt::LocalRetirement(MeshStreamRetirement::Shutdown))
                 }
                 _ = wait_optional_tls_reload(
                     tls_reload.as_ref().map(|reload| reload.revision_rx.clone()),
                     last_tls_revision,
                 ) => {
-                    info!("Mesh gRPC TLS source changed; reconnecting native MeshSubscribe stream");
-                    backoff_secs = BACKOFF_INITIAL_SECS;
-                    continue;
+                    Ok(MeshStreamAttempt::LocalRetirement(MeshStreamRetirement::TlsReload))
                 }
             }
         };
 
-        let increase_backoff = match result {
-            Ok(()) => {
-                warn!(
-                    cp_url = %cp_url,
-                    "Native MeshSubscribe stream ended; will reconnect"
-                );
-                current_cp_index = 0;
-                backoff_secs = BACKOFF_INITIAL_SECS;
-                false
+        let attempt = match result {
+            Ok(attempt) => {
+                if attempt.is_endpoint_failure() {
+                    warn!(
+                        cp_url = %cp_url,
+                        outcome = attempt.as_metric_label(),
+                        "Native MeshSubscribe stream ended; rotating to the next configured CP"
+                    );
+                } else {
+                    info!(
+                        outcome = attempt.as_metric_label(),
+                        "Retiring the native MeshSubscribe stream on a local lifecycle event"
+                    );
+                }
+                attempt
             }
             Err(e) => {
+                // A refusal by a fail-closed local gate (subscription binding or
+                // config-revision ordering) is about the CP's CONTENT, not its
+                // transport; both still rotate, but the reason label differs.
+                let attempt = if e.downcast_ref::<MeshApplyError>().is_some() {
+                    MeshStreamAttempt::PolicyRejected
+                } else {
+                    // `after_established` is what lets `/health` tell an
+                    // ordinary dial refusal apart from an already-established
+                    // transport going dark (the HTTP/2 PING-ack failure that
+                    // detects a blackhole). It is observed, never assumed.
+                    MeshStreamAttempt::TransportFailure {
+                        delivered_usable_state,
+                        after_established: stream_established,
+                    }
+                };
+                // Keep the live native mTLS classifier's closed-set
+                // `native_tls_class` field and connection-failed message while
+                // still recording the shared stream-lifecycle outcome.
                 match observed_class_from_error(&e) {
                     Some(class) => {
                         error!(
                             cp_url = %cp_url,
+                            outcome = attempt.as_metric_label(),
                             native_tls_class = class.as_str(),
                             error = %e,
                             "Native MeshSubscribe connection failed"
@@ -204,17 +266,38 @@ pub async fn start_native_mesh_client_with_shutdown(
                     None => {
                         error!(
                             cp_url = %cp_url,
+                            outcome = attempt.as_metric_label(),
                             error = %e,
                             "Native MeshSubscribe connection failed"
                         );
                     }
                 }
-                current_cp_index = (current_cp_index + 1) % cp_urls.len();
-                true
+                attempt
             }
         };
 
-        let sleep_duration = jittered_backoff(backoff_secs);
+        let disposition = tracker.record(attempt);
+        if force_primary {
+            current_cp_index = 0;
+        } else if disposition.advance_endpoint {
+            current_cp_index = (current_cp_index + 1) % cp_urls.len();
+        }
+        state.set_config_stream_status(tracker.status(state.has_first_slice()));
+        if shutting_down {
+            return;
+        }
+
+        if !attempt.is_endpoint_failure() {
+            backoff_secs = BACKOFF_INITIAL_SECS;
+            continue;
+        }
+
+        let (sleep_secs, next_secs) = reconnect_backoff_after_attempt(
+            backoff_secs,
+            disposition.increase_backoff,
+            delivered_usable_state,
+        );
+        let sleep_duration = jittered_backoff(sleep_secs);
         let mut sleep_shutdown_rx = shutdown_rx.clone();
         tokio::select! {
             _ = tokio::time::sleep(sleep_duration) => {}
@@ -230,7 +313,7 @@ pub async fn start_native_mesh_client_with_shutdown(
                 continue;
             }
         }
-        backoff_secs = next_backoff_secs(backoff_secs, increase_backoff);
+        backoff_secs = next_secs;
     }
 }
 
@@ -240,9 +323,22 @@ async fn connect_mesh_subscribe(
     config: &NativeMeshClientConfig,
     state: &MeshRuntimeState,
     tls_config: Option<&DpGrpcTlsConfig>,
-) -> Result<(), anyhow::Error> {
-    let mut endpoint =
-        Channel::from_shared(cp_url.to_string())?.connect_timeout(Duration::from_secs(10));
+    progress: MeshStreamAttemptProgress<'_>,
+) -> Result<MeshStreamAttempt, anyhow::Error> {
+    let MeshStreamAttemptProgress {
+        tracker,
+        delivered_usable_state,
+        stream_established,
+    } = progress;
+
+    // Bounded transport liveness, shared with the two ADS consumers and with
+    // the hardened DP ConfigSync client: HTTP/2 PING + TCP keepalive, kept alive
+    // while idle so a blackholed established stream fails instead of hanging.
+    let mut endpoint = configure_mesh_config_stream_endpoint(
+        Channel::from_shared(cp_url.to_string())?,
+        10,
+        config.timings,
+    );
 
     let mut tls_observer = None;
     if let Some(tls) = tls_config {
@@ -304,7 +400,30 @@ async fn connect_mesh_subscribe(
         MeshUpdateExpectation::from_subscribe_request(&subscribe_request),
     );
     let request = tonic::Request::new(subscribe_request);
-    let mut stream = client.mesh_subscribe(request).await?.into_inner();
+    // The first-frame clock starts at the RPC-open await, not when headers
+    // return: a CP can accept the authenticated request, keep HTTP/2 healthy,
+    // and never send response headers. Dropping this select cancels the
+    // in-flight open; nothing is detached. The same absolute Instant continues
+    // until the first response frame.
+    let attempt_started_at = tokio::time::Instant::now();
+    let first_frame_deadline =
+        tokio::time::sleep_until(attempt_started_at + config.timings.first_frame);
+    tokio::pin!(first_frame_deadline);
+    let mut stream = tokio::select! {
+        biased;
+        _ = &mut first_frame_deadline => {
+            return Ok(MeshStreamAttempt::FirstFrameTimeout);
+        }
+        result = client.mesh_subscribe(request) => {
+            result?.into_inner()
+        }
+    };
+    // The streaming RPC is open: that is what `/health` means by `connected`,
+    // and it is also the observation that lets a later transport failure be
+    // attributed to an ESTABLISHED stream rather than to a dial refusal.
+    *stream_established = true;
+    tracker.set_attachment(MeshStreamAttachment::Established);
+    state.set_config_stream_status(tracker.status(state.has_first_slice()));
 
     // A dropped ACK/NACK would otherwise leave the CP's slice-drift surface
     // reporting a false `sent_vs_acknowledged` divergence forever: nothing else
@@ -316,11 +435,72 @@ async fn connect_mesh_subscribe(
     // longer admissible, so retrying it can only add load.
     let mut pending_status_report: Option<(MeshSliceStatusReport, u8)> = None;
 
-    while let Some(update) = stream.message().await? {
+    // ── issue #3854: bounded liveness for an ESTABLISHED stream ──
+    // Clocks are absolute from `attempt_started_at` (the RPC-open await). They
+    // are polled before `stream.message()` so an already-expired bound cannot
+    // lose indefinitely to a continuously ready heartbeat or other frame.
+    let first_slice_deadline =
+        tokio::time::sleep_until(attempt_started_at + config.timings.first_slice);
+    tokio::pin!(first_slice_deadline);
+    let mut awaiting_first_frame = true;
+    let mut awaiting_first_slice = !state.has_first_slice();
+    // Application silence is only a liveness signal once this CP has actually
+    // demonstrated it emits heartbeats. Against a CP that never does, the
+    // stream is legitimately silent while idle and transport keepalive is the
+    // correct (and sufficient) bound. Set true and never cleared.
+    let mut heartbeats_observed = false;
+    let mut last_stream_activity = tokio::time::Instant::now();
+    let silence_deadline =
+        tokio::time::sleep_until(last_stream_activity + config.timings.max_silence);
+    tokio::pin!(silence_deadline);
+
+    loop {
+        let update = tokio::select! {
+            biased;
+            _ = &mut first_frame_deadline, if awaiting_first_frame => {
+                return Ok(MeshStreamAttempt::FirstFrameTimeout);
+            }
+            _ = &mut first_slice_deadline, if awaiting_first_slice => {
+                if state.has_first_slice() {
+                    awaiting_first_slice = false;
+                    continue;
+                }
+                return Ok(MeshStreamAttempt::FirstSliceTimeout);
+            }
+            _ = &mut silence_deadline, if heartbeats_observed => {
+                warn!(
+                    cp_url = %cp_url,
+                    max_silence_secs = config.timings.max_silence.as_secs(),
+                    "Native MeshSubscribe stream went silent past the heartbeat bound; failing over"
+                );
+                return Ok(MeshStreamAttempt::HeartbeatSilenceTimeout);
+            }
+            message = stream.message() => {
+                match message {
+                    Ok(Some(update)) => update,
+                    // A remote clean EOF is an endpoint failure, not success:
+                    // it rotates the CP and grows the bounded backoff.
+                    Ok(None) => return Ok(MeshStreamAttempt::RemoteEof),
+                    Err(status) => return Err(anyhow::Error::new(status)),
+                }
+            }
+        };
+        awaiting_first_frame = false;
+        last_stream_activity = tokio::time::Instant::now();
+        silence_deadline
+            .as_mut()
+            .reset(last_stream_activity + config.timings.max_silence);
+
         if let Some((report, attempts_left)) = pending_status_report.take() {
             let version = report.version.clone();
             let retry_report = report.clone();
-            if let Err(err) = status_client.report_mesh_slice_status(report).await {
+            let sent = tokio::time::timeout(
+                config.timings.outbound,
+                status_client.report_mesh_slice_status(report),
+            )
+            .await
+            .unwrap_or_else(|_| Err(status_report_deadline_exceeded()));
+            if let Err(err) = sent {
                 let transient = matches!(
                     err.code(),
                     tonic::Code::Unavailable
@@ -344,6 +524,7 @@ async fn connect_mesh_subscribe(
         // bound only to the CP compatibility contract and never reach the
         // install path.
         let applied = if update.heartbeat {
+            heartbeats_observed = true;
             validate_update_ferrum_version(&update.ferrum_version, MeshUpdateConsumer::Native)
                 .map(|()| None)
                 .map_err(MeshApplyError::Update)
@@ -353,6 +534,11 @@ async fn connect_mesh_subscribe(
 
         match applied {
             Ok(Some(slice)) => {
+                *delivered_usable_state = true;
+                awaiting_first_slice = false;
+                // This exact stream installed usable state.
+                tracker.record_usable_state();
+                state.set_config_stream_status(tracker.status(state.has_first_slice()));
                 info!(
                     node_id = %slice.node_id,
                     namespace = %slice.namespace,
@@ -365,10 +551,25 @@ async fn connect_mesh_subscribe(
                     session_token: update.session_token.clone(),
                 };
                 let retry_report = report.clone();
-                if let Err(err) = status_client.report_mesh_slice_status(report).await {
+                // Issue #3854 round two: this unary RPC used to be awaited
+                // inline with NO deadline. A control plane that simply never
+                // answered it suspended the whole `MeshSubscribe` receive loop,
+                // so the first-frame, first-slice, and heartbeat-silence bounds
+                // stopped being enforced by a piece of BEST-EFFORT reporting.
+                // A timeout surfaces as `DeadlineExceeded`, which the existing
+                // transient classification already retries through the same
+                // single-slot `pending_status_report` (so ACK/NACK ordering is
+                // unchanged) — and, critically, returns control to the select.
+                let sent = tokio::time::timeout(
+                    config.timings.outbound,
+                    status_client.report_mesh_slice_status(report),
+                )
+                .await
+                .unwrap_or_else(|_| Err(status_report_deadline_exceeded()));
+                if let Err(err) = sent {
                     warn!(
                         version = %slice.version,
-                        error = %err,
+                        code = ?err.code(),
                         "Failed to report mesh slice ACK to control plane"
                     );
                     pending_status_report = Some((retry_report, STATUS_REPORT_RETRIES));
@@ -390,10 +591,16 @@ async fn connect_mesh_subscribe(
                         session_token: update.session_token.clone(),
                     };
                     let retry_report = report.clone();
-                    if let Err(err) = status_client.report_mesh_slice_status(report).await {
+                    let sent = tokio::time::timeout(
+                        config.timings.outbound,
+                        status_client.report_mesh_slice_status(report),
+                    )
+                    .await
+                    .unwrap_or_else(|_| Err(status_report_deadline_exceeded()));
+                    if let Err(err) = sent {
                         warn!(
                             version = %update.version,
-                            error = %err,
+                            code = ?err.code(),
                             "Failed to report mesh slice NACK to control plane"
                         );
                         pending_status_report = Some((retry_report, STATUS_REPORT_RETRIES));
@@ -422,8 +629,19 @@ async fn connect_mesh_subscribe(
             }
         }
     }
+}
 
-    Ok(())
+/// The status this consumer synthesizes when a `ReportMeshSliceStatus` unary
+/// RPC exceeds the bounded outbound window (issue #3854).
+///
+/// `DeadlineExceeded` is deliberate rather than cosmetic: the caller's existing
+/// transient-retry classification already treats it as retryable, so a stalled
+/// control plane produces the same bounded, ordered retry a slow one does —
+/// while the receive loop regains control and its liveness bounds keep running.
+fn status_report_deadline_exceeded() -> tonic::Status {
+    tonic::Status::deadline_exceeded(
+        "mesh slice status report exceeded the bounded outbound window",
+    )
 }
 
 async fn wait_for_first_slice_then_primary_retry(state: MeshRuntimeState, interval: Duration) {
@@ -529,6 +747,7 @@ mod tests {
             ambient_udp_source_scoping: false,
             node_waypoint_capture_scoping: false,
             primary_retry_secs: 0,
+            timings: MeshStreamTimings::production(),
         }
     }
 
@@ -664,6 +883,7 @@ mod tests {
             ambient_udp_source_scoping: false,
             node_waypoint_capture_scoping: false,
             primary_retry_secs: 300,
+            timings: MeshStreamTimings::production(),
         };
         assert_eq!(config.primary_retry_secs, 300);
     }

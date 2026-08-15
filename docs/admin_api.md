@@ -117,6 +117,24 @@ missing/unknown socket-cookie metadata, missing pod/workload identity data,
 unknown pods, and workload-hash mismatches. These fields are omitted from the
 coarse unauthenticated responses.
 
+Mesh mode also carries `mesh.config_stream`, the closed-set attempt/liveness
+status of the configuration stream (native `MeshSubscribe`, the Ferrum-private
+ADS profile, or the third-party stock ADS profile). It is `null` for the
+localized `file` mesh source, which consumes no stream, and before the active
+consumer's first publication. Fields are `protocol` (`native`/`xds`/
+`stock_xds`), `state` (`connected`, `never_received_slice`,
+`stream_liveness_failed`, `serving_last_good` — a liveness failure is sticky
+and outranks the other three until a stream installs usable configuration),
+`last_attempt_outcome` (a closed-set label matching
+`ferrum_mesh_config_stream_attempts_total{outcome}`), `fallback_active` (true
+only while a stream is actually established on a non-primary endpoint),
+`consecutive_failures`, `credential` (`not_configured`, `unobserved`, `valid`,
+`source_invalid` — the external stock bearer posture), and
+`liveness_bound_seconds` (the documented bound within which a half-open
+established stream is detected without any application frames). No endpoint
+URL, control-plane host, node id, credential path, token, or decoded claim
+appears in this object. See [mesh.md](mesh.md#configuration-stream-attempt-and-liveness-policy).
+
 Ambient UDP placement rejection, unreadable/corrupt durable state, early
 finalize, and cleanup-tooling preflight failure disable only the UDP producer
 and keep mesh admin/control listeners running. Readiness remains false, so
