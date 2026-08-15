@@ -114,7 +114,10 @@ jobs:
     needs: coverage-plan
     if: needs.coverage-plan.outputs.mode == 'full'
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    # A cold/partial-cache lib + unit_tests llvm-cov invocation can exceed the
+    # old 45-minute budget even though warm shards normally finish sooner. Keep
+    # the combined invocation so runner loss cannot discard the shared compile.
+    timeout-minutes: 75
     strategy:
       fail-fast: false
       matrix:
