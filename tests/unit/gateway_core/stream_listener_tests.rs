@@ -3110,7 +3110,10 @@ async fn node_waypoint_udp_shared_rebind_clears_every_member_failure() {
 
     drop(blocker);
     let failures = manager.reconcile().await;
-    assert!(failures.is_empty(), "shared listener must rebind: {failures:?}");
+    assert!(
+        failures.is_empty(),
+        "shared listener must rebind: {failures:?}"
+    );
     assert!(
         manager
             .wait_until_started(Duration::from_secs(5))
