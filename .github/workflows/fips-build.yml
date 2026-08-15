@@ -20,9 +20,10 @@ name: FIPS Build Policy
 #      SHA-scoped, so dependency/compiler work stays warm across commits.
 #    - Exact producer channel: `actions/cache` key
 #      `fips-producer-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}`.
-#      Compile saves this after a successful build as a main step, before
-#      rust-cache's post cleanup. A new attempt always gets a fresh key, so
-#      GitHub's immutable exact-hit skip cannot trap newly warmed outputs.
+#      Compile restores the newest prior attempt for the same SHA + run_id,
+#      then saves the current attempt after a successful build as a main step,
+#      before rust-cache's post cleanup. A new attempt always gets a fresh key,
+#      so GitHub's immutable exact-hit skip cannot trap newly warmed outputs.
 #    Fork pull requests restore both layers and cannot save. `force_cold_cache`
 #    skips every restore and save. Abrupt loss of the producer cannot publish
 #    that producer's unsaved state.
@@ -328,6 +329,38 @@ jobs:
             --hit "$CACHE_HIT" \
             --path "${GITHUB_WORKSPACE}/.cache/sccache" \
             --note "layer=stable-fallback; measured=sccache-directory-subset; rust-cache Cargo/target archive bytes are not exposed; shared-key=ci-fips-contract save-if=non-fork fork=${FORK_PR:-false}"
+
+      # A full workflow rerun has a new run_attempt but the same SHA + run_id.
+      # Restore the previous successful producer as the warm source for this
+      # producer too; otherwise only clippy/tests consume the exact archive and
+      # every alleged warm gate recompiles the producer from the pruned stable
+      # fallback. A miss is valid on the first attempt and on fork PRs.
+      - name: Restore prior-attempt FIPS producer outputs
+        if: github.event.inputs.force_cold_cache != 'true'
+        id: prior-fips-producer
+        uses: actions/cache/restore@374a27f26986edd8c430f386d152a856e179c0ae # v4.2.4
+        with:
+          path: |
+            ${{ github.workspace }}/target
+            ${{ github.workspace }}/.cache/sccache
+          key: ${{ env.FIPS_PRODUCER_KEY }}
+          restore-keys: |
+            ${{ env.FIPS_PRODUCER_RESTORE_PREFIX }}
+
+      - name: Record prior-attempt FIPS producer restore
+        if: github.event.inputs.force_cold_cache != 'true'
+        env:
+          CACHE_HIT: ${{ steps.prior-fips-producer.outputs.cache-hit }}
+          CACHE_MATCHED: ${{ steps.prior-fips-producer.outputs.cache-matched-key }}
+          CACHE_PRIMARY: ${{ steps.prior-fips-producer.outputs.cache-primary-key }}
+        run: |
+          python3 .github/scripts/ci_runtime_telemetry.py classify-restore \
+            --name prior-fips-producer \
+            --hit "$CACHE_HIT" \
+            --matched "$CACHE_MATCHED" \
+            --primary "$CACHE_PRIMARY" \
+            --path "${GITHUB_WORKSPACE}/target" \
+            --note "layer=producer-warm-source; measured=target-directory; optional prior-attempt restore for the same sha+run_id"
 
       - name: Record cold-cache proof
         if: github.event.inputs.force_cold_cache == 'true'

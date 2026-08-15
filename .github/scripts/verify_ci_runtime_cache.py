@@ -9,7 +9,8 @@ publish, fail-closed cache-save preparation, fork restore-only / no-save
 steps, rust-cache save-if so fork PRs cannot save, FIPS producer/consumer key
 equality with unique attempt scoping and stable fallback isolation, rejection
 of ignored rust-cache `key` wiring, checksum-pinned sccache install without
-credential-exporting installers, exact verified executable activation, empty
+credential-exporting installers, prior-attempt producer warming, exact
+verified executable activation, empty
 SCCACHE_GHA_ENABLED persistence, fail-closed uncached fallback, and hosted
 cache-token absence assertions.
 """
@@ -772,8 +773,47 @@ def check_fips_producer_channel(
         failures,
     )
     require(
-        not compile_restores,
-        "fips-compile must publish the producer archive and not restore it",
+        len(compile_restores) == 1,
+        "fips-compile must have exactly one pinned prior-attempt producer restore "
+        f"step, found {len(compile_restores)}",
+        failures,
+    )
+    if compile_restores:
+        condition = step_if(compile_restores[0])
+        with_block = step_with(compile_restores[0])
+        require(
+            COLD_NOT_TRUE in condition,
+            "fips-compile prior-attempt restore must skip force_cold_cache",
+            failures,
+        )
+        require(
+            "key: ${{ env.FIPS_PRODUCER_KEY }}" in with_block,
+            "fips-compile prior-attempt restore must use env.FIPS_PRODUCER_KEY",
+            failures,
+        )
+        require(
+            "restore-keys:" in with_block
+            and "${{ env.FIPS_PRODUCER_RESTORE_PREFIX }}" in with_block,
+            "fips-compile prior-attempt restore must use the sha+run_id prefix",
+            failures,
+        )
+        require(
+            "fail-on-cache-miss:" not in with_block,
+            "fips-compile prior-attempt restore must allow the first attempt and "
+            "fork PRs to miss",
+            failures,
+        )
+        for path in FIPS_PRODUCER_PATHS:
+            require(
+                path in with_block,
+                f"fips-compile prior-attempt restore must include {path}",
+                failures,
+            )
+    require(
+        "Record prior-attempt FIPS producer restore" in compile_job
+        and "prior-fips-producer" in compile_job
+        and "classify-restore" in compile_job,
+        "fips-compile must classify the optional prior-attempt warm source",
         failures,
     )
     if compile_saves:
@@ -2432,6 +2472,11 @@ def self_test() -> int:
     require(
         any("must be a producer-cache consumer and must not save" in item for item in consumer_save_failures),
         "self-test: clippy producer save must fail",
+        failures,
+    )
+    require(
+        any("prior-attempt producer restore" in item for item in consumer_save_failures),
+        "self-test: missing compile prior-attempt restore must fail",
         failures,
     )
 

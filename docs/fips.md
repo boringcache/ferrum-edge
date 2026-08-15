@@ -93,10 +93,12 @@ and this layer is not SHA-scoped, so dependency/compiler work remains a warm
 cross-commit fallback. After a successful compile, `fips-compile` publishes
 the full `target/` and `.cache/sccache` tree under
 `fips-producer-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}`.
-`fips-clippy` and `fips-test` restore that exact producer key and do not
-save. Trusted non-cold runs fail closed if the producer channel is missing.
-The cache
-action holds the GitHub Actions cache credential inside the action process;
+On a full workflow rerun, `fips-compile` restores the newest prior attempt with
+the same SHA + `run_id` before rebuilding and publishes a fresh attempt key;
+the first attempt and fork PRs may miss this optional warm source.
+`fips-clippy` and `fips-test` restore the current producer key and do not save.
+Trusted non-cold consumers fail closed if the producer channel is missing.
+The cache action holds the GitHub Actions cache credential inside the action process;
 PR-controlled `run:` steps never receive that credential. `setup-sccache`
 installs sccache from a checksum-pinned GitHub release and never invokes
 `mozilla-actions/sccache-action` (which would export `ACTIONS_RUNTIME_TOKEN`

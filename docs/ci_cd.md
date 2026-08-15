@@ -290,12 +290,14 @@ policy/key-admission/handshake tests share two cache layers:
   `actions/cache/save` under
   `fips-producer-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}`.
   That key is unique per head and workflow-run attempt, so GitHub's immutable
-  exact-hit skip cannot trap newly warmed outputs. Clippy/test restore the
-  same key (`restore-keys` keep the SHA+`run_id` prefix so a failed-job rerun
-  can reuse a prior attempt) and never save. Trusted non-cold runs fail closed
-  if this-run producer output is missing. Fork pull requests restore only and
-  cannot save; GitHub confines `pull_request` writes to `refs/pull/.../merge`,
-  not the default branch.
+  exact-hit skip cannot trap newly warmed outputs. On a full workflow rerun,
+  compile first restores the newest prior attempt under the same SHA+`run_id`
+  prefix, so the whole gate—not only its consumers—uses the exact warm source.
+  A miss remains valid on the first attempt and on fork PRs. Clippy/test restore
+  the current producer key (with the same prefix fallback) and never save.
+  Trusted non-cold consumers fail closed if this-run producer output is missing.
+  Fork pull requests restore only and cannot save; GitHub confines
+  `pull_request` writes to `refs/pull/.../merge`, not the default branch.
 
 `force_cold_cache` skips every restore and save while still executing the live
 contracts. rust-cache `cache-on-failure` remains on the compile producer so
