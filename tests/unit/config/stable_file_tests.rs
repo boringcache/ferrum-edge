@@ -492,9 +492,9 @@ mod unix_targets {
         // settle-window regression: a publisher that removes and recreates the
         // path (non-atomic `cp`/editor style) must still be able to yield a
         // stable generation, and must never return the empty truncate window
-        // as success. Concurrent churn remains useful coverage; the
-        // deterministic torn-window proof lives in
-        // `held_torn_window_is_not_published_and_complete_generation_converges`.
+        // as success. Concurrent churn exercises fail-closed invariants during
+        // delete/unstable windows; the deterministic stable-generation proof is
+        // the post-join read of the writer's terminal `AAAA` generation.
         // Require the writer to complete one delete/recreate cycle before the
         // reader assertions start; without this handshake the reader loop can
         // beat the writer's first schedule on a saturated runner.
@@ -528,11 +528,9 @@ mod unix_targets {
             panic!("writer did not complete the first delete/recreate cycle: {error}");
         }
 
-        let mut saw_ok = false;
         for _ in 0..20 {
             match read_stable_file(&live, opts(TEST_LIMIT)) {
                 Ok(content) => {
-                    saw_ok = true;
                     assert_eq!(content, "AAAA", "must never publish partial content");
                 }
                 // A first-probe absence during the writer's delete window is a
@@ -547,9 +545,11 @@ mod unix_targets {
 
         *stop.lock().unwrap() = true;
         writer.join().unwrap();
-        assert!(
-            saw_ok,
-            "delete/recreate churn must still reach a stable generation"
+        let terminal = read_stable_file(&live, opts(TEST_LIMIT))
+            .expect("delete/recreate churn must reach a stable terminal generation");
+        assert_eq!(
+            terminal, "AAAA",
+            "terminal generation must be complete and unpublish partial content"
         );
     }
 
