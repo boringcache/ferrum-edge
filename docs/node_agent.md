@@ -387,7 +387,13 @@ selection), is enforced by
 `functional_mesh_live_source_capture_udp_manager_hbone_round_trip` (closed
 [#2013](https://github.com/ferrum-edge/ferrum-edge/issues/2013) /
 [#2038](https://github.com/ferrum-edge/ferrum-edge/issues/2038) /
-[#3621](https://github.com/ferrum-edge/ferrum-edge/issues/3621)).
+[#3621](https://github.com/ferrum-edge/ferrum-edge/issues/3621)). The
+complementary `node-waypoint-ebpf-live` UDP listener round trip proves the
+destination relay's socket mark admits its backend datagram through the real
+enrolled-pod `tc_inbound` classifier, while its unmarked direct-pod negatives
+remain dropped. Together the two hosted gates cover the destination-netns relay
+and the eBPF admit boundary without claiming that the netns-only fixture loads
+the eBPF program.
 
 The Ambient UDP producer needs the same host access the NodeWaypoint in-netns
 listener needs — the read-only host cgroup mount + host `/proc` to resolve pod

@@ -42,7 +42,7 @@ Current mesh HBONE/DNS perf status lives in
 | Multicluster poller partition / last-good live gate | Implemented — [#3331](https://github.com/ferrum-edge/ferrum-edge/issues/3331) (`.github/workflows/multicluster-poller-partition-live.yml`) |
 | SPIFFE Workload API JWT-SVID mint/validate/bundles | Implemented by [#3675](https://github.com/ferrum-edge/ferrum-edge/pull/3675), resolving [#3617](https://github.com/ferrum-edge/ferrum-edge/issues/3617); empty bundle success removed and the SPIRE serving boundary documented |
 | EgressGateway UDP `ServiceEntry` materialization | Implemented — [#3263](https://github.com/ferrum-edge/ferrum-edge/issues/3263) (external UDP ports materialize a datagram-over-mesh destination allowlist consumed by the gateway's authenticated mesh CONNECT terminator, plus the source-side `Sidecar`/`Ambient` producer that originates the identity-pinned `udp` CONNECT; no UDP/DTLS listener, by design) |
-| Ambient UDP enrolled-destination round trip | Implemented — [#3621](https://github.com/ferrum-edge/ferrum-edge/issues/3621) (`functional_mesh_live_source_capture_udp_manager_hbone_round_trip` covers source-capture → HBONE → enrolled destination pod-netns relay) |
+| Ambient UDP enrolled-destination round trip | Implemented — [#3621](https://github.com/ferrum-edge/ferrum-edge/issues/3621) (`functional_mesh_live_source_capture_udp_manager_hbone_round_trip` covers source-capture → HBONE → enrolled destination pod-netns relay; `node-waypoint-ebpf-live` independently proves the relay mark admits the backend datagram through the enrolled-pod `tc_inbound` guard while unmarked traffic stays closed) |
 
 ## Live dedicated trackers (current backlog)
 

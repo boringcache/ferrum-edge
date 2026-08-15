@@ -174,7 +174,10 @@ owned by the live gate / policy inventory, not by copying this table by hand.
 **Implemented since the epic (do not re-open from stale checklists):** remote-discovery
 JWT audience binding (#2475); Ambient UDP capture producer + live source-capture e2e
 (#2013 / #2038); Ambient UDP enrolled-destination round trip (#3621 —
-`functional_mesh_live_source_capture_udp_manager_hbone_round_trip`); VirtualService `tls[]` SNI passthrough L4 routing (see
+`functional_mesh_live_source_capture_udp_manager_hbone_round_trip` proves the
+source-capture/HBONE/destination-netns relay, while `node-waypoint-ebpf-live`
+proves the marked backend datagram crosses the enrolled-pod `tc_inbound` guard);
+VirtualService `tls[]` SNI passthrough L4 routing (see
 `docs/mesh_supported_matrix.md` + `tests/integration/mesh_l7_routing_tests.rs`);
 AI semantic-firewall token windows (#3302); subset-scoped Istio HTTP connection-pool
 policy (#3547, closing #3228 / #3240–#3242); `ai_stream_router` `google_gemini`

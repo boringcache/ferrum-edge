@@ -92,6 +92,11 @@ fn mesh_supported_matrix_product_deferral_index_is_current() {
             .contains("functional_mesh_live_source_capture_udp_manager_hbone_round_trip"),
         "completed enrolled-destination coverage must name the live source-capture gate"
     );
+    assert!(
+        MESH_SUPPORTED_MATRIX.contains("node-waypoint-ebpf-live")
+            && MESH_SUPPORTED_MATRIX.contains("enrolled-pod `tc_inbound` guard"),
+        "completed #3621 coverage must map the complementary live eBPF admit proof"
+    );
     // #3263 shipped: external UDP ServiceEntry ports now materialize a
     // datagram-over-mesh destination allowlist on the EgressGateway. It must be
     // recorded as completed, never re-listed as an open deferral row.
@@ -122,6 +127,11 @@ fn node_agent_udp_live_coverage_cites_closed_trackers_and_enrolled_destination_g
     assert!(
         NODE_AGENT.contains("functional_mesh_live_source_capture_udp_manager_hbone_round_trip"),
         "node_agent must name the live source-capture gate that closed #2013/#2038/#3621"
+    );
+    assert!(
+        NODE_AGENT.contains("node-waypoint-ebpf-live")
+            && NODE_AGENT.contains("enrolled-pod `tc_inbound` classifier"),
+        "node_agent must distinguish the complementary eBPF admit gate from the netns fixture"
     );
 }
 
@@ -193,6 +203,11 @@ fn issue_2110_register_maps_completed_work_and_live_trackers() {
         ISSUE_2110_REGISTER
             .contains("functional_mesh_live_source_capture_udp_manager_hbone_round_trip"),
         "completed #3621 must name the live source-capture gate"
+    );
+    assert!(
+        ISSUE_2110_REGISTER.contains("node-waypoint-ebpf-live")
+            && ISSUE_2110_REGISTER.contains("enrolled-pod `tc_inbound` guard"),
+        "completed #3621 must name the complementary live eBPF admit proof"
     );
     assert!(
         ISSUE_2110_REGISTER.contains("EnvoyFilter / WasmPlugin"),
