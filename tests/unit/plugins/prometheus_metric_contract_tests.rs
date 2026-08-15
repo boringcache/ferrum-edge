@@ -750,6 +750,10 @@ fn representative_exposition() -> String {
         "spire_agent",
         3600,
     );
+    // Closed-set protocol/outcome only — never an endpoint URL, node id, or
+    // credential path. Seeds the issue-#3854 family so representative
+    // exposition matches the inventory even when no sibling test has counted.
+    prometheus_helpers::increment_mesh_config_stream_attempt("stock_xds", "remote_clean_eof");
 
     let mut output = registry.render_uncached();
     output.push_str(&ferrum_edge::plugins::utils::jwks_cache::render_prometheus());

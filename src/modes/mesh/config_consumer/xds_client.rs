@@ -10,8 +10,13 @@ use tracing::{debug, error, info, warn};
 
 use super::common::{
     BACKOFF_INITIAL_SECS, MESH_CONFIG_GRPC_MAX_DECODING_MESSAGE_SIZE, jittered_backoff,
-    next_backoff_secs, refresh_dp_grpc_tls_config_if_changed, should_race_primary_retry,
-    tonic_tls_config, wait_for_shutdown, wait_optional_tls_reload,
+    refresh_dp_grpc_tls_config_if_changed, should_race_primary_retry, tonic_tls_config,
+    wait_for_shutdown, wait_optional_tls_reload,
+};
+use super::stream_lifecycle::{
+    MeshConfigStreamCredential, MeshStreamAttachment, MeshStreamAttempt, MeshStreamAttemptProgress,
+    MeshStreamRetirement, MeshStreamTimings, MeshStreamTracker,
+    configure_mesh_config_stream_endpoint, reconnect_backoff_after_attempt,
 };
 use crate::grpc::dp_client::{DpGrpcTlsConfig, DpGrpcTlsReload, GrpcJwtSecret};
 use crate::modes::mesh::config::{
@@ -59,6 +64,78 @@ const REQUIRED_MESH_SLICE_TYPE_URLS: [&str; 5] = [
 const XDS_APPLY_DEBOUNCE: Duration = Duration::from_millis(25);
 const XDS_CONSECUTIVE_NACK_LIMIT: u32 = 5;
 const XDS_APPLY_MAX_DELAY: Duration = Duration::from_millis(500);
+
+/// Closed-set failure of one Ferrum-private ADS attempt.
+///
+/// Local revision-gate rejection and NACK-circuit-breaker refusal are policy
+/// (content) failures. Dial, RPC-open, status, and outbound enqueue failures
+/// stay transport. Classification is by variant, never by inspecting error
+/// strings.
+#[derive(Debug)]
+enum XdsAttemptError {
+    Transport(anyhow::Error),
+    Policy(XdsPolicyRefusal),
+}
+
+#[derive(Debug)]
+enum XdsPolicyRefusal {
+    Revision(MeshRevisionRejection),
+    NackCircuitBreaker,
+}
+
+impl XdsAttemptError {
+    fn transport(error: impl Into<anyhow::Error>) -> Self {
+        Self::Transport(error.into())
+    }
+}
+
+impl std::fmt::Display for XdsAttemptError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Transport(error) => write!(f, "{error}"),
+            Self::Policy(refusal) => write!(f, "{refusal}"),
+        }
+    }
+}
+
+impl std::error::Error for XdsAttemptError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Transport(error) => error.source(),
+            Self::Policy(refusal) => Some(refusal),
+        }
+    }
+}
+
+impl std::fmt::Display for XdsPolicyRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Revision(rejection) => write!(f, "{rejection}"),
+            Self::NackCircuitBreaker => write!(f, "nack_circuit_breaker"),
+        }
+    }
+}
+
+impl std::error::Error for XdsPolicyRefusal {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Revision(rejection) => Some(rejection),
+            Self::NackCircuitBreaker => None,
+        }
+    }
+}
+
+impl From<MeshRevisionRejection> for XdsAttemptError {
+    fn from(rejection: MeshRevisionRejection) -> Self {
+        Self::Policy(XdsPolicyRefusal::Revision(rejection))
+    }
+}
+
+impl From<tonic::Status> for XdsAttemptError {
+    fn from(status: tonic::Status) -> Self {
+        Self::Transport(anyhow::Error::new(status))
+    }
+}
 
 type BearerToken = MetadataValue<tonic::metadata::Ascii>;
 
@@ -124,6 +201,20 @@ pub struct XdsClientConfig {
     pub connect_timeout_seconds: u64,
     pub labels: BTreeMap<String, String>,
 }
+
+/// Fixed-cardinality protocol label for the shared stream lifecycle.
+pub(crate) const XDS_PROTOCOL_LABEL: &str = "xds";
+
+/// Bound on one outbound ACK/NACK/subscription enqueue inside the response
+/// handler (issue #3854).
+///
+/// The Ferrum-private profile only ever talks to a Ferrum CP, so unlike the
+/// stock profile it does not take a per-invocation override — the shared
+/// production constant is the whole policy. The bound still matters: without
+/// it, a CP that stops reading its request stream would suspend the DP's
+/// receive loop and disarm the first-frame / first-slice deadlines.
+const XDS_OUTBOUND_BOUND: Duration =
+    Duration::from_secs(super::stream_lifecycle::MESH_CONFIG_STREAM_OUTBOUND_TIMEOUT_SECS);
 
 #[derive(Debug, Clone)]
 struct ClientSubscriptionState {
@@ -571,7 +662,15 @@ fn composite_required_version(accumulator: &ResourceAccumulator) -> String {
         .unwrap_or_default()
 }
 
-/// Maintain a live xDS ADS stream with simple multi-CP failover.
+/// Maintain a live xDS ADS stream with multi-CP failover.
+///
+/// Attempt classification, endpoint rotation, backoff, and transport keepalive
+/// are the shared [`super::stream_lifecycle`] policy (issue #3854). In
+/// particular a remote clean EOF is an endpoint failure — the Ferrum-private
+/// profile previously reset to the primary and the initial delay on `Ok(())`,
+/// which let a CP that accepted and immediately closed pin this data plane in a
+/// primary-only reconnect loop while a healthy fallback went unconsulted.
+#[allow(clippy::too_many_arguments)]
 pub async fn start_xds_client_with_shutdown(
     jwt_secret: GrpcJwtSecret,
     config: XdsClientConfig,
@@ -579,6 +678,7 @@ pub async fn start_xds_client_with_shutdown(
     shutdown_rx: tokio::sync::watch::Receiver<bool>,
     mut tls_config: Option<DpGrpcTlsConfig>,
     tls_reload: Option<DpGrpcTlsReload>,
+    timings: MeshStreamTimings,
 ) {
     let cp_urls = config.cp_urls.clone();
     if cp_urls.is_empty() {
@@ -594,12 +694,19 @@ pub async fn start_xds_client_with_shutdown(
         .as_ref()
         .map(|reload| *reload.revision_rx.borrow())
         .unwrap_or(0);
+    let mut tracker = MeshStreamTracker::new(
+        XDS_PROTOCOL_LABEL,
+        MeshConfigStreamCredential::NotConfigured,
+        timings,
+    );
+    state.set_config_stream_status(tracker.status(state.has_first_slice()));
 
     info!(
         node_id = %config.node_id,
         namespace = %config.namespace,
         cluster = %config.cluster,
         cp_urls = cp_urls.len(),
+        liveness_bound_secs = timings.liveness_bound_seconds(),
         "xDS mesh client starting"
     );
 
@@ -629,8 +736,16 @@ pub async fn start_xds_client_with_shutdown(
         }
         let is_primary = current_cp_index == 0;
         let is_fallback = !is_primary && cp_urls.len() > 1;
+        tracker.set_endpoint_index(current_cp_index);
         let mut stream_shutdown_rx = shutdown_rx.clone();
         let should_race_primary = should_race_primary_retry(is_fallback, config.primary_retry_secs);
+        let mut delivered_usable_state = false;
+        let mut stream_established = false;
+        let mut force_primary = false;
+        // Shutdown is recorded as an intentional retirement rather than an
+        // unobserved `return`, so `/metrics` distinguishes a clean stop from a
+        // stream that simply vanished.
+        let mut shutting_down = false;
         let result = if should_race_primary {
             tokio::select! {
                 result = connect_ads(
@@ -640,31 +755,28 @@ pub async fn start_xds_client_with_shutdown(
                     state.clone(),
                     tls_config.as_ref(),
                     &mut stream_state,
+                    timings,
+                    &mut tracker,
+                    &mut delivered_usable_state,
+                    &mut stream_established,
                 ) => result,
                 _ = wait_for_first_slice_then_primary_retry(
                     state.clone(),
                     Duration::from_secs(config.primary_retry_secs),
                 ) => {
-                    info!(
-                        primary_retry_secs = config.primary_retry_secs,
-                        cp_url = %cp_url,
-                        "xDS primary retry interval elapsed; reconnecting to primary CP"
-                    );
-                    current_cp_index = 0;
-                    backoff_secs = BACKOFF_INITIAL_SECS;
-                    continue;
+                    force_primary = true;
+                    Ok(MeshStreamAttempt::LocalRetirement(MeshStreamRetirement::PrimaryRetry))
                 }
                 _ = wait_for_shutdown(&mut stream_shutdown_rx) => {
                     info!("xDS mesh client shutting down");
-                    return;
+                    shutting_down = true;
+                    Ok(MeshStreamAttempt::LocalRetirement(MeshStreamRetirement::Shutdown))
                 }
                 _ = wait_optional_tls_reload(
                     tls_reload.as_ref().map(|reload| reload.revision_rx.clone()),
                     last_tls_revision,
                 ) => {
-                    info!("Mesh gRPC TLS source changed; reconnecting xDS ADS stream");
-                    backoff_secs = BACKOFF_INITIAL_SECS;
-                    continue;
+                    Ok(MeshStreamAttempt::LocalRetirement(MeshStreamRetirement::TlsReload))
                 }
             }
         } else {
@@ -676,46 +788,85 @@ pub async fn start_xds_client_with_shutdown(
                     state.clone(),
                     tls_config.as_ref(),
                     &mut stream_state,
+                    timings,
+                    &mut tracker,
+                    &mut delivered_usable_state,
+                    &mut stream_established,
                 ) => result,
                 _ = wait_for_shutdown(&mut stream_shutdown_rx) => {
                     info!("xDS mesh client shutting down");
-                    return;
+                    shutting_down = true;
+                    Ok(MeshStreamAttempt::LocalRetirement(MeshStreamRetirement::Shutdown))
                 }
                 _ = wait_optional_tls_reload(
                     tls_reload.as_ref().map(|reload| reload.revision_rx.clone()),
                     last_tls_revision,
                 ) => {
-                    info!("Mesh gRPC TLS source changed; reconnecting xDS ADS stream");
-                    backoff_secs = BACKOFF_INITIAL_SECS;
-                    continue;
+                    Ok(MeshStreamAttempt::LocalRetirement(MeshStreamRetirement::TlsReload))
                 }
             }
         };
 
-        let increase_backoff = match result {
-            Ok(()) => {
-                warn!(
-                    cp_url = %cp_url,
-                    "xDS ADS stream ended; will reconnect"
-                );
-                if is_fallback {
-                    current_cp_index = 0;
+        let attempt = match result {
+            Ok(attempt) => {
+                if attempt.is_endpoint_failure() {
+                    warn!(
+                        cp_url = %cp_url,
+                        outcome = attempt.as_metric_label(),
+                        "xDS ADS stream ended; rotating to the next configured CP"
+                    );
+                } else {
+                    info!(
+                        outcome = attempt.as_metric_label(),
+                        "Retiring the xDS ADS stream on a local lifecycle event"
+                    );
                 }
-                backoff_secs = BACKOFF_INITIAL_SECS;
-                false
+                attempt
             }
             Err(e) => {
+                // Local revision-gate / NACK-breaker refusals are about the
+                // CP's CONTENT, not its transport. Typed variants, never
+                // string inspection, keep `/health` from labelling a policy
+                // refusal as `stream_liveness_failed`.
+                let attempt = match &e {
+                    XdsAttemptError::Policy(_) => MeshStreamAttempt::PolicyRejected,
+                    XdsAttemptError::Transport(_) => MeshStreamAttempt::TransportFailure {
+                        delivered_usable_state,
+                        after_established: stream_established,
+                    },
+                };
                 error!(
                     cp_url = %cp_url,
+                    outcome = attempt.as_metric_label(),
                     error = %e,
-                    "xDS ADS connection failed"
+                    "xDS ADS attempt failed"
                 );
-                current_cp_index = (current_cp_index + 1) % cp_urls.len();
-                true
+                attempt
             }
         };
 
-        let sleep_duration = jittered_backoff(backoff_secs);
+        let disposition = tracker.record(attempt);
+        if force_primary {
+            current_cp_index = 0;
+        } else if disposition.advance_endpoint {
+            current_cp_index = (current_cp_index + 1) % cp_urls.len();
+        }
+        state.set_config_stream_status(tracker.status(state.has_first_slice()));
+        if shutting_down {
+            return;
+        }
+
+        if !attempt.is_endpoint_failure() {
+            backoff_secs = BACKOFF_INITIAL_SECS;
+            continue;
+        }
+
+        let (sleep_secs, next_secs) = reconnect_backoff_after_attempt(
+            backoff_secs,
+            disposition.increase_backoff,
+            delivered_usable_state,
+        );
+        let sleep_duration = jittered_backoff(sleep_secs);
         let mut sleep_shutdown_rx = shutdown_rx.clone();
         tokio::select! {
             _ = tokio::time::sleep(sleep_duration) => {}
@@ -731,7 +882,7 @@ pub async fn start_xds_client_with_shutdown(
                 continue;
             }
         }
-        backoff_secs = next_backoff_secs(backoff_secs, increase_backoff);
+        backoff_secs = next_secs;
     }
 }
 
@@ -740,6 +891,7 @@ async fn wait_for_first_slice_then_primary_retry(state: MeshRuntimeState, interv
     tokio::time::sleep(interval).await;
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn connect_ads(
     cp_url: &str,
     jwt_secret: &GrpcJwtSecret,
@@ -747,11 +899,17 @@ async fn connect_ads(
     state: MeshRuntimeState,
     tls_config: Option<&DpGrpcTlsConfig>,
     stream_state: &mut XdsStreamState,
-) -> Result<(), anyhow::Error> {
-    let mut endpoint = Channel::from_shared(cp_url.to_string())?;
-    if config.connect_timeout_seconds > 0 {
-        endpoint = endpoint.connect_timeout(Duration::from_secs(config.connect_timeout_seconds));
-    }
+    timings: MeshStreamTimings,
+    tracker: &mut MeshStreamTracker,
+    delivered_usable_state: &mut bool,
+    stream_established: &mut bool,
+) -> Result<MeshStreamAttempt, XdsAttemptError> {
+    // Bounded transport liveness, shared with the native and stock consumers.
+    let mut endpoint = configure_mesh_config_stream_endpoint(
+        Channel::from_shared(cp_url.to_string()).map_err(XdsAttemptError::transport)?,
+        config.connect_timeout_seconds,
+        timings,
+    );
 
     if let Some(tls) = tls_config {
         let mut client_tls = tonic_tls_config(tls);
@@ -760,10 +918,15 @@ async fn connect_ads(
         {
             client_tls = client_tls.domain_name(host);
         }
-        endpoint = endpoint.tls_config(client_tls)?;
+        endpoint = endpoint
+            .tls_config(client_tls)
+            .map_err(XdsAttemptError::transport)?;
     }
 
-    let channel = endpoint.connect().await?;
+    let channel = endpoint
+        .connect()
+        .await
+        .map_err(XdsAttemptError::transport)?;
     // External tokens are materialized once per connection attempt so rotation
     // is visible on reconnect without performing file I/O inside the tonic
     // interceptor (which runs on a Tokio worker).
@@ -771,10 +934,14 @@ async fn connect_ads(
         let auth_token = jwt_secret
             .mint_async(&config.node_id, Some(&config.namespace), None)
             .await
-            .map_err(|e| anyhow::anyhow!("failed to obtain xDS bearer token: {e}"))?;
-        let token: BearerToken = format!("Bearer {auth_token}")
-            .parse()
-            .map_err(|_| anyhow::anyhow!("failed to build authorization metadata"))?;
+            .map_err(|e| {
+                XdsAttemptError::transport(anyhow::anyhow!(
+                    "failed to obtain xDS bearer token: {e}"
+                ))
+            })?;
+        let token: BearerToken = format!("Bearer {auth_token}").parse().map_err(|_| {
+            XdsAttemptError::transport(anyhow::anyhow!("failed to build authorization metadata"))
+        })?;
         AdsAuth::External { token }
     } else {
         AdsAuth::Minted {
@@ -793,7 +960,20 @@ async fn connect_ads(
         "Connected to CP, subscribing for xDS ADS config"
     );
 
-    run_ads_stream_with_auth(channel, Some(auth), config, &consumer, stream_state).await
+    run_ads_stream_with_auth(
+        channel,
+        Some(auth),
+        config,
+        &consumer,
+        stream_state,
+        timings,
+        MeshStreamAttemptProgress {
+            tracker,
+            delivered_usable_state,
+            stream_established,
+        },
+    )
+    .await
 }
 
 async fn run_ads_stream_with_auth(
@@ -802,7 +982,15 @@ async fn run_ads_stream_with_auth(
     config: &XdsClientConfig,
     consumer: &XdsConfigConsumer,
     stream_state: &mut XdsStreamState,
-) -> Result<(), anyhow::Error> {
+    timings: MeshStreamTimings,
+    progress: MeshStreamAttemptProgress<'_>,
+) -> Result<MeshStreamAttempt, XdsAttemptError> {
+    let MeshStreamAttemptProgress {
+        tracker,
+        delivered_usable_state,
+        stream_established,
+    } = progress;
+
     #[allow(clippy::result_large_err)]
     let mut client = AggregatedDiscoveryServiceClient::with_interceptor(
         channel,
@@ -818,10 +1006,27 @@ async fn run_ads_stream_with_auth(
 
     let (tx, rx) = mpsc::channel(config.stream_channel_capacity.max(1));
     let request_stream = ReceiverStream::new(rx);
-    let mut response_stream = client
-        .stream_aggregated_resources(request_stream)
-        .await?
-        .into_inner();
+    // The first-frame clock starts at the RPC-open await, not when headers
+    // return. Dropping the pending open future cancels it; nothing is detached.
+    let attempt_started_at = tokio::time::Instant::now();
+    let first_frame_deadline = tokio::time::sleep_until(attempt_started_at + timings.first_frame);
+    tokio::pin!(first_frame_deadline);
+    let mut response_stream = tokio::select! {
+        biased;
+        _ = &mut first_frame_deadline => {
+            return Ok(MeshStreamAttempt::FirstFrameTimeout);
+        }
+        result = client.stream_aggregated_resources(request_stream) => {
+            result.map_err(XdsAttemptError::from)?.into_inner()
+        }
+    };
+    // The streaming RPC is open: `/health` may now report `connected`, and a
+    // later transport failure is attributable to an established stream.
+    *stream_established = true;
+    tracker.set_attachment(MeshStreamAttachment::Established);
+    consumer
+        .state()
+        .set_config_stream_status(tracker.status(consumer.state().has_first_slice()));
 
     // Nonce dedup is stream-scoped (per xDS spec). Clear the
     // per-type `last_processed_nonce` baseline so a deterministic-nonce CP
@@ -843,9 +1048,7 @@ async fn run_ads_stream_with_auth(
             node_waypoint_capture_scoping: config.node_waypoint_capture_scoping,
         },
     ) {
-        tx.send(request)
-            .await
-            .map_err(|_| anyhow::anyhow!("xDS ADS request stream closed before initial request"))?;
+        send_ads_request(&tx, request, timings.outbound).await?;
     }
 
     let debounce = tokio::time::sleep(Duration::from_secs(60 * 60 * 24));
@@ -854,12 +1057,58 @@ async fn run_ads_stream_with_auth(
     let mut pending_since: Option<tokio::time::Instant> = None;
     let mut pending_slice: Option<PendingXdsSlice> = None;
 
-    loop {
+    // ── issue #3854: bounded liveness for an ESTABLISHED stream ──
+    // HTTP/2 + TCP keepalive (applied on the endpoint) fail a blackholed
+    // transport without needing application frames. These two deadlines cover a
+    // CP that accepts the RPC and then never supplies a usable frame, or never
+    // completes a coherent required-type generation at all. They are the SAME
+    // absolute clocks that covered RPC-open: headers do not reset them.
+    //
+    // The select is `biased`. Already-expired first-frame / first-slice clocks
+    // cannot lose to a continuously ready response. Debounce commit still
+    // outranks the next message so a complete generation is published before
+    // another frame is admitted. Simultaneous clock vs. message/debounce
+    // boundaries fail closed (the clock wins).
+    let mut awaiting_first_frame = true;
+    let first_slice_deadline = tokio::time::sleep_until(attempt_started_at + timings.first_slice);
+    tokio::pin!(first_slice_deadline);
+    // Armed only while this data plane has never installed a slice.
+    let mut awaiting_first_slice = !consumer.state().has_first_slice();
+
+    let ended = loop {
         tokio::select! {
+            biased;
+            _ = &mut first_frame_deadline, if awaiting_first_frame => {
+                break MeshStreamAttempt::FirstFrameTimeout;
+            }
+            _ = &mut first_slice_deadline, if awaiting_first_slice => {
+                if consumer.state().has_first_slice() {
+                    awaiting_first_slice = false;
+                } else {
+                    break MeshStreamAttempt::FirstSliceTimeout;
+                }
+            }
+            _ = &mut debounce, if debounce_active => {
+                if let Some(pending) = pending_slice.take() {
+                    apply_pending_xds_slice(consumer, config, pending)?;
+                    *delivered_usable_state = true;
+                    awaiting_first_slice = false;
+                    // This exact stream installed usable state.
+                    tracker.record_usable_state();
+                    consumer.state().set_config_stream_status(
+                        tracker.status(consumer.state().has_first_slice()),
+                    );
+                }
+                debounce_active = false;
+                pending_since = None;
+            }
             response = response_stream.message() => {
                 let Some(response) = response? else {
-                    break;
+                    // Remote clean EOF is an endpoint failure, not success: the
+                    // CP hung up without being asked to.
+                    break MeshStreamAttempt::RemoteEof;
                 };
+                awaiting_first_frame = false;
                 let response_type_url = response.type_url.clone();
                 let nack_count_before = stream_state
                     .nack_circuit_breaker
@@ -911,6 +1160,8 @@ async fn run_ads_stream_with_auth(
                             consumer,
                             config,
                             &mut pending_slice,
+                            tracker,
+                            delivered_usable_state,
                             e,
                         );
                     }
@@ -924,21 +1175,22 @@ async fn run_ads_stream_with_auth(
                     .state()
                     .set_xds_convergence(stream_state.accumulator.convergence_snapshot());
             }
-            _ = &mut debounce, if debounce_active => {
-                if let Some(pending) = pending_slice.take() {
-                    apply_pending_xds_slice(consumer, config, pending)?;
-                }
-                debounce_active = false;
-                pending_since = None;
-            }
         }
-    }
+    };
 
-    if let Some(pending) = pending_slice.take() {
+    // Only a COMPLETE, version-coherent generation ever reaches `pending_slice`
+    // (`try_build_mesh_slice` gates on the required-type versions), so an EOF
+    // mid-convergence leaves the last good slice serving and fails over rather
+    // than publishing a mixed generation.
+    if matches!(ended, MeshStreamAttempt::RemoteEof)
+        && let Some(pending) = pending_slice.take()
+    {
         apply_pending_xds_slice(consumer, config, pending)?;
+        *delivered_usable_state = true;
+        tracker.record_usable_state();
     }
 
-    Ok(())
+    Ok(ended)
 }
 
 fn discard_pending_xds_slice_after_nack(
@@ -958,14 +1210,29 @@ fn discard_pending_xds_slice_after_nack(
     discarded
 }
 
+/// Publish an already-complete debounced generation before surfacing a stream
+/// error, then fail the attempt. Never returns `Ok` — the return type simply
+/// matches the stream loop's.
+///
+/// A successful flush is real progress: the slice is installed, so the outer
+/// loop must see `delivered_usable_state` and the tracker must record the
+/// usable install. The original error is still the attempt's failure
+/// classification — we do not convert a broken stream into success.
 fn flush_pending_xds_slice_before_error(
     consumer: &XdsConfigConsumer,
     config: &XdsClientConfig,
     pending_slice: &mut Option<PendingXdsSlice>,
-    error: anyhow::Error,
-) -> Result<(), anyhow::Error> {
+    tracker: &mut MeshStreamTracker,
+    delivered_usable_state: &mut bool,
+    error: XdsAttemptError,
+) -> Result<MeshStreamAttempt, XdsAttemptError> {
     if let Some(pending) = pending_slice.take() {
         apply_pending_xds_slice(consumer, config, pending)?;
+        *delivered_usable_state = true;
+        tracker.record_usable_state();
+        consumer
+            .state()
+            .set_config_stream_status(tracker.status(consumer.state().has_first_slice()));
     }
     Err(error)
 }
@@ -998,13 +1265,13 @@ async fn handle_ads_response(
     subscriptions: &mut ClientSubscriptionState,
     accumulator: &mut ResourceAccumulator,
     nack_circuit_breaker: &mut NackCircuitBreaker,
-) -> Result<Option<PendingXdsSlice>, anyhow::Error> {
+) -> Result<Option<PendingXdsSlice>, XdsAttemptError> {
     let type_url = response.type_url.clone();
     if !is_known_type_url(&type_url) {
         let message = format!("unknown xDS response type_url '{type_url}'");
         let mut nack = subscriptions.build_nack(&type_url, message.clone());
         nack.response_nonce = response.nonce.clone();
-        send_ads_request(tx, nack).await?;
+        send_ads_request(tx, nack, XDS_OUTBOUND_BOUND).await?;
         warn!(
             node_id = %config.node_id,
             type_url = %type_url,
@@ -1045,7 +1312,7 @@ async fn handle_ads_response(
 
     match slice_result {
         Ok(Some(slice)) => {
-            send_ads_request(tx, subscriptions.build_ack(&type_url)).await?;
+            send_ads_request(tx, subscriptions.build_ack(&type_url), XDS_OUTBOUND_BOUND).await?;
             subscriptions.mark_acked(&type_url);
             subscriptions.mark_processed(&type_url);
             nack_circuit_breaker.record_ack(&type_url);
@@ -1057,7 +1324,7 @@ async fn handle_ads_response(
             }))
         }
         Ok(None) => {
-            send_ads_request(tx, subscriptions.build_ack(&type_url)).await?;
+            send_ads_request(tx, subscriptions.build_ack(&type_url), XDS_OUTBOUND_BOUND).await?;
             subscriptions.mark_acked(&type_url);
             subscriptions.mark_processed(&type_url);
             nack_circuit_breaker.record_ack(&type_url);
@@ -1105,7 +1372,7 @@ async fn handle_ads_response(
             subscriptions.mark_processed(&type_url);
             let circuit_result =
                 trip_nack_circuit_if_needed(config, nack_circuit_breaker, &type_url);
-            send_ads_request(tx, nack).await?;
+            send_ads_request(tx, nack, XDS_OUTBOUND_BOUND).await?;
             circuit_result?;
             Ok(None)
         }
@@ -1120,17 +1387,21 @@ fn trip_nack_circuit_if_needed(
     config: &XdsClientConfig,
     nack_circuit_breaker: &mut NackCircuitBreaker,
     type_url: &str,
-) -> Result<(), anyhow::Error> {
+) -> Result<(), XdsAttemptError> {
     let consecutive_nacks = nack_circuit_breaker.record_nack(type_url);
     if consecutive_nacks < XDS_CONSECUTIVE_NACK_LIMIT {
         return Ok(());
     }
 
-    Err(anyhow::anyhow!(
-        "xDS ADS NACK circuit breaker tripped for type_url '{}' after {} consecutive NACKs on node '{}'; closing stream to trigger reconnect/failover",
-        type_url,
+    warn!(
+        node_id = %config.node_id,
+        namespace = %config.namespace,
         consecutive_nacks,
-        config.node_id
+        nack_limit = XDS_CONSECUTIVE_NACK_LIMIT,
+        "xDS ADS NACK circuit breaker tripped; closing stream to trigger reconnect/failover"
+    );
+    Err(XdsAttemptError::Policy(
+        XdsPolicyRefusal::NackCircuitBreaker,
     ))
 }
 
@@ -1138,12 +1409,10 @@ fn apply_pending_xds_slice(
     consumer: &XdsConfigConsumer,
     config: &XdsClientConfig,
     pending: PendingXdsSlice,
-) -> Result<(), anyhow::Error> {
+) -> Result<(), XdsAttemptError> {
     let version = pending.slice.version.clone();
     let version_skew = pending.version_skew;
-    consumer
-        .apply_slice(pending.slice)
-        .map_err(anyhow::Error::new)?;
+    consumer.apply_slice(pending.slice)?;
     if version_skew {
         crate::plugins::mesh::prometheus_helpers::increment_xds_warming_partial_apply(
             &config.namespace,
@@ -1161,13 +1430,28 @@ fn apply_pending_xds_slice(
     Ok(())
 }
 
+/// Enqueue one outbound `DiscoveryRequest`, bounded (issue #3854).
+///
+/// The outbound channel drains into the gRPC request stream, so a control plane
+/// that accepts the RPC and then stops reading — never opening its HTTP/2
+/// receive window — would otherwise leave this send pending forever and suspend
+/// the receive loop, disarming every liveness bound in this module. ACK/NACK
+/// ordering is preserved: the bound applies to a single enqueue, not to the
+/// sequence.
 async fn send_ads_request(
     tx: &mpsc::Sender<DiscoveryRequest>,
     request: DiscoveryRequest,
-) -> Result<(), anyhow::Error> {
-    tx.send(request)
-        .await
-        .map_err(|_| anyhow::anyhow!("xDS ADS request stream closed"))
+    bound: Duration,
+) -> Result<(), XdsAttemptError> {
+    match tokio::time::timeout(bound, tx.send(request)).await {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(_)) => Err(XdsAttemptError::transport(anyhow::anyhow!(
+            "xDS ADS request stream closed"
+        ))),
+        Err(_) => Err(XdsAttemptError::transport(anyhow::anyhow!(
+            "xDS ADS request could not be enqueued within the bounded outbound window"
+        ))),
+    }
 }
 
 #[derive(Clone)]
@@ -2456,6 +2740,10 @@ fn xds_type_short_name(type_url: &str) -> &str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::modes::mesh::config_consumer::stream_lifecycle::{
+        MeshConfigStreamCredential, MeshStreamAttachment, MeshStreamAttempt, MeshStreamTimings,
+        MeshStreamTracker,
+    };
     use crate::xds::translator::translate_mesh_slice_to_snapshot;
 
     fn test_config() -> XdsClientConfig {
@@ -3858,8 +4146,11 @@ mod tests {
         .expect_err("threshold NACK should close the ADS stream");
 
         assert!(
-            err.to_string()
-                .contains("xDS ADS NACK circuit breaker tripped")
+            matches!(
+                err,
+                XdsAttemptError::Policy(XdsPolicyRefusal::NackCircuitBreaker)
+            ),
+            "NACK-breaker refusal must be a typed policy failure, not transport: {err}"
         );
 
         let mut nack_count = 0;
@@ -4216,17 +4507,31 @@ mod tests {
             all_types_ready: true,
             version_skew: false,
         });
+        let mut tracker = MeshStreamTracker::new(
+            "xds",
+            MeshConfigStreamCredential::NotConfigured,
+            MeshStreamTimings::production(),
+        );
+        tracker.record(MeshStreamAttempt::HeartbeatSilenceTimeout);
+        tracker.set_attachment(MeshStreamAttachment::Established);
+        let mut delivered_usable_state = false;
 
         let err = flush_pending_xds_slice_before_error(
             &consumer,
             &config,
             &mut pending_slice,
-            anyhow::anyhow!("breaker"),
+            &mut tracker,
+            &mut delivered_usable_state,
+            XdsAttemptError::transport(anyhow::anyhow!("breaker")),
         )
         .expect_err("error is preserved after flush");
 
         assert_eq!(err.to_string(), "breaker");
         assert!(pending_slice.is_none());
+        assert!(
+            delivered_usable_state,
+            "a successful flush is progress even though the attempt still fails"
+        );
         assert_eq!(
             state
                 .snapshot()
@@ -4234,6 +4539,22 @@ mod tests {
                 .as_ref()
                 .map(|slice| slice.version.as_str()),
             Some("v-pending")
+        );
+        let status = tracker.status(state.has_first_slice());
+        assert_eq!(
+            status.state, "connected",
+            "the flush is a usable install, so a sticky liveness failure must clear"
+        );
+        assert_eq!(status.consecutive_failures, 0);
+        assert!(state.has_first_slice());
+        assert!(
+            !MeshStreamAttempt::TransportFailure {
+                delivered_usable_state: true,
+                after_established: true,
+            }
+            .disposition()
+            .increase_backoff,
+            "flush progress must keep the attempt from growing backoff"
         );
     }
 

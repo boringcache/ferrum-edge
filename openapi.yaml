@@ -12150,11 +12150,21 @@ components:
       type: object
       required:
         - egress_scope
+        - config_stream
         - node_waypoint_observability
         - udp_placement_migration
       properties:
         egress_scope:
           $ref: "#/components/schemas/MeshEgressScopeHealth"
+        config_stream:
+          oneOf:
+            - $ref: "#/components/schemas/MeshConfigStreamStatus"
+            - type: "null"
+          description: |
+            Mesh configuration-stream attempt/liveness status (issue #3854).
+            Authenticated `/health`/`/status` mesh detail. `null` for the
+            localized `file` mesh source, which consumes no stream, and before
+            the active consumer's first publication.
         node_waypoint_observability:
           $ref: "#/components/schemas/NodeWaypointObservabilitySnapshot"
           description: |
@@ -12165,6 +12175,122 @@ components:
             SVID rotation; they reset on NodeWaypoint process restart.
         udp_placement_migration:
           $ref: "#/components/schemas/UdpPlacementMigrationStatusSnapshot"
+
+    MeshConfigStreamStatus:
+      type: object
+      description: |
+        Closed-set status of the mesh configuration stream (native
+        `MeshSubscribe`, Ferrum-private ADS, or third-party stock ADS).
+        Deliberately label-free: no endpoint URL, control-plane host, node id,
+        credential path, token, or decoded claim appears here or in the matching
+        `ferrum_mesh_config_stream_attempts_total{protocol,outcome}` series.
+      required:
+        - protocol
+        - state
+        - last_attempt_outcome
+        - fallback_active
+        - consecutive_failures
+        - credential
+        - liveness_bound_seconds
+      properties:
+        protocol:
+          type: string
+          enum: [native, xds, stock_xds]
+          description: Which consumer owns the stream.
+        state:
+          type: string
+          enum:
+            - connected
+            - never_received_slice
+            - stream_liveness_failed
+            - serving_last_good
+          description: |
+            Readiness classification. `connected` means an RPC stream is
+            currently established AND usable configuration exists AND no sticky
+            liveness failure is outstanding. `never_received_slice` means
+            startup has never completed and no liveness bound has been hit.
+            `stream_liveness_failed` means an ESTABLISHED stream stopped being
+            usable — a first-frame, first-slice, or heartbeat-silence bound, or
+            a transport failure after the streaming RPC was open — and it
+            OUTRANKS both `connected` and `never_received_slice`. A bounded
+            liveness failure stays visible even before the first slice ever
+            arrives, and it stays visible after a replacement RPC is accepted
+            while last-good state still exists. It is cleared only when a
+            stream installs usable state; merely attaching a new RPC does not
+            report `connected`. `serving_last_good` means a previously
+            installed slice keeps serving while the stream is down or
+            reconnecting for an ordinary, non-liveness reason.
+        last_attempt_outcome:
+          type: string
+          enum:
+            - none
+            - shutdown
+            - tls_reload
+            - credential_rotated
+            - credential_source_invalid
+            - credential_deadline
+            - primary_retry
+            - remote_clean_eof
+            - transport_failure
+            - established_transport_failure
+            - first_frame_timeout
+            - first_slice_timeout
+            - heartbeat_silence_timeout
+            - policy_rejected
+          description: |
+            How the last completed attempt ended. The first six are intentional
+            LOCAL retirements and never rotate the endpoint or grow backoff; the
+            rest are endpoint failures that do. `none` before the first attempt.
+
+            The three credential outcomes are distinct on purpose:
+            `credential_rotated` is a real content change of the configured
+            source, `credential_source_invalid` is an unusable source (including
+            an expired or too-short-lived JWT-shaped token), and
+            `credential_deadline` is the stream reaching the absolute
+            authorization deadline stamped when the credential was admitted.
+
+            `transport_failure` is a connect/dial failure;
+            `established_transport_failure` is an already-open stream going
+            dark, which is what an HTTP/2 PING-ack failure against a blackholed
+            transport produces. `heartbeat_silence_timeout` is the native
+            `MeshSubscribe` APPLICATION-silence bound and is deliberately NOT
+            labelled as an HTTP/2 keepalive timeout.
+        fallback_active:
+          type: boolean
+          description: |
+            True only while a stream is actually ESTABLISHED on a non-primary
+            configured endpoint. Selecting a fallback index while connecting or
+            backing off does not raise it.
+        consecutive_failures:
+          type: integer
+          format: uint32
+          description: |
+            Consecutive endpoint-failure attempts since the last usable state.
+            Reset only when a stream installs usable configuration. An
+            intentional local retirement (shutdown, TLS reload, credential
+            rotation/invalidation/deadline, or primary retry) does not rotate
+            the endpoint or grow backoff, and it does not clear this counter.
+        credential:
+          type: string
+          enum: [not_configured, unobserved, valid, source_invalid]
+          description: |
+            External bearer-credential posture (issue #3852). `not_configured`
+            means no `FERRUM_MESH_STOCK_XDS_TOKEN_FILE` is set at all;
+            `unobserved` means one IS configured but has not been read yet;
+            `source_invalid` means it is missing, empty, non-regular,
+            unreadable, oversized, not valid UTF-8, not valid ASCII metadata,
+            or — for a JWT-shaped token — already past `exp` or unable to leave
+            a positive pre-expiry window after the configured refresh skew.
+            Reconnection is refused while `source_invalid` holds.
+        liveness_bound_seconds:
+          type: integer
+          format: uint64
+          description: |
+            Upper bound, in seconds, on detecting a half-open or blackholed
+            ESTABLISHED stream without any application frames (HTTP/2 PING
+            interval plus PING ack timeout) under the timing policy this
+            consumer is actually running. 40 with the shipped production
+            policy.
 
     UdpPlacementMigrationStatusSnapshot:
       type: object

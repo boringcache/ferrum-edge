@@ -19,6 +19,7 @@ use crate::modes::mesh::config::{
     MeshPolicy, PolicyScope, PolicyTargetAttachment, WaypointAttachment, Workload,
     policy_scope_applies_to_workload,
 };
+use crate::modes::mesh::config_consumer::stream_lifecycle::MeshConfigStreamStatus;
 use crate::modes::mesh::federation::FederationStore;
 use crate::modes::mesh::multicluster::RemoteEndpointStore;
 use crate::modes::mesh::revision::{
@@ -305,6 +306,10 @@ pub struct MeshRuntimeState {
     /// Latest xDS resource-warming convergence snapshot, published by the xDS
     /// client. `None` in native mode and before the first ADS response.
     xds_convergence: Arc<ArcSwap<Option<Arc<XdsConvergenceSnapshot>>>>,
+    /// Closed-set configuration-stream attempt/liveness status published by the
+    /// active consumer (issue #3854). `None` until the consumer starts, and for
+    /// the localized `file` source, which has no stream at all.
+    config_stream: Arc<ArcSwap<Option<MeshConfigStreamStatus>>>,
     /// Authoritative config-revision freshness gate (issue #2473). Every slice
     /// install runs through it BEFORE the `ArcSwap` replacement, so a lagging
     /// fallback CP cannot roll this data plane back to an older generation.
@@ -356,6 +361,7 @@ impl MeshRuntimeState {
             federation_store: FederationStore::new(),
             remote_endpoint_store: RemoteEndpointStore::new(),
             xds_convergence: Arc::new(ArcSwap::new(Arc::new(None))),
+            config_stream: Arc::new(ArcSwap::new(Arc::new(None))),
             revision_gate: Arc::new(MeshRevisionGate::new()),
         }
     }
@@ -412,6 +418,21 @@ impl MeshRuntimeState {
     /// first ADS response.
     pub fn xds_convergence(&self) -> Option<Arc<XdsConvergenceSnapshot>> {
         self.xds_convergence.load_full().as_ref().clone()
+    }
+
+    /// Publish the configuration-stream attempt/liveness status (issue #3854).
+    ///
+    /// Lock-free `ArcSwap` store on a cold path (once per attempt transition).
+    /// Every field is a closed set or a counter — never an endpoint URL, node
+    /// id, credential path, or token-derived value.
+    pub fn set_config_stream_status(&self, status: MeshConfigStreamStatus) {
+        self.config_stream.store(Arc::new(Some(status)));
+    }
+
+    /// Latest configuration-stream status, or `None` for the localized `file`
+    /// source and before the consumer's first publication.
+    pub fn config_stream_status(&self) -> Option<MeshConfigStreamStatus> {
+        *self.config_stream.load_full()
     }
 
     /// Return the latest mesh slice snapshot.

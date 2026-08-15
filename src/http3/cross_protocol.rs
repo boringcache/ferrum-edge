@@ -8554,6 +8554,13 @@ where
     tokio::pin!(flush_timer);
     let mut stream_done = false;
     let mut bytes_streamed: u64 = 0;
+    // Bytes offered to h3 `send_data`, including a write that is still parked
+    // in QUIC flow control. Completed-write `bytes_streamed` stays 0 until
+    // `poll_ready` finishes, which is too late for the message-safe trailer
+    // rule: the frame is queued on first poll of `send_data`. Charged only
+    // when that write is actually polled, so an already-elapsed bound that
+    // never starts the write still looks like pre-DATA.
+    let mut bytes_offered: u64 = 0;
     let mut client_disconnected = false;
     let mut body_error_class: Option<ErrorClass> = None;
     let mut trailers: Option<HeaderMap> = None;
@@ -8612,10 +8619,19 @@ where
     let downstream_write_bound =
         crate::proxy::auth_lifetime::ComposedAuthBound::compose(grpc_deadline_at, auth_deadline);
     macro_rules! await_downstream_write {
-        ($write:expr) => {{
+        ($write:expr, $len:expr) => {{
+            // Charge the offer only when this future is polled. h3 queues the
+            // DATA frame on first poll, then `poll_ready` parks on flow
+            // control; a cancelled write must not look like a zero-DATA
+            // trailers-only completion. An already-elapsed bound that never
+            // polls still looks like pre-DATA.
+            let write = async {
+                bytes_offered = bytes_offered.saturating_add($len);
+                $write.await
+            };
             match crate::http3::stream_util::await_response_write_before_deadline(
                 downstream_write_bound.deadline(),
-                $write,
+                write,
             )
             .await
             {
@@ -8641,7 +8657,7 @@ where
                         client_deadline_expired = true;
                         coalesce_buf.clear();
                         if crate::http3::stream_util::grpc_deadline_can_send_terminal_status(
-                            bytes_streamed,
+                            bytes_offered,
                         ) {
                             let mut deadline_trailers = HeaderMap::new();
                             deadline_trailers.insert(
@@ -8687,15 +8703,16 @@ where
             // into a partial-body reset.
             // Authorization lifetime (issue #3815), placed BEFORE the client
             // `grpc-timeout` arm so the security bound is the one attributed
-            // when both are ready. Message safety is the same rule the client
-            // arm uses: a clean `grpc-status: 16` (UNAUTHENTICATED) terminal is
-            // emitted only while NO response body byte is client-visible —
-            // gRPC-Web included, because the caller translates this trailer map
-            // into the equivalent bounded body-framed trailer — and the stream
-            // is RESET once any byte is on the wire, where a length-prefixed
-            // message could be cut mid-frame. `break 'outer` retires the
-            // opposite direction: the request pump is aborted by its guard and
-            // the upstream `Incoming` is dropped with the relay.
+            // when both are ready. Message safety uses offered DATA, not
+            // completed-write accounting: a clean `grpc-status: 16`
+            // (UNAUTHENTICATED) terminal is emitted only while NO response
+            // DATA has been queued on the H3 send half — gRPC-Web included,
+            // because the caller translates this trailer map into the
+            // equivalent bounded body-framed trailer — and the stream is RESET
+            // once any byte has been offered, where a length-prefixed message
+            // could be cut mid-frame. `break 'outer` retires the opposite
+            // direction: the request pump is aborted by its guard and the
+            // upstream `Incoming` is dropped with the relay.
             _ = &mut auth_deadline_sleep, if auth_deadline_active && !stream_done => {
                 let termination = auth_deadline
                     .map(|plan| plan.termination)
@@ -8704,7 +8721,7 @@ where
                     );
                 coalesce_buf.clear();
                 if crate::http3::stream_util::grpc_deadline_can_send_terminal_status(
-                    bytes_streamed,
+                    bytes_offered,
                 ) {
                     let mut auth_trailers = HeaderMap::new();
                     auth_trailers.insert(
@@ -8732,7 +8749,7 @@ where
                 client_deadline_expired = true;
                 coalesce_buf.clear();
                 if crate::http3::stream_util::grpc_deadline_can_send_terminal_status(
-                    bytes_streamed,
+                    bytes_offered,
                 ) {
                     let mut deadline_trailers = HeaderMap::new();
                     deadline_trailers.insert(
@@ -8790,7 +8807,7 @@ where
                                     data
                                 };
                                 let out_len = out.len() as u64;
-                                if !await_downstream_write!(stream.send_data(out)) {
+                                if !await_downstream_write!(stream.send_data(out), out_len) {
                                     break 'outer;
                                 }
                                 grpc_response_scanner
@@ -8814,7 +8831,7 @@ where
                                     metric_data.clone()
                                 };
                                 let out_len = out.len() as u64;
-                                if !await_downstream_write!(stream.send_data(out)) {
+                                if !await_downstream_write!(stream.send_data(out), out_len) {
                                     break 'outer;
                                 }
                                 grpc_response_scanner
@@ -8849,7 +8866,7 @@ where
                     metric_data.clone()
                 };
                 let out_len = out.len() as u64;
-                if !await_downstream_write!(stream.send_data(out)) {
+                if !await_downstream_write!(stream.send_data(out), out_len) {
                     break 'outer;
                 }
                 grpc_response_scanner.push(&metric_data, grpc_response_messages);
@@ -8877,7 +8894,7 @@ where
                     metric_data.clone()
                 };
                 let out_len = out.len() as u64;
-                if !await_downstream_write!(stream.send_data(out)) {
+                if !await_downstream_write!(stream.send_data(out), out_len) {
                     break 'outer;
                 }
                 grpc_response_scanner.push(&metric_data, grpc_response_messages);

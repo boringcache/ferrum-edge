@@ -39,13 +39,19 @@ pub(crate) enum H3ResponseWriteError<E> {
     DeadlineExceeded,
 }
 
-/// A deadline can still be reported with a clean terminal gRPC status while
-/// the downstream client has not observed any response DATA. Once any DATA is
-/// visible, resetting is the only safe choice because the deadline may have
-/// interrupted a length-prefixed gRPC message.
+/// A deadline can still be reported with a clean terminal gRPC status only
+/// while no response DATA has been offered to the H3 send half.
+///
+/// h3's `send_data` queues the DATA frame on `quic::SendStream::send_data`
+/// *before* `poll_ready` waits for Quinn to accept the whole buffer. A
+/// flow-control-blocked or cancelled write therefore leaves completed-write
+/// accounting at 0 even though a prefix may already be client-visible. Callers
+/// must pass the offered/queued byte count, charged when `send_data` is
+/// actually polled. Once any DATA has been offered, resetting is the only safe
+/// choice because a length-prefixed gRPC message may be partial.
 #[inline]
-pub(crate) fn grpc_deadline_can_send_terminal_status(bytes_streamed: u64) -> bool {
-    bytes_streamed == 0
+pub(crate) fn grpc_deadline_can_send_terminal_status(bytes_offered: u64) -> bool {
+    bytes_offered == 0
 }
 
 /// Race one potentially flow-control-blocked downstream H3 write against the
