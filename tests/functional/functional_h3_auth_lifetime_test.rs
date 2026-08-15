@@ -344,6 +344,28 @@ async fn wait_for_h3_supported(harness: &GatewayHarness, timeout: Duration) -> O
     }
 }
 
+/// Wait until an H2/TLS-only backend is ready for the cross-protocol bridge.
+/// `unknown` and `unsupported` both keep native-H3 backend dispatch disabled;
+/// requiring H2/TLS support proves the capability refresh itself has settled.
+async fn wait_for_h2_bridge_ready(harness: &GatewayHarness, timeout: Duration) -> Option<Value> {
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        if let Some(entry) = fetch_capability_entry(harness).await {
+            let h3 = entry["plain_http"]["h3"].as_str();
+            let h2_tls = entry["plain_http"]["h2_tls"].as_str();
+            if h2_tls == Some("supported")
+                && matches!(h3, Some("unsupported") | Some("unknown"))
+            {
+                return Some(entry);
+            }
+        }
+        if std::time::Instant::now() >= deadline {
+            return None;
+        }
+        tokio::time::sleep(Duration::from_millis(150)).await;
+    }
+}
+
 /// A backend script that keeps producing response DATA for `count` rounds
 /// spaced by `gap`. Activity must never extend the authorization deadline.
 fn h3_chatty_stream(count: usize, gap: Duration) -> Vec<H3Step> {
@@ -846,7 +868,10 @@ async fn h3_auth_lifetime_stalled_downstream_cannot_outlive_the_credential() {
     let mut steps = vec![
         GrpcStep::AcceptStreamingRpc(MatchRpc::any()),
         GrpcStep::SendInitialHeaders,
-        GrpcStep::RespondMessage(primed),
+        GrpcStep::RespondMessage(primed.clone()),
+        // Let the gateway flush the priming frame separately before the first
+        // bulk frame parks on the client's tiny receive window.
+        GrpcStep::Sleep(Duration::from_millis(100)),
     ];
     for _ in 0..40 {
         steps.push(GrpcStep::RespondMessage(big.clone()));
@@ -859,6 +884,13 @@ async fn h3_auth_lifetime_stalled_downstream_cannot_outlive_the_credential() {
         .expect("spawn bulk grpc backend");
 
     let (harness, https_port) = spawn_h3_gateway(protected_proxy_yaml(backend_port), false).await;
+    let capability = wait_for_h2_bridge_ready(&harness, Duration::from_secs(20)).await;
+    assert!(
+        capability.is_some(),
+        "the H2/TLS backend must be classified for the cross-protocol bridge before the \
+         short-lived credential is minted; logs:\n{}",
+        harness.captured_combined().unwrap_or_default()
+    );
 
     // A deliberately tiny per-stream receive window makes the backpressure
     // deterministic instead of depending on Quinn's default.
@@ -878,10 +910,23 @@ async fn h3_auth_lifetime_stalled_downstream_cannot_outlive_the_credential() {
     let (status, _headers) = stream.recv_response().await.expect("response headers");
     assert_eq!(status.as_u16(), 200);
 
+    // Prove the post-DATA precondition before deliberately stalling. Reading
+    // this 69-byte gRPC frame restores only its small amount of flow-control
+    // credit; the following 64 KiB frame still cannot complete in a 4 KiB
+    // stream window.
+    let first = stream
+        .recv_data()
+        .await
+        .expect("priming gRPC DATA must arrive before credential expiry")
+        .expect("priming gRPC response must not end before DATA");
+    assert_eq!(first.len(), primed.len() + 5, "complete priming gRPC frame");
+    assert!(first.ends_with(&primed), "priming gRPC payload must match");
+
     // From here the client NEVER reads a DATA frame. The tiny first message
-    // occupies the receive buffer, the bulk `send_data` parks, and only the
-    // authorization bound can end the exchange. Expiry after offered DATA
-    // must RESET: a clean EOF would hide a potentially partial gRPC message.
+    // has established the post-DATA state, the bulk `send_data` parks, and
+    // only the authorization bound can end the exchange. Expiry after offered
+    // DATA must RESET: a clean EOF would hide a potentially partial gRPC
+    // message.
     assert_credential_expired_exactly(&harness, "grpc", 1).await;
 
     // The stream must be terminated on the wire too, not merely counted.
