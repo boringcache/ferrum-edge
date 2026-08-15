@@ -11729,8 +11729,9 @@ impl LiveNetnsUdpEcho {
                 }
                 let mut buf = [0u8; 65535];
                 loop {
-                    if shutdown_rx.try_recv().is_ok() {
-                        return;
+                    match shutdown_rx.try_recv() {
+                        Ok(()) | Err(std::sync::mpsc::TryRecvError::Disconnected) => return,
+                        Err(std::sync::mpsc::TryRecvError::Empty) => {}
                     }
                     match tokio::time::timeout(
                         Duration::from_millis(100),
