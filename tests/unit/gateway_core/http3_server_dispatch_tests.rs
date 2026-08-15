@@ -1992,7 +1992,7 @@ fn h3_buffered_upload_deadlines_run_rejection_cleanup_and_logging() {
     assert!(helper.contains("apply_reject_after_proxy_and_synthetic_body_hooks("));
     assert!(helper.contains("run_h3_reject_response_committed_hooks("));
     assert!(helper.contains("log_rejected_request("));
-    assert!(helper.contains("send_h3_plugin_reject_flavor_aware("));
+    assert!(helper.contains("send_h3_plugin_reject_flavor_aware_with_recv_halt("));
     // Upload-deadline rejection is already selected; the terminal write must use
     // the shared post-deadline grace (via the plugin reject writer) rather than
     // re-racing the expired absolute deadline.
