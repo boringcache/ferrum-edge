@@ -25153,7 +25153,7 @@ async fn enforce_final_client_visible_response_header_policy(
     // Re-evaluate exactly once, so a preserved decoration cannot carry a refused
     // shape past the policy either. A second refusal collapses to the fixed
     // gateway terminal rather than iterating.
-    if let Some(reject) = evaluate_final_client_visible_response_header_policy(
+    if let Some(_reject) = evaluate_final_client_visible_response_header_policy(
         plugins,
         ctx,
         *response_status,
