@@ -2921,6 +2921,10 @@ fn every_streaming_h1h2_upload_installs_the_gateway_owned_pump() {
         GRPC_PROXY_SOURCE.contains("UploadSource::for_streaming_upload(body, auth)"),
         "the fully-streamed native-gRPC upload lost its gateway-owned lifecycle"
     );
+    assert!(
+        GRPC_PROXY_SOURCE.contains("deadline.expired(cx)"),
+        "native gRPC must reject a queued pump frame after authorization expiry"
+    );
     // The adapter deadline and the pump are installed together from one place,
     // so a transport cannot get one without the other.
     let installer = PROXY_SOURCE
