@@ -102,10 +102,12 @@ revalidate fresh-checkout source mtimes and repeat test-only compile/link work.
 On a full workflow rerun, `fips-compile` restores the newest prior attempt with
 the same SHA + `run_id` before rebuilding and publishes a fresh attempt key;
 the first attempt and fork PRs may miss this optional warm source.
-`fips-claimed-checks` and `fips-clippy` restore the current producer key and do
-not save. The six claimed combinations run separately and in parallel with
-clippy/tests after the shorter producer, keeping one cold job from accumulating
-the former hour-plus build/check/link sequence. Trusted non-cold cache consumers
+The three ordinal `fips-claimed-checks` shards and `fips-clippy` restore the
+current producer key and do not save. Each claimed shard selects profiles from
+the policy checker's single inventory by ordinal modulo three and fails closed
+if it selects none. The six claimed combinations therefore remain checker-owned
+while running in parallel with clippy/tests after the shorter producer, rather
+than accumulating in one over-target consumer. Trusted non-cold cache consumers
 fail closed if the producer channel is missing. `fips-test` consumes only the
 same-run immutable artifact and never restores a build cache.
 The cache action holds the GitHub Actions cache credential inside the action process;

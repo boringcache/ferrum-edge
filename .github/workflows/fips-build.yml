@@ -529,10 +529,20 @@ jobs:
           python3 .github/scripts/ci_runtime_telemetry.py summarize --title "FIPS compile"
 
   fips-claimed-checks:
-    name: FIPS claimed feature combinations
+    name: FIPS claimed feature combinations (${{ matrix.shard_name }})
     needs: fips-compile
     runs-on: ubuntu-latest
     timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - shard_index: 0
+            shard_name: 1-of-3
+          - shard_index: 1
+            shard_name: 2-of-3
+          - shard_index: 2
+            shard_name: 3-of-3
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
         with:
@@ -657,33 +667,63 @@ jobs:
 
       - name: Compile every crypto-relevant optional FIPS combination
         # `cargo check` proves each claimed cryptographic combination while
-        # avoiding redundant binary links. The cloud-secrets profile remains
-        # compile-covered even though runtime policy refuses it.
+        # avoiding redundant binary links. Three deterministic ordinal shards
+        # keep the warm gate below its wall-time target without duplicating the
+        # checker-owned profile inventory in workflow YAML. The cloud-secrets
+        # profile remains compile-covered even though runtime policy refuses it.
+        env:
+          FIPS_CLAIMED_SHARD_INDEX: ${{ matrix.shard_index }}
+          FIPS_CLAIMED_SHARD_COUNT: 3
         run: |
           set -euo pipefail
-          python3 .github/scripts/ci_runtime_telemetry.py start --phase fips-claimed-checks
+          case "${FIPS_CLAIMED_SHARD_INDEX}:${FIPS_CLAIMED_SHARD_COUNT}" in
+            0:3|1:3|2:3) ;;
+            *)
+              echo "::error::invalid FIPS claimed-profile shard contract" >&2
+              exit 1
+              ;;
+          esac
+          phase="fips-claimed-checks-${FIPS_CLAIMED_SHARD_INDEX}"
+          python3 .github/scripts/ci_runtime_telemetry.py start --phase "$phase"
+          profiles_file="$(mktemp)"
+          trap 'rm -f "$profiles_file"' EXIT
+          python3 .github/scripts/check_fips_feature_policy.py \
+            --list-claimed-profiles > "$profiles_file"
           status=0
+          profile_index=0
+          selected=0
           while IFS=$'\t' read -r label features; do
             [ -n "$features" ] || continue
-            echo "::group::cargo check — ${label}"
-            if ! cargo check --locked --no-default-features --features "$features" \
-              --lib --bins; then
-              echo "::error::FIPS claimed-profile compile failed for ${label} (--features ${features})"
-              status=1
+            if [ $((profile_index % FIPS_CLAIMED_SHARD_COUNT)) -eq "$FIPS_CLAIMED_SHARD_INDEX" ]; then
+              selected=$((selected + 1))
+              echo "::group::cargo check — ${label}"
+              if ! cargo check --locked --no-default-features --features "$features" \
+                --lib --bins; then
+                echo "::error::FIPS claimed-profile compile failed for ${label} (--features ${features})"
+                status=1
+              fi
+              echo "::endgroup::"
             fi
-            echo "::endgroup::"
-          done < <(python3 .github/scripts/check_fips_feature_policy.py --list-claimed-profiles)
-          python3 .github/scripts/ci_runtime_telemetry.py end --phase fips-claimed-checks --status "$status"
+            profile_index=$((profile_index + 1))
+          done < "$profiles_file"
+          if [ "$profile_index" -eq 0 ] || [ "$selected" -eq 0 ]; then
+            echo "::error::FIPS claimed-profile shard ${FIPS_CLAIMED_SHARD_INDEX} selected no profiles" >&2
+            status=1
+          fi
+          python3 .github/scripts/ci_runtime_telemetry.py end --phase "$phase" --status "$status"
           exit "$status"
 
       - name: Record sccache stats
         if: always()
+        env:
+          FIPS_CLAIMED_SHARD_INDEX: ${{ matrix.shard_index }}
         run: |
           sccache_bin="${FERRUM_SCCACHE_BIN:-}"
           if [ -n "$sccache_bin" ] && [ -x "$sccache_bin" ]; then
             "$sccache_bin" --show-stats || true
           fi
-          python3 .github/scripts/ci_runtime_telemetry.py summarize --title "FIPS claimed profiles"
+          python3 .github/scripts/ci_runtime_telemetry.py summarize \
+            --title "FIPS claimed profiles (${FIPS_CLAIMED_SHARD_INDEX})"
 
   fips-clippy:
     name: FIPS clippy

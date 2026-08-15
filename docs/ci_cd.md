@@ -283,9 +283,9 @@ policy/key-admission/handshake tests share two cache layers:
   `add-job-id-key` wiring). Automatic toolchain, environment, manifest, and
   lockfile hashing stays enabled. This layer is **not** SHA-scoped, so
   AWS-LC/compiler work stays warm across commits. `fips-compile` may save it
-  (`save-if` false for fork PRs); `fips-claimed-checks` and `fips-clippy`
-  restore it with `save-if: false` and never publish. The test job does not
-  restore build caches.
+  (`save-if` false for fork PRs); the three ordinal `fips-claimed-checks`
+  shards and `fips-clippy` restore it with `save-if: false` and never publish.
+  The test job does not restore build caches.
 - **Exact producer channel.** After a successful compile, `fips-compile`
   precompiles the complete FIPS `unit_tests` and `integration_tests`
   executables, stages digest-bound copies in an immutable same-run artifact,
@@ -297,11 +297,13 @@ policy/key-admission/handshake tests share two cache layers:
   exact-hit skip cannot trap newly warmed outputs. On a full workflow rerun,
   compile first restores the newest prior attempt under the same SHA+`run_id`
   prefix, so the whole gate—not only its consumers—uses the exact warm source.
-  A miss remains valid on the first attempt and on fork PRs. Claimed-profile
-  checks and clippy restore the current producer key (with the same prefix
-  fallback) and never save. They run in parallel after the shorter compile
-  producer so the six claimed combinations cannot push that producer past the
-  hosted runner-loss window. The test job downloads only the attempt-scoped
+  A miss remains valid on the first attempt and on fork PRs. The three
+  claimed-profile shards and clippy restore the current producer key (with the
+  same prefix fallback) and never save. Each claimed shard filters the policy
+  checker's single inventory by ordinal modulo three and fails closed if it
+  selects no profile. The shards run in parallel after the shorter compile
+  producer, so all six combinations remain checker-owned without accumulating
+  in one over-target consumer. The test job downloads only the attempt-scoped
   artifact, rejects unexpected names, symlinks, path escapes, and SHA-256
   mismatches, then executes the two binaries directly. Fresh-checkout source
   mtimes therefore cannot make Cargo repeat test-only compile/link work.

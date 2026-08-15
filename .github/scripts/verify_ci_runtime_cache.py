@@ -1556,6 +1556,39 @@ def check_fips(workflow: str, failures: list[str]) -> None:
         failures,
     )
     require(
+        "name: FIPS claimed feature combinations (${{ matrix.shard_name }})"
+        in claimed_job,
+        "FIPS claimed-profile checks must expose their deterministic shard name",
+        failures,
+    )
+    require(
+        "fail-fast: false" in claimed_job
+        and claimed_job.count("shard_index:") == 3
+        and "shard_index: 0" in claimed_job
+        and "shard_index: 1" in claimed_job
+        and "shard_index: 2" in claimed_job
+        and "shard_name: 1-of-3" in claimed_job
+        and "shard_name: 2-of-3" in claimed_job
+        and "shard_name: 3-of-3" in claimed_job,
+        "FIPS claimed-profile checks must use all three fail-fast-disabled shards",
+        failures,
+    )
+    require(
+        "FIPS_CLAIMED_SHARD_INDEX: ${{ matrix.shard_index }}" in claimed_job
+        and "FIPS_CLAIMED_SHARD_COUNT: 3" in claimed_job
+        and "profile_index % FIPS_CLAIMED_SHARD_COUNT" in claimed_job
+        and "profile_index=$((profile_index + 1))" in claimed_job
+        and "selected=$((selected + 1))" in claimed_job
+        and 'profiles_file="$(mktemp)"' in claimed_job
+        and '--list-claimed-profiles > "$profiles_file"' in claimed_job
+        and 'done < "$profiles_file"' in claimed_job
+        and "< <(" not in claimed_job
+        and '[ "$selected" -eq 0 ]' in claimed_job,
+        "FIPS claimed-profile shards must partition the checker-owned inventory "
+        "by ordinal, fail closed when enumeration fails, and reject an empty shard",
+        failures,
+    )
+    require(
         "cargo clippy --locked --no-default-features --features fips" in workflow,
         "FIPS clippy must still lint the fips profile",
         failures,
