@@ -600,6 +600,10 @@ cargo test --lib
 FERRUM_KTLS_LIVE_REQUIRED=1 cargo test --lib -- --ignored --test-threads=1 \
   proxy::ktls_live_kernel_tests
 cargo test --test unit_tests
+cargo test --features acme --lib --test unit_tests --no-run
+cargo test --features acme --lib tls::acme::client::tests
+cargo test --features acme --test unit_tests tls::acme_dns01_hook_tests
+cargo test --features acme --lib tls::acme_renewal_resume_tests
 
 # test-pkcs11-softhsm: compile both libtest binaries before either filtered
 # invocation, then exercise the signer and certificate-pairing contracts.

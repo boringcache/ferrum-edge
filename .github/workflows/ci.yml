@@ -478,6 +478,14 @@ jobs:
         env:
           RUST_BACKTRACE: 1
 
+      - name: Precompile ACME library and DNS hook test binaries
+        # All three ACME filters below run in one of these two libtest binaries.
+        # Compile the pair together so a hosted runner cannot pass one filter,
+        # then spend another full compile window linking the other target.
+        run: cargo test --features acme --lib --test unit_tests --no-run
+        env:
+          RUST_BACKTRACE: 1
+
       - name: Run ACME outbound-boundary regressions
         run: cargo test --features acme --lib tls::acme::client::tests
         env:
