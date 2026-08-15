@@ -3617,8 +3617,9 @@ impl StreamListenerManager {
     /// Only routes whose owning proxy is an accepted member of THIS listener's
     /// group are installed, so a candidate that materialization refused (mixed
     /// posture, duplicate exact claim, headless on a shared port) can never
-    /// reach the datapath. A refused publication retains the previous accepted
-    /// table — never a partially installed one.
+    /// reach the datapath. A refused publication retracts the complete table:
+    /// the config generation has already been accepted, so retaining its
+    /// predecessor's ownership would serve stale routes under the new config.
     fn publish_node_waypoint_udp_routes(
         &self,
         router: &crate::proxy::node_waypoint_udp_destination::NodeWaypointUdpDestinationRouter,
@@ -3649,13 +3650,16 @@ impl StreamListenerManager {
             }
             Err(err) => {
                 // Materialization already refuses every ambiguous claimant, so
-                // reaching this is a defect rather than operator input. Retain
-                // the previous accepted table rather than installing a
-                // partially-exact one.
+                // reaching this is a defect rather than operator input. The
+                // candidate config is nevertheless already accepted; retract
+                // every predecessor route so this generation fails closed
+                // rather than retaining stale ownership under new policy.
+                let generation = router.retract();
                 error!(
                     listen_port = port,
-                    "Refusing a NodeWaypoint UDP destination publication and retaining the \
-                     previous accepted routes: {}",
+                    destination_generation = generation,
+                    "Refusing a NodeWaypoint UDP destination publication and retracting every \
+                     exact route for this listener: {}",
                     err
                 );
             }

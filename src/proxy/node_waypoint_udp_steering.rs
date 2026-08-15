@@ -44,9 +44,9 @@
 //! * **Service identity is part of the match.** Rules are scoped
 //!   `-d <ClusterIP> --dport <port>`, never by port alone: a workload's datagram
 //!   to an unrelated off-cluster host that happens to share a port number is not
-//!   steered, and a materialized listener can only ever receive the Service it
-//!   was materialized for (one service per port is already enforced at
-//!   materialization — two claimants refuse BOTH).
+//!   steered. Compatible same-port UDP Services share one listener and are
+//!   demultiplexed by this exact ClusterIP destination; ambiguous exact-address
+//!   claimants and incompatible DTLS/mixed frontend postures are refused.
 //! * **No recursion.** The match is `-i <pod veth>` in `PREROUTING`. The
 //!   waypoint's own relay dials and replies are locally generated and traverse
 //!   `OUTPUT`, which is never hooked, so they are structurally incapable of
