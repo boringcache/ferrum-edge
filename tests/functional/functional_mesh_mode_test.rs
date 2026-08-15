@@ -11992,9 +11992,7 @@ async fn functional_mesh_live_source_capture_udp_manager_hbone_round_trip() {
     let dest_registry = TempDir::new().expect("UDP destination pod registry tempdir");
     let dest_registry_entry = destination
         .publish_enrolled(dest_registry.path(), DEST_POD_UID, b_spiffe)
-        .unwrap_or_else(|error| {
-            panic!("destination pod registry enrollment is required: {error}")
-        });
+        .unwrap_or_else(|error| panic!("destination pod registry enrollment is required: {error}"));
 
     let temp_a_disabled = TempDir::new().expect("disabled gateway A tempdir");
     let temp_a = TempDir::new().expect("gateway A tempdir");
@@ -12100,8 +12098,13 @@ async fn functional_mesh_live_source_capture_udp_manager_hbone_round_trip() {
         captured_output(&temp_a_disabled)
     );
     tokio::time::sleep(Duration::from_secs(3)).await;
-    wait_for_udp_capture_snapshot(source.pod.pid(), capture_port, false, Duration::from_secs(6))
-        .expect("capture-disabled pod must have no UDP rules/listener");
+    wait_for_udp_capture_snapshot(
+        source.pod.pid(),
+        capture_port,
+        false,
+        Duration::from_secs(6),
+    )
+    .expect("capture-disabled pod must have no UDP rules/listener");
     disabled_a.stop();
 
     // #2085 fixed fresh-netns installation by checking generation-A chain
@@ -12147,9 +12150,12 @@ async fn functional_mesh_live_source_capture_udp_manager_hbone_round_trip() {
         "UDP source gateway A did not start\n{}",
         captured_output(&temp_a)
     );
-    if let Err(error) =
-        wait_for_udp_capture_snapshot(source.pod.pid(), capture_port, true, Duration::from_secs(20))
-    {
+    if let Err(error) = wait_for_udp_capture_snapshot(
+        source.pod.pid(),
+        capture_port,
+        true,
+        Duration::from_secs(20),
+    ) {
         let status = gateway_a.poll_status();
         let gateway_a_output = captured_output(&temp_a);
         // #2085 made first-install detection portable by checking chain existence
@@ -12275,7 +12281,10 @@ async fn functional_mesh_live_source_capture_udp_manager_hbone_round_trip() {
     // including verified removal, refusal, and restart recovery; only then may
     // the producer remove its retained guard and every remaining rule/route.
     std::fs::remove_file(&registry_entry).expect("delete UDP pod registry entry");
-    let ack_required = registry.path().join(".udp-ack-required").join(SOURCE_POD_UID);
+    let ack_required = registry
+        .path()
+        .join(".udp-ack-required")
+        .join(SOURCE_POD_UID);
     let ack_deadline = Instant::now() + Duration::from_secs(5);
     while !ack_required.exists() && Instant::now() < ack_deadline {
         tokio::time::sleep(Duration::from_millis(10)).await;
@@ -12289,8 +12298,13 @@ async fn functional_mesh_live_source_capture_udp_manager_hbone_round_trip() {
     std::fs::create_dir_all(&not_ready_dir).expect("create UDP not-ready ack directory");
     std::fs::write(not_ready_dir.join(SOURCE_POD_UID), b"")
         .expect("publish node-agent UDP not-ready acknowledgement");
-    wait_for_udp_capture_snapshot(source.pod.pid(), capture_port, false, Duration::from_secs(12))
-        .expect("pod deletion must remove UDP rules/listener");
+    wait_for_udp_capture_snapshot(
+        source.pod.pid(),
+        capture_port,
+        false,
+        Duration::from_secs(12),
+    )
+    .expect("pod deletion must remove UDP rules/listener");
 
     // Closing A ends the CONNECT stream. B's relay-completion log is emitted
     // only by `handle_hbone_udp_request` after it accepted the UDP-marked HBONE

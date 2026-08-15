@@ -88,9 +88,8 @@ fn mesh_supported_matrix_product_deferral_index_is_current() {
         "completed #3621 must stay recorded in the completed historical rows"
     );
     assert!(
-        MESH_SUPPORTED_MATRIX.contains(
-            "functional_mesh_live_source_capture_udp_manager_hbone_round_trip"
-        ),
+        MESH_SUPPORTED_MATRIX
+            .contains("functional_mesh_live_source_capture_udp_manager_hbone_round_trip"),
         "completed enrolled-destination coverage must name the live source-capture gate"
     );
     // #3263 shipped: external UDP ServiceEntry ports now materialize a
@@ -174,9 +173,7 @@ fn issue_2110_register_maps_completed_work_and_live_trackers() {
         ISSUE_2110_REGISTER.contains("intentional mixed strategy"),
         "k8s status ownership must document the intentional RMW+SSA mixed strategy"
     );
-    for issue in [
-        "#3228", "#3299", "#3302", "#3304", "#3331", "#3332",
-    ] {
+    for issue in ["#3228", "#3299", "#3302", "#3304", "#3331", "#3332"] {
         assert!(
             ISSUE_2110_REGISTER.contains(issue),
             "register must cite live tracker {issue}"
@@ -189,14 +186,12 @@ fn issue_2110_register_maps_completed_work_and_live_trackers() {
         "completed #3263 must be recorded as implemented, not as a live residual"
     );
     assert!(
-        ISSUE_2110_REGISTER
-            .contains("| Ambient UDP enrolled-destination round trip | Implemented"),
+        ISSUE_2110_REGISTER.contains("| Ambient UDP enrolled-destination round trip | Implemented"),
         "completed #3621 must be recorded as implemented, not as a live residual"
     );
     assert!(
-        ISSUE_2110_REGISTER.contains(
-            "functional_mesh_live_source_capture_udp_manager_hbone_round_trip"
-        ),
+        ISSUE_2110_REGISTER
+            .contains("functional_mesh_live_source_capture_udp_manager_hbone_round_trip"),
         "completed #3621 must name the live source-capture gate"
     );
     assert!(

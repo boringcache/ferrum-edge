@@ -2965,7 +2965,10 @@ impl StreamListenerManager {
             }
 
             let (shutdown_tx, shutdown_rx) = watch::channel(false);
-            let rebound_proxy_ids = sni_ids.clone().unwrap_or_else(|| vec![identity.clone()]);
+            let rebound_proxy_ids = sni_ids
+                .clone()
+                .or_else(|| node_waypoint_udp_ids.clone())
+                .unwrap_or_else(|| vec![identity.clone()]);
             remove_bind_failures(&self.async_bind_failures, &rebound_proxy_ids);
             let proxy_id_owned = proxy_id.clone();
             // Owning namespace for this listener's proxy, carried verbatim from

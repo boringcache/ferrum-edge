@@ -3077,6 +3077,55 @@ async fn node_waypoint_udp_retract_a_keeps_shared_listener_and_b_route() {
     runtime.manager.shutdown_all().await;
 }
 
+/// A shared listener reports one durable bind failure for every member. Once
+/// the shared socket successfully rebinds, all of those member-scoped failures
+/// must clear together; retaining B's failure after representative A recovered
+/// would keep readiness falsely degraded indefinitely.
+#[tokio::test]
+async fn node_waypoint_udp_shared_rebind_clears_every_member_failure() {
+    let blocker = tokio::net::UdpSocket::bind("127.0.0.1:0")
+        .await
+        .expect("bind shared-listener blocker");
+    let port = blocker.local_addr().expect("blocker address").port();
+    let config = config_with_same_port_nw_udp(
+        port,
+        &[
+            ("udp-demux-recover-a", "10.96.0.20"),
+            ("udp-demux-recover-b", "10.96.0.21"),
+        ],
+    );
+    let manager = create_manager(config);
+
+    let failures = manager.reconcile().await;
+    assert_eq!(
+        failures.len(),
+        2,
+        "every shared member must report the bind failure"
+    );
+    assert_eq!(
+        manager.stream_bind_failures().len(),
+        2,
+        "both member-scoped failures must remain durable until rebind"
+    );
+
+    drop(blocker);
+    let failures = manager.reconcile().await;
+    assert!(failures.is_empty(), "shared listener must rebind: {failures:?}");
+    assert!(
+        manager
+            .wait_until_started(Duration::from_secs(5))
+            .await
+            .is_ok(),
+        "rebound shared listener must start"
+    );
+    assert!(
+        manager.stream_bind_failures().is_empty(),
+        "successful shared rebind must clear every member's durable failure"
+    );
+
+    manager.shutdown_all().await;
+}
+
 #[tokio::test]
 async fn node_waypoint_udp_withdrawal_retracts_steering() {
     let dest_ip = "10.96.0.10";
