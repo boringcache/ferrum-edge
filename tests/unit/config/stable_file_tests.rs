@@ -495,6 +495,9 @@ mod unix_targets {
         // as success. Concurrent churn remains useful coverage; the
         // deterministic torn-window proof lives in
         // `held_torn_window_is_not_published_and_complete_generation_converges`.
+        // Require the writer to complete one delete/recreate cycle before the
+        // reader assertions start; without this handshake the reader loop can
+        // beat the writer's first schedule on a saturated runner.
         let dir = tempfile::tempdir().unwrap();
         let live = dir.path().join("churn.conf");
         std::fs::write(&live, "AAAA").unwrap();
@@ -502,18 +505,31 @@ mod unix_targets {
         let stop = Arc::new(Mutex::new(false));
         let writer_stop = Arc::clone(&stop);
         let writer_path = live.clone();
+        let (churn_started_tx, churn_started_rx) = std::sync::mpsc::sync_channel(1);
         let writer = thread::spawn(move || {
+            let mut churn_started_tx = Some(churn_started_tx);
             while !*writer_stop.lock().unwrap() {
                 let _ = std::fs::remove_file(&writer_path);
                 thread::sleep(Duration::from_micros(200));
-                let _ = std::fs::write(&writer_path, "AAAA");
+                if std::fs::write(&writer_path, "AAAA").is_ok()
+                    && let Some(started_tx) = churn_started_tx.take()
+                {
+                    let _ = started_tx.send(());
+                }
                 thread::sleep(Duration::from_millis(1));
             }
+            // Terminal stable window: leave a complete generation in place.
+            let _ = std::fs::write(&writer_path, "AAAA");
         });
 
-        let deadline = Instant::now() + Duration::from_millis(500);
+        if let Err(error) = churn_started_rx.recv_timeout(Duration::from_secs(2)) {
+            *stop.lock().unwrap() = true;
+            writer.join().unwrap();
+            panic!("writer did not complete the first delete/recreate cycle: {error}");
+        }
+
         let mut saw_ok = false;
-        while Instant::now() < deadline {
+        for _ in 0..20 {
             match read_stable_file(&live, opts(TEST_LIMIT)) {
                 Ok(content) => {
                     saw_ok = true;
@@ -531,7 +547,6 @@ mod unix_targets {
 
         *stop.lock().unwrap() = true;
         writer.join().unwrap();
-        // The file exists between churn cycles, so a correct reader converges.
         assert!(
             saw_ok,
             "delete/recreate churn must still reach a stable generation"
