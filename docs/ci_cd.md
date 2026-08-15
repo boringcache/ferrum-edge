@@ -283,11 +283,13 @@ policy/key-admission/handshake tests share two cache layers:
   `add-job-id-key` wiring). Automatic toolchain, environment, manifest, and
   lockfile hashing stays enabled. This layer is **not** SHA-scoped, so
   AWS-LC/compiler work stays warm across commits. `fips-compile` may save it
-  (`save-if` false for fork PRs); `fips-clippy` and `fips-test` restore it
-  with `save-if: false` and never publish.
+  (`save-if` false for fork PRs); `fips-claimed-checks` and `fips-clippy`
+  restore it with `save-if: false` and never publish. The test job does not
+  restore build caches.
 - **Exact producer channel.** After a successful compile, `fips-compile`
   precompiles the complete FIPS `unit_tests` and `integration_tests`
-  executables, records their exact paths in the archive, then saves
+  executables, stages digest-bound copies in an immutable same-run artifact,
+  then saves
   `${{ github.workspace }}/target` and
   `.cache/sccache` with `actions/cache/save` under
   `fips-producer-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}`.
@@ -295,17 +297,23 @@ policy/key-admission/handshake tests share two cache layers:
   exact-hit skip cannot trap newly warmed outputs. On a full workflow rerun,
   compile first restores the newest prior attempt under the same SHA+`run_id`
   prefix, so the whole gate—not only its consumers—uses the exact warm source.
-  A miss remains valid on the first attempt and on fork PRs. Clippy/test restore
-  the current producer key (with the same prefix fallback) and never save; the
-  filtered test commands validate the producer manifest and execute the
-  restored binaries directly, so fresh-checkout source mtimes cannot make Cargo
-  repeat their test-only compile/link work.
+  A miss remains valid on the first attempt and on fork PRs. Claimed-profile
+  checks and clippy restore the current producer key (with the same prefix
+  fallback) and never save. They run in parallel after the shorter compile
+  producer so the six claimed combinations cannot push that producer past the
+  hosted runner-loss window. The test job downloads only the attempt-scoped
+  artifact, rejects unexpected names, symlinks, path escapes, and SHA-256
+  mismatches, then executes the two binaries directly. Fresh-checkout source
+  mtimes therefore cannot make Cargo repeat test-only compile/link work.
   Trusted non-cold consumers fail closed if this-run producer output is missing.
   Fork pull requests restore only and cannot save; GitHub confines
   `pull_request` writes to `refs/pull/.../merge`, not the default branch.
 
-`force_cold_cache` skips every restore and save while still executing the live
-contracts. rust-cache `cache-on-failure` remains on the compile producer so
+`force_cold_cache` skips every cache restore and save while still executing the
+live contracts. The immutable same-run test artifact is transport, not a warm
+cache, so forced-cold and fork runs can execute the exact binaries produced by
+their own cold compile without publishing shared state. rust-cache
+`cache-on-failure` remains on the compile producer so
 ordinary failing jobs can publish stable dependency work when post-job cleanup
 still runs. The producer `actions/cache/save` is a main step after compile and
 before rust-cache's post cleanup, which strips workspace crates from `target/`

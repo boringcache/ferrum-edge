@@ -94,16 +94,20 @@ cross-commit fallback. After a successful compile, `fips-compile` publishes
 the full `target/` and `.cache/sccache` tree under
 `fips-producer-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}`.
 Before publishing, the producer also builds the complete FIPS `unit_tests` and
-`integration_tests` executables once and records their exact paths in the
-archive. The filtered test consumer validates that manifest and executes the
-restored binaries directly. It does not ask Cargo to revalidate fresh-checkout
-source mtimes and repeat test-only compile/link work; a runner-loss retry reuses
-those same exact-SHA executables.
+`integration_tests` executables once and publishes digest-bound copies through
+an immutable artifact scoped to that workflow run and attempt. The filtered
+test consumer rejects unexpected names, symlinks, path escapes, and SHA-256
+mismatches before executing those binaries directly. It does not ask Cargo to
+revalidate fresh-checkout source mtimes and repeat test-only compile/link work.
 On a full workflow rerun, `fips-compile` restores the newest prior attempt with
 the same SHA + `run_id` before rebuilding and publishes a fresh attempt key;
 the first attempt and fork PRs may miss this optional warm source.
-`fips-clippy` and `fips-test` restore the current producer key and do not save.
-Trusted non-cold consumers fail closed if the producer channel is missing.
+`fips-claimed-checks` and `fips-clippy` restore the current producer key and do
+not save. The six claimed combinations run separately and in parallel with
+clippy/tests after the shorter producer, keeping one cold job from accumulating
+the former hour-plus build/check/link sequence. Trusted non-cold cache consumers
+fail closed if the producer channel is missing. `fips-test` consumes only the
+same-run immutable artifact and never restores a build cache.
 The cache action holds the GitHub Actions cache credential inside the action process;
 PR-controlled `run:` steps never receive that credential. `setup-sccache`
 installs sccache from a checksum-pinned GitHub release and never invokes
@@ -112,14 +116,16 @@ into `GITHUB_ENV`). It activates only the checksum-verified executable by
 exact path (`FERRUM_SCCACHE_BIN` / `RUSTC_WRAPPER`) and persists
 `SCCACHE_GHA_ENABLED` empty. rust-cache `save-if`
 is false when `github.event.pull_request.head.repo.fork` is true on the
-compile producer, and always false on clippy/test, so fork pull
+compile producer, and always false on claimed checks/clippy, so fork pull
 requests restore and cannot save. Trusted compile runs keep `cache-on-failure`
 so ordinary failing jobs can publish stable dependency work when post-job
-cleanup still runs. The successful compile producer publishes before
-clippy/test start, so a downstream runner-loss retry can reuse it; abrupt loss
-of the producer cannot publish that producer's unsaved state. A `workflow_dispatch` input
-`force_cold_cache` skips restore and save so a hosted cold-cache run still proves every
-live assertion. Path planning is fail-closed: a missing or unknown trusted
+cleanup still runs. The successful compile producer publishes before claimed
+checks/clippy/test start, so a downstream runner-loss retry can reuse it;
+abrupt loss of the producer cannot publish that producer's unsaved state. A `workflow_dispatch` input
+`force_cold_cache` skips cache restore and save so a hosted cold-cache run still
+proves every live assertion. Its producer still sends the exact test binaries
+to its own test job through the attempt-scoped artifact; that same-run transport
+does not warm or publish a shared cache. Path planning is fail-closed: a missing or unknown trusted
 planner runs the compile gate rather than skipping it. Path planning reads a
 NUL-delimited `git diff --name-only --no-renames -z` listing so a hostile
 filename cannot evade a sensitive prefix. Every compiled `tests/` input is

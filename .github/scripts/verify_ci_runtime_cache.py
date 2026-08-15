@@ -756,6 +756,7 @@ def check_fips_producer_channel(
         failures,
     )
     compile_job = extract_job(workflow, "fips-compile")
+    claimed_job = extract_job(workflow, "fips-claimed-checks")
     clippy_job = extract_job(workflow, "fips-clippy")
     test_job = extract_job(workflow, "fips-test")
     compile_saves = [
@@ -819,15 +820,22 @@ def check_fips_producer_channel(
     restore_position = compile_job.find("Restore prior-attempt FIPS producer outputs")
     build_position = compile_job.find("Build the FIPS profile")
     test_build_position = compile_job.find("Precompile FIPS test binaries for consumers")
+    artifact_position = compile_job.find("Publish exact FIPS test executables")
     save_position = compile_job.find("Save FIPS producer compile outputs")
     require(
         restore_position >= 0
         and build_position >= 0
         and test_build_position >= 0
+        and artifact_position >= 0
         and save_position >= 0
-        and restore_position < build_position < test_build_position < save_position,
-        "fips-compile must restore the prior attempt, build the FIPS binary and "
-        "test executables, then save the refreshed producer",
+        and restore_position
+        < build_position
+        < test_build_position
+        < artifact_position
+        < save_position,
+        "fips-compile must restore the prior attempt before building the FIPS "
+        "binary and test executables, publish their same-run artifact, then save "
+        "the refreshed producer",
         failures,
     )
     require(
@@ -838,8 +846,18 @@ def check_fips_producer_channel(
     )
     require(
         "--message-format=json" in compile_job
-        and "target/fips-test-binaries.json" in compile_job,
-        "fips-compile must record the exact test executables in its producer archive",
+        and "fips-test-bundle" in compile_job
+        and '"sha256"' in compile_job,
+        "fips-compile must stage digest-bound exact test executables",
+        failures,
+    )
+    require(
+        "actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a"
+        in compile_job
+        and "if-no-files-found: error" in compile_job
+        and "fips-test-binaries-${{ github.run_id }}-${{ github.run_attempt }}"
+        in compile_job,
+        "fips-compile must publish a pinned, attempt-scoped exact-test artifact",
         failures,
     )
     if compile_saves:
@@ -867,8 +885,8 @@ def check_fips_producer_channel(
                 failures,
             )
     for job_body, job_name in (
+        (claimed_job, "fips-claimed-checks"),
         (clippy_job, "fips-clippy"),
-        (test_job, "fips-test"),
     ):
         restores = [
             step
@@ -957,6 +975,31 @@ def check_fips_producer_channel(
                 f"{job_name} rust-cache must not use the compile producer save-if",
                 failures,
             )
+
+    require(
+        "actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c"
+        in test_job
+        and "fips-test-binaries-${{ github.run_id }}-${{ github.run_attempt }}"
+        in test_job,
+        "fips-test must download the pinned immutable artifact from this run attempt",
+        failures,
+    )
+    require(
+        not any(
+            step_uses(step).startswith(CACHE_RESTORE)
+            or step_uses(step).startswith(CACHE_SAVE)
+            for step in job_steps(test_job)
+        ),
+        "fips-test must consume only the same-run artifact, not shared caches",
+        failures,
+    )
+    require(
+        "digest mismatch" in test_job
+        and "must not be a symlink" in test_job
+        and "candidate.relative_to(bundle)" in test_job,
+        "fips-test must fail closed on digest, symlink, or path-boundary violations",
+        failures,
+    )
 
 
 def check_rust_cache_fork_save_if(
@@ -1450,8 +1493,8 @@ def check_fips(workflow: str, failures: list[str]) -> None:
     )
     for job_body, job_name in (
         (extract_job(workflow, "fips-compile"), "fips-compile"),
+        (extract_job(workflow, "fips-claimed-checks"), "fips-claimed-checks"),
         (extract_job(workflow, "fips-clippy"), "fips-clippy"),
-        (extract_job(workflow, "fips-test"), "fips-test"),
     ):
         blocks = rust_cache_with_blocks(job_body)
         require(
@@ -1492,7 +1535,8 @@ def check_fips(workflow: str, failures: list[str]) -> None:
     require(
         workflow.count('sccache_bin="${FERRUM_SCCACHE_BIN:-}"') == 3
         and workflow.count('"$sccache_bin" --show-stats') == 3,
-        "FIPS compile/clippy/test must record sccache stats via FERRUM_SCCACHE_BIN",
+        "FIPS compile/claimed-checks/clippy must record sccache stats via "
+        "FERRUM_SCCACHE_BIN",
         failures,
     )
     require(
@@ -1591,14 +1635,22 @@ def check_fips(workflow: str, failures: list[str]) -> None:
         failures,
     )
     compile_job = extract_job(workflow, "fips-compile")
+    claimed_job = extract_job(workflow, "fips-claimed-checks")
     clippy_job = extract_job(workflow, "fips-clippy")
     aggregate = extract_job(workflow, "fips-build")
     require(bool(compile_job), "fips-compile job is missing", failures)
+    require(bool(claimed_job), "fips-claimed-checks job is missing", failures)
     require(bool(clippy_job), "fips-clippy job is missing", failures)
     require(bool(test_job), "fips-test job is missing", failures)
     require(
         "needs.fips-plan.outputs.relevant == 'true'" in compile_job,
         "fips-compile must be bound to the trusted planner",
+        failures,
+    )
+    require(
+        "needs: fips-compile" in claimed_job
+        or "needs:\n      - fips-compile" in claimed_job,
+        "fips-claimed-checks must wait for the compile cache to be saved",
         failures,
     )
     require(
@@ -1642,8 +1694,8 @@ def check_fips(workflow: str, failures: list[str]) -> None:
     check_no_sccache_credential_exporter(workflow, "fips-build.yml", failures)
     for job_body, job_name in (
         (compile_job, "fips-compile"),
+        (claimed_job, "fips-claimed-checks"),
         (clippy_job, "fips-clippy"),
-        (test_job, "fips-test"),
     ):
         check_credential_absence_assertion(job_body, job_name, failures)
         cargo_idx = job_body.find("cargo ")
@@ -1666,6 +1718,17 @@ def check_fips(workflow: str, failures: list[str]) -> None:
             f"{job_name} may still record rust-cache hit/miss from the action output",
             failures,
         )
+    check_credential_absence_assertion(test_job, "fips-test", failures)
+    require(
+        "cargo " not in test_job,
+        "fips-test must execute the immutable artifact without invoking Cargo",
+        failures,
+    )
+    require(
+        "needs.fips-claimed-checks.result != 'success'" in aggregate,
+        "FIPS aggregate must fail closed when claimed-profile checks fail",
+        failures,
+    )
 
 
 def check_production_smoke(workflow: str, failures: list[str]) -> None:
