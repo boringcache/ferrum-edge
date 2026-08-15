@@ -17,6 +17,11 @@ concurrency:
 permissions:
   contents: read
 
+# The scaling-gate-signal job below is the durable alert for a red weekly
+# run. A separate daily freshness workflow reuses the same publisher so a
+# stale (unrun) gate cannot stay silent. Both upsert a launch-blocker issue
+# and must not mention required check names in live YAML.
+
 env:
   CARGO_TERM_COLOR: always
   CARGO_NET_RETRY: "10"
@@ -46,6 +51,14 @@ jobs:
 
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
+        with:
+          persist-credentials: false
+
+      - name: Verify workflow contract (static)
+        run: |
+          python3 -I .github/scripts/verify_scaling_regression_workflow.py --self-test
+          python3 -I .github/scripts/verify_scaling_regression_workflow.py
+          python3 -I .github/scripts/publish_scaling_gate_signal.py --self-test
 
       - uses: ./.github/actions/setup-rust-ci
         with:
@@ -193,3 +206,26 @@ jobs:
           path: scaling-regression.log
           retention-days: 30
           if-no-files-found: ignore
+
+  scaling-gate-signal:
+    name: Scaling gate signal
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    needs: [scaling-regression]
+    if: always()
+    permissions:
+      contents: read
+      actions: read
+      issues: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
+        with:
+          persist-credentials: false
+
+      - name: Publish scaling gate signal
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          SCALING_JOB_RESULT: ${{ needs.scaling-regression.result }}
+        run: |
+          python3 -I .github/scripts/publish_scaling_gate_signal.py --self-test
+          python3 -I .github/scripts/publish_scaling_gate_signal.py

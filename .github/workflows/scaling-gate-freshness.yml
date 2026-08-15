@@ -1,0 +1,46 @@
+name: Scheduled Scaling Gate Freshness
+
+# Daily fail-closed check that the weekly Scheduled Scaling Regression gate
+# last succeeded on main within eight days. Reuses the same issue publisher
+# as scaling-regression.yml so a red streak or a silently skipped/disabled
+# schedule cannot look launch-ready. Does not run the 10k/30k suites.
+
+on:
+  schedule:
+    # 12:00 UTC sits after the Saturday 04:00 scaling matrix (180-minute
+    # timeout ends by 07:00) and uses a distinct concurrency group.
+    - cron: "0 12 * * *"
+  workflow_dispatch:
+
+concurrency:
+  group: scaling-gate-freshness
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  scaling-gate-freshness:
+    name: Scaling gate freshness
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      actions: read
+      issues: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
+        with:
+          persist-credentials: false
+
+      - name: Verify scaling-gate contracts (static)
+        run: |
+          python3 -I .github/scripts/verify_scaling_regression_workflow.py --self-test
+          python3 -I .github/scripts/verify_scaling_regression_workflow.py
+          python3 -I .github/scripts/publish_scaling_gate_signal.py --self-test
+
+      - name: Publish scaling gate freshness
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          SCALING_JOB_RESULT: skipped
+        run: python3 -I .github/scripts/publish_scaling_gate_signal.py
