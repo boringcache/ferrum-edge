@@ -20,25 +20,33 @@ name: FIPS Build Policy
 #      whenever `shared-key` is set and must not appear). Automatic
 #      toolchain/env/manifest/lock hashing stays enabled. This layer is NOT
 #      SHA-scoped, so dependency/compiler work stays warm across commits.
-#    - Exact producer channel: `actions/cache` key
+#    - Exact same-run producer channel: `actions/cache` key
 #      `fips-producer-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}`.
-#      Compile restores the newest prior attempt for the same SHA + run_id,
-#      then saves the current attempt after a successful profile build as a
-#      main step, before rust-cache's post cleanup. A new attempt always gets
-#      a fresh key, so GitHub's immutable exact-hit skip cannot trap newly
-#      warmed outputs.
-#    Fork pull requests restore both layers and cannot save. `force_cold_cache`
-#    skips every restore and save. Abrupt loss of the producer cannot publish
-#    that producer's unsaved state.
+#      Saved after a successful profile build as a main step, before rust-cache's
+#      post cleanup, for this-attempt claimed/clippy/test-build consumers. A new
+#      attempt always gets a fresh key, so GitHub's immutable exact-hit skip
+#      cannot trap newly warmed outputs.
+#    Compile restores the newest prior-attempt late handoff for the same SHA +
+#    run_id (see job 4) as the cross-attempt warm source. A miss remains valid
+#    on the first attempt and on fork PRs. Fork pull requests restore both
+#    layers and cannot save. `force_cold_cache` skips every restore and save.
+#    Abrupt loss of the producer cannot publish that producer's unsaved state.
 # 4. `fips-claimed-checks`, `fips-clippy`, and `fips-test-build` restore the
-#    same producer key (consumers; rust-cache `save-if: false` and no producer
-#    save). Trusted non-cold runs fail closed if this-run producer output is
-#    missing. restore-keys keep
+#    same-run producer key (consumers; rust-cache `save-if: false` and no
+#    producer save). Trusted non-cold runs fail closed if this-run producer
+#    output is missing. restore-keys keep
 #    `fips-producer-${{ github.sha }}-${{ github.run_id }}-` so a failed-job
-#    rerun can reuse a prior attempt of the same run. `fips-test-build`
-#    precompiles the complete unit_tests and integration_tests executables and
-#    publishes digest-bound copies as an immutable same-run artifact, overlapping
-#    claimed-profile and clippy work after the shorter build-only producer.
+#    rerun of a consumer can reuse a prior attempt of the same run.
+#    `fips-test-build` precompiles the complete unit_tests and integration_tests
+#    executables and publishes digest-bound copies as an immutable same-run
+#    artifact, overlapping claimed-profile and clippy work after the shorter
+#    build-only producer. After that staged bundle is removed, a trusted
+#    non-fork, non-cold success saves the late cross-attempt handoff under
+#    `fips-handoff-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}`.
+#    Saving after the last heavyweight target-producing job keeps that archive
+#    fresh against GitHub's LRU eviction from later ordinary CI caches, so the
+#    next full-workflow rerun's `fips-compile` can restore it via the matching
+#    SHA + run_id prefix. Fork PRs and `force_cold_cache` never publish it.
 # 5. `fips-test` downloads only the immutable same-run test artifact and
 #    validates its manifest/digests before direct execution. This transport is
 #    available on forced-cold and fork runs without publishing shared cache.
@@ -78,9 +86,19 @@ env:
   # Exact compile-to-consumer channel. Unique per SHA + workflow run + attempt
   # so a source-only change can publish freshly warmed Cargo/target/AWS-LC/
   # sccache state. restore-keys use the SHA+run_id prefix (no attempt) so a
-  # failed-job rerun can reuse a prior successful compile in the same run.
+  # failed-job rerun of a consumer can reuse a prior successful compile in the
+  # same run. This early save is not the cross-attempt warm source: later
+  # ordinary CI caches can LRU-evict it before the next full-workflow rerun.
   FIPS_PRODUCER_KEY: fips-producer-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
   FIPS_PRODUCER_RESTORE_PREFIX: fips-producer-${{ github.sha }}-${{ github.run_id }}-
+  # Late cross-attempt handoff. Unique per SHA + workflow run + attempt and
+  # saved by fips-test-build after the staged test bundle is removed, so the
+  # archive is still fresh when the next attempt's fips-compile restores the
+  # SHA+run_id prefix. Distinct from fips-producer-* so same-run consumers
+  # cannot accidentally consume the late key, and compile cannot restore a
+  # different SHA or run_id lineage.
+  FIPS_HANDOFF_KEY: fips-handoff-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
+  FIPS_HANDOFF_RESTORE_PREFIX: fips-handoff-${{ github.sha }}-${{ github.run_id }}-
 
 jobs:
   feature-policy:
@@ -342,36 +360,37 @@ jobs:
             --note "layer=stable-fallback; measured=sccache-directory-subset; rust-cache Cargo/target archive bytes are not exposed; shared-key=ci-fips-contract save-if=non-fork fork=${FORK_PR:-false}"
 
       # A full workflow rerun has a new run_attempt but the same SHA + run_id.
-      # Restore the previous successful producer as the warm source for this
-      # producer too; otherwise only clippy/tests consume the exact archive and
-      # every alleged warm gate recompiles the producer from the pruned stable
-      # fallback. A miss is valid on the first attempt and on fork PRs.
-      - name: Restore prior-attempt FIPS producer outputs
+      # Restore the previous attempt's late handoff (saved by fips-test-build
+      # after the staged test bundle was removed) as the warm source for this
+      # producer. The early same-run producer is often LRU-evicted by later
+      # ordinary CI caches before that rerun starts. A miss is valid on the
+      # first attempt and on fork PRs. restore-keys stay on this SHA + run_id.
+      - name: Restore prior-attempt FIPS handoff outputs
         if: github.event.inputs.force_cold_cache != 'true'
-        id: prior-fips-producer
+        id: prior-fips-handoff
         uses: actions/cache/restore@374a27f26986edd8c430f386d152a856e179c0ae # v4.2.4
         with:
           path: |
             ${{ github.workspace }}/target
             ${{ github.workspace }}/.cache/sccache
-          key: ${{ env.FIPS_PRODUCER_KEY }}
+          key: ${{ env.FIPS_HANDOFF_KEY }}
           restore-keys: |
-            ${{ env.FIPS_PRODUCER_RESTORE_PREFIX }}
+            ${{ env.FIPS_HANDOFF_RESTORE_PREFIX }}
 
-      - name: Record prior-attempt FIPS producer restore
+      - name: Record prior-attempt FIPS handoff restore
         if: github.event.inputs.force_cold_cache != 'true'
         env:
-          CACHE_HIT: ${{ steps.prior-fips-producer.outputs.cache-hit }}
-          CACHE_MATCHED: ${{ steps.prior-fips-producer.outputs.cache-matched-key }}
-          CACHE_PRIMARY: ${{ steps.prior-fips-producer.outputs.cache-primary-key }}
+          CACHE_HIT: ${{ steps.prior-fips-handoff.outputs.cache-hit }}
+          CACHE_MATCHED: ${{ steps.prior-fips-handoff.outputs.cache-matched-key }}
+          CACHE_PRIMARY: ${{ steps.prior-fips-handoff.outputs.cache-primary-key }}
         run: |
           python3 .github/scripts/ci_runtime_telemetry.py classify-restore \
-            --name prior-fips-producer \
+            --name prior-fips-handoff \
             --hit "$CACHE_HIT" \
             --matched "$CACHE_MATCHED" \
             --primary "$CACHE_PRIMARY" \
             --path "${GITHUB_WORKSPACE}/target" \
-            --note "layer=producer-warm-source; measured=target-directory; optional prior-attempt restore for the same sha+run_id"
+            --note "layer=cross-attempt-handoff; measured=target-directory; optional prior-attempt restore for the same sha+run_id"
 
       - name: Record cold-cache proof
         if: github.event.inputs.force_cold_cache == 'true'
@@ -382,10 +401,15 @@ jobs:
             --bytes 0 \
             --note "layer=stable-fallback; force_cold_cache skipped restore"
           python3 .github/scripts/ci_runtime_telemetry.py cache \
+            --name prior-fips-handoff \
+            --hit false \
+            --bytes 0 \
+            --note "layer=cross-attempt-handoff; force_cold_cache skipped restore"
+          python3 .github/scripts/ci_runtime_telemetry.py cache \
             --name fips-producer \
             --hit false \
             --bytes 0 \
-            --note "layer=producer; force_cold_cache skipped restore and save"
+            --note "layer=producer; force_cold_cache skipped save"
 
       - name: Assert cache-service credentials are absent
         run: |
@@ -876,6 +900,11 @@ jobs:
             --hit false \
             --bytes 0 \
             --note "layer=producer; force_cold_cache skipped restore"
+          python3 .github/scripts/ci_runtime_telemetry.py cache \
+            --name fips-handoff \
+            --hit false \
+            --bytes 0 \
+            --note "layer=cross-attempt-handoff; force_cold_cache skipped save"
 
       - name: Require this-run FIPS producer cache
         if: github.event.inputs.force_cold_cache != 'true' && github.event.pull_request.head.repo.fork != true
@@ -1009,6 +1038,22 @@ jobs:
 
       - name: Remove staged FIPS test artifact
         run: rm -rf "${GITHUB_WORKSPACE}/target/fips-test-bundle"
+
+      # Late cross-attempt handoff: full workspace target + sccache after the
+      # last heavyweight target-producing job succeeds and the staged test
+      # bundle is gone. Unique sha/run_id/run_attempt avoids immutable exact-hit
+      # collisions. Saved as a main step so a failed producer cannot publish,
+      # and after the consumer tail of this job so GitHub's LRU still sees the
+      # archive as fresh for the next full-workflow rerun. Fork PRs and
+      # force_cold_cache never publish it.
+      - name: Save FIPS cross-attempt handoff
+        if: github.event.inputs.force_cold_cache != 'true' && github.event.pull_request.head.repo.fork != true
+        uses: actions/cache/save@374a27f26986edd8c430f386d152a856e179c0ae # v4.2.4
+        with:
+          path: |
+            ${{ github.workspace }}/target
+            ${{ github.workspace }}/.cache/sccache
+          key: ${{ env.FIPS_HANDOFF_KEY }}
 
       - name: Record sccache stats
         if: always()
@@ -1217,7 +1262,10 @@ jobs:
             echo "Compile published this-run producer cache "
             echo "(sha + run_id + run_attempt) after the locked fips profile "
             echo "build. Claimed checks, clippy, and test-binary compile restored "
-            echo "that exact channel in parallel. Tests executed digest-bound "
+            echo "that exact same-run channel in parallel. fips-test-build then "
+            echo "saved the late cross-attempt handoff after removing the staged "
+            echo "test bundle, so the next attempt's compile can restore the "
+            echo "same sha + run_id lineage. Tests executed digest-bound "
             echo "binaries from the immutable same-run artifact published by "
             echo "fips-test-build. Stable rust-cache remains the cross-commit "
             echo "fallback."

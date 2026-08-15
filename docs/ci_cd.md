@@ -272,7 +272,7 @@ inside `<code>` so a hostile name cannot break Markdown.
 
 **FIPS.** `FIPS Feature Policy` stays a cheap always-on graph audit.
 Compile, claimed-profile `cargo check`, clippy `-D warnings`, and the
-policy/key-admission/handshake tests share two cache layers:
+policy/key-admission/handshake tests share three cache layers:
 
 - **Stable rust-cache fallback.** `shared-key` is
   `ci-fips-contract-${{ hashFiles(...) }}` over the manifest/lockfile, Cargo
@@ -286,31 +286,47 @@ policy/key-admission/handshake tests share two cache layers:
   (`save-if` false for fork PRs); the three ordinal `fips-claimed-checks`
   shards, `fips-clippy`, and `fips-test-build` restore it with `save-if: false`
   and never publish. The test job does not restore build caches.
-- **Exact producer channel.** After a successful locked `fips` profile build,
-  `fips-compile` saves
+- **Exact same-run producer channel.** After a successful locked `fips` profile
+  build, `fips-compile` saves
   `${{ github.workspace }}/target` and
   `.cache/sccache` with `actions/cache/save` under
   `fips-producer-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}`.
   That key is unique per head and workflow-run attempt, so GitHub's immutable
-  exact-hit skip cannot trap newly warmed outputs. On a full workflow rerun,
-  compile first restores the newest prior attempt under the same SHA+`run_id`
-  prefix, so the whole gate—not only its consumers—uses the exact warm source.
-  A miss remains valid on the first attempt and on fork PRs. The three
-  claimed-profile shards, clippy, and `fips-test-build` restore the current
-  producer key (with the same prefix fallback) and never save. Each claimed
-  shard filters the policy checker's single inventory by ordinal modulo three
-  and fails closed if it selects no profile. Those consumers run in parallel
-  after the build-only compile producer, so test-binary precompile no longer
-  sits on the claimed-profile/clippy critical path. `fips-test-build`
-  precompiles the complete FIPS `unit_tests` and `integration_tests`
-  executables and stages digest-bound copies in an immutable same-run artifact.
-  The test job downloads only the attempt-scoped artifact, rejects unexpected
-  names, symlinks, path escapes, and SHA-256 mismatches, then executes the two
-  binaries directly. Fresh-checkout source mtimes therefore cannot make Cargo
-  repeat test-only compile/link work. Trusted non-cold consumers fail closed if
-  this-run producer output is missing. Fork pull requests restore only and
-  cannot save; GitHub confines `pull_request` writes to `refs/pull/.../merge`,
-  not the default branch.
+  exact-hit skip cannot trap newly warmed outputs. The three claimed-profile
+  shards, clippy, and `fips-test-build` restore the current producer key (with
+  the same SHA+`run_id` prefix fallback) and never save this channel. Each
+  claimed shard filters the policy checker's single inventory by ordinal modulo
+  three and fails closed if it selects no profile. Those consumers run in
+  parallel after the build-only compile producer, so test-binary precompile no
+  longer sits on the claimed-profile/clippy critical path. This early save is
+  for same-attempt compile-to-consumer reuse only. GitHub's cache LRU can
+  evict it during the consumer tail when later ordinary CI jobs write more
+  than the remaining cache budget (tens of GiB of newer entries have dropped
+  this key before the next full-workflow rerun).
+- **Late cross-attempt handoff.** After `fips-test-build` precompiles the
+  complete FIPS `unit_tests` and `integration_tests` executables, publishes
+  digest-bound copies as an immutable same-run artifact, and removes the
+  staged bundle, a trusted non-fork, non-cold success saves the same
+  `target/` + `.cache/sccache` tree under
+  `fips-handoff-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}`.
+  That key is distinct from `fips-producer-*`. Saving after the last
+  heavyweight target-producing job keeps the archive fresh against the
+  eviction window above. On a full workflow rerun, `fips-compile` restores
+  the newest prior attempt under the matching SHA+`run_id` prefix
+  (`fips-handoff-${{ github.sha }}-${{ github.run_id }}-`) and classifies the
+  action outputs as exact / partial / miss; it does not treat an empty restore
+  as a hit. A miss remains valid on the first attempt and on fork PRs. Fork
+  pull requests and `force_cold_cache` never publish this handoff.
+
+`fips-test-build` precompiles the complete FIPS `unit_tests` and
+`integration_tests` executables and stages digest-bound copies in an
+immutable same-run artifact. The test job downloads only the attempt-scoped
+artifact, rejects unexpected names, symlinks, path escapes, and SHA-256
+mismatches, then executes the two binaries directly. Fresh-checkout source
+mtimes therefore cannot make Cargo repeat test-only compile/link work.
+Trusted non-cold consumers fail closed if this-run producer output is
+missing. Fork pull requests restore only and cannot save; GitHub confines
+`pull_request` writes to `refs/pull/.../merge`, not the default branch.
 
 `force_cold_cache` skips every cache restore and save while still executing the
 live contracts. The immutable same-run test artifact is transport, not a warm
@@ -323,13 +339,15 @@ profile build and
 before rust-cache's post cleanup, which strips workspace crates from `target/`
 before saving the stable fallback. Example plugins stay out of the FIPS
 artifact (`FERRUM_CUSTOM_PLUGINS` is unset). Job summaries record rust-cache
-hit/miss from the action output as **stable fallback**, and producer restore
-as **exact / partial (same run_id) / miss** via `classify-restore`. Measured
+hit/miss from the action output as **stable fallback**, producer restore
+as **exact / partial (same run_id) / miss** via `classify-restore`, and the
+optional prior-attempt handoff restore as **exact / partial (same run_id) /
+miss** on the same classifier (never as a fabricated hit). Measured
 restored bytes are the sccache-directory subset for rust-cache and the
-on-disk `target/` directory for the producer archive; rust-cache Cargo/target
-archive bytes are not exposed. The required `FIPS Build & Test` aggregate
-depends on `fips-test-build` and fails closed if that test-binary producer
-does not succeed.
+on-disk `target/` directory for the producer and handoff archives; rust-cache
+Cargo/target archive bytes are not exposed. The required `FIPS Build & Test`
+aggregate depends on `fips-test-build` and fails closed if that test-binary
+producer does not succeed.
 
 **Trust boundary.** Untrusted `run:` steps never receive GitHub Actions cache
 write credentials. `setup-sccache` installs a checksum-pinned
