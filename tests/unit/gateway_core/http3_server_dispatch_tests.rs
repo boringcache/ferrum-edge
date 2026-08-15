@@ -1488,6 +1488,24 @@ async fn ready_h3_post_deadline_terminal_write_completes_within_grace() {
     );
 }
 
+#[test]
+fn native_h3_upload_expiry_terminal_uses_post_deadline_grace() {
+    let server = include_str!("../../../src/http3/server.rs");
+    let finalizer = server
+        .split("async fn finalize_h3_upload_deadline_rejection(")
+        .nth(1)
+        .expect("native H3 upload deadline finalizer")
+        .split("async fn send_h3_plugin_reject_flavor_aware(")
+        .next()
+        .expect("bounded native H3 upload deadline finalizer");
+
+    assert!(finalizer.contains("send_h3_plugin_reject_flavor_aware_with_recv_halt("));
+    assert!(
+        finalizer.contains("&reject.headers,\n        false,"),
+        "an expired upload must defer STOP_SENDING so the rejection write uses the post-deadline grace"
+    );
+}
+
 #[tokio::test(start_paused = true)]
 async fn stalled_h3_post_deadline_terminal_write_expires_grace() {
     let task = ferrum_edge::_test_support::spawn_stalled_h3_post_deadline_terminal_write_for_test();
