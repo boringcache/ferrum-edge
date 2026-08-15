@@ -353,9 +353,7 @@ async fn wait_for_h2_bridge_ready(harness: &GatewayHarness, timeout: Duration) -
         if let Some(entry) = fetch_capability_entry(harness).await {
             let h3 = entry["plain_http"]["h3"].as_str();
             let h2_tls = entry["plain_http"]["h2_tls"].as_str();
-            if h2_tls == Some("supported")
-                && matches!(h3, Some("unsupported") | Some("unknown"))
-            {
+            if h2_tls == Some("supported") && matches!(h3, Some("unsupported") | Some("unknown")) {
                 return Some(entry);
             }
         }

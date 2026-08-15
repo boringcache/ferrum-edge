@@ -1796,11 +1796,9 @@ fn h3_grpc_relays_charge_offered_data_before_awaiting_send_data() {
             .unwrap_or_else(|| {
                 panic!("{macro_name} must charge offered DATA when send_data is polled")
             });
-        let raced = macro_body
-            .find("let write = async")
-            .unwrap_or_else(|| {
-                panic!("{macro_name} must race a polled wrapper so unpolled writes stay pre-DATA")
-            });
+        let raced = macro_body.find("let write = async").unwrap_or_else(|| {
+            panic!("{macro_name} must race a polled wrapper so unpolled writes stay pre-DATA")
+        });
         assert!(
             raced < offer,
             "{macro_name} must charge offered DATA inside the raced write future, not before it \
