@@ -42,16 +42,45 @@
 //! points at with `FERRUM_MESH_STOCK_XDS_TOKEN_FILE` (typically a projected
 //! Kubernetes service-account token); with no token file configured the stream
 //! carries no `authorization` metadata and relies on gRPC TLS alone.
+//!
+//! ## Transport and credential admission
+//!
+//! Two fail-closed boundaries wrap that credential:
+//!
+//! * [`super::stock_xds_transport`] (issue #3853) admits the COMPLETE
+//!   primary/fallback endpoint set as one security posture before any socket is
+//!   opened, and the `authorization` interceptor below re-checks the selected
+//!   endpoint's classification at the insertion boundary so a bearer can never
+//!   ride an unauthenticated channel even if top-level admission were bypassed.
+//! * [`super::stock_xds_credential`] (issue #3852) gives the stream a finite
+//!   local authorization lifetime: the source is watched for rotation and
+//!   invalidation, and every stream carries a deadline derived from a bounded
+//!   local `exp` hint or the operator-visible maximum stream lifetime.
+//!
+//! Attempt classification, endpoint rotation, backoff, and transport keepalive
+//! are the shared [`super::stream_lifecycle`] policy (issue #3854).
+//!
+//! ## Log redaction
+//!
+//! A bearer-authenticated stock control plane sees the Authorization metadata
+//! and can copy that bearer into any ADS response field. Ferrum logs on this
+//! path therefore carry only closed-set type labels (`cds`/`eds`/`lds`/`rds`/
+//! `sds`/`unsolicited`/`policy_reload`), fixed reason codes, counts, booleans,
+//! endpoint indexes, and local node/namespace fields. Remote `type_url`,
+//! `version_info`, `nonce`, resource names, NACK error text, and refusal
+//! detail are omitted. Truncation is not redaction; NACK `error_detail` may
+//! still return a bounded copy of the CP's own fields to that same CP.
 
 use std::collections::{BTreeMap, HashMap};
+use std::future::Future;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, OnceLock};
+use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
 use std::time::Duration;
 
 use prost::Message;
-use tokio::sync::{Semaphore, mpsc};
+use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
-use tonic::metadata::MetadataValue;
 use tonic::transport::Channel;
 use tracing::{debug, error, info, warn};
 
@@ -67,6 +96,18 @@ use super::file_source::{
     mark_mesh_local_reload_rejected, normalized_mesh_gateway_config, read_mesh_config_document,
     run_mesh_local_reload_loop,
 };
+use super::stock_xds_credential::{
+    StockBearerCredential, StockCredentialInvalidReason, StockCredentialObservation,
+    StockCredentialReadEpoch, StockCredentialState, StockCredentialWatch, StockXdsCredentialSource,
+};
+use super::stock_xds_transport::{
+    StockXdsTransport, StockXdsTransportPolicy, admit_stock_xds_endpoints,
+    classify_stock_xds_endpoint,
+};
+use super::stream_lifecycle::{
+    MeshStreamAttachment, MeshStreamAttempt, MeshStreamRetirement, MeshStreamTimings,
+    MeshStreamTracker, configure_mesh_config_stream_endpoint, reconnect_backoff_after_attempt,
+};
 use crate::grpc::dp_client::{DpGrpcTlsConfig, DpGrpcTlsReload};
 use crate::modes::mesh::config::MeshConfig;
 use crate::modes::mesh::runtime::{MeshRuntimeState, MeshSliceInstall, XdsConvergenceSnapshot};
@@ -74,10 +115,7 @@ use crate::modes::mesh::slice::{MeshSlice, MeshSliceRequest};
 use crate::xds::proto::aggregated_discovery_service_client::AggregatedDiscoveryServiceClient;
 use crate::xds::proto::{self, DiscoveryRequest, Node, Status};
 use crate::xds::runtime_proto;
-use crate::xds::stock::{
-    StockDiscovery, StockRefusal, StockXdsAccumulator, StockXdsLimits, diagnostic_value,
-    refuse_stock_secret,
-};
+use crate::xds::stock::{StockDiscovery, StockRefusal, StockXdsAccumulator, StockXdsLimits};
 use crate::xds::translator::{
     CDS_TYPE_URL, EDS_TYPE_URL, LDS_TYPE_URL, RDS_TYPE_URL, SDS_TYPE_URL,
 };
@@ -89,23 +127,14 @@ const STOCK_INITIAL_TYPE_URL_ORDER: [&str; 2] = [CDS_TYPE_URL, LDS_TYPE_URL];
 const STOCK_APPLY_DEBOUNCE: Duration = Duration::from_millis(25);
 const STOCK_APPLY_MAX_DELAY: Duration = Duration::from_millis(500);
 const STOCK_CONSECUTIVE_NACK_LIMIT: u32 = 5;
-/// Bound the complete stock bearer-token admission attempt, including waiting
-/// for an earlier timed-out reader to leave the kernel.
-const STOCK_XDS_TOKEN_FILE_READ_TIMEOUT: Duration = Duration::from_secs(5);
 /// Maximum distinct refusals logged per apply. Refusals are bounded input from
 /// the control plane, so the log line is capped rather than unbounded.
 const STOCK_REFUSAL_LOG_LIMIT: usize = 12;
 
-/// A timed-out mount read may keep its detached OS thread blocked. The permit
-/// moves into that thread, so repeated ADS reconnects cannot accumulate more
-/// blocked readers while the same credential source remains unavailable.
-static STOCK_XDS_TOKEN_FILE_READ_LIMIT: OnceLock<Arc<Semaphore>> = OnceLock::new();
+/// Fixed-cardinality protocol label for the shared stream lifecycle.
+pub(crate) const STOCK_XDS_PROTOCOL_LABEL: &str = "stock_xds";
 
-pub(crate) fn stock_xds_token_file_read_limit() -> Arc<Semaphore> {
-    Arc::clone(STOCK_XDS_TOKEN_FILE_READ_LIMIT.get_or_init(|| Arc::new(Semaphore::new(1))))
-}
-
-pub(crate) type BearerToken = MetadataValue<tonic::metadata::Ascii>;
+pub use super::stock_xds_credential::BearerToken;
 
 /// Stock ADS client settings.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -122,14 +151,30 @@ pub struct StockXdsClientConfig {
     /// Flat string metadata encoded into `Node.metadata` as a
     /// `google.protobuf.Struct`.
     pub node_metadata: BTreeMap<String, String>,
-    /// Path to an externally issued bearer token presented to the stock CP.
-    /// `None` sends no `authorization` metadata.
-    pub token_file: Option<String>,
+    /// Externally issued bearer credential presented to the stock CP, with its
+    /// finite authorization lifetime policy (issue #3852). An unconfigured
+    /// source sends no `authorization` metadata.
+    pub credential: StockXdsCredentialSource,
+    /// `FERRUM_MESH_STOCK_XDS_ALLOW_PLAINTEXT` — the loopback-only development
+    /// switch (issue #3853). Never compatible with a bearer credential and
+    /// always refused under `FERRUM_MESH_PRODUCTION_MODE=true`.
+    pub allow_loopback_plaintext: bool,
     pub stream_channel_capacity: usize,
     pub primary_retry_secs: u64,
     /// Client connection timeout. `0` disables tonic's explicit connect timeout.
+    /// Transport keepalive is applied regardless — it is what bounds an already
+    /// established stream.
     pub connect_timeout_seconds: u64,
     pub limits: StockXdsLimits,
+    /// Per-invocation stream timing policy. Production uses
+    /// [`MeshStreamTimings::production`]; tests may compress it.
+    pub timings: MeshStreamTimings,
+}
+
+impl StockXdsClientConfig {
+    fn transport_policy(&self) -> StockXdsTransportPolicy {
+        StockXdsTransportPolicy::from_runtime(&self.credential, self.allow_loopback_plaintext)
+    }
 }
 
 /// Load and validate the local mesh policy document that backs the stock
@@ -462,7 +507,266 @@ struct StockStreamState {
 
 // ── client entry point ───────────────────────────────────────────────────
 
+/// How one stock ADS attempt ended, with the diagnostic that produced it.
+struct StockAttemptOutcome {
+    attempt: MeshStreamAttempt,
+    /// Bounded, closed-set diagnostic. NEVER a control-plane-supplied status
+    /// message, a tonic transport error (which can echo the configured URI or
+    /// host), a token, a claim, or a credential path.
+    reason: Option<&'static str>,
+    /// True when the accumulated discovery/subscription state this attempt
+    /// touched must be thrown away before the next stream opens (issue #3852:
+    /// nothing a retired credential produced may survive into the stream that
+    /// replaces it).
+    reset_discovery_state: bool,
+    /// Whether THIS attempt installed usable configuration. Distinct from the
+    /// runtime's last-good `has_first_slice`, which may be leftover from
+    /// another stream.
+    delivered_usable_state: bool,
+}
+
+impl StockAttemptOutcome {
+    fn local(reason: MeshStreamRetirement) -> Self {
+        Self {
+            attempt: MeshStreamAttempt::LocalRetirement(reason),
+            reason: None,
+            reset_discovery_state: reason.is_credential_retirement(),
+            delivered_usable_state: false,
+        }
+    }
+
+    fn local_with_reason(retirement: MeshStreamRetirement, reason: &'static str) -> Self {
+        Self {
+            attempt: MeshStreamAttempt::LocalRetirement(retirement),
+            reason: Some(reason),
+            reset_discovery_state: retirement.is_credential_retirement(),
+            delivered_usable_state: false,
+        }
+    }
+
+    fn ended(attempt: MeshStreamAttempt, delivered_usable_state: bool) -> Self {
+        Self {
+            attempt,
+            reason: None,
+            reset_discovery_state: false,
+            delivered_usable_state,
+        }
+    }
+
+    fn failed(attempt: MeshStreamAttempt, reason: &'static str) -> Self {
+        Self {
+            attempt,
+            reason: Some(reason),
+            reset_discovery_state: false,
+            delivered_usable_state: false,
+        }
+    }
+}
+
+/// A stock ADS stream failure, split by whether the ENDPOINT misbehaved or its
+/// content was refused by a local fail-closed gate. Both rotate and back off,
+/// but the distinction is what the operator-facing reason label reports.
+///
+/// The payload is a `&'static str` on purpose: a third-party control plane
+/// controls `Status::message()` and could echo the bearer straight back into
+/// it, and a tonic transport error can render the configured URI.
+enum StockStreamError {
+    /// The streaming RPC itself was refused; nothing was ever established.
+    SubscriptionRefused(&'static str),
+    /// An ESTABLISHED stream failed. Reported distinctly so `/health` can say
+    /// `stream_liveness_failed` — this is the shape an HTTP/2 PING-ack failure
+    /// against a blackholed transport takes.
+    Transport(&'static str),
+    /// A local fail-closed gate refused the content.
+    Policy(&'static str),
+    /// An already-observed or newly arriving credential retirement won over an
+    /// awaited outbound enqueue. Must not be mislabelled as a transport
+    /// failure: the next stream has to discard discovery state touched under
+    /// the retired credential.
+    Retirement(MeshStreamRetirement),
+}
+
+impl StockStreamError {
+    fn into_outcome(self, delivered_usable_state: bool) -> StockAttemptOutcome {
+        let mut outcome = match self {
+            Self::SubscriptionRefused(reason) => StockAttemptOutcome::failed(
+                MeshStreamAttempt::TransportFailure {
+                    delivered_usable_state,
+                    after_established: false,
+                },
+                reason,
+            ),
+            Self::Transport(reason) => StockAttemptOutcome::failed(
+                MeshStreamAttempt::TransportFailure {
+                    delivered_usable_state,
+                    after_established: true,
+                },
+                reason,
+            ),
+            Self::Policy(reason) => {
+                StockAttemptOutcome::failed(MeshStreamAttempt::PolicyRejected, reason)
+            }
+            Self::Retirement(retirement) => StockAttemptOutcome::local(retirement),
+        };
+        outcome.delivered_usable_state = delivered_usable_state;
+        outcome
+    }
+}
+
+/// Bounded, closed-set category for a gRPC status from a control plane Ferrum
+/// does not own.
+///
+/// Only the canonical code reaches a log line or an error. `Status::message()`,
+/// `Status::details()`, and the trailing metadata are all remote-authored: a
+/// hostile (or merely careless) control plane could echo the bearer token back
+/// in any of them, and Ferrum would then write the credential to its own logs.
+fn grpc_status_category(status: &tonic::Status) -> &'static str {
+    match status.code() {
+        tonic::Code::Ok => "grpc_ok",
+        tonic::Code::Cancelled => "grpc_cancelled",
+        tonic::Code::Unknown => "grpc_unknown",
+        tonic::Code::InvalidArgument => "grpc_invalid_argument",
+        tonic::Code::DeadlineExceeded => "grpc_deadline_exceeded",
+        tonic::Code::NotFound => "grpc_not_found",
+        tonic::Code::AlreadyExists => "grpc_already_exists",
+        tonic::Code::PermissionDenied => "grpc_permission_denied",
+        tonic::Code::ResourceExhausted => "grpc_resource_exhausted",
+        tonic::Code::FailedPrecondition => "grpc_failed_precondition",
+        tonic::Code::Aborted => "grpc_aborted",
+        tonic::Code::OutOfRange => "grpc_out_of_range",
+        tonic::Code::Unimplemented => "grpc_unimplemented",
+        tonic::Code::Internal => "grpc_internal",
+        tonic::Code::Unavailable => "grpc_unavailable",
+        tonic::Code::DataLoss => "grpc_data_loss",
+        tonic::Code::Unauthenticated => "grpc_unauthenticated",
+    }
+}
+
+/// The credential observation this attempt was opened under.
+///
+/// The fence is `(generation, deadline)`. `generation` advances only on a real
+/// state change of the configured source, so comparing it answers "is the
+/// credential I materialized still the current observation?" without retaining
+/// a second copy of the secret. The generation bound here is the one captured
+/// when *this* serialized read was admitted; it is never a later observation's
+/// generation. `deadline` is absolute and was stamped at admission, so neither
+/// dial latency nor application activity can move it.
+#[derive(Clone)]
+struct StockCredentialFence {
+    generation: u64,
+    deadline: Option<tokio::time::Instant>,
+    /// Whether a credential source is configured at all. With none, only the
+    /// (absent) deadline applies.
+    configured: bool,
+    /// The fence keeps its OWN receiver handle.
+    ///
+    /// The stream loop's `tokio::select!` holds a `&mut` borrow of the loop's
+    /// receiver for its `changed()` arm for as long as that future lives, so
+    /// every *other* arm — the debounce commit in particular — must be able to
+    /// read the current observation without touching it. An independent handle
+    /// on the same channel reads the identical shared value.
+    observations: tokio::sync::watch::Receiver<StockCredentialObservation>,
+}
+
+impl StockCredentialFence {
+    fn bind(
+        watch: &StockCredentialWatch,
+        generation: u64,
+        deadline: Option<tokio::time::Instant>,
+        configured: bool,
+    ) -> Self {
+        Self {
+            generation,
+            deadline,
+            configured,
+            observations: watch.receiver(),
+        }
+    }
+
+    fn latest(&self) -> StockCredentialObservation {
+        *self.observations.borrow()
+    }
+
+    fn retirement_from_observation(
+        &self,
+        observed: StockCredentialObservation,
+    ) -> MeshStreamRetirement {
+        if observed.state.is_invalid() {
+            MeshStreamRetirement::CredentialSourceInvalid
+        } else {
+            MeshStreamRetirement::CredentialRotated
+        }
+    }
+
+    /// Fail-closed check used on the async path (select pre-check, outbound
+    /// enqueue). Copies the observation; the commit path must use
+    /// [`Self::admit_commit`] so the watch read lock is held across install.
+    ///
+    /// Returning `Some` means the stream must be retired NOW and nothing it
+    /// staged may be published.
+    fn evaluate(&self) -> Option<MeshStreamRetirement> {
+        self.admit_locked(&self.observations.borrow())
+    }
+
+    /// Generation validation plus the absolute deadline, evaluated while the
+    /// caller holds a watch observation. The deadline is last so it is as
+    /// close to the subsequent synchronous install as possible.
+    fn admit_locked(&self, observed: &StockCredentialObservation) -> Option<MeshStreamRetirement> {
+        if self.configured {
+            if observed.generation != self.generation {
+                return Some(if observed.state.is_invalid() {
+                    MeshStreamRetirement::CredentialSourceInvalid
+                } else {
+                    MeshStreamRetirement::CredentialRotated
+                });
+            }
+            if observed.state.is_invalid() {
+                return Some(MeshStreamRetirement::CredentialSourceInvalid);
+            }
+        }
+        if let Some(deadline) = self.deadline
+            && tokio::time::Instant::now() >= deadline
+        {
+            return Some(MeshStreamRetirement::CredentialDeadline);
+        }
+        None
+    }
+
+    /// Fail-closed admission for a synchronous commit.
+    ///
+    /// The returned guard retains the watch observation lock, so the credential
+    /// watcher cannot publish a new generation or invalid state until the
+    /// caller drops it. `apply_pending` / `install_slice` must run before that
+    /// drop: there is no async gap between this admission and the install.
+    fn admit_commit(&self) -> Result<StockCredentialAdmission<'_>, MeshStreamRetirement> {
+        let observed = self.observations.borrow();
+        if let Some(retirement) = self.admit_locked(&observed) {
+            return Err(retirement);
+        }
+        Ok(StockCredentialAdmission { _held: observed })
+    }
+}
+
+/// Proof that the current watch generation was admitted. Holds the tokio watch
+/// read lock, so a concurrent `publish` cannot land until this value is
+/// dropped. Must not be held across an `.await`.
+struct StockCredentialAdmission<'a> {
+    _held: tokio::sync::watch::Ref<'a, StockCredentialObservation>,
+}
+
 /// Maintain a live stock ADS stream with multi-server failover.
+///
+/// Three fail-closed gates run before any socket is opened, in this order:
+///
+/// 1. The COMPLETE configured endpoint set is admitted as one transport
+///    posture (issue #3853). A refusal stops the client rather than dialing a
+///    weaker endpoint.
+/// 2. The external bearer credential must be observed valid (issue #3852). An
+///    invalid source *prevents* reconnection; there is no stale-token or
+///    freshness-only fallback.
+/// 3. The selected endpoint is re-classified at connect time as defense in
+///    depth, and the `authorization` interceptor refuses to attach metadata to
+///    anything not classified as authenticated TLS.
 #[allow(clippy::too_many_arguments)]
 pub async fn start_stock_xds_client_with_shutdown(
     config: StockXdsClientConfig,
@@ -470,18 +774,39 @@ pub async fn start_stock_xds_client_with_shutdown(
     state: MeshRuntimeState,
     shutdown_rx: tokio::sync::watch::Receiver<bool>,
     mut tls_config: Option<DpGrpcTlsConfig>,
-    tls_reload: Option<DpGrpcTlsReload>,
-    mut policy_rx: tokio::sync::watch::Receiver<StockPolicySnapshot>,
+    mut tls_reload: Option<DpGrpcTlsReload>,
+    policy_rx: tokio::sync::watch::Receiver<StockPolicySnapshot>,
     recovery: Arc<MeshLocalSourceRecovery>,
+    credential_watch: StockCredentialWatch,
 ) {
+    let mut policy_rx = policy_rx;
     let xds_urls = config.xds_urls.clone();
     if xds_urls.is_empty() {
         error!("No stock xDS URLs configured — cannot start stock xDS mesh client");
         return;
     }
 
+    // Issue #3853: admit the whole primary/fallback set as ONE posture. Startup
+    // validation already ran this (`MeshRuntimeConfig::from_env_config`); this
+    // is the defense-in-depth copy that keeps the client itself fail-closed.
+    if let Err(refusal) = admit_stock_xds_endpoints(&xds_urls, config.transport_policy()) {
+        error!(
+            endpoint_index = refusal.index,
+            scheme = refusal.scheme(),
+            host = refusal.host_class(),
+            refusal = refusal.refusal.as_metric_label(),
+            "Refusing to start the stock xDS mesh client: the configured ADS endpoint set does \
+             not satisfy the transport-security posture"
+        );
+        return;
+    }
+
+    let mut credential_rx = credential_watch.receiver();
     let mut current_index = 0usize;
     let mut backoff_secs = BACKOFF_INITIAL_SECS;
+    // A credential source that will not read is not the endpoint's fault, so it
+    // gets its own bounded delay instead of charging the endpoint backoff.
+    let mut credential_backoff_secs = BACKOFF_INITIAL_SECS;
     let mut accumulator = StockXdsAccumulator::new(config.limits);
     let mut stream_state = StockStreamState::default();
     let mut last_url: Option<String> = None;
@@ -489,13 +814,20 @@ pub async fn start_stock_xds_client_with_shutdown(
         .as_ref()
         .map(|reload| *reload.revision_rx.borrow())
         .unwrap_or(0);
+    let mut tracker = MeshStreamTracker::new(
+        STOCK_XDS_PROTOCOL_LABEL,
+        credential_watch.latest().state.health(),
+        config.timings,
+    );
+    state.set_config_stream_status(tracker.status(state.has_first_slice()));
 
     info!(
         node_id = %config.node_id,
         namespace = %config.namespace,
         cluster = %config.cluster,
         xds_urls = xds_urls.len(),
-        authorization = config.token_file.is_some(),
+        authorization = config.credential.is_configured(),
+        liveness_bound_secs = config.timings.liveness_bound_seconds(),
         "Stock xDS mesh client starting (third-party control plane; discovery only)"
     );
 
@@ -510,16 +842,44 @@ pub async fn start_stock_xds_client_with_shutdown(
             &xds_urls,
             &mut last_tls_revision,
         );
+
+        // ── issue #3852: fail-closed credential gate ──
+        // An invalid source must PREVENT reconnection, not merely fail the next
+        // read. The previously read token is never reused and no
+        // freshness-only path exists.
+        let observed = *credential_rx.borrow_and_update();
+        tracker.set_credential(observed.state.health());
+        if let StockCredentialState::Invalid { reason } = observed.state {
+            warn!(
+                reason = reason.as_metric_label(),
+                "Stock xDS bearer-credential source is invalid; refusing to open an ADS stream \
+                 until valid material is available"
+            );
+            state.set_config_stream_status(tracker.status(state.has_first_slice()));
+            let sleep_duration = jittered_backoff(credential_backoff_secs);
+            let mut credential_shutdown_rx = shutdown_rx.clone();
+            tokio::select! {
+                _ = tokio::time::sleep(sleep_duration) => {}
+                _ = credential_rx.changed() => {}
+                _ = wait_for_shutdown(&mut credential_shutdown_rx) => {
+                    info!("Stock xDS mesh client shutting down");
+                    return;
+                }
+            }
+            credential_backoff_secs = next_backoff_secs(credential_backoff_secs, true);
+            continue;
+        }
+        credential_backoff_secs = BACKOFF_INITIAL_SECS;
+
         // Pick up a SIGHUP-reloaded policy baseline before opening the stream so
         // the next slice already carries it.
         let baseline = policy_rx.borrow_and_update().clone();
 
         let xds_url = &xds_urls[current_index];
         if last_url.as_deref() != Some(xds_url.as_str()) {
-            if let Some(previous) = last_url.as_deref() {
+            if last_url.is_some() {
                 info!(
-                    previous_xds_url = previous,
-                    xds_url = %xds_url,
+                    endpoint_index = current_index,
                     "Stock xDS control plane changed; resetting accumulated discovery state"
                 );
                 // Discovery state is scoped to ONE control plane: never let a
@@ -532,13 +892,35 @@ pub async fn start_stock_xds_client_with_shutdown(
 
         let is_primary = current_index == 0;
         let is_fallback = !is_primary && xds_urls.len() > 1;
+        tracker.set_endpoint_index(current_index);
         let mut stream_shutdown_rx = shutdown_rx.clone();
         let should_race_primary = should_race_primary_retry(is_fallback, config.primary_retry_secs);
 
-        let result = if should_race_primary {
+        let mut force_primary = false;
+        // Shutdown is recorded as an intentional retirement rather than an
+        // unobserved `return`, so `/metrics` distinguishes a clean stop from a
+        // stream that simply vanished.
+        //
+        // The select is `biased`. Shutdown is first so a stop still terminates
+        // promptly. The inner ADS future is next so a credential retirement
+        // that is already ready cannot be masked by a simultaneously ready
+        // TLS-reload or primary-retry arm — those would cancel the inner
+        // future and return `reset_discovery_state=false`, letting the next
+        // stream reuse accumulator/subscription/nonce state touched under the
+        // retired credential. TLS/retry arms still coalesce any pending
+        // credential observation the cancelled inner had not yet consumed.
+        let mut shutting_down = false;
+        let outcome = if should_race_primary {
             tokio::select! {
-                result = connect_stock_ads(
+                biased;
+                _ = wait_for_shutdown(&mut stream_shutdown_rx) => {
+                    info!("Stock xDS mesh client shutting down");
+                    shutting_down = true;
+                    StockAttemptOutcome::local(MeshStreamRetirement::Shutdown)
+                }
+                outcome = connect_stock_ads(
                     xds_url,
+                    current_index,
                     &config,
                     baseline.clone(),
                     &request,
@@ -548,37 +930,43 @@ pub async fn start_stock_xds_client_with_shutdown(
                     &mut stream_state,
                     policy_rx.clone(),
                     recovery.clone(),
-                ) => result,
+                    &credential_watch,
+                    &mut credential_rx,
+                    &mut tracker,
+                ) => outcome,
+                _ = wait_optional_tls_reload(
+                    tls_reload.as_ref().map(|reload| reload.revision_rx.clone()),
+                    last_tls_revision,
+                ) => coalesce_outer_lifecycle(
+                    MeshStreamRetirement::TlsReload,
+                    &mut credential_rx,
+                ),
                 _ = wait_for_first_slice_then_primary_retry(
                     state.clone(),
                     Duration::from_secs(config.primary_retry_secs),
                 ) => {
-                    info!(
-                        primary_retry_secs = config.primary_retry_secs,
-                        xds_url = %xds_url,
-                        "Stock xDS primary retry interval elapsed; reconnecting to primary server"
+                    let outcome = coalesce_outer_lifecycle(
+                        MeshStreamRetirement::PrimaryRetry,
+                        &mut credential_rx,
                     );
-                    current_index = 0;
-                    backoff_secs = BACKOFF_INITIAL_SECS;
-                    continue;
-                }
-                _ = wait_for_shutdown(&mut stream_shutdown_rx) => {
-                    info!("Stock xDS mesh client shutting down");
-                    return;
-                }
-                _ = wait_optional_tls_reload(
-                    tls_reload.as_ref().map(|reload| reload.revision_rx.clone()),
-                    last_tls_revision,
-                ) => {
-                    info!("Mesh gRPC TLS source changed; reconnecting stock xDS ADS stream");
-                    backoff_secs = BACKOFF_INITIAL_SECS;
-                    continue;
+                    force_primary = matches!(
+                        outcome.attempt,
+                        MeshStreamAttempt::LocalRetirement(MeshStreamRetirement::PrimaryRetry)
+                    );
+                    outcome
                 }
             }
         } else {
             tokio::select! {
-                result = connect_stock_ads(
+                biased;
+                _ = wait_for_shutdown(&mut stream_shutdown_rx) => {
+                    info!("Stock xDS mesh client shutting down");
+                    shutting_down = true;
+                    StockAttemptOutcome::local(MeshStreamRetirement::Shutdown)
+                }
+                outcome = connect_stock_ads(
                     xds_url,
+                    current_index,
                     &config,
                     baseline.clone(),
                     &request,
@@ -588,39 +976,102 @@ pub async fn start_stock_xds_client_with_shutdown(
                     &mut stream_state,
                     policy_rx.clone(),
                     recovery.clone(),
-                ) => result,
-                _ = wait_for_shutdown(&mut stream_shutdown_rx) => {
-                    info!("Stock xDS mesh client shutting down");
-                    return;
-                }
+                    &credential_watch,
+                    &mut credential_rx,
+                    &mut tracker,
+                ) => outcome,
                 _ = wait_optional_tls_reload(
                     tls_reload.as_ref().map(|reload| reload.revision_rx.clone()),
                     last_tls_revision,
-                ) => {
-                    info!("Mesh gRPC TLS source changed; reconnecting stock xDS ADS stream");
-                    backoff_secs = BACKOFF_INITIAL_SECS;
-                    continue;
-                }
+                ) => coalesce_outer_lifecycle(
+                    MeshStreamRetirement::TlsReload,
+                    &mut credential_rx,
+                ),
             }
         };
 
-        let increase_backoff = match result {
-            Ok(()) => {
-                warn!(xds_url = %xds_url, "Stock xDS ADS stream ended; will reconnect");
-                if is_fallback {
-                    current_index = 0;
-                }
-                backoff_secs = BACKOFF_INITIAL_SECS;
-                false
-            }
-            Err(e) => {
-                error!(xds_url = %xds_url, error = %e, "Stock xDS ADS connection failed");
-                current_index = (current_index + 1) % xds_urls.len();
-                true
-            }
-        };
+        let StockAttemptOutcome {
+            attempt,
+            reason,
+            reset_discovery_state,
+            delivered_usable_state,
+        } = outcome;
+        // A TLS revision that was already published is applied at the top of
+        // the next loop via `refresh_dp_grpc_tls_config_if_changed`. Mark it
+        // seen here so a credential retirement that won the simultaneous
+        // select does not get immediately cancelled by the same TLS event.
+        if (reset_discovery_state
+            || matches!(
+                attempt,
+                MeshStreamAttempt::LocalRetirement(MeshStreamRetirement::TlsReload)
+            ))
+            && let Some(reload) = tls_reload.as_mut()
+        {
+            let _ = reload.revision_rx.borrow_and_update();
+        }
+        // Endpoint identity stays out of these lines: the configured URL is
+        // operator-authored but unbounded, so the index plus the closed-set
+        // outcome and reason are what the operator gets here and on `/metrics`.
+        // A remote `Status` message, a tonic transport error, a token, a claim,
+        // and a credential path can never reach any of these fields.
+        match (reason, attempt.is_endpoint_failure()) {
+            (Some(reason), true) => error!(
+                endpoint_index = current_index,
+                outcome = attempt.as_metric_label(),
+                reason,
+                "Stock xDS ADS attempt failed"
+            ),
+            (Some(reason), false) => info!(
+                outcome = attempt.as_metric_label(),
+                reason, "Retiring the stock xDS ADS stream on a local lifecycle event"
+            ),
+            (None, true) => warn!(
+                endpoint_index = current_index,
+                outcome = attempt.as_metric_label(),
+                "Stock xDS ADS stream ended; rotating to the next configured endpoint"
+            ),
+            (None, false) => info!(
+                outcome = attempt.as_metric_label(),
+                "Retiring the stock xDS ADS stream on a local lifecycle event"
+            ),
+        }
 
-        let sleep_duration = jittered_backoff(backoff_secs);
+        // Issue #3852: a stream retired for credential rotation, invalidation,
+        // or deadline must leave NOTHING behind. The ADS accumulator and the
+        // per-type subscription/nonce state were both mutated by responses that
+        // arrived under the retired credential, so they are discarded here; the
+        // only thing that survives is the slice already installed in the
+        // runtime, which was committed while the credential was still current.
+        if reset_discovery_state {
+            accumulator = StockXdsAccumulator::new(config.limits);
+            stream_state = StockStreamState::default();
+            last_url = None;
+        }
+
+        let disposition = tracker.record(attempt);
+        if force_primary {
+            current_index = 0;
+        } else if disposition.advance_endpoint {
+            current_index = (current_index + 1) % xds_urls.len();
+        }
+        state.set_config_stream_status(tracker.status(state.has_first_slice()));
+        if shutting_down {
+            return;
+        }
+
+        // An intentional local retirement reconnects immediately with the new
+        // material and never charges the endpoint's backoff.
+        if !attempt.is_endpoint_failure() {
+            backoff_secs = BACKOFF_INITIAL_SECS;
+            continue;
+        }
+
+        let (sleep_secs, next_secs) = reconnect_backoff_after_attempt(
+            backoff_secs,
+            disposition.increase_backoff,
+            delivered_usable_state,
+        );
+        let sleep_duration = jittered_backoff(sleep_secs);
         let mut sleep_shutdown_rx = shutdown_rx.clone();
         tokio::select! {
             _ = tokio::time::sleep(sleep_duration) => {}
@@ -636,7 +1087,7 @@ pub async fn start_stock_xds_client_with_shutdown(
                 continue;
             }
         }
-        backoff_secs = next_backoff_secs(backoff_secs, increase_backoff);
+        backoff_secs = next_secs;
     }
 }
 
@@ -645,9 +1096,32 @@ async fn wait_for_first_slice_then_primary_retry(state: MeshRuntimeState, interv
     tokio::time::sleep(interval).await;
 }
 
+/// TLS-reload and primary-retry cancel the inner ADS future. If that future
+/// already had a pending credential observation (rotation, invalidation) that
+/// it had not yet consumed, the cancellation would otherwise report the
+/// lifecycle event with `reset_discovery_state=false`. Peek the watch so the
+/// credential retirement — and its required discovery-state reset — is
+/// retained. Shutdown is not routed through here: it is selected first and
+/// still terminates promptly.
+fn coalesce_outer_lifecycle(
+    fallback: MeshStreamRetirement,
+    credential_rx: &mut tokio::sync::watch::Receiver<StockCredentialObservation>,
+) -> StockAttemptOutcome {
+    if credential_rx.has_changed().unwrap_or(false) {
+        let observed = *credential_rx.borrow_and_update();
+        return StockAttemptOutcome::local(if observed.state.is_invalid() {
+            MeshStreamRetirement::CredentialSourceInvalid
+        } else {
+            MeshStreamRetirement::CredentialRotated
+        });
+    }
+    StockAttemptOutcome::local(fallback)
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn connect_stock_ads(
     xds_url: &str,
+    endpoint_index: usize,
     config: &StockXdsClientConfig,
     baseline: StockPolicySnapshot,
     request: &MeshSliceRequest,
@@ -657,11 +1131,44 @@ async fn connect_stock_ads(
     stream_state: &mut StockStreamState,
     policy_rx: tokio::sync::watch::Receiver<StockPolicySnapshot>,
     recovery: Arc<MeshLocalSourceRecovery>,
-) -> Result<(), anyhow::Error> {
-    let mut endpoint = Channel::from_shared(xds_url.to_string())?;
-    if config.connect_timeout_seconds > 0 {
-        endpoint = endpoint.connect_timeout(Duration::from_secs(config.connect_timeout_seconds));
-    }
+    credential_watch: &StockCredentialWatch,
+    credential_rx: &mut tokio::sync::watch::Receiver<StockCredentialObservation>,
+    tracker: &mut MeshStreamTracker,
+) -> StockAttemptOutcome {
+    // Defense in depth (issue #3853): re-classify the endpoint about to be
+    // dialed. `admit_stock_xds_endpoints` already ran at startup and at client
+    // start, so reaching a refusal here means an admission path was bypassed —
+    // fail closed before a socket exists rather than trusting the earlier gate.
+    let transport =
+        match classify_stock_xds_endpoint(endpoint_index, xds_url, config.transport_policy()) {
+            Ok(transport) => transport,
+            Err(refusal) => {
+                // The refusal type is already bounded and index-shaped, but
+                // only its closed-set reason label is emitted here.
+                return StockAttemptOutcome::failed(
+                    MeshStreamAttempt::PolicyRejected,
+                    refusal.refusal.as_metric_label(),
+                );
+            }
+        };
+
+    let mut endpoint = match Channel::from_shared(xds_url.to_string()) {
+        Ok(endpoint) => configure_mesh_config_stream_endpoint(
+            endpoint,
+            config.connect_timeout_seconds,
+            config.timings,
+        ),
+        // The tonic error renders the offending URI, so it is dropped.
+        Err(_) => {
+            return StockAttemptOutcome::failed(
+                MeshStreamAttempt::TransportFailure {
+                    delivered_usable_state: false,
+                    after_established: false,
+                },
+                "endpoint_uri_invalid",
+            );
+        }
+    };
     if let Some(tls) = tls_config {
         let mut client_tls = tonic_tls_config(tls);
         if let Ok(uri) = xds_url.parse::<http::Uri>()
@@ -669,29 +1176,124 @@ async fn connect_stock_ads(
         {
             client_tls = client_tls.domain_name(host);
         }
-        endpoint = endpoint.tls_config(client_tls)?;
+        endpoint = match endpoint.tls_config(client_tls) {
+            Ok(endpoint) => endpoint,
+            Err(_) => {
+                return StockAttemptOutcome::failed(
+                    MeshStreamAttempt::TransportFailure {
+                        delivered_usable_state: false,
+                        after_established: false,
+                    },
+                    "tls_config_rejected",
+                );
+            }
+        };
     }
 
-    // The bearer token is read per connection attempt so a rotated projected
-    // service-account token is picked up on reconnect. It is never minted by
-    // Ferrum and never logged.
-    let token = match config.token_file.as_deref() {
-        Some(path) => Some(read_bearer_token(path).await?),
-        None => None,
+    // The bearer is materialized per connection attempt, so a failover or a
+    // failback always presents the NEWEST material rather than a value captured
+    // by an earlier endpoint's interceptor. Publication is last-completed-read:
+    // the epoch stamped under the one-reader permit is what admits this
+    // observation, so a delayed older read cannot overwrite a newer watcher
+    // result or bind a fence to that stale generation.
+    let read = config.credential.observe().await;
+    let observed = read.observed_state();
+    let generation =
+        match admit_stock_credential_observation(credential_watch, read.epoch(), observed) {
+            Ok(generation) => {
+                // Mark our own publication seen so the live stream does not treat
+                // it as a rotation on its very first poll.
+                let _ = credential_rx.borrow_and_update();
+                tracker.set_credential(observed.health());
+                generation
+            }
+            Err(retirement) => {
+                let _ = credential_rx.borrow_and_update();
+                tracker.set_credential(credential_watch.latest().state.health());
+                return StockAttemptOutcome::local(retirement);
+            }
+        };
+    let credential = match read.into_outcome() {
+        Ok(credential) => credential,
+        Err(reason) => {
+            return StockAttemptOutcome::local_with_reason(
+                MeshStreamRetirement::CredentialSourceInvalid,
+                reason.as_metric_label(),
+            );
+        }
     };
 
-    let channel = endpoint.connect().await?;
+    // The fence this attempt is bound to. `generation` is the value captured
+    // under the watch send lock when THIS observation was admitted — never
+    // `latest()` after the lock is dropped, which could already be a newer
+    // replacement. `deadline` is the absolute instant stamped at admission —
+    // dial latency spends it rather than extending it.
+    let fence = StockCredentialFence::bind(
+        credential_watch,
+        generation,
+        credential.as_ref().map(StockBearerCredential::deadline),
+        config.credential.is_configured(),
+    );
+
+    let channel = match endpoint.connect().await {
+        Ok(channel) => channel,
+        // The tonic transport error can render the configured URI/host, so the
+        // attempt is reported by index and closed-set reason only.
+        Err(_) => {
+            return StockAttemptOutcome::failed(
+                MeshStreamAttempt::TransportFailure {
+                    delivered_usable_state: false,
+                    after_established: false,
+                },
+                "connect_failed",
+            );
+        }
+    };
+
+    // Re-prove the credential is STILL the current observation, and still
+    // inside its absolute deadline, before the streaming RPC is opened. Dialing
+    // is unbounded in principle (DNS, TCP, TLS handshake), so a rotation or an
+    // invalidation that landed during the dial must not be able to ride into
+    // the new stream.
+    if credential
+        .as_ref()
+        .is_some_and(StockBearerCredential::deadline_reached)
+    {
+        return StockAttemptOutcome::local_with_reason(
+            MeshStreamRetirement::CredentialDeadline,
+            StockCredentialInvalidReason::DeadlineReached.as_metric_label(),
+        );
+    }
+    if let Some(retirement) = fence.evaluate() {
+        let _ = credential_rx.borrow_and_update();
+        tracker.set_credential(credential_watch.latest().state.health());
+        return StockAttemptOutcome::local_with_reason(retirement, "observed_before_rpc_open");
+    }
 
     info!(
         node_id = %config.node_id,
         namespace = %config.namespace,
-        xds_url = %xds_url,
+        endpoint_index,
+        transport = transport.as_label(),
+        authorization = credential.is_some(),
+        authorization_lifetime_secs = credential
+            .as_ref()
+            .map(|credential| credential.lifetime().as_secs())
+            .unwrap_or(0),
+        authorization_deadline_basis = credential
+            .as_ref()
+            .map(|credential| credential.deadline_basis().as_metric_label())
+            .unwrap_or("none"),
         "Connected to stock xDS control plane; subscribing CDS + LDS"
     );
 
-    run_stock_ads_stream(
+    let mut delivered_usable_state = false;
+    let attempt_started_at = tokio::time::Instant::now();
+    let result = run_stock_ads_stream(
         channel,
-        token,
+        credential,
+        transport,
+        fence,
         config,
         baseline,
         request,
@@ -700,38 +1302,55 @@ async fn connect_stock_ads(
         stream_state,
         policy_rx,
         recovery,
+        credential_rx,
+        tracker,
+        &mut delivered_usable_state,
+        attempt_started_at,
     )
-    .await
+    .await;
+    tracker.set_attachment(MeshStreamAttachment::Detached);
+    state.set_config_stream_status(tracker.status(state.has_first_slice()));
+
+    match result {
+        Ok(attempt) => {
+            let mut outcome = StockAttemptOutcome::ended(attempt, delivered_usable_state);
+            if let MeshStreamAttempt::LocalRetirement(retirement) = attempt {
+                outcome.reset_discovery_state = retirement.is_credential_retirement();
+            }
+            outcome
+        }
+        Err(error) => error.into_outcome(delivered_usable_state),
+    }
 }
 
-pub(crate) async fn read_bearer_token(path: &str) -> Result<BearerToken, anyhow::Error> {
-    use crate::secrets::credential_file::{
-        CredentialTrim, DEFAULT_CREDENTIAL_FILE_MAX_BYTES, read_credential_file_detached_guarded,
+/// The `authorization`-metadata INSERTION boundary (issue #3853).
+///
+/// Top-level admission (`admit_stock_xds_endpoints`) and the connect-time
+/// re-classification in `connect_stock_ads` both run before this point, so
+/// reaching it with a non-TLS transport means an admission path was bypassed.
+/// This is the last gate, and it fails closed: the bearer is never written onto
+/// a request whose endpoint is not classified as authenticated TLS.
+///
+/// Extracted from the interceptor closure so the boundary can be exercised
+/// DIRECTLY — a test that only configures a plaintext endpoint proves
+/// connect-time classification, not this insertion check.
+pub fn attach_stock_authorization(
+    authorization: Option<&(BearerToken, StockXdsTransport)>,
+    request: &mut tonic::Request<()>,
+) -> Result<(), tonic::Status> {
+    let Some((token, transport)) = authorization else {
+        return Ok(());
     };
-
-    let read = async {
-        let permit = stock_xds_token_file_read_limit()
-            .acquire_owned()
-            .await
-            .map_err(|_| anyhow::anyhow!("stock xDS bearer-token reader is unavailable"))?;
-        read_credential_file_detached_guarded(
-            path,
-            DEFAULT_CREDENTIAL_FILE_MAX_BYTES,
-            CredentialTrim::Ends,
-            "ferrum-stock-xds-token-file",
-            permit,
-        )
-        .await
-        .map_err(|error| anyhow::anyhow!("failed to read stock xDS bearer token: {error}"))
-    };
-    let token = match tokio::time::timeout(STOCK_XDS_TOKEN_FILE_READ_TIMEOUT, read).await {
-        Ok(result) => result?,
-        Err(_) => anyhow::bail!("timed out reading stock xDS bearer token"),
-    };
-    format!("Bearer {token}")
-        .parse()
-        // The parse error would echo the token, so it is deliberately dropped.
-        .map_err(|_| anyhow::anyhow!("stock xDS bearer token is not valid ASCII metadata"))
+    if !transport.allows_authorization_metadata() {
+        return Err(tonic::Status::failed_precondition(
+            "refusing to attach stock xDS authorization metadata to an endpoint that is not \
+             classified as authenticated TLS",
+        ));
+    }
+    request
+        .metadata_mut()
+        .insert("authorization", token.clone());
+    Ok(())
 }
 
 struct PendingStockSlice {
@@ -744,7 +1363,9 @@ struct PendingStockSlice {
 #[allow(clippy::too_many_arguments)]
 async fn run_stock_ads_stream(
     channel: Channel,
-    token: Option<BearerToken>,
+    credential: Option<StockBearerCredential>,
+    transport: StockXdsTransport,
+    fence: StockCredentialFence,
     config: &StockXdsClientConfig,
     mut baseline: StockPolicySnapshot,
     request: &MeshSliceRequest,
@@ -753,14 +1374,23 @@ async fn run_stock_ads_stream(
     stream_state: &mut StockStreamState,
     mut policy_rx: tokio::sync::watch::Receiver<StockPolicySnapshot>,
     recovery: Arc<MeshLocalSourceRecovery>,
-) -> Result<(), anyhow::Error> {
+    credential_rx: &mut tokio::sync::watch::Receiver<StockCredentialObservation>,
+    tracker: &mut MeshStreamTracker,
+    delivered_usable_state: &mut bool,
+    attempt_started_at: tokio::time::Instant,
+) -> Result<MeshStreamAttempt, StockStreamError> {
+    // The authorization metadata and the endpoint's admitted transport travel
+    // together into the interceptor. This is the issue-#3853 defense in depth:
+    // even if top-level admission were bypassed, a bearer can only be attached
+    // to an endpoint classified as authenticated TLS.
+    let authorization = credential
+        .as_ref()
+        .map(|credential| (credential.token().clone(), transport));
     #[allow(clippy::result_large_err)]
     let mut client = AggregatedDiscoveryServiceClient::with_interceptor(
         channel,
         move |mut req: tonic::Request<()>| {
-            if let Some(token) = token.as_ref() {
-                req.metadata_mut().insert("authorization", token.clone());
-            }
+            attach_stock_authorization(authorization.as_ref(), &mut req)?;
             Ok(req)
         },
     )
@@ -768,33 +1398,83 @@ async fn run_stock_ads_stream(
 
     let (tx, rx) = mpsc::channel(config.stream_channel_capacity.max(1));
     let request_stream = ReceiverStream::new(rx);
-    let mut response_stream = client
-        .stream_aggregated_resources(request_stream)
-        .await?
-        .into_inner();
+    // The interceptor attaches/sends the bearer as soon as this future is
+    // polled. A control plane can accept that authenticated request and then
+    // withhold response headers, so the RPC-open await itself must be raced
+    // against credential generation/invalidation/deadline AND the absolute
+    // first-frame bound. Already-observed or simultaneously-ready credential
+    // retirement wins (biased) and still resets discovery state; first-frame
+    // covers the no-bearer withhold case. Dropping the pending open cancels
+    // it; nothing is detached. Remote Status text stays classified, never
+    // echoed.
+    let first_frame_at = attempt_started_at + config.timings.first_frame;
+    let mut response_stream = match await_stock_ads_rpc_open_under_fence(
+        client.stream_aggregated_resources(request_stream),
+        &fence,
+        credential_rx,
+        first_frame_at,
+    )
+    .await
+    {
+        Ok(StockRpcOpen::Ready(response)) => response.into_inner(),
+        Ok(StockRpcOpen::FirstFrameTimeout) => {
+            return Ok(MeshStreamAttempt::FirstFrameTimeout);
+        }
+        Err(StockStreamError::Retirement(retirement)) => {
+            return Ok(MeshStreamAttempt::LocalRetirement(retirement));
+        }
+        Err(error) => return Err(error),
+    };
+
+    // A retirement that became ready in the same poll as an open success was
+    // already preferred by the biased select. Re-check before publishing
+    // Established so `/health` cannot claim a stream we are about to drop.
+    if let Some(retirement) = fence.evaluate() {
+        return Ok(MeshStreamAttempt::LocalRetirement(retirement));
+    }
+
+    // The streaming RPC is open and this consumer is about to read it: that is
+    // exactly what `/health` means by `connected` (issue #3854).
+    tracker.set_attachment(MeshStreamAttachment::Established);
+    state.set_config_stream_status(tracker.status(state.has_first_slice()));
 
     // Nonces are stream-scoped, and every new stream must re-send `Node`.
     stream_state.subscriptions.reset_for_new_stream();
 
-    for type_url in STOCK_INITIAL_TYPE_URL_ORDER {
-        let subscribe = stream_state
-            .subscriptions
-            .build_request(type_url, config, None);
-        send_request(&tx, subscribe).await?;
-    }
-    // Resume any dependency-ordered subscription established on a previous
-    // stream so a reconnect does not lose the EDS/RDS names already derived
-    // from the retained accumulator.
-    for type_url in [EDS_TYPE_URL, RDS_TYPE_URL] {
-        if !stream_state
-            .subscriptions
-            .resource_names(type_url)
-            .is_empty()
-        {
+    {
+        let mut outbound = StockOutbound {
+            tx: &tx,
+            bound: config.timings.outbound,
+            fence: &fence,
+            credential_rx,
+        };
+
+        for type_url in STOCK_INITIAL_TYPE_URL_ORDER {
             let subscribe = stream_state
                 .subscriptions
                 .build_request(type_url, config, None);
-            send_request(&tx, subscribe).await?;
+            outbound
+                .enqueue(subscribe)
+                .await
+                .map_err(StockOutboundError::into_stream_error)?;
+        }
+        // Resume any dependency-ordered subscription established on a previous
+        // stream so a reconnect does not lose the EDS/RDS names already derived
+        // from the retained accumulator.
+        for type_url in [EDS_TYPE_URL, RDS_TYPE_URL] {
+            if !stream_state
+                .subscriptions
+                .resource_names(type_url)
+                .is_empty()
+            {
+                let subscribe = stream_state
+                    .subscriptions
+                    .build_request(type_url, config, None);
+                outbound
+                    .enqueue(subscribe)
+                    .await
+                    .map_err(StockOutboundError::into_stream_error)?;
+            }
         }
     }
 
@@ -806,22 +1486,140 @@ async fn run_stock_ads_stream(
     let mut last_logged_refusals: Option<Vec<StockRefusal>> = None;
     let mut policy_watch_open = true;
 
-    loop {
+    // ── issue #3854: bounded liveness for an ESTABLISHED stream ──
+    // HTTP/2 + TCP keepalive (applied on the endpoint) already fail a
+    // blackholed transport. These two deadlines cover the other half: a control
+    // plane that accepts the RPC and then supplies nothing usable. They are
+    // the SAME absolute clocks that covered RPC-open: headers do not reset
+    // them. Already-expired clocks are polled before debounce and before
+    // `message()`, so a continuously ready incomplete frame cannot starve
+    // them; debounce still outranks the next message.
+    let first_frame_deadline = tokio::time::sleep_until(first_frame_at);
+    tokio::pin!(first_frame_deadline);
+    let mut awaiting_first_frame = true;
+    let first_slice_deadline =
+        tokio::time::sleep_until(attempt_started_at + config.timings.first_slice);
+    tokio::pin!(first_slice_deadline);
+    // Armed only while this data plane has never had a slice at all: a
+    // converged proxy must not be torn down for a legitimately quiet CP.
+    let mut awaiting_first_slice = !state.has_first_slice();
+
+    // ── issue #3852: finite local authorization lifetime ──
+    // The deadline is ABSOLUTE and was stamped at credential ADMISSION, before
+    // the channel was dialed — see `StockBearerCredential::admit`. Deriving it
+    // from stream-open time would silently extend a JWT past `exp` by the dial
+    // and RPC-setup latency. Application activity never resets it either, which
+    // is why nothing in this loop touches it.
+    let credential_deadline = fence.deadline;
+    let credential_deadline_sleep = tokio::time::sleep_until(
+        credential_deadline
+            .unwrap_or_else(|| attempt_started_at + Duration::from_secs(60 * 60 * 24)),
+    );
+    tokio::pin!(credential_deadline_sleep);
+    let mut credential_watch_open = true;
+
+    let ended = loop {
+        // The select below is `biased`, so the credential branches are polled
+        // before the response branch. That alone is not sufficient: a response
+        // could already be buffered and a simultaneously-ready timer could lose
+        // an unbiased draw, and — more importantly — the credential could have
+        // changed while the previous iteration's handler was awaiting. This
+        // explicit pre-check is the actual fence: no response may be admitted
+        // in an iteration whose credential is no longer current.
+        if let Some(retirement) = fence.evaluate() {
+            break MeshStreamAttempt::LocalRetirement(retirement);
+        }
         tokio::select! {
+            biased;
+            _ = &mut credential_deadline_sleep, if credential_deadline.is_some() => {
+                break MeshStreamAttempt::LocalRetirement(
+                    MeshStreamRetirement::CredentialDeadline,
+                );
+            }
+            changed = credential_rx.changed(), if credential_watch_open => {
+                if changed.is_err() {
+                    // The watcher is gone (shutdown). Stop selecting on it
+                    // rather than spinning; the absolute deadline above still
+                    // bounds this stream's authorization lifetime.
+                    credential_watch_open = false;
+                    continue;
+                }
+                // Read through the fence's own handle: the `changed()` future
+                // above still holds the `&mut` borrow of `credential_rx`.
+                let observed = fence.latest();
+                break MeshStreamAttempt::LocalRetirement(if observed.state.is_invalid() {
+                    MeshStreamRetirement::CredentialSourceInvalid
+                } else {
+                    MeshStreamRetirement::CredentialRotated
+                });
+            }
+            _ = &mut first_frame_deadline, if awaiting_first_frame => {
+                break MeshStreamAttempt::FirstFrameTimeout;
+            }
+            _ = &mut first_slice_deadline, if awaiting_first_slice => {
+                if state.has_first_slice() {
+                    awaiting_first_slice = false;
+                } else {
+                    break MeshStreamAttempt::FirstSliceTimeout;
+                }
+            }
+            _ = &mut debounce, if debounce_active => {
+                debounce_active = false;
+                pending_since = None;
+                if let Some(next) = pending.take() {
+                    // Re-check immediately before the commit, holding the watch
+                    // observation across the synchronous install so a concurrent
+                    // publish cannot land a retired generation between the
+                    // check and `install_slice`.
+                    match commit_pending(
+                        &fence,
+                        config,
+                        state,
+                        next,
+                        &mut last_logged_refusals,
+                        &recovery,
+                    ) {
+                        Ok(()) => {}
+                        Err(StockCommitFailure::Retirement(retirement)) => {
+                            break MeshStreamAttempt::LocalRetirement(retirement);
+                        }
+                        Err(StockCommitFailure::Policy(reason)) => {
+                            return Err(StockStreamError::Policy(reason));
+                        }
+                    }
+                    *delivered_usable_state = true;
+                    awaiting_first_slice = false;
+                    // This exact stream installed usable state: clear the
+                    // consecutive-failure run and the sticky liveness flag.
+                    tracker.record_usable_state();
+                    state.set_config_stream_status(tracker.status(state.has_first_slice()));
+                }
+            }
             response = response_stream.message() => {
-                let Some(response) = response? else {
-                    break;
+                let response = response
+                    .map_err(|status| StockStreamError::Transport(grpc_status_category(&status)))?;
+                let Some(response) = response else {
+                    // A remote clean EOF is NOT success. The control plane hung
+                    // up without being asked to, so the endpoint rotates and the
+                    // bounded backoff grows (issue #3854).
+                    break MeshStreamAttempt::RemoteEof;
                 };
+                awaiting_first_frame = false;
                 match handle_stock_response(
                     response,
                     config,
                     baseline.mesh(),
                     baseline.recovery_epoch,
                     request,
-                    &tx,
+                    &mut StockOutbound {
+                        tx: &tx,
+                        bound: config.timings.outbound,
+                        fence: &fence,
+                        credential_rx,
+                    },
                     accumulator,
                     stream_state,
-                ).await? {
+                ).await.map_err(StockResponseError::into_stream_error)? {
                     StockResponseOutcome::Pending(next) => {
                         pending = Some(next);
                         let now = tokio::time::Instant::now();
@@ -850,13 +1648,6 @@ async fn run_stock_ads_stream(
                     }
                 }
                 state.set_xds_convergence(convergence_snapshot(accumulator));
-            }
-            _ = &mut debounce, if debounce_active => {
-                if let Some(next) = pending.take() {
-                    apply_pending(config, state, next, &mut last_logged_refusals, &recovery)?;
-                }
-                debounce_active = false;
-                pending_since = None;
             }
             reloaded = next_policy_baseline(&mut policy_rx), if policy_watch_open => {
                 let Some(next_baseline) = reloaded else {
@@ -895,10 +1686,10 @@ async fn run_stock_ads_stream(
                             ));
                             debounce_active = true;
                         }
-                        Err(e) => {
+                        Err(_) => {
                             warn!(
                                 node_id = %config.node_id,
-                                error = %e,
+                                type_url = stock_log_type_label("policy-reload"),
                                 "Reloaded mesh policy document failed slice construction; keeping \
                                  the last good slice and raising config_rejected"
                             );
@@ -908,12 +1699,50 @@ async fn run_stock_ads_stream(
                 }
             }
         }
-    }
+    };
 
-    if let Some(next) = pending.take() {
-        apply_pending(config, state, next, &mut last_logged_refusals, &recovery)?;
+    // A debounced slice that is already complete is published on a clean end.
+    // A partial ADS generation never reaches this point: `pending` is only ever
+    // set once the accumulator's own required-type gate is satisfied, so an EOF
+    // mid-convergence leaves the last good slice serving and fails over
+    // (issue #3854 — no mixed generation is ever published).
+    //
+    // The fence is re-evaluated one final time while the watch observation is
+    // held across the synchronous install: this flush is a COMMIT, and a
+    // credential that rotated, was invalidated, or hit its deadline while the
+    // slice sat in the debounce window must retire the stream WITHOUT
+    // publishing anything it staged (issue #3852). The already-installed
+    // last-good runtime slice is the only thing that survives.
+    if matches!(ended, MeshStreamAttempt::RemoteEof)
+        && let Some(next) = pending.take()
+    {
+        match commit_pending(
+            &fence,
+            config,
+            state,
+            next,
+            &mut last_logged_refusals,
+            &recovery,
+        ) {
+            Ok(()) => {
+                *delivered_usable_state = true;
+                tracker.record_usable_state();
+                state.set_config_stream_status(tracker.status(state.has_first_slice()));
+            }
+            Err(StockCommitFailure::Retirement(retirement)) => {
+                warn!(
+                    outcome = retirement.as_metric_label(),
+                    "Discarding a staged stock xDS slice at stream end: the credential that \
+                     produced it is no longer current"
+                );
+                return Ok(MeshStreamAttempt::LocalRetirement(retirement));
+            }
+            Err(StockCommitFailure::Policy(reason)) => {
+                return Err(StockStreamError::Policy(reason));
+            }
+        }
     }
-    Ok(())
+    Ok(ended)
 }
 
 enum StockResponseOutcome {
@@ -922,6 +1751,29 @@ enum StockResponseOutcome {
     Pending(Box<PendingStockSlice>),
     Acked,
     Nacked,
+}
+
+/// Why admitting one ADS response failed. The payload is always a closed-set
+/// `&'static str`: a stock control plane authors the resource type URLs, the
+/// status messages, and the error details, so none of them may be carried into
+/// an operator-facing error string.
+enum StockResponseError {
+    /// The outbound request could not be enqueued in the bounded window.
+    Transport(&'static str),
+    /// A local fail-closed gate refused the content.
+    Policy(&'static str),
+    /// Credential retirement won while an ACK/NACK/dependency send was awaited.
+    Retirement(MeshStreamRetirement),
+}
+
+impl StockResponseError {
+    fn into_stream_error(self) -> StockStreamError {
+        match self {
+            Self::Transport(reason) => StockStreamError::Transport(reason),
+            Self::Policy(reason) => StockStreamError::Policy(reason),
+            Self::Retirement(reason) => StockStreamError::Retirement(reason),
+        }
+    }
 }
 
 /// Await the next SIGHUP-reloaded policy baseline.
@@ -946,69 +1798,49 @@ async fn handle_stock_response(
     baseline: &MeshConfig,
     policy_recovery_epoch: Option<u64>,
     request: &MeshSliceRequest,
-    tx: &mpsc::Sender<DiscoveryRequest>,
+    outbound: &mut StockOutbound<'_>,
     accumulator: &mut StockXdsAccumulator,
     stream_state: &mut StockStreamState,
-) -> Result<StockResponseOutcome, anyhow::Error> {
+) -> Result<StockResponseOutcome, StockResponseError> {
     let type_url = response.type_url.clone();
+    let type_label = stock_log_type_label(&type_url);
 
     // Unsubscribed / unsupported types fail closed by terminating the stream.
     // Sending a NACK DiscoveryRequest for a type the client never requested
     // would itself create a wildcard subscription to that type under SotW
-    // semantics. SDS gets a dedicated diagnostic because a stock CP
-    // volunteering key material is a security-relevant event, and Ferrum
-    // refuses it WITHOUT decoding the key fields or logging any payload.
+    // semantics. SDS gets a dedicated closed-set reason because a stock CP
+    // volunteering key material is a security-relevant event. Ferrum refuses
+    // it without decoding key fields and without logging any CP-authored
+    // name, type URL, or payload.
     if !is_stock_type_url(&type_url) {
-        // `type_url` is a control-plane-supplied string bounded only by the
-        // gRPC message size, and it lands in both a log line and the
-        // `error_detail` echoed back, so it is rendered before either use.
-        let safe_url = diagnostic_value(&type_url);
         let reason = if type_url == SDS_TYPE_URL {
-            // Bounded exactly like `log_refusals`: one volunteered SDS response
-            // must not be able to amplify into an unbounded burst of log lines.
-            for resource in response.resources.iter().take(STOCK_REFUSAL_LOG_LIMIT) {
-                let refusal = refuse_stock_secret(&resource.value);
-                warn!(
-                    node_id = %config.node_id,
-                    namespace = %config.namespace,
-                    resource = %refusal.resource,
-                    reason = refusal.reason,
-                    detail = %refusal.detail,
-                    "Refused an SDS secret pushed by the stock control plane; Ferrum never \
-                     ingests control-plane-delivered key or trust material"
-                );
-            }
-            if response.resources.len() > STOCK_REFUSAL_LOG_LIMIT {
-                warn!(
-                    node_id = %config.node_id,
-                    suppressed = response.resources.len() - STOCK_REFUSAL_LOG_LIMIT,
-                    "Additional refused SDS secrets suppressed by the per-response log bound"
-                );
-            }
-            format!(
-                "type_url '{safe_url}' is not consumed by the Ferrum stock xDS profile; workload \
-                 identity and trust anchors come from Ferrum's own SPIFFE configuration"
-            )
+            "unsolicited_sds"
         } else {
-            format!("type_url '{safe_url}' is not subscribed by the Ferrum stock xDS profile")
+            "unsolicited_type_url"
         };
+        if type_url == SDS_TYPE_URL {
+            warn!(
+                node_id = %config.node_id,
+                namespace = %config.namespace,
+                type_url = type_label,
+                reason,
+                refused_resources = response.resources.len(),
+                "Refused SDS secrets pushed by the stock control plane; Ferrum never \
+                 ingests control-plane-delivered key or trust material"
+            );
+        }
         warn!(
             node_id = %config.node_id,
-            type_url = %safe_url,
-            reason = %reason,
+            type_url = type_label,
+            reason,
             "Closing stock xDS stream after an unsolicited unsupported resource type"
         );
-        return Err(anyhow::anyhow!(
-            "stock xDS control plane sent unsolicited unsupported type_url '{safe_url}'; \
-             closing the stream without subscribing to that type"
-        ));
+        return Err(StockResponseError::Policy(reason));
     }
 
     debug!(
         node_id = %config.node_id,
-        type_url = %type_url,
-        version = %diagnostic_value(&response.version_info),
-        nonce = %diagnostic_value(&response.nonce),
+        type_url = type_label,
         resources = response.resources.len(),
         "Received stock xDS ADS response"
     );
@@ -1023,7 +1855,7 @@ async fn handle_stock_response(
     ) {
         debug!(
             node_id = %config.node_id,
-            type_url = %type_url,
+            type_url = type_label,
             "Ignoring stale/duplicate stock xDS response (nonce already processed)"
         );
         return Ok(StockResponseOutcome::Acked);
@@ -1048,14 +1880,16 @@ async fn handle_stock_response(
             .build_request(&type_url, config, Some(e.clone()));
         stream_state.subscriptions.mark_processed(&type_url);
         let consecutive = stream_state.breaker.record_nack(&type_url);
-        send_request(tx, nack).await?;
+        outbound
+            .enqueue(nack)
+            .await
+            .map_err(StockOutboundError::into_response_error)?;
         warn!(
             node_id = %config.node_id,
             namespace = %config.namespace,
-            type_url = %type_url,
+            type_url = type_label,
             consecutive_nacks = consecutive,
             blocking_first_slice,
-            error = %e,
             "NACKing invalid stock xDS ADS response"
         );
         if blocking_first_slice {
@@ -1065,13 +1899,14 @@ async fn handle_stock_response(
             );
         }
         if consecutive >= STOCK_CONSECUTIVE_NACK_LIMIT {
-            return Err(anyhow::anyhow!(
-                "stock xDS NACK circuit breaker tripped for type_url '{}' after {} \
-                 consecutive NACKs on node '{}'; closing stream to trigger reconnect/failover",
-                type_url,
-                consecutive,
-                config.node_id
-            ));
+            warn!(
+                node_id = %config.node_id,
+                type_url = type_label,
+                consecutive_nacks = consecutive,
+                "Stock xDS NACK circuit breaker tripped; closing the stream to trigger \
+                 reconnect/failover"
+            );
+            return Err(StockResponseError::Policy("nack_circuit_breaker"));
         }
         return Ok(StockResponseOutcome::Nacked);
     }
@@ -1084,7 +1919,10 @@ async fn handle_stock_response(
     let ack = stream_state
         .subscriptions
         .build_request(&type_url, config, None);
-    send_request(tx, ack).await?;
+    outbound
+        .enqueue(ack)
+        .await
+        .map_err(StockOutboundError::into_response_error)?;
     stream_state.subscriptions.mark_processed(&type_url);
     stream_state.breaker.record_ack(&type_url);
 
@@ -1098,13 +1936,17 @@ async fn handle_stock_response(
         let names = stream_state.subscriptions.resource_names(EDS_TYPE_URL);
         debug!(
             node_id = %config.node_id,
+            type_url = "eds",
             resources = names.len(),
             "Updating dependency-ordered EDS subscription after CDS update"
         );
         let subscribe = stream_state
             .subscriptions
             .build_request(EDS_TYPE_URL, config, None);
-        send_request(tx, subscribe).await?;
+        outbound
+            .enqueue(subscribe)
+            .await
+            .map_err(StockOutboundError::into_response_error)?;
     }
     if type_url == LDS_TYPE_URL
         && stream_state
@@ -1114,19 +1956,23 @@ async fn handle_stock_response(
         let names = stream_state.subscriptions.resource_names(RDS_TYPE_URL);
         debug!(
             node_id = %config.node_id,
+            type_url = "rds",
             resources = names.len(),
             "Updating dependency-ordered RDS subscription after LDS update"
         );
         let subscribe = stream_state
             .subscriptions
             .build_request(RDS_TYPE_URL, config, None);
-        send_request(tx, subscribe).await?;
+        outbound
+            .enqueue(subscribe)
+            .await
+            .map_err(StockOutboundError::into_response_error)?;
     }
 
     if !accumulator.ready() {
         debug!(
             node_id = %config.node_id,
-            type_url = %type_url,
+            type_url = type_label,
             pending = ?accumulator.pending_types(),
             "ACKed stock xDS response while waiting for the remaining gating types"
         );
@@ -1146,20 +1992,43 @@ async fn handle_stock_response(
             refusals: discovery.refusals,
             policy_recovery_epoch,
         }))),
-        Err(e) => {
+        Err(_) => {
             // The discovery half validated structurally; a failure here means
             // the merged document is invalid. Keep the last good slice and
-            // surface it rather than tearing the stream down.
+            // surface it rather than tearing the stream down. The validation
+            // error can echo remote resource names, so it is omitted from logs.
             warn!(
                 node_id = %config.node_id,
                 namespace = %config.namespace,
-                type_url = %type_url,
-                error = %e,
+                type_url = type_label,
                 "Stock xDS discovery did not produce a valid mesh slice; keeping the last good slice"
             );
             Ok(StockResponseOutcome::Acked)
         }
     }
+}
+
+enum StockCommitFailure {
+    Retirement(MeshStreamRetirement),
+    Policy(&'static str),
+}
+
+/// Admit the current credential generation and install while the watch
+/// observation lock is held. There is no async gap between final admission and
+/// `install_slice`; a concurrent watcher publish blocks until this returns.
+fn commit_pending(
+    fence: &StockCredentialFence,
+    config: &StockXdsClientConfig,
+    state: &MeshRuntimeState,
+    pending: Box<PendingStockSlice>,
+    last_logged_refusals: &mut Option<Vec<StockRefusal>>,
+    recovery: &MeshLocalSourceRecovery,
+) -> Result<(), StockCommitFailure> {
+    let _admission = fence
+        .admit_commit()
+        .map_err(StockCommitFailure::Retirement)?;
+    apply_pending(config, state, pending, last_logged_refusals, recovery)
+        .map_err(StockCommitFailure::Policy)
 }
 
 fn apply_pending(
@@ -1168,14 +2037,13 @@ fn apply_pending(
     pending: Box<PendingStockSlice>,
     last_logged_refusals: &mut Option<Vec<StockRefusal>>,
     recovery: &MeshLocalSourceRecovery,
-) -> Result<(), anyhow::Error> {
+) -> Result<(), &'static str> {
     let PendingStockSlice {
         slice,
         type_url,
         refusals,
         policy_recovery_epoch,
     } = *pending;
-    let version = slice.version.clone();
     let services = slice.services.len();
     let workloads = slice.workloads.len();
     // Bind the exact policy generation before `install_slice` wakes the proxy
@@ -1200,18 +2068,14 @@ fn apply_pending(
             // section: a separate `pending_epoch()` test would let the slot be
             // cleared or replaced before the raise landed.
             recovery.mark_rejected_if_pending();
-            return Err(anyhow::anyhow!(
-                "stock xDS mesh slice quarantined: {}",
-                rejection.reason().as_metric_label()
-            ));
+            return Err(rejection.reason().as_metric_label());
         }
     }
     log_refusals(config, &refusals, last_logged_refusals);
     info!(
         node_id = %config.node_id,
         namespace = %config.namespace,
-        version = %version,
-        type_url = %type_url,
+        type_url = stock_log_type_label(&type_url),
         services,
         workloads,
         refused_resources = refusals.len(),
@@ -1223,7 +2087,8 @@ fn apply_pending(
 /// Emit the capability refusals for this apply, but only when the refusal set
 /// CHANGED. A stock control plane re-sends the same unsupported resources on
 /// every update, so logging unconditionally would flood the operator's log with
-/// a static list.
+/// a static list. Only closed-set type labels, reason codes, and counts are
+/// emitted — resource names and field details can carry CP-authored bytes.
 fn log_refusals(
     config: &StockXdsClientConfig,
     refusals: &[StockRefusal],
@@ -1254,9 +2119,7 @@ fn log_refusals(
         warn!(
             node_id = %config.node_id,
             type_url = refusal.type_label,
-            resource = %refusal.resource,
             reason = refusal.reason,
-            field = %refusal.detail,
             "Refused a stock xDS resource"
         );
     }
@@ -1292,13 +2155,405 @@ fn is_stock_type_url(type_url: &str) -> bool {
     )
 }
 
+/// Closed-set type label for stock ADS diagnostics. Arbitrary remote
+/// `type_url` strings collapse to `unsolicited`.
+fn stock_log_type_label(type_url: &str) -> &'static str {
+    match type_url {
+        CDS_TYPE_URL => "cds",
+        EDS_TYPE_URL => "eds",
+        LDS_TYPE_URL => "lds",
+        RDS_TYPE_URL => "rds",
+        SDS_TYPE_URL => "sds",
+        "policy-reload" => "policy_reload",
+        _ => "unsolicited",
+    }
+}
+
+/// Race one ADS RPC-open (response-headers) future against the credential
+/// fence and the absolute first-frame bound. Mirrors the outbound enqueue
+/// fence: already-observed retirement wins before the wait, the select is
+/// `biased` so a simultaneously-ready generation, invalidation, or absolute
+/// credential deadline wins over first-frame and over an open success, and
+/// dropping this future is what cancels the in-flight open. No task is
+/// detached. A closed credential watcher does not spin or invent a rotation;
+/// the absolute credential deadline and the first-frame bound still apply.
+enum StockRpcOpen<S> {
+    Ready(tonic::Response<S>),
+    FirstFrameTimeout,
+}
+
+async fn await_stock_ads_rpc_open_under_fence<S>(
+    rpc_open: impl Future<Output = Result<tonic::Response<S>, tonic::Status>>,
+    fence: &StockCredentialFence,
+    credential_rx: &mut tokio::sync::watch::Receiver<StockCredentialObservation>,
+    first_frame_at: tokio::time::Instant,
+) -> Result<StockRpcOpen<S>, StockStreamError> {
+    if let Some(retirement) = fence.evaluate() {
+        return Err(StockStreamError::Retirement(retirement));
+    }
+
+    let deadline = fence.deadline;
+    let deadline_sleep = tokio::time::sleep_until(
+        deadline.unwrap_or_else(|| tokio::time::Instant::now() + Duration::from_secs(60 * 60 * 24)),
+    );
+    tokio::pin!(deadline_sleep);
+    let first_frame_deadline = tokio::time::sleep_until(first_frame_at);
+    tokio::pin!(first_frame_deadline);
+    tokio::pin!(rpc_open);
+
+    tokio::select! {
+        biased;
+        _ = &mut deadline_sleep, if deadline.is_some() => {
+            Err(StockStreamError::Retirement(
+                MeshStreamRetirement::CredentialDeadline,
+            ))
+        }
+        changed = credential_rx.changed() => {
+            if changed.is_err() {
+                // Watcher is gone (shutdown). Do not spin or mislabel that as
+                // rotation; the absolute credential deadline and first-frame
+                // bound still cover this open.
+                tokio::select! {
+                    biased;
+                    _ = &mut deadline_sleep, if deadline.is_some() => {
+                        Err(StockStreamError::Retirement(
+                            MeshStreamRetirement::CredentialDeadline,
+                        ))
+                    }
+                    _ = &mut first_frame_deadline => {
+                        Ok(StockRpcOpen::FirstFrameTimeout)
+                    }
+                    result = &mut rpc_open => map_rpc_open_result(result),
+                }
+            } else {
+                Err(StockStreamError::Retirement(
+                    fence.retirement_from_observation(fence.latest()),
+                ))
+            }
+        }
+        _ = &mut first_frame_deadline => {
+            Ok(StockRpcOpen::FirstFrameTimeout)
+        }
+        result = &mut rpc_open => map_rpc_open_result(result),
+    }
+}
+
+fn map_rpc_open_result<S>(
+    result: Result<tonic::Response<S>, tonic::Status>,
+) -> Result<StockRpcOpen<S>, StockStreamError> {
+    // Only the canonical gRPC code: the status message is remote-authored.
+    result
+        .map(StockRpcOpen::Ready)
+        .map_err(|status| StockStreamError::SubscriptionRefused(grpc_status_category(&status)))
+}
+
+/// Enqueue one outbound `DiscoveryRequest`, bounded and credential-aware.
+///
+/// The bound is load-bearing (issue #3854). The outbound channel drains into
+/// the gRPC request stream, so a control plane that accepts the RPC and then
+/// stops reading — never opening its HTTP/2 receive window — leaves this send
+/// pending forever. That would suspend the whole receive loop, and every
+/// liveness and credential deadline in this module would stop being enforced by
+/// an unrelated best-effort ACK. Timing out here converts that into an ordinary
+/// bounded stream failure instead.
+///
+/// An already-observed or newly arriving generation/invalid/deadline event
+/// outranks the send, including while the enqueue is blocked. Returning that
+/// as a local retirement (not a transport failure) is what makes the next
+/// stream discard accumulator/subscription/nonce state touched under the
+/// retired credential. No task is detached; ACK/NACK ordering is preserved
+/// because this waits on a single enqueue.
+struct StockOutbound<'a> {
+    tx: &'a mpsc::Sender<DiscoveryRequest>,
+    bound: Duration,
+    fence: &'a StockCredentialFence,
+    credential_rx: &'a mut tokio::sync::watch::Receiver<StockCredentialObservation>,
+}
+
+impl StockOutbound<'_> {
+    async fn enqueue(&mut self, request: DiscoveryRequest) -> Result<(), StockOutboundError> {
+        send_request(
+            self.tx,
+            request,
+            self.bound,
+            self.fence,
+            self.credential_rx,
+            None,
+        )
+        .await
+    }
+}
+
+enum StockOutboundError {
+    Transport(&'static str),
+    Retirement(MeshStreamRetirement),
+}
+
+impl StockOutboundError {
+    fn into_stream_error(self) -> StockStreamError {
+        match self {
+            Self::Transport(reason) => StockStreamError::Transport(reason),
+            Self::Retirement(reason) => StockStreamError::Retirement(reason),
+        }
+    }
+
+    fn into_response_error(self) -> StockResponseError {
+        match self {
+            Self::Transport(reason) => StockResponseError::Transport(reason),
+            Self::Retirement(reason) => StockResponseError::Retirement(reason),
+        }
+    }
+}
+
+/// Closed-set result of one credential-raced outbound enqueue. Exposed so
+/// external tests can drive the production send path through a filled channel
+/// without standing up a control plane.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StockOutboundAdmission {
+    Sent,
+    Closed,
+    Timeout,
+    Retired(MeshStreamRetirement),
+}
+
 async fn send_request(
     tx: &mpsc::Sender<DiscoveryRequest>,
     request: DiscoveryRequest,
-) -> Result<(), anyhow::Error> {
-    tx.send(request)
-        .await
-        .map_err(|_| anyhow::anyhow!("stock xDS ADS request stream closed"))
+    bound: Duration,
+    fence: &StockCredentialFence,
+    credential_rx: &mut tokio::sync::watch::Receiver<StockCredentialObservation>,
+    parked: Option<&tokio::sync::watch::Sender<bool>>,
+) -> Result<(), StockOutboundError> {
+    // Already-observed retirement wins before any enqueue wait begins.
+    if let Some(retirement) = fence.evaluate() {
+        return Err(StockOutboundError::Retirement(retirement));
+    }
+    if let Some(parked) = parked {
+        let _ = parked.send(true);
+    }
+
+    let deadline = fence.deadline;
+    let deadline_sleep = tokio::time::sleep_until(
+        deadline.unwrap_or_else(|| tokio::time::Instant::now() + Duration::from_secs(60 * 60 * 24)),
+    );
+    tokio::pin!(deadline_sleep);
+    let send = tokio::time::timeout(bound, tx.send(request));
+    tokio::pin!(send);
+
+    tokio::select! {
+        biased;
+        _ = &mut deadline_sleep, if deadline.is_some() => {
+            Err(StockOutboundError::Retirement(
+                MeshStreamRetirement::CredentialDeadline,
+            ))
+        }
+        changed = credential_rx.changed() => {
+            if changed.is_err() {
+                // Watcher is gone (shutdown). Do not spin or mislabel that as
+                // rotation; the absolute deadline and the outbound bound still
+                // apply.
+                tokio::select! {
+                    biased;
+                    _ = &mut deadline_sleep, if deadline.is_some() => {
+                        Err(StockOutboundError::Retirement(
+                            MeshStreamRetirement::CredentialDeadline,
+                        ))
+                    }
+                    result = &mut send => map_send_result(result),
+                }
+            } else {
+                Err(StockOutboundError::Retirement(
+                    fence.retirement_from_observation(fence.latest()),
+                ))
+            }
+        }
+        result = &mut send => map_send_result(result),
+    }
+}
+
+fn map_send_result(
+    result: Result<
+        Result<(), mpsc::error::SendError<DiscoveryRequest>>,
+        tokio::time::error::Elapsed,
+    >,
+) -> Result<(), StockOutboundError> {
+    match result {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(_)) => Err(StockOutboundError::Transport("request_stream_closed")),
+        Err(_) => Err(StockOutboundError::Transport("request_enqueue_timeout")),
+    }
+}
+
+/// Admit a serialized credential read onto the shared watch, or refuse it.
+///
+/// `Ok(generation)` is captured under the watch send lock for *this*
+/// observation and is the only generation a connection fence may be bound to.
+/// `Err` means a newer completed read already won; the caller must not dial or
+/// open with the losing material. Retirement outcomes stay the existing
+/// closed set: invalidation if the winner is unusable, rotation otherwise.
+fn admit_stock_credential_observation(
+    watch: &StockCredentialWatch,
+    epoch: Option<StockCredentialReadEpoch>,
+    state: StockCredentialState,
+) -> Result<u64, MeshStreamRetirement> {
+    match watch.admit_observation(epoch, state) {
+        Ok(generation) => Ok(generation),
+        Err(winning) => Err(if winning.is_invalid() {
+            MeshStreamRetirement::CredentialSourceInvalid
+        } else {
+            MeshStreamRetirement::CredentialRotated
+        }),
+    }
+}
+
+/// Production reconnect admission: publish a serialized read, or refuse to
+/// bind/open if a newer observation already won. Used by external tests to
+/// prove an older credential cannot open a stream after a newer read.
+pub fn admit_stock_credential_observation_for_test(
+    watch: &StockCredentialWatch,
+    epoch: Option<StockCredentialReadEpoch>,
+    state: StockCredentialState,
+) -> Result<u64, MeshStreamRetirement> {
+    admit_stock_credential_observation(watch, epoch, state)
+}
+
+/// Drive the production credential-raced outbound enqueue with a caller-owned
+/// channel, fence, and optional "parked" barrier. Used by external tests to
+/// prove a blocked send cannot outrank rotation, invalidation, or deadline.
+#[allow(clippy::too_many_arguments)]
+pub async fn send_stock_outbound_racing_credential_for_test(
+    tx: &mpsc::Sender<DiscoveryRequest>,
+    request: DiscoveryRequest,
+    bound: Duration,
+    watch: &StockCredentialWatch,
+    opened_generation: u64,
+    deadline: Option<tokio::time::Instant>,
+    configured: bool,
+    credential_rx: &mut tokio::sync::watch::Receiver<StockCredentialObservation>,
+    parked: Option<&tokio::sync::watch::Sender<bool>>,
+) -> StockOutboundAdmission {
+    let fence = StockCredentialFence::bind(watch, opened_generation, deadline, configured);
+    match send_request(tx, request, bound, &fence, credential_rx, parked).await {
+        Ok(()) => StockOutboundAdmission::Sent,
+        Err(StockOutboundError::Transport("request_stream_closed")) => {
+            StockOutboundAdmission::Closed
+        }
+        Err(StockOutboundError::Transport(_)) => StockOutboundAdmission::Timeout,
+        Err(StockOutboundError::Retirement(retirement)) => {
+            StockOutboundAdmission::Retired(retirement)
+        }
+    }
+}
+
+/// Run `commit` while the stock credential watch observation lock is held
+/// after generation/deadline admission. A concurrent `publish` cannot become
+/// visible until `commit` returns. There is no async gap.
+pub fn run_under_stock_credential_commit_admission_for_test<R>(
+    watch: &StockCredentialWatch,
+    opened_generation: u64,
+    deadline: Option<tokio::time::Instant>,
+    configured: bool,
+    commit: impl FnOnce() -> R,
+) -> Result<R, MeshStreamRetirement> {
+    let fence = StockCredentialFence::bind(watch, opened_generation, deadline, configured);
+    let _admission = fence.admit_commit()?;
+    Ok(commit())
+}
+
+/// Closed-set outcome of admitting one stock `DiscoveryResponse` through the
+/// production handler. Used by external tests to capture log output.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StockResponseAdmission {
+    Acked,
+    Nacked,
+    Applied,
+    Closed(&'static str),
+}
+
+/// Drive the production stock ADS response path (admit, ACK/NACK, apply) so
+/// tests can capture tracing output without standing up a control plane.
+pub struct StockAdsAdmissionProbe {
+    accumulator: StockXdsAccumulator,
+    stream_state: StockStreamState,
+    last_logged_refusals: Option<Vec<StockRefusal>>,
+    state: MeshRuntimeState,
+}
+
+impl Default for StockAdsAdmissionProbe {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl StockAdsAdmissionProbe {
+    pub fn new() -> Self {
+        Self {
+            accumulator: StockXdsAccumulator::default(),
+            stream_state: StockStreamState::default(),
+            last_logged_refusals: None,
+            state: MeshRuntimeState::new(),
+        }
+    }
+
+    pub fn accumulator(&self) -> &StockXdsAccumulator {
+        &self.accumulator
+    }
+
+    pub async fn admit(
+        &mut self,
+        response: proto::DiscoveryResponse,
+        config: &StockXdsClientConfig,
+        baseline: &MeshConfig,
+        request: &MeshSliceRequest,
+    ) -> StockResponseAdmission {
+        let watch = StockCredentialWatch::new(StockCredentialState::NotConfigured);
+        let mut credential_rx = watch.receiver();
+        let fence = StockCredentialFence::bind(&watch, watch.latest().generation, None, false);
+        let (tx, mut rx) = mpsc::channel(32);
+        let recovery = MeshLocalSourceRecovery::new(Arc::new(AtomicBool::new(false)));
+        // `StockOutbound` only borrows `tx`; ending that borrow by scope (not
+        // `drop`) is what lets the sender close so the probe can drain.
+        let result = {
+            let mut outbound = StockOutbound {
+                tx: &tx,
+                bound: Duration::from_secs(5),
+                fence: &fence,
+                credential_rx: &mut credential_rx,
+            };
+            handle_stock_response(
+                response,
+                config,
+                baseline,
+                None,
+                request,
+                &mut outbound,
+                &mut self.accumulator,
+                &mut self.stream_state,
+            )
+            .await
+        };
+        drop(tx);
+        while rx.try_recv().is_ok() {}
+        match result {
+            Ok(StockResponseOutcome::Acked) => StockResponseAdmission::Acked,
+            Ok(StockResponseOutcome::Nacked) => StockResponseAdmission::Nacked,
+            Ok(StockResponseOutcome::Pending(pending)) => {
+                match apply_pending(
+                    config,
+                    &self.state,
+                    pending,
+                    &mut self.last_logged_refusals,
+                    recovery.as_ref(),
+                ) {
+                    Ok(()) => StockResponseAdmission::Applied,
+                    Err(reason) => StockResponseAdmission::Closed(reason),
+                }
+            }
+            Err(StockResponseError::Policy(reason)) => StockResponseAdmission::Closed(reason),
+            Err(StockResponseError::Transport(reason)) => StockResponseAdmission::Closed(reason),
+            Err(StockResponseError::Retirement(_)) => StockResponseAdmission::Closed("retired"),
+        }
+    }
 }
 
 // ── policy document watcher ──────────────────────────────────────────────
