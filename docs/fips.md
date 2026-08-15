@@ -90,26 +90,30 @@ and `vendor/**`. That input is the one the pinned action actually uses; a
 sibling `key:` value is ignored whenever `shared-key` is set and is not
 wired. Automatic toolchain/environment/manifest/lock hashing stays enabled,
 and this layer is not SHA-scoped, so dependency/compiler work remains a warm
-cross-commit fallback. After a successful compile, `fips-compile` publishes
-the full `target/` and `.cache/sccache` tree under
+cross-commit fallback. After a successful locked `fips` profile build,
+`fips-compile` publishes the full `target/` and `.cache/sccache` tree under
 `fips-producer-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}`.
-Before publishing, the producer also builds the complete FIPS `unit_tests` and
-`integration_tests` executables once and publishes digest-bound copies through
-an immutable artifact scoped to that workflow run and attempt. The filtered
+That compile job is build-only: complete FIPS `unit_tests` and
+`integration_tests` executables are compiled by the parallel `fips-test-build`
+consumer so claimed-profile shards and clippy do not wait on test-binary
+precompile. `fips-test-build` publishes digest-bound copies through an
+immutable artifact scoped to that workflow run and attempt. The filtered
 test consumer rejects unexpected names, symlinks, path escapes, and SHA-256
 mismatches before executing those binaries directly. It does not ask Cargo to
 revalidate fresh-checkout source mtimes and repeat test-only compile/link work.
 On a full workflow rerun, `fips-compile` restores the newest prior attempt with
 the same SHA + `run_id` before rebuilding and publishes a fresh attempt key;
 the first attempt and fork PRs may miss this optional warm source.
-The three ordinal `fips-claimed-checks` shards and `fips-clippy` restore the
-current producer key and do not save. Each claimed shard selects profiles from
-the policy checker's single inventory by ordinal modulo three and fails closed
-if it selects none. The six claimed combinations therefore remain checker-owned
-while running in parallel with clippy/tests after the shorter producer, rather
-than accumulating in one over-target consumer. Trusted non-cold cache consumers
-fail closed if the producer channel is missing. `fips-test` consumes only the
-same-run immutable artifact and never restores a build cache.
+The three ordinal `fips-claimed-checks` shards, `fips-clippy`, and
+`fips-test-build` restore the current producer key and do not save. Each
+claimed shard selects profiles from the policy checker's single inventory by
+ordinal modulo three and fails closed if it selects none. The six claimed
+combinations therefore remain checker-owned while running in parallel with
+clippy and test-binary compile after the shorter build-only producer.
+Trusted non-cold cache consumers fail closed if the producer channel is
+missing. `fips-test` consumes only the same-run immutable artifact and never
+restores a build cache. The required `FIPS Build & Test` aggregate depends on
+`fips-test-build` and fails closed if that producer does not succeed.
 The cache action holds the GitHub Actions cache credential inside the action process;
 PR-controlled `run:` steps never receive that credential. `setup-sccache`
 installs sccache from a checksum-pinned GitHub release and never invokes
@@ -118,15 +122,18 @@ into `GITHUB_ENV`). It activates only the checksum-verified executable by
 exact path (`FERRUM_SCCACHE_BIN` / `RUSTC_WRAPPER`) and persists
 `SCCACHE_GHA_ENABLED` empty. rust-cache `save-if`
 is false when `github.event.pull_request.head.repo.fork` is true on the
-compile producer, and always false on claimed checks/clippy, so fork pull
+compile producer, and always false on claimed checks, clippy, and
+`fips-test-build`, so fork pull
 requests restore and cannot save. Trusted compile runs keep `cache-on-failure`
 so ordinary failing jobs can publish stable dependency work when post-job
 cleanup still runs. The successful compile producer publishes before claimed
-checks/clippy/test start, so a downstream runner-loss retry can reuse it;
+checks, clippy, and test-binary compile start, so a downstream runner-loss retry
+can reuse it;
 abrupt loss of the producer cannot publish that producer's unsaved state. A `workflow_dispatch` input
 `force_cold_cache` skips cache restore and save so a hosted cold-cache run still
-proves every live assertion. Its producer still sends the exact test binaries
-to its own test job through the attempt-scoped artifact; that same-run transport
+proves every live assertion. Its `fips-test-build` job still sends the exact
+test binaries to its own test job through the attempt-scoped artifact; that
+same-run transport
 does not warm or publish a shared cache. Path planning is fail-closed: a missing or unknown trusted
 planner runs the compile gate rather than skipping it. Path planning reads a
 NUL-delimited `git diff --name-only --no-renames -z` listing so a hostile

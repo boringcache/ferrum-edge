@@ -537,6 +537,22 @@ def extract_job(workflow: str, job: str) -> str:
     return match.group("body")
 
 
+def job_needs_list(job_body: str) -> set[str]:
+    list_match = re.search(
+        r"(?m)^    needs:\n(?P<needs>(?:^      - [^\n]+\n)+)", job_body
+    )
+    if list_match:
+        return {
+            line.strip().removeprefix("- ").strip()
+            for line in list_match.group("needs").splitlines()
+            if line.strip().startswith("- ")
+        }
+    scalar_match = re.search(r"(?m)^    needs: ([A-Za-z0-9_-]+)$", job_body)
+    if scalar_match:
+        return {scalar_match.group(1)}
+    return set()
+
+
 def job_steps(job_body: str) -> list[str]:
     match = re.search(r"(?ms)^    steps:\n(.*)\Z", job_body)
     if match is None:
@@ -758,7 +774,10 @@ def check_fips_producer_channel(
     compile_job = extract_job(workflow, "fips-compile")
     claimed_job = extract_job(workflow, "fips-claimed-checks")
     clippy_job = extract_job(workflow, "fips-clippy")
+    test_build_job = extract_job(workflow, "fips-test-build")
     test_job = extract_job(workflow, "fips-test")
+    aggregate = extract_job(workflow, "fips-build")
+    require(bool(test_build_job), "fips-test-build job is missing", failures)
     compile_saves = [
         step for step in job_steps(compile_job) if step_uses(step).startswith(CACHE_SAVE)
     ]
@@ -819,45 +838,23 @@ def check_fips_producer_channel(
     )
     restore_position = compile_job.find("Restore prior-attempt FIPS producer outputs")
     build_position = compile_job.find("Build the FIPS profile")
-    test_build_position = compile_job.find("Precompile FIPS test binaries for consumers")
-    artifact_position = compile_job.find("Publish exact FIPS test executables")
     save_position = compile_job.find("Save FIPS producer compile outputs")
     require(
         restore_position >= 0
         and build_position >= 0
-        and test_build_position >= 0
-        and artifact_position >= 0
         and save_position >= 0
-        and restore_position
-        < build_position
-        < test_build_position
-        < artifact_position
-        < save_position,
+        and restore_position < build_position < save_position,
         "fips-compile must restore the prior attempt before building the FIPS "
-        "binary and test executables, publish their same-run artifact, then save "
-        "the refreshed producer",
+        "binary, then save the refreshed producer",
         failures,
     )
     require(
-        "--test unit_tests --test integration_tests --no-run" in compile_job,
-        "fips-compile must put the exact unit/integration test executables in the "
-        "producer archive before consumers run filtered tests",
-        failures,
-    )
-    require(
-        "--message-format=json" in compile_job
-        and "fips-test-bundle" in compile_job
-        and '"sha256"' in compile_job,
-        "fips-compile must stage digest-bound exact test executables",
-        failures,
-    )
-    require(
-        "actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a"
-        in compile_job
-        and "if-no-files-found: error" in compile_job
-        and "fips-test-binaries-${{ github.run_id }}-${{ github.run_attempt }}"
-        in compile_job,
-        "fips-compile must publish a pinned, attempt-scoped exact-test artifact",
+        "Precompile FIPS test binaries for consumers" not in compile_job
+        and "--test unit_tests --test integration_tests --no-run" not in compile_job
+        and "Publish exact FIPS test executables" not in compile_job
+        and "upload-artifact@" not in compile_job,
+        "fips-compile must remain a build-only producer so test-binary precompile "
+        "can overlap claimed-profile and clippy consumers",
         failures,
     )
     if compile_saves:
@@ -887,6 +884,7 @@ def check_fips_producer_channel(
     for job_body, job_name in (
         (claimed_job, "fips-claimed-checks"),
         (clippy_job, "fips-clippy"),
+        (test_build_job, "fips-test-build"),
     ):
         restores = [
             step
@@ -975,6 +973,69 @@ def check_fips_producer_channel(
                 f"{job_name} rust-cache must not use the compile producer save-if",
                 failures,
             )
+
+    require(
+        "--test unit_tests --test integration_tests --no-run" in test_build_job,
+        "fips-test-build must compile the exact unit/integration test executables "
+        "before the filtered test consumer runs",
+        failures,
+    )
+    require(
+        "--message-format=json" in test_build_job
+        and "fips-test-bundle" in test_build_job
+        and '"sha256"' in test_build_job,
+        "fips-test-build must stage digest-bound exact test executables",
+        failures,
+    )
+    require(
+        "actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a"
+        in test_build_job
+        and "if-no-files-found: error" in test_build_job
+        and "fips-test-binaries-${{ github.run_id }}-${{ github.run_attempt }}"
+        in test_build_job,
+        "fips-test-build must publish a pinned, attempt-scoped exact-test artifact",
+        failures,
+    )
+    test_build_precompile = test_build_job.find(
+        "Precompile FIPS test binaries for consumers"
+    )
+    test_build_publish = test_build_job.find("Publish exact FIPS test executables")
+    test_build_restore = test_build_job.find("Restore FIPS producer compile outputs")
+    require(
+        test_build_restore >= 0
+        and test_build_precompile >= 0
+        and test_build_publish >= 0
+        and test_build_restore < test_build_precompile < test_build_publish,
+        "fips-test-build must restore the compile producer before precompiling "
+        "and publishing the exact test artifact",
+        failures,
+    )
+    require(
+        "fips-compile" in job_needs_list(test_build_job),
+        "fips-test-build must wait for the build-only compile producer",
+        failures,
+    )
+    require(
+        "fips-test-build" not in job_needs_list(claimed_job)
+        and "fips-test-build" not in job_needs_list(clippy_job),
+        "fips-claimed-checks and fips-clippy must not wait for test-binary precompile",
+        failures,
+    )
+    require(
+        "fips-test-build" in job_needs_list(test_job),
+        "fips-test must wait for the exact test-binary producer",
+        failures,
+    )
+    require(
+        "fips-test-build" in job_needs_list(aggregate),
+        "FIPS aggregate must depend on the test-binary producer",
+        failures,
+    )
+    require(
+        "needs.fips-test-build.result != 'success'" in aggregate,
+        "FIPS aggregate must fail closed when the test-binary producer fails",
+        failures,
+    )
 
     require(
         "actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c"
@@ -1481,6 +1542,12 @@ def check_fips(workflow: str, failures: list[str]) -> None:
         "FIPS rust-cache must not use the old ignored shared-key: ci-fips + key: shape",
         failures,
     )
+    compile_job = extract_job(workflow, "fips-compile")
+    claimed_job = extract_job(workflow, "fips-claimed-checks")
+    clippy_job = extract_job(workflow, "fips-clippy")
+    test_build_job = extract_job(workflow, "fips-test-build")
+    test_job = extract_job(workflow, "fips-test")
+    aggregate = extract_job(workflow, "fips-build")
     fips_contract_inputs = (
         "'Cargo.toml'",
         "'Cargo.lock'",
@@ -1492,9 +1559,10 @@ def check_fips(workflow: str, failures: list[str]) -> None:
         "'vendor/**'",
     )
     for job_body, job_name in (
-        (extract_job(workflow, "fips-compile"), "fips-compile"),
-        (extract_job(workflow, "fips-claimed-checks"), "fips-claimed-checks"),
-        (extract_job(workflow, "fips-clippy"), "fips-clippy"),
+        (compile_job, "fips-compile"),
+        (claimed_job, "fips-claimed-checks"),
+        (clippy_job, "fips-clippy"),
+        (test_build_job, "fips-test-build"),
     ):
         blocks = rust_cache_with_blocks(job_body)
         require(
@@ -1533,10 +1601,10 @@ def check_fips(workflow: str, failures: list[str]) -> None:
         failures,
     )
     require(
-        workflow.count('sccache_bin="${FERRUM_SCCACHE_BIN:-}"') == 3
-        and workflow.count('"$sccache_bin" --show-stats') == 3,
-        "FIPS compile/claimed-checks/clippy must record sccache stats via "
-        "FERRUM_SCCACHE_BIN",
+        workflow.count('sccache_bin="${FERRUM_SCCACHE_BIN:-}"') == 4
+        and workflow.count('"$sccache_bin" --show-stats') == 4,
+        "FIPS compile/claimed-checks/clippy/test-binary jobs must record sccache "
+        "stats via FERRUM_SCCACHE_BIN",
         failures,
     )
     require(
@@ -1604,7 +1672,6 @@ def check_fips(workflow: str, failures: list[str]) -> None:
         "FIPS key-admission tests must remain in the live gate",
         failures,
     )
-    test_job = extract_job(workflow, "fips-test")
     require(
         '"$unit_test_binary" tls::fips_' in test_job,
         "FIPS unit test binary must use one tls::fips_ TESTNAME prefix",
@@ -1670,10 +1737,12 @@ def check_fips(workflow: str, failures: list[str]) -> None:
     compile_job = extract_job(workflow, "fips-compile")
     claimed_job = extract_job(workflow, "fips-claimed-checks")
     clippy_job = extract_job(workflow, "fips-clippy")
+    test_build_job = extract_job(workflow, "fips-test-build")
     aggregate = extract_job(workflow, "fips-build")
     require(bool(compile_job), "fips-compile job is missing", failures)
     require(bool(claimed_job), "fips-claimed-checks job is missing", failures)
     require(bool(clippy_job), "fips-clippy job is missing", failures)
+    require(bool(test_build_job), "fips-test-build job is missing", failures)
     require(bool(test_job), "fips-test job is missing", failures)
     require(
         "needs.fips-plan.outputs.relevant == 'true'" in compile_job,
@@ -1681,19 +1750,30 @@ def check_fips(workflow: str, failures: list[str]) -> None:
         failures,
     )
     require(
-        "needs: fips-compile" in claimed_job
-        or "needs:\n      - fips-compile" in claimed_job,
+        "fips-compile" in job_needs_list(claimed_job),
         "fips-claimed-checks must wait for the compile cache to be saved",
         failures,
     )
     require(
-        "needs: fips-compile" in clippy_job or "needs:\n      - fips-compile" in clippy_job,
+        "fips-compile" in job_needs_list(clippy_job),
         "fips-clippy must wait for the compile cache to be saved",
         failures,
     )
     require(
-        "needs: fips-compile" in test_job or "needs:\n      - fips-compile" in test_job,
-        "fips-test must wait for the compile cache to be saved",
+        "fips-compile" in job_needs_list(test_build_job),
+        "fips-test-build must wait for the compile cache to be saved",
+        failures,
+    )
+    require(
+        "fips-test-build" in job_needs_list(test_job),
+        "fips-test must wait for the exact test-binary producer",
+        failures,
+    )
+    require(
+        "fips-test-build" not in job_needs_list(claimed_job)
+        and "fips-test-build" not in job_needs_list(clippy_job),
+        "claimed-profile and clippy consumers must overlap test-binary precompile "
+        "instead of waiting for it",
         failures,
     )
     require(
@@ -1729,6 +1809,7 @@ def check_fips(workflow: str, failures: list[str]) -> None:
         (compile_job, "fips-compile"),
         (claimed_job, "fips-claimed-checks"),
         (clippy_job, "fips-clippy"),
+        (test_build_job, "fips-test-build"),
     ):
         check_credential_absence_assertion(job_body, job_name, failures)
         cargo_idx = job_body.find("cargo ")
@@ -1758,8 +1839,35 @@ def check_fips(workflow: str, failures: list[str]) -> None:
         failures,
     )
     require(
+        {"fips-plan", "fips-compile", "fips-claimed-checks", "fips-clippy",
+         "fips-test-build", "fips-test"} <= job_needs_list(aggregate),
+        "FIPS Build & Test aggregate must depend on every expensive FIPS job "
+        "including the test-binary producer",
+        failures,
+    )
+    require(
+        "needs.fips-compile.result != 'success'" in aggregate,
+        "FIPS aggregate must fail closed when compile fails",
+        failures,
+    )
+    require(
         "needs.fips-claimed-checks.result != 'success'" in aggregate,
         "FIPS aggregate must fail closed when claimed-profile checks fail",
+        failures,
+    )
+    require(
+        "needs.fips-clippy.result != 'success'" in aggregate,
+        "FIPS aggregate must fail closed when clippy fails",
+        failures,
+    )
+    require(
+        "needs.fips-test-build.result != 'success'" in aggregate,
+        "FIPS aggregate must fail closed when the test-binary producer fails",
+        failures,
+    )
+    require(
+        "needs.fips-test.result != 'success'" in aggregate,
+        "FIPS aggregate must fail closed when tests fail",
         failures,
     )
 
@@ -2074,6 +2182,11 @@ def check_docs_and_coverage(failures: list[str]) -> None:
         failures,
     )
     require(
+        "fips-test-build" in ci_cd,
+        "docs/ci_cd.md must document the FIPS test-binary producer job",
+        failures,
+    )
+    require(
         "shared-key" in ci_cd and "ignored" in ci_cd.lower(),
         "docs/ci_cd.md must document that pinned rust-cache ignores key when shared-key is set",
         failures,
@@ -2158,6 +2271,11 @@ def check_docs_and_coverage(failures: list[str]) -> None:
         and "github.sha" in fips_doc
         and "run_attempt" in fips_doc,
         "docs/fips.md must document the exact producer cache key",
+        failures,
+    )
+    require(
+        "fips-test-build" in fips_doc,
+        "docs/fips.md must document the FIPS test-binary producer job",
         failures,
     )
     require(
@@ -2618,6 +2736,256 @@ def self_test() -> int:
             for item in consumer_save_failures
         ),
         "self-test: missing compile restore/build/save ordering must fail",
+        failures,
+    )
+    require(
+        any("fips-test-build job is missing" in item for item in consumer_save_failures),
+        "self-test: missing fips-test-build job must fail",
+        failures,
+    )
+    require(
+        any("test-binary producer" in item for item in consumer_save_failures),
+        "self-test: missing test-binary producer dependency/result must fail",
+        failures,
+    )
+
+    serial_test_build = (
+        "name: demo\n"
+        "env:\n"
+        f"  FIPS_PRODUCER_KEY: {FIPS_PRODUCER_KEY_EXPR}\n"
+        f"  FIPS_PRODUCER_RESTORE_PREFIX: {FIPS_PRODUCER_RESTORE_PREFIX_EXPR}\n"
+        "jobs:\n"
+        "  fips-compile:\n"
+        "    steps:\n"
+        "      - name: Restore prior-attempt FIPS producer outputs\n"
+        f"        uses: {CACHE_RESTORE} # v4.2.4\n"
+        f"        if: {COLD_NOT_TRUE}\n"
+        "        with:\n"
+        "          path: |\n"
+        f"            {FIPS_PRODUCER_PATHS[0]}\n"
+        f"            {FIPS_PRODUCER_PATHS[1]}\n"
+        "          key: ${{ env.FIPS_PRODUCER_KEY }}\n"
+        "          restore-keys: |\n"
+        "            ${{ env.FIPS_PRODUCER_RESTORE_PREFIX }}\n"
+        "      - name: Build the FIPS profile\n"
+        "        run: cargo build --locked --no-default-features --features fips --bin ferrum-edge\n"
+        "      - name: Precompile FIPS test binaries for consumers\n"
+        "        run: cargo test --locked --no-default-features --features fips --test unit_tests --test integration_tests --no-run\n"
+        "      - name: Publish exact FIPS test executables\n"
+        "        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a\n"
+        "      - name: Save FIPS producer compile outputs\n"
+        f"        uses: {CACHE_SAVE} # v4.2.4\n"
+        f"        if: {COLD_NOT_TRUE} && {FORK_NOT_TRUE}\n"
+        "        with:\n"
+        "          path: |\n"
+        f"            {FIPS_PRODUCER_PATHS[0]}\n"
+        f"            {FIPS_PRODUCER_PATHS[1]}\n"
+        "          key: ${{ env.FIPS_PRODUCER_KEY }}\n"
+        "  fips-claimed-checks:\n"
+        "    needs: fips-compile\n"
+        "    steps:\n"
+        "      - name: Restore FIPS producer compile outputs\n"
+        f"        uses: {CACHE_RESTORE} # v4.2.4\n"
+        f"        if: {COLD_NOT_TRUE}\n"
+        "        with:\n"
+        "          key: ${{ env.FIPS_PRODUCER_KEY }}\n"
+        "  fips-clippy:\n"
+        "    needs: fips-compile\n"
+        "    steps:\n"
+        "      - name: Restore FIPS producer compile outputs\n"
+        f"        uses: {CACHE_RESTORE} # v4.2.4\n"
+        f"        if: {COLD_NOT_TRUE}\n"
+        "        with:\n"
+        "          key: ${{ env.FIPS_PRODUCER_KEY }}\n"
+        "  fips-test-build:\n"
+        "    needs: fips-compile\n"
+        "    steps:\n"
+        "      - name: Restore FIPS producer compile outputs\n"
+        f"        uses: {CACHE_RESTORE} # v4.2.4\n"
+        f"        if: {COLD_NOT_TRUE}\n"
+        "        with:\n"
+        "          key: ${{ env.FIPS_PRODUCER_KEY }}\n"
+        "      - name: Precompile FIPS test binaries for consumers\n"
+        "      - name: Publish exact FIPS test executables\n"
+        "  fips-test:\n"
+        "    needs: fips-test-build\n"
+        "    steps:\n"
+        "      - name: Download exact FIPS test executables\n"
+        "  fips-build:\n"
+        "    needs:\n"
+        "      - fips-compile\n"
+        "      - fips-test-build\n"
+        "    steps:\n"
+        "      - name: Fail when FIPS test-binary compile did not succeed\n"
+        "        if: needs.fips-plan.outputs.relevant == 'true' && needs.fips-test-build.result != 'success'\n"
+        "        run: exit 1\n"
+    )
+    serial_failures: list[str] = []
+    check_fips_producer_channel(serial_test_build, serial_failures)
+    require(
+        any("build-only producer" in item for item in serial_failures),
+        "self-test: keeping test-binary precompile on fips-compile must fail",
+        failures,
+    )
+
+    test_bypass = serial_test_build.replace(
+        "      - name: Precompile FIPS test binaries for consumers\n"
+        "        run: cargo test --locked --no-default-features --features fips --test unit_tests --test integration_tests --no-run\n"
+        "      - name: Publish exact FIPS test executables\n"
+        "        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a\n"
+        "      - name: Save FIPS producer compile outputs\n",
+        "      - name: Save FIPS producer compile outputs\n",
+    ).replace(
+        "    needs: fips-test-build\n",
+        "    needs: fips-compile\n",
+        1,
+    )
+    bypass_failures: list[str] = []
+    check_fips_producer_channel(test_bypass, bypass_failures)
+    require(
+        any("exact test-binary producer" in item for item in bypass_failures),
+        "self-test: fips-test depending only on fips-compile must fail",
+        failures,
+    )
+
+    test_build_save = serial_test_build.replace(
+        "      - name: Precompile FIPS test binaries for consumers\n"
+        "        run: cargo test --locked --no-default-features --features fips --test unit_tests --test integration_tests --no-run\n"
+        "      - name: Publish exact FIPS test executables\n"
+        "        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a\n"
+        "      - name: Save FIPS producer compile outputs\n",
+        "      - name: Save FIPS producer compile outputs\n",
+    ).replace(
+        "  fips-test-build:\n"
+        "    needs: fips-compile\n"
+        "    steps:\n"
+        "      - name: Restore FIPS producer compile outputs\n"
+        f"        uses: {CACHE_RESTORE} # v4.2.4\n"
+        f"        if: {COLD_NOT_TRUE}\n"
+        "        with:\n"
+        "          key: ${{ env.FIPS_PRODUCER_KEY }}\n",
+        "  fips-test-build:\n"
+        "    needs: fips-compile\n"
+        "    steps:\n"
+        "      - name: Restore FIPS producer compile outputs\n"
+        f"        uses: {CACHE_RESTORE} # v4.2.4\n"
+        f"        if: {COLD_NOT_TRUE}\n"
+        "        with:\n"
+        "          key: ${{ env.FIPS_PRODUCER_KEY }}\n"
+        "      - name: Save FIPS producer compile outputs\n"
+        f"        uses: {CACHE_SAVE} # v4.2.4\n"
+        f"        if: {COLD_NOT_TRUE} && {FORK_NOT_TRUE}\n"
+        "        with:\n"
+        "          key: ${{ env.FIPS_PRODUCER_KEY }}\n",
+        1,
+    )
+    test_build_save_failures: list[str] = []
+    check_fips_producer_channel(test_build_save, test_build_save_failures)
+    require(
+        any(
+            "fips-test-build must be a producer-cache consumer and must not save" in item
+            for item in test_build_save_failures
+        ),
+        "self-test: fips-test-build producer save must fail",
+        failures,
+    )
+
+    missing_artifact = serial_test_build.replace(
+        "      - name: Precompile FIPS test binaries for consumers\n"
+        "        run: cargo test --locked --no-default-features --features fips --test unit_tests --test integration_tests --no-run\n"
+        "      - name: Publish exact FIPS test executables\n"
+        "        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a\n"
+        "      - name: Save FIPS producer compile outputs\n",
+        "      - name: Save FIPS producer compile outputs\n",
+    ).replace(
+        "      - name: Precompile FIPS test binaries for consumers\n"
+        "      - name: Publish exact FIPS test executables\n",
+        "      - name: Precompile FIPS test binaries for consumers\n"
+        "        run: cargo test --locked --no-default-features --features fips --test unit_tests --test integration_tests --no-run\n",
+        1,
+    )
+    missing_artifact_failures: list[str] = []
+    check_fips_producer_channel(missing_artifact, missing_artifact_failures)
+    require(
+        any(
+            "pinned, attempt-scoped exact-test artifact" in item
+            for item in missing_artifact_failures
+        ),
+        "self-test: fips-test-build without exact artifact publication must fail",
+        failures,
+    )
+
+    claimed_waits_for_tests = serial_test_build.replace(
+        "      - name: Precompile FIPS test binaries for consumers\n"
+        "        run: cargo test --locked --no-default-features --features fips --test unit_tests --test integration_tests --no-run\n"
+        "      - name: Publish exact FIPS test executables\n"
+        "        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a\n"
+        "      - name: Save FIPS producer compile outputs\n",
+        "      - name: Save FIPS producer compile outputs\n",
+    ).replace(
+        "  fips-claimed-checks:\n"
+        "    needs: fips-compile\n",
+        "  fips-claimed-checks:\n"
+        "    needs: fips-test-build\n",
+        1,
+    )
+    claimed_wait_failures: list[str] = []
+    check_fips_producer_channel(claimed_waits_for_tests, claimed_wait_failures)
+    require(
+        any(
+            "must not wait for test-binary precompile" in item
+            for item in claimed_wait_failures
+        ),
+        "self-test: claimed-profile waiting for test-binary precompile must fail",
+        failures,
+    )
+
+    missing_result = serial_test_build.replace(
+        "      - name: Precompile FIPS test binaries for consumers\n"
+        "        run: cargo test --locked --no-default-features --features fips --test unit_tests --test integration_tests --no-run\n"
+        "      - name: Publish exact FIPS test executables\n"
+        "        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a\n"
+        "      - name: Save FIPS producer compile outputs\n",
+        "      - name: Save FIPS producer compile outputs\n",
+    ).replace(
+        "        if: needs.fips-plan.outputs.relevant == 'true' && needs.fips-test-build.result != 'success'\n",
+        "        if: needs.fips-plan.outputs.relevant == 'true' && needs.fips-compile.result != 'success'\n",
+        1,
+    )
+    missing_result_failures: list[str] = []
+    check_fips_producer_channel(missing_result, missing_result_failures)
+    require(
+        any(
+            "fail closed when the test-binary producer fails" in item
+            for item in missing_result_failures
+        ),
+        "self-test: aggregate without test-binary producer result check must fail",
+        failures,
+    )
+
+    cold_test_build = test_bypass.replace(
+        "  fips-test-build:\n"
+        "    needs: fips-compile\n"
+        "    steps:\n"
+        "      - name: Restore FIPS producer compile outputs\n"
+        f"        uses: {CACHE_RESTORE} # v4.2.4\n"
+        f"        if: {COLD_NOT_TRUE}\n",
+        "  fips-test-build:\n"
+        "    needs: fips-compile\n"
+        "    steps:\n"
+        "      - name: Restore FIPS producer compile outputs\n"
+        f"        uses: {CACHE_RESTORE} # v4.2.4\n"
+        f"        if: {COLD_IS_TRUE}\n",
+        1,
+    )
+    cold_test_build_failures: list[str] = []
+    check_fips_producer_channel(cold_test_build, cold_test_build_failures)
+    require(
+        any(
+            "fips-test-build producer restore must skip force_cold_cache" in item
+            for item in cold_test_build_failures
+        ),
+        "self-test: fips-test-build restoring under force_cold_cache must fail",
         failures,
     )
 
