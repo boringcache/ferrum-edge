@@ -13059,6 +13059,13 @@ async fn dispatch_grpc_native_h3(
     tokio::pin!(read_deadline);
     let mut stream_done = false;
     let mut bytes_streamed: u64 = 0;
+    // Bytes offered to h3 `send_data`, including a write that is still parked
+    // in QUIC flow control. Completed-write `bytes_streamed` stays 0 until
+    // `poll_ready` finishes, which is too late for the message-safe trailer
+    // rule: the frame is queued on first poll of `send_data`. Charged only
+    // when that write is actually polled, so an already-elapsed bound that
+    // never starts the write still looks like pre-DATA.
+    let mut bytes_offered: u64 = 0;
     let mut total_streamed: usize = 0;
     let mut client_disconnected = false;
     let mut body_completed = false;
@@ -13133,10 +13140,19 @@ async fn dispatch_grpc_native_h3(
         auth_deadline_plan,
     );
     macro_rules! await_downstream_grpc_write {
-        ($write:expr) => {{
+        ($write:expr, $len:expr) => {{
+            // Charge the offer only when this future is polled. h3 queues the
+            // DATA frame on first poll, then `poll_ready` parks on flow
+            // control; a cancelled write must not look like a zero-DATA
+            // trailers-only completion. An already-elapsed bound that never
+            // polls still looks like pre-DATA.
+            let write = async {
+                bytes_offered = bytes_offered.saturating_add($len);
+                $write.await
+            };
             match crate::http3::stream_util::await_response_write_before_deadline(
                 downstream_write_bound.deadline(),
-                $write,
+                write,
             )
             .await
             {
@@ -13180,7 +13196,7 @@ async fn dispatch_grpc_native_h3(
                     client_deadline_expired = true;
                     coalesce_buf.clear();
                     if crate::http3::stream_util::grpc_deadline_can_send_terminal_status(
-                        bytes_streamed,
+                        bytes_offered,
                     ) {
                         if send_h3_grpc_terminal_trailers(
                             &mut send_half,
@@ -13232,14 +13248,16 @@ async fn dispatch_grpc_native_h3(
             // biased select so simultaneous backend DATA cannot cross the deadline.
             // Headers (HTTP 200 + content-type) are already on the wire.
             //
-            // If NO body bytes have been flushed yet, complete the RPC with a clean
-            // terminal `grpc-status: 4` trailer (an empty-body deadline) so the
-            // client surfaces gRPC DEADLINE_EXCEEDED instead of a transport failure
-            // — clearing any buffered-but-unflushed tail is safe because the client
-            // never saw a partial message. But once ANY body bytes are on the wire,
-            // a length-prefixed gRPC message may be mid-frame (H3 DATA chunk
-            // boundaries are independent of gRPC message boundaries), so dropping
-            // the buffered remainder and synthesizing clean trailers would hand the
+            // If NO body bytes have been offered to the H3 send half yet, complete
+            // the RPC with a clean terminal `grpc-status: 4` trailer (an empty-body
+            // deadline) so the client surfaces gRPC DEADLINE_EXCEEDED instead of a
+            // transport failure — clearing any buffered-but-unflushed tail is safe
+            // because the client never saw a partial message. Completed-write
+            // accounting is not enough: h3 queues DATA before `poll_ready`, so a
+            // cancelled flow-control wait can leave a prefix client-visible. Once
+            // ANY body bytes have been offered, a length-prefixed gRPC message may
+            // be mid-frame (H3 DATA chunk boundaries are independent of gRPC
+            // message boundaries), so synthesizing clean trailers would hand the
             // client a TRUNCATED message it surfaces as a protocol/internal error.
             // In that case RESET instead: the client sees a transport abort and its
             // own (equal) RPC deadline fires. Either way this client-owned expiry is
@@ -13251,12 +13269,13 @@ async fn dispatch_grpc_native_h3(
             // how much traffic is still flowing.
             //
             // Protocol-correct termination follows the same message-safety rule
-            // as the client-deadline arm directly below: while NO response body
-            // byte is client-visible, a clean `grpc-status: 16` (UNAUTHENTICATED)
-            // trailer is legal and complete; once ANY body byte is on the wire a
-            // length-prefixed gRPC message may be mid-frame, so the stream is
-            // RESET instead of being handed synthesized trailers that would
-            // truncate a message. Either way this is a gateway POLICY expiry,
+            // as the client-deadline arm directly below: while NO response DATA
+            // has been offered to the H3 send half, a clean `grpc-status: 16`
+            // (UNAUTHENTICATED) trailer is legal and complete; once ANY body byte
+            // has been queued a length-prefixed gRPC message may be mid-frame, so
+            // the stream is RESET instead of being handed synthesized trailers
+            // that would truncate a message. Either way this is a gateway POLICY
+            // expiry,
             // not a backend fault, so the recorded class stays health-neutral.
             //
             // `break 'outer` retires the opposite direction deterministically:
@@ -13270,7 +13289,7 @@ async fn dispatch_grpc_native_h3(
                     .unwrap_or(crate::proxy::auth_lifetime::StreamAuthTermination::CredentialExpired);
                 coalesce_buf.clear();
                 if crate::http3::stream_util::grpc_deadline_can_send_terminal_status(
-                    bytes_streamed,
+                    bytes_offered,
                 ) {
                     debug!(
                         "native H3 gRPC stream reached its authorization lifetime before any \
@@ -13325,7 +13344,7 @@ async fn dispatch_grpc_native_h3(
                 client_deadline_expired = true;
                 coalesce_buf.clear();
                 if crate::http3::stream_util::grpc_deadline_can_send_terminal_status(
-                    bytes_streamed,
+                    bytes_offered,
                 ) {
                     warn!(
                         "gRPC deadline (grpc-timeout) exceeded before any response body; \
@@ -13384,7 +13403,7 @@ async fn dispatch_grpc_native_h3(
                     // Health-neutral and exact-once through the request latch.
                     coalesce_buf.clear();
                     if crate::http3::stream_util::grpc_deadline_can_send_terminal_status(
-                        bytes_streamed,
+                        bytes_offered,
                     ) {
                         debug!(
                             "native H3 gRPC request upload reached its authorization lifetime \
@@ -13432,7 +13451,7 @@ async fn dispatch_grpc_native_h3(
                 );
                 coalesce_buf.clear();
                 if crate::http3::stream_util::grpc_deadline_can_send_terminal_status(
-                    bytes_streamed,
+                    bytes_offered,
                 ) {
                     if send_h3_grpc_terminal_trailers(
                         &mut send_half,
@@ -13491,7 +13510,10 @@ async fn dispatch_grpc_native_h3(
                         ) {
                             let data =
                                 crate::http3::config::copy_remaining_response_chunk(&mut chunk);
-                            if !await_downstream_grpc_write!(send_half.send_data(data.clone())) {
+                            if !await_downstream_grpc_write!(
+                                send_half.send_data(data.clone()),
+                                chunk_len as u64
+                            ) {
                                 break 'outer;
                             }
                             grpc_response_scanner.push(&data, &grpc_response_messages);
@@ -13505,7 +13527,10 @@ async fn dispatch_grpc_native_h3(
                         if coalesce_buf.len() >= coalesce_min_bytes {
                             let data = coalesce_buf.split().freeze();
                             let data_len = data.len() as u64;
-                            if !await_downstream_grpc_write!(send_half.send_data(data.clone())) {
+                            if !await_downstream_grpc_write!(
+                                send_half.send_data(data.clone()),
+                                data_len
+                            ) {
                                 break 'outer;
                             }
                             grpc_response_scanner.push(&data, &grpc_response_messages);
@@ -13557,7 +13582,7 @@ async fn dispatch_grpc_native_h3(
             _ = &mut flush_timer, if !coalesce_buf.is_empty() && !stream_done => {
                 let data = coalesce_buf.split().freeze();
                 let data_len = data.len() as u64;
-                if !await_downstream_grpc_write!(send_half.send_data(data.clone())) {
+                if !await_downstream_grpc_write!(send_half.send_data(data.clone()), data_len) {
                     break 'outer;
                 }
                 grpc_response_scanner.push(&data, &grpc_response_messages);
@@ -13579,7 +13604,7 @@ async fn dispatch_grpc_native_h3(
             if !coalesce_buf.is_empty() {
                 let data = coalesce_buf.split().freeze();
                 let data_len = data.len() as u64;
-                if !await_downstream_grpc_write!(send_half.send_data(data.clone())) {
+                if !await_downstream_grpc_write!(send_half.send_data(data.clone()), data_len) {
                     break 'outer;
                 }
                 grpc_response_scanner.push(&data, &grpc_response_messages);
@@ -13645,7 +13670,7 @@ async fn dispatch_grpc_native_h3(
                     Some(termination) => {
                         coalesce_buf.clear();
                         if crate::http3::stream_util::grpc_deadline_can_send_terminal_status(
-                            bytes_streamed,
+                            bytes_offered,
                         ) {
                             debug!(
                                 "native H3 gRPC stream reached its authorization lifetime \
@@ -13692,13 +13717,13 @@ async fn dispatch_grpc_native_h3(
                         // FIN — NOT that the last length-prefixed gRPC message
                         // ended on a frame boundary (a backend can FIN mid-frame).
                         // So only append a clean `grpc-status: 4` trailer when no
-                        // body bytes were forwarded (empty-body deadline); once
-                        // any body is on the wire, reset instead so a
+                        // body bytes were offered (empty-body deadline); once any
+                        // body has been queued on the send half, reset instead so a
                         // possibly-truncated message isn't capped with a clean
                         // status the client surfaces as a protocol error. Same
                         // rule as the mid-body deadline arm.
                         if crate::http3::stream_util::grpc_deadline_can_send_terminal_status(
-                            bytes_streamed,
+                            bytes_offered,
                         ) {
                             warn!(
                                 "gRPC deadline (grpc-timeout) exceeded while awaiting trailers \
@@ -13752,7 +13777,7 @@ async fn dispatch_grpc_native_h3(
                 Err(H3GrpcTerminatingUploadFault::AuthorizationExpired(termination)) => {
                     coalesce_buf.clear();
                     if crate::http3::stream_util::grpc_deadline_can_send_terminal_status(
-                        bytes_streamed,
+                        bytes_offered,
                     ) {
                         debug!(
                             "native H3 gRPC request upload reached its authorization lifetime \
@@ -13800,7 +13825,7 @@ async fn dispatch_grpc_native_h3(
                          terminating the response"
                     );
                     if crate::http3::stream_util::grpc_deadline_can_send_terminal_status(
-                        bytes_streamed,
+                        bytes_offered,
                     ) {
                         if send_h3_grpc_terminal_trailers(
                             &mut send_half,

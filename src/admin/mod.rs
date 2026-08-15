@@ -2509,8 +2509,20 @@ async fn handle_admin_request_inner(
                 .as_ref()
                 .map(|rt| rt.egress_scope_state().health())
                 .unwrap_or_default();
+            // Configuration-stream attempt/liveness status (issue #3854).
+            // Closed-set labels and counters only: readiness class, last
+            // attempt outcome, whether a fallback endpoint is active, the
+            // consecutive-failure run, the external-credential posture, and the
+            // documented half-open detection bound. Never an endpoint URL, node
+            // id, credential path, or token-derived value. `null` for the
+            // localized `file` source, which has no stream.
+            let config_stream = state
+                .mesh_runtime_state
+                .as_ref()
+                .and_then(|rt| rt.config_stream_status());
             health_status["mesh"] = json!({
                 "egress_scope": egress_health,
+                "config_stream": config_stream,
                 "node_waypoint_observability":
                     crate::modes::mesh::node_waypoint_observability::snapshot(),
                 "udp_placement_migration":

@@ -2378,6 +2378,20 @@
     "emission": "conditional"
   },
   {
+    "name": "ferrum_mesh_config_stream_attempts_total",
+    "type": "counter",
+    "help": "Completed mesh configuration-stream attempts by consumer protocol (native/xds/stock_xds) and closed-set outcome. A remote clean EOF is an endpoint failure, not a success. Local retirements (shutdown, tls_reload, credential_rotated, credential_source_invalid, credential_deadline, primary_retry) never rotate the endpoint or grow backoff. transport_failure is a dial failure while established_transport_failure is an already-open stream going dark; heartbeat_silence_timeout is the native application-silence bound, not an HTTP/2 keepalive timeout.",
+    "labels": [
+      "protocol",
+      "outcome",
+      "gateway_namespace"
+    ],
+    "subsystem": "mesh",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "conditional"
+  },
+  {
     "name": "ferrum_mesh_config_update_rejections_total",
     "type": "counter",
     "help": "MeshSubscribe responses refused before apply, by consumer and reason.",
