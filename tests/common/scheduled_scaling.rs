@@ -83,7 +83,10 @@ pub fn classify_admin_batch_response(
     retry_after: Option<&str>,
     body: &str,
 ) -> BatchProvisionDecision {
-    if (200..300).contains(&status) {
+    // POST /batch documents exactly one successful outcome. Treat every other
+    // status, including generic 2xx and partial-success responses, as fatal so
+    // a scaling gate cannot accept a partially or unexpectedly applied graph.
+    if status == 201 {
         return BatchProvisionDecision::Success;
     }
     if status == 503 && is_documented_namespace_fence_body(body) {

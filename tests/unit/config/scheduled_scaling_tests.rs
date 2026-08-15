@@ -87,13 +87,14 @@ fn documented_namespace_fence_503_is_the_only_retried_batch_response() {
         }
     );
     assert_eq!(
-        classify_admin_batch_response(200, None, ""),
-        BatchProvisionDecision::Success
-    );
-    assert_eq!(
         classify_admin_batch_response(201, None, "{}"),
         BatchProvisionDecision::Success
     );
+
+    match classify_admin_batch_response(200, None, "") {
+        BatchProvisionDecision::Fatal { status, .. } => assert_eq!(status, 200),
+        other => panic!("undocumented 2xx statuses must be fatal, got {other:?}"),
+    }
 
     let other_503 = json!({"error": "Service Unavailable"}).to_string();
     match classify_admin_batch_response(503, Some("1"), &other_503) {
