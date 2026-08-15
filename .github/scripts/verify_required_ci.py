@@ -648,6 +648,38 @@ def main() -> int:
 
     planner_errors: list[str] = []
     aggregate_body = extract_job_body(ci_yml, "test")
+    unit_body = extract_job_body(ci_yml, "test-unit")
+    unit_precompile = "Precompile inline and hardening test binaries"
+    unit_inline = "Run inline lib tests"
+    unit_hardening = "Run cache accounting and reload safety regressions"
+    if not (
+        unit_body.count("cargo test --lib --test unit_tests --no-run") == 1
+        and 0 <= unit_body.find(unit_precompile)
+        < unit_body.find(unit_inline)
+        < unit_body.find(unit_hardening)
+    ):
+        planner_errors.append(
+            "jobs.test-unit must precompile the lib and unit_tests binaries "
+            "together before running inline or plugin-hardening tests"
+        )
+
+    pkcs11_body = extract_job_body(ci_yml, "test-pkcs11-softhsm")
+    pkcs11_precompile = "Precompile PKCS#11 signer and pairing test binaries"
+    pkcs11_signer = "Run PKCS#11 signer smoke test"
+    pkcs11_pairing = "Run PKCS#11 certificate-pairing tests"
+    if not (
+        pkcs11_body.count(
+            "cargo test --features pkcs11 --lib --test unit_tests --no-run"
+        )
+        == 1
+        and 0 <= pkcs11_body.find(pkcs11_precompile)
+        < pkcs11_body.find(pkcs11_signer)
+        < pkcs11_body.find(pkcs11_pairing)
+    ):
+        planner_errors.append(
+            "jobs.test-pkcs11-softhsm must precompile the pkcs11 lib and "
+            "unit_tests binaries together before running either filter"
+        )
     for job in sorted(REQUIRED_JOBS):
         if f"needs.{job}.result" not in aggregate_body:
             planner_errors.append(

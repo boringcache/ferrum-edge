@@ -373,6 +373,14 @@ jobs:
         with:
           shared-key: "ci-test"
 
+      - name: Precompile inline and hardening test binaries
+        # Compile both targets in one Cargo invocation before running either.
+        # Otherwise a hosted runner can pass all inline tests, then lose the
+        # entire job while compiling the separate four-test hardening binary.
+        run: cargo test --lib --test unit_tests --no-run
+        env:
+          RUST_BACKTRACE: 1
+
       - name: Run inline lib tests
         # Covers `#[cfg(test)] mod tests` blocks inline in `src/` (used for
         # private fns/structs that the separate tests/ binaries can't see).
@@ -617,6 +625,14 @@ jobs:
           pkcs11-tool --module /usr/lib/softhsm/libsofthsm2.so \
             --login --pin 123456 --token-label ferrum-ci --list-objects
           echo "SOFTHSM2_CONF=$SOFTHSM2_CONF" >> "$GITHUB_ENV"
+
+      - name: Precompile PKCS#11 signer and pairing test binaries
+        # Both later filters execute in separate libtest binaries. Compile the
+        # pair together so the certificate-pairing phase cannot trigger a
+        # second full ferrum-edge compile after the signer smoke test passes.
+        run: cargo test --features pkcs11 --lib --test unit_tests --no-run
+        env:
+          RUST_BACKTRACE: 1
 
       - name: Run PKCS#11 signer smoke test
         run: cargo test --features pkcs11 --lib tls::pkcs11::tests::signer_loads_configured_token_and_signs -- --ignored
