@@ -20993,6 +20993,21 @@ async fn run_after_proxy_hooks_on_rejection(
         REJECTION_RESPONSE_METADATA_KEY.to_string(),
         "true".to_string(),
     );
+    if let Some(termination) = ctx.authorization_termination() {
+        // Authorization expiry is an authoritative gateway terminal, not a
+        // plugin-authored rejection. Do not construct or poll reject-path
+        // hooks: replacers must not overwrite it, and even non-replacing hooks
+        // must not retain protected request state after the credential expires.
+        replace_rejection_with_authorization_terminal(
+            ctx,
+            termination,
+            status_code,
+            response_body.as_deref_mut(),
+            response_headers,
+        );
+        restore_rejection_response_markers(ctx, previous_marker, previous_replaceable_marker);
+        return;
+    }
     let deadline_already_elapsed = ctx
         .grpc_deadline_at()
         .is_some_and(|deadline| deadline <= tokio::time::Instant::now());
@@ -52998,6 +53013,34 @@ mod tests {
             Some("applied")
         );
         assert_eq!(&*body, br#"{"error":"blocked"}"#);
+        assert!(!ctx.metadata.contains_key(REJECTION_RESPONSE_METADATA_KEY));
+    }
+
+    #[tokio::test]
+    async fn authorization_expiry_cannot_be_replaced_by_reject_hooks() {
+        let plugins: Vec<Arc<dyn Plugin>> = vec![Arc::new(ReplaceRejectPlugin)];
+        let mut ctx = RequestContext::new("203.0.113.10".into(), "GET".into(), "/body".into());
+        let termination = crate::proxy::auth_lifetime::StreamAuthTermination::CredentialExpired;
+        let reject = settle_precommit_authorization_expiry(&mut ctx, termination);
+        let RejectedResponseParts {
+            mut status_code,
+            mut body,
+            mut headers,
+        } = plugin_result_into_reject_parts(reject).expect("authorization terminal is a reject");
+
+        apply_replaceable_after_proxy_hooks_to_rejection(
+            &plugins,
+            &mut ctx,
+            &mut status_code,
+            &mut body,
+            &mut headers,
+        )
+        .await;
+
+        assert_eq!(status_code, StatusCode::UNAUTHORIZED.as_u16());
+        assert_eq!(&*body, br#"{"error":"Unauthorized"}"#);
+        assert!(!headers.contains_key("x-replaced"));
+        assert_eq!(ctx.authorization_termination(), Some(termination));
         assert!(!ctx.metadata.contains_key(REJECTION_RESPONSE_METADATA_KEY));
     }
 
