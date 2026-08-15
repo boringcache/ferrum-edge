@@ -53195,16 +53195,12 @@ mod tests {
 
         for buffered in [false, true] {
             let polls = Arc::new(AtomicU64::new(0));
-            let plugins: Vec<Arc<dyn Plugin>> =
-                vec![Arc::new(ExpiringFinalHeaderPolicyPlugin {
-                    polls: Arc::clone(&polls),
-                    expire_on_poll: 2,
-                })];
-            let mut ctx = RequestContext::new(
-                "203.0.113.10".into(),
-                "GET".into(),
-                "/protected".into(),
-            );
+            let plugins: Vec<Arc<dyn Plugin>> = vec![Arc::new(ExpiringFinalHeaderPolicyPlugin {
+                polls: Arc::clone(&polls),
+                expire_on_poll: 2,
+            })];
+            let mut ctx =
+                RequestContext::new("203.0.113.10".into(), "GET".into(), "/protected".into());
             let mut status_code = StatusCode::OK.as_u16();
             let mut headers =
                 HashMap::from([("content-type".to_string(), "text/plain".to_string())]);
