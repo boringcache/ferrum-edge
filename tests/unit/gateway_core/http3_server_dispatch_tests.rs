@@ -2014,7 +2014,7 @@ fn h3_buffered_upload_deadlines_run_rejection_cleanup_and_logging() {
     assert_eq!(helper.matches("record_request(state,").count(), 1);
     assert_eq!(
         helper
-            .matches("send_h3_plugin_reject_flavor_aware(")
+            .matches("send_h3_plugin_reject_flavor_aware_with_recv_halt(")
             .count(),
         1
     );
@@ -2031,7 +2031,7 @@ fn h3_buffered_upload_deadlines_run_rejection_cleanup_and_logging() {
         .find("record_request(state,")
         .expect("upload deadline metric");
     let send = helper
-        .find("send_h3_plugin_reject_flavor_aware(")
+        .find("send_h3_plugin_reject_flavor_aware_with_recv_halt(")
         .expect("upload deadline send");
     assert!(decorate < commit && commit < log && log < metric && metric < send);
     for phase in [
