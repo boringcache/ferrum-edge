@@ -286,15 +286,18 @@ policy/key-admission/handshake tests share two cache layers:
   (`save-if` false for fork PRs); `fips-clippy` and `fips-test` restore it
   with `save-if: false` and never publish.
 - **Exact producer channel.** After a successful compile, `fips-compile`
-  saves `${{ github.workspace }}/target` and `.cache/sccache` with
-  `actions/cache/save` under
+  precompiles the complete FIPS `unit_tests` and `integration_tests`
+  executables, then saves `${{ github.workspace }}/target` and
+  `.cache/sccache` with `actions/cache/save` under
   `fips-producer-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}`.
   That key is unique per head and workflow-run attempt, so GitHub's immutable
   exact-hit skip cannot trap newly warmed outputs. On a full workflow rerun,
   compile first restores the newest prior attempt under the same SHA+`run_id`
   prefix, so the whole gate—not only its consumers—uses the exact warm source.
   A miss remains valid on the first attempt and on fork PRs. Clippy/test restore
-  the current producer key (with the same prefix fallback) and never save.
+  the current producer key (with the same prefix fallback) and never save; the
+  filtered test commands execute the restored test binaries without repeating
+  their test-only compile/link work.
   Trusted non-cold consumers fail closed if this-run producer output is missing.
   Fork pull requests restore only and cannot save; GitHub confines
   `pull_request` writes to `refs/pull/.../merge`, not the default branch.

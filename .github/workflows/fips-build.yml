@@ -431,6 +431,22 @@ jobs:
           python3 .github/scripts/ci_runtime_telemetry.py end --phase fips-claimed-checks --status "$status"
           exit "$status"
 
+      # The consumer runs exact policy and handshake filters, but Cargo must
+      # still build the complete unit_tests and integration_tests binaries.
+      # Build those binaries once in the producer so downstream runners only
+      # execute them after restoring the SHA-scoped target archive. This also
+      # makes a runner-loss retry reuse the expensive test-only link outputs.
+      - name: Precompile FIPS test binaries for consumers
+        run: |
+          python3 .github/scripts/ci_runtime_telemetry.py start --phase fips-test-build
+          set +e
+          cargo test --locked --no-default-features --features fips \
+            --test unit_tests --test integration_tests --no-run
+          status=$?
+          set -e
+          python3 .github/scripts/ci_runtime_telemetry.py end --phase fips-test-build --status "$status"
+          exit "$status"
+
       # Exact producer archive: full workspace target + sccache as left by this
       # successful compile. Saved as a main step so rust-cache's later post
       # cleanup (which strips workspace crates) cannot empty it. Unique

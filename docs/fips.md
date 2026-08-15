@@ -93,6 +93,10 @@ and this layer is not SHA-scoped, so dependency/compiler work remains a warm
 cross-commit fallback. After a successful compile, `fips-compile` publishes
 the full `target/` and `.cache/sccache` tree under
 `fips-producer-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}`.
+Before publishing, the producer also builds the complete FIPS `unit_tests` and
+`integration_tests` executables once. The filtered test consumer therefore
+executes the restored binaries instead of repeating their test-only compile and
+link work, and a runner-loss retry reuses those same exact-SHA executables.
 On a full workflow rerun, `fips-compile` restores the newest prior attempt with
 the same SHA + `run_id` before rebuilding and publishes a fresh attempt key;
 the first attempt and fork PRs may miss this optional warm source.

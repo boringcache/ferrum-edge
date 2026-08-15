@@ -818,14 +818,22 @@ def check_fips_producer_channel(
     )
     restore_position = compile_job.find("Restore prior-attempt FIPS producer outputs")
     build_position = compile_job.find("Build the FIPS profile")
+    test_build_position = compile_job.find("Precompile FIPS test binaries for consumers")
     save_position = compile_job.find("Save FIPS producer compile outputs")
     require(
         restore_position >= 0
         and build_position >= 0
+        and test_build_position >= 0
         and save_position >= 0
-        and restore_position < build_position < save_position,
-        "fips-compile must restore the prior attempt before building and save "
-        "the refreshed producer afterward",
+        and restore_position < build_position < test_build_position < save_position,
+        "fips-compile must restore the prior attempt, build the FIPS binary and "
+        "test executables, then save the refreshed producer",
+        failures,
+    )
+    require(
+        "--test unit_tests --test integration_tests --no-run" in compile_job,
+        "fips-compile must put the exact unit/integration test executables in the "
+        "producer archive before consumers run filtered tests",
         failures,
     )
     if compile_saves:
