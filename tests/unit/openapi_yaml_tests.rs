@@ -3020,6 +3020,127 @@ fn oauth2_introspection_cache_schema_and_docs_match_runtime_constants() {
     );
 }
 
+/// `/health` publishes the shared single-use replay authority aggregate
+/// (issues #3834 / #3837). The schema must stay in exact parity with what the
+/// runtime serializes, and must stay two fixed-cardinality counters: the
+/// aggregate is the authenticated readiness surface, so its shape may not grow
+/// with configuration.
+#[test]
+fn health_shared_replay_authority_aggregate_matches_the_runtime_snapshot() {
+    let spec: serde_json::Value =
+        serde_yaml::from_str(include_str!("../../openapi.yaml")).expect("openapi.yaml parses");
+    let schema = spec
+        .pointer("/components/schemas/SharedReplayAuthorityHealth")
+        .expect("SharedReplayAuthorityHealth exists");
+
+    let rendered = serde_json::to_value(
+        ferrum_edge::plugins::utils::replay_authority::shared_health_snapshot(),
+    )
+    .expect("the aggregate serializes");
+    let runtime_fields: std::collections::BTreeSet<String> = rendered
+        .as_object()
+        .expect("the aggregate is an object")
+        .keys()
+        .cloned()
+        .collect();
+    let schema_fields: std::collections::BTreeSet<String> = schema["properties"]
+        .as_object()
+        .expect("the schema declares properties")
+        .keys()
+        .cloned()
+        .collect();
+    assert_eq!(
+        runtime_fields, schema_fields,
+        "openapi.yaml must match the serialized aggregate exactly"
+    );
+    assert_eq!(
+        schema_fields.len(),
+        2,
+        "the readiness aggregate must stay fixed-cardinality"
+    );
+    assert_eq!(
+        schema["required"],
+        json!(["shared_authorities", "shared_authorities_unavailable"])
+    );
+
+    // `/health` references it, and only on the detailed tier.
+    let health = spec
+        .pointer("/components/schemas/HealthResponse")
+        .expect("HealthResponse exists");
+    assert_eq!(
+        health["properties"]["replay_authority"]["$ref"],
+        json!("#/components/schemas/SharedReplayAuthorityHealth")
+    );
+    let description = health["description"]
+        .as_str()
+        .expect("HealthResponse documents its tiering");
+    assert!(
+        description.contains("replay_authority"),
+        "the detailed-tier field list must name the aggregate: {description}"
+    );
+
+    // A `shared` policy has no local fallback, so an unavailable backend is a
+    // readiness failure rather than a coarse degradation.
+    let ready = health["properties"]["ready"]["description"]
+        .as_str()
+        .expect("`ready` is documented");
+    assert!(
+        ready.contains("replay authority"),
+        "`ready` must document the shared replay dependency: {ready}"
+    );
+}
+
+/// `hmac_auth`'s configuration root became a closed key set with the
+/// single-use replay work (issues #3834 / #3837), so it now carries the same
+/// obligation every other closed plugin root does: exact parity with an
+/// `additionalProperties: false` OpenAPI schema. Without this guard a new
+/// runtime key silently becomes an undocumented field the Admin API rejects,
+/// or a documented field the runtime refuses.
+#[test]
+fn hmac_auth_config_root_is_closed_and_matches_openapi() {
+    use ferrum_edge::plugins::hmac_auth::HMAC_AUTH_CONFIG_KEYS;
+    use ferrum_edge::plugins::utils::redis_rate_limiter::REDIS_PLUGIN_CONFIG_KEYS;
+
+    let spec: serde_json::Value =
+        serde_yaml::from_str(include_str!("../../openapi.yaml")).expect("openapi.yaml parses");
+    let schema = spec
+        .pointer("/components/schemas/HmacAuthConfig")
+        .expect("HmacAuthConfig component exists");
+    assert_eq!(schema["additionalProperties"], json!(false));
+
+    let schema_fields: BTreeSet<&str> = schema["properties"]
+        .as_object()
+        .expect("HmacAuthConfig properties")
+        .keys()
+        .map(String::as_str)
+        .collect();
+    // The runtime allowlist is the plugin's own keys unioned with the shared
+    // Redis connectivity keys that back `replay_scope: shared`.
+    let runtime_fields: BTreeSet<&str> = HMAC_AUTH_CONFIG_KEYS
+        .iter()
+        .chain(REDIS_PLUGIN_CONFIG_KEYS.iter())
+        .copied()
+        .collect();
+    assert_eq!(schema_fields, runtime_fields, "HmacAuthConfig key drift");
+
+    // The replay scope has no default in either surface: an operator must
+    // declare whether process-local replay state is sufficient, and a schema
+    // default would reinstate silent per-replica replay.
+    assert_eq!(
+        schema["properties"]["replay_scope"]["enum"],
+        json!(["process", "shared"])
+    );
+    assert!(schema["properties"]["replay_scope"]["default"].is_null());
+    assert_eq!(
+        schema["properties"]["clock_skew_seconds"]["maximum"],
+        json!(ferrum_edge::plugins::hmac_auth::MAX_HMAC_CLOCK_SKEW_SECONDS)
+    );
+    assert_eq!(
+        schema["properties"]["replay_max_entries"]["default"],
+        json!(ferrum_edge::plugins::hmac_auth::DEFAULT_HMAC_REPLAY_MAX_ENTRIES)
+    );
+}
+
 #[test]
 fn jwks_auth_schema_and_cache_guide_match_runtime_contract() {
     let spec: serde_json::Value =
@@ -3061,8 +3182,32 @@ fn jwks_auth_schema_and_cache_guide_match_runtime_contract() {
         json!(ferrum_edge::plugins::jwks_auth::MAX_JWKS_MAX_STALE_SECONDS)
     );
     assert_eq!(
-        schema["properties"]["providers"]["items"]["properties"]["dpop_jti_cache_max_entries"]["default"],
-        json!(ferrum_edge::plugins::jwks_auth::DEFAULT_DPOP_JTI_CACHE_MAX_ENTRIES)
+        schema["properties"]["providers"]["items"]["properties"]["dpop_replay_max_entries"]["default"],
+        json!(ferrum_edge::plugins::jwks_auth::DEFAULT_DPOP_REPLAY_MAX_ENTRIES)
+    );
+    // The DPoP replay scope has no default: an operator must declare whether
+    // process-local replay state is sufficient. A schema default here would
+    // reinstate silent per-replica replay.
+    assert_eq!(
+        schema["properties"]["providers"]["items"]["properties"]["dpop_replay_scope"]["enum"],
+        json!(["process", "shared"])
+    );
+    assert!(
+        schema["properties"]["providers"]["items"]["properties"]["dpop_replay_scope"]["default"]
+            .is_null()
+    );
+    assert_eq!(
+        schema["properties"]["providers"]["items"]["properties"]["dpop_clock_skew_secs"]["maximum"],
+        json!(ferrum_edge::plugins::utils::dpop::MAX_DPOP_CLOCK_SKEW_SECS)
+    );
+    // The removed replay knobs must not reappear: retention is a fixed horizon
+    // derived from the clock-skew ceiling, not a configured value.
+    assert!(
+        schema["properties"]["providers"]["items"]["properties"]["dpop_jti_ttl_secs"].is_null()
+    );
+    assert!(
+        schema["properties"]["providers"]["items"]["properties"]["dpop_jti_cache_max_entries"]
+            .is_null()
     );
 
     let guide = include_str!("../../docs/cache_management.md");
@@ -6466,7 +6611,8 @@ fn mesh_and_overload_runtime_snapshots_are_covered_by_openapi() {
             "ready": true,
             "mesh": {
                 "egress_scope": health,
-                "node_waypoint_observability": node_waypoint_observability
+                "node_waypoint_observability": node_waypoint_observability,
+                "config_stream": null
             }
         }),
         false,
@@ -6480,6 +6626,7 @@ fn mesh_and_overload_runtime_snapshots_are_covered_by_openapi() {
             "mesh": {
                 "egress_scope": health,
                 "node_waypoint_observability": node_waypoint_observability,
+                "config_stream": null,
                 "udp_placement_migration": udp_placement_migration
             }
         }),

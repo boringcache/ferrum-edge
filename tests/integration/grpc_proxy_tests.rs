@@ -2041,7 +2041,10 @@ async fn hmac_auth_reuses_prebuffered_native_grpc_body_for_primary_dispatch() {
         "grpc-hmac-auth",
         "hmac_auth",
         "grpc-hmac",
-        serde_json::json!({}),
+        serde_json::json!({
+            "signing_profile": "ferrum-hmac-v1",
+            "allow_unsafe_replayable_v1": true
+        }),
     );
     let state = create_test_proxy_state_with_plugins_upstreams_and_consumers(
         vec![proxy],

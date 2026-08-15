@@ -407,7 +407,11 @@ fn json_spec_with_plugin(
 }
 
 fn hmac_plugin_config() -> Value {
-    json!({"clock_skew_seconds": 300})
+    // Modern `ferrum-hmac-v2` defaults: the profile is implicit, the replay
+    // scope is not (there is no default) — so a fixture that means "a valid
+    // HMAC policy" must declare it or it is rejected before composition
+    // validation is ever reached.
+    json!({"clock_skew_seconds": 300, "replay_scope": "process"})
 }
 
 fn request_body_transformer_config() -> Value {
@@ -2682,7 +2686,7 @@ async fn post_rejects_hmac_request_body_transformer_composition() {
             {
                 "id": hmac_id,
                 "plugin_name": "hmac_auth",
-                "config": {"clock_skew_seconds": 300}
+                "config": {"clock_skew_seconds": 300, "replay_scope": "process"}
             },
             {
                 "id": transformer_id,

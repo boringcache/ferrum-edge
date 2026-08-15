@@ -5988,6 +5988,14 @@ fn ordinary_authorization_expiry_is_never_logged_at_warning_level() {
             "http3/stream_util.rs",
             include_str!("../../../src/http3/stream_util.rs"),
         ),
+        // RFC 9298 CONNECT-UDP (issue #3860). A tunnel expiry is as
+        // client-triggerable as any other: one short-TTL credential can produce
+        // one on every tunnel it opens, including the flow-control-stall
+        // teardown path.
+        (
+            "http3/connect_udp.rs",
+            include_str!("../../../src/http3/connect_udp.rs"),
+        ),
     ];
     // Phrases that only an ORDINARY expiry message carries. A genuinely
     // anomalous failure describes the failure ("cleanup exceeded its
@@ -6045,6 +6053,10 @@ fn authorization_expiry_messages_are_still_compiled_in_at_debug_level() {
             include_str!("../../../src/http3/cross_protocol.rs"),
         ),
         ("proxy/mod.rs", include_str!("../../../src/proxy/mod.rs")),
+        (
+            "http3/connect_udp.rs",
+            include_str!("../../../src/http3/connect_udp.rs"),
+        ),
     ] {
         let mut debug_expiry_sites = 0usize;
         let lines: Vec<&str> = source.lines().collect();

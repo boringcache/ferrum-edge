@@ -1598,7 +1598,7 @@ async fn load_full_config_rejects_hmac_request_body_transform_composition() {
         (
             "cp-global-hmac",
             "hmac_auth",
-            json!({"clock_skew_seconds": 300}),
+            json!({"clock_skew_seconds": 300, "replay_scope": "process"}),
         ),
         (
             "cp-global-transformer",

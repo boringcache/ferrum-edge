@@ -27,6 +27,8 @@ use std::sync::Arc;
 #[path = "env_config_macro.rs"]
 mod env_config_macro;
 
+pub(crate) use env_config_macro::EnvValue;
+
 pub const DEFAULT_TLS_MANAGED_STORE_PATH: &str = "./ferrum-managed-tls";
 
 pub fn tls_managed_store_path_from_env() -> String {
@@ -2827,6 +2829,51 @@ pub struct EnvConfig {
     /// to constrain the attack surface of a public H3 listener until you
     /// have validated WebSocket-over-H3 in your environment.
     pub http3_websocket_enabled: bool,
+    /// Enable RFC 9298 UDP proxying (`:protocol = connect-udp`) on the HTTP/3
+    /// listener. Default `false`.
+    ///
+    /// When `true`, an Extended CONNECT request whose `:path` expands the
+    /// RFC 9298 URI Template establishes a bounded UDP tunnel to a destination
+    /// that is **already configured** for the matched proxy (its backend, or a
+    /// target of its upstream). Payloads ride RFC 9297 DATAGRAM capsules on
+    /// the CONNECT stream; `SETTINGS_H3_DATAGRAM` is never negotiated.
+    ///
+    /// This flag is process-wide: every H3 HTTP route whose routing and
+    /// `allowed_methods` policy admits CONNECT can match a suffix such as
+    /// `/udp/host/port/`. Deploy a dedicated MASQUE route (host/path),
+    /// authentication/authorization, and explicit method filters on routes
+    /// that must not expose CONNECT. There is no per-route enablement schema.
+    ///
+    /// When `false` (the default) a `connect-udp` Extended CONNECT is refused
+    /// with 501, and the setting is not advertised unless the WebSocket
+    /// profile is separately enabled. Enabling UDP tunnelling changes what a
+    /// route can reach, so it is opt-in rather than derived.
+    pub http3_connect_udp_enabled: bool,
+    /// Maximum concurrent RFC 9298 CONNECT-UDP tunnels for this gateway
+    /// process (default 256). `0` disables the limit.
+    ///
+    /// Bounded by [`crate::util::conn_limit::MAX_CONN_LIMIT`]: the value is
+    /// handed to `tokio::sync::Semaphore::new`, which panics above
+    /// `Semaphore::MAX_PERMITS`. A larger configured value is a validation
+    /// error, never a silent clamp and never a silent "unlimited".
+    pub http3_connect_udp_max_sessions: usize,
+    /// Seconds a CONNECT-UDP tunnel may carry no datagram in either direction
+    /// before it is closed (default 120). RFC 9298 §3.2 recommends that a UDP
+    /// proxy "SHOULD NOT" use an idle timeout shorter than two minutes, so the
+    /// default is exactly that; the accepted range stays 1–86400 so an operator
+    /// can deliberately choose a tighter bound. While the profile is enabled,
+    /// this value is also the floor for the frontend QUIC `max_idle_timeout`
+    /// (`EnvConfig::effective_http3_idle_timeout_seconds`): the derivation
+    /// only raises, leaves `FERRUM_HTTP3_IDLE_TIMEOUT=0` (disabled) alone, and
+    /// does not touch H3 backend pools, so the advertised tunnel lifetime is
+    /// the one that actually holds.
+    pub http3_connect_udp_idle_timeout_seconds: u64,
+    /// Largest UDP payload relayed in either direction (default 65527, the
+    /// RFC 9298 §5 ceiling for Context ID 0). Larger datagrams received from
+    /// the target are silently dropped rather than fragmented or truncated;
+    /// larger client capsules terminate the session. Lower this to bound
+    /// per-session buffers or to keep tunnelled datagrams inside the path MTU.
+    pub http3_connect_udp_max_datagram_bytes: usize,
     /// Milliseconds the HTTP/3 listener spends draining already-buffered
     /// request-body bytes before issuing STOP_SENDING when a
     /// small/successful response is emitted while the client is likely
@@ -3797,6 +3844,11 @@ impl Default for EnvConfig {
             http3_flush_interval_micros: 200,
             http3_request_body_channel_capacity: 32,
             http3_websocket_enabled: true,
+            http3_connect_udp_enabled: false,
+            http3_connect_udp_max_sessions: 256,
+            http3_connect_udp_idle_timeout_seconds: 120,
+            http3_connect_udp_max_datagram_bytes:
+                crate::http3::connect_udp::CONNECT_UDP_MAX_PAYLOAD_BYTES,
             h3_request_body_drain_ms: 50,
             http3_initial_mtu: 1500,
             grpc_pool_ready_wait_ms: 1,
@@ -4381,6 +4433,10 @@ impl EnvConfig {
             http3_flush_interval_micros: u64 = "FERRUM_HTTP3_FLUSH_INTERVAL_MICROS" => 200u64, clamp(crate::http3::config::H3_FLUSH_INTERVAL_MIN_MICROS, crate::http3::config::H3_FLUSH_INTERVAL_MAX_MICROS);
             http3_request_body_channel_capacity: usize = "FERRUM_HTTP3_REQUEST_BODY_CHANNEL_CAPACITY" => 32usize, clamp(1usize, 1024usize);
             http3_websocket_enabled: bool = "FERRUM_HTTP3_WEBSOCKET_ENABLED" => true;
+            http3_connect_udp_enabled: bool = "FERRUM_HTTP3_CONNECT_UDP_ENABLED" => false;
+            http3_connect_udp_max_sessions: usize = "FERRUM_HTTP3_CONNECT_UDP_MAX_SESSIONS" => 256usize;
+            http3_connect_udp_idle_timeout_seconds: u64 = "FERRUM_HTTP3_CONNECT_UDP_IDLE_TIMEOUT_SECONDS" => 120u64, clamp(1u64, 86_400u64);
+            http3_connect_udp_max_datagram_bytes: usize = "FERRUM_HTTP3_CONNECT_UDP_MAX_DATAGRAM_BYTES" => crate::http3::connect_udp::CONNECT_UDP_MAX_PAYLOAD_BYTES, clamp(1usize, crate::http3::connect_udp::CONNECT_UDP_MAX_PAYLOAD_BYTES);
             h3_request_body_drain_ms: u64 = "FERRUM_H3_REQUEST_BODY_DRAIN_MS" => 50u64, clamp(0u64, 1000u64);
             http3_initial_mtu: u16 = "FERRUM_HTTP3_INITIAL_MTU" => 1500u16;
             grpc_pool_ready_wait_ms: u64 = "FERRUM_GRPC_POOL_READY_WAIT_MS" => 1u64;
@@ -5177,6 +5233,10 @@ impl EnvConfig {
             http3_flush_interval_micros,
             http3_request_body_channel_capacity,
             http3_websocket_enabled,
+            http3_connect_udp_enabled,
+            http3_connect_udp_max_sessions,
+            http3_connect_udp_idle_timeout_seconds,
+            http3_connect_udp_max_datagram_bytes,
             h3_request_body_drain_ms,
             http3_initial_mtu,
             grpc_pool_ready_wait_ms,
@@ -6269,6 +6329,8 @@ impl EnvConfig {
             ));
         }
 
+        self.validate_h3_connect_udp_limits()?;
+
         // Mesh config ordering domains (issues #2473 / #3611). Both are
         // validated here, at the single configuration boundary, and neither
         // error echoes the operator-supplied value: an authority that reaches
@@ -7353,6 +7415,72 @@ impl EnvConfig {
             ));
         }
         Ok(())
+    }
+
+    /// Refuse an RFC 9298 CONNECT-UDP session cap that cannot be enforced.
+    ///
+    /// The value becomes the permit count of a `tokio::sync::Semaphore`, whose
+    /// constructor **panics** above `Semaphore::MAX_PERMITS`, so an
+    /// out-of-range value has to be refused at the configuration boundary
+    /// rather than reaching `ProxyState::new`. It is deliberately neither
+    /// clamped nor folded into the `0` ("no limit") sentinel: silently turning
+    /// an operator's typo into "unlimited concurrent UDP tunnels" is the
+    /// opposite of what they asked for, and a silent clamp would advertise a
+    /// bound that is not the configured one.
+    ///
+    /// Shares [`crate::util::conn_limit::MAX_CONN_LIMIT`] with the CP gRPC
+    /// listener so the two admission surfaces cannot disagree about the ceiling.
+    pub fn validate_h3_connect_udp_limits(&self) -> Result<(), String> {
+        if self.http3_connect_udp_max_sessions > crate::util::conn_limit::MAX_CONN_LIMIT {
+            return Err(format!(
+                "FERRUM_HTTP3_CONNECT_UDP_MAX_SESSIONS ({}) exceeds the maximum supported value \
+                 {}. Use 0 to disable the limit entirely.",
+                self.http3_connect_udp_max_sessions,
+                crate::util::conn_limit::MAX_CONN_LIMIT
+            ));
+        }
+        // RFC 9298 §3.1 requires that a UDP proxy not introduce IP
+        // fragmentation. Where the build target exposes no do-not-fragment
+        // socket option the gateway cannot honour that, so the profile is
+        // refused at configuration time rather than served best effort. See
+        // `crate::socket_opts::UDP_DONT_FRAGMENT_SUPPORTED`.
+        if self.http3_connect_udp_enabled
+            && !crate::http3::connect_udp::CONNECT_UDP_NON_FRAGMENTATION_ENFORCEABLE
+        {
+            const UNSUPPORTED_TARGET: &str = "FERRUM_HTTP3_CONNECT_UDP_ENABLED=true is not supported on this build \
+                 target: no do-not-fragment socket option is available, so RFC 9298 §3.1 \
+                 (\"the proxy MUST NOT introduce IP fragmentation\") cannot be enforced. \
+                 Disable the profile or run on Linux or macOS.";
+            return Err(UNSUPPORTED_TARGET.to_string());
+        }
+        Ok(())
+    }
+
+    /// The QUIC `max_idle_timeout` the HTTP/3 **frontend** listener installs,
+    /// in seconds.
+    ///
+    /// `FERRUM_HTTP3_IDLE_TIMEOUT` bounds the whole QUIC connection, and a
+    /// CONNECT-UDP tunnel lives on a stream of exactly one such connection. A
+    /// tunnel that carries no datagram also generates no QUIC activity, so a
+    /// connection idle limit below
+    /// `FERRUM_HTTP3_CONNECT_UDP_IDLE_TIMEOUT_SECONDS` closes the tunnel first
+    /// and makes the advertised RFC 9298 §3.2 idle posture unreachable — with
+    /// the shipped defaults, a 120-second tunnel bound that another
+    /// gateway-owned timer terminates at 30.
+    ///
+    /// So when the profile is enabled the connection idle limit is raised to
+    /// the tunnel's, never lowered: a larger operator-configured
+    /// `FERRUM_HTTP3_IDLE_TIMEOUT` still wins, and `0` — which DISABLES the
+    /// QUIC idle timer entirely (RFC 9000 §10.1) and therefore already cannot
+    /// undercut anything — is left alone rather than being shortened to 120.
+    /// The raise is reported at listener construction rather than applied
+    /// silently.
+    pub fn effective_http3_idle_timeout_seconds(&self) -> u64 {
+        if !self.http3_connect_udp_enabled || self.http3_idle_timeout == 0 {
+            return self.http3_idle_timeout;
+        }
+        let tunnel_idle = self.http3_connect_udp_idle_timeout_seconds;
+        std::cmp::max(self.http3_idle_timeout, tunnel_idle)
     }
 
     /// The xDS ADS admission budgets this configuration resolves to

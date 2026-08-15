@@ -68,6 +68,12 @@ runs:
       run: |
         set -euo pipefail
 
+        # The following step must never discover a preinstalled executable
+        # after this best-effort installer fails. Publish an empty sentinel
+        # first; replace it with the exact verified path only after the pinned
+        # archive has passed its checksum and the binary is installed.
+        echo "FERRUM_SCCACHE_BIN=" >> "$GITHUB_ENV"
+
         # Hosted callers: Linux x86_64 (ubuntu-latest / ubuntu-24.04),
         # macOS x86_64 and aarch64 (macos-latest), Windows x86_64
         # (windows-latest). Linux aarch64 is pinned for GitHub-hosted ARM
@@ -122,7 +128,8 @@ runs:
           fi
         }
 
-        install_dir="${RUNNER_TEMP}/ferrum-sccache/bin"
+        install_root="$(mktemp -d "${RUNNER_TEMP}/ferrum-sccache-bin.XXXXXX")"
+        install_dir="${install_root}/bin"
         work_dir="$(mktemp -d "${RUNNER_TEMP}/ferrum-sccache.XXXXXX")"
         archive="${work_dir}/sccache.tar.gz"
         mkdir -p "$install_dir"
@@ -161,12 +168,14 @@ runs:
         dest="${install_dir}/$(basename "$src")"
         cp "$src" "$dest"
         chmod 0755 "$dest"
-        echo "$install_dir" >> "$GITHUB_PATH"
-        echo "sccache v${SCCACHE_VERSION} (${triple}) installed to ${install_dir}"
+        echo "FERRUM_SCCACHE_BIN=${dest}" >> "$GITHUB_ENV"
+        echo "sccache v${SCCACHE_VERSION} (${triple}) installed to a verified runner-temporary path"
 
     - name: Configure sccache
       shell: bash
       run: |
+        set -euo pipefail
+
         # Deliberate security choice: do not enable the sccache GHA backend
         # and do not persist ACTIONS_RESULTS_URL / ACTIONS_RUNTIME_TOKEN.
         # Those credentials belong to the cache action process, not to later
@@ -181,6 +190,10 @@ runs:
         export SCCACHE_CACHE_SIZE=2G
         mkdir -p "${SCCACHE_DIR}"
         unset SCCACHE_GHA_ENABLED
+        # `unset` protects this shell. Persist an explicit empty value as the
+        # final GITHUB_ENV assignment so an earlier action or workflow cannot
+        # re-enable the credential-bearing GHA backend in later build steps.
+        echo "SCCACHE_GHA_ENABLED=" >> "$GITHUB_ENV"
 
         # Disable the sccache server idle timeout (default 600s). The release
         # build compiles the large `ferrum-edge` lib crate as a single rustc
@@ -190,10 +203,15 @@ runs:
         # then dies with "connection forcibly closed (os error 10054)". 0 = run
         # until the ephemeral runner is torn down.
         export SCCACHE_IDLE_TIMEOUT=0
-        # Stop any server a prior step started so no daemon holds stale
+        sccache_bin="${FERRUM_SCCACHE_BIN:-}"
+        # Invoke only the checksum-verified binary installed above. PATH lookup
+        # would let a failed download silently activate an unpinned preinstalled
+        # sccache. Stop any server a prior step started so no daemon holds stale
         # settings (a running server keeps the values it started with).
-        command -v sccache &> /dev/null && sccache --stop-server > /dev/null 2>&1 || true
-        if command -v sccache &> /dev/null && sccache --start-server 2>/dev/null; then
+        if [ -n "$sccache_bin" ] && [ -x "$sccache_bin" ]; then
+          "$sccache_bin" --stop-server > /dev/null 2>&1 || true
+        fi
+        if [ -n "$sccache_bin" ] && [ -x "$sccache_bin" ] && "$sccache_bin" --start-server 2>/dev/null; then
           # The start above is only a health probe. This action runs BEFORE the
           # cache step that restores ${SCCACHE_DIR} (rust-cache
           # `cache-directories` / producer archive), and the local-disk backend
@@ -202,8 +220,9 @@ runs:
           # rustc invocation lazily respawns it AFTER the cache restore,
           # inheriting SCCACHE_* from GITHUB_ENV, so the persisted cache is
           # actually indexed and reused.
-          sccache --stop-server > /dev/null 2>&1 || true
-          echo "RUSTC_WRAPPER=sccache" >> "$GITHUB_ENV"
+          "$sccache_bin" --stop-server > /dev/null 2>&1 || true
+          echo "RUSTC_WRAPPER=${sccache_bin}" >> "$GITHUB_ENV"
+          echo "CARGO_BUILD_RUSTC_WRAPPER=${sccache_bin}" >> "$GITHUB_ENV"
           # Persisted for build steps: the lazily-spawned server reads these.
           echo "SCCACHE_DIR=${SCCACHE_DIR}" >> "$GITHUB_ENV"
           echo "SCCACHE_CACHE_SIZE=${SCCACHE_CACHE_SIZE}" >> "$GITHUB_ENV"

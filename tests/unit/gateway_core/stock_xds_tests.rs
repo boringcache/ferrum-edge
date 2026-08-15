@@ -16,11 +16,15 @@
 //!    rather than silently reduced to plain routing.
 
 use std::collections::HashMap;
+use std::sync::Arc;
+use std::sync::Mutex;
 
 use prost::Message;
 use serial_test::serial;
 
 use ferrum_edge::modes::mesh::config::{AppProtocol, ServiceTargetPort};
+use ferrum_edge::modes::mesh::config_consumer::stock_xds_client::StockXdsClientConfig;
+use ferrum_edge::modes::mesh::slice::MeshSliceRequest;
 use ferrum_edge::xds::stock::{StockXdsAccumulator, StockXdsLimits, refusal};
 use ferrum_edge::xds::stock_proto as sp;
 use ferrum_edge::xds::{CDS_TYPE_URL, EDS_TYPE_URL, LDS_TYPE_URL, RDS_TYPE_URL};
@@ -854,7 +858,8 @@ fn stock_refused_rds_replacement_drops_the_previously_accepted_route_config() {
 #[test]
 fn stock_refusal_diagnostics_are_bounded_and_free_of_control_characters() {
     // Resource names are control-plane-chosen and bounded only by
-    // `max_resource_bytes`, and they land verbatim in operator log lines.
+    // `max_resource_bytes`. They are stored on `StockRefusal` for set-equality
+    // and tests, never logged — truncation is not redaction.
     let hostile = format!(
         "outbound|9080||{}\nWARN forged-log-line\r.example.com",
         "a".repeat(4096)
@@ -872,19 +877,30 @@ fn stock_refusal_diagnostics_are_bounded_and_free_of_control_characters() {
     let refusal = &refusals[0];
     assert!(
         refusal.resource.chars().count() <= 200,
-        "a refusal diagnostic must be length-bounded, got {} chars",
+        "a stored refusal diagnostic must be length-bounded, got {} chars",
         refusal.resource.chars().count()
     );
     assert!(
         !refusal.resource.chars().any(char::is_control),
-        "a refusal diagnostic must not carry control characters (log-line forgery)"
+        "a stored refusal diagnostic must not carry control characters"
     );
     assert!(refusal.resource.ends_with("(truncated)"));
+    // Production ordering parses the Istio four-tuple first
+    // (`<direction>|<port>|<subset>|<host>`). This hostile name is well-formed
+    // as that tuple; the host is not a Kubernetes service FQDN (overlong,
+    // control characters), so the closed-set reason is the host classifier,
+    // not `unparsable_cluster_name`. The resource is still refused, bounded,
+    // and stripped of control characters.
+    assert_eq!(refusal.reason, refusal::NON_KUBERNETES_SERVICE_HOST);
+    assert_eq!(refusal.type_label, "cds");
 }
 
 #[test]
-fn stock_observability_versions_are_bounded_and_free_of_control_characters() {
-    let hostile_version = format!("{}\nWARN forged-log-line\r", "v".repeat(4096));
+fn stock_observability_versions_are_closed_set_presence_markers() {
+    let hostile_version = format!(
+        "Bearer stock-xds-echoed-bearer-sentinel-{}\nWARN forged-log-line\r",
+        "v".repeat(64)
+    );
     let mut accumulator = StockXdsAccumulator::default();
     accumulator
         .apply_sotw(CDS_TYPE_URL, &[], &hostile_version)
@@ -894,9 +910,19 @@ fn stock_observability_versions_are_bounded_and_free_of_control_characters() {
         .per_type_versions()
         .remove("cds")
         .expect("CDS version");
-    assert!(version.chars().count() <= 200, "{version}");
-    assert!(!version.chars().any(char::is_control), "{version}");
-    assert!(version.ends_with("(truncated)"), "{version}");
+    assert_eq!(
+        version,
+        ferrum_edge::xds::stock::STOCK_RECEIVED_VERSION,
+        "stock observability must not retain remote version_info: {version}"
+    );
+    assert!(
+        !version.contains("Bearer"),
+        "a remote version_info prefix must not survive: {version}"
+    );
+    assert!(
+        !accumulator.composite_version().contains("Bearer"),
+        "composite version must not retain remote version_info"
+    );
 }
 
 #[test]
@@ -967,6 +993,26 @@ fn stock_duplicate_resource_name_is_a_structural_error() {
         )
         .expect_err("duplicate names make the SotW set ambiguous");
     assert!(error.contains("duplicate Cluster resource name"), "{error}");
+    assert!(error.contains(REVIEWS_CLUSTER), "{error}");
+}
+
+#[test]
+fn stock_structural_nack_detail_may_echo_the_cp_name_back_to_that_cp() {
+    // Returning bounded validation detail to the same control plane is not
+    // the log-disclosure defect. The name must still be present on the NACK
+    // payload so the CP can recognize its own rejected resource.
+    const SENTINEL: &str = "stock-xds-echoed-bearer-sentinel-nack";
+    let mut cluster = eds_cluster(REVIEWS_CLUSTER, &[REVIEWS_SAN]);
+    cluster.name = SENTINEL.to_string();
+    let mut accumulator = StockXdsAccumulator::default();
+    let error = accumulator
+        .apply_sotw(
+            CDS_TYPE_URL,
+            &[any(CDS_TYPE_URL, &cluster), any(CDS_TYPE_URL, &cluster)],
+            SENTINEL,
+        )
+        .expect_err("duplicate names make the SotW set ambiguous");
+    assert!(error.contains(SENTINEL), "{error}");
 }
 
 #[test]
@@ -2110,8 +2156,10 @@ fn stock_xds_bearer_token_uses_the_shared_bounded_reader() {
         )
         .await
         .expect_err("stock token must respect the shared 64 KiB ceiling");
+        // Issue #3852 replaced the free-form read error with a closed-set
+        // reason so the same value can label a metric and a health field.
         let rendered = error.to_string();
-        assert!(rendered.contains("maximum of 65536 bytes"), "{rendered}");
+        assert_eq!(rendered, "token_source_oversized", "{rendered}");
         assert!(!rendered.contains(oversized_path.to_str().unwrap()));
         assert!(!rendered.contains(&"s".repeat(128)));
     });
@@ -2159,10 +2207,375 @@ fn stock_xds_reconnects_bound_detached_reader_occupancy() {
 
 #[test]
 fn stock_xds_source_has_no_unbounded_async_token_read() {
-    let source = include_str!("../../../src/modes/mesh/config_consumer/stock_xds_client.rs");
+    // Issue #3852 moved the credential boundary into its own module so the
+    // connect path and the rotation watcher share one hardened reader.
+    let source = include_str!("../../../src/modes/mesh/config_consumer/stock_xds_credential.rs");
+    let client = include_str!("../../../src/modes/mesh/config_consumer/stock_xds_client.rs");
     let secret_registry = include_str!("../../../src/secrets/registry.rs");
     assert!(!source.contains("tokio::fs::read_to_string(path)"));
+    assert!(!client.contains("tokio::fs::read_to_string(path)"));
     assert!(source.contains("read_credential_file_detached_guarded"));
     assert!(source.contains("STOCK_XDS_TOKEN_FILE_READ_LIMIT"));
+    // The client must not have grown its own second reader.
+    assert!(!client.contains("read_credential_file_detached_guarded"));
     assert!(secret_registry.contains("\"FERRUM_MESH_STOCK_XDS_TOKEN_FILE\","));
+}
+
+// ── third-party ADS log redaction (issue #3852) ──────────────────────────
+
+const ECHOED_BEARER_SENTINEL: &str = "stock-xds-echoed-bearer-sentinel-7f3a";
+
+type StockLogBuffer = Arc<Mutex<Vec<u8>>>;
+
+fn capture_stock_logs() -> (StockLogBuffer, tracing::subscriber::DefaultGuard) {
+    #[derive(Clone)]
+    struct Writer(StockLogBuffer);
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Writer {
+        type Writer = Guard;
+
+        fn make_writer(&'a self) -> Self::Writer {
+            Guard(Arc::clone(&self.0))
+        }
+    }
+
+    struct Guard(StockLogBuffer);
+
+    impl std::io::Write for Guard {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().expect("log buffer").extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    let buffer = Arc::new(Mutex::new(Vec::new()));
+    let subscriber = tracing_subscriber::fmt()
+        .with_ansi(false)
+        .with_target(false)
+        .without_time()
+        .with_max_level(tracing::Level::DEBUG)
+        .with_writer(Writer(Arc::clone(&buffer)))
+        .finish();
+    let guard = tracing::subscriber::set_default(subscriber);
+    (buffer, guard)
+}
+
+fn captured_text(buffer: &StockLogBuffer) -> String {
+    String::from_utf8(buffer.lock().expect("log buffer").clone()).unwrap_or_default()
+}
+
+fn assert_no_echoed_bearer(logs: &str) {
+    assert!(
+        !logs.contains(ECHOED_BEARER_SENTINEL),
+        "a synthetic bearer echoed by the stock control plane must not reach Ferrum logs: {logs}"
+    );
+}
+
+fn stock_admission_config() -> StockXdsClientConfig {
+    use ferrum_edge::modes::mesh::config_consumer::stock_xds_credential::StockXdsCredentialSource;
+    use ferrum_edge::modes::mesh::config_consumer::stream_lifecycle::MeshStreamTimings;
+
+    StockXdsClientConfig {
+        xds_urls: vec!["https://127.0.0.1:15010".to_string()],
+        node_id: "sidecar~10.1.2.3~reviews.default~default.svc.cluster.local".to_string(),
+        cluster: "default".to_string(),
+        namespace: "default".to_string(),
+        node_metadata: Default::default(),
+        credential: StockXdsCredentialSource::unauthenticated(),
+        allow_loopback_plaintext: false,
+        stream_channel_capacity: 32,
+        primary_retry_secs: 0,
+        connect_timeout_seconds: 5,
+        limits: StockXdsLimits::default(),
+        timings: MeshStreamTimings::production(),
+    }
+}
+
+fn stock_admission_request(config: &StockXdsClientConfig) -> MeshSliceRequest {
+    MeshSliceRequest {
+        node_id: config.node_id.clone(),
+        namespace: config.namespace.clone(),
+        cluster_domain: "cluster.local".to_string(),
+        ..MeshSliceRequest::default()
+    }
+}
+
+fn discovery_response(
+    type_url: &str,
+    version: &str,
+    nonce: &str,
+    resources: Vec<ferrum_edge::xds::proto::Any>,
+) -> ferrum_edge::xds::proto::DiscoveryResponse {
+    ferrum_edge::xds::proto::DiscoveryResponse {
+        version_info: version.to_string(),
+        resources,
+        canary: false,
+        type_url: type_url.to_string(),
+        nonce: nonce.to_string(),
+        control_plane: None,
+    }
+}
+
+fn proto_any(type_url: &str, message: &impl Message) -> ferrum_edge::xds::proto::Any {
+    ferrum_edge::xds::proto::Any {
+        type_url: type_url.to_string(),
+        value: message.encode_to_vec(),
+    }
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn stock_logs_omit_echoed_bearer_from_unsolicited_type_url() {
+    use ferrum_edge::modes::mesh::config::MeshConfig;
+    use ferrum_edge::modes::mesh::config_consumer::stock_xds_client::{
+        StockAdsAdmissionProbe, StockResponseAdmission,
+    };
+
+    let config = stock_admission_config();
+    let request = stock_admission_request(&config);
+    let type_url = format!("type.googleapis.com/{ECHOED_BEARER_SENTINEL}");
+    let (buffer, guard) = capture_stock_logs();
+    let mut probe = StockAdsAdmissionProbe::new();
+    let admission = probe
+        .admit(
+            discovery_response(
+                &type_url,
+                ECHOED_BEARER_SENTINEL,
+                ECHOED_BEARER_SENTINEL,
+                vec![],
+            ),
+            &config,
+            &MeshConfig::default(),
+            &request,
+        )
+        .await;
+    drop(guard);
+    let logs = captured_text(&buffer);
+    assert_eq!(
+        admission,
+        StockResponseAdmission::Closed("unsolicited_type_url")
+    );
+    assert_no_echoed_bearer(&logs);
+    assert!(
+        logs.contains("unsolicited_type_url"),
+        "closed-set unsolicited reason must remain: {logs}"
+    );
+    assert!(
+        logs.contains("type_url=unsolicited") || logs.contains("unsolicited"),
+        "closed-set type label must remain: {logs}"
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn stock_logs_omit_echoed_bearer_from_volunteered_sds() {
+    use ferrum_edge::modes::mesh::config::MeshConfig;
+    use ferrum_edge::modes::mesh::config_consumer::stock_xds_client::{
+        StockAdsAdmissionProbe, StockResponseAdmission,
+    };
+    use ferrum_edge::xds::SDS_TYPE_URL;
+
+    let secret = sp::Secret {
+        name: ECHOED_BEARER_SENTINEL.to_string(),
+        tls_certificate: vec![vec![0x0a, 0x02, 0x61, 0x62]],
+        ..Default::default()
+    };
+    let config = stock_admission_config();
+    let request = stock_admission_request(&config);
+    let (buffer, guard) = capture_stock_logs();
+    let mut probe = StockAdsAdmissionProbe::new();
+    let admission = probe
+        .admit(
+            discovery_response(
+                SDS_TYPE_URL,
+                ECHOED_BEARER_SENTINEL,
+                ECHOED_BEARER_SENTINEL,
+                vec![proto_any(SDS_TYPE_URL, &secret)],
+            ),
+            &config,
+            &MeshConfig::default(),
+            &request,
+        )
+        .await;
+    drop(guard);
+    let logs = captured_text(&buffer);
+    assert_eq!(admission, StockResponseAdmission::Closed("unsolicited_sds"));
+    assert_no_echoed_bearer(&logs);
+    assert!(
+        logs.contains("unsolicited_sds"),
+        "closed-set SDS reason must remain: {logs}"
+    );
+    assert!(
+        logs.contains("refused_resources=1") || logs.contains("refused_resources: 1"),
+        "SDS refusal count must remain: {logs}"
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn stock_logs_omit_echoed_bearer_from_accepted_version_nonce_and_apply() {
+    use ferrum_edge::modes::mesh::config::MeshConfig;
+    use ferrum_edge::modes::mesh::config_consumer::stock_xds_client::{
+        StockAdsAdmissionProbe, StockResponseAdmission,
+    };
+
+    let config = stock_admission_config();
+    let request = stock_admission_request(&config);
+    let (buffer, guard) = capture_stock_logs();
+    let mut probe = StockAdsAdmissionProbe::new();
+    let admission = probe
+        .admit(
+            discovery_response(
+                CDS_TYPE_URL,
+                ECHOED_BEARER_SENTINEL,
+                ECHOED_BEARER_SENTINEL,
+                vec![],
+            ),
+            &config,
+            &MeshConfig::default(),
+            &request,
+        )
+        .await;
+    drop(guard);
+    let logs = captured_text(&buffer);
+    assert_eq!(admission, StockResponseAdmission::Applied);
+    assert_no_echoed_bearer(&logs);
+    assert!(
+        logs.contains("type_url=cds") || logs.contains("cds"),
+        "admitted type label must remain: {logs}"
+    );
+    assert!(
+        logs.contains("services=0") || logs.contains("services: 0"),
+        "apply counts must remain: {logs}"
+    );
+    let versions = probe.accumulator().per_type_versions();
+    assert_eq!(
+        versions.get("cds").map(String::as_str),
+        Some(ferrum_edge::xds::stock::STOCK_RECEIVED_VERSION)
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn stock_logs_omit_echoed_bearer_from_structural_nack() {
+    use ferrum_edge::modes::mesh::config::MeshConfig;
+    use ferrum_edge::modes::mesh::config_consumer::stock_xds_client::{
+        StockAdsAdmissionProbe, StockResponseAdmission,
+    };
+
+    let mut cluster = eds_cluster(REVIEWS_CLUSTER, &[REVIEWS_SAN]);
+    cluster.name = ECHOED_BEARER_SENTINEL.to_string();
+    let config = stock_admission_config();
+    let request = stock_admission_request(&config);
+    let (buffer, guard) = capture_stock_logs();
+    let mut probe = StockAdsAdmissionProbe::new();
+    let admission = probe
+        .admit(
+            discovery_response(
+                CDS_TYPE_URL,
+                ECHOED_BEARER_SENTINEL,
+                ECHOED_BEARER_SENTINEL,
+                vec![
+                    proto_any(CDS_TYPE_URL, &cluster),
+                    proto_any(CDS_TYPE_URL, &cluster),
+                ],
+            ),
+            &config,
+            &MeshConfig::default(),
+            &request,
+        )
+        .await;
+    drop(guard);
+    let logs = captured_text(&buffer);
+    assert_eq!(admission, StockResponseAdmission::Nacked);
+    assert_no_echoed_bearer(&logs);
+    assert!(
+        logs.contains("consecutive_nacks=1") || logs.contains("consecutive_nacks: 1"),
+        "NACK counter must remain: {logs}"
+    );
+    assert!(
+        logs.contains("type_url=cds") || logs.contains("cds"),
+        "admitted type label must remain: {logs}"
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn stock_logs_omit_echoed_bearer_from_capability_refusals() {
+    use ferrum_edge::modes::mesh::config::MeshConfig;
+    use ferrum_edge::modes::mesh::config_consumer::stock_xds_client::{
+        StockAdsAdmissionProbe, StockResponseAdmission,
+    };
+
+    let mut cluster = eds_cluster(REVIEWS_CLUSTER, &[REVIEWS_SAN]);
+    cluster.name = ECHOED_BEARER_SENTINEL.to_string();
+    cluster
+        .typed_extension_protocol_options
+        .insert(ECHOED_BEARER_SENTINEL.to_string(), sp::Any::default());
+    let config = stock_admission_config();
+    let request = stock_admission_request(&config);
+    let (buffer, guard) = capture_stock_logs();
+    let mut probe = StockAdsAdmissionProbe::new();
+    let admission = probe
+        .admit(
+            discovery_response(
+                CDS_TYPE_URL,
+                ECHOED_BEARER_SENTINEL,
+                ECHOED_BEARER_SENTINEL,
+                vec![proto_any(CDS_TYPE_URL, &cluster)],
+            ),
+            &config,
+            &MeshConfig::default(),
+            &request,
+        )
+        .await;
+    drop(guard);
+    let logs = captured_text(&buffer);
+    assert_eq!(admission, StockResponseAdmission::Applied);
+    assert_no_echoed_bearer(&logs);
+    assert!(
+        logs.contains(refusal::CLUSTER_EXTENSION_ESCAPE)
+            || logs.contains(refusal::UNPARSABLE_CLUSTER_NAME),
+        "closed-set refusal reason must remain: {logs}"
+    );
+    assert!(
+        logs.contains("refused_resources=1") || logs.contains("refused_resources: 1"),
+        "refusal count must remain: {logs}"
+    );
+}
+
+#[test]
+fn stock_xds_client_does_not_log_raw_remote_ads_fields() {
+    let client = include_str!("../../../src/modes/mesh/config_consumer/stock_xds_client.rs");
+    let stock = include_str!("../../../src/xds/stock.rs");
+    assert!(
+        !client.contains("diagnostic_value"),
+        "stock ADS logs must not render truncated remote fields as if they were safe"
+    );
+    assert!(!client.contains("safe_url"));
+    assert!(
+        !client.contains("version = %"),
+        "remote version_info must not be a log field"
+    );
+    assert!(
+        !client.contains("nonce = %"),
+        "remote nonce must not be a log field"
+    );
+    assert!(
+        !client.contains("resource = %"),
+        "remote resource names must not be a log field"
+    );
+    assert!(
+        !client.contains("field = %"),
+        "CP-authored refusal detail must not be a log field"
+    );
+    assert!(
+        !client.contains("detail = %"),
+        "CP-authored refusal detail must not be a log field"
+    );
+    assert!(
+        stock.contains("Truncation is **not** redaction")
+            || stock.contains("Truncation is not redaction"),
+        "stock diagnostic objects must document that truncation is not redaction"
+    );
+    assert!(stock.contains("STOCK_RECEIVED_VERSION"));
 }

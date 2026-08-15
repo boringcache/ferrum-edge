@@ -317,9 +317,13 @@ aarch64 archives actually used by callers) and does **not** invoke
 `mozilla-actions/sccache-action`, which exports `ACTIONS_RUNTIME_TOKEN` and
 `ACTIONS_RESULTS_URL` into `GITHUB_ENV`. A fail-closed assertion before cargo
 refuses to continue if those variables are present in a `run:` environment
-(values are never printed). The sccache GHA backend stays disabled; compiler
-outputs use a 2 GiB local directory persisted by rust-cache / the FIPS
-producer archive. Production-image cache restore and save stay inside the
+(values are never printed). The installer publishes an empty
+`FERRUM_SCCACHE_BIN` sentinel first, then sets `RUSTC_WRAPPER` to that
+checksum-verified path only; it never puts sccache on `PATH`. It persists
+`SCCACHE_GHA_ENABLED` as empty so a later step cannot re-enable the
+credential-bearing GHA backend. Install failure clears the rustc wrapper and
+continues uncached. Compiler outputs use a 2 GiB local directory persisted by
+rust-cache / the FIPS producer archive. Production-image cache restore and save stay inside the
 pinned `actions/cache/*` actions; PR-controlled `run:` steps only measure the
 restored directory and move the BuildKit local export. Workflows stay
 `permissions: contents: read`. Static checks live in

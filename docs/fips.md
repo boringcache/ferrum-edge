@@ -100,7 +100,9 @@ action holds the GitHub Actions cache credential inside the action process;
 PR-controlled `run:` steps never receive that credential. `setup-sccache`
 installs sccache from a checksum-pinned GitHub release and never invokes
 `mozilla-actions/sccache-action` (which would export `ACTIONS_RUNTIME_TOKEN`
-into `GITHUB_ENV`). rust-cache `save-if`
+into `GITHUB_ENV`). It activates only the checksum-verified executable by
+exact path (`FERRUM_SCCACHE_BIN` / `RUSTC_WRAPPER`) and persists
+`SCCACHE_GHA_ENABLED` empty. rust-cache `save-if`
 is false when `github.event.pull_request.head.repo.fork` is true on the
 compile producer, and always false on clippy/test, so fork pull
 requests restore and cannot save. Trusted compile runs keep `cache-on-failure`

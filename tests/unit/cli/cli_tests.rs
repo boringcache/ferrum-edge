@@ -1110,6 +1110,7 @@ fn test_apply_ambient_udp_preflight_overrides_sets_settings_path() {
             let args = AmbientUdpPreflightArgs {
                 settings: Some("/etc/ferrum/preflight.conf".into()),
                 timeout_seconds: 300,
+                host_proc_root: None,
                 verbose: 0,
             };
             ferrum_edge::cli::apply_ambient_udp_preflight_overrides(&args);
@@ -1140,6 +1141,7 @@ fn test_apply_ambient_udp_preflight_overrides_verbose_levels() {
                 let args = AmbientUdpPreflightArgs {
                     settings: None,
                     timeout_seconds: 300,
+                    host_proc_root: None,
                     verbose: level,
                 };
                 ferrum_edge::cli::apply_ambient_udp_preflight_overrides(&args);
@@ -1165,6 +1167,7 @@ fn test_apply_ambient_udp_preflight_overrides_no_verbose_does_not_set_log_level(
             let args = AmbientUdpPreflightArgs {
                 settings: None,
                 timeout_seconds: 300,
+                host_proc_root: None,
                 verbose: 0,
             };
             ferrum_edge::cli::apply_ambient_udp_preflight_overrides(&args);

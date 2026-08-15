@@ -414,8 +414,9 @@ jobs:
       - name: Record sccache stats
         if: always()
         run: |
-          if command -v sccache >/dev/null 2>&1; then
-            sccache --show-stats || true
+          sccache_bin="${FERRUM_SCCACHE_BIN:-}"
+          if [ -n "$sccache_bin" ] && [ -x "$sccache_bin" ]; then
+            "$sccache_bin" --show-stats || true
           fi
           python3 .github/scripts/ci_runtime_telemetry.py summarize --title "FIPS compile"
 
@@ -562,8 +563,9 @@ jobs:
       - name: Record sccache stats
         if: always()
         run: |
-          if command -v sccache >/dev/null 2>&1; then
-            sccache --show-stats || true
+          sccache_bin="${FERRUM_SCCACHE_BIN:-}"
+          if [ -n "$sccache_bin" ] && [ -x "$sccache_bin" ]; then
+            "$sccache_bin" --show-stats || true
           fi
           python3 .github/scripts/ci_runtime_telemetry.py summarize --title "FIPS clippy"
 
@@ -735,8 +737,9 @@ jobs:
       - name: Record sccache stats
         if: always()
         run: |
-          if command -v sccache >/dev/null 2>&1; then
-            sccache --show-stats || true
+          sccache_bin="${FERRUM_SCCACHE_BIN:-}"
+          if [ -n "$sccache_bin" ] && [ -x "$sccache_bin" ]; then
+            "$sccache_bin" --show-stats || true
           fi
           python3 .github/scripts/ci_runtime_telemetry.py summarize --title "FIPS tests"
 

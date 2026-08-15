@@ -491,12 +491,14 @@ fn synchronous_validation_of_remote_providers_is_runtime_free() {
 }
 
 #[test]
-fn dpop_replay_cache_uses_published_default_capacity() {
+fn dpop_replay_lane_uses_published_default_capacity() {
     let plugin = JwksAuth::new(
         &json!({
             "providers": [{
                 "jwks": {"keys": []},
-                "require_dpop": true
+                "issuer": "https://idp.example.com",
+                "require_dpop": true,
+                "dpop_replay_scope": "process"
             }]
         }),
         default_client(),
@@ -504,11 +506,12 @@ fn dpop_replay_cache_uses_published_default_capacity() {
     .expect("valid inline provider");
 
     assert_eq!(
-        plugin.dpop_jti_cache_capacities(),
+        plugin.dpop_replay_lane_capacities(),
         vec![Some(
-            ferrum_edge::plugins::jwks_auth::DEFAULT_DPOP_JTI_CACHE_MAX_ENTRIES
+            ferrum_edge::plugins::jwks_auth::DEFAULT_DPOP_REPLAY_MAX_ENTRIES
         )]
     );
+    assert_eq!(plugin.dpop_replay_modes(), vec![Some("process")]);
 }
 
 #[test]
@@ -1766,7 +1769,9 @@ async fn dpop_valid_proof_with_matching_jkt_succeeds() {
         &json!({
             "providers": [{
                 "jwks_uri": jwks_uri,
-                "require_dpop": true
+                "issuer": "https://idp.example.com",
+                "require_dpop": true,
+                "dpop_replay_scope": "process"
             }]
         }),
         default_client(),
@@ -1776,7 +1781,7 @@ async fn dpop_valid_proof_with_matching_jkt_succeeds() {
 
     let consumer_index = ConsumerIndex::new(&[create_consumer("idp-user")]);
     let access_token = create_rs256_token(
-        &json!({"sub": "idp-user", "cnf": {"jkt": jkt}}),
+        &json!({"sub": "idp-user", "iss": "https://idp.example.com", "cnf": {"jkt": jkt}}),
         private_key_pem,
     );
     let now = chrono::Utc::now().timestamp();
@@ -1830,7 +1835,9 @@ async fn dpop_required_but_header_missing_rejects_401() {
         &json!({
             "providers": [{
                 "jwks_uri": jwks_uri,
-                "require_dpop": true
+                "issuer": "https://idp.example.com",
+                "require_dpop": true,
+                "dpop_replay_scope": "process"
             }]
         }),
         default_client(),
@@ -1840,7 +1847,7 @@ async fn dpop_required_but_header_missing_rejects_401() {
 
     let consumer_index = ConsumerIndex::new(&[create_consumer("idp-user")]);
     let token = create_rs256_token(
-        &json!({"sub": "idp-user", "cnf": {"jkt": "missing"}}),
+        &json!({"sub": "idp-user", "iss": "https://idp.example.com", "cnf": {"jkt": "missing"}}),
         private_key_pem,
     );
     let mut ctx = make_ctx();
@@ -3264,4 +3271,1124 @@ async fn shared_discovery_uri_relaxes_only_after_the_stricter_generation_retires
     drop(relaxed);
     assert_eq!(wait_for_active_remote_stores(0).await, 0);
     clear_jwks_cache();
+}
+
+// ────────────────────────────────────────────────────────────────────
+// Issue #3834 — DPoP proofs are single-use across reloads and replicas
+// ────────────────────────────────────────────────────────────────────
+
+/// Everything a DPoP request needs, built once so the reload / replica /
+/// isolation cases can replay byte-identical inputs.
+struct DpopFixture {
+    access_token: String,
+    proof: String,
+}
+
+fn build_dpop_fixture(jti: &str) -> (DpopFixture, serde_json::Value) {
+    use base64::Engine;
+    use ferrum_edge::plugins::utils::dpop::jwk_thumbprint_sha256;
+    use jsonwebtoken::{EncodingKey, Header, encode};
+    use sha2::{Digest, Sha256};
+
+    let private_key_pem = include_bytes!("../../../tests/fixtures/test_rsa_private.pem");
+    let public_key_pem = include_bytes!("../../../tests/fixtures/test_rsa_public.pem");
+    let jwks = build_rsa_jwks_from_pem(public_key_pem);
+    let jwk: jsonwebtoken::jwk::Jwk = serde_json::from_value(jwks["keys"][0].clone()).unwrap();
+    let jkt = jwk_thumbprint_sha256(&jwk).unwrap();
+
+    let access_token = create_rs256_token(
+        &json!({"sub": "idp-user", "iss": DPOP_TEST_ISSUER, "cnf": {"jkt": jkt}}),
+        private_key_pem,
+    );
+    let mut hasher = Sha256::new();
+    hasher.update(access_token.as_bytes());
+    let ath = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(hasher.finalize());
+
+    let now = chrono::Utc::now().timestamp();
+    let mut dpop_header = Header::new(jsonwebtoken::Algorithm::RS256);
+    dpop_header.typ = Some("dpop+jwt".to_string());
+    dpop_header.jwk = Some(jwk);
+    let proof = encode(
+        &dpop_header,
+        &json!({
+            "htm": "GET",
+            "htu": "http://example.com/test",
+            "iat": now,
+            "exp": now + 60,
+            "jti": jti,
+            "ath": ath
+        }),
+        &EncodingKey::from_rsa_pem(private_key_pem).unwrap(),
+    )
+    .unwrap();
+
+    (
+        DpopFixture {
+            access_token,
+            proof,
+        },
+        jwks,
+    )
+}
+
+fn dpop_ctx(fixture: &DpopFixture) -> RequestContext {
+    let mut ctx = make_ctx();
+    ctx.headers.insert(
+        "authorization".to_string(),
+        format!("Bearer {}", fixture.access_token),
+    );
+    ctx.headers
+        .insert("dpop".to_string(), fixture.proof.clone());
+    ctx.headers
+        .insert("host".to_string(), "example.com".to_string());
+    ctx.metadata
+        .insert("ferrum.frontend_scheme".to_string(), "http".to_string());
+    ctx
+}
+
+fn dpop_plugin(jwks: &serde_json::Value, config_id: &str) -> JwksAuth {
+    JwksAuth::new_with_config_id(
+        &json!({
+            "providers": [{
+                "jwks": jwks,
+                "issuer": DPOP_TEST_ISSUER,
+                "require_dpop": true,
+                "dpop_replay_scope": "process"
+            }]
+        }),
+        default_client(),
+        Some(config_id),
+    )
+    .expect("inline-JWKS DPoP provider with a declared replay scope")
+}
+
+#[tokio::test]
+async fn dpop_exact_proof_replay_is_rejected() {
+    let (fixture, jwks) = build_dpop_fixture("dpop-replay-sequential");
+    let plugin = dpop_plugin(&jwks, "dpop-sequential");
+    let consumer_index = ConsumerIndex::new(&[create_consumer("idp-user")]);
+
+    let mut first = dpop_ctx(&fixture);
+    assert_continue(plugin.authenticate(&mut first, &consumer_index).await);
+
+    let mut replay = dpop_ctx(&fixture);
+    assert_reject(
+        plugin.authenticate(&mut replay, &consumer_index).await,
+        Some(401),
+    );
+}
+
+/// The reload opening from issue #3834: a rebuilt plugin generation must
+/// inherit the retired generation's replay markers instead of starting empty.
+#[tokio::test]
+async fn dpop_replay_stays_rejected_after_an_equivalent_plugin_rebuild() {
+    let (fixture, jwks) = build_dpop_fixture("dpop-replay-reload");
+    let consumer_index = ConsumerIndex::new(&[create_consumer("idp-user")]);
+
+    let original = dpop_plugin(&jwks, "dpop-reload");
+    let mut first = dpop_ctx(&fixture);
+    assert_continue(original.authenticate(&mut first, &consumer_index).await);
+
+    // Retire the generation that admitted the proof, exactly as a plugin-cache
+    // rebuild does, and construct an equivalent replacement.
+    drop(original);
+    let reloaded = dpop_plugin(&jwks, "dpop-reload");
+    let mut replay = dpop_ctx(&fixture);
+    assert_reject(
+        reloaded.authenticate(&mut replay, &consumer_index).await,
+        Some(401),
+    );
+}
+
+/// Two equivalent generations alive at once (the rolling-deployment shape)
+/// share one protection domain, so a proof admitted by either is a replay for
+/// the other.
+#[tokio::test]
+async fn dpop_replay_is_rejected_across_equivalent_concurrent_generations() {
+    let (fixture, jwks) = build_dpop_fixture("dpop-replay-rolling");
+    let consumer_index = ConsumerIndex::new(&[create_consumer("idp-user")]);
+
+    let old_generation = dpop_plugin(&jwks, "dpop-rolling");
+    let new_generation = dpop_plugin(&jwks, "dpop-rolling");
+
+    let mut first = dpop_ctx(&fixture);
+    assert_continue(
+        old_generation
+            .authenticate(&mut first, &consumer_index)
+            .await,
+    );
+    let mut replay = dpop_ctx(&fixture);
+    assert_reject(
+        new_generation
+            .authenticate(&mut replay, &consumer_index)
+            .await,
+        Some(401),
+    );
+}
+
+/// Distinct policies must not suppress one another: the same proof presented to
+/// an unrelated `jwks_auth` policy is that policy's first sighting.
+#[tokio::test]
+async fn dpop_replay_lanes_are_isolated_across_policies() {
+    let (fixture, jwks) = build_dpop_fixture("dpop-replay-isolation");
+    let consumer_index = ConsumerIndex::new(&[create_consumer("idp-user")]);
+
+    let policy_a = dpop_plugin(&jwks, "dpop-isolation-a");
+    let policy_b = dpop_plugin(&jwks, "dpop-isolation-b");
+
+    let mut first = dpop_ctx(&fixture);
+    assert_continue(policy_a.authenticate(&mut first, &consumer_index).await);
+    let mut second = dpop_ctx(&fixture);
+    assert_continue(policy_b.authenticate(&mut second, &consumer_index).await);
+}
+
+/// Filling a provider's replay lane must never make an unexpired proof
+/// reusable: at capacity a NEW proof is refused (503) while the retained one
+/// stays a replay (401).
+#[tokio::test]
+async fn dpop_capacity_refuses_new_proofs_without_freeing_a_live_marker() {
+    let (retained, jwks) = build_dpop_fixture("dpop-capacity-retained");
+    let (fresh, _) = build_dpop_fixture("dpop-capacity-fresh");
+    let consumer_index = ConsumerIndex::new(&[create_consumer("idp-user")]);
+
+    let plugin = JwksAuth::new_with_config_id(
+        &json!({
+            "providers": [{
+                "jwks": jwks,
+                "issuer": DPOP_TEST_ISSUER,
+                "require_dpop": true,
+                "dpop_replay_scope": "process",
+                "dpop_replay_max_entries": 1
+            }]
+        }),
+        default_client(),
+        Some("dpop-capacity"),
+    )
+    .expect("single-slot DPoP replay lane");
+
+    let mut first = dpop_ctx(&retained);
+    assert_continue(plugin.authenticate(&mut first, &consumer_index).await);
+
+    // The lane is full and the retained marker is live: the new proof is
+    // refused rather than the live marker evicted.
+    let mut new_proof = dpop_ctx(&fresh);
+    assert_reject(
+        plugin.authenticate(&mut new_proof, &consumer_index).await,
+        Some(503),
+    );
+
+    // …and the retained proof is still a replay, so capacity pressure did not
+    // reopen it.
+    let mut replay = dpop_ctx(&retained);
+    assert_reject(
+        plugin.authenticate(&mut replay, &consumer_index).await,
+        Some(401),
+    );
+}
+
+/// `require_dpop` without a declared replay scope is refused at admission: a
+/// gateway cannot observe its own replica count, so the declaration is the
+/// control that prevents silent per-replica replay.
+#[test]
+fn dpop_requires_an_explicitly_declared_replay_scope() {
+    let error = JwksAuth::new(
+        &json!({
+            "providers": [{
+                "jwks": {"keys": []},
+                "issuer": "https://idp.example.com",
+                "require_dpop": true
+            }]
+        }),
+        default_client(),
+    )
+    .map(|_| ())
+    .expect_err("require_dpop without a replay scope must be refused");
+    assert!(
+        error.contains("dpop_replay_scope"),
+        "diagnostic should name the missing declaration: {error}"
+    );
+
+    // The scope is meaningless without the feature it protects.
+    assert!(
+        JwksAuth::new(
+            &json!({
+                "providers": [{"jwks": {"keys": []}, "dpop_replay_scope": "process"}]
+            }),
+            default_client(),
+        )
+        .is_err()
+    );
+
+    // `shared` must be backed by Redis, and Redis must be consumed by a
+    // `shared` provider — a scope/backend disagreement is a misconfiguration in
+    // both directions, never a silent degradation to process-local state.
+    assert!(
+        JwksAuth::new(
+            &json!({
+                "providers": [{
+                    "jwks": {"keys": []},
+                    "issuer": "https://idp.example.com",
+                    "require_dpop": true,
+                    "dpop_replay_scope": "shared"
+                }]
+            }),
+            default_client(),
+        )
+        .is_err()
+    );
+    assert!(
+        JwksAuth::new(
+            &json!({
+                "providers": [{
+                    "jwks": {"keys": []},
+                    "issuer": "https://idp.example.com",
+                    "require_dpop": true,
+                    "dpop_replay_scope": "process"
+                }],
+                "sync_mode": "redis",
+                "redis_url": "redis://127.0.0.1:6379"
+            }),
+            default_client(),
+        )
+        .is_err()
+    );
+}
+
+/// `require_dpop` without a nonblank exact issuer is refused: the replay realm
+/// is the issuer, so omitting it would make key rotation or a source-URI change
+/// reopen every live proof.
+#[test]
+fn dpop_requires_a_nonblank_exact_issuer() {
+    let error = JwksAuth::new(
+        &json!({
+            "providers": [{
+                "jwks": {"keys": []},
+                "require_dpop": true,
+                "dpop_replay_scope": "process"
+            }]
+        }),
+        default_client(),
+    )
+    .map(|_| ())
+    .expect_err("require_dpop without an issuer must be refused");
+    assert!(
+        error.contains("issuer") && error.contains("require_dpop"),
+        "diagnostic should name the missing issuer: {error}"
+    );
+}
+
+// ── semantic provider identity ──────────────────────────────────────
+//
+// A provider's DPoP protection sub-domain is a digest of its exact issuer
+// realm, never its JWKS contents, key ids, source URL, or position in the
+// `providers` array. An ordinal is not an identity: reordering an unchanged
+// list, or inserting or deleting an unrelated provider ahead of one, would
+// otherwise strand a provider's live markers in a lane nothing consults and
+// readmit a proof it had already claimed. Hashing the JWKS document or source
+// endpoint would reopen those markers on an ordinary key rotation.
+
+const DPOP_TEST_ISSUER: &str = "https://idp.example.com";
+const DPOP_DECOY_ISSUER: &str = "https://decoy.example.invalid";
+
+fn dpop_provider(jwks: &serde_json::Value) -> serde_json::Value {
+    json!({
+        "jwks": jwks,
+        "issuer": DPOP_TEST_ISSUER,
+        "require_dpop": true,
+        "dpop_replay_scope": "process"
+    })
+}
+
+fn dpop_shared_provider(jwks: &serde_json::Value) -> serde_json::Value {
+    json!({
+        "jwks": jwks,
+        "issuer": DPOP_TEST_ISSUER,
+        "require_dpop": true,
+        "dpop_replay_scope": "shared"
+    })
+}
+
+/// Construction with a configured Redis backend. Used to prove mixed
+/// process/shared equivalent providers are refused even when the plugin-level
+/// effective scope would otherwise be `shared` (the previous hole).
+fn jwks_with_redis(providers: serde_json::Value, config_id: &str) -> Result<JwksAuth, String> {
+    JwksAuth::new_with_config_id(
+        &json!({
+            "providers": providers,
+            "sync_mode": "redis",
+            "redis_url": "redis://127.0.0.1:6379"
+        }),
+        default_client(),
+        Some(config_id),
+    )
+}
+
+/// A provider that requires DPoP but can never validate a token, so it is only
+/// ever an ordinal neighbour of the provider under test. It uses a distinct
+/// issuer so it does not share the real provider's replay realm.
+fn dpop_decoy_provider() -> serde_json::Value {
+    let mut decoy = dpop_provider(&json!({"keys": []}));
+    decoy["issuer"] = json!(DPOP_DECOY_ISSUER);
+    decoy
+}
+
+fn dpop_plugin_with_providers(providers: serde_json::Value, config_id: &str) -> JwksAuth {
+    JwksAuth::new_with_config_id(
+        &json!({ "providers": providers }),
+        default_client(),
+        Some(config_id),
+    )
+    .expect("multi-provider DPoP config with declared replay scopes")
+}
+
+/// Reordering an otherwise equivalent provider list must not reopen a proof.
+#[tokio::test]
+async fn dpop_provider_reordering_does_not_reopen_an_accepted_proof() {
+    let (fixture, jwks) = build_dpop_fixture("dpop-provider-reorder");
+    let consumer_index = ConsumerIndex::new(&[create_consumer("idp-user")]);
+
+    let decoy_first = dpop_plugin_with_providers(
+        json!([dpop_decoy_provider(), dpop_provider(&jwks)]),
+        "dpop-reorder",
+    );
+    let mut first = dpop_ctx(&fixture);
+    assert_continue(decoy_first.authenticate(&mut first, &consumer_index).await);
+
+    // The same two providers, swapped. Under array-position identity the real
+    // provider would move from sub-domain `1` to `0` and start a fresh lane.
+    let real_first = dpop_plugin_with_providers(
+        json!([dpop_provider(&jwks), dpop_decoy_provider()]),
+        "dpop-reorder",
+    );
+    let mut replay = dpop_ctx(&fixture);
+    assert_reject(
+        real_first.authenticate(&mut replay, &consumer_index).await,
+        Some(401),
+    );
+}
+
+/// Inserting, then deleting, then recreating a neighbouring provider must not
+/// reopen a proof at any step.
+#[tokio::test]
+async fn dpop_provider_insert_delete_and_recreate_do_not_reopen_a_proof() {
+    let (fixture, jwks) = build_dpop_fixture("dpop-provider-lifecycle");
+    let consumer_index = ConsumerIndex::new(&[create_consumer("idp-user")]);
+
+    let only = dpop_plugin_with_providers(json!([dpop_provider(&jwks)]), "dpop-lifecycle");
+    let mut first = dpop_ctx(&fixture);
+    assert_continue(only.authenticate(&mut first, &consumer_index).await);
+    drop(only);
+
+    for providers in [
+        // A neighbour inserted ahead of it.
+        json!([dpop_decoy_provider(), dpop_provider(&jwks)]),
+        // The neighbour deleted again.
+        json!([dpop_provider(&jwks)]),
+        // And recreated behind it.
+        json!([dpop_provider(&jwks), dpop_decoy_provider()]),
+    ] {
+        let generation = dpop_plugin_with_providers(providers, "dpop-lifecycle");
+        let mut replay = dpop_ctx(&fixture);
+        assert_reject(
+            generation.authenticate(&mut replay, &consumer_index).await,
+            Some(401),
+        );
+    }
+}
+
+/// A security-irrelevant edit is not a new trust anchor: it must not reopen a
+/// proof the previous generation already claimed. Widening the clock skew is the
+/// sharpest case — the fixed retention horizon already dominates the widest
+/// admissible skew, so the marker outlives the wider window.
+#[tokio::test]
+async fn security_irrelevant_provider_edits_do_not_reopen_a_proof() {
+    let (fixture, jwks) = build_dpop_fixture("dpop-provider-irrelevant-edit");
+    let consumer_index = ConsumerIndex::new(&[create_consumer("idp-user")]);
+
+    let original = dpop_plugin_with_providers(json!([dpop_provider(&jwks)]), "dpop-irrelevant");
+    let mut first = dpop_ctx(&fixture);
+    assert_continue(original.authenticate(&mut first, &consumer_index).await);
+    drop(original);
+
+    let mut edited = dpop_provider(&jwks);
+    edited["dpop_clock_skew_secs"] = json!(120);
+    edited["dpop_replay_max_entries"] = json!(4096);
+    edited["forward_original_token"] = json!(false);
+    let reloaded = dpop_plugin_with_providers(json!([edited]), "dpop-irrelevant");
+
+    let mut replay = dpop_ctx(&fixture);
+    assert_reject(
+        reloaded.authenticate(&mut replay, &consumer_index).await,
+        Some(401),
+    );
+}
+
+/// Additive inline key rotation for the same issuer must not reopen a proof
+/// the previous generation already claimed.
+#[tokio::test]
+async fn inline_key_rotation_for_the_same_issuer_does_not_reopen_a_proof() {
+    let (fixture, jwks) = build_dpop_fixture("dpop-provider-key-rotation");
+    let consumer_index = ConsumerIndex::new(&[create_consumer("idp-user")]);
+
+    let original = dpop_plugin_with_providers(json!([dpop_provider(&jwks)]), "dpop-key-rotation");
+    let mut first = dpop_ctx(&fixture);
+    assert_continue(original.authenticate(&mut first, &consumer_index).await);
+    drop(original);
+
+    let mut rotated = jwks.clone();
+    let extra = rotated["keys"][0].clone();
+    rotated["keys"] = json!([jwks["keys"][0].clone(), extra]);
+    rotated["keys"][1]["kid"] = json!("rotated-kid");
+    let reloaded =
+        dpop_plugin_with_providers(json!([dpop_provider(&rotated)]), "dpop-key-rotation");
+    let mut replay = dpop_ctx(&fixture);
+    assert_reject(
+        reloaded.authenticate(&mut replay, &consumer_index).await,
+        Some(401),
+    );
+}
+
+/// Two duplicate provider entries are one trust anchor, so they converge on one
+/// lane. A duplicated entry can therefore not launder a second acceptance.
+#[tokio::test]
+async fn duplicate_providers_converge_on_one_replay_lane() {
+    let (fixture, jwks) = build_dpop_fixture("dpop-provider-duplicate");
+    let consumer_index = ConsumerIndex::new(&[create_consumer("idp-user")]);
+
+    let duplicated = dpop_plugin_with_providers(
+        json!([dpop_provider(&jwks), dpop_provider(&jwks)]),
+        "dpop-duplicate",
+    );
+    let markers = duplicated.dpop_replay_domain_markers("thumbprint", "proof-id");
+    assert_eq!(markers.len(), 2);
+    assert_eq!(
+        markers[0], markers[1],
+        "equivalent providers must share one protection domain"
+    );
+
+    let mut first = dpop_ctx(&fixture);
+    assert_continue(duplicated.authenticate(&mut first, &consumer_index).await);
+    let mut replay = dpop_ctx(&fixture);
+    assert_reject(
+        duplicated.authenticate(&mut replay, &consumer_index).await,
+        Some(401),
+    );
+}
+
+/// Same-issuer providers share one replay realm even when their key sets or
+/// JWKS sources differ; different exact issuers stay isolated. Inline JWKS
+/// member order is not part of the identity.
+#[test]
+fn dpop_provider_identity_is_the_exact_issuer_realm() {
+    let (_, jwks) = build_dpop_fixture("dpop-provider-identity");
+
+    // Different inline key sets under one issuer share a realm — key rotation
+    // must not reopen a proof.
+    let mut other_keys = jwks.clone();
+    other_keys["keys"][0]["kid"] = json!("a-different-key-id");
+    let overlapping_inline = dpop_plugin_with_providers(
+        json!([dpop_provider(&jwks), dpop_provider(&other_keys)]),
+        "dpop-identity-inline",
+    );
+    let markers = overlapping_inline.dpop_replay_domain_markers("thumbprint", "proof-id");
+    assert_eq!(
+        markers[0], markers[1],
+        "different inline key sets with the same issuer must share a replay realm"
+    );
+
+    // Different remote sources under one issuer also share a realm.
+    let remote = |uri: &str, issuer: &str| {
+        json!({
+            "jwks_uri": uri,
+            "issuer": issuer,
+            "require_dpop": true,
+            "dpop_replay_scope": "process"
+        })
+    };
+    let overlapping_sources = dpop_plugin_with_providers(
+        json!([
+            remote("https://a.example.com/jwks", "https://idp.example.com"),
+            remote("https://b.example.com/jwks", "https://idp.example.com"),
+        ]),
+        "dpop-identity-source",
+    );
+    let markers = overlapping_sources.dpop_replay_domain_markers("thumbprint", "proof-id");
+    assert_eq!(
+        markers[0], markers[1],
+        "different JWKS URIs with the same issuer must share a replay realm"
+    );
+
+    // Same remote source, different issuers: isolated.
+    let distinct_issuers = dpop_plugin_with_providers(
+        json!([
+            remote("https://idp.example.com/jwks", "https://a.example.com"),
+            remote("https://idp.example.com/jwks", "https://b.example.com"),
+        ]),
+        "dpop-identity-issuer",
+    );
+    let markers = distinct_issuers.dpop_replay_domain_markers("thumbprint", "proof-id");
+    assert_ne!(
+        markers[0], markers[1],
+        "different exact issuers must stay isolated"
+    );
+
+    // Inline JWKS spelling is not part of the identity.
+    let compact = serde_json::to_string(&jwks).expect("inline JWKS serializes");
+    let spaced = serde_json::to_string_pretty(&jwks).expect("inline JWKS pretty-prints");
+    let canonicalized = dpop_plugin_with_providers(
+        json!([
+            dpop_provider(&json!(compact)),
+            dpop_provider(&json!(spaced)),
+        ]),
+        "dpop-identity-canonical",
+    );
+    let markers = canonicalized.dpop_replay_domain_markers("thumbprint", "proof-id");
+    assert_eq!(
+        markers[0], markers[1],
+        "inline JWKS spelling must not open a fresh replay lane"
+    );
+}
+
+/// Distinct JWKS or discovery URLs with the same exact issuer share one replay
+/// realm. Issuer matching remains exact: host-case on `issuer` is not
+/// normalized.
+#[test]
+fn dpop_same_issuer_sources_share_a_realm_and_issuer_matching_stays_exact() {
+    let remote = |uri: &str, issuer: &str| {
+        json!({
+            "jwks_uri": uri,
+            "issuer": issuer,
+            "require_dpop": true,
+            "dpop_replay_scope": "process"
+        })
+    };
+    let discovery = |url: &str, issuer: &str| {
+        json!({
+            "discovery_url": url,
+            "issuer": issuer,
+            "require_dpop": true,
+            "dpop_replay_scope": "process"
+        })
+    };
+    let issuer = "https://idp.example.com";
+
+    let equivalent_jwks = dpop_plugin_with_providers(
+        json!([
+            remote("https://idp.example.com/jwks", issuer),
+            remote("https://IDP.EXAMPLE.COM/jwks", issuer),
+            remote("https://idp.example.com:443/jwks", issuer),
+        ]),
+        "dpop-identity-url-jwks",
+    );
+    let markers = equivalent_jwks.dpop_replay_domain_markers("thumbprint", "proof-id");
+    assert_eq!(markers.len(), 3);
+    assert_eq!(markers[0], markers[1]);
+    assert_eq!(markers[0], markers[2]);
+
+    let equivalent_discovery = dpop_plugin_with_providers(
+        json!([
+            discovery(
+                "https://idp.example.com/.well-known/openid-configuration",
+                issuer
+            ),
+            discovery(
+                "https://IDP.EXAMPLE.COM/.well-known/openid-configuration",
+                issuer
+            ),
+            discovery("http://127.0.0.1/.well-known/openid-configuration", issuer),
+            discovery(
+                "http://127.0.0.1:80/.well-known/openid-configuration",
+                issuer
+            ),
+        ]),
+        "dpop-identity-url-discovery",
+    );
+    let markers = equivalent_discovery.dpop_replay_domain_markers("thumbprint", "proof-id");
+    assert_eq!(markers[0], markers[1]);
+    assert_eq!(markers[2], markers[3]);
+
+    // Distinct endpoints with the same issuer still share one realm.
+    let overlapping = dpop_plugin_with_providers(
+        json!([
+            remote("https://idp.example.com/jwks", issuer),
+            remote("https://idp.example.com:444/jwks", issuer),
+            remote("https://idp.example.com/other", issuer),
+            remote("https://other.example.com/jwks", issuer),
+            remote("https://idp.example.com/jwks?kid=a", issuer),
+        ]),
+        "dpop-identity-url-overlap",
+    );
+    let markers = overlapping.dpop_replay_domain_markers("thumbprint", "proof-id");
+    for (left, right) in [(0, 1), (0, 2), (0, 3), (0, 4), (1, 2), (1, 3), (2, 3)] {
+        assert_eq!(
+            markers[left], markers[right],
+            "same-issuer remote sources must share a replay realm ({left} vs {right})"
+        );
+    }
+
+    // Issuer matching stays exact: URL-like host-case on issuer is not a
+    // canonicalization of the realm.
+    let issuer_exact = dpop_plugin_with_providers(
+        json!([
+            remote("https://idp.example.com/jwks", "https://idp.example.com"),
+            remote("https://idp.example.com/jwks", "https://IDP.EXAMPLE.COM"),
+        ]),
+        "dpop-identity-issuer-exact",
+    );
+    let markers = issuer_exact.dpop_replay_domain_markers("thumbprint", "proof-id");
+    assert_ne!(
+        markers[0], markers[1],
+        "issuer matching remains exact; host-case on issuer must not converge"
+    );
+}
+
+/// Filling a provider's replay lane, then reloading with a *lower* cap, must
+/// refuse new proofs at the new cap while every previously admitted marker
+/// stays a replay.
+#[tokio::test]
+async fn dpop_capacity_decrease_across_equivalent_generations_preserves_live_markers() {
+    let (retained_a, jwks) = build_dpop_fixture("dpop-cap-dec-a");
+    let (retained_b, _) = build_dpop_fixture("dpop-cap-dec-b");
+    let (fresh, _) = build_dpop_fixture("dpop-cap-dec-fresh");
+    let consumer_index = ConsumerIndex::new(&[create_consumer("idp-user")]);
+
+    let mut high = dpop_provider(&jwks);
+    high["dpop_replay_max_entries"] = json!(2);
+    let original = dpop_plugin_with_providers(json!([high]), "dpop-cap-decrease");
+    assert_eq!(original.dpop_replay_lane_capacities(), vec![Some(2)]);
+
+    let mut first = dpop_ctx(&retained_a);
+    assert_continue(original.authenticate(&mut first, &consumer_index).await);
+    let mut second = dpop_ctx(&retained_b);
+    assert_continue(original.authenticate(&mut second, &consumer_index).await);
+    drop(original);
+
+    let mut low = dpop_provider(&jwks);
+    low["dpop_replay_max_entries"] = json!(1);
+    let lowered = dpop_plugin_with_providers(json!([low]), "dpop-cap-decrease");
+    assert_eq!(lowered.dpop_replay_lane_capacities(), vec![Some(1)]);
+
+    let mut replay_a = dpop_ctx(&retained_a);
+    assert_reject(
+        lowered.authenticate(&mut replay_a, &consumer_index).await,
+        Some(401),
+    );
+    let mut replay_b = dpop_ctx(&retained_b);
+    assert_reject(
+        lowered.authenticate(&mut replay_b, &consumer_index).await,
+        Some(401),
+    );
+    let mut new_proof = dpop_ctx(&fresh);
+    assert_reject(
+        lowered.authenticate(&mut new_proof, &consumer_index).await,
+        Some(503),
+    );
+}
+
+/// Reloading with a *higher* cap must restore headroom on the same lane
+/// without reopening an already-claimed proof.
+#[tokio::test]
+async fn dpop_capacity_increase_across_equivalent_generations_restores_headroom() {
+    let (retained, jwks) = build_dpop_fixture("dpop-cap-inc-retained");
+    let (fresh, _) = build_dpop_fixture("dpop-cap-inc-fresh");
+    let consumer_index = ConsumerIndex::new(&[create_consumer("idp-user")]);
+
+    let mut low = dpop_provider(&jwks);
+    low["dpop_replay_max_entries"] = json!(1);
+    let original = dpop_plugin_with_providers(json!([low]), "dpop-cap-increase");
+    let mut first = dpop_ctx(&retained);
+    assert_continue(original.authenticate(&mut first, &consumer_index).await);
+    let mut blocked = dpop_ctx(&fresh);
+    assert_reject(
+        original.authenticate(&mut blocked, &consumer_index).await,
+        Some(503),
+    );
+    drop(original);
+
+    let mut high = dpop_provider(&jwks);
+    high["dpop_replay_max_entries"] = json!(2);
+    let raised = dpop_plugin_with_providers(json!([high]), "dpop-cap-increase");
+    assert_eq!(raised.dpop_replay_lane_capacities(), vec![Some(2)]);
+
+    let mut replay = dpop_ctx(&retained);
+    assert_reject(
+        raised.authenticate(&mut replay, &consumer_index).await,
+        Some(401),
+    );
+    let mut new_proof = dpop_ctx(&fresh);
+    assert_continue(raised.authenticate(&mut new_proof, &consumer_index).await);
+}
+
+/// Duplicate equivalent providers with incompatible capacities cannot share a
+/// deterministic process-lane contract: matching order would pick which cap
+/// applies. Admission must refuse that configuration in either order.
+#[test]
+fn duplicate_equivalent_providers_with_incompatible_capacities_are_rejected() {
+    let (_, jwks) = build_dpop_fixture("dpop-cap-dup-reject");
+    let mut low = dpop_provider(&jwks);
+    low["dpop_replay_max_entries"] = json!(1);
+    let mut high = dpop_provider(&jwks);
+    high["dpop_replay_max_entries"] = json!(2);
+
+    for providers in [json!([low.clone(), high.clone()]), json!([high, low])] {
+        let error = JwksAuth::new_with_config_id(
+            &json!({ "providers": providers }),
+            default_client(),
+            Some("dpop-cap-dup-reject"),
+        )
+        .map(|_| ())
+        .expect_err("incompatible duplicate capacities must be refused");
+        assert!(
+            error.contains("dpop_replay_max_entries") && error.contains("incompatible"),
+            "diagnostic should name the disagreeing cap: {error}"
+        );
+    }
+}
+
+/// Duplicate equivalent providers that agree on capacity stay admitted and
+/// still share one lane, so a duplicated entry cannot launder a second
+/// acceptance. Explicit matching caps must not be mistaken for the
+/// incompatible-cap refusal.
+#[tokio::test]
+async fn duplicate_equivalent_providers_with_matching_capacity_share_one_lane() {
+    let (fixture, jwks) = build_dpop_fixture("dpop-cap-dup-match");
+    let consumer_index = ConsumerIndex::new(&[create_consumer("idp-user")]);
+    let mut provider = dpop_provider(&jwks);
+    provider["dpop_replay_max_entries"] = json!(8);
+
+    let duplicated =
+        dpop_plugin_with_providers(json!([provider.clone(), provider]), "dpop-cap-dup-match");
+    assert_eq!(
+        duplicated.dpop_replay_lane_capacities(),
+        vec![Some(8), Some(8)]
+    );
+    let markers = duplicated.dpop_replay_domain_markers("thumbprint", "proof-id");
+    assert_eq!(markers[0], markers[1]);
+
+    let mut first = dpop_ctx(&fixture);
+    assert_continue(duplicated.authenticate(&mut first, &consumer_index).await);
+    let mut replay = dpop_ctx(&fixture);
+    assert_reject(
+        duplicated.authenticate(&mut replay, &consumer_index).await,
+        Some(401),
+    );
+}
+
+/// Equivalent remote URL spellings that share one exact issuer are still one
+/// replay realm, so the incompatible-cap admission rule applies to them too —
+/// otherwise a host-case duplicate could smuggle a second cap.
+#[test]
+fn equivalent_remote_url_spellings_with_incompatible_capacities_are_rejected() {
+    let error = JwksAuth::new_with_config_id(
+        &json!({
+            "providers": [
+                {
+                    "jwks_uri": "https://idp.example.com/jwks",
+                    "issuer": "https://idp.example.com",
+                    "require_dpop": true,
+                    "dpop_replay_scope": "process",
+                    "dpop_replay_max_entries": 1
+                },
+                {
+                    "jwks_uri": "https://IDP.EXAMPLE.COM:443/jwks",
+                    "issuer": "https://idp.example.com",
+                    "require_dpop": true,
+                    "dpop_replay_scope": "process",
+                    "dpop_replay_max_entries": 8
+                }
+            ]
+        }),
+        default_client(),
+        Some("dpop-cap-url-dup"),
+    )
+    .map(|_| ())
+    .expect_err("canonical URL duplicates with different caps must be refused");
+    assert!(
+        error.contains("dpop_replay_max_entries"),
+        "diagnostic should name the disagreeing cap: {error}"
+    );
+}
+
+/// Mixed process/shared scopes on the same semantic DPoP provider split the
+/// proof across two stores: the process lane and Redis. Matching order, a
+/// reload, or a rolling replica would then accept the same proof twice.
+/// Admission must refuse that configuration in either order, including when
+/// Redis is configured so the failure cannot be blamed on a missing backend.
+#[test]
+fn equivalent_dpop_providers_with_mixed_process_and_shared_scopes_are_rejected() {
+    let (_, jwks) = build_dpop_fixture("dpop-scope-mix-reject");
+    let process = dpop_provider(&jwks);
+    let shared = dpop_shared_provider(&jwks);
+
+    for providers in [
+        json!([process.clone(), shared.clone()]),
+        json!([shared, process]),
+    ] {
+        let error = jwks_with_redis(providers, "dpop-scope-mix-reject")
+            .map(|_| ())
+            .expect_err(
+                "mixed process/shared equivalent DPoP providers must be refused \
+                 even when Redis is configured",
+            );
+        assert!(
+            error.contains("dpop_replay_scope") && error.contains("incompatible"),
+            "diagnostic should name the disagreeing replay authority: {error}"
+        );
+        assert!(
+            !error.contains("requires sync_mode"),
+            "refusal must be the equivalent-authority contract, not missing Redis: {error}"
+        );
+    }
+}
+
+/// Canonical remote URL spellings are one trust source, so mixing process and
+/// shared on them is the same split-authority hole as a verbatim duplicate.
+#[test]
+fn equivalent_remote_url_spellings_with_mixed_replay_scopes_are_rejected() {
+    for providers in [
+        json!([
+            {
+                "jwks_uri": "https://idp.example.com/jwks",
+                "issuer": "https://idp.example.com",
+                "require_dpop": true,
+                "dpop_replay_scope": "process"
+            },
+            {
+                "jwks_uri": "https://IDP.EXAMPLE.COM:443/jwks",
+                "issuer": "https://idp.example.com",
+                "require_dpop": true,
+                "dpop_replay_scope": "shared"
+            }
+        ]),
+        json!([
+            {
+                "jwks_uri": "https://IDP.EXAMPLE.COM:443/jwks",
+                "issuer": "https://idp.example.com",
+                "require_dpop": true,
+                "dpop_replay_scope": "shared"
+            },
+            {
+                "jwks_uri": "https://idp.example.com/jwks",
+                "issuer": "https://idp.example.com",
+                "require_dpop": true,
+                "dpop_replay_scope": "process"
+            }
+        ]),
+    ] {
+        let error = jwks_with_redis(providers, "dpop-scope-url-mix")
+            .map(|_| ())
+            .expect_err("canonical URL duplicates with mixed replay scopes must be refused");
+        assert!(
+            error.contains("dpop_replay_scope") && error.contains("incompatible"),
+            "diagnostic should name the disagreeing replay authority: {error}"
+        );
+    }
+}
+
+/// Distinct trust anchors may declare different replay scopes in one plugin:
+/// they do not share a domain, so they cannot launder one proof across stores.
+/// Redis is required only because one of them is `shared`.
+#[test]
+fn distinct_dpop_providers_may_mix_process_and_shared_scopes_when_redis_is_configured() {
+    let (_, jwks) = build_dpop_fixture("dpop-scope-mix-distinct");
+    let mut process = dpop_provider(&jwks);
+    process["issuer"] = json!("https://a.example.com");
+    let mut shared = dpop_shared_provider(&jwks);
+    shared["issuer"] = json!("https://b.example.com");
+
+    for providers in [
+        json!([process.clone(), shared.clone()]),
+        json!([shared.clone(), process.clone()]),
+    ] {
+        let plugin = jwks_with_redis(providers, "dpop-scope-mix-distinct")
+            .expect("distinct issuer realms may disagree on replay scope");
+        let markers = plugin.dpop_replay_domain_markers("thumbprint", "proof-id");
+        assert_ne!(
+            markers[0], markers[1],
+            "distinct issuer realms must not share a replay domain"
+        );
+        let modes = plugin.dpop_replay_modes();
+        assert!(
+            modes.contains(&Some("process")) && modes.contains(&Some("shared")),
+            "distinct issuers keep the scope each declared: {modes:?}"
+        );
+    }
+}
+
+/// Equivalent shared providers still converge on one shared authority in either
+/// order. Reorder therefore cannot move the domain onto a process store.
+#[test]
+fn equivalent_shared_dpop_providers_converge_on_one_shared_authority() {
+    let (_, jwks) = build_dpop_fixture("dpop-shared-dup");
+    let shared = dpop_shared_provider(&jwks);
+
+    for providers in [
+        json!([shared.clone(), shared.clone()]),
+        json!([shared.clone(), dpop_shared_provider(&jwks)]),
+    ] {
+        let plugin = jwks_with_redis(providers, "dpop-shared-dup")
+            .expect("equivalent shared providers with Redis must be admitted");
+        let markers = plugin.dpop_replay_domain_markers("thumbprint", "proof-id");
+        assert_eq!(markers[0], markers[1]);
+        assert_eq!(
+            plugin.dpop_replay_modes(),
+            vec![Some("shared"), Some("shared")]
+        );
+    }
+}
+
+/// A token that verifies against both siblings is matched to the first success.
+/// If one sibling requires DPoP and the other does not, matching order is an
+/// authentication bypass of the single-use proof. Fail closed on that
+/// ambiguous pair; distinct trust anchors may still disagree.
+#[test]
+fn equivalent_providers_that_disagree_on_require_dpop_are_rejected() {
+    let (_, jwks) = build_dpop_fixture("dpop-require-mix-reject");
+    let with_dpop = dpop_provider(&jwks);
+    let without_dpop = json!({ "jwks": jwks, "issuer": DPOP_TEST_ISSUER });
+
+    for providers in [
+        json!([with_dpop.clone(), without_dpop.clone()]),
+        json!([without_dpop.clone(), with_dpop.clone()]),
+    ] {
+        let error = JwksAuth::new_with_config_id(
+            &json!({ "providers": providers }),
+            default_client(),
+            Some("dpop-require-mix-reject"),
+        )
+        .map(|_| ())
+        .expect_err("equivalent providers must agree on require_dpop");
+        assert!(
+            error.contains("require_dpop") && error.contains("incompatible"),
+            "diagnostic should name the disagreeing DPoP requirement: {error}"
+        );
+    }
+
+    // The same hole with a configured Redis backend and a `shared` DPoP
+    // sibling: refusal must not be attributable to scope/backend admission.
+    let shared = dpop_shared_provider(&jwks);
+    for providers in [
+        json!([shared.clone(), without_dpop.clone()]),
+        json!([without_dpop, shared]),
+    ] {
+        let error = jwks_with_redis(providers, "dpop-require-mix-redis")
+            .map(|_| ())
+            .expect_err(
+                "equivalent require_dpop disagreement must be refused with Redis configured",
+            );
+        assert!(
+            error.contains("require_dpop") && error.contains("incompatible"),
+            "diagnostic should name the disagreeing DPoP requirement: {error}"
+        );
+    }
+}
+
+/// Distinct issuers are different replay realms. One may require DPoP and the
+/// other may not; a token matching only one of them is not an ambiguous DPoP
+/// bypass. A non-DPoP sibling without an issuer is also not the same realm.
+#[test]
+fn non_equivalent_providers_may_disagree_on_require_dpop() {
+    let distinct_issuers = JwksAuth::new(
+        &json!({
+            "providers": [
+                {
+                    "jwks_uri": "https://idp.example.com/jwks",
+                    "issuer": "https://a.example.com",
+                    "require_dpop": true,
+                    "dpop_replay_scope": "process"
+                },
+                {
+                    "jwks_uri": "https://idp.example.com/jwks",
+                    "issuer": "https://b.example.com"
+                }
+            ]
+        }),
+        default_client(),
+    )
+    .expect("distinct issuers may disagree on require_dpop");
+    assert_eq!(
+        distinct_issuers.dpop_replay_modes(),
+        vec![Some("process"), None]
+    );
+
+    let (_, jwks) = build_dpop_fixture("dpop-require-mix-distinct");
+    let mut other_keys = jwks.clone();
+    other_keys["keys"][0]["kid"] = json!("a-different-key-id");
+    let distinct_keys = dpop_plugin_with_providers(
+        json!([dpop_provider(&jwks), json!({ "jwks": other_keys })]),
+        "dpop-require-mix-distinct",
+    );
+    assert_eq!(
+        distinct_keys.dpop_replay_modes(),
+        vec![Some("process"), None]
+    );
+}
+
+/// A claimed process-scoped proof must stay a replay across equivalent reorder
+/// and cannot be reopened by a rolling generation that would move the same
+/// domain onto a shared Redis authority. Mixed process/shared equivalent
+/// configs are refused, so that rolling shape cannot be admitted.
+#[tokio::test]
+async fn claimed_dpop_proof_cannot_move_across_replay_authorities_on_reorder_or_reload() {
+    let (fixture, jwks) = build_dpop_fixture("dpop-authority-move");
+    let consumer_index = ConsumerIndex::new(&[create_consumer("idp-user")]);
+
+    let original = dpop_plugin_with_providers(json!([dpop_provider(&jwks)]), "dpop-authority-move");
+    let mut first = dpop_ctx(&fixture);
+    assert_continue(original.authenticate(&mut first, &consumer_index).await);
+
+    let process = dpop_provider(&jwks);
+    let shared = dpop_shared_provider(&jwks);
+    for providers in [
+        json!([process.clone(), shared.clone()]),
+        json!([shared, process.clone()]),
+    ] {
+        jwks_with_redis(providers, "dpop-authority-move")
+            .map(|_| ())
+            .expect_err(
+                "a rolling generation must not be able to split one domain across authorities",
+            );
+    }
+
+    let reordered = dpop_plugin_with_providers(
+        json!([dpop_provider(&jwks), dpop_decoy_provider()]),
+        "dpop-authority-move",
+    );
+    assert_eq!(
+        original.dpop_replay_domain_markers("thumbprint", "proof-id")[0],
+        reordered.dpop_replay_domain_markers("thumbprint", "proof-id")[0],
+        "equivalent reorder must keep the claimed domain on the same authority"
+    );
+    assert_eq!(reordered.dpop_replay_modes()[0], Some("process"));
+    let mut replay = dpop_ctx(&fixture);
+    assert_reject(
+        reordered.authenticate(&mut replay, &consumer_index).await,
+        Some(401),
+    );
+}
+
+/// The removed retention/capacity knobs are rejected with their replacement
+/// named, rather than silently ignored — a config still carrying
+/// `dpop_jti_ttl_secs` was written believing it controls how long a proof stays
+/// single-use.
+#[test]
+fn removed_dpop_replay_knobs_are_rejected_with_guidance() {
+    for (removed, expected) in [
+        ("dpop_jti_ttl_secs", "fixed horizon"),
+        ("dpop_jti_cache_max_entries", "dpop_replay_max_entries"),
+    ] {
+        let mut provider = json!({
+            "jwks": {"keys": []},
+            "require_dpop": true,
+            "dpop_replay_scope": "process"
+        });
+        provider[removed] = json!(300);
+        let error = JwksAuth::new(&json!({"providers": [provider]}), default_client())
+            .map(|_| ())
+            .expect_err("a removed replay knob must be rejected");
+        assert!(
+            error.contains(removed) && error.contains(expected),
+            "diagnostic should name the removal and its replacement: {error}"
+        );
+    }
 }

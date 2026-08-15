@@ -2295,6 +2295,8 @@ fn try_create_plugin(
             | "ws_rate_limiting"
             | "ai_rate_limiter"
             | "soap_ws_security"
+            | "jwks_auth"
+            | "hmac_auth"
     ) {
         // Pass the stable plugin-config resource id through the production
         // factory so identity-aware plugins partition or attribute sibling

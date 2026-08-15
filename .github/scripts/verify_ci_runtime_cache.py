@@ -9,7 +9,9 @@ publish, fail-closed cache-save preparation, fork restore-only / no-save
 steps, rust-cache save-if so fork PRs cannot save, FIPS producer/consumer key
 equality with unique attempt scoping and stable fallback isolation, rejection
 of ignored rust-cache `key` wiring, checksum-pinned sccache install without
-credential-exporting installers, and hosted cache-token absence assertions.
+credential-exporting installers, exact verified executable activation, empty
+SCCACHE_GHA_ENABLED persistence, fail-closed uncached fallback, and hosted
+cache-token absence assertions.
 """
 
 from __future__ import annotations
@@ -689,6 +691,48 @@ def check_no_sccache_credential_exporter(
     require(
         "core.exportVariable" not in text,
         f"{source} must not call core.exportVariable (ACTIONS_RUNTIME_TOKEN leak)",
+        failures,
+    )
+
+
+def check_setup_sccache_verified_activation(
+    text: str,
+    source: str,
+    failures: list[str],
+) -> None:
+    require(
+        'echo "FERRUM_SCCACHE_BIN=" >> "$GITHUB_ENV"' in text,
+        f"{source} must publish an empty FERRUM_SCCACHE_BIN sentinel before install",
+        failures,
+    )
+    require(
+        'echo "FERRUM_SCCACHE_BIN=${dest}" >> "$GITHUB_ENV"' in text,
+        f"{source} must record the checksum-verified executable path",
+        failures,
+    )
+    require(
+        "GITHUB_PATH" not in text,
+        f"{source} must not put sccache on PATH (PATH lookup can activate an unpinned binary)",
+        failures,
+    )
+    require(
+        'echo "RUSTC_WRAPPER=${sccache_bin}" >> "$GITHUB_ENV"' in text,
+        f"{source} must set RUSTC_WRAPPER to the verified executable, not a PATH name",
+        failures,
+    )
+    require(
+        'echo "CARGO_BUILD_RUSTC_WRAPPER=${sccache_bin}" >> "$GITHUB_ENV"' in text,
+        f"{source} must set CARGO_BUILD_RUSTC_WRAPPER to the verified executable",
+        failures,
+    )
+    require(
+        'echo "SCCACHE_GHA_ENABLED=" >> "$GITHUB_ENV"' in text,
+        f"{source} must persist an empty SCCACHE_GHA_ENABLED value",
+        failures,
+    )
+    require(
+        '"$sccache_bin" --start-server' in text and "command -v sccache" not in text,
+        f"{source} must invoke only the verified executable, never PATH lookup",
         failures,
     )
 
@@ -1375,6 +1419,17 @@ def check_fips(workflow: str, failures: list[str]) -> None:
         failures,
     )
     require(
+        "command -v sccache" not in workflow,
+        "FIPS jobs must not PATH-lookup sccache after the trusted installer",
+        failures,
+    )
+    require(
+        workflow.count('sccache_bin="${FERRUM_SCCACHE_BIN:-}"') == 3
+        and workflow.count('"$sccache_bin" --show-stats') == 3,
+        "FIPS compile/clippy/test must record sccache stats via FERRUM_SCCACHE_BIN",
+        failures,
+    )
+    require(
         "FERRUM_CUSTOM_PLUGINS" not in workflow,
         "FIPS jobs must not opt example plugins into the cryptographic artifact",
         failures,
@@ -1717,6 +1772,7 @@ def check_shared_actions(failures: list[str]) -> None:
     )
     check_no_sccache_credential_exporter(sccache, "setup-sccache", failures)
     check_credential_absence_assertion(sccache, "setup-sccache", failures)
+    check_setup_sccache_verified_activation(sccache, "setup-sccache", failures)
     require(
         SCCACHE_RELEASE_DOWNLOAD in sccache,
         "setup-sccache must download a pinned mozilla/sccache GitHub release",
@@ -2266,6 +2322,49 @@ def self_test() -> int:
     require(
         any("must not invoke credential-exporting installer" in item for item in exporter_failures),
         "self-test: mozilla-actions/sccache-action must fail",
+        failures,
+    )
+
+    path_based_sccache = (
+        '        echo "$install_dir" >> "$GITHUB_PATH"\n'
+        '        echo "RUSTC_WRAPPER=sccache" >> "$GITHUB_ENV"\n'
+        "        command -v sccache &> /dev/null && sccache --start-server\n"
+        "        unset SCCACHE_GHA_ENABLED\n"
+    )
+    path_based_failures: list[str] = []
+    check_setup_sccache_verified_activation(
+        path_based_sccache,
+        "self-test-path-based-sccache",
+        path_based_failures,
+    )
+    require(
+        any("empty FERRUM_SCCACHE_BIN sentinel" in item for item in path_based_failures)
+        and any("must not put sccache on PATH" in item for item in path_based_failures)
+        and any("verified executable, not a PATH name" in item for item in path_based_failures)
+        and any("persist an empty SCCACHE_GHA_ENABLED" in item for item in path_based_failures)
+        and any("never PATH lookup" in item for item in path_based_failures),
+        "self-test: PATH-based sccache activation must fail",
+        failures,
+    )
+
+    verified_sccache = (
+        '        echo "FERRUM_SCCACHE_BIN=" >> "$GITHUB_ENV"\n'
+        '        echo "FERRUM_SCCACHE_BIN=${dest}" >> "$GITHUB_ENV"\n'
+        '        echo "RUSTC_WRAPPER=${sccache_bin}" >> "$GITHUB_ENV"\n'
+        '        echo "CARGO_BUILD_RUSTC_WRAPPER=${sccache_bin}" >> "$GITHUB_ENV"\n'
+        '        echo "SCCACHE_GHA_ENABLED=" >> "$GITHUB_ENV"\n'
+        '        "$sccache_bin" --start-server 2>/dev/null\n'
+    )
+    verified_failures: list[str] = []
+    check_setup_sccache_verified_activation(
+        verified_sccache,
+        "self-test-verified-sccache",
+        verified_failures,
+    )
+    require(
+        not verified_failures,
+        "self-test: exact verified sccache activation should pass: "
+        + "; ".join(verified_failures),
         failures,
     )
 
