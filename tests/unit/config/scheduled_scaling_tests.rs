@@ -128,6 +128,22 @@ fn documented_namespace_fence_503_is_the_only_retried_batch_response() {
 }
 
 #[test]
+fn documented_namespace_fence_error_plus_extra_field_is_fatal() {
+    let extra = json!({
+        "error": NAMESPACE_FENCE_RETRY_MESSAGE,
+        "retry": true
+    })
+    .to_string();
+    match classify_admin_batch_response(503, Some("1"), &extra) {
+        BatchProvisionDecision::Fatal { status, body } => {
+            assert_eq!(status, 503);
+            assert!(body.contains("retry"));
+        }
+        other => panic!("documented error plus an extra field must be fatal, got {other:?}"),
+    }
+}
+
+#[test]
 fn retry_after_honors_delay_seconds_with_a_bounded_default() {
     assert_eq!(
         namespace_fence_retry_after_delay(None),

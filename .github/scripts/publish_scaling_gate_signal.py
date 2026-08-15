@@ -31,6 +31,9 @@ from typing import Any, Callable
 MARKER = "<!-- ferrum-scaling-gate-signal -->"
 ISSUE_TITLE = "[CI] Scheduled Scaling Regression is red or stale"
 ISSUE_LABELS = ("launch-blocker", "severity:high")
+SIGNAL_AUTHOR = "github-actions[bot]"
+ISSUE_LIST_PER_PAGE = 30
+ISSUE_LIST_MAX_PAGES = 5
 WORKFLOW_FILE = "scaling-regression.yml"
 # Weekly cadence (7d) plus one day so Sunday–Friday freshness checks do not
 # fire between a healthy Saturday run and the next scheduled window.
@@ -205,33 +208,83 @@ def last_success_age_seconds(
     return None, None
 
 
+def _issue_number(item: dict[str, Any], label: str) -> int:
+    number = item.get("number")
+    if not isinstance(number, int) or number <= 0:
+        raise SignalError("schema", f"{label} signal issue is missing number")
+    return number
+
+
+def _has_exact_signal_identity(item: dict[str, Any]) -> bool:
+    body = item.get("body")
+    return item.get("title") == ISSUE_TITLE and isinstance(body, str) and MARKER in body
+
+
+def _author_login(item: dict[str, Any]) -> str | None:
+    user = item.get("user")
+    if not isinstance(user, dict):
+        return None
+    login = user.get("login")
+    return login if isinstance(login, str) else None
+
+
+def require_publisher_owned_signal(item: Any, label: str) -> dict[str, Any]:
+    if not isinstance(item, dict) or item == {}:
+        raise SignalError("schema", f"{label} signal issue is not a durable object")
+    if not _has_exact_signal_identity(item):
+        raise SignalError("schema", f"{label} signal issue is missing title or marker")
+    login = _author_login(item)
+    if login is None:
+        raise SignalError("schema", f"{label} signal issue author is malformed")
+    if login != SIGNAL_AUTHOR:
+        raise SignalError("schema", f"{label} signal issue is not publisher-owned")
+    _issue_number(item, label)
+    return item
+
+
 def find_signal_issue(
     repo: str,
     token: str,
     request: Callable[[str, str, str, dict[str, Any] | None], Any] = api_request,
 ) -> dict[str, Any] | None:
-    query = urllib.parse.urlencode(
-        {
-            "q": f"repo:{repo} in:body ferrum-scaling-gate-signal",
-            "per_page": "5",
-        }
-    )
-    payload = request("GET", f"https://api.github.com/search/issues?{query}", token, None)
-    if not isinstance(payload, dict):
-        raise SignalError("schema", "issue search payload is not an object")
-    items = payload.get("items")
-    if not isinstance(items, list):
-        raise SignalError("schema", "issue search items is not a list")
-    for item in items:
-        if not isinstance(item, dict):
-            continue
-        body = item.get("body")
-        if isinstance(body, str) and MARKER in body:
-            return item
-        title = item.get("title")
-        if title == ISSUE_TITLE:
-            return item
-    return None
+    matches: list[dict[str, Any]] = []
+    for page in range(1, ISSUE_LIST_MAX_PAGES + 1):
+        query = urllib.parse.urlencode(
+            {
+                "state": "all",
+                "labels": ",".join(ISSUE_LABELS),
+                "per_page": str(ISSUE_LIST_PER_PAGE),
+                "page": str(page),
+            }
+        )
+        payload = request("GET", f"https://api.github.com/repos/{repo}/issues?{query}", token, None)
+        if not isinstance(payload, list):
+            raise SignalError("schema", "issue listing payload is not a list")
+        if len(payload) > ISSUE_LIST_PER_PAGE:
+            raise SignalError("schema", "issue listing page exceeded bound")
+        for item in payload:
+            if not isinstance(item, dict):
+                raise SignalError("schema", "issue listing item is not an object")
+            if "pull_request" in item:
+                continue
+            if not _has_exact_signal_identity(item):
+                continue
+            login = _author_login(item)
+            if login is None:
+                raise SignalError("schema", "signal issue author is malformed")
+            if login != SIGNAL_AUTHOR:
+                continue
+            _issue_number(item, "existing")
+            matches.append(item)
+        if len(payload) < ISSUE_LIST_PER_PAGE:
+            break
+        if page == ISSUE_LIST_MAX_PAGES:
+            raise SignalError("schema", "issue listing exceeded pagination bound")
+    if len(matches) > 1:
+        raise SignalError("schema", "ambiguous publisher-owned signal issues")
+    if not matches:
+        return None
+    return matches[0]
 
 
 def apply_decision(
@@ -259,8 +312,8 @@ def apply_decision(
                     "labels": list(ISSUE_LABELS),
                 },
             )
-            number = created.get("number") if isinstance(created, dict) else None
-            print(f"scaling-gate-signal: opened issue #{number}")
+            owned = require_publisher_owned_signal(created, "created")
+            print(f"scaling-gate-signal: opened issue #{owned['number']}")
             return
         number = existing.get("number")
         if not isinstance(number, int):
@@ -336,18 +389,84 @@ def self_test() -> int:
     expect(decide("skipped", None, "api: boom"), "open", True, "history unknown")
     expect(decide("weird", 1, None), "open", True, "unknown result")
 
-    captured: list[tuple[str, str]] = []
+    def signal_issue(
+        number: int,
+        *,
+        title: str = ISSUE_TITLE,
+        body: str | None = None,
+        state: str = "open",
+        login: str = SIGNAL_AUTHOR,
+        extra: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        issue: dict[str, Any] = {
+            "number": number,
+            "title": title,
+            "body": MARKER + "\nowned" if body is None else body,
+            "state": state,
+            "user": {"login": login},
+        }
+        if extra:
+            issue.update(extra)
+        return issue
+
+    def listing_request(items: list[Any]) -> Callable[[str, str, str, dict[str, Any] | None], Any]:
+        def request(method: str, url: str, token: str, body: dict[str, Any] | None) -> Any:
+            if method != "GET" or "/issues?" not in url:
+                raise AssertionError(f"unexpected {method} {url}")
+            if "state=all" not in url or "labels=" not in url:
+                raise AssertionError(f"listing must be bounded labeled state=all: {url}")
+            return items
+
+        return request
+
+    def expect_none(items: list[Any], label: str) -> None:
+        found = find_signal_issue("ferrum-edge/ferrum-edge", "token", listing_request(items))
+        if found is not None:
+            failures.append(f"{label}: expected spoof to be ignored, got {found!r}")
+
+    def expect_error(items: list[Any], label: str) -> None:
+        try:
+            find_signal_issue("ferrum-edge/ferrum-edge", "token", listing_request(items))
+        except SignalError:
+            return
+        failures.append(f"{label}: expected fail-closed SignalError")
+
+    expect_none(
+        [signal_issue(7, title="unrelated spoof", body=MARKER + "\nmarker only")],
+        "marker-only spoof",
+    )
+    expect_none(
+        [signal_issue(8, body="title only, no marker")],
+        "title-only spoof",
+    )
+    expect_none(
+        [signal_issue(9, login="alice")],
+        "user-authored exact-title+marker spoof",
+    )
+    expect_error(
+        [signal_issue(11), signal_issue(12)],
+        "multiple bot-owned matches",
+    )
+
+    closed = signal_issue(13, state="closed")
+    found_closed = find_signal_issue(
+        "ferrum-edge/ferrum-edge", "token", listing_request([closed])
+    )
+    if found_closed != closed:
+        failures.append("closed publisher-owned signal must be selectable for reopen")
+
+    captured: list[tuple[str, str, dict[str, Any] | None]] = []
 
     def fake_request(method: str, url: str, token: str, body: dict[str, Any] | None) -> Any:
-        captured.append((method, url))
-        if "search/issues" in url:
-            return {"items": []}
+        captured.append((method, url, body))
+        if method == "GET" and "/issues?" in url:
+            return []
         if method == "POST" and url.endswith("/issues"):
             assert body is not None
             assert body["title"] == ISSUE_TITLE
             assert body["labels"] == list(ISSUE_LABELS)
             assert MARKER in body["body"]
-            return {"number": 42}
+            return signal_issue(42, body=body["body"])
         raise AssertionError(f"unexpected {method} {url}")
 
     apply_decision(
@@ -358,10 +477,52 @@ def self_test() -> int:
         True,
         fake_request,
     )
-    if not any(method == "POST" and url.endswith("/issues") for method, url in captured):
+    if not any(method == "POST" and url.endswith("/issues") for method, url, _ in captured):
         failures.append("self-test expected issue creation on open")
 
     captured.clear()
+
+    def reopen_request(method: str, url: str, token: str, body: dict[str, Any] | None) -> Any:
+        captured.append((method, url, body))
+        if method == "GET" and "/issues?" in url:
+            return [closed]
+        if method == "PATCH" and url.endswith("/issues/13"):
+            assert body is not None
+            assert body.get("state") == "open"
+            return closed
+        raise AssertionError(f"unexpected {method} {url}")
+
+    apply_decision(
+        "ferrum-edge/ferrum-edge",
+        "token",
+        Decision("open", "scaling matrix result is failure", False),
+        "https://github.com/ferrum-edge/ferrum-edge/actions/runs/1",
+        True,
+        reopen_request,
+    )
+    if not any(method == "PATCH" and url.endswith("/issues/13") for method, url, _ in captured):
+        failures.append("self-test expected closed publisher-owned issue to be reopened")
+
+    def empty_create(method: str, url: str, token: str, body: dict[str, Any] | None) -> Any:
+        if method == "GET" and "/issues?" in url:
+            return []
+        if method == "POST" and url.endswith("/issues"):
+            return {}
+        raise AssertionError(f"unexpected {method} {url}")
+
+    try:
+        apply_decision(
+            "ferrum-edge/ferrum-edge",
+            "token",
+            Decision("open", "scaling matrix result is failure", False),
+            "https://github.com/ferrum-edge/ferrum-edge/actions/runs/1",
+            True,
+            empty_create,
+        )
+        failures.append("empty create response must fail closed")
+    except SignalError as exc:
+        if exc.code != "schema":
+            failures.append(f"empty create must fail schema-closed, got {exc.code}")
 
     def no_mutate_request(method: str, url: str, token: str, body: dict[str, Any] | None) -> Any:
         raise AssertionError("off-main must not call GitHub")

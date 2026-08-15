@@ -198,6 +198,9 @@ def validate_signal_text(text: str, failures: list[str]) -> None:
     require('ref == "refs/heads/main"' in text, "signal must mutate issues only on main", failures)
     require("fail-closed" in text or "fail_job" in text, "signal must fail closed on unknown history", failures)
     require("def self_test" in text, "signal publisher must have a self-test", failures)
+    require("search/issues" not in text, "signal must not use full-text issue search", failures)
+    require('SIGNAL_AUTHOR = "github-actions[bot]"' in text, "signal must require the Actions bot author", failures)
+    require('"state": "all"' in text, "signal must list issues with state=all", failures)
     for name in REQUIRED_CHECK_NAMES:
         require(
             name not in text,

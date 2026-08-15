@@ -66,8 +66,9 @@ fn is_documented_namespace_fence_body(body: &str) -> bool {
     };
     match value {
         serde_json::Value::Object(map) => {
-            map.get("error").and_then(serde_json::Value::as_str)
-                == Some(NAMESPACE_FENCE_RETRY_MESSAGE)
+            map.len() == 1
+                && map.get("error").and_then(serde_json::Value::as_str)
+                    == Some(NAMESPACE_FENCE_RETRY_MESSAGE)
         }
         _ => false,
     }
