@@ -18,6 +18,7 @@ use ferrum_edge::config::types::{BackendScheme, DispatchKind, GatewayConfig};
 use ferrum_edge::dns::{DnsCache, DnsConfig};
 use ferrum_edge::modes::mesh::config::{
     AppProtocol, MeshService, MtlsMode, PeerAuthentication, ServicePort, Workload, WorkloadRef,
+    WorkloadSelector,
 };
 use ferrum_edge::modes::mesh::slice::MeshSlice;
 use ferrum_edge::modes::mesh::{
@@ -180,10 +181,24 @@ async fn strict_dtls_without_client_ca_rejects_the_complete_candidate() {
             dtls_service("secure", STRICT_PORT, &secure),
         ],
         vec![coap, secure],
-        vec![namespace_peer_auth(
-            MtlsMode::Strict,
-            HashMap::from([(PERMISSIVE_PORT, MtlsMode::Permissive)]),
-        )],
+        vec![
+            namespace_peer_auth(MtlsMode::Strict, HashMap::new()),
+            // Istio portLevelMtls applies only on a workload-selector policy;
+            // selector-less namespace policies deliberately ignore
+            // `port_overrides`. Make the coap workload's port permissive while
+            // the secure workload retains the namespace-wide Strict posture.
+            PeerAuthentication {
+                name: "coap-permissive".to_string(),
+                namespace: DEFAULT_NAMESPACE.to_string(),
+                scope: None,
+                selector: Some(WorkloadSelector {
+                    labels: HashMap::from([("app".to_string(), "coap".to_string())]),
+                    namespace: None,
+                }),
+                mtls_mode: MtlsMode::Strict,
+                port_overrides: HashMap::from([(PERMISSIVE_PORT, MtlsMode::Permissive)]),
+            },
+        ],
     );
     let config = GatewayConfig {
         proxies: vec![
