@@ -1664,18 +1664,34 @@ async fn test_client_ca_withdrawal_retires_established_transport_and_new_handsha
     fixture.wait_for_accepted_withdrawal("proxy_frontend").await;
 
     // A brand-new connection must meet the new verifier only. The old client
-    // certificate no longer chains to any trusted anchor, so the handshake
-    // itself fails. Session resumption is disabled on this client so a ticket
-    // issued under the withdrawn generation cannot masquerade as a new
-    // handshake.
+    // certificate no longer chains to any trusted anchor. Session resumption is
+    // disabled on this client so a ticket issued under the withdrawn generation
+    // cannot masquerade as a new handshake.
+    //
+    // The refusal is observed by DRIVING the fresh transport, not by the
+    // handshake call returning an error. A TLS 1.3 client finishes its own
+    // handshake before the server has even parsed its Certificate message
+    // (tokio-rustls returns as soon as `is_handshaking()` clears), and hyper's
+    // HTTP/2 client handshake only writes the connection preface — it never
+    // reads from the peer. Both therefore report success against an accepting
+    // *and* a refusing gateway, so `establish_h2(..).is_err()` alone can
+    // neither pass here nor fail on a real regression. Requiring the fresh
+    // transport to be unable to carry an authorized request is the strictly
+    // stronger property: a gateway that still served the withdrawn credential
+    // answers 200 and fails this loop.
     let deadline = tokio::time::Instant::now() + RETIREMENT_DEADLINE;
     let mut refused = false;
     while tokio::time::Instant::now() < deadline {
-        if establish_h2(fixture.ports.proxy_https, fixture.h2_config())
-            .await
-            .is_err()
-        {
-            refused = true;
+        refused = match establish_h2(fixture.ports.proxy_https, fixture.h2_config()).await {
+            // Refused outright at the transport — the handshake or the h2
+            // preface exchange failed.
+            Err(_) => true,
+            // Established at the wire level: the credential must still buy
+            // nothing. A retired/refused transport fails, and the pre-routing
+            // fence answers a fixed 401; only a 200 is authorization.
+            Ok(mut fresh) => !fresh.request("localhost").await.is_authorized(),
+        };
+        if refused {
             break;
         }
         sleep(Duration::from_millis(250)).await;
@@ -1936,10 +1952,18 @@ async fn test_h3_streams_are_refused_after_crl_revocation_without_reconnect() {
     );
     fixture.wait_for_accepted_withdrawal("proxy_h3").await;
 
-    // A brand-new QUIC handshake must meet ONLY the accepted verifier: the
-    // revoked client certificate no longer passes revocation checking, so the
-    // handshake itself fails. This is what proves the endpoint installed the
-    // same generation it published, rather than only tearing the old one down.
+    // A brand-new QUIC connection must meet ONLY the accepted verifier: the
+    // revoked client certificate no longer passes revocation checking. This is
+    // what proves the endpoint installed the same generation it published,
+    // rather than only tearing the old one down.
+    //
+    // As on the H1/H2 side, the refusal is observed by DRIVING the fresh
+    // connection. quinn signals `Connected` to the client the moment its own
+    // TLS handshake stops handshaking — before the server has processed the
+    // client's Certificate — and `h3::client::new` only opens a local
+    // unidirectional stream and buffers SETTINGS, so neither call reads the
+    // server's rejection. A request on the fresh connection is what the
+    // withdrawn credential must not be able to buy.
     let fresh = crate::scaffolding::Http3Client::insecure_with_client_auth(
         &fixture.client_cert.cert_pem,
         &fixture.client_cert.key_pem,
@@ -1948,8 +1972,19 @@ async fn test_h3_streams_are_refused_after_crl_revocation_without_reconnect() {
     let deadline = tokio::time::Instant::now() + RETIREMENT_DEADLINE;
     let mut refused_handshake = false;
     while tokio::time::Instant::now() < deadline {
-        if fresh.connect(&url).await.is_err() {
-            refused_handshake = true;
+        refused_handshake = match fresh.connect(&url).await {
+            // Refused outright: the QUIC connection was closed before H3 setup
+            // completed.
+            Err(_) => true,
+            // Established at the wire level: the revoked credential must still
+            // buy nothing. The connection closes, or the stream-admission fence
+            // refuses before routing; only a 200 is authorization.
+            Ok(mut established) => match established.get(&url).await {
+                Ok(response) => response.status.as_u16() != 200,
+                Err(_) => true,
+            },
+        };
+        if refused_handshake {
             break;
         }
         sleep(Duration::from_millis(250)).await;

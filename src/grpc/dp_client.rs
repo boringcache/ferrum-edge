@@ -590,6 +590,14 @@ impl DpFrontendH3Pairing {
     }
 
     /// Current H3 serving candidate. One atomic load of the paired Arc.
+    ///
+    /// Introspection surface for the pairing tests. Production H3 never reads
+    /// through this accessor: `modes::data_plane` hands the listener
+    /// [`Self::h3_accepted_slot`] itself so the endpoint adopts the candidate
+    /// with its own single atomic load, which is the property
+    /// `frontend_trust_binding_tests` pins. The bin target re-declares the
+    /// module tree without `tests/`, so it is dead there.
+    #[allow(dead_code)]
     pub fn h3_accepted(&self) -> Option<Arc<crate::tls::AcceptedFrontendTls>> {
         self.h3_accepted_slot.load_full().as_ref().clone()
     }
