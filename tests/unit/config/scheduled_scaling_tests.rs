@@ -31,7 +31,7 @@ const CI_CD: &str = include_str!("../../../docs/ci_cd.md");
 #[test]
 fn admin_jwt_ttl_covers_the_180_minute_job_and_is_accepted_by_configured_max_ttl() {
     assert_eq!(SCHEDULED_SCALING_ADMIN_JWT_TTL_SECS, 4 * 60 * 60);
-    assert!(SCHEDULED_SCALING_ADMIN_JWT_TTL_SECS >= 180 * 60);
+    const { assert!(SCHEDULED_SCALING_ADMIN_JWT_TTL_SECS >= 180 * 60) };
     assert_eq!(
         scheduled_scaling_admin_jwt_max_ttl_value(),
         SCHEDULED_SCALING_ADMIN_JWT_TTL_SECS.to_string()
