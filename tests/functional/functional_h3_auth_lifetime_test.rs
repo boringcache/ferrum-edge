@@ -824,6 +824,10 @@ async fn h3_auth_lifetime_grpc_web_expiry_emits_bounded_trailer_frame() {
 //    EARLIEST of the client `grpc-timeout` and the authorization deadline
 //    around every downstream write — and this test sets no `grpc-timeout` at
 //    all, so the authorization bound is the only one that can fire.
+//
+//    A tiny first gRPC message is committed before the bulk stall so expiry
+//    cannot race onto the pre-DATA trailers-only path: once DATA has been
+//    offered, a clean EOF is unsafe for a possibly partial message.
 // ────────────────────────────────────────────────────────────────────────────
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore]
@@ -833,12 +837,16 @@ async fn h3_auth_lifetime_stalled_downstream_cannot_outlive_the_credential() {
     let reservation = reserve_port().await.expect("backend port");
     let backend_port = reservation.port;
 
-    // Each message is far larger than the client's receive window below, so the
-    // gateway's very first downstream `send_data` parks in flow control.
+    // A tiny first message fits in the stalled client's 4 KiB window so the
+    // gateway offers (and completes) DATA before the bulk frames park
+    // `send_data`. That pins expiry onto the post-offer RESET path instead of
+    // racing the pre-DATA trailers-only completion.
+    let primed = Bytes::from(vec![b'y'; 64]);
     let big = Bytes::from(vec![b'x'; 64 * 1024]);
     let mut steps = vec![
         GrpcStep::AcceptStreamingRpc(MatchRpc::any()),
         GrpcStep::SendInitialHeaders,
+        GrpcStep::RespondMessage(primed),
     ];
     for _ in 0..40 {
         steps.push(GrpcStep::RespondMessage(big.clone()));
@@ -870,17 +878,23 @@ async fn h3_auth_lifetime_stalled_downstream_cannot_outlive_the_credential() {
     let (status, _headers) = stream.recv_response().await.expect("response headers");
     assert_eq!(status.as_u16(), 200);
 
-    // From here the client NEVER reads a DATA frame. The gateway's downstream
-    // write parks, and only the authorization bound can end the exchange.
+    // From here the client NEVER reads a DATA frame. The tiny first message
+    // occupies the receive buffer, the bulk `send_data` parks, and only the
+    // authorization bound can end the exchange. Expiry after offered DATA
+    // must RESET: a clean EOF would hide a potentially partial gRPC message.
     assert_credential_expired_exactly(&harness, "grpc", 1).await;
 
     // The stream must be terminated on the wire too, not merely counted.
     match tokio::time::timeout(TERMINATION_GRACE, stream.recv_data()).await {
         Ok(Err(_)) => {}
-        Ok(Ok(other)) => {
+        Ok(Ok(None)) => panic!(
+            "a stalled-downstream expiry must reset the stream, never close it cleanly; logs:\n{}",
+            harness.captured_combined().unwrap_or_default()
+        ),
+        Ok(Ok(Some(_))) => {
             // Buffered credit may release a bounded prefix before the reset is
-            // observed; drain until the reset surfaces.
-            let _ = other;
+            // observed; drain until the reset surfaces. A subsequent clean EOF
+            // is still a failure: DATA was already client-visible.
             let started = std::time::Instant::now();
             loop {
                 match stream.recv_data().await {
@@ -890,7 +904,7 @@ async fn h3_auth_lifetime_stalled_downstream_cannot_outlive_the_credential() {
                     ),
                     Ok(None) => panic!(
                         "a stalled-downstream expiry must reset the stream, never close it \
-                         cleanly; logs:\n{}",
+                         cleanly after offered DATA; logs:\n{}",
                         harness.captured_combined().unwrap_or_default()
                     ),
                     Err(_) => break,
