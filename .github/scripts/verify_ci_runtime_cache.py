@@ -836,6 +836,12 @@ def check_fips_producer_channel(
         "producer archive before consumers run filtered tests",
         failures,
     )
+    require(
+        "--message-format=json" in compile_job
+        and "target/fips-test-binaries.json" in compile_job,
+        "fips-compile must record the exact test executables in its producer archive",
+        failures,
+    )
     if compile_saves:
         condition = step_if(compile_saves[0])
         with_block = step_with(compile_saves[0])
@@ -1521,9 +1527,16 @@ def check_fips(workflow: str, failures: list[str]) -> None:
         "FIPS key-admission tests must remain in the live gate",
         failures,
     )
+    test_job = extract_job(workflow, "fips-test")
     require(
-        re.search(r"(?m)--test unit_tests tls::fips_\s*$", workflow) is not None,
-        "FIPS unit tests must use one tls::fips_ TESTNAME prefix",
+        '"$unit_test_binary" tls::fips_' in test_job,
+        "FIPS unit test binary must use one tls::fips_ TESTNAME prefix",
+        failures,
+    )
+    require(
+        "cargo test" not in test_job,
+        "FIPS test consumer must execute producer-recorded binaries directly so "
+        "fresh-checkout mtimes cannot trigger a rebuild",
         failures,
     )
     require(
@@ -1543,6 +1556,11 @@ def check_fips(workflow: str, failures: list[str]) -> None:
     require(
         "legitimate_data_plane_connects_once_a_permit_is_released" in workflow,
         "FIPS CP/DP handshake coverage must remain",
+        failures,
+    )
+    require(
+        test_job.count('"$integration_test_binary"') == 2,
+        "FIPS handshake filters must execute the restored integration test binary twice",
         failures,
     )
     require(
@@ -1574,7 +1592,6 @@ def check_fips(workflow: str, failures: list[str]) -> None:
     )
     compile_job = extract_job(workflow, "fips-compile")
     clippy_job = extract_job(workflow, "fips-clippy")
-    test_job = extract_job(workflow, "fips-test")
     aggregate = extract_job(workflow, "fips-build")
     require(bool(compile_job), "fips-compile job is missing", failures)
     require(bool(clippy_job), "fips-clippy job is missing", failures)
