@@ -816,6 +816,18 @@ def check_fips_producer_channel(
         "fips-compile must classify the optional prior-attempt warm source",
         failures,
     )
+    restore_position = compile_job.find("Restore prior-attempt FIPS producer outputs")
+    build_position = compile_job.find("Build the FIPS profile")
+    save_position = compile_job.find("Save FIPS producer compile outputs")
+    require(
+        restore_position >= 0
+        and build_position >= 0
+        and save_position >= 0
+        and restore_position < build_position < save_position,
+        "fips-compile must restore the prior attempt before building and save "
+        "the refreshed producer afterward",
+        failures,
+    )
     if compile_saves:
         condition = step_if(compile_saves[0])
         with_block = step_with(compile_saves[0])
@@ -2477,6 +2489,14 @@ def self_test() -> int:
     require(
         any("prior-attempt producer restore" in item for item in consumer_save_failures),
         "self-test: missing compile prior-attempt restore must fail",
+        failures,
+    )
+    require(
+        any(
+            "restore the prior attempt before building" in item
+            for item in consumer_save_failures
+        ),
+        "self-test: missing compile restore/build/save ordering must fail",
         failures,
     )
 
