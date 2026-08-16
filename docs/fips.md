@@ -93,7 +93,7 @@ wired. Automatic toolchain/environment/manifest/lock hashing stays enabled,
 and this layer is not SHA-scoped, so dependency/compiler work remains a warm
 cross-commit fallback. After a successful locked `fips` profile build,
 `fips-compile` publishes the full `target/` and `.cache/sccache` tree under
-`fips-producer-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}`
+`fips-producer-${{ github.event.pull_request.head.sha || github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}`
 for same-attempt claimed-check, clippy, and `fips-test-build` consumers.
 That compile job is build-only: complete FIPS `unit_tests` and
 `integration_tests` executables are compiled by the parallel `fips-test-build`
@@ -103,7 +103,10 @@ immutable artifact scoped to that workflow run and attempt. The successful
 build-only producer packages its exact `target/` + `.cache/sccache` tree as a
 zstd tar, preserving executable modes that artifact ZIP extraction would
 normalize, and publishes it as the one-day immutable artifact
-`fips-producer-handoff-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}`.
+`fips-producer-handoff-${{ github.event.pull_request.head.sha || github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}`.
+The fallback expression deliberately uses the pull-request head SHA instead of
+the synthetic pull-request merge SHA, so a later manual run of that head can
+name the same source artifact; non-PR events continue to use `github.sha`.
 That cross-run channel is deliberately not another repository cache:
 concurrent CI writers empirically evicted a 4.15 GB late cache handoff within
 three minutes. The filtered

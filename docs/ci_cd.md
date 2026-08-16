@@ -291,7 +291,7 @@ artifact handoff:
   build, `fips-compile` saves
   `${{ github.workspace }}/target` and
   `.cache/sccache` with `actions/cache/save` under
-  `fips-producer-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}`.
+  `fips-producer-${{ github.event.pull_request.head.sha || github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}`.
   That key is unique per head and workflow-run attempt, so GitHub's immutable
   exact-hit skip cannot trap newly warmed outputs. The three claimed-profile
   shards, clippy, and `fips-test-build` restore the current producer key (with
@@ -308,13 +308,16 @@ artifact handoff:
   packages its exact `target/` + `.cache/sccache` producer tree as a zstd tar
   (preserving executable modes that artifact ZIP extraction would normalize)
   and publishes it as the one-day run artifact
-  `fips-producer-handoff-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}`.
+  `fips-producer-handoff-${{ github.event.pull_request.head.sha || github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}`.
+  Pull-request events use `github.event.pull_request.head.sha` rather than the
+  synthetic merge SHA so a manual run of the same branch head can address the
+  artifact; other events fall back to `github.sha`.
   This is intentionally not a third repository cache: concurrent CI writers
   empirically evicted a 4.15 GB late cache handoff within three minutes.
   GitHub also deletes a workflow run's artifacts when that same run is rerun,
   so warm evidence uses separate `workflow_dispatch` runs. Each dispatch names
   the exact source run ID and attempt; the pinned download action requests only
-  `fips-producer-handoff-${{ github.sha }}-<run_id>-<run_attempt>` from that run
+  `fips-producer-handoff-${{ github.event.pull_request.head.sha || github.sha }}-<run_id>-<run_attempt>` from that run
   in the current repository. An explicitly requested artifact must contain a
   real tar payload that extracts to real `target/` and `.cache/sccache`
   directories or the compile fails closed. `force_cold_cache` skips both

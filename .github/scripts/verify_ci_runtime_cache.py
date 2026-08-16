@@ -57,18 +57,21 @@ FIPS_CONTRACT_HASHFILES = (
 )
 FIPS_SHARED_KEY = "ci-fips-contract-${{ " + FIPS_CONTRACT_HASHFILES + " }}"
 FIPS_PRODUCER_KEY_EXPR = (
-    "fips-producer-${{ github.sha }}-${{ github.run_id }}-"
+    "fips-producer-${{ github.event.pull_request.head.sha || github.sha }}-"
+    "${{ github.run_id }}-"
     "${{ github.run_attempt }}"
 )
 FIPS_PRODUCER_RESTORE_PREFIX_EXPR = (
-    "fips-producer-${{ github.sha }}-${{ github.run_id }}-"
+    "fips-producer-${{ github.event.pull_request.head.sha || github.sha }}-"
+    "${{ github.run_id }}-"
 )
 FIPS_HANDOFF_ARTIFACT_EXPR = (
-    "fips-producer-handoff-${{ github.sha }}-${{ github.run_id }}-"
+    "fips-producer-handoff-${{ github.event.pull_request.head.sha || github.sha }}-"
+    "${{ github.run_id }}-"
     "${{ github.run_attempt }}"
 )
 FIPS_HANDOFF_SOURCE_EXPR = (
-    "fips-producer-handoff-${{ github.sha }}-"
+    "fips-producer-handoff-${{ github.event.pull_request.head.sha || github.sha }}-"
     "${{ inputs.warm_source_run_id }}-${{ inputs.warm_source_run_attempt }}"
 )
 FIPS_PRODUCER_PATHS = (
@@ -857,8 +860,8 @@ def check_fips_producer_channel(
         )
         require(
             f"name: {FIPS_HANDOFF_SOURCE_EXPR}" in with_block,
-            "fips-compile must bind the source artifact to the current SHA and "
-            "explicit run/attempt inputs",
+            "fips-compile must bind the source artifact to the event-stable "
+            "source SHA and explicit run/attempt inputs",
             failures,
         )
         require(
@@ -3217,10 +3220,30 @@ def self_test() -> int:
     check_fips_producer_channel(wrong_source_name, wrong_source_failures)
     require(
         any(
-            "bind the source artifact to the current SHA" in item
+            "bind the source artifact to the event-stable source SHA" in item
             for item in wrong_source_failures
         ),
         "self-test: cross-run artifact without SHA/run/attempt binding must fail",
+        failures,
+    )
+
+    synthetic_merge_source = handoff_channel.replace(
+        "${{ github.event.pull_request.head.sha || github.sha }}",
+        "${{ github.sha }}",
+    )
+    synthetic_merge_failures: list[str] = []
+    check_fips_producer_channel(
+        synthetic_merge_source, synthetic_merge_failures
+    )
+    require(
+        any(
+            "event-stable source SHA" in item
+            or "FIPS_PRODUCER_KEY" in item
+            or "FIPS_PRODUCER_RESTORE_PREFIX" in item
+            or "handoff artifact" in item
+            for item in synthetic_merge_failures
+        ),
+        "self-test: pull-request synthetic merge SHA handoff identity must fail",
         failures,
     )
 

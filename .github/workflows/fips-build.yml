@@ -21,7 +21,7 @@ name: FIPS Build Policy
 #      toolchain/env/manifest/lock hashing stays enabled. This layer is NOT
 #      SHA-scoped, so dependency/compiler work stays warm across commits.
 #    - Exact same-run producer channel: `actions/cache` key
-#      `fips-producer-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}`.
+#      `fips-producer-${{ github.event.pull_request.head.sha || github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}`.
 #      Saved after a successful profile build as a main step, before rust-cache's
 #      post cleanup, for this-attempt claimed/clippy/test-build consumers. A new
 #      attempt always gets a fresh key, so GitHub's immutable exact-hit skip
@@ -37,7 +37,7 @@ name: FIPS Build Policy
 #    same-run producer key (consumers; rust-cache `save-if: false` and no
 #    producer save). Trusted non-cold runs fail closed if this-run producer
 #    output is missing. restore-keys keep
-#    `fips-producer-${{ github.sha }}-${{ github.run_id }}-` so a failed-job
+#    `fips-producer-${{ github.event.pull_request.head.sha || github.sha }}-${{ github.run_id }}-` so a failed-job
 #    rerun of a consumer can reuse a prior attempt of the same run.
 #    `fips-test-build` precompiles the complete unit_tests and integration_tests
 #    executables and publishes digest-bound copies as an immutable same-run
@@ -97,13 +97,17 @@ env:
   # failed-job rerun of a consumer can reuse a prior successful compile in the
   # same run. This early save is not the cross-run warm source: later
   # ordinary CI caches can LRU-evict it before the next full-workflow rerun.
-  FIPS_PRODUCER_KEY: fips-producer-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
-  FIPS_PRODUCER_RESTORE_PREFIX: fips-producer-${{ github.sha }}-${{ github.run_id }}-
+  # Pull-request workflows execute a synthetic merge SHA, while a later manual
+  # warm run executes the selected branch head. Bind both event shapes to the
+  # pull-request head so the explicit cross-run handoff remains addressable;
+  # every other event keeps its native github.sha identity.
+  FIPS_PRODUCER_KEY: fips-producer-${{ github.event.pull_request.head.sha || github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
+  FIPS_PRODUCER_RESTORE_PREFIX: fips-producer-${{ github.event.pull_request.head.sha || github.sha }}-${{ github.run_id }}-
   # Immutable cross-run producer artifact. A later explicit workflow dispatch
   # names the exact source run and attempt; the artifact name also binds the
   # current SHA. Separate runs avoid both repository cache LRU and GitHub's
   # deletion of a run's artifacts when that same run is rerun.
-  FIPS_HANDOFF_ARTIFACT: fips-producer-handoff-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
+  FIPS_HANDOFF_ARTIFACT: fips-producer-handoff-${{ github.event.pull_request.head.sha || github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
 
 jobs:
   feature-policy:
@@ -373,7 +377,7 @@ jobs:
         id: cross-run-fips-handoff
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
         with:
-          name: fips-producer-handoff-${{ github.sha }}-${{ inputs.warm_source_run_id }}-${{ inputs.warm_source_run_attempt }}
+          name: fips-producer-handoff-${{ github.event.pull_request.head.sha || github.sha }}-${{ inputs.warm_source_run_id }}-${{ inputs.warm_source_run_attempt }}
           path: ${{ runner.temp }}/cross-run-fips-handoff
           github-token: ${{ github.token }}
           repository: ${{ github.repository }}
@@ -639,7 +643,7 @@ jobs:
               echo "Restored this-run FIPS producer cache."
               ;;
             *)
-              echo "::error::fips-compile producer cache was not restored for this github.sha/run_id; refusing to claim compile-to-consumer reuse" >&2
+              echo "::error::fips-compile producer cache was not restored for this event-stable source SHA/run_id; refusing to claim compile-to-consumer reuse" >&2
               exit 1
               ;;
           esac
@@ -828,7 +832,7 @@ jobs:
               echo "Restored this-run FIPS producer cache."
               ;;
             *)
-              echo "::error::fips-compile producer cache was not restored for this github.sha/run_id; refusing to claim compile-to-consumer reuse" >&2
+              echo "::error::fips-compile producer cache was not restored for this event-stable source SHA/run_id; refusing to claim compile-to-consumer reuse" >&2
               exit 1
               ;;
           esac
@@ -974,7 +978,7 @@ jobs:
               echo "Restored this-run FIPS producer cache."
               ;;
             *)
-              echo "::error::fips-compile producer cache was not restored for this github.sha/run_id; refusing to claim compile-to-consumer reuse" >&2
+              echo "::error::fips-compile producer cache was not restored for this event-stable source SHA/run_id; refusing to claim compile-to-consumer reuse" >&2
               exit 1
               ;;
           esac
