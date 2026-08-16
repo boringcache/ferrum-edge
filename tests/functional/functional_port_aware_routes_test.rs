@@ -52,14 +52,20 @@ async fn spawn_backend(identifier: &'static str) -> (u16, JoinHandle<()>) {
     (port, handle)
 }
 
-/// Reserve an ephemeral port number, then release the socket so the gateway
-/// binds it itself. The gateway's readiness barrier is what proves it won the
-/// race; a lost race shows up as an explicit "never bound" failure below.
-async fn reserve_free_port() -> u16 {
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let port = listener.local_addr().unwrap().port();
-    drop(listener);
-    port
+/// Reserve two distinct ephemeral port numbers, then release both sockets so
+/// the gateway binds them itself. Holding both reservations at the same time
+/// prevents the kernel from immediately returning the first port for the
+/// second request. The gateway's readiness barrier still proves it won the
+/// later bind race; a lost race shows up as an explicit "never bound" failure.
+async fn reserve_free_port_pair() -> (u16, u16) {
+    let first = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let second = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let ports = (
+        first.local_addr().unwrap().port(),
+        second.local_addr().unwrap().port(),
+    );
+    drop((first, second));
+    ports
 }
 
 async fn get_on_port(client: &reqwest::Client, port: u16, path: &str) -> (u16, String) {
@@ -142,8 +148,7 @@ fn plaintext_proxy(id: &str, listen_port: u16, backend_port: u16) -> String {
 async fn functional_port_aware_routes_two_same_protocol_listeners() {
     let (backend_a, _ha) = spawn_backend("listener-a").await;
     let (backend_b, _hb) = spawn_backend("listener-b").await;
-    let port_a = reserve_free_port().await;
-    let port_b = reserve_free_port().await;
+    let (port_a, port_b) = reserve_free_port_pair().await;
     assert_ne!(port_a, port_b);
 
     let config = format!(
@@ -201,8 +206,7 @@ plugin_configs: []
 async fn functional_port_aware_routes_http_and_https_listeners() {
     let (plain_backend, _hp) = spawn_backend("plain-backend").await;
     let (tls_backend, _ht) = spawn_backend("tls-backend").await;
-    let plain_port = reserve_free_port().await;
-    let tls_port = reserve_free_port().await;
+    let (plain_port, tls_port) = reserve_free_port_pair().await;
     assert_ne!(plain_port, tls_port);
 
     // `http_tls_listen_ports` is namespace-qualified: the entry is the
@@ -296,8 +300,7 @@ plugin_configs: []
 async fn functional_port_aware_routes_reload_adds_and_withdraws_listeners() {
     let (backend_a, _ha) = spawn_backend("listener-a").await;
     let (backend_b, _hb) = spawn_backend("listener-b").await;
-    let port_a = reserve_free_port().await;
-    let port_b = reserve_free_port().await;
+    let (port_a, port_b) = reserve_free_port_pair().await;
     assert_ne!(port_a, port_b);
 
     let initial = format!(
@@ -405,8 +408,7 @@ async fn functional_port_aware_routes_two_tls_listeners_serve_http3() {
 
     let (backend_a, _ha) = spawn_backend("tls-a").await;
     let (backend_b, _hb) = spawn_backend("tls-b").await;
-    let port_a = reserve_free_port().await;
-    let port_b = reserve_free_port().await;
+    let (port_a, port_b) = reserve_free_port_pair().await;
     assert_ne!(port_a, port_b);
 
     let both = format!(
