@@ -404,10 +404,45 @@ jobs:
               exit 1
             fi
           done
+          tree_manifest="${extract_root}/fips-producer-source-tree"
+          if [ ! -f "$tree_manifest" ] || [ -L "$tree_manifest" ]; then
+            echo "::error::cross-run FIPS handoff is missing its real source-tree manifest" >&2
+            exit 1
+          fi
+          archived_tree="$(cat "$tree_manifest")"
+          line_count="$(wc -l < "$tree_manifest")"
+          if [ "$line_count" -ne 1 ] || [ "${#archived_tree}" -ne 40 ] || \
+             [[ "$archived_tree" == *[!0-9a-f]* ]]; then
+            echo "::error::cross-run FIPS handoff source-tree manifest is malformed" >&2
+            exit 1
+          fi
+          current_tree="$(git rev-parse HEAD^{tree})"
+          if [ "$archived_tree" != "$current_tree" ]; then
+            echo "::error::cross-run FIPS handoff source tree does not match this checkout; refusing stale-base reuse" >&2
+            exit 1
+          fi
+          if ! git diff --quiet --no-ext-diff || \
+             ! git diff --cached --quiet --no-ext-diff; then
+            echo "::error::tracked checkout content changed before FIPS handoff promotion" >&2
+            exit 1
+          fi
           rm -rf "${GITHUB_WORKSPACE}/target" "${GITHUB_WORKSPACE}/.cache/sccache"
           mkdir -p "${GITHUB_WORKSPACE}/.cache"
           mv "${extract_root}/target" "${GITHUB_WORKSPACE}/target"
           mv "${extract_root}/.cache/sccache" "${GITHUB_WORKSPACE}/.cache/sccache"
+          # Checkout gives the identical source tree fresh mtimes. The handoff
+          # is already bound to this exact head/run/attempt, so make its regular
+          # outputs newer only after validating the restored executable. This
+          # prevents Cargo from relinking exact-head outputs as merely stale.
+          target_root="${GITHUB_WORKSPACE}/target"
+          fips_binary="${target_root}/debug/ferrum-edge"
+          if [ ! -d "$target_root" ] || [ -L "$target_root" ] || \
+             [ ! -f "$fips_binary" ] || [ -L "$fips_binary" ] || \
+             [ ! -x "$fips_binary" ]; then
+            echo "::error::exact cross-run FIPS target is missing its executable; refusing to refresh restored mtimes" >&2
+            exit 1
+          fi
+          find "$target_root" -xdev -type f -exec touch -- {} +
 
       - name: Record cross-run FIPS handoff restore
         if: github.event.inputs.force_cold_cache != 'true' && github.event_name == 'workflow_dispatch' && inputs.warm_source_run_id != ''
@@ -495,9 +530,22 @@ jobs:
         run: |
           set -euo pipefail
           archive="${RUNNER_TEMP}/fips-producer-handoff.tar.zst"
+          tree_manifest="${RUNNER_TEMP}/fips-producer-source-tree"
           rm -f "$archive"
+          if ! git diff --quiet --no-ext-diff || \
+             ! git diff --cached --quiet --no-ext-diff; then
+            echo "::error::tracked checkout content changed while building the FIPS producer" >&2
+            exit 1
+          fi
+          source_tree="$(git rev-parse HEAD^{tree})"
+          if [ "${#source_tree}" -ne 40 ] || [[ "$source_tree" == *[!0-9a-f]* ]]; then
+            echo "::error::failed to resolve the FIPS producer source tree" >&2
+            exit 1
+          fi
+          printf '%s\n' "$source_tree" > "$tree_manifest"
           tar --zstd -cf "$archive" -C "$GITHUB_WORKSPACE" \
-            target .cache/sccache
+            target .cache/sccache -C "$RUNNER_TEMP" fips-producer-source-tree
+          rm -f "$tree_manifest"
           if [ ! -s "$archive" ] || [ -L "$archive" ]; then
             echo "::error::failed to create a real FIPS producer handoff archive" >&2
             exit 1
@@ -647,6 +695,18 @@ jobs:
               exit 1
               ;;
           esac
+          # The validated producer prefix is bound to this source SHA/run_id.
+          # Refresh only regular target files after that proof so the newer
+          # checkout mtimes do not force Cargo to relink identical outputs.
+          target_root="${GITHUB_WORKSPACE}/target"
+          fips_binary="${target_root}/debug/ferrum-edge"
+          if [ ! -d "$target_root" ] || [ -L "$target_root" ] || \
+             [ ! -f "$fips_binary" ] || [ -L "$fips_binary" ] || \
+             [ ! -x "$fips_binary" ]; then
+            echo "::error::this-run FIPS target is missing its executable; refusing to refresh restored mtimes" >&2
+            exit 1
+          fi
+          find "$target_root" -xdev -type f -exec touch -- {} +
 
       - name: Assert cache-service credentials are absent
         run: |
@@ -836,6 +896,18 @@ jobs:
               exit 1
               ;;
           esac
+          # The validated producer prefix is bound to this source SHA/run_id.
+          # Refresh only regular target files after that proof so the newer
+          # checkout mtimes do not force Cargo to relink identical outputs.
+          target_root="${GITHUB_WORKSPACE}/target"
+          fips_binary="${target_root}/debug/ferrum-edge"
+          if [ ! -d "$target_root" ] || [ -L "$target_root" ] || \
+             [ ! -f "$fips_binary" ] || [ -L "$fips_binary" ] || \
+             [ ! -x "$fips_binary" ]; then
+            echo "::error::this-run FIPS target is missing its executable; refusing to refresh restored mtimes" >&2
+            exit 1
+          fi
+          find "$target_root" -xdev -type f -exec touch -- {} +
 
       - name: Assert cache-service credentials are absent
         run: |
@@ -982,6 +1054,18 @@ jobs:
               exit 1
               ;;
           esac
+          # The validated producer prefix is bound to this source SHA/run_id.
+          # Refresh only regular target files after that proof so the newer
+          # checkout mtimes do not force Cargo to relink identical outputs.
+          target_root="${GITHUB_WORKSPACE}/target"
+          fips_binary="${target_root}/debug/ferrum-edge"
+          if [ ! -d "$target_root" ] || [ -L "$target_root" ] || \
+             [ ! -f "$fips_binary" ] || [ -L "$fips_binary" ] || \
+             [ ! -x "$fips_binary" ]; then
+            echo "::error::this-run FIPS target is missing its executable; refusing to refresh restored mtimes" >&2
+            exit 1
+          fi
+          find "$target_root" -xdev -type f -exec touch -- {} +
 
       - name: Assert cache-service credentials are absent
         run: |

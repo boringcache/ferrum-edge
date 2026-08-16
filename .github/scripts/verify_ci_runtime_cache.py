@@ -804,7 +804,20 @@ def check_fips_producer_channel(
     test_build_job = extract_job(workflow, "fips-test-build")
     test_job = extract_job(workflow, "fips-test")
     aggregate = extract_job(workflow, "fips-build")
+    mtime_refresh = 'find "$target_root" -xdev -type f -exec touch -- {} +'
+    restored_binary_checks = (
+        'fips_binary="${target_root}/debug/ferrum-edge"',
+        '[ ! -f "$fips_binary" ]',
+        '[ -L "$fips_binary" ]',
+        '[ ! -x "$fips_binary" ]',
+    )
     require(bool(test_build_job), "fips-test-build job is missing", failures)
+    require(
+        workflow.count(mtime_refresh) == 4,
+        "FIPS workflow must refresh restored target mtimes exactly once in the "
+        "cross-run producer and each of its three exact same-run consumers",
+        failures,
+    )
     compile_saves = [
         step for step in job_steps(compile_job) if step_uses(step).startswith(CACHE_SAVE)
     ]
@@ -895,6 +908,53 @@ def check_fips_producer_channel(
         "same-SHA cross-run handoff artifact",
         failures,
     )
+    promote_steps = [
+        step
+        for step in job_steps(compile_job)
+        if "name: Promote exact cross-run FIPS handoff artifact" in step
+    ]
+    require(
+        len(promote_steps) == 1,
+        "fips-compile must have exactly one exact-handoff promotion step",
+        failures,
+    )
+    if promote_steps:
+        promote_condition = step_if(promote_steps[0])
+        require(
+            COLD_NOT_TRUE in promote_condition
+            and "github.event_name == 'workflow_dispatch'" in promote_condition
+            and "inputs.warm_source_run_id != ''" in promote_condition
+            and "steps.cross-run-fips-handoff.outcome == 'success'"
+            in promote_condition
+            and mtime_refresh in promote_steps[0]
+            and all(
+                check in promote_steps[0] for check in restored_binary_checks
+            )
+            and 'tree_manifest="${extract_root}/fips-producer-source-tree"'
+            in promote_steps[0]
+            and '[ ! -f "$tree_manifest" ] || [ -L "$tree_manifest" ]'
+            in promote_steps[0]
+            and 'current_tree="$(git rev-parse HEAD^{tree})"' in promote_steps[0]
+            and 'if [ "$archived_tree" != "$current_tree" ]; then'
+            in promote_steps[0]
+            and "refusing stale-base reuse" in promote_steps[0]
+            and "git diff --quiet --no-ext-diff" in promote_steps[0]
+            and "git diff --cached --quiet --no-ext-diff" in promote_steps[0],
+            "fips-compile must refresh mtimes inside the validated exact-handoff "
+            "promotion step only after a successful explicit non-cold download, "
+            "matching source tree, and clean tracked checkout",
+            failures,
+        )
+    package_steps = [
+        step
+        for step in job_steps(compile_job)
+        if "name: Package cross-run FIPS producer handoff" in step
+    ]
+    require(
+        len(package_steps) == 1,
+        "fips-compile must have exactly one cross-run handoff packaging step",
+        failures,
+    )
     require(
         "force_cold_cache skipped download" in compile_job
         and "layer=cross-run-artifact" in compile_job
@@ -905,6 +965,7 @@ def check_fips_producer_channel(
     )
     download_position = compile_job.find("Download exact cross-run FIPS handoff artifact")
     promote_position = compile_job.find("Promote exact cross-run FIPS handoff artifact")
+    refresh_position = compile_job.find(mtime_refresh)
     build_position = compile_job.find("Build the FIPS profile")
     save_position = compile_job.find("Save FIPS producer compile outputs")
     package_position = compile_job.find("Package cross-run FIPS producer handoff")
@@ -912,14 +973,16 @@ def check_fips_producer_channel(
     require(
         download_position >= 0
         and promote_position >= 0
+        and refresh_position >= 0
         and build_position >= 0
         and save_position >= 0
         and package_position >= 0
         and handoff_position >= 0
-        and download_position < promote_position < build_position
+        and download_position < promote_position < refresh_position < build_position
         and build_position < save_position < package_position < handoff_position,
-        "fips-compile must download/promote the cross-run artifact before building, "
-        "then publish the refreshed same-run cache and packaged immutable handoff",
+        "fips-compile must download/promote and mtime-refresh the exact cross-run "
+        "artifact before building, then publish the refreshed same-run cache and "
+        "packaged immutable handoff",
         failures,
     )
     require(
@@ -934,12 +997,32 @@ def check_fips_producer_channel(
         failures,
     )
     require(
-        'archive="${RUNNER_TEMP}/fips-producer-handoff.tar.zst"' in compile_job
-        and 'tar --zstd -cf "$archive" -C "$GITHUB_WORKSPACE"' in compile_job
-        and "target .cache/sccache" in compile_job
-        and '[ ! -s "$archive" ] || [ -L "$archive" ]' in compile_job,
-        "fips-compile must package target and sccache into a nonempty tar.zst "
-        "handoff that preserves executable modes",
+        bool(promote_steps)
+        and "refusing to refresh restored mtimes" in promote_steps[0],
+        "fips-compile must validate the exact restored executable before refreshing "
+        "regular target-file mtimes",
+        failures,
+    )
+    require(
+        bool(package_steps)
+        and COLD_NOT_TRUE in step_if(package_steps[0])
+        and 'archive="${RUNNER_TEMP}/fips-producer-handoff.tar.zst"'
+        in package_steps[0]
+        and 'tree_manifest="${RUNNER_TEMP}/fips-producer-source-tree"'
+        in package_steps[0]
+        and 'source_tree="$(git rev-parse HEAD^{tree})"' in package_steps[0]
+        and "git diff --quiet --no-ext-diff" in package_steps[0]
+        and "git diff --cached --quiet --no-ext-diff" in package_steps[0]
+        and 'printf \'%s\\n\' "$source_tree" > "$tree_manifest"'
+        in package_steps[0]
+        and 'tar --zstd -cf "$archive" -C "$GITHUB_WORKSPACE"'
+        in package_steps[0]
+        and 'target .cache/sccache -C "$RUNNER_TEMP" fips-producer-source-tree'
+        in package_steps[0]
+        and '[ ! -s "$archive" ] || [ -L "$archive" ]'
+        in package_steps[0],
+        "fips-compile must package target, sccache, and the clean checkout tree "
+        "identity into a nonempty tar.zst handoff that preserves executable modes",
         failures,
     )
     require(
@@ -1060,6 +1143,40 @@ def check_fips_producer_channel(
         require(
             "Require this-run FIPS producer cache" in job_body,
             f"{job_name} must fail closed when the this-run producer key is missing",
+            failures,
+        )
+        producer_require_steps = [
+            step
+            for step in job_steps(job_body)
+            if "name: Require this-run FIPS producer cache" in step
+        ]
+        require(
+            len(producer_require_steps) == 1,
+            f"{job_name} must have exactly one this-run producer requirement step",
+            failures,
+        )
+        require_position = job_body.find("Require this-run FIPS producer cache")
+        refresh_position = job_body.find(mtime_refresh)
+        credential_assert_position = job_body.find(
+            "Assert cache-service credentials are absent"
+        )
+        require(
+            require_position >= 0
+            and refresh_position >= 0
+            and credential_assert_position >= 0
+            and require_position < refresh_position < credential_assert_position
+            and bool(producer_require_steps)
+            and COLD_NOT_TRUE in step_if(producer_require_steps[0])
+            and FORK_NOT_TRUE in step_if(producer_require_steps[0])
+            and mtime_refresh in producer_require_steps[0]
+            and all(
+                check in producer_require_steps[0]
+                for check in restored_binary_checks
+            )
+            and "refusing to refresh restored mtimes"
+            in producer_require_steps[0],
+            f"{job_name} must validate the exact this-run producer and executable "
+            "before refreshing regular target-file mtimes",
             failures,
         )
         require(
@@ -3162,6 +3279,41 @@ def self_test() -> int:
         failures,
     )
 
+    missing_mtime_refresh = handoff_channel.replace(
+        '          find "$target_root" -xdev -type f -exec touch -- {} +\n',
+        "          true\n",
+        1,
+    )
+    missing_mtime_refresh_failures: list[str] = []
+    check_fips_producer_channel(
+        missing_mtime_refresh, missing_mtime_refresh_failures
+    )
+    require(
+        any(
+            "refresh restored target mtimes exactly once" in item
+            or "mtime-refresh the exact cross-run" in item
+            for item in missing_mtime_refresh_failures
+        ),
+        "self-test: exact FIPS restores without mtime normalization must fail",
+        failures,
+    )
+
+    stale_base_reuse = handoff_channel.replace(
+        '          if [ "$archived_tree" != "$current_tree" ]; then\n',
+        "          if false; then\n",
+        1,
+    )
+    stale_base_reuse_failures: list[str] = []
+    check_fips_producer_channel(stale_base_reuse, stale_base_reuse_failures)
+    require(
+        any(
+            "matching source tree" in item
+            for item in stale_base_reuse_failures
+        ),
+        "self-test: mtime normalization without source-tree equality must fail",
+        failures,
+    )
+
     missing_handoff_upload = handoff_channel.replace(
         f"        uses: {UPLOAD_ARTIFACT} # v7\n",
         "        uses: actions/upload-artifact@untrusted\n",
@@ -3182,14 +3334,17 @@ def self_test() -> int:
 
     unpackaged_handoff = handoff_channel.replace(
         '          tar --zstd -cf "$archive" -C "$GITHUB_WORKSPACE" \\\n'
-        "            target .cache/sccache\n",
+        '            target .cache/sccache -C "$RUNNER_TEMP" '
+        "fips-producer-source-tree\n",
         "          true\n",
         1,
     )
     unpackaged_failures: list[str] = []
     check_fips_producer_channel(unpackaged_handoff, unpackaged_failures)
     require(
-        any("package target and sccache" in item for item in unpackaged_failures),
+        any(
+            "package target, sccache" in item for item in unpackaged_failures
+        ),
         "self-test: direct permission-losing producer upload must fail",
         failures,
     )

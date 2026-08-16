@@ -118,7 +118,18 @@ evidence chains separate `workflow_dispatch` runs. Each dispatch names an exact
 source run ID and attempt, and the pinned download action requests only the
 same-SHA artifact from that run in the current repository. A requested source
 must contain a real tar payload and pass extracted-directory validation or the
-compile fails closed.
+compile fails closed. The archive also carries the producer checkout's Git tree
+identity. Promotion requires that identity to equal the current checkout tree
+and requires both checkouts to remain clean, so a pull-request synthetic merge
+cannot be reused as its branch head after the base tree changes. Checkout
+assigns fresh mtimes even when its source bytes match the archived tree, so
+Cargo would otherwise treat exact restored outputs as stale and relink them.
+Only after the tree identity, real target directory, and nonsymlink executable
+are validated does the producer refresh regular files under `target/`. The
+three non-fork consumers do the same only after the restored producer key
+matches the current source-SHA/run-ID prefix and the executable exists. Cold,
+fork, mismatched-tree, and untrusted-prefix paths never receive this mtime
+normalization.
 Telemetry records explicit cross-run hits and ordinary runs as no-source
 misses; it does not fabricate a hit.
 The three ordinal `fips-claimed-checks` shards, `fips-clippy`, and

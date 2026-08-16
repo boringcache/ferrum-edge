@@ -320,9 +320,19 @@ artifact handoff:
   `fips-producer-handoff-${{ github.event.pull_request.head.sha || github.sha }}-<run_id>-<run_attempt>` from that run
   in the current repository. An explicitly requested artifact must contain a
   real tar payload that extracts to real `target/` and `.cache/sccache`
-  directories or the compile fails closed. `force_cold_cache` skips both
-  handoff download and upload. Run artifacts cannot populate another ref's
-  shared cache.
+  directories or the compile fails closed. The archive carries the producer
+  checkout's Git tree identity; promotion requires an equal, clean current
+  checkout, preventing a synthetic PR merge tree from masquerading as the same
+  branch head after its base changes. Because checkout gives identical source
+  files newer mtimes than archived outputs, the exact-head producer refreshes
+  only regular files under `target/` after validating that tree and a real,
+  nonsymlink FIPS executable. Same-run consumers refresh those mtimes only
+  after the producer cache key matches the current source-SHA/run-ID prefix and
+  the same executable check succeeds. This keeps Cargo from relinking
+  content-identical outputs without allowing a partial, fork, cold, or
+  mismatched-tree restore to masquerade as current. `force_cold_cache` skips
+  both handoff download and upload. Run artifacts cannot populate another
+  ref's shared cache.
 
 `fips-test-build` precompiles the complete FIPS `unit_tests` and
 `integration_tests` executables and stages digest-bound copies in an
