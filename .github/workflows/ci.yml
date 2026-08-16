@@ -379,6 +379,20 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
 
+      - name: Extend runner swap for the aggregated unit_tests compile
+        run: |
+          set -euo pipefail
+          # The single-crate rustc frontend for the aggregated tests/unit_tests
+          # binary exceeds hosted-runner RAM on cold compiles: the VM dies with
+          # "The runner has received a shutdown signal" / exit 143 before any
+          # compiler diagnostic can print. Give the VM swap headroom so memory
+          # pressure degrades to paging instead of killing the runner agent.
+          sudo fallocate -l 12G /mnt/ferrum-swapfile
+          sudo chmod 600 /mnt/ferrum-swapfile
+          sudo mkswap /mnt/ferrum-swapfile
+          sudo swapon /mnt/ferrum-swapfile
+          free -h
+
       - uses: ./.github/actions/setup-rust-ci
         with:
           shared-key: "ci-test"
@@ -605,6 +619,17 @@ jobs:
       CARGO_PROFILE_DEV_DEBUG: "line-tables-only"
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
+
+      - name: Extend runner swap for the aggregated unit_tests compile
+        run: |
+          set -euo pipefail
+          # Same VM-loss pattern as test-unit: the aggregated unit_tests rustc
+          # frontend exceeds hosted-runner RAM on cold compiles. See test-unit.
+          sudo fallocate -l 12G /mnt/ferrum-swapfile
+          sudo chmod 600 /mnt/ferrum-swapfile
+          sudo mkswap /mnt/ferrum-swapfile
+          sudo swapon /mnt/ferrum-swapfile
+          free -h
 
       - uses: ./.github/actions/setup-rust-ci
         with:
