@@ -11772,71 +11772,14 @@ def validate_workflow_collection(
 
 
 # ---------------------------------------------------------------------------
-# Admitted `fips-build.yml` generation transition (issue #3888, PR #3889)
+# Workflow / job / local-action SHA-256 generation digests
 # ---------------------------------------------------------------------------
-# `.github/workflows/fips-build.yml` is an ordinary workflow: unprotected and
-# uncontracted, so the only thing the pull-request scan says about it is that
-# its Cross executable/configuration surface must not move. The FIPS runtime
-# rework in PR #3889 rewrites the file — trusted-base path planning, split
-# compile/lint phases, scoped caches, a dispatch input, per-phase summaries —
-# and moves that surface, so the scan rejects it with
-# `workflow directory/fips-build.yml cannot add or change Cross
-# executable/configuration surfaces`. The verifier that decides this is always
-# executed from the trusted base, so that pull request cannot repair it inside
-# its own proposal, and `FIPS Build & Test` is a required gate that must not be
-# left unscanned in the meantime.
-#
-# The repair is the same shape as the admitted release image-family adoption,
-# reduced to what a ~1,500-line workflow with no frozen job contract can carry.
-# There is no per-fragment projection to derive here, so the transition is bound
-# instead to the two exact file GENERATIONS it moves between, each named by the
-# SHA-256 of its complete text. Nothing about the admission comes from the pull
-# request — not the digest, not a manifest, not an allowlist, not a projection,
-# not a rationale — so a proposal reaches it only by being, byte for byte, the
-# destination revision this trusted policy already names.
-#
-# Properties, each fail-closed:
-#
-#   * The binding is exact on BOTH sides. The trusted base must be the retired
-#     generation and the proposal the adopted one. Any other pair — a one-byte
-#     drift on either side, an absent file, a file added outright, a partially
-#     applied rewrite — is scanned exactly as before.
-#   * It is bound to the path as well as to the two contents: the same two
-#     revisions under any other workflow filename are not this transition.
-#   * It is one-way. Once the trusted base carries the adopted generation, a
-#     proposal that returns the file to the retired one is refused explicitly,
-#     rather than relying on the two surfaces happening to differ.
-#   * It withholds ONE file's surface comparison for ONE revision pair. Every
-#     other workflow, and every action, automation script, protected job
-#     contract, digest name space, required-check binding, and live-gate
-#     relevance contract, is evaluated exactly as before — so a Cross surface
-#     added anywhere else in the same pull request is still rejected.
-#   * It suppresses no failure. Hard scan failures on either revision are
-#     appended before the comparison is reached and are still reported; only the
-#     surface-equality verdict for this one pair is withheld.
-#
-# RETIREMENT IS MANDATORY. Once PR #3889 is on `main` the trusted base IS the
-# adopted generation, so the admission is permanently unreachable: the retired
-# generation can only become a trusted base again by first passing the one-way
-# refusal above. Delete this block, the `admitted_generation_transition`
-# parameter, and the matching self-tests in the next trusted-policy change. See
-# `docs/ci_cd.md` and `docs/dependency-policy.md`.
-FIPS_BUILD_WORKFLOW_FILENAME = "fips-build.yml"
-# `.github/workflows/fips-build.yml` as it stands on the trusted base.
-FIPS_BUILD_RETIRED_GENERATION_SHA256 = (
-    "5cac372affc99bc052f995c4ea478d2b256f48f555bd41fa782f609b5e74d3ae"
-)
-# `.github/workflows/fips-build.yml` at PR #3889 head
-# bda16859610b90beaae82ee916eeeb719458de9b.
-FIPS_BUILD_ADOPTED_GENERATION_SHA256 = (
-    "527659b0ad96a0d97cd4a170543dd81acbf6784155b3c82918b1f70a20c7914b"
-)
-FIPS_BUILD_ADMITTED_GENERATION_TRANSITION = (
-    FIPS_BUILD_WORKFLOW_FILENAME,
-    FIPS_BUILD_RETIRED_GENERATION_SHA256,
-    FIPS_BUILD_ADOPTED_GENERATION_SHA256,
-)
-
+# The temporary `fips-build.yml` whole-file generation admission for issue
+# #3888 / PR #3889 is retired and non-operational now that #3889 is on `main`.
+# Ordinary `fips-build.yml` edits are compared by the normal fail-closed Cross
+# surface scan with no special case. The digest helper below remains because
+# CI-job and local-action finite transitions still name exact generations by
+# the SHA-256 of their complete text.
 WORKFLOW_GENERATION_DIGEST = re.compile(r"^[0-9a-f]{64}$")
 
 
@@ -11849,10 +11792,10 @@ def workflow_generation_digest(contents: str) -> str | None:
 
     The digest is taken over the text the loader produced. `load_text` decodes
     with Python's universal newlines, so it is the digest of the LF-normalized
-    file; both admitted generations are LF-only, which makes it equal to the
-    digest of their committed bytes. Every other frozen-text contract in this
-    file compares that same normalized text, so this binding is exactly as
-    strong as they are.
+    file; admitted CI-job and local-action generations are LF-only, which makes
+    it equal to the digest of their committed bytes. Every other frozen-text
+    contract in this file compares that same normalized text, so this binding is
+    exactly as strong as they are.
     """
 
     if not contents:
@@ -11860,47 +11803,215 @@ def workflow_generation_digest(contents: str) -> str | None:
     return hashlib.sha256(contents.encode("utf-8")).hexdigest()
 
 
-def fips_build_generation_transition(
+# ---------------------------------------------------------------------------
+# Admitted CI job SHA-256 generation transitions (CI optimization tranche)
+# ---------------------------------------------------------------------------
+# `ci.yml` is a protected workflow: the ARM64 job is digest-frozen, and every
+# other job the pull-request scan reads as Cross-sensitive is compared by its
+# whole-job SHA-256 (`job:<name>:<digest>`). The CI optimization PRs rewrite
+# Cross-sensitive jobs without changing the protected ARM64 invocation. Rather
+# than relaxing that scan, the trusted policy admits exact retired→adopted
+# job-text pairs. Each generation is named by the SHA-256 of `extract_job_block`
+# text (LF-normalized UTF-8, trailing whitespace stripped then one newline),
+# the same digest the surface comparison already uses. Nothing about the
+# admission comes from the pull request — not the digest, not a job name, not
+# an allowlist — so a proposal reaches a pair only by being, byte for byte, the
+# destination revision this trusted policy already names.
+#
+# Properties, each fail-closed:
+#
+#   * The binding is exact on BOTH sides and on the job name. Any other pair —
+#     a one-byte drift on either side, an absent job, a different job, a
+#     partially applied rewrite — is scanned exactly as before.
+#   * It is one-way. Once the trusted base carries an adopted generation, a
+#     proposal that returns that job to the matching retired text is refused
+#     explicitly. Withholding is symmetric, so the digest comparison alone
+#     would accept a revert; the explicit check is load-bearing.
+#   * It withholds ONE job's `job:<name>:*` surfaces for ONE revision pair.
+#     Every other job, action, automation script, protected job contract,
+#     digest name space, required-check binding, and live-gate relevance
+#     contract is evaluated exactly as before.
+#   * A move from one admitted destination to another, or any pair that is
+#     not an exact named retired→adopted match, is unrelated and is scanned
+#     as an ordinary rewrite. The candidate supplies no allowlist.
+#
+# `fuzz-smoke` is not in this table: it already has its own whole-text
+# generation list (`CI_FUZZ_SMOKE_JOB_GENERATIONS`). Overlapping destinations
+# that do not share a retired text — #3913 vs #3915 `ci-plan`/`test`, and the
+# remaining #3913 `test-pkcs11-softhsm` rewrite after #3889 already landed a
+# different PKCS job on `main` — are omitted because chaining them here would
+# invent a merged text that does not exist. Those need a follow-up predecessor
+# once the first destination is the trusted base.
+#
+# RETIREMENT: once each destination is on `main`, delete that tuple. See
+# `docs/ci_cd.md` → "Admitted CI job SHA-256 generation transitions".
+CI_JOB_GENERATION_TRANSITIONS: tuple[tuple[str, str, str], ...] = (
+    # `ci-plan` on the trusted base → PR #3913 (issue #3903) head
+    # 6c781fdfad703fd8a256167e639905473119190c.
+    (
+        "ci-plan",
+        "b3d95b6f0324f9a9ef842516907d7f5ff58d6d4a13f4a2d8afa5d659d6ab8336",
+        "c818a55308d27fe47692af3f22c8fdbd495755cf471760114ec2e6e4cb849c08",
+    ),
+    # `test` aggregate on the trusted base → PR #3913.
+    (
+        "test",
+        "e70ecf0924d88b6d86591608b471b70faad270ece6067c65b94eb5509ae1a03f",
+        "6bc548059b5b5efffbeb403ccfafebff8124c99af49a00c14aaa9af7e948e59d",
+    ),
+    # `performance-regression` on the trusted base → PR #3911 (issue #3906) head
+    # 5d342d8549ed3190a161a90ea53dc28ab80be5c7.
+    (
+        "performance-regression",
+        "74673023dee4c0970a8b8d3c9a99089be2f28eddf57ddb7337febdf22bd5a7e4",
+        "e7d9a4c0ea26a14efd92844998a42219ca2fb1379072776a313de6dd9b720986",
+    ),
+)
+
+# Local composite actions are compared by whole-file digest once Cross-sensitive.
+# `setup-rust-ci/action.yml` on current `main` (PR #3889's landed file) may
+# move to exactly one combined destination: PR #3911 after merging latest
+# `main`, preserving every #3889 cache-safety change plus #3911's optional
+# `workspaces` input/pass-through. Exact, path-bound, one-way, fail-closed.
+# The candidate cannot supply a digest. The Helm Chart setup-kubernetes-tools
+# generation lives in `verify_trusted_local_action.py`, not here: that gate is
+# byte-identity of the extracted checker, not a Cross surface comparison.
+LOCAL_ACTION_GENERATION_TRANSITIONS: tuple[tuple[str, str, str], ...] = (
+    (
+        "setup-rust-ci/action.yml",
+        "fc4e41818dffdea880c057c8dfa0881a629cd01c917b43f69a9f2e5e9bd90dda",
+        "57a99a179ddc2935af187f518a803bf167eb9e33593c37b7b29f7151ec994da2",
+    ),
+)
+
+
+def named_digest_generation_transition(
     name: str,
     merge_base_contents: str,
     proposed_contents: str,
-    *,
-    transition: tuple[str, str, str] = FIPS_BUILD_ADMITTED_GENERATION_TRANSITION,
+    transitions: tuple[tuple[str, str, str], ...],
 ) -> str:
-    """Classify one workflow's revision pair against the admitted transition.
+    """Classify one named text pair against trusted SHA-256 generation tuples.
 
-    Returns `"adoption"` for exactly the admitted retired-to-adopted move,
-    `"rollback"` for exactly its reverse, and `"unrelated"` for everything
-    else — which is every other file name, every other content on either side,
-    and every pair where either side is absent.
-
-    `transition` is a keyword parameter so the self-test can drive the
-    production comparison with fixtures it is able to construct; the two
-    admitted generations are complete workflow files and cannot be embedded
-    here. Production always uses the module binding, and no repository input,
-    argument, or environment variable reaches this parameter.
+    Returns `"adoption"` when the pair matches any tuple's retired→adopted move
+    for this name, `"rollback"` when it matches any tuple's reverse, and
+    `"unrelated"` otherwise. Adoption wins if both somehow matched; that would
+    require `retired == adopted`, which the self-test forbids. `transitions` is
+    a parameter so the self-test can drive fixtures; production always passes
+    the module binding, and no repository input reaches this parameter.
     """
 
-    filename, retired, adopted = transition
-    if name != filename:
-        return "unrelated"
     baseline_digest = workflow_generation_digest(merge_base_contents)
     proposed_digest = workflow_generation_digest(proposed_contents)
-    if baseline_digest == retired and proposed_digest == adopted:
+    adoption = False
+    rollback = False
+    for path, retired, adopted in transitions:
+        if path != name:
+            continue
+        if baseline_digest == retired and proposed_digest == adopted:
+            adoption = True
+        if baseline_digest == adopted and proposed_digest == retired:
+            rollback = True
+    if adoption:
         return "adoption"
-    if baseline_digest == adopted and proposed_digest == retired:
+    if rollback:
         return "rollback"
     return "unrelated"
+
+
+def ci_job_generation_transition_errors(
+    merge_base_contents: str,
+    proposed_contents: str,
+    source: str,
+    *,
+    transitions: tuple[tuple[str, str, str], ...] = CI_JOB_GENERATION_TRANSITIONS,
+) -> list[str]:
+    """Refuse an exact revert of an admitted CI job generation."""
+
+    errors: list[str] = []
+    seen: set[str] = set()
+    for job_name, _, _ in transitions:
+        if job_name in seen:
+            continue
+        seen.add(job_name)
+        baseline, baseline_failures = extract_job_block(
+            merge_base_contents,
+            f"merge-base {source}",
+            job_name,
+            required=False,
+        )
+        proposed, proposed_failures = extract_job_block(
+            proposed_contents,
+            f"proposed {source}",
+            job_name,
+            required=False,
+        )
+        errors.extend(baseline_failures)
+        errors.extend(proposed_failures)
+        if baseline_failures or proposed_failures:
+            continue
+        if (
+            named_digest_generation_transition(
+                job_name,
+                baseline or "",
+                proposed or "",
+                transitions,
+            )
+            == "rollback"
+        ):
+            errors.append(
+                f"proposed {source} job {job_name!r} cannot return to a retired "
+                "generation after the trusted base adopts an admitted one"
+            )
+    return list(dict.fromkeys(errors))
+
+
+def admitted_ci_job_generation_names(
+    merge_base_contents: str,
+    proposed_contents: str,
+    source: str,
+    *,
+    transitions: tuple[tuple[str, str, str], ...] = CI_JOB_GENERATION_TRANSITIONS,
+) -> frozenset[str]:
+    """Return job names whose revision pair is an admitted SHA-256 adoption."""
+
+    names: set[str] = set()
+    seen: set[str] = set()
+    for job_name, _, _ in transitions:
+        if job_name in seen:
+            continue
+        seen.add(job_name)
+        baseline, baseline_failures = extract_job_block(
+            merge_base_contents,
+            f"merge-base {source}",
+            job_name,
+            required=False,
+        )
+        proposed, proposed_failures = extract_job_block(
+            proposed_contents,
+            f"proposed {source}",
+            job_name,
+            required=False,
+        )
+        if baseline_failures or proposed_failures:
+            continue
+        if (
+            named_digest_generation_transition(
+                job_name,
+                baseline or "",
+                proposed or "",
+                transitions,
+            )
+            == "adoption"
+        ):
+            names.add(job_name)
+    return frozenset(names)
 
 
 def scan_pr_workflow_collection_cross_surfaces(
     merge_base_workflows: dict[str, str],
     proposed_workflows: dict[str, str],
     source: str,
-    *,
-    admitted_generation_transition: tuple[str, str, str] = (
-        FIPS_BUILD_ADMITTED_GENERATION_TRANSITION
-    ),
 ) -> list[str]:
     """Permit safe workflow edits while rejecting new or changed Cross inputs.
 
@@ -11945,22 +12056,6 @@ def scan_pr_workflow_collection_cross_surfaces(
                         "fuzz lane after the trusted base adopts it"
                     )
             continue
-        # The one admitted `fips-build.yml` generation transition. Both ends are
-        # complete file texts named by this trusted policy, so the only revision
-        # pair that reaches `"adoption"` is the exact one it names; the reverse
-        # pair is refused outright, and everything else is scanned as before.
-        generation_transition = fips_build_generation_transition(
-            name,
-            baseline_contents,
-            proposed_contents,
-            transition=admitted_generation_transition,
-        )
-        if generation_transition == "rollback":
-            errors.append(
-                f"proposed {source}/{name} cannot return to the retired FIPS "
-                "workflow generation after the trusted base adopts the "
-                "admitted one"
-            )
         baseline_surfaces, baseline_failures = generic_workflow_cross_surfaces(
             baseline_contents,
             f"merge-base {source}/{name}",
@@ -11988,13 +12083,7 @@ def scan_pr_workflow_collection_cross_surfaces(
         errors.extend(baseline_failures)
         errors.extend(proposed_failures)
         if not baseline_failures and not proposed_failures:
-            # The admitted generation transition withholds this one verdict, for
-            # this one file, for this one revision pair. Both failure lists above
-            # are already reported unconditionally.
-            if (
-                baseline_surfaces != proposed_surfaces
-                and generation_transition != "adoption"
-            ):
+            if baseline_surfaces != proposed_surfaces:
                 errors.append(
                     f"{source}/{name} cannot add or change Cross executable/"
                     "configuration surfaces"
@@ -12564,20 +12653,40 @@ def compare_pr_action_collection(
     merge_base_actions: dict[str, str],
     proposed_actions: dict[str, str],
     source: str,
+    *,
+    action_generation_transitions: tuple[tuple[str, str, str], ...] = (
+        LOCAL_ACTION_GENERATION_TRANSITIONS
+    ),
 ) -> list[str]:
     """Permit benign local-action edits while freezing Cross-sensitive files."""
 
     errors: list[str] = []
     for name in sorted(set(merge_base_actions) | set(proposed_actions)):
+        baseline_contents = merge_base_actions.get(name, "")
+        proposed_file = proposed_actions.get(name, "")
+        generation_transition = named_digest_generation_transition(
+            name,
+            baseline_contents,
+            proposed_file,
+            action_generation_transitions,
+        )
+        if generation_transition == "rollback":
+            errors.append(
+                f"{source}/{name} cannot return to a retired local-action "
+                "generation after the trusted base adopts an admitted one"
+            )
         baseline_surfaces = automation_file_cross_surfaces(
             name,
-            merge_base_actions.get(name, ""),
+            baseline_contents,
         )
         proposed_surfaces = automation_file_cross_surfaces(
             name,
-            proposed_actions.get(name, ""),
+            proposed_file,
         )
-        if baseline_surfaces != proposed_surfaces:
+        if (
+            baseline_surfaces != proposed_surfaces
+            and generation_transition != "adoption"
+        ):
             errors.append(
                 f"{source}/{name} cannot add or change Cross executable/"
                 "configuration surfaces"
@@ -16269,6 +16378,10 @@ def compare_pr_workflow_job(
     proposed_contents: str,
     source: str,
     job_name: str,
+    *,
+    job_generation_transitions: tuple[tuple[str, str, str], ...] = (
+        CI_JOB_GENERATION_TRANSITIONS
+    ),
 ) -> list[str]:
     """Hold a protected workflow to the trusted contract across a pull request.
 
@@ -16286,12 +16399,14 @@ def compare_pr_workflow_job(
     Equality with the trusted base already prevents a pull request from moving
     any of the three.
 
-    Two admissions are withheld from the surface comparison, both symmetrically
-    and both tied to a contract that has already validated exactly: the anchored
-    `fuzz-smoke` wiring in `ci.yml`, and the one admitted release image-family
-    adoption, whose frozen text is projected back to the shape it came from by
-    `release_family_transition_surface_contents`. Neither withholds a whole job's
-    comparison, and neither is reachable without the complete frozen contract.
+    Three admissions are withheld from the surface comparison, each tied to a
+    contract that has already validated exactly: the anchored `fuzz-smoke`
+    wiring in `ci.yml`; the one admitted release image-family adoption, whose
+    frozen text is projected back to the shape it came from by
+    `release_family_transition_surface_contents`; and the SHA-256 job-generation
+    pairs in `CI_JOB_GENERATION_TRANSITIONS`, which withhold one whole-job
+    digest surface for one named retired→adopted pair. None is reachable
+    without the complete frozen contract the trusted base already names.
     """
 
     baseline, failures = extract_job_block(
@@ -16444,6 +16559,28 @@ def compare_pr_workflow_job(
             proposed_surfaces,
             admitted_ci_job_names(proposed_contents, f"proposed {source}"),
         )
+    errors.extend(
+        ci_job_generation_transition_errors(
+            merge_base_contents,
+            proposed_contents,
+            source,
+            transitions=job_generation_transitions,
+        )
+    )
+    generation_jobs = admitted_ci_job_generation_names(
+        merge_base_contents,
+        proposed_contents,
+        source,
+        transitions=job_generation_transitions,
+    )
+    baseline_surfaces = without_admitted_job_surfaces(
+        baseline_surfaces,
+        generation_jobs,
+    )
+    proposed_surfaces = without_admitted_job_surfaces(
+        proposed_surfaces,
+        generation_jobs,
+    )
     if not baseline_surface_failures and not proposed_surface_failures:
         if baseline_surfaces != proposed_surfaces:
             errors.append(
@@ -17830,291 +17967,296 @@ pre_build = []
     ):
         failures.append("adding benign pinned remote actions was rejected")
 
-    # --- The one admitted `fips-build.yml` generation transition (#3888) ----
-    # The production binding names two complete workflow files that cannot be
-    # embedded here, so the fixtures below are two synthetic generations and the
-    # admitted pair is supplied through the same keyword production uses. The
-    # two digests are the ONLY thing that differs from production: every rule
-    # under test is the production rule, reached through the production
-    # comparison. The adopted fixture carries a literal Cross execution so the
-    # two generations are guaranteed to disagree on their Cross surface, which
-    # is what makes every "was not admitted" assertion below meaningful.
-    fips_name = FIPS_BUILD_WORKFLOW_FILENAME
-    fips_retired_generation = safe_extra_workflow.replace(
-        "name: Coverage\n",
-        "name: FIPS fixture\n",
+    # After #3889 landed, ordinary `fips-build.yml` edits are compared by the
+    # normal fail-closed Cross surface scan. There is no remaining FIPS
+    # generation bypass.
+    fips_retired_scan = scan_pr_workflow_collection_cross_surfaces(
+        {"fips-build.yml": safe_extra_workflow},
+        {"fips-build.yml": added_cross_workflow},
+        "self-test workflow directory",
     )
-    fips_adopted_generation = fips_retired_generation.replace(
-        "      - run: echo safe\n",
-        "      - run: cross build --target aarch64-unknown-linux-gnu\n",
-    )
-    fips_fixture_transition = (
-        fips_name,
-        hashlib.sha256(fips_retired_generation.encode("utf-8")).hexdigest(),
-        hashlib.sha256(fips_adopted_generation.encode("utf-8")).hexdigest(),
-    )
-    fips_rollback_refusal = (
-        f"proposed self-test workflow directory/{fips_name} "
-        "cannot return to the retired FIPS workflow generation after the "
-        "trusted base adopts the admitted one"
-    )
-
-    def fips_surface_conflict(workflow_name: str) -> str:
-        return (
-            f"self-test workflow directory/{workflow_name} cannot add or "
-            "change Cross executable/configuration surfaces"
-        )
-
-    def fips_scan(
-        baseline: dict[str, str],
-        proposed: dict[str, str],
-        *,
-        transition: tuple[str, str, str] | None = fips_fixture_transition,
-    ) -> list[str]:
-        """Scan one fixture pair, optionally under the production binding."""
-
-        if transition is None:
-            return scan_pr_workflow_collection_cross_surfaces(
-                baseline,
-                proposed,
-                "self-test workflow directory",
-            )
-        return scan_pr_workflow_collection_cross_surfaces(
-            baseline,
-            proposed,
-            "self-test workflow directory",
-            admitted_generation_transition=transition,
-        )
-
-    if fips_surface_conflict(fips_name) in fips_scan(
-        {fips_name: fips_retired_generation},
-        {fips_name: fips_adopted_generation},
-    ):
-        failures.append("the admitted FIPS workflow generation transition was rejected")
-    # The same file name and the same two revisions, under the production
-    # binding: the admission is the two exact generations, not the path.
-    if fips_surface_conflict(fips_name) not in fips_scan(
-        {fips_name: fips_retired_generation},
-        {fips_name: fips_adopted_generation},
-        transition=None,
+    if (
+        "self-test workflow directory/fips-build.yml cannot add or change "
+        "Cross executable/configuration surfaces"
+        not in fips_retired_scan
     ):
         failures.append(
-            "the FIPS workflow admission is bound to a file name rather than to "
-            "the two exact generations it names"
+            "ordinary fips-build.yml Cross surface edits were not compared "
+            "after the FIPS generation admission was retired"
         )
 
-    fips_rejected_transitions = {
-        "a wrong predecessor": (
-            fips_retired_generation.replace("echo safe", "echo other-predecessor"),
-            fips_adopted_generation,
-        ),
-        "a wrong destination": (
-            fips_retired_generation,
-            fips_adopted_generation.replace(
-                "aarch64-unknown-linux-gnu\n",
-                "aarch64-unknown-linux-gnu\n      - run: echo extra\n",
-            ),
-        ),
-        "a one-byte predecessor drift": (
-            fips_retired_generation + "\n",
-            fips_adopted_generation,
-        ),
-        "a one-byte destination drift": (
-            fips_retired_generation,
-            fips_adopted_generation + "\n",
-        ),
-        "the destination added outright": ("", fips_adopted_generation),
-        "deletion of the adopted generation": (fips_adopted_generation, ""),
-        "further drift after adoption": (
-            fips_adopted_generation,
-            fips_adopted_generation.replace(
-                "cross build --target aarch64-unknown-linux-gnu",
-                "echo drifted",
-            ),
-        ),
-        "the reverse transition": (
-            fips_adopted_generation,
-            fips_retired_generation,
-        ),
-    }
-    for label, (fips_baseline, fips_proposed) in fips_rejected_transitions.items():
-        if fips_surface_conflict(fips_name) not in fips_scan(
-            {fips_name: fips_baseline} if fips_baseline else {},
-            {fips_name: fips_proposed} if fips_proposed else {},
-        ):
-            failures.append(f"the FIPS generation admission accepted {label}")
-
-    if fips_surface_conflict(fips_name) in fips_scan(
-        {fips_name: fips_adopted_generation},
-        {fips_name: fips_adopted_generation},
-    ):
-        failures.append("an unchanged adopted FIPS workflow generation was rejected")
-
-    if fips_rollback_refusal not in fips_scan(
-        {fips_name: fips_adopted_generation},
-        {fips_name: fips_retired_generation},
-    ):
+    if workflow_generation_digest("") is not None:
+        failures.append("an absent workflow revision was given a generation digest")
+    digest_fixture = "name: Digest fixture\n"
+    if workflow_generation_digest(digest_fixture) != hashlib.sha256(
+        digest_fixture.encode("utf-8")
+    ).hexdigest():
         failures.append(
-            "returning the FIPS workflow to the retired generation was not "
-            "refused as a one-way transition"
+            "the workflow generation digest is not the SHA-256 of the revision"
         )
-    fips_non_rollbacks = {
-        "the admitted adoption": (
-            fips_retired_generation,
-            fips_adopted_generation,
-        ),
-        "an unchanged adopted generation": (
-            fips_adopted_generation,
-            fips_adopted_generation,
-        ),
-        "an unchanged retired generation": (
-            fips_retired_generation,
-            fips_retired_generation,
-        ),
-    }
-    for label, (fips_baseline, fips_proposed) in fips_non_rollbacks.items():
-        if fips_rollback_refusal in fips_scan(
-            {fips_name: fips_baseline},
-            {fips_name: fips_proposed},
-        ):
-            failures.append(f"{label} was reported as a one-way FIPS rollback")
 
-    for other_name in ("coverage.yml", "fips-build.yaml", "fips-build-2.yml"):
-        if fips_surface_conflict(other_name) not in fips_scan(
-            {other_name: fips_retired_generation},
-            {other_name: fips_adopted_generation},
-        ):
-            failures.append(
-                f"the FIPS generation admission was applied to {other_name!r}"
-            )
-
-    fips_simultaneous = fips_scan(
-        {
-            fips_name: fips_retired_generation,
-            "coverage.yml": safe_extra_workflow,
-        },
-        {
-            fips_name: fips_adopted_generation,
-            "coverage.yml": added_cross_workflow,
-        },
+    job_gen_prologue = (
+        "name: CI\n"
+        "on:\n"
+        "  pull_request:\n"
+        "jobs:\n"
+        "  frozen:\n"
+        "    runs-on: ubuntu-latest\n"
+        "    steps:\n"
+        "      - run: echo frozen\n"
     )
-    if fips_surface_conflict("coverage.yml") not in fips_simultaneous:
-        failures.append(
-            "a Cross surface added alongside the admitted FIPS generation "
-            "transition was not rejected"
-        )
-    if fips_surface_conflict(fips_name) in fips_simultaneous:
-        failures.append(
-            "the admitted FIPS generation transition was rejected because an "
-            "unrelated workflow changed in the same proposal"
-        )
-
-    fips_generation_pairs = {
-        "absent predecessor": ("", fips_adopted_generation, "unrelated"),
-        "absent proposal": (fips_retired_generation, "", "unrelated"),
-        "both absent": ("", "", "unrelated"),
-        "unchanged retired": (
-            fips_retired_generation,
-            fips_retired_generation,
-            "unrelated",
+    job_gen_retired_extra = (
+        "  extra:\n"
+        "    runs-on: ubuntu-latest\n"
+        "    steps:\n"
+        "      - run: cross build --target aarch64-unknown-linux-gnu\n"
+        "        # retired-generation\n"
+    )
+    job_gen_adopted_extra = (
+        "  extra:\n"
+        "    runs-on: ubuntu-latest\n"
+        "    steps:\n"
+        "      - run: cross build --target aarch64-unknown-linux-gnu\n"
+        "        # adopted-generation\n"
+    )
+    job_gen_other_extra = (
+        "  extra:\n"
+        "    runs-on: ubuntu-latest\n"
+        "    steps:\n"
+        "      - run: cross build --target aarch64-unknown-linux-gnu\n"
+        "        # other-generation\n"
+    )
+    job_gen_retired = job_gen_prologue + job_gen_retired_extra
+    job_gen_adopted = job_gen_prologue + job_gen_adopted_extra
+    job_gen_other = job_gen_prologue + job_gen_other_extra
+    job_gen_retired_block, job_gen_retired_failures = extract_job_block(
+        job_gen_retired, "self-test CI job generation", "extra", required=True
+    )
+    job_gen_adopted_block, job_gen_adopted_failures = extract_job_block(
+        job_gen_adopted, "self-test CI job generation", "extra", required=True
+    )
+    job_gen_other_block, job_gen_other_failures = extract_job_block(
+        job_gen_other, "self-test CI job generation", "extra", required=True
+    )
+    if job_gen_retired_failures or job_gen_adopted_failures or job_gen_other_failures:
+        failures.append("the CI job generation fixture could not be extracted")
+    job_gen_retired_digest = workflow_generation_digest(job_gen_retired_block or "")
+    job_gen_adopted_digest = workflow_generation_digest(job_gen_adopted_block or "")
+    job_gen_other_digest = workflow_generation_digest(job_gen_other_block or "")
+    if (
+        job_gen_retired_digest is None
+        or job_gen_adopted_digest is None
+        or job_gen_other_digest is None
+        or len({job_gen_retired_digest, job_gen_adopted_digest, job_gen_other_digest})
+        != 3
+    ):
+        failures.append("the CI job generation fixture digests are not distinct")
+    job_gen_fixture_transitions = (
+        ("extra", job_gen_retired_digest or "", job_gen_adopted_digest or ""),
+        ("extra", job_gen_retired_digest or "", job_gen_other_digest or ""),
+    )
+    job_generation_pairs = {
+        "exact first adoption": (
+            job_gen_retired_block or "",
+            job_gen_adopted_block or "",
+            "adoption",
         ),
-        "unchanged adopted": (
-            fips_adopted_generation,
-            fips_adopted_generation,
-            "unrelated",
-        ),
-        "one-byte predecessor drift": (
-            fips_retired_generation + "\n",
-            fips_adopted_generation,
-            "unrelated",
-        ),
-        "one-byte destination drift": (
-            fips_retired_generation,
-            fips_adopted_generation + "\n",
-            "unrelated",
-        ),
-        "exact adoption": (
-            fips_retired_generation,
-            fips_adopted_generation,
+        "exact second adoption": (
+            job_gen_retired_block or "",
+            job_gen_other_block or "",
             "adoption",
         ),
         "exact rollback": (
-            fips_adopted_generation,
-            fips_retired_generation,
+            job_gen_adopted_block or "",
+            job_gen_retired_block or "",
             "rollback",
         ),
+        "destination to destination": (
+            job_gen_adopted_block or "",
+            job_gen_other_block or "",
+            "unrelated",
+        ),
+        "absent proposed": (job_gen_retired_block or "", "", "unrelated"),
     }
-    for label, (fips_baseline, fips_proposed, expected) in (
-        fips_generation_pairs.items()
-    ):
-        verdict = fips_build_generation_transition(
-            fips_name,
-            fips_baseline,
-            fips_proposed,
-            transition=fips_fixture_transition,
+    for label, (job_baseline, job_proposed, expected) in job_generation_pairs.items():
+        verdict = named_digest_generation_transition(
+            "extra",
+            job_baseline,
+            job_proposed,
+            job_gen_fixture_transitions,
         )
         if verdict != expected:
             failures.append(
-                f"the FIPS generation pair {label!r} classified as {verdict!r} "
-                f"rather than {expected!r}"
+                f"the CI job generation pair {label!r} classified as "
+                f"{verdict!r} rather than {expected!r}"
             )
-    for other_name in ("coverage.yml", "fips-build.yaml", "ci.yml", ""):
+    if (
+        named_digest_generation_transition(
+            "ci-plan",
+            job_gen_retired_block or "",
+            job_gen_adopted_block or "",
+            job_gen_fixture_transitions,
+        )
+        != "unrelated"
+    ):
+        failures.append("the CI job generation admission is not bound to its job name")
+    job_gen_source = "self-test CI job generation"
+    if compare_pr_workflow_job(
+        job_gen_retired,
+        job_gen_adopted,
+        job_gen_source,
+        "frozen",
+        job_generation_transitions=job_gen_fixture_transitions,
+    ):
+        failures.append("an admitted CI job generation adoption was rejected")
+    if not compare_pr_workflow_job(
+        job_gen_retired,
+        job_gen_adopted,
+        job_gen_source,
+        "frozen",
+        job_generation_transitions=(),
+    ):
+        failures.append(
+            "a CI job rewrite was accepted without an admitted generation pair"
+        )
+    job_gen_rollback = compare_pr_workflow_job(
+        job_gen_adopted,
+        job_gen_retired,
+        job_gen_source,
+        "frozen",
+        job_generation_transitions=job_gen_fixture_transitions,
+    )
+    if not any("cannot return to a retired" in item for item in job_gen_rollback):
+        failures.append("an admitted CI job generation rollback was not refused")
+    if not compare_pr_workflow_job(
+        job_gen_adopted,
+        job_gen_other,
+        job_gen_source,
+        "frozen",
+        job_generation_transitions=job_gen_fixture_transitions,
+    ):
+        failures.append(
+            "a move between two admitted CI job destinations was treated as a "
+            "generation rather than scanned"
+        )
+
+    action_gen_retired = (
+        "name: Setup\n"
+        "runs:\n"
+        "  using: composite\n"
+        "  steps:\n"
+        "    - run: cross build --target aarch64-unknown-linux-gnu\n"
+        "      shell: bash\n"
+        "      # retired-generation\n"
+    )
+    action_gen_adopted = action_gen_retired.replace(
+        "retired-generation", "adopted-generation"
+    )
+    action_gen_other = action_gen_retired.replace(
+        "retired-generation", "other-generation"
+    )
+    action_gen_retired_digest = workflow_generation_digest(action_gen_retired)
+    action_gen_adopted_digest = workflow_generation_digest(action_gen_adopted)
+    action_gen_other_digest = workflow_generation_digest(action_gen_other)
+    action_gen_name = "setup-rust-ci/action.yml"
+    action_gen_fixture_transitions = (
+        (
+            action_gen_name,
+            action_gen_retired_digest or "",
+            action_gen_adopted_digest or "",
+        ),
+        (
+            action_gen_name,
+            action_gen_retired_digest or "",
+            action_gen_other_digest or "",
+        ),
+    )
+    if compare_pr_action_collection(
+        {action_gen_name: action_gen_retired},
+        {action_gen_name: action_gen_adopted},
+        "self-test local-action directory",
+        action_generation_transitions=action_gen_fixture_transitions,
+    ):
+        failures.append("an admitted local-action generation adoption was rejected")
+    if not compare_pr_action_collection(
+        {action_gen_name: action_gen_retired},
+        {action_gen_name: action_gen_adopted},
+        "self-test local-action directory",
+        action_generation_transitions=(),
+    ):
+        failures.append(
+            "a local-action rewrite was accepted without an admitted generation pair"
+        )
+    action_gen_rollback = compare_pr_action_collection(
+        {action_gen_name: action_gen_adopted},
+        {action_gen_name: action_gen_retired},
+        "self-test local-action directory",
+        action_generation_transitions=action_gen_fixture_transitions,
+    )
+    if not any("cannot return to a retired" in item for item in action_gen_rollback):
+        failures.append(
+            "an admitted local-action generation rollback was not refused"
+        )
+    if (
+        named_digest_generation_transition(
+            "setup/action.yml",
+            action_gen_retired,
+            action_gen_adopted,
+            action_gen_fixture_transitions,
+        )
+        != "unrelated"
+    ):
+        failures.append(
+            "the local-action generation admission is not bound to its path"
+        )
+
+    seen_job_generation_tuples: set[tuple[str, str, str]] = set()
+    for job_name, retired, adopted in CI_JOB_GENERATION_TRANSITIONS:
+        if (job_name, retired, adopted) in seen_job_generation_tuples:
+            failures.append(
+                f"duplicate CI job generation tuple for {job_name!r}"
+            )
+        seen_job_generation_tuples.add((job_name, retired, adopted))
+        if job_name in {CI_FUZZ_SMOKE_JOB_NAME, "build-arm64-cross"}:
+            failures.append(
+                f"CI job generation {job_name!r} collides with a whole-text freeze"
+            )
+        if retired == adopted:
+            failures.append(f"CI job generation {job_name!r} is not a move")
         if (
-            fips_build_generation_transition(
-                other_name,
-                fips_retired_generation,
-                fips_adopted_generation,
-                transition=fips_fixture_transition,
-            )
-            != "unrelated"
+            WORKFLOW_GENERATION_DIGEST.fullmatch(retired) is None
+            or WORKFLOW_GENERATION_DIGEST.fullmatch(adopted) is None
         ):
             failures.append(
-                "the FIPS generation admission is not bound to its path "
-                f"({other_name!r})"
+                f"CI job generation {job_name!r} does not pin SHA-256 digests"
             )
-
-    for label, digest in (
-        ("retired", FIPS_BUILD_RETIRED_GENERATION_SHA256),
-        ("adopted", FIPS_BUILD_ADOPTED_GENERATION_SHA256),
-    ):
-        if WORKFLOW_GENERATION_DIGEST.fullmatch(digest) is None:
+    seen_action_generation_tuples: set[tuple[str, str, str]] = set()
+    for action_name, retired, adopted in LOCAL_ACTION_GENERATION_TRANSITIONS:
+        if (action_name, retired, adopted) in seen_action_generation_tuples:
             failures.append(
-                f"the {label} FIPS workflow generation is not named by a "
-                "lowercase SHA-256 digest"
+                f"duplicate local-action generation tuple for {action_name!r}"
             )
-    if FIPS_BUILD_RETIRED_GENERATION_SHA256 == FIPS_BUILD_ADOPTED_GENERATION_SHA256:
-        failures.append(
-            "the admitted FIPS workflow generations must be two distinct revisions"
-        )
-    if FIPS_BUILD_ADMITTED_GENERATION_TRANSITION != (
-        FIPS_BUILD_WORKFLOW_FILENAME,
-        FIPS_BUILD_RETIRED_GENERATION_SHA256,
-        FIPS_BUILD_ADOPTED_GENERATION_SHA256,
+        seen_action_generation_tuples.add((action_name, retired, adopted))
+        if retired == adopted:
+            failures.append(f"local-action generation {action_name!r} is not a move")
+        if (
+            WORKFLOW_GENERATION_DIGEST.fullmatch(retired) is None
+            or WORKFLOW_GENERATION_DIGEST.fullmatch(adopted) is None
+        ):
+            failures.append(
+                f"local-action generation {action_name!r} does not pin SHA-256 "
+                "digests"
+            )
+    if LOCAL_ACTION_GENERATION_TRANSITIONS != (
+        (
+            "setup-rust-ci/action.yml",
+            "fc4e41818dffdea880c057c8dfa0881a629cd01c917b43f69a9f2e5e9bd90dda",
+            "57a99a179ddc2935af187f518a803bf167eb9e33593c37b7b29f7151ec994da2",
+        ),
     ):
         failures.append(
-            "the admitted FIPS workflow generation transition does not name the "
-            "pinned path and digests"
-        )
-    # A file the comparison loop never reaches — a protected workflow, or the
-    # frozen fuzz lane, which is decided before the generation transition is
-    # consulted — could not be admitted, so naming one would be a silent no-op.
-    if (
-        FIPS_BUILD_WORKFLOW_FILENAME in PROTECTED_WORKFLOW_FILENAMES
-        or FIPS_BUILD_WORKFLOW_FILENAME == FUZZ_WORKFLOW_FILENAME
-        or WORKFLOW_FILENAME.fullmatch(FIPS_BUILD_WORKFLOW_FILENAME) is None
-    ):
-        failures.append(
-            "the admitted FIPS workflow generation transition names a workflow "
-            "the pull-request comparison never reaches"
-        )
-    if workflow_generation_digest("") is not None:
-        failures.append("an absent workflow revision was given a generation digest")
-    if (
-        workflow_generation_digest(fips_adopted_generation)
-        != fips_fixture_transition[2]
-    ):
-        failures.append(
-            "the workflow generation digest is not the SHA-256 of the revision"
+            "the setup-rust-ci generation table does not pin the current-main "
+            "retired digest and the combined #3911 destination"
         )
 
     remote_action_composite = (
