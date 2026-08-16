@@ -510,17 +510,19 @@ phases.
 - Secret backend tests compile once with Vault/AWS/GCP/Azure enabled and use
   nextest `--no-fail-fast`. The planner schedules this job (`run_secrets_backends`)
   only when secret-provider sources, `tests/secrets_functional/`, secret-resolution
-  startup wiring (`src/main.rs`, `src/config/env_config.rs`), nextest config, or
-  shared compile-graph/controller inputs change; plugin-only and admin-only PRs
-  skip it before runner allocation. Manual `workflow_dispatch` runs, pushes to
+  startup wiring (`src/main.rs`, `src/config/env_config.rs`), the feature-gated
+  TLS secret-source resolver, nextest config, or shared compile-graph/controller
+  inputs change; plugin-only and admin-only PRs skip it before runner allocation.
+  Manual `workflow_dispatch` runs, pushes to
   `main`, and fail-closed planner cases still run it. Service integration
   likewise runs Consul, LDAP, Kafka, MySQL, OIDC, and OAuth2 introspection in
   one independently reported invocation.
 - PKCS#11 SoftHSM smoke (`run_pkcs11`) compiles the `pkcs11` feature graph and
   runs the token signer plus certificate-pairing tests against SoftHSM. The
   planner schedules it for `src/tls/pkcs11.rs`, the TLS load/backend/source/reload
-  paths those tests call, `tests/unit/tls` PKCS modules, and the same shared
-  compile-graph inputs; sibling ACME/FIPS TLS unit files do not schedule it.
+  paths those tests call, the feature-gated config and TLS inventory surfaces,
+  `tests/unit/tls` PKCS modules, and the same shared compile-graph inputs;
+  sibling ACME/FIPS TLS unit files do not schedule it.
 - Integration tests split across two shards (`admin-platform`,
   `mesh-protocols`). Each shard runs the prebuilt `integration_tests` nextest
   archive with a visible list of `integration::<file_module>` positional

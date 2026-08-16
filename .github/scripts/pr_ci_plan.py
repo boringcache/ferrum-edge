@@ -681,15 +681,16 @@ SHARED_FEATURE_JOB_PATTERNS = (
 # Secret Backends compiles `--features secrets-vault,secrets-aws,secrets-gcp,
 # secrets-azure --test secrets_functional` (then default-features
 # `cross_backend`). Observable surfaces are the provider module, that test
-# target, nextest's serial override for it, Cargo feature/optional-dep wiring,
-# and the startup path that calls `secrets::resolve_all_env_secrets()` before
-# `EnvConfig` parse. `src/startup.rs` is listener-failure bookkeeping and is
-# not on that path.
+# target, the TLS secret-source feature branches, nextest's serial override for
+# it, Cargo feature/optional-dep wiring, and the startup path that calls
+# `secrets::resolve_all_env_secrets()` before `EnvConfig` parse. `src/startup.rs`
+# is listener-failure bookkeeping and is not on that path.
 SECRETS_BACKENDS_PATTERNS = [
     re.compile(pattern)
     for pattern in (
         *SHARED_FEATURE_JOB_PATTERNS,
         r"^src/secrets/",
+        r"^src/tls/source/mod\.rs$",
         r"^tests/secrets_functional/",
         r"^src/main\.rs$",
         r"^src/config/env_config\.rs$",
@@ -699,18 +700,20 @@ SECRETS_BACKENDS_PATTERNS = [
 
 # PKCS#11 SoftHSM compiles `--features pkcs11 --lib tls::pkcs11::tests` and
 # `--test unit_tests tls::pkcs11`. Observable surfaces are the feature-gated
-# module, TLS load/backend/source/reload paths those tests call, the
-# `tests/unit/tls` PKCS modules plus their `mod.rs` wiring, and Cargo
-# `pkcs11`/`cryptoki` feature wiring. Sibling TLS unit files (ACME, FIPS) do
-# not change what this job runs.
+# module, the feature-gated config/inventory code, TLS load/backend/source/reload
+# paths those tests call, the `tests/unit/tls` PKCS modules plus their `mod.rs`
+# wiring, and Cargo `pkcs11`/`cryptoki` feature wiring. Sibling TLS unit files
+# (ACME, FIPS) do not change what this job runs.
 PKCS11_PATTERNS = [
     re.compile(pattern)
     for pattern in (
         *SHARED_FEATURE_JOB_PATTERNS,
+        r"^src/config/types\.rs$",
         r"^src/tls/pkcs11\.rs$",
         r"^src/tls/mod\.rs$",
         r"^src/tls/backend\.rs$",
         r"^src/tls/frontend_reload\.rs$",
+        r"^src/tls/inventory\.rs$",
         r"^src/tls/source/",
         r"^tests/unit/tls/(?:mod\.rs|pkcs11)",
     )
@@ -1189,6 +1192,11 @@ def self_test() -> int:
         ),
         (
             "pull_request",
+            ["src/tls/source/mod.rs"],
+            {"run_secrets_backends": True, "run_pkcs11": True},
+        ),
+        (
+            "pull_request",
             ["src/tls/pkcs11.rs"],
             {"run_pkcs11": True, "run_secrets_backends": False},
         ),
@@ -1209,7 +1217,12 @@ def self_test() -> int:
         ),
         (
             "pull_request",
-            ["src/tls/source/mod.rs"],
+            ["src/config/types.rs"],
+            {"run_pkcs11": True, "run_secrets_backends": False},
+        ),
+        (
+            "pull_request",
+            ["src/tls/inventory.rs"],
             {"run_pkcs11": True, "run_secrets_backends": False},
         ),
         (
