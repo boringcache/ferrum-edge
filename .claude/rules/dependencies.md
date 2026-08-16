@@ -61,7 +61,9 @@ Full policy: `docs/dependency-policy.md`. These are the load-bearing rules.
   disabled; `CI_FUZZ_SMOKE_JOB` keeps the deterministic property smoke as the
   required pull-request gate, moves the budget to `merge_group` / push to `main`
   / `workflow_dispatch`, and admits `./.github/actions/setup-sccache` plus a
-  `main`-push-only `save-if` cache. The transition is exact on both ends and
+  `main`-push-only `save-if` cache (`pull_request`, fork, `merge_group`, and
+  `workflow_dispatch` restore but never publish a `fuzz-smoke` cache). The
+  transition is exact on both ends and
   one-way — withholding is symmetric, so `admitted_fuzz_smoke_removal_errors` is
   what refuses a revert. `CI_FUZZ_SMOKE_BOUNDED_BUDGET` must appear exactly once
   in every generation, so a generation can never move the lane and relax its
