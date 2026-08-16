@@ -31,6 +31,12 @@ ADMIN_SHARDS = frozenset({ADMIN_API_SHARD, ADMIN_CONFIG_SHARD})
 MESH_SHARDS = frozenset({MESH_ROUTING_SHARD, MESH_PLATFORM_SHARD})
 ALL_INTEGRATION_SHARDS = frozenset(CANONICAL_SHARD_ORDER[1:])
 ALL_SHARDS = frozenset(CANONICAL_SHARD_ORDER)
+# Serving modes that start admin + proxy (and optionally DB/CP), but are not mesh.
+ADMIN_AND_PROTOCOL_SHARDS = frozenset({*ADMIN_SHARDS, PROTOCOLS_SHARD})
+# TLS datapath is exercised by mesh and protocol shards, not the admin API suite.
+MESH_AND_PROTOCOL_SHARDS = frozenset({*MESH_SHARDS, PROTOCOLS_SHARD})
+# K8s translation feeds admin mesh-config tests and both mesh shard families.
+CONFIG_SOURCES_SHARDS = frozenset({ADMIN_CONFIG_SHARD, *MESH_SHARDS})
 
 VALID_MODES = frozenset({"skip", "plugin", "shards", "full"})
 SHARD_NAME_RE = re.compile(r"^[a-z][a-z0-9-]*$")
@@ -63,32 +69,34 @@ BUILD_GRAPH_PATTERNS = [
 ]
 
 # Prefixes are matched longest-first. Unknown coverage-relevant paths fail closed
-# to the full shard matrix instead of guessing.
+# to the full shard matrix instead of guessing. Isolated admin, mesh-only, and
+# protocol-only trees stay narrow when shard modules support that isolation.
+# Shared runtime trees select every integration family their modules feed.
 CLASSIFIABLE_PREFIXES: tuple[tuple[str, frozenset[str]], ...] = (
     ("src/modes/mesh/", MESH_SHARDS),
-    ("src/config_sources/", frozenset({ADMIN_CONFIG_SHARD, MESH_PLATFORM_SHARD})),
+    ("src/config_sources/", CONFIG_SOURCES_SHARDS),
     ("src/k8s_controller/", frozenset({MESH_PLATFORM_SHARD})),
     ("src/admin/", ADMIN_SHARDS),
-    ("src/config/", frozenset({ADMIN_CONFIG_SHARD})),
+    ("src/config/", ALL_INTEGRATION_SHARDS),
     ("src/http3/", frozenset({PROTOCOLS_SHARD})),
-    ("src/identity/", frozenset({PROTOCOLS_SHARD})),
-    ("src/proxy/", frozenset({PROTOCOLS_SHARD, MESH_ROUTING_SHARD})),
+    ("src/identity/", ALL_INTEGRATION_SHARDS),
+    ("src/proxy/", ALL_INTEGRATION_SHARDS),
     ("src/dtls/", frozenset({PROTOCOLS_SHARD})),
-    ("src/grpc/", frozenset({PROTOCOLS_SHARD, *MESH_SHARDS})),
-    ("src/pool/", frozenset({PROTOCOLS_SHARD})),
-    ("src/tls/", frozenset({PROTOCOLS_SHARD})),
-    ("src/dns/", frozenset({PROTOCOLS_SHARD})),
-    ("src/xds/", frozenset({MESH_ROUTING_SHARD})),
+    ("src/grpc/", ALL_INTEGRATION_SHARDS),
+    ("src/pool/", ALL_INTEGRATION_SHARDS),
+    ("src/tls/", MESH_AND_PROTOCOL_SHARDS),
+    ("src/dns/", ALL_INTEGRATION_SHARDS),
+    ("src/xds/", ALL_INTEGRATION_SHARDS),
 )
 
 CLASSIFIABLE_FILES: dict[str, frozenset[str]] = {
     "src/bin/ferrum-cni.rs": frozenset({MESH_PLATFORM_SHARD}),
-    "src/config_delta.rs": frozenset({ADMIN_CONFIG_SHARD}),
-    "src/connection_pool.rs": frozenset({PROTOCOLS_SHARD}),
-    "src/modes/control_plane.rs": frozenset({PROTOCOLS_SHARD}),
-    "src/modes/data_plane.rs": frozenset({PROTOCOLS_SHARD}),
-    "src/modes/database.rs": frozenset({PROTOCOLS_SHARD}),
-    "src/modes/file.rs": frozenset({PROTOCOLS_SHARD}),
+    "src/config_delta.rs": ALL_INTEGRATION_SHARDS,
+    "src/connection_pool.rs": ALL_INTEGRATION_SHARDS,
+    "src/modes/control_plane.rs": ALL_INTEGRATION_SHARDS,
+    "src/modes/data_plane.rs": ADMIN_AND_PROTOCOL_SHARDS,
+    "src/modes/database.rs": ADMIN_AND_PROTOCOL_SHARDS,
+    "src/modes/file.rs": ADMIN_AND_PROTOCOL_SHARDS,
     "src/modes/injector.rs": frozenset({MESH_PLATFORM_SHARD}),
     "src/modes/node_agent.rs": frozenset({MESH_PLATFORM_SHARD}),
     "src/modes/node_agent_cni_server.rs": frozenset({MESH_PLATFORM_SHARD}),
@@ -479,20 +487,73 @@ def self_test() -> int:
     all_shards = CANONICAL_SHARD_ORDER
     lib_unit = (LIB_UNIT_SHARD,)
     admin = ordered_shards({LIB_UNIT_SHARD, *ADMIN_SHARDS})
-    admin_config = ordered_shards({LIB_UNIT_SHARD, ADMIN_CONFIG_SHARD})
     mesh = ordered_shards({LIB_UNIT_SHARD, *MESH_SHARDS})
     protocol = ordered_shards({LIB_UNIT_SHARD, PROTOCOLS_SHARD})
-    proxy = ordered_shards({LIB_UNIT_SHARD, PROTOCOLS_SHARD, MESH_ROUTING_SHARD})
+    admin_and_protocol = ordered_shards({LIB_UNIT_SHARD, *ADMIN_AND_PROTOCOL_SHARDS})
+    mesh_and_protocol = ordered_shards({LIB_UNIT_SHARD, *MESH_AND_PROTOCOL_SHARDS})
+    config_sources = ordered_shards({LIB_UNIT_SHARD, *CONFIG_SOURCES_SHARDS})
+    mesh_platform = ordered_shards({LIB_UNIT_SHARD, MESH_PLATFORM_SHARD})
+
+    # Exact ownership lock for every classifiable shared/isolated representative.
+    # Equality prevents a later edit from silently narrowing (or widening) a mapping.
+    ownership_lock: tuple[tuple[str, frozenset[str]], ...] = (
+        ("src/admin/mod.rs", ADMIN_SHARDS),
+        ("src/admin/api_specs/handlers.rs", ADMIN_SHARDS),
+        ("src/config/env_config.rs", ALL_INTEGRATION_SHARDS),
+        ("src/config/types.rs", ALL_INTEGRATION_SHARDS),
+        ("src/config/db_loader.rs", ALL_INTEGRATION_SHARDS),
+        ("src/config/file_loader.rs", ALL_INTEGRATION_SHARDS),
+        ("src/config_delta.rs", ALL_INTEGRATION_SHARDS),
+        ("src/config_sources/k8s/core.rs", CONFIG_SOURCES_SHARDS),
+        ("src/identity/mod.rs", ALL_INTEGRATION_SHARDS),
+        ("src/identity/spiffe/mod.rs", ALL_INTEGRATION_SHARDS),
+        ("src/tls/mod.rs", MESH_AND_PROTOCOL_SHARDS),
+        ("src/tls_offload.rs", frozenset({PROTOCOLS_SHARD})),
+        ("src/dns/mod.rs", ALL_INTEGRATION_SHARDS),
+        ("src/grpc/cp_server.rs", ALL_INTEGRATION_SHARDS),
+        ("src/grpc/mesh_server.rs", ALL_INTEGRATION_SHARDS),
+        ("src/pool/mod.rs", ALL_INTEGRATION_SHARDS),
+        ("src/connection_pool.rs", ALL_INTEGRATION_SHARDS),
+        ("src/proxy/mod.rs", ALL_INTEGRATION_SHARDS),
+        ("src/http3/server.rs", frozenset({PROTOCOLS_SHARD})),
+        ("src/dtls/mod.rs", frozenset({PROTOCOLS_SHARD})),
+        ("src/xds/mod.rs", ALL_INTEGRATION_SHARDS),
+        ("src/modes/mesh/config.rs", MESH_SHARDS),
+        ("src/modes/control_plane.rs", ALL_INTEGRATION_SHARDS),
+        ("src/modes/data_plane.rs", ADMIN_AND_PROTOCOL_SHARDS),
+        ("src/modes/database.rs", ADMIN_AND_PROTOCOL_SHARDS),
+        ("src/modes/file.rs", ADMIN_AND_PROTOCOL_SHARDS),
+        ("src/modes/injector.rs", frozenset({MESH_PLATFORM_SHARD})),
+        ("src/modes/node_agent.rs", frozenset({MESH_PLATFORM_SHARD})),
+        ("src/modes/node_agent_cni_server.rs", frozenset({MESH_PLATFORM_SHARD})),
+        ("src/k8s_controller/status.rs", frozenset({MESH_PLATFORM_SHARD})),
+        ("src/bin/ferrum-cni.rs", frozenset({MESH_PLATFORM_SHARD})),
+    )
 
     cases: list[tuple[str, list[str], str, tuple[str, ...], bool | None]] = [
         ("pull_request", ["src/admin/mod.rs"], "shards", admin, False),
         ("pull_request", ["src/admin/api_specs/handlers.rs"], "shards", admin, False),
-        ("pull_request", ["src/config/env_config.rs"], "shards", admin_config, False),
-        ("pull_request", ["src/config_delta.rs"], "shards", admin_config, False),
+        ("pull_request", ["src/config/env_config.rs"], "full", all_shards, False),
+        ("pull_request", ["src/config/types.rs"], "full", all_shards, False),
+        ("pull_request", ["src/config_delta.rs"], "full", all_shards, False),
+        ("pull_request", ["src/config_sources/k8s/core.rs"], "shards", config_sources, False),
+        ("pull_request", ["src/identity/mod.rs"], "full", all_shards, False),
+        ("pull_request", ["src/tls/mod.rs"], "shards", mesh_and_protocol, False),
+        ("pull_request", ["src/dns/mod.rs"], "full", all_shards, False),
+        ("pull_request", ["src/grpc/cp_server.rs"], "full", all_shards, False),
+        ("pull_request", ["src/pool/mod.rs"], "full", all_shards, False),
+        ("pull_request", ["src/connection_pool.rs"], "full", all_shards, False),
+        ("pull_request", ["src/proxy/mod.rs"], "full", all_shards, False),
+        ("pull_request", ["src/xds/mod.rs"], "full", all_shards, False),
+        ("pull_request", ["src/modes/control_plane.rs"], "full", all_shards, False),
+        ("pull_request", ["src/modes/data_plane.rs"], "shards", admin_and_protocol, False),
+        ("pull_request", ["src/modes/database.rs"], "shards", admin_and_protocol, False),
+        ("pull_request", ["src/modes/file.rs"], "shards", admin_and_protocol, False),
         ("pull_request", ["src/modes/mesh/config.rs"], "shards", mesh, False),
-        ("pull_request", ["src/k8s_controller/status.rs"], "shards", ordered_shards({LIB_UNIT_SHARD, MESH_PLATFORM_SHARD}), False),
+        ("pull_request", ["src/k8s_controller/status.rs"], "shards", mesh_platform, False),
         ("pull_request", ["src/http3/server.rs"], "shards", protocol, False),
-        ("pull_request", ["src/proxy/mod.rs"], "shards", proxy, False),
+        ("pull_request", ["src/dtls/mod.rs"], "shards", protocol, False),
+        ("pull_request", ["src/tls_offload.rs"], "shards", protocol, False),
         ("pull_request", ["src/plugins/cors.rs"], "plugin", lib_unit, True),
         ("pull_request", ["src/plugin_cache.rs"], "plugin", lib_unit, True),
         ("pull_request", ["tests/unit/plugins/cors_tests.rs"], "plugin", lib_unit, True),
@@ -501,6 +562,13 @@ def self_test() -> int:
             ["src/plugins/cors.rs", "src/admin/mod.rs"],
             "shards",
             admin,
+            True,
+        ),
+        (
+            "pull_request",
+            ["src/plugins/cors.rs", "src/proxy/http.rs"],
+            "full",
+            all_shards,
             True,
         ),
         (
@@ -549,7 +617,8 @@ def self_test() -> int:
         ("pull_request", ["README.md"], "skip", (), False),
         ("pull_request", [], "full", all_shards, False),
         ("merge_group", ["src/admin/mod.rs"], "shards", admin, False),
-        ("merge_group", ["src/config/mod.rs"], "shards", admin_config, False),
+        ("merge_group", ["src/config/mod.rs"], "full", all_shards, False),
+        ("merge_group", ["src/proxy/mod.rs"], "full", all_shards, False),
         ("merge_group", ["src/modes/mesh/mod.rs"], "shards", mesh, False),
         ("merge_group", ["src/http3/mod.rs"], "shards", protocol, False),
         ("merge_group", ["src/plugins/cors.rs"], "plugin", lib_unit, True),
@@ -586,6 +655,50 @@ def self_test() -> int:
         if failure:
             failures.append(failure)
 
+    for path, expected in ownership_lock:
+        classified = classify_path_shards(path)
+        if classified != expected:
+            failures.append(
+                f"{path}: ownership lock expected {sorted(expected)}, "
+                f"classified {sorted(classified or [])}"
+            )
+            continue
+        plan = select_plan("pull_request", [path])
+        if LIB_UNIT_SHARD not in plan.shards:
+            failures.append(f"{path}: non-skip ownership plan omitted lib-unit")
+        if set(plan.shards) - {LIB_UNIT_SHARD} != set(expected):
+            failures.append(
+                f"{path}: plan shards {plan.shards} drifted from ownership lock"
+            )
+        expected_mode = "full" if expected == ALL_INTEGRATION_SHARDS else "shards"
+        if plan.mode != expected_mode:
+            failures.append(
+                f"{path}: expected mode {expected_mode}, selected {plan.mode}"
+            )
+
+    locked_prefixes: set[str] = set()
+    locked_files: set[str] = set()
+    for path, _expected in ownership_lock:
+        if path in CLASSIFIABLE_FILES:
+            locked_files.add(path)
+            continue
+        for prefix, _shards in CLASSIFIABLE_PREFIXES:
+            if path == prefix.rstrip("/") or path.startswith(prefix):
+                locked_prefixes.add(prefix)
+                break
+        else:
+            failures.append(f"{path}: ownership lock path is not classifiable")
+    for prefix, _shards in CLASSIFIABLE_PREFIXES:
+        if prefix not in locked_prefixes:
+            failures.append(
+                f"classifiable prefix {prefix} has no ownership-lock representative"
+            )
+    for path in CLASSIFIABLE_FILES:
+        if path not in locked_files:
+            failures.append(
+                f"classifiable file {path} has no ownership-lock representative"
+            )
+
     admin_plan = select_plan("pull_request", ["src/admin/mod.rs"])
     if PROTOCOLS_SHARD in admin_plan.shards or MESH_ROUTING_SHARD in admin_plan.shards:
         failures.append("admin diffs must not select protocol or mesh-routing shards")
@@ -593,10 +706,75 @@ def self_test() -> int:
         failures.append("admin diffs must select both admin-bearing integration shards")
 
     config_plan = select_plan("pull_request", ["src/config/env_config.rs"])
-    if ADMIN_API_SHARD in config_plan.shards or PROTOCOLS_SHARD in config_plan.shards:
-        failures.append("config diffs must not select admin-api or protocol shards")
-    if any(shard in config_plan.shards for shard in MESH_SHARDS):
-        failures.append("config diffs must not select mesh shards")
+    if config_plan.mode != "full" or config_plan.shards != all_shards:
+        failures.append("config diffs must select the full shard matrix")
+    if ADMIN_API_SHARD not in config_plan.shards or ADMIN_CONFIG_SHARD not in config_plan.shards:
+        failures.append("config diffs must keep both admin-bearing integration shards")
+    if not MESH_SHARDS.issubset(config_plan.shards):
+        failures.append("config diffs must keep both mesh shards")
+    if PROTOCOLS_SHARD not in config_plan.shards:
+        failures.append("config diffs must keep the protocol shard")
+
+    identity_plan = select_plan("pull_request", ["src/identity/mod.rs"])
+    if identity_plan.mode != "full" or identity_plan.shards != all_shards:
+        failures.append("identity diffs must select the full shard matrix")
+
+    tls_plan = select_plan("pull_request", ["src/tls/mod.rs"])
+    if not MESH_SHARDS.issubset(tls_plan.shards) or PROTOCOLS_SHARD not in tls_plan.shards:
+        failures.append("tls diffs must select mesh and protocol shards")
+    if any(shard in tls_plan.shards for shard in ADMIN_SHARDS):
+        failures.append("tls diffs must not select admin shards")
+
+    dns_plan = select_plan("pull_request", ["src/dns/mod.rs"])
+    if dns_plan.mode != "full" or dns_plan.shards != all_shards:
+        failures.append("dns diffs must select the full shard matrix")
+
+    grpc_plan = select_plan("pull_request", ["src/grpc/cp_server.rs"])
+    if grpc_plan.mode != "full" or grpc_plan.shards != all_shards:
+        failures.append("grpc diffs must select the full shard matrix")
+
+    pool_plan = select_plan("pull_request", ["src/pool/mod.rs"])
+    if pool_plan.mode != "full" or pool_plan.shards != all_shards:
+        failures.append("pool diffs must select the full shard matrix")
+
+    connection_pool_plan = select_plan("pull_request", ["src/connection_pool.rs"])
+    if connection_pool_plan.mode != "full" or connection_pool_plan.shards != all_shards:
+        failures.append("connection_pool diffs must select the full shard matrix")
+
+    proxy_plan = select_plan("pull_request", ["src/proxy/mod.rs"])
+    if proxy_plan.mode != "full" or proxy_plan.shards != all_shards:
+        failures.append("proxy diffs must select the full shard matrix")
+
+    xds_plan = select_plan("pull_request", ["src/xds/mod.rs"])
+    if xds_plan.mode != "full" or xds_plan.shards != all_shards:
+        failures.append("xds diffs must select the full shard matrix")
+
+    control_plane_plan = select_plan("pull_request", ["src/modes/control_plane.rs"])
+    if control_plane_plan.mode != "full" or control_plane_plan.shards != all_shards:
+        failures.append("control_plane diffs must select the full shard matrix")
+
+    for mode_path in (
+        "src/modes/data_plane.rs",
+        "src/modes/database.rs",
+        "src/modes/file.rs",
+    ):
+        serving_plan = select_plan("pull_request", [mode_path])
+        if set(serving_plan.shards) != set(admin_and_protocol):
+            failures.append(
+                f"{mode_path} diffs must select admin and protocol shards"
+            )
+        if any(shard in serving_plan.shards for shard in MESH_SHARDS):
+            failures.append(f"{mode_path} diffs must not select mesh shards")
+
+    config_sources_plan = select_plan(
+        "pull_request", ["src/config_sources/k8s/core.rs"]
+    )
+    if ADMIN_CONFIG_SHARD not in config_sources_plan.shards:
+        failures.append("config_sources diffs must keep the admin-config shard")
+    if not MESH_SHARDS.issubset(config_sources_plan.shards):
+        failures.append("config_sources diffs must keep both mesh shards")
+    if ADMIN_API_SHARD in config_sources_plan.shards or PROTOCOLS_SHARD in config_sources_plan.shards:
+        failures.append("config_sources diffs must not select admin-api or protocol shards")
 
     mesh_plan = select_plan("pull_request", ["src/modes/mesh/config.rs"])
     if any(shard in mesh_plan.shards for shard in ADMIN_SHARDS):
@@ -615,6 +793,10 @@ def self_test() -> int:
     mixed = select_plan("pull_request", ["src/plugins/cors.rs", "src/proxy/http.rs"])
     if mixed.mode == "plugin":
         failures.append("mixed plugin and core diffs must not stay in plugin mode")
+    if mixed.mode != "full" or mixed.shards != all_shards:
+        failures.append("mixed plugin and proxy diffs must select the full shard matrix")
+    if not mixed.plugin_gate:
+        failures.append("mixed plugin and core diffs must keep the plugin gate")
     if LIB_UNIT_SHARD not in mixed.shards:
         failures.append("mixed plugin and core diffs must still run lib-unit")
 

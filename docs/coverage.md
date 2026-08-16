@@ -116,10 +116,17 @@ PR coverage is mode-aware:
   gate when plugin files are in the diff.
 - Pull requests that touch classifiable core coverage-relevant files run an
   explicit shard-scoped plan: `lib-unit` plus only the integration shards that
-  own the changed tree. `src/admin/**` selects the admin-bearing shards,
-  `src/config/**` selects the config shard, `src/modes/mesh/**` selects the mesh
-  shards, and protocol trees such as `src/http3/**` select the protocol
-  data-plane shard. The required `Merge Coverage` check verifies that every
+  own the changed tree. Isolated trees stay narrow: `src/admin/**` selects the
+  admin-bearing shards, `src/modes/mesh/**` selects the mesh shards, and
+  protocol trees such as `src/http3/**` select the protocol data-plane shard.
+  Shared runtime trees select every integration family they feed rather than an
+  optimistic single shard: `src/config/**`, `src/config_delta.rs`,
+  `src/proxy/**`, `src/dns/**`, `src/grpc/**`, `src/identity/**`, `src/pool/**`,
+  `src/connection_pool.rs`, `src/xds/**`, and `src/modes/control_plane.rs`
+  select the full matrix. `src/tls/**` selects mesh plus protocol shards;
+  file, database, and data-plane mode files select admin plus protocol shards;
+  `src/config_sources/**` selects admin-config plus both mesh shards. The
+  required `Merge Coverage` check verifies that every
   planned shard succeeded, that exactly those shard artifacts are present, and
   that reports are still published. Partial shard reports do not enforce the
   overall or `src/plugins/` floors because those floors are only meaningful on
