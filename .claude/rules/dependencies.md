@@ -55,6 +55,19 @@ Full policy: `docs/dependency-policy.md`. These are the load-bearing rules.
   still compared byte for byte, and the wiring cannot be removed once adopted. A
   committed `.cargo/config[.toml]` below the repository root is rejected
   outright.
+- The `fuzz-smoke` job carries TWO admitted generations for issue #3902
+  (`CI_FUZZ_SMOKE_JOB_GENERATIONS`, oldest first): `CI_FUZZ_SMOKE_RETIRED_JOB`
+  ran the six-target libFuzzer budget on every pull request with caching
+  disabled; `CI_FUZZ_SMOKE_JOB` keeps the deterministic property smoke as the
+  required pull-request gate, moves the budget to `merge_group` / push to `main`
+  / `workflow_dispatch`, and admits `./.github/actions/setup-sccache` plus a
+  `main`-push-only `save-if` cache. The transition is exact on both ends and
+  one-way — withholding is symmetric, so `admitted_fuzz_smoke_removal_errors` is
+  what refuses a revert. `CI_FUZZ_SMOKE_BOUNDED_BUDGET` must appear exactly once
+  in every generation, so a generation can never move the lane and relax its
+  bounds at the same time. Delete the retired generation once the adopted one is
+  on `main`. See `docs/ci_cd.md` → "Admitted `fuzz-smoke` lane-split
+  generation".
 - `release.yml` is admitted in exactly two shapes
   (`RELEASE_IMAGE_FAMILY_GENERATIONS`): the current two image families, or those
   plus the complete frozen `-ebpf-tools` contract (`docker-ebpf-tools-manifest`
