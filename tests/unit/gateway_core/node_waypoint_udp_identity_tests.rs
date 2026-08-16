@@ -42,6 +42,44 @@ fn binding(
     }
 }
 
+fn with_iface(mut record: HostUdpPodBinding, iface: &str) -> HostUdpPodBinding {
+    record.iface = iface.to_string();
+    record
+}
+
+fn assert_ifindex_refused_for_every_claimant(
+    index: &NodeWaypointUdpSourceIndex,
+    ifindex: u32,
+    source: &str,
+) {
+    assert_eq!(
+        index
+            .authorize(Some(ifindex), ip(source))
+            .expect_err("conflicting evidence for one ifindex must refuse every claimant"),
+        NodeWaypointUdpSourceRefusal::UnenrolledInterface
+    );
+}
+
+fn publish_both_orders_refuse_the_ifindex(
+    first: HostUdpPodBinding,
+    second: HostUdpPodBinding,
+    ifindex: u32,
+    sources: &[&str],
+) {
+    for records in [vec![first.clone(), second.clone()], vec![second, first]] {
+        let index = NodeWaypointUdpSourceIndex::new();
+        let published = index.publish(&records);
+        assert!(
+            published.ifaces.is_empty(),
+            "conflicting evidence must not survive publication in either order: {:?}",
+            published.ifaces
+        );
+        for source in sources {
+            assert_ifindex_refused_for_every_claimant(&index, ifindex, source);
+        }
+    }
+}
+
 fn target(uid: &str, sa: Option<&str>, ipv4: Option<&str>, ipv6: Option<&str>) -> PodCaptureTarget {
     PodCaptureTarget {
         pod_uid: uid.to_string(),
@@ -737,16 +775,97 @@ fn a_malformed_or_mismatched_binding_is_never_steered() {
 #[test]
 fn an_exactly_duplicated_binding_is_steered_once() {
     let index = NodeWaypointUdpSourceIndex::new();
-    let published = index.publish(&[
-        binding(UID_A, "ledger", 7, Some("10.244.1.7"), None),
-        binding(UID_A, "ledger", 7, Some("10.244.1.7"), None),
-    ]);
+    let record = binding(UID_A, "ledger", 7, Some("10.244.1.7"), None);
+    let published = index.publish(&[record.clone(), record]);
 
     assert_eq!(
         published.ifaces,
         vec!["veth7".to_string()],
         "a duplicate record is not a conflict, and must not duplicate a steering rule either"
     );
+    index
+        .authorize(Some(7), ip("10.244.1.7"))
+        .expect("an attribution-identical duplicate must remain attributable");
+}
+
+// Publication is the final attribution boundary. Two records for one ifindex
+// may collapse only when they are attribution-identical (`attribution_eq`:
+// UID, principal, ifindex, interface name, IPv4, IPv6). Conflicting evidence
+// refuses every claimant; insertion order is never a winner; a later third
+// record cannot re-add an already-contested ifindex.
+
+#[test]
+fn same_uid_and_principal_with_a_different_interface_name_refuses_every_claimant() {
+    publish_both_orders_refuse_the_ifindex(
+        binding(UID_A, "ledger", 7, Some("10.244.1.7"), None),
+        with_iface(
+            binding(UID_A, "ledger", 7, Some("10.244.1.7"), None),
+            "veth-other",
+        ),
+        7,
+        &["10.244.1.7"],
+    );
+}
+
+#[test]
+fn same_uid_and_principal_with_a_different_ipv4_source_refuses_every_claimant() {
+    publish_both_orders_refuse_the_ifindex(
+        binding(UID_A, "ledger", 7, Some("10.244.1.7"), None),
+        binding(UID_A, "ledger", 7, Some("10.244.1.9"), None),
+        7,
+        &["10.244.1.7", "10.244.1.9"],
+    );
+}
+
+#[test]
+fn same_uid_and_principal_with_a_different_ipv6_source_refuses_every_claimant() {
+    publish_both_orders_refuse_the_ifindex(
+        binding(UID_A, "ledger", 7, Some("10.244.1.7"), Some("fd00::7")),
+        binding(UID_A, "ledger", 7, Some("10.244.1.7"), Some("fd00::9")),
+        7,
+        &["10.244.1.7", "fd00::7", "fd00::9"],
+    );
+}
+
+#[test]
+fn a_later_third_record_cannot_re_add_a_contested_ifindex() {
+    let first = binding(UID_A, "ledger", 7, Some("10.244.1.7"), None);
+    let conflict = with_iface(first.clone(), "veth-other");
+    let sibling = binding(UID_B, "reports", 8, Some("10.244.1.8"), None);
+
+    for records in [
+        vec![
+            first.clone(),
+            conflict.clone(),
+            first.clone(),
+            sibling.clone(),
+        ],
+        vec![
+            conflict.clone(),
+            first.clone(),
+            first.clone(),
+            sibling.clone(),
+        ],
+        vec![
+            sibling.clone(),
+            first.clone(),
+            conflict.clone(),
+            first.clone(),
+        ],
+    ] {
+        let index = NodeWaypointUdpSourceIndex::new();
+        let published = index.publish(&records);
+        assert_eq!(
+            published.ifaces,
+            vec!["veth8".to_string()],
+            "a later identical record must not resurrect a contested ifindex: {:?}",
+            published.ifaces
+        );
+        assert_ifindex_refused_for_every_claimant(&index, 7, "10.244.1.7");
+        index
+            .authorize(Some(8), ip("10.244.1.8"))
+            .expect("an uncontested sibling ifindex must keep serving");
+    }
 }
 
 /// Over the interface bound the whole generation collapses to empty rather than

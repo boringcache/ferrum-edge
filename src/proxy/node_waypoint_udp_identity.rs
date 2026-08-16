@@ -316,13 +316,18 @@ impl NodeWaypointUdpSourceIndex {
     ///   scoped anyway, so admitting it would only produce an unscoped session.
     /// * A binding whose registry pod UID disagrees with the UID the attested
     ///   identity was issued for is dropped.
-    /// * An **ingress interface claimed by more than one binding refuses BOTH
-    ///   claimants.** The ingress interface is the whole source-evidence
-    ///   channel: two claimants mean the kernel fact no longer identifies one
-    ///   pod, so admitting either would run one pod's datagrams under the
-    ///   other's policy scope and attested principal. `plan_host_udp_bindings`
-    ///   normally rejects the conflict first, but a last-writer-wins insert here
-    ///   would silently pick a winner if it ever did not.
+    /// * An **ingress interface claimed by more than one binding refuses every
+    ///   claimant**, unless the records are attribution-identical
+    ///   ([`NodeWaypointUdpSourceBinding::attribution_eq`]: UID, principal,
+    ///   ifindex, interface name, IPv4, IPv6). The ingress interface is the
+    ///   whole source-evidence channel: conflicting evidence — including the
+    ///   same UID/principal with a different interface name or permitted source
+    ///   set — means the kernel fact no longer identifies one pod, so admitting
+    ///   either would run datagrams under an unvouched name or source set.
+    ///   Insertion order is never authoritative, and a later third record cannot
+    ///   re-add an already-contested ifindex. `plan_host_udp_bindings` normally
+    ///   rejects the conflict first, but a last-writer-wins insert here would
+    ///   silently pick a winner if it ever did not.
     /// * The published cardinality stays bounded by
     ///   [`crate::capture::MAX_HOST_UDP_CAPTURE_INTERFACES`]. An input that
     ///   exceeds it publishes an EMPTY generation (every datagram then refuses
@@ -356,31 +361,27 @@ impl NodeWaypointUdpSourceIndex {
             if contested_ifindexes.contains(&binding.ifindex) {
                 continue;
             }
+            let candidate = NodeWaypointUdpSourceBinding {
+                pod_uid,
+                pod_uid_text: binding.pod_uid.clone(),
+                principal: binding.identity.principal.clone(),
+                iface: binding.iface.clone(),
+                ifindex: binding.ifindex,
+                ipv4: binding.ipv4,
+                ipv6: binding.ipv6,
+                generation,
+            };
             if let Some(existing) = by_ifindex.get(&binding.ifindex) {
-                // Two attributable pods claim one ingress interface. Refuse BOTH
-                // — never keep the first-seen one, which would make attribution
-                // depend on registry read order.
-                if existing.pod_uid != pod_uid || existing.principal != binding.identity.principal {
+                // Conflicting evidence for one ingress ifindex refuses every
+                // claimant. Only an attribution-identical duplicate may
+                // collapse; insertion order is never a winner.
+                if !existing.attribution_eq(&candidate) {
                     by_ifindex.remove(&binding.ifindex);
                     contested_ifindexes.insert(binding.ifindex);
                 }
-                // An exactly-identical duplicate record is not a conflict; the
-                // already-inserted binding stands.
                 continue;
             }
-            by_ifindex.insert(
-                binding.ifindex,
-                Arc::new(NodeWaypointUdpSourceBinding {
-                    pod_uid,
-                    pod_uid_text: binding.pod_uid.clone(),
-                    principal: binding.identity.principal.clone(),
-                    iface: binding.iface.clone(),
-                    ifindex: binding.ifindex,
-                    ipv4: binding.ipv4,
-                    ipv6: binding.ipv6,
-                    generation,
-                }),
-            );
+            by_ifindex.insert(binding.ifindex, Arc::new(candidate));
         }
 
         if by_ifindex.len() > crate::capture::MAX_HOST_UDP_CAPTURE_INTERFACES {
