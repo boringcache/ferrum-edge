@@ -240,7 +240,9 @@ schema- and architecture-scoped local BuildKit cache (`type=local`) through pinn
 `production-dockerfile-smoke-{default,ebpf}-v1-${{ runner.os }}-${{ runner.arch }}-${{ github.sha }}`
 with matching `v1-${{ runner.os }}-${{ runner.arch }}-` restore prefixes. The `v1`
 component is the BuildKit cache schema; bump it only when the exported layout
-changes.
+changes. The Ambient production-image job uses a separate GHA-backend
+restore-only policy documented with that live suite, not this exact-generation
+local cache.
 
 `actions/cache/restore` v4 outputs are classified strictly: `cache-hit == 'true'`
 is an exact primary-key hit; `cache-hit == 'false'` is a restore-key partial
@@ -893,6 +895,26 @@ the datapath needs privileged host-netns manipulation that the live-kernel job
 already performs against the real kernel. The two jobs are complementary — the
 live job proves the datapath, the image job proves the shipped runtime can
 execute it — and the `Ambient Host UDP Live` gate requires both.
+
+**Cache-budget policy.** GitHub Actions gives each repository a 10 GB cache
+quota and evicts the least-recently used entries across every ref when that
+budget is exhausted. The Ambient production-image job previously published
+`type=gha,mode=max` BuildKit layers on every pull request under
+`scope=ambient-host-udp-images`. Those PR-scoped `buildkit-blob-*` entries
+cannot be restored by other PRs or by `ci-test`, but they still consume the
+shared quota, so ordinary Swatinem rust-cache entries disappear and Unit /
+PKCS#11 jobs compile cold. The image job still restores
+`cache-from: type=gha,scope=ambient-host-udp-images` on every event, including
+fork PRs, so a trusted default-branch cache remains useful. It publishes
+`cache-to` only when `github.ref == 'refs/heads/main'`, the event is neither
+`pull_request` nor `merge_group`, and the head is not a fork — today that is
+`workflow_dispatch` on `main`. The three required image targets
+(`capture-tools-base`, `runtime-ebpf-tools`, `runtime-ebpf`) and their
+executable/distroless contract checks always run; an empty `cache-to` does not
+skip a build. Existing cache entries are left for GitHub's LRU rather than
+deleted by this change. The Fuzz Smoke lane's separate main-only save is owned
+by PR #3918 and is not changed here. The NodeWaypoint/FIPS exact-generation
+local BuildKit design from PR #3889 is also unchanged.
 
 #### 6. Performance Regression Job
 
