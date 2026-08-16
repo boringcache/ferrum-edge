@@ -267,7 +267,11 @@ path is safe, none is sensitive, and every remaining path is on the explicit
 non-sensitive allowlist; a missing planner, a truncated listing, an empty
 listing, an unknown path, or an unsafe path (every C0 control including
 tab/newline, DEL, invalid UTF-8, absolute, traversal) fails closed toward
-running. Filenames in the plan summary are JSON-escaped then HTML-escaped
+running. In the FIPS workflow, the already mode/size/object-validated base blob
+is materialized over the checked-out planner and invoked through the literal
+`.github/scripts/ci_runtime_plan.py` path. The trusted Cross scanner can inspect
+that executable path statically; a variable-named temporary program is never
+executed. Filenames in the plan summary are JSON-escaped then HTML-escaped
 inside `<code>` so a hostile name cannot break Markdown.
 
 **FIPS.** `FIPS Feature Policy` stays a cheap always-on graph audit.

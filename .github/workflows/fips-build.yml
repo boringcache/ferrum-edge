@@ -192,8 +192,7 @@ jobs:
 
           filter_path=.github/scripts/ci_runtime_plan.py
           changed_files="$RUNNER_TEMP/fips-build-changed-files.txt"
-          trusted_filter="$RUNNER_TEMP/fips-build-trusted-filter.py"
-          rm -f -- "$changed_files" "$trusted_filter"
+          rm -f -- "$changed_files"
           : > "$changed_files"
 
           filter_args=(--suite fips-build --changed-files "$changed_files")
@@ -290,15 +289,30 @@ jobs:
             echo "::error::${filter_path} exceeds the 256 KiB trusted-filter ceiling" >&2
             exit 1
           fi
-          git cat-file blob "$entry_object" > "$trusted_filter"
+
+          # Keep the executed path literal and statically inspectable by the
+          # trusted Cross policy, while replacing its bytes with the already
+          # mode/size/object-validated trusted-base blob. A temporary path held
+          # in a shell variable is an intentionally opaque executable surface.
+          proposed_entry="$(git ls-tree --full-tree HEAD -- "$filter_path")"
+          if [[ "$proposed_entry" != "100644 blob "* && \
+                "$proposed_entry" != "100755 blob "* ]]; then
+            echo "::error::${filter_path} must be a regular blob in the proposed checkout" >&2
+            exit 1
+          fi
+          git cat-file blob "$entry_object" > "$filter_path"
+          if [ "$(git hash-object "$filter_path")" != "$entry_object" ]; then
+            echo "::error::failed to materialize the exact trusted planner blob" >&2
+            exit 1
+          fi
 
           if [ "$EVENT_NAME" = "pull_request" ] || [ "$EVENT_NAME" = "merge_group" ]; then
             git diff --name-only --no-renames -z "${trusted_sha}...HEAD" \
               > "$changed_files"
           fi
 
-          python3 -I "$trusted_filter" --self-test
-          plan="$(python3 -I "$trusted_filter" "${filter_args[@]}")"
+          python3 -I .github/scripts/ci_runtime_plan.py --self-test
+          plan="$(python3 -I .github/scripts/ci_runtime_plan.py "${filter_args[@]}")"
           relevant="$(printf '%s\n' "$plan" | sed -n 's/^relevant=//p')"
           case "$relevant" in
             true|false) ;;

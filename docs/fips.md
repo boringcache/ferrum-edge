@@ -80,6 +80,10 @@ the module certificate's tested-platform list (see §"The module boundary").
 always audits the resolved feature graph. `FIPS Build & Test` compiles the
 locked `fips` binary, every claimed feature combination, clippy `-D warnings`,
 and the policy, key-admission, and frontend/backend/CP-DP handshake tests.
+Its relevance job validates the trusted-base planner blob's mode, size, path,
+and object ID, materializes those bytes at the literal checked-out planner
+path, and invokes only that statically inspectable path. It never executes a
+variable-named temporary program.
 
 Compile artifacts use two cache layers plus one immutable run-artifact handoff
 through the local checksum-pinned `setup-sccache` action,

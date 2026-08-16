@@ -2052,12 +2052,27 @@ def check_fips(workflow: str, failures: list[str]) -> None:
         "FIPS handshake tests must not pass two Cargo TESTNAME filters to one invocation",
         failures,
     )
+    plan_job = extract_job(workflow, "fips-plan")
     require(
-        "python3 -I" in workflow and "ci_runtime_plan.py" in workflow,
-        "FIPS planner must execute an isolated trusted-base copy",
+        'git cat-file blob "$entry_object" > "$filter_path"' in plan_job
+        and 'git hash-object "$filter_path"' in plan_job
+        and 'python3 -I .github/scripts/ci_runtime_plan.py --self-test' in plan_job
+        and 'python3 -I .github/scripts/ci_runtime_plan.py "${filter_args[@]}"'
+        in plan_job
+        and "trusted_filter=" not in plan_job
+        and 'python3 -I "$trusted_filter"' not in plan_job,
+        "FIPS planner must materialize the validated trusted-base blob at the "
+        "literal repository path and execute only that statically inspectable path",
         failures,
     )
-    plan_job = extract_job(workflow, "fips-plan")
+    require(
+        'git ls-tree --full-tree HEAD -- "$filter_path"' in plan_job
+        and '"100644 blob "*' in plan_job
+        and '"100755 blob "*' in plan_job,
+        "FIPS planner must reject a non-regular proposed planner path before "
+        "materializing trusted bytes",
+        failures,
+    )
     check_nul_delimited_plan(plan_job, "FIPS planner", failures)
     require(
         "relevant=true" in workflow and "trusted base has not adopted" in workflow,
