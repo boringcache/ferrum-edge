@@ -238,14 +238,21 @@ jobs:
           paths_classifiable="$(printf '%s\n' "$plan" | sed -n 's/^paths_classifiable=//p')"
           echo "mode=$mode" >> "$GITHUB_OUTPUT"
 
-          # The first PR that introduces these outputs necessarily runs the
-          # older trusted base-branch planner. Missing/invalid gate values
-          # therefore fail closed to true; after merge, the trusted planner
-          # computes the narrow path gates for every subsequent PR.
+          # paths_classifiable is a trust/transport version handshake. This
+          # introducing PR and its merge group execute the trusted-base
+          # planner, which is newline-only and does not emit the flag. That
+          # older planner can treat a NUL stream as one record and still emit
+          # syntactically valid false values for pre-existing Helm/mesh/eBPF
+          # gates. Unless the flag is exactly true, force every job gate on
+          # before GITHUB_OUTPUT emission. Honor narrow true/false values only
+          # after the new planner proves the NUL stream classifiable.
+          # Missing/invalid individual outputs still fail closed to true.
           gate_fallbacks=()
           for gate in run_helm run_mesh_federation run_mesh_sidecar_smoke run_ebpf_live run_ebpf_build run_secrets_backends run_pkcs11; do
             value="$(printf '%s\n' "$plan" | sed -n "s/^${gate}=//p")"
-            if [ "$value" != "true" ] && [ "$value" != "false" ]; then
+            if [ "$paths_classifiable" != "true" ]; then
+              value=true
+            elif [ "$value" != "true" ] && [ "$value" != "false" ]; then
               value=true
               gate_fallbacks+=("$gate")
             fi
@@ -277,12 +284,17 @@ jobs:
             echo "| --- | --- |"
             for gate in run_helm run_mesh_federation run_mesh_sidecar_smoke run_ebpf_live run_ebpf_build run_secrets_backends run_pkcs11; do
               value="$(printf '%s\n' "$plan" | sed -n "s/^${gate}=//p")"
-              if [ "$value" != "true" ] && [ "$value" != "false" ]; then
+              if [ "$paths_classifiable" != "true" ]; then
+                value=true
+              elif [ "$value" != "true" ] && [ "$value" != "false" ]; then
                 value=true
               fi
               echo "| ${gate} | ${value} |"
             done
-            if [ "${#gate_fallbacks[@]}" -gt 0 ]; then
+            if [ "$paths_classifiable" != "true" ]; then
+              echo ""
+              echo "The planner did not prove a classifiable NUL stream; every job gate was scheduled fail-closed."
+            elif [ "${#gate_fallbacks[@]}" -gt 0 ]; then
               echo ""
               echo "The trusted base-branch planner predates one or more job gates; missing values were scheduled fail-closed."
             else

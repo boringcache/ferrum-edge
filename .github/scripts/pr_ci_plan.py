@@ -890,8 +890,12 @@ def plan_from_changed_bytes(
 ) -> tuple[str, str, dict[str, bool], bool]:
     """Select mode and gates from a raw NUL changed-file stream.
 
-    Unclassifiable input emits full mode, every job gate, and the canned
-    reason; it never returns parsed path strings to the caller.
+    Unclassifiable input emits full mode, every job gate, `paths_classifiable`
+    false, and the canned reason; it never returns parsed path strings to the
+    caller. The workflow controller treats `paths_classifiable` as a
+    trust/transport version handshake and force-runs every job gate unless the
+    flag is exactly true, so an older newline-only trusted-base planner cannot
+    honor syntactically valid false gates from a NUL stream.
     """
 
     changed_files, paths_classifiable = parse_nul_changed_files(data)
@@ -1410,6 +1414,8 @@ def main() -> int:
         args.event_name, data
     )
     print(f"mode={mode}")
+    # Workflow ci-plan treats this flag as a trust/transport version handshake:
+    # unless it is exactly "true", every job gate is forced on.
     print(f"paths_classifiable={str(paths_classifiable).lower()}")
     print(f"reason={reason}")
     for name, enabled in gates.items():

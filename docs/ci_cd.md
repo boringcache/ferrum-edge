@@ -250,6 +250,19 @@ edit cannot classify itself as light; edits to the planner therefore receive
 the full matrix. The required-CI verifier also checks that documentation paths
 used by live-suite filters remain in the planner's full-CI set.
 
+`paths_classifiable` is a trust/transport version handshake between `CI Plan`
+and the planner. Pull requests and merge groups execute the trusted-base
+planner, so the change that introduces NUL transport still runs the older
+newline-only planner that does not emit this flag. That older planner can treat
+a NUL-delimited stream as one record and still print syntactically valid
+`false` values for pre-existing Helm, mesh, and eBPF gates. Unless
+`paths_classifiable` is exactly `true`, the controller force-runs every job
+gate before writing `$GITHUB_OUTPUT`, even when those values look like valid
+booleans. Narrow `true`/`false` gate values are honored only after the new
+planner proves the NUL stream classifiable. Missing or invalid individual
+outputs still fail closed to `true`. Unclassifiable and pre-handshake summaries
+use the canned reason and never interpolate hostile paths.
+
 The same trusted planner emits fail-closed job outputs for Helm, the legacy
 multicluster deployment smoke, the sidecar deployment smoke, eBPF program
 builds, eBPF/netns live suites, Secret Backends (`run_secrets_backends`), and
@@ -260,7 +273,8 @@ force-run on every `main` push). PRs outside those curated path sets skip the
 downstream job before GitHub allocates a runner. Pushes to `main`, manual
 `workflow_dispatch` runs (the Secret Backends and PKCS#11 SoftHSM jobs use the
 same event guard as the other path-gated mesh/Helm/eBPF jobs), empty or
-unavailable diffs, unclassifiable/unsafe changed paths, and edits to
+unavailable diffs, unclassifiable/unsafe changed paths, a missing or non-`true`
+`paths_classifiable` handshake from an old trusted-base planner, and edits to
 the gate-controller scripts force all of these gates on. Shared compile-graph
 inputs (`Cargo.toml`/`Cargo.lock`, `vendor/`, `build.rs`, `proto/`,
 `rust-toolchain.toml`, `.cargo/`, `.github/workflows/ci.yml`, and the
