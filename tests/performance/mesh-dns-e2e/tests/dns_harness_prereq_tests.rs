@@ -85,7 +85,10 @@ fn selected_reports_fail_on_zero_success_or_errors() {
     let classes = [NameClass::UpstreamForward];
     let transports = [Transport::Tcp];
     assert!(selected_reports_failure(&[], &classes, &transports).is_some());
-    assert!(selected_reports_failure(&[sample_report(0, 12, 0)], &classes, &transports).is_some());
+    let zero_success =
+        selected_reports_failure(&[sample_report(0, 12, 0)], &classes, &transports)
+            .expect("zero successful queries must fail");
+    assert!(zero_success.contains("zero successful queries"));
     assert!(selected_reports_failure(&[sample_report(10, 1, 0)], &classes, &transports).is_some());
     assert!(selected_reports_failure(&[sample_report(10, 0, 1)], &classes, &transports).is_some());
     assert!(selected_reports_failure(&[sample_report(10, 0, 0)], &classes, &transports).is_none());
