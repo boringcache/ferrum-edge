@@ -413,13 +413,27 @@ pushes to `main`. The commands below are grouped by job, not run as one
 sequential shell script:
 
 ```bash
-# test-unit: inline lib first, then the unchanged four-test plugin-hardening
-# exact gate, then the kTLS live-kernel proof, then the complete external unit
-# suite in the same job.
+# test-unit: compile the inline and external targets together, then run the
+# inline lib, unchanged four-test plugin-hardening exact gate, kTLS live-kernel
+# proof, and complete external unit suite in the same job. The joint no-run
+# step prevents a runner-loss window between two full target compilations.
+cargo test --lib --test unit_tests --no-run
 cargo test --lib
 FERRUM_KTLS_LIVE_REQUIRED=1 cargo test --lib -- --ignored --test-threads=1 \
   proxy::ktls_live_kernel_tests
 cargo test --test unit_tests
+cargo test --features acme --lib --test unit_tests --no-run
+cargo test --features acme --lib tls::acme::client::tests
+cargo test --features acme --test unit_tests tls::acme_dns01_hook_tests
+cargo test --features acme --lib tls::acme_renewal_resume_tests
+
+# test-pkcs11-softhsm: compile both libtest binaries before either filtered
+# invocation, then exercise the signer and certificate-pairing contracts.
+cargo test --features pkcs11 --lib --test unit_tests --no-run
+cargo test --features pkcs11 --lib \
+  tls::pkcs11::tests::signer_loads_configured_token_and_signs -- --ignored
+cargo test --features pkcs11 --test unit_tests tls::pkcs11 \
+  -- --include-ignored --test-threads=1
 
 # test-integration-{admin-platform,mesh-protocols}
 cargo nextest run --archive-file integration-tests-*.tar.zst \
