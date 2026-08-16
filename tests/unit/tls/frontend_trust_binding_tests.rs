@@ -1152,7 +1152,8 @@ fn resumption_is_suppressed_only_for_a_scope_bound_mtls_listener() {
     )
     .expect("scope-bound mTLS candidate");
     assert_eq!(
-        bound.config.send_tls13_tickets, 0,
+        bound.config.send_tls13_tickets,
+        0,
         "a listener that can publish a withdrawal must not issue resumption tickets that skip \
          client-certificate verification"
     );
