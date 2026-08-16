@@ -231,7 +231,15 @@ rename detection when classifying paths, so both the source and destination of a
 rename are checked. The same `--no-renames` fail-closed classification applies
 to `coverage.yml` coverage planning, `gateway-api-conformance.yml` relevance
 filtering, and the `performance-regression` path classifier on both
-`pull_request` and `merge_group` diffs. Merge-group planning diffs
+`pull_request` and `merge_group` diffs. Coverage planning is shard-scoped on
+classifiable pull-request and merge-group diffs: `lib-unit` always runs with the
+affected integration shards, plugin-only diffs keep the plugin gate but reuse
+the `lib-unit` profraw/artifacts, and push to `main`, schedule, dispatch, empty
+or unavailable diffs, controller edits, dependency/build-graph inputs, unknown
+paths, and malformed/hostile path transport fail closed to the full coverage
+matrix. The `Merge Coverage` aggregate verifies exact planned shard outcomes and
+artifact presence so a skipped shard cannot false-green the required check.
+Merge-group planning diffs
 `merge_group.base_sha...HEAD` and executes the planner from that base SHA so a
 queued planner edit cannot self-classify as light.
 Any unrecognized path, an empty/unavailable diff, a mixed code-and-docs change,

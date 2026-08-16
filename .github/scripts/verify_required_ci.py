@@ -22,6 +22,9 @@ from pr_ci_plan import FULL_CI_DOCUMENTATION_PATHS, self_test as planner_self_te
 from validate_live_assertions import (
     run_self_test as live_assertion_validator_self_test,
 )
+from verify_coverage_workflow import (
+    main as coverage_workflow_main,
+)
 from verify_mesh_performance_baselines_workflow import (
     main as mesh_baselines_workflow_main,
 )
@@ -114,8 +117,8 @@ DEDICATED_REQUIRED_CHECKS = {
         "contract": {
             "needs.coverage-plan.result != 'success'",
             "needs.coverage-plan.outputs.mode == 'skip'",
-            "needs.coverage-plan.outputs.mode == 'full' && needs.coverage-shard.result != 'success'",
-            "!contains(fromJSON('[\"skip\", \"plugin\", \"full\"]'), needs.coverage-plan.outputs.mode)",
+            "needs.coverage-plan.outputs.mode != 'skip' && needs.coverage-shard.result != 'success'",
+            "!contains(fromJSON('[\"skip\", \"plugin\", \"shards\", \"full\"]'), needs.coverage-plan.outputs.mode)",
         },
     },
     ".github/workflows/gateway-api-conformance.yml": {
@@ -422,6 +425,7 @@ def merge_group_self_test() -> list[str]:
     # Absent pull_request payload must not be treated as a path-gated event by
     # the planners once merge_group is selected.
     from coverage_plan import select_mode as coverage_select_mode
+    from coverage_plan import select_plan as coverage_select_plan
     from pr_ci_plan import select_job_gates, select_mode as pr_select_mode
 
     mode, _ = pr_select_mode("merge_group", [])
@@ -448,6 +452,23 @@ def merge_group_self_test() -> list[str]:
     mode, _ = coverage_select_mode("merge_group", ["docs/configuration.md"])
     if mode != "skip":
         failures.append("irrelevant merge_group coverage paths should skip")
+    admin_plan = coverage_select_plan("merge_group", ["src/admin/mod.rs"])
+    if admin_plan.mode != "shards" or "lib-unit" not in admin_plan.shards:
+        failures.append("merge_group admin coverage must be shard-scoped with lib-unit")
+    if any(
+        shard in admin_plan.shards
+        for shard in ("mesh-routing", "mesh-platform", "protocols-data-plane")
+    ):
+        failures.append("merge_group admin coverage must not select unrelated shards")
+    plugin_plan = coverage_select_plan("merge_group", ["src/plugins/cors.rs"])
+    if plugin_plan.mode != "plugin" or plugin_plan.shards != ("lib-unit",):
+        failures.append("merge_group plugin coverage must reuse lib-unit only")
+    unknown_plan = coverage_select_plan("merge_group", ["src/cli.rs"])
+    if unknown_plan.mode != "full":
+        failures.append("unknown merge_group coverage paths must fail closed to full")
+    main_plan = coverage_select_plan("push", ["src/admin/mod.rs"])
+    if main_plan.mode != "full":
+        failures.append("push coverage must stay on the full shard matrix")
 
     # Synthetic workflow snippets: path filters / concurrency / fork-safe base.
     bare_pr_only = "on:\n  pull_request:\n"
@@ -1138,6 +1159,10 @@ def main() -> int:
         planner_errors.append(
             "mesh performance baselines workflow contract failed"
         )
+    if coverage_workflow_main(["--self-test"]) != 0:
+        planner_errors.append("coverage workflow verifier self-test failed")
+    if coverage_workflow_main([]) != 0:
+        planner_errors.append("coverage workflow shard-plan contract failed")
     # The scheduling decision above intentionally executes the trusted-base
     # planner on pull requests. Exercise the proposed planner here as data-plane
     # validation only: this verifier publishes no planner outputs and cannot
