@@ -229,7 +229,14 @@ deliberately triggers a live datapath suite (including the mesh, SPIRE,
 configuration, NodeWaypoint, and CI contract/runbook files) remains full mode.
 The planner runs `git diff --check` for PR/merge-group diff hygiene and disables
 rename detection when classifying paths, so both the source and destination of a
-rename are checked. The same `--no-renames` fail-closed classification applies
+rename are checked. `CI Plan` collects those paths as a NUL-delimited
+`git diff --name-only --no-renames -z` stream (no newline `sort`) and parses
+bytes fail-closed: a nonempty stream must be complete NUL-terminated UTF-8, and
+every path must be a repository-relative `[A-Za-z0-9._+@~ /-]` name with no
+absolute/dot/dotdot/empty components, C0/DEL, backslash, backtick, or other
+unclassifiable punctuation. Malformed or hostile names select full mode, force
+every job gate on, and are omitted from the step summary rather than
+interpolated into Markdown. The same `--no-renames` fail-closed classification applies
 to `coverage.yml` coverage planning, `gateway-api-conformance.yml` relevance
 filtering, and the `performance-regression` path classifier on both
 `pull_request` and `merge_group` diffs. Merge-group planning diffs
@@ -250,8 +257,10 @@ PKCS#11 SoftHSM (`run_pkcs11`). The deploy-only multicluster job remains a
 distinct packaging-and-rollout check; authoritative datapath coverage rides the
 dedicated `multicluster-federation-live.yml` workflow (path-filtered on PRs,
 force-run on every `main` push). PRs outside those curated path sets skip the
-downstream job before GitHub allocates a runner. Pushes to `main`, manual runs,
-empty or unavailable diffs, unclassifiable/unsafe changed paths, and edits to
+downstream job before GitHub allocates a runner. Pushes to `main`, manual
+`workflow_dispatch` runs (the Secret Backends and PKCS#11 SoftHSM jobs use the
+same event guard as the other path-gated mesh/Helm/eBPF jobs), empty or
+unavailable diffs, unclassifiable/unsafe changed paths, and edits to
 the gate-controller scripts force all of these gates on. Shared compile-graph
 inputs (`Cargo.toml`/`Cargo.lock`, `vendor/`, `build.rs`, `proto/`,
 `rust-toolchain.toml`, `.cargo/`, `.github/workflows/ci.yml`, and the
@@ -489,9 +498,10 @@ phases.
   only when secret-provider sources, `tests/secrets_functional/`, secret-resolution
   startup wiring (`src/main.rs`, `src/config/env_config.rs`), nextest config, or
   shared compile-graph/controller inputs change; plugin-only and admin-only PRs
-  skip it before runner allocation. Service integration likewise runs Consul, LDAP,
-  Kafka, MySQL, OIDC, and OAuth2 introspection in one independently reported
-  invocation.
+  skip it before runner allocation. Manual `workflow_dispatch` runs, pushes to
+  `main`, and fail-closed planner cases still run it. Service integration
+  likewise runs Consul, LDAP, Kafka, MySQL, OIDC, and OAuth2 introspection in
+  one independently reported invocation.
 - PKCS#11 SoftHSM smoke (`run_pkcs11`) compiles the `pkcs11` feature graph and
   runs the token signer plus certificate-pairing tests against SoftHSM. The
   planner schedules it for `src/tls/pkcs11.rs`, the TLS load/backend/source/reload

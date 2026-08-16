@@ -183,7 +183,9 @@ jobs:
             base_ref="origin/${BASE_REF}"
             # Disable rename detection so moving a full-CI input to an allowed
             # lightweight path reports both the deleted source and destination.
-            git diff --name-only --no-renames "${base_ref}...HEAD" | sort > "$changed_files"
+            # NUL-delimit the stream so a hostile filename cannot split or
+            # C-quote away a secrets/PKCS path before the planner classifies it.
+            git diff --name-only --no-renames -z "${base_ref}...HEAD" > "$changed_files"
 
             # A PR that edits only the planner must not be able to classify
             # itself as light. Use the base branch's trusted planner when it
@@ -210,7 +212,7 @@ jobs:
               git fetch --no-tags origin "${MERGE_BASE_SHA}"
             fi
             # Diff the synthesized merge-group commit against its payload base.
-            git diff --name-only --no-renames "${MERGE_BASE_SHA}...HEAD" | sort > "$changed_files"
+            git diff --name-only --no-renames -z "${MERGE_BASE_SHA}...HEAD" > "$changed_files"
 
             # Use the merge-group base planner so a queued change that edits the
             # planner cannot classify the combined SHA as light.
@@ -233,6 +235,7 @@ jobs:
             --changed-files "$changed_files")"
           mode="$(printf '%s\n' "$plan" | sed -n 's/^mode=//p')"
           reason="$(printf '%s\n' "$plan" | sed -n 's/^reason=//p')"
+          paths_classifiable="$(printf '%s\n' "$plan" | sed -n 's/^paths_classifiable=//p')"
           echo "mode=$mode" >> "$GITHUB_OUTPUT"
 
           # The first PR that introduces these outputs necessarily runs the
@@ -254,14 +257,18 @@ jobs:
             echo ""
             echo "Mode: **${mode}**"
             echo ""
-            echo "$reason"
-            if [ -s "$changed_files" ]; then
-              echo ""
-              echo "### Changed Files"
-              echo ""
-              while IFS= read -r path; do
-                echo "- \`${path}\`"
-              done < "$changed_files"
+            if [ "$paths_classifiable" = "true" ]; then
+              echo "$reason"
+              if [ -s "$changed_files" ]; then
+                echo ""
+                echo "### Changed Files"
+                echo ""
+                while IFS= read -r -d '' path; do
+                  echo "- \`${path}\`"
+                done < "$changed_files"
+              fi
+            else
+              echo "changed paths were suppressed as unclassifiable; defaulting to full CI"
             fi
             echo ""
             echo "### Runner-free job gates"
@@ -497,7 +504,7 @@ jobs:
   test-secrets:
     name: Secret Backends
     needs: ci-plan
-    if: needs.ci-plan.outputs.mode == 'full' && needs.ci-plan.outputs.run_secrets_backends == 'true' && (github.event_name == 'pull_request' || github.event_name == 'merge_group' || (github.event_name == 'push' && github.ref == 'refs/heads/main'))
+    if: needs.ci-plan.outputs.mode == 'full' && needs.ci-plan.outputs.run_secrets_backends == 'true' && (github.event_name == 'pull_request' || github.event_name == 'merge_group' || (github.event_name == 'push' && github.ref == 'refs/heads/main') || github.event_name == 'workflow_dispatch')
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
@@ -571,7 +578,7 @@ jobs:
   test-pkcs11-softhsm:
     name: PKCS#11 SoftHSM Smoke Test
     needs: ci-plan
-    if: needs.ci-plan.outputs.mode == 'full' && needs.ci-plan.outputs.run_pkcs11 == 'true' && (github.event_name == 'pull_request' || github.event_name == 'merge_group' || (github.event_name == 'push' && github.ref == 'refs/heads/main'))
+    if: needs.ci-plan.outputs.mode == 'full' && needs.ci-plan.outputs.run_pkcs11 == 'true' && (github.event_name == 'pull_request' || github.event_name == 'merge_group' || (github.event_name == 'push' && github.ref == 'refs/heads/main') || github.event_name == 'workflow_dispatch')
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
