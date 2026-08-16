@@ -4,8 +4,10 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import re
 import sys
+import textwrap
 from pathlib import Path
 
 from check_markdown_links import check_repository, run_self_test
@@ -414,6 +416,138 @@ def merge_group_trigger_is_present(workflow_yml: str) -> bool:
     return True
 
 
+NATIVE_BINARY_TARGETS = (
+    "x86_64-unknown-linux-gnu",
+    "x86_64-apple-darwin",
+    "aarch64-apple-darwin",
+    "x86_64-pc-windows-msvc",
+)
+
+
+def extract_binary_matrix_script(ci_yml: str) -> str:
+    """Return the ci-plan Python that selects the native binary matrix."""
+
+    body = extract_job_body(ci_yml, "ci-plan")
+    match = re.search(
+        r"python3 - <<'PY' >> \"\$GITHUB_OUTPUT\"\n(?P<script>.*?)^          PY\n",
+        body,
+        flags=re.M | re.S,
+    )
+    if not match:
+        raise RuntimeError("could not find jobs.ci-plan binary-matrix script")
+    return textwrap.dedent(match.group("script"))
+
+
+def load_binary_matrix(script: str, event_name: str) -> list[dict[str, str]]:
+    """Execute the checked-in matrix selector with a fake event name."""
+
+    captured: dict[str, object] = {}
+
+    def fake_print(*args: object, **_kwargs: object) -> None:
+        text = " ".join(str(arg) for arg in args)
+        if text.startswith("matrix="):
+            captured["matrix"] = json.loads(text.removeprefix("matrix="))
+
+    class _FakeOs:
+        environ = {"EVENT_NAME": event_name}
+
+    exec(  # noqa: S102 — deterministic in-repo contract script
+        compile(script, "<binary-matrix>", "exec"),
+        {"json": json, "os": _FakeOs, "print": fake_print},
+    )
+    matrix = captured.get("matrix")
+    if not isinstance(matrix, dict) or not isinstance(matrix.get("include"), list):
+        raise RuntimeError(f"binary-matrix for {event_name} did not emit include[]")
+    rows = matrix["include"]
+    if not all(isinstance(row, dict) for row in rows):
+        raise RuntimeError(f"binary-matrix for {event_name} include rows must be objects")
+    return rows  # type: ignore[return-value]
+
+
+def native_binary_compile_gate_self_test() -> list[str]:
+    """Lock merge_group macOS check / Windows link split and cache identity."""
+
+    failures: list[str] = []
+    ci_yml = Path(".github/workflows/ci.yml").read_text(encoding="utf-8")
+    try:
+        script = extract_binary_matrix_script(ci_yml)
+        pull_request_rows = load_binary_matrix(script, "pull_request")
+        merge_group_rows = load_binary_matrix(script, "merge_group")
+        push_rows = load_binary_matrix(script, "push")
+    except (RuntimeError, json.JSONDecodeError, SyntaxError, TypeError) as error:
+        return [f"native binary matrix contract failed closed: {error}"]
+
+    if [row.get("target") for row in pull_request_rows] != [
+        "x86_64-unknown-linux-gnu"
+    ]:
+        failures.append("pull_request binary matrix must stay Linux x86_64 only")
+
+    merge_targets = [row.get("target") for row in merge_group_rows]
+    if merge_targets != list(NATIVE_BINARY_TARGETS):
+        failures.append(
+            "merge_group binary matrix must keep Linux, both macOS targets, and Windows"
+        )
+    push_targets = [row.get("target") for row in push_rows]
+    if push_targets != list(NATIVE_BINARY_TARGETS):
+        failures.append("push-to-main native matrix must keep the four production targets")
+
+    build_body = extract_job_body(ci_yml, "build-binaries")
+    compile_gate = (
+        "run: cargo ${{ github.event_name == 'merge_group' && "
+        "endsWith(matrix.target, '-apple-darwin') && 'check' || 'build' }} "
+        "--features cloud-secrets --profile pr-build --target ${{ matrix.target }}"
+    )
+    if compile_gate not in build_body:
+        failures.append(
+            "jobs.build-binaries merge_group macOS must cargo check; "
+            "Linux/Windows and pull_request must cargo build --profile pr-build"
+        )
+    if "endsWith(matrix.target, '-apple-darwin') && 'check'" not in build_body:
+        failures.append(
+            "jobs.build-binaries must not cargo-check Windows or Linux merge_group gates"
+        )
+    if (
+        "run: cargo build --features cloud-secrets --release --target ${{ matrix.target }}"
+        not in build_body
+    ):
+        failures.append("jobs.build-binaries push path must keep cargo build --release")
+    if build_body.count(
+        "if: github.event_name == 'push' && github.ref == 'refs/heads/main'"
+    ) < 2:
+        failures.append(
+            "jobs.build-binaries must keep both Prepare release assets and "
+            "Upload artifacts on push-to-main"
+        )
+    cache_key = (
+        'shared-key: "build-${{ matrix.target }}-'
+        "${{ github.event_name == 'push' && 'release' || 'prbuild' }}\""
+    )
+    if cache_key not in build_body:
+        failures.append(
+            "jobs.build-binaries rust-cache key must split prbuild/check vs release lanes"
+        )
+    if 'shared-key: "build-${{ matrix.target }}"\n' in build_body:
+        failures.append(
+            "jobs.build-binaries must not share one rust-cache key across pr-build and release"
+        )
+    if "./.github/actions/setup-sccache" not in build_body:
+        failures.append(
+            "jobs.build-binaries must install sccache via the pinned repository action"
+        )
+    if '"${FERRUM_SCCACHE_BIN}" --show-stats' not in build_body:
+        failures.append(
+            "jobs.build-binaries must report pinned sccache --show-stats telemetry"
+        )
+    if (
+        "name: Prepare release assets" not in build_body
+        or "name: Upload artifacts" not in build_body
+    ):
+        failures.append(
+            "jobs.build-binaries must keep push-to-main asset prepare/upload steps"
+        )
+    return failures
+
+
 def merge_group_self_test() -> list[str]:
     """Deterministic fixtures for merge-queue required-check contracts."""
 
@@ -463,6 +597,7 @@ def merge_group_self_test() -> list[str]:
     )
     if merge_group_trigger_is_present(path_filtered):
         failures.append("path-filtered merge_group must be rejected")
+    failures.extend(native_binary_compile_gate_self_test())
     branches_filtered = (
         "on:\n  merge_group:\n    branches:\n      - main\n"
     )

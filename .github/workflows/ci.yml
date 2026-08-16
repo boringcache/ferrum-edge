@@ -5304,6 +5304,11 @@ jobs:
     strategy:
       fail-fast: false
       matrix: ${{ fromJSON(needs.ci-plan.outputs.binary-matrix) }}
+    # merge_group: macOS compile-gates with cargo check (queue binaries are
+    # discarded). Linux and Windows keep a linked pr-build; Windows MSVC/NASM
+    # linkage is the unique failure mode check cannot see. rust-cache keys
+    # split prbuild vs release so those profile trees cannot evict each other.
+    # Prepare/Upload stay push-to-main only.
 
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
@@ -5358,7 +5363,7 @@ jobs:
         # issue.
         continue-on-error: true
         with:
-          shared-key: "build-${{ matrix.target }}"
+          shared-key: "build-${{ matrix.target }}-${{ github.event_name == 'push' && 'release' || 'prbuild' }}"
           cache-directories: ${{ github.workspace }}/.cache/sccache
 
       - name: Install protoc (macOS)
@@ -5408,13 +5413,34 @@ jobs:
           }
           $nasmBin | Out-File -Append -FilePath $env:GITHUB_PATH -Encoding utf8
 
-      - name: Build PR verification binary
+      - name: Compile-gate (PR / merge_group)
         if: github.event_name == 'pull_request' || github.event_name == 'merge_group'
-        run: cargo build --features cloud-secrets --profile pr-build --target ${{ matrix.target }}
+        run: cargo ${{ github.event_name == 'merge_group' && endsWith(matrix.target, '-apple-darwin') && 'check' || 'build' }} --features cloud-secrets --profile pr-build --target ${{ matrix.target }}
 
       - name: Build release binary
         if: github.event_name == 'push'
         run: cargo build --features cloud-secrets --release --target ${{ matrix.target }}
+
+      - name: Report sccache stats
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          {
+            echo "## sccache"
+            echo ""
+            echo "- rustc wrapper: \`${RUSTC_WRAPPER:-unset}\`"
+            echo "- pinned binary: \`${FERRUM_SCCACHE_BIN:-unset}\`"
+            echo "- cache dir: \`${SCCACHE_DIR:-unset}\`"
+            echo ""
+            if [ -n "${FERRUM_SCCACHE_BIN:-}" ] && [ -x "${FERRUM_SCCACHE_BIN}" ]; then
+              echo '```'
+              "${FERRUM_SCCACHE_BIN}" --show-stats || true
+              echo '```'
+            else
+              echo "Pinned setup-sccache binary was not active on this runner."
+            fi
+          } >> "${GITHUB_STEP_SUMMARY}"
 
       - name: Prepare release assets
         if: github.event_name == 'push' && github.ref == 'refs/heads/main'
