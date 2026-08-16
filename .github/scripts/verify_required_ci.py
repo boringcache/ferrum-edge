@@ -31,6 +31,7 @@ from verify_release_image_attestations import (
 from verify_release_image_attestations import (
     validate_release_workflow,
 )
+from verify_ci_runtime_cache import main as ci_runtime_cache_main
 
 
 REQUIRED_JOBS = {
@@ -648,6 +649,20 @@ def main() -> int:
     planner_errors: list[str] = []
     aggregate_body = extract_job_body(ci_yml, "test")
     unit_body = extract_job_body(ci_yml, "test-unit")
+    unit_precompile = "Precompile inline and hardening test binaries"
+    unit_inline = "Run inline lib tests"
+    unit_hardening = "Run cache accounting and reload safety regressions"
+    if not (
+        unit_body.count("cargo test --lib --test unit_tests --no-run") == 1
+        and 0 <= unit_body.find(unit_precompile)
+        < unit_body.find(unit_inline)
+        < unit_body.find(unit_hardening)
+    ):
+        planner_errors.append(
+            "jobs.test-unit must precompile the lib and unit_tests binaries "
+            "together before running inline or plugin-hardening tests"
+        )
+
     acme_precompile = "Precompile ACME library and DNS hook test binaries"
     acme_outbound = "Run ACME outbound-boundary regressions"
     acme_dns_hook = "Run ACME DNS-01 hook cancellation regressions"
@@ -665,6 +680,24 @@ def main() -> int:
         planner_errors.append(
             "jobs.test-unit must precompile the acme lib and unit_tests binaries "
             "together before running any ACME filter"
+        )
+
+    pkcs11_body = extract_job_body(ci_yml, "test-pkcs11-softhsm")
+    pkcs11_precompile = "Precompile PKCS#11 signer and pairing test binaries"
+    pkcs11_signer = "Run PKCS#11 signer smoke test"
+    pkcs11_pairing = "Run PKCS#11 certificate-pairing tests"
+    if not (
+        pkcs11_body.count(
+            "cargo test --features pkcs11 --lib --test unit_tests --no-run"
+        )
+        == 1
+        and 0 <= pkcs11_body.find(pkcs11_precompile)
+        < pkcs11_body.find(pkcs11_signer)
+        < pkcs11_body.find(pkcs11_pairing)
+    ):
+        planner_errors.append(
+            "jobs.test-pkcs11-softhsm must precompile the pkcs11 lib and "
+            "unit_tests binaries together before running either filter"
         )
     for job in sorted(REQUIRED_JOBS):
         if f"needs.{job}.result" not in aggregate_body:
@@ -1157,6 +1190,10 @@ def main() -> int:
         planner_errors.append(
             "mesh performance baselines workflow contract failed"
         )
+    if ci_runtime_cache_main(["--self-test"]) != 0:
+        planner_errors.append("CI runtime cache contract self-test failed")
+    if ci_runtime_cache_main([]) != 0:
+        planner_errors.append("CI runtime cache contract failed")
     # The scheduling decision above intentionally executes the trusted-base
     # planner on pull requests. Exercise the proposed planner here as data-plane
     # validation only: this verifier publishes no planner outputs and cannot
