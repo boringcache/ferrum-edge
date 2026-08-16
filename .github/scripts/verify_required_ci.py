@@ -492,20 +492,30 @@ def native_binary_compile_gate_self_test() -> list[str]:
         failures.append("push-to-main native matrix must keep the four production targets")
 
     build_body = extract_job_body(ci_yml, "build-binaries")
-    compile_gate = (
-        "run: cargo ${{ github.event_name == 'merge_group' && "
-        "endsWith(matrix.target, '-apple-darwin') && 'check' || 'build' }} "
-        "--features cloud-secrets --profile pr-build --target ${{ matrix.target }}"
+    macos_check_gate = (
+        "- name: Check merge-group macOS target\n"
+        "        if: github.event_name == 'merge_group' && runner.os == 'macOS'\n"
+        "        run: cargo check --features cloud-secrets --profile pr-build "
+        "--target ${{ matrix.target }}"
     )
-    if compile_gate not in build_body:
+    if macos_check_gate not in build_body:
         failures.append(
-            "jobs.build-binaries merge_group macOS must cargo check; "
-            "Linux/Windows and pull_request must cargo build --profile pr-build"
+            "jobs.build-binaries merge_group macOS must use a static cargo check step"
         )
-    if "endsWith(matrix.target, '-apple-darwin') && 'check'" not in build_body:
+    native_build_gate = (
+        "- name: Build PR / merge-group verification binary\n"
+        "        if: github.event_name == 'pull_request' || "
+        "(github.event_name == 'merge_group' && runner.os != 'macOS')\n"
+        "        run: cargo build --features cloud-secrets --profile pr-build "
+        "--target ${{ matrix.target }}"
+    )
+    if native_build_gate not in build_body:
         failures.append(
-            "jobs.build-binaries must not cargo-check Windows or Linux merge_group gates"
+            "jobs.build-binaries pull_request and merge_group Linux/Windows must "
+            "use a static linked pr-build step"
         )
+    if "run: cargo ${{" in build_body:
+        failures.append("jobs.build-binaries must not select a Cargo subcommand dynamically")
     if (
         "run: cargo build --features cloud-secrets --release --target ${{ matrix.target }}"
         not in build_body

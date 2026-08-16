@@ -5413,9 +5413,13 @@ jobs:
           }
           $nasmBin | Out-File -Append -FilePath $env:GITHUB_PATH -Encoding utf8
 
-      - name: Compile-gate (PR / merge_group)
-        if: github.event_name == 'pull_request' || github.event_name == 'merge_group'
-        run: cargo ${{ github.event_name == 'merge_group' && endsWith(matrix.target, '-apple-darwin') && 'check' || 'build' }} --features cloud-secrets --profile pr-build --target ${{ matrix.target }}
+      - name: Check merge-group macOS target
+        if: github.event_name == 'merge_group' && runner.os == 'macOS'
+        run: cargo check --features cloud-secrets --profile pr-build --target ${{ matrix.target }}
+
+      - name: Build PR / merge-group verification binary
+        if: github.event_name == 'pull_request' || (github.event_name == 'merge_group' && runner.os != 'macOS')
+        run: cargo build --features cloud-secrets --profile pr-build --target ${{ matrix.target }}
 
       - name: Build release binary
         if: github.event_name == 'push'
