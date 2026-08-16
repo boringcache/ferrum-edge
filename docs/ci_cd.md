@@ -304,7 +304,7 @@ artifact handoff:
   evict it during the consumer tail when later ordinary CI jobs write more
   than the remaining cache budget (tens of GiB of newer entries have dropped
   this key before the next full-workflow rerun).
-- **Immutable cross-run handoff.** A successful non-cold `fips-compile`
+- **Immutable inter-run handoff.** A successful non-cold `fips-compile`
   packages its exact `target/` + `.cache/sccache` producer tree as a zstd tar
   (preserving executable modes that artifact ZIP extraction would normalize)
   and publishes it as the one-day run artifact
@@ -368,7 +368,7 @@ before saving the stable fallback. Example plugins stay out of the FIPS
 artifact (`FERRUM_CUSTOM_PLUGINS` is unset). Job summaries record rust-cache
 hit/miss from the action output as **stable fallback**, producer restore
 as **exact / partial (same run_id) / miss** via `classify-restore`, and the
-explicit cross-run handoff artifact as **hit / miss** (never as a fabricated
+explicit inter-run handoff artifact as **hit / miss** (never as a fabricated
 hit). Measured restored bytes are the sccache-directory subset for
 rust-cache and the on-disk `target/` directory for the producer cache and
 handoff artifact; rust-cache Cargo/target archive bytes are not exposed. The

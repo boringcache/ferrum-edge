@@ -43,7 +43,7 @@ name: FIPS Build Policy
 #    executables and publishes digest-bound copies as an immutable same-run
 #    artifact, overlapping claimed-profile and clippy work after the shorter
 #    build-only producer. The test-binary job remains a cache consumer and does
-#    not publish cross-run state.
+#    not publish inter-run state.
 # 5. `fips-test` downloads only the immutable same-run test artifact and
 #    validates its manifest/digests before direct execution. This transport is
 #    available on forced-cold and fork runs without publishing shared cache.
@@ -95,15 +95,15 @@ env:
   # so a source-only change can publish freshly warmed Cargo/target/AWS-LC/
   # sccache state. restore-keys use the SHA+run_id prefix (no attempt) so a
   # failed-job rerun of a consumer can reuse a prior successful compile in the
-  # same run. This early save is not the cross-run warm source: later
+  # same run. This early save is not the inter-run warm source: later
   # ordinary CI caches can LRU-evict it before the next full-workflow rerun.
   # Pull-request workflows execute a synthetic merge SHA, while a later manual
   # warm run executes the selected branch head. Bind both event shapes to the
-  # pull-request head so the explicit cross-run handoff remains addressable;
+  # pull-request head so the explicit inter-run handoff remains addressable;
   # every other event keeps its native github.sha identity.
   FIPS_PRODUCER_KEY: fips-producer-${{ github.event.pull_request.head.sha || github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
   FIPS_PRODUCER_RESTORE_PREFIX: fips-producer-${{ github.event.pull_request.head.sha || github.sha }}-${{ github.run_id }}-
-  # Immutable cross-run producer artifact. A later explicit workflow dispatch
+  # Immutable inter-run producer artifact. A later explicit workflow dispatch
   # names the exact source run and attempt; the artifact name also binds the
   # current SHA. Separate runs avoid both repository cache LRU and GitHub's
   # deletion of a run's artifacts when that same run is rerun.
@@ -387,53 +387,53 @@ jobs:
       # Warm evidence therefore chains separate workflow_dispatch runs, naming
       # the exact preceding run and attempt. The action receives a read-only
       # token internally; no PR-controlled run step receives GITHUB_TOKEN.
-      - name: Download exact cross-run FIPS handoff artifact
+      - name: Download exact inter-run FIPS handoff artifact
         if: github.event.inputs.force_cold_cache != 'true' && github.event_name == 'workflow_dispatch' && inputs.warm_source_run_id != ''
-        id: cross-run-fips-handoff
+        id: inter-run-fips-handoff
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
         with:
           name: fips-producer-handoff-${{ github.event.pull_request.head.sha || github.sha }}-${{ inputs.warm_source_run_id }}-${{ inputs.warm_source_run_attempt }}
-          path: ${{ runner.temp }}/cross-run-fips-handoff
+          path: ${{ runner.temp }}/inter-run-fips-handoff
           github-token: ${{ github.token }}
           repository: ${{ github.repository }}
           run-id: ${{ inputs.warm_source_run_id }}
 
-      - name: Promote exact cross-run FIPS handoff artifact
-        if: github.event.inputs.force_cold_cache != 'true' && github.event_name == 'workflow_dispatch' && inputs.warm_source_run_id != '' && steps.cross-run-fips-handoff.outcome == 'success'
+      - name: Promote exact inter-run FIPS handoff artifact
+        if: github.event.inputs.force_cold_cache != 'true' && github.event_name == 'workflow_dispatch' && inputs.warm_source_run_id != '' && steps.inter-run-fips-handoff.outcome == 'success'
         run: |
           set -euo pipefail
-          source_root="${RUNNER_TEMP}/cross-run-fips-handoff"
+          source_root="${RUNNER_TEMP}/inter-run-fips-handoff"
           archive="${source_root}/fips-producer-handoff.tar.zst"
           if [ ! -f "$archive" ] || [ -L "$archive" ]; then
-            echo "::error::cross-run FIPS handoff is missing its real tar.zst payload" >&2
+            echo "::error::inter-run FIPS handoff is missing its real tar.zst payload" >&2
             exit 1
           fi
-          extract_root="${RUNNER_TEMP}/cross-run-fips-extracted"
+          extract_root="${RUNNER_TEMP}/inter-run-fips-extracted"
           rm -rf "$extract_root"
           mkdir -p "$extract_root"
           tar --zstd --no-same-owner -xf "$archive" -C "$extract_root"
           for path in target .cache/sccache; do
             source_path="${extract_root}/${path}"
             if [ ! -d "$source_path" ] || [ -L "$source_path" ]; then
-              echo "::error::cross-run FIPS handoff is missing a real ${path} directory" >&2
+              echo "::error::inter-run FIPS handoff is missing a real ${path} directory" >&2
               exit 1
             fi
           done
           tree_manifest="${extract_root}/fips-producer-source-tree"
           if [ ! -f "$tree_manifest" ] || [ -L "$tree_manifest" ]; then
-            echo "::error::cross-run FIPS handoff is missing its real source-tree manifest" >&2
+            echo "::error::inter-run FIPS handoff is missing its real source-tree manifest" >&2
             exit 1
           fi
           archived_tree="$(cat "$tree_manifest")"
           line_count="$(wc -l < "$tree_manifest")"
           if [ "$line_count" -ne 1 ] || [ "${#archived_tree}" -ne 40 ] || \
              [[ "$archived_tree" == *[!0-9a-f]* ]]; then
-            echo "::error::cross-run FIPS handoff source-tree manifest is malformed" >&2
+            echo "::error::inter-run FIPS handoff source-tree manifest is malformed" >&2
             exit 1
           fi
           current_tree="$(git rev-parse HEAD^{tree})"
           if [ "$archived_tree" != "$current_tree" ]; then
-            echo "::error::cross-run FIPS handoff source tree does not match this checkout; refusing stale-base reuse" >&2
+            echo "::error::inter-run FIPS handoff source tree does not match this checkout; refusing stale-base reuse" >&2
             exit 1
           fi
           if ! git diff --quiet --no-ext-diff || \
@@ -454,7 +454,7 @@ jobs:
           if [ ! -d "$target_root" ] || [ -L "$target_root" ] || \
              [ ! -f "$fips_binary" ] || [ -L "$fips_binary" ] || \
              [ ! -x "$fips_binary" ]; then
-            echo "::error::exact cross-run FIPS target is missing its executable; refusing to refresh restored mtimes" >&2
+            echo "::error::exact inter-run FIPS target is missing its executable; refusing to refresh restored mtimes" >&2
             exit 1
           fi
           mtime_reference="${RUNNER_TEMP}/fips-target-mtime-reference"
@@ -464,26 +464,26 @@ jobs:
             -exec touch --reference="$mtime_reference" -- {} +
           rm -f "$mtime_reference"
 
-      - name: Record cross-run FIPS handoff restore
+      - name: Record inter-run FIPS handoff restore
         if: github.event.inputs.force_cold_cache != 'true' && github.event_name == 'workflow_dispatch' && inputs.warm_source_run_id != ''
         env:
           SOURCE_RUN_ID: ${{ inputs.warm_source_run_id }}
           SOURCE_RUN_ATTEMPT: ${{ inputs.warm_source_run_attempt }}
         run: |
           python3 .github/scripts/ci_runtime_telemetry.py cache \
-            --name cross-run-fips-handoff \
+            --name inter-run-fips-handoff \
             --hit true \
             --path "${GITHUB_WORKSPACE}/target" \
-            --note "layer=cross-run-artifact; measured=target-directory; source_run=${SOURCE_RUN_ID}; source_attempt=${SOURCE_RUN_ATTEMPT}"
+            --note "layer=inter-run-artifact; measured=target-directory; source_run=${SOURCE_RUN_ID}; source_attempt=${SOURCE_RUN_ATTEMPT}"
 
-      - name: Record absent cross-run FIPS handoff
+      - name: Record absent inter-run FIPS handoff
         if: github.event.inputs.force_cold_cache != 'true' && (github.event_name != 'workflow_dispatch' || inputs.warm_source_run_id == '')
         run: |
           python3 .github/scripts/ci_runtime_telemetry.py cache \
-            --name cross-run-fips-handoff \
+            --name inter-run-fips-handoff \
             --hit false \
             --bytes 0 \
-            --note "layer=cross-run-artifact; no explicit warm source requested"
+            --note "layer=inter-run-artifact; no explicit warm source requested"
 
       - name: Record cold-cache proof
         if: github.event.inputs.force_cold_cache == 'true'
@@ -494,10 +494,10 @@ jobs:
             --bytes 0 \
             --note "layer=stable-fallback; force_cold_cache skipped restore"
           python3 .github/scripts/ci_runtime_telemetry.py cache \
-            --name cross-run-fips-handoff \
+            --name inter-run-fips-handoff \
             --hit false \
             --bytes 0 \
-            --note "layer=cross-run-artifact; force_cold_cache skipped download"
+            --note "layer=inter-run-artifact; force_cold_cache skipped download"
           python3 .github/scripts/ci_runtime_telemetry.py cache \
             --name fips-producer \
             --hit false \
@@ -545,7 +545,7 @@ jobs:
 
       # Artifact ZIP extraction normalizes permissions. Package the producer
       # tree first so executable modes inside target survive the handoff.
-      - name: Package cross-run FIPS producer handoff
+      - name: Package inter-run FIPS producer handoff
         if: github.event.inputs.force_cold_cache != 'true'
         run: |
           set -euo pipefail
@@ -574,7 +574,7 @@ jobs:
       # Unlike the repository cache, this immutable run artifact is not subject
       # to cache-LRU churn from concurrent PR jobs. It is exact to the SHA, run,
       # and attempt, and download-artifact verifies its service digest.
-      - name: Publish cross-run FIPS producer handoff
+      - name: Publish inter-run FIPS producer handoff
         if: github.event.inputs.force_cold_cache != 'true'
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
@@ -1453,7 +1453,7 @@ jobs:
             echo "an immutable one-day producer artifact for an explicitly chained "
             echo "same-SHA workflow dispatch. Tests executed digest-bound "
             echo "binaries from the immutable same-run artifact published by "
-            echo "fips-test-build. Stable rust-cache remains the cross-commit "
+            echo "fips-test-build. Stable rust-cache remains the inter-commit "
             echo "fallback."
             echo ""
             echo "Warm PR target: <=30 minutes, p95 <=45 minutes, measured on hosted runs."

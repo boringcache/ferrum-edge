@@ -7,7 +7,7 @@ description: >-
   the CI half of that contract.
 
   This action does not invoke mozilla-actions/sccache-action (or any other
-  installer that exports `ACTIONS_RUNTIME_TOKEN` /
+  installer that `core.exportVariable`s `ACTIONS_RUNTIME_TOKEN` /
   `ACTIONS_RESULTS_URL` into `GITHUB_ENV`). PR-controlled `run:` steps
   therefore never receive the GitHub Actions cache-service credential.
   Compiler outputs use a bounded local-disk cache at

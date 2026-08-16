@@ -91,7 +91,7 @@ and `vendor/**`. That input is the one the pinned action actually uses; a
 sibling `key:` value is ignored whenever `shared-key` is set and is not
 wired. Automatic toolchain/environment/manifest/lock hashing stays enabled,
 and this layer is not SHA-scoped, so dependency/compiler work remains a warm
-cross-commit fallback. After a successful locked `fips` profile build,
+inter-commit fallback. After a successful locked `fips` profile build,
 `fips-compile` publishes the full `target/` and `.cache/sccache` tree under
 `fips-producer-${{ github.event.pull_request.head.sha || github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}`
 for same-attempt claimed-check, clippy, and `fips-test-build` consumers.
@@ -107,7 +107,7 @@ normalize, and publishes it as the one-day immutable artifact
 The fallback expression deliberately uses the pull-request head SHA instead of
 the synthetic pull-request merge SHA, so a later manual run of that head can
 name the same source artifact; non-PR events continue to use `github.sha`.
-That cross-run channel is deliberately not another repository cache:
+That inter-run channel is deliberately not another repository cache:
 concurrent CI writers empirically evicted a 4.15 GB late cache handoff within
 three minutes. The filtered
 test consumer rejects unexpected names, symlinks, path escapes, and SHA-256
@@ -139,7 +139,7 @@ variables before cache restore or compilation. The exact target handoff, not a
 runner-unique compiler wrapper, is the FIPS compiler cache. Cold, fork,
 mismatched-tree, untrusted-prefix, and unstable-wrapper paths cannot claim an
 exact warm restore.
-Telemetry records explicit cross-run hits and ordinary runs as no-source
+Telemetry records explicit inter-run hits and ordinary runs as no-source
 misses; it does not fabricate a hit.
 The three ordinal `fips-claimed-checks` shards, `fips-clippy`, and
 `fips-test-build` restore the current producer key and do not save that
@@ -183,7 +183,7 @@ sensitive (`cargo clippy --lib --tests` and the handshake binaries). Paths
 that are neither sensitive nor on the explicit non-sensitive allowlist
 force-run; empty, truncated, or unavailable diffs run or fail closed rather
 than skipping. Job summaries record rust-cache hit/miss as stable fallback,
-the same-run producer cache as exact/partial/miss, and the explicit cross-run
+the same-run producer cache as exact/partial/miss, and the explicit inter-run
 handoff artifact as hit/miss. Measured restored bytes are the sccache-directory
 subset for rust-cache and the on-disk `target/` directory for the producer
 cache and handoff artifact. Total rust-cache archive bytes are not exposed.

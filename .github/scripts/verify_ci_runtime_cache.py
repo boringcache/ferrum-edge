@@ -9,7 +9,7 @@ publish, fail-closed cache-save preparation, fork restore-only / no-save
 steps, rust-cache save-if so fork PRs cannot save, FIPS producer/consumer key
 equality with unique attempt scoping and stable fallback isolation, rejection
 of ignored rust-cache `key` wiring, checksum-pinned sccache install without
-credential-exporting installers, same-run producer vs immutable cross-run
+credential-exporting installers, same-run producer vs immutable inter-run
 artifact handoff warming, exact verified executable activation, empty
 SCCACHE_GHA_ENABLED persistence, fail-closed uncached fallback, and hosted
 cache-token absence assertions.
@@ -828,7 +828,7 @@ def check_fips_producer_channel(
     require(
         workflow.count(mtime_refresh) == 4,
         "FIPS workflow must refresh restored target mtimes exactly once in the "
-        "cross-run producer and each of its three exact same-run consumers",
+        "inter-run producer and each of its three exact same-run consumers",
         failures,
     )
     for job_name, job_body in (
@@ -894,12 +894,12 @@ def check_fips_producer_channel(
     require(
         not compile_restores,
         "fips-compile must not use the eviction-prone repository cache for its "
-        f"cross-run handoff; found {len(compile_restores)} restore steps",
+        f"inter-run handoff; found {len(compile_restores)} restore steps",
         failures,
     )
     require(
         len(compile_downloads) == 1,
-        "fips-compile must have exactly one pinned cross-run artifact "
+        "fips-compile must have exactly one pinned inter-run artifact "
         f"download, found {len(compile_downloads)}",
         failures,
     )
@@ -916,7 +916,7 @@ def check_fips_producer_channel(
             COLD_NOT_TRUE in condition
             and "github.event_name == 'workflow_dispatch'" in condition
             and "inputs.warm_source_run_id != ''" in condition,
-            "fips-compile cross-run artifact download must skip force_cold_cache "
+            "fips-compile inter-run artifact download must skip force_cold_cache "
             "and require an explicit workflow-dispatch source run",
             failures,
         )
@@ -927,8 +927,8 @@ def check_fips_producer_channel(
             failures,
         )
         require(
-            "path: ${{ runner.temp }}/cross-run-fips-handoff" in with_block,
-            "fips-compile must stage the cross-run artifact outside the workspace",
+            "path: ${{ runner.temp }}/inter-run-fips-handoff" in with_block,
+            "fips-compile must stage the inter-run artifact outside the workspace",
             failures,
         )
         require(
@@ -941,26 +941,26 @@ def check_fips_producer_channel(
         )
         require(
             "continue-on-error:" not in compile_downloads[0],
-            "fips-compile must fail closed when an explicitly requested cross-run "
+            "fips-compile must fail closed when an explicitly requested inter-run "
             "artifact is unavailable",
             failures,
         )
     require(
-        "Download exact cross-run FIPS handoff artifact" in compile_job
-        and "Promote exact cross-run FIPS handoff artifact" in compile_job
-        and "Record cross-run FIPS handoff restore" in compile_job
-        and "Record absent cross-run FIPS handoff" in compile_job
-        and "cross-run-fips-handoff" in compile_job
-        and "steps.cross-run-fips-handoff.outcome == 'success'" in compile_job
-        and "layer=cross-run-artifact" in compile_job,
+        "Download exact inter-run FIPS handoff artifact" in compile_job
+        and "Promote exact inter-run FIPS handoff artifact" in compile_job
+        and "Record inter-run FIPS handoff restore" in compile_job
+        and "Record absent inter-run FIPS handoff" in compile_job
+        and "inter-run-fips-handoff" in compile_job
+        and "steps.inter-run-fips-handoff.outcome == 'success'" in compile_job
+        and "layer=inter-run-artifact" in compile_job,
         "fips-compile must download, validate, promote, and record the explicit "
-        "same-SHA cross-run handoff artifact",
+        "same-SHA inter-run handoff artifact",
         failures,
     )
     promote_steps = [
         step
         for step in job_steps(compile_job)
-        if "name: Promote exact cross-run FIPS handoff artifact" in step
+        if "name: Promote exact inter-run FIPS handoff artifact" in step
     ]
     require(
         len(promote_steps) == 1,
@@ -973,7 +973,7 @@ def check_fips_producer_channel(
             COLD_NOT_TRUE in promote_condition
             and "github.event_name == 'workflow_dispatch'" in promote_condition
             and "inputs.warm_source_run_id != ''" in promote_condition
-            and "steps.cross-run-fips-handoff.outcome == 'success'"
+            and "steps.inter-run-fips-handoff.outcome == 'success'"
             in promote_condition
             and mtime_refresh in promote_steps[0]
             and 'mtime_reference="${RUNNER_TEMP}/fips-target-mtime-reference"'
@@ -1001,28 +1001,28 @@ def check_fips_producer_channel(
     package_steps = [
         step
         for step in job_steps(compile_job)
-        if "name: Package cross-run FIPS producer handoff" in step
+        if "name: Package inter-run FIPS producer handoff" in step
     ]
     require(
         len(package_steps) == 1,
-        "fips-compile must have exactly one cross-run handoff packaging step",
+        "fips-compile must have exactly one inter-run handoff packaging step",
         failures,
     )
     require(
         "force_cold_cache skipped download" in compile_job
-        and "layer=cross-run-artifact" in compile_job
-        and "--name cross-run-fips-handoff" in compile_job,
+        and "layer=inter-run-artifact" in compile_job
+        and "--name inter-run-fips-handoff" in compile_job,
         "fips-compile must record a cold-cache skip for the handoff download "
         "without fabricating a hit",
         failures,
     )
-    download_position = compile_job.find("Download exact cross-run FIPS handoff artifact")
-    promote_position = compile_job.find("Promote exact cross-run FIPS handoff artifact")
+    download_position = compile_job.find("Download exact inter-run FIPS handoff artifact")
+    promote_position = compile_job.find("Promote exact inter-run FIPS handoff artifact")
     refresh_position = compile_job.find(mtime_refresh)
     build_position = compile_job.find("Build the FIPS profile")
     save_position = compile_job.find("Save FIPS producer compile outputs")
-    package_position = compile_job.find("Package cross-run FIPS producer handoff")
-    handoff_position = compile_job.find("Publish cross-run FIPS producer handoff")
+    package_position = compile_job.find("Package inter-run FIPS producer handoff")
+    handoff_position = compile_job.find("Publish inter-run FIPS producer handoff")
     require(
         download_position >= 0
         and promote_position >= 0
@@ -1033,7 +1033,7 @@ def check_fips_producer_channel(
         and handoff_position >= 0
         and download_position < promote_position < refresh_position < build_position
         and build_position < save_position < package_position < handoff_position,
-        "fips-compile must download/promote and mtime-refresh the exact cross-run "
+        "fips-compile must download/promote and mtime-refresh the exact inter-run "
         "artifact before building, then publish the refreshed same-run cache and "
         "packaged immutable handoff",
         failures,
@@ -1313,10 +1313,10 @@ def check_fips_producer_channel(
         failures,
     )
     require(
-        "Save FIPS cross-run handoff" not in test_build_job
+        "Save FIPS inter-run handoff" not in test_build_job
         and "FIPS_HANDOFF_ARTIFACT" not in test_build_job,
         "fips-test-build must remain a handoff consumer; the build-only producer "
-        "owns the immutable cross-run artifact",
+        "owns the immutable inter-run artifact",
         failures,
     )
     require(
@@ -2518,13 +2518,13 @@ def check_docs_and_coverage(failures: list[str]) -> None:
     )
     require(
         "fips-producer-handoff" in ci_cd
-        and "cross-run" in ci_cd.lower()
+        and "inter-run" in ci_cd.lower()
         and "artifact" in ci_cd.lower()
         and "evict" in ci_cd.lower()
         and "deletes" in ci_cd.lower()
         and "zstd" in ci_cd.lower()
         and "executable modes" in ci_cd.lower(),
-        "docs/ci_cd.md must document the immutable FIPS cross-run artifact, "
+        "docs/ci_cd.md must document the immutable FIPS inter-run artifact, "
         "mode-preserving payload, cache eviction, and rerun deletion boundary",
         failures,
     )
@@ -2622,13 +2622,13 @@ def check_docs_and_coverage(failures: list[str]) -> None:
     )
     require(
         "fips-producer-handoff" in fips_doc
-        and "cross-run" in fips_doc.lower()
+        and "inter-run" in fips_doc.lower()
         and "artifact" in fips_doc.lower()
         and "evict" in fips_doc.lower()
         and "deletes" in fips_doc.lower()
         and "zstd" in fips_doc.lower()
         and "executable modes" in fips_doc.lower(),
-        "docs/fips.md must document the immutable FIPS cross-run artifact, "
+        "docs/fips.md must document the immutable FIPS inter-run artifact, "
         "mode-preserving payload, cache eviction, and rerun deletion boundary",
         failures,
     )
@@ -3108,15 +3108,15 @@ def self_test() -> int:
     )
     require(
         any(
-            "exactly one pinned cross-run artifact download" in item
+            "exactly one pinned inter-run artifact download" in item
             for item in consumer_save_failures
         ),
-        "self-test: missing compile cross-run artifact download must fail",
+        "self-test: missing compile inter-run artifact download must fail",
         failures,
     )
     require(
         any(
-            "download/promote and mtime-refresh the exact cross-run artifact before building"
+            "download/promote and mtime-refresh the exact inter-run artifact before building"
             in item
             for item in consumer_save_failures
         ),
@@ -3398,7 +3398,7 @@ def self_test() -> int:
     require(
         any(
             "refresh restored target mtimes exactly once" in item
-            or "mtime-refresh the exact cross-run" in item
+            or "mtime-refresh the exact inter-run" in item
             for item in missing_mtime_refresh_failures
         ),
         "self-test: exact FIPS restores without mtime normalization must fail",
@@ -3476,19 +3476,19 @@ def self_test() -> int:
     )
 
     eviction_prone_restore = handoff_channel.replace(
-        "      - name: Download exact cross-run FIPS handoff artifact\n",
+        "      - name: Download exact inter-run FIPS handoff artifact\n",
         "      - name: Restore eviction-prone FIPS handoff cache\n"
         f"        uses: {CACHE_RESTORE} # v4.2.4\n"
         "        with:\n"
         "          key: fips-handoff-legacy\n"
-        "      - name: Download exact cross-run FIPS handoff artifact\n",
+        "      - name: Download exact inter-run FIPS handoff artifact\n",
         1,
     )
     eviction_prone_failures: list[str] = []
     check_fips_producer_channel(eviction_prone_restore, eviction_prone_failures)
     require(
         any("eviction-prone repository cache" in item for item in eviction_prone_failures),
-        "self-test: repository-cache cross-run restore must fail",
+        "self-test: repository-cache inter-run restore must fail",
         failures,
     )
 
@@ -3504,7 +3504,7 @@ def self_test() -> int:
             "bind the source artifact to the event-stable source SHA" in item
             for item in wrong_source_failures
         ),
-        "self-test: cross-run artifact without SHA/run/attempt binding must fail",
+        "self-test: inter-run artifact without SHA/run/attempt binding must fail",
         failures,
     )
 
@@ -3529,9 +3529,9 @@ def self_test() -> int:
     )
 
     tolerant_missing_artifact = handoff_channel.replace(
-        "        id: cross-run-fips-handoff\n"
+        "        id: inter-run-fips-handoff\n"
         f"        uses: {DOWNLOAD_ARTIFACT} # v8\n",
-        "        id: cross-run-fips-handoff\n"
+        "        id: inter-run-fips-handoff\n"
         "        continue-on-error: true\n"
         f"        uses: {DOWNLOAD_ARTIFACT} # v8\n",
         1,
@@ -3540,7 +3540,7 @@ def self_test() -> int:
     check_fips_producer_channel(tolerant_missing_artifact, tolerant_missing_failures)
     require(
         any(
-            "fail closed when an explicitly requested cross-run" in item
+            "fail closed when an explicitly requested inter-run" in item
             for item in tolerant_missing_failures
         ),
         "self-test: an unavailable explicitly requested warm source must fail closed",
