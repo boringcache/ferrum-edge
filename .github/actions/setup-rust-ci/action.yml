@@ -5,11 +5,17 @@ description: >-
   (strict) and the optional fast linker (best-effort), configures
   setup-fast-linker, sets up the Swatinem rust-cache, and pre-fetches crate
   dependencies.
-  sccache caches compiler outputs in a bounded local directory (the
-  cache-service credential is intentionally not exposed to later PR-controlled
-  steps); rust-cache persists that directory together with Cargo and target
+  sccache is installed by the local checksum-pinned setup-sccache action (not
+  mozilla-actions/sccache-action) into a bounded local directory; the
+  cache-service credential is never exported into later PR-controlled `run:`
+  steps. rust-cache persists that directory together with Cargo and target
   directories using isolated shared keys so incompatible job/profile/target
-  artifacts do not mix.
+  artifacts do not mix. rust-cache saves on ordinary later-phase failures
+  (`cache-on-failure`) when post-job cleanup still executes. Abrupt runner loss
+  cannot publish that runner's unsaved state, although retries can still restore
+  an already-published warm cache.
+  Fork pull requests restore that cache and do not save (`save-if` is false
+  when `github.event.pull_request.head.repo.fork` is true).
   Centralizes the setup block so individual jobs only declare their cache key
   and any extra rustup components.
 
@@ -17,7 +23,7 @@ inputs:
   shared-key:
     description: >-
       rust-cache shared key. Set per logical job (e.g. `ci-test`,
-      `ci-live-pr-build`, `ci-lint`, `ci-perf`) so caches don't trample
+      `ci-test-functional`, `ci-lint`, `ci-perf`) so caches don't trample
       each other. Jobs that compile the same artifacts should share a key.
     required: true
   components:
@@ -26,6 +32,11 @@ inputs:
       string skips component install — most jobs don't need extras.
     required: false
     default: ""
+
+outputs:
+  cache-hit:
+    description: Whether rust-cache restored an exact key match
+    value: ${{ steps.rust-cache.outputs.cache-hit }}
 
 runs:
   using: composite
@@ -192,10 +203,13 @@ runs:
         install-linux-packages: "false"
 
     - name: Cache Rust dependencies
+      id: rust-cache
       uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
       with:
         shared-key: ${{ inputs.shared-key }}
         cache-directories: ${{ github.workspace }}/.cache/sccache
+        cache-on-failure: "true"
+        save-if: ${{ github.event.pull_request.head.repo.fork != true }}
 
     - name: Pre-fetch crate dependencies (isolate transient registry flakes)
       shell: bash

@@ -425,6 +425,27 @@ reachable on *either* revision stays in scope, so a pull request cannot drop the
 reachability edge and edit the file in the same commit. Newly reaching an
 already-Cross-sensitive script from a protected job is still rejected.
 
+#### Retired `fips-build.yml` generation transition (issue #3888 / PR #3889)
+
+PR #3889 landed on `main`. The temporary whole-file SHA-256 admission that let
+that rewrite pass the Cross surface scan is **retired and non-operational**.
+Ordinary `.github/workflows/fips-build.yml` edits are compared by the normal
+fail-closed Cross surface scan with no special case. The generic SHA-256
+generation digest helper remains because CI-job and local-action finite
+transitions still use it. Full description: `docs/ci_cd.md` → "Retired
+`fips-build.yml` generation transition".
+
+The same verifier still carries temporary SHA-256 generation pairs for
+Cross-sensitive `ci.yml` jobs and for `setup-rust-ci/action.yml`
+(`CI_JOB_GENERATION_TRANSITIONS`, `LOCAL_ACTION_GENERATION_TRANSITIONS`). Both
+ends are exact, path- or job-bound, one-way, and decided entirely by the trusted
+base. `setup-rust-ci` now has exactly one pair: current-main
+`fc4e41818dffdea880c057c8dfa0881a629cd01c917b43f69a9f2e5e9bd90dda` moving to the
+combined #3911 destination
+`57a99a179ddc2935af187f518a803bf167eb9e33593c37b7b29f7151ec994da2`. See
+`docs/ci_cd.md` → "Admitted CI job SHA-256 generation transitions" and
+"Admitted `setup-rust-ci` generation transition".
+
 ### Refreshing kind / kubectl / Helm versions and checksums
 
 Versions and digests live as defaults on the
@@ -448,6 +469,20 @@ Versions and digests live as defaults on the
    unchanged unless a job must pin an override input for a temporary skew.
 5. Land the change via PR; the trusted CI planner policy and the live suites that
    path-filter on the composite action will exercise the new pins.
+
+`Helm Chart` proves `.github/actions/setup-kubernetes-tools` against the trusted
+revision before `uses:`, so a pull request that edits that action is rejected
+unless `verify_trusted_local_action.py` already admits that exact
+source→destination generation pair. Issue #3904's predecessor transition binds
+the current `action.yml`
+(`6ecb4bde09a0d3d456d6019c03ef1678c3903cbc0275bba31fde3e56f6e6ef08`,
+non-executable, sole governed file) moving to the PR #3910 cached-installer
+generation
+(`41dd4b9ae1b0ad74e021e2974afbcdac1a1bc0d856a166a57e94046e803d6cd9`, same path
+set and mode). Future installer edits need a new frozen pair, or must match the
+trusted tree byte for byte. Do not treat a working-tree digest or a mutable
+allowlist as admission. After #3910 is the trusted base, retire the predecessor
+constants so the old generation cannot remain an admitted source.
 
 Never refresh a checksum by copying a digest from an unpinned adjacent path
 without official release provenance, and never pipe a remote install script to
