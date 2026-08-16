@@ -178,12 +178,54 @@ pub struct RunReport {
     pub reports: Vec<ClassReport>,
 }
 
-/// Return a reason when any selected protocol/row is incomplete or errorful.
-/// An empty report set is also a failure: a requested protocol that produced
-/// no rows must not print "Run completed successfully".
-pub fn selected_reports_failure(reports: &[ClassReport]) -> Option<String> {
-    if reports.is_empty() {
-        return Some("no DNS class/transport rows were collected".to_string());
+/// Return a reason when any selected class/transport row is absent, duplicated,
+/// unexpected, incomplete, or errorful.
+pub fn selected_reports_failure(
+    reports: &[ClassReport],
+    expected_classes: &[NameClass],
+    expected_transports: &[Transport],
+) -> Option<String> {
+    if expected_classes.is_empty() || expected_transports.is_empty() {
+        return Some("no DNS class/transport rows were selected".to_string());
+    }
+    for class in expected_classes {
+        for transport in expected_transports {
+            let matches = reports
+                .iter()
+                .filter(|report| {
+                    report.name_class == class.as_str()
+                        && report.transport == transport.as_str()
+                })
+                .count();
+            if matches == 0 {
+                return Some(format!(
+                    "selected DNS row {}/{} was not collected",
+                    class.as_str(),
+                    transport.as_str()
+                ));
+            }
+            if matches > 1 {
+                return Some(format!(
+                    "selected DNS row {}/{} was collected {matches} times",
+                    class.as_str(),
+                    transport.as_str()
+                ));
+            }
+        }
+    }
+    for report in reports {
+        let class_selected = expected_classes
+            .iter()
+            .any(|class| report.name_class == class.as_str());
+        let transport_selected = expected_transports
+            .iter()
+            .any(|transport| report.transport == transport.as_str());
+        if !class_selected || !transport_selected {
+            return Some(format!(
+                "unexpected DNS row {}/{} was collected",
+                report.name_class, report.transport
+            ));
+        }
     }
     for report in reports {
         if let Some(reason) = report.failure_reason() {

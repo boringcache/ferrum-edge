@@ -122,9 +122,27 @@ pub async fn handle_tcp_connection(mut stream: TcpStream) -> Result<(), anyhow::
     }
     loop {
         let mut len_buf = [0u8; 2];
-        match tokio::time::timeout(STUB_TCP_IO_TIMEOUT, stream.read_exact(&mut len_buf)).await {
+        match tokio::time::timeout(STUB_TCP_IO_TIMEOUT, stream.read(&mut len_buf[..1])).await {
+            Ok(Ok(0)) => return Ok(()),
+            Ok(Ok(1)) => {}
+            Ok(Ok(_)) => {
+                return Err(anyhow::anyhow!(
+                    "invalid byte count while reading TCP DNS length prefix"
+                ));
+            }
+            Ok(Err(e)) => return Err(e.into()),
+            Err(_) => return Err(anyhow::anyhow!("timed out reading TCP DNS length")),
+        }
+        match tokio::time::timeout(
+            STUB_TCP_IO_TIMEOUT,
+            stream.read_exact(&mut len_buf[1..]),
+        )
+        .await
+        {
             Ok(Ok(_)) => {}
-            Ok(Err(e)) if e.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(()),
+            Ok(Err(e)) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
+                return Err(anyhow::anyhow!("truncated TCP DNS length prefix"));
+            }
             Ok(Err(e)) => return Err(e.into()),
             Err(_) => return Err(anyhow::anyhow!("timed out reading TCP DNS length")),
         }

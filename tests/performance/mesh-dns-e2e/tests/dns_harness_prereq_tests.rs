@@ -9,7 +9,7 @@ use mesh_dns_e2e_perf::dns_wire::{
     QTYPE_A, QTYPE_AAAA, TcpDnsFrameError, build_query, decode_tcp_dns_length, frame_for_tcp,
     parse_response, unframe_from_tcp,
 };
-use mesh_dns_e2e_perf::metrics::{ClassReport, selected_reports_failure};
+use mesh_dns_e2e_perf::metrics::{ClassReport, NameClass, Transport, selected_reports_failure};
 use mesh_dns_e2e_perf::upstream_stub::{build_stub_response, handle_tcp_connection};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
@@ -82,14 +82,33 @@ fn stub_answers_a_and_aaaa_and_rejects_truncated() {
 
 #[test]
 fn selected_reports_fail_on_zero_success_or_errors() {
-    assert!(selected_reports_failure(&[]).is_some());
-    assert!(selected_reports_failure(&[sample_report(0, 12, 0)]).is_some());
-    assert!(selected_reports_failure(&[sample_report(10, 1, 0)]).is_some());
-    assert!(selected_reports_failure(&[sample_report(10, 0, 1)]).is_some());
-    assert!(selected_reports_failure(&[sample_report(10, 0, 0)]).is_none());
+    let classes = [NameClass::UpstreamForward];
+    let transports = [Transport::Tcp];
+    assert!(selected_reports_failure(&[], &classes, &transports).is_some());
+    assert!(selected_reports_failure(&[sample_report(0, 12, 0)], &classes, &transports).is_some());
+    assert!(selected_reports_failure(&[sample_report(10, 1, 0)], &classes, &transports).is_some());
+    assert!(selected_reports_failure(&[sample_report(10, 0, 1)], &classes, &transports).is_some());
+    assert!(selected_reports_failure(&[sample_report(10, 0, 0)], &classes, &transports).is_none());
     let mixed = vec![sample_report(10, 0, 0), sample_report(0, 500, 0)];
-    let reason = selected_reports_failure(&mixed).expect("tcp row must fail");
-    assert!(reason.contains("zero successful queries"));
+    let reason = selected_reports_failure(&mixed, &classes, &transports)
+        .expect("duplicate selected row must fail");
+    assert!(reason.contains("collected 2 times"));
+
+    let missing_udp = selected_reports_failure(
+        &[sample_report(10, 0, 0)],
+        &classes,
+        &[Transport::Udp, Transport::Tcp],
+    )
+    .expect("missing selected UDP row must fail");
+    assert!(missing_udp.contains("upstream-forward/udp was not collected"));
+
+    let missing_class = selected_reports_failure(
+        &[sample_report(10, 0, 0)],
+        &[NameClass::UpstreamForward, NameClass::MeshInternal],
+        &transports,
+    )
+    .expect("missing selected class row must fail");
+    assert!(missing_class.contains("mesh-internal/tcp was not collected"));
 }
 
 #[tokio::test]
@@ -147,4 +166,25 @@ async fn tcp_stub_closes_on_empty_length_prefix() {
         .expect("stub should finish after hostile length");
     let result = joined.expect("join");
     assert!(result.is_err(), "empty TCP DNS length must fail closed");
+}
+
+#[tokio::test]
+async fn tcp_stub_rejects_truncated_length_prefix() {
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("ephemeral tcp bind");
+    let addr = listener.local_addr().expect("local addr");
+    let server = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.expect("accept");
+        handle_tcp_connection(stream).await
+    });
+
+    let mut client = TcpStream::connect(addr).await.expect("connect stub");
+    client.write_all(&[1]).await.expect("partial prefix");
+    client.shutdown().await.expect("shutdown writer");
+    let joined = tokio::time::timeout(Duration::from_secs(2), server)
+        .await
+        .expect("stub should finish after truncated length");
+    let result = joined.expect("join");
+    assert!(result.is_err(), "truncated TCP DNS length must fail closed");
 }

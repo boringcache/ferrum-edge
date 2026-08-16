@@ -105,6 +105,11 @@ async fn main() -> Result<(), anyhow::Error> {
         ProtocolMode::Tcp => vec![Transport::Tcp],
         ProtocolMode::Both => vec![Transport::Udp, Transport::Tcp],
     };
+    let selected_classes: Vec<NameClass> = NameClass::ALL
+        .iter()
+        .copied()
+        .filter(|class| names.iter().any(|(_, selected)| selected == class))
+        .collect();
 
     let mut all_reports: Vec<ClassReport> = Vec::new();
     for &transport in &transports {
@@ -128,18 +133,9 @@ async fn main() -> Result<(), anyhow::Error> {
         print_text_report(&all_reports, &args.target, args.concurrency);
     }
 
-    for transport in &transports {
-        if !all_reports
-            .iter()
-            .any(|report| report.transport == transport.as_str())
-        {
-            return Err(anyhow!(
-                "selected protocol {} produced no result rows",
-                transport.as_str()
-            ));
-        }
-    }
-    if let Some(reason) = selected_reports_failure(&all_reports) {
+    if let Some(reason) =
+        selected_reports_failure(&all_reports, &selected_classes, &transports)
+    {
         eprintln!("[dns_loadgen] {reason}");
         return Err(anyhow!(reason));
     }

@@ -790,6 +790,12 @@ def check_dns_tcp_stub_and_fail_closed(
         failures,
     )
     require(
+        "truncated TCP DNS length prefix" in stub_lib
+        and "tcp_stub_rejects_truncated_length_prefix" in harness_tests,
+        "TCP DNS stub must reject a one-byte truncated length prefix",
+        failures,
+    )
+    require(
         "UDP+TCP listening" in stub_bin,
         "dns_upstream_stub must advertise UDP+TCP on the configured address",
         failures,
@@ -797,6 +803,11 @@ def check_dns_tcp_stub_and_fail_closed(
     require(
         "selected_reports_failure" in metrics and "selected_reports_failure" in loadgen,
         "DNS loadgen must fail closed via selected_reports_failure",
+        failures,
+    )
+    require(
+        "selected DNS row" in metrics and "selected_classes" in loadgen,
+        "DNS loadgen must require every selected class/transport result row",
         failures,
     )
     require(
