@@ -1802,10 +1802,36 @@ def builder_arg_features_is_after_apt(dockerfile: str) -> bool:
     return apt >= 0 and features > apt
 
 
+def workflow_permissions_are_read_only(text: str) -> bool:
+    """Require one explicit top-level permissions map with no write grants."""
+
+    lines = text.splitlines()
+    indexes = [index for index, line in enumerate(lines) if line == "permissions:"]
+    if len(indexes) != 1:
+        return False
+
+    entries: dict[str, str] = {}
+    for line in lines[indexes[0] + 1 :]:
+        if line and not line.startswith(" "):
+            break
+        if not line:
+            continue
+        match = re.fullmatch(r"  ([a-z][a-z-]*): (read|write|none)", line)
+        if match is None:
+            return False
+        name, access = match.groups()
+        if name in entries:
+            return False
+        entries[name] = access
+
+    return entries.get("contents") == "read" and "write" not in entries.values()
+
+
 def check_common_trust(text: str, source: str, failures: list[str]) -> None:
     require(
-        re.search(r"(?m)^permissions:\n  contents: read\s*$", text) is not None,
-        f"{source} must keep workflow contents: read",
+        workflow_permissions_are_read_only(text),
+        f"{source} must keep one explicit read-only workflow permissions block "
+        "with contents: read",
         failures,
     )
     require(
@@ -2688,6 +2714,28 @@ def self_test() -> int:
         "    steps:\n"
         f"      - uses: {CHECKOUT} # v6\n"
     )
+    require(
+        workflow_permissions_are_read_only(sample),
+        "self-test: contents: read permissions should pass",
+        failures,
+    )
+    require(
+        workflow_permissions_are_read_only(
+            "name: demo\npermissions:\n  actions: read\n  contents: read\njobs:\n"
+        ),
+        "self-test: additional read-only workflow permissions should pass",
+        failures,
+    )
+    require(
+        not workflow_permissions_are_read_only(
+            "name: demo\npermissions:\n  contents: write\njobs:\n"
+        )
+        and not workflow_permissions_are_read_only(
+            "name: demo\npermissions:\n  actions: write\n  contents: read\njobs:\n"
+        ),
+        "self-test: workflow write permissions must fail",
+        failures,
+    )
     require(not pin_errors(sample, "self-test"), "self-test: pinned checkout should pass", failures)
     require(
         bool(pin_errors("uses: actions/checkout@v6\n", "self-test")),
@@ -3068,7 +3116,8 @@ def self_test() -> int:
     )
     require(
         any(
-            "download/promote the cross-run artifact before building" in item
+            "download/promote and mtime-refresh the exact cross-run artifact before building"
+            in item
             for item in consumer_save_failures
         ),
         "self-test: missing compile artifact/build/publish ordering must fail",
