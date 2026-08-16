@@ -272,6 +272,71 @@ def local_action_files(root: Path, action_dir: PurePosixPath) -> dict[str, Path]
     return discovered
 
 
+def read_bounded_local_payload(
+    path: Path,
+    *,
+    limit: int = MAX_MEMBER_BYTES,
+    expected_executable: bool | None = None,
+) -> bytes:
+    """Read a candidate file without exceeding `limit` bytes.
+
+    The read itself is capped at `limit + 1`. An oversize file, a short
+    read, or a size that changes after the read fails closed. A prefix of
+    a larger file is never returned. Size is not used as a permission to
+    perform an unbounded read.
+    """
+
+    if limit < 0:
+        raise TrustedActionError("local action read limit is invalid")
+    try:
+        with path.open("rb") as handle:
+            before = os.fstat(handle.fileno())
+            if not stat.S_ISREG(before.st_mode):
+                raise TrustedActionError(
+                    "local action input must remain a regular file"
+                )
+            executable = bool(
+                before.st_mode & (stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
+            )
+            if (
+                expected_executable is not None
+                and executable != expected_executable
+            ):
+                raise TrustedActionError(
+                    "local action executable bit changed before bounded read"
+                )
+            if before.st_size > limit:
+                raise TrustedActionError(
+                    f"local action input exceeds {limit} bytes"
+                )
+            payload = handle.read(limit + 1)
+            after = os.fstat(handle.fileno())
+    except OSError as exc:
+        raise TrustedActionError(
+            f"unreadable local action input ({exc})"
+        ) from exc
+    if len(payload) > limit:
+        raise TrustedActionError(f"local action input exceeds {limit} bytes")
+    stable_fields = (
+        "st_dev",
+        "st_ino",
+        "st_mode",
+        "st_size",
+        "st_mtime_ns",
+        "st_ctime_ns",
+    )
+    if any(
+        getattr(before, field) != getattr(after, field)
+        for field in stable_fields
+    ):
+        raise TrustedActionError("local action input changed during bounded read")
+    if after.st_size != len(payload):
+        raise TrustedActionError(
+            "local action input size does not match the bytes read"
+        )
+    return payload
+
+
 def verify_local_action(
     root: Path,
     action_dir: PurePosixPath,
@@ -291,21 +356,16 @@ def verify_local_action(
         executable, expected = manifest[relative]
         path = discovered[relative]
         try:
-            actual = path.read_bytes()
-        except OSError as exc:
+            actual = read_bounded_local_payload(
+                path,
+                limit=MAX_MEMBER_BYTES,
+                expected_executable=executable,
+            )
+        except (TrustedActionError, OSError) as exc:
             findings.append(f"{relative}: unreadable local action input ({exc})")
             continue
         if actual != expected:
             findings.append(f"{relative}: differs from the trusted revision")
-        try:
-            mode = path.stat().st_mode
-        except OSError as exc:
-            findings.append(f"{relative}: unreadable local action mode ({exc})")
-            continue
-        if bool(mode & (stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)) != executable:
-            findings.append(
-                f"{relative}: executable bit differs from the trusted revision"
-            )
     return findings
 
 
@@ -339,19 +399,58 @@ def setup_kubernetes_tools_destination_generation() -> (
     )
 
 
-def read_local_generation(
+def setup_kubernetes_tools_destination_path_modes() -> dict[str, bool]:
+    return {
+        path: executable
+        for path, executable, _digest in setup_kubernetes_tools_destination_generation()
+    }
+
+
+def admitted_transition_payload_limit() -> int:
+    """Tight exact-safe bound: the frozen destination `action.yml` size."""
+
+    return min(
+        MAX_MEMBER_BYTES, len(SETUP_KUBERNETES_TOOLS_DESTINATION_ACTION_YML)
+    )
+
+
+def read_admitted_transition_generation(
     root: Path,
     action_dir: PurePosixPath,
-) -> dict[str, tuple[bool, bytes]]:
-    """Read the working-tree action into the same shape as a trusted manifest."""
+    manifest: dict[str, tuple[bool, bytes]],
+) -> dict[str, tuple[bool, bytes]] | None:
+    """Read the local tree only when the frozen transition is still possible.
 
-    discovered = local_action_files(root, action_dir)
+    Proves the action path, trusted source fingerprint, and destination
+    path set/modes before any candidate payload is read. Extra, missing, or
+    remoded paths return `None` without reading unrelated files. The
+    destination payload read is bounded and fails closed on oversize or a
+    short/changed read.
+    """
+
+    if action_dir.as_posix() != SETUP_KUBERNETES_TOOLS_ACTION_PATH:
+        return None
+    if generation_fingerprint(manifest) != setup_kubernetes_tools_current_generation():
+        return None
+    try:
+        discovered = local_action_files(root, action_dir)
+    except (TrustedActionError, OSError):
+        return None
+    expected_modes = setup_kubernetes_tools_destination_path_modes()
+    if set(discovered) != set(expected_modes):
+        return None
     generation: dict[str, tuple[bool, bytes]] = {}
+    limit = admitted_transition_payload_limit()
     for relative, path in discovered.items():
-        payload = path.read_bytes()
-        mode = path.stat().st_mode
-        executable = bool(mode & (stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH))
-        generation[relative] = (executable, payload)
+        try:
+            payload = read_bounded_local_payload(
+                path,
+                limit=limit,
+                expected_executable=expected_modes[relative],
+            )
+        except (TrustedActionError, OSError):
+            return None
+        generation[relative] = (expected_modes[relative], payload)
     return generation
 
 
@@ -386,14 +485,18 @@ def evaluate_local_action(
     Returns `(findings, admitted_transition)`. Ordinary byte identity yields
     empty findings and `False`. The one admitted generation move yields empty
     findings and `True`. Every other mismatch keeps its fail-closed findings.
+
+    The transition fallback does not read candidate payloads until the action
+    path, trusted source fingerprint, and local path set/modes still match
+    the frozen destination shape. Extra or missing paths, mode mismatches,
+    oversize payloads, and short or changed reads keep the original findings.
     """
 
     findings = verify_local_action(root, action_dir, manifest)
     if not findings:
         return findings, False
-    try:
-        local = read_local_generation(root, action_dir)
-    except OSError:
+    local = read_admitted_transition_generation(root, action_dir, manifest)
+    if local is None:
         return findings, False
     if is_admitted_generation_transition(action_dir, manifest, local):
         return [], True
@@ -404,6 +507,14 @@ def _write(path: Path, contents: bytes, *, executable: bool = False) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_bytes(contents)
     path.chmod(0o755 if executable else 0o644)
+
+
+def _write_sparse(path: Path, size: int) -> None:
+    """Create a holey file of `size` bytes without materializing the payload."""
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("wb") as handle:
+        handle.truncate(size)
 
 
 def _archive_bytes(
@@ -483,9 +594,10 @@ def run_self_test() -> list[str]:
 
     Also proves the frozen setup-kubernetes-tools current→destination pair:
     exact old→new admission, then rejection of a wrong predecessor, a wrong
-    destination digest, extra or missing files, a mode change, and the same
-    bytes on an unrelated action path. Destination-as-base identity still
-    passes; further unadmitted drift and a revert still fail.
+    destination digest, extra or missing files, a mode change, an oversized
+    destination payload, an oversized extra file, and the same bytes on an
+    unrelated action path. Destination-as-base identity still passes; further
+    unadmitted drift and a revert still fail.
     """
 
     failures: list[str] = []
@@ -697,7 +809,11 @@ def _generation_transition_self_tests(
     tmp: Path,
     default_action_dir: PurePosixPath,
 ) -> list[str]:
-    """Exact old→new admission and every nearby miss for the frozen pair."""
+    """Exact old→new admission and every nearby miss for the frozen pair.
+
+    Includes bounded-read rejection of an oversized destination payload and
+    an oversized extra file that must not be read during the fallback.
+    """
 
     failures: list[str] = []
     current_files = _current_setup_k8s_files()
@@ -888,6 +1004,111 @@ def _generation_transition_self_tests(
         if not findings or transitioned:
             failures.append("destination extra file was accepted")
 
+    oversized_extra = tmp / "destination-oversized-extra-file"
+    _write_generation(
+        oversized_extra, SETUP_KUBERNETES_TOOLS_ACTION_PATH, destination_files
+    )
+    extra_overflow = (
+        oversized_extra
+        / SETUP_KUBERNETES_TOOLS_ACTION_PATH
+        / "bin"
+        / "overflow.bin"
+    )
+    _write_sparse(extra_overflow, MAX_MEMBER_BYTES + 1)
+    if extra_overflow.stat().st_size != MAX_MEMBER_BYTES + 1:
+        failures.append(
+            "oversized extra-file fixture did not reach MAX_MEMBER_BYTES + 1"
+        )
+    try:
+        findings, transitioned = evaluate_local_action(
+            oversized_extra, action_dir, current_manifest
+        )
+    except TrustedActionError as exc:
+        failures.append(f"oversized extra file raised: {exc}")
+    else:
+        if not findings or transitioned:
+            failures.append("oversized extra file was accepted as a transition")
+        elif not any(item.startswith("bin/overflow.bin:") for item in findings):
+            failures.append(
+                "oversized extra file lost the ordinary extra-path finding: "
+                f"{findings}"
+            )
+    if (
+        read_admitted_transition_generation(
+            oversized_extra, action_dir, current_manifest
+        )
+        is not None
+    ):
+        failures.append(
+            "oversized extra file still produced a transition generation"
+        )
+
+    oversized_primary = tmp / "destination-oversized-primary-file"
+    _write_generation(
+        oversized_primary,
+        SETUP_KUBERNETES_TOOLS_ACTION_PATH,
+        destination_files,
+    )
+    primary_overflow = (
+        oversized_primary
+        / SETUP_KUBERNETES_TOOLS_ACTION_PATH
+        / "action.yml"
+    )
+    _write_sparse(primary_overflow, MAX_MEMBER_BYTES + 1)
+    try:
+        findings, transitioned = evaluate_local_action(
+            oversized_primary, action_dir, current_manifest
+        )
+    except TrustedActionError as exc:
+        failures.append(f"oversized primary file raised: {exc}")
+    else:
+        if not findings or transitioned:
+            failures.append("oversized primary file was accepted as a transition")
+        elif not any("exceeds" in item for item in findings):
+            failures.append(
+                "oversized primary file lost the bounded-read finding: "
+                f"{findings}"
+            )
+
+    oversized_dest = tmp / "destination-oversized-payload"
+    _write_generation(
+        oversized_dest,
+        SETUP_KUBERNETES_TOOLS_ACTION_PATH,
+        {
+            "action.yml": (
+                False,
+                destination_files["action.yml"][1] + b"\0",
+            )
+        },
+    )
+    try:
+        findings, transitioned = evaluate_local_action(
+            oversized_dest, action_dir, current_manifest
+        )
+    except TrustedActionError as exc:
+        failures.append(f"oversized destination payload raised: {exc}")
+    else:
+        if not findings or transitioned:
+            failures.append(
+                "oversized destination payload was accepted as a transition"
+            )
+        elif not any(
+            "differs from the trusted revision" in item for item in findings
+        ):
+            failures.append(
+                "oversized destination payload lost the ordinary byte-diff "
+                f"finding: {findings}"
+            )
+    if (
+        read_admitted_transition_generation(
+            oversized_dest, action_dir, current_manifest
+        )
+        is not None
+    ):
+        failures.append(
+            "oversized destination payload still produced a transition generation"
+        )
+
     missing_dest = tmp / "destination-missing-file"
     missing_dest.joinpath(SETUP_KUBERNETES_TOOLS_ACTION_PATH).mkdir(parents=True)
     try:
@@ -991,6 +1212,32 @@ def _generation_transition_self_tests(
                 "unrelated path lost ordinary byte-identical behavior: "
                 f"findings={findings} transitioned={transitioned}"
             )
+
+    bounded_oversize = tmp / "bounded-reader-oversize.bin"
+    # First six bytes are a legal payload; the extra suffix must not be
+    # returned as an accepted prefix of an over-limit file.
+    bounded_oversize.write_bytes(b"prefixXXXX")
+    try:
+        read_bounded_local_payload(bounded_oversize, limit=6)
+    except TrustedActionError:
+        pass
+    else:
+        failures.append("bounded reader accepted an over-limit payload")
+
+    bounded_exact = tmp / "bounded-reader-exact.bin"
+    bounded_exact.write_bytes(b"prefix")
+    try:
+        payload = read_bounded_local_payload(bounded_exact, limit=6)
+    except TrustedActionError as exc:
+        failures.append(f"bounded reader rejected an in-limit payload: {exc}")
+    else:
+        if payload != b"prefix":
+            failures.append("bounded reader returned the wrong in-limit payload")
+
+    if admitted_transition_payload_limit() != len(
+        SETUP_KUBERNETES_TOOLS_DESTINATION_ACTION_YML
+    ):
+        failures.append("admitted transition payload limit drifted from destination")
 
     return failures
 
