@@ -44,8 +44,9 @@ adding, removing, or materially changing a workflow.
 | `ambient-host-udp-live.yml` | Ambient Host UDP Live Kernel | Every PR, `merge_group`, manual | Privileged live-kernel gate for Ambient host-network UDP capture (`ProxyHostUdpBackend`), plus a production-image contract job that proves the chart-selected `-ebpf-tools` runtime can execute the shell/iptables tool set while `-ebpf` stays distroless; relevance is decided by a trusted-base classifier and `Ambient Host UDP Live` reports on every run. |
 | `launch-integrity.yml` | Launch Readiness Integrity | `pull_request_target` for PRs to `main`, `merge_group` | Read-only trusted-base validation that a candidate preserved the launch/release governance contract. Executable gate code (checker, readiness/release/integrity/advisory-trust workflows and verifiers) is byte-frozen to protected `main`; candidate-editable data (blocker policy, exemption schema, document markers, CODEOWNERS coverage) is structurally validated, and check-name/advisory-secret scanning covers every workflow including ones the candidate adds. It never computes a launch verdict, so open launch blockers keep it green. `Launch Readiness Integrity` is directly required. See [launch-readiness.md](launch-readiness.md). |
 | `launch-readiness.yml` | Launch Readiness | PRs, `merge_group`, push to `main`, `v*` tags, daily schedule, manual | Live go/no-go launch verdict (`Launch Readiness Gate`). Expected to stay red while real blockers are open; it is release-blocking, **not** a required PR context. |
-| `node-waypoint-ebpf-live.yml` | NodeWaypoint eBPF Live Datapath | Path-filtered PRs, manual | Live eBPF datapath validation in kind. |
-| `istio-status-cas-live.yml` | Istio Status CAS Live | Path-filtered PRs, manual | Kind/apiserver competing-writer proof that Ferrum's Istio status CAS preserves foreign and Ferrum-owned conditions. Not a required live-suite check. |
+| `node-waypoint-ebpf-live.yml` | NodeWaypoint eBPF Live Datapath | PRs, `merge_group`, push to `main`, manual | Optional always-reporting live eBPF datapath. `NodeWaypoint eBPF Live` is **not** branch-protection-required; relevance is decided by a trusted-base classifier and the aggregate reports green for proven irrelevance. |
+| `istio-status-cas-live.yml` | Istio Status CAS Live | PRs, `merge_group`, push to `main`, manual | Optional always-reporting Kind/apiserver competing-writer proof. `Istio Status CAS Live` is **not** a required live-suite check. |
+| `cni-lifecycle-live.yml` | CNI Install Lifecycle Live | PRs, `merge_group`, push to `main`, manual | Optional always-reporting CNI install/uninstall lifecycle proof. `CNI Lifecycle Live` is **not** a required live-suite check. |
 | `multicluster-federation-live.yml` | Multicluster Federation Live Datapath | PRs, `merge_group`, push to `main`, manual | Release-blocking multicluster federation datapath validation; `Multicluster Federation Live` is directly required on PRs and merge-queue groups. |
 | `multicluster-poller-partition-live.yml` | Multicluster Poller Partition Live | PRs, `merge_group`, push to `main`, manual | Release-blocking two-CP/two-DP trust/discovery partition and bounded last-good-retention validation; `Multicluster Poller Partition Live` is directly required. |
 | `dependency-audit.yml` | Dependency Audit | Weekly schedule, manual | Scheduled supply-chain governance beyond the per-PR audit gate. |
@@ -125,6 +126,17 @@ blocker is open, so requiring it would deadlock blocker-fix pull requests. The
 merge control is the separate integrity context above; the go/no-go verdict
 remains release-blocking through `release.yml`'s `validate-launch-readiness`
 job. See [launch-readiness.md](launch-readiness.md).
+
+Three additional live suites use the same trusted-base classifier and
+always-reporting aggregate pattern but are **not** branch-protection-required
+and must not be added to this list by this contract: `NodeWaypoint eBPF Live`
+from `node-waypoint-ebpf-live.yml`, `Istio Status CAS Live` from
+`istio-status-cas-live.yml`, and `CNI Lifecycle Live` from
+`cni-lifecycle-live.yml`. They still trigger on every pull request,
+`merge_group`, push to `main`, and manual dispatch. Unrelated PRs only pay for
+the cheap `changes` and `gate` jobs; the expensive live jobs run when the
+trusted-base classifier marks the diff relevant, and on every main/manual
+force-run.
 
 Each owner declares a `merge_group` (`types: [checks_requested]`) trigger in
 addition to its existing `pull_request` / `pull_request_target` / `push` /
@@ -531,9 +543,17 @@ the shared-types test runs on stable Rust.
 
 **Runs**: `ubuntu-24.04`
 
-`node-waypoint-ebpf-live` runs on PRs that touch eBPF, node-agent, NodeWaypoint
-identity, netns capture, socket option, TCP scope, chart, or live harness files.
-It builds the normal runtime Docker image from the host-built binary, builds the
+`node-waypoint-ebpf-live` triggers on every pull request, merge-queue group,
+push to `main`, and manual dispatch. It carries no top-level `paths:` filter.
+A `changes` job decides relevance from the **base branch's** copy of
+`.github/scripts/live_suite_path_filter.py`, and the `if: always()` aggregate
+`NodeWaypoint eBPF Live` reports on every run: green when the suite passed or
+was legitimately irrelevant, red when a relevant live job failed or the
+classifier failed closed. This aggregate is **not** a branch-protection-required
+check. The relevant surfaces are eBPF, node-agent, NodeWaypoint identity,
+netns capture, socket option, TCP scope, chart, live harness, and the listed
+docs. When relevant (and on every main/manual force-run) it builds the
+normal runtime Docker image from the host-built binary, builds the
 eBPF userspace binary with `FEATURES=cloud-secrets,ebpf`, builds the
 `ferrum-ebpf` BPF ELF with nightly Rust, and packages the `:<tag>-ebpf` runtime
 image from those cached host-built artifacts instead of recompiling inside
@@ -567,9 +587,13 @@ diagnostics, mesh drift snapshots, pod-registry dumps, live assertions, and
 
 **Runs**: `ubuntu-24.04`
 
-`istio-status-cas-live.yml` is a path-filtered Kind/apiserver lane for issue #3838.
+`istio-status-cas-live.yml` is an optional Kind/apiserver lane for issue #3838.
 It is **not** a required live-suite check and is not wired into the `ci.yml`
-`Tests` aggregate (that aggregate is Cross-frozen). The workflow uses the same
+`Tests` aggregate (that aggregate is Cross-frozen). The workflow triggers on
+every pull request, merge-queue group, push to `main`, and manual dispatch, with
+no top-level `paths:` filter. A trusted-base `changes` job decides relevance,
+and the `if: always()` aggregate `Istio Status CAS Live` reports on every run.
+The workflow uses the same
 pinned `.github/actions/setup-kubernetes-tools` Kind/kubectl install as the other
 Kind-capable jobs, applies the checked-in AuthorizationPolicy CRD fixture
 (`tests/fixtures/k8s/istio_authorizationpolicy_status_crd.yaml`), and runs the
@@ -653,6 +677,26 @@ the datapath needs privileged host-netns manipulation that the live-kernel job
 already performs against the real kernel. The two jobs are complementary — the
 live job proves the datapath, the image job proves the shipped runtime can
 execute it — and the `Ambient Host UDP Live` gate requires both.
+
+#### 5c. CNI Install Lifecycle Live Workflow
+
+**Runs**: `ubuntu-24.04`
+
+`cni-lifecycle-live.yml` is an optional hosted proof for issue #3609. It is
+**not** a required live-suite check and must not be added to branch protection.
+The workflow triggers on every pull request, merge-queue group, push to `main`,
+and manual dispatch, with no top-level `paths:` filter. A trusted-base
+`changes` job decides relevance from the retired CNI `paths:` list plus the
+classifier script (Helm matches stay exact chart files, not the whole
+`charts/ferrum-mesh/` tree), and the `if: always()` aggregate `CNI Lifecycle
+Live` reports on every run: green when the suite passed or was legitimately
+irrelevant, red when a relevant live job failed or the classifier failed
+closed. Unrelated PRs only pay for the cheap `changes` and `gate` jobs.
+
+When relevant (and on every main/manual force-run) the live job builds
+`ferrum-edge` and `ferrum-cni`, packages the runtime image, and runs
+`tests/k8s/cni_lifecycle_live/run.sh` on kind. Logic stays in that harness so
+the workflow remains a thin launcher.
 
 #### 6. Performance Regression Job
 
@@ -1388,21 +1432,32 @@ example consumes the exact `origin/${BASE_REF}` fetched by the immediately
 preceding policy step, so those adjacent steps have an intentional ordering
 dependency.
 
-##### Trusted-base relevance for required live gates
+##### Trusted-base relevance for governed live suites
 
-`mesh-e2e-sidecar-live.yml` and `multicluster-federation-live.yml` publish
-required status checks that may legitimately skip their expensive live job when
-a pull request touches nothing relevant. That skip is a security boundary: if
-the relevance verdict were computed by the pull request's own copy of
-`.github/scripts/live_suite_path_filter.py`, a pull request could widen
-`SUITE_PATTERNS`, declare itself irrelevant, skip the live job, and still turn
-the required gate green.
-
-Both workflows therefore share one byte-identical relevance job, frozen in the
-trusted verifier as `LIVE_SUITE_RELEVANCE_JOB_TEMPLATE` and enforced absolutely
-by `live_suite_relevance_errors` in exact validation *and* in pull-request
+Seven workflows share one byte-identical relevance job, frozen in the trusted
+verifier as `LIVE_SUITE_RELEVANCE_JOB_TEMPLATE` and enforced absolutely by
+`live_suite_relevance_errors` in exact validation *and* in pull-request
 comparison. Only the display name, temp-file slug, and `--suite` selector
-differ. Its load-bearing properties:
+differ.
+
+Four of them publish **required** status checks: `mesh-e2e-sidecar-live.yml`,
+`multicluster-federation-live.yml`, `multicluster-poller-partition-live.yml`,
+and `ambient-host-udp-live.yml` (`Ambient Host UDP Live` is in
+`LIVE_SUITE_RELEVANCE_CONTRACTS` with a complete live/image/gate freeze). Three
+publish **optional** always-reporting aggregates that are **not**
+branch-protection-required and must not be added to the required-check list:
+`node-waypoint-ebpf-live.yml` (`NodeWaypoint eBPF Live`),
+`istio-status-cas-live.yml` (`Istio Status CAS Live`), and
+`cni-lifecycle-live.yml` (`CNI Lifecycle Live`).
+
+A required or optional aggregate may legitimately skip its expensive live job
+when a pull request touches nothing relevant. That skip is a security
+boundary: if the relevance verdict were computed by the pull request's own copy
+of `.github/scripts/live_suite_path_filter.py`, a pull request could widen
+`SUITE_PATTERNS`, declare itself irrelevant, skip the live job, and still turn
+the aggregate green.
+
+Its load-bearing properties:
 
 - The relevance script comes from the base-branch tip of the **base**
   repository, never from the pull-request checkout. This holds for fork pull
@@ -1428,7 +1483,14 @@ Freezing the relevance job alone would not be enough — a pull request could
 leave it untouched and instead rewrite the live job's `needs`/`if`. The binding
 `needs: changes` plus `if: needs.changes.outputs.relevant == 'true'` is
 therefore part of the same contract, and deleting a governed workflow outright
-is rejected as well.
+is rejected as well. Optional suites additionally freeze their `if: always()`
+aggregates (`LIVE_SUITE_GATE_CONTRACTS`) so a skip cannot be silent: classifier
+or relevant-live failure is red; proven irrelevance is green. Relevance uses
+the immutable pull-request / merge-group base and `--force-run` on push-to-main
+and `workflow_dispatch`. Ambient Host UDP keeps its existing required-gate
+freeze (`AMBIENT_HOST_UDP_GATE_JOB`) and does not grow a `push: main` trigger
+in this contract. None of these workflows may restore a PR-widenable top-level
+`paths:` filter.
 
 ##### Admitted fuzz/property lane
 

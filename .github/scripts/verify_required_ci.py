@@ -518,6 +518,38 @@ def merge_group_self_test() -> list[str]:
         if marker not in cross:
             failures.append(f"cross-build policy missing merge_group safety marker {marker!r}")
 
+    if extract_documentation_paths(
+        "on:\n  pull_request:\n    paths:\n      - docs/mesh.md\n"
+    ) != {"docs/mesh.md"}:
+        failures.append("extract_documentation_paths missed a workflow paths entry")
+
+    optional_live_workflows = {
+        ".github/workflows/node-waypoint-ebpf-live.yml",
+        ".github/workflows/istio-status-cas-live.yml",
+        ".github/workflows/cni-lifecycle-live.yml",
+    }
+    optional_live_checks = {
+        "NodeWaypoint eBPF Live",
+        "Istio Status CAS Live",
+        "CNI Lifecycle Live",
+    }
+    for workflow_path in optional_live_workflows:
+        if workflow_path in REQUIRED_MERGE_GROUP_WORKFLOWS:
+            failures.append(
+                f"{workflow_path} must not be added to required merge-group owners"
+            )
+        if workflow_path in DEDICATED_REQUIRED_CHECKS:
+            failures.append(
+                f"{workflow_path} must not be added to dedicated required checks"
+            )
+    required_check_names = {check["name"] for check in DEDICATED_REQUIRED_CHECKS.values()}
+    required_check_names.update(REQUIRED_MERGE_GROUP_WORKFLOWS.values())
+    for check_name in optional_live_checks:
+        if check_name in required_check_names:
+            failures.append(
+                f"optional live aggregate {check_name!r} must not become a required check"
+            )
+
     return failures
 
 
@@ -1172,18 +1204,11 @@ def main() -> int:
     planner_errors.extend(validate_release_workflow(release_yml))
     planner_errors.extend(release_attestation_self_test(release_yml))
 
-    node_waypoint_yml = Path(
-        ".github/workflows/node-waypoint-ebpf-live.yml"
-    ).read_text(encoding="utf-8")
-    # `ambient-host-udp-live.yml` deliberately carries NO top-level `paths:`
-    # block: it runs unconditionally on every pull_request / merge_group and
-    # decides relevance from a trusted-base classifier instead, so it has no
-    # documentation paths to extract. Its documentation trigger set lives in
-    # `AMBIENT_HOST_UDP_DOCUMENTATION_PATHS`, already folded into the shared
-    # `LIVE_SUITE_DOCUMENTATION_PATHS` below.
-    required_full_ci_docs = LIVE_SUITE_DOCUMENTATION_PATHS | extract_documentation_paths(
-        node_waypoint_yml
-    )
+    # Governed live suites decide documentation triggers from
+    # `LIVE_SUITE_DOCUMENTATION_PATHS` in the trusted classifier. They must
+    # not carry a workflow-level `paths:` filter, including the optional
+    # NodeWaypoint / Istio CAS / CNI suites migrated in issue #3908.
+    required_full_ci_docs = LIVE_SUITE_DOCUMENTATION_PATHS
     configured_live_doc_patterns = {
         pattern
         for patterns in SUITE_PATTERNS.values()
@@ -1201,6 +1226,26 @@ def main() -> int:
         planner_errors.append(
             f"PR planner must keep live-suite documentation `{path}` on full CI"
         )
+
+    optional_trusted_live_workflows = (
+        ".github/workflows/node-waypoint-ebpf-live.yml",
+        ".github/workflows/istio-status-cas-live.yml",
+        ".github/workflows/cni-lifecycle-live.yml",
+    )
+    for optional_live in optional_trusted_live_workflows:
+        optional_yml = Path(optional_live).read_text(encoding="utf-8")
+        if not pull_request_trigger_is_unconditional(optional_yml):
+            planner_errors.append(
+                f"{optional_live} must trigger on every pull request without path filters"
+            )
+        if not merge_group_trigger_is_present(optional_yml):
+            planner_errors.append(
+                f"{optional_live} must declare an unconditional merge_group trigger"
+            )
+        if not main_push_trigger_is_unconditional(optional_yml):
+            planner_errors.append(
+                f"{optional_live} must push to main without a paths filter"
+            )
 
     if not missing and not extra and not planner_errors:
         print(

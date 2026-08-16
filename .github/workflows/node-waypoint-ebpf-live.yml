@@ -1,55 +1,27 @@
 name: NodeWaypoint eBPF Live Datapath
 
+# Optional always-reporting live datapath. `NodeWaypoint eBPF Live` is NOT a
+# branch-protection-required check: it reports on every run (green when the
+# suite passed or the trusted-base classifier proved irrelevance; red when
+# the classifier or a relevant live job failed). Relevance is decided by the
+# trusted-base `changes` job, never by this pull request's checkout.
+
 on:
   workflow_dispatch:
   pull_request:
-    paths:
-      - ".github/workflows/node-waypoint-ebpf-live.yml"
-      - ".dockerignore"
-      - ".github/actions/package-ferrum-runtime-image/**"
-      - ".github/actions/setup-kubernetes-tools/**"
-      - "Cargo.toml"
-      - "Cargo.lock"
-      - "Dockerfile"
-      - "Dockerfile.iproute2-layer"
-      - "Dockerfile.release"
-      - ".github/scripts/stage_iproute2_runtime.sh"
-      - "build.rs"
-      - "proto/**"
-      - "ebpf/**"
-      - "src/capture/**"
-      - "src/ebpf/**"
-      - "src/grpc/**"
-      - "src/identity/**"
-      - "src/k8s_controller/**"
-      - "src/modes/control_plane.rs"
-      - "src/modes/mesh/**"
-      - "src/modes/node_agent.rs"
-      - "src/plugins/mesh/**"
-      - "src/plugins/prometheus_metrics.rs"
-      - "src/proxy/hbone_pool.rs"
-      - "src/proxy/mesh_tcp_egress.rs"
-      - "src/proxy/mod.rs"
-      - "src/proxy/hbone_proxy.rs"
-      - "src/proxy/netns_capture.rs"
-      - "src/proxy/tcp_proxy.rs"
-      - "src/router_cache.rs"
-      - "src/socket_opts.rs"
-      - "charts/ferrum-mesh/**"
-      - "tests/k8s/lib/**"
-      - "tests/k8s/node_waypoint_ebpf_live/**"
-      - "docs/mesh.md"
-      - "docs/mesh_supported_matrix.md"
-      - "docs/node_agent.md"
-      - "docs/ci_cd.md"
-      - "docs/plans/node_waypoint_transport_adr.md"
+  merge_group:
+    types:
+      - checks_requested
+  push:
+    branches:
+      - main
 
 permissions:
   contents: read
 
 concurrency:
-  group: node-waypoint-ebpf-live-${{ github.ref }}
-  cancel-in-progress: true
+  group: ${{ github.event_name == 'pull_request' && format('node-waypoint-ebpf-live-pr-{0}', github.event.pull_request.number) || (github.event_name == 'merge_group' && format('node-waypoint-ebpf-live-merge-group-{0}', github.event.merge_group.head_sha) || (github.event_name == 'push' && format('node-waypoint-ebpf-live-{0}', github.ref) || 'node-waypoint-ebpf-live-shared')) }}
+  cancel-in-progress: ${{ github.event_name != 'workflow_dispatch' }}
 
 env:
   FERRUM_IMAGE_REPOSITORY: ferrum-edge
@@ -61,8 +33,182 @@ env:
   ISTIO_CRD_SHA256: 952afcf4b1bf47d2bdf1f230d636f9e613c3ee9cc68ef53ab751f6d59e2ee205
 
 jobs:
+  changes:
+    name: NodeWaypoint eBPF trigger
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      relevant: ${{ steps.filter.outputs.relevant }}
+    steps:
+      - name: Checkout Ferrum Edge
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
+        with:
+          fetch-depth: 0
+
+      # Relevance decides whether a REQUIRED live gate runs at all, so it must
+      # never be computed by code the pull request supplies: a PR that widens
+      # its own suite patterns could declare itself irrelevant, skip the live
+      # job, and still turn the required check green.
+      #
+      # Everything below reads ONE immutable trusted commit. The base-branch
+      # tip is fetched from the base repository, pinned once to a full object
+      # id, checked to hold the filter as a regular blob, and then read BY
+      # OBJECT ID rather than by path. A fork head, a rewritten head, or a push
+      # to the base branch mid-run therefore cannot swap the script between
+      # validation and execution, and every failure exits non-zero so the gate
+      # fails closed instead of quietly declaring itself irrelevant.
+      #
+      # This block is frozen by .github/scripts/verify_cross_build_policy.py
+      # (see live_suite_relevance_errors); it is byte-identical across every
+      # live-suite workflow apart from the suite, slug, and display name.
+      - name: Check for node-waypoint-ebpf changes
+        id: filter
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          BASE_REF: ${{ github.base_ref }}
+          MERGE_BASE_SHA: ${{ github.event.merge_group.base_sha }}
+        run: |
+          set -euo pipefail
+
+          filter_path=.github/scripts/live_suite_path_filter.py
+          changed_files="$RUNNER_TEMP/node-waypoint-ebpf-changed-files.txt"
+          trusted_filter="$RUNNER_TEMP/node-waypoint-ebpf-trusted-filter.py"
+          rm -f -- "$changed_files" "$trusted_filter"
+          : > "$changed_files"
+
+          filter_args=(--suite node-waypoint-ebpf --changed-files "$changed_files")
+
+          if [ "$EVENT_NAME" = "pull_request" ]; then
+            # `github.base_ref` names a branch in the BASE repository, so a fork
+            # cannot control its contents -- but it is still untrusted text.
+            # Reject anything outside a conservative branch charset before it
+            # reaches a refspec so no option, pathspec, or revision-syntax
+            # metacharacter can be smuggled into a git invocation.
+            if ! printf '%s' "$BASE_REF" | grep -Eq '^[A-Za-z0-9][A-Za-z0-9._/-]{0,200}$'; then
+              echo "::error::refusing to resolve an unsafe base ref" >&2
+              exit 1
+            fi
+            case "$BASE_REF" in
+              *..*|*//*|*/|*.lock|*/.*)
+                echo "::error::refusing to resolve an unsafe base ref" >&2
+                exit 1
+                ;;
+            esac
+            fetched=false
+            for attempt in 1 2 3; do
+              if git fetch --no-tags --no-recurse-submodules origin \
+                "+refs/heads/${BASE_REF}:refs/ferrum/trusted-base"; then
+                fetched=true
+                break
+              fi
+              echo "git fetch of ${BASE_REF} failed (attempt ${attempt}/3); retrying" >&2
+              sleep $(( attempt * 10 ))
+            done
+            if [ "$fetched" != true ]; then
+              echo "::error::git fetch of ${BASE_REF} failed after 3 attempts" >&2
+              exit 1
+            fi
+            # Pin the moving tip exactly once; nothing below re-resolves a ref.
+            trusted_sha="$(git rev-parse --verify --quiet refs/ferrum/trusted-base^{commit} || true)"
+          elif [ "$EVENT_NAME" = "merge_group" ]; then
+            # Merge queues synthesize a combined SHA. Use the event's base_sha
+            # as the trusted filter source and the change-set base so a missing
+            # pull_request payload cannot force-skip or check only main.
+            if ! printf '%s' "$MERGE_BASE_SHA" | grep -Eq '^[0-9a-f]{40}$'; then
+              echo "::error::merge_group base_sha missing or malformed" >&2
+              exit 1
+            fi
+            if ! git cat-file -e "${MERGE_BASE_SHA}^{commit}" 2>/dev/null; then
+              fetched=false
+              for attempt in 1 2 3; do
+                if git fetch --no-tags --no-recurse-submodules origin \
+                  "${MERGE_BASE_SHA}"; then
+                  fetched=true
+                  break
+                fi
+                echo "git fetch of merge_group base failed (attempt ${attempt}/3); retrying" >&2
+                sleep $(( attempt * 10 ))
+              done
+              if [ "$fetched" != true ]; then
+                echo "::error::git fetch of merge_group base_sha failed after 3 attempts" >&2
+                exit 1
+              fi
+            fi
+            trusted_sha="$MERGE_BASE_SHA"
+          else
+            # A push to the default branch and a manual dispatch already run
+            # trusted code, so the checked-out commit IS the trusted base.
+            trusted_sha="$(git rev-parse --verify --quiet 'HEAD^{commit}' || true)"
+            filter_args+=(--force-run)
+          fi
+
+          if ! printf '%s' "$trusted_sha" | grep -Eq '^[0-9a-f]{40}$'; then
+            echo "::error::trusted base did not resolve to a full commit id" >&2
+            exit 1
+          fi
+
+          # Reject anything that is not a regular blob at that exact commit: a
+          # symlink (mode 120000) would make a content read emit its target
+          # path, a gitlink (160000) or tree (040000) carries no script at all,
+          # and a missing entry must fail closed rather than fall back to the
+          # pull request's own copy.
+          entry="$(git ls-tree --full-tree "$trusted_sha" -- "$filter_path")"
+          if [ "$(printf '%s\n' "$entry" | grep -c . || true)" != "1" ]; then
+            echo "::error::${filter_path} is not a single tree entry at ${trusted_sha}" >&2
+            exit 1
+          fi
+          entry_mode="$(printf '%s\n' "$entry" | awk '{print $1}')"
+          entry_type="$(printf '%s\n' "$entry" | awk '{print $2}')"
+          entry_object="$(printf '%s\n' "$entry" | awk '{print $3}')"
+          entry_path="$(printf '%s\n' "$entry" | awk -F'\t' '{print $2}')"
+          if [ "$entry_type" != "blob" ] || [ "$entry_path" != "$filter_path" ]; then
+            echo "::error::${filter_path} is not a blob at ${trusted_sha}" >&2
+            exit 1
+          fi
+          case "$entry_mode" in
+            100644|100755) ;;
+            *)
+              echo "::error::${filter_path} has non-regular mode ${entry_mode}" >&2
+              exit 1
+              ;;
+          esac
+          if ! printf '%s' "$entry_object" | grep -Eq '^[0-9a-f]{40}$'; then
+            echo "::error::${filter_path} did not resolve to an object id" >&2
+            exit 1
+          fi
+          if [ "$(git cat-file -s "$entry_object")" -gt 262144 ]; then
+            echo "::error::${filter_path} exceeds the 256 KiB trusted-filter ceiling" >&2
+            exit 1
+          fi
+          git cat-file blob "$entry_object" > "$trusted_filter"
+
+          if [ "$EVENT_NAME" = "pull_request" ] || [ "$EVENT_NAME" = "merge_group" ]; then
+            git diff --name-only --no-renames "${trusted_sha}...HEAD" \
+              | sort > "$changed_files"
+          fi
+
+          # Isolated interpreter: no user site directory, no PYTHON* overrides,
+          # and no implicit path entry, so nothing the pull request committed
+          # can be imported by the trusted filter.
+          python3 -I "$trusted_filter" --self-test
+          plan="$(python3 -I "$trusted_filter" "${filter_args[@]}")"
+          relevant="$(printf '%s\n' "$plan" | sed -n 's/^relevant=//p')"
+          case "$relevant" in
+            true|false) ;;
+            *)
+              echo "::error::trusted relevance filter produced no usable verdict" >&2
+              exit 1
+              ;;
+          esac
+          echo "relevant=$relevant" >> "$GITHUB_OUTPUT"
+          echo "Relevance decided by trusted base ${trusted_sha}." >> "$GITHUB_STEP_SUMMARY"
+          printf '%s\n' "$plan" | sed -n '/^## /,$p' >> "$GITHUB_STEP_SUMMARY"
+
   production-dockerfile-smoke:
     name: Production Dockerfile eBPF image smoke
+    needs: changes
+    if: needs.changes.outputs.relevant == 'true'
     runs-on: ubuntu-24.04
     timeout-minutes: 90
 
@@ -130,6 +276,8 @@ jobs:
 
   node-waypoint-ebpf-live:
     name: NodeWaypoint eBPF live datapath
+    needs: changes
+    if: needs.changes.outputs.relevant == 'true'
     runs-on: ubuntu-24.04
     timeout-minutes: 120
 
@@ -398,3 +546,46 @@ jobs:
       - name: Delete kind cluster
         if: always()
         run: kind delete cluster --name "$KIND_CLUSTER" || true
+
+  gate:
+    name: NodeWaypoint eBPF Live
+    needs:
+      - changes
+      - production-dockerfile-smoke
+      - node-waypoint-ebpf-live
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Summarize NodeWaypoint eBPF live result
+        run: |
+          {
+            echo "## NodeWaypoint eBPF Live"
+            echo ""
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          if [ "${{ needs.changes.result }}" != "success" ]; then
+            echo "Failed before change detection completed." >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
+
+          if [ "${{ needs.changes.outputs.relevant }}" = "false" ]; then
+            echo "Skipped live datapath validation: no NodeWaypoint eBPF, node-agent, capture, chart, fixture, documentation, or CI workflow surfaces changed." >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+
+          if [ "${{ needs.changes.outputs.relevant }}" != "true" ]; then
+            echo "Change detection returned an invalid relevance result: ${{ needs.changes.outputs.relevant }}." >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
+
+          if [ "${{ needs.production-dockerfile-smoke.result }}" != "success" ]; then
+            echo "Production Dockerfile eBPF image smoke failed or did not complete: ${{ needs.production-dockerfile-smoke.result }}." >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
+
+          if [ "${{ needs.node-waypoint-ebpf-live.result }}" != "success" ]; then
+            echo "Live datapath validation failed or did not complete: ${{ needs.node-waypoint-ebpf-live.result }}." >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
+
+          echo "Production Dockerfile eBPF image smoke and live datapath validation passed." >> "$GITHUB_STEP_SUMMARY"

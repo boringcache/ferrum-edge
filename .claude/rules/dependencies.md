@@ -36,13 +36,18 @@ Full policy: `docs/dependency-policy.md`. These are the load-bearing rules.
 - The trusted-base `pr_ci_plan.py --self-test` rejects mutable or dynamic
   action refs, pipe-to-shell installers, and unverified tool downloads. The
   pull request's proposed policy is tested separately but never controls gates.
-- A required live gate must decide its own relevance from a pinned trusted-base
-  copy of `live_suite_path_filter.py`, never from the pull request's checkout.
+- A governed live suite must decide relevance from a pinned trusted-base copy
+  of `live_suite_path_filter.py`, never from the pull request's checkout.
   `verify_cross_build_policy.py` freezes that block byte-for-byte
-  (`LIVE_SUITE_RELEVANCE_JOB_TEMPLATE`) for `mesh-e2e-sidecar-live.yml` and
-  `multicluster-federation-live.yml`, together with the live job's
-  `needs`/`if` binding. See `docs/ci_cd.md` → "Trusted-base relevance for
-  required live gates".
+  (`LIVE_SUITE_RELEVANCE_JOB_TEMPLATE`) for every
+  `LIVE_SUITE_RELEVANCE_CONTRACTS` workflow — required gates
+  (`mesh-e2e-sidecar-live.yml`, `multicluster-federation-live.yml`,
+  `multicluster-poller-partition-live.yml`, `ambient-host-udp-live.yml`) and
+  optional always-reporting aggregates (`node-waypoint-ebpf-live.yml`,
+  `istio-status-cas-live.yml`, `cni-lifecycle-live.yml`) — together with each
+  live job's `needs`/`if` binding. Optional aggregate names are not
+  branch-protection-required. See `docs/ci_cd.md` → "Trusted-base relevance
+  for governed live suites".
 - The fuzz/property lane is admitted only as two byte-frozen shapes:
   `CI_FUZZ_SMOKE_JOB` (the whole `fuzz-smoke` job in `ci.yml`) and
   `FUZZ_WORKFLOW` (the whole of `.github/workflows/fuzz.yml`). Either may be

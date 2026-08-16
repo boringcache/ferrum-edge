@@ -37,6 +37,28 @@ AMBIENT_HOST_UDP_DOCUMENTATION_PATHS = frozenset(
     }
 )
 
+NODE_WAYPOINT_EBPF_DOCUMENTATION_PATHS = frozenset(
+    {
+        "docs/ci_cd.md",
+        "docs/mesh.md",
+        "docs/mesh_supported_matrix.md",
+        "docs/node_agent.md",
+        "docs/plans/node_waypoint_transport_adr.md",
+    }
+)
+
+CNI_LIFECYCLE_DOCUMENTATION_PATHS = frozenset(
+    {
+        "docs/node_agent.md",
+        "docs/node_agent_security.md",
+    }
+)
+
+# Istio Status CAS live has no documentation trigger set: its previous
+# workflow-level `paths:` list named only the writer, metrics, fixture, and
+# workflow/action surfaces. Keep that cost envelope.
+ISTIO_STATUS_CAS_DOCUMENTATION_PATHS = frozenset()
+
 # verify_required_ci.py requires the PR planner's protected documentation set
 # to cover this union, so new live-suite documentation triggers cannot silently
 # receive lightweight CI.
@@ -44,6 +66,9 @@ LIVE_SUITE_DOCUMENTATION_PATHS = (
     MESH_FEDERATION_DOCUMENTATION_PATHS
     | MESH_E2E_SIDECAR_DOCUMENTATION_PATHS
     | AMBIENT_HOST_UDP_DOCUMENTATION_PATHS
+    | NODE_WAYPOINT_EBPF_DOCUMENTATION_PATHS
+    | CNI_LIFECYCLE_DOCUMENTATION_PATHS
+    | ISTIO_STATUS_CAS_DOCUMENTATION_PATHS
 )
 
 
@@ -265,6 +290,80 @@ SUITE_PATTERNS: dict[str, list[str]] = {
         r"^src/socket_opts\.rs$",
         r"^src/ebpf/veth\.rs$",
         *exact_path_patterns(AMBIENT_HOST_UDP_DOCUMENTATION_PATHS),
+    ],
+    # NodeWaypoint eBPF live datapath. Patterns match the retired workflow-level
+    # `paths:` list plus the trusted classifier script itself, so a pull request
+    # that edits relevance cannot skip the suite after this contract lands.
+    "node-waypoint-ebpf": [
+        r"^\.github/workflows/node-waypoint-ebpf-live\.yml$",
+        r"^\.github/scripts/live_suite_path_filter\.py$",
+        r"^\.dockerignore$",
+        r"^\.github/actions/package-ferrum-runtime-image/",
+        r"^\.github/actions/setup-kubernetes-tools/",
+        r"^Cargo\.(toml|lock)$",
+        r"^Dockerfile$",
+        r"^Dockerfile\.iproute2-layer$",
+        r"^Dockerfile\.release$",
+        r"^\.github/scripts/stage_iproute2_runtime\.sh$",
+        r"^build\.rs$",
+        r"^proto/",
+        r"^ebpf/",
+        r"^src/capture/",
+        r"^src/ebpf/",
+        r"^src/grpc/",
+        r"^src/identity/",
+        r"^src/k8s_controller/",
+        r"^src/modes/control_plane\.rs$",
+        r"^src/modes/mesh/",
+        r"^src/modes/node_agent\.rs$",
+        r"^src/plugins/mesh/",
+        r"^src/plugins/prometheus_metrics\.rs$",
+        r"^src/proxy/hbone_pool\.rs$",
+        r"^src/proxy/mesh_tcp_egress\.rs$",
+        r"^src/proxy/mod\.rs$",
+        r"^src/proxy/hbone_proxy\.rs$",
+        r"^src/proxy/netns_capture\.rs$",
+        r"^src/proxy/tcp_proxy\.rs$",
+        r"^src/router_cache\.rs$",
+        r"^src/socket_opts\.rs$",
+        r"^charts/ferrum-mesh/",
+        r"^tests/k8s/lib/",
+        r"^tests/k8s/node_waypoint_ebpf_live/",
+        *exact_path_patterns(NODE_WAYPOINT_EBPF_DOCUMENTATION_PATHS),
+    ],
+    # Istio status CAS competing-writer live proof. Kept to the retired
+    # workflow-level `paths:` list plus the trusted classifier script.
+    "istio-status-cas": [
+        r"^\.github/workflows/istio-status-cas-live\.yml$",
+        r"^\.github/scripts/live_suite_path_filter\.py$",
+        r"^\.github/actions/setup-kubernetes-tools/",
+        r"^\.github/actions/setup-rust-ci/",
+        r"^src/k8s_controller/istio_status\.rs$",
+        r"^src/k8s_controller/metrics\.rs$",
+        r"^tests/k8s_istio_status_cas_live\.rs$",
+        r"^tests/fixtures/k8s/istio_authorizationpolicy_status_crd\.yaml$",
+        *exact_path_patterns(ISTIO_STATUS_CAS_DOCUMENTATION_PATHS),
+    ],
+    # CNI install lifecycle live recovery. Chart matches stay exact-path, not
+    # the whole Helm tree, so unrelated chart edits keep the previous cost.
+    "cni-lifecycle": [
+        r"^\.github/workflows/cni-lifecycle-live\.yml$",
+        r"^\.github/scripts/live_suite_path_filter\.py$",
+        r"^\.github/actions/package-ferrum-runtime-image/",
+        r"^\.github/actions/setup-kubernetes-tools/",
+        r"^Cargo\.(toml|lock)$",
+        r"^build\.rs$",
+        r"^proto/",
+        r"^src/bin/ferrum-cni\.rs$",
+        r"^src/cni/",
+        r"^charts/ferrum-mesh/templates/cni-uninstall-hook\.yaml$",
+        r"^charts/ferrum-mesh/templates/cni-cleanup-rbac\.yaml$",
+        r"^charts/ferrum-mesh/templates/node-agent-daemonset\.yaml$",
+        r"^charts/ferrum-mesh/templates/node-agent-rbac\.yaml$",
+        r"^charts/ferrum-mesh/values\.yaml$",
+        r"^tests/k8s/cni_lifecycle_live/",
+        r"^PRODUCTION_READINESS\.md$",
+        *exact_path_patterns(CNI_LIFECYCLE_DOCUMENTATION_PATHS),
     ],
 }
 
@@ -1253,6 +1352,51 @@ def self_test() -> int:
         ("ambient-host-udp", ["src/modes/node_agent.rs"], True),
         ("ambient-host-udp", ["src/modes/data_plane.rs"], False),
         ("ambient-host-udp", ["tests/k8s/mesh_e2e_sidecar/run.sh"], False),
+        ("node-waypoint-ebpf", ["ebpf/ferrum-ebpf/src/main.rs"], True),
+        ("node-waypoint-ebpf", ["src/modes/node_agent.rs"], True),
+        ("node-waypoint-ebpf", ["tests/k8s/node_waypoint_ebpf_live/run.sh"], True),
+        ("node-waypoint-ebpf", [".github/workflows/node-waypoint-ebpf-live.yml"], True),
+        ("node-waypoint-ebpf", [".github/scripts/live_suite_path_filter.py"], True),
+        ("node-waypoint-ebpf", ["charts/ferrum-mesh/values.yaml"], True),
+        ("node-waypoint-ebpf", ["docs/plans/node_waypoint_transport_adr.md"], True),
+        ("node-waypoint-ebpf", ["docs/mesh_supported_matrix.md"], True),
+        ("node-waypoint-ebpf", ["src/proxy/netns_capture.rs"], True),
+        ("node-waypoint-ebpf", ["src/modes/data_plane.rs"], False),
+        ("node-waypoint-ebpf", ["docs/admin_api.md"], False),
+        ("node-waypoint-ebpf", ["tests/k8s/cni_lifecycle_live/run.sh"], False),
+        ("istio-status-cas", ["src/k8s_controller/istio_status.rs"], True),
+        ("istio-status-cas", ["src/k8s_controller/metrics.rs"], True),
+        ("istio-status-cas", ["tests/k8s_istio_status_cas_live.rs"], True),
+        (
+            "istio-status-cas",
+            ["tests/fixtures/k8s/istio_authorizationpolicy_status_crd.yaml"],
+            True,
+        ),
+        ("istio-status-cas", [".github/workflows/istio-status-cas-live.yml"], True),
+        ("istio-status-cas", [".github/scripts/live_suite_path_filter.py"], True),
+        ("istio-status-cas", [".github/actions/setup-rust-ci/action.yml"], True),
+        ("istio-status-cas", ["src/k8s_controller/reconciler.rs"], False),
+        ("istio-status-cas", ["docs/ci_cd.md"], False),
+        ("cni-lifecycle", ["src/cni/mod.rs"], True),
+        ("cni-lifecycle", ["src/bin/ferrum-cni.rs"], True),
+        ("cni-lifecycle", ["tests/k8s/cni_lifecycle_live/run.sh"], True),
+        ("cni-lifecycle", [".github/workflows/cni-lifecycle-live.yml"], True),
+        ("cni-lifecycle", [".github/scripts/live_suite_path_filter.py"], True),
+        (
+            "cni-lifecycle",
+            ["charts/ferrum-mesh/templates/cni-uninstall-hook.yaml"],
+            True,
+        ),
+        ("cni-lifecycle", ["charts/ferrum-mesh/values.yaml"], True),
+        ("cni-lifecycle", ["docs/node_agent_security.md"], True),
+        ("cni-lifecycle", ["PRODUCTION_READINESS.md"], True),
+        (
+            "cni-lifecycle",
+            ["charts/ferrum-mesh/templates/sidecar-injector.yaml"],
+            False,
+        ),
+        ("cni-lifecycle", ["docs/ci_cd.md"], False),
+        ("cni-lifecycle", ["src/modes/data_plane.rs"], False),
     ]
     failures: list[str] = []
     for suite, changed, expected in cases:
