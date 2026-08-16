@@ -56,6 +56,7 @@ fn tcp_framing_round_trip_and_hostile_lengths() {
         unframe_from_tcp(&[0, 5, 1, 2]),
         Err(TcpDnsFrameError::Incomplete)
     );
+    assert!(frame_for_tcp(&[]).is_none());
     assert!(frame_for_tcp(&vec![0u8; (u16::MAX as usize) + 1]).is_none());
 }
 
@@ -84,6 +85,7 @@ fn selected_reports_fail_on_zero_success_or_errors() {
     assert!(selected_reports_failure(&[]).is_some());
     assert!(selected_reports_failure(&[sample_report(0, 12, 0)]).is_some());
     assert!(selected_reports_failure(&[sample_report(10, 1, 0)]).is_some());
+    assert!(selected_reports_failure(&[sample_report(10, 0, 1)]).is_some());
     assert!(selected_reports_failure(&[sample_report(10, 0, 0)]).is_none());
     let mixed = vec![sample_report(10, 0, 0), sample_report(0, 500, 0)];
     let reason = selected_reports_failure(&mixed).expect("tcp row must fail");

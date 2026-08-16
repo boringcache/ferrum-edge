@@ -810,6 +810,11 @@ def check_dns_tcp_stub_and_fail_closed(
         failures,
     )
     require(
+        "unexpected NXDOMAIN" in metrics,
+        "DNS fail-closed path must surface unexpected NXDOMAIN responses",
+        failures,
+    )
+    require(
         "serde_json::to_string_pretty" in loadgen
         and "selected_reports_failure" in loadgen.split("serde_json::to_string_pretty")[-1],
         "DNS loadgen must emit JSON before failing on errorful rows",

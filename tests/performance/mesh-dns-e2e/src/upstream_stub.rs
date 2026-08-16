@@ -101,7 +101,7 @@ pub async fn run_tcp_accept_loop(listener: TcpListener) {
     loop {
         match listener.accept().await {
             Ok((stream, peer)) => {
-                tokio::spawn(async move {
+                let _connection_task = tokio::spawn(async move {
                     if let Err(e) = handle_tcp_connection(stream).await {
                         eprintln!("[dns_upstream_stub] tcp {peer}: {e}");
                     }

@@ -87,10 +87,10 @@ pub fn decode_tcp_dns_length(len_bytes: [u8; 2]) -> Result<usize, TcpDnsFrameErr
 }
 
 /// Frame a UDP-style DNS packet for TCP transport (RFC 1035 §4.2.2):
-/// prepend a 2-byte length. Returns `None` when the packet cannot be
-/// represented in a u16 length prefix.
+/// prepend a 2-byte length. Returns `None` for an empty packet or when the
+/// packet cannot be represented in a u16 length prefix.
 pub fn frame_for_tcp(packet: &[u8]) -> Option<Vec<u8>> {
-    if packet.len() > DNS_TCP_MAX_MESSAGE {
+    if packet.is_empty() || packet.len() > DNS_TCP_MAX_MESSAGE {
         return None;
     }
     let mut framed = Vec::with_capacity(packet.len() + 2);

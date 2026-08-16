@@ -159,6 +159,11 @@ impl ClassReport {
                 self.total_queries,
                 self.total_nxdomain
             ))
+        } else if self.total_nxdomain != 0 {
+            Some(format!(
+                "DNS row {}/{} recorded {} unexpected NXDOMAIN responses (successful={})",
+                self.name_class, self.transport, self.total_nxdomain, self.total_queries
+            ))
         } else {
             None
         }

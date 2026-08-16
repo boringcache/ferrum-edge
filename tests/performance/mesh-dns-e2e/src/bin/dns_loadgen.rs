@@ -107,7 +107,7 @@ async fn main() -> Result<(), anyhow::Error> {
     };
 
     let mut all_reports: Vec<ClassReport> = Vec::new();
-    for transport in transports {
+    for &transport in &transports {
         let reports = run_phase(&args, target, transport, &names).await?;
         all_reports.extend(reports);
     }
@@ -312,7 +312,7 @@ async fn tcp_query(
     .map_err(|_| anyhow!("tcp connect timed out"))??;
     stream.set_nodelay(true)?;
     let framed = frame_for_tcp(packet)
-        .ok_or_else(|| anyhow!("DNS TCP query exceeds u16 length prefix"))?;
+        .ok_or_else(|| anyhow!("DNS TCP query cannot be represented by a u16 length prefix"))?;
     stream.write_all(&framed).await?;
     let mut len_buf = [0u8; 2];
     timeout(
