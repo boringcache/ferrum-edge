@@ -79,6 +79,7 @@ Pull Request / Merge Queue group
             └─► Full CI
                     ├─► Format + integration-shard coverage (in CI plan)
                     ├─► Unit+inline-lib / integration-shard / functional-shard tests
+                    ├─► Planner-gated Secret Backends / PKCS#11 SoftHSM jobs
                     ├─► Lint, dependency audit, vendored regressions
                     ├─► Fuzz smoke (libFuzzer + property budgets)
                     ├─► eBPF/netns live checks when planner marks relevant
@@ -244,12 +245,18 @@ used by live-suite filters remain in the planner's full-CI set.
 
 The same trusted planner emits fail-closed job outputs for Helm, the legacy
 multicluster deployment smoke, the sidecar deployment smoke, eBPF program
-builds, and eBPF/netns live suites. The deploy-only multicluster job remains a
+builds, eBPF/netns live suites, Secret Backends (`run_secrets_backends`), and
+PKCS#11 SoftHSM (`run_pkcs11`). The deploy-only multicluster job remains a
 distinct packaging-and-rollout check; authoritative datapath coverage rides the
 dedicated `multicluster-federation-live.yml` workflow (path-filtered on PRs,
 force-run on every `main` push). PRs outside those curated path sets skip the
-downstream job before GitHub allocates a runner. Pushes to `main` and manual
-runs force all of these gates on. Rust formatting and the integration-shard
+downstream job before GitHub allocates a runner. Pushes to `main`, manual runs,
+empty or unavailable diffs, unclassifiable/unsafe changed paths, and edits to
+the gate-controller scripts force all of these gates on. Shared compile-graph
+inputs (`Cargo.toml`/`Cargo.lock`, `vendor/`, `build.rs`, `proto/`,
+`rust-toolchain.toml`, `.cargo/`, `.github/workflows/ci.yml`, and the
+`setup-rust-ci` / `setup-sccache` / `setup-fast-linker` actions) also schedule
+the Secret Backends and PKCS#11 jobs. Rust formatting and the integration-shard
 coverage contract also run as named steps in `CI Plan`, avoiding two additional
 runner allocations.
 
@@ -346,8 +353,11 @@ prove each rejection dimension) in the `Tests` aggregate.
 
 In full mode, the `Tests` aggregate waits for the planner/format checks, test
 shards, lint, dependency audit, vendored patch regressions,
-planner-gated mesh/Helm gates, eBPF/netns gates, performance, and the
-cross-platform build matrix. In light mode it requires the planner to succeed
+planner-gated Secret Backends / PKCS#11 / mesh / Helm gates, eBPF/netns gates,
+performance, and the cross-platform build matrix. When the planner marks
+`run_secrets_backends` or `run_pkcs11` false, the aggregate accepts a skipped
+Secret Backends or PKCS#11 job; when the planner marks either true, that job
+must succeed. In light mode it requires the planner to succeed
 and accepts the planned heavy jobs as skipped. Pushes to `main` publish the
 `latest` prerelease and Docker images only after the full aggregate and build
 matrix pass.
@@ -475,9 +485,18 @@ phases.
 - Unit tests in `tests/unit_tests.rs`
 - Inline `#[cfg(test)]` modules in `src/`
 - Secret backend tests compile once with Vault/AWS/GCP/Azure enabled and use
-  nextest `--no-fail-fast`; service integration likewise runs Consul, LDAP,
+  nextest `--no-fail-fast`. The planner schedules this job (`run_secrets_backends`)
+  only when secret-provider sources, `tests/secrets_functional/`, secret-resolution
+  startup wiring (`src/main.rs`, `src/config/env_config.rs`), nextest config, or
+  shared compile-graph/controller inputs change; plugin-only and admin-only PRs
+  skip it before runner allocation. Service integration likewise runs Consul, LDAP,
   Kafka, MySQL, OIDC, and OAuth2 introspection in one independently reported
   invocation.
+- PKCS#11 SoftHSM smoke (`run_pkcs11`) compiles the `pkcs11` feature graph and
+  runs the token signer plus certificate-pairing tests against SoftHSM. The
+  planner schedules it for `src/tls/pkcs11.rs`, the TLS load/backend/source/reload
+  paths those tests call, `tests/unit/tls` PKCS modules, and the same shared
+  compile-graph inputs; sibling ACME/FIPS TLS unit files do not schedule it.
 - Integration tests split across two shards (`admin-platform`,
   `mesh-protocols`). Each shard runs the prebuilt `integration_tests` nextest
   archive with a visible list of `integration::<file_module>` positional

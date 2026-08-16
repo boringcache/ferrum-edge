@@ -66,9 +66,7 @@ REQUIRED_JOBS = {
 # downstream of one of these roots and are skipped transitively in light mode.
 DIRECT_FULL_CI_JOBS = {
     "test-unit",
-    "test-secrets",
     "test-service-integration",
-    "test-pkcs11-softhsm",
     "build-test-artifacts",
     "test-conformance",
     "dependency-audit",
@@ -88,6 +86,8 @@ PATH_GATED_JOBS = {
     "ebpf-live": "run_ebpf_live",
     "netns-capture-live": "run_ebpf_live",
     "two-cluster-mesh-live": "run_ebpf_live",
+    "test-secrets": "run_secrets_backends",
+    "test-pkcs11-softhsm": "run_pkcs11",
 }
 
 REMOVED_JOBS = {

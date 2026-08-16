@@ -663,12 +663,67 @@ EBPF_LIVE_PATTERNS = [
     )
 ]
 
+# Compile-graph and CI-controller inputs shared by the Secret Backends and
+# PKCS#11 SoftHSM jobs. Either job compiles a private feature graph, so a
+# toolchain, lockfile, vendored crate, proto, or rust-ci action change can
+# alter what those suites build even when no secrets/PKCS source moved.
+SHARED_FEATURE_JOB_PATTERNS = (
+    r"^\.github/workflows/ci\.yml$",
+    r"^\.github/actions/(?:setup-rust-ci|setup-sccache|setup-fast-linker)/",
+    r"^Cargo\.(?:toml|lock)$",
+    r"^\.cargo/",
+    r"^rust-toolchain\.toml$",
+    r"^build\.rs$",
+    r"^proto/",
+    r"^vendor/",
+)
+
+# Secret Backends compiles `--features secrets-vault,secrets-aws,secrets-gcp,
+# secrets-azure --test secrets_functional` (then default-features
+# `cross_backend`). Observable surfaces are the provider module, that test
+# target, nextest's serial override for it, Cargo feature/optional-dep wiring,
+# and the startup path that calls `secrets::resolve_all_env_secrets()` before
+# `EnvConfig` parse. `src/startup.rs` is listener-failure bookkeeping and is
+# not on that path.
+SECRETS_BACKENDS_PATTERNS = [
+    re.compile(pattern)
+    for pattern in (
+        *SHARED_FEATURE_JOB_PATTERNS,
+        r"^src/secrets/",
+        r"^tests/secrets_functional/",
+        r"^src/main\.rs$",
+        r"^src/config/env_config\.rs$",
+        r"^\.config/nextest\.toml$",
+    )
+]
+
+# PKCS#11 SoftHSM compiles `--features pkcs11 --lib tls::pkcs11::tests` and
+# `--test unit_tests tls::pkcs11`. Observable surfaces are the feature-gated
+# module, TLS load/backend/source/reload paths those tests call, the
+# `tests/unit/tls` PKCS modules plus their `mod.rs` wiring, and Cargo
+# `pkcs11`/`cryptoki` feature wiring. Sibling TLS unit files (ACME, FIPS) do
+# not change what this job runs.
+PKCS11_PATTERNS = [
+    re.compile(pattern)
+    for pattern in (
+        *SHARED_FEATURE_JOB_PATTERNS,
+        r"^src/tls/pkcs11\.rs$",
+        r"^src/tls/mod\.rs$",
+        r"^src/tls/backend\.rs$",
+        r"^src/tls/frontend_reload\.rs$",
+        r"^src/tls/source/",
+        r"^tests/unit/tls/(?:mod\.rs|pkcs11)",
+    )
+]
+
 JOB_GATE_NAMES = (
     "run_helm",
     "run_mesh_federation",
     "run_mesh_sidecar_smoke",
     "run_ebpf_live",
     "run_ebpf_build",
+    "run_secrets_backends",
+    "run_pkcs11",
 )
 
 # Scripts whose logic controls the gate decisions themselves. Changing either
@@ -726,8 +781,28 @@ def any_path_matches(patterns: list[re.Pattern[str]], changed_files: list[str]) 
     return any(pattern.search(path) for path in changed_files for pattern in patterns)
 
 
+def job_gate_paths_are_classifiable(changed_files: list[str]) -> bool:
+    """Return whether every changed path can be matched against job-gate allow-lists.
+
+    Git usually emits repository-relative POSIX paths. Traversal, absolute
+    paths, NUL, backslashes, or empty components cannot be classified safely,
+    so `select_job_gates()` fails closed and schedules every gated suite.
+    """
+
+    for path in changed_files:
+        if not path or "\x00" in path or "\\" in path or path.startswith("/"):
+            return False
+        parts = PurePosixPath(path).parts
+        if not parts or ".." in parts or "" in parts:
+            return False
+    return True
+
+
 def select_job_gates(event_name: str, changed_files: list[str]) -> dict[str, bool]:
     if not is_path_gated_event(event_name) or not changed_files:
+        return {name: True for name in JOB_GATE_NAMES}
+
+    if not job_gate_paths_are_classifiable(changed_files):
         return {name: True for name in JOB_GATE_NAMES}
 
     # These scripts decide which gated suites run. A PR that edits them is
@@ -748,6 +823,10 @@ def select_job_gates(event_name: str, changed_files: list[str]) -> dict[str, boo
         ),
         "run_ebpf_live": any_path_matches(EBPF_LIVE_PATTERNS, changed_files),
         "run_ebpf_build": any(path.startswith("ebpf/") for path in changed_files),
+        "run_secrets_backends": any_path_matches(
+            SECRETS_BACKENDS_PATTERNS, changed_files
+        ),
+        "run_pkcs11": any_path_matches(PKCS11_PATTERNS, changed_files),
     }
 
 
@@ -887,6 +966,136 @@ def self_test() -> int:
         ),
         (
             "pull_request",
+            ["src/secrets/env.rs"],
+            {"run_secrets_backends": True, "run_pkcs11": False},
+        ),
+        (
+            "pull_request",
+            ["tests/secrets_functional/cross_backend.rs"],
+            {"run_secrets_backends": True, "run_pkcs11": False},
+        ),
+        (
+            "pull_request",
+            ["src/main.rs"],
+            {"run_secrets_backends": True, "run_pkcs11": False},
+        ),
+        (
+            "pull_request",
+            ["src/config/env_config.rs"],
+            {"run_secrets_backends": True, "run_pkcs11": False},
+        ),
+        (
+            "pull_request",
+            ["src/tls/pkcs11.rs"],
+            {"run_pkcs11": True, "run_secrets_backends": False},
+        ),
+        (
+            "pull_request",
+            ["tests/unit/tls/pkcs11_softhsm_tests.rs"],
+            {"run_pkcs11": True, "run_secrets_backends": False},
+        ),
+        (
+            "pull_request",
+            ["src/tls/mod.rs"],
+            {"run_pkcs11": True, "run_secrets_backends": False},
+        ),
+        (
+            "pull_request",
+            ["src/tls/backend.rs"],
+            {"run_pkcs11": True, "run_secrets_backends": False},
+        ),
+        (
+            "pull_request",
+            ["src/tls/source/mod.rs"],
+            {"run_pkcs11": True, "run_secrets_backends": False},
+        ),
+        (
+            "pull_request",
+            ["src/plugins/cors.rs"],
+            {"run_secrets_backends": False, "run_pkcs11": False},
+        ),
+        (
+            "pull_request",
+            ["src/admin/mod.rs"],
+            {"run_secrets_backends": False, "run_pkcs11": False},
+        ),
+        (
+            "pull_request",
+            ["src/startup.rs"],
+            {"run_secrets_backends": False, "run_pkcs11": False},
+        ),
+        (
+            "pull_request",
+            ["tests/unit/secrets/env_tests.rs"],
+            {"run_secrets_backends": False, "run_pkcs11": False},
+        ),
+        (
+            "pull_request",
+            ["tests/unit/tls/acme_store_ha_tests.rs"],
+            {"run_pkcs11": False, "run_secrets_backends": False},
+        ),
+        (
+            "pull_request",
+            ["Cargo.lock"],
+            {"run_secrets_backends": True, "run_pkcs11": True},
+        ),
+        (
+            "pull_request",
+            ["Cargo.toml"],
+            {"run_secrets_backends": True, "run_pkcs11": True},
+        ),
+        (
+            "pull_request",
+            ["vendor/tungstenite-0.29.0-ferrum-patched/src/lib.rs"],
+            {"run_secrets_backends": True, "run_pkcs11": True},
+        ),
+        (
+            "pull_request",
+            [".github/actions/setup-rust-ci/action.yml"],
+            {"run_secrets_backends": True, "run_pkcs11": True},
+        ),
+        (
+            "pull_request",
+            ["rust-toolchain.toml"],
+            {"run_secrets_backends": True, "run_pkcs11": True},
+        ),
+        (
+            "pull_request",
+            [".github/workflows/ci.yml"],
+            {"run_secrets_backends": True, "run_pkcs11": True},
+        ),
+        (
+            "pull_request",
+            ["build.rs"],
+            {"run_secrets_backends": True, "run_pkcs11": True},
+        ),
+        (
+            "pull_request",
+            ["proto/ferrum.proto"],
+            {"run_secrets_backends": True, "run_pkcs11": True},
+        ),
+        (
+            "pull_request",
+            [".cargo/config.toml"],
+            {"run_secrets_backends": True, "run_pkcs11": True},
+        ),
+        (
+            "pull_request",
+            [".config/nextest.toml"],
+            {"run_secrets_backends": True, "run_pkcs11": False},
+        ),
+        (
+            "pull_request",
+            ["src/tls/frontend_reload.rs"],
+            {"run_pkcs11": True, "run_secrets_backends": False},
+        ),
+        (
+            "pull_request",
+            ["src/../secrets/env.rs"],
+            {name: True for name in JOB_GATE_NAMES},
+        ),
+        (
+            "pull_request",
             ["docs/admin_api.md"],
             {name: False for name in JOB_GATE_NAMES},
         ),
@@ -909,7 +1118,12 @@ def self_test() -> int:
         (
             "pull_request",
             [".github/actions/setup-kubernetes-tools/action.yml"],
-            {"run_ebpf_live": True, "run_helm": True},
+            {
+                "run_ebpf_live": True,
+                "run_helm": True,
+                "run_secrets_backends": False,
+                "run_pkcs11": False,
+            },
         ),
         (
             "pull_request",
@@ -925,6 +1139,16 @@ def self_test() -> int:
             "merge_group",
             ["charts/ferrum-gateway/values.yaml"],
             {"run_helm": True},
+        ),
+        (
+            "merge_group",
+            ["src/secrets/env.rs"],
+            {"run_secrets_backends": True, "run_pkcs11": False},
+        ),
+        (
+            "merge_group",
+            ["src/tls/pkcs11.rs"],
+            {"run_pkcs11": True, "run_secrets_backends": False},
         ),
         (
             "merge_group",

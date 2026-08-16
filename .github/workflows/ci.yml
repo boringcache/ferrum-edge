@@ -40,6 +40,8 @@ jobs:
       run_mesh_sidecar_smoke: ${{ steps.plan.outputs.run_mesh_sidecar_smoke }}
       run_ebpf_live: ${{ steps.plan.outputs.run_ebpf_live }}
       run_ebpf_build: ${{ steps.plan.outputs.run_ebpf_build }}
+      run_secrets_backends: ${{ steps.plan.outputs.run_secrets_backends }}
+      run_pkcs11: ${{ steps.plan.outputs.run_pkcs11 }}
       binary-matrix: ${{ steps.binary-matrix.outputs.matrix }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
@@ -238,7 +240,7 @@ jobs:
           # therefore fail closed to true; after merge, the trusted planner
           # computes the narrow path gates for every subsequent PR.
           gate_fallbacks=()
-          for gate in run_helm run_mesh_federation run_mesh_sidecar_smoke run_ebpf_live run_ebpf_build; do
+          for gate in run_helm run_mesh_federation run_mesh_sidecar_smoke run_ebpf_live run_ebpf_build run_secrets_backends run_pkcs11; do
             value="$(printf '%s\n' "$plan" | sed -n "s/^${gate}=//p")"
             if [ "$value" != "true" ] && [ "$value" != "false" ]; then
               value=true
@@ -266,7 +268,7 @@ jobs:
             echo ""
             echo "| Gate | Scheduled |"
             echo "| --- | --- |"
-            for gate in run_helm run_mesh_federation run_mesh_sidecar_smoke run_ebpf_live run_ebpf_build; do
+            for gate in run_helm run_mesh_federation run_mesh_sidecar_smoke run_ebpf_live run_ebpf_build run_secrets_backends run_pkcs11; do
               value="$(printf '%s\n' "$plan" | sed -n "s/^${gate}=//p")"
               if [ "$value" != "true" ] && [ "$value" != "false" ]; then
                 value=true
@@ -495,7 +497,7 @@ jobs:
   test-secrets:
     name: Secret Backends
     needs: ci-plan
-    if: needs.ci-plan.outputs.mode == 'full' && (github.event_name == 'pull_request' || github.event_name == 'merge_group' || (github.event_name == 'push' && github.ref == 'refs/heads/main'))
+    if: needs.ci-plan.outputs.mode == 'full' && needs.ci-plan.outputs.run_secrets_backends == 'true' && (github.event_name == 'pull_request' || github.event_name == 'merge_group' || (github.event_name == 'push' && github.ref == 'refs/heads/main'))
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
@@ -569,7 +571,7 @@ jobs:
   test-pkcs11-softhsm:
     name: PKCS#11 SoftHSM Smoke Test
     needs: ci-plan
-    if: needs.ci-plan.outputs.mode == 'full' && (github.event_name == 'pull_request' || github.event_name == 'merge_group' || (github.event_name == 'push' && github.ref == 'refs/heads/main'))
+    if: needs.ci-plan.outputs.mode == 'full' && needs.ci-plan.outputs.run_pkcs11 == 'true' && (github.event_name == 'pull_request' || github.event_name == 'merge_group' || (github.event_name == 'push' && github.ref == 'refs/heads/main'))
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
@@ -4435,9 +4437,9 @@ jobs:
 
           require_success "CI plan" "${{ needs.ci-plan.result }}"
           require_success "Unit and inline lib" "${{ needs.test-unit.result }}"
-          require_success "Secret backends" "${{ needs.test-secrets.result }}"
+          require_planned_gate "Secret backends" "${{ needs.test-secrets.result }}" "${{ needs.ci-plan.outputs.run_secrets_backends }}"
           require_success "Service integration" "${{ needs.test-service-integration.result }}"
-          require_success "PKCS#11 SoftHSM integration" "${{ needs.test-pkcs11-softhsm.result }}"
+          require_planned_gate "PKCS#11 SoftHSM integration" "${{ needs.test-pkcs11-softhsm.result }}" "${{ needs.ci-plan.outputs.run_pkcs11 }}"
           require_success "Test artifact build" "${{ needs.build-test-artifacts.result }}"
           require_success "Integration" "${{ needs.test-integration.result }}"
           require_success "Mesh conformance" "${{ needs.test-conformance.result }}"
