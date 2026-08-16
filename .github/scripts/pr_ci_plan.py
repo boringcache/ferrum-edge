@@ -624,50 +624,81 @@ HELM_PATTERNS = [
     )
 ]
 
-EBPF_LIVE_PATTERNS = [
-    re.compile(pattern)
-    for pattern in (
-        r"^\.github/workflows/(?:ci|node-waypoint-ebpf-live|ambient-host-udp-live)\.yml$",
-        r"^\.github/actions/(?:setup-rust-ci|setup-sccache|setup-fast-linker|setup-kubernetes-tools|package-ferrum-runtime-image)/",
-        r"^Cargo\.(?:toml|lock)$",
-        r"^\.cargo/",
-        r"^rust-toolchain\.toml$",
-        r"^build\.rs$",
-        r"^proto/",
-        # The live eBPF/capture suites build and run the published runtime image
-        # targets, and the mesh chart auto-selects one of them, so the image
-        # definition and its runtime tool staging are in scope for these gates.
-        r"^Dockerfile$",
-        r"^\.github/scripts/stage_iproute2_runtime\.sh$",
+# Compile-and-CI inputs shared by the three ci.yml live suites. These jobs
+# cargo-test locally; they do not build the published runtime image, so
+# Dockerfile / image-staging / kind tooling stay out. Dedicated live workflows
+# (node-waypoint-ebpf-live, ambient-host-udp-live) keep their own filters.
+LIVE_SUITE_SHARED_PATTERNS = (
+    r"^\.github/workflows/ci\.yml$",
+    r"^\.github/actions/(?:setup-rust-ci|setup-sccache|setup-fast-linker)/",
+    r"^Cargo\.(?:toml|lock)$",
+    r"^\.cargo/",
+    r"^rust-toolchain\.toml$",
+    r"^build\.rs$",
+    r"^vendor/",
+)
+
+
+def compile_path_patterns(*pattern_groups: tuple[str, ...]) -> list[re.Pattern[str]]:
+    return [re.compile(pattern) for group in pattern_groups for pattern in group]
+
+
+# `ebpf-live`: nightly BPF build + `ebpf::loader::live_kernel_tests` (load,
+# verify, attach, map round-trip, connect4 redirect, inbound tc redirect).
+EBPF_KERNEL_LIVE_PATTERNS = compile_path_patterns(
+    LIVE_SUITE_SHARED_PATTERNS,
+    (
+        r"^\.github/actions/setup-bpf-linker/",
         r"^ebpf/",
-        r"^src/capture/",
         r"^src/ebpf/",
-        r"^src/grpc/",
-        r"^src/identity/",
-        r"^src/k8s_controller/",
-        r"^src/modes/control_plane\.rs$",
-        r"^src/modes/mesh/",
+        r"^src/modes/node_agent\.rs$",
+    ),
+)
+
+# `netns-capture-live`: in-lib netns/TPROXY/SO_ORIGINAL_DST tests plus the
+# privileged `functional_mesh_live_source_capture_*` e2e (NetnsUdpCaptureManager,
+# production REDIRECT, HBONE/mTLS relay). Distinct from the dedicated
+# ambient-host-udp-live workflow.
+NETNS_CAPTURE_LIVE_PATTERNS = compile_path_patterns(
+    LIVE_SUITE_SHARED_PATTERNS,
+    (
+        r"^proto/",
+        r"^src/capture/",
         r"^src/modes/(?:node_agent|node_agent_cni_server)\.rs$",
+        r"^src/socket_opts\.rs$",
+        r"^src/proxy/(?:host_udp_capture|mesh_mtls_pool|mesh_tcp_egress|mesh_tcp_inbound|mesh_udp_capture|mesh_udp_frame|mod|netns_capture|netns_udp_capture|udp_batch)\.rs$",
+        r"^tests/functional/functional_mesh_mode_test\.rs$",
+    ),
+)
+
+# `two-cluster-mesh-live`: `functional_mesh_live_two_cluster_cross_cluster_protocol_matrix`
+# plus `tests/functional/fixtures/two_cluster_spire.sh`. Cross-cluster HBONE,
+# identity/SPIRE, east-west materialization, and mesh subscribe — not the
+# in-lib kernel or netns primitive tests.
+TWO_CLUSTER_LIVE_PATTERNS = compile_path_patterns(
+    LIVE_SUITE_SHARED_PATTERNS,
+    (
+        r"^proto/",
+        r"^src/capture/",
+        r"^src/grpc/mesh_",
+        r"^src/identity/",
+        r"^src/modes/mesh/",
         r"^src/plugins/mesh/",
-        r"^src/plugins/prometheus_metrics\.rs$",
-        r"^src/proxy/(?:backend_dispatch|grpc_proxy|hbone_pool|hbone_proxy|host_udp_capture|host_udp_capture_live_tests|mesh_mtls_pool|mesh_tcp_egress|mesh_tcp_inbound|mesh_udp_capture|mesh_udp_frame|mod|netns_capture|netns_udp_capture|tcp_proxy|udp_batch|udp_placement_migration)\.rs$",
-        r"^src/(?:router_cache|socket_opts)\.rs$",
-        r"^src/service_discovery/",
+        r"^src/proxy/(?:grpc_proxy|hbone_pool|hbone_proxy|mesh_mtls_pool|mesh_tcp_egress|mesh_tcp_inbound|mesh_udp_capture|mesh_udp_frame|mod|netns_udp_capture|tcp_proxy)\.rs$",
+        r"^src/service_discovery/mesh\.rs$",
         r"^src/tls/",
         r"^tests/functional/functional_mesh_mode_test\.rs$",
-        r"^tests/functional/fixtures/",
-        r"^tests/k8s/lib/",
-        r"^tests/k8s/node_waypoint_ebpf_live/",
-        r"^tests/k8s/ambient_host_udp_live/",
-        r"^tests/.*(?:capture|ebpf|netns|node_waypoint|host_udp).*",
-    )
-]
+        r"^tests/functional/fixtures/two_cluster_spire\.sh$",
+    ),
+)
 
 JOB_GATE_NAMES = (
     "run_helm",
     "run_mesh_federation",
     "run_mesh_sidecar_smoke",
-    "run_ebpf_live",
+    "run_ebpf_kernel_live",
+    "run_netns_capture_live",
+    "run_two_cluster_live",
     "run_ebpf_build",
 )
 
@@ -746,7 +777,15 @@ def select_job_gates(event_name: str, changed_files: list[str]) -> dict[str, boo
         "run_mesh_sidecar_smoke": bool(
             matched_files("mesh-e2e-sidecar", changed_files)
         ),
-        "run_ebpf_live": any_path_matches(EBPF_LIVE_PATTERNS, changed_files),
+        "run_ebpf_kernel_live": any_path_matches(
+            EBPF_KERNEL_LIVE_PATTERNS, changed_files
+        ),
+        "run_netns_capture_live": any_path_matches(
+            NETNS_CAPTURE_LIVE_PATTERNS, changed_files
+        ),
+        "run_two_cluster_live": any_path_matches(
+            TWO_CLUSTER_LIVE_PATTERNS, changed_files
+        ),
         "run_ebpf_build": any(path.startswith("ebpf/") for path in changed_files),
     }
 
@@ -860,30 +899,241 @@ def self_test() -> int:
             ["src/modes/grpc_tls_reload.rs"],
             {"run_mesh_sidecar_smoke": True},
         ),
+        # Per-suite positives: kernel loader/program, netns capture, two-cluster.
         (
             "pull_request",
-            ["src/proxy/host_udp_capture.rs"],
-            {"run_ebpf_live": True},
+            ["src/ebpf/loader.rs"],
+            {
+                "run_ebpf_kernel_live": True,
+                "run_netns_capture_live": False,
+                "run_two_cluster_live": False,
+            },
         ),
         (
             "pull_request",
-            ["tests/k8s/ambient_host_udp_live/run.sh"],
-            {"run_ebpf_live": True},
-        ),
-        (
-            "pull_request",
-            ["Dockerfile"],
-            {"run_ebpf_live": True},
+            ["src/proxy/netns_capture.rs"],
+            {
+                "run_ebpf_kernel_live": False,
+                "run_netns_capture_live": True,
+                "run_two_cluster_live": False,
+            },
         ),
         (
             "pull_request",
             ["src/socket_opts.rs"],
-            {"run_ebpf_live": True},
+            {
+                "run_ebpf_kernel_live": False,
+                "run_netns_capture_live": True,
+                "run_two_cluster_live": False,
+            },
+        ),
+        (
+            "pull_request",
+            ["src/proxy/host_udp_capture.rs"],
+            {
+                "run_ebpf_kernel_live": False,
+                "run_netns_capture_live": True,
+                "run_two_cluster_live": False,
+            },
+        ),
+        (
+            "pull_request",
+            ["src/modes/mesh/mod.rs"],
+            {
+                "run_ebpf_kernel_live": False,
+                "run_netns_capture_live": False,
+                "run_two_cluster_live": True,
+            },
+        ),
+        (
+            "pull_request",
+            ["src/proxy/hbone_proxy.rs"],
+            {
+                "run_ebpf_kernel_live": False,
+                "run_netns_capture_live": False,
+                "run_two_cluster_live": True,
+            },
+        ),
+        (
+            "pull_request",
+            ["src/grpc/mesh_server.rs"],
+            {
+                "run_ebpf_kernel_live": False,
+                "run_netns_capture_live": False,
+                "run_two_cluster_live": True,
+            },
+        ),
+        (
+            "pull_request",
+            ["src/identity/mod.rs"],
+            {
+                "run_ebpf_kernel_live": False,
+                "run_netns_capture_live": False,
+                "run_two_cluster_live": True,
+            },
+        ),
+        (
+            "pull_request",
+            ["tests/functional/fixtures/two_cluster_spire.sh"],
+            {
+                "run_ebpf_kernel_live": False,
+                "run_netns_capture_live": False,
+                "run_two_cluster_live": True,
+            },
         ),
         (
             "pull_request",
             ["ebpf/ferrum-ebpf/src/main.rs"],
-            {"run_ebpf_build": True, "run_ebpf_live": True},
+            {
+                "run_ebpf_build": True,
+                "run_ebpf_kernel_live": True,
+                "run_netns_capture_live": False,
+                "run_two_cluster_live": False,
+            },
+        ),
+        # Shared compile/CI inputs and the shared functional harness fire every
+        # live suite that actually cargo-tests that surface.
+        (
+            "pull_request",
+            ["Cargo.lock"],
+            {
+                "run_ebpf_kernel_live": True,
+                "run_netns_capture_live": True,
+                "run_two_cluster_live": True,
+            },
+        ),
+        (
+            "pull_request",
+            ["rust-toolchain.toml"],
+            {
+                "run_ebpf_kernel_live": True,
+                "run_netns_capture_live": True,
+                "run_two_cluster_live": True,
+            },
+        ),
+        (
+            "pull_request",
+            [".github/actions/setup-rust-ci/action.yml"],
+            {
+                "run_helm": True,
+                "run_ebpf_kernel_live": True,
+                "run_netns_capture_live": True,
+                "run_two_cluster_live": True,
+            },
+        ),
+        (
+            "pull_request",
+            [".github/workflows/ci.yml"],
+            {
+                "run_helm": True,
+                "run_ebpf_kernel_live": True,
+                "run_netns_capture_live": True,
+                "run_two_cluster_live": True,
+            },
+        ),
+        (
+            "pull_request",
+            [".github/actions/setup-bpf-linker/action.yml"],
+            {
+                "run_ebpf_kernel_live": True,
+                "run_netns_capture_live": False,
+                "run_two_cluster_live": False,
+            },
+        ),
+        (
+            "pull_request",
+            ["src/modes/node_agent.rs"],
+            {
+                "run_ebpf_kernel_live": True,
+                "run_netns_capture_live": True,
+                "run_two_cluster_live": False,
+            },
+        ),
+        (
+            "pull_request",
+            ["tests/functional/functional_mesh_mode_test.rs"],
+            {
+                "run_ebpf_kernel_live": False,
+                "run_netns_capture_live": True,
+                "run_two_cluster_live": True,
+            },
+        ),
+        (
+            "pull_request",
+            ["src/capture/mod.rs"],
+            {
+                "run_ebpf_kernel_live": False,
+                "run_netns_capture_live": True,
+                "run_two_cluster_live": True,
+            },
+        ),
+        # Meaningful negatives: dedicated ambient-host-UDP / image / k8s-tooling
+        # / TLS / non-mesh gRPC must not resurrect the old union gate.
+        (
+            "pull_request",
+            ["tests/k8s/ambient_host_udp_live/run.sh"],
+            {
+                "run_ebpf_kernel_live": False,
+                "run_netns_capture_live": False,
+                "run_two_cluster_live": False,
+            },
+        ),
+        (
+            "pull_request",
+            ["Dockerfile"],
+            {
+                "run_helm": True,
+                "run_ebpf_kernel_live": False,
+                "run_netns_capture_live": False,
+                "run_two_cluster_live": False,
+            },
+        ),
+        (
+            "pull_request",
+            [".github/actions/setup-kubernetes-tools/action.yml"],
+            {
+                "run_helm": True,
+                "run_ebpf_kernel_live": False,
+                "run_netns_capture_live": False,
+                "run_two_cluster_live": False,
+            },
+        ),
+        (
+            "pull_request",
+            ["src/tls/mod.rs"],
+            {
+                "run_ebpf_kernel_live": False,
+                "run_netns_capture_live": False,
+                "run_two_cluster_live": True,
+            },
+        ),
+        (
+            "pull_request",
+            ["src/grpc/cp_server.rs"],
+            {
+                "run_ebpf_kernel_live": False,
+                "run_netns_capture_live": False,
+                "run_two_cluster_live": False,
+            },
+        ),
+        # Plugin/admin-only: full CI, but none of the expensive live suites.
+        (
+            "pull_request",
+            ["src/plugins/cors.rs"],
+            {
+                "run_ebpf_kernel_live": False,
+                "run_netns_capture_live": False,
+                "run_two_cluster_live": False,
+            },
+        ),
+        (
+            "pull_request",
+            ["src/admin/mod.rs"],
+            {
+                "run_ebpf_kernel_live": False,
+                "run_netns_capture_live": False,
+                "run_two_cluster_live": False,
+            },
         ),
         (
             "pull_request",
@@ -905,11 +1155,6 @@ def self_test() -> int:
             "pull_request",
             [".github/scripts/live_suite_path_filter.py"],
             {name: True for name in JOB_GATE_NAMES},
-        ),
-        (
-            "pull_request",
-            [".github/actions/setup-kubernetes-tools/action.yml"],
-            {"run_ebpf_live": True, "run_helm": True},
         ),
         (
             "pull_request",

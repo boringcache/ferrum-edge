@@ -1153,22 +1153,22 @@ fn ambient_udp_production_entry_points_are_scheduled_by_the_trusted_classifier()
 }
 
 #[test]
-fn pr_ci_plan_schedules_ebpf_live_for_host_udp_surfaces() {
+fn pr_ci_plan_schedules_netns_capture_live_for_host_udp_surfaces() {
     let plan = read(".github/scripts/pr_ci_plan.py");
     assert!(
         plan.contains("host_udp_capture"),
-        "planner eBPF/netns live patterns must include host_udp_capture"
-    );
-    assert!(
-        plan.contains("ambient_host_udp_live"),
-        "planner must include the ambient host-UDP live fixture path"
-    );
-    assert!(
-        plan.contains("ambient-host-udp-live"),
-        "planner must treat the ambient host-UDP workflow as a live trigger"
+        "planner netns-capture live patterns must include host_udp_capture"
     );
     assert!(
         plan.contains("[\"src/proxy/host_udp_capture.rs\"]"),
-        "planner self-test must pin host_udp_capture as run_ebpf_live"
+        "planner self-test must pin host_udp_capture.rs as a netns-capture live input"
+    );
+    assert!(
+        plan.contains("\"run_netns_capture_live\": True"),
+        "planner self-test must schedule run_netns_capture_live for host_udp_capture"
+    );
+    assert!(
+        !plan.contains("run_ebpf_live"),
+        "the shared run_ebpf_live planner gate must not remain"
     );
 }

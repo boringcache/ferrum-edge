@@ -81,7 +81,7 @@ Pull Request / Merge Queue group
                     ├─► Unit+inline-lib / integration-shard / functional-shard tests
                     ├─► Lint, dependency audit, vendored regressions
                     ├─► Fuzz smoke (libFuzzer + property budgets)
-                    ├─► eBPF/netns live checks when planner marks relevant
+                    ├─► Per-suite eBPF kernel / netns-capture / two-cluster live checks when planner marks relevant
                     ├─► Planner-gated mesh / Helm / performance gates
                     └─► Five target release builds
     └─► Dedicated required checks (internally skip unrelated changes)
@@ -244,7 +244,21 @@ used by live-suite filters remain in the planner's full-CI set.
 
 The same trusted planner emits fail-closed job outputs for Helm, the legacy
 multicluster deployment smoke, the sidecar deployment smoke, eBPF program
-builds, and eBPF/netns live suites. The deploy-only multicluster job remains a
+builds, and three separate live suites (`run_ebpf_kernel_live`,
+`run_netns_capture_live`, `run_two_cluster_live`). Each live job reads only its
+own output. Pattern lists are derived from the files those jobs actually
+compile and execute: kernel live is the BPF crate plus `src/ebpf/` and the
+node-agent ingress-redirect helpers the in-lib tests call; netns capture live
+is the netns/TPROXY/SO_ORIGINAL_DST/UDP producer surfaces plus the shared
+functional harness; two-cluster live is mesh/HBONE/identity/SPIRE/east-west
+plus that same harness and `two_cluster_spire.sh`. Shared compile inputs
+(`Cargo.lock`, `rust-toolchain.toml`, `.cargo/`, `vendor/`, `setup-rust-ci`)
+still fire every live gate. Non-PR events, empty or unavailable diffs, and
+edits to `GATE_CONTROLLER_PATHS` (`pr_ci_plan.py`, `live_suite_path_filter.py`)
+force every gated suite on. Missing/invalid planner outputs fail closed to
+`true` in `CI Plan`. Plugin-only, admin-only, Dockerfile, and dedicated
+ambient-host-UDP/k8s-live paths do not schedule these three jobs. The
+deploy-only multicluster job remains a
 distinct packaging-and-rollout check; authoritative datapath coverage rides the
 dedicated `multicluster-federation-live.yml` workflow (path-filtered on PRs,
 force-run on every `main` push). PRs outside those curated path sets skip the
@@ -346,7 +360,8 @@ prove each rejection dimension) in the `Tests` aggregate.
 
 In full mode, the `Tests` aggregate waits for the planner/format checks, test
 shards, lint, dependency audit, vendored patch regressions,
-planner-gated mesh/Helm gates, eBPF/netns gates, performance, and the
+planner-gated mesh/Helm gates, per-suite eBPF kernel / netns-capture /
+two-cluster live gates, performance, and the
 cross-platform build matrix. In light mode it requires the planner to succeed
 and accepts the planned heavy jobs as skipped. Pushes to `main` publish the
 `latest` prerelease and Docker images only after the full aggregate and build
@@ -526,6 +541,30 @@ nightly to build `ferrum-ebpf`, uses stable to run
 `cargo test -p ferrum-ebpf-common`, and uploads the compiled `ebpf-programs`
 artifact with 14-day retention. If this job is edited, preserve the intent that
 the shared-types test runs on stable Rust.
+
+#### 4b. eBPF / netns / two-cluster live jobs (`ci.yml`)
+
+**Runs**: `ubuntu-latest` (privileged), only when `CI Plan` marks the matching
+gate `true`
+
+These three jobs used to share one `run_ebpf_live` allow-list. They now have
+separate fail-closed planner outputs and the `Tests` aggregate enforces each
+with `require_planned_gate` against that job's own output:
+
+| Job | Planner output | Distinctive surfaces |
+|---|---|---|
+| `ebpf-live` | `run_ebpf_kernel_live` | `ebpf/`, `src/ebpf/`, `src/modes/node_agent.rs`, `setup-bpf-linker` |
+| `netns-capture-live` | `run_netns_capture_live` | netns/UDP/TPROXY/SO_ORIGINAL_DST producers, `src/capture/`, `src/socket_opts.rs`, source-capture functional tests |
+| `two-cluster-mesh-live` | `run_two_cluster_live` | `src/modes/mesh/`, `src/identity/`, `src/tls/`, `src/grpc/mesh_*`, HBONE, east-west, `two_cluster_spire.sh` |
+
+All three also schedule on shared compile/CI inputs (`Cargo.toml`/`Cargo.lock`,
+`rust-toolchain.toml`, `.cargo/`, `vendor/`, `build.rs`, `.github/workflows/ci.yml`,
+and the rust-ci/sccache/fast-linker actions) and on the shared
+`tests/functional/functional_mesh_mode_test.rs` harness when that file is the
+one that changed. Empty diffs, non-PR/`main`/manual events, and planner
+controller edits force every gate on. The dedicated `ambient-host-udp-live.yml`
+and `node-waypoint-ebpf-live.yml` workflows keep their own path filters; they
+are not part of these three `ci.yml` jobs.
 
 #### 5. NodeWaypoint eBPF Live Datapath Workflow
 

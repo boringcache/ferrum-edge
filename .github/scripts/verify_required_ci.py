@@ -85,9 +85,9 @@ PATH_GATED_JOBS = {
     "mesh-e2e-sidecar": "run_mesh_sidecar_smoke",
     "helm-chart": "run_helm",
     "build-ebpf": "run_ebpf_build",
-    "ebpf-live": "run_ebpf_live",
-    "netns-capture-live": "run_ebpf_live",
-    "two-cluster-mesh-live": "run_ebpf_live",
+    "ebpf-live": "run_ebpf_kernel_live",
+    "netns-capture-live": "run_netns_capture_live",
+    "two-cluster-mesh-live": "run_two_cluster_live",
 }
 
 REMOVED_JOBS = {
