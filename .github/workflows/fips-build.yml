@@ -334,7 +334,7 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
-            cmake ninja-build golang-go libcurl4-openssl-dev protobuf-compiler
+            cmake ninja-build golang-go libcurl4-openssl-dev protobuf-compiler zstd
 
       - uses: ./.github/actions/setup-fast-linker
 
