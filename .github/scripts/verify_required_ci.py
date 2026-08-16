@@ -647,6 +647,25 @@ def main() -> int:
 
     planner_errors: list[str] = []
     aggregate_body = extract_job_body(ci_yml, "test")
+    unit_body = extract_job_body(ci_yml, "test-unit")
+    acme_precompile = "Precompile ACME library and DNS hook test binaries"
+    acme_outbound = "Run ACME outbound-boundary regressions"
+    acme_dns_hook = "Run ACME DNS-01 hook cancellation regressions"
+    acme_resume = "Run ACME renewal crash-recovery regressions"
+    if not (
+        unit_body.count(
+            "cargo test --features acme --lib --test unit_tests --no-run"
+        )
+        == 1
+        and 0 <= unit_body.find(acme_precompile)
+        < unit_body.find(acme_outbound)
+        < unit_body.find(acme_dns_hook)
+        < unit_body.find(acme_resume)
+    ):
+        planner_errors.append(
+            "jobs.test-unit must precompile the acme lib and unit_tests binaries "
+            "together before running any ACME filter"
+        )
     for job in sorted(REQUIRED_JOBS):
         if f"needs.{job}.result" not in aggregate_body:
             planner_errors.append(
