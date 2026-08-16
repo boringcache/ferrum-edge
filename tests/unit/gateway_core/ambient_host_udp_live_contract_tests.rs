@@ -1164,8 +1164,16 @@ fn pr_ci_plan_schedules_netns_capture_live_for_host_udp_surfaces() {
         "planner self-test must pin host_udp_capture.rs as a netns-capture live input"
     );
     assert!(
-        plan.contains("\"run_netns_capture_live\": True"),
-        "planner self-test must schedule run_netns_capture_live for host_udp_capture"
+        plan.contains(
+            "\
+            [\"src/proxy/host_udp_capture.rs\"],
+            {
+                \"run_ebpf_kernel_live\": False,
+                \"run_netns_capture_live\": True,
+                \"run_two_cluster_live\": False,
+            },"
+        ),
+        "planner self-test must pin host_udp_capture.rs to kernel=false, netns=true, two-cluster=false"
     );
     assert!(
         !plan.contains("run_ebpf_live"),

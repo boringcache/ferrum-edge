@@ -247,13 +247,20 @@ multicluster deployment smoke, the sidecar deployment smoke, eBPF program
 builds, and three separate live suites (`run_ebpf_kernel_live`,
 `run_netns_capture_live`, `run_two_cluster_live`). Each live job reads only its
 own output. Pattern lists are derived from the files those jobs actually
-compile and execute: kernel live is the BPF crate plus `src/ebpf/` and the
-node-agent ingress-redirect helpers the in-lib tests call; netns capture live
-is the netns/TPROXY/SO_ORIGINAL_DST/UDP producer surfaces plus the shared
-functional harness; two-cluster live is mesh/HBONE/identity/SPIRE/east-west
-plus that same harness and `two_cluster_spire.sh`. Shared compile inputs
+compile and execute: kernel live is the BPF crate plus `src/ebpf/`, the
+node-agent ingress-redirect helpers, `src/capture/` (`should_fallback_to_iptables`
+via `kernel_probe`), and the loader-adjacent transparent bind
+(`src/proxy/mod.rs` `create_proxy_socket` + `src/socket_opts.rs`); netns
+capture live is the netns/TPROXY/SO_ORIGINAL_DST/UDP producer surfaces plus
+the HBONE/mesh-runtime/MeshSubscribe/identity/TLS boundaries the source-capture
+e2e tests traverse; two-cluster live is mesh/HBONE/identity/SPIRE/east-west
+plus `SO_ORIGINAL_DST`, mesh trust withdrawal, MeshSubscribe JWT helpers, the
+shared functional harness, and `two_cluster_spire.sh`. Shared compile inputs
 (`Cargo.lock`, `rust-toolchain.toml`, `.cargo/`, `vendor/`, `setup-rust-ci`)
-still fire every live gate. Non-PR events, empty or unavailable diffs, and
+still fire every live gate. The functional harness file schedules netns and
+two-cluster only — kernel live tests live in `src/ebpf/loader.rs`, not that
+file. Non-mesh gRPC (`src/grpc/cp_server.rs`) stays isolated from all three.
+Non-PR events, empty or unavailable diffs, and
 edits to `GATE_CONTROLLER_PATHS` (`pr_ci_plan.py`, `live_suite_path_filter.py`)
 force every gated suite on. Missing/invalid planner outputs fail closed to
 `true` in `CI Plan`. Plugin-only, admin-only, Dockerfile, and dedicated
@@ -553,18 +560,19 @@ with `require_planned_gate` against that job's own output:
 
 | Job | Planner output | Distinctive surfaces |
 |---|---|---|
-| `ebpf-live` | `run_ebpf_kernel_live` | `ebpf/`, `src/ebpf/`, `src/modes/node_agent.rs`, `setup-bpf-linker` |
-| `netns-capture-live` | `run_netns_capture_live` | netns/UDP/TPROXY/SO_ORIGINAL_DST producers, `src/capture/`, `src/socket_opts.rs`, source-capture functional tests |
-| `two-cluster-mesh-live` | `run_two_cluster_live` | `src/modes/mesh/`, `src/identity/`, `src/tls/`, `src/grpc/mesh_*`, HBONE, east-west, `two_cluster_spire.sh` |
+| `ebpf-live` | `run_ebpf_kernel_live` | `ebpf/`, `src/ebpf/`, `src/capture/`, `src/proxy/mod.rs`, `src/socket_opts.rs`, `src/modes/node_agent.rs`, `setup-bpf-linker` |
+| `netns-capture-live` | `run_netns_capture_live` | netns/UDP/TPROXY/SO_ORIGINAL_DST producers, `src/capture/`, HBONE pool/proxy, mesh runtime, MeshSubscribe (`src/grpc/mesh_*`, `auth.rs`, `dp_client.rs`), identity, TLS, `mesh_trust_registry`, source-capture functional tests |
+| `two-cluster-mesh-live` | `run_two_cluster_live` | `src/modes/mesh/`, `src/identity/`, `src/tls/`, MeshSubscribe JWT/gRPC helpers, HBONE, east-west, `SO_ORIGINAL_DST`, `mesh_trust_registry`, `two_cluster_spire.sh` |
 
 All three also schedule on shared compile/CI inputs (`Cargo.toml`/`Cargo.lock`,
 `rust-toolchain.toml`, `.cargo/`, `vendor/`, `build.rs`, `.github/workflows/ci.yml`,
-and the rust-ci/sccache/fast-linker actions) and on the shared
-`tests/functional/functional_mesh_mode_test.rs` harness when that file is the
-one that changed. Empty diffs, non-PR/`main`/manual events, and planner
-controller edits force every gate on. The dedicated `ambient-host-udp-live.yml`
-and `node-waypoint-ebpf-live.yml` workflows keep their own path filters; they
-are not part of these three `ci.yml` jobs.
+and the rust-ci/sccache/fast-linker actions). `tests/functional/functional_mesh_mode_test.rs`
+schedules netns-capture live and two-cluster live only; kernel live does not
+run from that file because `ebpf-live` executes `ebpf::loader::live_kernel_tests`.
+Empty diffs, non-PR/`main`/manual events, and planner controller edits force
+every gate on. The dedicated `ambient-host-udp-live.yml` and
+`node-waypoint-ebpf-live.yml` workflows keep their own path filters; they are
+not part of these three `ci.yml` jobs.
 
 #### 5. NodeWaypoint eBPF Live Datapath Workflow
 
