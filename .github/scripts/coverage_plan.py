@@ -7,6 +7,7 @@ import argparse
 import json
 import re
 import sys
+import tempfile
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 
@@ -272,7 +273,7 @@ def is_coverage_relevant_path(path: str) -> bool:
 def is_well_formed_repo_path(path: str) -> bool:
     """Reject malformed or hostile path transport instead of classifying it."""
 
-    if not path or CONTROL_CHARS_RE.search(path):
+    if not path or path != path.strip() or CONTROL_CHARS_RE.search(path):
         return False
     if "\\" in path or path.startswith("/") or "//" in path:
         return False
@@ -399,9 +400,9 @@ def read_changed_files(path: Path | None) -> list[str]:
     if path is None:
         return []
     return [
-        line.strip()
+        line
         for line in path.read_text(encoding="utf-8").splitlines()
-        if line.strip()
+        if line
     ]
 
 
@@ -638,6 +639,8 @@ def self_test() -> int:
         ("pull_request", ["/src/admin/mod.rs"], "full", all_shards, False),
         ("pull_request", ["C:/src/admin/mod.rs"], "full", all_shards, False),
         ("pull_request", ["src//admin/mod.rs"], "full", all_shards, False),
+        ("pull_request", [" src/admin/mod.rs"], "full", all_shards, False),
+        ("pull_request", ["src/admin/mod.rs "], "full", all_shards, False),
         ("pull_request", ["src/admin/foo\0.rs"], "full", all_shards, False),
         ("pull_request", ["../Cargo.toml"], "full", all_shards, False),
         (
@@ -650,6 +653,18 @@ def self_test() -> int:
     ]
 
     failures: list[str] = []
+    with tempfile.TemporaryDirectory() as temp_dir:
+        changed_path = Path(temp_dir) / "changed-files.txt"
+        changed_path.write_text(
+            " src/admin/mod.rs\nsrc/admin/mod.rs \n", encoding="utf-8"
+        )
+        if read_changed_files(changed_path) != [
+            " src/admin/mod.rs",
+            "src/admin/mod.rs ",
+        ]:
+            failures.append(
+                "changed-file transport must preserve boundary whitespace for fail-closed validation"
+            )
     for event_name, changed, mode, shards, plugin_gate in cases:
         failure = _expect_plan(event_name, changed, mode, shards, plugin_gate)
         if failure:
