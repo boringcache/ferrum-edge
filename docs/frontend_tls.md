@@ -572,6 +572,21 @@ credential an operator could withdraw. It therefore:
   live reload — arming is what declines the TCP+TLS kTLS handoff, and an unarmed
   listener never does.
 
+The two rustls-level changes this control makes to a `ServerConfig` — the live
+handshake verifier wrapper (whose CertificateRequest CA-name hints are
+deliberately empty) and the suppression of TLS 1.3 session tickets and the
+stateful session cache — are likewise applied **only where a client-trust
+generation can actually be published**: an mTLS listener built without
+`FERRUM_FRONTEND_TLS_LIVE_RELOAD_ENABLED` keeps its `certificate_authorities`
+hints and its session resumption exactly as before. Suppressing resumption is
+required once a withdrawal can land mid-life, because a session ticket does not
+re-run client-certificate verification; where no generation can ever advance,
+there is no withdrawn generation for a ticket to outlive. The one exception is
+HTTP/3 under a data plane, whose reload channel is CP-delivered rather than
+operator-file-driven: there the QUIC listener binds the wrapper whenever it has
+a reload channel at all, which is the same condition under which it arms
+`proxy_h3`.
+
 Certificate/key-only live reload is unaffected on such a listener: it rotates
 normally, simply without a trust generation. A listener's authentication mode is
 fixed configuration and is not something live reload may change, so a reload

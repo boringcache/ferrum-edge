@@ -1112,6 +1112,52 @@ fn assert_source_order(source: &str, needles: &[&str], message: &str) {
     }
 }
 
+/// Suppressing TLS 1.3 resumption is required only where a withdrawal can
+/// actually land: a session ticket does not re-run client-certificate
+/// verification, so a listener bound to a client-trust scope must not issue
+/// one. A listener that is never bound can never publish a generation, so it
+/// has to keep the resumption it had before issue #3857 — otherwise every
+/// static mTLS deployment silently pays a full handshake per connection for a
+/// protection that cannot engage.
+#[test]
+fn resumption_is_suppressed_only_for_a_scope_bound_mtls_listener() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let pki = build_pki();
+    let crls = parse_crls(&pki.crl_pem(&[UNRELATED_SERIAL], 1));
+
+    let unbound = load_accepted_frontend_parts(
+        dir.path(),
+        "resumption-unbound",
+        &pki.server_cert_pem,
+        &pki.server_key_pem,
+        &pki.ca_pem,
+        &crls,
+        None,
+    )
+    .expect("unbound mTLS candidate");
+    assert!(
+        unbound.config.send_tls13_tickets > 0,
+        "a static mTLS listener must keep TLS 1.3 session tickets: no generation can advance, \
+         so no ticket can outlive a withdrawal"
+    );
+
+    let bound = load_accepted_frontend_parts(
+        dir.path(),
+        "resumption-bound",
+        &pki.server_cert_pem,
+        &pki.server_key_pem,
+        &pki.ca_pem,
+        &crls,
+        Some(ClientTrustScope::ProxyFrontend),
+    )
+    .expect("scope-bound mTLS candidate");
+    assert_eq!(
+        bound.config.send_tls13_tickets, 0,
+        "a listener that can publish a withdrawal must not issue resumption tickets that skip \
+         client-certificate verification"
+    );
+}
+
 /// A listener with no client-CA source installs no verifier, so a globally
 /// loaded CRL list is irrelevant: it must not reject the candidate, and the
 /// captured identity must stay empty rather than summarizing CRLs no handshake
@@ -1415,6 +1461,12 @@ fn dp_mode_pairs_cp_server_config_with_operator_trust_for_h3() {
     assert!(
         staged.contains("ClientTrustScope::ProxyFrontend"),
         "CP-delivered frontend TLS must bind ProxyFrontend's live handshake wrapper"
+    );
+    assert!(
+        staged.contains("frontend_tls_live_reload_enabled"),
+        "the wrapper must be bound only under the opt-in that can arm the scope; binding it \
+         unconditionally strips CertificateRequest CA-name hints and TLS 1.3 resumption on a \
+         DP that can never publish an operator trust generation"
     );
     assert!(
         staged.contains("load_gateway_multi_cert_tls_config_with_handshake_scope")

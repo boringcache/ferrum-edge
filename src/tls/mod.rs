@@ -1343,11 +1343,19 @@ pub(crate) fn finish_frontend_server_config_capturing_trust(
     // always set 0 here. Proxy-specific call sites apply early_data_max_size
     // via Arc::get_mut() after this returns — see modes/*.rs.
     config.max_early_data_size = 0;
-    if client_auth_enforced {
+    if client_auth_enforced && handshake_scope.is_some() {
         // TLS 1.3 session tickets and the stateful cache do not re-run client
         // certificate verification. After a CRL or client-CA withdrawal the
         // next handshake must meet the accepted verifier, not a ticket issued
         // under the withdrawn generation.
+        //
+        // Gated on `handshake_scope` — i.e. on this listener participating in
+        // client-trust binding at all, which callers set only under
+        // `FERRUM_FRONTEND_TLS_LIVE_RELOAD_ENABLED`. Without live reload no
+        // generation can ever advance, there is no withdrawn generation a
+        // ticket could outlive, and disabling resumption would be a pure
+        // handshake-cost regression on every static mTLS listener. Keep the
+        // "cost when disabled is zero" contract this feature documents.
         config.send_tls13_tickets = 0;
         config.session_storage = Arc::new(rustls::server::NoServerSessionStorage {});
     }

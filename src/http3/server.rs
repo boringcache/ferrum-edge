@@ -504,11 +504,20 @@ fn configured_h3_reload_candidate(
 /// `client_trust` is the verifier this endpoint will enforce together with the
 /// identity of the material behind it; the caller installs that verifier, then
 /// adopts the returned config, then publishes exactly that identity.
+///
+/// `bind_live_verifier` mirrors "this listener can publish a client-trust
+/// generation at all" — i.e. it has a frontend TLS reload channel, the same
+/// first half of the startup `arm_client_trust` predicate. Only then is the
+/// live handshake wrapper installed (with its deliberately empty, and therefore
+/// generation-neutral, CertificateRequest CA-name hints) and TLS 1.3 resumption
+/// suppressed. Without a reload channel no generation can ever advance, so both
+/// would be pure cost on a static mTLS HTTP/3 listener (issue #3857).
 fn build_h3_quinn_server_config(
     tls_config: &Arc<rustls::ServerConfig>,
     tls_policy: &TlsPolicy,
     client_trust: &crate::tls::AcceptedClientTrust,
     client_auth_configured: bool,
+    bind_live_verifier: bool,
     h3_config: &Http3ServerConfig,
 ) -> Result<quinn::ServerConfig, anyhow::Error> {
     // HTTP/3 (QUIC) requires TLS 1.3 — rebuild the server config with TLS 1.3 forced.
@@ -585,12 +594,19 @@ fn build_h3_quinn_server_config(
     // inbound verifier — only an explicitly *unconfigured* client CA yields no
     // client auth.
     let mut server_tls_config = match (client_auth_configured, client_trust.verifier.clone()) {
-        (_, Some(verifier)) => h3_builder
-            .with_client_cert_verifier(crate::tls::client_trust::bind_live_handshake_verifier(
-                crate::tls::ClientTrustScope::ProxyH3,
-                verifier,
-            ))
-            .with_cert_resolver(tls_config.cert_resolver.clone()),
+        (_, Some(verifier)) => {
+            let installed = if bind_live_verifier {
+                crate::tls::client_trust::bind_live_handshake_verifier(
+                    crate::tls::ClientTrustScope::ProxyH3,
+                    verifier,
+                )
+            } else {
+                verifier
+            };
+            h3_builder
+                .with_client_cert_verifier(installed)
+                .with_cert_resolver(tls_config.cert_resolver.clone())
+        }
         (true, None) => {
             return Err(anyhow::anyhow!(
                 "HTTP/3 mTLS is configured but the accepted frontend TLS candidate carries no \
@@ -640,7 +656,13 @@ fn build_h3_quinn_server_config(
     }
     server_tls_config.session_storage =
         rustls::server::ServerSessionMemoryCache::new(tls_policy.session_cache_size);
-    if client_trust.verifier.is_some() {
+    if client_trust.verifier.is_some() && bind_live_verifier {
+        // A QUIC session ticket does not re-run client-certificate
+        // verification, so once this listener can publish a withdrawal a
+        // resumed connection must still meet the accepted verifier. A listener
+        // with no reload channel can never publish one, and suppressing
+        // resumption there would only cost every mTLS HTTP/3 client a full
+        // handshake.
         server_tls_config.send_tls13_tickets = 0;
         server_tls_config.session_storage = Arc::new(rustls::server::NoServerSessionStorage {});
     }
@@ -879,6 +901,14 @@ pub async fn start_http3_listener_with_signal(
     // for this listener or it is not, at startup and on every reload alike.
     let client_auth_configured = client_ca_bundle_path.is_some();
 
+    // Whether this listener can ever publish a client-trust generation at all
+    // (issue #3857): only a listener with a frontend TLS reload channel adopts a
+    // later candidate, and that is the first half of the `arm_client_trust`
+    // predicate below. Without it the ProxyH3 scope stays unarmed for the whole
+    // process, so installing the live handshake wrapper (empty CertificateRequest
+    // CA-name hints) and suppressing QUIC resumption would be pure cost.
+    let client_trust_reload_active = frontend_tls_reload.is_some();
+
     // The client trust the STARTUP endpoint config enforces, loaded coherently
     // (issue #3857): one read of the client-CA source produces both the verifier
     // installed below and the identity published for it. `None` in the disabled
@@ -915,6 +945,7 @@ pub async fn start_http3_listener_with_signal(
             tls_policy,
             startup_client_trust,
             client_auth_configured,
+            client_trust_reload_active,
             &h3_config,
         )?;
         // Quinn's `Endpoint::server` convenience constructor is gated on its
@@ -933,7 +964,7 @@ pub async fn start_http3_listener_with_signal(
         // `None` refuses handshakes until that transaction runs — fail-closed,
         // not a certificate-less serving config.
         let arm_client_trust =
-            frontend_tls_reload.is_some() && startup_client_trust.verifier.is_some();
+            client_trust_reload_active && startup_client_trust.verifier.is_some();
         if arm_client_trust {
             let endpoint =
                 quinn::Endpoint::new(quinn::EndpointConfig::default(), None, socket, runtime)?;
@@ -1140,6 +1171,9 @@ pub async fn start_http3_listener_with_signal(
                     &reload_policy,
                     &client_trust,
                     client_auth_configured,
+                    // This arm only runs on a listener that has a reload
+                    // channel, so the ProxyH3 scope is live-verifier bound.
+                    true,
                     &reload_h3_config,
                 ) {
                     Ok(server_config) => {
@@ -18661,6 +18695,7 @@ mod build_h3_quinn_server_config_mtls_tests {
             &tls_policy,
             &client_trust,
             client_ca.is_some(),
+            true,
             &h3_config,
         )
     }

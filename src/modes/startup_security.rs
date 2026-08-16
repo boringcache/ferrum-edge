@@ -286,6 +286,32 @@ pub fn try_load_frontend_tls(
         .map(|candidate| candidate.map(|candidate| candidate.config))
 }
 
+/// The client-trust binding scope the proxy frontend `ServerConfig` is built
+/// with (issue #3857), or `None` when no generation can ever be published.
+///
+/// Binding a scope installs the live handshake verifier wrapper (which reports
+/// generation-neutral, i.e. empty, CertificateRequest CA-name hints) and
+/// disables TLS 1.3 resumption for mTLS listeners. Both are required once a
+/// withdrawal can land mid-life, and both are pure cost when it cannot:
+/// `client_trust` scopes are armed only from `modes::tls_reload`, which returns
+/// immediately unless `FERRUM_FRONTEND_TLS_LIVE_RELOAD_ENABLED` is set. A static
+/// mTLS listener therefore keeps its pre-#3857 CertificateRequest hints and
+/// session resumption exactly as before.
+fn proxy_frontend_handshake_scope(env_config: &EnvConfig) -> Option<tls::ClientTrustScope> {
+    env_config
+        .frontend_tls_live_reload_enabled
+        .then_some(tls::ClientTrustScope::ProxyFrontend)
+}
+
+/// [`proxy_frontend_handshake_scope`] for the admin HTTPS listener. Admin live
+/// reload is governed by the same process-wide opt-in
+/// (`modes::tls_reload::prepare_admin_frontend_tls`).
+fn admin_https_handshake_scope(env_config: &EnvConfig) -> Option<tls::ClientTrustScope> {
+    env_config
+        .frontend_tls_live_reload_enabled
+        .then_some(tls::ClientTrustScope::AdminHttps)
+}
+
 /// [`try_load_frontend_tls`] that also returns the accepted candidate's
 /// client-certificate verifier and trust identity (issue #3857).
 ///
@@ -313,7 +339,7 @@ pub fn try_load_frontend_tls_candidate(
         tls_policy,
         env_config.tls_cert_expiry_warning_days,
         crls,
-        Some(tls::ClientTrustScope::ProxyFrontend),
+        proxy_frontend_handshake_scope(env_config),
     )
     .map(Some)
     .map_err(|e| anyhow::anyhow!("Invalid TLS configuration: {}", e))
@@ -378,7 +404,7 @@ pub fn load_admin_tls_candidate(
         tls_policy,
         env_config.tls_cert_expiry_warning_days,
         crls,
-        Some(tls::ClientTrustScope::AdminHttps),
+        admin_https_handshake_scope(env_config),
     )
     .map_err(|e| anyhow::anyhow!("{}: {}", error_label, e))
 }

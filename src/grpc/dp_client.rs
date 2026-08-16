@@ -1666,7 +1666,16 @@ fn stage_frontend_tls_snapshot(
             // that snapshot generation; verification still uses the live
             // fail-closed operator verifier. Withdrawals already fail closed
             // via post-handshake revalidation.
-            let handshake_scope = Some(crate::tls::ClientTrustScope::ProxyFrontend);
+            //
+            // Bound only under the same opt-in that can arm the scope. Without
+            // `FERRUM_FRONTEND_TLS_LIVE_RELOAD_ENABLED` no operator client-trust
+            // generation is ever published, so the wrapper would only strip this
+            // listener's CertificateRequest CA-name hints and its TLS 1.3
+            // resumption for nothing.
+            let handshake_scope = proxy_state
+                .env_config
+                .frontend_tls_live_reload_enabled
+                .then_some(crate::tls::ClientTrustScope::ProxyFrontend);
             let mut tls_config = if !certificates.is_empty() {
                 load_gateway_multi_cert_tls_config_with_handshake_scope(
                     &certificates,
