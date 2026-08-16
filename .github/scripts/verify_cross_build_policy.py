@@ -2750,8 +2750,34 @@ LIVE_SUITE_JOB_BINDING = {
 #     compile and execute pull-request-authored Rust tests and fuzz targets;
 #   * a repository that has not adopted the job may omit it, but once the
 #     trusted base carries it a pull request cannot remove it.
+#
+# Issue #3902 changes what the job runs where, which a whole-job freeze cannot
+# express as an edit. It is therefore admitted the same way `release.yml` admits
+# a new image family: as two byte-frozen GENERATIONS with a one-way transition
+# between them (`CI_FUZZ_SMOKE_JOB_GENERATIONS`, oldest first).
+#
+#   * `CI_FUZZ_SMOKE_RETIRED_JOB` is the shape issue #2461 landed: one job that
+#     compiled and ran the six sanitizer-instrumented libFuzzer targets on every
+#     full-mode pull request, with compiler caching explicitly disabled.
+#   * `CI_FUZZ_SMOKE_JOB` is the adopted shape: the deterministic property smoke
+#     is still the required pull-request gate, the six-target bounded budget
+#     runs on merge_group / push to `main` / manual dispatch, and the lane uses
+#     the repository's checksum-pinned sccache installer.
+#
+# Both generations are admitted so the trusted base stays valid while the
+# transition lands, and so the destination revision validates against a policy
+# that already carries it. The transition is one-way: a revision may move from
+# the retired generation to the adopted one, but
+# `admitted_fuzz_smoke_removal_errors` refuses the reverse. Withholding is
+# symmetric across generations, so that explicit check — not the digest
+# comparison — is what makes the direction stick.
+#
+# `CI_FUZZ_SMOKE_BOUNDED_BUDGET` is the bounded run itself, asserted verbatim in
+# every generation by the self-test: the six target markers, the `cargo fuzz
+# run` invocation, and the `-runs` / `-max_total_time` / `-max_len` / `-timeout`
+# / `-rss_limit_mb` bounds cannot drift while a generation is added.
 CI_FUZZ_SMOKE_JOB_NAME = "fuzz-smoke"
-CI_FUZZ_SMOKE_JOB = r"""  fuzz-smoke:
+CI_FUZZ_SMOKE_RETIRED_JOB = r"""  fuzz-smoke:
     # Byte-frozen by the trusted Cross build policy
     # (.github/scripts/verify_cross_build_policy.py, CI_FUZZ_SMOKE_JOB). Issue
     # #2461 requires a short deterministic property/fuzz smoke in ordinary CI;
@@ -2816,6 +2842,155 @@ CI_FUZZ_SMOKE_JOB = r"""  fuzz-smoke:
               -rss_limit_mb=1024
           done
 """
+CI_FUZZ_SMOKE_JOB = r"""  fuzz-smoke:
+    # Byte-frozen by the trusted Cross build policy
+    # (.github/scripts/verify_cross_build_policy.py, CI_FUZZ_SMOKE_JOB). Issue
+    # #2461 requires a short deterministic property/fuzz smoke in ordinary CI;
+    # issue #3902 decides where each half of it runs. This is its entire
+    # permitted shape. Every command, action pin, toolchain pin, tool version,
+    # target name, and libFuzzer bound below is part of the contract, so a pull
+    # request cannot widen the budget, change the target list, add a step, or
+    # redirect this job at a repository-supplied script.
+    #
+    # Lane split (#3902): the deterministic property smoke stays the required
+    # full-mode pull-request gate. The six-target, sanitizer-instrumented
+    # libFuzzer build spent roughly 39 minutes compiling to buy roughly 48
+    # seconds of fuzzing on every pull request, so it now runs on merge_group,
+    # on the push to `main`, and on manual dispatch instead. Every route a
+    # change takes to `main` still executes it at byte-identical bounds.
+    name: Fuzz Smoke
+    needs: ci-plan
+    if: needs.ci-plan.outputs.mode == 'full' && (github.event_name == 'pull_request' || github.event_name == 'merge_group' || (github.event_name == 'push' && github.ref == 'refs/heads/main') || github.event_name == 'workflow_dispatch')
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    permissions:
+      contents: read
+    # The repository-root Cargo config also selects the mold linker through
+    # per-target rustflags, and this isolated lane installs no fast linker, so
+    # the inherited rustflags are cleared explicitly. The rustc wrapper is
+    # deliberately NOT pinned here: `setup-sccache` below publishes either the
+    # checksum-verified sccache path or an empty value through `GITHUB_ENV`,
+    # and a job-level `env` entry of the same name would override that
+    # fail-closed decision.
+    env:
+      RUSTFLAGS: ""
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
+        with:
+          persist-credentials: false
+
+      - name: Install required build dependency
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends protobuf-compiler
+
+      - name: Install pinned nightly toolchain
+        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # nightly
+        with:
+          toolchain: nightly-2025-07-01
+
+      # The repository's own checksum-pinned sccache installer, and the only
+      # local action this contract admits. It never enables the
+      # credential-bearing sccache GHA backend, never persists
+      # ACTIONS_RUNTIME_TOKEN / ACTIONS_RESULTS_URL into later steps, asserts
+      # those credentials are absent before any build runs, and fails closed to
+      # no wrapper at all. It must run BEFORE the cache restore below so the
+      # lazily started sccache server indexes the restored entries.
+      - uses: ./.github/actions/setup-sccache
+
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        with:
+          workspaces: fuzz -> target
+          shared-key: fuzz-smoke
+          cache-directories: ${{ github.workspace }}/.cache/sccache
+          # Only a push to `main` may write this lane's cache. GitHub already
+          # scopes a pull request's cache writes to its own ref; writing
+          # nothing at all from an untrusted ref is the stronger statement,
+          # and it keeps every compiler artifact the sanitizer build reuses
+          # attributable to code that has already merged.
+          save-if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
+
+      - name: Install pinned cargo-fuzz
+        run: cargo install cargo-fuzz --locked --version 0.13.1
+
+      - name: Run deterministic property smoke tests
+        working-directory: fuzz
+        run: |
+          set -euo pipefail
+
+          property_started=$SECONDS
+          cargo test --locked
+          echo "Fuzz property smoke seconds: $((SECONDS - property_started))"
+
+      - name: Run bounded libFuzzer smoke budget
+        # Issue #3902: off the ordinary pull-request path. Every route to
+        # `main` (merge_group, the push to `main` itself, and manual dispatch)
+        # still executes the whole six-target budget below.
+        if: github.event_name != 'pull_request'
+        working-directory: fuzz
+        run: |
+          set -euo pipefail
+
+          sanitizer_started=$SECONDS
+          sccache_bin="${RUSTC_WRAPPER:-}"
+          echo "Fuzz sanitizer lane sccache statistics before the sanitizer build:"
+          if [ -n "$sccache_bin" ] && [ -x "$sccache_bin" ]; then
+            "$sccache_bin" --show-stats
+          else
+            echo "sccache is unavailable; this sanitizer build cannot reuse compiler output"
+          fi
+
+          for fuzz_target in traceparent config_decode proxy_protocol mesh_udp_frame k8s_crd plugin_config; do
+            echo "Fuzz smoke target: ${fuzz_target}"
+            cargo fuzz run --codegen-units 16 "$fuzz_target" -- \
+              -runs=512 \
+              -max_total_time=8 \
+              -max_len=4096 \
+              -timeout=2 \
+              -rss_limit_mb=1024
+          done
+          echo "Fuzz sanitizer lane seconds: $((SECONDS - sanitizer_started))"
+
+      - name: Report fuzz lane compiler-cache telemetry
+        if: always()
+        run: |
+          set -euo pipefail
+
+          if [ "$GITHUB_EVENT_NAME" = "pull_request" ]; then
+            echo "Fuzz lane shape: deterministic property gate only"
+          else
+            echo "Fuzz lane shape: property gate plus the six-target sanitizer budget"
+          fi
+
+          sccache_bin="${RUSTC_WRAPPER:-}"
+          if [ -n "$sccache_bin" ] && [ -x "$sccache_bin" ]; then
+            echo "Fuzz lane sccache statistics after this run:"
+            "$sccache_bin" --show-stats
+            du -sh "${GITHUB_WORKSPACE}/.cache/sccache" || true
+          else
+            echo "::warning::sccache was unavailable; this fuzz run compiled without a compiler cache"
+          fi
+"""
+
+# Oldest first. The index of a revision's job text in this tuple is its
+# generation; a higher index may replace a lower one, never the reverse.
+CI_FUZZ_SMOKE_JOB_GENERATIONS = (CI_FUZZ_SMOKE_RETIRED_JOB, CI_FUZZ_SMOKE_JOB)
+
+# The bounded libFuzzer budget, verbatim. Every admitted generation must carry
+# it exactly once, wherever in the job it runs.
+CI_FUZZ_SMOKE_BOUNDED_BUDGET = (
+    "          for fuzz_target in traceparent config_decode proxy_protocol "
+    "mesh_udp_frame k8s_crd plugin_config; do\n"
+    '            echo "Fuzz smoke target: ${fuzz_target}"\n'
+    '            cargo fuzz run --codegen-units 16 "$fuzz_target" -- \\\n'
+    "              -runs=512 \\\n"
+    "              -max_total_time=8 \\\n"
+    "              -max_len=4096 \\\n"
+    "              -timeout=2 \\\n"
+    "              -rss_limit_mb=1024\n"
+    "          done\n"
+)
 
 # Adopting the byte-frozen job above is only half of the gate: a lane nothing
 # observes is not a gate at all, so the first adoption must also make
@@ -11202,13 +11377,30 @@ def live_suite_relevance_errors(
     return errors
 
 
+def admitted_fuzz_smoke_generation(block: str | None) -> int | None:
+    """Return which admitted generation this `fuzz-smoke` job text is.
+
+    `None` means the text is not an admitted generation at all, which is also
+    what an absent job yields; callers that must distinguish the two check the
+    block for `None` themselves. Equality against the whole frozen text is the
+    only test, so a generation can never be reached by editing another one.
+    """
+
+    if block is None:
+        return None
+    for generation, admitted in enumerate(CI_FUZZ_SMOKE_JOB_GENERATIONS):
+        if block == admitted:
+            return generation
+    return None
+
+
 def admitted_fuzz_smoke_errors(contents: str, source: str) -> list[str]:
-    """Reject any `fuzz-smoke` job that is not the byte-frozen contract.
+    """Reject any `fuzz-smoke` job that is not a byte-frozen generation.
 
     Absence is allowed: the fuzz lane is opt-in, and a repository that has not
-    adopted it must still validate. Presence is allowed only at exactly the
-    admitted text, so the admission can never be widened into a general licence
-    to add executable jobs to `ci.yml`.
+    adopted it must still validate. Presence is allowed only at exactly one of
+    the admitted generations, so the admission can never be widened into a
+    general licence to add executable jobs to `ci.yml`.
     """
 
     block, failures = extract_job_block(
@@ -11219,20 +11411,20 @@ def admitted_fuzz_smoke_errors(contents: str, source: str) -> list[str]:
     )
     if failures:
         return failures
-    if block is None or block == CI_FUZZ_SMOKE_JOB:
+    if block is None or admitted_fuzz_smoke_generation(block) is not None:
         return []
     return [
-        f"{source} job {CI_FUZZ_SMOKE_JOB_NAME!r} must be byte-identical to the "
-        "admitted fuzz-smoke contract in the trusted policy, or be absent"
+        f"{source} job {CI_FUZZ_SMOKE_JOB_NAME!r} must be byte-identical to an "
+        "admitted fuzz-smoke generation in the trusted policy, or be absent"
     ]
 
 
 def admitted_ci_job_names(contents: str, source: str) -> frozenset[str]:
     """Return the admitted jobs this workflow carries verbatim.
 
-    Only a job whose text equals its contract is admitted, so a tampered job
-    keeps every surface it produced and is rejected by the surface comparison
-    in addition to `admitted_fuzz_smoke_errors`.
+    Only a job whose text equals an admitted generation is admitted, so a
+    tampered job keeps every surface it produced and is rejected by the surface
+    comparison in addition to `admitted_fuzz_smoke_errors`.
     """
 
     block, failures = extract_job_block(
@@ -11241,7 +11433,7 @@ def admitted_ci_job_names(contents: str, source: str) -> frozenset[str]:
         CI_FUZZ_SMOKE_JOB_NAME,
         required=False,
     )
-    if failures or block is None or block != CI_FUZZ_SMOKE_JOB:
+    if failures or admitted_fuzz_smoke_generation(block) is None:
         return frozenset()
     return frozenset({CI_FUZZ_SMOKE_JOB_NAME})
 
@@ -11251,14 +11443,45 @@ def admitted_fuzz_smoke_removal_errors(
     proposed_contents: str,
     source: str,
 ) -> list[str]:
-    """Keep the admitted smoke gate once the trusted base has adopted it."""
+    """Keep the admitted smoke gate, and its direction, once the base adopts it.
 
-    baseline = admitted_ci_job_names(merge_base_contents, f"merge-base {source}")
-    proposed = admitted_ci_job_names(proposed_contents, f"proposed {source}")
-    if CI_FUZZ_SMOKE_JOB_NAME in baseline and CI_FUZZ_SMOKE_JOB_NAME not in proposed:
+    Two one-way rules, both invisible to the surface comparison because every
+    admitted generation is withheld from both sides of it:
+
+      * an adopted job may not be removed or replaced by unadmitted text;
+      * an adopted generation may not be replaced by an older one. The trusted
+        base decides when a generation retires, exactly as it does for the
+        admitted `release.yml` image-family adoption.
+    """
+
+    baseline_block, baseline_failures = extract_job_block(
+        merge_base_contents,
+        f"merge-base {source}",
+        CI_FUZZ_SMOKE_JOB_NAME,
+        required=False,
+    )
+    proposed_block, proposed_failures = extract_job_block(
+        proposed_contents,
+        f"proposed {source}",
+        CI_FUZZ_SMOKE_JOB_NAME,
+        required=False,
+    )
+    if baseline_failures or proposed_failures:
+        return [*baseline_failures, *proposed_failures]
+    baseline_generation = admitted_fuzz_smoke_generation(baseline_block)
+    if baseline_generation is None:
+        return []
+    proposed_generation = admitted_fuzz_smoke_generation(proposed_block)
+    if proposed_generation is None:
         return [
             f"{source} cannot remove or alter the admitted "
             f"{CI_FUZZ_SMOKE_JOB_NAME!r} job after the trusted base adopts it"
+        ]
+    if proposed_generation < baseline_generation:
+        return [
+            f"{source} cannot return the admitted {CI_FUZZ_SMOKE_JOB_NAME!r} "
+            "job to a retired generation; the trusted base decides when a "
+            "generation retires"
         ]
     return []
 
@@ -11308,9 +11531,12 @@ def ci_fuzz_smoke_aggregate_wiring(contents: str, source: str) -> FuzzAggregateW
     lane is opt-in. Presence is allowed only as the three byte-exact lines in
     `CI_FUZZ_SMOKE_AGGREGATE_INSERTIONS`, each immediately after its anchor, and
     only when the `fuzz-smoke` job it requires is itself present and
-    byte-identical to the frozen contract. Nothing else about the aggregate is
-    exempted: the caller still compares the withheld rendering byte for byte
-    against the trusted base, so any other edit to the job is still rejected.
+    byte-identical to one of the admitted generations. Nothing else about the
+    aggregate is exempted: the caller still compares the withheld rendering byte
+    for byte against the trusted base, so any other edit to the job is still
+    rejected. The wiring is generation-independent by construction, because
+    every generation is one job named `fuzz-smoke`, so a generation transition
+    moves no aggregate byte.
     """
 
     block, failures = extract_job_block(
@@ -11363,7 +11589,7 @@ def ci_fuzz_smoke_aggregate_wiring(contents: str, source: str) -> FuzzAggregateW
         errors.append(
             f"{source} job {CI_AGGREGATE_JOB_NAME!r} requires the "
             f"{CI_FUZZ_SMOKE_JOB_NAME!r} gate, so that job must be present and "
-            "byte-identical to the admitted fuzz-smoke contract"
+            "byte-identical to an admitted fuzz-smoke generation"
         )
     if errors:
         return FuzzAggregateWiring("invalid", contents, errors)
@@ -26371,8 +26597,22 @@ pre_build = []
     # ------------------------------------------------------------------
     # Admitted fuzz/property lane
     # ------------------------------------------------------------------
+    if len(CI_FUZZ_SMOKE_JOB_GENERATIONS) != len(set(CI_FUZZ_SMOKE_JOB_GENERATIONS)):
+        failures.append("the admitted fuzz-smoke generations are not distinct")
+    if CI_FUZZ_SMOKE_JOB_GENERATIONS[-1] != CI_FUZZ_SMOKE_JOB:
+        failures.append(
+            "the newest admitted fuzz-smoke generation must be CI_FUZZ_SMOKE_JOB"
+        )
+    if CI_FUZZ_SMOKE_JOB_GENERATIONS[0] != CI_FUZZ_SMOKE_RETIRED_JOB:
+        failures.append(
+            "the oldest admitted fuzz-smoke generation must be "
+            "CI_FUZZ_SMOKE_RETIRED_JOB"
+        )
     for admitted_label, admitted_text in (
-        ("fuzz-smoke job", CI_FUZZ_SMOKE_JOB),
+        *(
+            (f"fuzz-smoke job generation {generation}", admitted)
+            for generation, admitted in enumerate(CI_FUZZ_SMOKE_JOB_GENERATIONS)
+        ),
         ("scheduled fuzz lane", FUZZ_WORKFLOW),
     ):
         if TARGET in admitted_text:
@@ -26389,17 +26629,83 @@ pre_build = []
             failures.append(
                 f"the admitted {admitted_label} requests write permission"
             )
-        cargo_override_block = (
-            '    env:\n'
-            '      RUSTC_WRAPPER: ""\n'
-            '      CARGO_BUILD_RUSTC_WRAPPER: ""\n'
-            '      RUSTFLAGS: ""\n'
-        )
+    # Wherever the six-target budget runs, it runs at exactly these bounds. A
+    # generation that moved the lane must not also have relaxed it.
+    for generation, admitted in enumerate(CI_FUZZ_SMOKE_JOB_GENERATIONS):
+        if admitted.count(CI_FUZZ_SMOKE_BOUNDED_BUDGET) != 1:
+            failures.append(
+                f"admitted fuzz-smoke generation {generation} does not carry the "
+                "bounded six-target libFuzzer budget exactly once"
+            )
+    # The retired generation and the scheduled lane install no compiler cache
+    # at all, so both clear every wrapper input the root Cargo config sets.
+    cargo_override_block = (
+        '    env:\n'
+        '      RUSTC_WRAPPER: ""\n'
+        '      CARGO_BUILD_RUSTC_WRAPPER: ""\n'
+        '      RUSTFLAGS: ""\n'
+    )
+    for admitted_label, admitted_text in (
+        ("retired fuzz-smoke generation", CI_FUZZ_SMOKE_RETIRED_JOB),
+        ("scheduled fuzz lane", FUZZ_WORKFLOW),
+    ):
         if cargo_override_block not in admitted_text:
             failures.append(
-                f"the admitted {admitted_label} no longer disables repository "
-                "sccache wrapper inputs and inherited linker rustflags"
+                f"the {admitted_label} no longer disables repository sccache "
+                "wrapper inputs and inherited linker rustflags"
             )
+    # The adopted generation deliberately does the opposite for the wrapper: it
+    # leaves the name unset so the pinned installer's fail-closed GITHUB_ENV
+    # decision is the one cargo sees. Everything that makes that safe is
+    # asserted here rather than left to the prose of the contract.
+    if '    env:\n      RUSTFLAGS: ""\n' not in CI_FUZZ_SMOKE_JOB:
+        failures.append(
+            "the adopted fuzz-smoke generation no longer clears the inherited "
+            "linker rustflags of the root Cargo configuration"
+        )
+    if '      RUSTC_WRAPPER: ""\n' in CI_FUZZ_SMOKE_JOB:
+        failures.append(
+            "the adopted fuzz-smoke generation pins a job-level rustc wrapper, "
+            "which would override the pinned installer's fail-closed decision"
+        )
+    if CI_FUZZ_SMOKE_JOB.count("uses: ./.github/actions/") != 1:
+        failures.append(
+            "the adopted fuzz-smoke generation must reference exactly one local "
+            "action"
+        )
+    if "      - uses: ./.github/actions/setup-sccache\n" not in CI_FUZZ_SMOKE_JOB:
+        failures.append(
+            "the adopted fuzz-smoke generation no longer uses the repository's "
+            "checksum-pinned sccache installer"
+        )
+    if (
+        "          save-if: ${{ github.event_name == 'push' && "
+        "github.ref == 'refs/heads/main' }}\n"
+    ) not in CI_FUZZ_SMOKE_JOB:
+        failures.append(
+            "the adopted fuzz-smoke generation lets an untrusted ref write the "
+            "compiler cache the sanitizer build restores"
+        )
+    if "        if: github.event_name != 'pull_request'\n" not in CI_FUZZ_SMOKE_JOB:
+        failures.append(
+            "the adopted fuzz-smoke generation no longer keeps the sanitizer "
+            "budget off the ordinary pull-request path"
+        )
+    for admitted_event in (
+        "github.event_name == 'merge_group'",
+        "(github.event_name == 'push' && github.ref == 'refs/heads/main')",
+        "github.event_name == 'workflow_dispatch'",
+    ):
+        if admitted_event not in CI_FUZZ_SMOKE_JOB:
+            failures.append(
+                "the adopted fuzz-smoke generation no longer reaches the "
+                f"sanitizer budget through {admitted_event}"
+            )
+    if "needs.ci-plan.outputs.mode == 'full'" not in CI_FUZZ_SMOKE_JOB:
+        failures.append(
+            "the adopted fuzz-smoke generation no longer runs as a full-mode "
+            "required gate"
+        )
     if (
         "\non:\n  schedule:\n    - cron: '30 6 * * 1'\n  workflow_dispatch:\n"
         "\npermissions:\n  contents: read\n"
@@ -26409,15 +26715,22 @@ pre_build = []
             "schedule/dispatch trigger and read-only permissions"
         )
 
-    fuzz_ci_workflow = (
-        "name: Self-test CI\non:\n  pull_request:\njobs:\n" + CI_FUZZ_SMOKE_JOB
+    fuzz_generation_workflows = tuple(
+        "name: Self-test CI\non:\n  pull_request:\njobs:\n" + admitted
+        for admitted in CI_FUZZ_SMOKE_JOB_GENERATIONS
     )
-    if admitted_fuzz_smoke_errors(fuzz_ci_workflow, "CI workflow"):
-        failures.append("the admitted fuzz-smoke contract was rejected")
-    if admitted_ci_job_names(fuzz_ci_workflow, "CI workflow") != frozenset(
-        {CI_FUZZ_SMOKE_JOB_NAME}
-    ):
-        failures.append("the admitted fuzz-smoke job was not recognized")
+    fuzz_ci_workflow = fuzz_generation_workflows[-1]
+    for generation, generation_workflow in enumerate(fuzz_generation_workflows):
+        if admitted_fuzz_smoke_errors(generation_workflow, "CI workflow"):
+            failures.append(
+                f"the admitted fuzz-smoke generation {generation} was rejected"
+            )
+        if admitted_ci_job_names(generation_workflow, "CI workflow") != frozenset(
+            {CI_FUZZ_SMOKE_JOB_NAME}
+        ):
+            failures.append(
+                f"the admitted fuzz-smoke generation {generation} was not recognized"
+            )
     fuzz_absent_workflow = (
         "name: Self-test CI\non:\n  pull_request:\njobs:\n"
         "  other:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo ok\n"
@@ -26426,18 +26739,50 @@ pre_build = []
         failures.append("an absent fuzz-smoke job was rejected")
     if admitted_ci_job_names(fuzz_absent_workflow, "CI workflow"):
         failures.append("an absent fuzz-smoke job was reported as admitted")
-    if not admitted_fuzz_smoke_removal_errors(
-        fuzz_ci_workflow,
-        fuzz_absent_workflow,
-        "CI workflow",
-    ):
-        failures.append("removal of an adopted fuzz-smoke job was not rejected")
-    if admitted_fuzz_smoke_removal_errors(
-        fuzz_absent_workflow,
-        fuzz_ci_workflow,
-        "CI workflow",
-    ):
-        failures.append("initial adoption of the fuzz-smoke job was rejected")
+    for generation, generation_workflow in enumerate(fuzz_generation_workflows):
+        if not admitted_fuzz_smoke_removal_errors(
+            generation_workflow,
+            fuzz_absent_workflow,
+            "CI workflow",
+        ):
+            failures.append(
+                f"removal of adopted fuzz-smoke generation {generation} was not "
+                "rejected"
+            )
+        if admitted_fuzz_smoke_removal_errors(
+            fuzz_absent_workflow,
+            generation_workflow,
+            "CI workflow",
+        ):
+            failures.append(
+                f"initial adoption of fuzz-smoke generation {generation} was "
+                "rejected"
+            )
+    # Withholding is symmetric across generations, so nothing but this check
+    # gives the transition a direction. Assert both halves of it.
+    for older_generation in range(len(fuzz_generation_workflows)):
+        for newer_generation in range(
+            older_generation + 1,
+            len(fuzz_generation_workflows),
+        ):
+            if admitted_fuzz_smoke_removal_errors(
+                fuzz_generation_workflows[older_generation],
+                fuzz_generation_workflows[newer_generation],
+                "CI workflow",
+            ):
+                failures.append(
+                    "the admitted fuzz-smoke transition "
+                    f"{older_generation} -> {newer_generation} was rejected"
+                )
+            if not admitted_fuzz_smoke_removal_errors(
+                fuzz_generation_workflows[newer_generation],
+                fuzz_generation_workflows[older_generation],
+                "CI workflow",
+            ):
+                failures.append(
+                    "reverting the admitted fuzz-smoke generation "
+                    f"{newer_generation} to {older_generation} was not rejected"
+                )
 
     fuzz_smoke_tampering: dict[str, tuple[str, str]] = {
         "altered outer deadline": ("timeout-minutes: 60", "timeout-minutes: 30"),
@@ -26483,17 +26828,76 @@ pre_build = []
             "    needs: ci-plan\n    continue-on-error: true\n",
         ),
     }
-    for tamper_name, (original, replacement) in fuzz_smoke_tampering.items():
+    # Every generation is admitted, so every generation has to be tamper-proof.
+    for generation, generation_workflow in enumerate(fuzz_generation_workflows):
+        for tamper_name, (original, replacement) in fuzz_smoke_tampering.items():
+            tampered = generation_workflow.replace(original, replacement)
+            if tampered == generation_workflow:
+                failures.append(
+                    f"the {tamper_name} fuzz-smoke self-test mutation is stale "
+                    f"for generation {generation}"
+                )
+                continue
+            if not admitted_fuzz_smoke_errors(tampered, "CI workflow"):
+                failures.append(
+                    f"a {tamper_name} fuzz-smoke generation {generation} job was "
+                    "not rejected"
+                )
+            if admitted_ci_job_names(tampered, "CI workflow"):
+                failures.append(
+                    f"a {tamper_name} fuzz-smoke generation {generation} job was "
+                    "still admitted"
+                )
+
+    # What issue #3902 added to the contract, and therefore what a later pull
+    # request must not be able to take back out of it.
+    fuzz_smoke_adopted_tampering: dict[str, tuple[str, str]] = {
+        "sanitizer budget restored to every pull request": (
+            "        if: github.event_name != 'pull_request'\n",
+            "",
+        ),
+        "sanitizer budget dropped from the merge queue": (
+            "        if: github.event_name != 'pull_request'\n",
+            "        if: github.event_name == 'workflow_dispatch'\n",
+        ),
+        "property gate dropped from pull requests": (
+            "      - name: Run deterministic property smoke tests\n",
+            "      - name: Run deterministic property smoke tests\n"
+            "        if: github.event_name != 'pull_request'\n",
+        ),
+        "untrusted cache writes": (
+            "          save-if: ${{ github.event_name == 'push' && "
+            "github.ref == 'refs/heads/main' }}\n",
+            "          save-if: true\n",
+        ),
+        "unpinned third-party sccache installer": (
+            "      - uses: ./.github/actions/setup-sccache\n",
+            "      - uses: mozilla-actions/sccache-action@v0.0.9\n",
+        ),
+        "credential-bearing cache backend": (
+            '    env:\n      RUSTFLAGS: ""\n',
+            '    env:\n      RUSTFLAGS: ""\n      SCCACHE_GHA_ENABLED: "true"\n',
+        ),
+        "cache directory escape": (
+            "          cache-directories: ${{ github.workspace }}/.cache/sccache\n",
+            "          cache-directories: /\n",
+        ),
+    }
+    for tamper_name, (original, replacement) in fuzz_smoke_adopted_tampering.items():
         tampered = fuzz_ci_workflow.replace(original, replacement)
         if tampered == fuzz_ci_workflow:
             failures.append(
-                f"the {tamper_name} fuzz-smoke self-test mutation is stale"
+                f"the {tamper_name} adopted fuzz-smoke self-test mutation is stale"
             )
             continue
         if not admitted_fuzz_smoke_errors(tampered, "CI workflow"):
-            failures.append(f"a {tamper_name} fuzz-smoke job was not rejected")
+            failures.append(
+                f"a {tamper_name} adopted fuzz-smoke job was not rejected"
+            )
         if admitted_ci_job_names(tampered, "CI workflow"):
-            failures.append(f"a {tamper_name} fuzz-smoke job was still admitted")
+            failures.append(
+                f"a {tamper_name} adopted fuzz-smoke job was still admitted"
+            )
 
     # ------------------------------------------------------------------
     # Initial adoption of the fuzz gate in the required `test` aggregate
@@ -26645,6 +27049,63 @@ pre_build = []
         failures.append(
             "initial adoption of the byte-frozen fuzz job plus its required "
             "aggregate wiring was rejected"
+        )
+    # Issue #3902's transition, end to end: one revision moves the whole job
+    # from the retired generation to the adopted one with the aggregate wiring
+    # untouched. Both generations are withheld, so the digest comparison alone
+    # would accept the move in either direction; the reverse must be refused by
+    # `admitted_fuzz_smoke_removal_errors` instead.
+    aggregate_retired = (
+        aggregate_prologue
+        + aggregate_planner_job
+        + aggregate_lint_job
+        + CI_FUZZ_SMOKE_RETIRED_JOB
+        + aggregate_wired_job
+    )
+    if aggregate_retired == aggregate_adopted:
+        failures.append(
+            "the fuzz-smoke generation-transition self-test fixture is stale"
+        )
+    if compare_pr_workflow_job(
+        aggregate_baseline,
+        aggregate_retired,
+        "CI workflow",
+        "build-arm64-cross",
+    ):
+        failures.append(
+            "initial adoption of the retired fuzz-smoke generation was rejected"
+        )
+    if compare_pr_workflow_job(
+        aggregate_retired,
+        aggregate_adopted,
+        "CI workflow",
+        "build-arm64-cross",
+    ):
+        failures.append("the admitted fuzz-smoke generation transition was rejected")
+    if not compare_pr_workflow_job(
+        aggregate_adopted,
+        aggregate_retired,
+        "CI workflow",
+        "build-arm64-cross",
+    ):
+        failures.append(
+            "reverting the admitted fuzz-smoke generation transition was not "
+            "rejected"
+        )
+    # The transition carries no licence to drop the gate in the same revision.
+    if not compare_pr_workflow_job(
+        aggregate_retired,
+        aggregate_prologue
+        + aggregate_planner_job
+        + aggregate_lint_job
+        + CI_FUZZ_SMOKE_JOB
+        + aggregate_job,
+        "CI workflow",
+        "build-arm64-cross",
+    ):
+        failures.append(
+            "the fuzz-smoke generation transition was accepted without its "
+            "required aggregate wiring"
         )
     # Ordinary maintenance after adoption keeps working, and the admission does
     # not travel to any other part of the aggregate.
