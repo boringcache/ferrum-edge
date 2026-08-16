@@ -12,7 +12,8 @@ use serde_json::json;
 mod scheduled_scaling;
 
 use scheduled_scaling::{
-    BatchProvisionDecision, NAMESPACE_FENCE_DEFAULT_RETRY_AFTER_SECS, NAMESPACE_FENCE_MAX_ATTEMPTS,
+    ADMIN_BATCH_REQUEST_TIMEOUT_SECS, BatchProvisionDecision,
+    NAMESPACE_FENCE_DEFAULT_RETRY_AFTER_SECS, NAMESPACE_FENCE_MAX_ATTEMPTS,
     NAMESPACE_FENCE_MAX_RETRY_AFTER_SECS, NAMESPACE_FENCE_RETRY_MESSAGE,
     SCHEDULED_SCALING_ADMIN_JWT_TTL_SECS, classify_admin_batch_response,
     documented_namespace_fence_body, namespace_fence_retry_after_delay,
@@ -126,6 +127,20 @@ fn documented_namespace_fence_503_is_the_only_retried_batch_response() {
         "Namespace mutation is temporarily unavailable; retry later"
     );
     assert_eq!(NAMESPACE_FENCE_MAX_ATTEMPTS, 6);
+}
+
+#[test]
+fn atomic_admin_batches_have_a_bounded_timeout_without_transport_retries() {
+    assert_eq!(ADMIN_BATCH_REQUEST_TIMEOUT_SECS, 5 * 60);
+    let helper = include_str!("../../common/scheduled_scaling.rs");
+    assert!(
+        helper.contains(".timeout(Duration::from_secs(ADMIN_BATCH_REQUEST_TIMEOUT_SECS))"),
+        "each admin batch request must override the shorter data-plane client timeout"
+    );
+    assert!(
+        helper.contains("{operation} transport error: {err}"),
+        "ambiguous transport failures must remain fatal instead of being retried"
+    );
 }
 
 #[test]

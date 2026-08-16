@@ -35,6 +35,15 @@ pub const NAMESPACE_FENCE_MAX_RETRY_AFTER_SECS: u64 = 5;
 /// Bounded attempts for one atomic `POST /batch` body (1 try + retries).
 pub const NAMESPACE_FENCE_MAX_ATTEMPTS: u32 = 6;
 
+/// Per-request timeout for one atomic admin batch mutation.
+///
+/// The scale harness's general HTTP client uses a 60-second timeout for data
+/// plane probes. Growing SQL-backed configuration sets can legitimately need
+/// longer than that to commit one admin batch. Give the mutation a bounded
+/// five-minute budget instead of retrying an ambiguous transport timeout: the
+/// server may have committed even when the client did not receive a response.
+pub const ADMIN_BATCH_REQUEST_TIMEOUT_SECS: u64 = 5 * 60;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BatchProvisionDecision {
     Success,
@@ -117,6 +126,7 @@ pub async fn post_admin_batch(
             .post(&url)
             .header("Authorization", auth_header)
             .json(body)
+            .timeout(Duration::from_secs(ADMIN_BATCH_REQUEST_TIMEOUT_SECS))
             .send()
             .await
         {
