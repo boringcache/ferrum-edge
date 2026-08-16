@@ -347,8 +347,14 @@ jobs are a separate supply-chain surface from Rust crates. Policy:
    That composite action downloads from official versioned release URLs, verifies
    each artifact against repository-pinned SHA-256 digests **and** the matching
    official published checksum file for that exact version, then installs into
-   the runner PATH. It never pipes remote content to a shell and fails closed on
-   download or verification errors.
+   the runner PATH. Pinned downloads may be restored from `actions/cache` only
+   when the cache key includes every version, checksum, install-subset flag, and
+   runner OS/architecture that affect the artifacts; there is no prefix
+   restore-key fallback. Restored bytes are hashed again before install, official
+   checksum files are always fetched (never restored), and a restore mismatch
+   discards the entry and re-downloads. The cache action is pinned to a full
+   commit SHA. The installer never pipes remote content to a shell and fails
+   closed on download or verification errors.
 3. **Do not** use `azure/setup-helm`, `curl … | bash` installers, or
    `raw.githubusercontent.com/helm/helm/main` (or any other mutable-branch
    install script).

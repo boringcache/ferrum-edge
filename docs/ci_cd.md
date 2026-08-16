@@ -267,6 +267,21 @@ constraints entirely from that manifest, spawning no process of its own.
 Anything it cannot answer fails closed. Keeping the proof in Python rather than
 inline shell also keeps `helm-chart` free of the opaque-inline-shell and Cross
 surfaces that `Trusted Cross Build Policy` freezes per job.
+
+Live labs that compile the same default-feature `cargo build --profile pr-build
+--bin ferrum-edge` graph share the Swatinem rust-cache key `ci-live-pr-build`
+(`gateway-api-conformance.yml`, `mesh-e2e-sidecar-live.yml`,
+`multicluster-federation-live.yml`, and `multicluster-poller-partition-live.yml`).
+Lanes whose cache-affecting inputs differ keep private keys: CNI additionally
+links `ferrum-cni` (`ci-cni-lifecycle-live`), NodeWaypoint rebuilds with
+`--features cloud-secrets,ebpf` plus a nightly bpfel toolchain
+(`ci-node-waypoint-ebpf-live`), and Ambient Host UDP compiles the debug-profile
+lib/functional test binaries (`ci-ambient-host-udp-live`). Kind, kubectl, and
+Helm downloads used by those labs are restored inside
+`.github/actions/setup-kubernetes-tools` under an exact key of pinned
+versions/checksums, install subset, and runner OS/arch; checksums are verified
+after both restore and download.
+
 On pull requests and merge groups the checker is extracted from the base revision when
 one exists, then self-tested and executed against the proposed chart tree. That
 prevents the step from executing a checker replaced by the same pull request and
