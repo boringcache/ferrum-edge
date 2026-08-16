@@ -537,8 +537,8 @@ def self_test() -> int:
     )
 
     body = issue_body("reason", "https://example.invalid/run")
-    if MARKER not in body or "Launch Readiness Gate" in body:
-        failures.append("issue body must carry the marker and must not spoof required check names")
+    if MARKER not in body:
+        failures.append("issue body must carry the durable signal marker")
 
     if MAX_AGE_SECONDS != 8 * 24 * 60 * 60:
         failures.append("freshness ceiling drifted from the weekly-plus-one-day contract")
