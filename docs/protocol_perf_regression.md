@@ -13,8 +13,12 @@ lane inside the `Performance Regression Check` job in `.github/workflows/ci.yml`
 benchmark/build gating. That PR job has read-only contents permission and does
 not persist checkout credentials while running PR-controlled code. The
 lightweight HTTP/1 overhead gate in `ci.yml`
-remains the PR path for measured overhead. Noisy shared-runner microbenchmarks
-stay out of branch protection.
+remains the PR path for measured overhead. That same job caches both the root
+workspace (`. -> target`) and the standalone `tests/performance/mesh`
+Criterion workspace through `setup-rust-ci`'s optional rust-cache `workspaces`
+pass-through (`shared-key: ci-perf`). Omitting `workspaces` on other
+`setup-rust-ci` callers keeps rust-cache's root-only default. Noisy
+shared-runner microbenchmarks stay out of branch protection.
 
 ## Documented runner and build profile
 

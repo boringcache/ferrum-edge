@@ -5095,6 +5095,9 @@ jobs:
         if: steps.perf_changes.outputs.run == 'true' || steps.perf_changes.outputs.run_ip_restriction_benchmark == 'true' || steps.perf_changes.outputs.run_wrr_benchmark == 'true' || steps.perf_changes.outputs.run_rr_benchmark == 'true' || steps.perf_changes.outputs.run_ai_semantic_cache_benchmark == 'true'
         with:
           shared-key: "ci-perf"
+          workspaces: |
+            . -> target
+            tests/performance/mesh -> target
 
       - name: Run IP restriction worst-case microbenchmark
         if: steps.perf_changes.outputs.run_ip_restriction_benchmark == 'true'

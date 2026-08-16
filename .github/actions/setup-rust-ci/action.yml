@@ -10,8 +10,8 @@ description: >-
   steps); rust-cache persists that directory together with Cargo and target
   directories using isolated shared keys so incompatible job/profile/target
   artifacts do not mix.
-  Centralizes the setup block so individual jobs only declare their cache key
-  and any extra rustup components.
+  Centralizes the setup block so individual jobs only declare their cache key,
+  any extra rustup components, and an optional rust-cache `workspaces` list.
 
 inputs:
   shared-key:
@@ -24,6 +24,19 @@ inputs:
     description: >-
       Comma-separated rustup components (e.g. `clippy`, `rustfmt`). Empty
       string skips component install — most jobs don't need extras.
+    required: false
+    default: ""
+  workspaces:
+    description: >-
+      Optional rust-cache `workspaces` value, passed through exactly.
+      Use Swatinem/rust-cache syntax: newline-separated
+      `$workspace -> $target` entries (the `$target` path is relative to
+      that workspace and defaults to `target` when omitted). When this
+      input is omitted or empty, rust-cache keeps its documented default
+      `. -> target`, so existing callers retain root-workspace cache
+      coverage. Callers that add extra workspaces must still list
+      `. -> target` if they need the root `target/` directory cached;
+      listing only a nested workspace drops root coverage.
     required: false
     default: ""
 
@@ -195,6 +208,7 @@ runs:
       uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
       with:
         shared-key: ${{ inputs.shared-key }}
+        workspaces: ${{ inputs.workspaces }}
         cache-directories: ${{ github.workspace }}/.cache/sccache
 
     - name: Pre-fetch crate dependencies (isolate transient registry flakes)
