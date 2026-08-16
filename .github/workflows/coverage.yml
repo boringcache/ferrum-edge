@@ -114,7 +114,10 @@ jobs:
     needs: coverage-plan
     if: needs.coverage-plan.outputs.mode == 'full'
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    # A cold/partial-cache lib + unit_tests llvm-cov invocation can exceed the
+    # old 45-minute budget even though warm shards normally finish sooner. Keep
+    # the combined invocation so runner loss cannot discard the shared compile.
+    timeout-minutes: 75
     strategy:
       fail-fast: false
       matrix:
@@ -224,9 +227,11 @@ jobs:
         if: matrix.kind == 'lib-unit'
         run: |
           set -euo pipefail
+          # One llvm-cov invocation compiles lib + unit_tests together so a
+          # runner-loss after the library suite does not throw away that compile
+          # and then recompile ferrum-edge for the unit-test target (#3888).
           cargo llvm-cov --no-report \
-            --lib
-          cargo llvm-cov --no-report \
+            --lib \
             --test unit_tests
         env:
           RUST_BACKTRACE: 1
