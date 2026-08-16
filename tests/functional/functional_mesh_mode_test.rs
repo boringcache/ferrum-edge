@@ -11646,22 +11646,6 @@ fn udp_round_trip_from_netns_with_source(
     })
 }
 
-#[cfg(target_os = "linux")]
-fn udp_round_trip_from_netns(
-    pid: u32,
-    destination: SocketAddr,
-    payload: &'static [u8],
-    timeout: Duration,
-) -> Result<(Vec<u8>, SocketAddr), String> {
-    udp_round_trip_from_netns_with_source(
-        pid,
-        std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
-        destination,
-        payload,
-        timeout,
-    )
-}
-
 /// UDP echo bound inside an enrolled destination pod netns. Ownership of the
 /// setns thread, runtime, and socket stays with this fixture so teardown cannot
 /// leak the namespace-local listener.
