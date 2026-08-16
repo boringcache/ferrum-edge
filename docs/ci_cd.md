@@ -1930,66 +1930,15 @@ modification of the verifier it protects, and the landing is administrative afte
 root review), then an ordinary pull request that adopts the release workflow
 under the now-trusted policy and runs the full hosted matrix.
 
-##### Admitted `fips-build.yml` generation transition (temporary, issue #3888)
+##### Retired `fips-build.yml` generation transition (issue #3888 / PR #3889)
 
-`.github/workflows/fips-build.yml` is an ordinary workflow — unprotected and
-uncontracted — so the only thing the pull-request Cross scan says about it is
-that its Cross executable/configuration surface must not move between the
-trusted base and the proposal. The FIPS runtime rework in PR #3889 rewrites the
-file (trusted-base path planning, split compile/lint phases, scoped sccache and
-`ci-fips` rust-cache reuse, a `force_cold_cache` dispatch input, per-phase
-summaries) and moves that surface, so the scan rejects it with
-`workflow directory/fips-build.yml cannot add or change Cross
-executable/configuration surfaces`. The verifier that decides this always
-executes from the trusted base, so that pull request cannot repair it inside its
-own proposal.
-
-Rather than relaxing the scan, the trusted policy admits **exactly one**
-transition of that one file, bound to the two complete file **generations** it
-moves between. Each generation is named by the SHA-256 of its entire text and is
-pinned in the trusted verifier itself
-(`FIPS_BUILD_RETIRED_GENERATION_SHA256`, `FIPS_BUILD_ADOPTED_GENERATION_SHA256`).
-A workflow this large has no frozen job contract to project fragment by
-fragment, so exact whole-file generation binding is what replaces the release
-workflow's derived projection. Nothing about the admission comes from the pull
-request — not the digest, not a manifest, not an allowlist, not a projection,
-not a rationale — so a proposal reaches it only by being, byte for byte, the
-destination revision the trusted policy already names.
-
-The admission is fail-closed in every direction it does not name:
-
-- Both ends are exact. The trusted base must be the retired generation and the
-  proposal the adopted one. A one-byte drift on either side, an absent file, the
-  destination added outright, or a partially applied rewrite is scanned exactly
-  as before.
-- It is bound to the path as well as to the two contents; the same two revisions
-  under any other workflow filename are not this transition.
-- It is one-way. Once the trusted base carries the adopted generation, returning
-  the file to the retired one is refused explicitly
-  (`cannot return to the retired FIPS workflow generation after the trusted base
-  adopts the admitted one`) rather than relying on the two surfaces differing.
-- It withholds one surface-equality verdict, for one file, for one revision
-  pair. Every other workflow, action, automation script, protected job contract,
-  digest name space, required-check binding, and live-gate relevance contract is
-  evaluated exactly as before, so a Cross surface added anywhere else in the
-  same pull request is still rejected. Hard scan failures on either revision are
-  reported regardless.
-
-**Retirement is mandatory.** Once PR #3889 is on `main` the trusted base *is*
-the adopted generation, so the admission is permanently unreachable — the
-retired generation can only become a trusted base again by first passing the
-one-way refusal. The pinned digests, the `admitted_generation_transition`
-parameter, the self-tests, and this section must be deleted in the next
-trusted-policy change. If #3889's `fips-build.yml` changes for any reason before
-it lands (including a conflicting merge of `main`), the adopted digest no longer
-matches and the transition must be re-pinned by another trusted-policy pull
-request.
-
-Landing this admission takes the same two stages as the release image-family
-adoption: a policy-only pull request whose own `Trusted Cross Build Policy`
-check fails by design (that check refuses any pull-request modification of the
-verifier it protects, so `Candidate policy self-test` is the substantive
-evidence), then the ordinary workflow pull request under the now-trusted policy.
+PR #3889 landed on `main` as `7e9e69493`. The temporary whole-file SHA-256
+admission that let that rewrite pass the Cross surface scan is **retired and
+non-operational**. Ordinary `.github/workflows/fips-build.yml` edits are
+compared by the normal fail-closed Cross surface scan with no special case, no
+`admitted_generation_transition` bypass, and no FIPS-only classifier. The
+generic SHA-256 generation digest helper remains because CI-job and
+local-action finite transitions still use it.
 
 ##### Admitted CI job SHA-256 generation transitions (temporary)
 
@@ -2013,10 +1962,10 @@ no digest. `fuzz-smoke` is not in this table; it uses
 
 Jobs omitted because a single predecessor cannot name a unique merged text:
 
-- `test-pkcs11-softhsm` — #3889 and #3913 rewrite it from the same retired text
-  to two different destinations. Land #3889 first; #3913 then merges latest
-  `main` and needs a follow-up predecessor if the remaining PKCS path-gate still
-  moves a Cross-sensitive digest.
+- `test-pkcs11-softhsm` — #3889 already rewrote this job on `main`. #3913
+  rewrites it from a different retired text. #3913 must merge latest `main` and
+  needs a follow-up predecessor if the remaining PKCS path-gate still moves a
+  Cross-sensitive digest.
 - `ci-plan` / `test` for #3915 (issue #3900) — different destination hashes from
   #3913. After #3913 is the trusted base, #3915 needs a follow-up predecessor.
 
@@ -2025,24 +1974,24 @@ optional live-suite `changes` jobs (`#3919`) are not admitted here. They are not
 folded into this predecessor; if hosted Cross disagrees after a latest-`main`
 merge, they need their own exact pair rather than a wildcard.
 
-##### Admitted `setup-rust-ci` generation transitions (temporary)
+##### Admitted `setup-rust-ci` generation transition (temporary)
 
-`.github/actions/setup-rust-ci/action.yml` on the trusted base
-(`504c0173ba8fbd49298b71f2cf7a6498a8ce81efe012bf3289cec97ffb6f93bb`) may move to
-exactly one of two destinations decided by this trusted policy
+`.github/actions/setup-rust-ci/action.yml` on current `main` (PR #3889's landed
+file, SHA-256
+`fc4e41818dffdea880c057c8dfa0881a629cd01c917b43f69a9f2e5e9bd90dda`) may move to
+exactly one combined destination decided by this trusted policy
 (`LOCAL_ACTION_GENERATION_TRANSITIONS`):
 
-- PR #3911 / issue #3906:
-  `3b8530b31963c11c3dcd14d0937f4a0be7a5796d3631079410bea3405e821ddd`
-- PR #3889 / issue #3888:
-  `fc4e41818dffdea880c057c8dfa0881a629cd01c917b43f69a9f2e5e9bd90dda`
+- PR #3911 / issue #3906, after merging latest `main` while preserving every
+  #3889 cache-safety change plus #3911's optional `workspaces` input/pass-through:
+  `57a99a179ddc2935af187f518a803bf167eb9e33593c37b7b29f7151ec994da2`
 
-These are trusted-base-decided alternatives from the same retired digest, not a
-candidate allowlist. The first landing that matches an admitted pair wins.
-Moving from one destination to the other is unrelated and is scanned as an
-ordinary rewrite, so the other PR then needs a follow-up predecessor whose
-retired digest is the landed file. #3910's comment-only `setup-rust-ci` tweak is
-not admitted here; drop or re-pin it after merging latest `main`.
+The pair is exact, path-bound, one-way, and fail-closed. The candidate supplies
+no digest, allowlist, or fallback. A dest-to-dest rewrite, a one-byte drift, or
+any other path is scanned as an ordinary Cross surface change. The obsolete
+two-destination table from before #3889 landed is retired. #3910's comment-only
+`setup-rust-ci` tweak is not admitted here; drop or re-pin it after merging
+latest `main`.
 
 ##### Remaining CI-tranche predecessor sequence
 
@@ -2051,28 +2000,27 @@ issue-closing implementation PR; this policy PR tracks those issues and does
 not close them.
 
 1. Land this predecessor (admin; `Trusted Cross Build Policy` expected RED).
-2. Merge latest `main` into #3889, then land #3889. After that the FIPS
-   `fips-build.yml` admission is unreachable; retire it in a follow-up.
-3. Merge latest `main` into #3910 and land it. Helm Chart admits the
+   PR #3889 is already on `main`; this change retires the FIPS whole-file
+   admission and rebinds `setup-rust-ci` to the current-main → combined #3911
+   pair.
+2. Merge latest `main` into #3910 and land it. Helm Chart admits the
    setup-kubernetes-tools move via this predecessor's extracted checker.
-   #3912 is this PR; do not merge #3912 itself (it would revert later Cross
-   policy).
-4. Merge latest `main` into #3918 and land the destination `ci.yml` (the
+   #3912 is superseded by this PR; do not merge #3912 itself (it would revert
+   later Cross policy).
+3. Merge latest `main` into #3918 and land the destination `ci.yml` (the
    policy-only first commit is already in this predecessor). Then retire
    `CI_FUZZ_SMOKE_RETIRED_JOB`.
-5. Merge latest `main` into #3913 and land it (`ci-plan` / `test` pairs). If
-   #3889 already rewrote `test-pkcs11-softhsm`, #3913 must merge that result
-   and may need a new PKCS job pair.
-6. Merge latest `main` into #3909, #3916, and #3917 and land them as ordinary
+4. Merge latest `main` into #3913 and land it (`ci-plan` / `test` pairs).
+   #3889 already rewrote `test-pkcs11-softhsm` on `main`, so #3913 must merge
+   that result and may need a new PKCS job pair.
+5. Merge latest `main` into #3909, #3916, and #3917 and land them as ordinary
    implementation PRs unless hosted Cross names a new frozen surface.
-7. #3911 after #3889: `setup-rust-ci` retired digest is then #3889's file, so
-   #3911 needs a follow-up predecessor for that file (and can use the
-   `performance-regression` pair here if #3889 did not rewrite that job). If
-   #3911 lands first, #3889's `setup-rust-ci` dest is the one that needs the
-   follow-up.
-8. #3915 (issue #3900) after #3913: remaining predecessor for `ci-plan` /
+6. Merge latest `main` into #3911 and land it. This predecessor now admits the
+   combined `setup-rust-ci` destination; the `performance-regression` pair
+   remains valid if that job is untouched.
+7. #3915 (issue #3900) after #3913: remaining predecessor for `ci-plan` /
    `test` (hashes differ from #3913).
-9. #3919: destination freeze plus optional live-suite `changes` jobs. Do not
+8. #3919: destination freeze plus optional live-suite `changes` jobs. Do not
    self-admit its verifier `LIVE_SUITE_RELEVANCE_CONTRACTS`; those are absolute
    and fail without the matching workflow jobs. Classifier bootstrap until it
    is on `main`.

@@ -419,41 +419,26 @@ reachable on *either* revision stays in scope, so a pull request cannot drop the
 reachability edge and edit the file in the same commit. Newly reaching an
 already-Cross-sensitive script from a protected job is still rejected.
 
-#### Admitted `fips-build.yml` generation transition (temporary, issue #3888)
+#### Retired `fips-build.yml` generation transition (issue #3888 / PR #3889)
 
-The same verifier compares every workflow's Cross surface across revisions. The
-FIPS runtime rework in PR #3889 rewrites `.github/workflows/fips-build.yml` and
-moves that surface, and the verifier that decides this always executes from the
-trusted base, so the rework cannot admit itself. The trusted policy therefore
-carries **one** temporary admission: the exact retired `fips-build.yml`
-generation moving to the exact adopted one, each bound by the SHA-256 of its
-complete file text (`FIPS_BUILD_RETIRED_GENERATION_SHA256`,
-`FIPS_BUILD_ADOPTED_GENERATION_SHA256` in
-`.github/scripts/verify_cross_build_policy.py`).
+PR #3889 landed on `main`. The temporary whole-file SHA-256 admission that let
+that rewrite pass the Cross surface scan is **retired and non-operational**.
+Ordinary `.github/workflows/fips-build.yml` edits are compared by the normal
+fail-closed Cross surface scan with no special case. The generic SHA-256
+generation digest helper remains because CI-job and local-action finite
+transitions still use it. Full description: `docs/ci_cd.md` → "Retired
+`fips-build.yml` generation transition".
 
-Load-bearing properties: both ends are exact whole-file generations, so a
-one-byte drift on either side, an absent file, an outright addition, or a
-partial rewrite is scanned as before; the admission is bound to the path as well
-as the two contents; it is one-way, so returning the file to the retired
-generation after the trusted base adopts the new one is refused explicitly; and
-it withholds exactly one surface-equality verdict for one file and one revision
-pair, leaving every other workflow, action, automation file, and contract — and
-every hard scan failure — enforced. The candidate supplies no digest, manifest,
-allowlist, projection, or rationale of its own.
-
-**Retirement is mandatory.** Once #3889 is on `main` the trusted base *is* the
-adopted generation and the admission is permanently unreachable; delete the
-pinned digests, the `admitted_generation_transition` parameter, and the matching
-self-tests in the next trusted-policy change. Full description:
-`docs/ci_cd.md` → "Admitted `fips-build.yml` generation transition".
-
-The same verifier also carries temporary SHA-256 generation pairs for
+The same verifier still carries temporary SHA-256 generation pairs for
 Cross-sensitive `ci.yml` jobs and for `setup-rust-ci/action.yml`
 (`CI_JOB_GENERATION_TRANSITIONS`, `LOCAL_ACTION_GENERATION_TRANSITIONS`). Both
 ends are exact, path- or job-bound, one-way, and decided entirely by the trusted
-base. Two `setup-rust-ci` destinations share one retired digest; the first
-landing wins. See `docs/ci_cd.md` → "Admitted CI job SHA-256 generation
-transitions" and "Admitted `setup-rust-ci` generation transitions".
+base. `setup-rust-ci` now has exactly one pair: current-main
+`fc4e41818dffdea880c057c8dfa0881a629cd01c917b43f69a9f2e5e9bd90dda` moving to the
+combined #3911 destination
+`57a99a179ddc2935af187f518a803bf167eb9e33593c37b7b29f7151ec994da2`. See
+`docs/ci_cd.md` → "Admitted CI job SHA-256 generation transitions" and
+"Admitted `setup-rust-ci` generation transition".
 
 ### Refreshing kind / kubectl / Helm versions and checksums
 
