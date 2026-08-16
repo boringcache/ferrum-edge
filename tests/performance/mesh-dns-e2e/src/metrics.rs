@@ -142,12 +142,50 @@ pub struct ClassReport {
     pub total_bytes: u64,
 }
 
+impl ClassReport {
+    /// Fail closed when a selected row recorded no successes or any query error.
+    pub fn failure_reason(&self) -> Option<String> {
+        if self.total_queries == 0 {
+            Some(format!(
+                "DNS row {}/{} recorded zero successful queries (errors={}, nxdomain={})",
+                self.name_class, self.transport, self.total_errors, self.total_nxdomain
+            ))
+        } else if self.total_errors != 0 {
+            Some(format!(
+                "DNS row {}/{} recorded {} query errors (successful={}, nxdomain={})",
+                self.name_class,
+                self.transport,
+                self.total_errors,
+                self.total_queries,
+                self.total_nxdomain
+            ))
+        } else {
+            None
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct RunReport {
     pub target: String,
     pub concurrency: u64,
     pub duration_secs: u64,
     pub reports: Vec<ClassReport>,
+}
+
+/// Return a reason when any selected protocol/row is incomplete or errorful.
+/// An empty report set is also a failure: a requested protocol that produced
+/// no rows must not print "Run completed successfully".
+pub fn selected_reports_failure(reports: &[ClassReport]) -> Option<String> {
+    if reports.is_empty() {
+        return Some("no DNS class/transport rows were collected".to_string());
+    }
+    for report in reports {
+        if let Some(reason) = report.failure_reason() {
+            return Some(reason);
+        }
+    }
+    None
 }
 
 pub fn format_duration_us(us: u64) -> String {

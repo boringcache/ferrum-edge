@@ -37,6 +37,18 @@ ROOT_CARGO_TOML = REPO_ROOT / "Cargo.toml"
 DNS_LOADGEN = (
     REPO_ROOT / "tests" / "performance" / "mesh-dns-e2e" / "src" / "bin" / "dns_loadgen.rs"
 )
+DNS_UPSTREAM_STUB = (
+    REPO_ROOT / "tests" / "performance" / "mesh-dns-e2e" / "src" / "bin" / "dns_upstream_stub.rs"
+)
+DNS_UPSTREAM_STUB_LIB = (
+    REPO_ROOT / "tests" / "performance" / "mesh-dns-e2e" / "src" / "upstream_stub.rs"
+)
+DNS_WIRE = REPO_ROOT / "tests" / "performance" / "mesh-dns-e2e" / "src" / "dns_wire.rs"
+DNS_METRICS = REPO_ROOT / "tests" / "performance" / "mesh-dns-e2e" / "src" / "metrics.rs"
+DNS_README = REPO_ROOT / "tests" / "performance" / "mesh-dns-e2e" / "README.md"
+DNS_HARNESS_TESTS = (
+    REPO_ROOT / "tests" / "performance" / "mesh-dns-e2e" / "tests" / "dns_harness_prereq_tests.rs"
+)
 
 EXTERNAL_ACTION = re.compile(
     r"uses:\s*(?P<action>(?!\./)[^@\s]+)@(?P<ref>[^\s#]+)",
@@ -735,6 +747,96 @@ def check_scripts(failures: list[str]) -> None:
         "DNS load-generator worker join failures must fail the collection",
         failures,
     )
+    check_dns_tcp_stub_and_fail_closed(
+        DNS_UPSTREAM_STUB.read_text(encoding="utf-8") if DNS_UPSTREAM_STUB.is_file() else "",
+        DNS_UPSTREAM_STUB_LIB.read_text(encoding="utf-8") if DNS_UPSTREAM_STUB_LIB.is_file() else "",
+        dns_loadgen,
+        DNS_METRICS.read_text(encoding="utf-8") if DNS_METRICS.is_file() else "",
+        DNS_WIRE.read_text(encoding="utf-8") if DNS_WIRE.is_file() else "",
+        dns_run,
+        DNS_README.read_text(encoding="utf-8") if DNS_README.is_file() else "",
+        DNS_HARNESS_TESTS.read_text(encoding="utf-8") if DNS_HARNESS_TESTS.is_file() else "",
+        failures,
+    )
+
+
+def check_dns_tcp_stub_and_fail_closed(
+    stub_bin: str,
+    stub_lib: str,
+    loadgen: str,
+    metrics: str,
+    dns_wire: str,
+    dns_run: str,
+    readme: str,
+    harness_tests: str,
+    failures: list[str],
+) -> None:
+    """Reject UDP-only stubs, missing TCP framing, and false-success loadgen runs."""
+    stub = stub_bin + "\n" + stub_lib
+    require("TcpListener" in stub, "dns_upstream_stub must bind TcpListener", failures)
+    require("UdpSocket" in stub, "dns_upstream_stub must preserve UDP", failures)
+    require("run_tcp_accept_loop" in stub, "dns_upstream_stub must accept TCP connections", failures)
+    require("handle_tcp_connection" in stub, "dns_upstream_stub must loop per TCP connection", failures)
+    require("read_exact" in stub_lib, "TCP DNS stub must complete length and payload reads", failures)
+    require("write_all" in stub_lib, "TCP DNS stub must complete framed writes", failures)
+    require(
+        "decode_tcp_dns_length" in stub_lib and "decode_tcp_dns_length" in dns_wire,
+        "TCP DNS stub must use two-byte length framing",
+        failures,
+    )
+    require(
+        "EmptyLength" in dns_wire and "unframe_from_tcp" in dns_wire,
+        "TCP DNS framing must reject empty/incomplete prefixes",
+        failures,
+    )
+    require(
+        "UDP+TCP listening" in stub_bin,
+        "dns_upstream_stub must advertise UDP+TCP on the configured address",
+        failures,
+    )
+    require(
+        "selected_reports_failure" in metrics and "selected_reports_failure" in loadgen,
+        "DNS loadgen must fail closed via selected_reports_failure",
+        failures,
+    )
+    require(
+        "zero successful queries" in metrics,
+        "DNS fail-closed path must surface zero successful queries",
+        failures,
+    )
+    require(
+        "query errors" in metrics,
+        "DNS fail-closed path must surface nonzero query errors",
+        failures,
+    )
+    require(
+        "serde_json::to_string_pretty" in loadgen
+        and "selected_reports_failure" in loadgen.split("serde_json::to_string_pretty")[-1],
+        "DNS loadgen must emit JSON before failing on errorful rows",
+        failures,
+    )
+    require(
+        "set -e" in dns_run and "dns_loadgen" in dns_run,
+        "DNS run.sh must keep set -e so loadgen failures skip Run completed successfully",
+        failures,
+    )
+    require(
+        "tokio UDP server" not in readme and "──UDP DNS──► dns_upstream_stub" not in readme,
+        "DNS README must not describe the upstream stub as UDP-only",
+        failures,
+    )
+    require(
+        "UDP+TCP" in readme or "UDP and TCP" in readme or "UDP/TCP" in readme,
+        "DNS README must document UDP/TCP upstream-stub support",
+        failures,
+    )
+    require(
+        "handle_tcp_connection" in harness_tests
+        and "zero successful queries" in harness_tests
+        and "EmptyLength" in harness_tests,
+        "DNS harness must keep regression tests for TCP framing and fail-closed reports",
+        failures,
+    )
 
 
 def check_pr_ci_wiring(failures: list[str]) -> None:
@@ -1018,6 +1120,45 @@ EOF
     )
 
 
+def _self_test_dns_tcp_stub_and_fail_closed(failures: list[str]) -> None:
+    """Prove a UDP-only stub and a success-on-errors loadgen are rejected."""
+    udp_only_stub = """
+use tokio::net::UdpSocket;
+let socket = UdpSocket::bind(addr).await?;
+eprintln!("[dns_upstream_stub] UDP listening on {addr}");
+"""
+    forged: list[str] = []
+    check_dns_tcp_stub_and_fail_closed(
+        udp_only_stub,
+        "",
+        "println!(Run completed successfully);",
+        "pub fn print_text_report() {}",
+        "pub fn frame_for_tcp(packet: &[u8]) -> Vec<u8> { vec![] }",
+        "set -e\necho Run completed successfully\n",
+        "dns_upstream_stub is a 100-line tokio UDP server\n──UDP DNS──► dns_upstream_stub\n",
+        "",
+        forged,
+    )
+    require(forged, "UDP-only upstream stub must be rejected", failures)
+
+    if DNS_UPSTREAM_STUB.is_file() and DNS_LOADGEN.is_file() and DNS_HARNESS_TESTS.is_file():
+        real: list[str] = []
+        check_dns_tcp_stub_and_fail_closed(
+            DNS_UPSTREAM_STUB.read_text(encoding="utf-8"),
+            DNS_UPSTREAM_STUB_LIB.read_text(encoding="utf-8"),
+            DNS_LOADGEN.read_text(encoding="utf-8"),
+            DNS_METRICS.read_text(encoding="utf-8"),
+            DNS_WIRE.read_text(encoding="utf-8"),
+            (REPO_ROOT / "tests" / "performance" / "mesh-dns-e2e" / "run.sh").read_text(
+                encoding="utf-8"
+            ),
+            DNS_README.read_text(encoding="utf-8"),
+            DNS_HARNESS_TESTS.read_text(encoding="utf-8"),
+            real,
+        )
+        require(not real, f"real DNS harness must pass tcp/fail-closed contract: {real}", failures)
+
+
 def self_test() -> int:
     sample = """
 name: Mesh Performance Baselines
@@ -1108,6 +1249,7 @@ jobs:
     check_workflow(sample, failures)
     _self_test_hbone_backend_allow_ips(failures)
     _self_test_hbone_trusted_fixture_contract(failures)
+    _self_test_dns_tcp_stub_and_fail_closed(failures)
     # Intentionally skip docs checks in self-test.
     if failures:
         print("self-test failures:", *failures, sep="\n- ")
