@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import re
 import sys
 import textwrap
@@ -448,13 +449,18 @@ def load_binary_matrix(script: str, event_name: str) -> list[dict[str, str]]:
         if text.startswith("matrix="):
             captured["matrix"] = json.loads(text.removeprefix("matrix="))
 
-    class _FakeOs:
-        environ = {"EVENT_NAME": event_name}
-
-    exec(  # noqa: S102 — deterministic in-repo contract script
-        compile(script, "<binary-matrix>", "exec"),
-        {"json": json, "os": _FakeOs, "print": fake_print},
-    )
+    previous_event_name = os.environ.get("EVENT_NAME")
+    os.environ["EVENT_NAME"] = event_name
+    try:
+        exec(  # noqa: S102 — deterministic in-repo contract script
+            compile(script, "<binary-matrix>", "exec"),
+            {"print": fake_print},
+        )
+    finally:
+        if previous_event_name is None:
+            os.environ.pop("EVENT_NAME", None)
+        else:
+            os.environ["EVENT_NAME"] = previous_event_name
     matrix = captured.get("matrix")
     if not isinstance(matrix, dict) or not isinstance(matrix.get("include"), list):
         raise RuntimeError(f"binary-matrix for {event_name} did not emit include[]")
