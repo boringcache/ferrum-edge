@@ -804,7 +804,20 @@ def check_fips_producer_channel(
     test_build_job = extract_job(workflow, "fips-test-build")
     test_job = extract_job(workflow, "fips-test")
     aggregate = extract_job(workflow, "fips-build")
-    mtime_refresh = 'find "$target_root" -xdev -type f -exec touch -- {} +'
+    mtime_refresh = (
+        'find "$target_root" -xdev -type f '
+        '\\\n            -exec touch --reference="$mtime_reference" -- {} +'
+    )
+    compiler_identity_step_name = (
+        "Stabilize Cargo compiler identity for exact-target reuse"
+    )
+    compiler_identity_contract = (
+        "FERRUM_SCCACHE_BIN",
+        "--stop-server",
+        "'RUSTC_WRAPPER='",
+        "'CARGO_BUILD_RUSTC_WRAPPER='",
+        '>> "$GITHUB_ENV"',
+    )
     restored_binary_checks = (
         'fips_binary="${target_root}/debug/ferrum-edge"',
         '[ ! -f "$fips_binary" ]',
@@ -818,6 +831,42 @@ def check_fips_producer_channel(
         "cross-run producer and each of its three exact same-run consumers",
         failures,
     )
+    for job_name, job_body in (
+        ("fips-compile", compile_job),
+        ("fips-claimed-checks", claimed_job),
+        ("fips-clippy", clippy_job),
+        ("fips-test-build", test_build_job),
+    ):
+        identity_steps = [
+            step
+            for step in job_steps(job_body)
+            if f"name: {compiler_identity_step_name}" in step
+        ]
+        require(
+            len(identity_steps) == 1,
+            f"{job_name} must stabilize the Cargo compiler identity exactly once",
+            failures,
+        )
+        setup_position = job_body.find("uses: ./.github/actions/setup-sccache")
+        identity_position = job_body.find(compiler_identity_step_name)
+        cache_position = job_body.find(
+            "Cache FIPS Rust, AWS-LC, and sccache outputs"
+        )
+        require(
+            setup_position >= 0
+            and identity_position >= 0
+            and cache_position >= 0
+            and setup_position < identity_position < cache_position
+            and bool(identity_steps)
+            and not step_if(identity_steps[0])
+            and all(
+                contract in identity_steps[0]
+                for contract in compiler_identity_contract
+            ),
+            f"{job_name} must clear the runner-unique rustc-wrapper identity "
+            "after setup-sccache and before any Cargo/cache operation",
+            failures,
+        )
     compile_saves = [
         step for step in job_steps(compile_job) if step_uses(step).startswith(CACHE_SAVE)
     ]
@@ -927,6 +976,10 @@ def check_fips_producer_channel(
             and "steps.cross-run-fips-handoff.outcome == 'success'"
             in promote_condition
             and mtime_refresh in promote_steps[0]
+            and 'mtime_reference="${RUNNER_TEMP}/fips-target-mtime-reference"'
+            in promote_steps[0]
+            and 'touch "$mtime_reference"' in promote_steps[0]
+            and 'rm -f "$mtime_reference"' in promote_steps[0]
             and all(
                 check in promote_steps[0] for check in restored_binary_checks
             )
@@ -1169,6 +1222,10 @@ def check_fips_producer_channel(
             and COLD_NOT_TRUE in step_if(producer_require_steps[0])
             and FORK_NOT_TRUE in step_if(producer_require_steps[0])
             and mtime_refresh in producer_require_steps[0]
+            and 'mtime_reference="${RUNNER_TEMP}/fips-target-mtime-reference"'
+            in producer_require_steps[0]
+            and 'touch "$mtime_reference"' in producer_require_steps[0]
+            and 'rm -f "$mtime_reference"' in producer_require_steps[0]
             and all(
                 check in producer_require_steps[0]
                 for check in restored_binary_checks
@@ -3280,7 +3337,8 @@ def self_test() -> int:
     )
 
     missing_mtime_refresh = handoff_channel.replace(
-        '          find "$target_root" -xdev -type f -exec touch -- {} +\n',
+        '          find "$target_root" -xdev -type f \\\n'
+        '            -exec touch --reference="$mtime_reference" -- {} +\n',
         "          true\n",
         1,
     )
@@ -3295,6 +3353,25 @@ def self_test() -> int:
             for item in missing_mtime_refresh_failures
         ),
         "self-test: exact FIPS restores without mtime normalization must fail",
+        failures,
+    )
+
+    unstable_compiler_identity = handoff_channel.replace(
+        "      - name: Stabilize Cargo compiler identity for exact-target reuse\n",
+        "      - name: Leave runner-unique Cargo compiler identity active\n",
+        1,
+    )
+    unstable_compiler_identity_failures: list[str] = []
+    check_fips_producer_channel(
+        unstable_compiler_identity, unstable_compiler_identity_failures
+    )
+    require(
+        any(
+            "stabilize the Cargo compiler identity" in item
+            or "clear the runner-unique rustc-wrapper identity" in item
+            for item in unstable_compiler_identity_failures
+        ),
+        "self-test: exact FIPS restores with a runner-unique wrapper must fail",
         failures,
     )
 

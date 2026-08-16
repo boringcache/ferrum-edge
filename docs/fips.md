@@ -125,11 +125,20 @@ cannot be reused as its branch head after the base tree changes. Checkout
 assigns fresh mtimes even when its source bytes match the archived tree, so
 Cargo would otherwise treat exact restored outputs as stale and relink them.
 Only after the tree identity, real target directory, and nonsymlink executable
-are validated does the producer refresh regular files under `target/`. The
-three non-fork consumers do the same only after the restored producer key
-matches the current source-SHA/run-ID prefix and the executable exists. Cold,
-fork, mismatched-tree, and untrusted-prefix paths never receive this mtime
-normalization.
+are validated does the producer refresh regular files under `target/`. All
+files receive one reference timestamp so Cargo cannot see one restored
+dependency as newer than a dependent merely because separate `touch` batches
+ran in a different order. The three non-fork consumers do the same only after
+the restored producer key matches the current source-SHA/run-ID prefix and the
+executable exists.
+
+Cargo hashes the resolved `RUSTC_WRAPPER` identity into compiled artifacts.
+The checksum-pinned sccache action uses a fresh runner-private install path, so
+every FIPS Cargo job stops that wrapper and clears its two Cargo environment
+variables before cache restore or compilation. The exact target handoff, not a
+runner-unique compiler wrapper, is the FIPS compiler cache. Cold, fork,
+mismatched-tree, untrusted-prefix, and unstable-wrapper paths cannot claim an
+exact warm restore.
 Telemetry records explicit cross-run hits and ordinary runs as no-source
 misses; it does not fabricate a hit.
 The three ordinal `fips-claimed-checks` shards, `fips-clippy`, and

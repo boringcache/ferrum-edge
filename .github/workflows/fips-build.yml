@@ -330,6 +330,21 @@ jobs:
 
       - uses: ./.github/actions/setup-sccache
 
+      # Cargo fingerprints the resolved rustc-wrapper executable, including
+      # its runner-local path and metadata. setup-sccache deliberately installs
+      # into a fresh private directory, so carrying that wrapper identity into
+      # Cargo would invalidate every restored Rust artifact on the next job or
+      # runner. The exact target handoff is the compiler cache for this gate;
+      # clear the wrapper before any Cargo/cache operation so its artifacts
+      # retain the native rustc identity across trusted restores.
+      - name: Stabilize Cargo compiler identity for exact-target reuse
+        run: |
+          set -euo pipefail
+          if [ -n "${FERRUM_SCCACHE_BIN:-}" ] && [ -x "${FERRUM_SCCACHE_BIN}" ]; then
+            "${FERRUM_SCCACHE_BIN}" --stop-server > /dev/null 2>&1 || true
+          fi
+          printf '%s\n' 'RUSTC_WRAPPER=' 'CARGO_BUILD_RUSTC_WRAPPER=' >> "$GITHUB_ENV"
+
       - name: Install aws-lc-fips-sys build prerequisites
         # The FIPS build of AWS-LC is compiled through the upstream crate's
         # source-build path. This is a functional CI gate; certificate
@@ -442,7 +457,12 @@ jobs:
             echo "::error::exact cross-run FIPS target is missing its executable; refusing to refresh restored mtimes" >&2
             exit 1
           fi
-          find "$target_root" -xdev -type f -exec touch -- {} +
+          mtime_reference="${RUNNER_TEMP}/fips-target-mtime-reference"
+          rm -f "$mtime_reference"
+          touch "$mtime_reference"
+          find "$target_root" -xdev -type f \
+            -exec touch --reference="$mtime_reference" -- {} +
+          rm -f "$mtime_reference"
 
       - name: Record cross-run FIPS handoff restore
         if: github.event.inputs.force_cold_cache != 'true' && github.event_name == 'workflow_dispatch' && inputs.warm_source_run_id != ''
@@ -601,6 +621,14 @@ jobs:
 
       - uses: ./.github/actions/setup-sccache
 
+      - name: Stabilize Cargo compiler identity for exact-target reuse
+        run: |
+          set -euo pipefail
+          if [ -n "${FERRUM_SCCACHE_BIN:-}" ] && [ -x "${FERRUM_SCCACHE_BIN}" ]; then
+            "${FERRUM_SCCACHE_BIN}" --stop-server > /dev/null 2>&1 || true
+          fi
+          printf '%s\n' 'RUSTC_WRAPPER=' 'CARGO_BUILD_RUSTC_WRAPPER=' >> "$GITHUB_ENV"
+
       - name: Install aws-lc-fips-sys build prerequisites
         run: |
           sudo apt-get update
@@ -706,7 +734,12 @@ jobs:
             echo "::error::this-run FIPS target is missing its executable; refusing to refresh restored mtimes" >&2
             exit 1
           fi
-          find "$target_root" -xdev -type f -exec touch -- {} +
+          mtime_reference="${RUNNER_TEMP}/fips-target-mtime-reference"
+          rm -f "$mtime_reference"
+          touch "$mtime_reference"
+          find "$target_root" -xdev -type f \
+            -exec touch --reference="$mtime_reference" -- {} +
+          rm -f "$mtime_reference"
 
       - name: Assert cache-service credentials are absent
         run: |
@@ -802,6 +835,14 @@ jobs:
 
       - uses: ./.github/actions/setup-sccache
 
+      - name: Stabilize Cargo compiler identity for exact-target reuse
+        run: |
+          set -euo pipefail
+          if [ -n "${FERRUM_SCCACHE_BIN:-}" ] && [ -x "${FERRUM_SCCACHE_BIN}" ]; then
+            "${FERRUM_SCCACHE_BIN}" --stop-server > /dev/null 2>&1 || true
+          fi
+          printf '%s\n' 'RUSTC_WRAPPER=' 'CARGO_BUILD_RUSTC_WRAPPER=' >> "$GITHUB_ENV"
+
       - name: Install aws-lc-fips-sys build prerequisites
         run: |
           sudo apt-get update
@@ -907,7 +948,12 @@ jobs:
             echo "::error::this-run FIPS target is missing its executable; refusing to refresh restored mtimes" >&2
             exit 1
           fi
-          find "$target_root" -xdev -type f -exec touch -- {} +
+          mtime_reference="${RUNNER_TEMP}/fips-target-mtime-reference"
+          rm -f "$mtime_reference"
+          touch "$mtime_reference"
+          find "$target_root" -xdev -type f \
+            -exec touch --reference="$mtime_reference" -- {} +
+          rm -f "$mtime_reference"
 
       - name: Assert cache-service credentials are absent
         run: |
@@ -961,6 +1007,14 @@ jobs:
 
       - uses: ./.github/actions/setup-sccache
 
+      - name: Stabilize Cargo compiler identity for exact-target reuse
+        run: |
+          set -euo pipefail
+          if [ -n "${FERRUM_SCCACHE_BIN:-}" ] && [ -x "${FERRUM_SCCACHE_BIN}" ]; then
+            "${FERRUM_SCCACHE_BIN}" --stop-server > /dev/null 2>&1 || true
+          fi
+          printf '%s\n' 'RUSTC_WRAPPER=' 'CARGO_BUILD_RUSTC_WRAPPER=' >> "$GITHUB_ENV"
+
       - name: Install aws-lc-fips-sys build prerequisites
         run: |
           sudo apt-get update
@@ -1065,7 +1119,12 @@ jobs:
             echo "::error::this-run FIPS target is missing its executable; refusing to refresh restored mtimes" >&2
             exit 1
           fi
-          find "$target_root" -xdev -type f -exec touch -- {} +
+          mtime_reference="${RUNNER_TEMP}/fips-target-mtime-reference"
+          rm -f "$mtime_reference"
+          touch "$mtime_reference"
+          find "$target_root" -xdev -type f \
+            -exec touch --reference="$mtime_reference" -- {} +
+          rm -f "$mtime_reference"
 
       - name: Assert cache-service credentials are absent
         run: |

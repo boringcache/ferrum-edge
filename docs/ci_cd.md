@@ -326,13 +326,24 @@ artifact handoff:
   branch head after its base changes. Because checkout gives identical source
   files newer mtimes than archived outputs, the exact-head producer refreshes
   only regular files under `target/` after validating that tree and a real,
-  nonsymlink FIPS executable. Same-run consumers refresh those mtimes only
-  after the producer cache key matches the current source-SHA/run-ID prefix and
-  the same executable check succeeds. This keeps Cargo from relinking
-  content-identical outputs without allowing a partial, fork, cold, or
-  mismatched-tree restore to masquerade as current. `force_cold_cache` skips
-  both handoff download and upload. Run artifacts cannot populate another
-  ref's shared cache.
+  nonsymlink FIPS executable. Every refreshed file receives one common
+  reference timestamp: Cargo compares a unit's outputs with dependency outputs,
+  so independently generated `touch` times can themselves make a dependency
+  look newer and invalidate its dependents. Same-run consumers apply the same
+  normalization only after the producer cache key matches the current
+  source-SHA/run-ID prefix and the executable check succeeds.
+
+  Cargo also includes the resolved `RUSTC_WRAPPER` executable identity in its
+  artifact hashes. The checksum-pinned sccache installer intentionally uses a
+  fresh runner-private path, which is safe for ordinary compiler caching but
+  cannot identify an exact `target/` tree across jobs. Each FIPS Cargo job
+  therefore stops that private wrapper and clears both wrapper variables before
+  any cache or Cargo operation; the immutable exact-target channel is the FIPS
+  compiler cache. These two controls keep Cargo from rebuilding
+  content-identical outputs without allowing a partial, fork, cold,
+  mismatched-tree, or runner-unique-compiler restore to masquerade as current.
+  `force_cold_cache` skips both handoff download and upload. Run artifacts
+  cannot populate another ref's shared cache.
 
 `fips-test-build` precompiles the complete FIPS `unit_tests` and
 `integration_tests` executables and stages digest-bound copies in an
