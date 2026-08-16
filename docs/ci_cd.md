@@ -272,7 +272,8 @@ inside `<code>` so a hostile name cannot break Markdown.
 
 **FIPS.** `FIPS Feature Policy` stays a cheap always-on graph audit.
 Compile, claimed-profile `cargo check`, clippy `-D warnings`, and the
-policy/key-admission/handshake tests share three cache layers:
+policy/key-admission/handshake tests share two cache layers plus an immutable
+artifact handoff:
 
 - **Stable rust-cache fallback.** `shared-key` is
   `ci-fips-contract-${{ hashFiles(...) }}` over the manifest/lockfile, Cargo
@@ -303,20 +304,22 @@ policy/key-admission/handshake tests share three cache layers:
   evict it during the consumer tail when later ordinary CI jobs write more
   than the remaining cache budget (tens of GiB of newer entries have dropped
   this key before the next full-workflow rerun).
-- **Late cross-attempt handoff.** After `fips-test-build` precompiles the
-  complete FIPS `unit_tests` and `integration_tests` executables, publishes
-  digest-bound copies as an immutable same-run artifact, and removes the
-  staged bundle, a trusted non-fork, non-cold success saves the same
-  `target/` + `.cache/sccache` tree under
-  `fips-handoff-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}`.
-  That key is distinct from `fips-producer-*`. Saving after the last
-  heavyweight target-producing job keeps the archive fresh against the
-  eviction window above. On a full workflow rerun, `fips-compile` restores
-  the newest prior attempt under the matching SHA+`run_id` prefix
-  (`fips-handoff-${{ github.sha }}-${{ github.run_id }}-`) and classifies the
-  action outputs as exact / partial / miss; it does not treat an empty restore
-  as a hit. A miss remains valid on the first attempt and on fork PRs. Fork
-  pull requests and `force_cold_cache` never publish this handoff.
+- **Immutable cross-run handoff.** A successful non-cold `fips-compile`
+  packages its exact `target/` + `.cache/sccache` producer tree as a zstd tar
+  (preserving executable modes that artifact ZIP extraction would normalize)
+  and publishes it as the one-day run artifact
+  `fips-producer-handoff-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}`.
+  This is intentionally not a third repository cache: concurrent CI writers
+  empirically evicted a 4.15 GB late cache handoff within three minutes.
+  GitHub also deletes a workflow run's artifacts when that same run is rerun,
+  so warm evidence uses separate `workflow_dispatch` runs. Each dispatch names
+  the exact source run ID and attempt; the pinned download action requests only
+  `fips-producer-handoff-${{ github.sha }}-<run_id>-<run_attempt>` from that run
+  in the current repository. An explicitly requested artifact must contain a
+  real tar payload that extracts to real `target/` and `.cache/sccache`
+  directories or the compile fails closed. `force_cold_cache` skips both
+  handoff download and upload. Run artifacts cannot populate another ref's
+  shared cache.
 
 `fips-test-build` precompiles the complete FIPS `unit_tests` and
 `integration_tests` executables and stages digest-bound copies in an
@@ -341,11 +344,11 @@ before saving the stable fallback. Example plugins stay out of the FIPS
 artifact (`FERRUM_CUSTOM_PLUGINS` is unset). Job summaries record rust-cache
 hit/miss from the action output as **stable fallback**, producer restore
 as **exact / partial (same run_id) / miss** via `classify-restore`, and the
-optional prior-attempt handoff restore as **exact / partial (same run_id) /
-miss** on the same classifier (never as a fabricated hit). Measured
-restored bytes are the sccache-directory subset for rust-cache and the
-on-disk `target/` directory for the producer and handoff archives; rust-cache
-Cargo/target archive bytes are not exposed. The required `FIPS Build & Test`
+explicit cross-run handoff artifact as **hit / miss** (never as a fabricated
+hit). Measured restored bytes are the sccache-directory subset for
+rust-cache and the on-disk `target/` directory for the producer cache and
+handoff artifact; rust-cache Cargo/target archive bytes are not exposed. The
+required `FIPS Build & Test`
 aggregate depends on `fips-test-build` and fails closed if that test-binary
 producer does not succeed.
 

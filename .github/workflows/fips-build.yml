@@ -26,11 +26,13 @@ name: FIPS Build Policy
 #      post cleanup, for this-attempt claimed/clippy/test-build consumers. A new
 #      attempt always gets a fresh key, so GitHub's immutable exact-hit skip
 #      cannot trap newly warmed outputs.
-#    Compile restores the newest prior-attempt late handoff for the same SHA +
-#    run_id (see job 4) as the cross-attempt warm source. A miss remains valid
-#    on the first attempt and on fork PRs. Fork pull requests restore both
-#    layers and cannot save. `force_cold_cache` skips every restore and save.
-#    Abrupt loss of the producer cannot publish that producer's unsaved state.
+#    Compile also publishes its successful producer tree as an immutable,
+#    one-day artifact scoped to SHA + run_id + run_attempt. A later explicit
+#    workflow dispatch can name that source run and attempt, downloading the
+#    exact same-SHA artifact as its warm source. Separate workflow runs are
+#    required because GitHub deletes a run's artifacts when that run is rerun.
+#    Run artifacts are not exposed to repository cache-LRU eviction. Abrupt
+#    loss of the producer cannot publish that producer's unsaved state.
 # 4. `fips-claimed-checks`, `fips-clippy`, and `fips-test-build` restore the
 #    same-run producer key (consumers; rust-cache `save-if: false` and no
 #    producer save). Trusted non-cold runs fail closed if this-run producer
@@ -40,13 +42,8 @@ name: FIPS Build Policy
 #    `fips-test-build` precompiles the complete unit_tests and integration_tests
 #    executables and publishes digest-bound copies as an immutable same-run
 #    artifact, overlapping claimed-profile and clippy work after the shorter
-#    build-only producer. After that staged bundle is removed, a trusted
-#    non-fork, non-cold success saves the late cross-attempt handoff under
-#    `fips-handoff-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}`.
-#    Saving after the last heavyweight target-producing job keeps that archive
-#    fresh against GitHub's LRU eviction from later ordinary CI caches, so the
-#    next full-workflow rerun's `fips-compile` can restore it via the matching
-#    SHA + run_id prefix. Fork PRs and `force_cold_cache` never publish it.
+#    build-only producer. The test-binary job remains a cache consumer and does
+#    not publish cross-run state.
 # 5. `fips-test` downloads only the immutable same-run test artifact and
 #    validates its manifest/digests before direct execution. This transport is
 #    available on forced-cold and fork runs without publishing shared cache.
@@ -70,8 +67,19 @@ on:
         description: Skip cache restore to prove cold-path FIPS contracts
         type: boolean
         default: false
+      warm_source_run_id:
+        description: Exact prior FIPS workflow run ID to use as the warm source
+        type: string
+        required: false
+        default: ""
+      warm_source_run_attempt:
+        description: Exact attempt number that published the warm-source artifact
+        type: string
+        required: false
+        default: "1"
 
 permissions:
+  actions: read
   contents: read
 
 concurrency:
@@ -87,18 +95,15 @@ env:
   # so a source-only change can publish freshly warmed Cargo/target/AWS-LC/
   # sccache state. restore-keys use the SHA+run_id prefix (no attempt) so a
   # failed-job rerun of a consumer can reuse a prior successful compile in the
-  # same run. This early save is not the cross-attempt warm source: later
+  # same run. This early save is not the cross-run warm source: later
   # ordinary CI caches can LRU-evict it before the next full-workflow rerun.
   FIPS_PRODUCER_KEY: fips-producer-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
   FIPS_PRODUCER_RESTORE_PREFIX: fips-producer-${{ github.sha }}-${{ github.run_id }}-
-  # Late cross-attempt handoff. Unique per SHA + workflow run + attempt and
-  # saved by fips-test-build after the staged test bundle is removed, so the
-  # archive is still fresh when the next attempt's fips-compile restores the
-  # SHA+run_id prefix. Distinct from fips-producer-* so same-run consumers
-  # cannot accidentally consume the late key, and compile cannot restore a
-  # different SHA or run_id lineage.
-  FIPS_HANDOFF_KEY: fips-handoff-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
-  FIPS_HANDOFF_RESTORE_PREFIX: fips-handoff-${{ github.sha }}-${{ github.run_id }}-
+  # Immutable cross-run producer artifact. A later explicit workflow dispatch
+  # names the exact source run and attempt; the artifact name also binds the
+  # current SHA. Separate runs avoid both repository cache LRU and GitHub's
+  # deletion of a run's artifacts when that same run is rerun.
+  FIPS_HANDOFF_ARTIFACT: fips-producer-handoff-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
 
 jobs:
   feature-policy:
@@ -359,38 +364,67 @@ jobs:
             --path "${GITHUB_WORKSPACE}/.cache/sccache" \
             --note "layer=stable-fallback; measured=sccache-directory-subset; rust-cache Cargo/target archive bytes are not exposed; shared-key=ci-fips-contract save-if=non-fork fork=${FORK_PR:-false}"
 
-      # A full workflow rerun has a new run_attempt but the same SHA + run_id.
-      # Restore the previous attempt's late handoff (saved by fips-test-build
-      # after the staged test bundle was removed) as the warm source for this
-      # producer. The early same-run producer is often LRU-evicted by later
-      # ordinary CI caches before that rerun starts. A miss is valid on the
-      # first attempt and on fork PRs. restore-keys stay on this SHA + run_id.
-      - name: Restore prior-attempt FIPS handoff outputs
-        if: github.event.inputs.force_cold_cache != 'true'
-        id: prior-fips-handoff
-        uses: actions/cache/restore@374a27f26986edd8c430f386d152a856e179c0ae # v4.2.4
+      # Full reruns delete artifacts from earlier attempts of the same run.
+      # Warm evidence therefore chains separate workflow_dispatch runs, naming
+      # the exact preceding run and attempt. The action receives a read-only
+      # token internally; no PR-controlled run step receives GITHUB_TOKEN.
+      - name: Download exact cross-run FIPS handoff artifact
+        if: github.event.inputs.force_cold_cache != 'true' && github.event_name == 'workflow_dispatch' && inputs.warm_source_run_id != ''
+        id: cross-run-fips-handoff
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
         with:
-          path: |
-            ${{ github.workspace }}/target
-            ${{ github.workspace }}/.cache/sccache
-          key: ${{ env.FIPS_HANDOFF_KEY }}
-          restore-keys: |
-            ${{ env.FIPS_HANDOFF_RESTORE_PREFIX }}
+          name: fips-producer-handoff-${{ github.sha }}-${{ inputs.warm_source_run_id }}-${{ inputs.warm_source_run_attempt }}
+          path: ${{ runner.temp }}/cross-run-fips-handoff
+          github-token: ${{ github.token }}
+          repository: ${{ github.repository }}
+          run-id: ${{ inputs.warm_source_run_id }}
 
-      - name: Record prior-attempt FIPS handoff restore
-        if: github.event.inputs.force_cold_cache != 'true'
-        env:
-          CACHE_HIT: ${{ steps.prior-fips-handoff.outputs.cache-hit }}
-          CACHE_MATCHED: ${{ steps.prior-fips-handoff.outputs.cache-matched-key }}
-          CACHE_PRIMARY: ${{ steps.prior-fips-handoff.outputs.cache-primary-key }}
+      - name: Promote exact cross-run FIPS handoff artifact
+        if: github.event.inputs.force_cold_cache != 'true' && github.event_name == 'workflow_dispatch' && inputs.warm_source_run_id != '' && steps.cross-run-fips-handoff.outcome == 'success'
         run: |
-          python3 .github/scripts/ci_runtime_telemetry.py classify-restore \
-            --name prior-fips-handoff \
-            --hit "$CACHE_HIT" \
-            --matched "$CACHE_MATCHED" \
-            --primary "$CACHE_PRIMARY" \
+          set -euo pipefail
+          source_root="${RUNNER_TEMP}/cross-run-fips-handoff"
+          archive="${source_root}/fips-producer-handoff.tar.zst"
+          if [ ! -f "$archive" ] || [ -L "$archive" ]; then
+            echo "::error::cross-run FIPS handoff is missing its real tar.zst payload" >&2
+            exit 1
+          fi
+          extract_root="${RUNNER_TEMP}/cross-run-fips-extracted"
+          rm -rf "$extract_root"
+          mkdir -p "$extract_root"
+          tar --zstd --no-same-owner -xf "$archive" -C "$extract_root"
+          for path in target .cache/sccache; do
+            source_path="${extract_root}/${path}"
+            if [ ! -d "$source_path" ] || [ -L "$source_path" ]; then
+              echo "::error::cross-run FIPS handoff is missing a real ${path} directory" >&2
+              exit 1
+            fi
+          done
+          rm -rf "${GITHUB_WORKSPACE}/target" "${GITHUB_WORKSPACE}/.cache/sccache"
+          mkdir -p "${GITHUB_WORKSPACE}/.cache"
+          mv "${extract_root}/target" "${GITHUB_WORKSPACE}/target"
+          mv "${extract_root}/.cache/sccache" "${GITHUB_WORKSPACE}/.cache/sccache"
+
+      - name: Record cross-run FIPS handoff restore
+        if: github.event.inputs.force_cold_cache != 'true' && github.event_name == 'workflow_dispatch' && inputs.warm_source_run_id != ''
+        env:
+          SOURCE_RUN_ID: ${{ inputs.warm_source_run_id }}
+          SOURCE_RUN_ATTEMPT: ${{ inputs.warm_source_run_attempt }}
+        run: |
+          python3 .github/scripts/ci_runtime_telemetry.py cache \
+            --name cross-run-fips-handoff \
+            --hit true \
             --path "${GITHUB_WORKSPACE}/target" \
-            --note "layer=cross-attempt-handoff; measured=target-directory; optional prior-attempt restore for the same sha+run_id"
+            --note "layer=cross-run-artifact; measured=target-directory; source_run=${SOURCE_RUN_ID}; source_attempt=${SOURCE_RUN_ATTEMPT}"
+
+      - name: Record absent cross-run FIPS handoff
+        if: github.event.inputs.force_cold_cache != 'true' && (github.event_name != 'workflow_dispatch' || inputs.warm_source_run_id == '')
+        run: |
+          python3 .github/scripts/ci_runtime_telemetry.py cache \
+            --name cross-run-fips-handoff \
+            --hit false \
+            --bytes 0 \
+            --note "layer=cross-run-artifact; no explicit warm source requested"
 
       - name: Record cold-cache proof
         if: github.event.inputs.force_cold_cache == 'true'
@@ -401,10 +435,10 @@ jobs:
             --bytes 0 \
             --note "layer=stable-fallback; force_cold_cache skipped restore"
           python3 .github/scripts/ci_runtime_telemetry.py cache \
-            --name prior-fips-handoff \
+            --name cross-run-fips-handoff \
             --hit false \
             --bytes 0 \
-            --note "layer=cross-attempt-handoff; force_cold_cache skipped restore"
+            --note "layer=cross-run-artifact; force_cold_cache skipped download"
           python3 .github/scripts/ci_runtime_telemetry.py cache \
             --name fips-producer \
             --hit false \
@@ -449,6 +483,34 @@ jobs:
             ${{ github.workspace }}/target
             ${{ github.workspace }}/.cache/sccache
           key: ${{ env.FIPS_PRODUCER_KEY }}
+
+      # Artifact ZIP extraction normalizes permissions. Package the producer
+      # tree first so executable modes inside target survive the handoff.
+      - name: Package cross-run FIPS producer handoff
+        if: github.event.inputs.force_cold_cache != 'true'
+        run: |
+          set -euo pipefail
+          archive="${RUNNER_TEMP}/fips-producer-handoff.tar.zst"
+          rm -f "$archive"
+          tar --zstd -cf "$archive" -C "$GITHUB_WORKSPACE" \
+            target .cache/sccache
+          if [ ! -s "$archive" ] || [ -L "$archive" ]; then
+            echo "::error::failed to create a real FIPS producer handoff archive" >&2
+            exit 1
+          fi
+
+      # Unlike the repository cache, this immutable run artifact is not subject
+      # to cache-LRU churn from concurrent PR jobs. It is exact to the SHA, run,
+      # and attempt, and download-artifact verifies its service digest.
+      - name: Publish cross-run FIPS producer handoff
+        if: github.event.inputs.force_cold_cache != 'true'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: ${{ env.FIPS_HANDOFF_ARTIFACT }}
+          path: ${{ runner.temp }}/fips-producer-handoff.tar.zst
+          if-no-files-found: error
+          retention-days: 1
+          compression-level: 0
 
       - name: Record sccache stats
         if: always()
@@ -900,12 +962,6 @@ jobs:
             --hit false \
             --bytes 0 \
             --note "layer=producer; force_cold_cache skipped restore"
-          python3 .github/scripts/ci_runtime_telemetry.py cache \
-            --name fips-handoff \
-            --hit false \
-            --bytes 0 \
-            --note "layer=cross-attempt-handoff; force_cold_cache skipped save"
-
       - name: Require this-run FIPS producer cache
         if: github.event.inputs.force_cold_cache != 'true' && github.event.pull_request.head.repo.fork != true
         env:
@@ -1038,22 +1094,6 @@ jobs:
 
       - name: Remove staged FIPS test artifact
         run: rm -rf "${GITHUB_WORKSPACE}/target/fips-test-bundle"
-
-      # Late cross-attempt handoff: full workspace target + sccache after the
-      # last heavyweight target-producing job succeeds and the staged test
-      # bundle is gone. Unique sha/run_id/run_attempt avoids immutable exact-hit
-      # collisions. Saved as a main step so a failed producer cannot publish,
-      # and after the consumer tail of this job so GitHub's LRU still sees the
-      # archive as fresh for the next full-workflow rerun. Fork PRs and
-      # force_cold_cache never publish it.
-      - name: Save FIPS cross-attempt handoff
-        if: github.event.inputs.force_cold_cache != 'true' && github.event.pull_request.head.repo.fork != true
-        uses: actions/cache/save@374a27f26986edd8c430f386d152a856e179c0ae # v4.2.4
-        with:
-          path: |
-            ${{ github.workspace }}/target
-            ${{ github.workspace }}/.cache/sccache
-          key: ${{ env.FIPS_HANDOFF_KEY }}
 
       - name: Record sccache stats
         if: always()
@@ -1262,10 +1302,9 @@ jobs:
             echo "Compile published this-run producer cache "
             echo "(sha + run_id + run_attempt) after the locked fips profile "
             echo "build. Claimed checks, clippy, and test-binary compile restored "
-            echo "that exact same-run channel in parallel. fips-test-build then "
-            echo "saved the late cross-attempt handoff after removing the staged "
-            echo "test bundle, so the next attempt's compile can restore the "
-            echo "same sha + run_id lineage. Tests executed digest-bound "
+            echo "that exact same-run channel in parallel. Compile also published "
+            echo "an immutable one-day producer artifact for an explicitly chained "
+            echo "same-SHA workflow dispatch. Tests executed digest-bound "
             echo "binaries from the immutable same-run artifact published by "
             echo "fips-test-build. Stable rust-cache remains the cross-commit "
             echo "fallback."

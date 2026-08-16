@@ -81,8 +81,9 @@ always audits the resolved feature graph. `FIPS Build & Test` compiles the
 locked `fips` binary, every claimed feature combination, clippy `-D warnings`,
 and the policy, key-admission, and frontend/backend/CP-DP handshake tests.
 
-Compile artifacts use three cache layers through the local checksum-pinned
-`setup-sccache` action plus `Swatinem/rust-cache` and `actions/cache`.
+Compile artifacts use two cache layers plus one immutable run-artifact handoff
+through the local checksum-pinned `setup-sccache` action,
+`Swatinem/rust-cache`, `actions/cache`, and `actions/upload-artifact`.
 rust-cache's `shared-key` is `ci-fips-contract-${{ hashFiles(...) }}` over
 `Cargo.toml`, `Cargo.lock`, `.cargo/config.toml`, the root `build.rs`, the
 FIPS workflow, the claimed-profile/FIPS feature-policy checker, `src/fips/**`,
@@ -98,22 +99,25 @@ That compile job is build-only: complete FIPS `unit_tests` and
 `integration_tests` executables are compiled by the parallel `fips-test-build`
 consumer so claimed-profile shards and clippy do not wait on test-binary
 precompile. `fips-test-build` publishes digest-bound copies through an
-immutable artifact scoped to that workflow run and attempt. After that staged
-bundle is removed, a trusted non-fork, non-cold success saves the late
-cross-attempt handoff under
-`fips-handoff-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}`.
-The early producer is not the cross-attempt warm source: later ordinary CI
-caches can LRU-evict it during the consumer tail before the next
-full-workflow rerun. The late handoff is saved after the last heavyweight
-target-producing job so that archive stays fresh. The filtered
+immutable artifact scoped to that workflow run and attempt. The successful
+build-only producer packages its exact `target/` + `.cache/sccache` tree as a
+zstd tar, preserving executable modes that artifact ZIP extraction would
+normalize, and publishes it as the one-day immutable artifact
+`fips-producer-handoff-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}`.
+That cross-run channel is deliberately not another repository cache:
+concurrent CI writers empirically evicted a 4.15 GB late cache handoff within
+three minutes. The filtered
 test consumer rejects unexpected names, symlinks, path escapes, and SHA-256
 mismatches before executing those binaries directly. It does not ask Cargo to
 revalidate fresh-checkout source mtimes and repeat test-only compile/link work.
-On a full workflow rerun, `fips-compile` restores the newest prior-attempt
-handoff with the same SHA + `run_id` prefix before rebuilding and publishes a
-fresh same-run producer key; the first attempt and fork PRs may miss this
-optional warm source. Classify-restore records exact/partial/miss from the
-action outputs and does not fabricate a hit.
+GitHub deletes a workflow run's artifacts when that run is rerun, so warm
+evidence chains separate `workflow_dispatch` runs. Each dispatch names an exact
+source run ID and attempt, and the pinned download action requests only the
+same-SHA artifact from that run in the current repository. A requested source
+must contain a real tar payload and pass extracted-directory validation or the
+compile fails closed.
+Telemetry records explicit cross-run hits and ordinary runs as no-source
+misses; it does not fabricate a hit.
 The three ordinal `fips-claimed-checks` shards, `fips-clippy`, and
 `fips-test-build` restore the current producer key and do not save that
 channel. Each
@@ -134,18 +138,18 @@ exact path (`FERRUM_SCCACHE_BIN` / `RUSTC_WRAPPER`) and persists
 `SCCACHE_GHA_ENABLED` empty. rust-cache `save-if`
 is false when `github.event.pull_request.head.repo.fork` is true on the
 compile producer, and always false on claimed checks, clippy, and
-`fips-test-build`, so fork pull
-requests restore and cannot save, including the late cross-attempt handoff.
+`fips-test-build`, so fork pull requests restore and cannot save shared caches.
+Run-scoped immutable artifacts remain available to fork runs just as the
+existing exact-test artifact is; they cannot populate another ref's cache.
 Trusted compile runs keep `cache-on-failure`
 so ordinary failing jobs can publish stable dependency work when post-job
 cleanup still runs. The successful compile producer publishes before claimed
 checks, clippy, and test-binary compile start, so a downstream runner-loss retry
-can reuse it;
-abrupt loss of the producer cannot publish that producer's unsaved state. The
-late handoff is published only after `fips-test-build` succeeds and removes
-the staged test bundle. A `workflow_dispatch` input
-`force_cold_cache` skips cache restore and save so a hosted cold-cache run still
-proves every live assertion. Its `fips-test-build` job still sends the exact
+can reuse it; abrupt loss of the producer cannot publish that producer's
+unsaved cache or artifact state. A `workflow_dispatch` input
+`force_cold_cache` skips cache restore/save and the producer-handoff artifact
+download/upload so a hosted cold-cache run still proves every live assertion.
+Its `fips-test-build` job still sends the exact
 test binaries to its own test job through the attempt-scoped artifact; that
 same-run transport
 does not warm or publish a shared cache. Path planning is fail-closed: a missing or unknown trusted
@@ -155,10 +159,11 @@ filename cannot evade a sensitive prefix. Every compiled `tests/` input is
 sensitive (`cargo clippy --lib --tests` and the handshake binaries). Paths
 that are neither sensitive nor on the explicit non-sensitive allowlist
 force-run; empty, truncated, or unavailable diffs run or fail closed rather
-than skipping. Job summaries record rust-cache hit/miss as stable fallback
-and producer and prior-attempt handoff restore as exact/partial/miss; measured restored bytes are the
-sccache-directory subset for rust-cache and the on-disk `target/` directory
-for the producer archive. Total rust-cache archive bytes are not exposed.
+than skipping. Job summaries record rust-cache hit/miss as stable fallback,
+the same-run producer cache as exact/partial/miss, and the explicit cross-run
+handoff artifact as hit/miss. Measured restored bytes are the sccache-directory
+subset for rust-cache and the on-disk `target/` directory for the producer
+cache and handoff artifact. Total rust-cache archive bytes are not exposed.
 
 ## Current capability
 
