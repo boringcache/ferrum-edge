@@ -11963,18 +11963,28 @@ CI_JOB_GENERATION_TRANSITIONS: tuple[tuple[str, str, str], ...] = (
 )
 
 # Local composite actions are compared by whole-file digest once Cross-sensitive.
-# `setup-rust-ci/action.yml` on current `main` (PR #3889's landed file) may
-# move to exactly one combined destination: PR #3911 after merging latest
-# `main`, preserving every #3889 cache-safety change plus #3911's optional
-# `workspaces` input/pass-through. Exact, path-bound, one-way, fail-closed.
-# The candidate cannot supply a digest. The Helm Chart setup-kubernetes-tools
-# generation lives in `verify_trusted_local_action.py`, not here: that gate is
-# byte-identity of the extracted checker, not a Cross surface comparison.
+# `setup-rust-ci/action.yml` carries a two-step chain from PR #3889's landed
+# file: first the cache-budget generation (this change) that gates rust-cache
+# `save-if` to a trusted `refs/heads/main` run so pull requests and merge
+# groups restore without saving, then that generation may move to exactly one
+# combined destination: PR #3911 rebased onto it, preserving every cache-safety
+# change plus #3911's optional `workspaces` input/pass-through. Each step is
+# exact, path-bound, one-way, fail-closed. The candidate cannot supply a
+# digest. The former direct #3889→#3911 pair is superseded by this chain and
+# #3911 must rebase to the combined destination text. The Helm Chart
+# setup-kubernetes-tools generation lives in `verify_trusted_local_action.py`,
+# not here: that gate is byte-identity of the extracted checker, not a Cross
+# surface comparison.
 LOCAL_ACTION_GENERATION_TRANSITIONS: tuple[tuple[str, str, str], ...] = (
     (
         "setup-rust-ci/action.yml",
         "fc4e41818dffdea880c057c8dfa0881a629cd01c917b43f69a9f2e5e9bd90dda",
-        "57a99a179ddc2935af187f518a803bf167eb9e33593c37b7b29f7151ec994da2",
+        "b6ca6315ff9f2a206c1011b6b0166de3a340370fd75bf3e9cffe41e872008924",
+    ),
+    (
+        "setup-rust-ci/action.yml",
+        "b6ca6315ff9f2a206c1011b6b0166de3a340370fd75bf3e9cffe41e872008924",
+        "219187bdb0366d929577e67f48947b8c1096998dd7e04eafdffdb53dc3faa925",
     ),
 )
 
@@ -18345,12 +18355,17 @@ pre_build = []
         (
             "setup-rust-ci/action.yml",
             "fc4e41818dffdea880c057c8dfa0881a629cd01c917b43f69a9f2e5e9bd90dda",
-            "57a99a179ddc2935af187f518a803bf167eb9e33593c37b7b29f7151ec994da2",
+            "b6ca6315ff9f2a206c1011b6b0166de3a340370fd75bf3e9cffe41e872008924",
+        ),
+        (
+            "setup-rust-ci/action.yml",
+            "b6ca6315ff9f2a206c1011b6b0166de3a340370fd75bf3e9cffe41e872008924",
+            "219187bdb0366d929577e67f48947b8c1096998dd7e04eafdffdb53dc3faa925",
         ),
     ):
         failures.append(
-            "the setup-rust-ci generation table does not pin the current-main "
-            "retired digest and the combined #3911 destination"
+            "the setup-rust-ci generation table does not pin the cache-budget "
+            "generation chain and the rebased combined #3911 destination"
         )
 
     remote_action_composite = (
