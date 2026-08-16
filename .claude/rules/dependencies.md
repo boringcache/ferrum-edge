@@ -55,6 +55,19 @@ Full policy: `docs/dependency-policy.md`. These are the load-bearing rules.
   still compared byte for byte, and the wiring cannot be removed once adopted. A
   committed `.cargo/config[.toml]` below the repository root is rejected
   outright.
+- The `fuzz-smoke` job carries TWO admitted generations for issue #3902
+  (`CI_FUZZ_SMOKE_JOB_GENERATIONS`, oldest first): `CI_FUZZ_SMOKE_RETIRED_JOB`
+  ran the six-target libFuzzer budget on every pull request with caching
+  disabled; `CI_FUZZ_SMOKE_JOB` keeps the deterministic property smoke as the
+  required pull-request gate, moves the budget to `merge_group` / push to `main`
+  / `workflow_dispatch`, and admits `./.github/actions/setup-sccache` plus a
+  `main`-push-only `save-if` cache. The transition is exact on both ends and
+  one-way — withholding is symmetric, so `admitted_fuzz_smoke_removal_errors` is
+  what refuses a revert. `CI_FUZZ_SMOKE_BOUNDED_BUDGET` must appear exactly once
+  in every generation, so a generation can never move the lane and relax its
+  bounds at the same time. Delete the retired generation once the adopted one is
+  on `main`. See `docs/ci_cd.md` → "Admitted `fuzz-smoke` lane-split
+  generation".
 - `release.yml` is admitted in exactly two shapes
   (`RELEASE_IMAGE_FAMILY_GENERATIONS`): the current two image families, or those
   plus the complete frozen `-ebpf-tools` contract (`docker-ebpf-tools-manifest`
@@ -79,6 +92,21 @@ Full policy: `docs/dependency-policy.md`. These are the load-bearing rules.
   it once #3889 is on `main`. See `docs/ci_cd.md` and
   `docs/dependency-policy.md` → "Admitted `fips-build.yml` generation
   transition".
+- `Helm Chart` proves `.github/actions/setup-kubernetes-tools` against the
+  trusted revision before `uses:`. Issue #3904 admits exactly one extracted
+  checker generation: current `action.yml`
+  `6ecb4bde09a0d3d456d6019c03ef1678c3903cbc0275bba31fde3e56f6e6ef08` moving to
+  PR #3910 `41dd4b9ae1b0ad74e021e2974afbcdac1a1bc0d856a166a57e94046e803d6cd9`.
+  Source and destination are bound inside `verify_trusted_local_action.py`; the
+  candidate cannot supply a digest. Retire the pair after #3910 is the trusted
+  base.
+- Cross-sensitive `ci.yml` jobs `ci-plan`, `test`, and `performance-regression`
+  carry temporary SHA-256 generation pairs (`CI_JOB_GENERATION_TRANSITIONS`)
+  for PRs #3913 and #3911. `setup-rust-ci/action.yml` carries two trusted-base
+  destinations from one retired digest (`LOCAL_ACTION_GENERATION_TRANSITIONS`)
+  for PRs #3911 and #3889; first landing wins. Exact, one-way, no candidate
+  allowlist. See `docs/ci_cd.md` → "Admitted CI job SHA-256 generation
+  transitions".
 
 ## Drift Guard
 
