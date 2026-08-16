@@ -118,6 +118,12 @@ jobs:
     # old 45-minute budget even though warm shards normally finish sooner. Keep
     # the combined invocation so runner loss cannot discard the shared compile.
     timeout-minutes: 75
+    env:
+      # Cold-cache instrumented compiles have repeatedly killed hosted runners
+      # ("shutdown signal" + exit 143) on this shard matrix. Cap cargo's
+      # parallelism so peak memory/disk fits the runner; llvm-cov's own
+      # instrumentation settings are untouched.
+      CARGO_BUILD_JOBS: "3"
     strategy:
       fail-fast: false
       matrix:

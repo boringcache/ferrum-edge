@@ -366,6 +366,16 @@ jobs:
     needs: ci-plan
     if: needs.ci-plan.outputs.mode == 'full' && (github.event_name == 'pull_request' || github.event_name == 'merge_group' || (github.event_name == 'push' && github.ref == 'refs/heads/main'))
     runs-on: ubuntu-latest
+    env:
+      # Cold-cache full-workspace compiles repeatedly kill this hosted runner
+      # ("The runner has received a shutdown signal" + exit 143) while the
+      # combined lib + unit_tests precompile lets two full-debuginfo link jobs
+      # overlap. Cap cargo's parallelism and shrink debuginfo to line tables
+      # (backtraces keep file:line) so a cold compile fits the runner's
+      # memory/disk. Same values on every job sharing this rust-cache key so
+      # cached artifact fingerprints stay uniform.
+      CARGO_BUILD_JOBS: "3"
+      CARGO_PROFILE_DEV_DEBUG: "line-tables-only"
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
 
@@ -587,6 +597,12 @@ jobs:
     needs: ci-plan
     if: needs.ci-plan.outputs.mode == 'full' && (github.event_name == 'pull_request' || github.event_name == 'merge_group' || (github.event_name == 'push' && github.ref == 'refs/heads/main'))
     runs-on: ubuntu-latest
+    env:
+      # Same cold-compile survivability caps as test-unit (own rust-cache key,
+      # same repeated exit-143 runner loss during the pkcs11 double-target
+      # precompile).
+      CARGO_BUILD_JOBS: "3"
+      CARGO_PROFILE_DEV_DEBUG: "line-tables-only"
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
 
@@ -1003,6 +1019,12 @@ jobs:
     needs: ci-plan
     if: needs.ci-plan.outputs.mode == 'full' && (github.event_name == 'pull_request' || github.event_name == 'merge_group' || (github.event_name == 'push' && github.ref == 'refs/heads/main'))
     runs-on: ubuntu-latest
+    env:
+      # Shares the `ci-test` rust-cache key with test-unit: keep the same
+      # compile settings so cached artifact fingerprints stay uniform across
+      # the shared key.
+      CARGO_BUILD_JOBS: "3"
+      CARGO_PROFILE_DEV_DEBUG: "line-tables-only"
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
 
