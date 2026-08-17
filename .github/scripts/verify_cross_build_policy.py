@@ -11918,15 +11918,16 @@ def validate_workflow_collection(
 # served. See `docs/ci_cd.md` and `docs/dependency-policy.md`.
 FIPS_BUILD_WORKFLOW_FILENAME = "fips-build.yml"
 # `.github/workflows/fips-build.yml` as it stands on the trusted base
-# (PR #3889's landed file).
+# after PR #3952's landed static-path planner hardening.
 FIPS_BUILD_RETIRED_GENERATION_SHA256 = (
-    "527659b0ad96a0d97cd4a170543dd81acbf6784155b3c82918b1f70a20c7914b"
+    "0be313579a66265ef1f54e0a611f519e8d109a536ba29b0d6c4244530b9d6a08"
 )
-# `.github/workflows/fips-build.yml` at PR #3950 head
-# 0984a45e4: the same-run producer handoff moves off the eviction-prone
-# repository cache onto the immutable run artifact.
+# `.github/workflows/fips-build.yml` at PR #3950 head df1223520: the same-run
+# producer handoff moves off the eviction-prone repository cache onto the
+# immutable run artifact, and restored runner-local AWS-LC CMake intermediates
+# are quarantined before Cargo can reuse them on another runner.
 FIPS_BUILD_ADOPTED_GENERATION_SHA256 = (
-    "05f86617597b1eb7bcf1960a0c630a9884ff09ac1995982f46a80811c3965e74"
+    "17bfb40fbd31e80e6ae1a0efca922069c54ec485ec7a611c3420840da3e5e9e1"
 )
 FIPS_BUILD_ADMITTED_GENERATION_TRANSITION = (
     FIPS_BUILD_WORKFLOW_FILENAME,
