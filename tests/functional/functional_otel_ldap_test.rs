@@ -194,7 +194,13 @@ fn start_gateway(
     admin_port: u16,
     observability_token: &str,
 ) -> Result<std::process::Child, Box<dyn std::error::Error>> {
-    start_gateway_with_dns(config_path, proxy_port, admin_port, None, observability_token)
+    start_gateway_with_dns(
+        config_path,
+        proxy_port,
+        admin_port,
+        None,
+        observability_token,
+    )
 }
 
 /// Prove *this* child owns its admin/proxy listeners before returning.
@@ -230,12 +236,8 @@ async fn wait_for_owned_gateway(
             )
             .into());
         }
-        match probe_gateway_identity(
-            admin_port,
-            observability_token,
-            remaining.min(PROBE_SLICE),
-        )
-        .await
+        match probe_gateway_identity(admin_port, observability_token, remaining.min(PROBE_SLICE))
+            .await
         {
             Ok(()) => break,
             Err(err) => last_observation = err.to_string(),
@@ -303,8 +305,7 @@ async fn start_otel_gateway_with_retry(
         sleep(Duration::from_millis(200)).await;
 
         // Start gateway
-        let observability_token =
-            otel_ldap_observability_token(proxy_port, admin_port, attempt);
+        let observability_token = otel_ldap_observability_token(proxy_port, admin_port, attempt);
         let mut gateway_process = match start_gateway(
             &config_path.to_string_lossy(),
             proxy_port,
@@ -580,8 +581,7 @@ async fn start_ldap_gateway_with_retry(
         let echo_handle = tokio::spawn(start_echo_server_on(backend_listener));
         sleep(Duration::from_millis(200)).await;
 
-        let observability_token =
-            otel_ldap_observability_token(proxy_port, admin_port, attempt);
+        let observability_token = otel_ldap_observability_token(proxy_port, admin_port, attempt);
         let mut gateway_process = match start_gateway(
             &config_path.to_string_lossy(),
             proxy_port,
@@ -670,8 +670,7 @@ async fn start_ldap_rebinding_gateway_with_retry(
 
         let echo_handle = tokio::spawn(start_echo_server_on(backend_listener));
         sleep(Duration::from_millis(200)).await;
-        let observability_token =
-            otel_ldap_observability_token(proxy_port, admin_port, attempt);
+        let observability_token = otel_ldap_observability_token(proxy_port, admin_port, attempt);
         let mut gateway_process = match start_gateway_with_dns(
             &config_path.to_string_lossy(),
             proxy_port,
