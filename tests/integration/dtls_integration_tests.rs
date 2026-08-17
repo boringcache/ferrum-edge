@@ -1297,6 +1297,16 @@ async fn dtls12_client_handshake_on(
 /// currently accepted CA must still complete and relay.
 #[tokio::test]
 async fn test_frontend_dtls_refuses_untrusted_client_without_completing_the_handshake() {
+    // The session driver deliberately records packet-processing failures at
+    // TRACE because malformed datagrams are hostile input in production. Keep
+    // this integration test diagnosable in hosted CI without raising the
+    // production log level or turning transient infrastructure failures into
+    // blind reruns.
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter("ferrum_edge::dtls=trace")
+        .with_test_writer()
+        .try_init();
+
     let _ =
         rustls::crypto::CryptoProvider::install_default(rustls::crypto::ring::default_provider());
 
