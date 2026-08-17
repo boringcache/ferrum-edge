@@ -24,6 +24,13 @@
 //! does **not** insert registry rows, so a derived-only name cannot be the
 //! durable authority for "a namespace still exists". `GET /namespaces` stays
 //! the backward-compatible union of registry names and derived resource names.
+//!
+//! Connect/migrate runs a **one-time** compatibility backfill of pre-existing
+//! derived names plus canonical `ferrum`, then durably records completion in
+//! [`SCHEMA_COMPAT_TABLE`]. A failed attempt leaves that marker absent so a
+//! later startup retries. Once complete, later compatibility passes do not
+//! reseed deleted names or materialize newer derived-only names. The marker is
+//! not a registry row and never appears in `GET /namespaces`.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -53,6 +60,18 @@ pub const MAX_NAMESPACE_DESCRIPTION_CHARS: usize = 1024;
 /// requires an alphanumeric first character — so this key is collision-proof
 /// against any tenant's own admission row.
 pub const NAMESPACE_REGISTRY_ADMISSION_KEY: &str = "!namespace-registry";
+
+/// Internal one-time compatibility-state table (SQL) and collection (MongoDB).
+///
+/// This is not a tenant namespace, not a registry row, and is never unioned
+/// into `GET /namespaces`. The leading `_` is illegal as a namespace name
+/// ([`validate_namespace`] requires an alphanumeric first character), so it
+/// cannot collide with tenant data.
+pub const SCHEMA_COMPAT_TABLE: &str = "_ferrum_schema_compat";
+
+/// Completion marker for the one-time namespace-registry compatibility
+/// backfill. Stored as [`SCHEMA_COMPAT_TABLE`].`name` (SQL) / `_id` (MongoDB).
+pub const NAMESPACES_REGISTRY_BACKFILL_ID: &str = "namespaces_registry_backfill";
 
 /// Durable registry row for one tenant namespace.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -593,6 +612,30 @@ pub fn require_namespace_keyed_embedded_namespace(
     match embedded_namespace {
         Some(value) if !value.is_empty() && value == current_key => Ok(()),
         _ => Err(NamespaceRegistryCorrupt::field("namespace")),
+    }
+}
+
+/// Fail closed unless a namespace-keyed document's durable `_id`, embedded
+/// `namespace`, and resource `id` all agree with `current_name`.
+///
+/// `_id` and the embedded namespace must equal `current_name`. The resource
+/// identity must be a nonempty string (it defaults to the namespace but may
+/// be an operator-chosen address). Missing, empty, or mismatched fields are
+/// corruption. The error names the schema field only and never echoes stored
+/// values.
+pub fn require_namespace_keyed_identity(
+    current_name: &str,
+    old_id: &str,
+    embedded_namespace: Option<&str>,
+    resource_id: Option<&str>,
+) -> Result<String, NamespaceRegistryCorrupt> {
+    if old_id.is_empty() || old_id != current_name {
+        return Err(NamespaceRegistryCorrupt::field("identity"));
+    }
+    require_namespace_keyed_embedded_namespace(current_name, embedded_namespace)?;
+    match resource_id {
+        Some(id) if !id.is_empty() => Ok(id.to_string()),
+        _ => Err(NamespaceRegistryCorrupt::field("id")),
     }
 }
 

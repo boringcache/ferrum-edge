@@ -81,9 +81,11 @@ fn test_pool_config() -> DbPoolConfig {
 }
 
 async fn make_store(dir: &TempDir) -> DatabaseStore {
-    let db_path = dir
-        .path()
-        .join(format!("ns-admin-{}.db", uuid::Uuid::new_v4()));
+    make_store_at(dir, &format!("ns-admin-{}", uuid::Uuid::new_v4())).await
+}
+
+async fn make_store_at(dir: &TempDir, name: &str) -> DatabaseStore {
+    let db_path = dir.path().join(format!("{name}.db"));
     let url = format!("sqlite:{}?mode=rwc", db_path.to_string_lossy());
     DatabaseStore::connect_with_pool_config("sqlite", &url, test_pool_config())
         .await
@@ -297,8 +299,9 @@ async fn registry_row_exists(store: &DatabaseStore, name: &str) -> bool {
 }
 
 /// Drop the canonical `ferrum` registry row so a test can create an exact
-/// two-namespace world. The backfill always seeds `ferrum`, and with no
-/// resources under it the name then genuinely no longer exists.
+/// two-namespace world. The one-time compatibility backfill seeds `ferrum` on
+/// first connect; with no resources under it the name then genuinely no longer
+/// exists, and a later reconnect must not resurrect it.
 async fn drop_default_registry_row(store: &DatabaseStore) {
     sqlx::query("DELETE FROM namespaces WHERE name = 'ferrum'")
         .execute(&store.pool())
@@ -1055,6 +1058,68 @@ async fn effective_configured_namespace_is_protected_from_delete_and_rename() {
     assert_eq!(
         status, 204,
         "a non-configured `ferrum` is deletable: {body:?}"
+    );
+}
+
+#[tokio::test]
+async fn deleted_canonical_ferrum_is_not_resurrected_by_later_compatibility_pass() {
+    let dir = TempDir::new().unwrap();
+    let store_name = "ns-ferrum-not-resurrected";
+    let store = Arc::new({
+        let mut store = make_store_at(&dir, store_name).await;
+        store.set_effective_default_namespace("tenant-prod");
+        store
+    });
+    let (base, shutdown) = start_admin(admin_state_from_arc(store.clone())).await;
+    let token = admin_token();
+
+    let (status, body) = send(
+        reqwest::Method::POST,
+        &base,
+        "/namespaces",
+        &token,
+        Some(json!({"name": "tenant-prod"})),
+    )
+    .await;
+    assert_eq!(status, 201, "{body:?}");
+
+    let (status, body) = send(
+        reqwest::Method::DELETE,
+        &base,
+        "/namespaces/ferrum",
+        &token,
+        None,
+    )
+    .await;
+    assert_eq!(
+        status, 204,
+        "a non-configured `ferrum` is deletable: {body:?}"
+    );
+    assert!(
+        !registry_row_exists(store.as_ref(), "ferrum").await,
+        "delete must have removed the canonical registry row"
+    );
+
+    let _ = shutdown.send(true);
+    drop(store);
+
+    let store = {
+        let mut store = make_store_at(&dir, store_name).await;
+        store.set_effective_default_namespace("tenant-prod");
+        store
+    };
+    assert!(
+        registry_row_exists(&store, "tenant-prod").await,
+        "the remaining registry row must survive reconnect"
+    );
+    assert!(
+        !registry_row_exists(&store, "ferrum").await,
+        "a later connect/migrate compatibility pass must not resurrect deleted ferrum"
+    );
+    let listed = store.list_namespaces().await.unwrap();
+    assert!(
+        !listed.iter().any(|item| item == "ferrum"),
+        "GET /namespaces must not resurrect deleted ferrum: {listed:?}"
     );
 }
 

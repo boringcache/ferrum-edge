@@ -268,6 +268,9 @@ impl V001SqlBuilder {
             // exist before any resource row is written; GET /namespaces unions
             // this table with the derived resource-table names.
             self.create_namespaces_sql(),
+            // One-time compatibility-state for folded-in baseline work such as
+            // the namespace-registry backfill. Not a tenant table.
+            self.create_schema_compat_sql(),
         ] {
             sqlx::query(sql).execute(&mut *connection).await?;
         }
@@ -620,8 +623,16 @@ impl V001SqlBuilder {
         }
     }
 
-    /// Idempotent create + backfill for databases that recorded V001 before
-    /// the registry table was folded into the baseline.
+    /// Idempotent create + one-time backfill for databases that recorded V001
+    /// before the registry table was folded into the baseline.
+    ///
+    /// The first successful compatibility pass inserts every pre-existing
+    /// derived namespace plus canonical `ferrum`, then durably marks the
+    /// backfill complete in `_ferrum_schema_compat`. A failed or partial
+    /// attempt leaves that marker absent so a later startup retries
+    /// idempotently. Once the marker is present, later connect/migrate/
+    /// reconnect/startup passes do not reseed deleted names or materialize
+    /// newer derived-only names.
     async fn ensure_namespaces_registry(
         &self,
         connection: &mut AnyConnection,
@@ -629,13 +640,81 @@ impl V001SqlBuilder {
         sqlx::query(self.create_namespaces_sql())
             .execute(&mut *connection)
             .await?;
+        sqlx::query(self.create_schema_compat_sql())
+            .execute(&mut *connection)
+            .await?;
         self.backfill_namespaces_registry(connection).await
+    }
+
+    fn create_schema_compat_sql(&self) -> &'static str {
+        if self.is_mysql() {
+            r#"
+            CREATE TABLE IF NOT EXISTS _ferrum_schema_compat (
+                name VARCHAR(255) NOT NULL,
+                completed_at VARCHAR(64) NOT NULL,
+                PRIMARY KEY (name)
+            )
+            "#
+        } else {
+            r#"
+            CREATE TABLE IF NOT EXISTS _ferrum_schema_compat (
+                name TEXT NOT NULL,
+                completed_at TEXT NOT NULL,
+                PRIMARY KEY (name)
+            )
+            "#
+        }
+    }
+
+    async fn namespaces_registry_backfill_completed(
+        &self,
+        connection: &mut AnyConnection,
+    ) -> Result<bool, anyhow::Error> {
+        let sql = if self.is_mysql() || self.is_sqlite() {
+            "SELECT 1 FROM _ferrum_schema_compat WHERE name = ? LIMIT 1"
+        } else {
+            "SELECT 1 FROM _ferrum_schema_compat WHERE name = $1 LIMIT 1"
+        };
+        Ok(sqlx::query(sql)
+            .bind(crate::config::namespace_registry::NAMESPACES_REGISTRY_BACKFILL_ID)
+            .fetch_optional(&mut *connection)
+            .await?
+            .is_some())
+    }
+
+    async fn mark_namespaces_registry_backfill_complete(
+        &self,
+        connection: &mut AnyConnection,
+        completed_at: &str,
+    ) -> Result<(), anyhow::Error> {
+        let insert_marker = if self.is_mysql() {
+            "INSERT IGNORE INTO _ferrum_schema_compat (name, completed_at) VALUES (?, ?)"
+        } else if self.is_sqlite() {
+            "INSERT INTO _ferrum_schema_compat (name, completed_at) VALUES (?, ?) \
+             ON CONFLICT (name) DO NOTHING"
+        } else {
+            "INSERT INTO _ferrum_schema_compat (name, completed_at) VALUES ($1, $2) \
+             ON CONFLICT (name) DO NOTHING"
+        };
+        sqlx::query(insert_marker)
+            .bind(crate::config::namespace_registry::NAMESPACES_REGISTRY_BACKFILL_ID)
+            .bind(completed_at)
+            .execute(&mut *connection)
+            .await?;
+        Ok(())
     }
 
     async fn backfill_namespaces_registry(
         &self,
         connection: &mut AnyConnection,
     ) -> Result<(), anyhow::Error> {
+        if self
+            .namespaces_registry_backfill_completed(connection)
+            .await?
+        {
+            return Ok(());
+        }
+
         let now = chrono::Utc::now().to_rfc3339();
         // Postgres native placeholders are `$1..$n`; a trailing `?` is a
         // syntax error. MySQL has no `ON CONFLICT` — `INSERT IGNORE` is the
@@ -692,12 +771,21 @@ impl V001SqlBuilder {
         // the backfill must not read the process environment, and a
         // deployment-specific `FERRUM_NAMESPACE` that has no resources yet is
         // created through `POST /namespaces`. Ordinary resource writes isolate
-        // data under a derived name but do not insert a registry row.
+        // data under a derived name but do not insert a registry row. This
+        // insert runs only on the first compatibility pass; later startups
+        // see the completion marker and must not resurrect a deleted `ferrum`.
         sqlx::query(insert_default)
             .bind(crate::config::types::DEFAULT_NAMESPACE)
             .bind(&now)
             .bind(&now)
             .execute(&mut *connection)
+            .await?;
+
+        // Marker last: a crash before this write leaves completion absent so
+        // the next serialized compatibility pass retries the idempotent
+        // inserts. This must not be a namespaces row — GET /namespaces would
+        // then list it as a tenant.
+        self.mark_namespaces_registry_backfill_complete(connection, &now)
             .await?;
         Ok(())
     }
@@ -1779,6 +1867,60 @@ mod tests {
         let sql = builder.create_namespaces_sql();
         assert_columns_have_collation(sql, "namespaces", &["name"]);
         assert!(sql.contains("PRIMARY KEY (name)"));
+    }
+
+    #[test]
+    fn schema_compat_table_is_internal_and_keyed_by_name() {
+        for dialect in ["postgres", "mysql", "sqlite"] {
+            let sql = V001SqlBuilder::new(dialect).create_schema_compat_sql();
+            assert!(
+                sql.contains("CREATE TABLE IF NOT EXISTS _ferrum_schema_compat"),
+                "{dialect} must fold the compatibility-state table into the baseline"
+            );
+            assert!(
+                sql.contains("PRIMARY KEY (name)"),
+                "{dialect} must key completion markers by name, not as a namespaces row"
+            );
+            assert!(
+                !sql.contains("namespaces ("),
+                "{dialect} must not store compatibility state in the tenant registry"
+            );
+        }
+    }
+
+    #[test]
+    fn namespaces_registry_backfill_is_gated_by_schema_compat_marker() {
+        let source = include_str!("sql_dialect.rs");
+        let start = source
+            .find("async fn backfill_namespaces_registry(")
+            .expect("backfill helper");
+        let body = &source[start..];
+        let end = body
+            .find("\n    /// Authoritative namespace-keyed")
+            .unwrap_or(body.len());
+        let body = &body[..end];
+        let completed_at = body
+            .find("namespaces_registry_backfill_completed")
+            .expect("completion check");
+        let insert_at = body
+            .find("insert_derived")
+            .expect("derived-name insert");
+        let mark_at = body
+            .find("mark_namespaces_registry_backfill_complete")
+            .expect("completion mark");
+        assert!(
+            completed_at < insert_at,
+            "a completed backfill must skip inserts:\n{body}"
+        );
+        assert!(
+            insert_at < mark_at,
+            "the marker must be written after the idempotent inserts so a crash retries:\n{body}"
+        );
+        assert!(
+            body.contains("NAMESPACES_REGISTRY_BACKFILL_ID")
+                && body.contains("_ferrum_schema_compat"),
+            "completion must live in the internal compatibility table:\n{body}"
+        );
     }
 
     #[test]

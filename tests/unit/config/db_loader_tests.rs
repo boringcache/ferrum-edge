@@ -2268,6 +2268,26 @@ async fn seed_namespace_trust_bundle_only(store: &DatabaseStore, namespace: &str
     .unwrap();
 }
 
+async fn registry_row_exists(store: &DatabaseStore, name: &str) -> bool {
+    sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM namespaces WHERE name = ?")
+        .bind(name)
+        .fetch_one(&store.pool())
+        .await
+        .unwrap()
+        > 0
+}
+
+async fn namespace_registry_backfill_completed(store: &DatabaseStore) -> bool {
+    sqlx::query_scalar::<_, i64>(
+        "SELECT COUNT(*) FROM _ferrum_schema_compat WHERE name = ?",
+    )
+    .bind(ferrum_edge::config::namespace_registry::NAMESPACES_REGISTRY_BACKFILL_ID)
+    .fetch_one(&store.pool())
+    .await
+    .unwrap()
+    > 0
+}
+
 #[tokio::test]
 async fn list_namespaces_paginated_empty_store_returns_default_ferrum() {
     let temp_dir = tempfile::TempDir::new().unwrap();
@@ -2448,6 +2468,98 @@ async fn list_namespaces_paginated_includes_trust_bundle_only_namespace() {
     assert_eq!(second.total, 4);
 }
 
+#[tokio::test]
+async fn namespace_registry_backfill_is_one_time_and_does_not_reseed() {
+    let temp_dir = tempfile::TempDir::new().unwrap();
+    let name = "ns-backfill-once";
+    let store = connect_namespaces_test_store(&temp_dir, name).await;
+    assert!(
+        registry_row_exists(&store, "ferrum").await,
+        "first-run backfill must still seed canonical ferrum"
+    );
+    assert!(
+        namespace_registry_backfill_completed(&store).await,
+        "first-run backfill must durably mark completion"
+    );
+    let listed = store.list_namespaces().await.unwrap();
+    assert!(listed.contains(&"ferrum".to_string()));
+    assert!(
+        !listed.iter().any(|item| item == "_ferrum_schema_compat"
+            || item
+                == ferrum_edge::config::namespace_registry::NAMESPACES_REGISTRY_BACKFILL_ID),
+        "compatibility state must never appear in GET /namespaces: {listed:?}"
+    );
+
+    seed_namespace_upstream(&store, "derived-only", "up-derived").await;
+    assert!(
+        !registry_row_exists(&store, "derived-only").await,
+        "ordinary resource writes must not insert a registry row"
+    );
+    drop(store);
+
+    let store = connect_namespaces_test_store(&temp_dir, name).await;
+    assert!(registry_row_exists(&store, "ferrum").await);
+    assert!(
+        !registry_row_exists(&store, "derived-only").await,
+        "a later compatibility pass must not materialize newer derived-only names"
+    );
+    let listed = store.list_namespaces().await.unwrap();
+    assert!(
+        listed.contains(&"derived-only".to_string()),
+        "GET /namespaces remains the union of registry and derived names: {listed:?}"
+    );
+
+    sqlx::query("DELETE FROM namespaces WHERE name = 'ferrum'")
+        .execute(&store.pool())
+        .await
+        .unwrap();
+    assert!(!registry_row_exists(&store, "ferrum").await);
+    drop(store);
+
+    let store = connect_namespaces_test_store(&temp_dir, name).await;
+    assert!(
+        !registry_row_exists(&store, "ferrum").await,
+        "a later compatibility pass must not resurrect a deleted ferrum row"
+    );
+    assert!(!registry_row_exists(&store, "derived-only").await);
+    assert!(namespace_registry_backfill_completed(&store).await);
+}
+
+#[tokio::test]
+async fn unmarked_namespace_registry_backfill_retries_idempotently() {
+    let temp_dir = tempfile::TempDir::new().unwrap();
+    let name = "ns-backfill-retry";
+    let store = connect_namespaces_test_store(&temp_dir, name).await;
+    sqlx::query("DELETE FROM _ferrum_schema_compat")
+        .execute(&store.pool())
+        .await
+        .unwrap();
+    sqlx::query("DELETE FROM namespaces WHERE name = 'ferrum'")
+        .execute(&store.pool())
+        .await
+        .unwrap();
+    seed_namespace_upstream(&store, "legacy", "up-legacy").await;
+    assert!(
+        !namespace_registry_backfill_completed(&store).await,
+        "clearing the marker simulates an interrupted first-run attempt"
+    );
+    drop(store);
+
+    let store = connect_namespaces_test_store(&temp_dir, name).await;
+    assert!(
+        namespace_registry_backfill_completed(&store).await,
+        "an unmarked attempt must remain retryable"
+    );
+    assert!(
+        registry_row_exists(&store, "ferrum").await,
+        "retry must still seed canonical ferrum"
+    );
+    assert!(
+        registry_row_exists(&store, "legacy").await,
+        "retry must still insert pre-existing derived names"
+    );
+}
+
 /// Source-level drift guard: issue #3727 trust bundles are a namespaced
 /// resource and must participate in both list and paginated list unions.
 #[test]
@@ -2466,6 +2578,10 @@ fn list_namespaces_sql_unions_gateway_trust_bundles() {
     assert!(
         list_body.contains("SELECT name FROM namespaces"),
         "list_namespaces_from_pool must union the namespaces registry"
+    );
+    assert!(
+        !list_body.contains("_ferrum_schema_compat"),
+        "compatibility-state rows must not appear in GET /namespaces"
     );
 
     let page_body = source

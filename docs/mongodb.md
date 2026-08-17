@@ -337,11 +337,20 @@ transaction so a lost or stolen lease can never produce a durable write.
 The backend also requires the exact canonical lease-key sequence (global
 `!namespace-registry` first, then affected names sorted and de-duplicated)
 before opening that transaction; an incomplete or substituted set is the same
-retryable lost-lease refusal. Confirmed cascade delete scans both the embedded
+retryable lost-lease refusal. Connect/migrate runs a **one-time** compatibility
+backfill of pre-existing derived names plus canonical `ferrum`, then records
+completion in `_ferrum_schema_compat` (not a registry document). A failed
+attempt leaves that marker absent so a later startup retries; once complete,
+later migrate/reconnect/startup passes do not reseed deleted names. Confirmed
+cascade delete scans both the embedded
 `namespace` field and the durable key identity for consumers, the consumer
 identity index, and the gateway trust bundle, and aborts as typed registry
 corruption if those identities disagree, so a key-only or mismatched document
-cannot be ignored or deleted under the wrong tenant. Historical `audit_events`
+cannot be ignored or deleted under the wrong tenant. Rename uses the same
+split-identity scan for the gateway trust bundle before rewriting anything:
+`_id`, embedded `namespace`, and resource `id` must agree with the source
+namespace, or the whole transaction aborts as typed corruption and never
+rewrites another tenant's document. Historical `audit_events`
 documents are immutable evidence and are **not**
 bulk-rewritten on rename: they retain the namespace recorded when the event
 occurred. A namespace name is therefore a durable audit identity: reusing a

@@ -5,14 +5,15 @@ use ferrum_edge::config::batch_atomicity::{
     NamespaceConfigAdmissionLeaseRef,
 };
 use ferrum_edge::config::namespace_registry::{
-    CreateNamespaceRequest, MAX_NAMESPACE_DESCRIPTION_CHARS, NAMESPACE_OCCUPANCY_TABLES,
-    NAMESPACE_REGISTRY_ADMISSION_KEY, NAMESPACE_RENAME_SIMPLE_TABLES, NamespaceRegistryCorrupt,
-    UpdateNamespaceBody, mtls_dns_admission_namespaces, namespace_prefixed_id_suffix_field,
+    CreateNamespaceRequest, MAX_NAMESPACE_DESCRIPTION_CHARS, NAMESPACES_REGISTRY_BACKFILL_ID,
+    NAMESPACE_OCCUPANCY_TABLES, NAMESPACE_REGISTRY_ADMISSION_KEY, NAMESPACE_RENAME_SIMPLE_TABLES,
+    NamespaceRegistryCorrupt, SCHEMA_COMPAT_TABLE, UpdateNamespaceBody,
+    mtls_dns_admission_namespaces, namespace_prefixed_id_suffix_field,
     namespace_registry_admission_keys, normalize_description, parse_namespace_rfc3339,
     require_canonical_stored_description, require_namespace_identity,
-    require_namespace_keyed_embedded_namespace, require_namespace_prefixed_identity,
-    require_namespace_registry_admission_keys, require_namespace_registry_admission_leases,
-    validate_namespace_name,
+    require_namespace_keyed_embedded_namespace, require_namespace_keyed_identity,
+    require_namespace_prefixed_identity, require_namespace_registry_admission_keys,
+    require_namespace_registry_admission_leases, validate_namespace_name,
 };
 
 #[test]
@@ -400,6 +401,66 @@ fn require_namespace_keyed_embedded_namespace_is_strict() {
             "stored namespace must not leak: {text}"
         );
     }
+}
+
+#[test]
+fn require_namespace_keyed_identity_requires_id_namespace_and_resource() {
+    assert_eq!(
+        require_namespace_keyed_identity("ns", "ns", Some("ns"), Some("bundle")).unwrap(),
+        "bundle"
+    );
+    assert_eq!(
+        require_namespace_keyed_identity("ns", "ns", Some("ns"), Some("ns")).unwrap(),
+        "ns",
+        "an operator-chosen resource id may equal the namespace"
+    );
+
+    let other_key = require_namespace_keyed_identity(
+        "secret-ns",
+        "other-tenant",
+        Some("secret-ns"),
+        Some("bundle"),
+    )
+    .expect_err("a foreign durable _id must abort");
+    let text = other_key.to_string();
+    assert!(text.contains("identity"), "{text}");
+    assert!(!text.contains("secret") && !text.contains("other-tenant") && !text.contains("bundle"));
+
+    let embedded = require_namespace_keyed_identity(
+        "secret-ns",
+        "secret-ns",
+        Some("other-tenant"),
+        Some("bundle"),
+    )
+    .expect_err("embedded namespace mismatch must abort");
+    let text = embedded.to_string();
+    assert!(text.contains("namespace"), "{text}");
+    assert!(!text.contains("secret") && !text.contains("other-tenant"));
+
+    for resource in [None, Some("")] {
+        let err = require_namespace_keyed_identity(
+            "secret-ns",
+            "secret-ns",
+            Some("secret-ns"),
+            resource,
+        )
+        .expect_err("missing resource identity must abort");
+        let text = err.to_string();
+        assert!(text.contains("id"), "{text}");
+        assert!(!text.contains("secret"));
+    }
+}
+
+#[test]
+fn schema_compat_marker_cannot_collide_with_tenant_namespaces() {
+    assert!(
+        validate_namespace_name(SCHEMA_COMPAT_TABLE).is_err(),
+        "compatibility-state table must be an invalid namespace name"
+    );
+    assert!(
+        validate_namespace_name(NAMESPACES_REGISTRY_BACKFILL_ID).is_ok(),
+        "the backfill id is a legal namespace spelling, so it must live outside the registry"
+    );
 }
 
 #[test]

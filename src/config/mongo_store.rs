@@ -107,12 +107,12 @@ mod inner {
         default_index_name, required_mongo_indexes,
     };
     use crate::config::namespace_registry::{
-        DERIVED_NAMESPACE_RESOURCE_TABLES, NAMESPACE_OCCUPANCY_TABLES, NamespaceRecord,
-        NamespaceRegistryAtomicityUnsupported, NamespaceRegistryCorrupt,
-        NamespaceRegistryError as RegistryError, NamespaceRegistryPhase,
-        namespace_prefixed_id_suffix_field, namespace_registry_fault, parse_namespace_rfc3339,
-        require_canonical_stored_description, require_namespace_identity,
-        require_namespace_keyed_embedded_namespace, require_namespace_prefixed_identity,
+        DERIVED_NAMESPACE_RESOURCE_TABLES, NAMESPACES_REGISTRY_BACKFILL_ID,
+        NAMESPACE_OCCUPANCY_TABLES, NamespaceRecord, NamespaceRegistryAtomicityUnsupported,
+        NamespaceRegistryCorrupt, NamespaceRegistryError as RegistryError, NamespaceRegistryPhase,
+        SCHEMA_COMPAT_TABLE, namespace_prefixed_id_suffix_field, namespace_registry_fault,
+        parse_namespace_rfc3339, require_canonical_stored_description, require_namespace_identity,
+        require_namespace_keyed_identity, require_namespace_prefixed_identity,
         require_namespace_registry_admission_keys, require_namespace_registry_admission_leases,
     };
     use regex::escape as regex_escape;
@@ -2809,6 +2809,12 @@ mod inner {
             self.collection("namespaces")
         }
 
+        /// One-time compatibility-state documents. Not a tenant collection and
+        /// never listed by `GET /namespaces`.
+        fn schema_compat(&self) -> MongoCollectionHandle {
+            self.collection(SCHEMA_COMPAT_TABLE)
+        }
+
         fn audit_events(&self) -> MongoCollectionHandle {
             self.collection("audit_events")
         }
@@ -5416,6 +5422,12 @@ mod inner {
                 NamespaceRegistryPhase::Start,
             )?;
             let name = plan.current_name.as_str();
+            if name == plan.protected_default {
+                return Err(Self::namespace_protected_abort(
+                    name,
+                    RegistryError::PROTECTED_PROCESS_DEFAULT,
+                ));
+            }
             if !self
                 .namespace_name_in_use_in_session(&mut *session, name)
                 .await?
@@ -5816,8 +5828,9 @@ mod inner {
 
         /// Scan a namespace-keyed collection on both `_id` and embedded
         /// `namespace`. Any document whose key is missing, non-string, or not
-        /// exactly `namespace`, or whose embedded namespace disagrees, aborts
-        /// as typed corruption before the caller deletes anything.
+        /// exactly `namespace`, whose embedded namespace disagrees, or whose
+        /// resource `id` is missing/empty, aborts as typed corruption before
+        /// the caller mutates anything.
         async fn collect_validated_namespace_keyed_docs_in_session(
             &self,
             session: &mut ClientSession,
@@ -5841,22 +5854,13 @@ mod inner {
                             ))
                         })?
                         .to_string();
-                    if old_id != namespace {
-                        return Err(mongodb::error::Error::custom(
-                            NamespaceRegistryCorrupt::field("identity"),
-                        ));
-                    }
-                    require_namespace_keyed_embedded_namespace(
+                    let resource_id = require_namespace_keyed_identity(
                         namespace,
+                        &old_id,
                         document.get_str("namespace").ok(),
+                        document.get_str("id").ok(),
                     )
                     .map_err(mongodb::error::Error::custom)?;
-                    let resource_id = document
-                        .get_str("id")
-                        .map_err(|_| {
-                            mongodb::error::Error::custom(NamespaceRegistryCorrupt::field("id"))
-                        })?
-                        .to_string();
                     validated.push((old_id, resource_id));
                 }
             }
@@ -6044,6 +6048,17 @@ mod inner {
             record: &NamespaceRecord,
             fault: Option<NamespaceRegistryPhase>,
         ) -> mongodb::error::Result<()> {
+            // Scan both gateway-trust identity surfaces before rewriting
+            // anything: a document with `_id = other` and `namespace =
+            // current_name` is occupancy but must abort as corruption rather
+            // than being left behind while the rest of the tenant commits.
+            self.collect_validated_namespace_keyed_docs_in_session(
+                &mut *session,
+                "gateway_trust_bundles",
+                current_name,
+            )
+            .await?;
+
             self.namespaces()
                 .delete_one(doc! { "_id": current_name })
                 .session(&mut *session)
@@ -6271,6 +6286,12 @@ mod inner {
         }
 
         /// Move a document whose `_id` IS a namespace-derived key.
+        ///
+        /// Both identity surfaces (`_id` and embedded `namespace`) are scanned
+        /// and validated before any rewrite. A document that occupancy can see
+        /// via the embedded field but whose durable `_id` belongs to another
+        /// tenant aborts the whole transaction as typed corruption and is
+        /// never rewritten or deleted.
         async fn move_namespace_keyed_document_in_session(
             &self,
             session: &mut ClientSession,
@@ -6279,17 +6300,37 @@ mod inner {
             new_id: &str,
             new_namespace: &str,
         ) -> mongodb::error::Result<()> {
+            let validated = self
+                .collect_validated_namespace_keyed_docs_in_session(
+                    &mut *session,
+                    collection_name,
+                    current_id,
+                )
+                .await?;
+            if validated.is_empty() {
+                return Ok(());
+            }
+            // Validation already required `_id == current_id`. Load and move
+            // only that durable key so a mismatched document cannot be
+            // rewritten onto another tenant.
             let collection = self.collection(collection_name);
             let Some(mut document) = collection
                 .find_one(doc! { "_id": current_id })
                 .session(&mut *session)
                 .await?
             else {
-                return Ok(());
+                return Err(mongodb::error::Error::custom(
+                    NamespaceRegistryCorrupt::field("identity"),
+                ));
             };
-            require_namespace_keyed_embedded_namespace(
+            let loaded_id = document.get_str("_id").map_err(|_| {
+                mongodb::error::Error::custom(NamespaceRegistryCorrupt::field("identity"))
+            })?;
+            require_namespace_keyed_identity(
                 current_id,
+                loaded_id,
                 document.get_str("namespace").ok(),
+                document.get_str("id").ok(),
             )
             .map_err(mongodb::error::Error::custom)?;
             document.insert("_id", new_id);
@@ -15104,6 +15145,9 @@ mod inner {
         }
 
         async fn backfill_namespaces_registry(&self) -> Result<(), anyhow::Error> {
+            if self.namespaces_registry_backfill_completed().await? {
+                return Ok(());
+            }
             let now = Utc::now().to_rfc3339();
             let mut names = HashSet::new();
             for &collection in DERIVED_NAMESPACE_RESOURCE_TABLES {
@@ -15116,7 +15160,7 @@ mod inner {
             // deployment-specific `FERRUM_NAMESPACE` that has no resources yet
             // is created through `POST /namespaces`. Ordinary resource writes
             // isolate data under a derived name but do not insert a registry
-            // row.
+            // row. This insert runs only on the first compatibility pass.
             names.insert(crate::config::types::DEFAULT_NAMESPACE.to_string());
             for name in names {
                 let _ = self
@@ -15134,6 +15178,37 @@ mod inner {
                     .upsert(true)
                     .await?;
             }
+            // Marker last, and never as a namespaces document: a crash before
+            // this write leaves completion absent so the next serialized
+            // compatibility pass retries the idempotent upserts.
+            self.mark_namespaces_registry_backfill_complete(&now).await?;
+            Ok(())
+        }
+
+        async fn namespaces_registry_backfill_completed(&self) -> Result<bool, anyhow::Error> {
+            Ok(self
+                .schema_compat()
+                .find_one(doc! { "_id": NAMESPACES_REGISTRY_BACKFILL_ID })
+                .await?
+                .is_some())
+        }
+
+        async fn mark_namespaces_registry_backfill_complete(
+            &self,
+            completed_at: &str,
+        ) -> Result<(), anyhow::Error> {
+            let _ = self
+                .schema_compat()
+                .update_one(
+                    doc! { "_id": NAMESPACES_REGISTRY_BACKFILL_ID },
+                    doc! {
+                        "$setOnInsert": {
+                            "completed_at": completed_at,
+                        }
+                    },
+                )
+                .upsert(true)
+                .await?;
             Ok(())
         }
 
