@@ -295,7 +295,11 @@ SUITE_PATTERNS: dict[str, list[str]] = {
     # scope (the `ci_runtime_plan.py` `node-waypoint-ebpf-live` suite, which
     # `verify_ci_runtime_cache.py` proves is a subset of this list) plus the
     # trusted classifier script itself, so a pull request that edits relevance
-    # cannot skip the suite after this contract lands.
+    # cannot skip the suite after this contract lands, plus the local composite
+    # actions the live job actually executes (see
+    # SUITE_LOCAL_ACTION_DEPENDENCIES) — the retired `paths:` list named none of
+    # the toolchain/linker actions, so an edit to one of them could change what
+    # the live datapath compiled without ever re-running it.
     #
     # Deliberately NOT here, matching the retired scope: the production-image
     # broadening (`src/**`, `vendor/**`, `.cargo/**`, `rust-toolchain.toml`,
@@ -309,6 +313,13 @@ SUITE_PATTERNS: dict[str, list[str]] = {
         r"^\.dockerignore$",
         r"^\.github/actions/package-ferrum-runtime-image/",
         r"^\.github/actions/setup-kubernetes-tools/",
+        # The live job's own build toolchain: `setup-rust-ci` (which itself
+        # runs `setup-sccache` and `setup-fast-linker`) and the
+        # `setup-bpf-linker` install the nightly BPF ELF build needs.
+        r"^\.github/actions/setup-bpf-linker/",
+        r"^\.github/actions/setup-fast-linker/",
+        r"^\.github/actions/setup-rust-ci/",
+        r"^\.github/actions/setup-sccache/",
         r"^Cargo\.(toml|lock)$",
         r"^Dockerfile$",
         r"^Dockerfile\.iproute2-layer$",
@@ -346,12 +357,17 @@ SUITE_PATTERNS: dict[str, list[str]] = {
         *exact_path_patterns(NODE_WAYPOINT_EBPF_DOCUMENTATION_PATHS),
     ],
     # Istio status CAS competing-writer live proof. Kept to the retired
-    # workflow-level `paths:` list plus the trusted classifier script.
+    # workflow-level `paths:` list plus the trusted classifier script and the
+    # local composite actions the live job executes: the retired list named
+    # `setup-rust-ci` but not the `setup-sccache` / `setup-fast-linker` actions
+    # it runs, which decide how the live test binary is compiled and linked.
     "istio-status-cas": [
         r"^\.github/workflows/istio-status-cas-live\.yml$",
         r"^\.github/scripts/live_suite_path_filter\.py$",
         r"^\.github/actions/setup-kubernetes-tools/",
+        r"^\.github/actions/setup-fast-linker/",
         r"^\.github/actions/setup-rust-ci/",
+        r"^\.github/actions/setup-sccache/",
         r"^src/k8s_controller/istio_status\.rs$",
         r"^src/k8s_controller/metrics\.rs$",
         r"^tests/k8s_istio_status_cas_live\.rs$",
@@ -359,12 +375,18 @@ SUITE_PATTERNS: dict[str, list[str]] = {
         *exact_path_patterns(ISTIO_STATUS_CAS_DOCUMENTATION_PATHS),
     ],
     # CNI install lifecycle live recovery. Chart matches stay exact-path, not
-    # the whole Helm tree, so unrelated chart edits keep the previous cost.
+    # the whole Helm tree, so unrelated chart edits keep the previous cost. The
+    # retired `paths:` list named neither `setup-rust-ci` nor the
+    # `setup-sccache` / `setup-fast-linker` actions it runs, even though they
+    # build the `ferrum-edge` and `ferrum-cni` binaries this suite installs.
     "cni-lifecycle": [
         r"^\.github/workflows/cni-lifecycle-live\.yml$",
         r"^\.github/scripts/live_suite_path_filter\.py$",
         r"^\.github/actions/package-ferrum-runtime-image/",
         r"^\.github/actions/setup-kubernetes-tools/",
+        r"^\.github/actions/setup-fast-linker/",
+        r"^\.github/actions/setup-rust-ci/",
+        r"^\.github/actions/setup-sccache/",
         r"^Cargo\.(toml|lock)$",
         r"^build\.rs$",
         r"^proto/",
@@ -388,8 +410,132 @@ COMPILED = {
 }
 
 
+# Local composite actions each newly migrated live job executes, directly or
+# through `setup-rust-ci` (whose own steps run `setup-sccache` and
+# `setup-fast-linker`). These are direct execution dependencies of the live
+# job, so an edit to one must re-run the suite; the retired workflow-level
+# `paths:` lists covered them only partially.
+# `local_action_dependency_self_test` proves every entry here stays classified
+# by its suite, so the list cannot drift away from the patterns.
+#
+# This is a declared list rather than one scraped from the workflow on disk on
+# purpose: the self-test runs from the TRUSTED BASE copy against the pull
+# request's checkout, so deriving it from the candidate workflow would make the
+# very pull request that adds a new `uses: ./.github/actions/...` step
+# unmergeable until its own patterns were already on `main`.
+SUITE_LOCAL_ACTION_DEPENDENCIES: dict[str, tuple[str, ...]] = {
+    "node-waypoint-ebpf": (
+        "package-ferrum-runtime-image",
+        "setup-bpf-linker",
+        "setup-fast-linker",
+        "setup-kubernetes-tools",
+        "setup-rust-ci",
+        "setup-sccache",
+    ),
+    "istio-status-cas": (
+        "setup-fast-linker",
+        "setup-kubernetes-tools",
+        "setup-rust-ci",
+        "setup-sccache",
+    ),
+    "cni-lifecycle": (
+        "package-ferrum-runtime-image",
+        "setup-fast-linker",
+        "setup-kubernetes-tools",
+        "setup-rust-ci",
+        "setup-sccache",
+    ),
+}
+
+
+# Acknowledgement token printed alongside the verdict. The governed relevance
+# job requires it to be exactly this value before it will honor a `false`
+# verdict, so a trusted base that predates the NUL change set (and would read
+# the whole stream as one unmatched newline record) forces the live suite to
+# run instead of silently declaring irrelevance.
+CHANGED_FILES_TRANSPORT = "nul"
+
+# Conservative repository-relative charset, deliberately identical to the PR CI
+# planner's `CLASSIFIABLE_PATH_RE`. C0/C1 controls, DEL, newlines, tabs,
+# backslashes, backticks, and other shell/Markdown metacharacters are rejected
+# by omission, so a hostile Git pathname cannot split, quote, or interpolate its
+# way past a live-suite pattern.
+CLASSIFIABLE_PATH_RE = re.compile(r"^[A-Za-z0-9._+@~ /-]{1,4096}$")
+
+
+class ChangedFileStreamError(ValueError):
+    """A change-set record the trusted classifier refuses to interpret."""
+
+
+def is_classifiable_repo_path(path: str) -> bool:
+    """Return whether one decoded record is a normal repository-relative path.
+
+    `PurePosixPath.parts` collapses empty components, so classification splits
+    on `/` itself. Surrounding whitespace, absolute paths, trailing slashes,
+    empty / `.` / `..` components, and anything outside the conservative
+    charset fail closed.
+    """
+
+    if path != path.strip():
+        return False
+    if not CLASSIFIABLE_PATH_RE.fullmatch(path):
+        return False
+    if path.startswith("/") or path.endswith("/"):
+        return False
+    parts = path.split("/")
+    return bool(parts) and all(part not in {"", ".", ".."} for part in parts)
+
+
+def decode_changed_files(data: bytes) -> list[str]:
+    """Decode a `git diff --name-only --no-renames -z` change set.
+
+    Relevance decides whether a live gate runs at all, so a record that cannot
+    be decoded must never be silently dropped: dropping one makes the suite
+    look irrelevant and skips the gate. Every non-empty stream must therefore
+    be a canonical NUL-terminated sequence of strictly decodable, normal,
+    repository-relative pathnames, and any framing, encoding, or shape failure
+    raises `ChangedFileStreamError` for the caller to turn into a non-zero
+    exit. A genuinely empty diff yields an empty list.
+
+    Pathname bytes are never normalized or stripped into a different path, and
+    hostile record bytes are never echoed back — errors name the record index
+    and the reason only.
+    """
+
+    if not data:
+        return []
+    if not data.endswith(b"\0"):
+        raise ChangedFileStreamError(
+            "change set is not NUL-terminated; a truncated stream or a "
+            "line-delimited listing must never be classified"
+        )
+    records = data.split(b"\0")[:-1]
+    if not records:
+        raise ChangedFileStreamError("change set holds no records")
+    paths: list[str] = []
+    for index, record in enumerate(records):
+        if not record:
+            raise ChangedFileStreamError(
+                f"change-set record {index} is empty; the stream is not a "
+                "canonical NUL-delimited pathname list"
+            )
+        try:
+            path = record.decode("utf-8")
+        except UnicodeDecodeError:
+            raise ChangedFileStreamError(
+                f"change-set record {index} is not valid UTF-8"
+            ) from None
+        if not is_classifiable_repo_path(path):
+            raise ChangedFileStreamError(
+                f"change-set record {index} is not a normal "
+                "repository-relative pathname"
+            )
+        paths.append(path)
+    return paths
+
+
 def read_changed_files(path: Path) -> list[str]:
-    return [line.strip() for line in path.read_text(encoding="utf-8").splitlines() if line.strip()]
+    return decode_changed_files(path.read_bytes())
 
 
 def matched_files(suite: str, changed_files: list[str]) -> list[str]:
@@ -1281,6 +1427,113 @@ native_probe_running_identity capp
     return failures
 
 
+def changed_file_transport_self_test() -> list[str]:
+    """Prove the NUL change-set transport keeps identity and fails closed.
+
+    Every rejected case below would otherwise be classified as "no relevant
+    file" and skip a live gate. None of them echo the hostile bytes.
+    """
+
+    failures: list[str] = []
+
+    if decode_changed_files(b"") != []:
+        failures.append("an actually empty diff must decode to an empty change set")
+
+    exact = [
+        "src/proxy/mod.rs",
+        ".github/actions/setup-sccache/action.yml",
+        "tests/k8s/node waypoint/run.sh",
+        "docs/plans/node_waypoint_transport_adr.md",
+    ]
+    encoded = b"".join(path.encode("utf-8") + b"\0" for path in exact)
+    decoded = decode_changed_files(encoded)
+    if decoded != exact:
+        failures.append(
+            "ordinary NUL records must retain exact path identity "
+            f"({len(decoded)} record(s) decoded)"
+        )
+
+    rejected = (
+        # Framing.
+        ("unterminated-single-record", b"src/proxy/mod.rs"),
+        ("truncated-after-record", b"src/proxy/mod.rs\0src/ebpf/mod.rs"),
+        ("interior-empty-record", b"src/proxy/mod.rs\0\0src/ebpf/mod.rs\0"),
+        ("empty-record", b"\0"),
+        # A newline-delimited (or `sort`ed) listing is the exact regression
+        # this transport exists to refuse: it can neither represent nor be
+        # distinguished from a pathname that contains a newline.
+        ("line-delimited", b"src/proxy/mod.rs\nsrc/ebpf/mod.rs\n"),
+        (
+            "sorted-line-delimited",
+            b".github/scripts/live_suite_path_filter.py\nsrc/proxy/mod.rs\n",
+        ),
+        ("line-delimited-nul-terminated", b"src/proxy/mod.rs\nsrc/ebpf/mod.rs\0"),
+        # Encoding.
+        ("invalid-utf8", b"src/proxy/\xffmod.rs\0"),
+        ("truncated-utf8-sequence", b"src/proxy/\xc3\0"),
+        # Control / format characters.
+        ("newline-in-name", b"src/proxy/\nmod.rs\0"),
+        ("tab-in-name", b"src/proxy/\tmod.rs\0"),
+        ("carriage-return-in-name", b"src/proxy/\rmod.rs\0"),
+        ("c0-soh-in-name", b"src/proxy/\x01mod.rs\0"),
+        ("c0-us-in-name", b"src/proxy/\x1fmod.rs\0"),
+        ("del-in-name", b"src/proxy/\x7fmod.rs\0"),
+        (
+            "bidi-override-in-name",
+            ("src/proxy/" + chr(0x202E) + "mod.rs").encode("utf-8") + b"\0",
+        ),
+        (
+            "zero-width-joiner-in-name",
+            ("src/proxy/" + chr(0x200D) + "mod.rs").encode("utf-8") + b"\0",
+        ),
+        # Shape.
+        ("absolute", b"/src/proxy/mod.rs\0"),
+        ("traversal", b"src/../../etc/passwd\0"),
+        ("dot-prefix", b"./src/proxy/mod.rs\0"),
+        ("dot-inner", b"src/./proxy/mod.rs\0"),
+        ("empty-component", b"src//proxy/mod.rs\0"),
+        ("trailing-slash", b"src/proxy/\0"),
+        ("leading-space", b" src/proxy/mod.rs\0"),
+        ("trailing-space", b"src/proxy/mod.rs \0"),
+        ("backslash", b"src\\proxy\\mod.rs\0"),
+        ("backtick", b"src/proxy/`mod.rs\0"),
+        # A relevant path smuggled behind an unclassifiable one must still fail
+        # the whole change set rather than being classified alone.
+        (
+            "unclassifiable-alongside-relevant",
+            b".github/scripts/live_suite_path_filter.py\0src/proxy/\nmod.rs\0",
+        ),
+    )
+    for label, data in rejected:
+        try:
+            accepted = decode_changed_files(data)
+        except ChangedFileStreamError:
+            continue
+        failures.append(
+            f"{label} change set must be refused, decoded "
+            f"{len(accepted)} record(s) instead"
+        )
+    return failures
+
+
+def local_action_dependency_self_test() -> list[str]:
+    """Prove every declared local composite action stays suite-relevant."""
+
+    failures: list[str] = []
+    for suite, actions in sorted(SUITE_LOCAL_ACTION_DEPENDENCIES.items()):
+        if suite not in SUITE_PATTERNS:
+            failures.append(f"{suite} has local action dependencies but no patterns")
+            continue
+        for action in sorted(actions):
+            probe = f".github/actions/{action}/action.yml"
+            if not matched_files(suite, [probe]):
+                failures.append(
+                    f"{suite} must stay relevant to local composite action "
+                    f"{probe}; its live job executes it"
+                )
+    return failures
+
+
 def self_test() -> int:
     cases = [
         ("gateway-api", ["src/tls/frontend.rs"], True),
@@ -1379,6 +1632,16 @@ def self_test() -> int:
         ("node-waypoint-ebpf", ["Dockerfile.iproute2-layer"], True),
         ("node-waypoint-ebpf", ["Dockerfile.ebpf-tools-layer"], True),
         ("node-waypoint-ebpf", ["tests/k8s/lib/helpers.sh"], True),
+        # Local composite actions the live job executes (directly, or through
+        # setup-rust-ci, which runs setup-sccache and setup-fast-linker).
+        ("node-waypoint-ebpf", [".github/actions/setup-rust-ci/action.yml"], True),
+        ("node-waypoint-ebpf", [".github/actions/setup-sccache/action.yml"], True),
+        (
+            "node-waypoint-ebpf",
+            [".github/actions/setup-fast-linker/action.yml"],
+            True,
+        ),
+        ("node-waypoint-ebpf", [".github/actions/setup-bpf-linker/action.yml"], True),
         ("node-waypoint-ebpf", ["src/modes/data_plane.rs"], False),
         ("node-waypoint-ebpf", ["docs/admin_api.md"], False),
         ("node-waypoint-ebpf", ["tests/k8s/cni_lifecycle_live/run.sh"], False),
@@ -1407,6 +1670,21 @@ def self_test() -> int:
         ("istio-status-cas", [".github/workflows/istio-status-cas-live.yml"], True),
         ("istio-status-cas", [".github/scripts/live_suite_path_filter.py"], True),
         ("istio-status-cas", [".github/actions/setup-rust-ci/action.yml"], True),
+        ("istio-status-cas", [".github/actions/setup-sccache/action.yml"], True),
+        ("istio-status-cas", [".github/actions/setup-fast-linker/action.yml"], True),
+        (
+            "istio-status-cas",
+            [".github/actions/setup-kubernetes-tools/action.yml"],
+            True,
+        ),
+        # This suite compiles a test binary; it never builds an eBPF ELF or
+        # packages a runtime image, so those actions stay out of scope.
+        ("istio-status-cas", [".github/actions/setup-bpf-linker/action.yml"], False),
+        (
+            "istio-status-cas",
+            [".github/actions/package-ferrum-runtime-image/action.yml"],
+            False,
+        ),
         ("istio-status-cas", ["src/k8s_controller/reconciler.rs"], False),
         ("istio-status-cas", ["docs/ci_cd.md"], False),
         ("cni-lifecycle", ["src/cni/mod.rs"], True),
@@ -1422,6 +1700,16 @@ def self_test() -> int:
         ("cni-lifecycle", ["charts/ferrum-mesh/values.yaml"], True),
         ("cni-lifecycle", ["docs/node_agent_security.md"], True),
         ("cni-lifecycle", ["PRODUCTION_READINESS.md"], True),
+        ("cni-lifecycle", [".github/actions/setup-rust-ci/action.yml"], True),
+        ("cni-lifecycle", [".github/actions/setup-sccache/action.yml"], True),
+        ("cni-lifecycle", [".github/actions/setup-fast-linker/action.yml"], True),
+        (
+            "cni-lifecycle",
+            [".github/actions/package-ferrum-runtime-image/action.yml"],
+            True,
+        ),
+        # The CNI lifecycle job builds no eBPF ELF.
+        ("cni-lifecycle", [".github/actions/setup-bpf-linker/action.yml"], False),
         (
             "cni-lifecycle",
             ["charts/ferrum-mesh/templates/sidecar-injector.yaml"],
@@ -1437,6 +1725,8 @@ def self_test() -> int:
             failures.append(
                 f"{suite} {changed!r}: expected relevant={expected}, got {relevant}"
             )
+    failures.extend(changed_file_transport_self_test())
+    failures.extend(local_action_dependency_self_test())
     failures.extend(native_mtls_fixture_contract_errors(Path.cwd()))
     failures.extend(native_mtls_rotation_observation_self_test())
     failures.extend(native_mtls_negative_control_self_test())
@@ -1458,10 +1748,17 @@ def main() -> int:
     if not args.suite or not args.changed_files:
         parser.error("--suite and --changed-files are required unless --self-test is used")
 
-    changed = read_changed_files(args.changed_files)
+    try:
+        changed = read_changed_files(args.changed_files)
+    except ChangedFileStreamError as exc:
+        # Fail closed loudly rather than classifying a partial change set: a
+        # dropped record is indistinguishable from an irrelevant pull request.
+        print(f"::error::refusing to classify the change set: {exc}", file=sys.stderr)
+        return 1
     matched = matched_files(args.suite, changed)
     relevant = args.force_run or bool(matched)
     print(f"relevant={str(relevant).lower()}")
+    print(f"changed_files_transport={CHANGED_FILES_TRANSPORT}")
     print(f"matched_count={len(matched)}")
     write_summary(args.suite, relevant, changed, matched)
     return 0

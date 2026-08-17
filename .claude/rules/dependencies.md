@@ -46,7 +46,11 @@ Full policy: `docs/dependency-policy.md`. These are the load-bearing rules.
   optional always-reporting aggregates (`node-waypoint-ebpf-live.yml`,
   `istio-status-cas-live.yml`, `cni-lifecycle-live.yml`) — together with each
   live job's `needs`/`if` binding. Optional aggregate names are not
-  branch-protection-required. See `docs/ci_cd.md` → "Trusted-base relevance
+  branch-protection-required. That frozen block hands the change set over as a
+  NUL-delimited `git diff -z` stream (never newline-delimited, `sort`ed, or
+  re-quoted), requires the filter's `changed_files_transport=nul`
+  acknowledgement before it will honor a `false` verdict, and checks out with
+  `persist-credentials: false`. See `docs/ci_cd.md` → "Trusted-base relevance
   for governed live suites".
 - The fuzz/property lane is admitted only as two byte-frozen shapes:
   `CI_FUZZ_SMOKE_JOB` (the whole `fuzz-smoke` job in `ci.yml`) and

@@ -2254,6 +2254,16 @@ def derive_release_family_transition(
 #     and the emitted verdict must literally be `true` or `false`.
 #   * The filter runs under `python3 -I`, so nothing the pull request committed
 #     can be imported into the trusted interpreter.
+#   * The change set is handed over as a NUL-delimited `git diff -z` stream,
+#     never as newline-delimited (and never `sort`ed) text: a newline-delimited
+#     listing cannot represent a pathname containing a newline, and quoting one
+#     instead would classify a different path than the one that changed. The
+#     trusted filter rejects any record it cannot decode as a normal
+#     repository-relative pathname, and its `changed_files_transport=nul`
+#     acknowledgement is required before a `false` verdict may be honored — a
+#     trusted base predating this transport forces the live suite to run.
+#   * The checkout keeps no credentials in Git configuration; the job is
+#     read-only.
 #
 # The template is substituted only at three sentinels — display name, temp-file
 # slug, and suite selector — so every governed workflow runs identical logic.
@@ -2269,6 +2279,11 @@ LIVE_SUITE_RELEVANCE_JOB_TEMPLATE = r"""  changes:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
         with:
           fetch-depth: 0
+          # This job only ever reads: it fetches the base tip and inspects two
+          # commits. Leaving a write-capable token in the checkout's Git
+          # configuration would hand every later step in the job an
+          # authenticated remote it has no need for.
+          persist-credentials: false
 
       # Relevance decides whether a REQUIRED live gate runs at all, so it must
       # never be computed by code the pull request supplies: a PR that widens
@@ -2408,8 +2423,15 @@ LIVE_SUITE_RELEVANCE_JOB_TEMPLATE = r"""  changes:
           git cat-file blob "$entry_object" > "$trusted_filter"
 
           if [ "$EVENT_NAME" = "pull_request" ] || [ "$EVENT_NAME" = "merge_group" ]; then
-            git diff --name-only --no-renames "${trusted_sha}...HEAD" \
-              | sort > "$changed_files"
+            # NUL-delimited, unsorted, and never re-quoted. A newline-delimited
+            # listing cannot represent a pathname that contains a newline, and
+            # C-quoting one (core.quotePath) would hand the classifier a
+            # DIFFERENT path than the one that changed; either way a relevant
+            # file can be made to look like no file at all. The trusted filter
+            # refuses any record it cannot decode as a normal
+            # repository-relative pathname instead of skipping it.
+            git diff --name-only --no-renames -z "${trusted_sha}...HEAD" \
+              > "$changed_files"
           fi
 
           # Isolated interpreter: no user site directory, no PYTHON* overrides,
@@ -2418,6 +2440,7 @@ LIVE_SUITE_RELEVANCE_JOB_TEMPLATE = r"""  changes:
           python3 -I "$trusted_filter" --self-test
           plan="$(python3 -I "$trusted_filter" "${filter_args[@]}")"
           relevant="$(printf '%s\n' "$plan" | sed -n 's/^relevant=//p')"
+          transport="$(printf '%s\n' "$plan" | sed -n 's/^changed_files_transport=//p')"
           case "$relevant" in
             true|false) ;;
             *)
@@ -2425,6 +2448,15 @@ LIVE_SUITE_RELEVANCE_JOB_TEMPLATE = r"""  changes:
               exit 1
               ;;
           esac
+          # Transport handshake. A trusted base older than the NUL change set
+          # reads the whole stream as one newline-delimited record, matches
+          # nothing, and reports a syntactically valid `relevant=false`. Only an
+          # exact `nul` acknowledgement proves the records were classified as
+          # pathnames, so anything else runs the live suite.
+          if [ "$transport" != "nul" ]; then
+            echo "::warning::trusted relevance filter did not acknowledge the NUL change set; running the live suite" >&2
+            relevant=true
+          fi
           echo "relevant=$relevant" >> "$GITHUB_OUTPUT"
           echo "Relevance decided by trusted base ${trusted_sha}." >> "$GITHUB_STEP_SUMMARY"
           printf '%s\n' "$plan" | sed -n '/^## /,$p' >> "$GITHUB_STEP_SUMMARY"
@@ -27266,6 +27298,11 @@ pre_build = []
         '[ "$EVENT_NAME" = "pull_request" ] || [ "$EVENT_NAME" = "merge_group" ]',
         "            true|false) ;;",
         "            filter_args+=(--force-run)",
+        'git diff --name-only --no-renames -z "${trusted_sha}...HEAD"',
+        "changed_files_transport=",
+        '          if [ "$transport" != "nul" ]; then',
+        "            relevant=true",
+        "          persist-credentials: false",
     ):
         if required_token not in rendered_relevance:
             failures.append(
@@ -27510,6 +27547,20 @@ pre_build = []
         "dropped merge_group base pin": (
             '          elif [ "$EVENT_NAME" = "merge_group" ]; then\n',
             '          elif [ "$EVENT_NAME" = "pull_request_target" ]; then\n',
+        ),
+        "line-delimited change set": (
+            '            git diff --name-only --no-renames -z '
+            '"${trusted_sha}...HEAD" \\\n              > "$changed_files"\n',
+            '            git diff --name-only --no-renames '
+            '"${trusted_sha}...HEAD" \\\n              | sort > "$changed_files"\n',
+        ),
+        "dropped change-set transport handshake": (
+            '          if [ "$transport" != "nul" ]; then\n',
+            '          if false; then\n',
+        ),
+        "persisted checkout credentials": (
+            "          persist-credentials: false\n",
+            "",
         ),
     }
     for mutation_name, (original, replacement) in relevance_mutations.items():

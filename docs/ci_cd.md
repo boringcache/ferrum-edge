@@ -877,7 +877,14 @@ cheap planning jobs and the aggregate.
 
 The relevant live-datapath surfaces are eBPF, node-agent, NodeWaypoint identity,
 netns capture, socket option, TCP scope, chart, live harness, and the listed
-docs. When relevant (and on every main/manual force-run) the live job builds the
+docs. They also include the local composite actions this live job actually
+executes — `package-ferrum-runtime-image`, `setup-kubernetes-tools`,
+`setup-bpf-linker`, and `setup-rust-ci` together with the `setup-sccache` and
+`setup-fast-linker` actions it runs — which the retired `paths:` list did not
+cover even though they decide how the live datapath's binaries and BPF ELF are
+built. `SUITE_LOCAL_ACTION_DEPENDENCIES` declares them and the classifier
+self-test proves each one stays relevant to its suite. When relevant (and on
+every main/manual force-run) the live job builds the
 normal runtime Docker image from the host-built binary, builds the
 eBPF userspace binary with `FEATURES=cloud-secrets,ebpf`, builds the
 `ferrum-ebpf` BPF ELF with nightly Rust, and packages the `:<tag>-ebpf` runtime
@@ -923,9 +930,13 @@ diagnostics, mesh drift snapshots, pod-registry dumps, live assertions, and
 It is **not** a required live-suite check and is not wired into the `ci.yml`
 `Tests` aggregate (that aggregate is Cross-frozen). The workflow triggers on
 every pull request, merge-queue group, push to `main`, and manual dispatch, with
-no top-level `paths:` filter. A trusted-base `changes` job decides relevance,
-and the `if: always()` aggregate `Istio Status CAS Live` reports on every run.
-The workflow uses the same
+no top-level `paths:` filter. A trusted-base `changes` job decides relevance
+from the retired `paths:` list plus the classifier script and the local
+composite actions the live job executes (the retired list named
+`setup-rust-ci` and `setup-kubernetes-tools` but not the `setup-sccache` /
+`setup-fast-linker` actions `setup-rust-ci` itself runs, which decide how the
+live test binary is compiled and linked), and the `if: always()` aggregate
+`Istio Status CAS Live` reports on every run. The workflow uses the same
 pinned `.github/actions/setup-kubernetes-tools` Kind/kubectl install as the other
 Kind-capable jobs, applies the checked-in AuthorizationPolicy CRD fixture
 (`tests/fixtures/k8s/istio_authorizationpolicy_status_crd.yaml`), and runs the
@@ -1053,12 +1064,17 @@ separately (PR #3889).
 **not** a required live-suite check and must not be added to branch protection.
 The workflow triggers on every pull request, merge-queue group, push to `main`,
 and manual dispatch, with no top-level `paths:` filter. A trusted-base
-`changes` job decides relevance from the retired CNI `paths:` list plus the
-classifier script (Helm matches stay exact chart files, not the whole
-`charts/ferrum-mesh/` tree), and the `if: always()` aggregate `CNI Lifecycle
-Live` reports on every run: green when the suite passed or was legitimately
-irrelevant, red when a relevant live job failed or the classifier failed
-closed. Unrelated PRs only pay for the cheap `changes` and `gate` jobs.
+`changes` job decides relevance from the retired CNI `paths:` list, the
+classifier script, and the local composite actions the live job executes
+(`package-ferrum-runtime-image`, `setup-kubernetes-tools`, and `setup-rust-ci`
+with the `setup-sccache` / `setup-fast-linker` actions it runs — the retired
+list named none of the build-toolchain ones even though they build the
+`ferrum-edge` and `ferrum-cni` binaries this suite installs). Helm matches stay
+exact chart files, not the whole `charts/ferrum-mesh/` tree. The `if: always()`
+aggregate `CNI Lifecycle Live` reports on every run: green when the suite
+passed or was legitimately irrelevant, red when a relevant live job failed or
+the classifier failed closed. Unrelated PRs only pay for the cheap `changes`
+and `gate` jobs.
 
 When relevant (and on every main/manual force-run) the live job builds
 `ferrum-edge` and `ferrum-cni`, packages the runtime image, and runs
@@ -1845,6 +1861,31 @@ Its load-bearing properties:
   of defaulting to "irrelevant".
 - The filter runs under `python3 -I`, so nothing the pull request committed can
   be imported into the trusted interpreter.
+- The change set is handed over as a NUL-delimited
+  `git diff --name-only --no-renames -z "${trusted_sha}...HEAD"` stream — never
+  newline-delimited, never `sort`ed, never re-quoted. A newline-delimited
+  listing cannot represent a pathname that contains a newline, and C-quoting
+  one instead (`core.quotePath`) would classify a *different* path than the one
+  that changed; either way a relevant file can be made to look like no file at
+  all. `live_suite_path_filter.py` reads the file as raw bytes and requires a
+  canonical NUL-terminated stream: a missing terminal NUL, an interior empty
+  record, invalid UTF-8, a control/format character, a backslash or other
+  metacharacter outside the conservative `[A-Za-z0-9._+@~ /-]` charset, an
+  absolute path, or a non-normal component (empty, `.`, `..`, trailing slash,
+  surrounding whitespace) is **rejected with a non-zero exit**, not silently
+  treated as irrelevant, and the offending bytes are never echoed. Pathname
+  bytes are never normalized or stripped into a different path. An actually
+  empty diff stays an empty change set.
+- The filter prints `changed_files_transport=nul` beside its verdict, and the
+  relevance job honors a `false` verdict only when that acknowledgement is
+  exactly `nul`. A trusted base predating this transport would read the whole
+  stream as one unmatched newline record and report `relevant=false`; the
+  handshake turns that into a forced live run instead. It is the same
+  trust/transport version handshake `pr_ci_plan.py` uses via
+  `paths_classifiable`.
+- The checkout sets `persist-credentials: false`. The job only fetches the base
+  tip and inspects two commits, so it must not leave a write-capable token in
+  the checkout's Git configuration for later steps in the job to reuse.
 
 Freezing the relevance job alone would not be enough — a pull request could
 leave it untouched and instead rewrite the live job's `needs`/`if`. The binding
