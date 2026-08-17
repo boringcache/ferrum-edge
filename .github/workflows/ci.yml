@@ -368,8 +368,32 @@ jobs:
     needs: ci-plan
     if: needs.ci-plan.outputs.mode == 'full' && (github.event_name == 'pull_request' || github.event_name == 'merge_group' || (github.event_name == 'push' && github.ref == 'refs/heads/main'))
     runs-on: ubuntu-latest
+    env:
+      # Cold-cache full-workspace compiles repeatedly kill this hosted runner
+      # ("The runner has received a shutdown signal" + exit 143) while the
+      # combined lib + unit_tests precompile lets two full-debuginfo link jobs
+      # overlap. Cap cargo's parallelism and shrink debuginfo to line tables
+      # (backtraces keep file:line) so a cold compile fits the runner's
+      # memory/disk. Same values on every job sharing this rust-cache key so
+      # cached artifact fingerprints stay uniform.
+      CARGO_BUILD_JOBS: "3"
+      CARGO_PROFILE_DEV_DEBUG: "line-tables-only"
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
+
+      - name: Extend runner swap for the aggregated unit_tests compile
+        run: |
+          set -euo pipefail
+          # The single-crate rustc frontend for the aggregated tests/unit_tests
+          # binary exceeds hosted-runner RAM on cold compiles: the VM dies with
+          # "The runner has received a shutdown signal" / exit 143 before any
+          # compiler diagnostic can print. Give the VM swap headroom so memory
+          # pressure degrades to paging instead of killing the runner agent.
+          sudo fallocate -l 12G /mnt/ferrum-swapfile
+          sudo chmod 600 /mnt/ferrum-swapfile
+          sudo mkswap /mnt/ferrum-swapfile
+          sudo swapon /mnt/ferrum-swapfile
+          free -h
 
       - uses: ./.github/actions/setup-rust-ci
         with:
@@ -589,8 +613,25 @@ jobs:
     needs: ci-plan
     if: needs.ci-plan.outputs.mode == 'full' && (github.event_name == 'pull_request' || github.event_name == 'merge_group' || (github.event_name == 'push' && github.ref == 'refs/heads/main'))
     runs-on: ubuntu-latest
+    env:
+      # Same cold-compile survivability caps as test-unit (own rust-cache key,
+      # same repeated exit-143 runner loss during the pkcs11 double-target
+      # precompile).
+      CARGO_BUILD_JOBS: "3"
+      CARGO_PROFILE_DEV_DEBUG: "line-tables-only"
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
+
+      - name: Extend runner swap for the aggregated unit_tests compile
+        run: |
+          set -euo pipefail
+          # Same VM-loss pattern as test-unit: the aggregated unit_tests rustc
+          # frontend exceeds hosted-runner RAM on cold compiles. See test-unit.
+          sudo fallocate -l 12G /mnt/ferrum-swapfile
+          sudo chmod 600 /mnt/ferrum-swapfile
+          sudo mkswap /mnt/ferrum-swapfile
+          sudo swapon /mnt/ferrum-swapfile
+          free -h
 
       - uses: ./.github/actions/setup-rust-ci
         with:
@@ -1005,6 +1046,12 @@ jobs:
     needs: ci-plan
     if: needs.ci-plan.outputs.mode == 'full' && (github.event_name == 'pull_request' || github.event_name == 'merge_group' || (github.event_name == 'push' && github.ref == 'refs/heads/main'))
     runs-on: ubuntu-latest
+    env:
+      # Shares the `ci-test` rust-cache key with test-unit: keep the same
+      # compile settings so cached artifact fingerprints stay uniform across
+      # the shared key.
+      CARGO_BUILD_JOBS: "3"
+      CARGO_PROFILE_DEV_DEBUG: "line-tables-only"
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
 

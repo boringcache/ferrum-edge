@@ -2570,6 +2570,15 @@ AMBIENT_HOST_UDP_IMAGE_JOB = r"""  ambient-host-udp-image:
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4
 
+      # GitHub Actions cache is a 10 GB repository quota with LRU eviction
+      # across every ref. `type=gha,mode=max` exports multi-gigabyte BuildKit
+      # layers scoped to the writing ref. Pull requests and merge groups restore
+      # the default-branch cache and must not publish; only a trusted
+      # `refs/heads/main` run (currently `workflow_dispatch` on `main`) may
+      # cache-to. Fork PRs cannot publish: `github.ref` is never
+      # `refs/heads/main` on a PR, and the fork guard stays fail-closed if that
+      # ref check is later weakened. An empty cache-to does not skip the build.
+      #
       # Cheap, deterministic half: the tool-provisioning stage the production
       # runtime is built FROM. This alone would not prove the shipped image, so
       # the full target is smoked below; running it first surfaces a broken tool
@@ -2583,7 +2592,7 @@ AMBIENT_HOST_UDP_IMAGE_JOB = r"""  ambient-host-udp-image:
           load: true
           tags: ferrum-edge-capture-tools-base:ci
           cache-from: type=gha,scope=ambient-host-udp-images
-          cache-to: type=gha,mode=max,scope=ambient-host-udp-images
+          cache-to: ${{ github.event_name != 'pull_request' && github.event_name != 'merge_group' && github.ref == 'refs/heads/main' && github.event.pull_request.head.repo.fork != true && 'type=gha,mode=max,scope=ambient-host-udp-images' || '' }}
           provenance: false
 
       # The exact target the mesh chart's `-ebpf-tools` tag publishes.
@@ -2598,7 +2607,7 @@ AMBIENT_HOST_UDP_IMAGE_JOB = r"""  ambient-host-udp-image:
           load: true
           tags: ferrum-edge-ebpf-tools:ci
           cache-from: type=gha,scope=ambient-host-udp-images
-          cache-to: type=gha,mode=max,scope=ambient-host-udp-images
+          cache-to: ${{ github.event_name != 'pull_request' && github.event_name != 'merge_group' && github.ref == 'refs/heads/main' && github.event.pull_request.head.repo.fork != true && 'type=gha,mode=max,scope=ambient-host-udp-images' || '' }}
           provenance: false
 
       - name: Prove the published runtime can execute the production tool set
@@ -2644,7 +2653,7 @@ AMBIENT_HOST_UDP_IMAGE_JOB = r"""  ambient-host-udp-image:
           load: true
           tags: ferrum-edge-ebpf:ci
           cache-from: type=gha,scope=ambient-host-udp-images
-          cache-to: type=gha,mode=max,scope=ambient-host-udp-images
+          cache-to: ${{ github.event_name != 'pull_request' && github.event_name != 'merge_group' && github.ref == 'refs/heads/main' && github.event.pull_request.head.repo.fork != true && 'type=gha,mode=max,scope=ambient-host-udp-images' || '' }}
           provenance: false
 
       - name: Prove the `-ebpf` image keeps its distroless contract
@@ -2721,6 +2730,81 @@ AMBIENT_HOST_UDP_TOP_LEVEL_PERMISSIONS = "permissions:\n  contents: read\n"
 AMBIENT_HOST_UDP_FORBIDDEN_INHERITED_KEYS = ("defaults", "env")
 AMBIENT_HOST_UDP_REQUIRED_CHECK_NAME = "Ambient Host UDP Live"
 AMBIENT_HOST_UDP_REQUIRED_CHECK_OWNER = ("ambient-host-udp-live.yml", "gate")
+AMBIENT_HOST_UDP_IMAGE_CACHE_FROM = (
+    "cache-from: type=gha,scope=ambient-host-udp-images"
+)
+AMBIENT_HOST_UDP_IMAGE_UNCONDITIONAL_CACHE_TO = (
+    "cache-to: type=gha,mode=max,scope=ambient-host-udp-images"
+)
+AMBIENT_HOST_UDP_IMAGE_GATED_CACHE_TO = (
+    "cache-to: ${{ github.event_name != 'pull_request' && "
+    "github.event_name != 'merge_group' && "
+    "github.ref == 'refs/heads/main' && "
+    "github.event.pull_request.head.repo.fork != true && "
+    "'type=gha,mode=max,scope=ambient-host-udp-images' || '' }}"
+)
+AMBIENT_HOST_UDP_IMAGE_BUILD_STEPS = (
+    "Build the capture tool base stage",
+    "Build the production Ambient UDP lifecycle runtime",
+    "Build the distroless eBPF runtime",
+)
+AMBIENT_HOST_UDP_IMAGE_TARGETS = (
+    "capture-tools-base",
+    "runtime-ebpf-tools",
+    "runtime-ebpf",
+)
+AMBIENT_HOST_UDP_IMAGE_CONTRACT_CHECKS = (
+    "Prove the published runtime can execute the production tool set",
+    "Prove the `-ebpf` image keeps its distroless contract",
+)
+
+
+def ambient_host_udp_image_cache_budget_errors(job: str, source: str) -> list[str]:
+    """Reject Ambient image-job cache publication from PR and merge-group refs.
+
+    Exact job freeze still owns runner, checkout, and contract-check bytes.
+    These checks stay in force if a later trusted-policy edit updates that
+    freeze and the workflow together: an unconditional `type=gha,mode=max`
+    export, a missing restore, a skipped required target, or an `if:` on a
+    required build must fail closed.
+    """
+
+    errors: list[str] = []
+    if AMBIENT_HOST_UDP_IMAGE_UNCONDITIONAL_CACHE_TO in job:
+        errors.append(
+            f"{source} must not publish the Ambient GHA BuildKit cache "
+            "unconditionally from pull requests"
+        )
+    gated = job.count(AMBIENT_HOST_UDP_IMAGE_GATED_CACHE_TO)
+    if gated != 3:
+        errors.append(
+            f"{source} must gate all three Ambient image cache-to exports on "
+            f"trusted refs/heads/main (found {gated})"
+        )
+    restored = job.count(AMBIENT_HOST_UDP_IMAGE_CACHE_FROM)
+    if restored != 3:
+        errors.append(
+            f"{source} must restore the Ambient GHA BuildKit cache on all three "
+            f"image builds (found {restored})"
+        )
+    for target in AMBIENT_HOST_UDP_IMAGE_TARGETS:
+        if f"target: {target}" not in job:
+            errors.append(
+                f"{source} must still build the {target} image target"
+            )
+    for name in AMBIENT_HOST_UDP_IMAGE_BUILD_STEPS:
+        if f"- name: {name}\n        uses: docker/build-push-action@" not in job:
+            errors.append(
+                f"{source} must keep {name!r} unconditional; a missing/invalid "
+                "event must not skip the required image build"
+            )
+    for name in AMBIENT_HOST_UDP_IMAGE_CONTRACT_CHECKS:
+        if f"- name: {name}" not in job:
+            errors.append(
+                f"{source} must keep the {name!r} contract check"
+            )
+    return errors
+
 
 # Freezing the relevance job alone is not sufficient. A pull request that left
 # the frozen block untouched but rewrote the live job's `needs`/`if` would skip
@@ -11344,6 +11428,16 @@ def live_suite_relevance_errors(
                         "exactly frozen; runner, failure, environment, step, and "
                         "dependency semantics are one closed execution contract"
                     )
+                if (
+                    not job_failures
+                    and actual_job is not None
+                    and protected_job == "ambient-host-udp-image"
+                ):
+                    errors.extend(
+                        ambient_host_udp_image_cache_budget_errors(
+                            actual_job, located
+                        )
+                    )
 
             permissions, permission_failures = extract_top_level_block(
                 contents,
@@ -11869,18 +11963,28 @@ CI_JOB_GENERATION_TRANSITIONS: tuple[tuple[str, str, str], ...] = (
 )
 
 # Local composite actions are compared by whole-file digest once Cross-sensitive.
-# `setup-rust-ci/action.yml` on current `main` (PR #3889's landed file) may
-# move to exactly one combined destination: PR #3911 after merging latest
-# `main`, preserving every #3889 cache-safety change plus #3911's optional
-# `workspaces` input/pass-through. Exact, path-bound, one-way, fail-closed.
-# The candidate cannot supply a digest. The Helm Chart setup-kubernetes-tools
-# generation lives in `verify_trusted_local_action.py`, not here: that gate is
-# byte-identity of the extracted checker, not a Cross surface comparison.
+# `setup-rust-ci/action.yml` carries a two-step chain from PR #3889's landed
+# file: first the cache-budget generation (this change) that gates rust-cache
+# `save-if` to a trusted `refs/heads/main` run so pull requests and merge
+# groups restore without saving, then that generation may move to exactly one
+# combined destination: PR #3911 rebased onto it, preserving every cache-safety
+# change plus #3911's optional `workspaces` input/pass-through. Each step is
+# exact, path-bound, one-way, fail-closed. The candidate cannot supply a
+# digest. The former direct #3889→#3911 pair is superseded by this chain and
+# #3911 must rebase to the combined destination text. The Helm Chart
+# setup-kubernetes-tools generation lives in `verify_trusted_local_action.py`,
+# not here: that gate is byte-identity of the extracted checker, not a Cross
+# surface comparison.
 LOCAL_ACTION_GENERATION_TRANSITIONS: tuple[tuple[str, str, str], ...] = (
     (
         "setup-rust-ci/action.yml",
         "fc4e41818dffdea880c057c8dfa0881a629cd01c917b43f69a9f2e5e9bd90dda",
-        "57a99a179ddc2935af187f518a803bf167eb9e33593c37b7b29f7151ec994da2",
+        "b6ca6315ff9f2a206c1011b6b0166de3a340370fd75bf3e9cffe41e872008924",
+    ),
+    (
+        "setup-rust-ci/action.yml",
+        "b6ca6315ff9f2a206c1011b6b0166de3a340370fd75bf3e9cffe41e872008924",
+        "219187bdb0366d929577e67f48947b8c1096998dd7e04eafdffdb53dc3faa925",
     ),
 )
 
@@ -18251,12 +18355,17 @@ pre_build = []
         (
             "setup-rust-ci/action.yml",
             "fc4e41818dffdea880c057c8dfa0881a629cd01c917b43f69a9f2e5e9bd90dda",
-            "57a99a179ddc2935af187f518a803bf167eb9e33593c37b7b29f7151ec994da2",
+            "b6ca6315ff9f2a206c1011b6b0166de3a340370fd75bf3e9cffe41e872008924",
+        ),
+        (
+            "setup-rust-ci/action.yml",
+            "b6ca6315ff9f2a206c1011b6b0166de3a340370fd75bf3e9cffe41e872008924",
+            "219187bdb0366d929577e67f48947b8c1096998dd7e04eafdffdb53dc3faa925",
         ),
     ):
         failures.append(
-            "the setup-rust-ci generation table does not pin the current-main "
-            "retired digest and the combined #3911 destination"
+            "the setup-rust-ci generation table does not pin the cache-budget "
+            "generation chain and the rebased combined #3911 destination"
         )
 
     remote_action_composite = (
@@ -26206,6 +26315,77 @@ pre_build = []
     if live_suite_relevance_errors(relevance_workflows, "self-test workflows"):
         failures.append("the trusted-base relevance contract was rejected")
 
+    image_cache_budget = ambient_host_udp_image_cache_budget_errors(
+        AMBIENT_HOST_UDP_IMAGE_JOB, "self-test-ambient-image-cache"
+    )
+    if image_cache_budget:
+        failures.append(
+            "the frozen Ambient image job failed its cache-budget contract: "
+            + "; ".join(image_cache_budget)
+        )
+
+    unconditional_image_job = AMBIENT_HOST_UDP_IMAGE_JOB.replace(
+        AMBIENT_HOST_UDP_IMAGE_GATED_CACHE_TO,
+        AMBIENT_HOST_UDP_IMAGE_UNCONDITIONAL_CACHE_TO,
+    )
+    if unconditional_image_job == AMBIENT_HOST_UDP_IMAGE_JOB:
+        failures.append(
+            "the unconditional Ambient cache-to self-test mutation is stale"
+        )
+    elif not any(
+        "unconditionally from pull requests" in item
+        for item in ambient_host_udp_image_cache_budget_errors(
+            unconditional_image_job,
+            "self-test-unconditional-ambient-cache-to",
+        )
+    ):
+        failures.append(
+            "self-test: restoring unconditional Ambient cache-to must fail"
+        )
+
+    skipped_image_job = AMBIENT_HOST_UDP_IMAGE_JOB.replace(
+        "- name: Build the capture tool base stage\n"
+        "        uses: docker/build-push-action@",
+        "- name: Build the capture tool base stage\n"
+        "        if: github.event_name == 'workflow_dispatch'\n"
+        "        uses: docker/build-push-action@",
+        1,
+    )
+    if skipped_image_job == AMBIENT_HOST_UDP_IMAGE_JOB:
+        failures.append(
+            "the skipped Ambient image-build self-test mutation is stale"
+        )
+    elif not any(
+        "must not skip the required image build" in item
+        for item in ambient_host_udp_image_cache_budget_errors(
+            skipped_image_job, "self-test-skipped-ambient-image-build"
+        )
+    ):
+        failures.append(
+            "self-test: gating a required Ambient image build on event name "
+            "must fail"
+        )
+
+    main_only_without_pr_guard = AMBIENT_HOST_UDP_IMAGE_JOB.replace(
+        "github.event_name != 'pull_request' && github.event_name != 'merge_group' && ",
+        "",
+    )
+    if main_only_without_pr_guard == AMBIENT_HOST_UDP_IMAGE_JOB:
+        failures.append(
+            "the Ambient cache-to pull_request/merge_group guard mutation is stale"
+        )
+    elif not any(
+        "gate all three Ambient image cache-to exports" in item
+        for item in ambient_host_udp_image_cache_budget_errors(
+            main_only_without_pr_guard,
+            "self-test-ambient-cache-to-without-pr-guard",
+        )
+    ):
+        failures.append(
+            "self-test: Ambient cache-to without pull_request/merge_group "
+            "exclusions must fail"
+        )
+
     relevance_mutations: dict[str, tuple[str, str]] = {
         "pull-request-supplied filter": (
             'python3 -I "$trusted_filter" --self-test',
@@ -26464,6 +26644,19 @@ pre_build = []
         "removed production-image contract job",
         "\n" + AMBIENT_HOST_UDP_IMAGE_JOB,
         "",
+    )
+    ambient_mutation(
+        "unconditional GHA cache-to",
+        AMBIENT_HOST_UDP_IMAGE_GATED_CACHE_TO,
+        AMBIENT_HOST_UDP_IMAGE_UNCONDITIONAL_CACHE_TO,
+    )
+    ambient_mutation(
+        "event-gated production-image build",
+        "- name: Build the capture tool base stage\n"
+        "        uses: docker/build-push-action@",
+        "- name: Build the capture tool base stage\n"
+        "        if: github.event_name == 'workflow_dispatch'\n"
+        "        uses: docker/build-push-action@",
     )
 
     ownership_mutations: dict[str, tuple[dict[str, str], str]] = {}
