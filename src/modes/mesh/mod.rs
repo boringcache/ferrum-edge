@@ -14587,6 +14587,7 @@ async fn arm_mesh_runtime_startup(
                 cert_path.clone(),
                 key_path.clone(),
                 env_config.dtls_client_ca_cert_path.clone(),
+                env_config.frontend_tls_live_reload_enabled,
             )
             .await;
     }

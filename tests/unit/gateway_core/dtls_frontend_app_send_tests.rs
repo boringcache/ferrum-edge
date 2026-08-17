@@ -825,13 +825,10 @@ async fn already_retired_session_wins_an_exact_ready_tie_without_delivering() {
     let polled = Arc::new(AtomicBool::new(false));
     let polled_send = Arc::clone(&polled);
     let (tx, mut rx) = tokio::sync::mpsc::channel::<Vec<u8>>(1);
-    let outcome = frontend_trust_raced_delivery_for_test(
-        Some(&session),
-        async move {
-            polled_send.store(true, Ordering::SeqCst);
-            tx.send(b"payload".to_vec()).await
-        },
-    )
+    let outcome = frontend_trust_raced_delivery_for_test(Some(&session), async move {
+        polled_send.store(true, Ordering::SeqCst);
+        tx.send(b"payload".to_vec()).await
+    })
     .await;
     assert_eq!(outcome, Err(FrontendAppSendRejectForTest::Closed));
     assert!(

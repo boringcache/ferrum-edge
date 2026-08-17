@@ -2761,12 +2761,7 @@ impl DtlsServer {
                                     // registration so retirement stays final.
                                     match frontend_trust_raced_delivery(
                                         client_trust_guard.as_ref().map(|guard| guard.session()),
-                                        send_dtls_record(
-                                            &socket,
-                                            data,
-                                            peer_addr,
-                                            reply_local,
-                                        ),
+                                        send_dtls_record(&socket, data, peer_addr, reply_local),
                                     )
                                     .await
                                     {
@@ -2976,9 +2971,7 @@ impl DtlsServer {
                                     Ok(Err(_)) | Err(_) => {
                                         if let Some(inflight) = in_flight.take() {
                                             let _ = inflight.completion.send(Err(
-                                                FrontendAppSendReject::Closed
-                                                    .as_str()
-                                                    .to_string(),
+                                                FrontendAppSendReject::Closed.as_str().to_string(),
                                             ));
                                         }
                                         fail_queued_frontend_app_sends(
