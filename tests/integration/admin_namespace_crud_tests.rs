@@ -11,6 +11,7 @@
 use arc_swap::ArcSwap;
 use chrono::Utc;
 use ferrum_edge::_test_support::lock_namespace_registry_admission_for_test;
+use ferrum_edge::_test_support::{NamespaceRegistryPhase, set_namespace_registry_fault_for_test};
 use ferrum_edge::admin::{
     AdminState,
     audit::{AuditEvent, AuditListFilter},
@@ -22,9 +23,6 @@ use ferrum_edge::config::batch_atomicity::{
 };
 use ferrum_edge::config::db_backend::DatabaseBackend;
 use ferrum_edge::config::db_loader::{DatabaseStore, DbPoolConfig};
-use ferrum_edge::_test_support::{
-    NamespaceRegistryPhase, set_namespace_registry_fault_for_test,
-};
 use ferrum_edge::config::namespace_registry::MAX_NAMESPACE_DESCRIPTION_CHARS;
 use ferrum_edge::config::types::GatewayConfig;
 use jsonwebtoken::{EncodingKey, Header, encode};
@@ -1288,10 +1286,7 @@ async fn a_lost_admission_lease_fails_closed_at_the_commit_boundary() {
 
     // Handler path: a lease reported lost at the commit gate is the retryable
     // fail-closed 503, and nothing is deleted.
-    set_namespace_registry_fault_for_test(
-        "leased",
-        Some(NamespaceRegistryPhase::LeaseLost),
-    );
+    set_namespace_registry_fault_for_test("leased", Some(NamespaceRegistryPhase::LeaseLost));
     let (status, body) = send(
         reqwest::Method::DELETE,
         &base,

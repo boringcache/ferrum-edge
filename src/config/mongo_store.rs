@@ -107,8 +107,8 @@ mod inner {
         default_index_name, required_mongo_indexes,
     };
     use crate::config::namespace_registry::{
-        DERIVED_NAMESPACE_RESOURCE_TABLES, NAMESPACES_REGISTRY_BACKFILL_ID,
-        NAMESPACE_OCCUPANCY_TABLES, NamespaceRecord, NamespaceRegistryAtomicityUnsupported,
+        DERIVED_NAMESPACE_RESOURCE_TABLES, NAMESPACE_OCCUPANCY_TABLES,
+        NAMESPACES_REGISTRY_BACKFILL_ID, NamespaceRecord, NamespaceRegistryAtomicityUnsupported,
         NamespaceRegistryCorrupt, NamespaceRegistryError as RegistryError, NamespaceRegistryPhase,
         SCHEMA_COMPAT_TABLE, namespace_prefixed_id_suffix_field, namespace_registry_fault,
         parse_namespace_rfc3339, require_canonical_stored_description, require_namespace_identity,
@@ -5932,11 +5932,9 @@ mod inner {
                 .await?;
             let mut record = None;
             while cursor.advance(&mut *session).await? {
-                let parsed = Self::document_to_namespace_record(
-                    Some(name),
-                    cursor.deserialize_current()?,
-                )
-                .map_err(mongodb::error::Error::custom)?;
+                let parsed =
+                    Self::document_to_namespace_record(Some(name), cursor.deserialize_current()?)
+                        .map_err(mongodb::error::Error::custom)?;
                 if record.replace(parsed).is_some() {
                     return Err(mongodb::error::Error::custom(
                         NamespaceRegistryCorrupt::field("identity"),
@@ -15215,7 +15213,8 @@ mod inner {
             // Marker last, and never as a namespaces document: a crash before
             // this write leaves completion absent so the next serialized
             // compatibility pass retries the idempotent upserts.
-            self.mark_namespaces_registry_backfill_complete(&now).await?;
+            self.mark_namespaces_registry_backfill_complete(&now)
+                .await?;
             Ok(())
         }
 

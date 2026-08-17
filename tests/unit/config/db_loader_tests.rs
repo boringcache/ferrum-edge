@@ -2278,14 +2278,12 @@ async fn registry_row_exists(store: &DatabaseStore, name: &str) -> bool {
 }
 
 async fn namespace_registry_backfill_completed(store: &DatabaseStore) -> bool {
-    sqlx::query_scalar::<_, i64>(
-        "SELECT COUNT(*) FROM _ferrum_schema_compat WHERE name = ?",
-    )
-    .bind(ferrum_edge::config::namespace_registry::NAMESPACES_REGISTRY_BACKFILL_ID)
-    .fetch_one(&store.pool())
-    .await
-    .unwrap()
-    > 0
+    sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM _ferrum_schema_compat WHERE name = ?")
+        .bind(ferrum_edge::config::namespace_registry::NAMESPACES_REGISTRY_BACKFILL_ID)
+        .fetch_one(&store.pool())
+        .await
+        .unwrap()
+        > 0
 }
 
 #[tokio::test]
@@ -2485,8 +2483,7 @@ async fn namespace_registry_backfill_is_one_time_and_does_not_reseed() {
     assert!(listed.contains(&"ferrum".to_string()));
     assert!(
         !listed.iter().any(|item| item == "_ferrum_schema_compat"
-            || item
-                == ferrum_edge::config::namespace_registry::NAMESPACES_REGISTRY_BACKFILL_ID),
+            || item == ferrum_edge::config::namespace_registry::NAMESPACES_REGISTRY_BACKFILL_ID),
         "compatibility state must never appear in GET /namespaces: {listed:?}"
     );
 

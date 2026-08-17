@@ -5,10 +5,10 @@ use ferrum_edge::config::batch_atomicity::{
     NamespaceConfigAdmissionLeaseRef,
 };
 use ferrum_edge::config::namespace_registry::{
-    CreateNamespaceRequest, MAX_NAMESPACE_DESCRIPTION_CHARS, NAMESPACES_REGISTRY_BACKFILL_ID,
-    NAMESPACE_OCCUPANCY_TABLES, NAMESPACE_REGISTRY_ADMISSION_KEY, NAMESPACE_RENAME_SIMPLE_TABLES,
-    NamespaceRegistryCorrupt, SCHEMA_COMPAT_TABLE, UpdateNamespaceBody,
-    mtls_dns_admission_namespaces, namespace_prefixed_id_suffix_field,
+    CreateNamespaceRequest, MAX_NAMESPACE_DESCRIPTION_CHARS, NAMESPACE_OCCUPANCY_TABLES,
+    NAMESPACE_REGISTRY_ADMISSION_KEY, NAMESPACE_RENAME_SIMPLE_TABLES,
+    NAMESPACES_REGISTRY_BACKFILL_ID, NamespaceRegistryCorrupt, SCHEMA_COMPAT_TABLE,
+    UpdateNamespaceBody, mtls_dns_admission_namespaces, namespace_prefixed_id_suffix_field,
     namespace_registry_admission_keys, normalize_description, parse_namespace_rfc3339,
     require_canonical_stored_description, require_namespace_identity,
     require_namespace_keyed_embedded_namespace, require_namespace_keyed_identity,
@@ -438,13 +438,9 @@ fn require_namespace_keyed_identity_requires_id_namespace_and_resource() {
     assert!(!text.contains("secret") && !text.contains("other-tenant"));
 
     for resource in [None, Some("")] {
-        let err = require_namespace_keyed_identity(
-            "secret-ns",
-            "secret-ns",
-            Some("secret-ns"),
-            resource,
-        )
-        .expect_err("missing resource identity must abort");
+        let err =
+            require_namespace_keyed_identity("secret-ns", "secret-ns", Some("secret-ns"), resource)
+                .expect_err("missing resource identity must abort");
         let text = err.to_string();
         assert!(text.contains("id"), "{text}");
         assert!(!text.contains("secret"));

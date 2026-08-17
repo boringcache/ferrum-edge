@@ -716,10 +716,7 @@ fn registry_faults() -> MutexGuard<'static, HashMap<String, NamespaceRegistryPha
 /// Install (or clear, with `None`) a deterministic abort for `namespace`.
 ///
 /// Keyed per namespace so tests sharing one process cannot perturb each other.
-pub(crate) fn set_namespace_registry_fault(
-    namespace: &str,
-    phase: Option<NamespaceRegistryPhase>,
-) {
+pub(crate) fn set_namespace_registry_fault(namespace: &str, phase: Option<NamespaceRegistryPhase>) {
     let mut faults = registry_faults();
     match phase {
         Some(phase) => {

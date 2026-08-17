@@ -1902,9 +1902,7 @@ mod tests {
         let completed_at = body
             .find("namespaces_registry_backfill_completed")
             .expect("completion check");
-        let insert_at = body
-            .find("insert_derived")
-            .expect("derived-name insert");
+        let insert_at = body.find("insert_derived").expect("derived-name insert");
         let mark_at = body
             .find("mark_namespaces_registry_backfill_complete")
             .expect("completion mark");

@@ -1926,9 +1926,7 @@ fn mongo_namespace_rename_validates_split_trust_identity_before_any_mutation() {
     let collect_at = rename
         .find("collect_validated_namespace_keyed_docs_in_session")
         .expect("rename must scan gateway-trust identity before rewriting");
-    let first_mutation = rename
-        .find("delete_one")
-        .expect("registry-row delete");
+    let first_mutation = rename.find("delete_one").expect("registry-row delete");
     assert!(
         collect_at < first_mutation,
         "a split trust-bundle identity must abort before any rename write:\n{rename}"
@@ -2045,7 +2043,9 @@ fn mongo_namespace_registry_backfill_is_one_time_and_crash_retryable() {
     let backfill_at = migrations
         .find("backfill_namespaces_registry")
         .expect("backfill still runs during migrate");
-    let release_at = migrations.find("migration_lease.release()").expect("release");
+    let release_at = migrations
+        .find("migration_lease.release()")
+        .expect("release");
     assert!(
         lease_at < backfill_at && backfill_at < release_at,
         "the first compatibility run must stay serialized by the migration lease:\n{migrations}"
