@@ -103,6 +103,10 @@ pub mod mesh_udp_frame;
 pub mod netns_capture;
 pub mod netns_udp_capture;
 pub(crate) mod node_waypoint_ingress_capture;
+pub mod node_waypoint_udp_destination;
+pub mod node_waypoint_udp_identity;
+pub mod node_waypoint_udp_reply_source;
+pub mod node_waypoint_udp_steering;
 pub mod owned_shell;
 pub mod proxy_protocol;
 pub(crate) mod response_buffer_budget;
@@ -6188,6 +6192,16 @@ pub struct ProxyState {
     /// Inbound HBONE sockets from peer proxies do not carry those pod-loopback
     /// cookies and are authenticated by the HBONE/TLS path instead.
     pub node_waypoint_identity_resolver: Option<Arc<NodeWaypointIdentityResolver>>,
+    /// NodeWaypoint per-datagram UDP/DTLS source-workload attribution index
+    /// (issue #3286). `None` outside NodeWaypoint topology and whenever the
+    /// channel is unavailable; when present, UDP/DTLS listeners resolve each
+    /// session's source pod from the kernel-provided ingress interface plus the
+    /// registry-published source address, so namespace/selector-scoped
+    /// `AuthorizationPolicy` enforces per source workload instead of the whole
+    /// UDP/DTLS surface being disabled. See
+    /// [`crate::proxy::node_waypoint_udp_identity`].
+    pub node_waypoint_udp_source_index:
+        Option<Arc<crate::proxy::node_waypoint_udp_identity::NodeWaypointUdpSourceIndex>>,
     /// Gateway SPIFFE identity for gateway/sidecar-to-mesh outbound HBONE.
     ///
     /// This is the MATERIAL slot: `build_spiffe_outbound_config`, the inbound
@@ -9260,6 +9274,7 @@ impl ProxyState {
             adaptive_buffer,
             mesh_egress_strip_baggage_keys,
             node_waypoint_identity_resolver: None,
+            node_waypoint_udp_source_index: None,
             gateway_svid_bundle,
             gateway_file_svid_bundle,
             gateway_trust_bundles,
@@ -9311,6 +9326,19 @@ impl ProxyState {
         resolver: Arc<NodeWaypointIdentityResolver>,
     ) -> Self {
         self.node_waypoint_identity_resolver = Some(resolver);
+        self
+    }
+
+    /// Return a copy of this state with the NodeWaypoint UDP/DTLS source
+    /// attribution index installed before listeners start accepting traffic
+    /// (issue #3286). Installed only in NodeWaypoint topology and only when the
+    /// channel is supported; every other topology keeps `None` and behaves
+    /// exactly as before.
+    pub fn with_node_waypoint_udp_source_index(
+        mut self,
+        index: Arc<crate::proxy::node_waypoint_udp_identity::NodeWaypointUdpSourceIndex>,
+    ) -> Self {
+        self.node_waypoint_udp_source_index = Some(index);
         self
     }
 
@@ -12153,6 +12181,15 @@ impl ProxyState {
         // `mirror_request_epoch_wrappers` published its wrapper views above.
         let Some(delta) = applied_delta else {
             debug!("Config update: out-of-band mesh/trust/MMDB generation republished");
+            // ClusterIP-only mesh updates do not restart stream listeners, but
+            // they can change the desired NodeWaypoint UDP steering set. Sync
+            // against currently bound sockets so a rejected-or-unbound
+            // destination cannot stay marked, and a newly desired VIP on an
+            // already-bound port is published without waiting for a proxy delta.
+            let slm = self.stream_listener_manager.clone();
+            tokio::spawn(async move {
+                slm.sync_node_waypoint_udp_steering().await;
+            });
             return ConfigApplyOutcome::Applied;
         };
         let proxy_plugin_rebuild_count = proxy_plugin_rebuild_count.get();
@@ -12293,6 +12330,11 @@ impl ProxyState {
                         err
                     );
                 }
+            });
+        } else {
+            let slm = self.stream_listener_manager.clone();
+            tokio::spawn(async move {
+                slm.sync_node_waypoint_udp_steering().await;
             });
         }
 
@@ -12882,6 +12924,10 @@ impl ProxyState {
                     err
                 );
             }
+        } else {
+            self.stream_listener_manager
+                .sync_node_waypoint_udp_steering()
+                .await;
         }
 
         info!(
@@ -20993,6 +21039,21 @@ async fn run_after_proxy_hooks_on_rejection(
         REJECTION_RESPONSE_METADATA_KEY.to_string(),
         "true".to_string(),
     );
+    if let Some(termination) = ctx.authorization_termination() {
+        // Authorization expiry is an authoritative gateway terminal, not a
+        // plugin-authored rejection. Do not construct or poll reject-path
+        // hooks: replacers must not overwrite it, and even non-replacing hooks
+        // must not retain protected request state after the credential expires.
+        replace_rejection_with_authorization_terminal(
+            ctx,
+            termination,
+            status_code,
+            response_body.as_deref_mut(),
+            response_headers,
+        );
+        restore_rejection_response_markers(ctx, previous_marker, previous_replaceable_marker);
+        return;
+    }
     let deadline_already_elapsed = ctx
         .grpc_deadline_at()
         .is_some_and(|deadline| deadline <= tokio::time::Instant::now());
@@ -21822,7 +21883,8 @@ async fn reenforce_final_synthetic_client_visible_response_body_policy(
     // These gateway terminals are already the authoritative, redaction-safe
     // answer. Re-deciding policy against a gateway error payload is exactly what
     // the first-pass loops refuse to do.
-    if ctx.gateway_capacity_response_selected()
+    if ctx.authorization_termination().is_some()
+        || ctx.gateway_capacity_response_selected()
         || ctx.gateway_deadline_response_selected()
         || ctx.gateway_representation_response_selected()
     {
@@ -21892,47 +21954,58 @@ async fn reenforce_final_synthetic_client_visible_response_body_policy(
             true
         }
         FinalSyntheticBodyPolicyDecision::Reject(reject) => {
-            install_final_header_policy_rejection(
-                ctx,
-                response_status,
-                response_headers,
-                response_body,
-                reject,
-                true,
-                false,
-            );
-            // Fail closed on the rebuild, WITHOUT re-deciding policy against the
-            // gateway's own error payload — that is the rule every first-pass
-            // loop here follows, and violating it would turn any configured JSON
-            // response schema into a permanent 500 (the rejection body is itself
-            // JSON that no operator rule was written for).
-            //
-            // The rebuild is instead checked structurally: it must carry exactly
-            // the representation the gateway authored. Preserved decorators are
-            // non-representation by construction and the discarded body's
-            // metadata is dropped, so any other scope field means a plugin-
-            // supplied rejection header re-opened a policy scope that the
-            // decision above was not made under. That shape must not be
-            // published on the strength of that decision, so it collapses to the
-            // fixed, decorator-free terminal.
-            if final_response_body_policy_scope(response_headers)
-                != gateway_authored_rejection_body_policy_scope()
-            {
-                warn!(
-                    "Final client-visible response body policy rejection rebuilt an unexpected \
-                     representation; collapsing to the fixed gateway terminal"
+            if let Some(termination) = ctx.authorization_termination() {
+                replace_rejection_with_authorization_terminal(
+                    ctx,
+                    termination,
+                    response_status,
+                    Some(response_body),
+                    response_headers,
                 );
+                true
+            } else {
                 install_final_header_policy_rejection(
                     ctx,
                     response_status,
                     response_headers,
                     response_body,
-                    final_response_policy_conversion_failure_parts(),
-                    false,
+                    reject,
+                    true,
                     false,
                 );
+                // Fail closed on the rebuild, WITHOUT re-deciding policy against the
+                // gateway's own error payload — that is the rule every first-pass
+                // loop here follows, and violating it would turn any configured JSON
+                // response schema into a permanent 500 (the rejection body is itself
+                // JSON that no operator rule was written for).
+                //
+                // The rebuild is instead checked structurally: it must carry exactly
+                // the representation the gateway authored. Preserved decorators are
+                // non-representation by construction and the discarded body's
+                // metadata is dropped, so any other scope field means a plugin-
+                // supplied rejection header re-opened a policy scope that the
+                // decision above was not made under. That shape must not be
+                // published on the strength of that decision, so it collapses to the
+                // fixed, decorator-free terminal.
+                if final_response_body_policy_scope(response_headers)
+                    != gateway_authored_rejection_body_policy_scope()
+                {
+                    warn!(
+                        "Final client-visible response body policy rejection rebuilt an unexpected \
+                         representation; collapsing to the fixed gateway terminal"
+                    );
+                    install_final_header_policy_rejection(
+                        ctx,
+                        response_status,
+                        response_headers,
+                        response_body,
+                        final_response_policy_conversion_failure_parts(),
+                        false,
+                        false,
+                    );
+                }
+                true
             }
-            true
         }
     };
 
@@ -25074,6 +25147,13 @@ async fn enforce_final_client_visible_response_header_policy(
     response_body: &mut Bytes,
     preserve_from_gateway_provenance: bool,
 ) -> bool {
+    // A pre-commitment authorization expiry is already the gateway's fixed,
+    // redaction-safe terminal. Re-entering a plugin policy under the elapsed
+    // authorization bound would select that terminal again and the permitted
+    // second decision could then collapse it into an unrelated fallback.
+    if ctx.authorization_termination().is_some() {
+        return false;
+    }
     if !plugins
         .iter()
         .any(|plugin| plugin.enforces_final_client_visible_response_headers(ctx))
@@ -25105,18 +25185,38 @@ async fn enforce_final_client_visible_response_header_policy(
         preserve_from_gateway_provenance,
     );
 
+    if let Some(termination) = ctx.authorization_termination() {
+        replace_rejection_with_authorization_terminal(
+            ctx,
+            termination,
+            response_status,
+            Some(response_body),
+            response_headers,
+        );
+        return true;
+    }
+
     // Re-evaluate exactly once, so a preserved decoration cannot carry a refused
     // shape past the policy either. A second refusal collapses to the fixed
     // gateway terminal rather than iterating.
-    if evaluate_final_client_visible_response_header_policy(
+    if let Some(_reject) = evaluate_final_client_visible_response_header_policy(
         plugins,
         ctx,
         *response_status,
         response_headers,
     )
     .await
-    .is_some()
     {
+        if let Some(termination) = ctx.authorization_termination() {
+            replace_rejection_with_authorization_terminal(
+                ctx,
+                termination,
+                response_status,
+                Some(response_body),
+                response_headers,
+            );
+            return true;
+        }
         warn!(
             "Final client-visible response header policy still refused the rebuilt rejection; \
              collapsing to the fixed gateway terminal"
@@ -25144,13 +25244,16 @@ pub(crate) async fn enforce_buffered_final_client_visible_response_header_policy
     response_headers: &mut HashMap<String, String>,
     response_body: &mut Bytes,
 ) -> bool {
-    // These two gateway terminals are already flavor-correct and authoritative.
+    // These gateway terminals are already flavor-correct and authoritative.
     // In particular, an elapsed RPC deadline would make the policy future itself
     // return DEADLINE_EXCEEDED; treating that as a second policy refusal could
     // incorrectly collapse the canonical deadline into the fixed INTERNAL/500
     // fallback. Their builders apply the precomputed initial-header policy and
     // final wire sanitizers directly, so do not reopen either terminal here.
-    if ctx.gateway_deadline_response_selected() || ctx.gateway_capacity_response_selected() {
+    if ctx.authorization_termination().is_some()
+        || ctx.gateway_deadline_response_selected()
+        || ctx.gateway_capacity_response_selected()
+    {
         return false;
     }
     let Some(reject) = evaluate_final_client_visible_response_header_policy(
@@ -25174,10 +25277,10 @@ pub(crate) async fn enforce_buffered_final_client_visible_response_header_policy
     )
     .await;
 
-    // The request deadline can expire while the first final-header decision is
-    // pending. Rejection normalization above has installed the canonical
-    // deadline terminal; do not invoke policy again against it.
-    if ctx.gateway_deadline_response_selected() {
+    // A request or authorization deadline can expire while the first final-
+    // header decision is pending. Rejection normalization above has installed
+    // the canonical terminal; do not invoke policy again against it.
+    if ctx.authorization_termination().is_some() || ctx.gateway_deadline_response_selected() {
         return true;
     }
 
@@ -25193,6 +25296,18 @@ pub(crate) async fn enforce_buffered_final_client_visible_response_header_policy
     )
     .await
     {
+        if ctx.authorization_termination().is_some() {
+            replace_buffered_response_with_policy_rejection(
+                plugins,
+                ctx,
+                response_status,
+                response_headers,
+                response_body,
+                reject,
+            )
+            .await;
+            return true;
+        }
         // The deadline may also expire during the one permitted re-evaluation.
         // Install that authoritative terminal through the same protocol-aware
         // rejection path instead of replacing it with the policy fallback.
@@ -52443,6 +52558,15 @@ mod tests {
 
     struct ReplaceRejectPlugin;
 
+    struct RejectingFinalHeaderPolicyPlugin {
+        polled: Arc<AtomicBool>,
+    }
+
+    struct ExpiringFinalHeaderPolicyPlugin {
+        polls: Arc<AtomicU64>,
+        expire_on_poll: u64,
+    }
+
     struct CommittedHeaderProbePlugin;
 
     struct CustomNoTransformHeaderPlugin;
@@ -52680,6 +52804,62 @@ mod tests {
                 status_code: 503,
                 body: "late fail-closed rejection".to_string(),
                 headers: HashMap::from([("x-replaced".to_string(), "true".to_string())]),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl Plugin for RejectingFinalHeaderPolicyPlugin {
+        fn name(&self) -> &str {
+            "rejecting_final_header_policy_plugin"
+        }
+
+        fn enforces_final_client_visible_response_headers(&self, _ctx: &RequestContext) -> bool {
+            true
+        }
+
+        async fn finalize_client_visible_response_headers(
+            &self,
+            _ctx: &mut RequestContext,
+            _response_status: u16,
+            _response_headers: &HashMap<String, String>,
+        ) -> PluginResult {
+            self.polled.store(true, Ordering::Release);
+            PluginResult::Reject {
+                status_code: 418,
+                body: "late final-header rejection".to_string(),
+                headers: HashMap::from([("x-final-replaced".to_string(), "true".to_string())]),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl Plugin for ExpiringFinalHeaderPolicyPlugin {
+        fn name(&self) -> &str {
+            "expiring_final_header_policy_plugin"
+        }
+
+        fn enforces_final_client_visible_response_headers(&self, _ctx: &RequestContext) -> bool {
+            true
+        }
+
+        async fn finalize_client_visible_response_headers(
+            &self,
+            ctx: &mut RequestContext,
+            _response_status: u16,
+            _response_headers: &HashMap<String, String>,
+        ) -> PluginResult {
+            let poll = self.polls.fetch_add(1, Ordering::AcqRel) + 1;
+            if poll == self.expire_on_poll {
+                ctx.record_authorization_termination_once(
+                    crate::proxy::auth_lifetime::StreamAuthTermination::CredentialExpired,
+                    crate::proxy::auth_lifetime::StreamAuthProtocolFamily::Http,
+                );
+            }
+            PluginResult::Reject {
+                status_code: 418,
+                body: "late final-header rejection".to_string(),
+                headers: HashMap::from([("x-final-replaced".to_string(), "true".to_string())]),
             }
         }
     }
@@ -52999,6 +53179,107 @@ mod tests {
         );
         assert_eq!(&*body, br#"{"error":"blocked"}"#);
         assert!(!ctx.metadata.contains_key(REJECTION_RESPONSE_METADATA_KEY));
+    }
+
+    #[tokio::test]
+    async fn authorization_expiry_cannot_be_replaced_by_reject_or_final_policy_hooks() {
+        let final_header_policy_polled = Arc::new(AtomicBool::new(false));
+        let plugins: Vec<Arc<dyn Plugin>> = vec![
+            Arc::new(ReplaceRejectPlugin),
+            Arc::new(RejectingFinalHeaderPolicyPlugin {
+                polled: Arc::clone(&final_header_policy_polled),
+            }),
+        ];
+        let mut ctx = RequestContext::new("203.0.113.10".into(), "GET".into(), "/body".into());
+        let termination = crate::proxy::auth_lifetime::StreamAuthTermination::CredentialExpired;
+        let reject = settle_precommit_authorization_expiry(&mut ctx, termination);
+        let RejectedResponseParts {
+            mut status_code,
+            mut body,
+            mut headers,
+        } = plugin_result_into_reject_parts(reject).expect("authorization terminal is a reject");
+
+        apply_reject_after_proxy_and_synthetic_body_hooks(
+            &plugins,
+            &mut ctx,
+            &mut status_code,
+            &mut headers,
+            &mut body,
+            false,
+            false,
+        )
+        .await;
+
+        assert_eq!(status_code, StatusCode::UNAUTHORIZED.as_u16());
+        assert_eq!(&*body, br#"{"error":"Unauthorized"}"#);
+        assert!(!headers.contains_key("x-replaced"));
+        assert!(!headers.contains_key("x-final-replaced"));
+        assert!(
+            !final_header_policy_polled.load(Ordering::Acquire),
+            "final client-visible policy must not re-open the authorization terminal"
+        );
+        assert_eq!(ctx.authorization_termination(), Some(termination));
+        assert!(!ctx.metadata.contains_key(REJECTION_RESPONSE_METADATA_KEY));
+
+        let buffered_replaced = enforce_buffered_final_client_visible_response_header_policy(
+            &plugins,
+            &mut ctx,
+            &mut status_code,
+            &mut headers,
+            &mut body,
+        )
+        .await;
+        assert!(!buffered_replaced);
+        assert_eq!(status_code, StatusCode::UNAUTHORIZED.as_u16());
+        assert_eq!(&*body, br#"{"error":"Unauthorized"}"#);
+        assert!(!final_header_policy_polled.load(Ordering::Acquire));
+    }
+
+    #[tokio::test]
+    async fn authorization_expiry_during_final_policy_keeps_the_canonical_terminal() {
+        let termination = crate::proxy::auth_lifetime::StreamAuthTermination::CredentialExpired;
+
+        for buffered in [false, true] {
+            let polls = Arc::new(AtomicU64::new(0));
+            let plugins: Vec<Arc<dyn Plugin>> = vec![Arc::new(ExpiringFinalHeaderPolicyPlugin {
+                polls: Arc::clone(&polls),
+                expire_on_poll: 2,
+            })];
+            let mut ctx =
+                RequestContext::new("203.0.113.10".into(), "GET".into(), "/protected".into());
+            let mut status_code = StatusCode::OK.as_u16();
+            let mut headers =
+                HashMap::from([("content-type".to_string(), "text/plain".to_string())]);
+            let mut body = Bytes::from_static(b"protected response");
+
+            let replaced = if buffered {
+                enforce_buffered_final_client_visible_response_header_policy(
+                    &plugins,
+                    &mut ctx,
+                    &mut status_code,
+                    &mut headers,
+                    &mut body,
+                )
+                .await
+            } else {
+                enforce_final_client_visible_response_header_policy(
+                    &plugins,
+                    &mut ctx,
+                    &mut status_code,
+                    &mut headers,
+                    &mut body,
+                    false,
+                )
+                .await
+            };
+
+            assert!(replaced);
+            assert_eq!(polls.load(Ordering::Acquire), 2);
+            assert_eq!(ctx.authorization_termination(), Some(termination));
+            assert_eq!(status_code, StatusCode::UNAUTHORIZED.as_u16());
+            assert_eq!(&*body, br#"{"error":"Unauthorized"}"#);
+            assert!(!headers.contains_key("x-final-replaced"));
+        }
     }
 
     #[tokio::test]
@@ -60465,6 +60746,8 @@ mod tests {
             mesh: None,
             http_tls_listen_ports: Default::default(),
             mesh_revision: None,
+            node_waypoint_udp_steer_destinations: Vec::new(),
+            node_waypoint_udp_destination_routes: Vec::new(),
             k8s_mesh_overlay: Default::default(),
             gateway_trust_bundles: Vec::new(),
         }

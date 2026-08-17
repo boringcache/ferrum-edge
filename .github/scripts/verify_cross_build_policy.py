@@ -2431,8 +2431,8 @@ LIVE_SUITE_RELEVANCE_JOB_TEMPLATE = r"""  changes:
 """
 
 # workflow file -> (relevance job, live job, display name, temp slug, suite).
-# The primary `live job` is the namesake execution job; additional live jobs
-# (image smoke, production-image contract) are listed in LIVE_SUITE_LIVE_JOBS.
+# The `live job` here is the namesake execution job; the complete set of jobs
+# that must stay bound to the trusted relevance output is LIVE_SUITE_LIVE_JOBS.
 LIVE_SUITE_RELEVANCE_CONTRACTS = {
     "ambient-host-udp-live.yml": (
         "changes",
@@ -2488,6 +2488,16 @@ LIVE_SUITE_RELEVANCE_CONTRACTS = {
 # Every job that must stay bound to the trusted relevance output. Includes the
 # primary live job from LIVE_SUITE_RELEVANCE_CONTRACTS plus sibling execution
 # jobs that would otherwise skip independently.
+#
+# `node-waypoint-ebpf-live.yml` deliberately lists ONLY its live datapath job.
+# That workflow also carries the production-image lane
+# (`production-dockerfile-plan` and the two build jobs behind the fail-closed
+# `production-dockerfile-smoke` aggregate), which keeps its own narrower
+# trusted-base relevance from `.github/scripts/ci_runtime_plan.py`. Binding
+# those jobs to the whole-suite classifier would silently widen or narrow the
+# image contract; instead the frozen `gate` below requires the image aggregate
+# to have succeeded, and `verify_ci_runtime_cache.py` proves the classifier
+# suite is a superset of the planner's prior NodeWaypoint scope.
 LIVE_SUITE_LIVE_JOBS = {
     "ambient-host-udp-live.yml": (
         "ambient-host-udp-live",
@@ -2498,10 +2508,7 @@ LIVE_SUITE_LIVE_JOBS = {
     "multicluster-poller-partition-live.yml": (
         "multicluster-poller-partition-live",
     ),
-    "node-waypoint-ebpf-live.yml": (
-        "production-dockerfile-smoke",
-        "node-waypoint-ebpf-live",
-    ),
+    "node-waypoint-ebpf-live.yml": ("node-waypoint-ebpf-live",),
     "istio-status-cas-live.yml": ("istio-status-cas-live",),
     "cni-lifecycle-live.yml": ("cni-lifecycle-live",),
 }
@@ -2663,6 +2670,15 @@ AMBIENT_HOST_UDP_IMAGE_JOB = r"""  ambient-host-udp-image:
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4
 
+      # GitHub Actions cache is a 10 GB repository quota with LRU eviction
+      # across every ref. `type=gha,mode=max` exports multi-gigabyte BuildKit
+      # layers scoped to the writing ref. Pull requests and merge groups restore
+      # the default-branch cache and must not publish; only a trusted
+      # `refs/heads/main` run (currently `workflow_dispatch` on `main`) may
+      # cache-to. Fork PRs cannot publish: `github.ref` is never
+      # `refs/heads/main` on a PR, and the fork guard stays fail-closed if that
+      # ref check is later weakened. An empty cache-to does not skip the build.
+      #
       # Cheap, deterministic half: the tool-provisioning stage the production
       # runtime is built FROM. This alone would not prove the shipped image, so
       # the full target is smoked below; running it first surfaces a broken tool
@@ -2676,7 +2692,7 @@ AMBIENT_HOST_UDP_IMAGE_JOB = r"""  ambient-host-udp-image:
           load: true
           tags: ferrum-edge-capture-tools-base:ci
           cache-from: type=gha,scope=ambient-host-udp-images
-          cache-to: type=gha,mode=max,scope=ambient-host-udp-images
+          cache-to: ${{ github.event_name != 'pull_request' && github.event_name != 'merge_group' && github.ref == 'refs/heads/main' && github.event.pull_request.head.repo.fork != true && 'type=gha,mode=max,scope=ambient-host-udp-images' || '' }}
           provenance: false
 
       # The exact target the mesh chart's `-ebpf-tools` tag publishes.
@@ -2691,7 +2707,7 @@ AMBIENT_HOST_UDP_IMAGE_JOB = r"""  ambient-host-udp-image:
           load: true
           tags: ferrum-edge-ebpf-tools:ci
           cache-from: type=gha,scope=ambient-host-udp-images
-          cache-to: type=gha,mode=max,scope=ambient-host-udp-images
+          cache-to: ${{ github.event_name != 'pull_request' && github.event_name != 'merge_group' && github.ref == 'refs/heads/main' && github.event.pull_request.head.repo.fork != true && 'type=gha,mode=max,scope=ambient-host-udp-images' || '' }}
           provenance: false
 
       - name: Prove the published runtime can execute the production tool set
@@ -2737,7 +2753,7 @@ AMBIENT_HOST_UDP_IMAGE_JOB = r"""  ambient-host-udp-image:
           load: true
           tags: ferrum-edge-ebpf:ci
           cache-from: type=gha,scope=ambient-host-udp-images
-          cache-to: type=gha,mode=max,scope=ambient-host-udp-images
+          cache-to: ${{ github.event_name != 'pull_request' && github.event_name != 'merge_group' && github.ref == 'refs/heads/main' && github.event.pull_request.head.repo.fork != true && 'type=gha,mode=max,scope=ambient-host-udp-images' || '' }}
           provenance: false
 
       - name: Prove the `-ebpf` image keeps its distroless contract
@@ -2814,6 +2830,81 @@ AMBIENT_HOST_UDP_TOP_LEVEL_PERMISSIONS = "permissions:\n  contents: read\n"
 AMBIENT_HOST_UDP_FORBIDDEN_INHERITED_KEYS = ("defaults", "env")
 AMBIENT_HOST_UDP_REQUIRED_CHECK_NAME = "Ambient Host UDP Live"
 AMBIENT_HOST_UDP_REQUIRED_CHECK_OWNER = ("ambient-host-udp-live.yml", "gate")
+AMBIENT_HOST_UDP_IMAGE_CACHE_FROM = (
+    "cache-from: type=gha,scope=ambient-host-udp-images"
+)
+AMBIENT_HOST_UDP_IMAGE_UNCONDITIONAL_CACHE_TO = (
+    "cache-to: type=gha,mode=max,scope=ambient-host-udp-images"
+)
+AMBIENT_HOST_UDP_IMAGE_GATED_CACHE_TO = (
+    "cache-to: ${{ github.event_name != 'pull_request' && "
+    "github.event_name != 'merge_group' && "
+    "github.ref == 'refs/heads/main' && "
+    "github.event.pull_request.head.repo.fork != true && "
+    "'type=gha,mode=max,scope=ambient-host-udp-images' || '' }}"
+)
+AMBIENT_HOST_UDP_IMAGE_BUILD_STEPS = (
+    "Build the capture tool base stage",
+    "Build the production Ambient UDP lifecycle runtime",
+    "Build the distroless eBPF runtime",
+)
+AMBIENT_HOST_UDP_IMAGE_TARGETS = (
+    "capture-tools-base",
+    "runtime-ebpf-tools",
+    "runtime-ebpf",
+)
+AMBIENT_HOST_UDP_IMAGE_CONTRACT_CHECKS = (
+    "Prove the published runtime can execute the production tool set",
+    "Prove the `-ebpf` image keeps its distroless contract",
+)
+
+
+def ambient_host_udp_image_cache_budget_errors(job: str, source: str) -> list[str]:
+    """Reject Ambient image-job cache publication from PR and merge-group refs.
+
+    Exact job freeze still owns runner, checkout, and contract-check bytes.
+    These checks stay in force if a later trusted-policy edit updates that
+    freeze and the workflow together: an unconditional `type=gha,mode=max`
+    export, a missing restore, a skipped required target, or an `if:` on a
+    required build must fail closed.
+    """
+
+    errors: list[str] = []
+    if AMBIENT_HOST_UDP_IMAGE_UNCONDITIONAL_CACHE_TO in job:
+        errors.append(
+            f"{source} must not publish the Ambient GHA BuildKit cache "
+            "unconditionally from pull requests"
+        )
+    gated = job.count(AMBIENT_HOST_UDP_IMAGE_GATED_CACHE_TO)
+    if gated != 3:
+        errors.append(
+            f"{source} must gate all three Ambient image cache-to exports on "
+            f"trusted refs/heads/main (found {gated})"
+        )
+    restored = job.count(AMBIENT_HOST_UDP_IMAGE_CACHE_FROM)
+    if restored != 3:
+        errors.append(
+            f"{source} must restore the Ambient GHA BuildKit cache on all three "
+            f"image builds (found {restored})"
+        )
+    for target in AMBIENT_HOST_UDP_IMAGE_TARGETS:
+        if f"target: {target}" not in job:
+            errors.append(
+                f"{source} must still build the {target} image target"
+            )
+    for name in AMBIENT_HOST_UDP_IMAGE_BUILD_STEPS:
+        if f"- name: {name}\n        uses: docker/build-push-action@" not in job:
+            errors.append(
+                f"{source} must keep {name!r} unconditional; a missing/invalid "
+                "event must not skip the required image build"
+            )
+    for name in AMBIENT_HOST_UDP_IMAGE_CONTRACT_CHECKS:
+        if f"- name: {name}" not in job:
+            errors.append(
+                f"{source} must keep the {name!r} contract check"
+            )
+    return errors
+
 
 # Freezing the relevance job alone is not sufficient. A pull request that left
 # the frozen block untouched but rewrote the live job's `needs`/`if` would skip
@@ -2845,6 +2936,11 @@ NODE_WAYPOINT_EBPF_GATE_JOB = r"""  gate:
             exit 1
           fi
 
+          if [ "${{ needs.production-dockerfile-smoke.result }}" != "success" ]; then
+            echo "Production Dockerfile image contract failed or did not complete: ${{ needs.production-dockerfile-smoke.result }}." >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
+
           if [ "${{ needs.changes.outputs.relevant }}" = "false" ]; then
             echo "Skipped live datapath validation: no NodeWaypoint eBPF, node-agent, capture, chart, fixture, documentation, or CI workflow surfaces changed." >> "$GITHUB_STEP_SUMMARY"
             exit 0
@@ -2855,17 +2951,12 @@ NODE_WAYPOINT_EBPF_GATE_JOB = r"""  gate:
             exit 1
           fi
 
-          if [ "${{ needs.production-dockerfile-smoke.result }}" != "success" ]; then
-            echo "Production Dockerfile eBPF image smoke failed or did not complete: ${{ needs.production-dockerfile-smoke.result }}." >> "$GITHUB_STEP_SUMMARY"
-            exit 1
-          fi
-
           if [ "${{ needs.node-waypoint-ebpf-live.result }}" != "success" ]; then
             echo "Live datapath validation failed or did not complete: ${{ needs.node-waypoint-ebpf-live.result }}." >> "$GITHUB_STEP_SUMMARY"
             exit 1
           fi
 
-          echo "Production Dockerfile eBPF image smoke and live datapath validation passed." >> "$GITHUB_STEP_SUMMARY"
+          echo "Production Dockerfile image contract and live datapath validation passed." >> "$GITHUB_STEP_SUMMARY"
 """
 ISTIO_STATUS_CAS_GATE_JOB = r"""  gate:
     name: Istio Status CAS Live
@@ -2969,8 +3060,34 @@ LIVE_SUITE_GATE_CONTRACTS = {
 #     compile and execute pull-request-authored Rust tests and fuzz targets;
 #   * a repository that has not adopted the job may omit it, but once the
 #     trusted base carries it a pull request cannot remove it.
+#
+# Issue #3902 changes what the job runs where, which a whole-job freeze cannot
+# express as an edit. It is therefore admitted the same way `release.yml` admits
+# a new image family: as two byte-frozen GENERATIONS with a one-way transition
+# between them (`CI_FUZZ_SMOKE_JOB_GENERATIONS`, oldest first).
+#
+#   * `CI_FUZZ_SMOKE_RETIRED_JOB` is the shape issue #2461 landed: one job that
+#     compiled and ran the six sanitizer-instrumented libFuzzer targets on every
+#     full-mode pull request, with compiler caching explicitly disabled.
+#   * `CI_FUZZ_SMOKE_JOB` is the adopted shape: the deterministic property smoke
+#     is still the required pull-request gate, the six-target bounded budget
+#     runs on merge_group / push to `main` / manual dispatch, and the lane uses
+#     the repository's checksum-pinned sccache installer.
+#
+# Both generations are admitted so the trusted base stays valid while the
+# transition lands, and so the destination revision validates against a policy
+# that already carries it. The transition is one-way: a revision may move from
+# the retired generation to the adopted one, but
+# `admitted_fuzz_smoke_removal_errors` refuses the reverse. Withholding is
+# symmetric across generations, so that explicit check — not the digest
+# comparison — is what makes the direction stick.
+#
+# `CI_FUZZ_SMOKE_BOUNDED_BUDGET` is the bounded run itself, asserted verbatim in
+# every generation by the self-test: the six target markers, the `cargo fuzz
+# run` invocation, and the `-runs` / `-max_total_time` / `-max_len` / `-timeout`
+# / `-rss_limit_mb` bounds cannot drift while a generation is added.
 CI_FUZZ_SMOKE_JOB_NAME = "fuzz-smoke"
-CI_FUZZ_SMOKE_JOB = r"""  fuzz-smoke:
+CI_FUZZ_SMOKE_RETIRED_JOB = r"""  fuzz-smoke:
     # Byte-frozen by the trusted Cross build policy
     # (.github/scripts/verify_cross_build_policy.py, CI_FUZZ_SMOKE_JOB). Issue
     # #2461 requires a short deterministic property/fuzz smoke in ordinary CI;
@@ -3035,6 +3152,155 @@ CI_FUZZ_SMOKE_JOB = r"""  fuzz-smoke:
               -rss_limit_mb=1024
           done
 """
+CI_FUZZ_SMOKE_JOB = r"""  fuzz-smoke:
+    # Byte-frozen by the trusted Cross build policy
+    # (.github/scripts/verify_cross_build_policy.py, CI_FUZZ_SMOKE_JOB). Issue
+    # #2461 requires a short deterministic property/fuzz smoke in ordinary CI;
+    # issue #3902 decides where each half of it runs. This is its entire
+    # permitted shape. Every command, action pin, toolchain pin, tool version,
+    # target name, and libFuzzer bound below is part of the contract, so a pull
+    # request cannot widen the budget, change the target list, add a step, or
+    # redirect this job at a repository-supplied script.
+    #
+    # Lane split (#3902): the deterministic property smoke stays the required
+    # full-mode pull-request gate. The six-target, sanitizer-instrumented
+    # libFuzzer build spent roughly 39 minutes compiling to buy roughly 48
+    # seconds of fuzzing on every pull request, so it now runs on merge_group,
+    # on the push to `main`, and on manual dispatch instead. Every route a
+    # change takes to `main` still executes it at byte-identical bounds.
+    name: Fuzz Smoke
+    needs: ci-plan
+    if: needs.ci-plan.outputs.mode == 'full' && (github.event_name == 'pull_request' || github.event_name == 'merge_group' || (github.event_name == 'push' && github.ref == 'refs/heads/main') || github.event_name == 'workflow_dispatch')
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    permissions:
+      contents: read
+    # The repository-root Cargo config also selects the mold linker through
+    # per-target rustflags, and this isolated lane installs no fast linker, so
+    # the inherited rustflags are cleared explicitly. The rustc wrapper is
+    # deliberately NOT pinned here: `setup-sccache` below publishes either the
+    # checksum-verified sccache path or an empty value through `GITHUB_ENV`,
+    # and a job-level `env` entry of the same name would override that
+    # fail-closed decision.
+    env:
+      RUSTFLAGS: ""
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
+        with:
+          persist-credentials: false
+
+      - name: Install required build dependency
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends protobuf-compiler
+
+      - name: Install pinned nightly toolchain
+        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # nightly
+        with:
+          toolchain: nightly-2025-07-01
+
+      # The repository's own checksum-pinned sccache installer, and the only
+      # local action this contract admits. It never enables the
+      # credential-bearing sccache GHA backend, never persists
+      # ACTIONS_RUNTIME_TOKEN / ACTIONS_RESULTS_URL into later steps, asserts
+      # those credentials are absent before any build runs, and fails closed to
+      # no wrapper at all. It must run BEFORE the cache restore below so the
+      # lazily started sccache server indexes the restored entries.
+      - uses: ./.github/actions/setup-sccache
+
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        with:
+          workspaces: fuzz -> target
+          shared-key: fuzz-smoke
+          cache-directories: ${{ github.workspace }}/.cache/sccache
+          # Only a push to `main` may write this lane's cache. GitHub already
+          # scopes a pull request's cache writes to its own ref; writing
+          # nothing at all from an untrusted ref is the stronger statement,
+          # and it keeps every compiler artifact the sanitizer build reuses
+          # attributable to code that has already merged.
+          save-if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
+
+      - name: Install pinned cargo-fuzz
+        run: cargo install cargo-fuzz --locked --version 0.13.1
+
+      - name: Run deterministic property smoke tests
+        working-directory: fuzz
+        run: |
+          set -euo pipefail
+
+          property_started=$SECONDS
+          cargo test --locked
+          echo "Fuzz property smoke seconds: $((SECONDS - property_started))"
+
+      - name: Run bounded libFuzzer smoke budget
+        # Issue #3902: off the ordinary pull-request path. Every route to
+        # `main` (merge_group, the push to `main` itself, and manual dispatch)
+        # still executes the whole six-target budget below.
+        if: github.event_name != 'pull_request'
+        working-directory: fuzz
+        run: |
+          set -euo pipefail
+
+          sanitizer_started=$SECONDS
+          sccache_bin="${RUSTC_WRAPPER:-}"
+          echo "Fuzz sanitizer lane sccache statistics before the sanitizer build:"
+          if [ -n "$sccache_bin" ] && [ -x "$sccache_bin" ]; then
+            "$sccache_bin" --show-stats
+          else
+            echo "sccache is unavailable; this sanitizer build cannot reuse compiler output"
+          fi
+
+          for fuzz_target in traceparent config_decode proxy_protocol mesh_udp_frame k8s_crd plugin_config; do
+            echo "Fuzz smoke target: ${fuzz_target}"
+            cargo fuzz run --codegen-units 16 "$fuzz_target" -- \
+              -runs=512 \
+              -max_total_time=8 \
+              -max_len=4096 \
+              -timeout=2 \
+              -rss_limit_mb=1024
+          done
+          echo "Fuzz sanitizer lane seconds: $((SECONDS - sanitizer_started))"
+
+      - name: Report fuzz lane compiler-cache telemetry
+        if: always()
+        run: |
+          set -euo pipefail
+
+          if [ "$GITHUB_EVENT_NAME" = "pull_request" ]; then
+            echo "Fuzz lane shape: deterministic property gate only"
+          else
+            echo "Fuzz lane shape: property gate plus the six-target sanitizer budget"
+          fi
+
+          sccache_bin="${RUSTC_WRAPPER:-}"
+          if [ -n "$sccache_bin" ] && [ -x "$sccache_bin" ]; then
+            echo "Fuzz lane sccache statistics after this run:"
+            "$sccache_bin" --show-stats
+            du -sh "${GITHUB_WORKSPACE}/.cache/sccache" || true
+          else
+            echo "::warning::sccache was unavailable; this fuzz run compiled without a compiler cache"
+          fi
+"""
+
+# Oldest first. The index of a revision's job text in this tuple is its
+# generation; a higher index may replace a lower one, never the reverse.
+CI_FUZZ_SMOKE_JOB_GENERATIONS = (CI_FUZZ_SMOKE_RETIRED_JOB, CI_FUZZ_SMOKE_JOB)
+
+# The bounded libFuzzer budget, verbatim. Every admitted generation must carry
+# it exactly once, wherever in the job it runs.
+CI_FUZZ_SMOKE_BOUNDED_BUDGET = (
+    "          for fuzz_target in traceparent config_decode proxy_protocol "
+    "mesh_udp_frame k8s_crd plugin_config; do\n"
+    '            echo "Fuzz smoke target: ${fuzz_target}"\n'
+    '            cargo fuzz run --codegen-units 16 "$fuzz_target" -- \\\n'
+    "              -runs=512 \\\n"
+    "              -max_total_time=8 \\\n"
+    "              -max_len=4096 \\\n"
+    "              -timeout=2 \\\n"
+    "              -rss_limit_mb=1024\n"
+    "          done\n"
+)
 
 # Adopting the byte-frozen job above is only half of the gate: a lane nothing
 # observes is not a gate at all, so the first adoption must also make
@@ -11455,6 +11721,16 @@ def live_suite_relevance_errors(
                         "exactly frozen; runner, failure, environment, step, and "
                         "dependency semantics are one closed execution contract"
                     )
+                if (
+                    not job_failures
+                    and actual_job is not None
+                    and protected_job == "ambient-host-udp-image"
+                ):
+                    errors.extend(
+                        ambient_host_udp_image_cache_budget_errors(
+                            actual_job, located
+                        )
+                    )
 
             permissions, permission_failures = extract_top_level_block(
                 contents,
@@ -11488,13 +11764,30 @@ def live_suite_relevance_errors(
     return errors
 
 
+def admitted_fuzz_smoke_generation(block: str | None) -> int | None:
+    """Return which admitted generation this `fuzz-smoke` job text is.
+
+    `None` means the text is not an admitted generation at all, which is also
+    what an absent job yields; callers that must distinguish the two check the
+    block for `None` themselves. Equality against the whole frozen text is the
+    only test, so a generation can never be reached by editing another one.
+    """
+
+    if block is None:
+        return None
+    for generation, admitted in enumerate(CI_FUZZ_SMOKE_JOB_GENERATIONS):
+        if block == admitted:
+            return generation
+    return None
+
+
 def admitted_fuzz_smoke_errors(contents: str, source: str) -> list[str]:
-    """Reject any `fuzz-smoke` job that is not the byte-frozen contract.
+    """Reject any `fuzz-smoke` job that is not a byte-frozen generation.
 
     Absence is allowed: the fuzz lane is opt-in, and a repository that has not
-    adopted it must still validate. Presence is allowed only at exactly the
-    admitted text, so the admission can never be widened into a general licence
-    to add executable jobs to `ci.yml`.
+    adopted it must still validate. Presence is allowed only at exactly one of
+    the admitted generations, so the admission can never be widened into a
+    general licence to add executable jobs to `ci.yml`.
     """
 
     block, failures = extract_job_block(
@@ -11505,20 +11798,20 @@ def admitted_fuzz_smoke_errors(contents: str, source: str) -> list[str]:
     )
     if failures:
         return failures
-    if block is None or block == CI_FUZZ_SMOKE_JOB:
+    if block is None or admitted_fuzz_smoke_generation(block) is not None:
         return []
     return [
-        f"{source} job {CI_FUZZ_SMOKE_JOB_NAME!r} must be byte-identical to the "
-        "admitted fuzz-smoke contract in the trusted policy, or be absent"
+        f"{source} job {CI_FUZZ_SMOKE_JOB_NAME!r} must be byte-identical to an "
+        "admitted fuzz-smoke generation in the trusted policy, or be absent"
     ]
 
 
 def admitted_ci_job_names(contents: str, source: str) -> frozenset[str]:
     """Return the admitted jobs this workflow carries verbatim.
 
-    Only a job whose text equals its contract is admitted, so a tampered job
-    keeps every surface it produced and is rejected by the surface comparison
-    in addition to `admitted_fuzz_smoke_errors`.
+    Only a job whose text equals an admitted generation is admitted, so a
+    tampered job keeps every surface it produced and is rejected by the surface
+    comparison in addition to `admitted_fuzz_smoke_errors`.
     """
 
     block, failures = extract_job_block(
@@ -11527,7 +11820,7 @@ def admitted_ci_job_names(contents: str, source: str) -> frozenset[str]:
         CI_FUZZ_SMOKE_JOB_NAME,
         required=False,
     )
-    if failures or block is None or block != CI_FUZZ_SMOKE_JOB:
+    if failures or admitted_fuzz_smoke_generation(block) is None:
         return frozenset()
     return frozenset({CI_FUZZ_SMOKE_JOB_NAME})
 
@@ -11537,14 +11830,45 @@ def admitted_fuzz_smoke_removal_errors(
     proposed_contents: str,
     source: str,
 ) -> list[str]:
-    """Keep the admitted smoke gate once the trusted base has adopted it."""
+    """Keep the admitted smoke gate, and its direction, once the base adopts it.
 
-    baseline = admitted_ci_job_names(merge_base_contents, f"merge-base {source}")
-    proposed = admitted_ci_job_names(proposed_contents, f"proposed {source}")
-    if CI_FUZZ_SMOKE_JOB_NAME in baseline and CI_FUZZ_SMOKE_JOB_NAME not in proposed:
+    Two one-way rules, both invisible to the surface comparison because every
+    admitted generation is withheld from both sides of it:
+
+      * an adopted job may not be removed or replaced by unadmitted text;
+      * an adopted generation may not be replaced by an older one. The trusted
+        base decides when a generation retires, exactly as it does for the
+        admitted `release.yml` image-family adoption.
+    """
+
+    baseline_block, baseline_failures = extract_job_block(
+        merge_base_contents,
+        f"merge-base {source}",
+        CI_FUZZ_SMOKE_JOB_NAME,
+        required=False,
+    )
+    proposed_block, proposed_failures = extract_job_block(
+        proposed_contents,
+        f"proposed {source}",
+        CI_FUZZ_SMOKE_JOB_NAME,
+        required=False,
+    )
+    if baseline_failures or proposed_failures:
+        return [*baseline_failures, *proposed_failures]
+    baseline_generation = admitted_fuzz_smoke_generation(baseline_block)
+    if baseline_generation is None:
+        return []
+    proposed_generation = admitted_fuzz_smoke_generation(proposed_block)
+    if proposed_generation is None:
         return [
             f"{source} cannot remove or alter the admitted "
             f"{CI_FUZZ_SMOKE_JOB_NAME!r} job after the trusted base adopts it"
+        ]
+    if proposed_generation < baseline_generation:
+        return [
+            f"{source} cannot return the admitted {CI_FUZZ_SMOKE_JOB_NAME!r} "
+            "job to a retired generation; the trusted base decides when a "
+            "generation retires"
         ]
     return []
 
@@ -11594,9 +11918,12 @@ def ci_fuzz_smoke_aggregate_wiring(contents: str, source: str) -> FuzzAggregateW
     lane is opt-in. Presence is allowed only as the three byte-exact lines in
     `CI_FUZZ_SMOKE_AGGREGATE_INSERTIONS`, each immediately after its anchor, and
     only when the `fuzz-smoke` job it requires is itself present and
-    byte-identical to the frozen contract. Nothing else about the aggregate is
-    exempted: the caller still compares the withheld rendering byte for byte
-    against the trusted base, so any other edit to the job is still rejected.
+    byte-identical to one of the admitted generations. Nothing else about the
+    aggregate is exempted: the caller still compares the withheld rendering byte
+    for byte against the trusted base, so any other edit to the job is still
+    rejected. The wiring is generation-independent by construction, because
+    every generation is one job named `fuzz-smoke`, so a generation transition
+    moves no aggregate byte.
     """
 
     block, failures = extract_job_block(
@@ -11649,7 +11976,7 @@ def ci_fuzz_smoke_aggregate_wiring(contents: str, source: str) -> FuzzAggregateW
         errors.append(
             f"{source} job {CI_AGGREGATE_JOB_NAME!r} requires the "
             f"{CI_FUZZ_SMOKE_JOB_NAME!r} gate, so that job must be present and "
-            "byte-identical to the admitted fuzz-smoke contract"
+            "byte-identical to an admitted fuzz-smoke generation"
         )
     if errors:
         return FuzzAggregateWiring("invalid", contents, errors)
@@ -11875,21 +12202,24 @@ def validate_workflow_collection(
 #     appended before the comparison is reached and are still reported; only the
 #     surface-equality verdict for this one pair is withheld.
 #
-# RETIREMENT IS MANDATORY. Once PR #3889 is on `main` the trusted base IS the
+# RETIREMENT IS MANDATORY. Once PR #3950 is on `main` the trusted base IS the
 # adopted generation, so the admission is permanently unreachable: the retired
 # generation can only become a trusted base again by first passing the one-way
 # refusal above. Delete this block, the `admitted_generation_transition`
-# parameter, and the matching self-tests in the next trusted-policy change. See
-# `docs/ci_cd.md` and `docs/dependency-policy.md`.
+# parameter, and the matching self-tests in the next trusted-policy change,
+# exactly as #3943 retired the #3889 admission this mechanism previously
+# served. See `docs/ci_cd.md` and `docs/dependency-policy.md`.
 FIPS_BUILD_WORKFLOW_FILENAME = "fips-build.yml"
-# `.github/workflows/fips-build.yml` as it stands on the trusted base.
+# `.github/workflows/fips-build.yml` as it stands on the trusted base
+# (PR #3889's landed file).
 FIPS_BUILD_RETIRED_GENERATION_SHA256 = (
-    "5cac372affc99bc052f995c4ea478d2b256f48f555bd41fa782f609b5e74d3ae"
-)
-# `.github/workflows/fips-build.yml` at PR #3889 head
-# bda16859610b90beaae82ee916eeeb719458de9b.
-FIPS_BUILD_ADOPTED_GENERATION_SHA256 = (
     "527659b0ad96a0d97cd4a170543dd81acbf6784155b3c82918b1f70a20c7914b"
+)
+# `.github/workflows/fips-build.yml` at PR #3950 head
+# 0984a45e4: the same-run producer handoff moves off the eviction-prone
+# repository cache onto the immutable run artifact.
+FIPS_BUILD_ADOPTED_GENERATION_SHA256 = (
+    "05f86617597b1eb7bcf1960a0c630a9884ff09ac1995982f46a80811c3965e74"
 )
 FIPS_BUILD_ADMITTED_GENERATION_TRANSITION = (
     FIPS_BUILD_WORKFLOW_FILENAME,
@@ -11953,6 +12283,274 @@ def fips_build_generation_transition(
     return "unrelated"
 
 
+# ---------------------------------------------------------------------------
+# Admitted CI job SHA-256 generation transitions (CI optimization tranche)
+# ---------------------------------------------------------------------------
+# `ci.yml` is a protected workflow: the ARM64 job is digest-frozen, and every
+# other job the pull-request scan reads as Cross-sensitive is compared by its
+# whole-job SHA-256 (`job:<name>:<digest>`). The CI optimization PRs rewrite
+# Cross-sensitive jobs without changing the protected ARM64 invocation. Rather
+# than relaxing that scan, the trusted policy admits exact retired→adopted
+# job-text pairs. Each generation is named by the SHA-256 of `extract_job_block`
+# text (LF-normalized UTF-8, trailing whitespace stripped then one newline),
+# the same digest the surface comparison already uses. Nothing about the
+# admission comes from the pull request — not the digest, not a job name, not
+# an allowlist — so a proposal reaches a pair only by being, byte for byte, the
+# destination revision this trusted policy already names.
+#
+# Properties, each fail-closed:
+#
+#   * The binding is exact on BOTH sides and on the job name. Any other pair —
+#     a one-byte drift on either side, an absent job, a different job, a
+#     partially applied rewrite — is scanned exactly as before.
+#   * It is one-way. Once the trusted base carries an adopted generation, a
+#     proposal that returns that job to the matching retired text is refused
+#     explicitly. Withholding is symmetric, so the digest comparison alone
+#     would accept a revert; the explicit check is load-bearing.
+#   * It withholds ONE job's `job:<name>:*` surfaces for ONE revision pair.
+#     Every other job, action, automation script, protected job contract,
+#     digest name space, required-check binding, and live-gate relevance
+#     contract is evaluated exactly as before.
+#   * Two destinations from the same retired digest are trusted-base-decided
+#     alternatives, not a candidate allowlist. The first landing that matches
+#     an admitted pair wins; moving from one destination to the other is
+#     unrelated and is scanned as an ordinary rewrite.
+#
+# `fuzz-smoke` is not in this table: it already has its own whole-text
+# generation list (`CI_FUZZ_SMOKE_JOB_GENERATIONS`). Overlapping destinations
+# that do not share a retired text — #3913 vs #3915 `ci-plan`/`test`, #3889 vs
+# #3913 `test-pkcs11-softhsm` — are omitted because chaining them here would
+# invent a merged text that does not exist. Those need a follow-up predecessor
+# once the first destination is the trusted base.
+#
+# RETIREMENT: once each destination is on `main`, delete that tuple. See
+# `docs/ci_cd.md` → "Admitted CI job SHA-256 generation transitions".
+CI_JOB_GENERATION_TRANSITIONS: tuple[tuple[str, str, str], ...] = (
+    # PR #3913's `ci-plan` / `test` pairs are retired: its destination is on
+    # `main`, so the admission is permanently unreachable.
+    # `performance-regression` on the trusted base → PR #3911 (issue #3906) head
+    # 5d342d8549ed3190a161a90ea53dc28ab80be5c7.
+    (
+        "performance-regression",
+        "74673023dee4c0970a8b8d3c9a99089be2f28eddf57ddb7337febdf22bd5a7e4",
+        "e7d9a4c0ea26a14efd92844998a42219ca2fb1379072776a313de6dd9b720986",
+    ),
+    # The three per-suite live gates on the trusted base → PR #3915
+    # (issue #3900) after merging latest `main` (branch
+    # grok/issue-3900-ebpf-gates, merged text d95ea4796): the union
+    # `run_ebpf_live` planner gate splits into per-suite fail-closed outputs
+    # (`run_ebpf_kernel_live` / `run_netns_capture_live` /
+    # `run_two_cluster_live`), moving each consumer job's `if:` and comments.
+    (
+        "ebpf-live",
+        "b7596b48641c850f797c84710dd5646013414d6ba01c30f4d4b2805737c8c26c",
+        "9aa3332bff5c4538f797f31133be0ef7dfc9767a72e7212b39be33ed58dcca87",
+    ),
+    (
+        "netns-capture-live",
+        "db543d5c35bfbd4a7b987a52635b359ea6268669257cd313146324f5ca79f598",
+        "b71296ba5929c78cd786301cc8ed677905cca82cd605be46880021b88c243e32",
+    ),
+    (
+        "two-cluster-mesh-live",
+        "0586ab0b5b8b803f2ee3663b608c40caca06f9c92e58d4cb28c2080d68f23f27",
+        "9c3d5b4dfbc6a209e801a47bceabd31fe8aa7df033d49989ad8f88a3e4ed73e7",
+    ),
+    # `build-binaries` on the trusted base → PR #3916 (issue #3905), the
+    # merge-queue macOS compile-gate cost reduction, pinned against its
+    # latest-main-merged branch grok/issue-3905-merge-builds-r1.
+    (
+        "build-binaries",
+        "3bc9e7da00d7033b550df36db00048373b959aea437506ac28e494947422eaec",
+        "14b0890e2693cd0825fcf25ba7f48810b5ae9a33f2cbb5751bdaaf60186b83b1",
+    ),
+)
+
+# ---------------------------------------------------------------------------
+# Admitted workflow-directory job SHA-256 generation transitions (temporary)
+# ---------------------------------------------------------------------------
+# The `ci.yml` pairs above are consulted by the dedicated CI-workflow
+# comparison. Jobs in every OTHER workflow are compared by the generic
+# directory scan, whose Cross-flagged jobs carry a whole-job
+# `job:<name>:<digest>` surface — so even a benign edit inside such a job
+# moves its surface and is refused. This table admits exact retired→adopted
+# pairs for those jobs, keyed by the workflow filename AND the job name, with
+# the same properties as the `ci.yml` table: both ends are exact
+# `extract_job_block` SHA-256 digests the trusted base names (the candidate
+# supplies nothing), the move is one-way (the reverse pair is refused
+# explicitly), and only that one job's `job:` surfaces are withheld — an
+# explicit Cross surface added anywhere else in the same file, or any other
+# revision pair of the named job, is scanned exactly as before.
+#
+# RETIREMENT: once each destination is on `main`, delete that tuple. See
+# `docs/ci_cd.md` → "Admitted workflow-directory job SHA-256 generation
+# transitions".
+WORKFLOW_DIRECTORY_JOB_GENERATION_TRANSITIONS: tuple[
+    tuple[str, str, str, str], ...
+] = (
+    # `coverage.yml` `coverage-merge` on the trusted base → PR #3917
+    # (issue #3907): shard-scoped coverage planning re-shapes the merge
+    # aggregate (planned-shard artifact selection, plugin gate, planned-shard
+    # outcome enforcement), pinned against its latest-main-merged branch
+    # grok/issue-3907-coverage-shards-r1.
+    (
+        "coverage.yml",
+        "coverage-merge",
+        "d2480af21698fb3ad041b32b39587c949aeedec24746c8d5c8c63acd9f9d2fb6",
+        "34f5e1b022f1d01ac72d13c66256e11ff87c15135d775c03736e6701b2223a1c",
+    ),
+)
+
+# Local composite actions are compared by whole-file digest once Cross-sensitive.
+# `setup-rust-ci/action.yml` carries a two-step chain from PR #3889's landed
+# file: first the cache-budget generation (this change) that gates rust-cache
+# `save-if` to a trusted `refs/heads/main` run so pull requests and merge
+# groups restore without saving, then that generation may move to exactly one
+# combined destination: PR #3911 rebased onto it, preserving every cache-safety
+# change plus #3911's optional `workspaces` input/pass-through. Each step is
+# exact, path-bound, one-way, fail-closed. The candidate cannot supply a
+# digest. The former direct #3889→#3911 pair is superseded by this chain and
+# #3911 must rebase to the combined destination text. The Helm Chart
+# setup-kubernetes-tools generation lives in `verify_trusted_local_action.py`,
+# not here: that gate is byte-identity of the extracted checker, not a Cross
+# surface comparison.
+LOCAL_ACTION_GENERATION_TRANSITIONS: tuple[tuple[str, str, str], ...] = (
+    (
+        "setup-rust-ci/action.yml",
+        "fc4e41818dffdea880c057c8dfa0881a629cd01c917b43f69a9f2e5e9bd90dda",
+        "b6ca6315ff9f2a206c1011b6b0166de3a340370fd75bf3e9cffe41e872008924",
+    ),
+    (
+        "setup-rust-ci/action.yml",
+        "b6ca6315ff9f2a206c1011b6b0166de3a340370fd75bf3e9cffe41e872008924",
+        "219187bdb0366d929577e67f48947b8c1096998dd7e04eafdffdb53dc3faa925",
+    ),
+)
+
+
+def named_digest_generation_transition(
+    name: str,
+    merge_base_contents: str,
+    proposed_contents: str,
+    transitions: tuple[tuple[str, str, str], ...],
+) -> str:
+    """Classify one named text pair against trusted SHA-256 generation tuples.
+
+    Returns `"adoption"` when the pair matches any tuple's retired→adopted move
+    for this name, `"rollback"` when it matches any tuple's reverse, and
+    `"unrelated"` otherwise. Adoption wins if both somehow matched; that would
+    require `retired == adopted`, which the self-test forbids. `transitions` is
+    a parameter so the self-test can drive fixtures; production always passes
+    the module binding, and no repository input reaches this parameter.
+    """
+
+    baseline_digest = workflow_generation_digest(merge_base_contents)
+    proposed_digest = workflow_generation_digest(proposed_contents)
+    adoption = False
+    rollback = False
+    for path, retired, adopted in transitions:
+        if path != name:
+            continue
+        if baseline_digest == retired and proposed_digest == adopted:
+            adoption = True
+        if baseline_digest == adopted and proposed_digest == retired:
+            rollback = True
+    if adoption:
+        return "adoption"
+    if rollback:
+        return "rollback"
+    return "unrelated"
+
+
+def ci_job_generation_transition_errors(
+    merge_base_contents: str,
+    proposed_contents: str,
+    source: str,
+    *,
+    transitions: tuple[tuple[str, str, str], ...] = CI_JOB_GENERATION_TRANSITIONS,
+) -> list[str]:
+    """Refuse an exact revert of an admitted CI job generation."""
+
+    errors: list[str] = []
+    seen: set[str] = set()
+    for job_name, _, _ in transitions:
+        if job_name in seen:
+            continue
+        seen.add(job_name)
+        baseline, baseline_failures = extract_job_block(
+            merge_base_contents,
+            f"merge-base {source}",
+            job_name,
+            required=False,
+        )
+        proposed, proposed_failures = extract_job_block(
+            proposed_contents,
+            f"proposed {source}",
+            job_name,
+            required=False,
+        )
+        errors.extend(baseline_failures)
+        errors.extend(proposed_failures)
+        if baseline_failures or proposed_failures:
+            continue
+        if (
+            named_digest_generation_transition(
+                job_name,
+                baseline or "",
+                proposed or "",
+                transitions,
+            )
+            == "rollback"
+        ):
+            errors.append(
+                f"proposed {source} job {job_name!r} cannot return to a retired "
+                "generation after the trusted base adopts an admitted one"
+            )
+    return list(dict.fromkeys(errors))
+
+
+def admitted_ci_job_generation_names(
+    merge_base_contents: str,
+    proposed_contents: str,
+    source: str,
+    *,
+    transitions: tuple[tuple[str, str, str], ...] = CI_JOB_GENERATION_TRANSITIONS,
+) -> frozenset[str]:
+    """Return job names whose revision pair is an admitted SHA-256 adoption."""
+
+    names: set[str] = set()
+    seen: set[str] = set()
+    for job_name, _, _ in transitions:
+        if job_name in seen:
+            continue
+        seen.add(job_name)
+        baseline, baseline_failures = extract_job_block(
+            merge_base_contents,
+            f"merge-base {source}",
+            job_name,
+            required=False,
+        )
+        proposed, proposed_failures = extract_job_block(
+            proposed_contents,
+            f"proposed {source}",
+            job_name,
+            required=False,
+        )
+        if baseline_failures or proposed_failures:
+            continue
+        if (
+            named_digest_generation_transition(
+                job_name,
+                baseline or "",
+                proposed or "",
+                transitions,
+            )
+            == "adoption"
+        ):
+            names.add(job_name)
+    return frozenset(names)
+
+
 def scan_pr_workflow_collection_cross_surfaces(
     merge_base_workflows: dict[str, str],
     proposed_workflows: dict[str, str],
@@ -11960,6 +12558,9 @@ def scan_pr_workflow_collection_cross_surfaces(
     *,
     admitted_generation_transition: tuple[str, str, str] = (
         FIPS_BUILD_ADMITTED_GENERATION_TRANSITION
+    ),
+    directory_job_transitions: tuple[tuple[str, str, str, str], ...] = (
+        WORKFLOW_DIRECTORY_JOB_GENERATION_TRANSITIONS
     ),
 ) -> list[str]:
     """Permit safe workflow edits while rejecting new or changed Cross inputs.
@@ -11969,6 +12570,10 @@ def scan_pr_workflow_collection_cross_surfaces(
     before/after fixture must be able to prove that a hostile edit changes the
     Cross surface without also being asked to be a whole repository. The
     production pull-request path calls `compare_pr_workflow_collection`.
+
+    Both admission keywords exist so the self-test can drive the production
+    comparisons with fixtures it is able to construct; production always uses
+    the module bindings, and no repository input reaches either parameter.
     """
 
     errors: list[str] = []
@@ -12047,6 +12652,43 @@ def scan_pr_workflow_collection_cross_surfaces(
         proposed_failures = [*proposed_failures, *proposed_flow_failures]
         errors.extend(baseline_failures)
         errors.extend(proposed_failures)
+        # Admitted per-file job generation transitions: the same exact-pair,
+        # one-way mechanism as the `ci.yml` table, keyed additionally by the
+        # workflow filename. On the exact admitted adoption only that job's
+        # `job:<name>:<digest>` surfaces are withheld from BOTH revisions — the
+        # withheld surfaces ARE the admitted digests, so any other change to
+        # the job, and any Cross surface anywhere else in the file, still
+        # differs and is refused. The reverse pair is refused explicitly.
+        file_job_transitions = tuple(
+            (job_name, retired, adopted)
+            for workflow_name, job_name, retired, adopted in (
+                directory_job_transitions
+            )
+            if workflow_name == name
+        )
+        if file_job_transitions:
+            errors.extend(
+                ci_job_generation_transition_errors(
+                    baseline_contents,
+                    proposed_contents,
+                    f"{source}/{name}",
+                    transitions=file_job_transitions,
+                )
+            )
+            admitted_file_jobs = admitted_ci_job_generation_names(
+                baseline_contents,
+                proposed_contents,
+                f"{source}/{name}",
+                transitions=file_job_transitions,
+            )
+            baseline_surfaces = without_admitted_job_surfaces(
+                baseline_surfaces,
+                admitted_file_jobs,
+            )
+            proposed_surfaces = without_admitted_job_surfaces(
+                proposed_surfaces,
+                admitted_file_jobs,
+            )
         if not baseline_failures and not proposed_failures:
             # The admitted generation transition withholds this one verdict, for
             # this one file, for this one revision pair. Both failure lists above
@@ -12624,20 +13266,40 @@ def compare_pr_action_collection(
     merge_base_actions: dict[str, str],
     proposed_actions: dict[str, str],
     source: str,
+    *,
+    action_generation_transitions: tuple[tuple[str, str, str], ...] = (
+        LOCAL_ACTION_GENERATION_TRANSITIONS
+    ),
 ) -> list[str]:
     """Permit benign local-action edits while freezing Cross-sensitive files."""
 
     errors: list[str] = []
     for name in sorted(set(merge_base_actions) | set(proposed_actions)):
+        baseline_contents = merge_base_actions.get(name, "")
+        proposed_file = proposed_actions.get(name, "")
+        generation_transition = named_digest_generation_transition(
+            name,
+            baseline_contents,
+            proposed_file,
+            action_generation_transitions,
+        )
+        if generation_transition == "rollback":
+            errors.append(
+                f"{source}/{name} cannot return to a retired local-action "
+                "generation after the trusted base adopts an admitted one"
+            )
         baseline_surfaces = automation_file_cross_surfaces(
             name,
-            merge_base_actions.get(name, ""),
+            baseline_contents,
         )
         proposed_surfaces = automation_file_cross_surfaces(
             name,
-            proposed_actions.get(name, ""),
+            proposed_file,
         )
-        if baseline_surfaces != proposed_surfaces:
+        if (
+            baseline_surfaces != proposed_surfaces
+            and generation_transition != "adoption"
+        ):
             errors.append(
                 f"{source}/{name} cannot add or change Cross executable/"
                 "configuration surfaces"
@@ -16329,6 +16991,10 @@ def compare_pr_workflow_job(
     proposed_contents: str,
     source: str,
     job_name: str,
+    *,
+    job_generation_transitions: tuple[tuple[str, str, str], ...] = (
+        CI_JOB_GENERATION_TRANSITIONS
+    ),
 ) -> list[str]:
     """Hold a protected workflow to the trusted contract across a pull request.
 
@@ -16346,12 +17012,14 @@ def compare_pr_workflow_job(
     Equality with the trusted base already prevents a pull request from moving
     any of the three.
 
-    Two admissions are withheld from the surface comparison, both symmetrically
-    and both tied to a contract that has already validated exactly: the anchored
-    `fuzz-smoke` wiring in `ci.yml`, and the one admitted release image-family
-    adoption, whose frozen text is projected back to the shape it came from by
-    `release_family_transition_surface_contents`. Neither withholds a whole job's
-    comparison, and neither is reachable without the complete frozen contract.
+    Three admissions are withheld from the surface comparison, each tied to a
+    contract that has already validated exactly: the anchored `fuzz-smoke`
+    wiring in `ci.yml`; the one admitted release image-family adoption, whose
+    frozen text is projected back to the shape it came from by
+    `release_family_transition_surface_contents`; and the SHA-256 job-generation
+    pairs in `CI_JOB_GENERATION_TRANSITIONS`, which withhold one whole-job
+    digest surface for one named retired→adopted pair. None is reachable
+    without the complete frozen contract the trusted base already names.
     """
 
     baseline, failures = extract_job_block(
@@ -16504,6 +17172,28 @@ def compare_pr_workflow_job(
             proposed_surfaces,
             admitted_ci_job_names(proposed_contents, f"proposed {source}"),
         )
+    errors.extend(
+        ci_job_generation_transition_errors(
+            merge_base_contents,
+            proposed_contents,
+            source,
+            transitions=job_generation_transitions,
+        )
+    )
+    generation_jobs = admitted_ci_job_generation_names(
+        merge_base_contents,
+        proposed_contents,
+        source,
+        transitions=job_generation_transitions,
+    )
+    baseline_surfaces = without_admitted_job_surfaces(
+        baseline_surfaces,
+        generation_jobs,
+    )
+    proposed_surfaces = without_admitted_job_surfaces(
+        proposed_surfaces,
+        generation_jobs,
+    )
     if not baseline_surface_failures and not proposed_surface_failures:
         if baseline_surfaces != proposed_surfaces:
             errors.append(
@@ -18175,6 +18865,510 @@ pre_build = []
     ):
         failures.append(
             "the workflow generation digest is not the SHA-256 of the revision"
+        )
+
+    # --- Admitted workflow-directory job generation transitions -------------
+    # The production table names two exact `extract_job_block` digests of a job
+    # this fixture cannot embed, so the fixtures below are two synthetic
+    # generations of one Cross-flagged job and the admitted pair is supplied
+    # through the same keyword production uses. Both generations carry a
+    # literal Cross execution so both revisions are guaranteed to carry the
+    # whole-job `job:<name>:<digest>` surface, which is what makes every
+    # "was not admitted" assertion below meaningful.
+    directory_job_fixture_name = "coverage.yml"
+    directory_job_fixture_job = "coverage-merge"
+    directory_job_retired_generation = (
+        "name: Coverage merge fixture\n"
+        "on: [pull_request]\n"
+        "jobs:\n"
+        "  coverage-merge:\n"
+        "    runs-on: ubuntu-latest\n"
+        "    steps:\n"
+        "      - run: cross build --target aarch64-unknown-linux-gnu\n"
+    )
+    directory_job_adopted_generation = directory_job_retired_generation.replace(
+        "      - run: cross build --target aarch64-unknown-linux-gnu\n",
+        "      - run: cross build --target aarch64-unknown-linux-gnu\n"
+        "      - run: echo adopted\n",
+    )
+    directory_job_retired_block, directory_job_retired_failures = extract_job_block(
+        directory_job_retired_generation,
+        "self-test workflow directory fixture",
+        directory_job_fixture_job,
+        required=True,
+    )
+    directory_job_adopted_block, directory_job_adopted_failures = extract_job_block(
+        directory_job_adopted_generation,
+        "self-test workflow directory fixture",
+        directory_job_fixture_job,
+        required=True,
+    )
+    if (
+        directory_job_retired_failures
+        or directory_job_adopted_failures
+        or directory_job_retired_block is None
+        or directory_job_adopted_block is None
+    ):
+        failures.append(
+            "the workflow-directory job generation fixtures did not parse"
+        )
+    else:
+        directory_job_fixture_transitions = (
+            (
+                directory_job_fixture_name,
+                directory_job_fixture_job,
+                workflow_generation_digest(directory_job_retired_block),
+                workflow_generation_digest(directory_job_adopted_block),
+            ),
+        )
+        directory_job_rollback_refusal = (
+            f"proposed self-test workflow directory/{directory_job_fixture_name} "
+            f"job {directory_job_fixture_job!r} cannot return to a retired "
+            "generation after the trusted base adopts an admitted one"
+        )
+
+        def directory_job_scan(
+            baseline: dict[str, str],
+            proposed: dict[str, str],
+            *,
+            transitions: tuple[tuple[str, str, str, str], ...] | None = (
+                directory_job_fixture_transitions
+            ),
+        ) -> list[str]:
+            """Scan one fixture pair, optionally under the production table."""
+
+            if transitions is None:
+                return scan_pr_workflow_collection_cross_surfaces(
+                    baseline,
+                    proposed,
+                    "self-test workflow directory",
+                )
+            return scan_pr_workflow_collection_cross_surfaces(
+                baseline,
+                proposed,
+                "self-test workflow directory",
+                directory_job_transitions=transitions,
+            )
+
+        if fips_surface_conflict(directory_job_fixture_name) in directory_job_scan(
+            {directory_job_fixture_name: directory_job_retired_generation},
+            {directory_job_fixture_name: directory_job_adopted_generation},
+        ):
+            failures.append(
+                "the admitted workflow-directory job generation transition was "
+                "rejected"
+            )
+        # The same file and the same two revisions under the production table:
+        # the admission is the two exact job digests, not the file or job name.
+        if fips_surface_conflict(
+            directory_job_fixture_name
+        ) not in directory_job_scan(
+            {directory_job_fixture_name: directory_job_retired_generation},
+            {directory_job_fixture_name: directory_job_adopted_generation},
+            transitions=None,
+        ):
+            failures.append(
+                "the workflow-directory job admission is bound to a job name "
+                "rather than to the two exact generations it names"
+            )
+        directory_job_rejected_pairs = {
+            "a wrong predecessor": (
+                directory_job_retired_generation.replace(
+                    "aarch64-unknown-linux-gnu", "x86_64-unknown-linux-gnu"
+                ),
+                directory_job_adopted_generation,
+            ),
+            "a drifted destination": (
+                directory_job_retired_generation,
+                directory_job_adopted_generation.replace(
+                    "echo adopted", "echo drifted"
+                ),
+            ),
+            "further drift after adoption": (
+                directory_job_adopted_generation,
+                directory_job_adopted_generation.replace(
+                    "echo adopted", "echo drifted"
+                ),
+            ),
+            "the reverse transition": (
+                directory_job_adopted_generation,
+                directory_job_retired_generation,
+            ),
+        }
+        for label, (
+            directory_job_baseline,
+            directory_job_proposed,
+        ) in directory_job_rejected_pairs.items():
+            if fips_surface_conflict(
+                directory_job_fixture_name
+            ) not in directory_job_scan(
+                {directory_job_fixture_name: directory_job_baseline},
+                {directory_job_fixture_name: directory_job_proposed},
+            ):
+                failures.append(
+                    f"the workflow-directory job admission accepted {label}"
+                )
+        if directory_job_rollback_refusal not in directory_job_scan(
+            {directory_job_fixture_name: directory_job_adopted_generation},
+            {directory_job_fixture_name: directory_job_retired_generation},
+        ):
+            failures.append(
+                "returning the workflow-directory job to the retired generation "
+                "was not refused as a one-way transition"
+            )
+        if fips_surface_conflict("attacker.yml") not in directory_job_scan(
+            {"attacker.yml": directory_job_retired_generation},
+            {"attacker.yml": directory_job_adopted_generation},
+        ):
+            failures.append(
+                "the workflow-directory job admission was applied to a workflow "
+                "filename the table does not name"
+            )
+        directory_job_simultaneous = directory_job_scan(
+            {
+                directory_job_fixture_name: directory_job_retired_generation,
+                "attacker.yml": safe_extra_workflow,
+            },
+            {
+                directory_job_fixture_name: directory_job_adopted_generation,
+                "attacker.yml": added_cross_workflow,
+            },
+        )
+        if fips_surface_conflict("attacker.yml") not in directory_job_simultaneous:
+            failures.append(
+                "a Cross surface added alongside the admitted workflow-directory "
+                "job transition was not rejected"
+            )
+        if fips_surface_conflict(
+            directory_job_fixture_name
+        ) in directory_job_simultaneous:
+            failures.append(
+                "the admitted workflow-directory job transition was rejected "
+                "because an unrelated workflow changed in the same proposal"
+            )
+    seen_directory_job_tuples: set[tuple[str, str, str, str]] = set()
+    for (
+        directory_workflow_name,
+        directory_job_name,
+        directory_retired_digest,
+        directory_adopted_digest,
+    ) in WORKFLOW_DIRECTORY_JOB_GENERATION_TRANSITIONS:
+        if (
+            directory_workflow_name,
+            directory_job_name,
+            directory_retired_digest,
+            directory_adopted_digest,
+        ) in seen_directory_job_tuples:
+            failures.append(
+                "duplicate workflow-directory job generation tuple "
+                f"{directory_workflow_name!r}/{directory_job_name!r}"
+            )
+        seen_directory_job_tuples.add(
+            (
+                directory_workflow_name,
+                directory_job_name,
+                directory_retired_digest,
+                directory_adopted_digest,
+            )
+        )
+        for directory_digest in (directory_retired_digest, directory_adopted_digest):
+            if WORKFLOW_GENERATION_DIGEST.fullmatch(directory_digest) is None:
+                failures.append(
+                    "workflow-directory job generation "
+                    f"{directory_workflow_name!r}/{directory_job_name!r} does "
+                    "not pin SHA-256 digests"
+                )
+        if directory_retired_digest == directory_adopted_digest:
+            failures.append(
+                "workflow-directory job generation "
+                f"{directory_workflow_name!r}/{directory_job_name!r} must name "
+                "two distinct revisions"
+            )
+        if not directory_job_name:
+            failures.append(
+                "workflow-directory job generation entries must name a job"
+            )
+        # A file the comparison loop never reaches — a protected workflow, or
+        # the frozen fuzz lane, which is decided before this admission is
+        # consulted — could not be admitted, so naming one is a silent no-op.
+        if (
+            directory_workflow_name in PROTECTED_WORKFLOW_FILENAMES
+            or directory_workflow_name == FUZZ_WORKFLOW_FILENAME
+            or WORKFLOW_FILENAME.fullmatch(directory_workflow_name) is None
+        ):
+            failures.append(
+                "workflow-directory job generation "
+                f"{directory_workflow_name!r}/{directory_job_name!r} names a "
+                "workflow the pull-request comparison never reaches"
+            )
+
+    job_gen_prologue = (
+        "name: CI\n"
+        "on:\n"
+        "  pull_request:\n"
+        "jobs:\n"
+        "  frozen:\n"
+        "    runs-on: ubuntu-latest\n"
+        "    steps:\n"
+        "      - run: echo frozen\n"
+    )
+    job_gen_retired_extra = (
+        "  extra:\n"
+        "    runs-on: ubuntu-latest\n"
+        "    steps:\n"
+        "      - run: cross build --target aarch64-unknown-linux-gnu\n"
+        "        # retired-generation\n"
+    )
+    job_gen_adopted_extra = (
+        "  extra:\n"
+        "    runs-on: ubuntu-latest\n"
+        "    steps:\n"
+        "      - run: cross build --target aarch64-unknown-linux-gnu\n"
+        "        # adopted-generation\n"
+    )
+    job_gen_other_extra = (
+        "  extra:\n"
+        "    runs-on: ubuntu-latest\n"
+        "    steps:\n"
+        "      - run: cross build --target aarch64-unknown-linux-gnu\n"
+        "        # other-generation\n"
+    )
+    job_gen_retired = job_gen_prologue + job_gen_retired_extra
+    job_gen_adopted = job_gen_prologue + job_gen_adopted_extra
+    job_gen_other = job_gen_prologue + job_gen_other_extra
+    job_gen_retired_block, job_gen_retired_failures = extract_job_block(
+        job_gen_retired, "self-test CI job generation", "extra", required=True
+    )
+    job_gen_adopted_block, job_gen_adopted_failures = extract_job_block(
+        job_gen_adopted, "self-test CI job generation", "extra", required=True
+    )
+    job_gen_other_block, job_gen_other_failures = extract_job_block(
+        job_gen_other, "self-test CI job generation", "extra", required=True
+    )
+    if job_gen_retired_failures or job_gen_adopted_failures or job_gen_other_failures:
+        failures.append("the CI job generation fixture could not be extracted")
+    job_gen_retired_digest = workflow_generation_digest(job_gen_retired_block or "")
+    job_gen_adopted_digest = workflow_generation_digest(job_gen_adopted_block or "")
+    job_gen_other_digest = workflow_generation_digest(job_gen_other_block or "")
+    if (
+        job_gen_retired_digest is None
+        or job_gen_adopted_digest is None
+        or job_gen_other_digest is None
+        or len({job_gen_retired_digest, job_gen_adopted_digest, job_gen_other_digest})
+        != 3
+    ):
+        failures.append("the CI job generation fixture digests are not distinct")
+    job_gen_fixture_transitions = (
+        ("extra", job_gen_retired_digest or "", job_gen_adopted_digest or ""),
+        ("extra", job_gen_retired_digest or "", job_gen_other_digest or ""),
+    )
+    job_generation_pairs = {
+        "exact first adoption": (
+            job_gen_retired_block or "",
+            job_gen_adopted_block or "",
+            "adoption",
+        ),
+        "exact second adoption": (
+            job_gen_retired_block or "",
+            job_gen_other_block or "",
+            "adoption",
+        ),
+        "exact rollback": (
+            job_gen_adopted_block or "",
+            job_gen_retired_block or "",
+            "rollback",
+        ),
+        "destination to destination": (
+            job_gen_adopted_block or "",
+            job_gen_other_block or "",
+            "unrelated",
+        ),
+        "absent proposed": (job_gen_retired_block or "", "", "unrelated"),
+    }
+    for label, (job_baseline, job_proposed, expected) in job_generation_pairs.items():
+        verdict = named_digest_generation_transition(
+            "extra",
+            job_baseline,
+            job_proposed,
+            job_gen_fixture_transitions,
+        )
+        if verdict != expected:
+            failures.append(
+                f"the CI job generation pair {label!r} classified as "
+                f"{verdict!r} rather than {expected!r}"
+            )
+    if (
+        named_digest_generation_transition(
+            "ci-plan",
+            job_gen_retired_block or "",
+            job_gen_adopted_block or "",
+            job_gen_fixture_transitions,
+        )
+        != "unrelated"
+    ):
+        failures.append("the CI job generation admission is not bound to its job name")
+    job_gen_source = "self-test CI job generation"
+    if compare_pr_workflow_job(
+        job_gen_retired,
+        job_gen_adopted,
+        job_gen_source,
+        "frozen",
+        job_generation_transitions=job_gen_fixture_transitions,
+    ):
+        failures.append("an admitted CI job generation adoption was rejected")
+    if not compare_pr_workflow_job(
+        job_gen_retired,
+        job_gen_adopted,
+        job_gen_source,
+        "frozen",
+        job_generation_transitions=(),
+    ):
+        failures.append(
+            "a CI job rewrite was accepted without an admitted generation pair"
+        )
+    job_gen_rollback = compare_pr_workflow_job(
+        job_gen_adopted,
+        job_gen_retired,
+        job_gen_source,
+        "frozen",
+        job_generation_transitions=job_gen_fixture_transitions,
+    )
+    if not any("cannot return to a retired" in item for item in job_gen_rollback):
+        failures.append("an admitted CI job generation rollback was not refused")
+    if not compare_pr_workflow_job(
+        job_gen_adopted,
+        job_gen_other,
+        job_gen_source,
+        "frozen",
+        job_generation_transitions=job_gen_fixture_transitions,
+    ):
+        failures.append(
+            "a move between two admitted CI job destinations was treated as a "
+            "generation rather than scanned"
+        )
+
+    action_gen_retired = (
+        "name: Setup\n"
+        "runs:\n"
+        "  using: composite\n"
+        "  steps:\n"
+        "    - run: cross build --target aarch64-unknown-linux-gnu\n"
+        "      shell: bash\n"
+        "      # retired-generation\n"
+    )
+    action_gen_adopted = action_gen_retired.replace(
+        "retired-generation", "adopted-generation"
+    )
+    action_gen_other = action_gen_retired.replace(
+        "retired-generation", "other-generation"
+    )
+    action_gen_retired_digest = workflow_generation_digest(action_gen_retired)
+    action_gen_adopted_digest = workflow_generation_digest(action_gen_adopted)
+    action_gen_other_digest = workflow_generation_digest(action_gen_other)
+    action_gen_name = "setup-rust-ci/action.yml"
+    action_gen_fixture_transitions = (
+        (
+            action_gen_name,
+            action_gen_retired_digest or "",
+            action_gen_adopted_digest or "",
+        ),
+        (
+            action_gen_name,
+            action_gen_retired_digest or "",
+            action_gen_other_digest or "",
+        ),
+    )
+    if compare_pr_action_collection(
+        {action_gen_name: action_gen_retired},
+        {action_gen_name: action_gen_adopted},
+        "self-test local-action directory",
+        action_generation_transitions=action_gen_fixture_transitions,
+    ):
+        failures.append("an admitted local-action generation adoption was rejected")
+    if not compare_pr_action_collection(
+        {action_gen_name: action_gen_retired},
+        {action_gen_name: action_gen_adopted},
+        "self-test local-action directory",
+        action_generation_transitions=(),
+    ):
+        failures.append(
+            "a local-action rewrite was accepted without an admitted generation pair"
+        )
+    action_gen_rollback = compare_pr_action_collection(
+        {action_gen_name: action_gen_adopted},
+        {action_gen_name: action_gen_retired},
+        "self-test local-action directory",
+        action_generation_transitions=action_gen_fixture_transitions,
+    )
+    if not any("cannot return to a retired" in item for item in action_gen_rollback):
+        failures.append(
+            "an admitted local-action generation rollback was not refused"
+        )
+    if (
+        named_digest_generation_transition(
+            "setup/action.yml",
+            action_gen_retired,
+            action_gen_adopted,
+            action_gen_fixture_transitions,
+        )
+        != "unrelated"
+    ):
+        failures.append(
+            "the local-action generation admission is not bound to its path"
+        )
+
+    seen_job_generation_tuples: set[tuple[str, str, str]] = set()
+    for job_name, retired, adopted in CI_JOB_GENERATION_TRANSITIONS:
+        if (job_name, retired, adopted) in seen_job_generation_tuples:
+            failures.append(
+                f"duplicate CI job generation tuple for {job_name!r}"
+            )
+        seen_job_generation_tuples.add((job_name, retired, adopted))
+        if job_name in {CI_FUZZ_SMOKE_JOB_NAME, "build-arm64-cross"}:
+            failures.append(
+                f"CI job generation {job_name!r} collides with a whole-text freeze"
+            )
+        if retired == adopted:
+            failures.append(f"CI job generation {job_name!r} is not a move")
+        if (
+            WORKFLOW_GENERATION_DIGEST.fullmatch(retired) is None
+            or WORKFLOW_GENERATION_DIGEST.fullmatch(adopted) is None
+        ):
+            failures.append(
+                f"CI job generation {job_name!r} does not pin SHA-256 digests"
+            )
+    seen_action_generation_tuples: set[tuple[str, str, str]] = set()
+    for action_name, retired, adopted in LOCAL_ACTION_GENERATION_TRANSITIONS:
+        if (action_name, retired, adopted) in seen_action_generation_tuples:
+            failures.append(
+                f"duplicate local-action generation tuple for {action_name!r}"
+            )
+        seen_action_generation_tuples.add((action_name, retired, adopted))
+        if retired == adopted:
+            failures.append(f"local-action generation {action_name!r} is not a move")
+        if (
+            WORKFLOW_GENERATION_DIGEST.fullmatch(retired) is None
+            or WORKFLOW_GENERATION_DIGEST.fullmatch(adopted) is None
+        ):
+            failures.append(
+                f"local-action generation {action_name!r} does not pin SHA-256 "
+                "digests"
+            )
+    if LOCAL_ACTION_GENERATION_TRANSITIONS != (
+        (
+            "setup-rust-ci/action.yml",
+            "fc4e41818dffdea880c057c8dfa0881a629cd01c917b43f69a9f2e5e9bd90dda",
+            "b6ca6315ff9f2a206c1011b6b0166de3a340370fd75bf3e9cffe41e872008924",
+        ),
+        (
+            "setup-rust-ci/action.yml",
+            "b6ca6315ff9f2a206c1011b6b0166de3a340370fd75bf3e9cffe41e872008924",
+            "219187bdb0366d929577e67f48947b8c1096998dd7e04eafdffdb53dc3faa925",
+        ),
+    ):
+        failures.append(
+            "the setup-rust-ci generation table does not pin the cache-budget "
+            "generation chain and the rebased combined #3911 destination"
         )
 
     remote_action_composite = (
@@ -26119,6 +27313,27 @@ pre_build = []
                 f"frozen gate for {workflow_name} does not own {check_name!r}"
             )
 
+    SELF_TEST_AGGREGATE_SIBLING_JOBS = {
+        "node-waypoint-ebpf-live.yml": ("production-dockerfile-smoke",),
+    }
+    for sibling_owner, sibling_jobs in SELF_TEST_AGGREGATE_SIBLING_JOBS.items():
+        if sibling_owner not in LIVE_SUITE_GATE_CONTRACTS:
+            failures.append(
+                f"{sibling_owner} declares aggregate siblings without a frozen gate"
+            )
+            continue
+        gate_text = LIVE_SUITE_GATE_CONTRACTS[sibling_owner][1]
+        for sibling in sibling_jobs:
+            if f"      - {sibling}\n" not in gate_text:
+                failures.append(
+                    f"{sibling_owner} frozen gate must depend on sibling {sibling!r}"
+                )
+            if sibling in LIVE_SUITE_LIVE_JOBS.get(sibling_owner, ()):
+                failures.append(
+                    f"{sibling_owner} sibling {sibling!r} must not also be bound to "
+                    "the whole-suite relevance output"
+                )
+
     def relevance_workflow(
         contract_name: str, display: str, live_job: str, body: str
     ) -> str:
@@ -26141,6 +27356,18 @@ pre_build = []
                     "    runs-on: ubuntu-latest\n"
                     "    steps:\n"
                     "      - run: echo live\n"
+                )
+            # Sibling jobs the frozen aggregate depends on but that are NOT
+            # bound to the whole-suite classifier: NodeWaypoint's
+            # production-image aggregate keeps its own narrower planner.
+            for job in SELF_TEST_AGGREGATE_SIBLING_JOBS.get(contract_name, ()):
+                execution_jobs += (
+                    f"  {job}:\n"
+                    f"    name: {job} sibling\n"
+                    "    if: always()\n"
+                    "    runs-on: ubuntu-latest\n"
+                    "    steps:\n"
+                    "      - run: echo sibling\n"
                 )
             gate_contract = LIVE_SUITE_GATE_CONTRACTS.get(contract_name)
             if gate_contract is not None:
@@ -26175,6 +27402,77 @@ pre_build = []
     }
     if live_suite_relevance_errors(relevance_workflows, "self-test workflows"):
         failures.append("the trusted-base relevance contract was rejected")
+
+    image_cache_budget = ambient_host_udp_image_cache_budget_errors(
+        AMBIENT_HOST_UDP_IMAGE_JOB, "self-test-ambient-image-cache"
+    )
+    if image_cache_budget:
+        failures.append(
+            "the frozen Ambient image job failed its cache-budget contract: "
+            + "; ".join(image_cache_budget)
+        )
+
+    unconditional_image_job = AMBIENT_HOST_UDP_IMAGE_JOB.replace(
+        AMBIENT_HOST_UDP_IMAGE_GATED_CACHE_TO,
+        AMBIENT_HOST_UDP_IMAGE_UNCONDITIONAL_CACHE_TO,
+    )
+    if unconditional_image_job == AMBIENT_HOST_UDP_IMAGE_JOB:
+        failures.append(
+            "the unconditional Ambient cache-to self-test mutation is stale"
+        )
+    elif not any(
+        "unconditionally from pull requests" in item
+        for item in ambient_host_udp_image_cache_budget_errors(
+            unconditional_image_job,
+            "self-test-unconditional-ambient-cache-to",
+        )
+    ):
+        failures.append(
+            "self-test: restoring unconditional Ambient cache-to must fail"
+        )
+
+    skipped_image_job = AMBIENT_HOST_UDP_IMAGE_JOB.replace(
+        "- name: Build the capture tool base stage\n"
+        "        uses: docker/build-push-action@",
+        "- name: Build the capture tool base stage\n"
+        "        if: github.event_name == 'workflow_dispatch'\n"
+        "        uses: docker/build-push-action@",
+        1,
+    )
+    if skipped_image_job == AMBIENT_HOST_UDP_IMAGE_JOB:
+        failures.append(
+            "the skipped Ambient image-build self-test mutation is stale"
+        )
+    elif not any(
+        "must not skip the required image build" in item
+        for item in ambient_host_udp_image_cache_budget_errors(
+            skipped_image_job, "self-test-skipped-ambient-image-build"
+        )
+    ):
+        failures.append(
+            "self-test: gating a required Ambient image build on event name "
+            "must fail"
+        )
+
+    main_only_without_pr_guard = AMBIENT_HOST_UDP_IMAGE_JOB.replace(
+        "github.event_name != 'pull_request' && github.event_name != 'merge_group' && ",
+        "",
+    )
+    if main_only_without_pr_guard == AMBIENT_HOST_UDP_IMAGE_JOB:
+        failures.append(
+            "the Ambient cache-to pull_request/merge_group guard mutation is stale"
+        )
+    elif not any(
+        "gate all three Ambient image cache-to exports" in item
+        for item in ambient_host_udp_image_cache_budget_errors(
+            main_only_without_pr_guard,
+            "self-test-ambient-cache-to-without-pr-guard",
+        )
+    ):
+        failures.append(
+            "self-test: Ambient cache-to without pull_request/merge_group "
+            "exclusions must fail"
+        )
 
     relevance_mutations: dict[str, tuple[str, str]] = {
         "pull-request-supplied filter": (
@@ -26314,30 +27612,72 @@ pre_build = []
         failures.append("a missing push-to-main trigger was not rejected")
 
     node_waypoint_fixture = relevance_workflows["node-waypoint-ebpf-live.yml"]
-    detached_smoke = node_waypoint_fixture.replace(
-        "  production-dockerfile-smoke:\n"
-        "    name: production-dockerfile-smoke live\n"
+    detached_live = node_waypoint_fixture.replace(
+        "  node-waypoint-ebpf-live:\n"
+        "    name: node-waypoint-ebpf-live live\n"
         "    needs: changes\n"
         "    if: needs.changes.outputs.relevant == 'true'\n",
-        "  production-dockerfile-smoke:\n"
-        "    name: production-dockerfile-smoke live\n"
+        "  node-waypoint-ebpf-live:\n"
+        "    name: node-waypoint-ebpf-live live\n"
         "    needs: changes\n"
-        "    if: true\n",
+        "    if: always() && needs.production-dockerfile-plan.outputs."
+        "node_waypoint_relevant != 'false'\n",
         1,
     )
-    if detached_smoke == node_waypoint_fixture:
-        failures.append("the detached node-waypoint smoke binding mutation is stale")
-    else:
-        detached_smoke_collection = {
+    if detached_live == node_waypoint_fixture:
+        failures.append("the detached node-waypoint live binding mutation is stale")
+    elif not live_suite_relevance_errors(
+        {**relevance_workflows, "node-waypoint-ebpf-live.yml": detached_live},
+        "self-test workflows",
+    ):
+        failures.append(
+            "a node-waypoint live job re-pointed at the narrower production "
+            "planner was not rejected"
+        )
+
+    dropped_image_contract = node_waypoint_fixture.replace(
+        "      - changes\n      - production-dockerfile-smoke\n",
+        "      - changes\n",
+        1,
+    )
+    if dropped_image_contract == node_waypoint_fixture:
+        failures.append(
+            "the node-waypoint aggregate image-contract mutation is stale"
+        )
+    elif not live_suite_relevance_errors(
+        {
             **relevance_workflows,
-            "node-waypoint-ebpf-live.yml": detached_smoke,
-        }
-        if not live_suite_relevance_errors(
-            detached_smoke_collection, "self-test workflows"
-        ):
-            failures.append(
-                "a detached node-waypoint smoke relevance binding was not rejected"
-            )
+            "node-waypoint-ebpf-live.yml": dropped_image_contract,
+        },
+        "self-test workflows",
+    ):
+        failures.append(
+            "a NodeWaypoint aggregate that dropped the production-image "
+            "contract was not rejected"
+        )
+
+    reordered_image_contract = node_waypoint_fixture.replace(
+        '          if [ "${{ needs.production-dockerfile-smoke.result }}" '
+        '!= "success" ]; then\n',
+        '          if [ "${{ needs.production-dockerfile-smoke.result }}" '
+        '= "never" ]; then\n',
+        1,
+    )
+    if reordered_image_contract == node_waypoint_fixture:
+        failures.append(
+            "the node-waypoint aggregate image-result mutation is stale"
+        )
+    elif not live_suite_relevance_errors(
+        {
+            **relevance_workflows,
+            "node-waypoint-ebpf-live.yml": reordered_image_contract,
+        },
+        "self-test workflows",
+    ):
+        failures.append(
+            "a NodeWaypoint aggregate that stopped failing on a red "
+            "production-image contract was not rejected"
+        )
 
     for contract_name, (_gate_job, expected_gate) in LIVE_SUITE_GATE_CONTRACTS.items():
         missing_gate = dict(relevance_workflows)
@@ -26530,6 +27870,19 @@ pre_build = []
         "removed production-image contract job",
         "\n" + AMBIENT_HOST_UDP_IMAGE_JOB,
         "",
+    )
+    ambient_mutation(
+        "unconditional GHA cache-to",
+        AMBIENT_HOST_UDP_IMAGE_GATED_CACHE_TO,
+        AMBIENT_HOST_UDP_IMAGE_UNCONDITIONAL_CACHE_TO,
+    )
+    ambient_mutation(
+        "event-gated production-image build",
+        "- name: Build the capture tool base stage\n"
+        "        uses: docker/build-push-action@",
+        "- name: Build the capture tool base stage\n"
+        "        if: github.event_name == 'workflow_dispatch'\n"
+        "        uses: docker/build-push-action@",
     )
 
     ownership_mutations: dict[str, tuple[dict[str, str], str]] = {}
@@ -26805,8 +28158,22 @@ pre_build = []
     # ------------------------------------------------------------------
     # Admitted fuzz/property lane
     # ------------------------------------------------------------------
+    if len(CI_FUZZ_SMOKE_JOB_GENERATIONS) != len(set(CI_FUZZ_SMOKE_JOB_GENERATIONS)):
+        failures.append("the admitted fuzz-smoke generations are not distinct")
+    if CI_FUZZ_SMOKE_JOB_GENERATIONS[-1] != CI_FUZZ_SMOKE_JOB:
+        failures.append(
+            "the newest admitted fuzz-smoke generation must be CI_FUZZ_SMOKE_JOB"
+        )
+    if CI_FUZZ_SMOKE_JOB_GENERATIONS[0] != CI_FUZZ_SMOKE_RETIRED_JOB:
+        failures.append(
+            "the oldest admitted fuzz-smoke generation must be "
+            "CI_FUZZ_SMOKE_RETIRED_JOB"
+        )
     for admitted_label, admitted_text in (
-        ("fuzz-smoke job", CI_FUZZ_SMOKE_JOB),
+        *(
+            (f"fuzz-smoke job generation {generation}", admitted)
+            for generation, admitted in enumerate(CI_FUZZ_SMOKE_JOB_GENERATIONS)
+        ),
         ("scheduled fuzz lane", FUZZ_WORKFLOW),
     ):
         if TARGET in admitted_text:
@@ -26823,17 +28190,83 @@ pre_build = []
             failures.append(
                 f"the admitted {admitted_label} requests write permission"
             )
-        cargo_override_block = (
-            '    env:\n'
-            '      RUSTC_WRAPPER: ""\n'
-            '      CARGO_BUILD_RUSTC_WRAPPER: ""\n'
-            '      RUSTFLAGS: ""\n'
-        )
+    # Wherever the six-target budget runs, it runs at exactly these bounds. A
+    # generation that moved the lane must not also have relaxed it.
+    for generation, admitted in enumerate(CI_FUZZ_SMOKE_JOB_GENERATIONS):
+        if admitted.count(CI_FUZZ_SMOKE_BOUNDED_BUDGET) != 1:
+            failures.append(
+                f"admitted fuzz-smoke generation {generation} does not carry the "
+                "bounded six-target libFuzzer budget exactly once"
+            )
+    # The retired generation and the scheduled lane install no compiler cache
+    # at all, so both clear every wrapper input the root Cargo config sets.
+    cargo_override_block = (
+        '    env:\n'
+        '      RUSTC_WRAPPER: ""\n'
+        '      CARGO_BUILD_RUSTC_WRAPPER: ""\n'
+        '      RUSTFLAGS: ""\n'
+    )
+    for admitted_label, admitted_text in (
+        ("retired fuzz-smoke generation", CI_FUZZ_SMOKE_RETIRED_JOB),
+        ("scheduled fuzz lane", FUZZ_WORKFLOW),
+    ):
         if cargo_override_block not in admitted_text:
             failures.append(
-                f"the admitted {admitted_label} no longer disables repository "
-                "sccache wrapper inputs and inherited linker rustflags"
+                f"the {admitted_label} no longer disables repository sccache "
+                "wrapper inputs and inherited linker rustflags"
             )
+    # The adopted generation deliberately does the opposite for the wrapper: it
+    # leaves the name unset so the pinned installer's fail-closed GITHUB_ENV
+    # decision is the one cargo sees. Everything that makes that safe is
+    # asserted here rather than left to the prose of the contract.
+    if '    env:\n      RUSTFLAGS: ""\n' not in CI_FUZZ_SMOKE_JOB:
+        failures.append(
+            "the adopted fuzz-smoke generation no longer clears the inherited "
+            "linker rustflags of the root Cargo configuration"
+        )
+    if '      RUSTC_WRAPPER: ""\n' in CI_FUZZ_SMOKE_JOB:
+        failures.append(
+            "the adopted fuzz-smoke generation pins a job-level rustc wrapper, "
+            "which would override the pinned installer's fail-closed decision"
+        )
+    if CI_FUZZ_SMOKE_JOB.count("uses: ./.github/actions/") != 1:
+        failures.append(
+            "the adopted fuzz-smoke generation must reference exactly one local "
+            "action"
+        )
+    if "      - uses: ./.github/actions/setup-sccache\n" not in CI_FUZZ_SMOKE_JOB:
+        failures.append(
+            "the adopted fuzz-smoke generation no longer uses the repository's "
+            "checksum-pinned sccache installer"
+        )
+    if (
+        "          save-if: ${{ github.event_name == 'push' && "
+        "github.ref == 'refs/heads/main' }}\n"
+    ) not in CI_FUZZ_SMOKE_JOB:
+        failures.append(
+            "the adopted fuzz-smoke generation lets an untrusted ref write the "
+            "compiler cache the sanitizer build restores"
+        )
+    if "        if: github.event_name != 'pull_request'\n" not in CI_FUZZ_SMOKE_JOB:
+        failures.append(
+            "the adopted fuzz-smoke generation no longer keeps the sanitizer "
+            "budget off the ordinary pull-request path"
+        )
+    for admitted_event in (
+        "github.event_name == 'merge_group'",
+        "(github.event_name == 'push' && github.ref == 'refs/heads/main')",
+        "github.event_name == 'workflow_dispatch'",
+    ):
+        if admitted_event not in CI_FUZZ_SMOKE_JOB:
+            failures.append(
+                "the adopted fuzz-smoke generation no longer reaches the "
+                f"sanitizer budget through {admitted_event}"
+            )
+    if "needs.ci-plan.outputs.mode == 'full'" not in CI_FUZZ_SMOKE_JOB:
+        failures.append(
+            "the adopted fuzz-smoke generation no longer runs as a full-mode "
+            "required gate"
+        )
     if (
         "\non:\n  schedule:\n    - cron: '30 6 * * 1'\n  workflow_dispatch:\n"
         "\npermissions:\n  contents: read\n"
@@ -26843,15 +28276,22 @@ pre_build = []
             "schedule/dispatch trigger and read-only permissions"
         )
 
-    fuzz_ci_workflow = (
-        "name: Self-test CI\non:\n  pull_request:\njobs:\n" + CI_FUZZ_SMOKE_JOB
+    fuzz_generation_workflows = tuple(
+        "name: Self-test CI\non:\n  pull_request:\njobs:\n" + admitted
+        for admitted in CI_FUZZ_SMOKE_JOB_GENERATIONS
     )
-    if admitted_fuzz_smoke_errors(fuzz_ci_workflow, "CI workflow"):
-        failures.append("the admitted fuzz-smoke contract was rejected")
-    if admitted_ci_job_names(fuzz_ci_workflow, "CI workflow") != frozenset(
-        {CI_FUZZ_SMOKE_JOB_NAME}
-    ):
-        failures.append("the admitted fuzz-smoke job was not recognized")
+    fuzz_ci_workflow = fuzz_generation_workflows[-1]
+    for generation, generation_workflow in enumerate(fuzz_generation_workflows):
+        if admitted_fuzz_smoke_errors(generation_workflow, "CI workflow"):
+            failures.append(
+                f"the admitted fuzz-smoke generation {generation} was rejected"
+            )
+        if admitted_ci_job_names(generation_workflow, "CI workflow") != frozenset(
+            {CI_FUZZ_SMOKE_JOB_NAME}
+        ):
+            failures.append(
+                f"the admitted fuzz-smoke generation {generation} was not recognized"
+            )
     fuzz_absent_workflow = (
         "name: Self-test CI\non:\n  pull_request:\njobs:\n"
         "  other:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo ok\n"
@@ -26860,18 +28300,50 @@ pre_build = []
         failures.append("an absent fuzz-smoke job was rejected")
     if admitted_ci_job_names(fuzz_absent_workflow, "CI workflow"):
         failures.append("an absent fuzz-smoke job was reported as admitted")
-    if not admitted_fuzz_smoke_removal_errors(
-        fuzz_ci_workflow,
-        fuzz_absent_workflow,
-        "CI workflow",
-    ):
-        failures.append("removal of an adopted fuzz-smoke job was not rejected")
-    if admitted_fuzz_smoke_removal_errors(
-        fuzz_absent_workflow,
-        fuzz_ci_workflow,
-        "CI workflow",
-    ):
-        failures.append("initial adoption of the fuzz-smoke job was rejected")
+    for generation, generation_workflow in enumerate(fuzz_generation_workflows):
+        if not admitted_fuzz_smoke_removal_errors(
+            generation_workflow,
+            fuzz_absent_workflow,
+            "CI workflow",
+        ):
+            failures.append(
+                f"removal of adopted fuzz-smoke generation {generation} was not "
+                "rejected"
+            )
+        if admitted_fuzz_smoke_removal_errors(
+            fuzz_absent_workflow,
+            generation_workflow,
+            "CI workflow",
+        ):
+            failures.append(
+                f"initial adoption of fuzz-smoke generation {generation} was "
+                "rejected"
+            )
+    # Withholding is symmetric across generations, so nothing but this check
+    # gives the transition a direction. Assert both halves of it.
+    for older_generation in range(len(fuzz_generation_workflows)):
+        for newer_generation in range(
+            older_generation + 1,
+            len(fuzz_generation_workflows),
+        ):
+            if admitted_fuzz_smoke_removal_errors(
+                fuzz_generation_workflows[older_generation],
+                fuzz_generation_workflows[newer_generation],
+                "CI workflow",
+            ):
+                failures.append(
+                    "the admitted fuzz-smoke transition "
+                    f"{older_generation} -> {newer_generation} was rejected"
+                )
+            if not admitted_fuzz_smoke_removal_errors(
+                fuzz_generation_workflows[newer_generation],
+                fuzz_generation_workflows[older_generation],
+                "CI workflow",
+            ):
+                failures.append(
+                    "reverting the admitted fuzz-smoke generation "
+                    f"{newer_generation} to {older_generation} was not rejected"
+                )
 
     fuzz_smoke_tampering: dict[str, tuple[str, str]] = {
         "altered outer deadline": ("timeout-minutes: 60", "timeout-minutes: 30"),
@@ -26917,17 +28389,76 @@ pre_build = []
             "    needs: ci-plan\n    continue-on-error: true\n",
         ),
     }
-    for tamper_name, (original, replacement) in fuzz_smoke_tampering.items():
+    # Every generation is admitted, so every generation has to be tamper-proof.
+    for generation, generation_workflow in enumerate(fuzz_generation_workflows):
+        for tamper_name, (original, replacement) in fuzz_smoke_tampering.items():
+            tampered = generation_workflow.replace(original, replacement)
+            if tampered == generation_workflow:
+                failures.append(
+                    f"the {tamper_name} fuzz-smoke self-test mutation is stale "
+                    f"for generation {generation}"
+                )
+                continue
+            if not admitted_fuzz_smoke_errors(tampered, "CI workflow"):
+                failures.append(
+                    f"a {tamper_name} fuzz-smoke generation {generation} job was "
+                    "not rejected"
+                )
+            if admitted_ci_job_names(tampered, "CI workflow"):
+                failures.append(
+                    f"a {tamper_name} fuzz-smoke generation {generation} job was "
+                    "still admitted"
+                )
+
+    # What issue #3902 added to the contract, and therefore what a later pull
+    # request must not be able to take back out of it.
+    fuzz_smoke_adopted_tampering: dict[str, tuple[str, str]] = {
+        "sanitizer budget restored to every pull request": (
+            "        if: github.event_name != 'pull_request'\n",
+            "",
+        ),
+        "sanitizer budget dropped from the merge queue": (
+            "        if: github.event_name != 'pull_request'\n",
+            "        if: github.event_name == 'workflow_dispatch'\n",
+        ),
+        "property gate dropped from pull requests": (
+            "      - name: Run deterministic property smoke tests\n",
+            "      - name: Run deterministic property smoke tests\n"
+            "        if: github.event_name != 'pull_request'\n",
+        ),
+        "untrusted cache writes": (
+            "          save-if: ${{ github.event_name == 'push' && "
+            "github.ref == 'refs/heads/main' }}\n",
+            "          save-if: true\n",
+        ),
+        "unpinned third-party sccache installer": (
+            "      - uses: ./.github/actions/setup-sccache\n",
+            "      - uses: mozilla-actions/sccache-action@v0.0.9\n",
+        ),
+        "credential-bearing cache backend": (
+            '    env:\n      RUSTFLAGS: ""\n',
+            '    env:\n      RUSTFLAGS: ""\n      SCCACHE_GHA_ENABLED: "true"\n',
+        ),
+        "cache directory escape": (
+            "          cache-directories: ${{ github.workspace }}/.cache/sccache\n",
+            "          cache-directories: /\n",
+        ),
+    }
+    for tamper_name, (original, replacement) in fuzz_smoke_adopted_tampering.items():
         tampered = fuzz_ci_workflow.replace(original, replacement)
         if tampered == fuzz_ci_workflow:
             failures.append(
-                f"the {tamper_name} fuzz-smoke self-test mutation is stale"
+                f"the {tamper_name} adopted fuzz-smoke self-test mutation is stale"
             )
             continue
         if not admitted_fuzz_smoke_errors(tampered, "CI workflow"):
-            failures.append(f"a {tamper_name} fuzz-smoke job was not rejected")
+            failures.append(
+                f"a {tamper_name} adopted fuzz-smoke job was not rejected"
+            )
         if admitted_ci_job_names(tampered, "CI workflow"):
-            failures.append(f"a {tamper_name} fuzz-smoke job was still admitted")
+            failures.append(
+                f"a {tamper_name} adopted fuzz-smoke job was still admitted"
+            )
 
     # ------------------------------------------------------------------
     # Initial adoption of the fuzz gate in the required `test` aggregate
@@ -27079,6 +28610,63 @@ pre_build = []
         failures.append(
             "initial adoption of the byte-frozen fuzz job plus its required "
             "aggregate wiring was rejected"
+        )
+    # Issue #3902's transition, end to end: one revision moves the whole job
+    # from the retired generation to the adopted one with the aggregate wiring
+    # untouched. Both generations are withheld, so the digest comparison alone
+    # would accept the move in either direction; the reverse must be refused by
+    # `admitted_fuzz_smoke_removal_errors` instead.
+    aggregate_retired = (
+        aggregate_prologue
+        + aggregate_planner_job
+        + aggregate_lint_job
+        + CI_FUZZ_SMOKE_RETIRED_JOB
+        + aggregate_wired_job
+    )
+    if aggregate_retired == aggregate_adopted:
+        failures.append(
+            "the fuzz-smoke generation-transition self-test fixture is stale"
+        )
+    if compare_pr_workflow_job(
+        aggregate_baseline,
+        aggregate_retired,
+        "CI workflow",
+        "build-arm64-cross",
+    ):
+        failures.append(
+            "initial adoption of the retired fuzz-smoke generation was rejected"
+        )
+    if compare_pr_workflow_job(
+        aggregate_retired,
+        aggregate_adopted,
+        "CI workflow",
+        "build-arm64-cross",
+    ):
+        failures.append("the admitted fuzz-smoke generation transition was rejected")
+    if not compare_pr_workflow_job(
+        aggregate_adopted,
+        aggregate_retired,
+        "CI workflow",
+        "build-arm64-cross",
+    ):
+        failures.append(
+            "reverting the admitted fuzz-smoke generation transition was not "
+            "rejected"
+        )
+    # The transition carries no licence to drop the gate in the same revision.
+    if not compare_pr_workflow_job(
+        aggregate_retired,
+        aggregate_prologue
+        + aggregate_planner_job
+        + aggregate_lint_job
+        + CI_FUZZ_SMOKE_JOB
+        + aggregate_job,
+        "CI workflow",
+        "build-arm64-cross",
+    ):
+        failures.append(
+            "the fuzz-smoke generation transition was accepted without its "
+            "required aggregate wiring"
         )
     # Ordinary maintenance after adoption keeps working, and the admission does
     # not travel to any other part of the aggregate.

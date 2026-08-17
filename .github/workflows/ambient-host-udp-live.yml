@@ -302,6 +302,15 @@ jobs:
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4
 
+      # GitHub Actions cache is a 10 GB repository quota with LRU eviction
+      # across every ref. `type=gha,mode=max` exports multi-gigabyte BuildKit
+      # layers scoped to the writing ref. Pull requests and merge groups restore
+      # the default-branch cache and must not publish; only a trusted
+      # `refs/heads/main` run (currently `workflow_dispatch` on `main`) may
+      # cache-to. Fork PRs cannot publish: `github.ref` is never
+      # `refs/heads/main` on a PR, and the fork guard stays fail-closed if that
+      # ref check is later weakened. An empty cache-to does not skip the build.
+      #
       # Cheap, deterministic half: the tool-provisioning stage the production
       # runtime is built FROM. This alone would not prove the shipped image, so
       # the full target is smoked below; running it first surfaces a broken tool
@@ -315,7 +324,7 @@ jobs:
           load: true
           tags: ferrum-edge-capture-tools-base:ci
           cache-from: type=gha,scope=ambient-host-udp-images
-          cache-to: type=gha,mode=max,scope=ambient-host-udp-images
+          cache-to: ${{ github.event_name != 'pull_request' && github.event_name != 'merge_group' && github.ref == 'refs/heads/main' && github.event.pull_request.head.repo.fork != true && 'type=gha,mode=max,scope=ambient-host-udp-images' || '' }}
           provenance: false
 
       # The exact target the mesh chart's `-ebpf-tools` tag publishes.
@@ -330,7 +339,7 @@ jobs:
           load: true
           tags: ferrum-edge-ebpf-tools:ci
           cache-from: type=gha,scope=ambient-host-udp-images
-          cache-to: type=gha,mode=max,scope=ambient-host-udp-images
+          cache-to: ${{ github.event_name != 'pull_request' && github.event_name != 'merge_group' && github.ref == 'refs/heads/main' && github.event.pull_request.head.repo.fork != true && 'type=gha,mode=max,scope=ambient-host-udp-images' || '' }}
           provenance: false
 
       - name: Prove the published runtime can execute the production tool set
@@ -376,7 +385,7 @@ jobs:
           load: true
           tags: ferrum-edge-ebpf:ci
           cache-from: type=gha,scope=ambient-host-udp-images
-          cache-to: type=gha,mode=max,scope=ambient-host-udp-images
+          cache-to: ${{ github.event_name != 'pull_request' && github.event_name != 'merge_group' && github.ref == 'refs/heads/main' && github.event.pull_request.head.repo.fork != true && 'type=gha,mode=max,scope=ambient-host-udp-images' || '' }}
           provenance: false
 
       - name: Prove the `-ebpf` image keeps its distroless contract

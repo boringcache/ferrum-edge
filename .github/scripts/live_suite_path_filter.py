@@ -291,9 +291,18 @@ SUITE_PATTERNS: dict[str, list[str]] = {
         r"^src/ebpf/veth\.rs$",
         *exact_path_patterns(AMBIENT_HOST_UDP_DOCUMENTATION_PATHS),
     ],
-    # NodeWaypoint eBPF live datapath. Patterns match the retired workflow-level
-    # `paths:` list plus the trusted classifier script itself, so a pull request
-    # that edits relevance cannot skip the suite after this contract lands.
+    # NodeWaypoint eBPF live datapath. Patterns cover the prior NodeWaypoint
+    # scope (the `ci_runtime_plan.py` `node-waypoint-ebpf-live` suite, which
+    # `verify_ci_runtime_cache.py` proves is a subset of this list) plus the
+    # trusted classifier script itself, so a pull request that edits relevance
+    # cannot skip the suite after this contract lands.
+    #
+    # Deliberately NOT here, matching the retired scope: the production-image
+    # broadening (`src/**`, `vendor/**`, `.cargo/**`, `rust-toolchain.toml`,
+    # `custom_plugins/**`) and the CI-runtime planner/telemetry/verifier
+    # scripts, which drive the separate `production-dockerfile-plan` lane in the
+    # same workflow; and the NodeWaypoint `tests/unit` / `tests/integration`
+    # modules, which this live job never compiles.
     "node-waypoint-ebpf": [
         r"^\.github/workflows/node-waypoint-ebpf-live\.yml$",
         r"^\.github/scripts/live_suite_path_filter\.py$",
@@ -303,6 +312,11 @@ SUITE_PATTERNS: dict[str, list[str]] = {
         r"^Cargo\.(toml|lock)$",
         r"^Dockerfile$",
         r"^Dockerfile\.iproute2-layer$",
+        # The live job builds the tools-capable steering image from this layer
+        # (`docker build --file Dockerfile.ebpf-tools-layer`). The retired
+        # `paths:` list reached the workflow for it but every job then skipped,
+        # so this closes a real hole rather than widening scope.
+        r"^Dockerfile\.ebpf-tools-layer$",
         r"^Dockerfile\.release$",
         r"^\.github/scripts/stage_iproute2_runtime\.sh$",
         r"^build\.rs$",
@@ -1361,9 +1375,27 @@ def self_test() -> int:
         ("node-waypoint-ebpf", ["docs/plans/node_waypoint_transport_adr.md"], True),
         ("node-waypoint-ebpf", ["docs/mesh_supported_matrix.md"], True),
         ("node-waypoint-ebpf", ["src/proxy/netns_capture.rs"], True),
+        ("node-waypoint-ebpf", ["Dockerfile"], True),
+        ("node-waypoint-ebpf", ["Dockerfile.iproute2-layer"], True),
+        ("node-waypoint-ebpf", ["Dockerfile.ebpf-tools-layer"], True),
+        ("node-waypoint-ebpf", ["tests/k8s/lib/helpers.sh"], True),
         ("node-waypoint-ebpf", ["src/modes/data_plane.rs"], False),
         ("node-waypoint-ebpf", ["docs/admin_api.md"], False),
         ("node-waypoint-ebpf", ["tests/k8s/cni_lifecycle_live/run.sh"], False),
+        # The production-image broadening the retired `paths:` list carried is
+        # owned by `production-dockerfile-plan`, not by this live suite.
+        ("node-waypoint-ebpf", ["src/main.rs"], False),
+        ("node-waypoint-ebpf", ["src/admin/mod.rs"], False),
+        ("node-waypoint-ebpf", ["vendor/foo/src/lib.rs"], False),
+        ("node-waypoint-ebpf", [".cargo/config.toml"], False),
+        ("node-waypoint-ebpf", ["rust-toolchain.toml"], False),
+        ("node-waypoint-ebpf", ["custom_plugins/foo.rs"], False),
+        ("node-waypoint-ebpf", [".github/scripts/ci_runtime_plan.py"], False),
+        (
+            "node-waypoint-ebpf",
+            [".github/scripts/verify_ci_runtime_cache.py"],
+            False,
+        ),
         ("istio-status-cas", ["src/k8s_controller/istio_status.rs"], True),
         ("istio-status-cas", ["src/k8s_controller/metrics.rs"], True),
         ("istio-status-cas", ["tests/k8s_istio_status_cas_live.rs"], True),
