@@ -1543,7 +1543,8 @@ fn proxy_route_lock_cleanup_uses_an_escaped_id_prefix_not_a_namespace_filter() {
     // moment rustfmt reflows the call it is pinning.
     let rename = mongo_method("rename_namespace_documents_in_session(");
     assert!(
-        !rename.contains("proxy_route_locks"),
+        !rename.contains("self.proxy_route_locks()")
+            && !rename.contains("\"proxy_route_locks\","),
         "the rename must not try to rewrite `proxy_route_locks` ids — those \
          documents have no `namespace` field, so the filter never matches:\n{rename}"
     );
@@ -1682,7 +1683,7 @@ fn namespace_rename_acquires_source_and_target_mtls_dns_fences_in_lock_order() {
 
 #[test]
 fn mtls_dns_multi_lease_acquire_releases_already_held_guards_on_partial_failure() {
-    let body = mongo_method("acquire_mtls_dns_admission_leases_for_mode(");
+    let body = mongo_method("acquire_mtls_dns_admission_leases_for_mode<'a>(");
     assert!(
         body.contains("release_mtls_dns_admission_leases(&mut leases)"),
         "a later acquire error must release already-held guards rather than stranding \

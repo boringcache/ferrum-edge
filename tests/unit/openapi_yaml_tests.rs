@@ -8252,6 +8252,25 @@ fn namespace_registry_mutations_document_atomicity_refusal_and_server_error() {
 }
 
 #[test]
+fn namespace_body_routes_document_payload_too_large() {
+    let spec: serde_json::Value =
+        serde_yaml::from_str(include_str!("../../openapi.yaml")).expect("openapi.yaml parses");
+
+    for pointer in [
+        "/paths/~1namespaces/post/responses/413",
+        "/paths/~1namespaces~1{name}/put/responses/413",
+    ] {
+        assert_eq!(
+            spec.pointer(pointer)
+                .and_then(|value| value.get("$ref"))
+                .and_then(serde_json::Value::as_str),
+            Some("#/components/responses/PayloadTooLarge"),
+            "bounded namespace request body is missing its documented 413: {pointer}"
+        );
+    }
+}
+
+#[test]
 fn proxy_delete_documents_atomicity_refusal_for_standalone_mongodb() {
     let spec: serde_json::Value =
         serde_yaml::from_str(include_str!("../../openapi.yaml")).expect("openapi.yaml parses");

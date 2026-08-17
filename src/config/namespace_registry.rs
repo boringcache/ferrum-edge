@@ -112,12 +112,37 @@ where
 /// *omitted* from *explicitly null* and reject every other JSON type instead of
 /// silently coercing it. Resolve with [`UpdateNamespaceBody::resolve`]; nothing
 /// else may interpret these values.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone)]
 pub struct UpdateNamespaceBody {
-    #[serde(default, deserialize_with = "deserialize_present_json_value")]
     pub name: Option<serde_json::Value>,
-    #[serde(default, deserialize_with = "deserialize_present_json_value")]
     pub description: Option<serde_json::Value>,
+}
+
+#[derive(Deserialize)]
+struct UpdateNamespaceObject {
+    #[serde(default, deserialize_with = "deserialize_present_json_value")]
+    name: Option<serde_json::Value>,
+    #[serde(default, deserialize_with = "deserialize_present_json_value")]
+    description: Option<serde_json::Value>,
+}
+
+impl<'de> Deserialize<'de> for UpdateNamespaceBody {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let value = serde_json::Value::deserialize(deserializer)?;
+        if !value.is_object() {
+            return Err(serde::de::Error::custom(
+                "namespace update body must be a JSON object",
+            ));
+        }
+        let object = UpdateNamespaceObject::deserialize(value).map_err(serde::de::Error::custom)?;
+        Ok(Self {
+            name: object.name,
+            description: object.description,
+        })
+    }
 }
 
 /// The validated meaning of one `PUT /namespaces/:name` body.
@@ -208,12 +233,8 @@ pub const NAMESPACE_OCCUPANCY_TABLES: &[&str] = &[
 /// and must retain the namespace identity recorded when the event occurred. The
 /// rename mutation may still enqueue a new audit event under the new name with
 /// a before/after diff; prior rows stay put.
-pub const NAMESPACE_RENAME_SIMPLE_TABLES: &[&str] = &[
-    "proxies",
-    "plugin_configs",
-    "upstreams",
-    "api_specs",
-];
+pub const NAMESPACE_RENAME_SIMPLE_TABLES: &[&str] =
+    &["proxies", "plugin_configs", "upstreams", "api_specs"];
 
 /// One canonical trim/length rule for `description`, shared by create and
 /// update. Trims surrounding whitespace, maps empty to absent, and rejects

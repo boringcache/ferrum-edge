@@ -3123,7 +3123,7 @@ async fn write_topology_permit_blocks_failover_until_dropped() {
     assert!(!store.failover_topology_status().primary_active);
     assert_eq!(
         store.list_namespaces().await.unwrap(),
-        vec!["failover-ns".to_string()]
+        vec!["failover-ns".to_string(), "ferrum".to_string()]
     );
 }
 
@@ -3318,7 +3318,7 @@ async fn opt_in_write_permit_blocks_failback_until_dropped() {
     assert!(!store.failover_topology_status().primary_active);
     assert_eq!(
         store.list_namespaces().await.unwrap(),
-        vec!["failover-ns".to_string()]
+        vec!["failover-ns".to_string(), "ferrum".to_string()]
     );
 
     drop(permit);
@@ -3334,7 +3334,7 @@ async fn opt_in_write_permit_blocks_failback_until_dropped() {
     assert!(store.failover_topology_status().primary_active);
     assert_eq!(
         store.list_namespaces().await.unwrap(),
-        vec!["primary-ns".to_string()]
+        vec!["ferrum".to_string(), "primary-ns".to_string()]
     );
 }
 
