@@ -911,6 +911,8 @@ runs:
         shared-key: ${{ inputs.shared-key }}
         workspaces: ${{ inputs.workspaces }}
         cache-directories: ${{ github.workspace }}/.cache/sccache
+        cache-on-failure: "true"
+        save-if: ${{ github.event_name != 'pull_request' && github.event_name != 'merge_group' && github.ref == 'refs/heads/main' && github.event.pull_request.head.repo.fork != true }}
 """
     setup_ok: list[str] = []
     validate_setup_rust_ci_workspaces(good_setup_rust_ci, setup_ok)
