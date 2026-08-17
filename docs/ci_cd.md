@@ -46,9 +46,9 @@ adding, removing, or materially changing a workflow.
 | `ambient-host-udp-live.yml` | Ambient Host UDP Live Kernel | Every PR, `merge_group`, manual | Privileged live-kernel gate for Ambient host-network UDP capture (`ProxyHostUdpBackend`), plus a production-image contract job that proves the chart-selected `-ebpf-tools` runtime can execute the shell/iptables tool set while `-ebpf` stays distroless; relevance is decided by a trusted-base classifier and `Ambient Host UDP Live` reports on every run. |
 | `launch-integrity.yml` | Launch Readiness Integrity | `pull_request_target` for PRs to `main`, `merge_group` | Read-only trusted-base validation that a candidate preserved the launch/release governance contract. Executable gate code (checker, readiness/release/integrity/advisory-trust workflows and verifiers) is byte-frozen to protected `main`; candidate-editable data (blocker policy, exemption schema, document markers, CODEOWNERS coverage) is structurally validated, and check-name/advisory-secret scanning covers every workflow including ones the candidate adds. It never computes a launch verdict, so open launch blockers keep it green. `Launch Readiness Integrity` is directly required. See [launch-readiness.md](launch-readiness.md). |
 | `launch-readiness.yml` | Launch Readiness | PRs, `merge_group`, push to `main`, `v*` tags, daily schedule, manual | Live go/no-go launch verdict (`Launch Readiness Gate`). Expected to stay red while real blockers are open; it is release-blocking, **not** a required PR context. |
-| `node-waypoint-ebpf-live.yml` | NodeWaypoint eBPF Live Datapath | PRs, `merge_group`, push to `main`, manual | Optional always-reporting live eBPF datapath. `NodeWaypoint eBPF Live` is **not** branch-protection-required; relevance is decided by a trusted-base classifier and the aggregate reports green for proven irrelevance. |
-| `istio-status-cas-live.yml` | Istio Status CAS Live | PRs, `merge_group`, push to `main`, manual | Optional always-reporting Kind/apiserver competing-writer proof. `Istio Status CAS Live` is **not** a required live-suite check. |
-| `cni-lifecycle-live.yml` | CNI Install Lifecycle Live | PRs, `merge_group`, push to `main`, manual | Optional always-reporting CNI install/uninstall lifecycle proof. `CNI Lifecycle Live` is **not** a required live-suite check. |
+| `node-waypoint-ebpf-live.yml` | NodeWaypoint eBPF Live Datapath | Every PR, `merge_group`, push to `main`, manual | Live eBPF datapath validation in kind plus the production-image smoke. Relevance is decided by a trusted-base classifier and `NodeWaypoint eBPF Live` reports on every run; it is **not** a required live-suite check. |
+| `istio-status-cas-live.yml` | Istio Status CAS Live | Every PR, `merge_group`, push to `main`, manual | Kind/apiserver competing-writer proof that Ferrum's Istio status CAS preserves foreign and Ferrum-owned conditions. Relevance is decided by a trusted-base classifier and `Istio Status CAS Live` reports on every run; **not** a required live-suite check. |
+| `cni-lifecycle-live.yml` | CNI Install Lifecycle Live | Every PR, `merge_group`, push to `main`, manual | Live CNI install/uninstall lifecycle recovery proof in kind. Relevance is decided by a trusted-base classifier and `CNI Lifecycle Live` reports on every run; **not** a required live-suite check. |
 | `multicluster-federation-live.yml` | Multicluster Federation Live Datapath | PRs, `merge_group`, push to `main`, manual | Release-blocking multicluster federation datapath validation; `Multicluster Federation Live` is directly required on PRs and merge-queue groups. |
 | `multicluster-poller-partition-live.yml` | Multicluster Poller Partition Live | PRs, `merge_group`, push to `main`, manual | Release-blocking two-CP/two-DP trust/discovery partition and bounded last-good-retention validation; `Multicluster Poller Partition Live` is directly required. |
 | `dependency-audit.yml` | Dependency Audit | Weekly schedule, manual | Scheduled supply-chain governance beyond the per-PR audit gate. |
@@ -130,17 +130,6 @@ blocker is open, so requiring it would deadlock blocker-fix pull requests. The
 merge control is the separate integrity context above; the go/no-go verdict
 remains release-blocking through `release.yml`'s `validate-launch-readiness`
 job. See [launch-readiness.md](launch-readiness.md).
-
-Three additional live suites use the same trusted-base classifier and
-always-reporting aggregate pattern but are **not** branch-protection-required
-and must not be added to this list by this contract: `NodeWaypoint eBPF Live`
-from `node-waypoint-ebpf-live.yml`, `Istio Status CAS Live` from
-`istio-status-cas-live.yml`, and `CNI Lifecycle Live` from
-`cni-lifecycle-live.yml`. They still trigger on every pull request,
-`merge_group`, push to `main`, and manual dispatch. Unrelated PRs only pay for
-the cheap `changes` and `gate` jobs; the expensive live jobs run when the
-trusted-base classifier marks the diff relevant, and on every main/manual
-force-run.
 
 Each owner declares a `merge_group` (`types: [checks_requested]`) trigger in
 addition to its existing `pull_request` / `pull_request_target` / `push` /
@@ -415,16 +404,22 @@ restored directory and move the BuildKit local export. Workflows stay
 `permissions: contents: read`. Static checks live in
 `.github/scripts/verify_ci_runtime_cache.py`.
 
-`node-waypoint-ebpf-live.yml` path-filtered `pull_request.paths` must be a
-**trigger superset** of every `production-dockerfile-smoke` sensitive input in
-`.github/scripts/ci_runtime_plan.py` (for example `src/**`, `vendor/**`,
-`custom_plugins/**`, `.cargo/**`, and `rust-toolchain.toml`). If a valid Docker
-build input changes but the workflow never starts, the trusted planner cannot
-force the production-image gate. Required aggregate jobs (`Production Dockerfile
-eBPF image smoke`, `FIPS Build & Test`) use an **exact-boolean contract**: skip
-only on `relevant == 'false'`, run expensive jobs only on `relevant == 'true'`,
-and fail closed when planning succeeds but the output is blank or malformed
-(neither exact `true` nor exact `false`).
+`node-waypoint-ebpf-live.yml` carries **no workflow-level `paths:`** trigger
+filter (issue #3908). A `paths:` list lives in the pull request's own checkout,
+so the same commit that broke a Docker build input or the NodeWaypoint datapath
+could delete its own trigger and the workflow would never start — the trusted
+planner cannot force a gate for a run that does not exist. The workflow now
+triggers unconditionally on `workflow_dispatch`, `pull_request`, `merge_group`
+(`checks_requested`), and `push` to `main`, and the trusted-base planner is the
+only relevance authority. `verify_ci_runtime_cache.py`
+(`check_governed_live_trigger_shape`) rejects a restored `paths:` /
+`paths-ignore` filter and requires all four events.
+
+Required aggregate jobs (`Production Dockerfile eBPF image smoke`, `FIPS Build
+& Test`) use an **exact-boolean contract**: skip only on `relevant == 'false'`,
+run expensive jobs only on `relevant == 'true'`, and fail closed when planning
+succeeds but the output is blank or malformed (neither exact `true` nor exact
+`false`).
 
 The same trusted plan job emits a second exact boolean,
 `node_waypoint_relevant`, from the `node-waypoint-ebpf-live` planner suite.
@@ -439,6 +434,24 @@ GitHub skip-propagation is defeated with `always()`, and a trustworthy exact
 `false` is the only skip. A missing trusted planner (adoption PR), planner
 failure, unknown path, or blank/malformed NodeWaypoint verdict fails closed
 toward running.
+
+`node-waypoint-ebpf-live-gate` (check name `NodeWaypoint eBPF Live`) is the
+always-reporting aggregate for that live job. It fails when relevance planning
+fails, reports green when the planner proved exact `false`, and otherwise
+reports whatever the live job did. It is deliberately **not**
+branch-protection-required; `verify_required_ci.py` asserts it stays out of
+`REQUIRED_MERGE_GROUP_WORKFLOWS` and `DEDICATED_REQUIRED_CHECKS`. The
+production-image contract keeps reporting separately through `Production
+Dockerfile eBPF image smoke`, so an image-relevant but live-irrelevant change
+is still gated on the images without paying for the Kind/eBPF cluster.
+
+The `node-waypoint-ebpf-live` planner suite also covers
+`Dockerfile.ebpf-tools-layer` and the local composite actions the live job
+executes (`setup-rust-ci`, and through it `setup-sccache` and
+`setup-fast-linker`, plus `setup-bpf-linker`). The retired `paths:` list reached
+the workflow for the tools layer but the planner then skipped every job, and it
+named none of the toolchain actions at all, so an edit to one could change what
+the live datapath compiled without re-running it.
 
 ## CI Pipeline (ci.yml)
 
@@ -857,56 +870,26 @@ the shared-types test runs on stable Rust.
 
 **Runs**: `ubuntu-24.04`
 
-`node-waypoint-ebpf-live` triggers on every pull request, merge-queue group,
-push to `main`, and manual dispatch. It carries no top-level `paths:` filter,
-because a filter that lives in the pull request's own checkout can be widened by
-the same commit that breaks the surface it guards.
+The workflow triggers unconditionally on `workflow_dispatch`, `pull_request`,
+`merge_group` (`checks_requested`), and `push` to `main`, with **no
+workflow-level `paths:`** filter (issue #3908) — a queue entry is a combined
+commit, so relevance has to be re-evaluated there, and a `paths:` list supplied
+by the pull request could exclude the very change that broke the datapath.
 
-Two trusted-base classifiers now share this workflow, and neither can bypass the
-other:
-
-- The **whole-suite** verdict comes from the frozen `changes` job. It reads the
-  **base branch's** copy of `.github/scripts/live_suite_path_filter.py` by pinned
-  object id at one immutable trusted commit, runs it under an isolated
-  interpreter with `--suite node-waypoint-ebpf`, and force-runs on push-to-`main`
-  and `workflow_dispatch`. Only the Kind/eBPF live datapath job consumes it, via
-  the frozen binding `needs: changes` +
-  `if: needs.changes.outputs.relevant == 'true'`.
-- The **narrower production-runtime** verdict stays in `production-dockerfile-plan`,
-  which reads the base copy of `.github/scripts/ci_runtime_plan.py` from a
-  NUL-delimited `git diff --name-only --no-renames -z` listing. Its `relevant`
-  output still gates the two production-image jobs and the fail-closed
-  `production-dockerfile-smoke` aggregate, and it still publishes the prior-scope
-  `node_waypoint_relevant` verdict for that planner's `node-waypoint-ebpf-live`
-  suite. `node_waypoint_relevant` no longer gates the live job — the frozen
-  classifier does — but `verify_ci_runtime_cache.py` proves on every run that the
-  `node-waypoint-ebpf` classifier suite is a **superset** of every prior-scope
-  path that verdict schedules, and that the production-image-only paths
-  (`src/main.rs`, `src/admin/mod.rs`, `src/modes/database.rs`,
-  `src/plugins/cors.rs`, `vendor/**`, `.cargo/**`, `rust-toolchain.toml`,
-  `custom_plugins/**`) still skip the live cluster while still building the
-  production images. The migration therefore cannot narrow NodeWaypoint
-  scheduling, and the planner's `always()` fail-closed posture for a missing
-  trusted copy is unchanged.
-
-The `if: always()` aggregate `NodeWaypoint eBPF Live` reports on every run: green
-when the suite passed or the classifier proved irrelevance, red when the
-classifier failed closed, a relevant production-image contract failed, or a
-relevant live job failed. This aggregate is **not** a branch-protection-required
-check and must not be added to one. Unrelated pull requests pay only for the two
-cheap planning jobs and the aggregate.
-
-The relevant live-datapath surfaces are eBPF, node-agent, NodeWaypoint identity,
-netns capture, socket option, TCP scope, chart, live harness, and the listed
-docs. They also include the local composite actions this live job actually
-executes — `package-ferrum-runtime-image`, `setup-kubernetes-tools`,
-`setup-bpf-linker`, and `setup-rust-ci` together with the `setup-sccache` and
-`setup-fast-linker` actions it runs — which the retired `paths:` list did not
-cover even though they decide how the live datapath's binaries and BPF ELF are
-built. `SUITE_LOCAL_ACTION_DEPENDENCIES` declares them and the classifier
-self-test proves each one stays relevant to its suite. When relevant (and on
-every main/manual force-run) the live job builds the
-normal runtime Docker image from the host-built binary, builds the
+Relevance is decided entirely by the trusted-base `production-dockerfile-plan`
+job. `node-waypoint-ebpf-live` still runs on its **prior** path scope: eBPF,
+node-agent, NodeWaypoint identity, netns capture, socket option, TCP/HBONE
+mesh, chart, live harness files, `Dockerfile.ebpf-tools-layer`, the local
+composite actions the job executes, and the original specific `src/` paths. The
+expensive Kind/eBPF job is gated by `node_waypoint_relevant` from that planner:
+`if: always() &&
+needs.production-dockerfile-plan.outputs.node_waypoint_relevant != 'false'`.
+Unrelated production-image-only paths skip the live cluster; planner failure,
+a missing trusted copy, an unknown path, or a blank/malformed verdict cannot
+skip it. The `NodeWaypoint eBPF Live` aggregate (`if: always()`) reports green
+for proven irrelevance and fails closed otherwise, and is **not**
+branch-protection-required.
+It builds the normal runtime Docker image from the host-built binary, builds the
 eBPF userspace binary with `FEATURES=cloud-secrets,ebpf`, builds the
 `ferrum-ebpf` BPF ELF with nightly Rust, and packages the `:<tag>-ebpf` runtime
 image from those cached host-built artifacts instead of recompiling inside
@@ -947,17 +930,16 @@ diagnostics, mesh drift snapshots, pod-registry dumps, live assertions, and
 
 **Runs**: `ubuntu-24.04`
 
-`istio-status-cas-live.yml` is an optional Kind/apiserver lane for issue #3838.
-It is **not** a required live-suite check and is not wired into the `ci.yml`
-`Tests` aggregate (that aggregate is Cross-frozen). The workflow triggers on
-every pull request, merge-queue group, push to `main`, and manual dispatch, with
-no top-level `paths:` filter. A trusted-base `changes` job decides relevance
-from the retired `paths:` list plus the classifier script and the local
-composite actions the live job executes (the retired list named
-`setup-rust-ci` and `setup-kubernetes-tools` but not the `setup-sccache` /
-`setup-fast-linker` actions `setup-rust-ci` itself runs, which decide how the
-live test binary is compiled and linked), and the `if: always()` aggregate
-`Istio Status CAS Live` reports on every run. The workflow uses the same
+`istio-status-cas-live.yml` is a Kind/apiserver lane for issue #3838. It is
+**not** a required live-suite check and is not wired into the `ci.yml` `Tests`
+aggregate (that aggregate is Cross-frozen). Since issue #3908 it carries no
+workflow-level `paths:` filter: it triggers on `workflow_dispatch`, every
+`pull_request`, `merge_group` (`checks_requested`), and `push` to `main`, and a
+`changes` job decides relevance from the base branch's copy of
+`live_suite_path_filter.py` (`--suite istio-status-cas`). The `Istio Status CAS
+Live` aggregate runs with `if: always()`: it fails when change detection fails
+or returns a non-boolean verdict, reports green when relevance was proven
+`false`, and otherwise reports the live job's result. The workflow uses the same
 pinned `.github/actions/setup-kubernetes-tools` Kind/kubectl install as the other
 Kind-capable jobs, applies the checked-in AuthorizationPolicy CRD fixture
 (`tests/fixtures/k8s/istio_authorizationpolicy_status_crd.yaml`), and runs the
@@ -1081,26 +1063,28 @@ separately (PR #3889).
 
 **Runs**: `ubuntu-24.04`
 
-`cni-lifecycle-live.yml` is an optional hosted proof for issue #3609. It is
-**not** a required live-suite check and must not be added to branch protection.
-The workflow triggers on every pull request, merge-queue group, push to `main`,
-and manual dispatch, with no top-level `paths:` filter. A trusted-base
-`changes` job decides relevance from the retired CNI `paths:` list, the
-classifier script, and the local composite actions the live job executes
-(`package-ferrum-runtime-image`, `setup-kubernetes-tools`, and `setup-rust-ci`
-with the `setup-sccache` / `setup-fast-linker` actions it runs — the retired
-list named none of the build-toolchain ones even though they build the
-`ferrum-edge` and `ferrum-cni` binaries this suite installs). Helm matches stay
-exact chart files, not the whole `charts/ferrum-mesh/` tree. The `if: always()`
-aggregate `CNI Lifecycle Live` reports on every run: green when the suite
-passed or was legitimately irrelevant, red when a relevant live job failed or
-the classifier failed closed. Unrelated PRs only pay for the cheap `changes`
-and `gate` jobs.
+`cni-lifecycle-live.yml` is the live install/uninstall recovery proof for issue
+#3609. Logic lives in `tests/k8s/cni_lifecycle_live/run.sh`; the workflow stays
+a thin launcher (checkout, build `ferrum-edge` + `ferrum-cni`, package the
+runtime image, install pinned Kind/kubectl, run the harness, upload
+diagnostics). It is **not** a required live-suite check.
 
-When relevant (and on every main/manual force-run) the live job builds
-`ferrum-edge` and `ferrum-cni`, packages the runtime image, and runs
-`tests/k8s/cni_lifecycle_live/run.sh` on kind. Logic stays in that harness so
-the workflow remains a thin launcher.
+Since issue #3908 it carries no workflow-level `paths:` filter: it triggers on
+`workflow_dispatch`, every `pull_request`, `merge_group` (`checks_requested`),
+and `push` to `main`, and a `changes` job decides relevance from the base
+branch's copy of `live_suite_path_filter.py` (`--suite cni-lifecycle`). The
+merge-group trigger is the point: a queue entry is a combined commit, so one
+pull request renaming a chart value another one's CNI template consumes is
+exactly the interaction a per-pull-request `paths:` filter could never catch.
+
+The `cni-lifecycle` suite keeps the retired `paths:` cost envelope — chart
+matches stay exact template/values files rather than the whole Helm tree — and
+adds the classifier script itself plus the local composite actions the live job
+executes (`package-ferrum-runtime-image`, `setup-kubernetes-tools`,
+`setup-rust-ci`, and through it `setup-sccache` and `setup-fast-linker`). The
+`CNI Lifecycle Live` aggregate runs with `if: always()`: it fails when change
+detection fails or returns a non-boolean verdict, reports green when relevance
+was proven `false`, and otherwise reports the live job's result.
 
 #### 6. Performance Regression Job
 
@@ -1857,32 +1841,21 @@ example consumes the exact `origin/${BASE_REF}` fetched by the immediately
 preceding policy step, so those adjacent steps have an intentional ordering
 dependency.
 
-##### Trusted-base relevance for governed live suites
+##### Trusted-base relevance for required live gates
 
-Seven workflows share one byte-identical relevance job, frozen in the trusted
-verifier as `LIVE_SUITE_RELEVANCE_JOB_TEMPLATE` and enforced absolutely by
-`live_suite_relevance_errors` in exact validation *and* in pull-request
-comparison. Only the display name, temp-file slug, and `--suite` selector
-differ.
-
-Four of them publish **required** status checks: `mesh-e2e-sidecar-live.yml`,
-`multicluster-federation-live.yml`, `multicluster-poller-partition-live.yml`,
-and `ambient-host-udp-live.yml` (`Ambient Host UDP Live` is in
-`LIVE_SUITE_RELEVANCE_CONTRACTS` with a complete live/image/gate freeze). Three
-publish **optional** always-reporting aggregates that are **not**
-branch-protection-required and must not be added to the required-check list:
-`node-waypoint-ebpf-live.yml` (`NodeWaypoint eBPF Live`),
-`istio-status-cas-live.yml` (`Istio Status CAS Live`), and
-`cni-lifecycle-live.yml` (`CNI Lifecycle Live`).
-
-A required or optional aggregate may legitimately skip its expensive live job
-when a pull request touches nothing relevant. That skip is a security
-boundary: if the relevance verdict were computed by the pull request's own copy
-of `.github/scripts/live_suite_path_filter.py`, a pull request could widen
+`mesh-e2e-sidecar-live.yml` and `multicluster-federation-live.yml` publish
+required status checks that may legitimately skip their expensive live job when
+a pull request touches nothing relevant. That skip is a security boundary: if
+the relevance verdict were computed by the pull request's own copy of
+`.github/scripts/live_suite_path_filter.py`, a pull request could widen
 `SUITE_PATTERNS`, declare itself irrelevant, skip the live job, and still turn
-the aggregate green.
+the required gate green.
 
-Its load-bearing properties:
+Both workflows therefore share one byte-identical relevance job, frozen in the
+trusted verifier as `LIVE_SUITE_RELEVANCE_JOB_TEMPLATE` and enforced absolutely
+by `live_suite_relevance_errors` in exact validation *and* in pull-request
+comparison. Only the display name, temp-file slug, and `--suite` selector
+differ. Its load-bearing properties:
 
 - The relevance script comes from the base-branch tip of the **base**
   repository, never from the pull-request checkout. This holds for fork pull
@@ -1903,57 +1876,70 @@ Its load-bearing properties:
   of defaulting to "irrelevant".
 - The filter runs under `python3 -I`, so nothing the pull request committed can
   be imported into the trusted interpreter.
-- The change set is handed over as a NUL-delimited
-  `git diff --name-only --no-renames -z "${trusted_sha}...HEAD"` stream — never
-  newline-delimited, never `sort`ed, never re-quoted. A newline-delimited
-  listing cannot represent a pathname that contains a newline, and C-quoting
-  one instead (`core.quotePath`) would classify a *different* path than the one
-  that changed; either way a relevant file can be made to look like no file at
-  all. `live_suite_path_filter.py` reads the file as raw bytes and requires a
-  canonical NUL-terminated stream: a missing terminal NUL, an interior empty
-  record, invalid UTF-8, a control/format character, a backslash or other
-  metacharacter outside the conservative `[A-Za-z0-9._+@~ /-]` charset, an
-  absolute path, or a non-normal component (empty, `.`, `..`, trailing slash,
-  surrounding whitespace) is **rejected with a non-zero exit**, not silently
-  treated as irrelevant, and the offending bytes are never echoed. Pathname
-  bytes are never normalized or stripped into a different path. An actually
-  empty diff stays an empty change set.
-- The filter prints `changed_files_transport=nul` beside its verdict, and the
-  relevance job honors a `false` verdict only when that acknowledgement is
-  exactly `nul`. A trusted base predating this transport would read the whole
-  stream as one unmatched newline record and report `relevant=false`; the
-  handshake turns that into a forced live run instead. It is the same
-  trust/transport version handshake `pr_ci_plan.py` uses via
-  `paths_classifiable`.
-- The checkout sets `persist-credentials: false`. The job only fetches the base
-  tip and inspects two commits, so it must not leave a write-capable token in
-  the checkout's Git configuration for later steps in the job to reuse.
 
 Freezing the relevance job alone would not be enough — a pull request could
 leave it untouched and instead rewrite the live job's `needs`/`if`. The binding
 `needs: changes` plus `if: needs.changes.outputs.relevant == 'true'` is
 therefore part of the same contract, and deleting a governed workflow outright
-is rejected as well. Optional suites additionally freeze their `if: always()`
-aggregates (`LIVE_SUITE_GATE_CONTRACTS`) so a skip cannot be silent: classifier
-or relevant-live failure is red; proven irrelevance is green. Relevance uses
-the immutable pull-request / merge-group base and `--force-run` on push-to-main
-and `workflow_dispatch`. Ambient Host UDP keeps its existing required-gate
-freeze (`AMBIENT_HOST_UDP_GATE_JOB`) and does not grow a `push: main` trigger
-in this contract. None of these workflows may restore a PR-widenable top-level
-`paths:` filter.
+is rejected as well.
 
-`node-waypoint-ebpf-live.yml` is the one governed workflow that also hosts a
-second, narrower trusted-base planner (`production-dockerfile-plan`, reading
-`.github/scripts/ci_runtime_plan.py`) for its production-image lane. Only the
-live datapath job is listed in `LIVE_SUITE_LIVE_JOBS` and bound to the
-whole-suite classifier; binding the image jobs to it as well would widen or
-narrow an unrelated contract. The two verdicts cannot bypass each other because
-the frozen `NodeWaypoint eBPF Live` aggregate requires the fail-closed
-`production-dockerfile-smoke` result **before** it may report a proven-irrelevant
-live skip, and `verify_ci_runtime_cache.py` proves on every run that the
-`node-waypoint-ebpf` classifier suite is a superset of every prior-scope path
-the planner's retained `node_waypoint_relevant` verdict schedules, while the
-production-image-only paths still skip the live cluster.
+The change set the job hands the classifier is a newline-delimited
+`git diff --name-only --no-renames "${trusted_sha}...HEAD" | sort` listing.
+Git C-quotes any pathname carrying a newline, a quote, a backslash, or a
+non-ASCII byte, so a quoted record names a *different* path than the one on
+disk. `live_suite_path_filter.py` therefore refuses to classify any record that
+is not a normal repository-relative pathname (conservative
+`[A-Za-z0-9._+@~ /-]` charset; no absolute path, `.`/`..`/empty component,
+trailing slash, or surrounding whitespace). Refused records are withheld from
+pattern matching and from the step summary, and their presence forces
+`relevant=true`: a record the classifier cannot read must never be mistaken for
+"no relevant file changed". The suite is also forced to run on `push` and
+`workflow_dispatch` through `--force-run`.
+
+###### Optional suites on the same pattern
+
+Issue #3908 moved three optional suites off pull-request-supplied `paths:`
+triggers and onto the same posture:
+
+- `node-waypoint-ebpf-live.yml` already had a trusted-base classifier — the
+  `production-dockerfile-plan` job reading `ci_runtime_plan.py` — so it did not
+  get a second one. Two relevance jobs gating one live job is precisely the
+  "either gate bypasses the other" hazard; the existing planner stayed the sole
+  authority and only the trigger and the aggregate changed.
+- `istio-status-cas-live.yml` and `cni-lifecycle-live.yml` gained a `changes`
+  job that is the `LIVE_SUITE_RELEVANCE_JOB_TEMPLATE` text above, byte for byte
+  apart from the display name, slug, `--suite` selector, and one temporary
+  bootstrap block described below.
+
+These three aggregates (`NodeWaypoint eBPF Live`, `Istio Status CAS Live`,
+`CNI Lifecycle Live`) are **not** branch-protection-required and must not be
+added to `REQUIRED_MERGE_GROUP_WORKFLOWS` or `DEDICATED_REQUIRED_CHECKS`;
+`verify_required_ci.py` asserts that, and asserts each keeps unconditional
+`pull_request`, `merge_group`, and `push: main` triggers.
+
+Because they are not in `LIVE_SUITE_RELEVANCE_CONTRACTS`, the trusted policy
+does not yet freeze the two new relevance jobs. Adding them requires editing
+`.github/scripts/verify_cross_build_policy.py`, which no pull request may
+change (`Trusted Cross Build Policy` rejects it outright), so that step is a
+separate trusted-base change that lands directly on `main` after this one.
+Until it does, the security property that matters is already in force — the
+verdict is computed by the base branch's classifier, never by the pull
+request's copy — and what is missing is only the freeze on the job text itself.
+
+###### Bootstrap handshake for a newly named suite
+
+A relevance job runs the **trusted** classifier, but a new suite name arrives in
+the same commit as the workflow that uses it. The trusted copy therefore does
+not know the name yet and rejects `--suite <new-name>` with an argparse usage
+error — a hard failure, and one indistinguishable from a genuinely broken
+classifier. The two new relevance jobs carry one extra block for exactly that
+window: they ask the trusted copy `--list-suites`, and if the flag is refused
+(an older classifier) or the suite is absent from the answer, they emit
+`relevant=true` and say why in the step summary. Every other failure still
+fails the job closed, and the verdict still never comes from the pull request's
+own checkout. The block is one-way and temporary: once the classifier suite is
+on `main` it is inert, and it is deleted by the same trusted-base change that
+adds the two `LIVE_SUITE_RELEVANCE_CONTRACTS` entries.
 
 ##### Admitted fuzz/property lane
 

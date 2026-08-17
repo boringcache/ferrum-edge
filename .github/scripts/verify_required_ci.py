@@ -802,18 +802,6 @@ def workflow_has_exact_name(workflow_yml: str, expected: str) -> bool:
     return actual == expected
 
 
-def extract_documentation_paths(workflow_yml: str) -> set[str]:
-    paths = set(
-        re.findall(
-            r"(?m)^\s+-\s+[\"']?(docs/[^\"'\s]+)[\"']?\s*$",
-            workflow_yml,
-        )
-    )
-    if not paths:
-        raise RuntimeError("could not find documentation paths in live workflow")
-    return paths
-
-
 def extract_required_assertion_ids(gate_body: str) -> set[str]:
     """Return the `--require <id>` arguments the artifact gate passes."""
 
@@ -1234,7 +1222,6 @@ def main() -> int:
                     f"{workflow_path} concurrency must distinguish merge_group "
                     f"runs (missing `{marker}`)"
                 )
-
 
     ci_plan_body = extract_job_body(ci_yml, "ci-plan")
     pr_nul_diff = (

@@ -36,22 +36,33 @@ Full policy: `docs/dependency-policy.md`. These are the load-bearing rules.
 - The trusted-base `pr_ci_plan.py --self-test` rejects mutable or dynamic
   action refs, pipe-to-shell installers, and unverified tool downloads. The
   pull request's proposed policy is tested separately but never controls gates.
-- A governed live suite must decide relevance from a pinned trusted-base copy
-  of `live_suite_path_filter.py`, never from the pull request's checkout.
+- A required live gate must decide its own relevance from a pinned trusted-base
+  copy of `live_suite_path_filter.py`, never from the pull request's checkout.
   `verify_cross_build_policy.py` freezes that block byte-for-byte
   (`LIVE_SUITE_RELEVANCE_JOB_TEMPLATE`) for every
-  `LIVE_SUITE_RELEVANCE_CONTRACTS` workflow — required gates
-  (`mesh-e2e-sidecar-live.yml`, `multicluster-federation-live.yml`,
-  `multicluster-poller-partition-live.yml`, `ambient-host-udp-live.yml`) and
-  optional always-reporting aggregates (`node-waypoint-ebpf-live.yml`,
-  `istio-status-cas-live.yml`, `cni-lifecycle-live.yml`) — together with each
-  live job's `needs`/`if` binding. Optional aggregate names are not
-  branch-protection-required. That frozen block hands the change set over as a
-  NUL-delimited `git diff -z` stream (never newline-delimited, `sort`ed, or
-  re-quoted), requires the filter's `changed_files_transport=nul`
-  acknowledgement before it will honor a `false` verdict, and checks out with
-  `persist-credentials: false`. See `docs/ci_cd.md` → "Trusted-base relevance
-  for governed live suites".
+  `LIVE_SUITE_RELEVANCE_CONTRACTS` workflow — `ambient-host-udp-live.yml`,
+  `mesh-e2e-sidecar-live.yml`, `multicluster-federation-live.yml`, and
+  `multicluster-poller-partition-live.yml` — together with each live job's
+  `needs`/`if` binding. That block is protected: no pull request may edit
+  `verify_cross_build_policy.py`, so extending the contract set is a
+  direct-to-`main` change.
+- Governed live workflows carry NO workflow-level `paths:` trigger filter
+  (issue #3908): a filter in the pull request's own checkout can exclude the
+  change that broke the surface. `node-waypoint-ebpf-live.yml`,
+  `istio-status-cas-live.yml`, and `cni-lifecycle-live.yml` now trigger on
+  `pull_request`, `merge_group (checks_requested)`, `push: main`, and
+  `workflow_dispatch`, decide relevance from a trusted-base classifier
+  (`ci_runtime_plan.py` for NodeWaypoint, `live_suite_path_filter.py` for the
+  other two), and report through an `if: always()` aggregate. Their aggregates
+  (`NodeWaypoint eBPF Live`, `Istio Status CAS Live`, `CNI Lifecycle Live`) are
+  NOT branch-protection-required and must not be added to
+  `REQUIRED_MERGE_GROUP_WORKFLOWS` or `DEDICATED_REQUIRED_CHECKS`. The two new
+  `changes` jobs are not yet in `LIVE_SUITE_RELEVANCE_CONTRACTS`; adding them
+  (and deleting their temporary `--list-suites` bootstrap block) is the
+  follow-up direct-to-`main` policy change. The classifier refuses to classify
+  any change-set record that is not a normal repository-relative pathname and
+  forces the suite to run instead. See `docs/ci_cd.md` → "Trusted-base
+  relevance for required live gates".
 - The fuzz/property lane is admitted only as two byte-frozen shapes:
   `CI_FUZZ_SMOKE_JOB` (the whole `fuzz-smoke` job in `ci.yml`) and
   `FUZZ_WORKFLOW` (the whole of `.github/workflows/fuzz.yml`). Either may be

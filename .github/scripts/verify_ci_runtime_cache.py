@@ -4325,12 +4325,60 @@ def self_test() -> int:
         any(
             "must not filter a governed live trigger by `paths-ignore:`" in item
             for item in ignored_paths_failures
-        )
-        and any(
-            "push trigger must cover exactly the main branch" in item
-            for item in ignored_paths_failures
         ),
         "self-test: a paths-ignore filter must fail the governed trigger shape",
+        failures,
+    )
+
+    wrong_branch_trigger = (
+        "name: demo\n"
+        "on:\n"
+        "  workflow_dispatch:\n"
+        "  pull_request:\n"
+        "  merge_group:\n"
+        "    types:\n"
+        "      - checks_requested\n"
+        "  push:\n"
+        "    branches:\n"
+        "      - release\n"
+    )
+    wrong_branch_failures: list[str] = []
+    check_governed_live_trigger_shape(
+        wrong_branch_trigger,
+        "self-test-wrong-branch-trigger",
+        wrong_branch_failures,
+    )
+    require(
+        any(
+            "push trigger must cover exactly the main branch" in item
+            for item in wrong_branch_failures
+        ),
+        "self-test: a non-main push trigger must fail the governed trigger shape",
+        failures,
+    )
+
+    wrong_merge_group_trigger = (
+        "name: demo\n"
+        "on:\n"
+        "  workflow_dispatch:\n"
+        "  pull_request:\n"
+        "  merge_group:\n"
+        "  push:\n"
+        "    branches:\n"
+        "      - main\n"
+    )
+    wrong_merge_group_failures: list[str] = []
+    check_governed_live_trigger_shape(
+        wrong_merge_group_trigger,
+        "self-test-merge-group-types",
+        wrong_merge_group_failures,
+    )
+    require(
+        any(
+            "merge_group trigger must request checks on the synthesized" in item
+            for item in wrong_merge_group_failures
+        ),
+        "self-test: a merge_group trigger without checks_requested must fail",
         failures,
     )
 

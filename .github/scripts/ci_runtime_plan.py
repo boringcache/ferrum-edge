@@ -141,6 +141,17 @@ KNOWN_SAFE_PATTERNS: tuple[str, ...] = (
     r"^NOTICE",
     r"^AGENTS\.md$",
     r"^CLAUDE\.md$",
+    # Any root-level SHOUTY Markdown document (ARCHITECTURE.md, CHANGELOG.md,
+    # CONFORMANCE.md, FEATURES.md, PRODUCTION_READINESS.md, WEBSOCKET.md, ...).
+    # `.dockerignore` excludes `*.md` and no Dockerfile stage COPYs one, so such
+    # a file cannot reach either production image; it is not compiled, so it
+    # cannot reach the FIPS build; and it is not a NodeWaypoint datapath input.
+    # The class holds no `/`, so it can never match a path inside a directory.
+    #
+    # Issue #3908 makes this load-bearing: with the workflow-level `paths:`
+    # filter retired, an unknown path force-runs the 120-minute Kind/eBPF live
+    # job, and a documentation-only pull request must not pay for that.
+    r"^[A-Z0-9_-]+\.md$",
     r"^CODE_OF_CONDUCT",
     r"^SECURITY\.md$",
     r"^docs/",
@@ -553,6 +564,17 @@ def self_test() -> int:
         ("node-waypoint-ebpf-live", ["rust-toolchain.toml"], False),
         ("node-waypoint-ebpf-live", ["custom_plugins/mod.rs"], False),
         ("node-waypoint-ebpf-live", ["README.md"], False),
+        # Root-level documentation must not pay for the 120-minute Kind/eBPF
+        # cluster now that the workflow-level `paths:` filter is retired.
+        ("node-waypoint-ebpf-live", ["ARCHITECTURE.md"], False),
+        ("node-waypoint-ebpf-live", ["PRODUCTION_READINESS.md"], False),
+        ("node-waypoint-ebpf-live", ["CHANGELOG.md"], False),
+        ("production-dockerfile-smoke", ["PRODUCTION_READINESS.md"], False),
+        ("fips-build", ["PRODUCTION_READINESS.md"], False),
+        # The allowlist entry holds no `/`, so it cannot reach into a directory
+        # and turn a real source path into a skip.
+        ("node-waypoint-ebpf-live", ["src/ebpf/README.md"], True),
+        ("production-dockerfile-smoke", ["src/ebpf/README.md"], True),
         (
             "node-waypoint-ebpf-live",
             [".github/scripts/ci_runtime_plan.py"],
