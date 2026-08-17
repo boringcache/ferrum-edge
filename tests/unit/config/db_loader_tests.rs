@@ -3390,12 +3390,15 @@ fn sql_namespace_row_mapper_fails_closed_on_corrupt_timestamps() {
     assert!(
         body.contains("parse_namespace_rfc3339")
             && body.contains("NamespaceRegistryCorrupt")
-            && body.contains("require_namespace_identity"),
+            && body.contains("require_namespace_identity")
+            && body.contains("require_canonical_stored_description"),
         "corrupt registry rows must not be served as plausible API data:\n{body}"
     );
     assert!(
-        !body.contains("unwrap_or_else(Utc::now)") && !body.contains("unwrap_or(created_at)"),
-        "missing timestamps must not be fabricated:\n{body}"
+        !body.contains("unwrap_or_else(Utc::now)")
+            && !body.contains("unwrap_or(created_at)")
+            && !body.contains("normalize_description"),
+        "missing timestamps must not be fabricated and stored descriptions must not be normalized:\n{body}"
     );
 }
 

@@ -7934,8 +7934,8 @@ impl DatabaseStore {
         row: &AnyRow,
     ) -> Result<crate::config::namespace_registry::NamespaceRecord, anyhow::Error> {
         use crate::config::namespace_registry::{
-            NamespaceRegistryCorrupt, parse_namespace_rfc3339, require_namespace_identity,
-            stored_description,
+            NamespaceRegistryCorrupt, parse_namespace_rfc3339,
+            require_canonical_stored_description, require_namespace_identity,
         };
         let name: String = row
             .try_get("name")
@@ -7950,7 +7950,7 @@ impl DatabaseStore {
             .map_err(|_| NamespaceRegistryCorrupt::field("updated_at"))?;
         let updated_at = parse_namespace_rfc3339(&updated_raw, "updated_at")?;
         let description = match optional_utf8_text_column(row, "description") {
-            Ok(value) => stored_description(value),
+            Ok(value) => require_canonical_stored_description(value.as_deref())?,
             Err(_) => {
                 return Err(NamespaceRegistryCorrupt::field("description").into_error());
             }

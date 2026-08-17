@@ -420,7 +420,10 @@ pub fn parse_namespace_rfc3339(
 }
 
 /// Require a non-empty string `_id`/`name` pair that agrees with itself and,
-/// when the caller requested a specific key, with that key.
+/// when the caller requested a specific key, with that key. The agreed name
+/// must also pass [`validate_namespace`]: a durable row whose identity pair
+/// is consistent but illegal as a namespace is still corrupt. Failures map
+/// to [`NamespaceRegistryCorrupt`] without the stored value or validator text.
 pub fn require_namespace_identity(
     id: &str,
     name: &str,
@@ -434,13 +437,86 @@ pub fn require_namespace_identity(
     {
         return Err(NamespaceRegistryCorrupt::field("name"));
     }
+    if validate_namespace(name).is_err() {
+        return Err(NamespaceRegistryCorrupt::field("name"));
+    }
     Ok(name.to_string())
 }
 
-/// Stored description: empty becomes absent. Callers must already have
-/// rejected every non-string, non-null shape.
-pub fn stored_description(description: Option<String>) -> Option<String> {
-    description.filter(|value| !value.is_empty())
+/// Strict parser for a durable registry description.
+///
+/// Writes store only SQL/BSON null (absence) or a trimmed nonempty string of
+/// at most [`MAX_NAMESPACE_DESCRIPTION_CHARS`] Unicode scalar values. Empty,
+/// whitespace-only, untrimmed, and over-limit strings are corruption — they
+/// are not normalized or served. The error names the schema field only.
+pub fn require_canonical_stored_description(
+    description: Option<&str>,
+) -> Result<Option<String>, NamespaceRegistryCorrupt> {
+    let Some(raw) = description else {
+        return Ok(None);
+    };
+    if raw.is_empty()
+        || raw.trim() != raw
+        || raw.chars().count() > MAX_NAMESPACE_DESCRIPTION_CHARS
+    {
+        return Err(NamespaceRegistryCorrupt::field("description"));
+    }
+    Ok(Some(raw.to_string()))
+}
+
+/// Document field that must equal the `{namespace}:` suffix for a composite-id
+/// collection rewritten during namespace rename.
+pub fn namespace_prefixed_id_suffix_field(
+    collection_name: &str,
+) -> Result<&'static str, NamespaceRegistryCorrupt> {
+    match collection_name {
+        "consumers" => Ok("id"),
+        "consumer_identity_index" => Ok("identity_value"),
+        _ => Err(NamespaceRegistryCorrupt::field("identity")),
+    }
+}
+
+/// Fail closed unless a composite Mongo `_id` is exactly
+/// `{current_name}:{suffix}` with a nonempty suffix that equals the
+/// collection's identity field, and the embedded `namespace` string equals
+/// `current_name`. Missing, empty, or mismatched fields are corruption.
+/// The error names the schema field only and never echoes stored values.
+pub fn require_namespace_prefixed_identity<'a>(
+    current_name: &str,
+    old_id: &'a str,
+    embedded_namespace: Option<&str>,
+    suffix_field: &'static str,
+    suffix_value: Option<&str>,
+) -> Result<&'a str, NamespaceRegistryCorrupt> {
+    let expected_prefix = format!("{current_name}:");
+    let Some(suffix) = old_id.strip_prefix(&expected_prefix) else {
+        return Err(NamespaceRegistryCorrupt::field("identity"));
+    };
+    if suffix.is_empty() {
+        return Err(NamespaceRegistryCorrupt::field("identity"));
+    }
+    match embedded_namespace {
+        Some(value) if !value.is_empty() && value == current_name => {}
+        _ => return Err(NamespaceRegistryCorrupt::field("namespace")),
+    }
+    match suffix_value {
+        Some(value) if !value.is_empty() && value == suffix => {}
+        _ => return Err(NamespaceRegistryCorrupt::field(suffix_field)),
+    }
+    Ok(suffix)
+}
+
+/// Fail closed unless a namespace-keyed document's embedded `namespace`
+/// exists as a nonempty string and exactly equals the current key. A
+/// mismatch aborts rather than rewriting the field onto a corrupt document.
+pub fn require_namespace_keyed_embedded_namespace(
+    current_key: &str,
+    embedded_namespace: Option<&str>,
+) -> Result<(), NamespaceRegistryCorrupt> {
+    match embedded_namespace {
+        Some(value) if !value.is_empty() && value == current_key => Ok(()),
+        _ => Err(NamespaceRegistryCorrupt::field("namespace")),
+    }
 }
 
 pub fn namespace_registry_atomicity_unsupported(

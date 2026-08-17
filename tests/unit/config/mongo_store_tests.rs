@@ -1554,16 +1554,65 @@ fn proxy_route_lock_cleanup_uses_an_escaped_id_prefix_not_a_namespace_filter() {
 }
 
 #[test]
-fn namespace_prefixed_id_rewrite_requires_exact_prefix_and_nonempty_suffix() {
+fn namespace_prefixed_id_rewrite_requires_suffix_field_and_embedded_namespace() {
     let body = mongo_method("rewrite_namespace_prefixed_ids_in_session(");
     assert!(
-        body.contains("strip_prefix(&expected_prefix)") && body.contains("suffix.is_empty()"),
-        "malformed `{namespace}:…` identities must abort rather than being rewritten as \
-         `new_name:{{entire_old_id}}`:\n{body}"
+        body.contains("namespace_prefixed_id_suffix_field(collection_name)")
+            && body.contains("require_namespace_prefixed_identity(")
+            && body.contains("document.get_str(\"namespace\").ok()")
+            && body.contains("document.get_str(suffix_field).ok()"),
+        "composite rewrite must require suffix-to-field equality and an embedded namespace:\n{body}"
     );
     assert!(
         !body.contains("unwrap_or(old_id.as_str())"),
         "the silent strip_prefix fallback must not return:\n{body}"
+    );
+    let require_at = body
+        .find("require_namespace_prefixed_identity(")
+        .expect("require helper");
+    let delete_at = body.find("delete_one").expect("delete_one");
+    assert!(
+        require_at < delete_at,
+        "corrupt identities must abort before delete/insert so the rename rolls back:\n{body}"
+    );
+    let rename = mongo_method("rename_namespace_documents_in_session(");
+    assert!(
+        rename.contains("\"consumers\"")
+            && rename.contains("\"consumer_identity_index\"")
+            && rename.contains("\"gateway_trust_bundles\""),
+        "rename must still rewrite both composite collections and the keyed trust document:\n{rename}"
+    );
+}
+
+#[test]
+fn namespace_keyed_document_move_requires_embedded_namespace_equality() {
+    let body = mongo_method("move_namespace_keyed_document_in_session(");
+    assert!(
+        body.contains("require_namespace_keyed_embedded_namespace(")
+            && body.contains("document.get_str(\"namespace\").ok()"),
+        "keyed trust documents must require an embedded namespace equal to the current key:\n{body}"
+    );
+    assert!(
+        !body.contains("if document.get_str(\"namespace\").is_ok()"),
+        "a missing or non-string namespace must abort rather than being skipped:\n{body}"
+    );
+    let require_at = body
+        .find("require_namespace_keyed_embedded_namespace(")
+        .expect("require helper");
+    let delete_at = body.find("delete_one").expect("delete_one");
+    assert!(
+        require_at < delete_at,
+        "a mismatched embedded namespace must abort before delete/insert:\n{body}"
+    );
+}
+
+#[test]
+fn namespace_registry_transaction_error_preserves_typed_corrupt() {
+    let body = mongo_fn_body("        fn namespace_registry_transaction_error(");
+    assert!(
+        body.contains("get_custom::<NamespaceRegistryCorrupt>()")
+            && body.contains("anyhow::Error::new(corrupt)"),
+        "typed rename corruption must surface as NamespaceRegistryCorrupt so admin stays on the static 500:\n{body}"
     );
 }
 
@@ -1623,11 +1672,14 @@ fn document_to_namespace_record_is_strict_and_does_not_synthesize() {
     assert!(
         body.contains("require_namespace_identity")
             && body.contains("parse_namespace_rfc3339")
+            && body.contains("require_canonical_stored_description")
             && body.contains("NamespaceRegistryCorrupt::field"),
         "corrupt durable documents must fail closed:\n{body}"
     );
     assert!(
-        !body.contains("Utc::now()") && !body.contains("unwrap_or_else(|| fallback_name"),
-        "missing timestamps/names must not be fabricated:\n{body}"
+        !body.contains("Utc::now()")
+            && !body.contains("unwrap_or_else(|| fallback_name")
+            && !body.contains("normalize_description"),
+        "missing timestamps/names must not be fabricated and stored descriptions must not be normalized:\n{body}"
     );
 }

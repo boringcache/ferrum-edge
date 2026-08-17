@@ -109,8 +109,10 @@ mod inner {
     use crate::config::namespace_registry::{
         DERIVED_NAMESPACE_RESOURCE_TABLES, NAMESPACE_OCCUPANCY_TABLES, NamespaceRecord,
         NamespaceRegistryAtomicityUnsupported, NamespaceRegistryCorrupt,
-        NamespaceRegistryError as RegistryError, NamespaceRegistryPhase, namespace_registry_fault,
-        parse_namespace_rfc3339, require_namespace_identity, stored_description,
+        NamespaceRegistryError as RegistryError, NamespaceRegistryPhase,
+        namespace_prefixed_id_suffix_field, namespace_registry_fault, parse_namespace_rfc3339,
+        require_canonical_stored_description, require_namespace_identity,
+        require_namespace_keyed_embedded_namespace, require_namespace_prefixed_identity,
     };
     use regex::escape as regex_escape;
 
@@ -5988,6 +5990,12 @@ mod inner {
         /// reached here actually carries — `proxy_route_locks` does not, which
         /// is why it is handled by
         /// [`Self::delete_namespace_guard_docs_in_session`] instead.
+        ///
+        /// A nonempty suffix is not enough: it must exactly equal the
+        /// collection's identity field (`id` on `consumers`, `identity_value`
+        /// on `consumer_identity_index`), and the embedded `namespace` string
+        /// must equal `current_name`. Any other shape aborts as typed
+        /// corruption before delete/insert, so a split identity cannot move.
         async fn rewrite_namespace_prefixed_ids_in_session(
             &self,
             session: &mut ClientSession,
@@ -5995,6 +6003,8 @@ mod inner {
             current_name: &str,
             new_name: &str,
         ) -> mongodb::error::Result<()> {
+            let suffix_field = namespace_prefixed_id_suffix_field(collection_name)
+                .map_err(mongodb::error::Error::custom)?;
             let collection = self.collection(collection_name);
             let mut moved: Vec<(String, Document)> = Vec::new();
             {
@@ -6008,27 +6018,18 @@ mod inner {
                         .get_str("_id")
                         .map_err(|_| {
                             mongodb::error::Error::custom(
-                                crate::config::namespace_registry::NamespaceRegistryCorrupt::field(
-                                    "identity",
-                                ),
+                                NamespaceRegistryCorrupt::field("identity"),
                             )
                         })?
                         .to_string();
-                    let expected_prefix = format!("{current_name}:");
-                    let Some(suffix) = old_id.strip_prefix(&expected_prefix) else {
-                        return Err(mongodb::error::Error::custom(
-                            crate::config::namespace_registry::NamespaceRegistryCorrupt::field(
-                                "identity",
-                            ),
-                        ));
-                    };
-                    if suffix.is_empty() {
-                        return Err(mongodb::error::Error::custom(
-                            crate::config::namespace_registry::NamespaceRegistryCorrupt::field(
-                                "identity",
-                            ),
-                        ));
-                    }
+                    let suffix = require_namespace_prefixed_identity(
+                        current_name,
+                        &old_id,
+                        document.get_str("namespace").ok(),
+                        suffix_field,
+                        document.get_str(suffix_field).ok(),
+                    )
+                    .map_err(mongodb::error::Error::custom)?;
                     document.insert("_id", format!("{new_name}:{suffix}"));
                     document.insert("namespace", new_name);
                     moved.push((old_id, document));
@@ -6064,10 +6065,13 @@ mod inner {
             else {
                 return Ok(());
             };
+            require_namespace_keyed_embedded_namespace(
+                current_id,
+                document.get_str("namespace").ok(),
+            )
+            .map_err(mongodb::error::Error::custom)?;
             document.insert("_id", new_id);
-            if document.get_str("namespace").is_ok() {
-                document.insert("namespace", new_namespace);
-            }
+            document.insert("namespace", new_namespace);
             collection
                 .delete_one(doc! { "_id": current_id })
                 .session(&mut *session)
@@ -14925,7 +14929,9 @@ mod inner {
             )?;
             let description = match doc.get("description") {
                 None | Some(Bson::Null) => None,
-                Some(Bson::String(value)) => stored_description(Some(value.clone())),
+                Some(Bson::String(value)) => {
+                    require_canonical_stored_description(Some(value.as_str()))?
+                }
                 Some(_) => return Err(NamespaceRegistryCorrupt::field("description")),
             };
             Ok(NamespaceRecord {

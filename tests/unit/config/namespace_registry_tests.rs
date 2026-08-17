@@ -3,7 +3,9 @@
 use ferrum_edge::config::namespace_registry::{
     CreateNamespaceRequest, MAX_NAMESPACE_DESCRIPTION_CHARS, NAMESPACE_REGISTRY_ADMISSION_KEY,
     NamespaceRegistryCorrupt, UpdateNamespaceBody, mtls_dns_admission_namespaces,
-    normalize_description, parse_namespace_rfc3339, require_namespace_identity,
+    namespace_prefixed_id_suffix_field, normalize_description, parse_namespace_rfc3339,
+    require_canonical_stored_description, require_namespace_identity,
+    require_namespace_keyed_embedded_namespace, require_namespace_prefixed_identity,
     validate_namespace_name,
 };
 
@@ -217,4 +219,185 @@ fn durable_namespace_identity_and_timestamps_fail_closed() {
     assert!(!err.to_string().contains("not-a-timestamp"));
     assert!(err.to_string().contains(NamespaceRegistryCorrupt::MESSAGE));
     assert!(err.to_string().contains("created_at"));
+}
+
+#[test]
+fn require_namespace_identity_rejects_invalid_stored_grammar() {
+    assert!(require_namespace_identity("ferrum", "ferrum", None).is_ok());
+    assert!(require_namespace_identity("prod-1.staging_ns", "prod-1.staging_ns", None).is_ok());
+    let at_limit = "a".repeat(254);
+    assert!(require_namespace_identity(&at_limit, &at_limit, None).is_ok());
+
+    let too_long = "a".repeat(255);
+    for invalid in ["has space", "-leading-hyphen", too_long.as_str()] {
+        let err = require_namespace_identity(invalid, invalid, None)
+            .expect_err("illegal durable names must fail closed even when _id equals name");
+        let text = err.to_string();
+        assert!(text.contains(NamespaceRegistryCorrupt::MESSAGE), "{text}");
+        assert!(text.contains("name"), "{text}");
+        assert!(
+            !text.contains(invalid) && !text.contains("alphanumeric"),
+            "stored value and validator text must not leak: {text}"
+        );
+        let err = require_namespace_identity(invalid, invalid, Some(invalid))
+            .expect_err("an expected-name match must not bypass grammar");
+        assert!(
+            !err.to_string().contains(invalid),
+            "stored value must not leak: {err}"
+        );
+    }
+}
+
+#[test]
+fn require_canonical_stored_description_rejects_noncanonical_strings() {
+    assert_eq!(require_canonical_stored_description(None).unwrap(), None);
+    assert_eq!(
+        require_canonical_stored_description(Some("staging")).unwrap(),
+        Some("staging".into())
+    );
+
+    let at_limit = "x".repeat(MAX_NAMESPACE_DESCRIPTION_CHARS);
+    assert_eq!(
+        require_canonical_stored_description(Some(&at_limit)).unwrap(),
+        Some(at_limit)
+    );
+    let at_limit_multibyte: String = "🧪".repeat(MAX_NAMESPACE_DESCRIPTION_CHARS);
+    assert_eq!(
+        at_limit_multibyte.chars().count(),
+        MAX_NAMESPACE_DESCRIPTION_CHARS
+    );
+    assert!(at_limit_multibyte.len() > MAX_NAMESPACE_DESCRIPTION_CHARS);
+    assert_eq!(
+        require_canonical_stored_description(Some(&at_limit_multibyte)).unwrap(),
+        Some(at_limit_multibyte)
+    );
+
+    let over_limit = "x".repeat(MAX_NAMESPACE_DESCRIPTION_CHARS + 1);
+    let over_limit_multibyte = "🧪".repeat(MAX_NAMESPACE_DESCRIPTION_CHARS + 1);
+    for noncanonical in [
+        "",
+        "  ",
+        "\tstaging",
+        "staging  ",
+        "  staging  ",
+        over_limit.as_str(),
+        over_limit_multibyte.as_str(),
+    ] {
+        let err = require_canonical_stored_description(Some(noncanonical))
+            .expect_err("noncanonical durable descriptions must not be served");
+        let text = err.to_string();
+        assert!(text.contains(NamespaceRegistryCorrupt::MESSAGE), "{text}");
+        assert!(text.contains("description"), "{text}");
+        assert!(
+            (noncanonical.is_empty() || !text.contains(noncanonical))
+                && !text.contains("staging")
+                && !text.contains("🧪"),
+            "stored description must not leak: {text}"
+        );
+    }
+}
+
+#[test]
+fn require_namespace_prefixed_identity_requires_suffix_field_and_embedded_namespace() {
+    assert_eq!(
+        namespace_prefixed_id_suffix_field("consumers").unwrap(),
+        "id"
+    );
+    assert_eq!(
+        namespace_prefixed_id_suffix_field("consumer_identity_index").unwrap(),
+        "identity_value"
+    );
+    assert!(namespace_prefixed_id_suffix_field("gateway_trust_bundles").is_err());
+    assert!(namespace_prefixed_id_suffix_field("proxies").is_err());
+
+    assert_eq!(
+        require_namespace_prefixed_identity("ns", "ns:alice", Some("ns"), "id", Some("alice"))
+            .unwrap(),
+        "alice"
+    );
+    assert_eq!(
+        require_namespace_prefixed_identity(
+            "ns",
+            "ns:alice@ex",
+            Some("ns"),
+            "identity_value",
+            Some("alice@ex"),
+        )
+        .unwrap(),
+        "alice@ex"
+    );
+
+    let mismatch_id = require_namespace_prefixed_identity(
+        "secret-ns",
+        "secret-ns:secret-id",
+        Some("secret-ns"),
+        "id",
+        Some("other-id"),
+    )
+    .unwrap_err();
+    let mismatch_id_text = mismatch_id.to_string();
+    assert!(
+        mismatch_id_text.contains(NamespaceRegistryCorrupt::MESSAGE)
+            && mismatch_id_text.contains("id")
+            && !mismatch_id_text.contains("secret"),
+        "{mismatch_id_text}"
+    );
+
+    let mismatch_identity = require_namespace_prefixed_identity(
+        "secret-ns",
+        "secret-ns:secret-id",
+        Some("secret-ns"),
+        "identity_value",
+        Some("other"),
+    )
+    .unwrap_err();
+    let mismatch_identity_text = mismatch_identity.to_string();
+    assert!(
+        mismatch_identity_text.contains("identity_value")
+            && !mismatch_identity_text.contains("secret"),
+        "{mismatch_identity_text}"
+    );
+
+    for (old_id, embedded, suffix) in [
+        ("secret-ns:secret-id", None, Some("secret-id")),
+        ("secret-ns:secret-id", Some(""), Some("secret-id")),
+        ("secret-ns:secret-id", Some("other-ns"), Some("secret-id")),
+        ("secret-ns:secret-id", Some("secret-ns"), None),
+        ("secret-ns:secret-id", Some("secret-ns"), Some("")),
+        ("secret-ns:", Some("secret-ns"), Some("secret-id")),
+        ("secret-id", Some("secret-ns"), Some("secret-id")),
+        ("other-ns:secret-id", Some("secret-ns"), Some("secret-id")),
+    ] {
+        let err = require_namespace_prefixed_identity(
+            "secret-ns",
+            old_id,
+            embedded,
+            "id",
+            suffix,
+        )
+        .expect_err("corrupt composite identities must abort");
+        let text = err.to_string();
+        assert!(text.contains(NamespaceRegistryCorrupt::MESSAGE), "{text}");
+        assert!(
+            !text.contains("secret") && !text.contains(old_id),
+            "stored identity must not leak: {text}"
+        );
+    }
+}
+
+#[test]
+fn require_namespace_keyed_embedded_namespace_is_strict() {
+    assert!(require_namespace_keyed_embedded_namespace("ns", Some("ns")).is_ok());
+    for embedded in [None, Some(""), Some("other")] {
+        let err = require_namespace_keyed_embedded_namespace("secret-ns", embedded)
+            .expect_err("keyed documents must not move with a mismatched namespace");
+        let text = err.to_string();
+        assert!(text.contains(NamespaceRegistryCorrupt::MESSAGE), "{text}");
+        assert!(text.contains("namespace"), "{text}");
+        assert!(
+            !text.contains("secret")
+                && !embedded.is_some_and(|value| !value.is_empty() && text.contains(value)),
+            "stored namespace must not leak: {text}"
+        );
+    }
 }
