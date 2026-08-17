@@ -550,7 +550,10 @@ async fn update_description_respects_unicode_character_bounds() {
         Some(json!({"description": padded})),
     )
     .await;
-    assert_eq!(status, 200, "trim happens before the length check: {body:?}");
+    assert_eq!(
+        status, 200,
+        "trim happens before the length check: {body:?}"
+    );
 }
 
 #[tokio::test]
@@ -1004,7 +1007,10 @@ async fn effective_configured_namespace_is_protected_from_delete_and_rename() {
         None,
     )
     .await;
-    assert_eq!(status, 409, "configured namespace cannot be deleted: {body:?}");
+    assert_eq!(
+        status, 409,
+        "configured namespace cannot be deleted: {body:?}"
+    );
 
     let (status, body) = send(
         reqwest::Method::PUT,
@@ -1346,10 +1352,9 @@ async fn store_create_rename_delete_round_trip() {
     seed_upstream(&store, "direct", "up-direct").await;
     assert!(store.namespace_has_resources("direct").await.unwrap());
 
-    let admission =
-        lock_namespace_registry_admission_for_test(db.clone(), &["direct", "renamed"])
-            .await
-            .expect("registry admission");
+    let admission = lock_namespace_registry_admission_for_test(db.clone(), &["direct", "renamed"])
+        .await
+        .expect("registry admission");
     let updated = store
         .update_namespace(
             "direct",
@@ -1617,9 +1622,7 @@ async fn corrupt_registry_row_is_not_served_as_plausible_detail() {
     assert_eq!(status, 500, "corrupt timestamps must fail closed: {body:?}");
     let error = body["error"].as_str().unwrap_or("");
     assert!(
-        error.contains(
-            ferrum_edge::config::namespace_registry::NamespaceRegistryCorrupt::MESSAGE
-        ),
+        error.contains(ferrum_edge::config::namespace_registry::NamespaceRegistryCorrupt::MESSAGE),
         "client must see the static corrupt message: {body:?}"
     );
     assert!(

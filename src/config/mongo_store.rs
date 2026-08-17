@@ -5238,8 +5238,7 @@ mod inner {
                     if let Some(corrupt) = error.get_custom::<NamespaceRegistryCorrupt>().copied() {
                         anyhow::Error::new(corrupt)
                     } else {
-                        anyhow::Error::new(error)
-                            .context("namespace registry transaction failed")
+                        anyhow::Error::new(error).context("namespace registry transaction failed")
                     }
                 }
             }
@@ -6092,10 +6091,7 @@ mod inner {
         NotFound(String),
         NameInUse(String),
         NotEmpty(String),
-        Protected {
-            name: String,
-            reason: &'static str,
-        },
+        Protected { name: String, reason: &'static str },
         AdmissionLeaseLost,
         InjectedFault(NamespaceRegistryPhase),
     }
@@ -11785,18 +11781,15 @@ mod inner {
                         let mut session = connection.client.start_session().await?;
                         session
                             .start_transaction()
-                            .and_run(
-                                (self, namespace.to_string()),
-                                |s, (this, namespace)| {
-                                    Box::pin(async move {
-                                        this.delete_all_namespace_resources_in_session(
-                                            &mut *s,
-                                            namespace.as_str(),
-                                        )
-                                        .await
-                                    })
-                                },
-                            )
+                            .and_run((self, namespace.to_string()), |s, (this, namespace)| {
+                                Box::pin(async move {
+                                    this.delete_all_namespace_resources_in_session(
+                                        &mut *s,
+                                        namespace.as_str(),
+                                    )
+                                    .await
+                                })
+                            })
                             .await
                             .map_err(anyhow::Error::new)
                             .context("delete_all_resources transaction failed")?;
@@ -12300,9 +12293,9 @@ mod inner {
                 let record = session
                     .start_transaction()
                     .and_run((self, plan), |s, (this, plan)| {
-                        Box::pin(async move {
-                            this.update_namespace_in_session(&mut *s, plan).await
-                        })
+                        Box::pin(
+                            async move { this.update_namespace_in_session(&mut *s, plan).await },
+                        )
                     })
                     .await
                     .map_err(Self::namespace_registry_transaction_error)?;

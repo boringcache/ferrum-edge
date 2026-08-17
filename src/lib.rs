@@ -2055,9 +2055,7 @@ pub mod _test_support {
     impl TestNamespaceRegistryAdmission {
         /// The exact lease identities a backend re-verifies at its commit
         /// boundary.
-        pub fn holds(
-            &self,
-        ) -> Vec<crate::config::db_backend::NamespaceAdmissionLeaseHold<'_>> {
+        pub fn holds(&self) -> Vec<crate::config::db_backend::NamespaceAdmissionLeaseHold<'_>> {
             self.0.holds()
         }
     }

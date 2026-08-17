@@ -398,10 +398,7 @@ pub fn is_namespace_registry_corrupt(error: &anyhow::Error) -> Option<&Namespace
 /// description-only update needs only the current name. Callers acquire in
 /// this order so SQL row locks and Mongo multi-lease acquisition cannot
 /// deadlock.
-pub fn mtls_dns_admission_namespaces<'a>(
-    current_name: &'a str,
-    new_name: &'a str,
-) -> Vec<&'a str> {
+pub fn mtls_dns_admission_namespaces<'a>(current_name: &'a str, new_name: &'a str) -> Vec<&'a str> {
     let mut names = vec![current_name];
     if new_name != current_name {
         names.push(new_name);

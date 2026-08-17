@@ -8055,12 +8055,13 @@ impl DatabaseStore {
         tx: &mut sqlx::Transaction<'_, sqlx::Any>,
         name: &str,
     ) -> Result<Option<crate::config::namespace_registry::NamespaceRecord>, anyhow::Error> {
-        let row = sqlx::query(&self.q(
-            "SELECT name, description, created_at, updated_at FROM namespaces WHERE name = ?",
-        ))
-        .bind(name)
-        .fetch_optional(&mut **tx)
-        .await?;
+        let row =
+            sqlx::query(&self.q(
+                "SELECT name, description, created_at, updated_at FROM namespaces WHERE name = ?",
+            ))
+            .bind(name)
+            .fetch_optional(&mut **tx)
+            .await?;
         let Some(row) = row else {
             return Ok(None);
         };
@@ -8082,10 +8083,7 @@ impl DatabaseStore {
         leases: &[crate::config::batch_atomicity::NamespaceAdmissionLeaseHold<'_>],
         fault: Option<RegistryPhase>,
     ) -> Result<(), anyhow::Error> {
-        check_namespace_registry_fault(
-            fault,
-            RegistryPhase::LeaseLost,
-        )?;
+        check_namespace_registry_fault(fault, RegistryPhase::LeaseLost)?;
         for hold in leases {
             self.verify_namespace_config_admission_lease_tx(tx, hold.key, &hold.lease)
                 .await?;
@@ -8100,10 +8098,7 @@ impl DatabaseStore {
     ) -> Result<(), anyhow::Error> {
         let fault = namespace_registry_fault(&record.name);
         let mut tx = self.pool().begin().await?;
-        check_namespace_registry_fault(
-            fault,
-            RegistryPhase::Start,
-        )?;
+        check_namespace_registry_fault(fault, RegistryPhase::Start)?;
         // Vacancy is decided HERE, inside the serialized transaction — an
         // earlier handler query could only improve the error message.
         if self.namespace_name_in_use_tx(&mut tx, &record.name).await? {
@@ -8118,16 +8113,10 @@ impl DatabaseStore {
         .bind(record.updated_at.to_rfc3339())
         .execute(&mut *tx)
         .await?;
-        check_namespace_registry_fault(
-            fault,
-            RegistryPhase::RegistryRow,
-        )?;
+        check_namespace_registry_fault(fault, RegistryPhase::RegistryRow)?;
         self.verify_namespace_registry_leases_tx(&mut tx, leases, fault)
             .await?;
-        check_namespace_registry_fault(
-            fault,
-            RegistryPhase::Commit,
-        )?;
+        check_namespace_registry_fault(fault, RegistryPhase::Commit)?;
         tx.commit().await?;
         Ok(())
     }
@@ -8155,10 +8144,7 @@ impl DatabaseStore {
         // tombstones, so it needs the same repeatable-read capture the
         // namespace-wide delete path uses.
         self.use_delete_capture_snapshot_tx(&mut tx).await?;
-        check_namespace_registry_fault(
-            fault,
-            RegistryPhase::Start,
-        )?;
+        check_namespace_registry_fault(fault, RegistryPhase::Start)?;
 
         let existing = self.get_namespace_tx(&mut tx, current_name).await?;
         if existing.is_none() && !self.namespace_name_in_use_tx(&mut tx, current_name).await? {
@@ -8181,10 +8167,9 @@ impl DatabaseStore {
         // writes resources into `new_name`, so both source and target fences
         // are taken in sorted order inside this same transaction and fail
         // closed when either has a restore owner.
-        for name in crate::config::namespace_registry::mtls_dns_admission_namespaces(
-            current_name,
-            new_name,
-        ) {
+        for name in
+            crate::config::namespace_registry::mtls_dns_admission_namespaces(current_name, new_name)
+        {
             self.lock_mtls_dns_admission_for_owner_tx(&mut tx, name, None)
                 .await?;
         }
@@ -8207,16 +8192,10 @@ impl DatabaseStore {
         if !renaming {
             self.upsert_namespace_registry_row_tx(&mut tx, current_name, &record, &now_rfc)
                 .await?;
-            check_namespace_registry_fault(
-                fault,
-                RegistryPhase::RegistryRow,
-            )?;
+            check_namespace_registry_fault(fault, RegistryPhase::RegistryRow)?;
             self.verify_namespace_registry_leases_tx(&mut tx, leases, fault)
                 .await?;
-            check_namespace_registry_fault(
-                fault,
-                RegistryPhase::Commit,
-            )?;
+            check_namespace_registry_fault(fault, RegistryPhase::Commit)?;
             tx.commit().await?;
             self.check_slow_query("update_namespace", start);
             return Ok(record);
@@ -8226,10 +8205,7 @@ impl DatabaseStore {
             .await?;
         self.verify_namespace_registry_leases_tx(&mut tx, leases, fault)
             .await?;
-        check_namespace_registry_fault(
-            fault,
-            RegistryPhase::Commit,
-        )?;
+        check_namespace_registry_fault(fault, RegistryPhase::Commit)?;
         tx.commit().await?;
         self.check_slow_query("update_namespace", start);
         Ok(record)
@@ -8355,22 +8331,17 @@ impl DatabaseStore {
                 .await?;
         }
 
-        check_namespace_registry_fault(
-            fault,
-            RegistryPhase::Resources,
-        )?;
+        check_namespace_registry_fault(fault, RegistryPhase::Resources)?;
 
         // Route-bucket lock rows are NOT copied: every proxy admission upserts
         // the one it needs on demand, and copying could collide with a row a
         // previous tenant of the target name left behind, aborting an otherwise
         // valid rename. Removing the stale old-name rows is the deliberate
         // cleanup.
-        self.delete_namespace_guard_rows_tx(tx, current_name).await?;
+        self.delete_namespace_guard_rows_tx(tx, current_name)
+            .await?;
 
-        check_namespace_registry_fault(
-            fault,
-            RegistryPhase::Ancillary,
-        )?;
+        check_namespace_registry_fault(fault, RegistryPhase::Ancillary)?;
 
         // Polling tombstones: every mover is a `delete` under the old name and
         // an `upsert` under the new one. Historical `config_changes` rows and
@@ -8400,10 +8371,7 @@ impl DatabaseStore {
             .bind(current_name)
             .execute(&mut **tx)
             .await?;
-        check_namespace_registry_fault(
-            fault,
-            RegistryPhase::RegistryRow,
-        )?;
+        check_namespace_registry_fault(fault, RegistryPhase::RegistryRow)?;
         Ok(())
     }
 
@@ -8486,10 +8454,7 @@ impl DatabaseStore {
         let mut tx = self.pool().begin().await?;
         // Postgres: must precede every other statement in the transaction.
         self.use_delete_capture_snapshot_tx(&mut tx).await?;
-        check_namespace_registry_fault(
-            fault,
-            RegistryPhase::Start,
-        )?;
+        check_namespace_registry_fault(fault, RegistryPhase::Start)?;
 
         if !self.namespace_name_in_use_tx(&mut tx, name).await? {
             return Ok(false);
@@ -8509,25 +8474,16 @@ impl DatabaseStore {
             self.delete_namespace_trust_bundle_in_tx(&mut tx, name)
                 .await?;
         }
-        check_namespace_registry_fault(
-            fault,
-            RegistryPhase::Resources,
-        )?;
+        check_namespace_registry_fault(fault, RegistryPhase::Resources)?;
 
         self.delete_namespace_guard_rows_tx(&mut tx, name).await?;
-        check_namespace_registry_fault(
-            fault,
-            RegistryPhase::Ancillary,
-        )?;
+        check_namespace_registry_fault(fault, RegistryPhase::Ancillary)?;
 
         sqlx::query(&self.q("DELETE FROM namespaces WHERE name = ?"))
             .bind(name)
             .execute(&mut *tx)
             .await?;
-        check_namespace_registry_fault(
-            fault,
-            RegistryPhase::RegistryRow,
-        )?;
+        check_namespace_registry_fault(fault, RegistryPhase::RegistryRow)?;
 
         // Re-checked HERE against durable registry rows, not the GET union.
         // Ordinary resource deletion in a derived-only namespace does not take
@@ -8539,17 +8495,11 @@ impl DatabaseStore {
                 RegistryError::PROTECTED_LAST_REMAINING,
             ));
         }
-        check_namespace_registry_fault(
-            fault,
-            RegistryPhase::LastNamespaceCheck,
-        )?;
+        check_namespace_registry_fault(fault, RegistryPhase::LastNamespaceCheck)?;
 
         self.verify_namespace_registry_leases_tx(&mut tx, leases, fault)
             .await?;
-        check_namespace_registry_fault(
-            fault,
-            RegistryPhase::Commit,
-        )?;
+        check_namespace_registry_fault(fault, RegistryPhase::Commit)?;
         tx.commit().await?;
         self.check_slow_query("delete_namespace", start);
         Ok(true)

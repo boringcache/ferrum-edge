@@ -84,7 +84,9 @@ fn update_body_distinguishes_omit_from_clear() {
     let empty = parse_update(r#"{"description":"  "}"#).resolve().unwrap();
     assert_eq!(empty.description, Some(None));
 
-    let set = parse_update(r#"{"description":" live "}"#).resolve().unwrap();
+    let set = parse_update(r#"{"description":" live "}"#)
+        .resolve()
+        .unwrap();
     assert_eq!(set.description, Some(Some("live".into())));
 
     let nothing = parse_update("{}").resolve().unwrap();
