@@ -486,18 +486,23 @@ node-agent ingress-redirect helpers, `src/capture/` (`should_fallback_to_iptable
 via `kernel_probe`), and the loader-adjacent transparent bind
 (`src/proxy/mod.rs` `create_proxy_socket` + `src/socket_opts.rs`); netns
 capture live is the netns/TPROXY/SO_ORIGINAL_DST/UDP producer surfaces plus
-the HBONE/mesh-runtime/MeshSubscribe/identity/TLS boundaries the source-capture
-e2e tests traverse; two-cluster live is mesh/HBONE/identity/SPIRE/east-west
-plus `SO_ORIGINAL_DST`, mesh trust withdrawal, MeshSubscribe JWT helpers, the
-shared functional harness, and `two_cluster_spire.sh`. Shared compile inputs
+the HBONE/mesh-runtime/MeshSubscribe/identity/TLS boundaries, backend dispatch,
+TCP relay, route selection, and mesh policy the source-capture e2e tests
+traverse; two-cluster live is mesh/HBONE/identity/SPIRE/east-west plus
+`SO_ORIGINAL_DST`, mesh trust withdrawal, backend dispatch, route selection,
+mesh policy, MeshSubscribe JWT helpers, the shared functional harness, and
+`two_cluster_spire.sh`. Shared compile inputs
 (`Cargo.lock`, `rust-toolchain.toml`, `.cargo/`, `vendor/`, `setup-rust-ci`)
 still fire every live gate. The functional harness file schedules netns and
 two-cluster only — kernel live tests live in `src/ebpf/loader.rs`, not that
-file. Non-mesh gRPC (`src/grpc/cp_server.rs`) stays isolated from all three.
+file. CP-side trust serving (`src/grpc/cp_trust.rs`) stays isolated from all
+three, while `src/grpc/cp_server.rs` schedules netns and two-cluster because it
+owns the default JWT issuer shared by their functional fixture and production
+MeshSubscribe client.
 Non-PR events, empty or unavailable diffs, and
 edits to `GATE_CONTROLLER_PATHS` (`pr_ci_plan.py`, `live_suite_path_filter.py`)
 force every gated suite on. Missing/invalid planner outputs fail closed to
-`true` in `CI Plan`. Plugin-only, admin-only, Dockerfile, and dedicated
+`true` in `CI Plan`. Non-mesh-plugin-only, admin-only, Dockerfile, and dedicated
 ambient-host-UDP/k8s-live paths do not schedule these three jobs. The
 deploy-only multicluster job remains a
 distinct packaging-and-rollout check; authoritative datapath coverage rides the
@@ -854,8 +859,8 @@ with `require_planned_gate` against that job's own output:
 | Job | Planner output | Distinctive surfaces |
 |---|---|---|
 | `ebpf-live` | `run_ebpf_kernel_live` | `ebpf/`, `src/ebpf/`, `src/capture/`, `src/proxy/mod.rs`, `src/socket_opts.rs`, `src/modes/node_agent.rs`, `setup-bpf-linker` |
-| `netns-capture-live` | `run_netns_capture_live` | netns/UDP/TPROXY/SO_ORIGINAL_DST producers, `src/capture/`, HBONE pool/proxy, mesh runtime, MeshSubscribe (`src/grpc/mesh_*`, `auth.rs`, `dp_client.rs`), identity, TLS, `mesh_trust_registry`, source-capture functional tests |
-| `two-cluster-mesh-live` | `run_two_cluster_live` | `src/modes/mesh/`, `src/identity/`, `src/tls/`, MeshSubscribe JWT/gRPC helpers, HBONE, east-west, `SO_ORIGINAL_DST`, `mesh_trust_registry`, `two_cluster_spire.sh` |
+| `netns-capture-live` | `run_netns_capture_live` | netns/UDP/TPROXY/SO_ORIGINAL_DST producers, `src/capture/`, HBONE pool/proxy, mesh runtime, MeshSubscribe (`src/grpc/mesh_*`, `auth.rs`, `cp_server.rs`, `dp_client.rs`), backend dispatch/TCP relay, routing/service discovery, mesh policy, identity, TLS, `mesh_trust_registry`, source-capture functional tests |
+| `two-cluster-mesh-live` | `run_two_cluster_live` | `src/modes/mesh/`, `src/identity/`, `src/tls/`, MeshSubscribe JWT/gRPC helpers (including `cp_server.rs`), backend dispatch/TCP relay, routing/service discovery, mesh policy, HBONE, east-west, `SO_ORIGINAL_DST`, `mesh_trust_registry`, `two_cluster_spire.sh` |
 
 All three also schedule on shared compile/CI inputs (`Cargo.toml`/`Cargo.lock`,
 `rust-toolchain.toml`, `.cargo/`, `vendor/`, `build.rs`, `.github/workflows/ci.yml`,

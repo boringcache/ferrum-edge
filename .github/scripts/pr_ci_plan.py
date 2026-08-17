@@ -675,21 +675,25 @@ EBPF_KERNEL_LIVE_PATTERNS = compile_path_patterns(
 # The two functional tests spawn real mesh-mode gateways, so the gate also
 # covers the production boundaries they traverse rather than only capture
 # producers: HBONE pool/proxy, mesh-mode runtime (native MeshSubscribe client),
-# mesh gRPC subscribe (`src/grpc/mesh_*` plus JWT audience + `GrpcJwtSecret`
-# minting), identity/SVID, TLS/SPIFFE, and `mesh_trust_registry` (attached to
-# the HBONE/mTLS pools). Unrelated gRPC (`cp_server`, `cp_trust`) stays out.
+# mesh gRPC subscribe (`src/grpc/mesh_*` plus JWT audience, the shared
+# `cp_server` default issuer, and `GrpcJwtSecret` minting), identity/SVID,
+# TLS/SPIFFE, mesh policy plugins, route selection, and `mesh_trust_registry`
+# (attached to the HBONE/mTLS pools). Unrelated CP trust serving stays out.
 NETNS_CAPTURE_LIVE_PATTERNS = compile_path_patterns(
     LIVE_SUITE_SHARED_PATTERNS,
     (
         r"^proto/",
         r"^src/capture/",
-        r"^src/grpc/(?:mesh_|auth\.rs$|dp_client\.rs$)",
+        r"^src/grpc/(?:mesh_|auth\.rs$|cp_server\.rs$|dp_client\.rs$)",
         r"^src/identity/",
         r"^src/modes/mesh/",
         r"^src/modes/(?:node_agent|node_agent_cni_server)\.rs$",
+        r"^src/plugins/mesh/",
+        r"^src/router_cache\.rs$",
+        r"^src/service_discovery/mesh\.rs$",
         r"^src/socket_opts\.rs$",
         r"^src/tls/",
-        r"^src/proxy/(?:hbone_pool|hbone_proxy|host_udp_capture|mesh_mtls_pool|mesh_tcp_egress|mesh_tcp_inbound|mesh_trust_registry|mesh_udp_capture|mesh_udp_frame|mod|netns_capture|netns_udp_capture|udp_batch)\.rs$",
+        r"^src/proxy/(?:backend_dispatch|hbone_pool|hbone_proxy|host_udp_capture|mesh_mtls_pool|mesh_tcp_egress|mesh_tcp_inbound|mesh_trust_registry|mesh_udp_capture|mesh_udp_frame|mod|netns_capture|netns_udp_capture|tcp_proxy|udp_batch)\.rs$",
         r"^tests/functional/functional_mesh_mode_test\.rs$",
     ),
 )
@@ -702,19 +706,21 @@ NETNS_CAPTURE_LIVE_PATTERNS = compile_path_patterns(
 # Extra shared production helpers the matrix actually uses:
 # - `src/socket_opts.rs`: `SO_ORIGINAL_DST` after `install_tcp_capture` REDIRECT
 # - `src/proxy/mesh_trust_registry.rs`: federated / wrong-TD fail-closed
-# - `src/grpc/auth.rs` + `src/grpc/dp_client.rs`: native MeshSubscribe JWT
+# - `src/grpc/auth.rs` + `src/grpc/cp_server.rs` + `src/grpc/dp_client.rs`:
+#   native MeshSubscribe JWT authentication and shared issuer default
 # Not included: `src/proxy/netns_capture.rs` (sidecar binds in its own netns)
-# and non-mesh gRPC (`cp_server`).
+# and CP-side trust serving (`cp_trust`).
 TWO_CLUSTER_LIVE_PATTERNS = compile_path_patterns(
     LIVE_SUITE_SHARED_PATTERNS,
     (
         r"^proto/",
         r"^src/capture/",
-        r"^src/grpc/(?:mesh_|auth\.rs$|dp_client\.rs$)",
+        r"^src/grpc/(?:mesh_|auth\.rs$|cp_server\.rs$|dp_client\.rs$)",
         r"^src/identity/",
         r"^src/modes/mesh/",
         r"^src/plugins/mesh/",
-        r"^src/proxy/(?:grpc_proxy|hbone_pool|hbone_proxy|mesh_mtls_pool|mesh_tcp_egress|mesh_tcp_inbound|mesh_trust_registry|mesh_udp_capture|mesh_udp_frame|mod|netns_udp_capture|tcp_proxy)\.rs$",
+        r"^src/proxy/(?:backend_dispatch|grpc_proxy|hbone_pool|hbone_proxy|mesh_mtls_pool|mesh_tcp_egress|mesh_tcp_inbound|mesh_trust_registry|mesh_udp_capture|mesh_udp_frame|mod|netns_udp_capture|tcp_proxy)\.rs$",
+        r"^src/router_cache\.rs$",
         r"^src/service_discovery/mesh\.rs$",
         r"^src/socket_opts\.rs$",
         r"^src/tls/",
@@ -1364,6 +1370,60 @@ def self_test() -> int:
         ),
         (
             "pull_request",
+            ["src/grpc/cp_server.rs"],
+            {
+                "run_ebpf_kernel_live": False,
+                "run_netns_capture_live": True,
+                "run_two_cluster_live": True,
+            },
+        ),
+        (
+            "pull_request",
+            ["src/proxy/backend_dispatch.rs"],
+            {
+                "run_ebpf_kernel_live": False,
+                "run_netns_capture_live": True,
+                "run_two_cluster_live": True,
+            },
+        ),
+        (
+            "pull_request",
+            ["src/proxy/tcp_proxy.rs"],
+            {
+                "run_ebpf_kernel_live": False,
+                "run_netns_capture_live": True,
+                "run_two_cluster_live": True,
+            },
+        ),
+        (
+            "pull_request",
+            ["src/router_cache.rs"],
+            {
+                "run_ebpf_kernel_live": False,
+                "run_netns_capture_live": True,
+                "run_two_cluster_live": True,
+            },
+        ),
+        (
+            "pull_request",
+            ["src/service_discovery/mesh.rs"],
+            {
+                "run_ebpf_kernel_live": False,
+                "run_netns_capture_live": True,
+                "run_two_cluster_live": True,
+            },
+        ),
+        (
+            "pull_request",
+            ["src/plugins/mesh/mesh_authz.rs"],
+            {
+                "run_ebpf_kernel_live": False,
+                "run_netns_capture_live": True,
+                "run_two_cluster_live": True,
+            },
+        ),
+        (
+            "pull_request",
             ["ebpf/ferrum-ebpf/src/main.rs"],
             {
                 "run_ebpf_build": True,
@@ -1450,9 +1510,9 @@ def self_test() -> int:
             },
         ),
         # Meaningful negatives: dedicated ambient-host-UDP / image / k8s-tooling
-        # / non-mesh gRPC must not resurrect the old union gate. Mesh TLS is a
-        # shared netns+two-cluster security boundary (see src/tls/mod.rs above),
-        # not a kernel-live input.
+        # / unrelated CP trust serving must not resurrect the old union gate.
+        # Mesh TLS is a shared netns+two-cluster security boundary (see
+        # src/tls/mod.rs above), not a kernel-live input.
         (
             "pull_request",
             ["tests/k8s/ambient_host_udp_live/run.sh"],
@@ -1477,15 +1537,6 @@ def self_test() -> int:
             [".github/actions/setup-kubernetes-tools/action.yml"],
             {
                 "run_helm": True,
-                "run_ebpf_kernel_live": False,
-                "run_netns_capture_live": False,
-                "run_two_cluster_live": False,
-            },
-        ),
-        (
-            "pull_request",
-            ["src/grpc/cp_server.rs"],
-            {
                 "run_ebpf_kernel_live": False,
                 "run_netns_capture_live": False,
                 "run_two_cluster_live": False,
