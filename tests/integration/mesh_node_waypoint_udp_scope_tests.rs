@@ -2885,7 +2885,9 @@ fn an_absent_required_map_never_produces_an_acknowledgement() {
         "an ELF without the reply-source maps must never look converged"
     );
 
-    publisher.publish(&[], false).expect("empty withdrawal generation");
+    publisher
+        .publish(&[], false)
+        .expect("empty withdrawal generation");
     reconcile_node_waypoint_udp_reply_sources(&mut backend, &config, &pods, &mut state);
     assert_eq!(
         acknowledgement(registry.path()),
@@ -2977,10 +2979,13 @@ fn a_new_generation_retracts_the_previous_acknowledgement_before_applying() {
     // A new generation the agent cannot apply. The old acknowledgement must be
     // gone even though the new one is never written.
     publisher
-        .publish(&[
-            reply_source("10.96.0.10", 5300),
-            reply_source("10.96.0.11", 5301),
-        ], true)
+        .publish(
+            &[
+                reply_source("10.96.0.10", 5300),
+                reply_source("10.96.0.11", 5301),
+            ],
+            true,
+        )
         .expect("second");
     backend.fail_replace_udp_reply_sources = true;
     reconcile_node_waypoint_udp_reply_sources(&mut backend, &config, &pods, &mut state);
@@ -3145,7 +3150,9 @@ fn a_successor_generation_gets_its_own_acknowledgement() {
     let mut state = NodeWaypointUdpReplySourceState::default();
 
     let predecessor = RegistryDirReplySourcePublisher::new(registry.path(), Some(RELAY_POD_UID));
-    let old = predecessor.publish(&destinations, true).expect("predecessor");
+    let old = predecessor
+        .publish(&destinations, true)
+        .expect("predecessor");
     reconcile_node_waypoint_udp_reply_sources(&mut backend, &config, &pods, &mut state);
     assert_eq!(acknowledgement(registry.path()), Some(old.clone()));
     assert_eq!(backend.udp_reply_source_updates.len(), 1);

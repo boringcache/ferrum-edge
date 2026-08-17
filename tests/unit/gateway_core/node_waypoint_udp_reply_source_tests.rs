@@ -220,7 +220,9 @@ fn a_proxy_without_a_relay_identity_authorizes_nothing_but_still_withdraws() {
     let publisher = RegistryDirReplySourcePublisher::new(registry.path(), None);
 
     assert!(
-        publisher.publish(&[source("10.96.0.10", 5300)], true).is_err(),
+        publisher
+            .publish(&[source("10.96.0.10", 5300)], true)
+            .is_err(),
         "a non-empty set with no relay identity must be refused, not published unproven"
     );
     assert!(
@@ -258,7 +260,9 @@ fn an_unusable_relay_identity_is_refused_at_the_publisher() {
         let registry = tempfile::tempdir().expect("registry dir");
         let publisher = RegistryDirReplySourcePublisher::new(registry.path(), Some(uid));
         assert!(
-            publisher.publish(&[source("10.96.0.10", 5300)], true).is_err(),
+            publisher
+                .publish(&[source("10.96.0.10", 5300)], true)
+                .is_err(),
             "an unusable relay identity ({uid:?}) must authorize nothing"
         );
     }
@@ -411,11 +415,14 @@ fn the_whole_set_is_published_as_one_file() {
     let registry = tempfile::tempdir().expect("registry dir");
     let publisher = RegistryDirReplySourcePublisher::new(registry.path(), Some(RELAY_POD_UID));
     publisher
-        .publish(&[
-            source("10.96.0.10", 5300),
-            source("10.96.0.11", 5301),
-            source("fd00:10:96::a", 5300),
-        ], true)
+        .publish(
+            &[
+                source("10.96.0.10", 5300),
+                source("10.96.0.11", 5301),
+                source("fd00:10:96::a", 5300),
+            ],
+            true,
+        )
         .expect("publication");
 
     assert_eq!(
@@ -444,7 +451,10 @@ fn publishing_replaces_the_whole_set() {
     let publisher = RegistryDirReplySourcePublisher::new(registry.path(), Some(RELAY_POD_UID));
 
     publisher
-        .publish(&[source("10.96.0.10", 5300), source("10.96.0.11", 5301)], true)
+        .publish(
+            &[source("10.96.0.10", 5300), source("10.96.0.11", 5301)],
+            true,
+        )
         .expect("first publication");
     assert_eq!(
         published_sources(registry.path()),
@@ -454,7 +464,10 @@ fn publishing_replaces_the_whole_set() {
     // The second generation drops .10 and adds .12. The dropped one must be
     // gone, not merely shadowed.
     publisher
-        .publish(&[source("10.96.0.11", 5301), source("10.96.0.12", 5302)], true)
+        .publish(
+            &[source("10.96.0.11", 5301), source("10.96.0.12", 5302)],
+            true,
+        )
         .expect("second publication");
     assert_eq!(
         published_sources(registry.path()),
@@ -472,7 +485,10 @@ fn an_empty_publication_withdraws_everything() {
     let publisher = RegistryDirReplySourcePublisher::new(registry.path(), Some(RELAY_POD_UID));
 
     publisher
-        .publish(&[source("10.96.0.10", 5300), source("fd00:10:96::a", 5300)], true)
+        .publish(
+            &[source("10.96.0.10", 5300), source("fd00:10:96::a", 5300)],
+            true,
+        )
         .expect("publication");
     assert_eq!(published_sources(registry.path()).len(), 2);
 
@@ -496,12 +512,15 @@ fn publication_canonicalizes_order_and_duplicates() {
     let publisher = RegistryDirReplySourcePublisher::new(registry.path(), Some(RELAY_POD_UID));
 
     let scrambled = publisher
-        .publish(&[
-            source("fd00:10:96::a", 5300),
-            source("10.96.0.11", 5301),
-            source("10.96.0.10", 5300),
-            source("10.96.0.11", 5301),
-        ], true)
+        .publish(
+            &[
+                source("fd00:10:96::a", 5300),
+                source("10.96.0.11", 5301),
+                source("10.96.0.10", 5300),
+                source("10.96.0.11", 5301),
+            ],
+            true,
+        )
         .expect("scrambled publication");
     assert_eq!(
         published_sources(registry.path()),
@@ -515,11 +534,14 @@ fn publication_canonicalizes_order_and_duplicates() {
     // The same SET in a different order is the same generation, so an
     // acknowledgement already given for it still holds.
     let reordered = publisher
-        .publish(&[
-            source("10.96.0.11", 5301),
-            source("fd00:10:96::a", 5300),
-            source("10.96.0.10", 5300),
-        ], true)
+        .publish(
+            &[
+                source("10.96.0.11", 5301),
+                source("fd00:10:96::a", 5300),
+                source("10.96.0.10", 5300),
+            ],
+            true,
+        )
         .expect("reordered publication");
     // A reordering of one set must not manufacture a new generation.
     assert_eq!(scrambled, reordered);
@@ -557,7 +579,10 @@ fn a_changed_set_advances_the_generation() {
         .publish(&[source("10.96.0.10", 5300)], true)
         .expect("first");
     let second = publisher
-        .publish(&[source("10.96.0.10", 5300), source("10.96.0.11", 5301)], true)
+        .publish(
+            &[source("10.96.0.10", 5300), source("10.96.0.11", 5301)],
+            true,
+        )
         .expect("second");
     let back = publisher
         .publish(&[source("10.96.0.10", 5300)], true)
@@ -648,8 +673,14 @@ fn a_malformed_generation_is_refused_whole() {
         format!("ferrum-udp-reply-src v2 {owner} 1 1 {uid}\n{a}\n"),
         format!("{owner} 1 active 1 {uid}\n{a}\n"),
         // Owner is not exactly sixteen lowercase hex digits.
-        format!("ferrum-udp-reply-src v3 {} 1 active 1 {uid}\n{a}\n", &owner[..15]),
-        format!("ferrum-udp-reply-src v3 {}Z 1 active 1 {uid}\n{a}\n", &owner[..15]),
+        format!(
+            "ferrum-udp-reply-src v3 {} 1 active 1 {uid}\n{a}\n",
+            &owner[..15]
+        ),
+        format!(
+            "ferrum-udp-reply-src v3 {}Z 1 active 1 {uid}\n{a}\n",
+            &owner[..15]
+        ),
         format!("ferrum-udp-reply-src v3 {}0 1 active 1 {uid}\n{a}\n", owner),
         // Non-canonical / absent / zero sequence and count.
         format!("ferrum-udp-reply-src v3 {owner} 01 active 1 {uid}\n{a}\n"),
@@ -775,7 +806,10 @@ fn an_acknowledgement_satisfies_only_the_generation_it_names() {
     // The serving set changes. The acknowledgement on disk still describes the
     // OLD one, so it must not satisfy the new generation.
     let second = publisher
-        .publish(&[source("10.96.0.10", 5300), source("10.96.0.11", 5301)], true)
+        .publish(
+            &[source("10.96.0.10", 5300), source("10.96.0.11", 5301)],
+            true,
+        )
         .expect("second");
     assert_ne!(first, second);
     let stale = publisher.acknowledged().expect("read acknowledgement");

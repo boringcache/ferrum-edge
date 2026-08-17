@@ -2184,7 +2184,9 @@ fn a_predecessor_acknowledgement_does_not_let_a_successor_steer() {
 
     // The predecessor publishes and is acknowledged, then the process dies.
     let predecessor = RegistryDirReplySourcePublisher::new(registry.path(), Some(RELAY_POD_UID));
-    let old = predecessor.publish(&destinations, true).expect("predecessor");
+    let old = predecessor
+        .publish(&destinations, true)
+        .expect("predecessor");
     write_acknowledgement(registry.path(), &old).expect("predecessor acknowledgement");
 
     let log = Arc::new(Mutex::new(Vec::new()));
@@ -2269,6 +2271,8 @@ fn a_serving_headless_listener_keeps_the_sender_proof_without_steering() {
     assert!(steering.serving());
     assert!(steering.bound_destinations().is_empty());
 
+    agent.take_entries();
+
     assert_eq!(
         steering.reconcile_with(&ifaces(), &[], true),
         SteerReconcileOutcome::Unchanged
@@ -2286,7 +2290,10 @@ fn a_serving_headless_listener_keeps_the_sender_proof_without_steering() {
 #[test]
 fn clusterip_churn_while_serving_does_not_withdraw_the_sender_proof() {
     let (steering, agent) = acknowledged_steering(true);
-    let dest = [destination("10.96.0.10", 5300), destination("fd00::a", 5300)];
+    let dest = [
+        destination("10.96.0.10", 5300),
+        destination("fd00::a", 5300),
+    ];
 
     assert_eq!(
         steering.reconcile_with(&ifaces(), &dest, true),
@@ -2313,7 +2320,8 @@ fn clusterip_churn_while_serving_does_not_withdraw_the_sender_proof() {
     );
     let restored = agent.take_entries();
     assert!(
-        restored.contains(&"publish:2".to_string()) && restored.contains(&"script:setup".to_string()),
+        restored.contains(&"publish:2".to_string())
+            && restored.contains(&"script:setup".to_string()),
         "restoring ClusterIPs while still serving must re-authorize then steer: {restored:?}"
     );
 

@@ -233,16 +233,13 @@ impl ReplySourceGeneration {
         self.active
     }
 
-    /// Sentinel generation for a steering instance with no publication channel
-    /// (non-Linux, or no registry directory). Nothing is authorized and nothing
-    /// is materialized there, so the pair is trivially coherent. It can never be
+    /// Sentinel generation for a publisher-less steering instance (non-Linux,
+    /// or no registry directory). Nothing is authorized and nothing is
+    /// materialized there, so the pair is trivially coherent. It can never be
     /// confused with a real generation: the parser requires 16 lowercase hex
     /// digits for an owner and a nonzero sequence, so this value cannot come off
     /// disk and cannot be written to it.
-    pub(crate) fn inert() -> Self {
-        Self::inert_with_active(false)
-    }
-
+    ///
     /// Publisher-less steering still distinguishes active-empty from
     /// inactive-empty so quiet-poll `generation_proven` cannot treat a bound
     /// headless listener as a proven withdrawal.
@@ -512,9 +509,7 @@ fn parse_manifest(bytes: &[u8]) -> Option<DesiredReplySources> {
     //   identity) are the shapes that would open the wrong half of the
     //   classifier's conjunction and are refused whole.
     if active {
-        if relay_pod_uid.is_none() {
-            return None;
-        }
+        relay_pod_uid.as_ref()?;
     } else if count > 0 || relay_pod_uid.is_some() {
         return None;
     }
@@ -723,21 +718,23 @@ impl NodeWaypointUdpReplySourcePublisher for RegistryDirReplySourcePublisher {
         })?;
 
         let mut last = lock_recovering(&self.last);
-        let sequence = match last.as_ref() {
-            Some((sequence, published_active, published))
-                if *published_active == active && published == &canonical =>
-            {
-                *sequence
+        if let Some((sequence, published_active, published)) = last.as_ref() {
+            if *published_active == active && published == &canonical {
+                return Ok(ReplySourceGeneration {
+                    owner: owner.to_string(),
+                    sequence: *sequence,
+                    active,
+                });
             }
-            _ => self
-                .next_sequence
-                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |sequence| {
-                    sequence.checked_add(1)
-                })
-                .map_err(|_| {
-                    "NodeWaypoint UDP reply-source generation sequence is exhausted".to_string()
-                })?,
-        };
+        }
+        let sequence = self
+            .next_sequence
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |sequence| {
+                sequence.checked_add(1)
+            })
+            .map_err(|_| {
+                "NodeWaypoint UDP reply-source generation sequence is exhausted".to_string()
+            })?;
         let generation = ReplySourceGeneration {
             owner: owner.to_string(),
             sequence,

@@ -441,8 +441,7 @@ impl NodeWaypointUdpSteering {
     fn publish_desired_snapshot(&self, state: &SteeringState) {
         self.bound_destinations
             .store(Arc::new(state.desired_destinations.clone()));
-        self.serving
-            .store(state.desired_serving, Ordering::Release);
+        self.serving.store(state.desired_serving, Ordering::Release);
     }
 
     /// Replace the bound destination set and serving bit, then apply immediately
@@ -608,7 +607,7 @@ impl NodeWaypointUdpSteering {
             &desired.destinations,
         ) {
             Ok(Some(script)) => script,
-                    Ok(None) => return self.converge_serving_unsteered(state),
+            Ok(None) => return self.converge_serving_unsteered(state),
             Err(error) => {
                 warn!(
                     interfaces = desired.ifaces.len(),
@@ -798,6 +797,13 @@ impl NodeWaypointUdpSteering {
     /// — including the active-empty headless shape — so the relay-cgroup
     /// sender proof stays live for the direct-node lane.
     fn converge_serving_unsteered(&self, state: &mut SteeringState) -> SteerReconcileOutcome {
+        if state.reaped
+            && state.applied.is_none()
+            && Self::generation_proven(state, &state.desired_destinations, true)
+        {
+            return SteerReconcileOutcome::Unchanged;
+        }
+
         let rules_removed = if !state.reaped || state.applied.is_some() {
             self.remove_rules(state)
         } else {
