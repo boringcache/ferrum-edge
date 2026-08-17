@@ -114,7 +114,20 @@ jobs:
     needs: coverage-plan
     if: needs.coverage-plan.outputs.mode == 'full'
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    # A cold/partial-cache lib + unit_tests llvm-cov invocation can exceed the
+    # old 45-minute budget even though warm shards normally finish sooner. Keep
+    # the combined invocation so runner loss cannot discard the shared compile.
+    timeout-minutes: 75
+    env:
+      # Cold-cache instrumented compiles have repeatedly killed hosted runners
+      # ("shutdown signal" + exit 143) on this shard matrix. Cap cargo's
+      # parallelism so peak memory/disk fits the runner; llvm-cov's own
+      # instrumentation settings are untouched.
+      CARGO_BUILD_JOBS: "3"
+    # The lib-unit shard compiles the aggregated tests/unit_tests binary,
+    # whose single-crate rustc frontend exceeds hosted-runner RAM cold — the
+    # swap step below keeps the VM alive through that window (see ci.yml
+    # test-unit for the incident pattern).
     strategy:
       fail-fast: false
       matrix:
@@ -205,6 +218,15 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
 
+      - name: Extend runner swap for the aggregated unit_tests compile
+        run: |
+          set -euo pipefail
+          sudo fallocate -l 12G /mnt/ferrum-swapfile
+          sudo chmod 600 /mnt/ferrum-swapfile
+          sudo mkswap /mnt/ferrum-swapfile
+          sudo swapon /mnt/ferrum-swapfile
+          free -h
+
       - uses: ./.github/actions/setup-rust-ci
         with:
           shared-key: "ci-coverage"
@@ -224,9 +246,11 @@ jobs:
         if: matrix.kind == 'lib-unit'
         run: |
           set -euo pipefail
+          # One llvm-cov invocation compiles lib + unit_tests together so a
+          # runner-loss after the library suite does not throw away that compile
+          # and then recompile ferrum-edge for the unit-test target (#3888).
           cargo llvm-cov --no-report \
-            --lib
-          cargo llvm-cov --no-report \
+            --lib \
             --test unit_tests
         env:
           RUST_BACKTRACE: 1
