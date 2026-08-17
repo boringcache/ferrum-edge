@@ -1028,6 +1028,17 @@ def check_fips_producer_channel(
             in promote_steps[0]
             and '[ ! -f "$tree_manifest" ] || [ -L "$tree_manifest" ]'
             in promote_steps[0]
+            and 'identity="${extract_root}/fips-producer-identity"'
+            in promote_steps[0]
+            and '[ ! -f "$identity" ] || [ -L "$identity" ]'
+            in promote_steps[0]
+            and "does not match the named source artifact" in promote_steps[0]
+            and "SOURCE_SHA: ${{ github.event.pull_request.head.sha || github.sha }}"
+            in promote_steps[0]
+            and "SOURCE_RUN_ID: ${{ inputs.warm_source_run_id }}"
+            in promote_steps[0]
+            and "SOURCE_RUN_ATTEMPT: ${{ inputs.warm_source_run_attempt }}"
+            in promote_steps[0]
             and 'current_tree="$(git rev-parse HEAD^{tree})"' in promote_steps[0]
             and 'if [ "$archived_tree" != "$current_tree" ]; then'
             in promote_steps[0]
@@ -1101,19 +1112,30 @@ def check_fips_producer_channel(
         in package_steps[0]
         and 'tree_manifest="${RUNNER_TEMP}/fips-producer-source-tree"'
         in package_steps[0]
+        and 'identity="${RUNNER_TEMP}/fips-producer-identity"'
+        in package_steps[0]
+        and "SOURCE_SHA: ${{ github.event.pull_request.head.sha || github.sha }}"
+        in package_steps[0]
+        and "RUN_ID: ${{ github.run_id }}" in package_steps[0]
+        and "RUN_ATTEMPT: ${{ github.run_attempt }}" in package_steps[0]
         and 'source_tree="$(git rev-parse HEAD^{tree})"' in package_steps[0]
         and "git diff --quiet --no-ext-diff" in package_steps[0]
         and "git diff --cached --quiet --no-ext-diff" in package_steps[0]
+        and 'printf \'source_sha=%s\\nrun_id=%s\\nrun_attempt=%s\\n\''
+        in package_steps[0]
         and 'printf \'%s\\n\' "$source_tree" > "$tree_manifest"'
         in package_steps[0]
-        and 'tar --zstd -cf "$archive" -C "$GITHUB_WORKSPACE"'
+        and 'tar --zstd -cf "$archive" -C "$RUNNER_TEMP"'
         in package_steps[0]
-        and 'target .cache/sccache -C "$RUNNER_TEMP" fips-producer-source-tree'
+        and "fips-producer-identity fips-producer-source-tree"
+        in package_steps[0]
+        and '-C "$GITHUB_WORKSPACE" target .cache/sccache'
         in package_steps[0]
         and '[ ! -s "$archive" ] || [ -L "$archive" ]'
         in package_steps[0],
-        "fips-compile must package target, sccache, and the clean checkout tree "
-        "identity into a nonempty tar.zst handoff that preserves executable modes",
+        "fips-compile must package target, sccache, identity, and the clean "
+        "checkout tree identity into a nonempty tar.zst handoff that preserves "
+        "executable modes",
         failures,
     )
     require(
@@ -1155,20 +1177,24 @@ def check_fips_producer_channel(
         'channel_root="${RUNNER_TEMP}/fips-producer-channel"',
         '"$PREFIX"*) ;;',
         'attempt="${name#"$PREFIX"}"',
-        "''|0|*[!0-9]*)",
-        "channel contains a non-directory entry",
-        "channel contains an unexpected artifact name",
-        "channel contains a malformed attempt",
-        '[ "$attempt" -gt "$selected_attempt" ]',
-        'if [ -z "$selected" ]; then',
+        "producer handoff channel mixes files and directories",
+        "producer handoff channel flattened layout is malformed",
+        "producer handoff channel contains an unexpected artifact name",
+        "producer handoff channel contains a malformed attempt",
+        "producer handoff directory attempt does not match payload identity",
+        'payload_dir="$channel_root"',
+        'selected_attempt="$identity_attempt"',
+        "fips-producer-identity",
+        'if [ -z "$payload_dir" ]',
         "refusing to claim compile-to-consumer reuse",
-        'archive="${selected}/fips-producer-handoff.tar.zst"',
+        'archive="${payload_dir}/fips-producer-handoff.tar.zst"',
         '[ ! -f "$archive" ] || [ -L "$archive" ]',
         'tar --zstd --no-same-owner -xf "$archive" -C "$extract_root"',
         "for path in target .cache/sccache; do",
         '[ ! -d "$source_path" ] || [ -L "$source_path" ]',
         'tree_manifest="${extract_root}/fips-producer-source-tree"',
         '[ ! -f "$tree_manifest" ] || [ -L "$tree_manifest" ]',
+        'extracted_identity="${extract_root}/fips-producer-identity"',
         'current_tree="$(git rev-parse HEAD^{tree})"',
         'if [ "$archived_tree" != "$current_tree" ]; then',
         "refusing stale-base reuse",
@@ -1243,8 +1269,11 @@ def check_fips_producer_channel(
                 failures,
             )
             require(
-                "path: ${{ runner.temp }}/fips-producer-channel" in with_block,
-                f"{job_name} must stage the producer handoff outside the workspace",
+                "path: ${{ runner.temp }}/fips-producer-channel" in with_block
+                and "merge-multiple: false" in with_block,
+                f"{job_name} must stage the producer handoff outside the workspace "
+                "and keep merge-multiple false so one-match flattening and "
+                "multi-match per-artifact directories stay distinguishable",
                 failures,
             )
             require(
@@ -1288,6 +1317,10 @@ def check_fips_producer_channel(
             and FORK_IS_TRUE not in step_if(producer_promote_steps[0])
             and "PREFIX: ${{ env.FIPS_HANDOFF_ARTIFACT_PREFIX }}"
             in producer_promote_steps[0]
+            and "SOURCE_SHA: ${{ github.event.pull_request.head.sha || github.sha }}"
+            in producer_promote_steps[0]
+            and "RUN_ID: ${{ github.run_id }}" in producer_promote_steps[0]
+            and "github.run_attempt" not in producer_promote_steps[0]
             and mtime_refresh in producer_promote_steps[0]
             and all(
                 contract in producer_promote_steps[0]
@@ -1297,16 +1330,28 @@ def check_fips_producer_channel(
                 check in producer_promote_steps[0]
                 for check in restored_binary_checks
             ),
-            f"{job_name} must promote the newest attempt-wildcard handoff and "
-            "validate its payload, source tree, clean checkout, and executable "
-            "before refreshing regular target-file mtimes",
+            f"{job_name} must promote the newest attempt-wildcard handoff from "
+            "either the one-match flattened payload or per-artifact directories, "
+            "bind the attempt from fips-producer-identity, and validate its "
+            "payload, source tree, clean checkout, and executable before "
+            "refreshing regular target-file mtimes",
             failures,
         )
         require(
             'selected="$channel_root"' not in job_body
-            and 'selected_attempt="single"' not in job_body,
-            f"{job_name} must accept only the pinned download action's "
-            "per-artifact directory shape",
+            and 'selected_attempt="single"' not in job_body
+            and 'selected_attempt="${GITHUB_RUN_ATTEMPT}"' not in job_body
+            and "selected_attempt: ${{ github.run_attempt }}" not in job_body
+            and 'payload_dir="$channel_root"' in job_body
+            and 'selected_attempt="$identity_attempt"' in job_body
+            and "producer handoff channel flattened layout is malformed"
+            in job_body
+            and "producer handoff directory attempt does not match payload identity"
+            in job_body,
+            f"{job_name} must admit the pinned download action's one-match "
+            "flattened payload and multi-match per-artifact directories while "
+            "binding attempts from artifact identity rather than the consumer "
+            "run attempt or an undocumented direct-root fallback",
             failures,
         )
         require(
@@ -1345,7 +1390,9 @@ def check_fips_producer_channel(
     require(
         "--message-format=json" in test_build_job
         and "fips-test-bundle" in test_build_job
-        and '"sha256"' in test_build_job,
+        and '"sha256"' in test_build_job
+        and "fips-test-identity" in test_build_job
+        and 'f"run_id={run_id}\\nrun_attempt={run_attempt}\\n"' in test_build_job,
         "fips-test-build must stage digest-bound exact test executables",
         failures,
     )
@@ -1426,10 +1473,17 @@ def check_fips_producer_channel(
         "actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c"
         in test_job
         and "pattern: fips-test-binaries-${{ github.run_id }}-*" in test_job
+        and "merge-multiple: false" in test_job
         and "FIPS_TEST_ARTIFACT_PREFIX: fips-test-binaries-${{ github.run_id }}-"
         in test_job
-        and "attempts.append((int(raw_attempt), candidate))" in test_job
-        and "_, bundle = max(attempts)" in test_job,
+        and "FIPS_TEST_RUN_ID: ${{ github.run_id }}" in test_job
+        and "fips-test-identity" in test_job
+        and "FIPS test artifact channel mixes files and directories" in test_job
+        and "admit_bundle(channel, None)" in test_job
+        and "does not match payload identity" in test_job
+        and "attempts.append((attempt, candidate))" in test_job
+        and "_, bundle = max(attempts)" in test_job
+        and "GITHUB_RUN_ATTEMPT" not in test_job,
         "fips-test must download the pinned immutable artifacts for this run and "
         "select the newest attempt so failed-job reruns can reuse a skipped "
         "producer's artifact",
@@ -2769,9 +2823,13 @@ def check_docs_and_coverage(failures: list[str]) -> None:
     require(
         "fips-test-binaries-<run_id>-*" in ci_cd
         and "newest attempt" in ci_cd.lower()
-        and "failed-job rerun" in ci_cd.lower(),
+        and "failed-job rerun" in ci_cd.lower()
+        and "flattens" in ci_cd.lower()
+        and "fips-producer-identity" in ci_cd
+        and "fips-test-identity" in ci_cd,
         "docs/ci_cd.md must document attempt-wildcard FIPS test-artifact "
-        "selection for failed-job reruns",
+        "selection for failed-job reruns, one-match flattening, and internal "
+        "attempt identity",
         failures,
     )
     require(
@@ -2912,9 +2970,13 @@ def check_docs_and_coverage(failures: list[str]) -> None:
     require(
         "fips-test-binaries-<run_id>-*" in fips_doc
         and "newest attempt" in fips_doc.lower()
-        and "failed-job rerun" in fips_doc.lower(),
+        and "failed-job rerun" in fips_doc.lower()
+        and "flattens" in fips_doc.lower()
+        and "fips-producer-identity" in fips_doc
+        and "fips-test-identity" in fips_doc,
         "docs/fips.md must document attempt-wildcard FIPS test-artifact "
-        "selection for failed-job reruns",
+        "selection for failed-job reruns, one-match flattening, and internal "
+        "attempt identity",
         failures,
     )
     require(
@@ -3774,9 +3836,9 @@ def self_test() -> int:
     )
 
     unpackaged_handoff = handoff_channel.replace(
-        '          tar --zstd -cf "$archive" -C "$GITHUB_WORKSPACE" \\\n'
-        '            target .cache/sccache -C "$RUNNER_TEMP" '
-        "fips-producer-source-tree\n",
+        '          tar --zstd -cf "$archive" -C "$RUNNER_TEMP" \\\n'
+        "            fips-producer-identity fips-producer-source-tree \\\n"
+        '            -C "$GITHUB_WORKSPACE" target .cache/sccache\n',
         "          true\n",
         1,
     )
@@ -3921,10 +3983,10 @@ def self_test() -> int:
     )
 
     undocumented_direct_root = handoff_channel.replace(
-        '          if [ -z "$selected" ]; then\n',
+        '          if [ -z "$payload_dir" ] || ! is_positive_decimal "$selected_attempt"; then\n',
         '          selected="$channel_root"\n'
         '          selected_attempt="single"\n'
-        '          if [ -z "$selected" ]; then\n',
+        '          if [ -z "$payload_dir" ] || ! is_positive_decimal "$selected_attempt"; then\n',
         1,
     )
     undocumented_direct_root_failures: list[str] = []
@@ -3933,10 +3995,65 @@ def self_test() -> int:
     )
     require(
         any(
-            "per-artifact directory shape" in item
+            "undocumented direct-root" in item
             for item in undocumented_direct_root_failures
         ),
         "self-test: accepting an undocumented direct-root artifact must fail",
+        failures,
+    )
+
+    missing_flattened_layout = handoff_channel.replace(
+        '            payload_dir="$channel_root"\n',
+        "            true\n",
+        1,
+    )
+    missing_flattened_failures: list[str] = []
+    check_fips_producer_channel(
+        missing_flattened_layout, missing_flattened_failures
+    )
+    require(
+        any(
+            "one-match flattened payload" in item
+            for item in missing_flattened_failures
+        ),
+        "self-test: dropping the one-artifact flattened layout must fail",
+        failures,
+    )
+
+    consumer_attempt_inference = handoff_channel.replace(
+        '            selected_attempt="$identity_attempt"\n',
+        '            selected_attempt="${GITHUB_RUN_ATTEMPT}"\n',
+        1,
+    )
+    consumer_attempt_failures: list[str] = []
+    check_fips_producer_channel(
+        consumer_attempt_inference, consumer_attempt_failures
+    )
+    require(
+        any(
+            "consumer run attempt" in item or "fips-producer-identity" in item
+            for item in consumer_attempt_failures
+        ),
+        "self-test: inferring a producer attempt from the consumer run attempt must fail",
+        failures,
+    )
+
+    missing_test_flatten = handoff_channel.replace(
+        "              attempt, bundle = admit_bundle(channel, None)\n",
+        "              raise SystemExit('flattened layout is unsupported')\n",
+        1,
+    )
+    missing_test_flatten_failures: list[str] = []
+    check_fips_producer_channel(
+        missing_test_flatten, missing_test_flatten_failures
+    )
+    require(
+        any(
+            "admit_bundle(channel, None)" in item
+            or "select the newest attempt" in item
+            for item in missing_test_flatten_failures
+        ),
+        "self-test: dropping the one-artifact FIPS test flattened layout must fail",
         failures,
     )
 

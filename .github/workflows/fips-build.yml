@@ -37,25 +37,33 @@ name: FIPS Build Policy
 # 4. `fips-claimed-checks`, `fips-clippy`, and `fips-test-build` download the
 #    producer handoff by the attempt-wildcard pattern
 #    `fips-producer-handoff-${{ github.event.pull_request.head.sha || github.sha }}-${{ github.run_id }}-*`
-#    and promote the newest matching attempt after validating its payload,
-#    source-tree identity, and executable (consumers; rust-cache
-#    `save-if: false` and no producer publication). Trusted non-cold runs fail
-#    closed if no producer handoff for this source SHA/run_id exists. Because
-#    the pattern is attempt-independent, a `rerun --failed` consumer at a
-#    later attempt reuses the artifact the skipped producer published at an
-#    earlier attempt — the former run-attempt-scoped cache key made such
-#    reruns unrecoverable. `fips-test-build` precompiles the complete
-#    unit_tests and integration_tests executables and publishes digest-bound
-#    copies as an immutable same-run artifact, overlapping claimed-profile and
-#    clippy work after the shorter build-only producer. The test-binary job
-#    remains a handoff consumer and does not publish inter-run state.
+#    with `merge-multiple: false`. The pinned download action flattens a
+#    single matching artifact's payload into the channel directory and, when
+#    two or more attempts exist, extracts each into an artifact-named child
+#    directory. Promotion admits both layouts, binds the attempt from the
+#    `fips-producer-identity` member packaged inside the tar (never from the
+#    consumer's `github.run_attempt`), requires child directory names and
+#    payload identity to agree, and then validates the payload, source-tree
+#    identity, and executable (consumers; rust-cache `save-if: false` and no
+#    producer publication). Trusted non-cold runs fail closed if no producer
+#    handoff for this source SHA/run_id exists. Because the pattern is
+#    attempt-independent, a `rerun --failed` consumer at a later attempt
+#    reuses the artifact the skipped producer published at an earlier attempt
+#    — the former run-attempt-scoped cache key made such reruns unrecoverable.
+#    `fips-test-build` precompiles the complete unit_tests and
+#    integration_tests executables and publishes digest-bound copies as an
+#    immutable same-run artifact, overlapping claimed-profile and clippy work
+#    after the shorter build-only producer. The test-binary job remains a
+#    handoff consumer and does not publish inter-run state.
 # 5. `fips-test` downloads the immutable same-run test artifacts by the
-#    attempt-wildcard pattern `fips-test-binaries-${{ github.run_id }}-*`,
-#    selects the newest matching attempt, and validates its manifest/digests
-#    before direct execution. A failed-job rerun can therefore reuse the
-#    artifact from the successful, skipped `fips-test-build` prerequisite.
-#    This transport is available on forced-cold and fork runs without
-#    publishing shared cache.
+#    attempt-wildcard pattern `fips-test-binaries-${{ github.run_id }}-*`
+#    with the same one-match flattened / multi-match child-directory layout.
+#    It binds the attempt from `fips-test-identity` inside the bundle, selects
+#    the newest matching attempt, and validates manifest/digests before
+#    direct execution. A failed-job rerun can therefore reuse the artifact
+#    from the successful, skipped `fips-test-build` prerequisite. This
+#    transport is available on forced-cold and fork runs without publishing
+#    shared cache.
 # 6. `fips-build` keeps the `FIPS Build & Test` check name and fails closed,
 #    including on the test-binary producer result.
 #
@@ -420,6 +428,10 @@ jobs:
 
       - name: Promote exact inter-run FIPS handoff artifact
         if: github.event.inputs.force_cold_cache != 'true' && github.event_name == 'workflow_dispatch' && inputs.warm_source_run_id != '' && steps.inter-run-fips-handoff.outcome == 'success'
+        env:
+          SOURCE_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+          SOURCE_RUN_ID: ${{ inputs.warm_source_run_id }}
+          SOURCE_RUN_ATTEMPT: ${{ inputs.warm_source_run_attempt }}
         run: |
           set -euo pipefail
           source_root="${RUNNER_TEMP}/inter-run-fips-handoff"
@@ -449,6 +461,39 @@ jobs:
           if [ "$line_count" -ne 1 ] || [ "${#archived_tree}" -ne 40 ] || \
              [[ "$archived_tree" == *[!0-9a-f]* ]]; then
             echo "::error::inter-run FIPS handoff source-tree manifest is malformed" >&2
+            exit 1
+          fi
+          identity="${extract_root}/fips-producer-identity"
+          if [ ! -f "$identity" ] || [ -L "$identity" ]; then
+            echo "::error::inter-run FIPS handoff is missing its real identity manifest" >&2
+            exit 1
+          fi
+          case "$SOURCE_SHA" in
+            *[!0-9a-f]*)
+              echo "::error::inter-run FIPS handoff consumer source SHA is malformed" >&2
+              exit 1
+              ;;
+          esac
+          if [ "${#SOURCE_SHA}" -ne 40 ]; then
+            echo "::error::inter-run FIPS handoff consumer source SHA is malformed" >&2
+            exit 1
+          fi
+          case "$SOURCE_RUN_ID" in
+            ''|*[!0-9]*|0*)
+              echo "::error::inter-run FIPS handoff source run id is malformed" >&2
+              exit 1
+              ;;
+          esac
+          case "$SOURCE_RUN_ATTEMPT" in
+            ''|*[!0-9]*|0*)
+              echo "::error::inter-run FIPS handoff source attempt is malformed" >&2
+              exit 1
+              ;;
+          esac
+          expected_identity="$(printf 'source_sha=%s\nrun_id=%s\nrun_attempt=%s\n' \
+            "$SOURCE_SHA" "$SOURCE_RUN_ID" "$SOURCE_RUN_ATTEMPT")"
+          if [ "$(cat "$identity")" != "$expected_identity" ]; then
+            echo "::error::inter-run FIPS handoff identity does not match the named source artifact" >&2
             exit 1
           fi
           current_tree="$(git rev-parse HEAD^{tree})"
@@ -556,11 +601,16 @@ jobs:
       # executable modes inside target survive the handoff.
       - name: Package FIPS producer handoff
         if: github.event.inputs.force_cold_cache != 'true'
+        env:
+          SOURCE_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+          RUN_ID: ${{ github.run_id }}
+          RUN_ATTEMPT: ${{ github.run_attempt }}
         run: |
           set -euo pipefail
           archive="${RUNNER_TEMP}/fips-producer-handoff.tar.zst"
           tree_manifest="${RUNNER_TEMP}/fips-producer-source-tree"
-          rm -f "$archive"
+          identity="${RUNNER_TEMP}/fips-producer-identity"
+          rm -f "$archive" "$tree_manifest" "$identity"
           if ! git diff --quiet --no-ext-diff || \
              ! git diff --cached --quiet --no-ext-diff; then
             echo "::error::tracked checkout content changed while building the FIPS producer" >&2
@@ -571,10 +621,35 @@ jobs:
             echo "::error::failed to resolve the FIPS producer source tree" >&2
             exit 1
           fi
+          case "$SOURCE_SHA" in
+            *[!0-9a-f]*)
+              echo "::error::failed to resolve the FIPS producer source SHA" >&2
+              exit 1
+              ;;
+          esac
+          if [ "${#SOURCE_SHA}" -ne 40 ]; then
+            echo "::error::failed to resolve the FIPS producer source SHA" >&2
+            exit 1
+          fi
+          case "$RUN_ID" in
+            ''|*[!0-9]*|0*)
+              echo "::error::failed to resolve the FIPS producer run id" >&2
+              exit 1
+              ;;
+          esac
+          case "$RUN_ATTEMPT" in
+            ''|*[!0-9]*|0*)
+              echo "::error::failed to resolve the FIPS producer run attempt" >&2
+              exit 1
+              ;;
+          esac
+          printf 'source_sha=%s\nrun_id=%s\nrun_attempt=%s\n' \
+            "$SOURCE_SHA" "$RUN_ID" "$RUN_ATTEMPT" > "$identity"
           printf '%s\n' "$source_tree" > "$tree_manifest"
-          tar --zstd -cf "$archive" -C "$GITHUB_WORKSPACE" \
-            target .cache/sccache -C "$RUNNER_TEMP" fips-producer-source-tree
-          rm -f "$tree_manifest"
+          tar --zstd -cf "$archive" -C "$RUNNER_TEMP" \
+            fips-producer-identity fips-producer-source-tree \
+            -C "$GITHUB_WORKSPACE" target .cache/sccache
+          rm -f "$tree_manifest" "$identity"
           if [ ! -s "$archive" ] || [ -L "$archive" ]; then
             echo "::error::failed to create a real FIPS producer handoff archive" >&2
             exit 1
@@ -682,13 +757,16 @@ jobs:
       # Same-run producer channel: download every handoff attempt this source
       # SHA/run_id has published. The pattern is attempt-independent, so a
       # failed-job rerun at a later attempt still finds the artifact the
-      # skipped producer published earlier; promotion below picks the newest.
+      # skipped producer published earlier. The pinned action flattens one
+      # match into the channel directory and creates per-artifact children
+      # when several attempts exist; promotion below admits both layouts.
       - name: Download FIPS producer handoff
         if: github.event.inputs.force_cold_cache != 'true'
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
         with:
           pattern: ${{ env.FIPS_HANDOFF_ARTIFACT_PREFIX }}*
           path: ${{ runner.temp }}/fips-producer-channel
+          merge-multiple: false
 
       - name: Record cold-cache proof
         if: github.event.inputs.force_cold_cache == 'true'
@@ -705,7 +783,10 @@ jobs:
             --note "layer=producer; force_cold_cache skipped handoff download"
 
       # Promote the newest published handoff attempt for this source
-      # SHA/run_id. The archive is validated (real tar payload, real restored
+      # SHA/run_id. Attempt identity is read from the tar's
+      # fips-producer-identity member, never from this consumer's
+      # github.run_attempt. The archive is validated (exact channel shape,
+      # real tar payload, matching payload/directory identity, real restored
       # directories, matching source-tree identity, clean checkout, real
       # executable) before its regular target files receive one common
       # reference timestamp — checkout gives identical sources newer mtimes,
@@ -714,44 +795,215 @@ jobs:
         if: github.event.inputs.force_cold_cache != 'true'
         env:
           PREFIX: ${{ env.FIPS_HANDOFF_ARTIFACT_PREFIX }}
+          SOURCE_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+          RUN_ID: ${{ github.run_id }}
         run: |
           set -euo pipefail
           channel_root="${RUNNER_TEMP}/fips-producer-channel"
-          selected=""
+          payload_name="fips-producer-handoff.tar.zst"
+          identity_member="fips-producer-identity"
+          payload_dir=""
           selected_attempt=0
-          if [ -d "$channel_root" ]; then
-            for candidate in "$channel_root"/*; do
-              if [ ! -d "$candidate" ] || [ -L "$candidate" ]; then
-                echo "::error::producer handoff channel contains a non-directory entry" >&2
-                exit 1
-              fi
+
+          fail() {
+            echo "::error::$1" >&2
+            exit 1
+          }
+
+          is_real_dir() {
+            [ -d "$1" ] && [ ! -L "$1" ]
+          }
+
+          is_real_file() {
+            [ -f "$1" ] && [ ! -L "$1" ]
+          }
+
+          is_positive_decimal() {
+            case "$1" in
+              ''|*[!0-9]*|0*) return 1 ;;
+            esac
+            return 0
+          }
+
+          is_sha40() {
+            [ "${#1}" -eq 40 ] || return 1
+            case "$1" in
+              *[!0-9a-f]*) return 1 ;;
+            esac
+            return 0
+          }
+
+          collect_entries() {
+            local root="$1"
+            shopt -s nullglob dotglob
+            collected_entries=("$root"/*)
+            shopt -u nullglob dotglob
+          }
+
+          if ! is_sha40 "$SOURCE_SHA"; then
+            fail "consumer event-stable source SHA is malformed"
+          fi
+          if ! is_positive_decimal "$RUN_ID"; then
+            fail "consumer workflow run id is malformed"
+          fi
+          if [ "$PREFIX" != "fips-producer-handoff-${SOURCE_SHA}-${RUN_ID}-" ]; then
+            fail "producer handoff prefix does not match this source SHA/run_id"
+          fi
+
+          read_identity_file() {
+            local identity="$1"
+            identity_source_sha=""
+            identity_run_id=""
+            identity_attempt=""
+            local line_count=0
+            local line
+            while IFS= read -r line || [ -n "$line" ]; do
+              case "$line" in
+                *$'\r'*)
+                  fail "same-run FIPS producer handoff identity manifest is malformed"
+                  ;;
+              esac
+              line_count=$((line_count + 1))
+              case "$line" in
+                source_sha=*) identity_source_sha="${line#source_sha=}" ;;
+                run_id=*) identity_run_id="${line#run_id=}" ;;
+                run_attempt=*) identity_attempt="${line#run_attempt=}" ;;
+                *)
+                  fail "same-run FIPS producer handoff identity manifest is malformed"
+                  ;;
+              esac
+            done < "$identity"
+            if [ "$line_count" -ne 3 ] || \
+               ! is_sha40 "$identity_source_sha" || \
+               ! is_positive_decimal "$identity_run_id" || \
+               ! is_positive_decimal "$identity_attempt"; then
+              fail "same-run FIPS producer handoff identity manifest is malformed"
+            fi
+            expected_identity="$(printf 'source_sha=%s\nrun_id=%s\nrun_attempt=%s\n' \
+              "$identity_source_sha" "$identity_run_id" "$identity_attempt")"
+            if [ "$(cat "$identity")" != "$expected_identity" ]; then
+              fail "same-run FIPS producer handoff identity manifest is malformed"
+            fi
+            if [ "$identity_source_sha" != "$SOURCE_SHA" ]; then
+              fail "producer handoff identity source SHA does not match this checkout event"
+            fi
+            if [ "$identity_run_id" != "$RUN_ID" ]; then
+              fail "producer handoff identity run id does not match this workflow run"
+            fi
+          }
+
+          extract_identity() {
+            local archive="$1"
+            local dest="$2"
+            rm -rf "$dest"
+            mkdir -p "$dest"
+            if ! is_real_dir "$dest"; then
+              fail "failed to create producer handoff identity extract directory"
+            fi
+            tar --zstd --no-same-owner --no-absolute-filenames \
+              -xf "$archive" -C "$dest" "$identity_member"
+            local identity="${dest}/${identity_member}"
+            if ! is_real_file "$identity"; then
+              fail "same-run FIPS producer handoff is missing its real identity manifest"
+            fi
+            collect_entries "$dest"
+            if [ "${#collected_entries[@]}" -ne 1 ] || \
+               [ "$(basename "${collected_entries[0]}")" != "$identity_member" ]; then
+              fail "producer handoff identity extract contained unexpected paths"
+            fi
+            read_identity_file "$identity"
+          }
+
+          admit_payload_dir() {
+            local candidate="$1"
+            local directory_attempt="${2:-}"
+            if ! is_real_dir "$candidate"; then
+              fail "producer handoff payload directory is not a real directory"
+            fi
+            collect_entries "$candidate"
+            if [ "${#collected_entries[@]}" -ne 1 ]; then
+              fail "producer handoff payload directory has an unexpected entry shape"
+            fi
+            local archive="${collected_entries[0]}"
+            if [ "$(basename "$archive")" != "$payload_name" ] || ! is_real_file "$archive"; then
+              fail "same-run FIPS producer handoff is missing its real tar.zst payload"
+            fi
+            local channel_abs candidate_abs archive_dir_abs
+            channel_abs="$(cd "$channel_root" && pwd -P)"
+            candidate_abs="$(cd "$candidate" && pwd -P)"
+            archive_dir_abs="$(cd "$(dirname "$archive")" && pwd -P)"
+            case "$candidate_abs" in
+              "$channel_abs"|"$channel_abs"/*) ;;
+              *) fail "producer handoff payload directory escaped channel root" ;;
+            esac
+            if [ "$archive_dir_abs" != "$candidate_abs" ]; then
+              fail "producer handoff payload escaped its artifact directory"
+            fi
+            extract_identity "$archive" "${RUNNER_TEMP}/fips-producer-identity-extract"
+            if [ -n "$directory_attempt" ] && [ "$identity_attempt" != "$directory_attempt" ]; then
+              fail "producer handoff directory attempt does not match payload identity"
+            fi
+          }
+
+          if [ -L "$channel_root" ]; then
+            fail "producer handoff channel must not be a symlink"
+          fi
+          if ! is_real_dir "$channel_root"; then
+            fail "fips-compile producer handoff was not published for this event-stable source SHA/run_id; refusing to claim compile-to-consumer reuse"
+          fi
+          collect_entries "$channel_root"
+          if [ "${#collected_entries[@]}" -eq 0 ]; then
+            fail "fips-compile producer handoff was not published for this event-stable source SHA/run_id; refusing to claim compile-to-consumer reuse"
+          fi
+          file_count=0
+          dir_count=0
+          for entry in "${collected_entries[@]}"; do
+            if [ -L "$entry" ]; then
+              fail "producer handoff channel contains a symlink"
+            fi
+            if [ -f "$entry" ]; then
+              file_count=$((file_count + 1))
+            elif [ -d "$entry" ]; then
+              dir_count=$((dir_count + 1))
+            else
+              fail "producer handoff channel contains an unexpected entry type"
+            fi
+          done
+          if [ "$file_count" -gt 0 ] && [ "$dir_count" -gt 0 ]; then
+            fail "producer handoff channel mixes files and directories"
+          fi
+          if [ "$dir_count" -eq 0 ]; then
+            if [ "$file_count" -ne 1 ]; then
+              fail "producer handoff channel flattened layout is malformed"
+            fi
+            admit_payload_dir "$channel_root" ""
+            payload_dir="$channel_root"
+            selected_attempt="$identity_attempt"
+          else
+            for candidate in "${collected_entries[@]}"; do
               name="$(basename "$candidate")"
               case "$name" in
                 "$PREFIX"*) ;;
                 *)
-                  echo "::error::producer handoff channel contains an unexpected artifact name" >&2
-                  exit 1
+                  fail "producer handoff channel contains an unexpected artifact name"
                   ;;
               esac
               attempt="${name#"$PREFIX"}"
-              case "$attempt" in
-                ''|0|*[!0-9]*)
-                  echo "::error::producer handoff channel contains a malformed attempt" >&2
-                  exit 1
-                  ;;
-              esac
-              if [ "$attempt" -gt "$selected_attempt" ]; then
-                selected_attempt="$attempt"
-                selected="$candidate"
+              if ! is_positive_decimal "$attempt"; then
+                fail "producer handoff channel contains a malformed attempt"
+              fi
+              admit_payload_dir "$candidate" "$attempt"
+              if [ "$identity_attempt" -gt "$selected_attempt" ]; then
+                selected_attempt="$identity_attempt"
+                payload_dir="$candidate"
               fi
             done
           fi
-          if [ -z "$selected" ]; then
-            echo "::error::fips-compile producer handoff was not published for this event-stable source SHA/run_id; refusing to claim compile-to-consumer reuse" >&2
-            exit 1
+          if [ -z "$payload_dir" ] || ! is_positive_decimal "$selected_attempt"; then
+            fail "fips-compile producer handoff was not published for this event-stable source SHA/run_id; refusing to claim compile-to-consumer reuse"
           fi
           echo "Promoting FIPS producer handoff attempt ${selected_attempt}."
-          archive="${selected}/fips-producer-handoff.tar.zst"
+          archive="${payload_dir}/fips-producer-handoff.tar.zst"
           if [ ! -f "$archive" ] || [ -L "$archive" ]; then
             echo "::error::same-run FIPS producer handoff is missing its real tar.zst payload" >&2
             exit 1
@@ -777,6 +1029,16 @@ jobs:
           if [ "$line_count" -ne 1 ] || [ "${#archived_tree}" -ne 40 ] || \
              [[ "$archived_tree" == *[!0-9a-f]* ]]; then
             echo "::error::same-run FIPS producer handoff source-tree manifest is malformed" >&2
+            exit 1
+          fi
+          extracted_identity="${extract_root}/fips-producer-identity"
+          if [ ! -f "$extracted_identity" ] || [ -L "$extracted_identity" ]; then
+            echo "::error::same-run FIPS producer handoff is missing its real identity manifest" >&2
+            exit 1
+          fi
+          read_identity_file "$extracted_identity"
+          if [ "$identity_attempt" != "$selected_attempt" ]; then
+            echo "::error::producer handoff extracted identity does not match the selected attempt" >&2
             exit 1
           fi
           current_tree="$(git rev-parse HEAD^{tree})"
@@ -966,13 +1228,16 @@ jobs:
       # Same-run producer channel: download every handoff attempt this source
       # SHA/run_id has published. The pattern is attempt-independent, so a
       # failed-job rerun at a later attempt still finds the artifact the
-      # skipped producer published earlier; promotion below picks the newest.
+      # skipped producer published earlier. The pinned action flattens one
+      # match into the channel directory and creates per-artifact children
+      # when several attempts exist; promotion below admits both layouts.
       - name: Download FIPS producer handoff
         if: github.event.inputs.force_cold_cache != 'true'
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
         with:
           pattern: ${{ env.FIPS_HANDOFF_ARTIFACT_PREFIX }}*
           path: ${{ runner.temp }}/fips-producer-channel
+          merge-multiple: false
 
       - name: Record cold-cache proof
         if: github.event.inputs.force_cold_cache == 'true'
@@ -989,7 +1254,10 @@ jobs:
             --note "layer=producer; force_cold_cache skipped handoff download"
 
       # Promote the newest published handoff attempt for this source
-      # SHA/run_id. The archive is validated (real tar payload, real restored
+      # SHA/run_id. Attempt identity is read from the tar's
+      # fips-producer-identity member, never from this consumer's
+      # github.run_attempt. The archive is validated (exact channel shape,
+      # real tar payload, matching payload/directory identity, real restored
       # directories, matching source-tree identity, clean checkout, real
       # executable) before its regular target files receive one common
       # reference timestamp — checkout gives identical sources newer mtimes,
@@ -998,44 +1266,215 @@ jobs:
         if: github.event.inputs.force_cold_cache != 'true'
         env:
           PREFIX: ${{ env.FIPS_HANDOFF_ARTIFACT_PREFIX }}
+          SOURCE_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+          RUN_ID: ${{ github.run_id }}
         run: |
           set -euo pipefail
           channel_root="${RUNNER_TEMP}/fips-producer-channel"
-          selected=""
+          payload_name="fips-producer-handoff.tar.zst"
+          identity_member="fips-producer-identity"
+          payload_dir=""
           selected_attempt=0
-          if [ -d "$channel_root" ]; then
-            for candidate in "$channel_root"/*; do
-              if [ ! -d "$candidate" ] || [ -L "$candidate" ]; then
-                echo "::error::producer handoff channel contains a non-directory entry" >&2
-                exit 1
-              fi
+
+          fail() {
+            echo "::error::$1" >&2
+            exit 1
+          }
+
+          is_real_dir() {
+            [ -d "$1" ] && [ ! -L "$1" ]
+          }
+
+          is_real_file() {
+            [ -f "$1" ] && [ ! -L "$1" ]
+          }
+
+          is_positive_decimal() {
+            case "$1" in
+              ''|*[!0-9]*|0*) return 1 ;;
+            esac
+            return 0
+          }
+
+          is_sha40() {
+            [ "${#1}" -eq 40 ] || return 1
+            case "$1" in
+              *[!0-9a-f]*) return 1 ;;
+            esac
+            return 0
+          }
+
+          collect_entries() {
+            local root="$1"
+            shopt -s nullglob dotglob
+            collected_entries=("$root"/*)
+            shopt -u nullglob dotglob
+          }
+
+          if ! is_sha40 "$SOURCE_SHA"; then
+            fail "consumer event-stable source SHA is malformed"
+          fi
+          if ! is_positive_decimal "$RUN_ID"; then
+            fail "consumer workflow run id is malformed"
+          fi
+          if [ "$PREFIX" != "fips-producer-handoff-${SOURCE_SHA}-${RUN_ID}-" ]; then
+            fail "producer handoff prefix does not match this source SHA/run_id"
+          fi
+
+          read_identity_file() {
+            local identity="$1"
+            identity_source_sha=""
+            identity_run_id=""
+            identity_attempt=""
+            local line_count=0
+            local line
+            while IFS= read -r line || [ -n "$line" ]; do
+              case "$line" in
+                *$'\r'*)
+                  fail "same-run FIPS producer handoff identity manifest is malformed"
+                  ;;
+              esac
+              line_count=$((line_count + 1))
+              case "$line" in
+                source_sha=*) identity_source_sha="${line#source_sha=}" ;;
+                run_id=*) identity_run_id="${line#run_id=}" ;;
+                run_attempt=*) identity_attempt="${line#run_attempt=}" ;;
+                *)
+                  fail "same-run FIPS producer handoff identity manifest is malformed"
+                  ;;
+              esac
+            done < "$identity"
+            if [ "$line_count" -ne 3 ] || \
+               ! is_sha40 "$identity_source_sha" || \
+               ! is_positive_decimal "$identity_run_id" || \
+               ! is_positive_decimal "$identity_attempt"; then
+              fail "same-run FIPS producer handoff identity manifest is malformed"
+            fi
+            expected_identity="$(printf 'source_sha=%s\nrun_id=%s\nrun_attempt=%s\n' \
+              "$identity_source_sha" "$identity_run_id" "$identity_attempt")"
+            if [ "$(cat "$identity")" != "$expected_identity" ]; then
+              fail "same-run FIPS producer handoff identity manifest is malformed"
+            fi
+            if [ "$identity_source_sha" != "$SOURCE_SHA" ]; then
+              fail "producer handoff identity source SHA does not match this checkout event"
+            fi
+            if [ "$identity_run_id" != "$RUN_ID" ]; then
+              fail "producer handoff identity run id does not match this workflow run"
+            fi
+          }
+
+          extract_identity() {
+            local archive="$1"
+            local dest="$2"
+            rm -rf "$dest"
+            mkdir -p "$dest"
+            if ! is_real_dir "$dest"; then
+              fail "failed to create producer handoff identity extract directory"
+            fi
+            tar --zstd --no-same-owner --no-absolute-filenames \
+              -xf "$archive" -C "$dest" "$identity_member"
+            local identity="${dest}/${identity_member}"
+            if ! is_real_file "$identity"; then
+              fail "same-run FIPS producer handoff is missing its real identity manifest"
+            fi
+            collect_entries "$dest"
+            if [ "${#collected_entries[@]}" -ne 1 ] || \
+               [ "$(basename "${collected_entries[0]}")" != "$identity_member" ]; then
+              fail "producer handoff identity extract contained unexpected paths"
+            fi
+            read_identity_file "$identity"
+          }
+
+          admit_payload_dir() {
+            local candidate="$1"
+            local directory_attempt="${2:-}"
+            if ! is_real_dir "$candidate"; then
+              fail "producer handoff payload directory is not a real directory"
+            fi
+            collect_entries "$candidate"
+            if [ "${#collected_entries[@]}" -ne 1 ]; then
+              fail "producer handoff payload directory has an unexpected entry shape"
+            fi
+            local archive="${collected_entries[0]}"
+            if [ "$(basename "$archive")" != "$payload_name" ] || ! is_real_file "$archive"; then
+              fail "same-run FIPS producer handoff is missing its real tar.zst payload"
+            fi
+            local channel_abs candidate_abs archive_dir_abs
+            channel_abs="$(cd "$channel_root" && pwd -P)"
+            candidate_abs="$(cd "$candidate" && pwd -P)"
+            archive_dir_abs="$(cd "$(dirname "$archive")" && pwd -P)"
+            case "$candidate_abs" in
+              "$channel_abs"|"$channel_abs"/*) ;;
+              *) fail "producer handoff payload directory escaped channel root" ;;
+            esac
+            if [ "$archive_dir_abs" != "$candidate_abs" ]; then
+              fail "producer handoff payload escaped its artifact directory"
+            fi
+            extract_identity "$archive" "${RUNNER_TEMP}/fips-producer-identity-extract"
+            if [ -n "$directory_attempt" ] && [ "$identity_attempt" != "$directory_attempt" ]; then
+              fail "producer handoff directory attempt does not match payload identity"
+            fi
+          }
+
+          if [ -L "$channel_root" ]; then
+            fail "producer handoff channel must not be a symlink"
+          fi
+          if ! is_real_dir "$channel_root"; then
+            fail "fips-compile producer handoff was not published for this event-stable source SHA/run_id; refusing to claim compile-to-consumer reuse"
+          fi
+          collect_entries "$channel_root"
+          if [ "${#collected_entries[@]}" -eq 0 ]; then
+            fail "fips-compile producer handoff was not published for this event-stable source SHA/run_id; refusing to claim compile-to-consumer reuse"
+          fi
+          file_count=0
+          dir_count=0
+          for entry in "${collected_entries[@]}"; do
+            if [ -L "$entry" ]; then
+              fail "producer handoff channel contains a symlink"
+            fi
+            if [ -f "$entry" ]; then
+              file_count=$((file_count + 1))
+            elif [ -d "$entry" ]; then
+              dir_count=$((dir_count + 1))
+            else
+              fail "producer handoff channel contains an unexpected entry type"
+            fi
+          done
+          if [ "$file_count" -gt 0 ] && [ "$dir_count" -gt 0 ]; then
+            fail "producer handoff channel mixes files and directories"
+          fi
+          if [ "$dir_count" -eq 0 ]; then
+            if [ "$file_count" -ne 1 ]; then
+              fail "producer handoff channel flattened layout is malformed"
+            fi
+            admit_payload_dir "$channel_root" ""
+            payload_dir="$channel_root"
+            selected_attempt="$identity_attempt"
+          else
+            for candidate in "${collected_entries[@]}"; do
               name="$(basename "$candidate")"
               case "$name" in
                 "$PREFIX"*) ;;
                 *)
-                  echo "::error::producer handoff channel contains an unexpected artifact name" >&2
-                  exit 1
+                  fail "producer handoff channel contains an unexpected artifact name"
                   ;;
               esac
               attempt="${name#"$PREFIX"}"
-              case "$attempt" in
-                ''|0|*[!0-9]*)
-                  echo "::error::producer handoff channel contains a malformed attempt" >&2
-                  exit 1
-                  ;;
-              esac
-              if [ "$attempt" -gt "$selected_attempt" ]; then
-                selected_attempt="$attempt"
-                selected="$candidate"
+              if ! is_positive_decimal "$attempt"; then
+                fail "producer handoff channel contains a malformed attempt"
+              fi
+              admit_payload_dir "$candidate" "$attempt"
+              if [ "$identity_attempt" -gt "$selected_attempt" ]; then
+                selected_attempt="$identity_attempt"
+                payload_dir="$candidate"
               fi
             done
           fi
-          if [ -z "$selected" ]; then
-            echo "::error::fips-compile producer handoff was not published for this event-stable source SHA/run_id; refusing to claim compile-to-consumer reuse" >&2
-            exit 1
+          if [ -z "$payload_dir" ] || ! is_positive_decimal "$selected_attempt"; then
+            fail "fips-compile producer handoff was not published for this event-stable source SHA/run_id; refusing to claim compile-to-consumer reuse"
           fi
           echo "Promoting FIPS producer handoff attempt ${selected_attempt}."
-          archive="${selected}/fips-producer-handoff.tar.zst"
+          archive="${payload_dir}/fips-producer-handoff.tar.zst"
           if [ ! -f "$archive" ] || [ -L "$archive" ]; then
             echo "::error::same-run FIPS producer handoff is missing its real tar.zst payload" >&2
             exit 1
@@ -1061,6 +1500,16 @@ jobs:
           if [ "$line_count" -ne 1 ] || [ "${#archived_tree}" -ne 40 ] || \
              [[ "$archived_tree" == *[!0-9a-f]* ]]; then
             echo "::error::same-run FIPS producer handoff source-tree manifest is malformed" >&2
+            exit 1
+          fi
+          extracted_identity="${extract_root}/fips-producer-identity"
+          if [ ! -f "$extracted_identity" ] || [ -L "$extracted_identity" ]; then
+            echo "::error::same-run FIPS producer handoff is missing its real identity manifest" >&2
+            exit 1
+          fi
+          read_identity_file "$extracted_identity"
+          if [ "$identity_attempt" != "$selected_attempt" ]; then
+            echo "::error::producer handoff extracted identity does not match the selected attempt" >&2
             exit 1
           fi
           current_tree="$(git rev-parse HEAD^{tree})"
@@ -1208,13 +1657,16 @@ jobs:
       # Same-run producer channel: download every handoff attempt this source
       # SHA/run_id has published. The pattern is attempt-independent, so a
       # failed-job rerun at a later attempt still finds the artifact the
-      # skipped producer published earlier; promotion below picks the newest.
+      # skipped producer published earlier. The pinned action flattens one
+      # match into the channel directory and creates per-artifact children
+      # when several attempts exist; promotion below admits both layouts.
       - name: Download FIPS producer handoff
         if: github.event.inputs.force_cold_cache != 'true'
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
         with:
           pattern: ${{ env.FIPS_HANDOFF_ARTIFACT_PREFIX }}*
           path: ${{ runner.temp }}/fips-producer-channel
+          merge-multiple: false
 
       - name: Record cold-cache proof
         if: github.event.inputs.force_cold_cache == 'true'
@@ -1230,7 +1682,10 @@ jobs:
             --bytes 0 \
             --note "layer=producer; force_cold_cache skipped handoff download"
       # Promote the newest published handoff attempt for this source
-      # SHA/run_id. The archive is validated (real tar payload, real restored
+      # SHA/run_id. Attempt identity is read from the tar's
+      # fips-producer-identity member, never from this consumer's
+      # github.run_attempt. The archive is validated (exact channel shape,
+      # real tar payload, matching payload/directory identity, real restored
       # directories, matching source-tree identity, clean checkout, real
       # executable) before its regular target files receive one common
       # reference timestamp — checkout gives identical sources newer mtimes,
@@ -1239,44 +1694,215 @@ jobs:
         if: github.event.inputs.force_cold_cache != 'true'
         env:
           PREFIX: ${{ env.FIPS_HANDOFF_ARTIFACT_PREFIX }}
+          SOURCE_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+          RUN_ID: ${{ github.run_id }}
         run: |
           set -euo pipefail
           channel_root="${RUNNER_TEMP}/fips-producer-channel"
-          selected=""
+          payload_name="fips-producer-handoff.tar.zst"
+          identity_member="fips-producer-identity"
+          payload_dir=""
           selected_attempt=0
-          if [ -d "$channel_root" ]; then
-            for candidate in "$channel_root"/*; do
-              if [ ! -d "$candidate" ] || [ -L "$candidate" ]; then
-                echo "::error::producer handoff channel contains a non-directory entry" >&2
-                exit 1
-              fi
+
+          fail() {
+            echo "::error::$1" >&2
+            exit 1
+          }
+
+          is_real_dir() {
+            [ -d "$1" ] && [ ! -L "$1" ]
+          }
+
+          is_real_file() {
+            [ -f "$1" ] && [ ! -L "$1" ]
+          }
+
+          is_positive_decimal() {
+            case "$1" in
+              ''|*[!0-9]*|0*) return 1 ;;
+            esac
+            return 0
+          }
+
+          is_sha40() {
+            [ "${#1}" -eq 40 ] || return 1
+            case "$1" in
+              *[!0-9a-f]*) return 1 ;;
+            esac
+            return 0
+          }
+
+          collect_entries() {
+            local root="$1"
+            shopt -s nullglob dotglob
+            collected_entries=("$root"/*)
+            shopt -u nullglob dotglob
+          }
+
+          if ! is_sha40 "$SOURCE_SHA"; then
+            fail "consumer event-stable source SHA is malformed"
+          fi
+          if ! is_positive_decimal "$RUN_ID"; then
+            fail "consumer workflow run id is malformed"
+          fi
+          if [ "$PREFIX" != "fips-producer-handoff-${SOURCE_SHA}-${RUN_ID}-" ]; then
+            fail "producer handoff prefix does not match this source SHA/run_id"
+          fi
+
+          read_identity_file() {
+            local identity="$1"
+            identity_source_sha=""
+            identity_run_id=""
+            identity_attempt=""
+            local line_count=0
+            local line
+            while IFS= read -r line || [ -n "$line" ]; do
+              case "$line" in
+                *$'\r'*)
+                  fail "same-run FIPS producer handoff identity manifest is malformed"
+                  ;;
+              esac
+              line_count=$((line_count + 1))
+              case "$line" in
+                source_sha=*) identity_source_sha="${line#source_sha=}" ;;
+                run_id=*) identity_run_id="${line#run_id=}" ;;
+                run_attempt=*) identity_attempt="${line#run_attempt=}" ;;
+                *)
+                  fail "same-run FIPS producer handoff identity manifest is malformed"
+                  ;;
+              esac
+            done < "$identity"
+            if [ "$line_count" -ne 3 ] || \
+               ! is_sha40 "$identity_source_sha" || \
+               ! is_positive_decimal "$identity_run_id" || \
+               ! is_positive_decimal "$identity_attempt"; then
+              fail "same-run FIPS producer handoff identity manifest is malformed"
+            fi
+            expected_identity="$(printf 'source_sha=%s\nrun_id=%s\nrun_attempt=%s\n' \
+              "$identity_source_sha" "$identity_run_id" "$identity_attempt")"
+            if [ "$(cat "$identity")" != "$expected_identity" ]; then
+              fail "same-run FIPS producer handoff identity manifest is malformed"
+            fi
+            if [ "$identity_source_sha" != "$SOURCE_SHA" ]; then
+              fail "producer handoff identity source SHA does not match this checkout event"
+            fi
+            if [ "$identity_run_id" != "$RUN_ID" ]; then
+              fail "producer handoff identity run id does not match this workflow run"
+            fi
+          }
+
+          extract_identity() {
+            local archive="$1"
+            local dest="$2"
+            rm -rf "$dest"
+            mkdir -p "$dest"
+            if ! is_real_dir "$dest"; then
+              fail "failed to create producer handoff identity extract directory"
+            fi
+            tar --zstd --no-same-owner --no-absolute-filenames \
+              -xf "$archive" -C "$dest" "$identity_member"
+            local identity="${dest}/${identity_member}"
+            if ! is_real_file "$identity"; then
+              fail "same-run FIPS producer handoff is missing its real identity manifest"
+            fi
+            collect_entries "$dest"
+            if [ "${#collected_entries[@]}" -ne 1 ] || \
+               [ "$(basename "${collected_entries[0]}")" != "$identity_member" ]; then
+              fail "producer handoff identity extract contained unexpected paths"
+            fi
+            read_identity_file "$identity"
+          }
+
+          admit_payload_dir() {
+            local candidate="$1"
+            local directory_attempt="${2:-}"
+            if ! is_real_dir "$candidate"; then
+              fail "producer handoff payload directory is not a real directory"
+            fi
+            collect_entries "$candidate"
+            if [ "${#collected_entries[@]}" -ne 1 ]; then
+              fail "producer handoff payload directory has an unexpected entry shape"
+            fi
+            local archive="${collected_entries[0]}"
+            if [ "$(basename "$archive")" != "$payload_name" ] || ! is_real_file "$archive"; then
+              fail "same-run FIPS producer handoff is missing its real tar.zst payload"
+            fi
+            local channel_abs candidate_abs archive_dir_abs
+            channel_abs="$(cd "$channel_root" && pwd -P)"
+            candidate_abs="$(cd "$candidate" && pwd -P)"
+            archive_dir_abs="$(cd "$(dirname "$archive")" && pwd -P)"
+            case "$candidate_abs" in
+              "$channel_abs"|"$channel_abs"/*) ;;
+              *) fail "producer handoff payload directory escaped channel root" ;;
+            esac
+            if [ "$archive_dir_abs" != "$candidate_abs" ]; then
+              fail "producer handoff payload escaped its artifact directory"
+            fi
+            extract_identity "$archive" "${RUNNER_TEMP}/fips-producer-identity-extract"
+            if [ -n "$directory_attempt" ] && [ "$identity_attempt" != "$directory_attempt" ]; then
+              fail "producer handoff directory attempt does not match payload identity"
+            fi
+          }
+
+          if [ -L "$channel_root" ]; then
+            fail "producer handoff channel must not be a symlink"
+          fi
+          if ! is_real_dir "$channel_root"; then
+            fail "fips-compile producer handoff was not published for this event-stable source SHA/run_id; refusing to claim compile-to-consumer reuse"
+          fi
+          collect_entries "$channel_root"
+          if [ "${#collected_entries[@]}" -eq 0 ]; then
+            fail "fips-compile producer handoff was not published for this event-stable source SHA/run_id; refusing to claim compile-to-consumer reuse"
+          fi
+          file_count=0
+          dir_count=0
+          for entry in "${collected_entries[@]}"; do
+            if [ -L "$entry" ]; then
+              fail "producer handoff channel contains a symlink"
+            fi
+            if [ -f "$entry" ]; then
+              file_count=$((file_count + 1))
+            elif [ -d "$entry" ]; then
+              dir_count=$((dir_count + 1))
+            else
+              fail "producer handoff channel contains an unexpected entry type"
+            fi
+          done
+          if [ "$file_count" -gt 0 ] && [ "$dir_count" -gt 0 ]; then
+            fail "producer handoff channel mixes files and directories"
+          fi
+          if [ "$dir_count" -eq 0 ]; then
+            if [ "$file_count" -ne 1 ]; then
+              fail "producer handoff channel flattened layout is malformed"
+            fi
+            admit_payload_dir "$channel_root" ""
+            payload_dir="$channel_root"
+            selected_attempt="$identity_attempt"
+          else
+            for candidate in "${collected_entries[@]}"; do
               name="$(basename "$candidate")"
               case "$name" in
                 "$PREFIX"*) ;;
                 *)
-                  echo "::error::producer handoff channel contains an unexpected artifact name" >&2
-                  exit 1
+                  fail "producer handoff channel contains an unexpected artifact name"
                   ;;
               esac
               attempt="${name#"$PREFIX"}"
-              case "$attempt" in
-                ''|0|*[!0-9]*)
-                  echo "::error::producer handoff channel contains a malformed attempt" >&2
-                  exit 1
-                  ;;
-              esac
-              if [ "$attempt" -gt "$selected_attempt" ]; then
-                selected_attempt="$attempt"
-                selected="$candidate"
+              if ! is_positive_decimal "$attempt"; then
+                fail "producer handoff channel contains a malformed attempt"
+              fi
+              admit_payload_dir "$candidate" "$attempt"
+              if [ "$identity_attempt" -gt "$selected_attempt" ]; then
+                selected_attempt="$identity_attempt"
+                payload_dir="$candidate"
               fi
             done
           fi
-          if [ -z "$selected" ]; then
-            echo "::error::fips-compile producer handoff was not published for this event-stable source SHA/run_id; refusing to claim compile-to-consumer reuse" >&2
-            exit 1
+          if [ -z "$payload_dir" ] || ! is_positive_decimal "$selected_attempt"; then
+            fail "fips-compile producer handoff was not published for this event-stable source SHA/run_id; refusing to claim compile-to-consumer reuse"
           fi
           echo "Promoting FIPS producer handoff attempt ${selected_attempt}."
-          archive="${selected}/fips-producer-handoff.tar.zst"
+          archive="${payload_dir}/fips-producer-handoff.tar.zst"
           if [ ! -f "$archive" ] || [ -L "$archive" ]; then
             echo "::error::same-run FIPS producer handoff is missing its real tar.zst payload" >&2
             exit 1
@@ -1302,6 +1928,16 @@ jobs:
           if [ "$line_count" -ne 1 ] || [ "${#archived_tree}" -ne 40 ] || \
              [[ "$archived_tree" == *[!0-9a-f]* ]]; then
             echo "::error::same-run FIPS producer handoff source-tree manifest is malformed" >&2
+            exit 1
+          fi
+          extracted_identity="${extract_root}/fips-producer-identity"
+          if [ ! -f "$extracted_identity" ] || [ -L "$extracted_identity" ]; then
+            echo "::error::same-run FIPS producer handoff is missing its real identity manifest" >&2
+            exit 1
+          fi
+          read_identity_file "$extracted_identity"
+          if [ "$identity_attempt" != "$selected_attempt" ]; then
+            echo "::error::producer handoff extracted identity does not match the selected attempt" >&2
             exit 1
           fi
           current_tree="$(git rev-parse HEAD^{tree})"
@@ -1391,6 +2027,7 @@ jobs:
           import json
           import os
           from pathlib import Path
+          import re
           import shutil
           import sys
 
@@ -1438,6 +2075,16 @@ jobs:
                       digest.update(chunk)
               records[name] = {"file": name, "sha256": digest.hexdigest()}
 
+          run_id = os.environ["GITHUB_RUN_ID"]
+          run_attempt = os.environ["GITHUB_RUN_ATTEMPT"]
+          if re.fullmatch(r"[1-9][0-9]*", run_id) is None:
+              raise SystemExit("malformed FIPS test identity run id")
+          if re.fullmatch(r"[1-9][0-9]*", run_attempt) is None:
+              raise SystemExit("malformed FIPS test identity run attempt")
+          (bundle / "fips-test-identity").write_text(
+              f"run_id={run_id}\nrun_attempt={run_attempt}\n",
+              encoding="utf-8",
+          )
           (bundle / "manifest.json").write_text(
               json.dumps(records, sort_keys=True) + "\n",
               encoding="utf-8",
@@ -1486,14 +2133,18 @@ jobs:
 
       # A failed-job rerun can execute this consumer at attempt N without
       # rerunning its already-successful fips-test-build prerequisite. Download
-      # every immutable test bundle for this run and select the newest attempt
-      # below instead of asking for an artifact the skipped producer never
-      # published at attempt N.
+      # every immutable test bundle for this run. The pinned action flattens a
+      # single matching artifact into the channel directory and creates
+      # per-artifact children when several attempts exist. Validation below
+      # admits both layouts and binds the attempt from fips-test-identity
+      # instead of asking for an artifact the skipped producer never published
+      # at attempt N.
       - name: Download exact FIPS test executables
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
         with:
           pattern: fips-test-binaries-${{ github.run_id }}-*
           path: ${{ runner.temp }}/fips-test-channel
+          merge-multiple: false
 
       - name: Assert cache-service credentials are absent
         run: |
@@ -1514,6 +2165,7 @@ jobs:
         env:
           FIPS_TEST_CHANNEL: ${{ runner.temp }}/fips-test-channel
           FIPS_TEST_ARTIFACT_PREFIX: fips-test-binaries-${{ github.run_id }}-
+          FIPS_TEST_RUN_ID: ${{ github.run_id }}
         run: |
           python3 - <<'PY'
           import hashlib
@@ -1522,34 +2174,120 @@ jobs:
           from pathlib import Path
           import re
 
+          ALLOWED_BUNDLE = {
+              "unit_tests",
+              "integration_tests",
+              "manifest.json",
+              "fips-test-identity",
+          }
+          POSITIVE_DECIMAL = re.compile(r"[1-9][0-9]*")
+
+          def fail(message: str) -> None:
+              raise SystemExit(message)
+
           channel_path = Path(os.environ["FIPS_TEST_CHANNEL"])
           if channel_path.is_symlink():
-              raise SystemExit("FIPS test artifact channel must not be a symlink")
+              fail("FIPS test artifact channel must not be a symlink")
+          if not channel_path.is_dir():
+              fail("FIPS test artifact channel is not a directory")
           channel = channel_path.resolve(strict=True)
-          if not channel.is_dir():
-              raise SystemExit("FIPS test artifact channel is not a directory")
+          if not channel.is_dir() or channel.is_symlink():
+              fail("FIPS test artifact channel is not a directory")
           prefix = os.environ["FIPS_TEST_ARTIFACT_PREFIX"]
+          expected_run_id = os.environ["FIPS_TEST_RUN_ID"]
+          if POSITIVE_DECIMAL.fullmatch(expected_run_id) is None:
+              fail("malformed FIPS test run id")
+          if prefix != f"fips-test-binaries-{expected_run_id}-":
+              fail("FIPS test artifact prefix does not match this workflow run")
+
+          def read_identity(bundle: Path) -> int:
+              identity_path = bundle / "fips-test-identity"
+              if identity_path.is_symlink():
+                  fail("FIPS test identity must not be a symlink")
+              identity = identity_path.resolve(strict=True)
+              if identity.parent != bundle:
+                  fail("FIPS test identity escaped artifact root")
+              text = identity.read_text(encoding="utf-8")
+              lines = text.splitlines()
+              if not text.endswith("\n") or len(lines) != 2:
+                  fail("malformed FIPS test identity manifest")
+              records = {}
+              for line in lines:
+                  if "\r" in line or line.count("=") != 1:
+                      fail("malformed FIPS test identity manifest")
+                  key, value = line.split("=", 1)
+                  if key in records:
+                      fail("malformed FIPS test identity manifest")
+                  records[key] = value
+              if set(records) != {"run_id", "run_attempt"}:
+                  fail("malformed FIPS test identity manifest")
+              run_id = records["run_id"]
+              run_attempt = records["run_attempt"]
+              if POSITIVE_DECIMAL.fullmatch(run_id) is None:
+                  fail("malformed FIPS test identity run id")
+              if POSITIVE_DECIMAL.fullmatch(run_attempt) is None:
+                  fail("malformed FIPS test artifact attempt")
+              expected = f"run_id={run_id}\nrun_attempt={run_attempt}\n"
+              if text != expected:
+                  fail("malformed FIPS test identity manifest")
+              if run_id != expected_run_id:
+                  fail("FIPS test identity run id does not match this workflow run")
+              return int(run_attempt)
+
+          def admit_bundle(bundle_path: Path, directory_attempt: int | None) -> tuple[int, Path]:
+              if bundle_path.is_symlink() or not bundle_path.is_dir():
+                  fail(f"FIPS test bundle is not a real directory: {bundle_path.name}")
+              bundle = bundle_path.resolve(strict=True)
+              if bundle != channel and bundle.parent != channel:
+                  fail("FIPS test artifact directory escaped channel root")
+              names = []
+              for entry in sorted(bundle.iterdir(), key=lambda item: item.name):
+                  if entry.is_symlink() or not entry.is_file():
+                      fail(f"unexpected non-file FIPS test bundle entry: {entry.name}")
+                  resolved = entry.resolve(strict=True)
+                  if resolved.parent != bundle:
+                      fail("FIPS test bundle entry escaped artifact root")
+                  names.append(entry.name)
+              if set(names) != ALLOWED_BUNDLE:
+                  fail(f"unexpected FIPS test bundle entries: {sorted(names)}")
+              attempt = read_identity(bundle)
+              if directory_attempt is not None and attempt != directory_attempt:
+                  fail("FIPS test directory attempt does not match payload identity")
+              return attempt, bundle
+
+          channel_entries = sorted(channel.iterdir(), key=lambda item: item.name)
+          if not channel_entries:
+              fail("no FIPS test artifact exists for this workflow run")
+          files = []
+          dirs = []
+          for entry in channel_entries:
+              if entry.is_symlink():
+                  fail(f"FIPS test artifact channel contains a symlink: {entry.name}")
+              if entry.is_file():
+                  files.append(entry)
+              elif entry.is_dir():
+                  dirs.append(entry)
+              else:
+                  fail(f"unexpected FIPS test artifact entry type: {entry.name}")
+          if files and dirs:
+              fail("FIPS test artifact channel mixes files and directories")
+
           attempts = []
-          for candidate_path in channel.iterdir():
-              if candidate_path.is_symlink() or not candidate_path.is_dir():
-                  raise SystemExit(
-                      f"unexpected non-directory FIPS test artifact entry: {candidate_path.name}"
-                  )
-              if not candidate_path.name.startswith(prefix):
-                  raise SystemExit(
-                      f"unexpected FIPS test artifact name: {candidate_path.name}"
-                  )
-              raw_attempt = candidate_path.name[len(prefix):]
-              if re.fullmatch(r"[1-9][0-9]*", raw_attempt) is None:
-                  raise SystemExit(
-                      f"malformed FIPS test artifact attempt: {candidate_path.name}"
-                  )
-              candidate = candidate_path.resolve(strict=True)
-              if candidate.parent != channel:
-                  raise SystemExit("FIPS test artifact directory escaped channel root")
-              attempts.append((int(raw_attempt), candidate))
+          if dirs:
+              for candidate_path in dirs:
+                  if not candidate_path.name.startswith(prefix):
+                      fail(f"unexpected FIPS test artifact name: {candidate_path.name}")
+                  raw_attempt = candidate_path.name[len(prefix):]
+                  if POSITIVE_DECIMAL.fullmatch(raw_attempt) is None:
+                      fail(f"malformed FIPS test artifact attempt: {candidate_path.name}")
+                  directory_attempt = int(raw_attempt)
+                  attempt, candidate = admit_bundle(candidate_path, directory_attempt)
+                  attempts.append((attempt, candidate))
+          else:
+              attempt, bundle = admit_bundle(channel, None)
+              attempts.append((attempt, bundle))
           if not attempts:
-              raise SystemExit("no FIPS test artifact exists for this workflow run")
+              fail("no FIPS test artifact exists for this workflow run")
           _, bundle = max(attempts)
           manifest_path = bundle / "manifest.json"
           if manifest_path.is_symlink():

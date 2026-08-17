@@ -297,7 +297,9 @@ artifact handoff:
   and never publish. The test job does not restore build caches.
 - **Immutable producer handoff (same-run channel and inter-run warm
   source).** A successful non-cold `fips-compile`
-  packages its exact `target/` + `.cache/sccache` producer tree as a zstd tar
+  packages its exact `target/` + `.cache/sccache` producer tree, the
+  checkout's Git tree identity, and a `fips-producer-identity` member that
+  records source SHA, run id, and run attempt as a zstd tar
   (preserving executable modes that artifact ZIP extraction would normalize)
   and publishes it as the one-day run artifact
   `fips-producer-handoff-${{ github.event.pull_request.head.sha || github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}`.
@@ -317,9 +319,17 @@ artifact handoff:
 
   The three claimed-profile shards, clippy, and `fips-test-build` download
   the handoff with the attempt-independent pattern
-  `fips-producer-handoff-<sha>-<run_id>-*` and promote the newest matching
-  attempt, so a failed-job rerun reuses the artifact the skipped producer
-  published at an earlier attempt. They never publish this channel. Each
+  `fips-producer-handoff-<sha>-<run_id>-*` and `merge-multiple: false`. The
+  pinned download action flattens a single matching artifact's payload
+  directly into the channel directory; two or more matches extract each
+  artifact into a child directory named after that artifact. Promotion admits
+  both layouts, binds the attempt from the `fips-producer-identity` member
+  packaged at the front of the tar (never from the consumer's
+  `github.run_attempt`), requires child directory names and payload identity
+  to agree, and rejects mixed files and directories, extra entries, symlinks,
+  and malformed identity. It then promotes the newest matching attempt, so a
+  failed-job rerun reuses the artifact the skipped producer published at an
+  earlier attempt. They never publish this channel. Each
   claimed shard filters the policy checker's single inventory by ordinal
   modulo three and fails closed if it selects no profile. Those consumers run
   in parallel after the build-only compile producer, so test-binary precompile
@@ -362,11 +372,18 @@ artifact handoff:
 
 `fips-test-build` precompiles the complete FIPS `unit_tests` and
 `integration_tests` executables and stages digest-bound copies in an
-immutable same-run artifact. The test job downloads the run-scoped,
-attempt-wildcard pattern `fips-test-binaries-<run_id>-*`, rejects malformed
-artifact names and paths, selects the newest attempt, then rejects unexpected
-bundle names, symlinks, path escapes, and SHA-256 mismatches before executing
-the two binaries directly. A failed-job rerun can therefore reuse the artifact
+immutable same-run artifact together with `fips-test-identity`. The test job
+downloads the run-scoped, attempt-wildcard pattern
+`fips-test-binaries-<run_id>-*` with `merge-multiple: false`. A single
+matching artifact flattens `unit_tests`, `integration_tests`, `manifest.json`,
+and `fips-test-identity` into the channel directory; multiple matches create
+per-artifact child directories. Validation admits both layouts, binds the
+attempt from `fips-test-identity` (never from the consumer's
+`github.run_attempt`), requires directory names and payload identity to agree,
+rejects malformed artifact names and paths, selects the newest attempt, then
+rejects unexpected bundle names, symlinks, path escapes, and SHA-256
+mismatches before executing the two binaries directly. A failed-job rerun can
+therefore reuse the artifact
 from the successful `fips-test-build` prerequisite that GitHub skipped in the
 new attempt. Fresh-checkout source mtimes cannot make Cargo repeat test-only
 compile/link work.

@@ -103,7 +103,8 @@ consumer so claimed-profile shards and clippy do not wait on test-binary
 precompile. `fips-test-build` publishes digest-bound copies through an
 immutable artifact scoped to that workflow run and attempt. After a successful
 locked `fips` profile build, the
-build-only producer packages its exact `target/` + `.cache/sccache` tree as a
+build-only producer packages its exact `target/` + `.cache/sccache` tree, the
+checkout's Git tree identity, and a `fips-producer-identity` member as a
 zstd tar, preserving executable modes that artifact ZIP extraction would
 normalize, and publishes it as the one-day immutable artifact
 `fips-producer-handoff-${{ github.event.pull_request.head.sha || github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}`.
@@ -150,8 +151,14 @@ Telemetry records explicit inter-run hits and ordinary runs as no-source
 misses; it does not fabricate a hit.
 The three ordinal `fips-claimed-checks` shards, `fips-clippy`, and
 `fips-test-build` download the producer handoff with the attempt-independent
-pattern `fips-producer-handoff-<sha>-<run_id>-*`, promote the newest matching
-attempt, and never publish that channel — a failed-jobs rerun therefore
+pattern `fips-producer-handoff-<sha>-<run_id>-*` and `merge-multiple: false`.
+The pinned download action flattens a single matching artifact's payload
+directly into the channel directory and, when two or more attempts exist,
+extracts each into an artifact-named child directory. Promotion admits both
+layouts, binds the attempt from the `fips-producer-identity` member packaged
+inside the tar (never from the consumer's `github.run_attempt`), requires
+child directory names and payload identity to agree, and never publishes that
+channel — a failed-jobs rerun therefore
 reuses the artifact the skipped producer published at an earlier attempt.
 Each
 claimed shard selects profiles from the policy checker's single inventory by
@@ -161,10 +168,11 @@ clippy and test-binary compile after the shorter build-only producer.
 Non-cold consumers, fork runs included, fail closed if no producer handoff
 for their source SHA/run_id was published. `fips-test` consumes only immutable
 test artifacts from its workflow run and never restores a build cache. It
-downloads `fips-test-binaries-<run_id>-*`, validates the attempt-scoped
-directory names, and selects the newest attempt before validating the bundle,
-so a failed-job rerun can reuse the successful test-build prerequisite's
-earlier artifact. The required `FIPS Build & Test` aggregate depends on
+downloads `fips-test-binaries-<run_id>-*` with the same one-match flattened /
+multi-match child-directory layout, binds the attempt from `fips-test-identity`
+inside the bundle, and selects the newest attempt before validating the
+bundle, so a failed-job rerun can reuse the successful test-build
+prerequisite's earlier artifact. The required `FIPS Build & Test` aggregate depends on
 `fips-test-build` and fails closed if that producer does not succeed.
 The pinned cache and artifact actions hold their GitHub Actions service
 credentials inside the action process;
