@@ -646,7 +646,10 @@ jobs:
           printf 'source_sha=%s\nrun_id=%s\nrun_attempt=%s\n' \
             "$SOURCE_SHA" "$RUN_ID" "$RUN_ATTEMPT" > "$identity"
           printf '%s\n' "$source_tree" > "$tree_manifest"
-          tar --zstd -cf "$archive" -C "$RUNNER_TEMP" \
+          # Cargo may hard-link identical build outputs. Store each link as an
+          # independent regular-file member so consumers never need to admit
+          # archive link targets into the trusted handoff surface.
+          tar --zstd --hard-dereference -cf "$archive" -C "$RUNNER_TEMP" \
             fips-producer-identity fips-producer-source-tree \
             -C "$GITHUB_WORKSPACE" target .cache/sccache
           rm -f "$tree_manifest" "$identity"
