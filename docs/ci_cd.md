@@ -1907,24 +1907,28 @@ triggers and onto the same posture:
   "either gate bypasses the other" hazard; the existing planner stayed the sole
   authority and only the trigger and the aggregate changed.
 - `istio-status-cas-live.yml` and `cni-lifecycle-live.yml` gained a `changes`
-  job that is the `LIVE_SUITE_RELEVANCE_JOB_TEMPLATE` text above, byte for byte
-  apart from the display name, slug, `--suite` selector, and one temporary
-  bootstrap block described below.
+  job that currently matches the `LIVE_SUITE_RELEVANCE_JOB_TEMPLATE` text
+  above, apart from the display name, slug, `--suite` selector, and one
+  temporary bootstrap block described below. That text match is **not** a
+  freeze: the jobs are not in `LIVE_SUITE_RELEVANCE_CONTRACTS` yet.
 
 These three aggregates (`NodeWaypoint eBPF Live`, `Istio Status CAS Live`,
 `CNI Lifecycle Live`) are **not** branch-protection-required and must not be
 added to `REQUIRED_MERGE_GROUP_WORKFLOWS` or `DEDICATED_REQUIRED_CHECKS`;
-`verify_required_ci.py` asserts that, and asserts each keeps unconditional
-`pull_request`, `merge_group`, and `push: main` triggers.
+`verify_required_ci.py` asserts that, and asserts each keeps the canonical
+input-less `pull_request`, `merge_group` with exactly `checks_requested`,
+and `push: branches: [main]` trigger shape.
 
 Because they are not in `LIVE_SUITE_RELEVANCE_CONTRACTS`, the trusted policy
 does not yet freeze the two new relevance jobs. Adding them requires editing
 `.github/scripts/verify_cross_build_policy.py`, which no pull request may
 change (`Trusted Cross Build Policy` rejects it outright), so that step is a
 separate trusted-base change that lands directly on `main` after this one.
-Until it does, the security property that matters is already in force — the
-verdict is computed by the base branch's classifier, never by the pull
-request's copy — and what is missing is only the freeze on the job text itself.
+Until that follow-up lands, issue #3908 is **not durably complete** against
+future PR tampering: a later pull request can still rewrite the two `changes`
+jobs because the trusted policy does not freeze their text. The current
+workflows do compute the verdict from the base branch's classifier, but that
+posture is not protected until `LIVE_SUITE_RELEVANCE_CONTRACTS` adoption.
 
 ###### Bootstrap handshake for a newly named suite
 

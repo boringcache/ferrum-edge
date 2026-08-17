@@ -10638,6 +10638,89 @@ mod tests {
     }
 
     #[test]
+    fn http_route_non_headless_no_vip_dns_fallback_keeps_service_port() {
+        // Pending / incomplete ClusterIP objects have no VIP recorded but are
+        // not `spec.clusterIP: None`. Substituting targetPort here would
+        // mis-dial a Service that still expects kube-proxy DNAT on 8080.
+        let service = core_service(
+            "pending-clusterip",
+            serde_json::json!({
+                "ports": [{
+                    "name": "first-port",
+                    "port": 8080,
+                    "targetPort": 3000
+                }]
+            }),
+        );
+        let route = object(
+            "HTTPRoute",
+            serde_json::json!({
+                "rules": [{
+                    "matches": [{"path": {"type": "Exact", "value": "/pending-clusterip"}}],
+                    "backendRefs": [{"name": "pending-clusterip", "port": 8080}]
+                }]
+            }),
+        );
+
+        let result = translate_k8s_objects(
+            &[service, route],
+            options().with_pod_discovery_enabled(true),
+        )
+        .expect("non-headless Service without a VIP should translate");
+
+        assert_eq!(result.config.proxies.len(), 1);
+        assert_eq!(
+            result.config.proxies[0].backend_host,
+            "pending-clusterip.default.svc.cluster.local"
+        );
+        assert_eq!(
+            result.config.proxies[0].backend_port, 8080,
+            "empty cluster_ips is not headless identity; keep the Service port"
+        );
+        assert!(
+            result.config.upstreams.is_empty(),
+            "single DNS fallback target is dialed directly"
+        );
+    }
+
+    #[test]
+    fn http_route_headless_cluster_ips_none_dns_fallback_dials_target_port() {
+        let service = core_service(
+            "headless-manual-endpointslices",
+            serde_json::json!({
+                "clusterIPs": ["None"],
+                "clusterIP": "None",
+                "ports": [{
+                    "name": "first-port",
+                    "port": 8080,
+                    "targetPort": 3000
+                }]
+            }),
+        );
+        let route = object(
+            "HTTPRoute",
+            serde_json::json!({
+                "rules": [{
+                    "matches": [{"path": {"type": "Exact", "value": "/headless-manual-endpointslices"}}],
+                    "backendRefs": [{"name": "headless-manual-endpointslices", "port": 8080}]
+                }]
+            }),
+        );
+
+        let result = translate_k8s_objects(
+            &[service, route],
+            options().with_pod_discovery_enabled(true),
+        )
+        .expect("explicit clusterIPs None headless DNS fallback should translate");
+
+        assert_eq!(result.config.proxies.len(), 1);
+        assert_eq!(
+            result.config.proxies[0].backend_port, 3000,
+            "explicit clusterIPs: [None] is headless; dial targetPort"
+        );
+    }
+
+    #[test]
     fn http_route_endpoint_expansion_preserves_backend_ref_weight_totals() {
         let manual = core_service(
             "manual",

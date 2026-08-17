@@ -39,7 +39,14 @@ from verify_release_image_attestations import (
 from verify_release_image_attestations import (
     validate_release_workflow,
 )
-from verify_ci_runtime_cache import main as ci_runtime_cache_main
+from verify_ci_runtime_cache import (
+    CANONICAL_MERGE_GROUP_BODY,
+    CANONICAL_PULL_REQUEST_BODY,
+    CANONICAL_PUSH_MAIN_BODY,
+    extract_job,
+    main as ci_runtime_cache_main,
+    parse_canonical_on_events,
+)
 
 
 REQUIRED_JOBS = {
@@ -298,15 +305,41 @@ REQUIRED_MERGE_GROUP_WORKFLOWS = {
 # always-reporting aggregate is that an irrelevant run is visibly green rather
 # than a required check that never arrives.
 #
-# Pin both halves. The check name must stay out of the required tables, so a
-# later change cannot quietly promote a 120-minute Kind/eBPF suite into the
-# merge queue; and the triggers must stay unconditional on pull_request,
-# merge_group, and push to `main`, so the coverage the migration bought cannot
-# be given back by re-adding a filter.
+# Pin the check name out of the required tables so a later change cannot
+# quietly promote a 120-minute Kind/eBPF suite into the merge queue; pin the
+# canonical input-less `pull_request` / `merge_group: checks_requested` /
+# `push: [main]` trigger shape so a quoted or flow-form filter cannot give
+# the coverage back; and pin the aggregate job (not a whole-file name /
+# `if: always()` search), planner/relevance job, and live job so a decoy
+# job cannot satisfy the always-reporting contract. NodeWaypoint's stronger
+# step-level aggregate verifier lives in verify_ci_runtime_cache.py; the
+# checks here are complementary. CNI/Istio live jobs bind on exact
+# `relevant == 'true'`.
 OPTIONAL_LIVE_SUITE_WORKFLOWS = {
-    ".github/workflows/node-waypoint-ebpf-live.yml": "NodeWaypoint eBPF Live",
-    ".github/workflows/istio-status-cas-live.yml": "Istio Status CAS Live",
-    ".github/workflows/cni-lifecycle-live.yml": "CNI Lifecycle Live",
+    ".github/workflows/node-waypoint-ebpf-live.yml": {
+        "name": "NodeWaypoint eBPF Live",
+        "aggregate_job": "node-waypoint-ebpf-live-gate",
+        "planner_job": "production-dockerfile-plan",
+        "live_job": "node-waypoint-ebpf-live",
+        "relevance_output": "node_waypoint_relevant",
+        "live_binding": "not_false",
+    },
+    ".github/workflows/istio-status-cas-live.yml": {
+        "name": "Istio Status CAS Live",
+        "aggregate_job": "gate",
+        "planner_job": "changes",
+        "live_job": "istio-status-cas-live",
+        "relevance_output": "relevant",
+        "live_binding": "exact_true",
+    },
+    ".github/workflows/cni-lifecycle-live.yml": {
+        "name": "CNI Lifecycle Live",
+        "aggregate_job": "gate",
+        "planner_job": "changes",
+        "live_job": "cni-lifecycle-live",
+        "relevance_output": "relevant",
+        "live_binding": "exact_true",
+    },
 }
 
 # Markers that prove merge-group runs bind validation to the synthesized SHA /
@@ -441,6 +474,134 @@ def pull_request_trigger_is_unconditional(workflow_yml: str) -> bool:
     return not re.search(r"(?m)^    paths(?:-ignore)?:", body)
 
 
+def optional_live_suite_trigger_errors(
+    workflow_yml: str, workflow_path: str
+) -> list[str]:
+    """Require the issue-#3908 canonical live-suite event posture.
+
+    Unlike `pull_request_trigger_is_unconditional`, this rejects
+    `pull_request_target`, narrowed `types`, branch/path filters (including
+    quoted keys), aliases, flow mappings, extra event directives, and
+    malformed or duplicate event blocks. Trusted Cross Build Policy still
+    uses the generic helper above.
+    """
+
+    errors: list[str] = []
+    events = parse_canonical_on_events(workflow_yml)
+    if events is None:
+        errors.append(
+            f"{workflow_path} must declare a single canonical block `on:` "
+            "mapping (input-less pull_request, merge_group checks_requested, "
+            "push to main; no pull_request_target, quoted keys, flow "
+            "mappings, aliases, extra trigger directives, or duplicate "
+            "event blocks)"
+        )
+        return errors
+    if "pull_request_target" in events:
+        errors.append(
+            f"{workflow_path} must not trigger on pull_request_target; "
+            "optional live suites require an input-less pull_request event"
+        )
+    if events.get("pull_request") != CANONICAL_PULL_REQUEST_BODY:
+        errors.append(
+            f"{workflow_path} must trigger on every pull request without "
+            "path filters, types, or branch restrictions; relevance belongs "
+            "to the trusted-base classifier"
+        )
+    if events.get("merge_group") != CANONICAL_MERGE_GROUP_BODY:
+        errors.append(
+            f"{workflow_path} must declare merge_group with exactly "
+            "types: [checks_requested] so queue-combined commits are "
+            "re-evaluated"
+        )
+    if events.get("push") != CANONICAL_PUSH_MAIN_BODY:
+        errors.append(
+            f"{workflow_path} must run on every push to main "
+            "(branches: [main] only) so a queue-combined regression "
+            "surfaces immediately"
+        )
+    return errors
+
+
+def check_optional_live_suite_aggregate(
+    workflow_yml: str,
+    workflow_path: str,
+    contract: dict[str, str],
+) -> list[str]:
+    """Bind the always-reporting aggregate to its intended job block."""
+
+    errors: list[str] = []
+    job = contract["aggregate_job"]
+    expected_name = contract["name"]
+    planner = contract["planner_job"]
+    live = contract["live_job"]
+    body = extract_job(workflow_yml, job)
+    if not body:
+        errors.append(
+            f"{workflow_path} must declare jobs.{job} as the "
+            f"always-reporting aggregate `{expected_name}`"
+        )
+        return errors
+    if not re.search(rf"(?m)^    name: {re.escape(expected_name)}$", body):
+        errors.append(
+            f"{workflow_path} jobs.{job} must keep the always-reporting "
+            f"aggregate `{expected_name}`"
+        )
+    if not re.search(r"(?m)^    if: always\(\)$", body):
+        errors.append(
+            f"{workflow_path} jobs.{job} aggregate must run with if: always()"
+        )
+    expected_needs = {planner, live}
+    actual_needs = extract_job_needs(body)
+    if actual_needs != expected_needs:
+        errors.append(
+            f"{workflow_path} jobs.{job}.needs must be {sorted(expected_needs)}"
+        )
+    if contract["live_binding"] != "exact_true":
+        return errors
+
+    relevant = f"needs.{planner}.outputs.{contract['relevance_output']}"
+    planner_result = f"needs.{planner}.result"
+    live_result = f"needs.{live}.result"
+    planner_fail = f'"${{{{ {planner_result} }}}}" != "success"'
+    skip_false = f'"${{{{ {relevant} }}}}" = "false"'
+    malformed = f'"${{{{ {relevant} }}}}" != "true"'
+    live_fail = f'"${{{{ {live_result} }}}}" != "success"'
+    if not _bash_condition_exits(body, planner_fail, 1):
+        errors.append(
+            f"{workflow_path} jobs.{job} must fail when {planner} does not "
+            "succeed; planner failure cannot report green"
+        )
+    if not _bash_condition_exits(body, skip_false, 0):
+        errors.append(
+            f"{workflow_path} jobs.{job} skip must use exact {relevant} "
+            "= 'false'; exact false is the sole legitimate skip"
+        )
+    if not _bash_condition_exits(body, malformed, 1):
+        errors.append(
+            f"{workflow_path} jobs.{job} must fail closed on blank or "
+            f"malformed {relevant} (not exact true/false)"
+        )
+    if not _bash_condition_exits(body, live_fail, 1):
+        errors.append(
+            f"{workflow_path} jobs.{job} must fail when {live} was "
+            "scheduled and did not succeed"
+        )
+    return errors
+
+
+def _bash_condition_exits(body: str, condition: str, code: int) -> bool:
+    """Return whether `condition` is followed by `exit {code}` before the next `if [`."""
+
+    start = body.find(condition)
+    if start < 0:
+        return False
+    rest = body[start + len(condition) :]
+    next_if = rest.find("if [")
+    window = rest if next_if < 0 else rest[:next_if]
+    return f"exit {code}" in window
+
+
 def merge_group_trigger_is_present(workflow_yml: str) -> bool:
     """Return whether the workflow declares an unconditional merge_group trigger."""
 
@@ -555,6 +716,258 @@ def merge_group_self_test() -> list[str]:
     ):
         if marker not in cross:
             failures.append(f"cross-build policy missing merge_group safety marker {marker!r}")
+
+    return failures
+
+
+_OPTIONAL_CANONICAL_ON = (
+    "on:\n"
+    "  workflow_dispatch:\n"
+    "  pull_request:\n"
+    "  merge_group:\n"
+    "    types:\n"
+    "      - checks_requested\n"
+    "  push:\n"
+    "    branches:\n"
+    "      - main\n"
+)
+
+_CNI_OPTIONAL_CONTRACT = OPTIONAL_LIVE_SUITE_WORKFLOWS[
+    ".github/workflows/cni-lifecycle-live.yml"
+]
+
+
+def _cni_aggregate_script(
+    *,
+    planner_fail: bool = True,
+    skip_false: bool = True,
+    malformed: bool = True,
+    live_fail: bool = True,
+    skip_not_true: bool = False,
+) -> str:
+    lines = ["        run: |\n"]
+    if planner_fail:
+        lines.append(
+            '          if [ "${{ needs.changes.result }}" != "success" ]; then\n'
+            "            exit 1\n"
+            "          fi\n"
+        )
+    if skip_not_true:
+        lines.append(
+            '          if [ "${{ needs.changes.outputs.relevant }}" != "true" ]; then\n'
+            "            exit 0\n"
+            "          fi\n"
+        )
+    elif skip_false:
+        lines.append(
+            '          if [ "${{ needs.changes.outputs.relevant }}" = "false" ]; then\n'
+            "            exit 0\n"
+            "          fi\n"
+        )
+    if malformed:
+        lines.append(
+            '          if [ "${{ needs.changes.outputs.relevant }}" != "true" ]; then\n'
+            "            exit 1\n"
+            "          fi\n"
+        )
+    if live_fail:
+        lines.append(
+            '          if [ "${{ needs.cni-lifecycle-live.result }}" != "success" ]; then\n'
+            "            exit 1\n"
+            "          fi\n"
+        )
+    return "".join(lines)
+
+
+def _cni_like_workflow(
+    *,
+    extra_jobs: str = "",
+    gate_name: str = "CNI Lifecycle Live",
+    gate_if: str = "always()",
+    needs: str | None = None,
+    script: str | None = None,
+) -> str:
+    if needs is None:
+        needs = "      - changes\n      - cni-lifecycle-live\n"
+    if script is None:
+        script = _cni_aggregate_script()
+    return (
+        f"{_OPTIONAL_CANONICAL_ON}\n"
+        "jobs:\n"
+        f"{extra_jobs}"
+        "  changes:\n"
+        "    outputs:\n"
+        "      relevant: ${{ steps.filter.outputs.relevant }}\n"
+        "  cni-lifecycle-live:\n"
+        "    if: needs.changes.outputs.relevant == 'true'\n"
+        "    steps:\n"
+        "      - run: echo live\n"
+        "  gate:\n"
+        f"    name: {gate_name}\n"
+        "    needs:\n"
+        f"{needs}"
+        f"    if: {gate_if}\n"
+        "    steps:\n"
+        "      - name: Summarize CNI lifecycle live result\n"
+        f"{script}"
+    )
+
+
+def optional_live_suite_self_test() -> list[str]:
+    """Fixtures for issue-#3908 optional trigger and aggregate contracts."""
+
+    failures: list[str] = []
+    source = "self-test-optional.yml"
+
+    if optional_live_suite_trigger_errors(_OPTIONAL_CANONICAL_ON, source):
+        failures.append(
+            "canonical optional live-suite trigger must be accepted: "
+            + "; ".join(optional_live_suite_trigger_errors(_OPTIONAL_CANONICAL_ON, source))
+        )
+
+    target_only = "on:\n  pull_request_target:\n    branches:\n      - main\n"
+    target_errors = optional_live_suite_trigger_errors(target_only, source)
+    if not any("must not trigger on pull_request_target" in item for item in target_errors):
+        failures.append("optional suite must reject pull_request_target")
+
+    typed_pr = (
+        "on:\n"
+        "  pull_request:\n"
+        "    types:\n"
+        "      - opened\n"
+        "  merge_group:\n"
+        "    types:\n"
+        "      - checks_requested\n"
+        "  push:\n"
+        "    branches:\n"
+        "      - main\n"
+    )
+    typed_errors = optional_live_suite_trigger_errors(typed_pr, source)
+    if not any("without path filters, types, or branch restrictions" in item for item in typed_errors):
+        failures.append("optional suite must reject narrowed pull_request types")
+
+    quoted_paths = (
+        "on:\n"
+        "  pull_request:\n"
+        '    "paths":\n'
+        "      - src/**\n"
+        "  merge_group:\n"
+        "    types:\n"
+        "      - checks_requested\n"
+        "  push:\n"
+        "    branches:\n"
+        "      - main\n"
+    )
+    quoted_errors = optional_live_suite_trigger_errors(quoted_paths, source)
+    if not any("without path filters, types, or branch restrictions" in item for item in quoted_errors):
+        failures.append("optional suite must reject quoted pull_request paths")
+
+    flow_pr = (
+        "on:\n"
+        "  pull_request: {paths: [src/**]}\n"
+        "  merge_group:\n"
+        "    types:\n"
+        "      - checks_requested\n"
+        "  push:\n"
+        "    branches:\n"
+        "      - main\n"
+    )
+    flow_errors = optional_live_suite_trigger_errors(flow_pr, source)
+    if not any("canonical block `on:`" in item for item in flow_errors):
+        failures.append("optional suite must reject flow-form pull_request filters")
+
+    alias_pr = (
+        "on:\n"
+        "  pull_request: &pr\n"
+        "  merge_group: *pr\n"
+        "  push:\n"
+        "    branches:\n"
+        "      - main\n"
+    )
+    alias_errors = optional_live_suite_trigger_errors(alias_pr, source)
+    if not any("canonical block `on:`" in item for item in alias_errors):
+        failures.append("optional suite must reject aliased trigger mappings")
+
+    extra_merge_types = (
+        "on:\n"
+        "  pull_request:\n"
+        "  merge_group:\n"
+        "    types:\n"
+        "      - checks_requested\n"
+        "      - requested\n"
+        "  push:\n"
+        "    branches:\n"
+        "      - main\n"
+    )
+    extra_types_errors = optional_live_suite_trigger_errors(extra_merge_types, source)
+    if not any("merge_group with exactly" in item for item in extra_types_errors):
+        failures.append("optional suite must reject extra merge_group types")
+
+    duplicate_pr = (
+        "on:\n"
+        "  pull_request:\n"
+        "  pull_request:\n"
+        "  merge_group:\n"
+        "    types:\n"
+        "      - checks_requested\n"
+        "  push:\n"
+        "    branches:\n"
+        "      - main\n"
+    )
+    duplicate_errors = optional_live_suite_trigger_errors(duplicate_pr, source)
+    if not any("canonical block `on:`" in item for item in duplicate_errors):
+        failures.append("optional suite must reject duplicate pull_request blocks")
+
+    good_aggregate = check_optional_live_suite_aggregate(
+        _cni_like_workflow(), source, _CNI_OPTIONAL_CONTRACT
+    )
+    if good_aggregate:
+        failures.append(
+            "canonical optional aggregate must be accepted: "
+            + "; ".join(good_aggregate)
+        )
+
+    split_spoof = _cni_like_workflow(
+        extra_jobs=(
+            "  decoy-name:\n"
+            "    name: CNI Lifecycle Live\n"
+            "  decoy-always:\n"
+            "    if: always()\n"
+        ),
+        gate_name: "Not The Aggregate",
+        gate_if: "success()",
+    )
+    split_errors = check_optional_live_suite_aggregate(
+        split_spoof, source, _CNI_OPTIONAL_CONTRACT
+    )
+    if not (
+        any("must keep the always-reporting aggregate" in item for item in split_errors)
+        and any("must run with if: always()" in item for item in split_errors)
+    ):
+        failures.append(
+            "optional aggregate must reject a split name/always spoof on decoy jobs"
+        )
+
+    severed = _cni_like_workflow(needs: "      - changes\n")
+    severed_errors = check_optional_live_suite_aggregate(
+        severed, source, _CNI_OPTIONAL_CONTRACT
+    )
+    if not any(".needs must be" in item for item in severed_errors):
+        failures.append("optional aggregate must reject a severed needs list")
+
+    loose = _cni_like_workflow(
+        script=_cni_aggregate_script(skip_false=False, malformed=False, skip_not_true=True)
+    )
+    loose_errors = check_optional_live_suite_aggregate(
+        loose, source, _CNI_OPTIONAL_CONTRACT
+    )
+    if not (
+        any("exact false is the sole legitimate skip" in item for item in loose_errors)
+        and any("blank or malformed" in item for item in loose_errors)
+    ):
+        failures.append(
+            "optional aggregate must reject loose malformed-verdict handling"
+        )
 
     return failures
 
@@ -1153,16 +1566,16 @@ def main() -> int:
                 )
 
     planner_errors.extend(merge_group_self_test())
+    planner_errors.extend(optional_live_suite_self_test())
 
     # Optional live suites (issue #3908): trusted-base relevance, an
     # always-reporting aggregate, and NO branch-protection requirement.
     required_check_names = set(REQUIRED_MERGE_GROUP_WORKFLOWS.values()) | {
         required_check["name"] for required_check in DEDICATED_REQUIRED_CHECKS.values()
     }
-    for workflow_path, aggregate_name in sorted(
-        OPTIONAL_LIVE_SUITE_WORKFLOWS.items()
-    ):
+    for workflow_path, contract in sorted(OPTIONAL_LIVE_SUITE_WORKFLOWS.items()):
         workflow_yml = Path(workflow_path).read_text(encoding="utf-8")
+        aggregate_name = contract["name"]
         if workflow_path in REQUIRED_MERGE_GROUP_WORKFLOWS:
             planner_errors.append(
                 f"{workflow_path} must stay out of REQUIRED_MERGE_GROUP_WORKFLOWS; "
@@ -1178,38 +1591,12 @@ def main() -> int:
                 f"{workflow_path} aggregate `{aggregate_name}` must not collide "
                 "with a branch-protection-required check name"
             )
-        # The aggregate is what reports for the suite, so it has to exist and
-        # run unconditionally; without `always()` a skipped live job would take
-        # the aggregate with it and the suite would report nothing at all.
-        if not re.search(
-            rf"(?m)^    name: {re.escape(aggregate_name)}$", workflow_yml
-        ):
-            planner_errors.append(
-                f"{workflow_path} must keep the always-reporting aggregate "
-                f"`{aggregate_name}`"
-            )
-        if not re.search(r"(?m)^    if: always\(\)$", workflow_yml):
-            planner_errors.append(
-                f"{workflow_path} aggregate must run with if: always()"
-            )
-        # The three triggers the migration bought. A `paths:` filter re-added
-        # to any of them would put relevance back in the pull request's own
-        # checkout, which is the defect #3908 closed.
-        if not pull_request_trigger_is_unconditional(workflow_yml):
-            planner_errors.append(
-                f"{workflow_path} must trigger on every pull request without "
-                "path filters; relevance belongs to the trusted-base classifier"
-            )
-        if not merge_group_trigger_is_present(workflow_yml):
-            planner_errors.append(
-                f"{workflow_path} must declare an unconditional merge_group "
-                "trigger so queue-combined commits are re-evaluated"
-            )
-        if not main_push_trigger_is_unconditional(workflow_yml):
-            planner_errors.append(
-                f"{workflow_path} must run on every push to main so a "
-                "queue-combined regression surfaces immediately"
-            )
+        planner_errors.extend(
+            check_optional_live_suite_aggregate(workflow_yml, workflow_path, contract)
+        )
+        planner_errors.extend(
+            optional_live_suite_trigger_errors(workflow_yml, workflow_path)
+        )
         for marker in MERGE_GROUP_SHA_CONTRACT_MARKERS:
             if marker not in workflow_yml:
                 planner_errors.append(

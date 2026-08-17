@@ -57,9 +57,11 @@ Full policy: `docs/dependency-policy.md`. These are the load-bearing rules.
   (`NodeWaypoint eBPF Live`, `Istio Status CAS Live`, `CNI Lifecycle Live`) are
   NOT branch-protection-required and must not be added to
   `REQUIRED_MERGE_GROUP_WORKFLOWS` or `DEDICATED_REQUIRED_CHECKS`. The two new
-  `changes` jobs are not yet in `LIVE_SUITE_RELEVANCE_CONTRACTS`; adding them
-  (and deleting their temporary `--list-suites` bootstrap block) is the
-  follow-up direct-to-`main` policy change. The classifier refuses to classify
+  `changes` jobs are not yet in `LIVE_SUITE_RELEVANCE_CONTRACTS`; they are not
+  byte-frozen, and issue #3908 is not durably complete against future PR
+  tampering until the follow-up direct-to-`main` policy change adds them
+  (and deletes their temporary `--list-suites` bootstrap block). The
+  classifier refuses to classify
   any change-set record that is not a normal repository-relative pathname and
   forces the suite to run instead. See `docs/ci_cd.md` → "Trusted-base
   relevance for required live gates".

@@ -150,6 +150,82 @@ def extract_on_block(workflow: str) -> str:
     return "".join(lines[start + 1 : end])
 
 
+# Repository canonical live-suite event bodies after dropping blank and
+# full-line comment rows. This is not a general YAML parser: quoted event
+# keys, flow mappings, aliases, and duplicate event blocks fail closed.
+_BLANK_OR_COMMENT_LINE = re.compile(r"^\s*(?:#.*)?$")
+_CANONICAL_EVENT_HEADER = re.compile(r"^  ([A-Za-z0-9_-]+):\s*$")
+_PATH_FILTER_KEY = re.compile(
+    r"""^[ \t]{2,}["']?(paths|paths-ignore)["']?[ \t]*:"""
+)
+_FLOW_PATH_FILTER = re.compile(
+    r"""^  ["']?[A-Za-z0-9_-]+["']?[ \t]*:[ \t]*\{[^}\n]*["']?(paths(?:-ignore)?)["']?[ \t]*:"""
+)
+
+CANONICAL_PULL_REQUEST_BODY: tuple[str, ...] = ()
+CANONICAL_MERGE_GROUP_BODY: tuple[str, ...] = (
+    "    types:",
+    "      - checks_requested",
+)
+CANONICAL_PUSH_MAIN_BODY: tuple[str, ...] = (
+    "    branches:",
+    "      - main",
+)
+
+
+def parse_canonical_on_events(workflow: str) -> dict[str, tuple[str, ...]] | None:
+    """Parse the single top-level `on:` mapping into event -> body lines.
+
+    Accepts only the repository's canonical block shape: unquoted indent-2
+    event keys, mapping form `  event:` with no same-line value, and unique
+    events. Blank and full-line comment rows are ignored. Returns None when
+    the `on:` block is missing, duplicated, quoted, flow-form, aliased,
+    or otherwise malformed.
+    """
+
+    on_block = extract_on_block(workflow)
+    if not on_block:
+        return None
+    events: dict[str, list[str]] = {}
+    current: str | None = None
+    for line in on_block.splitlines():
+        raw = line.rstrip("\r\n")
+        if _BLANK_OR_COMMENT_LINE.match(raw):
+            continue
+        header = _CANONICAL_EVENT_HEADER.match(raw)
+        if header:
+            name = header.group(1)
+            if name in events:
+                return None
+            events[name] = []
+            current = name
+            continue
+        if current is None:
+            return None
+        if re.match(r'^  ["\']', raw) or re.match(r"^  [A-Za-z0-9_-]+:\s*\S", raw):
+            return None
+        if re.match(r"^  \S", raw) and not raw.startswith("    "):
+            return None
+        events[current].append(raw)
+    return {name: tuple(body) for name, body in events.items()}
+
+
+def on_block_path_filters(on_block: str) -> list[str]:
+    """Return `paths` / `paths-ignore` keys, including quoted and flow spellings."""
+
+    found: list[str] = []
+    for line in on_block.splitlines():
+        raw = line.rstrip("\r\n")
+        match = _PATH_FILTER_KEY.match(raw)
+        if match:
+            found.append(match.group(1))
+            continue
+        flow = _FLOW_PATH_FILTER.match(raw)
+        if flow:
+            found.append(flow.group(1))
+    return found
+
+
 def production_dockerfile_probe_paths() -> list[str]:
     probes: list[str] = []
     for pattern in SUITE_PATTERNS["production-dockerfile-smoke"]:
@@ -225,26 +301,39 @@ def check_governed_live_trigger_shape(
         f"{source} must declare a single top-level `on:` block",
         failures,
     )
-    for filtered in re.findall(r"(?m)^    (paths|paths-ignore):", on_block):
+    events = parse_canonical_on_events(workflow)
+    require(
+        events is not None,
+        f"{source} must use the canonical block event shape (unquoted event "
+        "keys, no flow/alias mappings, no duplicate event blocks)",
+        failures,
+    )
+    for filtered in on_block_path_filters(on_block):
         failures.append(
             f"{source} must not filter a governed live trigger by `{filtered}:`"
         )
+    if events is None:
+        return
     for event in GOVERNED_LIVE_TRIGGER_EVENTS:
         require(
-            re.search(rf"(?m)^  {re.escape(event)}:", on_block) is not None,
+            event in events,
             f"{source} must trigger on `{event}` so relevance is re-evaluated "
             "on pull requests, merge-queue combinations, and main pushes",
             failures,
         )
     require(
-        re.search(r"(?m)^  merge_group:\n    types:\n      - checks_requested$", on_block)
-        is not None,
+        events.get("pull_request") == CANONICAL_PULL_REQUEST_BODY,
+        f"{source} pull_request trigger must be an input-less block event",
+        failures,
+    )
+    require(
+        events.get("merge_group") == CANONICAL_MERGE_GROUP_BODY,
         f"{source} merge_group trigger must request checks on the synthesized "
         "queue commit",
         failures,
     )
     require(
-        re.search(r"(?m)^  push:\n    branches:\n      - main$", on_block) is not None,
+        events.get("push") == CANONICAL_PUSH_MAIN_BODY,
         f"{source} push trigger must cover exactly the main branch",
         failures,
     )
@@ -4432,6 +4521,102 @@ def self_test() -> int:
         not good_trigger_failures,
         "self-test: the governed four-event live trigger should pass: "
         + "; ".join(good_trigger_failures),
+        failures,
+    )
+
+    quoted_paths_trigger = (
+        "name: demo\n"
+        "on:\n"
+        "  workflow_dispatch:\n"
+        "  pull_request:\n"
+        '    "paths":\n'
+        "      - Dockerfile\n"
+        "  merge_group:\n"
+        "    types:\n"
+        "      - checks_requested\n"
+        "  push:\n"
+        "    branches:\n"
+        "      - main\n"
+    )
+    quoted_paths_failures: list[str] = []
+    check_governed_live_trigger_shape(
+        quoted_paths_trigger,
+        "self-test-quoted-paths-trigger",
+        quoted_paths_failures,
+    )
+    require(
+        any(
+            "must not filter a governed live trigger by `paths:`" in item
+            for item in quoted_paths_failures
+        )
+        and any(
+            "pull_request trigger must be an input-less block event" in item
+            for item in quoted_paths_failures
+        ),
+        "self-test: a quoted pull_request \"paths\" key must fail the governed "
+        "trigger shape",
+        failures,
+    )
+
+    quoted_ignore_trigger = (
+        "name: demo\n"
+        "on:\n"
+        "  workflow_dispatch:\n"
+        "  pull_request:\n"
+        "  merge_group:\n"
+        "    types:\n"
+        "      - checks_requested\n"
+        "  push:\n"
+        "    branches:\n"
+        "      - main\n"
+        '    "paths-ignore":\n'
+        "      - docs/**\n"
+    )
+    quoted_ignore_failures: list[str] = []
+    check_governed_live_trigger_shape(
+        quoted_ignore_trigger,
+        "self-test-quoted-paths-ignore-trigger",
+        quoted_ignore_failures,
+    )
+    require(
+        any(
+            "must not filter a governed live trigger by `paths-ignore:`" in item
+            for item in quoted_ignore_failures
+        )
+        and any(
+            "push trigger must cover exactly the main branch" in item
+            for item in quoted_ignore_failures
+        ),
+        "self-test: a quoted push \"paths-ignore\" key must fail the governed "
+        "trigger shape",
+        failures,
+    )
+
+    flow_paths_trigger = (
+        "name: demo\n"
+        "on:\n"
+        "  workflow_dispatch:\n"
+        "  pull_request: {paths: [Dockerfile]}\n"
+        "  merge_group:\n"
+        "    types:\n"
+        "      - checks_requested\n"
+        "  push:\n"
+        "    branches:\n"
+        "      - main\n"
+    )
+    flow_paths_failures: list[str] = []
+    check_governed_live_trigger_shape(
+        flow_paths_trigger,
+        "self-test-flow-paths-trigger",
+        flow_paths_failures,
+    )
+    require(
+        any(
+            "must use the canonical block event shape" in item
+            for item in flow_paths_failures
+        ),
+        "self-test: a flow-form pull_request.paths mapping must fail the "
+        "governed trigger shape",
         failures,
     )
 

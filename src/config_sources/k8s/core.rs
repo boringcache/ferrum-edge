@@ -50,8 +50,14 @@ struct CoreService {
     has_selector: bool,
     /// `spec.clusterIPs` (fallback `spec.clusterIP`), excluding the headless
     /// sentinel `"None"` and empty strings. Raw-TCP egress maps captured
-    /// original destinations to services through these VIPs.
+    /// original destinations to services through these VIPs. An empty list is
+    /// not itself a headless Service — see [`Self::is_headless`].
     cluster_ips: Vec<String>,
+    /// Explicit Kubernetes headless identity: `spec.clusterIP: None` and/or
+    /// `spec.clusterIPs` containing `"None"`. ExternalName, pending, malformed,
+    /// or incomplete Services can also lack a VIP and must not be treated as
+    /// headless.
+    is_headless: bool,
     /// Kubernetes `metadata.uid` for H1 pending-admission lane isolation
     /// across Service delete/recreate (issue #3778). Empty when absent.
     uid: String,
@@ -261,6 +267,20 @@ pub(super) fn finalize(acc: &mut K8sAccumulator) -> Result<(), K8sTranslateError
     Ok(())
 }
 
+/// Kubernetes headless identity is the explicit `"None"` sentinel on
+/// `spec.clusterIP` and/or `spec.clusterIPs`. Filtering that sentinel out of
+/// the collected VIP list leaves ExternalName, pending, and incomplete
+/// objects looking the same as a headless Service; those shapes must not
+/// inherit headless DNS-fallback dialing.
+fn service_declares_headless(spec: &Value) -> bool {
+    let cluster_ip_none = string_field(spec, "clusterIP") == Some("None");
+    let cluster_ips_none = spec
+        .get("clusterIPs")
+        .and_then(Value::as_array)
+        .is_some_and(|ips| ips.iter().any(|ip| ip.as_str() == Some("None")));
+    cluster_ip_none || cluster_ips_none
+}
+
 fn collect_service(acc: &mut K8sAccumulator, object: &K8sObject) -> Result<(), K8sTranslateError> {
     let Some(key) = K8sServiceKey::new(
         object.metadata.namespace.clone(),
@@ -301,7 +321,8 @@ fn collect_service(acc: &mut K8sAccumulator, object: &K8sObject) -> Result<(), K
     // `spec.clusterIPs` carries the dual-stack VIP list; older objects may
     // only have the singular `spec.clusterIP`. Headless services declare the
     // literal string "None" — skip it (and empties): an absent VIP list means
-    // "not raw-TCP-egress routable", never an invalid address.
+    // "not raw-TCP-egress routable", never an invalid address. Headless
+    // identity is the explicit `"None"` sentinel, recorded separately.
     let mut cluster_ips: Vec<String> = object
         .spec
         .get("clusterIPs")
@@ -331,6 +352,7 @@ fn collect_service(acc: &mut K8sAccumulator, object: &K8sObject) -> Result<(), K
                 .and_then(Value::as_object)
                 .is_some_and(|selector| !selector.is_empty()),
             cluster_ips,
+            is_headless: service_declares_headless(&object.spec),
             uid: object.metadata.uid.clone(),
         },
     );
@@ -737,10 +759,15 @@ pub(super) fn endpoint_route_backends_for_service(
 ///
 /// ClusterIP Services keep the Service port: kube-proxy DNATs
 /// `ClusterIP:servicePort` onto `podIP:targetPort`. Headless Services
-/// (`spec.clusterIP: None`) have no ClusterIP and no kube-proxy DNAT; CoreDNS
-/// returns the backing pod IPs, which listen on `targetPort`. Falling back to
-/// the Service port here is `connection_failure` (HTTP 502) — that is the
-/// Gateway API `HTTPRouteServiceTypes` `/headless-manual-endpointslices` miss.
+/// (`spec.clusterIP: None` / `spec.clusterIPs: ["None"]`) have no ClusterIP
+/// and no kube-proxy DNAT; CoreDNS returns the backing pod IPs, which listen
+/// on `targetPort`. Falling back to the Service port here is
+/// `connection_failure` (HTTP 502) — that is the Gateway API
+/// `HTTPRouteServiceTypes` `/headless-manual-endpointslices` miss.
+///
+/// Only the explicit headless sentinel authorizes `targetPort`. An empty
+/// collected VIP list also describes ExternalName, pending, malformed, or
+/// incomplete Services, which must keep the Service port.
 pub(super) fn service_dns_fallback_port(
     acc: &K8sAccumulator,
     namespace: &str,
@@ -754,7 +781,7 @@ pub(super) fn service_dns_fallback_port(
     let Some(service) = acc.core.services.get(&service_key) else {
         return service_port;
     };
-    if !service.cluster_ips.is_empty() {
+    if !service.is_headless {
         return service_port;
     }
     let service_port_spec = service

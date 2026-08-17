@@ -9,12 +9,13 @@ name: Istio Status CAS Live
 # `Istio Status CAS Live` is an OPTIONAL always-reporting aggregate: it is
 # deliberately not branch-protection-required (.claude/rules/testing.md), and
 # verify_required_ci.py asserts it stays out of REQUIRED_MERGE_GROUP_WORKFLOWS
-# and DEDICATED_REQUIRED_CHECKS. The `changes` job below is nonetheless the
-# same trusted-base relevance block the required live suites use, byte for byte
-# apart from the suite/slug/display substitutions and the temporary #3908
-# bootstrap handshake it carries until the classifier suite reaches `main`; its
-# comments are written for the required case on purpose so the block can be
-# frozen verbatim by a later trusted-policy change.
+# and DEDICATED_REQUIRED_CHECKS. The `changes` job below follows the same
+# trusted-base relevance shape the required live suites use, with the
+# suite/slug/display substitutions and a temporary #3908 bootstrap handshake
+# until the classifier suite reaches `main`. It is not byte-frozen until a
+# later trusted-policy change adds it to LIVE_SUITE_RELEVANCE_CONTRACTS; until
+# then a pull request can still rewrite this job. Comments are written for the
+# required case so the block can be frozen verbatim by that follow-up.
 
 on:
   workflow_dispatch:
