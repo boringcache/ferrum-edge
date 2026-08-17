@@ -99,6 +99,36 @@ fn dtls_demux_rejects_non_client_hello_handshake_records() {
         opens(&handshake_record(0x01, 0)),
         "the initial ClientHello fragment is the only datagram that opens a session"
     );
+    let mut truncated = handshake_record(0x01, 0);
+    truncated.pop();
+    assert!(
+        !opens(&truncated),
+        "a record shorter than its declared length must not open a session"
+    );
+    let mut nonzero_epoch = handshake_record(0x01, 0);
+    nonzero_epoch[4] = 1;
+    assert!(
+        !opens(&nonzero_epoch),
+        "a ClientHello record outside epoch zero must not open a session"
+    );
+    let mut empty_fragment = handshake_record(0x01, 0);
+    empty_fragment[22..25].copy_from_slice(&[0, 0, 0]);
+    assert!(
+        !opens(&empty_fragment),
+        "an empty ClientHello fragment must not reserve a session"
+    );
+    let mut oversized_fragment = handshake_record(0x01, 0);
+    oversized_fragment[22..25].copy_from_slice(&[0, 0, 17]);
+    assert!(
+        !opens(&oversized_fragment),
+        "a fragment longer than the record payload must not open a session"
+    );
+    let mut fragment_exceeds_message = handshake_record(0x01, 0);
+    fragment_exceeds_message[14..17].copy_from_slice(&[0, 0, 15]);
+    assert!(
+        !opens(&fragment_exceeds_message),
+        "a fragment longer than its declared handshake message must not open a session"
+    );
     let mut ccs = handshake_record(0x01, 0);
     ccs[0] = 0x14;
     assert!(

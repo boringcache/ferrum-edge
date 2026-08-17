@@ -1031,11 +1031,14 @@ fn client_send_output_drain_needs_another_round(
 fn dtls_datagram_opens_session(data: &[u8]) -> bool {
     // DTLS record header: content_type (1) + version (2) + epoch (2) +
     //                     sequence_number (6) + length (2) = 13 bytes
-    if data.len() < 13 || data[0] != 0x16 {
+    if data.len() < 13 || data[0] != 0x16 || data[3] != 0 || data[4] != 0 {
         return false;
     }
     let record_len = u16::from_be_bytes([data[11], data[12]]) as usize;
-    let Some(handshake) = data.get(13..13 + record_len.min(data.len() - 13)) else {
+    let Some(record_end) = 13usize.checked_add(record_len) else {
+        return false;
+    };
+    let Some(handshake) = data.get(13..record_end) else {
         return false;
     };
     // DTLS handshake header: msg_type (1) + length (3) + message_seq (2) +
@@ -1051,7 +1054,16 @@ fn dtls_datagram_opens_session(data: &[u8]) -> bool {
     let fragment_offset = ((handshake[6] as usize) << 16)
         | ((handshake[7] as usize) << 8)
         | (handshake[8] as usize);
+    let message_len = ((handshake[1] as usize) << 16)
+        | ((handshake[2] as usize) << 8)
+        | (handshake[3] as usize);
+    let fragment_len = ((handshake[9] as usize) << 16)
+        | ((handshake[10] as usize) << 8)
+        | (handshake[11] as usize);
     fragment_offset == 0
+        && fragment_len != 0
+        && fragment_len <= message_len
+        && fragment_len <= handshake.len() - 12
 }
 
 /// Pin the ClientHello-only demux admission predicate for external hosted tests.
