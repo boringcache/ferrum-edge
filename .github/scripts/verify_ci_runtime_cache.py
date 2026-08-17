@@ -128,13 +128,17 @@ YAML_DOUBLE_QUOTED_ESCAPES = {
     "L": chr(0x2028),
     "P": chr(0x2029),
 }
-YAML_KEY_TOKEN = r"'(?:[^']|'')*'|\"(?:[^\"\\]|\\.)*\"|[A-Za-z0-9_.+-]+"
+# `<<` is a YAML merge key, not an identifier. Keep it in the key token so
+# block/flow merge spellings are parsed and rejected rather than skipped.
+YAML_KEY_TOKEN = r"'(?:[^']|'')*'|\"(?:[^\"\\]|\\.)*\"|<<|[A-Za-z0-9_.+-]+"
 YAML_MAPPING_LINE = re.compile(
-    rf"^(?P<lead> *)(?P<dash>-\s+)?(?P<key>{YAML_KEY_TOKEN})\s*:(?P<value>.*)$"
+    rf"^(?P<lead>[ \t]*)(?P<dash>-[ \t]+)?(?P<key>{YAML_KEY_TOKEN})[ \t]*:(?P<value>.*)$"
 )
-YAML_FLOW_STEP = re.compile(r"^(?P<lead> *)-\s+(?P<flow>[\{\[].*)$")
-YAML_BLOCK_SCALAR = re.compile(r"^[|>][+-]?(?:\d+)?\s*(?:#.*)?$")
-YAML_EXPLICIT_KEY = re.compile(r"^\s*\?")
+YAML_FLOW_STEP = re.compile(r"^(?P<lead>[ \t]*)-[ \t]+(?P<flow>[\{\[].*)$")
+YAML_BLOCK_SCALAR = re.compile(r"^[|>][+-]?(?:\d+)?[ \t]*(?:#.*)?$")
+YAML_EXPLICIT_KEY = re.compile(r"^[ \t]*(?:-[ \t]+)?\?")
+YAML_SEQUENCE_ITEM = re.compile(r"^[ \t]*-[ \t]+(?P<item>.+)$")
+YAML_DOCUMENT_MARK = frozenset({"---", "..."})
 JS_ACTION_USING = re.compile(r"^node(?:\d+)?$", re.IGNORECASE)
 SCCACHE_PINNED_VERSION = "0.17.0"
 SCCACHE_RELEASE_DOWNLOAD = "https://github.com/mozilla/sccache/releases/download/"
@@ -876,14 +880,93 @@ def _yaml_strip_trailing_comment(text: str) -> str:
     return text
 
 
+def _yaml_quotes_balanced(text: str) -> bool:
+    """Return False for unclosed quotes, including `\\` line-continuation."""
+
+    quote: str | None = None
+    index = 0
+    while index < len(text):
+        character = text[index]
+        if quote == '"':
+            if character == "\\" and index + 1 < len(text):
+                index += 2
+                continue
+            if character == "\\":
+                return False
+            if character == '"':
+                quote = None
+            index += 1
+            continue
+        if quote == "'":
+            if character == "'" and index + 1 < len(text) and text[index + 1] == "'":
+                index += 2
+                continue
+            if character == "'":
+                quote = None
+            index += 1
+            continue
+        if character in {"'", '"'}:
+            quote = character
+            index += 1
+            continue
+        if character == "#":
+            return quote is None
+        index += 1
+    return quote is None
+
+
+def _leading_yaml_node_properties(text: str) -> tuple[bool, str]:
+    """Split `&anchor` / `*alias` / `!tag` prefixes from a node.
+
+    An alias is a complete node. Anchors and tags may precede a collection or
+    scalar; the remainder is returned so callers can still parse `{...}` / `[...]`
+    after rejecting the indirect spelling.
+    """
+
+    remaining = text.lstrip(" \t")
+    had = False
+    while remaining:
+        marker = remaining[0]
+        if marker in {"&", "*"}:
+            had = True
+            index = 1
+            while index < len(remaining) and remaining[index] not in " \t,{}[]:#":
+                index += 1
+            if index == 1:
+                return True, remaining
+            remaining = remaining[index:].lstrip(" \t")
+            if marker == "*":
+                break
+            continue
+        if marker != "!":
+            break
+        had = True
+        index = 1
+        if index < len(remaining) and remaining[index] == "<":
+            end = remaining.find(">", index)
+            if end < 0:
+                return True, ""
+            index = end + 1
+        else:
+            while index < len(remaining) and remaining[index] not in " \t,{}[]:#":
+                index += 1
+        remaining = remaining[index:].lstrip(" \t")
+    return had, remaining
+
+
+def _skip_flow_comment(text: str, index: int) -> int:
+    while index < len(text) and text[index] != "\n":
+        index += 1
+    return index
+
+
 def _balanced_flow(text: str, start: int) -> tuple[str, int] | None:
     if start >= len(text) or text[start] not in "{[":
         return None
-    opener = text[start]
-    closer = "}" if opener == "{" else "]"
-    depth = 0
+    closers = {"{": "}", "[": "]"}
+    stack = [text[start]]
     quote: str | None = None
-    index = start
+    index = start + 1
     while index < len(text):
         character = text[index]
         if quote == '"':
@@ -906,11 +989,16 @@ def _balanced_flow(text: str, start: int) -> tuple[str, int] | None:
             quote = character
             index += 1
             continue
-        if character == opener:
-            depth += 1
-        elif character == closer:
-            depth -= 1
-            if depth == 0:
+        if character == "#":
+            index = _skip_flow_comment(text, index)
+            continue
+        if character in "{[":
+            stack.append(character)
+        elif character in "}]":
+            if not stack or closers[stack[-1]] != character:
+                return None
+            stack.pop()
+            if not stack:
                 return text[start : index + 1], index + 1
         index += 1
     return None
@@ -948,6 +1036,9 @@ def _split_flow_entries(inner: str) -> list[str] | None:
             quote = character
             current.append(character)
             index += 1
+            continue
+        if character == "#":
+            index = _skip_flow_comment(inner, index)
             continue
         if character in "{[":
             depth += 1
@@ -989,74 +1080,6 @@ def _parse_uses_value(raw: str) -> tuple[str | None, str | None]:
     return decoded, None
 
 
-def _collect_flow_mapping_pairs(flow: str) -> tuple[list[tuple[str, str]], list[str]]:
-    pairs: list[tuple[str, str]] = []
-    errors: list[str] = []
-    if not (flow.startswith("{") and flow.endswith("}")):
-        return [], ["unreadable flow mapping"]
-    entries = _split_flow_entries(flow[1:-1])
-    if entries is None:
-        return [], ["unreadable flow mapping"]
-    for entry in entries:
-        item = entry.strip()
-        if not item:
-            continue
-        match = re.match(rf"^({YAML_KEY_TOKEN})\s*:(.*)$", item, re.DOTALL)
-        if match is None:
-            errors.append("unreadable flow mapping entry")
-            continue
-        pairs.append((match.group(1), match.group(2)))
-        value = match.group(2).strip()
-        if value.startswith("{"):
-            balanced = _balanced_flow(value, 0)
-            if balanced is None:
-                errors.append("unreadable nested flow mapping")
-                continue
-            nested, nested_errors = _collect_flow_mapping_pairs(balanced[0])
-            pairs.extend(nested)
-            errors.extend(nested_errors)
-        elif value.startswith("["):
-            balanced = _balanced_flow(value, 0)
-            if balanced is None:
-                errors.append("unreadable nested flow sequence")
-                continue
-            nested, nested_errors = _collect_flow_sequence(balanced[0])
-            pairs.extend(nested)
-            errors.extend(nested_errors)
-    return pairs, errors
-
-
-def _collect_flow_sequence(flow: str) -> tuple[list[tuple[str, str]], list[str]]:
-    pairs: list[tuple[str, str]] = []
-    errors: list[str] = []
-    if not (flow.startswith("[") and flow.endswith("]")):
-        return [], ["unreadable flow sequence"]
-    entries = _split_flow_entries(flow[1:-1])
-    if entries is None:
-        return [], ["unreadable flow sequence"]
-    for entry in entries:
-        item = entry.strip()
-        if not item:
-            continue
-        if item.startswith("{"):
-            balanced = _balanced_flow(item, 0)
-            if balanced is None:
-                errors.append("unreadable flow sequence mapping")
-                continue
-            nested, nested_errors = _collect_flow_mapping_pairs(balanced[0])
-            pairs.extend(nested)
-            errors.extend(nested_errors)
-        elif item.startswith("["):
-            balanced = _balanced_flow(item, 0)
-            if balanced is None:
-                errors.append("unreadable nested flow sequence")
-                continue
-            nested, nested_errors = _collect_flow_sequence(balanced[0])
-            pairs.extend(nested)
-            errors.extend(nested_errors)
-    return pairs, errors
-
-
 def _record_mapping_pair(
     raw_key: str,
     raw_value: str,
@@ -1088,6 +1111,185 @@ def _record_mapping_pair(
             using.append(value)
 
 
+def _record_flow_pairs(
+    pairs: list[tuple[str, str]],
+    flow_errors: list[str],
+    uses: list[str],
+    using: list[str],
+    errors: list[str],
+) -> None:
+    errors.extend(flow_errors)
+    for raw_key, raw_value in pairs:
+        _record_mapping_pair(raw_key, raw_value, uses, using, errors)
+
+
+def _collect_nested_flow_value(
+    value: str,
+    pairs: list[tuple[str, str]],
+    errors: list[str],
+) -> None:
+    had_props, remainder = _leading_yaml_node_properties(value)
+    if had_props:
+        errors.append("indirect or tagged YAML node")
+        value = remainder
+    if not value:
+        return
+    if value.startswith("?"):
+        errors.append("explicit YAML key")
+        return
+    if value.startswith("{"):
+        balanced = _balanced_flow(value, 0)
+        if balanced is None:
+            errors.append("unreadable nested flow mapping")
+            return
+        nested, nested_errors = _collect_flow_mapping_pairs(balanced[0])
+        pairs.extend(nested)
+        errors.extend(nested_errors)
+        return
+    if value.startswith("["):
+        balanced = _balanced_flow(value, 0)
+        if balanced is None:
+            errors.append("unreadable nested flow sequence")
+            return
+        nested, nested_errors = _collect_flow_sequence(balanced[0])
+        pairs.extend(nested)
+        errors.extend(nested_errors)
+
+
+def _collect_flow_mapping_pairs(flow: str) -> tuple[list[tuple[str, str]], list[str]]:
+    pairs: list[tuple[str, str]] = []
+    errors: list[str] = []
+    if not (flow.startswith("{") and flow.endswith("}")):
+        return [], ["unreadable flow mapping"]
+    entries = _split_flow_entries(flow[1:-1])
+    if entries is None:
+        return [], ["unreadable flow mapping"]
+    for entry in entries:
+        item = entry.strip()
+        if not item:
+            continue
+        had_props, item = _leading_yaml_node_properties(item)
+        if had_props:
+            errors.append("indirect or tagged YAML node")
+            if not item:
+                continue
+        if item.startswith("?"):
+            errors.append("explicit YAML key")
+            continue
+        match = re.match(rf"^({YAML_KEY_TOKEN})[ \t]*:(.*)$", item, re.DOTALL)
+        if match is None:
+            errors.append("unreadable flow mapping entry")
+            continue
+        pairs.append((match.group(1), match.group(2)))
+        _collect_nested_flow_value(match.group(2).strip(), pairs, errors)
+    return pairs, errors
+
+
+def _collect_flow_sequence(flow: str) -> tuple[list[tuple[str, str]], list[str]]:
+    pairs: list[tuple[str, str]] = []
+    errors: list[str] = []
+    if not (flow.startswith("[") and flow.endswith("]")):
+        return [], ["unreadable flow sequence"]
+    entries = _split_flow_entries(flow[1:-1])
+    if entries is None:
+        return [], ["unreadable flow sequence"]
+    for entry in entries:
+        item = entry.strip()
+        if not item:
+            continue
+        had_props, item = _leading_yaml_node_properties(item)
+        if had_props:
+            errors.append("indirect or tagged YAML node")
+            if not item:
+                continue
+        if item.startswith("?"):
+            errors.append("explicit YAML key")
+            continue
+        if item.startswith("{"):
+            balanced = _balanced_flow(item, 0)
+            if balanced is None:
+                errors.append("unreadable flow sequence mapping")
+                continue
+            nested, nested_errors = _collect_flow_mapping_pairs(balanced[0])
+            pairs.extend(nested)
+            errors.extend(nested_errors)
+            continue
+        if item.startswith("["):
+            balanced = _balanced_flow(item, 0)
+            if balanced is None:
+                errors.append("unreadable nested flow sequence")
+                continue
+            nested, nested_errors = _collect_flow_sequence(balanced[0])
+            pairs.extend(nested)
+            errors.extend(nested_errors)
+            continue
+        match = re.match(rf"^({YAML_KEY_TOKEN})[ \t]*:(.*)$", item, re.DOTALL)
+        if match is not None:
+            pairs.append((match.group(1), match.group(2)))
+            _collect_nested_flow_value(match.group(2).strip(), pairs, errors)
+            continue
+        if not _yaml_quotes_balanced(item):
+            errors.append("unreadable multiline YAML quoting")
+            continue
+        # Plain flow scalars (`[main]`) are not action carriers.
+    return pairs, errors
+
+
+def _scan_structural_text(
+    text: str,
+    uses: list[str],
+    using: list[str],
+    errors: list[str],
+) -> None:
+    item = text.strip()
+    if not item:
+        return
+    had_props, item = _leading_yaml_node_properties(item)
+    if had_props:
+        errors.append("indirect or tagged YAML node")
+        if not item:
+            return
+    if item.startswith("?"):
+        errors.append("explicit YAML key")
+        return
+    if item.startswith("{") or item.startswith("["):
+        balanced = _balanced_flow(item, 0)
+        if balanced is None:
+            errors.append("unreadable flow collection")
+            return
+        flow_text, _end = balanced
+        if flow_text.startswith("{"):
+            pairs, flow_errors = _collect_flow_mapping_pairs(flow_text)
+        else:
+            pairs, flow_errors = _collect_flow_sequence(flow_text)
+        _record_flow_pairs(pairs, flow_errors, uses, using, errors)
+        return
+    match = re.match(rf"^({YAML_KEY_TOKEN})[ \t]*:(.*)$", item, re.DOTALL)
+    if match is None:
+        errors.append("unreadable YAML structure")
+        return
+    _record_mapping_pair(match.group(1), match.group(2), uses, using, errors)
+    value = _yaml_strip_trailing_comment(match.group(2)).strip()
+    had_value_props, remainder = _leading_yaml_node_properties(value)
+    if had_value_props:
+        errors.append("indirect or tagged YAML node")
+        value = remainder
+    if value.startswith("{") or value.startswith("["):
+        _scan_structural_text(value, uses, using, errors)
+
+
+def _is_plain_sequence_scalar(item: str) -> bool:
+    text = _yaml_strip_trailing_comment(item).strip()
+    if not text:
+        return True
+    if not _yaml_quotes_balanced(text):
+        return False
+    had_props, remainder = _leading_yaml_node_properties(text)
+    if had_props or remainder[:1] in {"{", "[", "?"}:
+        return False
+    return re.match(rf"^(?:{YAML_KEY_TOKEN})[ \t]*:", remainder, re.DOTALL) is None
+
+
 def _skip_block_scalar(lines: list[str], start: int, parent_indent: int) -> int:
     index = start
     while index < len(lines):
@@ -1095,21 +1297,38 @@ def _skip_block_scalar(lines: list[str], start: int, parent_indent: int) -> int:
         if not line.strip():
             index += 1
             continue
-        indent = len(line) - len(line.lstrip(" "))
+        indent = len(line) - len(line.lstrip(" \t"))
         if indent <= parent_indent:
             break
         index += 1
     return index
 
 
+def _collect_multiline_flow(
+    lines: list[str], start_text: str, next_index: int
+) -> tuple[str | None, int]:
+    collected = [start_text]
+    cursor = next_index
+    blob = "\n".join(collected)
+    while _balanced_flow(blob, 0) is None and cursor < len(lines):
+        collected.append(lines[cursor])
+        blob = "\n".join(collected)
+        cursor += 1
+    balanced = _balanced_flow(blob, 0)
+    if balanced is None:
+        return None, next_index
+    return balanced[0], cursor
+
+
 def scan_yaml_action_invocations(text: str) -> tuple[list[str], list[str], list[str]]:
     """Extract `uses`/`using` values from workflow/action YAML.
 
     Block-scalar bodies (`run: |`, `description: >-`) are not YAML mappings, so
-    they are skipped. Flow mappings, quoted/escaped keys, aliases, merge keys,
-    and explicit `?` keys are parsed or rejected fail-closed. This is not a
-    full YAML implementation; unreadable structure is a failure, not an
-    admitted absence of actions.
+    they are skipped. Flow mappings, unbraced flow pairs, quoted/escaped keys,
+    explicit keys, anchors, aliases, tags, merge keys, and multiline quoted
+    keys are parsed or rejected fail-closed. This is not a full YAML
+    implementation; unreadable structure is a failure, not an admitted
+    absence of actions.
     """
 
     uses: list[str] = []
@@ -1119,65 +1338,89 @@ def scan_yaml_action_invocations(text: str) -> tuple[list[str], list[str], list[
     index = 0
     while index < len(lines):
         line = lines[index]
-        stripped = line.lstrip(" ")
-        if not stripped or stripped.startswith("#"):
+        stripped = line.lstrip(" \t")
+        if not stripped or stripped.startswith("#") or stripped in YAML_DOCUMENT_MARK:
             index += 1
             continue
-        if YAML_EXPLICIT_KEY.match(line):
+        if not _yaml_quotes_balanced(line):
+            errors.append("unreadable multiline YAML quoting")
+            index += 1
+            continue
+        explicit = YAML_EXPLICIT_KEY.match(line)
+        if explicit:
             errors.append("explicit YAML key")
+            rest = line[explicit.end() :].lstrip(" \t")
+            if rest:
+                _scan_structural_text(rest, uses, using, errors)
+            index += 1
+            continue
+        dash_item = YAML_SEQUENCE_ITEM.match(line)
+        content = dash_item.group("item") if dash_item else stripped
+        had_line_props, remainder = _leading_yaml_node_properties(content)
+        if had_line_props:
+            errors.append("indirect or tagged YAML node")
+            if remainder.startswith("{") or remainder.startswith("["):
+                flow_text, cursor = _collect_multiline_flow(
+                    lines, remainder, index + 1
+                )
+                if flow_text is None:
+                    errors.append("unreadable flow collection")
+                    index += 1
+                    continue
+                if flow_text.startswith("{"):
+                    pairs, flow_errors = _collect_flow_mapping_pairs(flow_text)
+                else:
+                    pairs, flow_errors = _collect_flow_sequence(flow_text)
+                _record_flow_pairs(pairs, flow_errors, uses, using, errors)
+                index = cursor
+                continue
+            if remainder:
+                _scan_structural_text(remainder, uses, using, errors)
             index += 1
             continue
         flow_step = YAML_FLOW_STEP.match(line)
         if flow_step:
-            collected = [line[flow_step.start("flow") :]]
-            cursor = index + 1
-            blob = "\n".join(collected)
-            while _balanced_flow(blob, 0) is None and cursor < len(lines):
-                collected.append(lines[cursor])
-                blob = "\n".join(collected)
-                cursor += 1
-            balanced = _balanced_flow(blob, 0)
-            if balanced is None:
+            flow_text, cursor = _collect_multiline_flow(
+                lines, line[flow_step.start("flow") :], index + 1
+            )
+            if flow_text is None:
                 errors.append("unreadable flow step")
                 index += 1
                 continue
-            flow_text, _end = balanced
             if flow_text.startswith("{"):
                 pairs, flow_errors = _collect_flow_mapping_pairs(flow_text)
             else:
                 pairs, flow_errors = _collect_flow_sequence(flow_text)
-            errors.extend(flow_errors)
-            for raw_key, raw_value in pairs:
-                _record_mapping_pair(raw_key, raw_value, uses, using, errors)
+            _record_flow_pairs(pairs, flow_errors, uses, using, errors)
             index = cursor
             continue
         parsed = YAML_MAPPING_LINE.match(line)
         if parsed is None:
+            if dash_item is not None and _is_plain_sequence_scalar(dash_item.group("item")):
+                index += 1
+                continue
+            errors.append("unreadable YAML structure")
             index += 1
             continue
         indent = len(parsed.group("lead"))
         raw_value = parsed.group("value")
         value = _yaml_strip_trailing_comment(raw_value).strip()
-        if YAML_BLOCK_SCALAR.match(value):
+        had_value_props, remainder = _leading_yaml_node_properties(value)
+        if had_value_props:
+            errors.append("indirect or tagged YAML node")
+        structural = remainder if had_value_props else value
+        if YAML_BLOCK_SCALAR.match(structural):
             key = _decode_yaml_scalar(parsed.group("key"))
             if key in {"uses", "using", "<<"}:
                 _record_mapping_pair(parsed.group("key"), raw_value, uses, using, errors)
             index = _skip_block_scalar(lines, index + 1, indent)
             continue
-        if value.startswith("{") or value.startswith("["):
-            collected = [value]
-            cursor = index + 1
-            blob = "\n".join(collected)
-            while _balanced_flow(blob, 0) is None and cursor < len(lines):
-                collected.append(lines[cursor])
-                blob = "\n".join(collected)
-                cursor += 1
-            balanced = _balanced_flow(blob, 0)
-            if balanced is None:
+        if structural.startswith("{") or structural.startswith("["):
+            flow_text, cursor = _collect_multiline_flow(lines, structural, index + 1)
+            if flow_text is None:
                 errors.append("unreadable flow collection")
                 index += 1
                 continue
-            flow_text, _end = balanced
             key = _decode_yaml_scalar(parsed.group("key"))
             if key in {"uses", "using", "<<"}:
                 _record_mapping_pair(parsed.group("key"), raw_value, uses, using, errors)
@@ -1185,9 +1428,7 @@ def scan_yaml_action_invocations(text: str) -> tuple[list[str], list[str], list[
                 pairs, flow_errors = _collect_flow_mapping_pairs(flow_text)
             else:
                 pairs, flow_errors = _collect_flow_sequence(flow_text)
-            errors.extend(flow_errors)
-            for raw_key, nested_value in pairs:
-                _record_mapping_pair(raw_key, nested_value, uses, using, errors)
+            _record_flow_pairs(pairs, flow_errors, uses, using, errors)
             index = cursor
             continue
         _record_mapping_pair(parsed.group("key"), raw_value, uses, using, errors)
@@ -4095,6 +4336,152 @@ def self_test() -> int:
         "self-test: nested action in setup-fast-linker must fail: "
         f"{linker_nested_failures}",
         failures,
+    )
+
+    def fips_insert(snippet: str) -> str:
+        mutated = real_fips.replace(setup_step, snippet + setup_step, 1)
+        require(
+            setup_step in mutated and snippet.split("\n", 1)[0] in mutated,
+            "self-test: FIPS carrier mutation must insert into the real workflow "
+            f"without dropping setup-sccache: {snippet!r}",
+            failures,
+        )
+        return mutated
+
+    def require_fips_carrier(name: str, snippet: str, needles: tuple[str, ...]) -> None:
+        carrier_failures: list[str] = []
+        check_fips_action_allowlist(fips_insert(snippet), name, carrier_failures)
+        require(
+            any(any(needle in item for needle in needles) for item in carrier_failures),
+            f"self-test: {name} must fail closed {needles}: {carrier_failures}",
+            failures,
+        )
+
+    require_fips_carrier(
+        "self-test-block-merge-key",
+        "      - <<: *evil\n",
+        ("YAML merge key",),
+    )
+    require_fips_carrier(
+        "self-test-flow-merge-key",
+        "      - {<<: *evil}\n",
+        ("YAML merge key",),
+    )
+    require_fips_carrier(
+        "self-test-block-merge-mapping",
+        "      - <<: {uses: " + github_script + "}\n",
+        ("YAML merge key", "closed FIPS allowlist"),
+    )
+    require_fips_carrier(
+        "self-test-sequence-explicit-key",
+        "      - ? uses\n        : " + github_script + "\n",
+        ("explicit YAML key",),
+    )
+    require_fips_carrier(
+        "self-test-sequence-explicit-key-compact",
+        "      - ? uses: " + github_script + "\n",
+        ("explicit YAML key", "closed FIPS allowlist"),
+    )
+    require_fips_carrier(
+        "self-test-unbraced-flow-pair",
+        "      - [uses: " + github_script + "]\n",
+        ("closed FIPS allowlist",),
+    )
+    require_fips_carrier(
+        "self-test-unbraced-flow-pair-after-mapping",
+        "      - [{name: hidden}, uses: " + github_script + "]\n",
+        ("closed FIPS allowlist",),
+    )
+    require_fips_carrier(
+        "self-test-anchored-flow-step",
+        "      - &step {uses: " + github_script + "}\n",
+        ("indirect or tagged YAML node", "closed FIPS allowlist"),
+    )
+    require_fips_carrier(
+        "self-test-anchored-mapping-value",
+        "      - dummy: &step {uses: " + github_script + "}\n",
+        ("indirect or tagged YAML node", "closed FIPS allowlist"),
+    )
+    require_fips_carrier(
+        "self-test-tagged-flow-step",
+        "      - !!map {uses: " + github_script + "}\n",
+        ("indirect or tagged YAML node", "closed FIPS allowlist"),
+    )
+    require_fips_carrier(
+        "self-test-tagged-uses-key",
+        "      - !!str uses: " + github_script + "\n",
+        ("indirect or tagged YAML node", "closed FIPS allowlist"),
+    )
+    require_fips_carrier(
+        "self-test-alias-sequence-item",
+        "      - *evil\n",
+        ("indirect or tagged YAML node",),
+    )
+    require_fips_carrier(
+        "self-test-alias-as-key",
+        "      - *uk: " + github_script + "\n",
+        ("indirect or tagged YAML node",),
+    )
+    require_fips_carrier(
+        "self-test-multiline-quoted-uses-key",
+        '      - "\\\n        uses": ' + github_script + "\n",
+        ("unreadable multiline YAML quoting",),
+    )
+
+    def sccache_insert(snippet: str) -> str:
+        marker = "  using: composite\n  steps:\n"
+        mutated = real_sccache.replace(marker, marker + snippet, 1)
+        require(
+            marker in mutated and snippet.split("\n", 1)[0] in mutated,
+            "self-test: setup-sccache carrier mutation must keep using: composite "
+            f"and insert the carrier: {snippet!r}",
+            failures,
+        )
+        return mutated
+
+    def require_sccache_carrier(name: str, snippet: str, needles: tuple[str, ...]) -> None:
+        carrier_failures: list[str] = []
+        check_shell_only_local_action(sccache_insert(snippet), name, carrier_failures)
+        require(
+            any(any(needle in item for needle in needles) for item in carrier_failures),
+            f"self-test: {name} must fail closed {needles}: {carrier_failures}",
+            failures,
+        )
+        require(
+            not any("must not contain exportVariable" in item for item in carrier_failures),
+            f"self-test: {name} must fail structurally, not only via the token",
+            failures,
+        )
+
+    require_sccache_carrier(
+        "self-test-sccache-block-merge-key",
+        "    - <<: *evil\n",
+        ("YAML merge key",),
+    )
+    require_sccache_carrier(
+        "self-test-sccache-sequence-explicit-key",
+        "    - ? uses: " + github_script + "\n",
+        ("explicit YAML key", "must not invoke nested actions"),
+    )
+    require_sccache_carrier(
+        "self-test-sccache-unbraced-flow-pair",
+        "    - [uses: " + github_script + "]\n",
+        ("must not invoke nested actions",),
+    )
+    require_sccache_carrier(
+        "self-test-sccache-anchored-flow-step",
+        "    - &step {uses: " + github_script + "}\n",
+        ("indirect or tagged YAML node", "must not invoke nested actions"),
+    )
+    require_sccache_carrier(
+        "self-test-sccache-tagged-flow-step",
+        "    - !!map {uses: " + github_script + "}\n",
+        ("indirect or tagged YAML node", "must not invoke nested actions"),
+    )
+    require_sccache_carrier(
+        "self-test-sccache-multiline-quoted-uses-key",
+        '    - "\\\n      uses": ' + github_script + "\n",
+        ("unreadable multiline YAML quoting",),
     )
 
     export_variable_bypass_shapes = (

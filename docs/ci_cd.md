@@ -407,8 +407,9 @@ actions and the two local shell-only composites (`setup-sccache`,
 `setup-fast-linker`). Those local actions must remain `using: composite`
 with `run:` steps only — no nested `uses:`, so no inline or third-party
 JavaScript carrier can reach the Actions toolkit credential environment.
-Alternate YAML spellings of `uses` (flow mappings, quoted/escaped keys,
-aliases, merge keys, block scalars, templates) are rejected fail-closed
+Alternate YAML spellings of `uses` (flow mappings, unbraced flow pairs,
+quoted/escaped/multiline keys, explicit keys, anchors, aliases, tags,
+merge keys, block scalars, templates) are rejected fail-closed
 rather than treated as an absence of invocations. The contiguous
 `exportVariable` token deny remains defense in depth; it does not catch
 computed property forms such as `core["export" + "Variable"]` on its own.
