@@ -747,6 +747,10 @@ fn trust_withdrawal_suppresses_final_packet_drain_while_deadline_unexpired() {
         !established_arm.contains("send_to"),
         "the retirement arm itself must not drain packets onto the wire"
     );
+    assert!(
+        !established_arm.contains("send_dtls_record"),
+        "the retirement arm must not drain packets from the pinned source either"
+    );
 
     let post_loop = DTLS_SOURCE
         .split("let discard_final_packets")
@@ -767,8 +771,13 @@ fn trust_withdrawal_suppresses_final_packet_drain_while_deadline_unexpired() {
         "the final drain must honor the combined trust-withdrawal / deadline predicate"
     );
     assert!(
-        post_loop.contains("socket.send_to(data, peer_addr)"),
-        "ordinary shutdown still flushes protocol records when the deadline has not elapsed"
+        post_loop.contains("send_dtls_record(&socket, data, peer_addr, reply_local)"),
+        "ordinary shutdown still flushes protocol records when the deadline has not elapsed, \
+         and from the session's pinned reply source"
+    );
+    assert!(
+        !post_loop.contains("socket.send_to(data, peer_addr)"),
+        "a generated NodeWaypoint listener must never fall back to a route-selected reply source"
     );
 
     let shutdown_body = DTLS_SOURCE
@@ -781,6 +790,84 @@ fn trust_withdrawal_suppresses_final_packet_drain_while_deadline_unexpired() {
     assert!(
         !shutdown_body.contains("retired_by_trust_withdrawal = true"),
         "ordinary shutdown must not reuse the trust-withdrawal termination reason"
+    );
+}
+
+/// A refused frontend DTLS client certificate must not complete the handshake.
+///
+/// dimpl's DTLS 1.2 server queues ChangeCipherSpec+Finished and only THEN
+/// pushes `Connected` onto the local-event queue that `poll_output` pops first,
+/// so at both refusal sites the server final flight exists but is unsent. A
+/// refusal that drains `poll_output` onto the socket therefore delivers that
+/// flight, the peer reaches `SSL_is_init_finished`, and an unauthenticated
+/// client observes an ESTABLISHED session before the alert queued behind it
+/// arrives. Pin the discard-before-write order, the fail-closed bailout when the
+/// bounded discard does not reach the end of the queue, and the pinned reply
+/// source. `tests/integration/dtls_integration_tests.rs` proves the wire
+/// outcome; this proves no refusal site can reintroduce the drain.
+#[test]
+fn refused_dtls_handshakes_never_commit_the_server_final_flight() {
+    let helper = DTLS_SOURCE
+        .split("async fn refuse_dtls_handshake(")
+        .nth(1)
+        .expect("handshake refusal helper")
+        .split("// Sans-IO Helpers")
+        .next()
+        .expect("handshake refusal helper body");
+    let discard = helper.find("Output::Timeout(_)").expect("queue discard");
+    let bail = helper.find("if !queue_drained {").expect("bailout");
+    let close = helper.find("dtls.close()").expect("alert");
+    let write = helper
+        .find("send_dtls_record(socket, data, peer_addr, reply_local)")
+        .expect("pinned refusal write");
+    assert!(
+        discard < bail && bail < close && close < write,
+        "a refusal must discard every queued record, bail out when that discard did not \
+         reach the end of the queue, and only then queue and write its own alert"
+    );
+    assert!(
+        !helper.contains("socket.send_to("),
+        "refusal datagrams must leave from the session's pinned reply source"
+    );
+    let discard_arm = &helper[discard..close];
+    assert!(
+        !discard_arm.contains("send_dtls_record") && !discard_arm.contains("send_to"),
+        "the discard pass must drop queued records rather than write them"
+    );
+
+    for (marker, site) in [
+        (
+            "\"DTLS frontend mTLS required but client presented no verified certificate; \
+             dropping session\"",
+            "an unauthenticated peer under a configured client verifier",
+        ),
+        (
+            "warn!(client = %peer_addr, \"Client cert validation failed: {}\", e);",
+            "a client chain the configured verifier refuses",
+        ),
+    ] {
+        let gate = DTLS_SOURCE
+            .split(marker)
+            .nth(1)
+            .and_then(|tail| tail.split("return;").next())
+            .unwrap_or_else(|| panic!("no refusal site found for {site}"));
+        assert!(
+            gate.contains("refuse_dtls_handshake("),
+            "{site} must be refused through the discard-first helper"
+        );
+        assert!(
+            gate.contains("reply_local"),
+            "{site} must refuse from the session's pinned reply source"
+        );
+        assert!(
+            !gate.contains("accept_tx.send") && !gate.contains("app_out_tx.send"),
+            "{site} must never reach accept or application delivery"
+        );
+    }
+
+    assert!(
+        !DTLS_SOURCE.contains("abort_dtls_handshake"),
+        "the drain-and-forward abort helper must not come back"
     );
 }
 

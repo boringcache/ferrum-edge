@@ -2831,10 +2831,11 @@ impl DtlsServer {
                                         client = %peer_addr,
                                         "DTLS frontend mTLS required but client presented no verified certificate; dropping session"
                                     );
-                                    abort_dtls_handshake(
+                                    refuse_dtls_handshake(
                                         &mut dtls,
                                         socket.as_ref(),
                                         peer_addr,
+                                        reply_local,
                                         &mut out_buf,
                                     )
                                     .await;
@@ -2907,10 +2908,11 @@ impl DtlsServer {
                                 if let Some(verifier) = client_cert_verifier.as_deref() {
                                     if let Err(e) = validate_client_cert(&chain, verifier) {
                                         warn!(client = %peer_addr, "Client cert validation failed: {}", e);
-                                        abort_dtls_handshake(
+                                        refuse_dtls_handshake(
                                             &mut dtls,
                                             socket.as_ref(),
                                             peer_addr,
+                                            reply_local,
                                             &mut out_buf,
                                         )
                                         .await;
@@ -3416,20 +3418,64 @@ fn validate_client_cert(
         .map_err(|e| anyhow::anyhow!("DTLS client certificate verification failed: {}", e))
 }
 
-/// Abort a frontend DTLS handshake so a refused client certificate is visible
-/// on the wire instead of looking like a completed session to a client that
-/// emitted local `Connected` before the server Finished/Alert flight.
-async fn abort_dtls_handshake(
+/// Refuse a frontend DTLS handshake WITHOUT committing the server's final
+/// flight to the wire.
+///
+/// dimpl's server pops its local-event queue before the engine's record queue
+/// (`Server::poll_output`), and the DTLS 1.2 server pushes `Connected` at the
+/// END of `send_finished` — after the ChangeCipherSpec and Finished records are
+/// already queued. So at both refusal sites below (an unverifiable client chain,
+/// and `Connected` with no verified client certificate under a configured
+/// verifier) that final flight EXISTS but has not been written: this session
+/// driver is the only thing that ever puts it on the socket.
+///
+/// Draining it here — which a `close()`-then-forward abort does — hands the peer
+/// a complete server final flight, so the client reaches `SSL_is_init_finished`
+/// and reports an ESTABLISHED DTLS session; the alert queued behind it only
+/// arrives afterwards. A peer that never authenticated then observes a completed
+/// handshake, whatever the gateway does with the session next. Every queued
+/// record is therefore discarded first, and only records the refusal itself
+/// produces are written. If that bounded discard does not reach the end of the
+/// queue, nothing is written at all, because a leftover record could still be
+/// part of that flight.
+///
+/// This makes the refusal fail closed at the DTLS 1.2 protocol boundary. In
+/// DTLS 1.3 the server's Finished belongs to an earlier flight and has
+/// necessarily already been sent before the client's certificate arrives, so no
+/// server behaviour can leave that handshake incomplete; there the alert is what
+/// tears the peer down. In both versions the caller returns immediately, so no
+/// application data and no accepted connection ever reach the proxy.
+///
+/// Writes go through `send_dtls_record`, so a generated NodeWaypoint listener
+/// refuses from the exact pinned reply source it handshook from rather than a
+/// route-selected node address the client's connected socket would discard. A
+/// failed send is not actionable — the session is being dropped either way — so
+/// it is ignored rather than retried.
+async fn refuse_dtls_handshake(
     dtls: &mut Dtls,
     socket: &UdpSocket,
     peer_addr: SocketAddr,
+    reply_local: Option<crate::socket_opts::PktinfoLocal>,
     out_buf: &mut [u8],
 ) {
+    // Discard everything dimpl has already queued for this session. `Timeout`
+    // is dimpl's "nothing actionable left" output, so it is the only exit that
+    // proves the queue is drained.
+    let mut queue_drained = false;
+    for _ in 0..MAX_OUTPUTS_PER_DRAIN {
+        if matches!(dtls.poll_output(out_buf), Output::Timeout(_)) {
+            queue_drained = true;
+            break;
+        }
+    }
+    if !queue_drained {
+        return;
+    }
     let _ = dtls.close();
     for _ in 0..MAX_OUTPUTS_PER_DRAIN {
         match dtls.poll_output(out_buf) {
             Output::Packet(data) => {
-                let _ = socket.send_to(data, peer_addr).await;
+                let _ = send_dtls_record(socket, data, peer_addr, reply_local).await;
             }
             _ => break,
         }

@@ -265,6 +265,31 @@ export FERRUM_ADMIN_TLS_KEY_PATH="/prod/certs/admin.key"
   candidate and keeps the last-known-good TLS configuration
 - Clients must present certificates signed by one of these CAs
 
+### Frontend DTLS Client-Certificate Refusal
+
+When `FERRUM_DTLS_CLIENT_CA_CERT_PATH` / `_SOURCE` is configured, a UDP+DTLS
+listener refuses two cases: a client chain the verifier cannot validate, and a
+client that completes the handshake without presenting a verified certificate at
+all (DTLS permits an empty `Certificate` message in response to a
+`CertificateRequest`, so this is a distinct case, not the same one).
+
+Both refusals happen **before the server's final flight is committed to the
+wire**. Ferrum discards every record the DTLS engine has queued for that session
+and only then emits the refusal alert, so under DTLS 1.2 the client never
+receives the server `ChangeCipherSpec`+`Finished` and its handshake does not
+complete — `openssl s_client -dtls1_2` reports a failed connection rather than an
+established session that is dropped a moment later. Under DTLS 1.3 the server's
+`Finished` belongs to a flight that necessarily precedes the client's
+certificate, so that handshake cannot be made incomplete by the server; there the
+alert is what tears the peer down. In both versions the refused session is never
+delivered to the proxy, no application data is relayed, and no backend session is
+created.
+
+On a Ferrum-generated `MeshNodeWaypoint` DTLS listener the refusal alert leaves
+from the same pinned reply source as the rest of the handshake, so a client that
+addressed a Service ClusterIP sees it instead of discarding a record sourced from
+a node address.
+
 ## Admin API TLS Configuration
 
 The Admin API also supports separate HTTP and HTTPS listeners with the same architecture as the proxy listeners.
