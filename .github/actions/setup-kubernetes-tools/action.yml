@@ -2,7 +2,8 @@ name: Setup Kubernetes tools
 description: >-
   Install kind, kubectl, and Helm from official versioned release URLs after
   verifying each download against repository-pinned SHA-256 digests and the
-  matching official published checksum files. Fail closed on download or
+  matching official published checksum files. Restored cache entries are
+  re-checked against the same pins before install. Fail closed on download or
   verification errors. Never pipes remote content to a shell.
 
 inputs:
@@ -52,6 +53,17 @@ inputs:
 runs:
   using: composite
   steps:
+    # Exact-key restore only: versions, checksums, install subset, and runner
+    # platform/arch all participate in the key. Prefix restore-keys are omitted
+    # so a different pin cannot be installed from a partial match. Checksums
+    # are verified again after restore; a mismatch discards the entry and
+    # re-downloads rather than installing untrusted bytes.
+    - name: Restore pinned Kubernetes tool downloads
+      uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+      with:
+        path: ${{ runner.temp }}/ferrum-k8s-tools/cache
+        key: ferrum-k8s-tools-v1-${{ runner.os }}-${{ runner.arch }}-kind-${{ inputs.kind-version }}-${{ inputs.kind-sha256 }}-kubectl-${{ inputs.kubectl-version }}-${{ inputs.kubectl-sha256 }}-helm-${{ inputs.helm-version }}-${{ inputs.helm-sha256 }}-ik-${{ inputs.install-kind }}-ic-${{ inputs.install-kubectl }}-ih-${{ inputs.install-helm }}
+
     - name: Install kind, kubectl, and Helm with pinned checksums
       shell: bash
       env:
@@ -124,9 +136,10 @@ runs:
           fi
         }
 
-        # Cross-check the repository pin against the official published
-        # checksum for this exact version. Reject if either the download or the
-        # pin disagrees with official provenance.
+        # Compare the repository pin against the official published checksum
+        # for this exact version. Reject if either the artifact or the pin
+        # disagrees with official provenance. Official checksum files are
+        # always fetched and are never taken from cache.
         assert_official_checksum_matches_pin() {
           local official_url="$1"
           local pinned="$2"
@@ -146,18 +159,39 @@ runs:
           fi
         }
 
+        restore_or_download() {
+          local dest="$1"
+          local url="$2"
+          local expected="$3"
+          local label="$4"
+          if [ -s "$dest" ]; then
+            local actual
+            actual="$(file_sha256 "$dest")"
+            if [ "$actual" = "$expected" ]; then
+              echo "${label}: restored pinned artifact from cache"
+              return 0
+            fi
+            echo "::warning::${label}: restored cache checksum mismatch: got ${actual}, want ${expected}; discarding and re-downloading"
+            rm -f "$dest"
+          fi
+          download "$url" "$dest"
+        }
+
         install_dir="${RUNNER_TEMP}/ferrum-k8s-tools/bin"
         work_dir="${RUNNER_TEMP}/ferrum-k8s-tools/work"
-        mkdir -p "$install_dir" "$work_dir"
+        cache_dir="${RUNNER_TEMP}/ferrum-k8s-tools/cache"
+        mkdir -p "$install_dir" "$work_dir" "$cache_dir"
         echo "$install_dir" >> "$GITHUB_PATH"
 
         if [ "$INSTALL_KIND" = "true" ]; then
           require_sha256 "$KIND_SHA256" "kind-sha256"
-          kind_bin="${work_dir}/kind-linux-amd64"
+          kind_bin="${cache_dir}/kind-linux-amd64"
           # GitHub release assets are the authoritative kind provenance.
-          download \
+          restore_or_download \
+            "$kind_bin" \
             "https://github.com/kubernetes-sigs/kind/releases/download/${KIND_VERSION}/kind-linux-amd64" \
-            "$kind_bin"
+            "$KIND_SHA256" \
+            "kind ${KIND_VERSION}"
           assert_official_checksum_matches_pin \
             "https://github.com/kubernetes-sigs/kind/releases/download/${KIND_VERSION}/kind-linux-amd64.sha256sum" \
             "$KIND_SHA256" \
@@ -169,10 +203,12 @@ runs:
 
         if [ "$INSTALL_KUBECTL" = "true" ]; then
           require_sha256 "$KUBECTL_SHA256" "kubectl-sha256"
-          kubectl_bin="${work_dir}/kubectl"
-          download \
+          kubectl_bin="${cache_dir}/kubectl"
+          restore_or_download \
+            "$kubectl_bin" \
             "https://dl.k8s.io/release/${KUBECTL_VERSION}/bin/linux/amd64/kubectl" \
-            "$kubectl_bin"
+            "$KUBECTL_SHA256" \
+            "kubectl ${KUBECTL_VERSION}"
           assert_official_checksum_matches_pin \
             "https://dl.k8s.io/release/${KUBECTL_VERSION}/bin/linux/amd64/kubectl.sha256" \
             "$KUBECTL_SHA256" \
@@ -184,11 +220,13 @@ runs:
 
         if [ "$INSTALL_HELM" = "true" ]; then
           require_sha256 "$HELM_SHA256" "helm-sha256"
-          helm_archive="${work_dir}/helm-linux-amd64.tar.gz"
+          helm_archive="${cache_dir}/helm-linux-amd64.tar.gz"
           # Official Helm distribution host; never raw.githubusercontent.com/helm/helm/main.
-          download \
+          restore_or_download \
+            "$helm_archive" \
             "https://get.helm.sh/helm-${HELM_VERSION}-linux-amd64.tar.gz" \
-            "$helm_archive"
+            "$HELM_SHA256" \
+            "helm ${HELM_VERSION}"
           assert_official_checksum_matches_pin \
             "https://get.helm.sh/helm-${HELM_VERSION}-linux-amd64.tar.gz.sha256sum" \
             "$HELM_SHA256" \
