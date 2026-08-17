@@ -83,6 +83,13 @@ FIPS_PRODUCER_PATHS = (
     "${{ github.workspace }}/.cache/sccache",
 )
 SCCACHE_EXPORTERS = ("mozilla-actions/sccache-action",)
+SCCACHE_EXPORT_VARIABLE_CALL = re.compile(
+    r"""core\.exportVariable
+        (?:(?:\s+)|//[^\r\n]*(?:\r?\n|$)|/\*.*?\*/)*
+        (?:\(|\.\s*(?:call|apply|bind)\s*\()
+    """,
+    re.DOTALL | re.VERBOSE,
+)
 SCCACHE_PINNED_VERSION = "0.17.0"
 SCCACHE_RELEASE_DOWNLOAD = "https://github.com/mozilla/sccache/releases/download/"
 CREDENTIAL_ASSERT_VARS = (
@@ -769,7 +776,7 @@ def check_no_sccache_credential_exporter(
         # legitimately names the `core.exportVariable` API while documenting
         # that no installer calling it is invoked. Only an actual call site
         # (always followed by an argument list) is a credential leak.
-        "core.exportVariable(" not in text,
+        SCCACHE_EXPORT_VARIABLE_CALL.search(text) is None,
         f"{source} must not call core.exportVariable (ACTIONS_RUNTIME_TOKEN leak)",
         failures,
     )
@@ -3302,6 +3309,39 @@ def self_test() -> int:
     require(
         any("must not invoke credential-exporting installer" in item for item in exporter_failures),
         "self-test: mozilla-actions/sccache-action must fail",
+        failures,
+    )
+
+    export_variable_calls = (
+        "core.exportVariable('ACTIONS_RUNTIME_TOKEN', token)",
+        "core.exportVariable ('ACTIONS_RUNTIME_TOKEN', token)",
+        "core.exportVariable\n('ACTIONS_RUNTIME_TOKEN', token)",
+        "core.exportVariable/* indirect */('ACTIONS_RUNTIME_TOKEN', token)",
+        "core.exportVariable.call(core, 'ACTIONS_RUNTIME_TOKEN', token)",
+    )
+    for index, call in enumerate(export_variable_calls):
+        call_failures: list[str] = []
+        check_no_sccache_credential_exporter(
+            call,
+            f"self-test-export-variable-call-{index}",
+            call_failures,
+        )
+        require(
+            any("must not call core.exportVariable" in item for item in call_failures),
+            f"self-test: exportVariable invocation must fail: {call!r}",
+            failures,
+        )
+
+    export_variable_prose_failures: list[str] = []
+    check_no_sccache_credential_exporter(
+        "No installer calling the `core.exportVariable` API is invoked.",
+        "self-test-export-variable-prose",
+        export_variable_prose_failures,
+    )
+    require(
+        not export_variable_prose_failures,
+        "self-test: exportVariable prose must pass: "
+        + "; ".join(export_variable_prose_failures),
         failures,
     )
 
