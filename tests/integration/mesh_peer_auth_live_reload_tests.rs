@@ -487,6 +487,7 @@ async fn mesh_owner_scoped_dtls_publish_without_dtls_listeners() {
             dimpl_config: std::sync::Arc::new(dtls_config),
             certificate,
             client_cert_verifier: None,
+            client_trust: None,
         },
     );
     let (generation, swapped) = manager

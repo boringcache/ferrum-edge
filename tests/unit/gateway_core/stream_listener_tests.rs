@@ -2268,7 +2268,7 @@ async fn swap_frontend_tls_config_replaces_slot_without_reconcile() {
 async fn frontend_dtls_publish_records_generation_without_listeners() {
     let manager = create_manager(empty_config());
     let (_generation, swapped) = manager
-        .publish_frontend_dtls_generation(ephemeral_frontend_dtls_config())
+        .publish_frontend_dtls_generation(ephemeral_frontend_dtls_config(), false)
         .await;
     assert_eq!(swapped, 0, "no listeners should mean no live swaps");
     let generation = manager
@@ -2405,7 +2405,7 @@ async fn ordinary_dtls_build_failure_keeps_last_good_across_mesh_tcp_tls_swap() 
 async fn mesh_node_waypoint_dtls_publish_never_touches_the_ordinary_generation() {
     let manager = create_manager(empty_config());
     let (_generation, _swapped) = manager
-        .publish_frontend_dtls_generation(ephemeral_frontend_dtls_config())
+        .publish_frontend_dtls_generation(ephemeral_frontend_dtls_config(), false)
         .await;
     let ordinary_before = manager
         .snapshot_frontend_dtls_generation()
@@ -2444,7 +2444,7 @@ async fn mesh_node_waypoint_dtls_publish_never_touches_the_ordinary_generation()
         .snapshot_mesh_node_waypoint_dtls_generation()
         .expect("mesh generation published");
     let (_generation, _swapped) = manager
-        .publish_frontend_dtls_generation(ephemeral_frontend_dtls_config())
+        .publish_frontend_dtls_generation(ephemeral_frontend_dtls_config(), false)
         .await;
     let mesh_after = manager
         .snapshot_mesh_node_waypoint_dtls_generation()
