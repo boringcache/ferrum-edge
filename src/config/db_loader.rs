@@ -28,6 +28,7 @@ use crate::config::gateway_trust::GatewayTrustBundleRecord;
 use crate::config::namespace_registry::{
     NamespaceRegistryError as RegistryError, NamespaceRegistryPhase as RegistryPhase,
     check_namespace_registry_fault, namespace_registry_fault,
+    require_namespace_registry_admission_leases,
 };
 use crate::config::types::{
     AuthMode, BackendScheme, CircuitBreakerConfig, Consumer, DispatchKind, GatewayConfig,
@@ -8072,17 +8073,22 @@ impl DatabaseStore {
     /// global registry key and each affected namespace — inside the transaction
     /// that is about to commit.
     ///
-    /// Expiry is compared against the database's own clock, and the rows are
-    /// pinned (`FOR UPDATE`, or SQLite's transaction-wide writer lock) until
-    /// commit, so a competing acquirer cannot take a lease between this check
-    /// and the commit. A lost lease aborts the transaction: nothing becomes
-    /// durable and there is nothing to compensate.
+    /// The supplied key sequence must already be the canonical set for
+    /// `names`; a substituted slice is a lost lease and never reaches the
+    /// owner/generation check. Expiry is compared against the database's own
+    /// clock, and the rows are pinned (`FOR UPDATE`, or SQLite's
+    /// transaction-wide writer lock) until commit, so a competing acquirer
+    /// cannot take a lease between this check and the commit. A lost lease
+    /// aborts the transaction: nothing becomes durable and there is nothing to
+    /// compensate.
     async fn verify_namespace_registry_leases_tx(
         &self,
         tx: &mut sqlx::Transaction<'_, sqlx::Any>,
+        names: &[&str],
         leases: &[crate::config::batch_atomicity::NamespaceAdmissionLeaseHold<'_>],
         fault: Option<RegistryPhase>,
     ) -> Result<(), anyhow::Error> {
+        require_namespace_registry_admission_leases(names, leases).map_err(anyhow::Error::new)?;
         check_namespace_registry_fault(fault, RegistryPhase::LeaseLost)?;
         for hold in leases {
             self.verify_namespace_config_admission_lease_tx(tx, hold.key, &hold.lease)
@@ -8096,6 +8102,8 @@ impl DatabaseStore {
         record: &crate::config::namespace_registry::NamespaceRecord,
         leases: &[crate::config::batch_atomicity::NamespaceAdmissionLeaseHold<'_>],
     ) -> Result<(), anyhow::Error> {
+        require_namespace_registry_admission_leases(&[&record.name], leases)
+            .map_err(anyhow::Error::new)?;
         let fault = namespace_registry_fault(&record.name);
         let mut tx = self.pool().begin().await?;
         check_namespace_registry_fault(fault, RegistryPhase::Start)?;
@@ -8114,7 +8122,7 @@ impl DatabaseStore {
         .execute(&mut *tx)
         .await?;
         check_namespace_registry_fault(fault, RegistryPhase::RegistryRow)?;
-        self.verify_namespace_registry_leases_tx(&mut tx, leases, fault)
+        self.verify_namespace_registry_leases_tx(&mut tx, &[&record.name], leases, fault)
             .await?;
         check_namespace_registry_fault(fault, RegistryPhase::Commit)?;
         tx.commit().await?;
@@ -8135,6 +8143,8 @@ impl DatabaseStore {
         description: Option<Option<String>>,
         leases: &[crate::config::batch_atomicity::NamespaceAdmissionLeaseHold<'_>],
     ) -> Result<crate::config::namespace_registry::NamespaceRecord, anyhow::Error> {
+        require_namespace_registry_admission_leases(&[current_name, new_name], leases)
+            .map_err(anyhow::Error::new)?;
         let start = Instant::now();
         let renaming = new_name != current_name;
         let fault = namespace_registry_fault(current_name);
@@ -8193,8 +8203,13 @@ impl DatabaseStore {
             self.upsert_namespace_registry_row_tx(&mut tx, current_name, &record, &now_rfc)
                 .await?;
             check_namespace_registry_fault(fault, RegistryPhase::RegistryRow)?;
-            self.verify_namespace_registry_leases_tx(&mut tx, leases, fault)
-                .await?;
+            self.verify_namespace_registry_leases_tx(
+                &mut tx,
+                &[current_name, new_name],
+                leases,
+                fault,
+            )
+            .await?;
             check_namespace_registry_fault(fault, RegistryPhase::Commit)?;
             tx.commit().await?;
             self.check_slow_query("update_namespace", start);
@@ -8203,7 +8218,7 @@ impl DatabaseStore {
 
         self.rename_namespace_in_tx(&mut tx, current_name, new_name, &record, &now_rfc, fault)
             .await?;
-        self.verify_namespace_registry_leases_tx(&mut tx, leases, fault)
+        self.verify_namespace_registry_leases_tx(&mut tx, &[current_name, new_name], leases, fault)
             .await?;
         check_namespace_registry_fault(fault, RegistryPhase::Commit)?;
         tx.commit().await?;
@@ -8443,6 +8458,8 @@ impl DatabaseStore {
         cascade: bool,
         leases: &[crate::config::batch_atomicity::NamespaceAdmissionLeaseHold<'_>],
     ) -> Result<bool, anyhow::Error> {
+        require_namespace_registry_admission_leases(&[name], leases)
+            .map_err(anyhow::Error::new)?;
         let start = Instant::now();
         let fault = namespace_registry_fault(name);
         if name == self.effective_default_namespace {
@@ -8497,7 +8514,7 @@ impl DatabaseStore {
         }
         check_namespace_registry_fault(fault, RegistryPhase::LastNamespaceCheck)?;
 
-        self.verify_namespace_registry_leases_tx(&mut tx, leases, fault)
+        self.verify_namespace_registry_leases_tx(&mut tx, &[name], leases, fault)
             .await?;
         check_namespace_registry_fault(fault, RegistryPhase::Commit)?;
         tx.commit().await?;

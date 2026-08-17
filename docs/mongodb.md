@@ -334,7 +334,15 @@ document, the consumer identity index, the gateway trust bundle, the tenant's
 route-bucket lock documents, and the polling change records; and every registry
 mutation re-verifies its namespace-admission leases *inside* the committing
 transaction so a lost or stolen lease can never produce a durable write.
-Historical `audit_events` documents are immutable evidence and are **not**
+The backend also requires the exact canonical lease-key sequence (global
+`!namespace-registry` first, then affected names sorted and de-duplicated)
+before opening that transaction; an incomplete or substituted set is the same
+retryable lost-lease refusal. Confirmed cascade delete scans both the embedded
+`namespace` field and the durable key identity for consumers, the consumer
+identity index, and the gateway trust bundle, and aborts as typed registry
+corruption if those identities disagree, so a key-only or mismatched document
+cannot be ignored or deleted under the wrong tenant. Historical `audit_events`
+documents are immutable evidence and are **not**
 bulk-rewritten on rename: they retain the namespace recorded when the event
 occurred. Last-remaining protection is a remaining **registry document**, not
 the GET union of derived resource names: ordinary resource CRUD is not
