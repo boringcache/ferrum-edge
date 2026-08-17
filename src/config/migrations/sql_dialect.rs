@@ -68,6 +68,11 @@
 //! aid `ALTER TABLE DROP CONSTRAINT` but do not change enforcement behavior.
 //! The inline tests below regression-guard this cross-dialect consistency.
 
+use crate::config::db_loader::{
+    CONFIG_ADMISSION_LEASE_DURATION_MILLIS, config_admission_lease_acquire_sql,
+    config_admission_lease_now_sql, rewrite_query_placeholders,
+};
+use crate::config::namespace_registry::NAMESPACE_REGISTRY_ADMISSION_KEY;
 use sqlx::{AnyConnection, Row};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -643,7 +648,167 @@ impl V001SqlBuilder {
         sqlx::query(self.create_schema_compat_sql())
             .execute(&mut *connection)
             .await?;
-        self.backfill_namespaces_registry(connection).await
+        self.run_serialized_namespaces_registry_backfill(connection)
+            .await
+    }
+
+    /// Run the one-time compatibility pass under the SAME global
+    /// `!namespace-registry` admission lease every live create / rename /
+    /// delete takes.
+    ///
+    /// Without that lease the pass reads derived names and inserts registry
+    /// rows outside the authority live namespace CRUD serializes on, so a
+    /// confirmed `DELETE /namespaces/{name}` could commit between the read and
+    /// the insert and have its row resurrected before the completion marker
+    /// landed. The lease is the whole fence: it is the first key in the
+    /// established total lock order (global first, then affected names
+    /// ascending), so taking only it can never invert that order or deadlock
+    /// against a concurrent registry mutation. It is a datastore row, not a
+    /// process-local mutex, so it serializes across gateway processes as well.
+    ///
+    /// A lease held elsewhere is not an error: the completion marker stays
+    /// absent, which is exactly the crash-retry state, and the next
+    /// connect / migrate / reconnect pass tries again.
+    async fn run_serialized_namespaces_registry_backfill(
+        &self,
+        connection: &mut AnyConnection,
+    ) -> Result<(), anyhow::Error> {
+        // Unfenced fast path. On every startup after the first completed pass
+        // this single SELECT is the entire cost of the backfill. It is only an
+        // optimization: the authoritative check runs inside the fenced
+        // transaction, so two processes cannot both seed.
+        if self
+            .namespaces_registry_backfill_completed(connection)
+            .await?
+        {
+            return Ok(());
+        }
+
+        let owner = uuid::Uuid::new_v4().to_string();
+        let Some(generation) = self
+            .try_acquire_namespaces_registry_backfill_lease(connection, &owner)
+            .await?
+        else {
+            tracing::info!(
+                "Namespace registry compatibility backfill deferred: the global registry \
+                 admission lease is held by another mutation; a later startup retries"
+            );
+            return Ok(());
+        };
+
+        // Always release, on success AND on error, so a failed pass cannot hold
+        // the global registry key for the rest of its lease and stall live
+        // namespace CRUD. Lease expiry stays the backstop for a hard crash.
+        let backfill = self
+            .backfill_namespaces_registry(connection, &owner, generation)
+            .await;
+        let release = self
+            .release_namespaces_registry_backfill_lease(connection, &owner)
+            .await;
+        match (backfill, release) {
+            (Ok(()), Ok(())) => Ok(()),
+            (Err(backfill_error), _) => Err(backfill_error),
+            (Ok(()), Err(release_error)) => Err(release_error),
+        }
+    }
+
+    /// Conditionally take the global registry admission lease.
+    ///
+    /// Returns the acquired generation, or `None` when an unexpired owner still
+    /// holds it. The statement itself never steals an unexpired lease — it is
+    /// the identical acquisition the runtime store uses for namespace
+    /// admission, so both paths share one ownership rule.
+    async fn try_acquire_namespaces_registry_backfill_lease(
+        &self,
+        connection: &mut AnyConnection,
+        owner: &str,
+    ) -> Result<Option<i64>, anyhow::Error> {
+        let acquire_sql = config_admission_lease_acquire_sql(self.db_type());
+        sqlx::query(&acquire_sql)
+            .bind(NAMESPACE_REGISTRY_ADMISSION_KEY)
+            .bind(owner)
+            .bind(CONFIG_ADMISSION_LEASE_DURATION_MILLIS)
+            .execute(&mut *connection)
+            .await?;
+
+        let now = config_admission_lease_now_sql(self.db_type());
+        let sql = self.q(&format!(
+            "SELECT generation FROM config_admission_locks \
+             WHERE namespace = ? AND owner = ? AND expires_at > {now}"
+        ));
+        let generation = sqlx::query_scalar::<_, i64>(&sql)
+            .bind(NAMESPACE_REGISTRY_ADMISSION_KEY)
+            .bind(owner)
+            .fetch_optional(&mut *connection)
+            .await;
+        match generation {
+            Ok(generation) => Ok(generation),
+            Err(error) => {
+                // The acquisition statement may already have taken the row, so
+                // an ambiguous lookup must not leave the global registry key
+                // owned for a full lease duration.
+                self.release_namespaces_registry_backfill_lease(connection, owner)
+                    .await?;
+                Err(error.into())
+            }
+        }
+    }
+
+    async fn release_namespaces_registry_backfill_lease(
+        &self,
+        connection: &mut AnyConnection,
+        owner: &str,
+    ) -> Result<(), anyhow::Error> {
+        let sql = self.q("UPDATE config_admission_locks SET expires_at = 0 \
+             WHERE namespace = ? AND owner = ?");
+        sqlx::query(&sql)
+            .bind(NAMESPACE_REGISTRY_ADMISSION_KEY)
+            .bind(owner)
+            .execute(&mut *connection)
+            .await?;
+        Ok(())
+    }
+
+    /// Confirm the global registry lease is still owned at this generation and
+    /// unexpired, pinned until commit.
+    ///
+    /// `FOR UPDATE` holds the lease row so a competing acquirer cannot take the
+    /// global key between this check and the commit. SQLite has no
+    /// `FOR UPDATE`, but the transaction is already holding the database writer
+    /// lock from the registry inserts above, which gives the same exclusion.
+    async fn namespaces_registry_backfill_lease_held(
+        &self,
+        connection: &mut AnyConnection,
+        owner: &str,
+        generation: i64,
+    ) -> Result<bool, anyhow::Error> {
+        let now = config_admission_lease_now_sql(self.db_type());
+        let for_update = if self.is_sqlite() { "" } else { " FOR UPDATE" };
+        let sql = self.q(&format!(
+            "SELECT 1 FROM config_admission_locks \
+             WHERE namespace = ? AND owner = ? AND generation = ? AND expires_at > {now}{for_update}"
+        ));
+        Ok(sqlx::query(&sql)
+            .bind(NAMESPACE_REGISTRY_ADMISSION_KEY)
+            .bind(owner)
+            .bind(generation)
+            .fetch_optional(&mut *connection)
+            .await?
+            .is_some())
+    }
+
+    /// Rewrite `?` placeholders for the active dialect, exactly as the runtime
+    /// store does.
+    fn q(&self, sql: &str) -> String {
+        rewrite_query_placeholders(self.db_type(), sql)
+    }
+
+    fn db_type(&self) -> &'static str {
+        match self.dialect {
+            SqlDialect::Postgres => "postgres",
+            SqlDialect::MySql => "mysql",
+            SqlDialect::Sqlite => "sqlite",
+        }
     }
 
     fn create_schema_compat_sql(&self) -> &'static str {
@@ -704,14 +869,29 @@ impl V001SqlBuilder {
         Ok(())
     }
 
+    /// The compatibility pass itself, fenced by `owner`/`generation` on the
+    /// global registry admission lease and committed as ONE transaction.
+    ///
+    /// Everything the pass reads and writes — the authoritative completion
+    /// check, the derived-name scan, the canonical `ferrum` seed, and the
+    /// completion marker — lives inside that single transaction, so a crash or
+    /// an abort leaves the marker absent and the next startup retries the same
+    /// idempotent statements. The marker is still written last within the
+    /// transaction so the ordering contract reads the same way it always did.
     async fn backfill_namespaces_registry(
         &self,
         connection: &mut AnyConnection,
+        owner: &str,
+        generation: i64,
     ) -> Result<(), anyhow::Error> {
-        if self
-            .namespaces_registry_backfill_completed(connection)
-            .await?
-        {
+        use sqlx::Connection;
+
+        let mut tx = connection.begin().await?;
+
+        // Authoritative completion check, inside the fence: two processes can
+        // never both observe an absent marker and both seed.
+        if self.namespaces_registry_backfill_completed(&mut tx).await? {
+            tx.rollback().await?;
             return Ok(());
         }
 
@@ -755,7 +935,7 @@ impl V001SqlBuilder {
         sqlx::query(insert_derived)
             .bind(&now)
             .bind(&now)
-            .execute(&mut *connection)
+            .execute(&mut *tx)
             .await?;
 
         let insert_default = if self.is_mysql() {
@@ -778,15 +958,32 @@ impl V001SqlBuilder {
             .bind(crate::config::types::DEFAULT_NAMESPACE)
             .bind(&now)
             .bind(&now)
-            .execute(&mut *connection)
+            .execute(&mut *tx)
             .await?;
 
-        // Marker last: a crash before this write leaves completion absent so
-        // the next serialized compatibility pass retries the idempotent
-        // inserts. This must not be a namespaces row — GET /namespaces would
-        // then list it as a tenant.
-        self.mark_namespaces_registry_backfill_complete(connection, &now)
+        // Marker last: it is the final write in the transaction, so an abort or
+        // a crash leaves completion absent and the next serialized
+        // compatibility pass retries the idempotent inserts. This must not be a
+        // namespaces row — GET /namespaces would then list it as a tenant.
+        self.mark_namespaces_registry_backfill_complete(&mut tx, &now)
             .await?;
+
+        // Commit-boundary fence, exactly like every live registry mutation: the
+        // global lease must still be owned at the acquired generation. A lost
+        // lease rolls the whole pass back with the marker absent, so nothing is
+        // resurrected and a later startup retries.
+        if !self
+            .namespaces_registry_backfill_lease_held(&mut tx, owner, generation)
+            .await?
+        {
+            tx.rollback().await?;
+            tracing::warn!(
+                "Namespace registry compatibility backfill rolled back: the global registry \
+                 admission lease was no longer held at the commit boundary; a later startup retries"
+            );
+            return Ok(());
+        }
+        tx.commit().await?;
         Ok(())
     }
 

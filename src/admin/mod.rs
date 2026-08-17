@@ -9119,6 +9119,18 @@ fn maybe_enforce_namespace_claim(
     enforce_namespace_claim(auth, name, path)
 }
 
+/// Detail record for a name that exists only as a derived resource namespace
+/// (or, in file mode, only in the loaded config).
+///
+/// There is no durable registry row, so there is no durable history either:
+/// `created_at`/`updated_at` are **observation timestamps** stamped when the
+/// request is served, not stable registry metadata. Two `GET`s of the same
+/// derived-only namespace return two different values, and they must not be
+/// compared, cached as identity, or used for ordering. A `POST /namespaces` or
+/// a `PUT` that materializes the row is what gives the tenant durable
+/// timestamps. Both timestamps stay required in the response schema so clients
+/// never have to special-case a missing field; this repair deliberately does
+/// not fabricate durable history for a row that does not exist.
 fn synthesized_namespace_record(name: &str) -> crate::config::namespace_registry::NamespaceRecord {
     crate::config::namespace_registry::NamespaceRecord::new(name.to_string(), None, Utc::now())
 }
@@ -9197,6 +9209,30 @@ fn map_namespace_registry_error(error: &anyhow::Error) -> Response<Full<Bytes>> 
             &json!({"error": "namespace already exists"}),
         );
     }
+    // The database itself aborted the committing transaction as a serialization
+    // failure or deadlock victim — PostgreSQL `40001`/`40P01` under the
+    // REPEATABLE READ capture a rename/delete uses, which the independent
+    // 30-second admission-lease renewer can trigger by updating
+    // `config_admission_locks` between this transaction's snapshot and its
+    // final `SELECT ... FOR UPDATE`. Nothing committed, so this is the same
+    // fail-closed, safe-to-retry answer a lost lease gets rather than a `500`.
+    // Classified after the uniqueness branch so a real name conflict — which a
+    // retry would only repeat — can never land here.
+    if crate::config::namespace_registry::is_namespace_registry_retryable_conflict(error) {
+        use crate::config::namespace_registry::NAMESPACE_REGISTRY_RETRYABLE_CONFLICT_MESSAGE;
+        error_persistence_failure_redacted("namespace_registry_transaction_conflict");
+        let mut response = json_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            &json!({
+                "error": NAMESPACE_REGISTRY_RETRYABLE_CONFLICT_MESSAGE,
+                "rollback": "not_needed",
+            }),
+        );
+        response
+            .headers_mut()
+            .insert(RETRY_AFTER, HeaderValue::from_static("1"));
+        return response;
+    }
     json_response(StatusCode::INTERNAL_SERVER_ERROR, &db_error_response(error))
 }
 
@@ -9254,12 +9290,16 @@ where
 
 /// Registry names a handler refuses to mutate, as the typed conflict error so
 /// the wire shape matches every other registry 409.
-fn protected_namespace_response(name: &str, reason: &'static str) -> Response<Full<Bytes>> {
-    map_namespace_registry_error(&anyhow::Error::new(
-        crate::config::namespace_registry::NamespaceRegistryError::Protected {
-            name: name.to_string(),
-            reason,
-        },
+///
+/// The reason is a fixed constant naming only the configuration keys an
+/// operator can change: it must never enumerate the rest of the configured
+/// namespace set, which would let a caller probe which tenants this gateway
+/// serves.
+fn protected_namespace_response(name: &str) -> Response<Full<Bytes>> {
+    use crate::config::namespace_registry::NamespaceRegistryError as RegistryError;
+    map_namespace_registry_error(&RegistryError::protected(
+        name,
+        RegistryError::PROTECTED_CONFIGURED_NAMESPACE,
     ))
 }
 
@@ -9532,14 +9572,13 @@ async fn handle_update_namespace(
         ));
     }
 
-    // A rename is semantically a removal of the old name, so the namespace this
-    // gateway is configured to serve is protected from it. Checked again inside
-    // the backend transaction — this precheck only produces a better message.
-    if new_name != current_name && current_name == db.effective_default_namespace() {
-        return Ok(protected_namespace_response(
-            current_name,
-            crate::config::namespace_registry::NamespaceRegistryError::PROTECTED_PROCESS_DEFAULT,
-        ));
+    // A rename is semantically a removal of the old name, so every namespace
+    // this gateway is configured to serve — the resolved `FERRUM_NAMESPACE`
+    // plus, on a control plane, each explicitly configured
+    // `FERRUM_CP_NAMESPACES` entry — is protected from it. Checked again inside
+    // the backend transaction; this precheck only produces a better message.
+    if new_name != current_name && db.is_protected_namespace(current_name) {
+        return Ok(protected_namespace_response(current_name));
     }
 
     // Global registry key first, then source and target in ascending order.
@@ -9619,15 +9658,13 @@ async fn handle_delete_namespace(
             &unsupported,
         ));
     }
-    // The effective configured namespace of this process — resolved once at
-    // startup through EnvConfig, never re-read from the environment here.
-    // Re-checked inside the backend transaction; this precheck only avoids
-    // taking leases for a request that cannot succeed.
-    if name == db.effective_default_namespace() {
-        return Ok(protected_namespace_response(
-            name,
-            crate::config::namespace_registry::NamespaceRegistryError::PROTECTED_PROCESS_DEFAULT,
-        ));
+    // The namespaces this process is configured to serve — resolved once at
+    // startup through EnvConfig (FERRUM_NAMESPACE, plus every explicit
+    // FERRUM_CP_NAMESPACES entry on a control plane), never re-read from the
+    // environment here. Re-checked inside the backend transaction; this
+    // precheck only avoids taking leases for a request that cannot succeed.
+    if db.is_protected_namespace(name) {
+        return Ok(protected_namespace_response(name));
     }
     let cascade = parse_restore_confirm(query);
     // The last-remaining-namespace invariant is NOT prechecked here: two

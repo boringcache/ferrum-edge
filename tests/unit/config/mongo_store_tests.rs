@@ -2007,33 +2007,123 @@ fn mongo_namespace_registry_reads_validate_both_identity_surfaces() {
 }
 
 #[test]
-fn mongo_namespace_delete_rechecks_protected_default_in_session() {
+fn mongo_namespace_delete_rechecks_protected_namespaces_in_session() {
     let session = mongo_method("delete_namespace_in_session(");
     assert!(
-        session.contains("plan.protected_default")
-            && session.contains("PROTECTED_PROCESS_DEFAULT")
+        session.contains("plan.protected_namespaces")
+            && session.contains("PROTECTED_CONFIGURED_NAMESPACE")
             && session.contains("namespace_protected_abort"),
-        "delete must recheck the configured namespace inside the committing transaction:\n{session}"
+        "delete must recheck the whole configured set inside the committing transaction:\n{session}"
     );
     let start_at = session
         .find("NamespaceRegistryPhase::Start")
         .expect("start fault");
     let protected_at = session
-        .find("plan.protected_default")
-        .expect("protected default");
+        .find("plan.protected_namespaces")
+        .expect("protected namespaces");
     let occupancy_at = session
         .find("namespace_name_in_use_in_session")
         .expect("existence check");
     assert!(
         start_at < protected_at && protected_at < occupancy_at,
-        "protected-default must be rechecked at the start of the session callback:\n{session}"
+        "the protected set must be rechecked at the start of the session callback:\n{session}"
     );
 
     let outer = mongo_method("delete_namespace(");
     assert!(
-        outer.contains("effective_default_namespace")
-            && outer.contains("PROTECTED_PROCESS_DEFAULT"),
+        outer.contains("protected_namespaces_contains(&self.protected_namespaces")
+            && outer.contains("PROTECTED_CONFIGURED_NAMESPACE"),
         "the outer precheck may stay for a fast response:\n{outer}"
+    );
+}
+
+/// Every namespace this process is configured to serve — `FERRUM_NAMESPACE`
+/// plus each explicit `FERRUM_CP_NAMESPACES` entry — must reach the committing
+/// transaction, not just the one resolved default (issue #3955 review).
+#[test]
+fn mongo_namespace_registry_plan_carries_the_whole_protected_set() {
+    for method in [
+        "create_namespace(",
+        "update_namespace(",
+        "delete_namespace(",
+    ] {
+        let body = mongo_method(method);
+        assert!(
+            body.contains("protected_namespaces: self.protected_namespaces.clone()"),
+            "{method} must hand the whole configured set to the transaction plan:\n{body}"
+        );
+    }
+    let rename = mongo_method("update_namespace_in_session(");
+    assert!(
+        rename.contains("protected_namespaces_contains(&plan.protected_namespaces, current_name)")
+            && rename.contains("PROTECTED_CONFIGURED_NAMESPACE"),
+        "rename-away must be refused for every configured namespace in-session:\n{rename}"
+    );
+    assert!(
+        !MONGO_STORE_SOURCE.contains("effective_default_namespace"),
+        "the single-namespace protection field must be fully replaced by the protected set"
+    );
+}
+
+/// The one-time compatibility backfill must serialize against live namespace
+/// CRUD on the same global registry admission key (issue #3955 review).
+#[test]
+fn mongo_namespace_registry_backfill_holds_the_global_registry_lease() {
+    let entry = mongo_method("backfill_namespaces_registry(");
+    let acquire_at = entry
+        .find("try_acquire_namespace_config_admission_lease")
+        .expect("the pass must take the global registry admission lease");
+    let under_at = entry
+        .find(".backfill_namespaces_registry_under_lease(")
+        .expect("the pass must run under that lease");
+    let release_at = entry
+        .find("release_namespace_config_admission_lease")
+        .expect("the pass must release the lease");
+    assert!(
+        acquire_at < under_at && under_at < release_at,
+        "the lease must be held across the whole compatibility pass:\n{entry}"
+    );
+    assert!(
+        entry.contains("NAMESPACE_REGISTRY_ADMISSION_KEY"),
+        "the pass must use the SAME global key live registry mutations take:\n{entry}"
+    );
+    assert!(
+        entry.contains("(Err(backfill_error), _) => Err(backfill_error)"),
+        "the lease must be released on the error path too, without masking the failure:\n{entry}"
+    );
+
+    let body = mongo_method("backfill_namespaces_registry_under_lease(");
+    let completed_at = body
+        .find("namespaces_registry_backfill_completed")
+        .expect("authoritative completion check under the lease");
+    let scan_at = body.find("distinct_namespaces").expect("derived-name scan");
+    let first_hold_at = body
+        .find("namespaces_registry_backfill_lease_still_held")
+        .expect("ownership re-proof before the upserts");
+    let upsert_at = body.find("namespaces()").expect("registry upserts");
+    let validate_at = body
+        .find("registry_namespace_names")
+        .expect("registry identity validation before completion");
+    let mark_at = body
+        .find("mark_namespaces_registry_backfill_complete")
+        .expect("completion mark");
+    let last_hold_at = body
+        .rfind("namespaces_registry_backfill_lease_still_held")
+        .expect("ownership re-proof before the marker");
+    assert!(
+        completed_at < scan_at && scan_at < first_hold_at && first_hold_at < upsert_at,
+        "ownership must be re-proved between the derived scan and the upserts:\n{body}"
+    );
+    assert!(
+        upsert_at < validate_at && validate_at < last_hold_at && last_hold_at < mark_at,
+        "ownership must be re-proved again immediately before the completion marker:\n{body}"
+    );
+
+    let renew = mongo_method("namespaces_registry_backfill_lease_still_held(");
+    assert!(
+        renew.contains("renew_namespace_config_admission_lease")
+            && renew.contains("NAMESPACE_REGISTRY_ADMISSION_KEY"),
+        "ownership must be re-proved by a conditional server-clock renewal:\n{renew}"
     );
 }
 

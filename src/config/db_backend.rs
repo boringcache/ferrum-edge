@@ -2199,24 +2199,44 @@ pub trait DatabaseBackend: NamespaceConfigAdmissionLeaseBackend + Send + Sync {
             .is_some())
     }
 
-    /// The namespace this process is configured to serve — the already-resolved
-    /// `FERRUM_NAMESPACE` value, applied once at startup through
-    /// [`Self::set_effective_default_namespace`] so no request-time code has to
-    /// re-read the process environment (which would bypass the
+    /// The namespaces this process is configured to serve, sorted and
+    /// de-duplicated.
+    ///
+    /// Applied once at startup through [`Self::set_protected_namespaces`] from
+    /// the already-resolved `EnvConfig`, so no request-time code has to re-read
+    /// the process environment (which would bypass the
     /// CLI > env > conf-file > default precedence `EnvConfig` already applied).
     ///
-    /// This namespace is protected from DELETE **and** from rename-away: a
-    /// rename is semantically a removal of the old name, and the gateway would
-    /// be left serving a namespace that no longer exists. A description-only
+    /// Database mode contributes its resolved `FERRUM_NAMESPACE`. A control
+    /// plane additionally contributes every explicitly configured
+    /// `FERRUM_CP_NAMESPACES` entry, because `CpScope::Single`/`Set` keeps
+    /// polling exactly those names forever: removing or renaming one would
+    /// leave the CP polling a namespace that no longer exists, and every DP
+    /// subscribed to it would converge to empty configuration until the process
+    /// was restarted. `FERRUM_CP_NAMESPACES=*` is dynamic and contributes
+    /// nothing beyond `FERRUM_NAMESPACE`.
+    ///
+    /// Every namespace here is protected from DELETE **and** from rename-away:
+    /// a rename is semantically a removal of the old name. A description-only
     /// update remains allowed.
-    fn effective_default_namespace(&self) -> &str {
-        crate::config::types::DEFAULT_NAMESPACE
+    fn protected_namespaces(&self) -> &[String] {
+        crate::config::namespace_registry::default_protected_namespaces()
     }
 
-    /// Apply the resolved `FERRUM_NAMESPACE` after store construction, the same
-    /// way [`Self::set_failover_allow_writes`] applies its env-derived setting.
-    fn set_effective_default_namespace(&mut self, namespace: &str) {
-        let _ = namespace;
+    /// Apply the resolved protected namespace set after store construction, the
+    /// same way [`Self::set_failover_allow_writes`] applies its env-derived
+    /// setting. Implementations normalize through
+    /// [`crate::config::namespace_registry::normalize_protected_namespaces`].
+    fn set_protected_namespaces(&mut self, namespaces: &[String]) {
+        let _ = namespaces;
+    }
+
+    /// True when `name` may not be deleted or renamed away.
+    fn is_protected_namespace(&self, name: &str) -> bool {
+        crate::config::namespace_registry::protected_namespaces_contains(
+            self.protected_namespaces(),
+            name,
+        )
     }
 
     /// Whether this backend deployment can commit a namespace registry

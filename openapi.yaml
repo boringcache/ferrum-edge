@@ -66,13 +66,25 @@ info:
     those lease identities against the datastore's own clock immediately before
     commit. Occupancy, target vacancy, protection of the configured namespace,
     and the last remaining **registry row** are all decided inside that
-    transaction, so nothing partial can become durable. `GET /namespaces`
+    transaction, so nothing partial can become durable. The namespaces this
+    process is configured to serve are protected from delete and rename-away:
+    the resolved `FERRUM_NAMESPACE` in database mode, plus every explicitly
+    configured `FERRUM_CP_NAMESPACES` entry on a control plane
+    (`FERRUM_CP_NAMESPACES=*` is dynamic and protects only `FERRUM_NAMESPACE`).
+    The set is resolved once at startup and never re-read per request. If the
+    database itself aborts the committing transaction as a serialization
+    failure or deadlock victim, nothing became durable and the endpoint answers
+    the retryable `503` (with `Retry-After` and `rollback: not_needed`) rather
+    than a `500`. `GET /namespaces`
     remains the backward-compatible union of registry names and derived
     resource names; ordinary resource writes isolate data but do not insert
     registry rows. Historical audit rows are never renamed or deleted, so a
     namespace name is a durable audit identity: reusing a deleted or renamed
     name resumes its prior `GET /audit` history for callers authorized for that
-    name. Assign unrelated tenants fresh, previously unused names. Standalone MongoDB has
+    name. Assign unrelated tenants fresh, previously unused names. The one-time
+    connect/migrate compatibility backfill of pre-existing derived names takes
+    that same global registry lease, so it can never resurrect a namespace a
+    concurrent confirmed `DELETE` removed. Standalone MongoDB has
     no multi-document transactions and therefore refuses these three operations
     with `501` before mutating anything; `GET` remains available.
 
@@ -4109,6 +4121,14 @@ paths:
         and `POST /restore` (full replacement). Consumer credentials are
         included **unredacted** since this is a backup endpoint.
 
+        The payload carries namespace-**scoped configuration resources** only.
+        It deliberately does NOT carry the namespace registry row itself — the
+        namespace `description` and its registry `created_at`/`updated_at` are
+        not exported, because `POST /restore` writes into the authenticated
+        target namespace and must not transplant a source tenant's metadata
+        into a different target. Manage that metadata with
+        `POST /namespaces` and `PUT /namespaces/{name}`.
+
         Falls back to the in-memory cached configuration when the database is
         unavailable, indicated by the `X-Data-Source: cached` response header.
 
@@ -4223,6 +4243,34 @@ paths:
         Accepts the same JSON format produced by `GET /backup`. Resources are
         imported in dependency order (consumers & upstreams first, then proxies,
         then plugin configs, then API specs).
+
+        ### Namespace registry metadata is out of scope
+
+        The payload carries namespace-scoped configuration resources, not the
+        namespace registry row. Restoring **in place** therefore preserves the
+        target namespace's registry metadata (description and registry
+        timestamps) unchanged, including across the destructive clear.
+        Importing into a **fresh target** yields a namespace that holds
+        resources but has no registry row and therefore no description — a
+        derived-only namespace, for which `GET /namespaces/{name}` synthesizes
+        a record with observation timestamps. Use `POST /namespaces` or
+        `PUT /namespaces/{name}` to materialize a durable registry row. This is
+        intentional: restore targets an authenticated namespace and must not
+        transplant source-tenant metadata into a different target.
+
+        ### MongoDB: malformed split identities are refused
+
+        On MongoDB the destructive clear uses the same strict namespace cascade
+        as namespace `DELETE ?confirm=true`. It validates each consumer and
+        consumer-identity-index document's durable
+        `_id = "{namespace}:{suffix}"` against the embedded `namespace` and
+        identity value before deleting anything, and deletes only validated
+        identities. A split identity — which only a hand-edited database or an
+        out-of-band writer can produce — now aborts the restore as typed
+        registry corruption (a redacted `500`, rolled back, prior configuration
+        retained) instead of being deleted blindly. Deleting a document whose
+        durable key belongs to another tenant would be a cross-tenant deletion,
+        and ignoring it would leave the target half-cleared before the import.
 
         Restore normalizes the submitted payload once before validation — the
         same `normalize_fields()` admission used by CRUD, batch, file mode, and
@@ -5636,6 +5684,10 @@ paths:
         when they have zero resources. In file mode, returns the namespaces
         captured at file load time (before namespace filtering).
 
+        The envelope carries name strings only, so it exposes no timestamps.
+        Detail records for derived-only names are synthesized — see
+        `GET /namespaces/{name}`.
+
         Viewer and operator roles may call this endpoint. When
         `FERRUM_ADMIN_REQUIRE_NAMESPACE_CLAIM=true`, results are filtered to
         the JWT `ns` claim; a token with no claim receives an empty list
@@ -5740,7 +5792,19 @@ paths:
         Returns the registry record for `name`. A name that exists only as a
         derived resource namespace (written under `X-Ferrum-Namespace` without
         a registry row) is still returned as a synthesized detail record.
-        Ordinary resource writes do not insert registry rows. Viewer and operator
+        Ordinary resource writes do not insert registry rows.
+
+        For such a synthesized record — and for every record file mode returns
+        — `created_at` and `updated_at` are **observation timestamps stamped
+        when the request was served**, not stable registry metadata. There is
+        no durable row behind them, so two `GET`s of the same derived-only
+        namespace return two different values; do not compare them, cache them
+        as identity, or order by them. `POST /namespaces` (or a `PUT` that
+        materializes the row) is what gives a tenant durable timestamps. Both
+        fields stay required so clients never have to special-case a missing
+        field.
+
+        Viewer and operator
         roles may call this endpoint. When
         `FERRUM_ADMIN_REQUIRE_NAMESPACE_CLAIM=true`, a token that cannot
         address `name` receives `403`.
@@ -5796,10 +5860,19 @@ paths:
         `name: null` and any non-string value are `400` with nothing mutated.
 
         Returns `409` when the target name already exists, and `409` when the
-        current name is the namespace this gateway is configured to serve
-        (`FERRUM_NAMESPACE`, default `ferrum`): a rename is semantically a
-        removal of the old name. A description-only update of that namespace
-        is allowed. Admin role required. File mode returns `403`. When
+        current name is one of the namespaces this gateway is configured to
+        serve: a rename is semantically a removal of the old name. That set is
+        the resolved `FERRUM_NAMESPACE` (default `ferrum`) in database mode,
+        plus every explicitly configured `FERRUM_CP_NAMESPACES` entry on a
+        control plane — `CpScope::Single`/`Set` polls exactly those names for
+        the life of the process, so renaming one away would leave the control
+        plane polling a namespace that no longer exists and its DPs converging
+        to empty configuration. `FERRUM_CP_NAMESPACES=*` is dynamic and
+        contributes nothing beyond `FERRUM_NAMESPACE`. The `409` reason is a
+        fixed string naming those two configuration keys and never enumerates
+        the rest of the configured set. A description-only update of a
+        protected namespace is allowed. Admin role required. File mode returns
+        `403`. When
         `FERRUM_ADMIN_REQUIRE_NAMESPACE_CLAIM=true`, the token must be
         allowed to address both the current name and the new name.
       tags: [Namespaces]
@@ -5860,9 +5933,15 @@ paths:
         reused name; an unrelated tenant must receive a fresh, previously unused
         name.
 
-        The namespace this gateway is configured to serve (`FERRUM_NAMESPACE`,
-        default `ferrum`) cannot be deleted, and the last remaining **registry
-        row** cannot be deleted — the latter is re-evaluated at the commit
+        The namespaces this gateway is configured to serve cannot be deleted —
+        the resolved `FERRUM_NAMESPACE` (default `ferrum`) in database mode,
+        plus every explicitly configured `FERRUM_CP_NAMESPACES` entry on a
+        control plane (`FERRUM_CP_NAMESPACES=*` is dynamic and contributes
+        nothing beyond `FERRUM_NAMESPACE`). The set is resolved once at startup
+        and re-checked inside the committing transaction, and the `409` reason
+        is a fixed string naming those two configuration keys rather than
+        enumerating the set. The last remaining **registry
+        row** likewise cannot be deleted — the latter is re-evaluated at the commit
         boundary against durable `namespaces` rows (not the GET union of
         derived resource names), so two gateways cannot each observe two
         registry rows and concurrently delete a different one. Ordinary
@@ -6858,10 +6937,22 @@ components:
             $ref: "#/components/schemas/Error"
     NamespaceAdmissionUnavailable:
       description: >-
-        The mutation is temporarily unavailable. For namespace contention, the
-        namespace is fenced by another mutation or an intentionally retained
-        uncertain operation; retry after the indicated delay. Operators must
-        recover a retained uncertain fence before retries can succeed.
+        The mutation is temporarily unavailable and **nothing was applied**;
+        retry after the indicated delay. Three fail-closed outcomes share this
+        response. (1) Namespace contention: the namespace is fenced by another
+        mutation or an intentionally retained uncertain operation — operators
+        must recover a retained uncertain fence before retries can succeed.
+        (2) A namespace-registry admission lease was not held (or not the exact
+        canonical key sequence) at the commit boundary, so the transaction
+        aborted. (3) The database itself aborted the committing transaction as
+        a serialization failure or deadlock victim — PostgreSQL `40001` /
+        `40P01`, or the same `40001` SQLSTATE MySQL reports for a deadlock
+        victim — which the independent admission-lease renewer can trigger by
+        updating `config_admission_locks` between a rename/delete
+        transaction's snapshot and its final `SELECT ... FOR UPDATE`. Cases
+        (2) and (3) carry `rollback: not_needed` and a fixed redacted message;
+        the driver's own text is never returned or logged, and a uniqueness or
+        name conflict is a `409` rather than this response.
       headers:
         Retry-After:
           required: false

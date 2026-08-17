@@ -108,12 +108,14 @@ mod inner {
     };
     use crate::config::namespace_registry::{
         DERIVED_NAMESPACE_RESOURCE_TABLES, NAMESPACE_OCCUPANCY_TABLES,
-        NAMESPACES_REGISTRY_BACKFILL_ID, NamespaceRecord, NamespaceRegistryAtomicityUnsupported,
-        NamespaceRegistryCorrupt, NamespaceRegistryError as RegistryError, NamespaceRegistryPhase,
-        SCHEMA_COMPAT_TABLE, namespace_prefixed_id_suffix_field, namespace_registry_fault,
-        parse_namespace_rfc3339, require_canonical_stored_description, require_namespace_identity,
-        require_namespace_keyed_identity, require_namespace_prefixed_identity,
-        require_namespace_registry_admission_keys, require_namespace_registry_admission_leases,
+        NAMESPACE_REGISTRY_ADMISSION_KEY, NAMESPACES_REGISTRY_BACKFILL_ID, NamespaceRecord,
+        NamespaceRegistryAtomicityUnsupported, NamespaceRegistryCorrupt,
+        NamespaceRegistryError as RegistryError, NamespaceRegistryPhase, SCHEMA_COMPAT_TABLE,
+        namespace_prefixed_id_suffix_field, namespace_registry_fault, parse_namespace_rfc3339,
+        protected_namespaces_contains, require_canonical_stored_description,
+        require_namespace_identity, require_namespace_keyed_identity,
+        require_namespace_prefixed_identity, require_namespace_registry_admission_keys,
+        require_namespace_registry_admission_leases,
     };
     use regex::escape as regex_escape;
 
@@ -980,13 +982,14 @@ mod inner {
         reconnect_transition_test_hooks:
             Arc<std::sync::Mutex<Option<MongoReconnectTransitionTestHooks>>>,
         replica_set_configured: Arc<AtomicBool>,
-        /// The namespace this process serves, applied once at startup from the
-        /// already-resolved `EnvConfig` (issue #3955). Namespace DELETE and
-        /// rename-away consult THIS value rather than re-reading
-        /// `std::env::var("FERRUM_NAMESPACE")` at request time, which would
-        /// bypass the CLI > env > conf-file > default precedence and could
-        /// protect the wrong namespace.
-        effective_default_namespace: String,
+        /// The namespaces this process is configured to serve, sorted and
+        /// de-duplicated, applied once at startup from the already-resolved
+        /// `EnvConfig` (issue #3955). Namespace DELETE and rename-away consult
+        /// THIS set rather than re-reading `std::env::var("FERRUM_NAMESPACE")` /
+        /// `FERRUM_CP_NAMESPACES` at request time, which would bypass the
+        /// CLI > env > conf-file > default precedence and could protect the
+        /// wrong namespaces.
+        protected_namespaces: Vec<String>,
     }
 
     impl MongoStore {
@@ -1077,7 +1080,7 @@ mod inner {
                 failover_topology: crate::config::db_backend::DbFailoverTopologyState::new(),
                 reconnect_transition_test_hooks: Arc::new(std::sync::Mutex::new(None)),
                 replica_set_configured: Arc::new(AtomicBool::new(replica_set_configured)),
-                effective_default_namespace: crate::config::types::DEFAULT_NAMESPACE.to_string(),
+                protected_namespaces: vec![crate::config::types::DEFAULT_NAMESPACE.to_string()],
             })
         }
 
@@ -1707,7 +1710,7 @@ mod inner {
                 failover_topology: crate::config::db_backend::DbFailoverTopologyState::new(),
                 reconnect_transition_test_hooks: Arc::new(std::sync::Mutex::new(None)),
                 replica_set_configured: Arc::new(AtomicBool::new(false)),
-                effective_default_namespace: crate::config::types::DEFAULT_NAMESPACE.to_string(),
+                protected_namespaces: vec![crate::config::types::DEFAULT_NAMESPACE.to_string()],
             })
         }
 
@@ -5333,10 +5336,10 @@ mod inner {
             }
             if renaming {
                 // A rename is semantically a removal of the old name.
-                if current_name == plan.protected_default {
+                if protected_namespaces_contains(&plan.protected_namespaces, current_name) {
                     return Err(Self::namespace_protected_abort(
                         current_name,
-                        RegistryError::PROTECTED_PROCESS_DEFAULT,
+                        RegistryError::PROTECTED_CONFIGURED_NAMESPACE,
                     ));
                 }
                 if self
@@ -5422,10 +5425,10 @@ mod inner {
                 NamespaceRegistryPhase::Start,
             )?;
             let name = plan.current_name.as_str();
-            if name == plan.protected_default {
+            if protected_namespaces_contains(&plan.protected_namespaces, name) {
                 return Err(Self::namespace_protected_abort(
                     name,
-                    RegistryError::PROTECTED_PROCESS_DEFAULT,
+                    RegistryError::PROTECTED_CONFIGURED_NAMESPACE,
                 ));
             }
             if !self
@@ -6037,6 +6040,10 @@ mod inner {
                 fault,
                 NamespaceRegistryPhase::LeaseLost,
             )?;
+            Self::check_namespace_registry_fault_in_session(
+                fault,
+                NamespaceRegistryPhase::TransactionConflict,
+            )?;
             for (key, owner, generation) in leases {
                 if !self
                     .verify_namespace_config_admission_lease_in_session(
@@ -6395,9 +6402,10 @@ mod inner {
         /// holds; all of them are re-verified before commit.
         leases: Vec<(String, String, i64)>,
         fault: Option<NamespaceRegistryPhase>,
-        /// The namespace this process serves, protected from delete and
+        /// The namespaces this process is configured to serve, sorted and
+        /// de-duplicated. Every one of them is protected from delete and
         /// rename-away.
-        protected_default: String,
+        protected_namespaces: Vec<String>,
         /// The row `create_namespace` inserts. `None` for update and delete.
         registry_doc: Option<Document>,
     }
@@ -12506,17 +12514,13 @@ mod inner {
                 .is_some())
         }
 
-        fn effective_default_namespace(&self) -> &str {
-            &self.effective_default_namespace
+        fn protected_namespaces(&self) -> &[String] {
+            &self.protected_namespaces
         }
 
-        fn set_effective_default_namespace(&mut self, namespace: &str) {
-            let namespace = namespace.trim();
-            self.effective_default_namespace = if namespace.is_empty() {
-                crate::config::types::DEFAULT_NAMESPACE.to_string()
-            } else {
-                namespace.to_string()
-            };
+        fn set_protected_namespaces(&mut self, namespaces: &[String]) {
+            self.protected_namespaces =
+                crate::config::namespace_registry::normalize_protected_namespaces(namespaces);
         }
 
         fn ensure_namespace_registry_atomicity_supported(
@@ -12551,7 +12555,7 @@ mod inner {
                     leases,
                 )?,
                 fault: namespace_registry_fault(&record.name),
-                protected_default: self.effective_default_namespace.clone(),
+                protected_namespaces: self.protected_namespaces.clone(),
                 registry_doc: Some(Self::namespace_registry_doc(record)),
             };
             let connection = self.connection();
@@ -12589,7 +12593,7 @@ mod inner {
                     leases,
                 )?,
                 fault: namespace_registry_fault(current_name),
-                protected_default: self.effective_default_namespace.clone(),
+                protected_namespaces: self.protected_namespaces.clone(),
                 registry_doc: None,
             };
             let mut mtls_leases = self
@@ -12641,13 +12645,13 @@ mod inner {
                 cascade,
                 leases: Self::owned_namespace_registry_leases_for_names(&[name], leases)?,
                 fault: namespace_registry_fault(name),
-                protected_default: self.effective_default_namespace.clone(),
+                protected_namespaces: self.protected_namespaces.clone(),
                 registry_doc: None,
             };
-            if name == self.effective_default_namespace {
+            if protected_namespaces_contains(&self.protected_namespaces, name) {
                 return Err(RegistryError::protected(
                     name,
-                    RegistryError::PROTECTED_PROCESS_DEFAULT,
+                    RegistryError::PROTECTED_CONFIGURED_NAMESPACE,
                 ));
             }
             // The durable namespace mutex every namespace-wide mutation takes;
@@ -15181,10 +15185,87 @@ mod inner {
             Ok(namespaces)
         }
 
+        /// Run the one-time compatibility pass under the SAME global
+        /// `!namespace-registry` admission lease every live create / rename /
+        /// delete takes.
+        ///
+        /// Without that lease the pass reads derived names and upserts registry
+        /// documents outside the authority live namespace CRUD serializes on,
+        /// so a confirmed `DELETE /namespaces/{name}` could commit between the
+        /// read and the upsert and have its document resurrected before the
+        /// completion marker landed. Taking only the global key can never
+        /// invert the established total lock order (global first, then affected
+        /// names ascending), and the lease is a datastore document rather than
+        /// a process-local mutex, so it serializes across gateway processes.
+        ///
+        /// A lease held elsewhere is not an error: the completion marker stays
+        /// absent, which is exactly the crash-retry state, and the next
+        /// migrate / reconnect / startup pass tries again.
         async fn backfill_namespaces_registry(&self) -> Result<(), anyhow::Error> {
+            // Unfenced fast path. After the first completed pass this single
+            // lookup is the entire cost; the authoritative check runs again
+            // under the lease so two processes cannot both seed.
             if self.namespaces_registry_backfill_completed().await? {
                 return Ok(());
             }
+
+            let owner = Uuid::new_v4().to_string();
+            if self
+                .try_acquire_namespace_config_admission_lease(
+                    NAMESPACE_REGISTRY_ADMISSION_KEY,
+                    &owner,
+                )
+                .await?
+                .is_none()
+            {
+                info!(
+                    "Namespace registry compatibility backfill deferred: the global registry \
+                     admission lease is held by another mutation; a later startup retries"
+                );
+                return Ok(());
+            }
+
+            // Always release, on success AND on error, so a failed pass cannot
+            // hold the global registry key for the rest of its lease and stall
+            // live namespace CRUD. Lease expiry stays the backstop for a hard
+            // crash.
+            let backfill = self.backfill_namespaces_registry_under_lease(&owner).await;
+            let release = self
+                .release_namespace_config_admission_lease(NAMESPACE_REGISTRY_ADMISSION_KEY, &owner)
+                .await;
+            match (backfill, release) {
+                (Ok(()), Ok(_)) => Ok(()),
+                (Err(backfill_error), _) => Err(backfill_error),
+                (Ok(()), Err(release_error)) => Err(release_error),
+            }
+        }
+
+        /// The compatibility pass itself, with `owner` holding the global
+        /// registry admission lease for its whole duration.
+        ///
+        /// MongoDB cannot run this as one transaction on every supported
+        /// deployment — a standalone `mongod` has no multi-document
+        /// transactions at all, and `distinct` is not universally transactional
+        /// — so continuous ownership is what fences it instead. Ownership is
+        /// re-proved by a conditional renewal (`owner` matches AND the document
+        /// has not expired against the server's own clock) immediately before
+        /// the upserts and again immediately before the completion marker. The
+        /// acquisition path never steals an unexpired owner and always bumps
+        /// `generation` on an ownership change, so a renewal that still matches
+        /// `owner` proves no other process held the key in between: no registry
+        /// mutation could have committed, and nothing this pass writes can
+        /// resurrect a concurrently deleted name. A failed renewal aborts
+        /// before the marker, leaving the crash-retry state intact.
+        async fn backfill_namespaces_registry_under_lease(
+            &self,
+            owner: &str,
+        ) -> Result<(), anyhow::Error> {
+            // Authoritative completion check, under the lease: two processes
+            // can never both observe an absent marker and both seed.
+            if self.namespaces_registry_backfill_completed().await? {
+                return Ok(());
+            }
+
             let now = Utc::now().to_rfc3339();
             let mut names = HashSet::new();
             for &collection in DERIVED_NAMESPACE_RESOURCE_TABLES {
@@ -15199,6 +15280,17 @@ mod inner {
             // isolate data under a derived name but do not insert a registry
             // row. This insert runs only on the first compatibility pass.
             names.insert(crate::config::types::DEFAULT_NAMESPACE.to_string());
+
+            if !self
+                .namespaces_registry_backfill_lease_still_held(owner)
+                .await?
+            {
+                warn!(
+                    "Namespace registry compatibility backfill aborted before writing: the global \
+                     registry admission lease was no longer held; a later startup retries"
+                );
+                return Ok(());
+            }
             for name in names {
                 let _ = self
                     .namespaces()
@@ -15220,12 +15312,36 @@ mod inner {
             // document must fail startup rather than coexist with the valid
             // row this pass just upserted.
             let _ = self.registry_namespace_names().await?;
-            // Marker last, and never as a namespaces document: a crash before
-            // this write leaves completion absent so the next serialized
-            // compatibility pass retries the idempotent upserts.
+            if !self
+                .namespaces_registry_backfill_lease_still_held(owner)
+                .await?
+            {
+                warn!(
+                    "Namespace registry compatibility backfill did not record completion: the \
+                     global registry admission lease was no longer held; a later startup retries"
+                );
+                return Ok(());
+            }
+            // Marker last, and never as a namespaces document: an abort or a
+            // crash before this write leaves completion absent so the next
+            // serialized compatibility pass retries the idempotent upserts.
             self.mark_namespaces_registry_backfill_complete(&now)
                 .await?;
             Ok(())
+        }
+
+        /// Conditionally renew the global registry admission lease.
+        ///
+        /// `false` means ownership is already gone (stolen after expiry, or
+        /// expired outright). The renewal predicate is evaluated by the server
+        /// against its own clock, so a skewed gateway cannot talk itself into
+        /// believing it still holds the key.
+        async fn namespaces_registry_backfill_lease_still_held(
+            &self,
+            owner: &str,
+        ) -> Result<bool, anyhow::Error> {
+            self.renew_namespace_config_admission_lease(NAMESPACE_REGISTRY_ADMISSION_KEY, owner)
+                .await
         }
 
         async fn namespaces_registry_backfill_completed(&self) -> Result<bool, anyhow::Error> {
@@ -16563,7 +16679,7 @@ mod inner {
                 replica_set_configured: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(
                     false,
                 )),
-                effective_default_namespace: crate::config::types::DEFAULT_NAMESPACE.to_string(),
+                protected_namespaces: vec![crate::config::types::DEFAULT_NAMESPACE.to_string()],
             }
         }
 

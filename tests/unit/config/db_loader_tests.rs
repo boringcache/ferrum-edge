@@ -13,7 +13,10 @@ use ferrum_edge::config::db_backend::{
     is_mtls_dns_admission_unavailable, is_mtls_dns_identity_conflict,
     tcp_connection_throttle_attachment_conflict,
 };
-use ferrum_edge::config::db_loader::DatabaseStore;
+use ferrum_edge::config::db_loader::{
+    DatabaseStore, is_retryable_sql_transaction_conflict,
+    sqlstate_is_retryable_transaction_conflict,
+};
 use ferrum_edge::config::plugin_trigger::PluginTrigger;
 use ferrum_edge::config::types::{
     AuthMode, BackendScheme, Consumer, LoadBalancerAlgorithm, PluginAssociation, PluginConfig,
@@ -3611,5 +3614,209 @@ fn sql_namespace_registry_mutations_require_canonical_lease_set_before_begin() {
         verify.contains("require_namespace_registry_admission_leases(names, leases)")
             && verify.contains("verify_namespace_config_admission_lease_tx"),
         "commit-boundary verification must re-check the canonical key set then owner/generation:\n{verify}"
+    );
+}
+
+// ── Retryable serialization/deadlock classification (issue #3955 review) ─────
+
+#[test]
+fn retryable_transaction_conflict_sqlstates_are_exactly_serialization_and_deadlock() {
+    for code in ["40001", "40P01"] {
+        assert!(
+            sqlstate_is_retryable_transaction_conflict(code),
+            "{code} is a database-aborted transaction and is safe to retry"
+        );
+    }
+    for code in [
+        // Uniqueness / name conflicts: a retry would only repeat them.
+        "23505", "23000", "23503", // Connectivity, syntax, permissions, and MySQL's generic class.
+        "08006", "08001", "42601", "42501", "HY000", "40002", "400011", "4000", "",
+    ] {
+        assert!(
+            !sqlstate_is_retryable_transaction_conflict(code),
+            "{code} must not be classified as a safe-retry transaction conflict"
+        );
+    }
+}
+
+#[test]
+fn retryable_transaction_conflict_classification_is_chain_aware() {
+    // Persistence layers wrap driver errors in their own context, so the
+    // outermost message alone misses the abort.
+    for code in ["40001", "40P01"] {
+        let wrapped =
+            anyhow::Error::new(sqlx::Error::Database(Box::new(TestDatabaseError { code })))
+                .context("namespace registry transaction failed")
+                .context("delete_namespace");
+        assert!(
+            is_retryable_sql_transaction_conflict(&wrapped),
+            "a wrapped SQLSTATE {code} must still classify as retryable: {wrapped:#}"
+        );
+    }
+}
+
+#[test]
+fn retryable_transaction_conflict_classification_does_not_misclassify() {
+    // A unique-constraint violation is a real 409, not a retryable abort.
+    let unique = anyhow::Error::new(sqlx::Error::Database(Box::new(TestDatabaseError {
+        code: "23505",
+    })))
+    .context("namespace registry transaction failed");
+    assert!(!is_retryable_sql_transaction_conflict(&unique));
+
+    // Connectivity failures carry no SQLSTATE at all.
+    let connectivity = anyhow::Error::new(sqlx::Error::PoolTimedOut).context("acquire failed");
+    assert!(!is_retryable_sql_transaction_conflict(&connectivity));
+    assert!(!is_retryable_sql_transaction_conflict(&anyhow::anyhow!(
+        "connection refused"
+    )));
+
+    // A typed registry error must never be swallowed by the classifier.
+    use ferrum_edge::config::namespace_registry::NamespaceRegistryError as RegistryError;
+    let name_in_use = RegistryError::name_in_use("tenant-a");
+    assert!(!is_retryable_sql_transaction_conflict(&name_in_use));
+}
+
+#[test]
+fn sql_registry_mutations_map_database_aborts_to_the_typed_retryable_conflict() {
+    // The three public entry points must funnel through the classifier so the
+    // admin layer never has to inspect driver text, and the driver error is
+    // dropped rather than chained (it is the last place a `{:#}` rendering
+    // could leak the relation name and the conflicting statement).
+    let source = include_str!("../../../src/config/db_loader.rs");
+    for (public, inner) in [
+        ("pub async fn create_namespace(", "create_namespace_inner("),
+        ("pub async fn update_namespace(", "update_namespace_inner("),
+        ("pub async fn delete_namespace(", "delete_namespace_inner("),
+    ] {
+        let start = source.find(public).expect(public);
+        let body = source[start..]
+            .split("\n    async fn ")
+            .next()
+            .unwrap_or(&source[start..]);
+        assert!(
+            body.contains("classify_namespace_registry_result") && body.contains(inner),
+            "{public} must route its result through the retryable classifier:\n{body}"
+        );
+    }
+
+    let classifier_start = source
+        .find("fn classify_namespace_registry_result")
+        .expect("classifier");
+    let classifier_tail = &source[classifier_start..];
+    let classifier_end = classifier_tail
+        .find("\n}\n")
+        .map(|offset| offset + 3)
+        .unwrap_or(classifier_tail.len());
+    let classifier = &classifier_tail[..classifier_end];
+    assert!(
+        classifier.contains("is_retryable_sql_transaction_conflict")
+            && classifier.contains("NamespaceRegistryRetryableConflict"),
+        "the classifier must map a database-aborted transaction onto the typed conflict:\n{classifier}"
+    );
+    assert!(
+        !classifier.contains(".context(") && !classifier.contains("to_string()"),
+        "the driver error must be dropped, never rendered or chained:\n{classifier}"
+    );
+}
+
+// ── One-time backfill serialization (issue #3955 review) ────────────────────
+
+#[test]
+fn sql_namespace_registry_backfill_runs_under_the_global_registry_lease() {
+    let source = include_str!("../../../src/config/migrations/sql_dialect.rs");
+    let start = source
+        .find("async fn run_serialized_namespaces_registry_backfill(")
+        .expect("serialized backfill entry point");
+    let serialized = source[start..]
+        .split("\n    /// Conditionally take the global registry admission lease.")
+        .next()
+        .expect("serialized backfill body");
+
+    let acquire_at = serialized
+        .find("try_acquire_namespaces_registry_backfill_lease")
+        .expect("the pass must take the global registry admission lease");
+    let backfill_at = serialized
+        .find(".backfill_namespaces_registry(")
+        .expect("the pass must run the backfill under that lease");
+    let release_at = serialized
+        .find("release_namespaces_registry_backfill_lease")
+        .expect("the pass must release the lease");
+    assert!(
+        acquire_at < backfill_at && backfill_at < release_at,
+        "the lease must be held across the whole compatibility pass:\n{serialized}"
+    );
+    assert!(
+        serialized.contains("(Err(backfill_error), _) => Err(backfill_error)"),
+        "the lease must be released on the error path too, without masking the failure:\n{serialized}"
+    );
+    // The lock order stays total: the pass takes ONLY the global key, which is
+    // always first, so it can never invert the order against a live mutation.
+    let acquire = source[source
+        .find("async fn try_acquire_namespaces_registry_backfill_lease(")
+        .expect("acquire helper")..]
+        .split("\n    async fn ")
+        .next()
+        .expect("acquire body");
+    assert!(
+        acquire.contains("NAMESPACE_REGISTRY_ADMISSION_KEY")
+            && acquire.contains("config_admission_lease_acquire_sql"),
+        "acquisition must reuse the runtime store's non-stealing lease SQL:\n{acquire}"
+    );
+}
+
+#[test]
+fn sql_namespace_registry_backfill_commits_once_and_verifies_its_lease() {
+    let source = include_str!("../../../src/config/migrations/sql_dialect.rs");
+    let start = source
+        .find("async fn backfill_namespaces_registry(")
+        .expect("backfill helper");
+    let body = source[start..]
+        .split("\n    /// Authoritative namespace-keyed")
+        .next()
+        .expect("backfill body");
+
+    let begin_at = body.find("connection.begin()").expect("single transaction");
+    let completed_at = body
+        .find("namespaces_registry_backfill_completed")
+        .expect("authoritative completion check");
+    let insert_at = body.find("insert_derived").expect("derived-name insert");
+    let mark_at = body
+        .find("mark_namespaces_registry_backfill_complete")
+        .expect("completion mark");
+    let verify_at = body
+        .find("namespaces_registry_backfill_lease_held")
+        .expect("commit-boundary lease verification");
+    let commit_at = body.find("tx.commit()").expect("single commit");
+    assert!(
+        begin_at < completed_at,
+        "the authoritative completion check must run inside the fenced transaction:\n{body}"
+    );
+    assert!(
+        completed_at < insert_at,
+        "a completed backfill must skip the inserts:\n{body}"
+    );
+    assert!(
+        insert_at < mark_at,
+        "the marker must be written after the idempotent inserts so a crash retries:\n{body}"
+    );
+    assert!(
+        mark_at < verify_at && verify_at < commit_at,
+        "the lease must be re-verified immediately before the single commit:\n{body}"
+    );
+
+    let verify = source[source
+        .find("async fn namespaces_registry_backfill_lease_held(")
+        .expect("lease verification helper")..]
+        .split("\n    /// Rewrite `?` placeholders")
+        .next()
+        .expect("lease verification body");
+    assert!(
+        verify.contains("FOR UPDATE") && verify.contains("is_sqlite()"),
+        "the lease row must be pinned until commit on every dialect that has FOR UPDATE:\n{verify}"
+    );
+    assert!(
+        verify.contains("generation = ?") && verify.contains("expires_at >"),
+        "verification must check owner, generation, and database-clock expiry:\n{verify}"
     );
 }

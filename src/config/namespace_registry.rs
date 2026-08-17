@@ -27,10 +27,14 @@
 //!
 //! Connect/migrate runs a **one-time** compatibility backfill of pre-existing
 //! derived names plus canonical `ferrum`, then durably records completion in
-//! [`SCHEMA_COMPAT_TABLE`]. A failed attempt leaves that marker absent so a
-//! later startup retries. Once complete, later compatibility passes do not
-//! reseed deleted names or materialize newer derived-only names. The marker is
-//! not a registry row and never appears in `GET /namespaces`.
+//! [`SCHEMA_COMPAT_TABLE`]. That pass takes the SAME global
+//! [`NAMESPACE_REGISTRY_ADMISSION_KEY`] lease every live create/rename/delete
+//! takes, so a confirmed DELETE can never commit next to a backfill that
+//! already read the derived names and then resurrect the removed row. A failed
+//! attempt leaves that marker absent so a later startup retries. Once complete,
+//! later compatibility passes do not reseed deleted names or materialize newer
+//! derived-only names. The marker is not a registry row and never appears in
+//! `GET /namespaces`.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -72,6 +76,55 @@ pub const SCHEMA_COMPAT_TABLE: &str = "_ferrum_schema_compat";
 /// Completion marker for the one-time namespace-registry compatibility
 /// backfill. Stored as [`SCHEMA_COMPAT_TABLE`].`name` (SQL) / `_id` (MongoDB).
 pub const NAMESPACES_REGISTRY_BACKFILL_ID: &str = "namespaces_registry_backfill";
+
+/// Normalize the namespaces this process refuses to remove.
+///
+/// Callers pass the already-resolved startup configuration — `FERRUM_NAMESPACE`
+/// in database mode, and additionally every explicitly configured
+/// `FERRUM_CP_NAMESPACES` entry in CP mode. Entries are trimmed, empties are
+/// dropped, and the result is sorted and de-duplicated so a lookup is a
+/// deterministic binary search over a tiny cold-path vector. An input that
+/// carries nothing usable falls back to the canonical default namespace rather
+/// than leaving the process with no protection at all.
+///
+/// A cluster-wide CP (`FERRUM_CP_NAMESPACES=*`) deliberately does NOT freeze
+/// every discovered name here: its scope is dynamic, so only `FERRUM_NAMESPACE`
+/// is protected and any other tenant stays removable.
+pub fn normalize_protected_namespaces(names: &[String]) -> Vec<String> {
+    let mut normalized: Vec<String> = names
+        .iter()
+        .map(|name| name.trim())
+        .filter(|name| !name.is_empty())
+        .map(str::to_string)
+        .collect();
+    normalized.sort_unstable();
+    normalized.dedup();
+    if normalized.is_empty() {
+        normalized.push(crate::config::types::DEFAULT_NAMESPACE.to_string());
+    }
+    normalized
+}
+
+/// Fail-closed default for a backend whose protected set was never configured.
+///
+/// Both production stores apply the resolved startup set, but a backend that
+/// skipped that step must still refuse to delete the canonical namespace rather
+/// than protect nothing at all.
+pub fn default_protected_namespaces() -> &'static [String] {
+    static DEFAULT_PROTECTED: OnceLock<Vec<String>> = OnceLock::new();
+    DEFAULT_PROTECTED.get_or_init(|| vec![crate::config::types::DEFAULT_NAMESPACE.to_string()])
+}
+
+/// Membership test for a [`normalize_protected_namespaces`] result.
+///
+/// The slice is sorted, so this is a binary search; it is only ever reached
+/// from admin namespace CRUD and the registry mutation transactions, never
+/// from a proxy request path.
+pub fn protected_namespaces_contains(protected: &[String], name: &str) -> bool {
+    protected
+        .binary_search_by(|candidate| candidate.as_str().cmp(name))
+        .is_ok()
+}
 
 /// Durable registry row for one tenant namespace.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -294,11 +347,16 @@ pub enum NamespaceRegistryError {
 }
 
 impl NamespaceRegistryError {
-    /// Reason text for the effective configured namespace of this process.
+    /// Reason text for a namespace this process is configured to serve.
+    ///
     /// A rename is semantically a removal of the old name, so both DELETE and
-    /// rename-away use this.
-    pub const PROTECTED_PROCESS_DEFAULT: &str =
-        "it is the namespace this gateway is configured to serve (FERRUM_NAMESPACE)";
+    /// rename-away use this. The text is a fixed constant: it names the two
+    /// configuration keys an operator can change and never echoes the rest of
+    /// the configured set, so a 409 cannot be used to enumerate which other
+    /// tenants this gateway serves.
+    pub const PROTECTED_CONFIGURED_NAMESPACE: &str =
+        "it is one of the namespaces this gateway is configured to serve \
+         (FERRUM_NAMESPACE / FERRUM_CP_NAMESPACES)";
     /// Last **registry row**, not last derived resource name. Resource writers
     /// do not take the global registry lease, so they cannot be the authority.
     pub const PROTECTED_LAST_REMAINING: &str = "it is the last remaining namespace";
@@ -384,6 +442,47 @@ pub fn is_namespace_registry_error(error: &anyhow::Error) -> Option<&NamespaceRe
     error
         .chain()
         .find_map(|cause| cause.downcast_ref::<NamespaceRegistryError>())
+}
+
+/// Stable admin-facing message for a registry mutation the database aborted as
+/// a concurrency conflict.
+///
+/// Fixed and redacted on purpose: the driver's own text names the relation, the
+/// conflicting transaction, and sometimes the row, none of which may reach a
+/// client or a log line.
+pub const NAMESPACE_REGISTRY_RETRYABLE_CONFLICT_MESSAGE: &str =
+    "The namespace registry mutation conflicted with a concurrent database transaction and was \
+     rolled back; nothing was applied. Retry the request.";
+
+/// The committing transaction was aborted by the database itself as a
+/// serialization failure or deadlock victim.
+///
+/// This is a *fail-closed* outcome, not a partial one: the abort happens before
+/// commit, so no registry row, resource row, or change-log tombstone is
+/// durable. It is distinct from a lost admission lease (the lease was still
+/// held; the datastore simply refused to serialize the two transactions) and
+/// from a name conflict (which is a real, non-retryable 409).
+///
+/// Concretely, PostgreSQL under `REPEATABLE READ` can raise `40001`
+/// (`serialization_failure`) or `40P01` (`deadlock_detected`) when the
+/// independent admission renewer updates `config_admission_locks` between this
+/// transaction's snapshot and its final `SELECT ... FOR UPDATE` on the same
+/// rows. MySQL reports a deadlock victim with the same `40001` SQLSTATE.
+#[derive(Debug)]
+pub struct NamespaceRegistryRetryableConflict;
+
+impl std::fmt::Display for NamespaceRegistryRetryableConflict {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(NAMESPACE_REGISTRY_RETRYABLE_CONFLICT_MESSAGE)
+    }
+}
+
+impl std::error::Error for NamespaceRegistryRetryableConflict {}
+
+pub fn is_namespace_registry_retryable_conflict(error: &anyhow::Error) -> bool {
+    error
+        .chain()
+        .any(|cause| cause.is::<NamespaceRegistryRetryableConflict>())
 }
 
 /// Stable admin-facing message for a registry mutation the configured database
@@ -670,6 +769,16 @@ pub enum NamespaceRegistryPhase {
     /// At the commit-boundary lease verification, reported as a lost lease so
     /// the retryable fail-closed 503 mapping is exercised end to end.
     LeaseLost,
+    /// At the commit-boundary lease verification, reported as the database
+    /// aborting the transaction as a serialization failure / deadlock victim.
+    ///
+    /// A real `40001` / `40P01` needs two racing PostgreSQL transactions and
+    /// the 30-second admission renewer, which no deterministic test can stage.
+    /// This phase injects the already-classified typed conflict at exactly the
+    /// point the real abort surfaces, so the documented `503` +
+    /// `Retry-After: 1` + `rollback: not_needed` response is exercised end to
+    /// end. The SQLSTATE classification itself is covered separately.
+    TransactionConflict,
     /// Immediately before the single commit.
     Commit,
 }
@@ -683,6 +792,7 @@ impl NamespaceRegistryPhase {
             Self::RegistryRow => "registry_row",
             Self::LastNamespaceCheck => "last_namespace_check",
             Self::LeaseLost => "lease_lost",
+            Self::TransactionConflict => "transaction_conflict",
             Self::Commit => "commit",
         }
     }
@@ -691,6 +801,12 @@ impl NamespaceRegistryPhase {
         if self == Self::LeaseLost {
             return anyhow::Error::new(BatchAdmissionLeaseLost).context(
                 "injected namespace registry fault: the admission lease was reported lost at the \
+                 commit boundary",
+            );
+        }
+        if self == Self::TransactionConflict {
+            return anyhow::Error::new(NamespaceRegistryRetryableConflict).context(
+                "injected namespace registry fault: the database aborted the transaction at the \
                  commit boundary",
             );
         }

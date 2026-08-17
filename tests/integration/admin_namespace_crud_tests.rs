@@ -96,9 +96,22 @@ async fn make_store_at(dir: &TempDir, name: &str) -> DatabaseStore {
 /// same startup setter `src/modes/database.rs` uses, so the protection path is
 /// exercised without touching the process environment.
 async fn make_store_serving(dir: &TempDir, namespace: &str) -> DatabaseStore {
+    make_store_protecting(dir, &[namespace]).await
+}
+
+/// A store configured to serve several namespaces, mirroring a control plane
+/// with `FERRUM_CP_NAMESPACES=a,b` (`CpScope::Set`). The set is applied through
+/// the same startup setter `src/modes/control_plane.rs` uses, so protection is
+/// exercised without touching the process environment.
+async fn make_store_protecting(dir: &TempDir, namespaces: &[&str]) -> DatabaseStore {
     let mut store = make_store(dir).await;
-    store.set_effective_default_namespace(namespace);
+    apply_protected_namespaces(&mut store, namespaces);
     store
+}
+
+fn apply_protected_namespaces(store: &mut DatabaseStore, namespaces: &[&str]) {
+    let owned: Vec<String> = namespaces.iter().map(|name| name.to_string()).collect();
+    store.set_protected_namespaces(&owned);
 }
 
 fn admin_state(db: DatabaseStore) -> AdminState {
@@ -1066,7 +1079,7 @@ async fn deleted_canonical_ferrum_is_not_resurrected_by_later_compatibility_pass
     let store_name = "ns-ferrum-not-resurrected";
     let store = Arc::new({
         let mut store = make_store_at(&dir, store_name).await;
-        store.set_effective_default_namespace("tenant-prod");
+        apply_protected_namespaces(&mut store, &["tenant-prod"]);
         store
     });
     let (base, shutdown) = start_admin(admin_state_from_arc(store.clone())).await;
@@ -1104,7 +1117,7 @@ async fn deleted_canonical_ferrum_is_not_resurrected_by_later_compatibility_pass
 
     let store = {
         let mut store = make_store_at(&dir, store_name).await;
-        store.set_effective_default_namespace("tenant-prod");
+        apply_protected_namespaces(&mut store, &["tenant-prod"]);
         store
     };
     assert!(
@@ -1798,4 +1811,589 @@ async fn corrupt_registry_row_is_not_served_as_plausible_detail() {
         !error.contains("not-a-timestamp") && !error.contains("ferrum"),
         "raw corrupt values must not be echoed: {body:?}"
     );
+}
+
+// ── Protected namespace set (issue #3955 review) ────────────────────────────
+
+async fn clear_backfill_marker(store: &DatabaseStore) {
+    sqlx::query("DELETE FROM _ferrum_schema_compat WHERE name = ?")
+        .bind(ferrum_edge::config::namespace_registry::NAMESPACES_REGISTRY_BACKFILL_ID)
+        .execute(&store.pool())
+        .await
+        .unwrap();
+}
+
+async fn backfill_marker_present(store: &DatabaseStore) -> bool {
+    sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM _ferrum_schema_compat WHERE name = ?")
+        .bind(ferrum_edge::config::namespace_registry::NAMESPACES_REGISTRY_BACKFILL_ID)
+        .fetch_one(&store.pool())
+        .await
+        .unwrap()
+        > 0
+}
+
+/// Free the global registry admission key deterministically.
+///
+/// Admin handlers release their lease from a `Drop`-spawned task, so a test
+/// that must observe the NEXT startup taking that key cannot depend on when
+/// that task happens to run. Expiring the row is exactly what the lease's own
+/// release statement does, and it needs no sleep or poll.
+async fn expire_global_registry_lease(store: &DatabaseStore) {
+    sqlx::query("UPDATE config_admission_locks SET expires_at = 0 WHERE namespace = ?")
+        .bind(ferrum_edge::config::namespace_registry::NAMESPACE_REGISTRY_ADMISSION_KEY)
+        .execute(&store.pool())
+        .await
+        .unwrap();
+}
+
+fn protected_reason_is_static(body: &Value) {
+    use ferrum_edge::config::namespace_registry::NamespaceRegistryError as RegistryError;
+    let error = body["error"].as_str().unwrap_or_default();
+    assert!(
+        error.contains(RegistryError::PROTECTED_CONFIGURED_NAMESPACE),
+        "the 409 must carry the fixed protected reason: {body:?}"
+    );
+}
+
+/// `FERRUM_CP_NAMESPACES=tenant-a,tenant-b` resolves to `CpScope::Set`, and the
+/// CP keeps polling BOTH names for the life of the process. Deleting or
+/// renaming either one away would leave the control plane polling a namespace
+/// that no longer exists and its DPs converging to empty configuration, so
+/// every explicitly configured name is protected — not only `FERRUM_NAMESPACE`.
+#[tokio::test]
+async fn cp_scope_set_protects_every_explicitly_configured_namespace() {
+    let dir = TempDir::new().unwrap();
+    // `reserved` is configured but has never been created — protection guards
+    // REMOVAL of a configured name, it does not reserve the name as a target.
+    let store = Arc::new(
+        make_store_protecting(&dir, &["tenant-a", "tenant-b", "ferrum", "reserved"]).await,
+    );
+    let (base, _shutdown) = start_admin(admin_state_from_arc(store.clone())).await;
+    let token = admin_token();
+
+    for name in ["tenant-a", "tenant-b", "spare", "spare-two"] {
+        let (status, body) = send(
+            reqwest::Method::POST,
+            &base,
+            "/namespaces",
+            &token,
+            Some(json!({ "name": name })),
+        )
+        .await;
+        assert_eq!(status, 201, "create {name}: {body:?}");
+    }
+
+    for name in ["tenant-a", "tenant-b", "ferrum"] {
+        let (status, body) = send(
+            reqwest::Method::DELETE,
+            &base,
+            &format!("/namespaces/{name}"),
+            &token,
+            None,
+        )
+        .await;
+        assert_eq!(status, 409, "{name} must be protected from delete: {body:?}");
+        protected_reason_is_static(&body);
+        assert!(
+            registry_row_exists(store.as_ref(), name).await,
+            "{name} must still exist after a refused delete"
+        );
+
+        let (status, body) = send(
+            reqwest::Method::PUT,
+            &base,
+            &format!("/namespaces/{name}"),
+            &token,
+            Some(json!({ "name": format!("{name}-renamed") })),
+        )
+        .await;
+        assert_eq!(
+            status, 409,
+            "{name} must be protected from rename-away: {body:?}"
+        );
+        protected_reason_is_static(&body);
+        assert!(
+            !registry_row_exists(store.as_ref(), &format!("{name}-renamed")).await,
+            "a refused rename must not materialize the target name"
+        );
+
+        // Description-only updates stay allowed for a protected namespace.
+        let (status, body) = send(
+            reqwest::Method::PUT,
+            &base,
+            &format!("/namespaces/{name}"),
+            &token,
+            Some(json!({ "description": "still editable" })),
+        )
+        .await;
+        assert_eq!(
+            status, 200,
+            "a description-only update of {name} must stay allowed: {body:?}"
+        );
+        assert_eq!(body["description"], "still editable");
+        assert_eq!(body["name"], name);
+    }
+
+    // Target-name creation semantics are unchanged: renaming INTO a configured
+    // but currently vacant name is allowed, exactly as `POST /namespaces` for
+    // that name would be.
+    let (status, body) = send(
+        reqwest::Method::PUT,
+        &base,
+        "/namespaces/spare",
+        &token,
+        Some(json!({ "name": "reserved" })),
+    )
+    .await;
+    assert_eq!(
+        status, 200,
+        "renaming into a configured but vacant name stays allowed: {body:?}"
+    );
+    assert_eq!(body["name"], "reserved");
+
+    // ...and once it exists under that configured name, it is protected.
+    let (status, body) = send(
+        reqwest::Method::DELETE,
+        &base,
+        "/namespaces/reserved",
+        &token,
+        None,
+    )
+    .await;
+    assert_eq!(
+        status, 409,
+        "a configured name is protected once it exists: {body:?}"
+    );
+    protected_reason_is_static(&body);
+
+    // An unconfigured tenant is still fully removable.
+    let (status, body) = send(
+        reqwest::Method::DELETE,
+        &base,
+        "/namespaces/spare-two",
+        &token,
+        None,
+    )
+    .await;
+    assert_eq!(status, 204, "an unconfigured tenant deletes freely: {body:?}");
+}
+
+/// `FERRUM_CP_NAMESPACES=*` (`CpScope::All`) discovers namespaces dynamically,
+/// so it must NOT freeze every discovered name. Only `FERRUM_NAMESPACE` is
+/// protected; every other tenant stays removable.
+#[tokio::test]
+async fn cp_scope_all_protects_only_the_configured_default_namespace() {
+    let dir = TempDir::new().unwrap();
+    // What `src/modes/control_plane.rs` computes for `CpScope::All`:
+    // `explicit_namespaces()` is `None`, so the set is FERRUM_NAMESPACE alone.
+    let store = Arc::new(make_store_protecting(&dir, &["tenant-home"]).await);
+    let (base, _shutdown) = start_admin(admin_state_from_arc(store.clone())).await;
+    let token = admin_token();
+
+    for name in ["tenant-home", "discovered-a", "discovered-b"] {
+        let (status, body) = send(
+            reqwest::Method::POST,
+            &base,
+            "/namespaces",
+            &token,
+            Some(json!({ "name": name })),
+        )
+        .await;
+        assert_eq!(status, 201, "create {name}: {body:?}");
+    }
+
+    let (status, body) = send(
+        reqwest::Method::DELETE,
+        &base,
+        "/namespaces/tenant-home",
+        &token,
+        None,
+    )
+    .await;
+    assert_eq!(status, 409, "FERRUM_NAMESPACE stays protected: {body:?}");
+    protected_reason_is_static(&body);
+
+    for name in ["discovered-a", "discovered-b"] {
+        let (status, body) = send(
+            reqwest::Method::PUT,
+            &base,
+            &format!("/namespaces/{name}"),
+            &token,
+            Some(json!({ "name": format!("{name}-moved") })),
+        )
+        .await;
+        assert_eq!(
+            status, 200,
+            "a dynamically discovered namespace stays renamable under CpScope::All: {body:?}"
+        );
+        let (status, body) = send(
+            reqwest::Method::DELETE,
+            &base,
+            &format!("/namespaces/{name}-moved"),
+            &token,
+            None,
+        )
+        .await;
+        assert_eq!(
+            status, 204,
+            "a dynamically discovered namespace stays deletable under CpScope::All: {body:?}"
+        );
+    }
+}
+
+/// The handler precheck is only a better message. The same predicate must hold
+/// inside the committing SQL transaction, so a caller that reaches the backend
+/// directly — a different admin surface, or a racing request that passed the
+/// precheck before the store was configured — still cannot remove a configured
+/// namespace.
+#[tokio::test]
+async fn sql_backend_refuses_protected_namespaces_without_the_handler_precheck() {
+    let dir = TempDir::new().unwrap();
+    let store: Arc<dyn DatabaseBackend> =
+        Arc::new(make_store_protecting(&dir, &["tenant-a", "tenant-b"]).await);
+
+    for name in ["tenant-a", "tenant-b"] {
+        let record = ferrum_edge::config::namespace_registry::NamespaceRecord::new(
+            name.to_string(),
+            None,
+            Utc::now(),
+        );
+        let admission = lock_namespace_registry_admission_for_test(store.clone(), &[name])
+            .await
+            .expect("registry admission");
+        store
+            .create_namespace(&record, &admission.holds())
+            .await
+            .expect("create");
+        drop(admission);
+    }
+
+    for name in ["tenant-a", "tenant-b"] {
+        let admission = lock_namespace_registry_admission_for_test(store.clone(), &[name])
+            .await
+            .expect("registry admission");
+        let error = store
+            .delete_namespace(name, true, &admission.holds())
+            .await
+            .expect_err("the backend itself must refuse a configured namespace");
+        let registry_error =
+            ferrum_edge::config::namespace_registry::is_namespace_registry_error(&error)
+                .expect("typed registry error");
+        assert!(
+            matches!(
+                registry_error,
+                ferrum_edge::config::namespace_registry::NamespaceRegistryError::Protected { .. }
+            ),
+            "expected a typed protection refusal, got {error}"
+        );
+        drop(admission);
+
+        let renamed = format!("{name}-renamed");
+        let admission =
+            lock_namespace_registry_admission_for_test(store.clone(), &[name, renamed.as_str()])
+                .await
+                .expect("registry admission");
+        let error = store
+            .update_namespace(name, &renamed, None, &admission.holds())
+            .await
+            .expect_err("the backend itself must refuse a rename-away");
+        assert!(
+            ferrum_edge::config::namespace_registry::is_namespace_registry_error(&error).is_some(),
+            "expected a typed protection refusal, got {error}"
+        );
+        drop(admission);
+    }
+
+    // Nothing was mutated by either refusal.
+    for name in ["tenant-a", "tenant-b"] {
+        assert!(store.get_namespace(name).await.unwrap().is_some());
+        assert!(
+            store
+                .get_namespace(&format!("{name}-renamed"))
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+}
+
+// ── One-time compatibility backfill serialization (issue #3955 review) ──────
+
+/// The compatibility pass takes the SAME global registry admission lease every
+/// live create/rename/delete takes. While that lease is held elsewhere the pass
+/// must defer instead of reading derived names next to a concurrent mutation —
+/// and it must leave the completion marker absent so a later startup retries.
+#[tokio::test]
+async fn namespace_registry_backfill_defers_while_the_global_registry_lease_is_held() {
+    let dir = TempDir::new().unwrap();
+    let store_name = "ns-backfill-deferred";
+    let store: Arc<dyn DatabaseBackend> = Arc::new(make_store_at(&dir, store_name).await);
+
+    // A derived-only tenant the next compatibility pass would seed.
+    {
+        let sql_store = make_store_at(&dir, store_name).await;
+        seed_upstream(&sql_store, "derived-tenant", "up-derived").await;
+        clear_backfill_marker(&sql_store).await;
+        assert!(!registry_row_exists(&sql_store, "derived-tenant").await);
+    }
+
+    // Hold the global registry key exactly the way a live mutation does.
+    let admission = lock_namespace_registry_admission_for_test(store.clone(), &["derived-tenant"])
+        .await
+        .expect("registry admission");
+
+    let contended = make_store_at(&dir, store_name).await;
+    assert!(
+        !registry_row_exists(&contended, "derived-tenant").await,
+        "the compatibility pass must not seed while the global registry lease is held elsewhere"
+    );
+    assert!(
+        !backfill_marker_present(&contended).await,
+        "a deferred pass must leave the completion marker absent so a later startup retries"
+    );
+    drop(admission);
+}
+
+/// A pass that crashed before recording completion leaves the marker absent, so
+/// the next startup retries the same idempotent inserts — and a namespace that
+/// was deliberately deleted in between is NOT resurrected, because it is no
+/// longer a derived name.
+#[tokio::test]
+async fn namespace_registry_backfill_retries_after_a_crash_without_resurrecting_deletes() {
+    let dir = TempDir::new().unwrap();
+    let store_name = "ns-backfill-crash-retry";
+    let store = Arc::new({
+        let mut store = make_store_at(&dir, store_name).await;
+        apply_protected_namespaces(&mut store, &["keeper"]);
+        store
+    });
+    let (base, shutdown) = start_admin(admin_state_from_arc(store.clone())).await;
+    let token = admin_token();
+
+    for name in ["keeper", "doomed"] {
+        let (status, body) = send(
+            reqwest::Method::POST,
+            &base,
+            "/namespaces",
+            &token,
+            Some(json!({ "name": name })),
+        )
+        .await;
+        assert_eq!(status, 201, "create {name}: {body:?}");
+    }
+
+    let (status, body) = send(
+        reqwest::Method::DELETE,
+        &base,
+        "/namespaces/doomed",
+        &token,
+        None,
+    )
+    .await;
+    assert_eq!(status, 204, "delete an empty tenant: {body:?}");
+    assert!(!registry_row_exists(store.as_ref(), "doomed").await);
+
+    // Simulate a compatibility pass that crashed before its marker landed, and
+    // a derived-only tenant that only the retry can materialize.
+    seed_upstream(store.as_ref(), "late-derived", "up-late").await;
+    clear_backfill_marker(store.as_ref()).await;
+    // The DELETE handler releases its admission lease from a Drop-spawned task;
+    // expire the global key outright so the reconnect below deterministically
+    // acquires it instead of racing that task.
+    expire_global_registry_lease(store.as_ref()).await;
+    let _ = shutdown.send(true);
+    drop(store);
+
+    let retried = make_store_at(&dir, store_name).await;
+    assert!(
+        backfill_marker_present(&retried).await,
+        "the retry must record completion"
+    );
+    assert!(
+        registry_row_exists(&retried, "late-derived").await,
+        "the retry must seed pre-existing derived names"
+    );
+    assert!(
+        registry_row_exists(&retried, "keeper").await,
+        "an existing registry row survives the retry"
+    );
+    assert!(
+        !registry_row_exists(&retried, "doomed").await,
+        "a deleted namespace must not be resurrected by a later compatibility pass"
+    );
+}
+
+/// Backfill-then-delete: once the pass has materialized a derived name, an
+/// ordinary confirmed delete removes it for good and no later pass brings it
+/// back (the completion marker is durable, and the name is no longer derived).
+#[tokio::test]
+async fn namespace_registry_backfill_then_delete_is_not_undone_by_a_later_pass() {
+    let dir = TempDir::new().unwrap();
+    let store_name = "ns-backfill-then-delete";
+    let store = Arc::new({
+        let mut store = make_store_at(&dir, store_name).await;
+        apply_protected_namespaces(&mut store, &["anchor"]);
+        store
+    });
+    seed_upstream(store.as_ref(), "seeded-tenant", "up-seeded").await;
+    clear_backfill_marker(store.as_ref()).await;
+    drop(store);
+
+    let store = Arc::new({
+        let mut store = make_store_at(&dir, store_name).await;
+        apply_protected_namespaces(&mut store, &["anchor"]);
+        store
+    });
+    assert!(
+        registry_row_exists(store.as_ref(), "seeded-tenant").await,
+        "the compatibility pass must materialize the derived name"
+    );
+    let (base, shutdown) = start_admin(admin_state_from_arc(store.clone())).await;
+    let token = admin_token();
+
+    let (status, body) = send(
+        reqwest::Method::POST,
+        &base,
+        "/namespaces",
+        &token,
+        Some(json!({ "name": "anchor" })),
+    )
+    .await;
+    assert_eq!(status, 201, "keep a second registry row: {body:?}");
+
+    let (status, body) = send(
+        reqwest::Method::DELETE,
+        &base,
+        "/namespaces/seeded-tenant?confirm=true",
+        &token,
+        None,
+    )
+    .await;
+    assert_eq!(status, 204, "confirmed cascade delete: {body:?}");
+    assert!(!registry_row_exists(store.as_ref(), "seeded-tenant").await);
+
+    let _ = shutdown.send(true);
+    drop(store);
+
+    let reconnected = make_store_at(&dir, store_name).await;
+    assert!(
+        !registry_row_exists(&reconnected, "seeded-tenant").await,
+        "a later compatibility pass must not resurrect a confirmed delete"
+    );
+    let listed = reconnected.list_namespaces().await.unwrap();
+    assert!(
+        !listed.iter().any(|item| item == "seeded-tenant"),
+        "GET /namespaces must not resurrect a confirmed delete: {listed:?}"
+    );
+}
+
+/// A database that aborts the committing transaction as a serialization
+/// failure or deadlock victim (PostgreSQL `40001` / `40P01`, or MySQL's `40001`
+/// deadlock victim) committed nothing, so the endpoint must answer the
+/// documented retryable `503` — not a `500`.
+///
+/// The real abort needs two racing PostgreSQL transactions plus the independent
+/// 30-second admission renewer, which no deterministic test can stage. This
+/// drives the already-classified typed conflict through the same commit-boundary
+/// gate the real abort surfaces at; the SQLSTATE classification itself is
+/// covered by `tests/unit/config/db_loader_tests.rs`.
+#[tokio::test]
+async fn a_database_aborted_transaction_is_a_retryable_503_not_a_500() {
+    let dir = TempDir::new().unwrap();
+    let store = Arc::new(make_store(&dir).await);
+    let (base, _shutdown) = start_admin(admin_state_from_arc(store.clone())).await;
+    let token = admin_token();
+
+    let (status, body) = send(
+        reqwest::Method::POST,
+        &base,
+        "/namespaces",
+        &token,
+        Some(json!({"name": "conflicted", "description": "before"})),
+    )
+    .await;
+    assert_eq!(status, 201, "{body:?}");
+
+    for (method, path, payload) in [
+        (
+            reqwest::Method::DELETE,
+            "/namespaces/conflicted".to_string(),
+            None,
+        ),
+        (
+            reqwest::Method::PUT,
+            "/namespaces/conflicted".to_string(),
+            Some(json!({"name": "conflicted-renamed"})),
+        ),
+    ] {
+        set_namespace_registry_fault_for_test(
+            "conflicted",
+            Some(NamespaceRegistryPhase::TransactionConflict),
+        );
+        let mut request = reqwest::Client::new()
+            .request(method.clone(), format!("{base}{path}"))
+            .bearer_auth(&token);
+        if let Some(payload) = &payload {
+            request = request.json(payload);
+        }
+        let response = request.send().await.expect("request succeeds");
+        let status = response.status().as_u16();
+        let retry_after = response
+            .headers()
+            .get("retry-after")
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_string);
+        let body = response.json::<Value>().await.unwrap_or_else(|_| json!({}));
+        set_namespace_registry_fault_for_test("conflicted", None);
+
+        assert_eq!(
+            status, 503,
+            "{method} must report a database-aborted transaction as retryable: {body:?}"
+        );
+        assert_eq!(
+            retry_after.as_deref(),
+            Some("1"),
+            "{method} must carry Retry-After: 1"
+        );
+        assert_eq!(
+            body["rollback"], "not_needed",
+            "{method} aborted before commit, so there is nothing to roll back"
+        );
+        assert_eq!(
+            body["error"],
+            ferrum_edge::config::namespace_registry::NAMESPACE_REGISTRY_RETRYABLE_CONFLICT_MESSAGE,
+            "{method} must return the fixed redacted message"
+        );
+
+        // Redaction: no SQLSTATE, driver text, relation name, or statement.
+        let rendered = body.to_string();
+        for leak in [
+            "40001",
+            "40P01",
+            "SQLSTATE",
+            "config_admission_locks",
+            "FOR UPDATE",
+            "serialization",
+            "deadlock",
+        ] {
+            assert!(
+                !rendered.contains(leak),
+                "the {method} response leaked driver/schema detail ({leak}): {rendered}"
+            );
+        }
+    }
+
+    // Nothing was applied by either refusal.
+    assert!(registry_row_exists(&store, "conflicted").await);
+    assert!(!registry_row_exists(&store, "conflicted-renamed").await);
+    let (status, body) = send(
+        reqwest::Method::GET,
+        &base,
+        "/namespaces/conflicted",
+        &token,
+        None,
+    )
+    .await;
+    assert_eq!(status, 200, "{body:?}");
+    assert_eq!(body["description"], "before");
 }

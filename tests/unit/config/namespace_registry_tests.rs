@@ -6,10 +6,12 @@ use ferrum_edge::config::batch_atomicity::{
 };
 use ferrum_edge::config::namespace_registry::{
     CreateNamespaceRequest, MAX_NAMESPACE_DESCRIPTION_CHARS, NAMESPACE_OCCUPANCY_TABLES,
-    NAMESPACE_REGISTRY_ADMISSION_KEY, NAMESPACE_RENAME_SIMPLE_TABLES,
-    NAMESPACES_REGISTRY_BACKFILL_ID, NamespaceRegistryCorrupt, SCHEMA_COMPAT_TABLE,
-    UpdateNamespaceBody, mtls_dns_admission_namespaces, namespace_prefixed_id_suffix_field,
-    namespace_registry_admission_keys, normalize_description, parse_namespace_rfc3339,
+    NAMESPACE_REGISTRY_ADMISSION_KEY, NAMESPACE_REGISTRY_RETRYABLE_CONFLICT_MESSAGE,
+    NAMESPACE_RENAME_SIMPLE_TABLES, NAMESPACES_REGISTRY_BACKFILL_ID, NamespaceRegistryCorrupt,
+    NamespaceRegistryError, NamespaceRegistryRetryableConflict, SCHEMA_COMPAT_TABLE,
+    UpdateNamespaceBody, is_namespace_registry_retryable_conflict, mtls_dns_admission_namespaces,
+    namespace_prefixed_id_suffix_field, namespace_registry_admission_keys, normalize_description,
+    normalize_protected_namespaces, parse_namespace_rfc3339, protected_namespaces_contains,
     require_canonical_stored_description, require_namespace_identity,
     require_namespace_keyed_embedded_namespace, require_namespace_keyed_identity,
     require_namespace_prefixed_identity, require_namespace_registry_admission_keys,
@@ -671,4 +673,138 @@ fn require_namespace_registry_admission_keys_rejects_incomplete_and_substituted_
         ),
         leaked,
     );
+}
+
+// ── Protected namespace set (issue #3955 review) ────────────────────────────
+
+#[test]
+fn protected_namespaces_are_normalized_deduped_and_sorted() {
+    let protected = normalize_protected_namespaces(&[
+        "  tenant-b  ".to_string(),
+        "tenant-a".to_string(),
+        "tenant-b".to_string(),
+        "   ".to_string(),
+        String::new(),
+        "ferrum".to_string(),
+    ]);
+    assert_eq!(
+        protected,
+        vec![
+            "ferrum".to_string(),
+            "tenant-a".to_string(),
+            "tenant-b".to_string()
+        ],
+        "entries must be trimmed, de-duplicated, and sorted so lookup is a binary search"
+    );
+    for name in ["ferrum", "tenant-a", "tenant-b"] {
+        assert!(
+            protected_namespaces_contains(&protected, name),
+            "{name} must be protected"
+        );
+    }
+    for name in ["tenant-c", "", "tenant-", "TENANT-A"] {
+        assert!(
+            !protected_namespaces_contains(&protected, name),
+            "{name} must not be protected"
+        );
+    }
+}
+
+#[test]
+fn protected_namespaces_never_resolve_to_an_empty_set() {
+    // A misconfigured or whitespace-only input must not leave the process with
+    // nothing protected at all; it falls back to the canonical default.
+    for input in [
+        Vec::new(),
+        vec![String::new()],
+        vec!["   ".to_string(), "\t".to_string()],
+    ] {
+        let protected = normalize_protected_namespaces(&input);
+        assert_eq!(protected, vec!["ferrum".to_string()], "input: {input:?}");
+        assert!(protected_namespaces_contains(&protected, "ferrum"));
+    }
+}
+
+#[test]
+fn protected_namespace_reason_is_static_and_enumerates_no_tenant() {
+    let reason = NamespaceRegistryError::PROTECTED_CONFIGURED_NAMESPACE;
+    assert!(
+        reason.contains("FERRUM_NAMESPACE") && reason.contains("FERRUM_CP_NAMESPACES"),
+        "the reason must name the configuration keys an operator can change: {reason}"
+    );
+    // A 409 must never let a caller enumerate the rest of the configured set.
+    let rendered = NamespaceRegistryError::Protected {
+        name: "tenant-a".to_string(),
+        reason,
+    }
+    .to_string();
+    assert!(rendered.contains("tenant-a"), "{rendered}");
+    for other in ["tenant-b", "tenant-c", "prod", "staging"] {
+        assert!(
+            !rendered.contains(other),
+            "the protected 409 leaked another configured namespace ({other}): {rendered}"
+        );
+    }
+}
+
+// ── Retryable database conflict (issue #3955 review) ────────────────────────
+
+#[test]
+fn retryable_registry_conflict_is_typed_chain_aware_and_redacted() {
+    let bare = anyhow::Error::new(NamespaceRegistryRetryableConflict);
+    assert!(is_namespace_registry_retryable_conflict(&bare));
+    assert_eq!(
+        bare.to_string(),
+        NAMESPACE_REGISTRY_RETRYABLE_CONFLICT_MESSAGE
+    );
+
+    // Persistence layers wrap errors with their own context; classification
+    // must still find the typed cause.
+    let wrapped = anyhow::Error::new(NamespaceRegistryRetryableConflict)
+        .context("namespace registry transaction failed");
+    assert!(is_namespace_registry_retryable_conflict(&wrapped));
+
+    // The fixed message must not read like a partial write, and must not carry
+    // driver text, a relation name, or a tenant name.
+    let message = NAMESPACE_REGISTRY_RETRYABLE_CONFLICT_MESSAGE;
+    assert!(
+        message.contains("nothing was applied"),
+        "the retryable message must state the fail-closed outcome: {message}"
+    );
+    for leak in [
+        "40001",
+        "40P01",
+        "SQLSTATE",
+        "config_admission_locks",
+        "namespaces",
+        "SELECT",
+    ] {
+        assert!(
+            !message.contains(leak),
+            "the retryable message leaked driver/schema detail ({leak}): {message}"
+        );
+    }
+}
+
+#[test]
+fn retryable_registry_conflict_is_not_confused_with_other_registry_failures() {
+    for other in [
+        anyhow::Error::new(BatchAdmissionLeaseLost),
+        NamespaceRegistryError::name_in_use("tenant-a"),
+        NamespaceRegistryError::not_empty("tenant-a"),
+        NamespaceRegistryError::protected(
+            "tenant-a",
+            NamespaceRegistryError::PROTECTED_CONFIGURED_NAMESPACE,
+        ),
+        anyhow::anyhow!("connection refused"),
+    ] {
+        assert!(
+            !is_namespace_registry_retryable_conflict(&other),
+            "misclassified as a retryable database conflict: {other}"
+        );
+    }
+    // ...and the retryable conflict is not a lost lease.
+    assert!(!ferrum_edge::config::db_backend::is_batch_admission_lease_lost(
+        &anyhow::Error::new(NamespaceRegistryRetryableConflict)
+    ));
 }

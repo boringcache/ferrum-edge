@@ -339,7 +339,19 @@ The backend also requires the exact canonical lease-key sequence (global
 before opening that transaction; an incomplete or substituted set is the same
 retryable lost-lease refusal. Connect/migrate runs a **one-time** compatibility
 backfill of pre-existing derived names plus canonical `ferrum`, then records
-completion in `_ferrum_schema_compat` (not a registry document). A failed
+completion in `_ferrum_schema_compat` (not a registry document). That pass runs
+under the **same global `!namespace-registry` admission lease** every live
+create/rename/delete takes, so it cannot read derived names next to a concurrent
+confirmed `DELETE` and then resurrect the removed document. Because MongoDB
+cannot run the pass as one transaction on every supported deployment (a
+standalone `mongod` has no multi-document transactions), continuous ownership is
+what fences it: the lease is re-proved by a conditional server-clock renewal
+immediately before the upserts and again immediately before the completion
+marker, and the acquisition path never steals an unexpired owner and always
+bumps `generation` on an ownership change — so a renewal that still matches the
+same owner proves no other process held the key in between. A lease held
+elsewhere defers the pass rather than failing startup, and the lease is released
+on every path, success or error. A failed
 attempt leaves that marker absent so a later startup retries; once complete,
 later migrate/reconnect/startup passes do not reseed deleted names. Registry
 lookups and vacancy checks scan both durable `_id` and embedded `name`, then
@@ -368,6 +380,24 @@ operations return `501 Not Implemented` before touching anything and name
 `FERRUM_MONGO_REPLICA_SET` (or the `replicaSet` URL option) as the remediation.
 `GET /namespaces` and `GET /namespaces/{name}` remain available, and SQL
 backends are unaffected.
+
+`POST /restore` shares that strict cascade. Its destructive clear no longer
+issues a blind `delete_many` over `consumers` and `consumer_identity_index`: it
+validates each document's durable `_id = "{namespace}:{suffix}"` against the
+embedded `namespace` and identity value first, and deletes only the identities it
+validated. This is a **behavior change on an existing endpoint** — a split
+identity that only a hand-edited database or an out-of-band writer can produce
+now aborts the restore as typed registry corruption (redacted `500`, rolled back,
+prior configuration retained) instead of being deleted blindly. Deleting a
+document whose durable key belongs to another tenant would be a cross-tenant
+deletion, and ignoring it would leave the target namespace half-cleared before
+the import, so this check is deliberately fail-closed. Repair or deliberately
+remove the offending document and re-run the restore.
+
+Namespace backup payloads carry namespace-scoped configuration resources, never
+the registry document itself, so restore never transplants a source tenant's
+description or registry timestamps into the authenticated target namespace. See
+[admin_api.md](admin_api.md) for the full boundary.
 
 A direct `DELETE /proxies/{id}` for an API-spec-owned proxy is different: its
 ownership cascade spans the proxy, scoped plugins, the `api_specs` owner

@@ -27,8 +27,8 @@ use crate::config::db_backend::GatewayTrustBundleRevisionConflict;
 use crate::config::gateway_trust::GatewayTrustBundleRecord;
 use crate::config::namespace_registry::{
     NamespaceRegistryError as RegistryError, NamespaceRegistryPhase as RegistryPhase,
-    check_namespace_registry_fault, namespace_registry_fault,
-    require_namespace_registry_admission_leases,
+    NamespaceRegistryRetryableConflict, check_namespace_registry_fault, namespace_registry_fault,
+    protected_namespaces_contains, require_namespace_registry_admission_leases,
 };
 use crate::config::types::{
     AuthMode, BackendScheme, CircuitBreakerConfig, Consumer, DispatchKind, GatewayConfig,
@@ -71,7 +71,133 @@ pub use crate::config::db_backend::{
     SortOrder, TcpConnectionThrottleAttachmentConflict, extract_db_hostname, redact_url,
 };
 
-const CONFIG_ADMISSION_LEASE_DURATION_MILLIS: i64 = 120_000;
+pub(crate) const CONFIG_ADMISSION_LEASE_DURATION_MILLIS: i64 = 120_000;
+
+/// Rewrite `?` placeholders into PostgreSQL's `$n` form.
+///
+/// Shared with the V001 compatibility pass so the migration-time namespace
+/// registry backfill binds parameters exactly the way the runtime store does.
+pub(crate) fn rewrite_query_placeholders(db_type: &str, sql: &str) -> String {
+    if db_type != "postgres" {
+        return sql.to_string();
+    }
+    let mut result = String::with_capacity(sql.len() + 16);
+    let mut n = 0u32;
+    for ch in sql.chars() {
+        if ch == '?' {
+            n += 1;
+            result.push('$');
+            // Inline u32 formatting to avoid format!() overhead
+            let s = n.to_string();
+            result.push_str(&s);
+        } else {
+            result.push(ch);
+        }
+    }
+    result
+}
+
+/// Database-side "now" in epoch milliseconds. Lease expiry is always compared
+/// against the datastore's own clock, never a process clock.
+pub(crate) fn config_admission_lease_now_sql(db_type: &str) -> &'static str {
+    match db_type {
+        "mysql" => "CAST(UNIX_TIMESTAMP(CURRENT_TIMESTAMP(3)) * 1000 AS SIGNED)",
+        "sqlite" => "CAST((julianday('now') - 2440587.5) * 86400000 AS INTEGER)",
+        _ => "CAST(EXTRACT(EPOCH FROM clock_timestamp()) * 1000 AS BIGINT)",
+    }
+}
+
+/// Conditional lease acquisition: takes the row only when it is unowned,
+/// expired, or already owned by this owner. It never steals an unexpired
+/// owner's lease, and it bumps `generation` on every ownership change.
+pub(crate) fn config_admission_lease_acquire_sql(db_type: &str) -> String {
+    let now = config_admission_lease_now_sql(db_type);
+    match db_type {
+        "mysql" => format!(
+            "INSERT INTO config_admission_locks \
+             (namespace, owner, expires_at, generation) VALUES (?, ?, {now} + ?, 1) \
+             ON DUPLICATE KEY UPDATE \
+             generation = IF(\
+                 expires_at <= {now} OR owner = VALUES(owner), \
+                 IF(owner = VALUES(owner), generation, generation + 1), \
+                 generation), \
+             owner = IF(expires_at <= {now} OR owner = VALUES(owner), VALUES(owner), owner), \
+             expires_at = IF(owner = VALUES(owner), VALUES(expires_at), expires_at)"
+        ),
+        _ => rewrite_query_placeholders(
+            db_type,
+            &format!(
+                "INSERT INTO config_admission_locks \
+                 (namespace, owner, expires_at, generation) VALUES (?, ?, {now} + ?, 1) \
+                 ON CONFLICT (namespace) DO UPDATE SET \
+                 generation = CASE \
+                     WHEN config_admission_locks.owner = excluded.owner \
+                     THEN config_admission_locks.generation \
+                     ELSE config_admission_locks.generation + 1 END, \
+                 owner = excluded.owner, expires_at = excluded.expires_at \
+                 WHERE config_admission_locks.expires_at <= {now} \
+                    OR config_admission_locks.owner = excluded.owner"
+            ),
+        ),
+    }
+}
+
+/// SQLSTATE classes a namespace registry mutation may safely retry.
+///
+/// `40001` is `serialization_failure` (PostgreSQL) and also the SQLSTATE MySQL
+/// reports for a deadlock victim; `40P01` is PostgreSQL's `deadlock_detected`.
+/// Both are raised by the server *instead of* committing, so nothing from the
+/// transaction is durable. Nothing else belongs here: `23505`/`23000`
+/// uniqueness violations are real conflicts a retry would only repeat, and
+/// connectivity failures carry no SQLSTATE at all.
+const RETRYABLE_TRANSACTION_CONFLICT_SQLSTATES: &[&str] = &["40001", "40P01"];
+
+/// True when `code` is a SQLSTATE the database uses to say "I aborted your
+/// transaction; nothing was applied, try again".
+pub fn sqlstate_is_retryable_transaction_conflict(code: &str) -> bool {
+    RETRYABLE_TRANSACTION_CONFLICT_SQLSTATES.contains(&code)
+}
+
+/// Chain-aware, code-based classification of a database-aborted transaction.
+///
+/// Persistence layers wrap driver errors with their own context, so the
+/// outermost message alone misses the abort. Only the SQLSTATE is inspected —
+/// the driver's message is never read, rendered, or logged, because it names
+/// the relation and the conflicting transaction.
+pub fn is_retryable_sql_transaction_conflict(error: &anyhow::Error) -> bool {
+    error
+        .chain()
+        .filter_map(|cause| cause.downcast_ref::<sqlx::Error>())
+        .any(sqlx_error_is_retryable_transaction_conflict)
+}
+
+fn sqlx_error_is_retryable_transaction_conflict(error: &sqlx::Error) -> bool {
+    use sqlx::error::DatabaseError;
+    let sqlx::Error::Database(database_error) = error else {
+        return false;
+    };
+    DatabaseError::code(&**database_error)
+        .is_some_and(|code| sqlstate_is_retryable_transaction_conflict(code.as_ref()))
+}
+
+/// Replace a database-aborted registry mutation with the typed retryable
+/// conflict so admin responders never have to inspect driver text.
+///
+/// The original error is deliberately dropped rather than chained: it is the
+/// only place the driver message could still leak into a `{:#}` rendering, and
+/// the SQLSTATE has already been consumed by the classification above.
+fn classify_namespace_registry_result<T>(
+    result: Result<T, anyhow::Error>,
+) -> Result<T, anyhow::Error> {
+    match result {
+        Ok(value) => Ok(value),
+        Err(error) if is_retryable_sql_transaction_conflict(&error) => {
+            Err(anyhow::Error::new(NamespaceRegistryRetryableConflict))
+        }
+        Err(error) => Err(error),
+    }
+}
+
 pub(crate) const MYSQL_MTLS_DNS_ADMISSION_LOCK_INSERT_SQL: &str = "INSERT INTO mtls_dns_admission_locks \
      (namespace, updated_at) VALUES (?, ?) \
      ON DUPLICATE KEY UPDATE updated_at = mtls_dns_admission_locks.updated_at";
@@ -715,13 +841,14 @@ pub struct DatabaseStore {
     /// Shared via `Arc<AtomicBool>` so all clones of the store observe the
     /// same cleared-state after recovery.
     migrations_pending: Arc<std::sync::atomic::AtomicBool>,
-    /// The namespace this process serves, applied once at startup from the
-    /// already-resolved `EnvConfig` (issue #3955). Namespace DELETE and
-    /// rename-away consult THIS value rather than re-reading
-    /// `std::env::var("FERRUM_NAMESPACE")` at request time, which would bypass
-    /// the CLI > env > conf-file > default precedence and could protect the
-    /// wrong namespace.
-    effective_default_namespace: String,
+    /// The namespaces this process is configured to serve, sorted and
+    /// de-duplicated, applied once at startup from the already-resolved
+    /// `EnvConfig` (issue #3955). Namespace DELETE and rename-away consult THIS
+    /// set rather than re-reading `std::env::var("FERRUM_NAMESPACE")` /
+    /// `FERRUM_CP_NAMESPACES` at request time, which would bypass the
+    /// CLI > env > conf-file > default precedence and could protect the wrong
+    /// namespaces.
+    protected_namespaces: Vec<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -943,23 +1070,7 @@ impl DatabaseStore {
     ///
     /// This method is a no-op for MySQL and SQLite (which use `?` natively).
     fn q(&self, sql: &str) -> String {
-        if self.db_type != "postgres" {
-            return sql.to_string();
-        }
-        let mut result = String::with_capacity(sql.len() + 16);
-        let mut n = 0u32;
-        for ch in sql.chars() {
-            if ch == '?' {
-                n += 1;
-                result.push('$');
-                // Inline u32 formatting to avoid format!() overhead
-                let s = n.to_string();
-                result.push_str(&s);
-            } else {
-                result.push(ch);
-            }
-        }
-        result
+        rewrite_query_placeholders(&self.db_type, sql)
     }
 
     fn proxy_route_lock_insert_sql(&self) -> String {
@@ -995,40 +1106,11 @@ impl DatabaseStore {
     }
 
     fn config_admission_lease_acquire_sql(&self) -> String {
-        let now = self.config_admission_lease_now_sql();
-        match self.db_type.as_str() {
-            "mysql" => format!(
-                "INSERT INTO config_admission_locks \
-                 (namespace, owner, expires_at, generation) VALUES (?, ?, {now} + ?, 1) \
-                 ON DUPLICATE KEY UPDATE \
-                 generation = IF(\
-                     expires_at <= {now} OR owner = VALUES(owner), \
-                     IF(owner = VALUES(owner), generation, generation + 1), \
-                     generation), \
-                 owner = IF(expires_at <= {now} OR owner = VALUES(owner), VALUES(owner), owner), \
-                 expires_at = IF(owner = VALUES(owner), VALUES(expires_at), expires_at)"
-            ),
-            _ => self.q(&format!(
-                "INSERT INTO config_admission_locks \
-                 (namespace, owner, expires_at, generation) VALUES (?, ?, {now} + ?, 1) \
-                 ON CONFLICT (namespace) DO UPDATE SET \
-                 generation = CASE \
-                     WHEN config_admission_locks.owner = excluded.owner \
-                     THEN config_admission_locks.generation \
-                     ELSE config_admission_locks.generation + 1 END, \
-                 owner = excluded.owner, expires_at = excluded.expires_at \
-                 WHERE config_admission_locks.expires_at <= {now} \
-                    OR config_admission_locks.owner = excluded.owner"
-            )),
-        }
+        config_admission_lease_acquire_sql(&self.db_type)
     }
 
     fn config_admission_lease_now_sql(&self) -> &'static str {
-        match self.db_type.as_str() {
-            "mysql" => "CAST(UNIX_TIMESTAMP(CURRENT_TIMESTAMP(3)) * 1000 AS SIGNED)",
-            "sqlite" => "CAST((julianday('now') - 2440587.5) * 86400000 AS INTEGER)",
-            _ => "CAST(EXTRACT(EPOCH FROM clock_timestamp()) * 1000 AS BIGINT)",
-        }
+        config_admission_lease_now_sql(&self.db_type)
     }
 
     fn config_admission_lease_renew_sql(&self) -> String {
@@ -1842,7 +1924,7 @@ impl DatabaseStore {
             audit_retention: crate::admin::audit::AuditRetentionPolicy::default(),
             audit_max_rows_prune_gates: Arc::new(DashMap::new()),
             migrations_pending: Arc::new(std::sync::atomic::AtomicBool::new(false)),
-            effective_default_namespace: crate::config::types::DEFAULT_NAMESPACE.to_string(),
+            protected_namespaces: vec![crate::config::types::DEFAULT_NAMESPACE.to_string()],
         };
 
         store.run_migrations().await?;
@@ -1903,7 +1985,7 @@ impl DatabaseStore {
             audit_retention: crate::admin::audit::AuditRetentionPolicy::default(),
             audit_max_rows_prune_gates: Arc::new(DashMap::new()),
             migrations_pending: Arc::new(std::sync::atomic::AtomicBool::new(true)),
-            effective_default_namespace: crate::config::types::DEFAULT_NAMESPACE.to_string(),
+            protected_namespaces: vec![crate::config::types::DEFAULT_NAMESPACE.to_string()],
         })
     }
 
@@ -8051,6 +8133,16 @@ impl DatabaseStore {
             .is_some())
     }
 
+    /// True when `name` is one of the namespaces this process is configured to
+    /// serve, and therefore may not be deleted or renamed away.
+    ///
+    /// Read from the set applied once at startup, never from the process
+    /// environment, and re-checked inside every committing registry
+    /// transaction so a handler precheck cannot be raced or bypassed.
+    fn is_protected_namespace_name(&self, name: &str) -> bool {
+        protected_namespaces_contains(&self.protected_namespaces, name)
+    }
+
     async fn get_namespace_tx(
         &self,
         tx: &mut sqlx::Transaction<'_, sqlx::Any>,
@@ -8090,6 +8182,7 @@ impl DatabaseStore {
     ) -> Result<(), anyhow::Error> {
         require_namespace_registry_admission_leases(names, leases).map_err(anyhow::Error::new)?;
         check_namespace_registry_fault(fault, RegistryPhase::LeaseLost)?;
+        check_namespace_registry_fault(fault, RegistryPhase::TransactionConflict)?;
         for hold in leases {
             self.verify_namespace_config_admission_lease_tx(tx, hold.key, &hold.lease)
                 .await?;
@@ -8097,7 +8190,20 @@ impl DatabaseStore {
         Ok(())
     }
 
+    /// Insert a registry row, all-or-nothing.
+    ///
+    /// A database-side serialization failure or deadlock abort is reported as
+    /// the typed retryable conflict: the transaction never committed, so the
+    /// caller gets a documented safe-retry answer instead of a generic 500.
     pub async fn create_namespace(
+        &self,
+        record: &crate::config::namespace_registry::NamespaceRecord,
+        leases: &[crate::config::batch_atomicity::NamespaceAdmissionLeaseHold<'_>],
+    ) -> Result<(), anyhow::Error> {
+        classify_namespace_registry_result(self.create_namespace_inner(record, leases).await)
+    }
+
+    async fn create_namespace_inner(
         &self,
         record: &crate::config::namespace_registry::NamespaceRecord,
         leases: &[crate::config::batch_atomicity::NamespaceAdmissionLeaseHold<'_>],
@@ -8136,7 +8242,23 @@ impl DatabaseStore {
     /// A derived-only namespace (resources but no registry row) is materialized
     /// here, so "update the description of an implicitly created tenant" has the
     /// same well-defined atomic outcome as any other update.
+    ///
+    /// A database-side serialization failure or deadlock abort is reported as
+    /// the typed retryable conflict rather than a generic failure.
     pub async fn update_namespace(
+        &self,
+        current_name: &str,
+        new_name: &str,
+        description: Option<Option<String>>,
+        leases: &[crate::config::batch_atomicity::NamespaceAdmissionLeaseHold<'_>],
+    ) -> Result<crate::config::namespace_registry::NamespaceRecord, anyhow::Error> {
+        classify_namespace_registry_result(
+            self.update_namespace_inner(current_name, new_name, description, leases)
+                .await,
+        )
+    }
+
+    async fn update_namespace_inner(
         &self,
         current_name: &str,
         new_name: &str,
@@ -8162,11 +8284,13 @@ impl DatabaseStore {
         }
         if renaming {
             // A rename is semantically a removal of the old name: the gateway
-            // would be left serving a namespace that no longer exists.
-            if current_name == self.effective_default_namespace {
+            // (or, in CP mode, every DP subscribed to an explicitly configured
+            // namespace) would be left serving a namespace that no longer
+            // exists.
+            if self.is_protected_namespace_name(current_name) {
                 return Err(RegistryError::protected(
                     current_name,
-                    RegistryError::PROTECTED_PROCESS_DEFAULT,
+                    RegistryError::PROTECTED_CONFIGURED_NAMESPACE,
                 ));
             }
             if self.namespace_name_in_use_tx(&mut tx, new_name).await? {
@@ -8452,7 +8576,19 @@ impl DatabaseStore {
     /// remaining **registry row**. The lease identities are re-verified
     /// against the database's clock immediately before commit, so a lost or
     /// stolen lease aborts with nothing durable.
+    ///
+    /// A database-side serialization failure or deadlock abort is reported as
+    /// the typed retryable conflict rather than a generic failure.
     pub async fn delete_namespace(
+        &self,
+        name: &str,
+        cascade: bool,
+        leases: &[crate::config::batch_atomicity::NamespaceAdmissionLeaseHold<'_>],
+    ) -> Result<bool, anyhow::Error> {
+        classify_namespace_registry_result(self.delete_namespace_inner(name, cascade, leases).await)
+    }
+
+    async fn delete_namespace_inner(
         &self,
         name: &str,
         cascade: bool,
@@ -8465,10 +8601,10 @@ impl DatabaseStore {
         // Postgres: must precede every other statement in the transaction.
         self.use_delete_capture_snapshot_tx(&mut tx).await?;
         check_namespace_registry_fault(fault, RegistryPhase::Start)?;
-        if name == self.effective_default_namespace {
+        if self.is_protected_namespace_name(name) {
             return Err(RegistryError::protected(
                 name,
-                RegistryError::PROTECTED_PROCESS_DEFAULT,
+                RegistryError::PROTECTED_CONFIGURED_NAMESPACE,
             ));
         }
 
@@ -11115,17 +11251,13 @@ impl DatabaseBackend for DatabaseStore {
         DatabaseStore::namespace_has_resources(self, name).await
     }
 
-    fn effective_default_namespace(&self) -> &str {
-        &self.effective_default_namespace
+    fn protected_namespaces(&self) -> &[String] {
+        &self.protected_namespaces
     }
 
-    fn set_effective_default_namespace(&mut self, namespace: &str) {
-        let namespace = namespace.trim();
-        self.effective_default_namespace = if namespace.is_empty() {
-            crate::config::types::DEFAULT_NAMESPACE.to_string()
-        } else {
-            namespace.to_string()
-        };
+    fn set_protected_namespaces(&mut self, namespaces: &[String]) {
+        self.protected_namespaces =
+            crate::config::namespace_registry::normalize_protected_namespaces(namespaces);
     }
 
     async fn create_namespace(
