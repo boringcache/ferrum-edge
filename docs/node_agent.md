@@ -19,7 +19,7 @@ For the security posture of this mode (required Linux capabilities, mounts, secc
 | BPF pod maps | `FERRUM_POD_IPS`, `FERRUM_POD_IPS6` | IPv4/IPv6 pod IP to proxy-port and capture-lifecycle metadata for enrolled workloads. The tc guard treats these maps as the enrolled destination set and keeps pod-originated Ambient UDP closed until the producer-ready flag is set. |
 | BPF node/probe maps | `FERRUM_NODE_IPS`, `FERRUM_NODE_IPS6`, `FERRUM_NODE_PROBE_PORTS`, `FERRUM_NODE_PROBE_PORTS6` | Explicit trusted kubelet probe source IPs plus enrolled pod probe ports allowed through the NodeWaypoint direct-inbound guard. Helm does not infer host-interface addresses; set `nodeAgent.trustedKubeletProbeSourceIps` only to known kubelet probe source IPs, such as a CNI bridge gateway address. The node-agent derives probe ports from Kubernetes HTTP/TCP/gRPC liveness, readiness, and startup probes. |
 | BPF original destination maps | `FERRUM_ORIG_DST4`, `FERRUM_ORIG_DST6` | Socket-cookie keyed original destination records. The `connect4`/`connect6` hooks write them (stamped with the source pod's UID + SPIFFE hash from `FERRUM_WORKLOAD_IDENTITY`); the node-agent pins them at `/sys/fs/bpf/ferrum/orig_dst{4,6}`; the node-waypoint mesh-proxy's **orig-dst bridge** (`src/ebpf/orig_dst_bridge.rs`) mirrors each record into the `NodeWaypointIdentityResolver`. |
-| BPF UDP reply-source maps and gate | `FERRUM_UDP_REPLY_SOURCES`, `FERRUM_UDP_REPLY_SOURCES6`, `FERRUM_UDP_REPLY_SOURCE_GATE` | Exact `(source address, source port)` pairs a SERVING NodeWaypoint UDP/DTLS listener may reply from, plus one shared BPF-visible gate both tc UDP classifier families consult before either map. The node-agent retracts `<pod registry dir>/.udp-reply-src/applied`, disables the gate, replaces both families while every entry is inert, revalidates the exact bounded manifest, enables the gate, and only then writes `applied`. After successful fencing, any unlink, scan, remove, insert, partial-family, revalidation, or acknowledgement-write failure leaves the gate closed and retryable; stale keys left by a failed removal are inert, not proof of a narrower coherent set. If the gate cannot be disabled, the node-agent reports a hard fencing failure and neither mutates nor acknowledges a successor. All three maps are required for NodeWaypoint readiness, including an empty withdrawal. |
+| BPF UDP relay authorization maps and gate | `FERRUM_UDP_REPLY_SOURCES`, `FERRUM_UDP_REPLY_SOURCES6`, `FERRUM_UDP_RELAY_CGROUPS`, `FERRUM_UDP_REPLY_SOURCE_GATE` | Exact `(source address, source port)` pairs a SERVING NodeWaypoint UDP/DTLS listener may reply from, the NodeWaypoint relay pod's own cgroup-v2 ids (the non-forgeable sender proof both UDP arms require FIRST — the node-agent resolves them from this node's cgroup hierarchy using the pod UID the proxy publishes, and refuses any id belonging to an enrolled workload), plus one shared BPF-visible gate both tc UDP classifier families consult before any of the three. The node-agent retracts `<pod registry dir>/.udp-reply-src/applied`, disables the gate, replaces the relay-cgroup map and then both source families while every entry is inert, revalidates the exact bounded manifest, enables the gate, and only then writes `applied`. After successful fencing, any unlink, scan, remove, insert, partial-family, revalidation, or acknowledgement-write failure leaves the gate closed and retryable; stale keys left by a failed removal are inert, not proof of a narrower coherent set. If the gate cannot be disabled, the node-agent reports a hard fencing failure and neither mutates nor acknowledges a successor. All three maps are required for NodeWaypoint readiness, including an empty withdrawal. |
 | BPF workload identity map | `FERRUM_WORKLOAD_IDENTITY` | Per-cgroup source workload identity (`{pod_uid, workload_spiffe_hash}`), keyed by `bpf_get_current_cgroup_id`. The node-agent writes one entry per enrolled pod cgroup; the connect hooks read it to stamp orig-dst records. Absent entry → connect hooks store the all-zero sentinel, which node-waypoint resolution treats as fail-closed. |
 | BPF capture filters | `FERRUM_BYPASS_UIDS`, `FERRUM_CIDR_*`, `FERRUM_PORT_EXCLUDE` | UID, CIDR, and port exclusions applied before outbound rewrite. |
 
@@ -520,15 +520,25 @@ workload that can forge ordinary Linux socket marks from using the mark alone as
 a direct-pod bypass. Direct UDP/DTLS to enrolled pod IPs fails closed except the
 NodeWaypoint relay's own marked datagrams and DNS responses from source port 53
 back to high pod-originated client ports (`>=32768`); ARP/ICMP and other control
-traffic remains pass-through. The UDP arms accept one SOURCE proof the TCP arm
-does not — an exact `(address, port)` entry in `FERRUM_UDP_REPLY_SOURCES` /
-`FERRUM_UDP_REPLY_SOURCES6` — because a NodeWaypoint UDP/DTLS reply is pinned to
-the address the client addressed rather than route-selected, and on the steered
-Service path that address is a Service ClusterIP. The relay auth mark is still
-required in every case, and those maps hold exact addresses with exact ports, never
-a CIDR or a service range. Both UDP arms first require the shared
-`FERRUM_UDP_REPLY_SOURCE_GATE`; stale or partial family-map keys are inert while
-it is closed. Packets sourced from explicitly configured trusted
+traffic remains pass-through. Every UDP admission additionally requires a
+NON-FORGEABLE sender proof the TCP arm does not have (issues #3956, #3957):
+`bpf_skb_cgroup_id()`, the cgroup-v2 id of the socket that generated the skb,
+must match `FERRUM_UDP_RELAY_CGROUPS` — the node-agent's own host-side rendering
+of the NodeWaypoint relay pod's cgroup subtree. A source address and a socket
+mark are both chosen by whoever emits the packet, so a same-node workload with
+`CAP_NET_ADMIN` in the host network namespace can present a trusted node source
+or (with `IP_TRANSPARENT`) a published Service ClusterIP together with the relay
+mark; it cannot present a cgroup it is not running in. Only inside that proof do
+the two source lanes apply: the configured node source (the relay's backend
+dial) and an exact `(address, port)` entry in `FERRUM_UDP_REPLY_SOURCES` /
+`FERRUM_UDP_REPLY_SOURCES6` (the source-pinned reply, whose address on the
+steered Service path is a Service ClusterIP). The relay auth mark is still
+required in every case, and those maps hold exact addresses with exact ports,
+never a CIDR or a service range. All three maps sit behind the shared
+`FERRUM_UDP_REPLY_SOURCE_GATE`; stale or partial keys are inert while it is
+closed. The sender proof answers only on the tc EGRESS hook of the pod's
+host-side veth, where the relay's own datagrams still carry their socket;
+forwarded traffic and the tc INGRESS hook report zero and are refused. Packets sourced from explicitly configured trusted
 kubelet probe source IPs in `FERRUM_NODE_IPS` / `FERRUM_NODE_IPS6` can also reach
 enrolled pod TCP probe ports without the relay mark when those ports are derived
 into `FERRUM_NODE_PROBE_PORTS` / `FERRUM_NODE_PROBE_PORTS6` from the pod's

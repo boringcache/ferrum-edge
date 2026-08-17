@@ -975,6 +975,48 @@ fn the_ambient_pod_isolates_the_service_account_token_from_the_explicit_uid_init
     );
 }
 
+/// The relay pod identity is chart-managed downward API and nothing else
+/// (issues #3956, #3957).
+///
+/// `FERRUM_MESH_NODE_WAYPOINT_RELAY_POD_UID` selects which cgroup the node-agent
+/// authorizes as the UDP relay SENDER, so an operator-supplied value would be a
+/// way to hand the sender proof to an arbitrary pod — the one thing the proof
+/// exists to prevent. It must come from `metadata.uid`, and an `ambient.env`
+/// override (with or without an external-secret suffix) must fail the render.
+#[test]
+fn the_node_waypoint_relay_pod_uid_is_downward_api_only() {
+    let ambient = read("templates/ambient-daemonset.yaml");
+
+    let regions = ambient_regions(&ambient);
+    let steady_state = &ambient[regions.proxy.0..regions.proxy.1];
+
+    assert!(
+        steady_state.contains("- name: FERRUM_MESH_NODE_WAYPOINT_RELAY_POD_UID")
+            && steady_state.contains("fieldPath: metadata.uid"),
+        "the NodeWaypoint proxy must receive its own pod UID from the downward API"
+    );
+    assert_eq!(
+        steady_state
+            .matches("- name: FERRUM_MESH_NODE_WAYPOINT_RELAY_POD_UID")
+            .count(),
+        1,
+        "the relay identity must be declared exactly once in the proxy container"
+    );
+    assert!(
+        ambient.contains(
+            "ambient.env.FERRUM_MESH_NODE_WAYPOINT_RELAY_POD_UID is chart-managed for NodeWaypoint"
+        ),
+        "an operator-supplied relay identity must fail the render, not silently win"
+    );
+    assert!(
+        ambient.contains("FERRUM_MESH_NODE_WAYPOINT_RELAY_POD_UID%s")
+            && ambient.contains(
+                r#"{{- range $suffix := list "" "_FILE" "_VAULT" "_AWS" "_AZURE" "_GCP" -}}"#
+            ),
+        "the override guard must cover the external-secret suffixes too"
+    );
+}
+
 /// SPIRE and the preflight bind the downward-API node name in DIFFERENT
 /// containers of the same pod, so neither duplicates an env row inside one
 /// container's env list.

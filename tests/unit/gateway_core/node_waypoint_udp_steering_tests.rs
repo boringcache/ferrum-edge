@@ -30,6 +30,11 @@ use ferrum_edge::proxy::node_waypoint_udp_steering::{
     NodeWaypointUdpSteerBackend, NodeWaypointUdpSteering, SteerReconcileOutcome,
 };
 
+/// The publishing NodeWaypoint proxy's own pod identity. The node-agent
+/// resolves it host-side into the relay cgroup set that makes a UDP relay
+/// datagram provable (issues #3956, #3957).
+const RELAY_POD_UID: &str = "11111111-2222-3333-4444-555555555555";
+
 /// Records every script the reconcile runs, and can fail on demand.
 struct RecordingBackend {
     scripts: Mutex<Vec<String>>,
@@ -1648,7 +1653,7 @@ fn acknowledged_steering(auto_acknowledge: bool) -> (NodeWaypointUdpSteering, No
     let fail_read_ack = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let fail_teardown = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let publisher = RecordingPublisher {
-        inner: RegistryDirReplySourcePublisher::new(registry.path()),
+        inner: RegistryDirReplySourcePublisher::new(registry.path(), Some(RELAY_POD_UID)),
         registry: registry.path().to_path_buf(),
         log: log.clone(),
         fail_publish: fail_publish.clone(),
@@ -2171,14 +2176,14 @@ fn a_predecessor_acknowledgement_does_not_let_a_successor_steer() {
     let destinations = [destination("10.96.0.10", 5300)];
 
     // The predecessor publishes and is acknowledged, then the process dies.
-    let predecessor = RegistryDirReplySourcePublisher::new(registry.path());
+    let predecessor = RegistryDirReplySourcePublisher::new(registry.path(), Some(RELAY_POD_UID));
     let old = predecessor.publish(&destinations).expect("predecessor");
     write_acknowledgement(registry.path(), &old).expect("predecessor acknowledgement");
 
     let log = Arc::new(Mutex::new(Vec::new()));
     let auto = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let publisher = RecordingPublisher {
-        inner: RegistryDirReplySourcePublisher::new(registry.path()),
+        inner: RegistryDirReplySourcePublisher::new(registry.path(), Some(RELAY_POD_UID)),
         registry: registry.path().to_path_buf(),
         log: log.clone(),
         fail_publish: Arc::new(std::sync::atomic::AtomicBool::new(false)),

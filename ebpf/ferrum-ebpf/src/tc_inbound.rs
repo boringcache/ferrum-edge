@@ -7,26 +7,55 @@
 //! local-node source and carry the NodeWaypoint relay's authorized socket
 //! mark; non-initial TCP packets are allowed so replies for
 //! intentionally bypassed outbound flows can return to the pod. Direct UDP is
-//! failed closed for NodeWaypoint except marked relay datagrams from an exact,
-//! live reply-source authorization and
-//! DNS responses from source port 53 to high pod-originated client ports
-//! (>=32768). The UDP arms accept one additional SOURCE proof the TCP arm does
-//! not: an exact `(address, port)` entry in `FERRUM_UDP_REPLY_SOURCES` /
-//! `FERRUM_UDP_REPLY_SOURCES6`, consulted only while the one shared
-//! `FERRUM_UDP_REPLY_SOURCE_GATE` is enabled for a complete generation. A
-//! NodeWaypoint UDP/DTLS reply is not route-selected — it is pinned to
-//! the local address the client addressed, which on the Service path is the
-//! Service ClusterIP and therefore never a configured node IP. The relay auth
-//! mark is still required in every case, and TCP semantics are unchanged.
-//! Explicitly configured local node source IPs can bypass the TCP guard only
-//! with the relay mark, or for enrolled Kubernetes probe ports without it;
-//! they never authorize UDP.
+//! failed closed for NodeWaypoint except the relay's own datagrams and DNS
+//! responses from source port 53 to high pod-originated client ports (>=32768).
+//!
+//! # Why UDP relay admission needs a sender proof (issues #3956, #3957)
+//!
+//! The TCP arm admits `configured node source + relay socket mark`. Both of
+//! those are attributes of a packet, and under this datapath's threat model —
+//! a same-node workload holding `CAP_NET_ADMIN` in the HOST network namespace —
+//! both are attacker-chosen: `SO_MARK` sets the mark, and binding a node-local
+//! address (or `IP_TRANSPARENT` plus any address at all) sets the source. The
+//! same is true of an exact `(source address, source port)` reply-source claim:
+//! it names an address the attacker can equally well bind, and because the map
+//! is listener-wide it replays against ANY enrolled destination. So neither a
+//! node source nor a reply-source tuple is an authorization on its own, and
+//! neither is their disjunction — swapping one forgeable lane for the other
+//! moves the bypass, it does not close it.
+//!
+//! Every UDP admission here therefore requires a proof the packet's emitter
+//! cannot choose: `bpf_skb_cgroup_id()`, the cgroup-v2 id of the SOCKET that
+//! generated the skb, matched against `FERRUM_UDP_RELAY_CGROUPS` — the
+//! node-agent's host-side rendering of the NodeWaypoint relay pod's own cgroup
+//! subtree. The kernel records that cgroup at socket creation from the creating
+//! task, so presenting it means already running inside the waypoint's cgroup.
+//! Zero (no socket on the skb: forwarded traffic, another netns, the tc INGRESS
+//! hook) denies, as does a closed gate or an absent entry.
+//!
+//! On top of that sender proof the two ORIGINAL source lanes are kept, because
+//! they still narrow what the relay itself may do and the relay needs both: its
+//! BACKEND dial leaves from a configured node address, while its REPLY is not
+//! route-selected but source-PINNED to the local address the client addressed —
+//! on the Service path the Service ClusterIP, which is never a node IP — and is
+//! admitted only by an exact, live `(address, port)` entry in
+//! `FERRUM_UDP_REPLY_SOURCES` / `FERRUM_UDP_REPLY_SOURCES6`. Admission is thus
+//! `relay cgroup AND relay mark AND (node source OR exact reply source)`; the
+//! disjunction is between two narrowing statements about the trusted sender,
+//! never between two ways of being trusted.
+//!
+//! The relay auth mark is still required in every case, and TCP semantics are
+//! byte-for-byte unchanged: explicitly configured local node source IPs bypass
+//! the TCP guard with the relay mark, or for enrolled Kubernetes probe ports
+//! without it, and the TCP arm reads none of the three UDP maps.
+//!
 //! The same classifier closes Ambient UDP enrollment: pod-IP metadata is
 //! inserted with UDP-not-ready before registry publication, so pod-originated
 //! UDP is dropped until the per-netns producer publishes readiness after its
 //! TPROXY socket and rules are live.
 
 use aya_ebpf::bindings::{TC_ACT_OK, TC_ACT_PIPE, TC_ACT_SHOT};
+use aya_ebpf::helpers::bpf_skb_cgroup_id;
 use aya_ebpf::macros::classifier;
 use aya_ebpf::programs::TcContext;
 use ferrum_ebpf_common::{
@@ -36,8 +65,8 @@ use ferrum_ebpf_common::{
 
 use crate::maps::{
     FERRUM_CAPTURE_CONFIG, FERRUM_NODE_IPS, FERRUM_NODE_IPS6, FERRUM_NODE_PROBE_PORTS,
-    FERRUM_NODE_PROBE_PORTS6, FERRUM_POD_IPS, FERRUM_POD_IPS6, FERRUM_UDP_REPLY_SOURCES,
-    FERRUM_UDP_REPLY_SOURCES6, FERRUM_UDP_REPLY_SOURCE_GATE,
+    FERRUM_NODE_PROBE_PORTS6, FERRUM_POD_IPS, FERRUM_POD_IPS6, FERRUM_UDP_RELAY_CGROUPS,
+    FERRUM_UDP_REPLY_SOURCES, FERRUM_UDP_REPLY_SOURCES6, FERRUM_UDP_REPLY_SOURCE_GATE,
 };
 
 const ETH_HDR_LEN: usize = 14;
@@ -117,27 +146,43 @@ fn guard_ipv4(ctx: &TcContext) -> Result<i32, i64> {
             guard_enrolled_destination(ctx, source_is_node)
         }
         IPPROTO_UDP => {
-            // The NodeWaypoint's own UDP relay (issue #3286) is authorized by
-            // the SAME socket-mark proof the TCP arm uses — its frontend
-            // listener socket and its per-session backend socket both carry
-            // `node_waypoint_inbound_auth_mark` — combined with a proof about
-            // the packet's SOURCE. A configured node address is deliberately
-            // not sufficient for UDP: a capable same-node pod can forge both
-            // that source address and the public socket mark. The relay is
-            // admitted only by the exact, live reply-source claim. Its
-            // datagram is source-PINNED to the local address the
-            // client addressed, which on the Service path is the Service
-            // ClusterIP, so it is admitted only by an exact, live
-            // `(address, port)` reply-source authorization the serving listener
-            // published. Both halves are still required; neither the mark alone
-            // nor the source alone admits anything. Checked BEFORE the DNS
-            // carve-out so a marked relay never depends on port heuristics.
+            // The NodeWaypoint's own UDP relay (issue #3286) is admitted by
+            // THREE conjoined proofs, checked BEFORE the DNS carve-out so a
+            // relay datagram never depends on port heuristics.
             //
+            // 1. The SENDER: `bpf_skb_cgroup_id()` must name the relay pod's
+            //    own cgroup. This is the only one of the three the emitter
+            //    cannot choose, so it is evaluated first and gates both source
+            //    lanes below — without it a `CAP_NET_ADMIN` host-netns workload
+            //    forges its way in through either lane (issues #3956, #3957).
+            // 2. The MARK: `node_waypoint_inbound_auth_mark`, the same socket
+            //    mark proof the TCP arm uses, inside
+            //    `enrolled_destination_authorized`.
+            // 3. The SOURCE, narrowing what the trusted relay may claim: the
+            //    backend dial leaves from a configured node address, exactly
+            //    like the TCP relay; the reply does not — it is source-PINNED
+            //    to the local address the client addressed, which on the
+            //    Service path is the Service ClusterIP, so it is admitted only
+            //    by an exact, live `(address, port)` reply-source authorization
+            //    the serving listener published.
+            //
+            // The two source proofs stay on separate arms.
+            // `source_is_node || reply_source_authorized` is two map-lookup
+            // `.is_some()` results; LLVM lowers that as `pointer |= pointer`,
+            // which the kernel verifier rejects. Each helper below collapses
+            // its own lookup to a `bool` before returning for the same reason.
             let ports = udp_ports4(ctx);
-            if let Ok((src_port, _)) = ports {
-                if enrolled_destination_authorized(ctx, udp_reply_source4_allowed(src_ip, src_port))
-                {
+            if udp_relay_sender_authorized(ctx) {
+                if enrolled_destination_authorized(ctx, source_is_node) {
                     return Ok(TC_ACT_PIPE);
+                }
+                if let Ok((src_port, _)) = ports {
+                    if enrolled_destination_authorized(
+                        ctx,
+                        udp_reply_source4_allowed(src_ip, src_port),
+                    ) {
+                        return Ok(TC_ACT_PIPE);
+                    }
                 }
             }
             match ports {
@@ -211,20 +256,25 @@ fn guard_ipv6(ctx: &TcContext) -> Result<i32, i64> {
             guard_enrolled_destination(ctx, source_is_node)
         }
         IPPROTO_UDP => {
-            // IPv6 mirror of the v4 arm, at exact parity: the NodeWaypoint's
-            // own marked UDP relay requires an exact, live reply-source
-            // authorization. A node address plus the public mark is forgeable
-            // by a capable same-node pod and is never a UDP authorization. A
-            // dual-stack waypoint
+            // IPv6 mirror of the v4 arm, at exact parity: the same
+            // non-forgeable relay-cgroup sender proof gates the same two source
+            // lanes under the same mark. The sender proof is family-agnostic —
+            // one socket, one cgroup — so a dual-stack waypoint cannot end up
+            // trusted on one family and forgeable on the other, and a waypoint
             // that admitted only one family would black-hole the other. Same
-            // source proof as IPv4.
+            // separate-arm source proofs as IPv4; do not reintroduce `||`.
             let ports = udp_ports6(ctx);
-            if let Ok((src_port, _)) = ports {
-                if enrolled_destination_authorized(
-                    ctx,
-                    udp_reply_source6_allowed(src_ip.addr, src_port),
-                ) {
+            if udp_relay_sender_authorized(ctx) {
+                if enrolled_destination_authorized(ctx, source_is_node) {
                     return Ok(TC_ACT_PIPE);
+                }
+                if let Ok((src_port, _)) = ports {
+                    if enrolled_destination_authorized(
+                        ctx,
+                        udp_reply_source6_allowed(src_ip.addr, src_port),
+                    ) {
+                        return Ok(TC_ACT_PIPE);
+                    }
                 }
             }
             match ports {
@@ -263,6 +313,11 @@ fn guard_enrolled_destination(ctx: &TcContext, source_is_node: bool) -> Result<i
 /// is lowered as `pointer |= pointer`. Neither half admits anything on
 /// its own. Unparseable UDP ports skip the reply-source attempt (no
 /// authorization), matching the prior fail-closed parse-miss.
+///
+/// On the UDP arms this is reached ONLY inside a successful
+/// [`udp_relay_sender_authorized`] check, so the mark and the source there are
+/// narrowing statements about an already-proven sender rather than the
+/// authorization itself. Do not hoist a UDP call out of that guard.
 #[inline(always)]
 fn enrolled_destination_authorized(ctx: &TcContext, source_authorized: bool) -> bool {
     if !source_authorized {
@@ -298,8 +353,51 @@ fn node_probe_port6_allowed(dst_ip: [u32; 4], port: u16) -> bool {
     unsafe { FERRUM_NODE_PROBE_PORTS6.get(&key) }.is_some()
 }
 
+/// The non-forgeable half of UDP relay admission: did the NodeWaypoint relay
+/// itself emit this datagram?
+///
+/// `bpf_skb_cgroup_id()` returns the cgroup-v2 id of the socket attached to the
+/// skb — recorded by the kernel when that socket was created, from the creating
+/// task's own cgroup. It is not a header field, it is not settable through any
+/// socket option, and it cannot be rewritten in flight, so unlike the socket
+/// mark and the source address it cannot be presented by a workload that is not
+/// running inside the relay's cgroup.
+///
+/// Three ways this returns `false`, all fail-closed:
+///
+/// * the shared gate is closed, so no generation is coherently applied;
+/// * the helper reports `0` — there is no socket on the skb. That is every
+///   FORWARDED packet (another pod's, another node's: `skb_scrub_packet` drops
+///   the socket when the skb crosses a network namespace) and every packet on
+///   the tc INGRESS hook, where the socket has not been looked up yet. The
+///   relay's own datagrams travel host-netns → pod, i.e. the EGRESS hook of the
+///   enrolled pod's host-side veth, which is precisely where the socket is
+///   still attached, so nothing legitimate is lost;
+/// * the id is not in `FERRUM_UDP_RELAY_CGROUPS` — some other local process
+///   sent it, including a `CAP_NET_ADMIN` host-netns workload that set the
+///   relay mark and bound a node address or a Service ClusterIP.
+///
+/// The lookup collapses to a `bool` inside this function so no caller ever
+/// combines two `PTR_TO_MAP_VALUE_OR_NULL` results with `&&`/`||`, which the
+/// kernel verifier rejects.
+#[inline(always)]
+fn udp_relay_sender_authorized(ctx: &TcContext) -> bool {
+    if !udp_reply_sources_enabled() {
+        return false;
+    }
+    let cgroup_id = unsafe { bpf_skb_cgroup_id(ctx.skb.skb) };
+    if cgroup_id == 0 {
+        return false;
+    }
+    unsafe { FERRUM_UDP_RELAY_CGROUPS.get(&cgroup_id) }.is_some()
+}
+
 /// Exact IPv4 reply-source authorization lookup. Address AND port must both
 /// match a live entry; there is no prefix, range, or port-blind form.
+///
+/// Reached only inside [`udp_relay_sender_authorized`]: on its own an entry
+/// here is a listener-wide `(address, port)` tuple that any host-netns workload
+/// could bind and replay against an arbitrary enrolled destination (#3957).
 #[inline(always)]
 fn udp_reply_source4_allowed(src_ip: u32, src_port: u16) -> bool {
     if !udp_reply_sources_enabled() {
@@ -309,7 +407,8 @@ fn udp_reply_source4_allowed(src_ip: u32, src_port: u16) -> bool {
     unsafe { FERRUM_UDP_REPLY_SOURCES.get(&key) }.is_some()
 }
 
-/// IPv6 counterpart to [`udp_reply_source4_allowed`].
+/// IPv6 counterpart to [`udp_reply_source4_allowed`], with the same
+/// sender-proof precondition.
 #[inline(always)]
 fn udp_reply_source6_allowed(src_ip: [u32; 4], src_port: u16) -> bool {
     if !udp_reply_sources_enabled() {
@@ -319,6 +418,10 @@ fn udp_reply_source6_allowed(src_ip: [u32; 4], src_port: u16) -> bool {
     unsafe { FERRUM_UDP_REPLY_SOURCES6.get(&key) }.is_some()
 }
 
+/// The ONE shared generation gate for every UDP relay authorization map —
+/// both reply-source families and `FERRUM_UDP_RELAY_CGROUPS`. Closed means no
+/// coherent generation is applied, so the sender proof and the source proof are
+/// both unavailable and every UDP relay lane is refused together.
 #[inline(always)]
 fn udp_reply_sources_enabled() -> bool {
     matches!(
