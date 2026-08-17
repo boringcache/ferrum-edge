@@ -688,9 +688,8 @@ fn dp_cp_only_refreshable_client_trust_has_validate_run_parity() {
         .err()
         .expect("validate must reject the trust-only material that DP run rejects");
     assert!(
-        format!("{err:#}").contains(
-            "frontend client-certificate trust is configured but could not be loaded"
-        ),
+        format!("{err:#}")
+            .contains("frontend client-certificate trust is configured but could not be loaded"),
         "unexpected error: {err:#}"
     );
 }

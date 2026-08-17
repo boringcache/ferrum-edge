@@ -70,7 +70,9 @@ fn dtls_demux_rejects_non_client_hello_handshake_records() {
 
         // content_type(1) + version(2) + epoch(2) + sequence_number(6), then
         // the record length and the handshake fragment.
-        let mut record = vec![0x16, 0xfe, 0xfd, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01];
+        let mut record = vec![
+            0x16, 0xfe, 0xfd, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01,
+        ];
         record.extend_from_slice(&(handshake.len() as u16).to_be_bytes());
         record.extend_from_slice(&handshake);
         record

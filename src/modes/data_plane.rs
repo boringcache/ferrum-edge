@@ -373,7 +373,9 @@ pub async fn run(
         // certificate and has not delivered one yet, so there is no paired
         // candidate and no listener config to publish — only the live verifier
         // and the baseline generation.
-        pairing.publish_operator_client_trust(trust, None, None).await;
+        pairing
+            .publish_operator_client_trust(trust, None, None)
+            .await;
         let watcher = tls_reload::spawn_dp_operator_client_trust_watcher(
             prepared,
             tls_reload::DpOperatorClientTrustWiring {

@@ -18794,9 +18794,9 @@ mod build_h3_quinn_server_config_mtls_tests {
         // A process-global CRL is irrelevant to an H3 listener that has no
         // client verifier. The unarmed branch must not parse or publish that
         // material as though H3 enforced it.
-        let crls: CrlList = Arc::new(vec![
-            rustls::pki_types::CertificateRevocationListDer::from(vec![0x30, 0x00]),
-        ]);
+        let crls: CrlList = Arc::new(vec![rustls::pki_types::CertificateRevocationListDer::from(
+            vec![0x30, 0x00],
+        )]);
         let accepted = super::load_configured_h3_client_trust(None, &crls)
             .expect("unenforced CRLs must not prevent non-mTLS H3 startup");
         assert!(accepted.verifier.is_none());

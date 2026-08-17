@@ -1622,9 +1622,8 @@ fn dp_cp_only_certificate_client_trust_applicability_is_fail_closed() {
             .is_none(),
         "static inline client-CA material must not start a watcher"
     );
-    env_config.frontend_tls_client_ca_bundle_path = Some(
-        "-----BEGIN CERTIFICATE-----\nnot pem\n-----END CERTIFICATE-----".to_string(),
-    );
+    env_config.frontend_tls_client_ca_bundle_path =
+        Some("-----BEGIN CERTIFICATE-----\nnot pem\n-----END CERTIFICATE-----".to_string());
     assert!(
         ferrum_edge::modes::tls_reload::prepare_dp_operator_client_trust(&env_config, &crls)
             .is_err(),
@@ -1713,7 +1712,11 @@ async fn dp_cp_only_certificate_arms_pairs_and_clears_without_synthesizing_a_cer
         .publish_cp_server_config(Some(cp.config.clone()), Some(&listener_slot), None)
         .await;
     assert!(std::sync::Arc::ptr_eq(
-        listener_slot.load_full().as_ref().as_ref().expect("CP config"),
+        listener_slot
+            .load_full()
+            .as_ref()
+            .as_ref()
+            .expect("CP config"),
         &cp.config
     ));
     let paired = pairing.h3_accepted().expect("paired H3 candidate");
@@ -1731,7 +1734,11 @@ async fn dp_cp_only_certificate_arms_pairs_and_clears_without_synthesizing_a_cer
         "an operator trust reload must not take the listener slot away from CP material"
     );
     assert!(std::sync::Arc::ptr_eq(
-        listener_slot.load_full().as_ref().as_ref().expect("CP config"),
+        listener_slot
+            .load_full()
+            .as_ref()
+            .as_ref()
+            .expect("CP config"),
         &cp.config
     ));
     let paired = pairing.h3_accepted().expect("re-paired H3 candidate");
@@ -1831,7 +1838,11 @@ async fn dp_cp_only_certificate_refused_candidate_retains_last_good_state() {
     let after_pair = pairing.h3_accepted().expect("retained pair");
     assert!(std::sync::Arc::ptr_eq(&before_pair, &after_pair));
     assert!(std::sync::Arc::ptr_eq(
-        listener_slot.load_full().as_ref().as_ref().expect("CP config"),
+        listener_slot
+            .load_full()
+            .as_ref()
+            .as_ref()
+            .expect("CP config"),
         &cp.config
     ));
 }
@@ -1878,7 +1889,9 @@ fn dp_cp_only_certificate_client_trust_is_wired_without_an_operator_certificate(
     );
 
     let client = include_str!("../../../src/grpc/dp_client.rs");
-    let paired = client.find("fn pair_h3_candidate(").expect("pairing helper");
+    let paired = client
+        .find("fn pair_h3_candidate(")
+        .expect("pairing helper");
     assert!(
         client[paired..].contains("state.cp_config")
             && client[paired..].contains("or_else(|| state.operator_config.clone())?"),

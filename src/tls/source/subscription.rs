@@ -476,8 +476,7 @@ fn spawn_async_material_set_reload_task_inner(
             Some(force_tx),
             shutdown_rx.clone(),
         );
-        run_async_material_set_reload_loop(config, shutdown_rx, force_rx, reconcile_startup)
-            .await;
+        run_async_material_set_reload_loop(config, shutdown_rx, force_rx, reconcile_startup).await;
         for handle in k8s_watchers {
             handle.abort();
         }
@@ -888,16 +887,8 @@ async fn run_async_material_set_reload_loop(
             }
             Err(error) => {
                 if let Some(fingerprint) = last_fingerprint.as_ref() {
-                    record_refresh_for_entries(
-                        surface,
-                        &fingerprint.entries,
-                        "rebuild_error",
-                    );
-                    crate::tls::events::record_rebuild_error(
-                        surface,
-                        &fingerprint.entries,
-                        &error,
-                    );
+                    record_refresh_for_entries(surface, &fingerprint.entries, "rebuild_error");
+                    crate::tls::events::record_rebuild_error(surface, &fingerprint.entries, &error);
                     last_rebuild_failure = Some(fingerprint.clone());
                 }
                 warn!(
