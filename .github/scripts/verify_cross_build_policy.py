@@ -86,7 +86,7 @@ WORKFLOW_CONTRACTS = (
     (
         "CI workflow",
         "build-arm64-cross",
-        "905e23deac2aa3021e3472c13745e146cf5f49c05d97861962ac2d2c612dce6f",
+        "9a1b2bb4914826b77e82ad4489f73b15ebbdc93cd0d925b91cbcdc21a5e148cc",
         "143872ebf5dd925529b785273f180671bcc3bbd612d74ef0b88e1b8dce86c774",
         # Pins the top-level `on:` mapping that schedules CI, including
         # unconditional `merge_group: checks_requested` alongside push,
@@ -96,7 +96,7 @@ WORKFLOW_CONTRACTS = (
     (
         "release workflow",
         "build-release-arm64-cross",
-        "e2792eb548322f3ef062b93ad971b5a13e9d21c74d9b00f5f3bdf8e0119c9712",
+        "338c9be78c5e354365990a9c27dafa36c21202f18cf517567ad44995cff03950",
         "1d5104bd955d0ef4c397cb7be08f37d2d829a822ff9efe43eb26bdac1133bc0a",
         "2a9e77c5946c27cbf1f055f20adf283e159ffd3735e2dcc90edded2c35563c3b",
     ),
