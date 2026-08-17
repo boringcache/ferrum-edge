@@ -640,11 +640,20 @@ fn trust_withdrawal_suppresses_final_packet_drain_while_deadline_unexpired() {
         "the production DTLS wire-commit path must use the trust-fenced helper"
     );
 
+    // Window = the withdrawal arm's BODY (from its warn! literal to its
+    // `break;`). The old markers ("Frontend client-certificate trust
+    // withdrawn" comment → "Shutdown signal" comment) span the whole biased
+    // select, so the ordinary app-data arm that legitimately calls
+    // `send_application_data` (behind its own `is_retired()` fence) sat inside
+    // the scanned text and failed the negative asserts spuriously.
     let established_arm = DTLS_SOURCE
-        .split("Frontend client-certificate trust withdrawn")
+        .split(
+            "\"Retiring established DTLS session: frontend client-certificate \
+             trust was withdrawn\"",
+        )
         .nth(1)
         .expect("established-session trust-withdrawal arm")
-        .split("Shutdown signal")
+        .split("break;")
         .next()
         .expect("trust-withdrawal arm body");
     assert!(
