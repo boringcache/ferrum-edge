@@ -51,6 +51,12 @@ RUST_CACHE_WITH_KEYS = (
     "shared-key",
     "workspaces",
     "cache-directories",
+    # Required by the CI runtime-cache contract (verify_ci_runtime_cache):
+    # cache-on-failure keeps post-job saves on ordinary failures, and save-if
+    # gates publication to trusted refs/heads/main runs. Still a closed set —
+    # any other key remains a trust-broadening extra.
+    "cache-on-failure",
+    "save-if",
 )
 
 EXTERNAL_ACTION = re.compile(
