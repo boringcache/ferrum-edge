@@ -36,6 +36,7 @@ from ci_runtime_telemetry import self_test as telemetry_self_test
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 FIPS_WORKFLOW = REPO_ROOT / ".github" / "workflows" / "fips-build.yml"
+FIPS_PLANNER_PATH = ".github/scripts/ci_runtime_plan.py"
 NODE_WORKFLOW = REPO_ROOT / ".github" / "workflows" / "node-waypoint-ebpf-live.yml"
 AMBIENT_WORKFLOW = REPO_ROOT / ".github" / "workflows" / "ambient-host-udp-live.yml"
 DOCKERFILE = REPO_ROOT / "Dockerfile"
@@ -2404,20 +2405,43 @@ def check_fips(workflow: str, failures: list[str]) -> None:
         failures,
     )
     plan_job = extract_job(workflow, "fips-plan")
+    planner_path_lines = tuple(
+        line.strip()
+        for line in plan_job.splitlines()
+        if FIPS_PLANNER_PATH in line
+    )
+    expected_planner_path_lines = (
+        f'if ! git cat-file -e "${{trusted_sha}}:{FIPS_PLANNER_PATH}" 2>/dev/null; then',
+        (
+            f'echo "trusted base has not adopted {FIPS_PLANNER_PATH}; '
+            'running the full gate." >> "$GITHUB_STEP_SUMMARY"'
+        ),
+        f'entry="$(git ls-tree --full-tree "$trusted_sha" -- {FIPS_PLANNER_PATH})"',
+        f'echo "::error::{FIPS_PLANNER_PATH} is not a single tree entry at ${{trusted_sha}}" >&2',
+        f'if [ "$entry_type" != "blob" ] || [ "$entry_path" != "{FIPS_PLANNER_PATH}" ]; then',
+        f'echo "::error::{FIPS_PLANNER_PATH} is not a blob at ${{trusted_sha}}" >&2',
+        f'echo "::error::{FIPS_PLANNER_PATH} has non-regular mode ${{entry_mode}}" >&2',
+        f'echo "::error::{FIPS_PLANNER_PATH} did not resolve to an object id" >&2',
+        f'echo "::error::{FIPS_PLANNER_PATH} exceeds the 256 KiB trusted-filter ceiling" >&2',
+        f'proposed_entry="$(git ls-tree --full-tree HEAD -- {FIPS_PLANNER_PATH})"',
+        f'echo "::error::{FIPS_PLANNER_PATH} must be a regular blob in the proposed checkout" >&2',
+        f'git cat-file blob "$entry_object" > {FIPS_PLANNER_PATH}',
+        f'if [ "$(git hash-object {FIPS_PLANNER_PATH})" != "$entry_object" ]; then',
+        f"python3 -I {FIPS_PLANNER_PATH} --self-test",
+        f'plan="$(python3 -I {FIPS_PLANNER_PATH} "${{filter_args[@]}}")"',
+    )
     require(
-        'git cat-file blob "$entry_object" > "$filter_path"' in plan_job
-        and 'git hash-object "$filter_path"' in plan_job
-        and 'python3 -I .github/scripts/ci_runtime_plan.py --self-test' in plan_job
-        and 'python3 -I .github/scripts/ci_runtime_plan.py "${filter_args[@]}"'
-        in plan_job
+        "filter_path" not in plan_job
+        and planner_path_lines == expected_planner_path_lines
         and "trusted_filter=" not in plan_job
         and 'python3 -I "$trusted_filter"' not in plan_job,
-        "FIPS planner must materialize the validated trusted-base blob at the "
-        "literal repository path and execute only that statically inspectable path",
+        "FIPS planner must use only the frozen literal repository path for every "
+        "trusted lookup, materialization, hash check, and execution; mutable path "
+        "aliases are forbidden",
         failures,
     )
     require(
-        'git ls-tree --full-tree HEAD -- "$filter_path"' in plan_job
+        f"git ls-tree --full-tree HEAD -- {FIPS_PLANNER_PATH}" in plan_job
         and '"100644 blob "*' in plan_job
         and '"100755 blob "*' in plan_job,
         "FIPS planner must reject a non-regular proposed planner path before "
@@ -3937,6 +3961,50 @@ def self_test() -> int:
             for item in special_tar_member_failures
         ),
         "self-test: accepting special tar members must fail",
+        failures,
+    )
+
+    mutable_planner_path = handoff_channel.replace(
+        '          git cat-file blob "$entry_object" > .github/scripts/ci_runtime_plan.py\n',
+        "          filter_path=.github/scripts/ci_runtime_plan.py\n"
+        "          filter_path+=.untrusted\n"
+        '          git cat-file blob "$entry_object" > "$filter_path"\n',
+        1,
+    )
+    require(
+        mutable_planner_path != handoff_channel,
+        "self-test: mutable FIPS planner-path fixture must alter the workflow",
+        failures,
+    )
+    mutable_planner_path_failures: list[str] = []
+    check_fips(mutable_planner_path, mutable_planner_path_failures)
+    require(
+        any(
+            "mutable path aliases are forbidden" in item
+            for item in mutable_planner_path_failures
+        ),
+        "self-test: a mutable FIPS planner path must fail the literal-path gate",
+        failures,
+    )
+
+    decoupled_materialization = handoff_channel.replace(
+        '          git cat-file blob "$entry_object" > .github/scripts/ci_runtime_plan.py\n',
+        '          git cat-file blob "$entry_object" > .github/scripts/ci_runtime_telemetry.py\n',
+        1,
+    )
+    require(
+        decoupled_materialization != handoff_channel,
+        "self-test: decoupled FIPS materialization fixture must alter the workflow",
+        failures,
+    )
+    decoupled_materialization_failures: list[str] = []
+    check_fips(decoupled_materialization, decoupled_materialization_failures)
+    require(
+        any(
+            "mutable path aliases are forbidden" in item
+            for item in decoupled_materialization_failures
+        ),
+        "self-test: a noncanonical FIPS materialization target must fail",
         failures,
     )
 
