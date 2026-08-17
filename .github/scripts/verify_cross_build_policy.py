@@ -11981,6 +11981,14 @@ CI_JOB_GENERATION_TRANSITIONS: tuple[tuple[str, str, str], ...] = (
         "0586ab0b5b8b803f2ee3663b608c40caca06f9c92e58d4cb28c2080d68f23f27",
         "9c3d5b4dfbc6a209e801a47bceabd31fe8aa7df033d49989ad8f88a3e4ed73e7",
     ),
+    # `build-binaries` on the trusted base → PR #3916 (issue #3905), the
+    # merge-queue macOS compile-gate cost reduction, pinned against its
+    # latest-main-merged branch grok/issue-3905-merge-builds-r1.
+    (
+        "build-binaries",
+        "3bc9e7da00d7033b550df36db00048373b959aea437506ac28e494947422eaec",
+        "14b0890e2693cd0825fcf25ba7f48810b5ae9a33f2cbb5751bdaaf60186b83b1",
+    ),
 )
 
 # Local composite actions are compared by whole-file digest once Cross-sensitive.
