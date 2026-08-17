@@ -2065,8 +2065,8 @@ repository cache onto the immutable run artifact, which necessarily edits four
 digest-frozen `fips-build.yml` job bodies. The destination also quarantines only
 restored `aws-lc-fips-sys-*/out/build` CMake intermediates before a cross-runner
 incremental build can reparse them. The pair is exact and one-way:
-trusted-base `527659b0ad96a0d97cd4a170543dd81acbf6784155b3c82918b1f70a20c7914b`
-(PR #3889's landed file) →
+trusted-base `0be313579a66265ef1f54e0a611f519e8d109a536ba29b0d6c4244530b9d6a08`
+(the workflow after PR #3952's landed static-path planner hardening) →
 `17bfb40fbd31e80e6ae1a0efca922069c54ec485ec7a611c3420840da3e5e9e1` (PR #3950
 head `df1223520`; recompute and re-pin if review changes the workflow bytes).
 The digest is over universal-newline-decoded text. RETIREMENT IS MANDATORY

@@ -11918,9 +11918,9 @@ def validate_workflow_collection(
 # served. See `docs/ci_cd.md` and `docs/dependency-policy.md`.
 FIPS_BUILD_WORKFLOW_FILENAME = "fips-build.yml"
 # `.github/workflows/fips-build.yml` as it stands on the trusted base
-# (PR #3889's landed file).
+# after PR #3952's landed static-path planner hardening.
 FIPS_BUILD_RETIRED_GENERATION_SHA256 = (
-    "527659b0ad96a0d97cd4a170543dd81acbf6784155b3c82918b1f70a20c7914b"
+    "0be313579a66265ef1f54e0a611f519e8d109a536ba29b0d6c4244530b9d6a08"
 )
 # `.github/workflows/fips-build.yml` at PR #3950 head df1223520: the same-run
 # producer handoff moves off the eviction-prone repository cache onto the
