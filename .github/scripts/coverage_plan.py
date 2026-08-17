@@ -42,6 +42,7 @@ CONFIG_SOURCES_SHARDS = frozenset({ADMIN_CONFIG_SHARD, *MESH_SHARDS})
 VALID_MODES = frozenset({"skip", "plugin", "shards", "full"})
 SHARD_NAME_RE = re.compile(r"^[a-z][a-z0-9-]*$")
 CONTROL_CHARS_RE = re.compile(r"[\x00-\x1f]")
+CLASSIFIABLE_PATH_RE = re.compile(r"^[A-Za-z0-9._+@~ /-]{1,4096}$")
 
 PLUGIN_PATTERNS = [
     re.compile(r"^src/plugin_cache\.rs$"),
@@ -273,7 +274,12 @@ def is_coverage_relevant_path(path: str) -> bool:
 def is_well_formed_repo_path(path: str) -> bool:
     """Reject malformed or hostile path transport instead of classifying it."""
 
-    if not path or path != path.strip() or CONTROL_CHARS_RE.search(path):
+    if (
+        not path
+        or path != path.strip()
+        or CONTROL_CHARS_RE.search(path)
+        or not CLASSIFIABLE_PATH_RE.fullmatch(path)
+    ):
         return False
     if "\\" in path or path.startswith("/") or "//" in path:
         return False
@@ -642,6 +648,9 @@ def self_test() -> int:
         ("pull_request", [" src/admin/mod.rs"], "full", all_shards, False),
         ("pull_request", ["src/admin/mod.rs "], "full", all_shards, False),
         ("pull_request", ["src/admin/foo\0.rs"], "full", all_shards, False),
+        ("pull_request", ["src/admin/`spoof`.rs"], "full", all_shards, False),
+        ("pull_request", ["src/admin/summary|row.rs"], "full", all_shards, False),
+        ("pull_request", ["src/admin/del\x7f.rs"], "full", all_shards, False),
         ("pull_request", ["../Cargo.toml"], "full", all_shards, False),
         (
             "pull_request",

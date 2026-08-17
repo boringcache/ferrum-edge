@@ -138,7 +138,9 @@ PR coverage is mode-aware:
   `Cargo.lock`, `build.rs`, `proto/**`, `ebpf/**`, `.cargo/**`,
   `rust-toolchain.toml`), unknown coverage-relevant paths, and malformed or
   hostile changed-path transport fail closed to the full six-shard matrix and
-  still enforce the overall and `src/plugins/` thresholds. A skipped planned
+  still enforce the overall and `src/plugins/` thresholds. Classifiable paths
+  use the conservative repository-relative `[A-Za-z0-9._+@~ /-]` alphabet, so
+  Markdown controls cannot alter the Coverage Plan summary. A skipped planned
   shard cannot green the merge aggregate.
 - Pushes to `main`, manual dispatches, and scheduled runs therefore keep
   published main coverage complete and semantically unchanged.
