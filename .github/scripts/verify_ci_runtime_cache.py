@@ -1050,10 +1050,24 @@ def check_fips_producer_channel(
             in promote_steps[0]
             and "refusing stale-base reuse" in promote_steps[0]
             and "git diff --quiet --no-ext-diff" in promote_steps[0]
-            and "git diff --cached --quiet --no-ext-diff" in promote_steps[0],
+            and "git diff --cached --quiet --no-ext-diff" in promote_steps[0]
+            and 'if ! tar --zstd -tf "$archive" >"$listing_tmp"; then'
+            in promote_steps[0]
+            and 'if ! tar --zstd -tvf "$archive" >"$verbose_tmp"; then'
+            in promote_steps[0]
+            and 'fail "producer handoff archive member uses path traversal"'
+            in promote_steps[0]
+            and 'fail "producer handoff archive contains a non-file member"'
+            in promote_steps[0]
+            and 'if [ "$identity_count" -ne 1 ]; then' in promote_steps[0]
+            and '-*) identity_verbose_count=$((identity_verbose_count + 1)) ;;'
+            in promote_steps[0]
+            and 'tar --zstd --no-same-owner -xf "$archive" -C "$extract_root"'
+            in promote_steps[0],
             "fips-compile must refresh mtimes inside the validated exact-handoff "
-            "promotion step only after a successful explicit non-cold download, "
-            "matching source tree, and clean tracked checkout",
+            "promotion step only after fail-closed archive-member validation, a "
+            "successful explicit non-cold download, matching source tree, and "
+            "clean tracked checkout",
             failures,
         )
     package_steps = [
@@ -1180,7 +1194,7 @@ def check_fips_producer_channel(
             failures,
         )
     require(
-        workflow.count('if ! tar --zstd -tf "$archive" >"$listing_tmp"; then') >= 3,
+        workflow.count('if ! tar --zstd -tf "$archive" >"$listing_tmp"; then') >= 4,
         "FIPS consumer promotion must capture tar listings in temp files and fail "
         "closed on listing errors",
         failures,
@@ -1199,26 +1213,26 @@ def check_fips_producer_channel(
     )
     require(
         workflow.count('fail "producer handoff archive member uses path traversal"')
-        >= 3,
+        >= 4,
         "FIPS consumer promotion must reject path traversal in archive member names",
         failures,
     )
     require(
-        workflow.count('if [ "$identity_count" -ne 1 ]; then') >= 3,
+        workflow.count('if [ "$identity_count" -ne 1 ]; then') >= 4,
         "FIPS consumer promotion must reject duplicate identity archive members",
         failures,
     )
     require(
         workflow.count(
             'fail "producer handoff archive contains a non-file member"'
-        ) >= 3,
+        ) >= 4,
         "FIPS consumer promotion must reject symlink and special tar members",
         failures,
     )
     require(
         workflow.count(
             '-*) identity_verbose_count=$((identity_verbose_count + 1)) ;;'
-        ) >= 3,
+        ) >= 4,
         "FIPS consumer promotion must require identity members to be regular files",
         failures,
     )

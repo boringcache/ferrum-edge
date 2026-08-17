@@ -443,6 +443,96 @@ jobs:
           extract_root="${RUNNER_TEMP}/inter-run-fips-extracted"
           rm -rf "$extract_root"
           mkdir -p "$extract_root"
+
+          fail() {
+            echo "::error::$1" >&2
+            exit 1
+          }
+
+          reject_hostile_tar_member() {
+            local member="$1"
+            case "$member" in
+              ''|.|..)
+                fail "producer handoff archive member is malformed"
+                ;;
+              *[![:print:]]*|*\\*)
+                fail "producer handoff archive member is malformed"
+                ;;
+              /*)
+                fail "producer handoff archive member uses an absolute path"
+                ;;
+            esac
+            local part
+            local IFS='/'
+            for part in $member; do
+              case "$part" in
+                ''|.|..|*[![:print:]]*|*\\*)
+                  fail "producer handoff archive member uses path traversal"
+                  ;;
+              esac
+            done
+          }
+
+          listing_tmp="$(mktemp "${RUNNER_TEMP}/fips-tar-listing.XXXXXX")"
+          verbose_tmp="$(mktemp "${RUNNER_TEMP}/fips-tar-verbose.XXXXXX")"
+          identity_verbose_tmp="$(mktemp "${RUNNER_TEMP}/fips-tar-identity-verbose.XXXXXX")"
+          if ! tar --zstd -tf "$archive" >"$listing_tmp"; then
+            rm -f "$listing_tmp" "$verbose_tmp" "$identity_verbose_tmp"
+            fail "producer handoff archive listing failed"
+          fi
+          if ! tar --zstd -tvf "$archive" >"$verbose_tmp"; then
+            rm -f "$listing_tmp" "$verbose_tmp" "$identity_verbose_tmp"
+            fail "producer handoff archive verbose listing failed"
+          fi
+          name_count=0
+          verbose_count=0
+          identity_count=0
+          identity_verbose_count=0
+          while IFS= read -r member || [ -n "$member" ]; do
+            reject_hostile_tar_member "$member"
+            name_count=$((name_count + 1))
+            if [ "$member" = "fips-producer-identity" ]; then
+              identity_count=$((identity_count + 1))
+            fi
+          done <"$listing_tmp"
+          while IFS= read -r line || [ -n "$line" ]; do
+            case "$line" in
+              '') continue ;;
+              [-]*|d*) ;;
+              *)
+                rm -f "$listing_tmp" "$verbose_tmp" "$identity_verbose_tmp"
+                fail "producer handoff archive contains a non-file member"
+                ;;
+            esac
+            verbose_count=$((verbose_count + 1))
+          done <"$verbose_tmp"
+          if [ "$name_count" -eq 0 ] || [ "$verbose_count" -ne "$name_count" ]; then
+            rm -f "$listing_tmp" "$verbose_tmp" "$identity_verbose_tmp"
+            fail "producer handoff archive listing is inconsistent"
+          fi
+          if [ "$identity_count" -ne 1 ]; then
+            rm -f "$listing_tmp" "$verbose_tmp" "$identity_verbose_tmp"
+            fail "producer handoff archive identity member is missing or ambiguous"
+          fi
+          if ! tar --zstd -tvf "$archive" fips-producer-identity >"$identity_verbose_tmp"; then
+            rm -f "$listing_tmp" "$verbose_tmp" "$identity_verbose_tmp"
+            fail "producer handoff archive identity member listing failed"
+          fi
+          while IFS= read -r line || [ -n "$line" ]; do
+            case "$line" in
+              '') continue ;;
+              -*) identity_verbose_count=$((identity_verbose_count + 1)) ;;
+              *)
+                rm -f "$listing_tmp" "$verbose_tmp" "$identity_verbose_tmp"
+                fail "producer handoff archive identity member is not a regular file"
+                ;;
+            esac
+          done <"$identity_verbose_tmp"
+          if [ "$identity_verbose_count" -ne 1 ]; then
+            rm -f "$listing_tmp" "$verbose_tmp" "$identity_verbose_tmp"
+            fail "producer handoff archive identity member is missing or ambiguous"
+          fi
+          rm -f "$listing_tmp" "$verbose_tmp" "$identity_verbose_tmp"
           tar --zstd --no-same-owner -xf "$archive" -C "$extract_root"
           for path in target .cache/sccache; do
             source_path="${extract_root}/${path}"
