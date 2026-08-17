@@ -884,6 +884,10 @@ fn app_protocol_sort_key(protocol: AppProtocol) -> u8 {
         AppProtocol::Mysql => 8,
         AppProtocol::Postgres => 9,
         AppProtocol::Unknown => 10,
+        // Appended, never inserted: the sort key is only a deterministic
+        // ordering, and renumbering the existing variants would reorder every
+        // already-materialized multi-cluster port list for no benefit.
+        AppProtocol::Dtls => 11,
     }
 }
 

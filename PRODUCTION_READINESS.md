@@ -166,7 +166,6 @@ owned by the live gate / policy inventory, not by copying this table by hand.
 | TCP outbound PROXY protocol v2 | #3618 | Inbound only today |
 | TCP/kTLS kernel splice (frontend-TLS relay) | #3619 | Unbuffered rustls handshake leaves splice inert |
 | HTTP/3 plain-HTTP/WebSocket to mesh-tagged targets | #3620 | H3 retry rotation must skip fail-closed targets |
-| Ambient UDP enrolled-destination round trip | #3621 | Source-capture live gate exists; destination pod-netns relay + tc-inbound admit not yet live-gated |
 | Direct-H2 in-path body-size limits | #3622 | Default nonzero limits still force reqwest path |
 | Admin read-only write audit logging | #3623 | Docs promise logging/counts that do not exist |
 | Env-only reads ignoring `ferrum.conf` | #3624 | `FERRUM_LOG_REDACT_METADATA_KEYS`, `FERRUM_NODE_ID`, validation-client gates |
@@ -174,7 +173,11 @@ owned by the live gate / policy inventory, not by copying this table by hand.
 
 **Implemented since the epic (do not re-open from stale checklists):** remote-discovery
 JWT audience binding (#2475); Ambient UDP capture producer + live source-capture e2e
-(#2013 / #2038); VirtualService `tls[]` SNI passthrough L4 routing (see
+(#2013 / #2038); Ambient UDP enrolled-destination round trip (#3621 —
+`functional_mesh_live_source_capture_udp_manager_hbone_round_trip` proves the
+source-capture/HBONE/destination-netns relay, while `node-waypoint-ebpf-live`
+proves the marked backend datagram crosses the enrolled-pod `tc_inbound` guard);
+VirtualService `tls[]` SNI passthrough L4 routing (see
 `docs/mesh_supported_matrix.md` + `tests/integration/mesh_l7_routing_tests.rs`);
 AI semantic-firewall token windows (#3302); subset-scoped Istio HTTP connection-pool
 policy (#3547, closing #3228 / #3240–#3242); `ai_stream_router` `google_gemini`

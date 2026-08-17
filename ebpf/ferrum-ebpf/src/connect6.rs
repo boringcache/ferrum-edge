@@ -1,6 +1,7 @@
 //! cgroup/connect6 — outbound IPv6 traffic capture.
 //!
-//! Same logic as connect4 but for IPv6. Rewrites destination to [::1]:15001.
+//! Same logic as connect4 but for IPv6. Rewrites TCP `SOCK_STREAM` destinations
+//! to [::1]:15001. UDP `connect()` is left unrewritten (see connect4).
 
 use aya_ebpf::macros::cgroup_sock_addr;
 use aya_ebpf::maps::lpm_trie::Key as LpmKey;
@@ -13,10 +14,11 @@ use crate::maps::{
 };
 use crate::sock_ops_emit::emit_drop_reason;
 use ferrum_ebpf_common::{
-    host_port_to_sock_addr_user_port, sock_addr_user_port_to_host, CidrKey6, IncludePortsPolicy,
-    OrigDst6, OrigDstKey, WorkloadIdentity, FERRUM_CAPTURE_CONFIG_KEY, IPV6_LOOPBACK_NBO,
-    OUTBOUND_CAPTURE_PORT, SOCK_OPS_DROP_BYPASS_UID_HIT, SOCK_OPS_DROP_EXCLUDE_CIDR_HIT,
-    SOCK_OPS_DROP_EXCLUDE_PORT_HIT, SOCK_OPS_DROP_NOT_IN_INCLUDE_CIDR,
+    host_port_to_sock_addr_user_port, is_tcp_stream_connect, sock_addr_user_port_to_host, CidrKey6,
+    IncludePortsPolicy, OrigDst6, OrigDstKey, WorkloadIdentity, FERRUM_CAPTURE_CONFIG_KEY,
+    IPV6_LOOPBACK_NBO, OUTBOUND_CAPTURE_PORT, SOCK_OPS_DROP_BYPASS_UID_HIT,
+    SOCK_OPS_DROP_EXCLUDE_CIDR_HIT, SOCK_OPS_DROP_EXCLUDE_PORT_HIT,
+    SOCK_OPS_DROP_NOT_IN_INCLUDE_CIDR,
 };
 
 #[cgroup_sock_addr(connect6)]
@@ -30,6 +32,12 @@ pub fn ferrum_connect6(ctx: SockAddrContext) -> i32 {
 #[inline(always)]
 fn try_connect6(ctx: &SockAddrContext) -> Result<i32, i64> {
     let sock_addr = unsafe { &*ctx.sock_addr };
+
+    // `type_` is a 4-byte read-only scalar. Skip SOCK_DGRAM before any rewrite
+    // (see connect4): UDP/DTLS connect() must keep the original destination.
+    if !is_tcp_stream_connect(sock_addr.type_) {
+        return Ok(1);
+    }
 
     let uid = (aya_ebpf::helpers::bpf_get_current_uid_gid() & 0xFFFFFFFF) as u32;
     if unsafe { FERRUM_BYPASS_UIDS.get(&uid) }.is_some() {

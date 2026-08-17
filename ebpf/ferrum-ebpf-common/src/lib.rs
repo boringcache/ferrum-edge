@@ -414,6 +414,81 @@ impl NodeProbePortKey6 {
     }
 }
 
+/// Key for `FERRUM_UDP_REPLY_SOURCES`: one EXACT `(source address, source
+/// port)` a serving NodeWaypoint UDP/DTLS listener is authorized to answer an
+/// enrolled pod from.
+///
+/// This is deliberately NOT a node-address or CIDR concept. A NodeWaypoint
+/// UDP/DTLS reply is not route-selected: the listener pins its source to the
+/// exact local address the client addressed (`IP_PKTINFO`/`IPV6_PKTINFO` over an
+/// `IP_TRANSPARENT` socket), which on the Service path is the Service ClusterIP,
+/// and its source PORT is the bound listener port. So the reply's own two-tuple
+/// is knowable in advance, and authorizing exactly that pair is the narrowest
+/// statement that admits the relay's reply without admitting anything else.
+///
+/// Entries exist ONLY while the matching listener is bound and serving on the
+/// accepted generation (see `crate::proxy::node_waypoint_udp_reply_source` on
+/// the userspace side). An address that was merely parsed out of a candidate
+/// configuration never reaches this map.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct UdpReplySourceKey4 {
+    /// Source IPv4 address in network byte order, matching the on-wire header.
+    pub addr: u32,
+    /// UDP source port in HOST byte order (the classifier converts before the
+    /// lookup, exactly as the probe/redirect scope keys do).
+    pub port: u16,
+    pub _pad: u16,
+}
+
+impl UdpReplySourceKey4 {
+    pub const fn new(addr: u32, port: u16) -> Self {
+        Self {
+            addr,
+            port,
+            _pad: 0,
+        }
+    }
+}
+
+/// IPv6 counterpart to [`UdpReplySourceKey4`]. IPv4 and IPv6 parity is
+/// mandatory here: a dual-stack NodeWaypoint that authorized only one family
+/// would silently black-hole every reply on the other.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct UdpReplySourceKey6 {
+    pub addr: [u32; 4],
+    pub port: u16,
+    pub _pad: u16,
+}
+
+impl UdpReplySourceKey6 {
+    pub const fn new(addr: [u32; 4], port: u16) -> Self {
+        Self {
+            addr,
+            port,
+            _pad: 0,
+        }
+    }
+}
+
+/// Bound on each NodeWaypoint UDP/DTLS reply-source authorization map.
+///
+/// One entry per serving `(Service address, port)` on this node. Sized well
+/// above any realistic per-node in-mesh UDP/DTLS service-port count while
+/// staying small enough that a bug cannot turn the map into an unbounded
+/// authorization surface; the userspace publisher refuses to exceed it rather
+/// than letting the kernel silently reject the overflow.
+pub const UDP_REPLY_SOURCE_MAX_ENTRIES: u32 = 1024;
+
+/// Single shared enable gate for the IPv4 and IPv6 NodeWaypoint UDP/DTLS
+/// reply-source authorization maps. Both tc classifier families consult this
+/// key before reading either family map, so entries left behind by a failed
+/// whole-set replacement are inert.
+pub const UDP_REPLY_SOURCE_GATE_KEY: u32 = 0;
+pub const UDP_REPLY_SOURCE_GATE_DISABLED: u8 = 0;
+pub const UDP_REPLY_SOURCE_GATE_ENABLED: u8 = 1;
+
 /// Per-cgroup workload identity in the `FERRUM_WORKLOAD_IDENTITY` map, keyed by
 /// cgroup id (`bpf_get_current_cgroup_id`).
 ///
@@ -597,6 +672,24 @@ pub struct CidrKey6 {
 
 /// Outbound capture port. Connect hooks rewrite destinations here.
 pub const OUTBOUND_CAPTURE_PORT: u16 = 15001;
+
+/// Linux `SOCK_STREAM`. `cgroup/connect4` and `cgroup/connect6` fire for every
+/// inet `connect()`, including UDP; the outbound capture listener on
+/// [`OUTBOUND_CAPTURE_PORT`] is TCP-only, so those programs rewrite only this
+/// socket type. UDP/DTLS `connect()` must stay unrewritten so NodeWaypoint
+/// host-netns listeners and Ambient TPROXY can observe the original destination.
+pub const SOCK_STREAM: u32 = 1;
+
+/// Linux `SOCK_DGRAM`. Pinned so tests can prove the TCP-only capture gate
+/// rejects the socket type a DTLS/`connect()`ed-UDP client uses.
+pub const SOCK_DGRAM: u32 = 2;
+
+/// True when a `bpf_sock_addr.type` value is the TCP stream the connect hooks
+/// are allowed to rewrite to loopback capture.
+#[inline(always)]
+pub const fn is_tcp_stream_connect(sock_type: u32) -> bool {
+    sock_type == SOCK_STREAM
+}
 
 /// Inbound HBONE port carried in the capture config for sidecarless topologies.
 pub const INBOUND_HBONE_PORT: u16 = 15008;
@@ -1043,6 +1136,8 @@ mod userspace_pod {
         NodeProbePortKey6,
         InboundRedirectKey4,
         InboundRedirectKey6,
+        UdpReplySourceKey4,
+        UdpReplySourceKey6,
         WorkloadIdentity,
         BpfCaptureConfig,
         IncludePortsPolicy,
@@ -1105,6 +1200,14 @@ mod tests {
         // [u32;4] + two u16 = 20 bytes. Both are fully defined (explicit pad).
         assert_eq!(mem::size_of::<InboundRedirectKey4>(), 8);
         assert_eq!(mem::size_of::<InboundRedirectKey6>(), 20);
+        // NodeWaypoint UDP/DTLS reply-source authorization keys share the same
+        // fully-defined (address, port, explicit pad) shape, so the map bytes
+        // the userspace publisher writes and the classifier looks up cannot
+        // diverge through implicit padding.
+        assert_eq!(mem::size_of::<UdpReplySourceKey4>(), 8);
+        assert_eq!(mem::size_of::<UdpReplySourceKey6>(), 20);
+        assert_eq!(mem::align_of::<UdpReplySourceKey4>(), 4);
+        assert_eq!(mem::align_of::<UdpReplySourceKey6>(), 4);
         assert_eq!(mem::size_of::<CidrKey4>(), 4);
         assert_eq!(mem::size_of::<CidrKey6>(), 16);
         // IncludePortsPolicy: two u32 (8) + [u16; INCLUDE_PORTS_MAX] (32) = 40 bytes, 4-byte aligned.
@@ -1139,6 +1242,20 @@ mod tests {
         assert_copy::<SockOpsRecord>();
         assert_copy::<AcceptFirstByteState>();
         assert_copy::<WorkloadIdentity>();
+        assert_copy::<UdpReplySourceKey4>();
+        assert_copy::<UdpReplySourceKey6>();
+        // The constructors are the ONE place the pad word is written, so a
+        // publisher and the classifier that both go through them agree on every
+        // key byte. Exactness is the whole security property: a differing port
+        // or address must be a different key, never a near-match.
+        let v4 = UdpReplySourceKey4::new(0x0100_00c0, 5353);
+        assert_eq!(v4._pad, 0);
+        assert_ne!(v4, UdpReplySourceKey4::new(0x0100_00c0, 5354));
+        assert_ne!(v4, UdpReplySourceKey4::new(0x0200_00c0, 5353));
+        let v6 = UdpReplySourceKey6::new([1, 2, 3, 4], 5353);
+        assert_eq!(v6._pad, 0);
+        assert_ne!(v6, UdpReplySourceKey6::new([1, 2, 3, 4], 5354));
+        assert_ne!(v6, UdpReplySourceKey6::new([1, 2, 3, 5], 5353));
     }
 
     #[test]
@@ -1257,6 +1374,17 @@ mod tests {
         // The previous bug (`remote_port as u16` first) read the zero low half
         // and returned 0 for both of these.
         assert_ne!(sock_ops_peer_port_host_order(0x901F_0000), 0);
+    }
+
+    #[test]
+    fn connect_capture_rewrites_tcp_stream_only() {
+        // cgroup/connect{4,6} also fire for UDP connect(). Rewriting SOCK_DGRAM
+        // to the TCP capture listener would black-hole DTLS from enrolled pods.
+        assert_eq!(SOCK_STREAM, 1);
+        assert_eq!(SOCK_DGRAM, 2);
+        assert!(is_tcp_stream_connect(SOCK_STREAM));
+        assert!(!is_tcp_stream_connect(SOCK_DGRAM));
+        assert!(!is_tcp_stream_connect(0));
     }
 
     #[test]

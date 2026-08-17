@@ -22,6 +22,34 @@ source "$SPIRE_HELPER"
 MESH_NS="${FERRUM_LIVE_MESH_NAMESPACE:-ferrum}"
 WORKLOAD_NS="${FERRUM_LIVE_WORKLOAD_NAMESPACE:-ferrum-ebpf-live}"
 UNMANAGED_NS="${FERRUM_LIVE_UNMANAGED_NAMESPACE:-$WORKLOAD_NS-unmanaged}"
+# Service port of the in-mesh `udp-echo` Service. The NodeWaypoint materializes
+# its UDP listener on this exact port number in the host network namespace
+# (issue #3286), so co-located pods reach it at <node IP>:<this port>. Kept out
+# of the reserved mesh port range (15001/15006/15008/15011/15090/15443).
+UDP_LISTENER_PORT="${FERRUM_LIVE_UDP_LISTENER_PORT:-15353}"
+# Service port of the in-mesh `dtls-echo` Service. Same `protocol: UDP` L4
+# transport, but its `appProtocol: dtls` hint makes the NodeWaypoint TERMINATE
+# frontend DTLS on the materialized listener and forward PLAINTEXT datagrams to
+# the backing pod (issue #3286).
+DTLS_LISTENER_PORT="${FERRUM_LIVE_DTLS_LISTENER_PORT:-15354}"
+# Secret + mount for the DTLS server material the NodeWaypoint terminates with.
+# The mesh data plane loads it from the DTLS-specific FERRUM_DTLS_CERT_PATH /
+# FERRUM_DTLS_KEY_PATH (NOT FERRUM_FRONTEND_TLS_*, which is the inbound TCP
+# listener's server identity and here is the SPIRE-issued NodeWaypoint SVID).
+# Without it every `dtls` listener stays deferred as `FrontendDtlsDeferred` and
+# never binds.
+DTLS_SECRET_NAME="${FERRUM_LIVE_DTLS_SECRET:-ferrum-live-node-waypoint-dtls}"
+DTLS_MOUNT_PATH=/etc/ferrum/dtls
+# Same numeric port for two compatible plain-UDP Services with distinct
+# ClusterIPs (issue #3861). Must not collide with udp-echo (15353) or
+# dtls-echo (15354).
+DEMUX_UDP_PORT="${FERRUM_LIVE_DEMUX_UDP_PORT:-15355}"
+DTLS_CLIENT_SECRET_NAME="${FERRUM_LIVE_DTLS_CLIENT_SECRET:-ferrum-live-dtls-clients}"
+DTLS_CLIENT_MOUNT_PATH=/etc/ferrum/dtls-clients
+# openssl CLI image for the enrolled DTLS probe pods. Built on the runner and
+# loaded into kind: those pods are mesh-captured, so they cannot `apk add`.
+DTLS_CLIENT_IMAGE="${FERRUM_LIVE_DTLS_CLIENT_IMAGE:-ferrum-live-dtls-client:local}"
+DTLS_CLIENT_DOCKERFILE="$ROOT_DIR/tests/k8s/node_waypoint_ebpf_live/dtls-client.Dockerfile"
 RELEASE="${FERRUM_LIVE_RELEASE:-ferrum-live}"
 IMAGE_REPOSITORY="${FERRUM_LIVE_IMAGE_REPOSITORY:-ferrumedge/ferrum-edge}"
 IMAGE_TAG="${FERRUM_LIVE_IMAGE_TAG:-0.9.0}"
@@ -74,6 +102,29 @@ REQUIRED_LIVE_ASSERTIONS=(
   node_waypoint.ipv4.direct_inbound_guard_cross_node
   node_waypoint.identity.stale_cleanup
   node_waypoint.identity.spire_chart_profile
+  node_waypoint.udp.listener_allow_attributed_source
+  node_waypoint.udp.service_path_allow_attributed_source
+  node_waypoint.udp.listener_deny_scoped_policy
+  node_waypoint.udp.listener_deny_unattributed_source
+  node_waypoint.udp.listener_deny_spoofed_source
+  node_waypoint.udp.policy_change_denies_live
+  node_waypoint.udp.policy_withdrawal_recovers_live
+  node_waypoint.dtls.listener_bound
+  node_waypoint.dtls.listener_allow_attributed_source
+  node_waypoint.dtls.listener_deny_scoped_policy
+  node_waypoint.dtls.service_path_allow_attributed_source
+  node_waypoint.dtls.service_path_deny_scoped_policy
+  node_waypoint.dtls.service_path_deny_unattributed_source
+  node_waypoint.udp.same_port_demux_serves_a
+  node_waypoint.udp.same_port_demux_serves_b
+  node_waypoint.udp.same_port_demux_isolated
+  node_waypoint.udp.same_port_demux_shared_client_tuple
+  node_waypoint.udp.same_port_demux_retract_a_keeps_b
+  node_waypoint.dtls.reload_permissive_to_strict
+  node_waypoint.dtls.reload_current_ca_admitted
+  node_waypoint.dtls.reload_stale_ca_rejected
+  node_waypoint.dtls.reload_unauthenticated_rejected
+  node_waypoint.dtls.operator_isolated_across_reload
 )
 if [[ "$STALE_IP_REUSE_HOST_LOCAL_PROFILE" == "true" ]]; then
   REQUIRED_LIVE_ASSERTIONS+=(
@@ -126,6 +177,9 @@ require_cmd kubectl
 require_cmd helm
 require_cmd curl
 require_cmd python3
+# Mints the throwaway DTLS server material the NodeWaypoint `dtls` listener
+# terminates with (issue #3286).
+require_cmd openssl
 if [[ -z "$KUBE_CONTEXT" ]]; then
   KUBE_CONTEXT="$(kubectl config current-context)"
 fi
@@ -256,6 +310,41 @@ render_chart_assertions() {
   ebpf_count="$(grep -c "image: \"$IMAGE_REPOSITORY:$IMAGE_TAG-ebpf\"" <<<"$rendered" || true)"
   if [[ "$ebpf_count" -lt 2 ]]; then
     echo "NodeWaypoint eBPF render did not select -ebpf images for both proxy and node-agent" >&2
+    grep -n 'image:' <<<"$rendered" >&2 || true
+    exit 1
+  fi
+  if grep -q "image: \"$IMAGE_REPOSITORY:$IMAGE_TAG-ebpf-tools\"" <<<"$rendered"; then
+    echo "TCP-only NodeWaypoint unexpectedly selected the tools-capable -ebpf-tools image" >&2
+    grep -n 'image:' <<<"$rendered" >&2 || true
+    exit 1
+  fi
+
+  rendered="$(helm template "$RELEASE" "$CHART_DIR" \
+    --namespace "$MESH_NS" \
+    --set image.repository="$IMAGE_REPOSITORY" \
+    --set image.tag="$IMAGE_TAG" \
+    --set ambient.enabled=true \
+    --set ambient.captureMode=ebpf \
+    --set ambient.env.FERRUM_MESH_TOPOLOGY=node_waypoint \
+    --set-string "ambient.env.FERRUM_METRICS_ALLOWED_CIDRS=127.0.0.1/32" \
+    --set-string "ambient.env.FERRUM_ADMIN_HTTP_PORT=$AMBIENT_ADMIN_PORT" \
+    --set ambient.env.FERRUM_MESH_NODE_WAYPOINT_UDP_LISTENERS_ENABLED=true \
+    --set nodeAgent.enabled=true \
+    --set-string "nodeAgent.env.FERRUM_METRICS_ALLOWED_CIDRS=127.0.0.1/32" \
+    --set nodeAgent.captureMode=ebpf \
+    --set nodeAgent.proxyMode=node_waypoint \
+    --set-string "nodeAgent.admin.port=$NODE_AGENT_ADMIN_PORT" \
+    --set-string "nodeAgent.podRegistryDir=$NODE_WAYPOINT_REGISTRY_DIR")"
+  local udp_tools_count udp_ebpf_exact
+  udp_tools_count="$(grep -c "image: \"$IMAGE_REPOSITORY:$IMAGE_TAG-ebpf-tools\"" <<<"$rendered" || true)"
+  udp_ebpf_exact="$(grep -E "image: \"$IMAGE_REPOSITORY:$IMAGE_TAG-ebpf\"[[:space:]]*$" <<<"$rendered" | grep -c . || true)"
+  if [[ "$udp_tools_count" -ne 1 ]]; then
+    echo "NodeWaypoint UDP listeners did not select exactly one -ebpf-tools ambient image" >&2
+    grep -n 'image:' <<<"$rendered" >&2 || true
+    exit 1
+  fi
+  if [[ "$udp_ebpf_exact" -lt 1 ]]; then
+    echo "NodeWaypoint UDP listeners did not keep the distroless -ebpf node-agent image" >&2
     grep -n 'image:' <<<"$rendered" >&2 || true
     exit 1
   fi
@@ -990,8 +1079,90 @@ install_spire_production_identity() {
     "spire/attested-agents.txt,spire/registered-entries.txt"
 }
 
+# Mint the DTLS server certificate the NodeWaypoint's `dtls` listener terminates
+# with, and publish it as a TLS Secret mounted into the ambient DaemonSet.
+#
+# Deliberately a throwaway self-signed P-256 leaf minted per run: Ferrum's DTLS
+# admission accepts only ECDSA P-256/P-384 server leaves, and using an RSA leaf
+# here would leave the listener deferred before the datapath under test exists.
+# The property under test is the DTLS datapath and scoped source authorization,
+# not PKI trust, and the live client does not verify the server certificate. No
+# key material leaves the cluster or the run's temp dir, and nothing is echoed
+# to the log.
+create_dtls_listener_secret() {
+  log "minting the NodeWaypoint frontend DTLS material and client CAs"
+  local dir
+  dir="$(mktemp -d)"
+  if ! openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes -days 2 \
+    -subj "/CN=ferrum-node-waypoint-dtls" \
+    -keyout "$dir/tls.key" -out "$dir/tls.crt" >/dev/null 2>&1; then
+    rm -rf "$dir"
+    echo "could not mint the NodeWaypoint frontend DTLS listener certificate" >&2
+    exit 1
+  fi
+  if ! openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes -days 2 \
+    -subj "/CN=ferrum-live-dtls-current-ca" \
+    -keyout "$dir/current-ca.key" -out "$dir/ca.crt" >/dev/null 2>&1; then
+    rm -rf "$dir"
+    echo "could not mint the current DTLS client CA" >&2
+    exit 1
+  fi
+  if ! openssl req -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes \
+    -subj "/CN=ferrum-live-dtls-current-client" \
+    -keyout "$dir/current.key" -out "$dir/current.csr" >/dev/null 2>&1; then
+    rm -rf "$dir"
+    echo "could not mint the current DTLS client key" >&2
+    exit 1
+  fi
+  printf '%s\n' 'basicConstraints=CA:FALSE' 'keyUsage=digitalSignature' \
+    'extendedKeyUsage=clientAuth' >"$dir/client.ext"
+  if ! openssl x509 -req -in "$dir/current.csr" -CA "$dir/ca.crt" \
+    -CAkey "$dir/current-ca.key" -CAcreateserial -days 2 \
+    -out "$dir/current.crt" -extfile "$dir/client.ext" >/dev/null 2>&1; then
+    rm -rf "$dir"
+    echo "could not sign the current DTLS client certificate" >&2
+    exit 1
+  fi
+  if ! openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes -days 2 \
+    -subj "/CN=ferrum-live-dtls-stale-ca" \
+    -keyout "$dir/stale-ca.key" -out "$dir/stale-ca.crt" >/dev/null 2>&1; then
+    rm -rf "$dir"
+    echo "could not mint the stale DTLS client CA" >&2
+    exit 1
+  fi
+  if ! openssl req -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes \
+    -subj "/CN=ferrum-live-dtls-stale-client" \
+    -keyout "$dir/stale.key" -out "$dir/stale.csr" >/dev/null 2>&1; then
+    rm -rf "$dir"
+    echo "could not mint the stale DTLS client key" >&2
+    exit 1
+  fi
+  if ! openssl x509 -req -in "$dir/stale.csr" -CA "$dir/stale-ca.crt" \
+    -CAkey "$dir/stale-ca.key" -CAcreateserial -days 2 \
+    -out "$dir/stale.crt" -extfile "$dir/client.ext" >/dev/null 2>&1; then
+    rm -rf "$dir"
+    echo "could not sign the stale DTLS client certificate" >&2
+    exit 1
+  fi
+  kubectl create namespace "$MESH_NS" --dry-run=client -o yaml | kubectl apply -f -
+  kubectl -n "$MESH_NS" create secret generic "$DTLS_SECRET_NAME" \
+    --from-file=tls.crt="$dir/tls.crt" \
+    --from-file=tls.key="$dir/tls.key" \
+    --from-file=ca.crt="$dir/ca.crt" \
+    --dry-run=client -o yaml | kubectl apply -f -
+  kubectl create namespace "$WORKLOAD_NS" --dry-run=client -o yaml | kubectl apply -f -
+  kubectl -n "$WORKLOAD_NS" create secret generic "$DTLS_CLIENT_SECRET_NAME" \
+    --from-file=current.crt="$dir/current.crt" \
+    --from-file=current.key="$dir/current.key" \
+    --from-file=stale.crt="$dir/stale.crt" \
+    --from-file=stale.key="$dir/stale.key" \
+    --dry-run=client -o yaml | kubectl apply -f -
+  rm -rf "$dir"
+}
+
 install_ferrum() {
   log "installing Ferrum chart"
+  create_dtls_listener_secret
   local -a identity_args=()
   local trusted_probe_ips_helm
   trusted_probe_ips_helm="$(helm_set_string_escape "$TRUSTED_KUBELET_PROBE_IPS")"
@@ -1052,6 +1223,13 @@ install_ferrum() {
     "${identity_args[@]}" \
     --set ambient.env.FERRUM_MESH_HBONE_LISTEN_ADDR=0.0.0.0:15008 \
     --set-string 'ambient.env.FERRUM_MESH_INBOUND_LISTEN_ADDR=[::]:15006' \
+    --set ambient.env.FERRUM_MESH_NODE_WAYPOINT_UDP_LISTENERS_ENABLED=true \
+    --set ambient.env.FERRUM_MESH_PEER_AUTH_LIVE_RELOAD_ENABLED=true \
+    --set-string "ambient.env.FERRUM_DTLS_CERT_PATH=$DTLS_MOUNT_PATH/tls.crt" \
+    --set-string "ambient.env.FERRUM_DTLS_KEY_PATH=$DTLS_MOUNT_PATH/tls.key" \
+    --set-string "ambient.env.FERRUM_DTLS_CLIENT_CA_CERT_PATH=$DTLS_MOUNT_PATH/ca.crt" \
+    --set-json "ambient.extraVolumes=[{\"name\":\"node-waypoint-dtls\",\"secret\":{\"secretName\":\"$DTLS_SECRET_NAME\"}}]" \
+    --set-json "ambient.extraVolumeMounts=[{\"name\":\"node-waypoint-dtls\",\"mountPath\":\"$DTLS_MOUNT_PATH\",\"readOnly\":true}]" \
     --set nodeAgent.enabled=true \
     --set-string "nodeAgent.env.FERRUM_METRICS_ALLOWED_CIDRS=127.0.0.1/32" \
     --set nodeAgent.captureMode=ebpf \
@@ -1616,12 +1794,34 @@ collect_bpf_evidence() {
     "bpftool-$NODE_A.txt,bpftool-$NODE_B.txt"
 }
 
+prepare_dtls_client_image() {
+  log "building the NodeWaypoint DTLS client image with openssl preinstalled"
+  require_cmd docker
+  require_cmd kind
+  if [[ ! -f "$DTLS_CLIENT_DOCKERFILE" ]]; then
+    echo "missing DTLS client Dockerfile: $DTLS_CLIENT_DOCKERFILE" >&2
+    exit 1
+  fi
+  local cluster="${FERRUM_LIVE_KIND_CLUSTER:-${KIND_CLUSTER:-ferrum-ebpf-live}}"
+  docker build -t "$DTLS_CLIENT_IMAGE" -f "$DTLS_CLIENT_DOCKERFILE" \
+    "$(dirname "$DTLS_CLIENT_DOCKERFILE")"
+  kind load docker-image "$DTLS_CLIENT_IMAGE" --name "$cluster"
+}
+
 apply_workloads() {
   log "applying live traffic workloads"
-  awk -v ns="$WORKLOAD_NS" -v td="$TRUST_DOMAIN" -v require_dual="$REQUIRE_DUAL_STACK" '
+  awk -v ns="$WORKLOAD_NS" -v td="$TRUST_DOMAIN" -v require_dual="$REQUIRE_DUAL_STACK" \
+    -v udp_port="$UDP_LISTENER_PORT" -v dtls_port="$DTLS_LISTENER_PORT" \
+    -v demux_port="$DEMUX_UDP_PORT" \
+    -v dtls_image="$DTLS_CLIENT_IMAGE" -v dtls_client_secret="$DTLS_CLIENT_SECRET_NAME" '
     {
       gsub(/__NAMESPACE__/, ns)
       gsub(/__TRUST_DOMAIN__/, td)
+      gsub(/__UDP_LISTENER_PORT__/, udp_port)
+      gsub(/__DTLS_LISTENER_PORT__/, dtls_port)
+      gsub(/__DEMUX_UDP_PORT__/, demux_port)
+      gsub(/__DTLS_CLIENT_IMAGE__/, dtls_image)
+      gsub(/__DTLS_CLIENT_CERT_SECRET__/, dtls_client_secret)
       if ($0 ~ /__SERVICE_IP_FAMILY_BLOCK__/) {
         if (require_dual == "true") {
           print "  ipFamilyPolicy: RequireDualStack"
@@ -1640,6 +1840,21 @@ apply_workloads() {
   kubectl -n "$WORKLOAD_NS" rollout status deploy/src-b --timeout=3m
   kubectl -n "$WORKLOAD_NS" rollout status deploy/dst-a --timeout=3m
   kubectl -n "$WORKLOAD_NS" rollout status deploy/dst-b --timeout=3m
+  kubectl -n "$WORKLOAD_NS" rollout status deploy/udp-echo --timeout=3m
+  kubectl -n "$WORKLOAD_NS" rollout status deploy/udp-src-a --timeout=3m
+  kubectl -n "$WORKLOAD_NS" rollout status deploy/udp-src-b --timeout=3m
+  kubectl -n "$WORKLOAD_NS" rollout status deploy/udp-demux-a --timeout=3m
+  kubectl -n "$WORKLOAD_NS" rollout status deploy/udp-demux-b --timeout=3m
+  kubectl -n "$WORKLOAD_NS" rollout status deploy/dtls-echo --timeout=3m
+  kubectl -n "$WORKLOAD_NS" rollout status deploy/dtls-src-a --timeout=3m
+  kubectl -n "$WORKLOAD_NS" rollout status deploy/dtls-src-b --timeout=3m
+  local dtls_app
+  for dtls_app in dtls-src-a dtls-src-b; do
+    if ! kubectl -n "$WORKLOAD_NS" exec "deploy/$dtls_app" -c dtls -- openssl version >/dev/null; then
+      echo "$dtls_app is missing the openssl CLI; the DTLS live client image did not load" >&2
+      exit 1
+    fi
+  done
 
   log "applying unmanaged direct-inbound probe workloads"
   kubectl create namespace "$UNMANAGED_NS" --dry-run=client -o yaml | kubectl apply -f -
@@ -1687,9 +1902,81 @@ spec:
         - name: curl
           image: curlimages/curl:8.10.1
           command: ["sh", "-c", "sleep 365d"]
+---
+# Unenrolled UDP sender for the NodeWaypoint UDP listener attribution checks
+# (issue #3286). It lives outside the mesh namespace and is not enrolled, so the
+# node-agent registry publishes no binding for its veth: every datagram it sends
+# to the NodeWaypoint UDP listener is UNATTRIBUTABLE and must be refused while a
+# scoped AuthorizationPolicy is enforcing. It also drives the source-address
+# spoof probe, where it names an enrolled pod's IP from its own interface.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: udp-unmanaged
+  namespace: $UNMANAGED_NS
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: udp-unmanaged
+  template:
+    metadata:
+      labels:
+        app: udp-unmanaged
+    spec:
+      nodeSelector:
+        ferrum.io/live-node: a
+      containers:
+        - name: udp
+          image: python:3.12-alpine
+          command: ["sh", "-c", "sleep 365d"]
+          securityContext:
+            capabilities:
+              # Explicit so the source-address spoof probe is DETERMINISTIC:
+              # without NET_RAW the forged datagram could not be built, and the
+              # required spoof-refusal assertion would have nothing to observe.
+              # The harness fails that assertion closed rather than recording a
+              # refusal for a datagram that was never emitted.
+              add: ["NET_RAW"]
+---
+# Unenrolled DTLS sender for the Service-path refusal check (issue #3286 root
+# review). Same posture as udp-unmanaged — outside the mesh namespace, no
+# registry binding for its veth — but carrying openssl, so it can attempt a real
+# handshake against the dtls-echo Service DNS name. No steering rule names its
+# interface, so its datagram takes the ordinary path: kube-proxy DNATs the
+# ClusterIP to the backing pod and the pod-veth guard drops it. The backend log
+# is the authority that it arrived nowhere.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: dtls-unmanaged
+  namespace: $UNMANAGED_NS
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: dtls-unmanaged
+  template:
+    metadata:
+      labels:
+        app: dtls-unmanaged
+    spec:
+      nodeSelector:
+        ferrum.io/live-node: a
+      containers:
+        - name: dtls
+          image: $DTLS_CLIENT_IMAGE
+          imagePullPolicy: IfNotPresent
+          command: ["sh", "-c", "sleep 365d"]
 EOF
   kubectl -n "$UNMANAGED_NS" rollout status deploy/unmanaged-a --timeout=3m
   kubectl -n "$UNMANAGED_NS" rollout status deploy/unmanaged-b --timeout=3m
+  kubectl -n "$UNMANAGED_NS" rollout status deploy/udp-unmanaged --timeout=3m
+  kubectl -n "$UNMANAGED_NS" rollout status deploy/dtls-unmanaged --timeout=3m
+  if ! kubectl -n "$UNMANAGED_NS" exec deploy/dtls-unmanaged -c dtls -- openssl version >/dev/null; then
+    echo "dtls-unmanaged is missing the openssl CLI; the DTLS live client image did not load" >&2
+    exit 1
+  fi
 }
 
 admin_bearer_token() {
@@ -1806,6 +2093,35 @@ fetch_node_waypoint_identities_for_node() {
   for _ in $(seq 1 20); do
     if curl -fsS -H "Authorization: Bearer $token" \
       "http://127.0.0.1:$port/node-waypoint/identities" >"$out" 2>"$out.curl"; then
+      fetched=true
+      break
+    fi
+    sleep 0.25
+  done
+  kill "$pf_pid" 2>/dev/null || true
+  wait "$pf_pid" 2>/dev/null || true
+  [[ "$fetched" == "true" ]]
+}
+
+fetch_ambient_admin_json() {
+  local node="$1"
+  local path="$2"
+  local out="$3"
+  local ambient_pod port token pf_log pf_pid fetched
+  ambient_pod="$(ambient_pod_on_node "$node")"
+  if [[ -z "$ambient_pod" ]]; then
+    echo "no ferrum-mesh-ambient pod found on node $node" >&2
+    return 1
+  fi
+  port="$(pick_loopback_port)"
+  token="$(admin_bearer_token)"
+  pf_log="$out.port-forward.log"
+  kubectl -n "$MESH_NS" port-forward "pod/$ambient_pod" "$port:$AMBIENT_ADMIN_PORT" >"$pf_log" 2>&1 &
+  pf_pid=$!
+  fetched=false
+  for _ in $(seq 1 20); do
+    if curl -fsS -H "Authorization: Bearer $token" \
+      "http://127.0.0.1:$port$path" >"$out" 2>"$out.curl"; then
       fetched=true
       break
     fi
@@ -3972,6 +4288,1279 @@ run_ipv6_checks() {
     "unmanaged-direct-ipv6-pod-ip-fail-closed"
 }
 
+# ── NodeWaypoint UDP listener datapath (issue #3286) ────────────────────────
+#
+# These checks push REAL datagrams through the production UDP listener the
+# NodeWaypoint materializes for the `udp-echo` Service's `protocol: UDP` port
+# (`materialize_node_waypoint_udp_listeners`, gated by
+# FERRUM_MESH_NODE_WAYPOINT_UDP_LISTENERS_ENABLED). Every assertion observes the
+# datagram outcome, never source code or model state:
+#
+#   * an ADMITTED enrolled source reaches the backend and gets its echo back;
+#   * a DENIED enrolled source (matched by the namespace-scoped `deny-src-b`
+#     AuthorizationPolicy on its attributed source principal) gets nothing;
+#   * an UNATTRIBUTABLE source (unenrolled pod, and the same pod SPOOFING an
+#     enrolled pod's source address) gets nothing — the ingress interface, not
+#     the forgeable source address, is what attributes the datagram;
+#   * a policy CHANGE denies the previously admitted source, and WITHDRAWING it
+#     restores service, both without restarting the data plane.
+
+# Send one datagram from a pod and print the reply, `TIMEOUT`, or `EXECFAIL`.
+udp_probe_from() {
+  local ns="$1" app="$2" target_ip="$3" port="$4" payload="$5" wait_secs="${6:-3}"
+  kubectl -n "$ns" exec "deploy/$app" -c udp -- python -u -c '
+import socket
+import sys
+
+target, port, payload, wait = sys.argv[1], int(sys.argv[2]), sys.argv[3], float(sys.argv[4])
+target = target.strip("[]")
+family = socket.AF_INET6 if ":" in target else socket.AF_INET
+s = socket.socket(family, socket.SOCK_DGRAM)
+s.settimeout(wait)
+addr = (target, port, 0, 0) if family == socket.AF_INET6 else (target, port)
+try:
+    s.sendto(payload.encode(), addr)
+    data, _ = s.recvfrom(2048)
+    sys.stdout.write(data.decode("utf-8", "replace"))
+except socket.timeout:
+    sys.stdout.write("TIMEOUT")
+except OSError as exc:
+    sys.stdout.write("OSERROR:%s" % exc.errno)
+' "$target_ip" "$port" "$payload" "$wait_secs" 2>/dev/null || echo "EXECFAIL"
+}
+
+# Send one datagram whose IP source address is FORGED to `spoof_ip`, from a pod
+# whose veth is not the one that address belongs to.
+#
+# Output contract, so a refusal can never be recorded for a datagram that was
+# never put on the wire:
+#   SPOOF-UNAVAILABLE  — the raw socket or the send FAILED; nothing was emitted.
+#   SPOOF-SENT:TIMEOUT — the forged datagram WAS emitted and drew no reply.
+#   SPOOF-SENT:<data>  — the forged datagram WAS emitted and drew a reply.
+# The `SPOOF-SENT:` prefix is printed only after `sendto` returns, so it is the
+# emission proof itself.
+udp_spoof_probe_from() {
+  local ns="$1" app="$2" target_ip="$3" port="$4" spoof_ip="$5" payload="$6" wait_secs="${7:-3}"
+  kubectl -n "$ns" exec "deploy/$app" -c udp -- python -u -c '
+import socket
+import struct
+import sys
+
+target, port, spoof, payload, wait = (
+    sys.argv[1], int(sys.argv[2]), sys.argv[3], sys.argv[4].encode(), float(sys.argv[5])
+)
+
+def checksum(data):
+    if len(data) % 2:
+        data += b"\x00"
+    total = 0
+    for i in range(0, len(data), 2):
+        total += (data[i] << 8) + data[i + 1]
+    while total >> 16:
+        total = (total & 0xFFFF) + (total >> 16)
+    return (~total) & 0xFFFF
+
+# The forging socket. The pod is granted NET_RAW explicitly, so a failure here
+# is an environment fault the caller must fail closed on, not a refusal.
+try:
+    raw = socket.socket(socket.AF_INET, socket.SOCK_RAW, socket.IPPROTO_RAW)
+except OSError:
+    sys.stdout.write("SPOOF-UNAVAILABLE")
+    raise SystemExit(0)
+
+sport = 45001
+udp_len = 8 + len(payload)
+pseudo = (
+    socket.inet_aton(spoof)
+    + socket.inet_aton(target)
+    + struct.pack("!BBH", 0, socket.IPPROTO_UDP, udp_len)
+)
+udp_header = struct.pack("!HHHH", sport, port, udp_len, 0)
+csum = checksum(pseudo + udp_header + payload)
+udp_header = struct.pack("!HHHH", sport, port, udp_len, csum or 0xFFFF)
+total_len = 20 + udp_len
+ip_header = struct.pack(
+    "!BBHHHBBH4s4s",
+    0x45, 0, total_len, 0x1234, 0, 64, socket.IPPROTO_UDP, 0,
+    socket.inet_aton(spoof), socket.inet_aton(target),
+)
+# Bound BEFORE the send, on the same source port the forged datagram carries,
+# so a reply the listener does send is observable rather than dropped by the
+# kernel.
+sink = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+sink.settimeout(wait)
+try:
+    sink.bind(("0.0.0.0", sport))
+except OSError:
+    sys.stdout.write("SPOOF-UNAVAILABLE")
+    raise SystemExit(0)
+
+try:
+    raw.sendto(ip_header + udp_header + payload, (target, 0))
+except OSError:
+    sys.stdout.write("SPOOF-UNAVAILABLE")
+    raise SystemExit(0)
+
+# Past this point the forged datagram IS on the wire, so every remaining
+# outcome is an observation about the listener rather than about the sandbox.
+sys.stdout.write("SPOOF-SENT:")
+try:
+    data, _ = sink.recvfrom(2048)
+    sys.stdout.write(data.decode("utf-8", "replace"))
+except socket.timeout:
+    sys.stdout.write("TIMEOUT")
+except OSError:
+    sys.stdout.write("TIMEOUT")
+' "$target_ip" "$port" "$spoof_ip" "$payload" "$wait_secs" 2>/dev/null || echo "SPOOF-UNAVAILABLE"
+}
+
+udp_backend_received() {
+  local ns="$1" deploy="$2" payload="$3"
+  kubectl -n "$ns" logs "deploy/$deploy" --tail=-1 2>/dev/null |
+    grep -c "^recv:${payload}$" || true
+}
+
+# How many datagrams carrying `payload` the udp-echo backend actually received.
+# Reply-absence alone is not proof for the spoofed-source case (a spoofed
+# datagram's reply is sent to the FORGED address, so the prober would see a
+# timeout either way); the backend log is.
+udp_echo_backend_received() {
+  udp_backend_received "$WORKLOAD_NS" udp-echo "$1"
+}
+
+ambient_restart_total() {
+  kubectl -n "$MESH_NS" get pods -l app.kubernetes.io/component=ambient \
+    -o jsonpath='{range .items[*]}{.status.containerStatuses[*].restartCount}{"\n"}{end}' 2>/dev/null |
+    awk '{ for (i = 1; i <= NF; i++) total += $i } END { print total + 0 }'
+}
+
+# The node-local address the NodeWaypoint UDP/DTLS listeners are PROBED at.
+#
+# This is deliberately NOT the node's `status.hostIP`. Both listeners bind
+# `0.0.0.0`, and every reply leaves with its source pinned by IP(v6)_PKTINFO to
+# the exact local address the client targeted — that is the reply-source
+# invariant the wildcard bind depends on, and for the DTLS listener a
+# route-selected source would break the client's connected socket outright. The
+# node-agent's direct-pod guard then admits a datagram to an enrolled pod only
+# when it carries the relay's socket mark AND its source is one of the trusted
+# node source IPs (`FERRUM_NODE_AGENT_NODE_IPS`, derived here from the node
+# PodCIDR gateways by `discover_trusted_kubelet_probe_ips`). Probing the
+# listener at an untrusted node address therefore produces a reply the node's
+# own guard drops, which is the documented fail-closed contract, not a datapath
+# defect. Probe at a trusted node source address so the relay can answer.
+node_waypoint_listener_ip() {
+  kubectl get node "$NODE_A" -o json | python3 -c '
+import ipaddress
+import json
+import sys
+
+node = json.load(sys.stdin)
+spec = node.get("spec") or {}
+cidrs = spec.get("podCIDRs") or []
+if not cidrs and spec.get("podCIDR"):
+    cidrs = [spec["podCIDR"]]
+for raw in cidrs:
+    try:
+        network = ipaddress.ip_network(raw, strict=False)
+    except ValueError:
+        continue
+    if network.version != 4:
+        continue
+    try:
+        print(next(network.hosts()))
+    except StopIteration:
+        continue
+    break
+'
+}
+
+# Poll a probe until its reply matches (or stops matching) the expected prefix.
+wait_for_udp_outcome_on() {
+  local mode="$1" expected="$2" ns="$3" app="$4" listener_ip="$5" port="$6" payload="$7" budget="${8:-40}"
+  local attempt reply
+  for ((attempt = 0; attempt < budget; attempt++)); do
+    reply="$(udp_probe_from "$ns" "$app" "$listener_ip" "$port" "$payload" 2)"
+    case "$mode" in
+      match)
+        if [[ "$reply" == "$expected"* ]]; then
+          printf '%s' "$reply"
+          return 0
+        fi
+        ;;
+      refuse)
+        if [[ "$reply" == "TIMEOUT" ]]; then
+          printf '%s' "$reply"
+          return 0
+        fi
+        ;;
+    esac
+    sleep 3
+  done
+  printf '%s' "$reply"
+  return 1
+}
+
+wait_for_udp_outcome() {
+  wait_for_udp_outcome_on "$1" "$2" "$3" "$4" "$5" "$UDP_LISTENER_PORT" "$6" "${7:-40}"
+}
+
+run_node_waypoint_udp_datapath_checks() {
+  log "running NodeWaypoint UDP listener datapath checks (issue #3286)"
+  local listener_ip reply restarts_before restarts_after echo_pod_ip
+
+  listener_ip="$(node_waypoint_listener_ip)"
+  if [[ -z "$listener_ip" ]]; then
+    record_live_assertion node_waypoint.udp.listener_allow_attributed_source fail \
+      udp-src-a udp-echo "could not resolve a trusted node source address for the listener" \
+      "" "" "node-waypoint-udp-listener"
+    return 1
+  fi
+  echo_pod_ip="$(kubectl -n "$WORKLOAD_NS" get pod -l app=udp-echo \
+    -o jsonpath='{.items[0].status.podIP}')"
+  log "NodeWaypoint UDP listener target ${listener_ip}:${UDP_LISTENER_PORT} (backend $echo_pod_ip)"
+
+  # 1. First construction: an admitted, attributed source reaches the backend.
+  if ! reply="$(wait_for_udp_outcome match "udp-ok:ping-a" \
+    "$WORKLOAD_NS" udp-src-a "$listener_ip" ping-a 40)"; then
+    record_live_assertion node_waypoint.udp.listener_allow_attributed_source fail \
+      udp-src-a udp-echo "observed=$reply" "$(spiffe_for_sa src-a)" "$(spiffe_for_sa dst-a)" \
+      "node-waypoint-udp-listener"
+    collect_traffic_failure_diagnostics
+    return 1
+  fi
+  local allow_backend_hits
+  allow_backend_hits="$(udp_echo_backend_received ping-a)"
+  if [[ "$allow_backend_hits" == "0" ]]; then
+    record_live_assertion node_waypoint.udp.listener_allow_attributed_source fail \
+      udp-src-a udp-echo "the echo arrived but the backend logged no datagram" \
+      "$(spiffe_for_sa src-a)" "$(spiffe_for_sa dst-a)" "node-waypoint-udp-listener"
+    collect_traffic_failure_diagnostics
+    return 1
+  fi
+  record_live_assertion node_waypoint.udp.listener_allow_attributed_source pass \
+    udp-src-a udp-echo "observed=$reply backend_hits=$allow_backend_hits" \
+    "$(spiffe_for_sa src-a)" "$(spiffe_for_sa dst-a)" "node-waypoint-udp-listener"
+
+  # 1b. The ORDINARY user path (issue #3286 root review): an enrolled workload
+  #     addressing its Service's ClusterIP — not a node address. Without the
+  #     Service-path steering this cannot work at all: kube-proxy DNATs the
+  #     ClusterIP to a backing pod and the pod-veth guard drops the unmarked
+  #     datagram, so the workload sees a timeout. Passing therefore proves the
+  #     steering rules diverted the datagram to the materialized listener with
+  #     its original destination intact AND that the reply came back sourced
+  #     from the ClusterIP (an unmarked or wrongly-sourced reply is dropped
+  #     before the workload ever sees it). The check above stays as the distinct
+  #     direct-node-address boundary.
+  local service_ip service_reply service_backend_hits
+  service_ip="$(kubectl -n "$WORKLOAD_NS" get svc udp-echo -o jsonpath='{.spec.clusterIP}')"
+  if [[ -z "$service_ip" || "$service_ip" == "None" ]]; then
+    record_live_assertion node_waypoint.udp.service_path_allow_attributed_source fail \
+      udp-src-a udp-echo "the udp-echo Service publishes no ClusterIP to steer" \
+      "$(spiffe_for_sa src-a)" "$(spiffe_for_sa dst-a)" "node-waypoint-udp-listener"
+    collect_traffic_failure_diagnostics
+    return 1
+  fi
+  log "NodeWaypoint UDP Service path target ${service_ip}:${UDP_LISTENER_PORT} (udp-echo ClusterIP)"
+  if ! service_reply="$(wait_for_udp_outcome match "udp-ok:svc-a" \
+    "$WORKLOAD_NS" udp-src-a "$service_ip" svc-a 40)"; then
+    # A no-reply outcome has two very different causes and the backend log is
+    # what separates them: zero hits means the steering rules never diverted the
+    # datagram to the materialized listener, while a non-zero count means the
+    # forward leg worked and only the ClusterIP-sourced reply was lost on the
+    # way back to the enrolled source pod. Record it so the failure is
+    # actionable from the job log alone.
+    local unreplied_backend_hits
+    unreplied_backend_hits="$(udp_echo_backend_received svc-a)"
+    record_live_assertion node_waypoint.udp.service_path_allow_attributed_source fail \
+      udp-src-a udp-echo \
+      "service_ip=$service_ip observed=$service_reply backend_hits=$unreplied_backend_hits" \
+      "$(spiffe_for_sa src-a)" "$(spiffe_for_sa dst-a)" "node-waypoint-udp-listener"
+    echo "[node-waypoint-ebpf-live] Service-path probe got no reply," \
+      "backend observed $unreplied_backend_hits svc-a datagram(s)" >&2
+    collect_traffic_failure_diagnostics
+    return 1
+  fi
+  service_backend_hits="$(udp_echo_backend_received svc-a)"
+  if [[ "$service_backend_hits" == "0" ]]; then
+    record_live_assertion node_waypoint.udp.service_path_allow_attributed_source fail \
+      udp-src-a udp-echo "the echo arrived but the backend logged no Service-path datagram" \
+      "$(spiffe_for_sa src-a)" "$(spiffe_for_sa dst-a)" "node-waypoint-udp-listener"
+    collect_traffic_failure_diagnostics
+    return 1
+  fi
+  record_live_assertion node_waypoint.udp.service_path_allow_attributed_source pass \
+    udp-src-a udp-echo "service_ip=$service_ip observed=$service_reply backend_hits=$service_backend_hits" \
+    "$(spiffe_for_sa src-a)" "$(spiffe_for_sa dst-a)" "node-waypoint-udp-listener"
+
+  # 2. A source the scoped AuthorizationPolicy denies gets no datagram through.
+  reply="$(udp_probe_from "$WORKLOAD_NS" udp-src-b "$listener_ip" "$UDP_LISTENER_PORT" ping-b 4)"
+  if [[ "$reply" != "TIMEOUT" ]]; then
+    record_live_assertion node_waypoint.udp.listener_deny_scoped_policy fail \
+      udp-src-b udp-echo "observed=$reply" "$(spiffe_for_sa src-b)" "$(spiffe_for_sa dst-a)" \
+      "node-waypoint-udp-listener"
+    collect_traffic_failure_diagnostics
+    return 1
+  fi
+  record_live_assertion node_waypoint.udp.listener_deny_scoped_policy pass \
+    udp-src-b udp-echo "observed=$reply" "$(spiffe_for_sa src-b)" "$(spiffe_for_sa dst-a)" \
+    "node-waypoint-udp-listener"
+
+  # 3. An UNATTRIBUTABLE source (unenrolled pod, no registry binding for its
+  #    veth) is refused while scoped enforcement applies.
+  reply="$(udp_probe_from "$UNMANAGED_NS" udp-unmanaged "$listener_ip" "$UDP_LISTENER_PORT" ping-x 4)"
+  if [[ "$reply" != "TIMEOUT" ]]; then
+    record_live_assertion node_waypoint.udp.listener_deny_unattributed_source fail \
+      udp-unmanaged udp-echo "observed=$reply" "" "$(spiffe_for_sa dst-a)" \
+      "node-waypoint-udp-listener"
+    collect_traffic_failure_diagnostics
+    return 1
+  fi
+  sleep 2
+  local unattributed_backend_hits
+  unattributed_backend_hits="$(udp_echo_backend_received ping-x)"
+  if [[ "$unattributed_backend_hits" != "0" ]]; then
+    record_live_assertion node_waypoint.udp.listener_deny_unattributed_source fail \
+      udp-unmanaged udp-echo \
+      "the refused datagram still reached the backend hits=$unattributed_backend_hits" "" \
+      "$(spiffe_for_sa dst-a)" "node-waypoint-udp-listener"
+    collect_traffic_failure_diagnostics
+    return 1
+  fi
+  record_live_assertion node_waypoint.udp.listener_deny_unattributed_source pass \
+    udp-unmanaged udp-echo "observed=$reply backend_hits=0" "" "$(spiffe_for_sa dst-a)" \
+    "node-waypoint-udp-listener"
+
+  # 4. The same unenrolled pod FORGING the admitted pod's source address is
+  #    still refused: attribution is the kernel-reported ingress interface.
+  local src_a_pod_ip spoof_reply
+  src_a_pod_ip="$(kubectl -n "$WORKLOAD_NS" get pod -l app=udp-src-a \
+    -o jsonpath='{.items[0].status.podIP}')"
+  spoof_reply="$(udp_spoof_probe_from "$UNMANAGED_NS" udp-unmanaged "$listener_ip" \
+    "$UDP_LISTENER_PORT" "$src_a_pod_ip" ping-spoof 4)"
+  sleep 2
+  local spoof_backend_hits
+  spoof_backend_hits="$(udp_echo_backend_received ping-spoof)"
+  # A refusal is only recorded when the forged datagram was ACTUALLY emitted
+  # (`SPOOF-SENT:` is printed after `sendto` returns) and the backend proved it
+  # never arrived. A sandbox that cannot forge fails the gate closed rather than
+  # recording a refusal nothing attempted: the pod is granted NET_RAW
+  # explicitly, so "no raw socket" is a broken environment, not a property of
+  # the listener.
+  case "$spoof_reply" in
+    SPOOF-SENT:TIMEOUT)
+      if [[ "$spoof_backend_hits" != "0" ]]; then
+        record_live_assertion node_waypoint.udp.listener_deny_spoofed_source fail \
+          udp-unmanaged udp-echo \
+          "forged_source=$src_a_pod_ip reached the backend hits=$spoof_backend_hits" "" \
+          "$(spiffe_for_sa dst-a)" "node-waypoint-udp-listener"
+        collect_traffic_failure_diagnostics
+        return 1
+      fi
+      record_live_assertion node_waypoint.udp.listener_deny_spoofed_source pass \
+        udp-unmanaged udp-echo \
+        "forged_source=$src_a_pod_ip emitted=true observed=TIMEOUT backend_hits=0" "" \
+        "$(spiffe_for_sa dst-a)" "node-waypoint-udp-listener"
+      ;;
+    SPOOF-UNAVAILABLE)
+      record_live_assertion node_waypoint.udp.listener_deny_spoofed_source fail \
+        udp-unmanaged udp-echo \
+        "no forged datagram could be emitted (raw socket unavailable despite NET_RAW), so no \
+refusal was observed" "" "$(spiffe_for_sa dst-a)" "node-waypoint-udp-listener"
+      collect_traffic_failure_diagnostics
+      return 1
+      ;;
+    *)
+      record_live_assertion node_waypoint.udp.listener_deny_spoofed_source fail \
+        udp-unmanaged udp-echo "forged_source=$src_a_pod_ip observed=$spoof_reply" "" \
+        "$(spiffe_for_sa dst-a)" "node-waypoint-udp-listener"
+      collect_traffic_failure_diagnostics
+      return 1
+      ;;
+  esac
+
+  # 5. Policy CHANGE: deny the previously admitted source and prove the live
+  #    data plane converges with no restart.
+  restarts_before="$(ambient_restart_total)"
+  kubectl apply -f - <<EOF
+apiVersion: security.istio.io/v1beta1
+kind: AuthorizationPolicy
+metadata:
+  name: deny-src-a-udp
+  namespace: $WORKLOAD_NS
+spec:
+  action: DENY
+  rules:
+    - from:
+        - source:
+            principals:
+              - $TRUST_DOMAIN/ns/$WORKLOAD_NS/sa/src-a
+EOF
+  if ! reply="$(wait_for_udp_outcome refuse "" "$WORKLOAD_NS" udp-src-a "$listener_ip" ping-a 40)"; then
+    kubectl -n "$WORKLOAD_NS" delete authorizationpolicy deny-src-a-udp --ignore-not-found=true
+    record_live_assertion node_waypoint.udp.policy_change_denies_live fail \
+      udp-src-a udp-echo "observed=$reply" "$(spiffe_for_sa src-a)" "$(spiffe_for_sa dst-a)" \
+      "node-waypoint-udp-listener"
+    collect_traffic_failure_diagnostics
+    return 1
+  fi
+  restarts_after="$(ambient_restart_total)"
+  if [[ "$restarts_after" != "$restarts_before" ]]; then
+    kubectl -n "$WORKLOAD_NS" delete authorizationpolicy deny-src-a-udp --ignore-not-found=true
+    record_live_assertion node_waypoint.udp.policy_change_denies_live fail \
+      udp-src-a udp-echo \
+      "convergence required a data plane restart before=$restarts_before after=$restarts_after" \
+      "$(spiffe_for_sa src-a)" "$(spiffe_for_sa dst-a)" "node-waypoint-udp-listener"
+    return 1
+  fi
+  record_live_assertion node_waypoint.udp.policy_change_denies_live pass \
+    udp-src-a udp-echo \
+    "observed=TIMEOUT ambient_restarts=$restarts_after (unchanged)" \
+    "$(spiffe_for_sa src-a)" "$(spiffe_for_sa dst-a)" "node-waypoint-udp-listener"
+
+  # 6. Policy WITHDRAWAL: removing it restores the datapath, still with no
+  #    data-plane restart.
+  kubectl -n "$WORKLOAD_NS" delete authorizationpolicy deny-src-a-udp --ignore-not-found=true
+  if ! reply="$(wait_for_udp_outcome match "udp-ok:ping-a" \
+    "$WORKLOAD_NS" udp-src-a "$listener_ip" ping-a 40)"; then
+    record_live_assertion node_waypoint.udp.policy_withdrawal_recovers_live fail \
+      udp-src-a udp-echo "observed=$reply" "$(spiffe_for_sa src-a)" "$(spiffe_for_sa dst-a)" \
+      "node-waypoint-udp-listener"
+    collect_traffic_failure_diagnostics
+    return 1
+  fi
+  restarts_after="$(ambient_restart_total)"
+  if [[ "$restarts_after" != "$restarts_before" ]]; then
+    record_live_assertion node_waypoint.udp.policy_withdrawal_recovers_live fail \
+      udp-src-a udp-echo \
+      "recovery required a data plane restart before=$restarts_before after=$restarts_after" \
+      "$(spiffe_for_sa src-a)" "$(spiffe_for_sa dst-a)" "node-waypoint-udp-listener"
+    return 1
+  fi
+  record_live_assertion node_waypoint.udp.policy_withdrawal_recovers_live pass \
+    udp-src-a udp-echo \
+    "observed=$reply ambient_restarts=$restarts_after (unchanged)" \
+    "$(spiffe_for_sa src-a)" "$(spiffe_for_sa dst-a)" "node-waypoint-udp-listener"
+}
+
+# ── NodeWaypoint DTLS listener datapath (issue #3286) ───────────────────────
+#
+# The DTLS half of the same listener family. `dtls-echo` is an in-mesh Service
+# whose `protocol: UDP` port carries `appProtocol: dtls`, so
+# `materialize_node_waypoint_udp_listeners` gives its listener
+# `frontend_tls: true`: the NodeWaypoint TERMINATES DTLS on the host-netns
+# socket and forwards PLAINTEXT datagrams to the backing pod. Everything below
+# is observed from a REAL `openssl s_client -dtls1_2` handshake and real
+# application data, never from rendered config:
+#
+#   * the listener actually bound and presents the operator DTLS material;
+#   * an ADMITTED enrolled source completes the handshake and its decrypted
+#     datagram reaches the backend, which logs it;
+#   * a source the namespace-scoped `deny-src-b` AuthorizationPolicy names
+#     reaches the backend with NOTHING, proving scoped source authorization is
+#     enforced on the DTLS path and not only on plain UDP.
+#
+# The frontend socket also has to carry NODE_WAYPOINT_INBOUND_AUTH_MARK, since
+# the DtlsServer owns the socket every encrypted record leaves from; an unmarked
+# one would be dropped by the pod-veth guard and the allow case below could not
+# pass.
+#
+# These three probe a trusted NODE address. That is a real but DISTINCT
+# boundary and is deliberately NOT substitute evidence for the ordinary user
+# path — the Service DNS name / ClusterIP — which
+# `run_node_waypoint_dtls_service_path_checks` proves separately.
+
+# Machine-classifiable DTLS handshake capture (stdout+stderr+exit).
+#
+# OpenSSL semantics used here (openssl 3 s_client):
+# - `CONNECTED(...)` is printed as soon as the UDP socket is connected. For
+#   DTLS that is a local connect(2) and does NOT prove a peer exists, so it
+#   is not used as listener identity.
+# - `-brief` sets quiet mode (bio_c_out discarded) and prints
+#   `CONNECTION ESTABLISHED` plus `print_ssl_summary` to stderr ONLY after
+#   `SSL_is_init_finished`. That is the positive completed-handshake marker.
+# - `-brief` also sets verify quiet, but the verify callback still prints
+#   `depth=0 CN=...` when verification is NOT ok. The generated listener's
+#   throwaway leaf is self-signed, so CN=ferrum-node-waypoint-dtls remains
+#   visible on an incomplete handshake that reached our Certificate flight.
+# - `-timeout` enables DTLS BIO send/recv timeouts so an unfinished
+#   handshake retransmits instead of blocking on a silent peer forever.
+# - `-no_ign_eof` undoes the `-brief`/`-quiet` ign_eof default so a
+#   completed handshake exits when kubectl exec provides no stdin, instead
+#   of hanging until the outer timeout.
+# - The wrapper `timeout` is the hard bound. Its status is appended as
+#   `FERRUM_DTLS_HS_RC:` locally so kubectl/exec/image failures stay
+#   distinguishable from a finished handshake.
+DTLS_GENERATED_LISTENER_CN="ferrum-node-waypoint-dtls"
+DTLS_HS_RC_MARKER="FERRUM_DTLS_HS_RC:"
+
+dtls_handshake_report_from() {
+  local ns="$1" app="$2" target_ip="$3" port="$4" wait_secs="${5:-8}"
+  local cert="${6:-}" key="${7:-}"
+  local -a extra=()
+  local report rc
+  if [[ -n "$cert" && -n "$key" ]]; then
+    extra=(-cert "$cert" -key "$key")
+  fi
+  report=""
+  rc=0
+  set +e
+  report="$(kubectl -n "$ns" exec "deploy/$app" -c dtls -- \
+    timeout "$wait_secs" openssl s_client -dtls1_2 -brief -timeout -no_ign_eof \
+      -connect "$target_ip:$port" "${extra[@]}" 2>&1)"
+  rc=$?
+  set -e
+  printf '%s\n%s%s\n' "$report" "$DTLS_HS_RC_MARKER" "$rc"
+}
+
+# Complete a DTLS handshake and send one application datagram; print whatever
+# application data comes back (empty when the session is denied or dropped).
+#
+# `-quiet` implies `-ign_eof`, so s_client keeps reading after stdin closes and
+# `timeout` bounds the wait. The server certificate is deliberately NOT
+# verified: this exercises the datagram datapath and its scoped source
+# authorization, not PKI trust, and the material is a per-run throwaway leaf.
+# Optional cert/key (args 7/8) present a client certificate for STRICT mTLS.
+dtls_probe_from() {
+  local ns="$1" app="$2" target_ip="$3" port="$4" payload="$5" wait_secs="${6:-8}"
+  local cert="${7:-}" key="${8:-}"
+  local -a extra=()
+  if [[ -n "$cert" && -n "$key" ]]; then
+    extra=(-cert "$cert" -key "$key")
+  fi
+  printf '%s\n' "$payload" | kubectl -n "$ns" exec -i "deploy/$app" -c dtls -- \
+    timeout "$wait_secs" openssl s_client -dtls1_2 \
+      -connect "$target_ip:$port" "${extra[@]}" -quiet 2>/dev/null \
+    || true
+}
+
+dtls_backend_received() {
+  local ns="$1" deploy="$2" payload="$3"
+  kubectl -n "$ns" logs "deploy/$deploy" --tail=-1 2>/dev/null |
+    grep -c "^recv:${payload}$" || true
+}
+
+# How many decrypted datagrams carrying `payload` the dtls-echo backend received.
+# Reply-absence alone would not distinguish "denied before the backend" from
+# "reply lost", so the backend log is the authority for the deny case.
+dtls_echo_backend_received() {
+  dtls_backend_received "$WORKLOAD_NS" dtls-echo "$1"
+}
+
+wait_for_dtls_echo_on() {
+  local ns="$1" app="$2" listener_ip="$3" port="$4" expected_prefix="$5" payload="$6"
+  local budget="${7:-20}" cert="${8:-}" key="${9:-}"
+  local attempt reply
+  for ((attempt = 0; attempt < budget; attempt++)); do
+    reply="$(dtls_probe_from "$ns" "$app" "$listener_ip" "$port" "$payload" 6 "$cert" "$key")"
+    if [[ "$reply" == *"${expected_prefix}${payload}"* ]]; then
+      printf '%s' "$reply"
+      return 0
+    fi
+    sleep 3
+  done
+  printf '%s' "$reply"
+  return 1
+}
+
+wait_for_dtls_echo() {
+  wait_for_dtls_echo_on "$1" "$2" "$3" "$DTLS_LISTENER_PORT" "dtls-ok:" "$4" "${5:-20}"
+}
+
+dtls_handshake_rc() {
+  local report="$1"
+  local line
+  line="$(printf '%s\n' "$report" | sed -n "s/^${DTLS_HS_RC_MARKER}//p" | tail -n1)"
+  printf '%s' "${line:-missing}"
+}
+
+# Positive completed-handshake evidence. Seeing the generated CN is NOT enough:
+# the Certificate message arrives before client authentication finishes, which
+# is exactly the hosted false-fail (CN presented, then the remote timeout
+# killed the client with no CONNECTION ESTABLISHED).
+dtls_handshake_completed() {
+  local report="$1"
+  [[ "$report" == *"CONNECTION ESTABLISHED"* \
+    && "$report" == *"Protocol version: DTLS"* \
+    && "$report" == *"${DTLS_GENERATED_LISTENER_CN}"* \
+    && "$report" != *"Ciphersuite: (NONE)"* \
+    && "$report" != *"Cipher is (NONE)"* ]]
+}
+
+# The generated listener presented its throwaway leaf. UDP CONNECTED is not
+# this check: connect(2) on SOCK_DGRAM succeeds with no peer.
+dtls_reached_generated_listener() {
+  local report="$1"
+  [[ "$report" == *"${DTLS_GENERATED_LISTENER_CN}"* ]]
+}
+
+# DNS/connectivity/exec/image/listener outages. Must not count as a STRICT pass.
+# UDP CONNECTED is not identity, so anything that did not present the generated
+# leaf and did not finish the handshake is treated as inconclusive/outage.
+dtls_handshake_outage() {
+  local report="$1"
+  dtls_handshake_completed "$report" && return 1
+  dtls_reached_generated_listener "$report" && return 1
+  return 0
+}
+
+# Handshake started against OUR generated listener and did not finish.
+# Alert strings are sufficient but not required: rustls may drop an
+# unauthenticated STRICT session without printing handshake failure.
+dtls_handshake_incomplete_against_generated_listener() {
+  local report="$1"
+  dtls_reached_generated_listener "$report" || return 1
+  dtls_handshake_completed "$report" && return 1
+  return 0
+}
+
+dtls_report_snippet() {
+  local rc
+  rc="$(dtls_handshake_rc "$1")"
+  printf 'rc=%s %s' "$rc" "$(printf '%s' "$1" | sed '/-----BEGIN/,/-----END/d' | tr '\n' ' ' | cut -c1-240)"
+}
+
+# ── The ORDINARY user path for DTLS: the Service DNS name / ClusterIP ───────
+#
+# Everything above targets a trusted NODE address, which is a deliberate but
+# NARROW boundary — no workload dials a node IP to reach a Service. The checks
+# below drive the same production listener through the address a workload
+# actually uses, which only works when the Service-path steering diverted the
+# datagram with its original destination intact AND every encrypted record came
+# back sourced from that ClusterIP (a `connect()`ed DTLS client discards a
+# record arriving from any other source, so a wrong reply source is
+# indistinguishable from no listener at all).
+#
+# The DNS name is resolved BY THE CLIENT POD, so a passing check also proves the
+# ordinary discovery path reaches the steered address rather than a hardcoded
+# one.
+run_node_waypoint_dtls_service_path_checks() {
+  log "running NodeWaypoint DTLS Service-path datapath checks (issue #3286 root review)"
+  local service_dns service_ip reply hits
+
+  service_dns="dtls-echo.${WORKLOAD_NS}.svc.cluster.local"
+  service_ip="$(kubectl -n "$WORKLOAD_NS" get svc dtls-echo -o jsonpath='{.spec.clusterIP}')"
+  if [[ -z "$service_ip" || "$service_ip" == "None" ]]; then
+    record_live_assertion node_waypoint.dtls.service_path_allow_attributed_source fail \
+      dtls-src-a dtls-echo "the dtls-echo Service publishes no ClusterIP to steer" \
+      "$(spiffe_for_sa src-a)" "$(spiffe_for_sa dst-a)" "node-waypoint-dtls-listener"
+    collect_traffic_failure_diagnostics
+    return 1
+  fi
+  log "NodeWaypoint DTLS Service path target ${service_dns} (${service_ip}:${DTLS_LISTENER_PORT})"
+
+  # 1. Admitted, attributed source addressing the Service DNS NAME. openssl
+  #    resolves it in the pod, handshakes through the steered listener, and the
+  #    backend logs the decrypted datagram it relayed.
+  if ! reply="$(wait_for_dtls_echo "$WORKLOAD_NS" dtls-src-a "$service_dns" dtls-svc-a 20)"; then
+    record_live_assertion node_waypoint.dtls.service_path_allow_attributed_source fail \
+      dtls-src-a dtls-echo "service_dns=$service_dns service_ip=$service_ip observed=$reply" \
+      "$(spiffe_for_sa src-a)" "$(spiffe_for_sa dst-a)" "node-waypoint-dtls-listener"
+    collect_traffic_failure_diagnostics
+    return 1
+  fi
+  hits="$(dtls_echo_backend_received dtls-svc-a)"
+  if [[ "$hits" == "0" ]]; then
+    record_live_assertion node_waypoint.dtls.service_path_allow_attributed_source fail \
+      dtls-src-a dtls-echo \
+      "the echo arrived but the backend logged no Service-path decrypted datagram" \
+      "$(spiffe_for_sa src-a)" "$(spiffe_for_sa dst-a)" "node-waypoint-dtls-listener"
+    collect_traffic_failure_diagnostics
+    return 1
+  fi
+  record_live_assertion node_waypoint.dtls.service_path_allow_attributed_source pass \
+    dtls-src-a dtls-echo \
+    "service_dns=$service_dns service_ip=$service_ip observed=dtls-ok backend_hits=$hits" \
+    "$(spiffe_for_sa src-a)" "$(spiffe_for_sa dst-a)" "node-waypoint-dtls-listener"
+
+  # 2. A source the namespace-scoped policy denies reaches the same steered
+  #    listener and is refused there. Reply-absence alone would be vacuous, so
+  #    the backend log is the authority.
+  reply="$(dtls_probe_from "$WORKLOAD_NS" dtls-src-b "$service_dns" "$DTLS_LISTENER_PORT" \
+    dtls-svc-b 8)"
+  sleep 2
+  hits="$(dtls_echo_backend_received dtls-svc-b)"
+  if [[ "$reply" == *"dtls-ok:dtls-svc-b"* || "$hits" != "0" ]]; then
+    record_live_assertion node_waypoint.dtls.service_path_deny_scoped_policy fail \
+      dtls-src-b dtls-echo "observed=$reply backend_hits=$hits" \
+      "$(spiffe_for_sa src-b)" "$(spiffe_for_sa dst-a)" "node-waypoint-dtls-listener"
+    collect_traffic_failure_diagnostics
+    return 1
+  fi
+  record_live_assertion node_waypoint.dtls.service_path_deny_scoped_policy pass \
+    dtls-src-b dtls-echo "no application data returned and backend_hits=0" \
+    "$(spiffe_for_sa src-b)" "$(spiffe_for_sa dst-a)" "node-waypoint-dtls-listener"
+
+  # 3. An UNENROLLED source. No steering rule names its interface, so its
+  #    datagram takes the pre-existing path: kube-proxy DNATs the ClusterIP to
+  #    the backing pod and the pod-veth guard drops it. Nothing reaches the
+  #    backend and no application data comes back — the fail-closed contract,
+  #    proven for the Service address rather than only for a node address.
+  reply="$(dtls_probe_from "$UNMANAGED_NS" dtls-unmanaged "$service_dns" "$DTLS_LISTENER_PORT" \
+    dtls-svc-x 8)"
+  sleep 2
+  hits="$(dtls_echo_backend_received dtls-svc-x)"
+  if [[ "$reply" == *"dtls-ok:dtls-svc-x"* || "$hits" != "0" ]]; then
+    record_live_assertion node_waypoint.dtls.service_path_deny_unattributed_source fail \
+      dtls-unmanaged dtls-echo "observed=$reply backend_hits=$hits" "" \
+      "$(spiffe_for_sa dst-a)" "node-waypoint-dtls-listener"
+    collect_traffic_failure_diagnostics
+    return 1
+  fi
+  record_live_assertion node_waypoint.dtls.service_path_deny_unattributed_source pass \
+    dtls-unmanaged dtls-echo "no application data returned and backend_hits=0" "" \
+    "$(spiffe_for_sa dst-a)" "node-waypoint-dtls-listener"
+}
+
+run_node_waypoint_dtls_datapath_checks() {
+  log "running NodeWaypoint DTLS listener datapath checks (issue #3286)"
+  local listener_ip report reply attempt
+
+  listener_ip="$(node_waypoint_listener_ip)"
+  if [[ -z "$listener_ip" ]]; then
+    record_live_assertion node_waypoint.dtls.listener_bound fail \
+      dtls-src-a dtls-echo "could not resolve a trusted node source address for the listener" \
+      "" "" "node-waypoint-dtls-listener"
+    return 1
+  fi
+  log "NodeWaypoint DTLS listener target ${listener_ip}:${DTLS_LISTENER_PORT}"
+
+  # 1. The materialized `dtls` listener really bound and terminates DTLS with
+  #    the operator-supplied material. Positive proof is a completed
+  #    `-brief` handshake (`CONNECTION ESTABLISHED`) that presents the
+  #    generated leaf. Seeing the CN alone is the Certificate flight, not
+  #    handshake completion.
+  report=""
+  for ((attempt = 0; attempt < 20; attempt++)); do
+    report="$(dtls_handshake_report_from "$WORKLOAD_NS" dtls-src-a "$listener_ip" \
+      "$DTLS_LISTENER_PORT" 10)"
+    if dtls_handshake_completed "$report"; then
+      break
+    fi
+    sleep 4
+  done
+  if ! dtls_handshake_completed "$report"; then
+    local snippet
+    snippet="$(dtls_report_snippet "$report")"
+    record_live_assertion node_waypoint.dtls.listener_bound fail \
+      dtls-src-a dtls-echo \
+      "no DTLS handshake completed on ${listener_ip}:${DTLS_LISTENER_PORT}, last probe=${snippet}" \
+      "$(spiffe_for_sa src-a)" "$(spiffe_for_sa dst-a)" "node-waypoint-dtls-listener"
+    collect_traffic_failure_diagnostics
+    return 1
+  fi
+  record_live_assertion node_waypoint.dtls.listener_bound pass \
+    dtls-src-a dtls-echo \
+    "dtls1.2 handshake completed against the materialized listener with the operator DTLS \
+material" "$(spiffe_for_sa src-a)" "$(spiffe_for_sa dst-a)" "node-waypoint-dtls-listener"
+
+  # 2. An admitted, attributed source: handshake, decrypt, relay, echo — and the
+  #    backend logs the plaintext datagram it received.
+  if ! reply="$(wait_for_dtls_echo "$WORKLOAD_NS" dtls-src-a "$listener_ip" dtls-a 20)"; then
+    record_live_assertion node_waypoint.dtls.listener_allow_attributed_source fail \
+      dtls-src-a dtls-echo "observed=$reply" "$(spiffe_for_sa src-a)" "$(spiffe_for_sa dst-a)" \
+      "node-waypoint-dtls-listener"
+    collect_traffic_failure_diagnostics
+    return 1
+  fi
+  local dtls_allow_hits
+  dtls_allow_hits="$(dtls_echo_backend_received dtls-a)"
+  if [[ "$dtls_allow_hits" == "0" ]]; then
+    record_live_assertion node_waypoint.dtls.listener_allow_attributed_source fail \
+      dtls-src-a dtls-echo "the echo arrived but the backend logged no decrypted datagram" \
+      "$(spiffe_for_sa src-a)" "$(spiffe_for_sa dst-a)" "node-waypoint-dtls-listener"
+    collect_traffic_failure_diagnostics
+    return 1
+  fi
+  record_live_assertion node_waypoint.dtls.listener_allow_attributed_source pass \
+    dtls-src-a dtls-echo "observed=dtls-ok backend_hits=$dtls_allow_hits" \
+    "$(spiffe_for_sa src-a)" "$(spiffe_for_sa dst-a)" "node-waypoint-dtls-listener"
+
+  # 3. A source the namespace-scoped policy denies gets nothing through, and —
+  #    the load-bearing half — the backend never sees its datagram.
+  reply="$(dtls_probe_from "$WORKLOAD_NS" dtls-src-b "$listener_ip" "$DTLS_LISTENER_PORT" dtls-b 8)"
+  sleep 2
+  local dtls_deny_hits
+  dtls_deny_hits="$(dtls_echo_backend_received dtls-b)"
+  if [[ "$reply" == *"dtls-ok:dtls-b"* || "$dtls_deny_hits" != "0" ]]; then
+    record_live_assertion node_waypoint.dtls.listener_deny_scoped_policy fail \
+      dtls-src-b dtls-echo "observed=$reply backend_hits=$dtls_deny_hits" \
+      "$(spiffe_for_sa src-b)" "$(spiffe_for_sa dst-a)" "node-waypoint-dtls-listener"
+    collect_traffic_failure_diagnostics
+    return 1
+  fi
+  record_live_assertion node_waypoint.dtls.listener_deny_scoped_policy pass \
+    dtls-src-b dtls-echo "no application data returned and backend_hits=0" \
+    "$(spiffe_for_sa src-b)" "$(spiffe_for_sa dst-a)" "node-waypoint-dtls-listener"
+}
+
+service_cluster_ip() {
+  local ns="$1" svc="$2" family="$3"
+  kubectl -n "$ns" get svc "$svc" -o json | python3 -c '
+import ipaddress
+import json
+import sys
+
+family = int(sys.argv[1])
+svc = json.load(sys.stdin)
+spec = svc.get("spec") or {}
+ips = list(spec.get("clusterIPs") or [])
+cip = spec.get("clusterIP")
+if cip and cip != "None":
+    ips = list(dict.fromkeys(ips + [cip]))
+for raw in ips:
+    try:
+        ip = ipaddress.ip_address(raw)
+    except ValueError:
+        continue
+    if ip.version == family:
+        print(raw)
+        break
+' "$family"
+}
+
+udp_shared_tuple_probe() {
+  local ns="$1" app="$2" ip_a="$3" ip_b="$4" port="$5" payload_a="$6" payload_b="$7" wait_secs="${8:-3}"
+  kubectl -n "$ns" exec "deploy/$app" -c udp -- python -u -c '
+import socket
+import sys
+
+ip_a, ip_b, port, pa, pb, wait = (
+    sys.argv[1], sys.argv[2], int(sys.argv[3]), sys.argv[4], sys.argv[5], float(sys.argv[6])
+)
+ip_a = ip_a.strip("[]")
+ip_b = ip_b.strip("[]")
+family = socket.AF_INET6 if ":" in ip_a else socket.AF_INET
+s = socket.socket(family, socket.SOCK_DGRAM)
+s.bind(("::", 0) if family == socket.AF_INET6 else ("0.0.0.0", 0))
+s.settimeout(wait)
+
+def addr(ip):
+    return (ip, port, 0, 0) if family == socket.AF_INET6 else (ip, port)
+
+out = []
+try:
+    s.sendto(pa.encode(), addr(ip_a))
+    data, _ = s.recvfrom(2048)
+    out.append("A:" + data.decode("utf-8", "replace"))
+except socket.timeout:
+    out.append("A:TIMEOUT")
+except OSError as exc:
+    out.append("A:OSERROR:%s" % exc.errno)
+try:
+    s.sendto(pb.encode(), addr(ip_b))
+    data, _ = s.recvfrom(2048)
+    out.append("B:" + data.decode("utf-8", "replace"))
+except socket.timeout:
+    out.append("B:TIMEOUT")
+except OSError as exc:
+    out.append("B:OSERROR:%s" % exc.errno)
+sys.stdout.write("|".join(out))
+' "$ip_a" "$ip_b" "$port" "$payload_a" "$payload_b" "$wait_secs" 2>/dev/null || echo "EXECFAIL"
+}
+
+# Same-port UDP Service demultiplexing (issue #3861): two compatible plain-UDP
+# Services, distinct ClusterIPs, one numeric port, distinct backends. Proof is
+# the backend logs plus the echo prefix, never reply-absence alone.
+run_node_waypoint_udp_same_port_demux_checks() {
+  log "running NodeWaypoint same-port UDP Service demultiplex checks (issue #3861)"
+  local ip_a ip_b reply hits_a hits_b restarts_before restarts_after
+
+  ip_a="$(service_cluster_ip "$WORKLOAD_NS" udp-demux-a 4)"
+  ip_b="$(service_cluster_ip "$WORKLOAD_NS" udp-demux-b 4)"
+  if [[ -z "$ip_a" || -z "$ip_b" || "$ip_a" == "$ip_b" ]]; then
+    record_live_assertion node_waypoint.udp.same_port_demux_serves_a fail \
+      udp-src-a udp-demux-a "ClusterIPs are missing or not distinct ipv4_a=$ip_a ipv4_b=$ip_b" \
+      "$(spiffe_for_sa src-a)" "$(spiffe_for_sa dst-a)" "node-waypoint-udp-same-port-demux"
+    collect_traffic_failure_diagnostics
+    return 1
+  fi
+  log "same-port UDP demux IPv4 ${ip_a}:${DEMUX_UDP_PORT} vs ${ip_b}:${DEMUX_UDP_PORT}"
+
+  if ! reply="$(wait_for_udp_outcome_on match "demux-a:demux-ping-a" \
+    "$WORKLOAD_NS" udp-src-a "$ip_a" "$DEMUX_UDP_PORT" demux-ping-a 40)"; then
+    record_live_assertion node_waypoint.udp.same_port_demux_serves_a fail \
+      udp-src-a udp-demux-a "observed=$reply cluster_ip=$ip_a" \
+      "$(spiffe_for_sa src-a)" "$(spiffe_for_sa dst-a)" "node-waypoint-udp-same-port-demux"
+    collect_traffic_failure_diagnostics
+    return 1
+  fi
+  hits_a="$(udp_backend_received "$WORKLOAD_NS" udp-demux-a demux-ping-a)"
+  hits_b="$(udp_backend_received "$WORKLOAD_NS" udp-demux-b demux-ping-a)"
+  if [[ "$hits_a" == "0" ]]; then
+    record_live_assertion node_waypoint.udp.same_port_demux_serves_a fail \
+      udp-src-a udp-demux-a "echo arrived but backend A logged no datagram" \
+      "$(spiffe_for_sa src-a)" "$(spiffe_for_sa dst-a)" "node-waypoint-udp-same-port-demux"
+    collect_traffic_failure_diagnostics
+    return 1
+  fi
+  record_live_assertion node_waypoint.udp.same_port_demux_serves_a pass \
+    udp-src-a udp-demux-a "cluster_ip=$ip_a observed=$reply backend_hits=$hits_a" \
+    "$(spiffe_for_sa src-a)" "$(spiffe_for_sa dst-a)" "node-waypoint-udp-same-port-demux"
+
+  if ! reply="$(wait_for_udp_outcome_on match "demux-b:demux-ping-b" \
+    "$WORKLOAD_NS" udp-src-a "$ip_b" "$DEMUX_UDP_PORT" demux-ping-b 40)"; then
+    record_live_assertion node_waypoint.udp.same_port_demux_serves_b fail \
+      udp-src-a udp-demux-b "observed=$reply cluster_ip=$ip_b" \
+      "$(spiffe_for_sa src-a)" "$(spiffe_for_sa dst-a)" "node-waypoint-udp-same-port-demux"
+    collect_traffic_failure_diagnostics
+    return 1
+  fi
+  hits_b="$(udp_backend_received "$WORKLOAD_NS" udp-demux-b demux-ping-b)"
+  hits_a="$(udp_backend_received "$WORKLOAD_NS" udp-demux-a demux-ping-b)"
+  if [[ "$hits_b" == "0" ]]; then
+    record_live_assertion node_waypoint.udp.same_port_demux_serves_b fail \
+      udp-src-a udp-demux-b "echo arrived but backend B logged no datagram" \
+      "$(spiffe_for_sa src-a)" "$(spiffe_for_sa dst-a)" "node-waypoint-udp-same-port-demux"
+    collect_traffic_failure_diagnostics
+    return 1
+  fi
+  record_live_assertion node_waypoint.udp.same_port_demux_serves_b pass \
+    udp-src-a udp-demux-b "cluster_ip=$ip_b observed=$reply backend_hits=$hits_b" \
+    "$(spiffe_for_sa src-a)" "$(spiffe_for_sa dst-a)" "node-waypoint-udp-same-port-demux"
+
+  if [[ "$hits_a" != "0" ]]; then
+    record_live_assertion node_waypoint.udp.same_port_demux_isolated fail \
+      udp-src-a udp-demux-a "payload for B reached backend A hits=$hits_a" \
+      "$(spiffe_for_sa src-a)" "$(spiffe_for_sa dst-a)" "node-waypoint-udp-same-port-demux"
+    collect_traffic_failure_diagnostics
+    return 1
+  fi
+  hits_b="$(udp_backend_received "$WORKLOAD_NS" udp-demux-b demux-ping-a)"
+  if [[ "$hits_b" != "0" ]]; then
+    record_live_assertion node_waypoint.udp.same_port_demux_isolated fail \
+      udp-src-a udp-demux-b "payload for A reached backend B hits=$hits_b" \
+      "$(spiffe_for_sa src-a)" "$(spiffe_for_sa dst-a)" "node-waypoint-udp-same-port-demux"
+    collect_traffic_failure_diagnostics
+    return 1
+  fi
+  record_live_assertion node_waypoint.udp.same_port_demux_isolated pass \
+    udp-src-a udp-demux-a "A payload only on A, B payload only on B" \
+    "$(spiffe_for_sa src-a)" "$(spiffe_for_sa dst-a)" "node-waypoint-udp-same-port-demux"
+
+  local shared
+  if ! shared="$(udp_shared_tuple_probe "$WORKLOAD_NS" udp-src-a "$ip_a" "$ip_b" \
+    "$DEMUX_UDP_PORT" demux-shared-a demux-shared-b 3)"; then
+    shared="EXECFAIL"
+  fi
+  hits_a="$(udp_backend_received "$WORKLOAD_NS" udp-demux-a demux-shared-a)"
+  hits_b="$(udp_backend_received "$WORKLOAD_NS" udp-demux-b demux-shared-b)"
+  local misroute_a misroute_b
+  misroute_a="$(udp_backend_received "$WORKLOAD_NS" udp-demux-b demux-shared-a)"
+  misroute_b="$(udp_backend_received "$WORKLOAD_NS" udp-demux-a demux-shared-b)"
+  if [[ "$shared" != *"A:demux-a:demux-shared-a"* || "$shared" != *"B:demux-b:demux-shared-b"* \
+    || "$hits_a" == "0" || "$hits_b" == "0" || "$misroute_a" != "0" || "$misroute_b" != "0" ]]; then
+    record_live_assertion node_waypoint.udp.same_port_demux_shared_client_tuple fail \
+      udp-src-a udp-demux-a "observed=$shared hits_a=$hits_a hits_b=$hits_b misroute_a=$misroute_a misroute_b=$misroute_b" \
+      "$(spiffe_for_sa src-a)" "$(spiffe_for_sa dst-a)" "node-waypoint-udp-same-port-demux"
+    collect_traffic_failure_diagnostics
+    return 1
+  fi
+  record_live_assertion node_waypoint.udp.same_port_demux_shared_client_tuple pass \
+    udp-src-a udp-demux-a "one bound client socket addressed both ClusterIPs without collision" \
+    "$(spiffe_for_sa src-a)" "$(spiffe_for_sa dst-a)" "node-waypoint-udp-same-port-demux"
+
+  restarts_before="$(ambient_restart_total)"
+  kubectl -n "$WORKLOAD_NS" delete svc udp-demux-a --wait=true --timeout=60s
+  # Convergence polls use a dedicated payload so pre-convergence datagrams that
+  # still reach backend A cannot pollute the post-convergence backend evidence.
+  if ! reply="$(wait_for_udp_outcome_on refuse "" \
+    "$WORKLOAD_NS" udp-src-a "$ip_a" "$DEMUX_UDP_PORT" demux-retract-converge-a 40)"; then
+    record_live_assertion node_waypoint.udp.same_port_demux_retract_a_keeps_b fail \
+      udp-src-a udp-demux-a "ClusterIP A still answered after Service delete observed=$reply" \
+      "$(spiffe_for_sa src-a)" "$(spiffe_for_sa dst-a)" "node-waypoint-udp-same-port-demux"
+    collect_traffic_failure_diagnostics
+    return 1
+  fi
+  reply="$(udp_probe_from "$WORKLOAD_NS" udp-src-a "$ip_a" "$DEMUX_UDP_PORT" demux-retract-proof-a 2)"
+  if [[ "$reply" != "TIMEOUT" ]]; then
+    record_live_assertion node_waypoint.udp.same_port_demux_retract_a_keeps_b fail \
+      udp-src-a udp-demux-a "ClusterIP A still answered after convergence observed=$reply" \
+      "$(spiffe_for_sa src-a)" "$(spiffe_for_sa dst-a)" "node-waypoint-udp-same-port-demux"
+    collect_traffic_failure_diagnostics
+    return 1
+  fi
+  hits_a="$(udp_backend_received "$WORKLOAD_NS" udp-demux-a demux-retract-proof-a)"
+  if [[ "$hits_a" != "0" ]]; then
+    record_live_assertion node_waypoint.udp.same_port_demux_retract_a_keeps_b fail \
+      udp-src-a udp-demux-a "backend A still received demux-retract-proof-a after Service delete" \
+      "$(spiffe_for_sa src-a)" "$(spiffe_for_sa dst-a)" "node-waypoint-udp-same-port-demux"
+    collect_traffic_failure_diagnostics
+    return 1
+  fi
+  if ! reply="$(wait_for_udp_outcome_on match "demux-b:demux-keep-b" \
+    "$WORKLOAD_NS" udp-src-a "$ip_b" "$DEMUX_UDP_PORT" demux-keep-b 40)"; then
+    record_live_assertion node_waypoint.udp.same_port_demux_retract_a_keeps_b fail \
+      udp-src-a udp-demux-b "B stopped serving after A was retracted observed=$reply" \
+      "$(spiffe_for_sa src-a)" "$(spiffe_for_sa dst-a)" "node-waypoint-udp-same-port-demux"
+    collect_traffic_failure_diagnostics
+    return 1
+  fi
+  hits_b="$(udp_backend_received "$WORKLOAD_NS" udp-demux-b demux-keep-b)"
+  hits_a="$(udp_backend_received "$WORKLOAD_NS" udp-demux-a demux-keep-b)"
+  restarts_after="$(ambient_restart_total)"
+  if [[ "$hits_b" == "0" || "$hits_a" != "0" || "$restarts_before" != "$restarts_after" ]]; then
+    record_live_assertion node_waypoint.udp.same_port_demux_retract_a_keeps_b fail \
+      udp-src-a udp-demux-b \
+      "hits_b=$hits_b hits_a=$hits_a restarts_before=$restarts_before restarts_after=$restarts_after" \
+      "$(spiffe_for_sa src-a)" "$(spiffe_for_sa dst-a)" "node-waypoint-udp-same-port-demux"
+    collect_traffic_failure_diagnostics
+    return 1
+  fi
+  record_live_assertion node_waypoint.udp.same_port_demux_retract_a_keeps_b pass \
+    udp-src-a udp-demux-b \
+    "A retracted cluster_ip=$ip_a, B still isolated on $ip_b, ambient restarts unchanged=$restarts_after" \
+    "$(spiffe_for_sa src-a)" "$(spiffe_for_sa dst-a)" "node-waypoint-udp-same-port-demux"
+}
+
+frontend_dtls_reload_generation() {
+  local file="$1"
+  python3 - "$file" <<'PY'
+import json
+import sys
+
+with open(sys.argv[1], encoding="utf-8") as fh:
+    data = json.load(fh)
+gen = ((data.get("stream_listeners") or {}).get("frontend_dtls_reload") or {}).get("generation")
+if gen is None:
+    sys.exit(1)
+print(gen)
+PY
+}
+
+health_ready() {
+  local file="$1"
+  python3 - "$file" <<'PY'
+import json
+import sys
+
+with open(sys.argv[1], encoding="utf-8") as fh:
+    data = json.load(fh)
+sys.exit(0 if data.get("ready") is True else 1)
+PY
+}
+
+# NodeWaypoint DTLS owner-scoped reload (issue #3858): generated dtls-echo
+# moves PERMISSIVE → STRICT for NEW sessions (current client CA required).
+# Ordinary-slot isolation is the authenticated /overload
+# stream_listeners.frontend_dtls_reload.generation captured before and after
+# that generated-owner publication — not a bound operator listener handshake.
+# Generated success requires CONNECTION ESTABLISHED plus backend log.
+# Unauthenticated/stale-CA rejection requires an incomplete handshake against
+# the generated listener PLUS backend_hits=0 and no application reply.
+# Reply-absence plus zero hits alone is not a pass: that is also what an
+# authorization drop after a successful unauthenticated handshake, or a
+# DNS/exec/listener outage, would look like.
+run_node_waypoint_dtls_reload_isolation_checks() {
+  log "running NodeWaypoint DTLS owner-scoped reload isolation checks (issue #3858)"
+  local listener_ip current_cert current_key stale_cert stale_key
+  local overload_before overload_after health_file report reply hits
+  local gen_before gen_after restarts_before restarts_after attempt payload snippet
+  local ambient_pod stale_payload
+
+  listener_ip="$(node_waypoint_listener_ip)"
+  if [[ -z "$listener_ip" ]]; then
+    record_live_assertion node_waypoint.dtls.reload_permissive_to_strict fail \
+      dtls-src-a dtls-echo "could not resolve a trusted node source address" \
+      "$(spiffe_for_sa src-a)" "$(spiffe_for_sa dst-a)" "node-waypoint-dtls-reload"
+    return 1
+  fi
+  current_cert="$DTLS_CLIENT_MOUNT_PATH/current.crt"
+  current_key="$DTLS_CLIENT_MOUNT_PATH/current.key"
+  stale_cert="$DTLS_CLIENT_MOUNT_PATH/stale.crt"
+  stale_key="$DTLS_CLIENT_MOUNT_PATH/stale.key"
+  overload_before="$RESULTS_DIR/dtls-reload-overload-before.json"
+  overload_after="$RESULTS_DIR/dtls-reload-overload-after.json"
+  health_file="$RESULTS_DIR/dtls-reload-health.json"
+  ambient_pod="$(ambient_pod_on_node "$NODE_A")"
+  restarts_before="$(ambient_restart_total)"
+
+  if ! fetch_ambient_admin_json "$NODE_A" /health "$health_file" \
+    || ! health_ready "$health_file"; then
+    record_live_assertion node_waypoint.dtls.operator_isolated_across_reload fail \
+      dtls-src-a dtls-echo "authenticated /health was not ready on $ambient_pod" \
+      "$(spiffe_for_sa src-a)" "$(spiffe_for_sa dst-a)" "node-waypoint-dtls-reload"
+    collect_traffic_failure_diagnostics
+    return 1
+  fi
+  if ! fetch_ambient_admin_json "$NODE_A" /overload "$overload_before"; then
+    record_live_assertion node_waypoint.dtls.operator_isolated_across_reload fail \
+      dtls-src-a dtls-echo "could not fetch authenticated /overload before generated-owner publication" \
+      "$(spiffe_for_sa src-a)" "$(spiffe_for_sa dst-a)" "node-waypoint-dtls-reload"
+    collect_traffic_failure_diagnostics
+    return 1
+  fi
+  gen_before="$(frontend_dtls_reload_generation "$overload_before")" || gen_before=""
+  # 0 is a valid captured ordinary-slot generation (none published yet).
+  if [[ -z "$gen_before" ]]; then
+    record_live_assertion node_waypoint.dtls.operator_isolated_across_reload fail \
+      dtls-src-a dtls-echo "frontend_dtls_reload.generation missing from /overload before generated-owner publication" \
+      "$(spiffe_for_sa src-a)" "$(spiffe_for_sa dst-a)" "node-waypoint-dtls-reload"
+    collect_traffic_failure_diagnostics
+    return 1
+  fi
+
+  kubectl -n "$WORKLOAD_NS" get peerauthentication dtls-echo -o json | python3 -c '
+import json
+import sys
+
+obj = json.load(sys.stdin)
+spec = obj.get("spec") or {}
+spec.pop("portLevelMtls", None)
+spec["mtls"] = {"mode": "STRICT"}
+obj["spec"] = spec
+obj.pop("status", None)
+print(json.dumps(obj))
+' | kubectl apply -f -
+
+  payload=""
+  report=""
+  reply=""
+  hits="0"
+  for ((attempt = 0; attempt < 20; attempt++)); do
+    payload="dtls-reload-unauth-${attempt}"
+    report="$(dtls_handshake_report_from "$WORKLOAD_NS" dtls-src-a "$listener_ip" \
+      "$DTLS_LISTENER_PORT" 4)"
+    if dtls_handshake_completed "$report"; then
+      # Still PERMISSIVE: unauthenticated handshake finished. Wait for STRICT.
+      sleep 3
+      continue
+    fi
+    if dtls_handshake_outage "$report"; then
+      sleep 3
+      continue
+    fi
+    if dtls_handshake_incomplete_against_generated_listener "$report"; then
+      # Same conclusive incomplete-handshake state: do not spend another
+      # full quiet-probe timeout before classifying. A short application
+      # probe plus the backend log still prove no plaintext mutation.
+      reply="$(dtls_probe_from "$WORKLOAD_NS" dtls-src-a "$listener_ip" \
+        "$DTLS_LISTENER_PORT" "$payload" 2)"
+      hits="$(dtls_echo_backend_received "$payload")"
+      if [[ "$reply" != *"dtls-ok:$payload"* && "$hits" == "0" ]]; then
+        break
+      fi
+    fi
+    sleep 3
+  done
+  if dtls_handshake_completed "$report"; then
+    snippet="$(dtls_report_snippet "$report")"
+    record_live_assertion node_waypoint.dtls.reload_permissive_to_strict fail \
+      dtls-src-a dtls-echo "generated listener still admitted unauthenticated traffic observed=$reply hits=$hits report=${snippet}" \
+      "$(spiffe_for_sa src-a)" "$(spiffe_for_sa dst-a)" "node-waypoint-dtls-reload"
+    collect_traffic_failure_diagnostics
+    return 1
+  fi
+  if dtls_handshake_outage "$report" \
+    || ! dtls_handshake_incomplete_against_generated_listener "$report" \
+    || [[ "$reply" == *"dtls-ok:$payload"* || "$hits" != "0" ]]; then
+    snippet="$(dtls_report_snippet "$report")"
+    record_live_assertion node_waypoint.dtls.reload_permissive_to_strict fail \
+      dtls-src-a dtls-echo "STRICT unauthenticated rejection was not proved observed=$reply hits=$hits report=${snippet}" \
+      "$(spiffe_for_sa src-a)" "$(spiffe_for_sa dst-a)" "node-waypoint-dtls-reload"
+    collect_traffic_failure_diagnostics
+    return 1
+  fi
+  record_live_assertion node_waypoint.dtls.reload_permissive_to_strict pass \
+    dtls-src-a dtls-echo "generated listener moved to STRICT, unauthenticated handshake failed closed, backend_hits=0" \
+    "$(spiffe_for_sa src-a)" "$(spiffe_for_sa dst-a)" "node-waypoint-dtls-reload"
+  record_live_assertion node_waypoint.dtls.reload_unauthenticated_rejected pass \
+    dtls-src-a dtls-echo "payload=$payload backend_hits=0 handshake did not complete" \
+    "$(spiffe_for_sa src-a)" "$(spiffe_for_sa dst-a)" "node-waypoint-dtls-reload"
+
+  if ! reply="$(wait_for_dtls_echo_on "$WORKLOAD_NS" dtls-src-a "$listener_ip" \
+    "$DTLS_LISTENER_PORT" "dtls-ok:" dtls-reload-current 20 \
+    "$current_cert" "$current_key")"; then
+    record_live_assertion node_waypoint.dtls.reload_current_ca_admitted fail \
+      dtls-src-a dtls-echo "observed=$reply" \
+      "$(spiffe_for_sa src-a)" "$(spiffe_for_sa dst-a)" "node-waypoint-dtls-reload"
+    collect_traffic_failure_diagnostics
+    return 1
+  fi
+  hits="$(dtls_echo_backend_received dtls-reload-current)"
+  report="$(dtls_handshake_report_from "$WORKLOAD_NS" dtls-src-a "$listener_ip" \
+    "$DTLS_LISTENER_PORT" 10 "$current_cert" "$current_key")"
+  if [[ "$hits" == "0" ]] || ! dtls_handshake_completed "$report"; then
+    snippet="$(dtls_report_snippet "$report")"
+    record_live_assertion node_waypoint.dtls.reload_current_ca_admitted fail \
+      dtls-src-a dtls-echo "backend_hits=$hits report=${snippet}" \
+      "$(spiffe_for_sa src-a)" "$(spiffe_for_sa dst-a)" "node-waypoint-dtls-reload"
+    collect_traffic_failure_diagnostics
+    return 1
+  fi
+  record_live_assertion node_waypoint.dtls.reload_current_ca_admitted pass \
+    dtls-src-a dtls-echo "current-CA handshake admitted, backend_hits=$hits" \
+    "$(spiffe_for_sa src-a)" "$(spiffe_for_sa dst-a)" "node-waypoint-dtls-reload"
+
+  report=""
+  reply=""
+  hits="0"
+  stale_payload=""
+  for ((attempt = 0; attempt < 5; attempt++)); do
+    stale_payload="dtls-reload-stale-${attempt}"
+    report="$(dtls_handshake_report_from "$WORKLOAD_NS" dtls-src-a "$listener_ip" \
+      "$DTLS_LISTENER_PORT" 4 "$stale_cert" "$stale_key")"
+    if dtls_handshake_outage "$report"; then
+      sleep 2
+      continue
+    fi
+    if dtls_handshake_completed "$report"; then
+      break
+    fi
+    if dtls_handshake_incomplete_against_generated_listener "$report"; then
+      reply="$(dtls_probe_from "$WORKLOAD_NS" dtls-src-a "$listener_ip" \
+        "$DTLS_LISTENER_PORT" "$stale_payload" 2 "$stale_cert" "$stale_key")"
+      hits="$(dtls_echo_backend_received "$stale_payload")"
+      if [[ "$reply" != *"dtls-ok:$stale_payload"* && "$hits" == "0" ]]; then
+        break
+      fi
+    fi
+    sleep 2
+  done
+  if dtls_handshake_completed "$report" \
+    || dtls_handshake_outage "$report" \
+    || ! dtls_handshake_incomplete_against_generated_listener "$report" \
+    || [[ "$reply" == *"dtls-ok:$stale_payload"* || "$hits" != "0" ]]; then
+    snippet="$(dtls_report_snippet "$report")"
+    record_live_assertion node_waypoint.dtls.reload_stale_ca_rejected fail \
+      dtls-src-a dtls-echo "observed=$reply backend_hits=$hits report=${snippet}" \
+      "$(spiffe_for_sa src-a)" "$(spiffe_for_sa dst-a)" "node-waypoint-dtls-reload"
+    collect_traffic_failure_diagnostics
+    return 1
+  fi
+  record_live_assertion node_waypoint.dtls.reload_stale_ca_rejected pass \
+    dtls-src-a dtls-echo "stale client CA rejected on generated listener, backend_hits=0" \
+    "$(spiffe_for_sa src-a)" "$(spiffe_for_sa dst-a)" "node-waypoint-dtls-reload"
+
+  if ! fetch_ambient_admin_json "$NODE_A" /overload "$overload_after"; then
+    record_live_assertion node_waypoint.dtls.operator_isolated_across_reload fail \
+      dtls-src-a dtls-echo "could not fetch authenticated /overload after generated-owner publication" \
+      "$(spiffe_for_sa src-a)" "$(spiffe_for_sa dst-a)" "node-waypoint-dtls-reload"
+    collect_traffic_failure_diagnostics
+    return 1
+  fi
+  gen_after="$(frontend_dtls_reload_generation "$overload_after")" || gen_after=""
+  restarts_after="$(ambient_restart_total)"
+  if [[ -z "$gen_after" ]]; then
+    record_live_assertion node_waypoint.dtls.operator_isolated_across_reload fail \
+      dtls-src-a dtls-echo "frontend_dtls_reload.generation missing from /overload after generated-owner publication" \
+      "$(spiffe_for_sa src-a)" "$(spiffe_for_sa dst-a)" "node-waypoint-dtls-reload"
+    collect_traffic_failure_diagnostics
+    return 1
+  fi
+  if [[ "$gen_after" != "$gen_before" || "$restarts_before" != "$restarts_after" ]]; then
+    record_live_assertion node_waypoint.dtls.operator_isolated_across_reload fail \
+      dtls-src-a dtls-echo \
+      "ordinary frontend_dtls_reload.generation or ambient restarts changed gen_before=$gen_before gen_after=$gen_after restarts_before=$restarts_before restarts_after=$restarts_after" \
+      "$(spiffe_for_sa src-a)" "$(spiffe_for_sa dst-a)" "node-waypoint-dtls-reload"
+    collect_traffic_failure_diagnostics
+    return 1
+  fi
+  record_live_assertion node_waypoint.dtls.operator_isolated_across_reload pass \
+    dtls-src-a dtls-echo \
+    "ordinary /overload frontend_dtls_reload.generation captured pre/post generated-owner publication unchanged=$gen_after, ambient restarts unchanged=$restarts_after, no bound ordinary listener claimed" \
+    "$(spiffe_for_sa src-a)" "$(spiffe_for_sa dst-a)" "node-waypoint-dtls-reload"
+}
+
 cleanup() {
   if [[ "$TOPOLOGY_ROUTE_MUTATED" == "true" && -n "$TOPOLOGY_ROUTE_NODE" \
     && -f "$TOPOLOGY_ROUTE_STATE_FILE" ]]; then
@@ -4002,10 +5591,16 @@ verify_ambient_spire_identity
 assert_node_agent_ready_metric
 run_ingress_topology_negative_and_drift_checks
 collect_bpf_evidence
+prepare_dtls_client_image
 apply_workloads
 wait_for_node_waypoint_ready_markers
 wait_for_ambient_mesh_slice
 run_traffic_checks
+run_node_waypoint_udp_datapath_checks
+run_node_waypoint_udp_same_port_demux_checks
+run_node_waypoint_dtls_datapath_checks
+run_node_waypoint_dtls_service_path_checks
+run_node_waypoint_dtls_reload_isolation_checks
 run_ipv6_checks
 ferrum_live_assertions_require_all_passed "$LIVE_ASSERTIONS_FILE" "${REQUIRED_LIVE_ASSERTIONS[@]}"
 
