@@ -1244,7 +1244,11 @@ async fn test_frontend_dtls_refuses_untrusted_client_without_completing_the_hand
     )
     .expect("load accepted client identity");
     let withdrawn_chain = ferrum_edge::dtls::load_dtls_certificate(
-        &write_pem(&temp_dir, "withdrawn-client.pem", &withdrawn_client.cert_pem),
+        &write_pem(
+            &temp_dir,
+            "withdrawn-client.pem",
+            &withdrawn_client.cert_pem,
+        ),
         &write_pem(&temp_dir, "withdrawn-client.key", &withdrawn_client.key_pem),
     )
     .expect("load withdrawn client identity");
