@@ -934,8 +934,8 @@ def optional_live_suite_self_test() -> list[str]:
             "  decoy-always:\n"
             "    if: always()\n"
         ),
-        gate_name: "Not The Aggregate",
-        gate_if: "success()",
+        gate_name="Not The Aggregate",
+        gate_if="success()",
     )
     split_errors = check_optional_live_suite_aggregate(
         split_spoof, source, _CNI_OPTIONAL_CONTRACT
@@ -948,7 +948,7 @@ def optional_live_suite_self_test() -> list[str]:
             "optional aggregate must reject a split name/always spoof on decoy jobs"
         )
 
-    severed = _cni_like_workflow(needs: "      - changes\n")
+    severed = _cni_like_workflow(needs="      - changes\n")
     severed_errors = check_optional_live_suite_aggregate(
         severed, source, _CNI_OPTIONAL_CONTRACT
     )
