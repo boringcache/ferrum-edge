@@ -273,6 +273,8 @@ def node_waypoint_probe_paths() -> list[str]:
             probes.append("src/proxy/hbone_proxy.rs")
         elif pattern == r"^src/proxy/netns_capture\.rs$":
             probes.append("src/proxy/netns_capture.rs")
+        elif pattern == r"^src/proxy/node_waypoint_ingress_capture\.rs$":
+            probes.append("src/proxy/node_waypoint_ingress_capture.rs")
         elif pattern == r"^src/proxy/tcp_proxy\.rs$":
             probes.append("src/proxy/tcp_proxy.rs")
         elif pattern == r"^src/router_cache\.rs$":
