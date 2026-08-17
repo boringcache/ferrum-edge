@@ -939,6 +939,21 @@ deleted by this change. The Fuzz Smoke lane's separate main-only save is owned
 by PR #3918 and is not changed here. The NodeWaypoint/FIPS exact-generation
 local BuildKit design from PR #3889 is also unchanged.
 
+The shared `setup-rust-ci` action applies the same restore-only policy to the
+Swatinem rust-cache: `save-if` is true only when the event is neither
+`pull_request` nor `merge_group`, `github.ref == 'refs/heads/main'`, and the
+head is not a fork — pushes to `main` (and a manual `workflow_dispatch` on
+`main`) refresh the per-`shared-key` caches that every pull-request lane then
+restores. PR-merge-ref-scoped rust-cache entries were multi-gigabyte per lane
+(`v0-rust-ci-test`, `v0-rust-ci-test-secrets`, live-suite keys, and so on) and
+evicted the default-branch entries under the shared 10 GB quota, which is what
+left Unit Tests / PKCS#11 compiling cold in the first place. The known cost:
+re-runs of a pull request's failed jobs no longer restore a same-PR warm
+cache and compile from the `main` baseline instead. The FIPS workflow's own
+rust-cache producer/consumer sites keep their existing fork-only `save-if`
+contract — that workflow's caching architecture is generation-pinned
+separately (PR #3889).
+
 #### 6. Performance Regression Job
 
 **Runs**: `ubuntu-latest`
@@ -1844,11 +1859,12 @@ therefore lists the job's admitted texts oldest first:
     decision — while `RUSTFLAGS: ""` stays, because the root Cargo
     configuration still selects a mold linker this lane does not install;
   - the sccache directory is persisted by the pinned `Swatinem/rust-cache` step
-    under `save-if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}`.
-    GitHub already scopes a pull request's cache writes to its own ref; writing
-    nothing at all from an untrusted ref is the stronger statement, and it keeps
-    every compiler artifact the sanitizer build restores attributable to code
-    that already merged;
+    under `save-if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}`
+    and nothing else. That predicate is the cache-quota control: `pull_request`
+    (same-repository PR refs and forks), `merge_group`, and `workflow_dispatch`
+    may restore a `fuzz-smoke` cache but cannot publish one. The retired
+    generation had no `save-if`, so a full-mode predecessor PR could still mint
+    a PR-ref `fuzz-smoke` entry; the adopted job cannot create another;
   - telemetry: the job prints `Fuzz property smoke seconds`, `Fuzz sanitizer
     lane seconds`, sccache statistics before and after the sanitizer build, the
     lane shape it took, and the on-disk cache size — so a hosted log shows
@@ -1996,24 +2012,29 @@ optional live-suite `changes` jobs (`#3919`) are not admitted here. They are not
 folded into this predecessor; if hosted Cross disagrees after a latest-`main`
 merge, they need their own exact pair rather than a wildcard.
 
-##### Admitted `setup-rust-ci` generation transition (temporary)
+##### Admitted `setup-rust-ci` generation transitions (temporary)
 
-`.github/actions/setup-rust-ci/action.yml` on current `main` (PR #3889's landed
-file, SHA-256
-`fc4e41818dffdea880c057c8dfa0881a629cd01c917b43f69a9f2e5e9bd90dda`) may move to
-exactly one combined destination decided by this trusted policy
-(`LOCAL_ACTION_GENERATION_TRANSITIONS`):
+`.github/actions/setup-rust-ci/action.yml` carries a two-step chain decided by
+this trusted policy (`LOCAL_ACTION_GENERATION_TRANSITIONS`), starting from PR
+#3889's landed file (SHA-256
+`fc4e41818dffdea880c057c8dfa0881a629cd01c917b43f69a9f2e5e9bd90dda`):
 
-- PR #3911 / issue #3906, after merging latest `main` while preserving every
-  #3889 cache-safety change plus #3911's optional `workspaces` input/pass-through:
-  `57a99a179ddc2935af187f518a803bf167eb9e33593c37b7b29f7151ec994da2`
+- Step 1 — the cache-budget generation: rust-cache `save-if` gated to a
+  trusted `refs/heads/main` run so pull requests and merge groups restore
+  without saving (see the cache-budget policy in the Ambient section):
+  `b6ca6315ff9f2a206c1011b6b0166de3a340370fd75bf3e9cffe41e872008924`
+- Step 2 — PR #3911 / issue #3906 rebased onto step 1, preserving every
+  cache-safety change plus #3911's optional `workspaces` input/pass-through:
+  `219187bdb0366d929577e67f48947b8c1096998dd7e04eafdffdb53dc3faa925`
 
-The pair is exact, path-bound, one-way, and fail-closed. The candidate supplies
-no digest, allowlist, or fallback. A dest-to-dest rewrite, a one-byte drift, or
-any other path is scanned as an ordinary Cross surface change. The obsolete
-two-destination table from before #3889 landed is retired. #3910's comment-only
-`setup-rust-ci` tweak is not admitted here; drop or re-pin it after merging
-latest `main`.
+Each pair is exact, path-bound, one-way, and fail-closed. The candidate
+supplies no digest, allowlist, or fallback. A dest-to-dest rewrite, a one-byte
+drift, or any other path is scanned as an ordinary Cross surface change. The
+former direct #3889→#3911 destination
+(`57a99a179ddc2935af187f518a803bf167eb9e33593c37b7b29f7151ec994da2`) is
+superseded by this chain; #3911 must rebase to the combined step-2 text.
+#3910's comment-only `setup-rust-ci` tweak is not admitted here; drop or
+re-pin it after merging latest `main`.
 
 ##### Remaining CI-tranche predecessor sequence
 

@@ -424,22 +424,40 @@ async fn initial_dtls_collision_preserves_tcp_and_suppresses_alt_svc() {
 async fn live_udp_claim_stops_only_quic_and_keeps_tcp_connection() {
     ensure_crypto_provider();
     let (backend, _b) = start_body_backend(b"keep-alive").await;
-    let port = free_port().await;
-    let initial = tls_config_with(
-        vec![port_scoped_https_proxy("https-gw", backend, port)],
-        port,
-    );
-    let state = ProxyState::new(
-        initial,
-        DnsCache::new(DnsConfig::default()),
-        test_env(),
-        None,
-        None,
-    )
-    .expect("proxy state")
-    .0;
-    let manager = build_manager(state.clone(), IpAddr::V4(Ipv4Addr::LOCALHOST));
-    assert!(manager.reconcile().await.is_empty());
+    // `free_port()` is bind-drop-rebind, so a parallel test can steal the
+    // released port before this manager's first reconcile binds it (the
+    // standard port-allocation race — see the functional-test port rules).
+    // A collision-free initial config must therefore retry with a fresh port
+    // instead of asserting on the first attempt; every attempt's manager is
+    // dropped before the next roll so its partial binds close.
+    let mut attempt = 0;
+    let (state, manager, port) = loop {
+        let port = free_port().await;
+        let initial = tls_config_with(
+            vec![port_scoped_https_proxy("https-gw", backend, port)],
+            port,
+        );
+        let state = ProxyState::new(
+            initial,
+            DnsCache::new(DnsConfig::default()),
+            test_env(),
+            None,
+            None,
+        )
+        .expect("proxy state")
+        .0;
+        let manager = build_manager(state.clone(), IpAddr::V4(Ipv4Addr::LOCALHOST));
+        let failures = manager.reconcile().await;
+        if failures.is_empty() {
+            break (state, manager, port);
+        }
+        attempt += 1;
+        assert!(
+            attempt < 5,
+            "could not bind a collision-free HTTPS listener in 5 attempts; \
+             last failures: {failures:?}"
+        );
+    };
     assert_eq!(manager.active_http3_ports().await, vec![port]);
     assert!(state.gateway_h3_alt_svc.load().get(&port).is_some());
 

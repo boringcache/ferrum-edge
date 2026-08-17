@@ -2710,10 +2710,22 @@ fn test_in_place_content_churn_fails_closed_or_never_admits_torn_plugin_list() {
     });
 
     let path = live_path.to_str().unwrap();
-    let deadline = Instant::now() + Duration::from_secs(2);
+    // Two clocks: a minimum churn window so healthy machines still exercise
+    // many read/write interleavings, and an evidence deadline so a starved CI
+    // runner (parallel libtest threads on a paging host) gets time to observe
+    // at least one classified outcome. A read that lands inside the writer's
+    // truncate window fails YAML parsing — that is also fail-closed, but it
+    // matches none of the loader's churn-defense messages below, so a slow
+    // runner could otherwise spend the whole fixed window on unclassified
+    // parse errors and fail the final liveness assert spuriously.
+    let min_churn_window = Instant::now() + Duration::from_secs(2);
+    let evidence_deadline = Instant::now() + Duration::from_secs(15);
     let mut saw_reject = false;
     let mut successes = 0usize;
-    while Instant::now() < deadline {
+    while {
+        let now = Instant::now();
+        now < min_churn_window || (now < evidence_deadline && !saw_reject && successes == 0)
+    } {
         match load_config_from_file(
             path,
             30,
