@@ -404,13 +404,21 @@ restored directory and move the BuildKit local export. Workflows stay
 `.github/scripts/verify_ci_runtime_cache.py`. The cache-credential gate is
 structural: `fips-build.yml` may invoke only a closed allowlist of pinned
 actions and the two local shell-only composites (`setup-sccache`,
-`setup-fast-linker`). Those local actions must remain `using: composite`
+`setup-fast-linker`). Extracted `uses` must match that allowlist with exact
+occurrence counts, so inserting a duplicate of an already-admitted
+checkout, cache, artifact, toolchain, or local action fails. Each
+`actions/checkout` step must keep the current-repository / default-ref /
+default-root contract: `persist-credentials: false` and no `repository`,
+`ref`, or `path` redirection (including equivalent quoted, escaped, or
+dynamic spellings). Those local actions must remain `using: composite`
 with `run:` steps only — no nested `uses:`, so no inline or third-party
 JavaScript carrier can reach the Actions toolkit credential environment.
 Alternate YAML spellings of `uses` (flow mappings, unbraced flow pairs,
 quoted/escaped/multiline keys, explicit keys, anchors, aliases, tags,
-merge keys, block scalars, templates) are rejected fail-closed
-rather than treated as an absence of invocations. The contiguous
+merge keys, block scalars, templates, compact-sequence siblings after a
+block scalar, and non-comment `#` data in plain flow scalars) are
+rejected fail-closed rather than treated as an absence of invocations.
+The contiguous
 `exportVariable` token deny remains defense in depth; it does not catch
 computed property forms such as `core["export" + "Variable"]` on its own.
 

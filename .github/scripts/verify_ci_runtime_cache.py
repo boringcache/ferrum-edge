@@ -12,7 +12,9 @@ FIPS producer/consumer key
 equality with unique attempt scoping and stable fallback isolation, rejection
 of ignored rust-cache `key` wiring, checksum-pinned sccache install without
 credential-exporting installers, a closed FIPS action-invocation allowlist
-with shell-only local actions so JavaScript toolkit carriers cannot reach
+with exact occurrence counts and checkout provenance (current repository,
+default ref, default root, persist-credentials: false) plus shell-only
+local actions so JavaScript toolkit carriers cannot reach
 the cache-credential environment, same-run producer vs immutable inter-run
 artifact handoff warming, exact verified executable activation, empty
 SCCACHE_GHA_ENABLED persistence, fail-closed uncached fallback, hosted
@@ -25,6 +27,7 @@ from __future__ import annotations
 import argparse
 import re
 import sys
+from collections import Counter
 from pathlib import Path
 
 from ci_runtime_plan import (
@@ -90,22 +93,26 @@ SCCACHE_EXPORTERS = ("mozilla-actions/sccache-action",)
 # does not contain this contiguous token; the closed FIPS uses allowlist and
 # shell-only local-action rule are the fail-closed gate.
 SCCACHE_EXPORT_VARIABLE_TOKEN = "exportVariable"
-# Exact pins/paths admitted in fips-build.yml. Job- and step-level uses must
-# equal this set; JavaScript/docker/reusable-workflow carriers cannot enter
-# without an allowlist change.
-FIPS_ALLOWED_ACTION_USES = frozenset(
-    {
-        CHECKOUT,
-        RUST_TOOLCHAIN,
-        "./.github/actions/setup-sccache",
-        "./.github/actions/setup-fast-linker",
-        RUST_CACHE,
-        DOWNLOAD_ARTIFACT,
-        CACHE_SAVE,
-        CACHE_RESTORE,
-        UPLOAD_ARTIFACT,
-    }
-)
+# Exact pins/paths admitted in fips-build.yml, frozen with occurrence counts
+# from the checked workflow. Set membership is not enough: duplicating an
+# already-allowlisted JavaScript action must fail. JavaScript/docker/
+# reusable-workflow carriers cannot enter without an allowlist change.
+FIPS_ALLOWED_ACTION_COUNTS = {
+    CHECKOUT: 7,
+    RUST_TOOLCHAIN: 5,
+    "./.github/actions/setup-sccache": 4,
+    "./.github/actions/setup-fast-linker": 4,
+    RUST_CACHE: 4,
+    DOWNLOAD_ARTIFACT: 2,
+    CACHE_SAVE: 1,
+    CACHE_RESTORE: 3,
+    UPLOAD_ARTIFACT: 2,
+}
+FIPS_ALLOWED_ACTION_USES = frozenset(FIPS_ALLOWED_ACTION_COUNTS)
+FIPS_CHECKOUT_COUNT = FIPS_ALLOWED_ACTION_COUNTS[CHECKOUT]
+# Closed checkout `with:` contract: current repo, default ref, default root.
+CHECKOUT_ALLOWED_WITH_KEYS = frozenset({"persist-credentials", "fetch-depth"})
+CHECKOUT_REDIRECT_KEYS = frozenset({"repository", "ref", "path"})
 SHELL_ONLY_COMPOSITE = "composite"
 YAML_HEX_DIGITS = frozenset("0123456789abcdefABCDEF")
 YAML_DOUBLE_QUOTED_ESCAPES = {
@@ -135,7 +142,7 @@ YAML_MAPPING_LINE = re.compile(
     rf"^(?P<lead>[ \t]*)(?P<dash>-[ \t]+)?(?P<key>{YAML_KEY_TOKEN})[ \t]*:(?P<value>.*)$"
 )
 YAML_FLOW_STEP = re.compile(r"^(?P<lead>[ \t]*)-[ \t]+(?P<flow>[\{\[].*)$")
-YAML_BLOCK_SCALAR = re.compile(r"^[|>][+-]?(?:\d+)?[ \t]*(?:#.*)?$")
+YAML_BLOCK_SCALAR = re.compile(r"^[|>][+-]?(?:\d+)?(?:[ \t]+(?:#.*)?)?$")
 YAML_EXPLICIT_KEY = re.compile(r"^[ \t]*(?:-[ \t]+)?\?")
 YAML_SEQUENCE_ITEM = re.compile(r"^[ \t]*-[ \t]+(?P<item>.+)$")
 YAML_DOCUMENT_MARK = frozenset({"---", "..."})
@@ -692,7 +699,7 @@ def step_uses(step: str) -> str:
         match = re.search(r"(?m)^        uses:\s*(\S+)", step)
     if match is None:
         return ""
-    return match.group(1).split("#", 1)[0].strip()
+    return _yaml_strip_trailing_comment(match.group(1)).strip()
 
 
 def step_with(step: str) -> str:
@@ -849,6 +856,20 @@ def _decode_yaml_scalar(raw: str) -> str | None:
     return text
 
 
+def _yaml_comment_starts_at(text: str, index: int) -> bool:
+    """YAML 1.2: `#` starts a comment only at start-of-text or after whitespace.
+
+    `harmless#suffix` is plain-scalar data, not a comment. Treating every `#`
+    as a comment opener conceals later flow entries on the same line.
+    """
+
+    if index < 0 or index >= len(text) or text[index] != "#":
+        return False
+    if index == 0:
+        return True
+    return text[index - 1] in " \t\r\n"
+
+
 def _yaml_strip_trailing_comment(text: str) -> str:
     quote: str | None = None
     index = 0
@@ -874,7 +895,7 @@ def _yaml_strip_trailing_comment(text: str) -> str:
             quote = character
             index += 1
             continue
-        if character == "#":
+        if _yaml_comment_starts_at(text, index):
             return text[:index]
         index += 1
     return text
@@ -909,7 +930,7 @@ def _yaml_quotes_balanced(text: str) -> bool:
             quote = character
             index += 1
             continue
-        if character == "#":
+        if _yaml_comment_starts_at(text, index):
             return quote is None
         index += 1
     return quote is None
@@ -989,7 +1010,7 @@ def _balanced_flow(text: str, start: int) -> tuple[str, int] | None:
             quote = character
             index += 1
             continue
-        if character == "#":
+        if _yaml_comment_starts_at(text, index):
             index = _skip_flow_comment(text, index)
             continue
         if character in "{[":
@@ -1037,7 +1058,7 @@ def _split_flow_entries(inner: str) -> list[str] | None:
             current.append(character)
             index += 1
             continue
-        if character == "#":
+        if _yaml_comment_starts_at(inner, index):
             index = _skip_flow_comment(inner, index)
             continue
         if character in "{[":
@@ -1290,7 +1311,89 @@ def _is_plain_sequence_scalar(item: str) -> bool:
     return re.match(rf"^(?:{YAML_KEY_TOKEN})[ \t]*:", remainder, re.DOTALL) is None
 
 
+def _yaml_mapping_key_indent(parsed: re.Match[str]) -> int:
+    """Indentation of a mapping key, not the compact sequence dash.
+
+    For `      - name: |`, the dash sits at column 6 while sibling keys such as
+    `uses:` are at column 8. Skipping a block scalar against the dash indent
+    would swallow those siblings as scalar body.
+    """
+
+    indent = len(parsed.group("lead"))
+    dash = parsed.group("dash")
+    if dash:
+        indent += len(dash)
+    return indent
+
+
+class _StepBucket:
+    """One YAML sequence mapping (typically a GHA step) plus its `with:` pairs."""
+
+    def __init__(self, key_indent: int | None) -> None:
+        self.key_indent = key_indent
+        self.uses: list[str] = []
+        self.using: list[str] = []
+        self.with_pairs: list[tuple[str, str]] = []
+        self.with_errors: list[str] = []
+        self.collecting_with = False
+
+
+def _note_step_actions(
+    step: _StepBucket | None,
+    uses: list[str],
+    using: list[str],
+    uses_before: int,
+    using_before: int,
+) -> None:
+    if step is None:
+        return
+    step.uses.extend(uses[uses_before:])
+    step.using.extend(using[using_before:])
+
+
+def _parse_plain_action_scalar(raw: str, what: str) -> tuple[str | None, str | None]:
+    value, error = _parse_uses_value(raw)
+    if error:
+        return None, error.replace("uses", what)
+    return value, None
+
+
+def _attach_with_value(step: _StepBucket, raw_value: str) -> None:
+    value = _yaml_strip_trailing_comment(raw_value).strip()
+    had_props, remainder = _leading_yaml_node_properties(value)
+    if had_props:
+        step.with_errors.append("indirect or tagged YAML node")
+        value = remainder
+    if not value:
+        return
+    if YAML_BLOCK_SCALAR.match(value):
+        step.with_errors.append("block-scalar with mapping")
+        return
+    if value.startswith("{"):
+        balanced = _balanced_flow(value, 0)
+        if balanced is None:
+            step.with_errors.append("unreadable with mapping")
+            return
+        pairs, errors = _collect_flow_mapping_pairs(balanced[0])
+        step.with_errors.extend(errors)
+        step.with_pairs.extend(pairs)
+        return
+    step.with_errors.append("unreadable with mapping")
+
+
+def _begin_step(steps: list[_StepBucket], key_indent: int | None) -> _StepBucket:
+    step = _StepBucket(key_indent)
+    steps.append(step)
+    return step
+
+
 def _skip_block_scalar(lines: list[str], start: int, parent_indent: int) -> int:
+    """Skip a block-scalar body: lines strictly more indented than the key.
+
+    `parent_indent` is the mapping-key column so compact sequence siblings
+    (`uses:` after `name: |`) terminate the scalar instead of being skipped.
+    """
+
     index = start
     while index < len(lines):
         line = lines[index]
@@ -1320,20 +1423,25 @@ def _collect_multiline_flow(
     return balanced[0], cursor
 
 
-def scan_yaml_action_invocations(text: str) -> tuple[list[str], list[str], list[str]]:
-    """Extract `uses`/`using` values from workflow/action YAML.
+def _scan_yaml_actions(
+    text: str,
+) -> tuple[list[str], list[str], list[str], list[_StepBucket]]:
+    """Extract `uses`/`using` values and sequence-item step mappings.
 
     Block-scalar bodies (`run: |`, `description: >-`) are not YAML mappings, so
-    they are skipped. Flow mappings, unbraced flow pairs, quoted/escaped keys,
-    explicit keys, anchors, aliases, tags, merge keys, and multiline quoted
-    keys are parsed or rejected fail-closed. This is not a full YAML
-    implementation; unreadable structure is a failure, not an admitted
-    absence of actions.
+    they are skipped using the mapping-key column (not the compact `- ` dash
+    column) so sibling keys remain visible. Flow mappings, unbraced flow pairs,
+    quoted/escaped keys, explicit keys, anchors, aliases, tags, merge keys, and
+    multiline quoted keys are parsed or rejected fail-closed. `#` is a comment
+    only when YAML would start one. This is not a full YAML implementation;
+    unreadable structure is a failure, not an admitted absence of actions.
     """
 
     uses: list[str] = []
     using: list[str] = []
     errors: list[str] = []
+    steps: list[_StepBucket] = []
+    current: _StepBucket | None = None
     lines = text.splitlines()
     index = 0
     while index < len(lines):
@@ -1350,8 +1458,11 @@ def scan_yaml_action_invocations(text: str) -> tuple[list[str], list[str], list[
         if explicit:
             errors.append("explicit YAML key")
             rest = line[explicit.end() :].lstrip(" \t")
+            uses_before = len(uses)
+            using_before = len(using)
             if rest:
                 _scan_structural_text(rest, uses, using, errors)
+            _note_step_actions(current, uses, using, uses_before, using_before)
             index += 1
             continue
         dash_item = YAML_SEQUENCE_ITEM.match(line)
@@ -1359,6 +1470,8 @@ def scan_yaml_action_invocations(text: str) -> tuple[list[str], list[str], list[
         had_line_props, remainder = _leading_yaml_node_properties(content)
         if had_line_props:
             errors.append("indirect or tagged YAML node")
+            uses_before = len(uses)
+            using_before = len(using)
             if remainder.startswith("{") or remainder.startswith("["):
                 flow_text, cursor = _collect_multiline_flow(
                     lines, remainder, index + 1
@@ -1371,11 +1484,19 @@ def scan_yaml_action_invocations(text: str) -> tuple[list[str], list[str], list[
                     pairs, flow_errors = _collect_flow_mapping_pairs(flow_text)
                 else:
                     pairs, flow_errors = _collect_flow_sequence(flow_text)
+                current = _begin_step(steps, None)
                 _record_flow_pairs(pairs, flow_errors, uses, using, errors)
+                _note_step_actions(current, uses, using, uses_before, using_before)
+                for raw_key, raw_value in pairs:
+                    if _decode_yaml_scalar(raw_key) == "with":
+                        _attach_with_value(current, raw_value)
                 index = cursor
                 continue
             if remainder:
+                if dash_item is not None:
+                    current = _begin_step(steps, None)
                 _scan_structural_text(remainder, uses, using, errors)
+                _note_step_actions(current, uses, using, uses_before, using_before)
             index += 1
             continue
         flow_step = YAML_FLOW_STEP.match(line)
@@ -1391,7 +1512,14 @@ def scan_yaml_action_invocations(text: str) -> tuple[list[str], list[str], list[
                 pairs, flow_errors = _collect_flow_mapping_pairs(flow_text)
             else:
                 pairs, flow_errors = _collect_flow_sequence(flow_text)
+            uses_before = len(uses)
+            using_before = len(using)
+            current = _begin_step(steps, None)
             _record_flow_pairs(pairs, flow_errors, uses, using, errors)
+            _note_step_actions(current, uses, using, uses_before, using_before)
+            for raw_key, raw_value in pairs:
+                if _decode_yaml_scalar(raw_key) == "with":
+                    _attach_with_value(current, raw_value)
             index = cursor
             continue
         parsed = YAML_MAPPING_LINE.match(line)
@@ -1402,18 +1530,43 @@ def scan_yaml_action_invocations(text: str) -> tuple[list[str], list[str], list[
             errors.append("unreadable YAML structure")
             index += 1
             continue
-        indent = len(parsed.group("lead"))
+        key_indent = _yaml_mapping_key_indent(parsed)
+        dash = parsed.group("dash")
+        decoded_key = _decode_yaml_scalar(parsed.group("key"))
+        if dash:
+            current = _begin_step(steps, key_indent)
+        elif current is not None:
+            if current.key_indent is not None and key_indent < current.key_indent:
+                current = None
+            elif current.key_indent is not None and key_indent == current.key_indent:
+                current.collecting_with = False
         raw_value = parsed.group("value")
         value = _yaml_strip_trailing_comment(raw_value).strip()
         had_value_props, remainder = _leading_yaml_node_properties(value)
         if had_value_props:
             errors.append("indirect or tagged YAML node")
         structural = remainder if had_value_props else value
+        uses_before = len(uses)
+        using_before = len(using)
         if YAML_BLOCK_SCALAR.match(structural):
-            key = _decode_yaml_scalar(parsed.group("key"))
-            if key in {"uses", "using", "<<"}:
+            if decoded_key in {"uses", "using", "<<"}:
                 _record_mapping_pair(parsed.group("key"), raw_value, uses, using, errors)
-            index = _skip_block_scalar(lines, index + 1, indent)
+            _note_step_actions(current, uses, using, uses_before, using_before)
+            if (
+                current is not None
+                and current.collecting_with
+                and current.key_indent is not None
+                and key_indent > current.key_indent
+            ):
+                current.with_pairs.append((parsed.group("key"), raw_value))
+            if (
+                current is not None
+                and decoded_key == "with"
+                and current.key_indent is not None
+                and key_indent == current.key_indent
+            ):
+                current.with_errors.append("block-scalar with mapping")
+            index = _skip_block_scalar(lines, index + 1, key_indent)
             continue
         if structural.startswith("{") or structural.startswith("["):
             flow_text, cursor = _collect_multiline_flow(lines, structural, index + 1)
@@ -1421,18 +1574,55 @@ def scan_yaml_action_invocations(text: str) -> tuple[list[str], list[str], list[
                 errors.append("unreadable flow collection")
                 index += 1
                 continue
-            key = _decode_yaml_scalar(parsed.group("key"))
-            if key in {"uses", "using", "<<"}:
+            if decoded_key in {"uses", "using", "<<"}:
                 _record_mapping_pair(parsed.group("key"), raw_value, uses, using, errors)
             if flow_text.startswith("{"):
                 pairs, flow_errors = _collect_flow_mapping_pairs(flow_text)
             else:
                 pairs, flow_errors = _collect_flow_sequence(flow_text)
             _record_flow_pairs(pairs, flow_errors, uses, using, errors)
+            _note_step_actions(current, uses, using, uses_before, using_before)
+            if (
+                current is not None
+                and decoded_key == "with"
+                and current.key_indent is not None
+                and key_indent == current.key_indent
+            ):
+                _attach_with_value(current, raw_value)
+            elif (
+                current is not None
+                and current.collecting_with
+                and current.key_indent is not None
+                and key_indent > current.key_indent
+            ):
+                current.with_pairs.append((parsed.group("key"), raw_value))
             index = cursor
             continue
         _record_mapping_pair(parsed.group("key"), raw_value, uses, using, errors)
+        _note_step_actions(current, uses, using, uses_before, using_before)
+        if (
+            current is not None
+            and decoded_key == "with"
+            and current.key_indent is not None
+            and key_indent == current.key_indent
+        ):
+            if not structural:
+                current.collecting_with = True
+            else:
+                current.with_errors.append("unreadable with mapping")
+        elif (
+            current is not None
+            and current.collecting_with
+            and current.key_indent is not None
+            and key_indent > current.key_indent
+        ):
+            current.with_pairs.append((parsed.group("key"), raw_value))
         index += 1
+    return uses, using, errors, steps
+
+
+def scan_yaml_action_invocations(text: str) -> tuple[list[str], list[str], list[str]]:
+    uses, using, errors, _steps = _scan_yaml_actions(text)
     return uses, using, errors
 
 
@@ -1461,12 +1651,101 @@ def check_no_sccache_credential_exporter(
     )
 
 
+def _action_count_drift(
+    observed: Counter[str], expected: Counter[str]
+) -> tuple[list[str], list[str], list[str]]:
+    unknown = sorted(key for key in observed if key not in expected)
+    extra_counts: list[str] = []
+    missing_counts: list[str] = []
+    for key in sorted(set(observed) | set(expected)):
+        got = observed[key]
+        want = expected[key]
+        if got == want:
+            continue
+        item = f"{key} observed={got} expected={want}"
+        if got > want:
+            extra_counts.append(item)
+        else:
+            missing_counts.append(item)
+    return unknown, extra_counts, missing_counts
+
+
+def check_fips_checkout_provenance(
+    steps: list[_StepBucket],
+    uses: list[str],
+    source: str,
+    failures: list[str],
+) -> None:
+    checkout_uses = [item for item in uses if item == CHECKOUT]
+    checkout_steps = [step for step in steps if CHECKOUT in step.uses]
+    require(
+        len(checkout_uses) == FIPS_CHECKOUT_COUNT
+        and len(checkout_steps) == FIPS_CHECKOUT_COUNT,
+        f"{source} must invoke pinned actions/checkout exactly "
+        f"{FIPS_CHECKOUT_COUNT} times with inspectable step mappings; "
+        f"uses={len(checkout_uses)} steps={len(checkout_steps)}",
+        failures,
+    )
+    for step in checkout_steps:
+        for error in step.with_errors:
+            failures.append(f"{source} checkout {error}")
+        persist: str | None = None
+        redirected: list[str] = []
+        extra: list[str] = []
+        seen: set[str] = set()
+        for raw_key, raw_value in step.with_pairs:
+            key = _decode_yaml_scalar(raw_key)
+            if key is None:
+                failures.append(f"{source} checkout has an unreadable with key")
+                continue
+            if key == "<<":
+                failures.append(f"{source} checkout with mapping uses a YAML merge key")
+                continue
+            parsed_value, error = _parse_plain_action_scalar(
+                raw_value, "checkout input"
+            )
+            if error:
+                failures.append(f"{source} checkout {error}")
+                continue
+            if key in seen:
+                failures.append(
+                    f"{source} checkout declares duplicate with key {key}"
+                )
+            seen.add(key)
+            if key in CHECKOUT_REDIRECT_KEYS:
+                redirected.append(key)
+            elif key not in CHECKOUT_ALLOWED_WITH_KEYS:
+                extra.append(key)
+            if key == "persist-credentials":
+                persist = parsed_value
+            elif key == "fetch-depth" and (
+                parsed_value is None or not parsed_value.isdigit()
+            ):
+                failures.append(
+                    f"{source} checkout fetch-depth must be a plain integer, "
+                    f"found {parsed_value!r}"
+                )
+        require(
+            persist == "false",
+            f"{source} checkout must set persist-credentials: false "
+            f"(found {persist!r})",
+            failures,
+        )
+        require(
+            not redirected and not extra,
+            f"{source} checkout must keep the current-repository/default-ref/"
+            f"default-root contract without repository/ref/path redirection; "
+            f"redirected={sorted(set(redirected))} extra={sorted(set(extra))}",
+            failures,
+        )
+
+
 def check_fips_action_allowlist(
     text: str,
     source: str,
     failures: list[str],
 ) -> None:
-    uses, using, errors = scan_yaml_action_invocations(text)
+    uses, using, errors, steps = _scan_yaml_actions(text)
     for error in errors:
         failures.append(f"{source} {error}")
     require(
@@ -1475,15 +1754,17 @@ def check_fips_action_allowlist(
         f"carriers are refused: {using}",
         failures,
     )
-    found = frozenset(uses)
-    extra = sorted(found - FIPS_ALLOWED_ACTION_USES)
-    missing = sorted(FIPS_ALLOWED_ACTION_USES - found)
+    observed = Counter(uses)
+    expected = Counter(FIPS_ALLOWED_ACTION_COUNTS)
+    unknown, extra_counts, missing_counts = _action_count_drift(observed, expected)
     require(
-        not extra and not missing and not errors,
-        f"{source} action uses must equal the closed FIPS allowlist; "
-        f"rejected={extra} missing={missing}",
+        not unknown and not extra_counts and not missing_counts and not errors,
+        f"{source} action uses must equal the closed FIPS allowlist with exact "
+        f"occurrence counts; rejected={unknown} extra=[{'; '.join(extra_counts)}] "
+        f"missing=[{'; '.join(missing_counts)}]",
         failures,
     )
+    check_fips_checkout_provenance(steps, uses, source, failures)
 
 
 def check_shell_only_local_action(
@@ -3499,9 +3780,14 @@ def check_docs_and_coverage(failures: list[str]) -> None:
         and "shell-only" in ci_cd.lower()
         and "setup-fast-linker" in ci_cd
         and "exportVariable" in ci_cd
-        and "defense" in ci_cd.lower(),
-        "docs/ci_cd.md must document the FIPS action allowlist, shell-only local "
-        "actions, and defense-in-depth exportVariable token rule",
+        and "defense" in ci_cd.lower()
+        and "occurrence counts" in ci_cd.lower()
+        and "persist-credentials" in ci_cd
+        and "repository" in ci_cd
+        and "default-ref" in ci_cd.lower(),
+        "docs/ci_cd.md must document the FIPS action allowlist, exact occurrence "
+        "counts, checkout provenance, shell-only local actions, and "
+        "defense-in-depth exportVariable token rule",
         failures,
     )
     require(
@@ -4427,6 +4713,107 @@ def self_test() -> int:
         '      - "\\\n        uses": ' + github_script + "\n",
         ("unreadable multiline YAML quoting",),
     )
+    require_fips_carrier(
+        "self-test-block-scalar-sibling-uses-literal",
+        "      - name: |\n"
+        "          harmless\n"
+        "        uses: " + github_script + "\n",
+        ("closed FIPS allowlist",),
+    )
+    require_fips_carrier(
+        "self-test-block-scalar-sibling-uses-folded",
+        "      - name: >-\n"
+        "          harmless\n"
+        "        uses: " + github_script + "\n",
+        ("closed FIPS allowlist",),
+    )
+    require_fips_carrier(
+        "self-test-plain-scalar-hash-flow",
+        "      - {name: harmless#suffix, uses: " + github_script + "\n"
+        "        }\n",
+        ("closed FIPS allowlist",),
+    )
+    require_fips_carrier(
+        "self-test-duplicate-checkout",
+        f"      - uses: {CHECKOUT} # v6\n"
+        "        with:\n"
+        "          persist-credentials: false\n",
+        ("occurrence counts", "observed="),
+    )
+    require_fips_carrier(
+        "self-test-duplicate-setup-sccache",
+        setup_step,
+        ("occurrence counts", "observed="),
+    )
+
+    comment_control = fips_insert(
+        "      - {name: harmless, # separated comment\n"
+        "        run: echo ok}\n"
+    )
+    comment_control_failures: list[str] = []
+    check_fips_action_allowlist(
+        comment_control,
+        "self-test-separated-comment-control",
+        comment_control_failures,
+    )
+    require(
+        not comment_control_failures,
+        "self-test: a whitespace-separated YAML comment must not hide or invent "
+        "action carriers: " + "; ".join(comment_control_failures),
+        failures,
+    )
+
+    checkout_with = "        with:\n          persist-credentials: false\n"
+    require(
+        checkout_with in real_fips and CHECKOUT in real_fips,
+        "self-test: fips-build.yml must still contain the admitted checkout with "
+        "persist-credentials: false",
+        failures,
+    )
+    repo_redirect = real_fips.replace(
+        checkout_with,
+        checkout_with + "          repository: evil/other-repo\n",
+        1,
+    )
+    require(
+        setup_step in repo_redirect and "persist-credentials: false" in repo_redirect,
+        "self-test: repository redirect mutation must keep original admitted "
+        "checkout and setup-sccache text",
+        failures,
+    )
+    repo_redirect_failures: list[str] = []
+    check_fips_action_allowlist(
+        repo_redirect, "self-test-checkout-repository-redirect", repo_redirect_failures
+    )
+    require(
+        any("repository/ref/path redirection" in item for item in repo_redirect_failures)
+        and any("repository" in item for item in repo_redirect_failures),
+        "self-test: checkout repository redirect must fail provenance: "
+        f"{repo_redirect_failures}",
+        failures,
+    )
+    path_redirect = real_fips.replace(
+        checkout_with,
+        checkout_with + "          path: .github/actions/setup-sccache\n",
+        1,
+    )
+    require(
+        setup_step in path_redirect
+        and "./.github/actions/setup-sccache" in path_redirect,
+        "self-test: path redirect mutation must keep original setup-sccache text",
+        failures,
+    )
+    path_redirect_failures: list[str] = []
+    check_fips_action_allowlist(
+        path_redirect, "self-test-checkout-path-redirect", path_redirect_failures
+    )
+    require(
+        any("repository/ref/path redirection" in item for item in path_redirect_failures)
+        and any("path" in item for item in path_redirect_failures),
+        "self-test: checkout path redirect must fail provenance: "
+        f"{path_redirect_failures}",
+        failures,
+    )
 
     def sccache_insert(snippet: str) -> str:
         marker = "  using: composite\n  steps:\n"
@@ -4482,6 +4869,43 @@ def self_test() -> int:
         "self-test-sccache-multiline-quoted-uses-key",
         '    - "\\\n      uses": ' + github_script + "\n",
         ("unreadable multiline YAML quoting",),
+    )
+    require_sccache_carrier(
+        "self-test-sccache-block-scalar-sibling-uses-literal",
+        "    - name: |\n"
+        "        harmless\n"
+        "      uses: " + github_script + "\n",
+        ("must not invoke nested actions",),
+    )
+    require_sccache_carrier(
+        "self-test-sccache-block-scalar-sibling-uses-folded",
+        "    - name: >-\n"
+        "        harmless\n"
+        "      uses: " + github_script + "\n",
+        ("must not invoke nested actions",),
+    )
+    require_sccache_carrier(
+        "self-test-sccache-plain-scalar-hash-flow",
+        "    - {name: harmless#suffix, uses: " + github_script + "\n"
+        "      }\n",
+        ("must not invoke nested actions",),
+    )
+
+    sccache_comment_control = sccache_insert(
+        "    - {name: harmless, # separated comment\n"
+        "      run: echo ok}\n"
+    )
+    sccache_comment_failures: list[str] = []
+    check_shell_only_local_action(
+        sccache_comment_control,
+        "self-test-sccache-separated-comment-control",
+        sccache_comment_failures,
+    )
+    require(
+        not sccache_comment_failures,
+        "self-test: a whitespace-separated YAML comment in setup-sccache must "
+        "not invent nested actions: " + "; ".join(sccache_comment_failures),
+        failures,
     )
 
     export_variable_bypass_shapes = (
