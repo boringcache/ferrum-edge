@@ -465,10 +465,13 @@ fn load_configured_h3_client_trust(
                     e
                 )
             }),
+        // No verifier means this listener does not enforce the process-global
+        // CRL set. Keep the scope unarmed and do not attempt to summarize
+        // material that cannot affect H3 admission; doing so can make an
+        // otherwise valid non-mTLS H3 listener fail on an irrelevant CRL.
         None => Ok(crate::tls::AcceptedClientTrust {
             verifier: None,
-            material: crate::tls::ClientTrustMaterial::from_parts(None, client_crls)
-                .map_err(|error| anyhow::anyhow!("{error}"))?,
+            material: crate::tls::ClientTrustMaterial::default(),
         }),
     }
 }
@@ -18762,5 +18765,18 @@ mod build_h3_quinn_server_config_mtls_tests {
             "H3 without a configured client CA must build (no client auth): {:?}",
             result.err()
         );
+    }
+
+    #[test]
+    fn no_client_ca_does_not_summarize_unenforced_crls() {
+        // A process-global CRL is irrelevant to an H3 listener that has no
+        // client verifier. The unarmed branch must not parse or publish that
+        // material as though H3 enforced it.
+        let crls: CrlList = Arc::new(vec![
+            rustls::pki_types::CertificateRevocationListDer::from(vec![0x30, 0x00]),
+        ]);
+        let accepted = super::load_configured_h3_client_trust(None, &crls)
+            .expect("unenforced CRLs must not prevent non-mTLS H3 startup");
+        assert!(accepted.verifier.is_none());
     }
 }
