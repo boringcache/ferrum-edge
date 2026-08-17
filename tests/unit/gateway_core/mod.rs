@@ -9,6 +9,8 @@ mod backend_dispatch_tests;
 mod backend_pending_limit_scope_tests;
 mod backend_reqwest_no_proxy_tests;
 mod cached_synthetic_bytes_share_tests;
+#[cfg(unix)]
+mod cgroup_tree_walk_tests;
 mod cidr_tests;
 mod circuit_breaker_tests;
 mod client_identity_tests;

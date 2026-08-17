@@ -6762,9 +6762,12 @@ pub fn reconcile_node_waypoint_udp_reply_sources(
 ///   `resolve_pod_cgroup_path` matches on UID-derived directory names, so a
 ///   hostile or malformed UID that resolved onto a workload's tree is caught
 ///   here even though the UID itself was not in the enrolled set;
-/// * a set larger than the map bound — refused whole, never truncated, because
+/// * a bounded tree walk that is not complete — more unique directory inodes
+///   than the map bound, deeper than the walk's depth bound, or a descendant
+///   that cannot be fully enumerated. Refused whole, never truncated, because
 ///   a truncated set silently black-holes whichever container leaf fell off the
-///   end.
+///   end, including the leaf `bpf_skb_cgroup_id` reports for the active relay
+///   container.
 fn resolve_node_waypoint_relay_cgroups(
     config: &NodeAgentConfig,
     pod_states: &DashMap<String, PodAttachmentState>,
@@ -6783,10 +6786,27 @@ fn resolve_node_waypoint_relay_cgroups(
     let Some(cgroup_path) = cgroup::resolve_pod_cgroup_path(&config.cgroup_root, pod_uid) else {
         return Err("relay_cgroup_unresolved");
     };
-    let mut cgroups = cgroup::collect_cgroup_tree_inodes(&cgroup_path);
-    if cgroups.is_empty() {
+    let walk = cgroup::collect_cgroup_tree(&cgroup_path);
+    if walk.inodes.is_empty() {
         return Err("relay_cgroup_unresolved");
     }
+    // Completeness is decided by the walk, not by `len() > map bound` after a
+    // collector that already stops at that bound: a 257th unique directory must
+    // be distinguishable from a complete 256-inode tree, and a depth or
+    // enumeration failure must not look like a full sender-proof set.
+    match walk.status {
+        cgroup::CgroupTreeWalkStatus::Complete => {}
+        cgroup::CgroupTreeWalkStatus::ExceededEntryBound => {
+            return Err("relay_cgroup_set_exceeds_map_bound");
+        }
+        cgroup::CgroupTreeWalkStatus::ExceededDepthBound => {
+            return Err("relay_cgroup_tree_exceeds_depth_bound");
+        }
+        cgroup::CgroupTreeWalkStatus::IncompleteEnumeration => {
+            return Err("relay_cgroup_tree_incomplete");
+        }
+    }
+    let mut cgroups = walk.inodes;
     // Canonical order so an unchanged tree produces an unchanged applied set and
     // a quiet poll stays quiet.
     cgroups.sort_unstable();

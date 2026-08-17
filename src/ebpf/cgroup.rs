@@ -68,6 +68,9 @@ fn discover_pod_cgroup_paths(
 
     while let Some((dir, depth)) = queue.pop_front() {
         if scanned >= POD_CGROUP_DISCOVERY_MAX_DIRS {
+            // A cap-hit is a miss for [`resolve_pod_cgroup_path`] (None), not a
+            // partial authorization set. Unlike [`collect_cgroup_tree`], this
+            // walk is a name search: failing to find the pod fail-closes.
             break;
         }
         scanned += 1;
@@ -108,17 +111,89 @@ pub fn cgroup_path_for_qos(cgroup_root: &str, pod_uid: &str, qos_class: &str) ->
     }
 }
 
-/// Bounds for [`collect_cgroup_tree_inodes`]. Kubernetes pod cgroups nest only
-/// a level or two deep (the pod slice plus a `.scope`/dir per container, plus
+/// Bounds for [`collect_cgroup_tree`]. Kubernetes pod cgroups nest only a
+/// level or two deep (the pod slice plus a `.scope`/dir per container, plus
 /// the pause container), so these are generous; they exist solely to keep a
 /// pathological or adversarial cgroup tree from turning enrollment into an
 /// unbounded directory walk.
-const CGROUP_TREE_MAX_DEPTH: usize = 8;
-const CGROUP_TREE_MAX_INODES: usize = 256;
+///
+/// Exactly [`CGROUP_TREE_MAX_INODES`] complete directory inodes remain
+/// representable. Observing a further unique directory, a descendant past
+/// [`CGROUP_TREE_MAX_DEPTH`], or a child that cannot be fully enumerated is
+/// reported via [`CgroupTreeWalkStatus`] rather than silently truncated.
+pub const CGROUP_TREE_MAX_DEPTH: usize = 8;
+pub const CGROUP_TREE_MAX_INODES: usize = 256;
+const CGROUP_TREE_MAX_DIR_ENTRIES: usize = 512;
+const CGROUP_TREE_MAX_VISITS: usize = 512;
+
+/// Why a bounded cgroup-tree walk could not prove the inode set complete.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CgroupTreeWalkStatus {
+    /// Every reachable descendant directory was enumerated; [`CgroupTreeWalk::inodes`]
+    /// is the full set.
+    Complete,
+    /// A unique directory inode past [`CGROUP_TREE_MAX_INODES`] was observed, or
+    /// the pending-visit queue could not be extended without exceeding that bound.
+    ExceededEntryBound,
+    /// A directory at [`CGROUP_TREE_MAX_DEPTH`] has a descendant that would
+    /// require walking deeper.
+    ExceededDepthBound,
+    /// A descendant could not be `stat`ed or `read_dir`ed, so remaining
+    /// children may exist unseen.
+    IncompleteEnumeration,
+}
+
+/// Bounded walk of a pod cgroup subtree.
+///
+/// `inodes` is the pod directory first, then descendants in breadth-first
+/// order, capped at [`CGROUP_TREE_MAX_INODES`]. It is an authorization set
+/// only when [`Self::status`] is [`CgroupTreeWalkStatus::Complete`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CgroupTreeWalk {
+    pub inodes: Vec<u64>,
+    pub status: CgroupTreeWalkStatus,
+}
+
+impl CgroupTreeWalk {
+    pub fn is_complete(&self) -> bool {
+        self.status == CgroupTreeWalkStatus::Complete
+    }
+
+    fn complete(inodes: Vec<u64>) -> Self {
+        Self {
+            inodes,
+            status: CgroupTreeWalkStatus::Complete,
+        }
+    }
+}
+
+#[cfg(unix)]
+fn record_incomplete(status: &mut CgroupTreeWalkStatus, reason: CgroupTreeWalkStatus) {
+    debug_assert_ne!(reason, CgroupTreeWalkStatus::Complete);
+    if *status == CgroupTreeWalkStatus::Complete {
+        *status = reason;
+    }
+}
 
 /// Collect the inode of `pod_cgroup_path` plus every descendant cgroup
 /// directory inode, breadth-first and bounded by [`CGROUP_TREE_MAX_DEPTH`] /
 /// [`CGROUP_TREE_MAX_INODES`]. The pod inode is returned first.
+///
+/// This is the best-effort prefix used by workload-identity and
+/// includeOutboundPorts enrollment: a truncated or incomplete walk still
+/// enrolls the inodes that were observed, and a missed container leaf fails
+/// closed at the connect hook. Authorization callers that must publish a
+/// whole set (NodeWaypoint UDP relay cgroups) must use [`collect_cgroup_tree`]
+/// and refuse unless [`CgroupTreeWalk::is_complete`] is true.
+///
+/// Returns an empty Vec on a missing/unreadable root or on non-Unix builds;
+/// those callers treat empty as "nothing enrolled".
+pub fn collect_cgroup_tree_inodes(pod_cgroup_path: &Path) -> Vec<u64> {
+    collect_cgroup_tree(pod_cgroup_path).inodes
+}
+
+/// Collect the inode of `pod_cgroup_path` plus every descendant cgroup
+/// directory inode, and report whether the walk proved that set complete.
 ///
 /// This exists because the `connect4`/`connect6` hooks read
 /// `bpf_get_current_cgroup_id()`, which returns the *leaf* cgroup the calling
@@ -129,23 +204,43 @@ const CGROUP_TREE_MAX_INODES: usize = 256;
 /// the hook's lookup key — per-cgroup maps keyed only by the pod inode miss and
 /// the hook falls back to its sentinel. Enrolling every descendant inode (the
 /// container leaves) as well as the pod inode keys those maps with the same id
-/// the hook reads. Returns an empty Vec on stat failure or on non-Unix builds;
-/// the caller treats empty as "nothing enrolled".
+/// the hook reads.
+///
+/// A missing or non-directory root returns an empty complete walk (nothing to
+/// enroll). Stat or `read_dir` failures on descendants, a unique directory
+/// past [`CGROUP_TREE_MAX_INODES`], or a child past [`CGROUP_TREE_MAX_DEPTH`]
+/// return the inodes observed so far with a non-complete status. The walk
+/// itself stays bounded against hostile trees.
 #[cfg(unix)]
-pub fn collect_cgroup_tree_inodes(pod_cgroup_path: &Path) -> Vec<u64> {
-    use std::collections::VecDeque;
+pub fn collect_cgroup_tree(pod_cgroup_path: &Path) -> CgroupTreeWalk {
+    use std::collections::HashSet;
     use std::os::unix::fs::MetadataExt;
 
     let mut inodes: Vec<u64> = Vec::new();
+    let mut seen: HashSet<u64> = HashSet::new();
     let mut queue: VecDeque<(PathBuf, usize)> = VecDeque::new();
+    let mut status = CgroupTreeWalkStatus::Complete;
     queue.push_back((pod_cgroup_path.to_path_buf(), 0));
+    let mut visits = 0usize;
 
     while let Some((path, depth)) = queue.pop_front() {
-        if inodes.len() >= CGROUP_TREE_MAX_INODES {
+        visits += 1;
+        if visits > CGROUP_TREE_MAX_VISITS {
+            record_incomplete(&mut status, CgroupTreeWalkStatus::IncompleteEnumeration);
             break;
         }
-        let Ok(meta) = std::fs::metadata(&path) else {
-            continue;
+
+        let meta = match std::fs::metadata(&path) {
+            Ok(meta) => meta,
+            Err(_) if inodes.is_empty() => {
+                // Missing or unreadable root: nothing enrolled, not a truncated
+                // descendant set.
+                return CgroupTreeWalk::complete(Vec::new());
+            }
+            Err(_) => {
+                record_incomplete(&mut status, CgroupTreeWalkStatus::IncompleteEnumeration);
+                continue;
+            }
         };
         // Only directories are cgroups; the files inside a cgroup dir
         // (`cgroup.procs`, `cgroup.controllers`, ...) are not.
@@ -153,31 +248,106 @@ pub fn collect_cgroup_tree_inodes(pod_cgroup_path: &Path) -> Vec<u64> {
             continue;
         }
         let inode = meta.ino();
-        if !inodes.contains(&inode) {
+        if seen.insert(inode) {
+            if inodes.len() >= CGROUP_TREE_MAX_INODES {
+                record_incomplete(&mut status, CgroupTreeWalkStatus::ExceededEntryBound);
+                break;
+            }
             inodes.push(inode);
-        }
-        if depth >= CGROUP_TREE_MAX_DEPTH {
+        } else {
+            // Already walked this cgroup (bind-mount / duplicate path). Do not
+            // re-descend: a cycle must not restart the bound.
             continue;
         }
-        if let Ok(entries) = std::fs::read_dir(&path) {
-            for entry in entries.flatten() {
-                // Use the readdir `d_type` when available (cgroupfs/kernfs
-                // supplies it without a stat); if it's unknown, enqueue anyway
-                // and let the loop's own `is_dir` check filter it out, so a
-                // child cgroup is never skipped.
-                let descend = entry.file_type().map(|t| t.is_dir()).unwrap_or(true);
-                if descend {
-                    queue.push_back((entry.path(), depth + 1));
+
+        if depth >= CGROUP_TREE_MAX_DEPTH {
+            match directory_has_directory_children(&path) {
+                Ok(true) => {
+                    record_incomplete(&mut status, CgroupTreeWalkStatus::ExceededDepthBound);
                 }
+                Ok(false) => {}
+                Err(()) => {
+                    record_incomplete(&mut status, CgroupTreeWalkStatus::IncompleteEnumeration);
+                }
+            }
+            continue;
+        }
+
+        match std::fs::read_dir(&path) {
+            Ok(entries) => {
+                enqueue_directory_children(&mut queue, entries, depth, &mut status);
+            }
+            Err(_) => {
+                record_incomplete(&mut status, CgroupTreeWalkStatus::IncompleteEnumeration);
             }
         }
     }
-    inodes
+
+    CgroupTreeWalk { inodes, status }
+}
+
+/// Enqueue directory children of one cgroup dir. Stops enqueueing once the
+/// pending queue would exceed [`CGROUP_TREE_MAX_INODES`], which is itself
+/// evidence the tree is over the entry bound.
+#[cfg(unix)]
+fn enqueue_directory_children(
+    queue: &mut VecDeque<(PathBuf, usize)>,
+    entries: std::fs::ReadDir,
+    depth: usize,
+    status: &mut CgroupTreeWalkStatus,
+) {
+    let mut inspected = 0usize;
+    for entry in entries {
+        inspected += 1;
+        if inspected > CGROUP_TREE_MAX_DIR_ENTRIES {
+            record_incomplete(status, CgroupTreeWalkStatus::IncompleteEnumeration);
+            return;
+        }
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(_) => {
+                record_incomplete(status, CgroupTreeWalkStatus::IncompleteEnumeration);
+                continue;
+            }
+        };
+        // Use the readdir `d_type` when available (cgroupfs/kernfs supplies it
+        // without a stat); if it's unknown, enqueue anyway and let the loop's
+        // own `is_dir` check filter it out, so a child cgroup is never skipped.
+        let descend = entry.file_type().map(|t| t.is_dir()).unwrap_or(true);
+        if !descend {
+            continue;
+        }
+        if queue.len() >= CGROUP_TREE_MAX_INODES {
+            record_incomplete(status, CgroupTreeWalkStatus::ExceededEntryBound);
+            return;
+        }
+        queue.push_back((entry.path(), depth + 1));
+    }
+}
+
+/// Whether `path` (already at [`CGROUP_TREE_MAX_DEPTH`]) has a directory child
+/// that would require walking deeper. Unknown `d_type` is treated as a possible
+/// directory so a child cgroup is never mistaken for a leaf.
+#[cfg(unix)]
+fn directory_has_directory_children(path: &Path) -> Result<bool, ()> {
+    let entries = std::fs::read_dir(path).map_err(|_| ())?;
+    let mut inspected = 0usize;
+    for entry in entries {
+        inspected += 1;
+        if inspected > CGROUP_TREE_MAX_DIR_ENTRIES {
+            return Err(());
+        }
+        let entry = entry.map_err(|_| ())?;
+        if entry.file_type().map(|t| t.is_dir()).unwrap_or(true) {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 #[cfg(not(unix))]
-pub fn collect_cgroup_tree_inodes(_pod_cgroup_path: &Path) -> Vec<u64> {
-    Vec::new()
+pub fn collect_cgroup_tree(_pod_cgroup_path: &Path) -> CgroupTreeWalk {
+    CgroupTreeWalk::complete(Vec::new())
 }
 
 #[cfg(test)]

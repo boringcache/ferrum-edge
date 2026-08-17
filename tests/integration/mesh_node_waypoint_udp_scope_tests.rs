@@ -2017,6 +2017,8 @@ fn a_withdrawn_or_disabled_generation_clears_desired_steering_metadata() {
 
 use dashmap::DashMap;
 use ferrum_edge::capture::{CaptureConfig, CaptureMode, NodeWaypointUdpSteerDestination};
+#[cfg(unix)]
+use ferrum_edge::ebpf::cgroup::{CGROUP_TREE_MAX_DEPTH, CGROUP_TREE_MAX_INODES};
 use ferrum_edge::ebpf::{
     BPF_MAP_UDP_REPLY_SOURCE_GATE, CaptureContract, EbpfBackend, FallbackMode, MockEbpfBackend,
     NodeAgentProxyMode, PodAttachmentState,
@@ -2085,6 +2087,13 @@ fn relay_cgroup_ids() -> Vec<u64> {
 }
 
 fn node_waypoint_config(registry_dir: Option<&std::path::Path>) -> NodeAgentConfig {
+    node_waypoint_config_with_cgroup_root(registry_dir, relay_cgroup_root())
+}
+
+fn node_waypoint_config_with_cgroup_root(
+    registry_dir: Option<&std::path::Path>,
+    cgroup_root: &std::path::Path,
+) -> NodeAgentConfig {
     let mut capture_config = CaptureConfig::explicit(15006, 15001);
     capture_config.mode = CaptureMode::Ebpf;
     let mut capture_contract = CaptureContract::local_pod_defaults();
@@ -2092,7 +2101,7 @@ fn node_waypoint_config(registry_dir: Option<&std::path::Path>) -> NodeAgentConf
     NodeAgentConfig {
         node_name: "node-a".to_string(),
         capture_config,
-        cgroup_root: relay_cgroup_root().to_string_lossy().into_owned(),
+        cgroup_root: cgroup_root.to_string_lossy().into_owned(),
         bpf_fs_path: "/nonexistent".to_string(),
         fallback_mode: FallbackMode::Fail,
         excluded_namespaces: std::collections::HashSet::new(),
@@ -2100,6 +2109,26 @@ fn node_waypoint_config(registry_dir: Option<&std::path::Path>) -> NodeAgentConf
         trust_domain: "cluster.local".to_string(),
         node_waypoint_pod_registry_dir: registry_dir.map(|dir| dir.to_path_buf()),
     }
+}
+
+#[cfg(unix)]
+fn relay_pod_cgroup(cgroup_root: &std::path::Path) -> std::path::PathBuf {
+    let pod = cgroup_root.join(format!("kubepods/pod{RELAY_POD_UID}"));
+    std::fs::create_dir_all(&pod).expect("relay pod cgroup");
+    pod
+}
+
+#[cfg(unix)]
+fn assert_generation_refused_whole(backend: &MockEbpfBackend, registry: &std::path::Path) {
+    assert!(
+        backend.udp_relay_cgroups.is_empty() && backend.udp_reply_sources.is_empty(),
+        "an incomplete relay cgroup walk must authorize neither half of the conjunction"
+    );
+    assert!(
+        !backend.udp_reply_sources_enabled,
+        "an incomplete walk must close the shared authorization gate"
+    );
+    assert_eq!(acknowledgement(registry), None);
 }
 
 fn enrolled_pod(uid: &str, pod_ip: &str) -> PodAttachmentState {
@@ -2468,6 +2497,103 @@ fn an_unresolvable_relay_identity_authorizes_nothing() {
     );
     assert!(!backend.udp_reply_sources_enabled);
     assert_eq!(acknowledgement(registry.path()), None);
+}
+
+/// A relay pod whose cgroup tree is larger than the map must be refused WHOLE.
+/// Silently truncating would omit an arbitrary container leaf — including the
+/// one `bpf_skb_cgroup_id` reports for the active relay container.
+#[cfg(unix)]
+#[test]
+fn an_over_bound_relay_cgroup_tree_is_refused_whole() {
+    let cgroup_root = tempfile::tempdir().expect("cgroup root");
+    let pod = relay_pod_cgroup(cgroup_root.path());
+    for index in 0..CGROUP_TREE_MAX_INODES {
+        std::fs::create_dir(pod.join(format!("cri-containerd-{index:03}.scope")))
+            .expect("container cgroup");
+    }
+
+    let registry = tempfile::tempdir().expect("registry dir");
+    let publisher = RegistryDirReplySourcePublisher::new(registry.path(), Some(RELAY_POD_UID));
+    publisher
+        .publish(&[reply_source("10.96.0.10", 5300)])
+        .expect("publication");
+
+    let mut backend = MockEbpfBackend::default();
+    let pods = DashMap::new();
+    let config = node_waypoint_config_with_cgroup_root(Some(registry.path()), cgroup_root.path());
+    let mut state = NodeWaypointUdpReplySourceState::default();
+    reconcile_node_waypoint_udp_reply_sources(&mut backend, &config, &pods, &mut state);
+
+    assert_generation_refused_whole(&backend, registry.path());
+}
+
+/// A relay pod nested past the walk's depth bound is refused WHOLE. The count
+/// may look small; the missing deeper leaf is still a truncated sender proof.
+#[cfg(unix)]
+#[test]
+fn a_too_deep_relay_cgroup_tree_is_refused_whole() {
+    let cgroup_root = tempfile::tempdir().expect("cgroup root");
+    let mut path = relay_pod_cgroup(cgroup_root.path());
+    for index in 0..=CGROUP_TREE_MAX_DEPTH {
+        path.push(format!("n{index}"));
+        std::fs::create_dir(&path).expect("depth chain");
+    }
+
+    let registry = tempfile::tempdir().expect("registry dir");
+    let publisher = RegistryDirReplySourcePublisher::new(registry.path(), Some(RELAY_POD_UID));
+    publisher
+        .publish(&[reply_source("10.96.0.10", 5300)])
+        .expect("publication");
+
+    let mut backend = MockEbpfBackend::default();
+    let pods = DashMap::new();
+    let config = node_waypoint_config_with_cgroup_root(Some(registry.path()), cgroup_root.path());
+    let mut state = NodeWaypointUdpReplySourceState::default();
+    reconcile_node_waypoint_udp_reply_sources(&mut backend, &config, &pods, &mut state);
+
+    assert_generation_refused_whole(&backend, registry.path());
+}
+
+/// A descendant that cannot be enumerated is not a complete sender-proof set.
+/// Publishing the readable prefix would omit the unreadable container leaf.
+#[cfg(unix)]
+#[test]
+fn an_incompletely_enumerated_relay_cgroup_tree_is_refused_whole() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    // SAFETY: `geteuid` is a pure read of this process's credentials.
+    if unsafe { libc::geteuid() } == 0 {
+        return;
+    }
+
+    let cgroup_root = tempfile::tempdir().expect("cgroup root");
+    let pod = relay_pod_cgroup(cgroup_root.path());
+    let hidden = pod.join("cri-containerd-hidden.scope");
+    std::fs::create_dir(&hidden).expect("hidden container");
+    std::fs::create_dir(hidden.join("nested-leaf")).expect("nested leaf");
+    std::fs::set_permissions(&hidden, std::fs::Permissions::from_mode(0o000)).expect("chmod");
+    struct RestoreMode<'a>(&'a std::path::Path);
+    impl Drop for RestoreMode<'_> {
+        fn drop(&mut self) {
+            use std::os::unix::fs::PermissionsExt as _;
+            let _ = std::fs::set_permissions(self.0, std::fs::Permissions::from_mode(0o755));
+        }
+    }
+    let _restore = RestoreMode(&hidden);
+
+    let registry = tempfile::tempdir().expect("registry dir");
+    let publisher = RegistryDirReplySourcePublisher::new(registry.path(), Some(RELAY_POD_UID));
+    publisher
+        .publish(&[reply_source("10.96.0.10", 5300)])
+        .expect("publication");
+
+    let mut backend = MockEbpfBackend::default();
+    let pods = DashMap::new();
+    let config = node_waypoint_config_with_cgroup_root(Some(registry.path()), cgroup_root.path());
+    let mut state = NodeWaypointUdpReplySourceState::default();
+    reconcile_node_waypoint_udp_reply_sources(&mut backend, &config, &pods, &mut state);
+
+    assert_generation_refused_whole(&backend, registry.path());
 }
 
 /// A generation whose SENDER proof cannot be written is never acknowledged, and

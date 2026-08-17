@@ -485,11 +485,13 @@ pub const UDP_REPLY_SOURCE_MAX_ENTRIES: u32 = 1024;
 ///
 /// The map holds the cgroup-v2 ids of exactly ONE pod — the NodeWaypoint relay's
 /// own — so the realistic occupancy is the pod slice plus one scope per
-/// container. This matches `cgroup::collect_cgroup_tree_inodes`'s own
-/// `CGROUP_TREE_MAX_INODES` walk bound, so a tree the node-agent is willing to
-/// enumerate is always a tree it can publish whole; anything larger is refused
-/// rather than truncated, because a truncated set silently black-holes the
-/// container whose leaf fell off the end.
+/// container. This matches `cgroup::collect_cgroup_tree`'s own
+/// `CGROUP_TREE_MAX_INODES` walk bound. A tree the walk reports complete is
+/// always a tree the node-agent can publish whole; an over-bound or incompletely
+/// enumerated tree is refused rather than truncated, because a truncated set
+/// silently black-holes the container whose leaf fell off the end. Exactly 256
+/// complete directory inodes remain representable; a 257th is detected as
+/// overflow instead of being dropped by the walker.
 pub const UDP_RELAY_CGROUP_MAX_ENTRIES: u32 = 256;
 
 /// Single shared enable gate for every NodeWaypoint UDP/DTLS relay
