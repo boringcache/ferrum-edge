@@ -72,6 +72,33 @@ fn generate_signed_cert(ca: &GeneratedCa, cn: &str, sans: &[&str]) -> GeneratedC
     }
 }
 
+/// Generate a leaf that exercises client-certificate path validation.
+///
+/// `WebPkiClientVerifier` requires the `clientAuth` purpose. Reusing the
+/// server-certificate fixture above would make both the trusted control and the
+/// untrusted-CA case fail before trust-anchor selection, leaving the latter
+/// assertion vacuous.
+fn generate_client_auth_cert(ca: &GeneratedCa, cn: &str, sans: &[&str]) -> GeneratedCert {
+    let key_pair =
+        KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).expect("generate client key");
+    let san_strings: Vec<String> = sans.iter().map(|s| s.to_string()).collect();
+    let mut params = CertificateParams::new(san_strings).expect("client leaf params");
+    params
+        .distinguished_name
+        .push(rcgen::DnType::CommonName, cn);
+    params.key_usages.push(KeyUsagePurpose::DigitalSignature);
+    params
+        .extended_key_usages
+        .push(rcgen::ExtendedKeyUsagePurpose::ClientAuth);
+    let cert = params
+        .signed_by(&key_pair, &ca.issuer)
+        .expect("sign client leaf");
+    GeneratedCert {
+        cert_pem: cert.pem(),
+        key_pem: key_pair.serialize_pem(),
+    }
+}
+
 fn write_pem(dir: &tempfile::TempDir, name: &str, data: &str) -> String {
     let path = dir.path().join(name);
     std::fs::write(&path, data).expect("write PEM");
@@ -1236,8 +1263,10 @@ async fn test_frontend_dtls_refuses_untrusted_client_without_completing_the_hand
     let temp_dir = tempfile::TempDir::new().expect("temp dir");
     let accepted_ca = generate_ca("DTLS accepted client CA");
     let withdrawn_ca = generate_ca("DTLS withdrawn client CA");
-    let accepted_client = generate_signed_cert(&accepted_ca, "accepted-client", &["client-a"]);
-    let withdrawn_client = generate_signed_cert(&withdrawn_ca, "withdrawn-client", &["client-b"]);
+    let accepted_client =
+        generate_client_auth_cert(&accepted_ca, "accepted-client", &["client-a"]);
+    let withdrawn_client =
+        generate_client_auth_cert(&withdrawn_ca, "withdrawn-client", &["client-b"]);
     let accepted_chain = ferrum_edge::dtls::load_dtls_certificate(
         &write_pem(&temp_dir, "accepted-client.pem", &accepted_client.cert_pem),
         &write_pem(&temp_dir, "accepted-client.key", &accepted_client.key_pem),
