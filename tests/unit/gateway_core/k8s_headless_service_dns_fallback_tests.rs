@@ -124,8 +124,7 @@ fn headless_manual_endpointslices_without_ready_addresses_dial_target_port() {
     assert_eq!(result.config.proxies.len(), 1);
     let proxy = &result.config.proxies[0];
     assert_eq!(
-        proxy.backend_host,
-        "headless-manual-endpointslices.default.svc.cluster.local",
+        proxy.backend_host, "headless-manual-endpointslices.default.svc.cluster.local",
         "empty slices must fall back to headless Service DNS so CoreDNS can publish later pod IPs"
     );
     assert_eq!(
