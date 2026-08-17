@@ -304,15 +304,12 @@ impl Drop for GatewayFixture {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore]
 async fn udp_session_idle_timeout_cleans_session_map() {
+    // Hold the backend port bound across gateway startup, but start the script
+    // afterwards: a failed health-check attempt costs up to 20 seconds and
+    // would expire the backend's 10-second `ExpectDatagram` deadline before the
+    // first client datagram.
     let reservation = reserve_udp_port().await.expect("reserve backend udp port");
     let backend_port = reservation.port;
-    let backend = ScriptedUdpBackend::builder(reservation.into_socket())
-        .step(UdpStep::ExpectDatagram(DatagramMatcher::any()))
-        .step(UdpStep::Reply(b"one".to_vec()))
-        .step(UdpStep::ExpectDatagram(DatagramMatcher::any()))
-        .step(UdpStep::Reply(b"two".to_vec()))
-        .spawn()
-        .expect("spawn udp backend");
 
     let build_yaml = move |listen_port: u16| {
         format!(
@@ -333,6 +330,14 @@ plugin_configs: []
         )
     };
     let fx = start_gateway_with_retry(build_yaml, Vec::new(), true).await;
+
+    let backend = ScriptedUdpBackend::builder(reservation.into_socket())
+        .step(UdpStep::ExpectDatagram(DatagramMatcher::any()))
+        .step(UdpStep::Reply(b"one".to_vec()))
+        .step(UdpStep::ExpectDatagram(DatagramMatcher::any()))
+        .step(UdpStep::Reply(b"two".to_vec()))
+        .spawn()
+        .expect("spawn udp backend");
 
     let gateway_addr: SocketAddr = format!("127.0.0.1:{}", fx.udp_port).parse().unwrap();
     let client = UdpClient::connect(gateway_addr).await.expect("client");
@@ -438,17 +443,14 @@ plugin_configs: []
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore]
 async fn udp_amplification_bound_enforced() {
+    // Keep the backend socket bound while the gateway starts, but do not start
+    // its script yet: `start_gateway_with_retry` may spend up to 20 seconds on
+    // a failed health-check attempt, which would expire the backend's
+    // 10-second `ExpectDatagram` deadline before the client ever sends and
+    // drop the socket. Same ordering as `dtls_passthrough_sni_routes_to_correct_backend`.
     let reservation = reserve_udp_port().await.expect("reserve");
     let backend_port = reservation.port;
     let reply_payload = vec![b'x'; 200]; // 2× the 100-byte request.
-    let backend = ScriptedUdpBackend::builder(reservation.into_socket())
-        .step(UdpStep::ExpectDatagram(DatagramMatcher::any()))
-        .step(UdpStep::ReplyN {
-            payload: reply_payload.clone(),
-            count: 100,
-        })
-        .spawn()
-        .expect("spawn backend");
 
     let build_yaml = move |listen_port: u16| {
         format!(
@@ -470,6 +472,17 @@ plugin_configs: []
         )
     };
     let fx = start_gateway_with_retry(build_yaml, Vec::new(), false).await;
+
+    // Start the script only once the gateway is healthy, so the expect
+    // deadline covers the client's datagram rather than gateway startup.
+    let backend = ScriptedUdpBackend::builder(reservation.into_socket())
+        .step(UdpStep::ExpectDatagram(DatagramMatcher::any()))
+        .step(UdpStep::ReplyN {
+            payload: reply_payload.clone(),
+            count: 100,
+        })
+        .spawn()
+        .expect("spawn backend");
 
     let gateway_addr: SocketAddr = format!("127.0.0.1:{}", fx.udp_port).parse().unwrap();
     let client = UdpClient::connect(gateway_addr).await.expect("client");

@@ -329,6 +329,21 @@ async fn http_get_host(port: u16, path: &str, host: &str) -> (u16, String) {
         .unwrap_or_else(|e| panic!("request to port {port} host {host} failed: {e}"))
 }
 
+/// A withdrawn Gateway listener must not serve its old route. Connect refusal,
+/// an empty/closed response (status sentinel 0), and HTTP 404 are the precise
+/// closed outcomes; anything else — especially 200 — is a stale-route leak.
+async fn assert_withdrawn_listener_fail_closed(port: u16) {
+    match try_http_get(port, "/api/x").await {
+        Err(_) => {}
+        Ok((0, _)) => {}
+        Ok((404, _)) => {}
+        Ok((status, body)) => panic!(
+            "a withdrawn listener must fail closed while its socket drains \
+             (HTTP 404 or transport close), got status {status} body {body:?}"
+        ),
+    }
+}
+
 /// Two Gateway listener ports of the SAME protocol (both plaintext) carrying
 /// the same `host` + `listen_path`. This is the exact case #3612 filed: it
 /// must validate, both ports must be bound by the gateway itself, and each
@@ -436,21 +451,12 @@ async fn gateway_listener_ports_follow_config_reload_add_and_withdraw() {
     );
     wait_for_listener_ports(&handles, &[listener_b_port]).await;
 
-    // Routing is withdrawn by the config swap itself, so even if the socket
-    // is still draining it can never stale-route. Three outcomes are all
-    // fail-closed: the connect is refused outright (`Err`), the teardown
-    // accepts and closes without writing a response (`status == 0` with an
-    // empty body — `try_http_get` maps a clean empty close to 0), or the
-    // still-draining socket serves the routed 404. Only a routed 200 would
-    // violate the invariant.
-    if let Ok((status, body)) = try_http_get(listener_a_port, "/api/x").await
-        && !(status == 0 && body.is_empty())
-    {
-        assert_eq!(
-            status, 404,
-            "a withdrawn listener must fail closed while its socket drains"
-        );
-    }
+    // Routing is withdrawn by the config swap itself. While the accept socket
+    // is still draining it answers HTTP 404 (never stale-route). Once the
+    // accept loop has observed shutdown, the kernel may complete a handshake
+    // and then close without an HTTP response (`try_http_get` status 0) or
+    // refuse the connect entirely. All three are fail-closed; 200 is not.
+    assert_withdrawn_listener_fail_closed(listener_a_port).await;
     assert_eq!(
         http_get(listener_b_port, "/api/x").await.1,
         "listener-b",

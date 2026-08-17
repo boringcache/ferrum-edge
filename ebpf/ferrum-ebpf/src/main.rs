@@ -5,8 +5,8 @@
 //!
 //! | Program             | Hook              | Purpose                              |
 //! |---------------------|-------------------|--------------------------------------|
-//! | `ferrum_connect4`   | cgroup/connect4   | Rewrite outbound IPv4 to loopback    |
-//! | `ferrum_connect6`   | cgroup/connect6   | Rewrite outbound IPv6 to loopback    |
+//! | `ferrum_connect4`   | cgroup/connect4   | Rewrite outbound IPv4 TCP to loopback |
+//! | `ferrum_connect6`   | cgroup/connect6   | Rewrite outbound IPv6 TCP to loopback |
 //! | `ferrum_getpeername4` | cgroup/getpeername4 | Return original IPv4 destination   |
 //! | `ferrum_getpeername6` | cgroup/getpeername6 | Return original IPv6 destination   |
 //! | `ferrum_tc_inbound` | tc ingress/egress (pod veth) | Guard enrolled destination pod traffic |

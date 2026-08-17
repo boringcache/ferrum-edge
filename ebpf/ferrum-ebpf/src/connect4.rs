@@ -1,6 +1,10 @@
 //! cgroup/connect4 — outbound IPv4 traffic capture.
 //!
-//! Intercepts `connect()` syscalls for IPv4 TCP from enrolled pods:
+//! Intercepts `connect()` syscalls for IPv4 TCP (`SOCK_STREAM`) from enrolled pods.
+//! `cgroup/connect4` also fires for UDP `connect()`; those are left unrewritten
+//! because the outbound capture listener is TCP-only. UDP/DTLS from enrolled
+//! pods reaches NodeWaypoint host-netns listeners (or Ambient TPROXY) with the
+//! original destination intact.
 //! 1. Skip if calling UID is in the bypass set (proxy UID 1337)
 //! 2. Skip if destination port is excluded
 //! 3. Skip if destination IP matches an exclude CIDR
@@ -20,10 +24,11 @@ use crate::maps::{
 };
 use crate::sock_ops_emit::emit_drop_reason;
 use ferrum_ebpf_common::{
-    host_port_to_sock_addr_user_port, sock_addr_user_port_to_host, CidrKey4, IncludePortsPolicy,
-    OrigDst4, OrigDstKey, WorkloadIdentity, FERRUM_CAPTURE_CONFIG_KEY, IPV4_LOOPBACK_NBO,
-    OUTBOUND_CAPTURE_PORT, SOCK_OPS_DROP_BYPASS_UID_HIT, SOCK_OPS_DROP_EXCLUDE_CIDR_HIT,
-    SOCK_OPS_DROP_EXCLUDE_PORT_HIT, SOCK_OPS_DROP_NOT_IN_INCLUDE_CIDR,
+    host_port_to_sock_addr_user_port, is_tcp_stream_connect, sock_addr_user_port_to_host, CidrKey4,
+    IncludePortsPolicy, OrigDst4, OrigDstKey, WorkloadIdentity, FERRUM_CAPTURE_CONFIG_KEY,
+    IPV4_LOOPBACK_NBO, OUTBOUND_CAPTURE_PORT, SOCK_OPS_DROP_BYPASS_UID_HIT,
+    SOCK_OPS_DROP_EXCLUDE_CIDR_HIT, SOCK_OPS_DROP_EXCLUDE_PORT_HIT,
+    SOCK_OPS_DROP_NOT_IN_INCLUDE_CIDR,
 };
 
 #[cgroup_sock_addr(connect4)]
@@ -37,6 +42,13 @@ pub fn ferrum_connect4(ctx: SockAddrContext) -> i32 {
 #[inline(always)]
 fn try_connect4(ctx: &SockAddrContext) -> Result<i32, i64> {
     let sock_addr = unsafe { &*ctx.sock_addr };
+
+    // `type_` is a 4-byte read-only scalar. Skip SOCK_DGRAM (and anything else
+    // that is not TCP) before any rewrite: openssl s_client -dtls and other
+    // connected-UDP clients must keep the original destination.
+    if !is_tcp_stream_connect(sock_addr.type_) {
+        return Ok(1);
+    }
 
     let uid = (aya_ebpf::helpers::bpf_get_current_uid_gid() & 0xFFFFFFFF) as u32;
     if unsafe { FERRUM_BYPASS_UIDS.get(&uid) }.is_some() {

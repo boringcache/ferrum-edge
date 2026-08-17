@@ -101,6 +101,8 @@ fn build_mesh_authz_for_workload(
         mesh: Some(Box::new(mesh)),
         http_tls_listen_ports: Default::default(),
         mesh_revision: None,
+        node_waypoint_udp_steer_destinations: Vec::new(),
+        node_waypoint_udp_destination_routes: Vec::new(),
         k8s_mesh_overlay: Default::default(),
         gateway_trust_bundles: Vec::new(),
     };
@@ -1538,6 +1540,8 @@ async fn trust_domain_alias_accepts_baggage_principal_from_aliased_domain() {
         mesh: Some(Box::new(mesh)),
         http_tls_listen_ports: Default::default(),
         mesh_revision: None,
+        node_waypoint_udp_steer_destinations: Vec::new(),
+        node_waypoint_udp_destination_routes: Vec::new(),
         k8s_mesh_overlay: Default::default(),
         gateway_trust_bundles: Vec::new(),
     };

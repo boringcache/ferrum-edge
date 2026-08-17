@@ -886,6 +886,199 @@ pub fn set_ipv6_recvpktinfo(_fd: i32) -> std::io::Result<()> {
     Ok(())
 }
 
+// ── Required ingress-pktinfo families for attributed UDP listeners ─────
+//
+// A NodeWaypoint scoped UDP/DTLS listener derives its per-datagram SOURCE
+// workload from the kernel-reported ingress interface, which only
+// `IP_PKTINFO` / `IPV6_RECVPKTINFO` surfaces. "Either option succeeded" is NOT
+// a sufficient outcome there: a dual-stack `[::]` listener receives native IPv6
+// through `IPV6_PKTINFO` and IPv4-mapped clients through `IP_PKTINFO`, so a
+// success on the family the socket does not actually serve would mask a
+// black-hole listener that reports itself healthy while denying every scoped
+// session. The decision below is therefore explicit per bound family.
+
+/// Which pktinfo option(s) a bound UDP socket must have enabled before
+/// per-datagram ingress-interface attribution is possible on it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum IngressPktinfoFamilies {
+    /// An `AF_INET` socket: only `IP_PKTINFO` is meaningful.
+    V4,
+    /// An `AF_INET6` socket with `IPV6_V6ONLY` set: only `IPV6_RECVPKTINFO`
+    /// is meaningful, because no IPv4 datagram can be delivered on it.
+    V6,
+    /// A dual-stack `AF_INET6` socket: native IPv6 datagrams carry
+    /// `IPV6_PKTINFO` and IPv4-mapped datagrams carry `IP_PKTINFO`, so BOTH
+    /// must be enabled or one family silently loses its ingress interface.
+    Both,
+}
+
+impl IngressPktinfoFamilies {
+    /// Whether IPv4 ingress datagrams can reach a socket with this shape.
+    pub fn needs_v4(self) -> bool {
+        matches!(self, Self::V4 | Self::Both)
+    }
+
+    /// Whether IPv6 ingress datagrams can reach a socket with this shape.
+    pub fn needs_v6(self) -> bool {
+        matches!(self, Self::V6 | Self::Both)
+    }
+}
+
+/// Decide which pktinfo options a bound UDP socket needs for ingress-interface
+/// attribution, from its bound local address and its `IPV6_V6ONLY` state.
+///
+/// `v6only` is ignored for an IPv4 bind (it cannot apply) and is read from the
+/// socket rather than assumed, because the dual-stack default is a sysctl
+/// (`net.ipv6.bindv6only`) rather than a Ferrum choice.
+pub fn required_ingress_pktinfo_families(
+    local: std::net::SocketAddr,
+    v6only: bool,
+) -> IngressPktinfoFamilies {
+    match local.ip() {
+        std::net::IpAddr::V4(_) => IngressPktinfoFamilies::V4,
+        std::net::IpAddr::V6(_) if v6only => IngressPktinfoFamilies::V6,
+        std::net::IpAddr::V6(_) => IngressPktinfoFamilies::Both,
+    }
+}
+
+/// A required ingress-pktinfo option could not be enabled on a socket that
+/// depends on it for source attribution.
+///
+/// Carries the family shape that was required and which of the two setsockopt
+/// calls failed, so the caller can report a listener as failed rather than
+/// starting a black hole that denies every scoped session.
+#[derive(Debug)]
+pub struct IngressPktinfoError {
+    /// The families the bound socket actually serves.
+    pub required: IngressPktinfoFamilies,
+    /// `IP_PKTINFO` failure, when IPv4 was required.
+    pub v4: Option<std::io::Error>,
+    /// `IPV6_RECVPKTINFO` failure, when IPv6 was required.
+    pub v6: Option<std::io::Error>,
+}
+
+impl std::fmt::Display for IngressPktinfoError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "ingress-interface capture unavailable for {:?} UDP socket",
+            self.required
+        )?;
+        if let Some(error) = &self.v4 {
+            write!(f, "; IP_PKTINFO: {error}")?;
+        }
+        if let Some(error) = &self.v6 {
+            write!(f, "; IPV6_RECVPKTINFO: {error}")?;
+        }
+        Ok(())
+    }
+}
+
+impl std::error::Error for IngressPktinfoError {}
+
+/// Build the fail-closed verdict for a required family shape from the two
+/// setsockopt outcomes.
+///
+/// Split out from the syscalls so the decision itself is exercised without a
+/// socket: success on an irrelevant family must never satisfy the family the
+/// socket actually serves.
+pub fn ingress_pktinfo_outcome(
+    required: IngressPktinfoFamilies,
+    v4: Result<(), std::io::Error>,
+    v6: Result<(), std::io::Error>,
+) -> Result<(), IngressPktinfoError> {
+    let v4 = match (required.needs_v4(), v4) {
+        (true, Err(error)) => Some(error),
+        _ => None,
+    };
+    let v6 = match (required.needs_v6(), v6) {
+        (true, Err(error)) => Some(error),
+        _ => None,
+    };
+    if v4.is_none() && v6.is_none() {
+        return Ok(());
+    }
+    Err(IngressPktinfoError { required, v4, v6 })
+}
+
+/// Read `IPV6_V6ONLY` from a bound socket (Linux only).
+#[cfg(target_os = "linux")]
+pub fn get_ipv6_v6only(fd: std::os::unix::io::RawFd) -> std::io::Result<bool> {
+    let mut val: libc::c_int = 0;
+    let mut len = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
+    let ret = unsafe {
+        libc::getsockopt(
+            fd,
+            libc::IPPROTO_IPV6,
+            libc::IPV6_V6ONLY,
+            &mut val as *mut libc::c_int as *mut libc::c_void,
+            &mut len,
+        )
+    };
+    if ret != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(val != 0)
+}
+
+/// Enable every ingress-pktinfo option the bound socket's family actually
+/// needs, failing closed when one of them cannot be enabled.
+///
+/// Used only by listeners whose security decision depends on the ingress
+/// interface (NodeWaypoint scoped UDP/DTLS). Ordinary UDP/DTLS listeners keep
+/// the best-effort `set_ip_pktinfo` / `set_ipv6_recvpktinfo` pair, where a
+/// failure only costs a routing-table lookup.
+#[cfg(target_os = "linux")]
+pub fn enable_ingress_pktinfo(
+    fd: std::os::unix::io::RawFd,
+    local: std::net::SocketAddr,
+) -> Result<IngressPktinfoFamilies, IngressPktinfoError> {
+    // A getsockopt failure on an IPv6 socket must not be read as "dual-stack
+    // is off"; treat the wider (Both) requirement as the safe assumption.
+    let v6only = local.is_ipv6() && get_ipv6_v6only(fd).unwrap_or(false);
+    let required = required_ingress_pktinfo_families(local, v6only);
+    let v4 = if required.needs_v4() {
+        set_ip_pktinfo(fd)
+    } else {
+        Ok(())
+    };
+    let v6 = if required.needs_v6() {
+        set_ipv6_recvpktinfo(fd)
+    } else {
+        Ok(())
+    };
+    ingress_pktinfo_outcome(required, v4, v6).map(|()| required)
+}
+
+/// Non-Linux builds have no `IP_PKTINFO` ingress-interface channel at all, so
+/// a listener that depends on it fails closed here rather than starting.
+#[cfg(not(target_os = "linux"))]
+#[allow(dead_code)]
+pub fn enable_ingress_pktinfo(
+    _fd: i32,
+    local: std::net::SocketAddr,
+) -> Result<IngressPktinfoFamilies, IngressPktinfoError> {
+    fn unsupported() -> std::io::Error {
+        std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "IP_PKTINFO ingress-interface capture is Linux-only",
+        )
+    }
+
+    let required = required_ingress_pktinfo_families(local, false);
+    let v4 = if required.needs_v4() {
+        Err(unsupported())
+    } else {
+        Ok(())
+    };
+    let v6 = if required.needs_v6() {
+        Err(unsupported())
+    } else {
+        Ok(())
+    };
+    ingress_pktinfo_outcome(required, v4, v6).map(|()| required)
+}
+
 // ── Do-not-fragment / path-MTU discovery (RFC 9298 §3.1) ────────────────────
 
 /// Whether the running target exposes a usable do-not-fragment socket option.
@@ -1010,13 +1203,60 @@ pub const UDP_DONT_FRAGMENT_UNSUPPORTED_MESSAGE: &str =
     "no do-not-fragment socket option is available on this build target";
 
 /// Captured local (reply-source) address from an `IP_PKTINFO` / `IPV6_PKTINFO`
-/// cmsg. The interface index is preserved so scoped IPv6 replies (notably
-/// link-local `fe80::/10`) egress the correct interface zone on send; for IPv4
-/// it's informational and safe to leave at 0.
+/// cmsg. The interface index is the RECEIVE-side ingress interface the kernel
+/// reported for the datagram, which NodeWaypoint UDP source attribution treats
+/// as authoritative evidence. It is deliberately NOT the same quantity as the
+/// send-side egress interface — see [`PktinfoLocal::send_ifindex`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct PktinfoLocal {
     pub ip: std::net::IpAddr,
     pub ifindex: u32,
+}
+
+impl PktinfoLocal {
+    /// Interface index to place in an OUTBOUND pktinfo cmsg for this reply
+    /// source.
+    ///
+    /// `ifindex` as captured is a receive-side fact ("the datagram arrived on
+    /// this interface"). In an outbound `in_pktinfo` / `in6_pktinfo` the same
+    /// field means something different — it constrains the egress route lookup
+    /// the way `SO_BINDTODEVICE` does, and on IPv4 it additionally makes the
+    /// kernel prefer the interface's primary address over `ipi_spec_dst`. Those
+    /// two meanings coincide only by accident, so the ingress interface must
+    /// never be reused blindly on send: replying to a same-node pod whose
+    /// datagram arrived on one device while the captured local address lives on
+    /// another would pin egress to a device the reply source does not belong
+    /// to, and the routing table would no longer be free to pick the path back
+    /// to the client.
+    ///
+    /// The one case where the field is genuinely REQUIRED on send is a scoped
+    /// IPv6 source address, whose zone is ambiguous without it: link-local
+    /// unicast (`fe80::/10`) and interface-local / link-local multicast
+    /// (`ff01::/16`, `ff02::/16`). Everything else — every IPv4 source and
+    /// every global IPv6 source — sends `0` and lets the route table choose the
+    /// egress device, while `ipi_spec_dst` / `ipi6_addr` still pins the source
+    /// address exactly to the local destination the client targeted.
+    ///
+    /// Both cmsg construction sites are Linux-only, so the binary target has no
+    /// caller for this on other platforms; the external unit tests still do.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    pub fn send_ifindex(self) -> u32 {
+        match self.ip {
+            std::net::IpAddr::V4(_) => 0,
+            std::net::IpAddr::V6(v6) => {
+                let octets = v6.octets();
+                // Link-local unicast: `fe80::/10`.
+                if octets[0] == 0xfe && (octets[1] & 0xc0) == 0x80 {
+                    return self.ifindex;
+                }
+                // Interface-local / link-local multicast: `ff01::/16`, `ff02::/16`.
+                if octets[0] == 0xff && matches!(octets[1] & 0x0f, 0x01 | 0x02) {
+                    return self.ifindex;
+                }
+                0
+            }
+        }
+    }
 }
 
 /// Parse an `IP_PKTINFO` or `IPV6_PKTINFO` cmsg and return the captured local
@@ -1146,6 +1386,55 @@ pub fn set_ip_transparent(_fd: i32) -> std::io::Result<()> {
 #[allow(dead_code)]
 pub fn set_ipv6_transparent(_fd: i32) -> std::io::Result<()> {
     Ok(())
+}
+
+/// Make a NodeWaypoint-scoped datagram listener socket transparent so it may
+/// SOURCE replies from an address that is not configured on this host.
+///
+/// This is a thin family dispatcher over the two established helpers above —
+/// [`set_ip_transparent`] and [`set_ipv6_transparent`] — deliberately NOT a
+/// third `setsockopt` implementation. Rust has no function overloading, so
+/// adding a second `set_ip_transparent` arity would not compile; the family
+/// decision belongs here, once, rather than being repeated at each scoped
+/// listener.
+///
+/// The NodeWaypoint Service datapath needs exactly this flag: a workload
+/// addresses its Service's ClusterIP, the steering rules deliver that datagram
+/// locally **without rewriting it**, and the reply must therefore leave with
+/// the ClusterIP as its source or the workload's connected socket discards it.
+/// The kernel refuses a non-local source address unless the socket carries
+/// `FLOWI_FLAG_ANYSRC`, which is what `IP_TRANSPARENT` / `IPV6_TRANSPARENT`
+/// sets. Both option numbers set the SAME kernel flag
+/// (`inet_sk(sk)->transparent`); the family-appropriate one is used so a
+/// failure names an option that socket can actually carry.
+///
+/// Requires `CAP_NET_ADMIN` (or `CAP_NET_RAW` on newer kernels). Unlike the
+/// per-family helpers — whose non-Linux stubs are historic no-ops for the
+/// TPROXY capture paths — this one FAILS CLOSED off Linux, because its only
+/// callers are scoped listeners that must not start when they cannot source
+/// their replies correctly.
+#[cfg(target_os = "linux")]
+pub fn set_scoped_reply_transparent(
+    fd: std::os::unix::io::RawFd,
+    ipv6: bool,
+) -> std::io::Result<()> {
+    if ipv6 {
+        set_ipv6_transparent(fd)
+    } else {
+        set_ip_transparent(fd)
+    }
+}
+
+/// Non-Linux builds have no transparent-socket concept, and the NodeWaypoint
+/// steering datapath is Linux-only, so a scoped listener refuses to start here
+/// rather than serving a one-way datapath.
+#[cfg(not(target_os = "linux"))]
+#[allow(dead_code)]
+pub fn set_scoped_reply_transparent(_fd: i32, _ipv6: bool) -> std::io::Result<()> {
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "transparent sockets (IP_TRANSPARENT / IPV6_TRANSPARENT) are Linux-only",
+    ))
 }
 
 // ── IP_RECVORIGDSTADDR / IPV6_RECVORIGDSTADDR ──────────────────────────
@@ -1287,7 +1576,9 @@ pub fn send_with_pktinfo(
     gso_segment_size: Option<u16>,
 ) -> std::io::Result<usize> {
     let local_ip = local.ip;
-    let ifindex = local.ifindex;
+    // Send-side interface selection is derived, never the captured ingress
+    // interface: see `PktinfoLocal::send_ifindex`.
+    let send_ifindex = local.send_ifindex();
     const UDP_SEGMENT: libc::c_int = 103;
 
     let iov = libc::iovec {
@@ -1330,13 +1621,13 @@ pub fn send_with_pktinfo(
             (*cmsg).cmsg_type = libc::IP_PKTINFO;
             (*cmsg).cmsg_len =
                 libc::CMSG_LEN(std::mem::size_of::<libc::in_pktinfo>() as u32) as usize;
-            // ipi_ifindex intentionally 0 for IPv4: per ip(7), a nonzero
-            // ifindex makes the kernel prefer the interface's primary address
-            // over ipi_spec_dst on multi-IP interfaces, which would defeat the
+            // `send_ifindex` is always 0 on IPv4: per ip(7), a nonzero ifindex
+            // makes the kernel prefer the interface's primary address over
+            // ipi_spec_dst on multi-IP interfaces, which would defeat the
             // "reply from captured destination" semantics. ipi_spec_dst alone
             // is sufficient on IPv4; ifindex is only honored for IPv6 scopes.
             let pi = libc::in_pktinfo {
-                ipi_ifindex: 0,
+                ipi_ifindex: send_ifindex as libc::c_int,
                 ipi_spec_dst: libc::in_addr {
                     s_addr: u32::from(v4).to_be(),
                 },
@@ -1357,7 +1648,7 @@ pub fn send_with_pktinfo(
                 ipi6_addr: libc::in6_addr {
                     s6_addr: v6.octets(),
                 },
-                ipi6_ifindex: ifindex,
+                ipi6_ifindex: send_ifindex,
             };
             std::ptr::copy_nonoverlapping(
                 &pi as *const libc::in6_pktinfo as *const u8,

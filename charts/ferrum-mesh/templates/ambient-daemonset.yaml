@@ -19,6 +19,13 @@
 {{- fail "ambient topology requires nodeAgent.enabled=true: the UDP placement guard and registry must remain durable even while UDP capture is disabled" -}}
 {{- end -}}
 {{- $nodeWaypointRegistryEnabled := eq $ambientTopology "node_waypoint" -}}
+{{- /* NodeWaypoint UDP/DTLS Service-path steering shells out to
+       iptables/ip6tables/ip (`HostNamespaceSteerBackend`). Only `true`/`1`
+       enable it — matches `node_waypoint_udp_listeners_enabled_from_env`. */ -}}
+{{- $nodeWaypointUdpListeners := false -}}
+{{- if and $nodeWaypointRegistryEnabled (hasKey $ambientEnv "FERRUM_MESH_NODE_WAYPOINT_UDP_LISTENERS_ENABLED") -}}
+{{- $nodeWaypointUdpListeners = has (lower (trim (toString (index $ambientEnv "FERRUM_MESH_NODE_WAYPOINT_UDP_LISTENERS_ENABLED")))) (list "true" "1") -}}
+{{- end -}}
 {{- $nodeWaypointRegistryMountPath := toString .Values.nodeAgent.podRegistryDir -}}
 {{- if hasKey $ambientEnv "FERRUM_MESH_NODE_WAYPOINT_POD_REGISTRY_DIR" -}}
 {{- $nodeWaypointRegistryMountPath = toString (index $ambientEnv "FERRUM_MESH_NODE_WAYPOINT_POD_REGISTRY_DIR") -}}
@@ -88,8 +95,9 @@
        placements, and the disabled stale-rule cleanup. The host placement uses
        the registry for the enrolled-pod set and the cgroup mount to resolve each
        pod's host-side interface. The tools-capable image is selected separately
-       below (`-ebpf-tools` for the UDP lifecycle, distroless `-ebpf` otherwise);
-       do not conflate the two — they have different security contracts. */ -}}
+       below (`-ebpf-tools` for the Ambient UDP lifecycle and NodeWaypoint UDP
+       listeners, distroless `-ebpf` otherwise); do not conflate the two — they
+       have different security contracts. */ -}}
 {{- $ambientInNetnsCapture := or $nodeWaypointRegistryEnabled $ambientUdpLifecycle -}}
 {{- /* SYS_ADMIN + SYS_PTRACE are needed ONLY by the placements that enter
        another namespace: NodeWaypoint's in-netns TCP listeners and the
@@ -238,6 +246,9 @@
 {{- fail (printf "ambient FERRUM_ADMIN_HTTPS_PORT and nodeAgent.admin.port both use hostNetwork port %s; set distinct ports or disable one listener" $ambientAdminHttpsPort) -}}
 {{- end -}}
 {{- if $nodeWaypointRegistryEnabled -}}
+{{- if hasKey $ambientEnv "FERRUM_K8S_NODE_NAME" -}}
+{{- fail "ambient.env.FERRUM_K8S_NODE_NAME is chart-managed for NodeWaypoint from downward API spec.nodeName" -}}
+{{- end -}}
 {{- if eq $ambientAdminPort "0" -}}
 {{- fail "ambient FERRUM_MESH_TOPOLOGY=node_waypoint requires FERRUM_ADMIN_HTTP_PORT to stay enabled for the Kubernetes readiness probe" -}}
 {{- end -}}
@@ -279,25 +290,25 @@
        * "-ebpf"       — `Dockerfile` target `runtime-ebpf`. Still DISTROLESS: it
                          adds the eBPF ELF and a staged `ip` closure but has NO
                          `/bin/sh` and NO `iptables`/`ip6tables`. Selected for
-                         eBPF capture and the NodeWaypoint topology, which need
+                         eBPF capture and TCP-only NodeWaypoint, which need
                          `ip` (policy rule/route) but never a shell.
        * "-ebpf-tools" — `Dockerfile` target `runtime-ebpf-tools`, a strict
                          SUPERSET of the above that also ships `/bin/sh`,
                          `iptables`, `ip6tables`, and the `*-save` helpers.
 
-       The Ambient UDP lifecycle (#2013) must select "-ebpf-tools", not "-ebpf":
-       both the producer and the disabled stale-rule cleanup manager execute
-       generated `sh -c` scripts calling `ip`/`iptables`/`ip6tables`, which the
-       distroless "-ebpf" image cannot run at all — `preflight_capture_tools`
-       refuses startup there by design. Selecting "-ebpf" for this pod (as the
-       chart previously did) rendered an image that could not run the backend it
-       was chosen for, and an enabled-to-disabled rollout could not clean
-       predecessor rules. Ordering matters: the UDP lifecycle wins because its
-       image already satisfies every eBPF/NodeWaypoint requirement. An operator
-       tag that already names a variant is left alone, and an explicit "-ebpf"
-       tag is PROMOTED (not double-suffixed) when tools are required. Mirrors the
-       established auto-append convention (values.yaml image docs). */ -}}
-{{- if $ambientUdpLifecycle -}}
+       The Ambient UDP lifecycle (#2013) AND NodeWaypoint UDP/DTLS listeners
+       (issue #3286 Service-path steering) must select "-ebpf-tools", not
+       "-ebpf": both execute generated `sh -c` scripts calling
+       `ip`/`iptables`/`ip6tables`, which the distroless "-ebpf" image cannot
+       run at all (`Command::new("sh")` is ENOENT). Selecting "-ebpf" for a
+       NodeWaypoint that has UDP listeners enabled materializes the listener
+       (direct node-address probes work) but never installs steering, so
+       ClusterIP traffic is DNAT-ed by kube-proxy and dropped by the pod-veth
+       guard. TCP-only NodeWaypoint stays distroless. The node-agent never
+       receives this image. An operator tag that already names a variant is
+       left alone, and an explicit "-ebpf" tag is PROMOTED (not double-suffixed)
+       when tools are required. */ -}}
+{{- if or $ambientUdpLifecycle $nodeWaypointUdpListeners -}}
 {{- if not (hasSuffix "-ebpf-tools" $ambientImageTag) -}}
 {{- $ambientImageTag = printf "%s-ebpf-tools" (trimSuffix "-ebpf" $ambientImageTag) -}}
 {{- end -}}
@@ -526,13 +537,13 @@ spec:
             - name: FERRUM_NODE_AGENT_INGRESS_REDIRECT_IFACES
               value: {{ .Values.nodeAgent.ingressRedirectIfaces | quote }}
             {{- end }}
-            {{- if $ambientSpireEnabled }}
-            {{- if $ambientSpireUsesNodeName }}
+            {{- if or $nodeWaypointRegistryEnabled (and $ambientSpireEnabled $ambientSpireUsesNodeName) }}
             - name: FERRUM_K8S_NODE_NAME
               valueFrom:
                 fieldRef:
                   fieldPath: spec.nodeName
             {{- end }}
+            {{- if $ambientSpireEnabled }}
             - name: FERRUM_MESH_CA_BACKEND
               value: "spire_agent"
             - name: FERRUM_MESH_SPIRE_AGENT_SOCKET
@@ -570,6 +581,9 @@ spec:
             - name: spire-agent-socket
               mountPath: {{ $ambientSpireSocketMountPath }}
               readOnly: true
+            {{- end }}
+            {{- with .Values.ambient.extraVolumeMounts }}
+            {{- toYaml . | nindent 12 }}
             {{- end }}
           {{- /* Admin-backed probes when the listener is enabled. NodeWaypoint
                  still requires a non-zero admin port (validated above). Ordinary
@@ -639,5 +653,8 @@ spec:
           hostPath:
             path: {{ $ambientSpireSocketHostPath }}
             type: DirectoryOrCreate
+        {{- end }}
+        {{- with .Values.ambient.extraVolumes }}
+        {{- toYaml . | nindent 8 }}
         {{- end }}
 {{- end }}

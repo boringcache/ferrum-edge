@@ -19,6 +19,7 @@ For the security posture of this mode (required Linux capabilities, mounts, secc
 | BPF pod maps | `FERRUM_POD_IPS`, `FERRUM_POD_IPS6` | IPv4/IPv6 pod IP to proxy-port and capture-lifecycle metadata for enrolled workloads. The tc guard treats these maps as the enrolled destination set and keeps pod-originated Ambient UDP closed until the producer-ready flag is set. |
 | BPF node/probe maps | `FERRUM_NODE_IPS`, `FERRUM_NODE_IPS6`, `FERRUM_NODE_PROBE_PORTS`, `FERRUM_NODE_PROBE_PORTS6` | Explicit trusted kubelet probe source IPs plus enrolled pod probe ports allowed through the NodeWaypoint direct-inbound guard. Helm does not infer host-interface addresses; set `nodeAgent.trustedKubeletProbeSourceIps` only to known kubelet probe source IPs, such as a CNI bridge gateway address. The node-agent derives probe ports from Kubernetes HTTP/TCP/gRPC liveness, readiness, and startup probes. |
 | BPF original destination maps | `FERRUM_ORIG_DST4`, `FERRUM_ORIG_DST6` | Socket-cookie keyed original destination records. The `connect4`/`connect6` hooks write them (stamped with the source pod's UID + SPIFFE hash from `FERRUM_WORKLOAD_IDENTITY`); the node-agent pins them at `/sys/fs/bpf/ferrum/orig_dst{4,6}`; the node-waypoint mesh-proxy's **orig-dst bridge** (`src/ebpf/orig_dst_bridge.rs`) mirrors each record into the `NodeWaypointIdentityResolver`. |
+| BPF UDP reply-source maps and gate | `FERRUM_UDP_REPLY_SOURCES`, `FERRUM_UDP_REPLY_SOURCES6`, `FERRUM_UDP_REPLY_SOURCE_GATE` | Exact `(source address, source port)` pairs a SERVING NodeWaypoint UDP/DTLS listener may reply from, plus one shared BPF-visible gate both tc UDP classifier families consult before either map. The node-agent retracts `<pod registry dir>/.udp-reply-src/applied`, disables the gate, replaces both families while every entry is inert, revalidates the exact bounded manifest, enables the gate, and only then writes `applied`. After successful fencing, any unlink, scan, remove, insert, partial-family, revalidation, or acknowledgement-write failure leaves the gate closed and retryable; stale keys left by a failed removal are inert, not proof of a narrower coherent set. If the gate cannot be disabled, the node-agent reports a hard fencing failure and neither mutates nor acknowledges a successor. All three maps are required for NodeWaypoint readiness, including an empty withdrawal. |
 | BPF workload identity map | `FERRUM_WORKLOAD_IDENTITY` | Per-cgroup source workload identity (`{pod_uid, workload_spiffe_hash}`), keyed by `bpf_get_current_cgroup_id`. The node-agent writes one entry per enrolled pod cgroup; the connect hooks read it to stamp orig-dst records. Absent entry → connect hooks store the all-zero sentinel, which node-waypoint resolution treats as fail-closed. |
 | BPF capture filters | `FERRUM_BYPASS_UIDS`, `FERRUM_CIDR_*`, `FERRUM_PORT_EXCLUDE` | UID, CIDR, and port exclusions applied before outbound rewrite. |
 
@@ -177,9 +178,14 @@ BPF map read are gated behind `#[cfg(all(feature = "ebpf", target_os = "linux"))
 >   using the root `Dockerfile` target `runtime-ebpf-tools`. It is a strict
 >   **superset** of
 >   `-ebpf` (identical binaries and BPF ELF) on a Debian 13 base that also ships
->   `/bin/sh`, `ip`, `iptables`, `ip6tables`, `iptables-save`, and
->   `ip6tables-save`. Use it for the two paths that shell out: the Ambient UDP
->   capture lifecycle (the mesh chart selects this tag automatically) and
+>   `/bin/sh`, `ip`, `iptables`, `ip6tables`, `iptables-save`,
+>   `ip6tables-save`, and the Debian platform CA bundle at
+>   `/etc/ssl/certs/ca-certificates.crt` (required for plugin `reqwest` TLS
+>   verification; the distroless `-ebpf` base already carries a CA store). Use it
+>   for the paths that shell out: the Ambient UDP capture lifecycle, the
+>   NodeWaypoint UDP/DTLS Service-path steering enabled by
+>   `FERRUM_MESH_NODE_WAYPOINT_UDP_LISTENERS_ENABLED=true` (the mesh chart
+>   selects this tag automatically for both), and
 >   `FERRUM_NODE_AGENT_FALLBACK_MODE=iptables`. It is **not distroless**, has a
 >   package manager, and runs as **root**, so prefer `-ebpf` wherever the tool
 >   contract is not required.
@@ -375,13 +381,19 @@ update/removal or classifier detach keeps capture degraded and withholds that
 acknowledgement; after a bounded wait
 the producer retains its in-netns fail-closed guard while releasing the producer
 tasks/netns handle instead of tearing down into plaintext. Live
-bind-collision/source-capture verification is enforced by
+bind-collision/source-capture verification, including the enrolled-destination
+two-pod UDP round trip (destination pod-netns relay plus registry/netns
+selection), is enforced by
 `functional_mesh_live_source_capture_udp_manager_hbone_round_trip` (closed
 [#2013](https://github.com/ferrum-edge/ferrum-edge/issues/2013) /
-[#2038](https://github.com/ferrum-edge/ferrum-edge/issues/2038)). The
-enrolled-destination two-pod UDP round trip (destination pod-netns relay plus
-tc-inbound admit) is not yet live-gated — tracked on
-[#3621](https://github.com/ferrum-edge/ferrum-edge/issues/3621).
+[#2038](https://github.com/ferrum-edge/ferrum-edge/issues/2038) /
+[#3621](https://github.com/ferrum-edge/ferrum-edge/issues/3621)). The
+complementary `node-waypoint-ebpf-live` UDP listener round trip proves the
+destination relay's socket mark admits its backend datagram through the real
+enrolled-pod `tc_inbound` classifier, while its unmarked direct-pod negatives
+remain dropped. Together the two hosted gates cover the destination-netns relay
+and the eBPF admit boundary without claiming that the netns-only fixture loads
+the eBPF program.
 
 The Ambient UDP producer needs the same host access the NodeWaypoint in-netns
 listener needs — the read-only host cgroup mount + host `/proc` to resolve pod
@@ -505,10 +517,18 @@ dropped unless they both come from an explicitly configured local-node source in
 `FERRUM_CAPTURE_CONFIG`; the destination HBONE relay sets that mark with
 `SO_MARK` before dialing the local backend pod. The source-IP check prevents a
 workload that can forge ordinary Linux socket marks from using the mark alone as
-a direct-pod bypass. Direct UDP/DTLS to enrolled pod IPs fails closed because no
-authorized UDP relay path exists yet, except DNS responses from source port 53
+a direct-pod bypass. Direct UDP/DTLS to enrolled pod IPs fails closed except the
+NodeWaypoint relay's own marked datagrams and DNS responses from source port 53
 back to high pod-originated client ports (`>=32768`); ARP/ICMP and other control
-traffic remains pass-through. Packets sourced from explicitly configured trusted
+traffic remains pass-through. The UDP arms accept one SOURCE proof the TCP arm
+does not — an exact `(address, port)` entry in `FERRUM_UDP_REPLY_SOURCES` /
+`FERRUM_UDP_REPLY_SOURCES6` — because a NodeWaypoint UDP/DTLS reply is pinned to
+the address the client addressed rather than route-selected, and on the steered
+Service path that address is a Service ClusterIP. The relay auth mark is still
+required in every case, and those maps hold exact addresses with exact ports, never
+a CIDR or a service range. Both UDP arms first require the shared
+`FERRUM_UDP_REPLY_SOURCE_GATE`; stale or partial family-map keys are inert while
+it is closed. Packets sourced from explicitly configured trusted
 kubelet probe source IPs in `FERRUM_NODE_IPS` / `FERRUM_NODE_IPS6` can also reach
 enrolled pod TCP probe ports without the relay mark when those ports are derived
 into `FERRUM_NODE_PROBE_PORTS` / `FERRUM_NODE_PROBE_PORTS6` from the pod's
