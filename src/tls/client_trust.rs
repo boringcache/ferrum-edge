@@ -1285,6 +1285,20 @@ impl<S> TrustFencedStream<S> {
         self.retired.is_some()
     }
 
+    /// Whether the fence — rather than the wrapped stream — produced the last
+    /// error this wrapper returned.
+    ///
+    /// A caller that wraps one bounded write (the TCP+TLS inspected-prefix
+    /// forward) needs to tell a withdrawal apart from a genuine backend I/O
+    /// failure: the first is a client-side, health-neutral authorization
+    /// decision, the second is backend evidence. Reading the latch is exact,
+    /// where re-reading the session afterwards would misattribute a backend
+    /// failure that merely coincided with a withdrawal.
+    #[inline]
+    pub fn fence_fired(&self) -> bool {
+        self.fired
+    }
+
     fn poll_fence(&mut self, cx: &mut Context<'_>) -> Option<std::io::Error> {
         let retired = self.retired.as_mut()?;
         if self.fired {

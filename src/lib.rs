@@ -7773,6 +7773,108 @@ pub mod _test_support {
         crate::proxy::tcp_proxy::within_stream_auth_deadline(plan, stage).await
     }
 
+    /// Why a post-admission TCP setup stage was interrupted (issues #3816 and
+    /// #3857), mirrored for external tests.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum StreamSetupInterruptForTest {
+        /// The admitted credential's authorization lifetime elapsed.
+        AuthorizationExpired(crate::proxy::auth_lifetime::StreamAuthTermination),
+        /// The frontend client-certificate trust decision was withdrawn.
+        TrustWithdrawn,
+    }
+
+    fn map_stream_setup_interrupt_for_test(
+        interrupt: crate::proxy::tcp_proxy::StreamSetupInterrupt,
+    ) -> StreamSetupInterruptForTest {
+        match interrupt {
+            crate::proxy::tcp_proxy::StreamSetupInterrupt::AuthorizationExpired(termination) => {
+                StreamSetupInterruptForTest::AuthorizationExpired(termination)
+            }
+            crate::proxy::tcp_proxy::StreamSetupInterrupt::TrustWithdrawn => {
+                StreamSetupInterruptForTest::TrustWithdrawn
+            }
+        }
+    }
+
+    /// Run one post-admission TCP setup stage under BOTH post-admission bounds
+    /// — the admitted credential's authorization deadline and the established
+    /// transport's client-trust retirement — exactly as
+    /// `handle_tcp_connection_inner` bounds DNS resolution and the backend
+    /// dial/handshake (issues #3816, #3857).
+    pub async fn tcp_setup_stage_within_bounds_for_test<F>(
+        plan: Option<crate::proxy::auth_lifetime::StreamAuthDeadline>,
+        client_trust: Option<&crate::tls::ClientTrustSession>,
+        stage: F,
+    ) -> Result<F::Output, StreamSetupInterruptForTest>
+    where
+        F: std::future::Future,
+    {
+        crate::proxy::tcp_proxy::within_stream_setup_bounds(plan, client_trust, stage)
+            .await
+            .map_err(map_stream_setup_interrupt_for_test)
+    }
+
+    /// Wait out one connect-retry backoff under both post-admission bounds,
+    /// exactly as the TCP setup loop does.
+    pub async fn tcp_retry_backoff_within_bounds_for_test(
+        plan: Option<crate::proxy::auth_lifetime::StreamAuthDeadline>,
+        client_trust: Option<&crate::tls::ClientTrustSession>,
+        delay: std::time::Duration,
+    ) -> Result<(), StreamSetupInterruptForTest> {
+        use crate::proxy::tcp_proxy::retry_backoff_within_stream_setup_bounds;
+
+        retry_backoff_within_stream_setup_bounds(plan, client_trust, delay)
+            .await
+            .map_err(map_stream_setup_interrupt_for_test)
+    }
+
+    /// Why the inspected decrypted prefix was not forwarded to the backend.
+    #[derive(Debug)]
+    pub enum PrefixForwardRejectForTest {
+        /// The frontend client-certificate trust decision was withdrawn.
+        TrustWithdrawn,
+        /// The backend leg failed — genuine backend evidence.
+        Io(std::io::Error),
+    }
+
+    /// Forward the decrypted inspection prefix behind the established
+    /// transport's trust fence, exactly as the TCP+TLS setup path does before
+    /// the relay starts (issue #3857).
+    pub async fn tcp_forward_prefix_under_trust_fence_for_test<W>(
+        writer: &mut W,
+        prefix: &[u8],
+        client_trust: Option<&crate::tls::ClientTrustSession>,
+    ) -> Result<(), PrefixForwardRejectForTest>
+    where
+        W: tokio::io::AsyncWrite + Unpin + ?Sized,
+    {
+        crate::proxy::tcp_proxy::forward_inspected_prefix_under_trust_fence(
+            writer,
+            prefix,
+            client_trust,
+        )
+        .await
+        .map_err(|reject| match reject {
+            crate::proxy::tcp_proxy::PrefixForwardReject::TrustWithdrawn => {
+                PrefixForwardRejectForTest::TrustWithdrawn
+            }
+            crate::proxy::tcp_proxy::PrefixForwardReject::Io(error) => {
+                PrefixForwardRejectForTest::Io(error)
+            }
+        })
+    }
+
+    /// Settle a client-trust withdrawal observed during TCP setup, exactly as
+    /// every admission and setup fence does: the fixed-cardinality fence
+    /// counter is recorded once per connection through the shared latch, and
+    /// the returned error carries the typed client-side setup kind.
+    pub fn tcp_settle_stream_trust_withdrawal_for_test(
+        client_trust: Option<&crate::tls::ClientTrustSession>,
+        settled: &std::sync::atomic::AtomicBool,
+    ) -> anyhow::Error {
+        crate::proxy::tcp_proxy::settle_stream_trust_withdrawal(client_trust, settled)
+    }
+
     /// Kernel splice/IORING is legal only for an unauthenticated plain TCP
     /// session. An admitted principal always takes the userspace deadline-aware
     /// relay (issue #3816).
