@@ -1011,6 +1011,55 @@ fn client_send_output_drain_needs_another_round(
         && drain_round_exhausted
 }
 
+/// Whether `data` can open a new DTLS demux session.
+///
+/// The recv loop previously spawned on any 13-byte handshake record
+/// (`content-type == 0x16`). After a refused client certificate the peer keeps
+/// retransmitting flight 5 (`Certificate` / `CertificateVerify` / `Finished`),
+/// which are also `0x16`. Each of those datagrams reserved a `handshake_timeout`
+/// slot, allocated four channels, and started a driver whose `Dtls::new_auto`
+/// engine then failed on a non-ClientHello — a spawn storm that, under coverage
+/// instrumentation, delayed the next legitimate ClientHello past its budget,
+/// and a leftover unconnected session at the same UDP 4-tuple would swallow a
+/// later client's opening flight instead of starting a new handshake.
+///
+/// Only the initial fragment of a ClientHello (`msg_type == 0x01`,
+/// `fragment_offset == 0`) starts a session. Continuation fragments and later
+/// handshake messages from an unknown peer are dropped; DTLS retransmission of
+/// a real ClientHello recovers loss. HelloVerifyRequest cookie retries are
+/// ClientHellos too, so they still open (or continue) a session.
+fn dtls_datagram_opens_session(data: &[u8]) -> bool {
+    // DTLS record header: content_type (1) + version (2) + epoch (2) +
+    //                     sequence_number (6) + length (2) = 13 bytes
+    if data.len() < 13 || data[0] != 0x16 {
+        return false;
+    }
+    let record_len = u16::from_be_bytes([data[11], data[12]]) as usize;
+    let Some(handshake) = data.get(13..13 + record_len.min(data.len() - 13)) else {
+        return false;
+    };
+    // DTLS handshake header: msg_type (1) + length (3) + message_seq (2) +
+    //                        fragment_offset (3) + fragment_length (3) = 12 bytes
+    if handshake.len() < 12 {
+        return false;
+    }
+    // msg_type 0x01 = ClientHello. Certificate (0x0b), Finished (0x14), and
+    // every other handshake type must not reserve a session for an unknown peer.
+    if handshake[0] != 0x01 {
+        return false;
+    }
+    let fragment_offset = ((handshake[6] as usize) << 16)
+        | ((handshake[7] as usize) << 8)
+        | (handshake[8] as usize);
+    fragment_offset == 0
+}
+
+/// Pin the ClientHello-only demux admission predicate for external hosted tests.
+#[allow(dead_code)] // used through library `_test_support`
+pub(crate) fn dtls_datagram_opens_session_for_test(data: &[u8]) -> bool {
+    dtls_datagram_opens_session(data)
+}
+
 /// Pin the fairness-boundary decision for external hosted tests without
 /// exposing it as runtime API.
 #[allow(dead_code)] // used through library `_test_support`
@@ -2367,7 +2416,7 @@ impl DtlsServer {
                         "DTLS session channel full; dropping datagram"
                     );
                 }
-                Err(mpsc::error::TrySendError::Closed(_)) => {
+                Err(mpsc::error::TrySendError::Closed(data)) => {
                     // Driver task exited — remove this generation only.
                     // A replacement may already occupy the peer address.
                     remove_session(
@@ -2377,21 +2426,32 @@ impl DtlsServer {
                         &peer_addr,
                         generation,
                     );
+                    // A ClientHello that raced the teardown would otherwise be
+                    // dropped, forcing the peer to wait for its retransmit
+                    // timer. If this generation still owned the map entry,
+                    // start the replacement handshake from this datagram
+                    // instead of waiting. A newer generation already in the
+                    // map must not be replaced.
+                    if self.sessions.get(&peer_addr).is_none()
+                        && dtls_datagram_opens_session(&data)
+                    {
+                        self.spawn_session(peer_addr, data, reply_local, forwarded_client);
+                    }
                 }
             }
-        } else if len >= 13 && data[0] == 0x16 {
-            // New client — spawn a session driver. Only for datagrams that
-            // plausibly start a DTLS handshake (content-type 0x16 with a
-            // full 13-byte record header): spawning reserves a
+        } else if dtls_datagram_opens_session(&data) {
+            // New client — spawn a session driver. Only the initial fragment
+            // of a ClientHello starts a handshake: spawning reserves a
             // `max_sessions` slot, allocates four channels, and holds the
-            // slot for the handshake timeout, so arbitrary garbage from
-            // scanners or spoofed floods must not reach it.
+            // slot for the handshake timeout, so later handshake records
+            // (a refused peer's Certificate/Finished retransmits) and
+            // scanner garbage must not reach it.
             self.spawn_session(peer_addr, data, reply_local, forwarded_client);
         } else {
             trace!(
                 client = %peer_addr,
                 len,
-                "DTLS: dropping non-handshake datagram from unknown source"
+                "DTLS: dropping non-ClientHello datagram from unknown source"
             );
         }
     }
@@ -3438,6 +3498,12 @@ fn validate_client_cert(
 /// produces are written. If that bounded discard does not reach the end of the
 /// queue, nothing is written at all, because a leftover record could still be
 /// part of that flight.
+///
+/// dimpl's `close()` during an in-progress handshake aborts without queuing an
+/// alert (no authenticated channel exists yet). The refused peer therefore
+/// retransmits flight 5. Those records are handshake content-type `0x16` but
+/// not ClientHellos; [`dtls_datagram_opens_session`] must drop them so they
+/// cannot spawn replacement sessions that occupy this peer address.
 ///
 /// This makes the refusal fail closed at the DTLS 1.2 protocol boundary. In
 /// DTLS 1.3 the server's Finished belongs to an earlier flight and has

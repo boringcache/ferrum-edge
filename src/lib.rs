@@ -9093,6 +9093,15 @@ pub mod _test_support {
         )
     }
 
+    /// Whether one UDP datagram may open a new frontend DTLS demux session.
+    ///
+    /// Only the initial fragment of a ClientHello is admitted. Later handshake
+    /// records from an unknown peer (a refused client's Certificate/Finished
+    /// retransmits) must not reserve a handshake-timeout slot.
+    pub fn dtls_datagram_opens_session_for_test(data: &[u8]) -> bool {
+        crate::dtls::dtls_datagram_opens_session_for_test(data)
+    }
+
     /// External regression coverage for issue #2959 (DTLS demux identity-aware
     /// session removal). See
     /// [`crate::dtls::dtls_stale_session_removal_preserves_newer_generation_for_test`].

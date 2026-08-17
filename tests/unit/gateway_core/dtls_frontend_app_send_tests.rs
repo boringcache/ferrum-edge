@@ -871,6 +871,51 @@ fn refused_dtls_handshakes_never_commit_the_server_final_flight() {
     );
 }
 
+/// After a refused client certificate, flight-5 retransmits are still handshake
+/// records (`content-type 0x16`). Spawning a session on any such record reserved
+/// a handshake-timeout slot for a half-open engine that then swallowed a later
+/// ClientHello at the same UDP 4-tuple. Pin the demux gate to the ClientHello
+/// predicate and the Closed-arm re-dispatch of an opening datagram.
+#[test]
+fn dtls_demux_opens_sessions_only_on_client_hello() {
+    let dispatch = DTLS_SOURCE
+        .split("} else if dtls_datagram_opens_session(&data) {")
+        .nth(1)
+        .expect("ClientHello demux spawn arm")
+        .split("fn spawn_session(")
+        .next()
+        .expect("spawn_session follows demux");
+    assert!(
+        dispatch.contains("self.spawn_session(peer_addr, data, reply_local, forwarded_client);"),
+        "a ClientHello from an unknown peer must still spawn a session"
+    );
+    assert!(
+        !dispatch.contains("data[0] == 0x16"),
+        "content-type 0x16 alone must not open a session: Certificate/Finished retransmits \
+         are also handshake records"
+    );
+
+    let closed = DTLS_SOURCE
+        .split("Err(mpsc::error::TrySendError::Closed(data)) => {")
+        .nth(1)
+        .expect("Closed-arm re-dispatch")
+        .split("} else if dtls_datagram_opens_session(&data) {")
+        .next()
+        .expect("Closed arm ends before unknown-peer spawn");
+    assert!(
+        closed.contains("dtls_datagram_opens_session(&data)"),
+        "a ClientHello that raced driver teardown must be eligible to start a replacement"
+    );
+    assert!(
+        closed.contains("self.sessions.get(&peer_addr).is_none()"),
+        "Closed-arm re-dispatch must not replace a newer generation already in the map"
+    );
+    assert!(
+        closed.contains("self.spawn_session(peer_addr, data, reply_local, forwarded_client);"),
+        "Closed-arm re-dispatch of a ClientHello must spawn rather than drop the opening flight"
+    );
+}
+
 fn registered_frontend_dtls_session() -> ferrum_edge::tls::ClientTrustSessionGuard {
     client_trust::arm_at_generation_for_test(ClientTrustScope::FrontendDtls, 1);
     client_trust::capture(ClientTrustScope::FrontendDtls)

@@ -1090,6 +1090,12 @@ struct Dtls12ClientOutcome {
     /// server's final flight reached it and the handshake actually completed.
     connected: bool,
     echo: Option<Vec<u8>>,
+    /// Why the raw client stopped processing records, if it did. A refused
+    /// handshake may produce a fatal alert or an unreadable epoch-1 record;
+    /// neither is a transport failure of the test driver. An accepted control
+    /// that never reaches `Connected` must still surface this so a silent
+    /// `handle_packet` error cannot be mistaken for a timeout.
+    transport_error: Option<String>,
 }
 
 /// Drive a raw dimpl **DTLS 1.2** client presenting `certificate`.
@@ -1102,8 +1108,9 @@ struct Dtls12ClientOutcome {
 /// would negotiate 1.3 against Ferrum's auto-sensing server and prove nothing.
 ///
 /// A refused handshake is expected to yield either nothing at all or a record
-/// this client cannot process. Neither is a transport failure worth reporting:
-/// only `connected` answers the question being asked.
+/// this client cannot process. Neither is a transport failure of the assertion:
+/// only `connected` answers the question being asked. `transport_error` is
+/// recorded so a later accepted control that stalls is diagnosable.
 async fn dtls12_client_handshake(
     server_addr: std::net::SocketAddr,
     certificate: dimpl::DtlsCertificateChain,
@@ -1112,7 +1119,19 @@ async fn dtls12_client_handshake(
 ) -> Result<Dtls12ClientOutcome, anyhow::Error> {
     let socket = UdpSocket::bind("127.0.0.1:0").await?;
     socket.connect(server_addr).await?;
+    dtls12_client_handshake_on(socket, certificate, budget, payload).await
+}
 
+/// Same driver as [`dtls12_client_handshake`], on a caller-owned connected
+/// socket. The refusal test reserves the accepted client's UDP port before the
+/// withdrawn peer starts so a leftover demux entry at a recycled ephemeral
+/// port cannot swallow the positive control.
+async fn dtls12_client_handshake_on(
+    socket: UdpSocket,
+    certificate: dimpl::DtlsCertificateChain,
+    budget: Duration,
+    payload: Option<&[u8]>,
+) -> Result<Dtls12ClientOutcome, anyhow::Error> {
     let config = Arc::new(
         dimpl::Config::builder()
             .use_server_cookie(false)
@@ -1141,6 +1160,7 @@ async fn dtls12_client_handshake(
 
     let handshake_deadline = Instant::now() + budget;
     let mut transport_ended = false;
+    let mut transport_error = None;
     while Instant::now() < handshake_deadline && !connected && !transport_ended {
         let remaining = handshake_deadline.saturating_duration_since(Instant::now());
         let sleep_dur = next_timeout
@@ -1151,7 +1171,8 @@ async fn dtls12_client_handshake(
         tokio::select! {
             result = socket.recv(&mut udp_buf) => {
                 let len = result?;
-                if client.handle_packet(&udp_buf[..len]).is_err() {
+                if let Err(e) = client.handle_packet(&udp_buf[..len]) {
+                    transport_error = Some(e.to_string());
                     transport_ended = true;
                 }
             }
@@ -1159,7 +1180,8 @@ async fn dtls12_client_handshake(
                 if let Some(t) = next_timeout
                     && Instant::now() >= t
                 {
-                    if client.handle_timeout(Instant::now()).is_err() {
+                    if let Err(e) = client.handle_timeout(Instant::now()) {
+                        transport_error = Some(e.to_string());
                         transport_ended = true;
                     }
                     next_timeout = None;
@@ -1182,6 +1204,7 @@ async fn dtls12_client_handshake(
         return Ok(Dtls12ClientOutcome {
             connected: false,
             echo: None,
+            transport_error,
         });
     }
 
@@ -1189,6 +1212,7 @@ async fn dtls12_client_handshake(
         return Ok(Dtls12ClientOutcome {
             connected: true,
             echo: None,
+            transport_error: None,
         });
     };
 
@@ -1240,6 +1264,7 @@ async fn dtls12_client_handshake(
     Ok(Dtls12ClientOutcome {
         connected: true,
         echo: received,
+        transport_error: None,
     })
 }
 
@@ -1336,6 +1361,17 @@ async fn test_frontend_dtls_refuses_untrusted_client_without_completing_the_hand
         }
     });
 
+    // Reserve the accepted client's UDP port before the withdrawn peer starts
+    // so a leftover demux session at a recycled ephemeral port cannot swallow
+    // the positive-control ClientHello.
+    let accepted_socket = UdpSocket::bind("127.0.0.1:0")
+        .await
+        .expect("reserve accepted client port");
+    accepted_socket
+        .connect(server_addr)
+        .await
+        .expect("connect accepted client");
+
     let refused = dtls12_client_handshake(
         server_addr,
         withdrawn_chain,
@@ -1359,8 +1395,8 @@ async fn test_frontend_dtls_refuses_untrusted_client_without_completing_the_hand
         "a refused handshake must never be delivered through accept()"
     );
 
-    let admitted = dtls12_client_handshake(
-        server_addr,
+    let admitted = dtls12_client_handshake_on(
+        accepted_socket,
         accepted_chain,
         Duration::from_secs(10),
         Some(&b"accepted-ca-ok"[..]),
@@ -1369,7 +1405,9 @@ async fn test_frontend_dtls_refuses_untrusted_client_without_completing_the_hand
     .expect("drive accepted DTLS 1.2 client");
     assert!(
         admitted.connected,
-        "a certificate from the currently accepted client CA must still complete the handshake"
+        "a certificate from the currently accepted client CA must still complete the \
+         handshake (transport_error={:?})",
+        admitted.transport_error
     );
     assert_eq!(
         admitted.echo.as_deref(),
