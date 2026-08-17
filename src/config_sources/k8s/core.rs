@@ -733,6 +733,64 @@ pub(super) fn endpoint_route_backends_for_service(
     backends
 }
 
+/// Dial port used when a Service backend cannot expand onto ready endpoints
+/// and therefore falls back to cluster DNS.
+///
+/// ClusterIP Services — including selectorless ones backed by manual
+/// EndpointSlices — keep `service_port`. kube-proxy / the CNI maps that port
+/// onto each endpoint's targetPort, so Ferrum can keep dialing the stable
+/// Service DNS name even before (or without) seeing the slices.
+///
+/// Headless Services (`spec.clusterIP: None`) have no VIP. CoreDNS returns
+/// ready endpoint addresses, which listen on `targetPort`, not `service_port`.
+/// Falling back to the Service port here is what made Gateway API conformance
+/// `HTTPRouteServiceTypes` `/headless-manual-endpointslices` fail closed with
+/// `connection_failure`: empty manual slices translated to
+/// `headless-manual-endpointslices.….svc:8080`, CoreDNS later returned the
+/// pod IP, and Ferrum kept dialing `:8080` while the echo container listened
+/// on `:3000`. Selector-based headless Services avoid this because
+/// kube-controller-manager populates EndpointSlices before first translation,
+/// so expansion uses targetPort. Manual slices are patched *after* the route
+/// is Accepted, so DNS fallback must already carry the container port.
+pub(super) fn service_dns_fallback_dial_port(
+    acc: &K8sAccumulator,
+    namespace: &str,
+    service_name: &str,
+    service_port: u16,
+) -> u16 {
+    let Some(service_key) = K8sServiceKey::new(namespace.to_string(), service_name.to_string())
+    else {
+        return service_port;
+    };
+    let Some(service) = acc.core.services.get(&service_key) else {
+        return service_port;
+    };
+    if !service.cluster_ips.is_empty() {
+        return service_port;
+    }
+
+    let service_port_spec = service
+        .ports
+        .iter()
+        .find(|candidate| candidate.port == service_port);
+    if let Some(port) = acc
+        .core
+        .endpoint_slices
+        .iter()
+        .filter(|slice| {
+            slice.service_key == service_key
+                && slice.backend_kind == EndpointSliceBackendKind::Service
+        })
+        .find_map(|slice| endpoint_backend_port(service_port_spec, service_port, slice))
+    {
+        return port;
+    }
+    match service_port_spec.and_then(|port| port.target_port.as_ref()) {
+        Some(ServiceTargetPort::Number(port)) if *port != 0 => *port,
+        _ => service_port,
+    }
+}
+
 /// Expand an MCS `ServiceImport` onto ready EndpointSlice addresses.
 ///
 /// Slices are selected by `multicluster.kubernetes.io/service-name`. Unlike
