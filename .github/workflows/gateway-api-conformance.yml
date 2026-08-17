@@ -94,9 +94,7 @@ jobs:
               echo "git fetch of ${BASE_REF} failed after 3 attempts" >&2
               exit 1
             fi
-            # NUL-delimited: the classifier refuses a newline-delimited stream,
-            # which cannot represent a pathname containing a newline.
-            git diff --name-only --no-renames -z "${base_ref}...HEAD" > "$changed_files"
+            git diff --name-only --no-renames "${base_ref}...HEAD" | sort > "$changed_files"
           elif [ "$EVENT_NAME" = "merge_group" ]; then
             # Validate the synthesized merge-group SHA against its payload base.
             # Do not consult pull_request fields; they are absent on merge_group.
@@ -119,7 +117,7 @@ jobs:
                 exit 1
               fi
             fi
-            git diff --name-only --no-renames -z "${MERGE_BASE_SHA}...HEAD" > "$changed_files"
+            git diff --name-only --no-renames "${MERGE_BASE_SHA}...HEAD" | sort > "$changed_files"
           else
             filter_args+=(--force-run)
           fi

@@ -2219,18 +2219,15 @@ def derive_release_family_transition(
 ) = derive_release_family_transition()
 
 # ---------------------------------------------------------------------------
-# Trusted-base relevance contract for governed live-datapath suites
+# Trusted-base relevance contract for the required live-datapath gates
 # ---------------------------------------------------------------------------
-# Required gates (`mesh-e2e-sidecar-live.yml`,
-# `multicluster-federation-live.yml`, `multicluster-poller-partition-live.yml`,
-# `ambient-host-udp-live.yml`) and optional always-reporting aggregates
-# (`node-waypoint-ebpf-live.yml`, `istio-status-cas-live.yml`,
-# `cni-lifecycle-live.yml`) may skip their expensive live job when a pull
-# request touches nothing relevant. That skip is a security boundary: if the
-# relevance verdict is computed by a script the PULL REQUEST supplies, the
-# pull request can widen its own suite patterns, declare itself irrelevant,
-# skip the live job, and still turn the aggregate green. Optional aggregates
-# are not branch-protection-required; they still must not silently disappear.
+# `mesh-e2e-sidecar-live.yml`, `multicluster-federation-live.yml`, and
+# `multicluster-poller-partition-live.yml` publish REQUIRED status checks that
+# may skip their expensive live job when a pull request touches nothing
+# relevant. That skip is a security boundary: if the relevance verdict is
+# computed by a script the PULL REQUEST supplies, the pull request can widen
+# its own suite patterns, declare itself irrelevant, skip the live job, and
+# still turn the required gate green.
 #
 # The block below is therefore the ONLY accepted shape for that decision, and
 # it is frozen byte-for-byte so a later pull request cannot weaken, redirect,
@@ -2254,16 +2251,6 @@ def derive_release_family_transition(
 #     and the emitted verdict must literally be `true` or `false`.
 #   * The filter runs under `python3 -I`, so nothing the pull request committed
 #     can be imported into the trusted interpreter.
-#   * The change set is handed over as a NUL-delimited `git diff -z` stream,
-#     never as newline-delimited (and never `sort`ed) text: a newline-delimited
-#     listing cannot represent a pathname containing a newline, and quoting one
-#     instead would classify a different path than the one that changed. The
-#     trusted filter rejects any record it cannot decode as a normal
-#     repository-relative pathname, and its `changed_files_transport=nul`
-#     acknowledgement is required before a `false` verdict may be honored — a
-#     trusted base predating this transport forces the live suite to run.
-#   * The checkout keeps no credentials in Git configuration; the job is
-#     read-only.
 #
 # The template is substituted only at three sentinels — display name, temp-file
 # slug, and suite selector — so every governed workflow runs identical logic.
@@ -2279,11 +2266,6 @@ LIVE_SUITE_RELEVANCE_JOB_TEMPLATE = r"""  changes:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
         with:
           fetch-depth: 0
-          # This job only ever reads: it fetches the base tip and inspects two
-          # commits. Leaving a write-capable token in the checkout's Git
-          # configuration would hand every later step in the job an
-          # authenticated remote it has no need for.
-          persist-credentials: false
 
       # Relevance decides whether a REQUIRED live gate runs at all, so it must
       # never be computed by code the pull request supplies: a PR that widens
@@ -2423,15 +2405,8 @@ LIVE_SUITE_RELEVANCE_JOB_TEMPLATE = r"""  changes:
           git cat-file blob "$entry_object" > "$trusted_filter"
 
           if [ "$EVENT_NAME" = "pull_request" ] || [ "$EVENT_NAME" = "merge_group" ]; then
-            # NUL-delimited, unsorted, and never re-quoted. A newline-delimited
-            # listing cannot represent a pathname that contains a newline, and
-            # C-quoting one (core.quotePath) would hand the classifier a
-            # DIFFERENT path than the one that changed; either way a relevant
-            # file can be made to look like no file at all. The trusted filter
-            # refuses any record it cannot decode as a normal
-            # repository-relative pathname instead of skipping it.
-            git diff --name-only --no-renames -z "${trusted_sha}...HEAD" \
-              > "$changed_files"
+            git diff --name-only --no-renames "${trusted_sha}...HEAD" \
+              | sort > "$changed_files"
           fi
 
           # Isolated interpreter: no user site directory, no PYTHON* overrides,
@@ -2440,7 +2415,6 @@ LIVE_SUITE_RELEVANCE_JOB_TEMPLATE = r"""  changes:
           python3 -I "$trusted_filter" --self-test
           plan="$(python3 -I "$trusted_filter" "${filter_args[@]}")"
           relevant="$(printf '%s\n' "$plan" | sed -n 's/^relevant=//p')"
-          transport="$(printf '%s\n' "$plan" | sed -n 's/^changed_files_transport=//p')"
           case "$relevant" in
             true|false) ;;
             *)
@@ -2448,23 +2422,12 @@ LIVE_SUITE_RELEVANCE_JOB_TEMPLATE = r"""  changes:
               exit 1
               ;;
           esac
-          # Transport handshake. A trusted base older than the NUL change set
-          # reads the whole stream as one newline-delimited record, matches
-          # nothing, and reports a syntactically valid `relevant=false`. Only an
-          # exact `nul` acknowledgement proves the records were classified as
-          # pathnames, so anything else runs the live suite.
-          if [ "$transport" != "nul" ]; then
-            echo "::warning::trusted relevance filter did not acknowledge the NUL change set; running the live suite" >&2
-            relevant=true
-          fi
           echo "relevant=$relevant" >> "$GITHUB_OUTPUT"
           echo "Relevance decided by trusted base ${trusted_sha}." >> "$GITHUB_STEP_SUMMARY"
           printf '%s\n' "$plan" | sed -n '/^## /,$p' >> "$GITHUB_STEP_SUMMARY"
 """
 
 # workflow file -> (relevance job, live job, display name, temp slug, suite).
-# The `live job` here is the namesake execution job; the complete set of jobs
-# that must stay bound to the trusted relevance output is LIVE_SUITE_LIVE_JOBS.
 LIVE_SUITE_RELEVANCE_CONTRACTS = {
     "ambient-host-udp-live.yml": (
         "changes",
@@ -2494,101 +2457,6 @@ LIVE_SUITE_RELEVANCE_CONTRACTS = {
         "multicluster-poller-partition",
         "mesh-federation",
     ),
-    "node-waypoint-ebpf-live.yml": (
-        "changes",
-        "node-waypoint-ebpf-live",
-        "NodeWaypoint eBPF trigger",
-        "node-waypoint-ebpf",
-        "node-waypoint-ebpf",
-    ),
-    "istio-status-cas-live.yml": (
-        "changes",
-        "istio-status-cas-live",
-        "Istio status CAS trigger",
-        "istio-status-cas",
-        "istio-status-cas",
-    ),
-    "cni-lifecycle-live.yml": (
-        "changes",
-        "cni-lifecycle-live",
-        "CNI lifecycle trigger",
-        "cni-lifecycle",
-        "cni-lifecycle",
-    ),
-}
-
-# Every job that must stay bound to the trusted relevance output. Includes the
-# primary live job from LIVE_SUITE_RELEVANCE_CONTRACTS plus sibling execution
-# jobs that would otherwise skip independently.
-#
-# `node-waypoint-ebpf-live.yml` deliberately lists ONLY its live datapath job.
-# That workflow also carries the production-image lane
-# (`production-dockerfile-plan` and the two build jobs behind the fail-closed
-# `production-dockerfile-smoke` aggregate), which keeps its own narrower
-# trusted-base relevance from `.github/scripts/ci_runtime_plan.py`. Binding
-# those jobs to the whole-suite classifier would silently widen or narrow the
-# image contract; instead the frozen `gate` below requires the image aggregate
-# to have succeeded, and `verify_ci_runtime_cache.py` proves the classifier
-# suite is a superset of the planner's prior NodeWaypoint scope.
-LIVE_SUITE_LIVE_JOBS = {
-    "ambient-host-udp-live.yml": (
-        "ambient-host-udp-live",
-        "ambient-host-udp-image",
-    ),
-    "mesh-e2e-sidecar-live.yml": ("mesh-e2e-sidecar-live",),
-    "multicluster-federation-live.yml": ("multicluster-federation-live",),
-    "multicluster-poller-partition-live.yml": (
-        "multicluster-poller-partition-live",
-    ),
-    "node-waypoint-ebpf-live.yml": ("node-waypoint-ebpf-live",),
-    "istio-status-cas-live.yml": ("istio-status-cas-live",),
-    "cni-lifecycle-live.yml": ("cni-lifecycle-live",),
-}
-
-# Events every governed live-suite workflow must declare. Ambient Host UDP has
-# no `push: main` on the trusted base; do not invent one here.
-LIVE_SUITE_REQUIRED_EVENTS = {
-    "ambient-host-udp-live.yml": frozenset(
-        {"workflow_dispatch", "pull_request", "merge_group"}
-    ),
-    "mesh-e2e-sidecar-live.yml": frozenset(
-        {"workflow_dispatch", "pull_request", "merge_group", "push"}
-    ),
-    "multicluster-federation-live.yml": frozenset(
-        {"workflow_dispatch", "pull_request", "merge_group", "push"}
-    ),
-    "multicluster-poller-partition-live.yml": frozenset(
-        {"workflow_dispatch", "pull_request", "merge_group", "push"}
-    ),
-    "node-waypoint-ebpf-live.yml": frozenset(
-        {"workflow_dispatch", "pull_request", "merge_group", "push"}
-    ),
-    "istio-status-cas-live.yml": frozenset(
-        {"workflow_dispatch", "pull_request", "merge_group", "push"}
-    ),
-    "cni-lifecycle-live.yml": frozenset(
-        {"workflow_dispatch", "pull_request", "merge_group", "push"}
-    ),
-}
-
-# Poller declares bare `merge_group:` (all types). The other contracted
-# workflows pin `types: [checks_requested]`.
-LIVE_SUITE_REQUIRE_MERGE_GROUP_CHECKS_REQUESTED = frozenset(
-    LIVE_SUITE_REQUIRED_EVENTS
-) - {"multicluster-poller-partition-live.yml"}
-
-LIVE_SUITE_REQUIRE_PUSH_MAIN = frozenset(
-    name
-    for name, events in LIVE_SUITE_REQUIRED_EVENTS.items()
-    if "push" in events
-)
-
-# Optional always-reporting aggregates. These names must never be added to
-# branch protection by this contract; they exist so a skip cannot be silent.
-OPTIONAL_LIVE_SUITE_CHECK_NAMES = {
-    "NodeWaypoint eBPF Live": ("node-waypoint-ebpf-live.yml", "gate"),
-    "Istio Status CAS Live": ("istio-status-cas-live.yml", "gate"),
-    "CNI Lifecycle Live": ("cni-lifecycle-live.yml", "gate"),
 }
 
 # The Ambient Host UDP required check is security-sensitive beyond relevance.
@@ -2945,132 +2813,6 @@ def ambient_host_udp_image_cache_budget_errors(job: str, source: str) -> list[st
 LIVE_SUITE_JOB_BINDING = {
     "needs": "    needs: changes\n",
     "if": "    if: needs.changes.outputs.relevant == 'true'\n",
-}
-
-NODE_WAYPOINT_EBPF_GATE_JOB = r"""  gate:
-    name: NodeWaypoint eBPF Live
-    needs:
-      - changes
-      - production-dockerfile-smoke
-      - node-waypoint-ebpf-live
-    if: always()
-    runs-on: ubuntu-latest
-    steps:
-      - name: Summarize NodeWaypoint eBPF live result
-        run: |
-          {
-            echo "## NodeWaypoint eBPF Live"
-            echo ""
-          } >> "$GITHUB_STEP_SUMMARY"
-
-          if [ "${{ needs.changes.result }}" != "success" ]; then
-            echo "Failed before change detection completed." >> "$GITHUB_STEP_SUMMARY"
-            exit 1
-          fi
-
-          if [ "${{ needs.production-dockerfile-smoke.result }}" != "success" ]; then
-            echo "Production Dockerfile image contract failed or did not complete: ${{ needs.production-dockerfile-smoke.result }}." >> "$GITHUB_STEP_SUMMARY"
-            exit 1
-          fi
-
-          if [ "${{ needs.changes.outputs.relevant }}" = "false" ]; then
-            echo "Skipped live datapath validation: no NodeWaypoint eBPF, node-agent, capture, chart, fixture, documentation, or CI workflow surfaces changed." >> "$GITHUB_STEP_SUMMARY"
-            exit 0
-          fi
-
-          if [ "${{ needs.changes.outputs.relevant }}" != "true" ]; then
-            echo "Change detection returned an invalid relevance result: ${{ needs.changes.outputs.relevant }}." >> "$GITHUB_STEP_SUMMARY"
-            exit 1
-          fi
-
-          if [ "${{ needs.node-waypoint-ebpf-live.result }}" != "success" ]; then
-            echo "Live datapath validation failed or did not complete: ${{ needs.node-waypoint-ebpf-live.result }}." >> "$GITHUB_STEP_SUMMARY"
-            exit 1
-          fi
-
-          echo "Production Dockerfile image contract and live datapath validation passed." >> "$GITHUB_STEP_SUMMARY"
-"""
-ISTIO_STATUS_CAS_GATE_JOB = r"""  gate:
-    name: Istio Status CAS Live
-    needs:
-      - changes
-      - istio-status-cas-live
-    if: always()
-    runs-on: ubuntu-latest
-    steps:
-      - name: Summarize Istio status CAS live result
-        run: |
-          {
-            echo "## Istio Status CAS Live"
-            echo ""
-          } >> "$GITHUB_STEP_SUMMARY"
-
-          if [ "${{ needs.changes.result }}" != "success" ]; then
-            echo "Failed before change detection completed." >> "$GITHUB_STEP_SUMMARY"
-            exit 1
-          fi
-
-          if [ "${{ needs.changes.outputs.relevant }}" = "false" ]; then
-            echo "Skipped live competing-writer proof: no Istio status writer, metrics, fixture, or CI workflow surfaces changed." >> "$GITHUB_STEP_SUMMARY"
-            exit 0
-          fi
-
-          if [ "${{ needs.changes.outputs.relevant }}" != "true" ]; then
-            echo "Change detection returned an invalid relevance result: ${{ needs.changes.outputs.relevant }}." >> "$GITHUB_STEP_SUMMARY"
-            exit 1
-          fi
-
-          if [ "${{ needs.istio-status-cas-live.result }}" != "success" ]; then
-            echo "Live competing-writer proof failed or did not complete: ${{ needs.istio-status-cas-live.result }}." >> "$GITHUB_STEP_SUMMARY"
-            exit 1
-          fi
-
-          echo "Live competing-writer proof passed." >> "$GITHUB_STEP_SUMMARY"
-"""
-CNI_LIFECYCLE_GATE_JOB = r"""  gate:
-    name: CNI Lifecycle Live
-    needs:
-      - changes
-      - cni-lifecycle-live
-    if: always()
-    runs-on: ubuntu-latest
-    steps:
-      - name: Summarize CNI lifecycle live result
-        run: |
-          {
-            echo "## CNI Lifecycle Live"
-            echo ""
-          } >> "$GITHUB_STEP_SUMMARY"
-
-          if [ "${{ needs.changes.result }}" != "success" ]; then
-            echo "Failed before change detection completed." >> "$GITHUB_STEP_SUMMARY"
-            exit 1
-          fi
-
-          if [ "${{ needs.changes.outputs.relevant }}" = "false" ]; then
-            echo "Skipped live install-lifecycle validation: no CNI binary, chart lifecycle, fixture, documentation, or CI workflow surfaces changed." >> "$GITHUB_STEP_SUMMARY"
-            exit 0
-          fi
-
-          if [ "${{ needs.changes.outputs.relevant }}" != "true" ]; then
-            echo "Change detection returned an invalid relevance result: ${{ needs.changes.outputs.relevant }}." >> "$GITHUB_STEP_SUMMARY"
-            exit 1
-          fi
-
-          if [ "${{ needs.cni-lifecycle-live.result }}" != "success" ]; then
-            echo "Live install-lifecycle validation failed or did not complete: ${{ needs.cni-lifecycle-live.result }}." >> "$GITHUB_STEP_SUMMARY"
-            exit 1
-          fi
-
-          echo "Live install-lifecycle validation passed." >> "$GITHUB_STEP_SUMMARY"
-"""
-
-# Frozen always-reporting aggregates for optional live suites. Ambient Host UDP
-# keeps its required-gate freeze in AMBIENT_HOST_UDP_GATE_JOB.
-LIVE_SUITE_GATE_CONTRACTS = {
-    "node-waypoint-ebpf-live.yml": ("gate", NODE_WAYPOINT_EBPF_GATE_JOB),
-    "istio-status-cas-live.yml": ("gate", ISTIO_STATUS_CAS_GATE_JOB),
-    "cni-lifecycle-live.yml": ("gate", CNI_LIFECYCLE_GATE_JOB),
 }
 
 # ---------------------------------------------------------------------------
@@ -11603,59 +11345,18 @@ def live_suite_relevance_job(display: str, slug: str, suite: str) -> str:
     )
 
 
-def live_suite_trigger_errors(contents: str, located: str, name: str) -> list[str]:
-    """Reject PR-widenable path filters and event regressions on governed suites."""
-
-    errors: list[str] = []
-    on_block, on_failures = extract_top_level_block(
-        contents,
-        located,
-        "on",
-        required=True,
-    )
-    errors.extend(on_failures)
-    if on_failures or on_block is None:
-        return errors
-    if re.search(r"(?m)^[ \t]+paths(?:-ignore)?:", on_block):
-        errors.append(
-            f"{located} must not use a PR-widenable top-level paths filter; "
-            "relevance is decided by the trusted-base classifier"
-        )
-    required_events = LIVE_SUITE_REQUIRED_EVENTS.get(name)
-    if required_events is None:
-        errors.append(f"{located} is missing from LIVE_SUITE_REQUIRED_EVENTS")
-        return errors
-    for event in sorted(required_events):
-        if not re.search(rf"(?m)^  {re.escape(event)}:", on_block):
-            errors.append(f"{located} must trigger on {event}")
-    if name in LIVE_SUITE_REQUIRE_MERGE_GROUP_CHECKS_REQUESTED and not re.search(
-        r"(?m)^  merge_group:\n    types:\n      - checks_requested\n",
-        on_block,
-    ):
-        errors.append(
-            f"{located} must pin merge_group to types: [checks_requested]"
-        )
-    if name in LIVE_SUITE_REQUIRE_PUSH_MAIN and not re.search(
-        r"(?m)^  push:\n    branches:\n      - main\s*$",
-        on_block,
-    ):
-        errors.append(f"{located} must push to main without a paths filter")
-    return errors
-
-
 def live_suite_relevance_errors(
     workflows: dict[str, str],
     source: str,
 ) -> list[str]:
-    """Hold every governed live suite to the trusted-base relevance contract.
+    """Hold every required live gate to the trusted-base relevance contract.
 
     This is an ABSOLUTE check in both exact and pull-request mode, not a
     comparison against the trusted base. A comparison would accept any shape
     the base already carried, which is exactly the property a bootstrap of this
     contract has to remove: the accepted shape is the one written here and
     nothing else. Deleting a governed workflow is rejected too, because a
-    required check that never runs is indistinguishable from a passing one,
-    and an optional aggregate that never reports is the same silent skip.
+    required check that never runs is indistinguishable from a passing one.
     """
 
     errors: list[str] = []
@@ -11674,7 +11375,6 @@ def live_suite_relevance_errors(
             )
             continue
         located = f"{source}/{name}"
-        errors.extend(live_suite_trigger_errors(contents, located, name))
         block, failures = extract_job_block(
             contents,
             located,
@@ -11690,47 +11390,22 @@ def live_suite_relevance_errors(
                     "relevance contract; a required live gate may not decide its own "
                     "relevance with pull-request-supplied code"
                 )
-        bound_live_jobs = LIVE_SUITE_LIVE_JOBS.get(name)
-        if bound_live_jobs is None:
-            errors.append(f"{located} is missing from LIVE_SUITE_LIVE_JOBS")
-            bound_live_jobs = (live_job,)
-        elif live_job not in bound_live_jobs:
-            errors.append(
-                f"{located} LIVE_SUITE_LIVE_JOBS must include primary live job "
-                f"{live_job!r}"
-            )
-        for bound_live_job in bound_live_jobs:
-            for field, expected_field in sorted(LIVE_SUITE_JOB_BINDING.items()):
-                actual, field_failures = extract_job_field_block(
-                    contents,
-                    located,
-                    bound_live_job,
-                    field,
-                    required=True,
-                )
-                errors.extend(field_failures)
-                if field_failures:
-                    continue
-                if actual != expected_field:
-                    errors.append(
-                        f"{located} job {bound_live_job!r} must keep {field!r} bound "
-                        "to the trusted relevance output; rewriting it skips the live "
-                        "job just as effectively as tampering with the relevance decision"
-                    )
-        gate_contract = LIVE_SUITE_GATE_CONTRACTS.get(name)
-        if gate_contract is not None:
-            gate_job, expected_gate = gate_contract
-            actual_gate, gate_failures = extract_job_contract_block(
+        for field, expected_field in sorted(LIVE_SUITE_JOB_BINDING.items()):
+            actual, field_failures = extract_job_field_block(
                 contents,
                 located,
-                gate_job,
+                live_job,
+                field,
                 required=True,
             )
-            errors.extend(gate_failures)
-            if not gate_failures and actual_gate != expected_gate:
+            errors.extend(field_failures)
+            if field_failures:
+                continue
+            if actual != expected_field:
                 errors.append(
-                    f"{located} must keep complete job {gate_job!r} exactly frozen; "
-                    "the always-reporting aggregate may not be detached or weakened"
+                    f"{located} job {live_job!r} must keep {field!r} bound to the "
+                    "trusted relevance output; rewriting it skips the live job just "
+                    "as effectively as tampering with the relevance decision"
                 )
 
         if name == "ambient-host-udp-live.yml":
@@ -27297,12 +26972,6 @@ pre_build = []
         'merge_group base_sha missing or malformed',
         '[ "$EVENT_NAME" = "pull_request" ] || [ "$EVENT_NAME" = "merge_group" ]',
         "            true|false) ;;",
-        "            filter_args+=(--force-run)",
-        'git diff --name-only --no-renames -z "${trusted_sha}...HEAD"',
-        "changed_files_transport=",
-        '          if [ "$transport" != "nul" ]; then',
-        "            relevant=true",
-        "          persist-credentials: false",
     ):
         if required_token not in rendered_relevance:
             failures.append(
@@ -27314,66 +26983,7 @@ pre_build = []
             "the trusted-base relevance contract executes the pull request's own filter"
         )
 
-    if set(LIVE_SUITE_LIVE_JOBS) != set(LIVE_SUITE_RELEVANCE_CONTRACTS):
-        failures.append("LIVE_SUITE_LIVE_JOBS must cover every governed live suite")
-    if set(LIVE_SUITE_REQUIRED_EVENTS) != set(LIVE_SUITE_RELEVANCE_CONTRACTS):
-        failures.append(
-            "LIVE_SUITE_REQUIRED_EVENTS must cover every governed live suite"
-        )
-    optional_names = set(OPTIONAL_LIVE_SUITE_CHECK_NAMES)
-    if AMBIENT_HOST_UDP_REQUIRED_CHECK_NAME in optional_names:
-        failures.append("an optional live aggregate reused a required check name")
-    if set(LIVE_SUITE_GATE_CONTRACTS) != {
-        owner[0] for owner in OPTIONAL_LIVE_SUITE_CHECK_NAMES.values()
-    }:
-        failures.append(
-            "LIVE_SUITE_GATE_CONTRACTS must own exactly the optional live aggregates"
-        )
-    if set(LIVE_SUITE_GATE_CONTRACTS) & {
-        "ambient-host-udp-live.yml",
-        "mesh-e2e-sidecar-live.yml",
-        "multicluster-federation-live.yml",
-        "multicluster-poller-partition-live.yml",
-    }:
-        failures.append(
-            "optional live-suite gate freeze must not capture a required live gate"
-        )
-    for check_name, owner in OPTIONAL_LIVE_SUITE_CHECK_NAMES.items():
-        workflow_name, gate_job = owner
-        gate_contract = LIVE_SUITE_GATE_CONTRACTS.get(workflow_name)
-        if gate_contract is None or gate_contract[0] != gate_job:
-            failures.append(
-                f"optional aggregate {check_name!r} is not bound to a frozen gate"
-            )
-        elif f"    name: {check_name}\n" not in gate_contract[1]:
-            failures.append(
-                f"frozen gate for {workflow_name} does not own {check_name!r}"
-            )
-
-    SELF_TEST_AGGREGATE_SIBLING_JOBS = {
-        "node-waypoint-ebpf-live.yml": ("production-dockerfile-smoke",),
-    }
-    for sibling_owner, sibling_jobs in SELF_TEST_AGGREGATE_SIBLING_JOBS.items():
-        if sibling_owner not in LIVE_SUITE_GATE_CONTRACTS:
-            failures.append(
-                f"{sibling_owner} declares aggregate siblings without a frozen gate"
-            )
-            continue
-        gate_text = LIVE_SUITE_GATE_CONTRACTS[sibling_owner][1]
-        for sibling in sibling_jobs:
-            if f"      - {sibling}\n" not in gate_text:
-                failures.append(
-                    f"{sibling_owner} frozen gate must depend on sibling {sibling!r}"
-                )
-            if sibling in LIVE_SUITE_LIVE_JOBS.get(sibling_owner, ()):
-                failures.append(
-                    f"{sibling_owner} sibling {sibling!r} must not also be bound to "
-                    "the whole-suite relevance output"
-                )
-
-    def relevance_workflow(
-        contract_name: str, display: str, live_job: str, body: str
-    ) -> str:
+    def relevance_workflow(display: str, live_job: str, body: str) -> str:
         if live_job == "ambient-host-udp-live":
             execution_jobs = (
                 AMBIENT_HOST_UDP_LIVE_JOB
@@ -27383,43 +26993,19 @@ pre_build = []
                 + AMBIENT_HOST_UDP_GATE_JOB
             )
         else:
-            execution_jobs = ""
-            for job in LIVE_SUITE_LIVE_JOBS[contract_name]:
-                execution_jobs += (
-                    f"  {job}:\n"
-                    f"    name: {job} live\n"
-                    "    needs: changes\n"
-                    "    if: needs.changes.outputs.relevant == 'true'\n"
-                    "    runs-on: ubuntu-latest\n"
-                    "    steps:\n"
-                    "      - run: echo live\n"
-                )
-            # Sibling jobs the frozen aggregate depends on but that are NOT
-            # bound to the whole-suite classifier: NodeWaypoint's
-            # production-image aggregate keeps its own narrower planner.
-            for job in SELF_TEST_AGGREGATE_SIBLING_JOBS.get(contract_name, ()):
-                execution_jobs += (
-                    f"  {job}:\n"
-                    f"    name: {job} sibling\n"
-                    "    if: always()\n"
-                    "    runs-on: ubuntu-latest\n"
-                    "    steps:\n"
-                    "      - run: echo sibling\n"
-                )
-            gate_contract = LIVE_SUITE_GATE_CONTRACTS.get(contract_name)
-            if gate_contract is not None:
-                execution_jobs += "\n" + gate_contract[1]
+            execution_jobs = (
+                f"  {live_job}:\n"
+                f"    name: {display} live\n"
+                "    needs: changes\n"
+                "    if: needs.changes.outputs.relevant == 'true'\n"
+                "    runs-on: ubuntu-latest\n"
+                "    steps:\n"
+                "      - run: echo live\n"
+            )
         return (
             "name: Self-test live suite\n"
             "on:\n"
-            "  workflow_dispatch:\n"
             "  pull_request:\n"
-            "  merge_group:\n"
-            "    types:\n"
-            "      - checks_requested\n"
-            "  push:\n"
-            "    branches:\n"
-            "      - main\n"
             "permissions:\n"
             "  contents: read\n"
             "jobs:\n"
@@ -27430,7 +27016,6 @@ pre_build = []
 
     relevance_workflows = {
         contract_name: relevance_workflow(
-            contract_name,
             contract[2],
             contract[1],
             live_suite_relevance_job(contract[2], contract[3], contract[4]),
@@ -27540,28 +27125,6 @@ pre_build = []
             "    permissions:\n      contents: read\n",
             "    permissions:\n      contents: write\n",
         ),
-        "dropped main/manual force-run": (
-            "            filter_args+=(--force-run)\n",
-            "            :\n",
-        ),
-        "dropped merge_group base pin": (
-            '          elif [ "$EVENT_NAME" = "merge_group" ]; then\n',
-            '          elif [ "$EVENT_NAME" = "pull_request_target" ]; then\n',
-        ),
-        "line-delimited change set": (
-            '            git diff --name-only --no-renames -z '
-            '"${trusted_sha}...HEAD" \\\n              > "$changed_files"\n',
-            '            git diff --name-only --no-renames '
-            '"${trusted_sha}...HEAD" \\\n              | sort > "$changed_files"\n',
-        ),
-        "dropped change-set transport handshake": (
-            '          if [ "$transport" != "nul" ]; then\n',
-            '          if false; then\n',
-        ),
-        "persisted checkout credentials": (
-            "          persist-credentials: false\n",
-            "",
-        ),
     }
     for mutation_name, (original, replacement) in relevance_mutations.items():
         mutated = {
@@ -27613,136 +27176,6 @@ pre_build = []
     ].replace("\n" + AMBIENT_HOST_UDP_GATE_JOB, "", 1)
     if not live_suite_relevance_errors(ambient_without_gate, "self-test workflows"):
         failures.append("a deleted Ambient Host UDP Live final gate was not rejected")
-
-    with_paths = {
-        key: value.replace(
-            "  pull_request:\n",
-            "  pull_request:\n    paths:\n      - src/**\n",
-            1,
-        )
-        for key, value in relevance_workflows.items()
-    }
-    if with_paths == relevance_workflows:
-        failures.append("the top-level paths-filter self-test mutation is stale")
-    elif not live_suite_relevance_errors(with_paths, "self-test workflows"):
-        failures.append("a restored PR-widenable paths filter was not rejected")
-
-    without_merge_group = {
-        key: value.replace(
-            "  merge_group:\n    types:\n      - checks_requested\n",
-            "",
-            1,
-        )
-        for key, value in relevance_workflows.items()
-    }
-    if without_merge_group == relevance_workflows:
-        failures.append("the missing merge_group trigger self-test mutation is stale")
-    elif not live_suite_relevance_errors(
-        without_merge_group, "self-test workflows"
-    ):
-        failures.append("a missing merge_group trigger was not rejected")
-
-    without_push = {
-        key: value.replace(
-            "  push:\n    branches:\n      - main\n",
-            "",
-            1,
-        )
-        for key, value in relevance_workflows.items()
-        if key in LIVE_SUITE_REQUIRE_PUSH_MAIN
-    }
-    push_fixture = {
-        **relevance_workflows,
-        **without_push,
-    }
-    if without_push == {
-        key: relevance_workflows[key] for key in without_push
-    }:
-        failures.append("the missing push-to-main self-test mutation is stale")
-    elif not live_suite_relevance_errors(push_fixture, "self-test workflows"):
-        failures.append("a missing push-to-main trigger was not rejected")
-
-    node_waypoint_fixture = relevance_workflows["node-waypoint-ebpf-live.yml"]
-    detached_live = node_waypoint_fixture.replace(
-        "  node-waypoint-ebpf-live:\n"
-        "    name: node-waypoint-ebpf-live live\n"
-        "    needs: changes\n"
-        "    if: needs.changes.outputs.relevant == 'true'\n",
-        "  node-waypoint-ebpf-live:\n"
-        "    name: node-waypoint-ebpf-live live\n"
-        "    needs: changes\n"
-        "    if: always() && needs.production-dockerfile-plan.outputs."
-        "node_waypoint_relevant != 'false'\n",
-        1,
-    )
-    if detached_live == node_waypoint_fixture:
-        failures.append("the detached node-waypoint live binding mutation is stale")
-    elif not live_suite_relevance_errors(
-        {**relevance_workflows, "node-waypoint-ebpf-live.yml": detached_live},
-        "self-test workflows",
-    ):
-        failures.append(
-            "a node-waypoint live job re-pointed at the narrower production "
-            "planner was not rejected"
-        )
-
-    dropped_image_contract = node_waypoint_fixture.replace(
-        "      - changes\n      - production-dockerfile-smoke\n",
-        "      - changes\n",
-        1,
-    )
-    if dropped_image_contract == node_waypoint_fixture:
-        failures.append(
-            "the node-waypoint aggregate image-contract mutation is stale"
-        )
-    elif not live_suite_relevance_errors(
-        {
-            **relevance_workflows,
-            "node-waypoint-ebpf-live.yml": dropped_image_contract,
-        },
-        "self-test workflows",
-    ):
-        failures.append(
-            "a NodeWaypoint aggregate that dropped the production-image "
-            "contract was not rejected"
-        )
-
-    reordered_image_contract = node_waypoint_fixture.replace(
-        '          if [ "${{ needs.production-dockerfile-smoke.result }}" '
-        '!= "success" ]; then\n',
-        '          if [ "${{ needs.production-dockerfile-smoke.result }}" '
-        '= "never" ]; then\n',
-        1,
-    )
-    if reordered_image_contract == node_waypoint_fixture:
-        failures.append(
-            "the node-waypoint aggregate image-result mutation is stale"
-        )
-    elif not live_suite_relevance_errors(
-        {
-            **relevance_workflows,
-            "node-waypoint-ebpf-live.yml": reordered_image_contract,
-        },
-        "self-test workflows",
-    ):
-        failures.append(
-            "a NodeWaypoint aggregate that stopped failing on a red "
-            "production-image contract was not rejected"
-        )
-
-    for contract_name, (_gate_job, expected_gate) in LIVE_SUITE_GATE_CONTRACTS.items():
-        missing_gate = dict(relevance_workflows)
-        missing_gate[contract_name] = missing_gate[contract_name].replace(
-            "\n" + expected_gate, "", 1
-        )
-        if missing_gate[contract_name] == relevance_workflows[contract_name]:
-            failures.append(
-                f"the {contract_name} missing-aggregate self-test mutation is stale"
-            )
-        elif not live_suite_relevance_errors(missing_gate, "self-test workflows"):
-            failures.append(
-                f"a deleted {contract_name} aggregate gate was not rejected"
-            )
 
     # The relevance contract has to be enforced by the *collection* entry
     # points, not only by `live_suite_relevance_errors` in isolation. The

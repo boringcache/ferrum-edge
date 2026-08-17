@@ -37,16 +37,6 @@ AMBIENT_HOST_UDP_DOCUMENTATION_PATHS = frozenset(
     }
 )
 
-NODE_WAYPOINT_EBPF_DOCUMENTATION_PATHS = frozenset(
-    {
-        "docs/ci_cd.md",
-        "docs/mesh.md",
-        "docs/mesh_supported_matrix.md",
-        "docs/node_agent.md",
-        "docs/plans/node_waypoint_transport_adr.md",
-    }
-)
-
 CNI_LIFECYCLE_DOCUMENTATION_PATHS = frozenset(
     {
         "docs/node_agent.md",
@@ -54,19 +44,26 @@ CNI_LIFECYCLE_DOCUMENTATION_PATHS = frozenset(
     }
 )
 
-# Istio Status CAS live has no documentation trigger set: its previous
+# Istio Status CAS live has no documentation trigger set: its retired
 # workflow-level `paths:` list named only the writer, metrics, fixture, and
 # workflow/action surfaces. Keep that cost envelope.
-ISTIO_STATUS_CAS_DOCUMENTATION_PATHS = frozenset()
+ISTIO_STATUS_CAS_DOCUMENTATION_PATHS: frozenset[str] = frozenset()
 
 # verify_required_ci.py requires the PR planner's protected documentation set
 # to cover this union, so new live-suite documentation triggers cannot silently
 # receive lightweight CI.
+#
+# The NodeWaypoint eBPF live suite is deliberately absent: its relevance is
+# decided by the `node-waypoint-ebpf-live` suite of `ci_runtime_plan.py`, the
+# trusted-base planner that already runs inside
+# `node-waypoint-ebpf-live.yml`'s `production-dockerfile-plan` job. Adding a
+# second classifier for the same live job would mean two gates that can each
+# bypass the other. `verify_required_ci.py` folds that planner's documentation
+# patterns into the same full-CI union.
 LIVE_SUITE_DOCUMENTATION_PATHS = (
     MESH_FEDERATION_DOCUMENTATION_PATHS
     | MESH_E2E_SIDECAR_DOCUMENTATION_PATHS
     | AMBIENT_HOST_UDP_DOCUMENTATION_PATHS
-    | NODE_WAYPOINT_EBPF_DOCUMENTATION_PATHS
     | CNI_LIFECYCLE_DOCUMENTATION_PATHS
     | ISTIO_STATUS_CAS_DOCUMENTATION_PATHS
 )
@@ -291,71 +288,6 @@ SUITE_PATTERNS: dict[str, list[str]] = {
         r"^src/ebpf/veth\.rs$",
         *exact_path_patterns(AMBIENT_HOST_UDP_DOCUMENTATION_PATHS),
     ],
-    # NodeWaypoint eBPF live datapath. Patterns cover the prior NodeWaypoint
-    # scope (the `ci_runtime_plan.py` `node-waypoint-ebpf-live` suite, which
-    # `verify_ci_runtime_cache.py` proves is a subset of this list) plus the
-    # trusted classifier script itself, so a pull request that edits relevance
-    # cannot skip the suite after this contract lands, plus the local composite
-    # actions the live job actually executes (see
-    # SUITE_LOCAL_ACTION_DEPENDENCIES) — the retired `paths:` list named none of
-    # the toolchain/linker actions, so an edit to one of them could change what
-    # the live datapath compiled without ever re-running it.
-    #
-    # Deliberately NOT here, matching the retired scope: the production-image
-    # broadening (`src/**`, `vendor/**`, `.cargo/**`, `rust-toolchain.toml`,
-    # `custom_plugins/**`) and the CI-runtime planner/telemetry/verifier
-    # scripts, which drive the separate `production-dockerfile-plan` lane in the
-    # same workflow; and the NodeWaypoint `tests/unit` / `tests/integration`
-    # modules, which this live job never compiles.
-    "node-waypoint-ebpf": [
-        r"^\.github/workflows/node-waypoint-ebpf-live\.yml$",
-        r"^\.github/scripts/live_suite_path_filter\.py$",
-        r"^\.dockerignore$",
-        r"^\.github/actions/package-ferrum-runtime-image/",
-        r"^\.github/actions/setup-kubernetes-tools/",
-        # The live job's own build toolchain: `setup-rust-ci` (which itself
-        # runs `setup-sccache` and `setup-fast-linker`) and the
-        # `setup-bpf-linker` install the nightly BPF ELF build needs.
-        r"^\.github/actions/setup-bpf-linker/",
-        r"^\.github/actions/setup-fast-linker/",
-        r"^\.github/actions/setup-rust-ci/",
-        r"^\.github/actions/setup-sccache/",
-        r"^Cargo\.(toml|lock)$",
-        r"^Dockerfile$",
-        r"^Dockerfile\.iproute2-layer$",
-        # The live job builds the tools-capable steering image from this layer
-        # (`docker build --file Dockerfile.ebpf-tools-layer`). The retired
-        # `paths:` list reached the workflow for it but every job then skipped,
-        # so this closes a real hole rather than widening scope.
-        r"^Dockerfile\.ebpf-tools-layer$",
-        r"^Dockerfile\.release$",
-        r"^\.github/scripts/stage_iproute2_runtime\.sh$",
-        r"^build\.rs$",
-        r"^proto/",
-        r"^ebpf/",
-        r"^src/capture/",
-        r"^src/ebpf/",
-        r"^src/grpc/",
-        r"^src/identity/",
-        r"^src/k8s_controller/",
-        r"^src/modes/control_plane\.rs$",
-        r"^src/modes/mesh/",
-        r"^src/modes/node_agent\.rs$",
-        r"^src/plugins/mesh/",
-        r"^src/plugins/prometheus_metrics\.rs$",
-        r"^src/proxy/hbone_pool\.rs$",
-        r"^src/proxy/mesh_tcp_egress\.rs$",
-        r"^src/proxy/mod\.rs$",
-        r"^src/proxy/hbone_proxy\.rs$",
-        r"^src/proxy/netns_capture\.rs$",
-        r"^src/proxy/tcp_proxy\.rs$",
-        r"^src/router_cache\.rs$",
-        r"^src/socket_opts\.rs$",
-        r"^charts/ferrum-mesh/",
-        r"^tests/k8s/lib/",
-        r"^tests/k8s/node_waypoint_ebpf_live/",
-        *exact_path_patterns(NODE_WAYPOINT_EBPF_DOCUMENTATION_PATHS),
-    ],
     # Istio status CAS competing-writer live proof. Kept to the retired
     # workflow-level `paths:` list plus the trusted classifier script and the
     # local composite actions the live job executes: the retired list named
@@ -424,14 +356,6 @@ COMPILED = {
 # very pull request that adds a new `uses: ./.github/actions/...` step
 # unmergeable until its own patterns were already on `main`.
 SUITE_LOCAL_ACTION_DEPENDENCIES: dict[str, tuple[str, ...]] = {
-    "node-waypoint-ebpf": (
-        "package-ferrum-runtime-image",
-        "setup-bpf-linker",
-        "setup-fast-linker",
-        "setup-kubernetes-tools",
-        "setup-rust-ci",
-        "setup-sccache",
-    ),
     "istio-status-cas": (
         "setup-fast-linker",
         "setup-kubernetes-tools",
@@ -448,32 +372,21 @@ SUITE_LOCAL_ACTION_DEPENDENCIES: dict[str, tuple[str, ...]] = {
 }
 
 
-# Acknowledgement token printed alongside the verdict. The governed relevance
-# job requires it to be exactly this value before it will honor a `false`
-# verdict, so a trusted base that predates the NUL change set (and would read
-# the whole stream as one unmatched newline record) forces the live suite to
-# run instead of silently declaring irrelevance.
-CHANGED_FILES_TRANSPORT = "nul"
-
 # Conservative repository-relative charset, deliberately identical to the PR CI
 # planner's `CLASSIFIABLE_PATH_RE`. C0/C1 controls, DEL, newlines, tabs,
-# backslashes, backticks, and other shell/Markdown metacharacters are rejected
-# by omission, so a hostile Git pathname cannot split, quote, or interpolate its
-# way past a live-suite pattern.
+# backslashes, backticks, quotes, and other shell/Markdown metacharacters are
+# rejected by omission, so a hostile Git pathname can neither slip past a
+# live-suite pattern nor be echoed into a step summary.
 CLASSIFIABLE_PATH_RE = re.compile(r"^[A-Za-z0-9._+@~ /-]{1,4096}$")
 
 
-class ChangedFileStreamError(ValueError):
-    """A change-set record the trusted classifier refuses to interpret."""
-
-
 def is_classifiable_repo_path(path: str) -> bool:
-    """Return whether one decoded record is a normal repository-relative path.
+    """Return whether one record is a normal repository-relative pathname.
 
-    `PurePosixPath.parts` collapses empty components, so classification splits
-    on `/` itself. Surrounding whitespace, absolute paths, trailing slashes,
-    empty / `.` / `..` components, and anything outside the conservative
-    charset fail closed.
+    Surrounding whitespace, absolute paths, trailing slashes, empty / `.` /
+    `..` components, and anything outside the conservative charset fail the
+    check. Classification splits on `/` itself rather than going through
+    `PurePosixPath.parts`, which silently collapses empty components.
     """
 
     if path != path.strip():
@@ -482,60 +395,53 @@ def is_classifiable_repo_path(path: str) -> bool:
         return False
     if path.startswith("/") or path.endswith("/"):
         return False
-    parts = path.split("/")
-    return bool(parts) and all(part not in {"", ".", ".."} for part in parts)
+    return all(part not in {"", ".", ".."} for part in path.split("/"))
 
 
-def decode_changed_files(data: bytes) -> list[str]:
-    """Decode a `git diff --name-only --no-renames -z` change set.
+def decode_changed_files(text: str) -> tuple[list[str], int]:
+    """Split the governed relevance job's change-set listing.
 
-    Relevance decides whether a live gate runs at all, so a record that cannot
-    be decoded must never be silently dropped: dropping one makes the suite
-    look irrelevant and skips the gate. Every non-empty stream must therefore
-    be a canonical NUL-terminated sequence of strictly decodable, normal,
-    repository-relative pathnames, and any framing, encoding, or shape failure
-    raises `ChangedFileStreamError` for the caller to turn into a non-zero
-    exit. A genuinely empty diff yields an empty list.
+    The frozen relevance job emits `git diff --name-only --no-renames` line by
+    line, which C-quotes any pathname carrying a newline, a quote, a backslash,
+    or a non-ASCII byte. A quoted record therefore names a DIFFERENT path than
+    the one on disk, and classifying it would answer a question about a path
+    that does not exist — silently, in the skip direction.
 
-    Pathname bytes are never normalized or stripped into a different path, and
-    hostile record bytes are never echoed back — errors name the record index
-    and the reason only.
+    Rather than drop such a record (which makes the suite look irrelevant) or
+    unquote it (which is the same guess by another name), the record is counted
+    as unclassifiable and the caller forces the suite to RUN. Unclassifiable
+    records are never returned, so hostile bytes never reach a pattern, a
+    verdict, or the step summary.
+
+    Returns the classifiable paths and the number of unclassifiable records.
     """
 
-    if not data:
-        return []
-    if not data.endswith(b"\0"):
-        raise ChangedFileStreamError(
-            "change set is not NUL-terminated; a truncated stream or a "
-            "line-delimited listing must never be classified"
-        )
-    records = data.split(b"\0")[:-1]
-    if not records:
-        raise ChangedFileStreamError("change set holds no records")
+    # Split on the transport's own delimiter, NOT `str.splitlines()`: that also
+    # breaks on CR, VT, FF, U+0085, U+2028, and U+2029, which would turn one
+    # record holding such a byte into two innocuous-looking halves. Splitting on
+    # "\n" alone keeps the byte inside its record, where the charset check
+    # refuses it.
+    records = text.split("\n")
+    if records and records[-1] == "":
+        # The terminator of the final line, not an extra record.
+        records.pop()
     paths: list[str] = []
-    for index, record in enumerate(records):
-        if not record:
-            raise ChangedFileStreamError(
-                f"change-set record {index} is empty; the stream is not a "
-                "canonical NUL-delimited pathname list"
-            )
-        try:
-            path = record.decode("utf-8")
-        except UnicodeDecodeError:
-            raise ChangedFileStreamError(
-                f"change-set record {index} is not valid UTF-8"
-            ) from None
-        if not is_classifiable_repo_path(path):
-            raise ChangedFileStreamError(
-                f"change-set record {index} is not a normal "
-                "repository-relative pathname"
-            )
-        paths.append(path)
-    return paths
+    unclassifiable = 0
+    for record in records:
+        if is_classifiable_repo_path(record):
+            paths.append(record)
+        else:
+            unclassifiable += 1
+    return paths, unclassifiable
 
 
-def read_changed_files(path: Path) -> list[str]:
-    return decode_changed_files(path.read_bytes())
+def read_changed_files(path: Path) -> tuple[list[str], int]:
+    # `errors="replace"` keeps an undecodable byte from raising here: it would
+    # otherwise abort before the unclassifiable record could force a run, and
+    # the replacement character is outside CLASSIFIABLE_PATH_RE anyway.
+    return decode_changed_files(
+        path.read_text(encoding="utf-8", errors="replace")
+    )
 
 
 def matched_files(suite: str, changed_files: list[str]) -> list[str]:
@@ -543,12 +449,25 @@ def matched_files(suite: str, changed_files: list[str]) -> list[str]:
     return [path for path in changed_files if any(pattern.search(path) for pattern in patterns)]
 
 
-def write_summary(suite: str, relevant: bool, changed: list[str], matched: list[str]) -> None:
+def write_summary(
+    suite: str,
+    relevant: bool,
+    changed: list[str],
+    matched: list[str],
+    unclassifiable: int = 0,
+) -> None:
     title = suite.replace("-", " ").title()
     print(f"## {title} Live Suite Path Filter")
     print()
     print(f"Relevant: **{str(relevant).lower()}**")
     print()
+    if unclassifiable:
+        print(
+            f"{unclassifiable} change-set record(s) are not normal "
+            "repository-relative pathnames and cannot be classified, so the "
+            "suite runs. The records themselves are withheld."
+        )
+        print()
     print("### Matched Files")
     print()
     if matched:
@@ -1428,15 +1347,18 @@ native_probe_running_identity capp
 
 
 def changed_file_transport_self_test() -> list[str]:
-    """Prove the NUL change-set transport keeps identity and fails closed.
+    """Prove the change-set reader never turns a hostile record into a skip.
 
-    Every rejected case below would otherwise be classified as "no relevant
-    file" and skip a live gate. None of them echo the hostile bytes.
+    Every rejected case below is a record `git diff --name-only` can emit for a
+    pathname it had to C-quote, or a record no ordinary repository path can
+    produce. Classifying any of them as "no relevant file" would skip a live
+    gate; each must instead be counted unclassifiable so the caller runs the
+    suite, and none may be returned for pattern matching or summary echo.
     """
 
     failures: list[str] = []
 
-    if decode_changed_files(b"") != []:
+    if decode_changed_files("") != ([], 0):
         failures.append("an actually empty diff must decode to an empty change set")
 
     exact = [
@@ -1445,74 +1367,82 @@ def changed_file_transport_self_test() -> list[str]:
         "tests/k8s/node waypoint/run.sh",
         "docs/plans/node_waypoint_transport_adr.md",
     ]
-    encoded = b"".join(path.encode("utf-8") + b"\0" for path in exact)
-    decoded = decode_changed_files(encoded)
-    if decoded != exact:
+    decoded, unclassifiable = decode_changed_files(
+        "".join(f"{path}\n" for path in exact)
+    )
+    if decoded != exact or unclassifiable:
         failures.append(
-            "ordinary NUL records must retain exact path identity "
-            f"({len(decoded)} record(s) decoded)"
+            "ordinary records must retain exact path identity "
+            f"({len(decoded)} record(s) decoded, {unclassifiable} refused)"
         )
 
-    rejected = (
-        # Framing.
-        ("unterminated-single-record", b"src/proxy/mod.rs"),
-        ("truncated-after-record", b"src/proxy/mod.rs\0src/ebpf/mod.rs"),
-        ("interior-empty-record", b"src/proxy/mod.rs\0\0src/ebpf/mod.rs\0"),
-        ("empty-record", b"\0"),
-        # A newline-delimited (or `sort`ed) listing is the exact regression
-        # this transport exists to refuse: it can neither represent nor be
-        # distinguished from a pathname that contains a newline.
-        ("line-delimited", b"src/proxy/mod.rs\nsrc/ebpf/mod.rs\n"),
-        (
-            "sorted-line-delimited",
-            b".github/scripts/live_suite_path_filter.py\nsrc/proxy/mod.rs\n",
-        ),
-        ("line-delimited-nul-terminated", b"src/proxy/mod.rs\nsrc/ebpf/mod.rs\0"),
-        # Encoding.
-        ("invalid-utf8", b"src/proxy/\xffmod.rs\0"),
-        ("truncated-utf8-sequence", b"src/proxy/\xc3\0"),
-        # Control / format characters.
-        ("newline-in-name", b"src/proxy/\nmod.rs\0"),
-        ("tab-in-name", b"src/proxy/\tmod.rs\0"),
-        ("carriage-return-in-name", b"src/proxy/\rmod.rs\0"),
-        ("c0-soh-in-name", b"src/proxy/\x01mod.rs\0"),
-        ("c0-us-in-name", b"src/proxy/\x1fmod.rs\0"),
-        ("del-in-name", b"src/proxy/\x7fmod.rs\0"),
-        (
-            "bidi-override-in-name",
-            ("src/proxy/" + chr(0x202E) + "mod.rs").encode("utf-8") + b"\0",
-        ),
-        (
-            "zero-width-joiner-in-name",
-            ("src/proxy/" + chr(0x200D) + "mod.rs").encode("utf-8") + b"\0",
-        ),
+    # A listing with no trailing newline is still a complete listing: the
+    # frozen job pipes `git diff --name-only` through `sort`, which terminates
+    # its last line, but an unterminated final record must not be dropped.
+    decoded, unclassifiable = decode_changed_files("src/proxy/mod.rs")
+    if decoded != ["src/proxy/mod.rs"] or unclassifiable:
+        failures.append("an unterminated final record must still be classified")
+
+    # Exactly one trailing terminator is consumed; a genuinely blank line is a
+    # record, and a blank line is not a repository path.
+    decoded, unclassifiable = decode_changed_files("src/proxy/mod.rs\n\n")
+    if decoded != ["src/proxy/mod.rs"] or unclassifiable != 1:
+        failures.append("a trailing blank line must be refused, not swallowed")
+
+    refused = (
+        # C-quoted forms `git diff --name-only` emits instead of the real path.
+        ("c-quoted-newline", '"src/proxy/\\nmod.rs"'),
+        ("c-quoted-non-ascii", '"src/proxy/\\303\\251mod.rs"'),
+        ("c-quoted-quote", '"src/proxy/\\"mod.rs"'),
+        ("c-quoted-backslash", '"src/proxy/\\\\mod.rs"'),
+        # Records no ordinary repository path can produce.
+        ("blank-record", ""),
+        ("whitespace-record", "   "),
+        ("undecodable-byte-replacement", "src/proxy/\ufffdmod.rs"),
+        ("tab-in-name", "src/proxy/\tmod.rs"),
+        ("carriage-return-in-name", "src/proxy/\rmod.rs"),
+        ("c0-soh-in-name", "src/proxy/\x01mod.rs"),
+        ("c0-us-in-name", "src/proxy/\x1fmod.rs"),
+        ("del-in-name", "src/proxy/\x7fmod.rs"),
+        ("bidi-override-in-name", "src/proxy/" + chr(0x202E) + "mod.rs"),
+        ("zero-width-joiner-in-name", "src/proxy/" + chr(0x200D) + "mod.rs"),
         # Shape.
-        ("absolute", b"/src/proxy/mod.rs\0"),
-        ("traversal", b"src/../../etc/passwd\0"),
-        ("dot-prefix", b"./src/proxy/mod.rs\0"),
-        ("dot-inner", b"src/./proxy/mod.rs\0"),
-        ("empty-component", b"src//proxy/mod.rs\0"),
-        ("trailing-slash", b"src/proxy/\0"),
-        ("leading-space", b" src/proxy/mod.rs\0"),
-        ("trailing-space", b"src/proxy/mod.rs \0"),
-        ("backslash", b"src\\proxy\\mod.rs\0"),
-        ("backtick", b"src/proxy/`mod.rs\0"),
-        # A relevant path smuggled behind an unclassifiable one must still fail
-        # the whole change set rather than being classified alone.
-        (
-            "unclassifiable-alongside-relevant",
-            b".github/scripts/live_suite_path_filter.py\0src/proxy/\nmod.rs\0",
-        ),
+        ("absolute", "/src/proxy/mod.rs"),
+        ("traversal", "src/../../etc/passwd"),
+        ("dot-prefix", "./src/proxy/mod.rs"),
+        ("dot-inner", "src/./proxy/mod.rs"),
+        ("empty-component", "src//proxy/mod.rs"),
+        ("trailing-slash", "src/proxy/"),
+        ("leading-space", " src/proxy/mod.rs"),
+        ("trailing-space", "src/proxy/mod.rs "),
+        ("backslash", "src\\proxy\\mod.rs"),
+        ("backtick", "src/proxy/`mod.rs"),
+        ("dollar-substitution", "src/proxy/$(id).rs"),
     )
-    for label, data in rejected:
-        try:
-            accepted = decode_changed_files(data)
-        except ChangedFileStreamError:
-            continue
+    for label, record in refused:
+        decoded, unclassifiable = decode_changed_files(f"{record}\n")
+        if decoded or unclassifiable != 1:
+            failures.append(
+                f"{label} record must be counted unclassifiable and withheld; "
+                f"got {len(decoded)} classified / {unclassifiable} refused"
+            )
+
+    # An unclassifiable record alongside an ordinary one must force the run
+    # rather than let the ordinary record decide relevance on its own.
+    decoded, unclassifiable = decode_changed_files(
+        'docs/admin_api.md\n"src/cni/\\nmod.rs"\n'
+    )
+    if decoded != ["docs/admin_api.md"] or unclassifiable != 1:
         failures.append(
-            f"{label} change set must be refused, decoded "
-            f"{len(accepted)} record(s) instead"
+            "an unclassifiable record must survive alongside classified ones"
         )
+    for suite in ("istio-status-cas", "cni-lifecycle"):
+        if matched_files(suite, decoded):
+            failures.append(
+                f"{suite} fixture must not match on its own; the run has to be "
+                "forced by the unclassifiable record"
+            )
+
     return failures
 
 
@@ -1619,46 +1549,6 @@ def self_test() -> int:
         ("ambient-host-udp", ["src/modes/node_agent.rs"], True),
         ("ambient-host-udp", ["src/modes/data_plane.rs"], False),
         ("ambient-host-udp", ["tests/k8s/mesh_e2e_sidecar/run.sh"], False),
-        ("node-waypoint-ebpf", ["ebpf/ferrum-ebpf/src/main.rs"], True),
-        ("node-waypoint-ebpf", ["src/modes/node_agent.rs"], True),
-        ("node-waypoint-ebpf", ["tests/k8s/node_waypoint_ebpf_live/run.sh"], True),
-        ("node-waypoint-ebpf", [".github/workflows/node-waypoint-ebpf-live.yml"], True),
-        ("node-waypoint-ebpf", [".github/scripts/live_suite_path_filter.py"], True),
-        ("node-waypoint-ebpf", ["charts/ferrum-mesh/values.yaml"], True),
-        ("node-waypoint-ebpf", ["docs/plans/node_waypoint_transport_adr.md"], True),
-        ("node-waypoint-ebpf", ["docs/mesh_supported_matrix.md"], True),
-        ("node-waypoint-ebpf", ["src/proxy/netns_capture.rs"], True),
-        ("node-waypoint-ebpf", ["Dockerfile"], True),
-        ("node-waypoint-ebpf", ["Dockerfile.iproute2-layer"], True),
-        ("node-waypoint-ebpf", ["Dockerfile.ebpf-tools-layer"], True),
-        ("node-waypoint-ebpf", ["tests/k8s/lib/helpers.sh"], True),
-        # Local composite actions the live job executes (directly, or through
-        # setup-rust-ci, which runs setup-sccache and setup-fast-linker).
-        ("node-waypoint-ebpf", [".github/actions/setup-rust-ci/action.yml"], True),
-        ("node-waypoint-ebpf", [".github/actions/setup-sccache/action.yml"], True),
-        (
-            "node-waypoint-ebpf",
-            [".github/actions/setup-fast-linker/action.yml"],
-            True,
-        ),
-        ("node-waypoint-ebpf", [".github/actions/setup-bpf-linker/action.yml"], True),
-        ("node-waypoint-ebpf", ["src/modes/data_plane.rs"], False),
-        ("node-waypoint-ebpf", ["docs/admin_api.md"], False),
-        ("node-waypoint-ebpf", ["tests/k8s/cni_lifecycle_live/run.sh"], False),
-        # The production-image broadening the retired `paths:` list carried is
-        # owned by `production-dockerfile-plan`, not by this live suite.
-        ("node-waypoint-ebpf", ["src/main.rs"], False),
-        ("node-waypoint-ebpf", ["src/admin/mod.rs"], False),
-        ("node-waypoint-ebpf", ["vendor/foo/src/lib.rs"], False),
-        ("node-waypoint-ebpf", [".cargo/config.toml"], False),
-        ("node-waypoint-ebpf", ["rust-toolchain.toml"], False),
-        ("node-waypoint-ebpf", ["custom_plugins/foo.rs"], False),
-        ("node-waypoint-ebpf", [".github/scripts/ci_runtime_plan.py"], False),
-        (
-            "node-waypoint-ebpf",
-            [".github/scripts/verify_ci_runtime_cache.py"],
-            False,
-        ),
         ("istio-status-cas", ["src/k8s_controller/istio_status.rs"], True),
         ("istio-status-cas", ["src/k8s_controller/metrics.rs"], True),
         ("istio-status-cas", ["tests/k8s_istio_status_cas_live.rs"], True),
@@ -1741,26 +1631,37 @@ def main() -> int:
     parser.add_argument("--changed-files", type=Path)
     parser.add_argument("--force-run", action="store_true")
     parser.add_argument("--self-test", action="store_true")
+    # Capability handshake for a live suite whose workflow lands before this
+    # classifier reaches the trusted base. A relevance job runs the TRUSTED
+    # copy, and an older trusted copy rejects an unknown `--suite` with a
+    # usage error, which is indistinguishable from a broken classifier. It
+    # also rejects this flag, so "the flag was refused" is itself the answer:
+    # the workflow reads that as "this base cannot classify me" and runs the
+    # suite. Printing the names it does know keeps the negative provable
+    # rather than inferred from an error string.
+    parser.add_argument("--list-suites", action="store_true")
     args = parser.parse_args()
 
     if args.self_test:
         return self_test()
+    if args.list_suites:
+        for suite in sorted(SUITE_PATTERNS):
+            print(suite)
+        return 0
     if not args.suite or not args.changed_files:
         parser.error("--suite and --changed-files are required unless --self-test is used")
 
-    try:
-        changed = read_changed_files(args.changed_files)
-    except ChangedFileStreamError as exc:
-        # Fail closed loudly rather than classifying a partial change set: a
-        # dropped record is indistinguishable from an irrelevant pull request.
-        print(f"::error::refusing to classify the change set: {exc}", file=sys.stderr)
-        return 1
+    changed, unclassifiable = read_changed_files(args.changed_files)
     matched = matched_files(args.suite, changed)
-    relevant = args.force_run or bool(matched)
+    # A record that is not a normal repository-relative pathname was withheld
+    # from `changed`, so it cannot match a pattern. Treating that as "nothing
+    # relevant changed" is exactly the false skip this classifier exists to
+    # prevent, so an unclassifiable change set runs the suite.
+    relevant = args.force_run or bool(unclassifiable) or bool(matched)
     print(f"relevant={str(relevant).lower()}")
-    print(f"changed_files_transport={CHANGED_FILES_TRANSPORT}")
     print(f"matched_count={len(matched)}")
-    write_summary(args.suite, relevant, changed, matched)
+    print(f"unclassifiable_count={unclassifiable}")
+    write_summary(args.suite, relevant, changed, matched, unclassifiable)
     return 0
 
 

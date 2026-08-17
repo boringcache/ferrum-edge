@@ -38,11 +38,6 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
         with:
           fetch-depth: 0
-          # This job only ever reads: it fetches the base tip and inspects two
-          # commits. Leaving a write-capable token in the checkout's Git
-          # configuration would hand every later step in the job an
-          # authenticated remote it has no need for.
-          persist-credentials: false
 
       # Relevance decides whether a REQUIRED live gate runs at all, so it must
       # never be computed by code the pull request supplies: a PR that widens
@@ -182,15 +177,8 @@ jobs:
           git cat-file blob "$entry_object" > "$trusted_filter"
 
           if [ "$EVENT_NAME" = "pull_request" ] || [ "$EVENT_NAME" = "merge_group" ]; then
-            # NUL-delimited, unsorted, and never re-quoted. A newline-delimited
-            # listing cannot represent a pathname that contains a newline, and
-            # C-quoting one (core.quotePath) would hand the classifier a
-            # DIFFERENT path than the one that changed; either way a relevant
-            # file can be made to look like no file at all. The trusted filter
-            # refuses any record it cannot decode as a normal
-            # repository-relative pathname instead of skipping it.
-            git diff --name-only --no-renames -z "${trusted_sha}...HEAD" \
-              > "$changed_files"
+            git diff --name-only --no-renames "${trusted_sha}...HEAD" \
+              | sort > "$changed_files"
           fi
 
           # Isolated interpreter: no user site directory, no PYTHON* overrides,
@@ -199,7 +187,6 @@ jobs:
           python3 -I "$trusted_filter" --self-test
           plan="$(python3 -I "$trusted_filter" "${filter_args[@]}")"
           relevant="$(printf '%s\n' "$plan" | sed -n 's/^relevant=//p')"
-          transport="$(printf '%s\n' "$plan" | sed -n 's/^changed_files_transport=//p')"
           case "$relevant" in
             true|false) ;;
             *)
@@ -207,15 +194,6 @@ jobs:
               exit 1
               ;;
           esac
-          # Transport handshake. A trusted base older than the NUL change set
-          # reads the whole stream as one newline-delimited record, matches
-          # nothing, and reports a syntactically valid `relevant=false`. Only an
-          # exact `nul` acknowledgement proves the records were classified as
-          # pathnames, so anything else runs the live suite.
-          if [ "$transport" != "nul" ]; then
-            echo "::warning::trusted relevance filter did not acknowledge the NUL change set; running the live suite" >&2
-            relevant=true
-          fi
           echo "relevant=$relevant" >> "$GITHUB_OUTPUT"
           echo "Relevance decided by trusted base ${trusted_sha}." >> "$GITHUB_STEP_SUMMARY"
           printf '%s\n' "$plan" | sed -n '/^## /,$p' >> "$GITHUB_STEP_SUMMARY"

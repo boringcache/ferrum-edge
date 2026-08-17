@@ -31,10 +31,6 @@ from ci_runtime_plan import (
     self_test as plan_self_test,
 )
 from ci_runtime_telemetry import self_test as telemetry_self_test
-from live_suite_path_filter import (
-    SUITE_PATTERNS as LIVE_SUITE_CLASSIFIER_PATTERNS,
-    matched_files as live_suite_matched_files,
-)
 
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -101,15 +97,10 @@ LINE_DIFF = 'git diff --name-only --no-renames "${trusted_sha}...HEAD"'
 NODE_WAYPOINT_PLANNER_OUTPUT = (
     "needs.production-dockerfile-plan.outputs.node_waypoint_relevant"
 )
-# Issue #3908: the live datapath follows the frozen whole-suite trusted-base
-# classifier (`live_suite_path_filter.py --suite node-waypoint-ebpf`), byte-frozen
-# by verify_cross_build_policy.py as LIVE_SUITE_JOB_BINDING. The narrower
-# `node_waypoint_relevant` planner verdict stays published for the
-# production-runtime lane and is proven below to be a subset of the classifier,
-# but it no longer gates a job — a second gate on the same job would let either
-# verdict silently bypass the other.
-NODE_WAYPOINT_LIVE_IF = "needs.changes.outputs.relevant == 'true'"
-NODE_WAYPOINT_CLASSIFIER_SUITE = "node-waypoint-ebpf"
+NODE_WAYPOINT_LIVE_IF = (
+    "always() && "
+    "needs.production-dockerfile-plan.outputs.node_waypoint_relevant != 'false'"
+)
 SHA40 = re.compile(r"^[0-9a-f]{40}$")
 USES = re.compile(
     r"^\s*(?:-\s*)?uses:\s*(?P<ref>\S+)",
@@ -133,6 +124,30 @@ def extract_pull_request_paths(workflow: str) -> list[str]:
         if stripped.startswith("- "):
             paths.append(stripped[2:].strip().strip('"').strip("'"))
     return paths
+
+
+def extract_on_block(workflow: str) -> str:
+    """Return the body of the single top-level `on:` mapping, or "".
+
+    Scoped rather than whole-file so a `paths:` key nested inside a job step
+    (or a second `on:`-looking line) cannot be mistaken for a trigger filter,
+    and so a workflow with a duplicated `on:` fails closed.
+    """
+
+    lines = workflow.splitlines(keepends=True)
+    headers = [index for index, line in enumerate(lines) if line.rstrip("\r\n") == "on:"]
+    if len(headers) != 1:
+        return ""
+    start = headers[0]
+    end = next(
+        (
+            index
+            for index in range(start + 1, len(lines))
+            if re.match(r"^[A-Za-z0-9_-]+:", lines[index])
+        ),
+        len(lines),
+    )
+    return "".join(lines[start + 1 : end])
 
 
 def production_dockerfile_probe_paths() -> list[str]:
@@ -175,25 +190,21 @@ def production_dockerfile_probe_paths() -> list[str]:
     return probes
 
 
-def extract_on_block(workflow: str) -> str:
-    """Return the top-level `on:` mapping text, or "" when it is absent."""
-
-    lines = workflow.splitlines(keepends=True)
-    try:
-        start = next(
-            index for index, line in enumerate(lines) if line.rstrip("\r\n") == "on:"
-        )
-    except StopIteration:
-        return ""
-    end = len(lines)
-    for index in range(start + 1, len(lines)):
-        line = lines[index]
-        if not line.strip() or line.lstrip().startswith("#"):
-            continue
-        if not line[:1].isspace():
-            end = index
-            break
-    return "".join(lines[start:end])
+# Issue #3908 retired the workflow-level `paths:` filter that used to decide
+# whether this workflow started at all. A `paths:` list lives in the pull
+# request's own checkout, so the commit that broke a surface could delete its
+# own trigger and skip the suite; the superset check below was the guard that
+# the trigger at least reached every planner-sensitive input. With no trigger
+# filter the workflow starts on every event and the trusted-base planner is the
+# only relevance authority, so the contract inverts: any restored `paths:` /
+# `paths-ignore` filter is a regression, and all four events must be present so
+# merge-group and main-push runs actually happen.
+GOVERNED_LIVE_TRIGGER_EVENTS = (
+    "workflow_dispatch",
+    "pull_request",
+    "merge_group",
+    "push",
+)
 
 
 def check_governed_live_trigger_shape(
@@ -201,59 +212,60 @@ def check_governed_live_trigger_shape(
     source: str,
     failures: list[str],
 ) -> None:
-    """Reject a PR-widenable trigger and require full event coverage.
-
-    Issue #3908 retired this workflow's top-level `paths:` list. A filter that
-    ships in the pull request's own checkout can be widened by the same commit
-    that breaks the surface it guards, and it never re-evaluates a merge-queue
-    combination or a push to `main`. Relevance now comes from two trusted-base
-    classifiers instead — `live_suite_path_filter.py` for the whole live suite
-    and `ci_runtime_plan.py` for the narrower production-image lane — so the
-    trigger itself must stay unconditional.
-    """
-
+    require(
+        not extract_pull_request_paths(workflow),
+        f"{source} must not restore a pull_request.paths filter; a filter the "
+        "pull request itself supplies can skip the suite that would have "
+        "caught the same commit",
+        failures,
+    )
     on_block = extract_on_block(workflow)
     require(
         bool(on_block),
-        f"{source} must declare a canonical top-level on: mapping",
+        f"{source} must declare a single top-level `on:` block",
         failures,
     )
-    if not on_block:
-        return
-    require(
-        not extract_pull_request_paths(workflow),
-        f"{source} must not declare a PR-widenable pull_request.paths filter; "
-        "relevance is decided by the trusted-base classifiers",
-        failures,
-    )
-    require(
-        re.search(r"(?m)^[ \t]+paths(?:-ignore)?:", on_block) is None,
-        f"{source} must not declare any top-level paths/paths-ignore filter",
-        failures,
-    )
-    for event in ("workflow_dispatch", "pull_request", "merge_group", "push"):
+    for filtered in re.findall(r"(?m)^    (paths|paths-ignore):", on_block):
+        failures.append(
+            f"{source} must not filter a governed live trigger by `{filtered}:`"
+        )
+    for event in GOVERNED_LIVE_TRIGGER_EVENTS:
         require(
-            re.search(rf"(?m)^  {event}:", on_block) is not None,
-            f"{source} must trigger on {event}",
+            re.search(rf"(?m)^  {re.escape(event)}:", on_block) is not None,
+            f"{source} must trigger on `{event}` so relevance is re-evaluated "
+            "on pull requests, merge-queue combinations, and main pushes",
             failures,
         )
     require(
-        re.search(
-            r"(?m)^  merge_group:\n    types:\n      - checks_requested\n",
-            on_block,
-        )
+        re.search(r"(?m)^  merge_group:\n    types:\n      - checks_requested$", on_block)
         is not None,
-        f"{source} must pin merge_group to types: [checks_requested] so a "
-        "queue-combined commit is re-evaluated",
+        f"{source} merge_group trigger must request checks on the synthesized "
+        "queue commit",
         failures,
     )
     require(
-        re.search(r"(?m)^  push:\n    branches:\n      - main\s*$", on_block)
-        is not None,
-        f"{source} must push to main without a paths filter so a "
-        "queue-combined regression surfaces on main",
+        re.search(r"(?m)^  push:\n    branches:\n      - main$", on_block) is not None,
+        f"{source} push trigger must cover exactly the main branch",
         failures,
     )
+    # Every probe the planner treats as sensitive must still be reachable; with
+    # no trigger filter that is now a statement about the planner alone.
+    for probe in production_dockerfile_probe_paths():
+        if probe.startswith("unmapped-production-pattern:"):
+            failures.append(
+                f"{source} verifier must map every production-dockerfile-smoke "
+                f"planner pattern ({probe[26:]})"
+            )
+            continue
+        relevant, _reason, _matched = decide_relevance(
+            "production-dockerfile-smoke", [probe]
+        )
+        require(
+            relevant,
+            f"{source} production-image sensitive path {probe} must run the "
+            "image jobs",
+            failures,
+        )
 
 
 def job_if(job_body: str) -> str:
@@ -274,12 +286,22 @@ def node_waypoint_probe_paths() -> list[str]:
             probes.append(".github/actions/package-ferrum-runtime-image/action.yml")
         elif pattern == r"^\.github/actions/setup-kubernetes-tools/":
             probes.append(".github/actions/setup-kubernetes-tools/action.yml")
+        elif pattern == r"^\.github/actions/setup-rust-ci/":
+            probes.append(".github/actions/setup-rust-ci/action.yml")
+        elif pattern == r"^\.github/actions/setup-sccache/":
+            probes.append(".github/actions/setup-sccache/action.yml")
+        elif pattern == r"^\.github/actions/setup-fast-linker/":
+            probes.append(".github/actions/setup-fast-linker/action.yml")
+        elif pattern == r"^\.github/actions/setup-bpf-linker/":
+            probes.append(".github/actions/setup-bpf-linker/action.yml")
         elif pattern == r"^Cargo\.(toml|lock)$":
             probes.extend(["Cargo.toml", "Cargo.lock"])
         elif pattern == r"^Dockerfile$":
             probes.append("Dockerfile")
         elif pattern == r"^Dockerfile\.iproute2-layer$":
             probes.append("Dockerfile.iproute2-layer")
+        elif pattern == r"^Dockerfile\.ebpf-tools-layer$":
+            probes.append("Dockerfile.ebpf-tools-layer")
         elif pattern == r"^Dockerfile\.release$":
             probes.append("Dockerfile.release")
         elif pattern == r"^\.github/scripts/stage_iproute2_runtime\.sh$":
@@ -390,9 +412,9 @@ def check_node_waypoint_live_job(
         failures,
     )
     require(
-        "needs: changes" in live_job
-        or "needs:\n      - changes" in live_job,
-        f"{source} live job must depend on the frozen trusted-base changes job",
+        "needs: production-dockerfile-plan" in live_job
+        or "needs:\n      - production-dockerfile-plan" in live_job,
+        f"{source} live job must depend on the trusted planner job",
         failures,
     )
     live_condition = job_if(live_job)
@@ -403,21 +425,34 @@ def check_node_waypoint_live_job(
     )
     require(
         live_condition == NODE_WAYPOINT_LIVE_IF,
-        f"{source} live job must be bound to the frozen relevance output "
-        f"({NODE_WAYPOINT_LIVE_IF}); found: {live_condition}",
+        f"{source} live job must skip only on exact {NODE_WAYPOINT_PLANNER_OUTPUT} "
+        f"!= 'false' under always(); found: {live_condition}",
         failures,
     )
     require(
-        NODE_WAYPOINT_PLANNER_OUTPUT not in live_job,
-        f"{source} live job must not re-introduce the narrower "
-        f"{NODE_WAYPOINT_PLANNER_OUTPUT} gate alongside the frozen classifier; "
-        "two gates on one job let either silently bypass the other",
+        "always()" in live_condition,
+        f"{source} live job must use always() so a planner failure cannot skip",
         failures,
     )
     require(
-        "always()" not in live_condition,
-        f"{source} live job must keep the frozen binding exactly; an always() "
-        "prefix is not the trusted-relevance contract",
+        f"{NODE_WAYPOINT_PLANNER_OUTPUT} != 'false'" in live_condition,
+        f"{source} live job skip must be exact-false-only",
+        failures,
+    )
+    require(
+        "== 'true'" not in live_condition,
+        f"{source} live job must not treat blank/malformed output as a skip",
+        failures,
+    )
+    require(
+        "result == 'success'" not in live_condition,
+        f"{source} live job must not require planner success to run "
+        "(planner failure must fail closed toward running)",
+        failures,
+    )
+    require(
+        "outputs.relevant" not in live_condition,
+        f"{source} live job must not reuse the production-image relevant output",
         failures,
     )
     require(
@@ -452,19 +487,6 @@ def check_node_waypoint_live_job(
         f"pattern ({', '.join(item[32:] for item in unmapped)})",
         failures,
     )
-    # Retiring the workflow-level `paths:` filter moved the live-datapath
-    # decision from `ci_runtime_plan.py` to `live_suite_path_filter.py`. Prove
-    # here that the move cannot NARROW scheduling: every prior-scope path the
-    # `node_waypoint_relevant` verdict still publishes must also be relevant to
-    # the classifier suite that now gates the job.
-    classifier_suites = set(LIVE_SUITE_CLASSIFIER_PATTERNS)
-    require(
-        NODE_WAYPOINT_CLASSIFIER_SUITE in classifier_suites,
-        f"{source} live_suite_path_filter.py must define the "
-        f"{NODE_WAYPOINT_CLASSIFIER_SUITE!r} suite that now gates the live job",
-        failures,
-    )
-    classifier_known = NODE_WAYPOINT_CLASSIFIER_SUITE in classifier_suites
     for probe in node_waypoint_probe_paths():
         if probe.startswith("unmapped-node-waypoint-pattern:"):
             continue
@@ -472,16 +494,6 @@ def check_node_waypoint_live_job(
         require(
             relevant,
             f"{source} prior-scope path {probe} must run the NodeWaypoint live job",
-            failures,
-        )
-        if not classifier_known:
-            continue
-        require(
-            bool(
-                live_suite_matched_files(NODE_WAYPOINT_CLASSIFIER_SUITE, [probe])
-            ),
-            f"{source} trusted classifier suite {NODE_WAYPOINT_CLASSIFIER_SUITE} "
-            f"must remain a superset of prior-scope path {probe}",
             failures,
         )
     for probe in NODE_WAYPOINT_PRODUCTION_ONLY_PROBES:
@@ -499,14 +511,6 @@ def check_node_waypoint_live_job(
             f"{source} production-only path {probe} must still trigger production-image smoke",
             failures,
         )
-        if not classifier_known:
-            continue
-        require(
-            not live_suite_matched_files(NODE_WAYPOINT_CLASSIFIER_SUITE, [probe]),
-            f"{source} production-only path {probe} must not become live-datapath "
-            "relevant to the trusted classifier",
-            failures,
-        )
     empty_relevant, _, _ = decide_relevance("node-waypoint-ebpf-live", [])
     require(
         empty_relevant,
@@ -519,6 +523,90 @@ def check_node_waypoint_live_job(
     require(
         unknown_relevant,
         f"{source} unknown NodeWaypoint path must fail closed toward running",
+        failures,
+    )
+
+
+# Issue #3908 gives the Kind/eBPF live job an always-reporting aggregate of its
+# own, `NodeWaypoint eBPF Live`. It must be consistent with the live job's
+# binding: the ONLY outcome that legitimately skips the live job is an exact
+# `false` verdict from the trusted-base planner, so that is the only outcome the
+# aggregate may report green without a successful live run. A planner failure
+# fails the aggregate, and a blank / malformed verdict runs the live job (the
+# `!= 'false'` binding) and is then judged on the live result.
+NODE_WAYPOINT_AGGREGATE_JOB = "node-waypoint-ebpf-live-gate"
+NODE_WAYPOINT_AGGREGATE_NAME = "NodeWaypoint eBPF Live"
+
+
+def check_node_waypoint_aggregate(
+    workflow: str,
+    source: str,
+    failures: list[str],
+) -> None:
+    aggregate = extract_job(workflow, NODE_WAYPOINT_AGGREGATE_JOB)
+    require(
+        bool(aggregate),
+        f"{source} must declare the {NODE_WAYPOINT_AGGREGATE_JOB!r} aggregate so "
+        "an irrelevant run still reports a result",
+        failures,
+    )
+    if not aggregate:
+        return
+    require(
+        re.search(
+            rf"(?m)^    name: {re.escape(NODE_WAYPOINT_AGGREGATE_NAME)}$", aggregate
+        )
+        is not None,
+        f"{source} aggregate must keep the check name "
+        f"{NODE_WAYPOINT_AGGREGATE_NAME!r}",
+        failures,
+    )
+    require(
+        re.search(r"(?m)^    if: always\(\)$", aggregate) is not None,
+        f"{source} aggregate must run with if: always() so a skipped or failed "
+        "live job still reports",
+        failures,
+    )
+    require(
+        job_needs_list(aggregate)
+        == {"production-dockerfile-plan", "node-waypoint-ebpf-live"},
+        f"{source} aggregate must depend on exactly the trusted planner and the "
+        "live job",
+        failures,
+    )
+    planner_result = "needs.production-dockerfile-plan.result"
+    require(
+        f"{planner_result} != 'success'" in aggregate,
+        f"{source} aggregate must fail when trusted-base relevance planning fails",
+        failures,
+    )
+    skip_steps = [
+        step
+        for step in job_steps(aggregate)
+        if re.search(r"(?m)^      - name: Skip", step)
+    ]
+    require(
+        len(skip_steps) == 1,
+        f"{source} aggregate must declare exactly one skip step",
+        failures,
+    )
+    skip_if = step_if(skip_steps[0]) if skip_steps else ""
+    require(
+        skip_if == f"{NODE_WAYPOINT_PLANNER_OUTPUT} == 'false'",
+        f"{source} aggregate skip must use exact {NODE_WAYPOINT_PLANNER_OUTPUT} "
+        f"== 'false', found: {skip_if}",
+        failures,
+    )
+    require(
+        "!= 'true'" not in skip_if,
+        f"{source} aggregate skip must not treat a blank verdict as irrelevance",
+        failures,
+    )
+    require(
+        f"{NODE_WAYPOINT_PLANNER_OUTPUT} != 'false' && "
+        "needs.node-waypoint-ebpf-live.result != 'success'" in aggregate,
+        f"{source} aggregate must fail whenever the live job was scheduled and "
+        "did not succeed",
         failures,
     )
 
@@ -2624,6 +2712,11 @@ def check_production_smoke(workflow: str, failures: list[str]) -> None:
         "node-waypoint-ebpf-live.yml",
         failures,
     )
+    check_node_waypoint_aggregate(
+        workflow,
+        "node-waypoint-ebpf-live.yml",
+        failures,
+    )
     require(
         "python3 -I" in workflow and "ci_runtime_plan.py" in workflow,
         "production-image planner must execute an isolated trusted-base copy",
@@ -2845,11 +2938,10 @@ def check_docs_and_coverage(failures: list[str]) -> None:
         failures,
     )
     require(
-        "no top-level `paths:` filter" in ci_cd
-        and "live_suite_path_filter.py" in ci_cd,
-        "docs/ci_cd.md must document the retired PR-widenable NodeWaypoint "
-        "pull_request.paths filter and the trusted-base classifier that "
-        "replaced it (issue #3908)",
+        "merge_group" in ci_cd and "no workflow-level `paths:`" in ci_cd.lower(),
+        "docs/ci_cd.md must document that the governed live workflows carry no "
+        "pull-request-supplied `paths:` trigger filter and re-evaluate on "
+        "merge_group",
         failures,
     )
     require(
@@ -2858,19 +2950,15 @@ def check_docs_and_coverage(failures: list[str]) -> None:
         failures,
     )
     require(
-        "node_waypoint_relevant" in ci_cd
-        and "always()" in ci_cd
-        and "needs.changes.outputs.relevant == 'true'" in ci_cd,
-        "docs/ci_cd.md must document the frozen NodeWaypoint live-datapath "
-        "binding and the retained narrower production-runtime verdict",
+        "node_waypoint_relevant" in ci_cd and "always()" in ci_cd,
+        "docs/ci_cd.md must document the NodeWaypoint job-level always() exact-false skip",
         failures,
     )
     require(
-        "prior-scope" in ci_cd
-        and ("nodewaypoint" in ci_cd.lower() or "node-waypoint" in ci_cd.lower())
-        and "superset" in ci_cd.lower(),
-        "docs/ci_cd.md must document that the trusted classifier suite stays a "
-        "superset of the planner's prior NodeWaypoint scope",
+        "prior" in ci_cd.lower()
+        and ("nodewaypoint" in ci_cd.lower() or "node-waypoint" in ci_cd.lower()),
+        "docs/ci_cd.md must document NodeWaypoint prior-scope scheduling vs "
+        "the production-image trigger superset",
         failures,
     )
     require(
@@ -4179,7 +4267,95 @@ def self_test() -> int:
         failures,
     )
 
-    GOOD_TRIGGER = (
+    filtered_trigger = (
+        "name: demo\n"
+        "on:\n"
+        "  workflow_dispatch:\n"
+        "  pull_request:\n"
+        "    paths:\n"
+        "      - Dockerfile\n"
+        "  merge_group:\n"
+        "    types:\n"
+        "      - checks_requested\n"
+        "  push:\n"
+        "    branches:\n"
+        "      - main\n"
+    )
+    filtered_trigger_failures: list[str] = []
+    check_governed_live_trigger_shape(
+        filtered_trigger,
+        "self-test-filtered-trigger",
+        filtered_trigger_failures,
+    )
+    require(
+        any(
+            "must not restore a pull_request.paths filter" in item
+            for item in filtered_trigger_failures
+        )
+        and any(
+            "must not filter a governed live trigger by `paths:`" in item
+            for item in filtered_trigger_failures
+        ),
+        "self-test: a restored pull_request.paths filter must fail the governed "
+        "trigger shape",
+        failures,
+    )
+
+    ignored_paths_trigger = (
+        "name: demo\n"
+        "on:\n"
+        "  workflow_dispatch:\n"
+        "  pull_request:\n"
+        "  merge_group:\n"
+        "    types:\n"
+        "      - checks_requested\n"
+        "  push:\n"
+        "    branches:\n"
+        "      - main\n"
+        "    paths-ignore:\n"
+        "      - docs/**\n"
+    )
+    ignored_paths_failures: list[str] = []
+    check_governed_live_trigger_shape(
+        ignored_paths_trigger,
+        "self-test-paths-ignore-trigger",
+        ignored_paths_failures,
+    )
+    require(
+        any(
+            "must not filter a governed live trigger by `paths-ignore:`" in item
+            for item in ignored_paths_failures
+        )
+        and any(
+            "push trigger must cover exactly the main branch" in item
+            for item in ignored_paths_failures
+        ),
+        "self-test: a paths-ignore filter must fail the governed trigger shape",
+        failures,
+    )
+
+    pr_only_trigger = (
+        "name: demo\n"
+        "on:\n"
+        "  workflow_dispatch:\n"
+        "  pull_request:\n"
+    )
+    pr_only_failures: list[str] = []
+    check_governed_live_trigger_shape(
+        pr_only_trigger,
+        "self-test-pr-only-trigger",
+        pr_only_failures,
+    )
+    require(
+        any("must trigger on `merge_group`" in item for item in pr_only_failures)
+        and any("must trigger on `push`" in item for item in pr_only_failures),
+        "self-test: a pull-request-only live trigger must fail closed",
+        failures,
+    )
+
+    # A `paths:` key inside a job step must not be mistaken for a trigger
+    # filter, and the complete four-event shape must pass.
+    good_trigger = (
         "name: demo\n"
         "on:\n"
         "  workflow_dispatch:\n"
@@ -4192,135 +4368,22 @@ def self_test() -> int:
         "      - main\n"
         "\n"
         "jobs:\n"
+        "  demo:\n"
+        "    steps:\n"
+        "      - uses: actions/upload-artifact@0000000000000000000000000000000000000000\n"
+        "        with:\n"
+        "          paths: target/demo\n"
     )
     good_trigger_failures: list[str] = []
     check_governed_live_trigger_shape(
-        GOOD_TRIGGER,
+        good_trigger,
         "self-test-good-trigger",
         good_trigger_failures,
     )
     require(
         not good_trigger_failures,
-        "self-test: unconditional governed live trigger should pass: "
+        "self-test: the governed four-event live trigger should pass: "
         + "; ".join(good_trigger_failures),
-        failures,
-    )
-
-    restored_paths = GOOD_TRIGGER.replace(
-        "  pull_request:\n",
-        "  pull_request:\n    paths:\n      - src/**\n",
-        1,
-    )
-    restored_paths_failures: list[str] = []
-    check_governed_live_trigger_shape(
-        restored_paths,
-        "self-test-restored-paths",
-        restored_paths_failures,
-    )
-    require(
-        any(
-            "must not declare a PR-widenable pull_request.paths filter" in item
-            for item in restored_paths_failures
-        )
-        and any(
-            "must not declare any top-level paths/paths-ignore filter" in item
-            for item in restored_paths_failures
-        ),
-        "self-test: a restored PR-widenable paths filter must fail",
-        failures,
-    )
-
-    paths_ignore = GOOD_TRIGGER.replace(
-        "  push:\n    branches:\n      - main\n",
-        "  push:\n    branches:\n      - main\n    paths-ignore:\n      - docs/**\n",
-        1,
-    )
-    paths_ignore_failures: list[str] = []
-    check_governed_live_trigger_shape(
-        paths_ignore,
-        "self-test-paths-ignore",
-        paths_ignore_failures,
-    )
-    require(
-        any(
-            "must not declare any top-level paths/paths-ignore filter" in item
-            for item in paths_ignore_failures
-        ),
-        "self-test: a paths-ignore filter must fail",
-        failures,
-    )
-
-    for dropped_event, expected in (
-        ("  workflow_dispatch:\n", "must trigger on workflow_dispatch"),
-        ("  pull_request:\n", "must trigger on pull_request"),
-        (
-            "  merge_group:\n    types:\n      - checks_requested\n",
-            "must trigger on merge_group",
-        ),
-        ("  push:\n    branches:\n      - main\n", "must trigger on push"),
-    ):
-        dropped = GOOD_TRIGGER.replace(dropped_event, "", 1)
-        require(
-            dropped != GOOD_TRIGGER,
-            f"self-test: the {expected!r} trigger mutation is stale",
-            failures,
-        )
-        dropped_failures: list[str] = []
-        check_governed_live_trigger_shape(
-            dropped,
-            "self-test-dropped-event",
-            dropped_failures,
-        )
-        require(
-            any(expected in item for item in dropped_failures),
-            f"self-test: a workflow missing its trigger must fail ({expected})",
-            failures,
-        )
-
-    loose_merge_group = GOOD_TRIGGER.replace(
-        "  merge_group:\n    types:\n      - checks_requested\n",
-        "  merge_group:\n",
-        1,
-    )
-    loose_merge_group_failures: list[str] = []
-    check_governed_live_trigger_shape(
-        loose_merge_group,
-        "self-test-loose-merge-group",
-        loose_merge_group_failures,
-    )
-    require(
-        any(
-            "must pin merge_group to types: [checks_requested]" in item
-            for item in loose_merge_group_failures
-        ),
-        "self-test: an unpinned merge_group trigger must fail",
-        failures,
-    )
-
-    no_on_block_failures: list[str] = []
-    check_governed_live_trigger_shape(
-        "name: demo\njobs:\n",
-        "self-test-no-on-block",
-        no_on_block_failures,
-    )
-    require(
-        any(
-            "must declare a canonical top-level on: mapping" in item
-            for item in no_on_block_failures
-        ),
-        "self-test: a workflow without an on: mapping must fail",
-        failures,
-    )
-
-    unmapped_production = [
-        probe
-        for probe in production_dockerfile_probe_paths()
-        if probe.startswith("unmapped-production-pattern:")
-    ]
-    require(
-        not unmapped_production,
-        "self-test: verifier must map every production-dockerfile-smoke planner "
-        f"pattern ({', '.join(item[27:] for item in unmapped_production)})",
         failures,
     )
 
@@ -4440,16 +4503,8 @@ def self_test() -> int:
         failures,
     )
 
-    def _live_workflow(live_if: str, needs: str = "changes") -> str:
-        needs_line = f"    needs: {needs}\n" if needs else ""
+    def _live_workflow(live_if: str) -> str:
         return (
-            "  changes:\n"
-            "    outputs:\n"
-            "      relevant: ${{ steps.filter.outputs.relevant }}\n"
-            "    steps:\n"
-            "      - name: Check for node-waypoint-ebpf changes\n"
-            "        run: |\n"
-            '          python3 -I "$trusted_filter" --suite node-waypoint-ebpf\n'
             "  production-dockerfile-plan:\n"
             "    outputs:\n"
             "      relevant: ${{ steps.filter.outputs.relevant }}\n"
@@ -4463,7 +4518,7 @@ def self_test() -> int:
             "          emit_suite_verdict node-waypoint-ebpf-live node_waypoint_relevant\n"
             "  node-waypoint-ebpf-live:\n"
             "    name: NodeWaypoint eBPF live datapath\n"
-            f"{needs_line}"
+            "    needs: production-dockerfile-plan\n"
             f"    if: {live_if}\n"
             "    runs-on: ubuntu-24.04\n"
             "    timeout-minutes: 120\n"
@@ -4482,101 +4537,166 @@ def self_test() -> int:
     )
     require(
         not good_live_failures,
-        "self-test: frozen-relevance NodeWaypoint live binding should pass: "
+        "self-test: exact-false NodeWaypoint live skip should pass: "
         + "; ".join(good_live_failures),
         failures,
     )
 
-    planner_gated_failures: list[str] = []
+    exact_true_failures: list[str] = []
     check_node_waypoint_live_job(
         _live_workflow(
-            "always() && needs.production-dockerfile-plan.outputs."
-            "node_waypoint_relevant != 'false'",
-            needs="production-dockerfile-plan",
+            "always() && needs.production-dockerfile-plan.outputs.node_waypoint_relevant == 'true'"
         ),
-        "self-test-live-planner-gated",
-        planner_gated_failures,
+        "self-test-live-exact-true",
+        exact_true_failures,
     )
     require(
-        any(
-            "must depend on the frozen trusted-base changes job" in item
-            for item in planner_gated_failures
-        )
-        and any(
-            "must be bound to the frozen relevance output" in item
-            for item in planner_gated_failures
-        )
-        and any(
-            "must not re-introduce the narrower" in item
-            for item in planner_gated_failures
-        ),
-        "self-test: a NodeWaypoint live job still gated on the narrower planner "
-        "verdict must fail",
+        any("must not treat blank/malformed output as a skip" in item for item in exact_true_failures)
+        or any("skip only on exact" in item for item in exact_true_failures),
+        "self-test: NodeWaypoint live job gated on == 'true' must fail",
         failures,
     )
 
-    always_prefixed_failures: list[str] = []
+    no_always_failures: list[str] = []
     check_node_waypoint_live_job(
-        _live_workflow("always() && needs.changes.outputs.relevant == 'true'"),
-        "self-test-live-always-prefixed",
-        always_prefixed_failures,
+        _live_workflow(
+            "needs.production-dockerfile-plan.outputs.node_waypoint_relevant != 'false'"
+        ),
+        "self-test-live-no-always",
+        no_always_failures,
     )
     require(
-        any(
-            "must keep the frozen binding exactly" in item
-            for item in always_prefixed_failures
-        ),
-        "self-test: an always()-prefixed NodeWaypoint live binding must fail",
+        any("always()" in item for item in no_always_failures),
+        "self-test: NodeWaypoint live job without always() must fail",
         failures,
     )
 
-    widened_failures: list[str] = []
+    success_required_failures: list[str] = []
     check_node_waypoint_live_job(
-        _live_workflow("needs.changes.outputs.relevant != 'false'"),
-        "self-test-live-widened",
-        widened_failures,
+        _live_workflow(
+            "always() && needs.production-dockerfile-plan.result == 'success' && "
+            "needs.production-dockerfile-plan.outputs.node_waypoint_relevant != 'false'"
+        ),
+        "self-test-live-success-required",
+        success_required_failures,
     )
     require(
-        any(
-            "must be bound to the frozen relevance output" in item
-            for item in widened_failures
-        ),
-        "self-test: a widened NodeWaypoint relevance binding must fail",
+        any("must not require planner success" in item for item in success_required_failures)
+        or any("skip only on exact" in item for item in success_required_failures),
+        "self-test: NodeWaypoint live job requiring planner success must fail",
         failures,
     )
 
     unbound_failures: list[str] = []
+    unbound_workflow = _live_workflow(NODE_WAYPOINT_LIVE_IF).replace(
+        "    needs: production-dockerfile-plan\n",
+        "",
+    )
     check_node_waypoint_live_job(
-        _live_workflow(NODE_WAYPOINT_LIVE_IF, needs=""),
+        unbound_workflow,
         "self-test-live-unbound",
         unbound_failures,
     )
     require(
-        any(
-            "must depend on the frozen trusted-base changes job" in item
-            for item in unbound_failures
-        ),
+        any("must depend on the trusted planner job" in item for item in unbound_failures),
         "self-test: NodeWaypoint live job without needs must fail",
         failures,
     )
 
-    missing_plan_output_failures: list[str] = []
-    check_node_waypoint_live_job(
-        _live_workflow(NODE_WAYPOINT_LIVE_IF).replace(
-            "      node_waypoint_relevant: ${{ steps.filter.outputs."
-            "node_waypoint_relevant }}\n",
-            "",
-            1,
+    def _node_waypoint_aggregate(skip_if: str, fail_if: str) -> str:
+        return (
+            "  node-waypoint-ebpf-live-gate:\n"
+            "    name: NodeWaypoint eBPF Live\n"
+            "    runs-on: ubuntu-latest\n"
+            "    needs:\n"
+            "      - production-dockerfile-plan\n"
+            "      - node-waypoint-ebpf-live\n"
+            "    if: always()\n"
+            "    steps:\n"
+            "      - name: Fail when NodeWaypoint relevance planning fails\n"
+            "        if: needs.production-dockerfile-plan.result != 'success'\n"
+            "        run: exit 1\n"
+            "      - name: Skip NodeWaypoint eBPF live datapath for unrelated changes\n"
+            f"        if: {skip_if}\n"
+            "        run: echo skip\n"
+            "      - name: Fail when the NodeWaypoint eBPF live datapath did not succeed\n"
+            f"        if: {fail_if}\n"
+            "        run: exit 1\n"
+        )
+
+    exact_false_skip = f"{NODE_WAYPOINT_PLANNER_OUTPUT} == 'false'"
+    scheduled_fail = (
+        f"{NODE_WAYPOINT_PLANNER_OUTPUT} != 'false' && "
+        "needs.node-waypoint-ebpf-live.result != 'success'"
+    )
+
+    good_aggregate_failures: list[str] = []
+    check_node_waypoint_aggregate(
+        _node_waypoint_aggregate(exact_false_skip, scheduled_fail),
+        "self-test-node-waypoint-aggregate",
+        good_aggregate_failures,
+    )
+    require(
+        not good_aggregate_failures,
+        "self-test: the exact-false NodeWaypoint aggregate should pass: "
+        + "; ".join(good_aggregate_failures),
+        failures,
+    )
+
+    loose_aggregate_failures: list[str] = []
+    check_node_waypoint_aggregate(
+        _node_waypoint_aggregate(
+            f"{NODE_WAYPOINT_PLANNER_OUTPUT} != 'true'", scheduled_fail
         ),
-        "self-test-live-missing-plan-output",
-        missing_plan_output_failures,
+        "self-test-node-waypoint-aggregate-loose",
+        loose_aggregate_failures,
     )
     require(
         any(
-            "must expose node_waypoint_relevant as a job output" in item
-            for item in missing_plan_output_failures
+            "aggregate skip must use exact" in item
+            for item in loose_aggregate_failures
+        )
+        and any(
+            "must not treat a blank verdict as irrelevance" in item
+            for item in loose_aggregate_failures
         ),
-        "self-test: a dropped node_waypoint_relevant planner verdict must fail",
+        "self-test: a `!= 'true'` NodeWaypoint aggregate skip must fail",
+        failures,
+    )
+
+    unscheduled_aggregate_failures: list[str] = []
+    check_node_waypoint_aggregate(
+        _node_waypoint_aggregate(
+            exact_false_skip,
+            f"{NODE_WAYPOINT_PLANNER_OUTPUT} == 'true' && "
+            "needs.node-waypoint-ebpf-live.result != 'success'",
+        ),
+        "self-test-node-waypoint-aggregate-unscheduled",
+        unscheduled_aggregate_failures,
+    )
+    require(
+        any(
+            "must fail whenever the live job was scheduled and did not succeed"
+            in item
+            for item in unscheduled_aggregate_failures
+        ),
+        "self-test: a NodeWaypoint aggregate that only judges exact-true runs "
+        "must fail",
+        failures,
+    )
+
+    missing_aggregate_failures: list[str] = []
+    check_node_waypoint_aggregate(
+        "  other-job:\n    steps:\n      - run: true\n",
+        "self-test-node-waypoint-aggregate-missing",
+        missing_aggregate_failures,
+    )
+    require(
+        any(
+            "aggregate so an irrelevant run still reports a result" in item
+            for item in missing_aggregate_failures
+        ),
+        "self-test: a missing NodeWaypoint aggregate must fail",
         failures,
     )
 

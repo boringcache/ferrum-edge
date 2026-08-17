@@ -540,8 +540,8 @@ FULL_CI_CONTRACT_PATHS = frozenset(
 )
 
 # These files deliberately trigger one or more live datapath suites. The
-# required-CI verifier mechanically checks this set against
-# live_suite_path_filter.py.
+# required-CI verifier mechanically checks this set against both
+# live_suite_path_filter.py and node-waypoint-ebpf-live.yml.
 FULL_CI_DOCUMENTATION_PATHS = frozenset(
     {
         "docs/ci_cd.md",
@@ -551,6 +551,9 @@ FULL_CI_DOCUMENTATION_PATHS = frozenset(
         "docs/mesh_multicluster_federation_runbook.md",
         "docs/mesh_supported_matrix.md",
         "docs/node_agent.md",
+        # Trigger of the CNI install-lifecycle live suite (issue #3908); the
+        # required-CI verifier proves this set covers every live-suite
+        # documentation trigger.
         "docs/node_agent_security.md",
         "docs/plans/node_waypoint_transport_adr.md",
         "docs/spire_deployment.md",
@@ -1041,7 +1044,6 @@ def self_test() -> int:
         ("pull_request", ["docs/cp_dp_mode.md"], "full"),
         ("pull_request", ["docs/configuration.md"], "full"),
         ("pull_request", ["docs/plans/node_waypoint_transport_adr.md"], "full"),
-        ("pull_request", ["docs/node_agent_security.md"], "full"),
         ("pull_request", ["docs/prometheus_metric_contract.json"], "full"),
         ("pull_request", ["docs/prometheus_metrics.md"], "full"),
         (

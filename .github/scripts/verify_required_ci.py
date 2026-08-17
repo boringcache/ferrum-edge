@@ -13,6 +13,9 @@ from check_node_agent_chart_runtime import (
     check_repository as check_node_agent_chart_runtime,
     main as node_agent_chart_runtime_main,
 )
+from ci_runtime_plan import (
+    SUITE_PATTERNS as CI_RUNTIME_SUITE_PATTERNS,
+)
 from live_suite_path_filter import (
     LIVE_SUITE_DOCUMENTATION_PATHS,
     SUITE_PATTERNS,
@@ -288,6 +291,24 @@ REQUIRED_MERGE_GROUP_WORKFLOWS = {
     ".github/workflows/ambient-host-udp-live.yml": "Ambient Host UDP Live",
 }
 
+# Issue #3908 migrated three optional live suites off pull-request-supplied
+# `paths:` triggers and onto trusted-base relevance with an always-reporting
+# aggregate. They are DELIBERATELY not branch-protection-required: the issue
+# says so, `.claude/rules/testing.md` says so, and the whole point of the
+# always-reporting aggregate is that an irrelevant run is visibly green rather
+# than a required check that never arrives.
+#
+# Pin both halves. The check name must stay out of the required tables, so a
+# later change cannot quietly promote a 120-minute Kind/eBPF suite into the
+# merge queue; and the triggers must stay unconditional on pull_request,
+# merge_group, and push to `main`, so the coverage the migration bought cannot
+# be given back by re-adding a filter.
+OPTIONAL_LIVE_SUITE_WORKFLOWS = {
+    ".github/workflows/node-waypoint-ebpf-live.yml": "NodeWaypoint eBPF Live",
+    ".github/workflows/istio-status-cas-live.yml": "Istio Status CAS Live",
+    ".github/workflows/cni-lifecycle-live.yml": "CNI Lifecycle Live",
+}
+
 # Markers that prove merge-group runs bind validation to the synthesized SHA /
 # payload base rather than absent pull_request fields or a main-only fallback.
 MERGE_GROUP_SHA_CONTRACT_MARKERS = (
@@ -534,38 +555,6 @@ def merge_group_self_test() -> list[str]:
     ):
         if marker not in cross:
             failures.append(f"cross-build policy missing merge_group safety marker {marker!r}")
-
-    if extract_documentation_paths(
-        "on:\n  pull_request:\n    paths:\n      - docs/mesh.md\n"
-    ) != {"docs/mesh.md"}:
-        failures.append("extract_documentation_paths missed a workflow paths entry")
-
-    optional_live_workflows = {
-        ".github/workflows/node-waypoint-ebpf-live.yml",
-        ".github/workflows/istio-status-cas-live.yml",
-        ".github/workflows/cni-lifecycle-live.yml",
-    }
-    optional_live_checks = {
-        "NodeWaypoint eBPF Live",
-        "Istio Status CAS Live",
-        "CNI Lifecycle Live",
-    }
-    for workflow_path in optional_live_workflows:
-        if workflow_path in REQUIRED_MERGE_GROUP_WORKFLOWS:
-            failures.append(
-                f"{workflow_path} must not be added to required merge-group owners"
-            )
-        if workflow_path in DEDICATED_REQUIRED_CHECKS:
-            failures.append(
-                f"{workflow_path} must not be added to dedicated required checks"
-            )
-    required_check_names = {check["name"] for check in DEDICATED_REQUIRED_CHECKS.values()}
-    required_check_names.update(REQUIRED_MERGE_GROUP_WORKFLOWS.values())
-    for check_name in optional_live_checks:
-        if check_name in required_check_names:
-            failures.append(
-                f"optional live aggregate {check_name!r} must not become a required check"
-            )
 
     return failures
 
@@ -1177,6 +1166,76 @@ def main() -> int:
 
     planner_errors.extend(merge_group_self_test())
 
+    # Optional live suites (issue #3908): trusted-base relevance, an
+    # always-reporting aggregate, and NO branch-protection requirement.
+    required_check_names = set(REQUIRED_MERGE_GROUP_WORKFLOWS.values()) | {
+        required_check["name"] for required_check in DEDICATED_REQUIRED_CHECKS.values()
+    }
+    for workflow_path, aggregate_name in sorted(
+        OPTIONAL_LIVE_SUITE_WORKFLOWS.items()
+    ):
+        workflow_yml = Path(workflow_path).read_text(encoding="utf-8")
+        if workflow_path in REQUIRED_MERGE_GROUP_WORKFLOWS:
+            planner_errors.append(
+                f"{workflow_path} must stay out of REQUIRED_MERGE_GROUP_WORKFLOWS; "
+                "promoting an optional live suite to a required check is a "
+                "separate, deliberate branch-protection change"
+            )
+        if workflow_path in DEDICATED_REQUIRED_CHECKS:
+            planner_errors.append(
+                f"{workflow_path} must stay out of DEDICATED_REQUIRED_CHECKS"
+            )
+        if aggregate_name in required_check_names:
+            planner_errors.append(
+                f"{workflow_path} aggregate `{aggregate_name}` must not collide "
+                "with a branch-protection-required check name"
+            )
+        # The aggregate is what reports for the suite, so it has to exist and
+        # run unconditionally; without `always()` a skipped live job would take
+        # the aggregate with it and the suite would report nothing at all.
+        if not re.search(
+            rf"(?m)^    name: {re.escape(aggregate_name)}$", workflow_yml
+        ):
+            planner_errors.append(
+                f"{workflow_path} must keep the always-reporting aggregate "
+                f"`{aggregate_name}`"
+            )
+        if not re.search(r"(?m)^    if: always\(\)$", workflow_yml):
+            planner_errors.append(
+                f"{workflow_path} aggregate must run with if: always()"
+            )
+        # The three triggers the migration bought. A `paths:` filter re-added
+        # to any of them would put relevance back in the pull request's own
+        # checkout, which is the defect #3908 closed.
+        if not pull_request_trigger_is_unconditional(workflow_yml):
+            planner_errors.append(
+                f"{workflow_path} must trigger on every pull request without "
+                "path filters; relevance belongs to the trusted-base classifier"
+            )
+        if not merge_group_trigger_is_present(workflow_yml):
+            planner_errors.append(
+                f"{workflow_path} must declare an unconditional merge_group "
+                "trigger so queue-combined commits are re-evaluated"
+            )
+        if not main_push_trigger_is_unconditional(workflow_yml):
+            planner_errors.append(
+                f"{workflow_path} must run on every push to main so a "
+                "queue-combined regression surfaces immediately"
+            )
+        for marker in MERGE_GROUP_SHA_CONTRACT_MARKERS:
+            if marker not in workflow_yml:
+                planner_errors.append(
+                    f"{workflow_path} must be event-aware for merge_group "
+                    f"SHA/base selection (missing `{marker}`)"
+                )
+        for marker in MERGE_GROUP_CONCURRENCY_MARKERS:
+            if marker not in workflow_yml:
+                planner_errors.append(
+                    f"{workflow_path} concurrency must distinguish merge_group "
+                    f"runs (missing `{marker}`)"
+                )
+
+
     ci_plan_body = extract_job_body(ci_yml, "ci-plan")
     pr_nul_diff = (
         'git diff --name-only --no-renames -z "${base_ref}...HEAD" > "$changed_files"'
@@ -1569,11 +1628,26 @@ def main() -> int:
     planner_errors.extend(validate_release_workflow(release_yml))
     planner_errors.extend(release_attestation_self_test(release_yml))
 
-    # Governed live suites decide documentation triggers from
-    # `LIVE_SUITE_DOCUMENTATION_PATHS` in the trusted classifier. They must
-    # not carry a workflow-level `paths:` filter, including the optional
-    # NodeWaypoint / Istio CAS / CNI suites migrated in issue #3908.
-    required_full_ci_docs = LIVE_SUITE_DOCUMENTATION_PATHS
+    # None of the governed live workflows carries a top-level `paths:` block any
+    # more: `ambient-host-udp-live.yml` never did, and issue #3908 retired the
+    # last three. Every one of them decides relevance from a trusted-base
+    # classifier instead, so the documentation trigger set is read from the
+    # classifiers rather than scraped from a workflow trigger — from
+    # `LIVE_SUITE_DOCUMENTATION_PATHS` for the `live_suite_path_filter.py`
+    # suites, and from the `node-waypoint-ebpf-live` suite of
+    # `ci_runtime_plan.py`, which is the sole relevance authority for the
+    # NodeWaypoint Kind/eBPF job.
+    node_waypoint_doc_paths = {
+        pattern.removeprefix("^").removesuffix("$").replace("\\.", ".")
+        for pattern in CI_RUNTIME_SUITE_PATTERNS["node-waypoint-ebpf-live"]
+        if pattern.startswith("^docs/") and pattern.endswith("$")
+    }
+    if not node_waypoint_doc_paths:
+        planner_errors.append(
+            "ci_runtime_plan.py node-waypoint-ebpf-live suite must keep exact "
+            "documentation trigger patterns"
+        )
+    required_full_ci_docs = LIVE_SUITE_DOCUMENTATION_PATHS | node_waypoint_doc_paths
     configured_live_doc_patterns = {
         pattern
         for patterns in SUITE_PATTERNS.values()
@@ -1591,26 +1665,6 @@ def main() -> int:
         planner_errors.append(
             f"PR planner must keep live-suite documentation `{path}` on full CI"
         )
-
-    optional_trusted_live_workflows = (
-        ".github/workflows/node-waypoint-ebpf-live.yml",
-        ".github/workflows/istio-status-cas-live.yml",
-        ".github/workflows/cni-lifecycle-live.yml",
-    )
-    for optional_live in optional_trusted_live_workflows:
-        optional_yml = Path(optional_live).read_text(encoding="utf-8")
-        if not pull_request_trigger_is_unconditional(optional_yml):
-            planner_errors.append(
-                f"{optional_live} must trigger on every pull request without path filters"
-            )
-        if not merge_group_trigger_is_present(optional_yml):
-            planner_errors.append(
-                f"{optional_live} must declare an unconditional merge_group trigger"
-            )
-        if not main_push_trigger_is_unconditional(optional_yml):
-            planner_errors.append(
-                f"{optional_live} must push to main without a paths filter"
-            )
 
     if not missing and not extra and not planner_errors:
         print(
