@@ -221,7 +221,10 @@ jobs:
 
       - uses: ./.github/actions/setup-rust-ci
         with:
-          shared-key: ci-multicluster-poller-partition-live
+          # Same default-feature `pr-build` ferrum-edge graph as the other
+          # live labs that compile only that binary. Do not share with
+          # extra-binary, extra-feature, or debug-profile lanes.
+          shared-key: "ci-live-pr-build"
 
       - name: Build runtime binary
         run: cargo build --profile pr-build --bin ferrum-edge

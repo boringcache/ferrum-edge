@@ -117,7 +117,7 @@ ferrum_version() {
 }
 
 start_upstream_stub() {
-    echo -e "${YELLOW}Starting dns_upstream_stub on 127.0.0.1:${UPSTREAM_STUB_PORT}...${NC}"
+    echo -e "${YELLOW}Starting dns_upstream_stub on UDP+TCP 127.0.0.1:${UPSTREAM_STUB_PORT}...${NC}"
     "$SCRIPT_DIR/target/release/dns_upstream_stub" --listen "127.0.0.1:${UPSTREAM_STUB_PORT}" \
         > "$SCRIPT_DIR/upstream.log" 2>&1 &
     UPSTREAM_PID=$!
