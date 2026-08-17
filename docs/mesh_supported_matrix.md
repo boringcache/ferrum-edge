@@ -216,12 +216,222 @@ need them, or because they are blocked upstream / architecturally:
   replacement UID/identity is admitted while stale registry state is gone, then
   restarts the SPIRE Agent and NodeWaypoint DaemonSets and proves SVID-backed
   traffic, policy, and HBONE authentication recover.
-- **UDP/DTLS per-pod authz scoping on NodeWaypoint** — architectural (no UDP
-  capture hooks); enforcing namespace/selector-scoped policies with UDP/DTLS
-  services or proxies force the NodeWaypoint UDP/DTLS path closed during config
-  preparation while the policy update still applies to supported TCP/HTTP
-  traffic. Mesh-wide UDP/DTLS policy stays supported, and Sidecar remains the
-  supported topology for workload-scoped UDP/DTLS authorization.
+- **UDP/DTLS per-pod authz scoping on NodeWaypoint — supported on Linux**
+  (issue #3286). The socket-cookie channel stays TCP-only, so UDP/DTLS resolves
+  its source workload from a separate exact channel: the kernel-reported ingress
+  interface of each datagram (`IP_PKTINFO`/`IPV6_PKTINFO`) joined against the
+  node-agent registry's published pod addresses and attested SPIFFE identity. The
+  resolved pod's `PolicyScopeCache` is stamped before `mesh_authz`, so
+  namespace/selector-scoped `AuthorizationPolicy` enforces per source workload and
+  UDP/DTLS service ports and proxies stay routable. A session is unattributable
+  when there is no ingress-interface cmsg, when the interface is one no enrolled
+  pod owns (all off-node traffic), when two enrolled pods claim it, when the
+  source address is not one the interface's pod owns, when the registry entry
+  carries no attested identity or address, or when the pod's workload has left
+  the live slice. Such a session carries no per-pod scope, and `mesh_authz`
+  then applies **exactly the same rule as the TCP stream path**: it is denied
+  whenever any enforcing namespace/selector-scoped `AuthorizationPolicy` is
+  loaded, and it falls through to mesh-wide evaluation in a mesh that carries
+  only mesh-wide policies (which is fully evaluable without a per-pod scope, and
+  is the pre-#3286 behaviour for those meshes). It is therefore not true that
+  every unattributable UDP/DTLS session is refused at the session boundary
+  regardless of policy — scoped enforcement is what makes the refusal.
+  Admitted sessions are re-authorized per datagram, so pod churn, veth reuse,
+  and registry removal terminate them; a datagram that merely names an
+  established session's (forgeable) source tuple from a different ingress
+  interface is refused on its own without ending that session. A scoped
+  listener whose socket cannot report ingress interfaces at all does not start:
+  the bind is reported as failed rather than serving a listener that could only
+  deny. The blanket config-preparation suppression of NodeWaypoint UDP/DTLS
+  remains only on builds where the channel cannot exist (non-Linux). Mesh-wide
+  UDP/DTLS policy is unchanged.
+- **NodeWaypoint UDP/DTLS Service-path reachability — supported on Linux**
+  (issue #3286 root review). Materializing a listener does not make it
+  reachable: a workload addressing its Service ClusterIP has that datagram
+  DNAT-ed by kube-proxy to a backing pod and then DROPPED by the pod-veth guard,
+  so the Service path was a black hole and only a direct dial to a trusted node
+  address worked. Transparent steering (`raw` `--notrack` + `mangle` mark +
+  Ferrum-owned `fwmark`/`local` route, scoped `-i <pod veth> -d <ClusterIP>
+  --dport <port>`) now delivers that datagram to the materialized listener
+  **without rewriting it**, so the source address, the ingress interface, and
+  the original destination all survive and the reply is sourced back from the
+  ClusterIP through a transparent socket. What is and is not covered:
+  - **Proven live** (`node-waypoint-ebpf-live`,
+    `node_waypoint.udp.service_path_allow_attributed_source`): an enrolled pod
+    sending to a `protocol: UDP` Service's ClusterIP reaches the production
+    listener, the backend logs the datagram, and the echo returns — under
+    kube-proxy **iptables** mode, IPv4, on kind.
+  - **Proven live for DTLS too**
+    (`node_waypoint.dtls.service_path_allow_attributed_source`,
+    `node_waypoint.dtls.service_path_deny_scoped_policy`, and
+    `node_waypoint.dtls.service_path_deny_unattributed_source`): an enrolled pod
+    resolves the `dtls-echo` Service DNS name, completes a real
+    `openssl s_client -dtls1_2` handshake against its ClusterIP through the
+    production listener, its decrypted datagram reaches the backend (which logs
+    it) and the echo returns; a namespace-scoped-denied source and an unenrolled
+    source both get no application data with the backend proving it saw nothing.
+    A steered DTLS session works because the `DtlsServer` PINS the captured
+    local destination per peer and sources every encrypted record from it —
+    initial handshake flight, ordinary output drain, retransmits, application
+    replies, and the final shutdown flush — over a transparent socket. A
+    datagram whose capture does not match the pinned one, or that carries no
+    capture at all on a scoped listener, is dropped before any session state is
+    allocated or delivered. The direct-node-address probes
+    (`node_waypoint.dtls.listener_bound`,
+    `node_waypoint.dtls.listener_allow_attributed_source`,
+    `node_waypoint.dtls.listener_deny_scoped_policy`) are retained as a
+    **distinct boundary**, not as substitute evidence for the Service path.
+  - **Not exercised, not claimed**: IPv6 Service steering, kube-proxy `ipvs` and
+    `nftables` modes, and headless (ClusterIP-less) services, which have no
+    address to steer and remain direct-address only.
+  - **Requires** `iptables` and `ip` in the NodeWaypoint image (the
+    `-ebpf-tools` image) plus `NET_ADMIN`; a `dtls` listener additionally needs
+    `NET_ADMIN` (or `NET_RAW` on newer kernels) for its transparent socket, and
+    refuses to start without it. Every PUBLISHED address family must be
+    installable in full: a node missing `ip6tables` while an IPv6 destination is
+    published fails the WHOLE apply, tears every Ferrum-owned object down, and
+    retries on the next reconcile — there is no per-family best-effort arm,
+    because a published-but-uninstalled family is a silent black hole that
+    would never be retried. A node that cannot install the plan leaves the
+    Service path unsteered, which is a lost service, never an unauthorized one.
+  - **Stale-rule reaping**: the chains, `ip rule`, and route survive the process
+    that installed them, so the FIRST reconcile of every process runs the
+    exact-name teardown even when it steers nothing; later unchanged polls run
+    no command. A generation change empties the `mangle` mark chain BEFORE the
+    `raw` notrack chain is repopulated, so no datagram is ever marked under a
+    destination generation whose notrack / local-delivery prerequisites do not
+    match it. The resulting window is unsteered (fail-closed at the pod-veth
+    guard), never cross-generation admission.
+  - **Steered interfaces are the PUBLISHED ones.** The steering interface set is
+    taken from the source-attribution index's published generation, after its
+    own refusals — a contested ingress interface (refused for both claimants), a
+    malformed or UID-mismatched binding, a duplicate, and an over-bound
+    generation all contribute nothing to steering.
+  - **Serving-generation ownership.** Mesh preparation may carry desired
+    destinations as candidate metadata; it must not publish the live datapath.
+    `StreamListenerManager` publishes only destinations whose UDP/DTLS listeners
+    are actually bound on the accepted serving generation, and retracts them
+    before those sockets go away (bind failure, deferred DTLS, withdrawal, task
+    failure, shutdown). A rejected or merely inspected candidate cannot change
+    steering, and a destination is never marked without a serving socket.
+
+
+  **The listener configuration surface.** The attribution channel is reachable
+  because a NodeWaypoint materializes real UDP/DTLS **service listeners** from
+  the mesh service inventory (`materialize_node_waypoint_udp_listeners`, opt-in
+  via `FERRUM_MESH_NODE_WAYPOINT_UDP_LISTENERS_ENABLED`). Each in-mesh
+  `MeshService` port whose protocol is `udp` (opaque datagram relay) or `dtls`
+  (frontend DTLS termination — the same L4 transport, selected by an
+  `appProtocol: dtls` / port-name hint on a `protocol: UDP` Service port, or by
+  a `dtls` Istio `ServiceEntry`/port protocol) materializes ONE datagram
+  listener on that port number, forwarding only to the service's backing pods
+  whose `node_waypoint.node_name` exactly matches the current
+  `FERRUM_K8S_NODE_NAME`, at their resolved `targetPort`. The backend socket's
+  authorization mark is node-local metadata and cannot cross nodes; enabling
+  the listener surface without that node name therefore fails serving startup
+  closed. Materialization runs DP-side in
+  `prepare_normalized_gateway_config_for_mesh`, exactly like the east-west and
+  egress-gateway stream listeners, so it needs neither a `stream_match` (which
+  `Proxy::validate` rejects on `udp`/`dtls`) nor a CP-side carrier. It is
+  default-OFF because a NodeWaypoint runs on the host network and enabling it
+  claims node-wide port numbers. Fail-closed refusals, each with a
+  field-specific log line and no inert leftovers: a port already claimed by a
+  mesh runtime listener or another stream proxy, incompatible same-port
+  frontend postures (mixed `udp`/`dtls` or multiple `dtls` claimants), an
+  ambiguous duplicate `(ClusterIP, port)` owner, a service port with no
+  reachable same-node endpoint, and port `0`. Compatible plain-`udp` Services
+  with distinct ClusterIPs share one listener and are demultiplexed by exact
+  destination. A
+  `dtls` port with no usable frontend DTLS material, or a scoped listener whose
+  socket cannot report ingress interfaces, fails the BIND and is reported as a
+  `StreamBindFailure` in readiness/status rather than starting a black-hole
+  listener. A `dtls` port stays unrepresentable at the EgressGateway
+  (terminate-and-re-originate has no DTLS origination path) and is refused
+  there with its own diagnostic.
+
+  **What is and is not proven, precisely.** The `node-waypoint-ebpf-live` gate
+  sends REAL datagrams through this production listener on a multi-pod kind
+  cluster (`tests/k8s/node_waypoint_ebpf_live/run.sh`,
+  `run_node_waypoint_udp_datapath_checks`): an admitted enrolled source reaches
+  the backend and gets its echo, a source denied by a scoped
+  `AuthorizationPolicy` gets nothing, an unenrolled source (and the same pod
+  FORGING an enrolled pod's source address over a raw socket) is refused
+  because attribution is the kernel-reported ingress interface, and a policy
+  change then withdrawal denies and restores that datapath with the ambient
+  DaemonSet's restart count unchanged. The relay itself is authorized past the pod-veth tc guard the same way the TCP
+  inbound relay is: the scoped listener's frontend socket and its per-session
+  backend socket carry `NODE_WAYPOINT_INBOUND_AUTH_MARK`, and `tc_inbound`'s
+  UDP arms (IPv4 and IPv6) admit a node-sourced datagram carrying that mark
+  before falling through to the existing DNS-response carve-out; unmarked UDP
+  to an enrolled pod stays dropped. A scoped listener that cannot set that
+  mark does not start.
+
+  The spoof probe needs a raw socket, so the `udp-unmanaged` pod is granted
+  `NET_RAW` explicitly and the probe prints its `SPOOF-SENT:` marker only after
+  `sendto` returns. `node_waypoint.udp.listener_deny_spoofed_source` passes
+  only when the forged datagram was ACTUALLY emitted and the backend log proves
+  it never arrived; a sandbox that cannot forge fails the required gate closed
+  rather than recording a refusal nothing attempted. The unenrolled-source
+  refusal remains an independent attribution proof.
+
+  **DTLS carries the same live gate.** The `dtls-echo` Service declares
+  `appProtocol: dtls` on a `protocol: UDP` port, so the NodeWaypoint
+  materializes a `frontend_tls: true` listener that TERMINATES DTLS on the
+  host-netns socket and forwards plaintext datagrams to the backing pod.
+  `run_node_waypoint_dtls_datapath_checks` drives a real
+  `openssl s_client -dtls1_2` handshake through it from a prebuilt
+  `ferrum-live-dtls-client` image (openssl cannot be `apk add`'d from a
+  mesh-enrolled pod: `connect4` rewrites that TCP `connect()` to the capture
+  listener; UDP `connect()` is left unrewritten so the DTLS client keeps the
+  host-netns destination) and records
+  `node_waypoint.dtls.listener_bound` (the handshake completes and the listener
+  presents the operator DTLS material — proof it bound, not that it was
+  configured), `node_waypoint.dtls.listener_allow_attributed_source` (the
+  admitted enrolled source's decrypted datagram reaches the backend, which logs
+  it, and the echo comes back), and
+  `node_waypoint.dtls.listener_deny_scoped_policy` (a source the
+  namespace-scoped `AuthorizationPolicy` denies gets no application data AND the
+  backend logs nothing from it). Those three are the DIRECT-NODE-ADDRESS
+  boundary; the ordinary user path — the Service DNS name / ClusterIP — is
+  proven separately by the three `node_waypoint.dtls.service_path_*` assertions
+  and neither substitutes for the other.
+
+  Because a `DtlsServer` owns the socket every encrypted record leaves from,
+  three socket options are stamped on it BEFORE the server object exists:
+  `DtlsServerLimits::socket_mark` (`NODE_WAYPOINT_INBOUND_AUTH_MARK`),
+  `DtlsServerLimits::transparent_reply_source` (`IP_TRANSPARENT` /
+  `IPV6_TRANSPARENT`, so a steered session can source records from the Service
+  ClusterIP), and `DtlsServerLimits::capture_ingress_ifindex` (the
+  `IP_PKTINFO` / `IPV6_PKTINFO` capture). A scoped DTLS listener that cannot
+  apply any of them fails construction and is reported as a bind failure. The
+  allow assertions above are what prove the mark and the pinned reply source are
+  really applied end to end.
+
+  The DTLS material itself comes from the DTLS-specific
+  `FERRUM_DTLS_CERT_PATH` / `FERRUM_DTLS_KEY_PATH` (+ optional
+  `FERRUM_DTLS_CLIENT_CA_CERT_PATH`), which mesh mode now loads at startup and
+  the PeerAuthentication live-reload path rebuilds from. `FERRUM_FRONTEND_TLS_*`
+  is deliberately NOT reused: on a mesh proxy that pair is the inbound TCP
+  listener's server identity, and sharing it would let configuring a DTLS
+  listener replace a SPIRE-issued inbound identity. Ordinary (non-generated)
+  DTLS without material stays visibly deferred (`FrontendDtlsDeferred`) rather
+  than binding. When generated NodeWaypoint DTLS listeners are required, a
+  missing dedicated cert/key or a Strict route without
+  `FERRUM_DTLS_CLIENT_CA_CERT_PATH` rejects the complete candidate before apply
+  and retains last-good.
+
+  Still **not** proven live: IPv6 DTLS, kube-proxy `ipvs`/`nftables` DTLS
+  steering, headless UDP/DTLS Services, multiple terminating-DTLS
+  claimants on one port, and a bound ordinary operator DTLS listener in the
+  same process (that stronger isolation remains unit/integration). Generated
+  DTLS client-certificate (mTLS) frontend verification and PeerAuthentication
+  PERMISSIVE → STRICT live-reload are proven by the
+  `node-waypoint-ebpf-live` assertions `node_waypoint.dtls.reload_*`.
+  Ordinary `FERRUM_DTLS_*` slot isolation is proven live only as unchanged
+  captured authenticated `/overload` `frontend_dtls_reload.generation` across
+  that publication (`node_waypoint.dtls.operator_isolated_across_reload`).
+  Same-port plain-UDP Service demultiplexing is proven by
+  `node_waypoint.udp.same_port_demux_*`.
 - **DR `connectionPool.http.maxRequestsPerConnection`** — parsed and validated
   but **Deferred** in status; backend close-after-N-requests is unsupported, so
   it is not projected as effective policy. Use `maxConcurrentStreams` for
@@ -258,9 +468,8 @@ ledger unless they change the support contract.
 
 | Deferral | Issue | Doc anchor |
 |---|---|---|
-| Enrolled Ambient destination pod UDP round trip (source-capture → HBONE → destination pod-netns relay; tc-inbound admit + reply socket inside destination pod netns) | [#3621](https://github.com/ferrum-edge/ferrum-edge/issues/3621) | `docs/mesh.md` UDP TPROXY capture footnote [12] |
 
-Completed historical rows (do **not** re-list as open): EgressGateway UDP `ServiceEntry` materialization (#3263 — external UDP ports materialize a datagram-over-mesh destination allowlist consumed by the gateway's authenticated mesh CONNECT terminator, plus the source-side `Sidecar`/`Ambient` producer that originates the identity-pinned `udp` CONNECT to the configured gateway; still no UDP/DTLS listener, by design); Ambient UDP capture producer + privileged live **source-capture** e2e (#2013 / #2038 — host-loopback destination echo only; enrolled-destination residual split to #3621); Ambient native gRPC over HBONE on the standard H1/H2 frontend (#3728 — the shared nested-HTTP/2 transport now serves every frontend; native gRPC still deliberately bypasses the generic HTTP/1.1 HBONE dispatch); VirtualService `tls[]` SNI passthrough L4 routing (`sniHosts` + port); general opaque-TLS SNI L4 routing outside passthrough (#3264 — an ordinary `tcp` stream listener that terminates nothing routes by normalized `server_name`, with fail-closed admission for indeterminate ClientHellos; see [`docs/tcp_udp_proxy.md`](tcp_udp_proxy.md#opaque-tls-sni-routing)); VirtualService `tcp[]`/`tls[]` weighted multi-destination splitting (#3251); remote-discovery JWT audience binding (#2475); subset-scoped DestinationRule HTTP connection-pool policy (#3228 / #3240–#3242); the poller-driven partition and bounded last-good-retention live gate (#3331); NodeWaypoint observability contract + maturity promotion gates (#3334 — ADR evidence table + Experimental→Beta/Beta→GA gates documented; maturity remains Experimental until promotion criteria close).
+Completed historical rows (do **not** re-list as open): EgressGateway UDP `ServiceEntry` materialization (#3263 — external UDP ports materialize a datagram-over-mesh destination allowlist consumed by the gateway's authenticated mesh CONNECT terminator, plus the source-side `Sidecar`/`Ambient` producer that originates the identity-pinned `udp` CONNECT to the configured gateway; still no UDP/DTLS listener, by design); Ambient UDP capture producer + privileged live source-capture **and enrolled-destination** e2e (#2013 / #2038 / #3621 — `functional_mesh_live_source_capture_udp_manager_hbone_round_trip` covers source-capture through HBONE to an echo bound inside the enrolled destination pod netns, and `node-waypoint-ebpf-live` independently proves the marked backend datagram is admitted through the enrolled-pod `tc_inbound` guard while unmarked traffic is dropped); Ambient native gRPC over HBONE on the standard H1/H2 frontend (#3728 — the shared nested-HTTP/2 transport now serves every frontend; native gRPC still deliberately bypasses the generic HTTP/1.1 HBONE dispatch); VirtualService `tls[]` SNI passthrough L4 routing (`sniHosts` + port); general opaque-TLS SNI L4 routing outside passthrough (#3264 — an ordinary `tcp` stream listener that terminates nothing routes by normalized `server_name`, with fail-closed admission for indeterminate ClientHellos; see [`docs/tcp_udp_proxy.md`](tcp_udp_proxy.md#opaque-tls-sni-routing)); VirtualService `tcp[]`/`tls[]` weighted multi-destination splitting (#3251); remote-discovery JWT audience binding (#2475); subset-scoped DestinationRule HTTP connection-pool policy (#3228 / #3240–#3242); the poller-driven partition and bounded last-good-retention live gate (#3331); NodeWaypoint observability contract + maturity promotion gates (#3334 — ADR evidence table + Experimental→Beta/Beta→GA gates documented; maturity remains Experimental until promotion criteria close).
 
 ## How a feature graduates
 
