@@ -401,9 +401,17 @@ rust-cache / the FIPS producer archive. Production-image cache restore and save 
 pinned `actions/cache/*` actions; PR-controlled `run:` steps only measure the
 restored directory and move the BuildKit local export. Workflows stay
 `permissions: contents: read`. Static checks live in
-`.github/scripts/verify_ci_runtime_cache.py` and fail closed on any
-occurrence of the exact `exportVariable` token in checked workflow and
-action text.
+`.github/scripts/verify_ci_runtime_cache.py`. The cache-credential gate is
+structural: `fips-build.yml` may invoke only a closed allowlist of pinned
+actions and the two local shell-only composites (`setup-sccache`,
+`setup-fast-linker`). Those local actions must remain `using: composite`
+with `run:` steps only — no nested `uses:`, so no inline or third-party
+JavaScript carrier can reach the Actions toolkit credential environment.
+Alternate YAML spellings of `uses` (flow mappings, quoted/escaped keys,
+aliases, merge keys, block scalars, templates) are rejected fail-closed
+rather than treated as an absence of invocations. The contiguous
+`exportVariable` token deny remains defense in depth; it does not catch
+computed property forms such as `core["export" + "Variable"]` on its own.
 
 `node-waypoint-ebpf-live.yml` path-filtered `pull_request.paths` must be a
 **trigger superset** of every `production-dockerfile-smoke` sensitive input in
