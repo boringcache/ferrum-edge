@@ -794,10 +794,15 @@ phases.
 
 **Runs**: `ubuntu-latest`
 
-Enforces code quality:
+Enforces code quality. Clippy omits DWARF (`profile.test.debug=0` and
+`profile.dev.debug=0`) so large integration targets stay within hosted-runner
+memory while `CARGO_BUILD_JOBS=2` restores modest compile parallelism:
 
 ```bash
-cargo clippy --all-targets -- -D warnings
+cargo clippy \
+  --config profile.test.debug=0 \
+  --config profile.dev.debug=0 \
+  --all-targets -- -D warnings
 ```
 
 **What it checks**:
