@@ -253,8 +253,9 @@ pub fn required_mongo_indexes() -> Vec<RequiredMongoIndex> {
     ));
 
     // namespaces registry (issue #3955). `_id` IS the name, so the implicit
-    // `_id` index already enforces uniqueness. This name index supports
-    // sorted listing without a collection scan of `_id` strings.
+    // `_id` index already enforces uniqueness. This index serves the embedded
+    // `name` half of split-identity reads and vacancy checks; listing merges
+    // registry and derived names in memory before sorting.
     plan.push(keys_only("namespaces", doc! { "name": 1 }));
 
     plan
