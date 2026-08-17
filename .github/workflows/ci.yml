@@ -4585,10 +4585,16 @@ jobs:
         # Keep all-target lint below the hosted runner's peak-memory limit on
         # cold caches. Large integration targets can otherwise overlap several
         # clippy-driver processes and starve the runner heartbeat before Cargo
-        # has a chance to emit a diagnostic.
+        # has a chance to emit a diagnostic. Clippy does not need DWARF, so
+        # omit debuginfo (same as the test-artifact archives) to lower per-
+        # process RSS and allow modest parallel compilation again.
         env:
-          CARGO_BUILD_JOBS: 1
-        run: cargo clippy --all-targets -- -D warnings
+          CARGO_BUILD_JOBS: 2
+        run: |
+          cargo clippy \
+            --config profile.test.debug=0 \
+            --config profile.dev.debug=0 \
+            --all-targets -- -D warnings
 
   fuzz-smoke:
     # Byte-frozen by the trusted Cross build policy
@@ -5255,6 +5261,9 @@ jobs:
         if: steps.perf_changes.outputs.run == 'true' || steps.perf_changes.outputs.run_ip_restriction_benchmark == 'true' || steps.perf_changes.outputs.run_wrr_benchmark == 'true' || steps.perf_changes.outputs.run_rr_benchmark == 'true' || steps.perf_changes.outputs.run_ai_semantic_cache_benchmark == 'true'
         with:
           shared-key: "ci-perf"
+          workspaces: |
+            . -> target
+            tests/performance/mesh -> target
 
       - name: Run IP restriction worst-case microbenchmark
         if: steps.perf_changes.outputs.run_ip_restriction_benchmark == 'true'
