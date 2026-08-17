@@ -2054,7 +2054,10 @@ def check_fips(workflow: str, failures: list[str]) -> None:
     )
     plan_job = extract_job(workflow, "fips-plan")
     require(
-        'git cat-file blob "$entry_object" > "$filter_path"' in plan_job
+        re.findall(r"(?m)^[ \t]*filter_path=(\S+)[ \t]*$", plan_job)
+        == [".github/scripts/ci_runtime_plan.py"]
+        and plan_job.count("filter_path=") == 1
+        and 'git cat-file blob "$entry_object" > "$filter_path"' in plan_job
         and 'git hash-object "$filter_path"' in plan_job
         and 'python3 -I .github/scripts/ci_runtime_plan.py --self-test' in plan_job
         and 'python3 -I .github/scripts/ci_runtime_plan.py "${filter_args[@]}"'
