@@ -281,7 +281,7 @@ inside `<code>` so a hostile name cannot break Markdown.
 
 **FIPS.** `FIPS Feature Policy` stays a cheap always-on graph audit.
 Compile, claimed-profile `cargo check`, clippy `-D warnings`, and the
-policy/key-admission/handshake tests share two cache layers plus an immutable
+policy/key-admission/handshake tests share one cache layer plus an immutable
 artifact handoff:
 
 - **Stable rust-cache fallback.** `shared-key` is
@@ -296,51 +296,68 @@ artifact handoff:
   (`save-if` false for fork PRs); the three ordinal `fips-claimed-checks`
   shards, `fips-clippy`, and `fips-test-build` restore it with `save-if: false`
   and never publish. The test job does not restore build caches.
-- **Exact same-run producer channel.** After a successful locked `fips` profile
-  build, `fips-compile` saves
-  `${{ github.workspace }}/target` and
-  `.cache/sccache` with `actions/cache/save` under
-  `fips-producer-${{ github.event.pull_request.head.sha || github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}`.
-  That key is unique per head and workflow-run attempt, so GitHub's immutable
-  exact-hit skip cannot trap newly warmed outputs. The three claimed-profile
-  shards, clippy, and `fips-test-build` restore the current producer key (with
-  the same SHA+`run_id` prefix fallback) and never save this channel. Each
-  claimed shard filters the policy checker's single inventory by ordinal modulo
-  three and fails closed if it selects no profile. Those consumers run in
-  parallel after the build-only compile producer, so test-binary precompile no
-  longer sits on the claimed-profile/clippy critical path. This early save is
-  for same-attempt compile-to-consumer reuse only. GitHub's cache LRU can
-  evict it during the consumer tail when later ordinary CI jobs write more
-  than the remaining cache budget (tens of GiB of newer entries have dropped
-  this key before the next full-workflow rerun).
-- **Immutable inter-run handoff.** A successful non-cold `fips-compile`
-  packages its exact `target/` + `.cache/sccache` producer tree as a zstd tar
+- **Immutable producer handoff (same-run channel and inter-run warm
+  source).** A successful non-cold `fips-compile`
+  packages its exact `target/` + `.cache/sccache` producer tree, the
+  checkout's Git tree identity, and a `fips-producer-identity` member that
+  records source SHA, run id, and run attempt as a zstd tar
   (preserving executable modes that artifact ZIP extraction would normalize)
   and publishes it as the one-day run artifact
   `fips-producer-handoff-${{ github.event.pull_request.head.sha || github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}`.
   Pull-request events use `github.event.pull_request.head.sha` rather than the
   synthetic merge SHA so a manual run of the same branch head can address the
   artifact; other events fall back to `github.sha`.
-  This is intentionally not a third repository cache: concurrent CI writers
-  empirically evicted a 4.15 GB late cache handoff within three minutes.
-  GitHub also deletes a workflow run's artifacts when that same run is rerun,
-  so warm evidence uses separate `workflow_dispatch` runs. Each dispatch names
+  This is intentionally not a repository cache: concurrent CI writers
+  empirically evicted a 4.15 GB late cache handoff within three minutes, and
+  the former run-attempt-scoped `actions/cache` producer key
+  (`fips-producer-<sha>-<run_id>-<run_attempt>`) was repeatedly LRU-evicted
+  out of the shared 10 GB quota between the producer's save and the five
+  consumers' restores, while a `rerun --failed` could never succeed because
+  consumers at attempt N asked for a key the skipped producer only saved at
+  attempt 1. Run artifacts sit outside that quota, and the artifact name's
+  attempt suffix exists only so a full rerun can republish without an
+  immutable-name conflict.
+
+  The three claimed-profile shards, clippy, and `fips-test-build` download
+  the handoff with the attempt-independent pattern
+  `fips-producer-handoff-<sha>-<run_id>-*` and `merge-multiple: false`. The
+  pinned download action flattens a single matching artifact's payload
+  directly into the channel directory; two or more matches extract each
+  artifact into a child directory named after that artifact. Promotion admits
+  both layouts, binds the attempt from the `fips-producer-identity` member
+  packaged at the front of the tar (never from the consumer's
+  `github.run_attempt`), requires child directory names and payload identity
+  to agree, and rejects mixed files and directories, extra entries, symlinks,
+  and malformed identity. It then promotes the newest matching attempt, so a
+  failed-job rerun reuses the artifact the skipped producer published at an
+  earlier attempt. They never publish this channel. Each
+  claimed shard filters the policy checker's single inventory by ordinal
+  modulo three and fails closed if it selects no profile. Those consumers run
+  in parallel after the build-only compile producer, so test-binary precompile
+  does not sit on the claimed-profile/clippy critical path. Unlike the former
+  cache channel (whose saves were fork-gated), the artifact channel is
+  fork-usable, so fork pull requests get the same exact compile-to-consumer
+  reuse and the same fail-closed promotion.
+
+  GitHub also deletes a workflow run's artifacts when that same run is fully
+  rerun, so warm evidence uses separate `workflow_dispatch` runs. Each
+  dispatch names
   the exact source run ID and attempt; the pinned download action requests only
   `fips-producer-handoff-${{ github.event.pull_request.head.sha || github.sha }}-<run_id>-<run_attempt>` from that run
-  in the current repository. An explicitly requested artifact must contain a
+  in the current repository. A promoted artifact — same-run or explicitly
+  requested — must contain a
   real tar payload that extracts to real `target/` and `.cache/sccache`
-  directories or the compile fails closed. The archive carries the producer
+  directories or the consuming job fails closed. The archive carries the
+  producer
   checkout's Git tree identity; promotion requires an equal, clean current
   checkout, preventing a synthetic PR merge tree from masquerading as the same
   branch head after its base changes. Because checkout gives identical source
-  files newer mtimes than archived outputs, the exact-head producer refreshes
+  files newer mtimes than archived outputs, the promoting job refreshes
   only regular files under `target/` after validating that tree and a real,
   nonsymlink FIPS executable. Every refreshed file receives one common
   reference timestamp: Cargo compares a unit's outputs with dependency outputs,
   so independently generated `touch` times can themselves make a dependency
-  look newer and invalidate its dependents. Same-run consumers apply the same
-  normalization only after the producer cache key matches the current
-  source-SHA/run-ID prefix and the executable check succeeds.
+  look newer and invalidate its dependents.
 
   Cargo also includes the resolved `RUSTC_WRAPPER` executable identity in its
   artifact hashes. The checksum-pinned sccache installer intentionally uses a
@@ -356,31 +373,46 @@ artifact handoff:
 
 `fips-test-build` precompiles the complete FIPS `unit_tests` and
 `integration_tests` executables and stages digest-bound copies in an
-immutable same-run artifact. The test job downloads only the attempt-scoped
-artifact, rejects unexpected names, symlinks, path escapes, and SHA-256
-mismatches, then executes the two binaries directly. Fresh-checkout source
-mtimes therefore cannot make Cargo repeat test-only compile/link work.
-Trusted non-cold consumers fail closed if this-run producer output is
-missing. Fork pull requests restore only and cannot save; GitHub confines
+immutable same-run artifact together with `fips-test-identity`. The test job
+downloads the run-scoped, attempt-wildcard pattern
+`fips-test-binaries-<run_id>-*` with `merge-multiple: false`. A single
+matching artifact flattens `unit_tests`, `integration_tests`, `manifest.json`,
+and `fips-test-identity` into the channel directory; multiple matches create
+per-artifact child directories. Validation admits both layouts, binds the
+attempt from `fips-test-identity` (never from the consumer's
+`github.run_attempt`), requires directory names and payload identity to agree,
+rejects malformed artifact names and paths, selects the newest attempt, then
+rejects unexpected bundle names, symlinks, path escapes, and SHA-256
+mismatches before executing the two binaries directly. A failed-job rerun can
+therefore reuse the artifact
+from the successful `fips-test-build` prerequisite that GitHub skipped in the
+new attempt. Fresh-checkout source mtimes cannot make Cargo repeat test-only
+compile/link work.
+Non-cold consumers fail closed if no producer handoff for their source
+SHA/run_id exists. Fork pull requests restore the rust-cache fallback only
+and cannot save it; GitHub confines
 `pull_request` writes to `refs/pull/.../merge`, not the default branch.
 
-`force_cold_cache` skips every cache restore and save while still executing the
+`force_cold_cache` skips every cache restore/save and the producer-handoff
+download, packaging, and upload while still executing the
 live contracts. The immutable same-run test artifact is transport, not a warm
 cache, so forced-cold and fork runs can execute the exact binaries produced by
 their own `fips-test-build` job without publishing shared state. rust-cache
 `cache-on-failure` remains on the compile producer so
 ordinary failing jobs can publish stable dependency work when post-job cleanup
-still runs. The producer `actions/cache/save` is a main step after the locked
+still runs. The producer handoff is packaged and uploaded by main steps after
+the locked
 profile build and
 before rust-cache's post cleanup, which strips workspace crates from `target/`
 before saving the stable fallback. Example plugins stay out of the FIPS
 artifact (`FERRUM_CUSTOM_PLUGINS` is unset). Job summaries record rust-cache
-hit/miss from the action output as **stable fallback**, producer restore
-as **exact / partial (same run_id) / miss** via `classify-restore`, and the
+hit/miss from the action output as **stable fallback**, same-run producer
+handoff promotion as an evidence-backed **hit** (a missing handoff fails the
+job rather than recording a fabricated miss), and the
 explicit inter-run handoff artifact as **hit / miss** (never as a fabricated
 hit). Measured restored bytes are the sccache-directory subset for
-rust-cache and the on-disk `target/` directory for the producer cache and
-handoff artifact; rust-cache Cargo/target archive bytes are not exposed. The
+rust-cache and the on-disk `target/` directory for the promoted producer
+handoff; rust-cache Cargo/target archive bytes are not exposed. The
 required `FIPS Build & Test`
 aggregate depends on `fips-test-build` and fails closed if that test-binary
 producer does not succeed.
@@ -2062,11 +2094,13 @@ The temporary whole-file SHA-256 admission first used for PR #3889 (and retired
 by #3943 once #3889 landed) is **re-armed for exactly one transition**: PR
 #3950 moves the FIPS same-run producer→consumer handoff off the eviction-prone
 repository cache onto the immutable run artifact, which necessarily edits four
-digest-frozen `fips-build.yml` job bodies. The pair is exact and one-way:
-trusted-base `527659b0ad96a0d97cd4a170543dd81acbf6784155b3c82918b1f70a20c7914b`
-(PR #3889's landed file) →
-`05f86617597b1eb7bcf1960a0c630a9884ff09ac1995982f46a80811c3965e74` (PR #3950
-head `0984a45e4`; recompute and re-pin if review changes the workflow bytes).
+digest-frozen `fips-build.yml` job bodies. The destination also quarantines only
+restored `aws-lc-fips-sys-*/out/build` CMake intermediates before a cross-runner
+incremental build can reparse them. The pair is exact and one-way:
+trusted-base `0be313579a66265ef1f54e0a611f519e8d109a536ba29b0d6c4244530b9d6a08`
+(the workflow after PR #3952's landed static-path planner hardening) →
+`17bfb40fbd31e80e6ae1a0efca922069c54ec485ec7a611c3420840da3e5e9e1` (PR #3950
+head `df1223520`; recompute and re-pin if review changes the workflow bytes).
 The digest is over universal-newline-decoded text. RETIREMENT IS MANDATORY
 once #3950 lands, exactly as #3943 retired the #3889 pair. Any other
 `fips-build.yml` edit is still compared by the normal fail-closed Cross
