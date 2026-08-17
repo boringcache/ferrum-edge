@@ -108,8 +108,9 @@ mod inner {
     };
     use crate::config::namespace_registry::{
         DERIVED_NAMESPACE_RESOURCE_TABLES, NAMESPACE_OCCUPANCY_TABLES, NamespaceRecord,
-        NamespaceRegistryAtomicityUnsupported, NamespaceRegistryError as RegistryError,
-        NamespaceRegistryPhase, namespace_registry_fault,
+        NamespaceRegistryAtomicityUnsupported, NamespaceRegistryCorrupt,
+        NamespaceRegistryError as RegistryError, NamespaceRegistryPhase, namespace_registry_fault,
+        parse_namespace_rfc3339, require_namespace_identity, stored_description,
     };
     use regex::escape as regex_escape;
 
@@ -303,6 +304,23 @@ mod inner {
         (says_unsupported && names_pipeline_form)
             || (references_update
                 && ((says_type_error && names_value_type) || has_pipeline_type_or_parse_code))
+    }
+
+    /// `$expr` / `$$NOW` in a query filter is unavailable. Distinct from
+    /// pipeline-form update rejection: a classic `$set` document can still
+    /// carry the same server-time predicate, and only this check decides the
+    /// deployment cannot evaluate expiry atomically in-session.
+    fn is_server_time_expr_unsupported(err: &mongodb::error::Error) -> bool {
+        let mongodb::error::ErrorKind::Command(command_error) = err.kind.as_ref() else {
+            return false;
+        };
+        let message = command_error.message.to_ascii_lowercase();
+        let says_unsupported = message.contains("not supported") || message.contains("unsupported");
+        let names_expr = message.contains("$expr")
+            || message.contains("$$now")
+            || message.contains("aggregation expression")
+            || (message.contains("expr") && message.contains("now"));
+        says_unsupported && names_expr
     }
 
     fn mesh_route_dispatch_references_upstream_id(
@@ -2136,10 +2154,16 @@ mod inner {
             namespaces.dedup();
             let mut leases = Vec::with_capacity(namespaces.len());
             for namespace in namespaces {
-                leases.push(
-                    self.acquire_mtls_dns_admission_lease_for_mode(namespace, mode)
-                        .await?,
-                );
+                match self
+                    .acquire_mtls_dns_admission_lease_for_mode(namespace, mode)
+                    .await
+                {
+                    Ok(lease) => leases.push(lease),
+                    Err(error) => {
+                        let _ = Self::release_mtls_dns_admission_leases(&mut leases).await;
+                        return Err(error);
+                    }
+                }
             }
             Ok(leases)
         }
@@ -5122,44 +5146,41 @@ mod inner {
             generation: i64,
         ) -> mongodb::error::Result<bool> {
             let locks = self.config_admission_locks_in_transaction();
+            let filter = doc! {
+                "_id": key,
+                "owner": owner,
+                "generation": generation,
+                "$expr": { "$gt": [ "$expires_at", "$$NOW" ] },
+            };
             let result = locks
-                .update_one(
-                    doc! {
-                        "_id": key,
-                        "owner": owner,
-                        "generation": generation,
-                        "$expr": { "$gt": [ "$expires_at", "$$NOW" ] },
-                    },
-                    Self::server_time_lease_touch_pipeline(),
-                )
+                .update_one(filter.clone(), Self::server_time_lease_touch_pipeline())
                 .session(&mut *session)
                 .await;
             let result = match result {
                 Err(error) if is_pipeline_update_unsupported(&error) => {
-                    // AWS DocumentDB rejects pipeline-form updates. Read the
-                    // server clock here, at the gate, and re-issue the
-                    // equivalent classic comparison — still MongoDB's time and
-                    // still evaluated after every phase has been written, never
-                    // the client clock and never a value captured before the
-                    // transaction opened.
-                    let now = self.lease_server_time().await.map_err(|error| {
-                        mongodb::error::Error::custom(format!(
-                            "namespace config admission lease verification could not read \
-                             the MongoDB server clock: {error}"
-                        ))
-                    })?;
-                    locks
-                        .update_one(
-                            doc! {
-                                "_id": key,
-                                "owner": owner,
-                                "generation": generation,
-                                "expires_at": { "$gt": now },
-                            },
-                            doc! { "$set": { "updated_at": now } },
-                        )
+                    // AWS DocumentDB rejects pipeline-form updates. Keep the
+                    // same in-session `$expr`/`$$NOW` expiry predicate on a
+                    // classic update document so expiry is still evaluated by
+                    // the server at this gate. `$currentDate` is metadata only
+                    // — never the authority for "is this lease still live".
+                    match locks
+                        .update_one(filter, doc! { "$currentDate": { "updated_at": true } })
                         .session(&mut *session)
                         .await
+                    {
+                        Ok(result) => Ok(result),
+                        Err(fallback_error)
+                            if is_pipeline_update_unsupported(&fallback_error)
+                                || is_server_time_expr_unsupported(&fallback_error) =>
+                        {
+                            Err(mongodb::error::Error::custom(
+                                "namespace config admission lease verification requires an \
+                                 in-session server-time expiry predicate, which this MongoDB \
+                                 deployment does not support",
+                            ))
+                        }
+                        other => other,
+                    }
                 }
                 result => result,
             }?;
@@ -5213,7 +5234,14 @@ mod inner {
                     )
                 }
                 Some(NamespaceRegistryAbort::InjectedFault(phase)) => phase.error(),
-                None => anyhow::Error::new(error).context("namespace registry transaction failed"),
+                None => {
+                    if let Some(corrupt) = error.get_custom::<NamespaceRegistryCorrupt>().copied() {
+                        anyhow::Error::new(corrupt)
+                    } else {
+                        anyhow::Error::new(error)
+                            .context("namespace registry transaction failed")
+                    }
+                }
             }
         }
 
@@ -5425,8 +5453,9 @@ mod inner {
                 NamespaceRegistryPhase::RegistryRow,
             )?;
 
-            // Re-checked HERE, not from an earlier list query: two gateways that
-            // each saw two names would otherwise both proceed and leave zero.
+            // Re-checked HERE against durable registry documents, not the GET
+            // union. Ordinary resource deletion in a derived-only namespace
+            // does not take the global registry lease.
             if !self.any_namespace_remains_in_session(&mut *session).await? {
                 return Err(Self::namespace_protected_abort(
                     name,
@@ -5682,7 +5711,13 @@ mod inner {
                 .find_one(doc! { "_id": name })
                 .session(&mut *session)
                 .await?;
-            Ok(doc.map(|doc| self.document_to_namespace_record(name, doc)))
+            Ok(match doc {
+                Some(doc) => Some(
+                    Self::document_to_namespace_record(Some(name), doc)
+                        .map_err(mongodb::error::Error::custom)?,
+                ),
+                None => None,
+            })
         }
 
         async fn namespace_name_in_use_in_session(
@@ -5723,35 +5758,20 @@ mod inner {
             Ok(false)
         }
 
-        /// Does ANY namespace still exist? Exactly the union `GET /namespaces`
-        /// lists, so the invariant and the client agree on what "the last
-        /// remaining namespace" means.
+        /// Does ANY durable registry document still exist? Last-remaining
+        /// protection is registry-row based because every registry-row removal
+        /// is serialized by the global registry lease. Ordinary resource CRUD
+        /// is not, so a derived-only name cannot be the authority.
         async fn any_namespace_remains_in_session(
             &self,
             session: &mut ClientSession,
         ) -> mongodb::error::Result<bool> {
-            if self
+            Ok(self
                 .namespaces()
                 .find_one(doc! {})
                 .session(&mut *session)
                 .await?
-                .is_some()
-            {
-                return Ok(true);
-            }
-            for &collection in DERIVED_NAMESPACE_RESOURCE_TABLES {
-                if self
-                    .collection(collection)
-                    .find_one(doc! {})
-                    .projection(doc! { "_id": 1 })
-                    .session(&mut *session)
-                    .await?
-                    .is_some()
-                {
-                    return Ok(true);
-                }
-            }
-            Ok(false)
+                .is_some())
         }
 
         /// Re-verify EVERY admission lease this mutation holds — the global
@@ -5988,15 +6008,28 @@ mod inner {
                     let old_id = document
                         .get_str("_id")
                         .map_err(|_| {
-                            mongodb::error::Error::custom(format!(
-                                "{collection_name} document is missing a string _id and cannot be \
-                                 renamed"
-                            ))
+                            mongodb::error::Error::custom(
+                                crate::config::namespace_registry::NamespaceRegistryCorrupt::field(
+                                    "identity",
+                                ),
+                            )
                         })?
                         .to_string();
-                    let suffix = old_id
-                        .strip_prefix(&format!("{current_name}:"))
-                        .unwrap_or(old_id.as_str());
+                    let expected_prefix = format!("{current_name}:");
+                    let Some(suffix) = old_id.strip_prefix(&expected_prefix) else {
+                        return Err(mongodb::error::Error::custom(
+                            crate::config::namespace_registry::NamespaceRegistryCorrupt::field(
+                                "identity",
+                            ),
+                        ));
+                    };
+                    if suffix.is_empty() {
+                        return Err(mongodb::error::Error::custom(
+                            crate::config::namespace_registry::NamespaceRegistryCorrupt::field(
+                                "identity",
+                            ),
+                        ));
+                    }
                     document.insert("_id", format!("{new_name}:{suffix}"));
                     document.insert("namespace", new_name);
                     moved.push((old_id, document));
@@ -12150,7 +12183,10 @@ mod inner {
         ) -> Result<Option<crate::config::namespace_registry::NamespaceRecord>, anyhow::Error>
         {
             let doc = self.namespaces().find_one(doc! { "_id": name }).await?;
-            Ok(doc.map(|doc| self.document_to_namespace_record(name, doc)))
+            Ok(match doc {
+                Some(doc) => Some(Self::document_to_namespace_record(Some(name), doc)?),
+                None => None,
+            })
         }
 
         async fn namespace_name_in_use(&self, name: &str) -> Result<bool, anyhow::Error> {
@@ -12250,27 +12286,30 @@ mod inner {
                 protected_default: self.effective_default_namespace.clone(),
                 registry_doc: None,
             };
-            // Every namespace-wide mutation takes the namespace's durable mTLS
-            // DNS admission mutex for its whole duration; it also fails closed
-            // while a guarded restore replay owns the namespace.
-            let mut mtls_lease = self.acquire_mtls_dns_admission_lease(current_name).await?;
-            let record = mtls_lease
-                .run_mutation(async {
-                    let connection = self.connection();
-                    let mut session = connection.client.start_session().await?;
-                    let record = session
-                        .start_transaction()
-                        .and_run((self, plan), |s, (this, plan)| {
-                            Box::pin(async move {
-                                this.update_namespace_in_session(&mut *s, plan).await
-                            })
-                        })
-                        .await
-                        .map_err(Self::namespace_registry_transaction_error)?;
-                    Ok(record)
-                })
+            let mut mtls_leases = self
+                .acquire_mtls_dns_admission_leases(
+                    crate::config::namespace_registry::mtls_dns_admission_namespaces(
+                        current_name,
+                        new_name,
+                    ),
+                )
                 .await?;
-            mtls_lease.release().await?;
+            let record = Self::run_mtls_dns_mutations(&mut mtls_leases, async {
+                let connection = self.connection();
+                let mut session = connection.client.start_session().await?;
+                let record = session
+                    .start_transaction()
+                    .and_run((self, plan), |s, (this, plan)| {
+                        Box::pin(async move {
+                            this.update_namespace_in_session(&mut *s, plan).await
+                        })
+                    })
+                    .await
+                    .map_err(Self::namespace_registry_transaction_error)?;
+                Ok(record)
+            })
+            .await?;
+            Self::release_mtls_dns_admission_leases_after_commit(&mut mtls_leases).await;
             if renaming {
                 self.compact_config_changes_best_effort(current_name).await;
                 self.compact_config_changes_best_effort(new_name).await;
@@ -14826,21 +14865,12 @@ mod inner {
         }
 
         async fn registry_namespace_names(&self) -> Result<HashSet<String>, anyhow::Error> {
-            let values = self.namespaces().distinct("name", doc! {}).await?;
+            let mut cursor = self.namespaces().find(doc! {}).await?;
             let mut namespaces = HashSet::new();
-            for val in values {
-                if let Some(s) = val.as_str() {
-                    namespaces.insert(s.to_string());
-                }
-            }
-            if namespaces.is_empty() {
-                // Documents use `_id` as the name; fall back if `name` was omitted.
-                let ids = self.namespaces().distinct("_id", doc! {}).await?;
-                for val in ids {
-                    if let Some(s) = val.as_str() {
-                        namespaces.insert(s.to_string());
-                    }
-                }
+            while cursor.advance().await? {
+                let doc = cursor.deserialize_current()?;
+                let record = Self::document_to_namespace_record(None, doc)?;
+                namespaces.insert(record.name);
             }
             Ok(namespaces)
         }
@@ -14856,8 +14886,9 @@ mod inner {
             // The canonical `ferrum` row per issue #3955. Nothing else is
             // seeded: the backfill must not read the process environment, and a
             // deployment-specific `FERRUM_NAMESPACE` that has no resources yet
-            // is created through `POST /namespaces` (or implicitly by its first
-            // resource write) like any other tenant.
+            // is created through `POST /namespaces`. Ordinary resource writes
+            // isolate data under a derived name but do not insert a registry
+            // row.
             names.insert(crate::config::types::DEFAULT_NAMESPACE.to_string());
             for name in names {
                 let _ = self
@@ -14879,35 +14910,37 @@ mod inner {
         }
 
         fn document_to_namespace_record(
-            &self,
-            fallback_name: &str,
+            expected_name: Option<&str>,
             doc: Document,
-        ) -> NamespaceRecord {
+        ) -> Result<NamespaceRecord, NamespaceRegistryCorrupt> {
+            let id = doc
+                .get_str("_id")
+                .map_err(|_| NamespaceRegistryCorrupt::field("_id"))?;
             let name = doc
                 .get_str("name")
-                .ok()
-                .map(str::to_string)
-                .or_else(|| doc.get_str("_id").ok().map(str::to_string))
-                .unwrap_or_else(|| fallback_name.to_string());
-            let description = doc
-                .get_str("description")
-                .ok()
-                .map(str::to_string)
-                .filter(|s| !s.is_empty());
-            let parse_ts = |key: &str| {
-                doc.get_str(key)
-                    .ok()
-                    .and_then(|s| DateTime::parse_from_rfc3339(s).ok())
-                    .map(|dt| dt.with_timezone(&Utc))
+                .map_err(|_| NamespaceRegistryCorrupt::field("name"))?;
+            let name = require_namespace_identity(id, name, expected_name)?;
+            let created_at = parse_namespace_rfc3339(
+                doc.get_str("created_at")
+                    .map_err(|_| NamespaceRegistryCorrupt::field("created_at"))?,
+                "created_at",
+            )?;
+            let updated_at = parse_namespace_rfc3339(
+                doc.get_str("updated_at")
+                    .map_err(|_| NamespaceRegistryCorrupt::field("updated_at"))?,
+                "updated_at",
+            )?;
+            let description = match doc.get("description") {
+                None | Some(Bson::Null) => None,
+                Some(Bson::String(value)) => stored_description(Some(value.clone())),
+                Some(_) => return Err(NamespaceRegistryCorrupt::field("description")),
             };
-            let created_at = parse_ts("created_at").unwrap_or_else(Utc::now);
-            let updated_at = parse_ts("updated_at").unwrap_or(created_at);
-            NamespaceRecord {
+            Ok(NamespaceRecord {
                 name,
                 description,
                 created_at,
                 updated_at,
-            }
+            })
         }
 
         /// Copy the caller's borrowed lease identities into an owned form the
@@ -16169,6 +16202,7 @@ mod inner {
                 replica_set_configured: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(
                     false,
                 )),
+                effective_default_namespace: crate::config::types::DEFAULT_NAMESPACE.to_string(),
             }
         }
 

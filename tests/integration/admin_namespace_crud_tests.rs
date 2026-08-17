@@ -1384,3 +1384,246 @@ async fn store_create_rename_delete_round_trip() {
     drop(admission);
     assert!(!store.namespace_name_in_use("renamed").await.unwrap());
 }
+
+#[tokio::test]
+async fn last_registry_row_cannot_disappear_behind_a_derived_only_name() {
+    // Race this invariant prevents: delete registered A while derived-only B
+    // still has one resource; concurrently ordinary DELETE removes B's last
+    // resource. If last-remaining counted the GET union, A's delete would
+    // observe B and commit, then B's resource delete would leave zero names.
+    // Registry-row authority cannot race with writers outside the global lease.
+    let dir = TempDir::new().unwrap();
+    let store = Arc::new(make_store_serving(&dir, "not-present").await);
+    drop_default_registry_row(&store).await;
+    let (base, _shutdown) = start_admin(admin_state_from_arc(store.clone())).await;
+    let token = admin_token();
+
+    let (status, body) = send(
+        reqwest::Method::POST,
+        &base,
+        "/namespaces",
+        &token,
+        Some(json!({ "name": "alpha" })),
+    )
+    .await;
+    assert_eq!(status, 201, "create the sole registry row: {body:?}");
+    seed_upstream(&store, "ghost", "up-ghost").await;
+    assert!(
+        !registry_row_exists(&store, "ghost").await,
+        "ordinary resource writes must not insert a registry row"
+    );
+
+    let (status, body) = send(
+        reqwest::Method::GET,
+        &base,
+        "/namespaces?limit=100",
+        &token,
+        None,
+    )
+    .await;
+    assert_eq!(status, 200, "{body:?}");
+    let names: Vec<&str> = body["data"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|v| v.as_str())
+        .collect();
+    assert!(
+        names.contains(&"alpha") && names.contains(&"ghost"),
+        "GET remains registry ∪ derived names: {body:?}"
+    );
+
+    let (status, body) = send(
+        reqwest::Method::DELETE,
+        &base,
+        "/namespaces/alpha",
+        &token,
+        None,
+    )
+    .await;
+    assert_eq!(
+        status, 409,
+        "the last registry row must survive even while a derived-only name has \
+         resources: {body:?}"
+    );
+    assert!(
+        body["error"]
+            .as_str()
+            .unwrap_or("")
+            .contains("last remaining"),
+        "typed last-remaining refusal: {body:?}"
+    );
+    assert!(
+        registry_row_exists(&store, "alpha").await,
+        "the last registry row must still be durable"
+    );
+}
+
+#[tokio::test]
+async fn namespace_rename_fails_closed_on_a_target_mtls_dns_restore_fence() {
+    // `alpha` sorts before `zeta`, so a rename zeta→alpha locks the target
+    // first. A restore owner on alpha must reject the rename. Locking only
+    // the source would write resources into the fenced target.
+    let dir = TempDir::new().unwrap();
+    let store = make_store(&dir).await;
+    let (base, _shutdown) = start_admin(admin_state(store.clone())).await;
+    let token = admin_token();
+    let (status, body) = send(
+        reqwest::Method::POST,
+        &base,
+        "/namespaces",
+        &token,
+        Some(json!({ "name": "zeta" })),
+    )
+    .await;
+    assert_eq!(status, 201, "{body:?}");
+
+    sqlx::query(
+        "INSERT INTO mtls_dns_admission_locks (namespace, updated_at, restore_owner) \
+         VALUES (?, ?, ?)",
+    )
+    .bind("alpha")
+    .bind(Utc::now().to_rfc3339())
+    .bind("restore-owner-uuid")
+    .execute(&store.pool())
+    .await
+    .unwrap();
+
+    let (status, body) = send(
+        reqwest::Method::PUT,
+        &base,
+        "/namespaces/zeta",
+        &token,
+        Some(json!({ "name": "alpha" })),
+    )
+    .await;
+    assert_eq!(
+        status, 503,
+        "target restore fence must fail closed: {body:?}"
+    );
+    assert!(
+        registry_row_exists(&store, "zeta").await && !registry_row_exists(&store, "alpha").await,
+        "the refused rename must not have created the target"
+    );
+}
+
+#[tokio::test]
+async fn namespace_rename_fails_closed_on_a_source_mtls_dns_restore_fence() {
+    let dir = TempDir::new().unwrap();
+    let store = make_store(&dir).await;
+    let (base, _shutdown) = start_admin(admin_state(store.clone())).await;
+    let token = admin_token();
+    let (status, body) = send(
+        reqwest::Method::POST,
+        &base,
+        "/namespaces",
+        &token,
+        Some(json!({ "name": "alpha" })),
+    )
+    .await;
+    assert_eq!(status, 201, "{body:?}");
+
+    sqlx::query(
+        "INSERT INTO mtls_dns_admission_locks (namespace, updated_at, restore_owner) \
+         VALUES (?, ?, ?)",
+    )
+    .bind("alpha")
+    .bind(Utc::now().to_rfc3339())
+    .bind("restore-owner-uuid")
+    .execute(&store.pool())
+    .await
+    .unwrap();
+
+    let (status, body) = send(
+        reqwest::Method::PUT,
+        &base,
+        "/namespaces/alpha",
+        &token,
+        Some(json!({ "name": "zeta" })),
+    )
+    .await;
+    assert_eq!(
+        status, 503,
+        "source restore fence must fail closed: {body:?}"
+    );
+    assert!(
+        registry_row_exists(&store, "alpha").await && !registry_row_exists(&store, "zeta").await,
+        "the refused rename must not have created the target"
+    );
+}
+
+#[tokio::test]
+async fn update_rejects_empty_or_non_object_bodies() {
+    let dir = TempDir::new().unwrap();
+    let store = make_store(&dir).await;
+    let (base, _shutdown) = start_admin(admin_state(store)).await;
+    let token = admin_token();
+    let (status, _body) = send(
+        reqwest::Method::POST,
+        &base,
+        "/namespaces",
+        &token,
+        Some(json!({ "name": "tenant", "description": "keep" })),
+    )
+    .await;
+    assert_eq!(status, 201);
+
+    for raw in ["", "null", "[]", "42", "\"tenant\""] {
+        let response = reqwest::Client::new()
+            .request(reqwest::Method::PUT, format!("{base}/namespaces/tenant"))
+            .bearer_auth(&token)
+            .header("Content-Type", "application/json")
+            .body(raw.to_string())
+            .send()
+            .await
+            .expect("request succeeds");
+        assert_eq!(
+            response.status().as_u16(),
+            400,
+            "non-object PUT body {raw:?} must be 400"
+        );
+    }
+
+    let (status, body) = send(
+        reqwest::Method::GET,
+        &base,
+        "/namespaces/tenant",
+        &token,
+        None,
+    )
+    .await;
+    assert_eq!(status, 200);
+    assert_eq!(body["description"], "keep");
+}
+
+#[tokio::test]
+async fn corrupt_registry_row_is_not_served_as_plausible_detail() {
+    let dir = TempDir::new().unwrap();
+    let store = make_store(&dir).await;
+    sqlx::query("UPDATE namespaces SET created_at = 'not-a-timestamp' WHERE name = 'ferrum'")
+        .execute(&store.pool())
+        .await
+        .unwrap();
+    let (base, _shutdown) = start_admin(admin_state(store)).await;
+    let token = admin_token();
+    let (status, body) = send(
+        reqwest::Method::GET,
+        &base,
+        "/namespaces/ferrum",
+        &token,
+        None,
+    )
+    .await;
+    assert_eq!(status, 500, "corrupt timestamps must fail closed: {body:?}");
+    let error = body["error"].as_str().unwrap_or("");
+    assert!(
+        error.contains(
+            ferrum_edge::config::namespace_registry::NamespaceRegistryCorrupt::MESSAGE
+        ),
+        "client must see the static corrupt message: {body:?}"
+    );
+    assert!(
+        !error.contains("not-a-timestamp") && !error.contains("ferrum"),
+        "raw corrupt values must not be echoed: {body:?}"
+    );
+}

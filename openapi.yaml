@@ -65,8 +65,11 @@ info:
     affected name, and commits in a single database transaction that re-verifies
     those lease identities against the datastore's own clock immediately before
     commit. Occupancy, target vacancy, protection of the configured namespace,
-    and the last-remaining-namespace invariant are all decided inside that
-    transaction, so nothing partial can become durable. Standalone MongoDB has
+    and the last remaining **registry row** are all decided inside that
+    transaction, so nothing partial can become durable. `GET /namespaces`
+    remains the backward-compatible union of registry names and derived
+    resource names; ordinary resource writes isolate data but do not insert
+    registry rows. Standalone MongoDB has
     no multi-document transactions and therefore refuses these three operations
     with `501` before mutating anything; `GET` remains available.
 
@@ -5730,9 +5733,10 @@ paths:
       summary: Get a namespace
       description: |
         Returns the registry record for `name`. A name that exists only as a
-        derived resource namespace (created implicitly via
-        `X-Ferrum-Namespace`) is still returned. Viewer and operator roles
-        may call this endpoint. When
+        derived resource namespace (written under `X-Ferrum-Namespace` without
+        a registry row) is still returned as a synthesized detail record.
+        Ordinary resource writes do not insert registry rows. Viewer and operator
+        roles may call this endpoint. When
         `FERRUM_ADMIN_REQUIRE_NAMESPACE_CLAIM=true`, a token that cannot
         address `name` receives `403`.
       tags: [Namespaces]
@@ -5770,9 +5774,12 @@ paths:
         transaction, under the global namespace-registry admission lease plus
         the source and target namespace leases. Those lease identities are
         re-verified inside the committing transaction, so a lost lease aborts
-        with nothing applied (`503`). A namespace that exists only because a
+        with nothing applied (`503`). Rename also holds both the source and
+        target mTLS DNS admission fences (sorted, de-duplicated) and fails
+        closed if either has a restore owner; a description-only update holds
+        the current name's fence. A namespace that exists only because a
         resource was written under it (no registry row) is materialized by the
-        same transaction.
+        same transaction. Ordinary resource writes do not insert registry rows.
 
         Omitted fields are left unchanged. `description: null` (or an empty
         string) clears it; `name` is only valid as a string when present —
@@ -5837,10 +5844,13 @@ paths:
         converges instead of serving stale configuration.
 
         The namespace this gateway is configured to serve (`FERRUM_NAMESPACE`,
-        default `ferrum`) cannot be deleted, and the last remaining namespace
-        cannot be deleted — the latter is re-evaluated at the commit boundary,
-        so two gateways cannot each observe two names and concurrently delete
-        a different one. Admin role required. File mode returns `403`.
+        default `ferrum`) cannot be deleted, and the last remaining **registry
+        row** cannot be deleted — the latter is re-evaluated at the commit
+        boundary against durable `namespaces` rows (not the GET union of
+        derived resource names), so two gateways cannot each observe two
+        registry rows and concurrently delete a different one. Ordinary
+        resource CRUD is not serialized by the global registry lease and does
+        not insert registry rows. Admin role required. File mode returns `403`.
       tags: [Namespaces]
       parameters:
         - name: confirm

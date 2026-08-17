@@ -691,8 +691,8 @@ impl V001SqlBuilder {
         // The canonical `ferrum` row per issue #3955. Nothing else is seeded:
         // the backfill must not read the process environment, and a
         // deployment-specific `FERRUM_NAMESPACE` that has no resources yet is
-        // created through `POST /namespaces` (or implicitly by its first
-        // resource write) like any other tenant.
+        // created through `POST /namespaces`. Ordinary resource writes isolate
+        // data under a derived name but do not insert a registry row.
         sqlx::query(insert_default)
             .bind(crate::config::types::DEFAULT_NAMESPACE)
             .bind(&now)

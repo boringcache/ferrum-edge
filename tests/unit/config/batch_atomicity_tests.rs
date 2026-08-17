@@ -464,8 +464,9 @@ fn atomic_batch_lease_gate_compares_expiry_against_current_database_time() {
         MONGO_STORE_SOURCE[touch_start..touch_end].contains("\"updated_at\": \"$$NOW\""),
         "the lease-gate write must stamp updated_at from the server clock"
     );
-    // The only fallback is the DocumentDB one, and it re-reads the server clock
-    // at the gate rather than reusing anything captured earlier.
+    // The only fallback is the DocumentDB one: reuse the same in-session
+    // `$expr`/`$$NOW` filter with a classic update. A client timestamp must
+    // never become the expiry predicate.
     assert!(
         gate.contains("is_pipeline_update_unsupported(&error)"),
         "pipeline-form rejection (AWS DocumentDB) must be the only fallback trigger"
@@ -473,10 +474,19 @@ fn atomic_batch_lease_gate_compares_expiry_against_current_database_time() {
     let fallback_start = gate
         .find("is_pipeline_update_unsupported(&error)")
         .expect("fallback arm");
+    let fallback = &gate[fallback_start..];
     assert!(
-        gate[fallback_start..].contains("self.lease_server_time().await"),
-        "the classic fallback must read the MongoDB server clock at the gate, never the \
-         client clock or a pre-transaction snapshot"
+        fallback.contains("$currentDate") && fallback.contains("filter"),
+        "the classic fallback must reuse the in-session $$NOW filter with a classic update"
+    );
+    assert!(
+        !fallback.contains("lease_server_time()"),
+        "the DocumentDB fallback must never reintroduce lease_server_time() as the expiry \
+         authority"
+    );
+    assert!(
+        !fallback.contains("\"expires_at\": { \"$gt\": now }"),
+        "a pre-read timestamp must not become the expiry predicate"
     );
     assert!(
         gate.contains("result.matched_count != 1"),

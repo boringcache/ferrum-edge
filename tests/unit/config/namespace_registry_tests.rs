@@ -2,7 +2,9 @@
 
 use ferrum_edge::config::namespace_registry::{
     CreateNamespaceRequest, MAX_NAMESPACE_DESCRIPTION_CHARS, NAMESPACE_REGISTRY_ADMISSION_KEY,
-    UpdateNamespaceBody, normalize_description, validate_namespace_name,
+    NamespaceRegistryCorrupt, UpdateNamespaceBody, mtls_dns_admission_namespaces,
+    normalize_description, parse_namespace_rfc3339, require_namespace_identity,
+    validate_namespace_name,
 };
 
 #[test]
@@ -157,4 +159,60 @@ fn create_request_deserializes_optional_description() {
         serde_json::from_str::<CreateNamespaceRequest>(r#"{"name":"tenant-a","description":5}"#)
             .is_err()
     );
+}
+
+#[test]
+fn update_body_serde_preserves_present_null_versus_omission() {
+    // The whole PUT contract rests on this: serde's Option<T> would map a
+    // present JSON null to None, collapsing `{"description":null}` into
+    // omission. The presence-aware field deserializer must keep Null.
+    let omitted: UpdateNamespaceBody = serde_json::from_str("{}").unwrap();
+    assert!(omitted.name.is_none());
+    assert!(omitted.description.is_none());
+
+    let name_null: UpdateNamespaceBody = serde_json::from_str(r#"{"name":null}"#).unwrap();
+    assert_eq!(name_null.name, Some(serde_json::Value::Null));
+    assert!(name_null.resolve().is_err());
+
+    let desc_null: UpdateNamespaceBody = serde_json::from_str(r#"{"description":null}"#).unwrap();
+    assert_eq!(desc_null.description, Some(serde_json::Value::Null));
+    assert_eq!(desc_null.resolve().unwrap().description, Some(None));
+
+    assert!(serde_json::from_str::<UpdateNamespaceBody>("").is_err());
+    assert!(serde_json::from_str::<UpdateNamespaceBody>("null").is_err());
+    assert!(serde_json::from_str::<UpdateNamespaceBody>("[]").is_err());
+    assert!(serde_json::from_str::<UpdateNamespaceBody>("42").is_err());
+}
+
+#[test]
+fn mtls_dns_admission_namespaces_are_sorted_and_deduplicated() {
+    assert_eq!(
+        mtls_dns_admission_namespaces("staging", "staging"),
+        vec!["staging"]
+    );
+    assert_eq!(
+        mtls_dns_admission_namespaces("zeta", "alpha"),
+        vec!["alpha", "zeta"],
+        "rename must lock the alphabetically first name first so SQL row locks \
+         and Mongo multi-lease acquisition cannot deadlock"
+    );
+    assert_eq!(
+        mtls_dns_admission_namespaces("alpha", "zeta"),
+        vec!["alpha", "zeta"]
+    );
+}
+
+#[test]
+fn durable_namespace_identity_and_timestamps_fail_closed() {
+    assert!(require_namespace_identity("a", "a", Some("a")).is_ok());
+    assert!(require_namespace_identity("a", "b", None).is_err());
+    assert!(require_namespace_identity("a", "a", Some("b")).is_err());
+    assert!(require_namespace_identity("", "a", None).is_err());
+
+    let ts = "2026-01-02T03:04:05Z";
+    assert!(parse_namespace_rfc3339(ts, "created_at").is_ok());
+    let err = parse_namespace_rfc3339("not-a-timestamp", "created_at").unwrap_err();
+    assert!(!err.to_string().contains("not-a-timestamp"));
+    assert!(err.to_string().contains(NamespaceRegistryCorrupt::MESSAGE));
+    assert!(err.to_string().contains("created_at"));
 }

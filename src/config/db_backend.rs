@@ -2257,8 +2257,8 @@ pub trait DatabaseBackend: NamespaceConfigAdmissionLeaseBackend + Send + Sync {
 
     /// Delete a namespace, all-or-nothing.
     ///
-    /// Occupancy, process-default protection, and the last-remaining-namespace
-    /// invariant are all evaluated INSIDE the committing transaction — a
+    /// Occupancy, process-default protection, and the last remaining
+    /// **registry row** are all evaluated INSIDE the committing transaction — a
     /// handler precheck can only improve the error message, never be the
     /// authority. When `cascade` is false and resources remain, returns
     /// [`crate::config::namespace_registry::NamespaceRegistryError::NotEmpty`]

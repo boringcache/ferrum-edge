@@ -333,7 +333,10 @@ confirmed cascade delete spans the registry document, every resource document,
 the consumer identity index, the gateway trust bundle, the tenant's route-bucket
 lock documents, and the polling change records; and every registry mutation
 re-verifies its namespace-admission leases *inside* the committing transaction
-so a lost or stolen lease can never produce a durable write. Neither guarantee
+so a lost or stolen lease can never produce a durable write. Last-remaining
+protection is a remaining **registry document**, not the GET union of derived
+resource names: ordinary resource CRUD is not serialized by the global registry
+lease and does not insert registry documents. Neither guarantee
 is available on a standalone `mongod`, so all three write operations return
 `501 Not Implemented` before touching anything and name `FERRUM_MONGO_REPLICA_SET`
 (or the `replicaSet` URL option) as the remediation. `GET /namespaces` and

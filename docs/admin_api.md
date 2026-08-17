@@ -384,7 +384,7 @@ Sizing note: there is no listener-wide budget for concurrently buffered request 
 
 ## Namespaces
 
-Namespaces are first-class registry objects. Historically `GET /namespaces` was a `DISTINCT` union over resource tables, so an empty tenant could not exist and there was no rename or delete. The durable `namespaces` table (SQL and Mongo) holds `name` (primary key), optional `description`, `created_at`, and `updated_at`. Connect/migrate backfills distinct names from proxies, consumers, plugin configs, upstreams, and gateway trust bundles, plus the canonical `ferrum` row. Nothing else is seeded: the backfill never reads the process environment, so a deployment-specific `FERRUM_NAMESPACE` that has no resources yet is created through `POST /namespaces` (or implicitly by its first resource write) like any other tenant.
+Namespaces are first-class registry objects. Historically `GET /namespaces` was a `DISTINCT` union over resource tables, so an empty tenant could not exist and there was no rename or delete. The durable `namespaces` table (SQL and Mongo) holds `name` (primary key), optional `description`, `created_at`, and `updated_at`. Connect/migrate backfills distinct names from proxies, consumers, plugin configs, upstreams, and gateway trust bundles, plus the canonical `ferrum` row. Nothing else is seeded: the backfill never reads the process environment, so a deployment-specific `FERRUM_NAMESPACE` that has no resources yet is created through `POST /namespaces`. Ordinary resource writes with a new `X-Ferrum-Namespace` still isolate data and appear in `GET /namespaces` as derived names, but they do **not** insert a registry row.
 
 Writing a proxy (or other resource) with a new `X-Ferrum-Namespace` still isolates data without a prior `POST` — that implicit path remains valid. What the registry adds is the ability to create a tenant before any resource, and to rename or delete it.
 
@@ -415,8 +415,8 @@ curl -X DELETE -H "Authorization: Bearer $TOKEN" \
 ### Request field semantics
 
 - `description` is trimmed; an empty or whitespace-only value is stored as absent and omitted from the response. The 1024 limit counts **Unicode characters** (scalar values), not bytes, matching the OpenAPI `maxLength`.
-- On `PUT`, an omitted field is left unchanged. `description: null` (or an empty string) clears it. `name` is valid only as a **string when present** — `name: null` is rejected, not treated as "unchanged".
-- Any other JSON type for either field is `400` with nothing mutated. A malformed `description` never silently erases the stored value.
+- On `PUT`, an omitted field is left unchanged. `description: null` (or an empty string) clears it. `name` is valid only as a **string when present** — `name: null` is rejected, not treated as "unchanged". Presence-aware deserialization keeps a present JSON `null` distinct from an omitted field.
+- Any other JSON type for either field is `400` with nothing mutated. A malformed `description` never silently erases the stored value. An empty body or a non-object JSON value is `400`.
 
 ### Atomicity and protected namespaces
 
@@ -424,11 +424,11 @@ Create, rename, and delete are serialized across gateway processes by a **global
 
 Every precondition that can race is evaluated inside that transaction, not by an earlier query: source existence, target vacancy, occupancy, protection of the configured namespace, and the last-remaining-namespace invariant. Handler prechecks exist only to produce better messages.
 
-- Rename rewrites the registry row, every resource `namespace` column, the consumer identity/credential indexes, the gateway trust bundle, and the polling change-log tombstones in that one transaction. Stale route-bucket lock rows under the old name are removed; the admission lease rows proving the mutation are never touched.
+- Rename rewrites the registry row, every resource `namespace` column, the consumer identity/credential indexes, the gateway trust bundle, and the polling change-log tombstones in that one transaction. Stale route-bucket lock rows under the old name are removed; the admission lease rows proving the mutation are never touched. Rename also holds both the source and target mTLS DNS admission fences (sorted and de-duplicated) and fails closed if either has a restore owner; a description-only update holds the current name's fence.
 - Delete does not cascade by default; `?confirm=true` cascade-deletes occupancy resources (proxies, consumers, plugin configs, upstreams, API specs, the gateway trust bundle, the consumer indexes, and the tenant's route-bucket lock rows) and then the registry row.
 - Change-log tombstones and the namespace's change-log retention floor are deliberately **retained** after a rename or delete so a gateway still polling the old name converges instead of serving stale configuration.
 - The namespace this gateway is configured to serve (`FERRUM_NAMESPACE`, default `ferrum`) cannot be deleted **or renamed away** — a rename is semantically a removal of the old name. A description-only update of it is allowed. The value comes from the resolved startup configuration (CLI > env > conf file > default), never from a request-time environment read.
-- The last remaining namespace cannot be deleted, re-checked at the commit boundary so two gateway instances cannot each observe two names and concurrently delete a different one.
+- The last remaining **registry row** cannot be deleted, re-checked at the commit boundary so two gateway instances cannot each observe two registry rows and concurrently delete a different one. `GET /namespaces` remains the union of registry names and derived resource names; ordinary resource CRUD is not serialized by the global registry lease and does not insert registry rows, so a derived-only name cannot be the durable authority for that invariant.
 
 ### MongoDB limitation
 

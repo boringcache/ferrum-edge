@@ -9142,6 +9142,15 @@ fn map_namespace_registry_error(error: &anyhow::Error) -> Response<Full<Bytes>> 
         };
         return json_response(status, &json!({"error": reg.to_string()}));
     }
+    if crate::config::namespace_registry::is_namespace_registry_corrupt(error).is_some() {
+        warn_persistence_failure_redacted("namespace_registry_corrupt");
+        return json_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &json!({
+                "error": crate::config::namespace_registry::NamespaceRegistryCorrupt::MESSAGE
+            }),
+        );
+    }
     // `501 Not Implemented` rather than `503`, matching `POST /batch`: the
     // request is well-formed and the server is healthy, but the endpoint's
     // atomicity contract is not implementable against the configured database
@@ -9266,10 +9275,7 @@ async fn handle_list_namespaces(
                     ));
                 }
                 Err(e) => {
-                    return Ok(json_response(
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        &db_error_response(&e),
-                    ));
+                    return Ok(map_namespace_registry_error(&e));
                 }
             }
         }
@@ -9281,10 +9287,7 @@ async fn handle_list_namespaces(
                 StatusCode::OK,
                 &paginate_db_response(&result.items, result.total, pagination),
             )),
-            Err(e) => Ok(json_response(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                &db_error_response(&e),
-            )),
+            Err(e) => Ok(map_namespace_registry_error(&e)),
         }
     } else if let Some(config) = state.cached_gateway_config() {
         // File mode: return namespaces captured at load time (before namespace filtering)
@@ -9349,10 +9352,7 @@ async fn handle_get_namespace(
                 StatusCode::NOT_FOUND,
                 &json!({"error": format!("namespace '{name}' not found")}),
             )),
-            Err(e) => Ok(json_response(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                &db_error_response(&e),
-            )),
+            Err(e) => Ok(map_namespace_registry_error(&e)),
         }
     } else if let Some(config) = state.cached_gateway_config() {
         if config
@@ -9612,9 +9612,11 @@ async fn handle_delete_namespace(
     }
     let cascade = parse_restore_confirm(query);
     // The last-remaining-namespace invariant is NOT prechecked here: two
-    // gateways could each observe two names and concurrently delete a different
-    // one. It is re-evaluated at the backend commit boundary, under the global
-    // registry lease that serializes every registry mutation cluster-wide.
+    // gateways could each observe two registry rows and concurrently delete a
+    // different one. It is re-evaluated at the backend commit boundary against
+    // remaining durable registry rows, under the global registry lease. Ordinary
+    // resource CRUD is not serialized by that lease and does not create
+    // registry rows, so derived-only names cannot be the authority.
     let admission = match acquire_namespace_registry_admission(db.clone(), &[name]).await {
         Ok(admission) => admission,
         Err(resp) => return Ok(resp),

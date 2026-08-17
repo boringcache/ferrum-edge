@@ -1497,8 +1497,20 @@ fn namespace_registry_lease_gate_uses_server_time_and_joins_the_write_set() {
         "expiry must be evaluated from MongoDB's clock at the gate:\n{body}"
     );
     assert!(
-        body.contains("lease_server_time()"),
-        "the DocumentDB fallback must still read the server clock:\n{body}"
+        body.contains("$currentDate")
+            && body.contains("is_pipeline_update_unsupported")
+            && body.contains("is_server_time_expr_unsupported")
+            && body.contains("filter.clone()"),
+        "the DocumentDB fallback must reuse the in-session $$NOW predicate on a classic \
+         update and fail closed when that predicate is unavailable:\n{body}"
+    );
+    assert!(
+        !body.contains("lease_server_time()"),
+        "lease_server_time() must not be the expiry authority in this gate:\n{body}"
+    );
+    assert!(
+        !body.contains("\"expires_at\": { \"$gt\": now }"),
+        "a pre-read timestamp must not become the expiry predicate:\n{body}"
     );
 }
 
@@ -1538,5 +1550,84 @@ fn proxy_route_lock_cleanup_uses_an_escaped_id_prefix_not_a_namespace_filter() {
     assert!(
         !MONGO_STORE_SOURCE.contains(r#""consumer_credential_index""#),
         "the MongoDB backend has no consumer_credential_index collection"
+    );
+}
+
+#[test]
+fn namespace_prefixed_id_rewrite_requires_exact_prefix_and_nonempty_suffix() {
+    let body = mongo_method("rewrite_namespace_prefixed_ids_in_session(");
+    assert!(
+        body.contains("strip_prefix(&expected_prefix)") && body.contains("suffix.is_empty()"),
+        "malformed `{namespace}:…` identities must abort rather than being rewritten as \
+         `new_name:{{entire_old_id}}`:\n{body}"
+    );
+    assert!(
+        !body.contains("unwrap_or(old_id.as_str())"),
+        "the silent strip_prefix fallback must not return:\n{body}"
+    );
+}
+
+#[test]
+fn last_remaining_namespace_authority_is_the_registry_collection() {
+    let body = mongo_method("any_namespace_remains_in_session(");
+    assert!(
+        body.contains("namespaces()") && !body.contains("DERIVED_NAMESPACE_RESOURCE_TABLES"),
+        "last-remaining protection must be registry-row based; ordinary resource CRUD \
+         is not serialized by the global registry lease:\n{body}"
+    );
+}
+
+#[test]
+fn mongo_namespace_list_fails_closed_on_corrupt_registry_documents() {
+    let list = mongo_method("list_namespaces(");
+    assert!(
+        list.contains("registry_namespace_names()"),
+        "list must load registry documents, not only derived names:\n{list}"
+    );
+    let registry = mongo_method("registry_namespace_names(");
+    assert!(
+        registry.contains("document_to_namespace_record"),
+        "corrupt registry documents must fail the list rather than being skipped:\n{registry}"
+    );
+}
+
+#[test]
+fn namespace_rename_acquires_source_and_target_mtls_dns_fences_in_lock_order() {
+    let body = mongo_method("update_namespace(");
+    assert!(
+        body.contains("mtls_dns_admission_namespaces(")
+            && body.contains("acquire_mtls_dns_admission_leases(")
+            && body.contains("run_mtls_dns_mutations("),
+        "rename must acquire both source and target mTLS DNS fences through the \
+         multi-lease helper:\n{body}"
+    );
+    assert!(
+        !body.contains("acquire_mtls_dns_admission_lease(current_name)"),
+        "a single current_name fence would bypass a retained restore owner on the target:\n{body}"
+    );
+}
+
+#[test]
+fn mtls_dns_multi_lease_acquire_releases_already_held_guards_on_partial_failure() {
+    let body = mongo_method("acquire_mtls_dns_admission_leases_for_mode(");
+    assert!(
+        body.contains("release_mtls_dns_admission_leases(&mut leases)"),
+        "a later acquire error must release already-held guards rather than stranding \
+         them:\n{body}"
+    );
+}
+
+#[test]
+fn document_to_namespace_record_is_strict_and_does_not_synthesize() {
+    let body = mongo_fn_body("        fn document_to_namespace_record(");
+    assert!(
+        body.contains("require_namespace_identity")
+            && body.contains("parse_namespace_rfc3339")
+            && body.contains("NamespaceRegistryCorrupt::field"),
+        "corrupt durable documents must fail closed:\n{body}"
+    );
+    assert!(
+        !body.contains("Utc::now()") && !body.contains("unwrap_or_else(|| fallback_name"),
+        "missing timestamps/names must not be fabricated:\n{body}"
     );
 }

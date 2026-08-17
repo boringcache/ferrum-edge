@@ -14,13 +14,20 @@
 //! first, then the affected namespace names in ascending order — and is
 //! committed by the backend in a single transaction that re-verifies those
 //! leases against the datastore's own clock immediately before commit.
+//!
+//! The last-remaining-namespace invariant is **registry-row** based: every
+//! registry-row removal takes that global lease, so two deletes cannot empty
+//! the table. Ordinary resource CRUD does **not** take the global lease and
+//! does **not** insert registry rows, so a derived-only name cannot be the
+//! durable authority for "a namespace still exists". `GET /namespaces` stays
+//! the backward-compatible union of registry names and derived resource names.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, MutexGuard, OnceLock};
 
 use chrono::{DateTime, Utc};
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 
 use crate::config::batch_atomicity::BatchAdmissionLeaseLost;
 use crate::config::types::validate_namespace;
@@ -86,6 +93,19 @@ pub struct CreateNamespaceRequest {
     pub description: Option<String>,
 }
 
+/// Serde maps a present JSON `null` to `None` for `Option<T>`. Capture the
+/// field as `Some(Value::Null)` instead so [`UpdateNamespaceBody::resolve`]
+/// can reject `name: null` and clear on `description: null`. Absent fields
+/// still become `None` via `#[serde(default)]`.
+fn deserialize_present_json_value<'de, D>(
+    deserializer: D,
+) -> Result<Option<serde_json::Value>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    serde_json::Value::deserialize(deserializer).map(Some)
+}
+
 /// PUT /namespaces/:name body.
 ///
 /// Both fields are captured as raw JSON so the handler can distinguish
@@ -94,9 +114,9 @@ pub struct CreateNamespaceRequest {
 /// else may interpret these values.
 #[derive(Debug, Clone, Deserialize)]
 pub struct UpdateNamespaceBody {
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_present_json_value")]
     pub name: Option<serde_json::Value>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_present_json_value")]
     pub description: Option<serde_json::Value>,
 }
 
@@ -232,6 +252,8 @@ impl NamespaceRegistryError {
     /// rename-away use this.
     pub const PROTECTED_PROCESS_DEFAULT: &str =
         "it is the namespace this gateway is configured to serve (FERRUM_NAMESPACE)";
+    /// Last **registry row**, not last derived resource name. Resource writers
+    /// do not take the global registry lease, so they cannot be the authority.
     pub const PROTECTED_LAST_REMAINING: &str = "it is the last remaining namespace";
 
     pub fn not_found(name: &str) -> anyhow::Error {
@@ -279,6 +301,37 @@ impl std::fmt::Display for NamespaceRegistryError {
 }
 
 impl std::error::Error for NamespaceRegistryError {}
+
+/// Durable registry row that cannot be interpreted as a [`NamespaceRecord`].
+///
+/// The payload is a schema field name only. It never carries the stored name,
+/// timestamp, description, or driver text — those can be hostile or
+/// PII-bearing and must not appear in client or log output.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct NamespaceRegistryCorrupt {
+    field: &'static str,
+}
+
+impl NamespaceRegistryCorrupt {
+    pub const MESSAGE: &'static str =
+        "durable namespace registry record is corrupt and cannot be served";
+
+    pub fn field(field: &'static str) -> Self {
+        Self { field }
+    }
+
+    pub fn into_error(self) -> anyhow::Error {
+        anyhow::Error::new(self)
+    }
+}
+
+impl std::fmt::Display for NamespaceRegistryCorrupt {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{} ({})", Self::MESSAGE, self.field)
+    }
+}
+
+impl std::error::Error for NamespaceRegistryCorrupt {}
 
 pub fn is_namespace_registry_error(error: &anyhow::Error) -> Option<&NamespaceRegistryError> {
     error
@@ -329,6 +382,69 @@ impl std::fmt::Display for NamespaceRegistryAtomicityUnsupported {
 }
 
 impl std::error::Error for NamespaceRegistryAtomicityUnsupported {}
+
+pub fn is_namespace_registry_corrupt(error: &anyhow::Error) -> Option<&NamespaceRegistryCorrupt> {
+    error
+        .chain()
+        .find_map(|cause| cause.downcast_ref::<NamespaceRegistryCorrupt>())
+}
+
+/// Sorted, de-duplicated namespace names whose mTLS DNS admission fences a
+/// registry update must hold.
+///
+/// A rename writes resources into `new_name`, so both the source and the
+/// target fences are required (a retained guarded-restore owner on the target
+/// would otherwise be bypassed once the target config lease is free). A
+/// description-only update needs only the current name. Callers acquire in
+/// this order so SQL row locks and Mongo multi-lease acquisition cannot
+/// deadlock.
+pub fn mtls_dns_admission_namespaces<'a>(
+    current_name: &'a str,
+    new_name: &'a str,
+) -> Vec<&'a str> {
+    let mut names = vec![current_name];
+    if new_name != current_name {
+        names.push(new_name);
+    }
+    names.sort_unstable();
+    names.dedup();
+    names
+}
+
+/// Strict RFC 3339 timestamp. Never invents `Utc::now()` for a missing or
+/// malformed durable value, and never echoes `raw` in the error.
+pub fn parse_namespace_rfc3339(
+    raw: &str,
+    field: &'static str,
+) -> Result<DateTime<Utc>, NamespaceRegistryCorrupt> {
+    DateTime::parse_from_rfc3339(raw)
+        .map(|dt| dt.with_timezone(&Utc))
+        .map_err(|_| NamespaceRegistryCorrupt::field(field))
+}
+
+/// Require a non-empty string `_id`/`name` pair that agrees with itself and,
+/// when the caller requested a specific key, with that key.
+pub fn require_namespace_identity(
+    id: &str,
+    name: &str,
+    expected: Option<&str>,
+) -> Result<String, NamespaceRegistryCorrupt> {
+    if id.is_empty() || name.is_empty() || id != name {
+        return Err(NamespaceRegistryCorrupt::field("name"));
+    }
+    if let Some(expected) = expected
+        && id != expected
+    {
+        return Err(NamespaceRegistryCorrupt::field("name"));
+    }
+    Ok(name.to_string())
+}
+
+/// Stored description: empty becomes absent. Callers must already have
+/// rejected every non-string, non-null shape.
+pub fn stored_description(description: Option<String>) -> Option<String> {
+    description.filter(|value| !value.is_empty())
+}
 
 pub fn namespace_registry_atomicity_unsupported(
     error: &anyhow::Error,

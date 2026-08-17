@@ -3337,3 +3337,80 @@ async fn opt_in_write_permit_blocks_failback_until_dropped() {
         vec!["primary-ns".to_string()]
     );
 }
+
+#[test]
+fn last_remaining_sql_is_registry_row_authority_not_the_get_union() {
+    let source = include_str!("../../../src/config/db_loader.rs");
+    let start = source
+        .find("const ANY_NAMESPACE_REMAINS_SQL")
+        .expect("ANY_NAMESPACE_REMAINS_SQL");
+    let sql = &source[start..start + 400];
+    assert!(
+        sql.contains("SELECT 1 AS present FROM namespaces LIMIT 1"),
+        "last-remaining protection must count durable registry rows only:\n{sql}"
+    );
+    assert!(
+        !sql.contains("UNION SELECT namespace FROM proxies"),
+        "the GET union must not be the delete authority; resource writers do not take \
+         the global registry lease:\n{sql}"
+    );
+}
+
+#[test]
+fn sql_namespace_rename_locks_source_and_target_mtls_dns_fences_in_order() {
+    let source = include_str!("../../../src/config/db_loader.rs");
+    let start = source
+        .find("pub async fn update_namespace(")
+        .expect("update_namespace");
+    let body = source[start..]
+        .split("async fn upsert_namespace_registry_row_tx(")
+        .next()
+        .expect("update_namespace body");
+    assert!(
+        body.contains("mtls_dns_admission_namespaces(")
+            && body.contains("lock_mtls_dns_admission_for_owner_tx"),
+        "rename must lock both names in sorted order inside the same transaction:\n{body}"
+    );
+    assert!(
+        !body.contains("lock_mtls_dns_admission_for_owner_tx(&mut tx, current_name, None)"),
+        "locking only current_name would bypass a restore owner on the target:\n{body}"
+    );
+}
+
+#[test]
+fn sql_namespace_row_mapper_fails_closed_on_corrupt_timestamps() {
+    let source = include_str!("../../../src/config/db_loader.rs");
+    let start = source
+        .find("fn row_to_namespace_record(")
+        .expect("row_to_namespace_record");
+    let body = source[start..]
+        .split("const NAMESPACE_NAME_IN_USE_SQL")
+        .next()
+        .expect("row_to_namespace_record body");
+    assert!(
+        body.contains("parse_namespace_rfc3339")
+            && body.contains("NamespaceRegistryCorrupt")
+            && body.contains("require_namespace_identity"),
+        "corrupt registry rows must not be served as plausible API data:\n{body}"
+    );
+    assert!(
+        !body.contains("unwrap_or_else(Utc::now)") && !body.contains("unwrap_or(created_at)"),
+        "missing timestamps must not be fabricated:\n{body}"
+    );
+}
+
+#[test]
+fn sql_namespace_list_fails_closed_on_corrupt_registry_rows() {
+    let source = include_str!("../../../src/config/db_loader.rs");
+    for marker in [
+        "async fn list_namespaces_from_pool(",
+        "async fn list_namespaces_paginated_from_pool(",
+    ] {
+        let start = source.find(marker).unwrap_or_else(|| panic!("{marker}"));
+        let body = &source[start..start + 600];
+        assert!(
+            body.contains("ensure_namespace_registry_rows_readable(pool)"),
+            "{marker} must refuse to serve names from an unreadable registry:\n{body}"
+        );
+    }
+}

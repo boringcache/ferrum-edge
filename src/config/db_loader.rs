@@ -7794,6 +7794,7 @@ impl DatabaseStore {
         pool: &AnyPool,
     ) -> Result<Vec<String>, anyhow::Error> {
         let start = Instant::now();
+        self.ensure_namespace_registry_rows_readable(pool).await?;
         // Registry ∪ derived resource names so empty tenants appear and
         // nothing disappears during rollout (issue #3955). Trust-only
         // namespaces still enumerate via gateway_trust_bundles.
@@ -7808,11 +7809,7 @@ impl DatabaseStore {
         let rows: Vec<AnyRow> = sqlx::query(sql).fetch_all(pool).await?;
         let mut namespaces = Vec::with_capacity(rows.len());
         for row in rows {
-            if let Ok(ns) = row.try_get::<String, _>("name") {
-                namespaces.push(ns);
-            } else if let Ok(ns) = row.try_get::<String, _>("namespace") {
-                namespaces.push(ns);
-            }
+            namespaces.push(list_namespace_name(&row)?);
         }
         self.check_slow_query("list_namespaces", start);
         Ok(namespaces)
@@ -7856,6 +7853,7 @@ impl DatabaseStore {
         pool: &AnyPool,
     ) -> Result<PaginatedResult<String>, anyhow::Error> {
         let start = Instant::now();
+        self.ensure_namespace_registry_rows_readable(pool).await?;
         // The union subquery keeps one deterministic ordering for both the
         // count and the page so `total` and the returned slice cannot drift
         // apart across the registry and the five resource tables (including
@@ -7886,11 +7884,7 @@ impl DatabaseStore {
             .await?;
         let mut namespaces = Vec::with_capacity(rows.len());
         for row in rows {
-            if let Ok(ns) = row.try_get::<String, _>("name") {
-                namespaces.push(ns);
-            } else if let Ok(ns) = row.try_get::<String, _>("namespace") {
-                namespaces.push(ns);
-            }
+            namespaces.push(list_namespace_name(&row)?);
         }
         self.check_slow_query("list_namespaces_paginated", start);
         Ok(PaginatedResult {
@@ -7914,32 +7908,55 @@ impl DatabaseStore {
         let Some(row) = row else {
             return Ok(None);
         };
-        Ok(Some(self.row_to_namespace_record(&row)?))
+        Ok(Some(self.row_to_namespace_record(Some(name), &row)?))
+    }
+
+    /// Fail closed if any durable registry row cannot be interpreted.
+    /// Derived-only resource names are not synthesized here; they still appear
+    /// in the GET union after this check.
+    async fn ensure_namespace_registry_rows_readable(
+        &self,
+        pool: &AnyPool,
+    ) -> Result<(), anyhow::Error> {
+        let rows: Vec<AnyRow> =
+            sqlx::query("SELECT name, description, created_at, updated_at FROM namespaces")
+                .fetch_all(pool)
+                .await?;
+        for row in rows {
+            self.row_to_namespace_record(None, &row)?;
+        }
+        Ok(())
     }
 
     fn row_to_namespace_record(
         &self,
+        expected_name: Option<&str>,
         row: &AnyRow,
     ) -> Result<crate::config::namespace_registry::NamespaceRecord, anyhow::Error> {
-        let created_at = row
-            .try_get::<String, _>("created_at")
-            .ok()
-            .and_then(|s| DateTime::parse_from_rfc3339(&s).ok())
-            .map(|dt| dt.with_timezone(&Utc))
-            .unwrap_or_else(Utc::now);
-        let updated_at = row
-            .try_get::<String, _>("updated_at")
-            .ok()
-            .and_then(|s| DateTime::parse_from_rfc3339(&s).ok())
-            .map(|dt| dt.with_timezone(&Utc))
-            .unwrap_or(created_at);
-        let description = row
-            .try_get::<Option<String>, _>("description")
-            .ok()
-            .flatten()
-            .filter(|s| !s.is_empty());
+        use crate::config::namespace_registry::{
+            NamespaceRegistryCorrupt, parse_namespace_rfc3339, require_namespace_identity,
+            stored_description,
+        };
+        let name: String = row
+            .try_get("name")
+            .map_err(|_| NamespaceRegistryCorrupt::field("name"))?;
+        let name = require_namespace_identity(&name, &name, expected_name)?;
+        let created_raw: String = row
+            .try_get("created_at")
+            .map_err(|_| NamespaceRegistryCorrupt::field("created_at"))?;
+        let created_at = parse_namespace_rfc3339(&created_raw, "created_at")?;
+        let updated_raw: String = row
+            .try_get("updated_at")
+            .map_err(|_| NamespaceRegistryCorrupt::field("updated_at"))?;
+        let updated_at = parse_namespace_rfc3339(&updated_raw, "updated_at")?;
+        let description = match optional_utf8_text_column(row, "description") {
+            Ok(value) => stored_description(value),
+            Err(_) => {
+                return Err(NamespaceRegistryCorrupt::field("description").into_error());
+            }
+        };
         Ok(crate::config::namespace_registry::NamespaceRecord {
-            name: row.try_get("name")?,
+            name,
             description,
             created_at,
             updated_at,
@@ -7970,21 +7987,17 @@ impl DatabaseStore {
          UNION SELECT namespace FROM api_specs WHERE namespace = ? \
          ) AS ferrum_ns_occupied LIMIT 1";
 
-    /// Does ANY namespace still exist? Exactly the union `GET /namespaces`
-    /// lists, so "the last remaining namespace" means the same thing to the
-    /// invariant and to the client. No binds.
-    const ANY_NAMESPACE_REMAINS_SQL: &str = "SELECT 1 AS present FROM ( \
-         SELECT name FROM namespaces \
-         UNION SELECT namespace FROM proxies \
-         UNION SELECT namespace FROM consumers \
-         UNION SELECT namespace FROM plugin_configs \
-         UNION SELECT namespace FROM upstreams \
-         UNION SELECT namespace FROM gateway_trust_bundles \
-         ) AS ferrum_ns_any LIMIT 1";
+    /// Does ANY durable registry row still exist? Last-remaining protection is
+    /// registry-row based because every registry-row removal is serialized by
+    /// the global registry lease. Ordinary resource CRUD is not, so a
+    /// derived-only name cannot be the authority. `GET /namespaces` remains
+    /// registry ∪ derived resource names. No binds.
+    const ANY_NAMESPACE_REMAINS_SQL: &str = "SELECT 1 AS present FROM namespaces LIMIT 1";
 
     pub async fn namespace_name_in_use(&self, name: &str) -> Result<bool, anyhow::Error> {
         let pool = self.pool();
-        let mut query = sqlx::query(&self.q(Self::NAMESPACE_NAME_IN_USE_SQL));
+        let sql = self.q(Self::NAMESPACE_NAME_IN_USE_SQL);
+        let mut query = sqlx::query(&sql);
         for _ in 0..7 {
             query = query.bind(name);
         }
@@ -7996,7 +8009,8 @@ impl DatabaseStore {
         tx: &mut sqlx::Transaction<'_, sqlx::Any>,
         name: &str,
     ) -> Result<bool, anyhow::Error> {
-        let mut query = sqlx::query(&self.q(Self::NAMESPACE_NAME_IN_USE_SQL));
+        let sql = self.q(Self::NAMESPACE_NAME_IN_USE_SQL);
+        let mut query = sqlx::query(&sql);
         for _ in 0..7 {
             query = query.bind(name);
         }
@@ -8005,7 +8019,8 @@ impl DatabaseStore {
 
     pub async fn namespace_has_resources(&self, name: &str) -> Result<bool, anyhow::Error> {
         let pool = self.pool();
-        let mut query = sqlx::query(&self.q(Self::NAMESPACE_HAS_RESOURCES_SQL));
+        let sql = self.q(Self::NAMESPACE_HAS_RESOURCES_SQL);
+        let mut query = sqlx::query(&sql);
         for _ in 0..6 {
             query = query.bind(name);
         }
@@ -8017,7 +8032,8 @@ impl DatabaseStore {
         tx: &mut sqlx::Transaction<'_, sqlx::Any>,
         name: &str,
     ) -> Result<bool, anyhow::Error> {
-        let mut query = sqlx::query(&self.q(Self::NAMESPACE_HAS_RESOURCES_SQL));
+        let sql = self.q(Self::NAMESPACE_HAS_RESOURCES_SQL);
+        let mut query = sqlx::query(&sql);
         for _ in 0..6 {
             query = query.bind(name);
         }
@@ -8048,7 +8064,7 @@ impl DatabaseStore {
         let Some(row) = row else {
             return Ok(None);
         };
-        Ok(Some(self.row_to_namespace_record(&row)?))
+        Ok(Some(self.row_to_namespace_record(Some(name), &row)?))
     }
 
     /// Re-verify EVERY admission lease this registry mutation holds — the
@@ -8160,11 +8176,16 @@ impl DatabaseStore {
             if self.namespace_name_in_use_tx(&mut tx, new_name).await? {
                 return Err(RegistryError::name_in_use(new_name));
             }
-            // Same fence every namespace-wide mutation takes: it locks the
-            // namespace's mTLS DNS admission row for the rest of this
-            // transaction AND fails closed (retryable 503) when a guarded
-            // restore replay — which spans several transactions — owns it.
-            self.lock_mtls_dns_admission_for_owner_tx(&mut tx, current_name, None)
+        }
+        // Description-only holds the current name's fence. A rename also
+        // writes resources into `new_name`, so both source and target fences
+        // are taken in sorted order inside this same transaction and fail
+        // closed when either has a restore owner.
+        for name in crate::config::namespace_registry::mtls_dns_admission_namespaces(
+            current_name,
+            new_name,
+        ) {
+            self.lock_mtls_dns_admission_for_owner_tx(&mut tx, name, None)
                 .await?;
         }
 
@@ -8444,8 +8465,8 @@ impl DatabaseStore {
     ///
     /// Every security/integrity precondition that can race is evaluated here,
     /// under the caller's admission leases and inside the committing
-    /// transaction: process-default protection, occupancy, and the
-    /// last-remaining-namespace invariant. The lease identities are re-verified
+    /// transaction: process-default protection, occupancy, and the last
+    /// remaining **registry row**. The lease identities are re-verified
     /// against the database's clock immediately before commit, so a lost or
     /// stolen lease aborts with nothing durable.
     pub async fn delete_namespace(
@@ -8508,10 +8529,10 @@ impl DatabaseStore {
             RegistryPhase::RegistryRow,
         )?;
 
-        // Re-checked HERE, not from an earlier list query: two gateways that
-        // each observed two names would otherwise both proceed and leave zero.
-        // Both hold the global registry lease, so this transaction is the only
-        // one that can be removing a namespace right now.
+        // Re-checked HERE against durable registry rows, not the GET union.
+        // Ordinary resource deletion in a derived-only namespace does not take
+        // the global registry lease; requiring one remaining registry row is
+        // the fence that cannot race with those writers.
         if !self.any_namespace_remains_tx(&mut tx).await? {
             return Err(RegistryError::protected(
                 name,
@@ -11651,6 +11672,14 @@ fn required_utf8_text_column(row: &AnyRow, column: &str) -> Result<String, anyho
                 .map_err(|error| anyhow::anyhow!("column '{column}' is not valid UTF-8: {error}"))
         }
     }
+}
+
+fn list_namespace_name(row: &AnyRow) -> Result<String, anyhow::Error> {
+    row.try_get::<String, _>("name")
+        .or_else(|_| row.try_get::<String, _>("namespace"))
+        .map_err(|_| {
+            crate::config::namespace_registry::NamespaceRegistryCorrupt::field("name").into_error()
+        })
 }
 
 /// Decode a nullable TEXT/MEDIUMTEXT column. `Ok(None)` preserves SQL NULL;
