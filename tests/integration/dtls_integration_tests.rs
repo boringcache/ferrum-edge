@@ -1303,7 +1303,7 @@ async fn test_frontend_dtls_refuses_untrusted_client_without_completing_the_hand
     // production log level or turning transient infrastructure failures into
     // blind reruns.
     let _ = tracing_subscriber::fmt()
-        .with_env_filter("ferrum_edge::dtls=trace")
+        .with_env_filter("ferrum_edge::dtls=trace,dimpl=trace")
         .with_test_writer()
         .try_init();
 
