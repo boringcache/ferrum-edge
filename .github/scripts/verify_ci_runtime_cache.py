@@ -3701,7 +3701,7 @@ def self_test() -> int:
     )
     require(
         any(
-            "download/promote and mtime-refresh the exact inter-run artifact before building"
+            "must quarantine stable-cache CMake state before an optional exact inter-run promotion"
             in item
             for item in consumer_save_failures
         ),
