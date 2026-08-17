@@ -309,6 +309,82 @@ fn pktinfo_local_debug_format() {
     assert!(dbg.contains("ifindex: 0"));
 }
 
+// ── PktinfoLocal::send_ifindex ─────────────────────────────────────────
+//
+// The captured `ifindex` is a RECEIVE-side fact (which interface the datagram
+// arrived on) and is what NodeWaypoint UDP source attribution is fenced by. In
+// an OUTBOUND pktinfo cmsg the same field constrains egress route selection
+// instead, so it may only be reused when the reply source address is a scoped
+// IPv6 address whose zone is otherwise ambiguous. Every other reply keeps the
+// pinned source address (`ipi_spec_dst` / `ipi6_addr`) and lets the route table
+// pick the egress device.
+
+fn pktinfo_local(ip: &str, ifindex: u32) -> PktinfoLocal {
+    PktinfoLocal {
+        ip: ip.parse().expect("valid IP literal"),
+        ifindex,
+    }
+}
+
+#[test]
+fn send_ifindex_is_zero_for_ipv4_even_when_ingress_interface_is_known() {
+    // Same-node pod ingress: the datagram arrived on the client pod's veth,
+    // but the captured local destination is a node address that may live on a
+    // different device. A nonzero IPv4 ifindex would make the kernel prefer
+    // that device's primary address over the pinned reply source.
+    assert_eq!(pktinfo_local("10.244.1.1", 17).send_ifindex(), 0);
+    assert_eq!(pktinfo_local("172.18.0.3", 17).send_ifindex(), 0);
+    assert_eq!(pktinfo_local("127.0.0.1", 1).send_ifindex(), 0);
+}
+
+#[test]
+fn send_ifindex_is_zero_for_global_ipv6_reply_sources() {
+    // Route-selected egress: a global source address is reachable through
+    // whatever device the route table picks, which need not be the receive
+    // interface.
+    assert_eq!(pktinfo_local("fd00:10:244:1::1", 23).send_ifindex(), 0);
+    assert_eq!(pktinfo_local("2001:db8::1", 23).send_ifindex(), 0);
+    assert_eq!(pktinfo_local("::1", 1).send_ifindex(), 0);
+}
+
+#[test]
+fn send_ifindex_is_preserved_for_link_local_ipv6_reply_sources() {
+    // fe80::/10 is zone-ambiguous: without the interface index the kernel
+    // cannot tell which link the source address belongs to.
+    assert_eq!(pktinfo_local("fe80::1", 23).send_ifindex(), 23);
+    assert_eq!(pktinfo_local("febf:ffff::1", 9).send_ifindex(), 9);
+    // fec0::/10 is site-local (deprecated, not link-local) — not scoped by
+    // interface index.
+    assert_eq!(pktinfo_local("fec0::1", 9).send_ifindex(), 0);
+}
+
+#[test]
+fn send_ifindex_is_preserved_for_interface_and_link_scoped_ipv6_multicast() {
+    assert_eq!(pktinfo_local("ff01::1", 5).send_ifindex(), 5);
+    assert_eq!(pktinfo_local("ff02::1", 5).send_ifindex(), 5);
+    // Wider multicast scopes route normally.
+    assert_eq!(pktinfo_local("ff05::1", 5).send_ifindex(), 0);
+    assert_eq!(pktinfo_local("ff0e::1", 5).send_ifindex(), 0);
+}
+
+#[test]
+fn send_ifindex_never_invents_an_interface() {
+    // A capture that reported no ingress interface must not turn into one on
+    // send for any address family or scope.
+    assert_eq!(pktinfo_local("fe80::1", 0).send_ifindex(), 0);
+    assert_eq!(pktinfo_local("ff02::1", 0).send_ifindex(), 0);
+    assert_eq!(pktinfo_local("10.0.0.1", 0).send_ifindex(), 0);
+}
+
+#[test]
+fn send_ifindex_does_not_disturb_the_captured_attribution_ifindex() {
+    // The receive-side evidence NodeWaypoint attribution is fenced by stays
+    // readable and unchanged after deriving the send-side value.
+    let local = pktinfo_local("10.244.1.1", 42);
+    assert_eq!(local.send_ifindex(), 0);
+    assert_eq!(local.ifindex, 42);
+}
+
 // ── connect_with_socket_opts (platform-independent, async) ─────────────
 
 #[tokio::test]

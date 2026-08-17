@@ -1,18 +1,21 @@
 #!/usr/bin/env python3
-"""Static contract checks for production-image and FIPS CI runtime caching (#3888).
+"""Static contract checks for production-image, FIPS, and Ambient CI caching.
 
 Does not compile Rust or build images. Proves workflow permission/caching
 boundaries, pinned actions, fail-closed NUL-delimited planning, preserved live
 contracts, telemetry redaction, evidence-backed cache restore bytes, schema-
 and architecture-scoped BuildKit keys, exact-hit restore-only vs partial/miss
 publish, fail-closed cache-save preparation, fork restore-only / no-save
-steps, rust-cache save-if so fork PRs cannot save, FIPS producer/consumer key
+steps, rust-cache save-if so fork PRs cannot save (and, for the shared
+setup-rust-ci action, so only trusted refs/heads/main runs save at all),
+FIPS producer/consumer key
 equality with unique attempt scoping and stable fallback isolation, rejection
 of ignored rust-cache `key` wiring, checksum-pinned sccache install without
 credential-exporting installers, same-run producer vs immutable inter-run
 artifact handoff warming, exact verified executable activation, empty
-SCCACHE_GHA_ENABLED persistence, fail-closed uncached fallback, and hosted
-cache-token absence assertions.
+SCCACHE_GHA_ENABLED persistence, fail-closed uncached fallback, hosted
+cache-token absence assertions, and Ambient production-image GHA cache-to
+gated to trusted `refs/heads/main` so pull requests restore without publishing.
 """
 
 from __future__ import annotations
@@ -33,6 +36,7 @@ from ci_runtime_telemetry import self_test as telemetry_self_test
 REPO_ROOT = Path(__file__).resolve().parents[2]
 FIPS_WORKFLOW = REPO_ROOT / ".github" / "workflows" / "fips-build.yml"
 NODE_WORKFLOW = REPO_ROOT / ".github" / "workflows" / "node-waypoint-ebpf-live.yml"
+AMBIENT_WORKFLOW = REPO_ROOT / ".github" / "workflows" / "ambient-host-udp-live.yml"
 DOCKERFILE = REPO_ROOT / "Dockerfile"
 SETUP_RUST = REPO_ROOT / ".github" / "actions" / "setup-rust-ci" / "action.yml"
 SETUP_SCCACHE = REPO_ROOT / ".github" / "actions" / "setup-sccache" / "action.yml"
@@ -522,6 +526,31 @@ def require(condition: bool, message: str, failures: list[str]) -> None:
 
 FORK_IS_TRUE = "github.event.pull_request.head.repo.fork == true"
 FORK_NOT_TRUE = "github.event.pull_request.head.repo.fork != true"
+AMBIENT_GHA_CACHE_SCOPE = "ambient-host-udp-images"
+AMBIENT_GHA_CACHE_FROM = f"type=gha,scope={AMBIENT_GHA_CACHE_SCOPE}"
+AMBIENT_GHA_CACHE_TO_EXPORT = f"type=gha,mode=max,scope={AMBIENT_GHA_CACHE_SCOPE}"
+AMBIENT_GHA_CACHE_TO = (
+    "${{ github.event_name != 'pull_request' && "
+    "github.event_name != 'merge_group' && "
+    "github.ref == 'refs/heads/main' && "
+    f"{FORK_NOT_TRUE} && "
+    f"'{AMBIENT_GHA_CACHE_TO_EXPORT}' || '' }}}}"
+)
+AMBIENT_IMAGE_BUILDS = (
+    ("Build the capture tool base stage", "capture-tools-base"),
+    (
+        "Build the production Ambient UDP lifecycle runtime",
+        "runtime-ebpf-tools",
+    ),
+    ("Build the distroless eBPF runtime", "runtime-ebpf"),
+)
+AMBIENT_IMAGE_CONTRACTS = (
+    "Prove the published runtime can execute the production tool set",
+    "Prove the `-ebpf` image keeps its distroless contract",
+)
+UNCONDITIONAL_AMBIENT_CACHE_TO = re.compile(
+    r"(?m)^[ \t]*cache-to:[ \t]*type=gha,mode=max,scope=ambient-host-udp-images\s*$"
+)
 COLD_IS_TRUE = "github.event.inputs.force_cold_cache == 'true'"
 COLD_NOT_TRUE = "github.event.inputs.force_cold_cache != 'true'"
 SAVE_IF_NON_FORK = re.compile(
@@ -531,6 +560,22 @@ SAVE_IF_NON_FORK = re.compile(
 )
 SAVE_IF_FALSE = re.compile(
     r"(?m)^[ \t]*save-if:\s*(?:['\"]?)(?:\$\{\{\s*)?false"
+    r"(?:\s*\}\})?(?:['\"]?)\s*(?:#.*)?$"
+)
+# The shared setup-rust-ci action publishes rust-cache saves only from a
+# trusted `refs/heads/main` run: PR-merge-ref-scoped Swatinem entries were
+# multi-gigabyte per lane, evicted the default-branch caches every job
+# restores from (10 GB repository quota, LRU across refs), and left ordinary
+# test lanes compiling cold. The pull_request/merge_group exclusions are
+# explicit even though `github.ref` alone would exclude both, so the guard
+# stays fail-closed if the ref check is later weakened; the fork guard is the
+# same defense in depth.
+SAVE_IF_TRUSTED_MAIN = re.compile(
+    r"(?m)^[ \t]*save-if:\s*(?:['\"]?)(?:\$\{\{\s*)?"
+    r"github\.event_name\s*!=\s*'pull_request'\s*&&\s*"
+    r"github\.event_name\s*!=\s*'merge_group'\s*&&\s*"
+    r"github\.ref\s*==\s*'refs/heads/main'\s*&&\s*"
+    r"github\.event\.pull_request\.head\.repo\.fork\s*!=\s*true"
     r"(?:\s*\}\})?(?:['\"]?)\s*(?:#.*)?$"
 )
 RUST_CACHE_BARE_KEY = re.compile(r"(?m)^[ \t]*key:")
@@ -719,7 +764,12 @@ def check_no_sccache_credential_exporter(
             failures,
         )
     require(
-        "core.exportVariable" not in text,
+        # Invocation-shaped match: `setup-sccache/action.yml` is whole-file
+        # digest-frozen under the Cross policy, and its description prose
+        # legitimately names the `core.exportVariable` API while documenting
+        # that no installer calling it is invoked. Only an actual call site
+        # (always followed by an argument list) is a credential leak.
+        "core.exportVariable(" not in text,
         f"{source} must not call core.exportVariable (ACTIONS_RUNTIME_TOKEN leak)",
         failures,
     )
@@ -1400,6 +1450,41 @@ def check_rust_cache_fork_save_if(
         )
 
 
+def check_rust_cache_trusted_main_save_if(
+    text: str,
+    source: str,
+    failures: list[str],
+    *,
+    expected_count: int,
+) -> None:
+    """Require rust-cache saves gated to a trusted `refs/heads/main` run.
+
+    Distinct from `check_rust_cache_fork_save_if`: a site that carries only
+    the fork guard still publishes multi-gigabyte PR-merge-ref caches into the
+    shared 10 GB quota, so restoring that older shape must fail closed here.
+    """
+
+    blocks = rust_cache_with_blocks(text)
+    require(
+        len(blocks) == expected_count,
+        f"{source} must have exactly {expected_count} pinned rust-cache "
+        f"site(s), found {len(blocks)}",
+        failures,
+    )
+    for index, block in enumerate(blocks, 1):
+        require(
+            SAVE_IF_TRUSTED_MAIN.search(block) is not None,
+            f"{source} rust-cache site {index} must gate save-if to trusted "
+            "refs/heads/main so pull requests and merge groups restore only",
+            failures,
+        )
+        require(
+            "cache-on-failure:" in block and "true" in block,
+            f"{source} rust-cache site {index} must keep cache-on-failure true",
+            failures,
+        )
+
+
 def buildkit_cache_key(scope: str) -> str:
     return (
         f"{scope}-{BUILDKIT_CACHE_SCHEMA}-"
@@ -1552,6 +1637,108 @@ def check_buildkit_cache_boundary(
         f"{source} must not use the BuildKit GHA cache backend",
         failures,
     )
+
+
+def with_scalar(with_block: str, key: str) -> str:
+    match = re.search(
+        rf"(?m)^[ \t]*{re.escape(key)}:\s*(.+?)\s*$",
+        with_block,
+    )
+    if match is None:
+        return ""
+    value = match.group(1).strip()
+    if len(value) >= 2 and value[0] == value[-1] and value[0] in {'"', "'"}:
+        return value[1:-1]
+    return value
+
+
+def check_ambient_image_cache_budget(
+    job_body: str,
+    source: str,
+    failures: list[str],
+) -> None:
+    require(
+        UNCONDITIONAL_AMBIENT_CACHE_TO.search(job_body) is None,
+        f"{source} must not publish the Ambient GHA BuildKit cache "
+        "unconditionally from pull requests",
+        failures,
+    )
+    steps_by_name: dict[str, str] = {}
+    for step in job_steps(job_body):
+        match = re.search(r"(?m)^      - name: (.+)$", step)
+        if match:
+            steps_by_name[match.group(1).strip()] = step
+    build_steps = [
+        step
+        for step in job_steps(job_body)
+        if step_uses(step).startswith(BUILD_PUSH)
+    ]
+    require(
+        len(build_steps) == 3,
+        f"{source} must keep exactly three pinned build-push steps, found "
+        f"{len(build_steps)}",
+        failures,
+    )
+    for name, target in AMBIENT_IMAGE_BUILDS:
+        step = steps_by_name.get(name, "")
+        require(
+            bool(step),
+            f"{source} must keep the {name!r} image build",
+            failures,
+        )
+        if not step:
+            continue
+        require(
+            not step_if(step),
+            f"{source} must keep {name!r} unconditional; a missing/invalid "
+            "event must not skip the required image build",
+            failures,
+        )
+        require(
+            step_uses(step).startswith(BUILD_PUSH),
+            f"{source} {name!r} must keep the pinned build-push-action",
+            failures,
+        )
+        with_block = step_with(step)
+        require(
+            with_scalar(with_block, "target") == target,
+            f"{source} {name!r} must build target {target}",
+            failures,
+        )
+        require(
+            with_scalar(with_block, "load") == "true",
+            f"{source} {name!r} must load the image for contract checks",
+            failures,
+        )
+        require(
+            with_scalar(with_block, "cache-from") == AMBIENT_GHA_CACHE_FROM,
+            f"{source} {name!r} must restore the Ambient GHA BuildKit cache",
+            failures,
+        )
+        require(
+            with_scalar(with_block, "cache-to") == AMBIENT_GHA_CACHE_TO,
+            f"{source} {name!r} must publish GHA cache only from trusted "
+            "refs/heads/main, never from pull_request or merge_group, and "
+            "never from a fork",
+            failures,
+        )
+        require(
+            FORK_NOT_TRUE in with_scalar(with_block, "cache-to"),
+            f"{source} {name!r} cache-to must keep the fork publication guard",
+            failures,
+        )
+    for name in AMBIENT_IMAGE_CONTRACTS:
+        require(
+            name in steps_by_name,
+            f"{source} must keep the {name!r} contract check",
+            failures,
+        )
+        if name in steps_by_name:
+            require(
+                not step_if(steps_by_name[name]),
+                f"{source} must keep {name!r} unconditional",
+                failures,
+            )
 
 
 def check_nul_delimited_plan(plan_job: str, source: str, failures: list[str]) -> None:
@@ -2489,7 +2676,7 @@ def check_shared_actions(failures: list[str]) -> None:
         "setup-rust-ci must keep the pinned rust-cache action",
         failures,
     )
-    check_rust_cache_fork_save_if(
+    check_rust_cache_trusted_main_save_if(
         rust_ci,
         "setup-rust-ci",
         failures,
@@ -2619,6 +2806,37 @@ def check_docs_and_coverage(failures: list[str]) -> None:
         and ("nodewaypoint" in ci_cd.lower() or "node-waypoint" in ci_cd.lower()),
         "docs/ci_cd.md must document NodeWaypoint prior-scope scheduling vs "
         "the production-image trigger superset",
+        failures,
+    )
+    require(
+        "10 GB" in ci_cd
+        and "LRU" in ci_cd
+        and "ambient-host-udp-images" in ci_cd,
+        "docs/ci_cd.md must document the Ambient GHA cache-budget policy, "
+        "10 GB quota, and LRU eviction",
+        failures,
+    )
+    require(
+        "#3918" in ci_cd and "Fuzz" in ci_cd,
+        "docs/ci_cd.md must identify PR #3918 as the separate Fuzz-lane "
+        "cache correction",
+        failures,
+    )
+    require(
+        "pull_request" in ci_cd
+        and "merge_group" in ci_cd
+        and "workflow_dispatch" in ci_cd
+        and "restore" in ci_cd.lower(),
+        "docs/ci_cd.md must document Ambient PR/merge-group restore-only "
+        "versus trusted default-branch publication",
+        failures,
+    )
+    require(
+        "setup-rust-ci" in ci_cd
+        and "save-if" in ci_cd
+        and "refs/heads/main" in ci_cd,
+        "docs/ci_cd.md must document the setup-rust-ci trusted-main "
+        "rust-cache save policy",
         failures,
     )
     require(
@@ -2949,6 +3167,81 @@ def self_test() -> int:
     require(
         any("save-if so fork PRs restore only" in item for item in inverted_failures),
         "self-test: inverted rust-cache save-if must fail",
+        failures,
+    )
+
+    trusted_main_save_if_line = (
+        "          save-if: ${{ github.event_name != 'pull_request' && "
+        "github.event_name != 'merge_group' && "
+        "github.ref == 'refs/heads/main' && "
+        "github.event.pull_request.head.repo.fork != true }}\n"
+    )
+    good_trusted_main = rust_step + trusted_main_save_if_line
+    good_trusted_main_failures: list[str] = []
+    check_rust_cache_trusted_main_save_if(
+        good_trusted_main,
+        "self-test-good-trusted-main-save-if",
+        good_trusted_main_failures,
+        expected_count=1,
+    )
+    require(
+        not good_trusted_main_failures,
+        "self-test: trusted-main rust-cache save-if should pass: "
+        + "; ".join(good_trusted_main_failures),
+        failures,
+    )
+
+    pr_publishing_failures: list[str] = []
+    check_rust_cache_trusted_main_save_if(
+        good_rust,
+        "self-test-pr-publishing-save-if",
+        pr_publishing_failures,
+        expected_count=1,
+    )
+    require(
+        any(
+            "gate save-if to trusted refs/heads/main" in item
+            for item in pr_publishing_failures
+        ),
+        "self-test: restoring the fork-only save-if on a trusted-main site "
+        "must fail",
+        failures,
+    )
+
+    trusted_main_missing_failures: list[str] = []
+    check_rust_cache_trusted_main_save_if(
+        rust_step,
+        "self-test-trusted-main-missing-save-if",
+        trusted_main_missing_failures,
+        expected_count=1,
+    )
+    require(
+        any(
+            "gate save-if to trusted refs/heads/main" in item
+            for item in trusted_main_missing_failures
+        ),
+        "self-test: removing save-if from a trusted-main site must fail",
+        failures,
+    )
+
+    ref_weakened_line = (
+        "          save-if: ${{ github.ref == 'refs/heads/main' && "
+        "github.event.pull_request.head.repo.fork != true }}\n"
+    )
+    ref_weakened_failures: list[str] = []
+    check_rust_cache_trusted_main_save_if(
+        rust_step + ref_weakened_line,
+        "self-test-save-if-without-event-guards",
+        ref_weakened_failures,
+        expected_count=1,
+    )
+    require(
+        any(
+            "gate save-if to trusted refs/heads/main" in item
+            for item in ref_weakened_failures
+        ),
+        "self-test: save-if without the pull_request/merge_group exclusions "
+        "must fail",
         failures,
     )
 
@@ -4093,6 +4386,88 @@ def self_test() -> int:
         failures,
     )
 
+    def _ambient_image_job(cache_to: str, extra_if: str = "") -> str:
+        if_line = f"        if: {extra_if}\n" if extra_if else ""
+        chunks: list[str] = ["    steps:\n"]
+        for name, target in AMBIENT_IMAGE_BUILDS:
+            chunks.append(
+                f"      - name: {name}\n"
+                f"{if_line}"
+                f"        uses: {BUILD_PUSH} # v7\n"
+                "        with:\n"
+                "          context: .\n"
+                "          file: Dockerfile\n"
+                f"          target: {target}\n"
+                "          load: true\n"
+                f"          cache-from: {AMBIENT_GHA_CACHE_FROM}\n"
+                f"          cache-to: {cache_to}\n"
+                "          provenance: false\n"
+            )
+        for name in AMBIENT_IMAGE_CONTRACTS:
+            chunks.append(f"      - name: {name}\n        run: echo ok\n")
+        return "".join(chunks)
+
+    good_ambient_failures: list[str] = []
+    check_ambient_image_cache_budget(
+        _ambient_image_job(AMBIENT_GHA_CACHE_TO),
+        "self-test-good-ambient-cache",
+        good_ambient_failures,
+    )
+    require(
+        not good_ambient_failures,
+        "self-test: trusted-main Ambient cache-to should pass: "
+        + "; ".join(good_ambient_failures),
+        failures,
+    )
+
+    unconditional_ambient_failures: list[str] = []
+    check_ambient_image_cache_budget(
+        _ambient_image_job(AMBIENT_GHA_CACHE_TO_EXPORT),
+        "self-test-unconditional-ambient-cache-to",
+        unconditional_ambient_failures,
+    )
+    require(
+        any(
+            "unconditionally from pull requests" in item
+            for item in unconditional_ambient_failures
+        ),
+        "self-test: restoring unconditional Ambient cache-to must fail",
+        failures,
+    )
+
+    skipped_ambient_failures: list[str] = []
+    check_ambient_image_cache_budget(
+        _ambient_image_job(
+            AMBIENT_GHA_CACHE_TO, extra_if="github.event_name == 'workflow_dispatch'"
+        ),
+        "self-test-skipped-ambient-image-build",
+        skipped_ambient_failures,
+    )
+    require(
+        any(
+            "must not skip the required image build" in item
+            for item in skipped_ambient_failures
+        ),
+        "self-test: event-gated Ambient image builds must fail",
+        failures,
+    )
+
+    fork_publish_failures: list[str] = []
+    inverted_fork = AMBIENT_GHA_CACHE_TO.replace(FORK_NOT_TRUE, FORK_IS_TRUE)
+    check_ambient_image_cache_budget(
+        _ambient_image_job(inverted_fork),
+        "self-test-ambient-fork-publish",
+        fork_publish_failures,
+    )
+    require(
+        any(
+            "never from a fork" in item or "fork publication guard" in item
+            for item in fork_publish_failures
+        ),
+        "self-test: inverted Ambient fork cache-to guard must fail",
+        failures,
+    )
+
     for failure in failures:
         print(f"::error::{failure}", file=sys.stderr)
     return 1 if failures else 0
@@ -4116,10 +4491,17 @@ def main(argv: list[str] | None = None) -> int:
 
     fips = FIPS_WORKFLOW.read_text(encoding="utf-8")
     node = NODE_WORKFLOW.read_text(encoding="utf-8")
+    ambient = AMBIENT_WORKFLOW.read_text(encoding="utf-8")
     check_common_trust(fips, "fips-build.yml", failures)
     check_common_trust(node, "node-waypoint-ebpf-live.yml", failures)
+    check_common_trust(ambient, "ambient-host-udp-live.yml", failures)
     check_fips(fips, failures)
     check_production_smoke(node, failures)
+    check_ambient_image_cache_budget(
+        extract_job(ambient, "ambient-host-udp-image"),
+        "ambient-host-udp-image",
+        failures,
+    )
     check_shared_actions(failures)
     check_docs_and_coverage(failures)
     check_dockerfile(failures)
@@ -4128,8 +4510,9 @@ def main(argv: list[str] | None = None) -> int:
     if failures:
         return 1
     print(
-        "CI runtime cache contracts hold for production-image and FIPS gates "
-        "(permissions, pins, planner, live assertions, telemetry)."
+        "CI runtime cache contracts hold for production-image, FIPS, and "
+        "Ambient image-cache gates (permissions, pins, planner, live "
+        "assertions, telemetry, restore-only PR publication)."
     )
     return 0
 

@@ -18,6 +18,7 @@ on:
       - "Cargo.lock"
       - "Dockerfile"
       - "Dockerfile.iproute2-layer"
+      - "Dockerfile.ebpf-tools-layer"
       - "Dockerfile.release"
       - ".github/scripts/stage_iproute2_runtime.sh"
       - ".github/scripts/ci_runtime_plan.py"
@@ -31,6 +32,12 @@ on:
       - "custom_plugins/**"
       - "ebpf/**"
       - "charts/ferrum-mesh/**"
+      - "tests/integration/mesh_node_waypoint_udp_scope_tests.rs"
+      - "tests/unit/gateway_core/node_waypoint_dtls_socket_options_tests.rs"
+      - "tests/unit/gateway_core/node_waypoint_udp_identity_tests.rs"
+      - "tests/unit/gateway_core/node_waypoint_udp_reply_source_tests.rs"
+      - "tests/unit/gateway_core/node_waypoint_udp_steering_tests.rs"
+      - "tests/unit/gateway_core/socket_opts_tests.rs"
       - "tests/k8s/lib/**"
       - "tests/k8s/node_waypoint_ebpf_live/**"
       - "docs/mesh.md"
@@ -716,6 +723,29 @@ jobs:
             --tag "$FINAL_IMAGE" \
             .
 
+      - name: Package tools-capable NodeWaypoint UDP steering image
+        env:
+          BASE_IMAGE: ${{ env.FERRUM_IMAGE_REPOSITORY }}:${{ env.FERRUM_IMAGE_TAG }}-ebpf-base
+          FINAL_IMAGE: ${{ env.FERRUM_IMAGE_REPOSITORY }}:${{ env.FERRUM_IMAGE_TAG }}-ebpf-tools
+        run: |
+          set -euo pipefail
+          docker build \
+            --build-arg BASE_IMAGE="$BASE_IMAGE" \
+            --file Dockerfile.ebpf-tools-layer \
+            --tag "$FINAL_IMAGE" \
+            .
+          docker run --rm --entrypoint /bin/sh "$FINAL_IMAGE" -c '
+            set -eu
+            for tool in ip iptables ip6tables iptables-save ip6tables-save; do
+              command -v "$tool" >/dev/null 2>&1 || {
+                echo "missing required steering tool: $tool" >&2
+                exit 1
+              }
+            done
+            test -s /app/ferrum-edge
+            test -s /app/bpf/ferrum-ebpf
+          '
+
       - name: Install Kubernetes tools
         uses: ./.github/actions/setup-kubernetes-tools
 
@@ -750,6 +780,7 @@ jobs:
           set -euo pipefail
           kind load docker-image "${FERRUM_IMAGE_REPOSITORY}:${FERRUM_IMAGE_TAG}" --name "$KIND_CLUSTER"
           kind load docker-image "${FERRUM_IMAGE_REPOSITORY}:${FERRUM_IMAGE_TAG}-ebpf" --name "$KIND_CLUSTER"
+          kind load docker-image "${FERRUM_IMAGE_REPOSITORY}:${FERRUM_IMAGE_TAG}-ebpf-tools" --name "$KIND_CLUSTER"
 
       - name: Install Istio policy CRDs
         run: |

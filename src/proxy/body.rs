@@ -1924,7 +1924,8 @@ where
 /// * The fixed-cardinality counter is recorded through the request's shared
 ///   latch, so an upload and a response body racing the same plan on a
 ///   bidirectional stream still count exactly one termination.
-struct UploadAuthDeadline {
+#[doc(hidden)]
+pub struct UploadAuthDeadline {
     sleep: Pin<Box<tokio::time::Sleep>>,
     termination: crate::proxy::auth_lifetime::StreamAuthTermination,
     family: crate::proxy::auth_lifetime::StreamAuthProtocolFamily,
@@ -1933,7 +1934,7 @@ struct UploadAuthDeadline {
 }
 
 impl UploadAuthDeadline {
-    fn new(
+    pub(crate) fn new(
         deadline: crate::proxy::auth_lifetime::StreamAuthDeadline,
         family: crate::proxy::auth_lifetime::StreamAuthProtocolFamily,
         latch: crate::proxy::auth_lifetime::StreamAuthTerminationLatch,
@@ -1950,7 +1951,7 @@ impl UploadAuthDeadline {
     /// Poll the absolute bound. `true` once the authorization lifetime has
     /// elapsed; latched, so every later poll of an already-terminated upload
     /// keeps reporting expiry without registering a second termination.
-    fn expired(&mut self, cx: &mut Context<'_>) -> bool {
+    pub(crate) fn expired(&mut self, cx: &mut Context<'_>) -> bool {
         if self.fired {
             return true;
         }
@@ -1964,7 +1965,7 @@ impl UploadAuthDeadline {
 
     /// Fixed, redacted upload-termination message. A compiled-in literal: no
     /// expiry instant, claim, subject, certificate field, or provider detail.
-    const fn message(&self) -> &'static str {
+    pub(crate) const fn message(&self) -> &'static str {
         "request upload terminated: authenticated stream authorization lifetime elapsed"
     }
 }
