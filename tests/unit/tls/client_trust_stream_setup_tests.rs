@@ -383,7 +383,7 @@ async fn a_withdrawal_outranks_a_credential_that_also_elapsed_on_the_prefix_forw
         tcp_forward_prefix_within_setup_bounds_for_test(plan, Some(session), writer, PREFIX).await;
 
     assert_eq!(
-        outcome.err().expect("a retired transport forwards nothing"),
+        outcome.expect_err("a retired transport forwards nothing"),
         StreamSetupInterruptForTest::TrustWithdrawn
     );
     let mut seen = [0u8; 1];
@@ -410,9 +410,7 @@ async fn an_elapsed_credential_alone_still_ends_the_prefix_forward_as_an_expiry(
         tcp_forward_prefix_within_setup_bounds_for_test(plan, Some(session), writer, PREFIX).await;
 
     assert_eq!(
-        outcome
-            .err()
-            .expect("an elapsed credential forwards nothing"),
+        outcome.expect_err("an elapsed credential forwards nothing"),
         StreamSetupInterruptForTest::AuthorizationExpired(
             StreamAuthTermination::AuthenticatedStreamMaxLifetime
         )
