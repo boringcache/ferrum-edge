@@ -981,8 +981,8 @@ pub async fn start_http3_listener_with_signal(
                     startup_client_trust.material.clone(),
                     verifier,
                     || {
-                        endpoint.set_server_config(Some(server_config.clone()));
                         adopted_for_expose.store(Arc::new(Some(Arc::new(server_config.clone()))));
+                        endpoint.set_server_config(Some(server_config.clone()));
                     },
                 );
             }
@@ -1162,6 +1162,11 @@ pub async fn start_http3_listener_with_signal(
                     },
                 };
                 let Some((new_tls, client_trust)) = adopted else {
+                    // Clear the config consulted by already-queued Incoming
+                    // handles before disabling the endpoint default. Otherwise
+                    // a task spawned just before this withdrawal could still
+                    // call `accept_with` on the previously adopted config.
+                    adopted_quic.store(Arc::new(None));
                     endpoint.set_server_config(None);
                     info!(
                         revision,
@@ -1192,10 +1197,10 @@ pub async fn start_http3_listener_with_signal(
                                     client_trust.material.clone(),
                                     verifier,
                                     || {
-                                        endpoint.set_server_config(Some(server_config.clone()));
                                         adopted_quic.store(Arc::new(Some(Arc::new(
                                             server_config.clone(),
                                         ))));
+                                        endpoint.set_server_config(Some(server_config.clone()));
                                     },
                                 );
                             info!(
@@ -1212,8 +1217,9 @@ pub async fn start_http3_listener_with_signal(
                                 );
                             }
                         } else {
-                            endpoint.set_server_config(Some(server_config.clone()));
-                            adopted_quic.store(Arc::new(Some(Arc::new(server_config))));
+                            adopted_quic
+                                .store(Arc::new(Some(Arc::new(server_config.clone()))));
+                            endpoint.set_server_config(Some(server_config));
                             info!(
                                 revision,
                                 "HTTP/3 listener server config swapped after frontend TLS reload"
@@ -1241,6 +1247,7 @@ pub async fn start_http3_listener_with_signal(
                 // connections continue to serve in-flight streams. Without
                 // this, an immediate `endpoint.close()` would abort live
                 // requests with a CONNECTION_CLOSE frame mid-stream.
+                adopted_quic.store(Arc::new(None));
                 endpoint.set_server_config(None);
                 break;
             }
@@ -1393,10 +1400,16 @@ fn close_h3_connection_for_trust_withdrawal(connection: &quinn::Connection, peer
 fn accept_h3_incoming(
     incoming: quinn::Incoming,
     adopted_quic: &arc_swap::ArcSwap<Option<Arc<quinn::ServerConfig>>>,
-) -> Result<quinn::Connecting, quinn::ConnectionError> {
+) -> Result<Option<quinn::Connecting>, quinn::ConnectionError> {
     match adopted_quic.load_full().as_ref().clone() {
-        Some(cfg) => incoming.accept_with(cfg),
-        None => incoming.accept(),
+        Some(cfg) => incoming.accept_with(cfg).map(Some),
+        None => {
+            // The endpoint was disabled after this Initial was queued. Never
+            // fall back to the config captured by `Incoming`: it is exactly the
+            // withdrawn snapshot the adopted slot exists to supersede.
+            incoming.refuse();
+            Ok(None)
+        }
     }
 }
 
@@ -1452,7 +1465,12 @@ async fn handle_h3_connection(
     // (`accept_with_optional_timeout`) and DTLS (`DtlsServerLimits.handshake_timeout`)
     // frontends, all gated by `FERRUM_FRONTEND_TLS_HANDSHAKE_TIMEOUT_SECONDS`.
     let connection = if early_data_enabled {
-        let connecting = accept_h3_incoming(connecting, adopted_quic.as_ref())?.into_0rtt();
+        let Some(connecting) = accept_h3_incoming(connecting, adopted_quic.as_ref())? else {
+            return Err(anyhow::anyhow!(
+                "HTTP/3 listener was disabled before the queued handshake was admitted"
+            ));
+        };
+        let connecting = connecting.into_0rtt();
         match connecting {
             Ok((conn, zero_rtt_accepted)) => {
                 let remote =
@@ -1523,7 +1541,11 @@ async fn handle_h3_connection(
         // explicit `.accept()?` here both surfaces address-validation errors
         // synchronously and gives us a typed `Connecting` future that
         // `tokio::time::timeout` can wrap directly.
-        let connecting = accept_h3_incoming(connecting, adopted_quic.as_ref())?;
+        let Some(connecting) = accept_h3_incoming(connecting, adopted_quic.as_ref())? else {
+            return Err(anyhow::anyhow!(
+                "HTTP/3 listener was disabled before the queued handshake was admitted"
+            ));
+        };
         match await_with_optional_timeout(connecting, handshake_timeout).await {
             Ok(result) => result?,
             Err(_elapsed) => {

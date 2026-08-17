@@ -897,8 +897,8 @@ fn rustls_reload_surfaces_install_live_verifier_before_exposing_config() {
         reload_arm,
         &[
             "publish_accepted_rustls_candidate",
-            "endpoint.set_server_config(Some(server_config.clone()))",
             "adopted_quic.store",
+            "endpoint.set_server_config(Some(server_config.clone()))",
         ],
         "H3 rustls reload must expose the exact candidate inside the rustls transaction",
     );
@@ -921,9 +921,22 @@ fn rustls_reload_surfaces_install_live_verifier_before_exposing_config() {
         startup_h3_src,
         &[
             "publish_accepted_rustls_candidate",
+            "adopted_for_expose.store",
             "endpoint.set_server_config(Some(server_config.clone()))",
         ],
         "H3 startup must expose the serving config inside the rustls transaction",
+    );
+    assert!(
+        h3.contains("adopted_quic.store(Arc::new(None));"),
+        "H3 config withdrawal must clear the config consulted by queued Incoming handles"
+    );
+    let accept_incoming = h3
+        .find("fn accept_h3_incoming")
+        .expect("H3 queued-Incoming admission helper");
+    let accept_incoming_src = &h3[accept_incoming..];
+    assert!(
+        accept_incoming_src.contains("incoming.refuse();"),
+        "a queued H3 Incoming must be refused when no adopted config remains"
     );
 
     let modes = include_str!("../../../src/modes/tls_reload.rs");
