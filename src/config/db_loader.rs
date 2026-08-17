@@ -8458,8 +8458,7 @@ impl DatabaseStore {
         cascade: bool,
         leases: &[crate::config::batch_atomicity::NamespaceAdmissionLeaseHold<'_>],
     ) -> Result<bool, anyhow::Error> {
-        require_namespace_registry_admission_leases(&[name], leases)
-            .map_err(anyhow::Error::new)?;
+        require_namespace_registry_admission_leases(&[name], leases).map_err(anyhow::Error::new)?;
         let start = Instant::now();
         let fault = namespace_registry_fault(name);
         if name == self.effective_default_namespace {

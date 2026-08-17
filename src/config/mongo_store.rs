@@ -5587,8 +5587,7 @@ mod inner {
                 .await?;
             let consumer_plain_ids: Vec<String> =
                 consumers.iter().map(|(_, suffix)| suffix.clone()).collect();
-            let consumer_doc_ids: Vec<String> =
-                consumers.into_iter().map(|(id, _)| id).collect();
+            let consumer_doc_ids: Vec<String> = consumers.into_iter().map(|(id, _)| id).collect();
             let identity_doc_ids: Vec<String> =
                 identity_index.into_iter().map(|(id, _)| id).collect();
             self.delete_validated_namespace_ids_in_session(

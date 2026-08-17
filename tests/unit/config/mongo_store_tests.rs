@@ -1713,7 +1713,10 @@ fn mongo_namespace_registry_mutations_require_canonical_lease_set_before_session
     for (entry, names_needle) in [
         ("create_namespace(", "&[record.name.as_str()]"),
         ("update_namespace(", "&[current_name, new_name]"),
-        ("delete_namespace(", "owned_namespace_registry_leases_for_names(&[name], leases)"),
+        (
+            "delete_namespace(",
+            "owned_namespace_registry_leases_for_names(&[name], leases)",
+        ),
     ] {
         let body = mongo_method(entry);
         assert!(

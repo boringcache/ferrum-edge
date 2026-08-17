@@ -3488,8 +3488,9 @@ fn sql_namespace_registry_mutations_require_canonical_lease_set_before_begin() {
         );
     }
 
-    let verify = source
-        [source.find("async fn verify_namespace_registry_leases_tx(").expect("verify helper")..]
+    let verify = source[source
+        .find("async fn verify_namespace_registry_leases_tx(")
+        .expect("verify helper")..]
         .split("\n    pub async fn create_namespace(")
         .next()
         .expect("verify body");

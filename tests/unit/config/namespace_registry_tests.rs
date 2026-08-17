@@ -572,11 +572,7 @@ fn require_namespace_registry_admission_keys_rejects_incomplete_and_substituted_
     assert_lease_set_lost(
         require_namespace_registry_admission_keys(
             &["secret-ns"],
-            &[
-                NAMESPACE_REGISTRY_ADMISSION_KEY,
-                "secret-ns",
-                "secret-ns",
-            ],
+            &[NAMESPACE_REGISTRY_ADMISSION_KEY, "secret-ns", "secret-ns"],
         ),
         leaked,
     );
