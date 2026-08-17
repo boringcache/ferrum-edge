@@ -31,6 +31,7 @@ from verify_release_image_attestations import (
 from verify_release_image_attestations import (
     validate_release_workflow,
 )
+from verify_ci_runtime_cache import main as ci_runtime_cache_main
 
 
 REQUIRED_JOBS = {
@@ -1189,6 +1190,10 @@ def main() -> int:
         planner_errors.append(
             "mesh performance baselines workflow contract failed"
         )
+    if ci_runtime_cache_main(["--self-test"]) != 0:
+        planner_errors.append("CI runtime cache contract self-test failed")
+    if ci_runtime_cache_main([]) != 0:
+        planner_errors.append("CI runtime cache contract failed")
     # The scheduling decision above intentionally executes the trusted-base
     # planner on pull requests. Exercise the proposed planner here as data-plane
     # validation only: this verifier publishes no planner outputs and cannot
