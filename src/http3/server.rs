@@ -15334,7 +15334,7 @@ async fn finalize_h3_upload_deadline_rejection(
     // lose immediately and abort before response HEADERS become observable.
     // Bound the terminal write with the shared post-deadline grace instead so a
     // flow-control-blocked client cannot retain the task indefinitely.
-    send_h3_plugin_reject_flavor_aware(
+    send_h3_plugin_reject_flavor_aware_with_recv_halt(
         stream,
         plugins,
         ctx,
@@ -15343,6 +15343,7 @@ async fn finalize_h3_upload_deadline_rejection(
         http_status,
         reject.body.clone(),
         &reject.headers,
+        false,
     )
     .await
 }
