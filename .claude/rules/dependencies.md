@@ -83,12 +83,14 @@ Full policy: `docs/dependency-policy.md`. These are the load-bearing rules.
   two-family a PR may leave the workflow byte-identical or adopt the whole
   three-family shape, and once the base is three-family a revert is refused. See
   `docs/ci_cd.md` → "Admitted release image-family adoption".
-- The temporary `fips-build.yml` whole-file generation admission for issue
-  #3888 / PR #3889 is **retired** now that #3889 is on `main`. Ordinary
-  `fips-build.yml` edits are compared by the normal fail-closed Cross surface
-  scan with no special case. The generic SHA-256 generation digest helper
-  remains for CI-job and local-action transitions. See `docs/ci_cd.md` →
-  "Retired `fips-build.yml` generation transition".
+- The temporary `fips-build.yml` whole-file generation admission (first used
+  for #3889, retired by #3943) is **re-armed for exactly one transition**: PR
+  #3950's artifact-based same-run FIPS handoff, pair
+  `527659b0…c7914b` → `ce9d409c…a68384` (recompute if #3950's workflow bytes
+  change). One-way, retire again once #3950 lands. Every other
+  `fips-build.yml` edit is compared by the normal fail-closed Cross surface
+  scan. See `docs/ci_cd.md` → "Admitted `fips-build.yml` generation
+  transition".
 - `Helm Chart` proves `.github/actions/setup-kubernetes-tools` against the
   trusted revision before `uses:`. Issue #3904 admits exactly one extracted
   checker generation: current `action.yml`

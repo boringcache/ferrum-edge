@@ -1967,15 +1967,21 @@ modification of the verifier it protects, and the landing is administrative afte
 root review), then an ordinary pull request that adopts the release workflow
 under the now-trusted policy and runs the full hosted matrix.
 
-##### Retired `fips-build.yml` generation transition (issue #3888 / PR #3889)
+##### Admitted `fips-build.yml` generation transition (issue #3888 lineage / PR #3950, temporary)
 
-PR #3889 landed on `main` as `7e9e69493`. The temporary whole-file SHA-256
-admission that let that rewrite pass the Cross surface scan is **retired and
-non-operational**. Ordinary `.github/workflows/fips-build.yml` edits are
-compared by the normal fail-closed Cross surface scan with no special case, no
-`admitted_generation_transition` bypass, and no FIPS-only classifier. The
-generic SHA-256 generation digest helper remains because CI-job and
-local-action finite transitions still use it.
+The temporary whole-file SHA-256 admission first used for PR #3889 (and retired
+by #3943 once #3889 landed) is **re-armed for exactly one transition**: PR
+#3950 moves the FIPS same-run producer→consumer handoff off the eviction-prone
+repository cache onto the immutable run artifact, which necessarily edits four
+digest-frozen `fips-build.yml` job bodies. The pair is exact and one-way:
+trusted-base `527659b0ad96a0d97cd4a170543dd81acbf6784155b3c82918b1f70a20c7914b`
+(PR #3889's landed file) →
+`ce9d409c96d30bea03f828b959eb4e0637bd38f9f5d1c0412933e1a68da68384` (PR #3950
+head `f1dc6f35b`; recompute and re-pin if review changes the workflow bytes).
+The digest is over universal-newline-decoded text. RETIREMENT IS MANDATORY
+once #3950 lands, exactly as #3943 retired the #3889 pair. Any other
+`fips-build.yml` edit is still compared by the normal fail-closed Cross
+surface scan.
 
 ##### Admitted CI job SHA-256 generation transitions (temporary)
 
@@ -1987,8 +1993,6 @@ relaxing the scan, the trusted policy admits exact retired→adopted pairs
 
 | Job | Retired SHA-256 (trusted base) | Adopted SHA-256 | Destination |
 |---|---|---|---|
-| `ci-plan` | `b3d95b6f0324f9a9ef842516907d7f5ff58d6d4a13f4a2d8afa5d659d6ab8336` | `c818a55308d27fe47692af3f22c8fdbd495755cf471760114ec2e6e4cb849c08` | PR #3913 / issue #3903 |
-| `test` | `e70ecf0924d88b6d86591608b471b70faad270ece6067c65b94eb5509ae1a03f` | `6bc548059b5b5efffbeb403ccfafebff8124c99af49a00c14aaa9af7e948e59d` | PR #3913 / issue #3903 |
 | `performance-regression` | `74673023dee4c0970a8b8d3c9a99089be2f28eddf57ddb7337febdf22bd5a7e4` | `e7d9a4c0ea26a14efd92844998a42219ca2fb1379072776a313de6dd9b720986` | PR #3911 / issue #3906 |
 | `ebpf-live` | `b7596b48641c850f797c84710dd5646013414d6ba01c30f4d4b2805737c8c26c` | `9aa3332bff5c4538f797f31133be0ef7dfc9767a72e7212b39be33ed58dcca87` | PR #3915 / issue #3900 |
 | `netns-capture-live` | `db543d5c35bfbd4a7b987a52635b359ea6268669257cd313146324f5ca79f598` | `b71296ba5929c78cd786301cc8ed677905cca82cd605be46880021b88c243e32` | PR #3915 / issue #3900 |
