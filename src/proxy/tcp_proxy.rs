@@ -1788,8 +1788,10 @@ pub struct TcpListenerConfig {
     /// Shared frontend TLS slot. The accept loop snapshots this per accept so
     /// a mesh PeerAuthentication live reload that swaps the slot is picked up
     /// on the next inbound TCP+TLS handshake without rebinding the listener.
-    /// In-flight TLS sessions keep the config they handshake with until they
-    /// end (rustls consults the `ServerConfig` only at handshake time).
+    /// In-flight TLS sessions keep the config they handshake with because
+    /// rustls consults the `ServerConfig` only at handshake time. An accepted
+    /// client-trust narrowing can separately retire authenticated sessions
+    /// through the live trust fence.
     pub frontend_tls_slot: Arc<arc_swap::ArcSwap<Option<Arc<rustls::ServerConfig>>>>,
     pub shutdown: watch::Receiver<bool>,
     /// Optional gateway-wide shutdown receiver (SIGTERM/SIGINT). When `Some`,

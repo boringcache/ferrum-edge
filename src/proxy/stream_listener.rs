@@ -2010,9 +2010,11 @@ impl StreamListenerManager {
     ///
     /// The generation is stored first so listeners created or restarted after
     /// this call receive exactly the same material. Existing sessions keep
-    /// their handshake snapshot; new handshakes use the accepted generation.
-    /// This method never rebuilds from sources — callers must validate the
-    /// complete candidate before invoking it.
+    /// their handshake snapshot, but the client-trust publication below
+    /// retires authenticated sessions when the accepted generation narrows
+    /// trust; new handshakes use the accepted generation. This method never
+    /// rebuilds from sources — callers must validate the complete candidate
+    /// before invoking it.
     ///
     /// `client_trust_reload_enabled=false` publishes and swaps the immutable
     /// DTLS crypto generation without arming per-session client-trust tracking.

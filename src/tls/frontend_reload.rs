@@ -12,15 +12,17 @@
 //! TLS config from this path.
 //!
 //! In-flight TLS sessions keep their original `ServerConfig` clone (rustls
-//! consults the config only during handshake; an `ArcSwap` swap does not tear
-//! down live sessions). Only newly accepted connections handshake against the
-//! new config.
+//! consults the config only during handshake). Cert/key-only and additive trust
+//! rotations leave those sessions running; an accepted client-trust narrowing
+//! separately retires client-certificate-authenticated sessions through
+//! [`crate::tls::client_trust`]. Only newly accepted connections handshake
+//! against the new config.
 //!
 //! The H3 / QUIC listener observes swaps through the same slot via a
 //! [`tokio::sync::watch`] revision counter; the H3 task rebuilds its
 //! [`quinn::ServerConfig`] and applies it with
 //! [`quinn::Endpoint::set_server_config`]. Existing QUIC connections keep
-//! serving.
+//! serving unless an accepted client-trust narrowing retires their scope.
 //!
 //! Frontend DTLS (UDP) material is live-reloaded under the same opt-in flag by
 //! [`crate::proxy::ProxyState`]'s DTLS source watcher: it validates one

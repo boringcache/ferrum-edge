@@ -947,9 +947,11 @@ pub async fn serve_admin_on_listener(
 /// served with live reload enabled — both paths share this accept loop so
 /// cert rotation is not limited to process-bound listeners.
 ///
-/// In-flight admin connections keep their original `ServerConfig` (rustls
-/// consults the config only during the handshake; swapping it does not tear
-/// down live sessions). When the slot holds `None` (e.g., live reload was
+/// In-flight admin connections keep their original `ServerConfig` because
+/// rustls consults it only during the handshake. Cert/key-only and additive
+/// trust rotations leave those sessions running; an accepted client-CA or CRL
+/// narrowing retires client-certificate-authenticated sessions through the
+/// separate trust fence below. When the slot holds `None` (e.g., live reload was
 /// turned on with no cert/key configured), the connection is dropped with
 /// a debug log — the admin listener cannot serve TLS without a config and
 /// must not silently downgrade to plaintext.

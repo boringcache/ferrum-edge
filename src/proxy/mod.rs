@@ -19280,8 +19280,9 @@ pub(crate) async fn start_mesh_udp_capture_listener_with_signal(
 /// watch task swaps the underlying `ArcSwap` after a validated cert/key
 /// reload; subsequent accepts pick up the new config without restarting the
 /// listener. Existing in-flight TLS sessions keep their original
-/// `ServerConfig`. Mirrors [`start_proxy_listener_with_tls_and_signal`] in
-/// every other respect.
+/// `ServerConfig`, while an accepted client-trust narrowing can separately
+/// retire authenticated sessions through the live trust fence. Mirrors
+/// [`start_proxy_listener_with_tls_and_signal`] in every other respect.
 pub async fn start_proxy_listener_with_dynamic_tls_and_signal(
     addr: SocketAddr,
     state: ProxyState,

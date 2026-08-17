@@ -12,9 +12,12 @@
 //! frontend client-certificate authentication, because materializing the
 //! connection before the peer's `Certificate` flight would leave
 //! `peer_identity()` unknowable (see [`crate::http3::peer_identity`]).
-//! Session resumption is always enabled (saves 1 RTT on reconnects). Ordinary
-//! listeners use stateless rotating tickets; non-mTLS listeners with early data
-//! enabled use the bounded stateful cache rustls requires for server 0-RTT.
+//! Session resumption is enabled by default (saves 1 RTT on reconnects).
+//! Ordinary listeners use stateless rotating tickets; non-mTLS listeners with
+//! early data enabled use the bounded stateful cache rustls requires for server
+//! 0-RTT. An mTLS listener whose client-trust scope can advance under frontend
+//! live reload disables tickets and the stateful cache so resumption cannot
+//! outlive an accepted client-CA or CRL withdrawal.
 
 use std::collections::HashMap;
 use std::net::SocketAddr;

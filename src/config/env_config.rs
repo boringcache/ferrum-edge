@@ -1621,11 +1621,12 @@ pub struct EnvConfig {
     /// DER OCSP response bytes, or a source URI resolving to DER bytes, to
     /// staple on frontend proxy TLS handshakes.
     pub frontend_tls_ocsp_response_source: Option<String>,
-    /// Opt in to live reload of frontend TLS cert/key sources for the proxy
-    /// HTTPS / H2 / H3 listeners, the admin HTTPS listener, and (in mesh
-    /// mode) the mesh inbound TLS listener. When `false` (the default)
-    /// cert/key sources are read once at startup and require a restart to
-    /// rotate. When `true`, a background watcher polls the configured sources
+    /// Opt in to live reload of frontend TLS/DTLS cert, key, client-CA, OCSP,
+    /// and CRL sources for the proxy HTTPS / H2 / H3 listeners, the admin
+    /// HTTPS listener, frontend DTLS listeners, and (in mesh mode) the mesh
+    /// inbound TLS listener. When `false` (the default), those sources are read
+    /// once at startup and require a restart to rotate. When `true`, a
+    /// background watcher polls the configured sources
     /// every [`frontend_tls_watch_interval_seconds`] seconds for file-backed
     /// sources or [`secret_refresh_interval_seconds`] seconds for provider-
     /// backed sources, then atomically
@@ -1634,12 +1635,15 @@ pub struct EnvConfig {
     /// validation (parse / expired / not-yet-valid / key mismatch) keeps
     /// the previous config and emits a `warn!` — the gateway never serves a
     /// known-bad config. In-flight TLS sessions keep their original
-    /// `ServerConfig`; only new handshakes pick up the new config.
-    /// Operator-supplied per-proxy backend TLS paths and the DTLS frontend
-    /// stay static under this knob.
+    /// `ServerConfig`, but an accepted client-CA or CRL narrowing retires
+    /// client-certificate-authenticated sessions through the live trust fence;
+    /// only new handshakes pick up the new config. Operator-supplied per-proxy
+    /// backend TLS paths stay outside this knob and follow the backend TLS
+    /// reload policy instead.
     pub frontend_tls_live_reload_enabled: bool,
-    /// Poll interval in seconds for the frontend TLS file-backed source watcher when
-    /// [`frontend_tls_live_reload_enabled`] is `true`. Defaults to `30`.
+    /// Poll interval in seconds for the frontend/admin TLS and DTLS file-backed
+    /// source watcher when [`frontend_tls_live_reload_enabled`] is `true`.
+    /// Defaults to `30`.
     /// Ignored when live reload is disabled. Clamped to a 1-second minimum
     /// so an accidental `0` does not busy-loop the filesystem.
     pub frontend_tls_watch_interval_seconds: u64,

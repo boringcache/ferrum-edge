@@ -1553,10 +1553,12 @@ impl Drop for DtlsConnection {
 /// frontend DTLS live reload (`FERRUM_FRONTEND_TLS_LIVE_RELOAD_ENABLED` /
 /// `FERRUM_DTLS_*` generation publish) and owner-scoped NodeWaypoint mesh
 /// DTLS publish can publish a new `dimpl_config`, `certificate`, and client
-/// verifier without dropping in-flight DTLS sessions. New sessions snapshot
-/// the slot in [`DtlsServer::spawn_session`]; existing sessions retain the
-/// material they were spawned with until they end. Mesh PeerAuthentication
-/// TCP+TLS reload must not write this slot as a process-wide fanout:
+/// verifier without mutating the snapshot held by in-flight DTLS sessions. New
+/// sessions snapshot the slot in [`DtlsServer::spawn_session`]; existing
+/// sessions retain the material they were spawned with. An ordinary frontend
+/// client-trust narrowing can separately retire authenticated sessions through
+/// [`crate::tls::client_trust`]. Mesh PeerAuthentication TCP+TLS reload must not
+/// write this slot as a process-wide fanout:
 /// generated NodeWaypoint listeners are swapped only through the owner-scoped
 /// generation, and ordinary `FERRUM_DTLS_*` listeners keep their dedicated
 /// identity.
@@ -2093,9 +2095,10 @@ impl DtlsServer {
     /// Used by frontend DTLS live reload (`FERRUM_FRONTEND_TLS_LIVE_RELOAD_ENABLED`)
     /// and owner-scoped NodeWaypoint DTLS publish to rotate the inbound DTLS
     /// `ServerConfig` equivalent (dimpl `Config` + certificate + optional
-    /// `ClientCertVerifier`) without re-binding the socket or evicting any
-    /// in-flight session. Active sessions keep the snapshot they handshake
-    /// with until they end (see
+    /// `ClientCertVerifier`) without re-binding the socket or mutating any
+    /// in-flight session's snapshot. Active sessions keep the snapshot they
+    /// handshake with; an ordinary frontend client-trust narrowing can
+    /// separately retire authenticated sessions through the trust fence (see
     /// [`DtlsServerActiveConfig`] doc-comment for the invariant). Mesh
     /// PeerAuthentication TCP+TLS reload must not call this as a process-wide
     /// fanout: ordinary operator listeners keep their dedicated `FERRUM_DTLS_*`
