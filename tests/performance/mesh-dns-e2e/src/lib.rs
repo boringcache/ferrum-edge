@@ -3,6 +3,7 @@
 pub mod dns_wire;
 pub mod metrics;
 pub mod slice;
+pub mod upstream_stub;
 
 pub mod proto {
     tonic::include_proto!("ferrum");

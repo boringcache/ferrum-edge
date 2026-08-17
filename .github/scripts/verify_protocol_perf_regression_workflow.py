@@ -42,6 +42,22 @@ SCENARIOS_PATH = (
 RUNBOOK_PATH = REPO_ROOT / "docs" / "protocol_perf_regression.md"
 CI_CD_PATH = REPO_ROOT / "docs" / "ci_cd.md"
 CI_WORKFLOW_PATH = REPO_ROOT / ".github" / "workflows" / "ci.yml"
+SETUP_RUST_CI_PATH = (
+    REPO_ROOT / ".github" / "actions" / "setup-rust-ci" / "action.yml"
+)
+PERF_CACHE_WORKSPACES = (". -> target", "tests/performance/mesh -> target")
+SETUP_RUST_CI_WORKSPACES_PASSTHROUGH = "workspaces: ${{ inputs.workspaces }}"
+RUST_CACHE_WITH_KEYS = (
+    "shared-key",
+    "workspaces",
+    "cache-directories",
+    # Required by the CI runtime-cache contract (verify_ci_runtime_cache):
+    # cache-on-failure keeps post-job saves on ordinary failures, and save-if
+    # gates publication to trusted refs/heads/main runs. Still a closed set —
+    # any other key remains a trust-broadening extra.
+    "cache-on-failure",
+    "save-if",
+)
 
 EXTERNAL_ACTION = re.compile(
     r"uses:\s*(?P<action>(?!\./)[^@\s]+)@(?P<ref>[^\s#]+)",
@@ -78,6 +94,229 @@ def parse_args() -> argparse.Namespace:
 def require(condition: bool, message: str, failures: list[str]) -> None:
     if not condition:
         failures.append(message)
+
+
+def mapping_block(text: str, key: str, indent: int = 0) -> str:
+    """Return the body of a YAML mapping key at `indent` spaces."""
+
+    prefix = " " * indent
+    match = re.search(
+        rf"(?m)^{re.escape(prefix)}{re.escape(key)}:\n",
+        text,
+    )
+    if match is None:
+        return ""
+    body_lines: list[str] = []
+    for line in text[match.end() :].splitlines(keepends=True):
+        if not line.strip():
+            body_lines.append(line)
+            continue
+        line_indent = len(line) - len(line.lstrip(" "))
+        if line_indent <= indent:
+            break
+        body_lines.append(line)
+    return "".join(body_lines)
+
+
+def named_step_block(text: str, step_name: str, item_indent: int) -> str:
+    """Return one list item whose first line is `- name: {step_name}`."""
+
+    prefix = " " * item_indent
+    marker = f"{prefix}- name: {step_name}\n"
+    start = text.find(marker)
+    if start == -1:
+        return ""
+    body_lines = [marker]
+    for line in text[start + len(marker) :].splitlines(keepends=True):
+        if line.startswith(f"{prefix}- "):
+            break
+        stripped = line.lstrip(" ")
+        if stripped == line and stripped.strip() and not stripped.startswith("#"):
+            break
+        body_lines.append(line)
+    return "".join(body_lines)
+
+
+def uses_step_block(text: str, uses: str, item_indent: int) -> str:
+    """Return one list item whose first line is `- uses: {uses}`."""
+
+    prefix = " " * item_indent
+    marker = f"{prefix}- uses: {uses}\n"
+    start = text.find(marker)
+    if start == -1:
+        return ""
+    body_lines = [marker]
+    for line in text[start + len(marker) :].splitlines(keepends=True):
+        if line.startswith(f"{prefix}- "):
+            break
+        stripped = line.lstrip(" ")
+        if stripped == line and stripped.strip() and not stripped.startswith("#"):
+            break
+        body_lines.append(line)
+    return "".join(body_lines)
+
+
+def mapping_keys(block: str, indent: int) -> list[str]:
+    """Return top-level keys in a YAML mapping at `indent` spaces."""
+
+    prefix = " " * indent
+    keys: list[str] = []
+    for line in block.splitlines():
+        if not line.startswith(prefix):
+            continue
+        if len(line) > indent and line[indent] == " ":
+            continue
+        match = re.match(rf"^{re.escape(prefix)}([A-Za-z0-9_-]+):", line)
+        if match:
+            keys.append(match.group(1))
+    return keys
+
+
+def parse_workspaces_entries(with_block: str, key_indent: int) -> list[str] | None:
+    """Parse rust-cache `workspaces` entries from a workflow `with:` block."""
+
+    prefix = " " * key_indent
+    lines = with_block.splitlines()
+    for index, line in enumerate(lines):
+        if line.startswith(f"{prefix}workspaces:"):
+            rest = line[len(prefix) + len("workspaces:") :].strip()
+            if rest == "|":
+                entries: list[str] = []
+                for inner in lines[index + 1 :]:
+                    if not inner.strip():
+                        continue
+                    inner_indent = len(inner) - len(inner.lstrip(" "))
+                    if inner_indent <= key_indent:
+                        break
+                    entries.append(inner.strip())
+                return entries
+            if rest.startswith("|"):
+                return None
+            value = rest.strip().strip('"').strip("'")
+            if not value:
+                return []
+            return [part.strip() for part in value.splitlines() if part.strip()]
+    return None
+
+
+def validate_setup_rust_ci_workspaces(text: str, failures: list[str]) -> None:
+    """setup-rust-ci must pass `workspaces` through exactly, defaulting to root."""
+
+    inputs = mapping_block(text, "inputs")
+    workspaces_input = mapping_block(inputs, "workspaces", indent=2)
+    require(
+        bool(workspaces_input),
+        "setup-rust-ci must declare an optional workspaces input",
+        failures,
+    )
+    require(
+        "required: false" in workspaces_input,
+        "setup-rust-ci workspaces input must be optional",
+        failures,
+    )
+    require(
+        "required: true" not in workspaces_input,
+        "setup-rust-ci workspaces input must not be required",
+        failures,
+    )
+    require(
+        'default: ""' in workspaces_input,
+        'setup-rust-ci workspaces input must default to "" so omitted callers '
+        "keep rust-cache root-workspace coverage",
+        failures,
+    )
+    require(
+        "passed through exactly" in workspaces_input
+        or "pass-through" in workspaces_input
+        or "passed through" in workspaces_input,
+        "setup-rust-ci workspaces input must document exact rust-cache pass-through",
+        failures,
+    )
+    require(
+        ". -> target" in workspaces_input
+        and ("omitted" in workspaces_input or "empty" in workspaces_input),
+        "setup-rust-ci workspaces input must document omitted/empty `. -> target` "
+        "root-workspace behavior",
+        failures,
+    )
+
+    rust_cache_step = named_step_block(text, "Cache Rust dependencies", item_indent=4)
+    require(
+        bool(rust_cache_step),
+        "setup-rust-ci must contain the Cache Rust dependencies step",
+        failures,
+    )
+    require(
+        "uses: Swatinem/rust-cache@" in rust_cache_step,
+        "setup-rust-ci Cache Rust dependencies must use Swatinem/rust-cache",
+        failures,
+    )
+    require(
+        SETUP_RUST_CI_WORKSPACES_PASSTHROUGH in rust_cache_step,
+        "setup-rust-ci must pass workspaces through exactly to rust-cache",
+        failures,
+    )
+    require(
+        "workspaces: |" not in rust_cache_step,
+        "setup-rust-ci must not wrap the workspaces pass-through in a block scalar",
+        failures,
+    )
+    with_block = mapping_block(rust_cache_step, "with", indent=6)
+    require(
+        mapping_keys(with_block, indent=8) == list(RUST_CACHE_WITH_KEYS),
+        "setup-rust-ci rust-cache with: keys must stay shared-key, workspaces, "
+        "and cache-directories (no trust-broadening extras)",
+        failures,
+    )
+    require(
+        "cache-all-crates:" not in rust_cache_step
+        and "cache-workspace-crates:" not in rust_cache_step,
+        "setup-rust-ci rust-cache must not enable cache-all-crates or "
+        "cache-workspace-crates",
+        failures,
+    )
+
+
+def validate_performance_regression_workspaces(text: str, failures: list[str]) -> None:
+    """Perf job must cache root plus tests/performance/mesh without extra workspaces."""
+
+    performance_job = re.search(
+        r"(?ms)^  performance-regression:\n(?P<body>.*?)(?=^  [A-Za-z0-9_-]+:\n|\Z)",
+        text,
+    )
+    require(
+        performance_job is not None,
+        "ci.yml must contain the performance-regression job",
+        failures,
+    )
+    body = performance_job.group("body") if performance_job else ""
+    setup_step = uses_step_block(
+        body, "./.github/actions/setup-rust-ci", item_indent=6
+    )
+    require(
+        bool(setup_step),
+        "ci.yml performance-regression must use setup-rust-ci",
+        failures,
+    )
+    with_block = mapping_block(setup_step, "with", indent=8)
+    require(
+        'shared-key: "ci-perf"' in with_block,
+        'ci.yml performance-regression setup-rust-ci must keep shared-key "ci-perf"',
+        failures,
+    )
+    entries = parse_workspaces_entries(with_block, key_indent=10)
+    require(
+        entries == list(PERF_CACHE_WORKSPACES),
+        "ci.yml performance-regression rust-cache workspaces must be exactly "
+        "`. -> target` then `tests/performance/mesh -> target`",
+        failures,
+    )
+    require(
+        "cache-all-crates:" not in setup_step
+        and "cache-directories:" not in setup_step,
+        "ci.yml performance-regression must not broaden rust-cache trust inputs",
+        failures,
+    )
 
 
 def validate_workflow_text(text: str, failures: list[str]) -> None:
@@ -395,6 +634,11 @@ def validate_repository_contract(failures: list[str]) -> None:
     require(RUNBOOK_PATH.is_file(), f"missing runbook: {RUNBOOK_PATH}", failures)
     require(CI_CD_PATH.is_file(), f"missing CI/CD docs: {CI_CD_PATH}", failures)
     require(CI_WORKFLOW_PATH.is_file(), f"missing CI workflow: {CI_WORKFLOW_PATH}", failures)
+    require(
+        SETUP_RUST_CI_PATH.is_file(),
+        f"missing setup-rust-ci action: {SETUP_RUST_CI_PATH}",
+        failures,
+    )
 
     if WORKFLOW_PATH.is_file():
         validate_workflow_text(WORKFLOW_PATH.read_text(encoding="utf-8"), failures)
@@ -406,7 +650,14 @@ def validate_repository_contract(failures: list[str]) -> None:
         validate_scenarios_contract(SCENARIOS_PATH.read_text(encoding="utf-8"), failures)
 
     if CI_WORKFLOW_PATH.is_file():
-        validate_pr_ci_contract(CI_WORKFLOW_PATH.read_text(encoding="utf-8"), failures)
+        ci_workflow = CI_WORKFLOW_PATH.read_text(encoding="utf-8")
+        validate_pr_ci_contract(ci_workflow, failures)
+        validate_performance_regression_workspaces(ci_workflow, failures)
+
+    if SETUP_RUST_CI_PATH.is_file():
+        validate_setup_rust_ci_workspaces(
+            SETUP_RUST_CI_PATH.read_text(encoding="utf-8"), failures
+        )
 
     if BUDGETS_PATH.is_file():
         import json
@@ -463,6 +714,15 @@ def validate_repository_contract(failures: list[str]) -> None:
             "docs/ci_cd.md must document protocol-perf static PR CI validation",
             failures,
         )
+        require(
+            "setup-rust-ci" in ci_cd
+            and "workspaces" in ci_cd
+            and ". -> target" in ci_cd
+            and "tests/performance/mesh -> target" in ci_cd,
+            "docs/ci_cd.md must document performance-regression rust-cache "
+            "workspaces covering root and tests/performance/mesh",
+            failures,
+        )
 
     if RUNBOOK_PATH.is_file():
         runbook = RUNBOOK_PATH.read_text(encoding="utf-8")
@@ -493,6 +753,14 @@ def validate_repository_contract(failures: list[str]) -> None:
             "Performance Regression Check" in runbook
             or "protocol-perf contracts" in runbook.lower(),
             "runbook must document PR CI static protocol-perf contract checks",
+            failures,
+        )
+        require(
+            "setup-rust-ci" in runbook
+            and "workspaces" in runbook
+            and "tests/performance/mesh" in runbook
+            and ". -> target" in runbook,
+            "runbook must document PR CI mesh workspace rust-cache coverage",
             failures,
         )
 
@@ -619,6 +887,143 @@ SIGHUP was not delivered
     )
     if not any("static" in item for item in pr_ci_bad_failures):
         failures.append("self-test expected missing protocol-perf static PR CI detection")
+
+    good_setup_rust_ci = """
+name: Setup Rust CI environment
+inputs:
+  shared-key:
+    required: true
+  components:
+    required: false
+    default: ""
+  workspaces:
+    description: >-
+      Optional rust-cache workspaces passed through exactly.
+      When omitted or empty, rust-cache keeps `. -> target`.
+    required: false
+    default: ""
+runs:
+  using: composite
+  steps:
+    - name: Cache Rust dependencies
+      uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+      with:
+        shared-key: ${{ inputs.shared-key }}
+        workspaces: ${{ inputs.workspaces }}
+        cache-directories: ${{ github.workspace }}/.cache/sccache
+        cache-on-failure: "true"
+        save-if: ${{ github.event_name != 'pull_request' && github.event_name != 'merge_group' && github.ref == 'refs/heads/main' && github.event.pull_request.head.repo.fork != true }}
+"""
+    setup_ok: list[str] = []
+    validate_setup_rust_ci_workspaces(good_setup_rust_ci, setup_ok)
+    if setup_ok:
+        failures.append(
+            f"self-test unexpectedly rejected good setup-rust-ci snippet: {setup_ok}"
+        )
+
+    missing_passthrough: list[str] = []
+    validate_setup_rust_ci_workspaces(
+        good_setup_rust_ci.replace(
+            "        workspaces: ${{ inputs.workspaces }}\n",
+            "",
+        ),
+        missing_passthrough,
+    )
+    if not any("pass workspaces through exactly" in item for item in missing_passthrough):
+        failures.append("self-test expected missing rust-cache workspaces pass-through")
+
+    required_workspaces: list[str] = []
+    validate_setup_rust_ci_workspaces(
+        good_setup_rust_ci.replace(
+            '    required: false\n    default: ""\nruns:',
+            '    required: true\n    default: ""\nruns:',
+        ),
+        required_workspaces,
+    )
+    if not any(
+        "must be optional" in item or "must not be required" in item
+        for item in required_workspaces
+    ):
+        failures.append("self-test expected required workspaces input detection")
+
+    nonempty_default: list[str] = []
+    validate_setup_rust_ci_workspaces(
+        good_setup_rust_ci.replace(
+            '    required: false\n    default: ""\nruns:',
+            '    required: false\n    default: "fuzz -> target"\nruns:',
+        ),
+        nonempty_default,
+    )
+    if not any("default to" in item for item in nonempty_default):
+        failures.append("self-test expected nonempty workspaces default detection")
+
+    wrapped_passthrough: list[str] = []
+    validate_setup_rust_ci_workspaces(
+        good_setup_rust_ci.replace(
+            "        workspaces: ${{ inputs.workspaces }}\n",
+            "        workspaces: |\n          ${{ inputs.workspaces }}\n",
+        ),
+        wrapped_passthrough,
+    )
+    if not any(
+        "block scalar" in item or "pass workspaces through exactly" in item
+        for item in wrapped_passthrough
+    ):
+        failures.append("self-test expected wrapped workspaces pass-through detection")
+
+    extra_cache_keys: list[str] = []
+    validate_setup_rust_ci_workspaces(
+        good_setup_rust_ci.replace(
+            "        cache-directories: ${{ github.workspace }}/.cache/sccache\n",
+            "        cache-directories: ${{ github.workspace }}/.cache/sccache\n"
+            "        cache-all-crates: true\n",
+        ),
+        extra_cache_keys,
+    )
+    if not any("trust-broadening" in item or "cache-all-crates" in item for item in extra_cache_keys):
+        failures.append("self-test expected extra rust-cache trust input detection")
+
+    good_perf_cache = """
+  performance-regression:
+    name: Performance Regression Check
+    steps:
+      - uses: ./.github/actions/setup-rust-ci
+        with:
+          shared-key: "ci-perf"
+          workspaces: |
+            . -> target
+            tests/performance/mesh -> target
+      - name: Run IP restriction worst-case microbenchmark
+        run: echo bench
+"""
+    perf_ok: list[str] = []
+    validate_performance_regression_workspaces(good_perf_cache, perf_ok)
+    if perf_ok:
+        failures.append(
+            f"self-test unexpectedly rejected good perf workspaces snippet: {perf_ok}"
+        )
+
+    mesh_only: list[str] = []
+    validate_performance_regression_workspaces(
+        good_perf_cache.replace(
+            "          workspaces: |\n            . -> target\n            tests/performance/mesh -> target\n",
+            "          workspaces: |\n            tests/performance/mesh -> target\n",
+        ),
+        mesh_only,
+    )
+    if not any("exactly" in item for item in mesh_only):
+        failures.append("self-test expected mesh-only workspaces to drop root coverage")
+
+    extra_workspace: list[str] = []
+    validate_performance_regression_workspaces(
+        good_perf_cache.replace(
+            "            tests/performance/mesh -> target\n",
+            "            tests/performance/mesh -> target\n            fuzz -> target\n",
+        ),
+        extra_workspace,
+    )
+    if not any("exactly" in item for item in extra_workspace):
+        failures.append("self-test expected extra perf workspace detection")
 
     if failures:
         for failure in failures:

@@ -525,12 +525,28 @@ Once the destination generation is the trusted base, an unchanged working tree
 passes by ordinary byte identity, and any further unadmitted drift fails. The
 predecessor constants are then inert — the trusted archive is no longer the
 source generation — and should be retired in a follow-up so the old tree
-cannot remain an admitted source. This predecessor must merge before #3910
-and does not contain #3910's action or workflow changes.
+cannot remain an admitted source. PR #3943 merged that predecessor onto `main`
+before this implementation; it did not contain #3910's action or workflow
+changes.
 
 Keeping the proof in Python rather than inline shell also keeps `helm-chart`
 free of the opaque-inline-shell and Cross surfaces that `Trusted Cross Build
 Policy` freezes per job.
+
+Live labs that compile the same default-feature `cargo build --profile pr-build
+--bin ferrum-edge` graph share the Swatinem rust-cache key `ci-live-pr-build`
+(`gateway-api-conformance.yml`, `mesh-e2e-sidecar-live.yml`,
+`multicluster-federation-live.yml`, and `multicluster-poller-partition-live.yml`).
+Lanes whose cache-affecting inputs differ keep private keys: CNI additionally
+links `ferrum-cni` (`ci-cni-lifecycle-live`), NodeWaypoint rebuilds with
+`--features cloud-secrets,ebpf` plus a nightly bpfel toolchain
+(`ci-node-waypoint-ebpf-live`), and Ambient Host UDP compiles the debug-profile
+lib/functional test binaries (`ci-ambient-host-udp-live`). Kind, kubectl, and
+Helm downloads used by those labs are restored inside
+`.github/actions/setup-kubernetes-tools` under an exact key of pinned
+versions/checksums, install subset, and runner OS/arch; checksums are verified
+after both restore and download.
+
 On pull requests and merge groups the checker is extracted from the base revision when
 one exists, then self-tested and executed against the proposed chart tree. That
 prevents the step from executing a checker replaced by the same pull request and
@@ -794,10 +810,15 @@ phases.
 
 **Runs**: `ubuntu-latest`
 
-Enforces code quality:
+Enforces code quality. Clippy omits DWARF (`profile.test.debug=0` and
+`profile.dev.debug=0`) so large integration targets stay within hosted-runner
+memory while `CARGO_BUILD_JOBS=2` restores modest compile parallelism:
 
 ```bash
-cargo clippy --all-targets -- -D warnings
+cargo clippy \
+  --config profile.test.debug=0 \
+  --config profile.dev.debug=0 \
+  --all-targets -- -D warnings
 ```
 
 **What it checks**:
@@ -1035,6 +1056,27 @@ python3 tests/performance/ci_overhead_bench.py \
 ```
 
 `--overhead-threshold 50` is a percentage threshold: the script fails when median gateway overhead across iterations exceeds 50%.
+
+The job's `setup-rust-ci` step keeps shared key `ci-perf` and passes rust-cache
+`workspaces` as `. -> target` plus `tests/performance/mesh -> target`. That
+covers both the root `ci-release` gateway build and the standalone Criterion
+crate under `tests/performance/mesh/` (own `Cargo.lock` / `target/`) without
+replacing root coverage. `setup-rust-ci` exposes `workspaces` as an optional
+pass-through to Swatinem/rust-cache; omitting it leaves rust-cache's default
+`. -> target`, so other jobs keep root-only caching. Do not list only the mesh
+workspace, and do not add unrelated workspaces, `cache-all-crates`, or extra
+`cache-directories` here.
+
+Hosted follow-ups that still need measured evidence before changing
+measurement fidelity or trigger breadth:
+
+- sccache hit rates on the `ci-release` gateway build (thin LTO). Do not
+  introduce a dedicated non-LTO perf profile until those stats are attached
+  and budgets are re-baselined.
+- whether workflow-only `.github/workflows/ci.yml` edits can skip the four
+  microbenchmarks. Today's static verifiers do not encode the `cargo bench`
+  invocation surface tightly enough to drop the `.github/workflows/ci.yml`
+  trigger safely.
 
 **Failures**:
 - Indicate performance regression issues
@@ -2068,10 +2110,38 @@ Jobs omitted because a single predecessor cannot name a unique merged text:
 - `ci-plan` / `test` for #3915 (issue #3900) — different destination hashes from
   #3913. After #3913 is the trusted base, #3915 needs a follow-up predecessor.
 
-Lint (`#3909`), `build-binaries` (`#3916`), coverage planning (`#3917`), and
-optional live-suite `changes` jobs (`#3919`) are not admitted here. They are not
-folded into this predecessor; if hosted Cross disagrees after a latest-`main`
-merge, they need their own exact pair rather than a wildcard.
+Lint (`#3909`), `build-binaries` (`#3916`), and optional live-suite `changes`
+jobs (`#3919`) are not admitted here. They are not folded into this
+predecessor; if hosted Cross disagrees after a latest-`main` merge, they need
+their own exact pair rather than a wildcard. Coverage planning (`#3917`) is
+admitted, but in the workflow-directory table below because `coverage.yml` is
+not a protected workflow.
+
+##### Admitted workflow-directory job SHA-256 generation transitions (temporary)
+
+The `CI_JOB_GENERATION_TRANSITIONS` table above only reaches `ci.yml`, which
+has its own dedicated comparison. Every other workflow is compared by the
+generic directory scan, where a Cross-flagged job carries a whole-job
+`job:<name>:<digest>` surface — so even a benign edit inside such a job moves
+its surface and is refused. `WORKFLOW_DIRECTORY_JOB_GENERATION_TRANSITIONS` in
+`.github/scripts/verify_cross_build_policy.py` admits exact retired→adopted
+pairs for those jobs, keyed by the workflow filename AND the job name:
+
+| Workflow | Job | Retired SHA-256 (trusted base) | Adopted SHA-256 | Destination |
+|---|---|---|---|---|
+| `coverage.yml` | `coverage-merge` | `d2480af21698fb3ad041b32b39587c949aeedec24746c8d5c8c63acd9f9d2fb6` | `34f5e1b022f1d01ac72d13c66256e11ff87c15135d775c03736e6701b2223a1c` | PR #3917 / issue #3907 |
+
+The pair admits #3917's shard-scoped coverage-merge reshape (planned-shard
+artifact selection, plugin gate, planned-shard outcome enforcement), pinned
+against #3917's branch after merging latest `main`
+(`grok/issue-3907-coverage-shards-r1`; recompute and re-pin if review changes
+the job bytes). Each digest is the SHA-256 of `extract_job_block` text. Both
+ends are exact, the binding includes the filename and job name, the move is
+one-way, and on the exact admitted pair only that job's `job:<name>:*`
+surfaces are withheld — an explicit Cross surface anywhere else in the same
+file, or any other revision pair of the named job, is scanned as before.
+RETIREMENT IS MANDATORY: once each destination is on `main`, delete that
+tuple.
 
 ##### Admitted `setup-rust-ci` generation transitions (temporary)
 
@@ -2118,7 +2188,10 @@ not close them.
    #3889 already rewrote `test-pkcs11-softhsm` on `main`, so #3913 must merge
    that result and may need a new PKCS job pair.
 5. Merge latest `main` into #3909, #3916, and #3917 and land them as ordinary
-   implementation PRs unless hosted Cross names a new frozen surface.
+   implementation PRs unless hosted Cross names a new frozen surface. #3917's
+   `coverage-merge` reshape is admitted by the workflow-directory job pair
+   above (added by a follow-up predecessor once the directory scan refused
+   the moved whole-job surface).
 6. Merge latest `main` into #3911 and land it. This predecessor now admits the
    combined `setup-rust-ci` destination; the `performance-regression` pair
    remains valid if that job is untouched.
