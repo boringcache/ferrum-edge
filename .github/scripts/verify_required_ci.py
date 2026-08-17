@@ -18,7 +18,12 @@ from live_suite_path_filter import (
     SUITE_PATTERNS,
     exact_path_patterns,
 )
-from pr_ci_plan import FULL_CI_DOCUMENTATION_PATHS, self_test as planner_self_test
+from pr_ci_plan import (
+    FULL_CI_DOCUMENTATION_PATHS,
+    JOB_GATE_NAMES,
+    UNCLASSIFIABLE_REASON,
+    self_test as planner_self_test,
+)
 from validate_live_assertions import (
     run_self_test as live_assertion_validator_self_test,
 )
@@ -70,9 +75,7 @@ REQUIRED_JOBS = {
 # downstream of one of these roots and are skipped transitively in light mode.
 DIRECT_FULL_CI_JOBS = {
     "test-unit",
-    "test-secrets",
     "test-service-integration",
-    "test-pkcs11-softhsm",
     "build-test-artifacts",
     "test-conformance",
     "dependency-audit",
@@ -92,7 +95,20 @@ PATH_GATED_JOBS = {
     "ebpf-live": "run_ebpf_live",
     "netns-capture-live": "run_ebpf_live",
     "two-cluster-mesh-live": "run_ebpf_live",
+    "test-secrets": "run_secrets_backends",
+    "test-pkcs11-softhsm": "run_pkcs11",
 }
+
+# Every path-gated job keeps this exact event set: PRs, merge-queue checks,
+# pushes to main, and manual workflow_dispatch. Omitting dispatch would skip
+# Secret Backends / PKCS#11 (and the rest) on a manual full-mode run even
+# though the planner force-schedules those gates.
+PATH_GATED_EVENT_GUARD = (
+    "(github.event_name == 'pull_request' || "
+    "github.event_name == 'merge_group' || "
+    "(github.event_name == 'push' && github.ref == 'refs/heads/main') || "
+    "github.event_name == 'workflow_dispatch')"
+)
 
 REMOVED_JOBS = {
     "fmt",
@@ -543,6 +559,217 @@ def merge_group_self_test() -> list[str]:
     return failures
 
 
+# ci-plan treats paths_classifiable as a trust/transport version handshake.
+# Unless the flag is exactly true, every published job gate is forced on
+# before $GITHUB_OUTPUT emission so an older newline-only trusted-base
+# planner cannot honor syntactically valid false Helm/mesh/eBPF values from
+# a NUL changed-file stream.
+CLASSIFIABLE_HANDSHAKE_SUMMARY = (
+    "The planner did not prove a classifiable NUL stream; every job gate was "
+    "scheduled fail-closed."
+)
+CLASSIFIABLE_HANDSHAKE_GATE_BLOCK = (
+    '            if [ "$paths_classifiable" != "true" ]; then\n'
+    "              value=true\n"
+    '            elif [ "$value" != "true" ] && [ "$value" != "false" ]; then\n'
+    "              value=true\n"
+)
+CLASSIFIABLE_HANDSHAKE_SUMMARY_BLOCK = (
+    '              if [ "$paths_classifiable" != "true" ]; then\n'
+    "                value=true\n"
+    '              elif [ "$value" != "true" ] && [ "$value" != "false" ]; then\n'
+    "                value=true\n"
+)
+GATE_OUTPUT_WRITE = 'printf \'%s=%s\\n\' "$gate" "$value" >> "$GITHUB_OUTPUT"'
+PARSE_ONLY_GATE_BLOCK = (
+    '            if [ "$value" != "true" ] && [ "$value" != "false" ]; then\n'
+    "              value=true\n"
+)
+JOB_GATE_FOR_LOOP = "for gate in " + " ".join(JOB_GATE_NAMES) + "; do"
+
+
+def resolve_planner_gate(paths_classifiable: str, value: str) -> str:
+    """Honor a planner gate only after a successful classifiable handshake.
+
+    Any paths_classifiable value other than exactly ``true`` — including a
+    missing flag from an old trusted-base planner, explicit ``false``, and
+    malformed tokens — force-runs the gate. Invalid or missing individual
+    outputs still fail closed to true after a successful handshake.
+    """
+
+    if paths_classifiable != "true":
+        return "true"
+    if value in {"true", "false"}:
+        return value
+    return "true"
+
+
+def check_classifiable_handshake(ci_plan_body: str) -> list[str]:
+    """Reject a ci-plan that parses the handshake flag but still honors false gates."""
+
+    errors: list[str] = []
+    if JOB_GATE_FOR_LOOP not in ci_plan_body:
+        errors.append(
+            "jobs.ci-plan must iterate every JOB_GATE_NAMES output in one loop"
+        )
+    if 's/^paths_classifiable=//p' not in ci_plan_body:
+        errors.append(
+            "jobs.ci-plan must parse paths_classifiable from the planner plan"
+        )
+
+    output_at = ci_plan_body.find(GATE_OUTPUT_WRITE)
+    if output_at == -1:
+        errors.append(
+            "jobs.ci-plan must emit each job gate to $GITHUB_OUTPUT before "
+            "the step summary"
+        )
+        return errors
+
+    prefix = ci_plan_body[:output_at]
+    if 's/^paths_classifiable=//p' not in prefix:
+        errors.append(
+            "jobs.ci-plan must parse paths_classifiable before emitting job gates"
+        )
+    if JOB_GATE_FOR_LOOP not in prefix:
+        errors.append(
+            "jobs.ci-plan must force every published job gate in the "
+            "$GITHUB_OUTPUT loop"
+        )
+    if CLASSIFIABLE_HANDSHAKE_GATE_BLOCK not in prefix:
+        errors.append(
+            "jobs.ci-plan must treat paths_classifiable as a trust/transport "
+            "version handshake and force every job gate true unless the flag "
+            "is exactly true, before $GITHUB_OUTPUT emission"
+        )
+    if CLASSIFIABLE_HANDSHAKE_SUMMARY_BLOCK not in ci_plan_body[output_at:]:
+        errors.append(
+            "jobs.ci-plan must apply the same classifiable handshake to the "
+            "step-summary gate table"
+        )
+    if CLASSIFIABLE_HANDSHAKE_SUMMARY not in ci_plan_body:
+        errors.append(
+            "jobs.ci-plan must summarize a failed classifiable handshake with "
+            "the canned fail-closed reason and must not interpolate hostile bytes"
+        )
+    if "$" in CLASSIFIABLE_HANDSHAKE_SUMMARY or "`" in CLASSIFIABLE_HANDSHAKE_SUMMARY:
+        errors.append("classifiable handshake summary must stay a canned constant")
+
+    # A workflow that only lists files when the flag is true, but still writes
+    # planner false values to $GITHUB_OUTPUT, must not satisfy this contract.
+    if (
+        '[ "$paths_classifiable" = "true" ]' in ci_plan_body
+        and CLASSIFIABLE_HANDSHAKE_GATE_BLOCK not in prefix
+    ):
+        errors.append(
+            "jobs.ci-plan must not honor old-planner false gates merely because "
+            "it parses paths_classifiable for the step summary"
+        )
+    return errors
+
+
+def classifiable_handshake_self_test(ci_plan_body: str) -> list[str]:
+    """Static fixtures proving old-planner, false, malformed, and safe-true behavior."""
+
+    failures: list[str] = []
+    if set(PATH_GATED_JOBS.values()) != set(JOB_GATE_NAMES):
+        failures.append("PATH_GATED_JOBS must publish every JOB_GATE_NAMES output")
+
+    handshake_cases = (
+        ("old-planner/no-flag", "", "false", "true"),
+        ("old-planner/no-flag-true-gate", "", "true", "true"),
+        ("explicit-false-flag", "false", "false", "true"),
+        ("explicit-false-flag-true-gate", "false", "true", "true"),
+        ("malformed-TRUE", "TRUE", "false", "true"),
+        ("malformed-True", "True", "false", "true"),
+        ("malformed-1", "1", "false", "true"),
+        ("malformed-yes", "yes", "false", "true"),
+        ("malformed-empty-token", " ", "false", "true"),
+        ("safe-true-narrow-false", "true", "false", "false"),
+        ("safe-true-narrow-true", "true", "true", "true"),
+        ("safe-true-missing-value", "true", "", "true"),
+        ("safe-true-invalid-value", "true", "maybe", "true"),
+    )
+    for label, flag, value, expected in handshake_cases:
+        actual = resolve_planner_gate(flag, value)
+        if actual != expected:
+            failures.append(
+                f"{label}: expected gate {expected!r} for "
+                f"paths_classifiable={flag!r} value={value!r}, got {actual!r}"
+            )
+
+    production_errors = check_classifiable_handshake(ci_plan_body)
+    if production_errors:
+        failures.extend(production_errors)
+        return failures
+
+    parse_only = ci_plan_body.replace(
+        CLASSIFIABLE_HANDSHAKE_GATE_BLOCK, PARSE_ONLY_GATE_BLOCK, 1
+    )
+    parse_only_errors = check_classifiable_handshake(parse_only)
+    if not parse_only_errors:
+        failures.append(
+            "handshake verifier must reject a workflow that parses "
+            "paths_classifiable but still honors old-planner false gate values"
+        )
+    elif not any("exactly true" in error for error in parse_only_errors):
+        failures.append(
+            "handshake verifier must reject parse-only workflows for honoring "
+            "false gates rather than for an unrelated contract"
+        )
+
+    # The pre-handshake substring check used for step-summary listing is not
+    # enough: the parse-only mutation still lists files only when the flag is
+    # true, which is the gap this handshake exists to close.
+    if '[ "$paths_classifiable" = "true" ]' not in parse_only:
+        failures.append("parse-only mutation must still parse paths_classifiable")
+
+    explicit_false = ci_plan_body.replace(
+        '[ "$paths_classifiable" != "true" ]; then',
+        '[ "$paths_classifiable" = "" ]; then',
+        1,
+    )
+    if not check_classifiable_handshake(explicit_false):
+        failures.append(
+            "handshake verifier must reject a workflow that force-runs only a "
+            "missing flag and still honors explicit paths_classifiable=false"
+        )
+
+    malformed = ci_plan_body.replace(
+        '[ "$paths_classifiable" != "true" ]; then',
+        '[ "$paths_classifiable" != "true" ] && [ "$paths_classifiable" != "TRUE" ]; then',
+        1,
+    )
+    if not check_classifiable_handshake(malformed):
+        failures.append(
+            "handshake verifier must reject a workflow that treats malformed "
+            "paths_classifiable tokens as classifiable"
+        )
+
+    swapped = ci_plan_body.replace(
+        CLASSIFIABLE_HANDSHAKE_GATE_BLOCK
+        + "              gate_fallbacks+=(\"$gate\")\n"
+        + "            fi\n"
+        + f"            {GATE_OUTPUT_WRITE}\n",
+        f"            {GATE_OUTPUT_WRITE}\n"
+        + CLASSIFIABLE_HANDSHAKE_GATE_BLOCK
+        + "              gate_fallbacks+=(\"$gate\")\n"
+        + "            fi\n",
+        1,
+    )
+    if swapped == ci_plan_body:
+        failures.append(
+            "handshake self-test could not relocate the $GITHUB_OUTPUT write "
+            "after the classifiable handshake"
+        )
+    elif not check_classifiable_handshake(swapped):
+        failures.append(
+            "handshake verifier must reject forcing job gates only after "
+            "$GITHUB_OUTPUT emission"
+        )
+
+    return failures
+
+
 def main_push_trigger_is_unconditional(workflow_yml: str) -> bool:
     """Return whether every push to main starts this workflow."""
 
@@ -791,6 +1018,11 @@ def main() -> int:
             planner_errors.append(
                 f"jobs.{job} must use the ci-plan `{output}` path gate"
             )
+        if PATH_GATED_EVENT_GUARD not in body:
+            planner_errors.append(
+                f"jobs.{job} must admit pull_request, merge_group, push to "
+                "main, and workflow_dispatch"
+            )
         if f"needs.ci-plan.outputs.{output}" not in aggregate_body:
             planner_errors.append(
                 f"jobs.test must enforce the ci-plan `{output}` path gate"
@@ -935,13 +1167,90 @@ def main() -> int:
     planner_errors.extend(merge_group_self_test())
 
     ci_plan_body = extract_job_body(ci_yml, "ci-plan")
-    if 'git diff --name-only --no-renames "${base_ref}...HEAD"' not in ci_plan_body:
+    pr_nul_diff = (
+        'git diff --name-only --no-renames -z "${base_ref}...HEAD" > "$changed_files"'
+    )
+    merge_nul_diff = (
+        'git diff --name-only --no-renames -z '
+        '"${MERGE_BASE_SHA}...HEAD" > "$changed_files"'
+    )
+    if pr_nul_diff not in ci_plan_body:
         planner_errors.append(
-            "jobs.ci-plan must disable rename detection when collecting changed files"
+            "jobs.ci-plan must collect pull_request changed files with "
+            "`git diff --name-only --no-renames -z`"
         )
-    if 'git diff --name-only --no-renames "${MERGE_BASE_SHA}...HEAD"' not in ci_plan_body:
+    if merge_nul_diff not in ci_plan_body:
         planner_errors.append(
-            "jobs.ci-plan must diff merge_group commits with rename detection disabled"
+            "jobs.ci-plan must collect merge_group changed files with "
+            "`git diff --name-only --no-renames -z`"
+        )
+    if ci_plan_body.count("--name-only --no-renames -z") != 2:
+        planner_errors.append(
+            "jobs.ci-plan must NUL-delimit both pull_request and merge_group "
+            "changed-file diffs"
+        )
+    if "| sort > \"$changed_files\"" in ci_plan_body:
+        planner_errors.append(
+            "jobs.ci-plan must not pipe changed files through newline sort"
+        )
+    planner_errors.extend(classifiable_handshake_self_test(ci_plan_body))
+    if 's/^paths_classifiable=//p' not in ci_plan_body:
+        planner_errors.append(
+            "jobs.ci-plan must parse paths_classifiable from the planner plan"
+        )
+    if '[ "$paths_classifiable" = "true" ]' not in ci_plan_body:
+        planner_errors.append(
+            "jobs.ci-plan must list changed files only when the planner "
+            "marks the NUL stream classifiable"
+        )
+    classifiable_at = ci_plan_body.find('[ "$paths_classifiable" = "true" ]')
+    reason_at = ci_plan_body.find('echo "$reason"')
+    if classifiable_at == -1 or reason_at == -1 or classifiable_at > reason_at:
+        planner_errors.append(
+            "jobs.ci-plan must echo the planner reason only after proving "
+            "the changed-file stream is classifiable"
+        )
+    if "while IFS= read -r -d '' path; do" not in ci_plan_body:
+        planner_errors.append(
+            "jobs.ci-plan must consume classifiable changed files as a NUL stream"
+        )
+    if "while IFS= read -r path; do" in ci_plan_body:
+        planner_errors.append(
+            "jobs.ci-plan must not parse changed files as newline-delimited"
+        )
+    if UNCLASSIFIABLE_REASON not in ci_plan_body:
+        planner_errors.append(
+            "jobs.ci-plan must summarize unclassifiable paths with the "
+            "planner canned reason and must not interpolate hostile bytes"
+        )
+    planner_src = Path(".github/scripts/pr_ci_plan.py").read_text(encoding="utf-8")
+    for marker, detail in (
+        (
+            "def parse_nul_changed_files(",
+            "jobs.ci-plan planner must parse changed files as a NUL stream",
+        ),
+        (
+            'if not data.endswith(b"\\0"):',
+            "jobs.ci-plan planner must require a complete NUL-terminated stream",
+        ),
+        (
+            'r"^[A-Za-z0-9._+@~ /-]{1,4096}$"',
+            "jobs.ci-plan planner must keep the conservative path allowlist",
+        ),
+        (
+            'print(f"paths_classifiable={str(paths_classifiable).lower()}")',
+            "jobs.ci-plan planner must emit paths_classifiable before interpolating paths",
+        ),
+    ):
+        if marker not in planner_src:
+            planner_errors.append(detail)
+    classifiable_emit = planner_src.find(
+        'print(f"paths_classifiable={str(paths_classifiable).lower()}")'
+    )
+    reason_emit = planner_src.find('print(f"reason={reason}")')
+    if classifiable_emit == -1 or reason_emit == -1 or classifiable_emit > reason_emit:
+        planner_errors.append(
+            "jobs.ci-plan planner must emit paths_classifiable before reason"
         )
 
     coverage_plan_body = extract_job_body(

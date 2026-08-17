@@ -393,6 +393,8 @@ async fn try_serve_translated_config(
             udp_gso_enabled: false,
             udp_pktinfo_enabled: false,
             mesh_outbound_enforcement: empty_slot(),
+            node_waypoint_udp_source_scoping: None,
+            node_waypoint_udp_destinations: None,
             datagram_client_address: None,
         };
         let join = tokio::spawn(async move {

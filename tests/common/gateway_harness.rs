@@ -158,6 +158,10 @@ pub struct TestGateway {
     pub config_path: Option<PathBuf>,
     stdout_path: Option<PathBuf>,
     stderr_path: Option<PathBuf>,
+    /// Environment the child was actually launched with (post-override).
+    /// Lets tests read back per-attempt values such as the ports allocated by
+    /// [`TestGatewayBuilder::env_ephemeral_port`].
+    launch_env: HashMap<String, String>,
 }
 
 impl TestGateway {
@@ -304,6 +308,16 @@ impl TestGateway {
 
     /// Write a YAML/JSON file into the harness's temp dir. Returns the
     /// absolute path. The file is cleaned up when the harness drops.
+    /// The launched child's env var `key` parsed as a port, if set.
+    ///
+    /// This is how a test reads the effective value of a port the harness
+    /// allocated per attempt via
+    /// [`TestGatewayBuilder::env_ephemeral_port`] — the local variable a
+    /// caller-side reservation would have captured does not exist there.
+    pub fn env_port(&self, key: &str) -> Option<u16> {
+        self.launch_env.get(key)?.parse().ok()
+    }
+
     pub fn write_temp_file(&self, name: &str, contents: &str) -> Result<PathBuf, std::io::Error> {
         let p = self.temp_dir.path().join(name);
         std::fs::write(&p, contents)?;
@@ -483,6 +497,9 @@ pub struct TestGatewayBuilder {
     auto_build: bool,
     prefer_release: bool,
     extra_env: Vec<(String, String)>,
+    /// Env var names that receive a FRESH ephemeral port on every spawn
+    /// attempt (see [`Self::env_ephemeral_port`]).
+    ephemeral_port_env: Vec<String>,
     /// Listener ports carried outside `extra_env` (for example, raw stream
     /// ports embedded in file-mode YAML). Automatic allocations must not reuse
     /// them within a spawn attempt.
@@ -515,6 +532,7 @@ impl Default for TestGatewayBuilder {
             auto_build: true,
             prefer_release: false,
             extra_env: Vec::new(),
+            ephemeral_port_env: Vec::new(),
             reserved_listener_ports: HashSet::new(),
             scrub_env: Vec::new(),
             clear_env: false,
@@ -637,6 +655,21 @@ impl TestGatewayBuilder {
     /// so `.env("FERRUM_LOG_LEVEL", "debug")` overrides `.log_level(..)`.
     pub fn env(mut self, key: impl Into<String>, value: impl Into<String>) -> Self {
         self.extra_env.push((key.into(), value.into()));
+        self
+    }
+
+    /// Set `key` to a FRESH ephemeral port on every spawn attempt.
+    ///
+    /// A caller-side bind-drop reservation passed through [`.env`](Self::env)
+    /// keeps its fixed value across the harness's retry loop, so a single
+    /// port steal defeats all attempts (every retry re-collides on the same
+    /// port and the child exits 1 at bind). This variant participates in the
+    /// per-attempt fresh-port contract instead: each attempt allocates a new
+    /// port against the same exclusion set as the admin/proxy allocations, so
+    /// it cannot collide with this attempt's other listeners. Read the
+    /// effective value after spawn with [`TestGateway::env_port`].
+    pub fn env_ephemeral_port(mut self, key: impl Into<String>) -> Self {
+        self.ephemeral_port_env.push(key.into());
         self
     }
 
@@ -805,6 +838,15 @@ impl TestGatewayBuilder {
             env.insert(k.clone(), v.clone());
         }
 
+        // Per-attempt ephemeral env ports (see `env_ephemeral_port`): applied
+        // after caller overrides so every retry gets a genuinely fresh value,
+        // allocated against the same exclusion set as this attempt's
+        // admin/proxy ports so listeners cannot collide within the attempt.
+        for key in &self.ephemeral_port_env {
+            let port = ephemeral_port_excluding(&mut excluded_ports).await?;
+            env.insert(key.clone(), port.to_string());
+        }
+
         let mut cmd = Command::new(&binary);
         if self.clear_env {
             cmd.env_clear();
@@ -884,6 +926,7 @@ impl TestGatewayBuilder {
             config_path,
             stdout_path,
             stderr_path,
+            launch_env: env,
         };
 
         // Ownership barrier. Watching the child while polling means a process

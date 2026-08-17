@@ -1780,7 +1780,7 @@ fn every_plain_udp_setup_stage_runs_under_the_authorization_deadline() {
         .find("// Record circuit breaker success")
         .expect("the backend success accounting");
     let insert = create_session
-        .find("sessions.insert(client_addr, session.clone());")
+        .find("sessions.insert(session_key.clone(), session.clone());")
         .expect("the session map insert");
     assert!(
         commit_check < cb_success && cb_success < insert,

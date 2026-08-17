@@ -1,0 +1,60 @@
+# syntax=docker/dockerfile:1
+# Builds the CI analogue of `Dockerfile` target `runtime-ebpf-tools` around an
+# already-packaged Ferrum eBPF runtime. NodeWaypoint UDP/DTLS Service-path
+# steering (issue #3286) executes generated `sh -c` iptables/ip6tables/ip
+# scripts from the ambient proxy; the distroless `-ebpf` image cannot run them
+# (`Command::new("sh")` returns ENOENT). This layer does not weaken `-ebpf`:
+# it is a separate tag selected only when tools are required.
+#
+# Pins match the production `capture-tools-base` stage (digest-pinned Debian 13
+# slim, the same iproute2 package revision, and `ca-certificates` for the
+# Debian platform trust store reqwest's verifier loads at startup). iptables
+# tracks the base suite rather than an exact package revision for the same
+# reason the production stage does: a point-release pin would break without
+# bounding anything the digest does not already bound.
+ARG BASE_IMAGE=gcr.io/distroless/cc-debian13:nonroot
+ARG TOOLS_BASE=debian:13-slim@sha256:28de0877c2189802884ccd20f15ee41c203573bd87bb6b883f5f46362d24c5c2
+ARG IPROUTE2_VERSION=6.15.0-1
+
+FROM ${BASE_IMAGE} AS ferrum-runtime
+
+FROM ${TOOLS_BASE}
+ARG IPROUTE2_VERSION
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+        ca-certificates \
+        "iproute2=${IPROUTE2_VERSION}" \
+        iptables \
+    && rm -rf /var/lib/apt/lists/* \
+    && test -x /bin/sh \
+    && test -s /etc/ssl/certs/ca-certificates.crt \
+    && for tool in ip iptables ip6tables iptables-save ip6tables-save; do \
+        command -v "$tool" >/dev/null 2>&1 || { \
+            echo "ebpf-tools layer is missing required tool: $tool" >&2; \
+            exit 1; \
+        }; \
+    done \
+    && iptables --version >/dev/null \
+    && ip6tables --version >/dev/null
+
+COPY --from=ferrum-runtime /app/ferrum-edge /app/ferrum-edge
+COPY --from=ferrum-runtime /app/bpf/ferrum-ebpf /app/bpf/ferrum-ebpf
+
+WORKDIR /app
+
+ENV PATH="/app:${PATH}" \
+    FERRUM_MODE=database \
+    FERRUM_LOG_LEVEL=error \
+    FERRUM_PROXY_HTTP_PORT=8000 \
+    FERRUM_PROXY_HTTPS_PORT=8443 \
+    FERRUM_ADMIN_HTTP_PORT=9000 \
+    FERRUM_ADMIN_HTTPS_PORT=9443 \
+    FERRUM_NODE_AGENT_BPF_ELF_PATH=/app/bpf/ferrum-ebpf
+
+# Production `runtime-ebpf-tools` runs as root because every consumer needs
+# root + NET_ADMIN to install host netfilter/iproute objects. The mesh chart
+# already selects UID 0 for this DaemonSet.
+USER 0:0
+
+ENTRYPOINT ["/app/ferrum-edge"]
+CMD ["run"]

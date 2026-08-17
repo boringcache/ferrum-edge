@@ -92,13 +92,19 @@ paths:
 
 - Hostile-parser fuzzing lives in the isolated `fuzz/` cargo-fuzz workspace; see
   `docs/fuzz.md` for budgets, corpora policy, and crash promotion.
-- Ordinary PR CI runs the deterministic inline `Fuzz Smoke` job in
-  `.github/workflows/ci.yml`.
-- Longer sanitizer-backed runs are scheduled in `.github/workflows/fuzz.yml` only.
+- Ordinary full-mode PR CI runs the deterministic `Fuzz Smoke` property gate
+  (`cargo test --locked` in `fuzz/`) in `.github/workflows/ci.yml`.
+- The six-target bounded sanitizer smoke (`-runs=512`, `-max_total_time=8`,
+  `-max_len=4096`) runs on `merge_group`, push to `main`, and manual
+  `workflow_dispatch` of `ci.yml`, not on `pull_request`.
+- `Swatinem/rust-cache` `save-if` for that job is strictly a push to `main`;
+  pull_request, fork, merge_group, and workflow_dispatch never publish a
+  `fuzz-smoke` cache.
+- Longer sanitizer-backed runs remain scheduled in `.github/workflows/fuzz.yml`.
 
 ## CI Expectations
 
-- Full-mode PR CI runs formatting and integration-shard coverage inside `ci-plan`, then runs consolidated test jobs (unit + inline lib, all secret backends, Consul + LDAP), two integration shards, three functional shards, lint, perf regression, and five build targets: Linux x86_64/ARM64, macOS x86_64/ARM64, Windows x86_64. The planner also emits trusted, fail-closed Helm/mesh/eBPF path gates so irrelevant jobs skip before runner allocation. Ordinary non-vendored documentation, license, and agent-instruction-only PRs stay on a lightweight diff-hygiene + `Tests` aggregate path; vendored Markdown and live-suite contract/runbook docs still select full mode. On full-mode PRs, the perf-regression job always runs lightweight protocol-perf static contracts (workflow/evaluator self-tests + scenario `py_compile`) after checkout; the expensive HTTP overhead benchmark runs only for shared runtime infrastructure (top-level `src/*.rs`), proxy/connection hot paths, file-mode startup and config, performance fixtures, or dependency/build-graph changes; plugin-internal, admin, secrets, and unrelated-mode changes skip the benchmark. It always runs on pushes to `main` and manual `workflow_dispatch`, and runs fail-closed when the PR diff cannot be computed.
+- Full-mode PR CI runs formatting and integration-shard coverage inside `ci-plan`, then runs consolidated test jobs (unit + inline lib, Consul + LDAP), two integration shards, three functional shards, lint, perf regression, and five build targets: Linux x86_64/ARM64, macOS x86_64/ARM64, Windows x86_64. The planner also emits trusted, fail-closed Helm/mesh/eBPF/Secret Backends (`run_secrets_backends`)/PKCS#11 SoftHSM (`run_pkcs11`) path gates so irrelevant jobs skip before runner allocation. Secret Backends and PKCS#11 remain required when their planner outputs are true and may skip when those outputs are false; pushes to `main`, manual runs, empty/unavailable diffs, unclassifiable paths, a missing or non-`true` `paths_classifiable` handshake from an old trusted-base planner, and gate-controller edits fail closed and schedule both. Ordinary non-vendored documentation, license, and agent-instruction-only PRs stay on a lightweight diff-hygiene + `Tests` aggregate path; vendored Markdown and live-suite contract/runbook docs still select full mode. On full-mode PRs, the perf-regression job always runs lightweight protocol-perf static contracts (workflow/evaluator self-tests + scenario `py_compile`) after checkout; the expensive HTTP overhead benchmark runs only for shared runtime infrastructure (top-level `src/*.rs`), proxy/connection hot paths, file-mode startup and config, performance fixtures, or dependency/build-graph changes; plugin-internal, admin, secrets, and unrelated-mode changes skip the benchmark. It always runs on pushes to `main` and manual `workflow_dispatch`, and runs fail-closed when the PR diff cannot be computed.
 - Branch protection must directly require `Tests`, `Merge Coverage`, `Gateway API Conformance`, `Mesh E2E Sidecar Live`, `Trusted Cross Build Policy`, `Multicluster Federation Live`, `Multicluster Poller Partition Live`, `Ambient Host UDP Live`, and `Launch Readiness Integrity`. `Launch Readiness Gate` is deliberately not required on PRs: it is the live go/no-go verdict and stays red while launch blockers are open (see `docs/launch-readiness.md`). The dedicated workflows trigger on every PR and on `merge_group`, and path-filter internally; do not add polling mirror jobs back to `ci.yml`. See `docs/ci_cd.md` for the live no-bypass posture and merge-queue SHA semantics.
 - Push to main overwrites the `latest` release and publishes multi-arch Docker images to Docker Hub and GHCR.
 - Tags `v*` create versioned releases and Docker tags.
