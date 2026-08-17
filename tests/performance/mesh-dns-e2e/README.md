@@ -5,7 +5,7 @@ End-to-end performance harness for Ferrum Edge's transparent mesh DNS proxy (`sr
 ## Architecture
 
 ```
-dns_loadgen ──UDP/TCP DNS──► ferrum-edge (15053) ──UDP DNS──► dns_upstream_stub
+dns_loadgen ──UDP/TCP DNS──► ferrum-edge (15053) ──UDP/TCP DNS──► dns_upstream_stub
                                   │                                (17053)
                                   ▼
                             mesh_cp_stub
@@ -19,7 +19,7 @@ Three name classes are measured:
 |---|---|---|---|
 | mesh-internal | `reviews.default.svc.cluster.local` | 10.0.0.1 | exact match in `DnsResolutionTable.exact` |
 | mesh-wildcard | `pod-7.headless.default.svc.cluster.local` | 10.0.0.99 | one-label wildcard suffix match |
-| upstream-forward | `example.com` | 192.0.2.1 (from stub) | UDP forward through `run_udp_forwarder` to `FERRUM_MESH_DNS_UPSTREAM_ADDR` |
+| upstream-forward | `example.com` | 192.0.2.1 (from stub) | UDP/TCP forward to `FERRUM_MESH_DNS_UPSTREAM_ADDR` |
 
 ## Quick start
 
@@ -44,7 +44,9 @@ The CP stub's `ferrum_version` must match the gateway's major.minor (the DP clie
 
 ## Why an in-process upstream stub?
 
-The gateway's upstream forward path issues UDP queries to `FERRUM_MESH_DNS_UPSTREAM_ADDR`. Pointing it at `127.0.0.53:53` (the host resolver) introduces network jitter that drowns the gateway overhead in the forward-path numbers. `dns_upstream_stub` is a 100-line tokio UDP server that answers `A` queries with `192.0.2.1` (RFC 5737 TEST-NET-1) and `AAAA` queries with `2001:db8::1` (RFC 3849).
+The gateway's upstream-forward path issues UDP or TCP queries to `FERRUM_MESH_DNS_UPSTREAM_ADDR` to match the client transport. Pointing that address at `127.0.0.53:53` (the host resolver) introduces network jitter that drowns the gateway overhead in the forward-path numbers. `dns_upstream_stub` is an in-process UDP+TCP server that answers `A` queries with `192.0.2.1` (RFC 5737 TEST-NET-1) and `AAAA` queries with `2001:db8::1` (RFC 3849), using RFC 1035 §4.2.2 two-byte length framing on TCP. Direct `--protocol both` baselines therefore exercise the same listener the gateway forwards to.
+
+Loadgen and `run.sh` fail closed: a selected protocol or class/transport row with zero successful queries or nonzero query errors exits nonzero after still printing the JSON/text report. Do not treat `Run completed successfully` as a substitute for the workflow acceptance gate (`dns_complete` / `dns_errors_ok`); that gate remains fail-closed for publication.
 
 ## Reporting
 
