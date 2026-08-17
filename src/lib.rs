@@ -9133,6 +9133,21 @@ pub mod _test_support {
             .map_err(map_frontend_app_send_reject_for_test)
     }
 
+    /// Race one post-registration DTLS delivery (plaintext, accept handoff, or
+    /// UDP write) against frontend client-trust retirement. Unauthenticated
+    /// sessions pass `None` and must not poll a retirement future.
+    pub async fn frontend_trust_raced_delivery_for_test<F>(
+        client_trust: Option<&crate::tls::ClientTrustSession>,
+        op: F,
+    ) -> Result<F::Output, FrontendAppSendRejectForTest>
+    where
+        F: std::future::Future,
+    {
+        crate::dtls::frontend_trust_raced_delivery_for_test(client_trust, op)
+            .await
+            .map_err(map_frontend_app_send_reject_for_test)
+    }
+
     /// Bounded, credential-free reject strings. Must not contain identity,
     /// certificate, or absolute expiry values.
     pub fn frontend_app_send_reject_as_str_for_test(

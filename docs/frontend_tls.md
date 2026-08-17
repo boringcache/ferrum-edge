@@ -656,7 +656,7 @@ client-CA change can revoke. Plaintext listeners are untouched.
 | gRPC | The pre-routing refusal is a `grpc-status: 16` (`UNAUTHENTICATED`) trailers-only response. |
 | WebSocket (H1/H2/H3) | The session's stop arbiter terminates it with the bounded reason `trust_withdrawn`, through the same teardown as drain and maximum-lifetime stops. |
 | TCP+TLS | The client leg fails with a bounded transport error, so byte counters, first-failure attribution, circuit-breaker classification, `on_stream_disconnect`, and the stream summary all complete exactly once through the existing relay paths. |
-| UDP+DTLS | The session driver ends through the same break the shutdown path uses; the demux entry, the active-session counter, and its mirror all release exactly once. Queued application data is **not** flushed — the peer is no longer authorized. |
+| UDP+DTLS | The session driver ends through the same break the shutdown path uses; the demux entry, the active-session counter, and its mirror all release exactly once. Queued application data is **not** flushed — the peer is no longer authorized. After a client-certificate session is registered, plaintext delivery to the proxy, the accepted-connection handoff, and UDP writes observe the same fail-closed retirement fence so a full channel cannot pin the session past withdrawal. |
 
 Because retirement runs through each transport's existing bounded teardown,
 request guards, connection guards, permits, load-balancer and circuit-breaker

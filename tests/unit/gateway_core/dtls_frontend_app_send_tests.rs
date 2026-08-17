@@ -1,4 +1,5 @@
-//! Terminating frontend DTLS application-send wire-commit (issue #3820).
+//! Terminating frontend DTLS application-send wire-commit (issue #3820)
+//! and established-session trust-retirement delivery races (issue #3857).
 //!
 //! Enqueue into `app_in_rx` is not a client-facing commit. These drive the
 //! production driver/helper seam: queued plaintext is cancelled on deadline
@@ -17,11 +18,13 @@ use ferrum_edge::_test_support::{
     encode_frontend_session_auth_deadline_offset_for_test,
     frontend_app_ciphertext_send_until_expiry_for_test, frontend_app_send_cancel_fired_for_test,
     frontend_app_send_reject_as_str_for_test, frontend_session_auth_deadline_for_test,
-    publish_frontend_session_auth_deadline_for_test, read_frontend_session_auth_deadline_for_test,
+    frontend_trust_raced_delivery_for_test, publish_frontend_session_auth_deadline_for_test,
+    read_frontend_session_auth_deadline_for_test,
     reconstruct_frontend_session_auth_deadline_for_test,
     reconstruct_frontend_session_auth_deadline_from_duration_for_test,
     shutdown_queued_frontend_app_send_for_test,
 };
+use ferrum_edge::tls::client_trust::{self, ClientTrustScope};
 
 const DTLS_SOURCE: &str = include_str!("../../../src/dtls/mod.rs");
 const UDP_PROXY_SOURCE: &str = include_str!("../../../src/proxy/udp_proxy.rs");
@@ -616,28 +619,100 @@ fn trust_withdrawal_suppresses_final_packet_drain_while_deadline_unexpired() {
         "an already-ready trust withdrawal must win over queued application data"
     );
 
-    let wire_fence = DTLS_SOURCE
+    let trust_race = DTLS_SOURCE
+        .split("async fn frontend_trust_raced_delivery<F>(")
+        .nth(1)
+        .expect("trust-raced delivery helper")
+        .split("async fn frontend_app_ciphertext_send_until_expiry_and_trust")
+        .next()
+        .expect("trust-raced helper body");
+    let none_path = trust_race
+        .find("return Ok(op.await)")
+        .expect("unauthenticated path");
+    let precheck = trust_race.find("session.is_retired()").expect("precheck");
+    let biased = trust_race.find("biased;").expect("biased delivery race");
+    let retirement = trust_race
+        .find("session.retired()")
+        .expect("retirement race");
+    let op_arm = trust_race.find("result = op =>").expect("delivery arm");
+    assert!(
+        none_path < precheck && precheck < biased && biased < retirement && retirement < op_arm,
+        "trust retirement must fence both an already-retired session and an in-flight delivery without polling a retirement future when unauthenticated"
+    );
+
+    let ciphertext = DTLS_SOURCE
         .split("async fn frontend_app_ciphertext_send_until_expiry_and_trust")
         .nth(1)
         .expect("trust-fenced ciphertext helper")
         .split("fn fail_queued_frontend_app_sends")
         .next()
         .expect("trust-fenced helper body");
-    let precheck = wire_fence.find("session.is_retired()").expect("precheck");
-    let biased = wire_fence.find("biased;").expect("biased wire race");
-    let retirement = wire_fence
-        .find("session.retired()")
-        .expect("retirement race");
-    let send = wire_fence
-        .find("result = bounded_send")
-        .expect("bounded send arm");
     assert!(
-        precheck < biased && biased < retirement && retirement < send,
-        "trust retirement must fence both an already-retired session and an in-flight socket write"
+        ciphertext.contains("frontend_trust_raced_delivery("),
+        "application ciphertext send_to must reuse the shared trust-raced delivery helper"
     );
     assert!(
         DTLS_SOURCE.contains("frontend_app_ciphertext_send_until_expiry_and_trust("),
         "the production DTLS wire-commit path must use the trust-fenced helper"
+    );
+
+    let handshake_udp = DTLS_SOURCE
+        .split("if !connected {")
+        .nth(1)
+        .expect("post-registration handshake UDP")
+        .split("match write_connected_frontend_record(")
+        .next()
+        .expect("handshake UDP body");
+    assert!(
+        handshake_udp.contains("frontend_trust_raced_delivery("),
+        "post-registration handshake UDP writes must observe trust retirement"
+    );
+
+    let accept_site = DTLS_SOURCE
+        .split("let conn = DtlsServerConn {")
+        .nth(1)
+        .expect("accepted connection")
+        .split("Output::PeerCert(der)")
+        .next()
+        .expect("accept arm");
+    assert!(
+        accept_site.contains("frontend_trust_raced_delivery("),
+        "accepted-connection delivery must observe trust retirement"
+    );
+    assert!(
+        accept_site.contains("accept_tx.send((conn, peer_addr))"),
+        "the accept channel is still the delivery path"
+    );
+    assert!(
+        !accept_site.contains("accept_tx.send((conn, peer_addr)).await.is_err()"),
+        "accept_tx.send must not await outside the trust-retirement race"
+    );
+
+    let frontend_driver = DTLS_SOURCE
+        .split("let mut client_trust_guard: Option<crate::tls::ClientTrustSessionGuard> = None;")
+        .nth(1)
+        .expect("frontend session driver")
+        .split("pub async fn close(")
+        .next()
+        .expect("frontend session body");
+    let app_data_arm = frontend_driver
+        .split("Output::ApplicationData(data)")
+        .nth(1)
+        .expect("application-data arm")
+        .split("Output::")
+        .next()
+        .expect("application-data arm body");
+    assert!(
+        app_data_arm.contains("frontend_trust_raced_delivery("),
+        "plaintext application delivery must observe trust retirement"
+    );
+    assert!(
+        app_data_arm.contains("app_out_tx.send(data.to_vec())"),
+        "plaintext still goes through the proxy delivery channel"
+    );
+    assert!(
+        !app_data_arm.contains("if app_out_tx.send(data.to_vec()).await.is_err()"),
+        "app_out_tx.send must not await in a match guard outside the trust-retirement race"
     );
 
     // Window = the withdrawal arm's BODY (from its warn! literal to its
@@ -706,5 +781,100 @@ fn trust_withdrawal_suppresses_final_packet_drain_while_deadline_unexpired() {
     assert!(
         !shutdown_body.contains("retired_by_trust_withdrawal = true"),
         "ordinary shutdown must not reuse the trust-withdrawal termination reason"
+    );
+}
+
+fn registered_frontend_dtls_session() -> ferrum_edge::tls::ClientTrustSessionGuard {
+    client_trust::arm_at_generation_for_test(ClientTrustScope::FrontendDtls, 1);
+    client_trust::capture(ClientTrustScope::FrontendDtls)
+        .expect("armed")
+        .register(true)
+        .expect("registered")
+}
+
+#[tokio::test]
+async fn unauthenticated_delivery_does_not_poll_a_retirement_future() {
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<Vec<u8>>(1);
+    tx.try_send(b"held".to_vec()).expect("fill channel");
+    let raced = tokio::spawn(async move {
+        frontend_trust_raced_delivery_for_test(None, tx.send(b"payload".to_vec())).await
+    });
+    tokio::task::yield_now().await;
+    tokio::task::yield_now().await;
+    assert!(
+        !raced.is_finished(),
+        "unauthenticated DTLS must wait on a full channel instead of polling retirement"
+    );
+    assert_eq!(rx.recv().await.expect("held"), b"held".to_vec());
+    assert_eq!(
+        raced.await.expect("join"),
+        Ok(Ok(())),
+        "unauthenticated delivery completes once capacity exists"
+    );
+    assert_eq!(rx.recv().await.expect("payload"), b"payload".to_vec());
+}
+
+#[tokio::test]
+#[allow(clippy::await_holding_lock)] // isolated_registry() must span awaits to serialize process-global registry state
+async fn already_retired_session_wins_an_exact_ready_tie_without_delivering() {
+    let _registry = crate::unit::tls::client_trust_tests::isolated_registry();
+    let guard = registered_frontend_dtls_session();
+    let session = guard.session().clone();
+    session.cancellation_token().cancel();
+
+    let polled = Arc::new(AtomicBool::new(false));
+    let polled_send = Arc::clone(&polled);
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<Vec<u8>>(1);
+    let outcome = frontend_trust_raced_delivery_for_test(
+        Some(&session),
+        async move {
+            polled_send.store(true, Ordering::SeqCst);
+            tx.send(b"payload".to_vec()).await
+        },
+    )
+    .await;
+    assert_eq!(outcome, Err(FrontendAppSendRejectForTest::Closed));
+    assert!(
+        !polled.load(Ordering::SeqCst),
+        "an already-ready retirement must never poll the delivery future"
+    );
+    assert!(
+        rx.try_recv().is_err(),
+        "an exact-ready tie must not deliver application plaintext"
+    );
+}
+
+#[tokio::test]
+#[allow(clippy::await_holding_lock)] // isolated_registry() must span awaits to serialize process-global registry state
+async fn a_full_channel_delivery_is_released_by_trust_withdrawal_without_delivering() {
+    let _registry = crate::unit::tls::client_trust_tests::isolated_registry();
+    let guard = registered_frontend_dtls_session();
+    let session = guard.session().clone();
+    let session_for_task = session.clone();
+
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<Vec<u8>>(1);
+    tx.try_send(b"held".to_vec()).expect("fill channel");
+    let raced = tokio::spawn(async move {
+        frontend_trust_raced_delivery_for_test(
+            Some(&session_for_task),
+            tx.send(b"payload".to_vec()),
+        )
+        .await
+    });
+    tokio::task::yield_now().await;
+    tokio::task::yield_now().await;
+    assert!(
+        !raced.is_finished(),
+        "a full delivery channel must park until retirement or capacity"
+    );
+    session.cancellation_token().cancel();
+    assert_eq!(
+        raced.await.expect("join"),
+        Err(FrontendAppSendRejectForTest::Closed)
+    );
+    assert_eq!(rx.try_recv().expect("held"), b"held".to_vec());
+    assert!(
+        rx.try_recv().is_err(),
+        "trust withdrawal must drop the in-flight send rather than deliver plaintext"
     );
 }

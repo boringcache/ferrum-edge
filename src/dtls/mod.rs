@@ -338,6 +338,37 @@ where
     }
 }
 
+/// Race one potentially-blocking delivery against frontend client-trust
+/// retirement. Used after a DTLS client-certificate session is registered so
+/// a full plaintext, accept, or UDP channel cannot pin the session past
+/// withdrawal (issue #3857).
+///
+/// A withdrawal that is already visible never polls `op`. One that becomes
+/// ready together with `op` wins the biased race and drops `op` before it
+/// can complete, so no new application plaintext is delivered to the proxy
+/// and no additional application ciphertext is committed to the client.
+/// Unauthenticated / static DTLS (`client_trust == None`) awaits `op` with
+/// no retirement future.
+async fn frontend_trust_raced_delivery<F>(
+    client_trust: Option<&crate::tls::ClientTrustSession>,
+    op: F,
+) -> Result<F::Output, FrontendAppSendReject>
+where
+    F: std::future::Future,
+{
+    let Some(session) = client_trust else {
+        return Ok(op.await);
+    };
+    if session.is_retired() {
+        return Err(FrontendAppSendReject::Closed);
+    }
+    tokio::select! {
+        biased;
+        _ = session.retired() => Err(FrontendAppSendReject::Closed),
+        result = op => Ok(result),
+    }
+}
+
 /// Add the established frontend client-trust retirement fence to one bounded
 /// ciphertext write. A withdrawal that is already visible never polls `send`;
 /// one that becomes ready together with the socket write wins the biased race
@@ -351,18 +382,11 @@ async fn frontend_app_ciphertext_send_until_expiry_and_trust<F>(
 where
     F: std::future::Future,
 {
-    let bounded_send = frontend_app_ciphertext_send_until_expiry(deadline, cancel, send);
-    let Some(session) = client_trust else {
-        return bounded_send.await;
-    };
-    if session.is_retired() {
-        return Err(FrontendAppSendReject::Closed);
-    }
-    tokio::select! {
-        biased;
-        _ = session.retired() => Err(FrontendAppSendReject::Closed),
-        result = bounded_send => result,
-    }
+    frontend_trust_raced_delivery(
+        client_trust,
+        frontend_app_ciphertext_send_until_expiry(deadline, cancel, send),
+    )
+    .await?
 }
 
 fn fail_queued_frontend_app_sends(
@@ -468,6 +492,19 @@ where
     F: std::future::Future,
 {
     frontend_app_ciphertext_send_until_expiry(deadline, cancel, send).await
+}
+
+/// Pin the post-registration trust-retirement race used for plaintext
+/// delivery, accept handoff, and UDP writes.
+#[allow(dead_code)] // used through library `_test_support`
+pub(crate) async fn frontend_trust_raced_delivery_for_test<F>(
+    client_trust: Option<&crate::tls::ClientTrustSession>,
+    op: F,
+) -> Result<F::Output, FrontendAppSendReject>
+where
+    F: std::future::Future,
+{
+    frontend_trust_raced_delivery(client_trust, op).await
 }
 
 /// Pin the bounded, credential-free reject strings.
@@ -2310,9 +2347,25 @@ impl DtlsServer {
                                     continue;
                                 }
                                 if !connected {
-                                    let _ = socket.send_to(data, peer_addr).await;
-                                    drain_round_exhausted = false;
-                                    continue;
+                                    match frontend_trust_raced_delivery(
+                                        client_trust_guard.as_ref().map(|guard| guard.session()),
+                                        socket.send_to(data, peer_addr),
+                                    )
+                                    .await
+                                    {
+                                        Ok(_) => {
+                                            drain_round_exhausted = false;
+                                            continue;
+                                        }
+                                        Err(_) => {
+                                            retired_by_trust_withdrawal = true;
+                                            fail_queued_frontend_app_sends(
+                                                &mut app_in_rx,
+                                                auth_deadline.get(),
+                                            );
+                                            return;
+                                        }
+                                    }
                                 }
                                 match write_connected_frontend_record(
                                     &socket,
@@ -2409,12 +2462,28 @@ impl DtlsServer {
                                     sni_hostname: sni_hostname.clone(),
                                     forwarded_client_addr: forwarded_client,
                                 };
-                                if accept_tx.send((conn, peer_addr)).await.is_err() {
-                                    fail_queued_frontend_app_sends(
-                                        &mut app_in_rx,
-                                        auth_deadline.get(),
-                                    );
-                                    return;
+                                match frontend_trust_raced_delivery(
+                                    client_trust_guard.as_ref().map(|guard| guard.session()),
+                                    accept_tx.send((conn, peer_addr)),
+                                )
+                                .await
+                                {
+                                    Ok(Ok(())) => {}
+                                    Ok(Err(_)) => {
+                                        fail_queued_frontend_app_sends(
+                                            &mut app_in_rx,
+                                            auth_deadline.get(),
+                                        );
+                                        return;
+                                    }
+                                    Err(_) => {
+                                        retired_by_trust_withdrawal = true;
+                                        fail_queued_frontend_app_sends(
+                                            &mut app_in_rx,
+                                            auth_deadline.get(),
+                                        );
+                                        return;
+                                    }
                                 }
                             }
                             Output::PeerCert(der) => {
@@ -2476,16 +2545,38 @@ impl DtlsServer {
                                 peer_cert_chain_der =
                                     (chain.len() > 1).then(|| Arc::new(chain[1..].to_vec()));
                             }
-                            Output::ApplicationData(data)
-                                if app_out_tx.send(data.to_vec()).await.is_err() =>
-                            {
-                                if let Some(inflight) = in_flight.take() {
-                                    let _ = inflight.completion.send(Err(
-                                        FrontendAppSendReject::Closed.as_str().to_string(),
-                                    ));
+                            Output::ApplicationData(data) => {
+                                match frontend_trust_raced_delivery(
+                                    client_trust_guard.as_ref().map(|guard| guard.session()),
+                                    app_out_tx.send(data.to_vec()),
+                                )
+                                .await
+                                {
+                                    Ok(Ok(())) => {
+                                        drain_round_exhausted = false;
+                                        break;
+                                    }
+                                    Ok(Err(_)) | Err(_) => {
+                                        if client_trust_guard
+                                            .as_ref()
+                                            .is_some_and(|guard| guard.session().is_retired())
+                                        {
+                                            retired_by_trust_withdrawal = true;
+                                        }
+                                        if let Some(inflight) = in_flight.take() {
+                                            let _ = inflight.completion.send(Err(
+                                                FrontendAppSendReject::Closed
+                                                    .as_str()
+                                                    .to_string(),
+                                            ));
+                                        }
+                                        fail_queued_frontend_app_sends(
+                                            &mut app_in_rx,
+                                            auth_deadline.get(),
+                                        );
+                                        return;
+                                    }
                                 }
-                                fail_queued_frontend_app_sends(&mut app_in_rx, auth_deadline.get());
-                                return;
                             }
                             _ => {
                                 drain_round_exhausted = false;
