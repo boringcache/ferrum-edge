@@ -1059,6 +1059,7 @@ def check_fips_producer_channel(
             in promote_steps[0]
             and 'fail "producer handoff archive contains a non-file member"'
             in promote_steps[0]
+            and '[-]*|d*) ;;' in promote_steps[0]
             and 'if [ "$identity_count" -ne 1 ]; then' in promote_steps[0]
             and '-*) identity_verbose_count=$((identity_verbose_count + 1)) ;;'
             in promote_steps[0]
@@ -1256,6 +1257,7 @@ def check_fips_producer_channel(
         "producer handoff archive verbose listing failed",
         "producer handoff archive identity member listing failed",
         "producer handoff archive contains a non-file member",
+        "[-]*|d*) ;;",
         "producer handoff archive listing is inconsistent",
         "producer handoff archive member is malformed",
         "producer handoff archive member uses an absolute path",
