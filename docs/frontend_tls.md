@@ -1191,7 +1191,7 @@ When using load balancers:
 ## Performance Considerations
 
 - **TLS Handshake Overhead**: Initial connections have higher latency
-- **Session Resumption**: Enabled by default. TLS 1.3 normally uses stateless auto-rotating tickets; HTTP/3 uses the bounded stateful cache sized by `FERRUM_TLS_SESSION_CACHE_SIZE` when server 0-RTT is explicitly enabled on a non-mTLS listener, because rustls requires stateful resumption for early data. TLS 1.2 uses the same bound for its stateful session ID cache. Resumption saves 1 RTT on reconnections. 0-RTT remains disabled by default because of replay risk.
+- **Session Resumption**: Enabled by default. TLS 1.3 normally uses stateless auto-rotating tickets; HTTP/3 uses the bounded stateful cache sized by `FERRUM_TLS_SESSION_CACHE_SIZE` when server 0-RTT is explicitly enabled on a non-mTLS listener, because rustls requires stateful resumption for early data. TLS 1.2 uses the same bound for its stateful session ID cache. Resumption is disabled on an mTLS listener whose client-trust scope can advance under `FERRUM_FRONTEND_TLS_LIVE_RELOAD_ENABLED=true`, so a ticket cannot outlive an accepted client-CA or CRL withdrawal; static mTLS listeners retain normal resumption. Resumption otherwise saves 1 RTT on reconnections. 0-RTT remains disabled by default because of replay risk.
 - **Hardware Acceleration**: Consider for high-throughput scenarios
 - **Certificate Size**: Smaller certificates improve performance
 
