@@ -5670,7 +5670,7 @@ mod inner {
         }
 
         /// Anchored, regex-escaped `_id` prefix for collections whose documents
-        /// are keyed `"{namespace}:{suffix}"` and carry NO `namespace` field.
+        /// are keyed `"{namespace}:{suffix}"`.
         ///
         /// `proxy_route_locks` is exactly that shape, so a `{"namespace": ...}`
         /// filter silently matches nothing. The name is escaped, so a namespace
@@ -5679,6 +5679,20 @@ mod inner {
         /// would otherwise be a wildcard.
         fn namespace_id_prefix_filter(namespace: &str) -> Document {
             doc! { "_id": { "$regex": format!("^{}:", regex_escape(namespace)) } }
+        }
+
+        /// Select every document that claims the namespace through either its
+        /// embedded field or its composite key. Inspecting both sides is
+        /// required to expose a split identity to the strict rename parser;
+        /// filtering only by the embedded field would silently miss a key whose
+        /// `namespace` field is absent or points elsewhere.
+        fn namespace_identity_scan_filter(namespace: &str) -> Document {
+            doc! {
+                "$or": [
+                    { "namespace": namespace },
+                    Self::namespace_id_prefix_filter(namespace),
+                ],
+            }
         }
 
         /// Remove the namespace's advisory guard documents in-session.
@@ -5986,10 +6000,10 @@ mod inner {
         /// Reinsert every document of `collection_name` whose `_id` is
         /// `"{current_name}:{suffix}"` under `"{new_name}:{suffix}"`.
         ///
-        /// The scan filters on the `namespace` FIELD, which every collection
-        /// reached here actually carries — `proxy_route_locks` does not, which
-        /// is why it is handled by
-        /// [`Self::delete_namespace_guard_docs_in_session`] instead.
+        /// The scan takes the union of the embedded `namespace` field and the
+        /// composite `_id` prefix so either half of a split identity is visible.
+        /// `proxy_route_locks` has no embedded field and is deleted separately
+        /// by [`Self::delete_namespace_guard_docs_in_session`].
         ///
         /// A nonempty suffix is not enough: it must exactly equal the
         /// collection's identity field (`id` on `consumers`, `identity_value`
@@ -6009,7 +6023,7 @@ mod inner {
             let mut moved: Vec<(String, Document)> = Vec::new();
             {
                 let mut cursor = collection
-                    .find(doc! { "namespace": current_name })
+                    .find(Self::namespace_identity_scan_filter(current_name))
                     .session(&mut *session)
                     .await?;
                 while cursor.advance(&mut *session).await? {

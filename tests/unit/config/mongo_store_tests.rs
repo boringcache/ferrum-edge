@@ -1558,10 +1558,18 @@ fn namespace_prefixed_id_rewrite_requires_suffix_field_and_embedded_namespace() 
     let body = mongo_method("rewrite_namespace_prefixed_ids_in_session(");
     assert!(
         body.contains("namespace_prefixed_id_suffix_field(collection_name)")
+            && body.contains("namespace_identity_scan_filter(current_name)")
             && body.contains("require_namespace_prefixed_identity(")
             && body.contains("document.get_str(\"namespace\").ok()")
             && body.contains("document.get_str(suffix_field).ok()"),
         "composite rewrite must require suffix-to-field equality and an embedded namespace:\n{body}"
+    );
+    let scan = mongo_fn_body("        fn namespace_identity_scan_filter(");
+    assert!(
+        scan.contains("\"$or\"")
+            && scan.contains("\"namespace\": namespace")
+            && scan.contains("namespace_id_prefix_filter(namespace)"),
+        "the scan must expose both halves of a split embedded/key identity:\n{scan}"
     );
     assert!(
         !body.contains("unwrap_or(old_id.as_str())"),
