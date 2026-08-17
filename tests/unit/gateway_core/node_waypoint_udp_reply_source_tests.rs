@@ -34,6 +34,31 @@ use ferrum_edge::proxy::node_waypoint_udp_reply_source::{
     encode_claim, read_acknowledgement, read_desired_generation, write_acknowledgement,
 };
 
+/// A node address and the fixed relay mark are packet-controlled attributes.
+/// Keep UDP off the TCP-only node-source admission lane so a capable same-node
+/// workload cannot bypass the waypoint's attribution and authorization.
+#[test]
+fn tc_inbound_udp_never_authorizes_a_node_source_without_an_exact_claim() {
+    let source = include_str!("../../../ebpf/ferrum-ebpf/src/tc_inbound.rs");
+    let udp_arms = source
+        .split("IPPROTO_UDP => {")
+        .skip(1)
+        .map(|arm| arm.split("_ => Ok(TC_ACT_OK)").next().unwrap_or(arm))
+        .collect::<Vec<_>>();
+
+    assert_eq!(udp_arms.len(), 2, "IPv4 and IPv6 UDP arms must be checked");
+    for arm in udp_arms {
+        assert!(
+            !arm.contains("enrolled_destination_authorized(ctx, source_is_node)"),
+            "UDP must not trust the forgeable node-source plus public-mark proof"
+        );
+        assert!(
+            arm.contains("udp_reply_source"),
+            "UDP relay admission must retain the exact live source claim"
+        );
+    }
+}
+
 fn source(ip: &str, port: u16) -> NodeWaypointUdpSteerDestination {
     NodeWaypointUdpSteerDestination {
         ip: ip.parse::<IpAddr>().expect("reply source address"),

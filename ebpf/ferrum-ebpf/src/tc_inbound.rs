@@ -7,7 +7,8 @@
 //! local-node source and carry the NodeWaypoint relay's authorized socket
 //! mark; non-initial TCP packets are allowed so replies for
 //! intentionally bypassed outbound flows can return to the pod. Direct UDP is
-//! failed closed for NodeWaypoint except the relay's own marked datagrams and
+//! failed closed for NodeWaypoint except marked relay datagrams from an exact,
+//! live reply-source authorization and
 //! DNS responses from source port 53 to high pod-originated client ports
 //! (>=32768). The UDP arms accept one additional SOURCE proof the TCP arm does
 //! not: an exact `(address, port)` entry in `FERRUM_UDP_REPLY_SOURCES` /
@@ -17,8 +18,9 @@
 //! the local address the client addressed, which on the Service path is the
 //! Service ClusterIP and therefore never a configured node IP. The relay auth
 //! mark is still required in every case, and TCP semantics are unchanged.
-//! Explicitly configured local node source IPs can only bypass this guard with
-//! the relay mark, or for enrolled Kubernetes probe ports without the mark.
+//! Explicitly configured local node source IPs can bypass the TCP guard only
+//! with the relay mark, or for enrolled Kubernetes probe ports without it;
+//! they never authorize UDP.
 //! The same classifier closes Ambient UDP enrollment: pod-IP metadata is
 //! inserted with UDP-not-ready before registry publication, so pod-originated
 //! UDP is dropped until the per-netns producer publishes readiness after its
@@ -94,7 +96,7 @@ fn guard_ipv4(ctx: &TcContext) -> Result<i32, i64> {
     }
 
     // Reaching here means the destination is enrolled; the source IP is needed
-    // for the node-source and authorization checks below on both protocols.
+    // for TCP's node-source check and UDP's exact reply-source lookup below.
     let src_ip: u32 = ctx.load(ETH_HDR_LEN + 12).map_err(|_| -1i64)?;
     let source_is_node = unsafe { FERRUM_NODE_IPS.get(&src_ip) }.is_some();
     match protocol {
@@ -119,9 +121,11 @@ fn guard_ipv4(ctx: &TcContext) -> Result<i32, i64> {
             // the SAME socket-mark proof the TCP arm uses — its frontend
             // listener socket and its per-session backend socket both carry
             // `node_waypoint_inbound_auth_mark` — combined with a proof about
-            // the packet's SOURCE. The backend dial to an enrolled pod leaves
-            // from a configured node address, exactly like the TCP relay. The
-            // REPLY does not: it is source-PINNED to the local address the
+            // the packet's SOURCE. A configured node address is deliberately
+            // not sufficient for UDP: a capable same-node pod can forge both
+            // that source address and the public socket mark. The relay is
+            // admitted only by the exact, live reply-source claim. Its
+            // datagram is source-PINNED to the local address the
             // client addressed, which on the Service path is the Service
             // ClusterIP, so it is admitted only by an exact, live
             // `(address, port)` reply-source authorization the serving listener
@@ -129,14 +133,7 @@ fn guard_ipv4(ctx: &TcContext) -> Result<i32, i64> {
             // nor the source alone admits anything. Checked BEFORE the DNS
             // carve-out so a marked relay never depends on port heuristics.
             //
-            // Node-source and reply-source proofs stay on separate arms.
-            // `source_is_node || reply_source_authorized` is two map-lookup
-            // `.is_some()` results; LLVM lowers that as `pointer |= pointer`,
-            // which the kernel verifier rejects.
             let ports = udp_ports4(ctx);
-            if enrolled_destination_authorized(ctx, source_is_node) {
-                return Ok(TC_ACT_PIPE);
-            }
             if let Ok((src_port, _)) = ports {
                 if enrolled_destination_authorized(ctx, udp_reply_source4_allowed(src_ip, src_port))
                 {
@@ -215,15 +212,13 @@ fn guard_ipv6(ctx: &TcContext) -> Result<i32, i64> {
         }
         IPPROTO_UDP => {
             // IPv6 mirror of the v4 arm, at exact parity: the NodeWaypoint's
-            // own marked UDP relay is authorized either from a configured node
-            // source (the backend dial) or from an exact, live reply-source
-            // authorization (the source-pinned reply). A dual-stack waypoint
+            // own marked UDP relay requires an exact, live reply-source
+            // authorization. A node address plus the public mark is forgeable
+            // by a capable same-node pod and is never a UDP authorization. A
+            // dual-stack waypoint
             // that admitted only one family would black-hole the other. Same
-            // separate-arm source proofs as IPv4; do not reintroduce `||`.
+            // source proof as IPv4.
             let ports = udp_ports6(ctx);
-            if enrolled_destination_authorized(ctx, source_is_node) {
-                return Ok(TC_ACT_PIPE);
-            }
             if let Ok((src_port, _)) = ports {
                 if enrolled_destination_authorized(
                     ctx,
