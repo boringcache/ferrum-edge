@@ -6749,10 +6749,12 @@ pub fn reconcile_node_waypoint_udp_reply_sources(
 ///
 /// Refusals, all whole-generation and all returning a closed-set reason:
 ///
-/// * an EMPTY source set resolves to an EMPTY relay set — a withdrawal
+/// * an INACTIVE generation resolves to an EMPTY relay set — a withdrawal
 ///   authorizes nothing and needs no identity (the manifest parser already
-///   refuses a NON-empty set with no relay identity, so the `None` arm here can
-///   only be a withdrawal);
+///   refuses inactive-with-identity and inactive-with-sources);
+/// * an ACTIVE generation, including one with zero ClusterIP sources, resolves
+///   the named relay pod's complete cgroup subtree so the direct-node lane
+///   stays usable without authorizing any ClusterIP tuple;
 /// * a pod UID that is one of THIS node's enrolled workloads: the relay may
 ///   answer for a Service address, never as one of the pods this guard
 ///   protects, and the same rule already governs reply-source addresses;
@@ -6773,12 +6775,14 @@ fn resolve_node_waypoint_relay_cgroups(
     pod_states: &DashMap<String, PodAttachmentState>,
     desired: &crate::proxy::node_waypoint_udp_reply_source::DesiredReplySources,
 ) -> Result<Vec<u64>, &'static str> {
-    let Some(pod_uid) = desired.relay_pod_uid.as_deref() else {
-        return Ok(Vec::new());
-    };
-    if desired.sources.is_empty() {
+    if !desired.generation.active() {
         return Ok(Vec::new());
     }
+    let Some(pod_uid) = desired.relay_pod_uid.as_deref() else {
+        // Parser already refuses active-without-identity; fail closed if a
+        // caller constructs the struct by hand.
+        return Err("relay_identity_missing");
+    };
     if pod_states.contains_key(pod_uid) {
         return Err("relay_identity_names_enrolled_pod");
     }

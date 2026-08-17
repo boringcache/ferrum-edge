@@ -2826,6 +2826,10 @@ async fn node_waypoint_udp_steering_is_not_published_until_the_listener_binds() 
         steering.bound_destinations().is_empty(),
         "desired metadata on an unbound listener must not be steered"
     );
+    assert!(
+        !steering.serving(),
+        "an unbound listener must not activate the relay sender proof"
+    );
 
     let failures = manager.reconcile().await;
     assert!(
@@ -2835,6 +2839,10 @@ async fn node_waypoint_udp_steering_is_not_published_until_the_listener_binds() 
     assert!(
         steering.bound_destinations().is_empty(),
         "a failed bind must never be steered"
+    );
+    assert!(
+        !steering.serving(),
+        "a failed bind must not activate the relay sender proof"
     );
     manager.shutdown_all().await;
 }
@@ -2916,6 +2924,54 @@ async fn node_waypoint_udp_successful_bind_publishes_and_shutdown_retracts() {
     assert!(
         steering.bound_destinations().is_empty(),
         "shutdown must retract the serving plan before sockets go away"
+    );
+}
+
+/// A headless/VIP-less NodeWaypoint UDP listener is still SERVING: it publishes
+/// no ClusterIP tuples but must not look withdrawn. Bind failure stays inactive.
+#[tokio::test]
+async fn node_waypoint_udp_headless_bind_publishes_serving_without_clusterip_tuples() {
+    let mut started = None;
+    let mut last_failures = Vec::new();
+    for _ in 0..8 {
+        let probe = tokio::net::UdpSocket::bind("127.0.0.1:0")
+            .await
+            .expect("udp probe");
+        let port = probe.local_addr().unwrap().port();
+        drop(probe);
+        let config = config_with_nw_udp(port, Vec::new());
+        let manager = create_manager(config);
+        let steering = attach_steering(&manager);
+        let failures = manager.reconcile().await;
+        if failures.is_empty()
+            && manager
+                .wait_until_started(Duration::from_secs(5))
+                .await
+                .is_ok()
+        {
+            started = Some((manager, steering));
+            break;
+        }
+        last_failures = failures;
+        manager.shutdown_all().await;
+    }
+    let (manager, steering) = started.unwrap_or_else(|| {
+        panic!("headless NodeWaypoint UDP listener did not start: {last_failures:?}")
+    });
+
+    assert!(
+        steering.serving(),
+        "a successfully bound headless listener must activate the relay sender proof"
+    );
+    assert!(
+        steering.bound_destinations().is_empty(),
+        "a headless listener publishes no ClusterIP steering destinations"
+    );
+
+    manager.shutdown_all().await;
+    assert!(
+        !steering.serving() && steering.bound_destinations().is_empty(),
+        "shutdown must withdraw serving state, not leave an active-empty generation behind"
     );
 }
 
