@@ -1875,11 +1875,12 @@ therefore lists the job's admitted texts oldest first:
     decision — while `RUSTFLAGS: ""` stays, because the root Cargo
     configuration still selects a mold linker this lane does not install;
   - the sccache directory is persisted by the pinned `Swatinem/rust-cache` step
-    under `save-if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}`.
-    GitHub already scopes a pull request's cache writes to its own ref; writing
-    nothing at all from an untrusted ref is the stronger statement, and it keeps
-    every compiler artifact the sanitizer build restores attributable to code
-    that already merged;
+    under `save-if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}`
+    and nothing else. That predicate is the cache-quota control: `pull_request`
+    (same-repository PR refs and forks), `merge_group`, and `workflow_dispatch`
+    may restore a `fuzz-smoke` cache but cannot publish one. The retired
+    generation had no `save-if`, so a full-mode predecessor PR could still mint
+    a PR-ref `fuzz-smoke` entry; the adopted job cannot create another;
   - telemetry: the job prints `Fuzz property smoke seconds`, `Fuzz sanitizer
     lane seconds`, sccache statistics before and after the sanitizer build, the
     lane shape it took, and the on-disk cache size — so a hosted log shows

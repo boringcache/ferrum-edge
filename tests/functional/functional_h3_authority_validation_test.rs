@@ -307,20 +307,23 @@ async fn functional_h3_host_authority_mismatch_rejected_before_backend() {
         start_counting_http_backend_on(backend_listener, Arc::clone(&backend_accepts));
     sleep(Duration::from_millis(150)).await;
 
-    let https_reservation = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let https_port = https_reservation.local_addr().unwrap().port();
-    drop(https_reservation);
-
+    // The HTTPS port must participate in the harness's per-attempt fresh-port
+    // contract: a bind-drop reservation taken here would stay fixed across all
+    // spawn retries, so one parallel test stealing it fails every attempt
+    // (observed as 3/3 "exited with exit status: 1 before proving ownership").
     let mut gateway = TestGateway::builder()
         .mode_file(build_config(backend_port))
         .log_level("warn")
         .env("FERRUM_ENABLE_HTTP3", "true")
-        .env("FERRUM_PROXY_HTTPS_PORT", https_port.to_string())
+        .env_ephemeral_port("FERRUM_PROXY_HTTPS_PORT")
         .env("FERRUM_FRONTEND_TLS_CERT_PATH", "tests/certs/server.crt")
         .env("FERRUM_FRONTEND_TLS_KEY_PATH", "tests/certs/server.key")
         .spawn()
         .await
         .expect("start gateway with h3");
+    let https_port = gateway
+        .env_port("FERRUM_PROXY_HTTPS_PORT")
+        .expect("harness-allocated HTTPS port");
 
     sleep(Duration::from_millis(250)).await;
     backend_accepts.store(0, Ordering::Relaxed);
