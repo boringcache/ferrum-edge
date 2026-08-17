@@ -267,12 +267,20 @@ pub(super) fn finalize(acc: &mut K8sAccumulator) -> Result<(), K8sTranslateError
 
 /// True when the Service declares the Kubernetes headless sentinel.
 fn service_spec_is_headless(spec: &Value) -> bool {
-    if string_field(spec, "clusterIP").is_some_and(|ip| ip == "None") {
-        return true;
+    let cluster_ips = spec.get("clusterIPs").and_then(Value::as_array);
+    let plural_is_headless = cluster_ips
+        .is_some_and(|ips| matches!(ips.as_slice(), [only] if only.as_str() == Some("None")));
+
+    match string_field(spec, "clusterIP") {
+        // Canonical objects carry both fields. If the plural field is present,
+        // require its exact singleton sentinel too; a mixed sentinel/VIP list
+        // is malformed and must keep the safer Service-port fallback.
+        Some("None") => cluster_ips.is_none() || plural_is_headless,
+        Some(_) => false,
+        // Accept the equivalent plural-only shape used by older fixtures, but
+        // only when it is the exact singleton sentinel.
+        None => plural_is_headless,
     }
-    spec.get("clusterIPs")
-        .and_then(Value::as_array)
-        .is_some_and(|ips| ips.iter().any(|ip| ip.as_str() == Some("None")))
 }
 
 fn collect_service(acc: &mut K8sAccumulator, object: &K8sObject) -> Result<(), K8sTranslateError> {

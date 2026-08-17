@@ -263,6 +263,36 @@ fn headless_cluster_ips_none_sentinel_dials_target_port() {
 }
 
 #[test]
+fn conflicting_headless_sentinel_and_vip_keeps_service_port() {
+    let result = translate_k8s_objects(
+        &[
+            service(
+                "conflicting-cluster-ips",
+                json!({
+                    "clusterIPs": ["None", "10.96.44.110"],
+                    "ports": [{
+                        "name": "first-port",
+                        "protocol": "TCP",
+                        "port": 8080,
+                        "targetPort": 3000
+                    }]
+                }),
+            ),
+            empty_manual_slice("conflicting-cluster-ips"),
+            http_route("/conflicting-cluster-ips", "conflicting-cluster-ips"),
+        ],
+        options(),
+    )
+    .expect("malformed mixed clusterIPs should translate conservatively");
+
+    assert_eq!(result.config.proxies.len(), 1);
+    assert_eq!(
+        result.config.proxies[0].backend_port, 8080,
+        "a mixed headless sentinel and real VIP must not select targetPort"
+    );
+}
+
+#[test]
 fn headless_named_target_port_resolves_from_empty_slice_ports() {
     let mut slice = empty_manual_slice("headless-named");
     slice.spec["ports"] = json!([{
