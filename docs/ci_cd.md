@@ -401,7 +401,9 @@ rust-cache / the FIPS producer archive. Production-image cache restore and save 
 pinned `actions/cache/*` actions; PR-controlled `run:` steps only measure the
 restored directory and move the BuildKit local export. Workflows stay
 `permissions: contents: read`. Static checks live in
-`.github/scripts/verify_ci_runtime_cache.py`.
+`.github/scripts/verify_ci_runtime_cache.py` and fail closed on any
+occurrence of the exact `exportVariable` token in checked workflow and
+action text.
 
 `node-waypoint-ebpf-live.yml` path-filtered `pull_request.paths` must be a
 **trigger superset** of every `production-dockerfile-smoke` sensitive input in

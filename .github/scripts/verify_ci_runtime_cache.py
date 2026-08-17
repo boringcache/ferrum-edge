@@ -83,13 +83,9 @@ FIPS_PRODUCER_PATHS = (
     "${{ github.workspace }}/.cache/sccache",
 )
 SCCACHE_EXPORTERS = ("mozilla-actions/sccache-action",)
-SCCACHE_EXPORT_VARIABLE_CALL = re.compile(
-    r"""core\.exportVariable
-        (?:(?:\s+)|//[^\r\n]*(?:\r?\n|$)|/\*.*?\*/)*
-        (?:\(|\.\s*(?:call|apply|bind)\s*\()
-    """,
-    re.DOTALL | re.VERBOSE,
-)
+# Fail closed on the exact toolkit identifier. Call-grammar matching misses
+# bracket access, optional chaining, aliases, and comma-operator forms.
+SCCACHE_EXPORT_VARIABLE_TOKEN = "exportVariable"
 SCCACHE_PINNED_VERSION = "0.17.0"
 SCCACHE_RELEASE_DOWNLOAD = "https://github.com/mozilla/sccache/releases/download/"
 CREDENTIAL_ASSERT_VARS = (
@@ -771,13 +767,12 @@ def check_no_sccache_credential_exporter(
             failures,
         )
     require(
-        # Invocation-shaped match: `setup-sccache/action.yml` is whole-file
-        # digest-frozen under the Cross policy, and its description prose
-        # legitimately names the `core.exportVariable` API while documenting
-        # that no installer calling it is invoked. Only an actual call site
-        # (always followed by an argument list) is a credential leak.
-        SCCACHE_EXPORT_VARIABLE_CALL.search(text) is None,
-        f"{source} must not call core.exportVariable (ACTIONS_RUNTIME_TOKEN leak)",
+        # Whole-file trusted policy still applies to setup-sccache. Deny the
+        # exact case-sensitive token in every checked workflow/action text so
+        # JS invocation grammar cannot evade the credential-export ban.
+        SCCACHE_EXPORT_VARIABLE_TOKEN not in text,
+        f"{source} must not contain {SCCACHE_EXPORT_VARIABLE_TOKEN} "
+        "(ACTIONS_RUNTIME_TOKEN leak)",
         failures,
     )
 
@@ -3312,36 +3307,43 @@ def self_test() -> int:
         failures,
     )
 
-    export_variable_calls = (
+    export_variable_bypass_shapes = (
         "core.exportVariable('ACTIONS_RUNTIME_TOKEN', token)",
         "core.exportVariable ('ACTIONS_RUNTIME_TOKEN', token)",
         "core.exportVariable\n('ACTIONS_RUNTIME_TOKEN', token)",
         "core.exportVariable/* indirect */('ACTIONS_RUNTIME_TOKEN', token)",
+        'core["exportVariable"](\'ACTIONS_RUNTIME_TOKEN\', token)',
+        "core?.exportVariable('ACTIONS_RUNTIME_TOKEN', token)",
         "core.exportVariable.call(core, 'ACTIONS_RUNTIME_TOKEN', token)",
+        "core.exportVariable.apply(core, ['ACTIONS_RUNTIME_TOKEN', token])",
+        "core.exportVariable.bind(core)('ACTIONS_RUNTIME_TOKEN', token)",
+        "const leak = core.exportVariable; leak('ACTIONS_RUNTIME_TOKEN', token)",
+        "const { exportVariable } = core; exportVariable('ACTIONS_RUNTIME_TOKEN', token)",
+        "(0, core.exportVariable)('ACTIONS_RUNTIME_TOKEN', token)",
     )
-    for index, call in enumerate(export_variable_calls):
-        call_failures: list[str] = []
+    for index, sample in enumerate(export_variable_bypass_shapes):
+        sample_failures: list[str] = []
         check_no_sccache_credential_exporter(
-            call,
-            f"self-test-export-variable-call-{index}",
-            call_failures,
+            sample,
+            f"self-test-export-variable-token-{index}",
+            sample_failures,
         )
         require(
-            any("must not call core.exportVariable" in item for item in call_failures),
-            f"self-test: exportVariable invocation must fail: {call!r}",
+            any("must not contain exportVariable" in item for item in sample_failures),
+            f"self-test: exportVariable token must fail: {sample!r}",
             failures,
         )
 
-    export_variable_prose_failures: list[str] = []
+    export_variable_control_failures: list[str] = []
     check_no_sccache_credential_exporter(
-        "No installer calling the `core.exportVariable` API is invoked.",
-        "self-test-export-variable-prose",
-        export_variable_prose_failures,
+        "This action does not persist cache-service credentials into GITHUB_ENV.",
+        "self-test-export-variable-control",
+        export_variable_control_failures,
     )
     require(
-        not export_variable_prose_failures,
-        "self-test: exportVariable prose must pass: "
-        + "; ".join(export_variable_prose_failures),
+        not export_variable_control_failures,
+        "self-test: credential-isolation prose without the token must pass: "
+        + "; ".join(export_variable_control_failures),
         failures,
     )
 
