@@ -11,9 +11,12 @@
 //!
 //! Every registry mutation is serialized cross-process by two admission leases
 //! taken in a total order — the global [`NAMESPACE_REGISTRY_ADMISSION_KEY`]
-//! first, then the affected namespace names in ascending order — and is
-//! committed by the backend in a single transaction that re-verifies those
-//! leases against the datastore's own clock immediately before commit.
+//! first, then the affected namespace names in ascending order. Each backend
+//! requires that exact canonical key sequence before mutating anything; an
+//! empty, incomplete, duplicated, reordered, or substituted set is a lost
+//! lease ([`BatchAdmissionLeaseLost`]) with nothing applied. The committing
+//! transaction then re-verifies each held lease's owner and generation against
+//! the datastore's own clock.
 //!
 //! The last-remaining-namespace invariant is **registry-row** based: every
 //! registry-row removal takes that global lease, so two deletes cannot empty
@@ -29,7 +32,7 @@ use std::sync::{Mutex, MutexGuard, OnceLock};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Deserializer, Serialize};
 
-use crate::config::batch_atomicity::BatchAdmissionLeaseLost;
+use crate::config::batch_atomicity::{BatchAdmissionLeaseLost, NamespaceAdmissionLeaseHold};
 use crate::config::types::validate_namespace;
 
 /// Maximum length for an optional namespace description, in Unicode scalar
@@ -391,6 +394,57 @@ pub fn is_namespace_registry_corrupt(error: &anyhow::Error) -> Option<&Namespace
     error
         .chain()
         .find_map(|cause| cause.downcast_ref::<NamespaceRegistryCorrupt>())
+}
+
+/// Canonical admission-key sequence for a namespace-registry mutation.
+///
+/// The global [`NAMESPACE_REGISTRY_ADMISSION_KEY`] is always first, followed
+/// by the affected tenant names sorted and de-duplicated — the same sequence
+/// the registry admission helper acquires.
+/// Create and delete pass one tenant name; a description-only update
+/// de-duplicates source and target; a rename passes both names.
+pub fn namespace_registry_admission_keys(names: &[&str]) -> Vec<String> {
+    let mut keys = vec![NAMESPACE_REGISTRY_ADMISSION_KEY.to_string()];
+    let mut sorted: Vec<&str> = names.to_vec();
+    sorted.sort_unstable();
+    sorted.dedup();
+    keys.extend(sorted.into_iter().map(str::to_string));
+    keys
+}
+
+/// Fail closed unless `supplied_keys` is exactly
+/// [`namespace_registry_admission_keys`] for `names`.
+///
+/// Empty, missing, extra, duplicated, reordered, or wrong-key slices cannot
+/// fence a registry mutation. The error is the static
+/// [`BatchAdmissionLeaseLost`] message and never echoes supplied keys,
+/// owners, or generations.
+pub fn require_namespace_registry_admission_keys(
+    names: &[&str],
+    supplied_keys: &[&str],
+) -> Result<(), BatchAdmissionLeaseLost> {
+    let expected = namespace_registry_admission_keys(names);
+    if supplied_keys.len() != expected.len()
+        || supplied_keys
+            .iter()
+            .zip(expected.iter())
+            .any(|(got, want)| *got != want.as_str())
+    {
+        return Err(BatchAdmissionLeaseLost);
+    }
+    Ok(())
+}
+
+/// Fail closed unless `leases` carries exactly the canonical key sequence for
+/// `names`. Owner and generation validity is re-checked inside the committing
+/// transaction against datastore time; this gate only proves the *set* is the
+/// one the admission helper produced.
+pub fn require_namespace_registry_admission_leases(
+    names: &[&str],
+    leases: &[NamespaceAdmissionLeaseHold<'_>],
+) -> Result<(), BatchAdmissionLeaseLost> {
+    let supplied: Vec<&str> = leases.iter().map(|hold| hold.key).collect();
+    require_namespace_registry_admission_keys(names, &supplied)
 }
 
 /// Sorted, de-duplicated namespace names whose mTLS DNS admission fences a

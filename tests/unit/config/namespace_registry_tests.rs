@@ -1,12 +1,18 @@
 //! Unit coverage for the first-class namespace registry helpers (issue #3955).
 
+use ferrum_edge::config::batch_atomicity::{
+    BATCH_ADMISSION_LEASE_LOST_MESSAGE, BatchAdmissionLeaseLost, NamespaceAdmissionLeaseHold,
+    NamespaceConfigAdmissionLeaseRef,
+};
 use ferrum_edge::config::namespace_registry::{
     CreateNamespaceRequest, MAX_NAMESPACE_DESCRIPTION_CHARS, NAMESPACE_OCCUPANCY_TABLES,
     NAMESPACE_REGISTRY_ADMISSION_KEY, NAMESPACE_RENAME_SIMPLE_TABLES, NamespaceRegistryCorrupt,
     UpdateNamespaceBody, mtls_dns_admission_namespaces, namespace_prefixed_id_suffix_field,
-    normalize_description, parse_namespace_rfc3339, require_canonical_stored_description,
-    require_namespace_identity, require_namespace_keyed_embedded_namespace,
-    require_namespace_prefixed_identity, validate_namespace_name,
+    namespace_registry_admission_keys, normalize_description, parse_namespace_rfc3339,
+    require_canonical_stored_description, require_namespace_identity,
+    require_namespace_keyed_embedded_namespace, require_namespace_prefixed_identity,
+    require_namespace_registry_admission_keys, require_namespace_registry_admission_leases,
+    validate_namespace_name,
 };
 
 #[test]
@@ -418,4 +424,198 @@ fn namespace_rename_simple_tables_cover_live_resources_and_exclude_audit_history
     // excludes audit history so leftover events cannot block DELETE.
     assert!(NAMESPACE_OCCUPANCY_TABLES.contains(&"api_specs"));
     assert!(!NAMESPACE_OCCUPANCY_TABLES.contains(&"audit_events"));
+}
+
+fn admission_hold(key: &str) -> NamespaceAdmissionLeaseHold<'_> {
+    NamespaceAdmissionLeaseHold {
+        key,
+        lease: NamespaceConfigAdmissionLeaseRef {
+            owner: "secret-owner",
+            generation: 9,
+        },
+    }
+}
+
+fn assert_lease_set_lost(result: Result<(), BatchAdmissionLeaseLost>, leaked: &[&str]) {
+    let err = result.expect_err("malformed lease set must fail closed");
+    let text = err.to_string();
+    assert_eq!(text, BATCH_ADMISSION_LEASE_LOST_MESSAGE);
+    for value in leaked {
+        assert!(
+            !text.contains(value),
+            "malformed lease-set errors must not leak {value}: {text}"
+        );
+    }
+}
+
+#[test]
+fn namespace_registry_admission_keys_match_create_update_rename_delete() {
+    assert_eq!(
+        namespace_registry_admission_keys(&["tenant"]),
+        vec![
+            NAMESPACE_REGISTRY_ADMISSION_KEY.to_string(),
+            "tenant".to_string()
+        ]
+    );
+    assert_eq!(
+        namespace_registry_admission_keys(&["leased"]),
+        vec![
+            NAMESPACE_REGISTRY_ADMISSION_KEY.to_string(),
+            "leased".to_string()
+        ],
+        "delete uses the same one-tenant sequence as create"
+    );
+    assert_eq!(
+        namespace_registry_admission_keys(&["staging", "staging"]),
+        vec![
+            NAMESPACE_REGISTRY_ADMISSION_KEY.to_string(),
+            "staging".to_string()
+        ],
+        "description-only update de-duplicates source and target"
+    );
+    assert_eq!(
+        namespace_registry_admission_keys(&["zeta", "alpha"]),
+        vec![
+            NAMESPACE_REGISTRY_ADMISSION_KEY.to_string(),
+            "alpha".to_string(),
+            "zeta".to_string()
+        ]
+    );
+    assert_eq!(
+        namespace_registry_admission_keys(&["alpha", "zeta"]),
+        vec![
+            NAMESPACE_REGISTRY_ADMISSION_KEY.to_string(),
+            "alpha".to_string(),
+            "zeta".to_string()
+        ]
+    );
+}
+
+#[test]
+fn require_namespace_registry_admission_keys_accepts_canonical_sets() {
+    assert!(
+        require_namespace_registry_admission_keys(
+            &["tenant"],
+            &[NAMESPACE_REGISTRY_ADMISSION_KEY, "tenant"]
+        )
+        .is_ok()
+    );
+    assert!(
+        require_namespace_registry_admission_keys(
+            &["staging", "staging"],
+            &[NAMESPACE_REGISTRY_ADMISSION_KEY, "staging"]
+        )
+        .is_ok()
+    );
+    assert!(
+        require_namespace_registry_admission_keys(
+            &["zeta", "alpha"],
+            &[NAMESPACE_REGISTRY_ADMISSION_KEY, "alpha", "zeta"]
+        )
+        .is_ok()
+    );
+    assert!(
+        require_namespace_registry_admission_leases(
+            &["tenant"],
+            &[
+                admission_hold(NAMESPACE_REGISTRY_ADMISSION_KEY),
+                admission_hold("tenant"),
+            ]
+        )
+        .is_ok()
+    );
+    assert!(
+        require_namespace_registry_admission_leases(
+            &["zeta", "alpha"],
+            &[
+                admission_hold(NAMESPACE_REGISTRY_ADMISSION_KEY),
+                admission_hold("alpha"),
+                admission_hold("zeta"),
+            ]
+        )
+        .is_ok()
+    );
+}
+
+#[test]
+fn require_namespace_registry_admission_keys_rejects_incomplete_and_substituted_sets() {
+    let leaked = &[
+        "secret-ns",
+        "other-ns",
+        "secret-owner",
+        "!namespace-registry",
+        "9",
+    ];
+
+    assert_lease_set_lost(
+        require_namespace_registry_admission_keys(&["secret-ns"], &[]),
+        leaked,
+    );
+    assert_lease_set_lost(
+        require_namespace_registry_admission_keys(
+            &["secret-ns"],
+            &[NAMESPACE_REGISTRY_ADMISSION_KEY],
+        ),
+        leaked,
+    );
+    assert_lease_set_lost(
+        require_namespace_registry_admission_keys(&["secret-ns"], &["secret-ns"]),
+        leaked,
+    );
+    assert_lease_set_lost(
+        require_namespace_registry_admission_keys(
+            &["secret-ns"],
+            &[NAMESPACE_REGISTRY_ADMISSION_KEY, "secret-ns", "other-ns"],
+        ),
+        leaked,
+    );
+    assert_lease_set_lost(
+        require_namespace_registry_admission_keys(
+            &["secret-ns"],
+            &[
+                NAMESPACE_REGISTRY_ADMISSION_KEY,
+                "secret-ns",
+                "secret-ns",
+            ],
+        ),
+        leaked,
+    );
+    assert_lease_set_lost(
+        require_namespace_registry_admission_keys(
+            &["secret-ns"],
+            &["secret-ns", NAMESPACE_REGISTRY_ADMISSION_KEY],
+        ),
+        leaked,
+    );
+    assert_lease_set_lost(
+        require_namespace_registry_admission_keys(
+            &["zeta", "alpha"],
+            &[NAMESPACE_REGISTRY_ADMISSION_KEY, "zeta", "alpha"],
+        ),
+        leaked,
+    );
+    assert_lease_set_lost(
+        require_namespace_registry_admission_keys(
+            &["secret-ns"],
+            &[NAMESPACE_REGISTRY_ADMISSION_KEY, "other-ns"],
+        ),
+        leaked,
+    );
+    assert_lease_set_lost(
+        require_namespace_registry_admission_leases(
+            &["secret-ns"],
+            &[admission_hold(NAMESPACE_REGISTRY_ADMISSION_KEY)],
+        ),
+        leaked,
+    );
+    assert_lease_set_lost(
+        require_namespace_registry_admission_leases(
+            &["secret-ns"],
+            &[
+                admission_hold("secret-ns"),
+                admission_hold(NAMESPACE_REGISTRY_ADMISSION_KEY),
+            ],
+        ),
+        leaked,
+    );
 }

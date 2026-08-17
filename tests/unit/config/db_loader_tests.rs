@@ -3445,3 +3445,57 @@ fn sql_namespace_list_fails_closed_on_corrupt_registry_rows() {
         );
     }
 }
+
+#[test]
+fn sql_namespace_registry_mutations_require_canonical_lease_set_before_begin() {
+    let source = include_str!("../../../src/config/db_loader.rs");
+    for (marker, names) in [
+        (
+            "pub async fn create_namespace(",
+            "require_namespace_registry_admission_leases(&[&record.name], leases)",
+        ),
+        (
+            "pub async fn update_namespace(",
+            "require_namespace_registry_admission_leases(&[current_name, new_name], leases)",
+        ),
+        (
+            "pub async fn delete_namespace(",
+            "require_namespace_registry_admission_leases(&[name], leases)",
+        ),
+    ] {
+        let start = source.find(marker).expect(marker);
+        let body = source[start..]
+            .split("\n    pub async fn ")
+            .next()
+            .unwrap_or(&source[start..]);
+        let require_at = body
+            .find("require_namespace_registry_admission_leases")
+            .unwrap_or_else(|| panic!("{marker} must validate the canonical lease set:\n{body}"));
+        let begin_at = body
+            .find("pool().begin()")
+            .unwrap_or_else(|| panic!("{marker} must open a transaction:\n{body}"));
+        assert!(
+            body.contains(names),
+            "{marker} must require the canonical names {names}:\n{body}"
+        );
+        assert!(
+            require_at < begin_at,
+            "{marker} must reject a substituted lease set before opening a transaction:\n{body}"
+        );
+        assert!(
+            body.contains("verify_namespace_registry_leases_tx"),
+            "{marker} must still re-verify owner/generation inside the transaction:\n{body}"
+        );
+    }
+
+    let verify = source
+        [source.find("async fn verify_namespace_registry_leases_tx(").expect("verify helper")..]
+        .split("\n    pub async fn create_namespace(")
+        .next()
+        .expect("verify body");
+    assert!(
+        verify.contains("require_namespace_registry_admission_leases(names, leases)")
+            && verify.contains("verify_namespace_config_admission_lease_tx"),
+        "commit-boundary verification must re-check the canonical key set then owner/generation:\n{verify}"
+    );
+}

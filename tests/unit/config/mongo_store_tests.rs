@@ -1707,3 +1707,183 @@ fn document_to_namespace_record_is_strict_and_does_not_synthesize() {
         "missing timestamps/names must not be fabricated and stored descriptions must not be normalized:\n{body}"
     );
 }
+
+#[test]
+fn mongo_namespace_registry_mutations_require_canonical_lease_set_before_session() {
+    for (entry, names_needle) in [
+        ("create_namespace(", "&[record.name.as_str()]"),
+        ("update_namespace(", "&[current_name, new_name]"),
+        ("delete_namespace(", "owned_namespace_registry_leases_for_names(&[name], leases)"),
+    ] {
+        let body = mongo_method(entry);
+        assert!(
+            body.contains("owned_namespace_registry_leases_for_names"),
+            "{entry} must validate the canonical lease set at the backend boundary:\n{body}"
+        );
+        assert!(
+            body.contains(names_needle),
+            "{entry} must pass the canonical names {names_needle}:\n{body}"
+        );
+        let require_at = body
+            .find("owned_namespace_registry_leases_for_names")
+            .expect("lease-set gate");
+        let session_at = body.find("start_session()").expect("start_session");
+        assert!(
+            require_at < session_at,
+            "{entry} must reject a substituted lease set before opening a session:\n{body}"
+        );
+    }
+
+    let owned = mongo_fn_body("        fn owned_namespace_registry_leases_for_names(");
+    assert!(
+        owned.contains("require_namespace_registry_admission_leases(names, leases)")
+            && owned.contains("map_err(anyhow::Error::new)"),
+        "owned lease copy must fail closed as BatchAdmissionLeaseLost without echoing keys:\n{owned}"
+    );
+
+    let verify = mongo_method("verify_namespace_registry_leases_in_session(");
+    assert!(
+        verify.contains("require_namespace_registry_admission_keys(names, &supplied)")
+            && verify.contains("NamespaceRegistryAbort::AdmissionLeaseLost")
+            && verify.contains("verify_namespace_config_admission_lease_in_session"),
+        "in-session verify must re-check the canonical key set then owner/generation:\n{verify}"
+    );
+}
+
+#[test]
+fn mongo_namespace_occupancy_scans_split_durable_identities() {
+    let occupancy = mongo_method("namespace_has_resources_in_session(");
+    assert!(
+        occupancy.contains("collection_has_namespace_occupancy_in_session")
+            && occupancy.contains("\"consumer_identity_index\""),
+        "occupancy must inspect split-identity collections, including the identity index:\n{occupancy}"
+    );
+    assert!(
+        !occupancy.contains("doc! { \"namespace\": name }"),
+        "occupancy must not look only at the embedded namespace field:\n{occupancy}"
+    );
+
+    let filter = mongo_fn_body("        fn namespace_occupancy_filter(");
+    assert!(
+        filter.contains("\"consumers\"")
+            && filter.contains("\"consumer_identity_index\"")
+            && filter.contains("namespace_identity_scan_filter(namespace)")
+            && filter.contains("\"gateway_trust_bundles\"")
+            && filter.contains("namespace_keyed_identity_scan_filter(namespace)"),
+        "occupancy filters must union embedded and key identities for split collections:\n{filter}"
+    );
+
+    let keyed = mongo_fn_body("        fn namespace_keyed_identity_scan_filter(");
+    assert!(
+        keyed.contains("\"$or\"")
+            && keyed.contains("\"namespace\": namespace")
+            && keyed.contains("\"_id\": namespace")
+            && !keyed.contains("namespace_id_prefix_filter"),
+        "trust-bundle occupancy must use the exact `_id = namespace` key, not a prefix:\n{keyed}"
+    );
+
+    let in_use = mongo_method("namespace_name_in_use(");
+    assert!(
+        in_use.contains("namespace_has_resources(name)")
+            || in_use.contains("namespace_occupancy_filter"),
+        "unconfirmed delete must not treat a key-only split identity as absent:\n{in_use}"
+    );
+}
+
+#[test]
+fn mongo_namespace_cascade_validates_split_identities_before_delete() {
+    let delete_ns = mongo_method("delete_namespace_in_session(");
+    let trust_validate_at = delete_ns
+        .find("collect_validated_namespace_keyed_docs_in_session")
+        .expect("trust-bundle validation before cascade");
+    let resources_at = delete_ns
+        .find("delete_all_namespace_resources_in_session")
+        .expect("resource cascade");
+    assert!(
+        trust_validate_at < resources_at,
+        "a split trust-bundle identity must abort before any resource delete:\n{delete_ns}"
+    );
+
+    let cascade = mongo_method("delete_all_namespace_resources_in_session(");
+    let consumers_at = cascade
+        .find("collect_validated_namespace_prefixed_docs_in_session")
+        .expect("consumer validation");
+    let first_delete = cascade.find("delete_many").expect("delete_many");
+    assert!(
+        consumers_at < first_delete,
+        "split consumer identities must be validated before deleting anything:\n{cascade}"
+    );
+    assert!(
+        cascade.contains("\"consumers\"")
+            && cascade.contains("\"consumer_identity_index\"")
+            && cascade.contains("delete_validated_namespace_ids_in_session"),
+        "cascade must delete only validated consumer and identity-index `_id`s:\n{cascade}"
+    );
+    assert!(
+        !cascade.contains("self.consumers()")
+            && !cascade.contains("self.consumer_identity_index()"),
+        "cascade must not broad-delete consumers by embedded namespace:\n{cascade}"
+    );
+
+    let prefixed = mongo_method("collect_validated_namespace_prefixed_docs_in_session(");
+    assert!(
+        prefixed.contains("namespace_identity_scan_filter(namespace)")
+            && prefixed.contains("require_namespace_prefixed_identity(")
+            && prefixed.contains("document.get_str(\"namespace\").ok()")
+            && prefixed.contains("NamespaceRegistryCorrupt::field"),
+        "prefixed collect must scan both identity surfaces and fail closed on mismatch:\n{prefixed}"
+    );
+    assert!(
+        !prefixed.contains("delete_one") && !prefixed.contains("delete_many"),
+        "validation collect must not delete:\n{prefixed}"
+    );
+
+    let keyed = mongo_method("collect_validated_namespace_keyed_docs_in_session(");
+    assert!(
+        keyed.contains("namespace_keyed_identity_scan_filter(namespace)")
+            && keyed.contains("require_namespace_keyed_embedded_namespace(")
+            && keyed.contains("old_id != namespace")
+            && keyed.contains("NamespaceRegistryCorrupt::field(\"identity\")")
+            && keyed.contains("NamespaceRegistryCorrupt::field(\"id\")"),
+        "keyed collect must require `_id` and embedded namespace to match the current tenant:\n{keyed}"
+    );
+    assert!(
+        !keyed.contains("delete_one") && !keyed.contains("delete_many"),
+        "keyed validation collect must not delete:\n{keyed}"
+    );
+
+    let delete_ids = mongo_method("delete_validated_namespace_ids_in_session(");
+    assert!(
+        delete_ids.contains("\"$in\"") && delete_ids.contains("ids.to_vec()"),
+        "deletes must target already-validated `_id`s only:\n{delete_ids}"
+    );
+    assert!(
+        !delete_ids.contains("\"namespace\""),
+        "validated-id deletes must not use a broad embedded-namespace filter:\n{delete_ids}"
+    );
+
+    let trust_delete = mongo_method("delete_namespace_trust_bundle_in_session(");
+    assert!(
+        trust_delete.contains("collect_validated_namespace_keyed_docs_in_session")
+            && trust_delete.contains("delete_validated_namespace_ids_in_session")
+            && trust_delete.contains("\"gateway_trust_bundles\""),
+        "trust-bundle cascade must delete only validated `_id`s:\n{trust_delete}"
+    );
+    assert!(
+        !trust_delete.contains("delete_many(doc! { \"namespace\": namespace })"),
+        "trust-bundle cascade must not broad-delete by embedded namespace:\n{trust_delete}"
+    );
+
+    let tx_error = mongo_fn_body("        fn namespace_registry_transaction_error(");
+    assert!(
+        tx_error.contains("get_custom::<NamespaceRegistryCorrupt>()"),
+        "split-identity corruption must abort the transaction as typed NamespaceRegistryCorrupt:\n{tx_error}"
+    );
+
+    let guards = mongo_method("delete_namespace_guard_docs_in_session(");
+    assert!(
+        guards.contains("namespace_id_prefix_filter(namespace)")
+            && guards.contains("proxy_route_locks()"),
+        "proxy_route_locks must remain escaped-prefix cleanup:\n{guards}"
+    );
+}

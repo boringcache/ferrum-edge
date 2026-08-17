@@ -692,12 +692,7 @@ pub(crate) async fn lock_namespace_registry_admission(
     db: Arc<dyn DatabaseBackend>,
     names: &[&str],
 ) -> Result<NamespaceRegistryAdmission, anyhow::Error> {
-    let mut keys: Vec<String> =
-        vec![crate::config::namespace_registry::NAMESPACE_REGISTRY_ADMISSION_KEY.to_string()];
-    let mut sorted: Vec<&str> = names.to_vec();
-    sorted.sort_unstable();
-    sorted.dedup();
-    keys.extend(sorted.into_iter().map(str::to_string));
+    let keys = crate::config::namespace_registry::namespace_registry_admission_keys(names);
 
     // One deduplicated, ascending-shard acquisition for the whole key set: the
     // per-key helper would self-deadlock the moment two keys hash to the same
