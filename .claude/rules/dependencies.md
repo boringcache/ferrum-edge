@@ -119,6 +119,15 @@ Full policy: `docs/dependency-policy.md`. These are the load-bearing rules.
   direct #3889→#3911 pair is superseded; #3911 must rebase to the combined
   text. Each step is exact, path-bound, one-way, no candidate allowlist. See
   `docs/ci_cd.md` → "Admitted CI job SHA-256 generation transitions".
+- Non-protected workflows get the same mechanism through
+  `WORKFLOW_DIRECTORY_JOB_GENERATION_TRANSITIONS`, keyed by workflow filename
+  AND job name: `coverage.yml`'s `coverage-merge` carries a pair for PR
+  #3917's shard-scoped coverage-merge reshape (issue #3907; adopted digest
+  pinned against #3917's latest-main merge). On the exact admitted pair only
+  that job's `job:<name>:*` surfaces are withheld; everything else in the file
+  is scanned as before, and the reverse pair is refused. Retire each tuple
+  once its destination is on `main`. See `docs/ci_cd.md` → "Admitted
+  workflow-directory job SHA-256 generation transitions".
 
 ## Drift Guard
 
