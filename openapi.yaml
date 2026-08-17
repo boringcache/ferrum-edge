@@ -69,7 +69,10 @@ info:
     transaction, so nothing partial can become durable. `GET /namespaces`
     remains the backward-compatible union of registry names and derived
     resource names; ordinary resource writes isolate data but do not insert
-    registry rows. Standalone MongoDB has
+    registry rows. Historical audit rows are never renamed or deleted, so a
+    namespace name is a durable audit identity: reusing a deleted or renamed
+    name resumes its prior `GET /audit` history for callers authorized for that
+    name. Assign unrelated tenants fresh, previously unused names. Standalone MongoDB has
     no multi-document transactions and therefore refuses these three operations
     with `501` before mutating anything; `GET` remains available.
 
@@ -5778,8 +5781,10 @@ paths:
         the committing transaction, so a lost lease aborts with nothing applied
         (`503`). Historical `audit_events` rows are immutable evidence and are
         not rewritten: they retain the namespace identity recorded when the
-        event occurred. The rename itself may emit a new audit event under the
-        new name with a before/after diff. Rename also holds both the source
+        event occurred. Reusing the old name resumes that same `GET /audit`
+        history for callers authorized for the reused name; an unrelated tenant
+        must receive a fresh, previously unused name. The rename itself may emit
+        a new audit event under the new name with a before/after diff. Rename also holds both the source
         and target mTLS DNS admission fences (sorted, de-duplicated) and fails
         closed if either has a restore owner; a description-only update holds
         the current name's fence. A namespace that exists only because a
@@ -5849,6 +5854,11 @@ paths:
         deliberately RETAINED (together with the namespace's change-log
         retention floor) so a gateway still polling the deleted namespace
         converges instead of serving stale configuration.
+
+        Historical audit rows are not deleted. Reusing this namespace name
+        resumes its prior `GET /audit` history for callers authorized for the
+        reused name; an unrelated tenant must receive a fresh, previously unused
+        name.
 
         The namespace this gateway is configured to serve (`FERRUM_NAMESPACE`,
         default `ferrum`) cannot be deleted, and the last remaining **registry

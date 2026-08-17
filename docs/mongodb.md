@@ -344,7 +344,10 @@ corruption if those identities disagree, so a key-only or mismatched document
 cannot be ignored or deleted under the wrong tenant. Historical `audit_events`
 documents are immutable evidence and are **not**
 bulk-rewritten on rename: they retain the namespace recorded when the event
-occurred. Last-remaining protection is a remaining **registry document**, not
+occurred. A namespace name is therefore a durable audit identity: reusing a
+deleted or renamed name resumes that same history for callers authorized for
+the reused name, so an unrelated tenant must receive a fresh, previously unused
+name. Last-remaining protection is a remaining **registry document**, not
 the GET union of derived resource names: ordinary resource CRUD is not
 serialized by the global registry lease and does not insert registry documents.
 Neither guarantee is available on a standalone `mongod`, so all three write

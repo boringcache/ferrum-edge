@@ -425,7 +425,7 @@ Create, rename, and delete are serialized across gateway processes by a **global
 Every precondition that can race is evaluated inside that transaction, not by an earlier query: source existence, target vacancy, occupancy, protection of the configured namespace, and the last-remaining-namespace invariant. Handler prechecks exist only to produce better messages.
 
 - Rename rewrites the registry row, every live resource `namespace` column (proxies, consumers, plugin configs, upstreams, gateway trust bundles, API specs), the consumer identity/credential indexes, and the polling change-log tombstones in that one transaction. Stale route-bucket lock rows under the old name are removed; the admission lease rows proving the mutation are never touched. Rename also holds both the source and target mTLS DNS admission fences (sorted and de-duplicated) and fails closed if either has a restore owner; a description-only update holds the current name's fence.
-- Historical `audit_events` rows are immutable evidence and are **not** rewritten: they retain the namespace identity recorded when the event occurred. `GET /audit` is namespace-scoped, so those events remain queryable under the original name (including if that name is later reused). The rename itself may still emit a new audit event under the new name with a before/after diff.
+- Historical `audit_events` rows are immutable evidence and are **not** rewritten or deleted: they retain the namespace identity recorded when the event occurred. A namespace name is therefore a durable audit identity, not a reusable tenant slot. If a deleted or renamed name is later reused, `GET /audit` for that name resumes the same history and exposes it to callers authorized for the reused name; an unrelated tenant must receive a fresh, previously unused name. The rename itself may still emit a new audit event under the new name with a before/after diff.
 - Delete does not cascade by default; `?confirm=true` cascade-deletes occupancy resources (proxies, consumers, plugin configs, upstreams, API specs, the gateway trust bundle, the consumer indexes, and the tenant's route-bucket lock rows) and then the registry row. On MongoDB, cascade delete scans both the embedded `namespace` field and the durable key identity (`_id = "{namespace}:{suffix}"` for consumers and the consumer identity index, `_id = namespace` for the gateway trust bundle) before deleting anything. A missing, non-string, or mismatched identity aborts as a redacted `500` and rolls back; only identities already validated for the current namespace are deleted or tombstoned. `proxy_route_locks` remain prefix-keyed cleanup.
 - Change-log tombstones and the namespace's change-log retention floor are deliberately **retained** after a rename or delete so a gateway still polling the old name converges instead of serving stale configuration.
 - The namespace this gateway is configured to serve (`FERRUM_NAMESPACE`, default `ferrum`) cannot be deleted **or renamed away** — a rename is semantically a removal of the old name. A description-only update of it is allowed. The value comes from the resolved startup configuration (CLI > env > conf file > default), never from a request-time environment read.
@@ -908,10 +908,12 @@ no durable audit evidence.
   as success). A duplicate delivery of the same id is success, never
   replacement: an `audit_events` row is immutable. Namespace rename does not
   rewrite historical `audit_events.namespace` values; those rows retain the
-  tenant identity recorded when the event occurred, and a later reuse of the
-  old name still serves that history under `GET /audit`. The MongoDB path is a
-  single-document write, so it needs no multi-document transaction and works on
-  standalone deployments.
+  tenant identity recorded when the event occurred. Namespace names are durable
+  audit identities: reusing a deleted or renamed name resumes that same history
+  under `GET /audit` and exposes it to callers authorized for the reused name,
+  so an unrelated tenant must receive a fresh, previously unused name. The
+  MongoDB path is a single-document write, so it needs no multi-document
+  transaction and works on standalone deployments.
 - **Unrecoverable evidence is retained, not dropped.** After the attempt budget
   is exhausted, the record moves to `<spool>/failed/` for operator remediation.
   Corrupt records (bad version, unparseable, oversized, non-finalized, or an id

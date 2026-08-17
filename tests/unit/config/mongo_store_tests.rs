@@ -1543,8 +1543,7 @@ fn proxy_route_lock_cleanup_uses_an_escaped_id_prefix_not_a_namespace_filter() {
     // moment rustfmt reflows the call it is pinning.
     let rename = mongo_method("rename_namespace_documents_in_session(");
     assert!(
-        !rename.contains("self.proxy_route_locks()")
-            && !rename.contains("\"proxy_route_locks\","),
+        !rename.contains("self.proxy_route_locks()") && !rename.contains("\"proxy_route_locks\","),
         "the rename must not try to rewrite `proxy_route_locks` ids — those \
          documents have no `namespace` field, so the filter never matches:\n{rename}"
     );
