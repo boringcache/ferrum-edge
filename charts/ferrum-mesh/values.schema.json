@@ -355,6 +355,22 @@
         "captureMode": {
           "type": "string"
         },
+        "extraVolumes": {
+          "type": "array",
+          "description": "Free-form extra ambient/NodeWaypoint pod volumes (Kubernetes Volume objects), e.g. the frontend DTLS cert/key a NodeWaypoint UDP/DTLS service listener terminates with.",
+          "items": {
+            "type": "object",
+            "additionalProperties": true
+          }
+        },
+        "extraVolumeMounts": {
+          "type": "array",
+          "description": "Free-form extra ambient/NodeWaypoint container volume mounts (Kubernetes VolumeMount objects), e.g. the DTLS material at FERRUM_DTLS_CERT_PATH / FERRUM_DTLS_KEY_PATH.",
+          "items": {
+            "type": "object",
+            "additionalProperties": true
+          }
+        },
         "udpNodePreflight": {
           "type": "object",
           "description": "Privileged one-shot Ambient UDP node preflight init container for the settled host-netns placement. It runs in the ambient pod itself so Kubernetes orders it before the steady-state proxy container, and reads target pids through a read-only host /proc mount instead of pod-scoped hostPID. The ambient pod disables automatic ServiceAccount token projection and mounts a short-lived kube-api-access volume into the proxy always and into this init container only when no explicit FERRUM_K8S_NODE_UID is set. Disabling it never relaxes the runtime proof boundary.",

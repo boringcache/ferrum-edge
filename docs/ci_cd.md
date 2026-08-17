@@ -81,6 +81,7 @@ Pull Request / Merge Queue group
             └─► Full CI
                     ├─► Format + integration-shard coverage (in CI plan)
                     ├─► Unit+inline-lib / integration-shard / functional-shard tests
+                    ├─► Planner-gated Secret Backends / PKCS#11 SoftHSM jobs
                     ├─► Lint, dependency audit, vendored regressions
                     ├─► Fuzz smoke (property budgets on PRs; the six-target
                     │   libFuzzer budget on merge_group / push to main / manual)
@@ -440,7 +441,14 @@ deliberately triggers a live datapath suite (including the mesh, SPIRE,
 configuration, NodeWaypoint, and CI contract/runbook files) remains full mode.
 The planner runs `git diff --check` for PR/merge-group diff hygiene and disables
 rename detection when classifying paths, so both the source and destination of a
-rename are checked. The same `--no-renames` fail-closed classification applies
+rename are checked. `CI Plan` collects those paths as a NUL-delimited
+`git diff --name-only --no-renames -z` stream (no newline `sort`) and parses
+bytes fail-closed: a nonempty stream must be complete NUL-terminated UTF-8, and
+every path must be a repository-relative `[A-Za-z0-9._+@~ /-]` name with no
+absolute/dot/dotdot/empty components, C0/DEL, backslash, backtick, or other
+unclassifiable punctuation. Malformed or hostile names select full mode, force
+every job gate on, and are omitted from the step summary rather than
+interpolated into Markdown. The same `--no-renames` fail-closed classification applies
 to `coverage.yml` coverage planning, `gateway-api-conformance.yml` relevance
 filtering, and the `performance-regression` path classifier on both
 `pull_request` and `merge_group` diffs. Merge-group planning diffs
@@ -454,11 +462,25 @@ edit cannot classify itself as light; edits to the planner therefore receive
 the full matrix. The required-CI verifier also checks that documentation paths
 used by live-suite filters remain in the planner's full-CI set.
 
+`paths_classifiable` is a trust/transport version handshake between `CI Plan`
+and the planner. Pull requests and merge groups execute the trusted-base
+planner, so the change that introduces NUL transport still runs the older
+newline-only planner that does not emit this flag. That older planner can treat
+a NUL-delimited stream as one record and still print syntactically valid
+`false` values for pre-existing Helm, mesh, and eBPF gates. Unless
+`paths_classifiable` is exactly `true`, the controller force-runs every job
+gate before writing `$GITHUB_OUTPUT`, even when those values look like valid
+booleans. Narrow `true`/`false` gate values are honored only after the new
+planner proves the NUL stream classifiable. Missing or invalid individual
+outputs still fail closed to `true`. Unclassifiable and pre-handshake summaries
+use the canned reason and never interpolate hostile paths.
+
 The same trusted planner emits fail-closed job outputs for Helm, the legacy
 multicluster deployment smoke, the sidecar deployment smoke, eBPF program
-builds, and three separate live suites (`run_ebpf_kernel_live`,
-`run_netns_capture_live`, `run_two_cluster_live`). Each live job reads only its
-own output. Pattern lists are derived from the files those jobs actually
+builds, three separate live suites (`run_ebpf_kernel_live`,
+`run_netns_capture_live`, `run_two_cluster_live`), Secret Backends
+(`run_secrets_backends`), and PKCS#11 SoftHSM (`run_pkcs11`). Each live job
+reads only its own output. Pattern lists are derived from the files those jobs actually
 compile and execute: kernel live is the BPF crate plus `src/ebpf/`, the
 node-agent ingress-redirect helpers, `src/capture/` (`should_fallback_to_iptables`
 via `kernel_probe`), and the loader-adjacent transparent bind
@@ -481,8 +503,16 @@ deploy-only multicluster job remains a
 distinct packaging-and-rollout check; authoritative datapath coverage rides the
 dedicated `multicluster-federation-live.yml` workflow (path-filtered on PRs,
 force-run on every `main` push). PRs outside those curated path sets skip the
-downstream job before GitHub allocates a runner. Pushes to `main` and manual
-runs force all of these gates on. Rust formatting and the integration-shard
+downstream job before GitHub allocates a runner. Pushes to `main`, manual
+`workflow_dispatch` runs (the Secret Backends and PKCS#11 SoftHSM jobs use the
+same event guard as the other path-gated mesh/Helm/eBPF jobs), empty or
+unavailable diffs, unclassifiable/unsafe changed paths, a missing or non-`true`
+`paths_classifiable` handshake from an old trusted-base planner, and edits to
+the gate-controller scripts force all of these gates on. Shared compile-graph
+inputs (`Cargo.toml`/`Cargo.lock`, `vendor/`, `build.rs`, `proto/`,
+`rust-toolchain.toml`, `.cargo/`, `.github/workflows/ci.yml`, and the
+`setup-rust-ci` / `setup-sccache` / `setup-fast-linker` actions) also schedule
+the Secret Backends and PKCS#11 jobs. Rust formatting and the integration-shard
 coverage contract also run as named steps in `CI Plan`, avoiding two additional
 runner allocations.
 
@@ -601,9 +631,12 @@ prove each rejection dimension) in the `Tests` aggregate.
 
 In full mode, the `Tests` aggregate waits for the planner/format checks, test
 shards, lint, dependency audit, vendored patch regressions,
-planner-gated mesh/Helm gates, per-suite eBPF kernel / netns-capture /
-two-cluster live gates, performance, and the
-cross-platform build matrix. In light mode it requires the planner to succeed
+planner-gated Secret Backends / PKCS#11 / mesh / Helm gates, per-suite eBPF
+kernel / netns-capture / two-cluster live gates, performance, and the
+cross-platform build matrix. When the planner marks `run_secrets_backends` or
+`run_pkcs11` false, the aggregate accepts a skipped Secret Backends or PKCS#11
+job; when the planner marks either true, that job must succeed. In light mode
+it requires the planner to succeed
 and accepts the planned heavy jobs as skipped. Pushes to `main` publish the
 `latest` prerelease and Docker images only after the full aggregate and build
 matrix pass.
@@ -745,9 +778,21 @@ phases.
 - Unit tests in `tests/unit_tests.rs`
 - Inline `#[cfg(test)]` modules in `src/`
 - Secret backend tests compile once with Vault/AWS/GCP/Azure enabled and use
-  nextest `--no-fail-fast`; service integration likewise runs Consul, LDAP,
-  Kafka, MySQL, OIDC, and OAuth2 introspection in one independently reported
-  invocation.
+  nextest `--no-fail-fast`. The planner schedules this job (`run_secrets_backends`)
+  only when secret-provider sources, `tests/secrets_functional/`, secret-resolution
+  startup wiring (`src/main.rs`, `src/config/env_config.rs`), the feature-gated
+  TLS secret-source resolver, nextest config, or shared compile-graph/controller
+  inputs change; plugin-only and admin-only PRs skip it before runner allocation.
+  Manual `workflow_dispatch` runs, pushes to
+  `main`, and fail-closed planner cases still run it. Service integration
+  likewise runs Consul, LDAP, Kafka, MySQL, OIDC, and OAuth2 introspection in
+  one independently reported invocation.
+- PKCS#11 SoftHSM smoke (`run_pkcs11`) compiles the `pkcs11` feature graph and
+  runs the token signer plus certificate-pairing tests against SoftHSM. The
+  planner schedules it for `src/tls/pkcs11.rs`, the TLS load/backend/source/reload
+  paths those tests call, the feature-gated config and TLS inventory surfaces,
+  `tests/unit/tls` PKCS modules, and the same shared compile-graph inputs;
+  sibling ACME/FIPS TLS unit files do not schedule it.
 - Integration tests split across two shards (`admin-platform`,
   `mesh-protocols`). Each shard runs the prebuilt `integration_tests` nextest
   archive with a visible list of `integration::<file_module>` positional
@@ -1906,11 +1951,12 @@ therefore lists the job's admitted texts oldest first:
     decision — while `RUSTFLAGS: ""` stays, because the root Cargo
     configuration still selects a mold linker this lane does not install;
   - the sccache directory is persisted by the pinned `Swatinem/rust-cache` step
-    under `save-if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}`.
-    GitHub already scopes a pull request's cache writes to its own ref; writing
-    nothing at all from an untrusted ref is the stronger statement, and it keeps
-    every compiler artifact the sanitizer build restores attributable to code
-    that already merged;
+    under `save-if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}`
+    and nothing else. That predicate is the cache-quota control: `pull_request`
+    (same-repository PR refs and forks), `merge_group`, and `workflow_dispatch`
+    may restore a `fuzz-smoke` cache but cannot publish one. The retired
+    generation had no `save-if`, so a full-mode predecessor PR could still mint
+    a PR-ref `fuzz-smoke` entry; the adopted job cannot create another;
   - telemetry: the job prints `Fuzz property smoke seconds`, `Fuzz sanitizer
     lane seconds`, sccache statistics before and after the sanitizer build, the
     lane shape it took, and the on-disk cache size — so a hosted log shows
@@ -2014,15 +2060,21 @@ modification of the verifier it protects, and the landing is administrative afte
 root review), then an ordinary pull request that adopts the release workflow
 under the now-trusted policy and runs the full hosted matrix.
 
-##### Retired `fips-build.yml` generation transition (issue #3888 / PR #3889)
+##### Admitted `fips-build.yml` generation transition (issue #3888 lineage / PR #3950, temporary)
 
-PR #3889 landed on `main` as `7e9e69493`. The temporary whole-file SHA-256
-admission that let that rewrite pass the Cross surface scan is **retired and
-non-operational**. Ordinary `.github/workflows/fips-build.yml` edits are
-compared by the normal fail-closed Cross surface scan with no special case, no
-`admitted_generation_transition` bypass, and no FIPS-only classifier. The
-generic SHA-256 generation digest helper remains because CI-job and
-local-action finite transitions still use it.
+The temporary whole-file SHA-256 admission first used for PR #3889 (and retired
+by #3943 once #3889 landed) is **re-armed for exactly one transition**: PR
+#3950 moves the FIPS same-run producer→consumer handoff off the eviction-prone
+repository cache onto the immutable run artifact, which necessarily edits four
+digest-frozen `fips-build.yml` job bodies. The pair is exact and one-way:
+trusted-base `527659b0ad96a0d97cd4a170543dd81acbf6784155b3c82918b1f70a20c7914b`
+(PR #3889's landed file) →
+`05f86617597b1eb7bcf1960a0c630a9884ff09ac1995982f46a80811c3965e74` (PR #3950
+head `0984a45e4`; recompute and re-pin if review changes the workflow bytes).
+The digest is over universal-newline-decoded text. RETIREMENT IS MANDATORY
+once #3950 lands, exactly as #3943 retired the #3889 pair. Any other
+`fips-build.yml` edit is still compared by the normal fail-closed Cross
+surface scan.
 
 ##### Admitted CI job SHA-256 generation transitions (temporary)
 
@@ -2034,9 +2086,19 @@ relaxing the scan, the trusted policy admits exact retired→adopted pairs
 
 | Job | Retired SHA-256 (trusted base) | Adopted SHA-256 | Destination |
 |---|---|---|---|
-| `ci-plan` | `b3d95b6f0324f9a9ef842516907d7f5ff58d6d4a13f4a2d8afa5d659d6ab8336` | `c818a55308d27fe47692af3f22c8fdbd495755cf471760114ec2e6e4cb849c08` | PR #3913 / issue #3903 |
-| `test` | `e70ecf0924d88b6d86591608b471b70faad270ece6067c65b94eb5509ae1a03f` | `6bc548059b5b5efffbeb403ccfafebff8124c99af49a00c14aaa9af7e948e59d` | PR #3913 / issue #3903 |
 | `performance-regression` | `74673023dee4c0970a8b8d3c9a99089be2f28eddf57ddb7337febdf22bd5a7e4` | `e7d9a4c0ea26a14efd92844998a42219ca2fb1379072776a313de6dd9b720986` | PR #3911 / issue #3906 |
+| `ebpf-live` | `b7596b48641c850f797c84710dd5646013414d6ba01c30f4d4b2805737c8c26c` | `9aa3332bff5c4538f797f31133be0ef7dfc9767a72e7212b39be33ed58dcca87` | PR #3915 / issue #3900 |
+| `netns-capture-live` | `db543d5c35bfbd4a7b987a52635b359ea6268669257cd313146324f5ca79f598` | `b71296ba5929c78cd786301cc8ed677905cca82cd605be46880021b88c243e32` | PR #3915 / issue #3900 |
+| `two-cluster-mesh-live` | `0586ab0b5b8b803f2ee3663b608c40caca06f9c92e58d4cb28c2080d68f23f27` | `9c3d5b4dfbc6a209e801a47bceabd31fe8aa7df033d49989ad8f88a3e4ed73e7` | PR #3915 / issue #3900 |
+| `build-binaries` | `3bc9e7da00d7033b550df36db00048373b959aea437506ac28e494947422eaec` | `14b0890e2693cd0825fcf25ba7f48810b5ae9a33f2cbb5751bdaaf60186b83b1` | PR #3916 / issue #3905 |
+
+The three `#3915` pairs admit the per-suite planner-gate split (the union
+`run_ebpf_live` output becomes `run_ebpf_kernel_live` /
+`run_netns_capture_live` / `run_two_cluster_live`); the adopted digests are
+pinned against #3915's branch after merging latest `main`
+(`grok/issue-3900-ebpf-gates`, merged text `d95ea4796`). #3915's `ci-plan` /
+`test` changes are planner-body and aggregate-summary edits that today's scan
+does not read as Cross-sensitive, so those need no pair here.
 
 Each digest is the SHA-256 of `extract_job_block` text. Both ends are exact, the
 binding includes the job name, the move is one-way, and only that job's

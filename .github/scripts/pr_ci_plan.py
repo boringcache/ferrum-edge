@@ -581,8 +581,8 @@ FULL_CI_GOVERNANCE_PREFIXES = ("docs/upstream-",)
 
 # Pull-request-only job gates. Keep these allow-lists narrow: a path must be
 # known to affect the expensive suite before the planner schedules it. An
-# unavailable/empty diff fails closed in select_job_gates() and schedules all
-# gated jobs.
+# unavailable/empty diff, or a NUL stream that cannot be classified, fails
+# closed in select_job_gates() and schedules all gated jobs.
 HELM_PATTERNS = [
     re.compile(pattern)
     for pattern in (
@@ -723,6 +723,62 @@ TWO_CLUSTER_LIVE_PATTERNS = compile_path_patterns(
     ),
 )
 
+# Compile-graph and CI-controller inputs shared by the Secret Backends and
+# PKCS#11 SoftHSM jobs. Either job compiles a private feature graph, so a
+# toolchain, lockfile, vendored crate, proto, or rust-ci action change can
+# alter what those suites build even when no secrets/PKCS source moved.
+SHARED_FEATURE_JOB_PATTERNS = (
+    r"^\.github/workflows/ci\.yml$",
+    r"^\.github/actions/(?:setup-rust-ci|setup-sccache|setup-fast-linker)/",
+    r"^Cargo\.(?:toml|lock)$",
+    r"^\.cargo/",
+    r"^rust-toolchain\.toml$",
+    r"^build\.rs$",
+    r"^proto/",
+    r"^vendor/",
+)
+
+# Secret Backends compiles `--features secrets-vault,secrets-aws,secrets-gcp,
+# secrets-azure --test secrets_functional` (then default-features
+# `cross_backend`). Observable surfaces are the provider module, that test
+# target, the TLS secret-source feature branches, nextest's serial override for
+# it, Cargo feature/optional-dep wiring, and the startup path that calls
+# `secrets::resolve_all_env_secrets()` before `EnvConfig` parse. `src/startup.rs`
+# is listener-failure bookkeeping and is not on that path.
+SECRETS_BACKENDS_PATTERNS = [
+    re.compile(pattern)
+    for pattern in (
+        *SHARED_FEATURE_JOB_PATTERNS,
+        r"^src/secrets/",
+        r"^src/tls/source/mod\.rs$",
+        r"^tests/secrets_functional/",
+        r"^src/main\.rs$",
+        r"^src/config/env_config\.rs$",
+        r"^\.config/nextest\.toml$",
+    )
+]
+
+# PKCS#11 SoftHSM compiles `--features pkcs11 --lib tls::pkcs11::tests` and
+# `--test unit_tests tls::pkcs11`. Observable surfaces are the feature-gated
+# module, the feature-gated config/inventory code, TLS load/backend/source/reload
+# paths those tests call, the `tests/unit/tls` PKCS modules plus their `mod.rs`
+# wiring, and Cargo `pkcs11`/`cryptoki` feature wiring. Sibling TLS unit files
+# (ACME, FIPS) do not change what this job runs.
+PKCS11_PATTERNS = [
+    re.compile(pattern)
+    for pattern in (
+        *SHARED_FEATURE_JOB_PATTERNS,
+        r"^src/config/types\.rs$",
+        r"^src/tls/pkcs11\.rs$",
+        r"^src/tls/mod\.rs$",
+        r"^src/tls/backend\.rs$",
+        r"^src/tls/frontend_reload\.rs$",
+        r"^src/tls/inventory\.rs$",
+        r"^src/tls/source/",
+        r"^tests/unit/tls/(?:mod\.rs|pkcs11)",
+    )
+]
+
 JOB_GATE_NAMES = (
     "run_helm",
     "run_mesh_federation",
@@ -731,6 +787,8 @@ JOB_GATE_NAMES = (
     "run_netns_capture_live",
     "run_two_cluster_live",
     "run_ebpf_build",
+    "run_secrets_backends",
+    "run_pkcs11",
 )
 
 # Scripts whose logic controls the gate decisions themselves. Changing either
@@ -740,6 +798,15 @@ GATE_CONTROLLER_PATHS = frozenset(
         ".github/scripts/pr_ci_plan.py",
         ".github/scripts/live_suite_path_filter.py",
     }
+)
+
+# Conservative repository-relative charset matching origin/main. C0 controls,
+# DEL, backslash, backticks, and other Markdown/shell metacharacters are
+# rejected by omission so a hostile Git filename cannot split, quote, or
+# interpolate its way past a secrets/PKCS path gate.
+CLASSIFIABLE_PATH_RE = re.compile(r"^[A-Za-z0-9._+@~ /-]{1,4096}$")
+UNCLASSIFIABLE_REASON = (
+    "changed paths were suppressed as unclassifiable; defaulting to full CI"
 )
 
 
@@ -777,6 +844,9 @@ def select_mode(event_name: str, changed_files: list[str]) -> tuple[str, str]:
     if not changed_files:
         return "full", "no changed files were detected; defaulting to full CI"
 
+    if not job_gate_paths_are_classifiable(changed_files):
+        return "full", UNCLASSIFIABLE_REASON
+
     full_ci_files = [path for path in changed_files if not is_lightweight_path(path)]
     if full_ci_files:
         return "full", f"full-CI input changed: {full_ci_files[0]}"
@@ -788,8 +858,41 @@ def any_path_matches(patterns: list[re.Pattern[str]], changed_files: list[str]) 
     return any(pattern.search(path) for path in changed_files for pattern in patterns)
 
 
+def is_classifiable_repo_path(path: str) -> bool:
+    """Return whether one path is a conservative repository-relative Git path.
+
+    `PurePosixPath.parts` collapses empty components, so classification splits
+    on `/` itself. Leading/trailing whitespace, `.` / `..` / empty components,
+    absolute paths, and any character outside the origin/main allowlist fail
+    closed.
+    """
+
+    if path != path.strip():
+        return False
+    if not CLASSIFIABLE_PATH_RE.fullmatch(path):
+        return False
+    if path.startswith("/") or path.endswith("/"):
+        return False
+    parts = path.split("/")
+    return bool(parts) and all(part not in {"", ".", ".."} for part in parts)
+
+
+def job_gate_paths_are_classifiable(changed_files: list[str]) -> bool:
+    """Return whether every changed path can be matched against job-gate allow-lists.
+
+    Unclassifiable paths make `select_mode()` choose full CI and
+    `select_job_gates()` schedule every gated suite, without interpolating the
+    raw bytes into the reason string.
+    """
+
+    return all(is_classifiable_repo_path(path) for path in changed_files)
+
+
 def select_job_gates(event_name: str, changed_files: list[str]) -> dict[str, bool]:
     if not is_path_gated_event(event_name) or not changed_files:
+        return {name: True for name in JOB_GATE_NAMES}
+
+    if not job_gate_paths_are_classifiable(changed_files):
         return {name: True for name in JOB_GATE_NAMES}
 
     # These scripts decide which gated suites run. A PR that edits them is
@@ -818,17 +921,183 @@ def select_job_gates(event_name: str, changed_files: list[str]) -> dict[str, boo
             TWO_CLUSTER_LIVE_PATTERNS, changed_files
         ),
         "run_ebpf_build": any(path.startswith("ebpf/") for path in changed_files),
+        "run_secrets_backends": any_path_matches(
+            SECRETS_BACKENDS_PATTERNS, changed_files
+        ),
+        "run_pkcs11": any_path_matches(PKCS11_PATTERNS, changed_files),
     }
 
 
-def read_changed_files(path: Path | None) -> list[str]:
+def parse_nul_changed_files(data: bytes) -> tuple[list[str], bool]:
+    """Parse a `git diff --name-only --no-renames -z` changed-file stream.
+
+    A nonempty stream must be a complete NUL-terminated sequence of UTF-8
+    repository-relative paths. Framing, encoding, or shape failures return no
+    paths and `classifiable=False` so callers fail closed without displaying
+    hostile bytes. An empty stream is classifiable and means "no files".
+    """
+
+    if not data:
+        return [], True
+    if not data.endswith(b"\0"):
+        return [], False
+    records = data.split(b"\0")[:-1]
+    if not records:
+        return [], False
+    paths: list[str] = []
+    for record in records:
+        if not record:
+            return [], False
+        try:
+            path = record.decode("utf-8")
+        except UnicodeDecodeError:
+            return [], False
+        if not is_classifiable_repo_path(path):
+            return [], False
+        paths.append(path)
+    return paths, True
+
+
+def plan_from_changed_bytes(
+    event_name: str, data: bytes
+) -> tuple[str, str, dict[str, bool], bool]:
+    """Select mode and gates from a raw NUL changed-file stream.
+
+    Unclassifiable input emits full mode, every job gate, `paths_classifiable`
+    false, and the canned reason; it never returns parsed path strings to the
+    caller. The workflow controller treats `paths_classifiable` as a
+    trust/transport version handshake and force-runs every job gate unless the
+    flag is exactly true, so an older newline-only trusted-base planner cannot
+    honor syntactically valid false gates from a NUL stream.
+    """
+
+    changed_files, paths_classifiable = parse_nul_changed_files(data)
+    if not paths_classifiable:
+        return (
+            "full",
+            UNCLASSIFIABLE_REASON,
+            {name: True for name in JOB_GATE_NAMES},
+            False,
+        )
+    mode, reason = select_mode(event_name, changed_files)
+    return mode, reason, select_job_gates(event_name, changed_files), True
+
+
+def read_changed_files(path: Path | None) -> tuple[list[str], bool]:
     if path is None:
-        return []
-    return [
-        line.strip()
-        for line in path.read_text(encoding="utf-8").splitlines()
-        if line.strip()
-    ]
+        return [], True
+    return parse_nul_changed_files(path.read_bytes())
+
+
+def nul_transport_self_test() -> list[str]:
+    """Prove NUL framing and fail-closed classification without printing hostile bytes."""
+
+    failures: list[str] = []
+    all_true = {name: True for name in JOB_GATE_NAMES}
+
+    parsed, classifiable = parse_nul_changed_files(
+        b"docs/admin_api.md\0src/proxy/mod.rs\0"
+    )
+    if not classifiable or parsed != ["docs/admin_api.md", "src/proxy/mod.rs"]:
+        failures.append("normal NUL stream must parse both repository paths")
+    mode, _reason, gates, flag = plan_from_changed_bytes(
+        "pull_request", b"docs/admin_api.md\0src/proxy/mod.rs\0"
+    )
+    if not flag or mode != "full":
+        failures.append("classifiable code path must keep full mode")
+    if gates["run_secrets_backends"] or gates["run_pkcs11"]:
+        failures.append("proxy-only NUL stream must not force secrets/PKCS gates")
+
+    parsed, classifiable = parse_nul_changed_files(b"")
+    if not classifiable or parsed:
+        failures.append("empty changed-file stream must stay classifiable and empty")
+    mode, reason, gates, flag = plan_from_changed_bytes("pull_request", b"")
+    if not flag or mode != "full" or gates != all_true:
+        failures.append("empty NUL stream must fail closed to full CI and every gate")
+    if reason != "no changed files were detected; defaulting to full CI":
+        failures.append("empty NUL stream must keep the unavailable-diff reason")
+
+    mode, _reason, gates, flag = plan_from_changed_bytes(
+        "pull_request", b"src/secrets/env.rs\0"
+    )
+    if (
+        not flag
+        or mode != "full"
+        or not gates["run_secrets_backends"]
+        or gates["run_pkcs11"]
+    ):
+        failures.append("classifiable secrets path must keep the narrow secrets gate")
+    mode, _reason, gates, flag = plan_from_changed_bytes(
+        "merge_group", b"src/tls/pkcs11.rs\0"
+    )
+    if (
+        not flag
+        or mode != "full"
+        or not gates["run_pkcs11"]
+        or gates["run_secrets_backends"]
+    ):
+        failures.append("classifiable PKCS path must keep the narrow PKCS gate")
+
+    unsafe_cases = (
+        ("truncated-no-nul", b"src/secrets/env.rs"),
+        ("truncated-after-record", b"docs/admin_api.md\0src/secrets/env.rs"),
+        ("invalid-utf8", b"src/secrets/\xff.rs\0"),
+        ("newline", b"src/secrets/\nenv.rs\0"),
+        ("tab", b"src/secrets/\tenv.rs\0"),
+        ("c0-soh", b"src/secrets/\x01env.rs\0"),
+        ("c0-cr", b"src/secrets/\renv.rs\0"),
+        ("c0-us", b"src/secrets/\x1fenv.rs\0"),
+        ("del", b"src/secrets/\x7fenv.rs\0"),
+        ("backslash", b"src\\secrets\\env.rs\0"),
+        ("absolute", b"/src/secrets/env.rs\0"),
+        ("traversal", b"src/../secrets/env.rs\0"),
+        ("dot-prefix", b"./src/secrets/env.rs\0"),
+        ("dot-inner", b"src/./secrets/env.rs\0"),
+        ("empty-component", b"src//secrets/env.rs\0"),
+        ("trailing-slash", b"src/secrets/env.rs/\0"),
+        ("empty-record", b"\0"),
+        ("backtick", b"src/secrets/`env.rs\0"),
+        ("paren", b"src/secrets/env(rs)\0"),
+        ("star", b"src/secrets/*.rs\0"),
+        ("hash", b"src/secrets/env#.rs\0"),
+        ("dollar", b"src/secrets/$env.rs\0"),
+        ("semicolon", b"src/secrets/env.rs;\0"),
+        ("single-quote", b"src/secrets/'env.rs\0"),
+        ("double-quote", b'src/secrets/"env.rs\0'),
+        ("newline-delimited", b"src/secrets/env.rs\ndocs/admin_api.md\n"),
+    )
+    for label, data in unsafe_cases:
+        parsed, classifiable = parse_nul_changed_files(data)
+        if classifiable or parsed:
+            failures.append(
+                f"{label}: NUL parse must reject the stream without returning paths"
+            )
+            continue
+        for event_name in ("pull_request", "merge_group"):
+            mode, reason, gates, flag = plan_from_changed_bytes(event_name, data)
+            if flag:
+                failures.append(f"{label}/{event_name}: must not mark paths classifiable")
+            if mode != "full" or reason != UNCLASSIFIABLE_REASON:
+                failures.append(
+                    f"{label}/{event_name}: must emit full mode with the unclassifiable reason"
+                )
+            if gates != all_true:
+                failures.append(f"{label}/{event_name}: must schedule every job gate")
+            if not reason.isascii() or any(ord(char) < 32 for char in reason):
+                failures.append(f"{label}/{event_name}: reason must stay safe ASCII")
+
+    with tempfile.TemporaryDirectory() as temp_dir:
+        stream = Path(temp_dir) / "changed"
+        stream.write_bytes(b"src/tls/pkcs11.rs\0")
+        files, ok = read_changed_files(stream)
+        if not ok or files != ["src/tls/pkcs11.rs"]:
+            failures.append("read_changed_files must parse a NUL-terminated PKCS path")
+        stream.write_bytes(b"src/secrets/env.rs")
+        files, ok = read_changed_files(stream)
+        if ok or files:
+            failures.append("read_changed_files must reject a truncated NUL stream")
+
+    return failures
 
 
 def self_test() -> int:
@@ -875,6 +1144,9 @@ def self_test() -> int:
         ("merge_group", ["docs/admin_api.md", "src/proxy/mod.rs"], "full"),
         ("push", ["docs/ci_cd.md"], "full"),
         ("workflow_dispatch", [], "full"),
+        ("pull_request", ["src/../secrets/env.rs"], "full"),
+        ("pull_request", ["docs/admin_api.md", "docs/`evil`.md"], "full"),
+        ("merge_group", ["src/secrets/\tenv.rs"], "full"),
     ]
     failures: list[str] = []
     for event_name, changed, expected in cases:
@@ -883,6 +1155,19 @@ def self_test() -> int:
             failures.append(
                 f"{event_name} {changed!r}: expected {expected}, selected {mode}"
             )
+
+    for changed in (
+        ["src/../secrets/env.rs"],
+        ["docs/admin_api.md", "docs/`evil`.md"],
+        ["src/secrets/\tenv.rs"],
+    ):
+        mode, reason = select_mode("pull_request", changed)
+        if mode != "full" or reason != UNCLASSIFIABLE_REASON:
+            failures.append(
+                "unclassifiable string paths must emit full mode with the canned reason"
+            )
+        if any(path in reason for path in changed):
+            failures.append("unclassifiable reason must not echo changed paths")
 
     gate_cases = [
         (
@@ -1236,6 +1521,161 @@ def self_test() -> int:
         ),
         (
             "pull_request",
+            ["src/secrets/env.rs"],
+            {"run_secrets_backends": True, "run_pkcs11": False},
+        ),
+        (
+            "pull_request",
+            ["tests/secrets_functional/cross_backend.rs"],
+            {"run_secrets_backends": True, "run_pkcs11": False},
+        ),
+        (
+            "pull_request",
+            ["src/main.rs"],
+            {"run_secrets_backends": True, "run_pkcs11": False},
+        ),
+        (
+            "pull_request",
+            ["src/config/env_config.rs"],
+            {"run_secrets_backends": True, "run_pkcs11": False},
+        ),
+        (
+            "pull_request",
+            ["src/tls/source/mod.rs"],
+            {"run_secrets_backends": True, "run_pkcs11": True},
+        ),
+        (
+            "pull_request",
+            ["src/tls/pkcs11.rs"],
+            {"run_pkcs11": True, "run_secrets_backends": False},
+        ),
+        (
+            "pull_request",
+            ["tests/unit/tls/pkcs11_softhsm_tests.rs"],
+            {"run_pkcs11": True, "run_secrets_backends": False},
+        ),
+        (
+            "pull_request",
+            ["src/tls/mod.rs"],
+            {"run_pkcs11": True, "run_secrets_backends": False},
+        ),
+        (
+            "pull_request",
+            ["src/tls/backend.rs"],
+            {"run_pkcs11": True, "run_secrets_backends": False},
+        ),
+        (
+            "pull_request",
+            ["src/config/types.rs"],
+            {"run_pkcs11": True, "run_secrets_backends": False},
+        ),
+        (
+            "pull_request",
+            ["src/tls/inventory.rs"],
+            {"run_pkcs11": True, "run_secrets_backends": False},
+        ),
+        (
+            "pull_request",
+            ["src/plugins/cors.rs"],
+            {"run_secrets_backends": False, "run_pkcs11": False},
+        ),
+        (
+            "pull_request",
+            ["src/admin/mod.rs"],
+            {"run_secrets_backends": False, "run_pkcs11": False},
+        ),
+        (
+            "pull_request",
+            ["src/startup.rs"],
+            {"run_secrets_backends": False, "run_pkcs11": False},
+        ),
+        (
+            "pull_request",
+            ["tests/unit/secrets/env_tests.rs"],
+            {"run_secrets_backends": False, "run_pkcs11": False},
+        ),
+        (
+            "pull_request",
+            ["tests/unit/tls/acme_store_ha_tests.rs"],
+            {"run_pkcs11": False, "run_secrets_backends": False},
+        ),
+        (
+            "pull_request",
+            ["Cargo.lock"],
+            {"run_secrets_backends": True, "run_pkcs11": True},
+        ),
+        (
+            "pull_request",
+            ["Cargo.toml"],
+            {"run_secrets_backends": True, "run_pkcs11": True},
+        ),
+        (
+            "pull_request",
+            ["vendor/tungstenite-0.29.0-ferrum-patched/src/lib.rs"],
+            {"run_secrets_backends": True, "run_pkcs11": True},
+        ),
+        (
+            "pull_request",
+            [".github/actions/setup-rust-ci/action.yml"],
+            {"run_secrets_backends": True, "run_pkcs11": True},
+        ),
+        (
+            "pull_request",
+            ["rust-toolchain.toml"],
+            {"run_secrets_backends": True, "run_pkcs11": True},
+        ),
+        (
+            "pull_request",
+            [".github/workflows/ci.yml"],
+            {"run_secrets_backends": True, "run_pkcs11": True},
+        ),
+        (
+            "pull_request",
+            ["build.rs"],
+            {"run_secrets_backends": True, "run_pkcs11": True},
+        ),
+        (
+            "pull_request",
+            ["proto/ferrum.proto"],
+            {"run_secrets_backends": True, "run_pkcs11": True},
+        ),
+        (
+            "pull_request",
+            [".cargo/config.toml"],
+            {"run_secrets_backends": True, "run_pkcs11": True},
+        ),
+        (
+            "pull_request",
+            [".config/nextest.toml"],
+            {"run_secrets_backends": True, "run_pkcs11": False},
+        ),
+        (
+            "pull_request",
+            ["src/tls/frontend_reload.rs"],
+            {"run_pkcs11": True, "run_secrets_backends": False},
+        ),
+        (
+            "pull_request",
+            ["src/../secrets/env.rs"],
+            {name: True for name in JOB_GATE_NAMES},
+        ),
+        (
+            "pull_request",
+            ["docs/admin_api.md", "docs/`evil`.md"],
+            {name: True for name in JOB_GATE_NAMES},
+        ),
+        (
+            "pull_request",
+            ["/src/secrets/env.rs"],
+            {name: True for name in JOB_GATE_NAMES},
+        ),
+        (
+            "pull_request",
+            ["src/secrets/env.rs;"],
+            {name: True for name in JOB_GATE_NAMES},
+        ),
+        (
+            "pull_request",
             ["docs/admin_api.md"],
             {name: False for name in JOB_GATE_NAMES},
         ),
@@ -1272,6 +1712,16 @@ def self_test() -> int:
         ),
         (
             "merge_group",
+            ["src/secrets/env.rs"],
+            {"run_secrets_backends": True, "run_pkcs11": False},
+        ),
+        (
+            "merge_group",
+            ["src/tls/pkcs11.rs"],
+            {"run_pkcs11": True, "run_secrets_backends": False},
+        ),
+        (
+            "merge_group",
             [],
             {name: True for name in JOB_GATE_NAMES},
         ),
@@ -1291,6 +1741,7 @@ def self_test() -> int:
         failures.append("live-suite path-filter self-test failed")
     failures.extend(action_pinning_self_test())
     failures.extend(validate_action_pinning_policy(Path.cwd()))
+    failures.extend(nul_transport_self_test())
     for failure in failures:
         print(f"::error::{failure}", file=sys.stderr)
     return 1 if failures else 0
@@ -1308,11 +1759,18 @@ def main() -> int:
     if not args.event_name:
         parser.error("--event-name is required unless --self-test is used")
 
-    changed_files = read_changed_files(args.changed_files)
-    mode, reason = select_mode(args.event_name, changed_files)
+    data = b""
+    if args.changed_files is not None:
+        data = args.changed_files.read_bytes()
+    mode, reason, gates, paths_classifiable = plan_from_changed_bytes(
+        args.event_name, data
+    )
     print(f"mode={mode}")
+    # Workflow ci-plan treats this flag as a trust/transport version handshake:
+    # unless it is exactly "true", every job gate is forced on.
+    print(f"paths_classifiable={str(paths_classifiable).lower()}")
     print(f"reason={reason}")
-    for name, enabled in select_job_gates(args.event_name, changed_files).items():
+    for name, enabled in gates.items():
         print(f"{name}={str(enabled).lower()}")
     return 0
 

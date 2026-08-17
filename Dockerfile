@@ -9,10 +9,11 @@
 #                            it adds the eBPF ELF and a staged `ip` closure and
 #                            deliberately has NO `/bin/sh` and NO iptables.
 #   * `runtime-ebpf-tools` — a strict superset of `runtime-ebpf` for the Ambient
-#                            host/pod-netns UDP lifecycle, which drives generated
-#                            `sh -c` iptables/ip6tables scripts and therefore
-#                            cannot run on a distroless image. Debian-based, so
-#                            it is NOT distroless by construction.
+#                            host/pod-netns UDP lifecycle and NodeWaypoint UDP/DTLS
+#                            Service-path steering, which drive generated `sh -c`
+#                            iptables/ip6tables scripts and therefore cannot run
+#                            on a distroless image. Debian-based, so it is NOT
+#                            distroless by construction.
 #
 # Build the eBPF targets with `FEATURES=cloud-secrets,ebpf`; hosted CI exercises
 # all three contracts.
@@ -207,14 +208,19 @@ FROM ${IPROUTE2_BASE} AS capture-tools-base
 ARG IPROUTE2_VERSION
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
+        ca-certificates \
         "iproute2=${IPROUTE2_VERSION}" \
         iptables \
     && rm -rf /var/lib/apt/lists/*
 # Fail the BUILD, not a node at 3am, if the tool contract the Ambient UDP
 # lifecycle depends on is ever absent. Keep this list in lock-step with
-# `preflight_capture_tools` and the `ambient-host-udp-live` image smoke.
+# `preflight_capture_tools`, `Dockerfile.ebpf-tools-layer`, and the
+# `ambient-host-udp-live` image smoke. Unlike distroless `-ebpf`, this Debian
+# root does not inherit a CA bundle from the base image; plugin reqwest clients
+# need the platform store at `/etc/ssl/certs/ca-certificates.crt`.
 RUN set -eu; \
     test -x /bin/sh; \
+    test -s /etc/ssl/certs/ca-certificates.crt; \
     for tool in ip iptables ip6tables iptables-save ip6tables-save; do \
         command -v "$tool" >/dev/null 2>&1 || { \
             echo "capture-tools-base is missing required tool: $tool" >&2; \

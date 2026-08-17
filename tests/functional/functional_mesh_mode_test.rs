@@ -11646,20 +11646,117 @@ fn udp_round_trip_from_netns_with_source(
     })
 }
 
+/// UDP echo bound inside an enrolled destination pod netns. Ownership of the
+/// setns thread, runtime, and socket stays with this fixture so teardown cannot
+/// leak the namespace-local listener.
 #[cfg(target_os = "linux")]
-fn udp_round_trip_from_netns(
-    pid: u32,
-    destination: SocketAddr,
-    payload: &'static [u8],
-    timeout: Duration,
-) -> Result<(Vec<u8>, SocketAddr), String> {
-    udp_round_trip_from_netns_with_source(
-        pid,
-        std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
-        destination,
-        payload,
-        timeout,
-    )
+struct LiveNetnsUdpEcho {
+    port: u16,
+    received: Arc<AtomicUsize>,
+    shutdown: Option<std::sync::mpsc::Sender<()>>,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+#[cfg(target_os = "linux")]
+impl LiveNetnsUdpEcho {
+    fn start(netns_pid: u32, bind_ip: std::net::Ipv4Addr) -> Result<Self, String> {
+        use std::os::fd::AsRawFd;
+
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+        let (shutdown_tx, shutdown_rx) = std::sync::mpsc::channel();
+        let thread = std::thread::spawn(move || {
+            let setup = (|| -> Result<tokio::runtime::Runtime, String> {
+                let netns = std::fs::File::open(format!("/proc/{netns_pid}/ns/net"))
+                    .map_err(|error| format!("open destination echo netns: {error}"))?;
+                // Safety: this dedicated echo thread never returns to a
+                // different namespace-aware runtime after setns.
+                if unsafe { libc::setns(netns.as_raw_fd(), libc::CLONE_NEWNET) } != 0 {
+                    return Err(format!(
+                        "enter destination echo netns: {}",
+                        std::io::Error::last_os_error()
+                    ));
+                }
+                tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .map_err(|error| format!("build destination echo runtime: {error}"))
+            })();
+            let runtime = match setup {
+                Ok(runtime) => runtime,
+                Err(error) => {
+                    let _ = ready_tx.send(Err(error));
+                    return;
+                }
+            };
+            runtime.block_on(async move {
+                let socket = match tokio::net::UdpSocket::bind((bind_ip, 0)).await {
+                    Ok(socket) => socket,
+                    Err(error) => {
+                        let _ = ready_tx.send(Err(format!(
+                            "bind destination pod-netns UDP echo on {bind_ip}: {error}"
+                        )));
+                        return;
+                    }
+                };
+                let port = match socket.local_addr() {
+                    Ok(addr) => addr.port(),
+                    Err(error) => {
+                        let _ = ready_tx.send(Err(format!(
+                            "read destination pod-netns UDP echo port: {error}"
+                        )));
+                        return;
+                    }
+                };
+                let received = Arc::new(AtomicUsize::new(0));
+                if ready_tx.send(Ok((port, received.clone()))).is_err() {
+                    return;
+                }
+                let mut buf = [0u8; 65535];
+                loop {
+                    match shutdown_rx.try_recv() {
+                        Ok(()) | Err(std::sync::mpsc::TryRecvError::Disconnected) => return,
+                        Err(std::sync::mpsc::TryRecvError::Empty) => {}
+                    }
+                    match tokio::time::timeout(
+                        Duration::from_millis(100),
+                        socket.recv_from(&mut buf),
+                    )
+                    .await
+                    {
+                        Ok(Ok((n, peer))) => {
+                            received.fetch_add(1, Ordering::Relaxed);
+                            if socket.send_to(&buf[..n], peer).await.is_err() {
+                                return;
+                            }
+                        }
+                        Ok(Err(_)) => return,
+                        Err(_) => {}
+                    }
+                }
+            });
+        });
+        let (port, received) = ready_rx
+            .recv_timeout(Duration::from_secs(10))
+            .map_err(|error| format!("wait for destination pod-netns UDP echo: {error}"))??;
+        Ok(Self {
+            port,
+            received,
+            shutdown: Some(shutdown_tx),
+            thread: Some(thread),
+        })
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl Drop for LiveNetnsUdpEcho {
+    fn drop(&mut self) {
+        if let Some(tx) = self.shutdown.take() {
+            let _ = tx.send(());
+        }
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -11789,14 +11886,15 @@ fn udp_fail_closed_guard_probe_literal_matches_source() {
 
 /// Full Ambient producer path: the real `NetnsUdpCaptureManager` resolves a
 /// synthetic cgroup, the real backend installs production UDP-only TPROXY rules
-/// and binds capture/reply sockets inside the pod netns, and the captured flow
-/// traverses gateway A's HBONE datagram tunnel plus gateway B's real destination
-/// relay before returning from the original VIP:port.
+/// and binds capture/reply sockets inside the source pod netns, and the captured
+/// flow traverses gateway A's HBONE datagram tunnel plus gateway B's enrolled
+/// destination-pod relay before returning from the original VIP:port.
 ///
-/// Scope: source-capture producer + HBONE egress to a **host-loopback** UDP echo
-/// (`start_counting_udp_echo` on `127.0.0.1`). Does **not** exercise the
-/// enrolled-destination pod-netns relay path (destination workload inside its own
-/// pod netns with registry mapping and tc-inbound admit) — tracked on #3621.
+/// Two independent `LiveVethPod` fixtures provide separately routable source and
+/// destination network state. DNS is split so A dials B on loopback while the
+/// CONNECT workload target resolves on B to the destination pod address. The
+/// echo socket is bound inside that destination netns; host-netns fallback is
+/// isolated fail-closed.
 #[cfg(target_os = "linux")]
 #[ignore = "requires root + netns + iptables/TPROXY + iproute2"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -11808,37 +11906,90 @@ async fn functional_mesh_live_source_capture_udp_manager_hbone_round_trip() {
 
     const VIP: &str = "192.0.2.40";
     const UNROUTABLE_VIP: &str = "192.0.2.41";
-    const POD_UID: &str = "functional-udp-source-capture-pod";
+    const SOURCE_POD_UID: &str = "functional-udp-source-capture-pod";
+    const DEST_POD_UID: &str = "functional-udp-enrolled-destination-pod";
+    const ECHO_HOST: &str = "enrolled-udp-echo.live.ferrum.test";
     let capture_port = ferrum_edge::capture::DEFAULT_UDP_OUTBOUND_PORT;
-    let pod = match LivePodNetns::spawn(true) {
+    let source = match LiveVethPod::spawn_indexed(8) {
         Ok(pod) => pod,
         Err(error) => {
-            skip_or_fail_live_source_capture(&format!("cannot create UDP pod netns: {error}"));
+            skip_or_fail_live_source_capture(&format!(
+                "cannot create UDP source pod netns/veth: {error}"
+            ));
             return;
         }
     };
-    let disabled_registry = TempDir::new().expect("disabled UDP pod registry tempdir");
-    let _disabled_registry_entry = pod
-        .publish(disabled_registry.path(), POD_UID)
-        .expect("publish disabled UDP pod registry entry");
-    let registry = TempDir::new().expect("UDP pod registry tempdir");
-    let registry_entry = pod
-        .publish(registry.path(), POD_UID)
-        .expect("publish UDP pod registry entry");
-
+    let destination = match LiveVethPod::spawn_indexed(9) {
+        Ok(pod) => pod,
+        Err(error) => {
+            skip_or_fail_live_source_capture(&format!(
+                "cannot create UDP destination pod netns/veth: {error}"
+            ));
+            return;
+        }
+    };
     let a_spiffe = "spiffe://cluster.local/ns/ferrum/sa/client-app";
     let b_spiffe = "spiffe://cluster.local/ns/ferrum/sa/udp-echo";
+    let echo = LiveNetnsUdpEcho::start(destination.pod.pid(), destination.pod_ip())
+        .unwrap_or_else(|error| {
+            panic!(
+                "destination pod-netns UDP echo is required for enrolled-destination coverage: {error}"
+            )
+        });
+    let echo_port = echo.port;
+    let echo_received = echo.received.clone();
+    netns_command(
+        destination.pod.pid(),
+        &format!("iptables -A INPUT ! -i lo -p udp --dport {echo_port} -j DROP"),
+    )
+    .unwrap_or_else(|error| {
+        panic!(
+            "destination netns must drop host-veth UDP to the echo so a host-netns fallback cannot pass: {error}"
+        )
+    });
+    {
+        let probe = std::net::UdpSocket::bind("0.0.0.0:0")
+            .expect("bind host-netns probe to enrolled destination echo");
+        probe
+            .send_to(
+                b"host-netns-must-not-arrive",
+                std::net::SocketAddr::from((destination.pod_ip(), echo_port)),
+            )
+            .expect("send host-netns probe to enrolled destination echo");
+        std::thread::sleep(Duration::from_millis(200));
+        assert_eq!(
+            echo_received.load(Ordering::Relaxed),
+            0,
+            "host-netns must not reach the destination-pod echo; refusing silent loopback/host fallback"
+        );
+    }
+    let disabled_registry = TempDir::new().expect("disabled UDP pod registry tempdir");
+    let _disabled_registry_entry = source
+        .pod
+        .publish(disabled_registry.path(), SOURCE_POD_UID)
+        .expect("publish disabled UDP pod registry entry");
+    let registry = TempDir::new().expect("UDP pod registry tempdir");
+    let registry_entry = source
+        .pod
+        .publish(registry.path(), SOURCE_POD_UID)
+        .expect("publish UDP pod registry entry");
+    let dest_registry = TempDir::new().expect("UDP destination pod registry tempdir");
+    let dest_registry_entry = destination
+        .publish_enrolled(dest_registry.path(), DEST_POD_UID, b_spiffe)
+        .unwrap_or_else(|error| panic!("destination pod registry enrollment is required: {error}"));
+
     let temp_a_disabled = TempDir::new().expect("disabled gateway A tempdir");
     let temp_a = TempDir::new().expect("gateway A tempdir");
     let temp_b = TempDir::new().expect("gateway B tempdir");
     let svids = generate_two_gateway_svids(temp_b.path(), a_spiffe, b_spiffe);
-    let (echo_port, echo_received, echo_task) = start_counting_udp_echo().await;
     let node_a = "functional-live-udp-source-a";
     let node_b = "functional-live-udp-source-b";
+    let a_dns_overrides = format!(r#"{{"{ECHO_HOST}":"127.0.0.1"}}"#);
+    let b_dns_overrides = format!(r#"{{"{ECHO_HOST}":"{}"}}"#, destination.pod_ip());
     let cp_a = start_static_mesh_cp(live_source_capture_slice(
         node_a,
         b_spiffe,
-        "127.0.0.1",
+        ECHO_HOST,
         VIP,
         echo_port,
         AppProtocol::Udp,
@@ -11847,7 +11998,7 @@ async fn functional_mesh_live_source_capture_udp_manager_hbone_round_trip() {
     let cp_b = start_static_mesh_cp(live_source_capture_slice(
         node_b,
         b_spiffe,
-        "127.0.0.1",
+        ECHO_HOST,
         VIP,
         echo_port,
         AppProtocol::Udp,
@@ -11876,6 +12027,11 @@ async fn functional_mesh_live_source_capture_udp_manager_hbone_round_trip() {
                     "FERRUM_GATEWAY_SVID_TRUST_BUNDLE_PATH",
                     svids.b.trust_bundle_path.clone(),
                 ),
+                (
+                    "FERRUM_MESH_NODE_WAYPOINT_POD_REGISTRY_DIR",
+                    dest_registry.path().display().to_string(),
+                ),
+                ("FERRUM_DNS_OVERRIDES", b_dns_overrides),
             ],
         },
     ));
@@ -11926,8 +12082,13 @@ async fn functional_mesh_live_source_capture_udp_manager_hbone_round_trip() {
         captured_output(&temp_a_disabled)
     );
     tokio::time::sleep(Duration::from_secs(3)).await;
-    wait_for_udp_capture_snapshot(pod.pid(), capture_port, false, Duration::from_secs(6))
-        .expect("capture-disabled pod must have no UDP rules/listener");
+    wait_for_udp_capture_snapshot(
+        source.pod.pid(),
+        capture_port,
+        false,
+        Duration::from_secs(6),
+    )
+    .expect("capture-disabled pod must have no UDP rules/listener");
     disabled_a.stop();
 
     // #2085 fixed fresh-netns installation by checking generation-A chain
@@ -11964,6 +12125,7 @@ async fn functional_mesh_live_source_capture_udp_manager_hbone_round_trip() {
                 ("FERRUM_MESH_CAPTURE_UDP_PORT", capture_port.to_string()),
                 ("FERRUM_MESH_IP6TABLES_ENABLED", "false".to_string()),
                 ("FERRUM_MESH_EGRESS_HBONE_PORT", b_hbone_port.to_string()),
+                ("FERRUM_DNS_OVERRIDES", a_dns_overrides),
             ],
         },
     ));
@@ -11972,9 +12134,12 @@ async fn functional_mesh_live_source_capture_udp_manager_hbone_round_trip() {
         "UDP source gateway A did not start\n{}",
         captured_output(&temp_a)
     );
-    if let Err(error) =
-        wait_for_udp_capture_snapshot(pod.pid(), capture_port, true, Duration::from_secs(20))
-    {
+    if let Err(error) = wait_for_udp_capture_snapshot(
+        source.pod.pid(),
+        capture_port,
+        true,
+        Duration::from_secs(20),
+    ) {
         let status = gateway_a.poll_status();
         let gateway_a_output = captured_output(&temp_a);
         // #2085 made first-install detection portable by checking chain existence
@@ -11991,7 +12156,7 @@ async fn functional_mesh_live_source_capture_udp_manager_hbone_round_trip() {
     // Let at least two additional 2s reconcile passes run, then prove neither
     // the manager nor the idempotent scripts duplicated listeners/rules/routes.
     tokio::time::sleep(Duration::from_secs(5)).await;
-    let reconciled = udp_capture_snapshot(pod.pid(), capture_port)
+    let reconciled = udp_capture_snapshot(source.pod.pid(), capture_port)
         .expect("inspect reconciled UDP producer state");
     assert_eq!(
         reconciled.output_jumps, 1,
@@ -12014,12 +12179,14 @@ async fn functional_mesh_live_source_capture_udp_manager_hbone_round_trip() {
         "duplicate UDP listener: {reconciled:?}"
     );
 
-    let destination: SocketAddr = format!("{VIP}:{echo_port}").parse().expect("UDP VIP");
+    let vip_destination: SocketAddr = format!("{VIP}:{echo_port}").parse().expect("UDP VIP");
+    let source_client_ip = std::net::IpAddr::V4(source.pod_ip());
     let deadline = Instant::now() + Duration::from_secs(18);
-    let (reply, source) = loop {
-        match udp_round_trip_from_netns(
-            pod.pid(),
-            destination,
+    let (reply, reply_source) = loop {
+        match udp_round_trip_from_netns_with_source(
+            source.pod.pid(),
+            source_client_ip,
+            vip_destination,
             b"udp-source-capture-live",
             Duration::from_secs(3),
         ) {
@@ -12036,8 +12203,12 @@ async fn functional_mesh_live_source_capture_udp_manager_hbone_round_trip() {
     };
     assert_eq!(reply, b"udp-source-capture-live");
     assert_eq!(
-        source, destination,
+        reply_source, vip_destination,
         "the pod client must see the reply sourced from its original VIP:port"
+    );
+    assert!(
+        echo_received.load(Ordering::Relaxed) >= 1,
+        "the enrolled destination pod-netns echo must observe the captured datagram"
     );
 
     // Strict route negative: a second TEST-NET VIP is still TPROXY-captured, but
@@ -12047,8 +12218,9 @@ async fn functional_mesh_live_source_capture_udp_manager_hbone_round_trip() {
         .parse()
         .expect("unroutable UDP VIP");
     assert!(
-        udp_round_trip_from_netns(
-            pod.pid(),
+        udp_round_trip_from_netns_with_source(
+            source.pod.pid(),
+            source_client_ip,
             unroutable,
             b"must-fail-closed",
             Duration::from_secs(2),
@@ -12063,13 +12235,40 @@ async fn functional_mesh_live_source_capture_udp_manager_hbone_round_trip() {
         "unroutable UDP must not reach the destination echo"
     );
 
+    // Destination registry withdrawal: B must stop selecting the dest-pod netns
+    // relay. Host-netns fallback is isolated above, so the next datagram fails
+    // closed instead of echoing from the host.
+    std::fs::remove_file(&dest_registry_entry)
+        .expect("delete enrolled destination UDP registry entry");
+    let received_before_dest_withdraw = echo_received.load(Ordering::Relaxed);
+    assert!(
+        udp_round_trip_from_netns_with_source(
+            source.pod.pid(),
+            source_client_ip,
+            vip_destination,
+            b"dest-registry-withdrawn",
+            Duration::from_secs(2),
+        )
+        .is_err(),
+        "withdrawn destination registry/capture ownership must fail closed"
+    );
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(
+        echo_received.load(Ordering::Relaxed),
+        received_before_dest_withdraw,
+        "withdrawn destination registry must not reach the destination-pod echo"
+    );
+
     // Pod deletion: this netns producer test intentionally runs no node-agent.
     // Simulate that separate process only after observing the producer's durable
     // ack requirement. Node-agent unit coverage exercises the real responder,
     // including verified removal, refusal, and restart recovery; only then may
     // the producer remove its retained guard and every remaining rule/route.
     std::fs::remove_file(&registry_entry).expect("delete UDP pod registry entry");
-    let ack_required = registry.path().join(".udp-ack-required").join(POD_UID);
+    let ack_required = registry
+        .path()
+        .join(".udp-ack-required")
+        .join(SOURCE_POD_UID);
     let ack_deadline = Instant::now() + Duration::from_secs(5);
     while !ack_required.exists() && Instant::now() < ack_deadline {
         tokio::time::sleep(Duration::from_millis(10)).await;
@@ -12081,15 +12280,20 @@ async fn functional_mesh_live_source_capture_udp_manager_hbone_round_trip() {
     );
     let not_ready_dir = registry.path().join(".udp-not-ready");
     std::fs::create_dir_all(&not_ready_dir).expect("create UDP not-ready ack directory");
-    std::fs::write(not_ready_dir.join(POD_UID), b"")
+    std::fs::write(not_ready_dir.join(SOURCE_POD_UID), b"")
         .expect("publish node-agent UDP not-ready acknowledgement");
-    wait_for_udp_capture_snapshot(pod.pid(), capture_port, false, Duration::from_secs(12))
-        .expect("pod deletion must remove UDP rules/listener");
+    wait_for_udp_capture_snapshot(
+        source.pod.pid(),
+        capture_port,
+        false,
+        Duration::from_secs(12),
+    )
+    .expect("pod deletion must remove UDP rules/listener");
 
     // Closing A ends the CONNECT stream. B's relay-completion log is emitted
     // only by `handle_hbone_udp_request` after it accepted the UDP-marked HBONE
     // CONNECT and relayed the framed datagrams, so this proves the round trip did
-    // not pass through a direct/plaintext dial from A to the loopback echo.
+    // not pass through a direct/plaintext dial from A to the destination echo.
     gateway_a.stop();
     assert!(
         wait_for_captured_output(
@@ -12104,7 +12308,6 @@ async fn functional_mesh_live_source_capture_udp_manager_hbone_round_trip() {
     gateway_b.stop();
     cp_a.shutdown().await;
     cp_b.shutdown().await;
-    echo_task.abort();
 }
 
 #[cfg(target_os = "linux")]
@@ -12185,6 +12388,27 @@ impl LiveVethPod {
 
     fn pod_ip(&self) -> std::net::Ipv4Addr {
         std::net::Ipv4Addr::new(10, 203, self.host_ip.octets()[2], 2)
+    }
+
+    /// Publish this veth-backed pod as an enrolled destination: cgroup path,
+    /// attested SPIFFE ID, and the pod IPv4 the HBONE dest relay looks up.
+    fn publish_enrolled(
+        &self,
+        registry_dir: &std::path::Path,
+        pod_uid: &str,
+        spiffe_id: &str,
+    ) -> Result<PathBuf, String> {
+        std::fs::create_dir_all(registry_dir)
+            .map_err(|error| format!("create enrolled destination registry: {error}"))?;
+        let path = registry_dir.join(pod_uid);
+        let contents = format!(
+            "{}\nspiffe_id={spiffe_id}\nipv4={}\n",
+            self.pod.cgroup_dir.path().display(),
+            self.pod_ip()
+        );
+        std::fs::write(&path, contents)
+            .map_err(|error| format!("publish enrolled destination registry entry: {error}"))?;
+        Ok(path)
     }
 }
 
