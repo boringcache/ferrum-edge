@@ -88,8 +88,9 @@ Full policy: `docs/dependency-policy.md`. These are the load-bearing rules.
 - The temporary `fips-build.yml` whole-file generation admission (first used
   for #3889, retired by #3943) is **re-armed for exactly one transition**: PR
   #3950's artifact-based same-run FIPS handoff, pair
-  `527659b0…c7914b` → `05f86617…965e74` (recompute if #3950's workflow bytes
-  change). One-way, retire again once #3950 lands. Every other
+  `527659b0…c7914b` → `17bfb40f…e5e9e1` (including the runner-local AWS-LC
+  CMake quarantine; recompute if #3950's workflow bytes change). One-way,
+  retire again once #3950 lands. Every other
   `fips-build.yml` edit is compared by the normal fail-closed Cross surface
   scan. See `docs/ci_cd.md` → "Admitted `fips-build.yml` generation
   transition".

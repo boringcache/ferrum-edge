@@ -2062,11 +2062,13 @@ The temporary whole-file SHA-256 admission first used for PR #3889 (and retired
 by #3943 once #3889 landed) is **re-armed for exactly one transition**: PR
 #3950 moves the FIPS same-run producer→consumer handoff off the eviction-prone
 repository cache onto the immutable run artifact, which necessarily edits four
-digest-frozen `fips-build.yml` job bodies. The pair is exact and one-way:
+digest-frozen `fips-build.yml` job bodies. The destination also quarantines only
+restored `aws-lc-fips-sys-*/out/build` CMake intermediates before a cross-runner
+incremental build can reparse them. The pair is exact and one-way:
 trusted-base `527659b0ad96a0d97cd4a170543dd81acbf6784155b3c82918b1f70a20c7914b`
 (PR #3889's landed file) →
-`05f86617597b1eb7bcf1960a0c630a9884ff09ac1995982f46a80811c3965e74` (PR #3950
-head `0984a45e4`; recompute and re-pin if review changes the workflow bytes).
+`17bfb40fbd31e80e6ae1a0efca922069c54ec485ec7a611c3420840da3e5e9e1` (PR #3950
+head `df1223520`; recompute and re-pin if review changes the workflow bytes).
 The digest is over universal-newline-decoded text. RETIREMENT IS MANDATORY
 once #3950 lands, exactly as #3943 retired the #3889 pair. Any other
 `fips-build.yml` edit is still compared by the normal fail-closed Cross
