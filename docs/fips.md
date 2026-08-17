@@ -96,7 +96,16 @@ and `vendor/**`. That input is the one the pinned action actually uses; a
 sibling `key:` value is ignored whenever `shared-key` is set and is not
 wired. Automatic toolchain/environment/manifest/lock hashing stays enabled,
 and this layer is not SHA-scoped, so dependency/compiler work remains a warm
-inter-commit fallback. That compile job is build-only: complete FIPS
+inter-commit fallback. The stable layer does not trust AWS-LC's runner-local
+CMake incremental tree across runners: after every non-cold rust-cache restore
+attempt, `fips-compile` validates any restored `target/` root and removes matching
+`*/build/aws-lc-fips-sys-*/out/build` directories before Cargo can rerun the
+upstream build script. Installed AWS-LC libraries and Rust outputs stay warm,
+while any required CMake work starts clean instead of reparsing a restored
+`libbcm_c_generated_asm.a` archive. An explicitly requested exact handoff is
+promoted after this quarantine and replaces the stable target tree.
+
+That compile job is build-only: complete FIPS
 `unit_tests` and
 `integration_tests` executables are compiled by the parallel `fips-test-build`
 consumer so claimed-profile shards and clippy do not wait on test-binary

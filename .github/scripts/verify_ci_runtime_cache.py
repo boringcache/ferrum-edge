@@ -860,6 +860,26 @@ def check_fips_producer_channel(
         "'CARGO_BUILD_RUSTC_WRAPPER='",
         '>> "$GITHUB_ENV"',
     )
+    cmake_quarantine_step_name = (
+        "Quarantine restored AWS-LC FIPS CMake state"
+    )
+    cmake_quarantine_contract = (
+        'target_root="${GITHUB_WORKSPACE}/target"',
+        '[ -L "$target_root" ]',
+        '[ ! -e "$target_root" ]',
+        '[ ! -d "$target_root" ]',
+        'listing="$(mktemp "${RUNNER_TEMP}/fips-aws-lc-cmake-roots.XXXXXX")"',
+        "trap 'rm -f \"$listing\"' EXIT",
+        'if ! find "$target_root" -xdev \\',
+        '>"$listing"; then',
+        'while IFS= read -r -d \'\' cmake_root; do',
+        '"$target_root"/*/build/aws-lc-fips-sys-*/out/build',
+        '[ ! -d "$cmake_root" ] || [ -L "$cmake_root" ]',
+        'rm -rf -- "$cmake_root"',
+        "-path '*/build/aws-lc-fips-sys-*/out/build' -prune -print0",
+        'done <"$listing"',
+        "trap - EXIT",
+    )
     restored_binary_checks = (
         'fips_binary="${target_root}/debug/ferrum-edge"',
         '[ ! -f "$fips_binary" ]',
@@ -907,6 +927,32 @@ def check_fips_producer_channel(
             ),
             f"{job_name} must clear the runner-unique rustc-wrapper identity "
             "after setup-sccache and before any Cargo/cache operation",
+            failures,
+        )
+    cmake_quarantine_steps = [
+        step
+        for step in job_steps(compile_job)
+        if f"name: {cmake_quarantine_step_name}" in step
+    ]
+    require(
+        len(cmake_quarantine_steps) == 1,
+        "fips-compile must quarantine restored AWS-LC FIPS CMake state exactly "
+        "once",
+        failures,
+    )
+    if cmake_quarantine_steps:
+        quarantine_condition = step_if(cmake_quarantine_steps[0])
+        require(
+            COLD_NOT_TRUE in quarantine_condition
+            and "steps.rust-cache.outputs.cache-hit" not in quarantine_condition
+            and "continue-on-error:" not in cmake_quarantine_steps[0]
+            and all(
+                contract in cmake_quarantine_steps[0]
+                for contract in cmake_quarantine_contract
+            ),
+            "fips-compile must fail closed while removing only the restored "
+            "aws-lc-fips-sys out/build trees after every non-cold stable-cache "
+            "restore attempt",
             failures,
         )
     compile_saves = [
@@ -1090,23 +1136,33 @@ def check_fips_producer_channel(
         "without fabricating a hit",
         failures,
     )
-    download_position = compile_job.find("Download exact inter-run FIPS handoff artifact")
+    cache_position = compile_job.find(
+        "Cache FIPS Rust, AWS-LC, and sccache outputs"
+    )
+    quarantine_position = compile_job.find(cmake_quarantine_step_name)
+    download_position = compile_job.find(
+        "Download exact inter-run FIPS handoff artifact"
+    )
     promote_position = compile_job.find("Promote exact inter-run FIPS handoff artifact")
     refresh_position = compile_job.find(mtime_refresh)
     build_position = compile_job.find("Build the FIPS profile")
     package_position = compile_job.find("Package FIPS producer handoff")
     handoff_position = compile_job.find("Publish FIPS producer handoff")
     require(
-        download_position >= 0
+        cache_position >= 0
+        and quarantine_position >= 0
+        and download_position >= 0
         and promote_position >= 0
         and refresh_position >= 0
         and build_position >= 0
         and package_position >= 0
         and handoff_position >= 0
+        and cache_position < quarantine_position < download_position
         and download_position < promote_position < refresh_position < build_position
         and build_position < package_position < handoff_position,
-        "fips-compile must download/promote and mtime-refresh the exact inter-run "
-        "artifact before building, then publish the packaged immutable handoff",
+        "fips-compile must quarantine stable-cache CMake state before an optional "
+        "exact inter-run promotion, mtime-refresh that handoff before building, "
+        "then publish the packaged immutable handoff",
         failures,
     )
     require(
@@ -3851,6 +3907,63 @@ def self_test() -> int:
         not handoff_failures,
         "self-test: checked-in FIPS artifact handoff must pass: "
         + "; ".join(handoff_failures),
+        failures,
+    )
+
+    missing_cmake_quarantine = handoff_channel.replace(
+        "      - name: Quarantine restored AWS-LC FIPS CMake state\n",
+        "      - name: Reuse restored AWS-LC FIPS CMake state\n",
+        1,
+    )
+    missing_cmake_quarantine_failures: list[str] = []
+    check_fips_producer_channel(
+        missing_cmake_quarantine, missing_cmake_quarantine_failures
+    )
+    require(
+        any(
+            "must quarantine restored AWS-LC FIPS CMake state exactly once" in item
+            for item in missing_cmake_quarantine_failures
+        ),
+        "self-test: a missing restored AWS-LC CMake quarantine must fail",
+        failures,
+    )
+
+    widened_cmake_quarantine = handoff_channel.replace(
+        "-path '*/build/aws-lc-fips-sys-*/out/build' -prune -print0",
+        "-path '*/build/*/out/build' -prune -print0",
+        1,
+    )
+    widened_cmake_quarantine_failures: list[str] = []
+    check_fips_producer_channel(
+        widened_cmake_quarantine, widened_cmake_quarantine_failures
+    )
+    require(
+        any(
+            "removing only the restored aws-lc-fips-sys out/build trees" in item
+            for item in widened_cmake_quarantine_failures
+        ),
+        "self-test: a widened restored CMake quarantine must fail",
+        failures,
+    )
+
+    exact_hit_only_quarantine = handoff_channel.replace(
+        "      - name: Quarantine restored AWS-LC FIPS CMake state\n"
+        f"        if: {COLD_NOT_TRUE}\n",
+        "      - name: Quarantine restored AWS-LC FIPS CMake state\n"
+        f"        if: {COLD_NOT_TRUE} && "
+        "steps.rust-cache.outputs.cache-hit == 'true'\n",
+        1,
+    )
+    exact_hit_only_quarantine_failures: list[str] = []
+    check_fips_producer_channel(
+        exact_hit_only_quarantine, exact_hit_only_quarantine_failures
+    )
+    require(
+        any(
+            "after every non-cold stable-cache restore attempt" in item
+            for item in exact_hit_only_quarantine_failures
+        ),
+        "self-test: an exact-hit-only CMake quarantine must fail",
         failures,
     )
 

@@ -19,7 +19,10 @@ name: FIPS Build Policy
 #      Swatinem/rust-cache actually uses; a sibling `key:` input is ignored
 #      whenever `shared-key` is set and must not appear). Automatic
 #      toolchain/env/manifest/lock hashing stays enabled. This layer is NOT
-#      SHA-scoped, so dependency/compiler work stays warm across commits.
+#      SHA-scoped, so dependency/compiler work stays warm across commits. The
+#      compile producer removes only restored aws-lc-fips-sys `out/build`
+#      CMake trees before Cargo: those intermediates are runner-local and can
+#      fail an incremental delocate pass after crossing runners.
 #    - Exact producer handoff artifact: the successful producer tree
 #      (workspace target + sccache + the checkout's Git tree identity) is
 #      packaged as a zstd tar and published as the immutable, one-day artifact
@@ -409,6 +412,57 @@ jobs:
             --hit "$CACHE_HIT" \
             --path "${GITHUB_WORKSPACE}/.cache/sccache" \
             --note "layer=stable-fallback; measured=sccache-directory-subset; rust-cache Cargo/target archive bytes are not exposed; shared-key=ci-fips-contract save-if=non-fork fork=${FORK_PR:-false}"
+
+      # The stable cache crosses runners. AWS-LC's CMake build tree does not:
+      # an incremental rerun can feed the restored libbcm archive back through
+      # delocate and reject debug `.loc` directives that the original clean
+      # build accepted. Keep installed libraries and Rust outputs warm, but
+      # force any later aws-lc-fips-sys build-script rerun to start from a clean
+      # CMake tree. Any exact artifact promotion happens later and replaces target.
+      - name: Quarantine restored AWS-LC FIPS CMake state
+        if: github.event.inputs.force_cold_cache != 'true'
+        run: |
+          set -euo pipefail
+          target_root="${GITHUB_WORKSPACE}/target"
+          if [ -L "$target_root" ]; then
+            echo "::error::restored FIPS target must not be a symlink" >&2
+            exit 1
+          fi
+          if [ ! -e "$target_root" ]; then
+            echo "rust-cache restore contains no target tree; no AWS-LC CMake state to quarantine."
+            exit 0
+          fi
+          if [ ! -d "$target_root" ]; then
+            echo "::error::restored FIPS target must be a real directory" >&2
+            exit 1
+          fi
+          listing="$(mktemp "${RUNNER_TEMP}/fips-aws-lc-cmake-roots.XXXXXX")"
+          trap 'rm -f "$listing"' EXIT
+          if ! find "$target_root" -xdev \
+            -path '*/build/aws-lc-fips-sys-*/out/build' -prune -print0 \
+            >"$listing"; then
+            echo "::error::failed to enumerate restored AWS-LC CMake state" >&2
+            exit 1
+          fi
+          quarantined=0
+          while IFS= read -r -d '' cmake_root; do
+            case "$cmake_root" in
+              "$target_root"/*/build/aws-lc-fips-sys-*/out/build) ;;
+              *)
+                echo "::error::AWS-LC CMake quarantine escaped the FIPS target" >&2
+                exit 1
+                ;;
+            esac
+            if [ ! -d "$cmake_root" ] || [ -L "$cmake_root" ]; then
+              echo "::error::restored AWS-LC CMake state must be a real directory" >&2
+              exit 1
+            fi
+            rm -rf -- "$cmake_root"
+            quarantined=$((quarantined + 1))
+          done <"$listing"
+          rm -f "$listing"
+          trap - EXIT
+          echo "Quarantined ${quarantined} restored AWS-LC FIPS CMake build tree(s)."
 
       # Full reruns delete artifacts from earlier attempts of the same run.
       # Warm evidence therefore chains separate workflow_dispatch runs, naming
