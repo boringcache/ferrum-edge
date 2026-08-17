@@ -921,6 +921,11 @@ def check_fips_producer_channel(
         if step_uses(step).startswith(UPLOAD_ARTIFACT)
     ]
     require(
+        "protobuf-compiler zstd" in compile_job,
+        "fips-compile must install zstd before extracting or packaging a handoff",
+        failures,
+    )
+    require(
         not compile_saves,
         "fips-compile must not publish the eviction-prone repository cache as a "
         "producer channel; the immutable handoff artifact is the channel, found "
@@ -1150,7 +1155,10 @@ def check_fips_producer_channel(
         'channel_root="${RUNNER_TEMP}/fips-producer-channel"',
         '"$PREFIX"*) ;;',
         'attempt="${name#"$PREFIX"}"',
-        "''|*[!0-9]*) continue ;;",
+        "''|0|*[!0-9]*)",
+        "channel contains a non-directory entry",
+        "channel contains an unexpected artifact name",
+        "channel contains a malformed attempt",
         '[ "$attempt" -gt "$selected_attempt" ]',
         'if [ -z "$selected" ]; then',
         "refusing to claim compile-to-consumer reuse",
@@ -1178,6 +1186,11 @@ def check_fips_producer_channel(
         (clippy_job, "fips-clippy"),
         (test_build_job, "fips-test-build"),
     ):
+        require(
+            "protobuf-compiler zstd" in job_body,
+            f"{job_name} must install zstd before extracting the producer handoff",
+            failures,
+        )
         restores = [
             step
             for step in job_steps(job_body)
@@ -1287,6 +1300,13 @@ def check_fips_producer_channel(
             f"{job_name} must promote the newest attempt-wildcard handoff and "
             "validate its payload, source tree, clean checkout, and executable "
             "before refreshing regular target-file mtimes",
+            failures,
+        )
+        require(
+            'selected="$channel_root"' not in job_body
+            and 'selected_attempt="single"' not in job_body,
+            f"{job_name} must accept only the pinned download action's "
+            "per-artifact directory shape",
             failures,
         )
         require(
@@ -1405,9 +1425,14 @@ def check_fips_producer_channel(
     require(
         "actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c"
         in test_job
-        and "fips-test-binaries-${{ github.run_id }}-${{ github.run_attempt }}"
-        in test_job,
-        "fips-test must download the pinned immutable artifact from this run attempt",
+        and "pattern: fips-test-binaries-${{ github.run_id }}-*" in test_job
+        and "FIPS_TEST_ARTIFACT_PREFIX: fips-test-binaries-${{ github.run_id }}-"
+        in test_job
+        and "attempts.append((int(raw_attempt), candidate))" in test_job
+        and "_, bundle = max(attempts)" in test_job,
+        "fips-test must download the pinned immutable artifacts for this run and "
+        "select the newest attempt so failed-job reruns can reuse a skipped "
+        "producer's artifact",
         failures,
     )
     require(
@@ -2742,6 +2767,14 @@ def check_docs_and_coverage(failures: list[str]) -> None:
         failures,
     )
     require(
+        "fips-test-binaries-<run_id>-*" in ci_cd
+        and "newest attempt" in ci_cd.lower()
+        and "failed-job rerun" in ci_cd.lower(),
+        "docs/ci_cd.md must document attempt-wildcard FIPS test-artifact "
+        "selection for failed-job reruns",
+        failures,
+    )
+    require(
         "shared-key" in ci_cd and "ignored" in ci_cd.lower(),
         "docs/ci_cd.md must document that pinned rust-cache ignores key when shared-key is set",
         failures,
@@ -2874,6 +2907,14 @@ def check_docs_and_coverage(failures: list[str]) -> None:
     require(
         "fips-test-build" in fips_doc,
         "docs/fips.md must document the FIPS test-binary producer job",
+        failures,
+    )
+    require(
+        "fips-test-binaries-<run_id>-*" in fips_doc
+        and "newest attempt" in fips_doc.lower()
+        and "failed-job rerun" in fips_doc.lower(),
+        "docs/fips.md must document attempt-wildcard FIPS test-artifact "
+        "selection for failed-job reruns",
         failures,
     )
     require(
@@ -3648,6 +3689,17 @@ def self_test() -> int:
         failures,
     )
 
+    missing_zstd = handoff_channel.replace(
+        "protobuf-compiler zstd", "protobuf-compiler", 1
+    )
+    missing_zstd_failures: list[str] = []
+    check_fips_producer_channel(missing_zstd, missing_zstd_failures)
+    require(
+        any("must install zstd" in item for item in missing_zstd_failures),
+        "self-test: a FIPS handoff job without zstd must fail",
+        failures,
+    )
+
     missing_mtime_refresh = handoff_channel.replace(
         '          find "$target_root" -xdev -type f \\\n'
         '            -exec touch --reference="$mtime_reference" -- {} +\n',
@@ -3865,6 +3917,62 @@ def self_test() -> int:
             for item in attempt_scoped_failures
         ),
         "self-test: an attempt-scoped consumer download must fail",
+        failures,
+    )
+
+    undocumented_direct_root = handoff_channel.replace(
+        '          if [ -z "$selected" ]; then\n',
+        '          selected="$channel_root"\n'
+        '          selected_attempt="single"\n'
+        '          if [ -z "$selected" ]; then\n',
+        1,
+    )
+    undocumented_direct_root_failures: list[str] = []
+    check_fips_producer_channel(
+        undocumented_direct_root, undocumented_direct_root_failures
+    )
+    require(
+        any(
+            "per-artifact directory shape" in item
+            for item in undocumented_direct_root_failures
+        ),
+        "self-test: accepting an undocumented direct-root artifact must fail",
+        failures,
+    )
+
+    attempt_scoped_test_download = handoff_channel.replace(
+        "          pattern: fips-test-binaries-${{ github.run_id }}-*\n",
+        "          name: fips-test-binaries-${{ github.run_id }}-${{ github.run_attempt }}\n",
+        1,
+    )
+    attempt_scoped_test_failures: list[str] = []
+    check_fips_producer_channel(
+        attempt_scoped_test_download, attempt_scoped_test_failures
+    )
+    require(
+        any(
+            "failed-job reruns can reuse a skipped producer's artifact" in item
+            for item in attempt_scoped_test_failures
+        ),
+        "self-test: an attempt-scoped FIPS test download must fail",
+        failures,
+    )
+
+    oldest_test_artifact = handoff_channel.replace(
+        "          _, bundle = max(attempts)\n",
+        "          _, bundle = min(attempts)\n",
+        1,
+    )
+    oldest_test_artifact_failures: list[str] = []
+    check_fips_producer_channel(
+        oldest_test_artifact, oldest_test_artifact_failures
+    )
+    require(
+        any(
+            "select the newest attempt" in item
+            for item in oldest_test_artifact_failures
+        ),
+        "self-test: selecting the oldest FIPS test artifact must fail",
         failures,
     )
 

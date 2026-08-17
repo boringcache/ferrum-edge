@@ -362,10 +362,14 @@ artifact handoff:
 
 `fips-test-build` precompiles the complete FIPS `unit_tests` and
 `integration_tests` executables and stages digest-bound copies in an
-immutable same-run artifact. The test job downloads only the attempt-scoped
-artifact, rejects unexpected names, symlinks, path escapes, and SHA-256
-mismatches, then executes the two binaries directly. Fresh-checkout source
-mtimes therefore cannot make Cargo repeat test-only compile/link work.
+immutable same-run artifact. The test job downloads the run-scoped,
+attempt-wildcard pattern `fips-test-binaries-<run_id>-*`, rejects malformed
+artifact names and paths, selects the newest attempt, then rejects unexpected
+bundle names, symlinks, path escapes, and SHA-256 mismatches before executing
+the two binaries directly. A failed-job rerun can therefore reuse the artifact
+from the successful `fips-test-build` prerequisite that GitHub skipped in the
+new attempt. Fresh-checkout source mtimes cannot make Cargo repeat test-only
+compile/link work.
 Non-cold consumers fail closed if no producer handoff for their source
 SHA/run_id exists. Fork pull requests restore the rust-cache fallback only
 and cannot save it; GitHub confines

@@ -49,9 +49,13 @@ name: FIPS Build Policy
 #    copies as an immutable same-run artifact, overlapping claimed-profile and
 #    clippy work after the shorter build-only producer. The test-binary job
 #    remains a handoff consumer and does not publish inter-run state.
-# 5. `fips-test` downloads only the immutable same-run test artifact and
-#    validates its manifest/digests before direct execution. This transport is
-#    available on forced-cold and fork runs without publishing shared cache.
+# 5. `fips-test` downloads the immutable same-run test artifacts by the
+#    attempt-wildcard pattern `fips-test-binaries-${{ github.run_id }}-*`,
+#    selects the newest matching attempt, and validates its manifest/digests
+#    before direct execution. A failed-job rerun can therefore reuse the
+#    artifact from the successful, skipped `fips-test-build` prerequisite.
+#    This transport is available on forced-cold and fork runs without
+#    publishing shared cache.
 # 6. `fips-build` keeps the `FIPS Build & Test` check name and fails closed,
 #    including on the test-binary producer result.
 #
@@ -639,7 +643,7 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
-            cmake ninja-build golang-go libcurl4-openssl-dev protobuf-compiler
+            cmake ninja-build golang-go libcurl4-openssl-dev protobuf-compiler zstd
 
       - uses: ./.github/actions/setup-fast-linker
 
@@ -718,32 +722,29 @@ jobs:
           if [ -d "$channel_root" ]; then
             for candidate in "$channel_root"/*; do
               if [ ! -d "$candidate" ] || [ -L "$candidate" ]; then
-                continue
+                echo "::error::producer handoff channel contains a non-directory entry" >&2
+                exit 1
               fi
               name="$(basename "$candidate")"
               case "$name" in
                 "$PREFIX"*) ;;
-                *) continue ;;
+                *)
+                  echo "::error::producer handoff channel contains an unexpected artifact name" >&2
+                  exit 1
+                  ;;
               esac
               attempt="${name#"$PREFIX"}"
               case "$attempt" in
-                ''|*[!0-9]*) continue ;;
+                ''|0|*[!0-9]*)
+                  echo "::error::producer handoff channel contains a malformed attempt" >&2
+                  exit 1
+                  ;;
               esac
               if [ "$attempt" -gt "$selected_attempt" ]; then
                 selected_attempt="$attempt"
                 selected="$candidate"
               fi
             done
-          fi
-          # A pattern download that matched exactly ONE artifact extracts its
-          # payload directly into the channel root (no per-artifact
-          # subdirectory) — the ordinary first-attempt shape. Multiple matched
-          # attempts nest one subdirectory each and the newest wins above.
-          if [ -z "$selected" ] \
-            && [ -f "$channel_root/fips-producer-handoff.tar.zst" ] \
-            && [ ! -L "$channel_root/fips-producer-handoff.tar.zst" ]; then
-            selected="$channel_root"
-            selected_attempt="single"
           fi
           if [ -z "$selected" ]; then
             echo "::error::fips-compile producer handoff was not published for this event-stable source SHA/run_id; refusing to claim compile-to-consumer reuse" >&2
@@ -926,7 +927,7 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
-            cmake ninja-build golang-go libcurl4-openssl-dev protobuf-compiler
+            cmake ninja-build golang-go libcurl4-openssl-dev protobuf-compiler zstd
 
       - uses: ./.github/actions/setup-fast-linker
 
@@ -1005,32 +1006,29 @@ jobs:
           if [ -d "$channel_root" ]; then
             for candidate in "$channel_root"/*; do
               if [ ! -d "$candidate" ] || [ -L "$candidate" ]; then
-                continue
+                echo "::error::producer handoff channel contains a non-directory entry" >&2
+                exit 1
               fi
               name="$(basename "$candidate")"
               case "$name" in
                 "$PREFIX"*) ;;
-                *) continue ;;
+                *)
+                  echo "::error::producer handoff channel contains an unexpected artifact name" >&2
+                  exit 1
+                  ;;
               esac
               attempt="${name#"$PREFIX"}"
               case "$attempt" in
-                ''|*[!0-9]*) continue ;;
+                ''|0|*[!0-9]*)
+                  echo "::error::producer handoff channel contains a malformed attempt" >&2
+                  exit 1
+                  ;;
               esac
               if [ "$attempt" -gt "$selected_attempt" ]; then
                 selected_attempt="$attempt"
                 selected="$candidate"
               fi
             done
-          fi
-          # A pattern download that matched exactly ONE artifact extracts its
-          # payload directly into the channel root (no per-artifact
-          # subdirectory) — the ordinary first-attempt shape. Multiple matched
-          # attempts nest one subdirectory each and the newest wins above.
-          if [ -z "$selected" ] \
-            && [ -f "$channel_root/fips-producer-handoff.tar.zst" ] \
-            && [ ! -L "$channel_root/fips-producer-handoff.tar.zst" ]; then
-            selected="$channel_root"
-            selected_attempt="single"
           fi
           if [ -z "$selected" ]; then
             echo "::error::fips-compile producer handoff was not published for this event-stable source SHA/run_id; refusing to claim compile-to-consumer reuse" >&2
@@ -1171,7 +1169,7 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
-            cmake ninja-build golang-go libcurl4-openssl-dev protobuf-compiler
+            cmake ninja-build golang-go libcurl4-openssl-dev protobuf-compiler zstd
 
       - uses: ./.github/actions/setup-fast-linker
 
@@ -1249,32 +1247,29 @@ jobs:
           if [ -d "$channel_root" ]; then
             for candidate in "$channel_root"/*; do
               if [ ! -d "$candidate" ] || [ -L "$candidate" ]; then
-                continue
+                echo "::error::producer handoff channel contains a non-directory entry" >&2
+                exit 1
               fi
               name="$(basename "$candidate")"
               case "$name" in
                 "$PREFIX"*) ;;
-                *) continue ;;
+                *)
+                  echo "::error::producer handoff channel contains an unexpected artifact name" >&2
+                  exit 1
+                  ;;
               esac
               attempt="${name#"$PREFIX"}"
               case "$attempt" in
-                ''|*[!0-9]*) continue ;;
+                ''|0|*[!0-9]*)
+                  echo "::error::producer handoff channel contains a malformed attempt" >&2
+                  exit 1
+                  ;;
               esac
               if [ "$attempt" -gt "$selected_attempt" ]; then
                 selected_attempt="$attempt"
                 selected="$candidate"
               fi
             done
-          fi
-          # A pattern download that matched exactly ONE artifact extracts its
-          # payload directly into the channel root (no per-artifact
-          # subdirectory) — the ordinary first-attempt shape. Multiple matched
-          # attempts nest one subdirectory each and the newest wins above.
-          if [ -z "$selected" ] \
-            && [ -f "$channel_root/fips-producer-handoff.tar.zst" ] \
-            && [ ! -L "$channel_root/fips-producer-handoff.tar.zst" ]; then
-            selected="$channel_root"
-            selected_attempt="single"
           fi
           if [ -z "$selected" ]; then
             echo "::error::fips-compile producer handoff was not published for this event-stable source SHA/run_id; refusing to claim compile-to-consumer reuse" >&2
@@ -1489,11 +1484,16 @@ jobs:
       - name: Initialize runtime telemetry
         run: python3 .github/scripts/ci_runtime_telemetry.py init --quiet
 
+      # A failed-job rerun can execute this consumer at attempt N without
+      # rerunning its already-successful fips-test-build prerequisite. Download
+      # every immutable test bundle for this run and select the newest attempt
+      # below instead of asking for an artifact the skipped producer never
+      # published at attempt N.
       - name: Download exact FIPS test executables
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
         with:
-          name: fips-test-binaries-${{ github.run_id }}-${{ github.run_attempt }}
-          path: ${{ runner.temp }}/fips-test-bundle
+          pattern: fips-test-binaries-${{ github.run_id }}-*
+          path: ${{ runner.temp }}/fips-test-channel
 
       - name: Assert cache-service credentials are absent
         run: |
@@ -1512,7 +1512,8 @@ jobs:
       - name: Validate restored FIPS test executables
         id: fips-test-binaries
         env:
-          FIPS_TEST_BUNDLE: ${{ runner.temp }}/fips-test-bundle
+          FIPS_TEST_CHANNEL: ${{ runner.temp }}/fips-test-channel
+          FIPS_TEST_ARTIFACT_PREFIX: fips-test-binaries-${{ github.run_id }}-
         run: |
           python3 - <<'PY'
           import hashlib
@@ -1521,7 +1522,35 @@ jobs:
           from pathlib import Path
           import re
 
-          bundle = Path(os.environ["FIPS_TEST_BUNDLE"]).resolve(strict=True)
+          channel_path = Path(os.environ["FIPS_TEST_CHANNEL"])
+          if channel_path.is_symlink():
+              raise SystemExit("FIPS test artifact channel must not be a symlink")
+          channel = channel_path.resolve(strict=True)
+          if not channel.is_dir():
+              raise SystemExit("FIPS test artifact channel is not a directory")
+          prefix = os.environ["FIPS_TEST_ARTIFACT_PREFIX"]
+          attempts = []
+          for candidate_path in channel.iterdir():
+              if candidate_path.is_symlink() or not candidate_path.is_dir():
+                  raise SystemExit(
+                      f"unexpected non-directory FIPS test artifact entry: {candidate_path.name}"
+                  )
+              if not candidate_path.name.startswith(prefix):
+                  raise SystemExit(
+                      f"unexpected FIPS test artifact name: {candidate_path.name}"
+                  )
+              raw_attempt = candidate_path.name[len(prefix):]
+              if re.fullmatch(r"[1-9][0-9]*", raw_attempt) is None:
+                  raise SystemExit(
+                      f"malformed FIPS test artifact attempt: {candidate_path.name}"
+                  )
+              candidate = candidate_path.resolve(strict=True)
+              if candidate.parent != channel:
+                  raise SystemExit("FIPS test artifact directory escaped channel root")
+              attempts.append((int(raw_attempt), candidate))
+          if not attempts:
+              raise SystemExit("no FIPS test artifact exists for this workflow run")
+          _, bundle = max(attempts)
           manifest_path = bundle / "manifest.json"
           if manifest_path.is_symlink():
               raise SystemExit("FIPS test manifest must not be a symlink")

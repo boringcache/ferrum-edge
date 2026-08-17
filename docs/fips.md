@@ -159,9 +159,12 @@ ordinal modulo three and fails closed if it selects none. The six claimed
 combinations therefore remain checker-owned while running in parallel with
 clippy and test-binary compile after the shorter build-only producer.
 Non-cold consumers, fork runs included, fail closed if no producer handoff
-for their source SHA/run_id was published. `fips-test` consumes only the
-same-run immutable artifact and never
-restores a build cache. The required `FIPS Build & Test` aggregate depends on
+for their source SHA/run_id was published. `fips-test` consumes only immutable
+test artifacts from its workflow run and never restores a build cache. It
+downloads `fips-test-binaries-<run_id>-*`, validates the attempt-scoped
+directory names, and selects the newest attempt before validating the bundle,
+so a failed-job rerun can reuse the successful test-build prerequisite's
+earlier artifact. The required `FIPS Build & Test` aggregate depends on
 `fips-test-build` and fails closed if that producer does not succeed.
 The pinned cache and artifact actions hold their GitHub Actions service
 credentials inside the action process;
@@ -183,11 +186,11 @@ cleanup still runs. The successful compile producer publishes before claimed
 checks, clippy, and test-binary compile start, so a downstream runner-loss retry
 can reuse it; abrupt loss of the producer cannot publish that producer's
 unsaved artifact state. A `workflow_dispatch` input
-`force_cold_cache` skips cache restore/save and the producer-handoff artifact
-download/upload so a hosted cold-cache run still proves every live assertion.
-Its `fips-test-build` job still sends the exact
-test binaries to its own test job through the attempt-scoped artifact; that
-same-run transport
+`force_cold_cache` skips shared-cache restore/save and the producer-handoff
+download, packaging, and upload so a hosted cold-cache run still proves every
+live assertion. Its `fips-test-build` job still publishes exact test binaries
+under its attempt-scoped artifact name; the test job selects the newest bundle
+for that workflow run. That same-run transport
 does not warm or publish a shared cache. Path planning is fail-closed: a missing or unknown trusted
 planner runs the compile gate rather than skipping it. Path planning reads a
 NUL-delimited `git diff --name-only --no-renames -z` listing so a hostile
