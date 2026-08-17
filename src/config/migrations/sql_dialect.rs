@@ -1891,9 +1891,17 @@ mod tests {
     #[test]
     fn namespaces_registry_backfill_is_gated_by_schema_compat_marker() {
         let source = include_str!("sql_dialect.rs");
+        let completed_start = source
+            .find("async fn namespaces_registry_backfill_completed(")
+            .expect("completion-check helper");
+        let mark_start = source
+            .find("async fn mark_namespaces_registry_backfill_complete(")
+            .expect("completion-mark helper");
         let start = source
             .find("async fn backfill_namespaces_registry(")
             .expect("backfill helper");
+        let completed_helper = &source[completed_start..mark_start];
+        let mark_helper = &source[mark_start..start];
         let body = &source[start..];
         let end = body
             .find("\n    /// Authoritative namespace-keyed")
@@ -1914,11 +1922,16 @@ mod tests {
             insert_at < mark_at,
             "the marker must be written after the idempotent inserts so a crash retries:\n{body}"
         );
-        assert!(
-            body.contains("NAMESPACES_REGISTRY_BACKFILL_ID")
-                && body.contains("_ferrum_schema_compat"),
-            "completion must live in the internal compatibility table:\n{body}"
-        );
+        for (name, helper) in [
+            ("completion check", completed_helper),
+            ("completion mark", mark_helper),
+        ] {
+            assert!(
+                helper.contains("NAMESPACES_REGISTRY_BACKFILL_ID")
+                    && helper.contains("_ferrum_schema_compat"),
+                "{name} must use the internal compatibility table and marker ID:\n{helper}"
+            );
+        }
     }
 
     #[test]
