@@ -3546,7 +3546,8 @@ mod tests {
 
         let published = pairing.h3_accepted().expect("paired candidate");
         let state = pairing.lock.lock().await;
-        let expected = pair_h3_candidate(&state);
+        let expected = pair_h3_candidate(&state)
+            .expect("the seeded pairing state must retain a server certificate");
         assert!(
             Arc::ptr_eq(&published.config, &expected.config),
             "published H3 config must match the locked pairing snapshot"
@@ -3568,12 +3569,16 @@ mod tests {
             "shared listener slot and stream-listener TLS must stay coherent"
         );
         if let Some(cp) = state.cp_config.as_ref() {
+            let operator_config = state
+                .operator_config
+                .as_ref()
+                .expect("this operator-certificate test must retain its operator config");
             assert!(
                 Arc::ptr_eq(&published.config, cp),
                 "CP material still owns the H3 server certificate"
             );
             assert!(
-                !Arc::ptr_eq(&published.config, &state.operator_candidate.config),
+                !Arc::ptr_eq(&published.config, operator_config),
                 "operator server certificate must not win while CP material is active"
             );
             assert!(
