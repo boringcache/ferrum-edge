@@ -11960,6 +11960,27 @@ CI_JOB_GENERATION_TRANSITIONS: tuple[tuple[str, str, str], ...] = (
         "74673023dee4c0970a8b8d3c9a99089be2f28eddf57ddb7337febdf22bd5a7e4",
         "e7d9a4c0ea26a14efd92844998a42219ca2fb1379072776a313de6dd9b720986",
     ),
+    # The three per-suite live gates on the trusted base → PR #3915
+    # (issue #3900) after merging latest `main` (branch
+    # grok/issue-3900-ebpf-gates, merged text d95ea4796): the union
+    # `run_ebpf_live` planner gate splits into per-suite fail-closed outputs
+    # (`run_ebpf_kernel_live` / `run_netns_capture_live` /
+    # `run_two_cluster_live`), moving each consumer job's `if:` and comments.
+    (
+        "ebpf-live",
+        "b7596b48641c850f797c84710dd5646013414d6ba01c30f4d4b2805737c8c26c",
+        "9aa3332bff5c4538f797f31133be0ef7dfc9767a72e7212b39be33ed58dcca87",
+    ),
+    (
+        "netns-capture-live",
+        "db543d5c35bfbd4a7b987a52635b359ea6268669257cd313146324f5ca79f598",
+        "b71296ba5929c78cd786301cc8ed677905cca82cd605be46880021b88c243e32",
+    ),
+    (
+        "two-cluster-mesh-live",
+        "0586ab0b5b8b803f2ee3663b608c40caca06f9c92e58d4cb28c2080d68f23f27",
+        "9c3d5b4dfbc6a209e801a47bceabd31fe8aa7df033d49989ad8f88a3e4ed73e7",
+    ),
 )
 
 # Local composite actions are compared by whole-file digest once Cross-sensitive.
