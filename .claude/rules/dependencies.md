@@ -85,12 +85,14 @@ Full policy: `docs/dependency-policy.md`. These are the load-bearing rules.
   two-family a PR may leave the workflow byte-identical or adopt the whole
   three-family shape, and once the base is three-family a revert is refused. See
   `docs/ci_cd.md` → "Admitted release image-family adoption".
-- The temporary `fips-build.yml` whole-file generation admission for issue
-  #3888 / PR #3889 is **retired** now that #3889 is on `main`. Ordinary
-  `fips-build.yml` edits are compared by the normal fail-closed Cross surface
-  scan with no special case. The generic SHA-256 generation digest helper
-  remains for CI-job and local-action transitions. See `docs/ci_cd.md` →
-  "Retired `fips-build.yml` generation transition".
+- The temporary `fips-build.yml` whole-file generation admission (first used
+  for #3889, retired by #3943) is **re-armed for exactly one transition**: PR
+  #3950's artifact-based same-run FIPS handoff, pair
+  `527659b0…c7914b` → `05f86617…965e74` (recompute if #3950's workflow bytes
+  change). One-way, retire again once #3950 lands. Every other
+  `fips-build.yml` edit is compared by the normal fail-closed Cross surface
+  scan. See `docs/ci_cd.md` → "Admitted `fips-build.yml` generation
+  transition".
 - `Helm Chart` proves `.github/actions/setup-kubernetes-tools` against the
   trusted revision before `uses:`. Issue #3904 admits exactly one extracted
   checker generation: current `action.yml`
@@ -101,7 +103,11 @@ Full policy: `docs/dependency-policy.md`. These are the load-bearing rules.
   base.
 - Cross-sensitive `ci.yml` jobs `ci-plan`, `test`, and `performance-regression`
   carry temporary SHA-256 generation pairs (`CI_JOB_GENERATION_TRANSITIONS`)
-  for PRs #3913 and #3911. `setup-rust-ci/action.yml` carries a two-step
+  for PRs #3913 and #3911, the three per-suite live gates (`ebpf-live`,
+  `netns-capture-live`, `two-cluster-mesh-live`) carry pairs for PR #3915's
+  planner-gate split (adopted digests pinned against #3915's latest-main merge
+  `d95ea4796`), and `build-binaries` carries a pair for PR #3916's macOS
+  compile-gate reduction. `setup-rust-ci/action.yml` carries a two-step
   trusted-base chain (`LOCAL_ACTION_GENERATION_TRANSITIONS`): #3889's landed
   `fc4e41818dffdea880c057c8dfa0881a629cd01c917b43f69a9f2e5e9bd90dda` moving to
   the cache-budget generation
@@ -113,6 +119,15 @@ Full policy: `docs/dependency-policy.md`. These are the load-bearing rules.
   direct #3889→#3911 pair is superseded; #3911 must rebase to the combined
   text. Each step is exact, path-bound, one-way, no candidate allowlist. See
   `docs/ci_cd.md` → "Admitted CI job SHA-256 generation transitions".
+- Non-protected workflows get the same mechanism through
+  `WORKFLOW_DIRECTORY_JOB_GENERATION_TRANSITIONS`, keyed by workflow filename
+  AND job name: `coverage.yml`'s `coverage-merge` carries a pair for PR
+  #3917's shard-scoped coverage-merge reshape (issue #3907; adopted digest
+  pinned against #3917's latest-main merge). On the exact admitted pair only
+  that job's `job:<name>:*` surfaces are withheld; everything else in the file
+  is scanned as before, and the reverse pair is refused. Retire each tuple
+  once its destination is on `main`. See `docs/ci_cd.md` → "Admitted
+  workflow-directory job SHA-256 generation transitions".
 
 ## Drift Guard
 

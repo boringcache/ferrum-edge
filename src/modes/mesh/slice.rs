@@ -700,6 +700,39 @@ pub(crate) fn node_waypoint_capture_peer_authentications_for_destinations<'a>(
         .collect()
 }
 
+/// PeerAuthentication set that governs a generated NodeWaypoint DTLS listener.
+///
+/// The NodeWaypoint's own inbound view (`peer_authentications`) is filtered to
+/// policies that apply to the waypoint pod. A selector-scoped destination
+/// overlay — including the live `dtls-echo` `portLevelMtls` PERMISSIVE pin —
+/// does not match that pod, so it is stripped from that view. Resolving DTLS
+/// client-certificate demand against only that view therefore treats the
+/// destination as namespace-wide `STRICT`, requires `FERRUM_DTLS_CLIENT_CA_CERT_PATH`,
+/// and drops every application-data session that presents no client certificate
+/// even after the DTLS handshake has already completed (dimpl still finishes
+/// an empty-Certificate handshake). The capture inventory already carries
+/// destination-applicable PeerAuthentication without widening the waypoint's
+/// own inbound view (issue #3287); union it here. Duplicates collapse by
+/// `(namespace, name)`. Cold-path only (slice apply / owner-config publish).
+pub fn node_waypoint_destination_peer_authentications(
+    slice: &MeshSlice,
+) -> Vec<PeerAuthentication> {
+    let mut seen: HashSet<(&str, &str)> = HashSet::new();
+    let mut out = Vec::with_capacity(
+        slice.node_waypoint_capture_peer_authentications.len() + slice.peer_authentications.len(),
+    );
+    for peer_auth in slice
+        .node_waypoint_capture_peer_authentications
+        .iter()
+        .chain(slice.peer_authentications.iter())
+    {
+        if seen.insert((peer_auth.namespace.as_str(), peer_auth.name.as_str())) {
+            out.push(peer_auth.clone());
+        }
+    }
+    out
+}
+
 impl MeshSlice {
     /// Compare mesh-slice content while ignoring the transport version stamp.
     ///

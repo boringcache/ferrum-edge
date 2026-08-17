@@ -15,6 +15,7 @@ use crate::health_check::ProxyHealthState;
 use arc_swap::ArcSwap;
 use dashmap::DashMap;
 use std::collections::{HashMap, HashSet};
+use std::net::IpAddr;
 use std::sync::LazyLock;
 
 use crate::fips::backend::rand::{SecureRandom, SystemRandom};
@@ -1559,6 +1560,40 @@ impl LoadBalancerCache {
         balancer.select_for_port(ctx_key, port, health)
     }
 
+    /// Select a target whose literal address shares `destination`'s IP family.
+    ///
+    /// Family is a hard eligibility scope (like port or subset), applied *inside*
+    /// ordinary health, locality, weight, and algorithm selection. Hostnames stay
+    /// eligible here; DNS filters them later. `None` means no same-family backend
+    /// exists — callers must fail closed rather than crossing families.
+    #[inline]
+    pub fn select_target_matching_family_from(
+        snapshot: &LoadBalancerCacheInner,
+        namespace: &str,
+        upstream_id: &str,
+        ctx_key: &str,
+        health: Option<&HealthContext<'_>>,
+        destination: IpAddr,
+    ) -> Option<TargetSelection> {
+        let balancer = snapshot.balancer(namespace, upstream_id)?;
+        balancer.select_matching_family(ctx_key, health, destination)
+    }
+
+    /// Port-lane variant of [`Self::select_target_matching_family_from`].
+    #[inline]
+    pub fn select_target_for_port_matching_family_from(
+        snapshot: &LoadBalancerCacheInner,
+        namespace: &str,
+        upstream_id: &str,
+        ctx_key: &str,
+        port: u16,
+        health: Option<&HealthContext<'_>>,
+        destination: IpAddr,
+    ) -> Option<TargetSelection> {
+        let balancer = snapshot.balancer(namespace, upstream_id)?;
+        balancer.select_for_port_matching_family(ctx_key, port, health, destination)
+    }
+
     /// Select a target from a named subset within an upstream.
     /// Unknown, empty, or fully unhealthy subsets return `None`.
     #[inline]
@@ -2106,6 +2141,19 @@ pub fn target_key(upstream_id: &str, target: &UpstreamTarget) -> String {
     key.push_str("::");
     write_target_host_port_key(&mut key, target);
     key
+}
+
+/// Literal backend IPs must share `destination`'s canonical family. Hostnames
+/// are admitted here so DNS can filter answers later; do not treat a hostname
+/// as a family mismatch.
+pub fn backend_host_matches_ip_family(host: &str, destination: IpAddr) -> bool {
+    match host.parse::<IpAddr>() {
+        Ok(ip) => {
+            crate::util::client_identity::canonical_ip(ip).is_ipv4()
+                == crate::util::client_identity::canonical_ip(destination).is_ipv4()
+        }
+        Err(_) => true,
+    }
 }
 
 /// Domain-separation prefix for backend-bound sticky-session tokens. Bumping
@@ -4693,6 +4741,32 @@ impl LoadBalancer {
             .collect()
     }
 
+    /// Stack bitset of targets eligible for `destination`'s address family.
+    /// Requires `self.targets.len() <= MAX_BITSET_TARGETS`.
+    fn family_eligibility_bitset(&self, destination: IpAddr) -> HealthBitset {
+        debug_assert!(self.targets.len() <= MAX_BITSET_TARGETS);
+        let mut bits = 0u128;
+        for (i, target) in self.targets.iter().enumerate() {
+            if i >= MAX_BITSET_TARGETS {
+                break;
+            }
+            if backend_host_matches_ip_family(&target.host, destination) {
+                bits |= 1u128 << i;
+            }
+        }
+        HealthBitset::from_bits(bits)
+    }
+
+    /// Vec-fallback (>128 targets) equivalent of [`Self::family_eligibility_bitset`].
+    fn family_eligibility_indices(&self, destination: IpAddr) -> Vec<usize> {
+        self.targets
+            .iter()
+            .enumerate()
+            .filter(|(_, target)| backend_host_matches_ip_family(&target.host, destination))
+            .map(|(idx, _)| idx)
+            .collect()
+    }
+
     pub fn select(
         &self,
         ctx_key: &str,
@@ -4731,6 +4805,63 @@ impl LoadBalancer {
         let (healthy, degraded) = self.preferred_locality_bitset(
             &healthy,
             &scope,
+            self.locality_lb.as_ref(),
+            self.failover_enabled,
+        );
+        self.select_with_bitset(ctx_key, &healthy)
+            .map(|target| TargetSelection {
+                target,
+                is_fallback: degraded,
+            })
+    }
+
+    /// Select among backends whose literal address shares `destination`'s family.
+    ///
+    /// Family membership is an eligibility scope, not a post-selection rewrite:
+    /// active/passive health, locality/failover, weights, and the configured
+    /// algorithm all run inside that scope. An empty same-family pool returns
+    /// `None` (fail closed). When same-family backends exist but all are
+    /// unhealthy, degraded fallback stays inside the family — it never crosses
+    /// to the other address family.
+    pub fn select_matching_family(
+        &self,
+        ctx_key: &str,
+        health: Option<&HealthContext<'_>>,
+        destination: IpAddr,
+    ) -> Option<TargetSelection> {
+        let n = self.targets.len();
+        if n == 0 {
+            return None;
+        }
+
+        if n > MAX_BITSET_TARGETS {
+            return self.select_matching_family_vec_fallback(ctx_key, health, destination);
+        }
+
+        let family_scope = self.family_eligibility_bitset(destination);
+        if family_scope.is_empty() {
+            return None;
+        }
+
+        let healthy = self.compute_health_bitset_for_mask(health, &family_scope);
+        if healthy.is_empty() {
+            let (all, _) = self.preferred_locality_bitset(
+                &family_scope,
+                &family_scope,
+                self.locality_lb.as_ref(),
+                self.failover_enabled,
+            );
+            return self
+                .select_with_bitset(ctx_key, &all)
+                .map(|target| TargetSelection {
+                    target,
+                    is_fallback: true,
+                });
+        }
+
+        let (healthy, degraded) = self.preferred_locality_bitset(
+            &healthy,
+            &family_scope,
             self.locality_lb.as_ref(),
             self.failover_enabled,
         );
@@ -4880,6 +5011,96 @@ impl LoadBalancer {
         })
     }
 
+    /// Port-lane variant of [`Self::select_matching_family`].
+    ///
+    /// Uses the same per-port algorithm, counters, weights, hash ring, and
+    /// locality/failover state as [`Self::select_for_port`], intersected with
+    /// destination-family eligibility. Missing port state falls back to the
+    /// upstream-level family selector.
+    pub fn select_for_port_matching_family(
+        &self,
+        ctx_key: &str,
+        port: u16,
+        health: Option<&HealthContext<'_>>,
+        destination: IpAddr,
+    ) -> Option<TargetSelection> {
+        let Some(port_state) = self.port_overrides.get(&port) else {
+            return self.select_matching_family(ctx_key, health, destination);
+        };
+        let n = self.targets.len();
+        if n == 0 || port_state.target_indices.is_empty() {
+            return None;
+        }
+
+        if n > MAX_BITSET_TARGETS {
+            return self.select_port_matching_family_vec_fallback(
+                ctx_key,
+                port_state,
+                health,
+                destination,
+            );
+        }
+
+        let family_scope = self.family_eligibility_bitset(destination);
+        if family_scope.is_empty() {
+            return None;
+        }
+        let port_scope = bitset_for_indices(&port_state.target_indices);
+        let scope = port_scope.intersect(&family_scope);
+        if scope.is_empty() {
+            return None;
+        }
+
+        let port_healthy = self.compute_health_bitset_for_mask(health, &scope);
+        let port_locality = port_state
+            .locality_lb
+            .as_ref()
+            .or(self.locality_lb.as_ref());
+
+        if port_healthy.is_empty() {
+            let (all_port_targets, _) = self.preferred_locality_bitset(
+                &scope,
+                &scope,
+                port_locality,
+                port_state.failover_enabled,
+            );
+            return self
+                .select_with_bitset_using(
+                    ctx_key,
+                    &all_port_targets,
+                    port_state.algorithm,
+                    &port_state.rr_counter,
+                    &port_state.wrr_state,
+                    &port_state.hash_ring,
+                    port_locality,
+                )
+                .map(|target| TargetSelection {
+                    target,
+                    is_fallback: true,
+                });
+        }
+
+        let (port_healthy, degraded) = self.preferred_locality_bitset(
+            &port_healthy,
+            &scope,
+            port_locality,
+            port_state.failover_enabled,
+        );
+        self.select_with_bitset_using(
+            ctx_key,
+            &port_healthy,
+            port_state.algorithm,
+            &port_state.rr_counter,
+            &port_state.wrr_state,
+            &port_state.hash_ring,
+            port_locality,
+        )
+        .map(|target| TargetSelection {
+            target,
+            is_fallback: degraded,
+        })
+    }
+
     /// Select a target from a named subset using a per-port override when one
     /// exists for `port`. Unknown, empty, or fully unhealthy subset/port
     /// intersections return `None`, matching `select_from_subset`.
@@ -4977,6 +5198,100 @@ impl LoadBalancer {
         let (candidates, degraded) = self.preferred_locality_candidates(
             candidates,
             &port_state.target_indices,
+            port_locality,
+            port_state.failover_enabled,
+        );
+
+        self.select_from_candidates_vec_using(
+            ctx_key,
+            &candidates,
+            port_state.algorithm,
+            &port_state.rr_counter,
+            &port_state.wrr_state,
+            &port_state.hash_ring,
+            port_locality,
+        )
+        .map(|target| TargetSelection {
+            target,
+            is_fallback: is_fallback || degraded,
+        })
+    }
+
+    fn select_matching_family_vec_fallback(
+        &self,
+        ctx_key: &str,
+        health: Option<&HealthContext<'_>>,
+        destination: IpAddr,
+    ) -> Option<TargetSelection> {
+        let scope_indices = self.family_eligibility_indices(destination);
+        if scope_indices.is_empty() {
+            return None;
+        }
+        let healthy = self.healthy_targets_vec_for_indices(health, &scope_indices);
+        if healthy.is_empty() {
+            let all: Vec<(usize, &Arc<UpstreamTarget>)> = scope_indices
+                .iter()
+                .copied()
+                .filter_map(|idx| self.targets.get(idx).map(|target| (idx, target)))
+                .collect();
+            let (all, _) = self.preferred_locality_candidates(
+                all,
+                &scope_indices,
+                self.locality_lb.as_ref(),
+                self.failover_enabled,
+            );
+            return self
+                .select_from_candidates_vec(ctx_key, &all)
+                .map(|target| TargetSelection {
+                    target,
+                    is_fallback: true,
+                });
+        }
+        let (healthy, degraded) = self.preferred_locality_candidates(
+            healthy,
+            &scope_indices,
+            self.locality_lb.as_ref(),
+            self.failover_enabled,
+        );
+        self.select_from_candidates_vec(ctx_key, &healthy)
+            .map(|target| TargetSelection {
+                target,
+                is_fallback: degraded,
+            })
+    }
+
+    fn select_port_matching_family_vec_fallback(
+        &self,
+        ctx_key: &str,
+        port_state: &PortLbState,
+        health: Option<&HealthContext<'_>>,
+        destination: IpAddr,
+    ) -> Option<TargetSelection> {
+        let family_indices = self.family_eligibility_indices(destination);
+        if family_indices.is_empty() {
+            return None;
+        }
+        let scope_indices =
+            self.subset_port_intersection_vec(&port_state.target_indices, &family_indices);
+        if scope_indices.is_empty() {
+            return None;
+        }
+        let mut candidates = self.healthy_targets_vec_for_indices(health, &scope_indices);
+        let is_fallback = candidates.is_empty();
+        if is_fallback {
+            candidates = scope_indices
+                .iter()
+                .copied()
+                .filter_map(|idx| self.targets.get(idx).map(|target| (idx, target)))
+                .collect();
+        }
+        let port_locality = port_state
+            .locality_lb
+            .as_ref()
+            .or(self.locality_lb.as_ref());
+        let (candidates, degraded) = self.preferred_locality_candidates(
+            candidates,
+            &scope_indices,
             port_locality,
             port_state.failover_enabled,
         );

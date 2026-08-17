@@ -1386,6 +1386,18 @@ fn service_app_protocol(port_entry: &Value, port_name: Option<&str>) -> AppProto
     // named `http` is an HTTP listener over TCP), so only `Udp` pre-empts here.
     let l4 = workload_port_protocol(string_field(port_entry, "protocol"));
     if matches!(l4, AppProtocol::Udp) {
+        // `dtls` is the ONE L7 hint allowed to refine a UDP port, and it refines
+        // it WITHIN the same L4 transport (issue #3286): it selects frontend
+        // DTLS termination on a NodeWaypoint UDP listener instead of an opaque
+        // datagram relay. Every other hint is still ignored on a UDP port —
+        // `appProtocol: http` describes what rides the datagrams, not the
+        // transport, and must never pull the port into HTTP-family routing. A
+        // `protocol: TCP` port can therefore never become `Dtls`.
+        if string_field(port_entry, "appProtocol").is_some_and(hint_is_dtls)
+            || port_name.is_some_and(hint_is_dtls)
+        {
+            return AppProtocol::Dtls;
+        }
         return l4;
     }
     if let Some(protocol) = string_field(port_entry, "appProtocol").and_then(app_protocol_from_hint)
@@ -1411,6 +1423,17 @@ fn workload_port_protocol(protocol: Option<&str>) -> AppProtocol {
         // yet; keep them unknown until a stage consumes them.
         _ => AppProtocol::Unknown,
     }
+}
+
+/// Whether an `appProtocol` / port-name hint names DTLS.
+///
+/// Deliberately NOT part of [`app_protocol_from_hint`]: DTLS is only meaningful
+/// on a `protocol: UDP` port, and folding it into the generic hint table would
+/// let a `protocol: TCP` port named `dtls` classify as a datagram transport.
+/// Matches the same lowercase-prefix convention as the generic table
+/// (`dtls`, `dtls-sip`, …) so a named port carries the hint.
+fn hint_is_dtls(value: &str) -> bool {
+    value.to_ascii_lowercase().starts_with("dtls")
 }
 
 fn app_protocol_from_hint(value: &str) -> Option<AppProtocol> {

@@ -2013,15 +2013,21 @@ modification of the verifier it protects, and the landing is administrative afte
 root review), then an ordinary pull request that adopts the release workflow
 under the now-trusted policy and runs the full hosted matrix.
 
-##### Retired `fips-build.yml` generation transition (issue #3888 / PR #3889)
+##### Admitted `fips-build.yml` generation transition (issue #3888 lineage / PR #3950, temporary)
 
-PR #3889 landed on `main` as `7e9e69493`. The temporary whole-file SHA-256
-admission that let that rewrite pass the Cross surface scan is **retired and
-non-operational**. Ordinary `.github/workflows/fips-build.yml` edits are
-compared by the normal fail-closed Cross surface scan with no special case, no
-`admitted_generation_transition` bypass, and no FIPS-only classifier. The
-generic SHA-256 generation digest helper remains because CI-job and
-local-action finite transitions still use it.
+The temporary whole-file SHA-256 admission first used for PR #3889 (and retired
+by #3943 once #3889 landed) is **re-armed for exactly one transition**: PR
+#3950 moves the FIPS same-run producer→consumer handoff off the eviction-prone
+repository cache onto the immutable run artifact, which necessarily edits four
+digest-frozen `fips-build.yml` job bodies. The pair is exact and one-way:
+trusted-base `527659b0ad96a0d97cd4a170543dd81acbf6784155b3c82918b1f70a20c7914b`
+(PR #3889's landed file) →
+`05f86617597b1eb7bcf1960a0c630a9884ff09ac1995982f46a80811c3965e74` (PR #3950
+head `0984a45e4`; recompute and re-pin if review changes the workflow bytes).
+The digest is over universal-newline-decoded text. RETIREMENT IS MANDATORY
+once #3950 lands, exactly as #3943 retired the #3889 pair. Any other
+`fips-build.yml` edit is still compared by the normal fail-closed Cross
+surface scan.
 
 ##### Admitted CI job SHA-256 generation transitions (temporary)
 
@@ -2033,9 +2039,19 @@ relaxing the scan, the trusted policy admits exact retired→adopted pairs
 
 | Job | Retired SHA-256 (trusted base) | Adopted SHA-256 | Destination |
 |---|---|---|---|
-| `ci-plan` | `b3d95b6f0324f9a9ef842516907d7f5ff58d6d4a13f4a2d8afa5d659d6ab8336` | `c818a55308d27fe47692af3f22c8fdbd495755cf471760114ec2e6e4cb849c08` | PR #3913 / issue #3903 |
-| `test` | `e70ecf0924d88b6d86591608b471b70faad270ece6067c65b94eb5509ae1a03f` | `6bc548059b5b5efffbeb403ccfafebff8124c99af49a00c14aaa9af7e948e59d` | PR #3913 / issue #3903 |
 | `performance-regression` | `74673023dee4c0970a8b8d3c9a99089be2f28eddf57ddb7337febdf22bd5a7e4` | `e7d9a4c0ea26a14efd92844998a42219ca2fb1379072776a313de6dd9b720986` | PR #3911 / issue #3906 |
+| `ebpf-live` | `b7596b48641c850f797c84710dd5646013414d6ba01c30f4d4b2805737c8c26c` | `9aa3332bff5c4538f797f31133be0ef7dfc9767a72e7212b39be33ed58dcca87` | PR #3915 / issue #3900 |
+| `netns-capture-live` | `db543d5c35bfbd4a7b987a52635b359ea6268669257cd313146324f5ca79f598` | `b71296ba5929c78cd786301cc8ed677905cca82cd605be46880021b88c243e32` | PR #3915 / issue #3900 |
+| `two-cluster-mesh-live` | `0586ab0b5b8b803f2ee3663b608c40caca06f9c92e58d4cb28c2080d68f23f27` | `9c3d5b4dfbc6a209e801a47bceabd31fe8aa7df033d49989ad8f88a3e4ed73e7` | PR #3915 / issue #3900 |
+| `build-binaries` | `3bc9e7da00d7033b550df36db00048373b959aea437506ac28e494947422eaec` | `14b0890e2693cd0825fcf25ba7f48810b5ae9a33f2cbb5751bdaaf60186b83b1` | PR #3916 / issue #3905 |
+
+The three `#3915` pairs admit the per-suite planner-gate split (the union
+`run_ebpf_live` output becomes `run_ebpf_kernel_live` /
+`run_netns_capture_live` / `run_two_cluster_live`); the adopted digests are
+pinned against #3915's branch after merging latest `main`
+(`grok/issue-3900-ebpf-gates`, merged text `d95ea4796`). #3915's `ci-plan` /
+`test` changes are planner-body and aggregate-summary edits that today's scan
+does not read as Cross-sensitive, so those need no pair here.
 
 Each digest is the SHA-256 of `extract_job_block` text. Both ends are exact, the
 binding includes the job name, the move is one-way, and only that job's
@@ -2052,10 +2068,38 @@ Jobs omitted because a single predecessor cannot name a unique merged text:
 - `ci-plan` / `test` for #3915 (issue #3900) — different destination hashes from
   #3913. After #3913 is the trusted base, #3915 needs a follow-up predecessor.
 
-Lint (`#3909`), `build-binaries` (`#3916`), coverage planning (`#3917`), and
-optional live-suite `changes` jobs (`#3919`) are not admitted here. They are not
-folded into this predecessor; if hosted Cross disagrees after a latest-`main`
-merge, they need their own exact pair rather than a wildcard.
+Lint (`#3909`), `build-binaries` (`#3916`), and optional live-suite `changes`
+jobs (`#3919`) are not admitted here. They are not folded into this
+predecessor; if hosted Cross disagrees after a latest-`main` merge, they need
+their own exact pair rather than a wildcard. Coverage planning (`#3917`) is
+admitted, but in the workflow-directory table below because `coverage.yml` is
+not a protected workflow.
+
+##### Admitted workflow-directory job SHA-256 generation transitions (temporary)
+
+The `CI_JOB_GENERATION_TRANSITIONS` table above only reaches `ci.yml`, which
+has its own dedicated comparison. Every other workflow is compared by the
+generic directory scan, where a Cross-flagged job carries a whole-job
+`job:<name>:<digest>` surface — so even a benign edit inside such a job moves
+its surface and is refused. `WORKFLOW_DIRECTORY_JOB_GENERATION_TRANSITIONS` in
+`.github/scripts/verify_cross_build_policy.py` admits exact retired→adopted
+pairs for those jobs, keyed by the workflow filename AND the job name:
+
+| Workflow | Job | Retired SHA-256 (trusted base) | Adopted SHA-256 | Destination |
+|---|---|---|---|---|
+| `coverage.yml` | `coverage-merge` | `d2480af21698fb3ad041b32b39587c949aeedec24746c8d5c8c63acd9f9d2fb6` | `34f5e1b022f1d01ac72d13c66256e11ff87c15135d775c03736e6701b2223a1c` | PR #3917 / issue #3907 |
+
+The pair admits #3917's shard-scoped coverage-merge reshape (planned-shard
+artifact selection, plugin gate, planned-shard outcome enforcement), pinned
+against #3917's branch after merging latest `main`
+(`grok/issue-3907-coverage-shards-r1`; recompute and re-pin if review changes
+the job bytes). Each digest is the SHA-256 of `extract_job_block` text. Both
+ends are exact, the binding includes the filename and job name, the move is
+one-way, and on the exact admitted pair only that job's `job:<name>:*`
+surfaces are withheld — an explicit Cross surface anywhere else in the same
+file, or any other revision pair of the named job, is scanned as before.
+RETIREMENT IS MANDATORY: once each destination is on `main`, delete that
+tuple.
 
 ##### Admitted `setup-rust-ci` generation transitions (temporary)
 
@@ -2102,7 +2146,10 @@ not close them.
    #3889 already rewrote `test-pkcs11-softhsm` on `main`, so #3913 must merge
    that result and may need a new PKCS job pair.
 5. Merge latest `main` into #3909, #3916, and #3917 and land them as ordinary
-   implementation PRs unless hosted Cross names a new frozen surface.
+   implementation PRs unless hosted Cross names a new frozen surface. #3917's
+   `coverage-merge` reshape is admitted by the workflow-directory job pair
+   above (added by a follow-up predecessor once the directory scan refused
+   the moved whole-job surface).
 6. Merge latest `main` into #3911 and land it. This predecessor now admits the
    combined `setup-rust-ci` destination; the `performance-regression` pair
    remains valid if that job is untouched.

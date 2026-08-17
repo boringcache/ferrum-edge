@@ -373,6 +373,24 @@ impl ResolvedAddresses {
         Self { addresses, start }
     }
 
+    /// Keep only addresses in the same canonical family as `destination`.
+    ///
+    /// Session setup uses this so an IPv4 Service ClusterIP cannot dial an
+    /// IPv6 backend (UDP `connect` succeeds, then ICMP refuses). Iteration
+    /// order follows the already-rotated answer set; the result is not
+    /// rotated again.
+    pub fn matching_family(&self, destination: IpAddr) -> Self {
+        let want_v4 = crate::util::client_identity::canonical_ip(destination).is_ipv4();
+        let filtered: Vec<IpAddr> = self
+            .iter()
+            .filter(|ip| crate::util::client_identity::canonical_ip(*ip).is_ipv4() == want_v4)
+            .collect();
+        Self {
+            addresses: Arc::from(filtered),
+            start: 0,
+        }
+    }
+
     pub fn len(&self) -> usize {
         self.addresses.len()
     }
