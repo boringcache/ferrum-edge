@@ -9,10 +9,12 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, anyhow};
 use clap::{Parser, ValueEnum};
 use mesh_dns_e2e_perf::dns_wire::{
-    QTYPE_A, build_query, build_query_with_edns, frame_for_tcp, parse_response,
+    QTYPE_A, build_query, build_query_with_edns, decode_tcp_dns_length, frame_for_tcp,
+    parse_response,
 };
 use mesh_dns_e2e_perf::metrics::{
     ClassMetrics, ClassReport, NameClass, RunReport, Transport, print_text_report,
+    selected_reports_failure,
 };
 use mesh_dns_e2e_perf::slice::workload_names;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -103,23 +105,39 @@ async fn main() -> Result<(), anyhow::Error> {
         ProtocolMode::Tcp => vec![Transport::Tcp],
         ProtocolMode::Both => vec![Transport::Udp, Transport::Tcp],
     };
+    let selected_classes: Vec<NameClass> = NameClass::ALL
+        .iter()
+        .copied()
+        .filter(|class| names.iter().any(|(_, selected)| selected == class))
+        .collect();
 
     let mut all_reports: Vec<ClassReport> = Vec::new();
-    for transport in transports {
+    for &transport in &transports {
         let reports = run_phase(&args, target, transport, &names).await?;
         all_reports.extend(reports);
     }
 
+    // Emit the machine-readable (or text) report before failing so hosted
+    // artifacts still contain the partial blob for diagnosis. A selected
+    // protocol or row with zero successes or nonzero query errors must not
+    // look like a clean run.
     if args.json {
         let run = RunReport {
             target: args.target.clone(),
             concurrency: args.concurrency,
             duration_secs: args.duration,
-            reports: all_reports,
+            reports: all_reports.clone(),
         };
         println!("{}", serde_json::to_string_pretty(&run)?);
     } else {
         print_text_report(&all_reports, &args.target, args.concurrency);
+    }
+
+    if let Some(reason) =
+        selected_reports_failure(&all_reports, &selected_classes, &transports)
+    {
+        eprintln!("[dns_loadgen] {reason}");
+        return Err(anyhow!(reason));
     }
     Ok(())
 }
@@ -289,7 +307,8 @@ async fn tcp_query(
     .await
     .map_err(|_| anyhow!("tcp connect timed out"))??;
     stream.set_nodelay(true)?;
-    let framed = frame_for_tcp(packet);
+    let framed = frame_for_tcp(packet)
+        .ok_or_else(|| anyhow!("DNS TCP query cannot be represented by a u16 length prefix"))?;
     stream.write_all(&framed).await?;
     let mut len_buf = [0u8; 2];
     timeout(
@@ -298,7 +317,8 @@ async fn tcp_query(
     )
     .await
     .map_err(|_| anyhow!("tcp read length timed out"))??;
-    let len = u16::from_be_bytes(len_buf) as usize;
+    let len = decode_tcp_dns_length(len_buf)
+        .map_err(|_| anyhow!("tcp DNS rejected empty length prefix"))?;
     let mut buf = vec![0u8; len];
     timeout(
         Duration::from_millis(timeout_ms),

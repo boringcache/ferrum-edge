@@ -12073,6 +12073,41 @@ CI_JOB_GENERATION_TRANSITIONS: tuple[tuple[str, str, str], ...] = (
     ),
 )
 
+# ---------------------------------------------------------------------------
+# Admitted workflow-directory job SHA-256 generation transitions (temporary)
+# ---------------------------------------------------------------------------
+# The `ci.yml` pairs above are consulted by the dedicated CI-workflow
+# comparison. Jobs in every OTHER workflow are compared by the generic
+# directory scan, whose Cross-flagged jobs carry a whole-job
+# `job:<name>:<digest>` surface — so even a benign edit inside such a job
+# moves its surface and is refused. This table admits exact retired→adopted
+# pairs for those jobs, keyed by the workflow filename AND the job name, with
+# the same properties as the `ci.yml` table: both ends are exact
+# `extract_job_block` SHA-256 digests the trusted base names (the candidate
+# supplies nothing), the move is one-way (the reverse pair is refused
+# explicitly), and only that one job's `job:` surfaces are withheld — an
+# explicit Cross surface added anywhere else in the same file, or any other
+# revision pair of the named job, is scanned exactly as before.
+#
+# RETIREMENT: once each destination is on `main`, delete that tuple. See
+# `docs/ci_cd.md` → "Admitted workflow-directory job SHA-256 generation
+# transitions".
+WORKFLOW_DIRECTORY_JOB_GENERATION_TRANSITIONS: tuple[
+    tuple[str, str, str, str], ...
+] = (
+    # `coverage.yml` `coverage-merge` on the trusted base → PR #3917
+    # (issue #3907): shard-scoped coverage planning re-shapes the merge
+    # aggregate (planned-shard artifact selection, plugin gate, planned-shard
+    # outcome enforcement), pinned against its latest-main-merged branch
+    # grok/issue-3907-coverage-shards-r1.
+    (
+        "coverage.yml",
+        "coverage-merge",
+        "d2480af21698fb3ad041b32b39587c949aeedec24746c8d5c8c63acd9f9d2fb6",
+        "34f5e1b022f1d01ac72d13c66256e11ff87c15135d775c03736e6701b2223a1c",
+    ),
+)
+
 # Local composite actions are compared by whole-file digest once Cross-sensitive.
 # `setup-rust-ci/action.yml` carries a two-step chain from PR #3889's landed
 # file: first the cache-budget generation (this change) that gates rust-cache
@@ -12231,6 +12266,9 @@ def scan_pr_workflow_collection_cross_surfaces(
     admitted_generation_transition: tuple[str, str, str] = (
         FIPS_BUILD_ADMITTED_GENERATION_TRANSITION
     ),
+    directory_job_transitions: tuple[tuple[str, str, str, str], ...] = (
+        WORKFLOW_DIRECTORY_JOB_GENERATION_TRANSITIONS
+    ),
 ) -> list[str]:
     """Permit safe workflow edits while rejecting new or changed Cross inputs.
 
@@ -12239,6 +12277,10 @@ def scan_pr_workflow_collection_cross_surfaces(
     before/after fixture must be able to prove that a hostile edit changes the
     Cross surface without also being asked to be a whole repository. The
     production pull-request path calls `compare_pr_workflow_collection`.
+
+    Both admission keywords exist so the self-test can drive the production
+    comparisons with fixtures it is able to construct; production always uses
+    the module bindings, and no repository input reaches either parameter.
     """
 
     errors: list[str] = []
@@ -12317,6 +12359,43 @@ def scan_pr_workflow_collection_cross_surfaces(
         proposed_failures = [*proposed_failures, *proposed_flow_failures]
         errors.extend(baseline_failures)
         errors.extend(proposed_failures)
+        # Admitted per-file job generation transitions: the same exact-pair,
+        # one-way mechanism as the `ci.yml` table, keyed additionally by the
+        # workflow filename. On the exact admitted adoption only that job's
+        # `job:<name>:<digest>` surfaces are withheld from BOTH revisions — the
+        # withheld surfaces ARE the admitted digests, so any other change to
+        # the job, and any Cross surface anywhere else in the file, still
+        # differs and is refused. The reverse pair is refused explicitly.
+        file_job_transitions = tuple(
+            (job_name, retired, adopted)
+            for workflow_name, job_name, retired, adopted in (
+                directory_job_transitions
+            )
+            if workflow_name == name
+        )
+        if file_job_transitions:
+            errors.extend(
+                ci_job_generation_transition_errors(
+                    baseline_contents,
+                    proposed_contents,
+                    f"{source}/{name}",
+                    transitions=file_job_transitions,
+                )
+            )
+            admitted_file_jobs = admitted_ci_job_generation_names(
+                baseline_contents,
+                proposed_contents,
+                f"{source}/{name}",
+                transitions=file_job_transitions,
+            )
+            baseline_surfaces = without_admitted_job_surfaces(
+                baseline_surfaces,
+                admitted_file_jobs,
+            )
+            proposed_surfaces = without_admitted_job_surfaces(
+                proposed_surfaces,
+                admitted_file_jobs,
+            )
         if not baseline_failures and not proposed_failures:
             # The admitted generation transition withholds this one verdict, for
             # this one file, for this one revision pair. Both failure lists above
@@ -18495,6 +18574,241 @@ pre_build = []
             "the workflow generation digest is not the SHA-256 of the revision"
         )
 
+    # --- Admitted workflow-directory job generation transitions -------------
+    # The production table names two exact `extract_job_block` digests of a job
+    # this fixture cannot embed, so the fixtures below are two synthetic
+    # generations of one Cross-flagged job and the admitted pair is supplied
+    # through the same keyword production uses. Both generations carry a
+    # literal Cross execution so both revisions are guaranteed to carry the
+    # whole-job `job:<name>:<digest>` surface, which is what makes every
+    # "was not admitted" assertion below meaningful.
+    directory_job_fixture_name = "coverage.yml"
+    directory_job_fixture_job = "coverage-merge"
+    directory_job_retired_generation = (
+        "name: Coverage merge fixture\n"
+        "on: [pull_request]\n"
+        "jobs:\n"
+        "  coverage-merge:\n"
+        "    runs-on: ubuntu-latest\n"
+        "    steps:\n"
+        "      - run: cross build --target aarch64-unknown-linux-gnu\n"
+    )
+    directory_job_adopted_generation = directory_job_retired_generation.replace(
+        "      - run: cross build --target aarch64-unknown-linux-gnu\n",
+        "      - run: cross build --target aarch64-unknown-linux-gnu\n"
+        "      - run: echo adopted\n",
+    )
+    directory_job_retired_block, directory_job_retired_failures = extract_job_block(
+        directory_job_retired_generation,
+        "self-test workflow directory fixture",
+        directory_job_fixture_job,
+        required=True,
+    )
+    directory_job_adopted_block, directory_job_adopted_failures = extract_job_block(
+        directory_job_adopted_generation,
+        "self-test workflow directory fixture",
+        directory_job_fixture_job,
+        required=True,
+    )
+    if (
+        directory_job_retired_failures
+        or directory_job_adopted_failures
+        or directory_job_retired_block is None
+        or directory_job_adopted_block is None
+    ):
+        failures.append(
+            "the workflow-directory job generation fixtures did not parse"
+        )
+    else:
+        directory_job_fixture_transitions = (
+            (
+                directory_job_fixture_name,
+                directory_job_fixture_job,
+                workflow_generation_digest(directory_job_retired_block),
+                workflow_generation_digest(directory_job_adopted_block),
+            ),
+        )
+        directory_job_rollback_refusal = (
+            f"proposed self-test workflow directory/{directory_job_fixture_name} "
+            f"job {directory_job_fixture_job!r} cannot return to a retired "
+            "generation after the trusted base adopts an admitted one"
+        )
+
+        def directory_job_scan(
+            baseline: dict[str, str],
+            proposed: dict[str, str],
+            *,
+            transitions: tuple[tuple[str, str, str, str], ...] | None = (
+                directory_job_fixture_transitions
+            ),
+        ) -> list[str]:
+            """Scan one fixture pair, optionally under the production table."""
+
+            if transitions is None:
+                return scan_pr_workflow_collection_cross_surfaces(
+                    baseline,
+                    proposed,
+                    "self-test workflow directory",
+                )
+            return scan_pr_workflow_collection_cross_surfaces(
+                baseline,
+                proposed,
+                "self-test workflow directory",
+                directory_job_transitions=transitions,
+            )
+
+        if fips_surface_conflict(directory_job_fixture_name) in directory_job_scan(
+            {directory_job_fixture_name: directory_job_retired_generation},
+            {directory_job_fixture_name: directory_job_adopted_generation},
+        ):
+            failures.append(
+                "the admitted workflow-directory job generation transition was "
+                "rejected"
+            )
+        # The same file and the same two revisions under the production table:
+        # the admission is the two exact job digests, not the file or job name.
+        if fips_surface_conflict(
+            directory_job_fixture_name
+        ) not in directory_job_scan(
+            {directory_job_fixture_name: directory_job_retired_generation},
+            {directory_job_fixture_name: directory_job_adopted_generation},
+            transitions=None,
+        ):
+            failures.append(
+                "the workflow-directory job admission is bound to a job name "
+                "rather than to the two exact generations it names"
+            )
+        directory_job_rejected_pairs = {
+            "a wrong predecessor": (
+                directory_job_retired_generation.replace(
+                    "aarch64-unknown-linux-gnu", "x86_64-unknown-linux-gnu"
+                ),
+                directory_job_adopted_generation,
+            ),
+            "a drifted destination": (
+                directory_job_retired_generation,
+                directory_job_adopted_generation.replace(
+                    "echo adopted", "echo drifted"
+                ),
+            ),
+            "further drift after adoption": (
+                directory_job_adopted_generation,
+                directory_job_adopted_generation.replace(
+                    "echo adopted", "echo drifted"
+                ),
+            ),
+            "the reverse transition": (
+                directory_job_adopted_generation,
+                directory_job_retired_generation,
+            ),
+        }
+        for label, (
+            directory_job_baseline,
+            directory_job_proposed,
+        ) in directory_job_rejected_pairs.items():
+            if fips_surface_conflict(
+                directory_job_fixture_name
+            ) not in directory_job_scan(
+                {directory_job_fixture_name: directory_job_baseline},
+                {directory_job_fixture_name: directory_job_proposed},
+            ):
+                failures.append(
+                    f"the workflow-directory job admission accepted {label}"
+                )
+        if directory_job_rollback_refusal not in directory_job_scan(
+            {directory_job_fixture_name: directory_job_adopted_generation},
+            {directory_job_fixture_name: directory_job_retired_generation},
+        ):
+            failures.append(
+                "returning the workflow-directory job to the retired generation "
+                "was not refused as a one-way transition"
+            )
+        if fips_surface_conflict("attacker.yml") not in directory_job_scan(
+            {"attacker.yml": directory_job_retired_generation},
+            {"attacker.yml": directory_job_adopted_generation},
+        ):
+            failures.append(
+                "the workflow-directory job admission was applied to a workflow "
+                "filename the table does not name"
+            )
+        directory_job_simultaneous = directory_job_scan(
+            {
+                directory_job_fixture_name: directory_job_retired_generation,
+                "attacker.yml": safe_extra_workflow,
+            },
+            {
+                directory_job_fixture_name: directory_job_adopted_generation,
+                "attacker.yml": added_cross_workflow,
+            },
+        )
+        if fips_surface_conflict("attacker.yml") not in directory_job_simultaneous:
+            failures.append(
+                "a Cross surface added alongside the admitted workflow-directory "
+                "job transition was not rejected"
+            )
+        if fips_surface_conflict(
+            directory_job_fixture_name
+        ) in directory_job_simultaneous:
+            failures.append(
+                "the admitted workflow-directory job transition was rejected "
+                "because an unrelated workflow changed in the same proposal"
+            )
+    seen_directory_job_tuples: set[tuple[str, str, str, str]] = set()
+    for (
+        directory_workflow_name,
+        directory_job_name,
+        directory_retired_digest,
+        directory_adopted_digest,
+    ) in WORKFLOW_DIRECTORY_JOB_GENERATION_TRANSITIONS:
+        if (
+            directory_workflow_name,
+            directory_job_name,
+            directory_retired_digest,
+            directory_adopted_digest,
+        ) in seen_directory_job_tuples:
+            failures.append(
+                "duplicate workflow-directory job generation tuple "
+                f"{directory_workflow_name!r}/{directory_job_name!r}"
+            )
+        seen_directory_job_tuples.add(
+            (
+                directory_workflow_name,
+                directory_job_name,
+                directory_retired_digest,
+                directory_adopted_digest,
+            )
+        )
+        for directory_digest in (directory_retired_digest, directory_adopted_digest):
+            if WORKFLOW_GENERATION_DIGEST.fullmatch(directory_digest) is None:
+                failures.append(
+                    "workflow-directory job generation "
+                    f"{directory_workflow_name!r}/{directory_job_name!r} does "
+                    "not pin SHA-256 digests"
+                )
+        if directory_retired_digest == directory_adopted_digest:
+            failures.append(
+                "workflow-directory job generation "
+                f"{directory_workflow_name!r}/{directory_job_name!r} must name "
+                "two distinct revisions"
+            )
+        if not directory_job_name:
+            failures.append(
+                "workflow-directory job generation entries must name a job"
+            )
+        # A file the comparison loop never reaches — a protected workflow, or
+        # the frozen fuzz lane, which is decided before this admission is
+        # consulted — could not be admitted, so naming one is a silent no-op.
+        if (
+            directory_workflow_name in PROTECTED_WORKFLOW_FILENAMES
+            or directory_workflow_name == FUZZ_WORKFLOW_FILENAME
+            or WORKFLOW_FILENAME.fullmatch(directory_workflow_name) is None
+        ):
+            failures.append(
+                "workflow-directory job generation "
+                f"{directory_workflow_name!r}/{directory_job_name!r} names a "
+                "workflow the pull-request comparison never reaches"
+            )
+
     job_gen_prologue = (
         "name: CI\n"
         "on:\n"
@@ -18731,8 +19045,6 @@ pre_build = []
                 f"CI job generation {job_name!r} does not pin SHA-256 digests"
             )
     seen_action_generation_tuples: set[tuple[str, str, str]] = set()
-    rust_ci_retired: set[str] = set()
-    rust_ci_adopted: set[str] = set()
     for action_name, retired, adopted in LOCAL_ACTION_GENERATION_TRANSITIONS:
         if (action_name, retired, adopted) in seen_action_generation_tuples:
             failures.append(
