@@ -3053,6 +3053,20 @@ impl DtlsServer {
                                     }
                                 }
                             }
+                            Output::KeyingMaterial(_, _) => {
+                                // Dimpl queues this local event immediately
+                                // after `Connected` when SRTP was negotiated,
+                                // before exposing the engine's queued DTLS 1.2
+                                // CCS + Finished packets. Keep draining or an
+                                // admitted peer never receives the server's
+                                // final flight and cannot complete its own
+                                // handshake. Refused peers return from the
+                                // certificate-validation arms above before
+                                // reaching this path, so their queued final
+                                // flight remains discarded fail-closed.
+                                drain_round_exhausted = false;
+                                continue;
+                            }
                             _ => {
                                 drain_round_exhausted = false;
                                 break;
