@@ -1118,6 +1118,27 @@ python3 tests/performance/ci_overhead_bench.py \
 
 `--overhead-threshold 50` is a percentage threshold: the script fails when median gateway overhead across iterations exceeds 50%.
 
+The job's `setup-rust-ci` step keeps shared key `ci-perf` and passes rust-cache
+`workspaces` as `. -> target` plus `tests/performance/mesh -> target`. That
+covers both the root `ci-release` gateway build and the standalone Criterion
+crate under `tests/performance/mesh/` (own `Cargo.lock` / `target/`) without
+replacing root coverage. `setup-rust-ci` exposes `workspaces` as an optional
+pass-through to Swatinem/rust-cache; omitting it leaves rust-cache's default
+`. -> target`, so other jobs keep root-only caching. Do not list only the mesh
+workspace, and do not add unrelated workspaces, `cache-all-crates`, or extra
+`cache-directories` here.
+
+Hosted follow-ups that still need measured evidence before changing
+measurement fidelity or trigger breadth:
+
+- sccache hit rates on the `ci-release` gateway build (thin LTO). Do not
+  introduce a dedicated non-LTO perf profile until those stats are attached
+  and budgets are re-baselined.
+- whether workflow-only `.github/workflows/ci.yml` edits can skip the four
+  microbenchmarks. Today's static verifiers do not encode the `cargo bench`
+  invocation surface tightly enough to drop the `.github/workflows/ci.yml`
+  trigger safely.
+
 **Failures**:
 - Indicate performance regression issues
 - Must be fixed before merging
