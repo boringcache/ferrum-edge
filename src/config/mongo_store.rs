@@ -106,6 +106,7 @@ mod inner {
         RequiredMongoIndex, classify_guard_collections, classify_plan_against_live,
         default_index_name, required_mongo_indexes,
     };
+    use crate::config::namespace_registry::NamespaceRecord;
     use regex::escape as regex_escape;
 
     // MongoDB server error codes used by the index-upgrade logic in
@@ -2763,6 +2764,11 @@ mod inner {
             self.collection("gateway_trust_bundles")
         }
 
+        /// First-class namespace registry (issue #3955). `_id` is the name.
+        fn namespaces(&self) -> MongoCollectionHandle {
+            self.collection("namespaces")
+        }
+
         fn audit_events(&self) -> MongoCollectionHandle {
             self.collection("audit_events")
         }
@@ -3152,6 +3158,19 @@ mod inner {
 
         fn config_change_retention_doc_id(namespace: &str) -> String {
             format!("retention:{namespace}")
+        }
+
+        fn namespace_registry_doc(record: &NamespaceRecord) -> Document {
+            let mut doc = doc! {
+                "_id": &record.name,
+                "name": &record.name,
+                "created_at": record.created_at.to_rfc3339(),
+                "updated_at": record.updated_at.to_rfc3339(),
+            };
+            if let Some(description) = &record.description {
+                doc.insert("description", description);
+            }
+            doc
         }
 
         fn config_change_doc(
@@ -11196,6 +11215,8 @@ mod inner {
                     self.ensure_planned_index(&entry).await?;
                 }
 
+                self.backfill_namespaces_registry().await?;
+
                 info!("MongoDB indexes ensured");
                 Ok(())
             }
@@ -11218,6 +11239,11 @@ mod inner {
 
         async fn list_namespaces(&self) -> Result<Vec<String>, anyhow::Error> {
             let mut all_namespaces = HashSet::new();
+
+            // Registry names first so empty tenants appear (issue #3955).
+            for ns in self.registry_namespace_names().await? {
+                all_namespaces.insert(ns);
+            }
 
             // Collect distinct namespaces from every namespaced config
             // collection, including gateway_trust_bundles so a trust-only
@@ -11269,6 +11295,152 @@ mod inner {
                 Err(_) => Vec::new(),
             };
             Ok(PaginatedResult { items, total })
+        }
+
+        async fn get_namespace(
+            &self,
+            name: &str,
+        ) -> Result<Option<crate::config::namespace_registry::NamespaceRecord>, anyhow::Error>
+        {
+            let doc = self
+                .namespaces()
+                .find_one(doc! { "_id": name })
+                .await?;
+            Ok(doc.map(|doc| self.document_to_namespace_record(name, doc)))
+        }
+
+        async fn namespace_name_in_use(&self, name: &str) -> Result<bool, anyhow::Error> {
+            if self.get_namespace(name).await?.is_some() {
+                return Ok(true);
+            }
+            for collection in [
+                "proxies",
+                "consumers",
+                "plugin_configs",
+                "upstreams",
+                "gateway_trust_bundles",
+                "api_specs",
+            ] {
+                let count = self
+                    .collection(collection)
+                    .count_documents(doc! { "namespace": name })
+                    .await?;
+                if count > 0 {
+                    return Ok(true);
+                }
+            }
+            Ok(false)
+        }
+
+        async fn namespace_has_resources(&self, name: &str) -> Result<bool, anyhow::Error> {
+            let counts = self.count_namespace_resources(name).await?;
+            if !counts.is_empty() {
+                return Ok(true);
+            }
+            Ok(self
+                .get_namespace_gateway_trust_bundle(name)
+                .await?
+                .is_some())
+        }
+
+        async fn create_namespace(
+            &self,
+            record: &crate::config::namespace_registry::NamespaceRecord,
+        ) -> Result<(), anyhow::Error> {
+            if self.namespace_name_in_use(&record.name).await? {
+                return Err(anyhow::Error::new(
+                    crate::config::namespace_registry::NamespaceRegistryError::NameInUse {
+                        name: record.name.clone(),
+                    },
+                ));
+            }
+            let doc = namespace_registry_doc(record);
+            self.namespaces().insert_one(doc).await?;
+            Ok(())
+        }
+
+        async fn update_namespace(
+            &self,
+            current_name: &str,
+            new_name: &str,
+            description: Option<Option<String>>,
+        ) -> Result<crate::config::namespace_registry::NamespaceRecord, anyhow::Error> {
+            let existing = self.get_namespace(current_name).await?;
+            let in_use = self.namespace_name_in_use(current_name).await?;
+            if existing.is_none() && !in_use {
+                return Err(anyhow::Error::new(
+                    crate::config::namespace_registry::NamespaceRegistryError::NotFound {
+                        name: current_name.to_string(),
+                    },
+                ));
+            }
+            if new_name != current_name && self.namespace_name_in_use(new_name).await? {
+                return Err(anyhow::Error::new(
+                    crate::config::namespace_registry::NamespaceRegistryError::NameInUse {
+                        name: new_name.to_string(),
+                    },
+                ));
+            }
+            let now = Utc::now();
+            let mut record = existing.unwrap_or_else(|| {
+                crate::config::namespace_registry::NamespaceRecord::new(
+                    current_name.to_string(),
+                    None,
+                    now,
+                )
+            });
+            if let Some(description) = description {
+                record.description = description;
+            }
+            record.updated_at = now;
+            record.name = new_name.to_string();
+
+            if new_name == current_name {
+                self.namespaces()
+                    .update_one(
+                        doc! { "_id": current_name },
+                        doc! {
+                            "$set": {
+                                "name": current_name,
+                                "description": match &record.description {
+                                    Some(value) => Bson::String(value.clone()),
+                                    None => Bson::Null,
+                                },
+                                "created_at": record.created_at.to_rfc3339(),
+                                "updated_at": record.updated_at.to_rfc3339(),
+                            }
+                        },
+                    )
+                    .upsert(true)
+                    .await?;
+                return Ok(record);
+            }
+
+            self.rename_namespace_documents(current_name, new_name, &record)
+                .await?;
+            Ok(record)
+        }
+
+        async fn delete_namespace(&self, name: &str, cascade: bool) -> Result<bool, anyhow::Error> {
+            if !self.namespace_name_in_use(name).await? {
+                return Ok(false);
+            }
+            if self.namespace_has_resources(name).await? {
+                if !cascade {
+                    return Err(anyhow::Error::new(
+                        crate::config::namespace_registry::NamespaceRegistryError::NotEmpty {
+                            name: name.to_string(),
+                        },
+                    ));
+                }
+                self.delete_all_resources(name, &BatchConfigWriteMode::Admission)
+                    .await?;
+                if let Some(bundle) = self.get_namespace_gateway_trust_bundle(name).await? {
+                    let _ = self.delete_gateway_trust_bundle(name, &bundle.id).await?;
+                }
+            }
+            let result = self.namespaces().delete_one(doc! { "_id": name }).await?;
+            Ok(result.deleted_count > 0 || cascade)
         }
 
         // -------------------------------------------------------------------
@@ -13763,6 +13935,238 @@ mod inner {
                 }
             }
             Ok(namespaces)
+        }
+
+        async fn registry_namespace_names(&self) -> Result<HashSet<String>, anyhow::Error> {
+            let values = self.namespaces().distinct("name", doc! {}).await?;
+            let mut namespaces = HashSet::new();
+            for val in values {
+                if let Some(s) = val.as_str() {
+                    namespaces.insert(s.to_string());
+                }
+            }
+            if namespaces.is_empty() {
+                // Documents use `_id` as the name; fall back if `name` was omitted.
+                let ids = self.namespaces().distinct("_id", doc! {}).await?;
+                for val in ids {
+                    if let Some(s) = val.as_str() {
+                        namespaces.insert(s.to_string());
+                    }
+                }
+            }
+            Ok(namespaces)
+        }
+
+        async fn backfill_namespaces_registry(&self) -> Result<(), anyhow::Error> {
+            let now = Utc::now().to_rfc3339();
+            let mut names = HashSet::new();
+            for collection in [
+                "proxies",
+                "consumers",
+                "plugin_configs",
+                "upstreams",
+                "gateway_trust_bundles",
+            ] {
+                for ns in self.distinct_namespaces(collection).await? {
+                    names.insert(ns);
+                }
+            }
+            names.insert(crate::config::types::DEFAULT_NAMESPACE.to_string());
+            for name in names {
+                let _ = self
+                    .namespaces()
+                    .update_one(
+                        doc! { "_id": &name },
+                        doc! {
+                            "$setOnInsert": {
+                                "name": &name,
+                                "created_at": &now,
+                                "updated_at": &now,
+                            }
+                        },
+                    )
+                    .upsert(true)
+                    .await?;
+            }
+            Ok(())
+        }
+
+        fn document_to_namespace_record(
+            &self,
+            fallback_name: &str,
+            doc: Document,
+        ) -> crate::config::namespace_registry::NamespaceRecord {
+            let name = doc
+                .get_str("name")
+                .ok()
+                .map(str::to_string)
+                .or_else(|| doc.get_str("_id").ok().map(str::to_string))
+                .unwrap_or_else(|| fallback_name.to_string());
+            let description = doc
+                .get_str("description")
+                .ok()
+                .map(str::to_string)
+                .filter(|s| !s.is_empty());
+            let parse_ts = |key: &str| {
+                doc.get_str(key)
+                    .ok()
+                    .and_then(|s| DateTime::parse_from_rfc3339(s).ok())
+                    .map(|dt| dt.with_timezone(&Utc))
+            };
+            let created_at = parse_ts("created_at").unwrap_or_else(Utc::now);
+            let updated_at = parse_ts("updated_at").unwrap_or(created_at);
+            crate::config::namespace_registry::NamespaceRecord {
+                name,
+                description,
+                created_at,
+                updated_at,
+            }
+        }
+
+        async fn rename_namespace_documents(
+            &self,
+            current_name: &str,
+            new_name: &str,
+            record: &crate::config::namespace_registry::NamespaceRecord,
+        ) -> Result<(), anyhow::Error> {
+            self.namespaces()
+                .insert_one(namespace_registry_doc(record))
+                .await?;
+
+            for collection in [
+                "proxies",
+                "plugin_configs",
+                "upstreams",
+                "api_specs",
+                "audit_events",
+                "config_changes",
+            ] {
+                self.collection(collection)
+                    .update_many(
+                        doc! { "namespace": current_name },
+                        doc! { "$set": { "namespace": new_name } },
+                    )
+                    .await?;
+            }
+
+            self.rewrite_namespace_prefixed_ids("consumers", current_name, new_name)
+                .await?;
+            self.rewrite_namespace_prefixed_ids("consumer_identity_index", current_name, new_name)
+                .await?;
+            self.rewrite_namespace_prefixed_ids("proxy_route_locks", current_name, new_name)
+                .await?;
+            self.rewrite_namespace_document_id(
+                "gateway_trust_bundles",
+                current_name,
+                new_name,
+                new_name,
+            )
+            .await?;
+            self.rewrite_namespace_document_id(
+                "config_change_retention",
+                &Self::config_change_retention_doc_id(current_name),
+                &Self::config_change_retention_doc_id(new_name),
+                new_name,
+            )
+            .await?;
+
+            self.record_namespace_rename_config_changes(current_name, new_name)
+                .await?;
+
+            let _ = self
+                .namespaces()
+                .delete_one(doc! { "_id": current_name })
+                .await?;
+            Ok(())
+        }
+
+        async fn record_namespace_rename_config_changes(
+            &self,
+            current_name: &str,
+            new_name: &str,
+        ) -> Result<(), anyhow::Error> {
+            for (resource_type, collection) in [
+                ("proxy", "proxies"),
+                ("consumer", "consumers"),
+                ("plugin_config", "plugin_configs"),
+                ("upstream", "upstreams"),
+            ] {
+                let mut cursor = self
+                    .collection(collection)
+                    .find(doc! { "namespace": new_name })
+                    .await?;
+                while cursor.advance().await? {
+                    let doc = cursor.deserialize_current()?;
+                    let id = doc
+                        .get_str("id")
+                        .ok()
+                        .map(str::to_string)
+                        .or_else(|| doc.get_str("_id").ok().map(str::to_string))
+                        .unwrap_or_default();
+                    if id.is_empty() {
+                        continue;
+                    }
+                    self.record_config_change(current_name, resource_type, &id, "delete")
+                        .await?;
+                    self.record_config_change(new_name, resource_type, &id, "upsert")
+                        .await?;
+                }
+            }
+            Ok(())
+        }
+
+        async fn rewrite_namespace_prefixed_ids(
+            &self,
+            collection_name: &str,
+            current_name: &str,
+            new_name: &str,
+        ) -> Result<(), anyhow::Error> {
+            let collection = self.collection(collection_name);
+            let mut cursor = collection
+                .find(doc! { "namespace": current_name })
+                .await?;
+            while cursor.advance().await? {
+                let mut doc = cursor.deserialize_current()?;
+                let old_id = doc
+                    .get_str("_id")
+                    .ok()
+                    .map(str::to_string)
+                    .unwrap_or_default();
+                let suffix = old_id
+                    .strip_prefix(&format!("{current_name}:"))
+                    .unwrap_or(old_id.as_str());
+                let new_id = format!("{new_name}:{suffix}");
+                doc.insert("_id", new_id);
+                doc.insert("namespace", new_name);
+                collection.insert_one(doc).await?;
+                if !old_id.is_empty() {
+                    collection.delete_one(doc! { "_id": old_id }).await?;
+                }
+            }
+            Ok(())
+        }
+
+        async fn rewrite_namespace_document_id(
+            &self,
+            collection_name: &str,
+            current_id: &str,
+            new_id: &str,
+            new_namespace: &str,
+        ) -> Result<(), anyhow::Error> {
+            let collection = self.collection(collection_name);
+            let Some(mut doc) = collection.find_one(doc! { "_id": current_id }).await? else {
+                return Ok(());
+            };
+            doc.insert("_id", new_id);
+            if doc.get_str("namespace").is_ok() {
+                doc.insert("namespace", new_namespace);
+            }
+            if doc.get_str("name").ok() == Some(current_id) {
+                doc.insert("name", new_namespace);
+            }
+            collection.insert_one(doc).await?;
+            collection.delete_one(doc! { "_id": current_id }).await?;
+            Ok(())
         }
 
         /// Returns `true` when a MongoDB replica set was configured at `connect()` time.

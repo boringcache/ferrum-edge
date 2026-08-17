@@ -196,6 +196,10 @@ fn list_namespaces_scans_gateway_trust_bundles() {
         );
     }
     assert!(
+        body.contains("registry_namespace_names()"),
+        "list_namespaces must union the namespaces registry"
+    );
+    assert!(
         body.contains("result.sort()"),
         "list_namespaces must keep deterministic ascending order"
     );

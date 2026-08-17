@@ -2213,7 +2213,7 @@ async fn read_replica_tracks_primary_topology_across_failover_and_failback() {
     store.connect_read_replica(&replica_url).await.unwrap();
     assert_eq!(
         store.list_namespaces().await.unwrap(),
-        vec!["failover-ns".to_string()],
+        vec!["failover-ns".to_string(), "ferrum".to_string()],
         "admin reads must stay on the active failover topology"
     );
 
@@ -2227,7 +2227,7 @@ async fn read_replica_tracks_primary_topology_across_failover_and_failback() {
     store.reconnect_read_replica(&replica_url).await.unwrap();
     assert_eq!(
         store.list_namespaces().await.unwrap(),
-        vec!["replica-ns".to_string()],
+        vec!["ferrum".to_string(), "replica-ns".to_string()],
         "the configured read replica should become eligible again after primary failback"
     );
 }
@@ -2269,13 +2269,13 @@ async fn seed_namespace_trust_bundle_only(store: &DatabaseStore, namespace: &str
 }
 
 #[tokio::test]
-async fn list_namespaces_paginated_empty_store_returns_zero_total() {
+async fn list_namespaces_paginated_empty_store_returns_default_ferrum() {
     let temp_dir = tempfile::TempDir::new().unwrap();
     let store = connect_namespaces_test_store(&temp_dir, "ns-empty").await;
 
     let page = store.list_namespaces_paginated(100, 0).await.unwrap();
-    assert_eq!(page.total, 0);
-    assert!(page.items.is_empty());
+    assert_eq!(page.total, 1);
+    assert_eq!(page.items, vec!["ferrum"]);
 }
 
 #[tokio::test]
@@ -2303,8 +2303,8 @@ async fn list_namespaces_paginated_dedupes_across_tables_and_orders() {
         .unwrap();
 
     let page = store.list_namespaces_paginated(100, 0).await.unwrap();
-    assert_eq!(page.total, 3);
-    assert_eq!(page.items, vec!["alpha", "middle", "zeta"]);
+    assert_eq!(page.total, 4);
+    assert_eq!(page.items, vec!["alpha", "ferrum", "middle", "zeta"]);
 }
 
 #[tokio::test]
@@ -2316,25 +2316,25 @@ async fn list_namespaces_paginated_slices_pages_and_preserves_total() {
     }
 
     let page = store.list_namespaces_paginated(2, 0).await.unwrap();
-    assert_eq!(page.items, vec!["ns-00", "ns-01"]);
-    assert_eq!(page.total, 5);
+    assert_eq!(page.items, vec!["ferrum", "ns-00"]);
+    assert_eq!(page.total, 6);
 
     let page = store.list_namespaces_paginated(2, 2).await.unwrap();
-    assert_eq!(page.items, vec!["ns-02", "ns-03"]);
-    assert_eq!(page.total, 5);
+    assert_eq!(page.items, vec!["ns-01", "ns-02"]);
+    assert_eq!(page.total, 6);
 
     let page = store.list_namespaces_paginated(2, 4).await.unwrap();
-    assert_eq!(page.items, vec!["ns-04"]);
-    assert_eq!(page.total, 5);
+    assert_eq!(page.items, vec!["ns-03", "ns-04"]);
+    assert_eq!(page.total, 6);
 
     // An offset at or beyond the total is a valid empty page, not an error.
-    let page = store.list_namespaces_paginated(2, 5).await.unwrap();
+    let page = store.list_namespaces_paginated(2, 6).await.unwrap();
     assert!(page.items.is_empty());
-    assert_eq!(page.total, 5);
+    assert_eq!(page.total, 6);
 
     let page = store.list_namespaces_paginated(2, 100).await.unwrap();
     assert!(page.items.is_empty());
-    assert_eq!(page.total, 5);
+    assert_eq!(page.total, 6);
 }
 
 #[tokio::test]
@@ -2349,21 +2349,21 @@ async fn list_namespaces_paginated_large_collection_pages_stably() {
     let mut offset = 0i64;
     loop {
         let page = store.list_namespaces_paginated(50, offset).await.unwrap();
-        assert_eq!(page.total, 120);
+        assert_eq!(page.total, 121);
         if page.items.is_empty() {
             break;
         }
         offset += page.items.len() as i64;
         collected.extend(page.items);
     }
-    assert_eq!(collected.len(), 120);
+    assert_eq!(collected.len(), 121);
     let mut sorted = collected.clone();
     sorted.sort();
     assert_eq!(
         collected, sorted,
         "pages must concatenate in ascending order"
     );
-    assert_eq!(collected.first().map(String::as_str), Some("ns-000"));
+    assert_eq!(collected.first().map(String::as_str), Some("ferrum"));
     assert_eq!(collected.last().map(String::as_str), Some("ns-119"));
 }
 
@@ -2376,8 +2376,8 @@ async fn list_namespaces_paginated_insert_after_cursor_keeps_pages_stable() {
     }
 
     let first = store.list_namespaces_paginated(4, 0).await.unwrap();
-    assert_eq!(first.items, vec!["ns-00", "ns-01", "ns-02", "ns-03"]);
-    assert_eq!(first.total, 10);
+    assert_eq!(first.items, vec!["ferrum", "ns-00", "ns-01", "ns-02"]);
+    assert_eq!(first.total, 11);
 
     // Inserts that sort after the fetched window must not shift already-
     // returned rows into a later page.
@@ -2386,11 +2386,11 @@ async fn list_namespaces_paginated_insert_after_cursor_keeps_pages_stable() {
     }
 
     let second = store.list_namespaces_paginated(100, 4).await.unwrap();
-    assert_eq!(second.total, 15);
+    assert_eq!(second.total, 16);
     let remainder: Vec<&str> = second.items.iter().map(String::as_str).collect();
     assert_eq!(
-        remainder[..6],
-        ["ns-04", "ns-05", "ns-06", "ns-07", "ns-08", "ns-09"],
+        remainder[..7],
+        ["ns-03", "ns-04", "ns-05", "ns-06", "ns-07", "ns-08", "ns-09"],
         "rows after the cursor keep their relative order; new inserts append"
     );
     assert!(
@@ -2413,7 +2413,11 @@ async fn list_namespaces_includes_trust_bundle_only_namespace() {
     let namespaces = store.list_namespaces().await.unwrap();
     assert_eq!(
         namespaces,
-        vec!["alpha".to_string(), "trust-only".to_string()],
+        vec![
+            "alpha".to_string(),
+            "ferrum".to_string(),
+            "trust-only".to_string()
+        ],
         "a namespace that only owns a gateway trust bundle must still enumerate"
     );
 }
@@ -2428,18 +2432,21 @@ async fn list_namespaces_paginated_includes_trust_bundle_only_namespace() {
     seed_namespace_upstream(&store, "alpha", "up-alpha").await;
 
     let page = store.list_namespaces_paginated(100, 0).await.unwrap();
-    assert_eq!(page.total, 3);
-    assert_eq!(page.items, vec!["alpha", "middle-trust", "zeta"]);
+    assert_eq!(page.total, 4);
+    assert_eq!(
+        page.items,
+        vec!["alpha", "ferrum", "middle-trust", "zeta"]
+    );
 
     // Paginate so the trust-only name is not on the first page, proving the
     // count and ordered union both include gateway_trust_bundles.
-    let first = store.list_namespaces_paginated(1, 0).await.unwrap();
-    assert_eq!(first.items, vec!["alpha"]);
-    assert_eq!(first.total, 3);
+    let first = store.list_namespaces_paginated(2, 0).await.unwrap();
+    assert_eq!(first.items, vec!["alpha", "ferrum"]);
+    assert_eq!(first.total, 4);
 
-    let second = store.list_namespaces_paginated(1, 1).await.unwrap();
-    assert_eq!(second.items, vec!["middle-trust"]);
-    assert_eq!(second.total, 3);
+    let second = store.list_namespaces_paginated(2, 2).await.unwrap();
+    assert_eq!(second.items, vec!["middle-trust", "zeta"]);
+    assert_eq!(second.total, 4);
 }
 
 /// Source-level drift guard: issue #3727 trust bundles are a namespaced
@@ -2456,6 +2463,10 @@ fn list_namespaces_sql_unions_gateway_trust_bundles() {
     assert!(
         list_body.contains("UNION SELECT DISTINCT namespace FROM gateway_trust_bundles"),
         "list_namespaces_from_pool must union gateway_trust_bundles"
+    );
+    assert!(
+        list_body.contains("SELECT name FROM namespaces"),
+        "list_namespaces_from_pool must union the namespaces registry"
     );
 
     let page_body = source
@@ -2721,7 +2732,7 @@ async fn failover_write_gate_fences_primary_after_opt_in_admission() {
     );
     assert_eq!(
         store.list_namespaces().await.unwrap(),
-        vec!["failover-ns".to_string()],
+        vec!["failover-ns".to_string(), "ferrum".to_string()],
         "the failover-side write must remain visible"
     );
 }
@@ -2859,7 +2870,7 @@ async fn delayed_primary_reconnect_cannot_overwrite_later_failover_topology() {
     );
     assert_eq!(
         store.list_namespaces().await.unwrap(),
-        vec!["failover-ns".to_string()],
+        vec!["failover-ns".to_string(), "ferrum".to_string()],
         "active pool must match the later failover publication"
     );
 }
@@ -2990,7 +3001,7 @@ async fn delayed_failover_reconnect_cannot_race_later_primary_topology() {
     );
     assert_eq!(
         store.list_namespaces().await.unwrap(),
-        vec!["primary-ns".to_string()],
+        vec!["ferrum".to_string(), "primary-ns".to_string()],
         "active pool must match the later primary publication"
     );
 }
@@ -3029,7 +3040,7 @@ async fn write_topology_permit_blocks_failover_until_dropped() {
     );
     assert_eq!(
         store.list_namespaces().await.unwrap(),
-        vec!["primary-ns".to_string()],
+        vec!["ferrum".to_string(), "primary-ns".to_string()],
         "pinned mutation must keep using the primary pool"
     );
 
@@ -3096,7 +3107,7 @@ async fn write_topology_permit_blocks_failover_until_dropped() {
     );
     assert_eq!(
         store.list_namespaces().await.unwrap(),
-        vec!["primary-ns".to_string()],
+        vec!["ferrum".to_string(), "primary-ns".to_string()],
         "pinned mutation must not observe the failover pool mid-flight"
     );
 
@@ -3247,7 +3258,7 @@ async fn opt_in_write_permit_blocks_failback_until_dropped() {
     assert!(permit.is_pinned());
     assert_eq!(
         store.list_namespaces().await.unwrap(),
-        vec!["failover-ns".to_string()],
+        vec!["failover-ns".to_string(), "ferrum".to_string()],
         "opt-in mutation must stay on the pinned failover pool"
     );
 

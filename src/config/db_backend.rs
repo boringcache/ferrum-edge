@@ -2164,6 +2164,77 @@ pub trait DatabaseBackend: NamespaceConfigAdmissionLeaseBackend + Send + Sync {
         offset: i64,
     ) -> Result<PaginatedResult<String>, anyhow::Error>;
 
+    /// Load one registry row. Returns `None` when the name is not in the
+    /// registry. Callers that need derived-only names should also check
+    /// [`Self::namespace_name_in_use`].
+    async fn get_namespace(
+        &self,
+        name: &str,
+    ) -> Result<Option<crate::config::namespace_registry::NamespaceRecord>, anyhow::Error> {
+        let _ = name;
+        Ok(None)
+    }
+
+    /// True when `name` exists in the registry or as a derived resource
+    /// namespace (the five resource tables plus API specs).
+    async fn namespace_name_in_use(&self, name: &str) -> Result<bool, anyhow::Error> {
+        Ok(self
+            .list_namespaces_authoritative()
+            .await?
+            .iter()
+            .any(|existing| existing == name))
+    }
+
+    /// True when the tenant still has occupancy resources that block an
+    /// unconfirmed DELETE (proxies, consumers, plugins, upstreams, trust
+    /// bundles, API specs).
+    async fn namespace_has_resources(&self, name: &str) -> Result<bool, anyhow::Error> {
+        let counts = self.count_namespace_resources(name).await?;
+        if !counts.is_empty() {
+            return Ok(true);
+        }
+        Ok(self
+            .get_namespace_gateway_trust_bundle(name)
+            .await?
+            .is_some())
+    }
+
+    /// Insert a registry row. Returns [`crate::config::namespace_registry::NamespaceRegistryError::NameInUse`]
+    /// when the name already exists in the registry or as a derived namespace.
+    async fn create_namespace(
+        &self,
+        record: &crate::config::namespace_registry::NamespaceRecord,
+    ) -> Result<(), anyhow::Error> {
+        let _ = record;
+        Err(anyhow::anyhow!(
+            "namespace registry writes are not supported by this backend"
+        ))
+    }
+
+    /// Update description and/or rename. Rename rewrites every resource
+    /// `namespace` column under the caller-held admission leases.
+    async fn update_namespace(
+        &self,
+        current_name: &str,
+        new_name: &str,
+        description: Option<Option<String>>,
+    ) -> Result<crate::config::namespace_registry::NamespaceRecord, anyhow::Error> {
+        let _ = (current_name, new_name, description);
+        Err(anyhow::anyhow!(
+            "namespace registry writes are not supported by this backend"
+        ))
+    }
+
+    /// Delete a registry row. `cascade` must already have been authorized by
+    /// the admin handler; when false and resources remain, returns
+    /// [`crate::config::namespace_registry::NamespaceRegistryError::NotEmpty`].
+    async fn delete_namespace(&self, name: &str, cascade: bool) -> Result<bool, anyhow::Error> {
+        let _ = (name, cascade);
+        Err(anyhow::anyhow!(
+            "namespace registry writes are not supported by this backend"
+        ))
+    }
+
     // -----------------------------------------------------------------------
     // ApiSpec CRUD (admin-only — NEVER call from polling loops, gRPC
     // distribution, or GatewayConfig loading. Hot-path isolation is critical.)

@@ -1275,6 +1275,8 @@ fn admin_body_timeout_408_inventory() -> BTreeSet<(String, String)> {
         ("PUT", "/upstreams/{id}"),
         ("POST", "/gateway-trust-bundles"),
         ("PUT", "/gateway-trust-bundles/{id}"),
+        ("POST", "/namespaces"),
+        ("PUT", "/namespaces/{name}"),
         ("POST", "/batch"),
         ("POST", "/restore"),
         ("POST", "/mesh/egress-scope/test"),

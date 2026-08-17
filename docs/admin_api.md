@@ -32,7 +32,9 @@ By default, admin JWTs are **global**: the `X-Ferrum-Namespace` header is a rout
 
 - The `ns` claim accepts the same shapes as the gRPC plane: a single string (`"ns": "prod"`) or an array of strings (`"ns": ["prod", "staging"]`).
 - A request whose `X-Ferrum-Namespace` (or the `ferrum` default when the header is omitted) is not in the token's `ns` set is rejected with `403 Forbidden`. With enforcement on, tokens without an `ns` claim are rejected on namespace-scoped routes — tenancy intent must be explicit.
-- Enforcement covers the namespace-scoped resource surfaces: `/proxies`, `/consumers` (including credentials), `/plugins/config`, `/upstreams`, `/api-specs`, `/batch`, `/backup`, `/restore`, and `/audit`. Global surfaces (observability, `/cluster`, `/namespaces`, TLS management, backend capabilities, mesh introspection, `GET /plugins` type listing) are not tenant-selected and are unaffected.
+- Enforcement covers the namespace-scoped resource surfaces: `/proxies`, `/consumers` (including credentials), `/plugins/config`, `/upstreams`, `/api-specs`, `/batch`, `/backup`, `/restore`, and `/audit`. Those routes are selected by `X-Ferrum-Namespace`.
+- The `/namespaces` registry is a global surface (the header does not select a tenant). When the flag is on, `GET /namespaces` is **filtered** to the JWT `ns` claim — a token with no claim receives an empty list rather than `403`. `GET`/`PUT`/`DELETE /namespaces/{name}` and `POST /namespaces` return `403` when the token cannot address that name; rename checks both the current and target names.
+- Other global surfaces (observability, `/cluster`, TLS management, backend capabilities, mesh introspection, `GET /plugins` type listing) remain unaffected.
 - Malformed `ns` claims (non-string entries, empty strings) are rejected at authentication time regardless of the flag — a garbled tenancy claim never widens access.
 
 With the flag off (default), behavior is unchanged and back-compatible.
@@ -41,7 +43,7 @@ With the flag off (default), behavior is unchanged and back-compatible.
 | --- | --- |
 | `viewer` | Read-only endpoints, including API spec metadata listing |
 | `operator` | Read-only endpoints plus proxy, upstream, plugin config, backend capability refresh, TLS inventory/events/validation/forced reload, and mesh egress-scope test operations |
-| `admin` | Full access, including consumers, credentials, raw API spec retrieval and mutations, TLS material and ACME state management, batch/restore, and audit logs |
+| `admin` | Full access, including consumers, credentials, namespace create/rename/delete, raw API spec retrieval and mutations, TLS material and ACME state management, batch/restore, and audit logs |
 
 Tokens without a valid `role` claim are rejected.
 
@@ -379,6 +381,38 @@ Both admin listeners (plaintext and HTTPS) serve HTTP/1.1 and HTTP/2 — HTTPS n
 - **Connection progress** is bounded by the same `FERRUM_HTTP_HEADER_READ_TIMEOUT_SECONDS` window: a connection that neither delivers a new request nor holds one in flight for a whole window is closed. This covers the HTTP/1.1-vs-HTTP/2 version sniff (a peer that connects and sends nothing) and HTTP/2 streams whose header block never completes. An idle keep-alive admin connection is therefore closed after this long and the client reconnects, which is what the HTTP/1.1 header timer already did. A response still being written to a slow reader counts as in flight and is not interrupted.
 
 Sizing note: there is no listener-wide budget for concurrently buffered request bodies, so the theoretical ceiling on retained body bytes is `FERRUM_ADMIN_MAX_CONNECTIONS` x `FERRUM_ADMIN_HTTP2_MAX_CONCURRENT_STREAMS` x the route's size cap. Reaching it requires credentials for a body-consuming route (every one of them is role-gated, and the role gate runs before the body is read), and in practice the binding constraint is the caller's upload bandwidth times the body deadline rather than the stream product — a caller can only hold what it has actually transmitted. Deployments that expose the admin plane to lower-trust `operator` tokens should size `FERRUM_ADMIN_MAX_CONNECTIONS`, `FERRUM_ADMIN_MAX_CONNECTIONS_PER_IP`, and `FERRUM_ADMIN_HTTP2_MAX_CONCURRENT_STREAMS` against the process memory limit rather than relying on the defaults.
+
+## Namespaces
+
+Namespaces are first-class registry objects. Historically `GET /namespaces` was a `DISTINCT` union over resource tables, so an empty tenant could not exist and there was no rename or delete. The durable `namespaces` table (SQL and Mongo) holds `name` (primary key), optional `description`, `created_at`, and `updated_at`. Connect/migrate backfills distinct names from proxies, consumers, plugin configs, upstreams, and gateway trust bundles, plus the default `ferrum` if missing.
+
+Writing a proxy (or other resource) with a new `X-Ferrum-Namespace` still isolates data without a prior `POST` — that implicit path remains valid. What the registry adds is the ability to create a tenant before any resource, and to rename or delete it.
+
+`GET /namespaces` stays a paginated list of **name strings** (`data: string[]`) so existing clients, including Ferrum Foundry, do not break. The list is the union of registry names and derived resource names, so nothing disappears during rollout and empty tenants appear. Viewer and operator may list and get; create, rename, and delete require `admin`. File mode and other read-only topologies return `403` on writes.
+
+```bash
+# List (string[] envelope — unchanged for existing clients)
+curl -H "Authorization: Bearer $TOKEN" http://localhost:9000/namespaces
+
+# Create an empty tenant
+curl -X POST -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
+  -d '{"name":"staging","description":"pre-prod"}' \
+  http://localhost:9000/namespaces
+
+# Get / rename / delete
+curl -H "Authorization: Bearer $TOKEN" http://localhost:9000/namespaces/staging
+curl -X PUT -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
+  -d '{"name":"prod","description":"production"}' \
+  http://localhost:9000/namespaces/staging
+curl -X DELETE -H "Authorization: Bearer $TOKEN" http://localhost:9000/namespaces/prod
+# Non-empty tenants return 409 unless explicitly confirmed:
+curl -X DELETE -H "Authorization: Bearer $TOKEN" \
+  "http://localhost:9000/namespaces/prod?confirm=true"
+```
+
+`name` uses the same rules as `X-Ferrum-Namespace`: `^[a-zA-Z0-9][a-zA-Z0-9._-]*$`, max 254. Duplicate names (registry or derived) return `409`. Rename rewrites every resource `namespace` column under the existing namespace-admission guard. Delete does not cascade by default; `?confirm=true` cascade-deletes occupancy resources and then the registry row. The process default namespace (`FERRUM_NAMESPACE`, or `ferrum`) cannot be deleted, and the last remaining namespace cannot be deleted.
+
+These routes are **not** selected by `X-Ferrum-Namespace`. See [Per-namespace tenancy](#per-namespace-tenancy-ferrum_admin_require_namespace_claim) for how the JWT `ns` claim applies to list filtering and per-name writes.
 
 ## Proxies
 

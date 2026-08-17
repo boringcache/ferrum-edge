@@ -149,6 +149,7 @@ impl V001SqlBuilder {
             .await?;
         self.create_full_load_indexes(connection).await?;
         self.create_config_change_indexes(connection).await?;
+        self.ensure_namespaces_registry(connection).await?;
         Ok(())
     }
 
@@ -263,6 +264,10 @@ impl V001SqlBuilder {
             // and must survive a full resource clear so a restore cannot
             // silently drop a namespace's roots.
             self.create_gateway_trust_bundles_sql(),
+            // First-class namespace registry (issue #3955). Empty tenants can
+            // exist before any resource row is written; GET /namespaces unions
+            // this table with the derived resource-table names.
+            self.create_namespaces_sql(),
         ] {
             sqlx::query(sql).execute(&mut *connection).await?;
         }
@@ -587,6 +592,109 @@ impl V001SqlBuilder {
             )
             "#
         }
+    }
+
+    /// First-class namespace registry (issue #3955). `name` is the PRIMARY KEY
+    /// and uses the same identifier collation as other tenant keys.
+    fn create_namespaces_sql(&self) -> &'static str {
+        if self.is_mysql() {
+            r#"
+            CREATE TABLE IF NOT EXISTS namespaces (
+                name VARCHAR(255) COLLATE utf8mb4_0900_bin NOT NULL,
+                description TEXT,
+                created_at VARCHAR(64) NOT NULL,
+                updated_at VARCHAR(64) NOT NULL,
+                PRIMARY KEY (name)
+            )
+            "#
+        } else {
+            r#"
+            CREATE TABLE IF NOT EXISTS namespaces (
+                name TEXT NOT NULL,
+                description TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                PRIMARY KEY (name)
+            )
+            "#
+        }
+    }
+
+    /// Idempotent create + backfill for databases that recorded V001 before
+    /// the registry table was folded into the baseline.
+    async fn ensure_namespaces_registry(
+        &self,
+        connection: &mut AnyConnection,
+    ) -> Result<(), anyhow::Error> {
+        sqlx::query(self.create_namespaces_sql())
+            .execute(&mut *connection)
+            .await?;
+        self.backfill_namespaces_registry(connection).await
+    }
+
+    async fn backfill_namespaces_registry(
+        &self,
+        connection: &mut AnyConnection,
+    ) -> Result<(), anyhow::Error> {
+        let now = chrono::Utc::now().to_rfc3339();
+        // Postgres native placeholders are `$1..$n`; a trailing `?` is a
+        // syntax error. MySQL has no `ON CONFLICT` — `INSERT IGNORE` is the
+        // matching idempotent insert. SQLite accepts `?` + `ON CONFLICT`.
+        let insert_derived = if self.is_mysql() {
+            "INSERT IGNORE INTO namespaces (name, created_at, updated_at) \
+             SELECT DISTINCT namespace, ?, ? FROM ( \
+                 SELECT namespace FROM proxies \
+                 UNION SELECT namespace FROM consumers \
+                 UNION SELECT namespace FROM plugin_configs \
+                 UNION SELECT namespace FROM upstreams \
+                 UNION SELECT namespace FROM gateway_trust_bundles \
+             ) AS ferrum_derived_namespaces \
+             WHERE namespace IS NOT NULL"
+        } else if self.is_sqlite() {
+            "INSERT INTO namespaces (name, created_at, updated_at) \
+             SELECT DISTINCT namespace, ?, ? FROM ( \
+                 SELECT namespace FROM proxies \
+                 UNION SELECT namespace FROM consumers \
+                 UNION SELECT namespace FROM plugin_configs \
+                 UNION SELECT namespace FROM upstreams \
+                 UNION SELECT namespace FROM gateway_trust_bundles \
+             ) AS ferrum_derived_namespaces \
+             WHERE namespace IS NOT NULL \
+             ON CONFLICT (name) DO NOTHING"
+        } else {
+            "INSERT INTO namespaces (name, created_at, updated_at) \
+             SELECT DISTINCT namespace, $1, $2 FROM ( \
+                 SELECT namespace FROM proxies \
+                 UNION SELECT namespace FROM consumers \
+                 UNION SELECT namespace FROM plugin_configs \
+                 UNION SELECT namespace FROM upstreams \
+                 UNION SELECT namespace FROM gateway_trust_bundles \
+             ) AS ferrum_derived_namespaces \
+             WHERE namespace IS NOT NULL \
+             ON CONFLICT (name) DO NOTHING"
+        };
+        sqlx::query(insert_derived)
+            .bind(&now)
+            .bind(&now)
+            .execute(&mut *connection)
+            .await?;
+
+        let insert_default = if self.is_mysql() {
+            "INSERT IGNORE INTO namespaces (name, created_at, updated_at) VALUES (?, ?, ?)"
+        } else if self.is_sqlite() {
+            "INSERT INTO namespaces (name, created_at, updated_at) VALUES (?, ?, ?) \
+             ON CONFLICT (name) DO NOTHING"
+        } else {
+            "INSERT INTO namespaces (name, created_at, updated_at) VALUES ($1, $2, $3) \
+             ON CONFLICT (name) DO NOTHING"
+        };
+        sqlx::query(insert_default)
+            .bind(crate::config::types::DEFAULT_NAMESPACE)
+            .bind(&now)
+            .bind(&now)
+            .execute(&mut *connection)
+            .await?;
+        Ok(())
     }
 
     /// Authoritative namespace-keyed gateway trust bundles (issue #3727).
@@ -1658,6 +1766,14 @@ mod tests {
             "consumers",
             &["id", "namespace", "username", "custom_id"],
         );
+    }
+
+    #[test]
+    fn test_mysql_namespaces_collation_on_name() {
+        let builder = V001SqlBuilder::new("mysql");
+        let sql = builder.create_namespaces_sql();
+        assert_columns_have_collation(sql, "namespaces", &["name"]);
+        assert!(sql.contains("PRIMARY KEY (name)"));
     }
 
     #[test]

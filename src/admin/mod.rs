@@ -1617,6 +1617,8 @@ fn body_consuming_route_role(method: &Method, segments: &[&str]) -> Option<Optio
         // which peer identities the fleet will accept.
         ["gateway-trust-bundles"] if is_post => Some(Some(AdminRole::Admin)),
         ["gateway-trust-bundles", _] if is_put => Some(Some(AdminRole::Admin)),
+        ["namespaces"] if is_post => Some(Some(AdminRole::Admin)),
+        ["namespaces", _] if is_put => Some(Some(AdminRole::Admin)),
         ["batch"] | ["restore"] if is_post => Some(Some(AdminRole::Admin)),
         ["mesh", "egress-scope", "test"] if is_post => Some(Some(AdminRole::Operator)),
         ["admin", "tls", "acme", "certificates"] if is_post => tls_role(),
@@ -1788,9 +1790,10 @@ fn extract_namespace(headers: &hyper::HeaderMap) -> Result<String, Response<Full
 /// Whether an admin route operates on namespace-scoped resources selected via
 /// `X-Ferrum-Namespace`. Used by the opt-in per-namespace `ns`-claim gate
 /// (`FERRUM_ADMIN_REQUIRE_NAMESPACE_CLAIM`); global admin surfaces (TLS
-/// management, `/cluster`, `/namespaces`, metrics, backend capabilities, mesh
-/// introspection, `/plugins` type listing) are exempt because the namespace
-/// header does not select a tenant there.
+/// management, `/cluster`, `/namespaces` registry CRUD, metrics, backend
+/// capabilities, mesh introspection, `/plugins` type listing) are exempt
+/// because the namespace header does not select a tenant there. Namespace
+/// registry handlers apply the `ns` claim to the path/body name themselves.
 fn is_namespace_scoped_route(segments: &[&str]) -> bool {
     match segments.first().copied() {
         Some(
@@ -2741,7 +2744,9 @@ async fn handle_admin_request_inner(
     // CP↔DP gRPC `ns` claim so a staging-scoped operator token cannot address
     // prod by swapping X-Ferrum-Namespace. Applies only to namespace-scoped
     // resource routes — global admin surfaces (TLS management, /cluster,
-    // /namespaces, metrics, mesh introspection) are not tenant-selected.
+    // /namespaces registry, metrics, mesh introspection) are not selected
+    // by X-Ferrum-Namespace. Registry handlers apply the claim to the
+    // path/body name themselves.
     if state.admin_require_namespace_claim
         && is_namespace_scoped_route(segments_peek.as_slice())
         && let Some(resp) = enforce_namespace_claim(&auth, &namespace, &path)
@@ -3249,10 +3254,29 @@ async fn handle_admin_request_inner(
             handle_audit_list(&state, &pagination, query.as_deref(), &namespace).await
         }
 
-        // Namespaces
+        // Namespaces (registry CRUD; not selected by X-Ferrum-Namespace)
         (Method::GET, ["namespaces"]) => {
             let pagination = route_pagination!();
-            handle_list_namespaces(&state, &pagination).await
+            handle_list_namespaces(&state, &auth, &pagination).await
+        }
+        (Method::GET, ["namespaces", name]) => handle_get_namespace(&state, &auth, name).await,
+        (Method::POST, ["namespaces"]) => {
+            if let Some(resp) = require_admin_role(&auth, AdminRole::Admin) {
+                return Ok(resp);
+            }
+            handle_create_namespace(&state, &auth, &body_bytes).await
+        }
+        (Method::PUT, ["namespaces", name]) => {
+            if let Some(resp) = require_admin_role(&auth, AdminRole::Admin) {
+                return Ok(resp);
+            }
+            handle_update_namespace(&state, &auth, name, &body_bytes).await
+        }
+        (Method::DELETE, ["namespaces", name]) => {
+            if let Some(resp) = require_admin_role(&auth, AdminRole::Admin) {
+                return Ok(resp);
+            }
+            handle_delete_namespace(&state, &auth, name, query.as_deref()).await
         }
 
         // Metrics
@@ -9066,11 +9090,101 @@ async fn handle_audit_list(
 
 // ---- Namespaces ----
 
+/// When `FERRUM_ADMIN_REQUIRE_NAMESPACE_CLAIM` is on, `GET /namespaces` is
+/// filtered to the token's claimed names (missing/empty claim → empty list)
+/// rather than 403, because the list route is a global surface.
+fn filter_listed_namespaces(
+    require_claim: bool,
+    auth: &AuditActor,
+    names: Vec<String>,
+) -> Vec<String> {
+    if !require_claim {
+        return names;
+    }
+    names
+        .into_iter()
+        .filter(|name| auth.allowed_namespaces.allows(name))
+        .collect()
+}
+
+fn maybe_enforce_namespace_claim(
+    state: &AdminState,
+    auth: &AuditActor,
+    name: &str,
+    path: &str,
+) -> Option<Response<Full<Bytes>>> {
+    if !state.admin_require_namespace_claim {
+        return None;
+    }
+    enforce_namespace_claim(auth, name, path)
+}
+
+fn synthesized_namespace_record(name: &str) -> crate::config::namespace_registry::NamespaceRecord {
+    crate::config::namespace_registry::NamespaceRecord::new(name.to_string(), None, Utc::now())
+}
+
+fn map_namespace_registry_error(error: &anyhow::Error) -> Response<Full<Bytes>> {
+    if let Some(reg) = crate::config::namespace_registry::is_namespace_registry_error(error) {
+        let status = match reg {
+            crate::config::namespace_registry::NamespaceRegistryError::NameInUse { .. }
+            | crate::config::namespace_registry::NamespaceRegistryError::NotEmpty { .. }
+            | crate::config::namespace_registry::NamespaceRegistryError::Protected { .. } => {
+                StatusCode::CONFLICT
+            }
+            crate::config::namespace_registry::NamespaceRegistryError::NotFound { .. } => {
+                StatusCode::NOT_FOUND
+            }
+        };
+        return json_response(status, &json!({"error": reg.to_string()}));
+    }
+    if chain_has_unique_constraint_violation(error) {
+        return json_response(
+            StatusCode::CONFLICT,
+            &json!({"error": "namespace already exists"}),
+        );
+    }
+    json_response(StatusCode::INTERNAL_SERVER_ERROR, &db_error_response(error))
+}
+
+async fn acquire_namespace_admission(
+    db: Arc<dyn DatabaseBackend>,
+    namespace: &str,
+) -> Result<crud::NamespaceConfigAdmissionGuard, Response<Full<Bytes>>> {
+    match crud::lock_namespace_config_admission(db, namespace).await {
+        Ok(guard) => Ok(guard),
+        Err(_error) => {
+            warn_persistence_failure_redacted("namespace_registry_admission_acquire");
+            Err(json_response(
+                StatusCode::SERVICE_UNAVAILABLE,
+                &json!({"error": CONFIG_ADMISSION_UNAVAILABLE_MESSAGE}),
+            ))
+        }
+    }
+}
+
 async fn handle_list_namespaces(
     state: &AdminState,
+    auth: &AuditActor,
     pagination: &PaginationParams,
 ) -> Result<Response<Full<Bytes>>, hyper::Error> {
     if let Some(ref db) = state.db {
+        if state.admin_require_namespace_claim {
+            match db.list_namespaces().await {
+                Ok(names) => {
+                    let filtered = filter_listed_namespaces(true, auth, names);
+                    return Ok(json_response(
+                        StatusCode::OK,
+                        &paginate_response(&filtered, pagination),
+                    ));
+                }
+                Err(e) => {
+                    return Ok(json_response(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        &db_error_response(&e),
+                    ));
+                }
+            }
+        }
         match db
             .list_namespaces_paginated(pagination.query_limit_i64(), pagination.query_offset_i64())
             .await
@@ -9086,16 +9200,356 @@ async fn handle_list_namespaces(
         }
     } else if let Some(config) = state.cached_gateway_config() {
         // File mode: return namespaces captured at load time (before namespace filtering)
+        let names = filter_listed_namespaces(
+            state.admin_require_namespace_claim,
+            auth,
+            config.known_namespaces.clone(),
+        );
         Ok(json_response(
             StatusCode::OK,
-            &paginate_response(&config.known_namespaces, pagination),
+            &paginate_response(&names, pagination),
+        ))
+    } else {
+        let names = filter_listed_namespaces(
+            state.admin_require_namespace_claim,
+            auth,
+            vec![crate::config::types::DEFAULT_NAMESPACE.to_string()],
+        );
+        Ok(json_response(
+            StatusCode::OK,
+            &paginate_response(&names, pagination),
+        ))
+    }
+}
+
+async fn resolve_namespace_record(
+    db: &dyn DatabaseBackend,
+    name: &str,
+) -> Result<Option<crate::config::namespace_registry::NamespaceRecord>, anyhow::Error> {
+    if let Some(record) = db.get_namespace(name).await? {
+        return Ok(Some(record));
+    }
+    if db.namespace_name_in_use(name).await? {
+        return Ok(Some(synthesized_namespace_record(name)));
+    }
+    Ok(None)
+}
+
+async fn handle_get_namespace(
+    state: &AdminState,
+    auth: &AuditActor,
+    name: &str,
+) -> Result<Response<Full<Bytes>>, hyper::Error> {
+    if let Err(e) = crate::config::namespace_registry::validate_namespace_name(name) {
+        return Ok(json_response(
+            StatusCode::BAD_REQUEST,
+            &json!({"error": format!("Invalid namespace name: {e}")}),
+        ));
+    }
+    if let Some(resp) = maybe_enforce_namespace_claim(state, auth, name, &format!("/namespaces/{name}"))
+    {
+        return Ok(resp);
+    }
+    if let Some(ref db) = state.db {
+        match resolve_namespace_record(db.as_ref(), name).await {
+            Ok(Some(record)) => Ok(json_response(StatusCode::OK, &serde_json::to_value(&record).unwrap_or_else(|_| json!({})))),
+            Ok(None) => Ok(json_response(
+                StatusCode::NOT_FOUND,
+                &json!({"error": format!("namespace '{name}' not found")}),
+            )),
+            Err(e) => Ok(json_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                &db_error_response(&e),
+            )),
+        }
+    } else if let Some(config) = state.cached_gateway_config() {
+        if config.known_namespaces.iter().any(|existing| existing == name) {
+            Ok(json_response(
+                StatusCode::OK,
+                &serde_json::to_value(synthesized_namespace_record(name))
+                    .unwrap_or_else(|_| json!({})),
+            ))
+        } else {
+            Ok(json_response(
+                StatusCode::NOT_FOUND,
+                &json!({"error": format!("namespace '{name}' not found")}),
+            ))
+        }
+    } else if name == crate::config::types::DEFAULT_NAMESPACE {
+        Ok(json_response(
+            StatusCode::OK,
+            &serde_json::to_value(synthesized_namespace_record(name)).unwrap_or_else(|_| json!({})),
         ))
     } else {
         Ok(json_response(
-            StatusCode::OK,
-            &paginate_response(&[crate::config::types::DEFAULT_NAMESPACE], pagination),
+            StatusCode::NOT_FOUND,
+            &json!({"error": format!("namespace '{name}' not found")}),
         ))
     }
+}
+
+async fn handle_create_namespace(
+    state: &AdminState,
+    actor: &AuditActor,
+    body: &[u8],
+) -> Result<Response<Full<Bytes>>, hyper::Error> {
+    let _write_permit = match state.admit_write().await {
+        Ok(permit) => permit,
+        Err(response) => return Ok(response),
+    };
+    let request: crate::config::namespace_registry::CreateNamespaceRequest =
+        match serde_json::from_slice(body) {
+            Ok(request) => request,
+            Err(e) => {
+                return Ok(json_response(
+                    StatusCode::BAD_REQUEST,
+                    &json!({"error": format!("Invalid JSON body: {e}")}),
+                ));
+            }
+        };
+    if let Err(e) = crate::config::namespace_registry::validate_namespace_name(&request.name) {
+        return Ok(json_response(
+            StatusCode::BAD_REQUEST,
+            &json!({"error": format!("Invalid namespace name: {e}")}),
+        ));
+    }
+    let description = match crate::config::namespace_registry::normalize_description(request.description)
+    {
+        Ok(description) => description,
+        Err(e) => {
+            return Ok(json_response(
+                StatusCode::BAD_REQUEST,
+                &json!({"error": e}),
+            ));
+        }
+    };
+    if let Some(resp) =
+        maybe_enforce_namespace_claim(state, actor, &request.name, "/namespaces")
+    {
+        return Ok(resp);
+    }
+    let db = match require_db(state) {
+        Ok(db) => db.clone(),
+        Err(resp) => return Ok(*resp),
+    };
+    let _guard = match acquire_namespace_admission(db.clone(), &request.name).await {
+        Ok(guard) => guard,
+        Err(resp) => return Ok(resp),
+    };
+    let record = crate::config::namespace_registry::NamespaceRecord::new(
+        request.name.clone(),
+        description,
+        Utc::now(),
+    );
+    if let Err(error) = db.create_namespace(&record).await {
+        return Ok(map_namespace_registry_error(&error));
+    }
+    let event = audit::AuditEvent::new(
+        actor,
+        "create",
+        "namespace",
+        &record.name,
+        &record.name,
+        audit::create_diff(record.audit_body()),
+    );
+    if let Err(error) = audit::record(state.admin_audit_enabled, db, event).await {
+        log_audit_enqueue_failure(&error);
+    }
+    Ok(json_response(
+        StatusCode::CREATED,
+        &serde_json::to_value(&record).unwrap_or_else(|_| json!({})),
+    ))
+}
+
+async fn handle_update_namespace(
+    state: &AdminState,
+    actor: &AuditActor,
+    current_name: &str,
+    body: &[u8],
+) -> Result<Response<Full<Bytes>>, hyper::Error> {
+    let _write_permit = match state.admit_write().await {
+        Ok(permit) => permit,
+        Err(response) => return Ok(response),
+    };
+    if let Err(e) = crate::config::namespace_registry::validate_namespace_name(current_name) {
+        return Ok(json_response(
+            StatusCode::BAD_REQUEST,
+            &json!({"error": format!("Invalid namespace name: {e}")}),
+        ));
+    }
+    let request: crate::config::namespace_registry::UpdateNamespaceBody =
+        match serde_json::from_slice(body) {
+            Ok(request) => request,
+            Err(e) => {
+                return Ok(json_response(
+                    StatusCode::BAD_REQUEST,
+                    &json!({"error": format!("Invalid JSON body: {e}")}),
+                ));
+            }
+        };
+    let new_name = match &request.name {
+        Some(name) => {
+            if let Err(e) = crate::config::namespace_registry::validate_namespace_name(name) {
+                return Ok(json_response(
+                    StatusCode::BAD_REQUEST,
+                    &json!({"error": format!("Invalid namespace name: {e}")}),
+                ));
+            }
+            name.clone()
+        }
+        None => current_name.to_string(),
+    };
+    if let Some(resp) =
+        maybe_enforce_namespace_claim(state, actor, current_name, &format!("/namespaces/{current_name}"))
+    {
+        return Ok(resp);
+    }
+    if new_name != current_name
+        && let Some(resp) =
+            maybe_enforce_namespace_claim(state, actor, &new_name, &format!("/namespaces/{current_name}"))
+    {
+        return Ok(resp);
+    }
+    let db = match require_db(state) {
+        Ok(db) => db.clone(),
+        Err(resp) => return Ok(*resp),
+    };
+
+    let (first, second) = if current_name <= new_name.as_str() {
+        (current_name.to_string(), new_name.clone())
+    } else {
+        (new_name.clone(), current_name.to_string())
+    };
+    let _first_guard = match acquire_namespace_admission(db.clone(), &first).await {
+        Ok(guard) => guard,
+        Err(resp) => return Ok(resp),
+    };
+    let _second_guard = if first != second {
+        match acquire_namespace_admission(db.clone(), &second).await {
+            Ok(guard) => Some(guard),
+            Err(resp) => return Ok(resp),
+        }
+    } else {
+        None
+    };
+
+    let before = match resolve_namespace_record(db.as_ref(), current_name).await {
+        Ok(Some(record)) => record,
+        Ok(None) => {
+            return Ok(json_response(
+                StatusCode::NOT_FOUND,
+                &json!({"error": format!("namespace '{current_name}' not found")}),
+            ));
+        }
+        Err(error) => return Ok(map_namespace_registry_error(&error)),
+    };
+
+    let record = match db
+        .update_namespace(current_name, &new_name, request.description_update())
+        .await
+    {
+        Ok(record) => record,
+        Err(error) => return Ok(map_namespace_registry_error(&error)),
+    };
+    let event = audit::AuditEvent::new(
+        actor,
+        "update",
+        "namespace",
+        &record.name,
+        &record.name,
+        audit::update_diff(before.audit_body(), record.audit_body()),
+    );
+    if let Err(error) = audit::record(state.admin_audit_enabled, db, event).await {
+        log_audit_enqueue_failure(&error);
+    }
+    Ok(json_response(
+        StatusCode::OK,
+        &serde_json::to_value(&record).unwrap_or_else(|_| json!({})),
+    ))
+}
+
+async fn handle_delete_namespace(
+    state: &AdminState,
+    actor: &AuditActor,
+    name: &str,
+    query: Option<&str>,
+) -> Result<Response<Full<Bytes>>, hyper::Error> {
+    let _write_permit = match state.admit_write().await {
+        Ok(permit) => permit,
+        Err(response) => return Ok(response),
+    };
+    if let Err(e) = crate::config::namespace_registry::validate_namespace_name(name) {
+        return Ok(json_response(
+            StatusCode::BAD_REQUEST,
+            &json!({"error": format!("Invalid namespace name: {e}")}),
+        ));
+    }
+    if let Some(resp) = maybe_enforce_namespace_claim(state, actor, name, &format!("/namespaces/{name}"))
+    {
+        return Ok(resp);
+    }
+    let db = match require_db(state) {
+        Ok(db) => db.clone(),
+        Err(resp) => return Ok(*resp),
+    };
+    let process_default = crate::config::namespace_registry::process_default_namespace();
+    if name == process_default {
+        return Ok(json_response(
+            StatusCode::CONFLICT,
+            &json!({"error": format!(
+                "namespace '{name}' cannot be deleted: it is the process default namespace"
+            )}),
+        ));
+    }
+    match db.list_namespaces().await {
+        Ok(names) if names.len() <= 1 && names.iter().any(|existing| existing == name) => {
+            return Ok(json_response(
+                StatusCode::CONFLICT,
+                &json!({"error": format!(
+                    "namespace '{name}' cannot be deleted: it is the last remaining namespace"
+                )}),
+            ));
+        }
+        Ok(_) => {}
+        Err(error) => return Ok(map_namespace_registry_error(&error)),
+    }
+    let cascade = parse_restore_confirm(query);
+    let _guard = match acquire_namespace_admission(db.clone(), name).await {
+        Ok(guard) => guard,
+        Err(resp) => return Ok(resp),
+    };
+    let before = match resolve_namespace_record(db.as_ref(), name).await {
+        Ok(Some(record)) => record,
+        Ok(None) => {
+            return Ok(json_response(
+                StatusCode::NOT_FOUND,
+                &json!({"error": format!("namespace '{name}' not found")}),
+            ));
+        }
+        Err(error) => return Ok(map_namespace_registry_error(&error)),
+    };
+    match db.delete_namespace(name, cascade).await {
+        Ok(true) => {}
+        Ok(false) => {
+            return Ok(json_response(
+                StatusCode::NOT_FOUND,
+                &json!({"error": format!("namespace '{name}' not found")}),
+            ));
+        }
+        Err(error) => return Ok(map_namespace_registry_error(&error)),
+    }
+    let event = audit::AuditEvent::new(
+        actor,
+        "delete",
+        "namespace",
+        name,
+        name,
+        audit::delete_diff(before.audit_body()),
+    );
+    if let Err(error) = audit::record(state.admin_audit_enabled, db, event).await {
+        log_audit_enqueue_failure(&error);
+    }
+    Ok(empty_response(StatusCode::NO_CONTENT))
 }
 
 // ---- Helpers ----
@@ -9589,6 +10043,7 @@ mod tests {
         for segs in [
             vec!["plugins"], // plugin *type* listing — global metadata
             vec!["namespaces"],
+            vec!["namespaces", "tenant-a"],
             vec!["cluster"],
             vec!["backend-capabilities"],
             vec!["metrics", "runtime"],
@@ -9647,6 +10102,34 @@ mod tests {
         // server-derived ceiling (admin has none).
         assert!(!AllowedNamespaces::empty().is_present());
         assert!(AllowedNamespaces::claimed(std::collections::HashSet::new()).is_present());
+    }
+
+    #[test]
+    fn list_namespaces_claim_filter_is_fail_closed() {
+        use crate::grpc::auth::AllowedNamespaces;
+
+        let actor = |allowed: AllowedNamespaces| AuditActor {
+            sub: "tester".to_string(),
+            role: AdminRole::Viewer,
+            allowed_namespaces: allowed,
+        };
+        let names = vec!["alpha".to_string(), "ferrum".to_string(), "zeta".to_string()];
+
+        assert_eq!(
+            filter_listed_namespaces(false, &actor(AllowedNamespaces::empty()), names.clone()),
+            names
+        );
+
+        let mut set = std::collections::HashSet::new();
+        set.insert("zeta".to_string());
+        assert_eq!(
+            filter_listed_namespaces(true, &actor(AllowedNamespaces::claimed(set)), names.clone()),
+            vec!["zeta".to_string()]
+        );
+        assert!(
+            filter_listed_namespaces(true, &actor(AllowedNamespaces::empty()), names).is_empty(),
+            "a token with no ns claim must not see any registry names"
+        );
     }
 
     #[test]
