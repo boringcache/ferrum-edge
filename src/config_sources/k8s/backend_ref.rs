@@ -384,9 +384,14 @@ pub(crate) fn materialize_backend(
             if !endpoint_backends.is_empty() {
                 return endpoint_backends;
             }
+            // Headless Services have no kube-proxy DNAT: Cluster DNS returns
+            // pod IPs that listen on targetPort. Keep `service_port` as the
+            // Gateway API identity tag so BackendTLSPolicy / BackendLBPolicy
+            // still attach to the Service port the route named.
+            let dial_port = acc.service_dns_fallback_port(namespace, name, port);
             vec![RouteBackend {
                 host: backend_dns_name(kind, name, namespace, &acc.options.cluster_domain),
-                port,
+                port: dial_port,
                 weight,
                 service_namespace: Some(namespace.to_string()),
                 service_name: Some(name.to_string()),

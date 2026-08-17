@@ -733,6 +733,56 @@ pub(super) fn endpoint_route_backends_for_service(
     backends
 }
 
+/// Dial port for a Service DNS fallback when EndpointSlice expansion is empty.
+///
+/// ClusterIP Services keep the Service port: kube-proxy DNATs
+/// `ClusterIP:servicePort` onto `podIP:targetPort`. Headless Services
+/// (`spec.clusterIP: None`) have no ClusterIP and no kube-proxy DNAT; CoreDNS
+/// returns the backing pod IPs, which listen on `targetPort`. Falling back to
+/// the Service port here is `connection_failure` (HTTP 502) — that is the
+/// Gateway API `HTTPRouteServiceTypes` `/headless-manual-endpointslices` miss.
+pub(super) fn service_dns_fallback_port(
+    acc: &K8sAccumulator,
+    namespace: &str,
+    service_name: &str,
+    service_port: u16,
+) -> u16 {
+    let Some(service_key) = K8sServiceKey::new(namespace.to_string(), service_name.to_string())
+    else {
+        return service_port;
+    };
+    let Some(service) = acc.core.services.get(&service_key) else {
+        return service_port;
+    };
+    if !service.cluster_ips.is_empty() {
+        return service_port;
+    }
+    let service_port_spec = service
+        .ports
+        .iter()
+        .find(|candidate| candidate.port == service_port);
+    match service_port_spec.and_then(|port| port.target_port.as_ref()) {
+        Some(ServiceTargetPort::Number(port)) if *port != 0 => *port,
+        Some(ServiceTargetPort::Name(name)) => acc
+            .core
+            .endpoint_slices
+            .iter()
+            .filter(|slice| {
+                slice.service_key == service_key
+                    && slice.backend_kind == EndpointSliceBackendKind::Service
+            })
+            .find_map(|slice| {
+                slice
+                    .ports
+                    .iter()
+                    .find(|port| port.name.as_deref() == Some(name.as_str()))
+                    .and_then(|port| port.port)
+            })
+            .unwrap_or(service_port),
+        Some(ServiceTargetPort::Number(_)) | None => service_port,
+    }
+}
+
 /// Expand an MCS `ServiceImport` onto ready EndpointSlice addresses.
 ///
 /// Slices are selected by `multicluster.kubernetes.io/service-name`. Unlike
