@@ -7864,6 +7864,43 @@ pub mod _test_support {
         })
     }
 
+    /// Forward the decrypted inspection prefix exactly as the production TCP
+    /// setup path does: under BOTH post-admission bounds, with the
+    /// per-write-poll trust fence inside them (issues #3816, #3857).
+    ///
+    /// The outer `Err` is the bound that ended the await — trust-first on a
+    /// tie. The inner `Err` distinguishes a fence that fired mid-write from
+    /// genuine backend evidence.
+    #[allow(clippy::type_complexity)]
+    pub async fn tcp_forward_prefix_within_setup_bounds_for_test<W>(
+        plan: Option<crate::proxy::auth_lifetime::StreamAuthDeadline>,
+        client_trust: Option<&crate::tls::ClientTrustSession>,
+        writer: &mut W,
+        prefix: &[u8],
+    ) -> Result<Result<(), PrefixForwardRejectForTest>, StreamSetupInterruptForTest>
+    where
+        W: tokio::io::AsyncWrite + Unpin + ?Sized,
+    {
+        crate::proxy::tcp_proxy::forward_inspected_prefix_within_stream_setup_bounds(
+            plan,
+            client_trust,
+            writer,
+            prefix,
+        )
+        .await
+        .map(|forwarded| {
+            forwarded.map_err(|reject| match reject {
+                crate::proxy::tcp_proxy::PrefixForwardReject::TrustWithdrawn => {
+                    PrefixForwardRejectForTest::TrustWithdrawn
+                }
+                crate::proxy::tcp_proxy::PrefixForwardReject::Io(error) => {
+                    PrefixForwardRejectForTest::Io(error)
+                }
+            })
+        })
+        .map_err(map_stream_setup_interrupt_for_test)
+    }
+
     /// Settle a client-trust withdrawal observed during TCP setup, exactly as
     /// every admission and setup fence does: the fixed-cardinality fence
     /// counter is recorded once per connection through the shared latch, and
@@ -7873,6 +7910,53 @@ pub mod _test_support {
         settled: &std::sync::atomic::AtomicBool,
     ) -> anyhow::Error {
         crate::proxy::tcp_proxy::settle_stream_trust_withdrawal(client_trust, settled)
+    }
+
+    /// Run the production `on_stream_connect` chain for a TCP+TLS connection
+    /// under the established transport's client-trust fence (issue #3857).
+    ///
+    /// This is the real chain the TCP+TLS admission path runs: the same hook
+    /// loop, the same fault-injection peer-reset race, the same admission
+    /// permit release, the same mesh opened/closed finalizer, and the same
+    /// typed refusals. Only the log-label arguments are supplied here — a
+    /// blocked hook, its cancellation, and the lifecycle it settles are not
+    /// reachable from outside the crate any other way.
+    pub async fn tcp_stream_connect_chain_under_trust_fence_for_test(
+        plugins: &[std::sync::Arc<dyn crate::plugins::Plugin>],
+        stream_ctx: &mut crate::plugins::StreamConnectionContext,
+        client_stream: &tokio::net::TcpStream,
+        client_trust: Option<&crate::tls::ClientTrustSession>,
+        settled: &std::sync::atomic::AtomicBool,
+    ) -> Result<(), anyhow::Error> {
+        crate::proxy::tcp_proxy::run_tcp_stream_connect_plugins(
+            plugins,
+            stream_ctx,
+            client_stream,
+            "trust-fence-test",
+            std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+            "TCP/TLS",
+            "(TCP/TLS)",
+            client_trust.map(|session| {
+                crate::proxy::tcp_proxy::StreamConnectTrustFence::new(session, settled)
+            }),
+        )
+        .await
+    }
+
+    /// Install one stream admission permit whose release increments `released`.
+    ///
+    /// `StreamConnectionContext::add_admission_permit` and
+    /// `StreamAdmissionPermit::new` are crate-private, so an external test
+    /// cannot otherwise put the chain in the state a plugin that took a permit
+    /// leaves it in — which is exactly the state a fence must not leak.
+    pub fn stream_ctx_hold_admission_permit_for_test(
+        stream_ctx: &mut crate::plugins::StreamConnectionContext,
+        released: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    ) {
+        let permit = crate::plugins::StreamAdmissionPermit::new(move || {
+            released.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        });
+        stream_ctx.add_admission_permit(permit);
     }
 
     /// Kernel splice/IORING is legal only for an unauthenticated plain TCP
