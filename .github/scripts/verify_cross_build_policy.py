@@ -11923,10 +11923,10 @@ FIPS_BUILD_RETIRED_GENERATION_SHA256 = (
     "527659b0ad96a0d97cd4a170543dd81acbf6784155b3c82918b1f70a20c7914b"
 )
 # `.github/workflows/fips-build.yml` at PR #3950 head
-# f1dc6f35b: the same-run producer handoff moves off the eviction-prone
+# 0984a45e4: the same-run producer handoff moves off the eviction-prone
 # repository cache onto the immutable run artifact.
 FIPS_BUILD_ADOPTED_GENERATION_SHA256 = (
-    "ce9d409c96d30bea03f828b959eb4e0637bd38f9f5d1c0412933e1a68da68384"
+    "05f86617597b1eb7bcf1960a0c630a9884ff09ac1995982f46a80811c3965e74"
 )
 FIPS_BUILD_ADMITTED_GENERATION_TRANSITION = (
     FIPS_BUILD_WORKFLOW_FILENAME,

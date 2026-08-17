@@ -1976,8 +1976,8 @@ repository cache onto the immutable run artifact, which necessarily edits four
 digest-frozen `fips-build.yml` job bodies. The pair is exact and one-way:
 trusted-base `527659b0ad96a0d97cd4a170543dd81acbf6784155b3c82918b1f70a20c7914b`
 (PR #3889's landed file) →
-`ce9d409c96d30bea03f828b959eb4e0637bd38f9f5d1c0412933e1a68da68384` (PR #3950
-head `f1dc6f35b`; recompute and re-pin if review changes the workflow bytes).
+`05f86617597b1eb7bcf1960a0c630a9884ff09ac1995982f46a80811c3965e74` (PR #3950
+head `0984a45e4`; recompute and re-pin if review changes the workflow bytes).
 The digest is over universal-newline-decoded text. RETIREMENT IS MANDATORY
 once #3950 lands, exactly as #3943 retired the #3889 pair. Any other
 `fips-build.yml` edit is still compared by the normal fail-closed Cross
