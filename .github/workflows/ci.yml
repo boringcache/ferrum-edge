@@ -40,6 +40,8 @@ jobs:
       run_mesh_sidecar_smoke: ${{ steps.plan.outputs.run_mesh_sidecar_smoke }}
       run_ebpf_live: ${{ steps.plan.outputs.run_ebpf_live }}
       run_ebpf_build: ${{ steps.plan.outputs.run_ebpf_build }}
+      run_secrets_backends: ${{ steps.plan.outputs.run_secrets_backends }}
+      run_pkcs11: ${{ steps.plan.outputs.run_pkcs11 }}
       binary-matrix: ${{ steps.binary-matrix.outputs.matrix }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
@@ -181,7 +183,9 @@ jobs:
             base_ref="origin/${BASE_REF}"
             # Disable rename detection so moving a full-CI input to an allowed
             # lightweight path reports both the deleted source and destination.
-            git diff --name-only --no-renames "${base_ref}...HEAD" | sort > "$changed_files"
+            # NUL-delimit the stream so a hostile filename cannot split or
+            # C-quote away a secrets/PKCS path before the planner classifies it.
+            git diff --name-only --no-renames -z "${base_ref}...HEAD" > "$changed_files"
 
             # A PR that edits only the planner must not be able to classify
             # itself as light. Use the base branch's trusted planner when it
@@ -208,7 +212,7 @@ jobs:
               git fetch --no-tags origin "${MERGE_BASE_SHA}"
             fi
             # Diff the synthesized merge-group commit against its payload base.
-            git diff --name-only --no-renames "${MERGE_BASE_SHA}...HEAD" | sort > "$changed_files"
+            git diff --name-only --no-renames -z "${MERGE_BASE_SHA}...HEAD" > "$changed_files"
 
             # Use the merge-group base planner so a queued change that edits the
             # planner cannot classify the combined SHA as light.
@@ -231,16 +235,24 @@ jobs:
             --changed-files "$changed_files")"
           mode="$(printf '%s\n' "$plan" | sed -n 's/^mode=//p')"
           reason="$(printf '%s\n' "$plan" | sed -n 's/^reason=//p')"
+          paths_classifiable="$(printf '%s\n' "$plan" | sed -n 's/^paths_classifiable=//p')"
           echo "mode=$mode" >> "$GITHUB_OUTPUT"
 
-          # The first PR that introduces these outputs necessarily runs the
-          # older trusted base-branch planner. Missing/invalid gate values
-          # therefore fail closed to true; after merge, the trusted planner
-          # computes the narrow path gates for every subsequent PR.
+          # paths_classifiable is a trust/transport version handshake. This
+          # introducing PR and its merge group execute the trusted-base
+          # planner, which is newline-only and does not emit the flag. That
+          # older planner can treat a NUL stream as one record and still emit
+          # syntactically valid false values for pre-existing Helm/mesh/eBPF
+          # gates. Unless the flag is exactly true, force every job gate on
+          # before GITHUB_OUTPUT emission. Honor narrow true/false values only
+          # after the new planner proves the NUL stream classifiable.
+          # Missing/invalid individual outputs still fail closed to true.
           gate_fallbacks=()
-          for gate in run_helm run_mesh_federation run_mesh_sidecar_smoke run_ebpf_live run_ebpf_build; do
+          for gate in run_helm run_mesh_federation run_mesh_sidecar_smoke run_ebpf_live run_ebpf_build run_secrets_backends run_pkcs11; do
             value="$(printf '%s\n' "$plan" | sed -n "s/^${gate}=//p")"
-            if [ "$value" != "true" ] && [ "$value" != "false" ]; then
+            if [ "$paths_classifiable" != "true" ]; then
+              value=true
+            elif [ "$value" != "true" ] && [ "$value" != "false" ]; then
               value=true
               gate_fallbacks+=("$gate")
             fi
@@ -252,28 +264,37 @@ jobs:
             echo ""
             echo "Mode: **${mode}**"
             echo ""
-            echo "$reason"
-            if [ -s "$changed_files" ]; then
-              echo ""
-              echo "### Changed Files"
-              echo ""
-              while IFS= read -r path; do
-                echo "- \`${path}\`"
-              done < "$changed_files"
+            if [ "$paths_classifiable" = "true" ]; then
+              echo "$reason"
+              if [ -s "$changed_files" ]; then
+                echo ""
+                echo "### Changed Files"
+                echo ""
+                while IFS= read -r -d '' path; do
+                  echo "- \`${path}\`"
+                done < "$changed_files"
+              fi
+            else
+              echo "changed paths were suppressed as unclassifiable; defaulting to full CI"
             fi
             echo ""
             echo "### Runner-free job gates"
             echo ""
             echo "| Gate | Scheduled |"
             echo "| --- | --- |"
-            for gate in run_helm run_mesh_federation run_mesh_sidecar_smoke run_ebpf_live run_ebpf_build; do
+            for gate in run_helm run_mesh_federation run_mesh_sidecar_smoke run_ebpf_live run_ebpf_build run_secrets_backends run_pkcs11; do
               value="$(printf '%s\n' "$plan" | sed -n "s/^${gate}=//p")"
-              if [ "$value" != "true" ] && [ "$value" != "false" ]; then
+              if [ "$paths_classifiable" != "true" ]; then
+                value=true
+              elif [ "$value" != "true" ] && [ "$value" != "false" ]; then
                 value=true
               fi
               echo "| ${gate} | ${value} |"
             done
-            if [ "${#gate_fallbacks[@]}" -gt 0 ]; then
+            if [ "$paths_classifiable" != "true" ]; then
+              echo ""
+              echo "The planner did not prove a classifiable NUL stream; every job gate was scheduled fail-closed."
+            elif [ "${#gate_fallbacks[@]}" -gt 0 ]; then
               echo ""
               echo "The trusted base-branch planner predates one or more job gates; missing values were scheduled fail-closed."
             else
@@ -366,8 +387,32 @@ jobs:
     needs: ci-plan
     if: needs.ci-plan.outputs.mode == 'full' && (github.event_name == 'pull_request' || github.event_name == 'merge_group' || (github.event_name == 'push' && github.ref == 'refs/heads/main'))
     runs-on: ubuntu-latest
+    env:
+      # Cold-cache full-workspace compiles repeatedly kill this hosted runner
+      # ("The runner has received a shutdown signal" + exit 143) while the
+      # combined lib + unit_tests precompile lets two full-debuginfo link jobs
+      # overlap. Cap cargo's parallelism and shrink debuginfo to line tables
+      # (backtraces keep file:line) so a cold compile fits the runner's
+      # memory/disk. Same values on every job sharing this rust-cache key so
+      # cached artifact fingerprints stay uniform.
+      CARGO_BUILD_JOBS: "3"
+      CARGO_PROFILE_DEV_DEBUG: "line-tables-only"
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
+
+      - name: Extend runner swap for the aggregated unit_tests compile
+        run: |
+          set -euo pipefail
+          # The single-crate rustc frontend for the aggregated tests/unit_tests
+          # binary exceeds hosted-runner RAM on cold compiles: the VM dies with
+          # "The runner has received a shutdown signal" / exit 143 before any
+          # compiler diagnostic can print. Give the VM swap headroom so memory
+          # pressure degrades to paging instead of killing the runner agent.
+          sudo fallocate -l 12G /mnt/ferrum-swapfile
+          sudo chmod 600 /mnt/ferrum-swapfile
+          sudo mkswap /mnt/ferrum-swapfile
+          sudo swapon /mnt/ferrum-swapfile
+          free -h
 
       - uses: ./.github/actions/setup-rust-ci
         with:
@@ -511,7 +556,7 @@ jobs:
   test-secrets:
     name: Secret Backends
     needs: ci-plan
-    if: needs.ci-plan.outputs.mode == 'full' && (github.event_name == 'pull_request' || github.event_name == 'merge_group' || (github.event_name == 'push' && github.ref == 'refs/heads/main'))
+    if: needs.ci-plan.outputs.mode == 'full' && needs.ci-plan.outputs.run_secrets_backends == 'true' && (github.event_name == 'pull_request' || github.event_name == 'merge_group' || (github.event_name == 'push' && github.ref == 'refs/heads/main') || github.event_name == 'workflow_dispatch')
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
@@ -585,10 +630,27 @@ jobs:
   test-pkcs11-softhsm:
     name: PKCS#11 SoftHSM Smoke Test
     needs: ci-plan
-    if: needs.ci-plan.outputs.mode == 'full' && (github.event_name == 'pull_request' || github.event_name == 'merge_group' || (github.event_name == 'push' && github.ref == 'refs/heads/main'))
+    if: needs.ci-plan.outputs.mode == 'full' && needs.ci-plan.outputs.run_pkcs11 == 'true' && (github.event_name == 'pull_request' || github.event_name == 'merge_group' || (github.event_name == 'push' && github.ref == 'refs/heads/main') || github.event_name == 'workflow_dispatch')
     runs-on: ubuntu-latest
+    env:
+      # Same cold-compile survivability caps as test-unit (own rust-cache key,
+      # same repeated exit-143 runner loss during the pkcs11 double-target
+      # precompile).
+      CARGO_BUILD_JOBS: "3"
+      CARGO_PROFILE_DEV_DEBUG: "line-tables-only"
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
+
+      - name: Extend runner swap for the aggregated unit_tests compile
+        run: |
+          set -euo pipefail
+          # Same VM-loss pattern as test-unit: the aggregated unit_tests rustc
+          # frontend exceeds hosted-runner RAM on cold compiles. See test-unit.
+          sudo fallocate -l 12G /mnt/ferrum-swapfile
+          sudo chmod 600 /mnt/ferrum-swapfile
+          sudo mkswap /mnt/ferrum-swapfile
+          sudo swapon /mnt/ferrum-swapfile
+          free -h
 
       - uses: ./.github/actions/setup-rust-ci
         with:
@@ -841,6 +903,8 @@ jobs:
               integration::mesh_outbound_registry_route_miss_tests
               integration::mesh_outbound_registry_stream_tests
               integration::mesh_node_waypoint_stream_scope_tests
+              integration::mesh_node_waypoint_udp_scope_tests
+              integration::mesh_node_waypoint_dtls_owner_tests
               integration::mesh_runtime_overlay_consumers_tests
               integration::transformer_runtime_overlay_generation_tests
               integration::mesh_local_reload_observability_tests
@@ -1003,6 +1067,12 @@ jobs:
     needs: ci-plan
     if: needs.ci-plan.outputs.mode == 'full' && (github.event_name == 'pull_request' || github.event_name == 'merge_group' || (github.event_name == 'push' && github.ref == 'refs/heads/main'))
     runs-on: ubuntu-latest
+    env:
+      # Shares the `ci-test` rust-cache key with test-unit: keep the same
+      # compile settings so cached artifact fingerprints stay uniform across
+      # the shared key.
+      CARGO_BUILD_JOBS: "3"
+      CARGO_PROFILE_DEV_DEBUG: "line-tables-only"
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
 
@@ -4459,9 +4529,9 @@ jobs:
 
           require_success "CI plan" "${{ needs.ci-plan.result }}"
           require_success "Unit and inline lib" "${{ needs.test-unit.result }}"
-          require_success "Secret backends" "${{ needs.test-secrets.result }}"
+          require_planned_gate "Secret backends" "${{ needs.test-secrets.result }}" "${{ needs.ci-plan.outputs.run_secrets_backends }}"
           require_success "Service integration" "${{ needs.test-service-integration.result }}"
-          require_success "PKCS#11 SoftHSM integration" "${{ needs.test-pkcs11-softhsm.result }}"
+          require_planned_gate "PKCS#11 SoftHSM integration" "${{ needs.test-pkcs11-softhsm.result }}" "${{ needs.ci-plan.outputs.run_pkcs11 }}"
           require_success "Test artifact build" "${{ needs.build-test-artifacts.result }}"
           require_success "Integration" "${{ needs.test-integration.result }}"
           require_success "Mesh conformance" "${{ needs.test-conformance.result }}"
@@ -4523,23 +4593,33 @@ jobs:
     # Byte-frozen by the trusted Cross build policy
     # (.github/scripts/verify_cross_build_policy.py, CI_FUZZ_SMOKE_JOB). Issue
     # #2461 requires a short deterministic property/fuzz smoke in ordinary CI;
-    # this is its entire permitted shape. Every command, action pin, toolchain
-    # pin, tool version, target name, and libFuzzer bound below is part of the
-    # contract, so a pull request cannot widen the budget, change the target
-    # list, add a step, or redirect this job at a repository-supplied script.
+    # issue #3902 decides where each half of it runs. This is its entire
+    # permitted shape. Every command, action pin, toolchain pin, tool version,
+    # target name, and libFuzzer bound below is part of the contract, so a pull
+    # request cannot widen the budget, change the target list, add a step, or
+    # redirect this job at a repository-supplied script.
+    #
+    # Lane split (#3902): the deterministic property smoke stays the required
+    # full-mode pull-request gate. The six-target, sanitizer-instrumented
+    # libFuzzer build spent roughly 39 minutes compiling to buy roughly 48
+    # seconds of fuzzing on every pull request, so it now runs on merge_group,
+    # on the push to `main`, and on manual dispatch instead. Every route a
+    # change takes to `main` still executes it at byte-identical bounds.
     name: Fuzz Smoke
     needs: ci-plan
-    if: needs.ci-plan.outputs.mode == 'full' && (github.event_name == 'pull_request' || github.event_name == 'merge_group' || (github.event_name == 'push' && github.ref == 'refs/heads/main'))
+    if: needs.ci-plan.outputs.mode == 'full' && (github.event_name == 'pull_request' || github.event_name == 'merge_group' || (github.event_name == 'push' && github.ref == 'refs/heads/main') || github.event_name == 'workflow_dispatch')
     runs-on: ubuntu-latest
     timeout-minutes: 60
     permissions:
       contents: read
-    # The repository-root Cargo config selects sccache and host linker flags,
-    # but this isolated fuzz job installs neither sccache nor mold. Disable both
-    # Cargo wrapper inputs and inherited rustflags explicitly.
+    # The repository-root Cargo config also selects the mold linker through
+    # per-target rustflags, and this isolated lane installs no fast linker, so
+    # the inherited rustflags are cleared explicitly. The rustc wrapper is
+    # deliberately NOT pinned here: `setup-sccache` below publishes either the
+    # checksum-verified sccache path or an empty value through `GITHUB_ENV`,
+    # and a job-level `env` entry of the same name would override that
+    # fail-closed decision.
     env:
-      RUSTC_WRAPPER: ""
-      CARGO_BUILD_RUSTC_WRAPPER: ""
       RUSTFLAGS: ""
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
@@ -4557,22 +4637,56 @@ jobs:
         with:
           toolchain: nightly-2025-07-01
 
+      # The repository's own checksum-pinned sccache installer, and the only
+      # local action this contract admits. It never enables the
+      # credential-bearing sccache GHA backend, never persists
+      # ACTIONS_RUNTIME_TOKEN / ACTIONS_RESULTS_URL into later steps, asserts
+      # those credentials are absent before any build runs, and fails closed to
+      # no wrapper at all. It must run BEFORE the cache restore below so the
+      # lazily started sccache server indexes the restored entries.
+      - uses: ./.github/actions/setup-sccache
+
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
           workspaces: fuzz -> target
           shared-key: fuzz-smoke
+          cache-directories: ${{ github.workspace }}/.cache/sccache
+          # Only a push to `main` may write this lane's cache. GitHub already
+          # scopes a pull request's cache writes to its own ref; writing
+          # nothing at all from an untrusted ref is the stronger statement,
+          # and it keeps every compiler artifact the sanitizer build reuses
+          # attributable to code that has already merged.
+          save-if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
 
       - name: Install pinned cargo-fuzz
         run: cargo install cargo-fuzz --locked --version 0.13.1
 
       - name: Run deterministic property smoke tests
         working-directory: fuzz
-        run: cargo test --locked
+        run: |
+          set -euo pipefail
+
+          property_started=$SECONDS
+          cargo test --locked
+          echo "Fuzz property smoke seconds: $((SECONDS - property_started))"
 
       - name: Run bounded libFuzzer smoke budget
+        # Issue #3902: off the ordinary pull-request path. Every route to
+        # `main` (merge_group, the push to `main` itself, and manual dispatch)
+        # still executes the whole six-target budget below.
+        if: github.event_name != 'pull_request'
         working-directory: fuzz
         run: |
           set -euo pipefail
+
+          sanitizer_started=$SECONDS
+          sccache_bin="${RUSTC_WRAPPER:-}"
+          echo "Fuzz sanitizer lane sccache statistics before the sanitizer build:"
+          if [ -n "$sccache_bin" ] && [ -x "$sccache_bin" ]; then
+            "$sccache_bin" --show-stats
+          else
+            echo "sccache is unavailable; this sanitizer build cannot reuse compiler output"
+          fi
 
           for fuzz_target in traceparent config_decode proxy_protocol mesh_udp_frame k8s_crd plugin_config; do
             echo "Fuzz smoke target: ${fuzz_target}"
@@ -4583,6 +4697,27 @@ jobs:
               -timeout=2 \
               -rss_limit_mb=1024
           done
+          echo "Fuzz sanitizer lane seconds: $((SECONDS - sanitizer_started))"
+
+      - name: Report fuzz lane compiler-cache telemetry
+        if: always()
+        run: |
+          set -euo pipefail
+
+          if [ "$GITHUB_EVENT_NAME" = "pull_request" ]; then
+            echo "Fuzz lane shape: deterministic property gate only"
+          else
+            echo "Fuzz lane shape: property gate plus the six-target sanitizer budget"
+          fi
+
+          sccache_bin="${RUSTC_WRAPPER:-}"
+          if [ -n "$sccache_bin" ] && [ -x "$sccache_bin" ]; then
+            echo "Fuzz lane sccache statistics after this run:"
+            "$sccache_bin" --show-stats
+            du -sh "${GITHUB_WORKSPACE}/.cache/sccache" || true
+          else
+            echo "::warning::sccache was unavailable; this fuzz run compiled without a compiler cache"
+          fi
 
   build-ebpf:
     name: Build eBPF Programs

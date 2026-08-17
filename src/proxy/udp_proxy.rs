@@ -233,6 +233,20 @@ struct UdpSession {
     /// is disabled, unsupported, or the first datagram did not carry a cmsg
     /// (e.g., it came through tokio's cmsg-less `recv_from`).
     local_addr: std::sync::OnceLock<crate::socket_opts::PktinfoLocal>,
+    /// Exact Service destination ownership pinned at admission for a shared
+    /// NodeWaypoint listener. The router republishes in place, so every late
+    /// client forward and backend reply revalidates this capability against
+    /// the current table before emitting traffic.
+    node_waypoint_destination: Option<NodeWaypointUdpSessionDestination>,
+    /// NodeWaypoint source-workload attribution pinned at admission (issue
+    /// #3286). `None` only for non-NodeWaypoint listeners. NodeWaypoint sessions
+    /// retain state even when mesh-wide-only policy admits an unattributable
+    /// source, so every subsequent datagram is fenced by the exact accepted
+    /// mesh-slice policy generation and either still resolves to the pinned
+    /// binding/miss or ends the session. Pod churn, interface reuse, registry
+    /// removal, and policy-only updates therefore cannot keep relaying under
+    /// stale evidence.
+    node_waypoint_source: Option<NodeWaypointUdpSessionSource>,
     /// Identified consumer username (gateway Consumer or external identity) resolved
     /// during `on_stream_connect`. Carried to `on_stream_disconnect` for logging.
     consumer_username: Option<String>,
@@ -335,7 +349,139 @@ struct UdpSessionAuthorization {
     latch: crate::proxy::auth_lifetime::StreamAuthTerminationLatch,
 }
 
+/// Source evidence pinned by an admitted NodeWaypoint UDP/DTLS session.
+/// Keeping the resolver beside the binding lets both client datagrams and
+/// backend replies revalidate against the current registry AND live slice.
+#[derive(Clone)]
+struct NodeWaypointUdpSessionSource {
+    scoping: crate::proxy::node_waypoint_udp_identity::NodeWaypointUdpSourceScoping,
+    /// Present when admission attributed the source to an enrolled pod. `None`
+    /// is still stateful: mesh-wide-only policy may admit an unattributable
+    /// source, but the miss and policy generation below remain pinned so a
+    /// later scoped-policy update cannot leave that session on the old chain.
+    binding: Option<Arc<crate::proxy::node_waypoint_udp_identity::NodeWaypointUdpSourceBinding>>,
+    ingress_ifindex: Option<u32>,
+    policy_generation: u64,
+    unresolved_refusal:
+        Option<crate::proxy::node_waypoint_udp_identity::NodeWaypointUdpSourceRefusal>,
+}
+
+/// Destination evidence pinned by an admitted shared-listener UDP session.
+/// Unlike the source-workload fence, this is absent on ordinary listeners and
+/// on the single-claimant direct-node-address boundary.
+#[derive(Clone)]
+struct NodeWaypointUdpSessionDestination {
+    router: Arc<crate::proxy::node_waypoint_udp_destination::NodeWaypointUdpDestinationRouter>,
+    destination: IpAddr,
+    owner: Arc<NamespacedResourceId>,
+}
+
+impl NodeWaypointUdpSessionDestination {
+    #[inline]
+    fn revalidate(
+        &self,
+    ) -> Result<(), crate::proxy::node_waypoint_udp_destination::NodeWaypointUdpDestinationRefusal>
+    {
+        self.router
+            .revalidate_owner(self.destination, self.owner.as_ref())
+            .map(|_| ())
+            .map_err(|(refusal, _)| refusal)
+    }
+}
+
+impl NodeWaypointUdpSessionSource {
+    fn revalidate(
+        &self,
+        ingress_ifindex: Option<u32>,
+        source: IpAddr,
+    ) -> Result<(), crate::proxy::node_waypoint_udp_identity::NodeWaypointUdpSourceRefusal> {
+        if let Some(binding) = self.binding.as_deref() {
+            self.scoping.revalidate_at_policy_generation(
+                binding,
+                self.policy_generation,
+                ingress_ifindex,
+                source,
+            )
+        } else {
+            self.scoping.revalidate_unattributed(
+                self.policy_generation,
+                self.unresolved_refusal.unwrap_or(
+                    crate::proxy::node_waypoint_udp_identity::NodeWaypointUdpSourceRefusal::AttributionChanged,
+                ),
+                ingress_ifindex,
+                source,
+            )
+        }
+    }
+
+    /// Re-authorize a datagram whose ingress interface is the DATAGRAM's, not
+    /// the session's. A UDP session is keyed by a forgeable source tuple, so a
+    /// refusal here must not be allowed to end a session whose own pinned
+    /// evidence is still current. The classification itself lives in
+    /// [`crate::proxy::node_waypoint_udp_identity`].
+    fn revalidate_datagram(
+        &self,
+        ingress_ifindex: Option<u32>,
+        source: IpAddr,
+    ) -> Result<(), crate::proxy::node_waypoint_udp_identity::NodeWaypointUdpDatagramVerdict> {
+        let pinned_iface = self.ingress_ifindex;
+        if let Some(binding) = self.binding.as_deref() {
+            return self.scoping.revalidate_datagram_at_policy_generation(
+                binding,
+                self.policy_generation,
+                pinned_iface,
+                ingress_ifindex,
+                source,
+            );
+        }
+
+        // For an unattributable session the ingress interface is still exact
+        // kernel evidence. A forged tuple arriving on a different interface is
+        // dropped alone when the session's own pinned miss remains current; it
+        // must not become a cross-workload teardown primitive.
+        if ingress_ifindex != pinned_iface {
+            return match self.revalidate(pinned_iface, source) {
+                Ok(()) => Err(
+                    crate::proxy::node_waypoint_udp_identity::NodeWaypointUdpDatagramVerdict::DropDatagram(
+                        self.scoping.record_attribution_changed(),
+                    ),
+                ),
+                Err(refusal) => Err(
+                    crate::proxy::node_waypoint_udp_identity::NodeWaypointUdpDatagramVerdict::CloseSession(
+                        refusal,
+                    ),
+                ),
+            };
+        }
+        self.revalidate(ingress_ifindex, source).map_err(
+            crate::proxy::node_waypoint_udp_identity::NodeWaypointUdpDatagramVerdict::CloseSession,
+        )
+    }
+}
+
 impl UdpSession {
+    /// Revalidate destination ownership and retire this session fail-closed on
+    /// removal or reownership. The reply task remains the identity-aware map
+    /// remover and accounting owner; flag + wake prevents any further send.
+    fn revalidate_destination(&self) -> Result<(), anyhow::Error> {
+        let Some(destination) = self.node_waypoint_destination.as_ref() else {
+            return Ok(());
+        };
+        if let Err(refusal) = destination.revalidate() {
+            destination
+                .router
+                .warn_session_refusal(&self.proxy_id, refusal);
+            self.expired.store(true, Ordering::Release);
+            signal_udp_reply_task_stop(&self.stop_reply_task, self.stop_notify.as_ref());
+            self.close_hook_ingress();
+            return Err(anyhow::anyhow!(
+                "NodeWaypoint UDP destination ownership no longer valid ({})",
+                refusal.as_str()
+            ));
+        }
+        Ok(())
+    }
+
     /// The bounded termination class when this session's authorization
     /// lifetime has elapsed, WITHOUT settling anything.
     ///
@@ -504,12 +650,12 @@ where
 /// until some later datagram overwrites the cache.
 #[allow(dead_code)] // also reached via `_test_support`
 pub(crate) fn take_udp_last_client_if_live<T>(
-    last_client: &mut Option<(SocketAddr, Arc<T>)>,
-    client_addr: SocketAddr,
+    last_client: &mut Option<(UdpSessionKey, Arc<T>)>,
+    client_addr: &UdpSessionKey,
     is_expired: impl FnOnce(&T) -> bool,
 ) -> Option<Arc<T>> {
     match last_client {
-        Some((cached_addr, cached)) if *cached_addr == client_addr => {
+        Some((cached_addr, cached)) if cached_addr == client_addr => {
             if is_expired(cached.as_ref()) {
                 *last_client = None;
                 None
@@ -521,10 +667,122 @@ pub(crate) fn take_udp_last_client_if_live<T>(
     }
 }
 
+/// Identity of one UDP session on one listener.
+///
+/// The client tuple ALONE is not a session identity on a shared same-port
+/// NodeWaypoint listener (issue #3861): one client socket may legitimately
+/// address ClusterIP A and ClusterIP B on the same port at the same time, and
+/// those are two different Services with different upstreams, policy scopes,
+/// plugin decisions, accounting and reply sources. Keying by the client tuple
+/// alone would collide them and let one Service's session serve the other's
+/// traffic.
+///
+/// Destination IP alone is also not enough. The route table can republish in
+/// place without restarting the listener; if exact destination X changes
+/// ownership from namespaced Service A to namespaced Service B, B's datagram
+/// must not hit A's established session, pending setup, or last-client cache.
+/// The whole destination-table generation is also not the identity: adding or
+/// removing unrelated route B must not change A's owner key, and an equivalent
+/// republication of A must remain equal.
+///
+/// The key therefore carries:
+///
+/// * `client` — the source tuple (forgeable; never an authorization input),
+/// * `destination` — the canonical local destination IP selected from the
+///   kernel-reported address, `None` on listeners that do no destination
+///   routing (every ordinary UDP listener, and a single-claimant NodeWaypoint
+///   listener serving the direct-node-address boundary),
+/// * `destination_owner` — the authoritative `NamespacedResourceId` of the
+///   selected route (`Arc`-cloned from the immutable table; never a datagram
+///   field, port-only inference, pointer equality, or a digest). `None` on
+///   the same undestined listeners as `destination`. Namespace is part of
+///   the identity.
+/// * `listener_generation` — the spawn generation of the bound socket that owns
+///   this session. It is constant for a listener's lifetime, so a destination
+///   table republication does NOT invalidate established sessions of an
+///   unchanged owner; a rebind does.
+///
+/// Hash and equality compare the inner namespaced identity, not the `Arc`
+/// pointer, so hasher collisions cannot alias tenants and equivalent
+/// republications remain equal. Not `Copy`: clone the key at every insert,
+/// remove, pending-gate, and teardown site so lifecycle accounting cannot
+/// drop a stale key.
+#[derive(Clone, Debug)]
+pub struct UdpSessionKey {
+    pub client: SocketAddr,
+    pub destination: Option<IpAddr>,
+    pub destination_owner: Option<Arc<NamespacedResourceId>>,
+    pub listener_generation: u64,
+}
+
+impl PartialEq for UdpSessionKey {
+    fn eq(&self, other: &Self) -> bool {
+        self.client == other.client
+            && self.destination == other.destination
+            && self.listener_generation == other.listener_generation
+            && match (
+                self.destination_owner.as_deref(),
+                other.destination_owner.as_deref(),
+            ) {
+                (None, None) => true,
+                (Some(left), Some(right)) => left == right,
+                _ => false,
+            }
+    }
+}
+
+impl Eq for UdpSessionKey {}
+
+impl Hash for UdpSessionKey {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.client.hash(state);
+        self.destination.hash(state);
+        self.listener_generation.hash(state);
+        match self.destination_owner.as_deref() {
+            Some(owner) => {
+                true.hash(state);
+                owner.hash(state);
+            }
+            None => false.hash(state),
+        }
+    }
+}
+
+impl UdpSessionKey {
+    /// Key for a listener that performs no destination routing.
+    #[inline]
+    pub fn undestined(client: SocketAddr, listener_generation: u64) -> Self {
+        Self {
+            client,
+            destination: None,
+            destination_owner: None,
+            listener_generation,
+        }
+    }
+
+    /// Key for a datagram that selected an exact destination route.
+    ///
+    /// Clones the precomputed owner `Arc` from the immutable route; does not
+    /// rebuild a runtime-key String or clone namespace/id Strings.
+    #[inline]
+    pub fn for_route(
+        client: SocketAddr,
+        route: &crate::proxy::node_waypoint_udp_destination::NodeWaypointUdpDestinationRoute,
+        listener_generation: u64,
+    ) -> Self {
+        Self {
+            client,
+            destination: Some(route.destination),
+            destination_owner: Some(route.owner_arc()),
+            listener_generation,
+        }
+    }
+}
+
 /// UDP session map using ahash (AES-NI accelerated) for faster per-datagram lookups.
-/// SocketAddr keys are kernel-provided (not attacker-controlled), so cryptographic
+/// Key components are kernel-provided (not attacker-controlled), so cryptographic
 /// hashing is unnecessary — speed wins here.
-type SessionMap = Arc<DashMap<SocketAddr, Arc<UdpSession>, ahash::RandomState>>;
+type SessionMap = Arc<DashMap<UdpSessionKey, Arc<UdpSession>, ahash::RandomState>>;
 type BackendDtlsConfigCache = Arc<BackendDtlsConfigCacheState>;
 
 /// Listener-local cache of built backend DTLS params keyed by the owning
@@ -555,7 +813,7 @@ impl BackendDtlsConfigCacheState {
     }
 }
 
-type PendingSessionMap = Arc<DashMap<SocketAddr, PendingDatagramQueue, ahash::RandomState>>;
+type PendingSessionMap = Arc<DashMap<UdpSessionKey, PendingDatagramQueue, ahash::RandomState>>;
 
 /// Maximum number of follow-up datagrams queued per pending (setup-in-progress)
 /// session. Sized for real opening flights — a QUIC Initial + 0-RTT coalesced
@@ -734,6 +992,30 @@ fn spawn_session_hook_ingress_worker(
                 break;
             }
 
+            // Route membership republishes without restarting the shared
+            // listener. Do not run plugin side effects for a destination whose
+            // exact namespaced owner has already been removed or replaced.
+            if session.revalidate_destination().is_err() {
+                break;
+            }
+
+            // The datagram may have waited in this bounded worker queue after
+            // the listener's first check. Revalidate before invoking plugins
+            // so their own side effects cannot run under stale workload scope.
+            if let Some(source) = session.node_waypoint_source.as_ref()
+                && let Err(refusal) = source.revalidate(source.ingress_ifindex, client_addr.ip())
+            {
+                source.scoping.index.warn_refusal(
+                    session.proxy_id.as_str(),
+                    session.datagram_client_ip.as_ref(),
+                    refusal,
+                );
+                session.expired.store(true, Ordering::Release);
+                signal_udp_reply_task_stop(&session.stop_reply_task, session.stop_notify.as_ref());
+                session.close_hook_ingress();
+                break;
+            }
+
             let allowed = tokio::select! {
                 allowed = udp_datagram_allowed(
                 &session.datagram_plugins,
@@ -759,6 +1041,24 @@ fn spawn_session_hook_ingress_worker(
                 .load(std::sync::atomic::Ordering::Acquire)
                 || session.expired.load(std::sync::atomic::Ordering::Acquire)
             {
+                break;
+            }
+
+            // A datagram may spend an arbitrary interval in an async plugin.
+            // Revalidate again after that await so a registry/slice change in
+            // the meantime cannot produce a late backend side effect under the
+            // old workload identity.
+            if let Some(source) = session.node_waypoint_source.as_ref()
+                && let Err(refusal) = source.revalidate(source.ingress_ifindex, client_addr.ip())
+            {
+                source.scoping.index.warn_refusal(
+                    session.proxy_id.as_str(),
+                    session.datagram_client_ip.as_ref(),
+                    refusal,
+                );
+                session.expired.store(true, Ordering::Release);
+                signal_udp_reply_task_stop(&session.stop_reply_task, session.stop_notify.as_ref());
+                session.close_hook_ingress();
                 break;
             }
 
@@ -792,7 +1092,7 @@ fn spawn_session_hook_ingress_worker(
 /// this queue preserves that behavior without blocking the recv loop.
 #[derive(Default)]
 struct PendingDatagramQueue {
-    datagrams: Vec<Vec<u8>>,
+    datagrams: Vec<PendingDatagram>,
     queued_bytes: usize,
     /// Forwarded client the in-flight setup was started for, when the listener
     /// runs the datagram client-address gate. A follow-up datagram asserting a
@@ -801,18 +1101,31 @@ struct PendingDatagramQueue {
     forwarded_client: Option<SocketAddr>,
 }
 
+/// One datagram retained while its source tuple's session is being admitted.
+/// The ingress interface is authorization evidence, not optional routing
+/// metadata: dropping it would let a same-tuple datagram arriving on another
+/// interface inherit the opening datagram's NodeWaypoint workload identity.
+#[derive(Debug, PartialEq, Eq)]
+struct PendingDatagram {
+    data: Vec<u8>,
+    ingress_ifindex: Option<u32>,
+}
+
 impl PendingDatagramQueue {
     /// Append a follow-up datagram, tail-dropping once either cap is hit.
     /// Returns `false` when the datagram was dropped. Zero-length datagrams
     /// are valid UDP and are queued like any other.
-    fn push_bounded(&mut self, data: &[u8]) -> bool {
+    fn push_bounded(&mut self, data: &[u8], ingress_ifindex: Option<u32>) -> bool {
         if self.datagrams.len() >= PENDING_SESSION_MAX_QUEUED_DATAGRAMS
             || self.queued_bytes.saturating_add(data.len()) > PENDING_SESSION_MAX_QUEUED_BYTES
         {
             return false;
         }
         self.queued_bytes += data.len();
-        self.datagrams.push(data.to_vec());
+        self.datagrams.push(PendingDatagram {
+            data: data.to_vec(),
+            ingress_ifindex,
+        });
         true
     }
 }
@@ -823,7 +1136,7 @@ impl PendingDatagramQueue {
 /// removes the gate atomically via [`take_pending_datagrams`] and disarms.
 struct PendingSessionGate {
     pending_sessions: PendingSessionMap,
-    client_addr: SocketAddr,
+    session_key: UdpSessionKey,
     armed: bool,
 }
 
@@ -836,7 +1149,7 @@ impl PendingSessionGate {
 impl Drop for PendingSessionGate {
     fn drop(&mut self) {
         if self.armed {
-            self.pending_sessions.remove(&self.client_addr);
+            self.pending_sessions.remove(&self.session_key);
         }
     }
 }
@@ -971,6 +1284,7 @@ async fn connect_udp_backend_candidates(
     port: u16,
     connect_timeout: Duration,
     dtls_params: Option<crate::dtls::BackendDtlsParams>,
+    socket_mark: Option<u32>,
 ) -> Result<(ConnectedUdpBackend, SocketAddr), anyhow::Error> {
     crate::dns::connect_candidates(candidates, port, connect_timeout, |addr| {
         let dtls_params = dtls_params.clone();
@@ -981,6 +1295,22 @@ async fn connect_udp_backend_candidates(
                 "0.0.0.0:0"
             };
             let socket = UdpSocket::bind(bind_addr).await?;
+            // NodeWaypoint UDP relay (issue #3286): the backend is an enrolled
+            // pod, and the pod-veth tc guard drops UDP to an enrolled pod IP
+            // unless the datagram carries the NodeWaypoint inbound auth mark —
+            // the same proof the TCP inbound relay dial uses. Fail the
+            // candidate rather than dialing unmarked into a guaranteed drop.
+            if let Some(mark) = socket_mark.filter(|mark| *mark != 0) {
+                #[cfg(unix)]
+                {
+                    use std::os::fd::AsRawFd;
+                    crate::socket_opts::set_socket_mark(socket.as_raw_fd(), mark)?;
+                }
+                // Socket marks are a Linux concept; NodeWaypoint scoping never
+                // runs on a non-unix target, so there is nothing to apply.
+                #[cfg(not(unix))]
+                let _ = mark;
+            }
             socket.connect(addr).await?;
             match dtls_params {
                 Some(params) => crate::dtls::DtlsConnection::connect(socket, params)
@@ -1022,7 +1352,7 @@ async fn connect_udp_backend_candidates(
 /// checks and mesh destination enforcement admit the flow.
 fn try_insert_pending_session_gate(
     pending_sessions: &PendingSessionMap,
-    client_addr: SocketAddr,
+    session_key: &UdpSessionKey,
     max_sessions: usize,
     forwarded_client: Option<SocketAddr>,
 ) -> Result<bool, anyhow::Error> {
@@ -1032,7 +1362,7 @@ fn try_insert_pending_session_gate(
             max_sessions
         ));
     }
-    match pending_sessions.entry(client_addr) {
+    match pending_sessions.entry(session_key.clone()) {
         dashmap::mapref::entry::Entry::Occupied(_) => Ok(false),
         dashmap::mapref::entry::Entry::Vacant(vacant) => {
             vacant.insert(PendingDatagramQueue {
@@ -1092,9 +1422,9 @@ fn refuse_new_udp_source(overload: &crate::overload::OverloadState) -> bool {
 /// backend sends.
 fn take_pending_datagrams(
     pending_sessions: &PendingSessionMap,
-    client_addr: SocketAddr,
-) -> Option<Vec<Vec<u8>>> {
-    match pending_sessions.entry(client_addr) {
+    session_key: &UdpSessionKey,
+) -> Option<Vec<PendingDatagram>> {
+    match pending_sessions.entry(session_key.clone()) {
         dashmap::mapref::entry::Entry::Occupied(mut occupied) => {
             if occupied.get().datagrams.is_empty() {
                 occupied.remove();
@@ -1928,8 +2258,9 @@ pub struct UdpListenerConfig {
     pub frontend_dtls_config: Option<crate::dtls::FrontendDtlsConfig>,
     /// Optional sender that receives the `Arc<DtlsServer>` once the DTLS
     /// listener has bound and constructed its server instance. Used by
-    /// [`crate::proxy::stream_listener::StreamListenerManager`] so ordinary
-    /// frontend DTLS generation publish can call
+    /// [`crate::proxy::stream_listener::StreamListenerManager`] so the matching
+    /// owner's generation (ordinary `FERRUM_DTLS_*` or owner-scoped
+    /// NodeWaypoint) can call
     /// [`crate::dtls::DtlsServer::swap_frontend_config`] on the same instance
     /// the recv loop is using. `None` for plain UDP listeners (no DTLS server
     /// is built).
@@ -1987,6 +2318,31 @@ pub struct UdpListenerConfig {
     /// destinations are silently dropped (UDP has no RST analogue).
     pub mesh_outbound_enforcement:
         crate::modes::mesh::outbound_enforcement::SharedMeshOutboundEnforcement,
+    /// NodeWaypoint UDP/DTLS per-datagram source-workload attribution (issue
+    /// #3286). `None` outside NodeWaypoint topology and for non-mesh UDP
+    /// proxies, which keeps their behaviour byte-for-byte unchanged. When
+    /// `Some`, every session resolves its source pod from the kernel-provided
+    /// ingress interface plus the node-agent-published source address and
+    /// stamps that pod's `PolicyScopeCache`, so `mesh_authz` enforces
+    /// namespace/selector-scoped policy per source workload. An unattributable
+    /// datagram leaves the scope absent and `mesh_authz` denies the session —
+    /// never a mesh-wide fallback while scoped enforcement applies.
+    pub node_waypoint_udp_source_scoping:
+        Option<crate::proxy::node_waypoint_udp_identity::NodeWaypointUdpSourceScoping>,
+    /// Exact NodeWaypoint UDP destination routing for a shared same-port
+    /// listener (issue #3861). `None` for every ordinary UDP listener and for a
+    /// single-claimant NodeWaypoint listener, which keeps the documented
+    /// direct-node-address boundary.
+    ///
+    /// When `Some`, EVERY received datagram selects exactly one Service route
+    /// from the kernel-reported local destination address before pending- or
+    /// established-session lookup, plugin hooks, `on_stream_connect`,
+    /// `on_udp_datagram`, backend selection or accounting. A datagram whose
+    /// local destination is missing or is not an exact route is dropped before
+    /// any session slot, pending gate or backend socket exists — there is no
+    /// fallback to another route.
+    pub node_waypoint_udp_destinations:
+        Option<Arc<crate::proxy::node_waypoint_udp_destination::NodeWaypointUdpDestinationRouter>>,
     /// Datagram client-address metadata gate (issues #3289, #3856, #3862).
     /// `Some` only when the proxy sets `stream_proxy_protocol: true`; then EVERY
     /// datagram must carry a trusted, well-formed (and, when a secret is
@@ -1995,6 +2351,85 @@ pub struct UdpListenerConfig {
     /// so it is per-listener and rebuilt on reload. `None` keeps ordinary
     /// UDP/DTLS behavior with the socket peer as the only identity.
     pub datagram_client_address: Option<Arc<DatagramClientAddressGate>>,
+}
+
+/// Monotonic per-process spawn generation for bound UDP listeners.
+static UDP_LISTENER_GENERATION: AtomicU64 = AtomicU64::new(0);
+
+/// Next spawn generation for a bound UDP listener socket.
+#[inline]
+fn next_udp_listener_generation() -> u64 {
+    UDP_LISTENER_GENERATION
+        .fetch_add(1, Ordering::Relaxed)
+        .saturating_add(1)
+}
+
+/// Overload / stale-configuration admission helper: whether this datagram
+/// belongs to an ALREADY-ESTABLISHED session.
+///
+/// On a destination-routed listener the client tuple alone is not a session
+/// identity, so the route is resolved here too. A datagram that cannot be
+/// attributed to an exact route has no established session by definition and is
+/// refused — the fail-closed direction, and consistent with
+/// [`process_datagram`], which drops it outright.
+#[inline]
+fn udp_source_has_established_session(
+    sessions: &SessionMap,
+    destinations: Option<
+        &Arc<crate::proxy::node_waypoint_udp_destination::NodeWaypointUdpDestinationRouter>,
+    >,
+    client_addr: SocketAddr,
+    local_addr: Option<crate::socket_opts::PktinfoLocal>,
+    listener_generation: u64,
+) -> bool {
+    let Some(router) = destinations else {
+        return sessions.contains_key(&UdpSessionKey::undestined(client_addr, listener_generation));
+    };
+    match router.resolve(local_addr.map(|local| local.ip)) {
+        Ok((route, _)) => sessions.contains_key(&UdpSessionKey::for_route(
+            client_addr,
+            route.as_ref(),
+            listener_generation,
+        )),
+        Err(_) => false,
+    }
+}
+
+/// Select the exact destination route for one received datagram and build its
+/// session key.
+///
+/// Returns `None` when a destination-routed listener cannot attribute the
+/// datagram: the caller must drop it before allocating anything. On a listener
+/// with no router every datagram keeps the historical client-tuple identity.
+#[inline]
+fn resolve_udp_session_route(
+    destinations: Option<
+        &Arc<crate::proxy::node_waypoint_udp_destination::NodeWaypointUdpDestinationRouter>,
+    >,
+    proxy_id: &str,
+    client_addr: SocketAddr,
+    local_addr: Option<crate::socket_opts::PktinfoLocal>,
+    listener_generation: u64,
+) -> Option<(
+    UdpSessionKey,
+    Option<Arc<crate::proxy::node_waypoint_udp_destination::NodeWaypointUdpDestinationRoute>>,
+)> {
+    let Some(router) = destinations else {
+        return Some((
+            UdpSessionKey::undestined(client_addr, listener_generation),
+            None,
+        ));
+    };
+    match router.resolve(local_addr.map(|local| local.ip)) {
+        Ok((route, _generation)) => Some((
+            UdpSessionKey::for_route(client_addr, route.as_ref(), listener_generation),
+            Some(route),
+        )),
+        Err((refusal, _generation)) => {
+            router.warn_refusal(proxy_id, refusal);
+            None
+        }
+    }
 }
 
 /// Start a UDP proxy listener on the given port.
@@ -2038,8 +2473,22 @@ pub async fn start_udp_listener(cfg: UdpListenerConfig) -> Result<(), anyhow::Er
         udp_gso_enabled,
         udp_pktinfo_enabled,
         mesh_outbound_enforcement,
+        node_waypoint_udp_source_scoping,
+        node_waypoint_udp_destinations,
         datagram_client_address,
     } = cfg;
+    // NodeWaypoint source attribution is anchored on the kernel-reported
+    // ingress interface, which only IP(v6)_PKTINFO surfaces. Force the option
+    // on for a scoped listener rather than letting
+    // `FERRUM_UDP_PKTINFO_ENABLED=false` silently turn every attributable
+    // session into a fail-closed denial.
+    // Exact same-port destination routing (issue #3861) reads the SAME cmsg:
+    // without it every datagram on a shared listener is unattributable and
+    // refused, so a routed listener forces the option on for the same reason a
+    // scoped one does.
+    let udp_pktinfo_enabled = udp_pktinfo_enabled
+        || node_waypoint_udp_source_scoping.is_some()
+        || node_waypoint_udp_destinations.is_some();
     // An enabled gate with an empty trust set can never admit a datagram. Say
     // so once here rather than dropping every datagram with only a rate-limited
     // per-datagram record to explain it.
@@ -2091,17 +2540,122 @@ pub async fn start_udp_listener(cfg: UdpListenerConfig) -> Result<(), anyhow::Er
             started,
             overload,
             Arc::new(BackendDtlsConfigCacheState::new(backend_tls_reload_epoch)),
+            node_waypoint_udp_source_scoping,
             datagram_client_address,
         )
         .await;
     }
+    // Destination routing is a plain-UDP shared-listener contract. A terminating
+    // DTLS port is refused at materialization when more than one Service claims
+    // it (a `DtlsServer` owns its socket and carries exactly one frontend
+    // config), so a DTLS listener never carries a router and the branch above
+    // returns without consulting it.
     // Plain-UDP listeners have no DTLS server to publish; if a sender was
     // supplied we drop it here, which makes any waiting receiver see
     // `oneshot` closure semantics rather than blocking forever.
     let _ = dtls_server_tx;
+    // NodeWaypoint per-datagram source attribution for this listener (issue
+    // #3286); `None` everywhere else.
+    let node_waypoint_udp_source = node_waypoint_udp_source_scoping;
 
     let addr = SocketAddr::new(bind_addr, port);
     let frontend_socket = Arc::new(UdpSocket::bind(addr).await?);
+
+    // NodeWaypoint UDP relay (issue #3286): replies leave THIS socket toward
+    // the enrolled source pod, and the pod-veth tc guard drops UDP to an
+    // enrolled pod IP unless it carries the NodeWaypoint inbound auth mark.
+    // Marking the frontend socket is therefore a startup precondition for a
+    // scoped listener, not an optimization — without it every admitted session
+    // would relay to the backend and have its reply silently dropped. Ordinary
+    // (non-scoped) UDP listeners are untouched.
+    if node_waypoint_udp_source.is_some() {
+        #[cfg(unix)]
+        {
+            use std::os::fd::AsRawFd;
+            crate::socket_opts::set_socket_mark(
+                frontend_socket.as_raw_fd(),
+                crate::ebpf::NODE_WAYPOINT_INBOUND_AUTH_MARK,
+            )
+            .map_err(|error| {
+                std::io::Error::other(format!(
+                    "NodeWaypoint scoped UDP listener on port {port} could not set the inbound \
+                     auth socket mark, so every reply to an enrolled source pod would be dropped \
+                     by the pod-veth guard: {error}"
+                ))
+            })?;
+        }
+
+        // Transparent socket (issue #3286 Service path). A steered datagram is
+        // delivered with its ORIGINAL destination — the Service ClusterIP — in
+        // the IP header, and the session sources its replies from exactly that
+        // address (pinned per session from the `IP_PKTINFO` / `IPV6_PKTINFO`
+        // cmsg). A ClusterIP is not configured on this host, so the kernel
+        // refuses that source unless the socket carries `FLOWI_FLAG_ANYSRC`.
+        // Without it every steered session would be one-way: the workload's
+        // datagram reaches the backend and the reply is dropped at the sender,
+        // or arrives from the wrong address and is discarded by the workload's
+        // connected socket. Fail the listener rather than serve that — including
+        // off Linux, where `set_scoped_reply_transparent` reports Unsupported.
+        {
+            #[cfg(unix)]
+            let fd = {
+                use std::os::fd::AsRawFd;
+                frontend_socket.as_raw_fd()
+            };
+            #[cfg(not(unix))]
+            let fd = 0;
+            let local = frontend_socket.local_addr().unwrap_or(addr);
+            let ipv6 = local.is_ipv6();
+            if let Err(error) = crate::socket_opts::set_scoped_reply_transparent(fd, ipv6) {
+                return Err(anyhow::anyhow!(
+                    "NodeWaypoint scoped UDP listener on port {port} could not become a \
+                     transparent socket, so it could not source replies from the Service address \
+                     a steered workload addressed. NET_ADMIN (or NET_RAW on newer kernels) is \
+                     required: {error}"
+                ));
+            }
+        }
+    }
+
+    // A NodeWaypoint scoped listener has no datapath at all without the
+    // kernel's ingress-interface cmsg: every session would resolve to "no
+    // attribution" and `mesh_authz` would deny it. Enabling the option for the
+    // family this socket actually serves is therefore a startup precondition,
+    // not an optimization — reporting the listener as started while it can only
+    // fail closed is a black hole that looks healthy. Ordinary (non-scoped) UDP
+    // listeners are untouched and keep the best-effort behaviour below.
+    if node_waypoint_udp_source.is_some() || node_waypoint_udp_destinations.is_some() {
+        let local = frontend_socket.local_addr().unwrap_or(addr);
+        #[cfg(target_os = "linux")]
+        let fd = {
+            use std::os::unix::io::AsRawFd;
+            frontend_socket.as_raw_fd()
+        };
+        #[cfg(not(target_os = "linux"))]
+        let fd = 0;
+        match crate::socket_opts::enable_ingress_pktinfo(fd, local) {
+            Ok(families) => info!(
+                proxy_id = %proxy_id,
+                port = port,
+                families = ?families,
+                "NodeWaypoint scoped UDP listener armed ingress-interface capture for every family \
+                 it serves"
+            ),
+            Err(error) => {
+                error!(
+                    proxy_id = %proxy_id,
+                    port = port,
+                    "NodeWaypoint scoped UDP listener cannot enable ingress-interface capture; \
+                     refusing to start a listener that could only deny every scoped session: {}",
+                    error
+                );
+                return Err(anyhow::Error::new(error).context(format!(
+                    "NodeWaypoint scoped UDP listener {proxy_id} on {local} cannot capture the \
+                     datagram ingress interface required for source-workload authorization"
+                )));
+            }
+        }
+    }
 
     // Apply Linux socket optimizations on the frontend UDP socket.
     #[cfg(target_os = "linux")]
@@ -2224,9 +2778,17 @@ pub async fn start_udp_listener(cfg: UdpListenerConfig) -> Result<(), anyhow::Er
     #[cfg(not(target_os = "linux"))]
     let _ = recvmmsg_batch_size; // suppress unused variable warning
 
-    // Hot-path cache: skip DashMap lookup when consecutive datagrams come from the
-    // same client address (very common in streaming UDP protocols).
-    let mut last_client: Option<(SocketAddr, Arc<UdpSession>)> = None;
+    // Hot-path cache: skip DashMap lookup when consecutive datagrams share the
+    // same client, destination, namespaced owner, and listener generation
+    // (very common in streaming UDP protocols).
+    let mut last_client: Option<(UdpSessionKey, Arc<UdpSession>)> = None;
+    // Spawn generation of THIS bound socket. Folded into every session key so a
+    // session can never outlive the listener that created it. Adding or removing
+    // an unrelated same-port Service republishes the route table without
+    // rebinding, so those sessions keep an equivalent owner key; a destination
+    // that changes namespaced owner is a different session identity.
+    let listener_generation = next_udp_listener_generation();
+    let destinations = node_waypoint_udp_destinations.as_ref();
 
     // When pktinfo is active on Linux, drive the recv loop via `readable()` +
     // `recvmmsg` so the first datagram in each wakeup also surfaces its
@@ -2281,11 +2843,18 @@ pub async fn start_udp_listener(cfg: UdpListenerConfig) -> Result<(), anyhow::Er
                                     // policy. `refuse_new_udp_sources` is
                                     // hoisted out of the batch: two relaxed
                                     // loads per batch, none per datagram.
-                                    if refuse_new_udp_sources && !sessions.contains_key(&addr2) {
+                                    let local2 = recv_batch.local_addr(i);
+                                    if refuse_new_udp_sources
+                                        && !udp_source_has_established_session(
+                                            &sessions,
+                                            destinations,
+                                            addr2,
+                                            local2,
+                                            listener_generation,
+                                        )
+                                    {
                                         continue;
                                     }
-
-                                    let local2 = recv_batch.local_addr(i);
 
                                     // GRO splitting: if the kernel coalesced multiple same-size
                                     // datagrams into one buffer, split by segment size.
@@ -2329,6 +2898,9 @@ pub async fn start_udp_listener(cfg: UdpListenerConfig) -> Result<(), anyhow::Er
                                                     global_shutdown_rx.as_ref(),
                                                     &overload,
                                                     &mesh_outbound_enforcement,
+                                                    node_waypoint_udp_source.as_ref(),
+                                                    destinations,
+                                                    listener_generation,
                                                     datagram_client_address.as_ref(),
                                                 )
                                                 .await;
@@ -2375,6 +2947,9 @@ pub async fn start_udp_listener(cfg: UdpListenerConfig) -> Result<(), anyhow::Er
                                         global_shutdown_rx.as_ref(),
                                         &overload,
                                         &mesh_outbound_enforcement,
+                                        node_waypoint_udp_source.as_ref(),
+                                        destinations,
+                                        listener_generation,
                                         datagram_client_address.as_ref(),
                                     )
                                     .await;
@@ -2415,7 +2990,15 @@ pub async fn start_udp_listener(cfg: UdpListenerConfig) -> Result<(), anyhow::Er
                 // bound (issue #3726). Existing sessions continue to be served
                 // (UDP is sessionless at the wire level, so we only block
                 // session creation, not in-flight traffic).
-                if refuse_new_udp_source(&overload) && !sessions.contains_key(&client_addr) {
+                if refuse_new_udp_source(&overload)
+                    && !udp_source_has_established_session(
+                        &sessions,
+                        destinations,
+                        client_addr,
+                        None,
+                        listener_generation,
+                    )
+                {
                     continue;
                 }
 
@@ -2462,6 +3045,9 @@ pub async fn start_udp_listener(cfg: UdpListenerConfig) -> Result<(), anyhow::Er
                     global_shutdown_rx.as_ref(),
                     &overload,
                     &mesh_outbound_enforcement,
+                    node_waypoint_udp_source.as_ref(),
+                    destinations,
+                    listener_generation,
                     datagram_client_address.as_ref(),
                 )
                 .await;
@@ -2514,7 +3100,15 @@ pub async fn start_udp_listener(cfg: UdpListenerConfig) -> Result<(), anyhow::Er
                                     // policy. `refuse_new_udp_sources` is
                                     // hoisted out of the batch: two relaxed
                                     // loads per batch, none per datagram.
-                                    if refuse_new_udp_sources && !sessions.contains_key(&addr2) {
+                                    if refuse_new_udp_sources
+                                        && !udp_source_has_established_session(
+                                            &sessions,
+                                            destinations,
+                                            addr2,
+                                            local2,
+                                            listener_generation,
+                                        )
+                                    {
                                         continue;
                                     }
 
@@ -2560,6 +3154,9 @@ pub async fn start_udp_listener(cfg: UdpListenerConfig) -> Result<(), anyhow::Er
                                                     global_shutdown_rx.as_ref(),
                                                     &overload,
                                                     &mesh_outbound_enforcement,
+                                                    node_waypoint_udp_source.as_ref(),
+                                                    destinations,
+                                                    listener_generation,
                                                     datagram_client_address.as_ref(),
                                                 )
                                                 .await;
@@ -2606,6 +3203,9 @@ pub async fn start_udp_listener(cfg: UdpListenerConfig) -> Result<(), anyhow::Er
                                         global_shutdown_rx.as_ref(),
                                         &overload,
                                         &mesh_outbound_enforcement,
+                                        node_waypoint_udp_source.as_ref(),
+                                        destinations,
+                                        listener_generation,
                                         datagram_client_address.as_ref(),
                                     )
                                     .await;
@@ -2635,7 +3235,15 @@ pub async fn start_udp_listener(cfg: UdpListenerConfig) -> Result<(), anyhow::Er
                                 // critical overload, or while the applied CP
                                 // configuration is stale beyond its bound
                                 // (issue #3726). Existing sessions drain.
-                                if refuse_new_udp_sources && !sessions.contains_key(&addr2) {
+                                if refuse_new_udp_sources
+                                    && !udp_source_has_established_session(
+                                        &sessions,
+                                        destinations,
+                                        addr2,
+                                        None,
+                                        listener_generation,
+                                    )
+                                {
                                     continue;
                                 }
 
@@ -2672,6 +3280,9 @@ pub async fn start_udp_listener(cfg: UdpListenerConfig) -> Result<(), anyhow::Er
                                     global_shutdown_rx.as_ref(),
                                     &overload,
                                     &mesh_outbound_enforcement,
+                                    node_waypoint_udp_source.as_ref(),
+                                    destinations,
+                                    listener_generation,
                                     datagram_client_address.as_ref(),
                                 )
                                 .await;
@@ -2713,7 +3324,8 @@ pub async fn start_udp_listener(cfg: UdpListenerConfig) -> Result<(), anyhow::Er
 /// Process a single datagram: resolve session, forward to backend, update batch counters.
 ///
 /// Uses `last_client` as a hot-path cache to avoid DashMap lookups when consecutive
-/// datagrams arrive from the same client address.
+/// datagrams share the same client, destination, namespaced owner, and listener
+/// generation.
 #[allow(clippy::too_many_arguments)]
 async fn process_datagram(
     data: &[u8],
@@ -2731,7 +3343,7 @@ async fn process_datagram(
     tls_ca_bundle_path: Option<&str>,
     backend_dtls_config_cache: &BackendDtlsConfigCache,
     max_sessions: usize,
-    last_client: &mut Option<(SocketAddr, Arc<UdpSession>)>,
+    last_client: &mut Option<(UdpSessionKey, Arc<UdpSession>)>,
     batch_dgrams_out: &mut u64,
     batch_bytes_out: &mut u64,
     listen_port: u16,
@@ -2746,6 +3358,13 @@ async fn process_datagram(
     overload: &Arc<crate::overload::OverloadState>,
     mesh_outbound_enforcement:
         &crate::modes::mesh::outbound_enforcement::SharedMeshOutboundEnforcement,
+    node_waypoint_udp_source: Option<
+        &crate::proxy::node_waypoint_udp_identity::NodeWaypointUdpSourceScoping,
+    >,
+    destinations: Option<
+        &Arc<crate::proxy::node_waypoint_udp_destination::NodeWaypointUdpDestinationRouter>,
+    >,
+    listener_generation: u64,
     datagram_client_address: Option<&Arc<DatagramClientAddressGate>>,
 ) -> Result<(), anyhow::Error> {
     // Client-address metadata boundary (issue #3289). When the listener runs
@@ -2777,7 +3396,33 @@ async fn process_datagram(
         },
     };
 
-    if let Some(mut pending) = pending_sessions.get_mut(&client_addr) {
+    // Exact destination route selection happens next — before pending-session
+    // lookup, established-session lookup, `on_stream_connect`,
+    // `on_udp_datagram`, backend selection, accounting, or any other
+    // route-sensitive work (issue #3861). A datagram whose kernel-reported
+    // local destination is missing or is not an exact route on this listener is
+    // dropped here: nothing is allocated for it and it never falls back to
+    // another Service's route.
+    let Some((session_key, route)) = resolve_udp_session_route(
+        destinations,
+        proxy_id,
+        client_addr,
+        local_addr,
+        listener_generation,
+    ) else {
+        return Ok(());
+    };
+    // The selected route exclusively owns this datagram's proxy identity, and
+    // with it the upstream, policy scope, plugin decisions, rate-limit /
+    // accounting / access-log context, and transparent reply source. The
+    // listener's own representative identity is only a fallback for listeners
+    // that do no destination routing.
+    let (proxy_namespace, proxy_id) = match route.as_ref() {
+        Some(route) => (route.proxy.namespace.as_str(), route.proxy.id.as_str()),
+        None => (proxy_namespace, proxy_id),
+    };
+
+    if let Some(mut pending) = pending_sessions.get_mut(&session_key) {
         // A follow-up datagram must belong to the same client the in-flight
         // setup was started for. Queueing a different forwarded client here
         // would hand its payload to a session admitted under another identity.
@@ -2798,7 +3443,7 @@ async fn process_datagram(
         // instead of being dropped; the setup task drains the queue in
         // arrival order before releasing the gate. Beyond the caps we
         // tail-drop, preserving the pending gate's flood-resistance bound.
-        let _ = pending.push_bounded(data);
+        let _ = pending.push_bounded(data, local_addr.map(|local| local.ifindex));
         return Ok(());
     }
 
@@ -2809,14 +3454,14 @@ async fn process_datagram(
     // we'd pin the backend socket/session on a quiet listener and keep
     // forwarding through a session the cleanup task already declared dead.
     let existing_session =
-        take_udp_last_client_if_live(last_client, client_addr, |cached_session| {
+        take_udp_last_client_if_live(last_client, &session_key, |cached_session| {
             cached_session
                 .expired
                 .load(std::sync::atomic::Ordering::Acquire)
         })
         .or_else(|| {
             sessions
-                .get(&client_addr)
+                .get(&session_key)
                 .map(|entry| entry.value().clone())
         });
 
@@ -2837,7 +3482,7 @@ async fn process_datagram(
         }
         if !try_insert_pending_session_gate(
             pending_sessions,
-            client_addr,
+            &session_key,
             max_sessions,
             identity.forwarded,
         )? {
@@ -2845,9 +3490,9 @@ async fn process_datagram(
             // function (not expected — the recv loop is a single task). Treat
             // this datagram as a follow-up for the in-flight setup, subject to
             // the same forwarded-client agreement as the ordinary queue path.
-            if let Some(mut pending) = pending_sessions.get_mut(&client_addr) {
+            if let Some(mut pending) = pending_sessions.get_mut(&session_key) {
                 if pending.forwarded_client == identity.forwarded {
-                    let _ = pending.push_bounded(data);
+                    let _ = pending.push_bounded(data, local_addr.map(|local| local.ifindex));
                 } else {
                     drop(pending);
                     record_client_address_metadata_drop(
@@ -2887,10 +3532,60 @@ async fn process_datagram(
             global_shutdown.cloned(),
             Arc::clone(overload),
             Arc::clone(mesh_outbound_enforcement),
+            node_waypoint_udp_source.cloned(),
+            destinations.cloned(),
             max_sessions,
+            session_key,
         );
         return Ok(());
     };
+
+    // Re-authorize an established NodeWaypoint session on EVERY datagram
+    // (issue #3286). The pinned binding must still be the current generation's
+    // attribution for this ingress interface and source address; nothing that
+    // fails here is ever forwarded. A recycled veth, a pod restarted under a new
+    // UID at the same address, or a registry removal invalidate the SESSION's
+    // own evidence and terminate it rather than letting it keep relaying under
+    // evidence that is no longer vouched for; a datagram that merely names this
+    // session's (forgeable) source tuple from a different ingress interface is
+    // refused on its own and leaves the session running.
+    if let Some(source) = session.node_waypoint_source.as_ref()
+        && let Err(verdict) =
+            source.revalidate_datagram(local_addr.map(|local| local.ifindex), client_addr.ip())
+    {
+        let refusal = verdict.refusal();
+        source
+            .scoping
+            .index
+            .warn_refusal(proxy_id, &udp_session_client_ip(client_addr), refusal);
+        if !verdict.closes_session() {
+            // This datagram entered on some other interface while the session's
+            // own evidence still resolves, so it is somebody else's traffic
+            // wearing a forged source tuple. Drop it — it is never forwarded —
+            // and leave the session alone: letting a neighbouring pod or an
+            // off-node sender tear down an established session by naming its
+            // 4-tuple would be a cross-workload denial of service, and refusing
+            // the datagram already gives the full security property. The
+            // refusal is counted and the warn is rate-limited, so a flood
+            // cannot become a log flood either.
+            return Ok(());
+        }
+        session
+            .expired
+            .store(true, std::sync::atomic::Ordering::Release);
+        // Wake the owning reply task and let that task perform the
+        // identity-aware map removal, active-session decrement, overload-guard
+        // release, and disconnect emission. Removing here would make its later
+        // `remove_if` miss and leak all three lifecycle accounts.
+        signal_udp_reply_task_stop(&session.stop_reply_task, session.stop_notify.as_ref());
+        session.close_hook_ingress();
+        *last_client = None;
+        return Err(anyhow::anyhow!(
+            "NodeWaypoint UDP source attribution no longer valid for this session ({}); \
+             dropping datagram and closing the session",
+            refusal.as_str()
+        ));
+    }
 
     // The established session was admitted under one authenticated client. A
     // datagram from the same socket peer asserting a different one is refused:
@@ -2915,7 +3610,7 @@ async fn process_datagram(
         if let Some(la) = local_addr {
             let _ = session.local_addr.set(la);
         }
-        *last_client = Some((client_addr, session.clone()));
+        *last_client = Some((session_key, session.clone()));
         let _ = enqueue_session_hook_datagram(&session, data, metrics);
         return Ok(());
     }
@@ -2928,7 +3623,7 @@ async fn process_datagram(
     }
 
     // Update cache for next datagram.
-    *last_client = Some((client_addr, session.clone()));
+    *last_client = Some((session_key, session.clone()));
 
     forward_client_datagram_to_backend(&session, data).await?;
     *batch_dgrams_out += 1;
@@ -2966,7 +3661,14 @@ fn spawn_new_session_datagram(
     overload: Arc<crate::overload::OverloadState>,
     mesh_outbound_enforcement:
         crate::modes::mesh::outbound_enforcement::SharedMeshOutboundEnforcement,
+    node_waypoint_udp_source: Option<
+        crate::proxy::node_waypoint_udp_identity::NodeWaypointUdpSourceScoping,
+    >,
+    node_waypoint_udp_destinations: Option<
+        Arc<crate::proxy::node_waypoint_udp_destination::NodeWaypointUdpDestinationRouter>,
+    >,
     max_sessions: usize,
+    session_key: UdpSessionKey,
 ) {
     let client_addr = identity.socket_peer;
     tokio::spawn(async move {
@@ -2976,7 +3678,7 @@ fn spawn_new_session_datagram(
         // inside `take_pending_datagrams` and disarms the gate.
         let gate = PendingSessionGate {
             pending_sessions: Arc::clone(&pending_sessions),
-            client_addr,
+            session_key: session_key.clone(),
             armed: true,
         };
         let result = process_new_session_datagram(
@@ -3005,7 +3707,10 @@ fn spawn_new_session_datagram(
             global_shutdown.as_ref(),
             &overload,
             &mesh_outbound_enforcement,
+            node_waypoint_udp_source.as_ref(),
+            node_waypoint_udp_destinations,
             max_sessions,
+            session_key,
             gate,
         )
         .await;
@@ -3072,13 +3777,37 @@ async fn process_new_session_datagram(
     overload: &Arc<crate::overload::OverloadState>,
     mesh_outbound_enforcement:
         &crate::modes::mesh::outbound_enforcement::SharedMeshOutboundEnforcement,
+    node_waypoint_udp_source: Option<
+        &crate::proxy::node_waypoint_udp_identity::NodeWaypointUdpSourceScoping,
+    >,
+    node_waypoint_udp_destinations: Option<
+        Arc<crate::proxy::node_waypoint_udp_destination::NodeWaypointUdpDestinationRouter>,
+    >,
     max_sessions: usize,
+    session_key: UdpSessionKey,
     mut gate: PendingSessionGate,
 ) -> Result<(), anyhow::Error> {
     let client_addr = identity.socket_peer;
-    if sessions.contains_key(&client_addr) {
+    if sessions.contains_key(&session_key) {
         return Ok(());
     }
+    let node_waypoint_destination = match (
+        node_waypoint_udp_destinations,
+        session_key.destination,
+        session_key.destination_owner.as_ref(),
+    ) {
+        (None, None, None) => None,
+        (Some(router), Some(destination), Some(owner)) => Some(NodeWaypointUdpSessionDestination {
+            router,
+            destination,
+            owner: Arc::clone(owner),
+        }),
+        _ => {
+            return Err(anyhow::anyhow!(
+                "invalid NodeWaypoint UDP destination ownership state"
+            ));
+        }
+    };
 
     // Anchor the finite authenticated-stream fallback maximum ONCE, here: the
     // instant this source's first datagram entered session admission, before
@@ -3106,13 +3835,17 @@ async fn process_new_session_datagram(
     if let Some(enforcement) = mesh_enforcement_snapshot.as_ref() {
         use crate::modes::mesh::outbound_enforcement::{Decision, PROTOCOL_UDP, PROTOCOL_UDP_DTLS};
         // Hash on the resolved client so backend stickiness follows the real
-        // client rather than the load balancer's socket address.
-        let lb_hash_key = udp_lb_hash_key_for_client_ip(identity.resolved().ip());
+        // client rather than the load balancer's socket address, and include the
+        // ClusterIP so one source socket addressing two same-port Services cannot
+        // share a Round-Robin slot or consistent-hash bucket.
+        let lb_hash_key =
+            udp_session_lb_hash_key(identity.resolved().ip(), session_key.destination);
         let (backend_host, backend_port) = resolve_backend_target(
             &view.proxy,
             &epoch.load_balancer,
             health_checker,
             &lb_hash_key,
+            session_key.destination,
         )?;
         preselected_backend_target = Some((backend_host.clone(), backend_port));
         let protocol_label = if matches!(view.proxy.effective_scheme(), BackendScheme::Dtls) {
@@ -3150,7 +3883,29 @@ async fn process_new_session_datagram(
     // unauthenticated clients must not be able to consume that bounded work
     // budget or remain in the pending-session map while stream policy will
     // ultimately reject them.
-    let stream_ctx = admit_plain_udp_stream(&epoch, &view, identity, listen_port).await?;
+    let (stream_ctx, node_waypoint_session_source) = admit_plain_udp_stream(
+        &epoch,
+        &view,
+        identity,
+        listen_port,
+        node_waypoint_udp_source,
+        local_addr.map(|local| local.ifindex),
+    )
+    .await?;
+
+    // Stream admission may await external plugins. Do not run datagram hooks
+    // for a Service route that was removed or reowned during that interval.
+    if let Some(destination) = node_waypoint_destination.as_ref()
+        && let Err(refusal) = destination.revalidate()
+    {
+        destination
+            .router
+            .warn_refusal(view.proxy.id.as_str(), refusal);
+        return Err(anyhow::anyhow!(
+            "NodeWaypoint UDP destination ownership changed during stream admission ({})",
+            refusal.as_str()
+        ));
+    }
 
     // Effective authorization lifetime for the admitted plain-UDP session
     // (issue #3816). `on_stream_connect` runs once, at admission, and is never
@@ -3216,6 +3971,35 @@ async fn process_new_session_datagram(
         return Ok(());
     }
 
+    // The first-datagram hook above may await. Revalidate before reserving a
+    // slot or beginning DNS/backend setup so stale source evidence cannot
+    // authorize those side effects.
+    if let Some(source) = node_waypoint_session_source.as_ref()
+        && let Err(refusal) = source.revalidate(source.ingress_ifindex, client_addr.ip())
+    {
+        source.scoping.index.warn_refusal(
+            view.proxy.id.as_str(),
+            &udp_session_client_ip(client_addr),
+            refusal,
+        );
+        return Err(anyhow::anyhow!(
+            "NodeWaypoint UDP source attribution changed while first-datagram policy hooks ran \
+             ({})",
+            refusal.as_str()
+        ));
+    }
+    if let Some(destination) = node_waypoint_destination.as_ref()
+        && let Err(refusal) = destination.revalidate()
+    {
+        destination
+            .router
+            .warn_refusal(view.proxy.id.as_str(), refusal);
+        return Err(anyhow::anyhow!(
+            "NodeWaypoint UDP destination ownership changed while first-datagram policy hooks ran ({})",
+            refusal.as_str()
+        ));
+    }
+
     let mut reservation = reserve_udp_session_slot(metrics, max_sessions)?;
 
     let session = create_session(
@@ -3224,6 +4008,7 @@ async fn process_new_session_datagram(
         dns_cache,
         frontend_socket,
         identity,
+        session_key.clone(),
         sessions,
         metrics,
         tls_no_verify,
@@ -3242,6 +4027,8 @@ async fn process_new_session_datagram(
         preselected_backend_target,
         admitted_datagram_plugins,
         stream_ctx,
+        node_waypoint_session_source,
+        node_waypoint_destination,
         auth_deadline,
         &auth_latch,
         &first_datagram_metadata,
@@ -3266,6 +4053,28 @@ async fn process_new_session_datagram(
         let _ = session.local_addr.set(la);
     }
 
+    // Session construction performs the same check before publication, but do
+    // it again at the last await boundary before the retained first datagram is
+    // sent. Shutdown/reconcile may retract the attribution while metadata is
+    // transferred from the first-datagram hook.
+    if let Some(source) = session.node_waypoint_source.as_ref()
+        && let Err(refusal) =
+            source.revalidate(local_addr.map(|local| local.ifindex), client_addr.ip())
+    {
+        source.scoping.index.warn_refusal(
+            session.proxy_id.as_str(),
+            session.datagram_client_ip.as_ref(),
+            refusal,
+        );
+        session.expired.store(true, Ordering::Release);
+        signal_udp_reply_task_stop(&session.stop_reply_task, session.stop_notify.as_ref());
+        session.close_hook_ingress();
+        return Err(anyhow::anyhow!(
+            "NodeWaypoint UDP source attribution changed before the initial forward ({})",
+            refusal.as_str()
+        ));
+    }
+
     forward_client_datagram_to_backend(&session, &data).await?;
     metrics.datagrams_out.fetch_add(1, Ordering::Relaxed);
     metrics
@@ -3276,7 +4085,7 @@ async fn process_new_session_datagram(
     // order, then atomically remove the pending gate. Each drained datagram
     // goes through the same per-datagram plugin hooks and debug-level
     // packet-error handling as the established-session path.
-    'drain: while let Some(batch) = take_pending_datagrams(pending_sessions, client_addr) {
+    'drain: while let Some(batch) = take_pending_datagrams(pending_sessions, &session_key) {
         for dgram in batch {
             // Stop the drain the moment the admitted credential stops
             // authorizing this session: no further hook runs and no further
@@ -3289,13 +4098,41 @@ async fn process_new_session_datagram(
             if session.refuse_if_authorization_expired().is_some() {
                 break 'drain;
             }
+            // The pending gate is keyed by the full session identity, but the
+            // client tuple inside that key is still forgeable. Re-authorize
+            // the actual ingress interface retained with every datagram
+            // before any plugin side effect. A queued datagram from a
+            // different interface is exactly the forged-tuple case, so it is
+            // dropped on its own rather than ending the admitted session.
+            if let Some(source) = session.node_waypoint_source.as_ref()
+                && let Err(verdict) =
+                    source.revalidate_datagram(dgram.ingress_ifindex, client_addr.ip())
+            {
+                let refusal = verdict.refusal();
+                source.scoping.index.warn_refusal(
+                    session.proxy_id.as_str(),
+                    session.datagram_client_ip.as_ref(),
+                    refusal,
+                );
+                if !verdict.closes_session() {
+                    continue;
+                }
+                session.expired.store(true, Ordering::Release);
+                signal_udp_reply_task_stop(&session.stop_reply_task, session.stop_notify.as_ref());
+                session.close_hook_ingress();
+                return Err(anyhow::anyhow!(
+                    "NodeWaypoint UDP pending datagram attribution does not match the admitted \
+                     session ({}); closing the session",
+                    refusal.as_str()
+                ));
+            }
             if !udp_datagram_allowed(
                 &session.datagram_plugins,
                 Arc::clone(&session.datagram_client_ip),
                 Arc::clone(&session.datagram_proxy_id),
                 session.datagram_proxy_name.clone(),
                 session.listen_port,
-                &dgram,
+                &dgram.data,
                 session.datagram_payload_kind,
                 UdpDatagramDirection::ClientToBackend,
                 Some(UdpMetadataSink::new(&session.metadata)),
@@ -3304,7 +4141,32 @@ async fn process_new_session_datagram(
             {
                 continue;
             }
-            if let Err(e) = forward_client_datagram_to_backend(&session, &dgram).await {
+            // The hook above may await arbitrary I/O. Revalidate again so a
+            // registry/slice change during it cannot produce a late backend
+            // side effect under the opening workload's identity.
+            if let Some(source) = session.node_waypoint_source.as_ref()
+                && let Err(verdict) =
+                    source.revalidate_datagram(dgram.ingress_ifindex, client_addr.ip())
+            {
+                let refusal = verdict.refusal();
+                source.scoping.index.warn_refusal(
+                    session.proxy_id.as_str(),
+                    session.datagram_client_ip.as_ref(),
+                    refusal,
+                );
+                if !verdict.closes_session() {
+                    continue;
+                }
+                session.expired.store(true, Ordering::Release);
+                signal_udp_reply_task_stop(&session.stop_reply_task, session.stop_notify.as_ref());
+                session.close_hook_ingress();
+                return Err(anyhow::anyhow!(
+                    "NodeWaypoint UDP pending datagram attribution changed while policy hooks ran \
+                     ({}); closing the session",
+                    refusal.as_str()
+                ));
+            }
+            if let Err(e) = forward_client_datagram_to_backend(&session, &dgram.data).await {
                 debug!(
                     proxy_id = %session.datagram_proxy_id,
                     client = %udp_client_log_addr(client_addr),
@@ -3317,7 +4179,7 @@ async fn process_new_session_datagram(
             metrics.datagrams_out.fetch_add(1, Ordering::Relaxed);
             metrics
                 .bytes_out
-                .fetch_add(dgram.len() as u64, Ordering::Relaxed);
+                .fetch_add(dgram.data.len() as u64, Ordering::Relaxed);
         }
     }
     // `take_pending_datagrams` removed the gate entry under the shard lock;
@@ -3330,6 +4192,10 @@ async fn forward_client_datagram_to_backend(
     session: &Arc<UdpSession>,
     data: &[u8],
 ) -> Result<(), anyhow::Error> {
+    // A shared listener stays bound while its Service routes republish. The
+    // admission-time route is not a lifetime capability: fail closed before
+    // every backend side effect if this destination was removed or reowned.
+    session.revalidate_destination()?;
     let send = async {
         if let Some(ref dtls) = session.dtls_conn {
             dtls.send(data)
@@ -3437,7 +4303,7 @@ fn spawn_session_cleanup(
             tokio::select! {
                 _ = interval.tick() => {
                     let now = coarse_epoch_millis();
-                    let mut expired: Vec<(SocketAddr, Arc<UdpSession>)> = Vec::new();
+                    let mut expired: Vec<(UdpSessionKey, Arc<UdpSession>)> = Vec::new();
 
                     for entry in sessions.iter() {
                         let last = entry.value().last_activity.load(Ordering::Relaxed);
@@ -3446,13 +4312,13 @@ fn spawn_session_cleanup(
                             // a session re-created at the same client address
                             // between this scan and the remove must NOT be
                             // evicted by us (it is a newer, still-live session).
-                            expired.push((*entry.key(), entry.value().clone()));
+                            expired.push((entry.key().clone(), entry.value().clone()));
                         }
                     }
 
-                    for (addr, expired_session) in &expired {
+                    for (session_key, expired_session) in &expired {
                         if let Some((_, session)) =
-                            sessions.remove_if(addr, |_, v| Arc::ptr_eq(v, expired_session))
+                            sessions.remove_if(session_key, |_, v| Arc::ptr_eq(v, expired_session))
                         {
                             // Mark the session expired BEFORE we let go of
                             // any reference. The recv-loop fast path may
@@ -3481,7 +4347,7 @@ fn spawn_session_cleanup(
                             metrics.active_sessions.fetch_sub(1, Ordering::Relaxed);
                             debug!(
                                 proxy_id = %proxy_id,
-                                client = %addr,
+                                client = %udp_client_log_addr(session_key.client),
                                 bytes_sent = bs,
                                 bytes_received = br,
                                 "UDP session expired (idle timeout)"
@@ -3631,6 +4497,9 @@ async fn start_dtls_frontend_listener(
     started: Arc<AtomicBool>,
     overload: Arc<crate::overload::OverloadState>,
     backend_dtls_config_cache: BackendDtlsConfigCache,
+    node_waypoint_udp_source_scoping: Option<
+        crate::proxy::node_waypoint_udp_identity::NodeWaypointUdpSourceScoping,
+    >,
     datagram_client_address: Option<Arc<DatagramClientAddressGate>>,
 ) -> Result<(), anyhow::Error> {
     let addr = SocketAddr::new(bind_addr, port);
@@ -3648,6 +4517,28 @@ async fn start_dtls_frontend_listener(
             !refuse_new_udp_source(&admission_overload)
         })),
         active_session_mirror: Some(metrics.dtls_demux_sessions.clone()),
+        // NodeWaypoint DTLS sessions are attributed to a source workload by the
+        // kernel-reported ingress interface of their ClientHello (issue #3286),
+        // so the demux must capture it. Off for every other listener.
+        capture_ingress_ifindex: node_waypoint_udp_source_scoping.is_some(),
+        // The `DtlsServer` owns the socket every encrypted record leaves from,
+        // so the NodeWaypoint inbound auth mark has to be applied there rather
+        // than here: the pod-veth tc guard drops UDP toward an enrolled pod IP
+        // unless it carries the mark, which would otherwise strand every
+        // ServerHello and every application reply. `bind_with_limits` applies
+        // it before the socket is used and fails the listener if it cannot,
+        // so this is a startup precondition, not an optimization. Off for
+        // every other DTLS listener.
+        socket_mark: node_waypoint_udp_source_scoping
+            .as_ref()
+            .map(|_| crate::ebpf::NODE_WAYPOINT_INBOUND_AUTH_MARK),
+        // Service-path steering delivers the datagram with the Service
+        // ClusterIP still in its IP header, and each session sources every
+        // encrypted record from exactly that pinned address. The ClusterIP is
+        // not configured on this node, so the socket has to be transparent or
+        // the kernel refuses the source. Applied before the server object
+        // exists, like the mark; off for every other DTLS listener.
+        transparent_reply_source: node_waypoint_udp_source_scoping.is_some(),
         // Envelope validation happens inside the demux loop, ahead of any
         // per-peer allocation, so an unauthenticated datagram never reserves a
         // session slot.
@@ -3659,9 +4550,10 @@ async fn start_dtls_frontend_listener(
     };
     let server =
         Arc::new(crate::dtls::DtlsServer::bind_with_limits(addr, dtls_config, dtls_limits).await?);
-    // Publish the live DTLS server handle so ordinary frontend DTLS live
-    // reload (`publish_frontend_dtls_generation`) can call
-    // `swap_frontend_config` on the same instance the recv loop is using.
+    // Publish the live DTLS server handle so StreamListenerManager can apply
+    // the matching owner's generation (`publish_frontend_dtls_generation` or
+    // `publish_mesh_node_waypoint_dtls_generation`) via `swap_frontend_config`
+    // on the same instance the recv loop is using.
     // Send-failure is benign: the receiver may have been dropped or the
     // manager may have moved on without wanting the handle.
     if let Some(tx) = dtls_server_tx {
@@ -3736,6 +4628,9 @@ async fn start_dtls_frontend_listener(
                 let handler_ca_bundle = tls_ca_bundle_path.clone();
                 let handler_dtls_cache = backend_dtls_config_cache.clone();
                 let handler_overload = overload.clone();
+                // NodeWaypoint per-datagram source attribution for this DTLS
+                // session (issue #3286); `None` for every other listener.
+                let handler_node_waypoint_source = node_waypoint_udp_source_scoping.clone();
                 // Monotonic session start for duration_ms; wall clock is only
                 // for human-readable connect/disconnect timestamps. Captured
                 // at accept so admission wait is included in the summary.
@@ -3807,22 +4702,59 @@ async fn start_dtls_frontend_listener(
                     stream_ctx.tls_client_cert_chain_der =
                         client_conn.tls_client_cert_chain_der.clone();
                     stream_ctx.sni_hostname = client_conn.sni_hostname.clone();
-                    // The constructor intentionally leaves node-waypoint per-pod
-                    // policy scope absent: UDP/DTLS cannot wire it without a new
-                    // capture path. Identity is keyed by the per-connection socket
-                    // cookie (`SO_COOKIE`), which node-agent eBPF stamps from
-                    // the source pod via the `connect4`/`connect6` cgroup hooks;
-                    // there are no UDP capture hooks, and a UDP stream proxy
-                    // serves all clients from one shared frontend socket with a
-                    // single cookie, so there is no per-source-pod cookie to
-                    // resolve here. With `per_pod_policy_scoping` on
-                    // (node-waypoint topology), `mesh_authz` stamps
-                    // `mesh_authz.scope_missing` and, because the per-pod scope is
-                    // always absent here, fails closed (rejects the stream, 403)
-                    // when any namespace/selector-scoped policy is configured;
-                    // with only mesh-wide policies it evaluates them normally.
-                    // Per-pod scoped enforcement is unavailable for DTLS streams
-                    // (TCP and HTTP/HBONE have it). See docs/mesh.md.
+                    // NodeWaypoint per-pod source scoping for DTLS (issue
+                    // #3286). The session's source workload is resolved from the
+                    // kernel-reported ingress interface of its ClientHello plus
+                    // the node-agent-published source address, and its
+                    // `PolicyScopeCache` + SPIFFE principal are stamped before
+                    // the `on_stream_connect` chain so `mesh_authz` enforces
+                    // namespace/selector-scoped policy for that exact pod. An
+                    // unattributable session leaves the scope absent, which
+                    // `mesh_authz` turns into a rejection while any scoped policy
+                    // exists — never a mesh-wide fallback. `None` for every other
+                    // topology and non-mesh DTLS proxy, whose behaviour is
+                    // unchanged. See docs/mesh.md.
+                    let mut handler_node_waypoint_session_source = None;
+                    if let Some(scoping) = handler_node_waypoint_source.as_ref() {
+                        let (policy_generation, resolution) = scoping
+                            .resolve_observed(client_conn.ingress_ifindex, client_addr.ip());
+                        match resolution {
+                            Ok(resolved) => {
+                                stream_ctx.node_waypoint_policy_scope = Some(resolved.scope);
+                                stream_ctx.insert_metadata(
+                                    "peer_spiffe_id".to_string(),
+                                    resolved.binding.principal.as_str().to_string(),
+                                );
+                                handler_node_waypoint_session_source =
+                                    Some(NodeWaypointUdpSessionSource {
+                                        scoping: scoping.clone(),
+                                        binding: Some(resolved.binding),
+                                        ingress_ifindex: client_conn.ingress_ifindex,
+                                        policy_generation: resolved.policy_generation,
+                                        unresolved_refusal: None,
+                                    });
+                            }
+                            Err(refusal) => {
+                                scoping.index.warn_refusal(
+                                    &resolved_proxy_id,
+                                    &client_ip,
+                                    refusal,
+                                );
+                                // Mesh-wide-only policy may deliberately admit
+                                // this missing scope. Keep the miss state and
+                                // exact policy generation so a later accepted
+                                // scoped-policy slice terminates the session.
+                                handler_node_waypoint_session_source =
+                                    Some(NodeWaypointUdpSessionSource {
+                                        scoping: scoping.clone(),
+                                        binding: None,
+                                        ingress_ifindex: client_conn.ingress_ifindex,
+                                        policy_generation,
+                                        unresolved_refusal: Some(refusal),
+                                    });
+                            }
+                        }
+                    }
                     for plugin in plugins.iter() {
                         if let PluginResult::Reject { .. } =
                             plugin.on_stream_connect(&mut stream_ctx).await
@@ -3923,6 +4855,7 @@ async fn start_dtls_frontend_listener(
                         port,
                         &handler_crls,
                         &handler_dtls_cache,
+                        handler_node_waypoint_session_source,
                         handler_auth_deadline,
                     )
                     .await;
@@ -4085,6 +5018,7 @@ async fn handle_dtls_client(
     listen_port: u16,
     crls: &crate::tls::CrlList,
     backend_dtls_config_cache: &BackendDtlsConfigCache,
+    node_waypoint_source: Option<NodeWaypointUdpSessionSource>,
     auth_deadline: Option<crate::proxy::auth_lifetime::StreamAuthDeadline>,
 ) -> DtlsHandlerResult {
     let mut backend_info = DtlsBackendInfo {
@@ -4122,6 +5056,7 @@ async fn handle_dtls_client(
         listen_port,
         crls,
         backend_dtls_config_cache,
+        node_waypoint_source,
         auth_deadline,
     )
     .await;
@@ -4271,6 +5206,48 @@ async fn dtls_shared_idle_watchdog(
         if udp_idle_expired(now, last, idle_timeout_ms) {
             return Err(UdpDtlsIdleTimeout.into());
         }
+    }
+}
+
+/// Which of a DTLS session's two relay tasks (if either) resolved on its own
+/// before the handler stopped waiting.
+///
+/// A `JoinHandle` panics if it is polled again after it has yielded its output,
+/// so the winner of the `select!` must be excluded from the post-abort join.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DtlsRelayCompletion {
+    /// The client → backend relay resolved.
+    ClientToBackend,
+    /// The backend → client relay resolved.
+    BackendToClient,
+    /// Neither relay resolved — the idle watchdog fired.
+    Neither,
+}
+
+/// Abort both DTLS relay tasks and await the ones that had not already
+/// resolved, so neither can still be executing once the caller returns.
+///
+/// `JoinHandle::abort` is a request: the task stops at its next await point, so
+/// without this join a losing relay could forward one more datagram *after* the
+/// handler reported the session terminated and released its scope pin and
+/// session accounting. Awaiting an aborted handle resolves as soon as the task
+/// observes the cancellation, and the relays are pure socket-await loops, so
+/// this cannot outlive one in-flight datagram copy.
+///
+/// The already-resolved handle named by `finished` is deliberately not polled
+/// again.
+pub async fn abort_and_join_dtls_relays<T>(
+    client_to_backend: &mut tokio::task::JoinHandle<T>,
+    backend_to_client: &mut tokio::task::JoinHandle<T>,
+    finished: DtlsRelayCompletion,
+) {
+    client_to_backend.abort();
+    backend_to_client.abort();
+    if finished != DtlsRelayCompletion::ClientToBackend {
+        let _ = client_to_backend.await;
+    }
+    if finished != DtlsRelayCompletion::BackendToClient {
+        let _ = backend_to_client.await;
     }
 }
 
@@ -4782,6 +5759,7 @@ async fn handle_dtls_client_inner(
     listen_port: u16,
     crls: &crate::tls::CrlList,
     backend_dtls_config_cache: &BackendDtlsConfigCache,
+    node_waypoint_source: Option<NodeWaypointUdpSessionSource>,
     auth_deadline: Option<crate::proxy::auth_lifetime::StreamAuthDeadline>,
 ) -> Result<(), anyhow::Error> {
     // Look up proxy config
@@ -4797,10 +5775,37 @@ async fn handle_dtls_client_inner(
     // identity-bearing values (backend stickiness, per-datagram hook context).
     let client_addr = identity.socket_peer;
 
-    // Resolve backend target
+    // Source admission ran before the potentially asynchronous stream plugin
+    // chain. Revalidate at the handler boundary so a pod deletion, identity
+    // rotation, or interface reuse during that chain cannot even begin backend
+    // selection/setup under stale workload evidence.
+    if let Some(source) = node_waypoint_source.as_ref()
+        && let Err(refusal) = source.revalidate(source.ingress_ifindex, client_addr.ip())
+    {
+        source.scoping.index.warn_refusal(
+            proxy_id,
+            udp_session_client_ip(client_addr).as_ref(),
+            refusal,
+        );
+        return Err(anyhow::anyhow!(
+            "NodeWaypoint DTLS source attribution changed after stream admission ({})",
+            refusal.as_str()
+        ));
+    }
+
+    // Resolve backend target. Frontend DTLS demux is still client-tuple keyed
+    // and has no destination router here; leave destination unset so undestined
+    // listeners keep the historical client-IP hash. Hash on the resolved client
+    // so backend stickiness follows the real client rather than the load
+    // balancer's socket address.
     let lb_hash_key = udp_lb_hash_key_for_client_ip(identity.resolved().ip());
-    let (backend_host, backend_port) =
-        resolve_backend_target(&proxy, &epoch.load_balancer, health_checker, &lb_hash_key)?;
+    let (backend_host, backend_port) = resolve_backend_target(
+        &proxy,
+        &epoch.load_balancer,
+        health_checker,
+        &lb_hash_key,
+        None,
+    )?;
     // Populate backend target as soon as it's known — even if DNS or connect fails.
     backend_info.backend_target = format!("{}:{}", backend_host, backend_port);
 
@@ -4919,7 +5924,17 @@ async fn handle_dtls_client_inner(
         &auth_termination_latch,
         &datagram_metadata,
         &release_half_open_probe,
-        || connect_udp_backend_candidates(&candidates, backend_port, connect_timeout, dtls_params),
+        || {
+            connect_udp_backend_candidates(
+                &candidates,
+                backend_port,
+                connect_timeout,
+                dtls_params,
+                node_waypoint_source
+                    .as_ref()
+                    .map(|_| crate::ebpf::NODE_WAYPOINT_INBOUND_AUTH_MARK),
+            )
+        },
     )
     .await?
     {
@@ -5010,6 +6025,8 @@ async fn handle_dtls_client_inner(
     // feed the same session map drained into the disconnect summary.
     let dgram_metadata_fwd = Arc::clone(&datagram_metadata);
     let dgram_metadata_rev = Arc::clone(&datagram_metadata);
+    let node_waypoint_source_fwd = node_waypoint_source.clone();
+    let node_waypoint_source_rev = node_waypoint_source;
     let shared_activity_ms = Arc::new(AtomicU64::new(coarse_epoch_millis()));
 
     // Client → Backend
@@ -5037,6 +6054,18 @@ async fn handle_dtls_client_inner(
                 Ok(Err(_)) => break,
                 Err(_) => break,
             };
+            if let Some(source) = node_waypoint_source_fwd.as_ref()
+                && let Err(refusal) = source.revalidate(source.ingress_ifindex, client_addr.ip())
+            {
+                source
+                    .scoping
+                    .index
+                    .warn_refusal(&proxy_id_fwd, dgram_client_ip.as_ref(), refusal);
+                return Err(anyhow::anyhow!(
+                    "NodeWaypoint DTLS source attribution no longer valid ({})",
+                    refusal.as_str()
+                ));
+            }
             let len = data.len();
 
             metrics_fwd.datagrams_in.fetch_add(1, Ordering::Relaxed);
@@ -5083,6 +6112,23 @@ async fn handle_dtls_client_inner(
                     // untouched so the session can still expire.
                     continue; // Silent drop — standard UDP behavior
                 }
+            }
+
+            // A datagram hook may await arbitrary I/O. Revalidate after it and
+            // immediately before the backend side effect so a registry/slice
+            // change cannot forward under stale workload identity.
+            if let Some(source) = node_waypoint_source_fwd.as_ref()
+                && let Err(refusal) = source.revalidate(source.ingress_ifindex, client_addr.ip())
+            {
+                source
+                    .scoping
+                    .index
+                    .warn_refusal(&proxy_id_fwd, dgram_client_ip.as_ref(), refusal);
+                return Err(anyhow::anyhow!(
+                    "NodeWaypoint DTLS source attribution changed while client policy hooks ran \
+                     ({})",
+                    refusal.as_str()
+                ));
             }
 
             // Publish before sending so a fast backend reply cannot observe a
@@ -5135,6 +6181,7 @@ async fn handle_dtls_client_inner(
             bytes_sent_fwd.fetch_add(len as u64, Ordering::Relaxed);
             maybe_touch_udp_idle_activity(activity_fwd.as_ref(), coarse_epoch_millis(), true, true);
         }
+        Ok::<(), anyhow::Error>(())
     });
 
     // Backend → Client — reuse pre-computed plugin list and context strings
@@ -5170,6 +6217,19 @@ async fn handle_dtls_client_inner(
             } else {
                 break;
             };
+            if let Some(source) = node_waypoint_source_rev.as_ref()
+                && let Err(refusal) = source.revalidate(source.ingress_ifindex, client_addr.ip())
+            {
+                source.scoping.index.warn_refusal(
+                    &proxy_id_rev,
+                    dgram_client_ip_rev.as_ref(),
+                    refusal,
+                );
+                return Err(anyhow::anyhow!(
+                    "NodeWaypoint DTLS source attribution no longer valid ({})",
+                    refusal.as_str()
+                ));
+            }
             let len = data.len();
 
             metrics_rev.datagrams_in.fetch_add(1, Ordering::Relaxed);
@@ -5225,6 +6285,24 @@ async fn handle_dtls_client_inner(
                 }
             }
 
+            // The response hook above may await arbitrary I/O. Revalidate at
+            // the last boundary before delivery so stale-session data is never
+            // encrypted and sent to a workload that inherited the peer tuple.
+            if let Some(source) = node_waypoint_source_rev.as_ref()
+                && let Err(refusal) = source.revalidate(source.ingress_ifindex, client_addr.ip())
+            {
+                source.scoping.index.warn_refusal(
+                    &proxy_id_rev,
+                    dgram_client_ip_rev.as_ref(),
+                    refusal,
+                );
+                return Err(anyhow::anyhow!(
+                    "NodeWaypoint DTLS source attribution changed while response policy hooks ran \
+                     ({})",
+                    refusal.as_str()
+                ));
+            }
+
             match udp_frontend_send_until_expiry(
                 reply_auth_plan,
                 client_sender.send_committed(&data, reply_auth_plan.map(|plan| plan.at)),
@@ -5264,6 +6342,7 @@ async fn handle_dtls_client_inner(
             bytes_received_rev.fetch_add(len as u64, Ordering::Relaxed);
             maybe_touch_udp_idle_activity(activity_rev.as_ref(), coarse_epoch_millis(), true, true);
         }
+        Ok::<(), anyhow::Error>(())
     });
 
     let mut client_to_backend = client_to_backend;
@@ -5279,7 +6358,7 @@ async fn handle_dtls_client_inner(
             .map(|plan| plan.at)
             .unwrap_or_else(tokio::time::Instant::now),
     ));
-    let outcome = tokio::select! {
+    let (outcome, finished) = tokio::select! {
         biased;
         _ = &mut authorization_deadline, if authorization_deadline_active => {
             // Fixed-cardinality termination class, recorded once through the
@@ -5297,17 +6376,25 @@ async fn handle_dtls_client_inner(
             }
             // Typed and health-neutral: no expiry value, identity, or
             // certificate detail reaches the message.
-            Err(DtlsAuthorizationExpired.into())
+            (Err(DtlsAuthorizationExpired.into()), DtlsRelayCompletion::Neither)
         }
-        _ = &mut client_to_backend => Ok(()),
-        _ = &mut backend_to_client => Ok(()),
-        result = &mut idle_watchdog => result,
+        result = &mut client_to_backend => (match result {
+            Ok(outcome) => outcome,
+            Err(error) => Err(anyhow::anyhow!("DTLS client forwarding task failed: {error}")),
+        }, DtlsRelayCompletion::ClientToBackend),
+        result = &mut backend_to_client => (match result {
+            Ok(outcome) => outcome,
+            Err(error) => Err(anyhow::anyhow!("DTLS backend forwarding task failed: {error}")),
+        }, DtlsRelayCompletion::BackendToClient),
+        result = &mut idle_watchdog => (result, DtlsRelayCompletion::Neither),
     };
-    // Both relay directions and the backend connection are torn down on every
-    // exit path below, including the authorization deadline, so no detached
-    // producer remains and the disconnect/accounting runs exactly once.
-    client_to_backend.abort();
-    backend_to_client.abort();
+    // Aborting only *requests* cancellation. Returning here would release the
+    // session's security and accounting lifetime (scope pin, session slot, byte
+    // counters, disconnect summary) while a losing relay could still be inside
+    // an await and forward one more datagram. Join the losers first so the
+    // handler's termination is also the relays' termination. Both directions
+    // are torn down on every exit path, including the authorization deadline.
+    abort_and_join_dtls_relays(&mut client_to_backend, &mut backend_to_client, finished).await;
 
     client_close.close().await;
     if let Some(ref dtls) = backend_dtls_cleanup {
@@ -5326,16 +6413,40 @@ async fn handle_dtls_client_inner(
 }
 
 /// Create a new UDP session for a client (plain UDP frontend path).
+///
+/// In NodeWaypoint topology (`node_waypoint_udp_source` present) the session's
+/// SOURCE workload is resolved from `ingress_ifindex` plus the datagram's source
+/// address before the `on_stream_connect` chain runs, and the resolved pod's
+/// `PolicyScopeCache` + SPIFFE principal are stamped onto the stream context so
+/// the mesh-injected `mesh_authz` enforces namespace/selector-scoped policy for
+/// that exact pod. An unattributable datagram leaves the scope absent, which
+/// `mesh_authz` turns into a 403 whenever any scoped policy exists — the same
+/// fail-closed gate the TCP stream path applies. Returns the admitted context
+/// together with the binding to pin on the session for per-datagram
+/// re-authorization.
 async fn admit_plain_udp_stream(
     epoch: &RequestEpoch,
     view: &UdpSessionEpochView,
     identity: DatagramClientIdentity,
     listen_port: u16,
-) -> Result<StreamConnectionContext, anyhow::Error> {
+    node_waypoint_udp_source: Option<
+        &crate::proxy::node_waypoint_udp_identity::NodeWaypointUdpSourceScoping,
+    >,
+    ingress_ifindex: Option<u32>,
+) -> Result<
+    (
+        StreamConnectionContext,
+        Option<NodeWaypointUdpSessionSource>,
+    ),
+    anyhow::Error,
+> {
+    let client_addr = identity.socket_peer;
     // `client_ip` (remote.ip) is the authenticated forwarded client when the
     // datagram client-address gate supplied one; `direct_client_ip` (source.ip)
     // is always the socket peer. Without the gate the two are identical, which
-    // is the historical UDP behavior.
+    // is the historical UDP behavior. NodeWaypoint attribution still uses the
+    // socket peer plus ingress interface — those are the kernel facts the
+    // node-agent registry vouches for.
     let client_ip = udp_session_client_ip(identity.resolved()).to_string();
     let direct_client_ip = udp_session_client_ip(identity.socket_peer).to_string();
     let mut stream_ctx = StreamConnectionContext::new(
@@ -5353,11 +6464,57 @@ async fn admit_plain_udp_stream(
         .plugin_cache
         .proxy_lifecycle_generation(&view.proxy.namespace, &view.proxy.id);
     stream_ctx.sni_hostname = view.sni_hostname.clone();
-    // The constructor intentionally leaves node-waypoint per-pod policy scope
-    // absent: plain UDP cannot wire it without a new capture path. Identity is
-    // keyed by the shared frontend socket rather than an individual client.
-    // Consequently mesh_authz fails closed when scoped policy requires the
-    // unavailable per-pod identity. See docs/mesh.md.
+    // NodeWaypoint per-pod source scoping (issue #3286). Absent for every other
+    // topology and for non-mesh UDP proxies, which keeps their behaviour
+    // unchanged. Both the identity and the scope come from ONE resolve, so a
+    // vouched pod can never be paired with a scope from a different slice
+    // generation — the same "never partial" rule the TCP path follows.
+    let mut node_waypoint_session_source = None;
+    if let Some(scoping) = node_waypoint_udp_source {
+        let (policy_generation, resolution) =
+            scoping.resolve_observed(ingress_ifindex, client_addr.ip());
+        match resolution {
+            Ok(resolved) => {
+                stream_ctx.node_waypoint_policy_scope = Some(resolved.scope);
+                // The resolved pod's SPIFFE ID is this session's authenticated
+                // source principal (parity with the TCP stream path), so
+                // source-principal-matched policies evaluate against the actual
+                // workload rather than an unauthenticated address.
+                stream_ctx.insert_metadata(
+                    "peer_spiffe_id".to_string(),
+                    resolved.binding.principal.as_str().to_string(),
+                );
+                node_waypoint_session_source = Some(NodeWaypointUdpSessionSource {
+                    scoping: scoping.clone(),
+                    binding: Some(resolved.binding),
+                    ingress_ifindex,
+                    policy_generation: resolved.policy_generation,
+                    unresolved_refusal: None,
+                });
+            }
+            Err(refusal) => {
+                // Leave the scope absent: `mesh_authz` denies the session when
+                // scoped policies exist, and evaluates mesh-wide-only when the
+                // mesh has none. Never a plaintext or mesh-wide fallback while
+                // scoped enforcement applies.
+                scoping.index.warn_refusal(
+                    view.proxy.id.as_str(),
+                    &udp_session_client_ip(client_addr),
+                    refusal,
+                );
+                // Mesh-wide-only policy may admit the absent scope. Preserve
+                // both the miss and this exact accepted slice generation so a
+                // later scoped-policy update cannot inherit the old admission.
+                node_waypoint_session_source = Some(NodeWaypointUdpSessionSource {
+                    scoping: scoping.clone(),
+                    binding: None,
+                    ingress_ifindex,
+                    policy_generation,
+                    unresolved_refusal: Some(refusal),
+                });
+            }
+        }
+    }
     for plugin in view.plugins.iter() {
         if let PluginResult::Reject { .. } = plugin.on_stream_connect(&mut stream_ctx).await {
             return Err(
@@ -5365,7 +6522,20 @@ async fn admit_plain_udp_stream(
             );
         }
     }
-    Ok(stream_ctx)
+    if let Some(source) = node_waypoint_session_source.as_ref()
+        && let Err(refusal) = source.revalidate(ingress_ifindex, client_addr.ip())
+    {
+        source.scoping.index.warn_refusal(
+            view.proxy.id.as_str(),
+            &udp_session_client_ip(client_addr),
+            refusal,
+        );
+        return Err(anyhow::anyhow!(
+            "NodeWaypoint UDP source attribution changed while stream admission hooks ran ({})",
+            refusal.as_str()
+        ));
+    }
+    Ok((stream_ctx, node_waypoint_session_source))
 }
 
 /// Create a new UDP session after stream admission and first-datagram policy.
@@ -5376,6 +6546,11 @@ async fn create_session(
     dns_cache: &DnsCache,
     frontend_socket: &Arc<UdpSocket>,
     identity: DatagramClientIdentity,
+    // Exact identity of this session on this listener: the client tuple, the
+    // selected destination IP, the exact namespaced route owner (issue #3861),
+    // and the bound socket's spawn generation. Every map insertion and
+    // identity-aware removal uses this same key.
+    session_key: UdpSessionKey,
     sessions: &SessionMap,
     metrics: &Arc<UdpProxyMetrics>,
     tls_no_verify: bool,
@@ -5394,6 +6569,8 @@ async fn create_session(
     preselected_backend_target: Option<(String, u16)>,
     admitted_datagram_plugins: Arc<[Arc<dyn Plugin>]>,
     mut stream_ctx: StreamConnectionContext,
+    node_waypoint_source: Option<NodeWaypointUdpSessionSource>,
+    node_waypoint_destination: Option<NodeWaypointUdpSessionDestination>,
     auth_deadline: Option<crate::proxy::auth_lifetime::StreamAuthDeadline>,
     auth_latch: &crate::proxy::auth_lifetime::StreamAuthTerminationLatch,
     setup_metadata: &std::sync::Mutex<std::collections::HashMap<String, String>>,
@@ -5418,13 +6595,14 @@ async fn create_session(
     // Session identity strings follow the resolved (authenticated) client.
     let client_ip = udp_session_client_ip(identity.resolved());
 
-    let lb_hash_key = udp_lb_hash_key_for_client_ip(identity.resolved().ip());
+    let lb_hash_key = udp_session_lb_hash_key(identity.resolved().ip(), session_key.destination);
     let (backend_host, backend_port) = resolve_or_reuse_backend_target(
         preselected_backend_target,
         &proxy,
         &epoch.load_balancer,
         health_checker,
         &lb_hash_key,
+        session_key.destination,
     )?;
 
     // Circuit breaker check — reject before creating backend socket if open.
@@ -5522,6 +6700,29 @@ async fn create_session(
             ));
         }
     };
+    let candidates = match session_key.destination {
+        Some(destination) => {
+            let filtered = candidates.matching_family(destination);
+            if filtered.is_empty() {
+                if let Some(ref cb_config) = proxy.circuit_breaker {
+                    let cb = circuit_breaker_cache.get_or_create(
+                        &proxy.namespace,
+                        proxy_id,
+                        cb_target_key.as_deref(),
+                        cb_config,
+                    );
+                    cb.record_failure(502, true, cb_is_half_open_probe);
+                }
+                return Err(StreamSetupError::new(
+                    StreamSetupKind::NoHealthyTargets,
+                    format!("no backends in destination family for {backend_host}"),
+                )
+                .into());
+            }
+            filtered
+        }
+        None => candidates,
+    };
     let use_dtls = proxy.effective_scheme() == BackendScheme::Dtls && !is_passthrough;
     let dtls_params = use_dtls
         .then(|| {
@@ -5546,7 +6747,17 @@ async fn create_session(
         setup_metadata,
         UDP_SESSION_SETUP_CONTEXT,
         &release_half_open_probe,
-        || connect_udp_backend_candidates(&candidates, backend_port, connect_timeout, dtls_params),
+        || {
+            connect_udp_backend_candidates(
+                &candidates,
+                backend_port,
+                connect_timeout,
+                dtls_params,
+                node_waypoint_source
+                    .as_ref()
+                    .map(|_| crate::ebpf::NODE_WAYPOINT_INBOUND_AUTH_MARK),
+            )
+        },
     )
     .await?
     {
@@ -5602,6 +6813,31 @@ async fn create_session(
         cb.record_success(cb_is_half_open_probe);
     }
 
+    // Admission preceded DNS and backend setup. Re-check immediately before
+    // publishing the session so a registry/slice change during those awaits
+    // cannot forward the retained first datagram under stale evidence.
+    if let Some(source) = node_waypoint_source.as_ref()
+        && let Err(refusal) = source.revalidate(source.ingress_ifindex, client_addr.ip())
+    {
+        source
+            .scoping
+            .index
+            .warn_refusal(proxy_id, client_ip.as_ref(), refusal);
+        return Err(anyhow::anyhow!(
+            "NodeWaypoint UDP source attribution changed during session setup ({})",
+            refusal.as_str()
+        ));
+    }
+    if let Some(destination) = node_waypoint_destination.as_ref()
+        && let Err(refusal) = destination.revalidate()
+    {
+        destination.router.warn_refusal(proxy_id, refusal);
+        return Err(anyhow::anyhow!(
+            "NodeWaypoint UDP destination ownership changed during session setup ({})",
+            refusal.as_str()
+        ));
+    }
+
     let now = coarse_epoch_millis();
     let connected_wall_at = chrono::Utc::now();
     let consumer_username = stream_ctx.effective_identity().map(str::to_owned);
@@ -5653,6 +6889,8 @@ async fn create_session(
         plugin_trigger_decisions: stream_ctx.plugin_trigger_decisions(),
         correlation_ids,
         local_addr: std::sync::OnceLock::new(),
+        node_waypoint_destination,
+        node_waypoint_source,
         plugins: Arc::clone(&plugins),
         datagram_plugins: Arc::clone(&datagram_plugins),
         datagram_client_ip: Arc::clone(&datagram_client_ip),
@@ -5701,7 +6939,7 @@ async fn create_session(
         );
     }
 
-    sessions.insert(client_addr, session.clone());
+    sessions.insert(session_key.clone(), session.clone());
     // Note: active_sessions is reserved by the receive loop before the
     // background setup task calls create_session, avoiding TOCTOU races.
     metrics.total_sessions.fetch_add(1, Ordering::Relaxed);
@@ -5912,6 +7150,39 @@ async fn create_session(
                 break;
             };
 
+            // A backend reply can outlive the client datagram that created the
+            // session. Revalidate before EVERY reply so pod deletion, identity
+            // rotation, or interface/address reuse cannot deliver stale-session
+            // data to a new workload that inherited the peer tuple.
+            if let Some(source) = reply_session.node_waypoint_source.as_ref()
+                && let Err(refusal) = source.revalidate(source.ingress_ifindex, client_addr.ip())
+            {
+                source.scoping.index.warn_refusal(
+                    &reply_proxy_id,
+                    &udp_session_client_ip(client_addr),
+                    refusal,
+                );
+                reply_session.expired.store(true, Ordering::Release);
+                disconnect_error = Some((
+                    format!(
+                        "NodeWaypoint UDP source attribution no longer valid ({})",
+                        refusal.as_str()
+                    ),
+                    crate::retry::ErrorClass::DispatchPolicyRejected,
+                    crate::plugins::DisconnectCause::RecvError,
+                    crate::plugins::Direction::BackendToClient,
+                ));
+                break;
+            }
+            if let Err(error) = reply_session.revalidate_destination() {
+                disconnect_error = Some((
+                    error.to_string(),
+                    crate::retry::ErrorClass::DispatchPolicyRejected,
+                    crate::plugins::DisconnectCause::RecvError,
+                    crate::plugins::Direction::BackendToClient,
+                ));
+                break;
+            }
             // Recheck immediately after the receive returns, before any
             // processing or client send: a datagram that won the receive race
             // just before expiry must not be forwarded once the credential no
@@ -5981,6 +7252,40 @@ async fn create_session(
                     send_batch.discard();
                 }
                 break 'reply;
+            }
+
+            // Response hooks may await arbitrary I/O. Revalidate at the last
+            // boundary before the client send so churn cannot deliver a stale
+            // reply to a workload that inherited the peer tuple.
+            if let Some(source) = reply_session.node_waypoint_source.as_ref()
+                && let Err(refusal) = source.revalidate(source.ingress_ifindex, client_addr.ip())
+            {
+                source.scoping.index.warn_refusal(
+                    &reply_proxy_id,
+                    &udp_session_client_ip(client_addr),
+                    refusal,
+                );
+                reply_session.expired.store(true, Ordering::Release);
+                disconnect_error = Some((
+                    format!(
+                        "NodeWaypoint UDP source attribution changed while response policy hooks \
+                         ran ({})",
+                        refusal.as_str()
+                    ),
+                    crate::retry::ErrorClass::DispatchPolicyRejected,
+                    crate::plugins::DisconnectCause::RecvError,
+                    crate::plugins::Direction::BackendToClient,
+                ));
+                break;
+            }
+            if let Err(error) = reply_session.revalidate_destination() {
+                disconnect_error = Some((
+                    error.to_string(),
+                    crate::retry::ErrorClass::DispatchPolicyRejected,
+                    crate::plugins::DisconnectCause::RecvError,
+                    crate::plugins::Direction::BackendToClient,
+                ));
+                break;
             }
 
             // Batch-local counters for this recv burst.
@@ -6117,6 +7422,36 @@ async fn create_session(
                     }
                     match sock.try_recv(&mut buf) {
                         Ok(len2) => {
+                            if let Some(source) = reply_session.node_waypoint_source.as_ref()
+                                && let Err(refusal) =
+                                    source.revalidate(source.ingress_ifindex, client_addr.ip())
+                            {
+                                source.scoping.index.warn_refusal(
+                                    &reply_proxy_id,
+                                    &udp_session_client_ip(client_addr),
+                                    refusal,
+                                );
+                                reply_session.expired.store(true, Ordering::Release);
+                                disconnect_error = Some((
+                                    format!(
+                                        "NodeWaypoint UDP source attribution no longer valid ({})",
+                                        refusal.as_str()
+                                    ),
+                                    crate::retry::ErrorClass::DispatchPolicyRejected,
+                                    crate::plugins::DisconnectCause::RecvError,
+                                    crate::plugins::Direction::BackendToClient,
+                                ));
+                                break 'reply;
+                            }
+                            if let Err(error) = reply_session.revalidate_destination() {
+                                disconnect_error = Some((
+                                    error.to_string(),
+                                    crate::retry::ErrorClass::DispatchPolicyRejected,
+                                    crate::plugins::DisconnectCause::RecvError,
+                                    crate::plugins::Direction::BackendToClient,
+                                ));
+                                break 'reply;
+                            }
                             // Amplification check on batched response datagram
                             if !admit_udp_response(
                                 &reply_session.response_budget_remaining,
@@ -6171,6 +7506,37 @@ async fn create_session(
                                     gso_batch.discard();
                                     send_batch.discard();
                                 }
+                                break 'reply;
+                            }
+                            if let Some(source) = reply_session.node_waypoint_source.as_ref()
+                                && let Err(refusal) =
+                                    source.revalidate(source.ingress_ifindex, client_addr.ip())
+                            {
+                                source.scoping.index.warn_refusal(
+                                    &reply_proxy_id,
+                                    &udp_session_client_ip(client_addr),
+                                    refusal,
+                                );
+                                reply_session.expired.store(true, Ordering::Release);
+                                disconnect_error = Some((
+                                    format!(
+                                        "NodeWaypoint UDP source attribution changed while \
+                                         response policy hooks ran ({})",
+                                        refusal.as_str()
+                                    ),
+                                    crate::retry::ErrorClass::DispatchPolicyRejected,
+                                    crate::plugins::DisconnectCause::RecvError,
+                                    crate::plugins::Direction::BackendToClient,
+                                ));
+                                break 'reply;
+                            }
+                            if let Err(error) = reply_session.revalidate_destination() {
+                                disconnect_error = Some((
+                                    error.to_string(),
+                                    crate::retry::ErrorClass::DispatchPolicyRejected,
+                                    crate::plugins::DisconnectCause::RecvError,
+                                    crate::plugins::Direction::BackendToClient,
+                                ));
                                 break 'reply;
                             }
 
@@ -6269,7 +7635,7 @@ async fn create_session(
                                             .store(true, std::sync::atomic::Ordering::Release);
                                         reply_session.close_hook_ingress();
                                         if reply_sessions
-                                            .remove_if(&client_addr, |_, v| {
+                                            .remove_if(&session_key, |_, v| {
                                                 Arc::ptr_eq(v, &reply_session)
                                             })
                                             .is_some()
@@ -6324,6 +7690,19 @@ async fn create_session(
             // Flush batched sends after draining all pending replies.
             #[cfg(target_os = "linux")]
             if send_batched {
+                // Buffered replies may have waited while the route table was
+                // republished. Revalidate once more at the final syscall
+                // boundary; breaking drops both batches without emitting
+                // traffic under removed or replaced Service ownership.
+                if let Err(error) = reply_session.revalidate_destination() {
+                    disconnect_error = Some((
+                        error.to_string(),
+                        crate::retry::ErrorClass::DispatchPolicyRejected,
+                        crate::plugins::DisconnectCause::RecvError,
+                        crate::plugins::Direction::BackendToClient,
+                    ));
+                    break;
+                }
                 // Recheck immediately before any GSO/sendmmsg flush so a payload
                 // queued before expiry is discarded rather than sent.
                 if let Some(termination) = udp_reply_expired_at_commit(reply_authorization_plan) {
@@ -6468,7 +7847,7 @@ async fn create_session(
         // newer session may have been re-created at the same client address —
         // identity-aware removal must not evict that newer generation).
         if reply_sessions
-            .remove_if(&client_addr, |_, v| Arc::ptr_eq(v, &reply_session))
+            .remove_if(&session_key, |_, v| Arc::ptr_eq(v, &reply_session))
             .is_some()
         {
             reply_session.release_overload_guard();
@@ -6533,11 +7912,18 @@ async fn create_session(
 /// placeholder port must never pin a mixed-port upstream). Stream target
 /// selection respects active health checks and passive ejection state recorded
 /// by HTTP-family traffic.
-fn resolve_backend_target(
+///
+/// When `destination` is a literal Service ClusterIP, destination address
+/// family is an eligibility constraint *inside* that selector: dual-stack
+/// NodeWaypoint upstreams publish every pod address, and UDP `connect()` to
+/// the other family "succeeds" then ICMP-refuses (TIMEOUT, zero backend hits).
+/// Family never bypasses health, locality, weights, or the configured algorithm.
+pub(crate) fn resolve_backend_target(
     proxy: &Proxy,
     lb_snapshot: &LoadBalancerCacheInner,
     health_checker: &HealthChecker,
     lb_hash_key: &str,
+    destination: Option<IpAddr>,
 ) -> Result<(String, u16), anyhow::Error> {
     if let Some(upstream_id) = &proxy.upstream_id {
         // Engage the per-port LB lane only when every upstream target shares a
@@ -6572,39 +7958,96 @@ fn resolve_backend_target(
             health_port_scope,
         );
 
-        let selection = if let Some(port) = port_lane {
-            LoadBalancerCache::select_target_for_port_from(
+        let selection = match (destination, port_lane) {
+            (Some(destination), Some(port)) => {
+                LoadBalancerCache::select_target_for_port_matching_family_from(
+                    lb_snapshot,
+                    &proxy.namespace,
+                    upstream_id,
+                    lb_hash_key,
+                    port,
+                    Some(&health_ctx),
+                    destination,
+                )
+            }
+            (Some(destination), None) => LoadBalancerCache::select_target_matching_family_from(
+                lb_snapshot,
+                &proxy.namespace,
+                upstream_id,
+                lb_hash_key,
+                Some(&health_ctx),
+                destination,
+            ),
+            (None, Some(port)) => LoadBalancerCache::select_target_for_port_from(
                 lb_snapshot,
                 &proxy.namespace,
                 upstream_id,
                 lb_hash_key,
                 port,
                 Some(&health_ctx),
-            )
-        } else {
-            LoadBalancerCache::select_target_from(
+            ),
+            (None, None) => LoadBalancerCache::select_target_from(
                 lb_snapshot,
                 &proxy.namespace,
                 upstream_id,
                 lb_hash_key,
                 Some(&health_ctx),
-            )
+            ),
         }
         .ok_or_else(|| -> anyhow::Error {
-            StreamSetupError::new(
-                StreamSetupKind::NoHealthyTargets,
-                format!("for upstream {upstream_id}"),
-            )
-            .into()
+            let family_gap = destination.is_some()
+                && LoadBalancerCache::get_upstream_from(lb_snapshot, &proxy.namespace, upstream_id)
+                    .is_some();
+            let detail = if family_gap {
+                format!("for upstream {upstream_id}: no backends in destination family")
+            } else {
+                format!("for upstream {upstream_id}")
+            };
+            StreamSetupError::new(StreamSetupKind::NoHealthyTargets, detail).into()
         })?;
         Ok((selection.target.host.clone(), selection.target.port))
     } else {
-        Ok((proxy.backend_host.clone(), proxy.backend_port))
+        let host = proxy.backend_host.clone();
+        if let Some(destination) = destination
+            && !udp_backend_host_matches_destination_family(&host, destination)
+        {
+            return Err(StreamSetupError::new(
+                StreamSetupKind::NoHealthyTargets,
+                "no backends in destination family",
+            )
+            .into());
+        }
+        Ok((host, proxy.backend_port))
     }
 }
 
-fn udp_lb_hash_key_for_client_ip(ip: std::net::IpAddr) -> String {
-    crate::util::client_identity::canonical_ip_string(ip)
+/// Session-setup LB hash key. Destination-routed listeners include the
+/// ClusterIP so one source socket addressing two same-port Services cannot
+/// share a Round-Robin slot or consistent-hash bucket. Undestined listeners
+/// keep the historical client-IP-only key.
+pub(crate) fn udp_session_lb_hash_key(client: IpAddr, destination: Option<IpAddr>) -> String {
+    let client = crate::util::client_identity::canonical_ip_string(client);
+    let Some(destination) = destination else {
+        return client;
+    };
+    let dest = crate::util::client_identity::canonical_ip_string(destination);
+    let mut key = String::with_capacity(client.len() + dest.len() + 1);
+    key.push_str(&client);
+    key.push('|');
+    key.push_str(&dest);
+    key
+}
+
+fn udp_lb_hash_key_for_client_ip(ip: IpAddr) -> String {
+    udp_session_lb_hash_key(ip, None)
+}
+
+/// Literal backend IPs must share the session destination family. Hostnames
+/// are admitted here; [`crate::dns::ResolvedAddresses::matching_family`] filters
+/// them after DNS. Upstream selection applies the same rule as an LB
+/// eligibility constraint via [`crate::load_balancer::backend_host_matches_ip_family`].
+pub(crate) fn udp_backend_host_matches_destination_family(host: &str, destination: IpAddr) -> bool {
+    crate::load_balancer::backend_host_matches_ip_family(host, destination)
 }
 
 fn udp_port_lane_selection_supported(
@@ -6678,10 +8121,26 @@ fn resolve_or_reuse_backend_target(
     lb_snapshot: &LoadBalancerCacheInner,
     health_checker: &HealthChecker,
     lb_hash_key: &str,
+    destination: Option<IpAddr>,
 ) -> Result<(String, u16), anyhow::Error> {
     match preselected {
-        Some(target) => Ok(target),
-        None => resolve_backend_target(proxy, lb_snapshot, health_checker, lb_hash_key),
+        Some(target) => {
+            if let Some(destination) = destination
+                && !udp_backend_host_matches_destination_family(&target.0, destination)
+            {
+                return resolve_backend_target(
+                    proxy,
+                    lb_snapshot,
+                    health_checker,
+                    lb_hash_key,
+                    Some(destination),
+                );
+            }
+            Ok(target)
+        }
+        None => {
+            resolve_backend_target(proxy, lb_snapshot, health_checker, lb_hash_key, destination)
+        }
     }
 }
 
@@ -6746,6 +8205,7 @@ pub struct UdpAuthorizationSessionProbe {
     overload: Arc<crate::overload::OverloadState>,
     sessions: SessionMap,
     client_addr: SocketAddr,
+    session_key: UdpSessionKey,
     hook_ingress_rx: std::sync::Mutex<Option<mpsc::Receiver<Bytes>>>,
     /// The peer the session's backend socket is connected to. Kept bound so
     /// "no datagram was forwarded after expiry" is observable, not inferred.
@@ -6842,6 +8302,8 @@ impl UdpAuthorizationSessionProbe {
             plugin_trigger_decisions: Default::default(),
             correlation_ids: Default::default(),
             local_addr: std::sync::OnceLock::new(),
+            node_waypoint_destination: None,
+            node_waypoint_source: None,
             plugins: Arc::new(Vec::new()),
             datagram_plugins: Arc::from([]),
             datagram_client_ip: Arc::from("127.0.0.1"),
@@ -6870,7 +8332,8 @@ impl UdpAuthorizationSessionProbe {
             ahash::RandomState::new(),
             udp_session_shard_amount(0),
         ));
-        sessions.insert(client_addr, Arc::clone(&session));
+        let session_key = UdpSessionKey::undestined(client_addr, 0);
+        sessions.insert(session_key.clone(), Arc::clone(&session));
         metrics.active_sessions.fetch_add(1, Ordering::Relaxed);
         Ok(Self {
             session,
@@ -6878,6 +8341,7 @@ impl UdpAuthorizationSessionProbe {
             overload,
             sessions,
             client_addr,
+            session_key,
             hook_ingress_rx: std::sync::Mutex::new(hook_ingress_rx),
             backend_peer,
         })
@@ -6988,8 +8452,8 @@ impl UdpAuthorizationSessionProbe {
     /// Returns `(resolved_a_live_generation, cache_entry_retained)`; the two
     /// must agree, which is what the external coverage asserts.
     pub fn cached_generation_is_live(&self) -> (bool, bool) {
-        let mut cache = Some((self.client_addr, Arc::clone(&self.session)));
-        let live = take_udp_last_client_if_live(&mut cache, self.client_addr, |cached| {
+        let mut cache = Some((self.session_key.clone(), Arc::clone(&self.session)));
+        let live = take_udp_last_client_if_live(&mut cache, &self.session_key, |cached| {
             cached.expired.load(std::sync::atomic::Ordering::Acquire)
         })
         .is_some();
@@ -7009,7 +8473,7 @@ impl UdpAuthorizationSessionProbe {
         self.session.close_hook_ingress();
         let removed = self
             .sessions
-            .remove_if(&self.client_addr, |_, v| Arc::ptr_eq(v, &self.session))
+            .remove_if(&self.session_key, |_, v| Arc::ptr_eq(v, &self.session))
             .is_some();
         if !removed {
             return None;
@@ -7048,7 +8512,7 @@ impl UdpAuthorizationSessionProbe {
     pub fn run_idle_cleanup_removal(&self) -> bool {
         let Some((_, session)) = self
             .sessions
-            .remove_if(&self.client_addr, |_, v| Arc::ptr_eq(v, &self.session))
+            .remove_if(&self.session_key, |_, v| Arc::ptr_eq(v, &self.session))
         else {
             return false;
         };
@@ -7086,7 +8550,7 @@ impl UdpAuthorizationSessionProbe {
 
     /// Whether the session is still resolvable in the listener session map.
     pub fn session_map_contains(&self) -> bool {
-        self.sessions.contains_key(&self.client_addr)
+        self.sessions.contains_key(&self.session_key)
     }
 }
 
@@ -7144,6 +8608,8 @@ mod tests {
             )])),
             correlation_ids: Default::default(),
             local_addr: std::sync::OnceLock::new(),
+            node_waypoint_destination: None,
+            node_waypoint_source: None,
             plugins: Arc::new(Vec::new()),
             datagram_plugins: Arc::from([]),
             datagram_client_ip: Arc::from("127.0.0.1"),
@@ -7911,35 +9377,52 @@ backend_tls_verify_server_cert: false
         "127.0.0.1:40000".parse().expect("valid addr")
     }
 
+    fn test_session_key() -> super::UdpSessionKey {
+        super::UdpSessionKey::undestined(test_client_addr(), 1)
+    }
+
     #[test]
     fn pending_datagram_queue_preserves_order_and_enforces_caps() {
         let mut queue = super::PendingDatagramQueue::default();
 
         // Zero-length datagrams are valid UDP and must be queued.
-        assert!(queue.push_bounded(&[]));
-        assert!(queue.push_bounded(&[1]));
-        assert!(queue.push_bounded(&[2, 2]));
+        assert!(queue.push_bounded(&[], Some(7)));
+        assert!(queue.push_bounded(&[1], Some(8)));
+        assert!(queue.push_bounded(&[2, 2], None));
         assert_eq!(
             queue.datagrams,
-            vec![Vec::<u8>::new(), vec![1], vec![2, 2]],
-            "queue must preserve arrival order"
+            vec![
+                super::PendingDatagram {
+                    data: Vec::new(),
+                    ingress_ifindex: Some(7),
+                },
+                super::PendingDatagram {
+                    data: vec![1],
+                    ingress_ifindex: Some(8),
+                },
+                super::PendingDatagram {
+                    data: vec![2, 2],
+                    ingress_ifindex: None,
+                },
+            ],
+            "queue must preserve arrival order and authorization evidence"
         );
         assert_eq!(queue.queued_bytes, 3);
 
         // Byte cap: a datagram that would exceed the total byte budget is
         // tail-dropped without touching the queue.
         let oversize = vec![0u8; super::PENDING_SESSION_MAX_QUEUED_BYTES];
-        assert!(!queue.push_bounded(&oversize));
+        assert!(!queue.push_bounded(&oversize, Some(9)));
         assert_eq!(queue.datagrams.len(), 3);
         assert_eq!(queue.queued_bytes, 3);
 
         // Datagram-count cap: beyond the max entry count everything is
         // tail-dropped, even zero-length datagrams.
         for _ in queue.datagrams.len()..super::PENDING_SESSION_MAX_QUEUED_DATAGRAMS {
-            assert!(queue.push_bounded(&[7]));
+            assert!(queue.push_bounded(&[7], Some(7)));
         }
-        assert!(!queue.push_bounded(&[8]));
-        assert!(!queue.push_bounded(&[]));
+        assert!(!queue.push_bounded(&[8], Some(8)));
+        assert!(!queue.push_bounded(&[], None));
         assert_eq!(
             queue.datagrams.len(),
             super::PENDING_SESSION_MAX_QUEUED_DATAGRAMS
@@ -8238,23 +9721,35 @@ backend_tls_verify_server_cert: false
     #[test]
     fn take_pending_datagrams_drains_in_order_then_removes_gate() {
         let pending = test_pending_map();
-        let addr = test_client_addr();
+        let addr = test_session_key();
 
         // Absent entry: nothing to drain, nothing inserted.
-        assert!(super::take_pending_datagrams(&pending, addr).is_none());
+        assert!(super::take_pending_datagrams(&pending, &addr).is_none());
         assert!(!pending.contains_key(&addr));
 
-        pending.insert(addr, super::PendingDatagramQueue::default());
+        pending.insert(addr.clone(), super::PendingDatagramQueue::default());
         {
             let mut entry = pending.get_mut(&addr).expect("gate present");
-            assert!(entry.push_bounded(&[1]));
-            assert!(entry.push_bounded(&[2]));
+            assert!(entry.push_bounded(&[1], Some(7)));
+            assert!(entry.push_bounded(&[2], Some(8)));
         }
 
         // First take hands off the queued batch in arrival order and leaves
         // the gate in place so concurrent arrivals keep queueing.
-        let batch = super::take_pending_datagrams(&pending, addr).expect("queued batch");
-        assert_eq!(batch, vec![vec![1], vec![2]]);
+        let batch = super::take_pending_datagrams(&pending, &addr).expect("queued batch");
+        assert_eq!(
+            batch,
+            vec![
+                super::PendingDatagram {
+                    data: vec![1],
+                    ingress_ifindex: Some(7),
+                },
+                super::PendingDatagram {
+                    data: vec![2],
+                    ingress_ifindex: Some(8),
+                },
+            ]
+        );
         assert!(
             pending.contains_key(&addr),
             "gate must survive a non-empty take"
@@ -8265,13 +9760,19 @@ backend_tls_verify_server_cert: false
         {
             let mut entry = pending.get_mut(&addr).expect("gate present");
             assert_eq!(entry.queued_bytes, 0, "take must reset byte accounting");
-            assert!(entry.push_bounded(&[3]));
+            assert!(entry.push_bounded(&[3], None));
         }
-        let batch = super::take_pending_datagrams(&pending, addr).expect("late batch");
-        assert_eq!(batch, vec![vec![3]]);
+        let batch = super::take_pending_datagrams(&pending, &addr).expect("late batch");
+        assert_eq!(
+            batch,
+            vec![super::PendingDatagram {
+                data: vec![3],
+                ingress_ifindex: None,
+            }]
+        );
 
         // Empty queue: the gate is removed atomically and the drain ends.
-        assert!(super::take_pending_datagrams(&pending, addr).is_none());
+        assert!(super::take_pending_datagrams(&pending, &addr).is_none());
         assert!(
             !pending.contains_key(&addr),
             "empty take must remove the pending gate"
@@ -8281,14 +9782,14 @@ backend_tls_verify_server_cert: false
     #[test]
     fn pending_session_gate_drops_queue_unless_disarmed() {
         let pending = test_pending_map();
-        let addr = test_client_addr();
+        let addr = test_session_key();
 
         // Armed gate (setup failure path): entry and queued datagrams removed.
-        pending.insert(addr, super::PendingDatagramQueue::default());
+        pending.insert(addr.clone(), super::PendingDatagramQueue::default());
         {
             let _gate = super::PendingSessionGate {
                 pending_sessions: Arc::clone(&pending),
-                client_addr: addr,
+                session_key: addr.clone(),
                 armed: true,
             };
         }
@@ -8298,11 +9799,11 @@ backend_tls_verify_server_cert: false
         );
 
         // Disarmed gate (successful handoff): entry left alone.
-        pending.insert(addr, super::PendingDatagramQueue::default());
+        pending.insert(addr.clone(), super::PendingDatagramQueue::default());
         {
             let mut gate = super::PendingSessionGate {
                 pending_sessions: Arc::clone(&pending),
-                client_addr: addr,
+                session_key: addr.clone(),
                 armed: true,
             };
             gate.disarm();
@@ -8317,11 +9818,14 @@ backend_tls_verify_server_cert: false
     fn pending_session_gate_limit_does_not_consume_active_session_slots() {
         let pending = test_pending_map();
         let metrics = Arc::new(super::UdpProxyMetrics::default());
-        let first = test_client_addr();
-        let second: SocketAddr = "127.0.0.1:40001".parse().expect("valid addr");
+        let first = test_session_key();
+        let second = super::UdpSessionKey::undestined(
+            "127.0.0.1:40001".parse::<SocketAddr>().expect("valid addr"),
+            1,
+        );
 
-        assert!(super::try_insert_pending_session_gate(&pending, first, 1, None).unwrap());
-        let err = super::try_insert_pending_session_gate(&pending, second, 1, None)
+        assert!(super::try_insert_pending_session_gate(&pending, &first, 1, None).unwrap());
+        let err = super::try_insert_pending_session_gate(&pending, &second, 1, None)
             .expect_err("second pending gate should hit pending limit");
 
         assert!(
@@ -8426,6 +9930,8 @@ backend_tls_verify_server_cert: false
             metadata: std::sync::Mutex::new(HashMap::new()),
             correlation_ids: Default::default(),
             local_addr: std::sync::OnceLock::new(),
+            node_waypoint_destination: None,
+            node_waypoint_source: None,
             plugins: Arc::new(Vec::new()),
             datagram_plugins: Arc::from([]),
             datagram_client_ip: Arc::from("127.0.0.1"),
@@ -8544,6 +10050,7 @@ listen_port: 5300
             &snapshot,
             &HealthChecker::new(),
             "127.0.0.1",
+            None,
         )
         .unwrap();
 
@@ -8587,7 +10094,7 @@ listen_port: 5300
         for i in 1..=64 {
             let key = format!("192.0.2.{i}");
             let (host, port) =
-                super::resolve_backend_target(&proxy, &snapshot, &HealthChecker::new(), &key)
+                super::resolve_backend_target(&proxy, &snapshot, &HealthChecker::new(), &key, None)
                     .expect("target selected");
             assert_eq!(port, 5353);
             hosts.insert(host);
@@ -8645,9 +10152,14 @@ listen_port: 5300
         let cache = LoadBalancerCache::new(&config);
         let snapshot = cache.load();
 
-        let err =
-            super::resolve_backend_target(&proxy, &snapshot, &HealthChecker::new(), "192.0.2.10")
-                .expect_err("per-port LEAST_CONN must be rejected explicitly");
+        let err = super::resolve_backend_target(
+            &proxy,
+            &snapshot,
+            &HealthChecker::new(),
+            "192.0.2.10",
+            None,
+        )
+        .expect_err("per-port LEAST_CONN must be rejected explicitly");
         let setup = find_stream_setup_error(&err).expect("typed stream setup error");
 
         assert_eq!(setup.kind, StreamSetupKind::UnsupportedStreamPolicy);
@@ -8690,9 +10202,14 @@ listen_port: 5300
         let cache = LoadBalancerCache::new(&config);
         let snapshot = cache.load();
 
-        let err =
-            super::resolve_backend_target(&proxy, &snapshot, &HealthChecker::new(), "192.0.2.10")
-                .expect_err("per-port LEAST_LATENCY must be rejected explicitly");
+        let err = super::resolve_backend_target(
+            &proxy,
+            &snapshot,
+            &HealthChecker::new(),
+            "192.0.2.10",
+            None,
+        )
+        .expect_err("per-port LEAST_LATENCY must be rejected explicitly");
         let setup = find_stream_setup_error(&err).expect("typed stream setup error");
 
         assert_eq!(setup.kind, StreamSetupKind::UnsupportedStreamPolicy);
@@ -8738,9 +10255,14 @@ listen_port: 5300
         let cache = LoadBalancerCache::new(&config);
         let snapshot = cache.load();
 
-        let err =
-            super::resolve_backend_target(&proxy, &snapshot, &HealthChecker::new(), "192.0.2.10")
-                .expect_err("stream hash_on cookie must be rejected explicitly");
+        let err = super::resolve_backend_target(
+            &proxy,
+            &snapshot,
+            &HealthChecker::new(),
+            "192.0.2.10",
+            None,
+        )
+        .expect_err("stream hash_on cookie must be rejected explicitly");
         let setup = find_stream_setup_error(&err).expect("typed stream setup error");
 
         assert_eq!(setup.kind, StreamSetupKind::UnsupportedStreamPolicy);
@@ -8784,9 +10306,14 @@ listen_port: 5300
         let cache = LoadBalancerCache::new(&config);
         let snapshot = cache.load();
 
-        let err =
-            super::resolve_backend_target(&proxy, &snapshot, &HealthChecker::new(), "192.0.2.10")
-                .expect_err("inherited stream hash_on header must be rejected explicitly");
+        let err = super::resolve_backend_target(
+            &proxy,
+            &snapshot,
+            &HealthChecker::new(),
+            "192.0.2.10",
+            None,
+        )
+        .expect_err("inherited stream hash_on header must be rejected explicitly");
         let setup = find_stream_setup_error(&err).expect("typed stream setup error");
 
         assert_eq!(setup.kind, StreamSetupKind::UnsupportedStreamPolicy);

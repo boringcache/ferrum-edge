@@ -238,6 +238,11 @@ impl NodeWaypointIdentity {
 /// a mix of a new gate with an old/missing scope.
 #[derive(Default)]
 struct NodeWaypointSlice {
+    /// Monotonic publication generation. UDP/DTLS sessions pin this value at
+    /// admission so any later accepted mesh slice (including a policy-only
+    /// change with identical workloads) terminates the old authorization
+    /// lifetime before another datagram or reply is forwarded.
+    generation: u64,
     identities_by_hash: std::collections::HashMap<u64, NodeWaypointIdentityGateEntry>,
     /// Pod UID -> SPIFFE identity for captured pods in this slice generation.
     /// Used only by pod-specific in-netns listeners whose source pod is already
@@ -420,6 +425,11 @@ pub struct NodeWaypointIdentityResolver {
     /// from the SAME load, so a reader can never see a new gate with an
     /// old/missing scope (the "never partial" reload invariant).
     slice: ArcSwap<NodeWaypointSlice>,
+    /// Allocates the generation embedded in each [`NodeWaypointSlice`]. Kept
+    /// separate from the `ArcSwap` only for allocation; the value consulted by
+    /// readers lives inside the published payload and is therefore coherent
+    /// with its identity/scope maps.
+    next_slice_generation: AtomicU64,
     // Sweep counters below are intentionally NOT `CachePadded` (unlike the
     // accept-path `node_waypoint_*_drops` atomics in `OverloadState`). They
     // are written at most once per sweep tick (default 30s) on a single
@@ -476,6 +486,7 @@ impl NodeWaypointIdentityResolver {
             cookie_fallback: ArcSwapOption::empty(),
             identities_by_pod_uid: DashMap::with_shard_amount(shards),
             slice: ArcSwap::from_pointee(NodeWaypointSlice::default()),
+            next_slice_generation: AtomicU64::new(1),
             cgroup_sweep_path_missing: AtomicU64::new(0),
             cgroup_sweep_inode_changed: AtomicU64::new(0),
             cgroup_sweep_passes: AtomicU64::new(0),
@@ -815,6 +826,51 @@ impl NodeWaypointIdentityResolver {
             .map(Arc::clone)
     }
 
+    /// Resolve a pod's scope only when the same live slice generation still
+    /// binds that pod UID to `expected_spiffe_id`.
+    ///
+    /// UDP/DTLS source attribution begins with the node-agent registry rather
+    /// than an eBPF SPIFFE hash.  Joining on pod UID alone would let a stale
+    /// registry principal survive a slice update that re-attested the same pod
+    /// under a different identity.  This one `ArcSwap` load proves both the
+    /// identity and its scope coherently, matching `resolve_record`'s TCP
+    /// fail-closed boundary without touching the identity cache.
+    pub fn policy_scope_for_pod_identity(
+        &self,
+        pod_uid: &[u8; 16],
+        expected_spiffe_id: &SpiffeId,
+    ) -> Option<Arc<PolicyScopeCache>> {
+        self.policy_scope_observation_for_pod_identity(pod_uid, expected_spiffe_id)
+            .1
+    }
+
+    /// Observe the current coherent policy-scope generation and, when the pod
+    /// identity is still vouched for, its scope from that exact generation.
+    ///
+    /// The generation is returned even on a scope miss. NodeWaypoint UDP/DTLS
+    /// permits an unattributable session only while the admitted plugin
+    /// generation contains no enforcing scoped policy; pinning this value lets
+    /// that session close on the next accepted mesh slice instead of retaining
+    /// the old mesh-wide-only admission forever.
+    pub fn policy_scope_observation_for_pod_identity(
+        &self,
+        pod_uid: &[u8; 16],
+        expected_spiffe_id: &SpiffeId,
+    ) -> (u64, Option<Arc<PolicyScopeCache>>) {
+        let slice = self.slice.load();
+        let generation = slice.generation;
+        if slice.spiffe_for_pod_uid(pod_uid) != Some(expected_spiffe_id) {
+            return (generation, None);
+        }
+        (generation, slice.scope_for(pod_uid))
+    }
+
+    /// Current coherent mesh-slice generation for authorization-lifetime
+    /// fencing. This is a lock-free `ArcSwap` load.
+    pub fn policy_scope_generation(&self) -> u64 {
+        self.slice.load().generation
+    }
+
     /// Install a node-waypoint slice generation derived from a slice's workload
     /// set.
     ///
@@ -877,6 +933,7 @@ impl NodeWaypointIdentityResolver {
         }
         NodeWaypointPolicyScopeSnapshot {
             slice: NodeWaypointSlice {
+                generation: 0,
                 identities_by_hash,
                 spiffe_by_pod_uid,
                 scopes_by_pod_uid,
@@ -890,7 +947,8 @@ impl NodeWaypointIdentityResolver {
     /// (`resolve_record` / `policy_scope_for_pod`) sees a coherent generation —
     /// it can never observe a new gate paired with an old/missing scope, which
     /// is the "never partial" reload invariant this resolver must hold.
-    pub fn install_policy_scope_snapshot(&self, snapshot: NodeWaypointPolicyScopeSnapshot) {
+    pub fn install_policy_scope_snapshot(&self, mut snapshot: NodeWaypointPolicyScopeSnapshot) {
+        snapshot.slice.generation = self.next_slice_generation.fetch_add(1, Ordering::Relaxed);
         self.slice.store(std::sync::Arc::new(snapshot.slice));
     }
 
@@ -2736,6 +2794,7 @@ mod tests {
         insert_identity_gate_entry(&mut identities_by_hash, collision_hash, &spiffe_b);
         resolver.install_policy_scope_snapshot(NodeWaypointPolicyScopeSnapshot {
             slice: NodeWaypointSlice {
+                generation: 0,
                 identities_by_hash,
                 spiffe_by_pod_uid: HashMap::new(),
                 scopes_by_pod_uid: HashMap::new(),
@@ -2797,6 +2856,7 @@ mod tests {
         insert_identity_gate_entry(&mut gate_a, hash, &spiffe_a);
         resolver.install_policy_scope_snapshot(NodeWaypointPolicyScopeSnapshot {
             slice: NodeWaypointSlice {
+                generation: 0,
                 identities_by_hash: gate_a,
                 spiffe_by_pod_uid: HashMap::new(),
                 scopes_by_pod_uid: HashMap::new(),
@@ -2812,6 +2872,7 @@ mod tests {
         insert_identity_gate_entry(&mut gate_b, hash, &spiffe_b);
         resolver.install_policy_scope_snapshot(NodeWaypointPolicyScopeSnapshot {
             slice: NodeWaypointSlice {
+                generation: 0,
                 identities_by_hash: gate_b,
                 spiffe_by_pod_uid: HashMap::new(),
                 scopes_by_pod_uid: HashMap::new(),

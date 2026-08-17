@@ -724,6 +724,7 @@ fn protocol_tag(protocol: AppProtocol) -> &'static str {
         AppProtocol::Tcp => "tcp",
         AppProtocol::Tls => "tls",
         AppProtocol::Udp => "udp",
+        AppProtocol::Dtls => "dtls",
         AppProtocol::Mongo => "mongo",
         AppProtocol::Redis => "redis",
         AppProtocol::Mysql => "mysql",

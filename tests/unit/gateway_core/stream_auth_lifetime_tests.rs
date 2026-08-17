@@ -2921,6 +2921,31 @@ fn every_streaming_h1h2_upload_installs_the_gateway_owned_pump() {
         GRPC_PROXY_SOURCE.contains("UploadSource::for_streaming_upload(body, auth)"),
         "the fully-streamed native-gRPC upload lost its gateway-owned lifecycle"
     );
+    let native_grpc_poll = GRPC_PROXY_SOURCE
+        .split("impl http_body::Body for GrpcBody")
+        .nth(1)
+        .expect("native gRPC body implementation")
+        .split("GrpcBody::Streaming {")
+        .nth(1)
+        .expect("native gRPC streaming poll arm")
+        .split("GrpcBody::Channel {")
+        .next()
+        .expect("bounded native gRPC streaming poll arm");
+    let expiry_check = native_grpc_poll
+        .find("deadline.expired(cx)")
+        .expect("native gRPC authorization deadline check");
+    let bridge_poll = native_grpc_poll
+        .find("incoming.poll_frame(cx)")
+        .expect("native gRPC upload bridge poll");
+    assert!(
+        expiry_check < bridge_poll,
+        "native gRPC must reject authorization expiry before polling a queued pump frame"
+    );
+    assert!(
+        native_grpc_poll[expiry_check..bridge_poll]
+            .contains("return Poll::Ready(Some(Err(deadline.message().into())))"),
+        "native gRPC authorization expiry must fail the backend stream closed"
+    );
     // The adapter deadline and the pump are installed together from one place,
     // so a transport cannot get one without the other.
     let installer = PROXY_SOURCE
