@@ -62,16 +62,19 @@ sanitizer build in both lanes. That build, not the fuzzing, was the cost: the
 `Fuzz Smoke` job averaged ~47 minutes on pull requests, of which ~39 minutes was
 compiling the instrumented targets for ~48 seconds of fuzzing. The `Fuzz Smoke`
 job now uses the repository's checksum-pinned `setup-sccache` action and
-persists its bounded local cache directory through `Swatinem/rust-cache`. That
-cache is written only by pushes to `main` (`save-if`), so no untrusted ref can
-populate what the sanitizer build later restores, and the credential-bearing
-sccache GHA backend is never enabled. Every run logs `Fuzz property smoke
-seconds`, the lane shape it took, a closing `sccache --show-stats`, and the
-on-disk cache size; runs that execute the sanitizer budget add a second
-`--show-stats` just before it plus `Fuzz sanitizer lane seconds`, so the log
-shows directly whether the sanitizer build reused compilation. When sccache is
-unavailable the job emits a warning annotation rather than letting caching fail
-silently.
+persists its bounded local cache directory through `Swatinem/rust-cache`.
+`save-if` is strictly `${{ github.event_name == 'push' && github.ref ==
+'refs/heads/main' }}`: pull requests (including same-repository PR refs and
+forks), `merge_group`, and `workflow_dispatch` never publish a `fuzz-smoke`
+cache. The retired generation had no `save-if`, which is how a predecessor PR
+could still mint a PR-ref Fuzz cache; the adopted job cannot create another.
+The credential-bearing sccache GHA backend is never enabled. Every run logs
+`Fuzz property smoke seconds`, the lane shape it took, a closing
+`sccache --show-stats`, and the on-disk cache size; runs that execute the
+sanitizer budget add a second `--show-stats` just before it plus `Fuzz
+sanitizer lane seconds`, so the log shows directly whether the sanitizer build
+reused compilation. When sccache is unavailable the job emits a warning
+annotation rather than letting caching fail silently.
 
 Both hosted shapes are byte-frozen by the trusted Cross build policy. The
 `fuzz-smoke` job is admitted as two generations with a one-way transition

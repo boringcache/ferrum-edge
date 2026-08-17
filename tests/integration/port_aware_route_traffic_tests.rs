@@ -437,8 +437,15 @@ async fn gateway_listener_ports_follow_config_reload_add_and_withdraw() {
     wait_for_listener_ports(&handles, &[listener_b_port]).await;
 
     // Routing is withdrawn by the config swap itself, so even if the socket
-    // is still draining it can only answer 404 — never stale-route.
-    if let Ok((status, _)) = try_http_get(listener_a_port, "/api/x").await {
+    // is still draining it can never stale-route. Three outcomes are all
+    // fail-closed: the connect is refused outright (`Err`), the teardown
+    // accepts and closes without writing a response (`status == 0` with an
+    // empty body — `try_http_get` maps a clean empty close to 0), or the
+    // still-draining socket serves the routed 404. Only a routed 200 would
+    // violate the invariant.
+    if let Ok((status, body)) = try_http_get(listener_a_port, "/api/x").await
+        && !(status == 0 && body.is_empty())
+    {
         assert_eq!(
             status, 404,
             "a withdrawn listener must fail closed while its socket drains"

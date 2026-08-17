@@ -81,6 +81,7 @@ Pull Request / Merge Queue group
             └─► Full CI
                     ├─► Format + integration-shard coverage (in CI plan)
                     ├─► Unit+inline-lib / integration-shard / functional-shard tests
+                    ├─► Planner-gated Secret Backends / PKCS#11 SoftHSM jobs
                     ├─► Lint, dependency audit, vendored regressions
                     ├─► Fuzz smoke (property budgets on PRs; the six-target
                     │   libFuzzer budget on merge_group / push to main / manual)
@@ -440,7 +441,14 @@ deliberately triggers a live datapath suite (including the mesh, SPIRE,
 configuration, NodeWaypoint, and CI contract/runbook files) remains full mode.
 The planner runs `git diff --check` for PR/merge-group diff hygiene and disables
 rename detection when classifying paths, so both the source and destination of a
-rename are checked. The same `--no-renames` fail-closed classification applies
+rename are checked. `CI Plan` collects those paths as a NUL-delimited
+`git diff --name-only --no-renames -z` stream (no newline `sort`) and parses
+bytes fail-closed: a nonempty stream must be complete NUL-terminated UTF-8, and
+every path must be a repository-relative `[A-Za-z0-9._+@~ /-]` name with no
+absolute/dot/dotdot/empty components, C0/DEL, backslash, backtick, or other
+unclassifiable punctuation. Malformed or hostile names select full mode, force
+every job gate on, and are omitted from the step summary rather than
+interpolated into Markdown. The same `--no-renames` fail-closed classification applies
 to `coverage.yml` coverage planning, `gateway-api-conformance.yml` relevance
 filtering, and the `performance-regression` path classifier on both
 `pull_request` and `merge_group` diffs. Merge-group planning diffs
@@ -454,14 +462,36 @@ edit cannot classify itself as light; edits to the planner therefore receive
 the full matrix. The required-CI verifier also checks that documentation paths
 used by live-suite filters remain in the planner's full-CI set.
 
+`paths_classifiable` is a trust/transport version handshake between `CI Plan`
+and the planner. Pull requests and merge groups execute the trusted-base
+planner, so the change that introduces NUL transport still runs the older
+newline-only planner that does not emit this flag. That older planner can treat
+a NUL-delimited stream as one record and still print syntactically valid
+`false` values for pre-existing Helm, mesh, and eBPF gates. Unless
+`paths_classifiable` is exactly `true`, the controller force-runs every job
+gate before writing `$GITHUB_OUTPUT`, even when those values look like valid
+booleans. Narrow `true`/`false` gate values are honored only after the new
+planner proves the NUL stream classifiable. Missing or invalid individual
+outputs still fail closed to `true`. Unclassifiable and pre-handshake summaries
+use the canned reason and never interpolate hostile paths.
+
 The same trusted planner emits fail-closed job outputs for Helm, the legacy
 multicluster deployment smoke, the sidecar deployment smoke, eBPF program
-builds, and eBPF/netns live suites. The deploy-only multicluster job remains a
+builds, eBPF/netns live suites, Secret Backends (`run_secrets_backends`), and
+PKCS#11 SoftHSM (`run_pkcs11`). The deploy-only multicluster job remains a
 distinct packaging-and-rollout check; authoritative datapath coverage rides the
 dedicated `multicluster-federation-live.yml` workflow (path-filtered on PRs,
 force-run on every `main` push). PRs outside those curated path sets skip the
-downstream job before GitHub allocates a runner. Pushes to `main` and manual
-runs force all of these gates on. Rust formatting and the integration-shard
+downstream job before GitHub allocates a runner. Pushes to `main`, manual
+`workflow_dispatch` runs (the Secret Backends and PKCS#11 SoftHSM jobs use the
+same event guard as the other path-gated mesh/Helm/eBPF jobs), empty or
+unavailable diffs, unclassifiable/unsafe changed paths, a missing or non-`true`
+`paths_classifiable` handshake from an old trusted-base planner, and edits to
+the gate-controller scripts force all of these gates on. Shared compile-graph
+inputs (`Cargo.toml`/`Cargo.lock`, `vendor/`, `build.rs`, `proto/`,
+`rust-toolchain.toml`, `.cargo/`, `.github/workflows/ci.yml`, and the
+`setup-rust-ci` / `setup-sccache` / `setup-fast-linker` actions) also schedule
+the Secret Backends and PKCS#11 jobs. Rust formatting and the integration-shard
 coverage contract also run as named steps in `CI Plan`, avoiding two additional
 runner allocations.
 
@@ -580,8 +610,11 @@ prove each rejection dimension) in the `Tests` aggregate.
 
 In full mode, the `Tests` aggregate waits for the planner/format checks, test
 shards, lint, dependency audit, vendored patch regressions,
-planner-gated mesh/Helm gates, eBPF/netns gates, performance, and the
-cross-platform build matrix. In light mode it requires the planner to succeed
+planner-gated Secret Backends / PKCS#11 / mesh / Helm gates, eBPF/netns gates,
+performance, and the cross-platform build matrix. When the planner marks
+`run_secrets_backends` or `run_pkcs11` false, the aggregate accepts a skipped
+Secret Backends or PKCS#11 job; when the planner marks either true, that job
+must succeed. In light mode it requires the planner to succeed
 and accepts the planned heavy jobs as skipped. Pushes to `main` publish the
 `latest` prerelease and Docker images only after the full aggregate and build
 matrix pass.
@@ -723,9 +756,21 @@ phases.
 - Unit tests in `tests/unit_tests.rs`
 - Inline `#[cfg(test)]` modules in `src/`
 - Secret backend tests compile once with Vault/AWS/GCP/Azure enabled and use
-  nextest `--no-fail-fast`; service integration likewise runs Consul, LDAP,
-  Kafka, MySQL, OIDC, and OAuth2 introspection in one independently reported
-  invocation.
+  nextest `--no-fail-fast`. The planner schedules this job (`run_secrets_backends`)
+  only when secret-provider sources, `tests/secrets_functional/`, secret-resolution
+  startup wiring (`src/main.rs`, `src/config/env_config.rs`), the feature-gated
+  TLS secret-source resolver, nextest config, or shared compile-graph/controller
+  inputs change; plugin-only and admin-only PRs skip it before runner allocation.
+  Manual `workflow_dispatch` runs, pushes to
+  `main`, and fail-closed planner cases still run it. Service integration
+  likewise runs Consul, LDAP, Kafka, MySQL, OIDC, and OAuth2 introspection in
+  one independently reported invocation.
+- PKCS#11 SoftHSM smoke (`run_pkcs11`) compiles the `pkcs11` feature graph and
+  runs the token signer plus certificate-pairing tests against SoftHSM. The
+  planner schedules it for `src/tls/pkcs11.rs`, the TLS load/backend/source/reload
+  paths those tests call, the feature-gated config and TLS inventory surfaces,
+  `tests/unit/tls` PKCS modules, and the same shared compile-graph inputs;
+  sibling ACME/FIPS TLS unit files do not schedule it.
 - Integration tests split across two shards (`admin-platform`,
   `mesh-protocols`). Each shard runs the prebuilt `integration_tests` nextest
   archive with a visible list of `integration::<file_module>` positional
@@ -1859,11 +1904,12 @@ therefore lists the job's admitted texts oldest first:
     decision — while `RUSTFLAGS: ""` stays, because the root Cargo
     configuration still selects a mold linker this lane does not install;
   - the sccache directory is persisted by the pinned `Swatinem/rust-cache` step
-    under `save-if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}`.
-    GitHub already scopes a pull request's cache writes to its own ref; writing
-    nothing at all from an untrusted ref is the stronger statement, and it keeps
-    every compiler artifact the sanitizer build restores attributable to code
-    that already merged;
+    under `save-if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}`
+    and nothing else. That predicate is the cache-quota control: `pull_request`
+    (same-repository PR refs and forks), `merge_group`, and `workflow_dispatch`
+    may restore a `fuzz-smoke` cache but cannot publish one. The retired
+    generation had no `save-if`, so a full-mode predecessor PR could still mint
+    a PR-ref `fuzz-smoke` entry; the adopted job cannot create another;
   - telemetry: the job prints `Fuzz property smoke seconds`, `Fuzz sanitizer
     lane seconds`, sccache statistics before and after the sanitizer build, the
     lane shape it took, and the on-disk cache size — so a hosted log shows
