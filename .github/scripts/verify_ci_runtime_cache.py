@@ -1223,7 +1223,8 @@ def check_fips_producer_channel(
         failures,
     )
     require(
-        workflow.count(
+        workflow.count('[-]*|d*) ;;') >= 4
+        and workflow.count(
             'fail "producer handoff archive contains a non-file member"'
         ) >= 4,
         "FIPS consumer promotion must reject symlink and special tar members",
