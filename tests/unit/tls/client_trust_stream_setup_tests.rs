@@ -38,7 +38,6 @@ use std::task::{Context, Poll};
 use std::time::Duration;
 
 use async_trait::async_trait;
-use ferrum_edge::{BackendScheme, ConsumerIndex};
 use ferrum_edge::_test_support::{
     PrefixForwardRejectForTest, StreamSetupInterruptForTest,
     stream_ctx_hold_admission_permit_for_test, tcp_forward_prefix_under_trust_fence_for_test,
@@ -52,6 +51,7 @@ use ferrum_edge::proxy::auth_lifetime::{StreamAuthDeadline, StreamAuthTerminatio
 use ferrum_edge::proxy::stream_error::{StreamSetupKind, find_stream_setup_error};
 use ferrum_edge::tls::ClientTrustSessionGuard;
 use ferrum_edge::tls::client_trust::{self, ClientTrustMaterial, ClientTrustScope};
+use ferrum_edge::{BackendScheme, ConsumerIndex};
 use tokio::io::AsyncReadExt;
 use tokio::net::{TcpListener, TcpStream};
 
@@ -410,7 +410,9 @@ async fn an_elapsed_credential_alone_still_ends_the_prefix_forward_as_an_expiry(
         tcp_forward_prefix_within_setup_bounds_for_test(plan, Some(session), writer, PREFIX).await;
 
     assert_eq!(
-        outcome.err().expect("an elapsed credential forwards nothing"),
+        outcome
+            .err()
+            .expect("an elapsed credential forwards nothing"),
         StreamSetupInterruptForTest::AuthorizationExpired(
             StreamAuthTermination::AuthenticatedStreamMaxLifetime
         )
