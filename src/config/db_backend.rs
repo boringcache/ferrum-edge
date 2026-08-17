@@ -2219,6 +2219,22 @@ pub trait DatabaseBackend: NamespaceConfigAdmissionLeaseBackend + Send + Sync {
         let _ = namespace;
     }
 
+    /// Whether this backend deployment can commit a namespace registry
+    /// mutation all-or-nothing right now.
+    ///
+    /// Admin handlers must consult this before acquiring admission leases so
+    /// an unsupported deployment is refused without touching even the guard
+    /// documents. Backends whose capability depends on live topology must
+    /// re-check inside [`DatabaseBackend::create_namespace`],
+    /// [`DatabaseBackend::update_namespace`], and
+    /// [`DatabaseBackend::delete_namespace`] so a reconnect between preflight
+    /// and persistence cannot open a partial-commit window.
+    fn ensure_namespace_registry_atomicity_supported(
+        &self,
+    ) -> Result<(), crate::config::namespace_registry::NamespaceRegistryAtomicityUnsupported> {
+        Ok(())
+    }
+
     /// Insert a registry row, all-or-nothing, re-verifying every `leases` entry
     /// inside the committing transaction.
     ///

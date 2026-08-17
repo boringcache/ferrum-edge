@@ -27,6 +27,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::sync::oneshot;
 
 const OWNER: &str = "test-owner-uuid";
+const ADMIN_SOURCE: &str = include_str!("../../../src/admin/mod.rs");
 const MONGO_STORE_SOURCE: &str = include_str!("../../../src/config/mongo_store.rs");
 const MONGODB_DOC: &str = include_str!("../../../docs/mongodb.md");
 // Fixed client-clock instant so the builders are deterministic (no DateTime::now).
@@ -1455,6 +1456,13 @@ fn gateway_trust_bundle_identity_parses_id_and_trust_domain_strictly() {
 /// other MongoDB shape contracts in this file use.
 #[test]
 fn namespace_registry_mutations_are_transactional_and_refuse_standalone() {
+    let preflight = mongo_fn_body("        fn ensure_namespace_registry_atomicity_supported(");
+    assert!(
+        preflight.contains("self.replica_set_configured()")
+            && preflight.contains("namespace_registry_standalone_refusal()"),
+        "the namespace registry capability preflight must refuse standalone MongoDB:\n{preflight}"
+    );
+
     for (entry, in_session) in [
         ("create_namespace(", "create_namespace_in_session("),
         ("update_namespace(", "update_namespace_in_session("),
@@ -1478,6 +1486,38 @@ fn namespace_registry_mutations_are_transactional_and_refuse_standalone() {
         assert!(
             session_body.contains("verify_namespace_registry_leases_in_session"),
             "{in_session} must re-verify the admission leases before commit:\n{session_body}"
+        );
+    }
+}
+
+/// The public 501 promise includes admission-lock collections: an unsupported
+/// standalone deployment must be refused before the handler acquires a global,
+/// source, or target namespace lease. The backend mutation still re-checks
+/// topology to close the reconnect race after this preflight.
+#[test]
+fn namespace_registry_handlers_refuse_before_admission_mutation() {
+    for (handler, next_handler) in [
+        ("handle_create_namespace(", "handle_update_namespace("),
+        ("handle_update_namespace(", "handle_delete_namespace("),
+        ("handle_delete_namespace(", "handle_list_audit_logs("),
+    ] {
+        let start = ADMIN_SOURCE
+            .find(&format!("async fn {handler}"))
+            .unwrap_or_else(|| panic!("missing handler {handler}"));
+        let end = ADMIN_SOURCE[start..]
+            .find(&format!("\nasync fn {next_handler}"))
+            .map(|offset| start + offset)
+            .unwrap_or(ADMIN_SOURCE.len());
+        let body = &ADMIN_SOURCE[start..end];
+        let capability = body
+            .find("db.ensure_namespace_registry_atomicity_supported()")
+            .unwrap_or_else(|| panic!("{handler} is missing the capability preflight"));
+        let admission = body
+            .find("acquire_namespace_registry_admission(")
+            .unwrap_or_else(|| panic!("{handler} is missing namespace admission"));
+        assert!(
+            capability < admission,
+            "{handler} must return 501 before touching admission-lock documents:\n{body}"
         );
     }
 }

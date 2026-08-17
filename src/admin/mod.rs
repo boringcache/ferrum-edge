@@ -9123,6 +9123,18 @@ fn synthesized_namespace_record(name: &str) -> crate::config::namespace_registry
     crate::config::namespace_registry::NamespaceRecord::new(name.to_string(), None, Utc::now())
 }
 
+fn namespace_registry_atomicity_unsupported_response(
+    unsupported: &crate::config::namespace_registry::NamespaceRegistryAtomicityUnsupported,
+) -> Response<Full<Bytes>> {
+    json_response(
+        StatusCode::NOT_IMPLEMENTED,
+        &json!({
+            "error": crate::config::namespace_registry::NAMESPACE_REGISTRY_ATOMICITY_UNSUPPORTED_MESSAGE,
+            "detail": unsupported.detail(),
+        }),
+    )
+}
+
 /// Map a failed namespace registry mutation onto a documented status.
 ///
 /// Every path here is fail-closed: nothing from the request is durable unless
@@ -9158,15 +9170,7 @@ fn map_namespace_registry_error(error: &anyhow::Error) -> Response<Full<Bytes>> 
     if let Some(unsupported) =
         crate::config::namespace_registry::namespace_registry_atomicity_unsupported(error)
     {
-        let message =
-            crate::config::namespace_registry::NAMESPACE_REGISTRY_ATOMICITY_UNSUPPORTED_MESSAGE;
-        return json_response(
-            StatusCode::NOT_IMPLEMENTED,
-            &json!({
-                "error": message,
-                "detail": unsupported.detail(),
-            }),
-        );
+        return namespace_registry_atomicity_unsupported_response(unsupported);
     }
     if is_mtls_dns_admission_unavailable(error) {
         return mtls_dns_admission_unavailable_response();
@@ -9423,6 +9427,11 @@ async fn handle_create_namespace(
         Ok(db) => db.clone(),
         Err(resp) => return Ok(*resp),
     };
+    if let Err(unsupported) = db.ensure_namespace_registry_atomicity_supported() {
+        return Ok(namespace_registry_atomicity_unsupported_response(
+            &unsupported,
+        ));
+    }
     let admission =
         match acquire_namespace_registry_admission(db.clone(), &[request.name.as_str()]).await {
             Ok(admission) => admission,
@@ -9517,6 +9526,11 @@ async fn handle_update_namespace(
         Ok(db) => db.clone(),
         Err(resp) => return Ok(*resp),
     };
+    if let Err(unsupported) = db.ensure_namespace_registry_atomicity_supported() {
+        return Ok(namespace_registry_atomicity_unsupported_response(
+            &unsupported,
+        ));
+    }
 
     // A rename is semantically a removal of the old name, so the namespace this
     // gateway is configured to serve is protected from it. Checked again inside
@@ -9600,6 +9614,11 @@ async fn handle_delete_namespace(
         Ok(db) => db.clone(),
         Err(resp) => return Ok(*resp),
     };
+    if let Err(unsupported) = db.ensure_namespace_registry_atomicity_supported() {
+        return Ok(namespace_registry_atomicity_unsupported_response(
+            &unsupported,
+        ));
+    }
     // The effective configured namespace of this process — resolved once at
     // startup through EnvConfig, never re-read from the environment here.
     // Re-checked inside the backend transaction; this precheck only avoids

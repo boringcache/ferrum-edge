@@ -12519,6 +12519,16 @@ mod inner {
             };
         }
 
+        fn ensure_namespace_registry_atomicity_supported(
+            &self,
+        ) -> Result<(), NamespaceRegistryAtomicityUnsupported> {
+            if self.replica_set_configured() {
+                Ok(())
+            } else {
+                Err(Self::namespace_registry_standalone_refusal())
+            }
+        }
+
         async fn create_namespace(
             &self,
             record: &crate::config::namespace_registry::NamespaceRecord,
