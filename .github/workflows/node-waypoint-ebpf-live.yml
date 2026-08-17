@@ -2,39 +2,34 @@ name: NodeWaypoint eBPF Live Datapath
 
 on:
   workflow_dispatch:
+    inputs:
+      force_cold_cache:
+        description: Skip BuildKit cache restore to prove cold-path image contracts
+        type: boolean
+        default: false
   pull_request:
     paths:
       - ".github/workflows/node-waypoint-ebpf-live.yml"
       - ".dockerignore"
       - ".github/actions/package-ferrum-runtime-image/**"
       - ".github/actions/setup-kubernetes-tools/**"
+      - ".cargo/**"
       - "Cargo.toml"
       - "Cargo.lock"
       - "Dockerfile"
       - "Dockerfile.iproute2-layer"
       - "Dockerfile.release"
       - ".github/scripts/stage_iproute2_runtime.sh"
+      - ".github/scripts/ci_runtime_plan.py"
+      - ".github/scripts/ci_runtime_telemetry.py"
+      - ".github/scripts/verify_ci_runtime_cache.py"
       - "build.rs"
+      - "rust-toolchain.toml"
       - "proto/**"
+      - "vendor/**"
+      - "src/**"
+      - "custom_plugins/**"
       - "ebpf/**"
-      - "src/capture/**"
-      - "src/ebpf/**"
-      - "src/grpc/**"
-      - "src/identity/**"
-      - "src/k8s_controller/**"
-      - "src/modes/control_plane.rs"
-      - "src/modes/mesh/**"
-      - "src/modes/node_agent.rs"
-      - "src/plugins/mesh/**"
-      - "src/plugins/prometheus_metrics.rs"
-      - "src/proxy/hbone_pool.rs"
-      - "src/proxy/mesh_tcp_egress.rs"
-      - "src/proxy/mod.rs"
-      - "src/proxy/hbone_proxy.rs"
-      - "src/proxy/netns_capture.rs"
-      - "src/proxy/tcp_proxy.rs"
-      - "src/router_cache.rs"
-      - "src/socket_opts.rs"
       - "charts/ferrum-mesh/**"
       - "tests/k8s/lib/**"
       - "tests/k8s/node_waypoint_ebpf_live/**"
@@ -59,37 +54,527 @@ env:
   # Commit behind the signed Istio 1.24.3 release tag.
   ISTIO_COMMIT_SHA: 44d0e58e49d0dc89e27fc4f8679c68132d46b887
   ISTIO_CRD_SHA256: 952afcf4b1bf47d2bdf1f230d636f9e613c3ee9cc68ef53ab751f6d59e2ee205
+  FERRUM_CI_FORCE_COLD_CACHE: ${{ github.event.inputs.force_cold_cache == 'true' }}
 
 jobs:
-  production-dockerfile-smoke:
-    name: Production Dockerfile eBPF image smoke
+  production-dockerfile-plan:
+    name: Production Dockerfile smoke trigger
+    runs-on: ubuntu-latest
+    outputs:
+      relevant: ${{ steps.filter.outputs.relevant }}
+      node_waypoint_relevant: ${{ steps.filter.outputs.node_waypoint_relevant }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Check for production Dockerfile smoke changes
+        id: filter
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          BASE_REF: ${{ github.base_ref }}
+          MERGE_BASE_SHA: ${{ github.event.merge_group.base_sha }}
+        run: |
+          set -euo pipefail
+
+          filter_path=.github/scripts/ci_runtime_plan.py
+          changed_files="$RUNNER_TEMP/production-dockerfile-smoke-changed-files.txt"
+          trusted_filter="$RUNNER_TEMP/production-dockerfile-smoke-trusted-filter.py"
+          rm -f -- "$changed_files" "$trusted_filter"
+          : > "$changed_files"
+
+          filter_args=(--changed-files "$changed_files")
+
+          if [ "$EVENT_NAME" = "pull_request" ]; then
+            if ! printf '%s' "$BASE_REF" | grep -Eq '^[A-Za-z0-9][A-Za-z0-9._/-]{0,200}$'; then
+              echo "::error::refusing to resolve an unsafe base ref" >&2
+              exit 1
+            fi
+            case "$BASE_REF" in
+              *..*|*//*|*/|*.lock|*/.*)
+                echo "::error::refusing to resolve an unsafe base ref" >&2
+                exit 1
+                ;;
+            esac
+            fetched=false
+            for attempt in 1 2 3; do
+              if git fetch --no-tags --no-recurse-submodules origin \
+                "+refs/heads/${BASE_REF}:refs/ferrum/trusted-base"; then
+                fetched=true
+                break
+              fi
+              echo "git fetch of ${BASE_REF} failed (attempt ${attempt}/3); retrying" >&2
+              sleep $(( attempt * 10 ))
+            done
+            if [ "$fetched" != true ]; then
+              echo "::error::git fetch of ${BASE_REF} failed after 3 attempts" >&2
+              exit 1
+            fi
+            trusted_sha="$(git rev-parse --verify --quiet refs/ferrum/trusted-base^{commit} || true)"
+          elif [ "$EVENT_NAME" = "merge_group" ]; then
+            if ! printf '%s' "$MERGE_BASE_SHA" | grep -Eq '^[0-9a-f]{40}$'; then
+              echo "::error::merge_group base_sha missing or malformed" >&2
+              exit 1
+            fi
+            if ! git cat-file -e "${MERGE_BASE_SHA}^{commit}" 2>/dev/null; then
+              fetched=false
+              for attempt in 1 2 3; do
+                if git fetch --no-tags --no-recurse-submodules origin \
+                  "${MERGE_BASE_SHA}"; then
+                  fetched=true
+                  break
+                fi
+                echo "git fetch of merge_group base failed (attempt ${attempt}/3); retrying" >&2
+                sleep $(( attempt * 10 ))
+              done
+              if [ "$fetched" != true ]; then
+                echo "::error::git fetch of merge_group base_sha failed after 3 attempts" >&2
+                exit 1
+              fi
+            fi
+            trusted_sha="$MERGE_BASE_SHA"
+          else
+            trusted_sha="$(git rev-parse --verify --quiet 'HEAD^{commit}' || true)"
+            filter_args+=(--force-run)
+          fi
+
+          if ! printf '%s' "$trusted_sha" | grep -Eq '^[0-9a-f]{40}$'; then
+            echo "::error::trusted base did not resolve to a full commit id" >&2
+            exit 1
+          fi
+
+          if ! git cat-file -e "${trusted_sha}:${filter_path}" 2>/dev/null; then
+            echo "relevant=true" >> "$GITHUB_OUTPUT"
+            echo "node_waypoint_relevant=true" >> "$GITHUB_OUTPUT"
+            echo "trusted base has not adopted ${filter_path}; running the full gate." >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+
+          entry="$(git ls-tree --full-tree "$trusted_sha" -- "$filter_path")"
+          if [ "$(printf '%s\n' "$entry" | grep -c . || true)" != "1" ]; then
+            echo "::error::${filter_path} is not a single tree entry at ${trusted_sha}" >&2
+            exit 1
+          fi
+          entry_mode="$(printf '%s\n' "$entry" | awk '{print $1}')"
+          entry_type="$(printf '%s\n' "$entry" | awk '{print $2}')"
+          entry_object="$(printf '%s\n' "$entry" | awk '{print $3}')"
+          entry_path="$(printf '%s\n' "$entry" | awk -F'\t' '{print $2}')"
+          if [ "$entry_type" != "blob" ] || [ "$entry_path" != "$filter_path" ]; then
+            echo "::error::${filter_path} is not a blob at ${trusted_sha}" >&2
+            exit 1
+          fi
+          case "$entry_mode" in
+            100644|100755) ;;
+            *)
+              echo "::error::${filter_path} has non-regular mode ${entry_mode}" >&2
+              exit 1
+              ;;
+          esac
+          if ! printf '%s' "$entry_object" | grep -Eq '^[0-9a-f]{40}$'; then
+            echo "::error::${filter_path} did not resolve to an object id" >&2
+            exit 1
+          fi
+          if [ "$(git cat-file -s "$entry_object")" -gt 262144 ]; then
+            echo "::error::${filter_path} exceeds the 256 KiB trusted-filter ceiling" >&2
+            exit 1
+          fi
+          git cat-file blob "$entry_object" > "$trusted_filter"
+
+          if [ "$EVENT_NAME" = "pull_request" ] || [ "$EVENT_NAME" = "merge_group" ]; then
+            git diff --name-only --no-renames -z "${trusted_sha}...HEAD" \
+              > "$changed_files"
+          fi
+
+          python3 -I "$trusted_filter" --self-test
+
+          emit_suite_verdict() {
+            local suite="$1"
+            local output_key="$2"
+            local plan relevant
+            plan="$(python3 -I "$trusted_filter" --suite "$suite" "${filter_args[@]}")"
+            relevant="$(printf '%s\n' "$plan" | sed -n 's/^relevant=//p')"
+            case "$relevant" in
+              true|false) ;;
+              *)
+                echo "::error::trusted ${suite} relevance filter produced no usable verdict" >&2
+                exit 1
+                ;;
+            esac
+            echo "${output_key}=$relevant" >> "$GITHUB_OUTPUT"
+            echo "Relevance (${suite}) decided by trusted base ${trusted_sha}." >> "$GITHUB_STEP_SUMMARY"
+            printf '%s\n' "$plan" | sed -n '/^## /,$p' >> "$GITHUB_STEP_SUMMARY"
+          }
+
+          emit_suite_verdict production-dockerfile-smoke relevant
+          emit_suite_verdict node-waypoint-ebpf-live node_waypoint_relevant
+
+  production-dockerfile-smoke-default:
+    name: Production Dockerfile default image
+    needs: production-dockerfile-plan
+    if: needs.production-dockerfile-plan.outputs.relevant == 'true'
     runs-on: ubuntu-24.04
     timeout-minutes: 90
-
     steps:
       - name: Checkout Ferrum Edge
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
+        with:
+          persist-credentials: false
 
-      - name: Build ordinary and eBPF production targets
+      - name: Initialize runtime telemetry
+        run: python3 .github/scripts/ci_runtime_telemetry.py init --quiet
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4
+
+      - name: Time cache restore
+        if: github.event.inputs.force_cold_cache != 'true'
+        run: python3 .github/scripts/ci_runtime_telemetry.py start --phase cache-restore
+
+      - name: Restore BuildKit local cache
+        if: github.event.inputs.force_cold_cache != 'true'
+        id: buildkit-cache
+        uses: actions/cache/restore@374a27f26986edd8c430f386d152a856e179c0ae # v4.2.4
+        with:
+          path: ${{ runner.temp }}/production-dockerfile-smoke-default
+          key: production-dockerfile-smoke-default-v1-${{ runner.os }}-${{ runner.arch }}-${{ github.sha }}
+          restore-keys: |
+            production-dockerfile-smoke-default-v1-${{ runner.os }}-${{ runner.arch }}-
+
+      - name: Classify BuildKit cache restore
+        if: github.event.inputs.force_cold_cache != 'true'
+        id: cache-kind
+        env:
+          CACHE_HIT: ${{ steps.buildkit-cache.outputs.cache-hit }}
+          CACHE_MATCHED: ${{ steps.buildkit-cache.outputs.cache-matched-key }}
+          CACHE_PRIMARY: ${{ steps.buildkit-cache.outputs.cache-primary-key }}
+          FORK_PR: ${{ github.event.pull_request.head.repo.fork }}
+          CACHE_DIR: ${{ runner.temp }}/production-dockerfile-smoke-default
         run: |
           set -euo pipefail
-          docker build \
-            --tag ferrum-edge:production-default-smoke \
-            --file Dockerfile \
-            .
-          docker build \
-            --target runtime-ebpf \
-            --build-arg FEATURES=cloud-secrets,ebpf \
-            --tag ferrum-edge:production-ebpf-smoke \
-            --file Dockerfile \
-            .
+          if [ "${FORK_PR:-}" = true ]; then
+            policy=fork-restore-only
+          else
+            policy=trusted-publish
+          fi
+          python3 .github/scripts/ci_runtime_telemetry.py classify-restore \
+            --name buildkit-local \
+            --hit "${CACHE_HIT}" \
+            --matched "${CACHE_MATCHED}" \
+            --primary "${CACHE_PRIMARY}" \
+            --path "$CACHE_DIR" \
+            --note "scope=production-dockerfile-smoke-default policy=${policy}"
 
-      - name: Verify distroless runtime contracts
+      - name: Finish cache restore timer
+        if: always() && github.event.inputs.force_cold_cache != 'true'
+        run: python3 .github/scripts/ci_runtime_telemetry.py end --phase cache-restore --status ${{ job.status == 'success' && '0' || '1' }}
+
+      - name: Record cold-cache proof
+        if: github.event.inputs.force_cold_cache == 'true'
+        run: |
+          python3 .github/scripts/ci_runtime_telemetry.py cache \
+            --name buildkit-local \
+            --hit false \
+            --bytes 0 \
+            --note "scope=production-dockerfile-smoke-default policy=force-cold skipped restore and save"
+
+      - name: Time image build
+        run: python3 .github/scripts/ci_runtime_telemetry.py start --phase image-build
+
+      # Trusted exact github.sha hits restore cache-from and must not
+      # export or save. Trusted partial matches and misses export mode=max
+      # and save the new exact key. Fork PRs restore and must not export or
+      # save. force_cold_cache skips restore, export, and save.
+      - name: Build ordinary production runtime (trusted exact-hit restore-only)
+        if: github.event.inputs.force_cold_cache != 'true' && github.event.pull_request.head.repo.fork != true && steps.cache-kind.outputs.kind == 'exact'
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7
+        with:
+          context: .
+          file: Dockerfile
+          target: runtime
+          load: true
+          tags: ferrum-edge:production-default-smoke
+          cache-from: type=local,src=${{ runner.temp }}/production-dockerfile-smoke-default
+          provenance: false
+
+      - name: Build ordinary production runtime
+        if: github.event.inputs.force_cold_cache != 'true' && github.event.pull_request.head.repo.fork != true && steps.cache-kind.outputs.publish == 'true'
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7
+        with:
+          context: .
+          file: Dockerfile
+          target: runtime
+          load: true
+          tags: ferrum-edge:production-default-smoke
+          cache-from: ${{ steps.buildkit-cache.outputs.cache-matched-key != '' && format('type=local,src={0}/production-dockerfile-smoke-default', runner.temp) || '' }}
+          cache-to: type=local,dest=${{ runner.temp }}/production-dockerfile-smoke-default-out,mode=max
+          provenance: false
+
+      - name: Build ordinary production runtime (fork restore-only)
+        if: github.event.inputs.force_cold_cache != 'true' && github.event.pull_request.head.repo.fork == true
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7
+        with:
+          context: .
+          file: Dockerfile
+          target: runtime
+          load: true
+          tags: ferrum-edge:production-default-smoke
+          cache-from: ${{ steps.buildkit-cache.outputs.cache-matched-key != '' && format('type=local,src={0}/production-dockerfile-smoke-default', runner.temp) || '' }}
+          provenance: false
+
+      - name: Build ordinary production runtime (cold cache)
+        if: github.event.inputs.force_cold_cache == 'true'
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7
+        with:
+          context: .
+          file: Dockerfile
+          target: runtime
+          load: true
+          tags: ferrum-edge:production-default-smoke
+          provenance: false
+
+      - name: Finish image build timer
+        if: always()
+        run: python3 .github/scripts/ci_runtime_telemetry.py end --phase image-build --status ${{ job.status == 'success' && '0' || '1' }}
+
+      - name: Time cache save
+        if: github.event.inputs.force_cold_cache != 'true' && github.event.pull_request.head.repo.fork != true && steps.cache-kind.outputs.publish == 'true'
+        run: python3 .github/scripts/ci_runtime_telemetry.py start --phase cache-save
+
+      - name: Prepare BuildKit cache for save
+        if: github.event.inputs.force_cold_cache != 'true' && github.event.pull_request.head.repo.fork != true && steps.cache-kind.outputs.publish == 'true'
         run: |
           set -euo pipefail
+          out="${RUNNER_TEMP}/production-dockerfile-smoke-default-out"
+          dest="${RUNNER_TEMP}/production-dockerfile-smoke-default"
+          if [ ! -d "$out" ]; then
+            echo "::error::fresh BuildKit cache export is missing; refusing to save a stale restore" >&2
+            exit 1
+          fi
+          rm -rf "$dest"
+          mv "$out" "$dest"
+
+      - name: Save BuildKit local cache
+        if: github.event.inputs.force_cold_cache != 'true' && github.event.pull_request.head.repo.fork != true && steps.cache-kind.outputs.publish == 'true'
+        uses: actions/cache/save@374a27f26986edd8c430f386d152a856e179c0ae # v4.2.4
+        with:
+          path: ${{ runner.temp }}/production-dockerfile-smoke-default
+          key: production-dockerfile-smoke-default-v1-${{ runner.os }}-${{ runner.arch }}-${{ github.sha }}
+
+      - name: Finish cache save timer
+        if: always() && github.event.inputs.force_cold_cache != 'true' && github.event.pull_request.head.repo.fork != true && steps.cache-kind.outputs.publish == 'true'
+        run: python3 .github/scripts/ci_runtime_telemetry.py end --phase cache-save --status ${{ job.status == 'success' && '0' || '1' }}
+
+      - name: Verify ordinary distroless runtime contract
+        run: |
+          set -euo pipefail
+          python3 .github/scripts/ci_runtime_telemetry.py start --phase ordinary-inventory
           ordinary_image=ferrum-edge:production-default-smoke
-          ebpf_image=ferrum-edge:production-ebpf-smoke
           docker run --rm --entrypoint /app/ferrum-edge "$ordinary_image" version
+
+          inventory_image() {
+            image="$1"
+            output="$2"
+            container="$(docker create "$image")"
+            docker export "$container" | tar -tf - | sed -e 's#^\./##' -e 's#^/##' > "$output"
+            docker rm "$container" >/dev/null
+          }
+          inventory_image "$ordinary_image" ordinary-runtime-files.txt
+
+          grep -Fxq app/ferrum-edge ordinary-runtime-files.txt
+          if grep -Fxq usr/sbin/ip ordinary-runtime-files.txt; then
+            echo "ordinary runtime unexpectedly contains eBPF-only /usr/sbin/ip" >&2
+            exit 1
+          fi
+
+          for forbidden in \
+            bin/sh usr/bin/sh bin/bash usr/bin/bash bin/dash usr/bin/dash \
+            bin/ash usr/bin/ash bin/zsh usr/bin/zsh bin/ksh usr/bin/ksh \
+            bin/busybox usr/bin/busybox sbin/apk usr/sbin/apk usr/bin/apk \
+            usr/bin/apt usr/bin/apt-cache usr/bin/apt-get \
+            usr/bin/dpkg usr/bin/dpkg-query usr/bin/rpm usr/bin/yum \
+            usr/bin/dnf usr/bin/microdnf usr/sbin/iptables \
+            usr/sbin/ip6tables usr/sbin/nft; do
+            if grep -Fxq "$forbidden" ordinary-runtime-files.txt; then
+              echo "forbidden runtime tool is present: /$forbidden" >&2
+              exit 1
+            fi
+          done
+          python3 .github/scripts/ci_runtime_telemetry.py end --phase ordinary-inventory --status 0
+
+      - name: Summarize ordinary image runtime
+        if: always()
+        run: python3 .github/scripts/ci_runtime_telemetry.py summarize --title "Production Dockerfile default image"
+
+  production-dockerfile-smoke-ebpf:
+    name: Production Dockerfile eBPF image
+    needs: production-dockerfile-plan
+    if: needs.production-dockerfile-plan.outputs.relevant == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    steps:
+      - name: Checkout Ferrum Edge
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
+        with:
+          persist-credentials: false
+
+      - name: Initialize runtime telemetry
+        run: python3 .github/scripts/ci_runtime_telemetry.py init --quiet
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4
+
+      - name: Time cache restore
+        if: github.event.inputs.force_cold_cache != 'true'
+        run: python3 .github/scripts/ci_runtime_telemetry.py start --phase cache-restore
+
+      - name: Restore BuildKit local cache
+        if: github.event.inputs.force_cold_cache != 'true'
+        id: buildkit-cache
+        uses: actions/cache/restore@374a27f26986edd8c430f386d152a856e179c0ae # v4.2.4
+        with:
+          path: ${{ runner.temp }}/production-dockerfile-smoke-ebpf
+          key: production-dockerfile-smoke-ebpf-v1-${{ runner.os }}-${{ runner.arch }}-${{ github.sha }}
+          restore-keys: |
+            production-dockerfile-smoke-ebpf-v1-${{ runner.os }}-${{ runner.arch }}-
+
+      - name: Classify BuildKit cache restore
+        if: github.event.inputs.force_cold_cache != 'true'
+        id: cache-kind
+        env:
+          CACHE_HIT: ${{ steps.buildkit-cache.outputs.cache-hit }}
+          CACHE_MATCHED: ${{ steps.buildkit-cache.outputs.cache-matched-key }}
+          CACHE_PRIMARY: ${{ steps.buildkit-cache.outputs.cache-primary-key }}
+          FORK_PR: ${{ github.event.pull_request.head.repo.fork }}
+          CACHE_DIR: ${{ runner.temp }}/production-dockerfile-smoke-ebpf
+        run: |
+          set -euo pipefail
+          if [ "${FORK_PR:-}" = true ]; then
+            policy=fork-restore-only
+          else
+            policy=trusted-publish
+          fi
+          python3 .github/scripts/ci_runtime_telemetry.py classify-restore \
+            --name buildkit-local \
+            --hit "${CACHE_HIT}" \
+            --matched "${CACHE_MATCHED}" \
+            --primary "${CACHE_PRIMARY}" \
+            --path "$CACHE_DIR" \
+            --note "scope=production-dockerfile-smoke-ebpf policy=${policy}"
+
+      - name: Finish cache restore timer
+        if: always() && github.event.inputs.force_cold_cache != 'true'
+        run: python3 .github/scripts/ci_runtime_telemetry.py end --phase cache-restore --status ${{ job.status == 'success' && '0' || '1' }}
+
+      - name: Record cold-cache proof
+        if: github.event.inputs.force_cold_cache == 'true'
+        run: |
+          python3 .github/scripts/ci_runtime_telemetry.py cache \
+            --name buildkit-local \
+            --hit false \
+            --bytes 0 \
+            --note "scope=production-dockerfile-smoke-ebpf policy=force-cold skipped restore and save"
+
+      - name: Time image build
+        run: python3 .github/scripts/ci_runtime_telemetry.py start --phase image-build
+
+      # Trusted exact github.sha hits restore cache-from and must not
+      # export or save. Trusted partial matches and misses export mode=max
+      # and save the new exact key. Fork PRs restore and must not export or
+      # save. force_cold_cache skips restore, export, and save.
+      - name: Build eBPF production runtime (trusted exact-hit restore-only)
+        if: github.event.inputs.force_cold_cache != 'true' && github.event.pull_request.head.repo.fork != true && steps.cache-kind.outputs.kind == 'exact'
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7
+        with:
+          context: .
+          file: Dockerfile
+          target: runtime-ebpf
+          build-args: |
+            FEATURES=cloud-secrets,ebpf
+          load: true
+          tags: ferrum-edge:production-ebpf-smoke
+          cache-from: type=local,src=${{ runner.temp }}/production-dockerfile-smoke-ebpf
+          provenance: false
+
+      - name: Build eBPF production runtime
+        if: github.event.inputs.force_cold_cache != 'true' && github.event.pull_request.head.repo.fork != true && steps.cache-kind.outputs.publish == 'true'
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7
+        with:
+          context: .
+          file: Dockerfile
+          target: runtime-ebpf
+          build-args: |
+            FEATURES=cloud-secrets,ebpf
+          load: true
+          tags: ferrum-edge:production-ebpf-smoke
+          cache-from: ${{ steps.buildkit-cache.outputs.cache-matched-key != '' && format('type=local,src={0}/production-dockerfile-smoke-ebpf', runner.temp) || '' }}
+          cache-to: type=local,dest=${{ runner.temp }}/production-dockerfile-smoke-ebpf-out,mode=max
+          provenance: false
+
+      - name: Build eBPF production runtime (fork restore-only)
+        if: github.event.inputs.force_cold_cache != 'true' && github.event.pull_request.head.repo.fork == true
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7
+        with:
+          context: .
+          file: Dockerfile
+          target: runtime-ebpf
+          build-args: |
+            FEATURES=cloud-secrets,ebpf
+          load: true
+          tags: ferrum-edge:production-ebpf-smoke
+          cache-from: ${{ steps.buildkit-cache.outputs.cache-matched-key != '' && format('type=local,src={0}/production-dockerfile-smoke-ebpf', runner.temp) || '' }}
+          provenance: false
+
+      - name: Build eBPF production runtime (cold cache)
+        if: github.event.inputs.force_cold_cache == 'true'
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7
+        with:
+          context: .
+          file: Dockerfile
+          target: runtime-ebpf
+          build-args: |
+            FEATURES=cloud-secrets,ebpf
+          load: true
+          tags: ferrum-edge:production-ebpf-smoke
+          provenance: false
+
+      - name: Finish image build timer
+        if: always()
+        run: python3 .github/scripts/ci_runtime_telemetry.py end --phase image-build --status ${{ job.status == 'success' && '0' || '1' }}
+
+      - name: Time cache save
+        if: github.event.inputs.force_cold_cache != 'true' && github.event.pull_request.head.repo.fork != true && steps.cache-kind.outputs.publish == 'true'
+        run: python3 .github/scripts/ci_runtime_telemetry.py start --phase cache-save
+
+      - name: Prepare BuildKit cache for save
+        if: github.event.inputs.force_cold_cache != 'true' && github.event.pull_request.head.repo.fork != true && steps.cache-kind.outputs.publish == 'true'
+        run: |
+          set -euo pipefail
+          out="${RUNNER_TEMP}/production-dockerfile-smoke-ebpf-out"
+          dest="${RUNNER_TEMP}/production-dockerfile-smoke-ebpf"
+          if [ ! -d "$out" ]; then
+            echo "::error::fresh BuildKit cache export is missing; refusing to save a stale restore" >&2
+            exit 1
+          fi
+          rm -rf "$dest"
+          mv "$out" "$dest"
+
+      - name: Save BuildKit local cache
+        if: github.event.inputs.force_cold_cache != 'true' && github.event.pull_request.head.repo.fork != true && steps.cache-kind.outputs.publish == 'true'
+        uses: actions/cache/save@374a27f26986edd8c430f386d152a856e179c0ae # v4.2.4
+        with:
+          path: ${{ runner.temp }}/production-dockerfile-smoke-ebpf
+          key: production-dockerfile-smoke-ebpf-v1-${{ runner.os }}-${{ runner.arch }}-${{ github.sha }}
+
+      - name: Finish cache save timer
+        if: always() && github.event.inputs.force_cold_cache != 'true' && github.event.pull_request.head.repo.fork != true && steps.cache-kind.outputs.publish == 'true'
+        run: python3 .github/scripts/ci_runtime_telemetry.py end --phase cache-save --status ${{ job.status == 'success' && '0' || '1' }}
+
+      - name: Verify eBPF distroless runtime contract
+        run: |
+          set -euo pipefail
+          python3 .github/scripts/ci_runtime_telemetry.py start --phase ebpf-inventory
+          ebpf_image=ferrum-edge:production-ebpf-smoke
           docker run --rm --entrypoint /app/ferrum-edge "$ebpf_image" version
           docker run --rm --entrypoint /usr/sbin/ip "$ebpf_image" -V
 
@@ -100,36 +585,84 @@ jobs:
             docker export "$container" | tar -tf - | sed -e 's#^\./##' -e 's#^/##' > "$output"
             docker rm "$container" >/dev/null
           }
-          inventory_image "$ordinary_image" ordinary-runtime-files.txt
           inventory_image "$ebpf_image" ebpf-runtime-files.txt
 
-          # Positive controls prove the normalized exact-path assertion is live.
-          grep -Fxq app/ferrum-edge ordinary-runtime-files.txt
           grep -Fxq app/ferrum-edge ebpf-runtime-files.txt
           grep -Fxq usr/sbin/ip ebpf-runtime-files.txt
-          if grep -Fxq usr/sbin/ip ordinary-runtime-files.txt; then
-            echo "ordinary runtime unexpectedly contains eBPF-only /usr/sbin/ip" >&2
-            exit 1
-          fi
 
-          for inventory in ordinary-runtime-files.txt ebpf-runtime-files.txt; do
-            for forbidden in \
-              bin/sh usr/bin/sh bin/bash usr/bin/bash bin/dash usr/bin/dash \
-              bin/ash usr/bin/ash bin/zsh usr/bin/zsh bin/ksh usr/bin/ksh \
-              bin/busybox usr/bin/busybox sbin/apk usr/sbin/apk usr/bin/apk \
-              usr/bin/apt usr/bin/apt-cache usr/bin/apt-get \
-              usr/bin/dpkg usr/bin/dpkg-query usr/bin/rpm usr/bin/yum \
-              usr/bin/dnf usr/bin/microdnf usr/sbin/iptables \
-              usr/sbin/ip6tables usr/sbin/nft; do
-              if grep -Fxq "$forbidden" "$inventory"; then
-                echo "forbidden runtime tool is present: /$forbidden" >&2
-                exit 1
-              fi
-            done
+          for forbidden in \
+            bin/sh usr/bin/sh bin/bash usr/bin/bash bin/dash usr/bin/dash \
+            bin/ash usr/bin/ash bin/zsh usr/bin/zsh bin/ksh usr/bin/ksh \
+            bin/busybox usr/bin/busybox sbin/apk usr/sbin/apk usr/bin/apk \
+            usr/bin/apt usr/bin/apt-cache usr/bin/apt-get \
+            usr/bin/dpkg usr/bin/dpkg-query usr/bin/rpm usr/bin/yum \
+            usr/bin/dnf usr/bin/microdnf usr/sbin/iptables \
+            usr/sbin/ip6tables usr/sbin/nft; do
+            if grep -Fxq "$forbidden" ebpf-runtime-files.txt; then
+              echo "forbidden runtime tool is present: /$forbidden" >&2
+              exit 1
+            fi
           done
+          python3 .github/scripts/ci_runtime_telemetry.py end --phase ebpf-inventory --status 0
+
+      - name: Summarize eBPF image runtime
+        if: always()
+        run: python3 .github/scripts/ci_runtime_telemetry.py summarize --title "Production Dockerfile eBPF image"
+
+  production-dockerfile-smoke:
+    name: Production Dockerfile eBPF image smoke
+    runs-on: ubuntu-latest
+    needs:
+      - production-dockerfile-plan
+      - production-dockerfile-smoke-default
+      - production-dockerfile-smoke-ebpf
+    if: always()
+    steps:
+      - name: Fail when production-image planning fails
+        if: needs.production-dockerfile-plan.result != 'success'
+        run: exit 1
+
+      - name: Fail when production-image planner output is unusable
+        if: needs.production-dockerfile-plan.result == 'success' && needs.production-dockerfile-plan.outputs.relevant != 'true' && needs.production-dockerfile-plan.outputs.relevant != 'false'
+        run: exit 1
+
+      - name: Skip production-image smoke for unrelated changes
+        if: needs.production-dockerfile-plan.outputs.relevant == 'false'
+        run: |
+          {
+            echo "## Production Dockerfile eBPF image smoke"
+            echo ""
+            echo "No Dockerfile/runtime-sensitive paths changed. Image smoke skipped."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Fail when the ordinary production image did not succeed
+        if: needs.production-dockerfile-plan.outputs.relevant == 'true' && needs.production-dockerfile-smoke-default.result != 'success'
+        run: exit 1
+
+      - name: Fail when the eBPF production image did not succeed
+        if: needs.production-dockerfile-plan.outputs.relevant == 'true' && needs.production-dockerfile-smoke-ebpf.result != 'success'
+        run: exit 1
+
+      - name: Report production-image smoke
+        if: needs.production-dockerfile-plan.outputs.relevant == 'true'
+        run: |
+          {
+            echo "## Production Dockerfile eBPF image smoke"
+            echo ""
+            echo "Ordinary \`runtime\` and distroless \`runtime-ebpf\` images built in parallel"
+            echo "through BuildKit. Trusted exact \`${{ github.sha }}\` hits restore a scoped"
+            echo "local BuildKit cache and do not export or save. Trusted partial matches"
+            echo "and misses export \`mode=max\` and save the new exact key via pinned"
+            echo "\`actions/cache/restore\` and \`actions/cache/save\`; fork pull"
+            echo "requests restore that cache and do not save. Distroless inventories passed."
+            echo ""
+            echo "Warm PR target: <=30 minutes, p95 <=45 minutes, measured on hosted runs."
+          } >> "$GITHUB_STEP_SUMMARY"
 
   node-waypoint-ebpf-live:
     name: NodeWaypoint eBPF live datapath
+    needs: production-dockerfile-plan
+    if: always() && needs.production-dockerfile-plan.outputs.node_waypoint_relevant != 'false'
     runs-on: ubuntu-24.04
     timeout-minutes: 120
 
