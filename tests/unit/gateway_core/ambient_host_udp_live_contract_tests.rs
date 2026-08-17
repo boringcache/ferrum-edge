@@ -951,8 +951,18 @@ fn image_surfaces_are_scheduled_by_the_trusted_relevance_classifier() {
 
     let plan = read(".github/scripts/pr_ci_plan.py");
     assert!(
-        plan.contains("r\"^Dockerfile$\""),
-        "the planner's eBPF/capture live patterns must include the Dockerfile"
+        plan.contains(
+            "\
+            [\"Dockerfile\"],
+            {
+                \"run_helm\": True,
+                \"run_ebpf_kernel_live\": False,
+                \"run_netns_capture_live\": False,
+                \"run_two_cluster_live\": False,
+            },"
+        ),
+        "the generic planner must leave Dockerfile coverage to the dedicated \
+         trusted Ambient Host UDP gate rather than scheduling all three live suites"
     );
 }
 
