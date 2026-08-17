@@ -541,7 +541,9 @@ impl SendMmsgBatch {
             // The cmsg_buf is pre-allocated for the v6 worst case and reused.
             if let Some(local) = self.local_ips[i] {
                 let local_ip = local.ip;
-                let ifindex = local.ifindex;
+                // Send-side interface selection is derived, never the captured
+                // ingress interface: see `PktinfoLocal::send_ifindex`.
+                let send_ifindex = local.send_ifindex();
                 let cmsg_buf = &mut self.cmsg_bufs[i];
                 cmsg_buf.fill(0);
                 let (pktinfo_len, pktinfo_space) = match local_ip {
@@ -571,14 +573,14 @@ impl SendMmsgBatch {
                             (*cmsg).cmsg_level = libc::IPPROTO_IP;
                             (*cmsg).cmsg_type = libc::IP_PKTINFO;
                             (*cmsg).cmsg_len = pktinfo_len;
-                            // ipi_ifindex intentionally 0 for IPv4: per ip(7),
-                            // a nonzero ifindex makes the kernel prefer the
+                            // `send_ifindex` is always 0 on IPv4: per ip(7), a
+                            // nonzero ifindex makes the kernel prefer the
                             // interface's primary address over ipi_spec_dst on
                             // multi-IP interfaces, which would defeat the
                             // "reply from captured destination" semantics.
                             // ipi_spec_dst alone is sufficient on IPv4.
                             let pi = libc::in_pktinfo {
-                                ipi_ifindex: 0,
+                                ipi_ifindex: send_ifindex as libc::c_int,
                                 ipi_spec_dst: libc::in_addr {
                                     s_addr: u32::from(v4).to_be(),
                                 },
@@ -598,7 +600,7 @@ impl SendMmsgBatch {
                                 ipi6_addr: libc::in6_addr {
                                     s6_addr: v6.octets(),
                                 },
-                                ipi6_ifindex: ifindex,
+                                ipi6_ifindex: send_ifindex,
                             };
                             std::ptr::copy_nonoverlapping(
                                 &pi as *const libc::in6_pktinfo as *const u8,
@@ -680,10 +682,12 @@ mod sendmmsg_batch_tests {
 
 /// Convert a `std::net::SocketAddr` to `libc::sockaddr_storage` + length.
 ///
-/// `pub(super)` so `flush_gso_batch()` in `udp_proxy.rs` can call it directly
-/// without a wrapper.
+/// `pub(crate)` so `flush_gso_batch()` in `udp_proxy.rs` and the DTLS server's
+/// pinned reply-source send path (`crate::dtls`) can both call it directly
+/// without a wrapper — one conversion, so the two datagram frontends cannot
+/// disagree about destination encoding.
 #[cfg(target_os = "linux")]
-pub(super) fn std_to_sockaddr_storage(
+pub(crate) fn std_to_sockaddr_storage(
     addr: SocketAddr,
 ) -> (libc::sockaddr_storage, libc::socklen_t) {
     let mut storage: libc::sockaddr_storage = unsafe { std::mem::zeroed() };

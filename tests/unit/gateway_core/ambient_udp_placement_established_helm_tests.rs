@@ -992,10 +992,11 @@ fn spire_and_preflight_each_bind_node_name_in_their_own_container() {
         "the preflight container must carry exactly one FERRUM_K8S_NODE_NAME row"
     );
     assert!(
-        steady_state.contains("if $ambientSpireUsesNodeName")
-            && steady_state.contains("- name: FERRUM_K8S_NODE_NAME")
+        steady_state.contains(
+            "if or $nodeWaypointRegistryEnabled (and $ambientSpireEnabled $ambientSpireUsesNodeName)"
+        ) && steady_state.contains("- name: FERRUM_K8S_NODE_NAME")
             && steady_state.contains("fieldPath: spec.nodeName"),
-        "SPIRE NodeWaypoint profiles must still receive their own downward-API node name in the steady-state container"
+        "SPIRE and NodeWaypoint registry profiles must still receive their own downward-API node name in the steady-state container"
     );
     assert!(
         ambient.contains(

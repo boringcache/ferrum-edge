@@ -469,6 +469,47 @@ async fn mesh_peer_auth_live_reload_tcp_tls_swap_takes_effect_on_next_accept() {
     manager.shutdown_all().await;
 }
 
+/// Owner-scoped DTLS publication (issue #3858) records an accepted generation
+/// even with no active DTLS listeners, so a listener created or restarted after
+/// the slice converges on exactly that generation — and it never seeds the
+/// ordinary operator `FERRUM_DTLS_*` slot.
+#[tokio::test]
+async fn mesh_owner_scoped_dtls_publish_without_dtls_listeners() {
+    let state = test_proxy_state(test_env_config());
+    let manager = &state.stream_listener_manager;
+
+    let certificate = ferrum_edge::dtls::generate_ephemeral_cert_public().expect("ephemeral cert");
+    let dtls_config = dimpl::Config::builder().build().expect("dtls config");
+    let mut configs = std::collections::BTreeMap::new();
+    configs.insert(
+        "ferrum|__mesh-nw-udp-team-a-dns-a-5353".to_string(),
+        ferrum_edge::dtls::FrontendDtlsConfig {
+            dimpl_config: std::sync::Arc::new(dtls_config),
+            certificate,
+            client_cert_verifier: None,
+        },
+    );
+    let (generation, swapped) = manager
+        .publish_mesh_node_waypoint_dtls_generation(configs)
+        .await;
+
+    assert_eq!(swapped, 0, "no active DTLS listeners means no live swaps");
+    assert_eq!(generation, 1);
+    assert!(
+        manager
+            .snapshot_mesh_node_waypoint_dtls_generation()
+            .is_some(),
+        "the owner-scoped generation must be published even when no DTLS listeners are bound yet"
+    );
+    assert!(
+        manager.snapshot_frontend_dtls_generation().is_none(),
+        "a mesh publish must never seed the ordinary FERRUM_DTLS_* generation"
+    );
+    let status = manager.frontend_dtls_reload_status();
+    assert_eq!(status.last_outcome, "none");
+    assert_eq!(status.generation, 0);
+}
+
 /// Mesh PeerAuthentication live reload swaps the shared TCP+TLS slot and must
 /// not seed the ordinary `FERRUM_DTLS_*` generation when no DTLS listener exists.
 #[tokio::test]

@@ -259,6 +259,31 @@ spec:
   mtls:
     mode: STRICT
 ---
+# Initial live DTLS probes are server-only (`openssl s_client -dtls1_2`
+# without a client certificate). Namespace-wide STRICT is the TCP/HBONE mTLS
+# default; pin the dtls-echo port to PERMISSIVE so those checks can bind and
+# handshake without a client cert. The harness DOES mount
+# FERRUM_DTLS_CLIENT_CA_CERT_PATH; `run_node_waypoint_dtls_reload_isolation_checks`
+# later applies this PeerAuthentication to STRICT and proves generated
+# listeners demand the current client CA. Ordinary `FERRUM_DTLS_*` slot
+# isolation is the captured `/overload` `frontend_dtls_reload.generation`
+# across that publication, not a bound operator listener. TCP STRICT and
+# AuthorizationPolicy are unchanged.
+apiVersion: security.istio.io/v1beta1
+kind: PeerAuthentication
+metadata:
+  name: dtls-echo
+  namespace: __NAMESPACE__
+spec:
+  selector:
+    matchLabels:
+      app: dtls-echo
+  mtls:
+    mode: STRICT
+  portLevelMtls:
+    "__DTLS_LISTENER_PORT__":
+      mode: PERMISSIVE
+---
 apiVersion: security.istio.io/v1beta1
 kind: AuthorizationPolicy
 metadata:
@@ -303,3 +328,378 @@ spec:
         - source:
             principals:
               - __TRUST_DOMAIN__/ns/__NAMESPACE__/sa/src-a
+---
+# ── NodeWaypoint UDP/DTLS listener datapath (issue #3286) ────────────────────
+#
+# `udp-echo` is an ordinary in-mesh Service whose port declares `protocol: UDP`.
+# With FERRUM_MESH_NODE_WAYPOINT_UDP_LISTENERS_ENABLED=true the NodeWaypoint
+# materializes ONE datagram listener on that port number in the host network
+# namespace and forwards to the Service's backing pods. A co-located enrolled
+# pod that sends to <node IP>:__UDP_LISTENER_PORT__ therefore reaches the production UDP
+# listener, and its source pod is attributed from the kernel-reported ingress
+# interface (its veth) before `mesh_authz` evaluates scoped policy.
+#
+# The two UDP senders deliberately REUSE the src-a / src-b ServiceAccounts, so
+# the same principal-keyed AuthorizationPolicies that govern the HTTP checks
+# also govern these datagrams: `deny-src-b` is namespace-scoped and matches the
+# src-b principal, so it applies to the src-b source scope and not to src-a's.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: udp-echo
+  namespace: __NAMESPACE__
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: udp-echo
+  template:
+    metadata:
+      labels:
+        app: udp-echo
+        ferrum.io/mesh: enabled
+    spec:
+      serviceAccountName: dst-a
+      nodeSelector:
+        ferrum.io/live-node: a
+      containers:
+        - name: udp
+          image: python:3.12-alpine
+          ports:
+            - containerPort: __UDP_LISTENER_PORT__
+              protocol: UDP
+          command:
+            - python
+            - -u
+            - -c
+            - |
+              import socket
+
+              s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+              s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+              s.bind(("0.0.0.0", __UDP_LISTENER_PORT__))
+              while True:
+                  data, peer = s.recvfrom(2048)
+                  # Logged so the live gate can prove a REFUSED datagram never
+                  # reached the backend, not merely that no reply came back
+                  # (a spoofed datagram's reply would be sent to the forged
+                  # address, so reply-absence alone would be vacuous).
+                  print("recv:" + data.decode("utf-8", "replace"), flush=True)
+                  s.sendto(b"udp-ok:" + data, peer)
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: udp-echo
+  namespace: __NAMESPACE__
+spec:
+  selector:
+    app: udp-echo
+  ports:
+    - name: udp
+      port: __UDP_LISTENER_PORT__
+      targetPort: __UDP_LISTENER_PORT__
+      protocol: UDP
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: udp-src-a
+  namespace: __NAMESPACE__
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: udp-src-a
+  template:
+    metadata:
+      labels:
+        app: udp-src-a
+        ferrum.io/mesh: enabled
+    spec:
+      serviceAccountName: src-a
+      nodeSelector:
+        ferrum.io/live-node: a
+      containers:
+        - name: udp
+          image: python:3.12-alpine
+          command: ["sh", "-c", "sleep 365d"]
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: udp-src-b
+  namespace: __NAMESPACE__
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: udp-src-b
+  template:
+    metadata:
+      labels:
+        app: udp-src-b
+        ferrum.io/mesh: enabled
+    spec:
+      serviceAccountName: src-b
+      nodeSelector:
+        ferrum.io/live-node: a
+      containers:
+        - name: udp
+          image: python:3.12-alpine
+          command: ["sh", "-c", "sleep 365d"]
+---
+# ── Same-port UDP Service demultiplexing (issue #3861) ───────────────────────
+#
+# Two compatible plain-UDP Services with DISTINCT ClusterIPs on the SAME
+# numeric port. The NodeWaypoint binds that port once and demultiplexes by the
+# kernel-reported local destination (IP_PKTINFO). Distinct echo prefixes and
+# backend logs make isolation non-vacuous: a datagram to A must reach only A.
+# Both backends sit on node A so the same NodeWaypoint child owns both routes.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: udp-demux-a
+  namespace: __NAMESPACE__
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: udp-demux-a
+  template:
+    metadata:
+      labels:
+        app: udp-demux-a
+        ferrum.io/mesh: enabled
+    spec:
+      serviceAccountName: dst-a
+      nodeSelector:
+        ferrum.io/live-node: a
+      containers:
+        - name: udp
+          image: python:3.12-alpine
+          ports:
+            - containerPort: __DEMUX_UDP_PORT__
+              protocol: UDP
+          command:
+            - python
+            - -u
+            - -c
+            - |
+              import socket
+
+              s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+              s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+              s.bind(("0.0.0.0", __DEMUX_UDP_PORT__))
+              while True:
+                  data, peer = s.recvfrom(2048)
+                  print("recv:" + data.decode("utf-8", "replace"), flush=True)
+                  s.sendto(b"demux-a:" + data, peer)
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: udp-demux-a
+  namespace: __NAMESPACE__
+spec:
+  selector:
+    app: udp-demux-a
+  __SERVICE_IP_FAMILY_BLOCK__
+  ports:
+    - name: udp
+      port: __DEMUX_UDP_PORT__
+      targetPort: __DEMUX_UDP_PORT__
+      protocol: UDP
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: udp-demux-b
+  namespace: __NAMESPACE__
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: udp-demux-b
+  template:
+    metadata:
+      labels:
+        app: udp-demux-b
+        ferrum.io/mesh: enabled
+    spec:
+      serviceAccountName: dst-a
+      nodeSelector:
+        ferrum.io/live-node: a
+      containers:
+        - name: udp
+          image: python:3.12-alpine
+          ports:
+            - containerPort: __DEMUX_UDP_PORT__
+              protocol: UDP
+          command:
+            - python
+            - -u
+            - -c
+            - |
+              import socket
+
+              s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+              s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+              s.bind(("0.0.0.0", __DEMUX_UDP_PORT__))
+              while True:
+                  data, peer = s.recvfrom(2048)
+                  print("recv:" + data.decode("utf-8", "replace"), flush=True)
+                  s.sendto(b"demux-b:" + data, peer)
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: udp-demux-b
+  namespace: __NAMESPACE__
+spec:
+  selector:
+    app: udp-demux-b
+  __SERVICE_IP_FAMILY_BLOCK__
+  ports:
+    - name: udp
+      port: __DEMUX_UDP_PORT__
+      targetPort: __DEMUX_UDP_PORT__
+      protocol: UDP
+---
+# ── NodeWaypoint DTLS listener datapath (issue #3286) ────────────────────────
+#
+# `dtls-echo` is the DTLS counterpart of `udp-echo`: the SAME `protocol: UDP` L4
+# transport, but its `appProtocol: dtls` hint classifies the port as
+# `AppProtocol::Dtls`, so `materialize_node_waypoint_udp_listeners` gives the
+# listener `frontend_tls: true` — the NodeWaypoint TERMINATES frontend DTLS on
+# the host-netns socket and forwards PLAINTEXT datagrams to this backing pod.
+# The backend therefore stays an ordinary UDP echo: if a datagram reaches it,
+# the proxy really did complete a DTLS handshake and decrypt application data.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: dtls-echo
+  namespace: __NAMESPACE__
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: dtls-echo
+  template:
+    metadata:
+      labels:
+        app: dtls-echo
+        ferrum.io/mesh: enabled
+    spec:
+      serviceAccountName: dst-a
+      nodeSelector:
+        ferrum.io/live-node: a
+      containers:
+        - name: udp
+          image: python:3.12-alpine
+          ports:
+            - containerPort: __DTLS_LISTENER_PORT__
+              protocol: UDP
+          command:
+            - python
+            - -u
+            - -c
+            - |
+              import socket
+
+              s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+              s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+              s.bind(("0.0.0.0", __DTLS_LISTENER_PORT__))
+              while True:
+                  data, peer = s.recvfrom(2048)
+                  # Logged so a DENIED source can be proven to have reached no
+                  # backend at all, rather than merely to have received no
+                  # reply.
+                  print("recv:" + data.decode("utf-8", "replace").strip(), flush=True)
+                  s.sendto(b"dtls-ok:" + data.strip(), peer)
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: dtls-echo
+  namespace: __NAMESPACE__
+spec:
+  selector:
+    app: dtls-echo
+  ports:
+    - name: dtls
+      port: __DTLS_LISTENER_PORT__
+      targetPort: __DTLS_LISTENER_PORT__
+      protocol: UDP
+      # The one L7 hint allowed to refine a `protocol: UDP` port
+      # (`service_app_protocol` / `hint_is_dtls`): it selects frontend DTLS
+      # termination within the same L4 transport.
+      appProtocol: dtls
+---
+# DTLS senders. Separate from the plain-UDP senders so the UDP checks keep their
+# dependency-free image, but they reuse the SAME src-a / src-b ServiceAccounts,
+# so the namespace-scoped `deny-src-b` AuthorizationPolicy that governs the HTTP
+# and UDP checks governs these DTLS sessions too. `openssl s_client -dtls1_2` is
+# the client: a real DTLS handshake, not a datagram shaped like one.
+#
+# openssl is baked into `__DTLS_CLIENT_IMAGE__` on the runner (see
+# `dtls-client.Dockerfile`) and loaded into kind. These pods are mesh-enrolled,
+# so a runtime `apk add` would have its TCP connect() rewritten to the capture
+# listener and could never reach Alpine mirrors.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: dtls-src-a
+  namespace: __NAMESPACE__
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: dtls-src-a
+  template:
+    metadata:
+      labels:
+        app: dtls-src-a
+        ferrum.io/mesh: enabled
+    spec:
+      serviceAccountName: src-a
+      nodeSelector:
+        ferrum.io/live-node: a
+      containers:
+        - name: dtls
+          image: __DTLS_CLIENT_IMAGE__
+          imagePullPolicy: IfNotPresent
+          command: ["sh", "-c", "sleep 365d"]
+          volumeMounts:
+            - name: dtls-clients
+              mountPath: /etc/ferrum/dtls-clients
+              readOnly: true
+      volumes:
+        - name: dtls-clients
+          secret:
+            secretName: __DTLS_CLIENT_CERT_SECRET__
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: dtls-src-b
+  namespace: __NAMESPACE__
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: dtls-src-b
+  template:
+    metadata:
+      labels:
+        app: dtls-src-b
+        ferrum.io/mesh: enabled
+    spec:
+      serviceAccountName: src-b
+      nodeSelector:
+        ferrum.io/live-node: a
+      containers:
+        - name: dtls
+          image: __DTLS_CLIENT_IMAGE__
+          imagePullPolicy: IfNotPresent
+          command: ["sh", "-c", "sleep 365d"]

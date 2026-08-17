@@ -329,6 +329,8 @@ async fn try_spawn_gateway(
         udp_gso_enabled: false,
         udp_pktinfo_enabled: false,
         mesh_outbound_enforcement: empty_slot(),
+        node_waypoint_udp_source_scoping: None,
+        node_waypoint_udp_destinations: None,
         datagram_client_address: Some(gate),
     };
     let join = tokio::spawn(async move {

@@ -748,7 +748,76 @@ pub mod _test_support {
         client_addr: std::net::SocketAddr,
         is_expired: impl FnOnce(&T) -> bool,
     ) -> Option<std::sync::Arc<T>> {
-        crate::proxy::udp_proxy::take_udp_last_client_if_live(last_client, client_addr, is_expired)
+        // The production cache is keyed by the full session identity (client
+        // tuple + selected destination IP + exact namespaced route owner +
+        // listener generation). This seam
+        // keeps the historical client-tuple shape by projecting onto the
+        // route-less key; `take_udp_last_client_if_live_keyed_for_test` covers
+        // the destination-routed case.
+        let mut keyed = last_client.take().map(|(addr, session)| {
+            (
+                crate::proxy::udp_proxy::UdpSessionKey::undestined(addr, 0),
+                session,
+            )
+        });
+        let result = crate::proxy::udp_proxy::take_udp_last_client_if_live(
+            &mut keyed,
+            &crate::proxy::udp_proxy::UdpSessionKey::undestined(client_addr, 0),
+            is_expired,
+        );
+        *last_client = keyed.map(|(key, session)| (key.client, session));
+        result
+    }
+
+    /// Same seam over the full production session key, so a test can prove that
+    /// one client tuple addressing two same-port Service destinations — or the
+    /// same destination under two namespaced owners — resolves to two
+    /// independent cache entries (issue #3861).
+    pub fn take_udp_last_client_if_live_keyed_for_test<T>(
+        last_client: &mut Option<(crate::proxy::udp_proxy::UdpSessionKey, std::sync::Arc<T>)>,
+        key: crate::proxy::udp_proxy::UdpSessionKey,
+        is_expired: impl FnOnce(&T) -> bool,
+    ) -> Option<std::sync::Arc<T>> {
+        crate::proxy::udp_proxy::take_udp_last_client_if_live(last_client, &key, is_expired)
+    }
+
+    /// Session-setup UDP load-balancer hash key. Destination-routed listeners
+    /// concatenate `client|dest` so one source socket addressing two same-port
+    /// ClusterIPs cannot share a Round-Robin slot.
+    pub fn udp_session_lb_hash_key_for_test(
+        client: std::net::IpAddr,
+        destination: Option<std::net::IpAddr>,
+    ) -> String {
+        crate::proxy::udp_proxy::udp_session_lb_hash_key(client, destination)
+    }
+
+    /// Whether a literal backend host is in the same IP family as the session
+    /// destination. Hostnames are treated as matching (DNS filters later).
+    pub fn udp_backend_host_matches_destination_family_for_test(
+        host: &str,
+        destination: std::net::IpAddr,
+    ) -> bool {
+        crate::proxy::udp_proxy::udp_backend_host_matches_destination_family(host, destination)
+    }
+
+    /// UDP backend selection with an optional session destination, so tests can
+    /// prove destination-family eligibility stays inside load-balancer health,
+    /// algorithm, and port-lane selection (hosted NodeWaypoint same-port demux).
+    pub fn resolve_udp_backend_target_for_destination_for_test(
+        proxy: &crate::config::types::Proxy,
+        snapshot: &crate::load_balancer::LoadBalancerCacheInner,
+        health_checker: &crate::health_check::HealthChecker,
+        lb_hash_key: &str,
+        destination: Option<std::net::IpAddr>,
+    ) -> Result<(String, u16), String> {
+        crate::proxy::udp_proxy::resolve_backend_target(
+            proxy,
+            snapshot,
+            health_checker,
+            lb_hash_key,
+            destination,
+        )
+        .map_err(|err| err.to_string())
     }
 
     /// Frontend-DTLS / UDP idle-expiry predicate on virtual monotonic timestamps.

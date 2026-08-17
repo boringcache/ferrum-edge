@@ -140,6 +140,10 @@ pub enum GrpcBody {
         /// RST_STREAM — never a clean END_STREAM the backend could mistake for
         /// a complete request stream.
         incoming: crate::proxy::body::UploadSource,
+        /// Transport-side deadline guard. The pump owns the inbound body when
+        /// hyper stops polling, while this guard prevents a frame already in
+        /// the bounded bridge from crossing the authorization deadline.
+        auth_deadline: Option<crate::proxy::body::UploadAuthDeadline>,
         bytes_seen: usize,
         max_bytes: usize,
         exceeded: Arc<AtomicBool>,
@@ -244,36 +248,44 @@ impl http_body::Body for GrpcBody {
                 exceeded,
                 grpc_messages,
                 grpc_scanner,
+                auth_deadline,
                 ..
-            } => match incoming.poll_frame(cx) {
-                Poll::Ready(Some(Ok(frame))) => {
-                    if let Some(data) = frame.data_ref() {
-                        if *max_bytes > 0 {
-                            *bytes_seen = bytes_seen.saturating_add(data.len());
-                            if *bytes_seen > *max_bytes {
-                                exceeded.store(true, Ordering::Release);
-                                // Return an error to RST_STREAM the request,
-                                // preventing the backend from treating a truncated
-                                // prefix as a completed stream.
-                                return Poll::Ready(Some(Err(format!(
-                                    "gRPC request payload exceeds maximum of {} bytes",
-                                    max_bytes
-                                )
-                                .into())));
+            } => {
+                if let Some(deadline) = auth_deadline
+                    && deadline.expired(cx)
+                {
+                    return Poll::Ready(Some(Err(deadline.message().into())));
+                }
+                match incoming.poll_frame(cx) {
+                    Poll::Ready(Some(Ok(frame))) => {
+                        if let Some(data) = frame.data_ref() {
+                            if *max_bytes > 0 {
+                                *bytes_seen = bytes_seen.saturating_add(data.len());
+                                if *bytes_seen > *max_bytes {
+                                    exceeded.store(true, Ordering::Release);
+                                    // Return an error to RST_STREAM the request,
+                                    // preventing the backend from treating a truncated
+                                    // prefix as a completed stream.
+                                    return Poll::Ready(Some(Err(format!(
+                                        "gRPC request payload exceeds maximum of {} bytes",
+                                        max_bytes
+                                    )
+                                    .into())));
+                                }
+                            }
+                            if let (Some(messages), Some(scanner)) =
+                                (grpc_messages.as_ref(), grpc_scanner.as_mut())
+                            {
+                                scanner.push(data, messages);
                             }
                         }
-                        if let (Some(messages), Some(scanner)) =
-                            (grpc_messages.as_ref(), grpc_scanner.as_mut())
-                        {
-                            scanner.push(data, messages);
-                        }
+                        Poll::Ready(Some(Ok(frame)))
                     }
-                    Poll::Ready(Some(Ok(frame)))
+                    Poll::Ready(Some(Err(e))) => Poll::Ready(Some(Err(e))),
+                    Poll::Ready(None) => Poll::Ready(None),
+                    Poll::Pending => Poll::Pending,
                 }
-                Poll::Ready(Some(Err(e))) => Poll::Ready(Some(Err(e))),
-                Poll::Ready(None) => Poll::Ready(None),
-                Poll::Pending => Poll::Pending,
-            },
+            }
             GrpcBody::Channel {
                 receiver,
                 bytes_seen,
@@ -3813,8 +3825,12 @@ pub async fn proxy_grpc_request_streaming(
     // the task when hyper drops that body, and the pump self-terminates at the
     // deadline regardless of what the backend is doing.
     let (body, _upload_pump) = crate::proxy::body::UploadSource::for_streaming_upload(body, auth);
+    let auth_deadline = auth.map(|(deadline, family, latch)| {
+        crate::proxy::body::UploadAuthDeadline::new(*deadline, *family, latch.clone())
+    });
     let grpc_body = GrpcBody::Streaming {
         incoming: body,
+        auth_deadline,
         bytes_seen: 0,
         max_bytes: max_grpc_recv_size_bytes,
         exceeded: Arc::clone(&body_size_exceeded),

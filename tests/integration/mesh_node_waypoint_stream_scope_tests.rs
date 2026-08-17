@@ -437,7 +437,10 @@ mod node_waypoint_capture_inventory {
         AppProtocol, MeshConfig, MtlsMode, NodeWaypointEndpoint, PeerAuthentication, PolicyScope,
         Workload, WorkloadPort, WorkloadSelector,
     };
-    use ferrum_edge::modes::mesh::slice::{MeshSlice, MeshSliceRequest};
+    use ferrum_edge::modes::mesh::slice::{
+        MeshSlice, MeshSliceRequest, node_waypoint_destination_peer_authentications,
+        resolve_effective_mtls_mode,
+    };
     use ferrum_edge::xds::carrier::MeshSliceCarrier;
 
     const THIS_WAYPOINT: &str = "spiffe://cluster.local/ns/ferrum/sa/node-waypoint-a";
@@ -573,6 +576,71 @@ mod node_waypoint_capture_inventory {
                 .iter()
                 .all(|policy| policy.namespace == "ferrum"),
             "the capture inventory must not widen the proxy's own PeerAuthentication view"
+        );
+    }
+
+    /// Same-namespace selector-scoped `portLevelMtls` overlays are stripped from
+    /// the NodeWaypoint's own inbound view (they do not match the waypoint pod)
+    /// but must still ride the capture inventory so generated DTLS listeners
+    /// can start PERMISSIVE without a client certificate.
+    #[test]
+    fn local_slicing_carries_same_namespace_dtls_port_overlay_on_the_capture_inventory() {
+        const DTLS_PORT: u16 = 15354;
+        let dtls_overlay = PeerAuthentication {
+            name: "dtls-echo".to_string(),
+            namespace: "ferrum".to_string(),
+            scope: None,
+            selector: Some(WorkloadSelector {
+                labels: HashMap::from([("app".to_string(), "dtls-echo".to_string())]),
+                namespace: None,
+            }),
+            mtls_mode: MtlsMode::Strict,
+            port_overrides: HashMap::from([(DTLS_PORT, MtlsMode::Permissive)]),
+        };
+        let config = GatewayConfig {
+            mesh: Some(Box::new(MeshConfig {
+                workloads: vec![workload(
+                    "ferrum",
+                    "dtls-echo",
+                    THIS_WAYPOINT,
+                    "10.244.1.11",
+                )],
+                peer_authentications: vec![
+                    namespace_peer_auth("ferrum", MtlsMode::Strict),
+                    dtls_overlay,
+                ],
+                ..MeshConfig::default()
+            })),
+            ..GatewayConfig::default()
+        };
+        let slice = MeshSlice::from_gateway_config(&config, node_waypoint_request());
+
+        assert!(
+            slice
+                .peer_authentications
+                .iter()
+                .all(|policy| policy.name != "dtls-echo"),
+            "the destination overlay must not leak into the waypoint's own inbound view"
+        );
+        assert!(
+            slice
+                .node_waypoint_capture_peer_authentications
+                .iter()
+                .any(|policy| policy.name == "dtls-echo"),
+            "the capture inventory must carry the destination portLevelMtls overlay"
+        );
+
+        let dtls_labels = HashMap::from([("app".to_string(), "dtls-echo".to_string())]);
+        let destination_auths = node_waypoint_destination_peer_authentications(&slice);
+        assert_eq!(
+            resolve_effective_mtls_mode(&destination_auths, "ferrum", &dtls_labels, DTLS_PORT),
+            MtlsMode::Permissive,
+            "generated DTLS on the overlaid port must be PERMISSIVE"
+        );
+        assert_eq!(
+            resolve_effective_mtls_mode(&destination_auths, "ferrum", &dtls_labels, APP_PORT),
+            MtlsMode::Strict,
+            "other ports on the same destination stay STRICT"
         );
     }
 

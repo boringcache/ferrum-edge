@@ -103,6 +103,10 @@ pub mod mesh_udp_frame;
 pub mod netns_capture;
 pub mod netns_udp_capture;
 pub(crate) mod node_waypoint_ingress_capture;
+pub mod node_waypoint_udp_destination;
+pub mod node_waypoint_udp_identity;
+pub mod node_waypoint_udp_reply_source;
+pub mod node_waypoint_udp_steering;
 pub mod owned_shell;
 pub mod proxy_protocol;
 pub(crate) mod response_buffer_budget;
@@ -6188,6 +6192,16 @@ pub struct ProxyState {
     /// Inbound HBONE sockets from peer proxies do not carry those pod-loopback
     /// cookies and are authenticated by the HBONE/TLS path instead.
     pub node_waypoint_identity_resolver: Option<Arc<NodeWaypointIdentityResolver>>,
+    /// NodeWaypoint per-datagram UDP/DTLS source-workload attribution index
+    /// (issue #3286). `None` outside NodeWaypoint topology and whenever the
+    /// channel is unavailable; when present, UDP/DTLS listeners resolve each
+    /// session's source pod from the kernel-provided ingress interface plus the
+    /// registry-published source address, so namespace/selector-scoped
+    /// `AuthorizationPolicy` enforces per source workload instead of the whole
+    /// UDP/DTLS surface being disabled. See
+    /// [`crate::proxy::node_waypoint_udp_identity`].
+    pub node_waypoint_udp_source_index:
+        Option<Arc<crate::proxy::node_waypoint_udp_identity::NodeWaypointUdpSourceIndex>>,
     /// Gateway SPIFFE identity for gateway/sidecar-to-mesh outbound HBONE.
     ///
     /// This is the MATERIAL slot: `build_spiffe_outbound_config`, the inbound
@@ -9266,6 +9280,7 @@ impl ProxyState {
             adaptive_buffer,
             mesh_egress_strip_baggage_keys,
             node_waypoint_identity_resolver: None,
+            node_waypoint_udp_source_index: None,
             gateway_svid_bundle,
             gateway_file_svid_bundle,
             gateway_trust_bundles,
@@ -9317,6 +9332,19 @@ impl ProxyState {
         resolver: Arc<NodeWaypointIdentityResolver>,
     ) -> Self {
         self.node_waypoint_identity_resolver = Some(resolver);
+        self
+    }
+
+    /// Return a copy of this state with the NodeWaypoint UDP/DTLS source
+    /// attribution index installed before listeners start accepting traffic
+    /// (issue #3286). Installed only in NodeWaypoint topology and only when the
+    /// channel is supported; every other topology keeps `None` and behaves
+    /// exactly as before.
+    pub fn with_node_waypoint_udp_source_index(
+        mut self,
+        index: Arc<crate::proxy::node_waypoint_udp_identity::NodeWaypointUdpSourceIndex>,
+    ) -> Self {
+        self.node_waypoint_udp_source_index = Some(index);
         self
     }
 
@@ -12159,6 +12187,15 @@ impl ProxyState {
         // `mirror_request_epoch_wrappers` published its wrapper views above.
         let Some(delta) = applied_delta else {
             debug!("Config update: out-of-band mesh/trust/MMDB generation republished");
+            // ClusterIP-only mesh updates do not restart stream listeners, but
+            // they can change the desired NodeWaypoint UDP steering set. Sync
+            // against currently bound sockets so a rejected-or-unbound
+            // destination cannot stay marked, and a newly desired VIP on an
+            // already-bound port is published without waiting for a proxy delta.
+            let slm = self.stream_listener_manager.clone();
+            tokio::spawn(async move {
+                slm.sync_node_waypoint_udp_steering().await;
+            });
             return ConfigApplyOutcome::Applied;
         };
         let proxy_plugin_rebuild_count = proxy_plugin_rebuild_count.get();
@@ -12299,6 +12336,11 @@ impl ProxyState {
                         err
                     );
                 }
+            });
+        } else {
+            let slm = self.stream_listener_manager.clone();
+            tokio::spawn(async move {
+                slm.sync_node_waypoint_udp_steering().await;
             });
         }
 
@@ -12888,6 +12930,10 @@ impl ProxyState {
                     err
                 );
             }
+        } else {
+            self.stream_listener_manager
+                .sync_node_waypoint_udp_steering()
+                .await;
         }
 
         info!(
@@ -60926,6 +60972,8 @@ mod tests {
             mesh: None,
             http_tls_listen_ports: Default::default(),
             mesh_revision: None,
+            node_waypoint_udp_steer_destinations: Vec::new(),
+            node_waypoint_udp_destination_routes: Vec::new(),
             k8s_mesh_overlay: Default::default(),
             gateway_trust_bundles: Vec::new(),
         }
