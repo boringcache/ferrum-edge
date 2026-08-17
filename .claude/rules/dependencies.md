@@ -101,7 +101,11 @@ Full policy: `docs/dependency-policy.md`. These are the load-bearing rules.
   base.
 - Cross-sensitive `ci.yml` jobs `ci-plan`, `test`, and `performance-regression`
   carry temporary SHA-256 generation pairs (`CI_JOB_GENERATION_TRANSITIONS`)
-  for PRs #3913 and #3911. `setup-rust-ci/action.yml` carries a two-step
+  for PRs #3913 and #3911, the three per-suite live gates (`ebpf-live`,
+  `netns-capture-live`, `two-cluster-mesh-live`) carry pairs for PR #3915's
+  planner-gate split (adopted digests pinned against #3915's latest-main merge
+  `d95ea4796`), and `build-binaries` carries a pair for PR #3916's macOS
+  compile-gate reduction. `setup-rust-ci/action.yml` carries a two-step
   trusted-base chain (`LOCAL_ACTION_GENERATION_TRANSITIONS`): #3889's landed
   `fc4e41818dffdea880c057c8dfa0881a629cd01c917b43f69a9f2e5e9bd90dda` moving to
   the cache-budget generation
