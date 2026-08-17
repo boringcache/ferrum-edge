@@ -6,7 +6,11 @@ self-relative trends; do not promote opportunistic laptop numbers into CI floors
 
 > **Publication status (issue #3332):** UDP/TCP gateway and direct-stub cells
 > remain `_TBD_` until a hosted `Mesh Performance Baselines` workflow run yields
-> ≥3 clean zero-error repetitions and those aggregates are copied here.
+> ≥3 clean zero-error repetitions and those aggregates are copied here. The
+> deterministic upstream stub must serve DNS-over-TCP (RFC 1035 §4.2.2) on the
+> same listen address as UDP; a UDP-only stub is not a publishable `--protocol
+> both` collection. Harness executables fail closed on zero-success or
+> errorful rows, and the workflow acceptance gate remains fail-closed.
 
 ## Reference environment (filled from hosted provenance)
 
@@ -65,7 +69,7 @@ TCP transport (RFC 1035 §4.2.2 length-framed):
 |---|---|---|---|---|---|
 | mesh-internal | _TBD_ | _TBD_ | _TBD_ | _TBD_ | |
 | mesh-wildcard | _TBD_ | _TBD_ | _TBD_ | _TBD_ | |
-| upstream-forward | _TBD_ | _TBD_ | _TBD_ | _TBD_ | |
+| upstream-forward | _TBD_ | _TBD_ | _TBD_ | _TBD_ | TCP forward to `dns_upstream_stub` |
 
 ## Direct baseline (dns_upstream_stub)
 
@@ -105,9 +109,10 @@ Only the upstream-forward class is meaningful here (mesh-internal / mesh-wildcar
   cache hit on the second-and-later identical queries (`cached_mesh_response`).
 - **Mesh-wildcard latency** adds a one-label suffix scan (sorted by suffix
   length) — expect a small p99 bump versus exact matches.
-- **Upstream-forward latency** = round-trip to `dns_upstream_stub` + gateway
-  txid rewriting cost. Subtract the direct-stub baseline to attribute gateway
-  overhead.
+- **Upstream-forward latency** = round-trip to `dns_upstream_stub` (UDP or
+  TCP, matching the client transport) + gateway txid rewriting cost. Subtract
+  the direct-stub baseline to attribute gateway overhead. The stub must listen
+  on both transports; a UDP-only stub makes TCP rows connection-refused.
 - Localhost-only topology; Linux `recvmmsg` vs other OS UDP paths differ —
   publish per runner OS/class.
 - CP stub publishes one slice; slice-churn cost belongs to `mesh/slice_apply`,

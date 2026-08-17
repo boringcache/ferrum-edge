@@ -4,7 +4,7 @@
 //! deliberately small — we only need:
 //!   - build_query(name, qtype, txid) -> Vec<u8>
 //!   - parse_response(packet) -> ParsedResponse
-//!   - frame_for_tcp(packet) / unframe_from_tcp(buf)
+//!   - frame_for_tcp(packet) / unframe_from_tcp(buf) / decode_tcp_dns_length
 
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
@@ -64,13 +64,52 @@ fn encode_dns_name(name: &str, buf: &mut Vec<u8>) {
     buf.push(0);
 }
 
+/// Maximum DNS-over-TCP message size (RFC 1035 §4.2.2 two-byte length).
+pub const DNS_TCP_MAX_MESSAGE: usize = u16::MAX as usize;
+
+/// DNS-over-TCP framing error. Empty prefixes are rejected because a DNS
+/// header is at least 12 bytes and a zero-length frame would otherwise spin
+/// a request loop.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TcpDnsFrameError {
+    EmptyLength,
+    Incomplete,
+}
+
+/// Decode the RFC 1035 §4.2.2 two-byte length prefix.
+pub fn decode_tcp_dns_length(len_bytes: [u8; 2]) -> Result<usize, TcpDnsFrameError> {
+    let len = u16::from_be_bytes(len_bytes) as usize;
+    if len == 0 {
+        Err(TcpDnsFrameError::EmptyLength)
+    } else {
+        Ok(len)
+    }
+}
+
 /// Frame a UDP-style DNS packet for TCP transport (RFC 1035 §4.2.2):
-/// prepend a 2-byte length.
-pub fn frame_for_tcp(packet: &[u8]) -> Vec<u8> {
+/// prepend a 2-byte length. Returns `None` for an empty packet or when the
+/// packet cannot be represented in a u16 length prefix.
+pub fn frame_for_tcp(packet: &[u8]) -> Option<Vec<u8>> {
+    if packet.is_empty() || packet.len() > DNS_TCP_MAX_MESSAGE {
+        return None;
+    }
     let mut framed = Vec::with_capacity(packet.len() + 2);
     framed.extend_from_slice(&(packet.len() as u16).to_be_bytes());
     framed.extend_from_slice(packet);
-    framed
+    Some(framed)
+}
+
+/// Split one complete TCP DNS frame off the front of `buf`.
+/// Returns `(message, remainder)`.
+pub fn unframe_from_tcp(buf: &[u8]) -> Result<(&[u8], &[u8]), TcpDnsFrameError> {
+    if buf.len() < 2 {
+        return Err(TcpDnsFrameError::Incomplete);
+    }
+    let len = decode_tcp_dns_length([buf[0], buf[1]])?;
+    if buf.len() < 2 + len {
+        return Err(TcpDnsFrameError::Incomplete);
+    }
+    Ok((&buf[2..2 + len], &buf[2 + len..]))
 }
 
 /// Parsed view of a DNS response. Only the fields the harness uses.

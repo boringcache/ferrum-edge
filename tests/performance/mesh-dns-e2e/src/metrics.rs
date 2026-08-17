@@ -142,12 +142,97 @@ pub struct ClassReport {
     pub total_bytes: u64,
 }
 
+impl ClassReport {
+    /// Fail closed when a selected row recorded no successes or any query error.
+    pub fn failure_reason(&self) -> Option<String> {
+        if self.total_queries == 0 {
+            Some(format!(
+                "DNS row {}/{} recorded zero successful queries (errors={}, nxdomain={})",
+                self.name_class, self.transport, self.total_errors, self.total_nxdomain
+            ))
+        } else if self.total_errors != 0 {
+            Some(format!(
+                "DNS row {}/{} recorded {} query errors (successful={}, nxdomain={})",
+                self.name_class,
+                self.transport,
+                self.total_errors,
+                self.total_queries,
+                self.total_nxdomain
+            ))
+        } else if self.total_nxdomain != 0 {
+            Some(format!(
+                "DNS row {}/{} recorded {} unexpected NXDOMAIN responses (successful={})",
+                self.name_class, self.transport, self.total_nxdomain, self.total_queries
+            ))
+        } else {
+            None
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct RunReport {
     pub target: String,
     pub concurrency: u64,
     pub duration_secs: u64,
     pub reports: Vec<ClassReport>,
+}
+
+/// Return a reason when any selected class/transport row is absent, duplicated,
+/// unexpected, incomplete, or errorful.
+pub fn selected_reports_failure(
+    reports: &[ClassReport],
+    expected_classes: &[NameClass],
+    expected_transports: &[Transport],
+) -> Option<String> {
+    if expected_classes.is_empty() || expected_transports.is_empty() {
+        return Some("no DNS class/transport rows were selected".to_string());
+    }
+    for class in expected_classes {
+        for transport in expected_transports {
+            let matches = reports
+                .iter()
+                .filter(|report| {
+                    report.name_class == class.as_str()
+                        && report.transport == transport.as_str()
+                })
+                .count();
+            if matches == 0 {
+                return Some(format!(
+                    "selected DNS row {}/{} was not collected",
+                    class.as_str(),
+                    transport.as_str()
+                ));
+            }
+            if matches > 1 {
+                return Some(format!(
+                    "selected DNS row {}/{} was collected {matches} times",
+                    class.as_str(),
+                    transport.as_str()
+                ));
+            }
+        }
+    }
+    for report in reports {
+        let class_selected = expected_classes
+            .iter()
+            .any(|class| report.name_class == class.as_str());
+        let transport_selected = expected_transports
+            .iter()
+            .any(|transport| report.transport == transport.as_str());
+        if !class_selected || !transport_selected {
+            return Some(format!(
+                "unexpected DNS row {}/{} was collected",
+                report.name_class, report.transport
+            ));
+        }
+    }
+    for report in reports {
+        if let Some(reason) = report.failure_reason() {
+            return Some(reason);
+        }
+    }
+    None
 }
 
 pub fn format_duration_us(us: u64) -> String {
