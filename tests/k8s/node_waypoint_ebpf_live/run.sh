@@ -1949,12 +1949,13 @@ spec:
 # #3957). This is the actual threat model, and it is deliberately NOT the
 # pod-netns prober above: a datagram leaving a pod netns crosses a veth, where
 # `skb_scrub_packet` clears `skb->mark`, so a pod cannot deliver a forged mark
-# into the host namespace at all. A host-network workload with NET_ADMIN can:
-# its socket IS in the host netns, so `SO_MARK` reaches the enrolled pod's veth
-# egress hook intact, and `IP_TRANSPARENT` lets it bind a Service ClusterIP it
-# does not own. That combination presents every packet attribute the tc UDP
-# guard used to accept. What it cannot present is `bpf_skb_cgroup_id()`: its
-# socket carries its OWN cgroup, not the NodeWaypoint relay's.
+# into the host namespace at all. A host-network workload with NET_ADMIN and
+# NET_RAW can: its socket IS in the host netns, so `SO_MARK` reaches the enrolled
+# pod's veth egress hook intact, and a raw datagram can carry a Service ClusterIP
+# and the occupied listener source port. That combination presents every packet
+# attribute the tc UDP guard used to accept. What it cannot present is
+# `bpf_skb_cgroup_id()`: its socket carries its OWN cgroup, not the NodeWaypoint
+# relay's.
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -1982,11 +1983,11 @@ spec:
           command: ["sh", "-c", "sleep 365d"]
           securityContext:
             capabilities:
-              # NET_ADMIN for SO_MARK and IP_TRANSPARENT. Explicit so the
-              # forgery is DETERMINISTIC: a sandbox that cannot forge FAILS the
-              # required gate rather than recording a refusal for an attack
-              # nothing attempted.
-              add: ["NET_ADMIN"]
+              # NET_ADMIN for SO_MARK and NET_RAW for the exact raw source
+              # tuple. Explicit so the forgery is DETERMINISTIC: a sandbox that
+              # cannot forge FAILS the required gate rather than recording a
+              # refusal for an attack nothing attempted.
+              add: ["NET_ADMIN", "NET_RAW"]
 ---
 # Unenrolled DTLS sender for the Service-path refusal check (issue #3286 root
 # review). Same posture as udp-unmanaged — outside the mesh namespace, no
@@ -4467,7 +4468,10 @@ except OSError:
 # Forge the COMPLETE pre-#3956/#3957 UDP admission from the HOST network
 # namespace and send it straight at an enrolled pod, bypassing the waypoint.
 #
-# `source_ip` is bound with IP_TRANSPARENT, so this drives BOTH historical
+# A raw IPv4 datagram is intentional: the live NodeWaypoint already owns the
+# wildcard listener port, so a second UDP socket cannot reliably bind the exact
+# `(ClusterIP, listener port)` tuple. The raw packet carries that exact source
+# port without colliding with the serving listener. This drives BOTH historical
 # bypass shapes from one helper: pass a trusted node source address for the
 # #3956 shape (node source + mark) and a published Service ClusterIP for the
 # #3957 shape (listener-wide reply tuple + mark, replayed at a destination its
@@ -4475,23 +4479,22 @@ except OSError:
 #
 # Output contract mirrors `udp_spoof_probe_from`, so a refusal can never be
 # recorded for an attack that was never mounted:
-#   FORGED-UNAVAILABLE:<detail>  — the socket, mark, bind, or send FAILED.
+#   FORGED-UNAVAILABLE:<detail>  — the socket, mark, header, or send FAILED.
 #   FORGED-SENT                  — the datagram WAS emitted.
 # The prefix is printed only after `sendto` returns.
 udp_forged_relay_probe_from() {
   local ns="$1" app="$2" target_ip="$3" port="$4" source_ip="$5" mark="$6" payload="$7"
   kubectl -n "$ns" exec "deploy/$app" -c udp -- python -u -c '
 import socket
+import struct
 import sys
 
 target, port, source, mark, payload = (
     sys.argv[1], int(sys.argv[2]), sys.argv[3], int(sys.argv[4]), sys.argv[5].encode()
 )
 
-IP_TRANSPARENT = 19
-
 try:
-    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    s = socket.socket(socket.AF_INET, socket.SOCK_RAW, socket.IPPROTO_RAW)
 except OSError as exc:
     sys.stdout.write("FORGED-UNAVAILABLE:socket:%s" % exc.errno)
     raise SystemExit(0)
@@ -4504,22 +4507,27 @@ except OSError as exc:
     sys.stdout.write("FORGED-UNAVAILABLE:so_mark:%s" % exc.errno)
     raise SystemExit(0)
 
-# IP_TRANSPARENT so a ClusterIP this host does not own is still bindable,
-# which is what makes the listener-wide reply-source tuple replayable.
 try:
-    s.setsockopt(socket.SOL_IP, IP_TRANSPARENT, 1)
+    s.setsockopt(socket.IPPROTO_IP, socket.IP_HDRINCL, 1)
 except OSError as exc:
-    sys.stdout.write("FORGED-UNAVAILABLE:ip_transparent:%s" % exc.errno)
+    sys.stdout.write("FORGED-UNAVAILABLE:ip_hdrincl:%s" % exc.errno)
     raise SystemExit(0)
 
 try:
-    s.bind((source, 0))
-except OSError as exc:
-    sys.stdout.write("FORGED-UNAVAILABLE:bind:%s" % exc.errno)
+    udp_len = 8 + len(payload)
+    udp_header = struct.pack("!HHHH", port, port, udp_len, 0)
+    total_len = 20 + udp_len
+    ip_header = struct.pack(
+        "!BBHHHBBH4s4s",
+        0x45, 0, total_len, 0, 0, 64, socket.IPPROTO_UDP, 0,
+        socket.inet_aton(source), socket.inet_aton(target),
+    )
+except (OSError, struct.error) as exc:
+    sys.stdout.write("FORGED-UNAVAILABLE:header:%s" % type(exc).__name__)
     raise SystemExit(0)
 
 try:
-    s.sendto(payload, (target, port))
+    s.sendto(ip_header + udp_header + payload, (target, 0))
 except OSError as exc:
     sys.stdout.write("FORGED-UNAVAILABLE:sendto:%s" % exc.errno)
     raise SystemExit(0)
@@ -4827,7 +4835,7 @@ refusal was observed" "" "$(spiffe_for_sa dst-a)" "node-waypoint-udp-listener"
     if [[ "$forger_result" != "FORGED-SENT" ]]; then
       record_live_assertion node_waypoint.udp.listener_deny_forged_relay_mark fail \
         udp-forger udp-echo \
-        "shape=$shape no forged datagram could be emitted despite hostNetwork+NET_ADMIN \
+        "shape=$shape no forged datagram could be emitted despite hostNetwork+NET_ADMIN+NET_RAW \
 ($forger_result), so no refusal was observed" "" "$(spiffe_for_sa dst-a)" \
         "node-waypoint-udp-listener"
       collect_traffic_failure_diagnostics

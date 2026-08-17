@@ -797,13 +797,6 @@ impl NodeWaypointUdpSteering {
     /// — including the active-empty headless shape — so the relay-cgroup
     /// sender proof stays live for the direct-node lane.
     fn converge_serving_unsteered(&self, state: &mut SteeringState) -> SteerReconcileOutcome {
-        if state.reaped
-            && state.applied.is_none()
-            && Self::generation_proven(state, &state.desired_destinations, true)
-        {
-            return SteerReconcileOutcome::Unchanged;
-        }
-
         let rules_removed = if !state.reaped || state.applied.is_some() {
             self.remove_rules(state)
         } else {

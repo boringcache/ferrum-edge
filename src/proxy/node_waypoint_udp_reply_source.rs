@@ -718,23 +718,21 @@ impl NodeWaypointUdpReplySourcePublisher for RegistryDirReplySourcePublisher {
         })?;
 
         let mut last = lock_recovering(&self.last);
-        if let Some((sequence, published_active, published)) = last.as_ref() {
-            if *published_active == active && published == &canonical {
-                return Ok(ReplySourceGeneration {
-                    owner: owner.to_string(),
-                    sequence: *sequence,
-                    active,
-                });
+        let sequence = match last.as_ref() {
+            Some((sequence, published_active, published))
+                if *published_active == active && published == &canonical =>
+            {
+                *sequence
             }
-        }
-        let sequence = self
-            .next_sequence
-            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |sequence| {
-                sequence.checked_add(1)
-            })
-            .map_err(|_| {
-                "NodeWaypoint UDP reply-source generation sequence is exhausted".to_string()
-            })?;
+            _ => self
+                .next_sequence
+                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |sequence| {
+                    sequence.checked_add(1)
+                })
+                .map_err(|_| {
+                    "NodeWaypoint UDP reply-source generation sequence is exhausted".to_string()
+                })?,
+        };
         let generation = ReplySourceGeneration {
             owner: owner.to_string(),
             sequence,

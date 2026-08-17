@@ -154,6 +154,42 @@ fn tc_inbound_udp_admission_requires_the_non_forgeable_relay_sender_proof() {
     }
 }
 
+/// The live #3957 replay must carry the exact published `(ClusterIP, port)`
+/// tuple. An ephemeral source port would be rejected by the old classifier too
+/// and could therefore report a false security pass.
+#[test]
+fn forged_relay_live_probe_uses_the_exact_reply_source_port() {
+    let live = include_str!("../../../tests/k8s/node_waypoint_ebpf_live/run.sh");
+    let helper = live
+        .split("udp_forged_relay_probe_from() {")
+        .nth(1)
+        .expect("forged relay helper")
+        .split("\n}\n")
+        .next()
+        .expect("forged relay helper body");
+
+    assert!(
+        helper.contains("socket.socket(socket.AF_INET, socket.SOCK_RAW, socket.IPPROTO_RAW)"),
+        "the occupied wildcard listener port requires a raw packet for an exact replay"
+    );
+    assert!(
+        helper.contains("s.setsockopt(socket.SOL_SOCKET, socket.SO_MARK, mark)"),
+        "the probe must carry the public relay mark"
+    );
+    assert!(
+        helper.contains("struct.pack(\"!HHHH\", port, port, udp_len, 0)"),
+        "the forged UDP source port must equal the published listener port"
+    );
+    assert!(
+        !helper.contains("s.bind((source, 0))"),
+        "an ephemeral source port does not exercise the reply-source admission lane"
+    );
+    assert!(
+        live.contains("add: [\"NET_ADMIN\", \"NET_RAW\"]"),
+        "the live forger must be able to set the mark and emit the exact raw tuple"
+    );
+}
+
 /// An ACTIVE generation — including the active-empty headless shape — carries
 /// the publishing proxy's own pod identity. An INACTIVE withdrawal deliberately
 /// does not.
