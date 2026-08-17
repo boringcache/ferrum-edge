@@ -735,6 +735,16 @@ jobs:
               fi
             done
           fi
+          # A pattern download that matched exactly ONE artifact extracts its
+          # payload directly into the channel root (no per-artifact
+          # subdirectory) — the ordinary first-attempt shape. Multiple matched
+          # attempts nest one subdirectory each and the newest wins above.
+          if [ -z "$selected" ] \
+            && [ -f "$channel_root/fips-producer-handoff.tar.zst" ] \
+            && [ ! -L "$channel_root/fips-producer-handoff.tar.zst" ]; then
+            selected="$channel_root"
+            selected_attempt="single"
+          fi
           if [ -z "$selected" ]; then
             echo "::error::fips-compile producer handoff was not published for this event-stable source SHA/run_id; refusing to claim compile-to-consumer reuse" >&2
             exit 1
@@ -1012,6 +1022,16 @@ jobs:
               fi
             done
           fi
+          # A pattern download that matched exactly ONE artifact extracts its
+          # payload directly into the channel root (no per-artifact
+          # subdirectory) — the ordinary first-attempt shape. Multiple matched
+          # attempts nest one subdirectory each and the newest wins above.
+          if [ -z "$selected" ] \
+            && [ -f "$channel_root/fips-producer-handoff.tar.zst" ] \
+            && [ ! -L "$channel_root/fips-producer-handoff.tar.zst" ]; then
+            selected="$channel_root"
+            selected_attempt="single"
+          fi
           if [ -z "$selected" ]; then
             echo "::error::fips-compile producer handoff was not published for this event-stable source SHA/run_id; refusing to claim compile-to-consumer reuse" >&2
             exit 1
@@ -1245,6 +1265,16 @@ jobs:
                 selected="$candidate"
               fi
             done
+          fi
+          # A pattern download that matched exactly ONE artifact extracts its
+          # payload directly into the channel root (no per-artifact
+          # subdirectory) — the ordinary first-attempt shape. Multiple matched
+          # attempts nest one subdirectory each and the newest wins above.
+          if [ -z "$selected" ] \
+            && [ -f "$channel_root/fips-producer-handoff.tar.zst" ] \
+            && [ ! -L "$channel_root/fips-producer-handoff.tar.zst" ]; then
+            selected="$channel_root"
+            selected_attempt="single"
           fi
           if [ -z "$selected" ]; then
             echo "::error::fips-compile producer handoff was not published for this event-stable source SHA/run_id; refusing to claim compile-to-consumer reuse" >&2
