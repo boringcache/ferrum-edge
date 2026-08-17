@@ -5767,6 +5767,20 @@ mod inner {
             }
         }
 
+        /// Select every registry document that claims `name` through either
+        /// its durable `_id` or embedded `name`. Reads and vacancy checks must
+        /// validate both surfaces: filtering only by `_id` would let a corrupt
+        /// `_id = other, name = target` document be ignored while create or
+        /// rename inserted a second durable identity for the same name.
+        fn namespace_registry_identity_scan_filter(name: &str) -> Document {
+            doc! {
+                "$or": [
+                    { "_id": name },
+                    { "name": name },
+                ],
+            }
+        }
+
         /// Occupancy filter for one collection: split-identity collections
         /// inspect both the embedded field and the durable key; every other
         /// occupancy table is namespace-field only. `proxy_route_locks` is
@@ -5911,18 +5925,25 @@ mod inner {
             session: &mut ClientSession,
             name: &str,
         ) -> mongodb::error::Result<Option<NamespaceRecord>> {
-            let doc = self
+            let mut cursor = self
                 .namespaces()
-                .find_one(doc! { "_id": name })
+                .find(Self::namespace_registry_identity_scan_filter(name))
                 .session(&mut *session)
                 .await?;
-            Ok(match doc {
-                Some(doc) => Some(
-                    Self::document_to_namespace_record(Some(name), doc)
-                        .map_err(mongodb::error::Error::custom)?,
-                ),
-                None => None,
-            })
+            let mut record = None;
+            while cursor.advance(&mut *session).await? {
+                let parsed = Self::document_to_namespace_record(
+                    Some(name),
+                    cursor.deserialize_current()?,
+                )
+                .map_err(mongodb::error::Error::custom)?;
+                if record.replace(parsed).is_some() {
+                    return Err(mongodb::error::Error::custom(
+                        NamespaceRegistryCorrupt::field("identity"),
+                    ));
+                }
+            }
+            Ok(record)
         }
 
         async fn namespace_name_in_use_in_session(
@@ -5931,9 +5952,7 @@ mod inner {
             name: &str,
         ) -> mongodb::error::Result<bool> {
             if self
-                .namespaces()
-                .find_one(doc! { "_id": name })
-                .session(&mut *session)
+                .get_namespace_in_session(&mut *session, name)
                 .await?
                 .is_some()
             {
@@ -12442,11 +12461,21 @@ mod inner {
             name: &str,
         ) -> Result<Option<crate::config::namespace_registry::NamespaceRecord>, anyhow::Error>
         {
-            let doc = self.namespaces().find_one(doc! { "_id": name }).await?;
-            Ok(match doc {
-                Some(doc) => Some(Self::document_to_namespace_record(Some(name), doc)?),
-                None => None,
-            })
+            let mut cursor = self
+                .namespaces()
+                .find(Self::namespace_registry_identity_scan_filter(name))
+                .await?;
+            let mut record = None;
+            while cursor.advance().await? {
+                let parsed =
+                    Self::document_to_namespace_record(Some(name), cursor.deserialize_current()?)?;
+                if record.replace(parsed).is_some() {
+                    return Err(anyhow::Error::new(NamespaceRegistryCorrupt::field(
+                        "identity",
+                    )));
+                }
+            }
+            Ok(record)
         }
 
         async fn namespace_name_in_use(&self, name: &str) -> Result<bool, anyhow::Error> {
@@ -15178,6 +15207,11 @@ mod inner {
                     .upsert(true)
                     .await?;
             }
+            // Validate every registry identity before declaring compatibility
+            // complete. In particular, an old `_id = other, name = ferrum`
+            // document must fail startup rather than coexist with the valid
+            // row this pass just upserted.
+            let _ = self.registry_namespace_names().await?;
             // Marker last, and never as a namespaces document: a crash before
             // this write leaves completion absent so the next serialized
             // compatibility pass retries the idempotent upserts.

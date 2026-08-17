@@ -341,15 +341,19 @@ retryable lost-lease refusal. Connect/migrate runs a **one-time** compatibility
 backfill of pre-existing derived names plus canonical `ferrum`, then records
 completion in `_ferrum_schema_compat` (not a registry document). A failed
 attempt leaves that marker absent so a later startup retries; once complete,
-later migrate/reconnect/startup passes do not reseed deleted names. Confirmed
-cascade delete scans both the embedded
+later migrate/reconnect/startup passes do not reseed deleted names. Registry
+lookups and vacancy checks scan both durable `_id` and embedded `name`, then
+require them to agree; a split identity is typed corruption, never an absent
+name that create or rename may reuse. Confirmed cascade delete scans both the
+embedded
 `namespace` field and the durable key identity for consumers, the consumer
 identity index, and the gateway trust bundle, and aborts as typed registry
 corruption if those identities disagree, so a key-only or mismatched document
 cannot be ignored or deleted under the wrong tenant. Rename uses the same
 split-identity scan for the gateway trust bundle before rewriting anything:
-`_id`, embedded `namespace`, and resource `id` must agree with the source
-namespace, or the whole transaction aborts as typed corruption and never
+`_id` and embedded `namespace` must agree with the source namespace; the
+separate operator-chosen resource `id` must be a nonempty string and is
+preserved. Otherwise the whole transaction aborts as typed corruption and never
 rewrites another tenant's document. Historical `audit_events`
 documents are immutable evidence and are **not**
 bulk-rewritten on rename: they retain the namespace recorded when the event

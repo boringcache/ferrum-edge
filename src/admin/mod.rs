@@ -9221,9 +9221,9 @@ async fn acquire_namespace_registry_admission(
 /// backend verified every lease inside the transaction it committed, against the
 /// datastore's own clock, so the write WAS authorized even though this process's
 /// local liveness view has since lapsed. A `Lost` completion whose persistence
-/// failed, and a lease lost before persistence started, both surface as the
-/// retryable fail-closed 503 — no unverified late write is ever reported as
-/// success.
+/// failed is mapped from the backend's typed error (including a commit-boundary
+/// lease loss as the retryable fail-closed 503); a lease lost before persistence
+/// started is also 503. No unverified late write is ever reported as success.
 async fn run_namespace_registry_mutation<T, F>(
     admission: &crud::NamespaceRegistryAdmission,
     future: F,

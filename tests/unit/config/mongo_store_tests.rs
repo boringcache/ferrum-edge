@@ -1641,8 +1641,8 @@ fn namespace_keyed_document_move_requires_embedded_namespace_equality() {
         body.contains("require_namespace_keyed_identity(")
             && body.contains("document.get_str(\"namespace\").ok()")
             && body.contains("document.get_str(\"id\").ok()"),
-        "keyed trust documents must require `_id`, embedded namespace, and resource id \
-         to agree with the source namespace:\n{body}"
+        "keyed trust documents must require source-matching `_id` and embedded namespace, \
+         plus a nonempty resource id:\n{body}"
     );
     assert!(
         !body.contains("if document.get_str(\"namespace\").is_ok()"),
@@ -1876,7 +1876,8 @@ fn mongo_namespace_cascade_validates_split_identities_before_delete() {
             && keyed.contains("document.get_str(\"namespace\").ok()")
             && keyed.contains("document.get_str(\"id\").ok()")
             && keyed.contains("NamespaceRegistryCorrupt::field"),
-        "keyed collect must require `_id`, embedded namespace, and resource id to match the current tenant:\n{keyed}"
+        "keyed collect must require source-matching `_id` and embedded namespace, plus a \
+         nonempty resource id:\n{keyed}"
     );
     assert!(
         !keyed.contains("delete_one") && !keyed.contains("delete_many"),
@@ -1939,6 +1940,35 @@ fn mongo_namespace_rename_validates_split_trust_identity_before_any_mutation() {
 }
 
 #[test]
+fn mongo_namespace_registry_reads_validate_both_identity_surfaces() {
+    let filter = mongo_fn_body("        fn namespace_registry_identity_scan_filter(");
+    assert!(
+        filter.contains("{ \"_id\": name }") && filter.contains("{ \"name\": name }"),
+        "registry reads must expose both halves of a split identity:\n{filter}"
+    );
+
+    let session_get = mongo_method("get_namespace_in_session(");
+    assert!(
+        session_get.contains("namespace_registry_identity_scan_filter(name)")
+            && session_get.contains("document_to_namespace_record(")
+            && session_get.contains("Some(name)"),
+        "transactional create/rename/delete vacancy checks must validate every registry \
+         document claiming the name:\n{session_get}"
+    );
+    assert!(
+        !session_get.contains("find_one(doc! { \"_id\": name })"),
+        "an _id-only read would ignore `_id = other, name = target` corruption:\n{session_get}"
+    );
+
+    let public_get = mongo_method("get_namespace(\n");
+    assert!(
+        public_get.contains("namespace_registry_identity_scan_filter(name)")
+            && public_get.contains("document_to_namespace_record("),
+        "the public GET/precheck path must fail closed on the same split identity:\n{public_get}"
+    );
+}
+
+#[test]
 fn mongo_namespace_delete_rechecks_protected_default_in_session() {
     let session = mongo_method("delete_namespace_in_session(");
     assert!(
@@ -1982,6 +2012,13 @@ fn mongo_namespace_registry_backfill_is_one_time_and_crash_retryable() {
     assert!(
         completed_at < insert_at && insert_at < mark_at,
         "a completed backfill must skip inserts; the marker must be written last so a crash retries:\n{body}"
+    );
+    let validate_at = body
+        .find("registry_namespace_names")
+        .expect("registry identity validation before completion");
+    assert!(
+        insert_at < validate_at && validate_at < mark_at,
+        "a split registry identity must abort before the compatibility marker is durable:\n{body}"
     );
 
     let completed = mongo_method("namespaces_registry_backfill_completed(");

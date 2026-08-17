@@ -8461,16 +8461,16 @@ impl DatabaseStore {
         require_namespace_registry_admission_leases(&[name], leases).map_err(anyhow::Error::new)?;
         let start = Instant::now();
         let fault = namespace_registry_fault(name);
+        let mut tx = self.pool().begin().await?;
+        // Postgres: must precede every other statement in the transaction.
+        self.use_delete_capture_snapshot_tx(&mut tx).await?;
+        check_namespace_registry_fault(fault, RegistryPhase::Start)?;
         if name == self.effective_default_namespace {
             return Err(RegistryError::protected(
                 name,
                 RegistryError::PROTECTED_PROCESS_DEFAULT,
             ));
         }
-        let mut tx = self.pool().begin().await?;
-        // Postgres: must precede every other statement in the transaction.
-        self.use_delete_capture_snapshot_tx(&mut tx).await?;
-        check_namespace_registry_fault(fault, RegistryPhase::Start)?;
 
         if !self.namespace_name_in_use_tx(&mut tx, name).await? {
             return Ok(false);

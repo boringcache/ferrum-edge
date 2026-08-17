@@ -22,9 +22,10 @@ use ferrum_edge::config::batch_atomicity::{
 };
 use ferrum_edge::config::db_backend::DatabaseBackend;
 use ferrum_edge::config::db_loader::{DatabaseStore, DbPoolConfig};
-use ferrum_edge::config::namespace_registry::{
-    MAX_NAMESPACE_DESCRIPTION_CHARS, NamespaceRegistryPhase, set_namespace_registry_fault,
+use ferrum_edge::_test_support::{
+    NamespaceRegistryPhase, set_namespace_registry_fault_for_test,
 };
+use ferrum_edge::config::namespace_registry::MAX_NAMESPACE_DESCRIPTION_CHARS;
 use ferrum_edge::config::types::GatewayConfig;
 use jsonwebtoken::{EncodingKey, Header, encode};
 use serde_json::{Value, json};
@@ -1224,7 +1225,10 @@ async fn a_late_transaction_failure_rolls_the_whole_tenant_back() {
     // Trip AFTER the resource rows, the guard rows, and the registry row have
     // all been written inside the transaction. A happy-path test can never
     // reach this step.
-    set_namespace_registry_fault("rollback", Some(NamespaceRegistryPhase::LastNamespaceCheck));
+    set_namespace_registry_fault_for_test(
+        "rollback",
+        Some(NamespaceRegistryPhase::LastNamespaceCheck),
+    );
     let (status, _body) = send(
         reqwest::Method::DELETE,
         &base,
@@ -1233,7 +1237,7 @@ async fn a_late_transaction_failure_rolls_the_whole_tenant_back() {
         None,
     )
     .await;
-    set_namespace_registry_fault("rollback", None);
+    set_namespace_registry_fault_for_test("rollback", None);
     assert_eq!(status, 500, "an injected late failure is a server error");
 
     assert!(
@@ -1284,7 +1288,10 @@ async fn a_lost_admission_lease_fails_closed_at_the_commit_boundary() {
 
     // Handler path: a lease reported lost at the commit gate is the retryable
     // fail-closed 503, and nothing is deleted.
-    set_namespace_registry_fault("leased", Some(NamespaceRegistryPhase::LeaseLost));
+    set_namespace_registry_fault_for_test(
+        "leased",
+        Some(NamespaceRegistryPhase::LeaseLost),
+    );
     let (status, body) = send(
         reqwest::Method::DELETE,
         &base,
@@ -1293,7 +1300,7 @@ async fn a_lost_admission_lease_fails_closed_at_the_commit_boundary() {
         None,
     )
     .await;
-    set_namespace_registry_fault("leased", None);
+    set_namespace_registry_fault_for_test("leased", None);
     assert_eq!(status, 503, "lost lease is retryable: {body:?}");
     assert_eq!(body["rollback"], "not_needed");
     assert!(registry_row_exists(&store, "leased").await);

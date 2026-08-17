@@ -4813,6 +4813,18 @@ pub mod _test_support {
         crate::config::batch_atomicity::set_atomic_batch_fault(namespace, fault);
     }
 
+    pub use crate::config::namespace_registry::NamespaceRegistryPhase;
+
+    /// Install (or clear) one deterministic namespace-registry transaction
+    /// abort. The production module keeps this installer crate-private; only
+    /// external tests reach it through this explicitly test-only seam.
+    pub fn set_namespace_registry_fault_for_test(
+        namespace: &str,
+        phase: Option<NamespaceRegistryPhase>,
+    ) {
+        crate::config::namespace_registry::set_namespace_registry_fault(namespace, phase);
+    }
+
     /// Shrink the per-chunk write size for one namespace so a small fixture can
     /// still cross a chunk boundary. `None` restores the backend default.
     pub fn set_atomic_batch_chunk_size_for_test(namespace: &str, chunk_size: Option<usize>) {
