@@ -6699,7 +6699,11 @@ pub fn reconcile_node_waypoint_udp_reply_sources(
         return;
     }
 
-    if let Err(error) = backend.set_udp_reply_sources_enabled(true) {
+    // An inactive generation proves a withdrawal: both maps are empty and the
+    // shared gate stays closed. Only an active generation may reopen the lane.
+    if desired.generation.active()
+        && let Err(error) = backend.set_udp_reply_sources_enabled(true)
+    {
         state.applied = None;
         state.applied_relay_cgroups = None;
         // A failed update is not assumed atomic. Re-drive disabled once; if

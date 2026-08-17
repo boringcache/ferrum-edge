@@ -2307,6 +2307,10 @@ fn withdrawing_a_source_revokes_its_authorization_under_a_new_generation() {
         authorized(&backend).is_empty(),
         "a full retraction must leave nothing authorized"
     );
+    assert!(
+        !backend.udp_reply_sources_enabled,
+        "an inactive retraction must leave the shared classifier gate closed"
+    );
     assert_eq!(
         acknowledgement(registry.path()),
         Some(empty),
