@@ -99,13 +99,18 @@ Full policy: `docs/dependency-policy.md`. These are the load-bearing rules.
   base.
 - Cross-sensitive `ci.yml` jobs `ci-plan`, `test`, and `performance-regression`
   carry temporary SHA-256 generation pairs (`CI_JOB_GENERATION_TRANSITIONS`)
-  for PRs #3913 and #3911. `setup-rust-ci/action.yml` carries exactly one
-  trusted-base pair (`LOCAL_ACTION_GENERATION_TRANSITIONS`): current-main
+  for PRs #3913 and #3911. `setup-rust-ci/action.yml` carries a two-step
+  trusted-base chain (`LOCAL_ACTION_GENERATION_TRANSITIONS`): #3889's landed
   `fc4e41818dffdea880c057c8dfa0881a629cd01c917b43f69a9f2e5e9bd90dda` moving to
-  the combined #3911 destination
-  `57a99a179ddc2935af187f518a803bf167eb9e33593c37b7b29f7151ec994da2`. Exact,
-  path-bound, one-way, no candidate allowlist. See `docs/ci_cd.md` →
-  "Admitted CI job SHA-256 generation transitions".
+  the cache-budget generation
+  `b6ca6315ff9f2a206c1011b6b0166de3a340370fd75bf3e9cffe41e872008924`
+  (rust-cache `save-if` gated to trusted `refs/heads/main`), which may then
+  move to the rebased combined #3911 destination
+  `219187bdb0366d929577e67f48947b8c1096998dd7e04eafdffdb53dc3faa925`
+  (adds the optional `workspaces` input/pass-through on top). The former
+  direct #3889→#3911 pair is superseded; #3911 must rebase to the combined
+  text. Each step is exact, path-bound, one-way, no candidate allowlist. See
+  `docs/ci_cd.md` → "Admitted CI job SHA-256 generation transitions".
 
 ## Drift Guard
 
