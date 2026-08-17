@@ -895,43 +895,89 @@ jobs:
           reject_hostile_tar_member() {
             local member="$1"
             case "$member" in
-              *$'\r'*|*$'\n'*)
+              ''|.|..)
+                fail "producer handoff archive member is malformed"
+                ;;
+              *[![:print:]]*|*\\*)
                 fail "producer handoff archive member is malformed"
                 ;;
               /*)
                 fail "producer handoff archive member uses an absolute path"
                 ;;
-              ..|../*|*/..|*/../*|*/..)
-                fail "producer handoff archive member uses path traversal"
-                ;;
             esac
+            local part
+            local IFS='/'
+            for part in $member; do
+              case "$part" in
+                ''|.|..|*[![:print:]]*|*\\*)
+                  fail "producer handoff archive member uses path traversal"
+                  ;;
+              esac
+            done
           }
 
           assert_identity_member() {
             local archive="$1"
             local expected="$2"
-            local member listing line_count found=0
-            while IFS= read -r member || [ -n "$member" ]; do
-              [ -n "$member" ] || continue
-              reject_hostile_tar_member "$member"
-              if [ "$member" = "$expected" ]; then
-                found=1
-              fi
-            done < <(tar --zstd -tf "$archive")
-            if [ "$found" -ne 1 ]; then
-              fail "producer handoff archive is missing its identity member"
+            local listing_tmp verbose_tmp identity_verbose_tmp
+            local member line
+            local name_count=0 verbose_count=0 identity_count=0 identity_verbose_count=0
+            listing_tmp="$(mktemp "${RUNNER_TEMP}/fips-tar-listing.XXXXXX")"
+            verbose_tmp="$(mktemp "${RUNNER_TEMP}/fips-tar-verbose.XXXXXX")"
+            identity_verbose_tmp="$(mktemp "${RUNNER_TEMP}/fips-tar-identity-verbose.XXXXXX")"
+            if ! tar --zstd -tf "$archive" >"$listing_tmp"; then
+              rm -f "$listing_tmp" "$verbose_tmp" "$identity_verbose_tmp"
+              fail "producer handoff archive listing failed"
             fi
-            listing="$(tar --zstd -tvf "$archive" "$expected" 2>/dev/null || true)"
-            line_count="$(printf '%s\n' "$listing" | sed '/^$/d' | wc -l | tr -d ' ')"
-            if [ "$line_count" -ne 1 ]; then
+            if ! tar --zstd -tvf "$archive" >"$verbose_tmp"; then
+              rm -f "$listing_tmp" "$verbose_tmp" "$identity_verbose_tmp"
+              fail "producer handoff archive verbose listing failed"
+            fi
+            while IFS= read -r member || [ -n "$member" ]; do
+              reject_hostile_tar_member "$member"
+              name_count=$((name_count + 1))
+              if [ "$member" = "$expected" ]; then
+                identity_count=$((identity_count + 1))
+              fi
+            done <"$listing_tmp"
+            while IFS= read -r line || [ -n "$line" ]; do
+              case "$line" in
+                '') continue ;;
+                [-]*|d*) ;;
+                *)
+                  rm -f "$listing_tmp" "$verbose_tmp" "$identity_verbose_tmp"
+                  fail "producer handoff archive contains a non-file member"
+                  ;;
+              esac
+              verbose_count=$((verbose_count + 1))
+            done <"$verbose_tmp"
+            if [ "$name_count" -eq 0 ] || [ "$verbose_count" -ne "$name_count" ]; then
+              rm -f "$listing_tmp" "$verbose_tmp" "$identity_verbose_tmp"
+              fail "producer handoff archive listing is inconsistent"
+            fi
+            if [ "$identity_count" -ne 1 ]; then
+              rm -f "$listing_tmp" "$verbose_tmp" "$identity_verbose_tmp"
               fail "producer handoff archive identity member is missing or ambiguous"
             fi
-            case "$(printf '%s\n' "$listing" | sed '/^$/d')" in
-              -*) ;;
-              *)
-                fail "producer handoff archive identity member is not a regular file"
-                ;;
-            esac
+            if ! tar --zstd -tvf "$archive" "$expected" >"$identity_verbose_tmp"; then
+              rm -f "$listing_tmp" "$verbose_tmp" "$identity_verbose_tmp"
+              fail "producer handoff archive identity member listing failed"
+            fi
+            while IFS= read -r line || [ -n "$line" ]; do
+              case "$line" in
+                '') continue ;;
+                -*) identity_verbose_count=$((identity_verbose_count + 1)) ;;
+                *)
+                  rm -f "$listing_tmp" "$verbose_tmp" "$identity_verbose_tmp"
+                  fail "producer handoff archive identity member is not a regular file"
+                  ;;
+              esac
+            done <"$identity_verbose_tmp"
+            if [ "$identity_verbose_count" -ne 1 ]; then
+              rm -f "$listing_tmp" "$verbose_tmp" "$identity_verbose_tmp"
+              fail "producer handoff archive identity member is missing or ambiguous"
+            fi
+            rm -f "$listing_tmp" "$verbose_tmp" "$identity_verbose_tmp"
           }
 
           extract_identity() {
@@ -1409,43 +1455,89 @@ jobs:
           reject_hostile_tar_member() {
             local member="$1"
             case "$member" in
-              *$'\r'*|*$'\n'*)
+              ''|.|..)
+                fail "producer handoff archive member is malformed"
+                ;;
+              *[![:print:]]*|*\\*)
                 fail "producer handoff archive member is malformed"
                 ;;
               /*)
                 fail "producer handoff archive member uses an absolute path"
                 ;;
-              ..|../*|*/..|*/../*|*/..)
-                fail "producer handoff archive member uses path traversal"
-                ;;
             esac
+            local part
+            local IFS='/'
+            for part in $member; do
+              case "$part" in
+                ''|.|..|*[![:print:]]*|*\\*)
+                  fail "producer handoff archive member uses path traversal"
+                  ;;
+              esac
+            done
           }
 
           assert_identity_member() {
             local archive="$1"
             local expected="$2"
-            local member listing line_count found=0
-            while IFS= read -r member || [ -n "$member" ]; do
-              [ -n "$member" ] || continue
-              reject_hostile_tar_member "$member"
-              if [ "$member" = "$expected" ]; then
-                found=1
-              fi
-            done < <(tar --zstd -tf "$archive")
-            if [ "$found" -ne 1 ]; then
-              fail "producer handoff archive is missing its identity member"
+            local listing_tmp verbose_tmp identity_verbose_tmp
+            local member line
+            local name_count=0 verbose_count=0 identity_count=0 identity_verbose_count=0
+            listing_tmp="$(mktemp "${RUNNER_TEMP}/fips-tar-listing.XXXXXX")"
+            verbose_tmp="$(mktemp "${RUNNER_TEMP}/fips-tar-verbose.XXXXXX")"
+            identity_verbose_tmp="$(mktemp "${RUNNER_TEMP}/fips-tar-identity-verbose.XXXXXX")"
+            if ! tar --zstd -tf "$archive" >"$listing_tmp"; then
+              rm -f "$listing_tmp" "$verbose_tmp" "$identity_verbose_tmp"
+              fail "producer handoff archive listing failed"
             fi
-            listing="$(tar --zstd -tvf "$archive" "$expected" 2>/dev/null || true)"
-            line_count="$(printf '%s\n' "$listing" | sed '/^$/d' | wc -l | tr -d ' ')"
-            if [ "$line_count" -ne 1 ]; then
+            if ! tar --zstd -tvf "$archive" >"$verbose_tmp"; then
+              rm -f "$listing_tmp" "$verbose_tmp" "$identity_verbose_tmp"
+              fail "producer handoff archive verbose listing failed"
+            fi
+            while IFS= read -r member || [ -n "$member" ]; do
+              reject_hostile_tar_member "$member"
+              name_count=$((name_count + 1))
+              if [ "$member" = "$expected" ]; then
+                identity_count=$((identity_count + 1))
+              fi
+            done <"$listing_tmp"
+            while IFS= read -r line || [ -n "$line" ]; do
+              case "$line" in
+                '') continue ;;
+                [-]*|d*) ;;
+                *)
+                  rm -f "$listing_tmp" "$verbose_tmp" "$identity_verbose_tmp"
+                  fail "producer handoff archive contains a non-file member"
+                  ;;
+              esac
+              verbose_count=$((verbose_count + 1))
+            done <"$verbose_tmp"
+            if [ "$name_count" -eq 0 ] || [ "$verbose_count" -ne "$name_count" ]; then
+              rm -f "$listing_tmp" "$verbose_tmp" "$identity_verbose_tmp"
+              fail "producer handoff archive listing is inconsistent"
+            fi
+            if [ "$identity_count" -ne 1 ]; then
+              rm -f "$listing_tmp" "$verbose_tmp" "$identity_verbose_tmp"
               fail "producer handoff archive identity member is missing or ambiguous"
             fi
-            case "$(printf '%s\n' "$listing" | sed '/^$/d')" in
-              -*) ;;
-              *)
-                fail "producer handoff archive identity member is not a regular file"
-                ;;
-            esac
+            if ! tar --zstd -tvf "$archive" "$expected" >"$identity_verbose_tmp"; then
+              rm -f "$listing_tmp" "$verbose_tmp" "$identity_verbose_tmp"
+              fail "producer handoff archive identity member listing failed"
+            fi
+            while IFS= read -r line || [ -n "$line" ]; do
+              case "$line" in
+                '') continue ;;
+                -*) identity_verbose_count=$((identity_verbose_count + 1)) ;;
+                *)
+                  rm -f "$listing_tmp" "$verbose_tmp" "$identity_verbose_tmp"
+                  fail "producer handoff archive identity member is not a regular file"
+                  ;;
+              esac
+            done <"$identity_verbose_tmp"
+            if [ "$identity_verbose_count" -ne 1 ]; then
+              rm -f "$listing_tmp" "$verbose_tmp" "$identity_verbose_tmp"
+              fail "producer handoff archive identity member is missing or ambiguous"
+            fi
+            rm -f "$listing_tmp" "$verbose_tmp" "$identity_verbose_tmp"
           }
 
           extract_identity() {
@@ -1880,43 +1972,89 @@ jobs:
           reject_hostile_tar_member() {
             local member="$1"
             case "$member" in
-              *$'\r'*|*$'\n'*)
+              ''|.|..)
+                fail "producer handoff archive member is malformed"
+                ;;
+              *[![:print:]]*|*\\*)
                 fail "producer handoff archive member is malformed"
                 ;;
               /*)
                 fail "producer handoff archive member uses an absolute path"
                 ;;
-              ..|../*|*/..|*/../*|*/..)
-                fail "producer handoff archive member uses path traversal"
-                ;;
             esac
+            local part
+            local IFS='/'
+            for part in $member; do
+              case "$part" in
+                ''|.|..|*[![:print:]]*|*\\*)
+                  fail "producer handoff archive member uses path traversal"
+                  ;;
+              esac
+            done
           }
 
           assert_identity_member() {
             local archive="$1"
             local expected="$2"
-            local member listing line_count found=0
-            while IFS= read -r member || [ -n "$member" ]; do
-              [ -n "$member" ] || continue
-              reject_hostile_tar_member "$member"
-              if [ "$member" = "$expected" ]; then
-                found=1
-              fi
-            done < <(tar --zstd -tf "$archive")
-            if [ "$found" -ne 1 ]; then
-              fail "producer handoff archive is missing its identity member"
+            local listing_tmp verbose_tmp identity_verbose_tmp
+            local member line
+            local name_count=0 verbose_count=0 identity_count=0 identity_verbose_count=0
+            listing_tmp="$(mktemp "${RUNNER_TEMP}/fips-tar-listing.XXXXXX")"
+            verbose_tmp="$(mktemp "${RUNNER_TEMP}/fips-tar-verbose.XXXXXX")"
+            identity_verbose_tmp="$(mktemp "${RUNNER_TEMP}/fips-tar-identity-verbose.XXXXXX")"
+            if ! tar --zstd -tf "$archive" >"$listing_tmp"; then
+              rm -f "$listing_tmp" "$verbose_tmp" "$identity_verbose_tmp"
+              fail "producer handoff archive listing failed"
             fi
-            listing="$(tar --zstd -tvf "$archive" "$expected" 2>/dev/null || true)"
-            line_count="$(printf '%s\n' "$listing" | sed '/^$/d' | wc -l | tr -d ' ')"
-            if [ "$line_count" -ne 1 ]; then
+            if ! tar --zstd -tvf "$archive" >"$verbose_tmp"; then
+              rm -f "$listing_tmp" "$verbose_tmp" "$identity_verbose_tmp"
+              fail "producer handoff archive verbose listing failed"
+            fi
+            while IFS= read -r member || [ -n "$member" ]; do
+              reject_hostile_tar_member "$member"
+              name_count=$((name_count + 1))
+              if [ "$member" = "$expected" ]; then
+                identity_count=$((identity_count + 1))
+              fi
+            done <"$listing_tmp"
+            while IFS= read -r line || [ -n "$line" ]; do
+              case "$line" in
+                '') continue ;;
+                [-]*|d*) ;;
+                *)
+                  rm -f "$listing_tmp" "$verbose_tmp" "$identity_verbose_tmp"
+                  fail "producer handoff archive contains a non-file member"
+                  ;;
+              esac
+              verbose_count=$((verbose_count + 1))
+            done <"$verbose_tmp"
+            if [ "$name_count" -eq 0 ] || [ "$verbose_count" -ne "$name_count" ]; then
+              rm -f "$listing_tmp" "$verbose_tmp" "$identity_verbose_tmp"
+              fail "producer handoff archive listing is inconsistent"
+            fi
+            if [ "$identity_count" -ne 1 ]; then
+              rm -f "$listing_tmp" "$verbose_tmp" "$identity_verbose_tmp"
               fail "producer handoff archive identity member is missing or ambiguous"
             fi
-            case "$(printf '%s\n' "$listing" | sed '/^$/d')" in
-              -*) ;;
-              *)
-                fail "producer handoff archive identity member is not a regular file"
-                ;;
-            esac
+            if ! tar --zstd -tvf "$archive" "$expected" >"$identity_verbose_tmp"; then
+              rm -f "$listing_tmp" "$verbose_tmp" "$identity_verbose_tmp"
+              fail "producer handoff archive identity member listing failed"
+            fi
+            while IFS= read -r line || [ -n "$line" ]; do
+              case "$line" in
+                '') continue ;;
+                -*) identity_verbose_count=$((identity_verbose_count + 1)) ;;
+                *)
+                  rm -f "$listing_tmp" "$verbose_tmp" "$identity_verbose_tmp"
+                  fail "producer handoff archive identity member is not a regular file"
+                  ;;
+              esac
+            done <"$identity_verbose_tmp"
+            if [ "$identity_verbose_count" -ne 1 ]; then
+              rm -f "$listing_tmp" "$verbose_tmp" "$identity_verbose_tmp"
+              fail "producer handoff archive identity member is missing or ambiguous"
+            fi
+            rm -f "$listing_tmp" "$verbose_tmp" "$identity_verbose_tmp"
           }
 
           extract_identity() {

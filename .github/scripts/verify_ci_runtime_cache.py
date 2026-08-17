@@ -1179,6 +1179,49 @@ def check_fips_producer_channel(
             "fips-compile handoff upload must contain only the packaged producer",
             failures,
         )
+    require(
+        workflow.count('if ! tar --zstd -tf "$archive" >"$listing_tmp"; then') >= 3,
+        "FIPS consumer promotion must capture tar listings in temp files and fail "
+        "closed on listing errors",
+        failures,
+    )
+    require(
+        'done < <(tar --zstd -tf' not in workflow,
+        "FIPS consumer promotion must not read tar listings through process "
+        "substitution",
+        failures,
+    )
+    require(
+        'tar --zstd -tvf "$archive" "$expected" 2>/dev/null || true' not in workflow,
+        "FIPS consumer promotion must not mask tar identity listing failures with "
+        "|| true",
+        failures,
+    )
+    require(
+        workflow.count('fail "producer handoff archive member uses path traversal"')
+        >= 3,
+        "FIPS consumer promotion must reject path traversal in archive member names",
+        failures,
+    )
+    require(
+        workflow.count('if [ "$identity_count" -ne 1 ]; then') >= 3,
+        "FIPS consumer promotion must reject duplicate identity archive members",
+        failures,
+    )
+    require(
+        workflow.count(
+            'fail "producer handoff archive contains a non-file member"'
+        ) >= 3,
+        "FIPS consumer promotion must reject symlink and special tar members",
+        failures,
+    )
+    require(
+        workflow.count(
+            '-*) identity_verbose_count=$((identity_verbose_count + 1)) ;;'
+        ) >= 3,
+        "FIPS consumer promotion must require identity members to be regular files",
+        failures,
+    )
     consumer_promote_contract = (
         'channel_root="${RUNNER_TEMP}/fips-producer-channel"',
         '"$PREFIX"*) ;;',
@@ -1193,9 +1236,16 @@ def check_fips_producer_channel(
         "fips-producer-identity",
         "reject_hostile_tar_member()",
         "assert_identity_member()",
-        'tar --zstd -tf "$archive"',
+        'mktemp "${RUNNER_TEMP}/fips-tar-listing.XXXXXX")',
+        "producer handoff archive listing failed",
+        "producer handoff archive verbose listing failed",
+        "producer handoff archive identity member listing failed",
+        "producer handoff archive contains a non-file member",
+        "producer handoff archive listing is inconsistent",
+        "producer handoff archive member is malformed",
         "producer handoff archive member uses an absolute path",
         "producer handoff archive member uses path traversal",
+        "producer handoff archive identity member is missing or ambiguous",
         "producer handoff archive identity member is not a regular file",
         'if [ -z "$payload_dir" ]',
         "refusing to claim compile-to-consumer reuse",
@@ -3788,6 +3838,88 @@ def self_test() -> int:
             for item in bsd_tar_identity_extract_failures
         ),
         "self-test: BSD-only tar identity extraction must fail",
+        failures,
+    )
+
+    masked_tar_listing_failure = handoff_channel.replace(
+        'if ! tar --zstd -tf "$archive" >"$listing_tmp"; then',
+        'tar --zstd -tf "$archive" >"$listing_tmp" || true\n'
+        '            if false; then',
+    )
+    masked_tar_listing_failure_failures: list[str] = []
+    check_fips_producer_channel(
+        masked_tar_listing_failure, masked_tar_listing_failure_failures
+    )
+    require(
+        any(
+            "capture tar listings in temp files" in item
+            for item in masked_tar_listing_failure_failures
+        ),
+        "self-test: masking tar listing failure must fail",
+        failures,
+    )
+
+    hostile_tar_member = handoff_channel.replace(
+        'fail "producer handoff archive member uses path traversal"',
+        'fail "producer handoff archive member uses an absolute path"',
+    )
+    hostile_tar_member_failures: list[str] = []
+    check_fips_producer_channel(hostile_tar_member, hostile_tar_member_failures)
+    require(
+        any(
+            "reject path traversal in archive member names" in item
+            for item in hostile_tar_member_failures
+        ),
+        "self-test: dropping path-traversal rejection must fail",
+        failures,
+    )
+
+    duplicate_identity_member = handoff_channel.replace(
+        'if [ "$identity_count" -ne 1 ]; then',
+        'if [ "$identity_count" -lt 1 ]; then',
+    )
+    duplicate_identity_member_failures: list[str] = []
+    check_fips_producer_channel(
+        duplicate_identity_member, duplicate_identity_member_failures
+    )
+    require(
+        any(
+            "reject duplicate identity archive members" in item
+            for item in duplicate_identity_member_failures
+        ),
+        "self-test: accepting duplicate identity members must fail",
+        failures,
+    )
+
+    non_regular_identity_member = handoff_channel.replace(
+        '                -*) identity_verbose_count=$((identity_verbose_count + 1)) ;;',
+        '                -*|d*) identity_verbose_count=$((identity_verbose_count + 1)) ;;',
+    )
+    non_regular_identity_member_failures: list[str] = []
+    check_fips_producer_channel(
+        non_regular_identity_member, non_regular_identity_member_failures
+    )
+    require(
+        any(
+            "require identity members to be regular files" in item
+            for item in non_regular_identity_member_failures
+        ),
+        "self-test: accepting a non-regular identity member must fail",
+        failures,
+    )
+
+    special_tar_member = handoff_channel.replace(
+        '                [-]*|d*) ;;',
+        '                [-]*|d*|l*) ;;',
+    )
+    special_tar_member_failures: list[str] = []
+    check_fips_producer_channel(special_tar_member, special_tar_member_failures)
+    require(
+        any(
+            "reject symlink and special tar members" in item
+            for item in special_tar_member_failures
+        ),
+        "self-test: accepting special tar members must fail",
         failures,
     )
 
