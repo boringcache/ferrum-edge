@@ -1208,6 +1208,7 @@ async fn h3_auth_lifetime_stalled_cross_protocol_plain_response_cannot_outlive_t
     let reservation = reserve_port().await.expect("backend port");
     let backend_port = reservation.port;
 
+    let primed = Bytes::from_static(b"primed-cross-protocol-data");
     let big = Bytes::from(vec![b'x'; 64 * 1024]);
     let mut steps = vec![
         H2Step::ExpectHeaders(MatchHeaders::any()),
@@ -1216,6 +1217,13 @@ async fn h3_auth_lifetime_stalled_cross_protocol_plain_response_cannot_outlive_t
             ("content-type", "text/event-stream".to_string()),
             ("cache-control", "no-cache".to_string()),
         ]),
+        H2Step::RespondData {
+            data: primed.clone(),
+            end_stream: false,
+        },
+        // Let the gateway flush the priming frame independently before the
+        // first bulk frame parks on the client's tiny receive window.
+        H2Step::Sleep(Duration::from_millis(100)),
     ];
     for _ in 0..40 {
         steps.push(H2Step::RespondData {
@@ -1231,6 +1239,13 @@ async fn h3_auth_lifetime_stalled_cross_protocol_plain_response_cannot_outlive_t
         .expect("spawn bulk h2 backend");
 
     let (harness, https_port) = spawn_h3_gateway(protected_proxy_yaml(backend_port), false).await;
+    let capability = wait_for_h2_bridge_ready(&harness, Duration::from_secs(20)).await;
+    assert!(
+        capability.is_some(),
+        "the H2/TLS backend must be classified for the cross-protocol bridge before the \
+         short-lived credential is minted; logs:\n{}",
+        harness.captured_combined().unwrap_or_default()
+    );
 
     let client = Http3Client::insecure_with_stream_receive_window(4 * 1024).expect("H3 client");
     let token = mint_short_lived_token();
@@ -1251,6 +1266,16 @@ async fn h3_auth_lifetime_stalled_cross_protocol_plain_response_cannot_outlive_t
         Some("text/event-stream"),
         "the relay under test must be the streaming SSE one"
     );
+
+    // Prove the post-DATA precondition before deliberately stalling. Reading
+    // this small priming frame restores only its own flow-control credit; the
+    // following 64 KiB frame still cannot complete in a 4 KiB stream window.
+    let first = stream
+        .recv_data()
+        .await
+        .expect("priming response DATA must arrive before credential expiry")
+        .expect("priming response must not end before DATA");
+    assert_eq!(first, primed, "priming response payload must match");
 
     // Stop reading. Only the authorization bound can end this exchange.
     assert_credential_expired_exactly(&harness, "http", 1).await;
