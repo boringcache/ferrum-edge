@@ -3114,11 +3114,17 @@ async fn node_waypoint_udp_shared_rebind_clears_every_member_failure() {
         failures.is_empty(),
         "shared listener must rebind: {failures:?}"
     );
+    // `wait_until_started` looks up per-proxy runtime keys and cannot observe
+    // a shared `__nwudp_{port}` handle (the documented limitation the shared
+    // helper exists for); the sibling shared-group tests all wait on the exact
+    // shared key.
     assert!(
-        manager
-            .wait_until_started(Duration::from_secs(5))
-            .await
-            .is_ok(),
+        wait_until_shared_nw_udp_listener_started(
+            &manager,
+            &format!("__nwudp_{port}"),
+            Duration::from_secs(5),
+        )
+        .await,
         "rebound shared listener must start"
     );
     assert!(
