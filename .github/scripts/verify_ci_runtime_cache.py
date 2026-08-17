@@ -1131,7 +1131,7 @@ def check_fips_producer_channel(
         in package_steps[0]
         and 'printf \'%s\\n\' "$source_tree" > "$tree_manifest"'
         in package_steps[0]
-        and 'tar --zstd -cf "$archive" -C "$RUNNER_TEMP"'
+        and 'tar --zstd --hard-dereference -cf "$archive" -C "$RUNNER_TEMP"'
         in package_steps[0]
         and "fips-producer-identity fips-producer-source-tree"
         in package_steps[0]
@@ -1141,7 +1141,7 @@ def check_fips_producer_channel(
         in package_steps[0],
         "fips-compile must package target, sccache, identity, and the clean "
         "checkout tree identity into a nonempty tar.zst handoff that preserves "
-        "executable modes",
+        "executable modes and materializes hard-linked outputs as regular files",
         failures,
     )
     require(
@@ -3997,7 +3997,7 @@ def self_test() -> int:
     )
 
     unpackaged_handoff = handoff_channel.replace(
-        '          tar --zstd -cf "$archive" -C "$RUNNER_TEMP" \\\n'
+        '          tar --zstd --hard-dereference -cf "$archive" -C "$RUNNER_TEMP" \\\n'
         "            fips-producer-identity fips-producer-source-tree \\\n"
         '            -C "$GITHUB_WORKSPACE" target .cache/sccache\n',
         "          true\n",
@@ -4010,6 +4010,20 @@ def self_test() -> int:
             "package target, sccache" in item for item in unpackaged_failures
         ),
         "self-test: direct permission-losing producer upload must fail",
+        failures,
+    )
+
+    linked_handoff = handoff_channel.replace(
+        "tar --zstd --hard-dereference -cf", "tar --zstd -cf", 1
+    )
+    linked_handoff_failures: list[str] = []
+    check_fips_producer_channel(linked_handoff, linked_handoff_failures)
+    require(
+        any(
+            "materializes hard-linked outputs as regular files" in item
+            for item in linked_handoff_failures
+        ),
+        "self-test: a producer archive that preserves hard-link members must fail",
         failures,
     )
 
