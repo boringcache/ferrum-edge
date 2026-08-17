@@ -125,7 +125,7 @@ inter-run warm source. It is deliberately not a repository cache:
 concurrent CI writers empirically evicted a 4.15 GB late cache handoff within
 three minutes, and the former run-attempt-scoped `actions/cache` producer key
 was repeatedly LRU-evicted out of the shared repository quota between the
-producer's save and the consumers' restores, while a failed-jobs rerun looked
+producer's save and the consumers' restores, while a failed-job rerun looked
 for an attempt-scoped key the skipped producer had never saved. The filtered
 test consumer rejects unexpected names, symlinks, path escapes, and SHA-256
 mismatches before executing those binaries directly. It does not ask Cargo to
@@ -167,7 +167,7 @@ extracts each into an artifact-named child directory. Promotion admits both
 layouts, binds the attempt from the `fips-producer-identity` member packaged
 inside the tar (never from the consumer's `github.run_attempt`), requires
 child directory names and payload identity to agree, and never publishes that
-channel — a failed-jobs rerun therefore
+channel — a failed-job rerun therefore
 reuses the artifact the skipped producer published at an earlier attempt.
 Each
 claimed shard selects profiles from the policy checker's single inventory by
