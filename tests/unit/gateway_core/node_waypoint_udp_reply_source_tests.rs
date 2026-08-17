@@ -186,7 +186,9 @@ fn a_proxy_without_a_relay_identity_authorizes_nothing_but_still_withdraws() {
         "a refused publication must leave no manifest behind"
     );
 
-    let generation = publisher.publish(&[]).expect("withdrawal must stay provable");
+    let generation = publisher
+        .publish(&[])
+        .expect("withdrawal must stay provable");
     write_acknowledgement(registry.path(), &generation).expect("node-agent proof");
     assert_eq!(
         publisher.acknowledged().expect("bound proof"),
@@ -615,7 +617,10 @@ fn a_malformed_generation_is_refused_whole() {
         format!("ferrum-udp-reply-src v2 {owner} 1 1 UPPER\n{a}\n"),
         format!("ferrum-udp-reply-src v2 {owner} 1 1 -lead\n{a}\n"),
         format!("ferrum-udp-reply-src v2 {owner} 1 1 trail-\n{a}\n"),
-        format!("ferrum-udp-reply-src v2 {owner} 1 1 {}\n{a}\n", "a".repeat(65)),
+        format!(
+            "ferrum-udp-reply-src v2 {owner} 1 1 {}\n{a}\n",
+            "a".repeat(65)
+        ),
         // Count disagrees with the body — the truncation case a per-file
         // directory could not even detect.
         format!("ferrum-udp-reply-src v2 {owner} 1 2 {uid}\n{a}\n"),

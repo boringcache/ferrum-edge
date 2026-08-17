@@ -2055,10 +2055,9 @@ fn relay_cgroup_root() -> &'static std::path::Path {
     static ROOT: std::sync::OnceLock<tempfile::TempDir> = std::sync::OnceLock::new();
     ROOT.get_or_init(|| {
         let dir = tempfile::tempdir().expect("relay cgroup root");
-        std::fs::create_dir_all(
-            dir.path()
-                .join(format!("kubepods/pod{RELAY_POD_UID}/cri-containerd-relay.scope")),
-        )
+        std::fs::create_dir_all(dir.path().join(format!(
+            "kubepods/pod{RELAY_POD_UID}/cri-containerd-relay.scope"
+        )))
         .expect("relay cgroup tree");
         dir
     })
