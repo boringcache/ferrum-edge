@@ -1263,8 +1263,7 @@ async fn test_frontend_dtls_refuses_untrusted_client_without_completing_the_hand
     let temp_dir = tempfile::TempDir::new().expect("temp dir");
     let accepted_ca = generate_ca("DTLS accepted client CA");
     let withdrawn_ca = generate_ca("DTLS withdrawn client CA");
-    let accepted_client =
-        generate_client_auth_cert(&accepted_ca, "accepted-client", &["client-a"]);
+    let accepted_client = generate_client_auth_cert(&accepted_ca, "accepted-client", &["client-a"]);
     let withdrawn_client =
         generate_client_auth_cert(&withdrawn_ca, "withdrawn-client", &["client-b"]);
     let accepted_chain = ferrum_edge::dtls::load_dtls_certificate(
