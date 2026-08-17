@@ -92,9 +92,15 @@ paths:
 
 - Hostile-parser fuzzing lives in the isolated `fuzz/` cargo-fuzz workspace; see
   `docs/fuzz.md` for budgets, corpora policy, and crash promotion.
-- Ordinary PR CI runs the deterministic inline `Fuzz Smoke` job in
-  `.github/workflows/ci.yml`.
-- Longer sanitizer-backed runs are scheduled in `.github/workflows/fuzz.yml` only.
+- Ordinary full-mode PR CI runs the deterministic `Fuzz Smoke` property gate
+  (`cargo test --locked` in `fuzz/`) in `.github/workflows/ci.yml`.
+- The six-target bounded sanitizer smoke (`-runs=512`, `-max_total_time=8`,
+  `-max_len=4096`) runs on `merge_group`, push to `main`, and manual
+  `workflow_dispatch` of `ci.yml`, not on `pull_request`.
+- `Swatinem/rust-cache` `save-if` for that job is strictly a push to `main`;
+  pull_request, fork, merge_group, and workflow_dispatch never publish a
+  `fuzz-smoke` cache.
+- Longer sanitizer-backed runs remain scheduled in `.github/workflows/fuzz.yml`.
 
 ## CI Expectations
 
