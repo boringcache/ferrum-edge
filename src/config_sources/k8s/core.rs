@@ -48,6 +48,10 @@ impl PodKey {
 struct CoreService {
     ports: Vec<ServicePort>,
     has_selector: bool,
+    /// Explicit headless declaration (`spec.clusterIP: "None"` or
+    /// `spec.clusterIPs` containing `"None"`). Empty VIP lists alone are not
+    /// headless — ExternalName and malformed objects also omit ClusterIP.
+    is_headless: bool,
     /// `spec.clusterIPs` (fallback `spec.clusterIP`), excluding the headless
     /// sentinel `"None"` and empty strings. Raw-TCP egress maps captured
     /// original destinations to services through these VIPs.
@@ -261,6 +265,16 @@ pub(super) fn finalize(acc: &mut K8sAccumulator) -> Result<(), K8sTranslateError
     Ok(())
 }
 
+/// True when the Service declares the Kubernetes headless sentinel.
+fn service_spec_is_headless(spec: &Value) -> bool {
+    if string_field(spec, "clusterIP").is_some_and(|ip| ip == "None") {
+        return true;
+    }
+    spec.get("clusterIPs")
+        .and_then(Value::as_array)
+        .is_some_and(|ips| ips.iter().any(|ip| ip.as_str() == Some("None")))
+}
+
 fn collect_service(acc: &mut K8sAccumulator, object: &K8sObject) -> Result<(), K8sTranslateError> {
     let Some(key) = K8sServiceKey::new(
         object.metadata.namespace.clone(),
@@ -330,6 +344,7 @@ fn collect_service(acc: &mut K8sAccumulator, object: &K8sObject) -> Result<(), K
                 .get("selector")
                 .and_then(Value::as_object)
                 .is_some_and(|selector| !selector.is_empty()),
+            is_headless: service_spec_is_headless(&object.spec),
             cluster_ips,
             uid: object.metadata.uid.clone(),
         },
@@ -765,7 +780,7 @@ pub(super) fn service_dns_fallback_dial_port(
     let Some(service) = acc.core.services.get(&service_key) else {
         return service_port;
     };
-    if !service.cluster_ips.is_empty() {
+    if !service.is_headless {
         return service_port;
     }
 

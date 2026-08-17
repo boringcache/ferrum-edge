@@ -195,6 +195,74 @@ fn headless_ready_endpoint_slices_still_expand_to_pod_ip_and_target_port() {
 }
 
 #[test]
+fn external_name_without_cluster_ip_keeps_service_port() {
+    let result = translate_k8s_objects(
+        &[
+            service(
+                "external-backend",
+                json!({
+                    "type": "ExternalName",
+                    "externalName": "example.com",
+                    "ports": [{
+                        "name": "first-port",
+                        "protocol": "TCP",
+                        "port": 8080,
+                        "targetPort": 3000
+                    }]
+                }),
+            ),
+            empty_manual_slice("external-backend"),
+            http_route("/external", "external-backend"),
+        ],
+        options(),
+    )
+    .expect("ExternalName Service without ClusterIP should translate");
+
+    assert_eq!(result.config.proxies.len(), 1);
+    let proxy = &result.config.proxies[0];
+    assert_eq!(
+        proxy.backend_host,
+        "external-backend.default.svc.cluster.local"
+    );
+    assert_eq!(
+        proxy.backend_port, 8080,
+        "ExternalName DNS fallback must keep the declared Service port, not targetPort"
+    );
+}
+
+#[test]
+fn headless_cluster_ips_none_sentinel_dials_target_port() {
+    let result = translate_k8s_objects(
+        &[
+            service(
+                "headless-cluster-ips",
+                json!({
+                    "clusterIPs": ["None"],
+                    "ports": [{
+                        "name": "first-port",
+                        "protocol": "TCP",
+                        "port": 8080,
+                        "targetPort": 3000
+                    }]
+                }),
+            ),
+            empty_manual_slice("headless-cluster-ips"),
+            http_route("/headless-cluster-ips", "headless-cluster-ips"),
+        ],
+        options(),
+    )
+    .expect("headless clusterIPs sentinel should translate");
+
+    assert_eq!(result.config.proxies.len(), 1);
+    let proxy = &result.config.proxies[0];
+    assert_eq!(
+        proxy.backend_host,
+        "headless-cluster-ips.default.svc.cluster.local"
+    );
+    assert_eq!(proxy.backend_port, 3000);
+}
+
+#[test]
 fn headless_named_target_port_resolves_from_empty_slice_ports() {
     let mut slice = empty_manual_slice("headless-named");
     slice.spec["ports"] = json!([{
