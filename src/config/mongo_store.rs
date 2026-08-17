@@ -6031,9 +6031,9 @@ mod inner {
                     let old_id = document
                         .get_str("_id")
                         .map_err(|_| {
-                            mongodb::error::Error::custom(
-                                NamespaceRegistryCorrupt::field("identity"),
-                            )
+                            mongodb::error::Error::custom(NamespaceRegistryCorrupt::field(
+                                "identity",
+                            ))
                         })?
                         .to_string();
                     let suffix = require_namespace_prefixed_identity(

@@ -455,9 +455,7 @@ pub fn require_canonical_stored_description(
     let Some(raw) = description else {
         return Ok(None);
     };
-    if raw.is_empty()
-        || raw.trim() != raw
-        || raw.chars().count() > MAX_NAMESPACE_DESCRIPTION_CHARS
+    if raw.is_empty() || raw.trim() != raw || raw.chars().count() > MAX_NAMESPACE_DESCRIPTION_CHARS
     {
         return Err(NamespaceRegistryCorrupt::field("description"));
     }

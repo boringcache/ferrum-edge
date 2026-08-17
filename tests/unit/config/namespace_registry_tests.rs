@@ -368,14 +368,8 @@ fn require_namespace_prefixed_identity_requires_suffix_field_and_embedded_namesp
         ("secret-id", Some("secret-ns"), Some("secret-id")),
         ("other-ns:secret-id", Some("secret-ns"), Some("secret-id")),
     ] {
-        let err = require_namespace_prefixed_identity(
-            "secret-ns",
-            old_id,
-            embedded,
-            "id",
-            suffix,
-        )
-        .expect_err("corrupt composite identities must abort");
+        let err = require_namespace_prefixed_identity("secret-ns", old_id, embedded, "id", suffix)
+            .expect_err("corrupt composite identities must abort");
         let text = err.to_string();
         assert!(text.contains(NamespaceRegistryCorrupt::MESSAGE), "{text}");
         assert!(
