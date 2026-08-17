@@ -106,7 +106,9 @@ mod inner {
         RequiredMongoIndex, classify_guard_collections, classify_plan_against_live,
         default_index_name, required_mongo_indexes,
     };
-    use crate::config::namespace_registry::NamespaceRecord;
+    use crate::config::namespace_registry::{
+        DERIVED_NAMESPACE_RESOURCE_TABLES, NAMESPACE_OCCUPANCY_TABLES, NamespaceRecord,
+    };
     use regex::escape as regex_escape;
 
     // MongoDB server error codes used by the index-upgrade logic in
@@ -11310,14 +11312,7 @@ mod inner {
             if self.get_namespace(name).await?.is_some() {
                 return Ok(true);
             }
-            for collection in [
-                "proxies",
-                "consumers",
-                "plugin_configs",
-                "upstreams",
-                "gateway_trust_bundles",
-                "api_specs",
-            ] {
+            for &collection in NAMESPACE_OCCUPANCY_TABLES {
                 let count = self
                     .collection(collection)
                     .count_documents(doc! { "namespace": name })
@@ -11351,7 +11346,7 @@ mod inner {
                     },
                 ));
             }
-            let doc = namespace_registry_doc(record);
+            let doc = Self::namespace_registry_doc(record);
             self.namespaces().insert_one(doc).await?;
             Ok(())
         }
@@ -11393,16 +11388,19 @@ mod inner {
             record.name = new_name.to_string();
 
             if new_name == current_name {
+                // An explicit `null` keeps Mongo and SQL in step: both clear
+                // the stored description rather than leaving the prior value.
+                let description_bson = match &record.description {
+                    Some(value) => Bson::String(value.clone()),
+                    None => Bson::Null,
+                };
                 self.namespaces()
                     .update_one(
                         doc! { "_id": current_name },
                         doc! {
                             "$set": {
                                 "name": current_name,
-                                "description": match &record.description {
-                                    Some(value) => Bson::String(value.clone()),
-                                    None => Bson::Null,
-                                },
+                                "description": description_bson,
                                 "created_at": record.created_at.to_rfc3339(),
                                 "updated_at": record.updated_at.to_rfc3339(),
                             }
@@ -13957,18 +13955,15 @@ mod inner {
         async fn backfill_namespaces_registry(&self) -> Result<(), anyhow::Error> {
             let now = Utc::now().to_rfc3339();
             let mut names = HashSet::new();
-            for collection in [
-                "proxies",
-                "consumers",
-                "plugin_configs",
-                "upstreams",
-                "gateway_trust_bundles",
-            ] {
+            for &collection in DERIVED_NAMESPACE_RESOURCE_TABLES {
                 for ns in self.distinct_namespaces(collection).await? {
                     names.insert(ns);
                 }
             }
+            // `ferrum` per issue #3955, plus the configured process default so
+            // the namespace DELETE refuses to remove always exists.
             names.insert(crate::config::types::DEFAULT_NAMESPACE.to_string());
+            names.insert(crate::config::namespace_registry::process_default_namespace());
             for name in names {
                 let _ = self
                     .namespaces()
@@ -14027,7 +14022,7 @@ mod inner {
             record: &crate::config::namespace_registry::NamespaceRecord,
         ) -> Result<(), anyhow::Error> {
             self.namespaces()
-                .insert_one(namespace_registry_doc(record))
+                .insert_one(Self::namespace_registry_doc(record))
                 .await?;
 
             for collection in [

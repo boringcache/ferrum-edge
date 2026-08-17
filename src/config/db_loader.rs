@@ -8085,6 +8085,7 @@ impl DatabaseStore {
             "id, ?, username, custom_id, credentials, acl_groups, created_at, updated_at",
             current_name,
             new_name,
+            false,
         )
         .await?;
         sqlx::query(
@@ -8113,6 +8114,7 @@ impl DatabaseStore {
             "?, id, trust_domain, bundle, revision, updated_by, created_at, updated_at",
             current_name,
             new_name,
+            false,
         )
         .await?;
         sqlx::query(&self.q("DELETE FROM gateway_trust_bundles WHERE namespace = ?"))
@@ -8127,6 +8129,7 @@ impl DatabaseStore {
             "?, route_key_hash, created_at",
             current_name,
             new_name,
+            true,
         )
         .await?;
         sqlx::query(&self.q("DELETE FROM proxy_route_locks WHERE namespace = ?"))
@@ -8141,6 +8144,7 @@ impl DatabaseStore {
             "?, updated_at, restore_owner",
             current_name,
             new_name,
+            true,
         )
         .await?;
         sqlx::query(&self.q("DELETE FROM mtls_dns_admission_locks WHERE namespace = ?"))
@@ -8155,6 +8159,7 @@ impl DatabaseStore {
             "?, retained_sequence, updated_at",
             current_name,
             new_name,
+            true,
         )
         .await?;
         sqlx::query(&self.q("DELETE FROM config_change_retention WHERE namespace = ?"))
@@ -8224,6 +8229,18 @@ impl DatabaseStore {
         Ok(())
     }
 
+    /// Copy one namespace's rows of a namespace-keyed table under the new name.
+    ///
+    /// `ignore_conflicts` is for the advisory lock/retention tables only.
+    /// `delete_all_resources` deliberately leaves `proxy_route_locks`,
+    /// `mtls_dns_admission_locks`, and `config_change_retention` rows behind, so
+    /// a name that is legitimately free (no registry row and no resource row)
+    /// can still carry stale rows there — for example the same
+    /// `route_key_hash` for an identical listen path. A strict INSERT would
+    /// abort the whole rename transaction on that primary-key collision.
+    /// Resource tables stay strict: the handler already proved the target name
+    /// unoccupied, so a conflict there is a real integrity failure.
+    #[allow(clippy::too_many_arguments)]
     async fn copy_namespace_pk_rows_tx(
         &self,
         tx: &mut sqlx::Transaction<'_, sqlx::Any>,
@@ -8232,10 +8249,21 @@ impl DatabaseStore {
         select_expr: &str,
         current_name: &str,
         new_name: &str,
+        ignore_conflicts: bool,
     ) -> Result<(), anyhow::Error> {
+        // MySQL has no `ON CONFLICT`; `INSERT IGNORE` is its idempotent form.
+        // The trailing upsert clause is unambiguous on SQLite only because the
+        // SELECT carries a WHERE clause, which it always does here.
+        let (insert_verb, conflict_clause) = if !ignore_conflicts {
+            ("INSERT", "")
+        } else if self.db_type == "mysql" {
+            ("INSERT IGNORE", "")
+        } else {
+            ("INSERT", " ON CONFLICT DO NOTHING")
+        };
         let sql = format!(
-            "INSERT INTO {table} ({insert_columns}) \
-             SELECT {select_expr} FROM {table} WHERE namespace = ?"
+            "{insert_verb} INTO {table} ({insert_columns}) \
+             SELECT {select_expr} FROM {table} WHERE namespace = ?{conflict_clause}"
         );
         sqlx::query(&self.q(&sql))
             .bind(new_name)

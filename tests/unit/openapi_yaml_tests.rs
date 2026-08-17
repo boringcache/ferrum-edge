@@ -8185,6 +8185,10 @@ fn namespace_admission_contention_is_documented_as_retryable() {
         "/paths/~1api-specs/post/responses/503",
         "/paths/~1api-specs~1{id}/put/responses/503",
         "/paths/~1api-specs~1{id}/delete/responses/503",
+        // Registry CRUD takes the same namespace-admission lease (issue #3955).
+        "/paths/~1namespaces/post/responses/503",
+        "/paths/~1namespaces~1{name}/put/responses/503",
+        "/paths/~1namespaces~1{name}/delete/responses/503",
     ] {
         assert_eq!(
             spec.pointer(pointer)

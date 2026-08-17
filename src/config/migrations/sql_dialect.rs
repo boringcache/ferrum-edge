@@ -688,12 +688,21 @@ impl V001SqlBuilder {
             "INSERT INTO namespaces (name, created_at, updated_at) VALUES ($1, $2, $3) \
              ON CONFLICT (name) DO NOTHING"
         };
-        sqlx::query(insert_default)
-            .bind(crate::config::types::DEFAULT_NAMESPACE)
-            .bind(&now)
-            .bind(&now)
-            .execute(&mut *connection)
-            .await?;
+        // `ferrum` per issue #3955, plus the configured process default so the
+        // namespace the DELETE handler refuses to remove always has a row.
+        let mut defaults = vec![crate::config::types::DEFAULT_NAMESPACE.to_string()];
+        let process_default = crate::config::namespace_registry::process_default_namespace();
+        if !defaults.contains(&process_default) {
+            defaults.push(process_default);
+        }
+        for name in defaults {
+            sqlx::query(insert_default)
+                .bind(&name)
+                .bind(&now)
+                .bind(&now)
+                .execute(&mut *connection)
+                .await?;
+        }
         Ok(())
     }
 

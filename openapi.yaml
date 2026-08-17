@@ -5690,7 +5690,7 @@ paths:
         "409":
           $ref: "#/components/responses/Conflict"
         "503":
-          $ref: "#/components/responses/ServiceUnavailable"
+          $ref: "#/components/responses/NamespaceAdmissionUnavailable"
 
   /namespaces/{name}:
     parameters:
@@ -5775,7 +5775,7 @@ paths:
         "409":
           $ref: "#/components/responses/Conflict"
         "503":
-          $ref: "#/components/responses/ServiceUnavailable"
+          $ref: "#/components/responses/NamespaceAdmissionUnavailable"
     delete:
       operationId: deleteNamespace
       summary: Delete a namespace
@@ -5812,7 +5812,7 @@ paths:
         "409":
           $ref: "#/components/responses/Conflict"
         "503":
-          $ref: "#/components/responses/ServiceUnavailable"
+          $ref: "#/components/responses/NamespaceAdmissionUnavailable"
 
   # ── API Specs ────────────────────────────────────────────────────────
   /api-specs:

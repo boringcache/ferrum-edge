@@ -9154,12 +9154,23 @@ async fn acquire_namespace_admission(
         Ok(guard) => Ok(guard),
         Err(_error) => {
             warn_persistence_failure_redacted("namespace_registry_admission_acquire");
-            Err(json_response(
-                StatusCode::SERVICE_UNAVAILABLE,
-                &json!({"error": CONFIG_ADMISSION_UNAVAILABLE_MESSAGE}),
-            ))
+            // Same retryable 503 (with `Retry-After`) every other
+            // admission-leased mutation returns, so clients can back off
+            // instead of treating contention as a hard failure.
+            Err(mtls_dns_admission_unavailable_response())
         }
     }
+}
+
+/// Registry names the DELETE handler refuses to remove, as the typed conflict
+/// error so the wire shape matches every other registry 409.
+fn protected_namespace_response(name: &str, reason: &'static str) -> Response<Full<Bytes>> {
+    map_namespace_registry_error(&anyhow::Error::new(
+        crate::config::namespace_registry::NamespaceRegistryError::Protected {
+            name: name.to_string(),
+            reason,
+        },
+    ))
 }
 
 async fn handle_list_namespaces(
@@ -9505,20 +9516,16 @@ async fn handle_delete_namespace(
     };
     let process_default = crate::config::namespace_registry::process_default_namespace();
     if name == process_default {
-        return Ok(json_response(
-            StatusCode::CONFLICT,
-            &json!({"error": format!(
-                "namespace '{name}' cannot be deleted: it is the process default namespace"
-            )}),
+        return Ok(protected_namespace_response(
+            name,
+            "it is the process default namespace",
         ));
     }
     match db.list_namespaces().await {
         Ok(names) if names.len() <= 1 && names.iter().any(|existing| existing == name) => {
-            return Ok(json_response(
-                StatusCode::CONFLICT,
-                &json!({"error": format!(
-                    "namespace '{name}' cannot be deleted: it is the last remaining namespace"
-                )}),
+            return Ok(protected_namespace_response(
+                name,
+                "it is the last remaining namespace",
             ));
         }
         Ok(_) => {}
