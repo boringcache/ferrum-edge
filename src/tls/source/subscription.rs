@@ -442,6 +442,30 @@ pub fn spawn_async_material_set_reload_task(
     config: AsyncMaterialSetReloadConfig,
     shutdown_rx: Option<watch::Receiver<bool>>,
 ) -> JoinHandle<()> {
+    spawn_async_material_set_reload_task_inner(config, shutdown_rx, false)
+}
+
+/// Spawn an async material-set watcher that reconciles the accepted runtime
+/// state once after establishing its initial source fingerprint.
+///
+/// Use this when the caller loaded and published a startup candidate before
+/// the watcher existed. A source can rotate between that accepted load and the
+/// watcher's first fingerprint; treating that fingerprint as already applied
+/// would otherwise leave the startup candidate in service indefinitely. The
+/// initial reconciliation runs before the readiness signal and before normal
+/// polling, then normal byte-fingerprint change detection resumes.
+pub fn spawn_async_material_set_reload_task_with_startup_reconcile(
+    config: AsyncMaterialSetReloadConfig,
+    shutdown_rx: Option<watch::Receiver<bool>>,
+) -> JoinHandle<()> {
+    spawn_async_material_set_reload_task_inner(config, shutdown_rx, true)
+}
+
+fn spawn_async_material_set_reload_task_inner(
+    config: AsyncMaterialSetReloadConfig,
+    shutdown_rx: Option<watch::Receiver<bool>>,
+    reconcile_startup: bool,
+) -> JoinHandle<()> {
     let surface = config.surface;
     let (force_tx, force_rx) = mpsc::channel(1);
     force_reload_registry().insert(surface, force_tx.clone());
@@ -452,7 +476,8 @@ pub fn spawn_async_material_set_reload_task(
             Some(force_tx),
             shutdown_rx.clone(),
         );
-        run_async_material_set_reload_loop(config, shutdown_rx, force_rx).await;
+        run_async_material_set_reload_loop(config, shutdown_rx, force_rx, reconcile_startup)
+            .await;
         for handle in k8s_watchers {
             handle.abort();
         }
@@ -804,6 +829,7 @@ async fn run_async_material_set_reload_loop(
     config: AsyncMaterialSetReloadConfig,
     mut shutdown_rx: Option<watch::Receiver<bool>>,
     mut force_rx: mpsc::Receiver<()>,
+    reconcile_startup: bool,
 ) {
     let AsyncMaterialSetReloadConfig {
         surface,
@@ -850,9 +876,43 @@ async fn run_async_material_set_reload_loop(
     let mut last_load_failed = last_fingerprint.is_none();
     let mut last_rebuild_failure: Option<MaterialSetFingerprint> = None;
 
+    if reconcile_startup {
+        match rebuild().await {
+            Ok(()) => {
+                revision_tx.send_modify(|revision| *revision = revision.saturating_add(1));
+                info!(
+                    surface,
+                    revision = *revision_tx.borrow(),
+                    "TLS material runtime reconciled with the watcher's startup source snapshot"
+                );
+            }
+            Err(error) => {
+                if let Some(fingerprint) = last_fingerprint.as_ref() {
+                    record_refresh_for_entries(
+                        surface,
+                        &fingerprint.entries,
+                        "rebuild_error",
+                    );
+                    crate::tls::events::record_rebuild_error(
+                        surface,
+                        &fingerprint.entries,
+                        &error,
+                    );
+                    last_rebuild_failure = Some(fingerprint.clone());
+                }
+                warn!(
+                    surface,
+                    error = %error,
+                    "TLS material startup reconciliation failed; keeping the previously accepted material"
+                );
+            }
+        }
+    }
+
     // Deterministic readiness: force/tick handling starts only after the
-    // initial fingerprint baseline is established, so callers cannot race the
-    // baseline onto a rewritten candidate.
+    // initial fingerprint baseline and any requested startup reconciliation
+    // are complete, so callers cannot race the baseline onto a rewritten
+    // candidate.
     if let Some(ready_tx) = ready_tx {
         let _ = ready_tx.send(());
     }
@@ -1541,6 +1601,54 @@ mod tests {
             .expect("watcher should still be alive");
         assert_eq!(*revision_rx.borrow(), 1);
         assert_eq!(attempts.load(Ordering::SeqCst), 1);
+
+        shutdown_tx.send_replace(true);
+        task.await.expect("watcher exits cleanly");
+    }
+
+    #[tokio::test]
+    async fn async_startup_reconcile_runs_before_ready() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("cert.pem");
+        std::fs::write(&path, b"startup bytes").expect("write");
+        let source = CertSource::parse(path.to_string_lossy().into_owned(), MaterialKind::Cert);
+
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let attempts_clone = attempts.clone();
+        let rebuild: MaterialSetAsyncRebuildFn = Box::new(move || {
+            let attempts_clone = attempts_clone.clone();
+            Box::pin(async move {
+                attempts_clone.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            })
+        });
+
+        let (revision_tx, revision_rx) = watch::channel(0u64);
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let (ready_tx, ready_rx) = oneshot::channel();
+        let task = spawn_async_material_set_reload_task_with_startup_reconcile(
+            AsyncMaterialSetReloadConfig {
+                surface: "test_async_startup_reconcile",
+                sources: vec![WatchedMaterialSource::new(
+                    "cert",
+                    source,
+                    MaterialKind::Cert,
+                )],
+                interval: Duration::from_secs(3600),
+                revision_tx,
+                rebuild,
+                max_material_bytes: crate::config::env_config::DEFAULT_TLS_MAX_MATERIAL_SIZE_BYTES,
+                ready_tx: Some(ready_tx),
+            },
+            Some(shutdown_rx),
+        );
+
+        tokio::time::timeout(Duration::from_secs(2), ready_rx)
+            .await
+            .expect("startup reconcile readiness should arrive")
+            .expect("watcher should send readiness");
+        assert_eq!(attempts.load(Ordering::SeqCst), 1);
+        assert_eq!(*revision_rx.borrow(), 1);
 
         shutdown_tx.send_replace(true);
         task.await.expect("watcher exits cleanly");

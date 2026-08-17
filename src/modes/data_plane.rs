@@ -21,6 +21,7 @@ use crate::config::EnvConfig;
 use crate::config::types::GatewayConfig;
 use crate::dns::{DnsCache, DnsConfig};
 use crate::modes::startup_security;
+use crate::modes::tls_reload;
 use crate::proxy::{self, ProxyState};
 use crate::startup::wait_for_start_signals;
 use crate::tls;
@@ -340,12 +341,57 @@ pub async fn run(
     let operator_accepted_slot = proxy_frontend_reload_handles
         .as_ref()
         .and_then(|handles| handles.accepted_slot.clone());
-    let h3_pairing = operator_accepted_slot.as_ref().and_then(|slot| {
+    let mut h3_pairing = operator_accepted_slot.as_ref().and_then(|slot| {
         let initial = slot.load_full().as_ref().clone()?;
         Some(Arc::new(
             crate::grpc::dp_client::DpFrontendH3Pairing::from_operator_candidate(initial),
         ))
     });
+    // CP-only server certificate (issue #3857). This DP has an HTTPS listener
+    // slot but no operator cert/key, so CP-delivered Gateway TLS material is the
+    // only server certificate it will ever serve — while the client-CA bundle
+    // and CRL remain operator-owned inputs that CP never delivers. Arm and
+    // live-reload that operator trust anyway: the accepted verifier is what the
+    // CP snapshot's `ProxyFrontend` handshake wrapper consults on new H1/H2 and
+    // TCP+TLS handshakes, the published generation is what retires established
+    // client-certificate transports on a withdrawal, and the pairing is what
+    // hands HTTP/3 one coherent (CP server config, accepted operator trust)
+    // candidate. No operator server certificate is ever synthesized.
+    let mut dp_client_trust_watcher: Option<JoinHandle<()>> = None;
+    if tls_config.is_none()
+        && h3_pairing.is_none()
+        && let Some(listener_slot) = proxy_frontend_tls_slot.clone()
+        && let Some(prepared) = tls_reload::prepare_dp_operator_client_trust(&env_config, &crls)?
+    {
+        let trust = prepared.client_trust.clone();
+        let pairing = Arc::new(
+            crate::grpc::dp_client::DpFrontendH3Pairing::from_operator_client_trust(trust.clone()),
+        );
+        // Arm the baseline before any listener accepts, so the very first
+        // connection already carries a generation the first reload can fence it
+        // against. Nothing is exposed by this transaction: CP owns the server
+        // certificate and has not delivered one yet, so there is no paired
+        // candidate and no listener config to publish — only the live verifier
+        // and the baseline generation.
+        pairing.publish_operator_client_trust(trust, None, None).await;
+        let watcher = tls_reload::spawn_dp_operator_client_trust_watcher(
+            prepared,
+            tls_reload::DpOperatorClientTrustWiring {
+                pairing: pairing.clone(),
+                listener_slot,
+                stream_listeners: proxy_state.stream_listener_manager.clone(),
+                revision_tx: proxy_frontend_tls_revision_tx.clone(),
+            },
+            env_config.tls_max_material_size_bytes,
+            Some(shutdown_tx.subscribe()),
+        );
+        dp_client_trust_watcher = Some(watcher);
+        info!(
+            interval_secs = env_config.frontend_tls_watch_interval_seconds,
+            "Frontend client-trust live reload enabled for a DP whose frontend server certificate is control-plane delivered"
+        );
+        h3_pairing = Some(pairing);
+    }
     let dp_frontend_tls_runtime =
         proxy_frontend_tls_slot
             .clone()
@@ -389,6 +435,10 @@ pub async fn run(
     let mut listener_handles = Vec::new();
     let mut background_handles: Vec<JoinHandle<()>> = Vec::new();
     let mut startup_signals = Vec::new();
+    // Long-lived watcher; it self-terminates on the shutdown receiver it holds.
+    if let Some(handle) = dp_client_trust_watcher.take() {
+        background_handles.push(handle);
+    }
 
     // Shared readiness flag. DP defers flipping it to `true` until the DP client
     // applies the first CP snapshot (and classifies backend capabilities), but

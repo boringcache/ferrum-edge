@@ -92,6 +92,18 @@ pub fn accepted_frontend_tls_slot_with(
     Arc::new(ArcSwap::new(Arc::new(Some(initial))))
 }
 
+/// Build an empty `SharedAcceptedFrontendTls` slot.
+///
+/// A data plane whose only frontend server certificate is control-plane
+/// delivered owns accepted client trust before it owns any server certificate
+/// (issue #3857). It publishes that trust immediately, but there is no
+/// candidate for the HTTP/3 endpoint to adopt until CP material arrives — and
+/// synthesizing an operator server certificate to fill the slot is exactly what
+/// must not happen. An empty slot disables the endpoint fail-closed instead.
+pub fn empty_accepted_frontend_tls_slot() -> SharedAcceptedFrontendTls {
+    Arc::new(ArcSwap::new(Arc::new(None)))
+}
+
 /// Configuration for [`spawn_frontend_tls_reload_task`].
 pub struct FrontendTlsReloadConfig {
     /// Human-readable identifier for logs ("proxy https", "admin https",

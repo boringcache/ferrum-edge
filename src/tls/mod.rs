@@ -54,7 +54,8 @@ pub use client_trust::{
 pub use frontend_reload::{
     AcceptedFrontendTls, FrontendTlsRebuildFn, FrontendTlsRebuilt, FrontendTlsReloadConfig,
     SharedAcceptedFrontendTls, SharedFrontendTls, accepted_frontend_tls_slot_with,
-    empty_frontend_tls_slot, frontend_tls_slot_with, spawn_frontend_tls_reload_task,
+    empty_accepted_frontend_tls_slot, empty_frontend_tls_slot, frontend_tls_slot_with,
+    spawn_frontend_tls_reload_task,
 };
 
 #[allow(unused_imports)]

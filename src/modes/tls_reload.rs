@@ -18,6 +18,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use futures_util::FutureExt as _;
 use rustls::ServerConfig;
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
@@ -26,7 +27,8 @@ use tracing::{info, warn};
 use crate::config::EnvConfig;
 use crate::tls::client_trust::{self, ClientTrustScope};
 use crate::tls::source::subscription::{
-    WatchedMaterialSource, material_set_poll_interval, source_is_refreshable,
+    AsyncMaterialSetReloadConfig, WatchedMaterialSource, material_set_poll_interval,
+    source_is_refreshable, spawn_async_material_set_reload_task_with_startup_reconcile,
 };
 use crate::tls::source::{CertSource, MaterialKind};
 use crate::tls::{
@@ -544,6 +546,230 @@ fn build_admin_rebuild_fn(
             config: candidate.config,
             client_trust: Some(candidate.client_trust),
         })
+    })
+}
+
+/// Watcher surface label for the DP CP-only-server-certificate operator
+/// client-trust reload.
+const DP_FRONTEND_CLIENT_TRUST_SURFACE: &str = "dp_proxy_frontend_client_trust";
+
+/// Operator-owned frontend client trust for a data plane whose **only** server
+/// certificate is control-plane delivered (issue #3857).
+///
+/// `modes::data_plane` deliberately creates an empty HTTPS listener slot when
+/// `FERRUM_PROXY_HTTPS_PORT` is enabled and the operator configured no
+/// `FERRUM_FRONTEND_TLS_CERT_PATH` / `_KEY_PATH`, so that
+/// `grpc::dp_client` can install the CP server config into it. Client trust
+/// stays operator-owned on that shape — CP frontend TLS never carries a
+/// client-CA bundle — so the client-CA/CRL half must still be loaded, armed and
+/// live-reloaded. Without it the `ProxyFrontend` scope was never armed, the CP
+/// snapshot's live-verifier wrapper silently fell back to the verifier baked
+/// into that snapshot, and an accepted CA/CRL change reached neither new
+/// H1/H2/TCP handshakes, established transports, nor HTTP/3.
+pub struct DpOperatorClientTrust {
+    /// The accepted startup load: the verifier that will be installed and the
+    /// semantic identity of exactly the bytes it was compiled from.
+    pub client_trust: AcceptedClientTrust,
+    sources: Vec<WatchedMaterialSource>,
+    interval: Duration,
+    client_ca_value: String,
+    crl_source_value: Option<String>,
+    startup_crls: CrlList,
+}
+
+/// Runtime wiring the DP operator client-trust watcher publishes into.
+pub struct DpOperatorClientTrustWiring {
+    /// The DP pairing that owns the exact H3 serving candidate and the
+    /// `ProxyFrontend` publication transaction on this shape.
+    pub pairing: Arc<crate::grpc::dp_client::DpFrontendH3Pairing>,
+    /// The H1/H2 listener slot. Only written when CP owns no server
+    /// certificate; CP material is never replaced by operator material.
+    pub listener_slot: SharedFrontendTls,
+    /// TCP+TLS stream listeners, which share the `ProxyFrontend` scope.
+    pub stream_listeners: Arc<crate::proxy::stream_listener::StreamListenerManager>,
+    /// The DP HTTP/3 revision channel. The reload loop bumps it after every
+    /// accepted publication so `ProxyH3` adopts the newly paired candidate.
+    pub revision_tx: watch::Sender<u64>,
+}
+
+/// Load and validate the operator client trust for the CP-only-certificate DP
+/// shape, or report that the shape does not apply.
+///
+/// `Ok(None)` means there is nothing to arm: live reload is off, no client-CA
+/// source is configured (so no transport on these listeners can ever hold a
+/// withdrawable client credential), or every watched source is static inline
+/// material that can never change. `Err` means client-certificate
+/// authentication IS configured but its material is unusable — fail closed at
+/// startup rather than serve CP material under an unknown trust baseline.
+pub fn prepare_dp_operator_client_trust(
+    env_config: &EnvConfig,
+    crls: &CrlList,
+) -> Result<Option<DpOperatorClientTrust>, anyhow::Error> {
+    if !env_config.frontend_tls_live_reload_enabled {
+        return Ok(None);
+    }
+    let Some(client_ca_value) = env_config.frontend_tls_client_ca_bundle_path.clone() else {
+        // No client-CA source: this listener never requests a client
+        // certificate, so no CRL or client-CA withdrawal has anything to
+        // revoke. Arming would publish an empty baseline and export retirement
+        // metrics for a protection with nothing to protect.
+        info!(
+            "Frontend TLS live reload is enabled on a data plane with no operator server certificate and no client-CA bundle; the proxy client-trust scope stays unarmed"
+        );
+        return Ok(None);
+    };
+    let client_ca_watch = WatchedMaterialSource::new(
+        "client_ca",
+        CertSource::parse(client_ca_value.clone(), MaterialKind::CaBundle),
+        MaterialKind::CaBundle,
+    );
+    let mut sources = vec![client_ca_watch];
+    let crl_source_value = env_config.tls_crl_file_path.clone();
+    if let Some(crl_value) = crl_source_value.as_ref() {
+        sources.push(WatchedMaterialSource::new(
+            "crl",
+            CertSource::parse(crl_value.clone(), MaterialKind::Crl),
+            MaterialKind::Crl,
+        ));
+    }
+    // The startup baseline uses the CRLs already loaded at startup — the very
+    // list the CP snapshot loader compiles into its own verifier — rather than
+    // re-reading `FERRUM_TLS_CRL_FILE_PATH` here. A second read could observe a
+    // different generation than the material actually in service.
+    let client_trust = match load_dp_operator_client_trust(&client_ca_value, None, crls) {
+        Ok(client_trust) => client_trust,
+        Err(error) => {
+            anyhow::bail!(
+                "frontend client-certificate trust is configured but could not be loaded: {error}"
+            );
+        }
+    };
+
+    // Static inline material cannot rotate, so it needs no generation or
+    // watcher. Validate it first nevertheless: both `run` and `validate` must
+    // reject a malformed operator CA before a later CP snapshot tries to use
+    // it, even when there will never be a refresh event.
+    if !sources
+        .iter()
+        .any(|source| source_is_refreshable(&source.source))
+    {
+        info!(
+            "FERRUM_FRONTEND_TLS_LIVE_RELOAD_ENABLED=true but the data plane's operator client-trust sources are static inline material; live reload disabled for proxy client trust"
+        );
+        return Ok(None);
+    }
+
+    let interval = material_set_poll_interval(
+        &sources,
+        Duration::from_secs(env_config.frontend_tls_watch_interval_seconds.max(1)),
+        Duration::from_secs(env_config.secret_refresh_interval_seconds.max(1)),
+    );
+
+    Ok(Some(DpOperatorClientTrust {
+        client_trust,
+        sources,
+        interval,
+        client_ca_value,
+        crl_source_value,
+        startup_crls: crls.clone(),
+    }))
+}
+
+/// Spawn the operator client-trust reload watcher for the CP-only-certificate
+/// DP shape.
+///
+/// Every accepted candidate is published through
+/// [`crate::grpc::dp_client::DpFrontendH3Pairing::publish_operator_client_trust`],
+/// which holds the pairing lock across the whole `ProxyFrontend` rustls
+/// transaction, so the live verifier, the paired H3 candidate and the published
+/// generation always describe one accepted load. The loop bumps the H3 revision
+/// only after that publication returns, and only for an accepted candidate.
+pub fn spawn_dp_operator_client_trust_watcher(
+    prepared: DpOperatorClientTrust,
+    wiring: DpOperatorClientTrustWiring,
+    max_material_bytes: usize,
+    shutdown_rx: Option<watch::Receiver<bool>>,
+) -> JoinHandle<()> {
+    let DpOperatorClientTrust {
+        client_trust: _,
+        sources,
+        interval,
+        client_ca_value,
+        crl_source_value,
+        startup_crls,
+    } = prepared;
+    let DpOperatorClientTrustWiring {
+        pairing,
+        listener_slot,
+        stream_listeners,
+        revision_tx,
+    } = wiring;
+
+    spawn_async_material_set_reload_task_with_startup_reconcile(
+        AsyncMaterialSetReloadConfig {
+            surface: DP_FRONTEND_CLIENT_TRUST_SURFACE,
+            sources,
+            interval,
+            revision_tx,
+            max_material_bytes,
+            ready_tx: None,
+            rebuild: Box::new(move || {
+                let pairing = pairing.clone();
+                let listener_slot = listener_slot.clone();
+                let stream_listeners = stream_listeners.clone();
+                let client_ca_value = client_ca_value.clone();
+                let crl_source_value = crl_source_value.clone();
+                let startup_crls = startup_crls.clone();
+                async move {
+                    let accepted = match load_dp_operator_client_trust(
+                        &client_ca_value,
+                        crl_source_value.as_deref(),
+                        &startup_crls,
+                    ) {
+                        Ok(accepted) => accepted,
+                        Err(error) => {
+                            // A refused candidate keeps the complete last-good
+                            // verifier, material, generation, paired config and
+                            // sessions. Recording it here is what makes
+                            // "retained, not silently ignored" observable on
+                            // the singular scope.
+                            client_trust::record_rejected_candidate(
+                                ClientTrustScope::ProxyFrontend,
+                            );
+                            return Err(error);
+                        }
+                    };
+                    pairing
+                        .publish_operator_client_trust(
+                            accepted,
+                            Some(&listener_slot),
+                            Some(stream_listeners.as_ref()),
+                        )
+                        .await;
+                    Ok(())
+                }
+                .boxed()
+            }),
+        },
+        shutdown_rx,
+    )
+}
+
+/// One coherent client-trust load: the client-CA source is read once and both
+/// the verifier and the semantic identity come out of that single read.
+fn load_dp_operator_client_trust(
+    client_ca_value: &str,
+    crl_source_value: Option<&str>,
+    startup_crls: &CrlList,
+) -> Result<AcceptedClientTrust, anyhow::Error> {
+    let active_crls = match crl_source_value {
+        Some(source) => tls::load_crls(Some(source))?,
+        None => startup_crls.clone(),
+    };
+    let candidate = tls::build_client_cert_verifier_candidate(client_ca_value, &active_crls)?;
+    Ok(AcceptedClientTrust {
+        verifier: Some(candidate.verifier),
+        material: candidate.material,
     })
 }
 

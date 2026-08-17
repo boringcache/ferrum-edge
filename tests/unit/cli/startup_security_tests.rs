@@ -663,3 +663,34 @@ fn try_load_frontend_tls_returns_none_when_unset() {
     let loaded = try_load_frontend_tls(&env, &policy, &crls).unwrap();
     assert!(loaded.is_none());
 }
+
+#[test]
+fn dp_cp_only_refreshable_client_trust_has_validate_run_parity() {
+    ensure_crypto_provider();
+    let dir = TempDir::new().unwrap();
+    let broken_ca = write_pem(
+        &dir,
+        "broken-client-ca.pem",
+        "-----BEGIN CERTIFICATE-----\nnot pem\n",
+    );
+    let env = EnvConfig {
+        mode: OperatingMode::DataPlane,
+        admin_https_port: 0,
+        proxy_https_port: 8443,
+        frontend_tls_live_reload_enabled: true,
+        frontend_tls_cert_path: None,
+        frontend_tls_key_path: None,
+        frontend_tls_client_ca_bundle_path: Some(broken_ca),
+        ..EnvConfig::default()
+    };
+
+    let err = load_startup_security(&env)
+        .err()
+        .expect("validate must reject the trust-only material that DP run rejects");
+    assert!(
+        format!("{err:#}").contains(
+            "frontend client-certificate trust is configured but could not be loaded"
+        ),
+        "unexpected error: {err:#}"
+    );
+}

@@ -1515,6 +1515,408 @@ fn dp_mode_pairs_cp_server_config_with_operator_trust_for_h3() {
     );
 }
 
+/// Write the operator's client-CA bundle and CRL, and build the `EnvConfig` a
+/// CP-only-server-certificate data plane runs with: HTTPS enabled, frontend
+/// live reload on, client trust configured, and **no** operator cert/key.
+fn cp_only_dp_env(
+    dir: &std::path::Path,
+    label: &str,
+    ca_pem: &str,
+    crl_pem: Option<&str>,
+) -> (EnvConfig, String) {
+    let ca_path = dir.join(format!("{label}-client-ca.pem"));
+    std::fs::write(&ca_path, ca_pem.as_bytes()).expect("write client CA");
+    let ca_path = ca_path.to_str().expect("utf8 ca path").to_string();
+    let crl_path = crl_pem.map(|pem| {
+        let path = dir.join(format!("{label}-revocations.pem"));
+        std::fs::write(&path, pem.as_bytes()).expect("write CRL");
+        path.to_str().expect("utf8 crl path").to_string()
+    });
+    (
+        EnvConfig {
+            proxy_https_port: 8443,
+            frontend_tls_live_reload_enabled: true,
+            frontend_tls_cert_path: None,
+            frontend_tls_key_path: None,
+            frontend_tls_client_ca_bundle_path: Some(ca_path.clone()),
+            tls_crl_file_path: crl_path,
+            ..EnvConfig::default()
+        },
+        ca_path,
+    )
+}
+
+/// A data plane whose only frontend server certificate is CP-delivered still
+/// owns client trust, so `prepare_dp_operator_client_trust` must load it
+/// coherently — with no operator cert/key anywhere in the picture.
+#[test]
+fn dp_cp_only_certificate_loads_operator_client_trust_without_a_server_certificate() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let pki = build_pki();
+    let crl_pem = pki.crl_pem(&[UNRELATED_SERIAL], 1);
+    let crls = parse_crls(&crl_pem);
+    let (env_config, _) = cp_only_dp_env(dir.path(), "cp-only-load", &pki.ca_pem, Some(&crl_pem));
+
+    let prepared =
+        ferrum_edge::modes::tls_reload::prepare_dp_operator_client_trust(&env_config, &crls)
+            .expect("client trust must load")
+            .expect("the CP-only-certificate shape applies");
+
+    assert!(
+        prepared.client_trust.verifier.is_some(),
+        "an operator client-CA bundle must yield a verifier even with no operator server certificate"
+    );
+    assert!(
+        admits_client(&prepared.client_trust, &pki),
+        "the loaded verifier must admit a client certificate no CRL revokes"
+    );
+    // The identity must describe the exact CRLs handed in, not an empty set:
+    // a candidate summarized without them would read as a withdrawal later.
+    let ca_path = env_config
+        .frontend_tls_client_ca_bundle_path
+        .clone()
+        .expect("client CA configured");
+    let withdrawn_crls = parse_crls(&pki.crl_pem(&[UNRELATED_SERIAL, pki.client_serial], 2));
+    let rotated = trust_only_candidate(&ca_path, &withdrawn_crls);
+    assert_ne!(
+        prepared.client_trust.material, rotated.material,
+        "the startup identity must carry the accepted CRLs, so a later revocation is a change"
+    );
+}
+
+/// The scope must stay unarmed where there is nothing to protect, and the
+/// startup load must fail closed where client authentication IS configured but
+/// its material is unusable.
+#[test]
+fn dp_cp_only_certificate_client_trust_applicability_is_fail_closed() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let pki = build_pki();
+    let crls = parse_crls(&pki.crl_pem(&[UNRELATED_SERIAL], 1));
+
+    let (mut env_config, ca_path) = cp_only_dp_env(dir.path(), "cp-only-gates", &pki.ca_pem, None);
+
+    env_config.frontend_tls_live_reload_enabled = false;
+    assert!(
+        ferrum_edge::modes::tls_reload::prepare_dp_operator_client_trust(&env_config, &crls)
+            .expect("no error without the opt-in")
+            .is_none(),
+        "without FERRUM_FRONTEND_TLS_LIVE_RELOAD_ENABLED no generation can ever advance"
+    );
+
+    env_config.frontend_tls_live_reload_enabled = true;
+    env_config.frontend_tls_client_ca_bundle_path = None;
+    assert!(
+        ferrum_edge::modes::tls_reload::prepare_dp_operator_client_trust(&env_config, &crls)
+            .expect("no error without client authentication")
+            .is_none(),
+        "a listener that requests no client certificate must not arm a scope, and an unrelated \
+         CRL must not make it fail"
+    );
+
+    // Inline PEM can never change, so there is nothing to watch and nothing to
+    // arm — the same rule the operator cert/key pipeline applies.
+    env_config.frontend_tls_client_ca_bundle_path = Some(pki.ca_pem.clone());
+    assert!(
+        ferrum_edge::modes::tls_reload::prepare_dp_operator_client_trust(&env_config, &crls)
+            .expect("no error for static inline material")
+            .is_none(),
+        "static inline client-CA material must not start a watcher"
+    );
+    env_config.frontend_tls_client_ca_bundle_path = Some(
+        "-----BEGIN CERTIFICATE-----\nnot pem\n-----END CERTIFICATE-----".to_string(),
+    );
+    assert!(
+        ferrum_edge::modes::tls_reload::prepare_dp_operator_client_trust(&env_config, &crls)
+            .is_err(),
+        "static inline trust still has to validate before the CP certificate arrives"
+    );
+
+    let broken = dir.path().join("broken-client-ca.pem");
+    std::fs::write(&broken, b"-----BEGIN CERTIFICATE-----\nnot pem\n").expect("write broken CA");
+    env_config.frontend_tls_client_ca_bundle_path =
+        Some(broken.to_str().expect("utf8 path").to_string());
+    assert!(
+        ferrum_edge::modes::tls_reload::prepare_dp_operator_client_trust(&env_config, &crls)
+            .is_err(),
+        "configured-but-unusable client trust must fail closed at startup, not serve CP material \
+         under an unknown baseline"
+    );
+
+    // The usable configuration still loads, so the failure above is about the
+    // material and not about the shape.
+    env_config.frontend_tls_client_ca_bundle_path = Some(ca_path);
+    assert!(
+        ferrum_edge::modes::tls_reload::prepare_dp_operator_client_trust(&env_config, &crls)
+            .expect("usable client trust loads")
+            .is_some()
+    );
+}
+
+/// End-to-end pairing contract for the CP-only-server-certificate shape:
+/// arming with no server certificate, CP delivery, an accepted operator
+/// withdrawal that never substitutes a server certificate, and a CP clear that
+/// disables the listener instead of synthesizing one.
+#[tokio::test]
+#[allow(clippy::await_holding_lock)] // `isolated_registry()` must span awaits to serialize process-global registry state
+async fn dp_cp_only_certificate_arms_pairs_and_clears_without_synthesizing_a_certificate() {
+    let _guard = isolated_registry();
+    let dir = tempfile::tempdir().expect("tempdir");
+    let pki = build_pki();
+    let startup_crls = parse_crls(&pki.crl_pem(&[UNRELATED_SERIAL], 1));
+    let withdrawn_crls = parse_crls(&pki.crl_pem(&[UNRELATED_SERIAL, pki.client_serial], 2));
+    let ca_path = dir.path().join("cp-only-pairing-ca.pem");
+    std::fs::write(&ca_path, pki.ca_pem.as_bytes()).expect("write client CA");
+    let ca_path = ca_path.to_str().expect("utf8 ca path").to_string();
+
+    let startup_trust = trust_only_candidate(&ca_path, &startup_crls);
+    let withdrawn_trust = trust_only_candidate(&ca_path, &withdrawn_crls);
+    assert!(admits_client(&startup_trust, &pki));
+    assert!(!admits_client(&withdrawn_trust, &pki));
+
+    // The CP server certificate. Nothing operator-owned supplies one here.
+    let cp = load_accepted_frontend(dir.path(), &pki, &startup_crls, "cp-only-server")
+        .expect("CP candidate");
+
+    let pairing = DpFrontendH3Pairing::from_operator_client_trust(startup_trust.clone());
+    let listener_slot = ferrum_edge::tls::empty_frontend_tls_slot();
+    assert!(
+        pairing.h3_accepted().is_none(),
+        "with no server certificate there is no coherent H3 candidate to adopt"
+    );
+
+    // Arming publishes the baseline and installs the live verifier the CP
+    // snapshot's handshake wrapper consults, without exposing any config.
+    let armed = pairing
+        .publish_operator_client_trust(startup_trust.clone(), Some(&listener_slot), None)
+        .await;
+    assert!(armed.listener_config.is_none());
+    assert!(
+        listener_slot.load_full().as_ref().is_none(),
+        "arming must not synthesize an operator server certificate"
+    );
+    assert!(pairing.h3_accepted().is_none());
+    assert_eq!(
+        client_trust::current_material(ClientTrustScope::ProxyFrontend).as_ref(),
+        Some(&startup_trust.material),
+        "the armed baseline must be the identity of the exact accepted load"
+    );
+    assert!(
+        client_trust::armed_handshake_still_trusted(
+            ClientTrustScope::ProxyFrontend,
+            Some(&[pki.client_cert()])
+        ),
+        "the accepted verifier must be the live one new handshakes are checked against"
+    );
+
+    // CP delivers the server certificate; H3 gets one coherent pair.
+    pairing
+        .publish_cp_server_config(Some(cp.config.clone()), Some(&listener_slot), None)
+        .await;
+    assert!(std::sync::Arc::ptr_eq(
+        listener_slot.load_full().as_ref().as_ref().expect("CP config"),
+        &cp.config
+    ));
+    let paired = pairing.h3_accepted().expect("paired H3 candidate");
+    assert!(std::sync::Arc::ptr_eq(&paired.config, &cp.config));
+    assert_eq!(paired.client_trust.material, startup_trust.material);
+
+    // An accepted CRL withdrawal advances the scope and re-pairs, but never
+    // replaces the CP-owned server certificate.
+    let before = proxy_frontend_trust_snapshot().generation;
+    let update = pairing
+        .publish_operator_client_trust(withdrawn_trust.clone(), Some(&listener_slot), None)
+        .await;
+    assert!(
+        !update.replace_listener,
+        "an operator trust reload must not take the listener slot away from CP material"
+    );
+    assert!(std::sync::Arc::ptr_eq(
+        listener_slot.load_full().as_ref().as_ref().expect("CP config"),
+        &cp.config
+    ));
+    let paired = pairing.h3_accepted().expect("re-paired H3 candidate");
+    assert!(
+        std::sync::Arc::ptr_eq(&paired.config, &cp.config),
+        "H3 must keep the CP server certificate while adopting the new trust"
+    );
+    assert!(!admits_client(&paired.client_trust, &pki));
+    let after = proxy_frontend_trust_snapshot();
+    assert!(
+        after.generation > before && after.withdrawal_generation == after.generation,
+        "an accepted withdrawal must advance the generation and move the retirement fence"
+    );
+    assert!(
+        !client_trust::armed_handshake_still_trusted(
+            ClientTrustScope::ProxyFrontend,
+            Some(&[pki.client_cert()])
+        ),
+        "new handshakes must meet the withdrawn verifier"
+    );
+
+    // Clearing CP material leaves nothing to serve: the listener is cleared and
+    // HTTP/3 disabled, never backfilled with a synthesized certificate.
+    let cleared = pairing
+        .publish_cp_server_config(None, Some(&listener_slot), None)
+        .await;
+    assert!(cleared.replace_listener && cleared.listener_config.is_none());
+    assert!(listener_slot.load_full().as_ref().is_none());
+    assert!(
+        pairing.h3_accepted().is_none(),
+        "clearing CP material with no operator server certificate must disable HTTP/3"
+    );
+    assert_eq!(
+        client_trust::current_material(ClientTrustScope::ProxyFrontend).as_ref(),
+        Some(&withdrawn_trust.material),
+        "a CP server-material change must not disturb the operator trust generation"
+    );
+}
+
+/// A refused client-trust candidate never reaches the pairing, so the complete
+/// last-good verifier, identity, generation and paired config are retained and
+/// the refusal is accounted on the singular scope.
+#[tokio::test]
+#[allow(clippy::await_holding_lock)] // `isolated_registry()` must span awaits to serialize process-global registry state
+async fn dp_cp_only_certificate_refused_candidate_retains_last_good_state() {
+    let _guard = isolated_registry();
+    let dir = tempfile::tempdir().expect("tempdir");
+    let pki = build_pki();
+    let startup_crls = parse_crls(&pki.crl_pem(&[UNRELATED_SERIAL], 1));
+    let ca_path = dir.path().join("cp-only-refuse-ca.pem");
+    std::fs::write(&ca_path, pki.ca_pem.as_bytes()).expect("write client CA");
+    let ca_source = ca_path.to_str().expect("utf8 ca path").to_string();
+
+    let startup_trust = trust_only_candidate(&ca_source, &startup_crls);
+    let cp = load_accepted_frontend(dir.path(), &pki, &startup_crls, "cp-only-refuse-server")
+        .expect("CP candidate");
+    let pairing = DpFrontendH3Pairing::from_operator_client_trust(startup_trust.clone());
+    let listener_slot = ferrum_edge::tls::empty_frontend_tls_slot();
+    pairing
+        .publish_operator_client_trust(startup_trust.clone(), Some(&listener_slot), None)
+        .await;
+    pairing
+        .publish_cp_server_config(Some(cp.config.clone()), Some(&listener_slot), None)
+        .await;
+    let before_snapshot = proxy_frontend_trust_snapshot();
+    let before_pair = pairing.h3_accepted().expect("paired candidate");
+
+    // The watcher's load step now fails: the client-CA bundle is truncated to
+    // material no verifier can be built from.
+    std::fs::write(&ca_path, b"-----BEGIN CERTIFICATE-----\ntruncated\n").expect("break CA");
+    let reload = ferrum_edge::tls::build_client_cert_verifier_candidate(&ca_source, &startup_crls);
+    assert!(reload.is_err(), "the broken bundle must not load");
+    client_trust::record_rejected_candidate(ClientTrustScope::ProxyFrontend);
+
+    let after_snapshot = proxy_frontend_trust_snapshot();
+    assert_eq!(after_snapshot.generation, before_snapshot.generation);
+    assert_eq!(
+        after_snapshot.withdrawal_generation,
+        before_snapshot.withdrawal_generation
+    );
+    assert_eq!(
+        after_snapshot.rejected_candidates,
+        before_snapshot.rejected_candidates + 1,
+        "a refused candidate must be accounted on the singular scope, not silently ignored"
+    );
+    assert_eq!(
+        client_trust::current_material(ClientTrustScope::ProxyFrontend).as_ref(),
+        Some(&startup_trust.material)
+    );
+    assert!(
+        client_trust::armed_handshake_still_trusted(
+            ClientTrustScope::ProxyFrontend,
+            Some(&[pki.client_cert()])
+        ),
+        "the last-good live verifier must be retained"
+    );
+    let after_pair = pairing.h3_accepted().expect("retained pair");
+    assert!(std::sync::Arc::ptr_eq(&before_pair, &after_pair));
+    assert!(std::sync::Arc::ptr_eq(
+        listener_slot.load_full().as_ref().as_ref().expect("CP config"),
+        &cp.config
+    ));
+}
+
+/// Source-shape contract for the CP-only wiring: the data plane must arm and
+/// watch operator client trust on the CP-only-certificate shape, and must not
+/// do so when it owns an operator server certificate (that shape already has a
+/// reload pipeline which owns the transaction).
+#[test]
+fn dp_cp_only_certificate_client_trust_is_wired_without_an_operator_certificate() {
+    let dp = include_str!("../../../src/modes/data_plane.rs");
+    let block = dp
+        .find("let mut dp_client_trust_watcher")
+        .expect("DP must arm operator client trust for the CP-only-certificate shape");
+    assert_source_order(
+        &dp[block..],
+        &[
+            "tls_config.is_none()",
+            "prepare_dp_operator_client_trust",
+            "from_operator_client_trust",
+            "publish_operator_client_trust",
+            "spawn_dp_operator_client_trust_watcher",
+        ],
+        "the CP-only path must be gated on owning no operator server certificate, then load, \
+         seed the pairing, arm the baseline, and start the watcher",
+    );
+
+    let modes = include_str!("../../../src/modes/tls_reload.rs");
+    let watcher = modes
+        .find("pub fn spawn_dp_operator_client_trust_watcher")
+        .expect("CP-only client-trust watcher");
+    let watcher_end = modes[watcher..]
+        .find("fn load_dp_operator_client_trust(")
+        .expect("the coherent loader follows the watcher");
+    let watcher_body = &modes[watcher..watcher + watcher_end];
+    assert_source_order(
+        watcher_body,
+        &["record_rejected_candidate", "publish_operator_client_trust"],
+        "a refused load must be recorded and must never reach the pairing publication",
+    );
+    assert!(
+        !watcher_body.contains("frontend_tls_cert_path"),
+        "the CP-only client-trust watcher must never read an operator server certificate"
+    );
+
+    let client = include_str!("../../../src/grpc/dp_client.rs");
+    let paired = client.find("fn pair_h3_candidate(").expect("pairing helper");
+    assert!(
+        client[paired..].contains("state.cp_config")
+            && client[paired..].contains("or_else(|| state.operator_config.clone())?"),
+        "CP material owns the server certificate, the operator's own certificate is the only \
+         fallback, and neither present means no candidate at all"
+    );
+    let publish = client
+        .find("pub async fn publish_operator_client_trust")
+        .expect("CP-only client-trust publisher");
+    assert_source_order(
+        &client[publish..],
+        &[
+            "publish_accepted_rustls_candidate",
+            "commit_listener_publication",
+        ],
+        "the rustls transaction must complete before the awaited stream-listener store",
+    );
+}
+
+/// One coherent client-trust load with no operator server certificate — the
+/// exact primitive the CP-only-certificate data plane arms and reloads from.
+fn trust_only_candidate(ca_path: &str, crls: &CrlList) -> AcceptedClientTrust {
+    let candidate = ferrum_edge::tls::build_client_cert_verifier_candidate(ca_path, crls)
+        .expect("client trust candidate");
+    AcceptedClientTrust {
+        verifier: Some(candidate.verifier),
+        material: candidate.material,
+    }
+}
+
+/// `ClientTrustScope::index` is private, so select the row by scope.
+fn proxy_frontend_trust_snapshot() -> client_trust::ClientTrustScopeSnapshot {
+    client_trust::snapshot()
+        .into_iter()
+        .find(|row| row.scope == ClientTrustScope::ProxyFrontend)
+        .expect("proxy_frontend trust scope row")
+}
+
 struct IssuedClient {
     ca_pem: String,
     cert_der: Vec<u8>,

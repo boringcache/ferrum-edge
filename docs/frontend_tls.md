@@ -562,6 +562,37 @@ Clearing CP material restores the latest accepted operator candidate — not a
 startup snapshot captured when CP material first arrived. This does not add
 CP-delivered client-CA support.
 
+A data plane may have **no operator server certificate at all**: with
+`FERRUM_PROXY_HTTPS_PORT` enabled and no `FERRUM_FRONTEND_TLS_CERT_PATH` /
+`FERRUM_FRONTEND_TLS_KEY_PATH`, the listener starts with an empty TLS slot and
+CP-delivered Gateway material is the only server certificate it will ever serve.
+Client trust is still operator-owned on that shape, so
+`FERRUM_FRONTEND_TLS_CLIENT_CA_BUNDLE_PATH` (plus `FERRUM_TLS_CRL_FILE_PATH`) is
+loaded once at startup, arms `proxy_frontend` before the first accept, and is
+live-reloaded under `FERRUM_FRONTEND_TLS_LIVE_RELOAD_ENABLED=true` exactly as it
+is on an operator-certificate data plane. The verifier and the published
+identity come from that one load, so what the listener enforces and what it
+reports can never describe different material. An accepted client-CA or CRL
+change installs the live verifier CP-delivered H1/H2 and TCP+TLS configs consult
+on new handshakes, advances the generation that retires established
+client-certificate transports, and re-pairs the live CP server config with the
+new trust for HTTP/3 — all under one publication that a concurrent CP update
+cannot interleave with. No operator server certificate is ever synthesized: the
+server half of every published candidate is the CP's, and when CP withdraws its
+material a node with no operator certificate clears the listener slot and
+disables HTTP/3 rather than inventing one. The scope stays unarmed when no
+client-CA source is configured (nothing on that listener can hold a withdrawable
+credential, and an unrelated CRL must not make it fail or export protection
+metrics) and when every configured client-trust source is inline material that
+can never change. A configured-but-unloadable client-CA bundle fails startup
+closed rather than serving CP material under an unknown trust baseline;
+`ferrum-edge validate` exercises the same trust-only load as `run`. After the
+watcher establishes its first source fingerprint, it reconciles once before
+normal polling so a rotation between the accepted startup load and watcher
+registration cannot be mistaken for already-applied material. A refused reload
+keeps the complete last-good verifier, identity, generation, paired config, and
+sessions.
+
 The `frontend_dtls` scope reads its declared client-CA source **once** through
 the shared `CertSource` abstraction, and derives both the DTLS trust anchors and
 the published identity from those exact bytes. A `file://` path, inline PEM, or

@@ -470,7 +470,15 @@ pub struct DpFrontendH3Pairing {
 
 struct DpFrontendH3PairingState {
     cp_config: Option<Arc<rustls::ServerConfig>>,
-    operator_candidate: Arc<crate::tls::AcceptedFrontendTls>,
+    /// The operator's own server config, when the operator configured
+    /// `FERRUM_FRONTEND_TLS_CERT_PATH` / `_KEY_PATH`. `None` on a data plane
+    /// whose only server certificate is CP-delivered: the operator still owns
+    /// client trust there, and no operator server certificate may be
+    /// synthesized to stand in for CP material.
+    operator_config: Option<Arc<rustls::ServerConfig>>,
+    /// The latest accepted operator client trust — the verifier and the
+    /// semantic identity of exactly the client-CA bytes and CRLs behind it.
+    client_trust: crate::tls::AcceptedClientTrust,
 }
 
 impl DpFrontendH3Pairing {
@@ -482,9 +490,36 @@ impl DpFrontendH3Pairing {
         Self {
             lock: Mutex::new(DpFrontendH3PairingState {
                 cp_config: None,
-                operator_candidate: initial.clone(),
+                operator_config: Some(initial.config.clone()),
+                client_trust: initial.client_trust.clone(),
             }),
             h3_accepted_slot: crate::tls::accepted_frontend_tls_slot_with(initial),
+            #[cfg(test)]
+            test_before_stream_listener: Mutex::new(()),
+        }
+    }
+
+    /// Seed from operator client trust alone, with no operator server
+    /// certificate (issue #3857).
+    ///
+    /// This is the CP-only-server-certificate data plane:
+    /// `FERRUM_PROXY_HTTPS_PORT` is enabled, the operator configured no
+    /// frontend cert/key, and CP-delivered Gateway TLS material is the only
+    /// server certificate this node will ever serve. Client trust
+    /// (`FERRUM_FRONTEND_TLS_CLIENT_CA_BUNDLE_PATH` + `FERRUM_TLS_CRL_FILE_PATH`)
+    /// is still operator-owned, so it is armed and live-reloaded exactly as it
+    /// is on an operator-certificate data plane — only the server half differs.
+    /// The H3 candidate slot starts empty: until CP delivers a certificate
+    /// there is nothing coherent to serve, and the endpoint stays disabled
+    /// rather than serving a synthesized one.
+    pub fn from_operator_client_trust(initial: crate::tls::AcceptedClientTrust) -> Self {
+        Self {
+            lock: Mutex::new(DpFrontendH3PairingState {
+                cp_config: None,
+                operator_config: None,
+                client_trust: initial,
+            }),
+            h3_accepted_slot: crate::tls::empty_accepted_frontend_tls_slot(),
             #[cfg(test)]
             test_before_stream_listener: Mutex::new(()),
         }
@@ -516,14 +551,100 @@ impl DpFrontendH3Pairing {
         stream_listeners: Option<&crate::proxy::stream_listener::StreamListenerManager>,
     ) -> DpFrontendListenerUpdate {
         let mut state = self.lock.lock().await;
-        state.operator_candidate = candidate;
+        state.operator_config = Some(candidate.config.clone());
+        state.client_trust = candidate.client_trust.clone();
+        self.publish_operator_paired(state, listener_slot, stream_listeners, None)
+            .await
+    }
+
+    /// Record an accepted operator client-trust candidate on a data plane that
+    /// owns **no** operator server certificate (issue #3857).
+    ///
+    /// This is the CP-only-server-certificate shape's publisher, and unlike
+    /// [`Self::publish_operator_candidate`] it owns the
+    /// [`crate::tls::ClientTrustScope::ProxyFrontend`] rustls transaction
+    /// itself: there is no operator cert/key reload pipeline on this shape to
+    /// have run one already. The pairing lock is taken first, then the scope
+    /// publication lock is held continuously across installing the accepted
+    /// live verifier, exposing the newly paired H3 candidate (and, only while
+    /// CP owns no server certificate, the H1/H2/TCP listener slot), and
+    /// publishing material/generation/fence. The `StreamListenerManager` store
+    /// is the one step that must `.await`, so it runs after that transaction
+    /// but still under the pairing lock — a concurrent CP publication cannot
+    /// interleave and cross-wire a server generation with a trust generation.
+    ///
+    /// Installing the live verifier is what makes an accepted reload reach new
+    /// H1/H2 and TCP+TLS handshakes: those listeners keep serving the CP
+    /// `ServerConfig`, which binds this scope's live handshake wrapper.
+    /// Publishing the material is what advances the generation and retires
+    /// established client-certificate transports on an accepted withdrawal. A
+    /// refused candidate never reaches this method, so the complete last-good
+    /// verifier, material, generation, paired config, and sessions are retained.
+    pub async fn publish_operator_client_trust(
+        &self,
+        client_trust: crate::tls::AcceptedClientTrust,
+        listener_slot: Option<&crate::tls::SharedFrontendTls>,
+        stream_listeners: Option<&crate::proxy::stream_listener::StreamListenerManager>,
+    ) -> DpFrontendListenerUpdate {
+        let transaction = client_trust
+            .verifier
+            .clone()
+            .map(|verifier| (verifier, client_trust.material.clone()));
+        let mut state = self.lock.lock().await;
+        state.client_trust = client_trust;
+        self.publish_operator_paired(state, listener_slot, stream_listeners, transaction)
+            .await
+    }
+
+    /// Shared operator-side publication: pair the active server config with the
+    /// current accepted operator trust, expose it, and hand off to the
+    /// stream-listener commit.
+    ///
+    /// `rustls_transaction` is `Some` only for the CP-only-certificate
+    /// publisher, which owns the `ProxyFrontend` transaction; the
+    /// operator-certificate path's reload pipeline already ran one before the
+    /// accepted candidate reached this type.
+    async fn publish_operator_paired(
+        &self,
+        state: tokio::sync::MutexGuard<'_, DpFrontendH3PairingState>,
+        listener_slot: Option<&crate::tls::SharedFrontendTls>,
+        stream_listeners: Option<&crate::proxy::stream_listener::StreamListenerManager>,
+        rustls_transaction: Option<(
+            Arc<dyn rustls::server::danger::ClientCertVerifier>,
+            crate::tls::ClientTrustMaterial,
+        )>,
+    ) -> DpFrontendListenerUpdate {
         let paired = pair_h3_candidate(&state);
+        // CP material still owns the listener slot when it is present: never
+        // substitute an operator server certificate for it.
         let replace_listener = state.cp_config.is_none();
-        let listener_config = Some(paired.config.clone());
-        if replace_listener && let Some(slot) = listener_slot {
-            slot.store(Arc::new(listener_config.clone()));
+        let listener_config = paired.as_ref().map(|paired| paired.config.clone());
+        let expose = || {
+            if replace_listener && let Some(slot) = listener_slot {
+                slot.store(Arc::new(listener_config.clone()));
+            }
+            self.h3_accepted_slot.store(Arc::new(paired));
+        };
+        match rustls_transaction {
+            Some((verifier, material)) => {
+                let publication = crate::tls::client_trust::publish_accepted_rustls_candidate(
+                    crate::tls::ClientTrustScope::ProxyFrontend,
+                    material,
+                    verifier,
+                    expose,
+                );
+                if publication.withdrew() {
+                    warn!(
+                        scope = publication.scope.label(),
+                        generation = publication.generation,
+                        reason = publication.reason.map(|reason| reason.label()),
+                        retired_connections = publication.retired_sessions,
+                        "Frontend client-certificate trust was withdrawn; established client-certificate transports on this scope were retired"
+                    );
+                }
+            }
+            None => expose(),
         }
-        self.h3_accepted_slot.store(Arc::new(Some(paired)));
         self.commit_listener_publication(
             state,
             DpFrontendListenerUpdate {
@@ -540,8 +661,10 @@ impl DpFrontendH3Pairing {
     /// `Some` stores the CP server config as the active certificate and pairs
     /// it with the latest accepted operator trust. `None` restores that latest
     /// operator candidate (config + trust), not a startup snapshot captured
-    /// when CP material first arrived. The listener slot and stream-listener
-    /// TLS slot are stored under the same lock as the H3 candidate.
+    /// when CP material first arrived. When the operator configured no server
+    /// certificate at all, `None` clears the listener and disables HTTP/3
+    /// rather than synthesizing one. The listener slot and stream-listener TLS
+    /// slot are stored under the same lock as the H3 candidate.
     pub async fn publish_cp_server_config(
         &self,
         cp_config: Option<Arc<rustls::ServerConfig>>,
@@ -551,11 +674,11 @@ impl DpFrontendH3Pairing {
         let mut state = self.lock.lock().await;
         state.cp_config = cp_config;
         let paired = pair_h3_candidate(&state);
-        let listener_config = Some(paired.config.clone());
+        let listener_config = paired.as_ref().map(|paired| paired.config.clone());
         if let Some(slot) = listener_slot {
             slot.store(Arc::new(listener_config.clone()));
         }
-        self.h3_accepted_slot.store(Arc::new(Some(paired)));
+        self.h3_accepted_slot.store(Arc::new(paired));
         self.commit_listener_publication(
             state,
             DpFrontendListenerUpdate {
@@ -603,14 +726,25 @@ impl DpFrontendH3Pairing {
     }
 }
 
-fn pair_h3_candidate(state: &DpFrontendH3PairingState) -> Arc<crate::tls::AcceptedFrontendTls> {
-    match &state.cp_config {
-        Some(cp_config) => Arc::new(crate::tls::AcceptedFrontendTls {
-            config: cp_config.clone(),
-            client_trust: state.operator_candidate.client_trust.clone(),
-        }),
-        None => state.operator_candidate.clone(),
-    }
+/// Pair the currently active server certificate with the latest accepted
+/// operator client trust.
+///
+/// CP material owns the server certificate whenever it is present; otherwise
+/// the operator's own certificate serves. `None` means this data plane holds no
+/// server certificate at all — a CP-only-certificate node before its first CP
+/// snapshot, or after CP withdrew one — and HTTP/3 must disable itself rather
+/// than adopt a candidate whose server half was invented.
+fn pair_h3_candidate(
+    state: &DpFrontendH3PairingState,
+) -> Option<Arc<crate::tls::AcceptedFrontendTls>> {
+    let config = state
+        .cp_config
+        .clone()
+        .or_else(|| state.operator_config.clone())?;
+    Some(Arc::new(crate::tls::AcceptedFrontendTls {
+        config,
+        client_trust: state.client_trust.clone(),
+    }))
 }
 
 /// Build the DP/mesh gRPC TLS client config from shared env settings.

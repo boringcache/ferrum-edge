@@ -209,6 +209,21 @@ pub fn load_startup_security_with_scope(
                 try_load_frontend_tls(env_config, policy, &materials.crls)?
             }
         };
+
+        // A DP can intentionally own no frontend server certificate while CP
+        // supplies the Gateway certificate later. On that shape, runtime still
+        // loads and live-reloads the operator-owned client CA / CRL. Exercise
+        // the same refreshable trust-only startup load here so `validate` does
+        // not accept material that `run` will reject (issue #3857).
+        if env_config.mode == OperatingMode::DataPlane
+            && env_config.proxy_https_port != 0
+            && materials.frontend_tls.is_none()
+        {
+            let _ = crate::modes::tls_reload::prepare_dp_operator_client_trust(
+                env_config,
+                &materials.crls,
+            )?;
+        }
     }
 
     if scope.admin_tls {
