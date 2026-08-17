@@ -826,6 +826,12 @@ def check_fips_producer_channel(
         failures,
     )
     require(
+        "--no-absolute-filenames" not in workflow,
+        "FIPS workflow must not use BSD-only tar options unsupported by GNU tar "
+        "on ubuntu-latest",
+        failures,
+    )
+    require(
         "warm_source_run_id:" in workflow
         and "warm_source_run_attempt:" in workflow
         and "permissions:\n  actions: read\n  contents: read" in workflow,
@@ -1185,6 +1191,12 @@ def check_fips_producer_channel(
         'payload_dir="$channel_root"',
         'selected_attempt="$identity_attempt"',
         "fips-producer-identity",
+        "reject_hostile_tar_member()",
+        "assert_identity_member()",
+        'tar --zstd -tf "$archive"',
+        "producer handoff archive member uses an absolute path",
+        "producer handoff archive member uses path traversal",
+        "producer handoff archive identity member is not a regular file",
         'if [ -z "$payload_dir" ]',
         "refusing to claim compile-to-consumer reuse",
         'archive="${payload_dir}/fips-producer-handoff.tar.zst"',
@@ -3759,6 +3771,23 @@ def self_test() -> int:
     require(
         any("must install zstd" in item for item in missing_zstd_failures),
         "self-test: a FIPS handoff job without zstd must fail",
+        failures,
+    )
+
+    bsd_tar_identity_extract = handoff_channel.replace(
+        'tar --zstd --no-same-owner \\\n              -xf "$archive" -C "$dest" "$identity_member"',
+        'tar --zstd --no-same-owner --no-absolute-filenames \\\n              -xf "$archive" -C "$dest" "$identity_member"',
+    )
+    bsd_tar_identity_extract_failures: list[str] = []
+    check_fips_producer_channel(
+        bsd_tar_identity_extract, bsd_tar_identity_extract_failures
+    )
+    require(
+        any(
+            "BSD-only tar options unsupported by GNU tar" in item
+            for item in bsd_tar_identity_extract_failures
+        ),
+        "self-test: BSD-only tar identity extraction must fail",
         failures,
     )
 

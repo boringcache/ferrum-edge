@@ -892,6 +892,48 @@ jobs:
             fi
           }
 
+          reject_hostile_tar_member() {
+            local member="$1"
+            case "$member" in
+              *$'\r'*|*$'\n'*)
+                fail "producer handoff archive member is malformed"
+                ;;
+              /*)
+                fail "producer handoff archive member uses an absolute path"
+                ;;
+              ..|../*|*/..|*/../*|*/..)
+                fail "producer handoff archive member uses path traversal"
+                ;;
+            esac
+          }
+
+          assert_identity_member() {
+            local archive="$1"
+            local expected="$2"
+            local member listing line_count found=0
+            while IFS= read -r member || [ -n "$member" ]; do
+              [ -n "$member" ] || continue
+              reject_hostile_tar_member "$member"
+              if [ "$member" = "$expected" ]; then
+                found=1
+              fi
+            done < <(tar --zstd -tf "$archive")
+            if [ "$found" -ne 1 ]; then
+              fail "producer handoff archive is missing its identity member"
+            fi
+            listing="$(tar --zstd -tvf "$archive" "$expected" 2>/dev/null || true)"
+            line_count="$(printf '%s\n' "$listing" | sed '/^$/d' | wc -l | tr -d ' ')"
+            if [ "$line_count" -ne 1 ]; then
+              fail "producer handoff archive identity member is missing or ambiguous"
+            fi
+            case "$(printf '%s\n' "$listing" | sed '/^$/d')" in
+              -*) ;;
+              *)
+                fail "producer handoff archive identity member is not a regular file"
+                ;;
+            esac
+          }
+
           extract_identity() {
             local archive="$1"
             local dest="$2"
@@ -900,7 +942,8 @@ jobs:
             if ! is_real_dir "$dest"; then
               fail "failed to create producer handoff identity extract directory"
             fi
-            tar --zstd --no-same-owner --no-absolute-filenames \
+            assert_identity_member "$archive" "$identity_member"
+            tar --zstd --no-same-owner \
               -xf "$archive" -C "$dest" "$identity_member"
             local identity="${dest}/${identity_member}"
             if ! is_real_file "$identity"; then
@@ -1363,6 +1406,48 @@ jobs:
             fi
           }
 
+          reject_hostile_tar_member() {
+            local member="$1"
+            case "$member" in
+              *$'\r'*|*$'\n'*)
+                fail "producer handoff archive member is malformed"
+                ;;
+              /*)
+                fail "producer handoff archive member uses an absolute path"
+                ;;
+              ..|../*|*/..|*/../*|*/..)
+                fail "producer handoff archive member uses path traversal"
+                ;;
+            esac
+          }
+
+          assert_identity_member() {
+            local archive="$1"
+            local expected="$2"
+            local member listing line_count found=0
+            while IFS= read -r member || [ -n "$member" ]; do
+              [ -n "$member" ] || continue
+              reject_hostile_tar_member "$member"
+              if [ "$member" = "$expected" ]; then
+                found=1
+              fi
+            done < <(tar --zstd -tf "$archive")
+            if [ "$found" -ne 1 ]; then
+              fail "producer handoff archive is missing its identity member"
+            fi
+            listing="$(tar --zstd -tvf "$archive" "$expected" 2>/dev/null || true)"
+            line_count="$(printf '%s\n' "$listing" | sed '/^$/d' | wc -l | tr -d ' ')"
+            if [ "$line_count" -ne 1 ]; then
+              fail "producer handoff archive identity member is missing or ambiguous"
+            fi
+            case "$(printf '%s\n' "$listing" | sed '/^$/d')" in
+              -*) ;;
+              *)
+                fail "producer handoff archive identity member is not a regular file"
+                ;;
+            esac
+          }
+
           extract_identity() {
             local archive="$1"
             local dest="$2"
@@ -1371,7 +1456,8 @@ jobs:
             if ! is_real_dir "$dest"; then
               fail "failed to create producer handoff identity extract directory"
             fi
-            tar --zstd --no-same-owner --no-absolute-filenames \
+            assert_identity_member "$archive" "$identity_member"
+            tar --zstd --no-same-owner \
               -xf "$archive" -C "$dest" "$identity_member"
             local identity="${dest}/${identity_member}"
             if ! is_real_file "$identity"; then
@@ -1791,6 +1877,48 @@ jobs:
             fi
           }
 
+          reject_hostile_tar_member() {
+            local member="$1"
+            case "$member" in
+              *$'\r'*|*$'\n'*)
+                fail "producer handoff archive member is malformed"
+                ;;
+              /*)
+                fail "producer handoff archive member uses an absolute path"
+                ;;
+              ..|../*|*/..|*/../*|*/..)
+                fail "producer handoff archive member uses path traversal"
+                ;;
+            esac
+          }
+
+          assert_identity_member() {
+            local archive="$1"
+            local expected="$2"
+            local member listing line_count found=0
+            while IFS= read -r member || [ -n "$member" ]; do
+              [ -n "$member" ] || continue
+              reject_hostile_tar_member "$member"
+              if [ "$member" = "$expected" ]; then
+                found=1
+              fi
+            done < <(tar --zstd -tf "$archive")
+            if [ "$found" -ne 1 ]; then
+              fail "producer handoff archive is missing its identity member"
+            fi
+            listing="$(tar --zstd -tvf "$archive" "$expected" 2>/dev/null || true)"
+            line_count="$(printf '%s\n' "$listing" | sed '/^$/d' | wc -l | tr -d ' ')"
+            if [ "$line_count" -ne 1 ]; then
+              fail "producer handoff archive identity member is missing or ambiguous"
+            fi
+            case "$(printf '%s\n' "$listing" | sed '/^$/d')" in
+              -*) ;;
+              *)
+                fail "producer handoff archive identity member is not a regular file"
+                ;;
+            esac
+          }
+
           extract_identity() {
             local archive="$1"
             local dest="$2"
@@ -1799,7 +1927,8 @@ jobs:
             if ! is_real_dir "$dest"; then
               fail "failed to create producer handoff identity extract directory"
             fi
-            tar --zstd --no-same-owner --no-absolute-filenames \
+            assert_identity_member "$archive" "$identity_member"
+            tar --zstd --no-same-owner \
               -xf "$archive" -C "$dest" "$identity_member"
             local identity="${dest}/${identity_member}"
             if ! is_real_file "$identity"; then
