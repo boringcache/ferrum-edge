@@ -2956,7 +2956,14 @@ impl StreamListenerManager {
                 );
                 degraded.extend(listener_failures(
                     identity,
-                    sni_ids.as_deref(),
+                    // Shared groups carry their membership in exactly one of
+                    // these: SNI groups in `sni_ids`, NodeWaypoint UDP groups
+                    // in `node_waypoint_udp_ids`. The clearing side
+                    // (`rebound_proxy_ids`) and the async task-failure side
+                    // already fan out over both; this synchronous probe
+                    // failure must too, or a shared-member bind failure is
+                    // reported only for the representative.
+                    sni_ids.as_deref().or(node_waypoint_udp_ids.as_deref()),
                     port_val,
                     &msg,
                     StreamListenerDegradation::BindFailed,
