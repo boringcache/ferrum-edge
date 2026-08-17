@@ -169,7 +169,13 @@ impl CgroupTreeWalk {
 
 #[cfg(unix)]
 fn record_incomplete(status: &mut CgroupTreeWalkStatus, reason: CgroupTreeWalkStatus) {
-    debug_assert_ne!(reason, CgroupTreeWalkStatus::Complete);
+    // A Complete "reason" is not a failure and must not clobber a prior one.
+    // Callers only pass incomplete statuses; ignore Complete rather than
+    // panicking in debug builds over an internal invariant with no extra
+    // diagnostic value.
+    if reason == CgroupTreeWalkStatus::Complete {
+        return;
+    }
     if *status == CgroupTreeWalkStatus::Complete {
         *status = reason;
     }

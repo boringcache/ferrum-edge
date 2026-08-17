@@ -171,12 +171,18 @@ fn guard_ipv4(ctx: &TcContext) -> Result<i32, i64> {
             // `.is_some()` results; LLVM lowers that as `pointer |= pointer`,
             // which the kernel verifier rejects. Each helper below collapses
             // its own lookup to a `bool` before returning for the same reason.
-            let ports = udp_ports4(ctx);
+            //
+            // UDP ports are parsed ONLY after `udp_relay_sender_authorized`
+            // returns. Binding a `Result`/port value across `bpf_skb_cgroup_id`
+            // lets LLVM keep that state live on the helper-zero path; the
+            // kernel verifier then rejects the classifier (`R9 !read_ok`).
+            // The node-source lane needs no ports. The reply-source lane and
+            // the DNS carve-out each parse after the helper has returned.
             if udp_relay_sender_authorized(ctx) {
                 if enrolled_destination_authorized(ctx, source_is_node) {
                     return Ok(TC_ACT_PIPE);
                 }
-                if let Ok((src_port, _)) = ports {
+                if let Ok((src_port, _)) = udp_ports4(ctx) {
                     if enrolled_destination_authorized(
                         ctx,
                         udp_reply_source4_allowed(src_ip, src_port),
@@ -185,7 +191,7 @@ fn guard_ipv4(ctx: &TcContext) -> Result<i32, i64> {
                     }
                 }
             }
-            match ports {
+            match udp_ports4(ctx) {
                 Ok((src_port, dst_port)) if dns_response_allowed(src_port, dst_port) => {
                     Ok(TC_ACT_OK)
                 }
@@ -263,12 +269,13 @@ fn guard_ipv6(ctx: &TcContext) -> Result<i32, i64> {
             // trusted on one family and forgeable on the other, and a waypoint
             // that admitted only one family would black-hole the other. Same
             // separate-arm source proofs as IPv4; do not reintroduce `||`.
-            let ports = udp_ports6(ctx);
+            // Same verifier-safe port ordering as IPv4: no UDP-port Result is
+            // live across `bpf_skb_cgroup_id`.
             if udp_relay_sender_authorized(ctx) {
                 if enrolled_destination_authorized(ctx, source_is_node) {
                     return Ok(TC_ACT_PIPE);
                 }
-                if let Ok((src_port, _)) = ports {
+                if let Ok((src_port, _)) = udp_ports6(ctx) {
                     if enrolled_destination_authorized(
                         ctx,
                         udp_reply_source6_allowed(src_ip.addr, src_port),
@@ -277,7 +284,7 @@ fn guard_ipv6(ctx: &TcContext) -> Result<i32, i64> {
                     }
                 }
             }
-            match ports {
+            match udp_ports6(ctx) {
                 Ok((src_port, dst_port)) if dns_response_allowed(src_port, dst_port) => {
                     Ok(TC_ACT_OK)
                 }
