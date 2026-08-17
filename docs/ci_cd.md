@@ -241,7 +241,9 @@ schema- and architecture-scoped local BuildKit cache (`type=local`) through pinn
 `production-dockerfile-smoke-{default,ebpf}-v1-${{ runner.os }}-${{ runner.arch }}-${{ github.sha }}`
 with matching `v1-${{ runner.os }}-${{ runner.arch }}-` restore prefixes. The `v1`
 component is the BuildKit cache schema; bump it only when the exported layout
-changes.
+changes. The Ambient production-image job uses a separate GHA-backend
+restore-only policy documented with that live suite, not this exact-generation
+local cache.
 
 `actions/cache/restore` v4 outputs are classified strictly: `cache-hit == 'true'`
 is an exact primary-key hit; `cache-hit == 'false'` is a restore-key partial
@@ -916,6 +918,41 @@ the datapath needs privileged host-netns manipulation that the live-kernel job
 already performs against the real kernel. The two jobs are complementary — the
 live job proves the datapath, the image job proves the shipped runtime can
 execute it — and the `Ambient Host UDP Live` gate requires both.
+
+**Cache-budget policy.** GitHub Actions gives each repository a 10 GB cache
+quota and evicts the least-recently used entries across every ref when that
+budget is exhausted. The Ambient production-image job previously published
+`type=gha,mode=max` BuildKit layers on every pull request under
+`scope=ambient-host-udp-images`. Those PR-scoped `buildkit-blob-*` entries
+cannot be restored by other PRs or by `ci-test`, but they still consume the
+shared quota, so ordinary Swatinem rust-cache entries disappear and Unit /
+PKCS#11 jobs compile cold. The image job still restores
+`cache-from: type=gha,scope=ambient-host-udp-images` on every event, including
+fork PRs, so a trusted default-branch cache remains useful. It publishes
+`cache-to` only when `github.ref == 'refs/heads/main'`, the event is neither
+`pull_request` nor `merge_group`, and the head is not a fork — today that is
+`workflow_dispatch` on `main`. The three required image targets
+(`capture-tools-base`, `runtime-ebpf-tools`, `runtime-ebpf`) and their
+executable/distroless contract checks always run; an empty `cache-to` does not
+skip a build. Existing cache entries are left for GitHub's LRU rather than
+deleted by this change. The Fuzz Smoke lane's separate main-only save is owned
+by PR #3918 and is not changed here. The NodeWaypoint/FIPS exact-generation
+local BuildKit design from PR #3889 is also unchanged.
+
+The shared `setup-rust-ci` action applies the same restore-only policy to the
+Swatinem rust-cache: `save-if` is true only when the event is neither
+`pull_request` nor `merge_group`, `github.ref == 'refs/heads/main'`, and the
+head is not a fork — pushes to `main` (and a manual `workflow_dispatch` on
+`main`) refresh the per-`shared-key` caches that every pull-request lane then
+restores. PR-merge-ref-scoped rust-cache entries were multi-gigabyte per lane
+(`v0-rust-ci-test`, `v0-rust-ci-test-secrets`, live-suite keys, and so on) and
+evicted the default-branch entries under the shared 10 GB quota, which is what
+left Unit Tests / PKCS#11 compiling cold in the first place. The known cost:
+re-runs of a pull request's failed jobs no longer restore a same-PR warm
+cache and compile from the `main` baseline instead. The FIPS workflow's own
+rust-cache producer/consumer sites keep their existing fork-only `save-if`
+contract — that workflow's caching architecture is generation-pinned
+separately (PR #3889).
 
 #### 6. Performance Regression Job
 
@@ -1984,24 +2021,29 @@ optional live-suite `changes` jobs (`#3919`) are not admitted here. They are not
 folded into this predecessor; if hosted Cross disagrees after a latest-`main`
 merge, they need their own exact pair rather than a wildcard.
 
-##### Admitted `setup-rust-ci` generation transition (temporary)
+##### Admitted `setup-rust-ci` generation transitions (temporary)
 
-`.github/actions/setup-rust-ci/action.yml` on current `main` (PR #3889's landed
-file, SHA-256
-`fc4e41818dffdea880c057c8dfa0881a629cd01c917b43f69a9f2e5e9bd90dda`) may move to
-exactly one combined destination decided by this trusted policy
-(`LOCAL_ACTION_GENERATION_TRANSITIONS`):
+`.github/actions/setup-rust-ci/action.yml` carries a two-step chain decided by
+this trusted policy (`LOCAL_ACTION_GENERATION_TRANSITIONS`), starting from PR
+#3889's landed file (SHA-256
+`fc4e41818dffdea880c057c8dfa0881a629cd01c917b43f69a9f2e5e9bd90dda`):
 
-- PR #3911 / issue #3906, after merging latest `main` while preserving every
-  #3889 cache-safety change plus #3911's optional `workspaces` input/pass-through:
-  `57a99a179ddc2935af187f518a803bf167eb9e33593c37b7b29f7151ec994da2`
+- Step 1 — the cache-budget generation: rust-cache `save-if` gated to a
+  trusted `refs/heads/main` run so pull requests and merge groups restore
+  without saving (see the cache-budget policy in the Ambient section):
+  `b6ca6315ff9f2a206c1011b6b0166de3a340370fd75bf3e9cffe41e872008924`
+- Step 2 — PR #3911 / issue #3906 rebased onto step 1, preserving every
+  cache-safety change plus #3911's optional `workspaces` input/pass-through:
+  `219187bdb0366d929577e67f48947b8c1096998dd7e04eafdffdb53dc3faa925`
 
-The pair is exact, path-bound, one-way, and fail-closed. The candidate supplies
-no digest, allowlist, or fallback. A dest-to-dest rewrite, a one-byte drift, or
-any other path is scanned as an ordinary Cross surface change. The obsolete
-two-destination table from before #3889 landed is retired. #3910's comment-only
-`setup-rust-ci` tweak is not admitted here; drop or re-pin it after merging
-latest `main`.
+Each pair is exact, path-bound, one-way, and fail-closed. The candidate
+supplies no digest, allowlist, or fallback. A dest-to-dest rewrite, a one-byte
+drift, or any other path is scanned as an ordinary Cross surface change. The
+former direct #3889→#3911 destination
+(`57a99a179ddc2935af187f518a803bf167eb9e33593c37b7b29f7151ec994da2`) is
+superseded by this chain; #3911 must rebase to the combined step-2 text.
+#3910's comment-only `setup-rust-ci` tweak is not admitted here; drop or
+re-pin it after merging latest `main`.
 
 ##### Remaining CI-tranche predecessor sequence
 
