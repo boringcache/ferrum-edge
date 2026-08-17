@@ -2358,7 +2358,6 @@ impl DtlsServer {
                                             continue;
                                         }
                                         Err(_) => {
-                                            retired_by_trust_withdrawal = true;
                                             fail_queued_frontend_app_sends(
                                                 &mut app_in_rx,
                                                 auth_deadline.get(),
@@ -2477,7 +2476,6 @@ impl DtlsServer {
                                         return;
                                     }
                                     Err(_) => {
-                                        retired_by_trust_withdrawal = true;
                                         fail_queued_frontend_app_sends(
                                             &mut app_in_rx,
                                             auth_deadline.get(),
@@ -2557,12 +2555,6 @@ impl DtlsServer {
                                         break;
                                     }
                                     Ok(Err(_)) | Err(_) => {
-                                        if client_trust_guard
-                                            .as_ref()
-                                            .is_some_and(|guard| guard.session().is_retired())
-                                        {
-                                            retired_by_trust_withdrawal = true;
-                                        }
                                         if let Some(inflight) = in_flight.take() {
                                             let _ = inflight.completion.send(Err(
                                                 FrontendAppSendReject::Closed
