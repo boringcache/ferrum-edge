@@ -58,6 +58,18 @@ info:
     create/get/rename/delete of a specific name return `403` when the token
     cannot address that name (rename checks both the current and target names).
 
+    ## Namespace registry atomicity
+
+    Every namespace create, rename, and delete is serialized across gateway
+    processes by a global namespace-registry admission lease plus one lease per
+    affected name, and commits in a single database transaction that re-verifies
+    those lease identities against the datastore's own clock immediately before
+    commit. Occupancy, target vacancy, protection of the configured namespace,
+    and the last-remaining-namespace invariant are all decided inside that
+    transaction, so nothing partial can become durable. Standalone MongoDB has
+    no multi-document transactions and therefore refuses these three operations
+    with `501` before mutating anything; `GET` remains available.
+
     ## Caching and read-only mode
 
     When the primary database is unavailable, read endpoints transparently fall
@@ -5662,9 +5674,15 @@ paths:
         call first.
 
         `name` must match `^[a-zA-Z0-9][a-zA-Z0-9._-]*$` and is at most 254
-        characters. Returns `409` when the name already exists in the
-        registry or as a derived resource namespace. Admin role required.
-        File mode and other read-only topologies return `403`.
+        characters. `description` is trimmed, an empty or whitespace-only
+        value is stored as absent, and the `maxLength` bound counts Unicode
+        characters (scalar values), not bytes. Any other JSON type for
+        `description` is `400`.
+
+        Returns `409` when the name already exists in the registry or as a
+        derived resource namespace — decided inside the committing
+        transaction, not by an earlier query. Admin role required. File mode
+        and other read-only topologies return `403`.
       tags: [Namespaces]
       requestBody:
         required: true
@@ -5689,6 +5707,10 @@ paths:
           $ref: "#/components/responses/RequestTimeout"
         "409":
           $ref: "#/components/responses/Conflict"
+        "500":
+          $ref: "#/components/responses/InternalServerError"
+        "501":
+          $ref: "#/components/responses/NamespaceRegistryAtomicityUnsupported"
         "503":
           $ref: "#/components/responses/NamespaceAdmissionUnavailable"
 
@@ -5739,13 +5761,28 @@ paths:
       operationId: updateNamespace
       summary: Update or rename a namespace
       description: |
-        Updates the optional description and/or renames the tenant. A rename
-        rewrites the registry row and every resource `namespace` column
+        Updates the optional description and/or renames the tenant.
+
+        A rename rewrites the registry row, every resource `namespace` column
         (proxies, consumers, plugin configs, upstreams, gateway trust
-        bundles, API specs, audit events, and related indexes) under the
-        namespace-admission guard so two writers cannot tear the tenant.
-        Returns `409` when the target name already exists. Admin role
-        required. File mode returns `403`. When
+        bundles, API specs, audit events, and the consumer identity/credential
+        indexes) and the polling change-log tombstones in ONE database
+        transaction, under the global namespace-registry admission lease plus
+        the source and target namespace leases. Those lease identities are
+        re-verified inside the committing transaction, so a lost lease aborts
+        with nothing applied (`503`). A namespace that exists only because a
+        resource was written under it (no registry row) is materialized by the
+        same transaction.
+
+        Omitted fields are left unchanged. `description: null` (or an empty
+        string) clears it; `name` is only valid as a string when present —
+        `name: null` and any non-string value are `400` with nothing mutated.
+
+        Returns `409` when the target name already exists, and `409` when the
+        current name is the namespace this gateway is configured to serve
+        (`FERRUM_NAMESPACE`, default `ferrum`): a rename is semantically a
+        removal of the old name. A description-only update of that namespace
+        is allowed. Admin role required. File mode returns `403`. When
         `FERRUM_ADMIN_REQUIRE_NAMESPACE_CLAIM=true`, the token must be
         allowed to address both the current name and the new name.
       tags: [Namespaces]
@@ -5774,6 +5811,10 @@ paths:
           $ref: "#/components/responses/RequestTimeout"
         "409":
           $ref: "#/components/responses/Conflict"
+        "500":
+          $ref: "#/components/responses/InternalServerError"
+        "501":
+          $ref: "#/components/responses/NamespaceRegistryAtomicityUnsupported"
         "503":
           $ref: "#/components/responses/NamespaceAdmissionUnavailable"
     delete:
@@ -5783,10 +5824,23 @@ paths:
         Deletes a registry row. Returns `409` when the namespace still has
         resources unless `confirm=true`, which cascade-deletes occupancy
         resources (proxies, consumers, plugin configs, upstreams, API specs,
-        and the gateway trust bundle) and then the registry row. The process
-        default namespace (`FERRUM_NAMESPACE`, or `ferrum`) cannot be
-        deleted, and the last remaining namespace cannot be deleted. Admin
-        role required. File mode returns `403`.
+        the gateway trust bundle, the consumer identity/credential indexes,
+        and the tenant's route-bucket lock rows) and then the registry row —
+        all in ONE database transaction, under the global namespace-registry
+        admission lease plus the namespace's own lease. Those lease
+        identities are re-verified inside the committing transaction, so a
+        lost lease aborts with nothing applied (`503`).
+
+        Change-log tombstones are written for every removed resource and are
+        deliberately RETAINED (together with the namespace's change-log
+        retention floor) so a gateway still polling the deleted namespace
+        converges instead of serving stale configuration.
+
+        The namespace this gateway is configured to serve (`FERRUM_NAMESPACE`,
+        default `ferrum`) cannot be deleted, and the last remaining namespace
+        cannot be deleted — the latter is re-evaluated at the commit boundary,
+        so two gateways cannot each observe two names and concurrently delete
+        a different one. Admin role required. File mode returns `403`.
       tags: [Namespaces]
       parameters:
         - name: confirm
@@ -5811,6 +5865,10 @@ paths:
           $ref: "#/components/responses/NotFound"
         "409":
           $ref: "#/components/responses/Conflict"
+        "500":
+          $ref: "#/components/responses/InternalServerError"
+        "501":
+          $ref: "#/components/responses/NamespaceRegistryAtomicityUnsupported"
         "503":
           $ref: "#/components/responses/NamespaceAdmissionUnavailable"
 
@@ -6793,6 +6851,26 @@ components:
             $ref: "#/components/schemas/Error"
           example:
             error: Namespace mutation is temporarily unavailable; retry later
+    NamespaceRegistryAtomicityUnsupported:
+      description: >-
+        The configured database deployment cannot commit a namespace registry
+        mutation all-or-nothing with a commit-boundary admission check
+        (standalone MongoDB has no multi-document transactions). Refused
+        before any mutation; `detail` names the configuration to change.
+        Retrying unchanged can never succeed.
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/NamespaceRegistryUnsupportedResponse"
+          example:
+            error: >-
+              Namespace registry mutations are not supported by the configured
+              database deployment
+            detail: >-
+              MongoDB multi-document transactions require a replica set; set
+              FERRUM_MONGO_REPLICA_SET (or a ?replicaSet= URL option) so
+              namespace create/rename/delete can commit all-or-nothing with a
+              commit-boundary admission check. Nothing was modified.
     NotImplemented:
       description: Capability is not available in this build
       content:
@@ -6815,7 +6893,11 @@ components:
         description:
           type: [string, "null"]
           maxLength: 1024
-          description: Optional operator-facing description
+          description: >-
+            Optional operator-facing description. Trimmed on write; an empty
+            or whitespace-only value is stored as absent and omitted from the
+            response. `maxLength` counts Unicode characters (scalar values),
+            not bytes.
         created_at:
           type: string
           format: date-time
@@ -6832,6 +6914,10 @@ components:
           maxLength: 254
           pattern: '^[a-zA-Z0-9][a-zA-Z0-9._-]*$'
         description:
+          description: >-
+            Trimmed on write; empty or whitespace-only is stored as absent.
+            `maxLength` counts Unicode characters, not bytes. Any other JSON
+            type is rejected with `400`.
           type: [string, "null"]
           maxLength: 1024
     UpdateNamespaceRequest:
@@ -6842,13 +6928,27 @@ components:
           minLength: 1
           maxLength: 254
           pattern: '^[a-zA-Z0-9][a-zA-Z0-9._-]*$'
-          description: New name; omitted leaves the current name unchanged
+          description: >-
+            New name. Omit the field to keep the current name — `null` is NOT
+            accepted as "unchanged" and is rejected with `400`, as is any
+            non-string value.
         description:
-          description: |
+          description: >-
             Omitted leaves the current description unchanged. JSON `null` or
-            an empty string clears it.
+            an empty/whitespace-only string clears it. `maxLength` counts
+            Unicode characters, not bytes. Any other JSON type is rejected
+            with `400` and nothing is mutated.
           type: [string, "null"]
           maxLength: 1024
+    NamespaceRegistryUnsupportedResponse:
+      type: object
+      required: [error, detail]
+      properties:
+        error:
+          type: string
+        detail:
+          type: string
+          description: Operator-actionable remediation; names configuration only.
     Error:
       type: object
       required: [error]

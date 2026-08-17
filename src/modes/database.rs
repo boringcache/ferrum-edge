@@ -967,6 +967,10 @@ pub async fn run(
             store.set_cert_expiry_warning_days(env_config.tls_cert_expiry_warning_days);
             store.set_backend_allow_ips(env_config.backend_allow_ips.clone());
             store.set_failover_allow_writes(env_config.db_failover_allow_writes);
+            // Resolved FERRUM_NAMESPACE (issue #3955): the namespace admin
+            // DELETE/rename-away protects. Applied here so no request-time code
+            // re-reads the process environment and bypasses config precedence.
+            store.set_effective_default_namespace(&env_config.namespace);
             let retention_policy = crate::admin::audit::AuditRetentionPolicy {
                 retention_days: env_config.audit_retention_days,
                 max_rows_per_namespace: env_config.audit_retention_max_rows,
@@ -1039,6 +1043,10 @@ pub async fn run(
             store.set_cert_expiry_warning_days(env_config.tls_cert_expiry_warning_days);
             store.set_backend_allow_ips(env_config.backend_allow_ips.clone());
             store.set_failover_allow_writes(env_config.db_failover_allow_writes);
+            // Resolved FERRUM_NAMESPACE (issue #3955): the namespace admin
+            // DELETE/rename-away protects. Applied here so no request-time code
+            // re-reads the process environment and bypasses config precedence.
+            store.set_effective_default_namespace(&env_config.namespace);
             let retention_policy = crate::admin::audit::AuditRetentionPolicy {
                 retention_days: env_config.audit_retention_days,
                 max_rows_per_namespace: env_config.audit_retention_max_rows,

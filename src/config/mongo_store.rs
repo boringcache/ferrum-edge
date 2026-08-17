@@ -108,6 +108,8 @@ mod inner {
     };
     use crate::config::namespace_registry::{
         DERIVED_NAMESPACE_RESOURCE_TABLES, NAMESPACE_OCCUPANCY_TABLES, NamespaceRecord,
+        NamespaceRegistryAtomicityUnsupported, NamespaceRegistryError as RegistryError,
+        NamespaceRegistryPhase, namespace_registry_fault,
     };
     use regex::escape as regex_escape;
 
@@ -957,6 +959,13 @@ mod inner {
         reconnect_transition_test_hooks:
             Arc<std::sync::Mutex<Option<MongoReconnectTransitionTestHooks>>>,
         replica_set_configured: Arc<AtomicBool>,
+        /// The namespace this process serves, applied once at startup from the
+        /// already-resolved `EnvConfig` (issue #3955). Namespace DELETE and
+        /// rename-away consult THIS value rather than re-reading
+        /// `std::env::var("FERRUM_NAMESPACE")` at request time, which would
+        /// bypass the CLI > env > conf-file > default precedence and could
+        /// protect the wrong namespace.
+        effective_default_namespace: String,
     }
 
     impl MongoStore {
@@ -1047,6 +1056,7 @@ mod inner {
                 failover_topology: crate::config::db_backend::DbFailoverTopologyState::new(),
                 reconnect_transition_test_hooks: Arc::new(std::sync::Mutex::new(None)),
                 replica_set_configured: Arc::new(AtomicBool::new(replica_set_configured)),
+                effective_default_namespace: crate::config::types::DEFAULT_NAMESPACE.to_string(),
             })
         }
 
@@ -1676,6 +1686,7 @@ mod inner {
                 failover_topology: crate::config::db_backend::DbFailoverTopologyState::new(),
                 reconnect_transition_test_hooks: Arc::new(std::sync::Mutex::new(None)),
                 replica_set_configured: Arc::new(AtomicBool::new(false)),
+                effective_default_namespace: crate::config::types::DEFAULT_NAMESPACE.to_string(),
             })
         }
 
@@ -5069,74 +5080,1013 @@ mod inner {
                 0,
             )?;
 
-            if let Some((owner, generation)) = &plan.admission_lease {
-                // Conditional in-session write, not a read: the lease document
-                // joins this transaction's write set, so a competing acquirer
-                // that took the lease mid-transaction raises a write conflict
-                // (retried, then matching nothing) instead of being masked by
-                // the transaction's read snapshot.
-                //
-                // Expiry is compared against MongoDB's own clock AT THIS GATE
-                // (`$expr` + `$$NOW`, the same convention the lease renew path
-                // uses), never against a timestamp captured before the
-                // transaction opened. A pre-transaction snapshot goes stale
-                // while the graph is written — and staler still when the
-                // convenient runner retries the callback — so a lease that
-                // lapsed with no competing acquirer yet would still match on
-                // owner/generation and commit. `$$NOW` re-evaluates on every
-                // attempt, matching the SQL backends' database-`now()` check at
-                // the same point.
-                let locks = self.config_admission_locks_in_transaction();
-                let result = locks
-                    .update_one(
-                        doc! {
-                            "_id": plan.lease_namespace.as_str(),
-                            "owner": owner.as_str(),
-                            "generation": *generation,
-                            "$expr": { "$gt": [ "$expires_at", "$$NOW" ] },
-                        },
-                        Self::server_time_lease_touch_pipeline(),
+            if let Some((owner, generation)) = &plan.admission_lease
+                && !self
+                    .verify_namespace_config_admission_lease_in_session(
+                        &mut *session,
+                        plan.lease_namespace.as_str(),
+                        owner.as_str(),
+                        *generation,
                     )
-                    .session(&mut *session)
-                    .await;
-                let result = match result {
-                    Err(error) if is_pipeline_update_unsupported(&error) => {
-                        // AWS DocumentDB rejects pipeline-form updates. Read the
-                        // server clock here, at the gate, and re-issue the
-                        // equivalent classic comparison — still MongoDB's time
-                        // and still evaluated after every phase has been
-                        // written, never the client clock and never a value
-                        // captured before the transaction opened.
-                        let now = self.lease_server_time().await.map_err(|error| {
-                            mongodb::error::Error::custom(format!(
-                                "namespace config admission lease verification could not read \
-                                 the MongoDB server clock: {error}"
-                            ))
-                        })?;
-                        locks
-                            .update_one(
-                                doc! {
-                                    "_id": plan.lease_namespace.as_str(),
-                                    "owner": owner.as_str(),
-                                    "generation": *generation,
-                                    "expires_at": { "$gt": now },
-                                },
-                                doc! { "$set": { "updated_at": now } },
-                            )
-                            .session(&mut *session)
-                            .await
-                    }
-                    result => result,
-                }?;
-                if result.matched_count != 1 {
-                    let abort = AtomicBatchAbort::AdmissionLeaseLost;
-                    return Err(mongodb::error::Error::custom(abort));
-                }
+                    .await?
+            {
+                let abort = AtomicBatchAbort::AdmissionLeaseLost;
+                return Err(mongodb::error::Error::custom(abort));
             }
 
             Self::check_atomic_batch_fault_in_session(plan.fault, AtomicBatchPhase::Commit, 0)?;
             Ok(())
         }
+
+        /// Re-verify one namespace config-admission lease inside `session`.
+        ///
+        /// Conditional in-session write, not a read: the lease document joins
+        /// this transaction's write set, so a competing acquirer that took the
+        /// lease mid-transaction raises a write conflict (retried, then matching
+        /// nothing) instead of being masked by the transaction's read snapshot.
+        ///
+        /// Expiry is compared against MongoDB's own clock AT THIS GATE (`$expr`
+        /// + `$$NOW`, the same convention the lease renew path uses), never
+        /// against a timestamp captured before the transaction opened. A
+        /// pre-transaction snapshot goes stale while the mutation is written —
+        /// and staler still when the convenient runner retries the callback — so
+        /// a lease that lapsed with no competing acquirer yet would still match
+        /// on owner/generation and commit. `$$NOW` re-evaluates on every
+        /// attempt, matching the SQL backends' database-`now()` check at the
+        /// same point.
+        async fn verify_namespace_config_admission_lease_in_session(
+            &self,
+            session: &mut ClientSession,
+            key: &str,
+            owner: &str,
+            generation: i64,
+        ) -> mongodb::error::Result<bool> {
+            let locks = self.config_admission_locks_in_transaction();
+            let result = locks
+                .update_one(
+                    doc! {
+                        "_id": key,
+                        "owner": owner,
+                        "generation": generation,
+                        "$expr": { "$gt": [ "$expires_at", "$$NOW" ] },
+                    },
+                    Self::server_time_lease_touch_pipeline(),
+                )
+                .session(&mut *session)
+                .await;
+            let result = match result {
+                Err(error) if is_pipeline_update_unsupported(&error) => {
+                    // AWS DocumentDB rejects pipeline-form updates. Read the
+                    // server clock here, at the gate, and re-issue the
+                    // equivalent classic comparison — still MongoDB's time and
+                    // still evaluated after every phase has been written, never
+                    // the client clock and never a value captured before the
+                    // transaction opened.
+                    let now = self.lease_server_time().await.map_err(|error| {
+                        mongodb::error::Error::custom(format!(
+                            "namespace config admission lease verification could not read \
+                             the MongoDB server clock: {error}"
+                        ))
+                    })?;
+                    locks
+                        .update_one(
+                            doc! {
+                                "_id": key,
+                                "owner": owner,
+                                "generation": generation,
+                                "expires_at": { "$gt": now },
+                            },
+                            doc! { "$set": { "updated_at": now } },
+                        )
+                        .session(&mut *session)
+                        .await
+                }
+                result => result,
+            }?;
+            Ok(result.matched_count == 1)
+        }
+
+        // ---------------------------------------------------------------
+        // Namespace registry (issue #3955)
+        // ---------------------------------------------------------------
+
+        /// Why standalone MongoDB cannot serve a namespace registry mutation.
+        ///
+        /// A rename or cascade delete spans many documents, and even a
+        /// single-document create cannot be fenced against a stolen admission
+        /// lease without a transaction to verify the lease in. Rather than
+        /// expose a partially-moved tenant or a write nobody authorized, the
+        /// request is refused before it mutates anything — the same posture
+        /// `POST /batch` takes.
+        fn namespace_registry_standalone_refusal() -> NamespaceRegistryAtomicityUnsupported {
+            NamespaceRegistryAtomicityUnsupported::new(
+                "MongoDB multi-document transactions require a replica set; set \
+                 FERRUM_MONGO_REPLICA_SET (or a ?replicaSet= URL option) so namespace \
+                 create/rename/delete can commit all-or-nothing with a commit-boundary \
+                 admission check. Nothing was modified.",
+            )
+        }
+
+        /// Translate a failed registry transaction back into a typed error.
+        ///
+        /// The convenient-transaction runner only aborts when the callback
+        /// returns `Err`, so application-level aborts travel as
+        /// `Error::custom(NamespaceRegistryAbort)` and are unwrapped here.
+        fn namespace_registry_transaction_error(error: mongodb::error::Error) -> anyhow::Error {
+            match error.get_custom::<NamespaceRegistryAbort>().cloned() {
+                Some(NamespaceRegistryAbort::NotFound(name)) => {
+                    anyhow::Error::new(RegistryError::NotFound { name })
+                }
+                Some(NamespaceRegistryAbort::NameInUse(name)) => {
+                    anyhow::Error::new(RegistryError::NameInUse { name })
+                }
+                Some(NamespaceRegistryAbort::NotEmpty(name)) => {
+                    anyhow::Error::new(RegistryError::NotEmpty { name })
+                }
+                Some(NamespaceRegistryAbort::Protected { name, reason }) => {
+                    anyhow::Error::new(RegistryError::Protected { name, reason })
+                }
+                Some(NamespaceRegistryAbort::AdmissionLeaseLost) => {
+                    anyhow::Error::new(BatchAdmissionLeaseLost).context(
+                        "MongoDB namespace registry mutation aborted before commit: an admission \
+                         lease was no longer held",
+                    )
+                }
+                Some(NamespaceRegistryAbort::InjectedFault(phase)) => phase.error(),
+                None => anyhow::Error::new(error).context("namespace registry transaction failed"),
+            }
+        }
+
+        /// The whole `create_namespace` mutation, inside the caller's session.
+        async fn create_namespace_in_session(
+            &self,
+            session: &mut ClientSession,
+            plan: &MongoNamespaceRegistryPlan,
+        ) -> mongodb::error::Result<()> {
+            Self::check_namespace_registry_fault_in_session(
+                plan.fault,
+                NamespaceRegistryPhase::Start,
+            )?;
+            let name = plan.current_name.as_str();
+            // Vacancy is decided INSIDE the transaction; an earlier handler
+            // query could only shape the error.
+            if self
+                .namespace_name_in_use_in_session(&mut *session, name)
+                .await?
+            {
+                return Err(mongodb::error::Error::custom(
+                    NamespaceRegistryAbort::NameInUse(name.to_string()),
+                ));
+            }
+            let document = plan.registry_doc.clone().ok_or_else(|| {
+                mongodb::error::Error::custom(
+                    "namespace create plan is missing its registry document",
+                )
+            })?;
+            self.namespaces()
+                .insert_one(document)
+                .session(&mut *session)
+                .await?;
+            Self::check_namespace_registry_fault_in_session(
+                plan.fault,
+                NamespaceRegistryPhase::RegistryRow,
+            )?;
+            self.verify_namespace_registry_leases_in_session(
+                &mut *session,
+                &plan.leases,
+                plan.fault,
+            )
+            .await?;
+            Self::check_namespace_registry_fault_in_session(
+                plan.fault,
+                NamespaceRegistryPhase::Commit,
+            )?;
+            Ok(())
+        }
+
+        /// The whole `update_namespace` mutation, inside the caller's session.
+        ///
+        /// Existence, target vacancy, and protection of the configured
+        /// namespace are decided here, under the caller's admission leases and
+        /// inside the transaction that is about to commit.
+        async fn update_namespace_in_session(
+            &self,
+            session: &mut ClientSession,
+            plan: &MongoNamespaceRegistryPlan,
+        ) -> mongodb::error::Result<NamespaceRecord> {
+            Self::check_namespace_registry_fault_in_session(
+                plan.fault,
+                NamespaceRegistryPhase::Start,
+            )?;
+            let current_name = plan.current_name.as_str();
+            let new_name = plan.new_name.as_str();
+            let renaming = new_name != current_name;
+
+            let existing = self
+                .get_namespace_in_session(&mut *session, current_name)
+                .await?;
+            if existing.is_none()
+                && !self
+                    .namespace_name_in_use_in_session(&mut *session, current_name)
+                    .await?
+            {
+                return Err(mongodb::error::Error::custom(
+                    NamespaceRegistryAbort::NotFound(current_name.to_string()),
+                ));
+            }
+            if renaming {
+                // A rename is semantically a removal of the old name.
+                if current_name == plan.protected_default {
+                    return Err(Self::namespace_protected_abort(
+                        current_name,
+                        RegistryError::PROTECTED_PROCESS_DEFAULT,
+                    ));
+                }
+                if self
+                    .namespace_name_in_use_in_session(&mut *session, new_name)
+                    .await?
+                {
+                    return Err(mongodb::error::Error::custom(
+                        NamespaceRegistryAbort::NameInUse(new_name.to_string()),
+                    ));
+                }
+            }
+
+            let now = Utc::now();
+            let mut record = existing
+                .unwrap_or_else(|| NamespaceRecord::new(current_name.to_string(), None, now));
+            if let Some(description) = &plan.description {
+                record.description = description.clone();
+            }
+            record.updated_at = now;
+            record.name = new_name.to_string();
+
+            if renaming {
+                self.rename_namespace_documents_in_session(
+                    &mut *session,
+                    current_name,
+                    new_name,
+                    &record,
+                    plan.fault,
+                )
+                .await?;
+            } else {
+                // Upsert materializes a derived-only tenant (resources but no
+                // registry document) so a description-only update has the same
+                // well-defined atomic outcome. An explicit `null` clears the
+                // field on both backends.
+                let description_bson = match &record.description {
+                    Some(value) => Bson::String(value.clone()),
+                    None => Bson::Null,
+                };
+                self.namespaces()
+                    .update_one(
+                        doc! { "_id": current_name },
+                        doc! {
+                            "$set": {
+                                "name": current_name,
+                                "description": description_bson,
+                                "created_at": record.created_at.to_rfc3339(),
+                                "updated_at": record.updated_at.to_rfc3339(),
+                            }
+                        },
+                    )
+                    .upsert(true)
+                    .session(&mut *session)
+                    .await?;
+                Self::check_namespace_registry_fault_in_session(
+                    plan.fault,
+                    NamespaceRegistryPhase::RegistryRow,
+                )?;
+            }
+
+            self.verify_namespace_registry_leases_in_session(
+                &mut *session,
+                &plan.leases,
+                plan.fault,
+            )
+            .await?;
+            Self::check_namespace_registry_fault_in_session(
+                plan.fault,
+                NamespaceRegistryPhase::Commit,
+            )?;
+            Ok(record)
+        }
+
+        /// The whole `delete_namespace` mutation, inside the caller's session.
+        async fn delete_namespace_in_session(
+            &self,
+            session: &mut ClientSession,
+            plan: &MongoNamespaceRegistryPlan,
+        ) -> mongodb::error::Result<bool> {
+            Self::check_namespace_registry_fault_in_session(
+                plan.fault,
+                NamespaceRegistryPhase::Start,
+            )?;
+            let name = plan.current_name.as_str();
+            if !self
+                .namespace_name_in_use_in_session(&mut *session, name)
+                .await?
+            {
+                return Ok(false);
+            }
+            if self
+                .namespace_has_resources_in_session(&mut *session, name)
+                .await?
+            {
+                if !plan.cascade {
+                    return Err(mongodb::error::Error::custom(
+                        NamespaceRegistryAbort::NotEmpty(name.to_string()),
+                    ));
+                }
+                self.delete_all_namespace_resources_in_session(&mut *session, name)
+                    .await?;
+                self.delete_namespace_trust_bundle_in_session(&mut *session, name)
+                    .await?;
+            }
+            Self::check_namespace_registry_fault_in_session(
+                plan.fault,
+                NamespaceRegistryPhase::Resources,
+            )?;
+
+            self.delete_namespace_guard_docs_in_session(&mut *session, name)
+                .await?;
+            Self::check_namespace_registry_fault_in_session(
+                plan.fault,
+                NamespaceRegistryPhase::Ancillary,
+            )?;
+
+            self.namespaces()
+                .delete_one(doc! { "_id": name })
+                .session(&mut *session)
+                .await?;
+            Self::check_namespace_registry_fault_in_session(
+                plan.fault,
+                NamespaceRegistryPhase::RegistryRow,
+            )?;
+
+            // Re-checked HERE, not from an earlier list query: two gateways that
+            // each saw two names would otherwise both proceed and leave zero.
+            if !self.any_namespace_remains_in_session(&mut *session).await? {
+                return Err(Self::namespace_protected_abort(
+                    name,
+                    RegistryError::PROTECTED_LAST_REMAINING,
+                ));
+            }
+            Self::check_namespace_registry_fault_in_session(
+                plan.fault,
+                NamespaceRegistryPhase::LastNamespaceCheck,
+            )?;
+
+            self.verify_namespace_registry_leases_in_session(
+                &mut *session,
+                &plan.leases,
+                plan.fault,
+            )
+            .await?;
+            Self::check_namespace_registry_fault_in_session(
+                plan.fault,
+                NamespaceRegistryPhase::Commit,
+            )?;
+            Ok(true)
+        }
+
+        /// Abort a registry transaction because `name` may not be removed.
+        fn namespace_protected_abort(name: &str, reason: &'static str) -> mongodb::error::Error {
+            mongodb::error::Error::custom(NamespaceRegistryAbort::Protected {
+                name: name.to_string(),
+                reason,
+            })
+        }
+
+        fn check_namespace_registry_fault_in_session(
+            fault: Option<NamespaceRegistryPhase>,
+            phase: NamespaceRegistryPhase,
+        ) -> mongodb::error::Result<()> {
+            match fault {
+                Some(installed) if installed == phase => Err(mongodb::error::Error::custom(
+                    NamespaceRegistryAbort::InjectedFault(installed),
+                )),
+                _ => Ok(()),
+            }
+        }
+
+        /// The whole-namespace resource cascade, written into the caller's
+        /// transaction session.
+        ///
+        /// Extracted from `delete_all_resources` so namespace DELETE composes
+        /// the identical cascade with the trust bundle, guard documents, and the
+        /// registry document in ONE transaction instead of chaining several.
+        async fn delete_all_namespace_resources_in_session(
+            &self,
+            session: &mut ClientSession,
+            namespace: &str,
+        ) -> mongodb::error::Result<()> {
+            let ns_filter = doc! { "namespace": namespace };
+            let proxy_ids = self
+                .load_collection_ids_filtered_in_session(
+                    &mut *session,
+                    "proxies",
+                    ns_filter.clone(),
+                )
+                .await
+                .map_err(|e| mongodb::error::Error::custom(e.to_string()))?;
+            // Consumers project the plain `id` field — their `_id` is the
+            // composite "{namespace}:{id}" and change-log records carry plain
+            // resource ids.
+            let consumer_ids = self
+                .load_consumer_plain_ids_filtered_in_session(&mut *session, ns_filter.clone())
+                .await
+                .map_err(|e| mongodb::error::Error::custom(e.to_string()))?;
+            let plugin_config_ids = self
+                .load_collection_ids_filtered_in_session(
+                    &mut *session,
+                    "plugin_configs",
+                    ns_filter.clone(),
+                )
+                .await
+                .map_err(|e| mongodb::error::Error::custom(e.to_string()))?;
+            let upstream_ids = self
+                .load_collection_ids_filtered_in_session(
+                    &mut *session,
+                    "upstreams",
+                    ns_filter.clone(),
+                )
+                .await
+                .map_err(|e| mongodb::error::Error::custom(e.to_string()))?;
+            self.plugin_configs()
+                .delete_many(ns_filter.clone())
+                .session(&mut *session)
+                .await?;
+            self.proxies()
+                .delete_many(ns_filter.clone())
+                .session(&mut *session)
+                .await?;
+            self.consumers()
+                .delete_many(ns_filter.clone())
+                .session(&mut *session)
+                .await?;
+            // Namespace wipe releases every consumer identity reservation in
+            // the namespace.
+            self.consumer_identity_index()
+                .delete_many(ns_filter.clone())
+                .session(&mut *session)
+                .await?;
+            self.upstreams()
+                .delete_many(ns_filter.clone())
+                .session(&mut *session)
+                .await?;
+            self.api_specs()
+                .delete_many(ns_filter)
+                .session(&mut *session)
+                .await?;
+            for id in &proxy_ids {
+                self.record_config_change_in_session(
+                    &mut *session,
+                    namespace,
+                    "proxy",
+                    id.as_str(),
+                    "delete",
+                )
+                .await?;
+            }
+            for id in &consumer_ids {
+                self.record_config_change_in_session(
+                    &mut *session,
+                    namespace,
+                    "consumer",
+                    id.as_str(),
+                    "delete",
+                )
+                .await?;
+            }
+            for id in &plugin_config_ids {
+                self.record_config_change_in_session(
+                    &mut *session,
+                    namespace,
+                    "plugin_config",
+                    id.as_str(),
+                    "delete",
+                )
+                .await?;
+            }
+            for id in &upstream_ids {
+                self.record_config_change_in_session(
+                    &mut *session,
+                    namespace,
+                    "upstream",
+                    id.as_str(),
+                    "delete",
+                )
+                .await?;
+            }
+            Ok(())
+        }
+
+        /// The trust bundle's RESOURCE id for change records.
+        ///
+        /// A gateway trust bundle document is keyed `_id = namespace` and
+        /// carries its resource id in a separate `id` field, so the generic
+        /// `_id`-projecting id loader would hand the change log a namespace
+        /// where a resource id belongs.
+        async fn namespace_trust_bundle_resource_id(
+            &self,
+            session: &mut ClientSession,
+            namespace: &str,
+        ) -> mongodb::error::Result<Option<String>> {
+            let document = self
+                .gateway_trust_bundles()
+                .find_one(doc! { "namespace": namespace })
+                .projection(doc! { "_id": 0, "id": 1 })
+                .session(&mut *session)
+                .await?;
+            let Some(document) = document else {
+                return Ok(None);
+            };
+            let id = document.get_str("id").map_err(|_| {
+                mongodb::error::Error::custom(format!(
+                    "gateway trust bundle for namespace '{namespace}' is missing its string id"
+                ))
+            })?;
+            Ok(Some(id.to_string()))
+        }
+
+        /// Remove the namespace's gateway trust bundle in-session, recording the
+        /// same `delete` change record the standalone path writes.
+        async fn delete_namespace_trust_bundle_in_session(
+            &self,
+            session: &mut ClientSession,
+            namespace: &str,
+        ) -> mongodb::error::Result<()> {
+            let Some(id) = self
+                .namespace_trust_bundle_resource_id(&mut *session, namespace)
+                .await?
+            else {
+                return Ok(());
+            };
+            self.gateway_trust_bundles()
+                .delete_many(doc! { "namespace": namespace })
+                .session(&mut *session)
+                .await?;
+            self.record_config_change_in_session(
+                &mut *session,
+                namespace,
+                GATEWAY_TRUST_BUNDLE_RESOURCE_TYPE,
+                id.as_str(),
+                "delete",
+            )
+            .await?;
+            Ok(())
+        }
+
+        /// Anchored, regex-escaped `_id` prefix for collections whose documents
+        /// are keyed `"{namespace}:{suffix}"` and carry NO `namespace` field.
+        ///
+        /// `proxy_route_locks` is exactly that shape, so a `{"namespace": ...}`
+        /// filter silently matches nothing. The name is escaped, so a namespace
+        /// containing regex metacharacters cannot widen the match — and the
+        /// grammar (`^[a-zA-Z0-9][a-zA-Z0-9._-]*$`) already permits `.`, which
+        /// would otherwise be a wildcard.
+        fn namespace_id_prefix_filter(namespace: &str) -> Document {
+            doc! { "_id": { "$regex": format!("^{}:", regex_escape(namespace)) } }
+        }
+
+        /// Remove the namespace's advisory guard documents in-session.
+        ///
+        /// `mtls_dns_admission_locks` is deliberately absent: the caller holds
+        /// that durable mutex for the whole mutation and releases (deletes) it
+        /// afterwards, so removing it here would destroy the fence proving the
+        /// mutation. `config_admission_locks` is likewise never touched — those
+        /// are the leases this transaction verifies against. `config_changes`
+        /// and `config_change_retention` also stay: the tombstones written above
+        /// live under this name and still need their retention floor.
+        async fn delete_namespace_guard_docs_in_session(
+            &self,
+            session: &mut ClientSession,
+            namespace: &str,
+        ) -> mongodb::error::Result<()> {
+            self.proxy_route_locks()
+                .delete_many(Self::namespace_id_prefix_filter(namespace))
+                .session(&mut *session)
+                .await?;
+            Ok(())
+        }
+
+        async fn get_namespace_in_session(
+            &self,
+            session: &mut ClientSession,
+            name: &str,
+        ) -> mongodb::error::Result<Option<NamespaceRecord>> {
+            let doc = self
+                .namespaces()
+                .find_one(doc! { "_id": name })
+                .session(&mut *session)
+                .await?;
+            Ok(doc.map(|doc| self.document_to_namespace_record(name, doc)))
+        }
+
+        async fn namespace_name_in_use_in_session(
+            &self,
+            session: &mut ClientSession,
+            name: &str,
+        ) -> mongodb::error::Result<bool> {
+            if self
+                .namespaces()
+                .find_one(doc! { "_id": name })
+                .session(&mut *session)
+                .await?
+                .is_some()
+            {
+                return Ok(true);
+            }
+            self.namespace_has_resources_in_session(&mut *session, name)
+                .await
+        }
+
+        async fn namespace_has_resources_in_session(
+            &self,
+            session: &mut ClientSession,
+            name: &str,
+        ) -> mongodb::error::Result<bool> {
+            for &collection in NAMESPACE_OCCUPANCY_TABLES {
+                if self
+                    .collection(collection)
+                    .find_one(doc! { "namespace": name })
+                    .projection(doc! { "_id": 1 })
+                    .session(&mut *session)
+                    .await?
+                    .is_some()
+                {
+                    return Ok(true);
+                }
+            }
+            Ok(false)
+        }
+
+        /// Does ANY namespace still exist? Exactly the union `GET /namespaces`
+        /// lists, so the invariant and the client agree on what "the last
+        /// remaining namespace" means.
+        async fn any_namespace_remains_in_session(
+            &self,
+            session: &mut ClientSession,
+        ) -> mongodb::error::Result<bool> {
+            if self
+                .namespaces()
+                .find_one(doc! {})
+                .session(&mut *session)
+                .await?
+                .is_some()
+            {
+                return Ok(true);
+            }
+            for &collection in DERIVED_NAMESPACE_RESOURCE_TABLES {
+                if self
+                    .collection(collection)
+                    .find_one(doc! {})
+                    .projection(doc! { "_id": 1 })
+                    .session(&mut *session)
+                    .await?
+                    .is_some()
+                {
+                    return Ok(true);
+                }
+            }
+            Ok(false)
+        }
+
+        /// Re-verify EVERY admission lease this mutation holds — the global
+        /// registry key and each affected namespace — immediately before the
+        /// runner commits.
+        async fn verify_namespace_registry_leases_in_session(
+            &self,
+            session: &mut ClientSession,
+            leases: &[(String, String, i64)],
+            fault: Option<NamespaceRegistryPhase>,
+        ) -> mongodb::error::Result<()> {
+            Self::check_namespace_registry_fault_in_session(
+                fault,
+                NamespaceRegistryPhase::LeaseLost,
+            )?;
+            for (key, owner, generation) in leases {
+                if !self
+                    .verify_namespace_config_admission_lease_in_session(
+                        &mut *session,
+                        key.as_str(),
+                        owner.as_str(),
+                        *generation,
+                    )
+                    .await?
+                {
+                    return Err(mongodb::error::Error::custom(
+                        NamespaceRegistryAbort::AdmissionLeaseLost,
+                    ));
+                }
+            }
+            Ok(())
+        }
+
+        /// Move every document that carries the tenant's name onto `new_name`,
+        /// inside the caller's transaction session.
+        async fn rename_namespace_documents_in_session(
+            &self,
+            session: &mut ClientSession,
+            current_name: &str,
+            new_name: &str,
+            record: &NamespaceRecord,
+            fault: Option<NamespaceRegistryPhase>,
+        ) -> mongodb::error::Result<()> {
+            self.namespaces()
+                .delete_one(doc! { "_id": current_name })
+                .session(&mut *session)
+                .await?;
+            self.namespaces()
+                .insert_one(Self::namespace_registry_doc(record))
+                .session(&mut *session)
+                .await?;
+
+            // Collections whose `_id` is independent of the namespace: rewrite
+            // the field in place.
+            for collection in ["proxies", "plugin_configs", "upstreams", "api_specs"] {
+                self.collection(collection)
+                    .update_many(
+                        doc! { "namespace": current_name },
+                        doc! { "$set": { "namespace": new_name } },
+                    )
+                    .session(&mut *session)
+                    .await?;
+            }
+            // Audit history follows the tenant so an operator can still read it
+            // under the new name. It is admin metadata, never polled.
+            self.audit_events()
+                .update_many(
+                    doc! { "namespace": current_name },
+                    doc! { "$set": { "namespace": new_name } },
+                )
+                .session(&mut *session)
+                .await?;
+
+            // Composite `_id` = "{namespace}:{suffix}", plus a `namespace`
+            // field: the document must be reinserted under a new `_id`.
+            self.rewrite_namespace_prefixed_ids_in_session(
+                &mut *session,
+                "consumers",
+                current_name,
+                new_name,
+            )
+            .await?;
+            self.rewrite_namespace_prefixed_ids_in_session(
+                &mut *session,
+                "consumer_identity_index",
+                current_name,
+                new_name,
+            )
+            .await?;
+            // There is deliberately no `consumer_credential_index` step: unlike
+            // SQL, the MongoDB backend has no such collection — credential
+            // uniqueness is enforced by partial unique indexes ON `consumers`,
+            // which move with the documents above.
+            // `gateway_trust_bundles` is keyed by the namespace itself.
+            self.move_namespace_keyed_document_in_session(
+                &mut *session,
+                "gateway_trust_bundles",
+                current_name,
+                new_name,
+                new_name,
+            )
+            .await?;
+
+            Self::check_namespace_registry_fault_in_session(
+                fault,
+                NamespaceRegistryPhase::Resources,
+            )?;
+
+            // Stale route-lock documents under the old name are removed, not
+            // copied: every writer that needs one upserts it on demand, and
+            // copying could collide with a document a previous tenant of the
+            // target name left behind.
+            self.delete_namespace_guard_docs_in_session(&mut *session, current_name)
+                .await?;
+            Self::check_namespace_registry_fault_in_session(
+                fault,
+                NamespaceRegistryPhase::Ancillary,
+            )?;
+
+            // Polling tombstones: `delete` under the old name, `upsert` under
+            // the new one. Historical change records and the old name's
+            // retention floor stay put — the tombstones live under the old name.
+            for (resource_type, collection) in [
+                ("proxy", "proxies"),
+                ("plugin_config", "plugin_configs"),
+                ("upstream", "upstreams"),
+            ] {
+                let ids = self
+                    .load_collection_ids_filtered_in_session(
+                        &mut *session,
+                        collection,
+                        doc! { "namespace": new_name },
+                    )
+                    .await
+                    .map_err(|e| mongodb::error::Error::custom(e.to_string()))?;
+                for id in &ids {
+                    self.record_config_change_in_session(
+                        &mut *session,
+                        current_name,
+                        resource_type,
+                        id.as_str(),
+                        "delete",
+                    )
+                    .await?;
+                    self.record_config_change_in_session(
+                        &mut *session,
+                        new_name,
+                        resource_type,
+                        id.as_str(),
+                        "upsert",
+                    )
+                    .await?;
+                }
+            }
+            // The trust bundle is keyed `_id = namespace`; its change records use
+            // the separate `id` field.
+            if let Some(id) = self
+                .namespace_trust_bundle_resource_id(&mut *session, new_name)
+                .await?
+            {
+                self.record_config_change_in_session(
+                    &mut *session,
+                    current_name,
+                    GATEWAY_TRUST_BUNDLE_RESOURCE_TYPE,
+                    id.as_str(),
+                    "delete",
+                )
+                .await?;
+                self.record_config_change_in_session(
+                    &mut *session,
+                    new_name,
+                    GATEWAY_TRUST_BUNDLE_RESOURCE_TYPE,
+                    id.as_str(),
+                    "upsert",
+                )
+                .await?;
+            }
+            // Consumers carry a composite `_id`; change records use the plain id.
+            let consumer_ids = self
+                .load_consumer_plain_ids_filtered_in_session(
+                    &mut *session,
+                    doc! { "namespace": new_name },
+                )
+                .await
+                .map_err(|e| mongodb::error::Error::custom(e.to_string()))?;
+            for id in &consumer_ids {
+                self.record_config_change_in_session(
+                    &mut *session,
+                    current_name,
+                    "consumer",
+                    id.as_str(),
+                    "delete",
+                )
+                .await?;
+                self.record_config_change_in_session(
+                    &mut *session,
+                    new_name,
+                    "consumer",
+                    id.as_str(),
+                    "upsert",
+                )
+                .await?;
+            }
+            Self::check_namespace_registry_fault_in_session(
+                fault,
+                NamespaceRegistryPhase::RegistryRow,
+            )?;
+            Ok(())
+        }
+
+        /// Reinsert every document of `collection_name` whose `_id` is
+        /// `"{current_name}:{suffix}"` under `"{new_name}:{suffix}"`.
+        ///
+        /// The scan filters on the `namespace` FIELD, which every collection
+        /// reached here actually carries — `proxy_route_locks` does not, which
+        /// is why it is handled by
+        /// [`Self::delete_namespace_guard_docs_in_session`] instead.
+        async fn rewrite_namespace_prefixed_ids_in_session(
+            &self,
+            session: &mut ClientSession,
+            collection_name: &str,
+            current_name: &str,
+            new_name: &str,
+        ) -> mongodb::error::Result<()> {
+            let collection = self.collection(collection_name);
+            let mut moved: Vec<(String, Document)> = Vec::new();
+            {
+                let mut cursor = collection
+                    .find(doc! { "namespace": current_name })
+                    .session(&mut *session)
+                    .await?;
+                while cursor.advance(&mut *session).await? {
+                    let mut document = cursor.deserialize_current()?;
+                    let old_id = document
+                        .get_str("_id")
+                        .map_err(|_| {
+                            mongodb::error::Error::custom(format!(
+                                "{collection_name} document is missing a string _id and cannot be \
+                                 renamed"
+                            ))
+                        })?
+                        .to_string();
+                    let suffix = old_id
+                        .strip_prefix(&format!("{current_name}:"))
+                        .unwrap_or(old_id.as_str());
+                    document.insert("_id", format!("{new_name}:{suffix}"));
+                    document.insert("namespace", new_name);
+                    moved.push((old_id, document));
+                }
+            }
+            for (old_id, document) in moved {
+                collection
+                    .delete_one(doc! { "_id": old_id })
+                    .session(&mut *session)
+                    .await?;
+                collection
+                    .insert_one(document)
+                    .session(&mut *session)
+                    .await?;
+            }
+            Ok(())
+        }
+
+        /// Move a document whose `_id` IS a namespace-derived key.
+        async fn move_namespace_keyed_document_in_session(
+            &self,
+            session: &mut ClientSession,
+            collection_name: &str,
+            current_id: &str,
+            new_id: &str,
+            new_namespace: &str,
+        ) -> mongodb::error::Result<()> {
+            let collection = self.collection(collection_name);
+            let Some(mut document) = collection
+                .find_one(doc! { "_id": current_id })
+                .session(&mut *session)
+                .await?
+            else {
+                return Ok(());
+            };
+            document.insert("_id", new_id);
+            if document.get_str("namespace").is_ok() {
+                document.insert("namespace", new_namespace);
+            }
+            collection
+                .delete_one(doc! { "_id": current_id })
+                .session(&mut *session)
+                .await?;
+            collection
+                .insert_one(document)
+                .session(&mut *session)
+                .await?;
+            Ok(())
+        }
+    }
+
+    /// An application-level reason to abort a namespace registry transaction.
+    ///
+    /// MongoDB's convenient-transaction runner only aborts when the callback
+    /// returns an error, so these travel as a `mongodb::error::Error::custom`
+    /// payload and are unwrapped back into typed errors once the transaction has
+    /// aborted (see [`MongoStore::namespace_registry_transaction_error`]).
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    enum NamespaceRegistryAbort {
+        NotFound(String),
+        NameInUse(String),
+        NotEmpty(String),
+        Protected {
+            name: String,
+            reason: &'static str,
+        },
+        AdmissionLeaseLost,
+        InjectedFault(NamespaceRegistryPhase),
+    }
+
+    /// Everything one namespace registry transaction needs, precomputed outside
+    /// the session so the retryable callback never re-derives it and every
+    /// attempt sees the same inputs.
+    struct MongoNamespaceRegistryPlan {
+        current_name: String,
+        /// Equal to `current_name` for create and delete.
+        new_name: String,
+        /// `None` = leave the stored description unchanged; `Some(None)` =
+        /// clear it. Unused by create and delete.
+        description: Option<Option<String>>,
+        cascade: bool,
+        /// `(admission key, owner, generation)` for every lease the caller
+        /// holds; all of them are re-verified before commit.
+        leases: Vec<(String, String, i64)>,
+        fault: Option<NamespaceRegistryPhase>,
+        /// The namespace this process serves, protected from delete and
+        /// rename-away.
+        protected_default: String,
+        /// The row `create_namespace` inserts. `None` for update and delete.
+        registry_doc: Option<Document>,
     }
 
     /// Everything one atomic batch transaction needs, precomputed outside the
@@ -10803,119 +11753,14 @@ mod inner {
                         session
                             .start_transaction()
                             .and_run(
-                                (self, namespace.to_string(), ns_filter.clone()),
-                                |s, (this, namespace, ns_filter)| {
+                                (self, namespace.to_string()),
+                                |s, (this, namespace)| {
                                     Box::pin(async move {
-                                        let proxy_ids = this
-                                            .load_collection_ids_filtered_in_session(
-                                                &mut *s,
-                                                "proxies",
-                                                ns_filter.clone(),
-                                            )
-                                            .await
-                                            .map_err(|e| {
-                                                mongodb::error::Error::custom(e.to_string())
-                                            })?;
-                                        // Consumers project the plain `id` field —
-                                        // their `_id` is the composite
-                                        // "{namespace}:{id}" and change-log records
-                                        // carry plain resource ids.
-                                        let consumer_ids = this
-                                            .load_consumer_plain_ids_filtered_in_session(
-                                                &mut *s,
-                                                ns_filter.clone(),
-                                            )
-                                            .await
-                                            .map_err(|e| {
-                                                mongodb::error::Error::custom(e.to_string())
-                                            })?;
-                                        let plugin_config_ids = this
-                                            .load_collection_ids_filtered_in_session(
-                                                &mut *s,
-                                                "plugin_configs",
-                                                ns_filter.clone(),
-                                            )
-                                            .await
-                                            .map_err(|e| {
-                                                mongodb::error::Error::custom(e.to_string())
-                                            })?;
-                                        let upstream_ids = this
-                                            .load_collection_ids_filtered_in_session(
-                                                &mut *s,
-                                                "upstreams",
-                                                ns_filter.clone(),
-                                            )
-                                            .await
-                                            .map_err(|e| {
-                                                mongodb::error::Error::custom(e.to_string())
-                                            })?;
-                                        this.plugin_configs()
-                                            .delete_many(ns_filter.clone())
-                                            .session(&mut *s)
-                                            .await?;
-                                        this.proxies()
-                                            .delete_many(ns_filter.clone())
-                                            .session(&mut *s)
-                                            .await?;
-                                        this.consumers()
-                                            .delete_many(ns_filter.clone())
-                                            .session(&mut *s)
-                                            .await?;
-                                        // Namespace wipe releases every consumer
-                                        // identity reservation in the namespace.
-                                        this.consumer_identity_index()
-                                            .delete_many(ns_filter.clone())
-                                            .session(&mut *s)
-                                            .await?;
-                                        this.upstreams()
-                                            .delete_many(ns_filter.clone())
-                                            .session(&mut *s)
-                                            .await?;
-                                        this.api_specs()
-                                            .delete_many(ns_filter.clone())
-                                            .session(&mut *s)
-                                            .await?;
-                                        for id in &proxy_ids {
-                                            this.record_config_change_in_session(
-                                                &mut *s,
-                                                namespace.as_str(),
-                                                "proxy",
-                                                id.as_str(),
-                                                "delete",
-                                            )
-                                            .await?;
-                                        }
-                                        for id in &consumer_ids {
-                                            this.record_config_change_in_session(
-                                                &mut *s,
-                                                namespace.as_str(),
-                                                "consumer",
-                                                id.as_str(),
-                                                "delete",
-                                            )
-                                            .await?;
-                                        }
-                                        for id in &plugin_config_ids {
-                                            this.record_config_change_in_session(
-                                                &mut *s,
-                                                namespace.as_str(),
-                                                "plugin_config",
-                                                id.as_str(),
-                                                "delete",
-                                            )
-                                            .await?;
-                                        }
-                                        for id in &upstream_ids {
-                                            this.record_config_change_in_session(
-                                                &mut *s,
-                                                namespace.as_str(),
-                                                "upstream",
-                                                id.as_str(),
-                                                "delete",
-                                            )
-                                            .await?;
-                                        }
-                                        Ok(())
+                                        this.delete_all_namespace_resources_in_session(
+                                            &mut *s,
+                                            namespace.as_str(),
+                                        )
+                                        .await
                                     })
                                 },
                             )
@@ -11335,19 +12180,50 @@ mod inner {
                 .is_some())
         }
 
+        fn effective_default_namespace(&self) -> &str {
+            &self.effective_default_namespace
+        }
+
+        fn set_effective_default_namespace(&mut self, namespace: &str) {
+            let namespace = namespace.trim();
+            self.effective_default_namespace = if namespace.is_empty() {
+                crate::config::types::DEFAULT_NAMESPACE.to_string()
+            } else {
+                namespace.to_string()
+            };
+        }
+
         async fn create_namespace(
             &self,
             record: &crate::config::namespace_registry::NamespaceRecord,
+            leases: &[crate::config::db_backend::NamespaceAdmissionLeaseHold<'_>],
         ) -> Result<(), anyhow::Error> {
-            if self.namespace_name_in_use(&record.name).await? {
+            // Re-checked here, not only at the admin preflight: a reconnect
+            // between the two must not open a partial-commit window.
+            if !self.replica_set_configured() {
                 return Err(anyhow::Error::new(
-                    crate::config::namespace_registry::NamespaceRegistryError::NameInUse {
-                        name: record.name.clone(),
-                    },
+                    Self::namespace_registry_standalone_refusal(),
                 ));
             }
-            let doc = Self::namespace_registry_doc(record);
-            self.namespaces().insert_one(doc).await?;
+            let plan = MongoNamespaceRegistryPlan {
+                current_name: record.name.clone(),
+                new_name: record.name.clone(),
+                description: None,
+                cascade: false,
+                leases: Self::owned_namespace_registry_leases(leases)?,
+                fault: namespace_registry_fault(&record.name),
+                protected_default: self.effective_default_namespace.clone(),
+                registry_doc: Some(Self::namespace_registry_doc(record)),
+            };
+            let connection = self.connection();
+            let mut session = connection.client.start_session().await?;
+            session
+                .start_transaction()
+                .and_run((self, plan), |s, (this, plan)| {
+                    Box::pin(async move { this.create_namespace_in_session(&mut *s, plan).await })
+                })
+                .await
+                .map_err(Self::namespace_registry_transaction_error)?;
             Ok(())
         }
 
@@ -11356,86 +12232,103 @@ mod inner {
             current_name: &str,
             new_name: &str,
             description: Option<Option<String>>,
+            leases: &[crate::config::db_backend::NamespaceAdmissionLeaseHold<'_>],
         ) -> Result<crate::config::namespace_registry::NamespaceRecord, anyhow::Error> {
-            let existing = self.get_namespace(current_name).await?;
-            let in_use = self.namespace_name_in_use(current_name).await?;
-            if existing.is_none() && !in_use {
+            if !self.replica_set_configured() {
                 return Err(anyhow::Error::new(
-                    crate::config::namespace_registry::NamespaceRegistryError::NotFound {
-                        name: current_name.to_string(),
-                    },
+                    Self::namespace_registry_standalone_refusal(),
                 ));
             }
-            if new_name != current_name && self.namespace_name_in_use(new_name).await? {
-                return Err(anyhow::Error::new(
-                    crate::config::namespace_registry::NamespaceRegistryError::NameInUse {
-                        name: new_name.to_string(),
-                    },
-                ));
-            }
-            let now = Utc::now();
-            let mut record = existing.unwrap_or_else(|| {
-                crate::config::namespace_registry::NamespaceRecord::new(
-                    current_name.to_string(),
-                    None,
-                    now,
-                )
-            });
-            if let Some(description) = description {
-                record.description = description;
-            }
-            record.updated_at = now;
-            record.name = new_name.to_string();
-
-            if new_name == current_name {
-                // An explicit `null` keeps Mongo and SQL in step: both clear
-                // the stored description rather than leaving the prior value.
-                let description_bson = match &record.description {
-                    Some(value) => Bson::String(value.clone()),
-                    None => Bson::Null,
-                };
-                self.namespaces()
-                    .update_one(
-                        doc! { "_id": current_name },
-                        doc! {
-                            "$set": {
-                                "name": current_name,
-                                "description": description_bson,
-                                "created_at": record.created_at.to_rfc3339(),
-                                "updated_at": record.updated_at.to_rfc3339(),
-                            }
-                        },
-                    )
-                    .upsert(true)
-                    .await?;
-                return Ok(record);
-            }
-
-            self.rename_namespace_documents(current_name, new_name, &record)
+            let renaming = new_name != current_name;
+            let plan = MongoNamespaceRegistryPlan {
+                current_name: current_name.to_string(),
+                new_name: new_name.to_string(),
+                description,
+                cascade: false,
+                leases: Self::owned_namespace_registry_leases(leases)?,
+                fault: namespace_registry_fault(current_name),
+                protected_default: self.effective_default_namespace.clone(),
+                registry_doc: None,
+            };
+            // Every namespace-wide mutation takes the namespace's durable mTLS
+            // DNS admission mutex for its whole duration; it also fails closed
+            // while a guarded restore replay owns the namespace.
+            let mut mtls_lease = self.acquire_mtls_dns_admission_lease(current_name).await?;
+            let record = mtls_lease
+                .run_mutation(async {
+                    let connection = self.connection();
+                    let mut session = connection.client.start_session().await?;
+                    let record = session
+                        .start_transaction()
+                        .and_run((self, plan), |s, (this, plan)| {
+                            Box::pin(async move {
+                                this.update_namespace_in_session(&mut *s, plan).await
+                            })
+                        })
+                        .await
+                        .map_err(Self::namespace_registry_transaction_error)?;
+                    Ok(record)
+                })
                 .await?;
+            mtls_lease.release().await?;
+            if renaming {
+                self.compact_config_changes_best_effort(current_name).await;
+                self.compact_config_changes_best_effort(new_name).await;
+            }
             Ok(record)
         }
 
-        async fn delete_namespace(&self, name: &str, cascade: bool) -> Result<bool, anyhow::Error> {
-            if !self.namespace_name_in_use(name).await? {
-                return Ok(false);
+        async fn delete_namespace(
+            &self,
+            name: &str,
+            cascade: bool,
+            leases: &[crate::config::db_backend::NamespaceAdmissionLeaseHold<'_>],
+        ) -> Result<bool, anyhow::Error> {
+            if !self.replica_set_configured() {
+                return Err(anyhow::Error::new(
+                    Self::namespace_registry_standalone_refusal(),
+                ));
             }
-            if self.namespace_has_resources(name).await? {
-                if !cascade {
-                    return Err(anyhow::Error::new(
-                        crate::config::namespace_registry::NamespaceRegistryError::NotEmpty {
-                            name: name.to_string(),
-                        },
-                    ));
-                }
-                self.delete_all_resources(name, &BatchConfigWriteMode::Admission)
-                    .await?;
-                if let Some(bundle) = self.get_namespace_gateway_trust_bundle(name).await? {
-                    let _ = self.delete_gateway_trust_bundle(name, &bundle.id).await?;
-                }
+            if name == self.effective_default_namespace {
+                return Err(RegistryError::protected(
+                    name,
+                    RegistryError::PROTECTED_PROCESS_DEFAULT,
+                ));
             }
-            let result = self.namespaces().delete_one(doc! { "_id": name }).await?;
-            Ok(result.deleted_count > 0 || cascade)
+            let plan = MongoNamespaceRegistryPlan {
+                current_name: name.to_string(),
+                new_name: name.to_string(),
+                description: None,
+                cascade,
+                leases: Self::owned_namespace_registry_leases(leases)?,
+                fault: namespace_registry_fault(name),
+                protected_default: self.effective_default_namespace.clone(),
+                registry_doc: None,
+            };
+            // The durable namespace mutex every namespace-wide mutation takes;
+            // it also fails closed while a guarded restore replay owns it.
+            let mut mtls_lease = self.acquire_mtls_dns_admission_lease(name).await?;
+            let deleted = mtls_lease
+                .run_mutation(async {
+                    let connection = self.connection();
+                    let mut session = connection.client.start_session().await?;
+                    let deleted = session
+                        .start_transaction()
+                        .and_run((self, plan), |s, (this, plan)| {
+                            Box::pin(async move {
+                                this.delete_namespace_in_session(&mut *s, plan).await
+                            })
+                        })
+                        .await
+                        .map_err(Self::namespace_registry_transaction_error)?;
+                    Ok(deleted)
+                })
+                .await?;
+            mtls_lease.release().await?;
+            if deleted {
+                self.compact_config_changes_best_effort(name).await;
+            }
+            Ok(deleted)
         }
 
         // -------------------------------------------------------------------
@@ -13960,10 +14853,12 @@ mod inner {
                     names.insert(ns);
                 }
             }
-            // `ferrum` per issue #3955, plus the configured process default so
-            // the namespace DELETE refuses to remove always exists.
+            // The canonical `ferrum` row per issue #3955. Nothing else is
+            // seeded: the backfill must not read the process environment, and a
+            // deployment-specific `FERRUM_NAMESPACE` that has no resources yet
+            // is created through `POST /namespaces` (or implicitly by its first
+            // resource write) like any other tenant.
             names.insert(crate::config::types::DEFAULT_NAMESPACE.to_string());
-            names.insert(crate::config::namespace_registry::process_default_namespace());
             for name in names {
                 let _ = self
                     .namespaces()
@@ -13987,7 +14882,7 @@ mod inner {
             &self,
             fallback_name: &str,
             doc: Document,
-        ) -> crate::config::namespace_registry::NamespaceRecord {
+        ) -> NamespaceRecord {
             let name = doc
                 .get_str("name")
                 .ok()
@@ -14007,7 +14902,7 @@ mod inner {
             };
             let created_at = parse_ts("created_at").unwrap_or_else(Utc::now);
             let updated_at = parse_ts("updated_at").unwrap_or(created_at);
-            crate::config::namespace_registry::NamespaceRecord {
+            NamespaceRecord {
                 name,
                 description,
                 created_at,
@@ -14015,148 +14910,24 @@ mod inner {
             }
         }
 
-        async fn rename_namespace_documents(
-            &self,
-            current_name: &str,
-            new_name: &str,
-            record: &crate::config::namespace_registry::NamespaceRecord,
-        ) -> Result<(), anyhow::Error> {
-            self.namespaces()
-                .insert_one(Self::namespace_registry_doc(record))
-                .await?;
-
-            for collection in [
-                "proxies",
-                "plugin_configs",
-                "upstreams",
-                "api_specs",
-                "audit_events",
-                "config_changes",
-            ] {
-                self.collection(collection)
-                    .update_many(
-                        doc! { "namespace": current_name },
-                        doc! { "$set": { "namespace": new_name } },
-                    )
-                    .await?;
-            }
-
-            self.rewrite_namespace_prefixed_ids("consumers", current_name, new_name)
-                .await?;
-            self.rewrite_namespace_prefixed_ids("consumer_identity_index", current_name, new_name)
-                .await?;
-            self.rewrite_namespace_prefixed_ids("proxy_route_locks", current_name, new_name)
-                .await?;
-            self.rewrite_namespace_document_id(
-                "gateway_trust_bundles",
-                current_name,
-                new_name,
-                new_name,
-            )
-            .await?;
-            self.rewrite_namespace_document_id(
-                "config_change_retention",
-                &Self::config_change_retention_doc_id(current_name),
-                &Self::config_change_retention_doc_id(new_name),
-                new_name,
-            )
-            .await?;
-
-            self.record_namespace_rename_config_changes(current_name, new_name)
-                .await?;
-
-            let _ = self
-                .namespaces()
-                .delete_one(doc! { "_id": current_name })
-                .await?;
-            Ok(())
-        }
-
-        async fn record_namespace_rename_config_changes(
-            &self,
-            current_name: &str,
-            new_name: &str,
-        ) -> Result<(), anyhow::Error> {
-            for (resource_type, collection) in [
-                ("proxy", "proxies"),
-                ("consumer", "consumers"),
-                ("plugin_config", "plugin_configs"),
-                ("upstream", "upstreams"),
-            ] {
-                let mut cursor = self
-                    .collection(collection)
-                    .find(doc! { "namespace": new_name })
-                    .await?;
-                while cursor.advance().await? {
-                    let doc = cursor.deserialize_current()?;
-                    let id = doc
-                        .get_str("id")
-                        .ok()
-                        .map(str::to_string)
-                        .or_else(|| doc.get_str("_id").ok().map(str::to_string))
-                        .unwrap_or_default();
-                    if id.is_empty() {
-                        continue;
-                    }
-                    self.record_config_change(current_name, resource_type, &id, "delete")
-                        .await?;
-                    self.record_config_change(new_name, resource_type, &id, "upsert")
-                        .await?;
-                }
-            }
-            Ok(())
-        }
-
-        async fn rewrite_namespace_prefixed_ids(
-            &self,
-            collection_name: &str,
-            current_name: &str,
-            new_name: &str,
-        ) -> Result<(), anyhow::Error> {
-            let collection = self.collection(collection_name);
-            let mut cursor = collection.find(doc! { "namespace": current_name }).await?;
-            while cursor.advance().await? {
-                let mut doc = cursor.deserialize_current()?;
-                let old_id = doc
-                    .get_str("_id")
-                    .ok()
-                    .map(str::to_string)
-                    .unwrap_or_default();
-                let suffix = old_id
-                    .strip_prefix(&format!("{current_name}:"))
-                    .unwrap_or(old_id.as_str());
-                let new_id = format!("{new_name}:{suffix}");
-                doc.insert("_id", new_id);
-                doc.insert("namespace", new_name);
-                collection.insert_one(doc).await?;
-                if !old_id.is_empty() {
-                    collection.delete_one(doc! { "_id": old_id }).await?;
-                }
-            }
-            Ok(())
-        }
-
-        async fn rewrite_namespace_document_id(
-            &self,
-            collection_name: &str,
-            current_id: &str,
-            new_id: &str,
-            new_namespace: &str,
-        ) -> Result<(), anyhow::Error> {
-            let collection = self.collection(collection_name);
-            let Some(mut doc) = collection.find_one(doc! { "_id": current_id }).await? else {
-                return Ok(());
-            };
-            doc.insert("_id", new_id);
-            if doc.get_str("namespace").is_ok() {
-                doc.insert("namespace", new_namespace);
-            }
-            if doc.get_str("name").ok() == Some(current_id) {
-                doc.insert("name", new_namespace);
-            }
-            collection.insert_one(doc).await?;
-            collection.delete_one(doc! { "_id": current_id }).await?;
-            Ok(())
+        /// Copy the caller's borrowed lease identities into an owned form the
+        /// retryable transaction callback can hold across attempts.
+        fn owned_namespace_registry_leases(
+            leases: &[crate::config::db_backend::NamespaceAdmissionLeaseHold<'_>],
+        ) -> Result<Vec<(String, String, i64)>, anyhow::Error> {
+            leases
+                .iter()
+                .map(|hold| {
+                    let generation = i64::try_from(hold.lease.generation).map_err(|_| {
+                        anyhow::anyhow!("namespace config admission generation is out of range")
+                    })?;
+                    Ok((
+                        hold.key.to_string(),
+                        hold.lease.owner.to_string(),
+                        generation,
+                    ))
+                })
+                .collect()
         }
 
         /// Returns `true` when a MongoDB replica set was configured at `connect()` time.

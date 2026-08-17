@@ -2035,6 +2035,33 @@ pub mod _test_support {
         Lost(T),
     }
 
+    /// Acquire the namespace REGISTRY admission leases — the global registry
+    /// key plus one per affected name, in the same total order the admin
+    /// handlers use — so external tests can drive backend registry mutations
+    /// with real, verifiable lease identities (issue #3955).
+    pub async fn lock_namespace_registry_admission_for_test(
+        db: std::sync::Arc<dyn crate::config::db_backend::DatabaseBackend>,
+        names: &[&str],
+    ) -> Result<TestNamespaceRegistryAdmission, String> {
+        crate::admin::crud::lock_namespace_registry_admission(db, names)
+            .await
+            .map(TestNamespaceRegistryAdmission)
+            .map_err(|_error| "namespace registry admission unavailable".to_string())
+    }
+
+    /// Opaque handle around the production registry admission guards.
+    pub struct TestNamespaceRegistryAdmission(crate::admin::crud::NamespaceRegistryAdmission);
+
+    impl TestNamespaceRegistryAdmission {
+        /// The exact lease identities a backend re-verifies at its commit
+        /// boundary.
+        pub fn holds(
+            &self,
+        ) -> Vec<crate::config::db_backend::NamespaceAdmissionLeaseHold<'_>> {
+            self.0.holds()
+        }
+    }
+
     pub fn validate_plugin_configs_fatal_for_test(
         config: &mut crate::config::types::GatewayConfig,
         backend_allow_ips: &crate::config::BackendEgressPolicy,

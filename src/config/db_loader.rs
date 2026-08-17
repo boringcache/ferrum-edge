@@ -25,6 +25,10 @@
 
 use crate::config::db_backend::GatewayTrustBundleRevisionConflict;
 use crate::config::gateway_trust::GatewayTrustBundleRecord;
+use crate::config::namespace_registry::{
+    NamespaceRegistryError as RegistryError, NamespaceRegistryPhase as RegistryPhase,
+    check_namespace_registry_fault, namespace_registry_fault,
+};
 use crate::config::types::{
     AuthMode, BackendScheme, CircuitBreakerConfig, Consumer, DispatchKind, GatewayConfig,
     HealthCheckConfig, LoadBalancerAlgorithm, PluginAssociation, PluginConfig, PluginScope, Proxy,
@@ -710,6 +714,13 @@ pub struct DatabaseStore {
     /// Shared via `Arc<AtomicBool>` so all clones of the store observe the
     /// same cleared-state after recovery.
     migrations_pending: Arc<std::sync::atomic::AtomicBool>,
+    /// The namespace this process serves, applied once at startup from the
+    /// already-resolved `EnvConfig` (issue #3955). Namespace DELETE and
+    /// rename-away consult THIS value rather than re-reading
+    /// `std::env::var("FERRUM_NAMESPACE")` at request time, which would bypass
+    /// the CLI > env > conf-file > default precedence and could protect the
+    /// wrong namespace.
+    effective_default_namespace: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1830,6 +1841,7 @@ impl DatabaseStore {
             audit_retention: crate::admin::audit::AuditRetentionPolicy::default(),
             audit_max_rows_prune_gates: Arc::new(DashMap::new()),
             migrations_pending: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            effective_default_namespace: crate::config::types::DEFAULT_NAMESPACE.to_string(),
         };
 
         store.run_migrations().await?;
@@ -1890,6 +1902,7 @@ impl DatabaseStore {
             audit_retention: crate::admin::audit::AuditRetentionPolicy::default(),
             audit_max_rows_prune_gates: Arc::new(DashMap::new()),
             migrations_pending: Arc::new(std::sync::atomic::AtomicBool::new(true)),
+            effective_default_namespace: crate::config::types::DEFAULT_NAMESPACE.to_string(),
         })
     }
 
@@ -7093,28 +7106,50 @@ impl DatabaseStore {
         // PostgreSQL requires SET TRANSACTION before any other statement in the
         // transaction (including the mTLS DNS admission lock queries below).
         self.use_delete_capture_snapshot_tx(&mut tx).await?;
-        self.lock_mtls_dns_admission_for_owner_tx(&mut tx, namespace, mode.guard_owner())
+        self.delete_all_resources_in_tx(&mut tx, namespace, mode)
+            .await?;
+        tx.commit().await?;
+        self.check_slow_query("delete_all_resources", start);
+        Ok(())
+    }
+
+    /// The body of [`Self::delete_all_resources`], written into a transaction
+    /// the caller owns.
+    ///
+    /// Namespace DELETE composes this with the trust bundle, guard rows, and
+    /// registry row so the whole tenant removal is one commit — the repository
+    /// rule that multi-step SQL CRUD lives in a single `sqlx::Transaction`. The
+    /// caller must already have applied
+    /// [`Self::use_delete_capture_snapshot_tx`] as the transaction's first
+    /// statement.
+    async fn delete_all_resources_in_tx(
+        &self,
+        tx: &mut sqlx::Transaction<'_, sqlx::Any>,
+        namespace: &str,
+        mode: &BatchConfigWriteMode,
+    ) -> Result<(), anyhow::Error> {
+        self.lock_mtls_dns_admission_for_owner_tx(tx, namespace, mode.guard_owner())
             .await?;
         let proxy_ids = self
-            .select_resource_ids_tx(&mut tx, "proxies", namespace, None, true)
+            .select_resource_ids_tx(tx, "proxies", namespace, None, true)
             .await?;
         let plugin_config_ids = self
-            .select_resource_ids_tx(&mut tx, "plugin_configs", namespace, None, true)
+            .select_resource_ids_tx(tx, "plugin_configs", namespace, None, true)
             .await?;
         let consumer_ids = self
-            .select_resource_ids_tx(&mut tx, "consumers", namespace, None, true)
+            .select_resource_ids_tx(tx, "consumers", namespace, None, true)
             .await?;
         let upstream_ids = self
-            .select_resource_ids_tx(&mut tx, "upstreams", namespace, None, true)
+            .select_resource_ids_tx(tx, "upstreams", namespace, None, true)
             .await?;
 
         sqlx::query(&self.q("DELETE FROM proxy_plugins WHERE proxy_id IN (SELECT id FROM proxies WHERE namespace = ?)"))
             .bind(namespace)
-            .execute(&mut *tx)
+            .execute(&mut **tx)
             .await?;
         sqlx::query(&self.q("DELETE FROM plugin_configs WHERE namespace = ?"))
             .bind(namespace)
-            .execute(&mut *tx)
+            .execute(&mut **tx)
             .await?;
         // Delete api_specs BEFORE proxies: the FK cascade (proxy_id → proxies ON
         // DELETE CASCADE) would handle it, but explicit deletion is clearer and
@@ -7122,52 +7157,48 @@ impl DatabaseStore {
         // disabled (e.g. SQLite PRAGMA foreign_keys=OFF in recovery scenarios).
         sqlx::query(&self.q("DELETE FROM api_specs WHERE namespace = ?"))
             .bind(namespace)
-            .execute(&mut *tx)
+            .execute(&mut **tx)
             .await?;
         sqlx::query(&self.q("DELETE FROM proxies WHERE namespace = ?"))
             .bind(namespace)
-            .execute(&mut *tx)
+            .execute(&mut **tx)
             .await?;
         sqlx::query(&self.q("DELETE FROM consumer_credential_index WHERE namespace = ?"))
             .bind(namespace)
-            .execute(&mut *tx)
+            .execute(&mut **tx)
             .await?;
         sqlx::query(&self.q("DELETE FROM consumer_identity_index WHERE namespace = ?"))
             .bind(namespace)
-            .execute(&mut *tx)
+            .execute(&mut **tx)
             .await?;
         sqlx::query(&self.q("DELETE FROM consumers WHERE namespace = ?"))
             .bind(namespace)
-            .execute(&mut *tx)
+            .execute(&mut **tx)
             .await?;
         sqlx::query(&self.q("DELETE FROM upstreams WHERE namespace = ?"))
             .bind(namespace)
-            .execute(&mut *tx)
+            .execute(&mut **tx)
             .await?;
         if mode.validates_mtls_dns() {
-            self.validate_mtls_dns_admission_tx(&mut tx, namespace)
-                .await?;
+            self.validate_mtls_dns_admission_tx(tx, namespace).await?;
         }
         for id in proxy_ids {
-            self.record_config_change_tx(&mut tx, namespace, "proxy", &id, "delete")
+            self.record_config_change_tx(tx, namespace, "proxy", &id, "delete")
                 .await?;
         }
         for id in plugin_config_ids {
-            self.record_config_change_tx(&mut tx, namespace, "plugin_config", &id, "delete")
+            self.record_config_change_tx(tx, namespace, "plugin_config", &id, "delete")
                 .await?;
         }
         for id in consumer_ids {
-            self.record_config_change_tx(&mut tx, namespace, "consumer", &id, "delete")
+            self.record_config_change_tx(tx, namespace, "consumer", &id, "delete")
                 .await?;
         }
         for id in upstream_ids {
-            self.record_config_change_tx(&mut tx, namespace, "upstream", &id, "delete")
+            self.record_config_change_tx(tx, namespace, "upstream", &id, "delete")
                 .await?;
         }
-        self.compact_config_changes_tx(&mut tx, namespace).await?;
-
-        tx.commit().await?;
-        self.check_slow_query("delete_all_resources", start);
+        self.compact_config_changes_tx(tx, namespace).await?;
         Ok(())
     }
 
@@ -7915,51 +7946,152 @@ impl DatabaseStore {
         })
     }
 
+    /// `SELECT 1` existence probe over the registry plus every occupancy table,
+    /// shared by the pooled read and the in-transaction authority so the two can
+    /// never diverge. Seven identical `name` binds, in column order.
+    const NAMESPACE_NAME_IN_USE_SQL: &str = "SELECT 1 AS present FROM ( \
+         SELECT name FROM namespaces WHERE name = ? \
+         UNION SELECT namespace FROM proxies WHERE namespace = ? \
+         UNION SELECT namespace FROM consumers WHERE namespace = ? \
+         UNION SELECT namespace FROM plugin_configs WHERE namespace = ? \
+         UNION SELECT namespace FROM upstreams WHERE namespace = ? \
+         UNION SELECT namespace FROM gateway_trust_bundles WHERE namespace = ? \
+         UNION SELECT namespace FROM api_specs WHERE namespace = ? \
+         ) AS ferrum_ns_in_use LIMIT 1";
+
+    /// Occupancy that blocks an unconfirmed DELETE: the same tables, minus the
+    /// registry row itself. Six identical `name` binds.
+    const NAMESPACE_HAS_RESOURCES_SQL: &str = "SELECT 1 AS present FROM ( \
+         SELECT namespace FROM proxies WHERE namespace = ? \
+         UNION SELECT namespace FROM consumers WHERE namespace = ? \
+         UNION SELECT namespace FROM plugin_configs WHERE namespace = ? \
+         UNION SELECT namespace FROM upstreams WHERE namespace = ? \
+         UNION SELECT namespace FROM gateway_trust_bundles WHERE namespace = ? \
+         UNION SELECT namespace FROM api_specs WHERE namespace = ? \
+         ) AS ferrum_ns_occupied LIMIT 1";
+
+    /// Does ANY namespace still exist? Exactly the union `GET /namespaces`
+    /// lists, so "the last remaining namespace" means the same thing to the
+    /// invariant and to the client. No binds.
+    const ANY_NAMESPACE_REMAINS_SQL: &str = "SELECT 1 AS present FROM ( \
+         SELECT name FROM namespaces \
+         UNION SELECT namespace FROM proxies \
+         UNION SELECT namespace FROM consumers \
+         UNION SELECT namespace FROM plugin_configs \
+         UNION SELECT namespace FROM upstreams \
+         UNION SELECT namespace FROM gateway_trust_bundles \
+         ) AS ferrum_ns_any LIMIT 1";
+
     pub async fn namespace_name_in_use(&self, name: &str) -> Result<bool, anyhow::Error> {
         let pool = self.pool();
-        let sql = self.q("SELECT 1 AS present FROM ( \
-             SELECT name FROM namespaces WHERE name = ? \
-             UNION SELECT namespace FROM proxies WHERE namespace = ? \
-             UNION SELECT namespace FROM consumers WHERE namespace = ? \
-             UNION SELECT namespace FROM plugin_configs WHERE namespace = ? \
-             UNION SELECT namespace FROM upstreams WHERE namespace = ? \
-             UNION SELECT namespace FROM gateway_trust_bundles WHERE namespace = ? \
-             UNION SELECT namespace FROM api_specs WHERE namespace = ? \
-             ) AS ferrum_ns_in_use LIMIT 1");
-        let row = sqlx::query(&sql)
-            .bind(name)
-            .bind(name)
-            .bind(name)
-            .bind(name)
-            .bind(name)
-            .bind(name)
-            .bind(name)
-            .fetch_optional(&pool)
-            .await?;
-        Ok(row.is_some())
+        let mut query = sqlx::query(&self.q(Self::NAMESPACE_NAME_IN_USE_SQL));
+        for _ in 0..7 {
+            query = query.bind(name);
+        }
+        Ok(query.fetch_optional(&pool).await?.is_some())
+    }
+
+    async fn namespace_name_in_use_tx(
+        &self,
+        tx: &mut sqlx::Transaction<'_, sqlx::Any>,
+        name: &str,
+    ) -> Result<bool, anyhow::Error> {
+        let mut query = sqlx::query(&self.q(Self::NAMESPACE_NAME_IN_USE_SQL));
+        for _ in 0..7 {
+            query = query.bind(name);
+        }
+        Ok(query.fetch_optional(&mut **tx).await?.is_some())
     }
 
     pub async fn namespace_has_resources(&self, name: &str) -> Result<bool, anyhow::Error> {
-        let counts = self.count_namespace_resources(name).await?;
-        if !counts.is_empty() {
-            return Ok(true);
+        let pool = self.pool();
+        let mut query = sqlx::query(&self.q(Self::NAMESPACE_HAS_RESOURCES_SQL));
+        for _ in 0..6 {
+            query = query.bind(name);
         }
-        Ok(self
-            .get_namespace_gateway_trust_bundle(name)
+        Ok(query.fetch_optional(&pool).await?.is_some())
+    }
+
+    async fn namespace_has_resources_tx(
+        &self,
+        tx: &mut sqlx::Transaction<'_, sqlx::Any>,
+        name: &str,
+    ) -> Result<bool, anyhow::Error> {
+        let mut query = sqlx::query(&self.q(Self::NAMESPACE_HAS_RESOURCES_SQL));
+        for _ in 0..6 {
+            query = query.bind(name);
+        }
+        Ok(query.fetch_optional(&mut **tx).await?.is_some())
+    }
+
+    async fn any_namespace_remains_tx(
+        &self,
+        tx: &mut sqlx::Transaction<'_, sqlx::Any>,
+    ) -> Result<bool, anyhow::Error> {
+        Ok(sqlx::query(Self::ANY_NAMESPACE_REMAINS_SQL)
+            .fetch_optional(&mut **tx)
             .await?
             .is_some())
+    }
+
+    async fn get_namespace_tx(
+        &self,
+        tx: &mut sqlx::Transaction<'_, sqlx::Any>,
+        name: &str,
+    ) -> Result<Option<crate::config::namespace_registry::NamespaceRecord>, anyhow::Error> {
+        let row = sqlx::query(&self.q(
+            "SELECT name, description, created_at, updated_at FROM namespaces WHERE name = ?",
+        ))
+        .bind(name)
+        .fetch_optional(&mut **tx)
+        .await?;
+        let Some(row) = row else {
+            return Ok(None);
+        };
+        Ok(Some(self.row_to_namespace_record(&row)?))
+    }
+
+    /// Re-verify EVERY admission lease this registry mutation holds — the
+    /// global registry key and each affected namespace — inside the transaction
+    /// that is about to commit.
+    ///
+    /// Expiry is compared against the database's own clock, and the rows are
+    /// pinned (`FOR UPDATE`, or SQLite's transaction-wide writer lock) until
+    /// commit, so a competing acquirer cannot take a lease between this check
+    /// and the commit. A lost lease aborts the transaction: nothing becomes
+    /// durable and there is nothing to compensate.
+    async fn verify_namespace_registry_leases_tx(
+        &self,
+        tx: &mut sqlx::Transaction<'_, sqlx::Any>,
+        leases: &[crate::config::batch_atomicity::NamespaceAdmissionLeaseHold<'_>],
+        fault: Option<RegistryPhase>,
+    ) -> Result<(), anyhow::Error> {
+        check_namespace_registry_fault(
+            fault,
+            RegistryPhase::LeaseLost,
+        )?;
+        for hold in leases {
+            self.verify_namespace_config_admission_lease_tx(tx, hold.key, &hold.lease)
+                .await?;
+        }
+        Ok(())
     }
 
     pub async fn create_namespace(
         &self,
         record: &crate::config::namespace_registry::NamespaceRecord,
+        leases: &[crate::config::batch_atomicity::NamespaceAdmissionLeaseHold<'_>],
     ) -> Result<(), anyhow::Error> {
-        if self.namespace_name_in_use(&record.name).await? {
-            return Err(anyhow::Error::new(
-                crate::config::namespace_registry::NamespaceRegistryError::NameInUse {
-                    name: record.name.clone(),
-                },
-            ));
+        let fault = namespace_registry_fault(&record.name);
+        let mut tx = self.pool().begin().await?;
+        check_namespace_registry_fault(
+            fault,
+            RegistryPhase::Start,
+        )?;
+        // Vacancy is decided HERE, inside the serialized transaction — an
+        // earlier handler query could only improve the error message.
+        if self.namespace_name_in_use_tx(&mut tx, &record.name).await? {
+            return Err(RegistryError::name_in_use(&record.name));
         }
         sqlx::query(&self.q(
             "INSERT INTO namespaces (name, description, created_at, updated_at) VALUES (?, ?, ?, ?)",
@@ -7968,32 +8100,72 @@ impl DatabaseStore {
         .bind(&record.description)
         .bind(record.created_at.to_rfc3339())
         .bind(record.updated_at.to_rfc3339())
-        .execute(&self.pool())
+        .execute(&mut *tx)
         .await?;
+        check_namespace_registry_fault(
+            fault,
+            RegistryPhase::RegistryRow,
+        )?;
+        self.verify_namespace_registry_leases_tx(&mut tx, leases, fault)
+            .await?;
+        check_namespace_registry_fault(
+            fault,
+            RegistryPhase::Commit,
+        )?;
+        tx.commit().await?;
         Ok(())
     }
 
+    /// Description update and/or rename, committed all-or-nothing.
+    ///
+    /// Existence, target vacancy, and process-default protection are decided
+    /// inside this transaction; the handler's prechecks only shape the message.
+    /// A derived-only namespace (resources but no registry row) is materialized
+    /// here, so "update the description of an implicitly created tenant" has the
+    /// same well-defined atomic outcome as any other update.
     pub async fn update_namespace(
         &self,
         current_name: &str,
         new_name: &str,
         description: Option<Option<String>>,
+        leases: &[crate::config::batch_atomicity::NamespaceAdmissionLeaseHold<'_>],
     ) -> Result<crate::config::namespace_registry::NamespaceRecord, anyhow::Error> {
-        let existing = self.get_namespace(current_name).await?;
-        let in_use = self.namespace_name_in_use(current_name).await?;
-        if existing.is_none() && !in_use {
-            return Err(anyhow::Error::new(
-                crate::config::namespace_registry::NamespaceRegistryError::NotFound {
-                    name: current_name.to_string(),
-                },
-            ));
+        let start = Instant::now();
+        let renaming = new_name != current_name;
+        let fault = namespace_registry_fault(current_name);
+        let mut tx = self.pool().begin().await?;
+        // Postgres needs `SET TRANSACTION` before any other statement; a rename
+        // deletes namespace-keyed rows after pre-scanning them for change-log
+        // tombstones, so it needs the same repeatable-read capture the
+        // namespace-wide delete path uses.
+        self.use_delete_capture_snapshot_tx(&mut tx).await?;
+        check_namespace_registry_fault(
+            fault,
+            RegistryPhase::Start,
+        )?;
+
+        let existing = self.get_namespace_tx(&mut tx, current_name).await?;
+        if existing.is_none() && !self.namespace_name_in_use_tx(&mut tx, current_name).await? {
+            return Err(RegistryError::not_found(current_name));
         }
-        if new_name != current_name && self.namespace_name_in_use(new_name).await? {
-            return Err(anyhow::Error::new(
-                crate::config::namespace_registry::NamespaceRegistryError::NameInUse {
-                    name: new_name.to_string(),
-                },
-            ));
+        if renaming {
+            // A rename is semantically a removal of the old name: the gateway
+            // would be left serving a namespace that no longer exists.
+            if current_name == self.effective_default_namespace {
+                return Err(RegistryError::protected(
+                    current_name,
+                    RegistryError::PROTECTED_PROCESS_DEFAULT,
+                ));
+            }
+            if self.namespace_name_in_use_tx(&mut tx, new_name).await? {
+                return Err(RegistryError::name_in_use(new_name));
+            }
+            // Same fence every namespace-wide mutation takes: it locks the
+            // namespace's mTLS DNS admission row for the rest of this
+            // transaction AND fails closed (retryable 503) when a guarded
+            // restore replay — which spans several transactions — owns it.
+            self.lock_mtls_dns_admission_for_owner_tx(&mut tx, current_name, None)
+                .await?;
         }
 
         let now = Utc::now();
@@ -8011,209 +8183,55 @@ impl DatabaseStore {
         record.updated_at = now;
         record.name = new_name.to_string();
 
-        if new_name == current_name {
-            self.ensure_namespace_registry_row(current_name, &record, &now_rfc)
+        if !renaming {
+            self.upsert_namespace_registry_row_tx(&mut tx, current_name, &record, &now_rfc)
                 .await?;
-            sqlx::query(
-                &self.q("UPDATE namespaces SET description = ?, updated_at = ? WHERE name = ?"),
-            )
-            .bind(&record.description)
-            .bind(&now_rfc)
-            .bind(current_name)
-            .execute(&self.pool())
-            .await?;
+            check_namespace_registry_fault(
+                fault,
+                RegistryPhase::RegistryRow,
+            )?;
+            self.verify_namespace_registry_leases_tx(&mut tx, leases, fault)
+                .await?;
+            check_namespace_registry_fault(
+                fault,
+                RegistryPhase::Commit,
+            )?;
+            tx.commit().await?;
+            self.check_slow_query("update_namespace", start);
             return Ok(record);
         }
 
-        self.rename_namespace_tx(current_name, new_name, &record, &now_rfc)
+        self.rename_namespace_in_tx(&mut tx, current_name, new_name, &record, &now_rfc, fault)
             .await?;
+        self.verify_namespace_registry_leases_tx(&mut tx, leases, fault)
+            .await?;
+        check_namespace_registry_fault(
+            fault,
+            RegistryPhase::Commit,
+        )?;
+        tx.commit().await?;
+        self.check_slow_query("update_namespace", start);
         Ok(record)
     }
 
-    async fn ensure_namespace_registry_row(
-        &self,
-        name: &str,
-        record: &crate::config::namespace_registry::NamespaceRecord,
-        now_rfc: &str,
-    ) -> Result<(), anyhow::Error> {
-        if self.get_namespace(name).await?.is_some() {
-            return Ok(());
-        }
-        let insert = if self.db_type == "mysql" {
-            "INSERT IGNORE INTO namespaces (name, description, created_at, updated_at) \
-             VALUES (?, ?, ?, ?)"
-        } else {
-            "INSERT INTO namespaces (name, description, created_at, updated_at) \
-             VALUES (?, ?, ?, ?) ON CONFLICT (name) DO NOTHING"
-        };
-        sqlx::query(&self.q(insert))
-            .bind(name)
-            .bind(&record.description)
-            .bind(record.created_at.to_rfc3339())
-            .bind(now_rfc)
-            .execute(&self.pool())
-            .await?;
-        Ok(())
-    }
-
-    async fn rename_namespace_tx(
-        &self,
-        current_name: &str,
-        new_name: &str,
-        record: &crate::config::namespace_registry::NamespaceRecord,
-        now_rfc: &str,
-    ) -> Result<(), anyhow::Error> {
-        let mut tx = self.pool().begin().await?;
-        self.ensure_namespace_registry_row_tx(&mut tx, current_name, record, now_rfc)
-            .await?;
-
-        sqlx::query(&self.q(
-            "INSERT INTO namespaces (name, description, created_at, updated_at) \
-             VALUES (?, ?, ?, ?)",
-        ))
-        .bind(new_name)
-        .bind(&record.description)
-        .bind(record.created_at.to_rfc3339())
-        .bind(now_rfc)
-        .execute(&mut *tx)
-        .await?;
-
-        self.copy_namespace_pk_rows_tx(
-            &mut tx,
-            "consumers",
-            "id, namespace, username, custom_id, credentials, acl_groups, created_at, updated_at",
-            "id, ?, username, custom_id, credentials, acl_groups, created_at, updated_at",
-            current_name,
-            new_name,
-            false,
-        )
-        .await?;
-        sqlx::query(
-            &self.q("UPDATE consumer_credential_index SET namespace = ? WHERE namespace = ?"),
-        )
-        .bind(new_name)
-        .bind(current_name)
-        .execute(&mut *tx)
-        .await?;
-        sqlx::query(
-            &self.q("UPDATE consumer_identity_index SET namespace = ? WHERE namespace = ?"),
-        )
-        .bind(new_name)
-        .bind(current_name)
-        .execute(&mut *tx)
-        .await?;
-        sqlx::query(&self.q("DELETE FROM consumers WHERE namespace = ?"))
-            .bind(current_name)
-            .execute(&mut *tx)
-            .await?;
-
-        self.copy_namespace_pk_rows_tx(
-            &mut tx,
-            "gateway_trust_bundles",
-            "namespace, id, trust_domain, bundle, revision, updated_by, created_at, updated_at",
-            "?, id, trust_domain, bundle, revision, updated_by, created_at, updated_at",
-            current_name,
-            new_name,
-            false,
-        )
-        .await?;
-        sqlx::query(&self.q("DELETE FROM gateway_trust_bundles WHERE namespace = ?"))
-            .bind(current_name)
-            .execute(&mut *tx)
-            .await?;
-
-        self.copy_namespace_pk_rows_tx(
-            &mut tx,
-            "proxy_route_locks",
-            "namespace, route_key_hash, created_at",
-            "?, route_key_hash, created_at",
-            current_name,
-            new_name,
-            true,
-        )
-        .await?;
-        sqlx::query(&self.q("DELETE FROM proxy_route_locks WHERE namespace = ?"))
-            .bind(current_name)
-            .execute(&mut *tx)
-            .await?;
-
-        self.copy_namespace_pk_rows_tx(
-            &mut tx,
-            "mtls_dns_admission_locks",
-            "namespace, updated_at, restore_owner",
-            "?, updated_at, restore_owner",
-            current_name,
-            new_name,
-            true,
-        )
-        .await?;
-        sqlx::query(&self.q("DELETE FROM mtls_dns_admission_locks WHERE namespace = ?"))
-            .bind(current_name)
-            .execute(&mut *tx)
-            .await?;
-
-        self.copy_namespace_pk_rows_tx(
-            &mut tx,
-            "config_change_retention",
-            "namespace, retained_sequence, updated_at",
-            "?, retained_sequence, updated_at",
-            current_name,
-            new_name,
-            true,
-        )
-        .await?;
-        sqlx::query(&self.q("DELETE FROM config_change_retention WHERE namespace = ?"))
-            .bind(current_name)
-            .execute(&mut *tx)
-            .await?;
-
-        for table in crate::config::namespace_registry::NAMESPACE_RENAME_SIMPLE_TABLES {
-            let sql = format!("UPDATE {table} SET namespace = ? WHERE namespace = ?");
-            sqlx::query(&self.q(&sql))
-                .bind(new_name)
-                .bind(current_name)
-                .execute(&mut *tx)
-                .await?;
-        }
-
-        for (resource_type, table) in [
-            ("proxy", "proxies"),
-            ("consumer", "consumers"),
-            ("plugin_config", "plugin_configs"),
-            ("upstream", "upstreams"),
-        ] {
-            let ids = self
-                .select_resource_ids_tx(&mut tx, table, new_name, None, false)
-                .await?;
-            for id in ids {
-                self.record_config_change_tx(&mut tx, current_name, resource_type, &id, "delete")
-                    .await?;
-                self.record_config_change_tx(&mut tx, new_name, resource_type, &id, "upsert")
-                    .await?;
-            }
-        }
-
-        sqlx::query(&self.q("DELETE FROM namespaces WHERE name = ?"))
-            .bind(current_name)
-            .execute(&mut *tx)
-            .await?;
-        tx.commit().await?;
-        Ok(())
-    }
-
-    async fn ensure_namespace_registry_row_tx(
+    /// Insert-or-update the registry row for `name` inside `tx`, materializing
+    /// a derived-only namespace on the way.
+    async fn upsert_namespace_registry_row_tx(
         &self,
         tx: &mut sqlx::Transaction<'_, sqlx::Any>,
         name: &str,
         record: &crate::config::namespace_registry::NamespaceRecord,
         now_rfc: &str,
     ) -> Result<(), anyhow::Error> {
-        let exists = sqlx::query(&self.q("SELECT 1 AS present FROM namespaces WHERE name = ?"))
-            .bind(name)
-            .fetch_optional(&mut **tx)
-            .await?
-            .is_some();
-        if exists {
+        let updated = sqlx::query(
+            &self.q("UPDATE namespaces SET description = ?, updated_at = ? WHERE name = ?"),
+        )
+        .bind(&record.description)
+        .bind(now_rfc)
+        .bind(name)
+        .execute(&mut **tx)
+        .await?;
+        if updated.rows_affected() > 0 {
             return Ok(());
         }
         sqlx::query(&self.q(
@@ -8229,18 +8247,176 @@ impl DatabaseStore {
         Ok(())
     }
 
+    /// Move every row that carries the tenant's name onto `new_name`, inside
+    /// the caller's transaction.
+    ///
+    /// Ordering is FK-driven: each namespace-keyed table's rows are inserted
+    /// under the new name BEFORE the old rows are removed, so a child row whose
+    /// foreign key names `(namespace, id)` always has a live parent.
+    /// `config_admission_locks` is deliberately untouched — those rows are the
+    /// leases proving this mutation.
+    async fn rename_namespace_in_tx(
+        &self,
+        tx: &mut sqlx::Transaction<'_, sqlx::Any>,
+        current_name: &str,
+        new_name: &str,
+        record: &crate::config::namespace_registry::NamespaceRecord,
+        now_rfc: &str,
+        fault: Option<RegistryPhase>,
+    ) -> Result<(), anyhow::Error> {
+        // The target row is inserted and the source row removed at the end, so a
+        // derived-only tenant (resources but no registry row) is materialized by
+        // the same statement pair as a registered one.
+        sqlx::query(&self.q(
+            "INSERT INTO namespaces (name, description, created_at, updated_at) \
+             VALUES (?, ?, ?, ?)",
+        ))
+        .bind(new_name)
+        .bind(&record.description)
+        .bind(record.created_at.to_rfc3339())
+        .bind(now_rfc)
+        .execute(&mut **tx)
+        .await?;
+
+        // Consumers are keyed `(namespace, id)`, and both consumer index tables
+        // carry an FK onto that pair. Insert the new parents, repoint the
+        // children, then drop the old parents.
+        self.copy_namespace_pk_rows_tx(
+            tx,
+            "consumers",
+            "id, namespace, username, custom_id, credentials, acl_groups, created_at, updated_at",
+            "id, ?, username, custom_id, credentials, acl_groups, created_at, updated_at",
+            current_name,
+            new_name,
+        )
+        .await?;
+        sqlx::query(
+            &self.q("UPDATE consumer_credential_index SET namespace = ? WHERE namespace = ?"),
+        )
+        .bind(new_name)
+        .bind(current_name)
+        .execute(&mut **tx)
+        .await?;
+        sqlx::query(
+            &self.q("UPDATE consumer_identity_index SET namespace = ? WHERE namespace = ?"),
+        )
+        .bind(new_name)
+        .bind(current_name)
+        .execute(&mut **tx)
+        .await?;
+        sqlx::query(&self.q("DELETE FROM consumers WHERE namespace = ?"))
+            .bind(current_name)
+            .execute(&mut **tx)
+            .await?;
+
+        // `gateway_trust_bundles` is keyed by `namespace`, so the row moves
+        // rather than being updated in place.
+        self.copy_namespace_pk_rows_tx(
+            tx,
+            "gateway_trust_bundles",
+            "namespace, id, trust_domain, bundle, revision, updated_by, created_at, updated_at",
+            "?, id, trust_domain, bundle, revision, updated_by, created_at, updated_at",
+            current_name,
+            new_name,
+        )
+        .await?;
+        sqlx::query(&self.q("DELETE FROM gateway_trust_bundles WHERE namespace = ?"))
+            .bind(current_name)
+            .execute(&mut **tx)
+            .await?;
+
+        for table in crate::config::namespace_registry::NAMESPACE_RENAME_SIMPLE_TABLES {
+            let sql = format!("UPDATE {table} SET namespace = ? WHERE namespace = ?");
+            sqlx::query(&self.q(&sql))
+                .bind(new_name)
+                .bind(current_name)
+                .execute(&mut **tx)
+                .await?;
+        }
+
+        check_namespace_registry_fault(
+            fault,
+            RegistryPhase::Resources,
+        )?;
+
+        // Route-bucket lock rows are NOT copied: every proxy admission upserts
+        // the one it needs on demand, and copying could collide with a row a
+        // previous tenant of the target name left behind, aborting an otherwise
+        // valid rename. Removing the stale old-name rows is the deliberate
+        // cleanup.
+        self.delete_namespace_guard_rows_tx(tx, current_name).await?;
+
+        check_namespace_registry_fault(
+            fault,
+            RegistryPhase::Ancillary,
+        )?;
+
+        // Polling tombstones: every mover is a `delete` under the old name and
+        // an `upsert` under the new one. Historical `config_changes` rows and
+        // the old name's `config_change_retention` floor stay put — the
+        // tombstones we just wrote live under the old name and still need it.
+        for (resource_type, table) in [
+            ("proxy", "proxies"),
+            ("consumer", "consumers"),
+            ("plugin_config", "plugin_configs"),
+            ("upstream", "upstreams"),
+            (GATEWAY_TRUST_BUNDLE_RESOURCE_TYPE, "gateway_trust_bundles"),
+        ] {
+            let ids = self
+                .select_resource_ids_tx(tx, table, new_name, None, false)
+                .await?;
+            for id in ids {
+                self.record_config_change_tx(tx, current_name, resource_type, &id, "delete")
+                    .await?;
+                self.record_config_change_tx(tx, new_name, resource_type, &id, "upsert")
+                    .await?;
+            }
+        }
+        self.compact_config_changes_tx(tx, current_name).await?;
+        self.compact_config_changes_tx(tx, new_name).await?;
+
+        sqlx::query(&self.q("DELETE FROM namespaces WHERE name = ?"))
+            .bind(current_name)
+            .execute(&mut **tx)
+            .await?;
+        check_namespace_registry_fault(
+            fault,
+            RegistryPhase::RegistryRow,
+        )?;
+        Ok(())
+    }
+
+    /// Remove the namespace's route-bucket lock rows.
+    ///
+    /// Every proxy admission upserts the row it needs, so removing the tenant's
+    /// rows is safe: this transaction holds the namespace's config-admission
+    /// lease, so no concurrent proxy admission for it can be waiting on one.
+    ///
+    /// Two lock tables are deliberately NOT removed. `config_admission_locks`
+    /// holds the leases proving this very mutation — deleting one before commit
+    /// would destroy the fence the commit-boundary verification depends on.
+    /// `mtls_dns_admission_locks` is the row this transaction took
+    /// `FOR UPDATE`; another transaction may be blocked on exactly that row, and
+    /// deleting it would turn its `SELECT ... FOR UPDATE` into a spurious
+    /// "row not found". Leaving one empty lock-anchor row behind costs nothing
+    /// and is re-used verbatim if the name is ever recreated.
+    async fn delete_namespace_guard_rows_tx(
+        &self,
+        tx: &mut sqlx::Transaction<'_, sqlx::Any>,
+        namespace: &str,
+    ) -> Result<(), anyhow::Error> {
+        sqlx::query(&self.q("DELETE FROM proxy_route_locks WHERE namespace = ?"))
+            .bind(namespace)
+            .execute(&mut **tx)
+            .await?;
+        Ok(())
+    }
+
     /// Copy one namespace's rows of a namespace-keyed table under the new name.
     ///
-    /// `ignore_conflicts` is for the advisory lock/retention tables only.
-    /// `delete_all_resources` deliberately leaves `proxy_route_locks`,
-    /// `mtls_dns_admission_locks`, and `config_change_retention` rows behind, so
-    /// a name that is legitimately free (no registry row and no resource row)
-    /// can still carry stale rows there — for example the same
-    /// `route_key_hash` for an identical listen path. A strict INSERT would
-    /// abort the whole rename transaction on that primary-key collision.
-    /// Resource tables stay strict: the handler already proved the target name
-    /// unoccupied, so a conflict there is a real integrity failure.
-    #[allow(clippy::too_many_arguments)]
+    /// The INSERT is strict: the transaction has already proved the target name
+    /// is entirely unoccupied, so a primary-key collision here is a real
+    /// integrity failure and must abort the rename rather than be swallowed.
     async fn copy_namespace_pk_rows_tx(
         &self,
         tx: &mut sqlx::Transaction<'_, sqlx::Any>,
@@ -8249,21 +8425,10 @@ impl DatabaseStore {
         select_expr: &str,
         current_name: &str,
         new_name: &str,
-        ignore_conflicts: bool,
     ) -> Result<(), anyhow::Error> {
-        // MySQL has no `ON CONFLICT`; `INSERT IGNORE` is its idempotent form.
-        // The trailing upsert clause is unambiguous on SQLite only because the
-        // SELECT carries a WHERE clause, which it always does here.
-        let (insert_verb, conflict_clause) = if !ignore_conflicts {
-            ("INSERT", "")
-        } else if self.db_type == "mysql" {
-            ("INSERT IGNORE", "")
-        } else {
-            ("INSERT", " ON CONFLICT DO NOTHING")
-        };
         let sql = format!(
-            "{insert_verb} INTO {table} ({insert_columns}) \
-             SELECT {select_expr} FROM {table} WHERE namespace = ?{conflict_clause}"
+            "INSERT INTO {table} ({insert_columns}) \
+             SELECT {select_expr} FROM {table} WHERE namespace = ?"
         );
         sqlx::query(&self.q(&sql))
             .bind(new_name)
@@ -8273,29 +8438,132 @@ impl DatabaseStore {
         Ok(())
     }
 
-    pub async fn delete_namespace(&self, name: &str, cascade: bool) -> Result<bool, anyhow::Error> {
-        if !self.namespace_name_in_use(name).await? {
+    /// Delete a namespace — occupancy resources, API specs, trust bundle,
+    /// derived indexes, advisory guard rows, polling tombstones, and the
+    /// registry row — in ONE transaction.
+    ///
+    /// Every security/integrity precondition that can race is evaluated here,
+    /// under the caller's admission leases and inside the committing
+    /// transaction: process-default protection, occupancy, and the
+    /// last-remaining-namespace invariant. The lease identities are re-verified
+    /// against the database's clock immediately before commit, so a lost or
+    /// stolen lease aborts with nothing durable.
+    pub async fn delete_namespace(
+        &self,
+        name: &str,
+        cascade: bool,
+        leases: &[crate::config::batch_atomicity::NamespaceAdmissionLeaseHold<'_>],
+    ) -> Result<bool, anyhow::Error> {
+        let start = Instant::now();
+        let fault = namespace_registry_fault(name);
+        if name == self.effective_default_namespace {
+            return Err(RegistryError::protected(
+                name,
+                RegistryError::PROTECTED_PROCESS_DEFAULT,
+            ));
+        }
+        let mut tx = self.pool().begin().await?;
+        // Postgres: must precede every other statement in the transaction.
+        self.use_delete_capture_snapshot_tx(&mut tx).await?;
+        check_namespace_registry_fault(
+            fault,
+            RegistryPhase::Start,
+        )?;
+
+        if !self.namespace_name_in_use_tx(&mut tx, name).await? {
             return Ok(false);
         }
-        if self.namespace_has_resources(name).await? {
-            if !cascade {
-                return Err(anyhow::Error::new(
-                    crate::config::namespace_registry::NamespaceRegistryError::NotEmpty {
-                        name: name.to_string(),
-                    },
-                ));
-            }
-            self.delete_all_resources(name, &BatchConfigWriteMode::Admission)
-                .await?;
-            if let Some(bundle) = self.get_namespace_gateway_trust_bundle(name).await? {
-                let _ = self.delete_gateway_trust_bundle(name, &bundle.id).await?;
-            }
-        }
-        let result = sqlx::query(&self.q("DELETE FROM namespaces WHERE name = ?"))
-            .bind(name)
-            .execute(&self.pool())
+        // Locks the namespace's mTLS DNS admission row for the rest of this
+        // transaction and fails closed (retryable 503) while a guarded restore
+        // replay owns it. `delete_all_resources_in_tx` takes the same lock, but
+        // an EMPTY namespace never reaches that call.
+        self.lock_mtls_dns_admission_for_owner_tx(&mut tx, name, None)
             .await?;
-        Ok(result.rows_affected() > 0 || cascade)
+        if self.namespace_has_resources_tx(&mut tx, name).await? {
+            if !cascade {
+                return Err(RegistryError::not_empty(name));
+            }
+            self.delete_all_resources_in_tx(&mut tx, name, &BatchConfigWriteMode::Admission)
+                .await?;
+            self.delete_namespace_trust_bundle_in_tx(&mut tx, name)
+                .await?;
+        }
+        check_namespace_registry_fault(
+            fault,
+            RegistryPhase::Resources,
+        )?;
+
+        self.delete_namespace_guard_rows_tx(&mut tx, name).await?;
+        check_namespace_registry_fault(
+            fault,
+            RegistryPhase::Ancillary,
+        )?;
+
+        sqlx::query(&self.q("DELETE FROM namespaces WHERE name = ?"))
+            .bind(name)
+            .execute(&mut *tx)
+            .await?;
+        check_namespace_registry_fault(
+            fault,
+            RegistryPhase::RegistryRow,
+        )?;
+
+        // Re-checked HERE, not from an earlier list query: two gateways that
+        // each observed two names would otherwise both proceed and leave zero.
+        // Both hold the global registry lease, so this transaction is the only
+        // one that can be removing a namespace right now.
+        if !self.any_namespace_remains_tx(&mut tx).await? {
+            return Err(RegistryError::protected(
+                name,
+                RegistryError::PROTECTED_LAST_REMAINING,
+            ));
+        }
+        check_namespace_registry_fault(
+            fault,
+            RegistryPhase::LastNamespaceCheck,
+        )?;
+
+        self.verify_namespace_registry_leases_tx(&mut tx, leases, fault)
+            .await?;
+        check_namespace_registry_fault(
+            fault,
+            RegistryPhase::Commit,
+        )?;
+        tx.commit().await?;
+        self.check_slow_query("delete_namespace", start);
+        Ok(true)
+    }
+
+    /// Remove the namespace's gateway trust bundle inside the caller's
+    /// transaction, recording the same `delete` change record the standalone
+    /// [`Self::delete_gateway_trust_bundle`] writes.
+    async fn delete_namespace_trust_bundle_in_tx(
+        &self,
+        tx: &mut sqlx::Transaction<'_, sqlx::Any>,
+        namespace: &str,
+    ) -> Result<(), anyhow::Error> {
+        let ids = self
+            .select_resource_ids_tx(tx, "gateway_trust_bundles", namespace, None, true)
+            .await?;
+        if ids.is_empty() {
+            return Ok(());
+        }
+        sqlx::query(&self.q("DELETE FROM gateway_trust_bundles WHERE namespace = ?"))
+            .bind(namespace)
+            .execute(&mut **tx)
+            .await?;
+        for id in ids {
+            self.record_config_change_tx(
+                tx,
+                namespace,
+                GATEWAY_TRUST_BUNDLE_RESOURCE_TYPE,
+                &id,
+                "delete",
+            )
+            .await?;
+        }
+        self.compact_config_changes_tx(tx, namespace).await?;
+        Ok(())
     }
 
     // -----------------------------------------------------------------------
@@ -10860,11 +11128,25 @@ impl DatabaseBackend for DatabaseStore {
         DatabaseStore::namespace_has_resources(self, name).await
     }
 
+    fn effective_default_namespace(&self) -> &str {
+        &self.effective_default_namespace
+    }
+
+    fn set_effective_default_namespace(&mut self, namespace: &str) {
+        let namespace = namespace.trim();
+        self.effective_default_namespace = if namespace.is_empty() {
+            crate::config::types::DEFAULT_NAMESPACE.to_string()
+        } else {
+            namespace.to_string()
+        };
+    }
+
     async fn create_namespace(
         &self,
         record: &crate::config::namespace_registry::NamespaceRecord,
+        leases: &[crate::config::db_backend::NamespaceAdmissionLeaseHold<'_>],
     ) -> Result<(), anyhow::Error> {
-        DatabaseStore::create_namespace(self, record).await
+        DatabaseStore::create_namespace(self, record, leases).await
     }
 
     async fn update_namespace(
@@ -10872,12 +11154,18 @@ impl DatabaseBackend for DatabaseStore {
         current_name: &str,
         new_name: &str,
         description: Option<Option<String>>,
+        leases: &[crate::config::db_backend::NamespaceAdmissionLeaseHold<'_>],
     ) -> Result<crate::config::namespace_registry::NamespaceRecord, anyhow::Error> {
-        DatabaseStore::update_namespace(self, current_name, new_name, description).await
+        DatabaseStore::update_namespace(self, current_name, new_name, description, leases).await
     }
 
-    async fn delete_namespace(&self, name: &str, cascade: bool) -> Result<bool, anyhow::Error> {
-        DatabaseStore::delete_namespace(self, name, cascade).await
+    async fn delete_namespace(
+        &self,
+        name: &str,
+        cascade: bool,
+        leases: &[crate::config::db_backend::NamespaceAdmissionLeaseHold<'_>],
+    ) -> Result<bool, anyhow::Error> {
+        DatabaseStore::delete_namespace(self, name, cascade, leases).await
     }
 
     async fn submit_api_spec_bundle(

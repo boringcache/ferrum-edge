@@ -1443,3 +1443,100 @@ fn gateway_trust_bundle_identity_parses_id_and_trust_domain_strictly() {
         "identity id/trust_domain must use strict stored-field decoding:\n{body}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Namespace registry (issue #3955)
+// ---------------------------------------------------------------------------
+
+/// Every registry mutation must (a) refuse standalone MongoDB before touching
+/// a document, and (b) commit inside one transaction that re-verifies the
+/// caller's admission leases. A live replica set is not available in unit
+/// tests, so the decision is pinned at the source level — the same seam the
+/// other MongoDB shape contracts in this file use.
+#[test]
+fn namespace_registry_mutations_are_transactional_and_refuse_standalone() {
+    for (entry, in_session) in [
+        ("create_namespace(", "create_namespace_in_session("),
+        ("update_namespace(", "update_namespace_in_session("),
+        ("delete_namespace(", "delete_namespace_in_session("),
+    ] {
+        let body = mongo_method(entry);
+        assert!(
+            body.contains("if !self.replica_set_configured()"),
+            "{entry} must re-check topology before mutating:\n{body}"
+        );
+        assert!(
+            body.contains("namespace_registry_standalone_refusal()"),
+            "{entry} must fail closed on standalone MongoDB:\n{body}"
+        );
+        assert!(
+            body.contains("start_transaction()") && body.contains(in_session),
+            "{entry} must run {in_session} inside one transaction:\n{body}"
+        );
+
+        let session_body = mongo_method(in_session);
+        assert!(
+            session_body.contains("verify_namespace_registry_leases_in_session"),
+            "{in_session} must re-verify the admission leases before commit:\n{session_body}"
+        );
+    }
+}
+
+/// The registry-lease gate is a conditional in-session WRITE compared against
+/// MongoDB's own clock, so a competing acquirer raises a write conflict rather
+/// than being masked by the transaction's read snapshot.
+#[test]
+fn namespace_registry_lease_gate_uses_server_time_and_joins_the_write_set() {
+    let body = mongo_method("verify_namespace_config_admission_lease_in_session(");
+    assert!(
+        body.contains("update_one"),
+        "the lease gate must be a conditional write, not a read:\n{body}"
+    );
+    assert!(
+        body.contains("$$NOW") && body.contains("server_time_lease_touch_pipeline"),
+        "expiry must be evaluated from MongoDB's clock at the gate:\n{body}"
+    );
+    assert!(
+        body.contains("lease_server_time()"),
+        "the DocumentDB fallback must still read the server clock:\n{body}"
+    );
+}
+
+/// `proxy_route_locks` documents are keyed only by `_id` (`"{namespace}:{hash}"`)
+/// and carry NO `namespace` field, so a `{"namespace": ...}` filter is a silent
+/// no-op. Cleanup must use the anchored, regex-escaped `_id` prefix instead —
+/// and the id-rewriting helper (which DOES filter on `namespace`) must never be
+/// pointed at that collection again.
+#[test]
+fn proxy_route_lock_cleanup_uses_an_escaped_id_prefix_not_a_namespace_filter() {
+    let filter = mongo_fn_body("        fn namespace_id_prefix_filter(");
+    assert!(
+        filter.contains("regex_escape(namespace)") && filter.contains(r#""^{}:""#),
+        "the id-prefix filter must be anchored and regex-escaped:\n{filter}"
+    );
+
+    let cleanup = mongo_method("delete_namespace_guard_docs_in_session(");
+    assert!(
+        cleanup.contains("proxy_route_locks()")
+            && cleanup.contains("namespace_id_prefix_filter(namespace)"),
+        "route-lock cleanup must target the `_id` prefix:\n{cleanup}"
+    );
+    assert!(
+        !cleanup.contains("mtls_dns_admission_locks")
+            && !cleanup.contains("config_admission_locks"),
+        "the guard documents proving the mutation must not be deleted:\n{cleanup}"
+    );
+
+    // Single-line needles only: a multi-line source assertion breaks the
+    // moment rustfmt reflows the call it is pinning.
+    let rename = mongo_method("rename_namespace_documents_in_session(");
+    assert!(
+        !rename.contains("proxy_route_locks"),
+        "the rename must not try to rewrite `proxy_route_locks` ids — those \
+         documents have no `namespace` field, so the filter never matches:\n{rename}"
+    );
+    assert!(
+        !MONGO_STORE_SOURCE.contains(r#""consumer_credential_index""#),
+        "the MongoDB backend has no consumer_credential_index collection"
+    );
+}

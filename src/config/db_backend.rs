@@ -10,8 +10,8 @@
 #[allow(unused_imports)]
 pub use crate::config::batch_atomicity::{
     ATOMIC_BATCH_UNSUPPORTED_MESSAGE, AtomicBatchCounts, AtomicBatchGraph, AtomicBatchUnsupported,
-    BATCH_ADMISSION_LEASE_LOST_MESSAGE, BatchAdmissionLeaseLost, NamespaceConfigAdmissionLeaseRef,
-    atomic_batch_unsupported, is_batch_admission_lease_lost,
+    BATCH_ADMISSION_LEASE_LOST_MESSAGE, BatchAdmissionLeaseLost, NamespaceAdmissionLeaseHold,
+    NamespaceConfigAdmissionLeaseRef, atomic_batch_unsupported, is_batch_admission_lease_lost,
 };
 use crate::config::gateway_trust::{GatewayTrustBundleIdentity, GatewayTrustBundleRecord};
 use crate::config::types::{
@@ -2199,37 +2199,77 @@ pub trait DatabaseBackend: NamespaceConfigAdmissionLeaseBackend + Send + Sync {
             .is_some())
     }
 
-    /// Insert a registry row. Returns [`crate::config::namespace_registry::NamespaceRegistryError::NameInUse`]
-    /// when the name already exists in the registry or as a derived namespace.
+    /// The namespace this process is configured to serve — the already-resolved
+    /// `FERRUM_NAMESPACE` value, applied once at startup through
+    /// [`Self::set_effective_default_namespace`] so no request-time code has to
+    /// re-read the process environment (which would bypass the
+    /// CLI > env > conf-file > default precedence `EnvConfig` already applied).
+    ///
+    /// This namespace is protected from DELETE **and** from rename-away: a
+    /// rename is semantically a removal of the old name, and the gateway would
+    /// be left serving a namespace that no longer exists. A description-only
+    /// update remains allowed.
+    fn effective_default_namespace(&self) -> &str {
+        crate::config::types::DEFAULT_NAMESPACE
+    }
+
+    /// Apply the resolved `FERRUM_NAMESPACE` after store construction, the same
+    /// way [`Self::set_failover_allow_writes`] applies its env-derived setting.
+    fn set_effective_default_namespace(&mut self, namespace: &str) {
+        let _ = namespace;
+    }
+
+    /// Insert a registry row, all-or-nothing, re-verifying every `leases` entry
+    /// inside the committing transaction.
+    ///
+    /// Returns [`crate::config::namespace_registry::NamespaceRegistryError::NameInUse`]
+    /// when the name already exists in the registry or as a derived namespace —
+    /// checked inside the transaction, not by an earlier handler query.
     async fn create_namespace(
         &self,
         record: &crate::config::namespace_registry::NamespaceRecord,
+        leases: &[NamespaceAdmissionLeaseHold<'_>],
     ) -> Result<(), anyhow::Error> {
-        let _ = record;
+        let _ = (record, leases);
         Err(anyhow::anyhow!(
             "namespace registry writes are not supported by this backend"
         ))
     }
 
-    /// Update description and/or rename. Rename rewrites every resource
-    /// `namespace` column under the caller-held admission leases.
+    /// Update description and/or rename, all-or-nothing.
+    ///
+    /// A rename rewrites the registry row, every resource `namespace` column,
+    /// every namespace-keyed ancillary row, and the polling change-log
+    /// tombstones in ONE transaction, re-verifying the source, target, and
+    /// global registry leases immediately before commit.
     async fn update_namespace(
         &self,
         current_name: &str,
         new_name: &str,
         description: Option<Option<String>>,
+        leases: &[NamespaceAdmissionLeaseHold<'_>],
     ) -> Result<crate::config::namespace_registry::NamespaceRecord, anyhow::Error> {
-        let _ = (current_name, new_name, description);
+        let _ = (current_name, new_name, description, leases);
         Err(anyhow::anyhow!(
             "namespace registry writes are not supported by this backend"
         ))
     }
 
-    /// Delete a registry row. `cascade` must already have been authorized by
-    /// the admin handler; when false and resources remain, returns
-    /// [`crate::config::namespace_registry::NamespaceRegistryError::NotEmpty`].
-    async fn delete_namespace(&self, name: &str, cascade: bool) -> Result<bool, anyhow::Error> {
-        let _ = (name, cascade);
+    /// Delete a namespace, all-or-nothing.
+    ///
+    /// Occupancy, process-default protection, and the last-remaining-namespace
+    /// invariant are all evaluated INSIDE the committing transaction — a
+    /// handler precheck can only improve the error message, never be the
+    /// authority. When `cascade` is false and resources remain, returns
+    /// [`crate::config::namespace_registry::NamespaceRegistryError::NotEmpty`]
+    /// with nothing deleted.
+    async fn delete_namespace(
+        &self,
+        name: &str,
+        cascade: bool,
+        leases: &[NamespaceAdmissionLeaseHold<'_>],
+    ) -> Result<bool, anyhow::Error> {
+        let _ = (name, cascade, leases);
         Err(anyhow::anyhow!(
             "namespace registry writes are not supported by this backend"
         ))

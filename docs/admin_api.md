@@ -384,7 +384,7 @@ Sizing note: there is no listener-wide budget for concurrently buffered request 
 
 ## Namespaces
 
-Namespaces are first-class registry objects. Historically `GET /namespaces` was a `DISTINCT` union over resource tables, so an empty tenant could not exist and there was no rename or delete. The durable `namespaces` table (SQL and Mongo) holds `name` (primary key), optional `description`, `created_at`, and `updated_at`. Connect/migrate backfills distinct names from proxies, consumers, plugin configs, upstreams, and gateway trust bundles, plus the default `ferrum` if missing.
+Namespaces are first-class registry objects. Historically `GET /namespaces` was a `DISTINCT` union over resource tables, so an empty tenant could not exist and there was no rename or delete. The durable `namespaces` table (SQL and Mongo) holds `name` (primary key), optional `description`, `created_at`, and `updated_at`. Connect/migrate backfills distinct names from proxies, consumers, plugin configs, upstreams, and gateway trust bundles, plus the canonical `ferrum` row. Nothing else is seeded: the backfill never reads the process environment, so a deployment-specific `FERRUM_NAMESPACE` that has no resources yet is created through `POST /namespaces` (or implicitly by its first resource write) like any other tenant.
 
 Writing a proxy (or other resource) with a new `X-Ferrum-Namespace` still isolates data without a prior `POST` — that implicit path remains valid. What the registry adds is the ability to create a tenant before any resource, and to rename or delete it.
 
@@ -410,7 +410,29 @@ curl -X DELETE -H "Authorization: Bearer $TOKEN" \
   "http://localhost:9000/namespaces/prod?confirm=true"
 ```
 
-`name` uses the same rules as `X-Ferrum-Namespace`: `^[a-zA-Z0-9][a-zA-Z0-9._-]*$`, max 254. Duplicate names (registry or derived) return `409`. Rename rewrites every resource `namespace` column under the existing namespace-admission guard. Delete does not cascade by default; `?confirm=true` cascade-deletes occupancy resources and then the registry row. The process default namespace (`FERRUM_NAMESPACE`, or `ferrum`) cannot be deleted, and the last remaining namespace cannot be deleted.
+`name` uses the same rules as `X-Ferrum-Namespace`: `^[a-zA-Z0-9][a-zA-Z0-9._-]*$`, max 254. Duplicate names (registry or derived) return `409`.
+
+### Request field semantics
+
+- `description` is trimmed; an empty or whitespace-only value is stored as absent and omitted from the response. The 1024 limit counts **Unicode characters** (scalar values), not bytes, matching the OpenAPI `maxLength`.
+- On `PUT`, an omitted field is left unchanged. `description: null` (or an empty string) clears it. `name` is valid only as a **string when present** — `name: null` is rejected, not treated as "unchanged".
+- Any other JSON type for either field is `400` with nothing mutated. A malformed `description` never silently erases the stored value.
+
+### Atomicity and protected namespaces
+
+Create, rename, and delete are serialized across gateway processes by a **global namespace-registry admission lease** plus one lease per affected name, taken in a fixed order (global first, then names ascending) so concurrent creates, deletes, and a two-name rename cannot deadlock. Each mutation commits in a **single database transaction** that re-verifies every held lease against the datastore's own clock immediately before commit; a lost or stolen lease aborts the transaction and returns a retryable `503` with nothing applied.
+
+Every precondition that can race is evaluated inside that transaction, not by an earlier query: source existence, target vacancy, occupancy, protection of the configured namespace, and the last-remaining-namespace invariant. Handler prechecks exist only to produce better messages.
+
+- Rename rewrites the registry row, every resource `namespace` column, the consumer identity/credential indexes, the gateway trust bundle, and the polling change-log tombstones in that one transaction. Stale route-bucket lock rows under the old name are removed; the admission lease rows proving the mutation are never touched.
+- Delete does not cascade by default; `?confirm=true` cascade-deletes occupancy resources (proxies, consumers, plugin configs, upstreams, API specs, the gateway trust bundle, the consumer indexes, and the tenant's route-bucket lock rows) and then the registry row.
+- Change-log tombstones and the namespace's change-log retention floor are deliberately **retained** after a rename or delete so a gateway still polling the old name converges instead of serving stale configuration.
+- The namespace this gateway is configured to serve (`FERRUM_NAMESPACE`, default `ferrum`) cannot be deleted **or renamed away** — a rename is semantically a removal of the old name. A description-only update of it is allowed. The value comes from the resolved startup configuration (CLI > env > conf file > default), never from a request-time environment read.
+- The last remaining namespace cannot be deleted, re-checked at the commit boundary so two gateway instances cannot each observe two names and concurrently delete a different one.
+
+### MongoDB limitation
+
+Namespace `POST`/`PUT`/`DELETE` require MongoDB **multi-document transactions**. On a standalone `mongod` they are refused with `501 Not Implemented` before anything is modified, and the `detail` field names the configuration to change (`FERRUM_MONGO_REPLICA_SET`, or a `?replicaSet=` URL option). `GET /namespaces` and `GET /namespaces/{name}` remain available. SQL backends are unaffected.
 
 These routes are **not** selected by `X-Ferrum-Namespace`. See [Per-namespace tenancy](#per-namespace-tenancy-ferrum_admin_require_namespace_claim) for how the JWT `ns` claim applies to list filtering and per-name writes.
 

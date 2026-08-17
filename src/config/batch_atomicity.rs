@@ -122,6 +122,24 @@ pub struct NamespaceConfigAdmissionLeaseRef<'a> {
     pub generation: u64,
 }
 
+/// One admission lease a caller holds, together with the admission key it was
+/// taken on.
+///
+/// `POST /batch` only ever needs the graph's own namespace, so it carries a
+/// bare [`NamespaceConfigAdmissionLeaseRef`]. A namespace **registry** mutation
+/// holds several leases at once — the global
+/// [`crate::config::namespace_registry::NAMESPACE_REGISTRY_ADMISSION_KEY`] plus
+/// the source and (for a rename) target names — and the backend must re-verify
+/// every one of them inside the committing transaction, so each lease has to
+/// travel with the key it belongs to.
+#[derive(Debug, Clone, Copy)]
+pub struct NamespaceAdmissionLeaseHold<'a> {
+    /// The `config_admission_locks` key: a namespace name, or the global
+    /// registry key.
+    pub key: &'a str,
+    pub lease: NamespaceConfigAdmissionLeaseRef<'a>,
+}
+
 /// One validated batch graph, persisted all-or-nothing.
 ///
 /// Field order matches the dependency order backends must write in: consumers

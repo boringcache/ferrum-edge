@@ -8210,6 +8210,47 @@ fn namespace_admission_contention_is_documented_as_retryable() {
     );
 }
 
+/// Namespace registry mutations need multi-document transactions, so a
+/// standalone MongoDB deployment refuses them before mutating anything
+/// (issue #3955). The refusal must be documented on all three write
+/// operations, together with the `500` every persistence failure can produce.
+#[test]
+fn namespace_registry_mutations_document_atomicity_refusal_and_server_error() {
+    let spec: serde_json::Value =
+        serde_yaml::from_str(include_str!("../../openapi.yaml")).expect("openapi.yaml parses");
+
+    for pointer in [
+        "/paths/~1namespaces/post/responses",
+        "/paths/~1namespaces~1{name}/put/responses",
+        "/paths/~1namespaces~1{name}/delete/responses",
+    ] {
+        let responses = spec
+            .pointer(pointer)
+            .unwrap_or_else(|| panic!("missing namespace responses: {pointer}"));
+        assert_eq!(
+            responses["501"]["$ref"],
+            "#/components/responses/NamespaceRegistryAtomicityUnsupported",
+            "namespace mutation is missing the standalone-MongoDB refusal: {pointer}"
+        );
+        assert_eq!(
+            responses["500"]["$ref"], "#/components/responses/InternalServerError",
+            "namespace mutation is missing the persistence-failure 500: {pointer}"
+        );
+    }
+
+    let response = spec
+        .pointer("/components/responses/NamespaceRegistryAtomicityUnsupported")
+        .expect("namespace registry atomicity refusal component");
+    assert_eq!(
+        response["content"]["application/json"]["schema"]["$ref"],
+        "#/components/schemas/NamespaceRegistryUnsupportedResponse"
+    );
+    let schema = spec
+        .pointer("/components/schemas/NamespaceRegistryUnsupportedResponse")
+        .expect("namespace registry atomicity refusal schema");
+    assert_eq!(schema["required"], json!(["error", "detail"]));
+}
+
 #[test]
 fn proxy_delete_documents_atomicity_refusal_for_standalone_mongodb() {
     let spec: serde_json::Value =

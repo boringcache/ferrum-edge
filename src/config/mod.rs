@@ -39,6 +39,10 @@ pub(crate) mod incremental_apply;
 pub mod migrations;
 pub mod mongo_index_plan;
 pub mod mongo_store;
+// The registry's fault-injection installer is driven by external tests through
+// the lib target; the bin target recompiles this module without that caller, so
+// it would otherwise read as dead code there.
+#[allow(dead_code)]
 pub mod namespace_registry;
 pub mod plugin_trigger;
 pub mod pool_config;

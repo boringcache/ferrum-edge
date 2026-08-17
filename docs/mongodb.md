@@ -298,6 +298,7 @@ FERRUM_DB_TLS_CLIENT_KEY_PATH=/certs/client.key
 | Single-document CRUD | Atomic | Atomic |
 | Multi-document operations (e.g., delete proxy + plugins) | Hand-managed proxy deletes use fail-safe sequential ordering; direct API-spec-owned proxy deletes are **rejected with `501` before mutation** | Transactional (ACID) via `ClientSession::start_transaction` |
 | `POST /batch` (all-or-nothing config graph) | **Rejected with `501` before any mutation** | Supported — the whole graph commits in one transaction |
+| `POST`/`PUT`/`DELETE /namespaces` (registry CRUD) | **Rejected with `501` before any mutation** | Supported — the whole tenant mutation commits in one transaction |
 | Change-stream-triggered config reloads | Not available (periodic polling only) | Available, opt-in via `FERRUM_MONGO_CHANGE_STREAM_ENABLED` |
 | Read preference routing | Not available | Available |
 | Automatic failover | Not available | Automatic |
@@ -325,6 +326,18 @@ partial failure can only leave orphaned plugin configs (no proxy references
 them). Orphans are recoverable; the previous order — plugin configs first —
 could leave a proxy in the DB referencing now-deleted plugin_config IDs, which
 validation rejects on every subsequent polling cycle until manually cleaned up.
+
+Namespace registry CRUD (`POST /namespaces`, `PUT /namespaces/{name}`,
+`DELETE /namespaces/{name}`, issue #3955) has the same requirement. A rename or
+confirmed cascade delete spans the registry document, every resource document,
+the consumer identity index, the gateway trust bundle, the tenant's route-bucket
+lock documents, and the polling change records; and every registry mutation
+re-verifies its namespace-admission leases *inside* the committing transaction
+so a lost or stolen lease can never produce a durable write. Neither guarantee
+is available on a standalone `mongod`, so all three write operations return
+`501 Not Implemented` before touching anything and name `FERRUM_MONGO_REPLICA_SET`
+(or the `replicaSet` URL option) as the remediation. `GET /namespaces` and
+`GET /namespaces/{name}` remain available, and SQL backends are unaffected.
 
 A direct `DELETE /proxies/{id}` for an API-spec-owned proxy is different: its
 ownership cascade spans the proxy, scoped plugins, the `api_specs` owner
