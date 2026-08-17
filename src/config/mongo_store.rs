@@ -5133,7 +5133,7 @@ mod inner {
         /// nothing) instead of being masked by the transaction's read snapshot.
         ///
         /// Expiry is compared against MongoDB's own clock AT THIS GATE (`$expr`
-        /// + `$$NOW`, the same convention the lease renew path uses), never
+        /// together with `$$NOW`, the same convention the lease renew path uses), never
         /// against a timestamp captured before the transaction opened. A
         /// pre-transaction snapshot goes stale while the mutation is written —
         /// and staler still when the convenient runner retries the callback — so
