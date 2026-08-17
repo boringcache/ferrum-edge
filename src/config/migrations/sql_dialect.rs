@@ -666,6 +666,12 @@ impl V001SqlBuilder {
     /// against a concurrent registry mutation. It is a datastore row, not a
     /// process-local mutex, so it serializes across gateway processes as well.
     ///
+    /// Holding the lease is not by itself enough, because a lease can lapse:
+    /// [`Self::backfill_namespaces_registry`] additionally verifies and LOCKS
+    /// that row as the first statement of its transaction, so a competing
+    /// acquisition cannot cross the derived-name scan even if the pass outruns
+    /// the lease duration.
+    ///
     /// A lease held elsewhere is not an error: the completion marker stays
     /// absent, which is exactly the crash-retry state, and the next
     /// connect / migrate / reconnect pass tries again.
@@ -769,24 +775,90 @@ impl V001SqlBuilder {
         Ok(())
     }
 
-    /// Confirm the global registry lease is still owned at this generation and
-    /// unexpired, pinned until commit.
+    /// Verify AND transactionally pin the global registry lease row as the
+    /// FIRST statement of the backfill transaction, before anything is scanned
+    /// or inserted.
     ///
-    /// `FOR UPDATE` holds the lease row so a competing acquirer cannot take the
-    /// global key between this check and the commit. SQLite has no
-    /// `FOR UPDATE`, but the transaction is already holding the database writer
-    /// lock from the registry inserts above, which gives the same exclusion.
-    async fn namespaces_registry_backfill_lease_held(
+    /// This is the whole fence. Verification alone at the commit boundary is
+    /// not enough: a competing acquirer could take the global key while the
+    /// derived-name scan runs and commit a namespace delete, and the scan's
+    /// pre-delete name set would then be inserted. Locking the row up front
+    /// makes that impossible — every competing acquisition is a write to this
+    /// exact row (`INSERT ... ON CONFLICT/DUPLICATE KEY UPDATE` on the
+    /// `namespace` primary key), so it blocks until this transaction commits or
+    /// rolls back and its mutation is strictly ordered after the pass.
+    ///
+    /// `FOR UPDATE` is the row lock on PostgreSQL and MySQL. SQLite has no
+    /// `FOR UPDATE`, so the equivalent is to promote the deferred transaction
+    /// to a **write** transaction here: a conditional `UPDATE` of the same row
+    /// takes SQLite's single database writer lock for the rest of the
+    /// transaction, which excludes every competing acquisition just as
+    /// completely. The renewal it writes is also what keeps the post-commit
+    /// lease view sane; correctness does not depend on it.
+    ///
+    /// A `false` return means the lease was already lost before any work
+    /// started (stolen after expiry, or released), so the pass defers.
+    async fn pin_namespaces_registry_backfill_lease(
         &self,
         connection: &mut AnyConnection,
         owner: &str,
         generation: i64,
     ) -> Result<bool, anyhow::Error> {
         let now = config_admission_lease_now_sql(self.db_type());
+        if self.is_sqlite() {
+            let sql = self.q(&format!(
+                "UPDATE config_admission_locks SET expires_at = {now} + ? \
+                 WHERE namespace = ? AND owner = ? AND generation = ? AND expires_at > {now}"
+            ));
+            let pinned = sqlx::query(&sql)
+                .bind(CONFIG_ADMISSION_LEASE_DURATION_MILLIS)
+                .bind(NAMESPACE_REGISTRY_ADMISSION_KEY)
+                .bind(owner)
+                .bind(generation)
+                .execute(&mut *connection)
+                .await?
+                .rows_affected();
+            return Ok(pinned == 1);
+        }
+        let sql = self.q(&format!(
+            "SELECT 1 FROM config_admission_locks \
+             WHERE namespace = ? AND owner = ? AND generation = ? AND expires_at > {now} FOR UPDATE"
+        ));
+        Ok(sqlx::query(&sql)
+            .bind(NAMESPACE_REGISTRY_ADMISSION_KEY)
+            .bind(owner)
+            .bind(generation)
+            .fetch_optional(&mut *connection)
+            .await?
+            .is_some())
+    }
+
+    /// Commit-boundary proof that the pinned lease row is still this pass's
+    /// own, at the same generation.
+    ///
+    /// Deliberately NOT predicated on `expires_at`. The row has been pinned by
+    /// [`Self::pin_namespaces_registry_backfill_lease`] since before the
+    /// derived-name scan, so no competing acquisition can have crossed it, and
+    /// ordinary elapsed wall time under that lock is not lost ownership.
+    /// Re-checking the TTL here would roll back an otherwise uncontended
+    /// backfill that simply took longer than one lease duration — and it would
+    /// do so on every retry, starving it forever. Owner and generation are the
+    /// real proof: an ownership change is the only thing that can rewrite
+    /// either, and nothing can rewrite them while the row is locked.
+    ///
+    /// `FOR UPDATE` is repeated so the pin is unambiguously still held on the
+    /// statement that authorizes the commit; SQLite is still inside the write
+    /// transaction the pin opened.
+    async fn namespaces_registry_backfill_lease_held(
+        &self,
+        connection: &mut AnyConnection,
+        owner: &str,
+        generation: i64,
+    ) -> Result<bool, anyhow::Error> {
         let for_update = if self.is_sqlite() { "" } else { " FOR UPDATE" };
         let sql = self.q(&format!(
             "SELECT 1 FROM config_admission_locks \
-             WHERE namespace = ? AND owner = ? AND generation = ? AND expires_at > {now}{for_update}"
+             WHERE namespace = ? AND owner = ? AND generation = ?{for_update}"
         ));
         Ok(sqlx::query(&sql)
             .bind(NAMESPACE_REGISTRY_ADMISSION_KEY)
@@ -872,12 +944,18 @@ impl V001SqlBuilder {
     /// The compatibility pass itself, fenced by `owner`/`generation` on the
     /// global registry admission lease and committed as ONE transaction.
     ///
-    /// Everything the pass reads and writes — the authoritative completion
-    /// check, the derived-name scan, the canonical `ferrum` seed, and the
-    /// completion marker — lives inside that single transaction, so a crash or
-    /// an abort leaves the marker absent and the next startup retries the same
-    /// idempotent statements. The marker is still written last within the
-    /// transaction so the ordering contract reads the same way it always did.
+    /// Everything the pass reads and writes — the lease pin, the authoritative
+    /// completion check, the derived-name scan, the canonical `ferrum` seed,
+    /// and the completion marker — lives inside that single transaction, so a
+    /// crash or an abort leaves the marker absent and the next startup retries
+    /// the same idempotent statements. The marker is still written last within
+    /// the transaction so the ordering contract reads the same way it always
+    /// did.
+    ///
+    /// The lease row is verified and locked BEFORE the scan, not only at the
+    /// commit boundary, so a competing acquirer cannot take the global key
+    /// across the scan and commit a delete the scan's name set would then
+    /// resurrect.
     async fn backfill_namespaces_registry(
         &self,
         connection: &mut AnyConnection,
@@ -887,6 +965,19 @@ impl V001SqlBuilder {
         use sqlx::Connection;
 
         let mut tx = connection.begin().await?;
+
+        // Pin FIRST: the fence has to cover the scan, not just the commit.
+        if !self
+            .pin_namespaces_registry_backfill_lease(&mut tx, owner, generation)
+            .await?
+        {
+            tx.rollback().await?;
+            tracing::warn!(
+                "Namespace registry compatibility backfill did not start: the global registry \
+                 admission lease was no longer held; a later startup retries"
+            );
+            return Ok(());
+        }
 
         // Authoritative completion check, inside the fence: two processes can
         // never both observe an absent marker and both seed.
@@ -969,9 +1060,11 @@ impl V001SqlBuilder {
             .await?;
 
         // Commit-boundary fence, exactly like every live registry mutation: the
-        // global lease must still be owned at the acquired generation. A lost
-        // lease rolls the whole pass back with the marker absent, so nothing is
-        // resurrected and a later startup retries.
+        // global lease must still be owned at the acquired generation. Under
+        // the pin taken above only an ownership change can falsify that, and no
+        // ownership change can happen while the row is locked — so this is a
+        // proof, not a TTL race. A lost lease rolls the whole pass back with the
+        // marker absent, so nothing is resurrected and a later startup retries.
         if !self
             .namespaces_registry_backfill_lease_held(&mut tx, owner, generation)
             .await?

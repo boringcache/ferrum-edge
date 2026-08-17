@@ -2287,6 +2287,59 @@ async fn namespace_registry_backfill_then_delete_is_not_undone_by_a_later_pass()
     );
 }
 
+/// The compatibility pass verifies AND locks the global registry lease row as
+/// the FIRST statement of its transaction, at the generation it just acquired.
+///
+/// A predecessor that crashed leaves an expired lease row behind at some
+/// earlier generation. Acquisition steals it and bumps `generation`; the
+/// start-of-pass pin must verify that NEW generation against the database's own
+/// clock. A pin bound to the wrong generation, or one whose placeholders are
+/// mis-ordered for the dialect, would defer every pass forever and never seed.
+/// Fully deterministic: the stale row is written directly, with no sleep and no
+/// timing race.
+#[tokio::test]
+async fn namespace_registry_backfill_pins_the_lease_generation_it_acquired() {
+    let dir = TempDir::new().unwrap();
+    let store_name = "ns-backfill-lease-pin";
+    let registry_key = ferrum_edge::config::namespace_registry::NAMESPACE_REGISTRY_ADMISSION_KEY;
+    {
+        let store = make_store_at(&dir, store_name).await;
+        seed_upstream(&store, "pinned-tenant", "up-pinned").await;
+        clear_backfill_marker(&store).await;
+        sqlx::query(
+            "INSERT INTO config_admission_locks (namespace, owner, expires_at, generation) \
+             VALUES (?, 'crashed-predecessor', 0, 7) \
+             ON CONFLICT (namespace) DO UPDATE SET \
+             owner = 'crashed-predecessor', expires_at = 0, generation = 7",
+        )
+        .bind(registry_key)
+        .execute(&store.pool())
+        .await
+        .unwrap();
+    }
+
+    let retried = make_store_at(&dir, store_name).await;
+    assert!(
+        backfill_marker_present(&retried).await,
+        "a pass that stole an expired lease must still commit"
+    );
+    assert!(
+        registry_row_exists(&retried, "pinned-tenant").await,
+        "the derived name must be seeded under the newly acquired generation"
+    );
+    let generation = sqlx::query_scalar::<_, i64>(
+        "SELECT generation FROM config_admission_locks WHERE namespace = ?",
+    )
+    .bind(registry_key)
+    .fetch_one(&retried.pool())
+    .await
+    .unwrap();
+    assert!(
+        generation > 7,
+        "stealing an expired lease must bump the generation the pin verifies: {generation}"
+    );
+}
+
 /// A database that aborts the committing transaction as a serialization
 /// failure or deadlock victim (PostgreSQL `40001` / `40P01`, or MySQL's `40001`
 /// deadlock victim) committed nothing, so the endpoint must answer the

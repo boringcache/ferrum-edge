@@ -2066,10 +2066,20 @@ fn mongo_namespace_registry_plan_carries_the_whole_protected_set() {
 }
 
 /// The one-time compatibility backfill must serialize against live namespace
-/// CRUD on the same global registry admission key (issue #3955 review).
+/// CRUD on the same global registry admission key, and it must commit as ONE
+/// transaction (issue #3955 review).
+///
+/// Renewals bracketing an unbounded run of durable upserts are not a fence: the
+/// lease can lapse mid-run, another gateway can acquire it and commit a
+/// namespace delete, and a later upsert from the pre-delete name set resurrects
+/// that document. The second renewal only notices afterwards, and an absent
+/// marker does not undo a durable write.
 #[test]
 fn mongo_namespace_registry_backfill_holds_the_global_registry_lease() {
     let entry = mongo_method("backfill_namespaces_registry(");
+    let standalone_at = entry
+        .find("replica_set_configured()")
+        .expect("a topology with no transactions must be handled explicitly");
     let acquire_at = entry
         .find("try_acquire_namespace_config_admission_lease")
         .expect("the pass must take the global registry admission lease");
@@ -2079,6 +2089,10 @@ fn mongo_namespace_registry_backfill_holds_the_global_registry_lease() {
     let release_at = entry
         .find("release_namespace_config_admission_lease")
         .expect("the pass must release the lease");
+    assert!(
+        standalone_at < acquire_at,
+        "a standalone mongod must defer before taking the lease or writing anything:\n{entry}"
+    );
     assert!(
         acquire_at < under_at && under_at < release_at,
         "the lease must be held across the whole compatibility pass:\n{entry}"
@@ -2092,61 +2106,105 @@ fn mongo_namespace_registry_backfill_holds_the_global_registry_lease() {
         "the lease must be released on the error path too, without masking the failure:\n{entry}"
     );
 
-    let body = mongo_method("backfill_namespaces_registry_under_lease(");
-    let completed_at = body
-        .find("namespaces_registry_backfill_completed")
-        .expect("authoritative completion check under the lease");
-    let scan_at = body.find("distinct_namespaces").expect("derived-name scan");
-    let first_hold_at = body
-        .find("namespaces_registry_backfill_lease_still_held")
-        .expect("ownership re-proof before the upserts");
-    let upsert_at = body.find("namespaces()").expect("registry upserts");
-    let validate_at = body
-        .find("registry_namespace_names")
-        .expect("registry identity validation before completion");
-    let mark_at = body
-        .find("mark_namespaces_registry_backfill_complete")
-        .expect("completion mark");
-    let last_hold_at = body
-        .rfind("namespaces_registry_backfill_lease_still_held")
-        .expect("ownership re-proof before the marker");
+    let runner = mongo_method("backfill_namespaces_registry_under_lease(");
     assert!(
-        completed_at < scan_at && scan_at < first_hold_at && first_hold_at < upsert_at,
-        "ownership must be re-proved between the derived scan and the upserts:\n{body}"
+        runner.contains("start_transaction()")
+            && runner.contains("backfill_namespaces_registry_in_session("),
+        "the pass must commit as ONE transaction, not a sequence of unfenced upserts:\n{runner}"
     );
     assert!(
-        upsert_at < validate_at && validate_at < last_hold_at && last_hold_at < mark_at,
-        "ownership must be re-proved again immediately before the completion marker:\n{body}"
+        runner.contains("BatchAdmissionLeaseLost"),
+        "a lost lease must roll the pass back and defer to a later startup, not fail \
+         startup:\n{runner}"
     );
 
-    let renew = mongo_method("namespaces_registry_backfill_lease_still_held(");
     assert!(
-        renew.contains("renew_namespace_config_admission_lease")
-            && renew.contains("NAMESPACE_REGISTRY_ADMISSION_KEY"),
-        "ownership must be re-proved by a conditional server-clock renewal:\n{renew}"
+        !MONGO_STORE_SOURCE.contains("namespaces_registry_backfill_lease_still_held"),
+        "conditional renewals bracketing unbounded durable writes are not a fence and must not \
+         come back"
+    );
+}
+
+/// A standalone `mongod` has no multi-document transactions, so the pass writes
+/// nothing at all there rather than claiming a cross-process atomicity the
+/// topology does not have. `GET /namespaces` is the union of registry names and
+/// derived resource names, and namespace create/rename/delete already return
+/// `501` before mutating anything, so nothing observable changes.
+#[test]
+fn mongo_namespace_registry_backfill_writes_nothing_without_transactions() {
+    let entry = mongo_method("backfill_namespaces_registry(");
+    let guard_at = entry
+        .find("replica_set_configured()")
+        .expect("standalone guard");
+    let acquire_at = entry
+        .find("try_acquire_namespace_config_admission_lease")
+        .expect("lease acquisition");
+    assert!(
+        guard_at < acquire_at,
+        "the standalone guard must run before any lease or write:\n{entry}"
+    );
+    assert!(
+        !entry.contains("namespaces()"),
+        "the entry point must not upsert registry documents outside the transaction:\n{entry}"
+    );
+
+    let in_session = mongo_method("backfill_namespaces_registry_in_session(");
+    assert!(
+        in_session.contains(".session(&mut *session)"),
+        "every read and write of the pass must run inside the caller's transaction:\n{in_session}"
+    );
+    assert!(
+        !in_session.contains("self.distinct_namespaces(")
+            && !in_session.contains("self.registry_namespace_names("),
+        "the sessionless scan helpers would read outside the transaction snapshot:\n{in_session}"
+    );
+
+    let scan = mongo_method("distinct_namespaces_in_session(");
+    assert!(
+        scan.contains("$group") && !scan.contains(".distinct("),
+        "the in-transaction scan must use an aggregation; `distinct` is not accepted inside a \
+         transaction on every supported server:\n{scan}"
     );
 }
 
 #[test]
 fn mongo_namespace_registry_backfill_is_one_time_and_crash_retryable() {
-    let body = mongo_method("backfill_namespaces_registry(");
+    let entry = mongo_method("backfill_namespaces_registry(");
+    assert!(
+        entry.contains("namespaces_registry_backfill_completed()"),
+        "a completed backfill must short-circuit before acquiring anything:\n{entry}"
+    );
+
+    let body = mongo_method("backfill_namespaces_registry_in_session(");
     let completed_at = body
-        .find("namespaces_registry_backfill_completed")
-        .expect("completion check");
+        .find("namespaces_registry_backfill_completed_in_session")
+        .expect("authoritative completion check inside the transaction");
+    let scan_at = body
+        .find("distinct_namespaces_in_session")
+        .expect("derived-name scan");
     let insert_at = body.find("namespaces()").expect("registry upserts");
+    let validate_at = body
+        .find("registry_namespace_names_in_session")
+        .expect("registry identity validation before completion");
     let mark_at = body
         .find("mark_namespaces_registry_backfill_complete")
         .expect("completion mark");
+    let verify_at = body
+        .find("verify_namespace_config_admission_lease_in_session")
+        .expect("commit-boundary owner/generation lease proof");
     assert!(
-        completed_at < insert_at && insert_at < mark_at,
-        "a completed backfill must skip inserts; the marker must be written last so a crash retries:\n{body}"
+        completed_at < scan_at && scan_at < insert_at,
+        "the name set must be discovered inside the same transaction that makes it durable, so \
+         no delete can commit in between:\n{body}"
     );
-    let validate_at = body
-        .find("registry_namespace_names")
-        .expect("registry identity validation before completion");
     assert!(
         insert_at < validate_at && validate_at < mark_at,
         "a split registry identity must abort before the compatibility marker is durable:\n{body}"
+    );
+    assert!(
+        mark_at < verify_at,
+        "the marker must be written last, and the owner/generation lease proof must be the final \
+         gate before the commit:\n{body}"
     );
 
     let completed = mongo_method("namespaces_registry_backfill_completed(");

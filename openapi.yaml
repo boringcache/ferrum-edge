@@ -83,10 +83,16 @@ info:
     name resumes its prior `GET /audit` history for callers authorized for that
     name. Assign unrelated tenants fresh, previously unused names. The one-time
     connect/migrate compatibility backfill of pre-existing derived names takes
-    that same global registry lease, so it can never resurrect a namespace a
-    concurrent confirmed `DELETE` removed. Standalone MongoDB has
-    no multi-document transactions and therefore refuses these three operations
-    with `501` before mutating anything; `GET` remains available.
+    that same global registry lease and commits as one transaction — on SQL the
+    lease row is verified and locked (`FOR UPDATE`, or SQLite's writer lock)
+    before the derived-name scan and stays locked through the commit, so the
+    pass neither resurrects a namespace a concurrent confirmed `DELETE` removed
+    nor rolls itself back merely for outrunning the lease TTL. Standalone
+    MongoDB has no multi-document transactions and therefore refuses these
+    three operations with `501` before mutating anything, and for the same
+    reason the compatibility backfill writes nothing on that topology; `GET`
+    remains available and still returns the union of registry names and derived
+    resource names.
 
     ## Caching and read-only mode
 

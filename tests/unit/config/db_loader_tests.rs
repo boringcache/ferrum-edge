@@ -3777,6 +3777,9 @@ fn sql_namespace_registry_backfill_commits_once_and_verifies_its_lease() {
         .expect("backfill body");
 
     let begin_at = body.find("connection.begin()").expect("single transaction");
+    let pin_at = body
+        .find("pin_namespaces_registry_backfill_lease")
+        .expect("start-of-transaction lease pin");
     let completed_at = body
         .find("namespaces_registry_backfill_completed")
         .expect("authoritative completion check");
@@ -3789,8 +3792,9 @@ fn sql_namespace_registry_backfill_commits_once_and_verifies_its_lease() {
         .expect("commit-boundary lease verification");
     let commit_at = body.find("tx.commit()").expect("single commit");
     assert!(
-        begin_at < completed_at,
-        "the authoritative completion check must run inside the fenced transaction:\n{body}"
+        begin_at < pin_at && pin_at < completed_at,
+        "the lease row must be verified and locked as the FIRST statement of the transaction, \
+         before anything is read or written:\n{body}"
     );
     assert!(
         completed_at < insert_at,
@@ -3805,6 +3809,27 @@ fn sql_namespace_registry_backfill_commits_once_and_verifies_its_lease() {
         "the lease must be re-verified immediately before the single commit:\n{body}"
     );
 
+    let pin = source[source
+        .find("async fn pin_namespaces_registry_backfill_lease(")
+        .expect("lease pin helper")..]
+        .split("\n    /// Commit-boundary proof")
+        .next()
+        .expect("lease pin body");
+    assert!(
+        pin.contains("FOR UPDATE") && pin.contains("is_sqlite()"),
+        "the pin must take a real row lock on every dialect that has FOR UPDATE, with an \
+         explicit SQLite branch:\n{pin}"
+    );
+    assert!(
+        pin.contains("UPDATE config_admission_locks SET expires_at"),
+        "the SQLite branch must promote the transaction to a WRITE transaction so the single \
+         database writer lock excludes a competing acquisition:\n{pin}"
+    );
+    assert!(
+        pin.contains("generation = ?") && pin.contains("expires_at > {now}"),
+        "the pin must verify owner, generation, and database-clock expiry before locking:\n{pin}"
+    );
+
     let verify = source[source
         .find("async fn namespaces_registry_backfill_lease_held(")
         .expect("lease verification helper")..]
@@ -3813,10 +3838,19 @@ fn sql_namespace_registry_backfill_commits_once_and_verifies_its_lease() {
         .expect("lease verification body");
     assert!(
         verify.contains("FOR UPDATE") && verify.contains("is_sqlite()"),
-        "the lease row must be pinned until commit on every dialect that has FOR UPDATE:\n{verify}"
+        "the lease row must stay pinned through the commit on every dialect that has \
+         FOR UPDATE:\n{verify}"
     );
     assert!(
-        verify.contains("generation = ?") && verify.contains("expires_at >"),
-        "verification must check owner, generation, and database-clock expiry:\n{verify}"
+        verify.contains("owner = ?") && verify.contains("generation = ?"),
+        "the commit-boundary proof must still be owner- and generation-qualified:\n{verify}"
+    );
+    // Regression: an otherwise uncontended backfill that outruns the 120s lease
+    // TTL while the row is transactionally pinned must still commit. Re-testing
+    // `expires_at` here would roll it back and starve it on every retry.
+    assert!(
+        !verify.contains("expires_at"),
+        "elapsed wall time under the row pin is not lost ownership; the commit-boundary proof \
+         must not re-check the lease TTL:\n{verify}"
     );
 }

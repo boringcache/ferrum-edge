@@ -29,8 +29,15 @@
 //! derived names plus canonical `ferrum`, then durably records completion in
 //! [`SCHEMA_COMPAT_TABLE`]. That pass takes the SAME global
 //! [`NAMESPACE_REGISTRY_ADMISSION_KEY`] lease every live create/rename/delete
-//! takes, so a confirmed DELETE can never commit next to a backfill that
-//! already read the derived names and then resurrect the removed row. A failed
+//! takes AND commits as one transaction, so a confirmed DELETE can never commit
+//! next to a backfill that already read the derived names and then resurrect the
+//! removed row. Holding a lease is not enough on its own, because a lease can
+//! lapse mid-pass: SQL verifies and row-locks the lease before the derived-name
+//! scan and holds that lock through the commit, and MongoDB performs the
+//! discovery, the upserts, the identity validation, the marker, and the
+//! owner/generation lease proof in one transaction. A standalone `mongod` has
+//! no transactions and already refuses every registry mutation, so the pass is
+//! deferred there rather than writing rows it cannot fence. A failed
 //! attempt leaves that marker absent so a later startup retries. Once complete,
 //! later compatibility passes do not reseed deleted names or materialize newer
 //! derived-only names. The marker is not a registry row and never appears in
