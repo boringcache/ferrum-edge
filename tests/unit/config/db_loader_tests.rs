@@ -2390,7 +2390,9 @@ async fn list_namespaces_paginated_insert_after_cursor_keeps_pages_stable() {
     let remainder: Vec<&str> = second.items.iter().map(String::as_str).collect();
     assert_eq!(
         remainder[..7],
-        ["ns-03", "ns-04", "ns-05", "ns-06", "ns-07", "ns-08", "ns-09"],
+        [
+            "ns-03", "ns-04", "ns-05", "ns-06", "ns-07", "ns-08", "ns-09"
+        ],
         "rows after the cursor keep their relative order; new inserts append"
     );
     assert!(
@@ -2433,10 +2435,7 @@ async fn list_namespaces_paginated_includes_trust_bundle_only_namespace() {
 
     let page = store.list_namespaces_paginated(100, 0).await.unwrap();
     assert_eq!(page.total, 4);
-    assert_eq!(
-        page.items,
-        vec!["alpha", "ferrum", "middle-trust", "zeta"]
-    );
+    assert_eq!(page.items, vec!["alpha", "ferrum", "middle-trust", "zeta"]);
 
     // Paginate so the trust-only name is not on the first page, proving the
     // count and ordered union both include gateway_trust_bundles.

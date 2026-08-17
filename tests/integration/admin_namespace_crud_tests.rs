@@ -361,16 +361,12 @@ async fn rename_moves_resources_and_rejects_target_collision() {
     .await;
     assert_eq!(status, 200, "new name exists: {body:?}");
 
-    let (status, body) = send(
-        reqwest::Method::GET,
-        &base,
-        "/upstreams/up-a",
-        &token,
-        None,
-    )
-    .await;
+    let (status, body) = send(reqwest::Method::GET, &base, "/upstreams/up-a", &token, None).await;
     // Default X-Ferrum-Namespace is ferrum; the moved upstream lives in tenant-b.
-    assert_eq!(status, 404, "upstream is not in default namespace: {body:?}");
+    assert_eq!(
+        status, 404,
+        "upstream is not in default namespace: {body:?}"
+    );
 
     let response = reqwest::Client::new()
         .get(format!("{base}/upstreams/up-a"))

@@ -7873,12 +7873,13 @@ impl DatabaseStore {
         name: &str,
     ) -> Result<Option<crate::config::namespace_registry::NamespaceRecord>, anyhow::Error> {
         let pool = self.pool();
-        let row = sqlx::query(&self.q(
-            "SELECT name, description, created_at, updated_at FROM namespaces WHERE name = ?",
-        ))
-        .bind(name)
-        .fetch_optional(&pool)
-        .await?;
+        let row =
+            sqlx::query(&self.q(
+                "SELECT name, description, created_at, updated_at FROM namespaces WHERE name = ?",
+            ))
+            .bind(name)
+            .fetch_optional(&pool)
+            .await?;
         let Some(row) = row else {
             return Ok(None);
         };
@@ -7916,8 +7917,7 @@ impl DatabaseStore {
 
     pub async fn namespace_name_in_use(&self, name: &str) -> Result<bool, anyhow::Error> {
         let pool = self.pool();
-        let sql = self.q(
-            "SELECT 1 AS present FROM ( \
+        let sql = self.q("SELECT 1 AS present FROM ( \
              SELECT name FROM namespaces WHERE name = ? \
              UNION SELECT namespace FROM proxies WHERE namespace = ? \
              UNION SELECT namespace FROM consumers WHERE namespace = ? \
@@ -7925,8 +7925,7 @@ impl DatabaseStore {
              UNION SELECT namespace FROM upstreams WHERE namespace = ? \
              UNION SELECT namespace FROM gateway_trust_bundles WHERE namespace = ? \
              UNION SELECT namespace FROM api_specs WHERE namespace = ? \
-             ) AS ferrum_ns_in_use LIMIT 1",
-        );
+             ) AS ferrum_ns_in_use LIMIT 1");
         let row = sqlx::query(&sql)
             .bind(name)
             .bind(name)
@@ -8015,9 +8014,9 @@ impl DatabaseStore {
         if new_name == current_name {
             self.ensure_namespace_registry_row(current_name, &record, &now_rfc)
                 .await?;
-            sqlx::query(&self.q(
-                "UPDATE namespaces SET description = ?, updated_at = ? WHERE name = ?",
-            ))
+            sqlx::query(
+                &self.q("UPDATE namespaces SET description = ?, updated_at = ? WHERE name = ?"),
+            )
             .bind(&record.description)
             .bind(&now_rfc)
             .bind(current_name)
@@ -8088,16 +8087,16 @@ impl DatabaseStore {
             new_name,
         )
         .await?;
-        sqlx::query(&self.q(
-            "UPDATE consumer_credential_index SET namespace = ? WHERE namespace = ?",
-        ))
+        sqlx::query(
+            &self.q("UPDATE consumer_credential_index SET namespace = ? WHERE namespace = ?"),
+        )
         .bind(new_name)
         .bind(current_name)
         .execute(&mut *tx)
         .await?;
-        sqlx::query(&self.q(
-            "UPDATE consumer_identity_index SET namespace = ? WHERE namespace = ?",
-        ))
+        sqlx::query(
+            &self.q("UPDATE consumer_identity_index SET namespace = ? WHERE namespace = ?"),
+        )
         .bind(new_name)
         .bind(current_name)
         .execute(&mut *tx)
@@ -8246,11 +8245,7 @@ impl DatabaseStore {
         Ok(())
     }
 
-    pub async fn delete_namespace(
-        &self,
-        name: &str,
-        cascade: bool,
-    ) -> Result<bool, anyhow::Error> {
+    pub async fn delete_namespace(&self, name: &str, cascade: bool) -> Result<bool, anyhow::Error> {
         if !self.namespace_name_in_use(name).await? {
             return Ok(false);
         }
@@ -8265,9 +8260,7 @@ impl DatabaseStore {
             self.delete_all_resources(name, &BatchConfigWriteMode::Admission)
                 .await?;
             if let Some(bundle) = self.get_namespace_gateway_trust_bundle(name).await? {
-                let _ = self
-                    .delete_gateway_trust_bundle(name, &bundle.id)
-                    .await?;
+                let _ = self.delete_gateway_trust_bundle(name, &bundle.id).await?;
             }
         }
         let result = sqlx::query(&self.q("DELETE FROM namespaces WHERE name = ?"))

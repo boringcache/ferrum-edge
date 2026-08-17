@@ -9246,13 +9246,17 @@ async fn handle_get_namespace(
             &json!({"error": format!("Invalid namespace name: {e}")}),
         ));
     }
-    if let Some(resp) = maybe_enforce_namespace_claim(state, auth, name, &format!("/namespaces/{name}"))
+    if let Some(resp) =
+        maybe_enforce_namespace_claim(state, auth, name, &format!("/namespaces/{name}"))
     {
         return Ok(resp);
     }
     if let Some(ref db) = state.db {
         match resolve_namespace_record(db.as_ref(), name).await {
-            Ok(Some(record)) => Ok(json_response(StatusCode::OK, &serde_json::to_value(&record).unwrap_or_else(|_| json!({})))),
+            Ok(Some(record)) => Ok(json_response(
+                StatusCode::OK,
+                &serde_json::to_value(&record).unwrap_or_else(|_| json!({})),
+            )),
             Ok(None) => Ok(json_response(
                 StatusCode::NOT_FOUND,
                 &json!({"error": format!("namespace '{name}' not found")}),
@@ -9263,7 +9267,11 @@ async fn handle_get_namespace(
             )),
         }
     } else if let Some(config) = state.cached_gateway_config() {
-        if config.known_namespaces.iter().any(|existing| existing == name) {
+        if config
+            .known_namespaces
+            .iter()
+            .any(|existing| existing == name)
+        {
             Ok(json_response(
                 StatusCode::OK,
                 &serde_json::to_value(synthesized_namespace_record(name))
@@ -9313,19 +9321,14 @@ async fn handle_create_namespace(
             &json!({"error": format!("Invalid namespace name: {e}")}),
         ));
     }
-    let description = match crate::config::namespace_registry::normalize_description(request.description)
-    {
-        Ok(description) => description,
-        Err(e) => {
-            return Ok(json_response(
-                StatusCode::BAD_REQUEST,
-                &json!({"error": e}),
-            ));
-        }
-    };
-    if let Some(resp) =
-        maybe_enforce_namespace_claim(state, actor, &request.name, "/namespaces")
-    {
+    let description =
+        match crate::config::namespace_registry::normalize_description(request.description) {
+            Ok(description) => description,
+            Err(e) => {
+                return Ok(json_response(StatusCode::BAD_REQUEST, &json!({"error": e})));
+            }
+        };
+    if let Some(resp) = maybe_enforce_namespace_claim(state, actor, &request.name, "/namespaces") {
         return Ok(resp);
     }
     let db = match require_db(state) {
@@ -9399,14 +9402,21 @@ async fn handle_update_namespace(
         }
         None => current_name.to_string(),
     };
-    if let Some(resp) =
-        maybe_enforce_namespace_claim(state, actor, current_name, &format!("/namespaces/{current_name}"))
-    {
+    if let Some(resp) = maybe_enforce_namespace_claim(
+        state,
+        actor,
+        current_name,
+        &format!("/namespaces/{current_name}"),
+    ) {
         return Ok(resp);
     }
     if new_name != current_name
-        && let Some(resp) =
-            maybe_enforce_namespace_claim(state, actor, &new_name, &format!("/namespaces/{current_name}"))
+        && let Some(resp) = maybe_enforce_namespace_claim(
+            state,
+            actor,
+            &new_name,
+            &format!("/namespaces/{current_name}"),
+        )
     {
         return Ok(resp);
     }
@@ -9484,7 +9494,8 @@ async fn handle_delete_namespace(
             &json!({"error": format!("Invalid namespace name: {e}")}),
         ));
     }
-    if let Some(resp) = maybe_enforce_namespace_claim(state, actor, name, &format!("/namespaces/{name}"))
+    if let Some(resp) =
+        maybe_enforce_namespace_claim(state, actor, name, &format!("/namespaces/{name}"))
     {
         return Ok(resp);
     }
@@ -10113,7 +10124,11 @@ mod tests {
             role: AdminRole::Viewer,
             allowed_namespaces: allowed,
         };
-        let names = vec!["alpha".to_string(), "ferrum".to_string(), "zeta".to_string()];
+        let names = vec![
+            "alpha".to_string(),
+            "ferrum".to_string(),
+            "zeta".to_string(),
+        ];
 
         assert_eq!(
             filter_listed_namespaces(false, &actor(AllowedNamespaces::empty()), names.clone()),

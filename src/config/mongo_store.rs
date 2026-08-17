@@ -11302,10 +11302,7 @@ mod inner {
             name: &str,
         ) -> Result<Option<crate::config::namespace_registry::NamespaceRecord>, anyhow::Error>
         {
-            let doc = self
-                .namespaces()
-                .find_one(doc! { "_id": name })
-                .await?;
+            let doc = self.namespaces().find_one(doc! { "_id": name }).await?;
             Ok(doc.map(|doc| self.document_to_namespace_record(name, doc)))
         }
 
@@ -14122,9 +14119,7 @@ mod inner {
             new_name: &str,
         ) -> Result<(), anyhow::Error> {
             let collection = self.collection(collection_name);
-            let mut cursor = collection
-                .find(doc! { "namespace": current_name })
-                .await?;
+            let mut cursor = collection.find(doc! { "namespace": current_name }).await?;
             while cursor.advance().await? {
                 let mut doc = cursor.deserialize_current()?;
                 let old_id = doc

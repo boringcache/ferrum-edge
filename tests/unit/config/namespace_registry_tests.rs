@@ -1,8 +1,8 @@
 //! Unit coverage for the first-class namespace registry helpers (issue #3955).
 
 use ferrum_edge::config::namespace_registry::{
-    CreateNamespaceRequest, UpdateNamespaceBody, normalize_description, process_default_namespace,
-    validate_namespace_name, MAX_NAMESPACE_DESCRIPTION_LENGTH,
+    CreateNamespaceRequest, MAX_NAMESPACE_DESCRIPTION_LENGTH, UpdateNamespaceBody,
+    normalize_description, process_default_namespace, validate_namespace_name,
 };
 use ferrum_edge::config::types::DEFAULT_NAMESPACE;
 
