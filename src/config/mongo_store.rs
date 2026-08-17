@@ -5808,7 +5808,8 @@ mod inner {
                         document.get_str(suffix_field).ok(),
                     )
                     .map_err(mongodb::error::Error::custom)?;
-                    validated.push((old_id, suffix.to_string()));
+                    let suffix = suffix.to_string();
+                    validated.push((old_id, suffix));
                 }
             }
             Ok(validated)
