@@ -1,12 +1,12 @@
 //! Unit coverage for the first-class namespace registry helpers (issue #3955).
 
 use ferrum_edge::config::namespace_registry::{
-    CreateNamespaceRequest, MAX_NAMESPACE_DESCRIPTION_CHARS, NAMESPACE_REGISTRY_ADMISSION_KEY,
-    NamespaceRegistryCorrupt, UpdateNamespaceBody, mtls_dns_admission_namespaces,
-    namespace_prefixed_id_suffix_field, normalize_description, parse_namespace_rfc3339,
-    require_canonical_stored_description, require_namespace_identity,
-    require_namespace_keyed_embedded_namespace, require_namespace_prefixed_identity,
-    validate_namespace_name,
+    CreateNamespaceRequest, MAX_NAMESPACE_DESCRIPTION_CHARS, NAMESPACE_OCCUPANCY_TABLES,
+    NAMESPACE_REGISTRY_ADMISSION_KEY, NAMESPACE_RENAME_SIMPLE_TABLES, NamespaceRegistryCorrupt,
+    UpdateNamespaceBody, mtls_dns_admission_namespaces, namespace_prefixed_id_suffix_field,
+    normalize_description, parse_namespace_rfc3339, require_canonical_stored_description,
+    require_namespace_identity, require_namespace_keyed_embedded_namespace,
+    require_namespace_prefixed_identity, validate_namespace_name,
 };
 
 #[test]
@@ -394,4 +394,28 @@ fn require_namespace_keyed_embedded_namespace_is_strict() {
             "stored namespace must not leak: {text}"
         );
     }
+}
+
+#[test]
+fn namespace_rename_simple_tables_cover_live_resources_and_exclude_audit_history() {
+    // In-place SQL rename rewrites live resource rows. Historical audit
+    // evidence is immutable and must keep the namespace recorded at event time.
+    assert_eq!(
+        NAMESPACE_RENAME_SIMPLE_TABLES,
+        &["proxies", "plugin_configs", "upstreams", "api_specs"]
+    );
+    assert!(
+        !NAMESPACE_RENAME_SIMPLE_TABLES.contains(&"audit_events"),
+        "audit_events must not be rewritten on rename"
+    );
+    for live in ["proxies", "plugin_configs", "upstreams", "api_specs"] {
+        assert!(
+            NAMESPACE_RENAME_SIMPLE_TABLES.contains(&live),
+            "{live} must still move with the tenant"
+        );
+    }
+    // Occupancy still treats API specs as live tenant metadata, and still
+    // excludes audit history so leftover events cannot block DELETE.
+    assert!(NAMESPACE_OCCUPANCY_TABLES.contains(&"api_specs"));
+    assert!(!NAMESPACE_OCCUPANCY_TABLES.contains(&"audit_events"));
 }

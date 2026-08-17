@@ -5767,15 +5767,18 @@ paths:
       description: |
         Updates the optional description and/or renames the tenant.
 
-        A rename rewrites the registry row, every resource `namespace` column
-        (proxies, consumers, plugin configs, upstreams, gateway trust
-        bundles, API specs, audit events, and the consumer identity/credential
-        indexes) and the polling change-log tombstones in ONE database
-        transaction, under the global namespace-registry admission lease plus
-        the source and target namespace leases. Those lease identities are
-        re-verified inside the committing transaction, so a lost lease aborts
-        with nothing applied (`503`). Rename also holds both the source and
-        target mTLS DNS admission fences (sorted, de-duplicated) and fails
+        A rename rewrites the registry row, every live resource `namespace`
+        column (proxies, consumers, plugin configs, upstreams, gateway trust
+        bundles, API specs, and the consumer identity/credential indexes) and
+        the polling change-log tombstones in ONE database transaction, under
+        the global namespace-registry admission lease plus the source and
+        target namespace leases. Those lease identities are re-verified inside
+        the committing transaction, so a lost lease aborts with nothing applied
+        (`503`). Historical `audit_events` rows are immutable evidence and are
+        not rewritten: they retain the namespace identity recorded when the
+        event occurred. The rename itself may emit a new audit event under the
+        new name with a before/after diff. Rename also holds both the source
+        and target mTLS DNS admission fences (sorted, de-duplicated) and fails
         closed if either has a restore owner; a description-only update holds
         the current name's fence. A namespace that exists only because a
         resource was written under it (no registry row) is materialized by the

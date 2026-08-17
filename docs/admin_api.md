@@ -424,7 +424,8 @@ Create, rename, and delete are serialized across gateway processes by a **global
 
 Every precondition that can race is evaluated inside that transaction, not by an earlier query: source existence, target vacancy, occupancy, protection of the configured namespace, and the last-remaining-namespace invariant. Handler prechecks exist only to produce better messages.
 
-- Rename rewrites the registry row, every resource `namespace` column, the consumer identity/credential indexes, the gateway trust bundle, and the polling change-log tombstones in that one transaction. Stale route-bucket lock rows under the old name are removed; the admission lease rows proving the mutation are never touched. Rename also holds both the source and target mTLS DNS admission fences (sorted and de-duplicated) and fails closed if either has a restore owner; a description-only update holds the current name's fence.
+- Rename rewrites the registry row, every live resource `namespace` column (proxies, consumers, plugin configs, upstreams, gateway trust bundles, API specs), the consumer identity/credential indexes, and the polling change-log tombstones in that one transaction. Stale route-bucket lock rows under the old name are removed; the admission lease rows proving the mutation are never touched. Rename also holds both the source and target mTLS DNS admission fences (sorted and de-duplicated) and fails closed if either has a restore owner; a description-only update holds the current name's fence.
+- Historical `audit_events` rows are immutable evidence and are **not** rewritten: they retain the namespace identity recorded when the event occurred. `GET /audit` is namespace-scoped, so those events remain queryable under the original name (including if that name is later reused). The rename itself may still emit a new audit event under the new name with a before/after diff.
 - Delete does not cascade by default; `?confirm=true` cascade-deletes occupancy resources (proxies, consumers, plugin configs, upstreams, API specs, the gateway trust bundle, the consumer indexes, and the tenant's route-bucket lock rows) and then the registry row.
 - Change-log tombstones and the namespace's change-log retention floor are deliberately **retained** after a rename or delete so a gateway still polling the old name converges instead of serving stale configuration.
 - The namespace this gateway is configured to serve (`FERRUM_NAMESPACE`, default `ferrum`) cannot be deleted **or renamed away** — a rename is semantically a removal of the old name. A description-only update of it is allowed. The value comes from the resolved startup configuration (CLI > env > conf file > default), never from a request-time environment read.
@@ -905,7 +906,10 @@ no durable audit evidence.
   no-op assignment that mutates no column, not `INSERT IGNORE`, which would also
   downgrade unrelated errors; MongoDB `insert_one` with a duplicate key treated
   as success). A duplicate delivery of the same id is success, never
-  replacement: an `audit_events` row is immutable. The MongoDB path is a
+  replacement: an `audit_events` row is immutable. Namespace rename does not
+  rewrite historical `audit_events.namespace` values; those rows retain the
+  tenant identity recorded when the event occurred, and a later reuse of the
+  old name still serves that history under `GET /audit`. The MongoDB path is a
   single-document write, so it needs no multi-document transaction and works on
   standalone deployments.
 - **Unrecoverable evidence is retained, not dropped.** After the attempt budget

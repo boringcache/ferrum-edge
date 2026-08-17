@@ -329,18 +329,21 @@ validation rejects on every subsequent polling cycle until manually cleaned up.
 
 Namespace registry CRUD (`POST /namespaces`, `PUT /namespaces/{name}`,
 `DELETE /namespaces/{name}`, issue #3955) has the same requirement. A rename or
-confirmed cascade delete spans the registry document, every resource document,
-the consumer identity index, the gateway trust bundle, the tenant's route-bucket
-lock documents, and the polling change records; and every registry mutation
-re-verifies its namespace-admission leases *inside* the committing transaction
-so a lost or stolen lease can never produce a durable write. Last-remaining
-protection is a remaining **registry document**, not the GET union of derived
-resource names: ordinary resource CRUD is not serialized by the global registry
-lease and does not insert registry documents. Neither guarantee
-is available on a standalone `mongod`, so all three write operations return
-`501 Not Implemented` before touching anything and name `FERRUM_MONGO_REPLICA_SET`
-(or the `replicaSet` URL option) as the remediation. `GET /namespaces` and
-`GET /namespaces/{name}` remain available, and SQL backends are unaffected.
+confirmed cascade delete spans the registry document, every live resource
+document, the consumer identity index, the gateway trust bundle, the tenant's
+route-bucket lock documents, and the polling change records; and every registry
+mutation re-verifies its namespace-admission leases *inside* the committing
+transaction so a lost or stolen lease can never produce a durable write.
+Historical `audit_events` documents are immutable evidence and are **not**
+bulk-rewritten on rename: they retain the namespace recorded when the event
+occurred. Last-remaining protection is a remaining **registry document**, not
+the GET union of derived resource names: ordinary resource CRUD is not
+serialized by the global registry lease and does not insert registry documents.
+Neither guarantee is available on a standalone `mongod`, so all three write
+operations return `501 Not Implemented` before touching anything and name
+`FERRUM_MONGO_REPLICA_SET` (or the `replicaSet` URL option) as the remediation.
+`GET /namespaces` and `GET /namespaces/{name}` remain available, and SQL
+backends are unaffected.
 
 A direct `DELETE /proxies/{id}` for an API-spec-owned proxy is different: its
 ownership cascade spans the proxy, scoped plugins, the `api_specs` owner

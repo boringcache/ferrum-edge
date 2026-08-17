@@ -203,12 +203,16 @@ pub const NAMESPACE_OCCUPANCY_TABLES: &[&str] = &[
 /// rename writes `delete` tombstones under the OLD name so pollers of the old
 /// namespace converge, and those tombstones need the old name's history and
 /// retention floor to stay where they are.
+///
+/// `audit_events` is also absent: historical audit rows are immutable evidence
+/// and must retain the namespace identity recorded when the event occurred. The
+/// rename mutation may still enqueue a new audit event under the new name with
+/// a before/after diff; prior rows stay put.
 pub const NAMESPACE_RENAME_SIMPLE_TABLES: &[&str] = &[
     "proxies",
     "plugin_configs",
     "upstreams",
     "api_specs",
-    "audit_events",
 ];
 
 /// One canonical trim/length rule for `description`, shared by create and

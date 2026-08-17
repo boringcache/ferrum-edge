@@ -1593,6 +1593,22 @@ fn namespace_prefixed_id_rewrite_requires_suffix_field_and_embedded_namespace() 
 }
 
 #[test]
+fn mongo_namespace_rename_does_not_rewrite_historical_audit_events() {
+    let rename = mongo_method("rename_namespace_documents_in_session(");
+    for collection in ["proxies", "plugin_configs", "upstreams", "api_specs"] {
+        assert!(
+            rename.contains(&format!("\"{collection}\"")),
+            "in-place Mongo rename must still rewrite live collection {collection}:\n{rename}"
+        );
+    }
+    assert!(
+        !rename.contains("self.audit_events()"),
+        "historical audit_events must retain the namespace recorded at event time; \
+         the rename may still enqueue a new event under the new name after commit:\n{rename}"
+    );
+}
+
+#[test]
 fn namespace_keyed_document_move_requires_embedded_namespace_equality() {
     let body = mongo_method("move_namespace_keyed_document_in_session(");
     assert!(

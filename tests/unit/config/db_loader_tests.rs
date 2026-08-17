@@ -3357,6 +3357,34 @@ fn last_remaining_sql_is_registry_row_authority_not_the_get_union() {
 }
 
 #[test]
+fn sql_namespace_rename_does_not_rewrite_historical_audit_events() {
+    let source = include_str!("../../../src/config/db_loader.rs");
+    let start = source
+        .find("async fn rename_namespace_in_tx(")
+        .expect("rename_namespace_in_tx");
+    let body = source[start..]
+        .split("async fn delete_namespace_guard_rows_tx(")
+        .next()
+        .expect("rename_namespace_in_tx body");
+    assert!(
+        body.contains("NAMESPACE_RENAME_SIMPLE_TABLES"),
+        "in-place SQL rename must still walk the live resource table plan:\n{body}"
+    );
+    assert!(
+        !body.contains("UPDATE audit_events")
+            && !body.contains("\"audit_events\"")
+            && !body.contains("'audit_events'"),
+        "historical audit_events must retain the namespace recorded at event time:\n{body}"
+    );
+    for table in ["proxies", "plugin_configs", "upstreams", "api_specs"] {
+        assert!(
+            body.contains("NAMESPACE_RENAME_SIMPLE_TABLES") || body.contains(table),
+            "rename must still cover live resource table {table}:\n{body}"
+        );
+    }
+}
+
+#[test]
 fn sql_namespace_rename_locks_source_and_target_mtls_dns_fences_in_order() {
     let source = include_str!("../../../src/config/db_loader.rs");
     let start = source

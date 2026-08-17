@@ -1,18 +1,19 @@
 //! Admin API first-class namespace CRUD (issue #3955).
 //!
 //! Covers create/get/list, malformed update bodies, Unicode description
-//! bounds, rename (resources move, target collision, derived-only tenants),
-//! delete (empty, occupied, confirmed cascade over every occupancy and
-//! ancillary surface), protection of the effective configured namespace from
-//! both delete and rename-away, the last-remaining-namespace invariant under
-//! concurrent deletes, commit-boundary lease loss, late-step rollback, and
-//! file-mode 403s.
+//! bounds, rename (resources move, target collision, derived-only tenants,
+//! historical audit namespace retained), delete (empty, occupied, confirmed
+//! cascade over every occupancy and ancillary surface), protection of the
+//! effective configured namespace from both delete and rename-away, the
+//! last-remaining-namespace invariant under concurrent deletes, commit-boundary
+//! lease loss, late-step rollback, and file-mode 403s.
 
 use arc_swap::ArcSwap;
 use chrono::Utc;
 use ferrum_edge::_test_support::lock_namespace_registry_admission_for_test;
 use ferrum_edge::admin::{
     AdminState,
+    audit::{AuditEvent, AuditListFilter},
     jwt_auth::{JwtConfig, JwtManager},
     serve_admin_on_listener,
 };
@@ -1388,6 +1389,107 @@ async fn store_create_rename_delete_round_trip() {
     );
     drop(admission);
     assert!(!store.namespace_name_in_use("renamed").await.unwrap());
+}
+
+#[tokio::test]
+async fn namespace_rename_retains_historical_audit_namespace() {
+    let dir = TempDir::new().unwrap();
+    let store = Arc::new(make_store(&dir).await);
+    let db: Arc<dyn DatabaseBackend> = store.clone();
+    let now = Utc::now();
+    let record = ferrum_edge::config::namespace_registry::NamespaceRecord::new(
+        "hist-a".to_string(),
+        None,
+        now,
+    );
+
+    let admission = lock_namespace_registry_admission_for_test(db.clone(), &["hist-a"])
+        .await
+        .expect("registry admission");
+    store
+        .create_namespace(&record, &admission.holds())
+        .await
+        .unwrap();
+    drop(admission);
+
+    seed_upstream(&store, "hist-a", "up-hist").await;
+    store
+        .insert_audit_event(&AuditEvent {
+            id: "hist-event-1".to_string(),
+            ts: now,
+            actor: "namespace-admin".to_string(),
+            action: "update".to_string(),
+            resource_type: "upstream".to_string(),
+            resource_id: "up-hist".to_string(),
+            namespace: "hist-a".to_string(),
+            source_address: String::new(),
+            request_id: String::new(),
+            outcome: "success".to_string(),
+            diff: json!({ "after": { "id": "up-hist" } }),
+        })
+        .await
+        .unwrap();
+
+    let admission = lock_namespace_registry_admission_for_test(db.clone(), &["hist-a", "hist-b"])
+        .await
+        .expect("registry admission");
+    store
+        .update_namespace("hist-a", "hist-b", None, &admission.holds())
+        .await
+        .unwrap();
+    drop(admission);
+
+    assert_eq!(
+        count_rows(
+            &store,
+            "SELECT COUNT(*) FROM upstreams WHERE namespace = ?",
+            "hist-a"
+        )
+        .await,
+        0,
+        "live resource rows must move with the tenant"
+    );
+    assert_eq!(
+        count_rows(
+            &store,
+            "SELECT COUNT(*) FROM upstreams WHERE namespace = ?",
+            "hist-b"
+        )
+        .await,
+        1,
+        "live resource rows must land under the new name"
+    );
+
+    let historical = store
+        .list_audit_events(
+            "hist-a",
+            &AuditListFilter {
+                limit: 50,
+                offset: 0,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(historical.total, 1, "prior audit rows stay under hist-a");
+    assert_eq!(historical.items[0].id, "hist-event-1");
+    assert_eq!(historical.items[0].namespace, "hist-a");
+
+    let renamed = store
+        .list_audit_events(
+            "hist-b",
+            &AuditListFilter {
+                limit: 50,
+                offset: 0,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        renamed.total, 0,
+        "rename must not rewrite historical audit_events onto the new name"
+    );
 }
 
 #[tokio::test]
