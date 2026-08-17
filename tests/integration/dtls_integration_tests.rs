@@ -1096,6 +1096,11 @@ struct Dtls12ClientOutcome {
     /// that never reaches `Connected` must still surface this so a silent
     /// `handle_packet` error cannot be mistaken for a timeout.
     transport_error: Option<String>,
+    /// How many datagrams this client received from the server. Without it, a
+    /// listener that never answered and a listener that answered and then went
+    /// silent are indistinguishable in the failure message: both are
+    /// `connected == false, transport_error == None`.
+    server_datagrams: usize,
 }
 
 /// Drive a raw dimpl **DTLS 1.2** client presenting `certificate`.
@@ -1132,9 +1137,13 @@ async fn dtls12_client_handshake_on(
     budget: Duration,
     payload: Option<&[u8]>,
 ) -> Result<Dtls12ClientOutcome, anyhow::Error> {
+    // `use_server_cookie` is a SERVER-side knob (`dimpl::dtls12::server` /
+    // `dtls13::server` are its only readers), so setting it here never changed
+    // this client and only obscured which side of the fixture owned the cookie
+    // exchange. The client drives whatever the listener asks for, exactly as
+    // `openssl s_client -dtls1_2` does in the hosted NodeWaypoint probe.
     let config = Arc::new(
         dimpl::Config::builder()
-            .use_server_cookie(false)
             .build()
             .expect("build DTLS 1.2 client config"),
     );
@@ -1147,6 +1156,7 @@ async fn dtls12_client_handshake_on(
     let mut next_timeout = None;
     let mut connected = false;
     let mut received = None;
+    let mut server_datagrams = 0usize;
 
     drain_dtls_client_outputs(
         &mut client,
@@ -1171,6 +1181,7 @@ async fn dtls12_client_handshake_on(
         tokio::select! {
             result = socket.recv(&mut udp_buf) => {
                 let len = result?;
+                server_datagrams += 1;
                 if let Err(e) = client.handle_packet(&udp_buf[..len]) {
                     transport_error = Some(e.to_string());
                     transport_ended = true;
@@ -1205,6 +1216,7 @@ async fn dtls12_client_handshake_on(
             connected: false,
             echo: None,
             transport_error,
+            server_datagrams,
         });
     }
 
@@ -1213,6 +1225,7 @@ async fn dtls12_client_handshake_on(
             connected: true,
             echo: None,
             transport_error: None,
+            server_datagrams,
         });
     };
 
@@ -1238,6 +1251,7 @@ async fn dtls12_client_handshake_on(
         tokio::select! {
             result = socket.recv(&mut udp_buf) => {
                 let len = result?;
+                server_datagrams += 1;
                 client.handle_packet(&udp_buf[..len])?;
             }
             _ = tokio::time::sleep(sleep_dur) => {
@@ -1265,6 +1279,7 @@ async fn dtls12_client_handshake_on(
         connected: true,
         echo: received,
         transport_error: None,
+        server_datagrams,
     })
 }
 
@@ -1315,11 +1330,23 @@ async fn test_frontend_dtls_refuses_untrusted_client_without_completing_the_hand
 
     let server_cert =
         dimpl::certificate::generate_self_signed_certificate().expect("generate server cert");
+    // Exactly the posture `dtls::build_frontend_dtls_config` produces for a
+    // listener with a client CA: `require_client_certificate(true)` on top of
+    // the builder defaults. The HelloVerifyRequest cookie exchange must NOT be
+    // disabled here. It is not cosmetic — it is the only frontend DTLS server
+    // configuration Ferrum ships, and it is what the hosted NodeWaypoint live
+    // gate handshakes against with `openssl s_client -dtls1_2` and a current-CA
+    // client certificate. Turning it off put this fixture on dimpl's
+    // auto-sense DTLS 1.2 FALLBACK path in a cookie-less, certificate-
+    // authenticated combination that neither Ferrum nor dimpl exercises
+    // anywhere else: the accepted control then never received the server's
+    // final flight, so it reported `connected == false` with no transport
+    // error, and the refusal assertions above passed vacuously because a
+    // listener that answers nothing also refuses everything.
     let frontend_config = ferrum_edge::dtls::FrontendDtlsConfig {
         dimpl_config: Arc::new(
             dimpl::Config::builder()
                 .require_client_certificate(true)
-                .use_server_cookie(false)
                 .build()
                 .expect("build frontend DTLS config"),
         ),
@@ -1394,6 +1421,16 @@ async fn test_frontend_dtls_refuses_untrusted_client_without_completing_the_hand
         0,
         "a refused handshake must never be delivered through accept()"
     );
+    // A listener that answered nothing at all would satisfy every assertion
+    // above without refusing anything. The refusal is only meaningful if this
+    // peer actually reached the certificate stage, which means it received the
+    // server's earlier flights first.
+    assert!(
+        refused.server_datagrams > 0,
+        "the refused peer must have been answered up to the certificate stage; a silent \
+         listener makes the refusal assertions vacuous (transport_error={:?})",
+        refused.transport_error
+    );
 
     let admitted = dtls12_client_handshake_on(
         accepted_socket,
@@ -1406,8 +1443,8 @@ async fn test_frontend_dtls_refuses_untrusted_client_without_completing_the_hand
     assert!(
         admitted.connected,
         "a certificate from the currently accepted client CA must still complete the \
-         handshake (transport_error={:?})",
-        admitted.transport_error
+         handshake (transport_error={:?}, server_datagrams={})",
+        admitted.transport_error, admitted.server_datagrams
     );
     assert_eq!(
         admitted.echo.as_deref(),

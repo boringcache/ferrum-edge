@@ -1051,12 +1051,10 @@ fn dtls_datagram_opens_session(data: &[u8]) -> bool {
     if handshake[0] != 0x01 {
         return false;
     }
-    let fragment_offset = ((handshake[6] as usize) << 16)
-        | ((handshake[7] as usize) << 8)
-        | (handshake[8] as usize);
-    let message_len = ((handshake[1] as usize) << 16)
-        | ((handshake[2] as usize) << 8)
-        | (handshake[3] as usize);
+    let fragment_offset =
+        ((handshake[6] as usize) << 16) | ((handshake[7] as usize) << 8) | (handshake[8] as usize);
+    let message_len =
+        ((handshake[1] as usize) << 16) | ((handshake[2] as usize) << 8) | (handshake[3] as usize);
     let fragment_len = ((handshake[9] as usize) << 16)
         | ((handshake[10] as usize) << 8)
         | (handshake[11] as usize);
@@ -2444,8 +2442,7 @@ impl DtlsServer {
                     // start the replacement handshake from this datagram
                     // instead of waiting. A newer generation already in the
                     // map must not be replaced.
-                    if self.sessions.get(&peer_addr).is_none()
-                        && dtls_datagram_opens_session(&data)
+                    if self.sessions.get(&peer_addr).is_none() && dtls_datagram_opens_session(&data)
                     {
                         self.spawn_session(peer_addr, data, reply_local, forwarded_client);
                     }

@@ -50,25 +50,27 @@ fn dtls_client_address_metadata_refusals_are_counted_and_rate_limited() {
 fn dtls_demux_rejects_non_client_hello_handshake_records() {
     fn handshake_record(msg_type: u8, fragment_offset: u32) -> Vec<u8> {
         let body = [0u8; 16];
-        let mut handshake = Vec::new();
-        handshake.push(msg_type);
-        handshake.push(0);
-        handshake.push(0);
-        handshake.push(body.len() as u8);
-        handshake.extend_from_slice(&[0x00, 0x00]);
-        handshake.push(((fragment_offset >> 16) & 0xff) as u8);
-        handshake.push(((fragment_offset >> 8) & 0xff) as u8);
-        handshake.push((fragment_offset & 0xff) as u8);
-        handshake.push(0);
-        handshake.push(0);
-        handshake.push(body.len() as u8);
+        // msg_type(1) + length(3) + message_seq(2) + fragment_offset(3) +
+        // fragment_length(3), then the fragment body.
+        let mut handshake = vec![
+            msg_type,
+            0,
+            0,
+            body.len() as u8,
+            0x00,
+            0x00,
+            ((fragment_offset >> 16) & 0xff) as u8,
+            ((fragment_offset >> 8) & 0xff) as u8,
+            (fragment_offset & 0xff) as u8,
+            0,
+            0,
+            body.len() as u8,
+        ];
         handshake.extend_from_slice(&body);
 
-        let mut record = Vec::new();
-        record.push(0x16);
-        record.extend_from_slice(&[0xfe, 0xfd]);
-        record.extend_from_slice(&[0x00, 0x00]);
-        record.extend_from_slice(&[0x00, 0x00, 0x00, 0x00, 0x00, 0x01]);
+        // content_type(1) + version(2) + epoch(2) + sequence_number(6), then
+        // the record length and the handshake fragment.
+        let mut record = vec![0x16, 0xfe, 0xfd, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01];
         record.extend_from_slice(&(handshake.len() as u16).to_be_bytes());
         record.extend_from_slice(&handshake);
         record
