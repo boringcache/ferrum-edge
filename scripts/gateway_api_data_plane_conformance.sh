@@ -830,10 +830,20 @@ run_blackbox_tests() {
 
   local seen_a=0
   local seen_b=0
-  for _ in $(seq 1 20); do
-    body="$(curl_body blackbox.example /weight)"
-    grep -q "backend=blackbox-a" <<<"$body" && seen_a=1
-    grep -q "backend=blackbox-b" <<<"$body" && seen_b=1
+  local body
+  # Applying the multi-document black-box fixture is eventually consistent:
+  # the controller can publish another complete snapshot while these probes
+  # begin. Treat a transient route miss like the convergence-aware assertions
+  # above, but keep a fixed deadline so a missing route or backend still fails.
+  for _ in $(seq 1 60); do
+    if body="$(curl_body blackbox.example /weight 2>/dev/null)"; then
+      grep -q "backend=blackbox-a" <<<"$body" && seen_a=1
+      grep -q "backend=blackbox-b" <<<"$body" && seen_b=1
+      if [ "$seen_a" -eq 1 ] && [ "$seen_b" -eq 1 ]; then
+        break
+      fi
+    fi
+    sleep 2
   done
   if [ "$seen_a" -ne 1 ] || [ "$seen_b" -ne 1 ]; then
     echo "weighted backend selection did not reach both backends" >&2
