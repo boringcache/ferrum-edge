@@ -663,7 +663,9 @@ LIVE_SUITE_SHARED_PATTERNS = (
 # it. It is owned by node-waypoint-ebpf-live.yml, which gates it both in its
 # `pull_request.paths` (`tests/k8s/lib/**`) and in its trusted planner scoped
 # suite (ci_runtime_plan.py `node-waypoint-ebpf-live` lists `^tests/k8s/lib/`).
-# ambient-host-udp-live.yml's `live_suite_path_filter.py` suite does not list it.
+# ambient-host-udp-live.yml's `live_suite_path_filter.py` additionally gates the
+# `live_assertions.sh` / `spire.sh` / `native_probe_classify.py` members, so the
+# shared harness is covered by both dedicated live workflows.
 
 
 def compile_path_patterns(*pattern_groups: tuple[str, ...]) -> list[re.Pattern[str]]:
