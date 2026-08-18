@@ -793,6 +793,61 @@ fn trust_withdrawal_suppresses_final_packet_drain_while_deadline_unexpired() {
     );
 }
 
+/// Post-accept application-send refusal must not double-count the fenced
+/// counter: the detached handler's `DtlsClientTrustFence` latch owns stream
+/// accounting for accepted connections (issue #3857).
+#[test]
+fn connected_application_send_refuses_without_direct_fence_accounting() {
+    let connected_send_arm = DTLS_SOURCE
+        .split("Some(pending) = app_in_rx.recv(), if connected => {")
+        .nth(1)
+        .expect("connected application-send arm")
+        .split("match admit_frontend_app_send(")
+        .next()
+        .expect("connected application-send arm body");
+    assert!(
+        connected_send_arm.contains("session.is_retired()"),
+        "the connected send gate must still fail closed on trust withdrawal"
+    );
+    assert!(
+        connected_send_arm.contains("fail_queued_frontend_app_sends("),
+        "the connected send gate must still fail queued application sends"
+    );
+    assert!(
+        !connected_send_arm.contains("session.record_fenced()"),
+        "post-accept send refusal must not increment the fence counter; the \
+         accepted handler's once-only latch owns stream accounting"
+    );
+
+    for (marker, label) in [
+        (
+            "Output::Connected => {",
+            "the Connected pre-handoff fence before accept()",
+        ),
+        (
+            "client_trust_guard.is_none()",
+            "the registration re-check inside the handshake drain",
+        ),
+    ] {
+        let site = DTLS_SOURCE
+            .split(marker)
+            .nth(1)
+            .expect(label)
+            .split("session.record_fenced()")
+            .next()
+            .expect(label);
+        assert!(
+            site.contains("session.is_retired()"),
+            "{label} must still consult the withdrawal fence"
+        );
+    }
+    assert_eq!(
+        DTLS_SOURCE.matches("session.record_fenced()").count(),
+        2,
+        "only pre-accept driver sites may record the fence counter directly"
+    );
+}
+
 /// A refused frontend DTLS client certificate must not complete the handshake.
 ///
 /// dimpl's DTLS 1.2 server queues ChangeCipherSpec+Finished and only THEN

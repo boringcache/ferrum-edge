@@ -2753,7 +2753,14 @@ impl DtlsServer {
                             .map(|guard| guard.session())
                             && session.is_retired()
                         {
-                            session.record_fenced();
+                            // Fail closed on the ciphertext-send gate, but do not
+                            // record the fixed-cardinality fence counter here:
+                            // an accepted stream's detached handler owns
+                            // once-only stream accounting through
+                            // `DtlsClientTrustFence::settle_withdrawal` and will
+                            // settle this same withdrawal. Pre-accept driver
+                            // sites still record directly because no handler can
+                            // own those refused streams.
                             retired_by_trust_withdrawal = true;
                             let _ = completion.send(Err(
                                 crate::tls::client_trust::TRUST_WITHDRAWN_REASON.to_string(),
