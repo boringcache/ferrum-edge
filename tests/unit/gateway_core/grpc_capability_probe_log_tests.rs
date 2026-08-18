@@ -638,12 +638,15 @@ async fn request_waiter_after_probe_debug_publication_upgrades_once() {
     started.notified().await;
 
     let request_registered = Arc::new(Notify::new());
-    let request = {
+    let request: tokio::task::JoinHandle<Result<(), GrpcProxyError>> = {
         let pool = pool.clone();
         let key = key.clone();
         let request_registered = request_registered.clone();
         tokio::spawn(async move {
-            pool.create_or_get_existing_owned_with_attempt(
+            // Pin `E = GrpcProxyError`: the create closure is a never-type
+            // panic (this task must stay a waiter), so rustc cannot choose
+            // among ShareablePoolCreateError impls (hosted E0283).
+            pool.create_or_get_existing_owned_with_attempt::<_, _, GrpcProxyError, _, _>(
                 key,
                 |_attempt| {
                     request_registered.notify_waiters();
@@ -660,6 +663,8 @@ async fn request_waiter_after_probe_debug_publication_upgrades_once() {
                 },
                 |_key, _attempt| async move {
                     panic!("request must remain a waiter on the probe create");
+                    #[allow(unreachable_code)]
+                    Err(h2c_handshake_miss())
                 },
             )
             .await
