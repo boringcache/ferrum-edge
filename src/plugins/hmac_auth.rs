@@ -90,7 +90,9 @@
 //! Consumer credentials should include:
 //!   { "hmac_auth": { "secret": "<shared-secret>" } }
 
-use crate::fips::approved::{HmacSha256, HmacSha512, Sha256, Sha512};
+use crate::fips::approved::{HmacSha256, HmacSha512, Sha256};
+#[cfg(test)]
+use crate::fips::approved::Sha512;
 use async_trait::async_trait;
 use base64::Engine as _;
 use serde_json::Value;
@@ -1237,11 +1239,7 @@ impl HmacAuth {
 
     /// Verify that a digest field value matches `body` under `syntax`.
     #[cfg(test)]
-    pub(crate) fn verify_body_digest(
-        digest_header: &str,
-        body: &[u8],
-        syntax: DigestSyntax,
-    ) -> bool {
+    fn verify_body_digest(digest_header: &str, body: &[u8], syntax: DigestSyntax) -> bool {
         let Ok(parsed) = parse_body_digest_header(digest_header, syntax) else {
             return false;
         };
@@ -1586,11 +1584,11 @@ impl AuthMechanism for HmacAuth {
             (Some(sha256), Some(sha512)) => Some((sha256, sha512)),
             _ => None,
         };
-        if let Some((body_sha256, body_sha512)) = hashes {
-            if !parsed_digest_matches_body(&parsed, body_sha256, body_sha512) {
-                debug!("hmac_auth: digest header does not match request body");
-                return VerifyOutcome::Invalid(DIGEST_MISMATCH_BODY.to_string());
-            }
+        if let Some((body_sha256, body_sha512)) = hashes
+            && !parsed_digest_matches_body(&parsed, body_sha256, body_sha512)
+        {
+            debug!("hmac_auth: digest header does not match request body");
+            return VerifyOutcome::Invalid(DIGEST_MISMATCH_BODY.to_string());
         }
 
         // Tampering with the digest header itself (without re-signing with
