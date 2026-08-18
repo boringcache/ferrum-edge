@@ -44,8 +44,12 @@ from verify_ci_runtime_cache import (
     CANONICAL_PULL_REQUEST_BODY,
     CANONICAL_PUSH_MAIN_BODY,
     extract_job,
+    job_if,
+    job_steps,
     main as ci_runtime_cache_main,
     parse_canonical_on_events,
+    step_if,
+    step_run_ends_with_exit,
 )
 
 
@@ -502,6 +506,13 @@ def optional_live_suite_trigger_errors(
             f"{workflow_path} must not trigger on pull_request_target; "
             "optional live suites require an input-less pull_request event"
         )
+    expected_events = {"workflow_dispatch", "pull_request", "merge_group", "push"}
+    if set(events) != expected_events:
+        errors.append(
+            f"{workflow_path} trigger events must be exactly "
+            f"{sorted(expected_events)}; extra events must not execute a "
+            "candidate-controlled live workflow"
+        )
     if events.get("pull_request") != CANONICAL_PULL_REQUEST_BODY:
         errors.append(
             f"{workflow_path} must trigger on every pull request without "
@@ -560,46 +571,56 @@ def check_optional_live_suite_aggregate(
     if contract["live_binding"] != "exact_true":
         return errors
 
+    live_body = extract_job(workflow_yml, live)
+    if not live_body:
+        errors.append(f"{workflow_path} must declare jobs.{live}")
+        return errors
+    if extract_job_needs(live_body) != {planner}:
+        errors.append(
+            f"{workflow_path} jobs.{live}.needs must be exactly [{planner!r}]"
+        )
     relevant = f"needs.{planner}.outputs.{contract['relevance_output']}"
-    planner_result = f"needs.{planner}.result"
-    live_result = f"needs.{live}.result"
-    planner_fail = f'"${{{{ {planner_result} }}}}" != "success"'
-    skip_false = f'"${{{{ {relevant} }}}}" = "false"'
-    malformed = f'"${{{{ {relevant} }}}}" != "true"'
-    live_fail = f'"${{{{ {live_result} }}}}" != "success"'
-    if not _bash_condition_exits(body, planner_fail, 1):
+    expected_live_if = f"{relevant} == 'true'"
+    if job_if(live_body) != expected_live_if:
         errors.append(
-            f"{workflow_path} jobs.{job} must fail when {planner} does not "
-            "succeed; planner failure cannot report green"
+            f"{workflow_path} jobs.{live} must run only on exact true "
+            f"relevance (`if: {expected_live_if}`)"
         )
-    if not _bash_condition_exits(body, skip_false, 0):
+
+    conditions = {
+        "planner_failure": f"needs.{planner}.result != 'success'",
+        "skip": f"{relevant} == 'false'",
+        "malformed": (
+            f"needs.{planner}.result == 'success' && {relevant} != 'true' && "
+            f"{relevant} != 'false'"
+        ),
+        "live_failure": f"{relevant} == 'true' && needs.{live}.result != 'success'",
+        "live_success": f"{relevant} == 'true' && needs.{live}.result == 'success'",
+    }
+    steps = job_steps(body)
+    if len(steps) != len(conditions):
         errors.append(
-            f"{workflow_path} jobs.{job} skip must use exact {relevant} "
-            "= 'false'; exact false is the sole legitimate skip"
+            f"{workflow_path} jobs.{job} must contain exactly the five "
+            "planner/skip/malformed/live-failure/live-success report steps"
         )
-    if not _bash_condition_exits(body, malformed, 1):
-        errors.append(
-            f"{workflow_path} jobs.{job} must fail closed on blank or "
-            f"malformed {relevant} (not exact true/false)"
-        )
-    if not _bash_condition_exits(body, live_fail, 1):
-        errors.append(
-            f"{workflow_path} jobs.{job} must fail when {live} was "
-            "scheduled and did not succeed"
-        )
+    matched_steps: dict[str, list[str]] = {
+        key: [step for step in steps if step_if(step) == condition]
+        for key, condition in conditions.items()
+    }
+    for key, matched in matched_steps.items():
+        if len(matched) != 1:
+            errors.append(
+                f"{workflow_path} jobs.{job} must declare exactly one {key} "
+                f"step with `if: {conditions[key]}`"
+            )
+    for key in ("planner_failure", "malformed", "live_failure"):
+        matched = matched_steps[key]
+        if matched and not step_run_ends_with_exit(matched[0], 1):
+            errors.append(
+                f"{workflow_path} jobs.{job} {key} step must terminate with "
+                "an effective exit 1"
+            )
     return errors
-
-
-def _bash_condition_exits(body: str, condition: str, code: int) -> bool:
-    """Return whether `condition` is followed by `exit {code}` before the next `if [`."""
-
-    start = body.find(condition)
-    if start < 0:
-        return False
-    rest = body[start + len(condition) :]
-    next_if = rest.find("if [")
-    window = rest if next_if < 0 else rest[:next_if]
-    return f"exit {code}" in window
 
 
 def merge_group_trigger_is_present(workflow_yml: str) -> bool:
@@ -737,46 +758,38 @@ _CNI_OPTIONAL_CONTRACT = OPTIONAL_LIVE_SUITE_WORKFLOWS[
 ]
 
 
-def _cni_aggregate_script(
+def _cni_aggregate_steps(
     *,
-    planner_fail: bool = True,
-    skip_false: bool = True,
-    malformed: bool = True,
-    live_fail: bool = True,
-    skip_not_true: bool = False,
+    skip_condition: str = "needs.changes.outputs.relevant == 'false'",
+    malformed_condition: str = (
+        "needs.changes.result == 'success' && "
+        "needs.changes.outputs.relevant != 'true' && "
+        "needs.changes.outputs.relevant != 'false'"
+    ),
+    live_failure_condition: str = (
+        "needs.changes.outputs.relevant == 'true' && "
+        "needs.cni-lifecycle-live.result != 'success'"
+    ),
+    planner_run: str = "exit 1",
 ) -> str:
-    lines = ["        run: |\n"]
-    if planner_fail:
-        lines.append(
-            '          if [ "${{ needs.changes.result }}" != "success" ]; then\n'
-            "            exit 1\n"
-            "          fi\n"
-        )
-    if skip_not_true:
-        lines.append(
-            '          if [ "${{ needs.changes.outputs.relevant }}" != "true" ]; then\n'
-            "            exit 0\n"
-            "          fi\n"
-        )
-    elif skip_false:
-        lines.append(
-            '          if [ "${{ needs.changes.outputs.relevant }}" = "false" ]; then\n'
-            "            exit 0\n"
-            "          fi\n"
-        )
-    if malformed:
-        lines.append(
-            '          if [ "${{ needs.changes.outputs.relevant }}" != "true" ]; then\n'
-            "            exit 1\n"
-            "          fi\n"
-        )
-    if live_fail:
-        lines.append(
-            '          if [ "${{ needs.cni-lifecycle-live.result }}" != "success" ]; then\n'
-            "            exit 1\n"
-            "          fi\n"
-        )
-    return "".join(lines)
+    return (
+        "      - name: Fail when CNI planning fails\n"
+        "        if: needs.changes.result != 'success'\n"
+        f"        run: {planner_run}\n"
+        "      - name: Skip CNI for unrelated changes\n"
+        f"        if: {skip_condition}\n"
+        "        run: echo skip\n"
+        "      - name: Fail on malformed CNI relevance\n"
+        f"        if: {malformed_condition}\n"
+        "        run: exit 1\n"
+        "      - name: Fail when CNI live did not succeed\n"
+        f"        if: {live_failure_condition}\n"
+        "        run: exit 1\n"
+        "      - name: Report CNI live success\n"
+        "        if: needs.changes.outputs.relevant == 'true' && "
+        "needs.cni-lifecycle-live.result == 'success'\n"
+        "        run: echo pass\n"
+    )
 
 
 def _cni_like_workflow(
@@ -785,12 +798,13 @@ def _cni_like_workflow(
     gate_name: str = "CNI Lifecycle Live",
     gate_if: str = "always()",
     needs: str | None = None,
-    script: str | None = None,
+    steps: str | None = None,
+    live_if: str = "needs.changes.outputs.relevant == 'true'",
 ) -> str:
     if needs is None:
         needs = "      - changes\n      - cni-lifecycle-live\n"
-    if script is None:
-        script = _cni_aggregate_script()
+    if steps is None:
+        steps = _cni_aggregate_steps()
     return (
         f"{_OPTIONAL_CANONICAL_ON}\n"
         "jobs:\n"
@@ -799,7 +813,8 @@ def _cni_like_workflow(
         "    outputs:\n"
         "      relevant: ${{ steps.filter.outputs.relevant }}\n"
         "  cni-lifecycle-live:\n"
-        "    if: needs.changes.outputs.relevant == 'true'\n"
+        f"    if: {live_if}\n"
+        "    needs: changes\n"
         "    steps:\n"
         "      - run: echo live\n"
         "  gate:\n"
@@ -808,8 +823,7 @@ def _cni_like_workflow(
         f"{needs}"
         f"    if: {gate_if}\n"
         "    steps:\n"
-        "      - name: Summarize CNI lifecycle live result\n"
-        f"{script}"
+        f"{steps}"
     )
 
 
@@ -918,6 +932,14 @@ def optional_live_suite_self_test() -> list[str]:
     if not any("canonical block `on:`" in item for item in duplicate_errors):
         failures.append("optional suite must reject duplicate pull_request blocks")
 
+    extra_event = _OPTIONAL_CANONICAL_ON.replace(
+        "  pull_request:\n",
+        "  schedule:\n    - cron: '0 0 * * *'\n  pull_request:\n",
+    )
+    extra_event_errors = optional_live_suite_trigger_errors(extra_event, source)
+    if not any("trigger events must be exactly" in item for item in extra_event_errors):
+        failures.append("optional suite must reject extra trigger events")
+
     good_aggregate = check_optional_live_suite_aggregate(
         _cni_like_workflow(), source, _CNI_OPTIONAL_CONTRACT
     )
@@ -956,18 +978,39 @@ def optional_live_suite_self_test() -> list[str]:
         failures.append("optional aggregate must reject a severed needs list")
 
     loose = _cni_like_workflow(
-        script=_cni_aggregate_script(skip_false=False, malformed=False, skip_not_true=True)
+        steps=_cni_aggregate_steps(
+            skip_condition="needs.changes.outputs.relevant != 'true'",
+            malformed_condition="needs.changes.outputs.relevant != 'true'",
+        )
     )
     loose_errors = check_optional_live_suite_aggregate(
         loose, source, _CNI_OPTIONAL_CONTRACT
     )
     if not (
-        any("exact false is the sole legitimate skip" in item for item in loose_errors)
-        and any("blank or malformed" in item for item in loose_errors)
+        any("exactly one skip step" in item for item in loose_errors)
+        and any("exactly one malformed step" in item for item in loose_errors)
     ):
         failures.append(
             "optional aggregate must reject loose malformed-verdict handling"
         )
+
+    loose_live = _cni_like_workflow(
+        live_if="needs.changes.outputs.relevant != 'false'"
+    )
+    loose_live_errors = check_optional_live_suite_aggregate(
+        loose_live, source, _CNI_OPTIONAL_CONTRACT
+    )
+    if not any("must run only on exact true relevance" in item for item in loose_live_errors):
+        failures.append("optional live job must reject non-false relevance binding")
+
+    inert_exit = _cni_like_workflow(
+        steps=_cni_aggregate_steps(planner_run="echo 'exit 1'")
+    )
+    inert_exit_errors = check_optional_live_suite_aggregate(
+        inert_exit, source, _CNI_OPTIONAL_CONTRACT
+    )
+    if not any("effective exit 1" in item for item in inert_exit_errors):
+        failures.append("optional aggregate must reject inert exit text")
 
     return failures
 

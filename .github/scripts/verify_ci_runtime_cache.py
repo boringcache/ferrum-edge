@@ -307,6 +307,14 @@ def check_governed_live_trigger_shape(
         )
     if events is None:
         return
+    require(
+        set(events) == set(GOVERNED_LIVE_TRIGGER_EVENTS),
+        f"{source} trigger events must be exactly "
+        f"{list(GOVERNED_LIVE_TRIGGER_EVENTS)}; extra events such as "
+        "pull_request_target must not execute a candidate-controlled live "
+        "workflow",
+        failures,
+    )
     for event in GOVERNED_LIVE_TRIGGER_EVENTS:
         require(
             event in events,
@@ -656,20 +664,33 @@ def check_node_waypoint_aggregate(
         "live job",
         failures,
     )
-    planner_result = "needs.production-dockerfile-plan.result"
+    steps = job_steps(aggregate)
+    planner_condition = "needs.production-dockerfile-plan.result != 'success'"
+    planner_steps = [step for step in steps if step_if(step) == planner_condition]
     require(
-        f"{planner_result} != 'success'" in aggregate,
-        f"{source} aggregate must fail when trusted-base relevance planning fails",
+        len(planner_steps) == 1,
+        f"{source} aggregate must declare exactly one planner-failure step "
+        f"with if: {planner_condition}",
         failures,
     )
+    if planner_steps:
+        require(
+            step_run_ends_with_exit(planner_steps[0], 1),
+            f"{source} planner-failure step must terminate with an effective exit 1",
+            failures,
+        )
+
     skip_steps = [
         step
-        for step in job_steps(aggregate)
-        if re.search(r"(?m)^      - name: Skip", step)
+        for step in steps
+        if re.search(
+            r"(?m)^      - name: Skip NodeWaypoint eBPF live datapath for unrelated changes$",
+            step,
+        )
     ]
     require(
         len(skip_steps) == 1,
-        f"{source} aggregate must declare exactly one skip step",
+        f"{source} aggregate must declare exactly one exact-false skip step",
         failures,
     )
     skip_if = step_if(skip_steps[0]) if skip_steps else ""
@@ -684,13 +705,25 @@ def check_node_waypoint_aggregate(
         f"{source} aggregate skip must not treat a blank verdict as irrelevance",
         failures,
     )
-    require(
+    live_failure_condition = (
         f"{NODE_WAYPOINT_PLANNER_OUTPUT} != 'false' && "
-        "needs.node-waypoint-ebpf-live.result != 'success'" in aggregate,
+        "needs.node-waypoint-ebpf-live.result != 'success'"
+    )
+    live_failure_steps = [
+        step for step in steps if step_if(step) == live_failure_condition
+    ]
+    require(
+        len(live_failure_steps) == 1,
         f"{source} aggregate must fail whenever the live job was scheduled and "
-        "did not succeed",
+        f"did not succeed, using exactly one step with if: {live_failure_condition}",
         failures,
     )
+    if live_failure_steps:
+        require(
+            step_run_ends_with_exit(live_failure_steps[0], 1),
+            f"{source} live-failure step must terminate with an effective exit 1",
+            failures,
+        )
 
 
 def check_aggregate_planner_contract(
@@ -858,6 +891,32 @@ def step_if(step: str) -> str:
     if match:
         return match.group(1).strip()
     return ""
+
+
+def step_run_ends_with_exit(step: str, code: int) -> bool:
+    """Return whether a run step has one effective terminal `exit CODE`.
+
+    Both the one-line fixture form (`run: exit 1`) and the block-scalar form
+    used by the real aggregates are accepted. Merely mentioning `exit 1` in a
+    comment, echo, or an earlier unreachable command is insufficient: the
+    block must contain exactly one executable `exit` line and it must be the
+    final non-empty command.
+    """
+
+    scalar = re.search(r"(?m)^        run:\s*([^|>].*)$", step)
+    if scalar:
+        return scalar.group(1).strip() == f"exit {code}"
+
+    block = re.search(r"(?ms)^        run:\s*\|[-+]?\s*\n(?P<body>.*)\Z", step)
+    if block is None:
+        return False
+    commands = [
+        line.strip()
+        for line in block.group("body").splitlines()
+        if line.strip() and not line.lstrip().startswith("#")
+    ]
+    exits = [line for line in commands if re.fullmatch(r"exit\s+\d+", line)]
+    return exits == [f"exit {code}"] and commands[-1] == f"exit {code}"
 
 
 def step_uses(step: str) -> str:
@@ -5154,6 +5213,22 @@ def self_test() -> int:
         failures,
     )
 
+    extra_event_trigger = good_trigger.replace(
+        "  pull_request:\n",
+        "  pull_request_target:\n  pull_request:\n",
+    )
+    extra_event_failures: list[str] = []
+    check_governed_live_trigger_shape(
+        extra_event_trigger,
+        "self-test-extra-trigger",
+        extra_event_failures,
+    )
+    require(
+        any("trigger events must be exactly" in item for item in extra_event_failures),
+        "self-test: an extra pull_request_target trigger must fail closed",
+        failures,
+    )
+
     quoted_paths_trigger = (
         "name: demo\n"
         "on:\n"
@@ -5466,7 +5541,11 @@ def self_test() -> int:
         failures,
     )
 
-    def _node_waypoint_aggregate(skip_if: str, fail_if: str) -> str:
+    def _node_waypoint_aggregate(
+        skip_if: str,
+        fail_if: str,
+        planner_run: str = "exit 1",
+    ) -> str:
         return (
             "  node-waypoint-ebpf-live-gate:\n"
             "    name: NodeWaypoint eBPF Live\n"
@@ -5478,7 +5557,7 @@ def self_test() -> int:
             "    steps:\n"
             "      - name: Fail when NodeWaypoint relevance planning fails\n"
             "        if: needs.production-dockerfile-plan.result != 'success'\n"
-            "        run: exit 1\n"
+            f"        run: {planner_run}\n"
             "      - name: Skip NodeWaypoint eBPF live datapath for unrelated changes\n"
             f"        if: {skip_if}\n"
             "        run: echo skip\n"
@@ -5560,6 +5639,22 @@ def self_test() -> int:
             for item in missing_aggregate_failures
         ),
         "self-test: a missing NodeWaypoint aggregate must fail",
+        failures,
+    )
+
+    inert_exit_failures: list[str] = []
+    check_node_waypoint_aggregate(
+        _node_waypoint_aggregate(
+            exact_false_skip,
+            scheduled_fail,
+            planner_run="echo 'exit 1'",
+        ),
+        "self-test-node-waypoint-inert-exit",
+        inert_exit_failures,
+    )
+    require(
+        any("effective exit 1" in item for item in inert_exit_failures),
+        "self-test: inert exit text must not satisfy a NodeWaypoint failure step",
         failures,
     )
 

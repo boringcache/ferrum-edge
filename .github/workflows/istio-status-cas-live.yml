@@ -293,31 +293,50 @@ jobs:
     if: always()
     runs-on: ubuntu-latest
     steps:
-      - name: Summarize Istio status CAS live result
+      - name: Fail when Istio status CAS relevance planning fails
+        if: needs.changes.result != 'success'
         run: |
           {
             echo "## Istio Status CAS Live"
             echo ""
+            echo "Failed before change detection completed."
+          } >> "$GITHUB_STEP_SUMMARY"
+          exit 1
+
+      - name: Skip Istio status CAS proof for unrelated changes
+        if: needs.changes.outputs.relevant == 'false'
+        run: |
+          {
+            echo "## Istio Status CAS Live"
+            echo ""
+            echo "Skipped the competing-writer proof: no Istio status writer, metrics, live test, CRD fixture, workflow, or local-action surfaces changed."
           } >> "$GITHUB_STEP_SUMMARY"
 
-          if [ "${{ needs.changes.result }}" != "success" ]; then
-            echo "Failed before change detection completed." >> "$GITHUB_STEP_SUMMARY"
-            exit 1
-          fi
+      - name: Fail when Istio status CAS relevance output is unusable
+        if: needs.changes.result == 'success' && needs.changes.outputs.relevant != 'true' && needs.changes.outputs.relevant != 'false'
+        run: |
+          {
+            echo "## Istio Status CAS Live"
+            echo ""
+            echo "Change detection returned an invalid relevance result: ${{ needs.changes.outputs.relevant }}."
+          } >> "$GITHUB_STEP_SUMMARY"
+          exit 1
 
-          if [ "${{ needs.changes.outputs.relevant }}" = "false" ]; then
-            echo "Skipped the competing-writer proof: no Istio status writer, metrics, live test, CRD fixture, workflow, or local-action surfaces changed." >> "$GITHUB_STEP_SUMMARY"
-            exit 0
-          fi
+      - name: Fail when Istio status CAS live proof did not succeed
+        if: needs.changes.outputs.relevant == 'true' && needs.istio-status-cas-live.result != 'success'
+        run: |
+          {
+            echo "## Istio Status CAS Live"
+            echo ""
+            echo "Live competing-writer proof failed or did not complete: ${{ needs.istio-status-cas-live.result }}."
+          } >> "$GITHUB_STEP_SUMMARY"
+          exit 1
 
-          if [ "${{ needs.changes.outputs.relevant }}" != "true" ]; then
-            echo "Change detection returned an invalid relevance result: ${{ needs.changes.outputs.relevant }}." >> "$GITHUB_STEP_SUMMARY"
-            exit 1
-          fi
-
-          if [ "${{ needs.istio-status-cas-live.result }}" != "success" ]; then
-            echo "Live competing-writer proof failed or did not complete: ${{ needs.istio-status-cas-live.result }}." >> "$GITHUB_STEP_SUMMARY"
-            exit 1
-          fi
-
-          echo "Live competing-writer proof passed." >> "$GITHUB_STEP_SUMMARY"
+      - name: Report Istio status CAS live proof
+        if: needs.changes.outputs.relevant == 'true' && needs.istio-status-cas-live.result == 'success'
+        run: |
+          {
+            echo "## Istio Status CAS Live"
+            echo ""
+            echo "Live competing-writer proof passed."
+          } >> "$GITHUB_STEP_SUMMARY"

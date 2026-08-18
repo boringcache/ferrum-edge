@@ -299,31 +299,50 @@ jobs:
     if: always()
     runs-on: ubuntu-latest
     steps:
-      - name: Summarize CNI lifecycle live result
+      - name: Fail when CNI lifecycle relevance planning fails
+        if: needs.changes.result != 'success'
         run: |
           {
             echo "## CNI Lifecycle Live"
             echo ""
+            echo "Failed before change detection completed."
+          } >> "$GITHUB_STEP_SUMMARY"
+          exit 1
+
+      - name: Skip CNI lifecycle live recovery for unrelated changes
+        if: needs.changes.outputs.relevant == 'false'
+        run: |
+          {
+            echo "## CNI Lifecycle Live"
+            echo ""
+            echo "Skipped the CNI install/uninstall lifecycle recovery proof: no CNI binary, plugin, chart template, harness, workflow, local-action, or documentation surfaces changed."
           } >> "$GITHUB_STEP_SUMMARY"
 
-          if [ "${{ needs.changes.result }}" != "success" ]; then
-            echo "Failed before change detection completed." >> "$GITHUB_STEP_SUMMARY"
-            exit 1
-          fi
+      - name: Fail when CNI lifecycle relevance output is unusable
+        if: needs.changes.result == 'success' && needs.changes.outputs.relevant != 'true' && needs.changes.outputs.relevant != 'false'
+        run: |
+          {
+            echo "## CNI Lifecycle Live"
+            echo ""
+            echo "Change detection returned an invalid relevance result: ${{ needs.changes.outputs.relevant }}."
+          } >> "$GITHUB_STEP_SUMMARY"
+          exit 1
 
-          if [ "${{ needs.changes.outputs.relevant }}" = "false" ]; then
-            echo "Skipped the CNI install/uninstall lifecycle recovery proof: no CNI binary, plugin, chart template, harness, workflow, local-action, or documentation surfaces changed." >> "$GITHUB_STEP_SUMMARY"
-            exit 0
-          fi
+      - name: Fail when CNI lifecycle live recovery did not succeed
+        if: needs.changes.outputs.relevant == 'true' && needs.cni-lifecycle-live.result != 'success'
+        run: |
+          {
+            echo "## CNI Lifecycle Live"
+            echo ""
+            echo "CNI lifecycle live recovery failed or did not complete: ${{ needs.cni-lifecycle-live.result }}."
+          } >> "$GITHUB_STEP_SUMMARY"
+          exit 1
 
-          if [ "${{ needs.changes.outputs.relevant }}" != "true" ]; then
-            echo "Change detection returned an invalid relevance result: ${{ needs.changes.outputs.relevant }}." >> "$GITHUB_STEP_SUMMARY"
-            exit 1
-          fi
-
-          if [ "${{ needs.cni-lifecycle-live.result }}" != "success" ]; then
-            echo "CNI lifecycle live recovery failed or did not complete: ${{ needs.cni-lifecycle-live.result }}." >> "$GITHUB_STEP_SUMMARY"
-            exit 1
-          fi
-
-          echo "CNI lifecycle live recovery passed." >> "$GITHUB_STEP_SUMMARY"
+      - name: Report CNI lifecycle live recovery
+        if: needs.changes.outputs.relevant == 'true' && needs.cni-lifecycle-live.result == 'success'
+        run: |
+          {
+            echo "## CNI Lifecycle Live"
+            echo ""
+            echo "CNI lifecycle live recovery passed."
+          } >> "$GITHUB_STEP_SUMMARY"
