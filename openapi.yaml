@@ -4432,10 +4432,11 @@ paths:
         Creates a new proxy route. A UUID is generated when `id` is omitted or
         empty. `created_at` and `updated_at` are set automatically.
 
-        In database mode a `201` means the committed generation is live on this
-        process: the handler waits for the same poll-loop reload that periodic
-        ticks use. If that reload cannot apply, the API returns `503` with
-        `applied: false` even though the row is durable.
+        In database mode a `201` means a covering `config_changes` generation is
+        live on this process: the handler captures that watermark under the
+        write-topology pin, then waits for the same poll-loop reload that
+        periodic ticks use. If that reload cannot apply, the API returns `503`
+        with `applied: false` even though the row is durable.
       tags: [Proxies]
       requestBody:
         required: true
@@ -4446,8 +4447,8 @@ paths:
       responses:
         "201":
           description: |
-            Proxy created. In database mode the committed generation is already
-            live on this process.
+            Proxy created. In database mode a covering `config_changes`
+            generation is already live on this process.
           content:
             application/json:
               schema:
@@ -4505,9 +4506,9 @@ paths:
         ignored — the path parameter is authoritative. `updated_at` is set
         automatically.
 
-        In database mode a `200` means the committed generation is live on this
-        process. If reload cannot apply, the API returns `503` with
-        `applied: false` even though the row is durable.
+        In database mode a `200` means a covering `config_changes` generation
+        is live on this process. If reload cannot apply, the API returns `503`
+        with `applied: false` even though the row is durable.
       tags: [Proxies]
       requestBody:
         required: true
@@ -4518,8 +4519,8 @@ paths:
       responses:
         "200":
           description: |
-            Proxy updated. In database mode the committed generation is already
-            live on this process.
+            Proxy updated. In database mode a covering `config_changes`
+            generation is already live on this process.
           content:
             application/json:
               schema:
@@ -4548,9 +4549,9 @@ paths:
       summary: Delete a proxy
       description: |
         Deletes the proxy and its proxy-owned cascade resources. In database
-        mode a `204` means the committed generation is live on this process; if
-        reload cannot apply, the API returns `503` with `applied: false` even
-        though the delete is durable. If the proxy is
+        mode a `204` means a covering `config_changes` generation is live on
+        this process; if reload cannot apply, the API returns `503` with
+        `applied: false` even though the delete is durable. If the proxy is
         owned by an API spec, the spec row and spec-owned resources are also
         deleted. When namespace admission is lost after that deletion commits,
         SQL backends and replica-set MongoDB use the API-spec compensation

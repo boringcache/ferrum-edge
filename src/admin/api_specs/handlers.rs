@@ -2899,8 +2899,9 @@ pub async fn handle_post_api_spec(
     if let Ok(hv) = hyper::header::HeaderValue::from_str(&format!("/api-specs/{}", spec_id)) {
         resp.headers_mut().insert("Location", hv);
     }
-    drop(_write_permit);
-    Ok(state.finish_live_config_mutation(namespace, resp).await)
+    Ok(state
+        .complete_live_config_mutation_after_commit(namespace, _write_permit, resp)
+        .await)
 }
 
 // ---------------------------------------------------------------------------
@@ -3155,9 +3156,12 @@ pub async fn handle_put_api_spec(
         "spec_version": spec.spec_version,
     });
 
-    drop(_write_permit);
     Ok(state
-        .finish_live_config_mutation(namespace, json_resp(StatusCode::OK, &resp_body))
+        .complete_live_config_mutation_after_commit(
+            namespace,
+            _write_permit,
+            json_resp(StatusCode::OK, &resp_body),
+        )
         .await)
 }
 
@@ -3647,8 +3651,9 @@ pub async fn handle_delete_api_spec(
             .header("Cache-Control", "no-store")
             .body(Full::new(Bytes::new()))
             .unwrap_or_else(|_| Response::new(Full::new(Bytes::new())));
-        drop(_write_permit);
-        Ok(state.finish_live_config_mutation(namespace, response).await)
+        Ok(state
+            .complete_live_config_mutation_after_commit(namespace, _write_permit, response)
+            .await)
     } else {
         Ok(error_response(ApiSpecError::NotFound))
     }

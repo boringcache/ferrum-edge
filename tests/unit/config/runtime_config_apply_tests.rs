@@ -3,11 +3,17 @@
 //! These cover waiter coalescing, rejection, timeout, and the post-tick nudge
 //! that prevents a consumed immediate permit from parking waiters on the
 //! periodic poll interval. The coordinator never applies config itself.
+//! Waiters use a covering watermark captured under the write pin; a later
+//! concurrent same-namespace commit can raise that watermark above one
+//! writer's own row, and one accepted generation still unblocks every waiter
+//! at or below it.
 
 use std::sync::Arc;
 use std::time::Duration;
 
-use ferrum_edge::config::runtime_config_apply::{LiveApplyFailure, RuntimeConfigApply};
+use ferrum_edge::config::runtime_config_apply::{
+    LiveApplyFailure, PreparedLiveApply, RuntimeConfigApply,
+};
 
 #[tokio::test]
 async fn already_accepted_sequence_returns_immediately() {
@@ -124,4 +130,15 @@ fn coordinator_is_namespace_scoped() {
     let apply = RuntimeConfigApply::new("ferrum", 0);
     assert!(apply.serves_namespace("ferrum"));
     assert!(!apply.serves_namespace("other"));
+}
+
+#[test]
+fn prepared_live_apply_distinguishes_noop_from_covering_watermark() {
+    let noop = PreparedLiveApply::noop();
+    assert!(noop.is_noop());
+    assert_eq!(noop.covering_sequence(), None);
+
+    let covering = PreparedLiveApply::from_covering_sequence(12);
+    assert!(!covering.is_noop());
+    assert_eq!(covering.covering_sequence(), Some(12));
 }

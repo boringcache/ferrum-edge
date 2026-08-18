@@ -230,8 +230,10 @@ Database-mode polling commits the accepted `config_changes.sequence` cursor only
 after an `Applied` or `Unchanged` candidate. Full reload candidates follow the
 same rule: a rejected full snapshot cannot poison the later incremental cursor.
 In-process Admin API mutations share that same apply path: after the database
-transaction commits they wait until the poll loop publishes a covering
-generation (or a truthful `503` with `applied: false` if reload cannot apply).
+transaction commits they capture a covering `config_changes` watermark from the
+pinned write topology, release that pin, then wait until the poll loop publishes
+a generation covering it (or a truthful `503` with `applied: false` if reload
+cannot apply).
 SQL runtime polling always uses the primary pool; `FERRUM_DB_READ_REPLICA_URL`
 is only for eligible admin reads. MongoDB config reads force primary read
 preference, and standalone MongoDB polling intentionally uses full reloads

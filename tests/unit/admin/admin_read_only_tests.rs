@@ -1117,6 +1117,94 @@ fn admin_mutation_handlers_use_admit_write_not_sync_gate_alone() {
     }
 }
 
+/// Config-database mutation handlers must capture the covering sequence under
+/// the write-topology pin, then release pins before the coordinator wait.
+#[test]
+fn live_apply_handlers_capture_sequence_before_releasing_pins() {
+    let config_db_sources = [
+        include_str!("../../../src/admin/mod.rs"),
+        include_str!("../../../src/admin/crud.rs"),
+        include_str!("../../../src/admin/api_specs/handlers.rs"),
+    ];
+    let joined = config_db_sources.join("\n");
+
+    assert!(
+        !joined.contains("finish_live_config_mutation(")
+            && !joined.contains("await_live_apply_after_commit("),
+        "the post-drop sequence re-query helpers must not exist"
+    );
+    assert_eq!(
+        joined
+            .matches("complete_live_config_mutation_after_commit")
+            .count(),
+        13,
+        "one two-phase helper plus twelve wired mutation completions"
+    );
+    assert!(
+        !joined.contains("drop(_write_permit)"),
+        "write-topology permits must be released by the two-phase helper, not dropped before capture"
+    );
+
+    let admin_source = include_str!("../../../src/admin/mod.rs");
+    let prepare = admin_source
+        .split("pub async fn prepare_live_apply_after_commit")
+        .nth(1)
+        .and_then(|tail| tail.split("pub async fn await_prepared_live_apply").next())
+        .expect("prepare_live_apply_after_commit remains inspectable");
+    assert!(
+        prepare.contains("latest_change_sequence"),
+        "covering watermark must be read in prepare, while pins are still held"
+    );
+
+    let await_phase = admin_source
+        .split("pub async fn await_prepared_live_apply")
+        .nth(1)
+        .and_then(|tail| {
+            tail.split("pub async fn complete_live_config_mutation_after_commit")
+                .next()
+        })
+        .expect("await/finish phase remains inspectable");
+    assert!(
+        !await_phase.contains("latest_change_sequence"),
+        "await/finish must not re-query latest_change_sequence after pin release"
+    );
+
+    let complete = admin_source
+        .split("pub async fn complete_live_config_mutation_after_commit")
+        .nth(1)
+        .and_then(|tail| tail.split("pub async fn admit_write").next())
+        .expect("complete_live_config_mutation_after_commit remains inspectable");
+    let drop_pins = complete
+        .find("drop(pins)")
+        .expect("pins dropped after capture");
+    let finish = complete
+        .find("finish_prepared_live_apply")
+        .expect("wait runs after pin release");
+    assert!(
+        drop_pins < finish,
+        "topology/namespace pins must drop before the coordinator wait"
+    );
+
+    let batch = admin_source
+        .split("async fn handle_batch_create")
+        .nth(1)
+        .and_then(|tail| tail.split("// ---- Backup & Restore ----").next())
+        .expect("batch create remains inspectable");
+    assert!(
+        batch.contains("(namespace_config_admission_guard, _write_permit)"),
+        "batch must capture the covering sequence before releasing the namespace guard"
+    );
+
+    let restore = admin_source
+        .split("async fn handle_restore")
+        .nth(1)
+        .expect("restore remains inspectable");
+    assert!(
+        restore.contains("(namespace_config_admission_guard, _write_permit)"),
+        "restore must capture the covering sequence before releasing the namespace guard"
+    );
+}
+
 // These tests reset/mutate the process-global read-only rejection observability
 // counter; serialize them for parallel `cargo test` runs.
 #[tokio::test]

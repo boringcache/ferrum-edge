@@ -50,6 +50,7 @@ use crate::config::db_backend::{
     tcp_connection_throttle_attachment_conflict,
 };
 use crate::config::gateway_trust::GatewayTrustBundleRecord;
+use crate::config::runtime_config_apply::{LiveApplyFailure, PreparedLiveApply};
 use crate::config::types::{
     ApiSpec, Consumer, GatewayConfig, PluginConfig, PluginScope, Proxy, Upstream,
     max_credentials_per_type,
@@ -457,7 +458,7 @@ pub struct AdminState {
     /// Loader used when external `$ref` resolution is effectively enabled.
     pub external_ref_loader: std::sync::Arc<crate::admin::api_specs::DefaultExternalDocumentLoader>,
     /// Database-mode coordinator that waits for the poll-loop reload to publish
-    /// a committed `config_changes` sequence before admin mutations return 2xx
+    /// a covering `config_changes` watermark before admin mutations return 2xx
     /// (issue #3926). `None` in every other mode and in tests that do not run
     /// a poll loop, so existing write handlers stay non-blocking.
     pub runtime_config_apply: Option<Arc<crate::config::runtime_config_apply::RuntimeConfigApply>>,
@@ -488,60 +489,115 @@ impl AdminState {
         self.check_write_allowed().is_some()
     }
 
-    /// After a config-database mutation commits, wait until that generation is
-    /// live on this process (issue #3926).
+    /// After a config-database mutation commits, capture the covering
+    /// `config_changes` watermark from the **same pinned write topology**
+    /// that just persisted the row (issue #3926).
+    ///
+    /// Call this after persist succeeds and **before** dropping the
+    /// write-topology permit (and before dropping a still-held namespace
+    /// admission guard). A sequence-read failure is a truthful `503`
+    /// `sequence_unavailable` after a durable commit.
     ///
     /// No-ops when this process has no poll-loop coordinator (CP/DP/file/tests)
     /// or when the write targeted a namespace this process does not serve.
-    /// Failures are truthful 503s: the row is already committed.
-    pub(crate) async fn await_live_apply_after_commit(
+    #[allow(clippy::result_large_err)]
+    pub async fn prepare_live_apply_after_commit(
         &self,
         namespace: &str,
-    ) -> Result<(), Response<Full<Bytes>>> {
+    ) -> Result<PreparedLiveApply, Response<Full<Bytes>>> {
         let Some(apply) = self.runtime_config_apply.as_ref() else {
-            return Ok(());
+            return Ok(PreparedLiveApply::noop());
         };
         if !apply.serves_namespace(namespace) {
-            return Ok(());
+            return Ok(PreparedLiveApply::noop());
         }
         let Some(db) = self.db.as_ref() else {
-            return Ok(());
+            return Ok(PreparedLiveApply::noop());
         };
-        let committed = match db.latest_change_sequence(namespace).await {
-            Ok(sequence) => sequence,
+        match db.latest_change_sequence(namespace).await {
+            Ok(sequence) => Ok(PreparedLiveApply::from_covering_sequence(sequence)),
             Err(_error) => {
                 warn_persistence_failure_redacted("admin_write_live_apply_sequence");
-                return Err(live_apply_failure_response(
-                    crate::config::runtime_config_apply::LiveApplyFailure::SequenceUnavailable,
-                ));
+                Err(live_apply_failure_response(
+                    LiveApplyFailure::SequenceUnavailable,
+                ))
             }
+        }
+    }
+
+    /// Phase 2: wait on a covering watermark captured by
+    /// [`Self::prepare_live_apply_after_commit`]. Call **after** releasing
+    /// topology / namespace pins. Never re-queries `latest_change_sequence`.
+    #[allow(clippy::result_large_err)]
+    pub async fn await_prepared_live_apply(
+        &self,
+        prepared: &PreparedLiveApply,
+    ) -> Result<(), Response<Full<Bytes>>> {
+        let Some(sequence) = prepared.covering_sequence() else {
+            return Ok(());
+        };
+        let Some(apply) = self.runtime_config_apply.as_ref() else {
+            return Err(live_apply_failure_response(
+                LiveApplyFailure::SequenceUnavailable,
+            ));
         };
         apply
-            .await_committed(committed)
+            .await_committed(sequence)
             .await
             .map_err(live_apply_failure_response)
     }
 
-    /// Overlay live-apply waiting onto a successful mutation response.
-    pub(crate) async fn finish_live_config_mutation(
+    /// Overlay live-apply waiting onto a successful mutation response using a
+    /// previously captured covering watermark.
+    pub async fn finish_prepared_live_apply(
         &self,
-        namespace: &str,
+        prepared: PreparedLiveApply,
         response: Response<Full<Bytes>>,
     ) -> Response<Full<Bytes>> {
         if !response.status().is_success() {
             return response;
         }
-        match self.await_live_apply_after_commit(namespace).await {
+        match self.await_prepared_live_apply(&prepared).await {
             Ok(()) => response,
             Err(failure) => failure,
         }
+    }
+
+    /// Capture the covering watermark while `pins` (write-topology permit and
+    /// a still-held namespace admission guard, when the handler still has one)
+    /// remain live, then drop those pins **before** waiting so a poll or
+    /// reconnect needed to publish the generation is not blocked.
+    ///
+    /// This is the only supported success-path completion for config-database
+    /// mutations. Non-success responses skip capture and wait.
+    pub async fn complete_live_config_mutation_after_commit<P>(
+        &self,
+        namespace: &str,
+        pins: P,
+        response: Response<Full<Bytes>>,
+    ) -> Response<Full<Bytes>> {
+        if !response.status().is_success() {
+            drop(pins);
+            return response;
+        }
+        let prepared = match self.prepare_live_apply_after_commit(namespace).await {
+            Ok(prepared) => prepared,
+            Err(failure) => {
+                drop(pins);
+                return failure;
+            }
+        };
+        drop(pins);
+        self.finish_prepared_live_apply(prepared, response).await
     }
 
     /// Admit an Admin API mutation under a write-topology pin (issue #3001).
     ///
     /// Acquires a backend topology pin **before** evaluating sticky-failover
     /// policy, and returns that pin so the caller retains it through
-    /// persistence and response construction. Ordering:
+    /// persistence and covering-sequence capture. Drop the pin before the
+    /// live-apply wait so a poll or reconnect needed to publish that
+    /// generation is not blocked. Ordering:
     /// - If a failover reconnect publishes first, this returns the existing
     ///   `503` fail-closed response (or admits under opt-in and pins failover).
     /// - If this pin wins first, reconnect publication waits (SQL) or
@@ -6215,8 +6271,9 @@ async fn handle_update_credentials(
         response
     })
     .await;
-    drop(_write_permit);
-    Ok(state.finish_live_config_mutation(namespace, response).await)
+    Ok(state
+        .complete_live_config_mutation_after_commit(namespace, _write_permit, response)
+        .await)
 }
 
 async fn handle_delete_credentials(
@@ -6300,8 +6357,9 @@ async fn handle_delete_credentials(
         response
     })
     .await;
-    drop(_write_permit);
-    Ok(state.finish_live_config_mutation(namespace, response).await)
+    Ok(state
+        .complete_live_config_mutation_after_commit(namespace, _write_permit, response)
+        .await)
 }
 
 /// POST /consumers/:id/credentials/:type — Append a credential entry for zero-downtime rotation.
@@ -6439,8 +6497,9 @@ async fn handle_append_credential(
         response
     })
     .await;
-    drop(_write_permit);
-    Ok(state.finish_live_config_mutation(namespace, response).await)
+    Ok(state
+        .complete_live_config_mutation_after_commit(namespace, _write_permit, response)
+        .await)
 }
 
 /// DELETE /consumers/:id/credentials/:type/:index — Remove a specific credential entry by index.
@@ -6565,8 +6624,9 @@ async fn handle_delete_credential_by_index(
         response
     })
     .await;
-    drop(_write_permit);
-    Ok(state.finish_live_config_mutation(namespace, response).await)
+    Ok(state
+        .complete_live_config_mutation_after_commit(namespace, _write_permit, response)
+        .await)
 }
 
 // ---- Gateway trust bundles (issue #3727) ----
@@ -7358,10 +7418,12 @@ async fn handle_batch_create(
         }
     }
 
-    drop(namespace_config_admission_guard);
-    drop(_write_permit);
     Ok(state
-        .finish_live_config_mutation(namespace, json_response(StatusCode::CREATED, &response))
+        .complete_live_config_mutation_after_commit(
+            namespace,
+            (namespace_config_admission_guard, _write_permit),
+            json_response(StatusCode::CREATED, &response),
+        )
         .await)
 }
 
@@ -9032,9 +9094,12 @@ async fn handle_restore(
         log_audit_enqueue_failure(&error);
     }
 
-    drop(_write_permit);
     Ok(state
-        .finish_live_config_mutation(namespace, json_response(StatusCode::OK, &response))
+        .complete_live_config_mutation_after_commit(
+            namespace,
+            (namespace_config_admission_guard, _write_permit),
+            json_response(StatusCode::OK, &response),
+        )
         .await)
 }
 
@@ -9165,9 +9230,7 @@ async fn handle_list_namespaces(
 
 // ---- Helpers ----
 
-fn live_apply_failure_response(
-    failure: crate::config::runtime_config_apply::LiveApplyFailure,
-) -> Response<Full<Bytes>> {
+fn live_apply_failure_response(failure: LiveApplyFailure) -> Response<Full<Bytes>> {
     json_response(
         StatusCode::SERVICE_UNAVAILABLE,
         &json!({

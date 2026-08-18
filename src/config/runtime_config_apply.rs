@@ -2,18 +2,20 @@
 //!
 //! Successful config-database writes must not return 2xx until the same
 //! authoritative poll-loop reload that periodic ticks use has accepted a
-//! generation covering the committed `config_changes` sequence — or until a
-//! truthful failure is known (validation rejection / timeout).
+//! generation covering the captured `config_changes` watermark — or until a
+//! truthful failure is known (validation rejection / timeout / sequence
+//! unavailable).
 //!
 //! This type is a coordinator, not a second apply path:
 //! - It never builds a partial snapshot, never holds a DB transaction, and
 //!   never rebuilds caches itself.
-//! - Admin writers signal a coalesced wake-up and wait on the durable
-//!   sequence watermark the poll loop publishes after `apply_incremental` /
+//! - Admin writers capture a covering watermark from the pinned write
+//!   topology after persist, release that pin, then wait on the durable
+//!   sequence the poll loop publishes after `apply_incremental` /
 //!   `update_config`.
-//! - Concurrent writers coalesce onto one reload: each waits for its own
-//!   committed sequence, and a single poll that advances past both unblocks
-//!   both waiters.
+//! - Concurrent writers coalesce onto one reload: each waits for the covering
+//!   watermark captured under its pin (see [`PreparedLiveApply`]), and a
+//!   single poll that advances past both watermarks unblocks both waiters.
 //! - External writers keep using the periodic / change-stream backstop; they
 //!   are not delayed by this wait, and an in-flight admin-triggered poll still
 //!   applies any rows they committed.
@@ -35,12 +37,69 @@ pub const ADMIN_WRITE_LIVE_APPLY_TIMEOUT: Duration = Duration::from_secs(30);
 /// JSON `reason` — never a resource id, namespace, or driver error string.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LiveApplyFailure {
-    /// The poll loop loaded the committed sequence and rejected the candidate.
+    /// The poll loop loaded a covering sequence and rejected the candidate.
     ConfigRejected,
     /// The wait budget elapsed before an accepted generation covered the write.
     Timeout,
-    /// The committed sequence could not be read after persist.
+    /// The covering sequence could not be read from the pinned topology after persist.
     SequenceUnavailable,
+}
+
+/// Covering `config_changes` watermark captured under a write-topology pin
+/// after a durable mutation (issue #3926).
+///
+/// Persistence APIs do not cheaply return the mutation's exact assigned
+/// sequence from the existing admission transaction, so handlers read
+/// `latest_change_sequence` while the pin (and a still-held namespace
+/// admission guard, when available) is live. That value is `MAX(sequence)`
+/// on the pinned topology and may include a later concurrent same-namespace
+/// writer. Waiting for it is conservative: `accepted >= covering` still
+/// implies this mutation is live. It is not this waiter's exact committed
+/// row unless no concurrent writer committed in between.
+///
+/// Capture this **before** releasing topology / namespace pins. Await it
+/// **after** those pins drop so a poll or reconnect needed to make progress
+/// is not blocked. Never re-query `latest_change_sequence` after release:
+/// a failover can publish a different pool whose watermark is `<= accepted`
+/// and would yield a false 2xx.
+#[derive(Debug, Clone)]
+#[must_use = "captured covering sequence must be awaited after releasing topology pins"]
+pub struct PreparedLiveApply {
+    covering: PreparedLiveApplyCovering,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PreparedLiveApplyCovering {
+    /// No poll-loop coordinator, or the write targeted a namespace this process
+    /// does not serve.
+    Noop,
+    Sequence(u64),
+}
+
+impl PreparedLiveApply {
+    pub fn noop() -> Self {
+        Self {
+            covering: PreparedLiveApplyCovering::Noop,
+        }
+    }
+
+    pub fn from_covering_sequence(sequence: u64) -> Self {
+        Self {
+            covering: PreparedLiveApplyCovering::Sequence(sequence),
+        }
+    }
+
+    pub fn is_noop(&self) -> bool {
+        matches!(self.covering, PreparedLiveApplyCovering::Noop)
+    }
+
+    /// Covering watermark to wait for, if this process serves the write.
+    pub fn covering_sequence(&self) -> Option<u64> {
+        match self.covering {
+            PreparedLiveApplyCovering::Noop => None,
+            PreparedLiveApplyCovering::Sequence(sequence) => Some(sequence),
+        }
+    }
 }
 
 impl LiveApplyFailure {
@@ -138,7 +197,7 @@ impl RuntimeConfigApply {
     }
 
     /// Publish that a completed poll attempted `sequence` and rejected it.
-    /// Waiters whose committed sequence is `<= sequence` fail closed.
+    /// Waiters whose covering sequence is `<= sequence` fail closed.
     pub fn record_rejected(&self, sequence: u64) {
         self.snapshot.send_modify(|snap| {
             if sequence > snap.rejected_through {
@@ -161,9 +220,11 @@ impl RuntimeConfigApply {
         }
     }
 
-    /// After a config-database mutation commits, wait until `sequence` is live
-    /// or a truthful failure is known. Signals an immediate coalesced wake so
-    /// the wait does not sit on `FERRUM_DB_POLL_INTERVAL`.
+    /// Wait until the poll loop has accepted a generation covering `sequence`
+    /// or a truthful failure is known. `sequence` must already have been
+    /// captured under the write-topology pin; this method never reads the
+    /// database. Signals an immediate coalesced wake so the wait does not sit
+    /// on `FERRUM_DB_POLL_INTERVAL`.
     pub async fn await_committed(&self, sequence: u64) -> Result<(), LiveApplyFailure> {
         if self.accepted_sequence() >= sequence {
             return Ok(());

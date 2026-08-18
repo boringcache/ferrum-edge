@@ -441,7 +441,10 @@ In **CP mode**, the gateway reserved port and OS-level checks are skipped since 
 In `FERRUM_MODE=database`, a successful create, update, or delete (proxies,
 consumers, plugins, upstreams, credentials, API specs, batch, and restore)
 returns 2xx only after the same authoritative poll-loop reload that periodic
-ticks use has published the committed `config_changes` generation. `GET /proxies`
+ticks use has published a covering `config_changes` generation. The covering
+watermark is captured from the pinned write topology after persist and before
+the topology/namespace pins are released; a later concurrent same-namespace
+writer may raise that watermark above this mutation's own row. `GET /proxies`
 already reads the database, so a 201 with an empty live snapshot is no longer
 possible on this process. If reload cannot apply, the API returns `503` with
 `{"error":"...","applied":false,"reason":"config_rejected"|"reload_timeout"|"sequence_unavailable"}`.

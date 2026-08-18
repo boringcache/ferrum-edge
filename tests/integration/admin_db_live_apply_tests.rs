@@ -1,8 +1,9 @@
 //! Database-mode admin mutations wait for the poll-loop generation (issue #3926).
 //!
 //! Successful POST/PUT/DELETE must not return 2xx until `ProxyState` is serving
-//! the committed sequence. Tests spawn a small replica of the authoritative
-//! incremental poll path — they do not invent a second apply implementation.
+//! a generation covering the captured `config_changes` watermark. Tests spawn a
+//! small replica of the authoritative incremental poll path — they do not invent
+//! a second apply implementation.
 
 use arc_swap::ArcSwap;
 use chrono::Utc;
