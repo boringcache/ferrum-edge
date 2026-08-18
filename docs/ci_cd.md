@@ -892,7 +892,8 @@ scope: eBPF, node-agent, NodeWaypoint identity, netns capture, socket option,
 TCP/HBONE mesh, chart, live harness files, the specific `src/` paths from the
 pre-#3888 trigger, and the NodeWaypoint datapath modules added since (the
 `src/proxy/node_waypoint_` prefix, `src/proxy/stream_listener.rs`,
-`src/proxy/udp_proxy.rs`, `src/proxy/mesh_tcp_inbound.rs`). The workflow `pull_request.paths` trigger remains a **superset** of
+`src/proxy/udp_proxy.rs`, `src/proxy/mesh_tcp_inbound.rs`). The workflow
+`pull_request.paths` trigger remains a **superset** of
 every production-Dockerfile smoke input (`src/**`, `vendor/**`,
 `custom_plugins/**`, `.cargo/**`, `rust-toolchain.toml`, and the other planner
 sensitive paths) so those changes always reach the trusted planner. The
