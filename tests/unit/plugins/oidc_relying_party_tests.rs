@@ -1975,12 +1975,7 @@ async fn explicit_jwks_uri_is_reported_as_active() {
 
 async fn mount_token_and_jwks(server: &MockServer, id_token: &str) {
     let public_key_pem = include_bytes!("../../../tests/fixtures/test_rsa_public.pem");
-    mount_token_and_jwks_document(
-        server,
-        build_rsa_jwks_from_pem(public_key_pem),
-        id_token,
-    )
-    .await;
+    mount_token_and_jwks_document(server, build_rsa_jwks_from_pem(public_key_pem), id_token).await;
 }
 
 async fn mount_token_and_jwks_document(
