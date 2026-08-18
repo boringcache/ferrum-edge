@@ -196,11 +196,7 @@ async fn sequence_unavailable_returns_applied_false() {
     let permit = state.admit_write().await.expect("admit on primary");
     let (status, body) = response_json(
         state
-            .complete_live_config_mutation_after_commit(
-                &default_namespace(),
-                permit,
-                ok_response(),
-            )
+            .complete_live_config_mutation_after_commit(&default_namespace(), permit, ok_response())
             .await,
     )
     .await;

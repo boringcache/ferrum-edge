@@ -3615,6 +3615,7 @@ mod tests {
         let mut last_change_sequence = Some(7);
         let sequence = 42;
         let config_rejected = AtomicBool::new(true);
+        let runtime_config_apply = RuntimeConfigApply::new("ferrum", 0);
 
         let accepted = commit_full_reload_poll_state(
             "test unchanged",
@@ -3622,6 +3623,7 @@ mod tests {
             &mut last_change_sequence,
             sequence,
             &config_rejected,
+            &runtime_config_apply,
         );
 
         assert!(accepted);
@@ -3638,6 +3640,7 @@ mod tests {
         // row is gone (issue #2158, P2).
         let mut last_change_sequence = None;
         let config_rejected = AtomicBool::new(true);
+        let runtime_config_apply = RuntimeConfigApply::new("ferrum", 0);
 
         let accepted = commit_full_reload_poll_state(
             "test applied",
@@ -3645,6 +3648,7 @@ mod tests {
             &mut last_change_sequence,
             99,
             &config_rejected,
+            &runtime_config_apply,
         );
 
         assert!(accepted);
@@ -3663,6 +3667,7 @@ mod tests {
         let previous_sequence = Some(7);
         let mut last_change_sequence = previous_sequence;
         let config_rejected = AtomicBool::new(false);
+        let runtime_config_apply = RuntimeConfigApply::new("ferrum", 0);
 
         let accepted = commit_full_reload_poll_state(
             "test rejected",
@@ -3672,6 +3677,7 @@ mod tests {
             &mut last_change_sequence,
             42,
             &config_rejected,
+            &runtime_config_apply,
         );
 
         assert!(!accepted);
@@ -3792,12 +3798,14 @@ mod tests {
 
         // 3) An accepted full reload clears the flag.
         let mut cursor = Some(1);
+        let runtime_config_apply = RuntimeConfigApply::new("ferrum", 0);
         let accepted = commit_full_reload_poll_state(
             "full reload",
             proxy::ConfigApplyOutcome::Applied,
             &mut cursor,
             2,
             &config_rejected,
+            &runtime_config_apply,
         );
         assert!(accepted);
         assert!(
