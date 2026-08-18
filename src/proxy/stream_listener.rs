@@ -1196,7 +1196,7 @@ pub struct StreamListenerManager {
     tcp_fastopen_enabled: bool,
     /// Listen backlog for TCP stream proxy sockets.
     tcp_listen_backlog: u32,
-    /// Number of SO_REUSEPORT TCP stream accept loops.
+    /// Number of duplicated exclusive-listen TCP stream accept loops.
     accept_threads: usize,
     /// Server-side TCP Fast Open queue length for TCP stream proxy sockets.
     tcp_fastopen_queue_len: u16,

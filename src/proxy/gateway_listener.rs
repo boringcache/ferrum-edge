@@ -20,11 +20,12 @@
 //!   between the readiness reconcile and [`GatewayListenerManager::run`] is
 //!   therefore still delivered — it cannot be swallowed as "already seen".
 //! - **Update.** A port whose TLS class, bind address, or mesh direction changed
-//!   is closed, **awaited**, and only then rebound: with
-//!   `FERRUM_ACCEPT_THREADS > 1` both generations bind the same port through
-//!   `SO_REUSEPORT`, so an overlap would let the kernel hand new connections to
-//!   a retiring generation with obsolete protocol/direction state or leave a
-//!   wildcard socket claiming a more-specific replacement.
+//!   is closed, **awaited**, and only then rebound. Extra accept workers share
+//!   one exclusive listen socket (never `SO_REUSEPORT`), so overlapping
+//!   generations cannot split traffic — but a replacement bind would fail with
+//!   `EADDRINUSE` until every old accept fd is closed, and an overlap would
+//!   also leave a retiring generation with obsolete protocol/direction state
+//!   or a wildcard socket claiming a more-specific replacement.
 //!   Awaiting the accept-loop task closes every accept socket first; already
 //!   accepted connections keep draining in their own tasks through the cloned
 //!   shutdown receivers they hold.
@@ -954,13 +955,12 @@ impl GatewayListenerManager {
             );
             listener.signal_shutdown();
             if replacing {
-                // The replacement binds the same port. With
-                // `FERRUM_ACCEPT_THREADS > 1` both generations use
-                // SO_REUSEPORT, so until every old accept socket is closed the
-                // kernel could hand new connections to the retiring class or
-                // bind address. Await the accept-loop task — accepted
-                // connections keep draining independently through their cloned
-                // shutdown receivers.
+                // The replacement binds the same port. Extra accept workers
+                // share one exclusive listen socket, so until every old
+                // accept fd is closed the replacement bind fails with
+                // EADDRINUSE rather than splitting generations. Await the
+                // accept-loop task — accepted connections keep draining
+                // independently through their cloned shutdown receivers.
                 let mut retired = true;
                 let mut pending: Vec<ListenerTask> = Vec::new();
                 for task in listener.tasks() {
@@ -1004,11 +1004,12 @@ impl GatewayListenerManager {
             }
         }
 
-        // A timed-out retiring task may still own an SO_REUSEPORT accept
+        // A timed-out retiring task may still own an exclusive accept
         // socket. Keep its port unavailable across later reconcile passes —
         // not only the pass that initiated retirement — until every old task
-        // actually exits. Otherwise the next retry could bind a replacement
-        // of the opposite TLS class beside the wedged generation.
+        // actually exits. Otherwise the next retry could fail to bind, or
+        // historically could have co-bound a replacement of the opposite TLS
+        // class beside the wedged generation.
         self.reap_finished_drains().await;
         let retiring_ports: BTreeSet<u16> = self
             .draining
@@ -1942,7 +1943,8 @@ mod tests {
 
     /// A retiring task that outlives one reconcile must keep ownership of its
     /// port visible to every later pass. Rebinding while it may still hold an
-    /// SO_REUSEPORT socket would let plaintext and TLS accept loops coexist.
+    /// exclusive accept socket would fail with EADDRINUSE (or, before #3924,
+    /// could let plaintext and TLS accept loops coexist via SO_REUSEPORT).
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_pending_retirement_blocks_rebind_across_reconcile_passes() {
         let port = free_port().await;
