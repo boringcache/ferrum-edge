@@ -789,7 +789,8 @@ impl PatternBuilder {
 fn rule_pattern(rule: &WafRule) -> String {
     match rule.match_kind {
         MatchKind::Regex => rule.pattern.clone(),
-        MatchKind::Literal | MatchKind::Contains => format!("(?i){}", regex::escape(&rule.pattern)),
+        MatchKind::Literal => regex::escape(&rule.pattern),
+        MatchKind::Contains => format!("(?i){}", regex::escape(&rule.pattern)),
         MatchKind::Equals => format!("(?i)^{}$", regex::escape(&rule.pattern)),
         MatchKind::Luhn | MatchKind::Cidr => unreachable!("non-regex rule handled separately"),
     }
@@ -1233,6 +1234,67 @@ mod tests {
                     .unwrap()
             ]
         );
+    }
+
+    #[test]
+    fn literal_rule_is_case_sensitive_substring() {
+        let rule = WafRule {
+            id: "R1".into(),
+            name: "test".into(),
+            category: "test".into(),
+            severity: Severity::Low,
+            target: RuleTarget::BodyText,
+            match_kind: MatchKind::Literal,
+            pattern: "EVIL-LITERAL".into(),
+            conditions: None,
+            action: RuleAction::Monitor,
+            fp_filters: vec![],
+            paranoia_min: 1,
+            score: None,
+        };
+        let compiled = compile_rules(
+            vec![(rule, false)],
+            &HashSet::new(),
+            &HashMap::new(),
+            None,
+            &HashMap::new(),
+            1,
+        )
+        .expect("compile");
+        let set = compiled.body_bytes.as_ref().unwrap().set;
+        assert!(set.is_match("prefix EVIL-LITERAL suffix"));
+        assert!(!set.is_match("evil-literal"));
+        assert!(!set.is_match("prefix evil-literal suffix"));
+    }
+
+    #[test]
+    fn contains_rule_is_case_insensitive_substring() {
+        let rule = WafRule {
+            id: "R1".into(),
+            name: "test".into(),
+            category: "test".into(),
+            severity: Severity::Low,
+            target: RuleTarget::BodyText,
+            match_kind: MatchKind::Contains,
+            pattern: "EVIL-LITERAL".into(),
+            conditions: None,
+            action: RuleAction::Monitor,
+            fp_filters: vec![],
+            paranoia_min: 1,
+            score: None,
+        };
+        let compiled = compile_rules(
+            vec![(rule, false)],
+            &HashSet::new(),
+            &HashMap::new(),
+            None,
+            &HashMap::new(),
+            1,
+        )
+        .expect("compile");
+        let set = compiled.body_bytes.as_ref().unwrap().set;
+        assert!(set.is_match("prefix EVIL-LITERAL suffix"));
+        assert!(set.is_match("evil-literal"));
     }
 
     #[test]

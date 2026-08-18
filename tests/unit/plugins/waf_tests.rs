@@ -1388,6 +1388,131 @@ async fn decoded_body_rules_scan_leading_zero_numeric_html_entities() {
     );
 }
 
+#[tokio::test]
+async fn literal_match_kind_is_case_sensitive_substring_on_body() {
+    let plugin = Waf::new(&json!({
+        "include_default_rules": false,
+        "custom_rules": [{
+            "id": "CUSTOM-LIT",
+            "name": "literal marker",
+            "category": "custom",
+            "severity": "high",
+            "target": "body_text",
+            "match_kind": "literal",
+            "pattern": "EVIL-LITERAL",
+            "action": "enforce"
+        }]
+    }))
+    .unwrap();
+
+    let mut clean_ctx = ctx("POST", "/custom");
+    clean_ctx
+        .headers
+        .insert("content-type".into(), "text/plain".into());
+    let clean_headers = clean_ctx.headers.clone();
+    let clean_result = plugin
+        .on_final_request_body_with_context(&mut clean_ctx, &clean_headers, b"nope")
+        .await;
+    assert!(matches!(clean_result, PluginResult::Continue));
+    assert!(!clean_ctx.metadata.contains_key("waf.rule_hits"));
+
+    let mut exact_ctx = ctx("POST", "/custom");
+    exact_ctx
+        .headers
+        .insert("content-type".into(), "text/plain".into());
+    let exact_headers = exact_ctx.headers.clone();
+    let exact_result = plugin
+        .on_final_request_body_with_context(
+            &mut exact_ctx,
+            &exact_headers,
+            b"prefix EVIL-LITERAL suffix",
+        )
+        .await;
+    assert!(matches!(exact_result, PluginResult::Reject { .. }));
+    assert_eq!(
+        exact_ctx.metadata.get("waf.rule_hits").map(String::as_str),
+        Some("CUSTOM-LIT")
+    );
+
+    let mut folded_ctx = ctx("POST", "/custom");
+    folded_ctx
+        .headers
+        .insert("content-type".into(), "text/plain".into());
+    let folded_headers = folded_ctx.headers.clone();
+    let folded_result = plugin
+        .on_final_request_body_with_context(&mut folded_ctx, &folded_headers, b"evil-literal")
+        .await;
+    assert!(matches!(folded_result, PluginResult::Continue));
+    assert!(!folded_ctx
+        .metadata
+        .get("waf.rule_hits")
+        .is_some_and(|hits| hits.contains("CUSTOM-LIT")));
+}
+
+#[tokio::test]
+async fn contains_match_kind_stays_case_insensitive_substring() {
+    let plugin = Waf::new(&json!({
+        "include_default_rules": false,
+        "custom_rules": [{
+            "id": "CUSTOM-CONTAINS",
+            "name": "contains marker",
+            "category": "custom",
+            "severity": "high",
+            "target": "body_text",
+            "match_kind": "contains",
+            "pattern": "EVIL-LITERAL",
+            "action": "enforce"
+        }]
+    }))
+    .unwrap();
+
+    let mut folded_ctx = ctx("POST", "/custom");
+    folded_ctx
+        .headers
+        .insert("content-type".into(), "text/plain".into());
+    let folded_headers = folded_ctx.headers.clone();
+    let folded_result = plugin
+        .on_final_request_body_with_context(&mut folded_ctx, &folded_headers, b"evil-literal")
+        .await;
+    assert!(matches!(folded_result, PluginResult::Reject { .. }));
+    assert_eq!(
+        folded_ctx.metadata.get("waf.rule_hits").map(String::as_str),
+        Some("CUSTOM-CONTAINS")
+    );
+}
+
+#[tokio::test]
+async fn regex_match_kind_honors_explicit_case_insensitive_flag() {
+    let plugin = Waf::new(&json!({
+        "include_default_rules": false,
+        "custom_rules": [{
+            "id": "CUSTOM-REGEX-I",
+            "name": "folded regex marker",
+            "category": "custom",
+            "severity": "high",
+            "target": "body_text",
+            "match_kind": "regex",
+            "pattern": "(?i)EVIL-LITERAL",
+            "action": "enforce"
+        }]
+    }))
+    .unwrap();
+
+    let mut folded_ctx = ctx("POST", "/custom");
+    folded_ctx
+        .headers
+        .insert("content-type".into(), "text/plain".into());
+    let folded_headers = folded_ctx.headers.clone();
+    let folded_result = plugin
+        .on_final_request_body_with_context(&mut folded_ctx, &folded_headers, b"evil-literal")
+        .await;
+    assert!(matches!(folded_result, PluginResult::Reject { .. }));
+    assert_eq!(
+        folded_ctx.metadata.get("waf.rule_hits").map(String::as_str),
+        Some("CUSTOM-REGEX-I")
+    );
+}
+
 #[test]
 fn invalid_custom_regex_is_rejected() {
     let err = Waf::new(&json!({

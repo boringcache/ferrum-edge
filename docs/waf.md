@@ -147,6 +147,16 @@ Runtime aliases map onto those targets: `request_headers` → `header_values`,
 
 `match_kind` is one of `regex` (default), `literal`, `contains`, `equals`,
 `luhn` (credit-card checksum; body targets only), or `cidr` (IP membership).
+Semantics:
+
+| Kind | Matching |
+| --- | --- |
+| `regex` | Operator-authored Rust regex. Case sensitivity follows the pattern; use `(?i)…` when you need folding. |
+| `literal` | Case-sensitive Unicode substring. `EVIL-LITERAL` does not match `evil-literal`; the value need not equal the whole field (unlike `equals`). |
+| `contains` | Case-insensitive substring (same substring semantics as `literal`, but folded). |
+| `equals` | Case-insensitive full-value match (anchored; does not prefix-match). |
+| `luhn` | Valid credit-card Luhn checksum on digit runs (body targets only). |
+| `cidr` | IP membership test. |
 
 ## Built-in rule pack
 
