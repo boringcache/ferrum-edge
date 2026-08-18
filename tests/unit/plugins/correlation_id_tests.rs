@@ -989,9 +989,11 @@ async fn omitted_header_records_private_generated_provenance_and_still_forwards(
 
     let logged = clone_log_metadata(&ctx);
     assert_eq!(logged.get("request_id"), Some(&generated));
-    assert!(!logged
-        .keys()
-        .any(|key| key.contains("generated") && key.contains("correlation")));
+    assert!(
+        !logged
+            .keys()
+            .any(|key| key.contains("generated") && key.contains("correlation"))
+    );
 }
 
 #[tokio::test]

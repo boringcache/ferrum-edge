@@ -3152,13 +3152,8 @@ impl Plugin for ResponseCaching {
         // the current request carries it would let an anonymous response omit
         // `Vary` and be replayed downstream to a credentialed request.
         self.merge_mandatory_sensitive_vary_headers(&mut vary_headers);
-        let cache_key = self.extend_base_key_with_vary(
-            ctx,
-            base_key.clone(),
-            &vary_headers,
-            headers,
-            None,
-        );
+        let cache_key =
+            self.extend_base_key_with_vary(ctx, base_key.clone(), &vary_headers, headers, None);
         // Store the full cache key (with Vary dimensions) so on_final_response_body
         // can mark the correct variant-specific key in the uncacheable predictor.
         ctx.metadata

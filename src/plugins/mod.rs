@@ -1616,9 +1616,9 @@ impl CorrelationIdState {
     }
 
     fn is_generated_header(&self, name: &str, value: &str) -> bool {
-        self.generated_headers.iter().any(|(header, generated)| {
-            header.eq_ignore_ascii_case(name) && generated == value
-        })
+        self.generated_headers
+            .iter()
+            .any(|(header, generated)| header.eq_ignore_ascii_case(name) && generated == value)
     }
 
     pub(crate) fn project_correlation_ids(&self, metadata: &mut HashMap<String, String>) {

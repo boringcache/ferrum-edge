@@ -7994,13 +7994,7 @@ async fn absent_correlation_plugin_still_keys_client_supplied_x_request_id() {
 
     let mut anonymous = make_ctx("GET", "/p/no-corr-anon");
     let mut anonymous_headers = HashMap::new();
-    store_public_entry(
-        &cache,
-        &mut anonymous,
-        &mut anonymous_headers,
-        b"anon-body",
-    )
-    .await;
+    store_public_entry(&cache, &mut anonymous, &mut anonymous_headers, b"anon-body").await;
     let mut anonymous_hit = make_ctx("GET", "/p/no-corr-anon");
     let mut anonymous_hit_headers = HashMap::new();
     let (_, body, _) = expect_reject(
