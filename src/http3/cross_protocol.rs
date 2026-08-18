@@ -8211,6 +8211,24 @@ where
         }
     }
 
+    // Unconditional post-relay fail-closed terminal (issue #3995). Every branch
+    // above that ends a COMMITTED response without landing a clean FIN is
+    // supposed to reset the send half, but "latch the termination" and "reset
+    // the stream" were two separate steps, so a branch that only broke out of
+    // the relay left the send half untouched — and `quinn::SendStream::drop`
+    // then implicitly `finish()`es it, handing a stalled client a normal end of
+    // response instead of an authorization failure. Re-asserting the reset here
+    // makes credential expiry a RESET no matter which branch observed it.
+    // `stop_stream` is idempotent (quinn rejects a redundant reset and h3
+    // discards the result), and the predicate is false for a cleanly finished
+    // body, so a successful `finish()` is never clobbered.
+    if crate::http3::stream_util::committed_response_requires_reset(
+        auth_termination.is_some(),
+        body_error_class.is_some(),
+        client_disconnected,
+    ) {
+        crate::http3::stream_util::abort_response_stream(stream);
+    }
     let body_completed = body_error_class.is_none() && !client_disconnected;
     (
         bytes_streamed,
@@ -8485,6 +8503,24 @@ where
         }
     }
 
+    // Unconditional post-relay fail-closed terminal (issue #3995). Every branch
+    // above that ends a COMMITTED response without landing a clean FIN is
+    // supposed to reset the send half, but "latch the termination" and "reset
+    // the stream" were two separate steps, so a branch that only broke out of
+    // the relay left the send half untouched — and `quinn::SendStream::drop`
+    // then implicitly `finish()`es it, handing a stalled client a normal end of
+    // response instead of an authorization failure. Re-asserting the reset here
+    // makes credential expiry a RESET no matter which branch observed it.
+    // `stop_stream` is idempotent (quinn rejects a redundant reset and h3
+    // discards the result), and the predicate is false for a cleanly finished
+    // body, so a successful `finish()` is never clobbered.
+    if crate::http3::stream_util::committed_response_requires_reset(
+        auth_termination.is_some(),
+        body_error_class.is_some(),
+        client_disconnected,
+    ) {
+        crate::http3::stream_util::abort_response_stream(stream);
+    }
     let body_completed = finished && body_error_class.is_none() && !client_disconnected;
     (
         bytes_streamed,
