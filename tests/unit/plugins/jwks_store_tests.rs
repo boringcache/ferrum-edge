@@ -162,6 +162,34 @@ fn oversized_jwk_component_is_rejected() {
     assert!(JwksKeyStore::from_inline_jwks(&jwks).is_err());
 }
 
+#[test]
+fn jwks_requires_unique_non_empty_key_identifiers() {
+    let key = |kid: Option<&str>| {
+        let mut key = json!({
+            "kty": "RSA",
+            "use": "sig",
+            "alg": "RS256",
+            "n": "AQAB",
+            "e": "AQAB"
+        });
+        if let Some(kid) = kid {
+            key["kid"] = json!(kid);
+        }
+        key
+    };
+
+    for rejected in [
+        json!({"keys": [key(None)]}),
+        json!({"keys": [key(Some(""))]}),
+        json!({"keys": [key(Some("duplicate")), key(Some("duplicate"))]}),
+    ] {
+        assert!(
+            JwksKeyStore::from_inline_jwks(&rejected.to_string()).is_err(),
+            "unaddressable or ambiguous signing keys must fail closed"
+        );
+    }
+}
+
 /// A minimal but well-formed RSA JWKS with one signing key.
 ///
 /// `DecodingKey::from_rsa_raw_components` stores the components without
