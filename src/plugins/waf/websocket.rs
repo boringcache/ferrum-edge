@@ -342,7 +342,8 @@ impl WafWsSession {
                     rule_name = %rule.name,
                     severity = %rule.severity.as_str(),
                     category = %rule.category,
-                    action = %rule.action.as_event_action(),
+                    action = %rule.action.effective_log_action(enforcing_globally),
+                    rule_action = %rule.action,
                     target_field = %hit.target_name,
                     "WAF rule matched on a WebSocket message"
                 );
