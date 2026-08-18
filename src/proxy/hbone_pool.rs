@@ -370,6 +370,26 @@ impl HbonePoolError {
             | Self::MissingCrossClusterAuthorityHost => "cross-cluster target misconfigured",
         }
     }
+
+    /// The peer's own CONNECT admission status, when the public body may carry
+    /// it. Only [`Self::ConnectRejected`] has one; every other variant returns
+    /// `None`, so no other failure can grow a numeric suffix.
+    ///
+    /// A three-digit HTTP status is the coarse outcome of the PEER's admission
+    /// decision — not an address, an identity, a certificate subject, or
+    /// verifier text — and it is the only thing that separates an
+    /// authorization denial (`403`) from a peer outage on an otherwise
+    /// identical tunnel refusal. The NodeWaypoint eBPF live gate
+    /// (`tests/k8s/node_waypoint_ebpf_live/run.sh`) matches on it to prove a
+    /// forged HBONE baggage assertion was refused by destination POLICY rather
+    /// than by any other transport failure, so collapsing it into the bare
+    /// reason would silently coarsen that security check.
+    pub fn public_status(&self) -> Option<u16> {
+        match self {
+            Self::ConnectRejected { status, .. } => Some(*status),
+            _ => None,
+        }
+    }
 }
 
 /// Which mesh transport a client-visible dispatch failure came from.
@@ -421,16 +441,27 @@ impl MeshTransportLabel {
     }
 
     /// Fixed JSON error body carrying the enumerated public reason from
-    /// [`HbonePoolError::public_reason`]. Accept the typed error rather than a
-    /// caller-supplied string so the redaction boundary is structural: a
-    /// future call site cannot accidentally pass `Display` (or another
-    /// peer-derived value) into the client body.
+    /// [`HbonePoolError::public_reason`], plus the peer's own admission status
+    /// where [`HbonePoolError::public_status`] reports one. Accept the typed
+    /// error rather than a caller-supplied string so the redaction boundary is
+    /// structural: a future call site cannot accidentally pass `Display` (or
+    /// another peer-derived value) into the client body.
     pub fn unavailable_body_for_error(self, error: &HbonePoolError) -> String {
-        format!(
-            r#"{{"error":"{}: {}"}}"#,
-            self.unavailable_noun(),
-            error.public_reason()
-        )
+        match error.public_status() {
+            // Peer-decided admission status only (see
+            // [`HbonePoolError::public_status`]); it is rendered from a `u16`,
+            // so it can carry no peer-controlled text into the JSON body.
+            Some(status) => format!(
+                r#"{{"error":"{}: {} with status {status}"}}"#,
+                self.unavailable_noun(),
+                error.public_reason()
+            ),
+            None => format!(
+                r#"{{"error":"{}: {}"}}"#,
+                self.unavailable_noun(),
+                error.public_reason()
+            ),
+        }
     }
 
     /// Operator-log noun for this transport. Used where the client-visible

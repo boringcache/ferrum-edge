@@ -102,6 +102,52 @@ fn ambient_handshake_failure_body_still_says_hbone() {
     );
 }
 
+#[test]
+fn connect_rejection_keeps_the_peer_admission_status_and_nothing_else() {
+    // Issue #3927 redacts the CONNECT authority, but NOT the peer's own
+    // admission status: a destination HBONE policy denial (403) has to stay
+    // distinguishable from any other tunnel refusal, and the NodeWaypoint
+    // eBPF live gate matches this exact body to prove a forged baggage
+    // assertion was refused by POLICY. A `u16` cannot carry peer-controlled
+    // text, so the suffix is not a redaction hole.
+    let error = HbonePoolError::ConnectRejected {
+        authority: SECRET_HOST.to_string(),
+        status: 403,
+    };
+    assert_eq!(error.public_status(), Some(403));
+    assert_eq!(
+        MeshTransportLabel::Hbone.unavailable_body_for_error(&error),
+        r#"{"error":"HBONE backend unavailable: tunnel rejected by peer with status 403"}"#
+    );
+    assert_eq!(
+        MeshTransportLabel::SidecarMtls.unavailable_body_for_error(&error),
+        r#"{"error":"Sidecar mTLS backend unavailable: tunnel rejected by peer with status 403"}"#
+    );
+}
+
+#[test]
+fn no_other_variant_grows_a_status_suffix() {
+    // The numeric suffix is variant-scoped. If another variant ever reported a
+    // status, its public body would start carrying a peer-influenced value
+    // that no test pins.
+    for err in [
+        tls_handshake_error(),
+        HbonePoolError::ConnectTimeout {
+            addr: SECRET_HOST.to_string(),
+            timeout_ms: 250,
+        },
+        HbonePoolError::ConnectStream {
+            authority: SECRET_HOST.to_string(),
+            message: SECRET_VERIFIER_TEXT.to_string(),
+        },
+        HbonePoolError::TrustWithdrawn,
+    ] {
+        assert_eq!(err.public_status(), None, "{err}");
+        let body = MeshTransportLabel::Hbone.unavailable_body_for_error(&err);
+        assert!(!body.contains("with status"), "{body}");
+    }
+}
+
 // ── Redaction contract ────────────────────────────────────────────────────
 
 #[test]
@@ -192,7 +238,10 @@ fn shared_server_name_error_is_transport_neutral_in_operator_logs() {
         message: SECRET_VERIFIER_TEXT.to_string(),
     }
     .to_string();
-    assert!(rendered.contains("invalid mesh TLS server name"), "{rendered}");
+    assert!(
+        rendered.contains("invalid mesh TLS server name"),
+        "{rendered}"
+    );
     assert!(
         !rendered.contains("HBONE"),
         "the shared error may be logged by the sidecar transport: {rendered}"
