@@ -30,6 +30,12 @@ from validate_live_assertions import (
 from verify_mesh_performance_baselines_workflow import (
     main as mesh_baselines_workflow_main,
 )
+from verify_install_docs_contract import (
+    run_self_test as install_docs_contract_self_test,
+)
+from verify_install_docs_contract import (
+    check_repository as check_install_docs_contract,
+)
 from verify_release_image_attestations import (
     run_self_test as release_attestation_self_test,
 )
@@ -1533,6 +1539,8 @@ def main() -> int:
         planner_errors.extend(chart_runtime_findings)
     planner_errors.extend(validate_artifact_gate_wiring())
     planner_errors.extend(error.format() for error in check_repository())
+    planner_errors.extend(install_docs_contract_self_test())
+    planner_errors.extend(check_install_docs_contract())
     release_yml = Path(".github/workflows/release.yml").read_text(encoding="utf-8")
     planner_errors.extend(validate_release_workflow(release_yml))
     planner_errors.extend(release_attestation_self_test(release_yml))
