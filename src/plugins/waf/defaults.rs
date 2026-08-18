@@ -1,4 +1,4 @@
-use super::rules::{MatchKind, RuleAction, RuleTarget, Severity, WafRule};
+use super::rules::{DefaultActionPolicy, MatchKind, RuleAction, RuleTarget, Severity, WafRule};
 
 /// Tightened XSS event-handler attribute list. The original `on[a-z]{3,32}=`
 /// matched benign fields like `online=`/`onset=`; this enumerates real DOM
@@ -116,6 +116,15 @@ pub fn default_rules() -> Vec<WafRule> {
             }
             _ => {}
         }
+        // Encoding-evasion heuristics false-positive on benign percent-encoded
+        // text (coupon codes like SAVE50%25, pasted `%00` / overlong UTF-8).
+        // They stay Monitor under bulk `default_rule_action: enforce`; only an
+        // explicit per-rule action promotes them. Other built-in specials
+        // (HPP, method abuse, encoded path-traversal `%00`) inherit bulk
+        // enforce — they are attack-shaped rather than encoding-heuristic.
+        if matches!(rule.id.as_str(), "FE-ENCODING-001" | "FE-ENCODING-002") {
+            rule.default_action_policy = DefaultActionPolicy::OptInEnforce;
+        }
         rule
     })
     .collect()
@@ -154,6 +163,7 @@ fn rp(
         pattern: pattern.to_string(),
         conditions: None,
         action: RuleAction::Monitor,
+        default_action_policy: DefaultActionPolicy::Inherit,
         fp_filters: Vec::new(),
         paranoia_min,
         score: None,

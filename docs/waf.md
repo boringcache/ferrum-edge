@@ -46,9 +46,13 @@ default: deploy the WAF, watch what it flags, then enforce deliberately. It
 also means `mode: enforce` **alone does not block anything** — you must opt
 rules into enforcement. There are three ways:
 
-1. **`default_rule_action`** — bulk-set the action of every built-in rule.
-   `default_rule_action: "enforce"` enforces the whole pack (still subject to
-   `paranoia_level`; see below). `rule_modes` overrides still win per rule.
+1. **`default_rule_action`** — bulk-set the action of built-in rules that
+   inherit it. `default_rule_action: "enforce"` enforces the low-false-positive
+   core of the pack (still subject to `paranoia_level`; see below). Heuristic
+   encoding-evasion rules (`FE-ENCODING-001`, `FE-ENCODING-002`) stay
+   **monitor** under that bulk switch; only an explicit per-rule `rule_modes`
+   or `rule_overrides.action` entry promotes them. Other `rule_modes` overrides
+   still win per rule.
 2. **`rule_modes`** — set the action of individual rules by id:
    `{"FE-SQLI-001": "enforce"}`.
 3. **anomaly scoring** — keep rules in `monitor` and block on the aggregate
@@ -61,7 +65,9 @@ below), the recommended starting posture for active blocking is:
 { "mode": "enforce", "default_rule_action": "enforce", "paranoia_level": 1 }
 ```
 
-This enforces only the low-false-positive core of the rule pack.
+This enforces only the low-false-positive core of the rule pack. Encoding
+heuristics remain monitor-only under this posture; promote them with
+`rule_modes` after confirming they are clean for your traffic.
 
 ### Strict configuration admission
 
@@ -125,9 +131,13 @@ Note that body marker detection is a heuristic: a benign body that legitimately
 contains a literal encoded marker (e.g. `code=SAVE50%25`, a `%00` in free text,
 or `%c0%ae` in a paste) can raise `FE-ENCODING-001` or `FE-ENCODING-002`.
 This is why both rules default to **Monitor** (they record `waf.rule_hits`
-metadata rather than blocking) even when the WAF is in `enforce` mode —
-operators opt a rule into blocking explicitly via `rule_modes` once they have
-confirmed it is clean for their traffic.
+metadata rather than blocking) even under the recommended `mode: enforce` +
+`default_rule_action: enforce` posture — operators opt a rule into blocking
+explicitly via `rule_modes` (or `rule_overrides.action`) once they have
+confirmed it is clean for their traffic. Global `mode: monitor` or `disabled`
+still dominates: a promoted encoding rule only logs in monitor mode and is
+not evaluated when the plugin is disabled. `waf.action` / `waf.score` /
+stdout `action=` fields report that compile-time effective disposition.
 
 ## Rule targets
 
@@ -172,7 +182,7 @@ and `rule_overrides`. Categories:
 | `deserialization` | FE-DESER-001..003 | Java / .NET / PHP markers |
 | `header_anomaly` | FE-HEADER-001..003 | control chars, method-override, header-borne injection (L2) |
 | `cookie_attack` | FE-COOKIE-001, FE-COOKIE-002 (Info, L3) | |
-| `encoding_evasion` / `parameter_pollution` / `method_abuse` | FE-ENCODING-001..002, FE-HPP-001, FE-METHOD-001 | |
+| `encoding_evasion` / `parameter_pollution` / `method_abuse` | FE-ENCODING-001..002, FE-HPP-001, FE-METHOD-001 | encoding heuristics stay monitor under bulk `default_rule_action: enforce`; HPP and method-abuse inherit bulk enforce |
 | stack trace / db error / source / fingerprint disclosure | FE-RESP-* | response-side; requires `response_inspection` |
 | `data_leak` | FE-DATA-LEAK-001..006 | credit card (Luhn), AWS/Stripe/GitHub keys, JWT (L2), private key |
 
@@ -327,12 +337,15 @@ gateway's own default body ceilings (`FERRUM_MAX_REQUEST_BODY_SIZE_BYTES` /
 anomaly `scoring` has an applicable rule reading that direction's body or at
 least one applicable `action: enforce` rule reads it — `body_text` /
 `body_json_path` for requests, `response_body` for responses, plus the
-body-scoped `FE-ENCODING-001` / `FE-ENCODING-002` specials, which read both. A
-rule is applicable only when its path, method, header, and consumer conditions
+body-scoped `FE-ENCODING-001` / `FE-ENCODING-002` specials when those rules
+are themselves enforce (they read both directions). A rule is applicable only
+when its path, method, header, and consumer conditions
 match the current request. A request-wide `global_exemptions.header_present`
 match also suppresses both rule hits and this fail-closed decision. Built-in
-rules are monitor-only unless you set `default_rule_action` or `rule_modes`, so
-a purely observational WAF (and any `mode: monitor` WAF) keeps prefix-scanning
+rules are monitor-only unless you set `default_rule_action` or `rule_modes`.
+Encoding-evasion specials additionally stay monitor under bulk
+`default_rule_action: enforce` until an explicit per-rule action promotes them,
+so a purely observational WAF (and any `mode: monitor` WAF) keeps prefix-scanning
 and never starts blocking. Requests and responses share one decision, so H1,
 H2, and H3 behave identically, and the request decision is made on the finalized
 backend-visible body — a request transformer that grows a body past the cap is
@@ -614,7 +627,7 @@ fire, then switch to `enforce`.
 | Field | Type | Default | Description |
 | --- | --- | --- | --- |
 | `mode` | enum | `enforce` | `enforce` / `monitor` / `disabled` |
-| `default_rule_action` | enum | _(unset)_ | bulk action for built-ins; `rule_modes` overrides win |
+| `default_rule_action` | enum | _(unset)_ | bulk action for built-ins that inherit it; encoding heuristics stay monitor until `rule_modes`; `rule_modes` overrides win |
 | `paranoia_level` | int 1–4 | `1` | activate rules with `paranoia_min <= level` |
 | `request_inspection` | bool | `true` | scan request metadata |
 | `request_body_inspection` | bool | `true` | scan request bodies |

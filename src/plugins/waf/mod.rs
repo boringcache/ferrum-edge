@@ -359,7 +359,9 @@ impl Waf {
             .collect::<HashSet<_>>();
         let rule_modes = parse_rule_modes(object.get("rule_modes"))?;
         // Bulk action for built-in rules. Unset preserves the safe monitor-only
-        // default; `rule_modes` still overrides individual rules either way.
+        // default. Compile-time resolution in `compile_rules` skips bulk Enforce
+        // for OptInEnforce pack metadata (encoding heuristics); explicit
+        // `rule_modes` / `rule_overrides.action` still promote those rules.
         let default_rule_action = optional_string(object, "default_rule_action")?
             .map(|raw| parse_rule_action(&raw, "default_rule_action"))
             .transpose()?;
