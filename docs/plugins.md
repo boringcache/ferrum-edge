@@ -3623,7 +3623,9 @@ config:
 
 Returns a predefined response without proxying to the backend. Useful for maintenance mode, mocking, or header/path-based short-circuiting. It runs immediately after CORS so browser preflight requests still receive valid CORS responses, and opted-in header plugins such as CORS can still decorate the rejected response.
 
-The response body and `Content-Type` are rendered **once** at construction time — the request hot path skips `format!()`, JSON/XML escaping, and `String::replace()` chains entirely. Repeated dispatch returns identical, immutable bytes.
+The response body and `Content-Type` are rendered **once** at construction time — the request hot path skips `format!()`, JSON/XML parsing and escaping, and `String::replace()` chains entirely. Repeated dispatch returns identical, immutable bytes.
+
+When `content_type` classifies as JSON (`json` or `+json`) and `message` is a complete, unambiguous JSON value, that value is the response body: the parsed document is compactly serialized rather than string-escaped inside the legacy `{"message":...,"status_code":...}` envelope. Objects, arrays, strings, numbers, booleans, and `null` all pass through this way. Malformed JSON, duplicate object member names, and other parser-ambiguous documents fail safe into that envelope so the response stays valid JSON and construction never panics. XML media types keep the `<response><message>…</message><status_code>…</status_code></response>` envelope. Every other content type emits `message` as plain text. Use `body` when the exact bytes must be preserved (including pretty-printed JSON).
 
 Configuration must be a top-level object. Accepted keys are `status_code`, `content_type`, `body`, `message`, and `trigger`; unknown top-level or nested `trigger` keys are rejected instead of being ignored (a typo such as `triger` must not silently become unconditional termination). Scalar/array/`null` configs are rejected, and explicit `null` is rejected for every property; omit an optional property to select its documented default. When present, `trigger` must select exactly one mode: `path_prefix`, or `header` with an optional `header_value`; an empty trigger or a detached `header_value` is rejected. `{}` remains the intentional maintenance-mode default.
 
@@ -3635,7 +3637,7 @@ Configuration must be a top-level object. Accepted keys are `status_code`, `cont
 | `status_code` | u16 | `503` | Final HTTP status (200–599). Informational statuses including `101` and out-of-range values are rejected at construction. `204`/`205`/`304` force an empty body (explicit non-empty `body` is rejected). A configured 2xx never establishes a CONNECT/Extended CONNECT tunnel — those requests fail closed with `403`. |
 | `body` | String | _(omit)_ | Explicit response body. Field presence — including `body: ""` — is authoritative and suppresses `message`. Omitting the field selects the default renderer. |
 | `content_type` | String | `application/json` | Response `Content-Type` header. Default-body formatting uses exact subtype `json`/`xml` or RFC 6838 `+json`/`+xml` suffixes after parameter stripping — not arbitrary substrings (`application/notjson` is plain text). |
-| `message` | String | `"Service unavailable"` | Builds the default JSON / XML / plain-text body when `body` is omitted. JSON escaping is applied automatically. For XML media types, the message must contain only XML 1.0-legal characters (tab/LF/CR and the XML Char ranges); illegal controls are rejected. |
+| `message` | String | `"Service unavailable"` | Builds the default body when `body` is omitted. For JSON media types, a complete unambiguous JSON `message` is emitted as the body; malformed or parser-ambiguous JSON fails safe into the `{message,status_code}` envelope. XML types wrap the message in `<message>` (XML 1.0-legal characters only; illegal controls are rejected). Other types emit `message` as plain text. |
 | `trigger.path_prefix` | String | _(none)_ | Only terminate when the [canonical policy path](request_path_canonicalization.md) starts with this prefix. Must start with `/` (or be exactly `*` to match the asterisk-form target of a server-wide `OPTIONS *` request) and contain no control characters; any other value can never match a request path. The prefix must itself already be canonical: no percent escape (none survives canonicalization), no literal `\`, and no literal `.`/`..` segment (no canonical path can contain one). `/%61dmin`, `/api%20name`, `/api/../admin`, and `/api\admin` are rejected at admission rather than silently never matching — a request spelled the first way arrives as `/admin`, and the other three are refused with `400` before the plugin runs. A `.` inside a segment (`/v1.0/`) is fine. Mutually exclusive with `trigger.header`. |
 | `trigger.header` | String | _(none)_ | Only terminate when this request header is present on any raw field line (including non-UTF-8 values). Header name is matched case-insensitively. Mutually exclusive with `trigger.path_prefix`. |
 | `trigger.header_value` | String | `""` | Optional exact value for `trigger.header`. Empty matches presence. A non-empty value matches any individual field line exactly — never a comma-folded multi-line serialization. |
@@ -3648,6 +3650,13 @@ plugin_name: request_termination
 config:
   status_code: 503
   message: Scheduled maintenance — back at 02:00 UTC
+
+# JSON content type + JSON message: the object is the body, not an envelope
+plugin_name: request_termination
+config:
+  status_code: 503
+  content_type: application/json
+  message: '{"error":"scheduled-maintenance"}'
 
 # Block /admin during business hours but pass other paths through
 plugin_name: request_termination
