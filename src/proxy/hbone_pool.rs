@@ -332,6 +332,128 @@ impl HbonePoolError {
             _ => false,
         }
     }
+
+    /// A fixed, enumerated, redaction-safe public reason for this failure.
+    ///
+    /// Issue #3927: the client-visible body used to interpolate `Display`,
+    /// which leaks the peer address, the CONNECT authority, and the raw rustls
+    /// / SPIFFE verifier text (`invalid peer certificate: BadSignature`,
+    /// subject names, trust-domain values). Every arm here is a `&'static str`
+    /// chosen from the error VARIANT alone, so no host, address, SPIFFE ID,
+    /// certificate subject, trust root, key material, or source-error text can
+    /// reach a client through it. The full `Display` still goes to the
+    /// operator-side `error!` log, which is where it belongs.
+    ///
+    /// Keep the reasons coarse: they name the phase that failed, never why the
+    /// peer rejected us.
+    pub fn public_reason(&self) -> &'static str {
+        match self {
+            Self::NoSvid | Self::NoLeafCert => "gateway identity unavailable",
+            Self::DnsLookup { .. } | Self::InvalidServerName { .. } => "DNS resolution failed",
+            Self::ConnectTimeout { .. } => "connect timed out",
+            Self::Connect { .. } => "TCP connect failed",
+            Self::InvalidDialHostTag { .. }
+            | Self::InvalidAuthorityHostTag { .. }
+            | Self::InvalidPeerSpiffeTag { .. } => "invalid mesh target metadata",
+            Self::TlsConfig(_) => "TLS configuration failed",
+            Self::TlsHandshake { .. } => "TLS handshake failed",
+            Self::H2Handshake { .. } => "HTTP/2 handshake failed",
+            Self::InvalidConnectRequest { .. } | Self::ConnectStream { .. } => {
+                "tunnel setup failed"
+            }
+            Self::ConnectRejected { .. } => "tunnel rejected by peer",
+            Self::TrustWithdrawn => "gateway trust authority withdrawn",
+            Self::MaxConnectionsExceeded { .. } => "backend connection limit reached",
+            Self::ExtendedConnectUnsupported { .. } => "peer does not support WebSocket tunneling",
+            Self::MissingCrossClusterSni
+            | Self::MissingCrossClusterTrustDomain
+            | Self::MissingCrossClusterAuthorityHost => "cross-cluster target misconfigured",
+        }
+    }
+}
+
+/// Which mesh transport a client-visible dispatch failure came from.
+///
+/// Issue #3927: the Sidecar SVID-mTLS pool and the Ambient HBONE pool share
+/// [`HbonePoolError`] because they share every failure shape, but they are not
+/// the same topology and must not describe themselves the same way to a
+/// client. A Sidecar outbound dial is plain HTTP/2 over mutual TLS to the peer
+/// sidecar's `:15006` inbound listener — there is no HBONE tunnel anywhere in
+/// it — so labeling its handshake failure "HBONE backend unavailable" sends the
+/// operator to debug a CONNECT tunnel that was never opened. Ambient/waypoint
+/// dispatch really does ride HTTP/2 CONNECT over `:15008` and keeps the HBONE
+/// wording.
+///
+/// The label only selects the fixed public noun; classification, retry
+/// accounting, and logging are identical on both transports.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MeshTransportLabel {
+    /// Ambient / waypoint HTTP/2 CONNECT tunnel (`:15008`).
+    Hbone,
+    /// Sidecar SVID-mTLS to a peer sidecar's inbound listener (`:15006`).
+    SidecarMtls,
+}
+
+impl MeshTransportLabel {
+    /// Client-visible noun for a dispatch failure on this transport.
+    pub fn unavailable_noun(self) -> &'static str {
+        match self {
+            Self::Hbone => "HBONE backend unavailable",
+            Self::SidecarMtls => "Sidecar mTLS backend unavailable",
+        }
+    }
+
+    /// Fixed JSON error body for a dispatch failure with no further public
+    /// detail (a post-dial hyper error, where the cause is already in the log).
+    pub fn unavailable_body(self) -> &'static str {
+        match self {
+            Self::Hbone => r#"{"error":"HBONE backend unavailable"}"#,
+            Self::SidecarMtls => r#"{"error":"Sidecar mTLS backend unavailable"}"#,
+        }
+    }
+
+    /// Fixed JSON error body for a name-resolution failure on this transport.
+    pub fn dns_failure_body(self) -> &'static str {
+        match self {
+            Self::Hbone => r#"{"error":"DNS resolution for HBONE backend failed"}"#,
+            Self::SidecarMtls => r#"{"error":"DNS resolution for sidecar mTLS backend failed"}"#,
+        }
+    }
+
+    /// Fixed JSON error body carrying the enumerated public reason from
+    /// [`HbonePoolError::public_reason`]. Both halves are `&'static str`, so no
+    /// peer address, certificate subject, SPIFFE ID, trust root, or raw
+    /// verifier text can reach the client through this body.
+    pub fn unavailable_body_with_reason(self, reason: &'static str) -> String {
+        format!(r#"{{"error":"{}: {}"}}"#, self.unavailable_noun(), reason)
+    }
+
+    /// Operator-log noun for this transport. Used where the client-visible
+    /// surface is transport-neutral (body-ceiling refusals) but the log must
+    /// still name the right datapath.
+    pub fn log_noun(self) -> &'static str {
+        match self {
+            Self::Hbone => "HBONE",
+            Self::SidecarMtls => "Sidecar mTLS",
+        }
+    }
+
+    /// Fixed `error!` message for a dispatch failure on this transport.
+    pub fn dispatch_failure_log_message(self) -> &'static str {
+        match self {
+            Self::Hbone => "HBONE backend request failed",
+            Self::SidecarMtls => "Sidecar mTLS backend request failed",
+        }
+    }
+
+    /// Fixed `error!` message for a tunneled/pooled HTTP failure after the
+    /// transport was established.
+    pub fn tunneled_failure_log_message(self) -> &'static str {
+        match self {
+            Self::Hbone => "HBONE tunneled HTTP request failed",
+            Self::SidecarMtls => "Sidecar mTLS HTTP request failed",
+        }
+    }
 }
 
 /// Distinguish affirmative TLS protocol/identity rejection from a connection
