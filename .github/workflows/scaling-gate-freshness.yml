@@ -1,9 +1,10 @@
 name: Scheduled Scaling Gate Freshness
 
-# Daily fail-closed check that the weekly Scheduled Scaling Regression gate
-# last succeeded on main within eight days. Reuses the same issue publisher
-# as scaling-regression.yml so a red streak or a silently skipped/disabled
-# schedule cannot look launch-ready. Does not run the 10k/30k suites.
+# Daily fail-closed check of the latest Scheduled Scaling Regression run on
+# main. Only a completed success within eight days may close the blocker; a
+# newer red, skipped, or still-running run, or stale/missing history, keeps
+# it open. Reuses the same issue publisher as scaling-regression.yml. Does
+# not run the 10k/30k suites.
 
 on:
   schedule:

@@ -32,6 +32,14 @@ REQUIRED_CHECK_NAMES = (
     "Launch Readiness Gate",
     "Launch Readiness Integrity",
 )
+REQUIRED_LATEST_RUN_SELF_TESTS = (
+    "newer failure plus older fresh success",
+    "latest in-progress plus older success",
+    "latest fresh success",
+    "stale latest success",
+    "malformed latest item",
+    "future timestamp",
+)
 
 
 def parse_args() -> argparse.Namespace:
@@ -201,6 +209,34 @@ def validate_signal_text(text: str, failures: list[str]) -> None:
     require("search/issues" not in text, "signal must not use full-text issue search", failures)
     require('SIGNAL_AUTHOR = "github-actions[bot]"' in text, "signal must require the Actions bot author", failures)
     require('"state": "all"' in text, "signal must list issues with state=all", failures)
+    production, sep, self_test_src = text.partition("def self_test")
+    require(sep == "def self_test", "signal must define self_test", failures)
+    require(
+        "def latest_run_on_main" in production,
+        "signal must inspect the latest scaling-regression run on main",
+        failures,
+    )
+    require(
+        '"status": "success"' not in production,
+        "freshness must not query only successful workflow runs",
+        failures,
+    )
+    require(
+        "out of order" in production,
+        "signal must fail closed on out-of-order workflow run history",
+        failures,
+    )
+    require(
+        "in_progress" in production,
+        "signal must fail closed when the latest scaling run is still in progress",
+        failures,
+    )
+    for label in REQUIRED_LATEST_RUN_SELF_TESTS:
+        require(
+            label in self_test_src,
+            f"signal self-test must cover {label}",
+            failures,
+        )
     for name in REQUIRED_CHECK_NAMES:
         require(
             name not in text,
@@ -349,6 +385,50 @@ jobs:
     validate_workflow_text("on:\n  pull_request:\n", bad_workflow_failures)
     if not bad_workflow_failures:
         failures.append("self-test expected pull_request workflow to fail")
+
+    good_signal = """
+MAX_AGE_SECONDS = 8 * 24 * 60 * 60
+ISSUE_LABELS = ("launch-blocker", "severity:high")
+ferrum-scaling-gate-signal
+pull_request
+ref == "refs/heads/main"
+fail-closed
+SIGNAL_AUTHOR = "github-actions[bot]"
+"state": "all"
+def latest_run_on_main
+in_progress
+out of order
+def self_test
+newer failure plus older fresh success
+latest in-progress plus older success
+latest fresh success
+stale latest success
+malformed latest item
+future timestamp
+"""
+    signal_failures: list[str] = []
+    validate_signal_text(good_signal, signal_failures)
+    if signal_failures:
+        failures.append(f"self-test unexpectedly rejected good signal: {signal_failures}")
+
+    success_only_failures: list[str] = []
+    validate_signal_text(
+        good_signal.replace(
+            "def latest_run_on_main",
+            '"status": "success"\ndef latest_run_on_main',
+        ),
+        success_only_failures,
+    )
+    if not any("successful workflow runs" in item for item in success_only_failures):
+        failures.append("self-test expected status=success freshness query to fail")
+
+    missing_label_failures: list[str] = []
+    validate_signal_text(
+        good_signal.replace("newer failure plus older fresh success\n", ""),
+        missing_label_failures,
+    )
+    if not any("newer failure plus older fresh success" in item for item in missing_label_failures):
+        failures.append("self-test expected missing latest-run self-test label to fail")
 
     if failures:
         for failure in failures:

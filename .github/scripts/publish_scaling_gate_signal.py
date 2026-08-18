@@ -1,16 +1,20 @@
 #!/usr/bin/env python3
 """Durable signal for Scheduled Scaling Regression (issue #3892).
 
-When the weekly scale/load matrix is red, or the last successful run on `main`
-is older than the freshness ceiling, this program upserts a GitHub issue labeled
-`launch-blocker` + `severity:high`. A fresh green run closes that issue as
-completed. Launch-readiness therefore cannot stay green while the scaling gate
-is red or stale.
+When the weekly scale/load matrix is red, or the latest scaling-regression run
+on `main` is not a completed success within the freshness ceiling, this program
+upserts a GitHub issue labeled `launch-blocker` + `severity:high`. The current
+matrix result is authoritative for the scaling workflow itself: success closes,
+failure/cancel/timeout opens. Freshness inspects the latest run on `main` and
+must not treat an older success as green over a newer non-success. Only a
+latest completed success within the ceiling closes the issue. Launch-readiness
+therefore cannot stay green while the scaling gate is red or stale.
 
 The program never grants itself extra credentials: it uses the job-scoped
 GITHUB_TOKEN with `issues: write` and `actions: read` only. It refuses
 pull_request events and refuses to mutate issues off `refs/heads/main`.
-Missing, malformed, or API-failed history is treated as stale (fail-closed).
+Missing, malformed, out-of-order, future-dated, or API-failed history is
+treated as stale (fail-closed).
 """
 
 from __future__ import annotations
@@ -24,7 +28,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any, Callable
 
 
@@ -35,6 +39,7 @@ SIGNAL_AUTHOR = "github-actions[bot]"
 ISSUE_LIST_PER_PAGE = 30
 ISSUE_LIST_MAX_PAGES = 5
 WORKFLOW_FILE = "scaling-regression.yml"
+WORKFLOW_RUN_LIST_PER_PAGE = 5
 # Weekly cadence (7d) plus one day so Sunday–Friday freshness checks do not
 # fire between a healthy Saturday run and the next scheduled window.
 MAX_AGE_SECONDS = 8 * 24 * 60 * 60
@@ -48,6 +53,9 @@ REPO_RE = re.compile(r"^[\w.-]+/[\w.-]+$")
 RED_RESULTS = frozenset({"failure", "cancelled", "timed_out"})
 GREEN_RESULTS = frozenset({"success"})
 SKIPPED_RESULTS = frozenset({"skipped", ""})
+NON_TERMINAL_STATUSES = frozenset(
+    {"queued", "in_progress", "waiting", "requested", "pending"}
+)
 
 
 class SignalError(Exception):
@@ -62,6 +70,13 @@ class Decision:
     action: str  # "open" | "close"
     reason: str
     fail_job: bool
+
+
+@dataclass(frozen=True)
+class LatestRun:
+    status: str
+    conclusion: str | None
+    age_seconds: int
 
 
 def utc_now() -> datetime:
@@ -82,10 +97,16 @@ def parse_iso8601(value: Any, label: str = "timestamp") -> datetime:
 
 def decide(
     job_result: str,
-    last_success_age_seconds: int | None,
+    latest: LatestRun | None,
     history_error: str | None,
 ) -> Decision:
-    """Pure policy. `last_success_age_seconds` is None when no success exists."""
+    """Pure policy. Current matrix success/failure/cancel/timeout is authoritative.
+
+    Freshness (`skipped`) inspects the latest scaling-regression run on `main`.
+    Only a latest completed success within the ceiling may close. A newer
+    non-success, in-progress, malformed, or missing history cannot be greened
+    by an older success.
+    """
 
     result = (job_result or "").strip().lower()
     if result in GREEN_RESULTS:
@@ -96,15 +117,25 @@ def decide(
         return Decision("open", f"unknown scaling job result {result!r}", True)
     if history_error:
         return Decision("open", f"scaling history unknown: {history_error}", True)
-    if last_success_age_seconds is None:
-        return Decision("open", "no successful scaling run on main", True)
-    if last_success_age_seconds > MAX_AGE_SECONDS:
-        return Decision(
-            "open",
-            f"last successful scaling run is {last_success_age_seconds}s old",
-            True,
-        )
-    return Decision("close", "last successful scaling run is within freshness", False)
+    if latest is None:
+        return Decision("open", "no scaling-regression run on main", True)
+    status = (latest.status or "").strip().lower()
+    conclusion = (latest.conclusion or "").strip().lower()
+    if status in NON_TERMINAL_STATUSES:
+        return Decision("open", f"latest scaling run is {status}", True)
+    if status != "completed":
+        return Decision("open", f"unknown latest scaling run status {status!r}", True)
+    if conclusion in GREEN_RESULTS:
+        if latest.age_seconds > MAX_AGE_SECONDS:
+            return Decision(
+                "open",
+                f"latest successful scaling run is {latest.age_seconds}s old",
+                True,
+            )
+        return Decision("close", "latest successful scaling run is within freshness", False)
+    if not conclusion:
+        return Decision("open", "latest scaling run conclusion is missing", True)
+    return Decision("open", f"latest scaling run conclusion is {conclusion}", True)
 
 
 def issue_body(reason: str, run_url: str) -> str:
@@ -162,17 +193,24 @@ def api_request(
         raise SignalError("api", f"GitHub API transport error: {exc}") from exc
 
 
-def last_success_age_seconds(
+def latest_run_on_main(
     repo: str,
     token: str,
     now: datetime,
     request: Callable[[str, str, str, dict[str, Any] | None], Any] = api_request,
-) -> tuple[int | None, str | None]:
+) -> tuple[LatestRun | None, str | None]:
+    """Return the newest scaling-regression run on `main`, not the last success.
+
+    GitHub lists workflow runs by created_at descending. Freshness must honor
+    that order: a newer failure, cancel, timeout, skip, or in-progress run
+    cannot be greened by an older success still inside the eight-day window.
+    Out-of-order, malformed, or future-dated history fails closed.
+    """
+
     query = urllib.parse.urlencode(
         {
             "branch": "main",
-            "status": "success",
-            "per_page": "5",
+            "per_page": str(WORKFLOW_RUN_LIST_PER_PAGE),
         }
     )
     url = (
@@ -188,24 +226,63 @@ def last_success_age_seconds(
     runs = payload.get("workflow_runs")
     if not isinstance(runs, list):
         return None, "schema: workflow_runs is not a list"
+    if len(runs) > WORKFLOW_RUN_LIST_PER_PAGE:
+        return None, "schema: workflow runs page exceeded bound"
+    if not runs:
+        return None, None
+
+    previous_created: datetime | None = None
     for entry in runs:
         if not isinstance(entry, dict):
-            continue
-        if entry.get("conclusion") != "success":
-            continue
+            return None, "schema: workflow run item is not an object"
         head_branch = entry.get("head_branch")
         if head_branch not in (None, "main"):
-            continue
-        stamp = entry.get("updated_at") or entry.get("run_started_at") or entry.get("created_at")
+            return None, "schema: workflow run is not on main"
         try:
-            finished = parse_iso8601(stamp, "workflow run timestamp")
+            created = parse_iso8601(entry.get("created_at"), "workflow run created_at")
         except SignalError as exc:
             return None, f"{exc.code}: {exc.message}"
-        age = int((now - finished).total_seconds())
-        if age < 0:
+        if created > now:
             return None, "schema: workflow run timestamp is in the future"
-        return age, None
-    return None, None
+        if previous_created is not None and created > previous_created:
+            return None, "schema: workflow runs are out of order"
+        previous_created = created
+
+    latest_entry = runs[0]
+    if not isinstance(latest_entry, dict):
+        return None, "schema: workflow run item is not an object"
+    stamp = (
+        latest_entry.get("updated_at")
+        or latest_entry.get("run_started_at")
+        or latest_entry.get("created_at")
+    )
+    try:
+        finished = parse_iso8601(stamp, "workflow run timestamp")
+    except SignalError as exc:
+        return None, f"{exc.code}: {exc.message}"
+    if finished > now:
+        return None, "schema: workflow run timestamp is in the future"
+    age = int((now - finished).total_seconds())
+    if age < 0:
+        return None, "schema: workflow run timestamp is in the future"
+
+    status = latest_entry.get("status")
+    if not isinstance(status, str) or not status.strip():
+        return None, "schema: workflow run status is malformed"
+    conclusion = latest_entry.get("conclusion")
+    if conclusion is not None and not isinstance(conclusion, str):
+        return None, "schema: workflow run conclusion is malformed"
+    normalized_conclusion = conclusion.strip().lower() if isinstance(conclusion, str) else None
+    if normalized_conclusion == "":
+        normalized_conclusion = None
+    return (
+        LatestRun(
+            status=status.strip().lower(),
+            conclusion=normalized_conclusion,
+            age_seconds=age,
+        ),
+        None,
+    )
 
 
 def _issue_number(item: dict[str, Any], label: str) -> int:
@@ -359,12 +436,12 @@ def run_live(now: datetime) -> int:
     run_id = os.environ.get("GITHUB_RUN_ID", "")
     run_url = f"{server}/{repo}/actions/runs/{run_id}" if run_id else server
 
-    age: int | None = None
+    latest: LatestRun | None = None
     history_error: str | None = None
     if (job_result or "").strip().lower() not in GREEN_RESULTS | RED_RESULTS:
-        age, history_error = last_success_age_seconds(repo, token, now)
+        latest, history_error = latest_run_on_main(repo, token, now)
 
-    decision = decide(job_result, age, history_error)
+    decision = decide(job_result, latest, history_error)
     print(f"scaling-gate-signal: {decision.action} because {decision.reason}")
     apply_decision(repo, token, decision, run_url, mutate)
     return 1 if decision.fail_job else 0
@@ -382,12 +459,131 @@ def self_test() -> int:
 
     expect(decide("success", None, None), "close", False, "matrix success")
     expect(decide("failure", None, None), "open", False, "matrix failure")
-    expect(decide("cancelled", 10, None), "open", False, "matrix cancelled")
-    expect(decide("skipped", 60, None), "close", False, "fresh skipped")
-    expect(decide("skipped", MAX_AGE_SECONDS + 1, None), "open", True, "stale skipped")
+    expect(
+        decide("cancelled", LatestRun("completed", "success", 10), None),
+        "open",
+        False,
+        "matrix cancelled",
+    )
+    expect(
+        decide("success", LatestRun("completed", "failure", 60), None),
+        "close",
+        False,
+        "current success remains authoritative",
+    )
+    expect(
+        decide("failure", LatestRun("completed", "success", 60), None),
+        "open",
+        False,
+        "current failure remains authoritative",
+    )
     expect(decide("skipped", None, None), "open", True, "never green")
     expect(decide("skipped", None, "api: boom"), "open", True, "history unknown")
-    expect(decide("weird", 1, None), "open", True, "unknown result")
+    expect(decide("weird", None, None), "open", True, "unknown result")
+
+    now = datetime(2026, 8, 15, 12, 0, 0, tzinfo=timezone.utc)
+
+    def iso(delta: timedelta) -> str:
+        return (now - delta).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+    def workflow_run(
+        *,
+        created: timedelta,
+        status: str = "completed",
+        conclusion: str | None = "success",
+        head_branch: str | None = "main",
+        extra: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        stamp = iso(created)
+        run: dict[str, Any] = {
+            "created_at": stamp,
+            "updated_at": stamp,
+            "status": status,
+            "conclusion": conclusion,
+            "head_branch": head_branch,
+        }
+        if extra:
+            run.update(extra)
+        return run
+
+    def history_request(
+        runs: list[Any],
+    ) -> Callable[[str, str, str, dict[str, Any] | None], Any]:
+        def request(method: str, url: str, token: str, body: dict[str, Any] | None) -> Any:
+            if method != "GET" or f"/workflows/{WORKFLOW_FILE}/runs?" not in url:
+                raise AssertionError(f"unexpected {method} {url}")
+            if "status=success" in url:
+                raise AssertionError(f"must not query only successful runs: {url}")
+            if "branch=main" not in url:
+                raise AssertionError(f"must query main branch runs: {url}")
+            if f"per_page={WORKFLOW_RUN_LIST_PER_PAGE}" not in url:
+                raise AssertionError(f"must bound workflow run pagination: {url}")
+            return {"workflow_runs": runs}
+
+        return request
+
+    def expect_history(runs: list[Any], action: str, fail_job: bool, label: str) -> None:
+        latest, err = latest_run_on_main(
+            "ferrum-edge/ferrum-edge", "token", now, history_request(runs)
+        )
+        expect(decide("skipped", latest, err), action, fail_job, label)
+
+    older_fresh_success = workflow_run(created=timedelta(days=7))
+    expect_history(
+        [
+            workflow_run(created=timedelta(hours=8), conclusion="failure"),
+            older_fresh_success,
+        ],
+        "open",
+        True,
+        "newer failure plus older fresh success",
+    )
+    expect_history(
+        [
+            workflow_run(
+                created=timedelta(minutes=20),
+                status="in_progress",
+                conclusion=None,
+            ),
+            older_fresh_success,
+        ],
+        "open",
+        True,
+        "latest in-progress plus older success",
+    )
+    expect_history(
+        [workflow_run(created=timedelta(days=1))],
+        "close",
+        False,
+        "latest fresh success",
+    )
+    expect_history(
+        [workflow_run(created=timedelta(days=9))],
+        "open",
+        True,
+        "stale latest success",
+    )
+    expect_history(
+        ["not-an-object", older_fresh_success],
+        "open",
+        True,
+        "malformed latest item",
+    )
+    expect_history(
+        [workflow_run(created=timedelta(days=-1))],
+        "open",
+        True,
+        "future timestamp",
+    )
+    expect_history(
+        [
+            workflow_run(created=timedelta(days=7)),
+            workflow_run(created=timedelta(hours=1)),
+        ],
+        "open",
+        True,
+        "out-of-order history",
+    )
 
     def signal_issue(
         number: int,
