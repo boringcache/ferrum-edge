@@ -3077,6 +3077,55 @@ async fn node_waypoint_udp_retract_a_keeps_shared_listener_and_b_route() {
     runtime.manager.shutdown_all().await;
 }
 
+#[tokio::test]
+async fn node_waypoint_udp_headless_survivor_returns_to_individual_listener() {
+    let probe = tokio::net::UdpSocket::bind("127.0.0.1:0")
+        .await
+        .expect("udp probe");
+    let port = probe.local_addr().expect("probe address").port();
+    drop(probe);
+
+    let initial = config_with_same_port_nw_udp(
+        port,
+        &[("udp-demux-a", "10.96.0.10"), ("udp-demux-b", "10.96.0.11")],
+    );
+    let config_arc = Arc::new(ArcSwap::from_pointee(initial.clone()));
+    let manager = create_manager_with_config_arc(config_arc.clone(), &initial);
+    assert!(manager.reconcile().await.is_empty());
+    let shared_key = format!("__nwudp_{port}");
+    assert!(
+        wait_until_shared_nw_udp_listener_started(&manager, &shared_key, Duration::from_secs(5),)
+            .await,
+        "the initial VIP claimants must share the port"
+    );
+
+    let headless = GatewayConfig {
+        proxies: vec![node_waypoint_udp_proxy_named("udp-demux-headless", port)],
+        ..empty_config()
+    };
+    config_arc.store(Arc::new(headless));
+    assert!(manager.reconcile().await.is_empty());
+    manager
+        .wait_until_started(Duration::from_secs(5))
+        .await
+        .expect("headless survivor must bind its individual listener");
+
+    let owners = manager.node_waypoint_udp_listener_owners_for_test().await;
+    assert_eq!(owners.len(), 1);
+    assert_ne!(
+        owners[0].0, shared_key,
+        "headless service cannot use exact destination routing"
+    );
+    assert!(
+        manager
+            .node_waypoint_udp_destination_snapshot_for_test(port)
+            .is_none(),
+        "an individual headless listener must not install an empty destination router"
+    );
+
+    manager.shutdown_all().await;
+}
+
 /// A shared listener reports one durable bind failure for every member. Once
 /// the shared socket successfully rebinds, all of those member-scoped failures
 /// must clear together; retaining B's failure after representative A recovered
