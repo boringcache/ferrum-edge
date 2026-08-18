@@ -1301,13 +1301,34 @@ async fn serve_admin_io<I>(
             // activity guards, the connection permit, and the response write
             // all complete exactly once through the paths this connection
             // already uses. No detached task and no second teardown path.
+            //
+            // With no slowloris deadline configured there is no listener window
+            // to drain inside, so the drain is bounded by the shared
+            // `AUTHORIZATION_TRANSPORT_CLOSE_SETTLE`: `graceful_shutdown` alone
+            // would let an already-open in-flight response run unbounded on a
+            // connection whose trust the operator just withdrew. Returning drops
+            // `conn` and closes the transport.
             _ = wait_for_admin_trust_withdrawal(connection_trust.as_ref()) => {
                 debug!(
                     client_ip = %client_ip,
                     "Retiring established admin TLS connection: frontend client-certificate trust was withdrawn"
                 );
                 conn.as_mut().graceful_shutdown();
-                conn.as_mut().await
+                match tokio::time::timeout(
+                    crate::proxy::AUTHORIZATION_TRANSPORT_CLOSE_SETTLE,
+                    conn.as_mut(),
+                )
+                .await
+                {
+                    Ok(result) => result,
+                    Err(_) => {
+                        debug!(
+                            client_ip = %client_ip,
+                            "Admin connection closed: retired connection did not drain within the settle window"
+                        );
+                        Ok(())
+                    }
+                }
             }
         };
         if let Err(e) = result {

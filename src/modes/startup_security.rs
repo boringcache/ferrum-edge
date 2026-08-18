@@ -307,23 +307,30 @@ pub fn try_load_frontend_tls(
 /// Binding a scope installs the live handshake verifier wrapper (which reports
 /// generation-neutral, i.e. empty, CertificateRequest CA-name hints) and
 /// disables TLS 1.3 resumption for mTLS listeners. Both are required once a
-/// withdrawal can land mid-life, and both are pure cost when it cannot:
-/// `client_trust` scopes are armed only from `modes::tls_reload`, which returns
-/// immediately unless `FERRUM_FRONTEND_TLS_LIVE_RELOAD_ENABLED` is set. A static
-/// mTLS listener therefore keeps its pre-#3857 CertificateRequest hints and
-/// session resumption exactly as before.
+/// withdrawal can land mid-life, and both are pure cost when it cannot.
+///
+/// The predicate is therefore the SAME one `modes::tls_reload` arms on
+/// ([`crate::modes::tls_reload::proxy_frontend_live_reload_can_arm`]), not the
+/// `FERRUM_FRONTEND_TLS_LIVE_RELOAD_ENABLED` flag alone: `prepare_proxy_frontend_tls`
+/// also returns unarmed when no cert/key pair is configured, and when every
+/// watched source is static inline PEM. Binding on the flag alone installed the
+/// wrapper — and so stripped the CertificateRequest CA-name hints a TLS 1.2
+/// client uses to select its certificate — on listeners where no generation
+/// could ever be published. A static mTLS listener keeps its pre-#3857
+/// CertificateRequest hints and session resumption exactly as before.
 fn proxy_frontend_handshake_scope(env_config: &EnvConfig) -> Option<tls::ClientTrustScope> {
-    env_config
-        .frontend_tls_live_reload_enabled
+    crate::modes::tls_reload::proxy_frontend_live_reload_can_arm(env_config)
         .then_some(tls::ClientTrustScope::ProxyFrontend)
 }
 
-/// [`proxy_frontend_handshake_scope`] for the admin HTTPS listener. Admin live
-/// reload is governed by the same process-wide opt-in
-/// (`modes::tls_reload::prepare_admin_frontend_tls`).
+/// [`proxy_frontend_handshake_scope`] for the admin HTTPS listener, over the
+/// `FERRUM_ADMIN_TLS_*` sources
+/// ([`crate::modes::tls_reload::admin_frontend_live_reload_can_arm`]). Admin
+/// live reload is governed by the same process-wide opt-in
+/// (`modes::tls_reload::prepare_admin_frontend_tls`) and by the same
+/// cert/key-configured and refreshable-source predicates.
 fn admin_https_handshake_scope(env_config: &EnvConfig) -> Option<tls::ClientTrustScope> {
-    env_config
-        .frontend_tls_live_reload_enabled
+    crate::modes::tls_reload::admin_frontend_live_reload_can_arm(env_config)
         .then_some(tls::ClientTrustScope::AdminHttps)
 }
 

@@ -13211,17 +13211,23 @@ async fn handle_connection(
     Ok(())
 }
 
-/// Bounded settle window granted to a client connection the authorization
-/// contract is closing (issue #3815).
+/// Bounded settle window granted to a client connection the gateway is closing
+/// against the client's will (issues #3815, #3857).
 ///
-/// The close is reached only when an admitted authenticated stream's deadline
-/// elapsed AND the downstream did not drain the protocol-correct terminal
-/// within the response watchdog's own grace. `graceful_shutdown` runs first, so
-/// this window is what lets sibling HTTP/2 streams on the same connection still
-/// finish before the hard close; HTTP/1.1 has no sibling to protect and simply
-/// ends the in-flight chunked/SSE body without its terminating chunk, which is
-/// exactly the "not a complete response" signal the contract requires.
-const AUTHORIZATION_TRANSPORT_CLOSE_SETTLE: Duration = Duration::from_secs(2);
+/// The authorization close is reached only when an admitted authenticated
+/// stream's deadline elapsed AND the downstream did not drain the
+/// protocol-correct terminal within the response watchdog's own grace. The
+/// client-trust retirement close is reached when the operator withdrew the
+/// connection's client-certificate trust decision. Both run
+/// `graceful_shutdown` first, so this window is what lets sibling HTTP/2
+/// streams on the same connection still finish before the hard close;
+/// HTTP/1.1 has no sibling to protect and simply ends the in-flight
+/// chunked/SSE body without its terminating chunk, which is exactly the
+/// "not a complete response" signal both contracts require.
+///
+/// `pub(crate)` because the admin HTTPS listener bounds its own untimed
+/// retirement drain with the same window (`admin::serve_admin_io`).
+pub(crate) const AUTHORIZATION_TRANSPORT_CLOSE_SETTLE: Duration = Duration::from_secs(2);
 
 /// Check if a hyper connection error indicates a client disconnect.
 fn is_client_disconnect_error(err: &str) -> bool {
@@ -19734,6 +19740,13 @@ struct TlsConnectionMetadata {
     /// Dynamic frontend TLS slot to re-load immediately before the handshake.
     /// `None` for static and mesh-inbound sources.
     tls_reload_slot: Option<crate::tls::SharedFrontendTls>,
+    /// This listener's client-trust domain, taken from
+    /// [`ListenerTlsSource::client_trust_scope`] at accept time. Carried rather
+    /// than re-derived so the pre-handshake re-capture below cannot hard-code a
+    /// scope: `reload_slot()` is `Some` only for `Dynamic` today, but a reload
+    /// slot on `MeshInbound` (whose scope is intentionally `None`) would
+    /// otherwise silently admit mesh connections into the proxy trust domain.
+    client_trust_scope: Option<crate::tls::ClientTrustScope>,
 }
 
 struct NodeWaypointAcceptIdentity {
@@ -20250,6 +20263,7 @@ async fn run_accept_loop(
                         }
                         let record_mesh_mtls_metric = tls_source.record_mesh_mtls_metric();
                         let tls_reload_slot = tls_source.reload_slot();
+                        let tls_client_trust_scope = tls_source.client_trust_scope();
                         // Each connection gets its own subscriber so that
                         // shutdown can interrupt the per-connection serve
                         // future (sending GOAWAY on H2 / closing keepalive
@@ -20464,6 +20478,7 @@ async fn run_accept_loop(
                                     mesh_inbound_pre_handshake_app_port,
                                     client_trust_admission,
                                     tls_reload_slot,
+                                    client_trust_scope: tls_client_trust_scope,
                                 };
                                 handle_tls_connection(
                                     stream,
@@ -20553,8 +20568,9 @@ async fn handle_tls_connection(
     // in that gap would otherwise handshake against the withdrawn verifier
     // while claiming the new generation (issue #3857).
     if let Some(slot) = tls_connection_metadata.tls_reload_slot.as_ref() {
-        client_trust_admission =
-            crate::tls::client_trust::capture(crate::tls::ClientTrustScope::ProxyFrontend);
+        client_trust_admission = tls_connection_metadata
+            .client_trust_scope
+            .and_then(crate::tls::client_trust::capture);
         match slot.load().as_ref().clone() {
             Some(current) => tls_config = current,
             None => {
@@ -20726,6 +20742,15 @@ async fn handle_tls_connection(
         // Requests already inside the service are additionally refused at the
         // per-request fence before routing or plugins run, so nothing new is
         // authorized in the drain window.
+        //
+        // The drain is BOUNDED by `AUTHORIZATION_TRANSPORT_CLOSE_SETTLE`, the same
+        // window the authorization-lifetime arm below uses: `graceful_shutdown`
+        // alone lets an already-open in-flight body (SSE, gRPC server streaming,
+        // a chunked download) run without any natural end, which would keep
+        // feeding a peer whose trust the operator just withdrew. Dropping `conn`
+        // when this `select!` returns is the hard close, so the retired transport
+        // matches H3 (`Connection::close()`), TCP+TLS (`TrustFencedStream`), and
+        // DTLS in admitting no further work past a bounded settle.
         _ = async {
             match connection_trust_session.as_ref() {
                 Some(session) => session.retired().await,
@@ -20737,7 +20762,10 @@ async fn handle_tls_connection(
                 "Retiring established TLS connection: frontend client-certificate trust was withdrawn"
             );
             conn.as_mut().graceful_shutdown();
-            conn.as_mut().await
+            match tokio::time::timeout(AUTHORIZATION_TRANSPORT_CLOSE_SETTLE, conn.as_mut()).await {
+                Ok(result) => result,
+                Err(_) => Ok(()),
+            }
         }
         _ = shutdown_rx.changed() => {
             // Send GOAWAY (H2) / signal end-of-keepalive (H1) and wait for

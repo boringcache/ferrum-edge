@@ -1380,6 +1380,23 @@ impl TrustRetirementFixture {
         let _ = self.child.wait().await;
     }
 
+    /// Prove the gateway is still the process that refused the request.
+    ///
+    /// `AttemptOutcome::TransportFailed` is the correct outcome for a retired
+    /// transport, but it is also what a dead gateway produces. Asserting the
+    /// child has not exited turns "the connection failed" into "the running
+    /// gateway closed the connection".
+    fn assert_still_running(&mut self, context: &str) {
+        match self.child.try_wait() {
+            Ok(None) => {}
+            Ok(Some(status)) => panic!(
+                "{context}: the gateway exited ({status}) rather than refusing on a live transport; output:\n{}",
+                self.capture.snapshot().join("\n")
+            ),
+            Err(e) => panic!("{context}: could not poll the gateway process: {e}"),
+        }
+    }
+
     fn h1_config(&self) -> rustls::ClientConfig {
         mtls_client_config(&self.server_ca_pem, &self.client_cert, &[b"http/1.1"])
     }
@@ -1581,6 +1598,7 @@ async fn test_h2_streams_are_refused_after_crl_revocation_without_reconnect() {
         !outcome.is_authorized(),
         "a NEW stream on the ORIGINAL H2 connection must not be authorized after revocation, got {outcome:?}"
     );
+    fixture.assert_still_running("H2 stream refusal after CRL revocation");
     assert!(
         matches!(
             outcome,
@@ -1627,9 +1645,32 @@ async fn test_h1_keepalive_is_refused_after_crl_revocation_without_reconnect() {
     fixture.revoke_client_certificate();
 
     let outcome = transport.wait_until_unauthorized("localhost").await;
+    fixture.assert_still_running("H1 keep-alive refusal after CRL revocation");
     assert!(
         !outcome.is_authorized(),
         "a reused H1 keep-alive connection must not be authorized after revocation, got {outcome:?}"
+    );
+    assert!(
+        matches!(
+            outcome,
+            AttemptOutcome::TransportFailed | AttemptOutcome::Status(401)
+        ),
+        "expected a fixed 401 or a closed transport, got {outcome:?}"
+    );
+
+    // Same bounded, fixed-cardinality proof the H2 sibling makes: without it
+    // `TransportFailed` alone does not distinguish "retired by the CRL
+    // publication" from "the connection broke for some other reason".
+    let metrics = fixture.scrape_metrics().await;
+    assert!(
+        metrics.contains(
+            "ferrum_frontend_client_trust_retired_connections_total{scope=\"proxy_frontend\",reason=\"crl_changed\"} 1"
+        ),
+        "expected exactly one CRL-reason retirement in /metrics:\n{metrics}"
+    );
+    assert!(
+        !metrics.contains("retirement-client") && !metrics.contains("14423"),
+        "client-trust series must never carry a certificate subject or serial"
     );
 
     fixture.shutdown().await;

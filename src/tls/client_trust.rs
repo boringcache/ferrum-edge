@@ -471,6 +471,11 @@ impl ClientTrustMaterial {
     /// Production material always comes from [`Self::from_parts`] over the exact
     /// client-CA bytes and CRLs behind a verifier. This digest is never a
     /// certificate fingerprint that could leak into logs or metrics.
+    ///
+    /// Compiled out of every shipping profile; see
+    /// [`reset_for_test`](crate::tls::client_trust::reset_for_test) for the gate
+    /// and why it is drawn there.
+    #[cfg(any(test, debug_assertions))]
     #[doc(hidden)]
     #[allow(dead_code)] // External test seam only.
     pub fn from_test_digest(digest: [u8; 32]) -> Self {
@@ -488,6 +493,29 @@ impl ClientTrustMaterial {
     /// Returns `None` for every widening or lateral change, which is what keeps
     /// an additive CA rotation (new CA appended, overlapping with the old) and a
     /// routine CRL re-issue from churning live sessions.
+    ///
+    /// # Known limitation: retirement is broader than enforcement for CRLs
+    ///
+    /// `revocations` hashes **every** entry in every configured CRL, but the
+    /// verifier those CRLs are installed on is built with
+    /// `.only_check_end_entity_revocation()` (`tls::build_client_cert_verifier`).
+    /// Publishing a CRL that revokes an **intermediate CA** therefore reports
+    /// `CrlChanged`, retires every client-certificate session in the scope, and
+    /// then admits the very same peers again on reconnect, because the verifier
+    /// never checks revocation above the leaf. An operator watching the
+    /// reconnect storm can read that as "the revocation took effect" when it did
+    /// not.
+    ///
+    /// This is deliberate, and it is not fixable here: a CRL entry is an issuer
+    /// key plus a serial number and carries nothing that distinguishes an
+    /// end-entity serial from a CA serial, so `from_parts` cannot narrow the set
+    /// without the revoked certificates themselves. Retiring on the superset is
+    /// also the fail-closed direction — it can only end sessions that would have
+    /// survived, never keep one alive that should have ended. The enforcement
+    /// gap belongs to the verifier posture (pre-#3857 behaviour), not to this
+    /// diff. To actually revoke an intermediate, remove it (or its issuing root)
+    /// from the client-CA bundle, which is an anchor change and IS enforced.
+    /// Documented for operators in `docs/frontend_tls.md`.
     pub fn withdrawal_relative_to(
         &self,
         previous: &ClientTrustMaterial,
@@ -1221,12 +1249,18 @@ impl ClientTrustSession {
     /// Latch this transport as retired. Returns `true` for the caller that won
     /// the latch, so accounting fires exactly once no matter how many
     /// publications or re-checks observe the same session.
+    ///
+    /// The token is cancelled BEFORE the latch is taken. `is_retired()` reads
+    /// the token, and every fence in the codebase reads `is_retired()` — so
+    /// latching first would leave a window in which a second observer (the
+    /// post-insert re-check in `register`, or the stream-relay gate) loses the
+    /// `swap` race, sees a not-yet-cancelled token, and admits one more step on
+    /// an already-retired session. Cancelling first makes the observable
+    /// "retired" edge strictly precede the exactly-once accounting edge, and
+    /// the `swap` still keeps the accounting exactly once.
     fn retire(&self, _reason: ClientTrustRetirementReason) -> bool {
-        if self.inner.retired.swap(true, Ordering::AcqRel) {
-            return false;
-        }
         self.inner.token.cancel();
-        true
+        !self.inner.retired.swap(true, Ordering::AcqRel)
     }
 
     /// Record that this transport refused a request / stream at the admission
@@ -1548,6 +1582,26 @@ pub fn render_prometheus(output: &mut String, ns_label: &str) {
 
 /// Reset every domain. **Test seam only** — the registry is process-global, so
 /// external test binaries need a way to isolate cases.
+///
+/// # Why this is compiled out of shipping artifacts
+///
+/// This is the one trust seam that fails **open**: a single call clears
+/// `armed`, `withdrawal_generation`, `live_verifier`, and the session map, so
+/// every later connection captures `None` and no withdrawal can ever bite
+/// again. `custom_plugins/` compiles into this same crate and could otherwise
+/// reach it, so it must not exist in a shipped binary.
+///
+/// `cfg(any(test, debug_assertions))` is that boundary: the `test` and `dev`
+/// profiles both enable `debug-assertions`, so `cargo test`, `cargo clippy
+/// --tests`, and the `pr-build` functional-test binary all keep the seam, while
+/// `release`, `ci-release`, and `max-perf` — every profile any artifact ships
+/// from — compile it out entirely. A cargo feature would be the stronger gate,
+/// but activating one for test targets requires either a self dev-dependency
+/// (an unverifiable `Cargo.lock` edit against CI's `cargo fetch --locked`) or
+/// `--features` on the test invocations, which live in Cross-frozen workflow
+/// jobs. See [`force_withdrawal_fence_for_test`] and
+/// [`arm_at_generation_for_test`], which carry the same gate.
+#[cfg(any(test, debug_assertions))]
 #[doc(hidden)]
 #[allow(dead_code)] // External test seam only.
 pub fn reset_for_test() {
@@ -1580,6 +1634,10 @@ pub fn reset_for_test() {
 /// Force the fence for `scope` to `generation` without publishing material.
 /// **Test seam only** — used to exercise the register-across-publication race
 /// deterministically.
+///
+/// Compiled out of every shipping profile; see [`reset_for_test`] for the gate
+/// and why it is drawn there.
+#[cfg(any(test, debug_assertions))]
 #[doc(hidden)]
 #[allow(dead_code)] // External test seam only.
 pub fn force_withdrawal_fence_for_test(
@@ -1598,6 +1656,10 @@ pub fn force_withdrawal_fence_for_test(
 }
 
 /// Arm `scope` at `generation` without publishing material. **Test seam only.**
+///
+/// Compiled out of every shipping profile; see [`reset_for_test`] for the gate
+/// and why it is drawn there.
+#[cfg(any(test, debug_assertions))]
 #[doc(hidden)]
 #[allow(dead_code)] // External test seam only.
 pub fn arm_at_generation_for_test(scope: ClientTrustScope, generation: u64) {

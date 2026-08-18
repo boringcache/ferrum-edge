@@ -135,6 +135,31 @@ fn material(ca_pems: &[&str], crl_pems: &[&str]) -> ClientTrustMaterial {
     ClientTrustMaterial::from_parts(ca_bytes.as_deref(), &crls).expect("summarize material")
 }
 
+/// Deterministic named client-CA bundle material.
+///
+/// The same `cn` always yields the same trust anchor for the life of the test
+/// binary, so subset relationships between two calls are meaningful: publishing
+/// `["ca-a", "ca-b"]` and then `["ca-b"]` is a real CA withdrawal, not two
+/// unrelated bundles that merely happen to differ.
+pub(crate) fn test_material(cns: &[&str]) -> ClientTrustMaterial {
+    static CAS: OnceLock<Mutex<std::collections::HashMap<String, String>>> = OnceLock::new();
+    let mut cache = CAS
+        .get_or_init(|| Mutex::new(std::collections::HashMap::new()))
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let pems: Vec<String> = cns
+        .iter()
+        .map(|cn| {
+            cache
+                .entry((*cn).to_string())
+                .or_insert_with(|| generate_ca(cn).cert_pem)
+                .clone()
+        })
+        .collect();
+    let refs: Vec<&str> = pems.iter().map(String::as_str).collect();
+    material(&refs, &[])
+}
+
 fn scope_row(scope: ClientTrustScope) -> ferrum_edge::tls::client_trust::ClientTrustScopeSnapshot {
     client_trust::snapshot()
         .into_iter()

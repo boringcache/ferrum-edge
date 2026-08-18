@@ -518,7 +518,14 @@ listener's rotation cannot tear down another's sessions:
 | `proxy_frontend` | Proxy HTTPS / HTTP-2 **and** TCP+TLS stream listeners | `FERRUM_FRONTEND_TLS_CLIENT_CA_BUNDLE_PATH` + `FERRUM_TLS_CRL_FILE_PATH` |
 | `proxy_h3` | The QUIC / HTTP-3 listener | the same operator material, published separately (see below) |
 | `admin_https` | The Admin API HTTPS listener | `FERRUM_ADMIN_TLS_CLIENT_CA_BUNDLE_PATH` + `FERRUM_TLS_CRL_FILE_PATH` |
-| `frontend_dtls` | UDP + DTLS listeners | `FERRUM_DTLS_CLIENT_CA_CERT_PATH` + `FERRUM_TLS_CRL_FILE_PATH` |
+| `frontend_dtls` | Operator-owned UDP + DTLS listeners only | `FERRUM_DTLS_CLIENT_CA_CERT_PATH` + `FERRUM_TLS_CRL_FILE_PATH` |
+
+Ferrum-generated mesh `NodeWaypoint` DTLS listeners deliberately join **no**
+trust scope. Their identity and client-CA policy are published by the mesh
+slice, not by the `FERRUM_DTLS_*` generation, and the live-swap path already
+skips them for the same reason. An operator CRL or client-CA edit therefore
+retires operator DTLS sessions only; it never tears down mesh datapath
+sessions or counts them under `scope="frontend_dtls"`.
 
 HTTP/3 keeps its own generation even though it serves the same material: the
 QUIC endpoint applies a reload asynchronously (`Endpoint::set_server_config`
@@ -686,6 +693,29 @@ unchanged revocation set remains unchanged and does not churn sessions.
 A refused candidate keeps the previous verifier, the previous generation, the
 previous semantic material, and every live session, and is counted as a rejected
 candidate so the refusal is observable rather than silent.
+
+##### Revoking an intermediate CA does not stop its leaves
+
+Ferrum's client-certificate verifier is built with rustls's
+`only_check_end_entity_revocation()`, so CRL checking applies to the **leaf**
+certificate a client presents and not to the intermediates above it. The
+semantic identity above, however, summarizes *every* revoked serial in every
+CRL, because a CRL entry is an issuer key plus a serial number and carries
+nothing that distinguishes an end-entity serial from a CA serial.
+
+The consequence is visible and easy to misread. Adding a CRL entry that revokes
+an **intermediate CA** advances the generation, retires every
+client-certificate-authenticated session in the scope, and produces a reconnect
+storm — and then every one of those clients reconnects **successfully**, because
+the verifier never checks revocation above the leaf. The retirement is real; the
+revocation is not enforced.
+
+Retiring on the broader set is the fail-closed direction: it can only end
+sessions that would have survived, never keep alive a session that should have
+ended. To actually revoke an intermediate, remove that intermediate (or its
+issuing root) from the client-CA bundle. That is a trust-anchor change, it is
+enforced on every subsequent handshake, and it shows up in the table above as
+"CA **removed** from the bundle".
 
 #### Retirement scope
 

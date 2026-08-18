@@ -4547,6 +4547,17 @@ async fn start_dtls_frontend_listener(
         // Refusal diagnostics on the demux path name the same listener the
         // plain-UDP path's do. Built once here, never per datagram.
         datagram_client_address_listener: Some((Arc::from(proxy_id.as_str()), port)),
+        // Owner-scoped client-trust retirement domain (issues #3857, #3858).
+        // Only an operator-owned `FERRUM_DTLS_*` listener joins the
+        // `FrontendDtls` domain, because that is the only domain whose
+        // material `publish_frontend_dtls_generation` swaps onto this server.
+        // A generated NodeWaypoint listener's posture is published by the mesh
+        // slice, which `swap_active_dtls_frontend_config` deliberately skips,
+        // so its sessions must not be retirable by an unrelated operator CRL
+        // or client-CA edit.
+        client_trust_scope: crate::dtls::dtls_client_trust_scope_for_owner(
+            node_waypoint_udp_source_scoping.is_some(),
+        ),
     };
     let server =
         Arc::new(crate::dtls::DtlsServer::bind_with_limits(addr, dtls_config, dtls_limits).await?);

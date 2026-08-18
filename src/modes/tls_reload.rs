@@ -316,6 +316,101 @@ fn build_proxy_rebuild_fn(
     })
 }
 
+/// Whether the proxy frontend live-reload path can arm the `ProxyFrontend`
+/// client-trust scope for THIS configuration (issue #3857).
+///
+/// [`prepare_proxy_frontend_tls`] returns unarmed on three configuration
+/// predicates before it ever looks at the accepted candidate: the process-wide
+/// opt-in, a configured cert/key pair, and at least one watched source that is
+/// actually refreshable (an all-inline-PEM configuration is static, so no
+/// generation can ever be published for it). This is exactly those three, kept
+/// in one place so `modes::startup_security::proxy_frontend_handshake_scope`
+/// cannot install the live handshake wrapper — and with it empty
+/// CertificateRequest CA-name hints for TLS 1.2 clients — on a listener where
+/// nothing will ever be armed.
+///
+/// The fourth predicate `prepare_proxy_frontend_tls` applies (the accepted
+/// candidate performs verified client-certificate authentication) is
+/// deliberately NOT modelled here: it needs the candidate, which does not exist
+/// yet when the `ServerConfig` is being built. It is also harmless to omit —
+/// with no client-certificate verifier the listener sends no CertificateRequest
+/// at all, so there are no CA-name hints to lose and no mTLS resumption to
+/// suppress.
+pub fn proxy_frontend_live_reload_can_arm(env_config: &EnvConfig) -> bool {
+    if !env_config.frontend_tls_live_reload_enabled {
+        return false;
+    }
+    let (Some(cert_path), Some(key_path)) = (
+        env_config.frontend_tls_cert_path.clone(),
+        env_config.frontend_tls_key_path.clone(),
+    ) else {
+        return false;
+    };
+    let cert_source = CertSource::parse(cert_path, MaterialKind::Cert);
+    let key_source = CertSource::parse(key_path, MaterialKind::Key);
+    let client_ca_source = env_config
+        .frontend_tls_client_ca_bundle_path
+        .clone()
+        .map(|source| CertSource::parse(source, MaterialKind::CaBundle));
+    let ocsp_source = env_config
+        .frontend_tls_ocsp_response_source
+        .clone()
+        .map(|source| CertSource::parse(source, MaterialKind::Ocsp));
+    let crl_source = env_config
+        .tls_crl_file_path
+        .clone()
+        .map(|source| CertSource::parse(source, MaterialKind::Crl));
+    frontend_watched_sources(
+        &cert_source,
+        &key_source,
+        client_ca_source.as_ref(),
+        ocsp_source.as_ref(),
+        crl_source.as_ref(),
+    )
+    .iter()
+    .any(|source| source_is_refreshable(&source.source))
+}
+
+/// [`proxy_frontend_live_reload_can_arm`] for the admin HTTPS listener. Same
+/// three configuration predicates over the `FERRUM_ADMIN_TLS_*` sources, so
+/// `modes::startup_security::admin_https_handshake_scope` and
+/// [`prepare_admin_frontend_tls`] cannot disagree about whether the `AdminHttps`
+/// scope can ever be armed.
+pub fn admin_frontend_live_reload_can_arm(env_config: &EnvConfig) -> bool {
+    if !env_config.frontend_tls_live_reload_enabled {
+        return false;
+    }
+    let (Some(cert_path), Some(key_path)) = (
+        env_config.admin_tls_cert_path.clone(),
+        env_config.admin_tls_key_path.clone(),
+    ) else {
+        return false;
+    };
+    let cert_source = CertSource::parse(cert_path, MaterialKind::Cert);
+    let key_source = CertSource::parse(key_path, MaterialKind::Key);
+    let client_ca_source = env_config
+        .admin_tls_client_ca_bundle_path
+        .clone()
+        .map(|source| CertSource::parse(source, MaterialKind::CaBundle));
+    let ocsp_source = env_config
+        .admin_tls_ocsp_response_source
+        .clone()
+        .map(|source| CertSource::parse(source, MaterialKind::Ocsp));
+    let crl_source = env_config
+        .tls_crl_file_path
+        .clone()
+        .map(|source| CertSource::parse(source, MaterialKind::Crl));
+    frontend_watched_sources(
+        &cert_source,
+        &key_source,
+        client_ca_source.as_ref(),
+        ocsp_source.as_ref(),
+        crl_source.as_ref(),
+    )
+    .iter()
+    .any(|source| source_is_refreshable(&source.source))
+}
+
 fn frontend_watched_sources(
     cert_source: &CertSource,
     key_source: &CertSource,

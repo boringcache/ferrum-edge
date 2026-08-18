@@ -704,6 +704,46 @@ pub struct DtlsServerLimits {
     /// record for the same proxy. Cloned once at listener spawn, never per
     /// datagram. `None` outside the proxy listener path.
     pub datagram_client_address_listener: Option<(Arc<str>, u16)>,
+    /// Client-trust retirement domain this listener's authenticated sessions
+    /// join (issues #3857, #3858).
+    ///
+    /// `Some(ClientTrustScope::FrontendDtls)` for every operator-owned
+    /// `FERRUM_DTLS_*` listener, which is the default. `None` for generated
+    /// `MeshNodeWaypoint` listeners: their trust anchors are owned by the mesh
+    /// slice, `swap_active_dtls_frontend_config` deliberately skips them, and
+    /// `publish_mesh_node_waypoint_dtls_generation` publishes no trust material
+    /// — so registering their sessions in the operator domain would let an
+    /// unrelated operator CRL edit retire mesh datapath sessions and count them
+    /// under `scope="frontend_dtls"`, while a mesh-side narrowing retired
+    /// nothing. `None` therefore means "this listener's sessions are not
+    /// retirable by any published generation", which is exactly the mesh
+    /// posture today.
+    pub client_trust_scope: Option<crate::tls::ClientTrustScope>,
+}
+
+/// Owner-scoped client-trust retirement domain for a DTLS listener (issues
+/// #3857, #3858).
+///
+/// One place, so the listener spawn path and the retirement domain cannot
+/// disagree about which listeners an operator `FERRUM_DTLS_*` publication may
+/// retire. `is_node_waypoint` is the same discriminator the listener already
+/// uses for its scoped socket options.
+///
+/// A generated `MeshNodeWaypoint` listener gets `None`: its posture is owned by
+/// the mesh slice, `StreamListenerManager::swap_active_dtls_frontend_config`
+/// deliberately skips it, and `publish_mesh_node_waypoint_dtls_generation`
+/// publishes no trust material. Putting its sessions in the operator domain
+/// would let an unrelated operator CRL edit retire mesh datapath sessions and
+/// count them under `scope="frontend_dtls"`, while a mesh-side narrowing
+/// retired nothing.
+pub fn dtls_client_trust_scope_for_owner(
+    is_node_waypoint: bool,
+) -> Option<crate::tls::ClientTrustScope> {
+    if is_node_waypoint {
+        None
+    } else {
+        Some(crate::tls::ClientTrustScope::FrontendDtls)
+    }
 }
 
 impl Default for DtlsServerLimits {
@@ -719,6 +759,7 @@ impl Default for DtlsServerLimits {
             datagram_client_address: None,
             datagram_client_address_drops: None,
             datagram_client_address_listener: None,
+            client_trust_scope: dtls_client_trust_scope_for_owner(false),
         }
     }
 }
@@ -2590,8 +2631,16 @@ impl DtlsServer {
         // captured generation is at or older than the verifier actually used —
         // a session can never claim a post-withdrawal generation while running
         // the withdrawn verifier.
-        let client_trust_admission =
-            crate::tls::client_trust::capture(crate::tls::ClientTrustScope::FrontendDtls);
+        //
+        // The scope comes from the listener's owner (issue #3858), never a
+        // hard-coded constant: a generated `MeshNodeWaypoint` listener carries
+        // `None` and so registers nothing, because its trust material is
+        // published by the mesh slice and not by the operator `FERRUM_DTLS_*`
+        // generation this domain tracks.
+        let client_trust_admission = self
+            .limits
+            .client_trust_scope
+            .and_then(crate::tls::client_trust::capture);
         // Snapshot the swappable crypto material once per session so the
         // running handshake / session cannot observe a partial rotation.
         let active = self.active_config.load_full();
