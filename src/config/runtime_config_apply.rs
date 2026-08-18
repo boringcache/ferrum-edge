@@ -145,11 +145,7 @@ pub struct RuntimeConfigApply {
 
 impl RuntimeConfigApply {
     pub fn new(namespace: impl Into<String>, accepted_sequence: u64) -> Self {
-        Self::with_timeout(
-            namespace,
-            accepted_sequence,
-            ADMIN_WRITE_LIVE_APPLY_TIMEOUT,
-        )
+        Self::with_timeout(namespace, accepted_sequence, ADMIN_WRITE_LIVE_APPLY_TIMEOUT)
     }
 
     pub fn with_timeout(

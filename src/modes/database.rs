@@ -33,10 +33,10 @@ use crate::config::config_change_watch::{
     ConfigChangeWakeWatcherParams, ConfigChangeWatchSettings, ConfigChangeWatcherHealth,
     ConfigChangeWatcherStatus, wait_for_config_poll_wake,
 };
-use crate::config::runtime_config_apply::RuntimeConfigApply;
 use crate::config::db_backend::{self, DatabaseBackend};
 use crate::config::db_loader::{DatabaseStore, DbPoolConfig};
 use crate::config::gateway_trust::detect_gateway_trust_drift;
+use crate::config::runtime_config_apply::RuntimeConfigApply;
 use crate::config::types::GatewayConfig;
 use crate::dns::{DnsCache, DnsConfig};
 use crate::modes::file::{

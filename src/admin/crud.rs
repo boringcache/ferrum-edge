@@ -2316,15 +2316,13 @@ pub(crate) async fn handle_delete<R: AdminResource>(
                     )),
                 };
             return match persistence {
-                Ok(true) => {
-                    Ok(state
-                        .complete_live_config_mutation_after_commit(
-                            namespace,
-                            _write_permit,
-                            super::empty_response(StatusCode::NO_CONTENT),
-                        )
-                        .await)
-                }
+                Ok(true) => Ok(state
+                    .complete_live_config_mutation_after_commit(
+                        namespace,
+                        _write_permit,
+                        super::empty_response(StatusCode::NO_CONTENT),
+                    )
+                    .await),
                 Ok(false) => Ok(not_found_response::<R>()),
                 Err(error) => Ok(R::map_delete_db_error(&error)),
             };
@@ -2383,15 +2381,13 @@ pub(crate) async fn handle_delete<R: AdminResource>(
         )),
     };
     match persistence {
-        Ok(true) => {
-            Ok(state
-                .complete_live_config_mutation_after_commit(
-                    namespace,
-                    _write_permit,
-                    super::empty_response(StatusCode::NO_CONTENT),
-                )
-                .await)
-        }
+        Ok(true) => Ok(state
+            .complete_live_config_mutation_after_commit(
+                namespace,
+                _write_permit,
+                super::empty_response(StatusCode::NO_CONTENT),
+            )
+            .await),
         Ok(false) => Ok(not_found_response::<R>()),
         Err(error) => Ok(R::map_delete_db_error(&error)),
     }

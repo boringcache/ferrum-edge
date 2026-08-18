@@ -363,12 +363,12 @@ async fn concurrent_writes_coalesce_and_both_become_live() {
         &token,
         Some(&proxy_payload("/coalesce-b")),
     );
-    let ((status_a, body_a), (status_b, body_b)) = tokio::time::timeout(
-        Duration::from_secs(5),
-        async { tokio::join!(post_a, post_b) },
-    )
-    .await
-    .expect("concurrent creates must coalesce onto one reload");
+    let ((status_a, body_a), (status_b, body_b)) =
+        tokio::time::timeout(Duration::from_secs(5), async {
+            tokio::join!(post_a, post_b)
+        })
+        .await
+        .expect("concurrent creates must coalesce onto one reload");
     assert_eq!(status_a, 201, "a: {body_a}");
     assert_eq!(status_b, 201, "b: {body_b}");
     assert!(runtime_has_listen_path(&proxy_state, "/coalesce-a"));

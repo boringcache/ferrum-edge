@@ -30,9 +30,6 @@ pub mod stable_file;
 // are consumed only through external tests, which the bin target cannot see.
 #[allow(dead_code)]
 pub mod config_change_watch;
-/// In-process database-mode admin write live-apply coordinator (issue #3926).
-#[allow(dead_code)]
-pub mod runtime_config_apply;
 pub mod config_migration;
 pub mod db_backend;
 pub mod db_loader;
@@ -48,6 +45,9 @@ pub mod plugin_trigger;
 pub mod pool_config;
 #[allow(dead_code)] // Public DOC-03 inventory is consumed by external tests, not the binary crate.
 pub mod public_env_inventory;
+/// In-process database-mode admin write live-apply coordinator (issue #3926).
+#[allow(dead_code)]
+pub mod runtime_config_apply;
 /// TEST-ONLY debug-build database outage control for functional fixtures.
 /// See the module docs — not a production configuration surface.
 #[allow(dead_code)] // arm_path / disarm_for_tests are exercised by external unit tests.

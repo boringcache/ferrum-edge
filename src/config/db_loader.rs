@@ -5518,7 +5518,10 @@ impl DatabaseStore {
     // ---- Incremental Polling ----
 
     pub async fn latest_change_sequence(&self, namespace: &str) -> Result<u64, anyhow::Error> {
-        if self.latest_change_sequence_test_fault.load(Ordering::Acquire) {
+        if self
+            .latest_change_sequence_test_fault
+            .load(Ordering::Acquire)
+        {
             anyhow::bail!("latest_change_sequence test fault");
         }
         let row = sqlx::query(
@@ -7242,7 +7245,8 @@ impl DatabaseStore {
     /// Fail the next [`Self::latest_change_sequence`] reads (issue #3926 tests).
     #[allow(dead_code)] // exercised via external unit tests through the lib target
     pub fn set_latest_change_sequence_fault_for_test(&self, fail: bool) {
-        self.latest_change_sequence_test_fault.store(fail, Ordering::Release);
+        self.latest_change_sequence_test_fault
+            .store(fail, Ordering::Release);
     }
 
     async fn invoke_reconnect_transition_hook(

@@ -854,8 +854,8 @@ async fn test_admit_non_config_db_write_keeps_read_only_and_db_unavailable_gates
     let unavailable_state = AdminState {
         read_only: false,
         db_available: Some(db_flag),
-        ..read_only_state
         runtime_config_apply: None,
+        ..read_only_state
     };
     let Err(unavailable_err) = unavailable_state.admit_non_config_db_write().await else {
         panic!("admit_non_config_db_write must honor database-unavailable");
