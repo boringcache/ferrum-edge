@@ -4459,11 +4459,13 @@ scanning the parsed key/value map and a best-effort reconstructed URL.
 | `reject_body` | string | `{"error":"Forbidden"}` | Body returned for enforced rejects. |
 
 **Multi-instance scoring:** Multiple scoped `waf` instances on one proxy keep
-independent anomaly accumulators keyed by plugin-config identity. Each instance
-thresholds only its own score across the shared H1/H2/H3 authorize / body /
-response lifecycle. Metadata uses `waf.instances.<id>.score` plus deterministic
-`waf.instance_scores` when more than one instance contributes; `waf.score` is
-emitted only for single-instance scoring. See [waf.md](waf.md#anomaly-scoring).
+independent anomaly accumulators keyed by the configured `plugin_configs[].id`
+(file, database, CP, and DP). Each instance thresholds only its own score across
+the shared H1/H2/H3 authorize / body / response lifecycle. Metadata uses
+`waf.instances.<id>.score` plus deterministic `waf.instance_scores` when more
+than one instance contributes; `waf.score` is emitted only for single-instance
+scoring. A process-local `standalone-<n>` identity is only for direct
+construction that has no configured id. See [waf.md](waf.md#anomaly-scoring).
 
 **Oversize bodies never silently bypass an enforcing body rule:** a body larger
 than `max_scan_bytes` cannot be completely inspected, and prefix-only inspection

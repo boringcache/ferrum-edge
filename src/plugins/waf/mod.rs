@@ -457,6 +457,10 @@ impl Waf {
         } else {
             HTTP_FAMILY_PROTOCOLS
         };
+        // `instance_id` is a private per-request map key, never an operator-facing
+        // identity. Configured construction still mints a unique runtime key so
+        // duplicate-id accidents cannot merge sibling accumulators, while the
+        // published metadata identity below is the stable plugin-config id.
         let instance_id = NEXT_WAF_INSTANCE_ID.fetch_add(1, Ordering::Relaxed);
         let identity: Arc<str> = match config_id {
             Some(id) => {
