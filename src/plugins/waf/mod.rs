@@ -1884,9 +1884,7 @@ struct WafInspectionSurfaces {
 impl WafInspectionSurfaces {
     fn inspects(self, target: &RuleTarget) -> bool {
         match target {
-            RuleTarget::BodyText | RuleTarget::BodyJsonPath(_) => {
-                self.request && self.request_body
-            }
+            RuleTarget::BodyText | RuleTarget::BodyJsonPath(_) => self.request && self.request_body,
             RuleTarget::ResponseHeaders => self.response,
             RuleTarget::ResponseBody => self.response && self.response_body,
             _ => self.request,
@@ -1918,10 +1916,7 @@ fn validate_enforce_mode_has_enforcing_rules(
     if scoring.is_some_and(|scoring| {
         compiled.rules.iter().any(|rule| {
             surfaces.inspects(&rule.target)
-                && rule
-                    .score
-                    .unwrap_or_else(|| scoring.weight(rule.severity))
-                    > 0
+                && rule.score.unwrap_or_else(|| scoring.weight(rule.severity)) > 0
         })
     }) {
         return Ok(());
