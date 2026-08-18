@@ -1488,6 +1488,24 @@ async fn ready_h3_post_deadline_terminal_write_completes_within_grace() {
     );
 }
 
+#[test]
+fn native_h3_upload_expiry_terminal_uses_post_deadline_grace() {
+    let server = include_str!("../../../src/http3/server.rs");
+    let finalizer = server
+        .split("async fn finalize_h3_upload_deadline_rejection(")
+        .nth(1)
+        .expect("native H3 upload deadline finalizer")
+        .split("async fn send_h3_plugin_reject_flavor_aware(")
+        .next()
+        .expect("bounded native H3 upload deadline finalizer");
+
+    assert!(finalizer.contains("send_h3_plugin_reject_flavor_aware_with_recv_halt("));
+    assert!(
+        finalizer.contains("&reject.headers,\n        false,"),
+        "an expired upload must defer STOP_SENDING so the rejection write uses the post-deadline grace"
+    );
+}
+
 #[tokio::test(start_paused = true)]
 async fn stalled_h3_post_deadline_terminal_write_expires_grace() {
     let task = ferrum_edge::_test_support::spawn_stalled_h3_post_deadline_terminal_write_for_test();
@@ -1974,7 +1992,7 @@ fn h3_buffered_upload_deadlines_run_rejection_cleanup_and_logging() {
     assert!(helper.contains("apply_reject_after_proxy_and_synthetic_body_hooks("));
     assert!(helper.contains("run_h3_reject_response_committed_hooks("));
     assert!(helper.contains("log_rejected_request("));
-    assert!(helper.contains("send_h3_plugin_reject_flavor_aware("));
+    assert!(helper.contains("send_h3_plugin_reject_flavor_aware_with_recv_halt("));
     // Upload-deadline rejection is already selected; the terminal write must use
     // the shared post-deadline grace (via the plugin reject writer) rather than
     // re-racing the expired absolute deadline.
@@ -1996,7 +2014,7 @@ fn h3_buffered_upload_deadlines_run_rejection_cleanup_and_logging() {
     assert_eq!(helper.matches("record_request(state,").count(), 1);
     assert_eq!(
         helper
-            .matches("send_h3_plugin_reject_flavor_aware(")
+            .matches("send_h3_plugin_reject_flavor_aware_with_recv_halt(")
             .count(),
         1
     );
@@ -2013,7 +2031,7 @@ fn h3_buffered_upload_deadlines_run_rejection_cleanup_and_logging() {
         .find("record_request(state,")
         .expect("upload deadline metric");
     let send = helper
-        .find("send_h3_plugin_reject_flavor_aware(")
+        .find("send_h3_plugin_reject_flavor_aware_with_recv_halt(")
         .expect("upload deadline send");
     assert!(decorate < commit && commit < log && log < metric && metric < send);
     for phase in [
