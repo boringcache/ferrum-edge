@@ -2584,7 +2584,7 @@ async fn pooled_h2_goaway_canceled_send_retries_buffered_unary() {
         // warmup must not add an extra dial to the count. Note this does NOT
         // make the gateway cold: with warmup off, `modes::file::serve` sets
         // `run_initial_refresh = true` and the backend-capability refresh task
-        //         immediately probes this plaintext backend via
+        // immediately probes this plaintext backend via
         // `ProxyState::probe_h2c` -> `grpc_pool.get_sender_for_capability_probe()`.
         // That probe uses
         // a clone of this proxy whose only delta is a clamped connect timeout —
