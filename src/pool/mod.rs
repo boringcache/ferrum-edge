@@ -841,14 +841,14 @@ impl<M: PoolManager> GenericPool<M> {
         pending: Arc<PendingCreation>,
         err: SharedPoolCreateError,
     ) {
-        // Publish Failed before removing the map entry so a request that races
-        // with this publication can still attach to this attempt, observe the
-        // shared error, and upgrade a probe-only diagnostic. Remove immediately
-        // after: there is no durable negative cache for later independent
-        // requests.
-        pending.finish_failed(err);
+        // Remove before publishing Failed so a request that arrives after this
+        // attempt completes cannot join the retired pending entry, consume a
+        // retry, and skip a fresh dial. Already-attached waiters keep their
+        // Arc and watch subscription, so they still observe the durable Failed
+        // outcome. There is no durable negative cache.
         self.pending_creations
             .remove_if(key, |_, current| Arc::ptr_eq(current, &pending));
+        pending.finish_failed(err);
     }
 
     async fn create_after_recheck<C, Fut, E>(
