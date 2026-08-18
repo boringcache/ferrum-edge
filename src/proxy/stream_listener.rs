@@ -915,6 +915,9 @@ struct DesiredStreamProxy {
     /// listener (issue #3861). Several may share one numeric port; the shared
     /// socket demultiplexes by exact local destination address.
     node_waypoint_udp_destination_member: bool,
+    /// Whether this member publishes at least one exact ClusterIP destination.
+    /// A headless member must use its individual direct-node-address listener.
+    node_waypoint_udp_has_destination_route: bool,
     /// Validated amplification factor encoded losslessly for cold-path listener
     /// drift detection. `None` is the explicit unlimited posture.
     udp_amplification_factor_bits: Option<u32>,
@@ -1017,12 +1020,18 @@ fn node_waypoint_udp_listener_key(port: u16) -> String {
 /// that port is already bound under `__nwudp_{port}`, shrinking to one
 /// remaining VIP claimant must keep the shared key: dissolving it stops the
 /// socket and races a rebind that can leave the survivor unbound (`EADDRINUSE`).
+/// A headless survivor has no exact destination route, so it must return to an
+/// individual listener rather than retaining an unusable shared router.
 #[inline]
 fn retain_shared_node_waypoint_udp_listener(
     member_count: usize,
     shared_listener_already_running: bool,
+    single_claimant_has_destination_route: bool,
 ) -> bool {
-    member_count > 1 || (member_count == 1 && shared_listener_already_running)
+    member_count > 1
+        || (member_count == 1
+            && shared_listener_already_running
+            && single_claimant_has_destination_route)
 }
 
 fn udp_amplification_restart_key_for_ids(
@@ -2251,6 +2260,13 @@ impl StreamListenerManager {
                                     .is_some_and(|m| !m.is_empty()),
                                 node_waypoint_udp_destination_member: p
                                     .joins_node_waypoint_udp_destination_plane(),
+                                node_waypoint_udp_has_destination_route: current_config
+                                    .node_waypoint_udp_destination_routes
+                                    .iter()
+                                    .any(|route| {
+                                        route.proxy.namespace == p.namespace
+                                            && route.proxy.id == p.id
+                                    }),
                                 udp_amplification_factor_bits: p
                                     .udp_max_response_amplification_factor
                                     .map(f32::to_bits),
@@ -2437,6 +2453,11 @@ impl StreamListenerManager {
             let keep_shared = retain_shared_node_waypoint_udp_listener(
                 ids.len(),
                 existing_shared_node_waypoint_udp_ports.contains(port),
+                ids.first().is_some_and(|id| {
+                    desired
+                        .get(id)
+                        .is_some_and(|entry| entry.node_waypoint_udp_has_destination_route)
+                }),
             );
             keep_shared
                 && !sni_groups.contains_key(port)
