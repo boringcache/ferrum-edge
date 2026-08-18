@@ -457,19 +457,24 @@ The contiguous
 `exportVariable` token deny remains defense in depth; it does not catch
 computed property forms such as `core["export" + "Variable"]` on its own.
 It is scanned over every slot except the **document-root** `description:`
-metadata value, which GitHub renders and never evaluates:
+metadata **scalar**, which GitHub renders and never evaluates:
 `setup-sccache/action.yml` is whole-file digest-frozen by the Cross build
 policy, so the installer that enforces the credential boundary has to stay free
 to document the toolkit call it refuses. The carve-out is that one key at
-column zero — its plain scalar plus its correctly delimited block body — and
-nothing else. Nested `description:` keys are **not** exempt: an action or
+column zero — its plain or quoted scalar plus its correctly delimited block
+body — and nothing else. A root `description:` whose value is a flow mapping,
+flow sequence, explicit complex value, or any other non-scalar shape stays
+scanned: it is not rendered string prose, and a nested `&anchor` inside a flow
+collection is not a leading node property, so blanking it would hide the token
+while an alias could still feed it into executable data. Nested `description:`
+keys are **not** exempt: an action or
 `workflow_dispatch` input description is `core.getInput('description')`, an
 `env:`/`with:` entry is `process.env.description`, and any other nested mapping
 is data some `run:` body can read, so a carrier parked there could rebuild the
 forbidden property (`core[process.env.description]`) with no contiguous token
-left on the line. A root `description:` carrying an `&anchor`, `*alias`, or
-`!tag` is scanned too, because an anchored scalar is reachable by alias from an
-executable slot, and only the first root `description:` is exempted because a
+left on the line. A root `description:` carrying a leading `&anchor`, `*alias`,
+or `!tag` is scanned too, because an anchored scalar is reachable by alias from
+an executable slot, and only the first root `description:` is exempted because a
 second one is a duplicate key rather than more rendered metadata. A
 `description:`-shaped line inside a `run:` body is stepped
 over as shell, a `- description:` item is a sequence entry rather than the root

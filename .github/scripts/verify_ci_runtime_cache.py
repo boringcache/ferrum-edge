@@ -1638,13 +1638,46 @@ def scan_yaml_action_invocations(text: str) -> tuple[list[str], list[str], list[
     return uses, using, errors
 
 
+def _is_inspectable_yaml_scalar(value: str) -> bool:
+    """True only for a YAML scalar the description carve-out may blank.
+
+    GitHub renders a string. Flow `{...}` / `[...]`, explicit `?` values,
+    compact nested sequences, malformed block indicators, and any other
+    structural or unreadable shape stay scanned. Nested `&anchor` properties
+    inside a flow collection are invisible to `_leading_yaml_node_properties`,
+    which only inspects the start of the node, so a flow value must never be
+    treated as rendered description prose.
+    """
+
+    if YAML_BLOCK_SCALAR.match(value):
+        return True
+    if not value:
+        return False
+    if value[0] in {"'", '"'}:
+        return _decode_yaml_scalar(value) is not None
+    if value[0] in "{[?|>":
+        return False
+    if value[0] == "-" and (len(value) == 1 or value[1] in " \t"):
+        return False
+    if not _yaml_quotes_balanced(value):
+        return False
+    return True
+
+
 def _is_root_description_key(parsed: re.Match[str], value: str) -> bool:
-    """True only for the root action/workflow metadata `description:`.
+    """True only for the root action/workflow metadata `description:` scalar.
 
     `description` is metadata *at one schema location*: the document root of an
-    `action.yml` (or a workflow), where GitHub renders it and nothing evaluates
-    it. Everywhere else the same spelling is ordinary data whose value is read
-    by something: `env: {description: ...}` becomes `process.env.description`,
+    `action.yml` (or a workflow), where GitHub renders a string and nothing
+    evaluates it. A flow mapping, flow sequence, explicit `?` value, or any
+    other non-scalar shape is not that string. Relying on GitHub to reject a
+    non-string metadata value is not a fail-closed verifier boundary: nested
+    `&anchor` names inside `{carrier: &leak exportVariable}` are not leading
+    node properties, so blanking the collection would hide the token while
+    `env: {description: *leak}` could still feed it into executable data.
+
+    Everywhere else the same spelling is ordinary data whose value is read by
+    something: `env: {description: ...}` becomes `process.env.description`,
     `with: {description: ...}` becomes `core.getInput('description')`, and an
     arbitrary nested mapping can be consumed by any `run:` body that reads the
     file. A carrier parked in one of those slots can rebuild the forbidden
@@ -1652,9 +1685,11 @@ def _is_root_description_key(parsed: re.Match[str], value: str) -> bool:
     the line, so only the root key may be withheld from the scan.
 
     Root means column zero with no compact-sequence dash: a `- description:`
-    item is a sequence entry, not the root mapping. The value must also carry no
-    `&anchor` / `*alias` / `!tag` node property, because an anchored scalar is
-    reachable by alias from an executable slot elsewhere in the document.
+    item is a sequence entry, not the root mapping. The value must be an
+    inspectable scalar (plain, quoted, or a valid block-scalar indicator) and
+    must carry no leading `&anchor` / `*alias` / `!tag` node property, because
+    an anchored scalar is reachable by alias from an executable slot elsewhere
+    in the document.
 
     Callers additionally exempt only the *first* such key: an Actions file is a
     single YAML document with one root mapping, so a second root `description:`
@@ -1665,36 +1700,41 @@ def _is_root_description_key(parsed: re.Match[str], value: str) -> bool:
         return False
     if parsed.group("key") != "description":
         return False
-    had_properties, _remainder = _leading_yaml_node_properties(value)
-    return not had_properties
+    had_properties, remainder = _leading_yaml_node_properties(value)
+    if had_properties:
+        return False
+    return _is_inspectable_yaml_scalar(remainder)
 
 
 def _without_yaml_description_prose(text: str) -> str:
     """Blank the root `description:` value only, keeping every other byte.
 
     A document-root action/workflow `description:` is metadata. GitHub renders
-    it; it is never a program, never a step, and never reaches a JavaScript
-    runtime, so documenting *which* toolkit call the trusted installers refuse
-    to make must not itself read as that call. `setup-sccache/action.yml` is
-    whole-file digest-frozen by the Cross build policy, so the token rule cannot
-    be made to depend on rewording that prose, and its one occurrence is exactly
-    that root key.
+    that scalar; it is never a program, never a step, and never reaches a
+    JavaScript runtime, so documenting *which* toolkit call the trusted
+    installers refuse to make must not itself read as that call.
+    `setup-sccache/action.yml` is whole-file digest-frozen by the Cross build
+    policy, so the token rule cannot be made to depend on rewording that prose,
+    and its one occurrence is exactly that root scalar.
 
     Nested `description:` keys — action inputs, `workflow_dispatch` inputs, step
     mappings, `env:`, `with:`, or any other mapping — are *not* exempt. See
     `_is_root_description_key`: those values are action-consumed data, not
     rendered prose, and stripping them would let a carrier build the forbidden
-    property indirectly.
+    property indirectly. A root flow mapping, flow sequence, explicit `?`
+    value, or any other non-scalar shape is likewise scanned: it is not
+    rendered string prose.
 
     The walk uses the same block-scalar discipline as `_scan_yaml_actions`: a
     `run:` (or any non-description) block-scalar body is stepped over without
     being read, so a `description:`-shaped line *inside* a shell body cannot
-    blank the lines after it. Only the root description's own scalar and its
-    correctly delimited block body are blanked, only for the unquoted,
-    unaliased, untagged spelling, and a body that cannot be delimited is left in
-    place — so the transform can only ever remove root-rendered prose, never an
-    executable or structural slot. Exactly one root `description:` is exempted
-    per document; a second is a duplicate key and stays scanned.
+    blank the lines after it. Only the root description's own inspectable
+    scalar and its correctly delimited block body are blanked, only for the
+    unquoted, unaliased, untagged key spelling, and a body that cannot be
+    delimited is left in place — so the transform can only ever remove
+    root-rendered scalar prose, never an executable or structural slot.
+    Exactly one root `description:` is exempted per document; a second is a
+    duplicate key and stays scanned.
     """
 
     lines = text.splitlines()
@@ -1752,11 +1792,12 @@ def check_no_sccache_credential_exporter(
         # Defense in depth: the contiguous token is insufficient against
         # computed property forms. The allowlist/shell-only checks are the gate.
         # Scanned over everything except the document-root `description:`
-        # metadata value, so the rule stays a superset of PR #3958's
+        # metadata scalar, so the rule stays a superset of PR #3958's
         # invocation-shaped match on every executable, data, and structural slot
         # while the frozen installers can still document the credential boundary
         # they enforce. Nested `description:` keys (inputs, `env:`, `with:`, any
-        # other mapping) are action-consumed data and remain scanned.
+        # other mapping) and non-scalar root `description:` values are
+        # action-consumed or structural data and remain scanned.
         SCCACHE_EXPORT_VARIABLE_TOKEN not in _without_yaml_description_prose(text),
         f"{source} must not contain {SCCACHE_EXPORT_VARIABLE_TOKEN} "
         "(ACTIONS_RUNTIME_TOKEN leak)",
@@ -4173,6 +4214,15 @@ def check_docs_and_coverage(failures: list[str]) -> None:
         failures,
     )
     require(
+        "plain or quoted scalar" in ci_cd
+        and "non-scalar" in ci_cd.lower()
+        and "flow mapping" in ci_cd
+        and "flow sequence" in ci_cd,
+        "docs/ci_cd.md must document that the exportVariable description "
+        "carve-out is scalar-only and that non-scalar root values stay scanned",
+        failures,
+    )
+    require(
         "actions/cache/restore" in ci_cd
         and "actions/cache/save" in ci_cd
         and "restore-only" in ci_cd,
@@ -5452,8 +5502,9 @@ def self_test() -> int:
         failures,
     )
 
-    # Only the document-root metadata `description:` is withheld from the scan:
-    # its plain scalar and its correctly delimited block body.
+    # Only the document-root metadata `description:` scalar is withheld from
+    # the scan: its plain or quoted scalar and its correctly delimited block
+    # body. Flow collections and other non-scalar shapes stay scanned.
     description_prose_shapes = (
         "description: >-\n"
         "  Does not invoke an installer that `core.exportVariable`s\n"
@@ -5465,6 +5516,20 @@ def self_test() -> int:
         "runs:\n"
         "  using: composite\n",
         "description: core.exportVariable is documented, never invoked\n"
+        "runs:\n"
+        "  using: composite\n",
+        'description: "core.exportVariable is documented, never invoked"\n'
+        "runs:\n"
+        "  using: composite\n",
+        "description: 'core.exportVariable is documented, never invoked'\n"
+        "runs:\n"
+        "  using: composite\n",
+        # Quoted scalars whose contents look like a flow collection are still
+        # strings GitHub renders, not YAML structure.
+        'description: "[exportVariable] is documented, never invoked"\n'
+        "runs:\n"
+        "  using: composite\n",
+        "description: '{carrier: exportVariable} is documented, never invoked'\n"
         "runs:\n"
         "  using: composite\n",
     )
@@ -5564,6 +5629,52 @@ def self_test() -> int:
         "description: exportVariable\n"
         "runs:\n"
         "  using: composite\n",
+        # A flow sequence is not rendered scalar prose.
+        "description: [exportVariable]\n"
+        "runs:\n"
+        "  using: composite\n",
+        # A flow mapping is not rendered scalar prose.
+        "description: {carrier: exportVariable}\n"
+        "runs:\n"
+        "  using: composite\n",
+        # Nested anchor inside a flow mapping, revived via alias. If the
+        # flow value were blanked, `*leak` would be the only remaining
+        # spelling and would not contain the contiguous token.
+        "description: {carrier: &leak exportVariable}\n"
+        "runs:\n"
+        "  using: composite\n"
+        "  steps:\n"
+        "    - env: {description: *leak}\n"
+        "      run: echo ok\n",
+        # Multiline flow: token on the opening line. The prose walker does
+        # not collect continuation lines, so blanking this line would hide
+        # the only occurrence.
+        "description: {carrier: exportVariable\n"
+        "}\n"
+        "runs:\n"
+        "  using: composite\n",
+        "description: [exportVariable\n"
+        "]\n"
+        "runs:\n"
+        "  using: composite\n",
+        # Continuation-line token: the walker must not start skipping flow
+        # bodies the way it skips block-scalar bodies.
+        "description: {\n"
+        "  carrier: exportVariable\n"
+        "}\n"
+        "runs:\n"
+        "  using: composite\n",
+        "description: [\n"
+        "  exportVariable]\n"
+        "runs:\n"
+        "  using: composite\n",
+        # Explicit complex value and compact nested sequence are not scalars.
+        "description: ? exportVariable\n"
+        "runs:\n"
+        "  using: composite\n",
+        "description: - exportVariable\n"
+        "runs:\n"
+        "  using: composite\n",
     )
     for index, sample in enumerate(description_adjacent_carriers):
         adjacent_failures: list[str] = []
@@ -5581,6 +5692,18 @@ def self_test() -> int:
             f"{sample!r}",
             failures,
         )
+
+    # A token-free flow value would pass the exporter check whether or not it
+    # was exempted. Assert the transform leaves it in the scanned text.
+    flow_kept = _without_yaml_description_prose(
+        "description: {carrier: harmless}\nruns:\n  using: composite\n"
+    )
+    require(
+        "{carrier: harmless}" in flow_kept,
+        "self-test: a token-free root flow description must stay scanned, "
+        f"not blanked: {flow_kept!r}",
+        failures,
+    )
 
     path_based_sccache = (
         '        echo "$install_dir" >> "$GITHUB_PATH"\n'
