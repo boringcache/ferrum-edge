@@ -1229,7 +1229,9 @@ mod tests {
         assert!(is_benign_script_step_error(
             "h2 handshake failed: Broken pipe (os error 32)"
         ));
-        assert!(is_benign_script_step_error("h2 handshake failed: Broken pipe"));
+        assert!(is_benign_script_step_error(
+            "h2 handshake failed: Broken pipe"
+        ));
     }
 
     #[test]
@@ -1241,17 +1243,25 @@ mod tests {
 
     #[test]
     fn benign_script_step_error_rejects_malformed_broken_pipe_h2_handshake_details() {
-        assert!(!is_benign_h2_handshake_broken_pipe_detail("Broken pipe (protocol error"));
+        assert!(!is_benign_h2_handshake_broken_pipe_detail(
+            "Broken pipe (protocol error"
+        ));
         assert!(!is_benign_h2_handshake_broken_pipe_detail("Broken pipe ("));
-        assert!(!is_benign_h2_handshake_broken_pipe_detail("Broken pipe (os error )"));
-        assert!(!is_benign_h2_handshake_broken_pipe_detail("Broken pipe (os error abc)"));
+        assert!(!is_benign_h2_handshake_broken_pipe_detail(
+            "Broken pipe (os error )"
+        ));
+        assert!(!is_benign_h2_handshake_broken_pipe_detail(
+            "Broken pipe (os error abc)"
+        ));
         assert!(!is_benign_h2_handshake_broken_pipe_detail(
             "Broken pipe (os error 32) trailing junk"
         ));
         assert!(!is_benign_script_step_error(
             "h2 handshake failed: Broken pipe (protocol error"
         ));
-        assert!(!is_benign_script_step_error("h2 handshake failed: Broken pipe ("));
+        assert!(!is_benign_script_step_error(
+            "h2 handshake failed: Broken pipe ("
+        ));
         assert!(!is_benign_script_step_error(
             "h2 handshake failed: Broken pipe (os error )"
         ));
