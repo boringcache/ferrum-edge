@@ -129,6 +129,120 @@ fn rejects_document_without_mesh_section() {
 }
 
 #[test]
+fn probe_accepts_localized_version_and_mesh_shape() {
+    use ferrum_edge::modes::mesh::config_consumer::file_source::probe_localized_mesh_file_document;
+
+    let path = write_temp(
+        "yaml",
+        r#"
+version: "1"
+mesh:
+  services: []
+"#,
+    );
+    assert!(
+        probe_localized_mesh_file_document(&path).expect("probe readable localized document"),
+        "optional version plus mesh mapping is the localized shape"
+    );
+}
+
+#[test]
+fn probe_accepts_mesh_only_document() {
+    use ferrum_edge::modes::mesh::config_consumer::file_source::probe_localized_mesh_file_document;
+
+    let path = write_temp("yaml", "mesh: {}\n");
+    assert!(
+        probe_localized_mesh_file_document(&path).expect("probe readable mesh-only document"),
+        "mesh mapping without version is still the localized shape"
+    );
+}
+
+#[test]
+fn probe_rejects_gateway_resources_document() {
+    use ferrum_edge::modes::mesh::config_consumer::file_source::probe_localized_mesh_file_document;
+
+    let path = write_temp(
+        "yaml",
+        r#"
+version: "1"
+proxies: []
+mesh:
+  services: []
+"#,
+    );
+    assert!(
+        !probe_localized_mesh_file_document(&path).expect("gateway document is readable"),
+        "unknown top-level keys must not select mesh file validation"
+    );
+}
+
+#[test]
+fn probe_rejects_missing_mesh_section() {
+    use ferrum_edge::modes::mesh::config_consumer::file_source::probe_localized_mesh_file_document;
+
+    let path = write_temp("yaml", "version: \"1\"\n");
+    assert!(
+        !probe_localized_mesh_file_document(&path).expect("version-only document is readable"),
+        "version without mesh is not the localized shape"
+    );
+}
+
+#[test]
+fn probe_json_extension_uses_json_parser() {
+    use ferrum_edge::modes::mesh::config_consumer::file_source::probe_localized_mesh_file_document;
+
+    let path = write_temp("json", r#"{"mesh":{}}"#);
+    assert!(
+        probe_localized_mesh_file_document(&path).expect("json mesh document"),
+        ".json must use the JSON parser, not content sniffing"
+    );
+}
+
+#[test]
+fn probe_malformed_yaml_is_not_the_localized_shape() {
+    use ferrum_edge::modes::mesh::config_consumer::file_source::probe_localized_mesh_file_document;
+
+    let path = write_temp("yaml", "mesh: [\n");
+    assert!(
+        !probe_localized_mesh_file_document(&path).expect("malformed yaml is still readable"),
+        "malformed YAML must not infer file protocol"
+    );
+}
+
+#[test]
+fn probe_missing_file_is_an_error() {
+    use ferrum_edge::modes::mesh::config_consumer::file_source::probe_localized_mesh_file_document;
+
+    let err = probe_localized_mesh_file_document(std::path::Path::new(
+        "/nonexistent/ferrum-mesh-validate.yaml",
+    ))
+    .expect_err("missing file must be an error");
+    assert!(err.to_string().contains("not found"), "{err}");
+}
+
+#[test]
+fn probe_accepts_localized_shape_even_when_inner_fields_are_invalid() {
+    use ferrum_edge::modes::mesh::config_consumer::file_source::probe_localized_mesh_file_document;
+
+    let path = write_temp(
+        "yaml",
+        r#"
+mesh:
+  services:
+    - name: api
+      namespace: ferrum
+      ports:
+        - port: 0
+          protocol: http
+"#,
+    );
+    assert!(
+        probe_localized_mesh_file_document(&path).expect("invalid inner fields are still the shape"),
+        "inference is top-level shape only; inner validity belongs to the real parser"
+    );
+}
+
+#[test]
 fn rejects_unknown_version_stamp() {
     let doc = r#"
 version: "999"

@@ -819,6 +819,59 @@ fn test_env_config_mesh_mode_stock_xds_needs_no_ferrum_cp_credentials() {
 }
 
 #[test]
+fn test_env_config_mesh_mode_file_requires_the_local_document() {
+    with_env_vars(
+        &[
+            ("FERRUM_MODE", "mesh"),
+            ("FERRUM_MESH_CONFIG_PROTOCOL", "file"),
+        ],
+        || {
+            remove_var("FERRUM_MESH_FILE_CONFIG_PATH");
+            remove_var("FERRUM_DP_CP_GRPC_URLS");
+            remove_var("FERRUM_CP_DP_GRPC_JWT_SECRET");
+            let error = EnvConfig::from_env()
+                .expect_err("file protocol without its document must fail closed");
+            assert!(
+                error.contains("FERRUM_MESH_FILE_CONFIG_PATH"),
+                "file protocol must be refused for the missing document, got: {error}"
+            );
+            assert!(
+                !error.contains("FERRUM_DP_CP_GRPC_URLS")
+                    && !error.contains("FERRUM_CP_DP_GRPC_JWT_SECRET"),
+                "file protocol must not require Ferrum CP/DP credentials, got: {error}"
+            );
+        },
+    );
+}
+
+#[test]
+fn test_env_config_mesh_mode_file_needs_no_ferrum_cp_credentials() {
+    with_env_vars(
+        &[
+            ("FERRUM_MODE", "mesh"),
+            ("FERRUM_MESH_CONFIG_PROTOCOL", "file"),
+            ("FERRUM_MESH_FILE_CONFIG_PATH", "/etc/ferrum/mesh.yaml"),
+            ("FERRUM_MESH_CA_BACKEND", "internal"),
+            ("FERRUM_MESH_CA_BOOTSTRAP_DEV", "true"),
+            (
+                "FERRUM_MESH_WORKLOAD_SPIFFE_ID",
+                "spiffe://cluster.local/ns/ferrum/sa/api",
+            ),
+        ],
+        || {
+            remove_var("FERRUM_DP_CP_GRPC_URLS");
+            remove_var("FERRUM_CP_DP_GRPC_JWT_SECRET");
+            remove_var("FERRUM_MESH_PRODUCTION_MODE");
+            remove_var("FERRUM_MESH_ALLOW_NO_CA");
+            let config = EnvConfig::from_env()
+                .expect("file protocol with identity must not require Ferrum CP credentials");
+            assert_eq!(config.mode, OperatingMode::Mesh);
+            assert_eq!(config.mesh_config_protocol, "file");
+        },
+    );
+}
+
+#[test]
 fn test_env_config_mesh_mode_missing_jwt_secret() {
     with_env_vars(
         &[

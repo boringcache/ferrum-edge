@@ -23,6 +23,7 @@ pub mod revision;
 pub mod runtime;
 pub mod runtime_overlay_consumers;
 pub mod slice;
+pub mod validate;
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fmt;
@@ -341,7 +342,7 @@ pub enum MeshConfigProtocol {
 }
 
 impl MeshConfigProtocol {
-    fn parse(raw: &str) -> Result<Self, String> {
+    pub fn parse(raw: &str) -> Result<Self, String> {
         match raw.trim().to_ascii_lowercase().as_str() {
             "native" => Ok(Self::Native),
             "xds" => Ok(Self::Xds),
@@ -355,7 +356,7 @@ impl MeshConfigProtocol {
         }
     }
 
-    fn as_str(self) -> &'static str {
+    pub fn as_str(self) -> &'static str {
         match self {
             Self::Native => "native",
             Self::Xds => "xds",
@@ -371,12 +372,12 @@ impl MeshConfigProtocol {
     /// `StockXds` is deliberately excluded: it dials a third-party server named
     /// by `FERRUM_MESH_STOCK_XDS_URLS` and must never present a Ferrum-minted
     /// CP/DP JWT to it.
-    fn requires_control_plane(self) -> bool {
+    pub fn requires_control_plane(self) -> bool {
         matches!(self, Self::Native | Self::Xds)
     }
 
     /// Whether this protocol requires the local mesh policy document.
-    fn requires_local_policy_document(self) -> bool {
+    pub fn requires_local_policy_document(self) -> bool {
         matches!(self, Self::File | Self::StockXds)
     }
 }
