@@ -1047,18 +1047,19 @@ impl V001SqlBuilder {
                     .await?;
                 Ok(())
             }
-            Ok(NamespacesRegistryBackfillOutcome::Defer) => self
-                .rollback_sqlite_namespaces_registry_backfill_savepoint(connection)
-                .await,
+            Ok(NamespacesRegistryBackfillOutcome::Defer) => {
+                self.rollback_sqlite_namespaces_registry_backfill_savepoint(connection)
+                    .await
+            }
             Err(error) => {
                 if self
                     .rollback_sqlite_namespaces_registry_backfill_savepoint(connection)
                     .await
                     .is_err()
                 {
-                    return Err(error.context(
-                        "namespace registry backfill savepoint rollback also failed",
-                    ));
+                    return Err(
+                        error.context("namespace registry backfill savepoint rollback also failed")
+                    );
                 }
                 Err(error)
             }
