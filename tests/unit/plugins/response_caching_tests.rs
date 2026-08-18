@@ -9,16 +9,18 @@ use super::plugin_utils::create_test_proxy;
 use chrono::Utc;
 use ferrum_edge::_test_support::{
     advance_response_caching_clock_for_test, clone_log_metadata,
+    is_gateway_generated_correlation_header_for_test,
     refine_stream_response_for_content_type_for_test, response_caching_cache_keys_for_test,
     response_caching_current_total_size_for_test, response_caching_instance_id_for_test,
     response_caching_shard_amount_for_test, response_caching_size_accounting_snapshot_for_test,
     response_caching_staging_metadata_key_for_test, response_caching_vary_index_snapshot_for_test,
     retry_response_decision_context_for_test, run_after_proxy_hooks_for_test,
     run_after_proxy_hooks_reject_for_test, set_replay_credential_headers_for_test,
-    set_replay_request_body_empty_proven_for_test,
+    set_replay_request_body_empty_proven_for_test, set_request_wire_protocol_for_test,
     set_response_presentation_policy_digest_for_test, stamp_original_response_metadata_for_test,
 };
-use ferrum_edge::config::types::Consumer;
+use ferrum_edge::config::types::{Consumer, HttpWireTransport};
+use ferrum_edge::plugins::correlation_id::CorrelationId;
 use ferrum_edge::plugins::response_caching::{RESPONSE_CACHING_CONFIG_KEYS, ResponseCaching};
 use ferrum_edge::plugins::response_size_limiting::ResponseSizeLimiting;
 use ferrum_edge::plugins::{
@@ -7828,4 +7830,395 @@ async fn a_cacheable_response_is_still_stored_under_a_healthy_budget() {
         1,
         "the entry copy acquires its own charge and the store proceeds"
     );
+}
+
+// === Gateway-minted correlation headers are not cache dimensions (#3929) ===
+
+async fn apply_correlation(
+    correlation: &CorrelationId,
+    ctx: &mut RequestContext,
+) -> HashMap<String, String> {
+    let received = correlation.on_request_received(ctx).await;
+    assert!(matches!(received, PluginResult::Continue));
+    let mut headers = ctx.headers.clone();
+    let forwarded = correlation.before_proxy(ctx, &mut headers).await;
+    assert!(matches!(forwarded, PluginResult::Continue));
+    headers
+}
+
+async fn store_public_entry(
+    cache: &ResponseCaching,
+    ctx: &mut RequestContext,
+    headers: &mut HashMap<String, String>,
+    body: &[u8],
+) {
+    assert!(matches!(
+        cache.before_proxy(ctx, headers).await,
+        PluginResult::Continue
+    ));
+    let mut response_headers = public_response_headers();
+    cache.after_proxy(ctx, 200, &mut response_headers).await;
+    cache
+        .on_final_response_body(ctx, 200, &response_headers, body)
+        .await;
+}
+
+#[tokio::test]
+async fn generated_correlation_header_is_omitted_from_shared_cache_key() {
+    let _guard = response_cache_replay_policy_guard();
+    let correlation = CorrelationId::new(&json!({})).unwrap();
+    let cache = default_plugin();
+
+    let mut miss_ctx = make_ctx("GET", "/p/cache");
+    let mut miss_headers = apply_correlation(&correlation, &mut miss_ctx).await;
+    let generated = miss_headers
+        .get("x-request-id")
+        .expect("forwarded generated id")
+        .clone();
+    assert!(uuid::Uuid::parse_str(&generated).is_ok());
+    assert!(is_gateway_generated_correlation_header_for_test(
+        &miss_ctx,
+        "x-request-id",
+        &generated
+    ));
+    store_public_entry(&cache, &mut miss_ctx, &mut miss_headers, b"shared-body").await;
+    assert_status(&cache, &miss_ctx, "MISS");
+
+    let mut hit_ctx = make_ctx("GET", "/p/cache");
+    let mut hit_headers = apply_correlation(&correlation, &mut hit_ctx).await;
+    let second_id = hit_headers
+        .get("x-request-id")
+        .expect("second generated id")
+        .clone();
+    assert_ne!(generated, second_id, "each request must mint a unique id");
+    let (status, body, mut response_headers) =
+        expect_reject(cache.before_proxy(&mut hit_ctx, &mut hit_headers).await);
+    assert_eq!(body, b"shared-body");
+    assert_status(&cache, &hit_ctx, "HIT");
+
+    let echoed = correlation
+        .after_proxy(&mut hit_ctx, status, &mut response_headers)
+        .await;
+    assert!(matches!(echoed, PluginResult::Continue));
+    assert_eq!(
+        response_headers.get("x-request-id"),
+        Some(&second_id),
+        "HIT must still echo this request's generated id"
+    );
+}
+
+#[tokio::test]
+async fn client_supplied_correlation_values_remain_distinct_cache_dimensions() {
+    let _guard = response_cache_replay_policy_guard();
+    let correlation = CorrelationId::new(&json!({})).unwrap();
+    let cache = default_plugin();
+
+    let mut first = make_ctx("GET", "/p/cache-client");
+    first
+        .headers
+        .insert("x-request-id".to_string(), "fixed-1".to_string());
+    let mut first_headers = apply_correlation(&correlation, &mut first).await;
+    assert!(!is_gateway_generated_correlation_header_for_test(
+        &first,
+        "x-request-id",
+        "fixed-1"
+    ));
+    store_public_entry(&cache, &mut first, &mut first_headers, b"body-1").await;
+
+    let mut same = make_ctx("GET", "/p/cache-client");
+    same.headers
+        .insert("x-request-id".to_string(), "fixed-1".to_string());
+    let mut same_headers = apply_correlation(&correlation, &mut same).await;
+    let (_, body, _) = expect_reject(cache.before_proxy(&mut same, &mut same_headers).await);
+    assert_eq!(body, b"body-1");
+
+    let mut other = make_ctx("GET", "/p/cache-client");
+    other
+        .headers
+        .insert("x-request-id".to_string(), "fixed-2".to_string());
+    let mut other_headers = apply_correlation(&correlation, &mut other).await;
+    assert!(matches!(
+        cache.before_proxy(&mut other, &mut other_headers).await,
+        PluginResult::Continue
+    ));
+}
+
+#[tokio::test]
+async fn custom_generated_correlation_header_is_omitted_from_the_key() {
+    let _guard = response_cache_replay_policy_guard();
+    let correlation = CorrelationId::new(&json!({
+        "header_name": "x-correlation-id"
+    }))
+    .unwrap();
+    let cache = default_plugin();
+
+    let mut miss_ctx = make_ctx("GET", "/p/custom-corr");
+    let mut miss_headers = apply_correlation(&correlation, &mut miss_ctx).await;
+    assert!(miss_headers.contains_key("x-correlation-id"));
+    store_public_entry(&cache, &mut miss_ctx, &mut miss_headers, b"custom-body").await;
+
+    let mut hit_ctx = make_ctx("GET", "/p/custom-corr");
+    let mut hit_headers = apply_correlation(&correlation, &mut hit_ctx).await;
+    let (_, body, _) = expect_reject(cache.before_proxy(&mut hit_ctx, &mut hit_headers).await);
+    assert_eq!(body, b"custom-body");
+}
+
+#[tokio::test]
+async fn absent_correlation_plugin_still_keys_client_supplied_x_request_id() {
+    let _guard = response_cache_replay_policy_guard();
+    let cache = default_plugin();
+
+    let mut first = make_ctx("GET", "/p/no-corr");
+    first
+        .headers
+        .insert("x-request-id".to_string(), "fixed-1".to_string());
+    let mut first_headers = first.headers.clone();
+    store_public_entry(&cache, &mut first, &mut first_headers, b"one").await;
+
+    let mut same = make_ctx("GET", "/p/no-corr");
+    same.headers
+        .insert("x-request-id".to_string(), "fixed-1".to_string());
+    let mut same_headers = same.headers.clone();
+    let (_, body, _) = expect_reject(cache.before_proxy(&mut same, &mut same_headers).await);
+    assert_eq!(body, b"one");
+
+    let mut other = make_ctx("GET", "/p/no-corr");
+    other
+        .headers
+        .insert("x-request-id".to_string(), "fixed-2".to_string());
+    let mut other_headers = other.headers.clone();
+    assert!(matches!(
+        cache.before_proxy(&mut other, &mut other_headers).await,
+        PluginResult::Continue
+    ));
+
+    let mut anonymous = make_ctx("GET", "/p/no-corr-anon");
+    let mut anonymous_headers = HashMap::new();
+    store_public_entry(
+        &cache,
+        &mut anonymous,
+        &mut anonymous_headers,
+        b"anon-body",
+    )
+    .await;
+    let mut anonymous_hit = make_ctx("GET", "/p/no-corr-anon");
+    let mut anonymous_hit_headers = HashMap::new();
+    let (_, body, _) = expect_reject(
+        cache
+            .before_proxy(&mut anonymous_hit, &mut anonymous_hit_headers)
+            .await,
+    );
+    assert_eq!(body, b"anon-body");
+}
+
+#[tokio::test]
+async fn generated_correlation_still_hits_when_origin_varies_on_the_header() {
+    let _guard = response_cache_replay_policy_guard();
+    let correlation = CorrelationId::new(&json!({})).unwrap();
+    let cache = default_plugin();
+
+    let mut miss_ctx = make_ctx("GET", "/p/vary-corr");
+    let mut miss_headers = apply_correlation(&correlation, &mut miss_ctx).await;
+    assert!(matches!(
+        cache.before_proxy(&mut miss_ctx, &mut miss_headers).await,
+        PluginResult::Continue
+    ));
+    let mut response_headers = public_response_headers();
+    response_headers.insert("vary".to_string(), "x-request-id".to_string());
+    cache
+        .after_proxy(&mut miss_ctx, 200, &mut response_headers)
+        .await;
+    cache
+        .on_final_response_body(&mut miss_ctx, 200, &response_headers, b"vary-body")
+        .await;
+
+    let mut hit_ctx = make_ctx("GET", "/p/vary-corr");
+    let mut hit_headers = apply_correlation(&correlation, &mut hit_ctx).await;
+    let (_, body, _) = expect_reject(cache.before_proxy(&mut hit_ctx, &mut hit_headers).await);
+    assert_eq!(body, b"vary-body");
+
+    let mut client = make_ctx("GET", "/p/vary-corr");
+    client
+        .headers
+        .insert("x-request-id".to_string(), "fixed-1".to_string());
+    let mut client_headers = apply_correlation(&correlation, &mut client).await;
+    assert!(matches!(
+        cache.before_proxy(&mut client, &mut client_headers).await,
+        PluginResult::Continue
+    ));
+}
+
+#[tokio::test]
+async fn multiple_correlation_instances_omit_only_generated_headers() {
+    let _guard = response_cache_replay_policy_guard();
+    let internal = CorrelationId::new(&json!({
+        "header_name": "x-internal-request-id"
+    }))
+    .unwrap();
+    let external = CorrelationId::new(&json!({
+        "header_name": "x-external-correlation-id"
+    }))
+    .unwrap();
+    let cache = default_plugin();
+
+    let mut miss_ctx = make_ctx("GET", "/p/multi-corr");
+    let mut miss_headers = apply_correlation(&internal, &mut miss_ctx).await;
+    let extra = apply_correlation(&external, &mut miss_ctx).await;
+    miss_headers.extend(extra);
+    store_public_entry(&cache, &mut miss_ctx, &mut miss_headers, b"multi-body").await;
+
+    let mut hit_ctx = make_ctx("GET", "/p/multi-corr");
+    let mut hit_headers = apply_correlation(&internal, &mut hit_ctx).await;
+    let extra = apply_correlation(&external, &mut hit_ctx).await;
+    hit_headers.extend(extra);
+    let (_, body, _) = expect_reject(cache.before_proxy(&mut hit_ctx, &mut hit_headers).await);
+    assert_eq!(body, b"multi-body");
+
+    let mut mixed = make_ctx("GET", "/p/multi-corr");
+    mixed.headers.insert(
+        "x-external-correlation-id".to_string(),
+        "tenant-a".to_string(),
+    );
+    let mut mixed_headers = apply_correlation(&internal, &mut mixed).await;
+    let extra = apply_correlation(&external, &mut mixed).await;
+    mixed_headers.extend(extra);
+    assert!(matches!(
+        cache.before_proxy(&mut mixed, &mut mixed_headers).await,
+        PluginResult::Continue
+    ));
+}
+
+#[tokio::test]
+async fn public_metadata_cannot_collapse_client_supplied_correlation_keys() {
+    let _guard = response_cache_replay_policy_guard();
+    let cache = default_plugin();
+
+    let mut first = make_ctx("GET", "/p/spoof-corr");
+    first
+        .headers
+        .insert("x-request-id".to_string(), "fixed-1".to_string());
+    first
+        .metadata
+        .insert("correlation_id.generated".to_string(), "true".to_string());
+    let mut first_headers = first.headers.clone();
+    store_public_entry(&cache, &mut first, &mut first_headers, b"spoof-1").await;
+
+    let mut other = make_ctx("GET", "/p/spoof-corr");
+    other
+        .headers
+        .insert("x-request-id".to_string(), "fixed-2".to_string());
+    other
+        .metadata
+        .insert("correlation_id.generated".to_string(), "true".to_string());
+    other.metadata.insert(
+        "correlation_id.generated.x-request-id".to_string(),
+        "true".to_string(),
+    );
+    let mut other_headers = other.headers.clone();
+    assert!(matches!(
+        cache.before_proxy(&mut other, &mut other_headers).await,
+        PluginResult::Continue
+    ));
+}
+
+#[tokio::test]
+async fn rewritten_generated_correlation_value_stays_a_cache_dimension() {
+    let _guard = response_cache_replay_policy_guard();
+    let correlation = CorrelationId::new(&json!({})).unwrap();
+    let cache = default_plugin();
+
+    let mut generated = make_ctx("GET", "/p/rewritten-corr");
+    let mut generated_headers = apply_correlation(&correlation, &mut generated).await;
+    store_public_entry(
+        &cache,
+        &mut generated,
+        &mut generated_headers,
+        b"generated-body",
+    )
+    .await;
+
+    let mut rewritten = make_ctx("GET", "/p/rewritten-corr");
+    let mut rewritten_headers = apply_correlation(&correlation, &mut rewritten).await;
+    rewritten_headers.insert(
+        "x-request-id".to_string(),
+        "transformer-rewrote-this".to_string(),
+    );
+    assert!(matches!(
+        cache
+            .before_proxy(&mut rewritten, &mut rewritten_headers)
+            .await,
+        PluginResult::Continue
+    ));
+}
+
+#[tokio::test]
+async fn generated_correlation_omit_survives_reload_reconstruction_and_retries() {
+    let correlation = CorrelationId::new(&json!({})).unwrap();
+    let generation_one = default_plugin();
+    let generation_two = default_plugin();
+
+    let mut first = make_ctx("GET", "/p/reload-corr");
+    let mut first_headers = apply_correlation(&correlation, &mut first).await;
+    assert!(matches!(
+        generation_one
+            .before_proxy(&mut first, &mut first_headers)
+            .await,
+        PluginResult::Continue
+    ));
+    let first_key = first
+        .metadata
+        .get(&staging_key(&generation_one, "cache_base_key"))
+        .cloned();
+
+    let mut second = make_ctx("GET", "/p/reload-corr");
+    let mut second_headers = apply_correlation(&correlation, &mut second).await;
+    assert!(matches!(
+        generation_two
+            .before_proxy(&mut second, &mut second_headers)
+            .await,
+        PluginResult::Continue
+    ));
+    let second_key = second
+        .metadata
+        .get(&staging_key(&generation_two, "cache_base_key"))
+        .cloned();
+    assert_eq!(
+        first_key, second_key,
+        "a reconstructed cache instance must still omit generated correlation ids"
+    );
+
+    let retry_ctx = retry_response_decision_context_for_test(&second);
+    let retry_id = second_headers
+        .get("x-request-id")
+        .expect("retry still forwards the generated id");
+    assert!(is_gateway_generated_correlation_header_for_test(
+        &retry_ctx,
+        "x-request-id",
+        retry_id
+    ));
+}
+
+#[tokio::test]
+async fn generated_correlation_omit_is_identical_on_h1_h2_h3() {
+    let _guard = response_cache_replay_policy_guard();
+    let correlation = CorrelationId::new(&json!({})).unwrap();
+    let cache = default_plugin();
+
+    for transport in [
+        HttpWireTransport::Http1,
+        HttpWireTransport::Http2,
+        HttpWireTransport::Http3,
+    ] {
+        let path = format!("/p/wire-{transport:?}");
+        let mut miss_ctx = make_ctx("GET", &path);
+        set_request_wire_protocol_for_test(&mut miss_ctx, transport, false);
+        let mut miss_headers = apply_correlation(&correlation, &mut miss_ctx).await;
+        store_public_entry(&cache, &mut miss_ctx, &mut miss_headers, b"wire-body").await;
+
+        let mut hit_ctx = make_ctx("GET", &path);
+        set_request_wire_protocol_for_test(&mut hit_ctx, transport, false);
+        let mut hit_headers = apply_correlation(&correlation, &mut hit_ctx).await;
+        let (_, body, _) = expect_reject(cache.before_proxy(&mut hit_ctx, &mut hit_headers).await);
+        assert_eq!(body, b"wire-body", "{transport:?} must HIT");
+    }
 }

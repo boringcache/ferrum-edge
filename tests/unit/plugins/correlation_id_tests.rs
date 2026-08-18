@@ -1,6 +1,8 @@
 //! Tests for the Correlation ID plugin
 
-use ferrum_edge::_test_support::clone_log_metadata;
+use ferrum_edge::_test_support::{
+    clone_log_metadata, is_gateway_generated_correlation_header_for_test,
+};
 use ferrum_edge::plugins::{
     ALL_PROTOCOLS, Plugin, REQUEST_ID_METADATA_KEY, RequestContext, correlation_id::CorrelationId,
     priority,
@@ -946,4 +948,135 @@ async fn test_websocket_handshake_response_echoes_generated_and_preserved_ids() 
             }
         }
     }
+}
+
+// ── Generated vs client-supplied provenance for response_caching (#3929) ─
+
+#[tokio::test]
+async fn omitted_header_records_private_generated_provenance_and_still_forwards() {
+    let plugin = CorrelationId::new(&json!({})).unwrap();
+    let mut ctx = make_ctx();
+    plugin_utils::assert_continue(plugin.on_request_received(&mut ctx).await);
+
+    let generated = ctx
+        .headers
+        .get("x-request-id")
+        .expect("generated header")
+        .clone();
+    assert!(uuid::Uuid::parse_str(&generated).is_ok());
+    assert!(is_gateway_generated_correlation_header_for_test(
+        &ctx,
+        "x-request-id",
+        &generated
+    ));
+    assert!(!is_gateway_generated_correlation_header_for_test(
+        &ctx,
+        "x-request-id",
+        "some-other-value"
+    ));
+
+    let mut outbound = HashMap::new();
+    plugin_utils::assert_continue(plugin.before_proxy(&mut ctx, &mut outbound).await);
+    assert_eq!(outbound.get("x-request-id"), Some(&generated));
+
+    let mut response_headers = HashMap::new();
+    plugin_utils::assert_continue(
+        plugin
+            .after_proxy(&mut ctx, 200, &mut response_headers)
+            .await,
+    );
+    assert_eq!(response_headers.get("x-request-id"), Some(&generated));
+
+    let logged = clone_log_metadata(&ctx);
+    assert_eq!(logged.get("request_id"), Some(&generated));
+    assert!(!logged
+        .keys()
+        .any(|key| key.contains("generated") && key.contains("correlation")));
+}
+
+#[tokio::test]
+async fn client_supplied_header_is_not_recorded_as_generated() {
+    let plugin = CorrelationId::new(&json!({})).unwrap();
+    let mut ctx = make_ctx();
+    ctx.headers
+        .insert("x-request-id".to_string(), "client-fixed-1".to_string());
+    plugin_utils::assert_continue(plugin.on_request_received(&mut ctx).await);
+
+    assert!(!is_gateway_generated_correlation_header_for_test(
+        &ctx,
+        "x-request-id",
+        "client-fixed-1"
+    ));
+    assert_eq!(
+        ctx.headers.get("x-request-id").map(String::as_str),
+        Some("client-fixed-1")
+    );
+}
+
+#[tokio::test]
+async fn rejected_inbound_value_is_recorded_as_generated() {
+    let plugin = CorrelationId::new(&json!({})).unwrap();
+    let mut ctx = make_ctx();
+    ctx.headers
+        .insert("x-request-id".to_string(), "not a token".to_string());
+    plugin_utils::assert_continue(plugin.on_request_received(&mut ctx).await);
+
+    let replacement = ctx
+        .headers
+        .get("x-request-id")
+        .expect("replacement header")
+        .clone();
+    assert_ne!(replacement, "not a token");
+    assert!(is_gateway_generated_correlation_header_for_test(
+        &ctx,
+        "x-request-id",
+        &replacement
+    ));
+}
+
+#[tokio::test]
+async fn custom_header_generation_is_instance_scoped() {
+    let plugin = CorrelationId::new(&json!({
+        "header_name": "x-correlation-id"
+    }))
+    .unwrap();
+    let mut ctx = make_ctx();
+    plugin_utils::assert_continue(plugin.on_request_received(&mut ctx).await);
+
+    let generated = ctx
+        .headers
+        .get("x-correlation-id")
+        .expect("custom generated header")
+        .clone();
+    assert!(is_gateway_generated_correlation_header_for_test(
+        &ctx,
+        "x-correlation-id",
+        &generated
+    ));
+    assert!(!is_gateway_generated_correlation_header_for_test(
+        &ctx,
+        "x-request-id",
+        &generated
+    ));
+}
+
+#[tokio::test]
+async fn public_metadata_cannot_mark_a_client_value_as_generated() {
+    let plugin = CorrelationId::new(&json!({})).unwrap();
+    let mut ctx = make_ctx();
+    ctx.headers
+        .insert("x-request-id".to_string(), "client-fixed-1".to_string());
+    ctx.metadata
+        .insert("correlation_id.generated".to_string(), "true".to_string());
+    ctx.metadata.insert(
+        "correlation_id.generated.x-request-id".to_string(),
+        "true".to_string(),
+    );
+    plugin_utils::assert_continue(plugin.on_request_received(&mut ctx).await);
+
+    assert!(!is_gateway_generated_correlation_header_for_test(
+        &ctx,
+        "x-request-id",
+        "client-fixed-1"
+    ));
 }

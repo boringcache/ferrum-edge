@@ -888,7 +888,7 @@ Captured Sidecar/Ambient raw-TCP and UDP **egress** bypasses the generic stream 
 | `tcp_connection_throttle` | ✓ | | Owns an opaque permit that caps process-local active TCP/TCP+TLS connections per Consumer, else canonical client IP; UDP/DTLS attachment is rejected |
 | `geo_restriction` | ✓ | | Rejects connections from denied countries |
 | `rate_limiting` | ✓ | | Consumer-aware rate limiting when a stream identity exists, else IP-based |
-| `correlation_id` | ✓ | | Assigns a UUID request ID to metadata |
+| `correlation_id` | ✓ | | Assigns a UUID request ID to private request/session state and metadata; records gateway-minted headers so `response_caching` can omit them from the shared-cache key |
 | `otel_tracing` | ✓ | ✓ | Generates trace/span IDs; emits structured trace log |
 | `stdout_logging` | | ✓ | JSON access log for stream connections |
 | `statsd_logging` | | ✓ | Sends stream connection and WebSocket session metrics to StatsD over UDP |

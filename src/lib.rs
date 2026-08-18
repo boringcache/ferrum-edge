@@ -687,6 +687,16 @@ pub mod _test_support {
         )
     }
 
+    /// Whether private request provenance records `name`/`value` as a
+    /// gateway-minted correlation header. Public metadata cannot set this.
+    pub fn is_gateway_generated_correlation_header_for_test(
+        ctx: &crate::plugins::RequestContext,
+        name: &str,
+        value: &str,
+    ) -> bool {
+        ctx.is_gateway_generated_correlation_header(name, value)
+    }
+
     pub fn udp_dtls_disconnect_metadata_after_datagram_metadata_for_test(
         ctx: &mut crate::plugins::StreamConnectionContext,
         datagram_metadata: HashMap<String, String>,
