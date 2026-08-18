@@ -4537,7 +4537,7 @@ representations explicitly outside the configured response-body scan scope.
 | `pattern` | string | `""` | Pattern text. Required except for `luhn` rules. CIDR rules accept an IP or CIDR range. |
 | `action` | string | global default | `enforce`, `monitor`, or `disabled`. |
 | `score` | integer | severity weight | Anomaly-score contribution when `scoring` is enabled. |
-| `fp_filters` | string[] | `[]` | Regex filters that suppress known false-positive captured values for this rule. |
+| `fp_filters` | string[] | `[]` | Unanchored regex filters evaluated against the complete inspected target value after a rule match; if any filter matches anywhere in that value, the hit is suppressed. For `body_json_path`, this is the selected JSON scalar's string form, not only the matched substring. |
 | `paranoia_min` | u8 | `1` | Minimum paranoia level required for this rule. |
 | `conditions` | object | `{}` | Optional request conditions: `paths`, `methods`, `headers`, and `consumers`. Path entries share exact-match and trailing-`*` prefix forms with `global_exemptions.paths`, but `~regex` anchoring differs: rule `conditions.paths` compile the text after `~` as an operator-authored, unanchored regex evaluated with Rust regex `is_match`, so they may match anywhere in the path unless the pattern itself is anchored (for example `~^/admin(?:/|$)`). A floating match such as `~api` therefore matches both `/api/users` and `/v1/api-keys`. Exact and prefix forms are unchanged and are not regex-anchored. |
 

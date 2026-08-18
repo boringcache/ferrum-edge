@@ -234,7 +234,11 @@ mode.
 
 `rule_overrides` tunes individual rules — **including built-ins** — without
 forking the rule pack. Attach false-positive filters, scope to paths, raise
-paranoia, change severity/score, or set a per-rule `action`:
+paranoia, change severity/score, or set a per-rule `action`. Per-rule
+`fp_filters` are unanchored regular expressions evaluated against the **complete
+inspected target value** after the rule matcher finds a hit — for example the
+full query value, header value, or `body_json_path` scalar string — not merely
+the substring that satisfied `contains`/`regex`/…:
 
 ```json
 {
@@ -291,6 +295,13 @@ unintended routes:
   ]
 }
 ```
+
+The `fp_filters` entry above is a regex, not a literal substring. Escape
+metacharacters as needed (`\\+` in JSON config for a literal `+` in
+`application/ld+json`). After the `contains` matcher hits on the selected
+`user.bio` string, the filter is checked against that **entire** bio value; a
+JSON-LD `<script type="application/ld+json">…</script>` block therefore
+suppresses the hit while an ordinary `<script>…</script>` payload still blocks.
 
 ## Body and response inspection
 
