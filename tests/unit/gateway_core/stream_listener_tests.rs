@@ -2268,7 +2268,7 @@ async fn swap_frontend_tls_config_replaces_slot_without_reconcile() {
 async fn frontend_dtls_publish_records_generation_without_listeners() {
     let manager = create_manager(empty_config());
     let (_generation, swapped) = manager
-        .publish_frontend_dtls_generation(ephemeral_frontend_dtls_config())
+        .publish_frontend_dtls_generation(ephemeral_frontend_dtls_config(), false)
         .await;
     assert_eq!(swapped, 0, "no listeners should mean no live swaps");
     let generation = manager
@@ -2330,7 +2330,7 @@ async fn ordinary_dtls_listener_keeps_dedicated_policy_across_mesh_tcp_tls_swap(
         ..empty_config()
     });
     manager
-        .set_frontend_dtls_cert_key(cert_path, key_path, Some(ca_path))
+        .set_frontend_dtls_cert_key(cert_path, key_path, Some(ca_path), false)
         .await;
     manager
         .wait_until_started(Duration::from_secs(2))
@@ -2376,7 +2376,7 @@ async fn ordinary_dtls_build_failure_keeps_last_good_across_mesh_tcp_tls_swap() 
     let _ = rustls::crypto::ring::default_provider().install_default();
     let manager = create_manager(empty_config());
     let (_gen, _) = manager
-        .publish_frontend_dtls_generation(ephemeral_frontend_dtls_config())
+        .publish_frontend_dtls_generation(ephemeral_frontend_dtls_config(), false)
         .await;
     let before = manager
         .snapshot_frontend_dtls_generation()
@@ -2405,7 +2405,7 @@ async fn ordinary_dtls_build_failure_keeps_last_good_across_mesh_tcp_tls_swap() 
 async fn mesh_node_waypoint_dtls_publish_never_touches_the_ordinary_generation() {
     let manager = create_manager(empty_config());
     let (_generation, _swapped) = manager
-        .publish_frontend_dtls_generation(ephemeral_frontend_dtls_config())
+        .publish_frontend_dtls_generation(ephemeral_frontend_dtls_config(), false)
         .await;
     let ordinary_before = manager
         .snapshot_frontend_dtls_generation()
@@ -2444,7 +2444,7 @@ async fn mesh_node_waypoint_dtls_publish_never_touches_the_ordinary_generation()
         .snapshot_mesh_node_waypoint_dtls_generation()
         .expect("mesh generation published");
     let (_generation, _swapped) = manager
-        .publish_frontend_dtls_generation(ephemeral_frontend_dtls_config())
+        .publish_frontend_dtls_generation(ephemeral_frontend_dtls_config(), false)
         .await;
     let mesh_after = manager
         .snapshot_mesh_node_waypoint_dtls_generation()
@@ -2496,8 +2496,8 @@ async fn concurrent_dtls_publishers_cannot_regress_the_accepted_generation() {
     let second_config = ephemeral_frontend_dtls_config();
 
     let (first, second) = tokio::join!(
-        manager.publish_frontend_dtls_generation(first_config),
-        manager.publish_frontend_dtls_generation(second_config)
+        manager.publish_frontend_dtls_generation(first_config, false),
+        manager.publish_frontend_dtls_generation(second_config, false)
     );
     let mut published = [first.0.generation, second.0.generation];
     published.sort_unstable();
@@ -2515,7 +2515,7 @@ async fn concurrent_dtls_publishers_cannot_regress_the_accepted_generation() {
 async fn collected_dtls_server_cannot_publish_an_older_generation_after_rotation() {
     let manager = Arc::new(create_manager(empty_config()));
     manager
-        .publish_frontend_dtls_generation(ephemeral_frontend_dtls_config())
+        .publish_frontend_dtls_generation(ephemeral_frontend_dtls_config(), false)
         .await;
 
     // Hold the shared fence, queue generation 2 first, then queue the collector
@@ -2531,7 +2531,7 @@ async fn collected_dtls_server_cannot_publish_an_older_generation_after_rotation
     let publisher = tokio::spawn(async move {
         let _ = publisher_started_tx.send(());
         publisher_manager
-            .publish_frontend_dtls_generation(ephemeral_frontend_dtls_config())
+            .publish_frontend_dtls_generation(ephemeral_frontend_dtls_config(), false)
             .await
             .0
             .generation
@@ -2561,7 +2561,7 @@ async fn collected_dtls_server_cannot_publish_an_older_generation_after_rotation
 async fn rejected_dtls_candidate_retains_previous_generation() {
     let manager = create_manager(empty_config());
     let (_gen, swapped) = manager
-        .publish_frontend_dtls_generation(ephemeral_frontend_dtls_config())
+        .publish_frontend_dtls_generation(ephemeral_frontend_dtls_config(), false)
         .await;
     assert_eq!(swapped, 0);
     let before = manager
@@ -2586,6 +2586,7 @@ fn ephemeral_frontend_dtls_config() -> ferrum_edge::dtls::FrontendDtlsConfig {
         dimpl_config: std::sync::Arc::new(config),
         certificate,
         client_cert_verifier: None,
+        client_trust: None,
     }
 }
 

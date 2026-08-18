@@ -2054,14 +2054,15 @@ fn client_facing_sends_are_raced_against_the_authorization_plan() {
         "the raced operation is the deadline-aware actual-commit DTLS send"
     );
     assert!(
-        dtls_inner.contains("dtls_c2b_until_expiry("),
-        "DTLS client→backend receive, hooks, and backend commits must race the plan"
+        dtls_inner.contains("dtls_c2b_under_bounds("),
+        "DTLS client→backend receive, hooks, and backend commits must race the plan (and, \
+         since issue #3857, the frontend client-trust fence composed over it)"
     );
     let dtls_c2b_publish = dtls_inner
         .find("publish_request_budget(")
         .expect("DTLS client→backend must publish the cumulative amplification budget");
     let dtls_c2b_send = dtls_inner[dtls_c2b_publish..]
-        .find("dtls_c2b_until_expiry(")
+        .find("dtls_c2b_under_bounds(")
         .expect("the DTLS backend send must race the plan after the budget publish");
     assert!(
         dtls_c2b_send > 0,
@@ -2088,8 +2089,9 @@ fn client_facing_sends_are_raced_against_the_authorization_plan() {
         .next()
         .expect("DTLS B2C hooks precede the client send race");
     assert!(
-        dtls_b2c.contains("udp_reply_commit_after_backend_hooks("),
-        "terminating-DTLS backend→client hooks share the raced helper"
+        dtls_b2c.contains("dtls_reply_commit_after_backend_hooks("),
+        "terminating-DTLS backend→client hooks share the raced helper, under both the \
+         authorization plan and the frontend client-trust fence (issue #3857)"
     );
     assert!(
         !dtls_b2c.contains("plugin.on_udp_datagram(&ctx).await"),

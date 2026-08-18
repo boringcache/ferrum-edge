@@ -658,6 +658,10 @@ pub(crate) async fn handle_h3_websocket(
         "H3 WebSocket (RFC 9220) upgrade request received"
     );
     let mut ctx = ctx;
+    // Issue #3857: captured before any later move of `ctx` so the upgraded H3
+    // WebSocket session carries the QUIC connection's client-trust session into
+    // the shared relay's stop arbiter.
+    let ws_client_trust_session = ctx.client_trust_session.clone();
     let ws_session_deadline = crate::proxy::effective_websocket_session_deadline(
         &ctx,
         state.env_config.websocket_max_lifetime_seconds,
@@ -1676,7 +1680,9 @@ pub(crate) async fn handle_h3_websocket(
     // splice. The same shared `run_websocket_proxy` handles per-frame
     // plugins, cancellation, and on_ws_disconnect bookkeeping. Dispatch
     // on Direct vs Mesh so both backend transports share one relay
-    // (issue #3620).
+    // (issue #3620). The client-trust session is the same transport-owned
+    // fence the H1/H2 path passes (issue #3857); Unix stays a fail-closed
+    // refusal because H3 has no Unix dialer.
     let relay_result = match backend_handshake {
         crate::proxy::WsBackendHandshake::Direct(handshake) => {
             let handshake = *handshake;
@@ -1694,7 +1700,9 @@ pub(crate) async fn handle_h3_websocket(
                 ws_write_buf,
                 false, // H3 always frame-parses; tunnel mode is H1-only
                 crate::proxy::WS_DRAIN_GRACE,
-                // RFC 9220 §5: WebSocket frames over HTTP/3 are NOT masked.
+                // RFC 9220 §5: WebSocket frames over HTTP/3 are NOT masked. The H3
+                // receive pump rejects masked client frames with close code 1002 before
+                // tungstenite's permissive accept-unmasked mode can normalize them.
                 true,
                 ws_idle_tracker,
                 ws_session_deadline,
@@ -1702,6 +1710,7 @@ pub(crate) async fn handle_h3_websocket(
                 Arc::clone(&state.overload),
                 crate::proxy::WsFragmentPolicy::from_env(&state.env_config),
                 &adaptive_buf,
+                ws_client_trust_session,
             )
             .await
         }
@@ -1728,6 +1737,7 @@ pub(crate) async fn handle_h3_websocket(
                 Arc::clone(&state.overload),
                 crate::proxy::WsFragmentPolicy::from_env(&state.env_config),
                 &adaptive_buf,
+                ws_client_trust_session,
             )
             .await
         }

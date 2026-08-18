@@ -135,6 +135,7 @@ impl ScriptedDtlsBackendBuilder {
             dimpl_config: self.config.dimpl_config,
             certificate: self.config.certificate,
             client_cert_verifier: None,
+            client_trust: None,
         };
         let server = DtlsServer::from_socket(self.socket, frontend_config);
         let server = Arc::new(server);
