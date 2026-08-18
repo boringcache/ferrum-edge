@@ -2634,7 +2634,8 @@ async fn ssrf_encoded_query_values_match_after_layered_decode() {
     .await;
     assert!(monitored(&percent, "FE-SSRF-001-Q"));
 
-    let percent_gopher = authorize_query(&plugin, "/w/rec", "u=gopher%3A%2F%2Fexample.com%2F").await;
+    let percent_gopher =
+        authorize_query(&plugin, "/w/rec", "u=gopher%3A%2F%2Fexample.com%2F").await;
     assert!(monitored(&percent_gopher, "FE-SSRF-002-Q"));
 
     // After query-component percent-decode this is `169&#46;254&#46;169&#46;254`;
@@ -2652,11 +2653,8 @@ async fn ssrf_encoded_query_values_match_after_layered_decode() {
 async fn ssrf_body_and_query_parity_for_metadata_and_gopher() {
     let plugin = Waf::new(&json!({})).unwrap();
 
-    let body_metadata = scan_text_plain_body(
-        &plugin,
-        b"http://169.254.169.254/latest/meta-data/",
-    )
-    .await;
+    let body_metadata =
+        scan_text_plain_body(&plugin, b"http://169.254.169.254/latest/meta-data/").await;
     assert!(monitored(&body_metadata, "FE-SSRF-001"));
 
     let query_metadata = authorize_query(
