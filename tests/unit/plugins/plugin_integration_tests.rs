@@ -454,6 +454,11 @@ async fn test_plugin_creation_all_plugins() {
                     "channels": ["ops"]
                 }]
             }),
+            // A bare `{}` waf config is no longer admissible: `mode` defaults to
+            // `enforce` and the built-in pack is monitor-only, which admission
+            // rejects as having no reachable enforcement path (issue #3928).
+            // `mode: monitor` is the documented always-valid posture.
+            "waf" => json!({ "mode": "monitor" }),
             _ => json!({}),
         };
         let plugin = create_plugin(plugin_name, &config);
