@@ -257,7 +257,7 @@ async fn monitor_mode_never_closes_a_session() {
 
 #[tokio::test]
 async fn log_to_stdout_monitor_mode_logs_monitored_effective_action() {
-    let (logs, guard) = crate::plugins::plugin_utils::capture_logs();
+    let (logs, guard) = crate::unit::plugins::plugin_utils::capture_logs();
     let mut config = enforcing_request_rule();
     config["mode"] = json!("monitor");
     config["log_to_stdout"] = json!(true);
@@ -283,14 +283,16 @@ async fn log_to_stdout_monitor_mode_logs_monitored_effective_action() {
         "configured enforce action must remain visible: {captured}"
     );
     assert!(
-        !captured.contains("action=block"),
-        "must not log configured enforce action as effective action: {captured}"
+        !captured
+            .split_whitespace()
+            .any(|field| field.trim_end_matches(',') == "action=block"),
+        "must not log the legacy exact action=block field: {captured}"
     );
 }
 
 #[tokio::test]
 async fn log_to_stdout_enforce_mode_logs_blocked_effective_action() {
-    let (logs, guard) = crate::plugins::plugin_utils::capture_logs();
+    let (logs, guard) = crate::unit::plugins::plugin_utils::capture_logs();
     let mut config = enforcing_request_rule();
     config["log_to_stdout"] = json!(true);
     let plugins = vec![waf(config)];
