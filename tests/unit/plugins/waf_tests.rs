@@ -1046,7 +1046,7 @@ fn enforce_mode_rejects_monitor_only_response_header_rules() {
         }]
     }))
     .unwrap_err();
-    assert!(err.contains("no rule with action 'enforce'"));
+    assert!(err.contains("no enabled enforcement path"));
     assert!(err.contains("default_rule_action"));
     assert!(err.contains("rule_modes"));
 }
@@ -2578,7 +2578,7 @@ fn enforce_mode_rejects_monitor_only_default_ruleset() {
         "include_default_rules": true
     }))
     .unwrap_err();
-    assert!(err.contains("no rule with action 'enforce'"));
+    assert!(err.contains("no enabled enforcement path"));
     assert!(err.contains("default_rule_action"));
     assert!(err.contains("rule_modes"));
     let shared = ferrum_edge::plugins::validate_plugin_config(
@@ -2589,7 +2589,7 @@ fn enforce_mode_rejects_monitor_only_default_ruleset() {
         }),
     )
     .unwrap_err();
-    assert!(shared.contains("no rule with action 'enforce'"));
+    assert!(shared.contains("no enabled enforcement path"));
 }
 
 #[test]
@@ -2637,6 +2637,66 @@ fn enforce_mode_allows_scoring_without_enforce_rules() {
         "scoring": { "enabled": true, "block_threshold": 5 }
     }))
     .unwrap();
+}
+
+#[test]
+fn enforce_mode_rejects_scoring_without_an_inspected_http_rule() {
+    let err = Waf::new(&json!({
+        "mode": "enforce",
+        "include_default_rules": false,
+        "scoring": { "enabled": true, "block_threshold": 5 },
+        "stream": {
+            "inspect_tcp": false,
+            "inspect_udp": false,
+            "inspect_response": false,
+            "signatures": [{
+                "id": "STREAM-MONITOR",
+                "pattern": "marker",
+                "action": "monitor"
+            }]
+        }
+    }))
+    .unwrap_err();
+    assert!(err.contains("no enabled enforcement path"));
+}
+
+#[test]
+fn enforce_mode_rejects_rule_on_a_disabled_response_surface() {
+    let err = Waf::new(&json!({
+        "mode": "enforce",
+        "include_default_rules": false,
+        "response_inspection": false,
+        "custom_rules": [{
+            "id": "RESPONSE-ONLY",
+            "category": "custom",
+            "target": "response_headers",
+            "pattern": "secret",
+            "match_kind": "contains",
+            "action": "enforce"
+        }]
+    }))
+    .unwrap_err();
+    assert!(err.contains("no enabled enforcement path"));
+}
+
+#[test]
+fn enforce_mode_rejects_unreachable_stream_enforce_signature() {
+    let err = Waf::new(&json!({
+        "mode": "enforce",
+        "include_default_rules": false,
+        "stream": {
+            "inspect_tcp": false,
+            "inspect_udp": false,
+            "inspect_response": false,
+            "signatures": [{
+                "id": "STREAM-ENFORCE",
+                "pattern": "marker",
+                "action": "enforce"
+            }]
+        }
+    }))
+    .unwrap_err();
+    assert!(err.contains("no enabled enforcement path"));
 }
 
 #[tokio::test]

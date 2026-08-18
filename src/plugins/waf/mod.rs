@@ -32,8 +32,8 @@ use tracing::warn;
 use self::defaults::default_rules;
 use self::exemptions::CompiledExemptions;
 use self::rules::{
-    CompiledRules, RuleAction, RuleHit, Severity, WafRule, compile_rules, parse_custom_rule,
-    parse_rule_action, parse_rule_overrides,
+    CompiledRules, RuleAction, RuleHit, RuleTarget, Severity, WafRule, compile_rules,
+    parse_custom_rule, parse_rule_action, parse_rule_overrides,
 };
 use self::scan::ScanOutcome;
 use self::stream::{
@@ -401,7 +401,18 @@ impl Waf {
         }
 
         let scoring = parse_scoring(object.get("scoring"))?;
-        validate_enforce_mode_has_enforcing_rules(mode, &compiled, stream.as_ref(), &scoring)?;
+        validate_enforce_mode_has_enforcing_rules(
+            mode,
+            &compiled,
+            stream.as_ref(),
+            scoring.as_ref(),
+            WafInspectionSurfaces {
+                request: request_inspection,
+                request_body: request_body_inspection,
+                response: response_inspection,
+                response_body: response_body_inspection,
+            },
+        )?;
 
         let config = WafConfig {
             mode,
@@ -1862,37 +1873,71 @@ fn parse_too_large_action(raw: &str) -> Result<TooLargeAction, String> {
     }
 }
 
-/// Reject `mode: enforce` when nothing in the effective active ruleset can
-/// block under that mode. Built-in rules ship monitor-only unless opted in;
-/// anomaly scoring and stream transport guards are separate enforcement paths.
+#[derive(Clone, Copy)]
+struct WafInspectionSurfaces {
+    request: bool,
+    request_body: bool,
+    response: bool,
+    response_body: bool,
+}
+
+impl WafInspectionSurfaces {
+    fn inspects(self, target: &RuleTarget) -> bool {
+        match target {
+            RuleTarget::BodyText | RuleTarget::BodyJsonPath(_) => {
+                self.request && self.request_body
+            }
+            RuleTarget::ResponseHeaders => self.response,
+            RuleTarget::ResponseBody => self.response && self.response_body,
+            _ => self.request,
+        }
+    }
+}
+
+/// Reject `mode: enforce` when no rule or separate enforcement path can block
+/// on a surface that is actually enabled. Built-in rules ship monitor-only
+/// unless opted in; anomaly scoring and stream transport guards are separate
+/// enforcement paths, but only when they have reachable input to inspect.
 fn validate_enforce_mode_has_enforcing_rules(
     mode: GlobalMode,
     compiled: &CompiledRules,
     stream: Option<&StreamWafConfig>,
-    scoring: &Option<ScoringConfig>,
+    scoring: Option<&ScoringConfig>,
+    surfaces: WafInspectionSurfaces,
 ) -> Result<(), String> {
     if mode != GlobalMode::Enforce {
-        return Ok(());
-    }
-    if scoring.is_some() {
         return Ok(());
     }
     if compiled
         .rules
         .iter()
-        .any(|rule| rule.action == RuleAction::Enforce)
+        .any(|rule| surfaces.inspects(&rule.target) && rule.action == RuleAction::Enforce)
     {
         return Ok(());
     }
+    if scoring.is_some_and(|scoring| {
+        compiled.rules.iter().any(|rule| {
+            surfaces.inspects(&rule.target)
+                && rule
+                    .score
+                    .unwrap_or_else(|| scoring.weight(rule.severity))
+                    > 0
+        })
+    }) {
+        return Ok(());
+    }
     if stream.is_some_and(|cfg| {
-        cfg.tcp_require_tls || cfg.signatures.has_enforce_action()
+        cfg.tcp_require_tls
+            || (cfg.signatures.has_enforce_action()
+                && (cfg.inspect_tcp || cfg.inspect_udp || cfg.inspect_response))
     }) {
         return Ok(());
     }
     Err(
-        "waf: mode is 'enforce' but the effective active ruleset has no rule with action \
-         'enforce'. Built-in rules are monitor-only by default; set 'default_rule_action' to \
-         'enforce' or opt rules in via 'rule_modes' / custom_rules[].action"
+        "waf: mode is 'enforce' but no enabled enforcement path can block traffic. Built-in \
+         rules are monitor-only by default; set 'default_rule_action' to 'enforce' or opt \
+         rules in via 'rule_modes' / custom_rules[].action, enable anomaly scoring over an \
+         inspected HTTP rule, or enable a stream enforcement rule"
             .to_string(),
     )
 }
