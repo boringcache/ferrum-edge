@@ -82,6 +82,16 @@
 //! withdrawal can be retired despite already using the new material; the benefit
 //! is that one can never escape the fence.
 //!
+//! One path does not achieve that ordering by capture placement: the TCP+TLS
+//! accept loop snapshots the frontend TLS slot for a connection before
+//! `handle_tcp_connection_inner` reads the generation, so it can hold a
+//! post-withdrawal generation beside a pre-withdrawal `ServerConfig`. It is
+//! covered instead by the post-handshake re-verification described next —
+//! because the verifier is installed before the generation advances, a
+//! connection observing generation G meets a verifier at or newer than G. There
+//! [`armed_handshake_der_chain_still_trusted`] is load-bearing rather than
+//! defence in depth, and the call site says so.
+//!
 //! rustls bakes the `ClientCertVerifier` into each `ServerConfig` snapshot, so
 //! swapping a slot or calling `Endpoint::set_server_config` does not rewrite a
 //! TlsAcceptor / QUIC endpoint config already in hand. Every rustls listener

@@ -752,9 +752,17 @@ loads the configuration second. A connection can therefore capture a generation
 that is *older* than the material it actually handshakes with — the conservative
 direction, costing at most one unnecessary retirement for a connection
 handshaking exactly across a withdrawal — but never a newer one, so none can
-escape the fence. A connection being registered while a publication sweeps is
-caught by a post-registration re-check against the same fence, so it can neither
-escape nor repopulate the registry after the sweep.
+escape the fence. The TCP+TLS accept path is the exception to the ordering
+itself — it snapshots the TLS configuration for a connection before reading the
+generation, so it can hold a post-withdrawal generation beside a pre-withdrawal
+configuration. Its outcome is unchanged, because every rustls surface also
+re-verifies the presented chain against the live published verifier once the
+handshake completes, and that verifier is installed before the generation
+advances: a connection observing generation G meets a verifier at or newer than
+G, so a credential withdrawn at or before G is refused there and one withdrawn
+after G is caught by the fence. A connection being registered while a
+publication sweeps is caught by a post-registration re-check against the same
+fence, so it can neither escape nor repopulate the registry after the sweep.
 
 The HTTP/3 revision channel is a wakeup, not a queue: several accepted
 candidates can coalesce into one notification, and the sources can rotate again

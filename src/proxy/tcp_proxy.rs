@@ -4241,12 +4241,28 @@ async fn handle_tcp_connection_inner(
     // (even when empty) means we read plaintext from the TLS session and must
     // therefore use a userspace relay (kTLS splice is no longer possible).
     let mut client_first_bytes_forward: Option<Vec<u8>> = None;
-    // Issue #3857. Captured BEFORE the frontend TLS config is consumed by the
-    // handshake: the publisher swaps material first and advances the generation
-    // second, so reading the generation first keeps the capture at or older than
-    // the verifier actually used. `None` (and therefore zero per-connection
-    // cost) unless the proxy frontend trust domain has accepted material, which
-    // only happens under `FERRUM_FRONTEND_TLS_LIVE_RELOAD_ENABLED`.
+    // Issue #3857. Captured before the handshake runs, but — unlike the
+    // HTTPS/H2 and admin accept paths, which read the generation and only then
+    // load their slot — AFTER the accept loop already snapshotted
+    // `frontend_tls_slot` for this connection. The "captured generation is at
+    // or older than the material actually served" ordering therefore does NOT
+    // hold on this path: a publication landing between that snapshot and this
+    // read hands us the new generation beside the old `ServerConfig`, and the
+    // fence alone would then not retire this connection.
+    //
+    // What closes that window is the post-handshake re-verification against the
+    // live published verifier below (`armed_handshake_der_chain_still_trusted`).
+    // The publication transaction installs the live verifier BEFORE it advances
+    // the generation, so a connection that observed generation G is re-checked
+    // against a verifier at or newer than G: a credential withdrawn at or
+    // before G is refused there, and one withdrawn after G is still caught by
+    // the fence. That check is load-bearing here, not defence in depth — do not
+    // drop it without first capturing the generation ahead of the slot
+    // snapshot in `run_tcp_accept_loop`.
+    //
+    // `None` (and therefore zero per-connection cost) unless the proxy frontend
+    // trust domain has accepted material, which only happens under
+    // `FERRUM_FRONTEND_TLS_LIVE_RELOAD_ENABLED`.
     //
     // TCP+TLS shares the proxy HTTPS/H2 `ServerConfig`, so it is the same trust
     // domain: an operator CRL or client-CA change retires both listener families
@@ -4412,6 +4428,16 @@ async fn handle_tcp_connection_inner(
                 .map(|cert| cert.to_vec())
                 .collect::<Vec<Vec<u8>>>()
         });
+        // Fail-closed live-verifier fence (issue #3857). LOAD-BEARING on this
+        // path: the generation above was captured after the accept loop
+        // snapshotted the TLS slot, so a connection can hold a post-withdrawal
+        // generation while having handshaked against the withdrawn
+        // `ServerConfig`. Re-verifying the presented chain against the verifier
+        // published with that generation is what refuses it. A missing chain on
+        // an armed listener is untrusted (an armed proxy frontend scope means a
+        // client-CA bundle is configured, so client authentication is
+        // mandatory). Returns before registration, first-byte inspection, and
+        // the stream-connect chain.
         if let Some(admission) = client_trust_admission
             && !crate::tls::client_trust::armed_handshake_der_chain_still_trusted(
                 admission.scope(),
