@@ -625,6 +625,9 @@ pub struct FrontendDtlsGeneration {
     pub config: FrontendDtlsConfig,
 }
 
+/// Source-attribution callback for new frontend DTLS sessions.
+pub type DtlsNewSessionAuthorizer = dyn Fn(SocketAddr, Option<u32>) -> bool + Send + Sync + 'static;
+
 /// Admission controls for the frontend DTLS demuxer.
 #[derive(Clone)]
 pub struct DtlsServerLimits {
@@ -636,6 +639,13 @@ pub struct DtlsServerLimits {
     pub handshake_timeout: Option<Duration>,
     /// Optional gate checked before allocating per-peer handshake state.
     pub allow_new_session: Option<Arc<dyn Fn() -> bool + Send + Sync + 'static>>,
+    /// Optional source-attribution gate checked before a new peer's handshake
+    /// driver is spawned and therefore before any handshake response can be
+    /// emitted. The callback receives the socket peer and kernel-reported
+    /// ingress interface. NodeWaypoint listeners use this to ensure the
+    /// marked server socket never sends a pre-authentication response to an
+    /// unattributable or source-mismatched peer.
+    pub authorize_new_session: Option<Arc<DtlsNewSessionAuthorizer>>,
     /// Optional diagnostic mirror for surfaces that need to report demux state
     /// outside this server object, such as the admin `/overload` endpoint. This
     /// is eventually consistent with `active_sessions` and is not used for
@@ -752,6 +762,7 @@ impl Default for DtlsServerLimits {
             max_sessions: None,
             handshake_timeout: Some(DEFAULT_DTLS_HANDSHAKE_TIMEOUT),
             allow_new_session: None,
+            authorize_new_session: None,
             active_session_mirror: None,
             capture_ingress_ifindex: false,
             socket_mark: None,
@@ -2556,6 +2567,15 @@ impl DtlsServer {
         reply_local: Option<crate::socket_opts::PktinfoLocal>,
         forwarded_client: Option<SocketAddr>,
     ) {
+        if let Some(ref authorize) = self.limits.authorize_new_session
+            && !authorize(peer_addr, reply_local.map(|local| local.ifindex))
+        {
+            trace!(
+                client = %peer_addr,
+                "DTLS new session rejected by source-attribution gate"
+            );
+            return;
+        }
         if let Some(ref allow) = self.limits.allow_new_session
             && !allow()
         {
@@ -4037,6 +4057,30 @@ mod tests {
             "127.0.0.1:12346".parse().unwrap(),
             vec![0x16; 32],
             None,
+            None,
+        );
+
+        assert_eq!(server.active_session_count(), 0);
+        assert!(server.sessions.is_empty());
+    }
+
+    #[tokio::test]
+    async fn dtls_server_authorizes_source_before_spawning_handshake() {
+        let server = test_server(DtlsServerLimits {
+            authorize_new_session: Some(Arc::new(|peer, ingress_ifindex| {
+                peer.ip().is_loopback() && ingress_ifindex == Some(7)
+            })),
+            ..DtlsServerLimits::default()
+        })
+        .await;
+
+        server.spawn_session(
+            "127.0.0.1:12346".parse().unwrap(),
+            vec![0x16; 32],
+            Some(crate::socket_opts::PktinfoLocal {
+                ip: "127.0.0.1".parse().unwrap(),
+                ifindex: 8,
+            }),
             None,
         );
 

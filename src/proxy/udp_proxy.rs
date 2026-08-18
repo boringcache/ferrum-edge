@@ -4524,6 +4524,22 @@ async fn start_dtls_frontend_listener(
 ) -> Result<(), anyhow::Error> {
     let addr = SocketAddr::new(bind_addr, port);
     let admission_overload = overload.clone();
+    let dtls_source_admission = node_waypoint_udp_source_scoping.clone().map(|scoping| {
+        let admission_proxy_id = proxy_id.clone();
+        Arc::new(move |peer_addr: SocketAddr, ingress_ifindex: Option<u32>| {
+            match scoping.resolve(ingress_ifindex, peer_addr.ip()) {
+                Ok(_) => true,
+                Err(refusal) => {
+                    scoping.index.warn_refusal(
+                        &admission_proxy_id,
+                        &udp_session_client_ip(peer_addr),
+                        refusal,
+                    );
+                    false
+                }
+            }
+        }) as Arc<crate::dtls::DtlsNewSessionAuthorizer>
+    });
     let dtls_limits = crate::dtls::DtlsServerLimits {
         max_sessions: Some(max_sessions),
         handshake_timeout: (frontend_tls_handshake_timeout_seconds > 0)
@@ -4536,6 +4552,11 @@ async fn start_dtls_frontend_listener(
         allow_new_session: Some(Arc::new(move || {
             !refuse_new_udp_source(&admission_overload)
         })),
+        // A marked NodeWaypoint socket may not emit even the first handshake
+        // flight until the ClientHello's kernel-observed source has been
+        // attributed to an enrolled workload. Ordinary DTLS listeners leave
+        // this gate off.
+        authorize_new_session: dtls_source_admission,
         active_session_mirror: Some(metrics.dtls_demux_sessions.clone()),
         // NodeWaypoint DTLS sessions are attributed to a source workload by the
         // kernel-reported ingress interface of their ClientHello (issue #3286),

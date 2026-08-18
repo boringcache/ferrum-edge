@@ -41,9 +41,10 @@ worker. The orchestrator selected this session's model deliberately.
    set `ALIBABA_TOKEN_PLAN_API_KEY_FILE` to a readable absolute path holding it, before
    dispatching. The launcher fails closed on a missing key rather than letting opencode surface a
    bare `No API-key provided` mid-run. Never echo, log, or commit the key.
-5. Use the pinned model `alibaba-token-plan/deepseek-v4-flash-0731`. Pass
-   `--model alibaba-token-plan/<other>` only when the user explicitly asks for a different
-   model on that provider. Do not silently substitute a different provider or model.
+5. Use the pinned model `alibaba-token-plan/deepseek-v4-flash-0731`. This is a **hard pin**:
+   the launcher refuses `--model` (exit 2) unless it names exactly that model, so no other
+   DeepSeek variant and no rolling alias is dispatchable from this skill. Do not substitute
+   a different provider or model.
 6. The pin is the **dated snapshot**, not the rolling `deepseek-v4-flash` alias. On the Singapore
    token plan the rolling alias returns `Access to model denied` on every attempt while
    `-0731` serves normally, so the snapshot is the only working flash tier today. If the rolling
