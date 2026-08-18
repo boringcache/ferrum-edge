@@ -2497,7 +2497,7 @@ Do not send both headers. Mixed RFC 9530 / legacy spellings on one field, duplic
 
 #### Example — RFC 9530 `Content-Digest` + `ferrum-hmac-v2`
 
-The Python snippet below computes the SHA-256 of the exact `--data-binary` bytes, builds the RFC 9530 field, and signs the documented v2 base (including the empty `{QUERY}` field when the URL has no query). It normalizes `{AUTHORITY}` like Ferrum — ASCII-lowercase host, no trailing DNS dot, no default `:80`/`:443`, non-default ports and bracketed IPv6 retained — and exits before signing when the URL has userinfo, no host, an unsupported scheme, or a malformed authority/port. It prints one `curl` command. Set `HMAC_SECRET` to the Consumer secret (≥32 non-whitespace characters); do not put a real secret in the script.
+The Python snippet below computes the SHA-256 of the exact `--data-binary` bytes, builds the RFC 9530 field, and signs the documented v2 base (including the empty `{QUERY}` field when the URL has no query). It normalizes `{AUTHORITY}` like Ferrum — ASCII-lowercase host, no trailing DNS dot, no default `:80`/`:443`, non-default ports and bracketed IPv6 retained — and exits before signing when the URL has userinfo, no host, an unsupported scheme, or a malformed authority/port. Its authority validators mirror Ferrum's byte-level checks: reg-name and IPvFuture segments require ASCII alphanumerics (not Unicode letters), and scoped IPv6 zone identifiers (`%scope`) are rejected before parsing. It prints one `curl` command. Set `HMAC_SECRET` to the Consumer secret (≥32 non-whitespace characters); do not put a real secret in the script.
 
 ```python
 #!/usr/bin/env python3
@@ -2515,24 +2515,32 @@ def default_port_for_scheme(scheme: str) -> int | None:
 def is_valid_port(port: str) -> bool:
     return port.isascii() and port.isdigit() and 0 <= int(port) <= 65535
 
+def _is_ascii_alnum(c: str) -> bool:
+    return len(c) == 1 and c.isascii() and c.isalnum()
+
 def is_valid_reg_name(host: str) -> bool:
     allowed = "-._%~!$&'()*+;="
-    return host and all(c.isalnum() or c in allowed for c in host)
+    return host and all(_is_ascii_alnum(c) or c in allowed for c in host)
 
 def is_valid_ip_literal_contents(content: str) -> bool:
+    if not content:
+        return False
+    # Ferrum uses std::net::Ipv6Addr, which rejects zone identifiers.
+    if "%" in content:
+        return False
     try:
         ipaddress.IPv6Address(content)
         return True
     except ValueError:
         pass
-    if content and content[0] in "vV":
+    if content[0] in "vV":
         hex_part, _, addr = content[1:].partition(".")
         allowed = "-._~!$&'()*+,;=:"
         return (
             hex_part
             and all(c in "0123456789abcdefABCDEF" for c in hex_part)
             and addr
-            and all(c.isalnum() or c in allowed for c in addr)
+            and all(_is_ascii_alnum(c) or c in allowed for c in addr)
         )
     return False
 
