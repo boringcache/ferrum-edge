@@ -82,6 +82,13 @@ enum SqlDialect {
     Sqlite,
 }
 
+/// Result of the shared pin / scan / seed / marker / proof sequence, before
+/// the dialect-specific commit boundary is applied.
+enum NamespacesRegistryBackfillOutcome {
+    Apply,
+    Defer,
+}
+
 /// Small dialect-aware SQL helper for V001.
 ///
 /// The helper keeps the migration logic conservative: it only encapsulates the
@@ -925,7 +932,11 @@ impl V001SqlBuilder {
         completed_at: &str,
     ) -> Result<(), anyhow::Error> {
         let insert_marker = if self.is_mysql() {
-            "INSERT IGNORE INTO _ferrum_schema_compat (name, completed_at) VALUES (?, ?)"
+            // Duplicate `name` is the only error this no-op UPDATE ignores.
+            // `INSERT IGNORE` would also swallow truncation and other
+            // integrity failures and could still write the completion marker.
+            "INSERT INTO _ferrum_schema_compat (name, completed_at) VALUES (?, ?) \
+             ON DUPLICATE KEY UPDATE name = _ferrum_schema_compat.name"
         } else if self.is_sqlite() {
             "INSERT INTO _ferrum_schema_compat (name, completed_at) VALUES (?, ?) \
              ON CONFLICT (name) DO NOTHING"
@@ -942,15 +953,26 @@ impl V001SqlBuilder {
     }
 
     /// The compatibility pass itself, fenced by `owner`/`generation` on the
-    /// global registry admission lease and committed as ONE transaction.
+    /// global registry admission lease.
     ///
     /// Everything the pass reads and writes — the lease pin, the authoritative
     /// completion check, the derived-name scan, the canonical `ferrum` seed,
-    /// and the completion marker — lives inside that single transaction, so a
-    /// crash or an abort leaves the marker absent and the next startup retries
-    /// the same idempotent statements. The marker is still written last within
-    /// the transaction so the ordering contract reads the same way it always
-    /// did.
+    /// and the completion marker — lives inside one atomic unit, so a crash or
+    /// an abort leaves the marker absent and the next startup retries the same
+    /// idempotent statements. The marker is still written last so the ordering
+    /// contract reads the same way it always did.
+    ///
+    /// PostgreSQL and MySQL commit that unit as ONE explicit transaction.
+    /// SQLite cannot: `MigrationConnectionLock` already issued `BEGIN
+    /// IMMEDIATE` on this same connection before `run_pending_locked` called
+    /// `ensure_compatibility_tables`, and sqlx does not know about that raw
+    /// BEGIN, so `connection.begin()` would emit another `BEGIN` and SQLite
+    /// would fail with "cannot start a transaction within a transaction". The
+    /// SQLite path therefore runs the identical sequence under a SAVEPOINT on
+    /// the already-open migration transaction. `RELEASE SAVEPOINT` (success)
+    /// or `ROLLBACK TO SAVEPOINT` (defer or failure) never `COMMIT`s or
+    /// `ROLLBACK`s the outer `BEGIN IMMEDIATE`; that outer transaction remains
+    /// the durable commit boundary via `MigrationConnectionLock::finish`.
     ///
     /// The lease row is verified and locked BEFORE the scan, not only at the
     /// commit boundary, so a competing acquirer cannot take the global key
@@ -962,36 +984,140 @@ impl V001SqlBuilder {
         owner: &str,
         generation: i64,
     ) -> Result<(), anyhow::Error> {
+        if self.is_sqlite() {
+            self.backfill_namespaces_registry_under_sqlite_savepoint(connection, owner, generation)
+                .await
+        } else {
+            self.backfill_namespaces_registry_in_explicit_transaction(connection, owner, generation)
+                .await
+        }
+    }
+
+    /// PostgreSQL / MySQL: one explicit backfill transaction on a connection
+    /// that is not already inside `BEGIN IMMEDIATE`.
+    async fn backfill_namespaces_registry_in_explicit_transaction(
+        &self,
+        connection: &mut AnyConnection,
+        owner: &str,
+        generation: i64,
+    ) -> Result<(), anyhow::Error> {
         use sqlx::Connection;
 
         let mut tx = connection.begin().await?;
+        match self
+            .backfill_namespaces_registry_body(&mut tx, owner, generation)
+            .await
+        {
+            Ok(NamespacesRegistryBackfillOutcome::Apply) => {
+                tx.commit().await?;
+                Ok(())
+            }
+            Ok(NamespacesRegistryBackfillOutcome::Defer) => {
+                tx.rollback().await?;
+                Ok(())
+            }
+            Err(error) => {
+                if tx.rollback().await.is_err() {
+                    return Err(error.context("namespace registry backfill rollback also failed"));
+                }
+                Err(error)
+            }
+        }
+    }
 
+    /// SQLite: run the backfill under a SAVEPOINT on the already-held
+    /// `BEGIN IMMEDIATE` migration transaction. This must not call
+    /// `connection.begin()`, `COMMIT`, or an unqualified `ROLLBACK`.
+    async fn backfill_namespaces_registry_under_sqlite_savepoint(
+        &self,
+        connection: &mut AnyConnection,
+        owner: &str,
+        generation: i64,
+    ) -> Result<(), anyhow::Error> {
+        sqlx::query("SAVEPOINT namespaces_registry_backfill")
+            .execute(&mut *connection)
+            .await?;
+        match self
+            .backfill_namespaces_registry_body(connection, owner, generation)
+            .await
+        {
+            Ok(NamespacesRegistryBackfillOutcome::Apply) => {
+                sqlx::query("RELEASE SAVEPOINT namespaces_registry_backfill")
+                    .execute(&mut *connection)
+                    .await?;
+                Ok(())
+            }
+            Ok(NamespacesRegistryBackfillOutcome::Defer) => self
+                .rollback_sqlite_namespaces_registry_backfill_savepoint(connection)
+                .await,
+            Err(error) => {
+                if self
+                    .rollback_sqlite_namespaces_registry_backfill_savepoint(connection)
+                    .await
+                    .is_err()
+                {
+                    return Err(error.context(
+                        "namespace registry backfill savepoint rollback also failed",
+                    ));
+                }
+                Err(error)
+            }
+        }
+    }
+
+    async fn rollback_sqlite_namespaces_registry_backfill_savepoint(
+        &self,
+        connection: &mut AnyConnection,
+    ) -> Result<(), anyhow::Error> {
+        sqlx::query("ROLLBACK TO SAVEPOINT namespaces_registry_backfill")
+            .execute(&mut *connection)
+            .await?;
+        sqlx::query("RELEASE SAVEPOINT namespaces_registry_backfill")
+            .execute(&mut *connection)
+            .await?;
+        Ok(())
+    }
+
+    /// Shared pin / scan / seed / marker / proof sequence. The caller supplies
+    /// the atomic unit: an explicit transaction on PostgreSQL/MySQL, or a
+    /// SAVEPOINT on the already-open SQLite migration transaction.
+    async fn backfill_namespaces_registry_body(
+        &self,
+        connection: &mut AnyConnection,
+        owner: &str,
+        generation: i64,
+    ) -> Result<NamespacesRegistryBackfillOutcome, anyhow::Error> {
         // Pin FIRST: the fence has to cover the scan, not just the commit.
         if !self
-            .pin_namespaces_registry_backfill_lease(&mut tx, owner, generation)
+            .pin_namespaces_registry_backfill_lease(connection, owner, generation)
             .await?
         {
-            tx.rollback().await?;
             tracing::warn!(
                 "Namespace registry compatibility backfill did not start: the global registry \
                  admission lease was no longer held; a later startup retries"
             );
-            return Ok(());
+            return Ok(NamespacesRegistryBackfillOutcome::Defer);
         }
 
         // Authoritative completion check, inside the fence: two processes can
         // never both observe an absent marker and both seed.
-        if self.namespaces_registry_backfill_completed(&mut tx).await? {
-            tx.rollback().await?;
-            return Ok(());
+        if self
+            .namespaces_registry_backfill_completed(connection)
+            .await?
+        {
+            return Ok(NamespacesRegistryBackfillOutcome::Defer);
         }
 
         let now = chrono::Utc::now().to_rfc3339();
         // Postgres native placeholders are `$1..$n`; a trailing `?` is a
-        // syntax error. MySQL has no `ON CONFLICT` — `INSERT IGNORE` is the
-        // matching idempotent insert. SQLite accepts `?` + `ON CONFLICT`.
+        // syntax error. MySQL has no `ON CONFLICT` — the matching idempotent
+        // insert is `ON DUPLICATE KEY UPDATE` of the primary key onto itself,
+        // which ignores only that duplicate and surfaces every other error.
+        // `INSERT IGNORE` is deliberately not used: it also downgrades
+        // truncation and other integrity failures to warnings. SQLite accepts
+        // `?` + `ON CONFLICT`.
         let insert_derived = if self.is_mysql() {
-            "INSERT IGNORE INTO namespaces (name, created_at, updated_at) \
+            "INSERT INTO namespaces (name, created_at, updated_at) \
              SELECT DISTINCT namespace, ?, ? FROM ( \
                  SELECT namespace FROM proxies \
                  UNION SELECT namespace FROM consumers \
@@ -999,7 +1125,8 @@ impl V001SqlBuilder {
                  UNION SELECT namespace FROM upstreams \
                  UNION SELECT namespace FROM gateway_trust_bundles \
              ) AS ferrum_derived_namespaces \
-             WHERE namespace IS NOT NULL"
+             WHERE namespace IS NOT NULL \
+             ON DUPLICATE KEY UPDATE name = namespaces.name"
         } else if self.is_sqlite() {
             "INSERT INTO namespaces (name, created_at, updated_at) \
              SELECT DISTINCT namespace, ?, ? FROM ( \
@@ -1026,11 +1153,12 @@ impl V001SqlBuilder {
         sqlx::query(insert_derived)
             .bind(&now)
             .bind(&now)
-            .execute(&mut *tx)
+            .execute(&mut *connection)
             .await?;
 
         let insert_default = if self.is_mysql() {
-            "INSERT IGNORE INTO namespaces (name, created_at, updated_at) VALUES (?, ?, ?)"
+            "INSERT INTO namespaces (name, created_at, updated_at) VALUES (?, ?, ?) \
+             ON DUPLICATE KEY UPDATE name = namespaces.name"
         } else if self.is_sqlite() {
             "INSERT INTO namespaces (name, created_at, updated_at) VALUES (?, ?, ?) \
              ON CONFLICT (name) DO NOTHING"
@@ -1049,14 +1177,14 @@ impl V001SqlBuilder {
             .bind(crate::config::types::DEFAULT_NAMESPACE)
             .bind(&now)
             .bind(&now)
-            .execute(&mut *tx)
+            .execute(&mut *connection)
             .await?;
 
-        // Marker last: it is the final write in the transaction, so an abort or
-        // a crash leaves completion absent and the next serialized
+        // Marker last: it is the final write in the atomic unit, so an abort
+        // or a crash leaves completion absent and the next serialized
         // compatibility pass retries the idempotent inserts. This must not be a
         // namespaces row — GET /namespaces would then list it as a tenant.
-        self.mark_namespaces_registry_backfill_complete(&mut tx, &now)
+        self.mark_namespaces_registry_backfill_complete(connection, &now)
             .await?;
 
         // Commit-boundary fence, exactly like every live registry mutation: the
@@ -1066,18 +1194,16 @@ impl V001SqlBuilder {
         // proof, not a TTL race. A lost lease rolls the whole pass back with the
         // marker absent, so nothing is resurrected and a later startup retries.
         if !self
-            .namespaces_registry_backfill_lease_held(&mut tx, owner, generation)
+            .namespaces_registry_backfill_lease_held(connection, owner, generation)
             .await?
         {
-            tx.rollback().await?;
             tracing::warn!(
                 "Namespace registry compatibility backfill rolled back: the global registry \
                  admission lease was no longer held at the commit boundary; a later startup retries"
             );
-            return Ok(());
+            return Ok(NamespacesRegistryBackfillOutcome::Defer);
         }
-        tx.commit().await?;
-        Ok(())
+        Ok(NamespacesRegistryBackfillOutcome::Apply)
     }
 
     /// Authoritative namespace-keyed gateway trust bundles (issue #3727).
@@ -2222,6 +2348,33 @@ mod tests {
                 "{name} must use the internal compatibility table and marker ID:\n{helper}"
             );
         }
+    }
+
+    #[test]
+    fn namespaces_registry_backfill_mysql_inserts_use_strict_duplicate_key_updates() {
+        let source = include_str!("sql_dialect.rs");
+        let start = source
+            .find("async fn mark_namespaces_registry_backfill_complete(")
+            .expect("completion-mark helper");
+        let end = source[start..]
+            .find("\n    /// Authoritative namespace-keyed")
+            .map(|offset| start + offset)
+            .unwrap_or(source.len());
+        let backfill = &source[start..end];
+        assert!(
+            !backfill.contains("INSERT IGNORE INTO") && !backfill.contains("\"INSERT IGNORE"),
+            "MySQL registry backfill must not use INSERT IGNORE; it swallows truncation and \
+             other non-duplicate integrity errors:\n{backfill}"
+        );
+        assert!(
+            backfill.contains("ON DUPLICATE KEY UPDATE name = _ferrum_schema_compat.name")
+                && backfill
+                    .matches("ON DUPLICATE KEY UPDATE name = namespaces.name")
+                    .count()
+                    == 2,
+            "MySQL registry backfill must ignore only the intended duplicate primary key:\n\
+             {backfill}"
+        );
     }
 
     #[test]

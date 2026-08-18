@@ -1892,7 +1892,10 @@ async fn cp_scope_set_protects_every_explicitly_configured_namespace() {
             None,
         )
         .await;
-        assert_eq!(status, 409, "{name} must be protected from delete: {body:?}");
+        assert_eq!(
+            status, 409,
+            "{name} must be protected from delete: {body:?}"
+        );
         protected_reason_is_static(&body);
         assert!(
             registry_row_exists(store.as_ref(), name).await,
@@ -1975,7 +1978,10 @@ async fn cp_scope_set_protects_every_explicitly_configured_namespace() {
         None,
     )
     .await;
-    assert_eq!(status, 204, "an unconfigured tenant deletes freely: {body:?}");
+    assert_eq!(
+        status, 204,
+        "an unconfigured tenant deletes freely: {body:?}"
+    );
 }
 
 /// `FERRUM_CP_NAMESPACES=*` (`CpScope::All`) discovers namespaces dynamically,

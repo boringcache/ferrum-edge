@@ -12673,24 +12673,27 @@ mod inner {
             }
             // The durable namespace mutex every namespace-wide mutation takes;
             // it also fails closed while a guarded restore replay owns it.
-            let mut mtls_lease = self.acquire_mtls_dns_admission_lease(name).await?;
-            let deleted = mtls_lease
-                .run_mutation(async {
-                    let connection = self.connection();
-                    let mut session = connection.client.start_session().await?;
-                    let deleted = session
-                        .start_transaction()
-                        .and_run((self, plan), |s, (this, plan)| {
-                            Box::pin(async move {
-                                this.delete_namespace_in_session(&mut *s, plan).await
-                            })
-                        })
-                        .await
-                        .map_err(Self::namespace_registry_transaction_error)?;
-                    Ok(deleted)
-                })
+            // Vector acquire/run/after-commit release: a post-commit cleanup
+            // failure must not convert a durable delete into an error response.
+            let mut mtls_leases = self
+                .acquire_mtls_dns_admission_leases(std::iter::once(name))
                 .await?;
-            mtls_lease.release().await?;
+            let deleted = Self::run_mtls_dns_mutations(&mut mtls_leases, async {
+                let connection = self.connection();
+                let mut session = connection.client.start_session().await?;
+                let deleted = session
+                    .start_transaction()
+                    .and_run((self, plan), |s, (this, plan)| {
+                        Box::pin(
+                            async move { this.delete_namespace_in_session(&mut *s, plan).await },
+                        )
+                    })
+                    .await
+                    .map_err(Self::namespace_registry_transaction_error)?;
+                Ok(deleted)
+            })
+            .await?;
+            Self::release_mtls_dns_admission_leases_after_commit(&mut mtls_leases).await;
             if deleted {
                 self.compact_config_changes_best_effort(name).await;
             }

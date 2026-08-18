@@ -9,9 +9,11 @@
 //! (`data: string[]`) for Foundry and other existing clients. Detail and write
 //! operations use [`NamespaceRecord`].
 //!
-//! Every registry mutation is serialized cross-process by two admission leases
-//! taken in a total order — the global [`NAMESPACE_REGISTRY_ADMISSION_KEY`]
-//! first, then the affected namespace names in ascending order. Each backend
+//! Every registry mutation is serialized cross-process by the global
+//! [`NAMESPACE_REGISTRY_ADMISSION_KEY`] lease plus one lease per affected
+//! namespace, taken in canonical order — the global key first, then the
+//! affected names in ascending order. Create and delete therefore take global
+//! plus one name; rename takes global plus source and target. Each backend
 //! requires that exact canonical key sequence before mutating anything; an
 //! empty, incomplete, duplicated, reordered, or substituted set is a lost
 //! lease ([`BatchAdmissionLeaseLost`]) with nothing applied. The committing
@@ -29,7 +31,9 @@
 //! derived names plus canonical `ferrum`, then durably records completion in
 //! [`SCHEMA_COMPAT_TABLE`]. That pass takes the SAME global
 //! [`NAMESPACE_REGISTRY_ADMISSION_KEY`] lease every live create/rename/delete
-//! takes AND commits as one transaction, so a confirmed DELETE can never commit
+//! takes AND commits as one atomic unit (an explicit transaction on
+//! PostgreSQL/MySQL; a SAVEPOINT on SQLite's already-open `BEGIN IMMEDIATE`
+//! migration transaction), so a confirmed DELETE can never commit
 //! next to a backfill that already read the derived names and then resurrect the
 //! removed row. Holding a lease is not enough on its own, because a lease can
 //! lapse mid-pass: SQL verifies and row-locks the lease before the derived-name
@@ -361,8 +365,7 @@ impl NamespaceRegistryError {
     /// configuration keys an operator can change and never echoes the rest of
     /// the configured set, so a 409 cannot be used to enumerate which other
     /// tenants this gateway serves.
-    pub const PROTECTED_CONFIGURED_NAMESPACE: &str =
-        "it is one of the namespaces this gateway is configured to serve \
+    pub const PROTECTED_CONFIGURED_NAMESPACE: &str = "it is one of the namespaces this gateway is configured to serve \
          (FERRUM_NAMESPACE / FERRUM_CP_NAMESPACES)";
     /// Last **registry row**, not last derived resource name. Resource writers
     /// do not take the global registry lease, so they cannot be the authority.
@@ -457,8 +460,7 @@ pub fn is_namespace_registry_error(error: &anyhow::Error) -> Option<&NamespaceRe
 /// Fixed and redacted on purpose: the driver's own text names the relation, the
 /// conflicting transaction, and sometimes the row, none of which may reach a
 /// client or a log line.
-pub const NAMESPACE_REGISTRY_RETRYABLE_CONFLICT_MESSAGE: &str =
-    "The namespace registry mutation conflicted with a concurrent database transaction and was \
+pub const NAMESPACE_REGISTRY_RETRYABLE_CONFLICT_MESSAGE: &str = "The namespace registry mutation conflicted with a concurrent database transaction and was \
      rolled back; nothing was applied. Retry the request.";
 
 /// The committing transaction was aborted by the database itself as a

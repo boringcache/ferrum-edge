@@ -804,7 +804,9 @@ fn retryable_registry_conflict_is_not_confused_with_other_registry_failures() {
         );
     }
     // ...and the retryable conflict is not a lost lease.
-    assert!(!ferrum_edge::config::db_backend::is_batch_admission_lease_lost(
-        &anyhow::Error::new(NamespaceRegistryRetryableConflict)
-    ));
+    assert!(
+        !ferrum_edge::config::db_backend::is_batch_admission_lease_lost(&anyhow::Error::new(
+            NamespaceRegistryRetryableConflict
+        ))
+    );
 }

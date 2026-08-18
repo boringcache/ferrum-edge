@@ -3629,7 +3629,8 @@ fn retryable_transaction_conflict_sqlstates_are_exactly_serialization_and_deadlo
     }
     for code in [
         // Uniqueness / name conflicts: a retry would only repeat them.
-        "23505", "23000", "23503", // Connectivity, syntax, permissions, and MySQL's generic class.
+        "23505", "23000",
+        "23503", // Connectivity, syntax, permissions, and MySQL's generic class.
         "08006", "08001", "42601", "42501", "HY000", "40002", "400011", "4000", "",
     ] {
         assert!(
@@ -3768,15 +3769,44 @@ fn sql_namespace_registry_backfill_runs_under_the_global_registry_lease() {
 #[test]
 fn sql_namespace_registry_backfill_commits_once_and_verifies_its_lease() {
     let source = include_str!("../../../src/config/migrations/sql_dialect.rs");
-    let start = source
+    let dispatcher = source[source
         .find("async fn backfill_namespaces_registry(")
-        .expect("backfill helper");
-    let body = source[start..]
+        .expect("backfill dispatcher")..]
+        .split("\n    /// PostgreSQL / MySQL:")
+        .next()
+        .expect("dispatcher body");
+    assert!(
+        dispatcher.contains("is_sqlite()")
+            && dispatcher.contains("backfill_namespaces_registry_under_sqlite_savepoint")
+            && dispatcher.contains("backfill_namespaces_registry_in_explicit_transaction"),
+        "SQLite must take the savepoint path; PostgreSQL/MySQL keep an explicit transaction:\n\
+         {dispatcher}"
+    );
+    assert!(
+        !dispatcher.contains("connection.begin()") && !dispatcher.contains("tx.commit()"),
+        "the dispatcher must not itself begin or commit a nested transaction:\n{dispatcher}"
+    );
+
+    let explicit = source[source
+        .find("async fn backfill_namespaces_registry_in_explicit_transaction(")
+        .expect("explicit transaction helper")..]
+        .split("\n    /// SQLite: run the backfill")
+        .next()
+        .expect("explicit transaction body");
+    assert!(
+        explicit.contains("connection.begin()")
+            && explicit.contains("tx.commit()")
+            && explicit.contains("tx.rollback()")
+            && explicit.contains("backfill_namespaces_registry_body"),
+        "PostgreSQL/MySQL must retain one explicit backfill transaction:\n{explicit}"
+    );
+
+    let body = source[source
+        .find("async fn backfill_namespaces_registry_body(")
+        .expect("shared backfill body")..]
         .split("\n    /// Authoritative namespace-keyed")
         .next()
-        .expect("backfill body");
-
-    let begin_at = body.find("connection.begin()").expect("single transaction");
+        .expect("shared backfill body");
     let pin_at = body
         .find("pin_namespaces_registry_backfill_lease")
         .expect("start-of-transaction lease pin");
@@ -3790,10 +3820,12 @@ fn sql_namespace_registry_backfill_commits_once_and_verifies_its_lease() {
     let verify_at = body
         .find("namespaces_registry_backfill_lease_held")
         .expect("commit-boundary lease verification");
-    let commit_at = body.find("tx.commit()").expect("single commit");
+    let apply_at = body
+        .find("NamespacesRegistryBackfillOutcome::Apply")
+        .expect("apply outcome");
     assert!(
-        begin_at < pin_at && pin_at < completed_at,
-        "the lease row must be verified and locked as the FIRST statement of the transaction, \
+        pin_at < completed_at,
+        "the lease row must be verified and locked as the FIRST statement of the atomic unit, \
          before anything is read or written:\n{body}"
     );
     assert!(
@@ -3805,8 +3837,14 @@ fn sql_namespace_registry_backfill_commits_once_and_verifies_its_lease() {
         "the marker must be written after the idempotent inserts so a crash retries:\n{body}"
     );
     assert!(
-        mark_at < verify_at && verify_at < commit_at,
-        "the lease must be re-verified immediately before the single commit:\n{body}"
+        mark_at < verify_at && verify_at < apply_at,
+        "the lease must be re-verified immediately before the caller commits:\n{body}"
+    );
+    assert!(
+        !body.contains("connection.begin()")
+            && !body.contains("tx.commit()")
+            && !body.contains("tx.rollback()"),
+        "the shared body must not begin, commit, or roll back the caller's atomic unit:\n{body}"
     );
 
     let pin = source[source
@@ -3852,5 +3890,64 @@ fn sql_namespace_registry_backfill_commits_once_and_verifies_its_lease() {
         !verify.contains("expires_at"),
         "elapsed wall time under the row pin is not lost ownership; the commit-boundary proof \
          must not re-check the lease TTL:\n{verify}"
+    );
+}
+
+/// Hosted SQLite migrations already hold `BEGIN IMMEDIATE` on this connection
+/// (`MigrationConnectionLock`). A nested `connection.begin()` is the
+/// `(code: 1) cannot start a transaction within a transaction` failure.
+#[test]
+fn sql_namespace_registry_backfill_does_not_nest_a_sqlite_begin() {
+    let migrations = include_str!("../../../src/config/migrations/mod.rs");
+    assert!(
+        migrations.contains("BEGIN IMMEDIATE")
+            && migrations.contains("struct MigrationConnectionLock")
+            && migrations.contains("ensure_compatibility_tables(connection)"),
+        "SQLite migrations must take BEGIN IMMEDIATE before the compatibility pass, and that \
+         outer transaction remains the durable commit boundary"
+    );
+
+    let source = include_str!("../../../src/config/migrations/sql_dialect.rs");
+    let sqlite = source[source
+        .find("async fn backfill_namespaces_registry_under_sqlite_savepoint(")
+        .expect("sqlite savepoint helper")..]
+        .split("\n    async fn rollback_sqlite_namespaces_registry_backfill_savepoint(")
+        .next()
+        .expect("sqlite savepoint body");
+    assert!(
+        sqlite.contains("SAVEPOINT namespaces_registry_backfill")
+            && sqlite.contains("RELEASE SAVEPOINT namespaces_registry_backfill")
+            && sqlite.contains("rollback_sqlite_namespaces_registry_backfill_savepoint"),
+        "SQLite must isolate the backfill with a SAVEPOINT on the already-open migration \
+         transaction:\n{sqlite}"
+    );
+    assert!(
+        !sqlite.contains("connection.begin()")
+            && !sqlite.contains("tx.commit()")
+            && !sqlite.contains("tx.rollback()")
+            && !sqlite.contains("sqlx::query(\"BEGIN")
+            && !sqlite.contains("sqlx::query(\"COMMIT")
+            && !sqlite.contains("sqlx::query(\"ROLLBACK"),
+        "the SQLite savepoint path must never emit BEGIN/COMMIT/ROLLBACK that would close \
+         or nest inside the outer BEGIN IMMEDIATE:\n{sqlite}"
+    );
+
+    let rollback = source[source
+        .find("async fn rollback_sqlite_namespaces_registry_backfill_savepoint(")
+        .expect("sqlite savepoint rollback")..]
+        .split("\n    /// Shared pin / scan")
+        .next()
+        .expect("sqlite savepoint rollback body");
+    assert!(
+        rollback.contains("ROLLBACK TO SAVEPOINT namespaces_registry_backfill")
+            && rollback.contains("RELEASE SAVEPOINT namespaces_registry_backfill"),
+        "failure/defer must roll back only the savepoint, then release it:\n{rollback}"
+    );
+    assert!(
+        !rollback.contains("sqlx::query(\"COMMIT")
+            && !rollback.contains("sqlx::query(\"ROLLBACK\")")
+            && !rollback.contains("connection.begin()"),
+        "savepoint rollback must not COMMIT or ROLLBACK the outer migration transaction:\n\
+         {rollback}"
     );
 }

@@ -2037,6 +2037,30 @@ fn mongo_namespace_delete_rechecks_protected_namespaces_in_session() {
     );
 }
 
+/// `delete_namespace` used a single `MongoLockGuard` and propagated
+/// `mtls_lease.release().await?` after a confirmed commit. The global vector
+/// helper regression does not catch that form.
+#[test]
+fn mongo_namespace_delete_cannot_fail_the_response_after_commit() {
+    let body = mongo_method("delete_namespace(");
+    assert!(
+        body.contains("acquire_mtls_dns_admission_leases(")
+            && body.contains("run_mtls_dns_mutations(")
+            && body.contains(
+                "release_mtls_dns_admission_leases_after_commit(&mut mtls_leases).await;"
+            ),
+        "delete must use the vector acquire/run/infallible-after-commit lease path:\n{body}"
+    );
+    assert!(
+        !body.contains("acquire_mtls_dns_admission_lease(name)")
+            && !body.contains(".release().await?")
+            && !body.contains("run_mutation(")
+            && !body.contains("release_mtls_dns_admission_leases(&mut mtls_leases).await?"),
+        "a single-guard .release().await? after commit turns a durable delete into an error \
+         and can suppress follow-up/audit behavior:\n{body}"
+    );
+}
+
 /// Every namespace this process is configured to serve — `FERRUM_NAMESPACE`
 /// plus each explicit `FERRUM_CP_NAMESPACES` entry — must reach the committing
 /// transaction, not just the one resolved default (issue #3955 review).
