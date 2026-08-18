@@ -1889,6 +1889,36 @@ def check_fips_producer_channel(
     test_build_job = extract_job(workflow, "fips-test-build")
     test_job = extract_job(workflow, "fips-test")
     aggregate = extract_job(workflow, "fips-build")
+    workflow_preamble = workflow.split("\njobs:", 1)[0]
+    require(
+        'CARGO_BUILD_JOBS: "3"' in workflow_preamble
+        and 'CARGO_PROFILE_DEV_DEBUG: "line-tables-only"' in workflow_preamble,
+        "FIPS producer and handoff consumers must share the three-job, "
+        "line-table debug profile used to bound hosted-runner memory",
+        failures,
+    )
+    swap_steps = [
+        step
+        for step in job_steps(test_build_job)
+        if "name: Extend runner swap for FIPS test binaries" in step
+    ]
+    swap_contract = (
+        "set -euo pipefail",
+        "sudo fallocate -l 12G /mnt/ferrum-swapfile",
+        "sudo chmod 600 /mnt/ferrum-swapfile",
+        "sudo mkswap /mnt/ferrum-swapfile",
+        "sudo swapon /mnt/ferrum-swapfile",
+        "free -h",
+    )
+    require(
+        len(swap_steps) == 1
+        and all(marker in swap_steps[0] for marker in swap_contract)
+        and test_build_job.find("Extend runner swap for FIPS test binaries")
+        < test_build_job.find("Precompile FIPS test binaries for consumers"),
+        "fips-test-build must provision the exact 12G swap contract before "
+        "precompiling its two aggregated test targets",
+        failures,
+    )
     mtime_refresh = (
         'find "$target_root" -xdev -type f '
         '\\\n            -exec touch --reference="$mtime_reference" -- {} +'
@@ -5651,6 +5681,36 @@ def self_test() -> int:
         not handoff_failures,
         "self-test: checked-in FIPS artifact handoff must pass: "
         + "; ".join(handoff_failures),
+        failures,
+    )
+
+    unbounded_fips_compile = handoff_channel.replace(
+        '  CARGO_BUILD_JOBS: "3"\n'
+        '  CARGO_PROFILE_DEV_DEBUG: "line-tables-only"\n',
+        "",
+        1,
+    )
+    unbounded_fips_failures: list[str] = []
+    check_fips_producer_channel(unbounded_fips_compile, unbounded_fips_failures)
+    require(
+        any(
+            "three-job, line-table debug profile" in item
+            for item in unbounded_fips_failures
+        ),
+        "self-test: removing the shared FIPS memory profile must fail",
+        failures,
+    )
+
+    missing_fips_swap = handoff_channel.replace(
+        "      - name: Extend runner swap for FIPS test binaries\n",
+        "      - name: Omit runner swap for FIPS test binaries\n",
+        1,
+    )
+    missing_fips_swap_failures: list[str] = []
+    check_fips_producer_channel(missing_fips_swap, missing_fips_swap_failures)
+    require(
+        any("exact 12G swap contract" in item for item in missing_fips_swap_failures),
+        "self-test: removing the FIPS test-binary swap contract must fail",
         failures,
     )
 

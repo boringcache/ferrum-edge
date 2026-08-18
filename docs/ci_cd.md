@@ -388,6 +388,15 @@ therefore reuse the artifact
 from the successful `fips-test-build` prerequisite that GitHub skipped in the
 new attempt. Fresh-checkout source mtimes cannot make Cargo repeat test-only
 compile/link work.
+
+The FIPS producer and all target-handoff consumers share
+`CARGO_BUILD_JOBS=3` and `CARGO_PROFILE_DEV_DEBUG=line-tables-only`, keeping
+their Cargo fingerprints compatible while bounding cold-runner compiler
+memory. `fips-test-build` also provisions the same 12 GiB swap headroom as the
+aggregated `unit_tests` lane before linking its two complete test targets. This
+is the repository-controlled mitigation for hosted-runner shutdown / exit 143
+during that precompile; file-and-line backtraces remain available.
+
 Non-cold consumers fail closed if no producer handoff for their source
 SHA/run_id exists. Fork pull requests restore the rust-cache fallback only
 and cannot save it; GitHub confines
