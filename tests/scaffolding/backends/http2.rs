@@ -1175,11 +1175,20 @@ const BENIGN_SCRIPT_STEP_ERROR_SUBSTRINGS: &[&str] = &[
 /// Exact std-IO display shapes for a pre-script H2 settings-handshake disconnect:
 /// `Broken pipe` or `Broken pipe (os error 32)`.
 const H2_HANDSHAKE_BENIGN_BROKEN_PIPE_EXACT: &str = "Broken pipe";
-const H2_HANDSHAKE_BENIGN_BROKEN_PIPE_WITH_OS_PREFIX: &str = "Broken pipe (";
+const H2_HANDSHAKE_BENIGN_BROKEN_PIPE_OS_ERROR_PREFIX: &str = "Broken pipe (os error ";
 
 fn is_benign_h2_handshake_broken_pipe_detail(detail: &str) -> bool {
-    detail == H2_HANDSHAKE_BENIGN_BROKEN_PIPE_EXACT
-        || detail.starts_with(H2_HANDSHAKE_BENIGN_BROKEN_PIPE_WITH_OS_PREFIX)
+    if detail == H2_HANDSHAKE_BENIGN_BROKEN_PIPE_EXACT {
+        return true;
+    }
+    let Some(rest) = detail.strip_prefix(H2_HANDSHAKE_BENIGN_BROKEN_PIPE_OS_ERROR_PREFIX) else {
+        return false;
+    };
+    if rest.is_empty() || !rest.ends_with(')') {
+        return false;
+    }
+    let digits = &rest[..rest.len() - 1];
+    !digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit())
 }
 
 /// Returns true when a pool probe or other short-lived client disappeared while
@@ -1227,6 +1236,30 @@ mod tests {
     fn benign_script_step_error_rejects_broken_pipeline_h2_handshake_failure() {
         assert!(!is_benign_script_step_error(
             "h2 handshake failed: Broken pipeline protocol error"
+        ));
+    }
+
+    #[test]
+    fn benign_script_step_error_rejects_malformed_broken_pipe_h2_handshake_details() {
+        assert!(!is_benign_h2_handshake_broken_pipe_detail("Broken pipe (protocol error"));
+        assert!(!is_benign_h2_handshake_broken_pipe_detail("Broken pipe ("));
+        assert!(!is_benign_h2_handshake_broken_pipe_detail("Broken pipe (os error )"));
+        assert!(!is_benign_h2_handshake_broken_pipe_detail("Broken pipe (os error abc)"));
+        assert!(!is_benign_h2_handshake_broken_pipe_detail(
+            "Broken pipe (os error 32) trailing junk"
+        ));
+        assert!(!is_benign_script_step_error(
+            "h2 handshake failed: Broken pipe (protocol error"
+        ));
+        assert!(!is_benign_script_step_error("h2 handshake failed: Broken pipe ("));
+        assert!(!is_benign_script_step_error(
+            "h2 handshake failed: Broken pipe (os error )"
+        ));
+        assert!(!is_benign_script_step_error(
+            "h2 handshake failed: Broken pipe (os error abc)"
+        ));
+        assert!(!is_benign_script_step_error(
+            "h2 handshake failed: Broken pipe (os error 32) trailing junk"
         ));
     }
 
