@@ -3833,22 +3833,8 @@ async fn plugin_cache_uses_configured_waf_ids_for_isolated_scoring_metadata() {
             vec!["pc-multi-a", "pc-multi-b"],
         )],
         vec![
-            scoring_waf_plugin_config(
-                "pc-multi-a",
-                PluginScope::Proxy,
-                Some("p1"),
-                "alpha",
-                5,
-                8,
-            ),
-            scoring_waf_plugin_config(
-                "pc-multi-b",
-                PluginScope::Proxy,
-                Some("p1"),
-                "beta",
-                5,
-                8,
-            ),
+            scoring_waf_plugin_config("pc-multi-a", PluginScope::Proxy, Some("p1"), "alpha", 5, 8),
+            scoring_waf_plugin_config("pc-multi-b", PluginScope::Proxy, Some("p1"), "beta", 5, 8),
         ],
     );
     let cache = PluginCache::new(&config).expect("configured WAF cache");
@@ -3901,14 +3887,7 @@ async fn plugin_cache_waf_blocking_instance_owns_score_metadata() {
                 5,
                 10,
             ),
-            scoring_waf_plugin_config(
-                "pc-multi-b",
-                PluginScope::Proxy,
-                Some("p1"),
-                "needle",
-                5,
-                4,
-            ),
+            scoring_waf_plugin_config("pc-multi-b", PluginScope::Proxy, Some("p1"), "needle", 5, 4),
         ],
     );
     let cache = PluginCache::new(&config).expect("configured WAF cache");
@@ -4028,14 +4007,7 @@ fn plugin_cache_rejects_blank_waf_config_id() {
     // Reaching the constructor error through PluginCache proves production
     // routing passes `pc.id`; the identityless factory would admit this row
     // with a standalone-N identity.
-    let plugin = scoring_waf_plugin_config(
-        "   ",
-        PluginScope::Proxy,
-        Some("p1"),
-        "needle",
-        5,
-        10,
-    );
+    let plugin = scoring_waf_plugin_config("   ", PluginScope::Proxy, Some("p1"), "needle", 5, 10);
     let config = make_config(vec![make_proxy("p1", "/search", vec!["   "])], vec![plugin]);
     let error = match PluginCache::new(&config) {
         Ok(_) => panic!("blank WAF identity must fail closed"),
