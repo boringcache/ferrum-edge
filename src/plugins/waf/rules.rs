@@ -1262,9 +1262,9 @@ mod tests {
         )
         .expect("compile");
         let set = compiled.body_bytes.as_ref().unwrap().set;
-        assert!(set.is_match("prefix EVIL-LITERAL suffix"));
-        assert!(!set.is_match("evil-literal"));
-        assert!(!set.is_match("prefix evil-literal suffix"));
+        assert!(set.is_match(b"prefix EVIL-LITERAL suffix"));
+        assert!(!set.is_match(b"evil-literal"));
+        assert!(!set.is_match(b"prefix evil-literal suffix"));
     }
 
     #[test]
@@ -1293,8 +1293,8 @@ mod tests {
         )
         .expect("compile");
         let set = compiled.body_bytes.as_ref().unwrap().set;
-        assert!(set.is_match("prefix EVIL-LITERAL suffix"));
-        assert!(set.is_match("evil-literal"));
+        assert!(set.is_match(b"prefix EVIL-LITERAL suffix"));
+        assert!(set.is_match(b"evil-literal"));
     }
 
     #[test]
