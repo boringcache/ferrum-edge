@@ -70,11 +70,17 @@ pub(super) enum RuleAction {
 }
 
 impl RuleAction {
-    pub(super) fn as_event_action(self) -> &'static str {
-        match self {
-            RuleAction::Enforce => "block",
-            RuleAction::Monitor => "monitor",
-            RuleAction::Disabled => "disabled",
+    /// Effective direct per-rule `action` for `log_to_stdout` after applying
+    /// the global mode (`blocked`, `monitored`, `disabled`). A later aggregate
+    /// anomaly-score decision can still block the request even when an
+    /// individual monitor-action hit is logged as `monitored`.
+    pub(super) fn effective_log_action(self, globally_enforcing: bool) -> &'static str {
+        if globally_enforcing && self == RuleAction::Enforce {
+            "blocked"
+        } else if self == RuleAction::Disabled {
+            "disabled"
+        } else {
+            "monitored"
         }
     }
 }
