@@ -19,7 +19,10 @@ use url::Url;
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, Request, ResponseTemplate};
 
-use super::jwks_auth_support::{build_rsa_jwks_from_pem, create_rs256_token};
+use super::jwks_auth_support::{
+    build_rsa_jwks_from_pem, build_rsa_jwks_from_pem_with_kid, create_rs256_token,
+    create_rs256_token_no_kid, create_rs256_token_with_kid,
+};
 use super::plugin_utils::{assert_continue, assert_reject, create_test_consumer};
 
 const AUTHORITY_MISMATCH_ERROR: &str =
@@ -1972,11 +1975,22 @@ async fn explicit_jwks_uri_is_reported_as_active() {
 
 async fn mount_token_and_jwks(server: &MockServer, id_token: &str) {
     let public_key_pem = include_bytes!("../../../tests/fixtures/test_rsa_public.pem");
+    mount_token_and_jwks_document(
+        server,
+        build_rsa_jwks_from_pem(public_key_pem),
+        id_token,
+    )
+    .await;
+}
+
+async fn mount_token_and_jwks_document(
+    server: &MockServer,
+    jwks: serde_json::Value,
+    id_token: &str,
+) {
     Mock::given(method("GET"))
         .and(path("/jwks"))
-        .respond_with(
-            ResponseTemplate::new(200).set_body_json(build_rsa_jwks_from_pem(public_key_pem)),
-        )
+        .respond_with(ResponseTemplate::new(200).set_body_json(jwks))
         .mount(server)
         .await;
     Mock::given(method("POST"))
@@ -2069,6 +2083,103 @@ async fn same_instance_callback_still_completes_with_sealed_pending_flow() {
     match complete_callback(&plugin, &challenge, "authorization-code").await {
         PluginResult::Reject { status_code, .. } => assert_eq!(status_code, 302),
         other => panic!("expected same-instance success, got {other:?}"),
+    }
+}
+
+fn two_key_oidc_jwks() -> serde_json::Value {
+    let key1 = build_rsa_jwks_from_pem_with_kid(
+        include_bytes!("../../../tests/fixtures/test_rsa_public.pem"),
+        "key-1",
+    );
+    let key2 = build_rsa_jwks_from_pem_with_kid(
+        include_bytes!("../../../tests/fixtures/test_rsa_public_other.pem"),
+        "key-2",
+    );
+    json!({
+        "keys": [key1["keys"][0].clone(), key2["keys"][0].clone()]
+    })
+}
+
+fn oidc_id_token_claims(challenge: &BrowserChallenge) -> serde_json::Value {
+    json!({
+        "iss": "https://issuer.example.com",
+        "aud": "ferrum-gateway",
+        "sub": "user-1",
+        "nonce": challenge.nonce.as_str(),
+    })
+}
+
+fn assert_invalid_id_token(result: PluginResult) {
+    match result {
+        PluginResult::Reject {
+            status_code, body, ..
+        } => {
+            assert_eq!(status_code, 400);
+            assert_eq!(body, r#"{"error":"Invalid ID token"}"#);
+            assert!(
+                !body.to_ascii_lowercase().contains("kid"),
+                "generic ID token error must not echo kid"
+            );
+        }
+        other => panic!("expected invalid ID token rejection, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn oidc_callback_rejects_id_token_without_kid() {
+    let server = MockServer::start().await;
+    let (_, plugin, _) = plugin_pair_for_server(&server);
+    let challenge = issue_browser_challenge(&plugin).await;
+    let id_token = create_rs256_token_no_kid(
+        &oidc_id_token_claims(&challenge),
+        include_bytes!("../../../tests/fixtures/test_rsa_private.pem"),
+    );
+    mount_token_and_jwks_document(&server, two_key_oidc_jwks(), &id_token).await;
+    assert_invalid_id_token(complete_callback(&plugin, &challenge, "authorization-code").await);
+}
+
+#[tokio::test]
+async fn oidc_callback_rejects_unknown_kid_even_when_another_published_key_verifies() {
+    let server = MockServer::start().await;
+    let (_, plugin, _) = plugin_pair_for_server(&server);
+    let challenge = issue_browser_challenge(&plugin).await;
+    let id_token = create_rs256_token_with_kid(
+        &oidc_id_token_claims(&challenge),
+        include_bytes!("../../../tests/fixtures/test_rsa_private.pem"),
+        "no-such-kid",
+    );
+    mount_token_and_jwks_document(&server, two_key_oidc_jwks(), &id_token).await;
+    assert_invalid_id_token(complete_callback(&plugin, &challenge, "authorization-code").await);
+}
+
+#[tokio::test]
+async fn oidc_callback_rejects_known_kid_signed_by_a_different_published_key() {
+    let server = MockServer::start().await;
+    let (_, plugin, _) = plugin_pair_for_server(&server);
+    let challenge = issue_browser_challenge(&plugin).await;
+    let id_token = create_rs256_token_with_kid(
+        &oidc_id_token_claims(&challenge),
+        include_bytes!("../../../tests/fixtures/test_rsa_private_other.pem"),
+        "key-1",
+    );
+    mount_token_and_jwks_document(&server, two_key_oidc_jwks(), &id_token).await;
+    assert_invalid_id_token(complete_callback(&plugin, &challenge, "authorization-code").await);
+}
+
+#[tokio::test]
+async fn oidc_callback_accepts_id_token_with_matching_kid() {
+    let server = MockServer::start().await;
+    let (_, plugin, _) = plugin_pair_for_server(&server);
+    let challenge = issue_browser_challenge(&plugin).await;
+    let id_token = create_rs256_token_with_kid(
+        &oidc_id_token_claims(&challenge),
+        include_bytes!("../../../tests/fixtures/test_rsa_private.pem"),
+        "key-1",
+    );
+    mount_token_and_jwks_document(&server, two_key_oidc_jwks(), &id_token).await;
+    match complete_callback(&plugin, &challenge, "authorization-code").await {
+        PluginResult::Reject { status_code, .. } => assert_eq!(status_code, 302),
+        other => panic!("expected matching-kid callback success, got {other:?}"),
     }
 }
 

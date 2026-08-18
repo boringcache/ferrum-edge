@@ -17924,7 +17924,11 @@ components:
     JwksAuthConfig:
       type: object
       additionalProperties: false
-      description: "Plugin: jwks_auth — Multi-provider JWKS JWT validation with claim-based authorization."
+      description: >-
+        Plugin: jwks_auth — Multi-provider JWKS JWT validation with claim-based
+        authorization. JWT header kid is required and binding: a missing, empty,
+        or unknown kid is rejected with a generic 401. There is no all-keys
+        fallback; a known kid selects only that trusted key.
       required: [providers]
       properties:
         providers:
@@ -18394,7 +18398,11 @@ components:
     OidcRelyingPartyConfig:
       type: object
       additionalProperties: false
-      description: "Plugin: oidc_relying_party — Browser OIDC relying party with authorization code + PKCE and encrypted sessions."
+      description: >-
+        Plugin: oidc_relying_party — Browser OIDC relying party with authorization
+        code + PKCE and encrypted sessions. ID token verification requires a JWT
+        header kid that selects exactly one current trusted JWKS key; missing,
+        empty, and unknown kid values are rejected with no all-keys fallback.
       required: [providers, session]
       properties:
         providers:

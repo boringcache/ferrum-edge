@@ -2225,6 +2225,8 @@ Unknown top-level, provider, and custom-header-location fields are rejected so m
 
 Remote discovery documents are capped at 128 KiB and JWKS responses at 1 MiB/256 keys, with bounded key components. A valid non-empty JWKS atomically replaces the key map, refreshes the monotonic trust deadline, clears failure state, and can restore authentication after expiry. Empty 200 responses, malformed or oversized bodies, non-2xx status, and transport/DNS/TLS/timeout failures retain last-known-good material only for the finite grace window and use a bounded accelerated retry cadence; after the deadline, verification refuses the retained material without deleting diagnostic/recovery state. JWKs are accepted for signature verification only when `use` is absent or `sig` and `key_ops` is absent or includes `verify`; contradictory operation metadata is rejected.
 
+JWT header `kid` is required and binding. A missing `kid`, an empty `kid`, or a `kid` that is not in the selected provider's current trusted JWKS is rejected with the same generic 401 (`{"error":"Invalid or unrecognized JWT"}`) as any other invalid token. There is no all-keys fallback: a known `kid` selects only that key, so a token signed by a different published key is still rejected. Ferrum never logs token data, key material, claims, or attacker-controlled `kid` values.
+
 Authenticated `/metrics` exposes only fixed-cardinality aggregate JWKS state for **active remote** stores: `fresh`, `grace`, or `expired`, maximum trust age per state, and closed refresh-failure classes. It never labels a series with a JWKS/discovery URL, `kid`, token, claim, or key material. Authenticated `/health`/`/status` mirror the same closed-set counts under `jwks_trust`; unauthenticated probes see only coarse readiness effects (grace → degraded+ready, expired → unavailable+not-ready, none → neutral) from an O(1) cached aggregate. Choose the maximum-stale window as an explicit availability-versus-revocation trade-off; production deployments should keep it short enough for emergency key removal to take effect within their incident-response objective.
 
 #### Single-use replay protection
@@ -2374,6 +2376,13 @@ OIDC relying-party JWKS uses the same shared bounded-trust store as
 does not refresh key trust; only a validated non-empty JWKS does. When the same
 URI is also referenced by `jwks_auth`, the strictest active maximum-stale and
 refresh requirements govern the shared store.
+
+ID token verification uses the same shared JWKS verifier: the ID token header
+must carry a `kid` that selects exactly one current trusted key. Missing, empty,
+and unknown `kid` values are rejected with a generic invalid-ID-token error;
+there is no all-keys fallback. A known `kid` with a bad signature under that
+key is also rejected. Token data, key material, claims, and attacker-controlled
+`kid` values are never logged.
 
 ### `jwt_auth`
 
