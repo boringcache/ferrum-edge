@@ -78,8 +78,10 @@ impl RuleAction {
         }
     }
 
-    /// Effective per-hit `action` for `log_to_stdout`, aligned with `waf.action`
-    /// metadata (`blocked`, `monitored`, `disabled`).
+    /// Effective direct per-rule `action` for `log_to_stdout` after applying
+    /// the global mode (`blocked`, `monitored`, `disabled`). A later aggregate
+    /// anomaly-score decision can still block the request even when an
+    /// individual monitor-action hit is logged as `monitored`.
     pub(super) fn effective_log_action(self, globally_enforcing: bool) -> &'static str {
         if globally_enforcing && self == RuleAction::Enforce {
             "blocked"

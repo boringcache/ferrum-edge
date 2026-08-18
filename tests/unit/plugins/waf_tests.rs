@@ -2619,8 +2619,10 @@ fn assert_waf_stdout_hit_action(logs: &str, effective: &str, configured: &str) {
         "expected configured rule_action={configured} in logs: {logs}"
     );
     assert!(
-        !logs.contains("action=block"),
-        "must not log configured enforce action as the effective action: {logs}"
+        !logs
+            .split_whitespace()
+            .any(|field| field.trim_end_matches(',') == "action=block"),
+        "must not log the legacy exact action=block field: {logs}"
     );
 }
 
