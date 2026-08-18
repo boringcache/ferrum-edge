@@ -33,6 +33,33 @@ plugin_configs: []
 }
 
 #[test]
+fn documented_file_mode_configuration_loads_and_validates() {
+    let docs = include_str!("../../../docs/configuration.md");
+    let section = docs
+        .split("## File Mode Configuration Format")
+        .nth(1)
+        .expect("File Mode Configuration Format section exists");
+    let yaml = section
+        .split("```yaml")
+        .nth(1)
+        .and_then(|tail| tail.split("```").next())
+        .expect("section contains a YAML example");
+    let mut file = NamedTempFile::with_suffix(".yaml").unwrap();
+    write!(file, "{}", yaml).unwrap();
+
+    let config = load_config_from_file(
+        file.path().to_str().unwrap(),
+        30,
+        &ferrum_edge::config::BackendEgressPolicy::unrestricted(),
+        "ferrum",
+    )
+    .expect("the documented file-mode YAML loads and validates");
+    assert_eq!(config.proxies.len(), 1);
+    assert_eq!(config.consumers.len(), 1);
+    assert_eq!(config.plugin_configs.len(), 2);
+}
+
+#[test]
 fn test_load_yaml_config() {
     let yaml = r#"
 version: "1"
