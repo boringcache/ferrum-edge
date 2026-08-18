@@ -8022,7 +8022,11 @@ pub mod _test_support {
     /// Run one awaitable post-admission DTLS setup stage (DNS resolution,
     /// backend UDP/DTLS connect and handshake) under the admitted session's
     /// absolute authorization deadline, exactly as `handle_dtls_client_inner`
-    /// bounds them (issue #3816).
+    /// bounds them for an ANONYMOUS session (issue #3816).
+    ///
+    /// The fence is unarmed here, which is the real anonymous / static DTLS
+    /// path. A client-certificate session's combined bound is
+    /// [`dtls_setup_stage_under_bounds_for_test`] (issue #3857).
     pub async fn dtls_setup_stage_under_authorization_for_test<S, F>(
         plan: Option<crate::proxy::auth_lifetime::StreamAuthDeadline>,
         stage: S,
@@ -8034,10 +8038,12 @@ pub mod _test_support {
         let latch = crate::proxy::auth_lifetime::StreamAuthTerminationLatch::default();
         let metadata = std::sync::Mutex::new(HashMap::new());
         let releases = std::sync::atomic::AtomicUsize::new(0);
-        let outcome = crate::proxy::udp_proxy::dtls_setup_stage_under_authorization(
+        let unarmed = crate::proxy::udp_proxy::DtlsClientTrustFence::unarmed();
+        let outcome = crate::proxy::udp_proxy::dtls_setup_stage_under_bounds(
             plan,
             &latch,
             &metadata,
+            &unarmed,
             || {
                 releases.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             },
@@ -8054,6 +8060,221 @@ pub mod _test_support {
                     .unwrap_or_else(|poisoned| poisoned.into_inner())
                     .clone(),
             )),
+        }
+    }
+
+    // ── Accepted-DTLS client-trust retirement (issue #3857) ────────────
+
+    /// The accepted DTLS session's frontend client-trust fence, as the
+    /// `udp_proxy` handler and both relay directions carry it.
+    ///
+    /// The production type is crate-private, so external coverage builds it
+    /// through this wrapper from a really-registered session — there is no way
+    /// to fabricate one, and an unarmed fence is the real anonymous/static DTLS
+    /// path rather than a stub.
+    pub struct DtlsTrustFenceForTest(crate::proxy::udp_proxy::DtlsClientTrustFence);
+
+    impl DtlsTrustFenceForTest {
+        /// Arm the fence from a registered session, or leave it unarmed
+        /// (`None`) exactly as an anonymous / static DTLS session does.
+        #[must_use]
+        pub fn new(session: Option<&crate::tls::ClientTrustSession>) -> Self {
+            Self(crate::proxy::udp_proxy::DtlsClientTrustFence::from_session(
+                session.cloned(),
+            ))
+        }
+
+        /// Whether this session carries a withdrawable trust decision at all.
+        #[must_use]
+        pub fn is_armed(&self) -> bool {
+            self.0.is_armed()
+        }
+
+        /// Whether the trust decision has already been withdrawn.
+        #[must_use]
+        pub fn is_retired(&self) -> bool {
+            self.0.is_retired()
+        }
+
+        /// Record the connection's fixed-cardinality fence counter through the
+        /// shared once-only latch — the exact call every production fence
+        /// makes, so a test can prove repeat observations stay at one.
+        pub fn record_fenced_once(&self) {
+            self.0.record_fenced_once();
+        }
+
+        /// Record the fence once and return the typed, client-side,
+        /// health-neutral refusal, classified the way the DTLS disconnect
+        /// summary classifies it.
+        #[must_use]
+        pub fn settle_withdrawal(&self) -> DtlsAuthorizationExpiryForTest {
+            let error = self.0.settle_withdrawal();
+            classify_dtls_session_failure_for_test(&error, 0, HashMap::new())
+        }
+    }
+
+    /// How the accepted-DTLS `on_stream_connect` chain ended.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum DtlsStreamConnectOutcomeForTest {
+        Admitted,
+        Rejected,
+        TrustWithdrawn,
+    }
+
+    /// Run the production accepted-DTLS `on_stream_connect` chain under the
+    /// established session's client-trust fence (issue #3857).
+    ///
+    /// This is the real chain the DTLS accept handler runs — the same hook
+    /// loop, the same withdrawal-first prechecks, the same mid-poll drop of a
+    /// blocked hook — so a blocked hook and its cancellation are not reachable
+    /// from outside the crate any other way.
+    pub async fn dtls_stream_connect_chain_under_trust_fence_for_test(
+        plugins: &[Arc<dyn Plugin>],
+        stream_ctx: &mut crate::plugins::StreamConnectionContext,
+        trust: &DtlsTrustFenceForTest,
+    ) -> DtlsStreamConnectOutcomeForTest {
+        match crate::proxy::udp_proxy::run_dtls_stream_connect_plugins(
+            plugins,
+            stream_ctx,
+            &trust.0,
+        )
+        .await
+        {
+            crate::proxy::udp_proxy::DtlsStreamConnectOutcome::Admitted => {
+                DtlsStreamConnectOutcomeForTest::Admitted
+            }
+            crate::proxy::udp_proxy::DtlsStreamConnectOutcome::Rejected => {
+                DtlsStreamConnectOutcomeForTest::Rejected
+            }
+            crate::proxy::udp_proxy::DtlsStreamConnectOutcome::TrustWithdrawn => {
+                DtlsStreamConnectOutcomeForTest::TrustWithdrawn
+            }
+        }
+    }
+
+    /// Run one awaitable post-admission DTLS backend-setup stage (DNS
+    /// resolution, the backend UDP connect, the backend DTLS handshake) under
+    /// BOTH post-admission bounds, exactly as `handle_dtls_client_inner` bounds
+    /// them (issues #3816, #3857).
+    ///
+    /// The returned settlement carries the HALF_OPEN probe-release count, so a
+    /// test can prove the claimed slot is handed back NEUTRALLY rather than
+    /// scored against the backend.
+    pub async fn dtls_setup_stage_under_bounds_for_test<S, F>(
+        plan: Option<crate::proxy::auth_lifetime::StreamAuthDeadline>,
+        trust: &DtlsTrustFenceForTest,
+        stage: S,
+    ) -> Result<F::Output, DtlsAuthorizationExpiryForTest>
+    where
+        S: FnOnce() -> F,
+        F: std::future::Future,
+    {
+        let latch = crate::proxy::auth_lifetime::StreamAuthTerminationLatch::default();
+        let metadata = std::sync::Mutex::new(HashMap::new());
+        let releases = std::sync::atomic::AtomicUsize::new(0);
+        let outcome = crate::proxy::udp_proxy::dtls_setup_stage_under_bounds(
+            plan,
+            &latch,
+            &metadata,
+            &trust.0,
+            || {
+                releases.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            },
+            stage,
+        )
+        .await;
+        match outcome {
+            Ok(output) => Ok(output),
+            Err(error) => Err(classify_dtls_session_failure_for_test(
+                &error,
+                releases.load(std::sync::atomic::Ordering::Relaxed),
+                metadata
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .clone(),
+            )),
+        }
+    }
+
+    /// Why one relayed DTLS datagram stage was interrupted.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum DtlsRelayInterruptForTest {
+        AuthorizationExpired(crate::proxy::auth_lifetime::StreamAuthTermination),
+        TrustWithdrawn,
+    }
+
+    /// Race one DTLS client→backend stage — receive, an awaited per-datagram
+    /// hook, or the backend application-datagram commit — against BOTH
+    /// post-admission bounds, the exact seam the relay uses.
+    pub async fn dtls_c2b_under_bounds_for_test<F>(
+        plan: Option<crate::proxy::auth_lifetime::StreamAuthDeadline>,
+        latch: &crate::proxy::auth_lifetime::StreamAuthTerminationLatch,
+        trust: &DtlsTrustFenceForTest,
+        stage: F,
+    ) -> Result<F::Output, DtlsRelayInterruptForTest>
+    where
+        F: std::future::Future,
+    {
+        let metadata = std::sync::Mutex::new(HashMap::new());
+        crate::proxy::udp_proxy::dtls_c2b_under_bounds(plan, latch, &metadata, &trust.0, stage)
+            .await
+            .map_err(|interrupt| match interrupt {
+                crate::proxy::udp_proxy::DtlsRelayInterrupt::AuthorizationExpired(termination) => {
+                    DtlsRelayInterruptForTest::AuthorizationExpired(termination)
+                }
+                crate::proxy::udp_proxy::DtlsRelayInterrupt::TrustWithdrawn => {
+                    DtlsRelayInterruptForTest::TrustWithdrawn
+                }
+            })
+    }
+
+    /// Outcome of one accepted-DTLS backend→client datagram after its hook
+    /// chain is raced against both post-admission bounds.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum DtlsReplyDatagramCommitForTest {
+        Commit,
+        Drop,
+        AuthorizationExpired(crate::proxy::auth_lifetime::StreamAuthTermination),
+        TrustWithdrawn,
+    }
+
+    /// Run the production accepted-DTLS backend→client hook chain under both
+    /// post-admission bounds. A still-pending hook is dropped when either bound
+    /// wins.
+    pub async fn dtls_reply_commit_after_backend_hooks_for_test(
+        plugins: &[Arc<dyn Plugin>],
+        payload: &[u8],
+        plan: Option<crate::proxy::auth_lifetime::StreamAuthDeadline>,
+        trust: &DtlsTrustFenceForTest,
+    ) -> DtlsReplyDatagramCommitForTest {
+        let ctx = crate::plugins::UdpDatagramContext {
+            client_ip: Arc::from("127.0.0.1"),
+            proxy_id: Arc::from("dtls-proxy"),
+            proxy_name: None,
+            listen_port: 5301,
+            datagram_size: payload.len(),
+            direction: crate::plugins::UdpDatagramDirection::BackendToClient,
+            payload,
+            payload_kind: crate::plugins::StreamBytesKind::DecryptedApp,
+            metadata_sink: None,
+        };
+        match crate::proxy::udp_proxy::dtls_reply_commit_after_backend_hooks(
+            plugins, &ctx, plan, &trust.0,
+        )
+        .await
+        {
+            crate::proxy::udp_proxy::DtlsReplyDatagramCommit::Commit => {
+                DtlsReplyDatagramCommitForTest::Commit
+            }
+            crate::proxy::udp_proxy::DtlsReplyDatagramCommit::Drop => {
+                DtlsReplyDatagramCommitForTest::Drop
+            }
+            crate::proxy::udp_proxy::DtlsReplyDatagramCommit::AuthorizationExpired(termination) => {
+                DtlsReplyDatagramCommitForTest::AuthorizationExpired(termination)
+            }
+            crate::proxy::udp_proxy::DtlsReplyDatagramCommit::TrustWithdrawn => {
+                DtlsReplyDatagramCommitForTest::TrustWithdrawn
+            }
         }
     }
 

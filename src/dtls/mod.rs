@@ -1845,6 +1845,25 @@ pub struct DtlsServerConn {
     /// `send_to` is owned by that bound. Unauthenticated sessions never set
     /// this.
     auth_deadline: Arc<FrontendSessionAuthDeadline>,
+    /// The registered frontend client-trust decision this session was admitted
+    /// under (issue #3857), or `None` for an anonymous / static DTLS session
+    /// that presented no gateway-verified client certificate.
+    ///
+    /// The session driver's own fences (plaintext delivery, accept handoff,
+    /// ciphertext sends) end the DRIVER, and its channels close. That is not a
+    /// retirement fence for the detached handler this connection is delivered
+    /// to: once `accept_tx.send` completed, that handler runs arbitrary awaited
+    /// `on_stream_connect` hooks, DNS resolution, a backend dial, a backend DTLS
+    /// handshake, and two relay tasks — every one of which can be parked across
+    /// a withdrawal and then continue. Carrying the registered session here is
+    /// what gives the handler the same bound the driver has.
+    ///
+    /// This is a cheap `Arc` clone of a process-local handle: it holds no
+    /// certificate, no trust material, and no generation a consumer can log. It
+    /// keeps the transport visible to a later sweep until the last handle drops,
+    /// which is the same lifetime rule an upgraded WebSocket relies on;
+    /// deregistration still happens exactly once, when the last handle goes.
+    client_trust: Option<crate::tls::ClientTrustSession>,
     /// DER-encoded client leaf certificate from the DTLS handshake.
     /// Populated when the client presents a certificate during mutual DTLS authentication.
     pub tls_client_cert_der: Option<Arc<Vec<u8>>>,
@@ -1931,6 +1950,16 @@ impl DtlsServerConn {
         rx.recv()
             .await
             .ok_or_else(|| anyhow::anyhow!("DTLS server connection closed"))
+    }
+
+    /// The registered frontend client-trust session this connection was
+    /// admitted under, or `None` for an anonymous / static DTLS session.
+    ///
+    /// The accepted-session handler clones this once and carries it as its
+    /// post-admission trust fence: a `None` here means the handler arms no
+    /// retirement future at all and keeps its previous behaviour.
+    pub fn client_trust_session(&self) -> Option<&crate::tls::ClientTrustSession> {
+        self.client_trust.as_ref()
     }
 
     /// Get a cloneable sender for this connection, allowing another task
@@ -2937,11 +2966,24 @@ impl DtlsServer {
                                 let Some(rx) = app_out_rx.take() else {
                                     continue; // Already connected — should not happen
                                 };
+                                // The accepted connection carries this session's
+                                // registered trust decision (issue #3857). The
+                                // accept handoff below is committed BEFORE the
+                                // server's queued final flight is drained, and
+                                // the proxy handler it wakes runs plugin hooks,
+                                // DNS, and a backend dial that this driver
+                                // cannot fence — so the fence travels with the
+                                // connection rather than staying behind in the
+                                // driver's channels. `None` for anonymous /
+                                // static DTLS, which arms nothing.
                                 let conn = DtlsServerConn {
                                     app_tx: app_in_tx.clone(),
                                     app_rx: tokio::sync::Mutex::new(rx),
                                     shutdown_tx: shutdown_tx.clone(),
                                     auth_deadline: auth_deadline.clone(),
+                                    client_trust: client_trust_guard
+                                        .as_ref()
+                                        .map(|guard| guard.session().clone()),
                                     tls_client_cert_der: peer_cert_der.clone(),
                                     tls_client_cert_chain_der: peer_cert_chain_der.clone(),
                                     sni_hostname: sni_hostname.clone(),

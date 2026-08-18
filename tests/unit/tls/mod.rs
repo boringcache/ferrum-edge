@@ -2,6 +2,7 @@
 mod acme_dns01_hook_tests;
 mod acme_http01_challenge_path_tests;
 mod acme_store_ha_tests;
+mod client_trust_dtls_session_tests;
 mod client_trust_stream_setup_tests;
 mod client_trust_tests;
 pub(crate) use client_trust_tests::isolated_registry;
