@@ -387,10 +387,10 @@ async fn establish_h2c_miss(
         key,
         move |attempt| {
             note_grpc_establishment_join(attempt, purpose);
-            if purpose == GrpcEstablishmentPurpose::Request {
-                if let Some(joined) = &joined {
-                    joined.fetch_add(1, Ordering::SeqCst);
-                }
+            if purpose == GrpcEstablishmentPurpose::Request
+                && let Some(joined) = &joined
+            {
+                joined.fetch_add(1, Ordering::SeqCst);
             }
         },
         move |attempt| note_grpc_establishment_waiter_failure(attempt, purpose),
