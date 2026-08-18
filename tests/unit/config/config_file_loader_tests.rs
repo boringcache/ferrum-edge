@@ -8,6 +8,31 @@ use tempfile::NamedTempFile;
 // ============================================================================
 
 #[test]
+fn test_load_yaml_without_consumers_key() {
+    let yaml = r#"
+version: "1"
+proxies:
+  - id: "proxy-1"
+    listen_path: "/api/v1"
+    backend_scheme: http
+    backend_host: "localhost"
+    backend_port: 3000
+plugin_configs: []
+"#;
+    let mut file = NamedTempFile::with_suffix(".yaml").unwrap();
+    write!(file, "{}", yaml).unwrap();
+    let config = load_config_from_file(
+        file.path().to_str().unwrap(),
+        30,
+        &ferrum_edge::config::BackendEgressPolicy::unrestricted(),
+        "ferrum",
+    )
+    .unwrap();
+    assert_eq!(config.proxies.len(), 1);
+    assert!(config.consumers.is_empty());
+}
+
+#[test]
 fn test_load_yaml_config() {
     let yaml = r#"
 version: "1"
