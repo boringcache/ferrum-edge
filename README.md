@@ -9,7 +9,7 @@
 <p align="center">
   <a href="https://github.com/ferrum-edge/ferrum-edge/actions/workflows/ci.yml"><img src="https://github.com/ferrum-edge/ferrum-edge/actions/workflows/ci.yml/badge.svg?branch=main" alt="CI"></a>
   <a href="https://github.com/ferrum-edge/ferrum-edge/actions/workflows/coverage.yml"><img src="https://github.com/ferrum-edge/ferrum-edge/actions/workflows/coverage.yml/badge.svg?branch=main" alt="Coverage"></a>
-  <a href="https://github.com/ferrum-edge/ferrum-edge/releases/latest"><img src="https://img.shields.io/github/v/release/ferrum-edge/ferrum-edge" alt="Release"></a>
+  <a href="https://github.com/ferrum-edge/ferrum-edge/releases/tag/latest"><img src="https://img.shields.io/github/v/release/ferrum-edge/ferrum-edge?include_prereleases" alt="Release"></a>
   <a href="https://github.com/ferrum-edge/ferrum-edge/blob/main/LICENSE"><img src="https://img.shields.io/badge/license-PolyForm%20Noncommercial-blue" alt="License"></a>
   <a href="https://hub.docker.com/r/ferrumedge/ferrum-edge"><img src="https://img.shields.io/docker/pulls/ferrumedge/ferrum-edge" alt="Docker Pulls"></a>
 </p>
@@ -70,13 +70,20 @@ ferrum-edge version
 
 ### Pre-built Binaries
 
-Download from [GitHub Releases](https://github.com/ferrum-edge/ferrum-edge/releases) for Linux x86_64/ARM64 and macOS x86_64/ARM64.
+Download from [GitHub Releases](https://github.com/ferrum-edge/ferrum-edge/releases) for Linux x86_64/ARM64 and macOS x86_64/ARM64. Releases ship raw platform binaries plus adjacent `.sha256` checksum files (for example `ferrum-edge-linux-x86_64` and `ferrum-edge-linux-x86_64.sha256`).
+
+Pin an explicit release tag in download URLs. Ferrum's moving `latest` tag is published as a prerelease, while GitHub's `/releases/latest` redirect and the `releases/latest` API endpoint skip prereleases. Use `/releases/download/<tag>/…` or `gh release download <tag>` instead.
 
 ```bash
 # Example: Linux x86_64
-curl -LO https://github.com/ferrum-edge/ferrum-edge/releases/latest/download/ferrum-edge-x86_64-unknown-linux-gnu.tar.gz
-tar xzf ferrum-edge-x86_64-unknown-linux-gnu.tar.gz
-sudo mv ferrum-edge /usr/local/bin/
+set -euo pipefail
+TAG=latest  # or replace with another explicit tag shown on the Releases page
+BASE="https://github.com/ferrum-edge/ferrum-edge/releases/download/${TAG}"
+curl -fsSLO "${BASE}/ferrum-edge-linux-x86_64"
+curl -fsSLO "${BASE}/ferrum-edge-linux-x86_64.sha256"
+sha256sum -c ferrum-edge-linux-x86_64.sha256
+chmod +x ferrum-edge-linux-x86_64
+sudo install -m 0755 ferrum-edge-linux-x86_64 /usr/local/bin/ferrum-edge
 ferrum-edge version
 ```
 
