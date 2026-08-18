@@ -4738,7 +4738,7 @@ Two policy guards run before parsing: the configured `<!ENTITY` declaration cap 
 
 ### `openapi_validator`
 
-Validates request and response bodies against operation schemas generated from an attached OpenAPI or Swagger document. JSON, XML, form-urlencoded, multipart, text, and binary media types are supported. This plugin is normally auto-injected by `POST /api-specs` or `PUT /api-specs/{id}` when the document includes `x-ferrum-validate`.
+Validates request and response bodies against operation schemas generated from an attached OpenAPI or Swagger document. JSON, XML, form-urlencoded, multipart, text, and binary media types are supported. This plugin is normally auto-injected by `POST /api-specs` or `PUT /api-specs/{id}` when the document includes `x-ferrum-validate`; that importer path generates the required `operations` table from the attached document. In file mode (or any other direct plugin configuration), you must supply the same generated `operations` array yourself — omitting it fails plugin construction with `'operations' is required`.
 
 **Priority:** 2960
 
@@ -4749,11 +4749,11 @@ Validates request and response bodies against operation schemas generated from a
 | `validate_response` | bool | `true` | Validate response bodies for operations with response schemas |
 | `request_content_types` | String[] | common JSON/XML/form/text/binary types | Request media types to validate |
 | `response_content_types` | String[] | common JSON/XML/form/text/binary types | Response media types to validate |
-| `fail_on_unknown_operation` | bool | `true` | Reject requests that do not match any generated operation |
+| `fail_on_unknown_operation` | bool | `true` | Reject requests that do not match any generated operation. In `block` mode the client-visible problem `title` is `Unknown OpenAPI operation` with detail `No OpenAPI operation matched this request`; the method and path are not interpolated into either string. |
 | `fail_on_missing_response_schema` | bool | `false` | Reject a response whose selected response object yields no schema, applied after status selection to missing, out-of-scope, and unmatched content types |
 | `max_body_bytes` | integer | `1048576` | Maximum raw body size and per-layer decoded size while undoing `Content-Encoding` chains |
 | `schema_draft` | string | generated | `auto`, `draft7`, or `draft2020-12` |
-| `operations` | array | required | Generated operation schema table |
+| `operations` | array | required | Generated operation schema table. Required in file mode and other direct plugin configuration; `POST /api-specs` / `PUT /api-specs/{id}` generate it from the attached document when `x-ferrum-validate` is enabled. |
 | `bypass.paths` | String[] | `[]` | Regex paths that skip validation |
 | `bypass.methods` | String[] | `[]` | HTTP methods that skip validation |
 | `bypass.consumers` | String[] | `[]` | Consumer identities that skip validation |

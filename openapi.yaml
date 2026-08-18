@@ -23116,7 +23116,11 @@ components:
         fail_on_unknown_operation:
           type: boolean
           default: true
-          description: Reject requests that do not match any generated operation.
+          description: >-
+            Reject requests that do not match any generated operation. In block
+            mode the client-visible problem title is "Unknown OpenAPI operation"
+            with detail "No OpenAPI operation matched this request"; the method
+            and path are not interpolated into either string.
         fail_on_missing_response_schema:
           type: boolean
           default: false
@@ -23150,7 +23154,12 @@ components:
           minItems: 1
           items:
             $ref: "#/components/schemas/OpenapiValidatorOperation"
-          description: Generated operation schema table. The importer replaces this from the spec on every spec PUT.
+          description: >-
+            Generated operation schema table. Required in file mode and other
+            direct plugin configuration; POST /api-specs and PUT
+            /api-specs/{id} generate it from the attached document when
+            x-ferrum-validate is enabled. The importer replaces this from the
+            spec on every spec PUT.
         bypass:
           type: object
           additionalProperties: false
