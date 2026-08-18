@@ -415,3 +415,20 @@ fn json_spec_infers_file_protocol_from_extension() {
     assert_eq!(std::env::var("FERRUM_MESH_CONFIG_PROTOCOL").unwrap(), "file");
     execute_validate().expect("empty mesh mapping is a valid file document");
 }
+
+#[test]
+fn validate_wires_stock_xds_to_the_policy_only_loader() {
+    let source = include_str!("../../../src/cli.rs");
+    let validate = source
+        .split("pub fn execute_validate()")
+        .nth(1)
+        .expect("execute_validate")
+        .split("pub fn execute_health(")
+        .next()
+        .unwrap_or(source);
+    assert!(
+        validate.contains("MeshConfigProtocol::StockXds")
+            && validate.contains("load_stock_policy_baseline"),
+        "stock_xds validate must parse the local document with its policy-only admission"
+    );
+}

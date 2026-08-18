@@ -924,16 +924,32 @@ pub fn execute_validate() -> Result<(), String> {
     if env_config.mode == OperatingMode::Mesh {
         let runtime = crate::modes::mesh::MeshRuntimeConfig::from_env_config(&env_config)
             .map_err(|e| format!("Mesh runtime validation failed: {e}"))?;
-        if runtime.config_protocol == MeshConfigProtocol::File {
+        if runtime.config_protocol.requires_local_policy_document() {
             let path = runtime.file_config_path.as_deref().ok_or_else(|| {
-                "FERRUM_MESH_FILE_CONFIG_PATH is required when FERRUM_MESH_CONFIG_PROTOCOL=file"
-                    .to_string()
+                format!(
+                    "FERRUM_MESH_FILE_CONFIG_PATH is required when \
+                     FERRUM_MESH_CONFIG_PROTOCOL={}",
+                    runtime.config_protocol.as_str()
+                )
             })?;
-            crate::modes::mesh::config_consumer::file_source::load_mesh_slice_from_file(
-                std::path::Path::new(path),
-                runtime.mesh_slice_request(),
-            )
-            .map_err(|e| format!("Mesh spec validation failed: {e}"))?;
+            match runtime.config_protocol {
+                MeshConfigProtocol::File => {
+                    crate::modes::mesh::config_consumer::file_source::load_mesh_slice_from_file(
+                        std::path::Path::new(path),
+                        runtime.mesh_slice_request(),
+                    )
+                    .map_err(|e| format!("Mesh spec validation failed: {e}"))?;
+                }
+                MeshConfigProtocol::StockXds => {
+                    crate::modes::mesh::config_consumer::stock_xds_client::load_stock_policy_baseline(
+                        std::path::Path::new(path),
+                    )
+                    .map_err(|e| format!("Mesh spec validation failed: {e}"))?;
+                }
+                MeshConfigProtocol::Native | MeshConfigProtocol::Xds => {
+                    return Err("internal mesh validation protocol mismatch".to_string());
+                }
+            }
             println!(
                 "Mesh spec ({}): OK",
                 report_field("FERRUM_MESH_FILE_CONFIG_PATH", path)
