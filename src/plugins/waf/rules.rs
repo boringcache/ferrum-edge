@@ -1334,9 +1334,11 @@ mod tests {
             pattern: "EVIL-LITERAL".into(),
             conditions: None,
             action: RuleAction::Monitor,
+            default_action_policy: DefaultActionPolicy::Inherit,
             fp_filters: vec![],
             paranoia_min: 1,
             score: None,
+            query_scan_mirror: QueryScanMirror::None,
         };
         let compiled = compile_rules(
             vec![(rule, false)],
@@ -1365,9 +1367,11 @@ mod tests {
             pattern: "EVIL-LITERAL".into(),
             conditions: None,
             action: RuleAction::Monitor,
+            default_action_policy: DefaultActionPolicy::Inherit,
             fp_filters: vec![],
             paranoia_min: 1,
             score: None,
+            query_scan_mirror: QueryScanMirror::None,
         };
         let compiled = compile_rules(
             vec![(rule, false)],
@@ -1499,6 +1503,7 @@ mod tests {
             fp_filters: vec![],
             paranoia_min: 1,
             score: None,
+            query_scan_mirror: QueryScanMirror::None,
         }
     }
 
