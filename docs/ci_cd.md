@@ -518,7 +518,8 @@ compile and execute: kernel live is the BPF crate plus `src/ebpf/`, the
 node-agent ingress-redirect helpers, `src/capture/` (`should_fallback_to_iptables`
 via `kernel_probe`), and the loader-adjacent transparent bind
 (`src/proxy/mod.rs` `create_proxy_socket` + `src/socket_opts.rs`); netns
-capture live is the netns/TPROXY/SO_ORIGINAL_DST/UDP producer surfaces plus
+capture live is the netns/TPROXY/SO_ORIGINAL_DST/UDP producer surfaces
+(`src/proxy/host_udp_capture_live_tests.rs`, `src/proxy/udp_placement_migration.rs`) plus
 the HBONE/mesh-runtime/MeshSubscribe/identity/TLS boundaries, backend dispatch,
 TCP relay, route selection, and mesh policy the source-capture e2e tests
 traverse; two-cluster live is mesh/HBONE/identity/SPIRE/east-west plus
@@ -531,7 +532,15 @@ two-cluster only — kernel live tests live in `src/ebpf/loader.rs`, not that
 file. CP-side trust serving (`src/grpc/cp_trust.rs`) stays isolated from all
 three, while `src/grpc/cp_server.rs` schedules netns and two-cluster because it
 owns the default JWT issuer shared by their functional fixture and production
-MeshSubscribe client.
+MeshSubscribe client. The deliberate drops from the old `run_ebpf_live` union —
+`src/k8s_controller/**`, `src/service_discovery/**` (except `mesh.rs`),
+`src/grpc/{mod,cp_trust,cp_trust_health,configsync_lifecycle}.rs`,
+`src/modes/control_plane.rs`, and `src/plugins/prometheus_metrics.rs` — are not
+exercised by any of the three ci.yml live jobs and stay out of their gates;
+they are instead covered by the dedicated live workflows or the always-run
+cargo jobs. The shared `tests/k8s/lib/` Kind/SPIRE harness is likewise not a
+ci.yml live input: `node-waypoint-ebpf-live.yml` owns it through its
+`pull_request.paths` (`tests/k8s/lib/**`) and its scoped planner suite.
 Non-PR events, empty or unavailable diffs, and
 edits to `GATE_CONTROLLER_PATHS` (`pr_ci_plan.py`, `live_suite_path_filter.py`)
 force every gated suite on. Missing/invalid planner outputs fail closed to

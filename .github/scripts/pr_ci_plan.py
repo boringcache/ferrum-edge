@@ -638,6 +638,33 @@ LIVE_SUITE_SHARED_PATTERNS = (
     r"^vendor/",
 )
 
+# Intentionally absent from all three per-suite gates (they were in the old
+# single `run_ebpf_live` union). None of the ci.yml live jobs execute them, so
+# narrowing per issue #3900 re-homes each to the dedicated workflows or leaves
+# it compiler-gated by the always-run cargo jobs:
+# - `src/k8s_controller/`: K8s watch/reconcile; no ci.yml live job boots a
+#   cluster (owned by node-waypoint-ebpf-live / mesh-federation / mesh-e2e-sidecar).
+# - `src/service_discovery/**` except `mesh.rs`: consul/DNS-SD/HTTP discovery
+#   polls; only the `service_discovery/mesh.rs` leg the meshes traverse is kept
+#   in netns + two-cluster.
+# - `src/grpc/{mod,cp_trust,cp_trust_health,configsync_lifecycle}.rs`: CP trust
+#   serving and ConfigSync lifecycle; the three suites exercise the dataplane,
+#   not CP serving (`cp_server.rs` stays for the shared JWT issuer).
+# - `src/modes/control_plane.rs`: CP runtime; not on any of the three datapaths.
+# - `src/plugins/prometheus_metrics.rs`: plugin metric collection; not part of
+#   the live datapath under test.
+# Dockerfile / stage_iproute2_runtime.sh / setup-kubernetes-tools /
+# package-ferrum-runtime-image are already justified by the shared-pattern
+# comment above (the ci.yml jobs cargo-test locally and build no runtime image).
+#
+# `tests/k8s/lib/` (kind.sh, spire.sh, live_assertions.sh,
+# native_probe_classify.py, spire_ambient_metrics.py) is the shared Kind/SPIRE
+# live harness; no ci.yml live job consumes it, so none of the three gates list
+# it. It is owned by node-waypoint-ebpf-live.yml, which gates it both in its
+# `pull_request.paths` (`tests/k8s/lib/**`) and in its trusted planner scoped
+# suite (ci_runtime_plan.py `node-waypoint-ebpf-live` lists `^tests/k8s/lib/`).
+# ambient-host-udp-live.yml's `live_suite_path_filter.py` suite does not list it.
+
 
 def compile_path_patterns(*pattern_groups: tuple[str, ...]) -> list[re.Pattern[str]]:
     return [re.compile(pattern) for group in pattern_groups for pattern in group]
@@ -693,7 +720,7 @@ NETNS_CAPTURE_LIVE_PATTERNS = compile_path_patterns(
         r"^src/service_discovery/mesh\.rs$",
         r"^src/socket_opts\.rs$",
         r"^src/tls/",
-        r"^src/proxy/(?:backend_dispatch|hbone_pool|hbone_proxy|host_udp_capture|mesh_mtls_pool|mesh_tcp_egress|mesh_tcp_inbound|mesh_trust_registry|mesh_udp_capture|mesh_udp_frame|mod|netns_capture|netns_udp_capture|tcp_proxy|udp_batch)\.rs$",
+        r"^src/proxy/(?:backend_dispatch|hbone_pool|hbone_proxy|host_udp_capture|host_udp_capture_live_tests|mesh_mtls_pool|mesh_tcp_egress|mesh_tcp_inbound|mesh_trust_registry|mesh_udp_capture|mesh_udp_frame|mod|netns_capture|netns_udp_capture|tcp_proxy|udp_batch|udp_placement_migration)\.rs$",
         r"^tests/functional/functional_mesh_mode_test\.rs$",
     ),
 )
@@ -1252,6 +1279,24 @@ def self_test() -> int:
         (
             "pull_request",
             ["src/proxy/host_udp_capture.rs"],
+            {
+                "run_ebpf_kernel_live": False,
+                "run_netns_capture_live": True,
+                "run_two_cluster_live": False,
+            },
+        ),
+        (
+            "pull_request",
+            ["src/proxy/host_udp_capture_live_tests.rs"],
+            {
+                "run_ebpf_kernel_live": False,
+                "run_netns_capture_live": True,
+                "run_two_cluster_live": False,
+            },
+        ),
+        (
+            "pull_request",
+            ["src/proxy/udp_placement_migration.rs"],
             {
                 "run_ebpf_kernel_live": False,
                 "run_netns_capture_live": True,
