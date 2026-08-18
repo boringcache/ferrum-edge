@@ -1638,27 +1638,68 @@ def scan_yaml_action_invocations(text: str) -> tuple[list[str], list[str], list[
     return uses, using, errors
 
 
-def _without_yaml_description_prose(text: str) -> str:
-    """Blank plainly spelled `description:` values, keeping every other byte.
+def _is_root_description_key(parsed: re.Match[str], value: str) -> bool:
+    """True only for the root action/workflow metadata `description:`.
 
-    An action or workflow-input `description:` is metadata. GitHub renders it;
-    it is never a program, never a step, and never reaches a JavaScript runtime,
-    so documenting *which* toolkit call the trusted installers refuse to make
-    must not itself read as that call. `setup-sccache/action.yml` is whole-file
-    digest-frozen by the Cross build policy, so the token rule cannot be made to
-    depend on rewording that prose.
+    `description` is metadata *at one schema location*: the document root of an
+    `action.yml` (or a workflow), where GitHub renders it and nothing evaluates
+    it. Everywhere else the same spelling is ordinary data whose value is read
+    by something: `env: {description: ...}` becomes `process.env.description`,
+    `with: {description: ...}` becomes `core.getInput('description')`, and an
+    arbitrary nested mapping can be consumed by any `run:` body that reads the
+    file. A carrier parked in one of those slots can rebuild the forbidden
+    property (`core[process.env.description]`) with no contiguous token left on
+    the line, so only the root key may be withheld from the scan.
+
+    Root means column zero with no compact-sequence dash: a `- description:`
+    item is a sequence entry, not the root mapping. The value must also carry no
+    `&anchor` / `*alias` / `!tag` node property, because an anchored scalar is
+    reachable by alias from an executable slot elsewhere in the document.
+
+    Callers additionally exempt only the *first* such key: an Actions file is a
+    single YAML document with one root mapping, so a second root `description:`
+    is a duplicate key rather than more rendered metadata.
+    """
+
+    if parsed.group("lead") != "" or parsed.group("dash") is not None:
+        return False
+    if parsed.group("key") != "description":
+        return False
+    had_properties, _remainder = _leading_yaml_node_properties(value)
+    return not had_properties
+
+
+def _without_yaml_description_prose(text: str) -> str:
+    """Blank the root `description:` value only, keeping every other byte.
+
+    A document-root action/workflow `description:` is metadata. GitHub renders
+    it; it is never a program, never a step, and never reaches a JavaScript
+    runtime, so documenting *which* toolkit call the trusted installers refuse
+    to make must not itself read as that call. `setup-sccache/action.yml` is
+    whole-file digest-frozen by the Cross build policy, so the token rule cannot
+    be made to depend on rewording that prose, and its one occurrence is exactly
+    that root key.
+
+    Nested `description:` keys — action inputs, `workflow_dispatch` inputs, step
+    mappings, `env:`, `with:`, or any other mapping — are *not* exempt. See
+    `_is_root_description_key`: those values are action-consumed data, not
+    rendered prose, and stripping them would let a carrier build the forbidden
+    property indirectly.
 
     The walk uses the same block-scalar discipline as `_scan_yaml_actions`: a
     `run:` (or any non-description) block-scalar body is stepped over without
     being read, so a `description:`-shaped line *inside* a shell body cannot
-    blank the lines after it. Only a real description's own scalar and body are
-    blanked, only for the unquoted, unaliased, untagged spelling, and a body
-    that cannot be delimited is left in place — so the transform can only ever
-    remove documented prose, never an executable or structural slot.
+    blank the lines after it. Only the root description's own scalar and its
+    correctly delimited block body are blanked, only for the unquoted,
+    unaliased, untagged spelling, and a body that cannot be delimited is left in
+    place — so the transform can only ever remove root-rendered prose, never an
+    executable or structural slot. Exactly one root `description:` is exempted
+    per document; a second is a duplicate key and stays scanned.
     """
 
     lines = text.splitlines()
     index = 0
+    exempted_root = False
     while index < len(lines):
         line = lines[index]
         stripped = line.lstrip(" \t")
@@ -1677,7 +1718,8 @@ def _without_yaml_description_prose(text: str) -> str:
             continue
         key_indent = _yaml_mapping_key_indent(parsed)
         value = _yaml_strip_trailing_comment(parsed.group("value")).strip()
-        prose = parsed.group("key") == "description"
+        prose = not exempted_root and _is_root_description_key(parsed, value)
+        exempted_root = exempted_root or prose
         if prose:
             lines[index] = line[: parsed.start("value")]
         index += 1
@@ -1709,10 +1751,12 @@ def check_no_sccache_credential_exporter(
     require(
         # Defense in depth: the contiguous token is insufficient against
         # computed property forms. The allowlist/shell-only checks are the gate.
-        # Scanned over everything except `description:` prose, so the rule stays
-        # a superset of PR #3958's invocation-shaped match on every executable
-        # and structural slot while the frozen installers can still document the
-        # credential boundary they enforce.
+        # Scanned over everything except the document-root `description:`
+        # metadata value, so the rule stays a superset of PR #3958's
+        # invocation-shaped match on every executable, data, and structural slot
+        # while the frozen installers can still document the credential boundary
+        # they enforce. Nested `description:` keys (inputs, `env:`, `with:`, any
+        # other mapping) are action-consumed data and remain scanned.
         SCCACHE_EXPORT_VARIABLE_TOKEN not in _without_yaml_description_prose(text),
         f"{source} must not contain {SCCACHE_EXPORT_VARIABLE_TOKEN} "
         "(ACTIONS_RUNTIME_TOKEN leak)",
@@ -5376,15 +5420,40 @@ def self_test() -> int:
 
     # The checked-in installer documents the exact toolkit call it refuses to
     # make, and the Cross build policy freezes that file whole, so the token
-    # rule has to read `description:` as prose. Assert the real file still
-    # exercises the carve-out; a silent reword would make it vacuous.
+    # rule has to read the *root* `description:` as prose. Assert the real file
+    # still exercises the carve-out at exactly that one location; a silent
+    # reword would make it vacuous, and a nested occurrence would mean the
+    # frozen file now depends on an exemption the transform does not grant.
     require(
         SCCACHE_EXPORT_VARIABLE_TOKEN in real_sccache,
         "self-test: setup-sccache description must still document the "
         f"{SCCACHE_EXPORT_VARIABLE_TOKEN} boundary it refuses",
         failures,
     )
+    # The root `description:` key at column zero plus every line of its block
+    # body (indented, or blank). Nothing else in the file is exempt, so every
+    # occurrence of the token has to fall inside this span.
+    root_description_block = re.search(
+        r"(?m)^description:[^\n]*\n(?:(?:[ \t]+[^\n]*)?\n)*",
+        real_sccache,
+    )
+    root_description_hits = (
+        0
+        if root_description_block is None
+        else root_description_block.group(0).count(SCCACHE_EXPORT_VARIABLE_TOKEN)
+    )
+    require(
+        root_description_hits > 0
+        and root_description_hits
+        == real_sccache.count(SCCACHE_EXPORT_VARIABLE_TOKEN),
+        "self-test: every setup-sccache "
+        f"{SCCACHE_EXPORT_VARIABLE_TOKEN} occurrence must live in the root "
+        "description block; nested description keys are scanned, not exempt",
+        failures,
+    )
 
+    # Only the document-root metadata `description:` is withheld from the scan:
+    # its plain scalar and its correctly delimited block body.
     description_prose_shapes = (
         "description: >-\n"
         "  Does not invoke an installer that `core.exportVariable`s\n"
@@ -5395,12 +5464,9 @@ def self_test() -> int:
         "  core.exportVariable('ACTIONS_RUNTIME_TOKEN', token) is refused.\n"
         "runs:\n"
         "  using: composite\n",
-        "inputs:\n"
-        "  version:\n"
-        "    description: rejected because it would exportVariable the token\n",
-        "      - name: documented step\n"
-        "        description: core[\"exportVariable\"] is never reached\n"
-        "        run: echo ok\n",
+        "description: core.exportVariable is documented, never invoked\n"
+        "runs:\n"
+        "  using: composite\n",
     )
     for index, sample in enumerate(description_prose_shapes):
         prose_failures: list[str] = []
@@ -5411,14 +5477,15 @@ def self_test() -> int:
         )
         require(
             not prose_failures,
-            f"self-test: description prose must not trip the token rule: "
+            f"self-test: root description prose must not trip the token rule: "
             f"{sample!r}: " + "; ".join(prose_failures),
             failures,
         )
 
-    # The carve-out is the description value only. A carrier in any executable
-    # or structural slot beside it, including a sibling of the same description,
-    # must still fail.
+    # The carve-out is the root description value only. A carrier in any
+    # executable, data, or structural slot beside it — including a nested
+    # `description` key of any depth, which is action-consumed data rather than
+    # rendered metadata — must still fail.
     description_adjacent_carriers = (
         "description: >-\n"
         "  Refuses core.exportVariable installers.\n"
@@ -5448,6 +5515,55 @@ def self_test() -> int:
         "  - |\n"
         "    description: |\n"
         "      core.exportVariable('ACTIONS_RUNTIME_TOKEN', t)\n",
+        # An action input `description` is `core.getInput('description')` to any
+        # JavaScript step in the same job, not rendered prose.
+        "inputs:\n"
+        "  version:\n"
+        "    description: rejected because it would exportVariable the token\n",
+        # Step-level compact-sequence `description` is an ordinary step key.
+        "      - name: documented step\n"
+        "        description: core[\"exportVariable\"] is never reached\n"
+        "        run: echo ok\n",
+        # A root-column sequence item is a sequence entry, not the root mapping.
+        "- description: core.exportVariable('ACTIONS_RUNTIME_TOKEN', t)\n",
+        # Arbitrary nested mapping: nothing marks this as rendered metadata.
+        "metadata:\n"
+        "  annotations:\n"
+        "    description: core.exportVariable('ACTIONS_RUNTIME_TOKEN', t)\n",
+        # Carrier construction through `env:`: the `run:` body never spells the
+        # property contiguously, it reads it out of the environment value. If
+        # `env.description` were blanked the whole leak would be invisible.
+        "runs:\n"
+        "  using: composite\n"
+        "  steps:\n"
+        "    - shell: bash\n"
+        "      env:\n"
+        "        description: exportVariable\n"
+        "      run: node -e "
+        "'core[process.env.description](\"ACTIONS_RUNTIME_TOKEN\", t)'\n",
+        # Same construction through a nested action's `with:` input.
+        "runs:\n"
+        "  using: composite\n"
+        "  steps:\n"
+        "    - uses: actions/github-script@v7\n"
+        "      with:\n"
+        "        description: exportVariable\n"
+        "        script: core[core.getInput('description')]('X', t)\n",
+        # An anchored root description is reachable by alias from an executable
+        # slot, so the node property disqualifies the carve-out.
+        "description: &leak exportVariable\n"
+        "runs:\n"
+        "  using: composite\n",
+        # Same for a tagged root description.
+        "description: !!str exportVariable\n"
+        "runs:\n"
+        "  using: composite\n",
+        # One root mapping means one root `description:`. A second is a
+        # duplicate key, not more rendered metadata, so it stays scanned.
+        "description: rendered metadata\n"
+        "description: exportVariable\n"
+        "runs:\n"
+        "  using: composite\n",
     )
     for index, sample in enumerate(description_adjacent_carriers):
         adjacent_failures: list[str] = []
@@ -5461,7 +5577,7 @@ def self_test() -> int:
                 "must not contain exportVariable" in item
                 for item in adjacent_failures
             ),
-            f"self-test: a carrier outside description prose must fail: "
+            f"self-test: a carrier outside root description prose must fail: "
             f"{sample!r}",
             failures,
         )

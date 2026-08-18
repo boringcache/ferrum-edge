@@ -456,12 +456,24 @@ rejected fail-closed rather than treated as an absence of invocations.
 The contiguous
 `exportVariable` token deny remains defense in depth; it does not catch
 computed property forms such as `core["export" + "Variable"]` on its own.
-It is scanned over every slot except `description:` prose, which GitHub renders
-and never evaluates: `setup-sccache/action.yml` is whole-file digest-frozen by
-the Cross build policy, so the installer that enforces the credential boundary
-has to stay free to document the toolkit call it refuses. That carve-out is the
-description value alone — a `description:`-shaped line inside a `run:` body is
-stepped over as shell, and quoted or suffixed key spellings keep the full scan.
+It is scanned over every slot except the **document-root** `description:`
+metadata value, which GitHub renders and never evaluates:
+`setup-sccache/action.yml` is whole-file digest-frozen by the Cross build
+policy, so the installer that enforces the credential boundary has to stay free
+to document the toolkit call it refuses. The carve-out is that one key at
+column zero — its plain scalar plus its correctly delimited block body — and
+nothing else. Nested `description:` keys are **not** exempt: an action or
+`workflow_dispatch` input description is `core.getInput('description')`, an
+`env:`/`with:` entry is `process.env.description`, and any other nested mapping
+is data some `run:` body can read, so a carrier parked there could rebuild the
+forbidden property (`core[process.env.description]`) with no contiguous token
+left on the line. A root `description:` carrying an `&anchor`, `*alias`, or
+`!tag` is scanned too, because an anchored scalar is reachable by alias from an
+executable slot, and only the first root `description:` is exempted because a
+second one is a duplicate key rather than more rendered metadata. A
+`description:`-shaped line inside a `run:` body is stepped
+over as shell, a `- description:` item is a sequence entry rather than the root
+mapping, and quoted or suffixed key spellings keep the full scan.
 
 `node-waypoint-ebpf-live.yml` path-filtered `pull_request.paths` must be a
 **trigger superset** of every `production-dockerfile-smoke` sensitive input in
