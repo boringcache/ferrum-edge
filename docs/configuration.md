@@ -1164,9 +1164,6 @@ proxies:
     # Connection pooling settings (optional - override global defaults)
     pool_idle_timeout_seconds: 120
     auth_mode: single
-    plugins:
-      - plugin_config_id: "log-plugin"
-      - plugin_config_id: "key-auth"
 
 consumers:
   - id: "user-1"
@@ -1177,6 +1174,7 @@ consumers:
         - key: "alice-rotated-key"
 
 plugin_configs:
+  # Global plugins apply automatically; do not attach them under a proxy.
   - id: "log-plugin"
     plugin_name: "stdout_logging"
     config: {}
