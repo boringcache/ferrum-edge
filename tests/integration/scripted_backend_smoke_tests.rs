@@ -14,10 +14,12 @@ use crate::scaffolding::backends::{
 use crate::scaffolding::certs::TestCa;
 use crate::scaffolding::clients::Http1Client;
 use crate::scaffolding::file_mode_yaml_for_backend;
+use crate::scaffolding::file_mode_yaml_for_backend_with;
 use crate::scaffolding::harness::GatewayHarness;
-use crate::scaffolding::ports::reserve_port;
+use crate::scaffolding::ports::{reserve_port, unbound_port};
+use serde_json::json;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 
@@ -1089,5 +1091,127 @@ async fn in_process_pool_warmup_helper_wins_over_earlier_env_call() {
         entry_count, 0,
         "pool_warmup_enabled(false) must win over earlier .env(...) — \
          backend-capabilities snapshot was {snapshot:?}",
+    );
+}
+
+fn gateway_error_header(resp: &crate::scaffolding::ClientResponse) -> Option<&str> {
+    resp.headers
+        .get("x-gateway-error")
+        .and_then(|v| v.to_str().ok())
+}
+
+// #3922: a backend that accepts then stalls before headers must 504 with a
+// timeout-specific public classification, not the same 502 / backend_error /
+// "Backend unavailable" pair a down backend uses.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn in_process_backend_read_timeout_maps_to_504_backend_timeout() {
+    let reservation = reserve_port().await.expect("reserve port");
+    let backend_port = reservation.port;
+    let _backend = ScriptedHttp1Backend::builder(reservation.into_listener())
+        .step(HttpStep::ExpectRequest(RequestMatcher::any()))
+        .step(HttpStep::Sleep(Duration::from_secs(30)))
+        .spawn()
+        .expect("spawn");
+
+    let read_timeout_ms: u64 = 800;
+    let yaml = file_mode_yaml_for_backend_with(
+        backend_port,
+        json!({ "backend_read_timeout_ms": read_timeout_ms }),
+    );
+    let harness = GatewayHarness::builder()
+        .mode_in_process()
+        .file_config(yaml)
+        .spawn()
+        .await
+        .expect("spawn gateway");
+
+    let client = harness.http_client().expect("client");
+    let started = Instant::now();
+    let resp = client
+        .get(&harness.proxy_url("/api/slow"))
+        .await
+        .expect("response");
+    let elapsed = started.elapsed();
+
+    assert_eq!(
+        resp.status,
+        reqwest::StatusCode::GATEWAY_TIMEOUT,
+        "live backend read timeout must be 504, got {} body={}",
+        resp.status,
+        resp.body_text()
+    );
+    assert_eq!(
+        gateway_error_header(&resp),
+        Some("backend_timeout"),
+        "timeout must not share X-Gateway-Error=backend_error with a 5xx backend"
+    );
+    assert_eq!(
+        resp.body_text(),
+        r#"{"error":"Backend timeout"}"#,
+        "timeout body must be timeout-specific"
+    );
+
+    let expected = Duration::from_millis(read_timeout_ms);
+    let floor = expected.saturating_sub(Duration::from_millis(200));
+    let ceiling = expected + Duration::from_millis(1500);
+    assert!(
+        elapsed >= floor,
+        "timed out too fast: {elapsed:?} < floor {floor:?}"
+    );
+    assert!(
+        elapsed <= ceiling,
+        "timed out too slowly: {elapsed:?} > ceiling {ceiling:?}"
+    );
+}
+
+// Companion of the timeout test: a port with nothing listening stays 502 with
+// the pre-wire connection_failure classification.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn in_process_backend_refused_stays_502_connection_failure() {
+    const MAX_ATTEMPTS: u32 = 5;
+    let mut last_failure: Option<String> = None;
+    for attempt in 1..=MAX_ATTEMPTS {
+        let backend_port = unbound_port().await.expect("unbound port");
+        let yaml = file_mode_yaml_for_backend(backend_port);
+        let harness = GatewayHarness::builder()
+            .mode_in_process()
+            .file_config(yaml)
+            .spawn()
+            .await
+            .expect("spawn gateway");
+
+        let client = harness.http_client().expect("client");
+        let resp = client
+            .get(&harness.proxy_url("/api/anything"))
+            .await
+            .expect("gateway returns a response");
+        if resp.status != reqwest::StatusCode::BAD_GATEWAY {
+            last_failure = Some(format!(
+                "attempt {attempt}/{MAX_ATTEMPTS}: expected 502, got {} body={}",
+                resp.status,
+                resp.body_text()
+            ));
+            continue;
+        }
+        if gateway_error_header(&resp) != Some("connection_failure") {
+            last_failure = Some(format!(
+                "attempt {attempt}/{MAX_ATTEMPTS}: expected X-Gateway-Error=connection_failure, got {:?} body={}",
+                gateway_error_header(&resp),
+                resp.body_text()
+            ));
+            continue;
+        }
+        if resp.body_text() != r#"{"error":"Backend unavailable"}"# {
+            last_failure = Some(format!(
+                "attempt {attempt}/{MAX_ATTEMPTS}: expected Backend unavailable body, got {}",
+                resp.body_text()
+            ));
+            continue;
+        }
+        return;
+    }
+    panic!(
+        "in-process refused-connect test failed across {MAX_ATTEMPTS} attempts; last failure: {}",
+        last_failure.unwrap_or_else(|| "unknown".into())
     );
 }

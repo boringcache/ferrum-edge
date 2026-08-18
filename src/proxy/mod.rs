@@ -3286,21 +3286,12 @@ fn http2_pool_sender_error_response(
     if matches!(h2_error_class, retry::ErrorClass::PortExhaustion) {
         state.overload.record_port_exhaustion();
     }
-    let error_body = r#"{"error":"Backend unavailable"}"#.to_string();
     error!(proxy_id = %proxy.id, error = %msg, "HTTP/2 pool connection failed");
-    retry::BackendResponse {
-        status_code: 502,
-        body: ResponseBody::buffered(error_body.into_bytes()),
-        headers: HashMap::new(),
-        // Derive connection_error from the class so a gateway-side egress denial
-        // (DispatchPolicyRejected — a hostname/dns_override that resolves or
-        // rebinds to a blocked IP) is non-retryable and neutral to backend
-        // health: request_reached_wire(DispatchPolicyRejected) is true, so this
-        // is false (no backend was dialed) instead of a hard-coded connect error.
-        connection_error: !retry::request_reached_wire(h2_error_class),
-        backend_resolved_ip: resolved_ip,
-        error_class: Some(h2_error_class),
-    }
+    // Derive status/body/connection_error from the class so a gateway-side
+    // egress denial (DispatchPolicyRejected) stays non-retryable and
+    // backend-health-neutral, and a post-wire read/write timeout (#3922)
+    // surfaces as 504 rather than a generic 502.
+    http_backend_dispatch_error_response(h2_error_class, resolved_ip)
 }
 
 /// Map a direct-H2 pooled `send_request` hyper error into a
@@ -3334,14 +3325,7 @@ pub(crate) fn direct_h2_send_request_error_response_for_class(
     error_class: retry::ErrorClass,
     resolved_ip: Option<String>,
 ) -> retry::BackendResponse {
-    retry::BackendResponse {
-        status_code: 502,
-        body: ResponseBody::buffered(r#"{"error":"Backend unavailable"}"#.as_bytes().to_vec()),
-        headers: HashMap::new(),
-        connection_error: !retry::request_reached_wire(error_class),
-        backend_resolved_ip: resolved_ip,
-        error_class: Some(error_class),
-    }
+    http_backend_dispatch_error_response(error_class, resolved_ip)
 }
 
 fn backend_tls_sni_requires_direct_h2_response(
@@ -39147,12 +39131,14 @@ pub(crate) async fn proxy_to_backend_retry(
             if error_class == retry::ErrorClass::PortExhaustion {
                 state.overload.record_port_exhaustion();
             }
-            // Drive `error_kind` and `connection_error` from `ErrorClass`
-            // (see comment on the corresponding initial-attempt branch in
-            // `proxy_to_backend`). Critically: a connect-class failure on
-            // the retry path must still report `connection_error=true` so
-            // the retry loop sees it and gives `retry_on_connect_failure`
-            // another chance against the next upstream target.
+            // Drive `error_kind`, status, body, and `connection_error` from
+            // `ErrorClass` (see comment on the corresponding initial-attempt
+            // branch in `proxy_to_backend`). Critically: a connect-class
+            // failure on the retry path must still report
+            // `connection_error=true` so the retry loop sees it and gives
+            // `retry_on_connect_failure` another chance against the next
+            // upstream target. A post-wire read/write timeout is 504, not a
+            // generic 502 (#3922).
             let error_kind = retry::error_class_log_kind(error_class);
             error!(
                 proxy_id = %proxy.id,
@@ -39161,15 +39147,7 @@ pub(crate) async fn proxy_to_backend_retry(
                 error = %e,
                 "Backend retry request failed"
             );
-            let error_body = r#"{"error":"Backend unavailable"}"#;
-            retry::BackendResponse {
-                status_code: 502,
-                body: ResponseBody::buffered(error_body.as_bytes().to_vec()),
-                headers: HashMap::new(),
-                connection_error: !retry::request_reached_wire(error_class),
-                backend_resolved_ip: resolved_ip.clone(),
-                error_class: Some(error_class),
-            }
+            http_backend_dispatch_error_response(error_class, resolved_ip.clone())
         }
     }
 }
@@ -40159,6 +40137,48 @@ fn buffered_backend_response_from_eager_collect(
     }
 }
 
+/// Client-visible HTTP status + redacted JSON body for a classified
+/// HTTP-family backend dispatch failure (#3922).
+///
+/// Post-wire `ReadWriteTimeout` (`backend_read_timeout_ms` /
+/// `backend_write_timeout_ms` expiry after the request reached the backend)
+/// is 504 with a timeout-specific body. Genuine connect/refused/unavailable
+/// failures stay 502 with the generic unavailable body. Path-specific
+/// overlays (DNS wording, H3 "request failed") may replace the 502 body;
+/// they must not override the 504 timeout pair.
+///
+/// gRPC keeps its protocol-appropriate Trailers-Only / `DEADLINE_EXCEEDED`
+/// shape and does not use this mapper.
+pub(crate) fn http_backend_failure_status_and_body(
+    class: retry::ErrorClass,
+) -> (u16, &'static str) {
+    if class == retry::ErrorClass::ReadWriteTimeout {
+        (504, r#"{"error":"Backend timeout"}"#)
+    } else {
+        (502, r#"{"error":"Backend unavailable"}"#)
+    }
+}
+
+/// Build the HTTP-family [`retry::BackendResponse`] for a classified
+/// dispatch failure. `connection_error` is derived solely from
+/// `!request_reached_wire(class)` so retry / circuit-breaker semantics
+/// cannot drift from the taxonomy: a post-wire read/write timeout is
+/// never a connect failure.
+pub(crate) fn http_backend_dispatch_error_response(
+    error_class: retry::ErrorClass,
+    resolved_ip: Option<String>,
+) -> retry::BackendResponse {
+    let (status_code, body) = http_backend_failure_status_and_body(error_class);
+    retry::BackendResponse {
+        status_code,
+        body: ResponseBody::buffered(body.as_bytes().to_vec()),
+        headers: HashMap::new(),
+        connection_error: !retry::request_reached_wire(error_class),
+        backend_resolved_ip: resolved_ip,
+        error_class: Some(error_class),
+    }
+}
+
 /// Status + `ErrorClass` for a reqwest body-read failure on an eager-buffering
 /// path, given the classifier's verdict for the underlying error (#2953).
 ///
@@ -40187,18 +40207,19 @@ pub(crate) fn eager_buffer_body_read_status_and_class(
     if !retry::request_reached_wire(class) {
         return (502, retry::ErrorClass::ConnectionReset);
     }
-    if class == retry::ErrorClass::ReadWriteTimeout {
-        return (504, class);
-    }
-    (502, class)
+    let (status, _) = http_backend_failure_status_and_body(class);
+    (status, class)
 }
 
 /// Error body paired with [`eager_buffer_body_read_status_and_class`]. The 504
-/// wording matches the direct-H2 read-timeout arm so operators see one string
+/// wording matches the dispatch-level timeout arm so operators see one string
 /// per fault regardless of transport.
-fn eager_buffer_body_read_error_body(status_code: u16) -> Vec<u8> {
+pub(crate) fn eager_buffer_body_read_error_body(status_code: u16) -> Vec<u8> {
     if status_code == 504 {
-        r#"{"error":"Backend timeout"}"#.as_bytes().to_vec()
+        http_backend_failure_status_and_body(retry::ErrorClass::ReadWriteTimeout)
+            .1
+            .as_bytes()
+            .to_vec()
     } else {
         r#"{"error":"Backend response body read failed"}"#.as_bytes().to_vec()
     }
@@ -42983,15 +43004,17 @@ async fn proxy_to_backend(
             if error_class == retry::ErrorClass::PortExhaustion {
                 state.overload.record_port_exhaustion();
             }
-            // Drive `error_kind` and `connection_error` from the same
-            // `ErrorClass` rather than re-deriving them from
+            // Drive `error_kind`, status, body, and `connection_error` from
+            // the same `ErrorClass` rather than re-deriving them from
             // `e.is_connect()` / `e.is_timeout()`. The reqwest predicates
             // miss TLS-handshake failures, DNS lookup errors that don't
             // surface as `is_connect()` (e.g. cached failures), and port
             // exhaustion — every transport-class failure must funnel
             // through `retry::request_reached_wire` so
             // `retry_on_connect_failure` fires consistently across reqwest,
-            // direct H2, gRPC, and H3 paths.
+            // direct H2, gRPC, and H3 paths. Post-wire read/write deadline
+            // expiry is 504 with a timeout-specific body (#3922); genuine
+            // connect/refused failures stay 502.
             let error_kind = retry::error_class_log_kind(error_class);
             error!(
                 proxy_id = %proxy.id,
@@ -43000,15 +43023,7 @@ async fn proxy_to_backend(
                 error = %e,
                 "Backend request failed"
             );
-            let error_body = r#"{"error":"Backend unavailable"}"#;
-            retry::BackendResponse {
-                status_code: 502,
-                body: ResponseBody::buffered(error_body.as_bytes().to_vec()),
-                headers: HashMap::new(),
-                connection_error: !retry::request_reached_wire(error_class),
-                backend_resolved_ip: resolved_ip.clone(),
-                error_class: Some(error_class),
-            }
+            http_backend_dispatch_error_response(error_class, resolved_ip.clone())
         }
     };
 
@@ -46196,16 +46211,10 @@ async fn proxy_to_backend_hbone_after_ready(
                     proxy.backend_read_timeout_ms
                 );
                 return (
-                    retry::BackendResponse {
-                        status_code: 504,
-                        body: ResponseBody::buffered(
-                            r#"{"error":"Backend timeout"}"#.as_bytes().to_vec(),
-                        ),
-                        headers: HashMap::new(),
-                        connection_error: false,
-                        backend_resolved_ip: resolved_ip,
-                        error_class: Some(retry::ErrorClass::ReadWriteTimeout),
-                    },
+                    http_backend_dispatch_error_response(
+                        retry::ErrorClass::ReadWriteTimeout,
+                        resolved_ip,
+                    ),
                     None,
                     None,
                 );
@@ -46352,16 +46361,10 @@ async fn proxy_to_backend_hbone_after_ready(
                     "HBONE backend response body read timed out"
                 );
                 return (
-                    retry::BackendResponse {
-                        status_code: 504,
-                        body: ResponseBody::buffered(
-                            r#"{"error":"Backend timeout"}"#.as_bytes().to_vec(),
-                        ),
-                        headers: HashMap::new(),
-                        connection_error: false,
-                        backend_resolved_ip: resolved_ip,
-                        error_class: Some(retry::ErrorClass::ReadWriteTimeout),
-                    },
+                    http_backend_dispatch_error_response(
+                        retry::ErrorClass::ReadWriteTimeout,
+                        resolved_ip,
+                    ),
                     None,
                     None,
                 );
@@ -46906,16 +46909,10 @@ async fn proxy_to_backend_unix(
                         // exchange leaves the connection in an unknown framing
                         // state and must never be reused.
                         return (
-                            retry::BackendResponse {
-                                status_code: 504,
-                                body: ResponseBody::buffered(
-                                    r#"{"error":"Backend timeout"}"#.as_bytes().to_vec(),
-                                ),
-                                headers: HashMap::new(),
-                                connection_error: false,
-                                backend_resolved_ip: resolved_ip,
-                                error_class: Some(retry::ErrorClass::ReadWriteTimeout),
-                            },
+                            http_backend_dispatch_error_response(
+                                retry::ErrorClass::ReadWriteTimeout,
+                                resolved_ip,
+                            ),
                             None,
                             None,
                         );
@@ -47167,16 +47164,10 @@ async fn proxy_to_backend_unix(
                     "Unix backend response body read timed out"
                 );
                 return (
-                    retry::BackendResponse {
-                        status_code: 504,
-                        body: ResponseBody::buffered(
-                            r#"{"error":"Backend timeout"}"#.as_bytes().to_vec(),
-                        ),
-                        headers: HashMap::new(),
-                        connection_error: false,
-                        backend_resolved_ip: resolved_ip,
-                        error_class: Some(retry::ErrorClass::ReadWriteTimeout),
-                    },
+                    http_backend_dispatch_error_response(
+                        retry::ErrorClass::ReadWriteTimeout,
+                        resolved_ip,
+                    ),
                     None,
                     None,
                 );
@@ -48440,16 +48431,10 @@ async fn proxy_to_backend_mesh_mtls_after_ready(
                     );
                 }
                 return (
-                    retry::BackendResponse {
-                        status_code: 504,
-                        body: ResponseBody::buffered(
-                            r#"{"error":"Backend timeout"}"#.as_bytes().to_vec(),
-                        ),
-                        headers: HashMap::new(),
-                        connection_error: false,
-                        backend_resolved_ip: resolved_ip,
-                        error_class: Some(retry::ErrorClass::ReadWriteTimeout),
-                    },
+                    http_backend_dispatch_error_response(
+                        retry::ErrorClass::ReadWriteTimeout,
+                        resolved_ip,
+                    ),
                     None,
                     None,
                 );
@@ -48725,16 +48710,10 @@ async fn proxy_to_backend_mesh_mtls_after_ready(
                     );
                 }
                 return (
-                    retry::BackendResponse {
-                        status_code: 504,
-                        body: ResponseBody::buffered(
-                            r#"{"error":"Backend timeout"}"#.as_bytes().to_vec(),
-                        ),
-                        headers: HashMap::new(),
-                        connection_error: false,
-                        backend_resolved_ip: resolved_ip,
-                        error_class: Some(retry::ErrorClass::ReadWriteTimeout),
-                    },
+                    http_backend_dispatch_error_response(
+                        retry::ErrorClass::ReadWriteTimeout,
+                        resolved_ip,
+                    ),
                     None,
                     None,
                 );
@@ -49326,18 +49305,10 @@ async fn proxy_to_backend_http2(
                             proxy.backend_read_timeout_ms
                         );
                         return (
-                            retry::BackendResponse {
-                                status_code: 504,
-                                body: ResponseBody::buffered(
-                                    r#"{"error":"Backend timeout"}"#.as_bytes().to_vec(),
-                                ),
-                                headers: HashMap::new(),
-                                // The request reached the H2 sender; this is a
-                                // response-read failure, not a connect failure.
-                                connection_error: false,
-                                backend_resolved_ip: resolved_ip,
-                                error_class: Some(retry::ErrorClass::ReadWriteTimeout),
-                            },
+                            http_backend_dispatch_error_response(
+                                retry::ErrorClass::ReadWriteTimeout,
+                                resolved_ip,
+                            ),
                             None,
                         );
                     }
@@ -49675,16 +49646,10 @@ async fn proxy_to_backend_http2(
                     "HTTP/2 backend response body read timed out"
                 );
                 return (
-                    retry::BackendResponse {
-                        status_code: 504,
-                        body: ResponseBody::buffered(
-                            r#"{"error":"Backend timeout"}"#.as_bytes().to_vec(),
-                        ),
-                        headers: HashMap::new(),
-                        connection_error: false,
-                        backend_resolved_ip: resolved_ip,
-                        error_class: Some(retry::ErrorClass::ReadWriteTimeout),
-                    },
+                    http_backend_dispatch_error_response(
+                        retry::ErrorClass::ReadWriteTimeout,
+                        resolved_ip,
+                    ),
                     None,
                 );
             }
@@ -51009,14 +50974,7 @@ pub(crate) fn declared_response_length_exceeds_limit(
 /// `retry_on_connect_failure` must not replay it; retries are governed by
 /// `retry_on_methods` / `retryable_status_codes`.
 fn h3_read_timeout_backend_response(resolved_ip: Option<String>) -> retry::BackendResponse {
-    retry::BackendResponse {
-        status_code: 504,
-        body: ResponseBody::buffered(r#"{"error":"Backend timeout"}"#.as_bytes().to_vec()),
-        headers: HashMap::new(),
-        connection_error: false,
-        backend_resolved_ip: resolved_ip,
-        error_class: Some(retry::ErrorClass::ReadWriteTimeout),
-    }
+    http_backend_dispatch_error_response(retry::ErrorClass::ReadWriteTimeout, resolved_ip)
 }
 
 /// Replay a saved HTTP/3 request to an explicit target (used during retries).

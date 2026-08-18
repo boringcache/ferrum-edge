@@ -1556,6 +1556,15 @@ fn test_direct_h2_send_request_error_response_maintains_wire_boundary() {
             !ferrum_edge::retry::request_reached_wire(class),
             "{class:?}: connection_error must equal !request_reached_wire"
         );
+        let expected_status = if class == ErrorClass::ReadWriteTimeout {
+            504
+        } else {
+            502
+        };
+        assert_eq!(
+            resp.status_code, expected_status,
+            "{class:?}: HTTP-family dispatch must map read/write timeout to 504 and everything else to 502"
+        );
     }
 }
 
@@ -1756,6 +1765,133 @@ fn test_eager_buffer_body_read_never_reports_a_pre_wire_class() {
         let (_, mapped) = classify(class);
         assert!(request_reached_wire(mapped), "{class:?} -> {mapped:?}");
     }
+}
+
+#[test]
+fn test_http_backend_dispatch_maps_read_write_timeout_to_504_timeout_body() {
+    // #3922: a live `backend_read_timeout_ms` / `backend_write_timeout_ms`
+    // expiry classifies as `ReadWriteTimeout` (the log line already said
+    // `error_kind=read_timeout`) but the reqwest dispatch path used to flatten
+    // it to 502 / `backend_error` / `{"error":"Backend unavailable"}`. The
+    // shared mapper is the single HTTP-family status+body boundary.
+    use ferrum_edge::_test_support::http_backend_dispatch_error_response_for_test as map;
+    use ferrum_edge::_test_support::http_backend_failure_status_and_body_for_test as status_body;
+    use ferrum_edge::retry::request_reached_wire;
+
+    let (status, body) = status_body(ErrorClass::ReadWriteTimeout);
+    assert_eq!(status, 504);
+    assert_eq!(body, r#"{"error":"Backend timeout"}"#);
+
+    let resp = map(ErrorClass::ReadWriteTimeout, Some("127.0.0.1".into()));
+    assert_eq!(resp.status_code, 504);
+    assert_eq!(
+        resp.body_bytes(),
+        br#"{"error":"Backend timeout"}"#,
+        "timeout body must be timeout-specific, not Backend unavailable"
+    );
+    assert!(
+        !resp.connection_error,
+        "post-wire read/write timeout must not look like a connect failure"
+    );
+    assert_eq!(resp.error_class, Some(ErrorClass::ReadWriteTimeout));
+    assert!(request_reached_wire(ErrorClass::ReadWriteTimeout));
+    assert_eq!(
+        resp.connection_error,
+        !request_reached_wire(ErrorClass::ReadWriteTimeout)
+    );
+}
+
+#[test]
+fn test_http_backend_dispatch_keeps_connect_refused_as_502_unavailable() {
+    // Connection-refused / connect-timeout / DNS / TLS stay 502 with the
+    // generic unavailable body and `connection_error=true` so retry and
+    // `X-Gateway-Error: connection_failure` keep their pre-wire meaning.
+    use ferrum_edge::_test_support::http_backend_dispatch_error_response_for_test as map;
+    use ferrum_edge::retry::request_reached_wire;
+
+    for class in [
+        ErrorClass::ConnectionRefused,
+        ErrorClass::ConnectionTimeout,
+        ErrorClass::DnsLookupError,
+        ErrorClass::TlsError,
+        ErrorClass::ConnectionPoolError,
+        ErrorClass::PortExhaustion,
+    ] {
+        let resp = map(class, None);
+        assert_eq!(resp.status_code, 502, "{class:?} stays 502");
+        assert_eq!(
+            resp.body_bytes(),
+            br#"{"error":"Backend unavailable"}"#,
+            "{class:?} keeps the generic unavailable body"
+        );
+        assert!(
+            resp.connection_error,
+            "{class:?} is pre-wire and must set connection_error"
+        );
+        assert_eq!(resp.error_class, Some(class));
+        assert!(!request_reached_wire(class), "{class:?} is pre-wire");
+    }
+}
+
+#[test]
+fn test_http_backend_dispatch_keeps_other_post_wire_failures_as_502() {
+    use ferrum_edge::_test_support::http_backend_dispatch_error_response_for_test as map;
+    use ferrum_edge::retry::request_reached_wire;
+
+    for class in [
+        ErrorClass::ConnectionReset,
+        ErrorClass::ConnectionClosed,
+        ErrorClass::ProtocolError,
+        ErrorClass::RequestError,
+        ErrorClass::GracefulRemoteClose,
+    ] {
+        let resp = map(class, None);
+        assert_eq!(resp.status_code, 502, "{class:?} stays 502");
+        assert_eq!(
+            resp.body_bytes(),
+            br#"{"error":"Backend unavailable"}"#,
+            "{class:?} keeps the generic unavailable body"
+        );
+        assert!(
+            !resp.connection_error,
+            "{class:?} is post-wire and must not set connection_error"
+        );
+        assert!(request_reached_wire(class), "{class:?} is post-wire");
+    }
+}
+
+#[test]
+fn test_http_family_dispatch_sites_use_shared_timeout_mapper() {
+    // #3922: the live reqwest send-error arms (initial + retry) and the H3
+    // cross-protocol reqwest bridge must not hard-code 502 / "Backend
+    // unavailable" after classifying a timeout. They funnel through the
+    // shared mapper so a future edit cannot reintroduce a one-off status.
+    let proxy = include_str!("../../../src/proxy/mod.rs");
+    assert!(
+        proxy.contains("http_backend_dispatch_error_response(error_class, resolved_ip.clone())"),
+        "reqwest dispatch error arms must build the client response via the shared mapper"
+    );
+    assert_eq!(
+        proxy
+            .matches("http_backend_dispatch_error_response(error_class, resolved_ip.clone())")
+            .count(),
+        2,
+        "initial and retry reqwest send failures must both use the shared mapper"
+    );
+    let cross = include_str!("../../../src/http3/cross_protocol.rs");
+    assert!(
+        cross.contains("crate::proxy::http_backend_failure_status_and_body(error_class)"),
+        "H3→HTTP reqwest bridge dispatch failures must use the shared status/body mapper"
+    );
+    assert!(
+        cross.contains("crate::proxy::eager_buffer_body_read_status_and_class("),
+        "H3→HTTP buffered body-read failures must reuse the eager-buffer 504 mapping"
+    );
+    let h3 = include_str!("../../../src/http3/server.rs");
+    assert!(
+        h3.contains("crate::proxy::http_backend_failure_status_and_body(classify_h3_error(e))"),
+        "native-H3 dispatch failures must use the shared mapper after typed classification"
+    );
 }
 
 /// Issue #2949 — the retry loop's response-streaming decision must not be
