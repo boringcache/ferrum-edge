@@ -1195,8 +1195,14 @@ fn pr_ci_plan_schedules_netns_capture_live_for_host_udp_surfaces() {
         ),
         "planner self-test must pin host_udp_capture.rs to kernel=false, netns=true, two-cluster=false"
     );
+    // Match the QUOTED KEY, not any mention: `plan` is the raw file text, so a
+    // bare substring check also matches prose. The constants deliberately
+    // document which paths used to sit in the old single `run_ebpf_live` union
+    // and why each was re-homed, and that documentation must not be what makes
+    // this contract fail. The gate itself can only appear as a quoted output
+    // key, exactly like the positive assertions above.
     assert!(
-        !plan.contains("run_ebpf_live"),
+        !plan.contains("\"run_ebpf_live\""),
         "the shared run_ebpf_live planner gate must not remain"
     );
 }
