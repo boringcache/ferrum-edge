@@ -86,6 +86,17 @@ by a blanket `additionalProperties: false` on the map itself:
 `scoring.weights` accepts only the severity names `info` / `low` / `medium` /
 `high` / `critical`.
 
+`mode: enforce` is rejected at construction when no reachable enforcement path
+remains after `default_rule_action`, `rule_modes`, `rule_overrides`,
+`disabled_default_rules`, custom rules, paranoia filtering, and the request /
+response inspection toggles. Built-in rules are monitor-only unless opted in, so
+`mode: enforce` with only the default pack is not admitted. `mode: monitor`
+with zero enforcing rules remains valid. Anomaly scoring (`scoring.enabled`) and
+stream transport guards (`stream.tcp_require_tls`, enforce-action
+`stream.signatures`) are separate enforcement paths and satisfy admission
+without per-rule `action: enforce` when their corresponding inspection surface
+is enabled.
+
 ## Paranoia levels
 
 `paranoia_level` (1–4, default 1) gates which rules are active. Each rule has a

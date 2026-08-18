@@ -55429,6 +55429,7 @@ mod tests {
 
         let plugins: Vec<Arc<dyn Plugin>> = vec![Arc::new(
             crate::plugins::waf::Waf::new(&json!({
+                "mode": "monitor",
                 "response_inspection": true,
                 "response_body_inspection": true,
             }))

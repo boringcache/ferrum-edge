@@ -13,7 +13,7 @@ fn ctx(method: &str, path: &str) -> RequestContext {
 
 #[tokio::test]
 async fn default_waf_monitors_sqli_query_without_blocking() {
-    let plugin = Waf::new(&json!({})).unwrap();
+    let plugin = Waf::new(&json!({ "mode": "monitor" })).unwrap();
     let mut ctx = ctx("GET", "/search");
     ctx.set_raw_query_string("q=%27%20OR%201%3D1".into());
 
@@ -33,7 +33,7 @@ async fn default_waf_monitors_sqli_query_without_blocking() {
 
 #[tokio::test]
 async fn clean_waf_evaluation_records_clean_action_for_metrics() {
-    let plugin = Waf::new(&json!({})).unwrap();
+    let plugin = Waf::new(&json!({ "mode": "monitor" })).unwrap();
     let mut ctx = ctx("GET", "/search");
     ctx.set_raw_query_string("q=ordinary".into());
 
@@ -180,7 +180,7 @@ async fn regex_alternation_exemption_anchors_all_branches() {
 
 #[tokio::test]
 async fn waf_clears_preexisting_reserved_metadata_before_evaluation() {
-    let plugin = Waf::new(&json!({})).unwrap();
+    let plugin = Waf::new(&json!({ "mode": "monitor" })).unwrap();
     let mut ctx = ctx("GET", "/search");
     ctx.metadata
         .insert("waf.rule_hits".to_string(), "SPOOFED".to_string());
@@ -995,7 +995,7 @@ async fn response_header_rules_request_buffered_grpc_web_trailer_policy() {
 
 #[test]
 fn inactive_response_header_inspection_does_not_govern_native_h3_trailers() {
-    let plugin = Waf::new(&json!({})).unwrap();
+    let plugin = Waf::new(&json!({ "mode": "monitor" })).unwrap();
 
     assert!(matches!(
         plugin.response_trailer_policy(),
@@ -1005,45 +1005,50 @@ fn inactive_response_header_inspection_does_not_govern_native_h3_trailers() {
 
 #[test]
 fn monitor_only_response_header_rules_do_not_drop_native_h3_trailers() {
-    for config in [
-        json!({
-            "mode": "monitor",
-            "include_default_rules": false,
-            "response_inspection": true,
-            "custom_rules": [{
-                "id": "CUSTOM-RESP-HEADER-GLOBAL-MONITOR",
-                "name": "globally monitored response metadata",
-                "category": "custom",
-                "severity": "high",
-                "target": "response_headers",
-                "match_kind": "contains",
-                "pattern": "leak-secret",
-                "action": "enforce"
-            }]
-        }),
-        json!({
-            "mode": "enforce",
-            "include_default_rules": false,
-            "response_inspection": true,
-            "custom_rules": [{
-                "id": "CUSTOM-RESP-HEADER-RULE-MONITOR",
-                "name": "rule-monitored response metadata",
-                "category": "custom",
-                "severity": "high",
-                "target": "response_headers",
-                "match_kind": "contains",
-                "pattern": "leak-secret",
-                "action": "monitor"
-            }]
-        }),
-    ] {
-        let plugin = Waf::new(&config).unwrap();
+    let plugin = Waf::new(&json!({
+        "mode": "monitor",
+        "include_default_rules": false,
+        "response_inspection": true,
+        "custom_rules": [{
+            "id": "CUSTOM-RESP-HEADER-GLOBAL-MONITOR",
+            "name": "globally monitored response metadata",
+            "category": "custom",
+            "severity": "high",
+            "target": "response_headers",
+            "match_kind": "contains",
+            "pattern": "leak-secret",
+            "action": "enforce"
+        }]
+    }))
+    .unwrap();
 
-        assert!(matches!(
-            plugin.response_trailer_policy(),
-            ResponseTrailerPolicy::None
-        ));
-    }
+    assert!(matches!(
+        plugin.response_trailer_policy(),
+        ResponseTrailerPolicy::None
+    ));
+}
+
+#[test]
+fn enforce_mode_rejects_monitor_only_response_header_rules() {
+    let err = Waf::new(&json!({
+        "mode": "enforce",
+        "include_default_rules": false,
+        "response_inspection": true,
+        "custom_rules": [{
+            "id": "CUSTOM-RESP-HEADER-RULE-MONITOR",
+            "name": "rule-monitored response metadata",
+            "category": "custom",
+            "severity": "high",
+            "target": "response_headers",
+            "match_kind": "contains",
+            "pattern": "leak-secret",
+            "action": "monitor"
+        }]
+    }))
+    .unwrap_err();
+    assert!(err.contains("no enabled enforcement path"));
+    assert!(err.contains("default_rule_action"));
+    assert!(err.contains("rule_modes"));
 }
 
 #[test]
@@ -1199,7 +1204,7 @@ async fn response_header_rules_do_not_request_grpc_web_trailer_policy_when_exemp
 
 #[tokio::test]
 async fn response_body_inspection_is_off_by_default() {
-    let plugin = Waf::new(&json!({})).unwrap();
+    let plugin = Waf::new(&json!({ "mode": "monitor" })).unwrap();
     let ctx = ctx("GET", "/");
     assert!(!plugin.requires_response_body_buffering());
     assert!(!plugin.should_buffer_response_body(&ctx));
@@ -2927,7 +2932,7 @@ fn monitored(ctx: &RequestContext, rule_id: &str) -> bool {
 
 #[tokio::test]
 async fn jndi_log4shell_detected_in_header_query_and_body() {
-    let plugin = Waf::new(&json!({})).unwrap();
+    let plugin = Waf::new(&json!({ "mode": "monitor" })).unwrap();
 
     // Header delivery — the original rule pack never scanned header values
     // for injection payloads, the primary Log4Shell channel.
@@ -2962,7 +2967,7 @@ async fn jndi_log4shell_detected_in_header_query_and_body() {
 
 #[tokio::test]
 async fn prototype_pollution_and_spring4shell_detected_in_body() {
-    let plugin = Waf::new(&json!({})).unwrap();
+    let plugin = Waf::new(&json!({ "mode": "monitor" })).unwrap();
 
     let mut proto_ctx = ctx("POST", "/submit");
     proto_ctx
@@ -2996,7 +3001,7 @@ async fn prototype_pollution_and_spring4shell_detected_in_body() {
 
 #[tokio::test]
 async fn xss_and_traversal_now_covered_in_request_body() {
-    let plugin = Waf::new(&json!({})).unwrap();
+    let plugin = Waf::new(&json!({ "mode": "monitor" })).unwrap();
 
     let mut xss_ctx = ctx("POST", "/submit");
     xss_ctx
@@ -3030,7 +3035,7 @@ async fn xss_and_traversal_now_covered_in_request_body() {
 
 #[tokio::test]
 async fn ssti_arithmetic_probe_fires_but_plain_template_does_not_at_default_paranoia() {
-    let plugin = Waf::new(&json!({})).unwrap();
+    let plugin = Waf::new(&json!({ "mode": "monitor" })).unwrap();
 
     let mut probe_ctx = ctx("POST", "/submit");
     probe_ctx
@@ -3061,7 +3066,7 @@ async fn ssti_arithmetic_probe_fires_but_plain_template_does_not_at_default_para
 
 #[tokio::test]
 async fn retuned_loud_rules_are_silent_at_default_paranoia() {
-    let plugin = Waf::new(&json!({})).unwrap();
+    let plugin = Waf::new(&json!({ "mode": "monitor" })).unwrap();
 
     // Hex color `#fff` previously tripped the SQL-comment-token rule
     // (FE-SQLI-004), now gated to paranoia_level >= 2.
@@ -3079,11 +3084,139 @@ async fn retuned_loud_rules_are_silent_at_default_paranoia() {
 
 #[tokio::test]
 async fn raised_paranoia_level_reactivates_retuned_rules() {
-    let plugin = Waf::new(&json!({ "paranoia_level": 2 })).unwrap();
+    let plugin = Waf::new(&json!({ "mode": "monitor", "paranoia_level": 2 })).unwrap();
     let mut url_ctx = ctx("GET", "/redirect");
     url_ctx.set_raw_query_string("next=https://example.com/path".into());
     let _ = plugin.authorize(&mut url_ctx).await;
     assert!(monitored(&url_ctx, "FE-RFI-001"));
+}
+
+#[test]
+fn enforce_mode_rejects_monitor_only_default_ruleset() {
+    let err = Waf::new(&json!({
+        "mode": "enforce",
+        "include_default_rules": true
+    }))
+    .unwrap_err();
+    assert!(err.contains("no enabled enforcement path"));
+    assert!(err.contains("default_rule_action"));
+    assert!(err.contains("rule_modes"));
+    let shared = ferrum_edge::plugins::validate_plugin_config(
+        "waf",
+        &json!({
+            "mode": "enforce",
+            "include_default_rules": true
+        }),
+    )
+    .unwrap_err();
+    assert!(shared.contains("no enabled enforcement path"));
+}
+
+#[test]
+fn monitor_mode_allows_monitor_only_default_ruleset() {
+    Waf::new(&json!({
+        "mode": "monitor",
+        "include_default_rules": true
+    }))
+    .unwrap();
+}
+
+#[test]
+fn enforce_mode_allows_default_rule_action_enforce() {
+    Waf::new(&json!({
+        "mode": "enforce",
+        "default_rule_action": "enforce"
+    }))
+    .unwrap();
+}
+
+#[test]
+fn enforce_mode_allows_rule_modes_opt_in() {
+    Waf::new(&json!({
+        "mode": "enforce",
+        "rule_modes": { "FE-XSS-001": "enforce" }
+    }))
+    .unwrap();
+}
+
+#[test]
+fn enforce_mode_rejects_when_only_enforce_rule_is_disabled() {
+    let err = Waf::new(&json!({
+        "mode": "enforce",
+        "rule_modes": { "FE-XSS-001": "enforce" },
+        "disabled_default_rules": ["FE-XSS-001"]
+    }))
+    .unwrap_err();
+    assert!(err.contains("no rule with action 'enforce'"));
+}
+
+#[test]
+fn enforce_mode_allows_scoring_without_enforce_rules() {
+    Waf::new(&json!({
+        "mode": "enforce",
+        "scoring": { "enabled": true, "block_threshold": 5 }
+    }))
+    .unwrap();
+}
+
+#[test]
+fn enforce_mode_rejects_scoring_without_an_inspected_http_rule() {
+    let err = Waf::new(&json!({
+        "mode": "enforce",
+        "include_default_rules": false,
+        "scoring": { "enabled": true, "block_threshold": 5 },
+        "stream": {
+            "inspect_tcp": false,
+            "inspect_udp": false,
+            "inspect_response": false,
+            "signatures": [{
+                "id": "STREAM-MONITOR",
+                "pattern": "marker",
+                "action": "monitor"
+            }]
+        }
+    }))
+    .unwrap_err();
+    assert!(err.contains("no enabled enforcement path"));
+}
+
+#[test]
+fn enforce_mode_rejects_rule_on_a_disabled_response_surface() {
+    let err = Waf::new(&json!({
+        "mode": "enforce",
+        "include_default_rules": false,
+        "response_inspection": false,
+        "custom_rules": [{
+            "id": "RESPONSE-ONLY",
+            "category": "custom",
+            "target": "response_headers",
+            "pattern": "secret",
+            "match_kind": "contains",
+            "action": "enforce"
+        }]
+    }))
+    .unwrap_err();
+    assert!(err.contains("no enabled enforcement path"));
+}
+
+#[test]
+fn enforce_mode_rejects_unreachable_stream_enforce_signature() {
+    let err = Waf::new(&json!({
+        "mode": "enforce",
+        "include_default_rules": false,
+        "stream": {
+            "inspect_tcp": false,
+            "inspect_udp": false,
+            "inspect_response": false,
+            "signatures": [{
+                "id": "STREAM-ENFORCE",
+                "pattern": "marker",
+                "action": "enforce"
+            }]
+        }
+    }))
+    .unwrap_err();
+    assert!(err.contains("no enabled enforcement path"));
 }
 
 #[tokio::test]
@@ -3604,6 +3737,7 @@ async fn on_body_too_large_block_rejects_when_enforcing() {
     // rather than passed through unscanned.
     let plugin = Waf::new(&json!({
         "mode": "enforce",
+        "default_rule_action": "enforce",
         "max_scan_bytes": 4,
         "on_body_too_large": "block"
     }))
@@ -4362,7 +4496,7 @@ fn stream_waf_attaches_to_stream_protocols_when_configured() {
 
 #[test]
 fn http_only_waf_does_not_attach_to_stream_protocols() {
-    let plugin = Waf::new(&json!({})).unwrap();
+    let plugin = Waf::new(&json!({ "mode": "monitor" })).unwrap();
     let protocols = plugin.supported_protocols();
     assert!(!protocols.contains(&ProxyProtocol::Tcp));
     assert!(!protocols.contains(&ProxyProtocol::Udp));
@@ -4410,7 +4544,9 @@ fn stream_waf_first_bytes_min_len_only_set_for_tls_shape_guard() {
     assert_eq!(sig_waf("enforce").stream_first_bytes_min_len(), 0);
     // An HTTP-only WAF never captures stream first bytes at all.
     assert_eq!(
-        Waf::new(&json!({})).unwrap().stream_first_bytes_min_len(),
+        Waf::new(&json!({ "mode": "monitor" }))
+            .unwrap()
+            .stream_first_bytes_min_len(),
         0
     );
 }

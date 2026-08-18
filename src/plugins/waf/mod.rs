@@ -35,8 +35,8 @@ use tracing::warn;
 use self::defaults::default_rules;
 use self::exemptions::CompiledExemptions;
 use self::rules::{
-    CompiledRules, RuleAction, RuleHit, Severity, WafRule, compile_rules, parse_custom_rule,
-    parse_rule_action, parse_rule_overrides,
+    CompiledRules, RuleAction, RuleHit, RuleTarget, Severity, WafRule, compile_rules,
+    parse_custom_rule, parse_rule_action, parse_rule_overrides,
 };
 use self::scan::ScanOutcome;
 use self::stream::{
@@ -403,6 +403,20 @@ impl Waf {
             );
         }
 
+        let scoring = parse_scoring(object.get("scoring"))?;
+        validate_enforce_mode_has_enforcing_rules(
+            mode,
+            &compiled,
+            stream.as_ref(),
+            scoring.as_ref(),
+            WafInspectionSurfaces {
+                request: request_inspection,
+                request_body: request_body_inspection,
+                response: response_inspection,
+                response_body: response_body_inspection,
+            },
+        )?;
+
         let config = WafConfig {
             mode,
             paranoia_level,
@@ -438,7 +452,7 @@ impl Waf {
                 .unwrap_or_else(|| "application/json".to_string()),
             reject_body: optional_string(object, "reject_body")?
                 .unwrap_or_else(|| r#"{"error":"Forbidden"}"#.to_string()),
-            scoring: parse_scoring(object.get("scoring"))?,
+            scoring,
         };
         if !(400..=599).contains(&config.reject_status_code) {
             return Err("waf: 'reject_status_code' must be from 400 to 599".to_string());
@@ -1866,6 +1880,70 @@ fn parse_too_large_action(raw: &str) -> Result<TooLargeAction, String> {
     }
 }
 
+#[derive(Clone, Copy)]
+struct WafInspectionSurfaces {
+    request: bool,
+    request_body: bool,
+    response: bool,
+    response_body: bool,
+}
+
+impl WafInspectionSurfaces {
+    fn inspects(self, target: &RuleTarget) -> bool {
+        match target {
+            RuleTarget::BodyText | RuleTarget::BodyJsonPath(_) => self.request && self.request_body,
+            RuleTarget::ResponseHeaders => self.response,
+            RuleTarget::ResponseBody => self.response && self.response_body,
+            _ => self.request,
+        }
+    }
+}
+
+/// Reject `mode: enforce` when no rule or separate enforcement path can block
+/// on a surface that is actually enabled. Built-in rules ship monitor-only
+/// unless opted in; anomaly scoring and stream transport guards are separate
+/// enforcement paths, but only when they have reachable input to inspect.
+fn validate_enforce_mode_has_enforcing_rules(
+    mode: GlobalMode,
+    compiled: &CompiledRules,
+    stream: Option<&StreamWafConfig>,
+    scoring: Option<&ScoringConfig>,
+    surfaces: WafInspectionSurfaces,
+) -> Result<(), String> {
+    if mode != GlobalMode::Enforce {
+        return Ok(());
+    }
+    if compiled
+        .rules
+        .iter()
+        .any(|rule| surfaces.inspects(&rule.target) && rule.action == RuleAction::Enforce)
+    {
+        return Ok(());
+    }
+    if scoring.is_some_and(|scoring| {
+        compiled.rules.iter().any(|rule| {
+            surfaces.inspects(&rule.target)
+                && rule.score.unwrap_or_else(|| scoring.weight(rule.severity)) > 0
+        })
+    }) {
+        return Ok(());
+    }
+    if stream.is_some_and(|cfg| {
+        cfg.tcp_require_tls
+            || (cfg.signatures.has_enforce_action()
+                && (cfg.inspect_tcp || cfg.inspect_udp || cfg.inspect_response))
+    }) {
+        return Ok(());
+    }
+    Err(
+        "waf: mode is 'enforce' but no enabled enforcement path can block traffic. Built-in \
+         rules are monitor-only by default; set 'default_rule_action' to 'enforce' or opt \
+         rules in via 'rule_modes' / custom_rules[].action, enable anomaly scoring over an \
+         inspected HTTP rule, or enable a stream enforcement rule"
+            .to_string(),
+    )
+}
+
 fn parse_scoring(value: Option<&Value>) -> Result<Option<ScoringConfig>, String> {
     let Some(value) = value else {
         return Ok(None);
@@ -2118,6 +2196,7 @@ mod tests {
     #[tokio::test]
     async fn scan_budget_timeout_block_action_rejects() {
         let plugin = Waf::new(&json!({
+            "mode": "monitor",
             "include_default_rules": false,
             "scan_budget_ms": 1,
             "on_scan_timeout": "block",
@@ -2161,7 +2240,7 @@ mod tests {
 
     #[test]
     fn cheap_scan_budget_flags_timeout() {
-        let plugin = Waf::new(&json!({ "scan_budget_ms": 1 })).unwrap();
+        let plugin = Waf::new(&json!({ "mode": "monitor", "scan_budget_ms": 1 })).unwrap();
         let outcome = plugin.run_cheap_with_budget(|| {
             std::thread::sleep(Duration::from_millis(5));
             ScanOutcome::default()
@@ -2171,7 +2250,7 @@ mod tests {
 
     #[test]
     fn cheap_scan_budget_zero_never_times_out() {
-        let plugin = Waf::new(&json!({ "scan_budget_ms": 0 })).unwrap();
+        let plugin = Waf::new(&json!({ "mode": "monitor", "scan_budget_ms": 0 })).unwrap();
         let outcome = plugin.run_cheap_with_budget(|| {
             std::thread::sleep(Duration::from_millis(2));
             ScanOutcome::default()

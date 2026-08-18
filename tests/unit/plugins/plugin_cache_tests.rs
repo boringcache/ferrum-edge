@@ -192,7 +192,7 @@ pub(crate) fn minimal_plugin_config(plugin_name: &str) -> serde_json::Value {
             json!({"rules": [{"operation": "add", "target": "header", "key": "x-test", "value": "1"}]})
         }
         "request_size_limiting" => json!({"max_bytes": 1048576}),
-        "waf" => json!({}),
+        "waf" => json!({ "mode": "monitor" }),
         "response_size_limiting" => json!({"max_bytes": 1048576}),
         "ws_message_size_limiting" => json!({"max_frame_bytes": 65536}),
         "ws_rate_limiting" => json!({"frames_per_second": 100}),
@@ -11134,7 +11134,7 @@ fn test_waf_sets_needs_final_request_body_context_capability() {
         vec![make_plugin_config_with_json(
             "ps1",
             "waf",
-            json!({}),
+            json!({ "mode": "monitor" }),
             PluginScope::Proxy,
             Some("p1"),
         )],
@@ -11151,8 +11151,13 @@ fn test_waf_sets_needs_final_request_body_context_capability() {
 
 #[test]
 fn test_priority_override_preserves_finalized_request_policy_capability() {
-    let mut waf =
-        make_plugin_config_with_json("ps1", "waf", json!({}), PluginScope::Proxy, Some("p1"));
+    let mut waf = make_plugin_config_with_json(
+        "ps1",
+        "waf",
+        json!({ "mode": "monitor" }),
+        PluginScope::Proxy,
+        Some("p1"),
+    );
     waf.priority_override = Some(2081);
     let config = make_config(vec![make_proxy("p1", "/api", vec!["ps1"])], vec![waf]);
     let cache = PluginCache::new(&config).unwrap();
