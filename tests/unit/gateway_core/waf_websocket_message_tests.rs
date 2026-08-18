@@ -502,15 +502,31 @@ async fn oversize_message_block_action_closes_without_enforcing_rule() {
         "include_default_rules": false,
         "max_scan_bytes": 16,
         "on_body_too_large": "block",
-        "custom_rules": [{
-            "id": "CUSTOM-WS-MONITOR",
-            "name": "monitored token",
-            "category": "custom",
-            "target": "body_text",
-            "match_kind": "contains",
-            "pattern": PROHIBITED,
-            "action": "monitor"
-        }]
+        "custom_rules": [
+            {
+                "id": "CUSTOM-WS-MONITOR",
+                "name": "monitored token",
+                "category": "custom",
+                "target": "body_text",
+                "match_kind": "contains",
+                "pattern": PROHIBITED,
+                "action": "monitor"
+            },
+            // `on_body_too_large: block` only rejects under the default
+            // `mode: enforce`, but enforce admission now requires a reachable
+            // enforcement path. This sentinel targets the query string, not the
+            // body, and never matches, so the oversize close below still comes
+            // from `block` alone and the assertion is unchanged.
+            {
+                "id": "CUSTOM-WS-ENFORCE-SENTINEL",
+                "name": "never matches",
+                "category": "custom",
+                "target": "query_values",
+                "match_kind": "contains",
+                "pattern": "ferrum-ws-sentinel-never-matches",
+                "action": "enforce"
+            }
+        ]
     }))];
     let ctx = upgrade_ctx("/ws");
 
