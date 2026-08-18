@@ -492,7 +492,8 @@ async fn unknown_operation_is_rejected_before_proxy() {
     let mut ctx = post_ctx("/missing");
     let mut headers = json_headers();
 
-    assert_reject(plugin.before_proxy(&mut ctx, &mut headers).await, Some(400));
+    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+    assert_reject(result, Some(400));
     assert_eq!(
         ctx.metadata
             .get("openapi_validator.request_error")
@@ -501,6 +502,116 @@ async fn unknown_operation_is_rejected_before_proxy() {
         // every logging sink and a path segment can carry a credential
         // (GHSA-5p2h-fq6q-gwh9).
         Some("No OpenAPI operation matched this request")
+    );
+}
+
+#[tokio::test]
+async fn unknown_operation_problem_title_is_precise_for_get_without_body() {
+    let plugin = OpenapiValidator::new(&json!({
+        "fail_on_unknown_operation": true,
+        "operations": [{
+            "method": "POST",
+            "path_template": "/echo",
+            "path_regex": "^/echo$",
+            "request_body": {
+                "content": {
+                    "application/json": {
+                        "type": "object",
+                        "required": ["name"],
+                        "properties": {"name": {"type": "string"}}
+                    }
+                }
+            }
+        }]
+    }))
+    .unwrap();
+    let mut ctx = RequestContext::new("127.0.0.1".into(), "GET".into(), "/p/oapi".into());
+    let mut headers = HashMap::new();
+
+    match plugin.before_proxy(&mut ctx, &mut headers).await {
+        PluginResult::Reject {
+            status_code,
+            body,
+            headers,
+        } => {
+            assert_eq!(status_code, 400);
+            assert_eq!(
+                headers.get("content-type").map(String::as_str),
+                Some("application/problem+json")
+            );
+            let problem: Value = serde_json::from_str(&body).expect("problem+json body");
+            assert_eq!(
+                problem.get("title").and_then(Value::as_str),
+                Some("Unknown OpenAPI operation")
+            );
+            assert_eq!(
+                problem.get("detail").and_then(Value::as_str),
+                Some("No OpenAPI operation matched this request")
+            );
+            assert_eq!(problem.get("operation"), Some(&Value::Null));
+            assert!(
+                !body.contains("Request body validation failed"),
+                "unknown operation must not use schema-validation title: {body}"
+            );
+        }
+        other => panic!("expected unknown-operation reject, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn schema_validation_problem_title_is_unchanged_for_request_body_mismatch() {
+    let plugin = OpenapiValidator::new(&json!({
+        "fail_on_unknown_operation": true,
+        "operations": [{
+            "method": "POST",
+            "path_template": "/echo",
+            "path_regex": "^/echo$",
+            "request_body": {
+                "content": {
+                    "application/json": {
+                        "type": "object",
+                        "required": ["name"],
+                        "properties": {"name": {"type": "string"}}
+                    }
+                }
+            }
+        }]
+    }))
+    .unwrap();
+    let mut ctx = post_ctx("/echo");
+    let headers = json_headers();
+
+    match plugin
+        .on_final_request_body_with_context(&mut ctx, &headers, br#"{"nope":1}"#)
+        .await
+    {
+        PluginResult::Reject { body, .. } => {
+            let problem: Value = serde_json::from_str(&body).expect("problem+json body");
+            assert_eq!(
+                problem.get("title").and_then(Value::as_str),
+                Some("Request body validation failed")
+            );
+            assert!(
+                problem
+                    .get("detail")
+                    .and_then(Value::as_str)
+                    .is_some_and(|detail| !detail.contains("No OpenAPI operation matched")),
+                "schema failures must keep schema diagnostics: {body}"
+            );
+        }
+        other => panic!("expected schema-validation reject, got {other:?}"),
+    }
+}
+
+#[test]
+fn file_mode_config_requires_generated_operations_table() {
+    let err = OpenapiValidator::new(&json!({
+        "fail_on_unknown_operation": true
+    }))
+    .expect_err("operations is required for direct/file-mode config");
+    assert!(
+        err.contains("'operations' is required"),
+        "expected operations requirement error, got: {err}"
     );
 }
 

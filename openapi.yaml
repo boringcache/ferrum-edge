@@ -23105,7 +23105,11 @@ components:
         fail_on_unknown_operation:
           type: boolean
           default: true
-          description: Reject requests that do not match any generated operation.
+          description: >-
+            Reject requests that do not match any generated operation. In block
+            mode the client-visible problem title is "Unknown OpenAPI operation"
+            with detail "No OpenAPI operation matched this request"; the method
+            and path are not interpolated into either string.
         fail_on_missing_response_schema:
           type: boolean
           default: false
