@@ -3919,7 +3919,9 @@ fn stream_waf_first_bytes_min_len_only_set_for_tls_shape_guard() {
     assert_eq!(sig_waf("enforce").stream_first_bytes_min_len(), 0);
     // An HTTP-only WAF never captures stream first bytes at all.
     assert_eq!(
-        Waf::new(&json!({ "mode": "monitor" })).unwrap().stream_first_bytes_min_len(),
+        Waf::new(&json!({ "mode": "monitor" }))
+            .unwrap()
+            .stream_first_bytes_min_len(),
         0
     );
 }

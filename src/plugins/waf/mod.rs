@@ -2194,6 +2194,7 @@ mod tests {
     #[tokio::test]
     async fn scan_budget_timeout_block_action_rejects() {
         let plugin = Waf::new(&json!({
+            "mode": "monitor",
             "include_default_rules": false,
             "scan_budget_ms": 1,
             "on_scan_timeout": "block",
@@ -2237,7 +2238,7 @@ mod tests {
 
     #[test]
     fn cheap_scan_budget_flags_timeout() {
-        let plugin = Waf::new(&json!({ "scan_budget_ms": 1 })).unwrap();
+        let plugin = Waf::new(&json!({ "mode": "monitor", "scan_budget_ms": 1 })).unwrap();
         let outcome = plugin.run_cheap_with_budget(|| {
             std::thread::sleep(Duration::from_millis(5));
             ScanOutcome::default()
@@ -2247,7 +2248,7 @@ mod tests {
 
     #[test]
     fn cheap_scan_budget_zero_never_times_out() {
-        let plugin = Waf::new(&json!({ "scan_budget_ms": 0 })).unwrap();
+        let plugin = Waf::new(&json!({ "mode": "monitor", "scan_budget_ms": 0 })).unwrap();
         let outcome = plugin.run_cheap_with_budget(|| {
             std::thread::sleep(Duration::from_millis(2));
             ScanOutcome::default()
