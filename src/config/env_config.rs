@@ -6577,6 +6577,19 @@ impl EnvConfig {
                 if self.mesh_workload_api_enabled && any_file_workload_identity {
                     return Err(Self::WORKLOAD_API_FILE_SVID_UNSUPPORTED.to_string());
                 }
+                // A PARTIAL file-SVID tuple is a misconfiguration, not a
+                // fallback (issue #3927). `load_gateway_svid_bundle` already
+                // refuses it at `ProxyState` construction, but without this
+                // gate `validate` either reports the generic no-identity error
+                // (which sends the operator to add a CA backend they did not
+                // want) or — with `FERRUM_MESH_ALLOW_NO_CA=true` — reports OK
+                // for a mesh that cannot start. Fail here with the same
+                // together-or-not-at-all diagnostic run uses, so validate and
+                // startup agree and no partial tuple can be read as "identity
+                // is configured".
+                if any_file_workload_identity && !has_file_workload_identity {
+                    return Err(Self::FILE_SVID_TUPLE_INCOMPLETE.to_string());
+                }
                 let workload_spiffe_id = if mesh_ca_backend != crate::identity::ca::CaBackend::None
                     && !has_file_workload_identity
                 {
@@ -7564,6 +7577,15 @@ impl EnvConfig {
     /// Enabling the Workload API surface with no CA backend at all.
     const WORKLOAD_API_REQUIRES_CA_BACKEND: &str = "FERRUM_MESH_WORKLOAD_API_ENABLED=true requires FERRUM_MESH_CA_BACKEND so the Workload \
          API has an authority to mint SVIDs from";
+
+    /// A partially configured file-based gateway SVID tuple in `mesh` mode.
+    /// The three sources are loaded together by `load_gateway_svid_bundle`, so
+    /// naming some of them is never a usable identity (issue #3927).
+    const FILE_SVID_TUPLE_INCOMPLETE: &str = "file-based gateway SVID material is incomplete: FERRUM_GATEWAY_SVID_CERT_PATH, \
+         FERRUM_GATEWAY_SVID_KEY_PATH, and FERRUM_GATEWAY_SVID_TRUST_BUNDLE_PATH must be set \
+         together (a leaf without its key or trust bundle cannot present or verify an mTLS peer \
+         certificate). Set all three, or unset them all and configure \
+         FERRUM_MESH_CA_BACKEND with FERRUM_MESH_WORKLOAD_SPIFFE_ID";
 
     /// Enabling the Workload API while explicit file identity suppresses the
     /// automatic CA-backed issuer at mesh startup.

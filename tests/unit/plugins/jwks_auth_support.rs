@@ -24,9 +24,32 @@ pub fn create_rs256_token(claims: &Value, private_key_pem: &[u8]) -> String {
 }
 
 pub fn create_rs256_token_exact(claims: &Value, private_key_pem: &[u8]) -> String {
+    encode_rs256_token(claims, private_key_pem, Some("test-key-1"))
+}
+
+pub fn create_rs256_token_with_kid(claims: &Value, private_key_pem: &[u8], kid: &str) -> String {
+    let claims = claims_with_default_exp(claims);
+    encode_rs256_token(&claims, private_key_pem, Some(kid))
+}
+
+pub fn create_rs256_token_no_kid(claims: &Value, private_key_pem: &[u8]) -> String {
+    let claims = claims_with_default_exp(claims);
+    encode_rs256_token(&claims, private_key_pem, None)
+}
+
+fn claims_with_default_exp(claims: &Value) -> Value {
+    let mut claims = claims.clone();
+    if let Some(obj) = claims.as_object_mut() {
+        obj.entry("exp")
+            .or_insert_with(|| json!(chrono::Utc::now().timestamp() + 3600));
+    }
+    claims
+}
+
+fn encode_rs256_token(claims: &Value, private_key_pem: &[u8], kid: Option<&str>) -> String {
     use jsonwebtoken::{EncodingKey, Header, encode};
     let mut header = Header::new(jsonwebtoken::Algorithm::RS256);
-    header.kid = Some("test-key-1".to_string());
+    header.kid = kid.map(ToOwned::to_owned);
     encode(
         &header,
         claims,
@@ -36,6 +59,10 @@ pub fn create_rs256_token_exact(claims: &Value, private_key_pem: &[u8]) -> Strin
 }
 
 pub fn build_rsa_jwks_from_pem(public_key_pem: &[u8]) -> serde_json::Value {
+    build_rsa_jwks_from_pem_with_kid(public_key_pem, "test-key-1")
+}
+
+pub fn build_rsa_jwks_from_pem_with_kid(public_key_pem: &[u8], kid: &str) -> serde_json::Value {
     use base64::Engine;
     use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 
@@ -46,7 +73,7 @@ pub fn build_rsa_jwks_from_pem(public_key_pem: &[u8]) -> serde_json::Value {
     json!({
         "keys": [{
             "kty": "RSA",
-            "kid": "test-key-1",
+            "kid": kid,
             "use": "sig",
             "alg": "RS256",
             "n": URL_SAFE_NO_PAD.encode(&n),

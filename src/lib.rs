@@ -1405,6 +1405,19 @@ pub mod _test_support {
         crate::proxy::eager_buffer_body_read_status_and_class(class)
     }
 
+    pub fn http_backend_dispatch_error_response_for_test(
+        error_class: crate::retry::ErrorClass,
+        resolved_ip: Option<String>,
+    ) -> crate::retry::BackendResponse {
+        crate::proxy::http_backend_dispatch_error_response(error_class, resolved_ip)
+    }
+
+    pub fn http_backend_failure_status_and_body_for_test(
+        class: crate::retry::ErrorClass,
+    ) -> (u16, &'static str) {
+        crate::proxy::http_backend_failure_status_and_body(class)
+    }
+
     pub fn set_grpc_deadline_budget_for_test(
         ctx: &mut crate::plugins::RequestContext,
         budget_ms: Option<u64>,

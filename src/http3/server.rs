@@ -9792,28 +9792,28 @@ fn classify_h3_error(e: &crate::http3::client::H3PoolError) -> crate::retry::Err
 }
 
 /// Select the client-facing status + JSON body for a native-H3 backend
-/// dispatch failure. A `backend_read_timeout_ms` deadline expiry maps to
-/// 504 `{"error":"Backend timeout"}` — matching the direct-H2 / HBONE /
-/// sidecar-mTLS read-timeout arms in `crate::proxy` — while every other
-/// failure keeps the generic 502 `{"error":"Backend unavailable"}`.
-/// The canonical H3 backend-failure body. Deliberately `&'static str`: the
-/// `send_h3_response` consumers want a string, and the buffered-dispatch
-/// consumers can reach `Bytes::from_static(..)` from the same static lifetime,
-/// so neither side has to copy the literal.
+/// dispatch failure. Classification is the shared HTTP-family mapper
+/// (`crate::proxy::http_backend_failure_status_and_body`): a
+/// `backend_read_timeout_ms` deadline expiry (`ReadWriteTimeout`) maps to
+/// 504 `{"error":"Backend timeout"}`, matching the reqwest / direct-H2 /
+/// HBONE / sidecar-mTLS arms, while every other failure keeps the generic
+/// 502 `{"error":"Backend unavailable"}`.
+///
+/// The body is deliberately `&'static str`: the `send_h3_response`
+/// consumers want a string, and the buffered-dispatch consumers can reach
+/// `Bytes::from_static(..)` from the same static lifetime, so neither side
+/// has to copy the literal.
 fn h3_backend_failure_status_body(
     e: &crate::http3::client::H3PoolError,
 ) -> (StatusCode, &'static str) {
-    if e.is_read_timeout() {
-        (
-            StatusCode::GATEWAY_TIMEOUT,
-            r#"{"error":"Backend timeout"}"#,
-        )
+    let (status_code, body) =
+        crate::proxy::http_backend_failure_status_and_body(classify_h3_error(e));
+    let status = if status_code == 504 {
+        StatusCode::GATEWAY_TIMEOUT
     } else {
-        (
-            StatusCode::BAD_GATEWAY,
-            r#"{"error":"Backend unavailable"}"#,
-        )
-    }
+        StatusCode::BAD_GATEWAY
+    };
+    (status, body)
 }
 
 fn is_h3_client_request_body_disconnect(err_msg: &str) -> bool {
@@ -10248,13 +10248,17 @@ async fn collect_h3_open_response_body(
                         timeout_ms = proxy.backend_read_timeout_ms,
                         "HTTP/3 backend buffered response read timed out (refined path)"
                     );
-                    // Read timeout: 504 Backend timeout (matching the
-                    // direct-H2 / HBONE read-timeout arms), classified as
-                    // ReadWriteTimeout. No capability downgrade — a stalled
-                    // backend has not proved it lost H3 support.
+                    // Read timeout: 504 Backend timeout via the shared
+                    // HTTP-family mapper (matching the direct-H2 / HBONE
+                    // read-timeout arms), classified as ReadWriteTimeout.
+                    // No capability downgrade — a stalled backend has not
+                    // proved it lost H3 support.
+                    let (status, body) = crate::proxy::http_backend_failure_status_and_body(
+                        crate::retry::ErrorClass::ReadWriteTimeout,
+                    );
                     return H3BufferedDispatchResult {
-                        status: 504,
-                        body: Bytes::from_static(br#"{"error":"Backend timeout"}"#),
+                        status,
+                        body: Bytes::from_static(body.as_bytes()),
                         headers: HashMap::new(),
                         trailers: None,
                         error_class: Some(crate::retry::ErrorClass::ReadWriteTimeout),
@@ -10336,9 +10340,11 @@ async fn collect_h3_open_response_body(
                         .backend_capabilities
                         .mark_h3_unsupported(proxy, upstream_target);
                 }
+                let (status, body) =
+                    crate::proxy::http_backend_failure_status_and_body(h3_error_class);
                 return H3BufferedDispatchResult {
-                    status: 502,
-                    body: Bytes::from_static(br#"{"error":"Backend unavailable"}"#),
+                    status,
+                    body: Bytes::from_static(body.as_bytes()),
                     headers: HashMap::new(),
                     trailers: None,
                     error_class: Some(h3_error_class),
@@ -10373,9 +10379,10 @@ async fn collect_h3_open_response_body(
                     .backend_capabilities
                     .mark_h3_unsupported(proxy, upstream_target);
             }
+            let (status, body) = crate::proxy::http_backend_failure_status_and_body(h3_error_class);
             return H3BufferedDispatchResult {
-                status: 502,
-                body: Bytes::from_static(br#"{"error":"Backend unavailable"}"#),
+                status,
+                body: Bytes::from_static(body.as_bytes()),
                 headers: HashMap::new(),
                 trailers: None,
                 error_class: Some(h3_error_class),

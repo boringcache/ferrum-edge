@@ -2228,7 +2228,9 @@ Claim values are auto-detected as space-delimited strings (OAuth2 standard), JSO
 Claim header fan-out refuses reserved hop-by-hop, authorization, host, and consumer identity headers.
 Unknown top-level, provider, and custom-header-location fields are rejected so misspelled authentication controls cannot silently fail open. For each remote provider, `jwks_refresh_interval_secs` must not exceed its effective `jwks_max_stale_seconds`. Shared stores use both the minimum refresh interval and the minimum maximum-stale value requested by active consumers. A newly added stricter consumer takes effect immediately; full or incremental publication deterministically reconciles the exact minima, so removing the strict consumer may relax policy without replacing the store or resetting key age. Discovery-backed reloads retain the last validated URI/store until rediscovery produces a usable replacement, but discovery success alone never refreshes key trust. A store an OIDC discovery task resolves *after* its generation was published joins the active refresh/maximum-stale arbitration and the trust aggregate at that moment rather than at the next reload, and leaves it when that generation retires or repoints to a different URI; a staged generation that is never published contributes nothing to readiness or metrics.
 
-Remote discovery documents are capped at 128 KiB and JWKS responses at 1 MiB/256 keys, with bounded key components. A valid non-empty JWKS atomically replaces the key map, refreshes the monotonic trust deadline, clears failure state, and can restore authentication after expiry. Empty 200 responses, malformed or oversized bodies, non-2xx status, and transport/DNS/TLS/timeout failures retain last-known-good material only for the finite grace window and use a bounded accelerated retry cadence; after the deadline, verification refuses the retained material without deleting diagnostic/recovery state. JWKs are accepted for signature verification only when `use` is absent or `sig` and `key_ops` is absent or includes `verify`; contradictory operation metadata is rejected.
+Remote discovery documents are capped at 128 KiB and JWKS responses at 1 MiB/256 keys, with bounded key components. A valid non-empty JWKS atomically replaces the key map, refreshes the monotonic trust deadline, clears failure state, and can restore authentication after expiry. Empty 200 responses, malformed or oversized bodies, non-2xx status, and transport/DNS/TLS/timeout failures retain last-known-good material only for the finite grace window and use a bounded accelerated retry cadence; after the deadline, verification refuses the retained material without deleting diagnostic/recovery state. JWKs are accepted for signature verification only when `use` is absent or `sig` and `key_ops` is absent or includes `verify`; contradictory operation metadata is rejected. Signing keys without a non-empty `kid` are unusable, and a JWKS with duplicate usable `kid` values is rejected rather than choosing one by response order.
+
+JWT header `kid` is required and binding. A missing `kid`, an empty `kid`, or a `kid` that is not in the selected provider's current trusted JWKS is rejected with the same generic 401 (`{"error":"Invalid or unrecognized JWT"}`) as any other invalid token. There is no all-keys fallback: a known `kid` selects only that key, so a token signed by a different published key is still rejected. Ferrum never logs token data, key material, claims, or attacker-controlled `kid` values.
 
 Authenticated `/metrics` exposes only fixed-cardinality aggregate JWKS state for **active remote** stores: `fresh`, `grace`, or `expired`, maximum trust age per state, and closed refresh-failure classes. It never labels a series with a JWKS/discovery URL, `kid`, token, claim, or key material. Authenticated `/health`/`/status` mirror the same closed-set counts under `jwks_trust`; unauthenticated probes see only coarse readiness effects (grace → degraded+ready, expired → unavailable+not-ready, none → neutral) from an O(1) cached aggregate. Choose the maximum-stale window as an explicit availability-versus-revocation trade-off; production deployments should keep it short enough for emergency key removal to take effect within their incident-response objective.
 
@@ -2379,6 +2381,13 @@ OIDC relying-party JWKS uses the same shared bounded-trust store as
 does not refresh key trust; only a validated non-empty JWKS does. When the same
 URI is also referenced by `jwks_auth`, the strictest active maximum-stale and
 refresh requirements govern the shared store.
+
+ID token verification uses the same shared JWKS verifier: the ID token header
+must carry a `kid` that selects exactly one current trusted key. Missing, empty,
+and unknown `kid` values are rejected with a generic invalid-ID-token error;
+there is no all-keys fallback. A known `kid` with a bad signature under that
+key is also rejected. Token data, key material, claims, and attacker-controlled
+`kid` values are never logged.
 
 ### `jwt_auth`
 
@@ -4361,10 +4370,14 @@ config:
 Inspects HTTP-family traffic for content-threat patterns such as SQL injection,
 XSS, command injection, path traversal, SSRF, response disclosure, and
 data-leakage indicators. The built-in seed rules are monitor-only by default;
-set individual `rule_modes` or custom rule `action` values to `enforce` when a
-rule should block. Invalid WAF configuration is security-fatal at
-startup/reload, so the gateway does not silently serve without the intended
-inspection.
+set `default_rule_action: enforce` or individual `rule_modes` / custom rule
+`action` values to `enforce` when a rule should block. With `mode: enforce`,
+admission rejects configurations with no reachable enforcement path after
+defaults, overrides, disabled rules, paranoia filtering, and inspection-surface
+toggles — built-in pack plus `mode: enforce` alone is not blocking.
+`mode: monitor` with zero enforcing rules remains valid. Invalid WAF
+configuration is security-fatal at startup/reload, so the gateway does not
+silently serve without the intended inspection.
 
 **Admission.** Fixed-shape objects reject unknown keys with path-qualified
 diagnostics and spelling suggestions before defaults apply (top-level config,
@@ -4439,7 +4452,7 @@ scanning the parsed key/value map and a best-effort reconstructed URL.
 | `include_default_rules` | bool | `true` | Include Ferrum's built-in seed rules. |
 | `disabled_default_rules` | string[] | `[]` | Built-in rule IDs to remove from the active ruleset. |
 | `rule_modes` | object | `{}` | Per-rule action overrides keyed by rule ID. Values: `enforce`, `monitor`, `disabled` (aliases like `block` and `off` are accepted). |
-| `default_rule_action` | string | _(unset)_ | Bulk action for built-in rules: `enforce`, `monitor`, or `disabled`. Unset keeps the safe monitor-only default for built-ins. |
+| `default_rule_action` | string | _(unset)_ | Bulk action for built-in rules that inherit it: `enforce`, `monitor`, or `disabled`. Unset keeps the safe monitor-only default. Encoding-evasion heuristics (`FE-ENCODING-001`, `FE-ENCODING-002`) stay monitor under bulk `enforce` until an explicit `rule_modes` or `rule_overrides.action` entry promotes them. |
 | `rule_overrides` | object | `{}` | Per-rule field overrides for supported rule metadata such as action/severity/paranoia tuning. |
 | `scoring` | object | _(none)_ | Optional anomaly scoring. Configure `block_threshold` and optional severity weights so multiple monitored hits can block when **that instance's** accumulated score crosses the threshold. Scores are isolated per WAF plugin-config instance; see [Anomaly scoring](waf.md#anomaly-scoring). |
 | `custom_rules` | object[] | `[]` | Additional rules. See custom rule fields below. |
@@ -4458,17 +4471,19 @@ scanning the parsed key/value map and a best-effort reconstructed URL.
 | `on_scan_timeout` | string | `log_and_allow` | Action when a body scan times out: `allow`, `block`, or `log_and_allow`. |
 | `disallowed_methods` | string[] | `[]` | Methods that should trigger the built-in `FE-METHOD-001` rule when that rule is active. |
 | `log_to_metadata` | bool | `true` | Write WAF metadata such as `waf.rule_hits`, `waf.action`, and `waf.severity` into transaction logs. |
-| `log_to_stdout` | bool | `false` | Emit `tracing::warn!` events for rule matches. |
+| `log_to_stdout` | bool | `false` | Emit `tracing::warn!` events for rule matches. Each event's `action` is that rule's effective direct outcome after applying the global mode (`blocked`, `monitored`, `disabled`); `rule_action` carries the configured rule action (`enforce`, `monitor`, `disabled`). Aggregate anomaly scoring can still make the final transaction `waf.action=blocked` after individual per-rule events. |
 | `reject_status_code` | u16 | `403` | HTTP status for enforced rejects. Must be 400-599. |
 | `reject_content_type` | string | `application/json` | Content-Type header for enforced rejects. |
 | `reject_body` | string | `{"error":"Forbidden"}` | Body returned for enforced rejects. |
 
 **Multi-instance scoring:** Multiple scoped `waf` instances on one proxy keep
-independent anomaly accumulators keyed by plugin-config identity. Each instance
-thresholds only its own score across the shared H1/H2/H3 authorize / body /
-response lifecycle. Metadata uses `waf.instances.<id>.score` plus deterministic
-`waf.instance_scores` when more than one instance contributes; `waf.score` is
-emitted only for single-instance scoring. See [waf.md](waf.md#anomaly-scoring).
+independent anomaly accumulators keyed by the configured `plugin_configs[].id`
+(file, database, CP, and DP). Each instance thresholds only its own score across
+the shared H1/H2/H3 authorize / body / response lifecycle. Metadata uses
+`waf.instances.<id>.score` plus deterministic `waf.instance_scores` when more
+than one instance contributes; `waf.score` is emitted only for single-instance
+scoring. A process-local `standalone-<n>` identity is only for direct
+construction that has no configured id. See [waf.md](waf.md#anomaly-scoring).
 
 **Oversize bodies never silently bypass an enforcing body rule:** a body larger
 than `max_scan_bytes` cannot be completely inspected, and prefix-only inspection
@@ -4479,9 +4494,12 @@ body whenever that direction actually carries an enforcing body policy: global
 `mode: enforce` plus either anomaly `scoring` with an applicable body rule or at
 least one applicable `action: enforce` rule reading `body_text` /
 `body_json_path` (request) or `response_body` (response), including the
-body-scoped `FE-ENCODING-001` / `FE-ENCODING-002` specials, which read both
-directions. A rule is applicable only when its path, method, header, and consumer
-conditions match the current request, and a request-wide
+body-scoped `FE-ENCODING-001` / `FE-ENCODING-002` specials when those rules
+are themselves enforce. Encoding specials stay monitor under bulk
+`default_rule_action: enforce` until `rule_modes` or `rule_overrides.action`
+promotes them, and they read both directions. A rule is applicable only when
+its path, method, header, and consumer conditions match the current request,
+and a request-wide
 `global_exemptions.header_present` match suppresses the fail-closed decision as
 well as rule hits. The request and response paths use the same decision, so H1,
 H2, and H3 behave identically. A body whose length is *exactly*
@@ -4538,11 +4556,11 @@ representations explicitly outside the configured response-body scan scope.
 | `category` | string | required | Category label, such as `sqli`, `xss`, or `custom`. |
 | `severity` | string | `medium` | `info`, `low`, `medium`, `high`, or `critical`. |
 | `target` | string/object | required | Scan target. Strings cover every target except `body_json_path` (object-only). Object form uses `type`; optional non-empty `names` only for `header_values`/`request_headers`; required non-empty `path` only for `body_json_path`. Aliases `request_headers`, `request_query`, `request_path`, `request_url`, `request_method`, and `request_body` are accepted. |
-| `match_kind` | string | `regex` | `regex`, `literal`, `contains`, `equals`, `luhn`, or `cidr`. |
+| `match_kind` | string | `regex` | `regex`, `literal`, `contains`, `equals`, `luhn`, or `cidr`. `literal` is a case-sensitive substring; `contains` is the case-insensitive substring form; `equals` is a case-insensitive full-value match. For folding with `regex`, write `(?i)…` explicitly. |
 | `pattern` | string | `""` | Pattern text. Required except for `luhn` rules. CIDR rules accept an IP or CIDR range. |
 | `action` | string | global default | `enforce`, `monitor`, or `disabled`. |
 | `score` | integer | severity weight | Anomaly-score contribution when `scoring` is enabled. |
-| `fp_filters` | string[] | `[]` | Regex filters that suppress known false-positive captured values for this rule. |
+| `fp_filters` | string[] | `[]` | Unanchored regex filters evaluated against the complete inspected target value after a rule match; if any filter matches anywhere in that value, the hit is suppressed. For `body_json_path`, this is the selected JSON scalar's string form, not only the matched substring. |
 | `paranoia_min` | u8 | `1` | Minimum paranoia level required for this rule. |
 | `conditions` | object | `{}` | Optional request conditions: `paths`, `methods`, `headers`, and `consumers`. Path entries share exact-match and trailing-`*` prefix forms with `global_exemptions.paths`, but `~regex` anchoring differs: rule `conditions.paths` compile the text after `~` as an operator-authored, unanchored regex evaluated with Rust regex `is_match`, so they may match anywhere in the path unless the pattern itself is anchored (for example `~^/admin(?:/|$)`). A floating match such as `~api` therefore matches both `/api/users` and `/v1/api-keys`. Exact and prefix forms are unchanged and are not regex-anchored. |
 
@@ -4580,6 +4598,8 @@ under these start-anchored exemption semantics.
 config:
   mode: enforce
   include_default_rules: true
+  default_rule_action: enforce
+  paranoia_level: 1
   rule_modes:
     FE-XSS-001: enforce
     FE-SQLI-002: enforce
@@ -4723,7 +4743,7 @@ Two policy guards run before parsing: the configured `<!ENTITY` declaration cap 
 
 ### `openapi_validator`
 
-Validates request and response bodies against operation schemas generated from an attached OpenAPI or Swagger document. JSON, XML, form-urlencoded, multipart, text, and binary media types are supported. This plugin is normally auto-injected by `POST /api-specs` or `PUT /api-specs/{id}` when the document includes `x-ferrum-validate`.
+Validates request and response bodies against operation schemas generated from an attached OpenAPI or Swagger document. JSON, XML, form-urlencoded, multipart, text, and binary media types are supported. This plugin is normally auto-injected by `POST /api-specs` or `PUT /api-specs/{id}` when the document includes `x-ferrum-validate`; that importer path generates the required `operations` table from the attached document. In file mode (or any other direct plugin configuration), you must supply the same generated `operations` array yourself — omitting it fails plugin construction with `'operations' is required`.
 
 **Priority:** 2960
 
@@ -4734,11 +4754,11 @@ Validates request and response bodies against operation schemas generated from a
 | `validate_response` | bool | `true` | Validate response bodies for operations with response schemas |
 | `request_content_types` | String[] | common JSON/XML/form/text/binary types | Request media types to validate |
 | `response_content_types` | String[] | common JSON/XML/form/text/binary types | Response media types to validate |
-| `fail_on_unknown_operation` | bool | `true` | Reject requests that do not match any generated operation |
+| `fail_on_unknown_operation` | bool | `true` | Reject requests that do not match any generated operation. In `block` mode the client-visible problem `title` is `Unknown OpenAPI operation` with detail `No OpenAPI operation matched this request`; the method and path are not interpolated into either string. |
 | `fail_on_missing_response_schema` | bool | `false` | Reject a response whose selected response object yields no schema, applied after status selection to missing, out-of-scope, and unmatched content types |
 | `max_body_bytes` | integer | `1048576` | Maximum raw body size and per-layer decoded size while undoing `Content-Encoding` chains |
 | `schema_draft` | string | generated | `auto`, `draft7`, or `draft2020-12` |
-| `operations` | array | required | Generated operation schema table |
+| `operations` | array | required | Generated operation schema table. Required in file mode and other direct plugin configuration; `POST /api-specs` / `PUT /api-specs/{id}` generate it from the attached document when `x-ferrum-validate` is enabled. |
 | `bypass.paths` | String[] | `[]` | Regex paths that skip validation |
 | `bypass.methods` | String[] | `[]` | HTTP methods that skip validation |
 | `bypass.consumers` | String[] | `[]` | Consumer identities that skip validation |
