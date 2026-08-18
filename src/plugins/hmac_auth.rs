@@ -366,10 +366,7 @@ fn parse_body_digest_header(
 }
 
 fn select_digest_header(ctx: &RequestContext) -> Result<(&str, DigestSyntax), &'static str> {
-    match (
-        ctx.headers.get("content-digest"),
-        ctx.headers.get("digest"),
-    ) {
+    match (ctx.headers.get("content-digest"), ctx.headers.get("digest")) {
         (Some(_), Some(_)) => Err(AMBIGUOUS_DIGEST_BODY),
         (Some(value), None) => {
             if value.trim().is_empty() {

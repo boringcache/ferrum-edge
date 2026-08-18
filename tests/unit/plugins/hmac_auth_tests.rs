@@ -2804,14 +2804,8 @@ async fn both_digest_headers_fail_closed_as_ambiguous() {
     let legacy = sha256_digest_header(body);
     let date = current_date();
     let nonce = test_nonce(3940);
-    let signature = sign_v2_with_digest(
-        TEST_SECRET,
-        "POST",
-        "/api/orders",
-        &date,
-        &content,
-        &nonce,
-    );
+    let signature =
+        sign_v2_with_digest(TEST_SECRET, "POST", "/api/orders", &date, &content, &nonce);
     let mut ctx = make_ctx("POST", "/api/orders");
     ctx.headers.insert(
         "authorization".to_string(),
@@ -2851,9 +2845,7 @@ async fn unsupported_and_malformed_digest_headers_fail_closed() {
     unsupported.headers.insert("date".to_string(), date.clone());
     set_legacy_digest(&mut unsupported, "md5=ignored".to_string());
     assert_reject_error(
-        plugin
-            .authenticate(&mut unsupported, &consumer_index)
-            .await,
+        plugin.authenticate(&mut unsupported, &consumer_index).await,
         401,
         "Unsupported digest algorithm",
     );
@@ -2906,14 +2898,7 @@ async fn v2_rejects_duplicate_digest_algorithm_keys_and_mixed_spellings() {
     let date = current_date();
     let nonce = test_nonce(3947);
     let single = sha256_content_digest_header(body);
-    let signature = sign_v2_with_digest(
-        TEST_SECRET,
-        "POST",
-        "/api/orders",
-        &date,
-        &single,
-        &nonce,
-    );
+    let signature = sign_v2_with_digest(TEST_SECRET, "POST", "/api/orders", &date, &single, &nonce);
 
     let mut duplicate = make_ctx("POST", "/api/orders");
     duplicate.headers.insert(
@@ -2953,14 +2938,7 @@ async fn v2_replay_of_a_content_digest_request_is_rejected() {
     let digest = sha256_content_digest_header(body);
     let date = current_date();
     let nonce = test_nonce(3942);
-    let signature = sign_v2_with_digest(
-        TEST_SECRET,
-        "POST",
-        "/api/orders",
-        &date,
-        &digest,
-        &nonce,
-    );
+    let signature = sign_v2_with_digest(TEST_SECRET, "POST", "/api/orders", &date, &digest, &nonce);
 
     let mut first = make_ctx("POST", "/api/orders");
     first.headers.insert(
@@ -2995,14 +2973,7 @@ async fn hmac_auth_preserves_downstream_request_body_bytes() {
     let digest = sha256_content_digest_header(body);
     let date = current_date();
     let nonce = test_nonce(3943);
-    let signature = sign_v2_with_digest(
-        TEST_SECRET,
-        "POST",
-        "/api/orders",
-        &date,
-        &digest,
-        &nonce,
-    );
+    let signature = sign_v2_with_digest(TEST_SECRET, "POST", "/api/orders", &date, &digest, &nonce);
     let mut ctx = make_ctx("POST", "/api/orders");
     ctx.headers.insert(
         "authorization".to_string(),
@@ -3047,14 +3018,7 @@ async fn hmac_prebuffer_then_matching_rfc9530_body_authenticates() {
     let digest = sha256_content_digest_header(body);
     let date = current_date();
     let nonce = test_nonce(3944);
-    let signature = sign_v2_with_digest(
-        TEST_SECRET,
-        "POST",
-        "/upload",
-        &date,
-        &digest,
-        &nonce,
-    );
+    let signature = sign_v2_with_digest(TEST_SECRET, "POST", "/upload", &date, &digest, &nonce);
 
     let mut ctx = make_ctx("POST", "/upload");
     ctx.request_body_sha256 = None;
