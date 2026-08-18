@@ -429,17 +429,12 @@ impl BoundaryHarness {
         let fail_all = mode == BoundaryMode::FailingProviderWithRetries;
         let provider = CapturingBackend::spawn(fail_all).await;
         let normal_backend = CapturingBackend::spawn(false).await;
-        let https_listener = TcpListener::bind("127.0.0.1:0")
-            .await
-            .expect("reserve https port");
-        let https_port = https_listener.local_addr().expect("https addr").port();
-        drop(https_listener);
 
         let gateway = TestGateway::builder()
             .mode_file(boundary_config(mode, provider.port, normal_backend.port))
             .log_level("warn")
             .env("FERRUM_ENABLE_HTTP3", "true")
-            .env("FERRUM_PROXY_HTTPS_PORT", https_port.to_string())
+            .env_ephemeral_port("FERRUM_PROXY_HTTPS_PORT")
             .env("FERRUM_FRONTEND_TLS_CERT_PATH", "tests/certs/server.crt")
             .env("FERRUM_FRONTEND_TLS_KEY_PATH", "tests/certs/server.key")
             .env("FERRUM_POOL_WARMUP_ENABLED", "false")
@@ -450,6 +445,9 @@ impl BoundaryHarness {
             .wait_for_proxy_port(Duration::from_secs(5))
             .await
             .expect("proxy port ready");
+        let https_port = gateway
+            .env_port("FERRUM_PROXY_HTTPS_PORT")
+            .expect("harness-allocated HTTPS port");
 
         Self {
             gateway,
