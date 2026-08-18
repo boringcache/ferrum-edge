@@ -321,8 +321,7 @@ fn render_default_body(content_type: &str, status_code: u16, message: &str) -> S
 /// phrase such as the default `"Service unavailable"` — fails safe into the
 /// legacy `{message,status_code}` envelope so the response remains valid JSON.
 fn render_json_body(status_code: u16, message: &str) -> String {
-    json_passthrough_body(message)
-        .unwrap_or_else(|| json_message_envelope(status_code, message))
+    json_passthrough_body(message).unwrap_or_else(|| json_message_envelope(status_code, message))
 }
 
 /// Parse `message` as one JSON value and return its compact serialization.
