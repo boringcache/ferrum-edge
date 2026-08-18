@@ -84,8 +84,8 @@ fn sidecar_handshake_failure_body_is_the_reported_regression() {
     // The exact shape reported in #3927 — a sidecar-to-sidecar `:15006`
     // SVID-mTLS handshake failure — must no longer be labeled HBONE, and must
     // still say which phase failed.
-    let reason = tls_handshake_error().public_reason();
-    let body = MeshTransportLabel::SidecarMtls.unavailable_body_with_reason(reason);
+    let error = tls_handshake_error();
+    let body = MeshTransportLabel::SidecarMtls.unavailable_body_for_error(&error);
     assert_eq!(
         body,
         r#"{"error":"Sidecar mTLS backend unavailable: TLS handshake failed"}"#
@@ -94,8 +94,8 @@ fn sidecar_handshake_failure_body_is_the_reported_regression() {
 
 #[test]
 fn ambient_handshake_failure_body_still_says_hbone() {
-    let reason = tls_handshake_error().public_reason();
-    let body = MeshTransportLabel::Hbone.unavailable_body_with_reason(reason);
+    let error = tls_handshake_error();
+    let body = MeshTransportLabel::Hbone.unavailable_body_for_error(&error);
     assert_eq!(
         body,
         r#"{"error":"HBONE backend unavailable: TLS handshake failed"}"#
@@ -166,7 +166,7 @@ fn public_reason_never_echoes_peer_or_verifier_detail() {
             );
         }
         for label in [MeshTransportLabel::Hbone, MeshTransportLabel::SidecarMtls] {
-            let body = label.unavailable_body_with_reason(reason);
+            let body = label.unavailable_body_for_error(err);
             assert!(
                 !body.contains(SECRET_HOST) && !body.contains("BadSignature"),
                 "client body '{body}' leaked peer/verifier detail"
@@ -183,6 +183,20 @@ fn display_keeps_the_detail_the_operator_log_needs() {
     let rendered = tls_handshake_error().to_string();
     assert!(rendered.contains(SECRET_HOST), "{rendered}");
     assert!(rendered.contains("BadSignature"), "{rendered}");
+}
+
+#[test]
+fn shared_server_name_error_is_transport_neutral_in_operator_logs() {
+    let rendered = HbonePoolError::InvalidServerName {
+        host: SECRET_HOST.to_string(),
+        message: SECRET_VERIFIER_TEXT.to_string(),
+    }
+    .to_string();
+    assert!(rendered.contains("invalid mesh TLS server name"), "{rendered}");
+    assert!(
+        !rendered.contains("HBONE"),
+        "the shared error may be logged by the sidecar transport: {rendered}"
+    );
 }
 
 #[test]

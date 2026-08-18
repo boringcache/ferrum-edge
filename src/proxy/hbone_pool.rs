@@ -169,7 +169,7 @@ pub enum HbonePoolError {
         #[source]
         source: std::io::Error,
     },
-    #[error("invalid HBONE server name {host}: {message}")]
+    #[error("invalid mesh TLS server name {host}: {message}")]
     InvalidServerName { host: String, message: String },
     #[error("invalid {HBONE_DIAL_HOST_TAG} tag '{value}' on mesh target: {message}")]
     InvalidDialHostTag { value: String, message: String },
@@ -421,11 +421,16 @@ impl MeshTransportLabel {
     }
 
     /// Fixed JSON error body carrying the enumerated public reason from
-    /// [`HbonePoolError::public_reason`]. Both halves are `&'static str`, so no
-    /// peer address, certificate subject, SPIFFE ID, trust root, or raw
-    /// verifier text can reach the client through this body.
-    pub fn unavailable_body_with_reason(self, reason: &'static str) -> String {
-        format!(r#"{{"error":"{}: {}"}}"#, self.unavailable_noun(), reason)
+    /// [`HbonePoolError::public_reason`]. Accept the typed error rather than a
+    /// caller-supplied string so the redaction boundary is structural: a
+    /// future call site cannot accidentally pass `Display` (or another
+    /// peer-derived value) into the client body.
+    pub fn unavailable_body_for_error(self, error: &HbonePoolError) -> String {
+        format!(
+            r#"{{"error":"{}: {}"}}"#,
+            self.unavailable_noun(),
+            error.public_reason()
+        )
     }
 
     /// Operator-log noun for this transport. Used where the client-visible

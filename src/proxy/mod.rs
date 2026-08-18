@@ -44138,7 +44138,7 @@ fn mesh_transport_pool_error_response(
     let error_body = if error_class == retry::ErrorClass::DnsLookupError {
         transport.dns_failure_body().to_string()
     } else {
-        transport.unavailable_body_with_reason(err.public_reason())
+        transport.unavailable_body_for_error(err)
     };
     error!(
         proxy_id = %proxy.id,

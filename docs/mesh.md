@@ -4453,8 +4453,8 @@ they take precedence over `FERRUM_MESH_CA_BACKEND` when both are set.
 | Requirement | Why / enforced by |
 |---|---|
 | Cert file is a **leaf-first** PEM chain; each entry is issued by the next | `validate_certificate_chain_order` verifies issuer/subject linkage **and** the signature. The final root may be omitted, as is conventional for a presentation chain |
-| Leaf carries `basicConstraints = critical, CA:FALSE` | `validate_leaf_is_not_ca` refuses a CA certificate as a workload SVID |
-| Leaf carries `subjectAltName = URI:spiffe://<trust-domain>/…` | The SPIFFE ID (and therefore the trust domain) is read from the URI SAN. Without one, `FERRUM_GATEWAY_SPIFFE_ID` must supply it explicitly |
+| Leaf is not a CA; this recipe emits `basicConstraints = critical, CA:FALSE` | `validate_leaf_is_not_ca` refuses an explicit `CA:TRUE`. The loader also accepts an omitted basic-constraints extension, but an explicit critical `CA:FALSE` keeps the intended workload-leaf role unambiguous |
+| Leaf carries `subjectAltName = URI:spiffe://<trust-domain>/…` | Sidecar peer verification reads the SPIFFE identity from the certificate URI SAN, so this two-process recipe requires it. `FERRUM_GATEWAY_SPIFFE_ID` can supply the bundle's local identity when a certificate has no SPIFFE URI SAN, but it does not add a SAN to that certificate and cannot make a SAN-less leaf usable for this peer-verified sidecar path |
 | Leaf carries `extendedKeyUsage = serverAuth, clientAuth` | A sidecar is **both** ends: it terminates inbound mTLS and presents a client cert outbound. Peer verification runs through rustls' `WebPkiClientVerifier` in both directions |
 | Key is **PKCS#8** (`-----BEGIN PRIVATE KEY-----`) | `read_pkcs8_key_source` rejects PKCS#1 / SEC1 (`BEGIN RSA PRIVATE KEY`, `BEGIN EC PRIVATE KEY`) |
 | Key matches the leaf | `verify_leaf_key_match` compares canonical DER `SubjectPublicKeyInfo` bytes |
