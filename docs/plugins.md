@@ -4356,10 +4356,14 @@ config:
 Inspects HTTP-family traffic for content-threat patterns such as SQL injection,
 XSS, command injection, path traversal, SSRF, response disclosure, and
 data-leakage indicators. The built-in seed rules are monitor-only by default;
-set individual `rule_modes` or custom rule `action` values to `enforce` when a
-rule should block. Invalid WAF configuration is security-fatal at
-startup/reload, so the gateway does not silently serve without the intended
-inspection.
+set `default_rule_action: enforce` or individual `rule_modes` / custom rule
+`action` values to `enforce` when a rule should block. With `mode: enforce`,
+admission rejects configurations whose effective active ruleset has no
+`action: enforce` rule after defaults, overrides, disabled rules, and paranoia
+filtering — built-in pack plus `mode: enforce` alone is not blocking.
+`mode: monitor` with zero enforcing rules remains valid. Invalid WAF
+configuration is security-fatal at startup/reload, so the gateway does not
+silently serve without the intended inspection.
 
 **Admission.** Fixed-shape objects reject unknown keys with path-qualified
 diagnostics and spelling suggestions before defaults apply (top-level config,
@@ -4575,6 +4579,8 @@ under these start-anchored exemption semantics.
 config:
   mode: enforce
   include_default_rules: true
+  default_rule_action: enforce
+  paranoia_level: 1
   rule_modes:
     FE-XSS-001: enforce
     FE-SQLI-002: enforce

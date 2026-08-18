@@ -400,6 +400,9 @@ impl Waf {
             );
         }
 
+        let scoring = parse_scoring(object.get("scoring"))?;
+        validate_enforce_mode_has_enforcing_rules(mode, &compiled, stream.as_ref(), &scoring)?;
+
         let config = WafConfig {
             mode,
             paranoia_level,
@@ -435,7 +438,7 @@ impl Waf {
                 .unwrap_or_else(|| "application/json".to_string()),
             reject_body: optional_string(object, "reject_body")?
                 .unwrap_or_else(|| r#"{"error":"Forbidden"}"#.to_string()),
-            scoring: parse_scoring(object.get("scoring"))?,
+            scoring,
         };
         if !(400..=599).contains(&config.reject_status_code) {
             return Err("waf: 'reject_status_code' must be from 400 to 599".to_string());
@@ -1857,6 +1860,41 @@ fn parse_too_large_action(raw: &str) -> Result<TooLargeAction, String> {
              skip, or block; got {other:?}"
         )),
     }
+}
+
+/// Reject `mode: enforce` when nothing in the effective active ruleset can
+/// block under that mode. Built-in rules ship monitor-only unless opted in;
+/// anomaly scoring and stream transport guards are separate enforcement paths.
+fn validate_enforce_mode_has_enforcing_rules(
+    mode: GlobalMode,
+    compiled: &CompiledRules,
+    stream: Option<&StreamWafConfig>,
+    scoring: &Option<ScoringConfig>,
+) -> Result<(), String> {
+    if mode != GlobalMode::Enforce {
+        return Ok(());
+    }
+    if scoring.is_some() {
+        return Ok(());
+    }
+    if compiled
+        .rules
+        .iter()
+        .any(|rule| rule.action == RuleAction::Enforce)
+    {
+        return Ok(());
+    }
+    if stream.is_some_and(|cfg| {
+        cfg.tcp_require_tls || cfg.signatures.has_enforce_action()
+    }) {
+        return Ok(());
+    }
+    Err(
+        "waf: mode is 'enforce' but the effective active ruleset has no rule with action \
+         'enforce'. Built-in rules are monitor-only by default; set 'default_rule_action' to \
+         'enforce' or opt rules in via 'rule_modes' / custom_rules[].action"
+            .to_string(),
+    )
 }
 
 fn parse_scoring(value: Option<&Value>) -> Result<Option<ScoringConfig>, String> {
