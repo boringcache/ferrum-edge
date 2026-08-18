@@ -97,10 +97,7 @@ fn unexpected_probe_failures_stay_warn() {
         ("timeout", connect_timeout()),
     ] {
         assert_eq!(
-            grpc_establishment_failure_log_level(
-                GrpcEstablishmentPurpose::CapabilityProbe,
-                &error,
-            ),
+            grpc_establishment_failure_log_level(GrpcEstablishmentPurpose::CapabilityProbe, &error,),
             GrpcEstablishmentLogLevel::Warn,
             "{label} during a capability probe must stay WARN"
         );

@@ -10027,7 +10027,8 @@ impl ProxyState {
             probe_timeout,
             self.grpc_pool.get_sender_for_capability_probe(probe_proxy),
         )
-        .await {
+        .await
+        {
             Ok(Ok(_)) => {
                 record.grpc_transport.h2c = ProtocolSupport::Supported;
             }

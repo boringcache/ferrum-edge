@@ -3,7 +3,7 @@ use async_trait::async_trait;
 use dashmap::DashMap;
 use dashmap::mapref::entry::Entry;
 use std::cell::RefCell;
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 use tokio::sync::{Semaphore, watch};
@@ -792,16 +792,13 @@ impl<M: PoolManager> GenericPool<M> {
 
             let pending_guard = PendingCreationGuard::new(self, key.clone(), pending);
             let result = self
-                .create_after_recheck(
-                    key.clone(),
-                    {
-                        let create = create
-                            .take()
-                            .expect("create closure should only be consumed by the creator");
-                        let attempt = attempt.clone();
-                        move |key| create(key, attempt)
-                    },
-                )
+                .create_after_recheck(key.clone(), {
+                    let create = create
+                        .take()
+                        .expect("create closure should only be consumed by the creator");
+                    let attempt = attempt.clone();
+                    move |key| create(key, attempt)
+                })
                 .await;
             match result {
                 Ok(conn) => {
