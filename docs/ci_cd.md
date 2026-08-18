@@ -1119,18 +1119,28 @@ measurement fidelity or trigger breadth:
 
 **Runs**: `ubuntu-latest`, `macos-latest`, `windows-latest`
 
-Full-mode PRs build the native Linux x86_64 verification binary. Pushes to
-`main` build optimized release binaries for Linux x86_64, Linux ARM64, macOS
-x86_64, macOS ARM64, and Windows x86_64. Native targets share the ordinary
-matrix; Linux ARM64 runs only after code reaches `main`, in the isolated
-`build-arm64-cross` job described below. The jobs install the same prerequisites
-as the Release pipeline — `protoc` on every OS, `libcurl4-openssl-dev` on Linux,
-and NASM on Windows — and build with `--features cloud-secrets` so
-Vault/AWS/Azure/GCP secret backends are included. The macOS x86_64 build targets
-`x86_64-apple-darwin` with the standard Apple/Rust toolchain (no `cross` needed)
-and runs on whichever host architecture GitHub maps `macos-latest` to today
-(currently ARM64); pin to a concrete runner image such as `macos-14` if the
-host architecture must be guaranteed.
+Full-mode PRs compile the native Linux x86_64 verification binary with
+`--profile pr-build`. `merge_group` keeps all four native targets as
+fail-closed compile gates whose outputs are discarded: Linux x86_64 and
+Windows x86_64 still `cargo build --profile pr-build` (Windows MSVC/NASM
+linkage is the platform-specific failure mode `cargo check` cannot see);
+macOS x86_64 and macOS ARM64 run `cargo check --profile pr-build` because
+queue binaries are never published. Pushes to `main` build optimized
+`release` binaries for Linux x86_64, Linux ARM64, macOS x86_64, macOS ARM64,
+and Windows x86_64. Native targets share the ordinary matrix; Linux ARM64
+runs only after code reaches `main`, in the isolated `build-arm64-cross` job
+described below. rust-cache keys are split by profile lane
+(`build-<target>-prbuild` vs `build-<target>-release`) so queue check/pr-build
+trees cannot evict push-to-main release artifacts. Each native job installs
+the pinned repository `setup-sccache` action and reports `sccache --show-stats`
+after compile. The jobs install the same prerequisites as the Release pipeline
+— `protoc` on every OS, `libcurl4-openssl-dev` on Linux, and NASM on Windows —
+and compile with `--features cloud-secrets` so Vault/AWS/Azure/GCP secret
+backends are included. The macOS x86_64 build targets `x86_64-apple-darwin`
+with the standard Apple/Rust toolchain (no `cross` needed) and runs on
+whichever host architecture GitHub maps `macos-latest` to today (currently
+ARM64); pin to a concrete runner image such as `macos-14` if the host
+architecture must be guaranteed.
 
 ##### Trusted ARM64 Cross boundary
 
@@ -2940,10 +2950,13 @@ strategy:
 ```
 
 Musl targets need their own toolchain setup. Add `musl-tools` before a native
-`cargo build`. A Cross-backed target requires a separate isolated invocation
-job, a complete Cross configuration allowlist, fixed empty environment, and an
-updated trusted verifier contract; do not add an unguarded Cross invocation to
-the native matrix.
+`cargo build`. Merge-queue compile gates for discarded artifacts live in the
+`build-binaries` compile-gate step (`cargo check` on `*-apple-darwin`, linked
+`pr-build` elsewhere); do not feed queue outputs into Prepare/Upload. A
+Cross-backed target requires a separate isolated invocation job, a complete
+Cross configuration allowlist, fixed empty environment, and an updated trusted
+verifier contract; do not add an unguarded Cross invocation to the native
+matrix.
 
 ### Skipping Steps
 

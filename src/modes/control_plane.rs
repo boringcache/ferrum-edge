@@ -4161,6 +4161,10 @@ mod tests {
     use crate::config::db_backend::{IncrementalResult, NamespacedResourceId};
     use crate::config::types::*;
     use chrono::{TimeZone, Utc};
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
     use std::time::Instant;
 
     fn empty_incremental() -> IncrementalResult {
@@ -4822,10 +4826,16 @@ mod tests {
     #[tokio::test]
     async fn cp_shutdown_drains_remaining_listeners_when_one_panics() {
         let (shutdown_tx, _) = tokio::sync::watch::channel(false);
+        let drained_listeners = Arc::new(AtomicUsize::new(0));
 
         let mut admin_http_rx = shutdown_tx.subscribe();
+        let admin_http_drained = Arc::clone(&drained_listeners);
         let admin_http = tokio::spawn(async move {
-            let _ = admin_http_rx.changed().await;
+            admin_http_rx
+                .changed()
+                .await
+                .expect("shutdown sender must stay alive");
+            admin_http_drained.fetch_add(1, Ordering::Relaxed);
             Ok::<(), anyhow::Error>(())
         });
 
@@ -4834,8 +4844,13 @@ mod tests {
         });
 
         let mut admin_https_rx = shutdown_tx.subscribe();
+        let admin_https_drained = Arc::clone(&drained_listeners);
         let admin_https = tokio::spawn(async move {
-            let _ = admin_https_rx.changed().await;
+            admin_https_rx
+                .changed()
+                .await
+                .expect("shutdown sender must stay alive");
+            admin_https_drained.fetch_add(1, Ordering::Relaxed);
             Ok::<(), anyhow::Error>(())
         });
 
@@ -4845,14 +4860,12 @@ mod tests {
             ("CP admin HTTPS listener".to_string(), admin_https),
         ];
 
-        let started = Instant::now();
         let result = wait_for_cp_listeners_until_shutdown_or_exit(
             listener_handles,
             shutdown_tx,
             Duration::from_secs(2),
         )
         .await;
-        let elapsed = started.elapsed();
 
         let err = result.expect_err("the gRPC listener panicked, helper must return Err");
         let rendered = format!("{err:#}");
@@ -4860,9 +4873,10 @@ mod tests {
             rendered.contains("panicked"),
             "error should report panic; got {rendered}",
         );
-        assert!(
-            elapsed < std::time::Duration::from_secs(2),
-            "remaining listeners should drain via shutdown trigger; took {elapsed:?}",
+        assert_eq!(
+            drained_listeners.load(Ordering::Relaxed),
+            2,
+            "both remaining listeners must observe shutdown and drain",
         );
     }
 
