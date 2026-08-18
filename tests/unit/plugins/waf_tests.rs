@@ -3387,6 +3387,254 @@ async fn rule_modes_still_overrides_default_rule_action() {
     );
 }
 
+fn bulk_enforce_waf() -> Waf {
+    Waf::new(&json!({
+        "mode": "enforce",
+        "default_rule_action": "enforce",
+        "paranoia_level": 1
+    }))
+    .unwrap()
+}
+
+async fn scan_form_body(plugin: &Waf, body: &[u8]) -> (PluginResult, RequestContext) {
+    let mut ctx = ctx("POST", "/w/encoding");
+    ctx.headers.insert(
+        "content-type".into(),
+        "application/x-www-form-urlencoded".into(),
+    );
+    let headers = ctx.headers.clone();
+    let result = plugin
+        .on_final_request_body_with_context(&mut ctx, &headers, body)
+        .await;
+    (result, ctx)
+}
+
+fn assert_encoding_monitored(result: &PluginResult, ctx: &RequestContext, rule_id: &str) {
+    assert!(
+        matches!(result, PluginResult::Continue),
+        "expected continue for {rule_id}, got {result:?}"
+    );
+    assert!(
+        monitored(ctx, rule_id),
+        "expected {rule_id} in {:?}",
+        ctx.metadata.get("waf.rule_hits")
+    );
+    assert_eq!(
+        ctx.metadata.get("waf.action").map(String::as_str),
+        Some("monitored")
+    );
+    assert!(!ctx.metadata.contains_key("waf.first_blocking_rule"));
+}
+
+#[tokio::test]
+async fn default_posture_monitors_encoding_heuristics() {
+    let plugin = Waf::new(&json!({ "mode": "enforce" })).unwrap();
+    let (result, ctx) = scan_form_body(&plugin, b"code=SAVE50%25").await;
+    assert_encoding_monitored(&result, &ctx, "FE-ENCODING-001");
+}
+
+#[tokio::test]
+async fn bulk_enforce_monitors_benign_save50_percent_body() {
+    let plugin = bulk_enforce_waf();
+    let (result, ctx) = scan_form_body(&plugin, b"code=SAVE50%25").await;
+    assert_encoding_monitored(&result, &ctx, "FE-ENCODING-001");
+}
+
+#[tokio::test]
+async fn bulk_enforce_monitors_save50_percent_query() {
+    let plugin = bulk_enforce_waf();
+    let mut ctx = ctx("GET", "/w/encoding");
+    ctx.set_raw_query_string("code=SAVE50%25".into());
+    let result = plugin.authorize(&mut ctx).await;
+    assert_encoding_monitored(&result, &ctx, "FE-ENCODING-001");
+}
+
+#[tokio::test]
+async fn bulk_enforce_monitors_null_byte_encoding() {
+    let plugin = bulk_enforce_waf();
+    let (result, ctx) = scan_form_body(&plugin, b"foo%00bar").await;
+    assert_encoding_monitored(&result, &ctx, "FE-ENCODING-001");
+}
+
+#[tokio::test]
+async fn bulk_enforce_monitors_overlong_utf8_encoding() {
+    let plugin = bulk_enforce_waf();
+    let (result, ctx) = scan_form_body(&plugin, b"foo%c0%aebar").await;
+    assert_encoding_monitored(&result, &ctx, "FE-ENCODING-002");
+}
+
+#[tokio::test]
+async fn rule_modes_promotes_encoding_double_encode_to_enforce() {
+    let plugin = Waf::new(&json!({
+        "mode": "enforce",
+        "default_rule_action": "enforce",
+        "rule_modes": { "FE-ENCODING-001": "enforce" }
+    }))
+    .unwrap();
+    let (result, ctx) = scan_form_body(&plugin, b"code=SAVE50%25").await;
+    assert!(matches!(result, PluginResult::Reject { .. }));
+    assert_eq!(
+        ctx.metadata.get("waf.action").map(String::as_str),
+        Some("blocked")
+    );
+    assert_eq!(
+        ctx.metadata
+            .get("waf.first_blocking_rule")
+            .map(String::as_str),
+        Some("FE-ENCODING-001")
+    );
+}
+
+#[tokio::test]
+async fn rule_modes_promotes_encoding_overlong_to_enforce() {
+    let plugin = Waf::new(&json!({
+        "mode": "enforce",
+        "default_rule_action": "enforce",
+        "rule_modes": { "FE-ENCODING-002": "enforce" }
+    }))
+    .unwrap();
+    let (overlong, overlong_ctx) = scan_form_body(&plugin, b"foo%c0%aebar").await;
+    assert!(matches!(overlong, PluginResult::Reject { .. }));
+    assert_eq!(
+        overlong_ctx
+            .metadata
+            .get("waf.first_blocking_rule")
+            .map(String::as_str),
+        Some("FE-ENCODING-002")
+    );
+
+    let (coupon, coupon_ctx) = scan_form_body(&plugin, b"code=SAVE50%25").await;
+    assert_encoding_monitored(&coupon, &coupon_ctx, "FE-ENCODING-001");
+}
+
+#[tokio::test]
+async fn rule_override_action_promotes_encoding_to_enforce() {
+    let plugin = Waf::new(&json!({
+        "mode": "enforce",
+        "default_rule_action": "enforce",
+        "rule_overrides": { "FE-ENCODING-001": { "action": "enforce" } }
+    }))
+    .unwrap();
+    let (result, ctx) = scan_form_body(&plugin, b"foo%00bar").await;
+    assert!(matches!(result, PluginResult::Reject { .. }));
+    assert_eq!(
+        ctx.metadata
+            .get("waf.first_blocking_rule")
+            .map(String::as_str),
+        Some("FE-ENCODING-001")
+    );
+}
+
+#[tokio::test]
+async fn rule_modes_can_disable_encoding_heuristic() {
+    let plugin = Waf::new(&json!({
+        "mode": "enforce",
+        "default_rule_action": "enforce",
+        "rule_modes": { "FE-ENCODING-001": "disabled" }
+    }))
+    .unwrap();
+    let (result, ctx) = scan_form_body(&plugin, b"code=SAVE50%25").await;
+    assert!(matches!(result, PluginResult::Continue));
+    assert!(
+        ctx.metadata
+            .get("waf.rule_hits")
+            .is_none_or(|hits| !hits.split(',').any(|hit| hit == "FE-ENCODING-001")),
+        "disabled FE-ENCODING-001 must not record a hit, got {:?}",
+        ctx.metadata.get("waf.rule_hits")
+    );
+    assert!(!ctx.metadata.contains_key("waf.first_blocking_rule"));
+}
+
+#[tokio::test]
+async fn bulk_disabled_still_drops_encoding_heuristics() {
+    let plugin = Waf::new(&json!({
+        "mode": "enforce",
+        "default_rule_action": "disabled",
+        "rule_modes": { "FE-SQLI-001": "enforce" }
+    }))
+    .unwrap();
+    let (encoding, encoding_ctx) = scan_form_body(&plugin, b"code=SAVE50%25").await;
+    assert!(matches!(encoding, PluginResult::Continue));
+    assert!(
+        encoding_ctx
+            .metadata
+            .get("waf.rule_hits")
+            .is_none_or(|hits| !hits.contains("FE-ENCODING-001"))
+    );
+
+    let mut sqli = ctx("GET", "/search");
+    sqli.set_raw_query_string("q=union+select+1".into());
+    let result = plugin.authorize(&mut sqli).await;
+    assert!(matches!(result, PluginResult::Reject { .. }));
+    assert_eq!(
+        sqli.metadata
+            .get("waf.first_blocking_rule")
+            .map(String::as_str),
+        Some("FE-SQLI-001")
+    );
+}
+
+#[tokio::test]
+async fn encoding_rule_modes_enforce_monitors_when_global_mode_is_monitor() {
+    let plugin = Waf::new(&json!({
+        "mode": "monitor",
+        "default_rule_action": "enforce",
+        "rule_modes": { "FE-ENCODING-001": "enforce" }
+    }))
+    .unwrap();
+    let (result, ctx) = scan_form_body(&plugin, b"code=SAVE50%25").await;
+    assert_encoding_monitored(&result, &ctx, "FE-ENCODING-001");
+}
+
+#[tokio::test]
+async fn global_disabled_mode_skips_encoding_evaluation() {
+    let plugin = Waf::new(&json!({
+        "mode": "disabled",
+        "default_rule_action": "enforce",
+        "rule_modes": { "FE-ENCODING-001": "enforce" }
+    }))
+    .unwrap();
+    let (result, ctx) = scan_form_body(&plugin, b"code=SAVE50%25").await;
+    assert!(matches!(result, PluginResult::Continue));
+    assert!(!ctx.metadata.contains_key("waf.rule_hits"));
+    assert!(!ctx.metadata.contains_key("waf.first_blocking_rule"));
+}
+
+#[tokio::test]
+async fn bulk_enforce_encoding_hit_scores_as_monitor() {
+    let plugin = Waf::new(&json!({
+        "mode": "enforce",
+        "default_rule_action": "enforce",
+        "scoring": { "enabled": true, "block_threshold": 10 }
+    }))
+    .unwrap();
+    let (result, ctx) = scan_form_body(&plugin, b"code=SAVE50%25").await;
+    assert_encoding_monitored(&result, &ctx, "FE-ENCODING-001");
+    assert_eq!(ctx.metadata.get("waf.score").map(String::as_str), Some("3"));
+    assert_eq!(
+        ctx.metadata.get("waf.block_reason").map(String::as_str),
+        None
+    );
+}
+
+#[tokio::test]
+async fn bulk_enforce_still_blocks_encoded_null_path_traversal() {
+    // Audit: FE-PATHTRAV-003 (`%00` on the URL) inherits bulk enforce. Body
+    // `%00` stays monitor via FE-ENCODING-001; URL `%00` is attack-shaped
+    // path truncation and still blocks under the recommended posture.
+    let plugin = bulk_enforce_waf();
+    let mut ctx = ctx("GET", "/download");
+    ctx.set_raw_query_string("file=foo%00bar".into());
+    let result = plugin.authorize(&mut ctx).await;
+    assert!(matches!(result, PluginResult::Reject { .. }));
+    assert_eq!(
+        ctx.metadata
+            .get("waf.first_blocking_rule")
+            .map(String::as_str),
+        Some("FE-PATHTRAV-003")
+    );
+}
+
 #[tokio::test]
 async fn rule_override_attaches_fp_filter_to_built_in_rule() {
     // Gap 1.6: tune a noisy built-in without forking the rule pack.
@@ -3417,6 +3665,7 @@ async fn rule_override_fp_filter_suppresses_special_encoding_rule() {
     let plugin = Waf::new(&json!({
         "mode": "enforce",
         "default_rule_action": "enforce",
+        "rule_modes": { "FE-ENCODING-001": "enforce" },
         "rule_overrides": {
             "FE-ENCODING-001": { "fp_filters": ["known%252fpath"] }
         }

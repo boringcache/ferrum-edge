@@ -4438,7 +4438,7 @@ scanning the parsed key/value map and a best-effort reconstructed URL.
 | `include_default_rules` | bool | `true` | Include Ferrum's built-in seed rules. |
 | `disabled_default_rules` | string[] | `[]` | Built-in rule IDs to remove from the active ruleset. |
 | `rule_modes` | object | `{}` | Per-rule action overrides keyed by rule ID. Values: `enforce`, `monitor`, `disabled` (aliases like `block` and `off` are accepted). |
-| `default_rule_action` | string | _(unset)_ | Bulk action for built-in rules: `enforce`, `monitor`, or `disabled`. Unset keeps the safe monitor-only default for built-ins. |
+| `default_rule_action` | string | _(unset)_ | Bulk action for built-in rules that inherit it: `enforce`, `monitor`, or `disabled`. Unset keeps the safe monitor-only default. Encoding-evasion heuristics (`FE-ENCODING-001`, `FE-ENCODING-002`) stay monitor under bulk `enforce` until an explicit `rule_modes` or `rule_overrides.action` entry promotes them. |
 | `rule_overrides` | object | `{}` | Per-rule field overrides for supported rule metadata such as action/severity/paranoia tuning. |
 | `scoring` | object | _(none)_ | Optional anomaly scoring. Configure `block_threshold` and optional severity weights so multiple monitored hits can block when **that instance's** accumulated score crosses the threshold. Scores are isolated per WAF plugin-config instance; see [Anomaly scoring](waf.md#anomaly-scoring). |
 | `custom_rules` | object[] | `[]` | Additional rules. See custom rule fields below. |
@@ -4480,9 +4480,12 @@ body whenever that direction actually carries an enforcing body policy: global
 `mode: enforce` plus either anomaly `scoring` with an applicable body rule or at
 least one applicable `action: enforce` rule reading `body_text` /
 `body_json_path` (request) or `response_body` (response), including the
-body-scoped `FE-ENCODING-001` / `FE-ENCODING-002` specials, which read both
-directions. A rule is applicable only when its path, method, header, and consumer
-conditions match the current request, and a request-wide
+body-scoped `FE-ENCODING-001` / `FE-ENCODING-002` specials when those rules
+are themselves enforce. Encoding specials stay monitor under bulk
+`default_rule_action: enforce` until `rule_modes` or `rule_overrides.action`
+promotes them, and they read both directions. A rule is applicable only when
+its path, method, header, and consumer conditions match the current request,
+and a request-wide
 `global_exemptions.header_present` match suppresses the fail-closed decision as
 well as rule hits. The request and response paths use the same decision, so H1,
 H2, and H3 behave identically. A body whose length is *exactly*
