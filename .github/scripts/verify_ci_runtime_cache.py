@@ -135,7 +135,11 @@ YAML_MAPPING_LINE = re.compile(
     rf"^(?P<lead>[ \t]*)(?P<dash>-[ \t]+)?(?P<key>{YAML_KEY_TOKEN})[ \t]*:(?P<value>.*)$"
 )
 YAML_FLOW_STEP = re.compile(r"^(?P<lead>[ \t]*)-[ \t]+(?P<flow>[\{\[].*)$")
-YAML_BLOCK_SCALAR = re.compile(r"^[|>][+-]?(?:\d+)?(?:[ \t]+(?:#.*)?)?$")
+# YAML permits the chomping and indentation indicators in either order
+# (`|-2` and `|2-`). A valid indentation indicator is one digit from 1-9.
+YAML_BLOCK_SCALAR = re.compile(
+    r"^[|>](?:[+-](?:[1-9])?|[1-9][+-]?)?(?:[ \t]+(?:#.*)?)?$"
+)
 YAML_EXPLICIT_KEY = re.compile(r"^[ \t]*(?:-[ \t]+)?\?")
 YAML_SEQUENCE_ITEM = re.compile(r"^[ \t]*-[ \t]+(?P<item>.+)$")
 YAML_DOCUMENT_MARK = frozenset({"---", "..."})
@@ -1493,6 +1497,17 @@ def _scan_yaml_actions(
                 _scan_structural_text(remainder, uses, using, errors)
                 _note_step_actions(current, uses, using, uses_before, using_before)
             index += 1
+            continue
+        if dash_item is not None and YAML_BLOCK_SCALAR.match(
+            _yaml_strip_trailing_comment(content).strip()
+        ):
+            # A standalone sequence scalar (`- |` / `- >2-`) is data, not a
+            # step mapping. Its body can contain text such as `uses: ...` and
+            # must not satisfy the closed action-count allowlist. The dash
+            # column is the sequence item's parent indentation; the scalar
+            # body is necessarily more indented than it.
+            sequence_indent = len(line) - len(stripped)
+            index = _skip_block_scalar(lines, index + 1, sequence_indent)
             continue
         flow_step = YAML_FLOW_STEP.match(line)
         if flow_step:
@@ -4650,6 +4665,56 @@ def self_test() -> int:
     require(
         setup_step in real_fips,
         "self-test: fips-build.yml must still contain the setup-sccache step",
+        failures,
+    )
+
+    sequence_scalar_text = (
+        "paths:\n"
+        "  - |\n"
+        "      uses: actions/github-script@decoy\n"
+        "  - >2-\n"
+        "      using: node20\n"
+    )
+    scalar_uses, scalar_using, scalar_errors = scan_yaml_action_invocations(
+        sequence_scalar_text
+    )
+    require(
+        not scalar_uses and not scalar_using and not scalar_errors,
+        "self-test: standalone sequence block-scalar bodies must remain data, "
+        "not action-count carriers: "
+        f"uses={scalar_uses} using={scalar_using} errors={scalar_errors}",
+        failures,
+    )
+
+    scalar_count_decoy = real_fips.replace(
+        "    branches: [main]\n",
+        "    branches:\n"
+        "      - main\n"
+        "      - |\n"
+        "          uses: ./.github/actions/setup-sccache\n",
+        1,
+    ).replace(setup_step, "      - run: true\n", 1)
+    require(
+        "      - |\n          uses: ./.github/actions/setup-sccache\n"
+        in scalar_count_decoy
+        and scalar_count_decoy.count(setup_step) == real_fips.count(setup_step) - 1,
+        "self-test: sequence block-scalar decoy mutation must insert inert text "
+        "and remove exactly one real setup-sccache action",
+        failures,
+    )
+    scalar_count_failures: list[str] = []
+    check_fips_action_allowlist(
+        scalar_count_decoy,
+        "self-test-sequence-block-scalar-count-decoy",
+        scalar_count_failures,
+    )
+    require(
+        any(
+            "./.github/actions/setup-sccache observed=3 expected=4" in item
+            for item in scalar_count_failures
+        ),
+        "self-test: inert sequence block-scalar text must not replace a real "
+        f"allowlisted invocation: {scalar_count_failures}",
         failures,
     )
 
