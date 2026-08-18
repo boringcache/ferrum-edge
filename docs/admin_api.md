@@ -436,6 +436,20 @@ The Admin API validates `listen_port` at creation and update time:
 
 In **CP mode**, the gateway reserved port and OS-level checks are skipped since stream proxies run on remote Data Plane nodes.
 
+### Database-mode live apply
+
+In `FERRUM_MODE=database`, a successful create, update, or delete (proxies,
+consumers, plugins, upstreams, credentials, API specs, batch, and restore)
+returns 2xx only after the same authoritative poll-loop reload that periodic
+ticks use has published the committed `config_changes` generation. `GET /proxies`
+already reads the database, so a 201 with an empty live snapshot is no longer
+possible on this process. If reload cannot apply, the API returns `503` with
+`{"error":"...","applied":false,"reason":"config_rejected"|"reload_timeout"|"sequence_unavailable"}`.
+The row is durable; retry or repair the rejected candidate. Writes to a
+namespace this process does not serve, and writes in CP/file/DP modes, do not
+wait. External writers still become live on the next poll interval or
+change-stream wake.
+
 ## Consumers
 
 Consumer identity is one keyspace per namespace: `id`, `username`, and `custom_id` must all be mutually unique across every consumer in a namespace (a consumer whose own `custom_id` equals its own `id`/`username` is fine). Cross-field collisions — e.g. one consumer's `username` equalling another's `custom_id` — are rejected with `409 Conflict`, enforced both by the admission precheck and by a persistence-level unique constraint (`consumer_identity_index`), so concurrent writes cannot race a collision in. Consumer `id` values are scoped per namespace: the same id may exist in two namespaces.

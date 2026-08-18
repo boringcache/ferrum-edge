@@ -11,6 +11,8 @@
 //! - `config_backup` — On-disk JSON backup for DB-unreachable startup failover
 //! - `config_change_watch` — Coalesced wake-up signal for backend-native
 //!   config-change watchers (MongoDB replica-set change streams)
+//! - `runtime_config_apply` — Database-mode admin read-your-write wait on the
+//!   authoritative poll-loop reload (issue #3926)
 //! - `config_migration` — Config format version migrations (chain-of-responsibility)
 //! - `migrations` — SQL schema migrations for database mode
 //! - `plugin_trigger` — Declarative per-plugin-instance execution triggers
@@ -28,6 +30,9 @@ pub mod stable_file;
 // are consumed only through external tests, which the bin target cannot see.
 #[allow(dead_code)]
 pub mod config_change_watch;
+/// In-process database-mode admin write live-apply coordinator (issue #3926).
+#[allow(dead_code)]
+pub mod runtime_config_apply;
 pub mod config_migration;
 pub mod db_backend;
 pub mod db_loader;

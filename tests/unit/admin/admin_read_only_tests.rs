@@ -85,6 +85,7 @@ fn create_test_admin_state(config: &TestConfig, read_only: bool) -> AdminState {
         external_ref_loader: std::sync::Arc::new(
             ferrum_edge::admin::api_specs::DefaultExternalDocumentLoader::default(),
         ),
+        runtime_config_apply: None,
     }
 }
 
@@ -234,6 +235,7 @@ async fn test_admin_state_mode_field() {
         external_ref_loader: std::sync::Arc::new(
             ferrum_edge::admin::api_specs::DefaultExternalDocumentLoader::default(),
         ),
+        runtime_config_apply: None,
     };
     assert_eq!(admin_state_prod.mode, "production");
 }
@@ -294,6 +296,7 @@ async fn test_check_write_allowed_permits_when_db_available() {
         external_ref_loader: std::sync::Arc::new(
             ferrum_edge::admin::api_specs::DefaultExternalDocumentLoader::default(),
         ),
+        runtime_config_apply: None,
     };
     assert!(
         state.check_write_allowed().is_none(),
@@ -346,6 +349,7 @@ async fn test_check_write_allowed_blocks_when_db_unavailable() {
         external_ref_loader: std::sync::Arc::new(
             ferrum_edge::admin::api_specs::DefaultExternalDocumentLoader::default(),
         ),
+        runtime_config_apply: None,
     };
     let resp = state.check_write_allowed();
     assert!(
@@ -404,6 +408,7 @@ async fn test_check_write_allowed_blocks_when_read_only() {
         external_ref_loader: std::sync::Arc::new(
             ferrum_edge::admin::api_specs::DefaultExternalDocumentLoader::default(),
         ),
+        runtime_config_apply: None,
     };
     let resp = state.check_write_allowed();
     assert!(
@@ -461,6 +466,7 @@ async fn test_check_write_allowed_permits_when_no_db_flag() {
         external_ref_loader: std::sync::Arc::new(
             ferrum_edge::admin::api_specs::DefaultExternalDocumentLoader::default(),
         ),
+        runtime_config_apply: None,
     };
     assert!(
         state.check_write_allowed().is_none(),
@@ -513,6 +519,7 @@ async fn test_db_available_flag_transitions() {
         external_ref_loader: std::sync::Arc::new(
             ferrum_edge::admin::api_specs::DefaultExternalDocumentLoader::default(),
         ),
+        runtime_config_apply: None,
     };
 
     // Initially available
@@ -593,6 +600,7 @@ async fn test_check_write_allowed_blocks_on_failover_without_opt_in() {
         external_ref_loader: std::sync::Arc::new(
             ferrum_edge::admin::api_specs::DefaultExternalDocumentLoader::default(),
         ),
+        runtime_config_apply: None,
     };
 
     assert!(
@@ -675,6 +683,7 @@ async fn test_check_write_allowed_opt_in_is_policy_pure() {
         external_ref_loader: std::sync::Arc::new(
             ferrum_edge::admin::api_specs::DefaultExternalDocumentLoader::default(),
         ),
+        runtime_config_apply: None,
     };
 
     assert!(
@@ -771,6 +780,7 @@ async fn test_admit_write_pins_and_blocks_on_failover_without_opt_in() {
         external_ref_loader: std::sync::Arc::new(
             ferrum_edge::admin::api_specs::DefaultExternalDocumentLoader::default(),
         ),
+        runtime_config_apply: None,
     };
 
     let Err(err) = state.admit_write().await else {
@@ -834,6 +844,7 @@ async fn test_admit_non_config_db_write_keeps_read_only_and_db_unavailable_gates
         external_ref_loader: std::sync::Arc::new(
             ferrum_edge::admin::api_specs::DefaultExternalDocumentLoader::default(),
         ),
+        runtime_config_apply: None,
     };
     let Err(read_only_err) = read_only_state.admit_non_config_db_write().await else {
         panic!("admit_non_config_db_write must honor read-only mode");
@@ -844,6 +855,7 @@ async fn test_admit_non_config_db_write_keeps_read_only_and_db_unavailable_gates
         read_only: false,
         db_available: Some(db_flag),
         ..read_only_state
+        runtime_config_apply: None,
     };
     let Err(unavailable_err) = unavailable_state.admit_non_config_db_write().await else {
         panic!("admit_non_config_db_write must honor database-unavailable");
@@ -922,6 +934,7 @@ async fn test_admit_write_retains_pin_for_mutation_lifetime_on_primary() {
         external_ref_loader: std::sync::Arc::new(
             ferrum_edge::admin::api_specs::DefaultExternalDocumentLoader::default(),
         ),
+        runtime_config_apply: None,
     };
 
     let permit = state

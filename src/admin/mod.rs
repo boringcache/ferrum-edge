@@ -456,6 +456,11 @@ pub struct AdminState {
     pub external_ref_policy: std::sync::Arc<crate::admin::api_specs::ExternalRefProcessPolicy>,
     /// Loader used when external `$ref` resolution is effectively enabled.
     pub external_ref_loader: std::sync::Arc<crate::admin::api_specs::DefaultExternalDocumentLoader>,
+    /// Database-mode coordinator that waits for the poll-loop reload to publish
+    /// a committed `config_changes` sequence before admin mutations return 2xx
+    /// (issue #3926). `None` in every other mode and in tests that do not run
+    /// a poll loop, so existing write handlers stay non-blocking.
+    pub runtime_config_apply: Option<Arc<crate::config::runtime_config_apply::RuntimeConfigApply>>,
 }
 
 impl AdminState {
@@ -481,6 +486,55 @@ impl AdminState {
     /// [`Self::check_write_allowed`], for observe-only callers such as `/health`).
     pub fn admin_writes_currently_blocked(&self) -> bool {
         self.check_write_allowed().is_some()
+    }
+
+    /// After a config-database mutation commits, wait until that generation is
+    /// live on this process (issue #3926).
+    ///
+    /// No-ops when this process has no poll-loop coordinator (CP/DP/file/tests)
+    /// or when the write targeted a namespace this process does not serve.
+    /// Failures are truthful 503s: the row is already committed.
+    pub(crate) async fn await_live_apply_after_commit(
+        &self,
+        namespace: &str,
+    ) -> Result<(), Response<Full<Bytes>>> {
+        let Some(apply) = self.runtime_config_apply.as_ref() else {
+            return Ok(());
+        };
+        if !apply.serves_namespace(namespace) {
+            return Ok(());
+        }
+        let Some(db) = self.db.as_ref() else {
+            return Ok(());
+        };
+        let committed = match db.latest_change_sequence(namespace).await {
+            Ok(sequence) => sequence,
+            Err(_error) => {
+                warn_persistence_failure_redacted("admin_write_live_apply_sequence");
+                return Err(live_apply_failure_response(
+                    crate::config::runtime_config_apply::LiveApplyFailure::SequenceUnavailable,
+                ));
+            }
+        };
+        apply
+            .await_committed(committed)
+            .await
+            .map_err(live_apply_failure_response)
+    }
+
+    /// Overlay live-apply waiting onto a successful mutation response.
+    pub(crate) async fn finish_live_config_mutation(
+        &self,
+        namespace: &str,
+        response: Response<Full<Bytes>>,
+    ) -> Response<Full<Bytes>> {
+        if !response.status().is_success() {
+            return response;
+        }
+        match self.await_live_apply_after_commit(namespace).await {
+            Ok(()) => response,
+            Err(failure) => failure,
+        }
     }
 
     /// Admit an Admin API mutation under a write-topology pin (issue #3001).
@@ -6161,7 +6215,8 @@ async fn handle_update_credentials(
         response
     })
     .await;
-    Ok(response)
+    drop(_write_permit);
+    Ok(state.finish_live_config_mutation(namespace, response).await)
 }
 
 async fn handle_delete_credentials(
@@ -6245,7 +6300,8 @@ async fn handle_delete_credentials(
         response
     })
     .await;
-    Ok(response)
+    drop(_write_permit);
+    Ok(state.finish_live_config_mutation(namespace, response).await)
 }
 
 /// POST /consumers/:id/credentials/:type — Append a credential entry for zero-downtime rotation.
@@ -6383,7 +6439,8 @@ async fn handle_append_credential(
         response
     })
     .await;
-    Ok(response)
+    drop(_write_permit);
+    Ok(state.finish_live_config_mutation(namespace, response).await)
 }
 
 /// DELETE /consumers/:id/credentials/:type/:index — Remove a specific credential entry by index.
@@ -6508,7 +6565,8 @@ async fn handle_delete_credential_by_index(
         response
     })
     .await;
-    Ok(response)
+    drop(_write_permit);
+    Ok(state.finish_live_config_mutation(namespace, response).await)
 }
 
 // ---- Gateway trust bundles (issue #3727) ----
@@ -7300,7 +7358,11 @@ async fn handle_batch_create(
         }
     }
 
-    Ok(json_response(StatusCode::CREATED, &response))
+    drop(namespace_config_admission_guard);
+    drop(_write_permit);
+    Ok(state
+        .finish_live_config_mutation(namespace, json_response(StatusCode::CREATED, &response))
+        .await)
 }
 
 // ---- Backup & Restore ----
@@ -8970,7 +9032,10 @@ async fn handle_restore(
         log_audit_enqueue_failure(&error);
     }
 
-    Ok(json_response(StatusCode::OK, &response))
+    drop(_write_permit);
+    Ok(state
+        .finish_live_config_mutation(namespace, json_response(StatusCode::OK, &response))
+        .await)
 }
 
 fn parse_audit_filter(
@@ -9099,6 +9164,19 @@ async fn handle_list_namespaces(
 }
 
 // ---- Helpers ----
+
+fn live_apply_failure_response(
+    failure: crate::config::runtime_config_apply::LiveApplyFailure,
+) -> Response<Full<Bytes>> {
+    json_response(
+        StatusCode::SERVICE_UNAVAILABLE,
+        &json!({
+            "error": failure.error_message(),
+            "applied": false,
+            "reason": failure.as_str(),
+        }),
+    )
+}
 
 pub(in crate::admin) fn json_response(status: StatusCode, body: &Value) -> Response<Full<Bytes>> {
     let body_str = serde_json::to_string(body).unwrap_or_else(|_| "{}".into());
