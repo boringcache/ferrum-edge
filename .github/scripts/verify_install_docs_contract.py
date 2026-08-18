@@ -19,6 +19,9 @@ COPY_TRUSTED_DEST = re.compile(
 )
 FORBIDDEN_INSTALL_PATTERNS = (
     re.compile(r"releases/latest/download"),
+    re.compile(
+        r"https://github\.com/ferrum-edge/ferrum-edge/releases/latest(?=[\"')])"
+    ),
     re.compile(r"ferrum-edge-x86_64-unknown-linux-gnu\.tar\.gz"),
     re.compile(r"x86_64-unknown-linux-gnu\.tar\.gz"),
 )
@@ -30,10 +33,10 @@ EXPLICIT_TAG_GUIDANCE = re.compile(
 )
 
 
-def release_gateway_binary_assets(release_workflow: str) -> frozenset[str]:
+def release_gateway_assets(release_workflow: str) -> frozenset[str]:
     assets: set[str] = set()
     for _source, dest in COPY_TRUSTED_DEST.findall(release_workflow):
-        if dest.startswith("ferrum-edge-") and not dest.endswith(".sha256"):
+        if dest.startswith("ferrum-edge-"):
             assets.add(dest)
     return frozenset(assets)
 
@@ -45,10 +48,14 @@ def check_operator_install_docs(
     release_workflow: str,
 ) -> list[str]:
     errors: list[str] = []
-    gateway_assets = release_gateway_binary_assets(release_workflow)
+    gateway_assets = release_gateway_assets(release_workflow)
     if LINUX_X86_64_BINARY not in gateway_assets:
         errors.append(
             "release workflow contract is missing the Linux x86_64 gateway binary asset"
+        )
+    if LINUX_X86_64_CHECKSUM not in gateway_assets:
+        errors.append(
+            "release workflow contract is missing the Linux x86_64 checksum asset"
         )
 
     for label, text in (

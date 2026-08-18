@@ -13,7 +13,7 @@ sudo cp target/release/ferrum-edge /usr/local/bin/
 # From a pre-built release download (Linux x86_64 example)
 # Pin an explicit tag. GitHub /releases/latest skips prereleases.
 set -euo pipefail
-TAG=latest  # or v0.2.0 for a stable semver tag
+TAG=latest  # or replace with another explicit tag shown on the Releases page
 BASE="https://github.com/ferrum-edge/ferrum-edge/releases/download/${TAG}"
 curl -fsSLO "${BASE}/ferrum-edge-linux-x86_64"
 curl -fsSLO "${BASE}/ferrum-edge-linux-x86_64.sha256"
