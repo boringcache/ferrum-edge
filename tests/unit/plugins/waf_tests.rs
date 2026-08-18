@@ -2609,6 +2609,109 @@ async fn default_rule_action_enforce_monitors_when_global_mode_is_monitor() {
     assert!(!ctx.metadata.contains_key("waf.first_blocking_rule"));
 }
 
+fn assert_waf_stdout_hit_action(logs: &str, effective: &str, configured: &str) {
+    assert!(
+        logs.contains(&format!("action={effective}")),
+        "expected effective action={effective} in logs: {logs}"
+    );
+    assert!(
+        logs.contains(&format!("rule_action={configured}")),
+        "expected configured rule_action={configured} in logs: {logs}"
+    );
+    assert!(
+        !logs.contains("action=block"),
+        "must not log configured enforce action as the effective action: {logs}"
+    );
+}
+
+#[tokio::test]
+async fn log_to_stdout_monitor_mode_logs_monitored_effective_action() {
+    let (logs, guard) = super::plugin_utils::capture_logs();
+    let plugin = Waf::new(&json!({
+        "mode": "monitor",
+        "default_rule_action": "enforce",
+        "log_to_stdout": true
+    }))
+    .unwrap();
+    let mut ctx = ctx("GET", "/search");
+    ctx.set_raw_query_string("q=%27%20OR%201%3D1".into());
+
+    let result = plugin.authorize(&mut ctx).await;
+    drop(guard);
+
+    assert!(matches!(result, PluginResult::Continue));
+    assert_eq!(
+        ctx.metadata.get("waf.action").map(String::as_str),
+        Some("monitored")
+    );
+    let captured = logs.contents();
+    assert!(
+        captured.contains("WAF rule matched"),
+        "expected per-hit warning: {captured}"
+    );
+    assert_waf_stdout_hit_action(&captured, "monitored", "enforce");
+}
+
+#[tokio::test]
+async fn log_to_stdout_enforce_mode_logs_blocked_effective_action() {
+    let (logs, guard) = super::plugin_utils::capture_logs();
+    let plugin = Waf::new(&json!({
+        "rule_modes": { "FE-SQLI-002": "enforce" },
+        "log_to_stdout": true
+    }))
+    .unwrap();
+    let mut ctx = ctx("GET", "/search");
+    ctx.set_raw_query_string("q=%27%20OR%201%3D1".into());
+
+    let result = plugin.authorize(&mut ctx).await;
+    drop(guard);
+
+    assert!(matches!(result, PluginResult::Reject { .. }));
+    assert_eq!(
+        ctx.metadata.get("waf.action").map(String::as_str),
+        Some("blocked")
+    );
+    let captured = logs.contents();
+    assert!(
+        captured.contains("WAF rule matched"),
+        "expected per-hit warning: {captured}"
+    );
+    assert_waf_stdout_hit_action(&captured, "blocked", "enforce");
+}
+
+#[tokio::test]
+async fn log_to_stdout_stream_monitor_mode_logs_monitored_effective_action() {
+    let (logs, guard) = super::plugin_utils::capture_logs();
+    let plugin = Waf::new(&json!({
+        "mode": "monitor",
+        "include_default_rules": false,
+        "log_to_stdout": true,
+        "stream": {
+            "signatures": [{
+                "id": "STREAM-SQLI-1",
+                "pattern": "(?i)union\\s+select",
+                "severity": "high",
+                "action": "enforce"
+            }]
+        }
+    }))
+    .unwrap();
+    let mut sctx = stream_ctx(b"id=1 union select 1", StreamBytesKind::PlaintextWire);
+
+    let result = plugin.on_stream_connect(&mut sctx).await;
+    drop(guard);
+
+    assert!(matches!(result, PluginResult::Continue));
+    let md = sctx.metadata.as_ref().expect("metadata set on monitor");
+    assert_eq!(md.get("waf.action").map(String::as_str), Some("monitored"));
+    let captured = logs.contents();
+    assert!(
+        captured.contains("WAF stream signature matched"),
+        "expected per-hit stream warning: {captured}"
+    );
+    assert_waf_stdout_hit_action(&captured, "monitored", "enforce");
+}
+
 #[tokio::test]
 async fn rule_modes_still_overrides_default_rule_action() {
     let plugin = Waf::new(&json!({

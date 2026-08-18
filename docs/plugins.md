@@ -4453,7 +4453,7 @@ scanning the parsed key/value map and a best-effort reconstructed URL.
 | `on_scan_timeout` | string | `log_and_allow` | Action when a body scan times out: `allow`, `block`, or `log_and_allow`. |
 | `disallowed_methods` | string[] | `[]` | Methods that should trigger the built-in `FE-METHOD-001` rule when that rule is active. |
 | `log_to_metadata` | bool | `true` | Write WAF metadata such as `waf.rule_hits`, `waf.action`, and `waf.severity` into transaction logs. |
-| `log_to_stdout` | bool | `false` | Emit `tracing::warn!` events for rule matches. |
+| `log_to_stdout` | bool | `false` | Emit `tracing::warn!` events for rule matches. Each event's `action` is the effective outcome (`blocked`, `monitored`, `disabled`); `rule_action` carries the configured rule action (`enforce`, `monitor`, `disabled`). |
 | `reject_status_code` | u16 | `403` | HTTP status for enforced rejects. Must be 400-599. |
 | `reject_content_type` | string | `application/json` | Content-Type header for enforced rejects. |
 | `reject_body` | string | `{"error":"Forbidden"}` | Body returned for enforced rejects. |

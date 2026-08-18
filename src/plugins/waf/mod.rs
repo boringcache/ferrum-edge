@@ -677,13 +677,15 @@ impl Waf {
         if !self.config.log_to_stdout {
             return;
         }
+        let globally_enforcing = self.config.mode == GlobalMode::Enforce;
         for hit in hits {
             warn!(
                 target: "waf",
                 proxy = %proxy_id,
                 rule = %hit.id,
                 severity = %hit.severity.as_str(),
-                action = %hit.action.as_event_action(),
+                action = %hit.action.effective_log_action(globally_enforcing),
+                rule_action = %hit.action,
                 transport = %transport,
                 client_ip = %client_ip,
                 blocked = blocked,
@@ -907,6 +909,7 @@ impl Waf {
             return;
         }
         let rule = &self.compiled.rules[hit.rule_index];
+        let globally_enforcing = self.config.mode == GlobalMode::Enforce;
         warn!(
             target: "waf",
             proxy = %proxy_id(ctx),
@@ -914,7 +917,8 @@ impl Waf {
             rule_name = %rule.name,
             severity = %rule.severity.as_str(),
             category = %rule.category,
-            action = %rule.action.as_event_action(),
+            action = %rule.action.effective_log_action(globally_enforcing),
+            rule_action = %rule.action,
             target_field = %hit.target_name,
             client_ip = %ctx.client_ip,
             path = %ctx.path,

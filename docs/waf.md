@@ -602,7 +602,10 @@ particular the server-first `first_bytes_unavailable` false-positive risk noted
 above, whose would-blocks carry no `waf.rule_hits` to infer from.
 
 `log_to_stdout` additionally emits a dedicated structured `warn!`
-(`target: "waf"`) per matched rule, independent of any logging plugin.
+(`target: "waf"`) per matched rule, independent of any logging plugin. Each
+event carries `action` as the **effective** outcome (`blocked`, `monitored`, or
+`disabled`, matching `waf.action` metadata) and `rule_action` as the configured
+rule action (`enforce`, `monitor`, or `disabled`).
 
 The per-instance anomaly score is carried in `waf.instances.<id>.score` (and
 `waf.score` when only one scoring instance contributed). Run in `monitor`

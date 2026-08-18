@@ -256,6 +256,67 @@ async fn monitor_mode_never_closes_a_session() {
 }
 
 #[tokio::test]
+async fn log_to_stdout_monitor_mode_logs_monitored_effective_action() {
+    let (logs, guard) = crate::plugins::plugin_utils::capture_logs();
+    let mut config = enforcing_request_rule();
+    config["mode"] = json!("monitor");
+    config["log_to_stdout"] = json!(true);
+    let plugins = vec![waf(config)];
+    let ctx = upgrade_ctx("/ws");
+    let original = Message::Text(PROHIBITED.into());
+
+    let outgoing = relay_to_backend(&plugins, &ctx, original.clone()).await;
+    drop(guard);
+
+    assert_eq!(outgoing, original);
+    let captured = logs.contents();
+    assert!(
+        captured.contains("WAF rule matched on a WebSocket message"),
+        "expected per-message warning: {captured}"
+    );
+    assert!(
+        captured.contains("action=monitored"),
+        "monitor-mode hit must log monitored effective action: {captured}"
+    );
+    assert!(
+        captured.contains("rule_action=enforce"),
+        "configured enforce action must remain visible: {captured}"
+    );
+    assert!(
+        !captured.contains("action=block"),
+        "must not log configured enforce action as effective action: {captured}"
+    );
+}
+
+#[tokio::test]
+async fn log_to_stdout_enforce_mode_logs_blocked_effective_action() {
+    let (logs, guard) = crate::plugins::plugin_utils::capture_logs();
+    let mut config = enforcing_request_rule();
+    config["log_to_stdout"] = json!(true);
+    let plugins = vec![waf(config)];
+    let ctx = upgrade_ctx("/ws");
+    let message = Message::Text(PROHIBITED.into());
+
+    let outgoing = relay_to_backend(&plugins, &ctx, message).await;
+    drop(guard);
+
+    assert_policy_close(&outgoing);
+    let captured = logs.contents();
+    assert!(
+        captured.contains("WAF rule matched on a WebSocket message"),
+        "expected per-message warning: {captured}"
+    );
+    assert!(
+        captured.contains("action=blocked"),
+        "enforce-mode hit must log blocked effective action: {captured}"
+    );
+    assert!(
+        captured.contains("rule_action=enforce"),
+        "configured enforce action must remain visible: {captured}"
+    );
+}
+
+#[tokio::test]
 async fn upgrade_request_exemption_applies_to_the_whole_session() {
     let mut config = enforcing_request_rule();
     config["global_exemptions"] = json!({ "paths": ["/exempt-ws"] });

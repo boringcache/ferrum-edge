@@ -77,6 +77,18 @@ impl RuleAction {
             RuleAction::Disabled => "disabled",
         }
     }
+
+    /// Effective per-hit `action` for `log_to_stdout`, aligned with `waf.action`
+    /// metadata (`blocked`, `monitored`, `disabled`).
+    pub(super) fn effective_log_action(self, globally_enforcing: bool) -> &'static str {
+        if globally_enforcing && self == RuleAction::Enforce {
+            "blocked"
+        } else if self == RuleAction::Disabled {
+            "disabled"
+        } else {
+            "monitored"
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
