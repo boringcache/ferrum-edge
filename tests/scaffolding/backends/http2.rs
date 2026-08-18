@@ -1172,12 +1172,24 @@ const BENIGN_SCRIPT_STEP_ERROR_SUBSTRINGS: &[&str] = &[
     "Connection reset by peer",
 ];
 
+/// Detail prefix for the hosted pre-script H2 settings-handshake disconnect:
+/// `h2 handshake failed: Broken pipe (os error 32)`.
+const H2_HANDSHAKE_BENIGN_BROKEN_PIPE_DETAIL_PREFIX: &str = "Broken pipe";
+
 /// Returns true when a pool probe or other short-lived client disappeared while
 /// the fixture was still in the pre-script H2 settings handshake. Startup
 /// cleanup on a doomed gateway can close that connection and surface as a broken
 /// pipe here even though the scripted stream under test later behaves normally.
+///
+/// Requires the handshake error prefix and a broken-pipe-leading detail — a
+/// genuine protocol/translation failure that merely mentions `Broken pipe` later
+/// in unrelated text must not be swallowed.
 fn is_benign_h2_handshake_client_disconnect(error: &str) -> bool {
-    error.starts_with(H2_HANDSHAKE_FAILED_PREFIX) && error.contains("Broken pipe")
+    if !error.starts_with(H2_HANDSHAKE_FAILED_PREFIX) {
+        return false;
+    }
+    let detail = error[H2_HANDSHAKE_FAILED_PREFIX.len()..].trim_start();
+    detail.starts_with(H2_HANDSHAKE_BENIGN_BROKEN_PIPE_DETAIL_PREFIX)
 }
 
 /// Returns true when `error` matches a known-benign client-disconnect shape.
@@ -1216,6 +1228,15 @@ mod tests {
             "h2 handshake failed: connection error detected: frame with invalid size"
         ));
         assert!(!is_benign_script_step_error(
+            "h2 handshake failed: connection error detected: frame with invalid size; later Broken pipe (os error 32)"
+        ));
+    }
+
+    #[test]
+    fn benign_script_step_error_ignores_h2_handshake_connection_reset() {
+        // Pre-existing substring allowlist: every `Connection reset by peer`
+        // client disconnect is benign, including during the pre-script handshake.
+        assert!(is_benign_script_step_error(
             "h2 handshake failed: Connection reset by peer (os error 54)"
         ));
     }
