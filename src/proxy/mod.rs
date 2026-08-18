@@ -10011,9 +10011,10 @@ impl ProxyState {
     /// `record` so the outcome is written directly. The pool dial uses
     /// `get_sender_for_capability_probe` so an expected HTTP/1.1 h2c miss is
     /// debug-level at the establishment logger; request-time gRPC still WARNs.
-    /// Unexpected probe failures (timeouts, connect/DNS, port exhaustion)
-    /// keep their WARN/ERROR diagnostics. Genuine "backend doesn't speak
-    /// h2c" outcomes classify as `Unsupported`.
+    /// Probe dial timeouts, port exhaustion, and unexpected candidate
+    /// connection/handshake failures keep their WARN/ERROR diagnostics.
+    /// Genuine "backend doesn't speak h2c" outcomes classify as
+    /// `Unsupported`.
     async fn probe_h2c(
         &self,
         probe_proxy: &Proxy,
