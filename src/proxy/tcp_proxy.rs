@@ -1695,9 +1695,9 @@ fn classify_tcp_accept_peer_exit(
 ) -> TcpAcceptPeerExit {
     match join_result {
         Ok(Ok(())) => TcpAcceptPeerExit::Clean,
-        Ok(Err(err)) => TcpAcceptPeerExit::Failed(err.context(format!(
-            "TCP accept loop {class} exited with error"
-        ))),
+        Ok(Err(err)) => TcpAcceptPeerExit::Failed(
+            err.context(format!("TCP accept loop {class} exited with error")),
+        ),
         Err(join_err) if join_err.is_cancelled() => {
             if teardown_started {
                 // Sibling abort after an earlier peer failure, or shutdown drain.

@@ -455,7 +455,11 @@ pub mod _test_support {
         accept_threads: usize,
     ) -> Result<Vec<tokio::net::TcpListener>, anyhow::Error> {
         crate::proxy::bind_exclusive_proxy_accept_listeners(
-            addr, backlog, None, accept_threads, false,
+            addr,
+            backlog,
+            None,
+            accept_threads,
+            false,
         )
     }
 

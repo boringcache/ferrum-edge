@@ -22,8 +22,7 @@ fn ipv4_ephemeral() -> SocketAddr {
 }
 
 fn is_addr_in_use(err: &std::io::Error) -> bool {
-    err.kind() == ErrorKind::AddrInUse
-        || err.to_string().to_ascii_lowercase().contains("in use")
+    err.kind() == ErrorKind::AddrInUse || err.to_string().to_ascii_lowercase().contains("in use")
 }
 
 fn assert_foreign_bind_rejected(addr: SocketAddr, what: &str) {
@@ -66,7 +65,8 @@ async fn foreign_bind_is_rejected_while_exclusive_listener_holds_the_port() {
     assert_foreign_bind_rejected(addr, "single exclusive listener");
 
     let connect = TcpStream::connect(addr);
-    let accept = listeners.into_iter().next().expect("listener").accept();
+    let listener = listeners.into_iter().next().expect("listener");
+    let accept = listener.accept();
     let (client, accepted) = tokio::join!(connect, accept);
     let mut client = client.expect("first process must still accept after rejected foreign bind");
     let (mut server, _) = accepted.expect("accept");

@@ -486,8 +486,7 @@ async fn tcp_stream_accept_threads_two_binds_and_relays_connections() {
         spawn_fast_path_gateway_with_options(backend_port, Vec::new(), 2).await;
     let gateway_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), listen_port);
 
-    let foreign =
-        ferrum_edge::_test_support::try_foreign_reuseport_tcp_bind_for_test(gateway_addr);
+    let foreign = ferrum_edge::_test_support::try_foreign_reuseport_tcp_bind_for_test(gateway_addr);
     assert!(
         foreign.is_err(),
         "a second process must not join the exclusive TCP stream listener on \
