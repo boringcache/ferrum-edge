@@ -244,6 +244,9 @@ impl Waf {
             body,
             subject,
         );
+        // JSON-path rules decode variants per selected scalar so whole-body
+        // normalization cannot rewrite unrelated `+` characters (for example
+        // `application/ld+json`) and bypass per-rule `fp_filters`.
         self.scan_json_path_rules(&mut outcome, body, subject);
         let text = String::from_utf8_lossy(body);
         // Re-scan decoded forms so payloads hidden behind JSON `\uXXXX`,
@@ -259,7 +262,6 @@ impl Waf {
         // layered decode cannot fully peel, are otherwise silent).
         self.scan_body_encoding_specials(&mut outcome, text.as_ref(), residual_encoding, subject);
         for variant in variants {
-            self.scan_json_path_rules(&mut outcome, variant.as_bytes(), subject);
             self.scan_bytes_set(
                 &mut outcome,
                 self.compiled.body_bytes.as_ref(),
@@ -437,33 +439,49 @@ impl Waf {
             let Some(text) = json_scan_text(value, &mut scratch) else {
                 continue;
             };
-            if self.json_path_rule_matches(path_rule, text, subject) {
-                outcome.push(RuleHit {
-                    rule_index: path_rule.rule_index,
-                    target_name: path_rule.target_name,
-                });
+            self.push_json_path_hit_if_matched(outcome, path_rule, text, text, subject);
+            let (variants, _) = normalize::decoded_variants_with_residual(text);
+            for variant in variants {
+                self.push_json_path_hit_if_matched(outcome, path_rule, &variant, text, subject);
             }
+        }
+    }
+
+    fn push_json_path_hit_if_matched(
+        &self,
+        outcome: &mut ScanOutcome,
+        path_rule: &JsonPathRule,
+        match_value: &str,
+        fp_filter_target: &str,
+        subject: ScanSubject<'_>,
+    ) {
+        if self.json_path_rule_matches(path_rule, match_value, fp_filter_target, subject) {
+            outcome.push(RuleHit {
+                rule_index: path_rule.rule_index,
+                target_name: path_rule.target_name,
+            });
         }
     }
 
     fn json_path_rule_matches(
         &self,
         path_rule: &JsonPathRule,
-        value: &str,
+        match_value: &str,
+        fp_filter_target: &str,
         subject: ScanSubject<'_>,
     ) -> bool {
         let rule = &self.compiled.rules[path_rule.rule_index];
         let matched = match &path_rule.matcher {
-            JsonPathMatcher::Regex(regex) => regex.is_match(value),
-            JsonPathMatcher::Luhn => contains_luhn_candidate(value),
+            JsonPathMatcher::Regex(regex) => regex.is_match(match_value),
+            JsonPathMatcher::Luhn => contains_luhn_candidate(match_value),
             JsonPathMatcher::Cidr => rule
                 .cidr
-                .is_some_and(|cidr| extract_ip_tokens(value).any(|ip| cidr.matches(ip))),
+                .is_some_and(|cidr| extract_ip_tokens(match_value).any(|ip| cidr.matches(ip))),
         };
         matched
             && self.rule_applies(subject, path_rule.rule_index)
-            && !self.exemptions.suppresses_value(value)
-            && !rule.suppresses_text(value)
+            && !self.exemptions.suppresses_value(fp_filter_target)
+            && !rule.suppresses_text(fp_filter_target)
     }
 
     fn scan_cookies(&self, outcome: &mut ScanOutcome, header: &str, subject: ScanSubject<'_>) {
