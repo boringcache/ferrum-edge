@@ -1095,7 +1095,9 @@ async fn in_process_pool_warmup_helper_wins_over_earlier_env_call() {
 }
 
 fn gateway_error_header(resp: &crate::scaffolding::ClientResponse) -> Option<&str> {
-    resp.headers.get("x-gateway-error").and_then(|v| v.to_str().ok())
+    resp.headers
+        .get("x-gateway-error")
+        .and_then(|v| v.to_str().ok())
 }
 
 // #3922: a backend that accepts then stalls before headers must 504 with a

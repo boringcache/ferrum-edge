@@ -9927,8 +9927,7 @@ async fn collect_h3_open_response_body(
                     .backend_capabilities
                     .mark_h3_unsupported(proxy, upstream_target);
             }
-            let (status, body) =
-                crate::proxy::http_backend_failure_status_and_body(h3_error_class);
+            let (status, body) = crate::proxy::http_backend_failure_status_and_body(h3_error_class);
             return H3BufferedDispatchResult {
                 status,
                 body: Bytes::from_static(body.as_bytes()),
