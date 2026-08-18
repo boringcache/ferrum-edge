@@ -2182,11 +2182,12 @@ pairs for those jobs, keyed by the workflow filename AND the job name:
 
 | Workflow | Job | Retired SHA-256 (trusted base) | Adopted SHA-256 | Destination |
 |---|---|---|---|---|
-| `coverage.yml` | `coverage-merge` | `d2480af21698fb3ad041b32b39587c949aeedec24746c8d5c8c63acd9f9d2fb6` | `34f5e1b022f1d01ac72d13c66256e11ff87c15135d775c03736e6701b2223a1c` | PR #3917 / issue #3907 |
+| `coverage.yml` | `coverage-merge` | `5acba780094766b03f72059b8ac229c7bcc4a722ce0130060da7ed0d1ba5850f` | `28c3ff517027c36ba2ca7ce8a80adc43d2e8475e46c4d5cb0106819dd3f1c152` | PR #3917 / issue #3907 |
 
 The pair admits #3917's shard-scoped coverage-merge reshape (planned-shard
 artifact selection, plugin gate, planned-shard outcome enforcement), pinned
-against #3917's branch after merging latest `main`
+against #3917's branch after merging latest `main` and inheriting the current
+checksum-pinned `taiki-e/install-action` update
 (`grok/issue-3907-coverage-shards-r1`; recompute and re-pin if review changes
 the job bytes). Each digest is the SHA-256 of `extract_job_block` text. Both
 ends are exact, the binding includes the filename and job name, the move is
