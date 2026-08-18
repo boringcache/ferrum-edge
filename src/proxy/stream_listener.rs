@@ -3263,6 +3263,13 @@ impl StreamListenerManager {
                         udp_pktinfo_enabled,
                         mesh_outbound_enforcement,
                         node_waypoint_udp_source_scoping,
+                        // Owner-scoped client-trust retirement domain for a
+                        // terminating DTLS listener (issue #3858): the same bit
+                        // that chose `dtls_owner` above, so the listener an
+                        // operator publication deliberately does not
+                        // reconfigure is also the listener whose sessions it
+                        // cannot retire.
+                        node_waypoint_udp_owner,
                         node_waypoint_udp_destinations,
                         datagram_client_address,
                     })

@@ -2329,6 +2329,23 @@ pub struct UdpListenerConfig {
     /// never a mesh-wide fallback while scoped enforcement applies.
     pub node_waypoint_udp_source_scoping:
         Option<crate::proxy::node_waypoint_udp_identity::NodeWaypointUdpSourceScoping>,
+    /// This listener is a Ferrum-generated NodeWaypoint Service listener
+    /// (issue #3858 owner split).
+    ///
+    /// Decided by `StreamListenerManager` from the accepted listener identity —
+    /// the same bit that picks its `DtlsListenerOwner`. It is carried here for
+    /// exactly one decision: which client-trust retirement domain a terminating
+    /// DTLS session joins.
+    ///
+    /// Deliberately NOT derived from `node_waypoint_udp_source_scoping`. That
+    /// field is built once from the manager-wide NodeWaypoint source index and
+    /// identity resolver and handed to EVERY UDP listener spawn, so it is
+    /// `Some` for operator listeners too whenever the topology is active.
+    /// Keying trust ownership on it would drop an operator `FERRUM_DTLS_*`
+    /// listener out of its own domain in exactly the deployment the split is
+    /// about — mesh NodeWaypoint plus a configured operator DTLS listener — and
+    /// an operator CRL publication would then retire nothing.
+    pub node_waypoint_udp_owner: bool,
     /// Exact NodeWaypoint UDP destination routing for a shared same-port
     /// listener (issue #3861). `None` for every ordinary UDP listener and for a
     /// single-claimant NodeWaypoint listener, which keeps the documented
@@ -2474,6 +2491,7 @@ pub async fn start_udp_listener(cfg: UdpListenerConfig) -> Result<(), anyhow::Er
         udp_pktinfo_enabled,
         mesh_outbound_enforcement,
         node_waypoint_udp_source_scoping,
+        node_waypoint_udp_owner,
         node_waypoint_udp_destinations,
         datagram_client_address,
     } = cfg;
@@ -2541,6 +2559,7 @@ pub async fn start_udp_listener(cfg: UdpListenerConfig) -> Result<(), anyhow::Er
             overload,
             Arc::new(BackendDtlsConfigCacheState::new(backend_tls_reload_epoch)),
             node_waypoint_udp_source_scoping,
+            node_waypoint_udp_owner,
             datagram_client_address,
         )
         .await;
@@ -4500,6 +4519,7 @@ async fn start_dtls_frontend_listener(
     node_waypoint_udp_source_scoping: Option<
         crate::proxy::node_waypoint_udp_identity::NodeWaypointUdpSourceScoping,
     >,
+    node_waypoint_udp_owner: bool,
     datagram_client_address: Option<Arc<DatagramClientAddressGate>>,
 ) -> Result<(), anyhow::Error> {
     let addr = SocketAddr::new(bind_addr, port);
@@ -4555,9 +4575,12 @@ async fn start_dtls_frontend_listener(
         // slice, which `swap_active_dtls_frontend_config` deliberately skips,
         // so its sessions must not be retirable by an unrelated operator CRL
         // or client-CA edit.
-        client_trust_scope: crate::dtls::dtls_client_trust_scope_for_owner(
-            node_waypoint_udp_source_scoping.is_some(),
-        ),
+        // Listener OWNERSHIP, not the mesh-wide source-scoping option: the
+        // latter is built once per manager and handed to every UDP listener
+        // spawn, so an operator `FERRUM_DTLS_*` listener running alongside
+        // NodeWaypoint would otherwise leave the operator domain and survive
+        // the CRL edit meant to retire it.
+        client_trust_scope: crate::dtls::dtls_client_trust_scope_for_owner(node_waypoint_udp_owner),
     };
     let server =
         Arc::new(crate::dtls::DtlsServer::bind_with_limits(addr, dtls_config, dtls_limits).await?);

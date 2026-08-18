@@ -181,6 +181,32 @@ fn a_node_waypoint_dtls_listener_joins_no_operator_trust_domain() {
     );
 }
 
+/// The owner argument must come from listener OWNERSHIP, not from the
+/// NodeWaypoint source-scoping option.
+///
+/// `node_waypoint_udp_source_scoping` is built once from the manager-wide
+/// source index and identity resolver (`stream_listener.rs`) and handed to
+/// EVERY UDP listener spawn, so it is `Some` for operator listeners too as soon
+/// as the topology is active. Keying the trust domain on it inverts the bug
+/// this finding is about: in the very deployment it describes — mesh
+/// NodeWaypoint plus a configured operator `FERRUM_DTLS_*` listener — the
+/// operator listener would leave its own domain, register nothing, and survive
+/// the CRL edit meant to retire it. `node_waypoint_udp_owner` is the same bit
+/// that chooses the listener's `DtlsListenerOwner`.
+#[test]
+fn the_dtls_trust_domain_is_keyed_on_listener_ownership() {
+    let source = read_source("src/proxy/udp_proxy.rs");
+    assert!(
+        source.contains("dtls_client_trust_scope_for_owner(node_waypoint_udp_owner)"),
+        "the terminating-DTLS listener must derive its trust domain from listener ownership"
+    );
+    assert_eq!(
+        source.matches("dtls_client_trust_scope_for_owner(").count(),
+        1,
+        "exactly one DTLS listener path decides the trust domain, and it is the ownership one"
+    );
+}
+
 /// The end-to-end consequence: an operator `FrontendDtls` withdrawal retires
 /// only the sessions that captured that scope. A listener whose owner scope is
 /// `None` captures nothing at all, so it has no session to retire and does not
