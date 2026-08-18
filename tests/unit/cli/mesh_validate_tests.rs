@@ -118,8 +118,14 @@ fn explicit_file_protocol_uses_spec_without_mesh_file_path() {
 
     apply_validate_overrides(&validate_args(Some(&slice)));
     prepare_validate_file_source().expect("explicit file protocol accepts --spec");
-    assert_eq!(std::env::var("FERRUM_MESH_CONFIG_PROTOCOL").unwrap(), "file");
-    assert_eq!(std::env::var("FERRUM_MESH_FILE_CONFIG_PATH").unwrap(), slice);
+    assert_eq!(
+        std::env::var("FERRUM_MESH_CONFIG_PROTOCOL").unwrap(),
+        "file"
+    );
+    assert_eq!(
+        std::env::var("FERRUM_MESH_FILE_CONFIG_PATH").unwrap(),
+        slice
+    );
     execute_validate().expect("validate file protocol slice");
 }
 
@@ -133,8 +139,14 @@ fn infers_file_protocol_from_localized_spec() {
 
     apply_validate_overrides(&validate_args(Some(&slice)));
     prepare_validate_file_source().expect("localized document infers file");
-    assert_eq!(std::env::var("FERRUM_MESH_CONFIG_PROTOCOL").unwrap(), "file");
-    assert_eq!(std::env::var("FERRUM_MESH_FILE_CONFIG_PATH").unwrap(), slice);
+    assert_eq!(
+        std::env::var("FERRUM_MESH_CONFIG_PROTOCOL").unwrap(),
+        "file"
+    );
+    assert_eq!(
+        std::env::var("FERRUM_MESH_FILE_CONFIG_PATH").unwrap(),
+        slice
+    );
     execute_validate().expect("inferred file protocol validates the slice");
 }
 
@@ -373,7 +385,10 @@ mesh:
 
     apply_validate_overrides(&validate_args(Some(&bad)));
     prepare_validate_file_source().expect("localized shape infers file even with invalid fields");
-    assert_eq!(std::env::var("FERRUM_MESH_CONFIG_PROTOCOL").unwrap(), "file");
+    assert_eq!(
+        std::env::var("FERRUM_MESH_CONFIG_PROTOCOL").unwrap(),
+        "file"
+    );
     let error = execute_validate().expect_err("invalid mesh fields must fail");
     assert!(
         error.contains("Mesh spec validation failed") && error.contains("validation failed"),
@@ -412,7 +427,10 @@ fn json_spec_infers_file_protocol_from_extension() {
 
     apply_validate_overrides(&validate_args(Some(&slice)));
     prepare_validate_file_source().expect("json localized document infers file");
-    assert_eq!(std::env::var("FERRUM_MESH_CONFIG_PROTOCOL").unwrap(), "file");
+    assert_eq!(
+        std::env::var("FERRUM_MESH_CONFIG_PROTOCOL").unwrap(),
+        "file"
+    );
     execute_validate().expect("empty mesh mapping is a valid file document");
 }
 

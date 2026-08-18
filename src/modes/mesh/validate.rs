@@ -64,8 +64,7 @@ fn native_or_xds_spec_conflict(protocol: MeshConfigProtocol) -> String {
 }
 
 fn mode_is_mesh() -> bool {
-    resolve_ferrum_var("FERRUM_MODE")
-        .is_some_and(|mode| mode.trim().eq_ignore_ascii_case("mesh"))
+    resolve_ferrum_var("FERRUM_MODE").is_some_and(|mode| mode.trim().eq_ignore_ascii_case("mesh"))
 }
 
 fn explicit_mesh_config_protocol() -> Result<Option<MeshConfigProtocol>, String> {
@@ -79,7 +78,10 @@ fn optional_path(key: &str) -> Option<String> {
     resolve_ferrum_var(key).filter(|value| !value.trim().is_empty())
 }
 
-fn bind_local_document_path(spec_path: Option<&str>, mesh_path: Option<&str>) -> Result<(), String> {
+fn bind_local_document_path(
+    spec_path: Option<&str>,
+    mesh_path: Option<&str>,
+) -> Result<(), String> {
     match (spec_path, mesh_path) {
         (Some(spec), Some(mesh)) if !same_resolved_path(spec, mesh) => {
             Err(CONFLICTING_MESH_FILE_SOURCES.to_string())

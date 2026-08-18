@@ -237,7 +237,8 @@ mesh:
 "#,
     );
     assert!(
-        probe_localized_mesh_file_document(&path).expect("invalid inner fields are still the shape"),
+        probe_localized_mesh_file_document(&path)
+            .expect("invalid inner fields are still the shape"),
         "inference is top-level shape only; inner validity belongs to the real parser"
     );
 }
