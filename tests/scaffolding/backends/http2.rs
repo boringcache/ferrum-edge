@@ -1172,24 +1172,31 @@ const BENIGN_SCRIPT_STEP_ERROR_SUBSTRINGS: &[&str] = &[
     "Connection reset by peer",
 ];
 
-/// Detail prefix for the hosted pre-script H2 settings-handshake disconnect:
-/// `h2 handshake failed: Broken pipe (os error 32)`.
-const H2_HANDSHAKE_BENIGN_BROKEN_PIPE_DETAIL_PREFIX: &str = "Broken pipe";
+/// Exact std-IO display shapes for a pre-script H2 settings-handshake disconnect:
+/// `Broken pipe` or `Broken pipe (os error 32)`.
+const H2_HANDSHAKE_BENIGN_BROKEN_PIPE_EXACT: &str = "Broken pipe";
+const H2_HANDSHAKE_BENIGN_BROKEN_PIPE_WITH_OS_PREFIX: &str = "Broken pipe (";
+
+fn is_benign_h2_handshake_broken_pipe_detail(detail: &str) -> bool {
+    detail == H2_HANDSHAKE_BENIGN_BROKEN_PIPE_EXACT
+        || detail.starts_with(H2_HANDSHAKE_BENIGN_BROKEN_PIPE_WITH_OS_PREFIX)
+}
 
 /// Returns true when a pool probe or other short-lived client disappeared while
 /// the fixture was still in the pre-script H2 settings handshake. Startup
 /// cleanup on a doomed gateway can close that connection and surface as a broken
 /// pipe here even though the scripted stream under test later behaves normally.
 ///
-/// Requires the handshake error prefix and a broken-pipe-leading detail — a
+/// Requires the handshake error prefix and a std-IO broken-pipe detail — a
 /// genuine protocol/translation failure that merely mentions `Broken pipe` later
-/// in unrelated text must not be swallowed.
+/// in unrelated text (or as a longer word such as `Broken pipeline`) must not
+/// be swallowed.
 fn is_benign_h2_handshake_client_disconnect(error: &str) -> bool {
     if !error.starts_with(H2_HANDSHAKE_FAILED_PREFIX) {
         return false;
     }
     let detail = error[H2_HANDSHAKE_FAILED_PREFIX.len()..].trim_start();
-    detail.starts_with(H2_HANDSHAKE_BENIGN_BROKEN_PIPE_DETAIL_PREFIX)
+    is_benign_h2_handshake_broken_pipe_detail(detail)
 }
 
 /// Returns true when `error` matches a known-benign client-disconnect shape.
@@ -1212,6 +1219,14 @@ mod tests {
     fn benign_script_step_error_ignores_pre_script_h2_handshake_broken_pipe() {
         assert!(is_benign_script_step_error(
             "h2 handshake failed: Broken pipe (os error 32)"
+        ));
+        assert!(is_benign_script_step_error("h2 handshake failed: Broken pipe"));
+    }
+
+    #[test]
+    fn benign_script_step_error_rejects_broken_pipeline_h2_handshake_failure() {
+        assert!(!is_benign_script_step_error(
+            "h2 handshake failed: Broken pipeline protocol error"
         ));
     }
 
