@@ -23143,7 +23143,12 @@ components:
           minItems: 1
           items:
             $ref: "#/components/schemas/OpenapiValidatorOperation"
-          description: Generated operation schema table. The importer replaces this from the spec on every spec PUT.
+          description: >-
+            Generated operation schema table. Required in file mode and other
+            direct plugin configuration; POST /api-specs and PUT
+            /api-specs/{id} generate it from the attached document when
+            x-ferrum-validate is enabled. The importer replaces this from the
+            spec on every spec PUT.
         bypass:
           type: object
           additionalProperties: false
