@@ -44120,10 +44120,12 @@ fn build_plain_text_response(status: StatusCode, body: &str) -> Response<ProxyBo
 /// between the two.
 ///
 /// The body carries only [`HbonePoolError::public_reason`], a fixed
-/// `&'static str` chosen from the error variant. The peer address, CONNECT
+/// `&'static str` chosen from the error variant, plus
+/// [`HbonePoolError::public_status`] for `ConnectRejected`. The operator
+/// `error!` record is the same closed set (`error_kind`, `error_phase`, and
+/// numeric `peer_status` only for CONNECT admission). Peer address, CONNECT
 /// authority, certificate subject, SPIFFE ID, trust roots, and raw
-/// rustls/SPIFFE verifier text stay in the `error!` log and never reach a
-/// client.
+/// rustls/SPIFFE verifier text are not interpolated into either surface.
 fn mesh_transport_pool_error_response(
     state: &ProxyState,
     proxy: &Proxy,
@@ -44140,13 +44142,7 @@ fn mesh_transport_pool_error_response(
     } else {
         transport.unavailable_body_for_error(err)
     };
-    error!(
-        proxy_id = %proxy.id,
-        error_kind = retry::error_class_log_kind(error_class),
-        error = %err,
-        "{}",
-        transport.dispatch_failure_log_message()
-    );
+    transport.log_pool_error(&proxy.id, err);
     retry::BackendResponse {
         status_code: 502,
         body: ResponseBody::buffered(error_body.into_bytes()),

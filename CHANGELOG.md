@@ -103,8 +103,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `TCP connect failed`, `connect timed out`, `gateway identity unavailable`, …)
   rather than the interpolated error `Display`, so peer addresses, certificate
   subjects, SPIFFE IDs, trust roots, and raw rustls/SPIFFE verifier text no
-  longer reach a client — that detail stays on the process's `error!` log. The
-  one retained detail is the peer's own HTTP/2 CONNECT admission status
+  longer reach a client. The operator `error!` record on this path is the same
+  closed set (`error_kind`, `error_phase`, and `peer_status` only for CONNECT
+  admission) and does not interpolate `Display`. The one retained
+  client-visible detail is the peer's own HTTP/2 CONNECT admission status
   (`tunnel rejected by peer with status 403`), which keeps a destination policy
   denial distinguishable from any other tunnel refusal.
   Error classification, the pre/post-wire retry boundary, circuit-breaker and

@@ -14,22 +14,195 @@
 //! These tests also pin the redaction contract: the public reason is chosen
 //! from the error VARIANT and is always a fixed `&'static str`, so no peer
 //! address, CONNECT authority, SPIFFE ID, certificate subject, trust root, or
-//! raw rustls/SPIFFE verifier text can ride the client body. The full
-//! `Display` — which does carry those details — stays on the operator log.
+//! raw rustls/SPIFFE verifier text can ride the client body. The operator
+//! `error!` record on the pool-error path is the same closed set (`error_kind`,
+//! `error_phase`, and `peer_status` only for `ConnectRejected`) and never
+//! interpolates `Display`. `Display` may still carry those details as an
+//! error value.
 
 use ferrum_edge::proxy::hbone_pool::{HbonePoolError, MeshTransportLabel};
+use ferrum_edge::retry::error_class_log_kind;
 use ferrum_edge::tls::spiffe::SpiffeTlsError;
 use std::io;
+use std::sync::{Arc, Mutex};
+use tracing_subscriber::fmt::MakeWriter;
 
-/// Values a client must never be able to read back out of an error body.
+/// Values a client and the operator log must never echo from `Display`.
 const SECRET_HOST: &str = "10.4.7.9:15006";
-const SECRET_VERIFIER_TEXT: &str =
-    "invalid peer certificate: BadSignature; subject CN=orders, spiffe://cluster.local/ns/x/sa/y";
+const SECRET_VERIFIER_TEXT: &str = concat!(
+    "invalid peer certificate: BadSignature; ",
+    "subject CN=hostile-leaf, ",
+    "spiffe://cluster.local/ns/x/sa/y",
+);
+const SECRET_SPIFFE: &str = "spiffe://cluster.local/ns/default/sa/orders";
+const SECRET_TRUST_ROOT: &str = "CN=cluster.local-hostile-root";
+const SECRET_FINGERPRINT: &str = "sha256:deadbeefcafebabe00112233";
+const SECRET_KEY_PATH: &str = "/var/run/secrets/svid/hostile-key.pem";
+const SECRET_SAN: &str = "URI:spiffe://cluster.local/ns/x/sa/y";
+const HOSTILE_SENTINELS: &[&str] = &[
+    SECRET_HOST,
+    SECRET_VERIFIER_TEXT,
+    SECRET_SPIFFE,
+    SECRET_TRUST_ROOT,
+    SECRET_FINGERPRINT,
+    SECRET_KEY_PATH,
+    SECRET_SAN,
+    "BadSignature",
+    "spiffe://",
+    "hostile-leaf",
+    "hostile-root",
+    "hostile-key.pem",
+];
 
 fn tls_handshake_error() -> HbonePoolError {
     HbonePoolError::TlsHandshake {
         host: SECRET_HOST.to_string(),
         source: io::Error::other(SECRET_VERIFIER_TEXT),
+    }
+}
+
+#[derive(Clone, Default)]
+struct SharedLogWriter(Arc<Mutex<Vec<u8>>>);
+
+impl io::Write for SharedLogWriter {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        self.0.lock().unwrap().extend_from_slice(buf);
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+impl<'a> MakeWriter<'a> for SharedLogWriter {
+    type Writer = Self;
+
+    fn make_writer(&'a self) -> Self::Writer {
+        self.clone()
+    }
+}
+
+fn capture_pool_error_log(label: MeshTransportLabel, err: &HbonePoolError) -> String {
+    let writer = SharedLogWriter::default();
+    let subscriber = tracing_subscriber::fmt()
+        .with_ansi(false)
+        .with_target(false)
+        .without_time()
+        .with_writer(writer.clone())
+        .finish();
+    tracing::subscriber::with_default(subscriber, || {
+        label.log_pool_error("mesh-outbound", err);
+    });
+    String::from_utf8(writer.0.lock().unwrap().clone()).expect("operator log must be utf-8")
+}
+
+fn sensitive_pool_errors() -> Vec<HbonePoolError> {
+    vec![
+        tls_handshake_error(),
+        HbonePoolError::DnsLookup {
+            host: SECRET_HOST.to_string(),
+            message: SECRET_VERIFIER_TEXT.to_string(),
+        },
+        HbonePoolError::ConnectTimeout {
+            addr: SECRET_HOST.to_string(),
+            timeout_ms: 250,
+        },
+        HbonePoolError::Connect {
+            addr: SECRET_HOST.to_string(),
+            source: io::Error::new(io::ErrorKind::ConnectionRefused, SECRET_VERIFIER_TEXT),
+        },
+        HbonePoolError::InvalidServerName {
+            host: SECRET_HOST.to_string(),
+            message: SECRET_VERIFIER_TEXT.to_string(),
+        },
+        HbonePoolError::InvalidDialHostTag {
+            value: SECRET_HOST.to_string(),
+            message: SECRET_KEY_PATH.to_string(),
+        },
+        HbonePoolError::InvalidAuthorityHostTag {
+            value: SECRET_HOST.to_string(),
+            message: SECRET_SAN.to_string(),
+        },
+        HbonePoolError::InvalidPeerSpiffeTag {
+            value: SECRET_SPIFFE.to_string(),
+            message: SECRET_VERIFIER_TEXT.to_string(),
+        },
+        HbonePoolError::TlsConfig(SpiffeTlsError::BadKeyMaterial(format!(
+            "{SECRET_VERIFIER_TEXT}; trust={SECRET_TRUST_ROOT}; \
+             fp={SECRET_FINGERPRINT}; path={SECRET_KEY_PATH}"
+        ))),
+        HbonePoolError::TlsConfig(SpiffeTlsError::Rustls(format!(
+            "{SECRET_VERIFIER_TEXT}; {SECRET_SAN}"
+        ))),
+        HbonePoolError::H2Handshake {
+            host: SECRET_HOST.to_string(),
+            message: SECRET_VERIFIER_TEXT.to_string(),
+        },
+        HbonePoolError::InvalidConnectRequest {
+            authority: SECRET_HOST.to_string(),
+            message: SECRET_VERIFIER_TEXT.to_string(),
+        },
+        HbonePoolError::ConnectStream {
+            authority: SECRET_HOST.to_string(),
+            message: SECRET_VERIFIER_TEXT.to_string(),
+        },
+        HbonePoolError::ConnectRejected {
+            authority: SECRET_HOST.to_string(),
+            status: 403,
+        },
+        HbonePoolError::MaxConnectionsExceeded {
+            host: SECRET_HOST.to_string(),
+            port: 8080,
+            current: 12,
+            cap: 12,
+        },
+        HbonePoolError::ExtendedConnectUnsupported {
+            authority: SECRET_HOST.to_string(),
+        },
+        HbonePoolError::TrustWithdrawn,
+        HbonePoolError::MissingCrossClusterSni,
+        HbonePoolError::MissingCrossClusterTrustDomain,
+        HbonePoolError::MissingCrossClusterAuthorityHost,
+        HbonePoolError::NoSvid,
+        HbonePoolError::NoLeafCert,
+    ]
+}
+
+fn assert_operator_log_redacted(logs: &str, err: &HbonePoolError, label: MeshTransportLabel) {
+    for secret in HOSTILE_SENTINELS {
+        assert!(
+            !logs.contains(secret),
+            "operator log leaked {secret:?}: {logs}"
+        );
+    }
+    assert!(
+        logs.contains(err.public_reason()),
+        "operator log missing error_phase '{}': {logs}",
+        err.public_reason()
+    );
+    assert!(
+        logs.contains(error_class_log_kind(err.error_class())),
+        "operator log missing error_kind: {logs}"
+    );
+    assert!(
+        logs.contains(label.dispatch_failure_log_message()),
+        "operator log missing transport message: {logs}"
+    );
+    match err.public_status() {
+        Some(status) => {
+            let status_text = status.to_string();
+            assert!(
+                logs.contains("peer_status=") && logs.contains(&status_text),
+                "operator log missing numeric CONNECT peer_status {status}: {logs}"
+            );
+        }
+        None => {
+            assert!(
+                !logs.contains("peer_status"),
+                "operator log grew an unexpected peer_status field: {logs}"
+            );
+        }
     }
 }
 
@@ -152,80 +325,31 @@ fn no_other_variant_grows_a_status_suffix() {
 
 #[test]
 fn public_reason_never_echoes_peer_or_verifier_detail() {
-    let leaky = [
-        tls_handshake_error(),
-        HbonePoolError::Connect {
-            addr: SECRET_HOST.to_string(),
-            source: io::Error::new(io::ErrorKind::ConnectionRefused, SECRET_VERIFIER_TEXT),
-        },
-        HbonePoolError::ConnectTimeout {
-            addr: SECRET_HOST.to_string(),
-            timeout_ms: 250,
-        },
-        HbonePoolError::DnsLookup {
-            host: SECRET_HOST.to_string(),
-            message: SECRET_VERIFIER_TEXT.to_string(),
-        },
-        HbonePoolError::InvalidServerName {
-            host: SECRET_HOST.to_string(),
-            message: SECRET_VERIFIER_TEXT.to_string(),
-        },
-        HbonePoolError::InvalidPeerSpiffeTag {
-            value: "spiffe://cluster.local/ns/default/sa/orders".to_string(),
-            message: SECRET_VERIFIER_TEXT.to_string(),
-        },
-        HbonePoolError::H2Handshake {
-            host: SECRET_HOST.to_string(),
-            message: SECRET_VERIFIER_TEXT.to_string(),
-        },
-        HbonePoolError::ConnectStream {
-            authority: SECRET_HOST.to_string(),
-            message: SECRET_VERIFIER_TEXT.to_string(),
-        },
-        HbonePoolError::ConnectRejected {
-            authority: SECRET_HOST.to_string(),
-            status: 403,
-        },
-        HbonePoolError::MaxConnectionsExceeded {
-            host: "orders.default.svc.cluster.local".to_string(),
-            port: 8080,
-            current: 12,
-            cap: 12,
-        },
-        HbonePoolError::TlsConfig(SpiffeTlsError::BadKeyMaterial(
-            SECRET_VERIFIER_TEXT.to_string(),
-        )),
-    ];
-
-    for err in &leaky {
+    for err in sensitive_pool_errors() {
         let reason = err.public_reason();
-        for secret in [
-            SECRET_HOST,
-            SECRET_VERIFIER_TEXT,
-            "spiffe://",
-            "BadSignature",
-            "orders",
-        ] {
+        for secret in HOSTILE_SENTINELS {
             assert!(
                 !reason.contains(secret),
                 "public reason '{reason}' leaked '{secret}'"
             );
         }
         for label in [MeshTransportLabel::Hbone, MeshTransportLabel::SidecarMtls] {
-            let body = label.unavailable_body_for_error(err);
-            assert!(
-                !body.contains(SECRET_HOST) && !body.contains("BadSignature"),
-                "client body '{body}' leaked peer/verifier detail"
-            );
+            let body = label.unavailable_body_for_error(&err);
+            for secret in HOSTILE_SENTINELS {
+                assert!(
+                    !body.contains(secret),
+                    "client body '{body}' leaked '{secret}'"
+                );
+            }
         }
     }
 }
 
 #[test]
-fn display_keeps_the_detail_the_operator_log_needs() {
-    // The redaction is client-side only: the operator-facing `Display` (what
-    // the `error!` line carries) must still name the peer and the cause, or
-    // the fix would have traded a mislabel for an undiagnosable failure.
+fn display_still_carries_internal_diagnostic_detail() {
+    // `Display` remains useful as the error value. Production operator logs
+    // must not interpolate it; they are pinned separately by capturing the
+    // `error!` record.
     let rendered = tls_handshake_error().to_string();
     assert!(rendered.contains(SECRET_HOST), "{rendered}");
     assert!(rendered.contains("BadSignature"), "{rendered}");
@@ -284,4 +408,36 @@ fn every_reason_is_a_short_fixed_phrase() {
         assert!(!reason.contains(SECRET_HOST), "{reason}");
         assert!(!reason.contains(SECRET_VERIFIER_TEXT), "{reason}");
     }
+}
+
+#[test]
+fn operator_pool_error_log_omits_hostile_display_detail() {
+    for err in sensitive_pool_errors() {
+        for label in [MeshTransportLabel::Hbone, MeshTransportLabel::SidecarMtls] {
+            let logs = capture_pool_error_log(label, &err);
+            assert!(
+                !logs.trim().is_empty(),
+                "pool-error path must emit an operator log"
+            );
+            assert_operator_log_redacted(&logs, &err, label);
+        }
+    }
+}
+
+#[test]
+fn connect_rejected_operator_log_keeps_numeric_peer_status() {
+    let err = HbonePoolError::ConnectRejected {
+        authority: SECRET_HOST.to_string(),
+        status: 403,
+    };
+    let logs = capture_pool_error_log(MeshTransportLabel::Hbone, &err);
+    assert_operator_log_redacted(&logs, &err, MeshTransportLabel::Hbone);
+    assert!(
+        logs.contains("peer_status=403"),
+        "CONNECT admission status must remain a closed numeric field: {logs}"
+    );
+    assert_eq!(
+        MeshTransportLabel::Hbone.unavailable_body_for_error(&err),
+        r#"{"error":"HBONE backend unavailable: tunnel rejected by peer with status 403"}"#
+    );
 }

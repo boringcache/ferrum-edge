@@ -23,7 +23,7 @@ use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::net::TcpStream;
 use tokio::sync::Mutex;
 use tokio_rustls::TlsConnector;
-use tracing::debug;
+use tracing::{debug, error};
 
 use crate::config::PoolConfig;
 use crate::config::types::{Proxy, UpstreamTarget};
@@ -36,7 +36,7 @@ use crate::modes::mesh::hbone::{
 use crate::proxy::mesh_trust_registry::{
     MeshTransportGate, MeshTransportKind, MeshTransportRegistration, MeshTrustRegistry,
 };
-use crate::retry::ErrorClass;
+use crate::retry::{ErrorClass, error_class_log_kind};
 use crate::tls::backend::BackendSvidGeneration;
 use crate::tls::spiffe::{SpiffeTlsError, build_spiffe_outbound_config};
 use arc_swap::ArcSwap;
@@ -341,8 +341,9 @@ impl HbonePoolError {
     /// subject names, trust-domain values). Every arm here is a `&'static str`
     /// chosen from the error VARIANT alone, so no host, address, SPIFFE ID,
     /// certificate subject, trust root, key material, or source-error text can
-    /// reach a client through it. The full `Display` still goes to the
-    /// operator-side `error!` log, which is where it belongs.
+    /// reach a client through it. The same phrase is the operator-log
+    /// `error_phase`; production log records on this path never interpolate
+    /// `Display`. `Display` remains useful as the error value itself.
     ///
     /// Keep the reasons coarse: they name the phase that failed, never why the
     /// peer rejected us.
@@ -405,7 +406,8 @@ impl HbonePoolError {
 /// wording.
 ///
 /// The label only selects the fixed public noun; classification, retry
-/// accounting, and logging are identical on both transports.
+/// accounting, and the closed-cardinality operator log fields are identical
+/// on both transports.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum MeshTransportLabel {
     /// Ambient / waypoint HTTP/2 CONNECT tunnel (`:15008`).
@@ -479,6 +481,41 @@ impl MeshTransportLabel {
         match self {
             Self::Hbone => "HBONE backend request failed",
             Self::SidecarMtls => "Sidecar mTLS backend request failed",
+        }
+    }
+
+    /// Emit the operator `error!` record for a pool-setup failure on this
+    /// transport.
+    ///
+    /// Fields are closed-cardinality: `error_kind`, `error_phase` (from
+    /// [`HbonePoolError::public_reason`]), and `peer_status` only for
+    /// [`HbonePoolError::ConnectRejected`]. Never interpolates `Display`, so
+    /// a host, address, CONNECT authority, tag value, SPIFFE ID, certificate
+    /// subject/SAN/issuer/serial/fingerprint, trust root, key id, file path,
+    /// verifier message, or peer-controlled string cannot ride this record.
+    pub fn log_pool_error(self, proxy_id: &str, err: &HbonePoolError) {
+        let error_kind = error_class_log_kind(err.error_class());
+        let error_phase = err.public_reason();
+        match err.public_status() {
+            Some(peer_status) => {
+                error!(
+                    proxy_id = %proxy_id,
+                    error_kind,
+                    error_phase,
+                    peer_status,
+                    "{}",
+                    self.dispatch_failure_log_message()
+                );
+            }
+            None => {
+                error!(
+                    proxy_id = %proxy_id,
+                    error_kind,
+                    error_phase,
+                    "{}",
+                    self.dispatch_failure_log_message()
+                );
+            }
         }
     }
 
