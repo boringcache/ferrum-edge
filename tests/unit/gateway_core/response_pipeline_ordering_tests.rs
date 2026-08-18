@@ -1757,13 +1757,12 @@ fn waf_monitoring_response_body() -> Arc<dyn Plugin> {
     )
 }
 
-/// Globally enforcing, but the only rule that reads the response body is itself
-/// `monitor` and no anomaly scoring can promote it — the rule-level half of the
-/// same question.
+/// Globally monitoring with a response-body rule that is itself `monitor` and no
+/// anomaly scoring can promote it — the rule-level half of the same question.
 fn waf_with_monitor_only_response_rule() -> Arc<dyn Plugin> {
     Arc::new(
         Waf::new(&json!({
-            "mode": "enforce",
+            "mode": "monitor",
             "include_default_rules": false,
             "scan_budget_ms": 0,
             "response_inspection": true,

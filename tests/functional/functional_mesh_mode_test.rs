@@ -430,6 +430,7 @@ fn mesh_port_is_reserved(port: u16) -> bool {
         .contains(&port)
 }
 
+#[cfg(not(target_os = "linux"))]
 async fn reserve_unique_mesh_port() -> u16 {
     loop {
         let reservation = reserve_port().await.expect("reserve unique mesh port");
@@ -442,6 +443,40 @@ async fn reserve_unique_mesh_port() -> u16 {
             return reservation.drop_and_take_port();
         }
     }
+}
+
+#[cfg(target_os = "linux")]
+/// Select a host-network listener port outside Linux's ephemeral source range.
+///
+/// Mesh startup opens its control-plane connection before every proxy listener
+/// has bound. Releasing an ordinary `127.0.0.1:0` reservation can therefore let
+/// that connection claim its own promised listener port and fail startup with
+/// `EADDRINUSE`. The netns allocator below already enforces this invariant.
+async fn reserve_unique_mesh_port() -> u16 {
+    let (ephemeral_first, ephemeral_last) =
+        ephemeral_port_range().expect("read host ephemeral port range");
+    for port in 10_240..=u16::MAX {
+        if (ephemeral_first..=ephemeral_last).contains(&port) || mesh_port_is_reserved(port) {
+            continue;
+        }
+        let listener = match std::net::TcpListener::bind(("0.0.0.0", port)) {
+            Ok(listener) => listener,
+            Err(error) if error.kind() == std::io::ErrorKind::AddrInUse => continue,
+            Err(error) => panic!("probe host mesh port {port}: {error}"),
+        };
+        let inserted = used_mesh_ports()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(port);
+        if inserted {
+            drop(listener);
+            return port;
+        }
+    }
+    panic!(
+        "no free host mesh port outside ephemeral range \
+         {ephemeral_first}-{ephemeral_last}"
+    );
 }
 
 /// Bind attempts [`bind_fixture_listener_where`] makes before giving up.
@@ -518,25 +553,37 @@ pub(crate) async fn reserve_mesh_ports() -> MeshPorts {
 }
 
 #[cfg(target_os = "linux")]
+fn parse_ephemeral_port_range(raw: &str, scope: &str) -> Result<(u16, u16), String> {
+    let mut fields = raw.split_whitespace();
+    let first = fields
+        .next()
+        .ok_or_else(|| format!("{scope} ephemeral port range is empty"))?
+        .parse::<u16>()
+        .map_err(|error| format!("parse {scope} ephemeral port range start: {error}"))?;
+    let last = fields
+        .next()
+        .ok_or_else(|| format!("{scope} ephemeral port range has no end"))?
+        .parse::<u16>()
+        .map_err(|error| format!("parse {scope} ephemeral port range end: {error}"))?;
+    if fields.next().is_some() || first > last {
+        return Err(format!("invalid {scope} ephemeral port range: {raw:?}"));
+    }
+    Ok((first, last))
+}
+
+#[cfg(target_os = "linux")]
+fn ephemeral_port_range() -> Result<(u16, u16), String> {
+    let raw = std::fs::read_to_string("/proc/sys/net/ipv4/ip_local_port_range")
+        .map_err(|error| format!("read host ephemeral port range: {error}"))?;
+    parse_ephemeral_port_range(&raw, "host")
+}
+
+#[cfg(target_os = "linux")]
 fn ephemeral_port_range_in_netns(pid: u32) -> Result<(u16, u16), String> {
     run_in_live_netns(pid, || {
         let raw = std::fs::read_to_string("/proc/sys/net/ipv4/ip_local_port_range")
             .map_err(|error| format!("read netns ephemeral port range: {error}"))?;
-        let mut fields = raw.split_whitespace();
-        let first = fields
-            .next()
-            .ok_or_else(|| "netns ephemeral port range is empty".to_string())?
-            .parse::<u16>()
-            .map_err(|error| format!("parse netns ephemeral port range start: {error}"))?;
-        let last = fields
-            .next()
-            .ok_or_else(|| "netns ephemeral port range has no end".to_string())?
-            .parse::<u16>()
-            .map_err(|error| format!("parse netns ephemeral port range end: {error}"))?;
-        if fields.next().is_some() || first > last {
-            return Err(format!("invalid netns ephemeral port range: {raw:?}"));
-        }
-        Ok((first, last))
+        parse_ephemeral_port_range(&raw, "netns")
     })
 }
 
@@ -1119,6 +1166,27 @@ async fn fixture_listeners_never_take_a_reserved_mesh_port() {
             "a fixture listener bound port {port}, which is already promised to a mesh gateway \
              subprocess — the gateway would fail startup with EADDRINUSE while a bare port probe \
              kept succeeding (issue #2132)"
+        );
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn host_mesh_ports_stay_outside_the_ephemeral_source_range() {
+    let (ephemeral_first, ephemeral_last) =
+        ephemeral_port_range().expect("read host ephemeral port range");
+    let ports = reserve_mesh_ports().await;
+    for (label, port) in [
+        ("inbound", ports.inbound),
+        ("outbound", ports.outbound),
+        ("hbone", ports.hbone),
+        ("egress", ports.egress),
+        ("east_west", ports.east_west),
+    ] {
+        assert!(
+            !(ephemeral_first..=ephemeral_last).contains(&port),
+            "mesh {label} port {port} must stay outside the host ephemeral source range \
+             {ephemeral_first}-{ephemeral_last}"
         );
     }
 }
