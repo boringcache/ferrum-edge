@@ -608,7 +608,8 @@ fn file_mode_config_requires_generated_operations_table() {
     let err = OpenapiValidator::new(&json!({
         "fail_on_unknown_operation": true
     }))
-    .expect_err("operations is required for direct/file-mode config");
+    .err()
+    .expect("operations is required for direct/file-mode config");
     assert!(
         err.contains("'operations' is required"),
         "expected operations requirement error, got: {err}"
