@@ -2568,15 +2568,22 @@ https://github.com/ferrum-edge/ferrum-edge/releases
 
 ### Download Latest Release
 
+Published gateway binaries use raw asset names such as `ferrum-edge-linux-x86_64` with adjacent `.sha256` sidecars. Pin an explicit published tag (`latest` for the current prerelease stream). Do not rely on GitHub's `/releases/latest` redirect or the `releases/latest` API endpoint for a prerelease tag.
+
 ```bash
-# Using GitHub CLI
-gh release download --repo ferrum-edge/ferrum-edge -p "*linux-x86_64"
+# Using GitHub CLI (explicit tag; resolves tag name `latest` even when prerelease)
+gh release download --repo ferrum-edge/ferrum-edge latest -p 'ferrum-edge-linux-x86_64*'
+sha256sum -c ferrum-edge-linux-x86_64.sha256
+chmod +x ferrum-edge-linux-x86_64
 
 # Using curl
-RELEASE_URL=$(curl -s https://api.github.com/repos/ferrum-edge/ferrum-edge/releases/latest | \
-  jq -r '.assets[] | select(.name == "ferrum-edge-linux-x86_64") | .browser_download_url')
-curl -L -o ferrum-edge $RELEASE_URL
-chmod +x ferrum-edge
+set -euo pipefail
+TAG=latest  # or replace with another explicit published tag
+BASE="https://github.com/ferrum-edge/ferrum-edge/releases/download/${TAG}"
+curl -fsSLO "${BASE}/ferrum-edge-linux-x86_64"
+curl -fsSLO "${BASE}/ferrum-edge-linux-x86_64.sha256"
+sha256sum -c ferrum-edge-linux-x86_64.sha256
+chmod +x ferrum-edge-linux-x86_64
 ```
 
 ### Platform-Specific Binaries
