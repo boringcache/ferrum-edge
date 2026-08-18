@@ -19005,11 +19005,12 @@ pub async fn start_proxy_listener_with_bound_listener_and_mesh_direction(
 /// accept workers (issue #3924).
 ///
 /// `SO_REUSEPORT` is never set. A second unrelated process cannot join this
-/// address/port; the kernel returns `EADDRINUSE`. `FERRUM_ACCEPT_THREADS`
+/// address/port; the OS refuses its bind (`EADDRINUSE` on Unix and
+/// `WSAEADDRINUSE` or `WSAEACCES` on Windows). `FERRUM_ACCEPT_THREADS`
 /// concurrency is preserved by duplicating the single authoritative listener
-/// so each tokio accept task has its own fd/waker while still sharing one
-/// kernel listen socket. Do not replace this with a TOCTOU occupancy probe
-/// or a second independent bind.
+/// so each tokio accept task has its own fd/waker while still sharing one kernel
+/// listen socket. Do not replace this with a TOCTOU occupancy probe or a second
+/// independent bind.
 pub(crate) fn bind_exclusive_proxy_accept_listeners(
     addr: SocketAddr,
     backlog: i32,
@@ -19073,10 +19074,15 @@ fn clone_proxy_listener_inner(_listener: &TcpListener) -> std::io::Result<TcpLis
     ))
 }
 
-/// Create a bound TCP socket with SO_REUSEADDR and without SO_REUSEPORT.
+/// Create a bound TCP socket with an OS-native exclusive server posture.
 ///
-/// The socket is exclusive at the kernel: another process cannot listen on
-/// the same TCP address/port, including one that sets `SO_REUSEPORT`.
+/// Unix uses `SO_REUSEADDR` without `SO_REUSEPORT`. Windows must instead set
+/// `SO_EXCLUSIVEADDRUSE`: Winsock's `SO_REUSEADDR` lets another process
+/// forcibly co-bind the port and would recreate the traffic-splitting defect
+/// this factory closes.
+///
+/// The socket is exclusive at the kernel: another process cannot listen on the
+/// same TCP address/port, including one that requests a reuse option.
 /// Intra-process accept workers must [`clone_proxy_listener`] this fd rather
 /// than binding again. Used by HTTP, Gateway, and stream/TCP listeners.
 ///
@@ -19099,10 +19105,17 @@ pub(crate) fn create_proxy_socket(
         Some(socket2::Protocol::TCP),
     )?;
 
-    // SO_REUSEADDR: allow rapid restart without TIME_WAIT blocking the port.
-    // Do not set SO_REUSEPORT: that lets a second ferrum-edge process bind the
-    // same proxy port and split traffic (issue #3924).
+    // Unix SO_REUSEADDR allows rapid restart without admitting an independent
+    // listener. Do not set SO_REUSEPORT: that lets a second ferrum-edge
+    // process bind the same proxy port and split traffic (issue #3924).
+    #[cfg(unix)]
     socket.set_reuse_address(true)?;
+
+    // Winsock SO_REUSEADDR has the opposite security posture: another process
+    // can forcibly co-bind the port and make delivery indeterminate. Server
+    // sockets therefore require SO_EXCLUSIVEADDRUSE before bind.
+    #[cfg(windows)]
+    set_windows_exclusive_addr_use(&socket)?;
 
     // IP_TRANSPARENT / IPV6_TRANSPARENT for the NodeWaypoint transparent
     // inbound CAPTURE listener (issue #3287). That listener is the only caller
@@ -19172,6 +19185,53 @@ pub(crate) fn create_proxy_socket(
     })?;
 
     Ok(TcpListener::from_std(socket.into())?)
+}
+
+#[cfg(windows)]
+#[link(name = "Ws2_32")]
+unsafe extern "system" {
+    #[link_name = "setsockopt"]
+    fn winsock_setsockopt(
+        socket: usize,
+        level: i32,
+        option_name: i32,
+        option_value: *const std::ffi::c_char,
+        option_len: i32,
+    ) -> i32;
+    #[link_name = "WSAGetLastError"]
+    fn winsock_last_error() -> i32;
+}
+
+#[cfg(windows)]
+fn set_windows_exclusive_addr_use(socket: &socket2::Socket) -> std::io::Result<()> {
+    use std::os::windows::io::AsRawSocket;
+
+    const SOL_SOCKET: i32 = 0xffff;
+    const SO_REUSEADDR: i32 = 0x0004;
+    const SO_EXCLUSIVEADDRUSE: i32 = !SO_REUSEADDR;
+    const SOCKET_ERROR: i32 = -1;
+
+    let enabled: i32 = 1;
+    // SAFETY: `socket` is live, `enabled` remains valid for the call, and the
+    // option length exactly describes that integer. Winsock requires this
+    // option before bind, which is where the caller invokes this helper.
+    let result = unsafe {
+        winsock_setsockopt(
+            socket.as_raw_socket() as usize,
+            SOL_SOCKET,
+            SO_EXCLUSIVEADDRUSE,
+            std::ptr::addr_of!(enabled).cast(),
+            std::mem::size_of::<i32>() as i32,
+        )
+    };
+    if result == SOCKET_ERROR {
+        // SAFETY: WSAGetLastError has no arguments and reads thread-local
+        // Winsock error state immediately after the failed call.
+        return Err(std::io::Error::from_raw_os_error(unsafe {
+            winsock_last_error()
+        }));
+    }
+    Ok(())
 }
 
 /// Start the proxy listener with an optional startup signal sent after bind.

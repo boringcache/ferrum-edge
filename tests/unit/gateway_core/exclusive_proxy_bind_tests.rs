@@ -22,7 +22,9 @@ fn ipv4_ephemeral() -> SocketAddr {
 }
 
 fn is_addr_in_use(err: &std::io::Error) -> bool {
-    err.kind() == ErrorKind::AddrInUse || err.to_string().to_ascii_lowercase().contains("in use")
+    err.kind() == ErrorKind::AddrInUse
+        || (cfg!(windows) && err.kind() == ErrorKind::PermissionDenied)
+        || err.to_string().to_ascii_lowercase().contains("in use")
 }
 
 fn assert_foreign_bind_rejected(addr: SocketAddr, what: &str) {
@@ -30,13 +32,14 @@ fn assert_foreign_bind_rejected(addr: SocketAddr, what: &str) {
         Ok(stolen) => {
             drop(stolen);
             panic!(
-                "{what}: SO_REUSEPORT foreign bind succeeded on {addr}; exclusive listen socket \
+                "{what}: reuse-enabled foreign bind succeeded on {addr}; exclusive listen socket \
                  must not be joinable by another process"
             );
         }
         Err(err) => assert!(
             is_addr_in_use(&err),
-            "{what}: expected EADDRINUSE for SO_REUSEPORT foreign bind on {addr}, got {err}"
+            "{what}: expected an address-collision error for reuse-enabled foreign bind on \
+             {addr}, got {err}"
         ),
     }
 
@@ -44,13 +47,14 @@ fn assert_foreign_bind_rejected(addr: SocketAddr, what: &str) {
         Ok(stolen) => {
             drop(stolen);
             panic!(
-                "{what}: SO_REUSEADDR-only foreign bind succeeded on {addr}; the first process \
-                 must keep exclusive ownership"
+                "{what}: default foreign bind succeeded on {addr}; the first process must keep \
+                 exclusive ownership"
             );
         }
         Err(err) => assert!(
             is_addr_in_use(&err),
-            "{what}: expected EADDRINUSE for SO_REUSEADDR foreign bind on {addr}, got {err}"
+            "{what}: expected an address-collision error for default foreign bind on {addr}, \
+             got {err}"
         ),
     }
 }
