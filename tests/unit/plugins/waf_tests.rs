@@ -1683,6 +1683,7 @@ fn waf_rule_target_openapi_runtime_parity() {
 
     let waf_with_target = |target: &JsonValue| {
         Waf::new(&json!({
+            "mode": "monitor",
             "include_default_rules": false,
             "custom_rules": [{
                 "id": "CUSTOM-TARGET-PARITY",
@@ -2462,6 +2463,7 @@ async fn changing_waf_rule_category_cannot_alter_scan_targets() {
 #[tokio::test]
 async fn disabled_default_rules_are_skipped() {
     let plugin = Waf::new(&json!({
+        "mode": "monitor",
         "disabled_default_rules": ["FE-XSS-001"],
         "rule_modes": { "FE-XSS-001": "enforce" }
     }))
@@ -2491,7 +2493,7 @@ async fn paranoia_level_filters_custom_rules() {
                 "target": "query_values",
                 "match_kind": "contains",
                 "pattern": "never-matches",
-                "action": "monitor",
+                "action": "enforce",
                 "paranoia_min": 1
             },
             {
@@ -2581,6 +2583,7 @@ fn response_body_buffering_narrows_to_inspectable_content_types() {
     // (allowlisted) types. The proxy uses this to stream non-allowlisted/binary
     // responses instead of buffering-then-skipping them.
     let plugin = Waf::new(&json!({
+        "mode": "monitor",
         "response_inspection": true,
         "response_body_inspection": true,
     }))
@@ -2791,6 +2794,7 @@ async fn oversized_body_skip_mode_does_not_scan_truncated_prefix() {
 #[tokio::test]
 async fn clean_truncated_scan_preserves_owned_log_metadata() {
     let plugin = Waf::new(&json!({
+        "mode": "monitor",
         "include_default_rules": false,
         "max_scan_bytes": 4,
         "custom_rules": [{
@@ -3202,7 +3206,7 @@ fn enforce_mode_rejects_when_only_enforce_rule_is_disabled() {
         "disabled_default_rules": ["FE-XSS-001"]
     }))
     .unwrap_err();
-    assert!(err.contains("no rule with action 'enforce'"));
+    assert!(err.contains("no enabled enforcement path"));
 }
 
 #[test]
@@ -3483,7 +3487,7 @@ fn assert_encoding_monitored(result: &PluginResult, ctx: &RequestContext, rule_i
 
 #[tokio::test]
 async fn default_posture_monitors_encoding_heuristics() {
-    let plugin = Waf::new(&json!({ "mode": "enforce" })).unwrap();
+    let plugin = Waf::new(&json!({ "mode": "monitor" })).unwrap();
     let (result, ctx) = scan_form_body(&plugin, b"code=SAVE50%25").await;
     assert_encoding_monitored(&result, &ctx, "FE-ENCODING-001");
 }
@@ -3832,6 +3836,7 @@ async fn rule_override_scopes_built_in_rule_to_paths() {
 #[tokio::test]
 async fn rule_override_can_lower_paranoia_to_reactivate_rule() {
     let plugin = Waf::new(&json!({
+        "mode": "monitor",
         "rule_overrides": { "FE-RFI-001": { "paranoia_min": 1 } }
     }))
     .unwrap();
@@ -4721,17 +4726,27 @@ async fn stream_waf_signature_monitor_mode_records_but_allows() {
 async fn stream_waf_monitor_action_signature_is_not_a_would_block() {
     // A signature whose own `action` is `monitor` never rejects — not even under
     // global `enforce`. It must record the rule hit but NOT a would-block, so the
-    // would-block count reflects only signatures that would actually reject.
+    // would-block count reflects only signatures that would actually reject. The
+    // second signature never matches this payload; it only supplies the enforce
+    // action `mode: enforce` now requires, without changing the assertions.
     let plugin = Waf::new(&json!({
         "mode": "enforce",
         "include_default_rules": false,
         "stream": {
-            "signatures": [{
-                "id": "STREAM-PROBE-1",
-                "pattern": "(?i)union\\s+select",
-                "severity": "medium",
-                "action": "monitor"
-            }]
+            "signatures": [
+                {
+                    "id": "STREAM-PROBE-1",
+                    "pattern": "(?i)union\\s+select",
+                    "severity": "medium",
+                    "action": "monitor"
+                },
+                {
+                    "id": "STREAM-ENFORCE-SENTINEL",
+                    "pattern": "(?i)this-pattern-never-matches",
+                    "severity": "high",
+                    "action": "enforce"
+                }
+            ]
         }
     }))
     .unwrap();
@@ -5152,12 +5167,14 @@ async fn stream_waf_signature_missing_bytes_still_allows_encrypted_passthrough()
 
 #[tokio::test]
 async fn stream_waf_monitor_only_signatures_do_not_fail_closed_on_missing_bytes() {
-    // Global `enforce` but every signature is `action: monitor`: a present match
-    // is allowed (`stream_decision` blocks only enforce-action hits), so missing
-    // first bytes must NOT fail closed either — otherwise idle / server-first
-    // clients are rejected even though no configured signature could ever block.
+    // A monitor-only signature set can no longer be constructed under `enforce`
+    // (there is no reachable enforcement path), so exercise the same
+    // missing-first-bytes invariant under `monitor`: when no configured
+    // signature is enforce-action there is nothing to fail closed for, so missing bytes
+    // must record nothing — not a block, not a would-block — instead of phantom
+    // rejecting idle / server-first clients.
     let plugin = Waf::new(&json!({
-        "mode": "enforce",
+        "mode": "monitor",
         "include_default_rules": false,
         "stream": {
             "signatures": [{
@@ -5803,6 +5820,7 @@ async fn request_wide_header_exemption_prevents_oversize_fail_closed_block() {
 async fn monitor_only_body_rules_still_prefix_scan_oversize_request_body() {
     // No enforcing body policy: the oversize body is observed, not blocked.
     let plugin = Waf::new(&json!({
+        "mode": "monitor",
         "include_default_rules": false,
         "max_scan_bytes": SCAN_CAP,
         "custom_rules": [monitor_request_body_rule()]
@@ -5834,7 +5852,7 @@ async fn monitor_only_body_rules_still_prefix_scan_oversize_request_body() {
 async fn default_builtin_pack_does_not_block_oversize_body() {
     // The stock config (built-ins, which are monitor-only unless opted in) must
     // not start rejecting large uploads because of the new default.
-    let plugin = Waf::new(&json!({ "max_scan_bytes": SCAN_CAP })).unwrap();
+    let plugin = Waf::new(&json!({ "mode": "monitor", "max_scan_bytes": SCAN_CAP })).unwrap();
     let mut ctx = body_ctx();
     let headers = ctx.headers.clone();
 
@@ -5908,12 +5926,26 @@ async fn scan_truncated_opt_out_preserves_prefix_only_inspection() {
 #[tokio::test]
 async fn explicit_block_still_rejects_oversize_body_without_enforcing_body_rule() {
     // `block` keeps its stricter meaning: it does not narrow to the
-    // enforcing-policy predicate that `fail_closed` uses.
+    // enforcing-policy predicate that `fail_closed` uses. The query sentinel is
+    // not a body rule; it only supplies the enforcement path `mode: enforce`
+    // now requires, so the oversized *body* still blocks on `block` alone.
     let plugin = Waf::new(&json!({
         "include_default_rules": false,
         "max_scan_bytes": SCAN_CAP,
         "on_body_too_large": "block",
-        "custom_rules": [monitor_request_body_rule()]
+        "custom_rules": [
+            monitor_request_body_rule(),
+            {
+                "id": "CUSTOM-QUERY-ENFORCE",
+                "name": "query sentinel",
+                "category": "custom",
+                "severity": "high",
+                "target": "query_values",
+                "match_kind": "contains",
+                "pattern": "never-matches",
+                "action": "enforce"
+            }
+        ]
     }))
     .unwrap();
     let mut ctx = body_ctx();
@@ -5999,6 +6031,7 @@ async fn oversize_response_body_fails_closed_by_default() {
 #[tokio::test]
 async fn monitor_only_response_body_rule_prefix_scans_oversize_response_body() {
     let plugin = Waf::new(&json!({
+        "mode": "monitor",
         "include_default_rules": false,
         "max_scan_bytes": SCAN_CAP,
         "response_inspection": true,
@@ -6089,10 +6122,10 @@ async fn enforcing_response_body_rule_does_not_fail_close_the_request_body() {
 
 #[test]
 fn on_body_too_large_accepts_fail_closed_and_rejects_unknown_values() {
-    let accepted = Waf::new(&json!({ "on_body_too_large": "fail_closed" }));
+    let accepted = Waf::new(&json!({ "mode": "monitor", "on_body_too_large": "fail_closed" }));
     assert!(accepted.is_ok());
 
-    let rejected = Waf::new(&json!({ "on_body_too_large": "scan_truncted" }));
+    let rejected = Waf::new(&json!({ "mode": "monitor", "on_body_too_large": "scan_truncted" }));
     let error = rejected.unwrap_err();
     assert!(
         error.contains("fail_closed") && error.contains("scan_truncated"),
@@ -6128,7 +6161,7 @@ fn on_body_too_large_openapi_runtime_parity() {
     );
     for value in &documented {
         assert!(
-            Waf::new(&json!({ "on_body_too_large": value })).is_ok(),
+            Waf::new(&json!({ "mode": "monitor", "on_body_too_large": value })).is_ok(),
             "runtime must accept documented on_body_too_large value {value}"
         );
     }
