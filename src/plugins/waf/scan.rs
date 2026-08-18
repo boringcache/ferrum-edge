@@ -1,8 +1,5 @@
-use std::borrow::Cow;
 use std::collections::HashMap;
 use std::net::IpAddr;
-
-use percent_encoding::percent_decode_str;
 
 use super::Waf;
 use super::decode;
@@ -156,15 +153,16 @@ impl Waf {
         // value past `query_keys`/`query_values` rules. The parsed HashMap
         // still collapses `?q=<script>&q=ok` to `q=ok`, so relying on the
         // monitor-only HPP rule alone would miss enforced query-value rules.
+        // Split on `&`/`=` first, then canonicalize each component (including
+        // `%2f`) so PATHTRAV/LFI and QueryValues (SSRF-Q) see the same decoded
+        // slashes without treating encoded separators as extra pairs.
         if let Some(raw) = raw_query {
             for pair in raw.split('&') {
                 if pair.is_empty() {
                     continue;
                 }
                 let (raw_k, raw_v) = pair.split_once('=').unwrap_or((pair, ""));
-                let key = decode_query_component_for_waf(raw_k);
-                let value = decode_query_component_for_waf(raw_v);
-                self.scan_query_pair(&mut outcome, &key, &value, subject);
+                self.scan_query_pair(&mut outcome, raw_k, raw_v, subject);
             }
         } else {
             for (key, value) in &ctx.query_params {
@@ -491,31 +489,42 @@ impl Waf {
     fn scan_query_pair(
         &self,
         outcome: &mut ScanOutcome,
-        key: &str,
-        value: &str,
+        raw_key: &str,
+        raw_value: &str,
         subject: ScanSubject<'_>,
     ) {
-        self.scan_text_set(
-            outcome,
-            self.compiled.query_keys.as_ref(),
-            key,
-            subject,
-            None,
-        );
-        self.scan_cidr_rules_matching(
-            outcome,
-            key,
-            &self.compiled.text_cidr_rules,
-            subject,
-            |target| matches!(target, RuleTarget::QueryKeys),
-        );
-        // Match the percent-decoded parameter value, then the same bounded
-        // layered variants used for bodies (stacked percent / HTML-entity /
-        // unicode). Query rules never inspect raw whole-URI text.
-        self.scan_query_value(outcome, value, subject);
-        let (variants, _) = normalize::decoded_variants_with_residual(value);
-        for variant in variants {
-            self.scan_query_value(outcome, &variant, subject);
+        // One shared decode: split components are already isolated, then
+        // `canonical_query_component_views` percent-decodes `%2f` and produces
+        // the bounded layered variants. PATHTRAV/LFI (canonical_query_values)
+        // and QueryValues including SSRF-Q must scan those same views — not a
+        // second, weaker decode of the already-normalized string.
+        let key_views = normalize::canonical_query_component_views(raw_key);
+        let value_views = normalize::canonical_query_component_views(raw_value);
+        for key in key_views.iter() {
+            self.scan_text_set(
+                outcome,
+                self.compiled.query_keys.as_ref(),
+                key,
+                subject,
+                None,
+            );
+            self.scan_cidr_rules_matching(
+                outcome,
+                key,
+                &self.compiled.text_cidr_rules,
+                subject,
+                |target| matches!(target, RuleTarget::QueryKeys),
+            );
+        }
+        for value in value_views.iter() {
+            self.scan_query_value(outcome, value, subject);
+            self.scan_text_set(
+                outcome,
+                self.compiled.canonical_query_values.as_ref(),
+                value,
+                subject,
+                None,
+            );
         }
     }
 
@@ -768,15 +777,6 @@ impl Waf {
                 target_name: rule_ref.target_name,
             });
         }
-    }
-}
-
-fn decode_query_component_for_waf(raw: &str) -> Cow<'_, str> {
-    let decoded = percent_decode_str(raw).decode_utf8_lossy();
-    if decoded.contains('+') {
-        Cow::Owned(decoded.replace('+', " "))
-    } else {
-        decoded
     }
 }
 

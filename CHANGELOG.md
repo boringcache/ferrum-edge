@@ -92,6 +92,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   nonce. To defer the client change, set the acknowledged v1 profile explicitly
   — but not on non-idempotent routes.
 
+- **Sidecar mesh-mTLS dispatch failures are no longer labeled HBONE** (issue
+  #3927). A Sidecar-topology outbound dial is plain HTTP/2 over mutual TLS to
+  the peer sidecar's `:15006` inbound listener and opens no HTTP/2 CONNECT
+  tunnel, so its `502` body is now
+  `{"error":"Sidecar mTLS backend unavailable: <reason>"}` instead of
+  `{"error":"HBONE backend unavailable: …"}`. Ambient/waypoint CONNECT over
+  `:15008` keeps the HBONE wording. `<reason>` on **both** transports is now a
+  fixed phrase selected from the failure kind (`TLS handshake failed`,
+  `TCP connect failed`, `connect timed out`, `gateway identity unavailable`, …)
+  rather than the interpolated error `Display`, so peer addresses, certificate
+  subjects, SPIFFE IDs, trust roots, and raw rustls/SPIFFE verifier text no
+  longer reach a client. The operator `error!` record on this path is the same
+  closed set (`error_kind`, `error_phase`, and `peer_status` only for CONNECT
+  admission) and does not interpolate `Display`. The one retained
+  client-visible detail is the peer's own HTTP/2 CONNECT admission status
+  (`tunnel rejected by peer with status 403`), which keeps a destination policy
+  denial distinguishable from any other tunnel refusal.
+  Error classification, the pre/post-wire retry boundary, circuit-breaker and
+  passive-health accounting, and transaction-log `error_class` are unchanged.
+  Anything matching on the old sidecar body string must be updated.
+
+- **`mesh` mode refuses a partial `FERRUM_GATEWAY_SVID_*` tuple at validate
+  time** (issue #3927). Naming one or two of
+  `FERRUM_GATEWAY_SVID_CERT_PATH` / `KEY_PATH` / `TRUST_BUNDLE_PATH` already
+  failed at startup; `ferrum-edge validate` now fails with the same
+  together-or-not-at-all diagnostic instead of reporting the generic
+  no-identity error, and `FERRUM_MESH_ALLOW_NO_CA` no longer lets a
+  half-configured identity validate clean.
+
 ### Fixed
 
 - WAF query SSRF mirrors `FE-SSRF-001-Q` / `FE-SSRF-002-Q` now compile at
