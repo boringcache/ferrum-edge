@@ -1443,10 +1443,12 @@ async fn literal_match_kind_is_case_sensitive_substring_on_body() {
         .on_final_request_body_with_context(&mut folded_ctx, &folded_headers, b"evil-literal")
         .await;
     assert!(matches!(folded_result, PluginResult::Continue));
-    assert!(!folded_ctx
-        .metadata
-        .get("waf.rule_hits")
-        .is_some_and(|hits| hits.contains("CUSTOM-LIT")));
+    assert!(
+        !folded_ctx
+            .metadata
+            .get("waf.rule_hits")
+            .is_some_and(|hits| hits.contains("CUSTOM-LIT"))
+    );
 }
 
 #[tokio::test]
