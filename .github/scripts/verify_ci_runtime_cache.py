@@ -1638,6 +1638,59 @@ def scan_yaml_action_invocations(text: str) -> tuple[list[str], list[str], list[
     return uses, using, errors
 
 
+def _without_yaml_description_prose(text: str) -> str:
+    """Blank plainly spelled `description:` values, keeping every other byte.
+
+    An action or workflow-input `description:` is metadata. GitHub renders it;
+    it is never a program, never a step, and never reaches a JavaScript runtime,
+    so documenting *which* toolkit call the trusted installers refuse to make
+    must not itself read as that call. `setup-sccache/action.yml` is whole-file
+    digest-frozen by the Cross build policy, so the token rule cannot be made to
+    depend on rewording that prose.
+
+    The walk uses the same block-scalar discipline as `_scan_yaml_actions`: a
+    `run:` (or any non-description) block-scalar body is stepped over without
+    being read, so a `description:`-shaped line *inside* a shell body cannot
+    blank the lines after it. Only a real description's own scalar and body are
+    blanked, only for the unquoted, unaliased, untagged spelling, and a body
+    that cannot be delimited is left in place — so the transform can only ever
+    remove documented prose, never an executable or structural slot.
+    """
+
+    lines = text.splitlines()
+    index = 0
+    while index < len(lines):
+        line = lines[index]
+        stripped = line.lstrip(" \t")
+        sequence = YAML_SEQUENCE_ITEM.match(line)
+        if sequence is not None and YAML_BLOCK_SCALAR.match(
+            _yaml_strip_trailing_comment(sequence.group("item")).strip()
+        ):
+            # `- |` is inert sequence data, not a mapping. Step over its body.
+            index = _skip_block_scalar(
+                lines, index + 1, len(line) - len(stripped)
+            )
+            continue
+        parsed = YAML_MAPPING_LINE.match(line)
+        if parsed is None:
+            index += 1
+            continue
+        key_indent = _yaml_mapping_key_indent(parsed)
+        value = _yaml_strip_trailing_comment(parsed.group("value")).strip()
+        prose = parsed.group("key") == "description"
+        if prose:
+            lines[index] = line[: parsed.start("value")]
+        index += 1
+        if not YAML_BLOCK_SCALAR.match(value):
+            continue
+        end = _skip_block_scalar(lines, index, key_indent)
+        if prose:
+            for body in range(index, end):
+                lines[body] = ""
+        index = end
+    return "\n".join(lines)
+
+
 def check_no_sccache_credential_exporter(
     text: str,
     source: str,
@@ -1656,7 +1709,11 @@ def check_no_sccache_credential_exporter(
     require(
         # Defense in depth: the contiguous token is insufficient against
         # computed property forms. The allowlist/shell-only checks are the gate.
-        SCCACHE_EXPORT_VARIABLE_TOKEN not in text,
+        # Scanned over everything except `description:` prose, so the rule stays
+        # a superset of PR #3958's invocation-shaped match on every executable
+        # and structural slot while the frozen installers can still document the
+        # credential boundary they enforce.
+        SCCACHE_EXPORT_VARIABLE_TOKEN not in _without_yaml_description_prose(text),
         f"{source} must not contain {SCCACHE_EXPORT_VARIABLE_TOKEN} "
         "(ACTIONS_RUNTIME_TOKEN leak)",
         failures,
@@ -1889,36 +1946,6 @@ def check_fips_producer_channel(
     test_build_job = extract_job(workflow, "fips-test-build")
     test_job = extract_job(workflow, "fips-test")
     aggregate = extract_job(workflow, "fips-build")
-    workflow_preamble = workflow.split("\njobs:", 1)[0]
-    require(
-        'CARGO_BUILD_JOBS: "3"' in workflow_preamble
-        and 'CARGO_PROFILE_DEV_DEBUG: "line-tables-only"' in workflow_preamble,
-        "FIPS producer and handoff consumers must share the three-job, "
-        "line-table debug profile used to bound hosted-runner memory",
-        failures,
-    )
-    swap_steps = [
-        step
-        for step in job_steps(test_build_job)
-        if "name: Extend runner swap for FIPS test binaries" in step
-    ]
-    swap_contract = (
-        "set -euo pipefail",
-        "sudo fallocate -l 12G /mnt/ferrum-swapfile",
-        "sudo chmod 600 /mnt/ferrum-swapfile",
-        "sudo mkswap /mnt/ferrum-swapfile",
-        "sudo swapon /mnt/ferrum-swapfile",
-        "free -h",
-    )
-    require(
-        len(swap_steps) == 1
-        and all(marker in swap_steps[0] for marker in swap_contract)
-        and test_build_job.find("Extend runner swap for FIPS test binaries")
-        < test_build_job.find("Precompile FIPS test binaries for consumers"),
-        "fips-test-build must provision the exact 12G swap contract before "
-        "precompiling its two aggregated test targets",
-        failures,
-    )
     mtime_refresh = (
         'find "$target_root" -xdev -type f '
         '\\\n            -exec touch --reference="$mtime_reference" -- {} +'
@@ -5347,6 +5374,98 @@ def self_test() -> int:
         failures,
     )
 
+    # The checked-in installer documents the exact toolkit call it refuses to
+    # make, and the Cross build policy freezes that file whole, so the token
+    # rule has to read `description:` as prose. Assert the real file still
+    # exercises the carve-out; a silent reword would make it vacuous.
+    require(
+        SCCACHE_EXPORT_VARIABLE_TOKEN in real_sccache,
+        "self-test: setup-sccache description must still document the "
+        f"{SCCACHE_EXPORT_VARIABLE_TOKEN} boundary it refuses",
+        failures,
+    )
+
+    description_prose_shapes = (
+        "description: >-\n"
+        "  Does not invoke an installer that `core.exportVariable`s\n"
+        "  ACTIONS_RUNTIME_TOKEN into GITHUB_ENV.\n"
+        "runs:\n"
+        "  using: composite\n",
+        "description: |\n"
+        "  core.exportVariable('ACTIONS_RUNTIME_TOKEN', token) is refused.\n"
+        "runs:\n"
+        "  using: composite\n",
+        "inputs:\n"
+        "  version:\n"
+        "    description: rejected because it would exportVariable the token\n",
+        "      - name: documented step\n"
+        "        description: core[\"exportVariable\"] is never reached\n"
+        "        run: echo ok\n",
+    )
+    for index, sample in enumerate(description_prose_shapes):
+        prose_failures: list[str] = []
+        check_no_sccache_credential_exporter(
+            sample,
+            f"self-test-export-variable-description-{index}",
+            prose_failures,
+        )
+        require(
+            not prose_failures,
+            f"self-test: description prose must not trip the token rule: "
+            f"{sample!r}: " + "; ".join(prose_failures),
+            failures,
+        )
+
+    # The carve-out is the description value only. A carrier in any executable
+    # or structural slot beside it, including a sibling of the same description,
+    # must still fail.
+    description_adjacent_carriers = (
+        "description: >-\n"
+        "  Refuses core.exportVariable installers.\n"
+        "runs:\n"
+        "  using: composite\n"
+        "  steps:\n"
+        "    - shell: bash\n"
+        "      run: node -e 'core.exportVariable(\"ACTIONS_RUNTIME_TOKEN\", t)'\n",
+        "description: harmless\n"
+        "runs:\n"
+        "  steps:\n"
+        "    - run: |\n"
+        "        node -e 'const { exportVariable } = core; exportVariable(v, t)'\n",
+        '"description": core.exportVariable is quoted, so this is not prose\n',
+        "  description-suffix: core.exportVariable('ACTIONS_RUNTIME_TOKEN', t)\n",
+        # A `description:`-shaped line inside a shell body must not blank the
+        # rest of that body: the walk steps over `run:` scalars without reading
+        # them, so the pipeline below is still scanned.
+        "runs:\n"
+        "  steps:\n"
+        "    - shell: bash\n"
+        "      run: |\n"
+        "        description: |\n"
+        "          node -e 'core.exportVariable(\"ACTIONS_RUNTIME_TOKEN\", t)'\n",
+        # Same carrier under an inert standalone sequence scalar.
+        "notes:\n"
+        "  - |\n"
+        "    description: |\n"
+        "      core.exportVariable('ACTIONS_RUNTIME_TOKEN', t)\n",
+    )
+    for index, sample in enumerate(description_adjacent_carriers):
+        adjacent_failures: list[str] = []
+        check_no_sccache_credential_exporter(
+            sample,
+            f"self-test-export-variable-adjacent-{index}",
+            adjacent_failures,
+        )
+        require(
+            any(
+                "must not contain exportVariable" in item
+                for item in adjacent_failures
+            ),
+            f"self-test: a carrier outside description prose must fail: "
+            f"{sample!r}",
+            failures,
+        )
+
     path_based_sccache = (
         '        echo "$install_dir" >> "$GITHUB_PATH"\n'
         '        echo "RUSTC_WRAPPER=sccache" >> "$GITHUB_ENV"\n'
@@ -5681,36 +5800,6 @@ def self_test() -> int:
         not handoff_failures,
         "self-test: checked-in FIPS artifact handoff must pass: "
         + "; ".join(handoff_failures),
-        failures,
-    )
-
-    unbounded_fips_compile = handoff_channel.replace(
-        '  CARGO_BUILD_JOBS: "3"\n'
-        '  CARGO_PROFILE_DEV_DEBUG: "line-tables-only"\n',
-        "",
-        1,
-    )
-    unbounded_fips_failures: list[str] = []
-    check_fips_producer_channel(unbounded_fips_compile, unbounded_fips_failures)
-    require(
-        any(
-            "three-job, line-table debug profile" in item
-            for item in unbounded_fips_failures
-        ),
-        "self-test: removing the shared FIPS memory profile must fail",
-        failures,
-    )
-
-    missing_fips_swap = handoff_channel.replace(
-        "      - name: Extend runner swap for FIPS test binaries\n",
-        "      - name: Omit runner swap for FIPS test binaries\n",
-        1,
-    )
-    missing_fips_swap_failures: list[str] = []
-    check_fips_producer_channel(missing_fips_swap, missing_fips_swap_failures)
-    require(
-        any("exact 12G swap contract" in item for item in missing_fips_swap_failures),
-        "self-test: removing the FIPS test-binary swap contract must fail",
         failures,
     )
 

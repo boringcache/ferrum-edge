@@ -388,15 +388,6 @@ therefore reuse the artifact
 from the successful `fips-test-build` prerequisite that GitHub skipped in the
 new attempt. Fresh-checkout source mtimes cannot make Cargo repeat test-only
 compile/link work.
-
-The FIPS producer and all target-handoff consumers share
-`CARGO_BUILD_JOBS=3` and `CARGO_PROFILE_DEV_DEBUG=line-tables-only`, keeping
-their Cargo fingerprints compatible while bounding cold-runner compiler
-memory. `fips-test-build` also provisions the same 12 GiB swap headroom as the
-aggregated `unit_tests` lane before linking its two complete test targets. This
-is the repository-controlled mitigation for hosted-runner shutdown / exit 143
-during that precompile; file-and-line backtraces remain available.
-
 Non-cold consumers fail closed if no producer handoff for their source
 SHA/run_id exists. Fork pull requests restore the rust-cache fallback only
 and cannot save it; GitHub confines
@@ -465,6 +456,12 @@ rejected fail-closed rather than treated as an absence of invocations.
 The contiguous
 `exportVariable` token deny remains defense in depth; it does not catch
 computed property forms such as `core["export" + "Variable"]` on its own.
+It is scanned over every slot except `description:` prose, which GitHub renders
+and never evaluates: `setup-sccache/action.yml` is whole-file digest-frozen by
+the Cross build policy, so the installer that enforces the credential boundary
+has to stay free to document the toolkit call it refuses. That carve-out is the
+description value alone — a `description:`-shaped line inside a `run:` body is
+stepped over as shell, and quoted or suffixed key spellings keep the full scan.
 
 `node-waypoint-ebpf-live.yml` path-filtered `pull_request.paths` must be a
 **trigger superset** of every `production-dockerfile-smoke` sensitive input in

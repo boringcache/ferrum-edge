@@ -110,13 +110,6 @@ env:
   CARGO_TERM_COLOR: always
   CARGO_NET_RETRY: "10"
   CARGO_HTTP_MULTIPLEXING: "false"
-  # The complete unit_tests + integration_tests FIPS precompile has the same
-  # cold-runner memory profile as ci.yml's aggregated unit_tests lane. Keep
-  # every producer/handoff consumer on one fingerprint-compatible profile,
-  # cap compiler concurrency, and retain file:line backtraces without full
-  # DWARF. fips-test-build adds swap below for its two linked test targets.
-  CARGO_BUILD_JOBS: "3"
-  CARGO_PROFILE_DEV_DEBUG: "line-tables-only"
   FERRUM_CI_FORCE_COLD_CACHE: ${{ github.event.inputs.force_cold_cache == 'true' }}
   # Immutable producer handoff artifact: the exact compile-to-consumer channel
   # for this run AND the inter-run warm source for a later explicit workflow
@@ -1928,19 +1921,6 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
         with:
           persist-credentials: false
-
-      - name: Extend runner swap for FIPS test binaries
-        run: |
-          set -euo pipefail
-          # The aggregated unit_tests frontend plus the integration_tests link
-          # has twice ended with hosted-runner shutdown / exit 143 before any
-          # compiler diagnostic. Match ci.yml's proven cold-compile headroom so
-          # memory pressure degrades to paging instead of killing the agent.
-          sudo fallocate -l 12G /mnt/ferrum-swapfile
-          sudo chmod 600 /mnt/ferrum-swapfile
-          sudo mkswap /mnt/ferrum-swapfile
-          sudo swapon /mnt/ferrum-swapfile
-          free -h
 
       - name: Initialize runtime telemetry
         run: python3 .github/scripts/ci_runtime_telemetry.py init --quiet
