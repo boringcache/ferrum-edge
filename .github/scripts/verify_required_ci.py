@@ -1012,6 +1012,60 @@ def optional_live_suite_self_test() -> list[str]:
     if not any("effective exit 1" in item for item in inert_exit_errors):
         failures.append("optional aggregate must reject inert exit text")
 
+    real_block_run = (
+        "|\n"
+        "          {\n"
+        '            echo "## CNI Lifecycle Live"\n'
+        '            echo ""\n'
+        '            echo "Failed before change detection completed."\n'
+        '          } >> "$GITHUB_STEP_SUMMARY"\n'
+        "          exit 1"
+    )
+    real_block = _cni_like_workflow(
+        steps=_cni_aggregate_steps(planner_run=real_block_run)
+    )
+    real_block_errors = check_optional_live_suite_aggregate(
+        real_block, source, _CNI_OPTIONAL_CONTRACT
+    )
+    if real_block_errors:
+        failures.append(
+            "optional aggregate must accept a real `run: |` block that ends "
+            "with exit 1: " + "; ".join(real_block_errors)
+        )
+
+    comment_only = _cni_like_workflow(
+        steps=_cni_aggregate_steps(
+            planner_run="|\n          # exit 1\n          echo skip"
+        )
+    )
+    comment_only_errors = check_optional_live_suite_aggregate(
+        comment_only, source, _CNI_OPTIONAL_CONTRACT
+    )
+    if not any("effective exit 1" in item for item in comment_only_errors):
+        failures.append("optional aggregate must reject a comment-only exit mention")
+
+    non_terminal = _cni_like_workflow(
+        steps=_cni_aggregate_steps(
+            planner_run="|\n          exit 1\n          echo still running"
+        )
+    )
+    non_terminal_errors = check_optional_live_suite_aggregate(
+        non_terminal, source, _CNI_OPTIONAL_CONTRACT
+    )
+    if not any("effective exit 1" in item for item in non_terminal_errors):
+        failures.append("optional aggregate must reject a non-terminal exit")
+
+    folded = _cni_like_workflow(
+        steps=_cni_aggregate_steps(
+            planner_run=">\n          echo summary\n          exit 1"
+        )
+    )
+    folded_errors = check_optional_live_suite_aggregate(
+        folded, source, _CNI_OPTIONAL_CONTRACT
+    )
+    if not any("effective exit 1" in item for item in folded_errors):
+        failures.append("optional aggregate must reject a folded `run: >` block")
+
     return failures
 
 

@@ -896,18 +896,24 @@ def step_if(step: str) -> str:
 def step_run_ends_with_exit(step: str, code: int) -> bool:
     """Return whether a run step has one effective terminal `exit CODE`.
 
-    Both the one-line fixture form (`run: exit 1`) and the block-scalar form
-    used by the real aggregates are accepted. Merely mentioning `exit 1` in a
-    comment, echo, or an earlier unreachable command is insufficient: the
-    block must contain exactly one executable `exit` line and it must be the
-    final non-empty command.
+    Same-line scalars must be exactly `exit CODE` on the `run:` line. Only
+    horizontal whitespace may surround that command, so a `run: |` introducer
+    cannot be captured as a scalar and whitespace cannot cross a newline.
+    Literal blocks accept `|`, `|-`, and `|+` on that same line; folded `>`
+    blocks are refused. Merely mentioning `exit 1` in a comment, echo, or an
+    earlier unreachable command is insufficient: the block must contain
+    exactly one executable `exit` line and it must be the final non-empty,
+    non-comment command.
     """
 
-    scalar = re.search(r"(?m)^        run:\s*([^|>].*)$", step)
-    if scalar:
-        return scalar.group(1).strip() == f"exit {code}"
+    expected = f"exit {code}"
+    if re.search(rf"(?m)^        run:[ \t]+{re.escape(expected)}[ \t]*$", step):
+        return True
 
-    block = re.search(r"(?ms)^        run:\s*\|[-+]?\s*\n(?P<body>.*)\Z", step)
+    block = re.search(
+        r"(?ms)^        run:[ \t]+\|[-+]?[ \t]*\n(?P<body>.*)\Z",
+        step,
+    )
     if block is None:
         return False
     commands = [
@@ -915,8 +921,10 @@ def step_run_ends_with_exit(step: str, code: int) -> bool:
         for line in block.group("body").splitlines()
         if line.strip() and not line.lstrip().startswith("#")
     ]
+    if not commands:
+        return False
     exits = [line for line in commands if re.fullmatch(r"exit\s+\d+", line)]
-    return exits == [f"exit {code}"] and commands[-1] == f"exit {code}"
+    return exits == [expected] and commands[-1] == expected
 
 
 def step_uses(step: str) -> str:
@@ -5655,6 +5663,105 @@ def self_test() -> int:
     require(
         any("effective exit 1" in item for item in inert_exit_failures),
         "self-test: inert exit text must not satisfy a NodeWaypoint failure step",
+        failures,
+    )
+
+    def _exit_step(run_header: str, *body_lines: str) -> str:
+        body = "".join(f"{line}\n" for line in body_lines)
+        return f"      - name: Fail\n        run: {run_header}\n{body}"
+
+    require(
+        step_run_ends_with_exit("      - name: Fail\n        run: exit 1\n", 1),
+        "self-test: same-line scalar `run: exit 1` must pass",
+        failures,
+    )
+    real_literal = _exit_step(
+        "|",
+        "          {",
+        '            echo "## NodeWaypoint eBPF Live"',
+        '            echo ""',
+        '            echo "Failed before trusted-base relevance planning completed."',
+        '          } >> "$GITHUB_STEP_SUMMARY"',
+        "          exit 1",
+    )
+    require(
+        step_run_ends_with_exit(real_literal, 1),
+        "self-test: `run: |` must reach the literal-block parser and accept "
+        "summary commands then terminal exit 1",
+        failures,
+    )
+    require(
+        step_run_ends_with_exit(
+            _exit_step("|-", "          echo summary", "          exit 1"),
+            1,
+        ),
+        "self-test: literal `run: |-` with terminal exit 1 must pass",
+        failures,
+    )
+    require(
+        step_run_ends_with_exit(
+            _exit_step("|+", "          echo summary", "          exit 1"),
+            1,
+        ),
+        "self-test: literal `run: |+` with terminal exit 1 must pass",
+        failures,
+    )
+    require(
+        not step_run_ends_with_exit(
+            "      - name: Fail\n        run: echo 'exit 1'\n",
+            1,
+        ),
+        "self-test: `echo 'exit 1'` must not count as an effective exit",
+        failures,
+    )
+    require(
+        not step_run_ends_with_exit(
+            _exit_step("|", "          # exit 1", "          echo skip"),
+            1,
+        ),
+        "self-test: a comment-only `exit 1` mention must not count",
+        failures,
+    )
+    require(
+        not step_run_ends_with_exit(
+            _exit_step("|", "          exit 1", "          echo still running"),
+            1,
+        ),
+        "self-test: a non-terminal `exit 1` must not count",
+        failures,
+    )
+    require(
+        not step_run_ends_with_exit(
+            _exit_step(">", "          echo summary", "          exit 1"),
+            1,
+        ),
+        "self-test: folded `run: >` blocks must not count as an effective exit",
+        failures,
+    )
+
+    real_block_planner = (
+        "|\n"
+        "          {\n"
+        '            echo "## NodeWaypoint eBPF Live"\n'
+        '            echo ""\n'
+        '            echo "Failed before trusted-base relevance planning completed."\n'
+        '          } >> "$GITHUB_STEP_SUMMARY"\n'
+        "          exit 1"
+    )
+    real_block_failures: list[str] = []
+    check_node_waypoint_aggregate(
+        _node_waypoint_aggregate(
+            exact_false_skip,
+            scheduled_fail,
+            planner_run=real_block_planner,
+        ),
+        "self-test-node-waypoint-literal-block",
+        real_block_failures,
+    )
+    require(
+        not real_block_failures,
+        "self-test: NodeWaypoint planner `run: |` with summary then exit 1 "
+        "should pass: " + "; ".join(real_block_failures),
         failures,
     )
 
