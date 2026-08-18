@@ -251,6 +251,15 @@ Ferrum allows multiple scoped `waf` instances on one proxy. Anomaly scores are
   - `waf.scoring_instance` — identity of the instance that crossed its score
     threshold
 
+Those identities are the configured `plugin_configs[].id` in file, database, CP,
+and DP modes. File/DB/CP/DP construction never substitutes a process-local
+`standalone-<n>` label for a configured instance; that fallback exists only for
+direct constructors that have no resource id (tests and similar callers).
+Resource-id admission already rejects commas, equals signs, and other
+delimiter-breaking characters, so `waf.instance_scores` (`id=score,...`) and
+`waf.instances.<id>.score` stay unambiguous. Duplicate `(namespace, id)` plugin
+configs are refused at config load.
+
 Cross-instance aggregation is intentionally unsupported. If you want one
 combined scoring policy, configure a single WAF instance (or one shared
 `proxy_group`-scoped instance) rather than attaching multiple scoring-enabled

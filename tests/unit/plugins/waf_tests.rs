@@ -3966,6 +3966,92 @@ fn scoring_rejects_invalid_or_blank_config_ids() {
 }
 
 #[tokio::test]
+async fn scoring_direct_construction_uses_standalone_fallback() {
+    // Direct/test construction has no plugin_configs[].id. Sibling Waf::new
+    // calls must still isolate accumulators under distinct standalone-N labels,
+    // and that fallback must not be used once a configured id is supplied.
+    let first = Waf::new(&json!({
+        "mode": "enforce",
+        "include_default_rules": false,
+        "scoring": { "enabled": true, "block_threshold": 10 },
+        "custom_rules": [{
+            "id": "CUSTOM-A",
+            "category": "custom",
+            "severity": "low",
+            "target": "query_values",
+            "match_kind": "contains",
+            "pattern": "needle",
+            "action": "monitor",
+            "score": 5
+        }]
+    }))
+    .unwrap();
+    let second = Waf::new(&json!({
+        "mode": "enforce",
+        "include_default_rules": false,
+        "scoring": { "enabled": true, "block_threshold": 10 },
+        "custom_rules": [{
+            "id": "CUSTOM-B",
+            "category": "custom",
+            "severity": "low",
+            "target": "query_values",
+            "match_kind": "contains",
+            "pattern": "needle",
+            "action": "monitor",
+            "score": 3
+        }]
+    }))
+    .unwrap();
+    let configured = scoring_instance("pc-configured", "needle", 2, 10);
+
+    let mut ctx = ctx("GET", "/search");
+    ctx.set_raw_query_string("q=needle".into());
+    assert!(matches!(
+        first.authorize(&mut ctx).await,
+        PluginResult::Continue
+    ));
+    assert!(matches!(
+        second.authorize(&mut ctx).await,
+        PluginResult::Continue
+    ));
+    assert!(matches!(
+        configured.authorize(&mut ctx).await,
+        PluginResult::Continue
+    ));
+
+    let standalone_keys: Vec<&str> = ctx
+        .metadata
+        .keys()
+        .filter(|key| key.starts_with("waf.instances.standalone-") && key.ends_with(".score"))
+        .map(String::as_str)
+        .collect();
+    assert_eq!(
+        standalone_keys.len(),
+        2,
+        "two direct Waf::new instances must publish distinct standalone identities, got {standalone_keys:?}"
+    );
+    assert_eq!(
+        ctx.metadata
+            .get("waf.instances.pc-configured.score")
+            .map(String::as_str),
+        Some("2")
+    );
+    let aggregate = ctx
+        .metadata
+        .get("waf.instance_scores")
+        .map(String::as_str)
+        .expect("three contributing instances emit an aggregate");
+    assert!(
+        aggregate.contains("pc-configured=2"),
+        "configured identity must appear beside standalone fallbacks: {aggregate}"
+    );
+    assert!(
+        aggregate.contains("standalone-"),
+        "direct construction must keep the standalone fallback: {aggregate}"
+    );
+}
+
+#[tokio::test]
 async fn scoring_instances_use_own_weights_and_thresholds() {
     // Different weights/thresholds: first stays sub-threshold; second crosses
     // only its own threshold from its own contribution.
