@@ -1328,6 +1328,7 @@ class _StepBucket:
         self.using: list[str] = []
         self.with_pairs: list[tuple[str, str]] = []
         self.with_errors: list[str] = []
+        self.with_declarations = 0
         self.collecting_with = False
 
 
@@ -1352,6 +1353,7 @@ def _parse_plain_action_scalar(raw: str, what: str) -> tuple[str | None, str | N
 
 
 def _attach_with_value(step: _StepBucket, raw_value: str) -> None:
+    step.with_declarations += 1
     value = _yaml_strip_trailing_comment(raw_value).strip()
     had_props, remainder = _leading_yaml_node_properties(value)
     if had_props:
@@ -1558,6 +1560,7 @@ def _scan_yaml_actions(
                 and current.key_indent is not None
                 and key_indent == current.key_indent
             ):
+                current.with_declarations += 1
                 current.with_errors.append("block-scalar with mapping")
             index = _skip_block_scalar(lines, index + 1, key_indent)
             continue
@@ -1599,6 +1602,7 @@ def _scan_yaml_actions(
             and current.key_indent is not None
             and key_indent == current.key_indent
         ):
+            current.with_declarations += 1
             if not structural:
                 current.collecting_with = True
             else:
@@ -1680,6 +1684,12 @@ def check_fips_checkout_provenance(
         failures,
     )
     for step in checkout_steps:
+        require(
+            step.with_declarations == 1,
+            f"{source} checkout must declare exactly one inspectable with mapping "
+            f"(found {step.with_declarations})",
+            failures,
+        )
         for error in step.with_errors:
             failures.append(f"{source} checkout {error}")
         persist: str | None = None
@@ -5080,6 +5090,32 @@ def self_test() -> int:
         and any("path" in item for item in path_redirect_failures),
         "self-test: checkout path redirect must fail provenance: "
         f"{path_redirect_failures}",
+        failures,
+    )
+    duplicate_with = real_fips.replace(
+        checkout_with,
+        checkout_with + "        with:\n          fetch-depth: 1\n",
+        1,
+    )
+    require(
+        setup_step in duplicate_with and duplicate_with.count(checkout_with) >= 1,
+        "self-test: duplicate checkout with mutation must keep the original "
+        "checkout provenance and setup-sccache text",
+        failures,
+    )
+    duplicate_with_failures: list[str] = []
+    check_fips_action_allowlist(
+        duplicate_with,
+        "self-test-checkout-duplicate-with",
+        duplicate_with_failures,
+    )
+    require(
+        any(
+            "exactly one inspectable with mapping" in item
+            for item in duplicate_with_failures
+        ),
+        "self-test: duplicate checkout with mappings must fail provenance: "
+        f"{duplicate_with_failures}",
         failures,
     )
 

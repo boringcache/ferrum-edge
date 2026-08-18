@@ -443,7 +443,9 @@ checkout, rust-cache, artifact, toolchain, or local action fails. Each
 `actions/checkout` step must keep the current-repository / default-ref /
 default-root contract: `persist-credentials: false` and no `repository`,
 `ref`, or `path` redirection (including equivalent quoted, escaped, or
-dynamic spellings). Those local actions must remain `using: composite`
+dynamic spellings). Each checkout has exactly one inspectable `with:` mapping,
+so duplicate-key shadowing cannot hide the effective inputs. Those local actions
+must remain `using: composite`
 with `run:` steps only — no nested `uses:`, so no inline or third-party
 JavaScript carrier can reach the Actions toolkit credential environment.
 Alternate YAML spellings of `uses` (flow mappings, unbraced flow pairs,
