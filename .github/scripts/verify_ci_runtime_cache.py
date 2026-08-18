@@ -8,10 +8,11 @@ and architecture-scoped BuildKit keys, exact-hit restore-only vs partial/miss
 publish, fail-closed cache-save preparation, fork restore-only / no-save
 steps, rust-cache save-if so fork PRs cannot save (and, for the shared
 setup-rust-ci action, so only trusted refs/heads/main runs save at all),
-FIPS producer/consumer key
-equality with unique attempt scoping and stable fallback isolation, rejection
+the FIPS producer handoff as an immutable run artifact rather than an
+eviction-prone repository cache (attempt-wildcard consumer promotion with
+stable fallback isolation), rejection
 of ignored rust-cache `key` wiring, checksum-pinned sccache install without
-credential-exporting installers, same-run producer vs immutable inter-run
+credential-exporting installers, same-run producer and immutable inter-run
 artifact handoff warming, exact verified executable activation, empty
 SCCACHE_GHA_ENABLED persistence, fail-closed uncached fallback, hosted
 cache-token absence assertions, and Ambient production-image GHA cache-to
@@ -35,6 +36,7 @@ from ci_runtime_telemetry import self_test as telemetry_self_test
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 FIPS_WORKFLOW = REPO_ROOT / ".github" / "workflows" / "fips-build.yml"
+FIPS_PLANNER_PATH = ".github/scripts/ci_runtime_plan.py"
 NODE_WORKFLOW = REPO_ROOT / ".github" / "workflows" / "node-waypoint-ebpf-live.yml"
 AMBIENT_WORKFLOW = REPO_ROOT / ".github" / "workflows" / "ambient-host-udp-live.yml"
 DOCKERFILE = REPO_ROOT / "Dockerfile"
@@ -60,27 +62,18 @@ FIPS_CONTRACT_HASHFILES = (
     "'src/fips/**', 'vendor/**')"
 )
 FIPS_SHARED_KEY = "ci-fips-contract-${{ " + FIPS_CONTRACT_HASHFILES + " }}"
-FIPS_PRODUCER_KEY_EXPR = (
-    "fips-producer-${{ github.event.pull_request.head.sha || github.sha }}-"
-    "${{ github.run_id }}-"
-    "${{ github.run_attempt }}"
-)
-FIPS_PRODUCER_RESTORE_PREFIX_EXPR = (
-    "fips-producer-${{ github.event.pull_request.head.sha || github.sha }}-"
-    "${{ github.run_id }}-"
-)
 FIPS_HANDOFF_ARTIFACT_EXPR = (
     "fips-producer-handoff-${{ github.event.pull_request.head.sha || github.sha }}-"
     "${{ github.run_id }}-"
     "${{ github.run_attempt }}"
 )
+FIPS_HANDOFF_PREFIX_EXPR = (
+    "fips-producer-handoff-${{ github.event.pull_request.head.sha || github.sha }}-"
+    "${{ github.run_id }}-"
+)
 FIPS_HANDOFF_SOURCE_EXPR = (
     "fips-producer-handoff-${{ github.event.pull_request.head.sha || github.sha }}-"
     "${{ inputs.warm_source_run_id }}-${{ inputs.warm_source_run_attempt }}"
-)
-FIPS_PRODUCER_PATHS = (
-    "${{ github.workspace }}/target",
-    "${{ github.workspace }}/.cache/sccache",
 )
 SCCACHE_EXPORTERS = ("mozilla-actions/sccache-action",)
 SCCACHE_PINNED_VERSION = "0.17.0"
@@ -1060,22 +1053,21 @@ def check_fips_producer_channel(
     failures: list[str],
 ) -> None:
     require(
-        f"FIPS_PRODUCER_KEY: {FIPS_PRODUCER_KEY_EXPR}" in workflow,
-        "FIPS workflow env must define FIPS_PRODUCER_KEY as "
-        f"{FIPS_PRODUCER_KEY_EXPR}",
-        failures,
-    )
-    require(
-        f"FIPS_PRODUCER_RESTORE_PREFIX: {FIPS_PRODUCER_RESTORE_PREFIX_EXPR}"
-        in workflow,
-        "FIPS workflow env must define FIPS_PRODUCER_RESTORE_PREFIX as "
-        f"{FIPS_PRODUCER_RESTORE_PREFIX_EXPR}",
-        failures,
-    )
-    require(
         f"FIPS_HANDOFF_ARTIFACT: {FIPS_HANDOFF_ARTIFACT_EXPR}" in workflow,
         "FIPS workflow env must define the exact run-attempt handoff artifact as "
         f"{FIPS_HANDOFF_ARTIFACT_EXPR}",
+        failures,
+    )
+    require(
+        f"FIPS_HANDOFF_ARTIFACT_PREFIX: {FIPS_HANDOFF_PREFIX_EXPR}" in workflow,
+        "FIPS workflow env must define the attempt-independent handoff prefix as "
+        f"{FIPS_HANDOFF_PREFIX_EXPR}",
+        failures,
+    )
+    require(
+        "--no-absolute-filenames" not in workflow,
+        "FIPS workflow must not use BSD-only tar options unsupported by GNU tar "
+        "on ubuntu-latest",
         failures,
     )
     require(
@@ -1105,6 +1097,26 @@ def check_fips_producer_channel(
         "'RUSTC_WRAPPER='",
         "'CARGO_BUILD_RUSTC_WRAPPER='",
         '>> "$GITHUB_ENV"',
+    )
+    cmake_quarantine_step_name = (
+        "Quarantine restored AWS-LC FIPS CMake state"
+    )
+    cmake_quarantine_contract = (
+        'target_root="${GITHUB_WORKSPACE}/target"',
+        '[ -L "$target_root" ]',
+        '[ ! -e "$target_root" ]',
+        '[ ! -d "$target_root" ]',
+        'listing="$(mktemp "${RUNNER_TEMP}/fips-aws-lc-cmake-roots.XXXXXX")"',
+        "trap 'rm -f \"$listing\"' EXIT",
+        'if ! find "$target_root" -xdev \\',
+        '>"$listing"; then',
+        'while IFS= read -r -d \'\' cmake_root; do',
+        '"$target_root"/*/build/aws-lc-fips-sys-*/out/build',
+        '[ ! -d "$cmake_root" ] || [ -L "$cmake_root" ]',
+        'rm -rf -- "$cmake_root"',
+        "-path '*/build/aws-lc-fips-sys-*/out/build' -prune -print0",
+        'done <"$listing"',
+        "trap - EXIT",
     )
     restored_binary_checks = (
         'fips_binary="${target_root}/debug/ferrum-edge"',
@@ -1155,6 +1167,32 @@ def check_fips_producer_channel(
             "after setup-sccache and before any Cargo/cache operation",
             failures,
         )
+    cmake_quarantine_steps = [
+        step
+        for step in job_steps(compile_job)
+        if f"name: {cmake_quarantine_step_name}" in step
+    ]
+    require(
+        len(cmake_quarantine_steps) == 1,
+        "fips-compile must quarantine restored AWS-LC FIPS CMake state exactly "
+        "once",
+        failures,
+    )
+    if cmake_quarantine_steps:
+        quarantine_condition = step_if(cmake_quarantine_steps[0])
+        require(
+            COLD_NOT_TRUE in quarantine_condition
+            and "steps.rust-cache.outputs.cache-hit" not in quarantine_condition
+            and "continue-on-error:" not in cmake_quarantine_steps[0]
+            and all(
+                contract in cmake_quarantine_steps[0]
+                for contract in cmake_quarantine_contract
+            ),
+            "fips-compile must fail closed while removing only the restored "
+            "aws-lc-fips-sys out/build trees after every non-cold stable-cache "
+            "restore attempt",
+            failures,
+        )
     compile_saves = [
         step for step in job_steps(compile_job) if step_uses(step).startswith(CACHE_SAVE)
     ]
@@ -1174,9 +1212,15 @@ def check_fips_producer_channel(
         if step_uses(step).startswith(UPLOAD_ARTIFACT)
     ]
     require(
-        len(compile_saves) == 1,
-        f"fips-compile must have exactly one pinned actions/cache/save producer "
-        f"step, found {len(compile_saves)}",
+        "protobuf-compiler zstd" in compile_job,
+        "fips-compile must install zstd before extracting or packaging a handoff",
+        failures,
+    )
+    require(
+        not compile_saves,
+        "fips-compile must not publish the eviction-prone repository cache as a "
+        "producer channel; the immutable handoff artifact is the channel, found "
+        f"{len(compile_saves)} save steps",
         failures,
     )
     require(
@@ -1275,25 +1319,51 @@ def check_fips_producer_channel(
             in promote_steps[0]
             and '[ ! -f "$tree_manifest" ] || [ -L "$tree_manifest" ]'
             in promote_steps[0]
+            and 'identity="${extract_root}/fips-producer-identity"'
+            in promote_steps[0]
+            and '[ ! -f "$identity" ] || [ -L "$identity" ]'
+            in promote_steps[0]
+            and "does not match the named source artifact" in promote_steps[0]
+            and "SOURCE_SHA: ${{ github.event.pull_request.head.sha || github.sha }}"
+            in promote_steps[0]
+            and "SOURCE_RUN_ID: ${{ inputs.warm_source_run_id }}"
+            in promote_steps[0]
+            and "SOURCE_RUN_ATTEMPT: ${{ inputs.warm_source_run_attempt }}"
+            in promote_steps[0]
             and 'current_tree="$(git rev-parse HEAD^{tree})"' in promote_steps[0]
             and 'if [ "$archived_tree" != "$current_tree" ]; then'
             in promote_steps[0]
             and "refusing stale-base reuse" in promote_steps[0]
             and "git diff --quiet --no-ext-diff" in promote_steps[0]
-            and "git diff --cached --quiet --no-ext-diff" in promote_steps[0],
+            and "git diff --cached --quiet --no-ext-diff" in promote_steps[0]
+            and 'if ! tar --zstd -tf "$archive" >"$listing_tmp"; then'
+            in promote_steps[0]
+            and 'if ! tar --zstd -tvf "$archive" >"$verbose_tmp"; then'
+            in promote_steps[0]
+            and 'fail "producer handoff archive member uses path traversal"'
+            in promote_steps[0]
+            and 'fail "producer handoff archive contains a non-file member"'
+            in promote_steps[0]
+            and '[-]*|d*) ;;' in promote_steps[0]
+            and 'if [ "$identity_count" -ne 1 ]; then' in promote_steps[0]
+            and '-*) identity_verbose_count=$((identity_verbose_count + 1)) ;;'
+            in promote_steps[0]
+            and 'tar --zstd --no-same-owner -xf "$archive" -C "$extract_root"'
+            in promote_steps[0],
             "fips-compile must refresh mtimes inside the validated exact-handoff "
-            "promotion step only after a successful explicit non-cold download, "
-            "matching source tree, and clean tracked checkout",
+            "promotion step only after fail-closed archive-member validation, a "
+            "successful explicit non-cold download, matching source tree, and "
+            "clean tracked checkout",
             failures,
         )
     package_steps = [
         step
         for step in job_steps(compile_job)
-        if "name: Package inter-run FIPS producer handoff" in step
+        if "name: Package FIPS producer handoff" in step
     ]
     require(
         len(package_steps) == 1,
-        "fips-compile must have exactly one inter-run handoff packaging step",
+        "fips-compile must have exactly one producer handoff packaging step",
         failures,
     )
     require(
@@ -1304,26 +1374,33 @@ def check_fips_producer_channel(
         "without fabricating a hit",
         failures,
     )
-    download_position = compile_job.find("Download exact inter-run FIPS handoff artifact")
+    cache_position = compile_job.find(
+        "Cache FIPS Rust, AWS-LC, and sccache outputs"
+    )
+    quarantine_position = compile_job.find(cmake_quarantine_step_name)
+    download_position = compile_job.find(
+        "Download exact inter-run FIPS handoff artifact"
+    )
     promote_position = compile_job.find("Promote exact inter-run FIPS handoff artifact")
     refresh_position = compile_job.find(mtime_refresh)
     build_position = compile_job.find("Build the FIPS profile")
-    save_position = compile_job.find("Save FIPS producer compile outputs")
-    package_position = compile_job.find("Package inter-run FIPS producer handoff")
-    handoff_position = compile_job.find("Publish inter-run FIPS producer handoff")
+    package_position = compile_job.find("Package FIPS producer handoff")
+    handoff_position = compile_job.find("Publish FIPS producer handoff")
     require(
-        download_position >= 0
+        cache_position >= 0
+        and quarantine_position >= 0
+        and download_position >= 0
         and promote_position >= 0
         and refresh_position >= 0
         and build_position >= 0
-        and save_position >= 0
         and package_position >= 0
         and handoff_position >= 0
+        and cache_position < quarantine_position < download_position
         and download_position < promote_position < refresh_position < build_position
-        and build_position < save_position < package_position < handoff_position,
-        "fips-compile must download/promote and mtime-refresh the exact inter-run "
-        "artifact before building, then publish the refreshed same-run cache and "
-        "packaged immutable handoff",
+        and build_position < package_position < handoff_position,
+        "fips-compile must quarantine stable-cache CMake state before an optional "
+        "exact inter-run promotion, mtime-refresh that handoff before building, "
+        "then publish the packaged immutable handoff",
         failures,
     )
     require(
@@ -1351,19 +1428,30 @@ def check_fips_producer_channel(
         in package_steps[0]
         and 'tree_manifest="${RUNNER_TEMP}/fips-producer-source-tree"'
         in package_steps[0]
+        and 'identity="${RUNNER_TEMP}/fips-producer-identity"'
+        in package_steps[0]
+        and "SOURCE_SHA: ${{ github.event.pull_request.head.sha || github.sha }}"
+        in package_steps[0]
+        and "RUN_ID: ${{ github.run_id }}" in package_steps[0]
+        and "RUN_ATTEMPT: ${{ github.run_attempt }}" in package_steps[0]
         and 'source_tree="$(git rev-parse HEAD^{tree})"' in package_steps[0]
         and "git diff --quiet --no-ext-diff" in package_steps[0]
         and "git diff --cached --quiet --no-ext-diff" in package_steps[0]
+        and 'printf \'source_sha=%s\\nrun_id=%s\\nrun_attempt=%s\\n\''
+        in package_steps[0]
         and 'printf \'%s\\n\' "$source_tree" > "$tree_manifest"'
         in package_steps[0]
-        and 'tar --zstd -cf "$archive" -C "$GITHUB_WORKSPACE"'
+        and 'tar --zstd --hard-dereference -cf "$archive" -C "$RUNNER_TEMP"'
         in package_steps[0]
-        and 'target .cache/sccache -C "$RUNNER_TEMP" fips-producer-source-tree'
+        and "fips-producer-identity fips-producer-source-tree"
+        in package_steps[0]
+        and '-C "$GITHUB_WORKSPACE" target .cache/sccache'
         in package_steps[0]
         and '[ ! -s "$archive" ] || [ -L "$archive" ]'
         in package_steps[0],
-        "fips-compile must package target, sccache, and the clean checkout tree "
-        "identity into a nonempty tar.zst handoff that preserves executable modes",
+        "fips-compile must package target, sccache, identity, and the clean "
+        "checkout tree identity into a nonempty tar.zst handoff that preserves "
+        "executable modes and materializes hard-linked outputs as regular files",
         failures,
     )
     require(
@@ -1375,30 +1463,6 @@ def check_fips_producer_channel(
         "can overlap claimed-profile and clippy consumers",
         failures,
     )
-    if compile_saves:
-        condition = step_if(compile_saves[0])
-        with_block = step_with(compile_saves[0])
-        require(
-            COLD_NOT_TRUE in condition,
-            "fips-compile producer save must skip force_cold_cache",
-            failures,
-        )
-        require(
-            FORK_NOT_TRUE in condition and FORK_IS_TRUE not in condition,
-            "fips-compile producer save must exclude fork PRs",
-            failures,
-        )
-        require(
-            "key: ${{ env.FIPS_PRODUCER_KEY }}" in with_block,
-            "fips-compile producer save must use env.FIPS_PRODUCER_KEY",
-            failures,
-        )
-        for path in FIPS_PRODUCER_PATHS:
-            require(
-                path in with_block,
-                f"fips-compile producer save must include {path}",
-                failures,
-            )
     if compile_uploads:
         condition = step_if(compile_uploads[0])
         with_block = step_with(compile_uploads[0])
@@ -1425,11 +1489,108 @@ def check_fips_producer_channel(
             "fips-compile handoff upload must contain only the packaged producer",
             failures,
         )
+    require(
+        workflow.count('if ! tar --zstd -tf "$archive" >"$listing_tmp"; then') >= 4,
+        "FIPS consumer promotion must capture tar listings in temp files and fail "
+        "closed on listing errors",
+        failures,
+    )
+    require(
+        'done < <(tar --zstd -tf' not in workflow,
+        "FIPS consumer promotion must not read tar listings through process "
+        "substitution",
+        failures,
+    )
+    require(
+        'tar --zstd -tvf "$archive" "$expected" 2>/dev/null || true' not in workflow,
+        "FIPS consumer promotion must not mask tar identity listing failures with "
+        "|| true",
+        failures,
+    )
+    require(
+        workflow.count('fail "producer handoff archive member uses path traversal"')
+        >= 4,
+        "FIPS consumer promotion must reject path traversal in archive member names",
+        failures,
+    )
+    require(
+        workflow.count('if [ "$identity_count" -ne 1 ]; then') >= 4,
+        "FIPS consumer promotion must reject duplicate identity archive members",
+        failures,
+    )
+    require(
+        workflow.count('[-]*|d*) ;;') >= 4
+        and workflow.count(
+            'fail "producer handoff archive contains a non-file member"'
+        ) >= 4,
+        "FIPS consumer promotion must reject symlink and special tar members",
+        failures,
+    )
+    require(
+        workflow.count(
+            '-*) identity_verbose_count=$((identity_verbose_count + 1)) ;;'
+        ) >= 4,
+        "FIPS consumer promotion must require identity members to be regular files",
+        failures,
+    )
+    consumer_promote_contract = (
+        'channel_root="${RUNNER_TEMP}/fips-producer-channel"',
+        '"$PREFIX"*) ;;',
+        'attempt="${name#"$PREFIX"}"',
+        "producer handoff channel mixes files and directories",
+        "producer handoff channel flattened layout is malformed",
+        "producer handoff channel contains an unexpected artifact name",
+        "producer handoff channel contains a malformed attempt",
+        "producer handoff directory attempt does not match payload identity",
+        'payload_dir="$channel_root"',
+        'selected_attempt="$identity_attempt"',
+        "fips-producer-identity",
+        "reject_hostile_tar_member()",
+        "assert_identity_member()",
+        'mktemp "${RUNNER_TEMP}/fips-tar-listing.XXXXXX")',
+        "producer handoff archive listing failed",
+        "producer handoff archive verbose listing failed",
+        "producer handoff archive identity member listing failed",
+        "producer handoff archive contains a non-file member",
+        "[-]*|d*) ;;",
+        "producer handoff archive listing is inconsistent",
+        "producer handoff archive member is malformed",
+        "producer handoff archive member uses an absolute path",
+        "producer handoff archive member uses path traversal",
+        "producer handoff archive identity member is missing or ambiguous",
+        "producer handoff archive identity member is not a regular file",
+        'if [ -z "$payload_dir" ]',
+        "refusing to claim compile-to-consumer reuse",
+        'archive="${payload_dir}/fips-producer-handoff.tar.zst"',
+        '[ ! -f "$archive" ] || [ -L "$archive" ]',
+        'tar --zstd --no-same-owner -xf "$archive" -C "$extract_root"',
+        "for path in target .cache/sccache; do",
+        '[ ! -d "$source_path" ] || [ -L "$source_path" ]',
+        'tree_manifest="${extract_root}/fips-producer-source-tree"',
+        '[ ! -f "$tree_manifest" ] || [ -L "$tree_manifest" ]',
+        'extracted_identity="${extract_root}/fips-producer-identity"',
+        'current_tree="$(git rev-parse HEAD^{tree})"',
+        'if [ "$archived_tree" != "$current_tree" ]; then',
+        "refusing stale-base reuse",
+        "git diff --quiet --no-ext-diff",
+        "git diff --cached --quiet --no-ext-diff",
+        'mv "${extract_root}/target" "${GITHUB_WORKSPACE}/target"',
+        'mv "${extract_root}/.cache/sccache" "${GITHUB_WORKSPACE}/.cache/sccache"',
+        'mtime_reference="${RUNNER_TEMP}/fips-target-mtime-reference"',
+        'touch "$mtime_reference"',
+        'rm -f "$mtime_reference"',
+        "refusing to refresh restored mtimes",
+    )
     for job_body, job_name in (
         (claimed_job, "fips-claimed-checks"),
         (clippy_job, "fips-clippy"),
         (test_build_job, "fips-test-build"),
     ):
+        require(
+            "protobuf-compiler zstd" in job_body,
+            f"{job_name} must install zstd before extracting the producer handoff",
+            failures,
+        )
         restores = [
             step
             for step in job_steps(job_body)
@@ -1440,106 +1601,144 @@ def check_fips_producer_channel(
         ]
         require(
             not saves,
-            f"{job_name} must be a producer-cache consumer and must not save",
+            f"{job_name} must be a producer-handoff consumer and must not save",
             failures,
         )
         require(
-            len(restores) == 1,
-            f"{job_name} must have exactly one pinned actions/cache/restore "
-            f"producer step, found {len(restores)}",
+            not restores,
+            f"{job_name} must not restore the eviction-prone repository cache "
+            "as its producer channel",
             failures,
         )
-        if restores:
-            condition = step_if(restores[0])
-            with_block = step_with(restores[0])
-            require(
-                COLD_NOT_TRUE in condition,
-                f"{job_name} producer restore must skip force_cold_cache",
-                failures,
-            )
-            require(
-                "key: ${{ env.FIPS_PRODUCER_KEY }}" in with_block,
-                f"{job_name} producer restore key must equal compile's "
-                "env.FIPS_PRODUCER_KEY",
-                failures,
-            )
-            require(
-                "restore-keys:" in with_block
-                and "${{ env.FIPS_PRODUCER_RESTORE_PREFIX }}" in with_block,
-                f"{job_name} producer restore-keys must use the sha+run_id prefix",
-                failures,
-            )
-            require(
-                "fail-on-cache-miss:" in with_block
-                and "github.event.pull_request.head.repo.fork != true" in with_block,
-                f"{job_name} must fail closed on a producer miss for non-fork runs",
-                failures,
-            )
-            for path in FIPS_PRODUCER_PATHS:
-                require(
-                    path in with_block,
-                    f"{job_name} producer restore must include {path}",
-                    failures,
-                )
-        require(
-            "Require this-run FIPS producer cache" in job_body,
-            f"{job_name} must fail closed when the this-run producer key is missing",
-            failures,
-        )
-        producer_require_steps = [
+        downloads = [
             step
             for step in job_steps(job_body)
-            if "name: Require this-run FIPS producer cache" in step
+            if step_uses(step).startswith(DOWNLOAD_ARTIFACT)
         ]
         require(
-            len(producer_require_steps) == 1,
-            f"{job_name} must have exactly one this-run producer requirement step",
+            len(downloads) == 1,
+            f"{job_name} must have exactly one pinned producer-handoff artifact "
+            f"download, found {len(downloads)}",
             failures,
         )
-        require_position = job_body.find("Require this-run FIPS producer cache")
+        if downloads:
+            condition = step_if(downloads[0])
+            with_block = step_with(downloads[0])
+            require(
+                COLD_NOT_TRUE in condition,
+                f"{job_name} producer download must skip force_cold_cache",
+                failures,
+            )
+            require(
+                FORK_NOT_TRUE not in condition and FORK_IS_TRUE not in condition,
+                f"{job_name} producer download must include fork runs; the "
+                "run-artifact channel is fork-usable",
+                failures,
+            )
+            require(
+                "pattern: ${{ env.FIPS_HANDOFF_ARTIFACT_PREFIX }}*" in with_block,
+                f"{job_name} must download the attempt-independent producer "
+                "handoff pattern env.FIPS_HANDOFF_ARTIFACT_PREFIX* so failed-job "
+                "reruns can reuse an earlier attempt's producer",
+                failures,
+            )
+            require(
+                "path: ${{ runner.temp }}/fips-producer-channel" in with_block
+                and "merge-multiple: false" in with_block,
+                f"{job_name} must stage the producer handoff outside the workspace "
+                "and keep merge-multiple false so one-match flattening and "
+                "multi-match per-artifact directories stay distinguishable",
+                failures,
+            )
+            require(
+                "run-id:" not in with_block and "github-token:" not in with_block,
+                f"{job_name} producer download must stay within the current "
+                "workflow run",
+                failures,
+            )
+        require(
+            "Promote same-run FIPS producer handoff" in job_body,
+            f"{job_name} must fail closed when no producer handoff for this "
+            "source SHA/run_id was published",
+            failures,
+        )
+        producer_promote_steps = [
+            step
+            for step in job_steps(job_body)
+            if "name: Promote same-run FIPS producer handoff" in step
+        ]
+        require(
+            len(producer_promote_steps) == 1,
+            f"{job_name} must have exactly one same-run handoff promotion step",
+            failures,
+        )
+        download_position = job_body.find("Download FIPS producer handoff")
+        promote_position = job_body.find("Promote same-run FIPS producer handoff")
         refresh_position = job_body.find(mtime_refresh)
         credential_assert_position = job_body.find(
             "Assert cache-service credentials are absent"
         )
         require(
-            require_position >= 0
+            download_position >= 0
+            and promote_position >= 0
             and refresh_position >= 0
             and credential_assert_position >= 0
-            and require_position < refresh_position < credential_assert_position
-            and bool(producer_require_steps)
-            and COLD_NOT_TRUE in step_if(producer_require_steps[0])
-            and FORK_NOT_TRUE in step_if(producer_require_steps[0])
-            and mtime_refresh in producer_require_steps[0]
-            and 'mtime_reference="${RUNNER_TEMP}/fips-target-mtime-reference"'
-            in producer_require_steps[0]
-            and 'touch "$mtime_reference"' in producer_require_steps[0]
-            and 'rm -f "$mtime_reference"' in producer_require_steps[0]
+            and download_position < promote_position
+            and promote_position < refresh_position < credential_assert_position
+            and bool(producer_promote_steps)
+            and COLD_NOT_TRUE in step_if(producer_promote_steps[0])
+            and FORK_NOT_TRUE not in step_if(producer_promote_steps[0])
+            and FORK_IS_TRUE not in step_if(producer_promote_steps[0])
+            and "PREFIX: ${{ env.FIPS_HANDOFF_ARTIFACT_PREFIX }}"
+            in producer_promote_steps[0]
+            and "SOURCE_SHA: ${{ github.event.pull_request.head.sha || github.sha }}"
+            in producer_promote_steps[0]
+            and "RUN_ID: ${{ github.run_id }}" in producer_promote_steps[0]
+            and "github.run_attempt" not in producer_promote_steps[0]
+            and mtime_refresh in producer_promote_steps[0]
             and all(
-                check in producer_require_steps[0]
-                for check in restored_binary_checks
+                contract in producer_promote_steps[0]
+                for contract in consumer_promote_contract
             )
-            and "refusing to refresh restored mtimes"
-            in producer_require_steps[0],
-            f"{job_name} must validate the exact this-run producer and executable "
-            "before refreshing regular target-file mtimes",
+            and all(
+                check in producer_promote_steps[0]
+                for check in restored_binary_checks
+            ),
+            f"{job_name} must promote the newest attempt-wildcard handoff from "
+            "either the one-match flattened payload or per-artifact directories, "
+            "bind the attempt from fips-producer-identity, and validate its "
+            "payload, source tree, clean checkout, and executable before "
+            "refreshing regular target-file mtimes",
             failures,
         )
         require(
-            "FIPS_PRODUCER_RESTORE_PREFIX" in job_body
-            and "refusing to claim compile-to-consumer reuse" in job_body,
-            f"{job_name} producer requirement must match the sha+run_id prefix",
+            'selected="$channel_root"' not in job_body
+            and 'selected_attempt="single"' not in job_body
+            and 'selected_attempt="${GITHUB_RUN_ATTEMPT}"' not in job_body
+            and "selected_attempt: ${{ github.run_attempt }}" not in job_body
+            and 'payload_dir="$channel_root"' in job_body
+            and 'selected_attempt="$identity_attempt"' in job_body
+            and "producer handoff channel flattened layout is malformed"
+            in job_body
+            and "producer handoff directory attempt does not match payload identity"
+            in job_body,
+            f"{job_name} must admit the pinned download action's one-match "
+            "flattened payload and multi-match per-artifact directories while "
+            "binding attempts from artifact identity rather than the consumer "
+            "run attempt or an undocumented direct-root fallback",
             failures,
         )
         require(
-            "Drop stable target before producer restore" in job_body,
-            f"{job_name} must drop rust-cache target/sccache before restoring "
-            "the SHA-scoped producer archive",
+            "Drop stable target before producer promotion" in job_body,
+            f"{job_name} must drop rust-cache target/sccache before promoting "
+            "the SHA-scoped producer handoff",
             failures,
         )
         require(
-            "layer=producer" in job_body and "classify-restore" in job_body,
-            f"{job_name} must classify producer restore separately from "
-            "stable fallback",
+            "layer=producer" in job_body
+            and "transport=same-run-artifact" in job_body,
+            f"{job_name} must record the same-run producer handoff separately "
+            "from stable fallback",
             failures,
         )
         rust_blocks = rust_cache_with_blocks(job_body)
@@ -1565,7 +1764,9 @@ def check_fips_producer_channel(
     require(
         "--message-format=json" in test_build_job
         and "fips-test-bundle" in test_build_job
-        and '"sha256"' in test_build_job,
+        and '"sha256"' in test_build_job
+        and "fips-test-identity" in test_build_job
+        and 'f"run_id={run_id}\\nrun_attempt={run_attempt}\\n"' in test_build_job,
         "fips-test-build must stage digest-bound exact test executables",
         failures,
     )
@@ -1582,15 +1783,17 @@ def check_fips_producer_channel(
         "Precompile FIPS test binaries for consumers"
     )
     test_build_publish = test_build_job.find("Publish exact FIPS test executables")
-    test_build_restore = test_build_job.find("Restore FIPS producer compile outputs")
+    test_build_promote = test_build_job.find(
+        "Promote same-run FIPS producer handoff"
+    )
     test_build_remove = test_build_job.find("Remove staged FIPS test artifact")
     require(
-        test_build_restore >= 0
+        test_build_promote >= 0
         and test_build_precompile >= 0
         and test_build_publish >= 0
-        and test_build_restore < test_build_precompile < test_build_publish,
-        "fips-test-build must restore the compile producer before precompiling "
-        "and publishing the exact test artifact",
+        and test_build_promote < test_build_precompile < test_build_publish,
+        "fips-test-build must promote the compile producer handoff before "
+        "precompiling and publishing the exact test artifact",
         failures,
     )
     require(
@@ -1600,11 +1803,17 @@ def check_fips_producer_channel(
         "fips-test-build must remove its staged bundle after publishing it",
         failures,
     )
+    test_build_uploads = [
+        step
+        for step in job_steps(test_build_job)
+        if step_uses(step).startswith(UPLOAD_ARTIFACT)
+    ]
     require(
-        "Save FIPS inter-run handoff" not in test_build_job
-        and "FIPS_HANDOFF_ARTIFACT" not in test_build_job,
-        "fips-test-build must remain a handoff consumer; the build-only producer "
-        "owns the immutable inter-run artifact",
+        len(test_build_uploads) == 1
+        and "Publish FIPS producer handoff" not in test_build_job
+        and "name: ${{ env.FIPS_HANDOFF_ARTIFACT }}" not in test_build_job,
+        "fips-test-build must remain a handoff consumer publishing only the "
+        "exact-test artifact; the build-only producer owns the producer handoff",
         failures,
     )
     require(
@@ -1637,9 +1846,21 @@ def check_fips_producer_channel(
     require(
         "actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c"
         in test_job
-        and "fips-test-binaries-${{ github.run_id }}-${{ github.run_attempt }}"
-        in test_job,
-        "fips-test must download the pinned immutable artifact from this run attempt",
+        and "pattern: fips-test-binaries-${{ github.run_id }}-*" in test_job
+        and "merge-multiple: false" in test_job
+        and "FIPS_TEST_ARTIFACT_PREFIX: fips-test-binaries-${{ github.run_id }}-"
+        in test_job
+        and "FIPS_TEST_RUN_ID: ${{ github.run_id }}" in test_job
+        and "fips-test-identity" in test_job
+        and "FIPS test artifact channel mixes files and directories" in test_job
+        and "admit_bundle(channel, None)" in test_job
+        and "does not match payload identity" in test_job
+        and "attempts.append((attempt, candidate))" in test_job
+        and "_, bundle = max(attempts)" in test_job
+        and "GITHUB_RUN_ATTEMPT" not in test_job,
+        "fips-test must download the pinned immutable artifacts for this run and "
+        "select the newest attempt so failed-job reruns can reuse a skipped "
+        "producer's artifact",
         failures,
     )
     require(
@@ -2478,20 +2699,43 @@ def check_fips(workflow: str, failures: list[str]) -> None:
         failures,
     )
     plan_job = extract_job(workflow, "fips-plan")
+    planner_path_lines = tuple(
+        line.strip()
+        for line in plan_job.splitlines()
+        if FIPS_PLANNER_PATH in line
+    )
+    expected_planner_path_lines = (
+        f'if ! git cat-file -e "${{trusted_sha}}:{FIPS_PLANNER_PATH}" 2>/dev/null; then',
+        (
+            f'echo "trusted base has not adopted {FIPS_PLANNER_PATH}; '
+            'running the full gate." >> "$GITHUB_STEP_SUMMARY"'
+        ),
+        f'entry="$(git ls-tree --full-tree "$trusted_sha" -- {FIPS_PLANNER_PATH})"',
+        f'echo "::error::{FIPS_PLANNER_PATH} is not a single tree entry at ${{trusted_sha}}" >&2',
+        f'if [ "$entry_type" != "blob" ] || [ "$entry_path" != "{FIPS_PLANNER_PATH}" ]; then',
+        f'echo "::error::{FIPS_PLANNER_PATH} is not a blob at ${{trusted_sha}}" >&2',
+        f'echo "::error::{FIPS_PLANNER_PATH} has non-regular mode ${{entry_mode}}" >&2',
+        f'echo "::error::{FIPS_PLANNER_PATH} did not resolve to an object id" >&2',
+        f'echo "::error::{FIPS_PLANNER_PATH} exceeds the 256 KiB trusted-filter ceiling" >&2',
+        f'proposed_entry="$(git ls-tree --full-tree HEAD -- {FIPS_PLANNER_PATH})"',
+        f'echo "::error::{FIPS_PLANNER_PATH} must be a regular blob in the proposed checkout" >&2',
+        f'git cat-file blob "$entry_object" > {FIPS_PLANNER_PATH}',
+        f'if [ "$(git hash-object {FIPS_PLANNER_PATH})" != "$entry_object" ]; then',
+        f"python3 -I {FIPS_PLANNER_PATH} --self-test",
+        f'plan="$(python3 -I {FIPS_PLANNER_PATH} "${{filter_args[@]}}")"',
+    )
     require(
-        'git cat-file blob "$entry_object" > "$filter_path"' in plan_job
-        and 'git hash-object "$filter_path"' in plan_job
-        and 'python3 -I .github/scripts/ci_runtime_plan.py --self-test' in plan_job
-        and 'python3 -I .github/scripts/ci_runtime_plan.py "${filter_args[@]}"'
-        in plan_job
+        "filter_path" not in plan_job
+        and planner_path_lines == expected_planner_path_lines
         and "trusted_filter=" not in plan_job
         and 'python3 -I "$trusted_filter"' not in plan_job,
-        "FIPS planner must materialize the validated trusted-base blob at the "
-        "literal repository path and execute only that statically inspectable path",
+        "FIPS planner must use only the frozen literal repository path for every "
+        "trusted lookup, materialization, hash check, and execution; mutable path "
+        "aliases are forbidden",
         failures,
     )
     require(
-        'git ls-tree --full-tree HEAD -- "$filter_path"' in plan_job
+        f"git ls-tree --full-tree HEAD -- {FIPS_PLANNER_PATH}" in plan_job
         and '"100644 blob "*' in plan_job
         and '"100755 blob "*' in plan_job,
         "FIPS planner must reject a non-regular proposed planner path before "
@@ -2526,17 +2770,17 @@ def check_fips(workflow: str, failures: list[str]) -> None:
     )
     require(
         "fips-compile" in job_needs_list(claimed_job),
-        "fips-claimed-checks must wait for the compile cache to be saved",
+        "fips-claimed-checks must wait for the compile producer handoff to be published",
         failures,
     )
     require(
         "fips-compile" in job_needs_list(clippy_job),
-        "fips-clippy must wait for the compile cache to be saved",
+        "fips-clippy must wait for the compile producer handoff to be published",
         failures,
     )
     require(
         "fips-compile" in job_needs_list(test_build_job),
-        "fips-test-build must wait for the compile cache to be saved",
+        "fips-test-build must wait for the compile producer handoff to be published",
         failures,
     )
     require(
@@ -2979,6 +3223,18 @@ def check_docs_and_coverage(failures: list[str]) -> None:
         failures,
     )
     require(
+        "fips-test-binaries-<run_id>-*" in ci_cd
+        and "newest attempt" in ci_cd.lower()
+        and "failed-job rerun" in ci_cd.lower()
+        and "flattens" in ci_cd.lower()
+        and "fips-producer-identity" in ci_cd
+        and "fips-test-identity" in ci_cd,
+        "docs/ci_cd.md must document attempt-wildcard FIPS test-artifact "
+        "selection for failed-job reruns, one-match flattening, and internal "
+        "attempt identity",
+        failures,
+    )
+    require(
         "shared-key" in ci_cd and "ignored" in ci_cd.lower(),
         "docs/ci_cd.md must document that pinned rust-cache ignores key when shared-key is set",
         failures,
@@ -3113,6 +3369,18 @@ def check_docs_and_coverage(failures: list[str]) -> None:
     require(
         "fips-test-build" in fips_doc,
         "docs/fips.md must document the FIPS test-binary producer job",
+        failures,
+    )
+    require(
+        "fips-test-binaries-<run_id>-*" in fips_doc
+        and "newest attempt" in fips_doc.lower()
+        and "failed-job rerun" in fips_doc.lower()
+        and "flattens" in fips_doc.lower()
+        and "fips-producer-identity" in fips_doc
+        and "fips-test-identity" in fips_doc,
+        "docs/fips.md must document attempt-wildcard FIPS test-artifact "
+        "selection for failed-job reruns, one-match flattening, and internal "
+        "attempt identity",
         failures,
     )
     require(
@@ -3627,36 +3895,45 @@ def self_test() -> int:
     consumer_save = (
         "name: demo\n"
         "env:\n"
-        f"  FIPS_PRODUCER_KEY: {FIPS_PRODUCER_KEY_EXPR}\n"
-        f"  FIPS_PRODUCER_RESTORE_PREFIX: {FIPS_PRODUCER_RESTORE_PREFIX_EXPR}\n"
+        f"  FIPS_HANDOFF_ARTIFACT: {FIPS_HANDOFF_ARTIFACT_EXPR}\n"
+        f"  FIPS_HANDOFF_ARTIFACT_PREFIX: {FIPS_HANDOFF_PREFIX_EXPR}\n"
         "jobs:\n"
         "  fips-compile:\n"
         "    steps:\n"
         f"      - uses: {CACHE_SAVE} # v4.2.4\n"
         f"        if: {COLD_NOT_TRUE} && {FORK_NOT_TRUE}\n"
         "        with:\n"
-        "          path: |\n"
-        f"            {FIPS_PRODUCER_PATHS[0]}\n"
-        f"            {FIPS_PRODUCER_PATHS[1]}\n"
-        "          key: ${{ env.FIPS_PRODUCER_KEY }}\n"
+        "          path: ${{ github.workspace }}/target\n"
+        "          key: fips-producer-legacy\n"
         "  fips-clippy:\n"
         "    steps:\n"
         f"      - uses: {CACHE_SAVE} # v4.2.4\n"
         f"        if: {COLD_NOT_TRUE} && {FORK_NOT_TRUE}\n"
         "        with:\n"
-        "          key: ${{ env.FIPS_PRODUCER_KEY }}\n"
+        "          key: fips-producer-legacy\n"
         "  fips-test:\n"
         "    steps:\n"
         f"      - uses: {CACHE_RESTORE} # v4.2.4\n"
         f"        if: {COLD_NOT_TRUE}\n"
         "        with:\n"
-        "          key: ${{ env.FIPS_PRODUCER_KEY }}\n"
+        "          key: fips-producer-legacy\n"
     )
     consumer_save_failures: list[str] = []
     check_fips_producer_channel(consumer_save, consumer_save_failures)
     require(
-        any("must be a producer-cache consumer and must not save" in item for item in consumer_save_failures),
+        any(
+            "must be a producer-handoff consumer and must not save" in item
+            for item in consumer_save_failures
+        ),
         "self-test: clippy producer save must fail",
+        failures,
+    )
+    require(
+        any(
+            "must not publish the eviction-prone repository cache" in item
+            for item in consumer_save_failures
+        ),
+        "self-test: compile repository-cache producer save must fail",
         failures,
     )
     require(
@@ -3669,7 +3946,7 @@ def self_test() -> int:
     )
     require(
         any(
-            "download/promote and mtime-refresh the exact inter-run artifact before building"
+            "must quarantine stable-cache CMake state before an optional exact inter-run promotion"
             in item
             for item in consumer_save_failures
         ),
@@ -3687,63 +3964,52 @@ def self_test() -> int:
         failures,
     )
 
-    serial_test_build = (
-        "name: demo\n"
-        "env:\n"
-        f"  FIPS_PRODUCER_KEY: {FIPS_PRODUCER_KEY_EXPR}\n"
-        f"  FIPS_PRODUCER_RESTORE_PREFIX: {FIPS_PRODUCER_RESTORE_PREFIX_EXPR}\n"
-        "jobs:\n"
-        "  fips-compile:\n"
-        "    steps:\n"
-        "      - name: Restore invalid FIPS producer outputs\n"
-        f"        uses: {CACHE_RESTORE} # v4.2.4\n"
+    consumer_download = (
+        "      - name: Download FIPS producer handoff\n"
         f"        if: {COLD_NOT_TRUE}\n"
+        f"        uses: {DOWNLOAD_ARTIFACT} # v8\n"
         "        with:\n"
-        "          path: |\n"
-        f"            {FIPS_PRODUCER_PATHS[0]}\n"
-        f"            {FIPS_PRODUCER_PATHS[1]}\n"
-        "          key: ${{ env.FIPS_PRODUCER_KEY }}\n"
-        "          restore-keys: |\n"
-        "            ${{ env.FIPS_PRODUCER_RESTORE_PREFIX }}\n"
-        "      - name: Build the FIPS profile\n"
-        "        run: cargo build --locked --no-default-features --features fips --bin ferrum-edge\n"
+        "          pattern: ${{ env.FIPS_HANDOFF_ARTIFACT_PREFIX }}*\n"
+        "          path: ${{ runner.temp }}/fips-producer-channel\n"
+    )
+    compile_test_precompile = (
         "      - name: Precompile FIPS test binaries for consumers\n"
         "        run: cargo test --locked --no-default-features --features fips --test unit_tests --test integration_tests --no-run\n"
         "      - name: Publish exact FIPS test executables\n"
-        "        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a\n"
-        "      - name: Save FIPS producer compile outputs\n"
-        f"        uses: {CACHE_SAVE} # v4.2.4\n"
-        f"        if: {COLD_NOT_TRUE} && {FORK_NOT_TRUE}\n"
+        f"        uses: {UPLOAD_ARTIFACT}\n"
+    )
+    serial_test_build = (
+        "name: demo\n"
+        "env:\n"
+        f"  FIPS_HANDOFF_ARTIFACT: {FIPS_HANDOFF_ARTIFACT_EXPR}\n"
+        f"  FIPS_HANDOFF_ARTIFACT_PREFIX: {FIPS_HANDOFF_PREFIX_EXPR}\n"
+        "jobs:\n"
+        "  fips-compile:\n"
+        "    steps:\n"
+        "      - name: Build the FIPS profile\n"
+        "        run: cargo build --locked --no-default-features --features fips --bin ferrum-edge\n"
+        + compile_test_precompile
+        + "      - name: Package FIPS producer handoff\n"
+        f"        if: {COLD_NOT_TRUE}\n"
+        "        run: echo packaged\n"
+        "      - name: Publish FIPS producer handoff\n"
+        f"        uses: {UPLOAD_ARTIFACT}\n"
+        f"        if: {COLD_NOT_TRUE}\n"
         "        with:\n"
-        "          path: |\n"
-        f"            {FIPS_PRODUCER_PATHS[0]}\n"
-        f"            {FIPS_PRODUCER_PATHS[1]}\n"
-        "          key: ${{ env.FIPS_PRODUCER_KEY }}\n"
+        "          name: ${{ env.FIPS_HANDOFF_ARTIFACT }}\n"
         "  fips-claimed-checks:\n"
         "    needs: fips-compile\n"
         "    steps:\n"
-        "      - name: Restore FIPS producer compile outputs\n"
-        f"        uses: {CACHE_RESTORE} # v4.2.4\n"
-        f"        if: {COLD_NOT_TRUE}\n"
-        "        with:\n"
-        "          key: ${{ env.FIPS_PRODUCER_KEY }}\n"
-        "  fips-clippy:\n"
+        + consumer_download
+        + "  fips-clippy:\n"
         "    needs: fips-compile\n"
         "    steps:\n"
-        "      - name: Restore FIPS producer compile outputs\n"
-        f"        uses: {CACHE_RESTORE} # v4.2.4\n"
-        f"        if: {COLD_NOT_TRUE}\n"
-        "        with:\n"
-        "          key: ${{ env.FIPS_PRODUCER_KEY }}\n"
-        "  fips-test-build:\n"
+        + consumer_download
+        + "  fips-test-build:\n"
         "    needs: fips-compile\n"
         "    steps:\n"
-        "      - name: Restore FIPS producer compile outputs\n"
-        f"        uses: {CACHE_RESTORE} # v4.2.4\n"
-        f"        if: {COLD_NOT_TRUE}\n"
-        "        with:\n"
-        "          key: ${{ env.FIPS_PRODUCER_KEY }}\n"
-        "      - name: Precompile FIPS test binaries for consumers\n"
+        + consumer_download
+        + "      - name: Precompile FIPS test binaries for consumers\n"
         "      - name: Publish exact FIPS test executables\n"
         "  fips-test:\n"
         "    needs: fips-test-build\n"
@@ -3766,14 +4032,9 @@ def self_test() -> int:
         failures,
     )
 
-    test_bypass = serial_test_build.replace(
-        "      - name: Precompile FIPS test binaries for consumers\n"
-        "        run: cargo test --locked --no-default-features --features fips --test unit_tests --test integration_tests --no-run\n"
-        "      - name: Publish exact FIPS test executables\n"
-        "        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a\n"
-        "      - name: Save FIPS producer compile outputs\n",
-        "      - name: Save FIPS producer compile outputs\n",
-    ).replace(
+    build_only_producer = serial_test_build.replace(compile_test_precompile, "", 1)
+
+    test_bypass = build_only_producer.replace(
         "    needs: fips-test-build\n",
         "    needs: fips-compile\n",
         1,
@@ -3786,42 +4047,27 @@ def self_test() -> int:
         failures,
     )
 
-    test_build_save = serial_test_build.replace(
-        "      - name: Precompile FIPS test binaries for consumers\n"
-        "        run: cargo test --locked --no-default-features --features fips --test unit_tests --test integration_tests --no-run\n"
-        "      - name: Publish exact FIPS test executables\n"
-        "        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a\n"
-        "      - name: Save FIPS producer compile outputs\n",
-        "      - name: Save FIPS producer compile outputs\n",
-    ).replace(
+    test_build_save = build_only_producer.replace(
         "  fips-test-build:\n"
         "    needs: fips-compile\n"
         "    steps:\n"
-        "      - name: Restore FIPS producer compile outputs\n"
-        f"        uses: {CACHE_RESTORE} # v4.2.4\n"
-        f"        if: {COLD_NOT_TRUE}\n"
-        "        with:\n"
-        "          key: ${{ env.FIPS_PRODUCER_KEY }}\n",
+        + consumer_download,
         "  fips-test-build:\n"
         "    needs: fips-compile\n"
         "    steps:\n"
-        "      - name: Restore FIPS producer compile outputs\n"
-        f"        uses: {CACHE_RESTORE} # v4.2.4\n"
-        f"        if: {COLD_NOT_TRUE}\n"
-        "        with:\n"
-        "          key: ${{ env.FIPS_PRODUCER_KEY }}\n"
-        "      - name: Save FIPS producer compile outputs\n"
+        + consumer_download
+        + "      - name: Save FIPS producer compile outputs\n"
         f"        uses: {CACHE_SAVE} # v4.2.4\n"
         f"        if: {COLD_NOT_TRUE} && {FORK_NOT_TRUE}\n"
         "        with:\n"
-        "          key: ${{ env.FIPS_PRODUCER_KEY }}\n",
+        "          key: fips-producer-legacy\n",
         1,
     )
     test_build_save_failures: list[str] = []
     check_fips_producer_channel(test_build_save, test_build_save_failures)
     require(
         any(
-            "fips-test-build must be a producer-cache consumer and must not save"
+            "fips-test-build must be a producer-handoff consumer and must not save"
             in item
             for item in test_build_save_failures
         ),
@@ -3829,22 +4075,8 @@ def self_test() -> int:
         failures,
     )
 
-    missing_artifact = serial_test_build.replace(
-        "      - name: Precompile FIPS test binaries for consumers\n"
-        "        run: cargo test --locked --no-default-features --features fips --test unit_tests --test integration_tests --no-run\n"
-        "      - name: Publish exact FIPS test executables\n"
-        "        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a\n"
-        "      - name: Save FIPS producer compile outputs\n",
-        "      - name: Save FIPS producer compile outputs\n",
-    ).replace(
-        "      - name: Precompile FIPS test binaries for consumers\n"
-        "      - name: Publish exact FIPS test executables\n",
-        "      - name: Precompile FIPS test binaries for consumers\n"
-        "        run: cargo test --locked --no-default-features --features fips --test unit_tests --test integration_tests --no-run\n",
-        1,
-    )
     missing_artifact_failures: list[str] = []
-    check_fips_producer_channel(missing_artifact, missing_artifact_failures)
+    check_fips_producer_channel(build_only_producer, missing_artifact_failures)
     require(
         any(
             "pinned, attempt-scoped exact-test artifact" in item
@@ -3854,14 +4086,7 @@ def self_test() -> int:
         failures,
     )
 
-    claimed_waits_for_tests = serial_test_build.replace(
-        "      - name: Precompile FIPS test binaries for consumers\n"
-        "        run: cargo test --locked --no-default-features --features fips --test unit_tests --test integration_tests --no-run\n"
-        "      - name: Publish exact FIPS test executables\n"
-        "        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a\n"
-        "      - name: Save FIPS producer compile outputs\n",
-        "      - name: Save FIPS producer compile outputs\n",
-    ).replace(
+    claimed_waits_for_tests = build_only_producer.replace(
         "  fips-claimed-checks:\n"
         "    needs: fips-compile\n",
         "  fips-claimed-checks:\n"
@@ -3879,14 +4104,7 @@ def self_test() -> int:
         failures,
     )
 
-    missing_result = serial_test_build.replace(
-        "      - name: Precompile FIPS test binaries for consumers\n"
-        "        run: cargo test --locked --no-default-features --features fips --test unit_tests --test integration_tests --no-run\n"
-        "      - name: Publish exact FIPS test executables\n"
-        "        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a\n"
-        "      - name: Save FIPS producer compile outputs\n",
-        "      - name: Save FIPS producer compile outputs\n",
-    ).replace(
+    missing_result = build_only_producer.replace(
         "        if: needs.fips-plan.outputs.relevant == 'true' && needs.fips-test-build.result != 'success'\n",
         "        if: needs.fips-plan.outputs.relevant == 'true' && needs.fips-compile.result != 'success'\n",
         1,
@@ -3902,29 +4120,28 @@ def self_test() -> int:
         failures,
     )
 
-    cold_test_build = test_bypass.replace(
+    cold_test_build = build_only_producer.replace(
         "  fips-test-build:\n"
         "    needs: fips-compile\n"
         "    steps:\n"
-        "      - name: Restore FIPS producer compile outputs\n"
-        f"        uses: {CACHE_RESTORE} # v4.2.4\n"
-        f"        if: {COLD_NOT_TRUE}\n",
+        + consumer_download,
         "  fips-test-build:\n"
         "    needs: fips-compile\n"
         "    steps:\n"
-        "      - name: Restore FIPS producer compile outputs\n"
-        f"        uses: {CACHE_RESTORE} # v4.2.4\n"
-        f"        if: {COLD_IS_TRUE}\n",
+        + consumer_download.replace(
+            f"        if: {COLD_NOT_TRUE}\n",
+            f"        if: {COLD_IS_TRUE}\n",
+        ),
         1,
     )
     cold_test_build_failures: list[str] = []
     check_fips_producer_channel(cold_test_build, cold_test_build_failures)
     require(
         any(
-            "fips-test-build producer restore must skip force_cold_cache" in item
+            "fips-test-build producer download must skip force_cold_cache" in item
             for item in cold_test_build_failures
         ),
-        "self-test: fips-test-build restoring under force_cold_cache must fail",
+        "self-test: fips-test-build downloading under force_cold_cache must fail",
         failures,
     )
 
@@ -3935,6 +4152,217 @@ def self_test() -> int:
         not handoff_failures,
         "self-test: checked-in FIPS artifact handoff must pass: "
         + "; ".join(handoff_failures),
+        failures,
+    )
+
+    missing_cmake_quarantine = handoff_channel.replace(
+        "      - name: Quarantine restored AWS-LC FIPS CMake state\n",
+        "      - name: Reuse restored AWS-LC FIPS CMake state\n",
+        1,
+    )
+    missing_cmake_quarantine_failures: list[str] = []
+    check_fips_producer_channel(
+        missing_cmake_quarantine, missing_cmake_quarantine_failures
+    )
+    require(
+        any(
+            "must quarantine restored AWS-LC FIPS CMake state exactly once" in item
+            for item in missing_cmake_quarantine_failures
+        ),
+        "self-test: a missing restored AWS-LC CMake quarantine must fail",
+        failures,
+    )
+
+    widened_cmake_quarantine = handoff_channel.replace(
+        "-path '*/build/aws-lc-fips-sys-*/out/build' -prune -print0",
+        "-path '*/build/*/out/build' -prune -print0",
+        1,
+    )
+    widened_cmake_quarantine_failures: list[str] = []
+    check_fips_producer_channel(
+        widened_cmake_quarantine, widened_cmake_quarantine_failures
+    )
+    require(
+        any(
+            "removing only the restored aws-lc-fips-sys out/build trees" in item
+            for item in widened_cmake_quarantine_failures
+        ),
+        "self-test: a widened restored CMake quarantine must fail",
+        failures,
+    )
+
+    exact_hit_only_quarantine = handoff_channel.replace(
+        "      - name: Quarantine restored AWS-LC FIPS CMake state\n"
+        f"        if: {COLD_NOT_TRUE}\n",
+        "      - name: Quarantine restored AWS-LC FIPS CMake state\n"
+        f"        if: {COLD_NOT_TRUE} && "
+        "steps.rust-cache.outputs.cache-hit == 'true'\n",
+        1,
+    )
+    exact_hit_only_quarantine_failures: list[str] = []
+    check_fips_producer_channel(
+        exact_hit_only_quarantine, exact_hit_only_quarantine_failures
+    )
+    require(
+        any(
+            "after every non-cold stable-cache restore attempt" in item
+            for item in exact_hit_only_quarantine_failures
+        ),
+        "self-test: an exact-hit-only CMake quarantine must fail",
+        failures,
+    )
+
+    missing_zstd = handoff_channel.replace(
+        "protobuf-compiler zstd", "protobuf-compiler", 1
+    )
+    missing_zstd_failures: list[str] = []
+    check_fips_producer_channel(missing_zstd, missing_zstd_failures)
+    require(
+        any("must install zstd" in item for item in missing_zstd_failures),
+        "self-test: a FIPS handoff job without zstd must fail",
+        failures,
+    )
+
+    bsd_tar_identity_extract = handoff_channel.replace(
+        'tar --zstd --no-same-owner \\\n              -xf "$archive" -C "$dest" "$identity_member"',
+        'tar --zstd --no-same-owner --no-absolute-filenames \\\n              -xf "$archive" -C "$dest" "$identity_member"',
+    )
+    bsd_tar_identity_extract_failures: list[str] = []
+    check_fips_producer_channel(
+        bsd_tar_identity_extract, bsd_tar_identity_extract_failures
+    )
+    require(
+        any(
+            "BSD-only tar options unsupported by GNU tar" in item
+            for item in bsd_tar_identity_extract_failures
+        ),
+        "self-test: BSD-only tar identity extraction must fail",
+        failures,
+    )
+
+    masked_tar_listing_failure = handoff_channel.replace(
+        'if ! tar --zstd -tf "$archive" >"$listing_tmp"; then',
+        'tar --zstd -tf "$archive" >"$listing_tmp" || true\n'
+        '            if false; then',
+    )
+    masked_tar_listing_failure_failures: list[str] = []
+    check_fips_producer_channel(
+        masked_tar_listing_failure, masked_tar_listing_failure_failures
+    )
+    require(
+        any(
+            "capture tar listings in temp files" in item
+            for item in masked_tar_listing_failure_failures
+        ),
+        "self-test: masking tar listing failure must fail",
+        failures,
+    )
+
+    hostile_tar_member = handoff_channel.replace(
+        'fail "producer handoff archive member uses path traversal"',
+        'fail "producer handoff archive member uses an absolute path"',
+    )
+    hostile_tar_member_failures: list[str] = []
+    check_fips_producer_channel(hostile_tar_member, hostile_tar_member_failures)
+    require(
+        any(
+            "reject path traversal in archive member names" in item
+            for item in hostile_tar_member_failures
+        ),
+        "self-test: dropping path-traversal rejection must fail",
+        failures,
+    )
+
+    duplicate_identity_member = handoff_channel.replace(
+        'if [ "$identity_count" -ne 1 ]; then',
+        'if [ "$identity_count" -lt 1 ]; then',
+    )
+    duplicate_identity_member_failures: list[str] = []
+    check_fips_producer_channel(
+        duplicate_identity_member, duplicate_identity_member_failures
+    )
+    require(
+        any(
+            "reject duplicate identity archive members" in item
+            for item in duplicate_identity_member_failures
+        ),
+        "self-test: accepting duplicate identity members must fail",
+        failures,
+    )
+
+    non_regular_identity_member = handoff_channel.replace(
+        '                -*) identity_verbose_count=$((identity_verbose_count + 1)) ;;',
+        '                -*|d*) identity_verbose_count=$((identity_verbose_count + 1)) ;;',
+    )
+    non_regular_identity_member_failures: list[str] = []
+    check_fips_producer_channel(
+        non_regular_identity_member, non_regular_identity_member_failures
+    )
+    require(
+        any(
+            "require identity members to be regular files" in item
+            for item in non_regular_identity_member_failures
+        ),
+        "self-test: accepting a non-regular identity member must fail",
+        failures,
+    )
+
+    special_tar_member = handoff_channel.replace(
+        '                [-]*|d*) ;;',
+        '                [-]*|d*|l*) ;;',
+    )
+    special_tar_member_failures: list[str] = []
+    check_fips_producer_channel(special_tar_member, special_tar_member_failures)
+    require(
+        any(
+            "reject symlink and special tar members" in item
+            for item in special_tar_member_failures
+        ),
+        "self-test: accepting special tar members must fail",
+        failures,
+    )
+
+    mutable_planner_path = handoff_channel.replace(
+        '          git cat-file blob "$entry_object" > .github/scripts/ci_runtime_plan.py\n',
+        "          filter_path=.github/scripts/ci_runtime_plan.py\n"
+        "          filter_path+=.untrusted\n"
+        '          git cat-file blob "$entry_object" > "$filter_path"\n',
+        1,
+    )
+    require(
+        mutable_planner_path != handoff_channel,
+        "self-test: mutable FIPS planner-path fixture must alter the workflow",
+        failures,
+    )
+    mutable_planner_path_failures: list[str] = []
+    check_fips(mutable_planner_path, mutable_planner_path_failures)
+    require(
+        any(
+            "mutable path aliases are forbidden" in item
+            for item in mutable_planner_path_failures
+        ),
+        "self-test: a mutable FIPS planner path must fail the literal-path gate",
+        failures,
+    )
+
+    decoupled_materialization = handoff_channel.replace(
+        '          git cat-file blob "$entry_object" > .github/scripts/ci_runtime_plan.py\n',
+        '          git cat-file blob "$entry_object" > .github/scripts/ci_runtime_telemetry.py\n',
+        1,
+    )
+    require(
+        decoupled_materialization != handoff_channel,
+        "self-test: decoupled FIPS materialization fixture must alter the workflow",
+        failures,
+    )
+    decoupled_materialization_failures: list[str] = []
+    check_fips(decoupled_materialization, decoupled_materialization_failures)
+    require(
+        any(
+            "mutable path aliases are forbidden" in item
+            for item in decoupled_materialization_failures
+        ),
+        "self-test: a noncanonical FIPS materialization target must fail",
         failures,
     )
 
@@ -4012,9 +4440,9 @@ def self_test() -> int:
     )
 
     unpackaged_handoff = handoff_channel.replace(
-        '          tar --zstd -cf "$archive" -C "$GITHUB_WORKSPACE" \\\n'
-        '            target .cache/sccache -C "$RUNNER_TEMP" '
-        "fips-producer-source-tree\n",
+        '          tar --zstd --hard-dereference -cf "$archive" -C "$RUNNER_TEMP" \\\n'
+        "            fips-producer-identity fips-producer-source-tree \\\n"
+        '            -C "$GITHUB_WORKSPACE" target .cache/sccache\n',
         "          true\n",
         1,
     )
@@ -4025,6 +4453,20 @@ def self_test() -> int:
             "package target, sccache" in item for item in unpackaged_failures
         ),
         "self-test: direct permission-losing producer upload must fail",
+        failures,
+    )
+
+    linked_handoff = handoff_channel.replace(
+        "tar --zstd --hard-dereference -cf", "tar --zstd -cf", 1
+    )
+    linked_handoff_failures: list[str] = []
+    check_fips_producer_channel(linked_handoff, linked_handoff_failures)
+    require(
+        any(
+            "materializes hard-linked outputs as regular files" in item
+            for item in linked_handoff_failures
+        ),
+        "self-test: a producer archive that preserves hard-link members must fail",
         failures,
     )
 
@@ -4072,9 +4514,8 @@ def self_test() -> int:
     require(
         any(
             "event-stable source SHA" in item
-            or "FIPS_PRODUCER_KEY" in item
-            or "FIPS_PRODUCER_RESTORE_PREFIX" in item
             or "handoff artifact" in item
+            or "handoff prefix" in item
             for item in synthetic_merge_failures
         ),
         "self-test: pull-request synthetic merge SHA handoff identity must fail",
@@ -4097,6 +4538,195 @@ def self_test() -> int:
             for item in tolerant_missing_failures
         ),
         "self-test: an unavailable explicitly requested warm source must fail closed",
+        failures,
+    )
+
+    consumer_cache_restore = handoff_channel.replace(
+        "      - name: Download FIPS producer handoff\n",
+        "      - name: Restore FIPS producer compile outputs\n"
+        f"        uses: {CACHE_RESTORE} # v4.2.4\n"
+        "        with:\n"
+        "          key: fips-producer-legacy\n"
+        "      - name: Download FIPS producer handoff\n",
+        1,
+    )
+    consumer_cache_restore_failures: list[str] = []
+    check_fips_producer_channel(
+        consumer_cache_restore, consumer_cache_restore_failures
+    )
+    require(
+        any(
+            "must not restore the eviction-prone repository cache" in item
+            for item in consumer_cache_restore_failures
+        ),
+        "self-test: consumer repository-cache producer restore must fail",
+        failures,
+    )
+
+    compile_cache_save = handoff_channel.replace(
+        "      - name: Package FIPS producer handoff\n",
+        "      - name: Save FIPS producer compile outputs\n"
+        f"        uses: {CACHE_SAVE} # v4.2.4\n"
+        "        with:\n"
+        "          key: fips-producer-legacy\n"
+        "      - name: Package FIPS producer handoff\n",
+        1,
+    )
+    compile_cache_save_failures: list[str] = []
+    check_fips_producer_channel(compile_cache_save, compile_cache_save_failures)
+    require(
+        any(
+            "must not publish the eviction-prone repository cache" in item
+            for item in compile_cache_save_failures
+        ),
+        "self-test: reintroducing the compile repository-cache save must fail",
+        failures,
+    )
+
+    attempt_scoped_download = handoff_channel.replace(
+        "          pattern: ${{ env.FIPS_HANDOFF_ARTIFACT_PREFIX }}*\n",
+        "          name: ${{ env.FIPS_HANDOFF_ARTIFACT }}\n",
+        1,
+    )
+    attempt_scoped_failures: list[str] = []
+    check_fips_producer_channel(attempt_scoped_download, attempt_scoped_failures)
+    require(
+        any(
+            "attempt-independent producer "
+            "handoff pattern" in item
+            for item in attempt_scoped_failures
+        ),
+        "self-test: an attempt-scoped consumer download must fail",
+        failures,
+    )
+
+    undocumented_direct_root = handoff_channel.replace(
+        '          if [ -z "$payload_dir" ] || ! is_positive_decimal "$selected_attempt"; then\n',
+        '          selected="$channel_root"\n'
+        '          selected_attempt="single"\n'
+        '          if [ -z "$payload_dir" ] || ! is_positive_decimal "$selected_attempt"; then\n',
+        1,
+    )
+    undocumented_direct_root_failures: list[str] = []
+    check_fips_producer_channel(
+        undocumented_direct_root, undocumented_direct_root_failures
+    )
+    require(
+        any(
+            "undocumented direct-root" in item
+            for item in undocumented_direct_root_failures
+        ),
+        "self-test: accepting an undocumented direct-root artifact must fail",
+        failures,
+    )
+
+    missing_flattened_layout = handoff_channel.replace(
+        '            payload_dir="$channel_root"\n',
+        "            true\n",
+        1,
+    )
+    missing_flattened_failures: list[str] = []
+    check_fips_producer_channel(
+        missing_flattened_layout, missing_flattened_failures
+    )
+    require(
+        any(
+            "one-match flattened payload" in item
+            for item in missing_flattened_failures
+        ),
+        "self-test: dropping the one-artifact flattened layout must fail",
+        failures,
+    )
+
+    consumer_attempt_inference = handoff_channel.replace(
+        '            selected_attempt="$identity_attempt"\n',
+        '            selected_attempt="${GITHUB_RUN_ATTEMPT}"\n',
+        1,
+    )
+    consumer_attempt_failures: list[str] = []
+    check_fips_producer_channel(
+        consumer_attempt_inference, consumer_attempt_failures
+    )
+    require(
+        any(
+            "consumer run attempt" in item or "fips-producer-identity" in item
+            for item in consumer_attempt_failures
+        ),
+        "self-test: inferring a producer attempt from the consumer run attempt must fail",
+        failures,
+    )
+
+    missing_test_flatten = handoff_channel.replace(
+        "              attempt, bundle = admit_bundle(channel, None)\n",
+        "              raise SystemExit('flattened layout is unsupported')\n",
+        1,
+    )
+    missing_test_flatten_failures: list[str] = []
+    check_fips_producer_channel(
+        missing_test_flatten, missing_test_flatten_failures
+    )
+    require(
+        any(
+            "admit_bundle(channel, None)" in item
+            or "select the newest attempt" in item
+            for item in missing_test_flatten_failures
+        ),
+        "self-test: dropping the one-artifact FIPS test flattened layout must fail",
+        failures,
+    )
+
+    attempt_scoped_test_download = handoff_channel.replace(
+        "          pattern: fips-test-binaries-${{ github.run_id }}-*\n",
+        "          name: fips-test-binaries-${{ github.run_id }}-${{ github.run_attempt }}\n",
+        1,
+    )
+    attempt_scoped_test_failures: list[str] = []
+    check_fips_producer_channel(
+        attempt_scoped_test_download, attempt_scoped_test_failures
+    )
+    require(
+        any(
+            "failed-job reruns can reuse a skipped producer's artifact" in item
+            for item in attempt_scoped_test_failures
+        ),
+        "self-test: an attempt-scoped FIPS test download must fail",
+        failures,
+    )
+
+    oldest_test_artifact = handoff_channel.replace(
+        "          _, bundle = max(attempts)\n",
+        "          _, bundle = min(attempts)\n",
+        1,
+    )
+    oldest_test_artifact_failures: list[str] = []
+    check_fips_producer_channel(
+        oldest_test_artifact, oldest_test_artifact_failures
+    )
+    require(
+        any(
+            "select the newest attempt" in item
+            for item in oldest_test_artifact_failures
+        ),
+        "self-test: selecting the oldest FIPS test artifact must fail",
+        failures,
+    )
+
+    fork_gated_promotion = handoff_channel.replace(
+        "      - name: Promote same-run FIPS producer handoff\n"
+        "        if: github.event.inputs.force_cold_cache != 'true'\n",
+        "      - name: Promote same-run FIPS producer handoff\n"
+        "        if: github.event.inputs.force_cold_cache != 'true' && "
+        "github.event.pull_request.head.repo.fork != true\n",
+        1,
+    )
+    fork_gated_failures: list[str] = []
+    check_fips_producer_channel(fork_gated_promotion, fork_gated_failures)
+    require(
+        any(
+            "promote the newest attempt-wildcard handoff" in item
+            for item in fork_gated_failures
+        ),
+        "self-test: fork-gated handoff promotion must fail",
         failures,
     )
 
