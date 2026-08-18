@@ -17,6 +17,7 @@ use ferrum_edge::config::db_loader::{
     DatabaseStore, is_retryable_sql_transaction_conflict,
     sqlstate_is_retryable_transaction_conflict,
 };
+use ferrum_edge::config::namespace_registry::NamespaceRegistryCorrupt;
 use ferrum_edge::config::plugin_trigger::PluginTrigger;
 use ferrum_edge::config::types::{
     AuthMode, BackendScheme, Consumer, LoadBalancerAlgorithm, PluginAssociation, PluginConfig,
@@ -2557,6 +2558,49 @@ async fn unmarked_namespace_registry_backfill_retries_idempotently() {
     assert!(
         registry_row_exists(&store, "legacy").await,
         "retry must still insert pre-existing derived names"
+    );
+}
+
+#[tokio::test]
+async fn namespace_registry_backfill_rejects_invalid_derived_names_before_completion() {
+    let temp_dir = tempfile::TempDir::new().unwrap();
+    let name = "ns-backfill-invalid-derived";
+    let db_path = temp_dir.path().join(format!("{name}.db"));
+    let url = format!("sqlite:{}?mode=rwc", db_path.to_string_lossy());
+    let store = connect_namespaces_test_store(&temp_dir, name).await;
+
+    sqlx::query("DELETE FROM _ferrum_schema_compat")
+        .execute(&store.pool())
+        .await
+        .unwrap();
+    seed_namespace_upstream(&store, "invalid/namespace", "up-invalid").await;
+
+    let error = match DatabaseStore::connect_with_pool_config(
+        "sqlite",
+        &url,
+        DbPoolConfig::default(),
+    )
+    .await
+    {
+        Ok(_) => panic!("an invalid legacy namespace must fail the compatibility pass"),
+        Err(error) => error,
+    };
+    let diagnostic = format!("{error:#}");
+    assert!(
+        diagnostic.contains(NamespaceRegistryCorrupt::MESSAGE),
+        "the failure must use the redacted registry-corruption diagnostic: {diagnostic}"
+    );
+    assert!(
+        !diagnostic.contains("invalid/namespace"),
+        "the hostile stored value must not be echoed: {diagnostic}"
+    );
+    assert!(
+        !namespace_registry_backfill_completed(&store).await,
+        "a rejected pass must leave the marker absent for a later repair and retry"
+    );
+    assert!(
+        !registry_row_exists(&store, "invalid/namespace").await,
+        "the derived registry insert must roll back with the rejected pass"
     );
 }
 

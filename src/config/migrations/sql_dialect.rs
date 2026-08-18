@@ -72,7 +72,9 @@ use crate::config::db_loader::{
     CONFIG_ADMISSION_LEASE_DURATION_MILLIS, config_admission_lease_acquire_sql,
     config_admission_lease_now_sql, rewrite_query_placeholders,
 };
-use crate::config::namespace_registry::NAMESPACE_REGISTRY_ADMISSION_KEY;
+use crate::config::namespace_registry::{
+    NAMESPACE_REGISTRY_ADMISSION_KEY, NamespaceRegistryCorrupt, require_namespace_identity,
+};
 use sqlx::{AnyConnection, Row};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1180,6 +1182,22 @@ impl V001SqlBuilder {
             .bind(&now)
             .execute(&mut *connection)
             .await?;
+
+        // Match MongoDB's in-transaction identity validation before recording
+        // compatibility completion. Legacy resource rows can predate current
+        // namespace admission, so copying an invalid derived name into the
+        // registry and marking the pass complete would defer the corruption to
+        // a later admin read. Keep the diagnostic redacted to the schema field
+        // and let the caller roll the complete backfill transaction back.
+        let registry_rows = sqlx::query("SELECT name FROM namespaces")
+            .fetch_all(&mut *connection)
+            .await?;
+        for row in registry_rows {
+            let name: String = row
+                .try_get("name")
+                .map_err(|_| NamespaceRegistryCorrupt::field("name"))?;
+            require_namespace_identity(&name, &name, None)?;
+        }
 
         // Marker last: it is the final write in the atomic unit, so an abort
         // or a crash leaves completion absent and the next serialized
