@@ -107,8 +107,11 @@ matching request and response bodies, the WAF also scans **decoded variants**:
 So a `<script>` written as `<script>`, `&lt;script&gt;`, or
 `%3Cscript%3E` in a body is still caught by the script-tag rule. Decoding is
 content-type-agnostic (an attacker controls the declared `Content-Type`), and
-bounded to a small number of variants. Query values are percent-decoded before
-matching as well.
+bounded to a small number of variants. Query matching is per decoded parameter
+value, not the raw whole URI: each value is percent-decoded (including
+`+`-as-space) and then scanned as that form plus the same bounded layered
+variants, so stacked percent / HTML-entity / unicode encodings in a parameter
+cannot evade query rules.
 
 The layered decode runs a bounded number of rounds (a cost guard against
 decompression-style blowups), so double- and triple-stacked encodings are fully
@@ -167,7 +170,7 @@ and `rule_overrides`. Categories:
 | `xss` | FE-XSS-001..005 plus `-B`/`-Q` body/query mirrors | script-tag and js-URL now cover both query and body |
 | `path_traversal` | FE-PATHTRAV-001..003, FE-PATHTRAV-001-B | now covers request bodies, not just the URL |
 | `lfi` / `rfi` | FE-LFI-001(+ -B), FE-RFI-001 (L2) | |
-| `ssrf` | FE-SSRF-001(+ -Q), FE-SSRF-002(+ -Q) | metadata/private-IP and dangerous schemes across body and query |
+| `ssrf` | FE-SSRF-001(+ -Q), FE-SSRF-002(+ -Q) | metadata/private-IP and dangerous schemes; **level 1** across body and decoded query values (not the raw whole URI). Same dotted-IPv4 / `metadata.google.internal` / `file|gopher|dict|jar|ldap://` claims as the body rules; IPv6 and alternate textual IP forms are out of scope |
 | `xxe` | FE-XXE-001 | external-entity markers; no longer trips on `<!DOCTYPE html>` |
 | `deserialization` | FE-DESER-001..003 | Java / .NET / PHP markers |
 | `header_anomaly` | FE-HEADER-001..003 | control chars, method-override, header-borne injection (L2) |

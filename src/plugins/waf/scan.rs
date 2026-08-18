@@ -502,19 +502,30 @@ impl Waf {
             subject,
             None,
         );
-        self.scan_text_set(
-            outcome,
-            self.compiled.query_values.as_ref(),
-            value,
-            subject,
-            None,
-        );
         self.scan_cidr_rules_matching(
             outcome,
             key,
             &self.compiled.text_cidr_rules,
             subject,
             |target| matches!(target, RuleTarget::QueryKeys),
+        );
+        // Match the percent-decoded parameter value, then the same bounded
+        // layered variants used for bodies (stacked percent / HTML-entity /
+        // unicode). Query rules never inspect raw whole-URI text.
+        self.scan_query_value(outcome, value, subject);
+        let (variants, _) = normalize::decoded_variants_with_residual(value);
+        for variant in variants {
+            self.scan_query_value(outcome, &variant, subject);
+        }
+    }
+
+    fn scan_query_value(&self, outcome: &mut ScanOutcome, value: &str, subject: ScanSubject<'_>) {
+        self.scan_text_set(
+            outcome,
+            self.compiled.query_values.as_ref(),
+            value,
+            subject,
+            None,
         );
         self.scan_cidr_rules_matching(
             outcome,

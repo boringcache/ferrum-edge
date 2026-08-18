@@ -5,6 +5,16 @@ use super::rules::{MatchKind, RuleAction, RuleTarget, Severity, WafRule};
 /// event handlers so the rule is safe to enforce.
 const EVENT_HANDLER: &str = r"(?i)\bon(?:error|load|click|dblclick|mouseover|mouseout|mousemove|mousedown|mouseup|focus|focusin|blur|submit|change|input|keydown|keyup|keypress|abort|beforeunload|contextmenu|drag|dragstart|dragend|dragover|drop|toggle|wheel|pointerdown|pointerup|pointermove|pointerover|touchstart|touchend|touchmove|animationstart|animationend|transitionend|hashchange|popstate|message|scroll|resize|select|reset|copy|cut|paste)\s*=";
 
+/// Cloud-metadata hostname and dotted IPv4 private/loopback/link-local forms
+/// claimed by `FE-SSRF-001` / `FE-SSRF-001-Q`. Body and query share this
+/// pattern so coverage stays in lockstep. IPv6 and alternative textual IP
+/// forms (decimal, hex, octal, `[::1]`) are intentionally out of scope.
+const SSRF_METADATA_OR_PRIVATE_IP: &str = r"(?i)(?:169\.254\.169\.254|metadata\.google\.internal|127\.\d{1,3}\.\d{1,3}\.\d{1,3}|10\.\d{1,3}\.\d{1,3}\.\d{1,3}|192\.168\.\d{1,3}\.\d{1,3}|172\.(?:1[6-9]|2\d|3[01])\.\d{1,3}\.\d{1,3})";
+
+/// Dangerous schemes claimed by `FE-SSRF-002` / `FE-SSRF-002-Q`. Word-bounded
+/// so tokens like `profile://` are not substring matches.
+const SSRF_DANGEROUS_SCHEME: &str = r"(?i)\b(?:file|gopher|dict|jar|ldap)://";
+
 pub fn default_rules() -> Vec<WafRule> {
     vec![
         r("FE-SQLI-001", "UNION SELECT SQL injection", "sqli", Severity::High, RuleTarget::QueryValues, r"(?i)\bunion\s+(?:all\s+)?select\b"),
@@ -35,8 +45,8 @@ pub fn default_rules() -> Vec<WafRule> {
         r("FE-DESER-001", "Java serialized object marker", "deserialization", Severity::High, RuleTarget::BodyText, r"\brO0AB[A-Za-z0-9+/=]{8,}"),
         r("FE-DESER-002", ".NET BinaryFormatter marker", "deserialization", Severity::High, RuleTarget::BodyText, r"AAEAAAD/////"),
         r("FE-DESER-003", "PHP serialized object marker", "deserialization", Severity::High, RuleTarget::BodyText, r#"O:\d+:"[^"]+":"#),
-        r("FE-SSRF-001", "Cloud metadata or private IP URL", "ssrf", Severity::High, RuleTarget::BodyText, r"(?i)(?:169\.254\.169\.254|metadata\.google\.internal|127\.\d{1,3}\.\d{1,3}\.\d{1,3}|10\.\d{1,3}\.\d{1,3}\.\d{1,3}|192\.168\.\d{1,3}\.\d{1,3}|172\.(?:1[6-9]|2\d|3[01])\.\d{1,3}\.\d{1,3})"),
-        r("FE-SSRF-002", "Dangerous URL scheme", "ssrf", Severity::High, RuleTarget::BodyText, r"(?i)\b(?:file|gopher|dict|jar|ldap)://"),
+        r("FE-SSRF-001", "Cloud metadata or private IP URL", "ssrf", Severity::High, RuleTarget::BodyText, SSRF_METADATA_OR_PRIVATE_IP),
+        r("FE-SSRF-002", "Dangerous URL scheme", "ssrf", Severity::High, RuleTarget::BodyText, SSRF_DANGEROUS_SCHEME),
         r("FE-HEADER-001", "Header control character", "header_anomaly", Severity::Medium, RuleTarget::HeaderValues(None), r"[\r\n\x00-\x08\x0b\x0c\x0e-\x1f\x7f]"),
         r("FE-HEADER-002", "HTTP method override header", "header_anomaly", Severity::Low, RuleTarget::HeaderNames, r"(?i)^x-http-method-override$"),
         r("FE-COOKIE-001", "Cookie control character", "cookie_attack", Severity::Medium, RuleTarget::Cookies, r"[\r\n\x00-\x08\x0b\x0c\x0e-\x1f\x7f]"),
@@ -84,10 +94,15 @@ pub fn default_rules() -> Vec<WafRule> {
         rp("FE-XSS-003-Q", "HTML event handler (query)", "xss", Severity::Medium, RuleTarget::QueryValues, EVENT_HANDLER, 1),
         rp("FE-XSS-005-B", "HTML data URL (body)", "xss", Severity::Medium, RuleTarget::BodyText, r"(?i)data\s*:\s*text/html", 1),
         // --- Traversal / LFI / SSRF parity across body and query ---
+        // SSRF query mirrors stay on QueryValues (decoded parameter values),
+        // not FullUrl, so a path token like `/v10.1.2.3` is not a substring
+        // hit. They ship at paranoia 1 with the body rules: the documented
+        // pack covers metadata/private-IP and dangerous schemes on both
+        // sides at the recommended enforce/L1 posture.
         rp("FE-PATHTRAV-001-B", "Dot-dot path traversal (body)", "path_traversal", Severity::High, RuleTarget::BodyText, r"(?:\.\./|\.\.\\)", 1),
         rp("FE-LFI-001-B", "Local file inclusion target (body)", "lfi", Severity::High, RuleTarget::BodyText, r"(?i)(?:/etc/passwd|/proc/self/|c:\\windows\\|php://filter|expect://|file:///)", 1),
-        rp("FE-SSRF-001-Q", "Cloud metadata or private IP URL (query)", "ssrf", Severity::High, RuleTarget::QueryValues, r"(?i)(?:169\.254\.169\.254|metadata\.google\.internal|127\.\d{1,3}\.\d{1,3}\.\d{1,3}|10\.\d{1,3}\.\d{1,3}\.\d{1,3}|192\.168\.\d{1,3}\.\d{1,3}|172\.(?:1[6-9]|2\d|3[01])\.\d{1,3}\.\d{1,3})", 2),
-        rp("FE-SSRF-002-Q", "Dangerous URL scheme (query)", "ssrf", Severity::High, RuleTarget::QueryValues, r"(?i)\b(?:file|gopher|dict|jar|ldap)://", 2),
+        rp("FE-SSRF-001-Q", "Cloud metadata or private IP URL (query)", "ssrf", Severity::High, RuleTarget::QueryValues, SSRF_METADATA_OR_PRIVATE_IP, 1),
+        rp("FE-SSRF-002-Q", "Dangerous URL scheme (query)", "ssrf", Severity::High, RuleTarget::QueryValues, SSRF_DANGEROUS_SCHEME, 1),
     ]
     .into_iter()
     .map(|mut rule| {
