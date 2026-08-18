@@ -471,7 +471,10 @@ async fn a_withdrawal_during_backend_setup_drops_it_and_frees_the_probe() {
         dropped.load(Ordering::SeqCst),
         "the interrupted setup stage must be dropped, not left to finish"
     );
-    assert_eq!(settled.probe_releases, 1, "the HALF_OPEN probe slot is freed once");
+    assert_eq!(
+        settled.probe_releases, 1,
+        "the HALF_OPEN probe slot is freed once"
+    );
     let kind = settled.setup_kind.expect("a typed stream-setup kind");
     assert_eq!(kind, StreamSetupKind::ClientTrustWithdrawn);
     assert!(
@@ -509,9 +512,15 @@ async fn an_already_retired_session_never_builds_a_setup_stage() {
     let outcome = run_setup_stage(None, &fence, stage).await;
     let settled = outcome.expect_err("a retired session resolves and dials nothing");
 
-    assert!(!built.load(Ordering::SeqCst), "a retired session must not even construct the stage");
+    assert!(
+        !built.load(Ordering::SeqCst),
+        "a retired session must not even construct the stage"
+    );
     assert!(!polled.load(Ordering::SeqCst));
-    assert_eq!(settled.setup_kind, Some(StreamSetupKind::ClientTrustWithdrawn));
+    assert_eq!(
+        settled.setup_kind,
+        Some(StreamSetupKind::ClientTrustWithdrawn)
+    );
     assert_eq!(settled.probe_releases, 1);
 }
 
@@ -531,7 +540,10 @@ async fn a_withdrawal_outranks_a_credential_that_also_elapsed() {
     let outcome = run_setup_stage(plan, &fence, stage).await;
     let settled = outcome.expect_err("a retired session establishes no backend");
 
-    assert_eq!(settled.setup_kind, Some(StreamSetupKind::ClientTrustWithdrawn));
+    assert_eq!(
+        settled.setup_kind,
+        Some(StreamSetupKind::ClientTrustWithdrawn)
+    );
 }
 
 #[tokio::test]
@@ -548,7 +560,10 @@ async fn an_elapsed_credential_alone_still_settles_as_an_expiry() {
     let outcome = run_setup_stage(plan, &fence, stage).await;
     let settled = outcome.expect_err("an elapsed credential establishes no backend");
 
-    assert_eq!(settled.setup_kind, Some(StreamSetupKind::AuthorizationExpired));
+    assert_eq!(
+        settled.setup_kind,
+        Some(StreamSetupKind::AuthorizationExpired)
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -733,17 +748,35 @@ async fn the_connection_fence_counter_is_recorded_exactly_once() {
     let repeat = fence.settle_withdrawal();
     fence.record_fenced_once();
 
-    assert_eq!(fenced_total(), before + 1, "one fence observation per connection");
+    assert_eq!(
+        fenced_total(),
+        before + 1,
+        "one fence observation per connection"
+    );
 
     // Diagnostics are fixed-cardinality and redacted: one compiled-in literal,
     // identical at every boundary, naming no certificate field, no trust
     // material, no path, and no generation.
     for message in [settled.error.as_str(), repeat.error.as_str()] {
         assert_eq!(message, FENCED_MESSAGE);
-        for leak in ["CN=", "SAN", "serial", "issuer", "sha256", "generation", "/"] {
-            assert!(!message.contains(leak), "the refusal must not carry `{leak}`: {message}");
+        for leak in [
+            "CN=",
+            "SAN",
+            "serial",
+            "issuer",
+            "sha256",
+            "generation",
+            "/",
+        ] {
+            assert!(
+                !message.contains(leak),
+                "the refusal must not carry `{leak}`: {message}"
+            );
         }
     }
-    assert_eq!(repeat.setup_kind, Some(StreamSetupKind::ClientTrustWithdrawn));
+    assert_eq!(
+        repeat.setup_kind,
+        Some(StreamSetupKind::ClientTrustWithdrawn)
+    );
     assert!(settled.metadata.is_empty());
 }

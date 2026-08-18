@@ -8134,9 +8134,7 @@ pub mod _test_support {
         trust: &DtlsTrustFenceForTest,
     ) -> DtlsStreamConnectOutcomeForTest {
         match crate::proxy::udp_proxy::run_dtls_stream_connect_plugins(
-            plugins,
-            stream_ctx,
-            &trust.0,
+            plugins, stream_ctx, &trust.0,
         )
         .await
         {
