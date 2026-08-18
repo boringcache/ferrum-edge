@@ -4739,15 +4739,35 @@ pub mod client {
 
         #[tokio::test]
         async fn shared_connection_deadline_covers_fresh_dns_resolution() {
-            let stalled_resolver = tokio::net::UdpSocket::bind("127.0.0.1:0")
-                .await
-                .expect("bind stalled DNS responder");
-            let resolver_address = stalled_resolver
-                .local_addr()
-                .expect("stalled resolver address");
-            let _stalled_tcp_resolver = tokio::net::TcpListener::bind(resolver_address)
-                .await
-                .expect("bind stalled TCP DNS responder");
+            // The responder needs the SAME port number on both UDP and TCP, but
+            // the two port spaces are independent: taking an ephemeral UDP port
+            // says nothing about that number being free for TCP, so a bare
+            // `bind` here races every other parallel test and intermittently
+            // fails with EADDRINUSE. Retry whole UDP+TCP pairs until one number
+            // is free in both spaces (the repo's standing rule that test port
+            // allocation must retry rather than bind-drop-rebind).
+            // Both sockets stay bound for the duration of the test; neither is
+            // read, so both carry the `_` prefix while still holding the port.
+            let (_stalled_resolver, _stalled_tcp_resolver, resolver_address) = {
+                let mut bound = None;
+                for _ in 0..64 {
+                    let udp = tokio::net::UdpSocket::bind("127.0.0.1:0")
+                        .await
+                        .expect("bind stalled DNS responder");
+                    let address = udp.local_addr().expect("stalled resolver address");
+                    match tokio::net::TcpListener::bind(address).await {
+                        Ok(tcp) => {
+                            bound = Some((udp, tcp, address));
+                            break;
+                        }
+                        // That port number is taken in the TCP space; the UDP
+                        // socket is dropped here so the pair is retried cleanly.
+                        Err(error) if error.kind() == std::io::ErrorKind::AddrInUse => continue,
+                        Err(error) => panic!("bind stalled TCP DNS responder: {error}"),
+                    }
+                }
+                bound.expect("no port free in both the UDP and TCP spaces after 64 attempts")
+            };
             let dns_cache = DnsCache::new(DnsConfig {
                 resolver_addresses: Some(resolver_address.to_string()),
                 try_tcp_on_error: false,
