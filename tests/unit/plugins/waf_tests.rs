@@ -13,7 +13,7 @@ fn ctx(method: &str, path: &str) -> RequestContext {
 
 #[tokio::test]
 async fn default_waf_monitors_sqli_query_without_blocking() {
-    let plugin = Waf::new(&json!({})).unwrap();
+    let plugin = Waf::new(&json!({ "mode": "monitor" })).unwrap();
     let mut ctx = ctx("GET", "/search");
     ctx.set_raw_query_string("q=%27%20OR%201%3D1".into());
 
@@ -33,7 +33,7 @@ async fn default_waf_monitors_sqli_query_without_blocking() {
 
 #[tokio::test]
 async fn clean_waf_evaluation_records_clean_action_for_metrics() {
-    let plugin = Waf::new(&json!({})).unwrap();
+    let plugin = Waf::new(&json!({ "mode": "monitor" })).unwrap();
     let mut ctx = ctx("GET", "/search");
     ctx.set_raw_query_string("q=ordinary".into());
 
@@ -180,7 +180,7 @@ async fn regex_alternation_exemption_anchors_all_branches() {
 
 #[tokio::test]
 async fn waf_clears_preexisting_reserved_metadata_before_evaluation() {
-    let plugin = Waf::new(&json!({})).unwrap();
+    let plugin = Waf::new(&json!({ "mode": "monitor" })).unwrap();
     let mut ctx = ctx("GET", "/search");
     ctx.metadata
         .insert("waf.rule_hits".to_string(), "SPOOFED".to_string());
@@ -560,6 +560,61 @@ async fn body_json_path_rule_scans_decoded_variants() {
         ctx.metadata.get("waf.rule_hits").map(String::as_str),
         Some("CUSTOM-JSON-DECODED")
     );
+}
+
+#[tokio::test]
+async fn custom_body_json_path_fp_filter_suppresses_json_ld_script() {
+    // Issue #3938: per-rule fp_filters must be evaluated against the complete
+    // JSON-path value after the rule matcher hits, not only the matched token.
+    let plugin = Waf::new(&json!({
+        "include_default_rules": false,
+        "custom_rules": [{
+            "id": "ACME-1",
+            "category": "custom",
+            "severity": "high",
+            "target": { "type": "body_json_path", "path": "user.bio" },
+            "match_kind": "contains",
+            "pattern": "<script",
+            "action": "enforce",
+            "paranoia_min": 1,
+            "fp_filters": ["<script type=\"application/ld\\+json\">"],
+            "conditions": { "methods": ["POST"], "paths": ["/profile*"] }
+        }]
+    }))
+    .unwrap();
+
+    let mut blocked = ctx("POST", "/profile/edit");
+    blocked
+        .headers
+        .insert("content-type".into(), "application/json".into());
+    let headers = blocked.headers.clone();
+    let result = plugin
+        .on_final_request_body_with_context(
+            &mut blocked,
+            &headers,
+            br#"{"user":{"bio":"<script>alert(1)</script>"}}"#,
+        )
+        .await;
+    assert!(matches!(result, PluginResult::Reject { .. }));
+    assert_eq!(
+        blocked.metadata.get("waf.rule_hits").map(String::as_str),
+        Some("ACME-1")
+    );
+
+    let mut suppressed = ctx("POST", "/profile/edit");
+    suppressed
+        .headers
+        .insert("content-type".into(), "application/json".into());
+    let headers = suppressed.headers.clone();
+    let result = plugin
+        .on_final_request_body_with_context(
+            &mut suppressed,
+            &headers,
+            br#"{"user":{"bio":"<script type=\"application/ld+json\">{\"@context\":\"https://schema.org\"}</script>"}}"#,
+        )
+        .await;
+    assert!(matches!(result, PluginResult::Continue));
+    assert!(!suppressed.metadata.contains_key("waf.rule_hits"));
 }
 
 #[tokio::test]
@@ -995,7 +1050,7 @@ async fn response_header_rules_request_buffered_grpc_web_trailer_policy() {
 
 #[test]
 fn inactive_response_header_inspection_does_not_govern_native_h3_trailers() {
-    let plugin = Waf::new(&json!({})).unwrap();
+    let plugin = Waf::new(&json!({ "mode": "monitor" })).unwrap();
 
     assert!(matches!(
         plugin.response_trailer_policy(),
@@ -1005,45 +1060,50 @@ fn inactive_response_header_inspection_does_not_govern_native_h3_trailers() {
 
 #[test]
 fn monitor_only_response_header_rules_do_not_drop_native_h3_trailers() {
-    for config in [
-        json!({
-            "mode": "monitor",
-            "include_default_rules": false,
-            "response_inspection": true,
-            "custom_rules": [{
-                "id": "CUSTOM-RESP-HEADER-GLOBAL-MONITOR",
-                "name": "globally monitored response metadata",
-                "category": "custom",
-                "severity": "high",
-                "target": "response_headers",
-                "match_kind": "contains",
-                "pattern": "leak-secret",
-                "action": "enforce"
-            }]
-        }),
-        json!({
-            "mode": "enforce",
-            "include_default_rules": false,
-            "response_inspection": true,
-            "custom_rules": [{
-                "id": "CUSTOM-RESP-HEADER-RULE-MONITOR",
-                "name": "rule-monitored response metadata",
-                "category": "custom",
-                "severity": "high",
-                "target": "response_headers",
-                "match_kind": "contains",
-                "pattern": "leak-secret",
-                "action": "monitor"
-            }]
-        }),
-    ] {
-        let plugin = Waf::new(&config).unwrap();
+    let plugin = Waf::new(&json!({
+        "mode": "monitor",
+        "include_default_rules": false,
+        "response_inspection": true,
+        "custom_rules": [{
+            "id": "CUSTOM-RESP-HEADER-GLOBAL-MONITOR",
+            "name": "globally monitored response metadata",
+            "category": "custom",
+            "severity": "high",
+            "target": "response_headers",
+            "match_kind": "contains",
+            "pattern": "leak-secret",
+            "action": "enforce"
+        }]
+    }))
+    .unwrap();
 
-        assert!(matches!(
-            plugin.response_trailer_policy(),
-            ResponseTrailerPolicy::None
-        ));
-    }
+    assert!(matches!(
+        plugin.response_trailer_policy(),
+        ResponseTrailerPolicy::None
+    ));
+}
+
+#[test]
+fn enforce_mode_rejects_monitor_only_response_header_rules() {
+    let err = Waf::new(&json!({
+        "mode": "enforce",
+        "include_default_rules": false,
+        "response_inspection": true,
+        "custom_rules": [{
+            "id": "CUSTOM-RESP-HEADER-RULE-MONITOR",
+            "name": "rule-monitored response metadata",
+            "category": "custom",
+            "severity": "high",
+            "target": "response_headers",
+            "match_kind": "contains",
+            "pattern": "leak-secret",
+            "action": "monitor"
+        }]
+    }))
+    .unwrap_err();
+    assert!(err.contains("no enabled enforcement path"));
+    assert!(err.contains("default_rule_action"));
+    assert!(err.contains("rule_modes"));
 }
 
 #[test]
@@ -1199,7 +1259,7 @@ async fn response_header_rules_do_not_request_grpc_web_trailer_policy_when_exemp
 
 #[tokio::test]
 async fn response_body_inspection_is_off_by_default() {
-    let plugin = Waf::new(&json!({})).unwrap();
+    let plugin = Waf::new(&json!({ "mode": "monitor" })).unwrap();
     let ctx = ctx("GET", "/");
     assert!(!plugin.requires_response_body_buffering());
     assert!(!plugin.should_buffer_response_body(&ctx));
@@ -1385,6 +1445,133 @@ async fn decoded_body_rules_scan_leading_zero_numeric_html_entities() {
         ctx.metadata
             .get("waf.rule_hits")
             .is_some_and(|hits| hits.contains("FE-XSS-001-B"))
+    );
+}
+
+#[tokio::test]
+async fn literal_match_kind_is_case_sensitive_substring_on_body() {
+    let plugin = Waf::new(&json!({
+        "include_default_rules": false,
+        "custom_rules": [{
+            "id": "CUSTOM-LIT",
+            "name": "literal marker",
+            "category": "custom",
+            "severity": "high",
+            "target": "body_text",
+            "match_kind": "literal",
+            "pattern": "EVIL-LITERAL",
+            "action": "enforce"
+        }]
+    }))
+    .unwrap();
+
+    let mut clean_ctx = ctx("POST", "/custom");
+    clean_ctx
+        .headers
+        .insert("content-type".into(), "text/plain".into());
+    let clean_headers = clean_ctx.headers.clone();
+    let clean_result = plugin
+        .on_final_request_body_with_context(&mut clean_ctx, &clean_headers, b"nope")
+        .await;
+    assert!(matches!(clean_result, PluginResult::Continue));
+    assert!(!clean_ctx.metadata.contains_key("waf.rule_hits"));
+
+    let mut exact_ctx = ctx("POST", "/custom");
+    exact_ctx
+        .headers
+        .insert("content-type".into(), "text/plain".into());
+    let exact_headers = exact_ctx.headers.clone();
+    let exact_result = plugin
+        .on_final_request_body_with_context(
+            &mut exact_ctx,
+            &exact_headers,
+            b"prefix EVIL-LITERAL suffix",
+        )
+        .await;
+    assert!(matches!(exact_result, PluginResult::Reject { .. }));
+    assert_eq!(
+        exact_ctx.metadata.get("waf.rule_hits").map(String::as_str),
+        Some("CUSTOM-LIT")
+    );
+
+    let mut folded_ctx = ctx("POST", "/custom");
+    folded_ctx
+        .headers
+        .insert("content-type".into(), "text/plain".into());
+    let folded_headers = folded_ctx.headers.clone();
+    let folded_result = plugin
+        .on_final_request_body_with_context(&mut folded_ctx, &folded_headers, b"evil-literal")
+        .await;
+    assert!(matches!(folded_result, PluginResult::Continue));
+    assert!(
+        !folded_ctx
+            .metadata
+            .get("waf.rule_hits")
+            .is_some_and(|hits| hits.contains("CUSTOM-LIT"))
+    );
+}
+
+#[tokio::test]
+async fn contains_match_kind_stays_case_insensitive_substring() {
+    let plugin = Waf::new(&json!({
+        "include_default_rules": false,
+        "custom_rules": [{
+            "id": "CUSTOM-CONTAINS",
+            "name": "contains marker",
+            "category": "custom",
+            "severity": "high",
+            "target": "body_text",
+            "match_kind": "contains",
+            "pattern": "EVIL-LITERAL",
+            "action": "enforce"
+        }]
+    }))
+    .unwrap();
+
+    let mut folded_ctx = ctx("POST", "/custom");
+    folded_ctx
+        .headers
+        .insert("content-type".into(), "text/plain".into());
+    let folded_headers = folded_ctx.headers.clone();
+    let folded_result = plugin
+        .on_final_request_body_with_context(&mut folded_ctx, &folded_headers, b"evil-literal")
+        .await;
+    assert!(matches!(folded_result, PluginResult::Reject { .. }));
+    assert_eq!(
+        folded_ctx.metadata.get("waf.rule_hits").map(String::as_str),
+        Some("CUSTOM-CONTAINS")
+    );
+}
+
+#[tokio::test]
+async fn regex_match_kind_honors_explicit_case_insensitive_flag() {
+    let plugin = Waf::new(&json!({
+        "include_default_rules": false,
+        "custom_rules": [{
+            "id": "CUSTOM-REGEX-I",
+            "name": "folded regex marker",
+            "category": "custom",
+            "severity": "high",
+            "target": "body_text",
+            "match_kind": "regex",
+            "pattern": "(?i)EVIL-LITERAL",
+            "action": "enforce"
+        }]
+    }))
+    .unwrap();
+
+    let mut folded_ctx = ctx("POST", "/custom");
+    folded_ctx
+        .headers
+        .insert("content-type".into(), "text/plain".into());
+    let folded_headers = folded_ctx.headers.clone();
+    let folded_result = plugin
+        .on_final_request_body_with_context(&mut folded_ctx, &folded_headers, b"evil-literal")
+        .await;
+    assert!(matches!(folded_result, PluginResult::Reject { .. }));
+    assert_eq!(
+        folded_ctx.metadata.get("waf.rule_hits").map(String::as_str),
+        Some("CUSTOM-REGEX-I")
     );
 }
 
@@ -1876,6 +2063,399 @@ async fn plus_encoded_query_space_is_detected_by_query_value_rules() {
             .get("waf.first_blocking_rule")
             .map(String::as_str),
         Some("FE-SQLI-001")
+    );
+}
+
+fn pathtrav_lfi_enforced_waf() -> Waf {
+    Waf::new(&json!({
+        "mode": "enforce",
+        "rule_modes": {
+            "FE-PATHTRAV-001": "enforce",
+            "FE-PATHTRAV-002": "enforce",
+            "FE-LFI-001": "enforce"
+        }
+    }))
+    .unwrap()
+}
+
+#[tokio::test]
+async fn query_encoded_slash_cannot_bypass_path_traversal_or_lfi() {
+    // Built-in FullUrl PATHTRAV/LFI signatures historically scanned the raw
+    // query, so `%2e` could still match the encoded-dot rule while `%2f` never
+    // became `/`. Their compile-time canonical query-value mirror decodes `%2f`
+    // (unlike path canonicalization) without rewriting forwarded bytes.
+    let plugin = pathtrav_lfi_enforced_waf();
+
+    struct Case {
+        query: &'static str,
+        expect_pathtrav: bool,
+        expect_lfi: bool,
+    }
+
+    let cases = [
+        Case {
+            query: "file=../../../etc/passwd",
+            expect_pathtrav: true,
+            expect_lfi: true,
+        },
+        Case {
+            query: "file=/etc/passwd",
+            expect_pathtrav: false,
+            expect_lfi: true,
+        },
+        Case {
+            query: "file=..%2f..%2f..%2fetc/passwd",
+            expect_pathtrav: true,
+            expect_lfi: true,
+        },
+        Case {
+            query: "file=..%2F..%2F..%2Fetc/passwd",
+            expect_pathtrav: true,
+            expect_lfi: true,
+        },
+        Case {
+            query: "file=..%2fetc%2Fpasswd",
+            expect_pathtrav: true,
+            expect_lfi: true,
+        },
+        Case {
+            query: "file=%2e%2e/%2e%2e/%2e%2e/etc/passwd",
+            expect_pathtrav: true,
+            expect_lfi: true,
+        },
+        Case {
+            query: "file=%2E%2E%2F%2E%2E%2F%2E%2E%2Fetc%2Fpasswd",
+            expect_pathtrav: true,
+            expect_lfi: true,
+        },
+        Case {
+            query: "file=%2e%2e%2fetc%2fpasswd",
+            expect_pathtrav: true,
+            expect_lfi: true,
+        },
+        Case {
+            query: "file=%2e%2E%2fetc%2Fpasswd",
+            expect_pathtrav: true,
+            expect_lfi: true,
+        },
+        Case {
+            query: "file=%2Fetc%2Fpasswd",
+            expect_pathtrav: false,
+            expect_lfi: true,
+        },
+        Case {
+            query: "file=%2fetc%2fpasswd",
+            expect_pathtrav: false,
+            expect_lfi: true,
+        },
+        Case {
+            query: "file=%252e%252e%252fetc%252fpasswd",
+            expect_pathtrav: true,
+            expect_lfi: true,
+        },
+        Case {
+            query: "file=%252Fetc%252Fpasswd",
+            expect_pathtrav: false,
+            expect_lfi: true,
+        },
+        Case {
+            query: "file=%252fetc%252fpasswd",
+            expect_pathtrav: false,
+            expect_lfi: true,
+        },
+        Case {
+            query: "file=%25252Fetc%25252Fpasswd",
+            expect_pathtrav: false,
+            expect_lfi: true,
+        },
+    ];
+
+    for case in cases {
+        let mut req = ctx("GET", "/w/rec");
+        req.set_raw_query_string(case.query.into());
+
+        let result = plugin.authorize(&mut req).await;
+        match result {
+            PluginResult::Reject { status_code, .. } => {
+                assert_eq!(status_code, 403, "status for {}", case.query)
+            }
+            other => panic!("expected reject for {}, got {other:?}", case.query),
+        }
+        if case.expect_pathtrav {
+            assert!(
+                monitored(&req, "FE-PATHTRAV-001") || monitored(&req, "FE-PATHTRAV-002"),
+                "expected PATHTRAV hit for {}, hits={:?}",
+                case.query,
+                req.metadata.get("waf.rule_hits")
+            );
+        } else {
+            assert!(
+                !monitored(&req, "FE-PATHTRAV-001") && !monitored(&req, "FE-PATHTRAV-002"),
+                "unexpected PATHTRAV hit for {}, hits={:?}",
+                case.query,
+                req.metadata.get("waf.rule_hits")
+            );
+        }
+        if case.expect_lfi {
+            assert!(
+                monitored(&req, "FE-LFI-001"),
+                "expected LFI hit for {}, hits={:?}",
+                case.query,
+                req.metadata.get("waf.rule_hits")
+            );
+        }
+        assert_eq!(
+            req.raw_query_string(),
+            Some(case.query),
+            "inspection must not rewrite forwarded query bytes"
+        );
+    }
+}
+
+#[tokio::test]
+async fn query_malformed_percent_plus_and_benign_literals_are_not_traversal() {
+    let plugin = pathtrav_lfi_enforced_waf();
+    for query in [
+        "file=..%2",
+        "file=..%2Getc",
+        "file=..%zz",
+        "q=100% sure",
+        "q=SAVE50%25",
+        "q=hello+world",
+        "file=%2fhome%2fuser",
+        "q=%2f",
+        // Four percent layers is past the documented 3-round cap, so LFI must
+        // not see `/etc/passwd` (and PATHTRAV must not be synthesized either).
+        "file=%2525252Fetc%2525252Fpasswd",
+    ] {
+        let mut req = ctx("GET", "/w/rec");
+        req.set_raw_query_string(query.into());
+        let result = plugin.authorize(&mut req).await;
+        assert!(
+            matches!(result, PluginResult::Continue),
+            "expected continue for {query}, got {result:?}"
+        );
+        assert!(
+            !monitored(&req, "FE-PATHTRAV-001")
+                && !monitored(&req, "FE-PATHTRAV-002")
+                && !monitored(&req, "FE-LFI-001"),
+            "benign/malformed query {query} must not hit PATHTRAV/LFI, hits={:?}",
+            req.metadata.get("waf.rule_hits")
+        );
+        assert_eq!(req.raw_query_string(), Some(query));
+    }
+}
+
+#[tokio::test]
+async fn query_xss_percent_decode_is_unchanged() {
+    let plugin = Waf::new(&json!({
+        "mode": "enforce",
+        "rule_modes": { "FE-XSS-001": "enforce" }
+    }))
+    .unwrap();
+    let mut req = ctx("GET", "/search");
+    req.set_raw_query_string("q=%3Cscript%3Ealert(1)%3C/script%3E".into());
+
+    let result = plugin.authorize(&mut req).await;
+    match result {
+        PluginResult::Reject { status_code, .. } => assert_eq!(status_code, 403),
+        other => panic!("expected XSS reject, got {other:?}"),
+    }
+    assert_eq!(
+        req.metadata
+            .get("waf.first_blocking_rule")
+            .map(String::as_str),
+        Some("FE-XSS-001")
+    );
+}
+
+#[tokio::test]
+async fn encoded_ampersand_does_not_smuggle_an_extra_query_key() {
+    let plugin = Waf::new(&json!({
+        "include_default_rules": false,
+        "mode": "enforce",
+        "custom_rules": [{
+            "id": "CUSTOM-SMUGGLE-KEY",
+            "name": "smuggled key",
+            "category": "custom",
+            "severity": "high",
+            "target": "query_keys",
+            "pattern": "^smuggled$",
+            "action": "enforce"
+        }]
+    }))
+    .unwrap();
+
+    let mut smuggled = ctx("GET", "/search");
+    smuggled.set_raw_query_string("q=ok%26smuggled=1".into());
+    let result = plugin.authorize(&mut smuggled).await;
+    assert!(
+        matches!(result, PluginResult::Continue),
+        "encoded '&' inside a value must not become a second pair, got {result:?}"
+    );
+
+    let mut real = ctx("GET", "/search");
+    real.set_raw_query_string("smuggled=1".into());
+    let result = plugin.authorize(&mut real).await;
+    match result {
+        PluginResult::Reject { status_code, .. } => assert_eq!(status_code, 403),
+        other => panic!("literal smuggled key must still match, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn h3_style_raw_query_params_still_decode_slash_for_lfi() {
+    let plugin = pathtrav_lfi_enforced_waf();
+    let mut req = ctx("GET", "/w/rec");
+    req.query_params
+        .insert("file".into(), "%2Fetc%2Fpasswd".into());
+
+    let result = plugin.authorize(&mut req).await;
+    match result {
+        PluginResult::Reject { status_code, .. } => assert_eq!(status_code, 403),
+        other => panic!("expected LFI reject on raw materialized value, got {other:?}"),
+    }
+    assert!(monitored(&req, "FE-LFI-001"));
+}
+
+fn custom_full_url_waf(id: &str, category: &str, pattern: &str) -> Waf {
+    Waf::new(&json!({
+        "include_default_rules": false,
+        "mode": "enforce",
+        "custom_rules": [{
+            "id": id,
+            "name": id,
+            "category": category,
+            "severity": "high",
+            "target": "full_url",
+            "pattern": pattern,
+            "action": "enforce"
+        }]
+    }))
+    .unwrap()
+}
+
+#[tokio::test]
+async fn builtin_fullurl_pathtrav_lfi_still_catch_encoded_query_slash() {
+    let plugin = pathtrav_lfi_enforced_waf();
+
+    let mut trav = ctx("GET", "/w/rec");
+    trav.set_raw_query_string("file=..%2fetc%2Fpasswd".into());
+    let result = plugin.authorize(&mut trav).await;
+    match result {
+        PluginResult::Reject { status_code, .. } => assert_eq!(status_code, 403),
+        other => panic!("expected built-in PATHTRAV reject, got {other:?}"),
+    }
+    assert!(
+        monitored(&trav, "FE-PATHTRAV-001") || monitored(&trav, "FE-PATHTRAV-002"),
+        "built-in PATHTRAV must still see decoded `%2f`, hits={:?}",
+        trav.metadata.get("waf.rule_hits")
+    );
+    assert_eq!(trav.raw_query_string(), Some("file=..%2fetc%2Fpasswd"));
+
+    let mut lfi = ctx("GET", "/w/rec");
+    lfi.set_raw_query_string("file=%2Fetc%2Fpasswd".into());
+    let result = plugin.authorize(&mut lfi).await;
+    match result {
+        PluginResult::Reject { status_code, .. } => assert_eq!(status_code, 403),
+        other => panic!("expected built-in LFI reject, got {other:?}"),
+    }
+    assert!(monitored(&lfi, "FE-LFI-001"));
+    assert_eq!(lfi.raw_query_string(), Some("file=%2Fetc%2Fpasswd"));
+}
+
+#[tokio::test]
+async fn custom_fullurl_lfi_or_path_traversal_category_does_not_mirror_canonical_query() {
+    // A custom FullUrl rule merely labeled `lfi` / `path_traversal` must not
+    // inherit the built-in pack's decoded query-value mirror. Category is
+    // operator-facing metadata; the declared target stays `full_url`.
+    for category in ["lfi", "path_traversal"] {
+        let lfi_plugin = custom_full_url_waf(
+            "CUSTOM-FULLURL-LFI",
+            category,
+            r"(?i)(?:/etc/passwd|/proc/self/|c:\\windows\\|php://filter|expect://|file:///)",
+        );
+        let mut encoded_lfi = ctx("GET", "/w/rec");
+        encoded_lfi.set_raw_query_string("file=%2Fetc%2Fpasswd".into());
+        let result = lfi_plugin.authorize(&mut encoded_lfi).await;
+        assert!(
+            matches!(result, PluginResult::Continue),
+            "custom FullUrl labeled {category} must not decode `%2f`, got {result:?}"
+        );
+        assert!(
+            !monitored(&encoded_lfi, "CUSTOM-FULLURL-LFI"),
+            "undeclared canonical-query mirror for category={category}, hits={:?}",
+            encoded_lfi.metadata.get("waf.rule_hits")
+        );
+        assert_eq!(encoded_lfi.raw_query_string(), Some("file=%2Fetc%2Fpasswd"));
+
+        let trav_plugin = custom_full_url_waf("CUSTOM-FULLURL-TRAV", category, r"(?:\.\./|\.\.\\)");
+        let mut encoded_trav = ctx("GET", "/w/rec");
+        encoded_trav.set_raw_query_string("file=..%2fetc%2Fpasswd".into());
+        let result = trav_plugin.authorize(&mut encoded_trav).await;
+        assert!(
+            matches!(result, PluginResult::Continue),
+            "custom FullUrl labeled {category} must not decode `%2f`, got {result:?}"
+        );
+        assert!(!monitored(&encoded_trav, "CUSTOM-FULLURL-TRAV"));
+        assert_eq!(
+            encoded_trav.raw_query_string(),
+            Some("file=..%2fetc%2Fpasswd")
+        );
+    }
+}
+
+#[tokio::test]
+async fn changing_waf_rule_category_cannot_alter_scan_targets() {
+    let encoded_query = "file=%2Fetc%2Fpasswd";
+    let literal_query = "file=/etc/passwd";
+    let pattern = r"(?i)/etc/passwd";
+    let mut encoded_outcomes = Vec::new();
+    let mut literal_outcomes = Vec::new();
+
+    for category in ["lfi", "path_traversal", "custom", "encoding_evasion"] {
+        let plugin = custom_full_url_waf("CUSTOM-FULLURL", category, pattern);
+
+        let mut encoded = ctx("GET", "/w/rec");
+        encoded.set_raw_query_string(encoded_query.into());
+        let encoded_result = plugin.authorize(&mut encoded).await;
+        let encoded_hit = monitored(&encoded, "CUSTOM-FULLURL");
+        encoded_outcomes.push((
+            matches!(encoded_result, PluginResult::Reject { .. }),
+            encoded_hit,
+        ));
+        assert!(
+            !encoded_hit,
+            "encoded `%2f` must not match declared FullUrl for category={category}"
+        );
+        assert_eq!(encoded.raw_query_string(), Some(encoded_query));
+
+        let mut literal = ctx("GET", "/w/rec");
+        literal.set_raw_query_string(literal_query.into());
+        let literal_result = plugin.authorize(&mut literal).await;
+        let literal_hit = monitored(&literal, "CUSTOM-FULLURL");
+        literal_outcomes.push((
+            matches!(literal_result, PluginResult::Reject { .. }),
+            literal_hit,
+        ));
+        assert!(
+            literal_hit,
+            "literal `/etc/passwd` must still match declared FullUrl for category={category}"
+        );
+        match literal_result {
+            PluginResult::Reject { status_code, .. } => assert_eq!(status_code, 403),
+            other => panic!("expected literal FullUrl reject for {category}, got {other:?}"),
+        }
+        assert_eq!(literal.raw_query_string(), Some(literal_query));
+    }
+
+    assert!(
+        encoded_outcomes.windows(2).all(|pair| pair[0] == pair[1]),
+        "encoded outcomes must be identical across categories: {encoded_outcomes:?}"
+    );
+    assert!(
+        literal_outcomes.windows(2).all(|pair| pair[0] == pair[1]),
+        "literal outcomes must be identical across categories: {literal_outcomes:?}"
     );
 }
 
@@ -2407,7 +2987,7 @@ fn monitored(ctx: &RequestContext, rule_id: &str) -> bool {
 
 #[tokio::test]
 async fn jndi_log4shell_detected_in_header_query_and_body() {
-    let plugin = Waf::new(&json!({})).unwrap();
+    let plugin = Waf::new(&json!({ "mode": "monitor" })).unwrap();
 
     // Header delivery — the original rule pack never scanned header values
     // for injection payloads, the primary Log4Shell channel.
@@ -2442,7 +3022,7 @@ async fn jndi_log4shell_detected_in_header_query_and_body() {
 
 #[tokio::test]
 async fn prototype_pollution_and_spring4shell_detected_in_body() {
-    let plugin = Waf::new(&json!({})).unwrap();
+    let plugin = Waf::new(&json!({ "mode": "monitor" })).unwrap();
 
     let mut proto_ctx = ctx("POST", "/submit");
     proto_ctx
@@ -2476,7 +3056,7 @@ async fn prototype_pollution_and_spring4shell_detected_in_body() {
 
 #[tokio::test]
 async fn xss_and_traversal_now_covered_in_request_body() {
-    let plugin = Waf::new(&json!({})).unwrap();
+    let plugin = Waf::new(&json!({ "mode": "monitor" })).unwrap();
 
     let mut xss_ctx = ctx("POST", "/submit");
     xss_ctx
@@ -2510,7 +3090,7 @@ async fn xss_and_traversal_now_covered_in_request_body() {
 
 #[tokio::test]
 async fn ssti_arithmetic_probe_fires_but_plain_template_does_not_at_default_paranoia() {
-    let plugin = Waf::new(&json!({})).unwrap();
+    let plugin = Waf::new(&json!({ "mode": "monitor" })).unwrap();
 
     let mut probe_ctx = ctx("POST", "/submit");
     probe_ctx
@@ -2541,7 +3121,7 @@ async fn ssti_arithmetic_probe_fires_but_plain_template_does_not_at_default_para
 
 #[tokio::test]
 async fn retuned_loud_rules_are_silent_at_default_paranoia() {
-    let plugin = Waf::new(&json!({})).unwrap();
+    let plugin = Waf::new(&json!({ "mode": "monitor" })).unwrap();
 
     // Hex color `#fff` previously tripped the SQL-comment-token rule
     // (FE-SQLI-004), now gated to paranoia_level >= 2.
@@ -2559,11 +3139,139 @@ async fn retuned_loud_rules_are_silent_at_default_paranoia() {
 
 #[tokio::test]
 async fn raised_paranoia_level_reactivates_retuned_rules() {
-    let plugin = Waf::new(&json!({ "paranoia_level": 2 })).unwrap();
+    let plugin = Waf::new(&json!({ "mode": "monitor", "paranoia_level": 2 })).unwrap();
     let mut url_ctx = ctx("GET", "/redirect");
     url_ctx.set_raw_query_string("next=https://example.com/path".into());
     let _ = plugin.authorize(&mut url_ctx).await;
     assert!(monitored(&url_ctx, "FE-RFI-001"));
+}
+
+#[test]
+fn enforce_mode_rejects_monitor_only_default_ruleset() {
+    let err = Waf::new(&json!({
+        "mode": "enforce",
+        "include_default_rules": true
+    }))
+    .unwrap_err();
+    assert!(err.contains("no enabled enforcement path"));
+    assert!(err.contains("default_rule_action"));
+    assert!(err.contains("rule_modes"));
+    let shared = ferrum_edge::plugins::validate_plugin_config(
+        "waf",
+        &json!({
+            "mode": "enforce",
+            "include_default_rules": true
+        }),
+    )
+    .unwrap_err();
+    assert!(shared.contains("no enabled enforcement path"));
+}
+
+#[test]
+fn monitor_mode_allows_monitor_only_default_ruleset() {
+    Waf::new(&json!({
+        "mode": "monitor",
+        "include_default_rules": true
+    }))
+    .unwrap();
+}
+
+#[test]
+fn enforce_mode_allows_default_rule_action_enforce() {
+    Waf::new(&json!({
+        "mode": "enforce",
+        "default_rule_action": "enforce"
+    }))
+    .unwrap();
+}
+
+#[test]
+fn enforce_mode_allows_rule_modes_opt_in() {
+    Waf::new(&json!({
+        "mode": "enforce",
+        "rule_modes": { "FE-XSS-001": "enforce" }
+    }))
+    .unwrap();
+}
+
+#[test]
+fn enforce_mode_rejects_when_only_enforce_rule_is_disabled() {
+    let err = Waf::new(&json!({
+        "mode": "enforce",
+        "rule_modes": { "FE-XSS-001": "enforce" },
+        "disabled_default_rules": ["FE-XSS-001"]
+    }))
+    .unwrap_err();
+    assert!(err.contains("no rule with action 'enforce'"));
+}
+
+#[test]
+fn enforce_mode_allows_scoring_without_enforce_rules() {
+    Waf::new(&json!({
+        "mode": "enforce",
+        "scoring": { "enabled": true, "block_threshold": 5 }
+    }))
+    .unwrap();
+}
+
+#[test]
+fn enforce_mode_rejects_scoring_without_an_inspected_http_rule() {
+    let err = Waf::new(&json!({
+        "mode": "enforce",
+        "include_default_rules": false,
+        "scoring": { "enabled": true, "block_threshold": 5 },
+        "stream": {
+            "inspect_tcp": false,
+            "inspect_udp": false,
+            "inspect_response": false,
+            "signatures": [{
+                "id": "STREAM-MONITOR",
+                "pattern": "marker",
+                "action": "monitor"
+            }]
+        }
+    }))
+    .unwrap_err();
+    assert!(err.contains("no enabled enforcement path"));
+}
+
+#[test]
+fn enforce_mode_rejects_rule_on_a_disabled_response_surface() {
+    let err = Waf::new(&json!({
+        "mode": "enforce",
+        "include_default_rules": false,
+        "response_inspection": false,
+        "custom_rules": [{
+            "id": "RESPONSE-ONLY",
+            "category": "custom",
+            "target": "response_headers",
+            "pattern": "secret",
+            "match_kind": "contains",
+            "action": "enforce"
+        }]
+    }))
+    .unwrap_err();
+    assert!(err.contains("no enabled enforcement path"));
+}
+
+#[test]
+fn enforce_mode_rejects_unreachable_stream_enforce_signature() {
+    let err = Waf::new(&json!({
+        "mode": "enforce",
+        "include_default_rules": false,
+        "stream": {
+            "inspect_tcp": false,
+            "inspect_udp": false,
+            "inspect_response": false,
+            "signatures": [{
+                "id": "STREAM-ENFORCE",
+                "pattern": "marker",
+                "action": "enforce"
+            }]
+        }
+    }))
+    .unwrap_err();
+    assert!(err.contains("no enabled enforcement path"));
 }
 
 #[tokio::test]
@@ -2609,6 +3317,111 @@ async fn default_rule_action_enforce_monitors_when_global_mode_is_monitor() {
     assert!(!ctx.metadata.contains_key("waf.first_blocking_rule"));
 }
 
+fn assert_waf_stdout_hit_action(logs: &str, effective: &str, configured: &str) {
+    assert!(
+        logs.contains(&format!("action={effective}")),
+        "expected effective action={effective} in logs: {logs}"
+    );
+    assert!(
+        logs.contains(&format!("rule_action={configured}")),
+        "expected configured rule_action={configured} in logs: {logs}"
+    );
+    assert!(
+        !logs
+            .split_whitespace()
+            .any(|field| field.trim_end_matches(',') == "action=block"),
+        "must not log the legacy exact action=block field: {logs}"
+    );
+}
+
+#[tokio::test]
+async fn log_to_stdout_monitor_mode_logs_monitored_effective_action() {
+    let (logs, guard) = super::plugin_utils::capture_logs();
+    let plugin = Waf::new(&json!({
+        "mode": "monitor",
+        "default_rule_action": "enforce",
+        "log_to_stdout": true
+    }))
+    .unwrap();
+    let mut ctx = ctx("GET", "/search");
+    ctx.set_raw_query_string("q=%27%20OR%201%3D1".into());
+
+    let result = plugin.authorize(&mut ctx).await;
+    drop(guard);
+
+    assert!(matches!(result, PluginResult::Continue));
+    assert_eq!(
+        ctx.metadata.get("waf.action").map(String::as_str),
+        Some("monitored")
+    );
+    let captured = logs.contents();
+    assert!(
+        captured.contains("WAF rule matched"),
+        "expected per-hit warning: {captured}"
+    );
+    assert_waf_stdout_hit_action(&captured, "monitored", "enforce");
+}
+
+#[tokio::test]
+async fn log_to_stdout_enforce_mode_logs_blocked_effective_action() {
+    let (logs, guard) = super::plugin_utils::capture_logs();
+    let plugin = Waf::new(&json!({
+        "rule_modes": { "FE-SQLI-002": "enforce" },
+        "log_to_stdout": true
+    }))
+    .unwrap();
+    let mut ctx = ctx("GET", "/search");
+    ctx.set_raw_query_string("q=%27%20OR%201%3D1".into());
+
+    let result = plugin.authorize(&mut ctx).await;
+    drop(guard);
+
+    assert!(matches!(result, PluginResult::Reject { .. }));
+    assert_eq!(
+        ctx.metadata.get("waf.action").map(String::as_str),
+        Some("blocked")
+    );
+    let captured = logs.contents();
+    assert!(
+        captured.contains("WAF rule matched"),
+        "expected per-hit warning: {captured}"
+    );
+    assert_waf_stdout_hit_action(&captured, "blocked", "enforce");
+}
+
+#[tokio::test]
+async fn log_to_stdout_stream_monitor_mode_logs_monitored_effective_action() {
+    let (logs, guard) = super::plugin_utils::capture_logs();
+    let plugin = Waf::new(&json!({
+        "mode": "monitor",
+        "include_default_rules": false,
+        "log_to_stdout": true,
+        "stream": {
+            "signatures": [{
+                "id": "STREAM-SQLI-1",
+                "pattern": "(?i)union\\s+select",
+                "severity": "high",
+                "action": "enforce"
+            }]
+        }
+    }))
+    .unwrap();
+    let mut sctx = stream_ctx(b"id=1 union select 1", StreamBytesKind::PlaintextWire);
+
+    let result = plugin.on_stream_connect(&mut sctx).await;
+    drop(guard);
+
+    assert!(matches!(result, PluginResult::Continue));
+    let md = sctx.metadata.as_ref().expect("metadata set on monitor");
+    assert_eq!(md.get("waf.action").map(String::as_str), Some("monitored"));
+    let captured = logs.contents();
+    assert!(
+        captured.contains("WAF stream signature matched"),
+        "expected per-hit stream warning: {captured}"
+    );
+    assert_waf_stdout_hit_action(&captured, "monitored", "enforce");
+}
+
 #[tokio::test]
 async fn rule_modes_still_overrides_default_rule_action() {
     let plugin = Waf::new(&json!({
@@ -2626,6 +3439,254 @@ async fn rule_modes_still_overrides_default_rule_action() {
     assert_eq!(
         ctx.metadata.get("waf.action").map(String::as_str),
         Some("monitored")
+    );
+}
+
+fn bulk_enforce_waf() -> Waf {
+    Waf::new(&json!({
+        "mode": "enforce",
+        "default_rule_action": "enforce",
+        "paranoia_level": 1
+    }))
+    .unwrap()
+}
+
+async fn scan_form_body(plugin: &Waf, body: &[u8]) -> (PluginResult, RequestContext) {
+    let mut ctx = ctx("POST", "/w/encoding");
+    ctx.headers.insert(
+        "content-type".into(),
+        "application/x-www-form-urlencoded".into(),
+    );
+    let headers = ctx.headers.clone();
+    let result = plugin
+        .on_final_request_body_with_context(&mut ctx, &headers, body)
+        .await;
+    (result, ctx)
+}
+
+fn assert_encoding_monitored(result: &PluginResult, ctx: &RequestContext, rule_id: &str) {
+    assert!(
+        matches!(result, PluginResult::Continue),
+        "expected continue for {rule_id}, got {result:?}"
+    );
+    assert!(
+        monitored(ctx, rule_id),
+        "expected {rule_id} in {:?}",
+        ctx.metadata.get("waf.rule_hits")
+    );
+    assert_eq!(
+        ctx.metadata.get("waf.action").map(String::as_str),
+        Some("monitored")
+    );
+    assert!(!ctx.metadata.contains_key("waf.first_blocking_rule"));
+}
+
+#[tokio::test]
+async fn default_posture_monitors_encoding_heuristics() {
+    let plugin = Waf::new(&json!({ "mode": "enforce" })).unwrap();
+    let (result, ctx) = scan_form_body(&plugin, b"code=SAVE50%25").await;
+    assert_encoding_monitored(&result, &ctx, "FE-ENCODING-001");
+}
+
+#[tokio::test]
+async fn bulk_enforce_monitors_benign_save50_percent_body() {
+    let plugin = bulk_enforce_waf();
+    let (result, ctx) = scan_form_body(&plugin, b"code=SAVE50%25").await;
+    assert_encoding_monitored(&result, &ctx, "FE-ENCODING-001");
+}
+
+#[tokio::test]
+async fn bulk_enforce_monitors_save50_percent_query() {
+    let plugin = bulk_enforce_waf();
+    let mut ctx = ctx("GET", "/w/encoding");
+    ctx.set_raw_query_string("code=SAVE50%25".into());
+    let result = plugin.authorize(&mut ctx).await;
+    assert_encoding_monitored(&result, &ctx, "FE-ENCODING-001");
+}
+
+#[tokio::test]
+async fn bulk_enforce_monitors_null_byte_encoding() {
+    let plugin = bulk_enforce_waf();
+    let (result, ctx) = scan_form_body(&plugin, b"foo%00bar").await;
+    assert_encoding_monitored(&result, &ctx, "FE-ENCODING-001");
+}
+
+#[tokio::test]
+async fn bulk_enforce_monitors_overlong_utf8_encoding() {
+    let plugin = bulk_enforce_waf();
+    let (result, ctx) = scan_form_body(&plugin, b"foo%c0%aebar").await;
+    assert_encoding_monitored(&result, &ctx, "FE-ENCODING-002");
+}
+
+#[tokio::test]
+async fn rule_modes_promotes_encoding_double_encode_to_enforce() {
+    let plugin = Waf::new(&json!({
+        "mode": "enforce",
+        "default_rule_action": "enforce",
+        "rule_modes": { "FE-ENCODING-001": "enforce" }
+    }))
+    .unwrap();
+    let (result, ctx) = scan_form_body(&plugin, b"code=SAVE50%25").await;
+    assert!(matches!(result, PluginResult::Reject { .. }));
+    assert_eq!(
+        ctx.metadata.get("waf.action").map(String::as_str),
+        Some("blocked")
+    );
+    assert_eq!(
+        ctx.metadata
+            .get("waf.first_blocking_rule")
+            .map(String::as_str),
+        Some("FE-ENCODING-001")
+    );
+}
+
+#[tokio::test]
+async fn rule_modes_promotes_encoding_overlong_to_enforce() {
+    let plugin = Waf::new(&json!({
+        "mode": "enforce",
+        "default_rule_action": "enforce",
+        "rule_modes": { "FE-ENCODING-002": "enforce" }
+    }))
+    .unwrap();
+    let (overlong, overlong_ctx) = scan_form_body(&plugin, b"foo%c0%aebar").await;
+    assert!(matches!(overlong, PluginResult::Reject { .. }));
+    assert_eq!(
+        overlong_ctx
+            .metadata
+            .get("waf.first_blocking_rule")
+            .map(String::as_str),
+        Some("FE-ENCODING-002")
+    );
+
+    let (coupon, coupon_ctx) = scan_form_body(&plugin, b"code=SAVE50%25").await;
+    assert_encoding_monitored(&coupon, &coupon_ctx, "FE-ENCODING-001");
+}
+
+#[tokio::test]
+async fn rule_override_action_promotes_encoding_to_enforce() {
+    let plugin = Waf::new(&json!({
+        "mode": "enforce",
+        "default_rule_action": "enforce",
+        "rule_overrides": { "FE-ENCODING-001": { "action": "enforce" } }
+    }))
+    .unwrap();
+    let (result, ctx) = scan_form_body(&plugin, b"foo%00bar").await;
+    assert!(matches!(result, PluginResult::Reject { .. }));
+    assert_eq!(
+        ctx.metadata
+            .get("waf.first_blocking_rule")
+            .map(String::as_str),
+        Some("FE-ENCODING-001")
+    );
+}
+
+#[tokio::test]
+async fn rule_modes_can_disable_encoding_heuristic() {
+    let plugin = Waf::new(&json!({
+        "mode": "enforce",
+        "default_rule_action": "enforce",
+        "rule_modes": { "FE-ENCODING-001": "disabled" }
+    }))
+    .unwrap();
+    let (result, ctx) = scan_form_body(&plugin, b"code=SAVE50%25").await;
+    assert!(matches!(result, PluginResult::Continue));
+    assert!(
+        ctx.metadata
+            .get("waf.rule_hits")
+            .is_none_or(|hits| !hits.split(',').any(|hit| hit == "FE-ENCODING-001")),
+        "disabled FE-ENCODING-001 must not record a hit, got {:?}",
+        ctx.metadata.get("waf.rule_hits")
+    );
+    assert!(!ctx.metadata.contains_key("waf.first_blocking_rule"));
+}
+
+#[tokio::test]
+async fn bulk_disabled_still_drops_encoding_heuristics() {
+    let plugin = Waf::new(&json!({
+        "mode": "enforce",
+        "default_rule_action": "disabled",
+        "rule_modes": { "FE-SQLI-001": "enforce" }
+    }))
+    .unwrap();
+    let (encoding, encoding_ctx) = scan_form_body(&plugin, b"code=SAVE50%25").await;
+    assert!(matches!(encoding, PluginResult::Continue));
+    assert!(
+        encoding_ctx
+            .metadata
+            .get("waf.rule_hits")
+            .is_none_or(|hits| !hits.contains("FE-ENCODING-001"))
+    );
+
+    let mut sqli = ctx("GET", "/search");
+    sqli.set_raw_query_string("q=union+select+1".into());
+    let result = plugin.authorize(&mut sqli).await;
+    assert!(matches!(result, PluginResult::Reject { .. }));
+    assert_eq!(
+        sqli.metadata
+            .get("waf.first_blocking_rule")
+            .map(String::as_str),
+        Some("FE-SQLI-001")
+    );
+}
+
+#[tokio::test]
+async fn encoding_rule_modes_enforce_monitors_when_global_mode_is_monitor() {
+    let plugin = Waf::new(&json!({
+        "mode": "monitor",
+        "default_rule_action": "enforce",
+        "rule_modes": { "FE-ENCODING-001": "enforce" }
+    }))
+    .unwrap();
+    let (result, ctx) = scan_form_body(&plugin, b"code=SAVE50%25").await;
+    assert_encoding_monitored(&result, &ctx, "FE-ENCODING-001");
+}
+
+#[tokio::test]
+async fn global_disabled_mode_skips_encoding_evaluation() {
+    let plugin = Waf::new(&json!({
+        "mode": "disabled",
+        "default_rule_action": "enforce",
+        "rule_modes": { "FE-ENCODING-001": "enforce" }
+    }))
+    .unwrap();
+    let (result, ctx) = scan_form_body(&plugin, b"code=SAVE50%25").await;
+    assert!(matches!(result, PluginResult::Continue));
+    assert!(!ctx.metadata.contains_key("waf.rule_hits"));
+    assert!(!ctx.metadata.contains_key("waf.first_blocking_rule"));
+}
+
+#[tokio::test]
+async fn bulk_enforce_encoding_hit_scores_as_monitor() {
+    let plugin = Waf::new(&json!({
+        "mode": "enforce",
+        "default_rule_action": "enforce",
+        "scoring": { "enabled": true, "block_threshold": 10 }
+    }))
+    .unwrap();
+    let (result, ctx) = scan_form_body(&plugin, b"code=SAVE50%25").await;
+    assert_encoding_monitored(&result, &ctx, "FE-ENCODING-001");
+    assert_eq!(ctx.metadata.get("waf.score").map(String::as_str), Some("3"));
+    assert_eq!(
+        ctx.metadata.get("waf.block_reason").map(String::as_str),
+        None
+    );
+}
+
+#[tokio::test]
+async fn bulk_enforce_still_blocks_encoded_null_path_traversal() {
+    // Audit: FE-PATHTRAV-003 (`%00` on the URL) inherits bulk enforce. Body
+    // `%00` stays monitor via FE-ENCODING-001; URL `%00` is attack-shaped
+    // path truncation and still blocks under the recommended posture.
+    let plugin = bulk_enforce_waf();
+    let mut ctx = ctx("GET", "/download");
+    ctx.set_raw_query_string("file=foo%00bar".into());
+    let result = plugin.authorize(&mut ctx).await;
+    assert!(matches!(result, PluginResult::Reject { .. }));
+    assert_eq!(
+        ctx.metadata
+            .get("waf.first_blocking_rule")
+            .map(String::as_str),
+        Some("FE-PATHTRAV-003")
     );
 }
 
@@ -2659,6 +3720,7 @@ async fn rule_override_fp_filter_suppresses_special_encoding_rule() {
     let plugin = Waf::new(&json!({
         "mode": "enforce",
         "default_rule_action": "enforce",
+        "rule_modes": { "FE-ENCODING-001": "enforce" },
         "rule_overrides": {
             "FE-ENCODING-001": { "fp_filters": ["known%252fpath"] }
         }
@@ -2979,6 +4041,7 @@ async fn on_body_too_large_block_rejects_when_enforcing() {
     // rather than passed through unscanned.
     let plugin = Waf::new(&json!({
         "mode": "enforce",
+        "default_rule_action": "enforce",
         "max_scan_bytes": 4,
         "on_body_too_large": "block"
     }))
@@ -3204,6 +4267,92 @@ fn scoring_rejects_invalid_or_blank_config_ids() {
         };
         assert!(error.contains("invalid plugin config id"), "{error}");
     }
+}
+
+#[tokio::test]
+async fn scoring_direct_construction_uses_standalone_fallback() {
+    // Direct/test construction has no plugin_configs[].id. Sibling Waf::new
+    // calls must still isolate accumulators under distinct standalone-N labels,
+    // and that fallback must not be used once a configured id is supplied.
+    let first = Waf::new(&json!({
+        "mode": "enforce",
+        "include_default_rules": false,
+        "scoring": { "enabled": true, "block_threshold": 10 },
+        "custom_rules": [{
+            "id": "CUSTOM-A",
+            "category": "custom",
+            "severity": "low",
+            "target": "query_values",
+            "match_kind": "contains",
+            "pattern": "needle",
+            "action": "monitor",
+            "score": 5
+        }]
+    }))
+    .unwrap();
+    let second = Waf::new(&json!({
+        "mode": "enforce",
+        "include_default_rules": false,
+        "scoring": { "enabled": true, "block_threshold": 10 },
+        "custom_rules": [{
+            "id": "CUSTOM-B",
+            "category": "custom",
+            "severity": "low",
+            "target": "query_values",
+            "match_kind": "contains",
+            "pattern": "needle",
+            "action": "monitor",
+            "score": 3
+        }]
+    }))
+    .unwrap();
+    let configured = scoring_instance("pc-configured", "needle", 2, 10);
+
+    let mut ctx = ctx("GET", "/search");
+    ctx.set_raw_query_string("q=needle".into());
+    assert!(matches!(
+        first.authorize(&mut ctx).await,
+        PluginResult::Continue
+    ));
+    assert!(matches!(
+        second.authorize(&mut ctx).await,
+        PluginResult::Continue
+    ));
+    assert!(matches!(
+        configured.authorize(&mut ctx).await,
+        PluginResult::Continue
+    ));
+
+    let standalone_keys: Vec<&str> = ctx
+        .metadata
+        .keys()
+        .filter(|key| key.starts_with("waf.instances.standalone-") && key.ends_with(".score"))
+        .map(String::as_str)
+        .collect();
+    assert_eq!(
+        standalone_keys.len(),
+        2,
+        "two direct Waf::new instances must publish distinct standalone identities, got {standalone_keys:?}"
+    );
+    assert_eq!(
+        ctx.metadata
+            .get("waf.instances.pc-configured.score")
+            .map(String::as_str),
+        Some("2")
+    );
+    let aggregate = ctx
+        .metadata
+        .get("waf.instance_scores")
+        .map(String::as_str)
+        .expect("three contributing instances emit an aggregate");
+    assert!(
+        aggregate.contains("pc-configured=2"),
+        "configured identity must appear beside standalone fallbacks: {aggregate}"
+    );
+    assert!(
+        aggregate.contains("standalone-"),
+        "direct construction must keep the standalone fallback: {aggregate}"
+    );
 }
 
 #[tokio::test]
@@ -3737,7 +4886,7 @@ fn stream_waf_attaches_to_stream_protocols_when_configured() {
 
 #[test]
 fn http_only_waf_does_not_attach_to_stream_protocols() {
-    let plugin = Waf::new(&json!({})).unwrap();
+    let plugin = Waf::new(&json!({ "mode": "monitor" })).unwrap();
     let protocols = plugin.supported_protocols();
     assert!(!protocols.contains(&ProxyProtocol::Tcp));
     assert!(!protocols.contains(&ProxyProtocol::Udp));
@@ -3785,7 +4934,9 @@ fn stream_waf_first_bytes_min_len_only_set_for_tls_shape_guard() {
     assert_eq!(sig_waf("enforce").stream_first_bytes_min_len(), 0);
     // An HTTP-only WAF never captures stream first bytes at all.
     assert_eq!(
-        Waf::new(&json!({})).unwrap().stream_first_bytes_min_len(),
+        Waf::new(&json!({ "mode": "monitor" }))
+            .unwrap()
+            .stream_first_bytes_min_len(),
         0
     );
 }

@@ -69,12 +69,42 @@ pub(super) enum RuleAction {
     Disabled,
 }
 
-impl RuleAction {
-    pub(super) fn as_event_action(self) -> &'static str {
+/// How `default_rule_action` interacts with a rule at compile time.
+///
+/// Resolution is applied once in [`compile_rules`]. The request path only
+/// reads the resulting [`RuleAction`]; it never re-evaluates this policy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum DefaultActionPolicy {
+    /// Apply `default_rule_action` whenever it is set (normal built-ins).
+    Inherit,
+    /// Do not let bulk `default_rule_action: enforce` raise this rule to
+    /// Enforce. The pack-authored Monitor action stays unless an explicit
+    /// per-rule `rule_modes` or `rule_overrides.action` entry promotes it.
+    /// Bulk `monitor` and `disabled` still apply.
+    OptInEnforce,
+}
+
+impl DefaultActionPolicy {
+    fn applies_to(self, bulk: RuleAction) -> bool {
         match self {
-            RuleAction::Enforce => "block",
-            RuleAction::Monitor => "monitor",
-            RuleAction::Disabled => "disabled",
+            Self::Inherit => true,
+            Self::OptInEnforce => bulk != RuleAction::Enforce,
+        }
+    }
+}
+
+impl RuleAction {
+    /// Effective direct per-rule `action` for `log_to_stdout` after applying
+    /// the global mode (`blocked`, `monitored`, `disabled`). A later aggregate
+    /// anomaly-score decision can still block the request even when an
+    /// individual monitor-action hit is logged as `monitored`.
+    pub(super) fn effective_log_action(self, globally_enforcing: bool) -> &'static str {
+        if globally_enforcing && self == RuleAction::Enforce {
+            "blocked"
+        } else if self == RuleAction::Disabled {
+            "disabled"
+        } else {
+            "monitored"
         }
     }
 }
@@ -239,6 +269,21 @@ impl CompiledConditions {
     }
 }
 
+/// Pack-internal extra scan target folded at rule compilation.
+///
+/// Operator-facing `category` is metadata and must not select this. Custom
+/// rules and ordinary built-ins stay [`Self::None`]. Only the built-in FullUrl
+/// FE-PATHTRAV / FE-LFI signatures set [`Self::CanonicalQueryValues`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(super) enum QueryScanMirror {
+    #[default]
+    None,
+    /// Also evaluate this FullUrl rule against canonical query-value views
+    /// (bounded percent-decode including `%2f`). Request-path cost is unchanged:
+    /// those views already exist for `query_values`.
+    CanonicalQueryValues,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct WafRule {
     pub(super) id: String,
@@ -250,11 +295,16 @@ pub(super) struct WafRule {
     pub(super) pattern: String,
     pub(super) conditions: Option<Conditions>,
     pub(super) action: RuleAction,
+    /// Compile-time interaction with `default_rule_action`. Not consulted on
+    /// the request path; [`compile_rules`] folds it into `action`.
+    pub(super) default_action_policy: DefaultActionPolicy,
     pub(super) fp_filters: Vec<String>,
     pub(super) paranoia_min: u8,
     /// Anomaly-score contribution when scoring is enabled. `None` falls back to
     /// the configured per-severity weight.
     pub(super) score: Option<u32>,
+    /// Pack-internal compile-time mirror. Never parsed from custom-rule JSON.
+    pub(super) query_scan_mirror: QueryScanMirror,
 }
 
 #[derive(Debug)]
@@ -342,6 +392,11 @@ pub(super) struct CompiledRules {
     pub(super) header_values: Option<TextRuleSet>,
     pub(super) query_keys: Option<TextRuleSet>,
     pub(super) query_values: Option<TextRuleSet>,
+    /// FullUrl rules that opted into [`QueryScanMirror::CanonicalQueryValues`]
+    /// at compile time, evaluated against canonical (percent-decoded, including
+    /// `%2f`) query values. Same rule ids as the raw `full_url` set; hits are
+    /// deduped by `rule_index`. Not selected by operator-facing `category`.
+    pub(super) canonical_query_values: Option<TextRuleSet>,
     pub(super) cookies: Option<TextRuleSet>,
     pub(super) url_path: Option<TextRuleSet>,
     pub(super) full_url: Option<TextRuleSet>,
@@ -474,10 +529,12 @@ pub(super) fn compile_rules(
         {
             continue;
         }
-        // Bulk action for built-ins; an explicit per-rule `rule_modes` entry
-        // (applied below) still wins.
-        if is_default && let Some(action) = default_rule_action {
-            rule.action = action;
+        // Bulk + per-rule action resolution is compile-time only. An explicit
+        // `rule_modes` or `rule_overrides.action` entry still wins; OptInEnforce
+        // built-ins skip bulk Enforce so noisy heuristics stay monitor under
+        // the recommended starting posture.
+        if is_default {
+            apply_default_rule_action(&mut rule, default_rule_action);
         }
         if let Some(ov) = rule_overrides.get(&rule.id)
             && let Some(action) = ov.action
@@ -577,6 +634,15 @@ pub(super) fn compile_rules(
     builders.finish(compiled_rules)
 }
 
+fn apply_default_rule_action(rule: &mut WafRule, default_rule_action: Option<RuleAction>) {
+    let Some(bulk) = default_rule_action else {
+        return;
+    };
+    if rule.default_action_policy.applies_to(bulk) {
+        rule.action = bulk;
+    }
+}
+
 fn validate_rule(rule: &WafRule) -> Result<(), String> {
     if rule.id.trim().is_empty() {
         return Err("waf: rule id must be non-empty".to_string());
@@ -608,6 +674,14 @@ fn validate_rule(rule: &WafRule) -> Result<(), String> {
             rule.id
         ));
     }
+    if rule.query_scan_mirror == QueryScanMirror::CanonicalQueryValues
+        && !matches!(rule.target, RuleTarget::FullUrl)
+    {
+        return Err(format!(
+            "waf: rule '{}' canonical query-value mirror is only valid for full_url targets",
+            rule.id
+        ));
+    }
     Ok(())
 }
 
@@ -629,6 +703,7 @@ struct RuleSetBuilders {
     header_values: PatternBuilder,
     query_keys: PatternBuilder,
     query_values: PatternBuilder,
+    canonical_query_values: PatternBuilder,
     cookies: PatternBuilder,
     url_path: PatternBuilder,
     full_url: PatternBuilder,
@@ -703,7 +778,13 @@ impl RuleSetBuilders {
             RuleTarget::QueryValues => self.query_values.push(pattern, rule_ref),
             RuleTarget::Cookies => self.cookies.push(pattern, rule_ref),
             RuleTarget::UrlPath => self.url_path.push(pattern, rule_ref),
-            RuleTarget::FullUrl => self.full_url.push(pattern, rule_ref),
+            RuleTarget::FullUrl => {
+                if rule.query_scan_mirror == QueryScanMirror::CanonicalQueryValues {
+                    self.canonical_query_values
+                        .push(pattern.clone(), rule_ref.clone());
+                }
+                self.full_url.push(pattern, rule_ref);
+            }
             RuleTarget::Method => self.method.push(pattern, rule_ref),
             RuleTarget::BodyText | RuleTarget::BodyJsonPath(_) => {
                 self.body_bytes.push(pattern, rule_ref)
@@ -721,6 +802,9 @@ impl RuleSetBuilders {
             header_values: self.header_values.finish_text("header_values")?,
             query_keys: self.query_keys.finish_text("query_keys")?,
             query_values: self.query_values.finish_text("query_values")?,
+            canonical_query_values: self
+                .canonical_query_values
+                .finish_text("canonical_query_values")?,
             cookies: self.cookies.finish_text("cookies")?,
             url_path: self.url_path.finish_text("url_path")?,
             full_url: self.full_url.finish_text("full_url")?,
@@ -789,7 +873,8 @@ impl PatternBuilder {
 fn rule_pattern(rule: &WafRule) -> String {
     match rule.match_kind {
         MatchKind::Regex => rule.pattern.clone(),
-        MatchKind::Literal | MatchKind::Contains => format!("(?i){}", regex::escape(&rule.pattern)),
+        MatchKind::Literal => regex::escape(&rule.pattern),
+        MatchKind::Contains => format!("(?i){}", regex::escape(&rule.pattern)),
         MatchKind::Equals => format!("(?i)^{}$", regex::escape(&rule.pattern)),
         MatchKind::Luhn | MatchKind::Cidr => unreachable!("non-regex rule handled separately"),
     }
@@ -974,9 +1059,11 @@ pub(super) fn parse_custom_rule(
         pattern,
         conditions,
         action,
+        default_action_policy: DefaultActionPolicy::Inherit,
         fp_filters,
         paranoia_min,
         score,
+        query_scan_mirror: QueryScanMirror::None,
     })
 }
 
@@ -1236,6 +1323,67 @@ mod tests {
     }
 
     #[test]
+    fn literal_rule_is_case_sensitive_substring() {
+        let rule = WafRule {
+            id: "R1".into(),
+            name: "test".into(),
+            category: "test".into(),
+            severity: Severity::Low,
+            target: RuleTarget::BodyText,
+            match_kind: MatchKind::Literal,
+            pattern: "EVIL-LITERAL".into(),
+            conditions: None,
+            action: RuleAction::Monitor,
+            fp_filters: vec![],
+            paranoia_min: 1,
+            score: None,
+        };
+        let compiled = compile_rules(
+            vec![(rule, false)],
+            &HashSet::new(),
+            &HashMap::new(),
+            None,
+            &HashMap::new(),
+            1,
+        )
+        .expect("compile");
+        let set = &compiled.body_bytes.as_ref().unwrap().set;
+        assert!(set.is_match(b"prefix EVIL-LITERAL suffix"));
+        assert!(!set.is_match(b"evil-literal"));
+        assert!(!set.is_match(b"prefix evil-literal suffix"));
+    }
+
+    #[test]
+    fn contains_rule_is_case_insensitive_substring() {
+        let rule = WafRule {
+            id: "R1".into(),
+            name: "test".into(),
+            category: "test".into(),
+            severity: Severity::Low,
+            target: RuleTarget::BodyText,
+            match_kind: MatchKind::Contains,
+            pattern: "EVIL-LITERAL".into(),
+            conditions: None,
+            action: RuleAction::Monitor,
+            fp_filters: vec![],
+            paranoia_min: 1,
+            score: None,
+        };
+        let compiled = compile_rules(
+            vec![(rule, false)],
+            &HashSet::new(),
+            &HashMap::new(),
+            None,
+            &HashMap::new(),
+            1,
+        )
+        .expect("compile");
+        let set = &compiled.body_bytes.as_ref().unwrap().set;
+        assert!(set.is_match(b"prefix EVIL-LITERAL suffix"));
+        assert!(set.is_match(b"evil-literal"));
+    }
+
+    #[test]
     fn equals_rule_is_anchored_and_case_insensitive() {
         let rule = WafRule {
             id: "R1".into(),
@@ -1247,9 +1395,11 @@ mod tests {
             pattern: "propfind".into(),
             conditions: None,
             action: RuleAction::Monitor,
+            default_action_policy: DefaultActionPolicy::Inherit,
             fp_filters: vec![],
             paranoia_min: 1,
             score: None,
+            query_scan_mirror: QueryScanMirror::None,
         };
         let compiled = compile_rules(
             vec![(rule, false)],
@@ -1276,9 +1426,11 @@ mod tests {
             pattern: "propfind".into(),
             conditions: None,
             action: RuleAction::Monitor,
+            default_action_policy: DefaultActionPolicy::Inherit,
             fp_filters: vec![],
             paranoia_min: 1,
             score: None,
+            query_scan_mirror: QueryScanMirror::None,
         };
         let mut modes = HashMap::new();
         modes.insert("R-TYPO".to_string(), RuleAction::Enforce);
@@ -1312,9 +1464,11 @@ mod tests {
             pattern: "propfind".into(),
             conditions: None,
             action: RuleAction::Monitor,
+            default_action_policy: DefaultActionPolicy::Inherit,
             fp_filters: vec![],
             paranoia_min: 4,
             score: None,
+            query_scan_mirror: QueryScanMirror::None,
         };
         let mut modes = HashMap::new();
         modes.insert("R1".to_string(), RuleAction::Enforce);
@@ -1328,5 +1482,78 @@ mod tests {
         )
         .expect("compile");
         assert!(compiled.method.as_ref().unwrap().set.is_match("PROPFIND"));
+    }
+
+    fn method_rule(id: &str, policy: DefaultActionPolicy) -> WafRule {
+        WafRule {
+            id: id.to_string(),
+            name: "test".into(),
+            category: "test".into(),
+            severity: Severity::Low,
+            target: RuleTarget::Method,
+            match_kind: MatchKind::Equals,
+            pattern: "post".into(),
+            conditions: None,
+            action: RuleAction::Monitor,
+            default_action_policy: policy,
+            fp_filters: vec![],
+            paranoia_min: 1,
+            score: None,
+        }
+    }
+
+    fn pack_pair() -> Vec<(WafRule, bool)> {
+        vec![
+            (method_rule("CORE-001", DefaultActionPolicy::Inherit), true),
+            (
+                method_rule("HEURISTIC-001", DefaultActionPolicy::OptInEnforce),
+                true,
+            ),
+        ]
+    }
+
+    #[test]
+    fn default_action_policy_is_resolved_at_compile_time() {
+        let compiled = compile_rules(
+            pack_pair(),
+            &HashSet::new(),
+            &HashMap::new(),
+            Some(RuleAction::Enforce),
+            &HashMap::new(),
+            1,
+        )
+        .expect("compile");
+        assert_eq!(compiled.rules[0].id, "CORE-001");
+        assert_eq!(compiled.rules[0].action, RuleAction::Enforce);
+        assert_eq!(compiled.rules[1].id, "HEURISTIC-001");
+        assert_eq!(compiled.rules[1].action, RuleAction::Monitor);
+
+        let mut modes = HashMap::new();
+        modes.insert("HEURISTIC-001".to_string(), RuleAction::Enforce);
+        let compiled = compile_rules(
+            pack_pair(),
+            &HashSet::new(),
+            &modes,
+            Some(RuleAction::Enforce),
+            &HashMap::new(),
+            1,
+        )
+        .expect("compile");
+        assert_eq!(compiled.rules[1].action, RuleAction::Enforce);
+
+        let mut modes = HashMap::new();
+        modes.insert("CORE-001".to_string(), RuleAction::Monitor);
+        let compiled = compile_rules(
+            pack_pair(),
+            &HashSet::new(),
+            &modes,
+            Some(RuleAction::Disabled),
+            &HashMap::new(),
+            1,
+        )
+        .expect("compile");
+        assert_eq!(compiled.rules.len(), 1);
+        assert_eq!(compiled.rules[0].id, "CORE-001");
+        assert_eq!(compiled.rules[0].action, RuleAction::Monitor);
     }
 }

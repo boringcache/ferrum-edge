@@ -39,7 +39,7 @@ use crate::plugins::utils::jwks_cache::{JwksRefreshRequirement, retain_active_re
 use crate::plugins::utils::policy_digest::presentation_policy_digest;
 use crate::plugins::{
     Plugin, PluginFailurePolicy, PluginHttpClient, ProxyProtocol, ResponsePresentationPolicy,
-    create_plugin_with_http_client, create_plugin_with_http_client_and_config_id,
+    create_plugin_with_http_client_and_config_id,
 };
 
 // ---------------------------------------------------------------------------
@@ -2297,6 +2297,7 @@ fn try_create_plugin(
             | "soap_ws_security"
             | "jwks_auth"
             | "hmac_auth"
+            | "waf"
     ) {
         // Pass the stable plugin-config resource id through the production
         // factory so identity-aware plugins partition or attribute sibling
@@ -2312,6 +2313,13 @@ fn try_create_plugin(
         // `soap_ws_security` uses the same stable identity for its process
         // replay registry and shared Redis keyspace. Passing `None` here would
         // leave every production reload generation with private replay state.
+        //
+        // `waf` uses it as the operator-facing anomaly-score identity
+        // (`waf.instances.<id>.score`, `waf.instance_scores`,
+        // `waf.scoring_instance`). Passing `None` here would mint a
+        // process-local `standalone-N` surrogate that is unstable across
+        // reload/rebuild and across replicas consuming the same file, database,
+        // CP, or DP config (issue #3940).
         create_plugin_with_http_client_and_config_id(
             &pc.plugin_name,
             &pc.config,
@@ -2355,7 +2363,16 @@ fn try_create_plugin(
         )
         .map(|plugin| Some(Arc::new(plugin) as Arc<dyn Plugin>))
     } else {
-        create_plugin_with_http_client(&pc.plugin_name, &pc.config, http_client.clone())
+        // Configured runtime construction always has a plugin-config resource
+        // id. Pass it through so identity-aware plugins (and any future ones
+        // that opt into the factory argument) cannot fall back to a
+        // process-local standalone identity on this path.
+        create_plugin_with_http_client_and_config_id(
+            &pc.plugin_name,
+            &pc.config,
+            http_client.clone(),
+            Some(&pc.id),
+        )
     };
 
     match created {

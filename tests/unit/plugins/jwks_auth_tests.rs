@@ -3,7 +3,8 @@
 use ferrum_edge::ConsumerIndex;
 use ferrum_edge::config::types::AuthMode;
 use ferrum_edge::plugins::{
-    HTTP_FAMILY_PROTOCOLS, JwtAuthAttributeValue, Plugin, PluginHttpClient, RequestContext,
+    HTTP_FAMILY_PROTOCOLS, JwtAuthAttributeValue, Plugin, PluginHttpClient, PluginResult,
+    RequestContext,
     jwks_auth::{JwksAuth, MAX_JWKS_MAX_STALE_SECONDS},
     key_auth::KeyAuth,
     priority, validate_plugin_config, validate_plugin_config_with_policy,
@@ -124,7 +125,6 @@ fn create_rs256_token(claims: &Value, private_key_pem: &[u8]) -> String {
     create_rs256_token_exact(&claims, private_key_pem)
 }
 
-#[allow(dead_code)]
 fn create_rs256_token_with_kid(claims: &Value, private_key_pem: &[u8], kid: &str) -> String {
     use jsonwebtoken::{EncodingKey, Header, encode};
     let mut header = Header::new(jsonwebtoken::Algorithm::RS256);
@@ -1967,23 +1967,161 @@ async fn test_jwks_auth_validates_with_audience() {
     assert_continue(result);
 }
 
-#[tokio::test]
-async fn test_jwks_auth_token_without_kid_tries_all_keys() {
-    let private_key_pem = include_bytes!("../../../tests/fixtures/test_rsa_private.pem");
-    let public_key_pem = include_bytes!("../../../tests/fixtures/test_rsa_public.pem");
+const GENERIC_JWKS_401: &str = r#"{"error":"Invalid or unrecognized JWT"}"#;
+const KEY_1_PEM: &[u8] = include_bytes!("../../../tests/fixtures/test_rsa_private.pem");
+const KEY_1_PUB: &[u8] = include_bytes!("../../../tests/fixtures/test_rsa_public.pem");
+const KEY_2_PEM: &[u8] = include_bytes!("../../../tests/fixtures/test_rsa_private_other.pem");
+const KEY_2_PUB: &[u8] = include_bytes!("../../../tests/fixtures/test_rsa_public_other.pem");
 
-    let (_server, jwks_uri) = start_jwks_server(public_key_pem).await;
-    let plugin = JwksAuth::new(&single_provider_config(&jwks_uri), default_client()).unwrap();
-    plugin.warmup_jwks().await;
+fn two_key_jwks() -> Value {
+    let key1 = build_rsa_jwks_from_pem_with_kid(KEY_1_PUB, "key-1");
+    let key2 = build_rsa_jwks_from_pem_with_kid(KEY_2_PUB, "key-2");
+    json!({
+        "keys": [key1["keys"][0].clone(), key2["keys"][0].clone()]
+    })
+}
 
-    let consumer_index = ConsumerIndex::new(&[create_consumer("user")]);
-    let token = create_rs256_token_no_kid(&json!({"sub": "user"}), private_key_pem);
+fn two_key_inline_plugin() -> JwksAuth {
+    JwksAuth::new(
+        &json!({
+            "providers": [{
+                "jwks": two_key_jwks()
+            }]
+        }),
+        default_client(),
+    )
+    .unwrap()
+}
 
+async fn authenticate_bearer(plugin: &JwksAuth, token: &str) -> PluginResult {
     let mut ctx = make_ctx();
     ctx.headers
-        .insert("authorization".to_string(), format!("Bearer {}", token));
-    let result = plugin.authenticate(&mut ctx, &consumer_index).await;
+        .insert("authorization".to_string(), format!("Bearer {token}"));
+    plugin
+        .authenticate(&mut ctx, &ConsumerIndex::new(&[]))
+        .await
+}
+
+fn assert_generic_jwt_401(result: PluginResult) {
+    match result {
+        PluginResult::Reject {
+            status_code, body, ..
+        } => {
+            assert_eq!(status_code, 401);
+            assert_eq!(body, GENERIC_JWKS_401);
+            assert!(
+                !body.to_ascii_lowercase().contains("kid"),
+                "generic 401 must not echo kid"
+            );
+        }
+        other => panic!("expected generic 401, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn test_jwks_auth_token_without_kid_is_rejected() {
+    let plugin = two_key_inline_plugin();
+    let token = create_rs256_token_no_kid(&json!({"sub": "user"}), KEY_1_PEM);
+    assert_generic_jwt_401(authenticate_bearer(&plugin, &token).await);
+}
+
+#[tokio::test]
+async fn test_jwks_auth_unknown_kid_is_rejected_even_when_another_published_key_verifies() {
+    let plugin = two_key_inline_plugin();
+    let token = create_rs256_token_with_kid(&json!({"sub": "user"}), KEY_1_PEM, "no-such-kid");
+    assert_generic_jwt_401(authenticate_bearer(&plugin, &token).await);
+}
+
+#[tokio::test]
+async fn test_jwks_auth_known_kid_wrong_key_is_rejected() {
+    let plugin = two_key_inline_plugin();
+    let token = create_rs256_token_with_kid(&json!({"sub": "user"}), KEY_2_PEM, "key-1");
+    assert_generic_jwt_401(authenticate_bearer(&plugin, &token).await);
+}
+
+#[tokio::test]
+async fn test_jwks_auth_known_kid_matching_key_is_accepted() {
+    let plugin = two_key_inline_plugin();
+    let token = create_rs256_token_with_kid(&json!({"sub": "user"}), KEY_1_PEM, "key-1");
+    let mut ctx = make_ctx();
+    ctx.headers
+        .insert("authorization".to_string(), format!("Bearer {token}"));
+    let result = plugin
+        .authenticate(&mut ctx, &ConsumerIndex::new(&[]))
+        .await;
     assert_continue(result);
+    assert_eq!(ctx.authenticated_identity.as_deref(), Some("user"));
+}
+
+#[tokio::test]
+async fn test_jwks_auth_second_published_key_is_accepted_only_under_its_own_kid() {
+    let plugin = two_key_inline_plugin();
+    let matching = create_rs256_token_with_kid(&json!({"sub": "other"}), KEY_2_PEM, "key-2");
+    let mut ctx = make_ctx();
+    ctx.headers
+        .insert("authorization".to_string(), format!("Bearer {matching}"));
+    let result = plugin
+        .authenticate(&mut ctx, &ConsumerIndex::new(&[]))
+        .await;
+    assert_continue(result);
+    assert_eq!(ctx.authenticated_identity.as_deref(), Some("other"));
+
+    let swapped = create_rs256_token_with_kid(&json!({"sub": "other"}), KEY_1_PEM, "key-2");
+    assert_generic_jwt_401(authenticate_bearer(&plugin, &swapped).await);
+}
+
+#[tokio::test]
+async fn test_jwks_auth_multi_provider_does_not_fall_back_across_key_sets() {
+    let plugin = JwksAuth::new(
+        &json!({
+            "providers": [
+                {
+                    "issuer": "https://idp-a.example.com",
+                    "jwks": build_rsa_jwks_from_pem_with_kid(KEY_1_PUB, "key-a")
+                },
+                {
+                    "issuer": "https://idp-b.example.com",
+                    "jwks": build_rsa_jwks_from_pem_with_kid(KEY_2_PUB, "key-b")
+                }
+            ]
+        }),
+        default_client(),
+    )
+    .unwrap();
+
+    let valid_a = create_rs256_token_with_kid(
+        &json!({"iss": "https://idp-a.example.com", "sub": "user-a"}),
+        KEY_1_PEM,
+        "key-a",
+    );
+    let mut ctx = make_ctx();
+    ctx.headers
+        .insert("authorization".to_string(), format!("Bearer {valid_a}"));
+    let result = plugin
+        .authenticate(&mut ctx, &ConsumerIndex::new(&[]))
+        .await;
+    assert_continue(result);
+    assert_eq!(ctx.authenticated_identity.as_deref(), Some("user-a"));
+
+    let unknown_kid = create_rs256_token_with_kid(
+        &json!({"iss": "https://idp-a.example.com", "sub": "user-a"}),
+        KEY_1_PEM,
+        "key-b",
+    );
+    assert_generic_jwt_401(authenticate_bearer(&plugin, &unknown_kid).await);
+
+    let missing_kid = create_rs256_token_no_kid(
+        &json!({"iss": "https://idp-a.example.com", "sub": "user-a"}),
+        KEY_1_PEM,
+    );
+    assert_generic_jwt_401(authenticate_bearer(&plugin, &missing_kid).await);
+
+    let wrong_key = create_rs256_token_with_kid(
+        &json!({"iss": "https://idp-a.example.com", "sub": "user-a"}),
+        KEY_2_PEM,
+        "key-a",
+    );
+    assert_generic_jwt_401(authenticate_bearer(&plugin, &wrong_key).await);
 }
 
 // ─── Consumer-Optional Flow ────────────────────────────────────────────
