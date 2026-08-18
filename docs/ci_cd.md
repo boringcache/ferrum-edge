@@ -271,16 +271,17 @@ path is safe, none is sensitive, and every remaining path is on the explicit
 non-sensitive allowlist; a missing planner, a truncated listing, an empty
 listing, an unknown path, or an unsafe path (every C0 control including
 tab/newline, DEL, invalid UTF-8, absolute, traversal) fails closed toward
-running. In the FIPS workflow, the already mode/size/object-validated base blob
-is materialized over the checked-out planner and invoked through the literal
-`.github/scripts/ci_runtime_plan.py` path. The trusted Cross scanner can inspect
-that executable path statically; a variable-named temporary program is never
-executed. Filenames in the plan summary are JSON-escaped then HTML-escaped
+running. In the FIPS workflow, every trusted-tree lookup, proposed-entry check,
+materialization target, post-write hash check, and invocation names the literal
+`.github/scripts/ci_runtime_plan.py` path. The trusted Cross scanner rejects a
+mutable path alias, so the validated base blob cannot be written somewhere else
+while PR-controlled planner bytes remain at the executed path. Filenames in the
+plan summary are JSON-escaped then HTML-escaped
 inside `<code>` so a hostile name cannot break Markdown.
 
 **FIPS.** `FIPS Feature Policy` stays a cheap always-on graph audit.
 Compile, claimed-profile `cargo check`, clippy `-D warnings`, and the
-policy/key-admission/handshake tests share two cache layers plus an immutable
+policy/key-admission/handshake tests share one cache layer plus an immutable
 artifact handoff:
 
 - **Stable rust-cache fallback.** `shared-key` is
@@ -295,51 +296,68 @@ artifact handoff:
   (`save-if` false for fork PRs); the three ordinal `fips-claimed-checks`
   shards, `fips-clippy`, and `fips-test-build` restore it with `save-if: false`
   and never publish. The test job does not restore build caches.
-- **Exact same-run producer channel.** After a successful locked `fips` profile
-  build, `fips-compile` saves
-  `${{ github.workspace }}/target` and
-  `.cache/sccache` with `actions/cache/save` under
-  `fips-producer-${{ github.event.pull_request.head.sha || github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}`.
-  That key is unique per head and workflow-run attempt, so GitHub's immutable
-  exact-hit skip cannot trap newly warmed outputs. The three claimed-profile
-  shards, clippy, and `fips-test-build` restore the current producer key (with
-  the same SHA+`run_id` prefix fallback) and never save this channel. Each
-  claimed shard filters the policy checker's single inventory by ordinal modulo
-  three and fails closed if it selects no profile. Those consumers run in
-  parallel after the build-only compile producer, so test-binary precompile no
-  longer sits on the claimed-profile/clippy critical path. This early save is
-  for same-attempt compile-to-consumer reuse only. GitHub's cache LRU can
-  evict it during the consumer tail when later ordinary CI jobs write more
-  than the remaining cache budget (tens of GiB of newer entries have dropped
-  this key before the next full-workflow rerun).
-- **Immutable inter-run handoff.** A successful non-cold `fips-compile`
-  packages its exact `target/` + `.cache/sccache` producer tree as a zstd tar
+- **Immutable producer handoff (same-run channel and inter-run warm
+  source).** A successful non-cold `fips-compile`
+  packages its exact `target/` + `.cache/sccache` producer tree, the
+  checkout's Git tree identity, and a `fips-producer-identity` member that
+  records source SHA, run id, and run attempt as a zstd tar
   (preserving executable modes that artifact ZIP extraction would normalize)
   and publishes it as the one-day run artifact
   `fips-producer-handoff-${{ github.event.pull_request.head.sha || github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}`.
   Pull-request events use `github.event.pull_request.head.sha` rather than the
   synthetic merge SHA so a manual run of the same branch head can address the
   artifact; other events fall back to `github.sha`.
-  This is intentionally not a third repository cache: concurrent CI writers
-  empirically evicted a 4.15 GB late cache handoff within three minutes.
-  GitHub also deletes a workflow run's artifacts when that same run is rerun,
-  so warm evidence uses separate `workflow_dispatch` runs. Each dispatch names
+  This is intentionally not a repository cache: concurrent CI writers
+  empirically evicted a 4.15 GB late cache handoff within three minutes, and
+  the former run-attempt-scoped `actions/cache` producer key
+  (`fips-producer-<sha>-<run_id>-<run_attempt>`) was repeatedly LRU-evicted
+  out of the shared 10 GB quota between the producer's save and the five
+  consumers' restores, while a `rerun --failed` could never succeed because
+  consumers at attempt N asked for a key the skipped producer only saved at
+  attempt 1. Run artifacts sit outside that quota, and the artifact name's
+  attempt suffix exists only so a full rerun can republish without an
+  immutable-name conflict.
+
+  The three claimed-profile shards, clippy, and `fips-test-build` download
+  the handoff with the attempt-independent pattern
+  `fips-producer-handoff-<sha>-<run_id>-*` and `merge-multiple: false`. The
+  pinned download action flattens a single matching artifact's payload
+  directly into the channel directory; two or more matches extract each
+  artifact into a child directory named after that artifact. Promotion admits
+  both layouts, binds the attempt from the `fips-producer-identity` member
+  packaged at the front of the tar (never from the consumer's
+  `github.run_attempt`), requires child directory names and payload identity
+  to agree, and rejects mixed files and directories, extra entries, symlinks,
+  and malformed identity. It then promotes the newest matching attempt, so a
+  failed-job rerun reuses the artifact the skipped producer published at an
+  earlier attempt. They never publish this channel. Each
+  claimed shard filters the policy checker's single inventory by ordinal
+  modulo three and fails closed if it selects no profile. Those consumers run
+  in parallel after the build-only compile producer, so test-binary precompile
+  does not sit on the claimed-profile/clippy critical path. Unlike the former
+  cache channel (whose saves were fork-gated), the artifact channel is
+  fork-usable, so fork pull requests get the same exact compile-to-consumer
+  reuse and the same fail-closed promotion.
+
+  GitHub also deletes a workflow run's artifacts when that same run is fully
+  rerun, so warm evidence uses separate `workflow_dispatch` runs. Each
+  dispatch names
   the exact source run ID and attempt; the pinned download action requests only
   `fips-producer-handoff-${{ github.event.pull_request.head.sha || github.sha }}-<run_id>-<run_attempt>` from that run
-  in the current repository. An explicitly requested artifact must contain a
+  in the current repository. A promoted artifact — same-run or explicitly
+  requested — must contain a
   real tar payload that extracts to real `target/` and `.cache/sccache`
-  directories or the compile fails closed. The archive carries the producer
+  directories or the consuming job fails closed. The archive carries the
+  producer
   checkout's Git tree identity; promotion requires an equal, clean current
   checkout, preventing a synthetic PR merge tree from masquerading as the same
   branch head after its base changes. Because checkout gives identical source
-  files newer mtimes than archived outputs, the exact-head producer refreshes
+  files newer mtimes than archived outputs, the promoting job refreshes
   only regular files under `target/` after validating that tree and a real,
   nonsymlink FIPS executable. Every refreshed file receives one common
   reference timestamp: Cargo compares a unit's outputs with dependency outputs,
   so independently generated `touch` times can themselves make a dependency
-  look newer and invalidate its dependents. Same-run consumers apply the same
-  normalization only after the producer cache key matches the current
-  source-SHA/run-ID prefix and the executable check succeeds.
+  look newer and invalidate its dependents.
 
   Cargo also includes the resolved `RUSTC_WRAPPER` executable identity in its
   artifact hashes. The checksum-pinned sccache installer intentionally uses a
@@ -355,31 +373,46 @@ artifact handoff:
 
 `fips-test-build` precompiles the complete FIPS `unit_tests` and
 `integration_tests` executables and stages digest-bound copies in an
-immutable same-run artifact. The test job downloads only the attempt-scoped
-artifact, rejects unexpected names, symlinks, path escapes, and SHA-256
-mismatches, then executes the two binaries directly. Fresh-checkout source
-mtimes therefore cannot make Cargo repeat test-only compile/link work.
-Trusted non-cold consumers fail closed if this-run producer output is
-missing. Fork pull requests restore only and cannot save; GitHub confines
+immutable same-run artifact together with `fips-test-identity`. The test job
+downloads the run-scoped, attempt-wildcard pattern
+`fips-test-binaries-<run_id>-*` with `merge-multiple: false`. A single
+matching artifact flattens `unit_tests`, `integration_tests`, `manifest.json`,
+and `fips-test-identity` into the channel directory; multiple matches create
+per-artifact child directories. Validation admits both layouts, binds the
+attempt from `fips-test-identity` (never from the consumer's
+`github.run_attempt`), requires directory names and payload identity to agree,
+rejects malformed artifact names and paths, selects the newest attempt, then
+rejects unexpected bundle names, symlinks, path escapes, and SHA-256
+mismatches before executing the two binaries directly. A failed-job rerun can
+therefore reuse the artifact
+from the successful `fips-test-build` prerequisite that GitHub skipped in the
+new attempt. Fresh-checkout source mtimes cannot make Cargo repeat test-only
+compile/link work.
+Non-cold consumers fail closed if no producer handoff for their source
+SHA/run_id exists. Fork pull requests restore the rust-cache fallback only
+and cannot save it; GitHub confines
 `pull_request` writes to `refs/pull/.../merge`, not the default branch.
 
-`force_cold_cache` skips every cache restore and save while still executing the
+`force_cold_cache` skips every cache restore/save and the producer-handoff
+download, packaging, and upload while still executing the
 live contracts. The immutable same-run test artifact is transport, not a warm
 cache, so forced-cold and fork runs can execute the exact binaries produced by
 their own `fips-test-build` job without publishing shared state. rust-cache
 `cache-on-failure` remains on the compile producer so
 ordinary failing jobs can publish stable dependency work when post-job cleanup
-still runs. The producer `actions/cache/save` is a main step after the locked
+still runs. The producer handoff is packaged and uploaded by main steps after
+the locked
 profile build and
 before rust-cache's post cleanup, which strips workspace crates from `target/`
 before saving the stable fallback. Example plugins stay out of the FIPS
 artifact (`FERRUM_CUSTOM_PLUGINS` is unset). Job summaries record rust-cache
-hit/miss from the action output as **stable fallback**, producer restore
-as **exact / partial (same run_id) / miss** via `classify-restore`, and the
+hit/miss from the action output as **stable fallback**, same-run producer
+handoff promotion as an evidence-backed **hit** (a missing handoff fails the
+job rather than recording a fabricated miss), and the
 explicit inter-run handoff artifact as **hit / miss** (never as a fabricated
 hit). Measured restored bytes are the sccache-directory subset for
-rust-cache and the on-disk `target/` directory for the producer cache and
-handoff artifact; rust-cache Cargo/target archive bytes are not exposed. The
+rust-cache and the on-disk `target/` directory for the promoted producer
+handoff; rust-cache Cargo/target archive bytes are not exposed. The
 required `FIPS Build & Test`
 aggregate depends on `fips-test-build` and fails closed if that test-binary
 producer does not succeed.
@@ -525,12 +558,28 @@ Once the destination generation is the trusted base, an unchanged working tree
 passes by ordinary byte identity, and any further unadmitted drift fails. The
 predecessor constants are then inert — the trusted archive is no longer the
 source generation — and should be retired in a follow-up so the old tree
-cannot remain an admitted source. This predecessor must merge before #3910
-and does not contain #3910's action or workflow changes.
+cannot remain an admitted source. PR #3943 merged that predecessor onto `main`
+before this implementation; it did not contain #3910's action or workflow
+changes.
 
 Keeping the proof in Python rather than inline shell also keeps `helm-chart`
 free of the opaque-inline-shell and Cross surfaces that `Trusted Cross Build
 Policy` freezes per job.
+
+Live labs that compile the same default-feature `cargo build --profile pr-build
+--bin ferrum-edge` graph share the Swatinem rust-cache key `ci-live-pr-build`
+(`gateway-api-conformance.yml`, `mesh-e2e-sidecar-live.yml`,
+`multicluster-federation-live.yml`, and `multicluster-poller-partition-live.yml`).
+Lanes whose cache-affecting inputs differ keep private keys: CNI additionally
+links `ferrum-cni` (`ci-cni-lifecycle-live`), NodeWaypoint rebuilds with
+`--features cloud-secrets,ebpf` plus a nightly bpfel toolchain
+(`ci-node-waypoint-ebpf-live`), and Ambient Host UDP compiles the debug-profile
+lib/functional test binaries (`ci-ambient-host-udp-live`). Kind, kubectl, and
+Helm downloads used by those labs are restored inside
+`.github/actions/setup-kubernetes-tools` under an exact key of pinned
+versions/checksums, install subset, and runner OS/arch; checksums are verified
+after both restore and download.
+
 On pull requests and merge groups the checker is extracted from the base revision when
 one exists, then self-tested and executed against the proposed chart tree. That
 prevents the step from executing a checker replaced by the same pull request and
@@ -794,10 +843,15 @@ phases.
 
 **Runs**: `ubuntu-latest`
 
-Enforces code quality:
+Enforces code quality. Clippy omits DWARF (`profile.test.debug=0` and
+`profile.dev.debug=0`) so large integration targets stay within hosted-runner
+memory while `CARGO_BUILD_JOBS=2` restores modest compile parallelism:
 
 ```bash
-cargo clippy --all-targets -- -D warnings
+cargo clippy \
+  --config profile.test.debug=0 \
+  --config profile.dev.debug=0 \
+  --all-targets -- -D warnings
 ```
 
 **What it checks**:
@@ -1036,6 +1090,27 @@ python3 tests/performance/ci_overhead_bench.py \
 
 `--overhead-threshold 50` is a percentage threshold: the script fails when median gateway overhead across iterations exceeds 50%.
 
+The job's `setup-rust-ci` step keeps shared key `ci-perf` and passes rust-cache
+`workspaces` as `. -> target` plus `tests/performance/mesh -> target`. That
+covers both the root `ci-release` gateway build and the standalone Criterion
+crate under `tests/performance/mesh/` (own `Cargo.lock` / `target/`) without
+replacing root coverage. `setup-rust-ci` exposes `workspaces` as an optional
+pass-through to Swatinem/rust-cache; omitting it leaves rust-cache's default
+`. -> target`, so other jobs keep root-only caching. Do not list only the mesh
+workspace, and do not add unrelated workspaces, `cache-all-crates`, or extra
+`cache-directories` here.
+
+Hosted follow-ups that still need measured evidence before changing
+measurement fidelity or trigger breadth:
+
+- sccache hit rates on the `ci-release` gateway build (thin LTO). Do not
+  introduce a dedicated non-LTO perf profile until those stats are attached
+  and budgets are re-baselined.
+- whether workflow-only `.github/workflows/ci.yml` edits can skip the four
+  microbenchmarks. Today's static verifiers do not encode the `cargo bench`
+  invocation surface tightly enough to drop the `.github/workflows/ci.yml`
+  trigger safely.
+
 **Failures**:
 - Indicate performance regression issues
 - Must be fixed before merging
@@ -1044,18 +1119,28 @@ python3 tests/performance/ci_overhead_bench.py \
 
 **Runs**: `ubuntu-latest`, `macos-latest`, `windows-latest`
 
-Full-mode PRs build the native Linux x86_64 verification binary. Pushes to
-`main` build optimized release binaries for Linux x86_64, Linux ARM64, macOS
-x86_64, macOS ARM64, and Windows x86_64. Native targets share the ordinary
-matrix; Linux ARM64 runs only after code reaches `main`, in the isolated
-`build-arm64-cross` job described below. The jobs install the same prerequisites
-as the Release pipeline — `protoc` on every OS, `libcurl4-openssl-dev` on Linux,
-and NASM on Windows — and build with `--features cloud-secrets` so
-Vault/AWS/Azure/GCP secret backends are included. The macOS x86_64 build targets
-`x86_64-apple-darwin` with the standard Apple/Rust toolchain (no `cross` needed)
-and runs on whichever host architecture GitHub maps `macos-latest` to today
-(currently ARM64); pin to a concrete runner image such as `macos-14` if the
-host architecture must be guaranteed.
+Full-mode PRs compile the native Linux x86_64 verification binary with
+`--profile pr-build`. `merge_group` keeps all four native targets as
+fail-closed compile gates whose outputs are discarded: Linux x86_64 and
+Windows x86_64 still `cargo build --profile pr-build` (Windows MSVC/NASM
+linkage is the platform-specific failure mode `cargo check` cannot see);
+macOS x86_64 and macOS ARM64 run `cargo check --profile pr-build` because
+queue binaries are never published. Pushes to `main` build optimized
+`release` binaries for Linux x86_64, Linux ARM64, macOS x86_64, macOS ARM64,
+and Windows x86_64. Native targets share the ordinary matrix; Linux ARM64
+runs only after code reaches `main`, in the isolated `build-arm64-cross` job
+described below. rust-cache keys are split by profile lane
+(`build-<target>-prbuild` vs `build-<target>-release`) so queue check/pr-build
+trees cannot evict push-to-main release artifacts. Each native job installs
+the pinned repository `setup-sccache` action and reports `sccache --show-stats`
+after compile. The jobs install the same prerequisites as the Release pipeline
+— `protoc` on every OS, `libcurl4-openssl-dev` on Linux, and NASM on Windows —
+and compile with `--features cloud-secrets` so Vault/AWS/Azure/GCP secret
+backends are included. The macOS x86_64 build targets `x86_64-apple-darwin`
+with the standard Apple/Rust toolchain (no `cross` needed) and runs on
+whichever host architecture GitHub maps `macos-latest` to today (currently
+ARM64); pin to a concrete runner image such as `macos-14` if the host
+architecture must be guaranteed.
 
 ##### Trusted ARM64 Cross boundary
 
@@ -2019,11 +2104,13 @@ The temporary whole-file SHA-256 admission first used for PR #3889 (and retired
 by #3943 once #3889 landed) is **re-armed for exactly one transition**: PR
 #3950 moves the FIPS same-run producer→consumer handoff off the eviction-prone
 repository cache onto the immutable run artifact, which necessarily edits four
-digest-frozen `fips-build.yml` job bodies. The pair is exact and one-way:
-trusted-base `527659b0ad96a0d97cd4a170543dd81acbf6784155b3c82918b1f70a20c7914b`
-(PR #3889's landed file) →
-`05f86617597b1eb7bcf1960a0c630a9884ff09ac1995982f46a80811c3965e74` (PR #3950
-head `0984a45e4`; recompute and re-pin if review changes the workflow bytes).
+digest-frozen `fips-build.yml` job bodies. The destination also quarantines only
+restored `aws-lc-fips-sys-*/out/build` CMake intermediates before a cross-runner
+incremental build can reparse them. The pair is exact and one-way:
+trusted-base `0be313579a66265ef1f54e0a611f519e8d109a536ba29b0d6c4244530b9d6a08`
+(the workflow after PR #3952's landed static-path planner hardening) →
+`17bfb40fbd31e80e6ae1a0efca922069c54ec485ec7a611c3420840da3e5e9e1` (PR #3950
+head `df1223520`; recompute and re-pin if review changes the workflow bytes).
 The digest is over universal-newline-decoded text. RETIREMENT IS MANDATORY
 once #3950 lands, exactly as #3943 retired the #3889 pair. Any other
 `fips-build.yml` edit is still compared by the normal fail-closed Cross
@@ -2087,11 +2174,12 @@ pairs for those jobs, keyed by the workflow filename AND the job name:
 
 | Workflow | Job | Retired SHA-256 (trusted base) | Adopted SHA-256 | Destination |
 |---|---|---|---|---|
-| `coverage.yml` | `coverage-merge` | `d2480af21698fb3ad041b32b39587c949aeedec24746c8d5c8c63acd9f9d2fb6` | `34f5e1b022f1d01ac72d13c66256e11ff87c15135d775c03736e6701b2223a1c` | PR #3917 / issue #3907 |
+| `coverage.yml` | `coverage-merge` | `5acba780094766b03f72059b8ac229c7bcc4a722ce0130060da7ed0d1ba5850f` | `28c3ff517027c36ba2ca7ce8a80adc43d2e8475e46c4d5cb0106819dd3f1c152` | PR #3917 / issue #3907 |
 
 The pair admits #3917's shard-scoped coverage-merge reshape (planned-shard
 artifact selection, plugin gate, planned-shard outcome enforcement), pinned
-against #3917's branch after merging latest `main`
+against #3917's branch after merging latest `main` and inheriting the current
+checksum-pinned `taiki-e/install-action` update
 (`grok/issue-3907-coverage-shards-r1`; recompute and re-pin if review changes
 the job bytes). Each digest is the SHA-256 of `extract_job_block` text. Both
 ends are exact, the binding includes the filename and job name, the move is
@@ -2491,15 +2579,22 @@ https://github.com/ferrum-edge/ferrum-edge/releases
 
 ### Download Latest Release
 
+Published gateway binaries use raw asset names such as `ferrum-edge-linux-x86_64` with adjacent `.sha256` sidecars. Pin an explicit published tag (`latest` for the current prerelease stream). Do not rely on GitHub's `/releases/latest` redirect or the `releases/latest` API endpoint for a prerelease tag.
+
 ```bash
-# Using GitHub CLI
-gh release download --repo ferrum-edge/ferrum-edge -p "*linux-x86_64"
+# Using GitHub CLI (explicit tag; resolves tag name `latest` even when prerelease)
+gh release download --repo ferrum-edge/ferrum-edge latest -p 'ferrum-edge-linux-x86_64*'
+sha256sum -c ferrum-edge-linux-x86_64.sha256
+chmod +x ferrum-edge-linux-x86_64
 
 # Using curl
-RELEASE_URL=$(curl -s https://api.github.com/repos/ferrum-edge/ferrum-edge/releases/latest | \
-  jq -r '.assets[] | select(.name == "ferrum-edge-linux-x86_64") | .browser_download_url')
-curl -L -o ferrum-edge $RELEASE_URL
-chmod +x ferrum-edge
+set -euo pipefail
+TAG=latest  # or replace with another explicit published tag
+BASE="https://github.com/ferrum-edge/ferrum-edge/releases/download/${TAG}"
+curl -fsSLO "${BASE}/ferrum-edge-linux-x86_64"
+curl -fsSLO "${BASE}/ferrum-edge-linux-x86_64.sha256"
+sha256sum -c ferrum-edge-linux-x86_64.sha256
+chmod +x ferrum-edge-linux-x86_64
 ```
 
 ### Platform-Specific Binaries
@@ -2855,10 +2950,13 @@ strategy:
 ```
 
 Musl targets need their own toolchain setup. Add `musl-tools` before a native
-`cargo build`. A Cross-backed target requires a separate isolated invocation
-job, a complete Cross configuration allowlist, fixed empty environment, and an
-updated trusted verifier contract; do not add an unguarded Cross invocation to
-the native matrix.
+`cargo build`. Merge-queue compile gates for discarded artifacts live in the
+`build-binaries` compile-gate step (`cargo check` on `*-apple-darwin`, linked
+`pr-build` elsewhere); do not feed queue outputs into Prepare/Upload. A
+Cross-backed target requires a separate isolated invocation job, a complete
+Cross configuration allowlist, fixed empty environment, and an updated trusted
+verifier contract; do not add an unguarded Cross invocation to the native
+matrix.
 
 ### Skipping Steps
 

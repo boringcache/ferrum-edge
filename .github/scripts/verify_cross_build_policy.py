@@ -86,7 +86,7 @@ WORKFLOW_CONTRACTS = (
     (
         "CI workflow",
         "build-arm64-cross",
-        "905e23deac2aa3021e3472c13745e146cf5f49c05d97861962ac2d2c612dce6f",
+        "9a1b2bb4914826b77e82ad4489f73b15ebbdc93cd0d925b91cbcdc21a5e148cc",
         "143872ebf5dd925529b785273f180671bcc3bbd612d74ef0b88e1b8dce86c774",
         # Pins the top-level `on:` mapping that schedules CI, including
         # unconditional `merge_group: checks_requested` alongside push,
@@ -96,7 +96,7 @@ WORKFLOW_CONTRACTS = (
     (
         "release workflow",
         "build-release-arm64-cross",
-        "e2792eb548322f3ef062b93ad971b5a13e9d21c74d9b00f5f3bdf8e0119c9712",
+        "338c9be78c5e354365990a9c27dafa36c21202f18cf517567ad44995cff03950",
         "1d5104bd955d0ef4c397cb7be08f37d2d829a822ff9efe43eb26bdac1133bc0a",
         "2a9e77c5946c27cbf1f055f20adf283e159ffd3735e2dcc90edded2c35563c3b",
     ),
@@ -11918,15 +11918,16 @@ def validate_workflow_collection(
 # served. See `docs/ci_cd.md` and `docs/dependency-policy.md`.
 FIPS_BUILD_WORKFLOW_FILENAME = "fips-build.yml"
 # `.github/workflows/fips-build.yml` as it stands on the trusted base
-# (PR #3889's landed file).
+# after PR #3952's landed static-path planner hardening.
 FIPS_BUILD_RETIRED_GENERATION_SHA256 = (
-    "527659b0ad96a0d97cd4a170543dd81acbf6784155b3c82918b1f70a20c7914b"
+    "0be313579a66265ef1f54e0a611f519e8d109a536ba29b0d6c4244530b9d6a08"
 )
-# `.github/workflows/fips-build.yml` at PR #3950 head
-# 0984a45e4: the same-run producer handoff moves off the eviction-prone
-# repository cache onto the immutable run artifact.
+# `.github/workflows/fips-build.yml` at PR #3950 head df1223520: the same-run
+# producer handoff moves off the eviction-prone repository cache onto the
+# immutable run artifact, and restored runner-local AWS-LC CMake intermediates
+# are quarantined before Cargo can reuse them on another runner.
 FIPS_BUILD_ADOPTED_GENERATION_SHA256 = (
-    "05f86617597b1eb7bcf1960a0c630a9884ff09ac1995982f46a80811c3965e74"
+    "17bfb40fbd31e80e6ae1a0efca922069c54ec485ec7a611c3420840da3e5e9e1"
 )
 FIPS_BUILD_ADMITTED_GENERATION_TRANSITION = (
     FIPS_BUILD_WORKFLOW_FILENAME,
@@ -12099,12 +12100,13 @@ WORKFLOW_DIRECTORY_JOB_GENERATION_TRANSITIONS: tuple[
     # (issue #3907): shard-scoped coverage planning re-shapes the merge
     # aggregate (planned-shard artifact selection, plugin gate, planned-shard
     # outcome enforcement), pinned against its latest-main-merged branch
-    # grok/issue-3907-coverage-shards-r1.
+    # grok/issue-3907-coverage-shards-r1. Both generations include the current
+    # checksum-pinned taiki-e/install-action update.
     (
         "coverage.yml",
         "coverage-merge",
-        "d2480af21698fb3ad041b32b39587c949aeedec24746c8d5c8c63acd9f9d2fb6",
-        "34f5e1b022f1d01ac72d13c66256e11ff87c15135d775c03736e6701b2223a1c",
+        "5acba780094766b03f72059b8ac229c7bcc4a722ce0130060da7ed0d1ba5850f",
+        "28c3ff517027c36ba2ca7ce8a80adc43d2e8475e46c4d5cb0106819dd3f1c152",
     ),
 )
 
