@@ -746,6 +746,28 @@ impl GrpcConnectionPool {
         &self,
         proxy: &Proxy,
     ) -> Result<http2::SendRequest<GrpcBody>, GrpcProxyError> {
+        self.get_sender_with_purpose(proxy, GrpcEstablishmentPurpose::Request)
+            .await
+    }
+
+    /// Acquire a sender for startup/reload backend capability classification.
+    ///
+    /// Same pool and handshake as [`Self::get_sender`]; the purpose is threaded
+    /// into establishment logging so an expected HTTP/1.1 h2c miss is not
+    /// reported as a request-time gRPC outage.
+    pub async fn get_sender_for_capability_probe(
+        &self,
+        proxy: &Proxy,
+    ) -> Result<http2::SendRequest<GrpcBody>, GrpcProxyError> {
+        self.get_sender_with_purpose(proxy, GrpcEstablishmentPurpose::CapabilityProbe)
+            .await
+    }
+
+    async fn get_sender_with_purpose(
+        &self,
+        proxy: &Proxy,
+        purpose: GrpcEstablishmentPurpose,
+    ) -> Result<http2::SendRequest<GrpcBody>, GrpcProxyError> {
         let pool_config = self.pool.manager().global_pool_config.for_proxy(proxy);
         let shard_count = pool_config.http2_connections_per_host.max(1);
 
@@ -841,7 +863,9 @@ impl GrpcConnectionPool {
             .pool
             .create_or_get_existing_owned(selected_key, |key| async move {
                 let _ = key;
-                manager.create_connection(proxy, svid_generation).await
+                manager
+                    .create_connection(proxy, svid_generation, purpose)
+                    .await
             })
             .await
         {
@@ -931,6 +955,7 @@ impl GrpcPoolManager {
         &self,
         proxy: &Proxy,
         svid_generation: Option<u64>,
+        purpose: GrpcEstablishmentPurpose,
     ) -> Result<http2::SendRequest<GrpcBody>, GrpcProxyError> {
         let host = &proxy.backend_host;
         let port = proxy.backend_port;
@@ -1071,6 +1096,8 @@ impl GrpcPoolManager {
             .map(|(sender, _)| sender)
             .map_err(|error| match error {
                 crate::dns::CandidateConnectError::TimedOut { last_addr } => {
+                    // Timeouts stay WARN for both request-time dials and capability
+                    // probes: a hung origin is not an expected HTTP/1.1 miss.
                     warn!(
                         "gRPC: protocol establishment budget exhausted ({}ms) for backend {} \
                          (last={})",
@@ -1085,20 +1112,7 @@ impl GrpcPoolManager {
                     }
                 }
                 crate::dns::CandidateConnectError::Failed { last_addr, source } => {
-                    if crate::retry::is_port_exhaustion(&source) {
-                        tracing::error!(
-                            "gRPC: PORT EXHAUSTION connecting to backend {}: {} — \
-                             reduce outbound connection rate or increase net.ipv4.ip_local_port_range",
-                            last_addr,
-                            source
-                        );
-                    } else {
-                        warn!(
-                            "gRPC: all DNS candidates failed protocol establishment for backend {} \
-                             (last={}): {}",
-                            host, last_addr, source
-                        );
-                    }
+                    log_grpc_protocol_establishment_failure(purpose, host, last_addr, &source);
                     source
                 }
             })
@@ -1264,9 +1278,13 @@ impl PoolManager for GrpcPoolManager {
     }
 
     async fn create(&self, _key: &str, proxy: &Proxy) -> Result<http2::SendRequest<GrpcBody>> {
-        self.create_connection(proxy, self.svid_generation_for_proxy(proxy))
-            .await
-            .map_err(anyhow::Error::from)
+        self.create_connection(
+            proxy,
+            self.svid_generation_for_proxy(proxy),
+            GrpcEstablishmentPurpose::Request,
+        )
+        .await
+        .map_err(anyhow::Error::from)
     }
 
     fn is_healthy(&self, conn: &Self::Connection) -> bool {
@@ -1338,6 +1356,86 @@ impl GrpcPoolManager {
             self.workload_svid_cert_path.as_deref(),
             self.current_svid_generation(),
         )
+    }
+}
+
+/// Why a gRPC HTTP/2 connection is being established.
+///
+/// Capability probes share the request-time pool and handshake, but an
+/// expected plaintext HTTP/1.1 classification miss must not be logged as a
+/// live gRPC outage. Request-time dials keep the existing WARN/ERROR surface.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GrpcEstablishmentPurpose {
+    /// Live request-time gRPC dispatch, pool create, or any other production dial.
+    Request,
+    /// Startup, SIGHUP, or periodic backend capability classification.
+    CapabilityProbe,
+}
+
+/// Tracing severity for a gRPC protocol-establishment failure.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GrpcEstablishmentLogLevel {
+    Error,
+    Warn,
+    Debug,
+}
+
+/// Classify how loudly a gRPC establishment failure should be logged.
+///
+/// Port exhaustion is always `ERROR`. An expected h2c handshake miss during a
+/// capability probe is `DEBUG` (ordinary HTTP/1.1 origins). Timeouts, TLS
+/// failures, connect/DNS failures, and request-time gRPC misses stay `WARN`.
+pub fn grpc_establishment_failure_log_level(
+    purpose: GrpcEstablishmentPurpose,
+    error: &GrpcProxyError,
+) -> GrpcEstablishmentLogLevel {
+    if crate::retry::is_port_exhaustion(error) {
+        return GrpcEstablishmentLogLevel::Error;
+    }
+    match (purpose, error) {
+        (
+            GrpcEstablishmentPurpose::CapabilityProbe,
+            GrpcProxyError::BackendUnavailable {
+                kind: GrpcBackendUnavailableKind::H2cHandshake,
+                ..
+            },
+        ) => GrpcEstablishmentLogLevel::Debug,
+        _ => GrpcEstablishmentLogLevel::Warn,
+    }
+}
+
+/// Emit the establishment-failure diagnostic at the classified severity.
+///
+/// Messages name only host and socket address — never secrets, bearer tokens,
+/// cookies, or credential metadata.
+pub fn log_grpc_protocol_establishment_failure(
+    purpose: GrpcEstablishmentPurpose,
+    host: &str,
+    last_addr: impl std::fmt::Display,
+    error: &GrpcProxyError,
+) {
+    match grpc_establishment_failure_log_level(purpose, error) {
+        GrpcEstablishmentLogLevel::Error => {
+            error!(
+                "gRPC: PORT EXHAUSTION connecting to backend {}: {} — \
+                 reduce outbound connection rate or increase net.ipv4.ip_local_port_range",
+                last_addr, error
+            );
+        }
+        GrpcEstablishmentLogLevel::Debug => {
+            debug!(
+                "gRPC capability probe: expected h2c classification miss for backend {} \
+                 (last={}): {}",
+                host, last_addr, error
+            );
+        }
+        GrpcEstablishmentLogLevel::Warn => {
+            warn!(
+                "gRPC: all DNS candidates failed protocol establishment for backend {} \
+                 (last={}): {}",
+                host, last_addr, error
+            );
+        }
     }
 }
 

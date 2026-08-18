@@ -41,6 +41,7 @@ mod gateway_listener_plan_tests;
 mod gateway_listener_status_tests;
 mod gateway_trust_runtime_publication_tests;
 mod gatewayclass_helm_tests;
+mod grpc_capability_probe_log_tests;
 mod grpc_proxy_tests;
 mod gso_batch_buf_tests;
 mod h3_cross_protocol_bytes_share_tests;

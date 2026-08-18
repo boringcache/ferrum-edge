@@ -9910,6 +9910,10 @@ impl ProxyState {
         match scheme {
             BackendScheme::Http => {
                 record.plain_http.h1 = ProtocolSupport::Supported;
+                // HTTP-family backends can still carry native gRPC (runtime
+                // flavor, not a scheme), so configuration cannot prove h2c is
+                // inapplicable. Probe with explicit capability-probe context
+                // so only the expected HTTP/1.1 classification miss is quiet.
                 self.probe_h2c(&probe_proxy, probe_timeout, host, port, &mut record)
                     .await;
             }
@@ -10004,9 +10008,12 @@ impl ProxyState {
     }
 
     /// h2c prior-knowledge probe for a plaintext HTTP backend. Borrows
-    /// `record` so the outcome is written directly; genuine errors (none
-    /// expected for h2c — "backend doesn't speak h2c" is the normal case)
-    /// drop to `debug!` and classify as `Unsupported`.
+    /// `record` so the outcome is written directly. The pool dial uses
+    /// `get_sender_for_capability_probe` so an expected HTTP/1.1 h2c miss is
+    /// debug-level at the establishment logger; request-time gRPC still WARNs.
+    /// Unexpected probe failures (timeouts, connect/DNS, port exhaustion)
+    /// keep their WARN/ERROR diagnostics. Genuine "backend doesn't speak
+    /// h2c" outcomes classify as `Unsupported`.
     async fn probe_h2c(
         &self,
         probe_proxy: &Proxy,
@@ -10015,7 +10022,11 @@ impl ProxyState {
         port: u16,
         record: &mut BackendCapabilityRecord,
     ) {
-        match tokio::time::timeout(probe_timeout, self.grpc_pool.get_sender(probe_proxy)).await {
+        match tokio::time::timeout(
+            probe_timeout,
+            self.grpc_pool.get_sender_for_capability_probe(probe_proxy),
+        )
+        .await {
             Ok(Ok(_)) => {
                 record.grpc_transport.h2c = ProtocolSupport::Supported;
             }

@@ -992,7 +992,7 @@ See [infrastructure_sizing.md](infrastructure_sizing.md) for detailed tuning gui
 | `FERRUM_POOL_WARMUP_ENABLED` | No | `true` | Pre-establish backend connections at startup after DNS warmup. Skipped for TCP/UDP stream proxies |
 | `FERRUM_POOL_WARMUP_CONCURRENCY` | No | `500` | Maximum concurrent connection warmup attempts at startup |
 | `FERRUM_POOL_CLEANUP_INTERVAL_SECONDS` | No | `30` | Cleanup sweep interval for all connection pools |
-| `FERRUM_BACKEND_CAPABILITY_REFRESH_INTERVAL_SECS` | No | `86400` | Background interval for reproving backend HTTP/2, HTTP/3, and h2c capabilities |
+| `FERRUM_BACKEND_CAPABILITY_REFRESH_INTERVAL_SECS` | No | `86400` | Background interval for reproving backend HTTP/2, HTTP/3, and h2c capabilities. Expected plaintext HTTP/1.1 h2c classification misses are debug-level; they do not emit WARN at the default `FERRUM_LOG_LEVEL` |
 | `FERRUM_GRPC_POOL_READY_WAIT_MS` | No | `1` | Time the gRPC pool waits for stream capacity before opening another backend connection |
 | `FERRUM_POOL_MAX_IDLE_PER_HOST` | No | `64` | Maximum idle connections per backend host (min: 4, max: 1024) |
 | `FERRUM_POOL_IDLE_TIMEOUT_SECONDS` | No | `90` | Seconds before idle connections are closed |
