@@ -6,7 +6,10 @@
 //! cascade over every occupancy and ancillary surface), protection of the
 //! effective configured namespace from both delete and rename-away, the
 //! last-remaining-namespace invariant under concurrent deletes, commit-boundary
-//! lease loss, late-step rollback, and file-mode 403s.
+//! lease loss, late-step rollback, file-mode 403s, and the
+//! `FERRUM_ADMIN_REQUIRE_NAMESPACE_CLAIM` gate the registry handlers apply to
+//! the path/body name themselves (list filtering plus per-name 403s, including
+//! a rename's target name).
 
 use arc_swap::ArcSwap;
 use chrono::Utc;
@@ -65,6 +68,28 @@ fn token_with_role(role: &str) -> String {
 
 fn admin_token() -> String {
     token_with_role("admin")
+}
+
+/// Mint an admin JWT carrying an `ns` claim verbatim, so the namespace-claim
+/// gate can be exercised with both the single-string and the array shapes.
+fn admin_token_with_ns(ns: Value) -> String {
+    let now = Utc::now();
+    let claims = json!({
+        "iss": JWT_ISSUER,
+        "sub": "namespace-admin",
+        "role": "admin",
+        "ns": ns,
+        "iat": now.timestamp(),
+        "nbf": now.timestamp(),
+        "exp": (now + chrono::Duration::seconds(3600)).timestamp(),
+        "jti": uuid::Uuid::new_v4().to_string(),
+    });
+    encode(
+        &Header::new(jsonwebtoken::Algorithm::HS256),
+        &claims,
+        &EncodingKey::from_secret(JWT_SECRET.as_bytes()),
+    )
+    .expect("token encodes")
 }
 
 fn test_pool_config() -> DbPoolConfig {
@@ -158,6 +183,16 @@ fn admin_state_from_arc(db: Arc<dyn DatabaseBackend>) -> AdminState {
         external_ref_loader: std::sync::Arc::new(
             ferrum_edge::admin::api_specs::DefaultExternalDocumentLoader::default(),
         ),
+    }
+}
+
+/// `admin_state_from_arc` with `FERRUM_ADMIN_REQUIRE_NAMESPACE_CLAIM` on. The
+/// registry routes are NOT selected by `X-Ferrum-Namespace`, so each handler
+/// applies the claim to the path/body name itself.
+fn claim_enforcing_state(db: Arc<dyn DatabaseBackend>) -> AdminState {
+    AdminState {
+        admin_require_namespace_claim: true,
+        ..admin_state_from_arc(db)
     }
 }
 
@@ -2455,4 +2490,149 @@ async fn a_database_aborted_transaction_is_a_retryable_503_not_a_500() {
     .await;
     assert_eq!(status, 200, "{body:?}");
     assert_eq!(body["description"], "before");
+}
+
+#[tokio::test]
+async fn namespace_claim_gate_filters_the_list_and_denies_unclaimed_names() {
+    let dir = TempDir::new().unwrap();
+    let store = Arc::new(make_store(&dir).await);
+    let (base, _shutdown) = start_admin(claim_enforcing_state(store.clone())).await;
+    let broad = admin_token_with_ns(json!(["tenant-a", "tenant-b"]));
+    let narrow = admin_token_with_ns(json!("tenant-b"));
+    let no_claim = admin_token();
+
+    for name in ["tenant-a", "tenant-b"] {
+        let (status, body) = send(
+            reqwest::Method::POST,
+            &base,
+            "/namespaces",
+            &broad,
+            Some(json!({"name": name})),
+        )
+        .await;
+        assert_eq!(status, 201, "create {name}: {body:?}");
+    }
+
+    // The list is a global surface, so it is FILTERED to the claim, never 403.
+    let (status, body) = send(reqwest::Method::GET, &base, "/namespaces", &narrow, None).await;
+    assert_eq!(status, 200, "claim-filtered list: {body:?}");
+    let names: Vec<&str> = body["data"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(Value::as_str)
+        .collect();
+    assert_eq!(names, ["tenant-b"], "list must be filtered to the ns claim");
+
+    // A token with no `ns` claim sees an empty list rather than every tenant.
+    let (status, body) = send(reqwest::Method::GET, &base, "/namespaces", &no_claim, None).await;
+    assert_eq!(status, 200, "no-claim list is empty, not 403: {body:?}");
+    assert!(
+        body["data"].as_array().unwrap().is_empty(),
+        "a token with no ns claim must not see any registry name: {body:?}"
+    );
+
+    // Per-name routes deny a name the token cannot address.
+    let (status, body) = send(
+        reqwest::Method::GET,
+        &base,
+        "/namespaces/tenant-a",
+        &narrow,
+        None,
+    )
+    .await;
+    assert_eq!(status, 403, "GET of an unclaimed name: {body:?}");
+
+    let (status, body) = send(
+        reqwest::Method::POST,
+        &base,
+        "/namespaces",
+        &narrow,
+        Some(json!({"name": "tenant-c"})),
+    )
+    .await;
+    assert_eq!(status, 403, "create of an unclaimed name: {body:?}");
+    assert!(
+        !registry_row_exists(&store, "tenant-c").await,
+        "a denied create must not persist anything"
+    );
+
+    let (status, body) = send(
+        reqwest::Method::DELETE,
+        &base,
+        "/namespaces/tenant-a",
+        &narrow,
+        None,
+    )
+    .await;
+    assert_eq!(status, 403, "delete of an unclaimed name: {body:?}");
+    assert!(
+        registry_row_exists(&store, "tenant-a").await,
+        "a denied delete must not remove the row"
+    );
+}
+
+#[tokio::test]
+async fn namespace_rename_requires_the_claim_for_the_target_name_too() {
+    let dir = TempDir::new().unwrap();
+    let store = Arc::new(make_store(&dir).await);
+    let (base, _shutdown) = start_admin(claim_enforcing_state(store.clone())).await;
+    let broad = admin_token_with_ns(json!(["tenant-a", "tenant-b"]));
+    let source_only = admin_token_with_ns(json!("tenant-a"));
+
+    let (status, body) = send(
+        reqwest::Method::POST,
+        &base,
+        "/namespaces",
+        &broad,
+        Some(json!({"name": "tenant-a"})),
+    )
+    .await;
+    assert_eq!(status, 201, "create the source tenant: {body:?}");
+
+    // Authorized for the current name only. A rename moves the whole tenant
+    // into a namespace this token may not address, so it must be refused.
+    let (status, body) = send(
+        reqwest::Method::PUT,
+        &base,
+        "/namespaces/tenant-a",
+        &source_only,
+        Some(json!({"name": "tenant-b"})),
+    )
+    .await;
+    assert_eq!(status, 403, "rename must also check the target: {body:?}");
+    assert!(
+        registry_row_exists(&store, "tenant-a").await,
+        "a denied rename must leave the source row in place"
+    );
+    assert!(
+        !registry_row_exists(&store, "tenant-b").await,
+        "a denied rename must not materialize the target row"
+    );
+
+    // A description-only update of the claimed name stays allowed.
+    let (status, body) = send(
+        reqwest::Method::PUT,
+        &base,
+        "/namespaces/tenant-a",
+        &source_only,
+        Some(json!({"description": "still mine"})),
+    )
+    .await;
+    assert_eq!(status, 200, "description-only update: {body:?}");
+    assert_eq!(body["description"], "still mine");
+
+    // With both names claimed the rename is admitted.
+    let (status, body) = send(
+        reqwest::Method::PUT,
+        &base,
+        "/namespaces/tenant-a",
+        &broad,
+        Some(json!({"name": "tenant-b"})),
+    )
+    .await;
+    assert_eq!(status, 200, "rename with both names claimed: {body:?}");
+    assert_eq!(body["name"], "tenant-b");
+    assert!(!registry_row_exists(&store, "tenant-a").await);
+    assert!(registry_row_exists(&store, "tenant-b").await);
 }
