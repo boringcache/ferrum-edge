@@ -36,9 +36,9 @@ this provider has no effort tiers. Do not claim an effort level was applied.
 
 Non-negotiables:
 - The launcher pins **`alibaba-token-plan/qwen3.8-max`** on the write-enabled `build`
-  agent and feeds the prompt on stdin (`opencode run --auto`). Pass
-  `--model alibaba-token-plan/<other>` only when the user asks for a different model on
-  that provider.
+  agent and feeds the prompt on stdin (`opencode run --auto`). This is a **hard pin**:
+  `--model` is refused (exit 2) unless it names exactly `alibaba-token-plan/qwen3.8-max`.
+  No other Qwen/DeepSeek variant and no rolling alias can be dispatched from this skill.
 - **`ALIBABA_TOKEN_PLAN_API_KEY` must be in the dispatch process environment.** A non-interactive
   session does not source `~/.zshrc`, so export it yourself (or set
   `ALIBABA_TOKEN_PLAN_API_KEY_FILE` to a readable absolute path holding it). The launcher exits 2

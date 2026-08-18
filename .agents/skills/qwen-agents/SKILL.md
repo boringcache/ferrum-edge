@@ -41,9 +41,10 @@ worker. The orchestrator selected this session's model deliberately.
    set `ALIBABA_TOKEN_PLAN_API_KEY_FILE` to a readable absolute path holding it, before
    dispatching. The launcher fails closed on a missing key rather than letting opencode surface a
    bare `No API-key provided` mid-run. Never echo, log, or commit the key.
-5. Use the pinned model `alibaba-token-plan/qwen3.8-max`. Pass
-   `--model alibaba-token-plan/<other>` only when the user explicitly asks for a different
-   model on that provider. Do not silently substitute a different provider or model.
+5. Use the pinned model `alibaba-token-plan/qwen3.8-max`. This is a **hard pin**: the
+   launcher refuses `--model` (exit 2) unless it names exactly that model, so no other
+   Qwen/DeepSeek variant and no rolling alias is dispatchable from this skill. Do not
+   substitute a different provider or model.
 
 ## Isolate every worker
 
