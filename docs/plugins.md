@@ -2488,7 +2488,73 @@ ferrum-hmac-v2\n{NAMESPACE}\n{USERNAME}\n{AUTHORITY}\n{METHOD}\n{PATH}\n{QUERY}\
 
 `{NAMESPACE}` is the namespace of the matched proxy (the default is `ferrum`) and HMAC Consumer identity lookup is restricted to that namespace. `{USERNAME}` is the decoded username auth-param. `{AUTHORITY}` is the validated request authority with an ASCII-lowercased hostname, no trailing DNS dot, no default `:80`/`:443` port, and any explicit non-default port retained; bracketed IPv6 remains bracketed. `{PATH}` is the request path component exactly as the client sent it on the wire — the raw target, *before* canonicalization — because the client signed those bytes; it is the only surface that reads the raw path, and it never influences routing or policy (see [docs/request_path_canonicalization.md](request_path_canonicalization.md)). `{QUERY}` is the raw query string as received (percent-encoded, without the leading `?`, empty when there is no query). `DIGEST_HEADER_VALUE` is the literal value of the selected digest field. Binding namespace, username, and authority prevents a captured signature from being relabeled to another Consumer, namespace, or virtual host; binding the raw query prevents query alteration.
 
-For RFC 9530 `Content-Digest`, use structured-field byte-sequence syntax such as `sha-256=:<base64-of-sha256-of-body>:`. Legacy `Digest` compatibility accepts `sha-256=<base64-of-sha256-of-body>`. SHA-512 is also supported. Ferrum verifies the digest against the original client bytes and signs its literal field value.
+Send **exactly one** body-integrity field:
+
+- RFC 9530 `Content-Digest` structured-field dictionary, for example `sha-256=:<standard-base64-of-sha256-of-body>:`
+- or legacy RFC 3230 `Digest`, for example `sha-256=<standard-base64-of-sha256-of-body>` with no colon wrapping
+
+Do not send both headers. Mixed RFC 9530 / legacy spellings on one field, duplicate algorithm keys, empty members, unsupported algorithms (`md5`, `sha-1`), and non-standard Base64 fail closed. When both `sha-256` and `sha-512` are present, **both** must match. Ferrum hashes the exact client bytes from the single forwarding buffer after a valid signature admits collection; it never invents an empty-body digest when the body was not collected. `{DIGEST_HEADER_VALUE}` is that field's literal header value, not a canonicalized rewrite.
+
+#### Example — RFC 9530 `Content-Digest` + `ferrum-hmac-v2`
+
+The Python snippet below computes the SHA-256 of the exact `--data-binary` bytes, builds the RFC 9530 field, and signs the documented v2 base (including the empty `{QUERY}` field when the URL has no query). It prints one `curl` command. Set `HMAC_SECRET` to the Consumer secret (≥32 non-whitespace characters); do not put a real secret in the script.
+
+```python
+#!/usr/bin/env python3
+import base64, hashlib, hmac, os, secrets, shlex, sys
+from email.utils import formatdate
+from urllib.parse import urlsplit
+
+secret = os.environ.get("HMAC_SECRET", "")
+if len(secret.strip()) < 32:
+    sys.exit("set HMAC_SECRET to the Consumer hmac_auth secret (>= 32 non-whitespace chars)")
+
+url = sys.argv[1] if len(sys.argv) > 1 else "http://127.0.0.1:8080/p/hmac"
+username = sys.argv[2] if len(sys.argv) > 2 else "alice"
+body = b'{"ping":1}'
+namespace = os.environ.get("FERRUM_NAMESPACE", "ferrum")
+
+parts = urlsplit(url)
+authority = parts.netloc.lower()
+path = parts.path or "/"
+query = parts.query  # empty when absent; still a signing field
+date = formatdate(usegmt=True)
+nonce = secrets.token_hex(16)
+digest = "sha-256=:" + base64.b64encode(hashlib.sha256(body).digest()).decode() + ":"
+signing_string = "\n".join([
+    "ferrum-hmac-v2",
+    namespace,
+    username,
+    authority,
+    "POST",
+    path,
+    query,
+    date,
+    digest,
+    nonce,
+])
+signature = base64.b64encode(
+    hmac.new(secret.encode(), signing_string.encode(), hashlib.sha256).digest()
+).decode()
+auth = (
+    f'hmac username="{username}", algorithm="hmac-sha256", '
+    f'nonce="{nonce}", signature="{signature}"'
+)
+cmd = [
+    "curl", "-sS", "-D-", "-X", "POST", url,
+    "-H", f"Authorization: {auth}",
+    "-H", f"Date: {date}",
+    "-H", f"Content-Digest: {digest}",
+    "--data-binary", body.decode(),
+]
+print(" ".join(shlex.quote(part) for part in cmd))
+```
+
+```bash
+export HMAC_SECRET='replace-with-the-consumer-secret-at-least-32-chars'
+python3 sign_hmac_v2.py 'http://127.0.0.1:8080/p/hmac' alice
+# copy and run the printed curl; it sends Content-Digest only, never Digest
+```
 
 `hmac_auth` authenticates the client-to-gateway representation. It cannot be combined on one proxy with a plugin that transforms the request body: configuration fails closed instead of forwarding an Authorization signature and digest that describe different bytes. The HMAC pre-authentication path verifies the original client bytes, then reuses that same bounded buffer for native gRPC primary dispatch on H1/H2 and H3; it never re-reads the upload or recomputes the client signature over a transformed representation. The stricter of the gRPC receive ceiling and HMAC's 10 MiB hard body ceiling applies even when the general request-body limit is unlimited.
 

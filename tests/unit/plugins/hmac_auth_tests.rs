@@ -4,6 +4,7 @@ use base64::Engine;
 use chrono::Utc;
 use ferrum_edge::ConsumerIndex;
 use ferrum_edge::config::types::Consumer;
+use ferrum_edge::plugins::utils::auth_flow::AuthMechanism;
 use ferrum_edge::plugins::{
     HTTP_FAMILY_PROTOCOLS, Plugin, PluginResult, RequestContext, hmac_auth::HmacAuth, priority,
 };
@@ -248,6 +249,13 @@ fn sha256_content_digest_header(body: &[u8]) -> String {
     )
 }
 
+fn sha512_content_digest_header(body: &[u8]) -> String {
+    format!(
+        "sha-512=:{}:",
+        base64::engine::general_purpose::STANDARD.encode(Sha512::digest(body))
+    )
+}
+
 /// Build a `Digest:` header value of the form `sha-512=<base64>`.
 fn sha512_digest_header(body: &[u8]) -> String {
     let mut hasher = Sha512::new();
@@ -264,6 +272,31 @@ fn hmac_auth_header(username: &str, algorithm: Option<&str>, signature: &str) ->
             username, alg, signature
         ),
         None => format!(r#"hmac username="{}", signature="{}""#, username, signature),
+    }
+}
+
+fn set_legacy_digest(ctx: &mut RequestContext, value: String) {
+    ctx.headers.remove("content-digest");
+    ctx.headers.insert("digest".to_string(), value);
+}
+
+fn set_content_digest(ctx: &mut RequestContext, value: String) {
+    ctx.headers.remove("digest");
+    ctx.headers.insert("content-digest".to_string(), value);
+}
+
+fn assert_reject_error(result: PluginResult, expected_status: u16, needle: &str) {
+    match result {
+        PluginResult::Reject {
+            status_code, body, ..
+        } => {
+            assert_eq!(status_code, expected_status, "body={body}");
+            assert!(
+                body.contains(needle),
+                "expected {needle:?} in rejection body {body}"
+            );
+        }
+        other => panic!("Expected Reject, got {other:?}"),
     }
 }
 
@@ -806,7 +839,7 @@ async fn test_preverified_reuse_verifies_seeded_empty_body_digests() {
             hmac_auth_header(TEST_USERNAME, Some("hmac-sha256"), &signature),
         );
         ctx.headers.insert("date".to_string(), date);
-        ctx.headers.insert("content-digest".to_string(), digest);
+        set_content_digest(&mut ctx, digest);
 
         assert!(
             plugin.should_buffer_request_body_before_authenticate(&ctx, &consumer_index),
@@ -834,8 +867,7 @@ async fn test_preverified_reuse_verifies_seeded_empty_body_digests() {
             hmac_auth_header(TEST_USERNAME, Some("hmac-sha256"), &signature),
         );
         ctx.headers.insert("date".to_string(), date);
-        ctx.headers
-            .insert("content-digest".to_string(), incorrect_digest);
+        set_content_digest(&mut ctx, incorrect_digest);
 
         assert!(
             plugin.should_buffer_request_body_before_authenticate(&ctx, &consumer_index),
@@ -1644,15 +1676,11 @@ async fn test_hmac_multi_secret_wrong_secret_rejected() {
 // Digest verification tests.
 // ────────────────────────────────────────────────────────────────────
 
-/// Helper to populate the buffered request body in a way that mirrors what
-/// the proxy hot path does in `store_request_body_metadata`.
+/// Helper to populate body hashes the same way `store_request_body_metadata`
+/// does for `hmac_auth` (`needs_request_body_digests`, no text/bytes copies).
 fn set_request_body(ctx: &mut RequestContext, body: &[u8]) {
     ctx.request_body_sha256 = Some(Sha256::digest(body).into());
     ctx.request_body_sha512 = Some(Sha512::digest(body).into());
-    if let Ok(s) = std::str::from_utf8(body) {
-        ctx.metadata
-            .insert("request_body".to_string(), s.to_string());
-    }
 }
 
 #[tokio::test]
@@ -1855,8 +1883,7 @@ async fn test_digest_required_content_digest_header_accepted() {
         hmac_auth_header("hmacuser", Some("hmac-sha256"), &signature),
     );
     ctx.headers.insert("date".to_string(), date);
-    // RFC 9530 header name and byte-sequence syntax (instead of legacy Digest).
-    ctx.headers.insert("content-digest".to_string(), digest);
+    set_content_digest(&mut ctx, digest);
     set_request_body(&mut ctx, body);
     ctx.identified_consumer = None;
 
@@ -2593,4 +2620,453 @@ async fn a_staged_record_is_not_consumed_when_the_request_changed() {
     // request still succeeds.
     let mut legitimate = request.context();
     assert_continue(owner.authenticate(&mut legitimate, &consumer_index).await);
+}
+
+// ────────────────────────────────────────────────────────────────────
+// Issue #3932 — Content-Digest + ferrum-hmac-v2 signing contract
+// ────────────────────────────────────────────────────────────────────
+
+fn sign_v2_with_digest(
+    secret: &str,
+    method: &str,
+    path: &str,
+    date: &str,
+    digest: &str,
+    nonce: &str,
+) -> String {
+    sign_v2(
+        secret,
+        HmacSigningInput {
+            namespace: ferrum_edge::config::types::DEFAULT_NAMESPACE,
+            username: TEST_USERNAME,
+            authority: TEST_AUTHORITY,
+            method,
+            path,
+            query: "",
+            date,
+            digest_header: digest,
+        },
+        nonce,
+    )
+}
+
+async fn authenticate_v2_digest_request(
+    digest: &str,
+    content_digest: bool,
+    body: &[u8],
+    hashes_present: bool,
+    nonce_seed: u64,
+) -> (PluginResult, RequestContext) {
+    let plugin = v2_plugin_named(&format!("v2-digest-{nonce_seed}"));
+    let consumer_index = ConsumerIndex::new(&[create_hmac_consumer()]);
+    let method = "POST";
+    let path = "/api/orders";
+    let date = current_date();
+    let nonce = test_nonce(nonce_seed);
+    let signature = sign_v2_with_digest(TEST_SECRET, method, path, &date, digest, &nonce);
+    let mut ctx = make_ctx(method, path);
+    ctx.headers.insert(
+        "authorization".to_string(),
+        v2_auth_header(TEST_USERNAME, &nonce, &signature),
+    );
+    ctx.headers.insert("date".to_string(), date);
+    if content_digest {
+        set_content_digest(&mut ctx, digest.to_string());
+    } else {
+        set_legacy_digest(&mut ctx, digest.to_string());
+    }
+    if hashes_present {
+        set_request_body(&mut ctx, body);
+    } else {
+        ctx.request_body_sha256 = None;
+        ctx.request_body_sha512 = None;
+    }
+    ctx.identified_consumer = None;
+    let result = plugin.authenticate(&mut ctx, &consumer_index).await;
+    (result, ctx)
+}
+
+#[tokio::test]
+async fn v2_accepts_rfc9530_content_digest_for_nonempty_body() {
+    let body = br#"{"ping":1}"#;
+    let digest = sha256_content_digest_header(body);
+    let (result, ctx) = authenticate_v2_digest_request(&digest, true, body, true, 3932).await;
+    assert_continue(result);
+    assert_eq!(ctx.identified_consumer.unwrap().username, TEST_USERNAME);
+}
+
+#[tokio::test]
+async fn v2_accepts_rfc9530_content_digest_for_empty_body() {
+    let body = b"";
+    let digest = sha256_content_digest_header(body);
+    let (result, ctx) = authenticate_v2_digest_request(&digest, true, body, true, 3933).await;
+    assert_continue(result);
+    assert_eq!(ctx.identified_consumer.unwrap().username, TEST_USERNAME);
+}
+
+#[tokio::test]
+async fn v2_accepts_legacy_digest_for_nonempty_and_empty_bodies() {
+    for (seed, body) in [(3934u64, &br#"{"ping":1}"#[..]), (3935, &b""[..])] {
+        let digest = sha256_digest_header(body);
+        let (result, ctx) = authenticate_v2_digest_request(&digest, false, body, true, seed).await;
+        assert_continue(result);
+        assert_eq!(ctx.identified_consumer.unwrap().username, TEST_USERNAME);
+    }
+}
+
+#[tokio::test]
+async fn v2_rejects_bad_digest_without_accepting_the_signature() {
+    let body = br#"{"ping":1}"#;
+    let digest = sha256_content_digest_header(b"not-the-body");
+    let (result, ctx) = authenticate_v2_digest_request(&digest, true, body, true, 3936).await;
+    assert_reject_error(result, 401, "Digest header does not match request body");
+    assert!(ctx.identified_consumer.is_none());
+}
+
+#[tokio::test]
+async fn v2_rejects_bad_signature_as_invalid_credentials() {
+    let plugin = v2_plugin_named("v2-bad-sig");
+    let consumer_index = ConsumerIndex::new(&[create_hmac_consumer()]);
+    let body = br#"{"ping":1}"#;
+    let digest = sha256_content_digest_header(body);
+    let date = current_date();
+    let nonce = test_nonce(3937);
+    let signature = sign_v2_with_digest(
+        "wrong-secret-that-cannot-authenticate-hmac",
+        "POST",
+        "/api/orders",
+        &date,
+        &digest,
+        &nonce,
+    );
+    let mut ctx = make_ctx("POST", "/api/orders");
+    ctx.headers.insert(
+        "authorization".to_string(),
+        v2_auth_header(TEST_USERNAME, &nonce, &signature),
+    );
+    ctx.headers.insert("date".to_string(), date);
+    set_content_digest(&mut ctx, digest);
+    set_request_body(&mut ctx, body);
+    assert_reject_error(
+        plugin.authenticate(&mut ctx, &consumer_index).await,
+        401,
+        "Invalid credentials",
+    );
+}
+
+#[tokio::test]
+async fn missing_body_hashes_do_not_impersonate_an_empty_body() {
+    let body = br#"{"ping":1}"#;
+    let digest = sha256_content_digest_header(body);
+    let (result, ctx) = authenticate_v2_digest_request(&digest, true, body, false, 3938).await;
+    assert_reject_error(result, 401, "Digest header does not match request body");
+    assert!(ctx.identified_consumer.is_none());
+}
+
+#[tokio::test]
+async fn missing_body_hashes_with_invalid_signature_are_invalid_credentials() {
+    let plugin = v2_plugin_named("v2-no-hash-bad-sig");
+    let consumer_index = ConsumerIndex::new(&[create_hmac_consumer()]);
+    let body = br#"{"ping":1}"#;
+    let digest = sha256_content_digest_header(body);
+    let date = current_date();
+    let nonce = test_nonce(3939);
+    let signature = sign_v2_with_digest(
+        "wrong-secret-that-cannot-authenticate-hmac",
+        "POST",
+        "/api/orders",
+        &date,
+        &digest,
+        &nonce,
+    );
+    let mut ctx = make_ctx("POST", "/api/orders");
+    ctx.request_body_sha256 = None;
+    ctx.request_body_sha512 = None;
+    ctx.headers.insert(
+        "authorization".to_string(),
+        v2_auth_header(TEST_USERNAME, &nonce, &signature),
+    );
+    ctx.headers.insert("date".to_string(), date);
+    set_content_digest(&mut ctx, digest);
+    assert_reject_error(
+        plugin.authenticate(&mut ctx, &consumer_index).await,
+        401,
+        "Invalid credentials",
+    );
+}
+
+#[tokio::test]
+async fn both_digest_headers_fail_closed_as_ambiguous() {
+    let plugin = v2_plugin_named("v2-ambiguous-digest");
+    let consumer_index = ConsumerIndex::new(&[create_hmac_consumer()]);
+    let body = br#"{"ping":1}"#;
+    let content = sha256_content_digest_header(body);
+    let legacy = sha256_digest_header(body);
+    let date = current_date();
+    let nonce = test_nonce(3940);
+    let signature = sign_v2_with_digest(
+        TEST_SECRET,
+        "POST",
+        "/api/orders",
+        &date,
+        &content,
+        &nonce,
+    );
+    let mut ctx = make_ctx("POST", "/api/orders");
+    ctx.headers.insert(
+        "authorization".to_string(),
+        v2_auth_header(TEST_USERNAME, &nonce, &signature),
+    );
+    ctx.headers.insert("date".to_string(), date);
+    ctx.headers.insert("content-digest".to_string(), content);
+    ctx.headers.insert("digest".to_string(), legacy);
+    set_request_body(&mut ctx, body);
+    assert_reject_error(
+        plugin.authenticate(&mut ctx, &consumer_index).await,
+        401,
+        "Ambiguous Digest and Content-Digest headers",
+    );
+}
+
+#[tokio::test]
+async fn unsupported_and_malformed_digest_headers_fail_closed() {
+    let plugin = v2_plugin_named("v2-digest-shape");
+    let consumer_index = ConsumerIndex::new(&[create_hmac_consumer()]);
+    let date = current_date();
+    let nonce = test_nonce(3941);
+    let signature = sign_v2_with_digest(
+        TEST_SECRET,
+        "POST",
+        "/api/orders",
+        &date,
+        "sha-256=aaaa",
+        &nonce,
+    );
+
+    let mut unsupported = make_ctx("POST", "/api/orders");
+    unsupported.headers.insert(
+        "authorization".to_string(),
+        v2_auth_header(TEST_USERNAME, &nonce, &signature),
+    );
+    unsupported.headers.insert("date".to_string(), date.clone());
+    set_legacy_digest(&mut unsupported, "md5=ignored".to_string());
+    assert_reject_error(
+        plugin
+            .authenticate(&mut unsupported, &consumer_index)
+            .await,
+        401,
+        "Unsupported digest algorithm",
+    );
+
+    let mut malformed = make_ctx("POST", "/api/orders");
+    malformed.headers.insert(
+        "authorization".to_string(),
+        v2_auth_header(TEST_USERNAME, &nonce, &signature),
+    );
+    malformed.headers.insert("date".to_string(), date);
+    set_content_digest(&mut malformed, "sha-256=not-a-byte-sequence".to_string());
+    assert_reject_error(
+        plugin.authenticate(&mut malformed, &consumer_index).await,
+        401,
+        "Malformed digest header",
+    );
+}
+
+#[tokio::test]
+async fn v2_accepts_combined_rfc9530_sha256_and_sha512_when_both_match() {
+    let body = br#"{"ping":1}"#;
+    let digest = format!(
+        "{}, {}",
+        sha256_content_digest_header(body),
+        sha512_content_digest_header(body)
+    );
+    let (result, ctx) = authenticate_v2_digest_request(&digest, true, body, true, 3945).await;
+    assert_continue(result);
+    assert_eq!(ctx.identified_consumer.unwrap().username, TEST_USERNAME);
+}
+
+#[tokio::test]
+async fn v2_rejects_when_one_of_two_digest_algorithms_mismatches() {
+    let body = br#"{"ping":1}"#;
+    let digest = format!(
+        "{}, {}",
+        sha256_content_digest_header(body),
+        sha512_content_digest_header(b"not-the-body")
+    );
+    let (result, ctx) = authenticate_v2_digest_request(&digest, true, body, true, 3946).await;
+    assert_reject_error(result, 401, "Digest header does not match request body");
+    assert!(ctx.identified_consumer.is_none());
+}
+
+#[tokio::test]
+async fn v2_rejects_duplicate_digest_algorithm_keys_and_mixed_spellings() {
+    let plugin = v2_plugin_named("v2-digest-duplicates");
+    let consumer_index = ConsumerIndex::new(&[create_hmac_consumer()]);
+    let body = br#"{"ping":1}"#;
+    let date = current_date();
+    let nonce = test_nonce(3947);
+    let single = sha256_content_digest_header(body);
+    let signature = sign_v2_with_digest(
+        TEST_SECRET,
+        "POST",
+        "/api/orders",
+        &date,
+        &single,
+        &nonce,
+    );
+
+    let mut duplicate = make_ctx("POST", "/api/orders");
+    duplicate.headers.insert(
+        "authorization".to_string(),
+        v2_auth_header(TEST_USERNAME, &nonce, &signature),
+    );
+    duplicate.headers.insert("date".to_string(), date.clone());
+    set_content_digest(&mut duplicate, format!("{single}, {single}"));
+    set_request_body(&mut duplicate, body);
+    assert_reject_error(
+        plugin.authenticate(&mut duplicate, &consumer_index).await,
+        401,
+        "Malformed digest header",
+    );
+
+    let mixed = format!("{}, {}", single, sha512_digest_header(body));
+    let mut mixed_ctx = make_ctx("POST", "/api/orders");
+    mixed_ctx.headers.insert(
+        "authorization".to_string(),
+        v2_auth_header(TEST_USERNAME, &nonce, &signature),
+    );
+    mixed_ctx.headers.insert("date".to_string(), date);
+    set_content_digest(&mut mixed_ctx, mixed);
+    set_request_body(&mut mixed_ctx, body);
+    assert_reject_error(
+        plugin.authenticate(&mut mixed_ctx, &consumer_index).await,
+        401,
+        "Malformed digest header",
+    );
+}
+
+#[tokio::test]
+async fn v2_replay_of_a_content_digest_request_is_rejected() {
+    let plugin = v2_plugin_named("v2-content-digest-replay");
+    let consumer_index = ConsumerIndex::new(&[create_hmac_consumer()]);
+    let body = br#"{"ping":1}"#;
+    let digest = sha256_content_digest_header(body);
+    let date = current_date();
+    let nonce = test_nonce(3942);
+    let signature = sign_v2_with_digest(
+        TEST_SECRET,
+        "POST",
+        "/api/orders",
+        &date,
+        &digest,
+        &nonce,
+    );
+
+    let mut first = make_ctx("POST", "/api/orders");
+    first.headers.insert(
+        "authorization".to_string(),
+        v2_auth_header(TEST_USERNAME, &nonce, &signature),
+    );
+    first.headers.insert("date".to_string(), date.clone());
+    set_content_digest(&mut first, digest.clone());
+    set_request_body(&mut first, body);
+    assert_continue(plugin.authenticate(&mut first, &consumer_index).await);
+
+    let mut replay = make_ctx("POST", "/api/orders");
+    replay.headers.insert(
+        "authorization".to_string(),
+        v2_auth_header(TEST_USERNAME, &nonce, &signature),
+    );
+    replay.headers.insert("date".to_string(), date);
+    set_content_digest(&mut replay, digest);
+    set_request_body(&mut replay, body);
+    assert_reject_error(
+        plugin.authenticate(&mut replay, &consumer_index).await,
+        401,
+        "Signed request has already been used",
+    );
+}
+
+#[tokio::test]
+async fn hmac_auth_preserves_downstream_request_body_bytes() {
+    let plugin = v2_plugin_named("v2-preserve-body");
+    let consumer_index = ConsumerIndex::new(&[create_hmac_consumer()]);
+    let body = br#"{"ping":1}"#;
+    let digest = sha256_content_digest_header(body);
+    let date = current_date();
+    let nonce = test_nonce(3943);
+    let signature = sign_v2_with_digest(
+        TEST_SECRET,
+        "POST",
+        "/api/orders",
+        &date,
+        &digest,
+        &nonce,
+    );
+    let mut ctx = make_ctx("POST", "/api/orders");
+    ctx.headers.insert(
+        "authorization".to_string(),
+        v2_auth_header(TEST_USERNAME, &nonce, &signature),
+    );
+    ctx.headers.insert("date".to_string(), date);
+    set_content_digest(&mut ctx, digest);
+    set_request_body(&mut ctx, body);
+    ctx.request_body_bytes = Some(bytes::Bytes::copy_from_slice(body));
+    ctx.identified_consumer = None;
+
+    assert_continue(plugin.authenticate(&mut ctx, &consumer_index).await);
+    assert_eq!(
+        ctx.request_body_bytes.as_deref(),
+        Some(body.as_slice()),
+        "hmac_auth must not rewrite the forwarding buffer"
+    );
+    assert!(
+        !ctx.metadata.contains_key("request_body"),
+        "hmac_auth must not retain a UTF-8 body copy"
+    );
+    let credential_debug = format!("{:?}", plugin.extract(&ctx));
+    assert!(
+        credential_debug.contains("[REDACTED]"),
+        "extracted HMAC credential debug must redact signature material"
+    );
+    assert!(
+        !credential_debug.contains("ping"),
+        "extracted HMAC credential debug must not include body content"
+    );
+    assert!(
+        !credential_debug.contains(&signature),
+        "extracted HMAC credential debug must not include the signature bytes"
+    );
+}
+
+#[tokio::test]
+async fn hmac_prebuffer_then_matching_rfc9530_body_authenticates() {
+    let plugin = v2_plugin_named("v2-prebuffer-content-digest");
+    let consumer_index = ConsumerIndex::new(&[create_hmac_consumer()]);
+    let body = br#"{"amount":1}"#;
+    let digest = sha256_content_digest_header(body);
+    let date = current_date();
+    let nonce = test_nonce(3944);
+    let signature = sign_v2_with_digest(
+        TEST_SECRET,
+        "POST",
+        "/upload",
+        &date,
+        &digest,
+        &nonce,
+    );
+
+    let mut ctx = make_ctx("POST", "/upload");
+    ctx.request_body_sha256 = None;
+    ctx.request_body_sha512 = None;
+    ctx.headers.insert(
+        "authorization".to_string(),
+        v2_auth_header(TEST_USERNAME, &nonce, &signature),
+    );
+    ctx.headers.insert("date".to_string(), date);
+    set_content_digest(&mut ctx, digest);
+    assert!(plugin.should_buffer_request_body_before_authenticate(&ctx, &consumer_index));
+    set_request_body(&mut ctx, body);
+    assert_continue(plugin.authenticate(&mut ctx, &consumer_index).await);
+    assert_eq!(ctx.identified_consumer.unwrap().username, TEST_USERNAME);
 }

@@ -1,5 +1,6 @@
 use async_trait::async_trait;
 use std::collections::HashMap;
+use std::fmt;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tracing::debug;
@@ -38,7 +39,7 @@ pub enum ExtractedCredential {
 /// HMAC credential fields extracted from a request, used to reconstruct the
 /// signing string and verify the body digest. Boxed inside
 /// [`ExtractedCredential::HmacAuth`].
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct HmacAuthCredential {
     /// Namespace of the matched proxy. HMAC identity resolution is scoped to
     /// this namespace and the value is bound into the signing base.
@@ -56,19 +57,53 @@ pub struct HmacAuthCredential {
     /// into the signing string so query parameters cannot be altered without
     /// invalidating the HMAC. Empty when the request had no query.
     pub query: String,
-    /// Value of legacy `Digest:` or RFC 9530 `Content-Digest:`
-    /// header.
+    /// Literal value of the selected digest field (`Content-Digest` or
+    /// `Digest`). Signed as-is; never a canonicalized rewrite.
     pub digest_header: String,
+    /// `true` when the selected field was RFC 9530 `Content-Digest`.
+    /// `false` means RFC 3230 `Digest`. The two spellings are not interchangeable.
+    pub digest_is_rfc9530: bool,
     /// `ferrum-hmac-v2` client nonce from the `Authorization` parameters,
     /// already validated for wire form. Bound into the v2 signing base and, once
     /// the signature and body digest verify, claimed exactly once against the
     /// shared replay authority. `None` under the legacy `ferrum-hmac-v1`
     /// profile, which accepts no nonce and provides no single-use guarantee.
     pub nonce: Option<String>,
-    /// Hashes of the sole forwarding buffer used to verify `digest_header`
-    /// without retaining another full request-body copy.
-    pub request_body_sha256: [u8; 32],
-    pub request_body_sha512: [u8; 64],
+    /// SHA-256 of the sole forwarding buffer, when the proxy has actually
+    /// hashed those bytes. `None` means the body was not collected — never
+    /// treated as the empty-body digest.
+    pub request_body_sha256: Option<[u8; 32]>,
+    /// SHA-512 of the same forwarding buffer, paired with
+    /// [`Self::request_body_sha256`].
+    pub request_body_sha512: Option<[u8; 64]>,
+}
+
+impl fmt::Debug for HmacAuthCredential {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("HmacAuthCredential")
+            .field("namespace", &self.namespace)
+            .field("username", &self.username)
+            .field("authority", &self.authority)
+            .field("algorithm", &self.algorithm)
+            .field("signature", &"[REDACTED]")
+            .field("date", &self.date)
+            .field("method", &self.method)
+            .field("path", &self.path)
+            .field("query", &self.query)
+            .field("digest_header", &"[REDACTED]")
+            .field("digest_is_rfc9530", &self.digest_is_rfc9530)
+            .field("nonce", &self.nonce.as_ref().map(|_| "[REDACTED]"))
+            .field(
+                "request_body_sha256",
+                &self.request_body_sha256.as_ref().map(|_| "[REDACTED]"),
+            )
+            .field(
+                "request_body_sha512",
+                &self.request_body_sha512.as_ref().map(|_| "[REDACTED]"),
+            )
+            .finish()
+    }
 }
 
 /// Canonical maximum size, in UTF-8 bytes, of an authenticated principal.
