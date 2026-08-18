@@ -3121,7 +3121,12 @@ async fn scan_text_plain_body(plugin: &Waf, body: &[u8]) -> RequestContext {
 
 #[tokio::test]
 async fn ssrf_query_mirrors_fire_at_default_paranoia() {
-    let plugin = Waf::new(&json!({})).unwrap();
+    // These assert that the SSRF query mirrors FIRE (monitored hits), not that
+    // they block; `ssrf_query_mirrors_enforce_at_paranoia_1` covers blocking
+    // separately. A bare `{}` is no longer admissible because `mode` defaults to
+    // `enforce` and the built-in pack is monitor-only (issue #3928), so state the
+    // monitor posture these assertions already assume.
+    let plugin = Waf::new(&json!({ "mode": "monitor" })).unwrap();
 
     let metadata = authorize_query(
         &plugin,
@@ -3178,7 +3183,12 @@ async fn ssrf_query_mirrors_enforce_at_paranoia_1() {
 
 #[tokio::test]
 async fn ssrf_query_benign_urls_and_unclaimed_forms_are_clean() {
-    let plugin = Waf::new(&json!({})).unwrap();
+    // These assert that the SSRF query mirrors FIRE (monitored hits), not that
+    // they block; `ssrf_query_mirrors_enforce_at_paranoia_1` covers blocking
+    // separately. A bare `{}` is no longer admissible because `mode` defaults to
+    // `enforce` and the built-in pack is monitor-only (issue #3928), so state the
+    // monitor posture these assertions already assume.
+    let plugin = Waf::new(&json!({ "mode": "monitor" })).unwrap();
 
     let https = authorize_query(&plugin, "/redirect", "next=https://example.com/path").await;
     assert!(!monitored(&https, "FE-SSRF-001-Q"));
@@ -3208,7 +3218,12 @@ async fn ssrf_query_benign_urls_and_unclaimed_forms_are_clean() {
 
 #[tokio::test]
 async fn ssrf_encoded_query_values_match_after_layered_decode() {
-    let plugin = Waf::new(&json!({})).unwrap();
+    // These assert that the SSRF query mirrors FIRE (monitored hits), not that
+    // they block; `ssrf_query_mirrors_enforce_at_paranoia_1` covers blocking
+    // separately. A bare `{}` is no longer admissible because `mode` defaults to
+    // `enforce` and the built-in pack is monitor-only (issue #3928), so state the
+    // monitor posture these assertions already assume.
+    let plugin = Waf::new(&json!({ "mode": "monitor" })).unwrap();
 
     let percent = authorize_query(
         &plugin,
@@ -3235,7 +3250,12 @@ async fn ssrf_encoded_query_values_match_after_layered_decode() {
 
 #[tokio::test]
 async fn ssrf_body_and_query_parity_for_metadata_and_gopher() {
-    let plugin = Waf::new(&json!({})).unwrap();
+    // These assert that the SSRF query mirrors FIRE (monitored hits), not that
+    // they block; `ssrf_query_mirrors_enforce_at_paranoia_1` covers blocking
+    // separately. A bare `{}` is no longer admissible because `mode` defaults to
+    // `enforce` and the built-in pack is monitor-only (issue #3928), so state the
+    // monitor posture these assertions already assume.
+    let plugin = Waf::new(&json!({ "mode": "monitor" })).unwrap();
 
     let body_metadata =
         scan_text_plain_body(&plugin, b"http://169.254.169.254/latest/meta-data/").await;
