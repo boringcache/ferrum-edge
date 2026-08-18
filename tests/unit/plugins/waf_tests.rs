@@ -563,6 +563,61 @@ async fn body_json_path_rule_scans_decoded_variants() {
 }
 
 #[tokio::test]
+async fn custom_body_json_path_fp_filter_suppresses_json_ld_script() {
+    // Issue #3938: per-rule fp_filters must be evaluated against the complete
+    // JSON-path value after the rule matcher hits, not only the matched token.
+    let plugin = Waf::new(&json!({
+        "include_default_rules": false,
+        "custom_rules": [{
+            "id": "ACME-1",
+            "category": "custom",
+            "severity": "high",
+            "target": { "type": "body_json_path", "path": "user.bio" },
+            "match_kind": "contains",
+            "pattern": "<script",
+            "action": "enforce",
+            "paranoia_min": 1,
+            "fp_filters": ["<script type=\"application/ld\\+json\">"],
+            "conditions": { "methods": ["POST"], "paths": ["/profile*"] }
+        }]
+    }))
+    .unwrap();
+
+    let mut blocked = ctx("POST", "/profile/edit");
+    blocked
+        .headers
+        .insert("content-type".into(), "application/json".into());
+    let headers = blocked.headers.clone();
+    let result = plugin
+        .on_final_request_body_with_context(
+            &mut blocked,
+            &headers,
+            br#"{"user":{"bio":"<script>alert(1)</script>"}}"#,
+        )
+        .await;
+    assert!(matches!(result, PluginResult::Reject { .. }));
+    assert_eq!(
+        blocked.metadata.get("waf.rule_hits").map(String::as_str),
+        Some("ACME-1")
+    );
+
+    let mut suppressed = ctx("POST", "/profile/edit");
+    suppressed
+        .headers
+        .insert("content-type".into(), "application/json".into());
+    let headers = suppressed.headers.clone();
+    let result = plugin
+        .on_final_request_body_with_context(
+            &mut suppressed,
+            &headers,
+            br#"{"user":{"bio":"<script type=\"application/ld+json\">{\"@context\":\"https://schema.org\"}</script>"}}"#,
+        )
+        .await;
+    assert!(matches!(result, PluginResult::Continue));
+    assert!(!suppressed.metadata.contains_key("waf.rule_hits"));
+}
+
+#[tokio::test]
 async fn body_luhn_and_cidr_rules_scan_decoded_variants() {
     let plugin = Waf::new(&json!({
         "include_default_rules": false,
