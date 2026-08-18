@@ -1392,10 +1392,7 @@ mod tests {
 
     fn pack_pair() -> Vec<(WafRule, bool)> {
         vec![
-            (
-                method_rule("CORE-001", DefaultActionPolicy::Inherit),
-                true,
-            ),
+            (method_rule("CORE-001", DefaultActionPolicy::Inherit), true),
             (
                 method_rule("HEURISTIC-001", DefaultActionPolicy::OptInEnforce),
                 true,
