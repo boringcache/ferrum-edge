@@ -63,6 +63,10 @@ curl http://localhost:9000/live
 
 `/live` is always unauthenticated and returns only `{"status":"ok"}` with a 200. It reveals no operational internals and is the recommended endpoint for load-balancer / Kubernetes **liveness** probes.
 
+#### Withdrawn admin client-certificate trust (issue #3857)
+
+There is one transport-level exception that applies to **every** admin endpoint, `/live` included. When admin HTTPS terminates client certificates (`FERRUM_ADMIN_TLS_CLIENT_CA_BUNDLE_PATH`) and frontend TLS live reload is enabled, an established admin connection whose client certificate the operator has since revoked — via `FERRUM_TLS_CRL_FILE_PATH` — or whose issuing CA has left the bundle is **retired**: any request already buffered on that connection is refused with a fixed `401 {"error":"Client certificate trust withdrawn"}` *before* it enters admin routing, and the connection ends through hyper's graceful shutdown (HTTP/2 gets a `GOAWAY`; HTTP/1.1 ends keep-alive). Plaintext admin connections and admin TLS connections that presented no client certificate are untouched, and the admin connection permit and slowloris accounting release exactly once on the paths that already own them. See [Frontend TLS → Client-Trust Generations and Established-Transport Retirement](frontend_tls.md#client-trust-generations-and-established-transport-retirement).
+
 ### `/health`, `/status` — readiness + diagnostics (tiered)
 
 ```bash

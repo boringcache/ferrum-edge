@@ -1,8 +1,5 @@
-use std::borrow::Cow;
 use std::collections::HashMap;
 use std::net::IpAddr;
-
-use percent_encoding::percent_decode_str;
 
 use super::Waf;
 use super::decode;
@@ -156,15 +153,16 @@ impl Waf {
         // value past `query_keys`/`query_values` rules. The parsed HashMap
         // still collapses `?q=<script>&q=ok` to `q=ok`, so relying on the
         // monitor-only HPP rule alone would miss enforced query-value rules.
+        // Split on `&`/`=` first, then canonicalize each component (including
+        // `%2f`) so PATHTRAV/LFI see decoded slashes without treating encoded
+        // separators as extra pairs.
         if let Some(raw) = raw_query {
             for pair in raw.split('&') {
                 if pair.is_empty() {
                     continue;
                 }
                 let (raw_k, raw_v) = pair.split_once('=').unwrap_or((pair, ""));
-                let key = decode_query_component_for_waf(raw_k);
-                let value = decode_query_component_for_waf(raw_v);
-                self.scan_query_pair(&mut outcome, &key, &value, subject);
+                self.scan_query_pair(&mut outcome, raw_k, raw_v, subject);
             }
         } else {
             for (key, value) in &ctx.query_params {
@@ -244,6 +242,9 @@ impl Waf {
             body,
             subject,
         );
+        // JSON-path rules decode variants per selected scalar so whole-body
+        // normalization cannot rewrite unrelated `+` characters (for example
+        // `application/ld+json`) and bypass per-rule `fp_filters`.
         self.scan_json_path_rules(&mut outcome, body, subject);
         let text = String::from_utf8_lossy(body);
         // Re-scan decoded forms so payloads hidden behind JSON `\uXXXX`,
@@ -259,7 +260,6 @@ impl Waf {
         // layered decode cannot fully peel, are otherwise silent).
         self.scan_body_encoding_specials(&mut outcome, text.as_ref(), residual_encoding, subject);
         for variant in variants {
-            self.scan_json_path_rules(&mut outcome, variant.as_bytes(), subject);
             self.scan_bytes_set(
                 &mut outcome,
                 self.compiled.body_bytes.as_ref(),
@@ -437,33 +437,49 @@ impl Waf {
             let Some(text) = json_scan_text(value, &mut scratch) else {
                 continue;
             };
-            if self.json_path_rule_matches(path_rule, text, subject) {
-                outcome.push(RuleHit {
-                    rule_index: path_rule.rule_index,
-                    target_name: path_rule.target_name,
-                });
+            self.push_json_path_hit_if_matched(outcome, path_rule, text, text, subject);
+            let (variants, _) = normalize::decoded_variants_with_residual(text);
+            for variant in variants {
+                self.push_json_path_hit_if_matched(outcome, path_rule, &variant, text, subject);
             }
+        }
+    }
+
+    fn push_json_path_hit_if_matched(
+        &self,
+        outcome: &mut ScanOutcome,
+        path_rule: &JsonPathRule,
+        match_value: &str,
+        fp_filter_target: &str,
+        subject: ScanSubject<'_>,
+    ) {
+        if self.json_path_rule_matches(path_rule, match_value, fp_filter_target, subject) {
+            outcome.push(RuleHit {
+                rule_index: path_rule.rule_index,
+                target_name: path_rule.target_name,
+            });
         }
     }
 
     fn json_path_rule_matches(
         &self,
         path_rule: &JsonPathRule,
-        value: &str,
+        match_value: &str,
+        fp_filter_target: &str,
         subject: ScanSubject<'_>,
     ) -> bool {
         let rule = &self.compiled.rules[path_rule.rule_index];
         let matched = match &path_rule.matcher {
-            JsonPathMatcher::Regex(regex) => regex.is_match(value),
-            JsonPathMatcher::Luhn => contains_luhn_candidate(value),
+            JsonPathMatcher::Regex(regex) => regex.is_match(match_value),
+            JsonPathMatcher::Luhn => contains_luhn_candidate(match_value),
             JsonPathMatcher::Cidr => rule
                 .cidr
-                .is_some_and(|cidr| extract_ip_tokens(value).any(|ip| cidr.matches(ip))),
+                .is_some_and(|cidr| extract_ip_tokens(match_value).any(|ip| cidr.matches(ip))),
         };
         matched
             && self.rule_applies(subject, path_rule.rule_index)
-            && !self.exemptions.suppresses_value(value)
-            && !rule.suppresses_text(value)
+            && !self.exemptions.suppresses_value(fp_filter_target)
+            && !rule.suppresses_text(fp_filter_target)
     }
 
     fn scan_cookies(&self, outcome: &mut ScanOutcome, header: &str, subject: ScanSubject<'_>) {
@@ -491,38 +507,51 @@ impl Waf {
     fn scan_query_pair(
         &self,
         outcome: &mut ScanOutcome,
-        key: &str,
-        value: &str,
+        raw_key: &str,
+        raw_value: &str,
         subject: ScanSubject<'_>,
     ) {
-        self.scan_text_set(
-            outcome,
-            self.compiled.query_keys.as_ref(),
-            key,
-            subject,
-            None,
-        );
-        self.scan_text_set(
-            outcome,
-            self.compiled.query_values.as_ref(),
-            value,
-            subject,
-            None,
-        );
-        self.scan_cidr_rules_matching(
-            outcome,
-            key,
-            &self.compiled.text_cidr_rules,
-            subject,
-            |target| matches!(target, RuleTarget::QueryKeys),
-        );
-        self.scan_cidr_rules_matching(
-            outcome,
-            value,
-            &self.compiled.text_cidr_rules,
-            subject,
-            |target| matches!(target, RuleTarget::QueryValues),
-        );
+        let key_views = normalize::canonical_query_component_views(raw_key);
+        let value_views = normalize::canonical_query_component_views(raw_value);
+        for key in key_views.iter() {
+            self.scan_text_set(
+                outcome,
+                self.compiled.query_keys.as_ref(),
+                key,
+                subject,
+                None,
+            );
+            self.scan_cidr_rules_matching(
+                outcome,
+                key,
+                &self.compiled.text_cidr_rules,
+                subject,
+                |target| matches!(target, RuleTarget::QueryKeys),
+            );
+        }
+        for value in value_views.iter() {
+            self.scan_text_set(
+                outcome,
+                self.compiled.query_values.as_ref(),
+                value,
+                subject,
+                None,
+            );
+            self.scan_text_set(
+                outcome,
+                self.compiled.canonical_query_values.as_ref(),
+                value,
+                subject,
+                None,
+            );
+            self.scan_cidr_rules_matching(
+                outcome,
+                value,
+                &self.compiled.text_cidr_rules,
+                subject,
+                |target| matches!(target, RuleTarget::QueryValues),
+            );
+        }
     }
 
     fn scan_luhn_rules(
@@ -757,15 +786,6 @@ impl Waf {
                 target_name: rule_ref.target_name,
             });
         }
-    }
-}
-
-fn decode_query_component_for_waf(raw: &str) -> Cow<'_, str> {
-    let decoded = percent_decode_str(raw).decode_utf8_lossy();
-    if decoded.contains('+') {
-        Cow::Owned(decoded.replace('+', " "))
-    } else {
-        decoded
     }
 }
 

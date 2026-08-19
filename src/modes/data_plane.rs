@@ -21,6 +21,7 @@ use crate::config::EnvConfig;
 use crate::config::types::GatewayConfig;
 use crate::dns::{DnsCache, DnsConfig};
 use crate::modes::startup_security;
+use crate::modes::tls_reload;
 use crate::proxy::{self, ProxyState};
 use crate::startup::wait_for_start_signals;
 use crate::tls;
@@ -255,9 +256,16 @@ pub async fn run(
         };
 
     // Load TLS configuration if provided (shared with validate, issue #2976).
-    let tls_config = match startup_security::try_load_frontend_tls(&env_config, &tls_policy, &crls)
-    {
-        Ok(Some(mut config)) => {
+    // The candidate carries the client-certificate verifier and trust identity
+    // of this same load, so the client-trust baseline armed below describes
+    // exactly the material these listeners serve (issue #3857).
+    let tls_startup = match startup_security::try_load_frontend_tls_candidate(
+        &env_config,
+        &tls_policy,
+        &crls,
+    ) {
+        Ok(Some(candidate)) => {
+            let mut config = candidate.config;
             info!("Loading TLS configuration...");
             // Enable 0-RTT on the proxy frontend only (not admin).
             tls::enable_early_data(&mut config, &tls_policy);
@@ -276,7 +284,7 @@ pub async fn run(
                     "TLS configuration loaded without client certificate verification (HTTPS available)"
                 );
             }
-            Some(config)
+            Some((config, candidate.client_trust))
         }
         Ok(None) => {
             info!("No TLS configuration provided (HTTP only)");
@@ -287,6 +295,10 @@ pub async fn run(
             return Err(e);
         }
     };
+    let (tls_config, frontend_startup_client_trust) = match tls_startup {
+        Some((config, client_trust)) => (Some(config), Some(client_trust)),
+        None => (None, None),
+    };
 
     // Wire opt-in frontend TLS live reload (see modes/database.rs for full
     // rationale). DP-mode listeners participate identically: live reload is
@@ -295,6 +307,7 @@ pub async fn run(
     let proxy_frontend_reload_handles = tls_config.as_ref().map(|cfg| {
         crate::modes::tls_reload::prepare_proxy_frontend_tls(
             cfg.clone(),
+            frontend_startup_client_trust.clone(),
             &env_config,
             &tls_policy,
             &crls,
@@ -325,6 +338,62 @@ pub async fn run(
     let (proxy_frontend_tls_revision_tx, proxy_frontend_tls_revision_rx) =
         tokio::sync::watch::channel(0_u64);
     let cp_frontend_tls_materialized = Arc::new(AtomicBool::new(false));
+    let operator_accepted_slot = proxy_frontend_reload_handles
+        .as_ref()
+        .and_then(|handles| handles.accepted_slot.clone());
+    let mut h3_pairing = operator_accepted_slot.as_ref().and_then(|slot| {
+        let initial = slot.load_full().as_ref().clone()?;
+        Some(Arc::new(
+            crate::grpc::dp_client::DpFrontendH3Pairing::from_operator_candidate(initial),
+        ))
+    });
+    // CP-only server certificate (issue #3857). This DP has an HTTPS listener
+    // slot but no operator cert/key, so CP-delivered Gateway TLS material is the
+    // only server certificate it will ever serve — while the client-CA bundle
+    // and CRL remain operator-owned inputs that CP never delivers. Arm and
+    // live-reload that operator trust anyway: the accepted verifier is what the
+    // CP snapshot's `ProxyFrontend` handshake wrapper consults on new H1/H2 and
+    // TCP+TLS handshakes, the published generation is what retires established
+    // client-certificate transports on a withdrawal, and the pairing is what
+    // hands HTTP/3 one coherent (CP server config, accepted operator trust)
+    // candidate. No operator server certificate is ever synthesized.
+    let mut dp_client_trust_watcher: Option<JoinHandle<()>> = None;
+    if tls_config.is_none()
+        && h3_pairing.is_none()
+        && let Some(listener_slot) = proxy_frontend_tls_slot.clone()
+        && let Some(prepared) = tls_reload::prepare_dp_operator_client_trust(&env_config, &crls)?
+    {
+        let trust = prepared.client_trust.clone();
+        let pairing = Arc::new(
+            crate::grpc::dp_client::DpFrontendH3Pairing::from_operator_client_trust(trust.clone()),
+        );
+        // Arm the baseline before any listener accepts, so the very first
+        // connection already carries a generation the first reload can fence it
+        // against. Nothing is exposed by this transaction: CP owns the server
+        // certificate and has not delivered one yet, so there is no paired
+        // candidate and no listener config to publish — only the live verifier
+        // and the baseline generation.
+        pairing
+            .publish_operator_client_trust(trust, None, None)
+            .await;
+        let watcher = tls_reload::spawn_dp_operator_client_trust_watcher(
+            prepared,
+            tls_reload::DpOperatorClientTrustWiring {
+                pairing: pairing.clone(),
+                listener_slot,
+                stream_listeners: proxy_state.stream_listener_manager.clone(),
+                revision_tx: proxy_frontend_tls_revision_tx.clone(),
+            },
+            env_config.tls_max_material_size_bytes,
+            Some(shutdown_tx.subscribe()),
+        );
+        dp_client_trust_watcher = Some(watcher);
+        info!(
+            interval_secs = env_config.frontend_tls_watch_interval_seconds,
+            "Frontend client-trust live reload enabled for a DP whose frontend server certificate is control-plane delivered"
+        );
+        h3_pairing = Some(pairing);
+    }
     let dp_frontend_tls_runtime =
         proxy_frontend_tls_slot
             .clone()
@@ -333,6 +402,7 @@ pub async fn run(
                 restore_source_slot: operator_frontend_tls_slot.clone(),
                 h3_revision_tx: Some(proxy_frontend_tls_revision_tx.clone()),
                 cp_materialized: cp_frontend_tls_materialized.clone(),
+                h3_pairing: h3_pairing.clone(),
             });
 
     // Set TLS config on stream listener manager for TCP proxies with frontend_tls.
@@ -355,6 +425,7 @@ pub async fn run(
                 cert_path.clone(),
                 key_path.clone(),
                 env_config.dtls_client_ca_cert_path.clone(),
+                env_config.frontend_tls_live_reload_enabled,
             )
             .await;
     }
@@ -366,6 +437,10 @@ pub async fn run(
     let mut listener_handles = Vec::new();
     let mut background_handles: Vec<JoinHandle<()>> = Vec::new();
     let mut startup_signals = Vec::new();
+    // Long-lived watcher; it self-terminates on the shutdown receiver it holds.
+    if let Some(handle) = dp_client_trust_watcher.take() {
+        background_handles.push(handle);
+    }
 
     // Shared readiness flag. DP defers flipping it to `true` until the DP client
     // applies the first CP snapshot (and classifies backend capabilities), but
@@ -390,6 +465,8 @@ pub async fn run(
     ) {
         let cp_materialized = cp_frontend_tls_materialized.clone();
         let revision_tx = proxy_frontend_tls_revision_tx.clone();
+        let pairing = h3_pairing.clone();
+        let operator_accepted = operator_accepted_slot.clone();
         let mut bridge_shutdown = shutdown_tx.subscribe();
         let bridge_proxy_state = proxy_state.clone();
         let bridge_handle = tokio::spawn(async move {
@@ -398,6 +475,35 @@ pub async fn run(
                     changed = operator_revision_rx.changed() => {
                         if changed.is_err() {
                             break;
+                        }
+                        if let (Some(pairing), Some(operator_accepted)) =
+                            (pairing.as_ref(), operator_accepted.as_ref())
+                        {
+                            // CP may own the server certificate; still wake H3
+                            // with the paired (CP config, operator trust) Arc.
+                            // H1/H2/TCP keep that CP config, which binds the
+                            // ProxyFrontend live wrapper, so new handshakes
+                            // consult the accepted operator verifier without
+                            // substituting the operator server certificate.
+                            // A refused operator candidate never updates the
+                            // accepted slot or this revision watch, so last-good
+                            // H3 verifier/config/generation/sessions are retained.
+                            let Some(candidate) =
+                                operator_accepted.load_full().as_ref().clone()
+                            else {
+                                continue;
+                            };
+                            pairing
+                                .publish_operator_candidate(
+                                    candidate,
+                                    Some(&listener_slot),
+                                    Some(bridge_proxy_state.stream_listener_manager.as_ref()),
+                                )
+                                .await;
+                            revision_tx.send_modify(|revision| {
+                                *revision = revision.saturating_add(1);
+                            });
+                            continue;
                         }
                         if cp_materialized.load(Ordering::Acquire) {
                             continue;
@@ -548,6 +654,13 @@ pub async fn run(
             client_ca_bundle_path: env_config.frontend_tls_client_ca_bundle_path.clone(),
             client_crls: crls.clone(),
             tls_slot: proxy_frontend_tls_slot.clone(),
+            // When the operator reload pipeline publishes accepted candidates,
+            // H3 adopts the DP pairing slot: CP server config (while present)
+            // plus the latest accepted operator client-trust, as one Arc.
+            // Without pairing, H3 falls back to its coherent configured load.
+            tls_accepted_slot: h3_pairing
+                .as_ref()
+                .map(|pairing| pairing.h3_accepted_slot.clone()),
             tls_revision_rx: proxy_frontend_tls_slot
                 .as_ref()
                 .map(|_| proxy_frontend_tls_revision_rx.clone()),
@@ -589,6 +702,15 @@ pub async fn run(
             let h3_reload = proxy_frontend_tls_slot.clone().map(|tls_slot| {
                 crate::http3::server::Http3FrontendTlsReload {
                     tls_slot,
+                    // Pairing publishes one Arc of (active server config,
+                    // accepted operator trust). CP material never substitutes
+                    // the operator server certificate into this candidate's
+                    // trust half, and an operator trust reload never replaces
+                    // the CP server certificate. Without pairing, H3 loads
+                    // configured client trust coherently itself.
+                    accepted_slot: h3_pairing
+                        .as_ref()
+                        .map(|pairing| pairing.h3_accepted_slot.clone()),
                     revision_rx: proxy_frontend_tls_revision_rx.clone(),
                 }
             });
@@ -772,13 +894,13 @@ pub async fn run(
         let admin_https_shutdown = shutdown_tx.subscribe();
 
         // Load admin TLS configuration (shared with validate, issue #2976).
-        let admin_tls_config = match startup_security::load_admin_tls_material(
+        let admin_tls_candidate = match startup_security::load_admin_tls_candidate(
             &env_config,
             &tls_policy,
             &crls,
             "Invalid admin TLS configuration",
         ) {
-            Ok(config) => {
+            Ok(candidate) => {
                 if env_config.admin_tls_client_ca_bundle_path.is_some() {
                     info!(
                         "Admin TLS configuration loaded with client certificate verification (HTTPS with mTLS available)"
@@ -792,7 +914,7 @@ pub async fn run(
                         "Admin TLS configuration loaded without client certificate verification (HTTPS available)"
                     );
                 }
-                config
+                candidate
             }
             Err(e) => {
                 error!("Failed to load admin TLS configuration: {:#}", e);
@@ -800,8 +922,12 @@ pub async fn run(
             }
         };
 
+        let admin_tls_config = admin_tls_candidate.config;
         let admin_reload_handles = crate::modes::tls_reload::prepare_admin_frontend_tls(
             admin_tls_config.clone(),
+            // Baseline from the exact load that produced `admin_tls_config`
+            // (issue #3857), never from a second read of the client-CA source.
+            Some(admin_tls_candidate.client_trust),
             &env_config,
             &tls_policy,
             &crls,

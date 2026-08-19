@@ -786,6 +786,64 @@ wait_for_body_contains() {
   return 1
 }
 
+# Wait until /weight is served, then rapid-sample both backends.
+#
+# Hosted RCA (PR #3971, SHA 3e4f5e4): neighboring PathPrefix rules on the same
+# HTTPRoute were already answering, then `curl --fail` aborted the script on the
+# first /weight 404 (exit 22) before the 20-probe loop ran. The weighted rule
+# programs a backend set, so an intermediate snapshot can omit that path even
+# while /host and /redirect are live. Treat that miss like wait_for_body_contains
+# (60 * 2s). Once a 200 lands, fire the original 20-probe budget with no sleep
+# so a single-backend product defect fails quickly instead of soaking 2s gaps.
+# Failure prints which backends were seen, sample count, last body, and last
+# HTTP status so a 404 miss cannot be confused with broken weighting.
+wait_for_weighted_backends() {
+  local host="$1"
+  local path="$2"
+  local seen_a=0
+  local seen_b=0
+  local last_body=""
+  local samples=0
+  local body
+
+  for _ in $(seq 1 60); do
+    if body="$(curl_body "$host" "$path" 2>/dev/null)"; then
+      last_body="$body"
+      samples=$((samples + 1))
+      grep -q "backend=blackbox-a" <<<"$body" && seen_a=1
+      grep -q "backend=blackbox-b" <<<"$body" && seen_b=1
+      break
+    fi
+    sleep 2
+  done
+  if [ "$samples" -eq 0 ]; then
+    echo "weighted path ${host}${path} did not converge (seen_a=${seen_a} seen_b=${seen_b} samples=0 last_http=$(curl_status "$host" "$path"))" >&2
+    return 1
+  fi
+
+  for _ in $(seq 1 19); do
+    if [ "$seen_a" -eq 1 ] && [ "$seen_b" -eq 1 ]; then
+      break
+    fi
+    if body="$(curl_body "$host" "$path" 2>/dev/null)"; then
+      last_body="$body"
+      samples=$((samples + 1))
+      grep -q "backend=blackbox-a" <<<"$body" && seen_a=1
+      grep -q "backend=blackbox-b" <<<"$body" && seen_b=1
+    else
+      # A later snapshot can 404 the weighted path again; do not burn the
+      # remaining samples in a tight loop, and do not treat that miss as a hit.
+      sleep 2
+    fi
+  done
+
+  if [ "$seen_a" -ne 1 ] || [ "$seen_b" -ne 1 ]; then
+    echo "weighted backend selection did not reach both backends (seen_a=${seen_a} seen_b=${seen_b} samples=${samples} last_body=${last_body} last_http=$(curl_status "$host" "$path"))" >&2
+    return 1
+  fi
+  printf '%s\n' "$last_body"
+}
+
 # Same retry budget as wait_for_body_contains, over the HTTPS listener. The TLS
 # route is the only black-box assertion whose listener depends on the CP having
 # already withdrawn the deleted upstream Gateway's claim on the namespace's
@@ -828,17 +886,7 @@ run_blackbox_tests() {
   fi
   echo "request redirect returned ${redirect}" >> "$report"
 
-  local seen_a=0
-  local seen_b=0
-  for _ in $(seq 1 20); do
-    body="$(curl_body blackbox.example /weight)"
-    grep -q "backend=blackbox-a" <<<"$body" && seen_a=1
-    grep -q "backend=blackbox-b" <<<"$body" && seen_b=1
-  done
-  if [ "$seen_a" -ne 1 ] || [ "$seen_b" -ne 1 ]; then
-    echo "weighted backend selection did not reach both backends" >&2
-    return 1
-  fi
+  wait_for_weighted_backends blackbox.example /weight | tee -a "$report"
   echo "weighted backend selection reached blackbox-a and blackbox-b" >> "$report"
 
   local invalid_status

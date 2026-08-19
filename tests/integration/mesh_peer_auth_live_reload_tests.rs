@@ -487,6 +487,7 @@ async fn mesh_owner_scoped_dtls_publish_without_dtls_listeners() {
             dimpl_config: std::sync::Arc::new(dtls_config),
             certificate,
             client_cert_verifier: None,
+            client_trust: None,
         },
     );
     let (generation, swapped) = manager
@@ -572,7 +573,7 @@ async fn mesh_peer_auth_live_reload_does_not_mutate_active_ordinary_dtls_listene
     let state = test_proxy_state_with_config(test_env_config(), config);
     let manager = &state.stream_listener_manager;
     manager
-        .set_frontend_dtls_cert_key(cert_path, key_path, Some(ca_path))
+        .set_frontend_dtls_cert_key(cert_path, key_path, Some(ca_path), false)
         .await;
     manager
         .wait_until_started(Duration::from_secs(2))

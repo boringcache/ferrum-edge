@@ -162,6 +162,7 @@ fn select_compatible_certified_key(
 /// previous one. Serving a partial set would silently answer some hostnames
 /// with the fallback certificate — a name mismatch the operator never asked
 /// for — so a broken certificate is a rejected snapshot, not a degraded one.
+#[allow(dead_code)] // Public integration-test entry point; production binds an explicit scope.
 pub fn load_gateway_multi_cert_tls_config(
     certificates: &[GatewayCertificateInput],
     client_ca_bundle_path: Option<&str>,
@@ -169,6 +170,38 @@ pub fn load_gateway_multi_cert_tls_config(
     tls_policy: &TlsPolicy,
     cert_expiry_warning_days: u64,
     crls: &[CertificateRevocationListDer<'static>],
+) -> Result<Arc<rustls::ServerConfig>, anyhow::Error> {
+    load_gateway_multi_cert_tls_config_with_handshake_scope(
+        certificates,
+        client_ca_bundle_path,
+        ocsp_response_source,
+        tls_policy,
+        cert_expiry_warning_days,
+        crls,
+        None,
+    )
+}
+
+/// [`load_gateway_multi_cert_tls_config`] that binds
+/// [`crate::tls::client_trust::bind_live_handshake_verifier`] for `handshake_scope`.
+///
+/// CP-delivered Gateway snapshots must pass
+/// [`crate::tls::ClientTrustScope::ProxyFrontend`]: the resulting `ServerConfig`
+/// keeps this resolver (the CP server certificate) while handshake-time
+/// client-certificate verification reads the live operator verifier and
+/// CertificateRequest CA-name hints stay generation-neutral. Without the
+/// wrapper, an accepted additive CA/CRL reload would keep rejecting new
+/// H1/H2/TCP handshakes against the snapshot's stale inner verifier (issue
+/// #3857).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn load_gateway_multi_cert_tls_config_with_handshake_scope(
+    certificates: &[GatewayCertificateInput],
+    client_ca_bundle_path: Option<&str>,
+    ocsp_response_source: Option<&str>,
+    tls_policy: &TlsPolicy,
+    cert_expiry_warning_days: u64,
+    crls: &[CertificateRevocationListDer<'static>],
+    handshake_scope: Option<crate::tls::ClientTrustScope>,
 ) -> Result<Arc<rustls::ServerConfig>, anyhow::Error> {
     if certificates.is_empty() {
         anyhow::bail!("Gateway frontend TLS was requested with no certificate sources");
@@ -353,6 +386,7 @@ pub fn load_gateway_multi_cert_tls_config(
         crls,
         &cert_display,
         &key_display,
+        handshake_scope,
     )
 }
 

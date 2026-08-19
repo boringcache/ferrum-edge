@@ -600,6 +600,7 @@ async fn try_spawn_udp_listener(
         udp_pktinfo_enabled: false,
         mesh_outbound_enforcement: enforcement,
         node_waypoint_udp_source_scoping: None,
+        node_waypoint_udp_owner: false,
         node_waypoint_udp_destinations: None,
         datagram_client_address: None,
     };
