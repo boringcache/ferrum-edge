@@ -5616,7 +5616,7 @@ async fn test_backup_then_restore_roundtrip_with_proxy_plugin_association() {
 }
 
 #[tokio::test]
-async fn test_restore_read_only_rejected() {
+async fn test_restore_file_mode_returns_503_no_database() {
     let tc = TestConfig::default();
     let state = AdminState {
         db: None,
@@ -5624,7 +5624,7 @@ async fn test_restore_read_only_rejected() {
         metrics_auth: Default::default(),
         cached_config: None,
         proxy_state: None,
-        mode: "test".to_string(),
+        mode: "file".to_string(),
         read_only: true,
         admin_audit_enabled: false,
         admin_audit_fallback_dir: Some(crate::common::isolated_audit_fallback_dir()),
@@ -5663,9 +5663,297 @@ async fn test_restore_read_only_rejected() {
     let (base_url, _shutdown) = start_test_admin(state).await;
     let token = generate_test_token(&tc);
 
-    let (status, body) = admin_post(&base_url, "/restore?confirm=true", &token, &json!({})).await;
-    assert_eq!(status, 403);
-    assert!(body["error"].as_str().unwrap().contains("read-only"));
+    let (status, body) = admin_post(
+        &base_url,
+        "/restore?confirm=true",
+        &token,
+        &json!({}),
+    )
+    .await;
+    assert_eq!(
+        status, 503,
+        "file/DP restore must report no database, not read-only: {body:?}"
+    );
+    assert_eq!(body["error"], "No database");
+
+    let (status, body) = admin_post(
+        &base_url,
+        "/batch",
+        &token,
+        &json!({"proxies": []}),
+    )
+    .await;
+    assert_eq!(
+        status, 403,
+        "other file-mode writes must stay read-only 403: {body:?}"
+    );
+    assert!(
+        body["error"]
+            .as_str()
+            .unwrap()
+            .contains("read-only"),
+        "batch in file mode must keep the generic RO body: {body:?}"
+    );
+}
+
+#[tokio::test]
+async fn test_restore_read_only_with_database_still_forbidden() {
+    let tc = TestConfig::default();
+    let (mut state, _dir) = create_db_admin_state(&tc).await;
+    state.read_only = true;
+    let (base_url, _shutdown) = start_test_admin(state).await;
+    let token = generate_test_token(&tc);
+
+    let (status, body) = admin_post(
+        &base_url,
+        "/restore?confirm=true",
+        &token,
+        &json!({
+            "proxies": [{
+                "id": "should-not-land",
+                "listen_path": "/nope",
+                "backend_scheme": "http",
+                "backend_host": "localhost",
+                "backend_port": 8080
+            }]
+        }),
+    )
+    .await;
+    assert_eq!(
+        status, 403,
+        "database-mode read-only restore must not fall through to a write: {body:?}"
+    );
+    assert!(
+        body["error"]
+            .as_str()
+            .unwrap()
+            .contains("read-only"),
+        "genuine read-only restore must keep the 403 body: {body:?}"
+    );
+}
+
+#[tokio::test]
+async fn test_restore_rejects_omitted_resource_ids() {
+    let tc = TestConfig::default();
+    let (state, _dir) = create_db_admin_state(&tc).await;
+    let (base_url, _shutdown) = start_test_admin(state).await;
+    let token = generate_test_token(&tc);
+
+    let seed = json!({
+        "proxies": [{
+            "id": "restore-keep",
+            "listen_path": "/keep",
+            "backend_scheme": "http",
+            "backend_host": "localhost",
+            "backend_port": 8080
+        }]
+    });
+    let (status, body) = admin_post(&base_url, "/batch", &token, &seed).await;
+    assert_eq!(status, 201, "seed failed: {body:?}");
+
+    let (status, body) = admin_post(
+        &base_url,
+        "/restore?confirm=true",
+        &token,
+        &json!({
+            "consumers": [{
+                "username": "noid-user",
+                "credentials": {"keyauth": [{"key": "k"}]}
+            }]
+        }),
+    )
+    .await;
+    assert_eq!(
+        status, 400,
+        "restore without ids must 400: {body:?}"
+    );
+    assert!(
+        body["error"]
+            .as_str()
+            .unwrap()
+            .contains("existing config was NOT deleted"),
+        "omitted-id restore must stay fail-safe: {body:?}"
+    );
+    let errors = body["validation_errors"]
+        .as_array()
+        .expect("validation_errors");
+    assert!(
+        errors.iter().any(|e| e
+            .as_str()
+            .unwrap_or("")
+            .contains("POST /restore does not")),
+        "restore must explain that ids are required: {body:?}"
+    );
+
+    let (status, _, _) = admin_get(&base_url, "/proxies/restore-keep", &token).await;
+    assert_eq!(
+        status,
+        reqwest::StatusCode::OK,
+        "omitted-id restore must not delete existing config"
+    );
+}
+
+#[tokio::test]
+async fn test_batch_rejects_unknown_envelope_keys() {
+    let tc = TestConfig::default();
+    let (state, _dir) = create_db_admin_state(&tc).await;
+    let (base_url, _shutdown) = start_test_admin(state).await;
+    let token = generate_test_token(&tc);
+
+    let (status, body) = admin_post(
+        &base_url,
+        "/batch",
+        &token,
+        &json!({
+            "updates": {"proxies": [{"id": "keep-a", "listen_path": "/keep-a-UPDATED"}]},
+            "deletes": {"proxies": ["keep-a"]},
+            "dry_run": true,
+            "proxies": [{
+                "id": "unk-created",
+                "listen_path": "/unk",
+                "backend_scheme": "http",
+                "backend_host": "localhost",
+                "backend_port": 8080
+            }]
+        }),
+    )
+    .await;
+    assert_eq!(
+        status, 400,
+        "unknown batch envelope keys must 400: {body:?}"
+    );
+    let error = body["error"].as_str().unwrap_or("");
+    assert!(
+        error.contains("unknown field"),
+        "batch must name the unknown field: {body:?}"
+    );
+    assert!(
+        error.contains("updates")
+            || error.contains("deletes")
+            || error.contains("dry_run"),
+        "batch must reject unimplemented mutation verbs: {body:?}"
+    );
+
+    let (status, _, _) = admin_get(&base_url, "/proxies/unk-created", &token).await;
+    assert_eq!(
+        status,
+        reqwest::StatusCode::NOT_FOUND,
+        "rejected envelope must not persist the nested create"
+    );
+}
+
+#[tokio::test]
+async fn test_batch_accepts_backup_metadata_keys() {
+    let tc = TestConfig::default();
+    let (state, _dir) = create_db_admin_state(&tc).await;
+    let (base_url, _shutdown) = start_test_admin(state).await;
+    let token = generate_test_token(&tc);
+
+    let (status, body) = admin_post(
+        &base_url,
+        "/batch",
+        &token,
+        &json!({
+            "version": "1",
+            "ferrum_version": "0.9.0",
+            "exported_at": "2026-08-19T00:00:00Z",
+            "source": "database",
+            "counts": {
+                "proxies": 1,
+                "consumers": 0,
+                "plugin_configs": 0,
+                "upstreams": 0,
+                "api_specs": 0,
+                "gateway_trust_bundles": 0
+            },
+            "api_specs": {"section_version": "2", "items": []},
+            "gateway_trust_bundles": [],
+            "proxies": [{
+                "id": "from-backup",
+                "listen_path": "/from-backup",
+                "backend_scheme": "http",
+                "backend_host": "localhost",
+                "backend_port": 8080
+            }]
+        }),
+    )
+    .await;
+    assert_eq!(
+        status, 201,
+        "GET /backup metadata must still be a valid additive import: {body:?}"
+    );
+    assert_eq!(body["created"]["proxies"], 1);
+}
+
+#[tokio::test]
+async fn test_proxy_and_batch_accept_upstream_id_without_backend_host() {
+    let tc = TestConfig::default();
+    let (state, _dir) = create_db_admin_state(&tc).await;
+    let (base_url, _shutdown) = start_test_admin(state).await;
+    let token = generate_test_token(&tc);
+
+    let (status, body) = admin_post(
+        &base_url,
+        "/upstreams",
+        &token,
+        &json!({
+            "id": "user-svc-upstream",
+            "name": "user-service-pool",
+            "algorithm": "round_robin",
+            "targets": [
+                {"host": "10.0.1.10", "port": 3000, "weight": 100}
+            ]
+        }),
+    )
+    .await;
+    assert_eq!(status, 201, "upstream create failed: {body:?}");
+
+    let (status, body) = admin_post(
+        &base_url,
+        "/proxies",
+        &token,
+        &json!({
+            "id": "via-up",
+            "listen_path": "/via-up",
+            "backend_scheme": "http",
+            "upstream_id": "user-svc-upstream"
+        }),
+    )
+    .await;
+    assert_eq!(
+        status, 201,
+        "POST /proxies with upstream_id and no host must succeed: {body:?}"
+    );
+    assert_eq!(body["backend_host"], "");
+    assert_eq!(body["backend_port"], 0);
+    assert_eq!(body["upstream_id"], "user-svc-upstream");
+
+    let (status, body) = admin_post(
+        &base_url,
+        "/batch",
+        &token,
+        &json!({
+            "upstreams": [{
+                "id": "batch-up",
+                "name": "batch-up-pool",
+                "algorithm": "round_robin",
+                "targets": [{"host": "10.0.1.11", "port": 3000, "weight": 100}]
+            }],
+            "proxies": [{
+                "name": "user-service",
+                "listen_path": "/api/users",
+                "backend_scheme": "http",
+                "upstream_id": "batch-up"
+            }]
+        }),
+    )
+    .await;
+    assert_eq!(
+        status, 201,
+        "POST /batch load-balanced example without host must succeed: {body:?}"
+    );
+    assert_eq!(body["created"]["upstreams"], 1);
+    assert_eq!(body["created"]["proxies"], 1);
 }
 
 #[tokio::test]

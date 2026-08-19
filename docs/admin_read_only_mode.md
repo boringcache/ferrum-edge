@@ -138,8 +138,8 @@ The Admin API validates proxy configurations on create (`POST /proxies`) and upd
 | Field | Rule | Example Error |
 |-------|------|---------------|
 | `listen_path` | Must be non-empty and start with `/` | `"listen_path must start with '/'"` |
-| `backend_host` | Must be non-empty | `"backend_host must not be empty"` |
-| `backend_port` | Must be greater than 0 | `"backend_port must be greater than 0"` |
+| `backend_host` | Must be non-empty unless `upstream_id` is set | `"backend_host must be non-empty (or set upstream_id)"` |
+| `backend_port` | Must be greater than 0 unless `upstream_id` is set | `"backend_port must be greater than 0 (or set upstream_id)"` |
 
 These validations apply in all operating modes (database, file, CP) and are enforced regardless of read-only mode.
 

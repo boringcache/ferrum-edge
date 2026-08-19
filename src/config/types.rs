@@ -2488,7 +2488,15 @@ pub struct Proxy {
     /// the request hot path. Never serialized. Same pattern as `resolved_tls`.
     #[serde(skip)]
     pub dispatch_kind: DispatchKind,
+    /// Direct-backend hostname. Optional (defaults to empty) when
+    /// `upstream_id` is set — the selected upstream target supplies the dial
+    /// address, and the runtime already skips an empty fallback. Required and
+    /// non-empty when `upstream_id` is absent.
+    #[serde(default)]
     pub backend_host: String,
+    /// Direct-backend port. Optional (defaults to 0) when `upstream_id` is
+    /// set. Required and greater than 0 when `upstream_id` is absent.
+    #[serde(default)]
     pub backend_port: u16,
     #[serde(default)]
     pub backend_path: Option<String>,

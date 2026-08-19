@@ -35,11 +35,11 @@ use tracing::{debug, error, info, warn};
 use crate::admin::audit::AuditActor;
 use crate::admin::backup::{
     ApiSpecsBackupSection, BACKUP_API_SPECS_FILTER_DEPENDENCY_ERROR,
-    BACKUP_UNSUPPORTED_RESOURCE_FILTER_ERROR, BackupCounts, BackupPayload, RestorePayload,
-    clear_api_spec_ownership_tags, filter_config_by_namespace, parse_backup_resources,
-    parse_confirm_api_spec_deletion, parse_restore_confirm,
-    validate_backup_api_specs_resource_filter, validate_backup_resources_allowlist,
-    validate_restore_api_specs_section_with_total_limit,
+    BACKUP_UNSUPPORTED_RESOURCE_FILTER_ERROR, BackupCounts, BackupPayload, BatchCreateRequest,
+    RestorePayload, clear_api_spec_ownership_tags, filter_config_by_namespace,
+    parse_backup_resources, parse_confirm_api_spec_deletion, parse_restore_confirm,
+    restore_missing_resource_id_errors, validate_backup_api_specs_resource_filter,
+    validate_backup_resources_allowlist, validate_restore_api_specs_section_with_total_limit,
 };
 use crate::admin::jwt_auth::{AdminRole, JwtError, JwtManager};
 use crate::config::db_backend::{
@@ -6966,8 +6966,8 @@ async fn handle_batch_create(
             }
         };
 
-    let mut batch: RestorePayload = match serde_json::from_slice(body) {
-        Ok(v) => v,
+    let mut batch: RestorePayload = match serde_json::from_slice::<BatchCreateRequest>(body) {
+        Ok(request) => request.into(),
         Err(e) => {
             return Ok(json_response(
                 StatusCode::BAD_REQUEST,
@@ -8269,14 +8269,17 @@ async fn handle_restore(
     query: Option<&str>,
     namespace: &str,
 ) -> Result<Response<Full<Bytes>>, hyper::Error> {
-    let _write_permit = match state.admit_write().await {
-        Ok(permit) => permit,
-        Err(response) => return Ok(response),
-    };
-
+    // File/DP have no database. Report that before the generic read-only
+    // gate so operators get the documented 503 rather than 403. Modes that
+    // do have a database still run `admit_write` next, so
+    // `FERRUM_ADMIN_READ_ONLY=true` cannot fall through to a write.
     let db = match require_db(state) {
         Ok(db) => db,
         Err(resp) => return Ok(*resp),
+    };
+    let _write_permit = match state.admit_write().await {
+        Ok(permit) => permit,
+        Err(response) => return Ok(response),
     };
 
     if !parse_restore_confirm(query) {
@@ -8331,6 +8334,17 @@ async fn handle_restore(
                     payload.version,
                     crate::config::types::CURRENT_CONFIG_VERSION
                 )
+            }),
+        ));
+    }
+
+    let missing_id_errors = restore_missing_resource_id_errors(&payload);
+    if !missing_id_errors.is_empty() {
+        return Ok(json_response(
+            StatusCode::BAD_REQUEST,
+            &json!({
+                "error": "Restore payload validation failed — existing config was NOT deleted",
+                "validation_errors": missing_id_errors,
             }),
         ));
     }

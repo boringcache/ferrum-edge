@@ -5157,6 +5157,50 @@ fn test_hosts_deserialization_default_empty() {
 }
 
 #[test]
+fn proxy_deserializes_without_backend_host_when_upstream_id_is_set() {
+    let json = r#"{
+        "id": "via-up",
+        "listen_path": "/via-up",
+        "backend_scheme": "http",
+        "upstream_id": "user-svc-upstream"
+    }"#;
+    let proxy: Proxy = serde_json::from_str(json).unwrap();
+    assert_eq!(proxy.backend_host, "");
+    assert_eq!(proxy.backend_port, 0);
+    assert_eq!(
+        proxy.upstream_id.as_deref(),
+        Some("user-svc-upstream")
+    );
+    if let Err(errors) = proxy.validate_fields() {
+        assert!(
+            errors
+                .iter()
+                .all(|e| !e.contains("backend_host") && !e.contains("backend_port")),
+            "upstream-backed proxy must not require host/port: {errors:?}"
+        );
+    }
+}
+
+#[test]
+fn proxy_still_requires_backend_host_without_upstream_id() {
+    let json = r#"{
+        "id": "direct",
+        "listen_path": "/direct",
+        "backend_scheme": "http"
+    }"#;
+    let proxy: Proxy = serde_json::from_str(json).unwrap();
+    let errors = proxy.validate_fields().unwrap_err();
+    assert!(
+        errors.iter().any(|e| e.contains("backend_host")),
+        "direct-backend proxy must still require host: {errors:?}"
+    );
+    assert!(
+        errors.iter().any(|e| e.contains("backend_port")),
+        "direct-backend proxy must still require port: {errors:?}"
+    );
+}
+
+#[test]
 fn test_hosts_deserialization_with_values() {
     let json = r#"{
         "id": "p1",

@@ -1011,6 +1011,11 @@ fn consumer_credential_surface_schemas_match_runtime_redaction() {
         Some(&json!("#/components/schemas/ConsumerCreate"))
     );
     assert_eq!(
+        spec.pointer("/components/schemas/BatchCreateRequest/additionalProperties"),
+        Some(&json!(false)),
+        "POST /batch envelope must reject unknown top-level keys"
+    );
+    assert_eq!(
         spec.pointer("/components/schemas/BackupResponse/properties/consumers/items/$ref"),
         Some(&json!("#/components/schemas/ConsumerBackup"))
     );

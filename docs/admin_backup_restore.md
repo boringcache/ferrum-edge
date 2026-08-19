@@ -9,11 +9,11 @@ The Ferrum Edge Admin API provides dedicated endpoints for full configuration ba
 | `/backup` | GET | Export complete gateway config as JSON |
 | `/restore?confirm=true` | POST | Replace all config from a backup payload |
 
-Both endpoints require JWT authentication. The restore endpoint is blocked in read-only mode.
+Both endpoints require JWT authentication. File/DP restore returns `503` (`{"error":"No database"}`) because there is no database. Database mode with `FERRUM_ADMIN_READ_ONLY=true` still returns `403`.
 
 ## Backup — `GET /backup`
 
-Returns the entire gateway configuration as a single JSON document. The output format is directly compatible with both `POST /restore` (full replacement) and `POST /batch` (additive import).
+Returns the entire gateway configuration as a single JSON document. The output format is directly compatible with both `POST /restore` (full replacement) and `POST /batch` (additive import). Compatibility is backup → restore/batch: every resource in a backup carries a non-empty `id`. `POST /restore` requires those ids and returns `400` without deleting existing config if any resource omits one. `POST /batch` auto-generates omitted ids, so a caller who strips ids from a backup can still import additively.
 
 ### Key Behaviors
 
@@ -181,7 +181,7 @@ When restoring a legacy backup that omits the `api_specs` section while the targ
 
 ### Request Format
 
-Accepts the same JSON format produced by `GET /backup`. All resource arrays are optional — omitted types are treated as empty (meaning existing resources of that type will be deleted but not replaced).
+Accepts the same JSON format produced by `GET /backup`. All resource arrays are optional — omitted types are treated as empty (meaning existing resources of that type will be deleted but not replaced). Every included proxy, consumer, plugin config, and upstream must carry a non-empty `id` — the ids `GET /backup` always emits. `POST /batch` auto-generates omitted ids; restore does not, because a second restore of the same body would otherwise invent different identities on a destructive replacement. A batch-shaped body without ids returns `400` with `validation_errors` and does not delete existing config.
 
 ```json
 {
@@ -343,6 +343,8 @@ retryable availability problem.
 |---------|-----------------|---------------|
 | Deletes existing data | Yes (full wipe) | No (additive) |
 | Safety guard | Requires `?confirm=true` | None |
+| Resource ids | Required (as in `GET /backup`) | Auto-generated if omitted |
+| Unknown envelope keys | Backup metadata ignored (restore envelope is not closed) | Rejected (`400`); backup metadata accepted and ignored |
 | Use case | Disaster recovery, environment migration | Incremental provisioning |
 | Body size limit | 100 MiB (configurable) | 1 MiB |
 | Response key | `restored` | `created` |
@@ -359,7 +361,7 @@ curl -s -H "Authorization: Bearer $TOKEN" \
 # Response includes: "source": "cached"
 ```
 
-Restore requires a database and will return `503 Service Unavailable` in file/DP mode.
+Restore requires a database and returns `503 Service Unavailable` with `{"error":"No database"}` in file/DP mode. Other file-mode writes (`POST /proxies`, `POST /batch`) still return `403` `{"error":"Admin API is in read-only mode"}`. Database mode with `FERRUM_ADMIN_READ_ONLY=true` also returns that `403` for restore.
 
 ## Recommended Practices
 
