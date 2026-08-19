@@ -778,3 +778,43 @@ fn test_direct_h2_request_body_passthrough_skips_size_limited_incoming() {
         "upload-completion gate and gRPC observation must still wrap SizeLimitedIncoming"
     );
 }
+
+/// Issue #3942 follow-up: skipping the per-frame atomic must not cost the
+/// byte accounting. `TransactionSummary.bytes_sent` and the `api_chargeback`
+/// plugin both bill on `ctx.bytes_sent_observed`, and an HTTP/2 upload may
+/// legally omit `Content-Length`, so the passthrough arm has to tally what it
+/// actually forwarded and publish it — once — rather than trusting a header.
+#[test]
+fn test_direct_h2_passthrough_still_accounts_forwarded_bytes() {
+    let body_source = include_str!("../../../src/proxy/body.rs");
+    assert!(
+        body_source.contains("fn publish_bytes"),
+        "passthrough arm must publish its byte tally through a named helper"
+    );
+    assert!(
+        body_source.contains("impl Drop for DirectH2RequestBody"),
+        "an aborted or early-dropped upload must still publish what it forwarded"
+    );
+    assert!(
+        body_source.contains("*seen = seen.saturating_add(data.len() as u64);"),
+        "passthrough must tally data frames in a plain counter, not an atomic"
+    );
+
+    let proxy_source = include_str!("../../../src/proxy/mod.rs");
+    let dispatch = proxy_source
+        .split("async fn proxy_to_backend_http2(")
+        .nth(1)
+        .expect("proxy_to_backend_http2 must exist");
+    assert!(
+        dispatch.contains("observed: Arc::clone(ctx_bytes_sent_observed)"),
+        "passthrough must be handed the request's bytes_sent counter"
+    );
+    assert!(
+        !dispatch.contains(
+            "ctx_bytes_sent_observed.fetch_max(cl, std::sync::atomic::Ordering::Release)"
+        ),
+        "bytes_sent must come from forwarded frames, not a Content-Length seed: \
+         an H2 upload may omit the header, and an aborted one sends fewer bytes \
+         than it announced"
+    );
+}

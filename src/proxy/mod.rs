@@ -49292,22 +49292,23 @@ async fn proxy_to_backend_http2(
             .with_grpc_message_counter(messages);
             (body::DirectH2RequestBody::Limited(body), None, None)
         } else {
-            // Unlimited, unauthenticated, no gRPC observation: seed bytes_sent
-            // from Content-Length (Jun 19 direct-H2 accounting) and forward
-            // Incoming. Cancel stays armed so an early return after send_request
-            // still resets hyper's detached upload pipe. The same arm is the
-            // panic-free fallback if `direct_h2_uses_limit_adapter` ever drifts
-            // true without a gate or gRPC observer.
-            if let Some(cl) = headers
-                .get("content-length")
-                .and_then(|v| v.parse::<u64>().ok())
-            {
-                ctx_bytes_sent_observed.fetch_max(cl, std::sync::atomic::Ordering::Release);
-            }
+            // Unlimited, unauthenticated, no gRPC observation: forward
+            // `Incoming` directly. Cancel stays armed so an early return after
+            // send_request still resets hyper's detached upload pipe. The
+            // passthrough arm tallies forwarded bytes in a plain counter and
+            // publishes `bytes_sent_observed` once, at end-of-stream, on a
+            // body error, or on drop — skipping the per-frame atomic without
+            // giving up the accounting `TransactionSummary.bytes_sent` and
+            // `api_chargeback` read. This arm is also the panic-free fallback
+            // if `direct_h2_uses_limit_adapter` ever drifts true without a
+            // gate or gRPC observer.
             (
                 body::DirectH2RequestBody::Passthrough {
                     inner: body,
                     cancel: Some(cancel_rx),
+                    seen: 0,
+                    observed: Arc::clone(ctx_bytes_sent_observed),
+                    published: false,
                 },
                 None,
                 None,

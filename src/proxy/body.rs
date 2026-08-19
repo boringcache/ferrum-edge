@@ -2436,8 +2436,54 @@ pub enum DirectH2RequestBody {
     Passthrough {
         inner: Incoming,
         cancel: Option<tokio::sync::oneshot::Receiver<()>>,
+        /// Bytes polled out of the client body so far. A PLAIN counter, not an
+        /// atomic: skipping the per-frame atomic is the whole point of this
+        /// arm (issue #3942). It is published once, in [`Self::publish_bytes`].
+        seen: u64,
+        /// `ctx.bytes_sent_observed`. `TransactionSummary.bytes_sent` and the
+        /// `api_chargeback` plugin bill on this, so the passthrough arm must
+        /// still report the bytes it actually forwarded — seeding from
+        /// `Content-Length` would report nothing for a streaming H2 upload
+        /// that omits it, and would over-report an aborted one.
+        observed: Arc<AtomicU64>,
+        /// Guards against double publication when end-of-stream is followed by
+        /// `Drop`.
+        published: bool,
     },
     Limited(SizeLimitedIncoming),
+}
+
+impl DirectH2RequestBody {
+    /// Publish the passthrough byte count exactly once.
+    ///
+    /// `fetch_max` matches [`SizeLimitedIncoming`]'s contract: a retry whose
+    /// plugin transforms shrink the body must not lower an earlier observation.
+    fn publish_bytes(observed: &Arc<AtomicU64>, seen: u64, published: &mut bool) {
+        if *published {
+            return;
+        }
+        *published = true;
+        if seen > 0 {
+            observed.fetch_max(seen, Ordering::Release);
+        }
+    }
+}
+
+impl Drop for DirectH2RequestBody {
+    fn drop(&mut self) {
+        // A client that aborts mid-upload, or an early return that drops the
+        // body before end-of-stream, still has to account for what was
+        // forwarded. The clean-EOS path has already published by this point.
+        if let DirectH2RequestBody::Passthrough {
+            seen,
+            observed,
+            published,
+            ..
+        } = self
+        {
+            Self::publish_bytes(observed, *seen, published);
+        }
+    }
 }
 
 impl http_body::Body for DirectH2RequestBody {
@@ -2449,16 +2495,34 @@ impl http_body::Body for DirectH2RequestBody {
         cx: &mut Context<'_>,
     ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
         match self.get_mut() {
-            DirectH2RequestBody::Passthrough { inner, cancel } => {
+            DirectH2RequestBody::Passthrough {
+                inner,
+                cancel,
+                seen,
+                observed,
+                published,
+            } => {
                 if poll_upload_cancel(cancel, cx) == UploadCancelSignal::Cancelled {
+                    Self::publish_bytes(observed, *seen, published);
                     return Poll::Ready(Some(Err(
                         "request body forwarding cancelled after upload timeout".into(),
                     )));
                 }
                 match Pin::new(inner).poll_frame(cx) {
-                    Poll::Ready(Some(Ok(frame))) => Poll::Ready(Some(Ok(frame))),
-                    Poll::Ready(Some(Err(e))) => Poll::Ready(Some(Err(e.into()))),
-                    Poll::Ready(None) => Poll::Ready(None),
+                    Poll::Ready(Some(Ok(frame))) => {
+                        if let Some(data) = frame.data_ref() {
+                            *seen = seen.saturating_add(data.len() as u64);
+                        }
+                        Poll::Ready(Some(Ok(frame)))
+                    }
+                    Poll::Ready(Some(Err(e))) => {
+                        Self::publish_bytes(observed, *seen, published);
+                        Poll::Ready(Some(Err(e.into())))
+                    }
+                    Poll::Ready(None) => {
+                        Self::publish_bytes(observed, *seen, published);
+                        Poll::Ready(None)
+                    }
                     Poll::Pending => Poll::Pending,
                 }
             }
