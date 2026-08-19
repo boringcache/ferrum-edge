@@ -145,6 +145,19 @@ pub fn is_proxy_owned_forwarding_header(name: &str, add_forwarded_header: bool) 
             || name.eq_ignore_ascii_case("x-forwarded-host"))
 }
 
+/// True when an untrusted peer's `X-Real-IP` must not reach a backend.
+///
+/// Ferrum never regenerates `X-Real-IP`; it only consumes a configured
+/// real-IP header for inbound identity when the peer is trusted. Copying the
+/// inbound value from an untrusted socket would let a client assert an
+/// arbitrary address to any backend that treats `X-Real-IP` as authoritative.
+/// Trusted peers keep the header so an overwrite-only proxy assertion still
+/// reaches the origin.
+#[inline]
+pub fn is_untrusted_real_ip_header(name: &str, peer_trusted: bool) -> bool {
+    !peer_trusted && name.eq_ignore_ascii_case("x-real-ip")
+}
+
 /// Whether client `Host` / authority should survive secondary-request filtering.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SecondaryRequestHostPolicy {
