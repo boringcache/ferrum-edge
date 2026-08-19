@@ -534,11 +534,15 @@ fn start_echo_backend_on(listener: tokio::net::TcpListener) -> tokio::task::Join
     })
 }
 
+/// Shared slot holding the last mutating request body the capturing backend
+/// saw, or `None` if it has not seen one yet.
+type CapturedBody = Arc<Mutex<Option<Vec<u8>>>>;
+
 /// Capture the last mutating HTTP/1.1 request body. Health probes and
 /// `GET`/`HEAD` warmup must not overwrite application POSTs.
 fn start_capturing_backend(
     listener: tokio::net::TcpListener,
-) -> (tokio::task::JoinHandle<()>, Arc<Mutex<Option<Vec<u8>>>>) {
+) -> (tokio::task::JoinHandle<()>, CapturedBody) {
     let captured = Arc::new(Mutex::new(None));
     let captured_for_task = Arc::clone(&captured);
     let handle = tokio::spawn(async move {
@@ -598,10 +602,11 @@ fn start_capturing_backend(
                         || method.eq_ignore_ascii_case("PUT")
                         || method.eq_ignore_ascii_case("PATCH")
                         || method.eq_ignore_ascii_case("DELETE");
-                    if mutating && path != "/health" {
-                        if let Ok(mut slot) = captured.lock() {
-                            *slot = Some(body);
-                        }
+                    if mutating
+                        && path != "/health"
+                        && let Ok(mut slot) = captured.lock()
+                    {
+                        *slot = Some(body);
                     }
                     let response_body = r#"{"status":"ok","echo":true}"#;
                     let response = format!(
