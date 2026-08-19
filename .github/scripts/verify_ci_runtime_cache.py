@@ -134,6 +134,12 @@ def gh_path_filter_matches(filter_pattern: str, file_path: str) -> bool:
     return path == pattern
 
 
+# Sentinels for a planner pattern this verifier has no probe for. Named so
+# the diagnostic strips exactly the prefix it prepended.
+PRODUCTION_UNMAPPED_PREFIX = "unmapped-production-pattern:"
+NODE_WAYPOINT_UNMAPPED_PREFIX = "unmapped-node-waypoint-pattern:"
+
+
 def production_dockerfile_probe_paths() -> list[str]:
     probes: list[str] = []
     for pattern in SUITE_PATTERNS["production-dockerfile-smoke"]:
@@ -170,7 +176,7 @@ def production_dockerfile_probe_paths() -> list[str]:
         elif pattern == r"^\.github/scripts/verify_ci_runtime_cache\.py$":
             probes.append(".github/scripts/verify_ci_runtime_cache.py")
         else:
-            probes.append(f"unmapped-production-pattern:{pattern}")
+            probes.append(f"{PRODUCTION_UNMAPPED_PREFIX}{pattern}")
     return probes
 
 
@@ -188,10 +194,11 @@ def check_production_trigger_superset(
     )
     uncovered: list[str] = []
     for probe in production_dockerfile_probe_paths():
-        if probe.startswith("unmapped-production-pattern:"):
+        if probe.startswith(PRODUCTION_UNMAPPED_PREFIX):
             failures.append(
                 f"{source} verifier must map every production-dockerfile-smoke "
-                f"planner pattern ({probe[26:]})"
+                f"planner pattern "
+                f"({probe.removeprefix(PRODUCTION_UNMAPPED_PREFIX)})"
             )
             continue
         if not any(
@@ -211,6 +218,19 @@ def job_if(job_body: str) -> str:
     if match:
         return match.group(1).strip()
     return ""
+
+
+# Concrete `src/proxy/node_waypoint_*` modules the planner prefix pattern
+# must keep sensitive. Add a row when a new NodeWaypoint proxy module lands;
+# the planner stays correct without one, but the probe keeps this assertion
+# honest about what the prefix is actually covering today.
+NODE_WAYPOINT_PROXY_MODULE_PROBES = (
+    "src/proxy/node_waypoint_ingress_capture.rs",
+    "src/proxy/node_waypoint_udp_destination.rs",
+    "src/proxy/node_waypoint_udp_identity.rs",
+    "src/proxy/node_waypoint_udp_reply_source.rs",
+    "src/proxy/node_waypoint_udp_steering.rs",
+)
 
 
 def node_waypoint_probe_paths() -> list[str]:
@@ -264,14 +284,25 @@ def node_waypoint_probe_paths() -> list[str]:
             probes.append("src/proxy/hbone_pool.rs")
         elif pattern == r"^src/proxy/mesh_tcp_egress\.rs$":
             probes.append("src/proxy/mesh_tcp_egress.rs")
+        elif pattern == r"^src/proxy/mesh_tcp_inbound\.rs$":
+            probes.append("src/proxy/mesh_tcp_inbound.rs")
         elif pattern == r"^src/proxy/mod\.rs$":
             probes.append("src/proxy/mod.rs")
         elif pattern == r"^src/proxy/hbone_proxy\.rs$":
             probes.append("src/proxy/hbone_proxy.rs")
         elif pattern == r"^src/proxy/netns_capture\.rs$":
             probes.append("src/proxy/netns_capture.rs")
+        elif pattern == r"^src/proxy/node_waypoint_":
+            # Probe every NodeWaypoint proxy module the prefix is meant to
+            # cover, not just one representative, so a module that stops
+            # matching is caught here rather than in production.
+            probes.extend(NODE_WAYPOINT_PROXY_MODULE_PROBES)
+        elif pattern == r"^src/proxy/stream_listener\.rs$":
+            probes.append("src/proxy/stream_listener.rs")
         elif pattern == r"^src/proxy/tcp_proxy\.rs$":
             probes.append("src/proxy/tcp_proxy.rs")
+        elif pattern == r"^src/proxy/udp_proxy\.rs$":
+            probes.append("src/proxy/udp_proxy.rs")
         elif pattern == r"^src/router_cache\.rs$":
             probes.append("src/router_cache.rs")
         elif pattern == r"^src/socket_opts\.rs$":
@@ -293,7 +324,7 @@ def node_waypoint_probe_paths() -> list[str]:
         elif pattern == r"^docs/plans/node_waypoint_transport_adr\.md$":
             probes.append("docs/plans/node_waypoint_transport_adr.md")
         else:
-            probes.append(f"unmapped-node-waypoint-pattern:{pattern}")
+            probes.append(f"{NODE_WAYPOINT_UNMAPPED_PREFIX}{pattern}")
     return probes
 
 
@@ -407,16 +438,17 @@ def check_node_waypoint_live_job(
     unmapped = [
         probe
         for probe in node_waypoint_probe_paths()
-        if probe.startswith("unmapped-node-waypoint-pattern:")
+        if probe.startswith(NODE_WAYPOINT_UNMAPPED_PREFIX)
     ]
     require(
         not unmapped,
         f"{source} verifier must map every node-waypoint-ebpf-live planner "
-        f"pattern ({', '.join(item[32:] for item in unmapped)})",
+        f"pattern ("
+        f"{', '.join(item.removeprefix(NODE_WAYPOINT_UNMAPPED_PREFIX) for item in unmapped)})",
         failures,
     )
     for probe in node_waypoint_probe_paths():
-        if probe.startswith("unmapped-node-waypoint-pattern:"):
+        if probe.startswith(NODE_WAYPOINT_UNMAPPED_PREFIX):
             continue
         relevant, _reason, _matched = decide_relevance("node-waypoint-ebpf-live", [probe])
         require(

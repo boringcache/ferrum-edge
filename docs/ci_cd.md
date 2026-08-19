@@ -444,12 +444,21 @@ and fail closed when planning succeeds but the output is blank or malformed
 
 The same trusted plan job emits a second exact boolean,
 `node_waypoint_relevant`, from the `node-waypoint-ebpf-live` planner suite.
-That suite keeps the pre-#3888 NodeWaypoint path scope (eBPF, node-agent,
-mesh/HBONE, chart, harness, and the original specific `src/` files). Ordinary
-`src/**`, `vendor/**`, `.cargo/**`, `rust-toolchain.toml`, and
-`custom_plugins/**` changes still start the workflow for production-image
-smoke, but skip the 120-minute Kind/eBPF live job unless they also match that
-prior scope. The live job uses `if: always() &&
+That suite is the pre-#3888 NodeWaypoint path scope (eBPF, node-agent,
+mesh/HBONE, chart, harness, and specific `src/` files) plus the NodeWaypoint
+datapath modules that landed after the historical list was written: every
+`src/proxy/node_waypoint_*` module, `src/proxy/stream_listener.rs`,
+`src/proxy/udp_proxy.rs`, and `src/proxy/mesh_tcp_inbound.rs`. The
+`src/proxy/node_waypoint_` entry is a **prefix**, not a file list, because
+that historical set enumerated `src/proxy/` file by file and was already
+stale when it was frozen: `node_waypoint_ingress_capture.rs` and the four
+`node_waypoint_udp_*.rs` modules were the only gate for the
+`node_waypoint.udp.*` and `node_waypoint.dtls.*` live assertions and were
+skipping it. A new NodeWaypoint proxy module is now sensitive by
+construction. Ordinary `src/**`, `vendor/**`, `.cargo/**`,
+`rust-toolchain.toml`, and `custom_plugins/**` changes still start the
+workflow for production-image smoke, but skip the 120-minute Kind/eBPF live
+job unless they also match that scope. The live job uses `if: always() &&
 needs.production-dockerfile-plan.outputs.node_waypoint_relevant != 'false'`:
 GitHub skip-propagation is defeated with `always()`, and a trustworthy exact
 `false` is the only skip. A missing trusted planner (adoption PR), planner
@@ -942,10 +951,13 @@ not part of these three `ci.yml` jobs.
 
 **Runs**: `ubuntu-24.04`
 
-`node-waypoint-ebpf-live` still runs on PRs that match its **prior** path
+`node-waypoint-ebpf-live` still runs on PRs that match its narrowed planner
 scope: eBPF, node-agent, NodeWaypoint identity, netns capture, socket option,
-TCP/HBONE mesh, chart, live harness files, and the original specific `src/`
-paths. The workflow `pull_request.paths` trigger remains a **superset** of
+TCP/HBONE mesh, chart, live harness files, the specific `src/` paths from the
+pre-#3888 trigger, and the NodeWaypoint datapath modules added since (the
+`src/proxy/node_waypoint_` prefix, `src/proxy/stream_listener.rs`,
+`src/proxy/udp_proxy.rs`, `src/proxy/mesh_tcp_inbound.rs`). The workflow
+`pull_request.paths` trigger remains a **superset** of
 every production-Dockerfile smoke input (`src/**`, `vendor/**`,
 `custom_plugins/**`, `.cargo/**`, `rust-toolchain.toml`, and the other planner
 sensitive paths) so those changes always reach the trusted planner. The
