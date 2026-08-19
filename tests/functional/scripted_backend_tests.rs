@@ -119,6 +119,23 @@ async fn backend_refuses_connect_maps_to_502_with_connection_refused() {
             ));
             continue;
         }
+        let gateway_error = resp
+            .headers
+            .get("x-gateway-error")
+            .and_then(|v| v.to_str().ok());
+        if gateway_error != Some("connection_failure") {
+            last_failure = Some(format!(
+                "attempt {attempt}/{MAX_ATTEMPTS}: expected X-Gateway-Error=connection_failure, got {gateway_error:?}"
+            ));
+            continue;
+        }
+        if resp.body_text() != r#"{"error":"Backend unavailable"}"# {
+            last_failure = Some(format!(
+                "attempt {attempt}/{MAX_ATTEMPTS}: expected Backend unavailable body, got {}",
+                resp.body_text()
+            ));
+            continue;
+        }
 
         let logs = require_logs(&harness);
         // `connect_failure` is the gateway's `error_kind` for reqwest
@@ -257,16 +274,28 @@ async fn backend_read_timeout_fires_after_backend_read_timeout_ms() {
         .await
         .expect("response");
     let elapsed = started.elapsed();
-    // Status: 502 or 504 depending on the code path — both are acceptable
-    // "gateway gave up on backend" responses. The timing is the load-bearing
-    // assertion.
-    assert!(
-        matches!(
-            resp.status,
-            StatusCode::BAD_GATEWAY | StatusCode::GATEWAY_TIMEOUT
-        ),
-        "expected 502 or 504, got {}",
-        resp.status
+    // #3922: a live `backend_read_timeout_ms` expiry on the streaming
+    // reqwest path must be 504 with the timeout-specific public
+    // classification, not the same 502 / backend_error pair a refused
+    // backend uses.
+    assert_eq!(
+        resp.status,
+        StatusCode::GATEWAY_TIMEOUT,
+        "expected 504 for a live backend read timeout, got {} body={}",
+        resp.status,
+        resp.body_text()
+    );
+    assert_eq!(
+        resp.headers
+            .get("x-gateway-error")
+            .and_then(|v| v.to_str().ok()),
+        Some("backend_timeout"),
+        "timeout must not share X-Gateway-Error=backend_error with a 5xx backend"
+    );
+    assert_eq!(
+        resp.body_text(),
+        r#"{"error":"Backend timeout"}"#,
+        "timeout body must be timeout-specific, not Backend unavailable"
     );
     let expected = Duration::from_millis(read_timeout_ms);
     let floor = expected.saturating_sub(Duration::from_millis(200));

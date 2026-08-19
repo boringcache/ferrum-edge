@@ -259,6 +259,13 @@ fn validate_jwk_field_sizes(jwk: &JwkKey) -> Result<(), String> {
     Ok(())
 }
 
+fn required_jwk_kid(jwk: &JwkKey) -> Result<&str, String> {
+    match jwk.kid.as_deref() {
+        Some(kid) if !kid.is_empty() => Ok(kid),
+        _ => Err("JWK kid must be non-empty".to_string()),
+    }
+}
+
 fn validate_jwk_verification_use(jwk: &JwkKey) -> Result<(), String> {
     if let Some(key_use) = jwk.key_use.as_deref()
         && key_use != "sig"
@@ -600,16 +607,17 @@ impl JwksKeyStore {
         let mut new_keys = HashMap::new();
 
         for (idx, jwk) in jwks.keys.iter().enumerate() {
-            match validate_jwk_field_sizes(jwk)
-                .and_then(|()| validate_jwk_verification_use(jwk))
-                .and_then(|()| Self::parse_jwk(jwk))
-            {
-                Ok(cached) => {
-                    let kid = jwk
-                        .kid
-                        .clone()
-                        .unwrap_or_else(|| format!("__unnamed_{idx}"));
-                    new_keys.insert(kid, cached);
+            let parsed = required_jwk_kid(jwk).and_then(|kid| {
+                validate_jwk_field_sizes(jwk)?;
+                validate_jwk_verification_use(jwk)?;
+                let cached = Self::parse_jwk(jwk)?;
+                Ok((kid.to_string(), cached))
+            });
+            match parsed {
+                Ok((kid, cached)) => {
+                    if new_keys.insert(kid, cached).is_some() {
+                        return Err("JWKS response contains duplicate kid".to_string());
+                    }
                 }
                 Err(_) => {
                     warn!("Skipping invalid or unsupported JWKS key at index {}", idx);

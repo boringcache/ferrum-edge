@@ -316,8 +316,12 @@ fn classify_stream_setup_kind(kind: crate::proxy::stream_error::StreamSetupKind)
         | StreamSetupKind::UnsupportedStreamPolicy
         // An elapsed authorization lifetime is a gateway-side security
         // decision about the client's own credential — never a transport
-        // failure and never a backend fault.
-        | StreamSetupKind::AuthorizationExpired => ErrorClass::RequestError,
+        // failure and never a backend fault. A withdrawn frontend client-trust
+        // decision (issue #3857) is the same shape of decision, taken by the
+        // operator rather than by the clock, so it classifies identically: the
+        // typed kind carries the client-side attribution the class cannot.
+        | StreamSetupKind::AuthorizationExpired
+        | StreamSetupKind::ClientTrustWithdrawn => ErrorClass::RequestError,
     }
 }
 

@@ -867,6 +867,21 @@ pub async fn serve_admin_on_listener(
                         };
 
                         let state = state.clone();
+                        // Capture the admin client-trust generation BEFORE the
+                        // `ServerConfig` this handshake will use is selected
+                        // (issue #3857). Publication swaps the material first
+                        // and advances the generation second, so reading them
+                        // in this order keeps the captured generation at or
+                        // older than the verifier actually served — the
+                        // conservative direction. `None`, and therefore zero
+                        // per-connection cost, unless the admin trust domain is
+                        // armed, which requires both live reload and a
+                        // configured admin client-CA bundle.
+                        let client_trust_admission = if tls_config.is_some() {
+                            capture_admin_client_trust()
+                        } else {
+                            None
+                        };
                         let tls_config = tls_config.clone();
 
                         tokio::spawn(async move {
@@ -875,7 +890,15 @@ pub async fn serve_admin_on_listener(
                             let _conn_permit = conn_permit;
                             let result = if let Some(tls_config) = tls_config {
                                 // Handle TLS connection
-                                handle_admin_tls_connection(stream, remote_addr, state, tls_config).await
+                                handle_admin_tls_connection(
+                                    stream,
+                                    remote_addr,
+                                    state,
+                                    tls_config,
+                                    client_trust_admission,
+                                    None,
+                                )
+                                .await
                             } else {
                                 // Handle plain HTTP connection
                                 handle_admin_connection(stream, remote_addr, state).await
@@ -924,9 +947,11 @@ pub async fn serve_admin_on_listener(
 /// served with live reload enabled — both paths share this accept loop so
 /// cert rotation is not limited to process-bound listeners.
 ///
-/// In-flight admin connections keep their original `ServerConfig` (rustls
-/// consults the config only during the handshake; swapping it does not tear
-/// down live sessions). When the slot holds `None` (e.g., live reload was
+/// In-flight admin connections keep their original `ServerConfig` because
+/// rustls consults it only during the handshake. Cert/key-only and additive
+/// trust rotations leave those sessions running; an accepted client-CA or CRL
+/// narrowing retires client-certificate-authenticated sessions through the
+/// separate trust fence below. When the slot holds `None` (e.g., live reload was
 /// turned on with no cert/key configured), the connection is dropped with
 /// a debug log — the admin listener cannot serve TLS without a config and
 /// must not silently downgrade to plaintext.
@@ -986,7 +1011,17 @@ pub async fn serve_admin_on_listener_with_dynamic_tls(
                             }
                         };
 
+                        // Issue #3857. Read the generation BEFORE the slot, never
+                        // after: the reload task stores the rotated
+                        // `ServerConfig` and only then advances the generation,
+                        // so this order guarantees the captured generation is at
+                        // or older than the verifier this handshake runs. Reading
+                        // the slot first would let a connection that handshakes
+                        // against the withdrawn verifier claim the
+                        // post-withdrawal generation and escape the fence.
+                        let client_trust_admission = capture_admin_client_trust();
                         let tls_config = tls_slot.load().as_ref().clone();
+                        let tls_reload_slot = tls_slot.clone();
                         let state = state.clone();
 
                         tokio::spawn(async move {
@@ -1000,9 +1035,15 @@ pub async fn serve_admin_on_listener_with_dynamic_tls(
                                 drop(stream);
                                 return;
                             };
-                            if let Err(e) =
-                                handle_admin_tls_connection(stream, remote_addr, state, tls_config)
-                                    .await
+                            if let Err(e) = handle_admin_tls_connection(
+                                stream,
+                                remote_addr,
+                                state,
+                                tls_config,
+                                client_trust_admission,
+                                Some(tls_reload_slot),
+                            )
+                            .await
                             {
                                 debug!("Admin connection handling error: {}", e);
                             }
@@ -1181,8 +1222,12 @@ impl http_body::Body for GuardedAdminBody {
 ///
 /// Returning drops the connection future, which closes the transport and
 /// releases the accept-loop's [`conn_limit::AdminConnPermit`].
-async fn serve_admin_io<I>(io: I, state: AdminState, client_ip: std::net::IpAddr)
-where
+async fn serve_admin_io<I>(
+    io: I,
+    state: AdminState,
+    client_ip: std::net::IpAddr,
+    client_trust: Option<crate::tls::ClientTrustSession>,
+) where
     I: hyper::rt::Read + hyper::rt::Write + Unpin + Send + 'static,
 {
     let header_read_timeout_seconds = state.admin_http_header_read_timeout_seconds;
@@ -1190,10 +1235,36 @@ where
 
     let activity = Arc::new(AdminConnActivity::new());
     let service_activity = Arc::clone(&activity);
+    // Kept out of the service closure so the connection-level select below can
+    // still observe retirement after the closure has taken its own handle.
+    let connection_trust = client_trust.clone();
     let svc = service_fn(move |req: Request<Incoming>| {
         let state = state.clone();
         let guard = AdminActivityGuard::new(Arc::clone(&service_activity));
+        let client_trust = client_trust.clone();
         async move {
+            // Frontend client-trust admission fence (issue #3857). One relaxed
+            // atomic read of connection-local state, and only for a connection
+            // that actually authenticated with a client certificate on an armed
+            // admin trust domain — every other request loads a `None` and does
+            // no work at all.
+            //
+            // This is what stops a request already buffered on a retired
+            // keep-alive / HTTP-2 connection from entering admin routing while
+            // the graceful shutdown below is still draining. The body is a
+            // compiled-in literal naming no serial, subject, issuer,
+            // fingerprint, path, or generation.
+            if let Some(session) = client_trust.as_ref()
+                && session.is_retired()
+            {
+                session.record_fenced();
+                let response = json_response(
+                    StatusCode::UNAUTHORIZED,
+                    &json!({ "error": "Client certificate trust withdrawn" }),
+                );
+                let guarded = response.map(|inner| GuardedAdminBody::new(inner, guard));
+                return Ok::<_, hyper::Error>(guarded);
+            }
             let response = handle_admin_request(req, state, client_ip).await?;
             let guarded = response.map(|inner| GuardedAdminBody::new(inner, guard));
             Ok::<_, hyper::Error>(guarded)
@@ -1220,7 +1291,47 @@ where
     tokio::pin!(conn);
 
     if header_read_timeout_seconds == 0 {
-        if let Err(e) = conn.await {
+        let result = tokio::select! {
+            biased;
+            result = conn.as_mut() => result,
+            // Issue #3857: the operator withdrew this connection's
+            // client-certificate trust decision. Reuse hyper's own graceful
+            // shutdown — HTTP/2 gets a GOAWAY so no further stream is admitted,
+            // HTTP/1.1 ends keep-alive after the in-flight request — so the
+            // activity guards, the connection permit, and the response write
+            // all complete exactly once through the paths this connection
+            // already uses. No detached task and no second teardown path.
+            //
+            // With no slowloris deadline configured there is no listener window
+            // to drain inside, so the drain is bounded by the shared
+            // `AUTHORIZATION_TRANSPORT_CLOSE_SETTLE`: `graceful_shutdown` alone
+            // would let an already-open in-flight response run unbounded on a
+            // connection whose trust the operator just withdrew. Returning drops
+            // `conn` and closes the transport.
+            _ = wait_for_admin_trust_withdrawal(connection_trust.as_ref()) => {
+                debug!(
+                    client_ip = %client_ip,
+                    "Retiring established admin TLS connection: frontend client-certificate trust was withdrawn"
+                );
+                conn.as_mut().graceful_shutdown();
+                match tokio::time::timeout(
+                    crate::proxy::AUTHORIZATION_TRANSPORT_CLOSE_SETTLE,
+                    conn.as_mut(),
+                )
+                .await
+                {
+                    Ok(result) => result,
+                    Err(_) => {
+                        debug!(
+                            client_ip = %client_ip,
+                            "Admin connection closed: retired connection did not drain within the settle window"
+                        );
+                        Ok(())
+                    }
+                }
+            }
+        };
+        if let Err(e) = result {
             // Debug, not error: a slowloris flood would otherwise turn every
             // aborted connection into an error-level log line.
             debug!(error = %e, "Admin HTTP connection error");
@@ -1232,9 +1343,31 @@ where
     let mut previous = activity.snapshot();
     loop {
         tokio::select! {
-            result = &mut conn => {
+            biased;
+            result = conn.as_mut() => {
                 if let Err(e) = result {
                     debug!(error = %e, "Admin HTTP connection error");
+                }
+                return;
+            }
+            // Same ordinary teardown as the untimed path above, but the drain
+            // stays inside this listener's configured slowloris window: a peer
+            // that stops making progress must not be able to hold the retired
+            // connection (and its permit) open by never finishing its request.
+            // Returning drops `conn` and closes the transport.
+            _ = wait_for_admin_trust_withdrawal(connection_trust.as_ref()) => {
+                debug!(
+                    client_ip = %client_ip,
+                    "Retiring established admin TLS connection: frontend client-certificate trust was withdrawn"
+                );
+                conn.as_mut().graceful_shutdown();
+                match tokio::time::timeout(deadline, conn.as_mut()).await {
+                    Ok(Err(e)) => debug!(error = %e, "Admin HTTP connection error"),
+                    Err(_) => debug!(
+                        client_ip = %client_ip,
+                        "Admin connection closed: retired connection did not drain within the deadline"
+                    ),
+                    Ok(Ok(())) => {}
                 }
                 return;
             }
@@ -1260,14 +1393,48 @@ where
     }
 }
 
+/// Capture the admin HTTPS client-trust generation (issue #3857).
+///
+/// **Call this before loading / selecting the `ServerConfig`** the handshake
+/// will use. Returns `None` — and therefore costs nothing per connection —
+/// until the admin scope has accepted material, which requires both
+/// `FERRUM_FRONTEND_TLS_LIVE_RELOAD_ENABLED` and verified client-certificate
+/// authentication on the admin listener.
+fn capture_admin_client_trust() -> Option<crate::tls::ClientTrustAdmission> {
+    crate::tls::client_trust::capture(crate::tls::ClientTrustScope::AdminHttps)
+}
+
+/// Resolve once `session` is retired; never resolve when there is nothing to
+/// fence, so an untracked connection registers no waker at all.
+async fn wait_for_admin_trust_withdrawal(session: Option<&crate::tls::ClientTrustSession>) {
+    match session {
+        Some(session) => session.retired().await,
+        None => std::future::pending().await,
+    }
+}
+
 /// Handle TLS connections for Admin API.
 async fn handle_admin_tls_connection(
     stream: tokio::net::TcpStream,
     remote_addr: SocketAddr,
     state: AdminState,
     tls_config: Arc<rustls::ServerConfig>,
+    client_trust_admission: Option<crate::tls::ClientTrustAdmission>,
+    tls_reload_slot: Option<crate::tls::SharedFrontendTls>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     use tokio_rustls::TlsAcceptor;
+
+    let mut tls_config = tls_config;
+    let mut client_trust_admission = client_trust_admission;
+    if let Some(slot) = tls_reload_slot.as_ref() {
+        client_trust_admission = capture_admin_client_trust();
+        match slot.load().as_ref().clone() {
+            Some(current) => tls_config = current,
+            None => {
+                return Err("Admin HTTPS TLS slot is empty".into());
+            }
+        }
+    }
 
     let acceptor = TlsAcceptor::from(tls_config);
     let tls_handshake_timeout = state.admin_tls_handshake_timeout_seconds;
@@ -1281,13 +1448,34 @@ async fn handle_admin_tls_connection(
     .await?;
     info!("Admin TLS connection established from {}", remote_addr.ip());
 
+    // Register this transport against the admin client-trust domain (issue
+    // #3857). Only a connection on which rustls actually authenticated a peer
+    // client certificate holds a trust decision a CRL or client-CA withdrawal
+    // can revoke; an anonymous admin TLS connection registers nothing, is never
+    // retired, and pays a single `Option` branch. The guard is held for the
+    // whole admin connection lifetime below and deregisters on every exit path.
+    let peer_certs = tls_stream.get_ref().1.peer_certificates();
+    if let Some(admission) = client_trust_admission
+        && !crate::tls::client_trust::armed_handshake_still_trusted(admission.scope(), peer_certs)
+    {
+        return Err(crate::tls::client_trust::TRUST_WITHDRAWN_REASON.into());
+    }
+    let client_cert_authenticated = peer_certs.is_some_and(|certs| !certs.is_empty());
+    let client_trust_guard =
+        client_trust_admission.and_then(|admission| admission.register(client_cert_authenticated));
+    let client_trust_session = client_trust_guard
+        .as_ref()
+        .map(|guard| guard.session().clone());
+
     serve_admin_io(
         hyper_util::rt::TokioIo::new(tls_stream),
         state,
         remote_addr.ip(),
+        client_trust_session,
     )
     .await;
 
+    drop(client_trust_guard);
     Ok(())
 }
 
@@ -1297,7 +1485,9 @@ async fn handle_admin_connection(
     remote_addr: SocketAddr,
     state: AdminState,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    serve_admin_io(TokioIo::new(stream), state, remote_addr.ip()).await;
+    // Plaintext admin connections carry no client certificate and therefore no
+    // withdrawable client-certificate trust decision.
+    serve_admin_io(TokioIo::new(stream), state, remote_addr.ip(), None).await;
 
     Ok(())
 }
