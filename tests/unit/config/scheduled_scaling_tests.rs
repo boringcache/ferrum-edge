@@ -222,7 +222,10 @@ fn freshness_workflow_is_fail_closed_and_does_not_run_the_suites() {
     assert!(!FRESHNESS.contains("LAUNCH_ADVISORY_READ_TOKEN"));
     assert!(!FRESHNESS.contains("Launch Readiness Gate"));
     assert!(SIGNAL.contains("MAX_AGE_SECONDS = 8 * 24 * 60 * 60"));
-    assert!(SIGNAL.contains("launch-blocker"));
+    // PR #4010 deleted the launch-readiness lane, so nothing consumes a
+    // `launch-blocker` label any more; the signal issue carries severity only.
+    assert!(SIGNAL.contains("severity:high"));
+    assert!(!SIGNAL.contains("launch-blocker"));
     assert!(SIGNAL.contains("refs/heads/main"));
     assert!(VERIFIER.contains("verify_scaling_regression_workflow.py"));
     assert!(CI_CD.contains("scaling-gate-freshness.yml"));
