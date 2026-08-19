@@ -636,9 +636,7 @@ fn classify_typed_chain(
             // TLS record layer") and must not take the connect-phase RST
             // → `ConnectionRefused` collapse. Distinguish by typed rustls
             // presence, not by string matching on "tls" / "refused".
-            if rustls_error_in_chain(
-                io_err as &(dyn std::error::Error + 'static),
-            ) {
+            if rustls_error_in_chain(io_err as &(dyn std::error::Error + 'static)) {
                 return Some(if phase_is_connect {
                     ErrorClass::TlsError
                 } else {

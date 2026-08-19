@@ -1072,10 +1072,7 @@ fn classify_typed_chain(err: &Http2PoolError) -> Option<crate::retry::ErrorClass
             // TLS failure as `connection_refused`. TimedOut still maps to
             // ConnectionTimeout (handshake stalled); port exhaustion is
             // still PortExhaustion. Everything else is TlsError.
-            if matches!(
-                io_err.raw_os_error(),
-                Some(99) | Some(49) | Some(10049)
-            ) {
+            if matches!(io_err.raw_os_error(), Some(99) | Some(49) | Some(10049)) {
                 return Some(ErrorClass::PortExhaustion);
             }
             if io_err.kind() == std::io::ErrorKind::TimedOut {
@@ -1153,9 +1150,7 @@ fn classify_io_error(
     // handshake/record failure, not a SYN-RST. Peek before the
     // connect-phase RST collapse so a plaintext origin that resets
     // during ClientHello classifies as TlsError.
-    if crate::retry::rustls_error_in_chain(
-        io_err as &(dyn std::error::Error + 'static),
-    ) {
+    if crate::retry::rustls_error_in_chain(io_err as &(dyn std::error::Error + 'static)) {
         return Some(if phase_is_connect {
             ErrorClass::TlsError
         } else {

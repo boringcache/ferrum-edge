@@ -384,14 +384,8 @@ fn test_h3_quinn_locally_closed() {
 
 #[test]
 fn test_h3_io_unexpected_eof_is_connection_closed() {
-    let err = io::Error::new(
-        io::ErrorKind::UnexpectedEof,
-        "failed to fill whole buffer",
-    );
-    assert_eq!(
-        classify_http3_error(&err),
-        ErrorClass::ConnectionClosed
-    );
+    let err = io::Error::new(io::ErrorKind::UnexpectedEof, "failed to fill whole buffer");
+    assert_eq!(classify_http3_error(&err), ErrorClass::ConnectionClosed);
 }
 
 #[test]

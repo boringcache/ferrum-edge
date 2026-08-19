@@ -622,10 +622,7 @@ mod tests {
         assert!(!plugin.should_log_transaction(&http_summary(200, 1.0, None)));
     }
 
-    fn ws_disconnect(
-        error_class: Option<ErrorClass>,
-        backend_target: &str,
-    ) -> WsDisconnectContext {
+    fn ws_disconnect(error_class: Option<ErrorClass>, backend_target: &str) -> WsDisconnectContext {
         WsDisconnectContext {
             namespace: "ferrum".to_string(),
             proxy_id: "proxy-ws".to_string(),
@@ -679,10 +676,8 @@ mod tests {
             Some(ErrorClass::ConnectionReset),
             "http://127.0.0.1:9/",
         ));
-        let clean = transaction_summary_from_ws_disconnect(&ws_disconnect(
-            None,
-            "http://127.0.0.1:9/",
-        ));
+        let clean =
+            transaction_summary_from_ws_disconnect(&ws_disconnect(None, "http://127.0.0.1:9/"));
         assert!(plugin.should_log_transaction(&failed));
         assert!(!plugin.should_log_transaction(&clean));
     }

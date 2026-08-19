@@ -861,8 +861,7 @@ async fn run_http_script(
                         }
                         Ok(None) => {
                             state.step_errors.lock().await.push(
-                                "RespondWebSocketUpgrade: peer closed before a full request"
-                                    .into(),
+                                "RespondWebSocketUpgrade: peer closed before a full request".into(),
                             );
                             return Ok(());
                         }
@@ -875,15 +874,15 @@ async fn run_http_script(
                     }
                 }
                 let Some(key) = last_ws_key.as_deref() else {
-                    state.step_errors.lock().await.push(
-                        "RespondWebSocketUpgrade: missing Sec-WebSocket-Key".into(),
-                    );
+                    state
+                        .step_errors
+                        .lock()
+                        .await
+                        .push("RespondWebSocketUpgrade: missing Sec-WebSocket-Key".into());
                     return Ok(());
                 };
                 let accept =
-                    tokio_tungstenite::tungstenite::handshake::derive_accept_key(
-                        key.as_bytes(),
-                    );
+                    tokio_tungstenite::tungstenite::handshake::derive_accept_key(key.as_bytes());
                 let response = format!(
                     "HTTP/1.1 101 Switching Protocols\r\n\
                      Upgrade: websocket\r\n\

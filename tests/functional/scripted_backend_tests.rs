@@ -59,9 +59,7 @@ fn file_mode_yaml_with_stdout_logging(port: u16, overrides: serde_json::Value) -
         "backend_read_timeout_ms": 5000,
         "backend_write_timeout_ms": 5000,
     });
-    if let (Some(proxy_obj), Some(overrides_obj)) =
-        (proxy.as_object_mut(), overrides.as_object())
-    {
+    if let (Some(proxy_obj), Some(overrides_obj)) = (proxy.as_object_mut(), overrides.as_object()) {
         for (k, v) in overrides_obj {
             proxy_obj.insert(k.clone(), v.clone());
         }
