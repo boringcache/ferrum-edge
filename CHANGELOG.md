@@ -136,6 +136,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- HTTP-family `backend_write_timeout_ms` now bounds request-body upload
+  inactivity on H1, H2 (reqwest and the direct H2 pool), and native H3, not
+  only TCP streams. A backend that accepts and never reads surfaces as
+  `504` / `X-Gateway-Error: backend_timeout` /
+  `error_class=read_write_timeout`. `0` still disables the bound.
+
+- HTTP-family `backend_read_timeout_ms` is an idle-between-frames watermark
+  on streaming response bodies (including SSE after headers). A stall after
+  the first event no longer tears the stream down immediately as
+  `request_error`; headers-already-committed stalls abort the body and
+  classify `read_write_timeout` in the access log. Slow-but-progressing
+  streams keep the watermark fresh. `0` still disables the bound.
+
 - WAF `mode: enforce` admission now counts `on_body_too_large: block` as a
   reachable enforcement path (issue #4006). That setting already rejected
   oversize governed HTTP bodies and WebSocket application messages whenever

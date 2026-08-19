@@ -2905,7 +2905,7 @@ fn every_streaming_h1h2_upload_installs_the_gateway_owned_pump() {
         PROXY_SOURCE
             .matches("install_streaming_upload_authorization(")
             .count(),
-        6,
+        7,
         "an H1/H2 streaming upload lost its gateway-owned lifecycle"
     );
     assert_eq!(
@@ -2918,7 +2918,8 @@ fn every_streaming_h1h2_upload_installs_the_gateway_owned_pump() {
     // Native gRPC keeps its own body type, so it installs the pump directly on
     // the shared upload source rather than through the H1/H2 adapters.
     assert!(
-        GRPC_PROXY_SOURCE.contains("UploadSource::for_streaming_upload(body, auth)"),
+        GRPC_PROXY_SOURCE.contains("UploadSource::for_streaming_upload(")
+            && GRPC_PROXY_SOURCE.contains("proxy.backend_write_timeout_ms"),
         "the fully-streamed native-gRPC upload lost its gateway-owned lifecycle"
     );
     let native_grpc_poll = GRPC_PROXY_SOURCE
@@ -2957,8 +2958,9 @@ fn every_streaming_h1h2_upload_installs_the_gateway_owned_pump() {
         .expect("bounded installer body");
     assert!(installer.contains("with_authorization_deadline("));
     assert!(installer.contains("with_gateway_upload_pump("));
-    // Unauthenticated requests keep the previous zero-overhead path.
-    assert!(installer.contains("let Some(plan) = auth else {"));
+    // Unauthenticated requests with write timeout disabled keep the previous
+    // zero-overhead path (no pump, no timer).
+    assert!(installer.contains("write_timeout_ms == 0"));
 }
 
 #[test]

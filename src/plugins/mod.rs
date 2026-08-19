@@ -3101,13 +3101,12 @@ pub struct RequestContext {
     /// matched predicate even when the hot router selected a later fallback
     /// proxy for the same public path.
     ///
-    /// On the reqwest dispatch path this is the vendored `RequestBuilder::timeout()`
-    /// budget, which reqwest applies from connect through **response body
-    /// completion** — it is a whole-exchange bound, not a per-chunk inactivity
-    /// bound. `Some(0)` deliberately means "no gateway-imposed whole-exchange
-    /// bound" (dispatch only installs a timeout when the effective value is
-    /// non-zero), which is how a long-running streamed generation opts out of the
-    /// placeholder proxy's default.
+    /// On the reqwest dispatch path this is the header-wait bound around
+    /// `send()` plus the idle-between-frames `backend_read_timeout_ms` on
+    /// streaming bodies. `Some(0)` deliberately means "no gateway-imposed
+    /// idle or header-wait bound" (dispatch only arms a timer when the
+    /// effective value is non-zero), which is how a long-running streamed
+    /// generation opts out of the placeholder proxy's default.
     pub route_override_backend_read_timeout_ms: Option<u64>,
     /// Plugin-set override for the proxy's backend connect timeout.
     ///

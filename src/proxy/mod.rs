@@ -37598,6 +37598,7 @@ async fn handle_proxy_request_inner(
                     inspector,
                     tx,
                     effective_max_response_body_size_bytes,
+                    proxy.backend_read_timeout_ms,
                     reqwest_backend_guard,
                     lb_connection_guard,
                 ));
@@ -37640,7 +37641,11 @@ async fn handle_proxy_request_inner(
                 let base = if state.response_buffer_cutoff_bytes == 0
                     && effective_max_response_body_size_bytes == 0
                 {
-                    crate::proxy::body::direct_streaming_body(response, advertised_cl)
+                    crate::proxy::body::direct_streaming_body(
+                        response,
+                        advertised_cl,
+                        proxy.backend_read_timeout_ms,
+                    )
                 } else if effective_max_response_body_size_bytes > 0 && cl.is_none() {
                     // No Content-Length — enforce size limit while streaming instead
                     // of buffering the entire body into memory.
@@ -37648,9 +37653,14 @@ async fn handle_proxy_request_inner(
                         response,
                         effective_max_response_body_size_bytes,
                         advertised_cl,
+                        proxy.backend_read_timeout_ms,
                     )
                 } else {
-                    crate::proxy::body::coalescing_body(response, advertised_cl)
+                    crate::proxy::body::coalescing_body(
+                        response,
+                        advertised_cl,
+                        proxy.backend_read_timeout_ms,
+                    )
                 };
                 let base = if let Some(guard) = reqwest_backend_guard {
                     base.with_reqwest_backend_guard(guard)
@@ -39103,12 +39113,10 @@ pub(crate) async fn proxy_to_backend_retry(
             req_builder = req_builder.connect_timeout(operator_timeout);
         }
     }
-    if proxy.backend_read_timeout_ms > 0 {
-        let operator_timeout = Duration::from_millis(proxy.backend_read_timeout_ms);
-        if client_deadline_remaining.is_none_or(|remaining| operator_timeout < remaining) {
-            req_builder = req_builder.timeout(operator_timeout);
-        }
-    }
+    // Header wait is bounded below by `tokio::time::timeout` around `send()`.
+    // Do not install reqwest `RequestBuilder::timeout()`: that is a total
+    // deadline from `send()` start that is transferred onto the response as
+    // `TotalTimeoutBody` and would kill a slow-but-progressing SSE stream.
 
     // Forward headers, stripping hop-by-hop headers per RFC 9110 §7.6.1
     // (canonical predicate in `proxy::headers`). Also strip every header
@@ -39295,7 +39303,25 @@ pub(crate) async fn proxy_to_backend_retry(
         send_auth_deadline.as_ref(),
     );
     let send_future = crate::plugins::await_deadline_first(send_bound.at, req_builder.send());
-    let send_result = match send_future.await {
+    let header_wait = if proxy.backend_read_timeout_ms > 0 {
+        match tokio::time::timeout(
+            Duration::from_millis(proxy.backend_read_timeout_ms),
+            send_future,
+        )
+        .await
+        {
+            Ok(inner) => inner,
+            Err(_) => {
+                return http_backend_dispatch_error_response(
+                    retry::ErrorClass::ReadWriteTimeout,
+                    resolved_ip,
+                );
+            }
+        }
+    } else {
+        send_future.await
+    };
+    let send_result = match header_wait {
         Ok(result) => result,
         Err(()) => {
             if dispatch_phase_authorization_expiry(send_bound, send_auth_deadline.as_ref())
@@ -39409,6 +39435,7 @@ pub(crate) async fn proxy_to_backend_retry(
                             response,
                             retained_ceiling,
                             declared_len,
+                            proxy.backend_read_timeout_ms,
                         ),
                     )
                     .await
@@ -39466,7 +39493,11 @@ pub(crate) async fn proxy_to_backend_retry(
                     let collected = match collect_response_under_authorization(
                         request_ctx.grpc_deadline_at(),
                         send_auth_deadline.as_ref(),
-                        collect_response_with_limit(response, max_size),
+                        collect_response_with_limit(
+                            response,
+                            max_size,
+                            proxy.backend_read_timeout_ms,
+                        ),
                     )
                     .await
                     {
@@ -40421,6 +40452,8 @@ fn record_h2_pool_admission_failure(
 enum EagerRetainFailure {
     /// Mid-body transport failure after the response headers arrived.
     Read(reqwest::Error),
+    /// `backend_read_timeout_ms` elapsed between buffered body chunks.
+    ReadTimeout,
     /// The retained bounds refused the body.
     Retain(response_buffer_budget::RetainRejection),
 }
@@ -40435,6 +40468,7 @@ async fn eager_collect_charged_backend_body(
     response: reqwest::Response,
     ceiling: usize,
     preallocation_hint: usize,
+    read_timeout_ms: u64,
 ) -> Result<Bytes, EagerRetainFailure> {
     use futures_util::StreamExt as _;
     let mut collector = response_buffer_budget::ChargedBodyCollector::with_preallocation(
@@ -40444,7 +40478,17 @@ async fn eager_collect_charged_backend_body(
     )
     .map_err(EagerRetainFailure::Retain)?;
     let mut stream = response.bytes_stream();
-    while let Some(chunk) = stream.next().await {
+    loop {
+        let chunk = match next_reqwest_chunk_idle(
+            &mut stream,
+            read_timeout_ms,
+        )
+        .await
+        {
+            Ok(Some(chunk)) => chunk,
+            Ok(None) => break,
+            Err(()) => return Err(EagerRetainFailure::ReadTimeout),
+        };
         match chunk {
             Ok(chunk) => {
                 if let Err(rejection) = collector.append(&chunk) {
@@ -40534,6 +40578,25 @@ fn buffered_backend_response_from_eager_collect(
                 error_class: Some(error_class),
             }
         }
+        Err(EagerRetainFailure::ReadTimeout) => {
+            let (status_code, body) = http_backend_failure_status_and_body(
+                retry::ErrorClass::ReadWriteTimeout,
+            );
+            warn!(
+                error_kind = retry::error_class_log_kind(
+                    retry::ErrorClass::ReadWriteTimeout
+                ),
+                "Backend response body read timed out while buffering"
+            );
+            retry::BackendResponse {
+                status_code,
+                body: ResponseBody::buffered(body.as_bytes().to_vec()),
+                headers: HashMap::new(),
+                connection_error: false,
+                backend_resolved_ip: resolved_ip,
+                error_class: Some(retry::ErrorClass::ReadWriteTimeout),
+            }
+        }
     }
 }
 
@@ -40582,15 +40645,14 @@ pub(crate) fn http_backend_dispatch_error_response(
 /// Status + `ErrorClass` for a reqwest body-read failure on an eager-buffering
 /// path, given the classifier's verdict for the underlying error (#2953).
 ///
-/// The per-request `RequestBuilder::timeout()` (`backend_read_timeout_ms`)
-/// covers through body completion in reqwest, so a read **timeout** during
-/// eager buffering lands here. Hardcoding `ConnectionReset`/502 made the same
-/// backend fault surface as 502/`connection_reset` over reqwest and
-/// 504/`read_write_timeout` over direct H2 (`HyperBodyCollectError::ReadTimeout`)
-/// — a transport-dependent split in `TransactionSummary.error_class`, operator
-/// dashboards, and circuit-breaker `failure_status_codes` matching. Map
-/// `ReadWriteTimeout` to 504 for parity with the H2/H3 arms; everything else
-/// keeps the 502.
+/// Idle `backend_read_timeout_ms` between buffered chunks
+/// (`next_reqwest_chunk_idle`) surfaces here as `ReadWriteTimeout`. Hardcoding
+/// `ConnectionReset`/502 made the same backend fault surface as
+/// 502/`connection_reset` over reqwest and 504/`read_write_timeout` over
+/// direct H2 (`HyperBodyCollectError::ReadTimeout`) — a transport-dependent
+/// split in `TransactionSummary.error_class`, operator dashboards, and
+/// circuit-breaker `failure_status_codes` matching. Map `ReadWriteTimeout` to
+/// 504 for parity with the H2/H3 arms; everything else keeps the 502.
 ///
 /// Response headers have already arrived at every call site, so the fault is
 /// post-wire by construction and callers keep `connection_error: false`. A
@@ -42289,12 +42351,10 @@ async fn proxy_to_backend(
             req_builder = req_builder.connect_timeout(operator_timeout);
         }
     }
-    if proxy.backend_read_timeout_ms > 0 {
-        let operator_timeout = Duration::from_millis(proxy.backend_read_timeout_ms);
-        if client_deadline_remaining.is_none_or(|remaining| operator_timeout < remaining) {
-            req_builder = req_builder.timeout(operator_timeout);
-        }
-    }
+    // Header wait is bounded below by `tokio::time::timeout` around `send()`.
+    // Do not install reqwest `RequestBuilder::timeout()`: that is a total
+    // deadline from `send()` start that is transferred onto the response as
+    // `TotalTimeoutBody` and would kill a slow-but-progressing SSE stream.
 
     // Forward headers, stripping hop-by-hop headers per RFC 9110 §7.6.1
     // (canonical predicate in `proxy::headers`). Also strip every header
@@ -42520,6 +42580,7 @@ async fn proxy_to_backend(
                     let (limited, _upload_pump) = install_streaming_upload_authorization(
                         limited,
                         upload_auth_deadline.as_ref(),
+                        proxy.backend_write_timeout_ms,
                     );
                     let limited =
                         if crate::plugins::mesh::prometheus_helpers::metadata_observes_grpc_messages(
@@ -42547,6 +42608,7 @@ async fn proxy_to_backend(
                     let (counting, _upload_pump) = install_counting_upload_authorization(
                         counting,
                         upload_auth_deadline.as_ref(),
+                        proxy.backend_write_timeout_ms,
                     );
                     let counting =
                         if crate::plugins::mesh::prometheus_helpers::metadata_observes_grpc_messages(
@@ -42920,7 +42982,29 @@ async fn proxy_to_backend(
         send_auth_deadline.as_ref(),
     );
     let send_future = crate::plugins::await_deadline_first(send_bound.at, req_builder.send());
-    let send_result = match send_future.await {
+    let header_wait = if proxy.backend_read_timeout_ms > 0 {
+        match tokio::time::timeout(
+            Duration::from_millis(proxy.backend_read_timeout_ms),
+            send_future,
+        )
+        .await
+        {
+            Ok(inner) => inner,
+            Err(_) => {
+                return backend_dispatch_response(
+                    http_backend_dispatch_error_response(
+                        retry::ErrorClass::ReadWriteTimeout,
+                        resolved_ip,
+                    ),
+                    retained_body,
+                    backend_admission_permits,
+                );
+            }
+        }
+    } else {
+        send_future.await
+    };
+    let send_result = match header_wait {
         Ok(result) => result,
         Err(()) => {
             // Attribute the fired bound. An authorization expiry cancels the
@@ -43084,6 +43168,7 @@ async fn proxy_to_backend(
                                 response,
                                 retained_ceiling,
                                 declared_len,
+                                proxy.backend_read_timeout_ms,
                             ),
                         )
                         .await
@@ -43172,7 +43257,11 @@ async fn proxy_to_backend(
                 let collected = match collect_response_under_authorization(
                     request_ctx.grpc_deadline_at(),
                     send_auth_deadline.as_ref(),
-                    collect_response_with_limit(response, max_size),
+                    collect_response_with_limit(
+                        response,
+                        max_size,
+                        proxy.backend_read_timeout_ms,
+                    ),
                 )
                 .await
                 {
@@ -43242,6 +43331,7 @@ async fn proxy_to_backend(
                             response,
                             retained_ceiling,
                             declared_len,
+                            proxy.backend_read_timeout_ms,
                         ),
                     )
                     .await
@@ -43300,7 +43390,11 @@ async fn proxy_to_backend(
                 let collected = match collect_response_under_authorization(
                     request_ctx.grpc_deadline_at(),
                     send_auth_deadline.as_ref(),
-                    collect_response_with_limit(response, max_size),
+                    collect_response_with_limit(
+                        response,
+                        max_size,
+                        proxy.backend_read_timeout_ms,
+                    ),
                 )
                 .await
                 {
@@ -43477,6 +43571,17 @@ impl BufferedCollectFailure {
         }
     }
 
+    fn read_timeout() -> Self {
+        let (status_code, body) = http_backend_failure_status_and_body(
+            retry::ErrorClass::ReadWriteTimeout,
+        );
+        Self {
+            status_code,
+            body: body.as_bytes().to_vec(),
+            error_class: retry::ErrorClass::ReadWriteTimeout,
+        }
+    }
+
     /// Aggregate buffered-response budget exhausted. Carries the neutral
     /// gateway-capacity class, NOT `ResponseBodyTooLarge`: the backend behaved
     /// correctly and stayed within every configured per-response ceiling, so
@@ -43510,6 +43615,7 @@ impl BufferedCollectFailure {
 async fn collect_response_with_limit(
     response: reqwest::Response,
     max_size: usize,
+    read_timeout_ms: u64,
 ) -> Result<(Bytes, usize), BufferedCollectFailure> {
     use futures_util::StreamExt as _;
     let mut body = response_buffer_budget::ChargedBodyCollector::new(
@@ -43517,7 +43623,17 @@ async fn collect_response_with_limit(
         max_size,
     );
     let mut stream = response.bytes_stream();
-    while let Some(chunk_result) = stream.next().await {
+    loop {
+        let chunk_result = match next_reqwest_chunk_idle(
+            &mut stream,
+            read_timeout_ms,
+        )
+        .await
+        {
+            Ok(Some(chunk)) => chunk,
+            Ok(None) => break,
+            Err(()) => return Err(BufferedCollectFailure::read_timeout()),
+        };
         match chunk_result {
             Ok(chunk) => {
                 // The collector owns BOTH bounds. It charges the growth target
@@ -43540,6 +43656,30 @@ async fn collect_response_with_limit(
             response_buffer_budget::RetainRejection::BudgetExhausted,
             max_size,
         )),
+    }
+}
+
+/// Wait for the next reqwest body chunk, bounded by an idle
+/// `backend_read_timeout_ms`. `0` disables the idle arm.
+async fn next_reqwest_chunk_idle<S, T>(
+    stream: &mut S,
+    read_timeout_ms: u64,
+) -> Result<Option<T>, ()>
+where
+    S: futures_util::Stream<Item = T> + Unpin,
+{
+    use futures_util::StreamExt as _;
+    if read_timeout_ms == 0 {
+        return Ok(stream.next().await);
+    }
+    match tokio::time::timeout(
+        Duration::from_millis(read_timeout_ms),
+        stream.next(),
+    )
+    .await
+    {
+        Ok(item) => Ok(item),
+        Err(_) => Err(()),
     }
 }
 
@@ -45307,21 +45447,28 @@ pub(crate) fn request_upload_auth_deadline(
 /// `cancel_and_join()` resolves only after the pump published its outcome,
 /// which it does after dropping the client body.
 ///
-/// Unauthenticated requests get neither (`auth` is `None`), so the no-auth-plan
-/// hot path is byte-for-byte the previous one: no task, no channel, no timer.
+/// Unauthenticated requests with `backend_write_timeout_ms == 0` get neither,
+/// so that hot path stays byte-for-byte the previous one: no task, no channel,
+/// no timer. A live write timeout installs the pump even without a credential
+/// so a backend that accepts and never reads cannot hang the upload.
 pub(crate) fn install_streaming_upload_authorization(
     body: body::SizeLimitedIncoming,
     auth: Option<&RequestAuthLifetimePlan>,
+    write_timeout_ms: u64,
 ) -> (
     body::SizeLimitedIncoming,
     Option<upload_pump::UploadPumpJoin>,
 ) {
-    let Some(plan) = auth else {
-        return (body, None);
+    let body = if let Some(plan) = auth {
+        let (deadline, family, latch) = plan;
+        body.with_authorization_deadline(*deadline, *family, latch.clone())
+    } else {
+        body
     };
-    let (deadline, family, latch) = plan;
-    body.with_authorization_deadline(*deadline, *family, latch.clone())
-        .with_gateway_upload_pump(plan)
+    if auth.is_none() && write_timeout_ms == 0 {
+        return (body, None);
+    }
+    body.with_gateway_upload_pump(auth, write_timeout_ms)
 }
 
 /// [`install_streaming_upload_authorization`] for the unlimited-size streaming
@@ -45329,13 +45476,18 @@ pub(crate) fn install_streaming_upload_authorization(
 pub(crate) fn install_counting_upload_authorization(
     body: body::CountingIncoming,
     auth: Option<&RequestAuthLifetimePlan>,
+    write_timeout_ms: u64,
 ) -> (body::CountingIncoming, Option<upload_pump::UploadPumpJoin>) {
-    let Some(plan) = auth else {
-        return (body, None);
+    let body = if let Some(plan) = auth {
+        let (deadline, family, latch) = plan;
+        body.with_authorization_deadline(*deadline, *family, latch.clone())
+    } else {
+        body
     };
-    let (deadline, family, latch) = plan;
-    body.with_authorization_deadline(*deadline, *family, latch.clone())
-        .with_gateway_upload_pump(plan)
+    if auth.is_none() && write_timeout_ms == 0 {
+        return (body, None);
+    }
+    body.with_gateway_upload_pump(auth, write_timeout_ms)
 }
 
 /// Compose the admitted request's absolute authorization deadline over the
@@ -46412,6 +46564,7 @@ async fn proxy_to_backend_hbone_after_ready(
                     state.env_config.authenticated_stream_max_lifetime_seconds,
                 )
                 .as_ref(),
+                proxy.backend_write_timeout_ms,
             );
             let body = match ctx {
                 Some(c)
@@ -47113,6 +47266,7 @@ async fn proxy_to_backend_unix(
                     state.env_config.authenticated_stream_max_lifetime_seconds,
                 )
                 .as_ref(),
+                proxy.backend_write_timeout_ms,
             );
             let body = match ctx {
                 Some(c)
@@ -48595,6 +48749,7 @@ async fn proxy_to_backend_mesh_mtls_after_ready(
                     state.env_config.authenticated_stream_max_lifetime_seconds,
                 )
                 .as_ref(),
+                proxy.backend_write_timeout_ms,
             );
             let body = if crate::plugins::mesh::prometheus_helpers::metadata_observes_grpc_messages(
                 &request_ctx.metadata,
@@ -49405,8 +49560,11 @@ async fn proxy_to_backend_http2(
         // exit. Once that join returns, the pump task has published its
         // outcome, which it does after dropping the inbound client body: no
         // gateway-owned upload survives this function.
-        let (body, upload_pump) =
-            install_streaming_upload_authorization(body, upload_auth_deadline.as_ref());
+        let (body, upload_pump) = install_streaming_upload_authorization(
+            body,
+            upload_auth_deadline.as_ref(),
+            proxy.backend_write_timeout_ms,
+        );
         (
             body,
             Some(completion_rx),
@@ -49425,9 +49583,19 @@ async fn proxy_to_backend_http2(
         }
         // Unreachable with an authorization plan present
         // (`needs_upload_completion_gate` is true whenever
-        // `upload_auth_deadline.is_some()`), so this arm is the unauthenticated
-        // hot path and installs neither timer nor pump.
-        (body, None, None)
+        // `upload_auth_deadline.is_some()`). A live write timeout still
+        // installs the pump so an unauthenticated upload cannot hang when
+        // the backend never reads.
+        let (body, upload_pump) = install_streaming_upload_authorization(
+            body,
+            None,
+            proxy.backend_write_timeout_ms,
+        );
+        (
+            body,
+            None,
+            upload_pump.map(crate::proxy::upload_pump::UploadPumpJoin::cancel_on_drop),
+        )
     };
 
     // Set the URI

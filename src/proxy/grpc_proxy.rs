@@ -4028,7 +4028,11 @@ pub async fn proxy_grpc_request_streaming(
     // lifetime is the transport body's — `UploadPumpSource`'s abort guard ends
     // the task when hyper drops that body, and the pump self-terminates at the
     // deadline regardless of what the backend is doing.
-    let (body, _upload_pump) = crate::proxy::body::UploadSource::for_streaming_upload(body, auth);
+    let (body, _upload_pump) = crate::proxy::body::UploadSource::for_streaming_upload(
+        body,
+        auth,
+        proxy.backend_write_timeout_ms,
+    );
     let auth_deadline = auth.map(|(deadline, family, latch)| {
         crate::proxy::body::UploadAuthDeadline::new(*deadline, *family, latch.clone())
     });

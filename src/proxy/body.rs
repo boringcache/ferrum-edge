@@ -2000,8 +2000,8 @@ pub enum UploadSource {
 
 impl UploadSource {
     /// Build the source for one streaming client upload, installing a
-    /// gateway-owned pump when (and only when) the request carries an
-    /// authorization-lifetime plan.
+    /// gateway-owned pump when the request carries an authorization-lifetime
+    /// plan and/or a live `backend_write_timeout_ms`.
     ///
     /// This is the entry the native-gRPC request body uses; the H1/H2 adapters
     /// reach the same machinery through
@@ -2009,12 +2009,10 @@ impl UploadSource {
     pub(crate) fn for_streaming_upload(
         incoming: Incoming,
         auth: Option<&crate::proxy::RequestAuthLifetimePlan>,
+        write_timeout_ms: u64,
     ) -> (Self, Option<crate::proxy::upload_pump::UploadPumpJoin>) {
         let mut source = UploadSource::Direct(incoming);
-        let join = match auth {
-            Some(plan) => source.install_pump(plan),
-            None => None,
-        };
+        let join = source.install_pump(auth, write_timeout_ms);
         (source, join)
     }
 
@@ -2056,13 +2054,30 @@ impl UploadSource {
     /// hyper relies on `is_end_stream()` being true up front to send
     /// `END_STREAM` with the request headers) or when a pump is already
     /// installed.
+    /// Move the client body into a gateway-owned pump, returning the join
+    /// point.
+    ///
+    /// Returns `None` — leaving the direct path untouched — when the body is
+    /// already at end of stream (an empty upload has nothing to bound, and
+    /// hyper relies on `is_end_stream()` being true up front to send
+    /// `END_STREAM` with the request headers), when a pump is already
+    /// installed, or when neither an authorization plan nor a live write
+    /// timeout needs a gateway-owned task.
     fn install_pump(
         &mut self,
-        plan: &crate::proxy::RequestAuthLifetimePlan,
+        plan: Option<&crate::proxy::RequestAuthLifetimePlan>,
+        write_timeout_ms: u64,
     ) -> Option<crate::proxy::upload_pump::UploadPumpJoin> {
+        if plan.is_none() && write_timeout_ms == 0 {
+            return None;
+        }
         match std::mem::replace(self, UploadSource::Exhausted) {
             UploadSource::Direct(incoming) if !http_body::Body::is_end_stream(&incoming) => {
-                let (source, join) = crate::proxy::upload_pump::spawn_upload_pump(incoming, plan);
+                let (source, join) = crate::proxy::upload_pump::spawn_upload_pump(
+                    incoming,
+                    plan,
+                    write_timeout_ms,
+                );
                 *self = UploadSource::Pumped(source);
                 Some(join)
             }
@@ -2299,9 +2314,10 @@ impl SizeLimitedIncoming {
     #[must_use]
     pub(crate) fn with_gateway_upload_pump(
         mut self,
-        plan: &crate::proxy::RequestAuthLifetimePlan,
+        plan: Option<&crate::proxy::RequestAuthLifetimePlan>,
+        write_timeout_ms: u64,
     ) -> (Self, Option<crate::proxy::upload_pump::UploadPumpJoin>) {
-        let join = self.inner.install_pump(plan);
+        let join = self.inner.install_pump(plan, write_timeout_ms);
         (self, join)
     }
 
@@ -2587,9 +2603,10 @@ impl CountingIncoming {
     #[must_use]
     pub(crate) fn with_gateway_upload_pump(
         mut self,
-        plan: &crate::proxy::RequestAuthLifetimePlan,
+        plan: Option<&crate::proxy::RequestAuthLifetimePlan>,
+        write_timeout_ms: u64,
     ) -> (Self, Option<crate::proxy::upload_pump::UploadPumpJoin>) {
-        let join = self.inner.install_pump(plan);
+        let join = self.inner.install_pump(plan, write_timeout_ms);
         (self, join)
     }
 
@@ -2708,6 +2725,7 @@ pub(crate) fn size_limited_streaming_body(
     response: reqwest::Response,
     max_bytes: usize,
     content_length: Option<u64>,
+    read_timeout_ms: u64,
 ) -> ProxyBody {
     use futures_util::StreamExt;
 
@@ -2725,7 +2743,7 @@ pub(crate) fn size_limited_streaming_body(
         COALESCE_TARGET,
         content_length,
     );
-    ProxyBody::streaming(Box::pin(coalescing))
+    wrap_idle_read_timeout(coalescing, read_timeout_ms)
 }
 
 impl<S> futures_util::Stream for SizeLimitedStreamingResponse<S>
@@ -4174,9 +4192,26 @@ impl<S: H3RecvStream + Unpin> http_body::Body for DirectH3Body<S> {
     }
 }
 
+/// Outermost idle `backend_read_timeout_ms` wrapper for reqwest streaming
+/// bodies. `0` skips the wrapper so long-lived streams stay unbounded.
+fn wrap_idle_read_timeout<B>(body: B, read_timeout_ms: u64) -> ProxyBody
+where
+    B: http_body::Body<Data = Bytes, Error = BoxError> + Send + Unpin + 'static,
+{
+    if read_timeout_ms > 0 {
+        ProxyBody::streaming(Box::pin(IdleReadTimeoutBody::new(
+            body,
+            read_timeout_ms,
+        )))
+    } else {
+        ProxyBody::streaming(Box::pin(body))
+    }
+}
+
 pub(crate) fn coalescing_body(
     response: reqwest::Response,
     content_length: Option<u64>,
+    read_timeout_ms: u64,
 ) -> ProxyBody {
     use futures_util::StreamExt;
 
@@ -4188,12 +4223,13 @@ pub(crate) fn coalescing_body(
         COALESCE_TARGET,
         content_length,
     );
-    ProxyBody::streaming(Box::pin(body))
+    wrap_idle_read_timeout(body, read_timeout_ms)
 }
 
 pub(crate) fn direct_streaming_body(
     response: reqwest::Response,
     content_length: Option<u64>,
+    read_timeout_ms: u64,
 ) -> ProxyBody {
     use futures_util::StreamExt;
 
@@ -4204,7 +4240,7 @@ pub(crate) fn direct_streaming_body(
         inner: stream,
         content_length,
     };
-    ProxyBody::streaming(Box::pin(body))
+    wrap_idle_read_timeout(body, read_timeout_ms)
 }
 
 /// Build a streaming response body fed by [`run_response_inspection`] over an
@@ -4261,12 +4297,16 @@ where
 /// `max_response_body_size_bytes` (`0` = unlimited) bounds total bytes received
 /// from the backend, mirroring the non-inspected `size_limited_streaming_body`
 /// path: an SSE response that exceeds it is terminated with a body error rather
-/// than forwarded unbounded just because each window was clean.
+/// than forwarded unbounded just because each window was clean. A live
+/// `backend_read_timeout_ms` is an idle-between-chunks bound on `stream.next()`
+/// only — inspector time is not charged, and `0` leaves the wait unbounded.
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn run_response_inspection(
     response: reqwest::Response,
     mut inspector: Box<dyn crate::plugins::ResponseStreamInspector>,
     tx: tokio::sync::mpsc::Sender<Result<Frame<Bytes>, BoxError>>,
     max_response_body_size_bytes: usize,
+    read_timeout_ms: u64,
     _reqwest_backend_guard: Option<crate::runtime_metrics::ReqwestBackendRequestGuard>,
     _lb_connection_guard: super::LoadBalancerConnectionGuard,
 ) {
@@ -4275,6 +4315,11 @@ pub(crate) async fn run_response_inspection(
 
     let mut stream = response.bytes_stream();
     let mut total_received: usize = 0;
+    let read_timeout_active = read_timeout_ms > 0;
+    let read_deadline = tokio::time::sleep(std::time::Duration::from_millis(
+        read_timeout_ms.max(1),
+    ));
+    tokio::pin!(read_deadline);
     loop {
         // Watch for client disconnect WHILE awaiting the next backend chunk: an
         // idle long-lived SSE stream may not produce another chunk for a long
@@ -4282,9 +4327,29 @@ pub(crate) async fn run_response_inspection(
         // stay open until a chunk or read timeout arrives. `tx.closed()` resolves
         // as soon as the downstream body drops the receiver; returning here drops
         // `stream` (cancelling the backend request) and the guards.
+        //
+        // Re-arm the idle watermark at the start of each wait so inspection
+        // time is not charged against `backend_read_timeout_ms`.
+        if read_timeout_active {
+            read_deadline.as_mut().reset(
+                tokio::time::Instant::now()
+                    + std::time::Duration::from_millis(read_timeout_ms),
+            );
+        }
         let chunk = tokio::select! {
             biased;
             _ = tx.closed() => return,
+            _ = &mut read_deadline, if read_timeout_active => {
+                let _ = tx
+                    .send(Err(Box::new(std::io::Error::new(
+                        std::io::ErrorKind::TimedOut,
+                        format!(
+                            "backend response body read timeout after {read_timeout_ms}ms"
+                        ),
+                    )) as BoxError))
+                    .await;
+                return;
+            }
             next = stream.next() => next,
         };
         let Some(chunk) = chunk else { break };

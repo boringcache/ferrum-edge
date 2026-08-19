@@ -554,6 +554,40 @@ where
     result.map_err(recv_response_err)
 }
 
+/// Bound one native-H3 request-body write (`send_data` / `send_trailers` /
+/// `finish`) by `backend_write_timeout_ms`. `0` leaves the write unbounded.
+/// A stall maps to [`H3PoolError::write_timeout`] so dispatch sites surface
+/// the same 504 / `ReadWriteTimeout` as a response-side read timeout.
+async fn await_h3_client_write_with_timeout<F, T, E>(
+    backend_write_timeout_ms: u64,
+    fut: F,
+    op: &'static str,
+) -> H3PoolResult<T>
+where
+    F: std::future::Future<Output = Result<T, E>>,
+    E: std::fmt::Display,
+{
+    if backend_write_timeout_ms == 0 {
+        return fut.await.map_err(|e| {
+            H3PoolError::post_wire(anyhow::anyhow!("{op} failed: {e}"))
+        });
+    }
+    match tokio::time::timeout(
+        Duration::from_millis(backend_write_timeout_ms),
+        fut,
+    )
+    .await
+    {
+        Ok(Ok(value)) => Ok(value),
+        Ok(Err(e)) => Err(H3PoolError::post_wire(anyhow::anyhow!(
+            "{op} failed: {e}"
+        ))),
+        Err(_) => Err(H3PoolError::write_timeout(anyhow::anyhow!(
+            "backend request body write timeout after {backend_write_timeout_ms}ms"
+        ))),
+    }
+}
+
 #[inline]
 fn connection_listed_headers_if_present(headers: &http::HeaderMap) -> Vec<http::HeaderName> {
     if headers.contains_key(http::header::CONNECTION) {
@@ -902,6 +936,14 @@ impl H3PoolError {
         }
     }
 
+    /// Alias of [`Self::read_timeout`] for a `backend_write_timeout_ms`
+    /// stall while sending request-body DATA, trailers, or FIN. Dispatch
+    /// sites keep the typed `is_read_timeout` flag so the client-visible
+    /// 504 / `ReadWriteTimeout` mapping does not fork.
+    pub fn write_timeout(error: impl Into<anyhow::Error>) -> Self {
+        Self::read_timeout(error)
+    }
+
     /// Borrow the underlying error for downcast / display / `tracing` use.
     pub fn as_error(&self) -> &anyhow::Error {
         &self.inner
@@ -926,12 +968,12 @@ impl H3PoolError {
     }
 
     /// Returns `true` if this error originates from a
-    /// `backend_read_timeout_ms` deadline expiring while waiting for the
-    /// backend response (header wait or buffered body drain). Gateway
-    /// dispatch sites use this typed signal to return 504 Backend timeout
-    /// (consistent with the direct-H2 / HBONE read-timeout arms) and to
-    /// classify as `ReadWriteTimeout` deterministically. Read timeouts do
-    /// not trigger `mark_h3_unsupported`.
+    /// `backend_read_timeout_ms` or `backend_write_timeout_ms` deadline
+    /// expiring (header wait, buffered body drain, or a parked request-body
+    /// write). Gateway dispatch sites use this typed signal to return 504
+    /// Backend timeout (consistent with the direct-H2 / HBONE timeout arms)
+    /// and to classify as `ReadWriteTimeout` deterministically. These
+    /// timeouts do not trigger `mark_h3_unsupported`.
     pub fn is_read_timeout(&self) -> bool {
         self.read_timeout
     }
@@ -2373,15 +2415,19 @@ impl Http3ConnectionPool {
             .map_err(|e| H3PoolError::pre_wire(anyhow::anyhow!("send_request failed: {}", e)))?;
 
         if !body.is_empty() {
-            stream
-                .send_data(body)
-                .await
-                .map_err(|e| H3PoolError::post_wire(anyhow::anyhow!("send_data failed: {}", e)))?;
+            await_h3_client_write_with_timeout(
+                proxy.backend_write_timeout_ms,
+                stream.send_data(body),
+                "send_data",
+            )
+            .await?;
         }
-        stream
-            .finish()
-            .await
-            .map_err(|e| H3PoolError::post_wire(anyhow::anyhow!("finish failed: {}", e)))?;
+        await_h3_client_write_with_timeout(
+            proxy.backend_write_timeout_ms,
+            stream.finish(),
+            "finish",
+        )
+        .await?;
 
         let response =
             recv_h3_response_with_timeout(&mut stream, proxy.backend_read_timeout_ms).await?;
@@ -2469,15 +2515,19 @@ impl Http3ConnectionPool {
             .map_err(|e| H3PoolError::pre_wire(anyhow::anyhow!("send_request failed: {}", e)))?;
 
         if !body.is_empty() {
-            stream
-                .send_data(body)
-                .await
-                .map_err(|e| H3PoolError::post_wire(anyhow::anyhow!("send_data failed: {}", e)))?;
+            await_h3_client_write_with_timeout(
+                proxy.backend_write_timeout_ms,
+                stream.send_data(body),
+                "send_data",
+            )
+            .await?;
         }
-        stream
-            .finish()
-            .await
-            .map_err(|e| H3PoolError::post_wire(anyhow::anyhow!("finish failed: {}", e)))?;
+        await_h3_client_write_with_timeout(
+            proxy.backend_write_timeout_ms,
+            stream.finish(),
+            "finish",
+        )
+        .await?;
 
         let response =
             recv_h3_response_with_timeout(&mut stream, proxy.backend_read_timeout_ms).await?;
@@ -2595,10 +2645,12 @@ impl Http3ConnectionPool {
             }
             let data = chunk.copy_to_bytes(len);
             let metric_data = grpc_scanner.as_ref().map(|_| data.clone());
-            backend_stream
-                .send_data(data)
-                .await
-                .map_err(|e| H3PoolError::post_wire(anyhow::anyhow!("send_data failed: {}", e)))?;
+            await_h3_client_write_with_timeout(
+                proxy.backend_write_timeout_ms,
+                backend_stream.send_data(data),
+                "send_data",
+            )
+            .await?;
             if let (Some(messages), Some(scanner), Some(metric_data)) = (
                 grpc_messages.as_ref(),
                 grpc_scanner.as_mut(),
@@ -2631,12 +2683,12 @@ impl Http3ConnectionPool {
                 // Only forward a still-non-empty block; an all-reserved trailer set
                 // collapses to nothing and must not emit an empty trailer frame.
                 if !trailers.is_empty() {
-                    backend_stream.send_trailers(trailers).await.map_err(|e| {
-                        H3PoolError::post_wire(anyhow::anyhow!(
-                            "send request trailers failed: {}",
-                            e
-                        ))
-                    })?;
+                    await_h3_client_write_with_timeout(
+                        proxy.backend_write_timeout_ms,
+                        backend_stream.send_trailers(trailers),
+                        "send request trailers",
+                    )
+                    .await?;
                 }
             }
             Ok(_) => {}
@@ -2647,10 +2699,12 @@ impl Http3ConnectionPool {
                 )));
             }
         }
-        backend_stream
-            .finish()
-            .await
-            .map_err(|e| H3PoolError::post_wire(anyhow::anyhow!("finish failed: {}", e)))?;
+        await_h3_client_write_with_timeout(
+            proxy.backend_write_timeout_ms,
+            backend_stream.finish(),
+            "finish",
+        )
+        .await?;
         // The client upload (body + trailers) is fully forwarded and the backend
         // send side is FINished — any timeout from here on is the backend being slow
         // to return response headers, NOT a stalled client upload.
@@ -2993,10 +3047,12 @@ impl Http3ConnectionPool {
             }
             let data = chunk.copy_to_bytes(len);
             let metric_data = grpc_scanner.as_ref().map(|_| data.clone());
-            backend_stream
-                .send_data(data)
-                .await
-                .map_err(|e| H3PoolError::post_wire(anyhow::anyhow!("send_data failed: {}", e)))?;
+            await_h3_client_write_with_timeout(
+                proxy.backend_write_timeout_ms,
+                backend_stream.send_data(data),
+                "send_data",
+            )
+            .await?;
             if let (Some(messages), Some(scanner), Some(metric_data)) = (
                 grpc_messages.as_ref(),
                 grpc_scanner.as_mut(),
@@ -3006,10 +3062,12 @@ impl Http3ConnectionPool {
             }
             bytes_seen.fetch_add(len as u64, Ordering::Release);
         }
-        backend_stream
-            .finish()
-            .await
-            .map_err(|e| H3PoolError::post_wire(anyhow::anyhow!("finish failed: {}", e)))?;
+        await_h3_client_write_with_timeout(
+            proxy.backend_write_timeout_ms,
+            backend_stream.finish(),
+            "finish",
+        )
+        .await?;
 
         let response =
             recv_h3_response_with_timeout(&mut backend_stream, proxy.backend_read_timeout_ms)
@@ -3963,9 +4021,21 @@ impl Http3Client {
 
         // Send body if present
         if !body.is_empty() {
-            stream.send_data(body).await?;
+            await_h3_client_write_with_timeout(
+                proxy.backend_write_timeout_ms,
+                stream.send_data(body),
+                "send_data",
+            )
+            .await
+            .map_err(|e| anyhow::anyhow!("{}", e.as_error()))?;
         }
-        stream.finish().await?;
+        await_h3_client_write_with_timeout(
+            proxy.backend_write_timeout_ms,
+            stream.finish(),
+            "finish",
+        )
+        .await
+        .map_err(|e| anyhow::anyhow!("{}", e.as_error()))?;
 
         // Receive response
         let response = stream.recv_response().await?;

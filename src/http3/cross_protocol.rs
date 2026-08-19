@@ -1012,9 +1012,11 @@ fn build_plain_request_builder(
         req_builder =
             req_builder.connect_timeout(Duration::from_millis(proxy.backend_connect_timeout_ms));
     }
-    if proxy.backend_read_timeout_ms > 0 {
-        req_builder = req_builder.timeout(Duration::from_millis(proxy.backend_read_timeout_ms));
-    }
+    // Header wait is bounded by `tokio::time::timeout` around `send()` in
+    // the dispatch `select!`. Do not install reqwest
+    // `RequestBuilder::timeout()`: that is a total deadline from `send()`
+    // start that is transferred onto the response as `TotalTimeoutBody` and
+    // would kill a slow-but-progressing SSE stream.
 
     let original_host_header = proxy_headers.get("host").map(|s| s.as_str());
     let original_xff = proxy_headers.get("x-forwarded-for").map(|s| s.as_str());
@@ -1158,6 +1160,7 @@ fn cross_protocol_retain_rejection(
 async fn collect_reqwest_response_body_with_limit(
     mut response: reqwest::Response,
     max_response_body_size_bytes: usize,
+    read_timeout_ms: u64,
 ) -> Result<bytes::Bytes, (u16, Vec<u8>, Option<ErrorClass>)> {
     use crate::proxy::response_buffer_budget;
 
@@ -1168,7 +1171,29 @@ async fn collect_reqwest_response_body_with_limit(
         max_response_body_size_bytes,
     );
     loop {
-        match response.chunk().await {
+        let chunk = if read_timeout_ms == 0 {
+            response.chunk().await
+        } else {
+            match tokio::time::timeout(
+                Duration::from_millis(read_timeout_ms),
+                response.chunk(),
+            )
+            .await
+            {
+                Ok(chunk) => chunk,
+                Err(_) => {
+                    let (status, body) = crate::proxy::http_backend_failure_status_and_body(
+                        ErrorClass::ReadWriteTimeout,
+                    );
+                    return Err((
+                        status,
+                        body.as_bytes().to_vec(),
+                        Some(ErrorClass::ReadWriteTimeout),
+                    ));
+                }
+            }
+        };
+        match chunk {
             Ok(Some(chunk)) => {
                 // The collector owns the ceiling check and the aggregate charge,
                 // and charges the growth target BEFORE allocating it, so a
@@ -3249,22 +3274,49 @@ where
                 // once H3 DATA is drained so reqwest emits the final chunk marker.
                 let reader_finished = Arc::new(AtomicBool::new(false));
                 let reader_done_notify = Arc::new(tokio::sync::Notify::new());
+                let write_timed_out = Arc::new(AtomicBool::new(false));
                 let body_stream_reader_finished = Arc::clone(&reader_finished);
                 let body_stream_reader_done_notify = Arc::clone(&reader_done_notify);
+                let body_stream_write_timed_out = Arc::clone(&write_timed_out);
                 let body_stream = futures_util::stream::unfold(
                     (
                         rx,
                         body_stream_reader_finished,
                         body_stream_reader_done_notify,
+                        body_stream_write_timed_out,
                     ),
-                    |(mut rx, reader_finished, reader_done_notify)| async move {
+                    |(mut rx, reader_finished, reader_done_notify, write_timed_out)| async move {
                         loop {
+                            if write_timed_out.load(Ordering::Acquire) {
+                                return Some((
+                                    Err(std::io::Error::new(
+                                        std::io::ErrorKind::TimedOut,
+                                        "backend request body write timeout",
+                                    )),
+                                    (
+                                        rx,
+                                        reader_finished,
+                                        reader_done_notify,
+                                        write_timed_out,
+                                    ),
+                                ));
+                            }
                             if reader_finished.load(Ordering::Acquire) && rx.is_empty() {
                                 return None;
                             }
                             tokio::select! {
                                 item = rx.recv() => {
-                                    return item.map(|item| (item, (rx, reader_finished, reader_done_notify)));
+                                    return item.map(|item| {
+                                        (
+                                            item,
+                                            (
+                                                rx,
+                                                reader_finished,
+                                                reader_done_notify,
+                                                write_timed_out,
+                                            ),
+                                        )
+                                    });
                                 }
                                 _ = reader_done_notify.notified() => {}
                             }
@@ -3302,6 +3354,8 @@ where
                 // final safety net for any await that remains uncancellable.
                 let reader_finished_for_reader = Arc::clone(&reader_finished);
                 let reader_done_notify_for_reader = Arc::clone(&reader_done_notify);
+                let reader_write_timed_out = Arc::clone(&write_timed_out);
+                let reader_write_timeout_ms = dispatch_proxy.backend_write_timeout_ms;
                 // Capture STOP_SENDING before the reader borrows the stream.
                 // The future is `'static` and does not hold `&mut` on either
                 // half, so the upload pump can keep polling recv_data.
@@ -3313,6 +3367,11 @@ where
                         reader_finished_for_reader.store(true, Ordering::Release);
                         reader_done_notify_for_reader.notify_waiters();
                     };
+                    let write_timeout_active = reader_write_timeout_ms > 0;
+                    let write_deadline = tokio::time::sleep(Duration::from_millis(
+                        reader_write_timeout_ms.max(1),
+                    ));
+                    tokio::pin!(write_deadline);
                     let mut total: usize = 0;
                     loop {
                         tokio::select! {
@@ -3348,10 +3407,27 @@ where
                                         // pattern used by the native H3 backend pool
                                         // in `src/http3/client.rs`.
                                         let body_bytes = chunk.copy_to_bytes(len);
+                                        if write_timeout_active {
+                                            write_deadline.as_mut().reset(
+                                                tokio::time::Instant::now()
+                                                    + Duration::from_millis(
+                                                        reader_write_timeout_ms,
+                                                    ),
+                                            );
+                                        }
                                         let send_outcome = tokio::select! {
                                             biased;
                                             _ = reader_halt.notified() => {
                                                 crate::http3::stream_util::halt_request_body(stream);
+                                                finish_reader();
+                                                return;
+                                            }
+                                            _ = &mut write_deadline, if write_timeout_active => {
+                                                reader_write_timed_out
+                                                    .store(true, Ordering::Release);
+                                                crate::http3::stream_util::halt_request_body(
+                                                    stream,
+                                                );
                                                 finish_reader();
                                                 return;
                                             }
@@ -3407,6 +3483,7 @@ where
                 let mut upload_auth_expired: Option<
                     crate::proxy::auth_lifetime::StreamAuthTermination,
                 > = None;
+                let mut header_wait_expired = false;
                 let peer_signal = ctx.peer_connection.clone();
                 let mut peer_gone = peer_signal
                     .as_ref()
@@ -3431,6 +3508,12 @@ where
                         }));
                     tokio::pin!(upload_deadline);
                     tokio::pin!(stream_cancelled);
+                    let header_wait_ms = dispatch_proxy.backend_read_timeout_ms;
+                    let header_wait_active = header_wait_ms > 0;
+                    let header_wait = tokio::time::sleep(Duration::from_millis(
+                        header_wait_ms.max(1),
+                    ));
+                    tokio::pin!(header_wait);
                     let peer_closed = async {
                         if let Some(signal) = peer_signal.as_ref() {
                             signal.closed().await;
@@ -3450,6 +3533,20 @@ where
                             _ = &mut upload_deadline, if upload_deadline_active => {
                                 upload_auth_expired = plain_write_bound.expired_authorization();
                                 drop(pending_slot.take());
+                                break None;
+                            }
+                            _ = &mut header_wait, if header_wait_active => {
+                                header_wait_expired = true;
+                                drop(pending_slot.take());
+                                if !reader_done {
+                                    halt_notify.notify_one();
+                                    let halt_deadline = Duration::from_millis(100);
+                                    let _ = tokio::time::timeout(
+                                        halt_deadline,
+                                        &mut reader_future,
+                                    )
+                                    .await;
+                                }
                                 break None;
                             }
                             _ = &mut stream_cancelled => {
@@ -3566,6 +3663,44 @@ where
                             bytes_sent,
                         )
                         .await;
+                    }
+                    if header_wait_expired {
+                        record_cross_protocol_backend_admission_outcome(
+                            &mut backend_admission_permits,
+                            504,
+                            false,
+                            Some(ErrorClass::ReadWriteTimeout),
+                            backend_admission_start.elapsed(),
+                        );
+                        record_backend_outcome(
+                            state,
+                            proxy,
+                            &epoch.load_balancer,
+                            upstream_balancer,
+                            current_target.as_deref(),
+                            current_cb_target_key.as_deref(),
+                            504,
+                            false,
+                            Some(ErrorClass::ReadWriteTimeout),
+                            cb_retry_probe_slot_available,
+                            false,
+                            backend_start.elapsed(),
+                        );
+                        let mut outcome = write_plain_gateway_error(
+                            stream,
+                            ctx,
+                            StatusCode::GATEWAY_TIMEOUT,
+                            r#"{"error":"Backend timeout"}"#,
+                            Some(("x-gateway-error", "backend_timeout")),
+                            backend_start,
+                            bytes_sent,
+                        )
+                        .await?;
+                        outcome.backend_target =
+                            Some(strip_query_from_backend_url(&current_url));
+                        outcome.connection_error = false;
+                        outcome.error_class = Some(ErrorClass::ReadWriteTimeout);
+                        return Ok(outcome);
                     }
                     if peer_gone {
                         return Ok(plain_peer_gone_before_response_headers(
@@ -3690,6 +3825,24 @@ where
                             false,
                             backend_start.elapsed(),
                         );
+                        if attempt_result.status_code == 504 {
+                            let mut outcome = write_plain_gateway_error(
+                                stream,
+                                ctx,
+                                StatusCode::GATEWAY_TIMEOUT,
+                                r#"{"error":"Backend timeout"}"#,
+                                Some(("x-gateway-error", "backend_timeout")),
+                                backend_start,
+                                bytes_sent,
+                            )
+                            .await?;
+                            outcome.backend_target =
+                                Some(strip_query_from_backend_url(&current_url));
+                            outcome.connection_error = attempt_result.connection_error;
+                            outcome.error_class = attempt_result.error_class;
+                            outcome.backend_resolved_ip = final_backend_resolved_ip.clone();
+                            return Ok(outcome);
+                        }
                         let mut outcome = write_plain_gateway_error(
                             stream,
                             ctx,
@@ -3977,6 +4130,7 @@ where
                     collect_reqwest_response_body_with_limit(
                         response,
                         effective_max_response_body_size_bytes,
+                        proxy.backend_read_timeout_ms,
                     ),
                 )
                 .await
@@ -4672,6 +4826,7 @@ where
                 response,
                 inspector,
                 max_resp_bytes,
+                proxy.backend_read_timeout_ms,
                 auth_deadline_plan,
                 &auth_latch,
             )
@@ -4682,6 +4837,7 @@ where
                 response,
                 coalesce,
                 max_resp_bytes,
+                proxy.backend_read_timeout_ms,
                 auth_deadline_plan,
                 &auth_latch,
             )
@@ -8021,11 +8177,13 @@ fn normalized_h3_grpc_deadline() -> crate::proxy::NormalizedRejectResponse {
 
 /// Stream a reqwest response body into the H3 stream with coalescing.
 /// Returns `(bytes_streamed, body_completed, client_disconnected, body_error_class)`.
+#[allow(clippy::too_many_arguments)]
 async fn stream_reqwest_response<S>(
     stream: &mut RequestStream<S, Bytes>,
     mut response: reqwest::Response,
     coalesce: CoalesceConfig,
     max_response_body_size_bytes: usize,
+    read_timeout_ms: u64,
     auth_deadline: Option<crate::proxy::auth_lifetime::StreamAuthDeadline>,
     // The REQUEST's shared once-only termination latch, so a write that parks
     // past the credential records through the same latch as the upload
@@ -8061,6 +8219,12 @@ where
     let mut bytes_streamed: u64 = 0;
     let mut client_disconnected = false;
     let mut body_error_class: Option<ErrorClass> = None;
+    let read_timeout_active = read_timeout_ms > 0;
+    let read_deadline = tokio::time::sleep(std::time::Duration::from_millis(
+        read_timeout_ms.max(1),
+    ));
+    tokio::pin!(read_deadline);
+    let mut just_received_backend_frame = false;
 
     // The ONE downstream-write seam for this relay (issue #3815). The `select!`
     // arm below only bounds an IDLE stream: a client that stops reading parks
@@ -8103,10 +8267,18 @@ where
     }
 
     'outer: loop {
+        if read_timeout_active && just_received_backend_frame && coalesce_buf.is_empty() {
+            read_deadline.as_mut().reset(
+                tokio::time::Instant::now()
+                    + std::time::Duration::from_millis(read_timeout_ms),
+            );
+            just_received_backend_frame = false;
+        }
         tokio::select! {
             chunk_result = response.chunk(), if !stream_done => {
                 match chunk_result {
                     Ok(Some(chunk)) => {
+                        just_received_backend_frame = true;
                         if max_response_body_size_bytes > 0 {
                             total_streamed += chunk.len();
                             if total_streamed > max_response_body_size_bytes {
@@ -8198,6 +8370,15 @@ where
                 auth_termination = Some(termination);
                 break 'outer;
             }
+            _ = &mut read_deadline, if read_timeout_active && !stream_done && coalesce_buf.is_empty() => {
+                warn!(
+                    "Backend read timeout ({read_timeout_ms}ms) during cross-protocol \
+                     H3 streaming response body; aborting"
+                );
+                crate::http3::stream_util::abort_response_stream(stream);
+                body_error_class = Some(ErrorClass::ReadWriteTimeout);
+                break 'outer;
+            }
         }
         if stream_done {
             if !coalesce_buf.is_empty() {
@@ -8263,11 +8444,13 @@ fn inspected_emitted_response_limit_exceeded(
 /// already disconnected is recorded as a disconnect, not a clean completion.
 /// Returns `(bytes_streamed, body_completed, client_disconnected, body_error_class,
 /// authorization_termination)`.
+#[allow(clippy::too_many_arguments)]
 async fn stream_inspected_reqwest_response<S>(
     stream: &mut RequestStream<S, Bytes>,
     mut response: reqwest::Response,
     mut inspector: Box<dyn ResponseStreamInspector>,
     max_response_body_size_bytes: usize,
+    read_timeout_ms: u64,
     auth_deadline: Option<crate::proxy::auth_lifetime::StreamAuthDeadline>,
     // The REQUEST's shared once-only termination latch, so a write that parks
     // past the credential records through the same latch as the upload
@@ -8300,6 +8483,11 @@ where
         }));
     tokio::pin!(auth_deadline_sleep);
     let mut auth_termination: Option<crate::proxy::auth_lifetime::StreamAuthTermination> = None;
+    let read_timeout_active = read_timeout_ms > 0;
+    let read_deadline = tokio::time::sleep(std::time::Duration::from_millis(
+        read_timeout_ms.max(1),
+    ));
+    tokio::pin!(read_deadline);
 
     // The ONE downstream-write seam for this relay (issue #3815) — the same
     // helper the uninspected relay and the native-H3 relays use. The chunk race
@@ -8341,41 +8529,51 @@ where
     // Labelled so the authorization-deadline `select!` arm below breaks this
     // relay loop explicitly rather than relying on unlabelled resolution.
     'relay: loop {
-        // Race the backend chunk against the authorization deadline. `biased`
-        // makes an already-elapsed deadline win over a simultaneously ready
-        // chunk, so a continuously active stream is cut deterministically
-        // rather than relaying one more window. Response HEADERS are committed,
-        // so termination is a RESET; dropping `response` on return cancels the
-        // backend body.
-        let chunk_result = if auth_deadline_active {
-            tokio::select! {
-                biased;
-                () = &mut auth_deadline_sleep => {
-                    let termination = auth_deadline
-                        .map(|plan| plan.termination)
-                        .unwrap_or(
-                            crate::proxy::auth_lifetime::StreamAuthTermination::CredentialExpired,
-                        );
-                    debug!(
-                        "inspected cross-protocol H3 streaming response reached its \
-                         authorization lifetime; resetting the stream"
+        // Re-arm the idle watermark at the start of each wait so inspector
+        // time is not charged against `backend_read_timeout_ms`.
+        if read_timeout_active {
+            read_deadline.as_mut().reset(
+                tokio::time::Instant::now()
+                    + std::time::Duration::from_millis(read_timeout_ms),
+            );
+        }
+        // Race the backend chunk against the authorization deadline and the
+        // idle read watermark. `biased` makes an already-elapsed deadline win
+        // over a simultaneously ready chunk, so a continuously active stream
+        // is cut deterministically rather than relaying one more window.
+        // Response HEADERS are committed, so termination is a RESET; dropping
+        // `response` on return cancels the backend body.
+        let chunk_result = tokio::select! {
+            biased;
+            () = &mut auth_deadline_sleep, if auth_deadline_active => {
+                let termination = auth_deadline
+                    .map(|plan| plan.termination)
+                    .unwrap_or(
+                        crate::proxy::auth_lifetime::StreamAuthTermination::CredentialExpired,
                     );
-                    crate::http3::stream_util::abort_response_stream(stream);
-                    body_error_class = Some(ErrorClass::ClientDisconnect);
-                    // Through the REQUEST latch: the loop breaks here, and the
-                    // latch keeps a concurrent blocked-write exit from counting
-                    // the same stream twice.
-                    auth_latch.record_once(
-                        termination,
-                        crate::proxy::auth_lifetime::StreamAuthProtocolFamily::Http,
-                    );
-                    auth_termination = Some(termination);
-                    break 'relay;
-                }
-                chunk = response.chunk() => chunk,
+                debug!(
+                    "inspected cross-protocol H3 streaming response reached its \
+                     authorization lifetime; resetting the stream"
+                );
+                crate::http3::stream_util::abort_response_stream(stream);
+                body_error_class = Some(ErrorClass::ClientDisconnect);
+                auth_latch.record_once(
+                    termination,
+                    crate::proxy::auth_lifetime::StreamAuthProtocolFamily::Http,
+                );
+                auth_termination = Some(termination);
+                break 'relay;
             }
-        } else {
-            response.chunk().await
+            _ = &mut read_deadline, if read_timeout_active => {
+                warn!(
+                    "Backend read timeout ({read_timeout_ms}ms) during inspected \
+                     cross-protocol H3 streaming response body; aborting"
+                );
+                crate::http3::stream_util::abort_response_stream(stream);
+                body_error_class = Some(ErrorClass::ReadWriteTimeout);
+                break 'relay;
+            }
+            chunk = response.chunk() => chunk,
         };
         match chunk_result {
             Ok(Some(chunk)) => {

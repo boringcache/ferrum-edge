@@ -958,6 +958,7 @@ jobs:
               integration::grpc_proxy_tests
               integration::policy_path_canonicalization_tests
               integration::scripted_backend_smoke_tests
+              integration::backend_timeout_enforcement_tests
               integration::service_discovery_endpointslice_lifecycle_tests
               integration::service_discovery_lifecycle_tests
               integration::dtls_integration_tests

@@ -1,5 +1,5 @@
-//! Gateway-owned request-upload lifecycle for authenticated H1/H2 dispatch
-//! (issues #3815 / #3816).
+//! Gateway-owned request-upload lifecycle for H1/H2 dispatch (issues #3815 /
+//! #3816 / #4055).
 //!
 //! # Why a pump exists at all
 //!
@@ -26,17 +26,24 @@
 //!
 //! The pump moves the inbound `hyper::body::Incoming` into a **gateway-owned
 //! task** and hands the transport a bounded channel receiver instead. The task
-//! selects, biased, over three things on every iteration:
+//! selects, biased, over four things on every iteration:
 //!
 //! 1. an explicit cancellation signal from the dispatcher,
-//! 2. the admitted stream's absolute authorization deadline,
-//! 3. the next unit of work (channel capacity, then one source frame).
+//! 2. the admitted stream's absolute authorization deadline (when present),
+//! 3. `backend_write_timeout_ms` idle while waiting for the transport to
+//!    consume the previous frame (`sender.reserve()`),
+//! 4. the next unit of work (channel capacity, then one source frame).
 //!
-//! Because arms 1 and 2 are polled by the gateway's own task, they fire **even
+//! Because arms 1–3 are polled by the gateway's own task, they fire **even
 //! while the backend transport is parked on flow control and is not polling the
-//! body at all**. When either fires the task publishes a terminal state, drops
-//! its channel sender, and drops the `Incoming`. From that instant the gateway
-//! neither owns nor polls the client body.
+//! body at all**. When any of them fires the task publishes a terminal state,
+//! drops its channel sender, and drops the `Incoming`. From that instant the
+//! gateway neither owns nor polls the client body.
+//!
+//! The write idle arm is reset at the start of each `reserve()` wait and is
+//! not polled while waiting on the client body, so a slow-but-progressing
+//! upload stays alive and a stalled client is not misread as a backend write
+//! stall. `backend_write_timeout_ms == 0` leaves that arm unarmed.
 //!
 //! The dispatcher holds an [`UploadPumpJoin`], whose
 //! [`cancel_and_join`](UploadPumpJoin::cancel_and_join) is an actual join: it
@@ -57,15 +64,16 @@
 //!
 //! # Cost
 //!
-//! One task and one capacity-1 channel per **authenticated** streaming upload.
-//! Unauthenticated requests never construct a pump: `UploadSource::Direct`
-//! keeps the previous zero-overhead path. Frames move by `Bytes` handle, so no
-//! per-chunk copy or allocation is introduced.
+//! One task and one capacity-1 channel per streaming upload that carries an
+//! authorization plan **or** a live `backend_write_timeout_ms`. Uploads with
+//! neither keep `UploadSource::Direct` (no task, no channel, no timer). Frames
+//! move by `Bytes` handle, so no per-chunk copy or allocation is introduced.
 
 use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU8, Ordering};
 use std::task::{Context, Poll};
+use std::time::Duration;
 
 use bytes::Bytes;
 use http_body::Frame;
@@ -88,6 +96,7 @@ const PUMP_SOURCE_ERROR: u8 = 2;
 const PUMP_CANCELLED: u8 = 3;
 const PUMP_AUTHORIZATION_EXPIRED: u8 = 4;
 const PUMP_CONSUMER_GONE: u8 = 5;
+const PUMP_WRITE_TIMEOUT: u8 = 6;
 
 /// Terminal state of one gateway-owned upload pump.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -106,6 +115,11 @@ pub(crate) enum UploadPumpOutcome {
     /// The transport dropped the bridge receiver, so there is nobody left to
     /// forward to.
     ConsumerGone,
+    /// The transport stopped consuming request-body frames for
+    /// `backend_write_timeout_ms`. Surfaced as `io::ErrorKind::TimedOut` so
+    /// `classify_body_error` / `classify_reqwest_error` map it to
+    /// `ReadWriteTimeout`.
+    WriteTimeout,
 }
 
 const fn outcome_code(outcome: UploadPumpOutcome) -> u8 {
@@ -115,6 +129,7 @@ const fn outcome_code(outcome: UploadPumpOutcome) -> u8 {
         UploadPumpOutcome::Cancelled => PUMP_CANCELLED,
         UploadPumpOutcome::AuthorizationExpired => PUMP_AUTHORIZATION_EXPIRED,
         UploadPumpOutcome::ConsumerGone => PUMP_CONSUMER_GONE,
+        UploadPumpOutcome::WriteTimeout => PUMP_WRITE_TIMEOUT,
     }
 }
 
@@ -125,6 +140,7 @@ const fn code_outcome(code: u8) -> Option<UploadPumpOutcome> {
         PUMP_CANCELLED => Some(UploadPumpOutcome::Cancelled),
         PUMP_AUTHORIZATION_EXPIRED => Some(UploadPumpOutcome::AuthorizationExpired),
         PUMP_CONSUMER_GONE => Some(UploadPumpOutcome::ConsumerGone),
+        PUMP_WRITE_TIMEOUT => Some(UploadPumpOutcome::WriteTimeout),
         _ => None,
     }
 }
@@ -141,8 +157,29 @@ pub(crate) const fn upload_pump_error_message(outcome: UploadPumpOutcome) -> &'s
         UploadPumpOutcome::Cancelled => "request upload terminated: cancelled by the gateway",
         UploadPumpOutcome::SourceError => "request upload terminated: client body stream error",
         UploadPumpOutcome::ConsumerGone => "request upload terminated: backend upload was released",
+        UploadPumpOutcome::WriteTimeout => {
+            "request upload terminated: backend request body write timeout"
+        }
         // Never surfaced as an error; present so the mapping is total.
         UploadPumpOutcome::Completed => "request upload completed",
+    }
+}
+
+/// Transport-side error for a non-clean pump terminal.
+///
+/// Write-timeout uses a typed `io::ErrorKind::TimedOut` so the existing
+/// `classify_body_error` / `classify_reqwest_error` walks map it to
+/// `ReadWriteTimeout` without a second string heuristic. Other terminals keep
+/// the redacted literal.
+fn pump_terminal_error(outcome: UploadPumpOutcome) -> BoxError {
+    let message = upload_pump_error_message(outcome);
+    if outcome == UploadPumpOutcome::WriteTimeout {
+        Box::new(std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            message,
+        ))
+    } else {
+        message.into()
     }
 }
 
@@ -203,7 +240,7 @@ impl UploadPumpSource {
             && outcome != UploadPumpOutcome::Completed
         {
             self.reported_error = true;
-            return Poll::Ready(Some(Err(upload_pump_error_message(outcome).into())));
+            return Poll::Ready(Some(Err(pump_terminal_error(outcome))));
         }
         match self.receiver.poll_recv(cx) {
             Poll::Ready(Some(frame)) => {
@@ -226,12 +263,13 @@ impl UploadPumpSource {
                     }
                     Some(other) => {
                         self.reported_error = true;
-                        Poll::Ready(Some(Err(upload_pump_error_message(other).into())))
+                        Poll::Ready(Some(Err(pump_terminal_error(other))))
                     }
                     None => {
                         self.reported_error = true;
-                        let message = upload_pump_error_message(UploadPumpOutcome::ConsumerGone);
-                        Poll::Ready(Some(Err(message.into())))
+                        Poll::Ready(Some(Err(pump_terminal_error(
+                            UploadPumpOutcome::ConsumerGone,
+                        ))))
                     }
                 }
             }
@@ -356,7 +394,8 @@ impl Drop for UploadPumpJoin {
 /// cannot be constructed outside a live connection.
 pub(crate) fn spawn_upload_pump<B>(
     body: B,
-    plan: &RequestAuthLifetimePlan,
+    plan: Option<&RequestAuthLifetimePlan>,
+    write_timeout_ms: u64,
 ) -> (UploadPumpSource, UploadPumpJoin)
 where
     B: http_body::Body<Data = Bytes> + Send + Unpin + 'static,
@@ -368,15 +407,14 @@ where
     let (finished_tx, finished_rx) = tokio::sync::oneshot::channel();
     let terminal = Arc::new(AtomicU8::new(PUMP_RUNNING));
     let task_terminal = Arc::clone(&terminal);
-    let (deadline, family, latch) = plan.clone();
+    let plan = plan.cloned();
     let handle = tokio::spawn(async move {
         let outcome = run_upload_pump(
             body,
             sender,
             cancel_rx,
-            deadline,
-            family,
-            latch,
+            plan,
+            write_timeout_ms,
             task_terminal,
         )
         .await;
@@ -436,33 +474,55 @@ async fn await_cancel_signal(
     std::future::poll_fn(|cx| std::future::Future::poll(Pin::new(&mut *receiver), cx)).await
 }
 
-#[allow(clippy::too_many_arguments)]
 async fn run_upload_pump<B>(
     mut body: B,
     sender: tokio::sync::mpsc::Sender<Frame<Bytes>>,
     cancel_rx: tokio::sync::oneshot::Receiver<()>,
-    deadline: crate::proxy::auth_lifetime::StreamAuthDeadline,
-    family: crate::proxy::auth_lifetime::StreamAuthProtocolFamily,
-    latch: crate::proxy::auth_lifetime::StreamAuthTerminationLatch,
+    plan: Option<RequestAuthLifetimePlan>,
+    write_timeout_ms: u64,
     terminal: Arc<AtomicU8>,
 ) -> UploadPumpOutcome
 where
     B: http_body::Body<Data = Bytes> + Unpin,
 {
     let mut cancel = Some(cancel_rx);
-    // Absolute and armed once. Relayed DATA, gRPC messages, and trailers never
-    // refresh it, and it is owned by THIS task, so it fires regardless of what
-    // the backend transport is doing.
-    let mut expiry = Box::pin(tokio::time::sleep_until(deadline.at));
+    // Absolute and armed once when a credential admitted the stream. Relayed
+    // DATA, gRPC messages, and trailers never refresh it, and it is owned by
+    // THIS task, so it fires regardless of what the backend transport is doing.
+    let auth_armed = plan.is_some();
+    let mut expiry = Box::pin(tokio::time::sleep_until(
+        plan.as_ref()
+            .map(|(deadline, _, _)| deadline.at)
+            .unwrap_or_else(|| {
+                tokio::time::Instant::now() + Duration::from_secs(86_400)
+            }),
+    ));
+    // Per-reserve idle bound. Reset at the start of each capacity wait so a
+    // slow-but-progressing upload keeps the watermark fresh. Not polled while
+    // waiting on the client body: that stall is not a backend write stall.
+    let write_armed = write_timeout_ms > 0;
+    let write_idle_dur = Duration::from_millis(write_timeout_ms.max(1));
+    let mut write_idle = Box::pin(tokio::time::sleep(write_idle_dur));
     let outcome = loop {
         // Reserve capacity BEFORE reading the client, so a transport that
         // stops draining stops the read rather than filling a buffer.
+        if write_armed {
+            match tokio::time::Instant::now().checked_add(write_idle_dur) {
+                Some(at) => write_idle.as_mut().reset(at),
+                None => {}
+            }
+        }
         let permit = tokio::select! {
             biased;
             () = cancel_requested(&mut cancel) => break UploadPumpOutcome::Cancelled,
-            () = &mut expiry => {
-                latch.record_once(deadline.termination, family);
+            () = &mut expiry, if auth_armed => {
+                if let Some((deadline, family, latch)) = plan.as_ref() {
+                    latch.record_once(deadline.termination, *family);
+                }
                 break UploadPumpOutcome::AuthorizationExpired;
+            }
+            () = &mut write_idle, if write_armed => {
+                break UploadPumpOutcome::WriteTimeout;
             }
             reserved = sender.reserve() => match reserved {
                 Ok(permit) => permit,
@@ -472,8 +532,10 @@ where
         let frame = tokio::select! {
             biased;
             () = cancel_requested(&mut cancel) => break UploadPumpOutcome::Cancelled,
-            () = &mut expiry => {
-                latch.record_once(deadline.termination, family);
+            () = &mut expiry, if auth_armed => {
+                if let Some((deadline, family, latch)) = plan.as_ref() {
+                    latch.record_once(deadline.termination, *family);
+                }
                 break UploadPumpOutcome::AuthorizationExpired;
             }
             frame = http_body_util::BodyExt::frame(&mut body) => frame,

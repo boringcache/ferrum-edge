@@ -8943,6 +8943,7 @@ pub mod _test_support {
         Cancelled,
         AuthorizationExpired,
         ConsumerGone,
+        WriteTimeout,
         /// The join point resolved without an outcome (task aborted).
         Aborted,
     }
@@ -9007,7 +9008,11 @@ pub mod _test_support {
                 receiver,
                 released: std::sync::Arc::clone(&released),
             };
-            let (source, join) = crate::proxy::upload_pump::spawn_upload_pump(body, plan);
+            let (source, join) = crate::proxy::upload_pump::spawn_upload_pump(
+                body,
+                Some(plan),
+                0,
+            );
             Self {
                 feed: Some(feed),
                 source: Some(source),
@@ -9084,6 +9089,7 @@ pub mod _test_support {
             Some(UploadPumpOutcome::Cancelled) => ProbePumpOutcome::Cancelled,
             Some(UploadPumpOutcome::AuthorizationExpired) => ProbePumpOutcome::AuthorizationExpired,
             Some(UploadPumpOutcome::ConsumerGone) => ProbePumpOutcome::ConsumerGone,
+            Some(UploadPumpOutcome::WriteTimeout) => ProbePumpOutcome::WriteTimeout,
             None => ProbePumpOutcome::Aborted,
         }
     }

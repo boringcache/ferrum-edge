@@ -1188,15 +1188,29 @@ plugin_configs:
 ```
 
 `backend_read_timeout_ms` defaults to `30000` (30 seconds). For HTTP and gRPC
-proxies it has two roles: it bounds backend response reads, and it is the total
-(not idle) deadline for collecting a client request body whenever retries or
-body-processing policy require Ferrum to buffer that upload before dispatch.
-Buffered uploads that take longer than the configured total deadline are
-deliberately rejected with HTTP `408 Request Timeout` or gRPC
-`DEADLINE_EXCEEDED`, even if the client is still making progress; increase the
-value for legitimate slow buffered uploads. Streaming pass-through uploads are
-unaffected. Set the value to `0` to disable both the backend read bound and this
-buffered-upload collection deadline.
+proxies it has three roles:
+
+- **Header wait:** time from `send()` (or native-H3 `recv_response`) until
+  response headers arrive.
+- **Streaming / SSE bodies:** idle time *between frames*. A slow-but-progressing
+  stream keeps the watermark fresh; a stall after headers is a read timeout.
+  `0` disables this idle bound so long-lived SSE connections are not killed.
+- **Buffered client uploads:** the total (not idle) deadline for collecting a
+  client request body whenever retries or body-processing policy require Ferrum
+  to buffer that upload before dispatch. Buffered uploads that take longer than
+  the configured total deadline are deliberately rejected with HTTP
+  `408 Request Timeout` or gRPC `DEADLINE_EXCEEDED`, even if the client is
+  still making progress; increase the value for legitimate slow buffered
+  uploads.
+
+`backend_write_timeout_ms` defaults to `30000` (30 seconds) and is the
+per-direction *idle* bound on writing the request body to the backend. HTTP-family
+streaming uploads arm it in the gateway-owned upload pump (H1/H2/reqwest) or on
+each native-H3 `send_data`/`finish`; a backend that accepts and never reads
+surfaces as `504` / `X-Gateway-Error: backend_timeout` /
+`error_class=read_write_timeout`. `0` disables the write bound. Streaming
+pass-through uploads are otherwise unaffected by the buffered-upload collection
+deadline above.
 
 ### Stream Proxy (TCP/UDP/DTLS)
 

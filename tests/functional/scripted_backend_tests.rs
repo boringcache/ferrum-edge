@@ -18,7 +18,10 @@ use crate::scaffolding::backends::{
 use crate::scaffolding::certs::TestCa;
 use crate::scaffolding::harness::GatewayHarness;
 use crate::scaffolding::ports::{reserve_port, unbound_port};
-use crate::scaffolding::{file_mode_yaml_for_backend, file_mode_yaml_for_backend_with};
+use crate::scaffolding::{
+    file_mode_yaml_for_backend, file_mode_yaml_for_backend_with, to_file_mode_yaml,
+};
+use futures_util::StreamExt;
 use reqwest::StatusCode;
 use serde_json::json;
 use std::time::{Duration, Instant};
@@ -69,6 +72,79 @@ async fn collect_body_error_logs(harness: &GatewayHarness) -> String {
     loop {
         let logs = require_logs(harness);
         if has_body_error_signal(&logs) || Instant::now() >= deadline {
+            return logs;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
+fn assert_timeout_envelope(elapsed: Duration, timeout_ms: u64) {
+    let expected = Duration::from_millis(timeout_ms);
+    let floor = expected.saturating_sub(Duration::from_millis(200));
+    let ceiling = expected + Duration::from_millis(1500);
+    assert!(
+        elapsed >= floor,
+        "timed out too fast: {elapsed:?} < floor {floor:?} (timeout was {timeout_ms}ms)"
+    );
+    assert!(
+        elapsed <= ceiling,
+        "timed out too slowly: {elapsed:?} > ceiling {ceiling:?} (timeout was {timeout_ms}ms)"
+    );
+}
+
+fn has_read_write_timeout_class(logs: &str) -> bool {
+    logs.contains("\"body_error_class\":\"read_write_timeout\"")
+        || logs.contains("\\\"body_error_class\\\":\\\"read_write_timeout\\\"")
+        || logs.contains("\"error_class\":\"read_write_timeout\"")
+        || logs.contains("\\\"error_class\\\":\\\"read_write_timeout\\\"")
+}
+
+fn file_mode_yaml_with_timeouts_and_access_log(
+    port: u16,
+    read_timeout_ms: u64,
+    write_timeout_ms: u64,
+) -> String {
+    to_file_mode_yaml(&json!({
+        "version": "1",
+        "proxies": [{
+            "id": "scripted",
+            "listen_path": "/api",
+            "backend_scheme": "http",
+            "backend_host": "127.0.0.1",
+            "backend_port": port,
+            "strip_listen_path": true,
+            "backend_connect_timeout_ms": 2000,
+            "backend_read_timeout_ms": read_timeout_ms,
+            "backend_write_timeout_ms": write_timeout_ms,
+        }],
+        "consumers": [],
+        "upstreams": [],
+        "plugin_configs": [{
+            "id": "access-log",
+            "plugin_name": "stdout_logging",
+            "config": {},
+            "scope": "global",
+            "enabled": true,
+        }],
+    }))
+}
+
+async fn collect_read_write_timeout_logs(harness: &GatewayHarness) -> String {
+    if let Ok(url) = harness.admin_url("/health").parse::<reqwest::Url>() {
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_millis(500))
+            .build()
+            .expect("reqwest client");
+        for _ in 0..2 {
+            let _ = client.get(url.clone()).send().await;
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    }
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let logs = require_logs(harness);
+        if has_read_write_timeout_class(&logs) || Instant::now() >= deadline {
             return logs;
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
@@ -1562,4 +1638,212 @@ async fn a2a_retry_configured_json_agent_card_is_still_rewritten() {
     );
     backend.assert_no_matcher_mismatches().await;
     backend.assert_no_step_errors().await;
+}
+
+const UPLOAD_STALL_BYTES: usize = 2 * 1024 * 1024;
+const SSE_FIRST_EVENT: &[u8] = b"data: hello\r\n\n";
+
+// #4055: HTTP/1.1 POST against a backend that accepts and never reads must
+// 504 near `backend_write_timeout_ms`. `HttpStep::ExpectRequest` drains the
+// body, so the fixture is raw TCP Sleep.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore]
+async fn h1_backend_write_timeout_maps_to_504_backend_timeout() {
+    let reservation = reserve_port().await.expect("reserve port");
+    let backend_port = reservation.port;
+    let _backend = ScriptedTcpBackend::builder(reservation.into_listener())
+        .step(TcpStep::Sleep(Duration::from_secs(30)))
+        .spawn()
+        .expect("spawn");
+
+    let write_timeout_ms: u64 = 800;
+    let yaml = file_mode_yaml_with_timeouts_and_access_log(
+        backend_port,
+        8_000,
+        write_timeout_ms,
+    );
+    let harness = GatewayHarness::builder()
+        .file_config(yaml)
+        .log_level("info")
+        .capture_output()
+        .spawn()
+        .await
+        .expect("spawn gateway");
+
+    let client = harness.http_client().expect("client");
+    let started = Instant::now();
+    let resp = client
+        .as_reqwest()
+        .post(harness.proxy_url("/api/twrite"))
+        .header("content-type", "application/octet-stream")
+        .body(vec![b'x'; UPLOAD_STALL_BYTES])
+        .send()
+        .await
+        .expect("gateway returns a response");
+    let elapsed = started.elapsed();
+    let status = resp.status();
+    let gateway_error = resp
+        .headers()
+        .get("x-gateway-error")
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_owned);
+    let body = resp.text().await.expect("body");
+
+    assert_eq!(
+        status,
+        StatusCode::GATEWAY_TIMEOUT,
+        "expected 504 for a live backend write timeout, got {status} body={body}"
+    );
+    assert_eq!(
+        gateway_error.as_deref(),
+        Some("backend_timeout"),
+        "timeout must carry X-Gateway-Error=backend_timeout, body={body}"
+    );
+    assert_eq!(body, r#"{"error":"Backend timeout"}"#);
+    assert_timeout_envelope(elapsed, write_timeout_ms);
+
+    let logs = collect_read_write_timeout_logs(&harness).await;
+    assert!(
+        has_read_write_timeout_class(&logs),
+        "write timeout must classify as read_write_timeout; logs:\n{logs}"
+    );
+}
+
+// #4057: SSE headers + one event + stall. Headers are already committed, so
+// the client sees 200 then an abort near the idle read watermark. Access log
+// must be `body_error_class=read_write_timeout`, not `request_error`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore]
+async fn h1_sse_stall_after_first_event_classifies_read_write_timeout() {
+    let reservation = reserve_port().await.expect("reserve port");
+    let backend_port = reservation.port;
+    let _backend = ScriptedHttp1Backend::builder(reservation.into_listener())
+        .step(HttpStep::RespondStatus {
+            status: 200,
+            reason: "OK".into(),
+        })
+        .step(HttpStep::RespondHeader {
+            name: "Content-Type".into(),
+            value: "text/event-stream".into(),
+        })
+        .step(HttpStep::RespondBodyChunk(SSE_FIRST_EVENT.to_vec()))
+        .step(HttpStep::Sleep(Duration::from_secs(30)))
+        .spawn()
+        .expect("spawn");
+
+    let read_timeout_ms: u64 = 800;
+    let yaml = file_mode_yaml_with_timeouts_and_access_log(
+        backend_port,
+        read_timeout_ms,
+        5_000,
+    );
+    let harness = GatewayHarness::builder()
+        .file_config(yaml)
+        .log_level("info")
+        .capture_output()
+        .spawn()
+        .await
+        .expect("spawn gateway");
+
+    let client = harness.http_client().expect("client");
+    let resp = client
+        .as_reqwest()
+        .get(harness.proxy_url("/api/ssestall"))
+        .header("accept", "text/event-stream")
+        .send()
+        .await
+        .expect("headers");
+    assert_eq!(
+        resp.status(),
+        StatusCode::OK,
+        "committed SSE headers must be 200, not a 504"
+    );
+    let mut stream = resp.bytes_stream();
+    let first = tokio::time::timeout(Duration::from_secs(2), stream.next())
+        .await
+        .expect("first SSE event bounded")
+        .expect("first SSE event present")
+        .expect("first SSE event readable");
+    assert!(
+        first
+            .windows(b"data: hello".len())
+            .any(|w| w == b"data: hello"),
+        "first event missing from {first:?}"
+    );
+
+    let stall_started = Instant::now();
+    let rest = tokio::time::timeout(Duration::from_secs(5), async {
+        while let Some(item) = stream.next().await {
+            item?;
+        }
+        Ok::<(), reqwest::Error>(())
+    })
+    .await;
+    let stall_elapsed = stall_started.elapsed();
+    match rest {
+        Ok(Ok(())) => panic!(
+            "SSE stall closed cleanly instead of aborting as a read timeout; \
+             stall_elapsed={stall_elapsed:?}"
+        ),
+        Ok(Err(_)) | Err(_) => {
+            assert_timeout_envelope(stall_elapsed, read_timeout_ms);
+        }
+    }
+
+    let logs = collect_read_write_timeout_logs(&harness).await;
+    assert!(
+        has_read_write_timeout_class(&logs),
+        "SSE stall after headers must classify as read_write_timeout, not \
+         request_error; logs:\n{logs}"
+    );
+    assert!(
+        !logs.contains("\"body_error_class\":\"request_error\"")
+            && !logs.contains("\\\"body_error_class\\\":\\\"request_error\\\""),
+        "must not keep the pre-fix request_error class; logs:\n{logs}"
+    );
+}
+
+// Companion of the SSE stall: gaps under the idle watermark must complete.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore]
+async fn h1_progressing_sse_survives_idle_read_timeout() {
+    let reservation = reserve_port().await.expect("reserve port");
+    let backend_port = reservation.port;
+    let body = b"data: a\n\ndata: b\n\ndata: c\n\n".to_vec();
+    let _backend = ScriptedHttp1Backend::builder(reservation.into_listener())
+        .step(HttpStep::TrickleBody {
+            status: 200,
+            reason: "OK".into(),
+            headers: vec![("Content-Type".into(), "text/event-stream".into())],
+            body,
+            chunk_size: 8,
+            pause: Duration::from_millis(200),
+        })
+        .spawn()
+        .expect("spawn");
+
+    let yaml = file_mode_yaml_with_timeouts_and_access_log(backend_port, 800, 5_000);
+    let harness = GatewayHarness::builder()
+        .file_config(yaml)
+        .log_level("info")
+        .capture_output()
+        .spawn()
+        .await
+        .expect("spawn gateway");
+
+    let client = harness.http_client().expect("client");
+    let resp = client
+        .as_reqwest()
+        .get(harness.proxy_url("/api/ssetrickle"))
+        .header("accept", "text/event-stream")
+        .send()
+        .await
+        .expect("headers");
+    assert_eq!(resp.status(), StatusCode::OK);
+    let bytes = resp.bytes().await.expect("progressing SSE must complete");
+    let text = String::from_utf8_lossy(&bytes);
+    assert!(
+        text.contains("data: a") && text.contains("data: c"),
+        "progressing SSE body truncated: {text:?}"
+    );
 }
