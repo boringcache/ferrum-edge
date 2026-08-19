@@ -1180,6 +1180,15 @@ impl K8sAccumulator {
         core::endpoint_route_backends_for_service(self, namespace, service, service_port, weight)
     }
 
+    pub(crate) fn service_dns_fallback_dial_port(
+        &self,
+        namespace: &str,
+        service: &str,
+        service_port: u16,
+    ) -> u16 {
+        core::service_dns_fallback_dial_port(self, namespace, service, service_port)
+    }
+
     pub(crate) fn endpoint_route_backends_for_service_import(
         &self,
         namespace: &str,
