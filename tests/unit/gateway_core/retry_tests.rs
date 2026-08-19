@@ -1194,6 +1194,9 @@ fn test_classify_boxed_setup_error_handshake_alert_is_tls_error() {
         ErrorClass::TlsError
     );
 }
+
+#[test]
+fn test_classify_boxed_error_typed_no_healthy_targets() {
     use ferrum_edge::proxy::stream_error::{StreamSetupError, StreamSetupKind};
     let err: Box<dyn std::error::Error + Send + Sync> = Box::new(StreamSetupError::new(
         StreamSetupKind::NoHealthyTargets,
