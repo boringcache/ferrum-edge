@@ -9,6 +9,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **BREAKING — `DELETE /consumers/{id}` returns 409 while `access_control.allowed_consumers` still names the username**
+  (issue #4045). The previous 204 left live plugin configs authorizing an
+  identity that no longer exists. Ferrum now scans `access_control` plugin
+  configs in the same namespace and refuses the delete with
+  `{"error":"Consumer is referenced by one or more access_control plugin_configs and cannot be deleted"}`.
+  Plugin configs are not rewritten. **Operator action**: remove or edit the
+  username in those plugin configs, then retry. A consumer named only in
+  `disallowed_consumers` can still be deleted. See
+  [docs/admin_api.md](docs/admin_api.md).
+
+- **`DELETE /upstreams/{id}` 409 is now documented** (issue #4044). The
+  behavior was already correct: a still-referenced upstream returns
+  `{"error":"Upstream is referenced by one or more proxies and cannot be deleted"}`
+  (and the equivalent `mesh_route_dispatch` 409). `docs/admin_api.md` and
+  `openapi.yaml` now carry those strings.
+
+- **`DELETE /proxies/{id}` orphan-cleans a last-referenced hand-owned upstream**
+  (issue #4046). This matches the existing `delete_proxy` transaction: when the
+  deleted proxy is hand-managed, a hand-owned (`api_spec_id` null) upstream
+  referenced only by that proxy is removed. A shared upstream survives. A
+  spec-owned proxy that drifted onto a hand-owned upstream leaves that
+  upstream in place. The cascade table in `docs/admin_api.md` and the OpenAPI
+  `deleteProxy` description now say so.
+
 - **BREAKING — WAF custom `match_kind: literal` is now case-sensitive**
   (issue #3937). `literal` was compiled with `(?i)` exactly like `contains`, so
   a rule spelled `pattern: EVIL-LITERAL` also blocked `evil-literal` and there

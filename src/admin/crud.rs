@@ -4352,6 +4352,33 @@ impl AdminResource for Consumer {
         super::json_response(StatusCode::CONFLICT, &json!({"error": errors.join("; ")}))
     }
 
+    fn map_delete_db_error(error: &anyhow::Error) -> Response<Full<Bytes>> {
+        if is_mtls_dns_admission_unavailable(error) {
+            return super::mtls_dns_admission_unavailable_response();
+        }
+        if let Some(conflict) = mtls_dns_identity_conflict(error) {
+            return super::json_response(
+                StatusCode::CONFLICT,
+                &json!({"error": conflict.to_string()}),
+            );
+        }
+        let error_chain_contains = |needle| {
+            error
+                .chain()
+                .any(|cause| cause.to_string().contains(needle))
+        };
+        if error_chain_contains("referenced by access_control plugin_config") {
+            return super::json_response(
+                StatusCode::CONFLICT,
+                &json!({"error": "Consumer is referenced by one or more access_control plugin_configs and cannot be deleted"}),
+            );
+        }
+        super::json_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            &super::db_error_response(error),
+        )
+    }
+
     fn prepare_for_write(&mut self) -> Result<(), PrepareWriteError> {
         let consumer_id = self.id.clone();
         hash_consumer_credentials(self).map_err(|error| match error {
