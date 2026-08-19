@@ -44,8 +44,6 @@ adding, removing, or materially changing a workflow.
 | `mesh-e2e-sidecar-live.yml` | Mesh E2E Sidecar Live Datapath | PRs, `merge_group`, push to `main`, manual | Release-blocking sidecar datapath validation; `Mesh E2E Sidecar Live` is directly required on PRs and merge-queue groups. |
 | `cross-build-policy.yml` | Cross Build Policy | `pull_request_target` for PRs to `main`, `merge_group` | Read-only trusted-base validation of every PR-controlled ARM64 Cross configuration and invocation surface on PRs; merge-group mode verifies the synthesized combined SHA with `contents: read` only. `Trusted Cross Build Policy` is directly required. |
 | `ambient-host-udp-live.yml` | Ambient Host UDP Live Kernel | Every PR, `merge_group`, manual | Privileged live-kernel gate for Ambient host-network UDP capture (`ProxyHostUdpBackend`), plus a production-image contract job that proves the chart-selected `-ebpf-tools` runtime can execute the shell/iptables tool set while `-ebpf` stays distroless; relevance is decided by a trusted-base classifier and `Ambient Host UDP Live` reports on every run. |
-| `launch-integrity.yml` | Launch Readiness Integrity | `pull_request_target` for PRs to `main`, `merge_group` | Read-only trusted-base validation that a candidate preserved the launch/release governance contract. Executable gate code (checker, readiness/release/integrity/advisory-trust workflows and verifiers) is byte-frozen to protected `main`; candidate-editable data (blocker policy, exemption schema, document markers, CODEOWNERS coverage) is structurally validated, and check-name/advisory-secret scanning covers every workflow including ones the candidate adds. It never computes a launch verdict, so open launch blockers keep it green. `Launch Readiness Integrity` is directly required. See [launch-readiness.md](launch-readiness.md). |
-| `launch-readiness.yml` | Launch Readiness | PRs, `merge_group`, push to `main`, `v*` tags, daily schedule, manual | Live go/no-go launch verdict (`Launch Readiness Gate`). Expected to stay red while real blockers are open; it is release-blocking, **not** a required PR context. |
 | `node-waypoint-ebpf-live.yml` | NodeWaypoint eBPF Live Datapath | Path-filtered PRs, manual | Live eBPF datapath validation in kind. |
 | `istio-status-cas-live.yml` | Istio Status CAS Live | Path-filtered PRs, manual | Kind/apiserver competing-writer proof that Ferrum's Istio status CAS preserves foreign and Ferrum-owned conditions. Not a required live-suite check. |
 | `multicluster-federation-live.yml` | Multicluster Federation Live Datapath | PRs, `merge_group`, push to `main`, manual | Release-blocking multicluster federation datapath validation; `Multicluster Federation Live` is directly required on PRs and merge-queue groups. |
@@ -70,9 +68,6 @@ adding, removing, or materially changing a workflow.
 
 ```
 Pull Request / Merge Queue group
-    ├─► Launch Readiness Integrity
-            ├─► PR: `pull_request_target`, trusted-base verifier, candidate tree as data
-            └─► Merge group: synthesized queue SHA, `contents: read`, no secrets
     ├─► Trusted Cross Build Policy
             ├─► PR: `pull_request_target`, base code only, PR tree as data
             └─► Merge group: synthesized queue SHA, `contents: read`, no secrets
@@ -121,14 +116,14 @@ app id `15368`):
 | `Multicluster Federation Live` | `.github/workflows/multicluster-federation-live.yml` | `gate` |
 | `Multicluster Poller Partition Live` | `.github/workflows/multicluster-poller-partition-live.yml` | `gate` |
 | `Ambient Host UDP Live` | `.github/workflows/ambient-host-udp-live.yml` | `gate` |
-| `Launch Readiness Integrity` | `.github/workflows/launch-integrity.yml` | `verify` |
 
-`Launch Readiness Gate` (from `launch-readiness.yml`) is deliberately **not** in
-this list: it is the live go/no-go verdict and stays red while any real launch
-blocker is open, so requiring it would deadlock blocker-fix pull requests. The
-merge control is the separate integrity context above; the go/no-go verdict
-remains release-blocking through `release.yml`'s `validate-launch-readiness`
-job. See [launch-readiness.md](launch-readiness.md).
+The launch-readiness governance lane (`launch-readiness.yml`,
+`launch-integrity.yml`, `launch-advisory-trust.yml`, their verifiers, the blocker
+policy/exemption data, and `release.yml`'s `validate-launch-readiness` job) was
+removed once every tracked blocker had closed. There is no automated go/no-go
+launch verdict, and a `v*` tag no longer requires one. `Launch Readiness
+Integrity` must also be dropped from the branch ruleset's required contexts, or
+pull requests will wait on a check that can never report.
 
 Each owner declares a `merge_group` (`types: [checks_requested]`) trigger in
 addition to its existing `pull_request` / `pull_request_target` / `push` /
@@ -484,7 +479,15 @@ every job gate on, and are omitted from the step summary rather than
 interpolated into Markdown. The same `--no-renames` fail-closed classification applies
 to `coverage.yml` coverage planning, `gateway-api-conformance.yml` relevance
 filtering, and the `performance-regression` path classifier on both
-`pull_request` and `merge_group` diffs. Merge-group planning diffs
+`pull_request` and `merge_group` diffs. Coverage planning is shard-scoped on
+classifiable pull-request and merge-group diffs: `lib-unit` always runs with the
+affected integration shards, plugin-only diffs keep the plugin gate but reuse
+the `lib-unit` profraw/artifacts, and push to `main`, schedule, dispatch, empty
+or unavailable diffs, controller edits, dependency/build-graph inputs, unknown
+paths, and malformed/hostile path transport fail closed to the full coverage
+matrix. The `Merge Coverage` aggregate verifies exact planned shard outcomes and
+artifact presence so a skipped shard cannot false-green the required check.
+Merge-group planning diffs
 `merge_group.base_sha...HEAD` and executes the planner from that base SHA so a
 queued planner edit cannot self-classify as light.
 Any unrecognized path, an empty/unavailable diff, a mixed code-and-docs change,
@@ -1119,18 +1122,28 @@ measurement fidelity or trigger breadth:
 
 **Runs**: `ubuntu-latest`, `macos-latest`, `windows-latest`
 
-Full-mode PRs build the native Linux x86_64 verification binary. Pushes to
-`main` build optimized release binaries for Linux x86_64, Linux ARM64, macOS
-x86_64, macOS ARM64, and Windows x86_64. Native targets share the ordinary
-matrix; Linux ARM64 runs only after code reaches `main`, in the isolated
-`build-arm64-cross` job described below. The jobs install the same prerequisites
-as the Release pipeline — `protoc` on every OS, `libcurl4-openssl-dev` on Linux,
-and NASM on Windows — and build with `--features cloud-secrets` so
-Vault/AWS/Azure/GCP secret backends are included. The macOS x86_64 build targets
-`x86_64-apple-darwin` with the standard Apple/Rust toolchain (no `cross` needed)
-and runs on whichever host architecture GitHub maps `macos-latest` to today
-(currently ARM64); pin to a concrete runner image such as `macos-14` if the
-host architecture must be guaranteed.
+Full-mode PRs compile the native Linux x86_64 verification binary with
+`--profile pr-build`. `merge_group` keeps all four native targets as
+fail-closed compile gates whose outputs are discarded: Linux x86_64 and
+Windows x86_64 still `cargo build --profile pr-build` (Windows MSVC/NASM
+linkage is the platform-specific failure mode `cargo check` cannot see);
+macOS x86_64 and macOS ARM64 run `cargo check --profile pr-build` because
+queue binaries are never published. Pushes to `main` build optimized
+`release` binaries for Linux x86_64, Linux ARM64, macOS x86_64, macOS ARM64,
+and Windows x86_64. Native targets share the ordinary matrix; Linux ARM64
+runs only after code reaches `main`, in the isolated `build-arm64-cross` job
+described below. rust-cache keys are split by profile lane
+(`build-<target>-prbuild` vs `build-<target>-release`) so queue check/pr-build
+trees cannot evict push-to-main release artifacts. Each native job installs
+the pinned repository `setup-sccache` action and reports `sccache --show-stats`
+after compile. The jobs install the same prerequisites as the Release pipeline
+— `protoc` on every OS, `libcurl4-openssl-dev` on Linux, and NASM on Windows —
+and compile with `--features cloud-secrets` so Vault/AWS/Azure/GCP secret
+backends are included. The macOS x86_64 build targets `x86_64-apple-darwin`
+with the standard Apple/Rust toolchain (no `cross` needed) and runs on
+whichever host architecture GitHub maps `macos-latest` to today (currently
+ARM64); pin to a concrete runner image such as `macos-14` if the host
+architecture must be guaranteed.
 
 ##### Trusted ARM64 Cross boundary
 
@@ -2164,11 +2177,12 @@ pairs for those jobs, keyed by the workflow filename AND the job name:
 
 | Workflow | Job | Retired SHA-256 (trusted base) | Adopted SHA-256 | Destination |
 |---|---|---|---|---|
-| `coverage.yml` | `coverage-merge` | `d2480af21698fb3ad041b32b39587c949aeedec24746c8d5c8c63acd9f9d2fb6` | `34f5e1b022f1d01ac72d13c66256e11ff87c15135d775c03736e6701b2223a1c` | PR #3917 / issue #3907 |
+| `coverage.yml` | `coverage-merge` | `5acba780094766b03f72059b8ac229c7bcc4a722ce0130060da7ed0d1ba5850f` | `28c3ff517027c36ba2ca7ce8a80adc43d2e8475e46c4d5cb0106819dd3f1c152` | PR #3917 / issue #3907 |
 
 The pair admits #3917's shard-scoped coverage-merge reshape (planned-shard
 artifact selection, plugin gate, planned-shard outcome enforcement), pinned
-against #3917's branch after merging latest `main`
+against #3917's branch after merging latest `main` and inheriting the current
+checksum-pinned `taiki-e/install-action` update
 (`grok/issue-3907-coverage-shards-r1`; recompute and re-pin if review changes
 the job bytes). Each digest is the SHA-256 of `extract_job_block` text. Both
 ends are exact, the binding includes the filename and job name, the move is
@@ -2568,15 +2582,22 @@ https://github.com/ferrum-edge/ferrum-edge/releases
 
 ### Download Latest Release
 
+Published gateway binaries use raw asset names such as `ferrum-edge-linux-x86_64` with adjacent `.sha256` sidecars. Pin an explicit published tag (`latest` for the current prerelease stream). Do not rely on GitHub's `/releases/latest` redirect or the `releases/latest` API endpoint for a prerelease tag.
+
 ```bash
-# Using GitHub CLI
-gh release download --repo ferrum-edge/ferrum-edge -p "*linux-x86_64"
+# Using GitHub CLI (explicit tag; resolves tag name `latest` even when prerelease)
+gh release download --repo ferrum-edge/ferrum-edge latest -p 'ferrum-edge-linux-x86_64*'
+sha256sum -c ferrum-edge-linux-x86_64.sha256
+chmod +x ferrum-edge-linux-x86_64
 
 # Using curl
-RELEASE_URL=$(curl -s https://api.github.com/repos/ferrum-edge/ferrum-edge/releases/latest | \
-  jq -r '.assets[] | select(.name == "ferrum-edge-linux-x86_64") | .browser_download_url')
-curl -L -o ferrum-edge $RELEASE_URL
-chmod +x ferrum-edge
+set -euo pipefail
+TAG=latest  # or replace with another explicit published tag
+BASE="https://github.com/ferrum-edge/ferrum-edge/releases/download/${TAG}"
+curl -fsSLO "${BASE}/ferrum-edge-linux-x86_64"
+curl -fsSLO "${BASE}/ferrum-edge-linux-x86_64.sha256"
+sha256sum -c ferrum-edge-linux-x86_64.sha256
+chmod +x ferrum-edge-linux-x86_64
 ```
 
 ### Platform-Specific Binaries
@@ -2932,10 +2953,13 @@ strategy:
 ```
 
 Musl targets need their own toolchain setup. Add `musl-tools` before a native
-`cargo build`. A Cross-backed target requires a separate isolated invocation
-job, a complete Cross configuration allowlist, fixed empty environment, and an
-updated trusted verifier contract; do not add an unguarded Cross invocation to
-the native matrix.
+`cargo build`. Merge-queue compile gates for discarded artifacts live in the
+`build-binaries` compile-gate step (`cargo check` on `*-apple-darwin`, linked
+`pr-build` elsewhere); do not feed queue outputs into Prepare/Upload. A
+Cross-backed target requires a separate isolated invocation job, a complete
+Cross configuration allowlist, fixed empty environment, and an updated trusted
+verifier contract; do not add an unguarded Cross invocation to the native
+matrix.
 
 ### Skipping Steps
 

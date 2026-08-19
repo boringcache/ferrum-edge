@@ -92,6 +92,9 @@ const CLAIM_HEADER_METADATA_PREFIX: &str = "jwks_auth.claim_header.";
 ///   context for downstream use (logging, rate limiting, consumer header).
 /// - **Shared JWKS cache**: Stores keyed by resolved `jwks_uri` are shared
 ///   across plugin instances — no duplicate fetches or refresh tasks.
+/// - **Header `kid` is binding**: A missing, empty, or unknown JWT `kid` is
+///   rejected with the same generic 401 as any other invalid token. A known
+///   `kid` selects only that trusted key; there is no all-keys fallback.
 /// - **Small provider sets**: Token extraction is intentionally linear over
 ///   configured providers and their token locations. Mesh and direct gateway
 ///   configurations are expected to keep JWT provider/location cardinality low.
@@ -1818,7 +1821,11 @@ fn spawn_discovery_task(
     })
 }
 
-/// Try to validate a JWT against a single provider's JWKS store.
+/// Try to validate a JWT against a single provider's current trusted JWKS.
+///
+/// Key selection is the JWT header `kid` via [`verify_jwt_with_jwks`]: missing,
+/// empty, and unknown identifiers fail closed, and a matching `kid` binds
+/// verification to that one key.
 async fn try_validate_with_provider(provider: &JwksProvider, token: &str) -> Option<Value> {
     let guard = provider.jwks_store.load();
     let store = guard.as_ref().as_ref()?;
