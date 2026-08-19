@@ -697,8 +697,7 @@ impl MeshRuntimeState {
 /// Passing is not applying. It records only that this stage did not refuse the
 /// candidate; the stage that actually installs the generation still commits
 /// through [`MeshRuntimeState::record_applied_slice`].
-#[must_use = "a received slice under evaluation must be resolved with `pass()` or `reject()`; \
-              dropping the guard rolls the config-revision watermark back"]
+#[must_use = "an unresolved evaluation rolls the config-revision watermark back on drop"]
 pub struct MeshSliceEvaluation {
     state: MeshRuntimeState,
     received: Arc<Option<MeshSlice>>,
