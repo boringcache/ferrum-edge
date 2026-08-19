@@ -561,21 +561,28 @@ fn start_capturing_backend(
                         }
                         continue;
                     };
-                    let header_text = String::from_utf8_lossy(&buf[..header_end]);
-                    let mut lines = header_text.lines();
-                    let request_line = lines.next().unwrap_or_default();
-                    let mut parts = request_line.split_whitespace();
-                    let method = parts.next().unwrap_or("");
-                    let path = parts.next().unwrap_or("/");
-                    let mut content_length = 0usize;
-                    for line in header_text.lines().skip(1) {
-                        let Some((name, value)) = line.split_once(':') else {
-                            continue;
-                        };
-                        if name.eq_ignore_ascii_case("content-length") {
-                            content_length = value.trim().parse().unwrap_or(0);
+                    // Own everything parsed out of the header before the body
+                    // loop below extends `buf`: `header_text` borrows `buf`, and
+                    // `method` / `path` borrow `header_text`, so holding either
+                    // across `buf.extend_from_slice` is a borrow conflict.
+                    let (method, path, content_length) = {
+                        let header_text = String::from_utf8_lossy(&buf[..header_end]);
+                        let mut lines = header_text.lines();
+                        let request_line = lines.next().unwrap_or_default();
+                        let mut parts = request_line.split_whitespace();
+                        let method = parts.next().unwrap_or("").to_string();
+                        let path = parts.next().unwrap_or("/").to_string();
+                        let mut content_length = 0usize;
+                        for line in header_text.lines().skip(1) {
+                            let Some((name, value)) = line.split_once(':') else {
+                                continue;
+                            };
+                            if name.eq_ignore_ascii_case("content-length") {
+                                content_length = value.trim().parse().unwrap_or(0);
+                            }
                         }
-                    }
+                        (method, path, content_length)
+                    };
                     let body_start = header_end + 4;
                     while buf.len() < body_start + content_length {
                         let mut tmp = [0u8; 1024];
