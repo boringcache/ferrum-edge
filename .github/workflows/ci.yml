@@ -624,8 +624,11 @@ jobs:
         # Consul, LDAP, Kafka/Redpanda, MySQL, and Hydra (OIDC / introspection)
         # run real third-party software through testcontainers. Nextest reports
         # each test independently and keeps running after one backend fails so
-        # one middleware cannot mask another.
-        run: cargo nextest run --test service_integration --no-fail-fast consul ldap kafka mysql oidc oauth2_introspection
+        # one middleware cannot mask another. `host_port_allocation` needs no
+        # container: it is the pure unit coverage for the host-port allocator
+        # every fixture above maps through, and the filter list is exhaustive,
+        # so a module missing from it never runs (issue #3999).
+        run: cargo nextest run --test service_integration --no-fail-fast consul ldap kafka mysql oidc oauth2_introspection host_port_allocation
         env:
           RUST_BACKTRACE: 1
 
