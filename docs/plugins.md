@@ -4386,7 +4386,11 @@ set `default_rule_action: enforce` or individual `rule_modes` / custom rule
 admission rejects configurations with no reachable enforcement path after
 defaults, overrides, disabled rules, paranoia filtering, and inspection-surface
 toggles — built-in pack plus `mode: enforce` alone is not blocking.
-`mode: monitor` with zero enforcing rules remains valid. Invalid WAF
+`on_body_too_large: block` is a reachable enforcement path when a body
+inspection surface can run: it rejects oversize governed HTTP bodies and
+WebSocket application messages while globally enforcing, even when every rule
+stays monitor-only. `fail_closed`, `scan_truncated`, and `skip` do not satisfy
+the gate. `mode: monitor` with zero enforcing rules remains valid. Invalid WAF
 configuration is security-fatal at startup/reload, so the gateway does not
 silently serve without the intended inspection.
 
@@ -4477,7 +4481,7 @@ scanning the parsed key/value map and a best-effort reconstructed URL.
 | `inspect_multipart` | bool | `false` | Inspect `multipart/*` bodies. |
 | `inspect_binary_body` | bool | `false` | Inspect bodies whose content type is not in `body_content_types`. |
 | `max_scan_bytes` | usize | `1048576` | Maximum bytes scanned from each body. Must be greater than zero. |
-| `on_body_too_large` | string | `fail_closed` | `fail_closed` rejects an oversize governed body when that direction has an enforcing body rule or anomaly scoring, and otherwise scans the first `max_scan_bytes` and records truncation; `scan_truncated` is the explicit compatibility opt-out that always scans only the prefix and forwards the complete body; `skip` skips known-oversized bodies; `block` rejects every oversize governed body in enforce mode. |
+| `on_body_too_large` | string | `fail_closed` | `fail_closed` rejects an oversize governed body when that direction has an enforcing body rule or anomaly scoring, and otherwise scans the first `max_scan_bytes` and records truncation; `scan_truncated` is the explicit compatibility opt-out that always scans only the prefix and forwards the complete body; `skip` skips known-oversized bodies; `block` rejects every oversize governed body in enforce mode and, when a body inspection surface can run, satisfies `mode: enforce` admission on its own. |
 | `scan_budget_ms` | u64 | `50` | Post-hoc deadline for metadata/header and body scans. `0` disables the timeout wrapper. The synchronous scan cannot be cancelled mid-regex; over-budget scans are reported after the scan returns. |
 | `on_scan_timeout` | string | `log_and_allow` | Action when a body scan times out: `allow`, `block`, or `log_and_allow`. |
 | `disallowed_methods` | string[] | `[]` | Methods that should trigger the built-in `FE-METHOD-001` rule when that rule is active. |

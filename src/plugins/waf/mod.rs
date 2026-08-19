@@ -417,6 +417,7 @@ impl Waf {
                 response: response_inspection,
                 response_body: response_body_inspection,
             },
+            on_body_too_large,
         )?;
 
         let config = WafConfig {
@@ -1907,14 +1908,16 @@ impl WafInspectionSurfaces {
 
 /// Reject `mode: enforce` when no rule or separate enforcement path can block
 /// on a surface that is actually enabled. Built-in rules ship monitor-only
-/// unless opted in; anomaly scoring and stream transport guards are separate
-/// enforcement paths, but only when they have reachable input to inspect.
+/// unless opted in; anomaly scoring, stream transport guards, and
+/// `on_body_too_large: block` are separate enforcement paths, but only when
+/// they have reachable input to inspect.
 fn validate_enforce_mode_has_enforcing_rules(
     mode: GlobalMode,
     compiled: &CompiledRules,
     stream: Option<&StreamWafConfig>,
     scoring: Option<&ScoringConfig>,
     surfaces: WafInspectionSurfaces,
+    on_body_too_large: TooLargeAction,
 ) -> Result<(), String> {
     if mode != GlobalMode::Enforce {
         return Ok(());
@@ -1941,13 +1944,42 @@ fn validate_enforce_mode_has_enforcing_rules(
     }) {
         return Ok(());
     }
+    if oversize_body_block_is_reachable(on_body_too_large, compiled, surfaces) {
+        return Ok(());
+    }
     Err(
         "waf: mode is 'enforce' but no enabled enforcement path can block traffic. Built-in \
          rules are monitor-only by default; set 'default_rule_action' to 'enforce' or opt \
          rules in via 'rule_modes' / custom_rules[].action, enable anomaly scoring over an \
-         inspected HTTP rule, or enable a stream enforcement rule"
+         inspected HTTP rule, enable a stream enforcement rule, or set 'on_body_too_large' \
+         to 'block' on an inspected body surface"
             .to_string(),
     )
+}
+
+/// `on_body_too_large: block` rejects oversize governed HTTP bodies and
+/// WebSocket application messages whenever `mode` is `enforce`, independent of
+/// per-rule `action`. That is only a reachable enforcement path when the body
+/// inspection hook that consults the setting can actually run — the same
+/// request/response body buffering predicates the runtime uses, including the
+/// body-scoped encoding specials that also pull a session into inspection.
+fn oversize_body_block_is_reachable(
+    on_body_too_large: TooLargeAction,
+    compiled: &CompiledRules,
+    surfaces: WafInspectionSurfaces,
+) -> bool {
+    if on_body_too_large != TooLargeAction::Block {
+        return false;
+    }
+    let encoding_specials = compiled.find_rule_index("FE-ENCODING-001").is_some()
+        || compiled.find_rule_index("FE-ENCODING-002").is_some();
+    let request_hook = surfaces.request
+        && surfaces.request_body
+        && (compiled.request_body_rules_active || encoding_specials);
+    let response_hook = surfaces.response
+        && surfaces.response_body
+        && (compiled.response_body_rules_active || encoding_specials);
+    request_hook || response_hook
 }
 
 fn parse_scoring(value: Option<&Value>) -> Result<Option<ScoringConfig>, String> {
