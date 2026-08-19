@@ -48,10 +48,6 @@ impl PodKey {
 struct CoreService {
     ports: Vec<ServicePort>,
     has_selector: bool,
-    /// Explicit headless declaration (`spec.clusterIP: "None"` or
-    /// `spec.clusterIPs` containing `"None"`). Empty VIP lists alone are not
-    /// headless — ExternalName and malformed objects also omit ClusterIP.
-    is_headless: bool,
     /// `spec.clusterIPs` (fallback `spec.clusterIP`), excluding the headless
     /// sentinel `"None"` and empty strings. Raw-TCP egress maps captured
     /// original destinations to services through these VIPs.
@@ -265,24 +261,6 @@ pub(super) fn finalize(acc: &mut K8sAccumulator) -> Result<(), K8sTranslateError
     Ok(())
 }
 
-/// True when the Service declares the Kubernetes headless sentinel.
-fn service_spec_is_headless(spec: &Value) -> bool {
-    let cluster_ips = spec.get("clusterIPs").and_then(Value::as_array);
-    let plural_is_headless = cluster_ips
-        .is_some_and(|ips| matches!(ips.as_slice(), [only] if only.as_str() == Some("None")));
-
-    match string_field(spec, "clusterIP") {
-        // Canonical objects carry both fields. If the plural field is present,
-        // require its exact singleton sentinel too; a mixed sentinel/VIP list
-        // is malformed and must keep the safer Service-port fallback.
-        Some("None") => cluster_ips.is_none() || plural_is_headless,
-        Some(_) => false,
-        // Accept the equivalent plural-only shape used by older fixtures, but
-        // only when it is the exact singleton sentinel.
-        None => plural_is_headless,
-    }
-}
-
 fn collect_service(acc: &mut K8sAccumulator, object: &K8sObject) -> Result<(), K8sTranslateError> {
     let Some(key) = K8sServiceKey::new(
         object.metadata.namespace.clone(),
@@ -352,7 +330,6 @@ fn collect_service(acc: &mut K8sAccumulator, object: &K8sObject) -> Result<(), K
                 .get("selector")
                 .and_then(Value::as_object)
                 .is_some_and(|selector| !selector.is_empty()),
-            is_headless: service_spec_is_headless(&object.spec),
             cluster_ips,
             uid: object.metadata.uid.clone(),
         },
@@ -754,64 +731,6 @@ pub(super) fn endpoint_route_backends_for_service(
         }
     }
     backends
-}
-
-/// Dial port used when a Service backend cannot expand onto ready endpoints
-/// and therefore falls back to cluster DNS.
-///
-/// ClusterIP Services — including selectorless ones backed by manual
-/// EndpointSlices — keep `service_port`. kube-proxy / the CNI maps that port
-/// onto each endpoint's targetPort, so Ferrum can keep dialing the stable
-/// Service DNS name even before (or without) seeing the slices.
-///
-/// Headless Services (`spec.clusterIP: None`) have no VIP. CoreDNS returns
-/// ready endpoint addresses, which listen on `targetPort`, not `service_port`.
-/// Falling back to the Service port here is what made Gateway API conformance
-/// `HTTPRouteServiceTypes` `/headless-manual-endpointslices` fail closed with
-/// `connection_failure`: empty manual slices translated to
-/// `headless-manual-endpointslices.….svc:8080`, CoreDNS later returned the
-/// pod IP, and Ferrum kept dialing `:8080` while the echo container listened
-/// on `:3000`. Selector-based headless Services avoid this because
-/// kube-controller-manager populates EndpointSlices before first translation,
-/// so expansion uses targetPort. Manual slices are patched *after* the route
-/// is Accepted, so DNS fallback must already carry the container port.
-pub(super) fn service_dns_fallback_dial_port(
-    acc: &K8sAccumulator,
-    namespace: &str,
-    service_name: &str,
-    service_port: u16,
-) -> u16 {
-    let Some(service_key) = K8sServiceKey::new(namespace.to_string(), service_name.to_string())
-    else {
-        return service_port;
-    };
-    let Some(service) = acc.core.services.get(&service_key) else {
-        return service_port;
-    };
-    if !service.is_headless {
-        return service_port;
-    }
-
-    let service_port_spec = service
-        .ports
-        .iter()
-        .find(|candidate| candidate.port == service_port);
-    if let Some(port) = acc
-        .core
-        .endpoint_slices
-        .iter()
-        .filter(|slice| {
-            slice.service_key == service_key
-                && slice.backend_kind == EndpointSliceBackendKind::Service
-        })
-        .find_map(|slice| endpoint_backend_port(service_port_spec, service_port, slice))
-    {
-        return port;
-    }
-    match service_port_spec.and_then(|port| port.target_port.as_ref()) {
-        Some(ServiceTargetPort::Number(port)) if *port != 0 => *port,
-        _ => service_port,
-    }
 }
 
 /// Expand an MCS `ServiceImport` onto ready EndpointSlice addresses.
