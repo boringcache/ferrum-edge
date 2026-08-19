@@ -22417,6 +22417,16 @@ components:
           type: string
           enum: [enforce, monitor, disabled]
           default: enforce
+          description: >-
+            Global WAF mode. enforce is rejected at construction when no
+            reachable enforcement path remains after default_rule_action,
+            rule_modes, rule_overrides, disabled rules, paranoia filtering,
+            and inspection-surface toggles. Built-in rules are monitor-only
+            unless opted in. Anomaly scoring, stream.tcp_require_tls,
+            enforce-action stream.signatures, and on_body_too_large: block
+            (when a body inspection hook can run) each satisfy admission
+            without per-rule action: enforce. monitor with zero enforcing
+            rules remains valid.
         default_rule_action:
           type: string
           enum: [enforce, monitor, disabled]
@@ -22476,6 +22486,10 @@ components:
             inspection lets a padded suffix carry blocked content past an
             enforcing rule. skip scans nothing. block rejects every oversize
             governed body while mode is enforce, otherwise scans the prefix.
+            Under mode: enforce, block is itself a reachable admission
+            enforcement path when a body inspection hook can run (HTTP bodies
+            and WebSocket application messages share this setting). fail_closed,
+            scan_truncated, and skip do not satisfy that gate.
         include_default_rules:
           type: boolean
           default: true

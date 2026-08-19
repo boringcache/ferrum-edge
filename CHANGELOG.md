@@ -123,6 +123,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- WAF `mode: enforce` admission now counts `on_body_too_large: block` as a
+  reachable enforcement path (issue #4006). That setting already rejected
+  oversize governed HTTP bodies and WebSocket application messages whenever
+  the global mode was `enforce`, even with every rule left monitor-only, but
+  construction refused the config as having no enforcement path. The
+  observation-only-rules, resource-bound-enforced posture is now admitted
+  when a body inspection hook can actually run. `fail_closed` (the default),
+  `scan_truncated`, and `skip` still do not satisfy the gate, and a config
+  that cannot block anything is still refused.
+
 - Authenticated UDP/DTLS client-facing sends no longer emit after the
   authorization deadline (issues #3815, #3816, #3820). A pre-send commitment
   check then `send_to`/`writable().await` could stay pending across the bound
