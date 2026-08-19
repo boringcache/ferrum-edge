@@ -1179,10 +1179,7 @@ fn test_classify_boxed_error_tls_close_without_notify_is_connection_closed() {
              https://docs.rs/rustls/latest/rustls/manual/_03_howto/index.html#unexpected-eof"
         ),
     );
-    assert_eq!(
-        classify_boxed_error(&io_err),
-        ErrorClass::ConnectionClosed
-    );
+    assert_eq!(classify_boxed_error(&io_err), ErrorClass::ConnectionClosed);
     assert_ne!(classify_boxed_error(&io_err), ErrorClass::TlsError);
 }
 

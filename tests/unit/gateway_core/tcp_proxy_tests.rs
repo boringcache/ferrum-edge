@@ -2106,11 +2106,7 @@ async fn test_bidirectional_copy_tls_close_without_notify_is_graceful() {
         io::ErrorKind::UnexpectedEof,
         RUSTLS_EOF,
     );
-    let backend = ScriptedStream::new(
-        vec![b"RESPONSE".to_vec()],
-        vec![],
-        WriteOutcome::Accept,
-    );
+    let backend = ScriptedStream::new(vec![b"RESPONSE".to_vec()], vec![], WriteOutcome::Accept);
 
     let result =
         bidirectional_copy_for_test(client, backend, TEST_IDLE_TIMEOUT, None, 8 * 1024).await;
@@ -2572,12 +2568,11 @@ async fn test_udp_setup_dns_failure_emits_stream_summary() {
     let plugins: Vec<Arc<dyn Plugin>> = vec![Arc::new(CaptureUdpSetupPlugin {
         summaries: Arc::clone(&captured),
     })];
-    let error: anyhow::Error =
-        ferrum_edge::proxy::stream_error::StreamSetupError::dns_lookup(
-            "backend.local",
-            std::io::Error::other("DNS resolution returned no addresses for backend.local"),
-        )
-        .into();
+    let error: anyhow::Error = ferrum_edge::proxy::stream_error::StreamSetupError::dns_lookup(
+        "backend.local",
+        std::io::Error::other("DNS resolution returned no addresses for backend.local"),
+    )
+    .into();
 
     emit_udp_setup_failure_for_test(
         &plugins,
@@ -2599,10 +2594,7 @@ async fn test_udp_setup_dns_failure_emits_stream_summary() {
     assert_eq!(summary.listen_port, 5353);
     assert_eq!(summary.bytes_sent, 0);
     assert_eq!(summary.bytes_received, 0);
-    assert_eq!(
-        summary.error_class,
-        Some(ErrorClass::DnsLookupError)
-    );
+    assert_eq!(summary.error_class, Some(ErrorClass::DnsLookupError));
     assert_eq!(
         summary.disconnect_cause,
         Some(DisconnectCause::BackendError)
