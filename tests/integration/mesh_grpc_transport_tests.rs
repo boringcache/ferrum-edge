@@ -503,10 +503,8 @@ async fn start_mesh_mtls_http_server(
     (addr, observed_rx)
 }
 
-async fn serve_one_http_request<T>(
-    io: T,
-    observed_tx: oneshot::Sender<ObservedHttpRequest>,
-) where
+async fn serve_one_http_request<T>(io: T, observed_tx: oneshot::Sender<ObservedHttpRequest>)
+where
     T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
 {
     let mut h2 = h2::server::handshake(io).await.expect("h2 server");

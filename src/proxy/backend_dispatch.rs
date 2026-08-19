@@ -2321,22 +2321,8 @@ mod tests {
         let proxy = &epoch.config.proxies[0];
         let ((first, second), log) = capture_dispatch_warns(|| {
             (
-                select_upstream_target(
-                    proxy,
-                    &state,
-                    &epoch,
-                    "192.0.2.10",
-                    &HashMap::new(),
-                    None,
-                ),
-                select_upstream_target(
-                    proxy,
-                    &state,
-                    &epoch,
-                    "192.0.2.10",
-                    &HashMap::new(),
-                    None,
-                ),
+                select_upstream_target(proxy, &state, &epoch, "192.0.2.10", &HashMap::new(), None),
+                select_upstream_target(proxy, &state, &epoch, "192.0.2.10", &HashMap::new(), None),
             )
         });
         assert!(first.target.is_some(), "RR fallback must select a target");
@@ -2348,9 +2334,7 @@ mod tests {
             "RR fallback should rotate across the pool"
         );
         assert!(
-            log.contains(
-                "PASSTHROUGH: original destination absent, falling back to round-robin"
-            ),
+            log.contains("PASSTHROUGH: original destination absent, falling back to round-robin"),
             "absent orig-dst must warn before RR fallback, got {log:?}"
         );
     }
