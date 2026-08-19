@@ -100,9 +100,7 @@ use super::utils::auth_flow::{
     self, AuthMechanism, ExtractedCredential, VerifyOutcome, commit_authentication_attempt,
     constant_time_eq,
 };
-use super::utils::header_extract::{
-    ConfiguredHeaderLookup, lookup_configured_header,
-};
+use super::utils::header_extract::{ConfiguredHeaderLookup, lookup_configured_header};
 use super::utils::redis_rate_limiter::{
     REDIS_PLUGIN_CONFIG_KEYS, RedisConfig, RedisRateLimitClient,
 };
@@ -1156,9 +1154,7 @@ impl HmacAuth {
     fn extract_digest_header(ctx: &RequestContext) -> Option<String> {
         match Self::lookup_digest_header(ctx) {
             ConfiguredHeaderLookup::Value(value) => Some(value),
-            ConfiguredHeaderLookup::Absent | ConfiguredHeaderLookup::PresentNonMaterialized => {
-                None
-            }
+            ConfiguredHeaderLookup::Absent | ConfiguredHeaderLookup::PresentNonMaterialized => None,
         }
     }
 

@@ -67,9 +67,7 @@ use crate::tls::source::{CertSource, MaterialKind, load_material_blocking};
 
 use super::utils::PluginHttpClient;
 use super::utils::auth_flow::{self, AuthMechanism, ExtractedCredential, VerifyOutcome};
-use super::utils::header_extract::{
-    ConfiguredHeaderLookup, lookup_configured_header,
-};
+use super::utils::header_extract::{ConfiguredHeaderLookup, lookup_configured_header};
 use super::{RequestContext, strip_auth_scheme};
 
 pub const LDAP_AUTH_DEFAULT_CACHE_TTL_SECONDS: u64 = 0;

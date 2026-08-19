@@ -19,9 +19,7 @@ use crate::consumer_index::ConsumerIndex;
 use super::utils::auth_flow::{
     self, AuthMechanism, ExtractedCredential, VerifyOutcome, constant_time_eq,
 };
-use super::utils::header_extract::{
-    ConfiguredHeaderLookup, lookup_configured_header,
-};
+use super::utils::header_extract::{ConfiguredHeaderLookup, lookup_configured_header};
 use super::{RequestContext, strip_auth_scheme};
 
 // A canonical stored Basic hash alone consumes this many serialized bytes,

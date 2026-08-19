@@ -167,10 +167,7 @@ pub fn context_with_materialized_raw_header(name: &str, value: &str) -> RequestC
 
 /// Build a request context from raw header bytes that `materialize_headers()`
 /// omits, then materialize the rest of the map.
-pub fn context_with_materialized_raw_header_bytes(
-    name: &str,
-    value: &[u8],
-) -> RequestContext {
+pub fn context_with_materialized_raw_header_bytes(name: &str, value: &[u8]) -> RequestContext {
     let mut ctx = RequestContext::new(
         "127.0.0.1".to_string(),
         "GET".to_string(),
@@ -199,9 +196,7 @@ pub fn context_with_materialized_raw_header_bytes(
 pub fn assert_reject_body(result: PluginResult, expected_body: &str) {
     match result {
         PluginResult::Reject {
-            status_code,
-            body,
-            ..
+            status_code, body, ..
         } => {
             assert_eq!(status_code, 401);
             assert_eq!(body, expected_body);
