@@ -2317,7 +2317,7 @@ pub(crate) async fn handle_delete<R: AdminResource>(
                 };
             return match persistence {
                 Ok(true) => Ok(state
-                    .complete_live_config_mutation_after_commit(
+                    .complete_live_config_mutation_after_commit_boxed(
                         namespace,
                         _write_permit,
                         super::empty_response(StatusCode::NO_CONTENT),
@@ -2382,7 +2382,7 @@ pub(crate) async fn handle_delete<R: AdminResource>(
     };
     match persistence {
         Ok(true) => Ok(state
-            .complete_live_config_mutation_after_commit(
+            .complete_live_config_mutation_after_commit_boxed(
                 namespace,
                 _write_permit,
                 super::empty_response(StatusCode::NO_CONTENT),
@@ -4801,7 +4801,7 @@ async fn handle_write<R: AdminResource>(
         WriteAction::Update { .. } => StatusCode::OK,
     };
     Ok(state
-        .complete_live_config_mutation_after_commit(
+        .complete_live_config_mutation_after_commit_boxed(
             namespace,
             _write_permit,
             super::json_response(status, &body),

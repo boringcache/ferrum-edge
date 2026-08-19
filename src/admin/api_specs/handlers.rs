@@ -2900,7 +2900,7 @@ pub async fn handle_post_api_spec(
         resp.headers_mut().insert("Location", hv);
     }
     Ok(state
-        .complete_live_config_mutation_after_commit(namespace, _write_permit, resp)
+        .complete_live_config_mutation_after_commit_boxed(namespace, _write_permit, resp)
         .await)
 }
 
@@ -3157,7 +3157,7 @@ pub async fn handle_put_api_spec(
     });
 
     Ok(state
-        .complete_live_config_mutation_after_commit(
+        .complete_live_config_mutation_after_commit_boxed(
             namespace,
             _write_permit,
             json_resp(StatusCode::OK, &resp_body),
@@ -3652,7 +3652,7 @@ pub async fn handle_delete_api_spec(
             .body(Full::new(Bytes::new()))
             .unwrap_or_else(|_| Response::new(Full::new(Bytes::new())));
         Ok(state
-            .complete_live_config_mutation_after_commit(namespace, _write_permit, response)
+            .complete_live_config_mutation_after_commit_boxed(namespace, _write_permit, response)
             .await)
     } else {
         Ok(error_response(ApiSpecError::NotFound))

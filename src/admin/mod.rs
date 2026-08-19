@@ -570,6 +570,34 @@ impl AdminState {
     ///
     /// This is the only supported success-path completion for config-database
     /// mutations. Non-success responses skip capture and wait.
+    /// Heap-boxed [`Self::complete_live_config_mutation_after_commit`].
+    ///
+    /// At the coverage profile's `opt-level = 0`, every temporary in a
+    /// coroutine's `poll` body is a fixed alloca emitted on entry, so awaiting
+    /// the generic async fn directly charges its whole future — a
+    /// `Response<Full<Bytes>>`, the pins, and the live-apply wait state — to
+    /// EVERY admin write handler's frame. Adding that to the API-spec handlers
+    /// overflowed the stack in the `admin-api` coverage shard (22 tests
+    /// aborting with `fatal runtime error: stack overflow`).
+    ///
+    /// A call-site `Box::pin` does not fix this: the future is still
+    /// materialized in the caller's frame before it is moved to the heap. The
+    /// box has to happen behind an `#[inline(never)]` boundary so the
+    /// construction lands in THIS function's frame and the caller keeps only a
+    /// pointer. Same remedy as the #3764 / #3820 coverage overflows.
+    #[inline(never)]
+    pub fn complete_live_config_mutation_after_commit_boxed<'a, P>(
+        &'a self,
+        namespace: &'a str,
+        pins: P,
+        response: Response<Full<Bytes>>,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Response<Full<Bytes>>> + Send + 'a>>
+    where
+        P: Send + 'a,
+    {
+        Box::pin(self.complete_live_config_mutation_after_commit(namespace, pins, response))
+    }
+
     pub async fn complete_live_config_mutation_after_commit<P>(
         &self,
         namespace: &str,
@@ -6462,7 +6490,7 @@ async fn handle_update_credentials(
     })
     .await;
     Ok(state
-        .complete_live_config_mutation_after_commit(namespace, _write_permit, response)
+        .complete_live_config_mutation_after_commit_boxed(namespace, _write_permit, response)
         .await)
 }
 
@@ -6548,7 +6576,7 @@ async fn handle_delete_credentials(
     })
     .await;
     Ok(state
-        .complete_live_config_mutation_after_commit(namespace, _write_permit, response)
+        .complete_live_config_mutation_after_commit_boxed(namespace, _write_permit, response)
         .await)
 }
 
@@ -6688,7 +6716,7 @@ async fn handle_append_credential(
     })
     .await;
     Ok(state
-        .complete_live_config_mutation_after_commit(namespace, _write_permit, response)
+        .complete_live_config_mutation_after_commit_boxed(namespace, _write_permit, response)
         .await)
 }
 
@@ -6815,7 +6843,7 @@ async fn handle_delete_credential_by_index(
     })
     .await;
     Ok(state
-        .complete_live_config_mutation_after_commit(namespace, _write_permit, response)
+        .complete_live_config_mutation_after_commit_boxed(namespace, _write_permit, response)
         .await)
 }
 
@@ -7609,7 +7637,7 @@ async fn handle_batch_create(
     }
 
     Ok(state
-        .complete_live_config_mutation_after_commit(
+        .complete_live_config_mutation_after_commit_boxed(
             namespace,
             (namespace_config_admission_guard, _write_permit),
             json_response(StatusCode::CREATED, &response),
@@ -9285,7 +9313,7 @@ async fn handle_restore(
     }
 
     Ok(state
-        .complete_live_config_mutation_after_commit(
+        .complete_live_config_mutation_after_commit_boxed(
             namespace,
             (namespace_config_admission_guard, _write_permit),
             json_response(StatusCode::OK, &response),
