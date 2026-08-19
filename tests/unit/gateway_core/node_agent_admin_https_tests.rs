@@ -471,13 +471,15 @@ fn optional_client_ca_mtls_loads_and_fails_closed() {
         admin_tls_client_ca_bundle_path: Some("/nonexistent/client-ca.crt".into()),
         ..EnvConfig::default()
     };
-    let err = load_admin_https_tls_fail_closed(
+    let err = match load_admin_https_tls_fail_closed(
         &bad_env,
         &policy,
         &crls,
         "Invalid node_agent admin TLS configuration",
-    )
-    .expect_err("missing client CA must fail closed");
+    ) {
+        Err(err) => err,
+        Ok(_) => panic!("missing client CA must fail closed"),
+    };
     assert!(
         format!("{err:#}").contains("Invalid node_agent admin TLS configuration"),
         "unexpected error: {err:#}"

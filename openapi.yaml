@@ -210,9 +210,16 @@ paths:
       operationId: getLive
       summary: Liveness probe (unauthenticated, minimal)
       description: |
-        Always returns `200 OK` with the body `{"status":"ok"}` and no
-        operational internals. Intended for load-balancer / Kubernetes
-        liveness probes. Never requires authentication.
+        Returns `200 OK` with the body `{"status":"ok"}` and no operational
+        internals. Intended for load-balancer / Kubernetes liveness probes.
+        Never requires authentication.
+
+        The one exception is transport-level, not endpoint-level: on an admin
+        HTTPS connection that authenticated with a client certificate whose
+        trust the operator has since withdrawn, every request on that
+        connection — this one included — is refused with `401` before it enters
+        admin routing, and the connection is closed (issue #3857). Plaintext
+        and anonymous-TLS probes are unaffected.
       tags: [Health]
       security: []
       responses:
@@ -227,6 +234,18 @@ paths:
                   status:
                     type: string
                     enum: [ok]
+        "401":
+          description: |
+            The admin HTTPS connection this request arrived on authenticated
+            with a client certificate whose trust the operator has since
+            withdrawn (a CRL now revokes it, or its issuing CA left
+            `FERRUM_ADMIN_TLS_CLIENT_CA_BUNDLE_PATH`). The request is refused
+            before it enters admin routing and the connection is closed. Never
+            reached on a plaintext or anonymous-TLS admin connection.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
 
   /health:
     get:
@@ -342,6 +361,18 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/HealthResponse"
+        "401":
+          description: |
+            The admin HTTPS connection this request arrived on authenticated
+            with a client certificate whose trust the operator has since
+            withdrawn (a CRL now revokes it, or its issuing CA left
+            `FERRUM_ADMIN_TLS_CLIENT_CA_BUNDLE_PATH`). The request is refused
+            before it enters admin routing and the connection is closed. Never
+            reached on a plaintext or anonymous-TLS admin connection.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
 
   /status:
     get:
@@ -362,6 +393,18 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/HealthResponse"
+        "401":
+          description: |
+            The admin HTTPS connection this request arrived on authenticated
+            with a client certificate whose trust the operator has since
+            withdrawn (a CRL now revokes it, or its issuing CA left
+            `FERRUM_ADMIN_TLS_CLIENT_CA_BUNDLE_PATH`). The request is refused
+            before it enters admin routing and the connection is closed. Never
+            reached on a plaintext or anonymous-TLS admin connection.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
 
   /admin/tls/inventory:
     get:
@@ -1759,6 +1802,18 @@ paths:
                 oneOf:
                   - $ref: "#/components/schemas/OverloadSnapshot"
                   - $ref: "#/components/schemas/OverloadLevelOnly"
+        "401":
+          description: |
+            The admin HTTPS connection this request arrived on authenticated
+            with a client certificate whose trust the operator has since
+            withdrawn (a CRL now revokes it, or its issuing CA left
+            `FERRUM_ADMIN_TLS_CLIENT_CA_BUNDLE_PATH`). The request is refused
+            before it enters admin routing and the connection is closed. Never
+            reached on a plaintext or anonymous-TLS admin connection.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
 
   # ── Metrics ─────────────────────────────────────────────────────────
   /metrics:
@@ -14663,7 +14718,7 @@ components:
     # ── Runtime metrics ─────────────────────────────────────────────
     RuntimeMetricsSnapshot:
       type: object
-      required: [timestamp, uptime_seconds, mode, ferrum_version, system, http, errors, dns, connections, logs, plugin_triggers, replay_authority, authorization_lifetime, overload]
+      required: [timestamp, uptime_seconds, mode, ferrum_version, system, http, errors, dns, connections, logs, plugin_triggers, replay_authority, authorization_lifetime, overload, frontend_client_trust]
       properties:
         timestamp:
           type: string
@@ -14696,6 +14751,113 @@ components:
           $ref: "#/components/schemas/RuntimeAuthorizationLifetimeSnapshot"
         overload:
           $ref: "#/components/schemas/OverloadSnapshot"
+        frontend_client_trust:
+          type: array
+          description: |
+            Frontend client-CA / CRL trust generations and established-transport
+            retirement, one entry per listener scope that has accepted trust
+            material (issue #3857). Empty when no scope has. No certificate
+            field, serial, subject, fingerprint, or source path is representable
+            in this object.
+          items:
+            $ref: "#/components/schemas/RuntimeFrontendClientTrustSnapshot"
+
+    RuntimeFrontendClientTrustSnapshot:
+      type: object
+      description: |
+        One frontend listener scope's client-certificate trust state. Every
+        member is a counter, a gauge, or the closed scope vocabulary.
+      required:
+        [
+          scope,
+          generation,
+          withdrawal_generation,
+          tracked_connections,
+          publications_armed,
+          publications_unchanged,
+          publications_advanced,
+          publications_withdrawn,
+          rejected_candidates,
+          retired_client_ca_withdrawn,
+          retired_crl_changed,
+          fenced_requests,
+        ]
+      properties:
+        scope:
+          type: string
+          enum: [proxy_frontend, proxy_h3, admin_https, frontend_dtls]
+          description: |
+            Listener family whose client certificates are verified against one
+            trust domain. `proxy_frontend` covers the proxy HTTPS/HTTP-2
+            listeners and TCP+TLS stream listeners, which share the same
+            operator-configured frontend material.
+        generation:
+          type: integer
+          format: uint64
+          description: |
+            Monotonic generation in force. Advances only after a validated,
+            accepted candidate that semantically differs from the last accepted
+            one; a re-issued CRL with an unchanged revocation set does not
+            advance it.
+        withdrawal_generation:
+          type: integer
+          format: uint64
+          description: |
+            Generation at which client-certificate authority was last narrowed
+            (a trust anchor disappeared, or a new revocation appeared). `0` when
+            it never has been. Established transports below this generation are
+            retired and admit no further requests or streams.
+        tracked_connections:
+          type: integer
+          format: uint64
+          description: |
+            Established client-certificate-authenticated transports currently
+            registered for retirement in this scope.
+        publications_armed:
+          type: integer
+          format: uint64
+          description: Accepted publications that established the scope's baseline.
+        publications_unchanged:
+          type: integer
+          format: uint64
+          description: |
+            Accepted publications semantically identical to the previous one.
+            The generation did not advance and no session was touched.
+        publications_advanced:
+          type: integer
+          format: uint64
+          description: |
+            Accepted publications that changed the material without narrowing
+            authority (a CA added, a revocation removed). No session retired.
+        publications_withdrawn:
+          type: integer
+          format: uint64
+          description: |
+            Accepted publications that narrowed authority, moved the fence, and
+            retired established client-certificate transports.
+        rejected_candidates:
+          type: integer
+          format: uint64
+          description: |
+            Reload candidates refused. The last accepted generation, its
+            verifier, and every live session were retained.
+        retired_client_ca_withdrawn:
+          type: integer
+          format: uint64
+          description: |
+            Established transports retired because a trust anchor left the
+            client-CA bundle.
+        retired_crl_changed:
+          type: integer
+          format: uint64
+          description: |
+            Established transports retired because a CRL added a revocation.
+        fenced_requests:
+          type: integer
+          format: uint64
+          description: |
+            Requests or streams refused before routing and plugins because the
+            transport's client-certificate trust had been withdrawn.
 
     RuntimeReplayAuthoritySnapshot:
       type: object
@@ -18376,7 +18538,11 @@ components:
     JwksAuthConfig:
       type: object
       additionalProperties: false
-      description: "Plugin: jwks_auth — Multi-provider JWKS JWT validation with claim-based authorization."
+      description: >-
+        Plugin: jwks_auth — Multi-provider JWKS JWT validation with claim-based
+        authorization. JWT header kid is required and binding: a missing, empty,
+        or unknown kid is rejected with a generic 401. There is no all-keys
+        fallback; a known kid selects only that trusted key.
       required: [providers]
       properties:
         providers:
@@ -18846,7 +19012,11 @@ components:
     OidcRelyingPartyConfig:
       type: object
       additionalProperties: false
-      description: "Plugin: oidc_relying_party — Browser OIDC relying party with authorization code + PKCE and encrypted sessions."
+      description: >-
+        Plugin: oidc_relying_party — Browser OIDC relying party with authorization
+        code + PKCE and encrypted sessions. ID token verification requires a JWT
+        header kid that selects exactly one current trusted JWKS key; missing,
+        empty, and unknown kid values are rejected with no all-keys fallback.
       required: [providers, session]
       properties:
         providers:
@@ -22703,10 +22873,13 @@ components:
           type: string
           enum: [enforce, monitor, disabled]
           description: >-
-            Bulk action applied to every built-in rule. Unset leaves the pack
-            monitor-only; per-rule rule_modes entries still take precedence.
-            Combine with paranoia_level to enforce only the low-false-positive
-            core of the rule pack.
+            Bulk action applied to built-in rules that inherit it. Unset leaves
+            the pack monitor-only; per-rule rule_modes entries still take
+            precedence. Encoding-evasion heuristics (FE-ENCODING-001 and
+            FE-ENCODING-002) stay monitor under bulk enforce until an explicit
+            rule_modes or rule_overrides.action entry promotes them. Combine
+            with paranoia_level to enforce only the low-false-positive core of
+            the rule pack.
         paranoia_level:
           type: integer
           minimum: 1
@@ -23557,7 +23730,11 @@ components:
         fail_on_unknown_operation:
           type: boolean
           default: true
-          description: Reject requests that do not match any generated operation.
+          description: >-
+            Reject requests that do not match any generated operation. In block
+            mode the client-visible problem title is "Unknown OpenAPI operation"
+            with detail "No OpenAPI operation matched this request"; the method
+            and path are not interpolated into either string.
         fail_on_missing_response_schema:
           type: boolean
           default: false
@@ -23591,7 +23768,12 @@ components:
           minItems: 1
           items:
             $ref: "#/components/schemas/OpenapiValidatorOperation"
-          description: Generated operation schema table. The importer replaces this from the spec on every spec PUT.
+          description: >-
+            Generated operation schema table. Required in file mode and other
+            direct plugin configuration; POST /api-specs and PUT
+            /api-specs/{id} generate it from the attached document when
+            x-ferrum-validate is enabled. The importer replaces this from the
+            spec on every spec PUT.
         bypass:
           type: object
           additionalProperties: false

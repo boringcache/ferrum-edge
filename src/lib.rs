@@ -1405,6 +1405,19 @@ pub mod _test_support {
         crate::proxy::eager_buffer_body_read_status_and_class(class)
     }
 
+    pub fn http_backend_dispatch_error_response_for_test(
+        error_class: crate::retry::ErrorClass,
+        resolved_ip: Option<String>,
+    ) -> crate::retry::BackendResponse {
+        crate::proxy::http_backend_dispatch_error_response(error_class, resolved_ip)
+    }
+
+    pub fn http_backend_failure_status_and_body_for_test(
+        class: crate::retry::ErrorClass,
+    ) -> (u16, &'static str) {
+        crate::proxy::http_backend_failure_status_and_body(class)
+    }
+
     pub fn set_grpc_deadline_budget_for_test(
         ctx: &mut crate::plugins::RequestContext,
         budget_ms: Option<u64>,
@@ -7334,7 +7347,7 @@ pub mod _test_support {
                 .unwrap_or_else(tokio::time::Instant::now),
             reason,
         };
-        crate::proxy::wait_for_websocket_session_stop(deadline, Some(shutdown_rx), &overload)
+        crate::proxy::wait_for_websocket_session_stop(deadline, Some(shutdown_rx), &overload, None)
             .await
             .as_str()
     }
@@ -7356,6 +7369,7 @@ pub mod _test_support {
             deadline,
             Some(shutdown_rx),
             overload.as_ref(),
+            None,
         )
         .await;
         drop(shutdown_tx);
@@ -7809,6 +7823,192 @@ pub mod _test_support {
         crate::proxy::tcp_proxy::within_stream_auth_deadline(plan, stage).await
     }
 
+    /// Why a post-admission TCP setup stage was interrupted (issues #3816 and
+    /// #3857), mirrored for external tests.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum StreamSetupInterruptForTest {
+        /// The admitted credential's authorization lifetime elapsed.
+        AuthorizationExpired(crate::proxy::auth_lifetime::StreamAuthTermination),
+        /// The frontend client-certificate trust decision was withdrawn.
+        TrustWithdrawn,
+    }
+
+    fn map_stream_setup_interrupt_for_test(
+        interrupt: crate::proxy::tcp_proxy::StreamSetupInterrupt,
+    ) -> StreamSetupInterruptForTest {
+        match interrupt {
+            crate::proxy::tcp_proxy::StreamSetupInterrupt::AuthorizationExpired(termination) => {
+                StreamSetupInterruptForTest::AuthorizationExpired(termination)
+            }
+            crate::proxy::tcp_proxy::StreamSetupInterrupt::TrustWithdrawn => {
+                StreamSetupInterruptForTest::TrustWithdrawn
+            }
+        }
+    }
+
+    /// Run one post-admission TCP setup stage under BOTH post-admission bounds
+    /// — the admitted credential's authorization deadline and the established
+    /// transport's client-trust retirement — exactly as
+    /// `handle_tcp_connection_inner` bounds DNS resolution and the backend
+    /// dial/handshake (issues #3816, #3857).
+    pub async fn tcp_setup_stage_within_bounds_for_test<F>(
+        plan: Option<crate::proxy::auth_lifetime::StreamAuthDeadline>,
+        client_trust: Option<&crate::tls::ClientTrustSession>,
+        stage: F,
+    ) -> Result<F::Output, StreamSetupInterruptForTest>
+    where
+        F: std::future::Future,
+    {
+        crate::proxy::tcp_proxy::within_stream_setup_bounds(plan, client_trust, stage)
+            .await
+            .map_err(map_stream_setup_interrupt_for_test)
+    }
+
+    /// Wait out one connect-retry backoff under both post-admission bounds,
+    /// exactly as the TCP setup loop does.
+    pub async fn tcp_retry_backoff_within_bounds_for_test(
+        plan: Option<crate::proxy::auth_lifetime::StreamAuthDeadline>,
+        client_trust: Option<&crate::tls::ClientTrustSession>,
+        delay: std::time::Duration,
+    ) -> Result<(), StreamSetupInterruptForTest> {
+        use crate::proxy::tcp_proxy::retry_backoff_within_stream_setup_bounds;
+
+        retry_backoff_within_stream_setup_bounds(plan, client_trust, delay)
+            .await
+            .map_err(map_stream_setup_interrupt_for_test)
+    }
+
+    /// Why the inspected decrypted prefix was not forwarded to the backend.
+    #[derive(Debug)]
+    pub enum PrefixForwardRejectForTest {
+        /// The frontend client-certificate trust decision was withdrawn.
+        TrustWithdrawn,
+        /// The backend leg failed — genuine backend evidence.
+        Io(std::io::Error),
+    }
+
+    /// Forward the decrypted inspection prefix behind the established
+    /// transport's trust fence, exactly as the TCP+TLS setup path does before
+    /// the relay starts (issue #3857).
+    pub async fn tcp_forward_prefix_under_trust_fence_for_test<W>(
+        writer: &mut W,
+        prefix: &[u8],
+        client_trust: Option<&crate::tls::ClientTrustSession>,
+    ) -> Result<(), PrefixForwardRejectForTest>
+    where
+        W: tokio::io::AsyncWrite + Unpin + ?Sized,
+    {
+        crate::proxy::tcp_proxy::forward_inspected_prefix_under_trust_fence(
+            writer,
+            prefix,
+            client_trust,
+        )
+        .await
+        .map_err(|reject| match reject {
+            crate::proxy::tcp_proxy::PrefixForwardReject::TrustWithdrawn => {
+                PrefixForwardRejectForTest::TrustWithdrawn
+            }
+            crate::proxy::tcp_proxy::PrefixForwardReject::Io(error) => {
+                PrefixForwardRejectForTest::Io(error)
+            }
+        })
+    }
+
+    /// Forward the decrypted inspection prefix exactly as the production TCP
+    /// setup path does: under BOTH post-admission bounds, with the
+    /// per-write-poll trust fence inside them (issues #3816, #3857).
+    ///
+    /// The outer `Err` is the bound that ended the await — trust-first on a
+    /// tie. The inner `Err` distinguishes a fence that fired mid-write from
+    /// genuine backend evidence.
+    #[allow(clippy::type_complexity)]
+    pub async fn tcp_forward_prefix_within_setup_bounds_for_test<W>(
+        plan: Option<crate::proxy::auth_lifetime::StreamAuthDeadline>,
+        client_trust: Option<&crate::tls::ClientTrustSession>,
+        writer: &mut W,
+        prefix: &[u8],
+    ) -> Result<Result<(), PrefixForwardRejectForTest>, StreamSetupInterruptForTest>
+    where
+        W: tokio::io::AsyncWrite + Unpin + ?Sized,
+    {
+        crate::proxy::tcp_proxy::forward_inspected_prefix_within_stream_setup_bounds(
+            plan,
+            client_trust,
+            writer,
+            prefix,
+        )
+        .await
+        .map(|forwarded| {
+            forwarded.map_err(|reject| match reject {
+                crate::proxy::tcp_proxy::PrefixForwardReject::TrustWithdrawn => {
+                    PrefixForwardRejectForTest::TrustWithdrawn
+                }
+                crate::proxy::tcp_proxy::PrefixForwardReject::Io(error) => {
+                    PrefixForwardRejectForTest::Io(error)
+                }
+            })
+        })
+        .map_err(map_stream_setup_interrupt_for_test)
+    }
+
+    /// Settle a client-trust withdrawal observed during TCP setup, exactly as
+    /// every admission and setup fence does: the fixed-cardinality fence
+    /// counter is recorded once per connection through the shared latch, and
+    /// the returned error carries the typed client-side setup kind.
+    pub fn tcp_settle_stream_trust_withdrawal_for_test(
+        client_trust: Option<&crate::tls::ClientTrustSession>,
+        settled: &std::sync::atomic::AtomicBool,
+    ) -> anyhow::Error {
+        crate::proxy::tcp_proxy::settle_stream_trust_withdrawal(client_trust, settled)
+    }
+
+    /// Run the production `on_stream_connect` chain for a TCP+TLS connection
+    /// under the established transport's client-trust fence (issue #3857).
+    ///
+    /// This is the real chain the TCP+TLS admission path runs: the same hook
+    /// loop, the same fault-injection peer-reset race, the same admission
+    /// permit release, the same mesh opened/closed finalizer, and the same
+    /// typed refusals. Only the log-label arguments are supplied here — a
+    /// blocked hook, its cancellation, and the lifecycle it settles are not
+    /// reachable from outside the crate any other way.
+    pub async fn tcp_stream_connect_chain_under_trust_fence_for_test(
+        plugins: &[std::sync::Arc<dyn crate::plugins::Plugin>],
+        stream_ctx: &mut crate::plugins::StreamConnectionContext,
+        client_stream: &tokio::net::TcpStream,
+        client_trust: Option<&crate::tls::ClientTrustSession>,
+        settled: &std::sync::atomic::AtomicBool,
+    ) -> Result<(), anyhow::Error> {
+        crate::proxy::tcp_proxy::run_tcp_stream_connect_plugins(
+            plugins,
+            stream_ctx,
+            client_stream,
+            "trust-fence-test",
+            std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+            "TCP/TLS",
+            "(TCP/TLS)",
+            client_trust.map(|session| {
+                crate::proxy::tcp_proxy::StreamConnectTrustFence::new(session, settled)
+            }),
+        )
+        .await
+    }
+
+    /// Install one stream admission permit whose release increments `released`.
+    ///
+    /// `StreamConnectionContext::add_admission_permit` and
+    /// `StreamAdmissionPermit::new` are crate-private, so an external test
+    /// cannot otherwise put the chain in the state a plugin that took a permit
+    /// leaves it in — which is exactly the state a fence must not leak.
+    pub fn stream_ctx_hold_admission_permit_for_test(
+        stream_ctx: &mut crate::plugins::StreamConnectionContext,
+        released: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    ) {
+        let permit = crate::plugins::StreamAdmissionPermit::new(move || {
+            released.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        });
+        stream_ctx.add_admission_permit(permit);
+    }
+
     /// Kernel splice/IORING is legal only for an unauthenticated plain TCP
     /// session. An admitted principal always takes the userspace deadline-aware
     /// relay (issue #3816).
@@ -7872,7 +8072,11 @@ pub mod _test_support {
     /// Run one awaitable post-admission DTLS setup stage (DNS resolution,
     /// backend UDP/DTLS connect and handshake) under the admitted session's
     /// absolute authorization deadline, exactly as `handle_dtls_client_inner`
-    /// bounds them (issue #3816).
+    /// bounds them for an ANONYMOUS session (issue #3816).
+    ///
+    /// The fence is unarmed here, which is the real anonymous / static DTLS
+    /// path. A client-certificate session's combined bound is
+    /// [`dtls_setup_stage_under_bounds_for_test`] (issue #3857).
     pub async fn dtls_setup_stage_under_authorization_for_test<S, F>(
         plan: Option<crate::proxy::auth_lifetime::StreamAuthDeadline>,
         stage: S,
@@ -7884,10 +8088,12 @@ pub mod _test_support {
         let latch = crate::proxy::auth_lifetime::StreamAuthTerminationLatch::default();
         let metadata = std::sync::Mutex::new(HashMap::new());
         let releases = std::sync::atomic::AtomicUsize::new(0);
-        let outcome = crate::proxy::udp_proxy::dtls_setup_stage_under_authorization(
+        let unarmed = crate::proxy::udp_proxy::DtlsClientTrustFence::unarmed();
+        let outcome = crate::proxy::udp_proxy::dtls_setup_stage_under_bounds(
             plan,
             &latch,
             &metadata,
+            &unarmed,
             || {
                 releases.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             },
@@ -7904,6 +8110,219 @@ pub mod _test_support {
                     .unwrap_or_else(|poisoned| poisoned.into_inner())
                     .clone(),
             )),
+        }
+    }
+
+    // ── Accepted-DTLS client-trust retirement (issue #3857) ────────────
+
+    /// The accepted DTLS session's frontend client-trust fence, as the
+    /// `udp_proxy` handler and both relay directions carry it.
+    ///
+    /// The production type is crate-private, so external coverage builds it
+    /// through this wrapper from a really-registered session — there is no way
+    /// to fabricate one, and an unarmed fence is the real anonymous/static DTLS
+    /// path rather than a stub.
+    pub struct DtlsTrustFenceForTest(crate::proxy::udp_proxy::DtlsClientTrustFence);
+
+    impl DtlsTrustFenceForTest {
+        /// Arm the fence from a registered session, or leave it unarmed
+        /// (`None`) exactly as an anonymous / static DTLS session does.
+        #[must_use]
+        pub fn new(session: Option<&crate::tls::ClientTrustSession>) -> Self {
+            Self(crate::proxy::udp_proxy::DtlsClientTrustFence::from_session(
+                session.cloned(),
+            ))
+        }
+
+        /// Whether this session carries a withdrawable trust decision at all.
+        #[must_use]
+        pub fn is_armed(&self) -> bool {
+            self.0.is_armed()
+        }
+
+        /// Whether the trust decision has already been withdrawn.
+        #[must_use]
+        pub fn is_retired(&self) -> bool {
+            self.0.is_retired()
+        }
+
+        /// Record the connection's fixed-cardinality fence counter through the
+        /// shared once-only latch — the exact call every production fence
+        /// makes, so a test can prove repeat observations stay at one.
+        pub fn record_fenced_once(&self) {
+            self.0.record_fenced_once();
+        }
+
+        /// Record the fence once and return the typed, client-side,
+        /// health-neutral refusal, classified the way the DTLS disconnect
+        /// summary classifies it.
+        #[must_use]
+        pub fn settle_withdrawal(&self) -> DtlsAuthorizationExpiryForTest {
+            let error = self.0.settle_withdrawal();
+            classify_dtls_session_failure_for_test(&error, 0, HashMap::new())
+        }
+    }
+
+    /// How the accepted-DTLS `on_stream_connect` chain ended.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum DtlsStreamConnectOutcomeForTest {
+        Admitted,
+        Rejected,
+        TrustWithdrawn,
+    }
+
+    /// Run the production accepted-DTLS `on_stream_connect` chain under the
+    /// established session's client-trust fence (issue #3857).
+    ///
+    /// This is the real chain the DTLS accept handler runs — the same hook
+    /// loop, the same withdrawal-first prechecks, the same mid-poll drop of a
+    /// blocked hook — so a blocked hook and its cancellation are not reachable
+    /// from outside the crate any other way.
+    pub async fn dtls_stream_connect_chain_under_trust_fence_for_test(
+        plugins: &[Arc<dyn Plugin>],
+        stream_ctx: &mut crate::plugins::StreamConnectionContext,
+        trust: &DtlsTrustFenceForTest,
+    ) -> DtlsStreamConnectOutcomeForTest {
+        match crate::proxy::udp_proxy::run_dtls_stream_connect_plugins(
+            plugins, stream_ctx, &trust.0,
+        )
+        .await
+        {
+            crate::proxy::udp_proxy::DtlsStreamConnectOutcome::Admitted => {
+                DtlsStreamConnectOutcomeForTest::Admitted
+            }
+            crate::proxy::udp_proxy::DtlsStreamConnectOutcome::Rejected => {
+                DtlsStreamConnectOutcomeForTest::Rejected
+            }
+            crate::proxy::udp_proxy::DtlsStreamConnectOutcome::TrustWithdrawn => {
+                DtlsStreamConnectOutcomeForTest::TrustWithdrawn
+            }
+        }
+    }
+
+    /// Run one awaitable post-admission DTLS backend-setup stage (DNS
+    /// resolution, the backend UDP connect, the backend DTLS handshake) under
+    /// BOTH post-admission bounds, exactly as `handle_dtls_client_inner` bounds
+    /// them (issues #3816, #3857).
+    ///
+    /// The returned settlement carries the HALF_OPEN probe-release count, so a
+    /// test can prove the claimed slot is handed back NEUTRALLY rather than
+    /// scored against the backend.
+    pub async fn dtls_setup_stage_under_bounds_for_test<S, F>(
+        plan: Option<crate::proxy::auth_lifetime::StreamAuthDeadline>,
+        trust: &DtlsTrustFenceForTest,
+        stage: S,
+    ) -> Result<F::Output, DtlsAuthorizationExpiryForTest>
+    where
+        S: FnOnce() -> F,
+        F: std::future::Future,
+    {
+        let latch = crate::proxy::auth_lifetime::StreamAuthTerminationLatch::default();
+        let metadata = std::sync::Mutex::new(HashMap::new());
+        let releases = std::sync::atomic::AtomicUsize::new(0);
+        let outcome = crate::proxy::udp_proxy::dtls_setup_stage_under_bounds(
+            plan,
+            &latch,
+            &metadata,
+            &trust.0,
+            || {
+                releases.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            },
+            stage,
+        )
+        .await;
+        match outcome {
+            Ok(output) => Ok(output),
+            Err(error) => Err(classify_dtls_session_failure_for_test(
+                &error,
+                releases.load(std::sync::atomic::Ordering::Relaxed),
+                metadata
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .clone(),
+            )),
+        }
+    }
+
+    /// Why one relayed DTLS datagram stage was interrupted.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum DtlsRelayInterruptForTest {
+        AuthorizationExpired(crate::proxy::auth_lifetime::StreamAuthTermination),
+        TrustWithdrawn,
+    }
+
+    /// Race one DTLS client→backend stage — receive, an awaited per-datagram
+    /// hook, or the backend application-datagram commit — against BOTH
+    /// post-admission bounds, the exact seam the relay uses.
+    pub async fn dtls_c2b_under_bounds_for_test<F>(
+        plan: Option<crate::proxy::auth_lifetime::StreamAuthDeadline>,
+        latch: &crate::proxy::auth_lifetime::StreamAuthTerminationLatch,
+        trust: &DtlsTrustFenceForTest,
+        stage: F,
+    ) -> Result<F::Output, DtlsRelayInterruptForTest>
+    where
+        F: std::future::Future,
+    {
+        let metadata = std::sync::Mutex::new(HashMap::new());
+        crate::proxy::udp_proxy::dtls_c2b_under_bounds(plan, latch, &metadata, &trust.0, stage)
+            .await
+            .map_err(|interrupt| match interrupt {
+                crate::proxy::udp_proxy::DtlsRelayInterrupt::AuthorizationExpired(termination) => {
+                    DtlsRelayInterruptForTest::AuthorizationExpired(termination)
+                }
+                crate::proxy::udp_proxy::DtlsRelayInterrupt::TrustWithdrawn => {
+                    DtlsRelayInterruptForTest::TrustWithdrawn
+                }
+            })
+    }
+
+    /// Outcome of one accepted-DTLS backend→client datagram after its hook
+    /// chain is raced against both post-admission bounds.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum DtlsReplyDatagramCommitForTest {
+        Commit,
+        Drop,
+        AuthorizationExpired(crate::proxy::auth_lifetime::StreamAuthTermination),
+        TrustWithdrawn,
+    }
+
+    /// Run the production accepted-DTLS backend→client hook chain under both
+    /// post-admission bounds. A still-pending hook is dropped when either bound
+    /// wins.
+    pub async fn dtls_reply_commit_after_backend_hooks_for_test(
+        plugins: &[Arc<dyn Plugin>],
+        payload: &[u8],
+        plan: Option<crate::proxy::auth_lifetime::StreamAuthDeadline>,
+        trust: &DtlsTrustFenceForTest,
+    ) -> DtlsReplyDatagramCommitForTest {
+        let ctx = crate::plugins::UdpDatagramContext {
+            client_ip: Arc::from("127.0.0.1"),
+            proxy_id: Arc::from("dtls-proxy"),
+            proxy_name: None,
+            listen_port: 5301,
+            datagram_size: payload.len(),
+            direction: crate::plugins::UdpDatagramDirection::BackendToClient,
+            payload,
+            payload_kind: crate::plugins::StreamBytesKind::DecryptedApp,
+            metadata_sink: None,
+        };
+        match crate::proxy::udp_proxy::dtls_reply_commit_after_backend_hooks(
+            plugins, &ctx, plan, &trust.0,
+        )
+        .await
+        {
+            crate::proxy::udp_proxy::DtlsReplyDatagramCommit::Commit => {
+                DtlsReplyDatagramCommitForTest::Commit
+            }
+            crate::proxy::udp_proxy::DtlsReplyDatagramCommit::Drop => {
+                DtlsReplyDatagramCommitForTest::Drop
+            }
+            crate::proxy::udp_proxy::DtlsReplyDatagramCommit::AuthorizationExpired(termination) => {
+                DtlsReplyDatagramCommitForTest::AuthorizationExpired(termination)
+            }
+            crate::proxy::udp_proxy::DtlsReplyDatagramCommit::TrustWithdrawn => {
+                DtlsReplyDatagramCommitForTest::TrustWithdrawn
+            }
         }
     }
 
@@ -9129,6 +9548,15 @@ pub mod _test_support {
         )
     }
 
+    /// Whether one UDP datagram may open a new frontend DTLS demux session.
+    ///
+    /// Only the initial fragment of a ClientHello is admitted. Later handshake
+    /// records from an unknown peer (a refused client's Certificate/Finished
+    /// retransmits) must not reserve a handshake-timeout slot.
+    pub fn dtls_datagram_opens_session_for_test(data: &[u8]) -> bool {
+        crate::dtls::dtls_datagram_opens_session_for_test(data)
+    }
+
     /// External regression coverage for issue #2959 (DTLS demux identity-aware
     /// session removal). See
     /// [`crate::dtls::dtls_stale_session_removal_preserves_newer_generation_for_test`].
@@ -9234,6 +9662,21 @@ pub mod _test_support {
         F: std::future::Future,
     {
         crate::dtls::frontend_app_ciphertext_send_until_expiry_for_test(deadline, cancel, send)
+            .await
+            .map_err(map_frontend_app_send_reject_for_test)
+    }
+
+    /// Race one post-registration DTLS delivery (plaintext, accept handoff, or
+    /// UDP write) against frontend client-trust retirement. Unauthenticated
+    /// sessions pass `None` and must not poll a retirement future.
+    pub async fn frontend_trust_raced_delivery_for_test<F>(
+        client_trust: Option<&crate::tls::ClientTrustSession>,
+        op: F,
+    ) -> Result<F::Output, FrontendAppSendRejectForTest>
+    where
+        F: std::future::Future,
+    {
+        crate::dtls::frontend_trust_raced_delivery_for_test(client_trust, op)
             .await
             .map_err(map_frontend_app_send_reject_for_test)
     }

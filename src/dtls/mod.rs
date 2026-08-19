@@ -338,6 +338,57 @@ where
     }
 }
 
+/// Race one potentially-blocking delivery against frontend client-trust
+/// retirement. Used after a DTLS client-certificate session is registered so
+/// a full plaintext, accept, or UDP channel cannot pin the session past
+/// withdrawal (issue #3857).
+///
+/// A withdrawal that is already visible never polls `op`. One that becomes
+/// ready together with `op` wins the biased race and drops `op` before it
+/// can complete, so no new application plaintext is delivered to the proxy
+/// and no additional application ciphertext is committed to the client.
+/// Unauthenticated / static DTLS (`client_trust == None`) awaits `op` with
+/// no retirement future.
+async fn frontend_trust_raced_delivery<F>(
+    client_trust: Option<&crate::tls::ClientTrustSession>,
+    op: F,
+) -> Result<F::Output, FrontendAppSendReject>
+where
+    F: std::future::Future,
+{
+    let Some(session) = client_trust else {
+        return Ok(op.await);
+    };
+    if session.is_retired() {
+        return Err(FrontendAppSendReject::Closed);
+    }
+    tokio::select! {
+        biased;
+        _ = session.retired() => Err(FrontendAppSendReject::Closed),
+        result = op => Ok(result),
+    }
+}
+
+/// Add the established frontend client-trust retirement fence to one bounded
+/// ciphertext write. A withdrawal that is already visible never polls `send`;
+/// one that becomes ready together with the socket write wins the biased race
+/// and drops that write future before it can commit a datagram.
+async fn frontend_app_ciphertext_send_until_expiry_and_trust<F>(
+    deadline: Option<tokio::time::Instant>,
+    cancel: Option<&mut oneshot::Receiver<()>>,
+    client_trust: Option<&crate::tls::ClientTrustSession>,
+    send: F,
+) -> Result<F::Output, FrontendAppSendReject>
+where
+    F: std::future::Future,
+{
+    frontend_trust_raced_delivery(
+        client_trust,
+        frontend_app_ciphertext_send_until_expiry(deadline, cancel, send),
+    )
+    .await?
+}
+
 fn fail_queued_frontend_app_sends(
     app_in_rx: &mut mpsc::Receiver<FrontendAppSend>,
     session_deadline: Option<tokio::time::Instant>,
@@ -364,12 +415,14 @@ async fn write_connected_frontend_record(
     reply_local: Option<crate::socket_opts::PktinfoLocal>,
     in_flight: Option<&mut InFlightFrontendAppSend>,
     session_deadline: Option<tokio::time::Instant>,
+    client_trust: Option<&crate::tls::ClientTrustSession>,
 ) -> Result<(), FrontendAppSendReject> {
     if let Some(inflight) = in_flight {
         let deadline = earliest_frontend_app_send_deadline(inflight.deadline, session_deadline);
-        match frontend_app_ciphertext_send_until_expiry(
+        match frontend_app_ciphertext_send_until_expiry_and_trust(
             deadline,
             Some(&mut inflight.cancel),
+            client_trust,
             send_dtls_record(socket, data, peer, reply_local),
         )
         .await
@@ -379,9 +432,10 @@ async fn write_connected_frontend_record(
             Err(reject) => Err(reject),
         }
     } else {
-        match frontend_app_ciphertext_send_until_expiry(
+        match frontend_app_ciphertext_send_until_expiry_and_trust(
             session_deadline,
             None,
+            client_trust,
             send_dtls_record(socket, data, peer, reply_local),
         )
         .await
@@ -439,6 +493,19 @@ where
     F: std::future::Future,
 {
     frontend_app_ciphertext_send_until_expiry(deadline, cancel, send).await
+}
+
+/// Pin the post-registration trust-retirement race used for plaintext
+/// delivery, accept handoff, and UDP writes.
+#[allow(dead_code)] // used through library `_test_support`
+pub(crate) async fn frontend_trust_raced_delivery_for_test<F>(
+    client_trust: Option<&crate::tls::ClientTrustSession>,
+    op: F,
+) -> Result<F::Output, FrontendAppSendReject>
+where
+    F: std::future::Future,
+{
+    frontend_trust_raced_delivery(client_trust, op).await
 }
 
 /// Pin the bounded, credential-free reject strings.
@@ -514,6 +581,14 @@ pub struct FrontendDtlsConfig {
     pub dimpl_config: Arc<Config>,
     pub certificate: DtlsCertificateChain,
     pub client_cert_verifier: Option<Arc<dyn rustls::server::danger::ClientCertVerifier>>,
+    /// Semantic client-CA / CRL identity of THIS generation (issue #3857).
+    ///
+    /// Derived from the exact bytes this candidate's verifier was built from, so
+    /// the retirement decision published for established DTLS sessions can never
+    /// describe material that was not the material actually accepted. `None`
+    /// when the listener performs no client-certificate verification, in which
+    /// case no session can hold a withdrawable trust decision.
+    pub client_trust: Option<crate::tls::ClientTrustMaterial>,
 }
 
 /// Datagrams drained per `recvmmsg` call on the ingress-interface capture path.
@@ -550,6 +625,9 @@ pub struct FrontendDtlsGeneration {
     pub config: FrontendDtlsConfig,
 }
 
+/// Source-attribution callback for new frontend DTLS sessions.
+pub type DtlsNewSessionAuthorizer = dyn Fn(SocketAddr, Option<u32>) -> bool + Send + Sync + 'static;
+
 /// Admission controls for the frontend DTLS demuxer.
 #[derive(Clone)]
 pub struct DtlsServerLimits {
@@ -561,6 +639,13 @@ pub struct DtlsServerLimits {
     pub handshake_timeout: Option<Duration>,
     /// Optional gate checked before allocating per-peer handshake state.
     pub allow_new_session: Option<Arc<dyn Fn() -> bool + Send + Sync + 'static>>,
+    /// Optional source-attribution gate checked before a new peer's handshake
+    /// driver is spawned and therefore before any handshake response can be
+    /// emitted. The callback receives the socket peer and kernel-reported
+    /// ingress interface. NodeWaypoint listeners use this to ensure the
+    /// marked server socket never sends a pre-authentication response to an
+    /// unattributable or source-mismatched peer.
+    pub authorize_new_session: Option<Arc<DtlsNewSessionAuthorizer>>,
     /// Optional diagnostic mirror for surfaces that need to report demux state
     /// outside this server object, such as the admin `/overload` endpoint. This
     /// is eventually consistent with `active_sessions` and is not used for
@@ -629,6 +714,46 @@ pub struct DtlsServerLimits {
     /// record for the same proxy. Cloned once at listener spawn, never per
     /// datagram. `None` outside the proxy listener path.
     pub datagram_client_address_listener: Option<(Arc<str>, u16)>,
+    /// Client-trust retirement domain this listener's authenticated sessions
+    /// join (issues #3857, #3858).
+    ///
+    /// `Some(ClientTrustScope::FrontendDtls)` for every operator-owned
+    /// `FERRUM_DTLS_*` listener, which is the default. `None` for generated
+    /// `MeshNodeWaypoint` listeners: their trust anchors are owned by the mesh
+    /// slice, `swap_active_dtls_frontend_config` deliberately skips them, and
+    /// `publish_mesh_node_waypoint_dtls_generation` publishes no trust material
+    /// — so registering their sessions in the operator domain would let an
+    /// unrelated operator CRL edit retire mesh datapath sessions and count them
+    /// under `scope="frontend_dtls"`, while a mesh-side narrowing retired
+    /// nothing. `None` therefore means "this listener's sessions are not
+    /// retirable by any published generation", which is exactly the mesh
+    /// posture today.
+    pub client_trust_scope: Option<crate::tls::ClientTrustScope>,
+}
+
+/// Owner-scoped client-trust retirement domain for a DTLS listener (issues
+/// #3857, #3858).
+///
+/// One place, so the listener spawn path and the retirement domain cannot
+/// disagree about which listeners an operator `FERRUM_DTLS_*` publication may
+/// retire. `is_node_waypoint` is the same discriminator the listener already
+/// uses for its scoped socket options.
+///
+/// A generated `MeshNodeWaypoint` listener gets `None`: its posture is owned by
+/// the mesh slice, `StreamListenerManager::swap_active_dtls_frontend_config`
+/// deliberately skips it, and `publish_mesh_node_waypoint_dtls_generation`
+/// publishes no trust material. Putting its sessions in the operator domain
+/// would let an unrelated operator CRL edit retire mesh datapath sessions and
+/// count them under `scope="frontend_dtls"`, while a mesh-side narrowing
+/// retired nothing.
+pub fn dtls_client_trust_scope_for_owner(
+    is_node_waypoint: bool,
+) -> Option<crate::tls::ClientTrustScope> {
+    if is_node_waypoint {
+        None
+    } else {
+        Some(crate::tls::ClientTrustScope::FrontendDtls)
+    }
 }
 
 impl Default for DtlsServerLimits {
@@ -637,6 +762,7 @@ impl Default for DtlsServerLimits {
             max_sessions: None,
             handshake_timeout: Some(DEFAULT_DTLS_HANDSHAKE_TIMEOUT),
             allow_new_session: None,
+            authorize_new_session: None,
             active_session_mirror: None,
             capture_ingress_ifindex: false,
             socket_mark: None,
@@ -644,6 +770,7 @@ impl Default for DtlsServerLimits {
             datagram_client_address: None,
             datagram_client_address_drops: None,
             datagram_client_address_listener: None,
+            client_trust_scope: dtls_client_trust_scope_for_owner(false),
         }
     }
 }
@@ -843,24 +970,51 @@ pub fn build_frontend_dtls_config(
 ) -> Result<FrontendDtlsConfig, anyhow::Error> {
     let certificate = load_dtls_certificate(cert_path, key_path)?;
 
-    let (require_client_cert, client_cert_verifier) = if let Some(ca_path) = client_ca_cert_path {
-        let root_store = load_root_store_from_pem(ca_path)?;
-        let mut verifier_builder =
-            rustls::server::WebPkiClientVerifier::builder(Arc::new(root_store));
-        if !crls.is_empty() {
-            verifier_builder = verifier_builder
-                .with_crls(crls.iter().cloned())
-                .allow_unknown_revocation_status()
-                .only_check_end_entity_revocation();
-        }
-        let verifier = verifier_builder
-            .build()
-            .map_err(|e| anyhow::anyhow!("Failed to build DTLS client verifier: {}", e))?;
-        debug!("Frontend DTLS mTLS enabled: requiring and verifying client certificates");
-        (true, Some(verifier))
-    } else {
-        (false, None)
-    };
+    let (require_client_cert, client_cert_verifier, client_trust) =
+        if let Some(ca_path) = client_ca_cert_path {
+            // ONE bounded read of the declared client-CA source, through the
+            // repository's `CertSource` abstraction (issue #3857). Both the
+            // trust anchors the verifier enforces and the semantic identity
+            // published for this generation come out of that single read.
+            //
+            // Reading the path twice — once with `std::fs::read` for the
+            // identity and once through `load_root_store_from_pem` for the
+            // store — could observe a rotation in between and publish identity
+            // A while serving verifier B. Going through `CertSource` also keeps
+            // the hostile-input ceiling (`FERRUM_TLS_MAX_MATERIAL_SIZE_BYTES`)
+            // and makes an inline / non-file client-CA source work at all,
+            // which a raw path read silently could not.
+            let loaded = load_pem_root_store(ca_path)?;
+            let client_trust = crate::tls::ClientTrustMaterial::from_parts(
+                Some(loaded.material.bytes.expose_secret()),
+                crls,
+            )
+            .map_err(|e| {
+                // Source-redacted: a client-CA source may be inline PEM, so the
+                // configured "path" can itself be secret material.
+                anyhow::anyhow!(
+                    "Invalid DTLS client CA bundle from source {}: {}",
+                    loaded.material.display_source_id,
+                    e
+                )
+            })?;
+            let root_store = loaded.roots;
+            let mut verifier_builder =
+                rustls::server::WebPkiClientVerifier::builder(Arc::new(root_store));
+            if !crls.is_empty() {
+                verifier_builder = verifier_builder
+                    .with_crls(crls.iter().cloned())
+                    .allow_unknown_revocation_status()
+                    .only_check_end_entity_revocation();
+            }
+            let verifier = verifier_builder
+                .build()
+                .map_err(|e| anyhow::anyhow!("Failed to build DTLS client verifier: {}", e))?;
+            debug!("Frontend DTLS mTLS enabled: requiring and verifying client certificates");
+            (true, Some(verifier), Some(client_trust))
+        } else {
+            (false, None, None)
+        };
 
     let config_builder = Config::builder().require_client_certificate(require_client_cert);
     let config = Arc::new(
@@ -873,6 +1027,7 @@ pub fn build_frontend_dtls_config(
         dimpl_config: config,
         certificate,
         client_cert_verifier,
+        client_trust,
     })
 }
 
@@ -906,6 +1061,65 @@ fn client_send_output_drain_needs_another_round(
         && !socket_send_failed
         && !fatal_send_failed
         && drain_round_exhausted
+}
+
+/// Whether `data` can open a new DTLS demux session.
+///
+/// The recv loop previously spawned on any 13-byte handshake record
+/// (`content-type == 0x16`). After a refused client certificate the peer keeps
+/// retransmitting flight 5 (`Certificate` / `CertificateVerify` / `Finished`),
+/// which are also `0x16`. Each of those datagrams reserved a `handshake_timeout`
+/// slot, allocated four channels, and started a driver whose `Dtls::new_auto`
+/// engine then failed on a non-ClientHello — a spawn storm that, under coverage
+/// instrumentation, delayed the next legitimate ClientHello past its budget,
+/// and a leftover unconnected session at the same UDP 4-tuple would swallow a
+/// later client's opening flight instead of starting a new handshake.
+///
+/// Only the initial fragment of a ClientHello (`msg_type == 0x01`,
+/// `fragment_offset == 0`) starts a session. Continuation fragments and later
+/// handshake messages from an unknown peer are dropped; DTLS retransmission of
+/// a real ClientHello recovers loss. HelloVerifyRequest cookie retries are
+/// ClientHellos too, so they still open (or continue) a session.
+fn dtls_datagram_opens_session(data: &[u8]) -> bool {
+    // DTLS record header: content_type (1) + version (2) + epoch (2) +
+    //                     sequence_number (6) + length (2) = 13 bytes
+    if data.len() < 13 || data[0] != 0x16 || data[3] != 0 || data[4] != 0 {
+        return false;
+    }
+    let record_len = u16::from_be_bytes([data[11], data[12]]) as usize;
+    let Some(record_end) = 13usize.checked_add(record_len) else {
+        return false;
+    };
+    let Some(handshake) = data.get(13..record_end) else {
+        return false;
+    };
+    // DTLS handshake header: msg_type (1) + length (3) + message_seq (2) +
+    //                        fragment_offset (3) + fragment_length (3) = 12 bytes
+    if handshake.len() < 12 {
+        return false;
+    }
+    // msg_type 0x01 = ClientHello. Certificate (0x0b), Finished (0x14), and
+    // every other handshake type must not reserve a session for an unknown peer.
+    if handshake[0] != 0x01 {
+        return false;
+    }
+    let fragment_offset =
+        ((handshake[6] as usize) << 16) | ((handshake[7] as usize) << 8) | (handshake[8] as usize);
+    let message_len =
+        ((handshake[1] as usize) << 16) | ((handshake[2] as usize) << 8) | (handshake[3] as usize);
+    let fragment_len = ((handshake[9] as usize) << 16)
+        | ((handshake[10] as usize) << 8)
+        | (handshake[11] as usize);
+    fragment_offset == 0
+        && fragment_len != 0
+        && fragment_len <= message_len
+        && fragment_len <= handshake.len() - 12
+}
+
+/// Pin the ClientHello-only demux admission predicate for external hosted tests.
+#[allow(dead_code)] // used through library `_test_support`
+pub(crate) fn dtls_datagram_opens_session_for_test(data: &[u8]) -> bool {
+    dtls_datagram_opens_session(data)
 }
 
 /// Pin the fairness-boundary decision for external hosted tests without
@@ -1391,10 +1605,12 @@ impl Drop for DtlsConnection {
 /// frontend DTLS live reload (`FERRUM_FRONTEND_TLS_LIVE_RELOAD_ENABLED` /
 /// `FERRUM_DTLS_*` generation publish) and owner-scoped NodeWaypoint mesh
 /// DTLS publish can publish a new `dimpl_config`, `certificate`, and client
-/// verifier without dropping in-flight DTLS sessions. New sessions snapshot
-/// the slot in [`DtlsServer::spawn_session`]; existing sessions retain the
-/// material they were spawned with until they end. Mesh PeerAuthentication
-/// TCP+TLS reload must not write this slot as a process-wide fanout:
+/// verifier without mutating the snapshot held by in-flight DTLS sessions. New
+/// sessions snapshot the slot in [`DtlsServer::spawn_session`]; existing
+/// sessions retain the material they were spawned with. An ordinary frontend
+/// client-trust narrowing can separately retire authenticated sessions through
+/// [`crate::tls::client_trust`]. Mesh PeerAuthentication TCP+TLS reload must not
+/// write this slot as a process-wide fanout:
 /// generated NodeWaypoint listeners are swapped only through the owner-scoped
 /// generation, and ordinary `FERRUM_DTLS_*` listeners keep their dedicated
 /// identity.
@@ -1681,6 +1897,25 @@ pub struct DtlsServerConn {
     /// `send_to` is owned by that bound. Unauthenticated sessions never set
     /// this.
     auth_deadline: Arc<FrontendSessionAuthDeadline>,
+    /// The registered frontend client-trust decision this session was admitted
+    /// under (issue #3857), or `None` for an anonymous / static DTLS session
+    /// that presented no gateway-verified client certificate.
+    ///
+    /// The session driver's own fences (plaintext delivery, accept handoff,
+    /// ciphertext sends) end the DRIVER, and its channels close. That is not a
+    /// retirement fence for the detached handler this connection is delivered
+    /// to: once `accept_tx.send` completed, that handler runs arbitrary awaited
+    /// `on_stream_connect` hooks, DNS resolution, a backend dial, a backend DTLS
+    /// handshake, and two relay tasks — every one of which can be parked across
+    /// a withdrawal and then continue. Carrying the registered session here is
+    /// what gives the handler the same bound the driver has.
+    ///
+    /// This is a cheap `Arc` clone of a process-local handle: it holds no
+    /// certificate, no trust material, and no generation a consumer can log. It
+    /// keeps the transport visible to a later sweep until the last handle drops,
+    /// which is the same lifetime rule an upgraded WebSocket relies on;
+    /// deregistration still happens exactly once, when the last handle goes.
+    client_trust: Option<crate::tls::ClientTrustSession>,
     /// DER-encoded client leaf certificate from the DTLS handshake.
     /// Populated when the client presents a certificate during mutual DTLS authentication.
     pub tls_client_cert_der: Option<Arc<Vec<u8>>>,
@@ -1767,6 +2002,16 @@ impl DtlsServerConn {
         rx.recv()
             .await
             .ok_or_else(|| anyhow::anyhow!("DTLS server connection closed"))
+    }
+
+    /// The registered frontend client-trust session this connection was
+    /// admitted under, or `None` for an anonymous / static DTLS session.
+    ///
+    /// The accepted-session handler clones this once and carries it as its
+    /// post-admission trust fence: a `None` here means the handler arms no
+    /// retirement future at all and keeps its previous behaviour.
+    pub fn client_trust_session(&self) -> Option<&crate::tls::ClientTrustSession> {
+        self.client_trust.as_ref()
     }
 
     /// Get a cloneable sender for this connection, allowing another task
@@ -1931,9 +2176,10 @@ impl DtlsServer {
     /// Used by frontend DTLS live reload (`FERRUM_FRONTEND_TLS_LIVE_RELOAD_ENABLED`)
     /// and owner-scoped NodeWaypoint DTLS publish to rotate the inbound DTLS
     /// `ServerConfig` equivalent (dimpl `Config` + certificate + optional
-    /// `ClientCertVerifier`) without re-binding the socket or evicting any
-    /// in-flight session. Active sessions keep the snapshot they handshake
-    /// with until they end (see
+    /// `ClientCertVerifier`) without re-binding the socket or mutating any
+    /// in-flight session's snapshot. Active sessions keep the snapshot they
+    /// handshake with; an ordinary frontend client-trust narrowing can
+    /// separately retire authenticated sessions through the trust fence (see
     /// [`DtlsServerActiveConfig`] doc-comment for the invariant). Mesh
     /// PeerAuthentication TCP+TLS reload must not call this as a process-wide
     /// fanout: ordinary operator listeners keep their dedicated `FERRUM_DTLS_*`
@@ -2264,7 +2510,7 @@ impl DtlsServer {
                         "DTLS session channel full; dropping datagram"
                     );
                 }
-                Err(mpsc::error::TrySendError::Closed(_)) => {
+                Err(mpsc::error::TrySendError::Closed(data)) => {
                     // Driver task exited — remove this generation only.
                     // A replacement may already occupy the peer address.
                     remove_session(
@@ -2274,21 +2520,31 @@ impl DtlsServer {
                         &peer_addr,
                         generation,
                     );
+                    // A ClientHello that raced the teardown would otherwise be
+                    // dropped, forcing the peer to wait for its retransmit
+                    // timer. If this generation still owned the map entry,
+                    // start the replacement handshake from this datagram
+                    // instead of waiting. A newer generation already in the
+                    // map must not be replaced.
+                    if self.sessions.get(&peer_addr).is_none() && dtls_datagram_opens_session(&data)
+                    {
+                        self.spawn_session(peer_addr, data, reply_local, forwarded_client);
+                    }
                 }
             }
-        } else if len >= 13 && data[0] == 0x16 {
-            // New client — spawn a session driver. Only for datagrams that
-            // plausibly start a DTLS handshake (content-type 0x16 with a
-            // full 13-byte record header): spawning reserves a
+        } else if dtls_datagram_opens_session(&data) {
+            // New client — spawn a session driver. Only the initial fragment
+            // of a ClientHello starts a handshake: spawning reserves a
             // `max_sessions` slot, allocates four channels, and holds the
-            // slot for the handshake timeout, so arbitrary garbage from
-            // scanners or spoofed floods must not reach it.
+            // slot for the handshake timeout, so later handshake records
+            // (a refused peer's Certificate/Finished retransmits) and
+            // scanner garbage must not reach it.
             self.spawn_session(peer_addr, data, reply_local, forwarded_client);
         } else {
             trace!(
                 client = %peer_addr,
                 len,
-                "DTLS: dropping non-handshake datagram from unknown source"
+                "DTLS: dropping non-ClientHello datagram from unknown source"
             );
         }
     }
@@ -2311,6 +2567,15 @@ impl DtlsServer {
         reply_local: Option<crate::socket_opts::PktinfoLocal>,
         forwarded_client: Option<SocketAddr>,
     ) {
+        if let Some(ref authorize) = self.limits.authorize_new_session
+            && !authorize(peer_addr, reply_local.map(|local| local.ifindex))
+        {
+            trace!(
+                client = %peer_addr,
+                "DTLS new session rejected by source-attribution gate"
+            );
+            return;
+        }
         if let Some(ref allow) = self.limits.allow_new_session
             && !allow()
         {
@@ -2379,6 +2644,23 @@ impl DtlsServer {
             },
         );
 
+        // Issue #3857: capture the frontend DTLS client-trust generation BEFORE
+        // snapshotting the crypto material this session handshakes with. The
+        // publisher swaps the material into every active `DtlsServer` and only
+        // then advances the generation, so reading in this order guarantees the
+        // captured generation is at or older than the verifier actually used —
+        // a session can never claim a post-withdrawal generation while running
+        // the withdrawn verifier.
+        //
+        // The scope comes from the listener's owner (issue #3858), never a
+        // hard-coded constant: a generated `MeshNodeWaypoint` listener carries
+        // `None` and so registers nothing, because its trust material is
+        // published by the mesh slice and not by the operator `FERRUM_DTLS_*`
+        // generation this domain tracks.
+        let client_trust_admission = self
+            .limits
+            .client_trust_scope
+            .and_then(crate::tls::client_trust::capture);
         // Snapshot the swappable crypto material once per session so the
         // running handshake / session cannot observe a partial rotation.
         let active = self.active_config.load_full();
@@ -2416,6 +2698,12 @@ impl DtlsServer {
             let mut connected = false;
             let mut peer_cert_der: Option<Arc<Vec<u8>>> = None;
             let mut peer_cert_chain_der: Option<Arc<Vec<Vec<u8>>>> = None;
+            // Frontend client-trust registration for this session (issue #3857).
+            // The Option is the live owner from spawn start to teardown: `None`
+            // means "not yet admitted" and is observed every select iteration,
+            // then replaced once by the guard after a verified client
+            // certificate. Dropping the guard on any exit path deregisters it.
+            let mut client_trust_guard: Option<crate::tls::ClientTrustSessionGuard> = None;
             // Whether a client certificate was actually presented AND verified
             // against the configured client CA during the handshake. dimpl's
             // `require_client_certificate(true)` only makes the server SEND a
@@ -2458,6 +2746,13 @@ impl DtlsServer {
                 }
             }
 
+            // Whether this driver is leaving because frontend client-certificate
+            // trust was withdrawn (issue #3857). Distinct from ordinary
+            // shutdown / handshake timeout / max-lifetime: the post-loop drain
+            // must not emit queued packets after this retirement even when the
+            // session authorization deadline has not elapsed.
+            let mut retired_by_trust_withdrawal = false;
+
             loop {
                 // Check the handshake deadline at the top of each iteration so
                 // a sustained datagram flood cannot starve the timeout arm
@@ -2484,6 +2779,28 @@ impl DtlsServer {
                 let mut in_flight: Option<InFlightFrontendAppSend> = None;
 
                 tokio::select! {
+                    biased;
+                    // Frontend client-certificate trust withdrawn (issue
+                    // #3857). This authority decision is polled before queued
+                    // application data; the socket-write helper below repeats
+                    // the same fence across an in-flight `send_to`.
+                    _ = async {
+                        match client_trust_guard.as_ref() {
+                            Some(guard) => guard.session().retired().await,
+                            None => std::future::pending().await,
+                        }
+                    } => {
+                        warn!(
+                            client = %peer_addr,
+                            "Retiring established DTLS session: frontend client-certificate trust was withdrawn"
+                        );
+                        retired_by_trust_withdrawal = true;
+                        fail_queued_frontend_app_sends(
+                            &mut app_in_rx,
+                            auth_deadline.get(),
+                        );
+                        break;
+                    }
                     // Application data to send back to this client. Success is
                     // reported only after every produced ciphertext datagram is
                     // accepted by the UDP socket, not at channel enqueue.
@@ -2500,6 +2817,29 @@ impl DtlsServer {
                             deadline,
                             session_deadline,
                         );
+                        if let Some(session) = client_trust_guard
+                            .as_ref()
+                            .map(|guard| guard.session())
+                            && session.is_retired()
+                        {
+                            // Fail closed on the ciphertext-send gate, but do not
+                            // record the fixed-cardinality fence counter here:
+                            // an accepted stream's detached handler owns
+                            // once-only stream accounting through
+                            // `DtlsClientTrustFence::settle_withdrawal` and will
+                            // settle this same withdrawal. Pre-accept driver
+                            // sites still record directly because no handler can
+                            // own those refused streams.
+                            retired_by_trust_withdrawal = true;
+                            let _ = completion.send(Err(
+                                crate::tls::client_trust::TRUST_WITHDRAWN_REASON.to_string(),
+                            ));
+                            fail_queued_frontend_app_sends(
+                                &mut app_in_rx,
+                                auth_deadline.get(),
+                            );
+                            break;
+                        }
                         match admit_frontend_app_send(
                             cancelled,
                             effective,
@@ -2593,11 +2933,27 @@ impl DtlsServer {
                                     // Handshake/control records leave from this
                                     // session's pinned reply source on a scoped
                                     // listener. Ordinary listeners pass None
-                                    // and keep send_to byte for byte.
-                                    let _ = send_dtls_record(&socket, data, peer_addr, reply_local)
-                                        .await;
-                                    drain_round_exhausted = false;
-                                    continue;
+                                    // and keep send_to byte for byte. Race the
+                                    // write against trust withdrawal after
+                                    // registration so retirement stays final.
+                                    match frontend_trust_raced_delivery(
+                                        client_trust_guard.as_ref().map(|guard| guard.session()),
+                                        send_dtls_record(&socket, data, peer_addr, reply_local),
+                                    )
+                                    .await
+                                    {
+                                        Ok(_) => {
+                                            drain_round_exhausted = false;
+                                            continue;
+                                        }
+                                        Err(_) => {
+                                            fail_queued_frontend_app_sends(
+                                                &mut app_in_rx,
+                                                auth_deadline.get(),
+                                            );
+                                            return;
+                                        }
+                                    }
                                 }
                                 match write_connected_frontend_record(
                                     &socket,
@@ -2606,6 +2962,7 @@ impl DtlsServer {
                                     reply_local,
                                     in_flight.as_mut(),
                                     auth_deadline.get(),
+                                    client_trust_guard.as_ref().map(|guard| guard.session()),
                                 )
                                 .await
                                 {
@@ -2614,6 +2971,12 @@ impl DtlsServer {
                                     }
                                     Err(reject) => {
                                         discard_app_ciphertext = true;
+                                        if client_trust_guard
+                                            .as_ref()
+                                            .is_some_and(|guard| guard.session().is_retired())
+                                        {
+                                            retired_by_trust_withdrawal = true;
+                                        }
                                         if let Some(inflight) = in_flight.take() {
                                             let _ = inflight
                                                 .completion
@@ -2645,6 +3008,30 @@ impl DtlsServer {
                                         client = %peer_addr,
                                         "DTLS frontend mTLS required but client presented no verified certificate; dropping session"
                                     );
+                                    refuse_dtls_handshake(
+                                        &mut dtls,
+                                        socket.as_ref(),
+                                        peer_addr,
+                                        reply_local,
+                                        &mut out_buf,
+                                    )
+                                    .await;
+                                    fail_queued_frontend_app_sends(
+                                        &mut app_in_rx,
+                                        auth_deadline.get(),
+                                    );
+                                    return;
+                                }
+                                // Close the interval between certificate-chain
+                                // validation and connection delivery. A withdrawal
+                                // that lands after registration but before this
+                                // `Connected` output must fence the session before
+                                // the proxy can observe it through `accept()`.
+                                if let Some(session) =
+                                    client_trust_guard.as_ref().map(|guard| guard.session())
+                                    && session.is_retired()
+                                {
+                                    session.record_fenced();
                                     fail_queued_frontend_app_sends(
                                         &mut app_in_rx,
                                         auth_deadline.get(),
@@ -2655,23 +3042,51 @@ impl DtlsServer {
                                 let Some(rx) = app_out_rx.take() else {
                                     continue; // Already connected — should not happen
                                 };
+                                // The accepted connection carries this session's
+                                // registered trust decision (issue #3857). The
+                                // accept handoff below is committed BEFORE the
+                                // server's queued final flight is drained, and
+                                // the proxy handler it wakes runs plugin hooks,
+                                // DNS, and a backend dial that this driver
+                                // cannot fence — so the fence travels with the
+                                // connection rather than staying behind in the
+                                // driver's channels. `None` for anonymous /
+                                // static DTLS, which arms nothing.
                                 let conn = DtlsServerConn {
                                     app_tx: app_in_tx.clone(),
                                     app_rx: tokio::sync::Mutex::new(rx),
                                     shutdown_tx: shutdown_tx.clone(),
                                     auth_deadline: auth_deadline.clone(),
+                                    client_trust: client_trust_guard
+                                        .as_ref()
+                                        .map(|guard| guard.session().clone()),
                                     tls_client_cert_der: peer_cert_der.clone(),
                                     tls_client_cert_chain_der: peer_cert_chain_der.clone(),
                                     sni_hostname: sni_hostname.clone(),
                                     ingress_ifindex,
                                     forwarded_client_addr: forwarded_client,
                                 };
-                                if accept_tx.send((conn, peer_addr)).await.is_err() {
-                                    fail_queued_frontend_app_sends(
-                                        &mut app_in_rx,
-                                        auth_deadline.get(),
-                                    );
-                                    return;
+                                match frontend_trust_raced_delivery(
+                                    client_trust_guard.as_ref().map(|guard| guard.session()),
+                                    accept_tx.send((conn, peer_addr)),
+                                )
+                                .await
+                                {
+                                    Ok(Ok(())) => {}
+                                    Ok(Err(_)) => {
+                                        fail_queued_frontend_app_sends(
+                                            &mut app_in_rx,
+                                            auth_deadline.get(),
+                                        );
+                                        return;
+                                    }
+                                    Err(_) => {
+                                        fail_queued_frontend_app_sends(
+                                            &mut app_in_rx,
+                                            auth_deadline.get(),
+                                        );
+                                        return;
+                                    }
                                 }
                             }
                             Output::PeerCert(der) => {
@@ -2683,6 +3098,14 @@ impl DtlsServer {
                                 if let Some(verifier) = client_cert_verifier.as_deref() {
                                     if let Err(e) = validate_client_cert(&chain, verifier) {
                                         warn!(client = %peer_addr, "Client cert validation failed: {}", e);
+                                        refuse_dtls_handshake(
+                                            &mut dtls,
+                                            socket.as_ref(),
+                                            peer_addr,
+                                            reply_local,
+                                            &mut out_buf,
+                                        )
+                                        .await;
                                         fail_queued_frontend_app_sends(
                                             &mut app_in_rx,
                                             auth_deadline.get(),
@@ -2692,20 +3115,78 @@ impl DtlsServer {
                                     // A client certificate was presented and verified
                                     // against the configured client CA.
                                     verified_peer_cert = true;
+                                    // Only now does this session hold a trust
+                                    // decision a CRL / client-CA withdrawal can
+                                    // revoke, so this is where it joins the
+                                    // retirement domain (issue #3857). Registration
+                                    // re-checks the fence against the generation
+                                    // captured at session start, so a withdrawal
+                                    // published while this handshake was running
+                                    // retires the session immediately instead of
+                                    // letting it repopulate the domain behind the
+                                    // sweep.
+                                    if client_trust_guard.is_none() {
+                                        client_trust_guard = client_trust_admission
+                                            .and_then(|admission| admission.register(true));
+                                    }
+                                    // Registration re-checks the withdrawal fence after
+                                    // inserting this session. If that re-check retired us,
+                                    // stop inside the handshake drain rather than waiting
+                                    // for the outer select to poll the cancellation arm: an
+                                    // already-fenced session must never reach `accept()`.
+                                    if let Some(session) =
+                                        client_trust_guard.as_ref().map(|guard| guard.session())
+                                        && session.is_retired()
+                                    {
+                                        session.record_fenced();
+                                        fail_queued_frontend_app_sends(
+                                            &mut app_in_rx,
+                                            auth_deadline.get(),
+                                        );
+                                        return;
+                                    }
                                 }
                                 peer_cert_chain_der =
                                     (chain.len() > 1).then(|| Arc::new(chain[1..].to_vec()));
                             }
-                            Output::ApplicationData(data)
-                                if app_out_tx.send(data.to_vec()).await.is_err() =>
-                            {
-                                if let Some(inflight) = in_flight.take() {
-                                    let _ = inflight.completion.send(Err(
-                                        FrontendAppSendReject::Closed.as_str().to_string(),
-                                    ));
+                            Output::ApplicationData(data) => {
+                                match frontend_trust_raced_delivery(
+                                    client_trust_guard.as_ref().map(|guard| guard.session()),
+                                    app_out_tx.send(data.to_vec()),
+                                )
+                                .await
+                                {
+                                    Ok(Ok(())) => {
+                                        drain_round_exhausted = false;
+                                        break;
+                                    }
+                                    Ok(Err(_)) | Err(_) => {
+                                        if let Some(inflight) = in_flight.take() {
+                                            let _ = inflight.completion.send(Err(
+                                                FrontendAppSendReject::Closed.as_str().to_string(),
+                                            ));
+                                        }
+                                        fail_queued_frontend_app_sends(
+                                            &mut app_in_rx,
+                                            auth_deadline.get(),
+                                        );
+                                        return;
+                                    }
                                 }
-                                fail_queued_frontend_app_sends(&mut app_in_rx, auth_deadline.get());
-                                return;
+                            }
+                            Output::KeyingMaterial(_, _) => {
+                                // Dimpl queues this local event immediately
+                                // after `Connected` when SRTP was negotiated,
+                                // before exposing the engine's queued DTLS 1.2
+                                // CCS + Finished packets. Keep draining or an
+                                // admitted peer never receives the server's
+                                // final flight and cannot complete its own
+                                // handshake. Refused peers return from the
+                                // certificate-validation arms above before
+                                // reaching this path, so their queued final
+                                // flight remains discarded fail-closed.
+                                drain_round_exhausted = false;
+                                continue;
                             }
                             _ => {
                                 drain_round_exhausted = false;
@@ -2727,6 +3208,11 @@ impl DtlsServer {
                     break;
                 }
 
+                if retired_by_trust_withdrawal {
+                    fail_queued_frontend_app_sends(&mut app_in_rx, auth_deadline.get());
+                    break;
+                }
+
                 if let Some(inflight) = in_flight.take() {
                     if !wrote_ciphertext_datagram {
                         let _ =
@@ -2742,13 +3228,16 @@ impl DtlsServer {
 
             fail_queued_frontend_app_sends(&mut app_in_rx, auth_deadline.get());
             // Protocol/handshake records may still be flushed from the same
-            // pinned reply source. Application ciphertext whose authorization
-            // expired is discarded, not written.
-            let discard_expired = session_authorization_elapsed(&auth_deadline);
+            // pinned reply source on ordinary shutdown. Application ciphertext
+            // whose authorization expired is discarded. Trust withdrawal must
+            // not emit any queued packet: the peer is no longer authorized,
+            // even if the session deadline has not elapsed.
+            let discard_final_packets =
+                retired_by_trust_withdrawal || session_authorization_elapsed(&auth_deadline);
             for _ in 0..MAX_OUTPUTS_PER_DRAIN {
                 match dtls.poll_output(&mut out_buf) {
                     Output::Packet(data) => {
-                        if discard_expired {
+                        if discard_final_packets {
                             continue;
                         }
                         let _ = send_dtls_record(&socket, data, peer_addr, reply_local).await;
@@ -3002,8 +3491,26 @@ pub(crate) fn load_dtls_certificate_with_key_drop_hook(
     .map_err(|error| anyhow::anyhow!("Invalid DTLS certificate chain: {error}"))
 }
 
-/// Load a rustls root store from a PEM file.
-pub fn load_root_store_from_pem(pem_path: &str) -> Result<rustls::RootCertStore, anyhow::Error> {
+/// One bounded read of a declared PEM CA source, keeping BOTH the parsed root
+/// store and the exact bytes it was parsed from (issue #3857).
+///
+/// A caller that must publish the semantic identity of the anchors it installs
+/// has to derive both halves from one read; a second read of the same source
+/// can observe a later rotation and describe material the verifier is not
+/// enforcing.
+pub(crate) struct LoadedPemRootStore {
+    /// Trust anchors parsed from [`Self::material`].
+    pub(crate) roots: rustls::RootCertStore,
+    /// The exact material those anchors came from, with its redacted
+    /// operator-facing source label.
+    pub(crate) material: crate::tls::source::MaterializedMaterial,
+}
+
+/// Read a declared PEM CA source once and parse it into a root store.
+///
+/// Goes through `CertSource`, so `file://`, inline PEM, and provider URIs all
+/// resolve and the shared `FERRUM_TLS_MAX_MATERIAL_SIZE_BYTES` ceiling applies.
+pub(crate) fn load_pem_root_store(pem_path: &str) -> Result<LoadedPemRootStore, anyhow::Error> {
     let source = CertSource::parse(pem_path, MaterialKind::CaBundle);
     let material = load_material_blocking(&source, MaterialKind::CaBundle).map_err(|e| {
         anyhow::anyhow!(
@@ -3012,11 +3519,20 @@ pub fn load_root_store_from_pem(pem_path: &str) -> Result<rustls::RootCertStore,
             e
         )
     })?;
-    crate::tls::root_cert_store_from_pem_bundle(
+    let roots = crate::tls::root_cert_store_from_pem_bundle(
         material.bytes.expose_secret(),
         "DTLS CA bundle",
         &material.display_source_id,
-    )
+    )?;
+    Ok(LoadedPemRootStore { roots, material })
+}
+
+/// Load a rustls root store from a PEM source.
+///
+/// Thin single-read projection of [`load_pem_root_store`] for callers that need
+/// only the anchors.
+pub fn load_root_store_from_pem(pem_path: &str) -> Result<rustls::RootCertStore, anyhow::Error> {
+    load_pem_root_store(pem_path).map(|loaded| loaded.roots)
 }
 
 fn load_backend_root_store(
@@ -3104,6 +3620,76 @@ fn validate_client_cert(
         .verify_client_cert(&cert, &intermediates, rustls::pki_types::UnixTime::now())
         .map(|_| ())
         .map_err(|e| anyhow::anyhow!("DTLS client certificate verification failed: {}", e))
+}
+
+/// Refuse a frontend DTLS handshake WITHOUT committing the server's final
+/// flight to the wire.
+///
+/// dimpl's server pops its local-event queue before the engine's record queue
+/// (`Server::poll_output`), and the DTLS 1.2 server pushes `Connected` at the
+/// END of `send_finished` — after the ChangeCipherSpec and Finished records are
+/// already queued. So at both refusal sites below (an unverifiable client chain,
+/// and `Connected` with no verified client certificate under a configured
+/// verifier) that final flight EXISTS but has not been written: this session
+/// driver is the only thing that ever puts it on the socket.
+///
+/// Draining it here — which a `close()`-then-forward abort does — hands the peer
+/// a complete server final flight, so the client reaches `SSL_is_init_finished`
+/// and reports an ESTABLISHED DTLS session; the alert queued behind it only
+/// arrives afterwards. A peer that never authenticated then observes a completed
+/// handshake, whatever the gateway does with the session next. Every queued
+/// record is therefore discarded first, and only records the refusal itself
+/// produces are written. If that bounded discard does not reach the end of the
+/// queue, nothing is written at all, because a leftover record could still be
+/// part of that flight.
+///
+/// dimpl's `close()` during an in-progress handshake aborts without queuing an
+/// alert (no authenticated channel exists yet). The refused peer therefore
+/// retransmits flight 5. Those records are handshake content-type `0x16` but
+/// not ClientHellos; [`dtls_datagram_opens_session`] must drop them so they
+/// cannot spawn replacement sessions that occupy this peer address.
+///
+/// This makes the refusal fail closed at the DTLS 1.2 protocol boundary. In
+/// DTLS 1.3 the server's Finished belongs to an earlier flight and has
+/// necessarily already been sent before the client's certificate arrives, so no
+/// server behaviour can leave that handshake incomplete; there the alert is what
+/// tears the peer down. In both versions the caller returns immediately, so no
+/// application data and no accepted connection ever reach the proxy.
+///
+/// Writes go through `send_dtls_record`, so a generated NodeWaypoint listener
+/// refuses from the exact pinned reply source it handshook from rather than a
+/// route-selected node address the client's connected socket would discard. A
+/// failed send is not actionable — the session is being dropped either way — so
+/// it is ignored rather than retried.
+async fn refuse_dtls_handshake(
+    dtls: &mut Dtls,
+    socket: &UdpSocket,
+    peer_addr: SocketAddr,
+    reply_local: Option<crate::socket_opts::PktinfoLocal>,
+    out_buf: &mut [u8],
+) {
+    // Discard everything dimpl has already queued for this session. `Timeout`
+    // is dimpl's "nothing actionable left" output, so it is the only exit that
+    // proves the queue is drained.
+    let mut queue_drained = false;
+    for _ in 0..MAX_OUTPUTS_PER_DRAIN {
+        if matches!(dtls.poll_output(out_buf), Output::Timeout(_)) {
+            queue_drained = true;
+            break;
+        }
+    }
+    if !queue_drained {
+        return;
+    }
+    let _ = dtls.close();
+    for _ in 0..MAX_OUTPUTS_PER_DRAIN {
+        match dtls.poll_output(out_buf) {
+            Output::Packet(data) => {
+                let _ = send_dtls_record(socket, data, peer_addr, reply_local).await;
+            }
+            _ => break,
+        }
+    }
 }
 
 // ============================================================================
@@ -3307,6 +3893,7 @@ mod tests {
                 dimpl_config: Arc::new(config),
                 certificate: certificate.into(),
                 client_cert_verifier: None,
+                client_trust: None,
             },
             limits,
         )
@@ -3478,6 +4065,30 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn dtls_server_authorizes_source_before_spawning_handshake() {
+        let server = test_server(DtlsServerLimits {
+            authorize_new_session: Some(Arc::new(|peer, ingress_ifindex| {
+                peer.ip().is_loopback() && ingress_ifindex == Some(7)
+            })),
+            ..DtlsServerLimits::default()
+        })
+        .await;
+
+        server.spawn_session(
+            "127.0.0.1:12346".parse().unwrap(),
+            vec![0x16; 32],
+            Some(crate::socket_opts::PktinfoLocal {
+                ip: "127.0.0.1".parse().unwrap(),
+                ifindex: 8,
+            }),
+            None,
+        );
+
+        assert_eq!(server.active_session_count(), 0);
+        assert!(server.sessions.is_empty());
+    }
+
+    #[tokio::test]
     async fn dtls_server_rejects_second_peer_at_cap_and_releases_mirror_on_timeout() {
         let mirror = Arc::new(AtomicU64::new(0));
         let server = test_server(DtlsServerLimits {
@@ -3597,6 +4208,7 @@ mod tests {
             dimpl_config: Arc::new(new_config),
             certificate: new_certificate.clone(),
             client_cert_verifier: None,
+            client_trust: None,
         });
 
         let after = Arc::as_ptr(&server.active_config.load_full());
