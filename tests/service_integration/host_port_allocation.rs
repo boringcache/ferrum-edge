@@ -161,7 +161,10 @@ async fn retry_returns_non_collision_errors_on_the_first_attempt() {
         async { Err("error pulling image mysql:8.4".into()) }
     })
     .await;
-    assert!(result.is_err(), "generic start failure must stay a hard error");
+    assert!(
+        result.is_err(),
+        "generic start failure must stay a hard error"
+    );
     assert_eq!(attempts.load(Ordering::SeqCst), 1);
 }
 
@@ -197,7 +200,10 @@ async fn retry_exhausts_collision_budget_without_masking_the_error() {
         err.to_string().contains("still allocated after"),
         "exhaustion must keep the collision visible: {err}"
     );
-    assert_eq!(attempts.load(Ordering::SeqCst), HOST_PORT_COLLISION_ATTEMPTS);
+    assert_eq!(
+        attempts.load(Ordering::SeqCst),
+        HOST_PORT_COLLISION_ATTEMPTS
+    );
 }
 
 #[cfg(target_os = "linux")]
