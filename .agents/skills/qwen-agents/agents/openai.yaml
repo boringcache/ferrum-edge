@@ -1,0 +1,4 @@
+interface:
+  display_name: "Qwen3.8 Max Agents"
+  short_description: "Orchestrate Qwen3.8 Max coding agents via the opencode CLI"
+  default_prompt: "Use $qwen-agents to dispatch alibaba-token-plan/qwen3.8-max agents for this Ferrum Edge task."

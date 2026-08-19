@@ -2329,6 +2329,23 @@ pub struct UdpListenerConfig {
     /// never a mesh-wide fallback while scoped enforcement applies.
     pub node_waypoint_udp_source_scoping:
         Option<crate::proxy::node_waypoint_udp_identity::NodeWaypointUdpSourceScoping>,
+    /// This listener is a Ferrum-generated NodeWaypoint Service listener
+    /// (issue #3858 owner split).
+    ///
+    /// Decided by `StreamListenerManager` from the accepted listener identity —
+    /// the same bit that picks its `DtlsListenerOwner`. It is carried here for
+    /// exactly one decision: which client-trust retirement domain a terminating
+    /// DTLS session joins.
+    ///
+    /// Deliberately NOT derived from `node_waypoint_udp_source_scoping`. That
+    /// field is built once from the manager-wide NodeWaypoint source index and
+    /// identity resolver and handed to EVERY UDP listener spawn, so it is
+    /// `Some` for operator listeners too whenever the topology is active.
+    /// Keying trust ownership on it would drop an operator `FERRUM_DTLS_*`
+    /// listener out of its own domain in exactly the deployment the split is
+    /// about — mesh NodeWaypoint plus a configured operator DTLS listener — and
+    /// an operator CRL publication would then retire nothing.
+    pub node_waypoint_udp_owner: bool,
     /// Exact NodeWaypoint UDP destination routing for a shared same-port
     /// listener (issue #3861). `None` for every ordinary UDP listener and for a
     /// single-claimant NodeWaypoint listener, which keeps the documented
@@ -2474,6 +2491,7 @@ pub async fn start_udp_listener(cfg: UdpListenerConfig) -> Result<(), anyhow::Er
         udp_pktinfo_enabled,
         mesh_outbound_enforcement,
         node_waypoint_udp_source_scoping,
+        node_waypoint_udp_owner,
         node_waypoint_udp_destinations,
         datagram_client_address,
     } = cfg;
@@ -2541,6 +2559,7 @@ pub async fn start_udp_listener(cfg: UdpListenerConfig) -> Result<(), anyhow::Er
             overload,
             Arc::new(BackendDtlsConfigCacheState::new(backend_tls_reload_epoch)),
             node_waypoint_udp_source_scoping,
+            node_waypoint_udp_owner,
             datagram_client_address,
         )
         .await;
@@ -4500,10 +4519,27 @@ async fn start_dtls_frontend_listener(
     node_waypoint_udp_source_scoping: Option<
         crate::proxy::node_waypoint_udp_identity::NodeWaypointUdpSourceScoping,
     >,
+    node_waypoint_udp_owner: bool,
     datagram_client_address: Option<Arc<DatagramClientAddressGate>>,
 ) -> Result<(), anyhow::Error> {
     let addr = SocketAddr::new(bind_addr, port);
     let admission_overload = overload.clone();
+    let dtls_source_admission = node_waypoint_udp_source_scoping.clone().map(|scoping| {
+        let admission_proxy_id = proxy_id.clone();
+        Arc::new(move |peer_addr: SocketAddr, ingress_ifindex: Option<u32>| {
+            match scoping.resolve(ingress_ifindex, peer_addr.ip()) {
+                Ok(_) => true,
+                Err(refusal) => {
+                    scoping.index.warn_refusal(
+                        &admission_proxy_id,
+                        &udp_session_client_ip(peer_addr),
+                        refusal,
+                    );
+                    false
+                }
+            }
+        }) as Arc<crate::dtls::DtlsNewSessionAuthorizer>
+    });
     let dtls_limits = crate::dtls::DtlsServerLimits {
         max_sessions: Some(max_sessions),
         handshake_timeout: (frontend_tls_handshake_timeout_seconds > 0)
@@ -4516,6 +4552,11 @@ async fn start_dtls_frontend_listener(
         allow_new_session: Some(Arc::new(move || {
             !refuse_new_udp_source(&admission_overload)
         })),
+        // A marked NodeWaypoint socket may not emit even the first handshake
+        // flight until the ClientHello's kernel-observed source has been
+        // attributed to an enrolled workload. Ordinary DTLS listeners leave
+        // this gate off.
+        authorize_new_session: dtls_source_admission,
         active_session_mirror: Some(metrics.dtls_demux_sessions.clone()),
         // NodeWaypoint DTLS sessions are attributed to a source workload by the
         // kernel-reported ingress interface of their ClientHello (issue #3286),
@@ -4547,6 +4588,20 @@ async fn start_dtls_frontend_listener(
         // Refusal diagnostics on the demux path name the same listener the
         // plain-UDP path's do. Built once here, never per datagram.
         datagram_client_address_listener: Some((Arc::from(proxy_id.as_str()), port)),
+        // Owner-scoped client-trust retirement domain (issues #3857, #3858).
+        // Only an operator-owned `FERRUM_DTLS_*` listener joins the
+        // `FrontendDtls` domain, because that is the only domain whose
+        // material `publish_frontend_dtls_generation` swaps onto this server.
+        // A generated NodeWaypoint listener's posture is published by the mesh
+        // slice, which `swap_active_dtls_frontend_config` deliberately skips,
+        // so its sessions must not be retirable by an unrelated operator CRL
+        // or client-CA edit.
+        // Listener OWNERSHIP, not the mesh-wide source-scoping option: the
+        // latter is built once per manager and handed to every UDP listener
+        // spawn, so an operator `FERRUM_DTLS_*` listener running alongside
+        // NodeWaypoint would otherwise leave the operator domain and survive
+        // the CRL edit meant to retire it.
+        client_trust_scope: crate::dtls::dtls_client_trust_scope_for_owner(node_waypoint_udp_owner),
     };
     let server =
         Arc::new(crate::dtls::DtlsServer::bind_with_limits(addr, dtls_config, dtls_limits).await?);
@@ -4678,6 +4733,17 @@ async fn start_dtls_frontend_listener(
                         forwarded: client_conn.forwarded_client_addr,
                     };
                     let client_ip = udp_session_client_ip(identity.resolved());
+                    // The established session's frontend client-trust decision
+                    // (issue #3857), carried out of the DTLS driver on the
+                    // accepted connection. Everything this detached handler is
+                    // about to do — the `on_stream_connect` chain, backend
+                    // selection and setup, and both relay directions — is bound
+                    // by it, because the driver's own fences stop only the
+                    // driver. `None` for anonymous / static DTLS, which arms
+                    // nothing and behaves exactly as before.
+                    let client_trust = DtlsClientTrustFence::from_session(
+                        client_conn.client_trust_session().cloned(),
+                    );
 
                     // Run on_stream_connect plugins (with DTLS client cert if available)
                     let stream_client_ip = client_ip.to_string();
@@ -4755,14 +4821,41 @@ async fn start_dtls_frontend_listener(
                             }
                         }
                     }
-                    for plugin in plugins.iter() {
-                        if let PluginResult::Reject { .. } =
-                            plugin.on_stream_connect(&mut stream_ctx).await
-                        {
+                    match run_dtls_stream_connect_plugins(
+                        plugins.as_slice(),
+                        &mut stream_ctx,
+                        &client_trust,
+                    )
+                    .await
+                    {
+                        DtlsStreamConnectOutcome::Admitted => {}
+                        DtlsStreamConnectOutcome::Rejected => {
                             debug!(
                                 proxy_id = %handler_proxy_id,
                                 client = %udp_client_log_addr(client_addr),
                                 "DTLS connection rejected by plugin"
+                            );
+                            client_conn.close().await;
+                            handler_metrics
+                                .active_sessions
+                                .fetch_sub(1, Ordering::Relaxed);
+                            return;
+                        }
+                        DtlsStreamConnectOutcome::TrustWithdrawn => {
+                            // The chain already settled this session's
+                            // admission lifecycle: every permit the completed
+                            // hooks took is released, and the connection's
+                            // fixed-cardinality fence counter is recorded once
+                            // through the shared latch. What is left here is the
+                            // transport and the reserved session slot. The
+                            // session never reached the accepted-session
+                            // accounting below, so `total_sessions` is not
+                            // incremented and no disconnect summary is built —
+                            // identical to a plugin refusal at the same point.
+                            warn!(
+                                proxy_id = %handler_proxy_id,
+                                client = %udp_client_log_addr(client_addr),
+                                "Refusing accepted DTLS session: frontend client-certificate trust was withdrawn"
                             );
                             client_conn.close().await;
                             handler_metrics
@@ -4857,6 +4950,7 @@ async fn start_dtls_frontend_listener(
                         &handler_dtls_cache,
                         handler_node_waypoint_session_source,
                         handler_auth_deadline,
+                        &client_trust,
                     )
                     .await;
                     let (err_msg, error_class, disconnect_cause, disconnect_direction) =
@@ -5020,6 +5114,7 @@ async fn handle_dtls_client(
     backend_dtls_config_cache: &BackendDtlsConfigCache,
     node_waypoint_source: Option<NodeWaypointUdpSessionSource>,
     auth_deadline: Option<crate::proxy::auth_lifetime::StreamAuthDeadline>,
+    client_trust: &DtlsClientTrustFence,
 ) -> DtlsHandlerResult {
     let mut backend_info = DtlsBackendInfo {
         backend_target: String::new(),
@@ -5058,6 +5153,7 @@ async fn handle_dtls_client(
         backend_dtls_config_cache,
         node_waypoint_source,
         auth_deadline,
+        client_trust,
     )
     .await;
     DtlsHandlerResult {
@@ -5329,6 +5425,240 @@ pub(crate) const UDP_SESSION_SETUP_CONTEXT: &str = "(UDP session)";
 /// Fixed suffix identifying the DTLS session lifecycle in the same error.
 pub(crate) const DTLS_SESSION_SETUP_CONTEXT: &str = "(DTLS session)";
 
+/// Fixed detail suffix for every accepted-DTLS client-trust fence.
+///
+/// It states only what is true at EVERY fence. A withdrawal can land after the
+/// handler already forwarded datagrams under the decision that was still
+/// standing, so "before any backend datagram" was not a claim this refusal
+/// could make; what the fence guarantees is that nothing FURTHER is forwarded
+/// on the retired session's behalf. Compiled-in and redacted: it names the
+/// contract, never the certificate, its subject, its SANs, its serial, its
+/// issuer, its key ID, its fingerprint, or the trust generation.
+pub(crate) const DTLS_TRUST_WITHDRAWN_SETUP_DETAIL: &str =
+    "(DTLS session) with no further backend datagram forwarded";
+
+/// The typed, client-side, health-neutral refusal for an accepted DTLS session
+/// whose frontend client-certificate trust decision was withdrawn (issue
+/// #3857).
+///
+/// [`StreamSetupKind::ClientTrustWithdrawn`] is client-side, so
+/// `dtls_disconnect_cause` reports `RecvError` / `ClientToBackend` and
+/// `dtls_error_class` reports `RequestError`: withdrawing a trust root is the
+/// operator's own local authorization decision, never evidence about the
+/// upstream, so no circuit-breaker, passive-health, or load-balancer state
+/// moves for it.
+pub(crate) fn dtls_trust_withdrawn_error() -> anyhow::Error {
+    StreamSetupError::new(
+        StreamSetupKind::ClientTrustWithdrawn,
+        DTLS_TRUST_WITHDRAWN_SETUP_DETAIL,
+    )
+    .into()
+}
+
+/// The registered frontend client-trust decision one ACCEPTED DTLS session was
+/// admitted under, plus that session's once-only fence-settlement latch (issue
+/// #3857).
+///
+/// The DTLS driver fences its own plaintext delivery, accept handoff, and
+/// ciphertext sends, and then exits and closes its channels. That closure is
+/// not a retirement fence for the detached handler the connection was already
+/// delivered to: an awaited `on_stream_connect` hook, a DNS resolution, a
+/// backend dial, a backend DTLS handshake, or a parked per-datagram hook can
+/// all be pending when the withdrawal lands, and each would otherwise resume
+/// and commit backend work under a decision the operator has revoked. This
+/// carries the same bound into the handler and both relay directions.
+///
+/// An anonymous / static DTLS session holds no withdrawable trust decision, so
+/// its fence is UNARMED: every helper here takes an `Option` miss, arms no
+/// retirement future, registers no waker, and reads no atomic.
+#[derive(Clone)]
+pub(crate) struct DtlsClientTrustFence {
+    armed: Option<ArmedDtlsClientTrust>,
+}
+
+#[derive(Clone)]
+struct ArmedDtlsClientTrust {
+    session: crate::tls::ClientTrustSession,
+    /// Shared by every fence observation on this connection — the admission
+    /// chain, each setup stage, the pre-relay gate, and both relay directions —
+    /// so the fixed-cardinality fence counter is recorded exactly once for the
+    /// connection however many of them see the same withdrawal.
+    settled: Arc<AtomicBool>,
+}
+
+/// A post-admission stage that a client-trust withdrawal ended. Carries no
+/// certificate, trust material, or generation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct DtlsTrustWithdrawn;
+
+impl DtlsClientTrustFence {
+    /// Arm the fence from the accepted connection's registered session.
+    /// `None` (anonymous / static DTLS) produces an unarmed fence.
+    pub(crate) fn from_session(session: Option<crate::tls::ClientTrustSession>) -> Self {
+        Self {
+            armed: session.map(|session| ArmedDtlsClientTrust {
+                session,
+                settled: Arc::new(AtomicBool::new(false)),
+            }),
+        }
+    }
+
+    /// An unarmed fence, for plain UDP and for anonymous DTLS. Allocates
+    /// nothing.
+    pub(crate) fn unarmed() -> Self {
+        Self { armed: None }
+    }
+
+    /// Whether this session carries a withdrawable trust decision at all.
+    #[inline]
+    pub(crate) fn is_armed(&self) -> bool {
+        self.armed.is_some()
+    }
+
+    fn session(&self) -> Option<&crate::tls::ClientTrustSession> {
+        self.armed.as_ref().map(|armed| &armed.session)
+    }
+
+    /// Whether the trust decision has already been withdrawn. One relaxed
+    /// atomic read for an armed session; an `Option` miss otherwise.
+    #[inline]
+    pub(crate) fn is_retired(&self) -> bool {
+        self.armed
+            .as_ref()
+            .is_some_and(|armed| armed.session.is_retired())
+    }
+
+    /// Resolves once the trust decision is withdrawn. An unarmed fence parks
+    /// forever, so a `select!` arm built on it is never taken and registers no
+    /// waker.
+    pub(crate) async fn retired(&self) {
+        match self.armed.as_ref() {
+            Some(armed) => armed.session.retired().await,
+            None => std::future::pending().await,
+        }
+    }
+
+    /// Record the fixed-cardinality, scope-labelled fence counter once for this
+    /// connection. Repeat observations of the same withdrawal are absorbed by
+    /// the shared latch.
+    pub(crate) fn record_fenced_once(&self) {
+        if let Some(armed) = self.armed.as_ref()
+            && !armed.settled.swap(true, Ordering::AcqRel)
+        {
+            armed.session.record_fenced();
+        }
+    }
+
+    /// Record the fence once and return the typed, client-side, health-neutral
+    /// refusal.
+    pub(crate) fn settle_withdrawal(&self) -> anyhow::Error {
+        self.record_fenced_once();
+        dtls_trust_withdrawn_error()
+    }
+}
+
+/// Race one awaited accepted-DTLS stage against the established session's
+/// trust retirement (issue #3857).
+///
+/// An already-visible withdrawal never polls `stage`. One that becomes ready
+/// together with `stage` wins the biased race, and DROPPING `stage` is what
+/// guarantees a half-run hook, a half-completed dial, or a datagram commit is
+/// abandoned rather than finished. An unarmed session awaits `stage` with no
+/// select, no timer, and no retirement future at all.
+pub(crate) async fn within_dtls_trust_fence<F>(
+    trust: &DtlsClientTrustFence,
+    stage: F,
+) -> Result<F::Output, DtlsTrustWithdrawn>
+where
+    F: std::future::Future,
+{
+    if !trust.is_armed() {
+        return Ok(stage.await);
+    }
+    if trust.is_retired() {
+        return Err(DtlsTrustWithdrawn);
+    }
+    tokio::select! {
+        biased;
+        () = trust.retired() => Err(DtlsTrustWithdrawn),
+        output = stage => Ok(output),
+    }
+}
+
+/// How the accepted-DTLS `on_stream_connect` chain ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DtlsStreamConnectOutcome {
+    /// Every hook ran and admitted the session.
+    Admitted,
+    /// A hook returned `PluginResult::Reject`.
+    Rejected,
+    /// The frontend client-certificate trust decision was withdrawn before the
+    /// chain started, while a hook was pending, or as the last hook returned.
+    TrustWithdrawn,
+}
+
+/// Run the accepted-DTLS `on_stream_connect` chain under the established
+/// session's client-trust fence (issue #3857).
+///
+/// The DTLS driver hands this connection to a DETACHED handler through
+/// `accept_tx`, and the very first thing that handler does is await arbitrary
+/// plugin hooks. Without an interruptible chain, a withdrawal landing after the
+/// accept left a retired session parked in a hook and then free to resolve a
+/// backend, take a circuit-breaker slot, dial, and start relaying — the DTLS
+/// analogue of the TCP+TLS chain gap.
+///
+/// Withdrawal-first ordering, checked before each hook is even constructed: an
+/// already-retired session STARTS no hook; a withdrawal that becomes visible in
+/// the same poll as a hook's completion is reported as the withdrawal; and the
+/// in-flight hook future is dropped mid-poll, so no later hook and no backend
+/// stage runs. An anonymous / static session arms nothing and runs the chain
+/// exactly as before.
+pub(crate) async fn run_dtls_stream_connect_plugins(
+    plugins: &[Arc<dyn Plugin>],
+    stream_ctx: &mut StreamConnectionContext,
+    trust: &DtlsClientTrustFence,
+) -> DtlsStreamConnectOutcome {
+    for plugin in plugins {
+        if trust.is_retired() {
+            return settle_dtls_stream_connect_trust_withdrawal(stream_ctx, trust);
+        }
+        match within_dtls_trust_fence(trust, plugin.on_stream_connect(stream_ctx)).await {
+            Err(DtlsTrustWithdrawn) => {
+                return settle_dtls_stream_connect_trust_withdrawal(stream_ctx, trust);
+            }
+            Ok(PluginResult::Reject { .. }) => return DtlsStreamConnectOutcome::Rejected,
+            Ok(_) => {}
+        }
+    }
+    // A withdrawal that landed as the last hook returned is settled here rather
+    // than handed on as an accepted admission: this is the last point at which
+    // the chain still owns the session's lifecycle.
+    if trust.is_retired() {
+        return settle_dtls_stream_connect_trust_withdrawal(stream_ctx, trust);
+    }
+    DtlsStreamConnectOutcome::Admitted
+}
+
+/// Settle a client-trust withdrawal that ended the accepted-DTLS
+/// `on_stream_connect` chain (issue #3857).
+///
+/// The interrupted hook future has already been dropped by the caller's race,
+/// so no later hook and no backend work runs. Here the admission permits every
+/// completed hook took are handed back — the bookkeeping the plugin-reject path
+/// settles by dropping the context, run eagerly so a fence cannot hold a
+/// concurrency slot while the caller tears the transport down — and the
+/// connection's fixed-cardinality fence counter is recorded through the shared
+/// latch, so this observation and every later one settle it once between them.
+/// There is no mesh opened/closed TCP lifecycle on the DTLS path to finalize.
+fn settle_dtls_stream_connect_trust_withdrawal(
+    stream_ctx: &mut StreamConnectionContext,
+    trust: &DtlsClientTrustFence,
+) -> DtlsStreamConnectOutcome {
+    stream_ctx.release_admission_permits();
+    trust.record_fenced_once();
+    DtlsStreamConnectOutcome::TrustWithdrawn
+}
+
 /// The typed, client-side, health-neutral error returned when authorization
 /// elapsed during post-admission DTLS setup, before any backend or application
 /// datagram was forwarded. Fixed redacted wording.
@@ -5518,6 +5848,53 @@ where
     }
 }
 
+/// Why one relayed DTLS datagram stage was interrupted.
+///
+/// Independent, earliest-wins causes with the operator's decision reported on
+/// a tie, matching the setup-phase pairing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DtlsRelayInterrupt {
+    /// The admitted credential's authorization lifetime elapsed (issue #3816).
+    AuthorizationExpired(crate::proxy::auth_lifetime::StreamAuthTermination),
+    /// The frontend client-certificate trust decision was withdrawn (issue
+    /// #3857).
+    TrustWithdrawn,
+}
+
+/// Race one DTLS client→backend stage — receive, an awaited per-datagram hook,
+/// or the backend application-datagram commit — against BOTH post-admission
+/// bounds (issues #3816, #3857).
+///
+/// The relay's outer supervisor is not sufficient for either bound: abort is
+/// scheduled only after this task may already have committed, so a datagram
+/// that was received while the decision still stood could otherwise be
+/// forwarded from inside a parked hook after the withdrawal. An already-retired
+/// session never polls `stage`, and a withdrawal that races it drops it.
+pub(crate) async fn dtls_c2b_under_bounds<F>(
+    plan: Option<crate::proxy::auth_lifetime::StreamAuthDeadline>,
+    latch: &crate::proxy::auth_lifetime::StreamAuthTerminationLatch,
+    session_metadata: &std::sync::Mutex<std::collections::HashMap<String, String>>,
+    trust: &DtlsClientTrustFence,
+    stage: F,
+) -> Result<F::Output, DtlsRelayInterrupt>
+where
+    F: std::future::Future,
+{
+    match within_dtls_trust_fence(
+        trust,
+        dtls_c2b_until_expiry(plan, latch, session_metadata, stage),
+    )
+    .await
+    {
+        Err(DtlsTrustWithdrawn) => {
+            trust.record_fenced_once();
+            Err(DtlsRelayInterrupt::TrustWithdrawn)
+        }
+        Ok(Err(termination)) => Err(DtlsRelayInterrupt::AuthorizationExpired(termination)),
+        Ok(Ok(output)) => Ok(output),
+    }
+}
+
 /// Race a client-facing `writable()` wait against the same absolute plan,
 /// then re-read the plan after readiness and before the caller may issue
 /// the send syscall.
@@ -5585,6 +5962,55 @@ pub(crate) async fn udp_reply_commit_after_backend_hooks(
             UdpReplyDatagramCommit::AuthorizationExpired(termination)
         }
         UdpFrontendSendOutcome::Sent(commit) => commit,
+    }
+}
+
+/// Outcome of one accepted-DTLS backend→client datagram after the awaitable
+/// hook chain is raced against both post-admission bounds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DtlsReplyDatagramCommit {
+    /// The datagram may be encrypted and sent to the client.
+    Commit,
+    /// A plugin dropped it while the session was still authorized and trusted;
+    /// continue receiving.
+    Drop,
+    /// The admitted credential's authorization lifetime elapsed.
+    AuthorizationExpired(crate::proxy::auth_lifetime::StreamAuthTermination),
+    /// The frontend client-certificate trust decision was withdrawn while a
+    /// hook was pending, or was already withdrawn before the chain was polled.
+    /// The still-pending hook future is dropped and the reply task tears down.
+    TrustWithdrawn,
+}
+
+/// Run the accepted-DTLS backend→client `on_udp_datagram` chain under both
+/// post-admission bounds (issues #3816, #3857).
+///
+/// A backend reply hook that is already running when the withdrawal lands would
+/// otherwise complete and deliver a client-facing datagram under a decision the
+/// operator revoked. The chain is owned for the whole wait, so a withdrawal
+/// drops it mid-hook, and a `Drop` verdict is honoured only when it becomes
+/// ready strictly before the fence.
+pub(crate) async fn dtls_reply_commit_after_backend_hooks(
+    datagram_plugins: &[Arc<dyn Plugin>],
+    ctx: &UdpDatagramContext<'_>,
+    plan: Option<crate::proxy::auth_lifetime::StreamAuthDeadline>,
+    trust: &DtlsClientTrustFence,
+) -> DtlsReplyDatagramCommit {
+    match within_dtls_trust_fence(
+        trust,
+        udp_reply_commit_after_backend_hooks(datagram_plugins, ctx, plan),
+    )
+    .await
+    {
+        Err(DtlsTrustWithdrawn) => {
+            trust.record_fenced_once();
+            DtlsReplyDatagramCommit::TrustWithdrawn
+        }
+        Ok(UdpReplyDatagramCommit::Commit) => DtlsReplyDatagramCommit::Commit,
+        Ok(UdpReplyDatagramCommit::Drop) => DtlsReplyDatagramCommit::Drop,
+        Ok(UdpReplyDatagramCommit::AuthorizationExpired(termination)) => {
+            DtlsReplyDatagramCommit::AuthorizationExpired(termination)
+        }
     }
 }
 
@@ -5695,28 +6121,43 @@ where
     S: FnOnce() -> F,
     F: std::future::Future,
 {
-    if let Some(termination) =
-        dtls_authorization_expired_before_relay(plan, tokio::time::Instant::now())
-    {
-        release_probe();
-        settle_stream_udp_auth_expiry(termination, latch, session_metadata);
-        return Err(StreamSetupError::new(StreamSetupKind::AuthorizationExpired, context).into());
-    }
-    match crate::proxy::tcp_proxy::within_stream_auth_deadline(plan, stage()).await {
-        Ok(output) => Ok(output),
-        Err(termination) => {
-            release_probe();
-            settle_stream_udp_auth_expiry(termination, latch, session_metadata);
-            Err(StreamSetupError::new(StreamSetupKind::AuthorizationExpired, context).into())
-        }
-    }
+    // Plain UDP terminates no client certificate, so it holds no withdrawable
+    // trust decision and takes the unarmed path: no select, no retirement
+    // future, byte-for-byte the previous behaviour.
+    let unarmed = DtlsClientTrustFence::unarmed();
+    stream_udp_setup_stage_under_bounds(
+        plan,
+        latch,
+        session_metadata,
+        context,
+        &unarmed,
+        release_probe,
+        stage,
+    )
+    .await
 }
 
-/// DTLS projection of [`stream_udp_setup_stage_under_authorization`].
-pub(crate) async fn dtls_setup_stage_under_authorization<S, F>(
+/// Run one awaitable post-admission UDP/DTLS stream-setup stage under BOTH
+/// post-admission bounds: the admitted credential's absolute authorization
+/// deadline (issue #3816) and the established frontend transport's
+/// client-trust retirement (issue #3857).
+///
+/// The two are independent, earliest-wins causes, and a withdrawal the operator
+/// has already taken outranks a timer that merely also elapsed — the same
+/// biased ordering the TCP+TLS setup bound and the DTLS delivery fence use. An
+/// already-retired session never BUILDS the stage, so it resolves no name,
+/// dials no backend, and runs no hook; a withdrawal that races a running stage
+/// drops that stage's future rather than letting it finish.
+///
+/// `release_probe` runs on either bound so a claimed HALF_OPEN circuit-breaker
+/// probe slot is released NEUTRALLY: both are gateway-side authorization
+/// decisions and must record neither backend success nor backend failure.
+pub(crate) async fn stream_udp_setup_stage_under_bounds<S, F>(
     plan: Option<crate::proxy::auth_lifetime::StreamAuthDeadline>,
     latch: &crate::proxy::auth_lifetime::StreamAuthTerminationLatch,
     session_metadata: &std::sync::Mutex<std::collections::HashMap<String, String>>,
+    context: &'static str,
+    trust: &DtlsClientTrustFence,
     release_probe: impl FnOnce(),
     stage: S,
 ) -> Result<F::Output, anyhow::Error>
@@ -5724,11 +6165,56 @@ where
     S: FnOnce() -> F,
     F: std::future::Future,
 {
-    stream_udp_setup_stage_under_authorization(
+    if trust.is_retired() {
+        release_probe();
+        return Err(trust.settle_withdrawal());
+    }
+    if let Some(termination) =
+        dtls_authorization_expired_before_relay(plan, tokio::time::Instant::now())
+    {
+        release_probe();
+        settle_stream_udp_auth_expiry(termination, latch, session_metadata);
+        return Err(StreamSetupError::new(StreamSetupKind::AuthorizationExpired, context).into());
+    }
+    let bounded =
+        crate::proxy::tcp_proxy::within_stream_setup_bounds(plan, trust.session(), stage()).await;
+    match bounded {
+        Ok(output) => Ok(output),
+        Err(crate::proxy::tcp_proxy::StreamSetupInterrupt::TrustWithdrawn) => {
+            release_probe();
+            Err(trust.settle_withdrawal())
+        }
+        Err(crate::proxy::tcp_proxy::StreamSetupInterrupt::AuthorizationExpired(termination)) => {
+            release_probe();
+            settle_stream_udp_auth_expiry(termination, latch, session_metadata);
+            Err(StreamSetupError::new(StreamSetupKind::AuthorizationExpired, context).into())
+        }
+    }
+}
+
+/// DTLS projection of [`stream_udp_setup_stage_under_bounds`]: every
+/// post-admission backend-setup await of an accepted DTLS session — DNS
+/// resolution, the backend UDP connect, and the backend DTLS handshake — runs
+/// under both the credential's authorization deadline and the session's
+/// client-trust fence.
+pub(crate) async fn dtls_setup_stage_under_bounds<S, F>(
+    plan: Option<crate::proxy::auth_lifetime::StreamAuthDeadline>,
+    latch: &crate::proxy::auth_lifetime::StreamAuthTerminationLatch,
+    session_metadata: &std::sync::Mutex<std::collections::HashMap<String, String>>,
+    trust: &DtlsClientTrustFence,
+    release_probe: impl FnOnce(),
+    stage: S,
+) -> Result<F::Output, anyhow::Error>
+where
+    S: FnOnce() -> F,
+    F: std::future::Future,
+{
+    stream_udp_setup_stage_under_bounds(
         plan,
         latch,
         session_metadata,
         DTLS_SESSION_SETUP_CONTEXT,
+        trust,
         release_probe,
         stage,
     )
@@ -5761,7 +6247,17 @@ async fn handle_dtls_client_inner(
     backend_dtls_config_cache: &BackendDtlsConfigCache,
     node_waypoint_source: Option<NodeWaypointUdpSessionSource>,
     auth_deadline: Option<crate::proxy::auth_lifetime::StreamAuthDeadline>,
+    client_trust: &DtlsClientTrustFence,
 ) -> Result<(), anyhow::Error> {
+    // Frontend client-trust fence, before any post-admission work (issue
+    // #3857). A withdrawal can land between the driver's accept handoff and
+    // this handler being polled, so an already-retired session must select no
+    // backend, advance no load-balancer cursor, claim no circuit-breaker slot,
+    // resolve no name, and dial nothing. Health-neutral by construction: the
+    // typed refusal is client-side, so no breaker or passive-health state moves.
+    if client_trust.is_retired() {
+        return Err(client_trust.settle_withdrawal());
+    }
     // Look up proxy config
     let proxy = epoch
         .proxy_by_namespaced_id(proxy_namespace, proxy_id)
@@ -5864,10 +6360,11 @@ async fn handle_dtls_client_inner(
         }
     };
 
-    let candidates = match dtls_setup_stage_under_authorization(
+    let candidates = match dtls_setup_stage_under_bounds(
         auth_deadline,
         &auth_termination_latch,
         &datagram_metadata,
+        client_trust,
         &release_half_open_probe,
         || {
             dns_cache.resolve_candidates(
@@ -5919,10 +6416,11 @@ async fn handle_dtls_client_inner(
         })
         .transpose()?;
     let connect_timeout = Duration::from_millis(proxy.backend_connect_timeout_ms);
-    let (connected, backend_addr) = match dtls_setup_stage_under_authorization(
+    let (connected, backend_addr) = match dtls_setup_stage_under_bounds(
         auth_deadline,
         &auth_termination_latch,
         &datagram_metadata,
+        client_trust,
         &release_half_open_probe,
         || {
             connect_udp_backend_candidates(
@@ -5964,6 +6462,17 @@ async fn handle_dtls_client_inner(
     // socket / DTLS connection just established is dropped on return, so an
     // expired session forwards no application datagram and leaves no detached
     // producer.
+    //
+    // The trust fence is re-read FIRST for the same reason and with the same
+    // withdrawal-first ordering the setup stages use: a withdrawal that landed
+    // while the backend was being established must not be credited as a backend
+    // success, and must not reach the relay tasks. The HALF_OPEN probe slot is
+    // released NEUTRALLY — the operator's authorization decision is not evidence
+    // about this upstream.
+    if client_trust.is_retired() {
+        release_half_open_probe();
+        return Err(client_trust.settle_withdrawal());
+    }
     if let Some(termination) =
         dtls_authorization_expired_before_relay(auth_deadline, tokio::time::Instant::now())
     {
@@ -6040,19 +6549,30 @@ async fn handle_dtls_client_inner(
     // so a parked recv/hook/send must race the plan itself (issue #3816 / #3820).
     let c2b_auth_plan = auth_deadline;
     let c2b_auth_latch = auth_termination_latch.clone();
+    // The same task also owns the frontend client-trust boundary (issue #3857):
+    // the outer supervisor's abort is scheduled only after this task may
+    // already have committed a datagram to the backend, so a receive, hook, or
+    // send that is parked when the withdrawal lands has to race the fence
+    // itself. An anonymous session clones an unarmed fence and polls nothing.
+    let c2b_trust = client_trust.clone();
+    let b2c_trust = client_trust.clone();
     let client_to_backend = tokio::spawn(async move {
         'c2b: loop {
-            let data = match dtls_c2b_until_expiry(
+            let data = match dtls_c2b_under_bounds(
                 c2b_auth_plan,
                 &c2b_auth_latch,
                 dgram_metadata_fwd.as_ref(),
+                &c2b_trust,
                 client_conn.recv(),
             )
             .await
             {
                 Ok(Ok(d)) => d,
                 Ok(Err(_)) => break,
-                Err(_) => break,
+                Err(DtlsRelayInterrupt::TrustWithdrawn) => {
+                    return Err(dtls_trust_withdrawn_error());
+                }
+                Err(DtlsRelayInterrupt::AuthorizationExpired(_)) => break,
             };
             if let Some(source) = node_waypoint_source_fwd.as_ref()
                 && let Err(refusal) = source.revalidate(source.ingress_ifindex, client_addr.ip())
@@ -6091,10 +6611,11 @@ async fn handle_dtls_client_inner(
                 };
                 let mut dropped = false;
                 for plugin in dgram_plugins.iter() {
-                    match dtls_c2b_until_expiry(
+                    match dtls_c2b_under_bounds(
                         c2b_auth_plan,
                         &c2b_auth_latch,
                         dgram_metadata_fwd.as_ref(),
+                        &c2b_trust,
                         plugin.on_udp_datagram(&ctx),
                     )
                     .await
@@ -6104,7 +6625,13 @@ async fn handle_dtls_client_inner(
                             break;
                         }
                         Ok(_) => {}
-                        Err(_) => break 'c2b,
+                        // A datagram received while the decision still stood
+                        // must not reach the backend from inside a hook that
+                        // was still pending when it was withdrawn.
+                        Err(DtlsRelayInterrupt::TrustWithdrawn) => {
+                            return Err(dtls_trust_withdrawn_error());
+                        }
+                        Err(DtlsRelayInterrupt::AuthorizationExpired(_)) => break 'c2b,
                     }
                 }
                 if dropped {
@@ -6153,10 +6680,11 @@ async fn handle_dtls_client_inner(
                     Err("no backend socket available".to_string())
                 }
             };
-            match dtls_c2b_until_expiry(
+            match dtls_c2b_under_bounds(
                 c2b_auth_plan,
                 &c2b_auth_latch,
                 dgram_metadata_fwd.as_ref(),
+                &c2b_trust,
                 send,
             )
             .await
@@ -6171,7 +6699,10 @@ async fn handle_dtls_client_inner(
                     }
                     break;
                 }
-                Err(_) => break,
+                Err(DtlsRelayInterrupt::TrustWithdrawn) => {
+                    return Err(dtls_trust_withdrawn_error());
+                }
+                Err(DtlsRelayInterrupt::AuthorizationExpired(_)) => break,
             }
 
             metrics_fwd.datagrams_out.fetch_add(1, Ordering::Relaxed);
@@ -6204,18 +6735,29 @@ async fn handle_dtls_client_inner(
     let backend_to_client = tokio::spawn(async move {
         let mut buf = vec![0u8; MAX_UDP_DATAGRAM_SIZE];
         loop {
-            let data = if let Some(ref dtls) = backend_dtls {
-                match dtls.recv().await {
-                    Ok(d) => d,
-                    Err(_) => break,
+            // The backend receive is fenced too, so a withdrawal ends this
+            // direction promptly rather than leaving it parked until the
+            // supervisor's abort lands.
+            let received = within_dtls_trust_fence(&b2c_trust, async {
+                if let Some(ref dtls) = backend_dtls {
+                    dtls.recv().await.ok()
+                } else if let Some(ref sock) = backend_udp {
+                    match sock.recv(&mut buf).await {
+                        Ok(n) => Some(buf[..n].to_vec()),
+                        Err(_) => None,
+                    }
+                } else {
+                    None
                 }
-            } else if let Some(ref sock) = backend_udp {
-                match sock.recv(&mut buf).await {
-                    Ok(n) => buf[..n].to_vec(),
-                    Err(_) => break,
+            })
+            .await;
+            let data = match received {
+                Ok(Some(data)) => data,
+                Ok(None) => break,
+                Err(DtlsTrustWithdrawn) => {
+                    b2c_trust.record_fenced_once();
+                    return Err(dtls_trust_withdrawn_error());
                 }
-            } else {
-                break;
             };
             if let Some(source) = node_waypoint_source_rev.as_ref()
                 && let Err(refusal) = source.revalidate(source.ingress_ifindex, client_addr.ip())
@@ -6265,15 +6807,16 @@ async fn handle_dtls_client_inner(
                     payload_kind: StreamBytesKind::DecryptedApp,
                     metadata_sink: Some(UdpMetadataSink::new(dgram_metadata_rev.as_ref())),
                 };
-                match udp_reply_commit_after_backend_hooks(
+                match dtls_reply_commit_after_backend_hooks(
                     dgram_plugins_rev.as_ref(),
                     &ctx,
                     reply_auth_plan,
+                    &b2c_trust,
                 )
                 .await
                 {
-                    UdpReplyDatagramCommit::Drop => continue,
-                    UdpReplyDatagramCommit::AuthorizationExpired(termination) => {
+                    DtlsReplyDatagramCommit::Drop => continue,
+                    DtlsReplyDatagramCommit::AuthorizationExpired(termination) => {
                         settle_dtls_auth_expiry(
                             termination,
                             &reply_auth_latch,
@@ -6281,7 +6824,12 @@ async fn handle_dtls_client_inner(
                         );
                         break;
                     }
-                    UdpReplyDatagramCommit::Commit => {}
+                    // A backend reply hook that was still pending when the
+                    // decision was withdrawn must not deliver its datagram.
+                    DtlsReplyDatagramCommit::TrustWithdrawn => {
+                        return Err(dtls_trust_withdrawn_error());
+                    }
+                    DtlsReplyDatagramCommit::Commit => {}
                 }
             }
 
@@ -6303,12 +6851,25 @@ async fn handle_dtls_client_inner(
                 ));
             }
 
-            match udp_frontend_send_until_expiry(
-                reply_auth_plan,
-                client_sender.send_committed(&data, reply_auth_plan.map(|plan| plan.at)),
+            let sent = within_dtls_trust_fence(
+                &b2c_trust,
+                udp_frontend_send_until_expiry(
+                    reply_auth_plan,
+                    client_sender.send_committed(&data, reply_auth_plan.map(|plan| plan.at)),
+                ),
             )
-            .await
-            {
+            .await;
+            let sent = match sent {
+                Ok(sent) => sent,
+                // The driver refuses application ciphertext after withdrawal on
+                // its own; racing the send here also drops the queued request so
+                // nothing is left pending against a retired session.
+                Err(DtlsTrustWithdrawn) => {
+                    b2c_trust.record_fenced_once();
+                    return Err(dtls_trust_withdrawn_error());
+                }
+            };
+            match sent {
                 UdpFrontendSendOutcome::AuthorizationExpired(termination) => {
                     settle_dtls_auth_expiry(
                         termination,
@@ -6360,6 +6921,23 @@ async fn handle_dtls_client_inner(
     ));
     let (outcome, finished) = tokio::select! {
         biased;
+        // Frontend client-certificate trust withdrawal is the FIRST arm (issue
+        // #3857): an authority decision the operator has already taken outranks
+        // a timer that merely also elapsed, matching the withdrawal-first
+        // ordering every other paired observation on this path uses. Both relay
+        // directions carry the same fence, so this arm is the supervisor's
+        // promptness guarantee rather than the only boundary; teardown below
+        // aborts AND joins them, so no direction is left detached. An anonymous
+        // session's fence is unarmed, so the branch is disabled and its future
+        // is never polled.
+        () = client_trust.retired(), if client_trust.is_armed() => {
+            warn!(
+                proxy_id = %proxy_id,
+                client = %udp_client_log_addr(client_addr),
+                "Retiring established DTLS session: frontend client-certificate trust was withdrawn"
+            );
+            (Err(client_trust.settle_withdrawal()), DtlsRelayCompletion::Neither)
+        }
         _ = &mut authorization_deadline, if authorization_deadline_active => {
             // Fixed-cardinality termination class, recorded once through the
             // same latch the setup phase uses, and stamped into the session

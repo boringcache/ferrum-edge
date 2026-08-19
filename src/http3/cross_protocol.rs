@@ -1082,21 +1082,22 @@ fn reqwest_error_response_for_cross_protocol(
     if error_class == crate::retry::ErrorClass::PortExhaustion {
         state.overload.record_port_exhaustion();
     }
-    let error_body = if error_class == crate::retry::ErrorClass::DnsLookupError {
-        r#"{"error":"DNS resolution for backend failed"}"#
+    let (status_code, body) = if error_class == crate::retry::ErrorClass::DnsLookupError {
+        (502, r#"{"error":"DNS resolution for backend failed"}"#)
     } else {
-        r#"{"error":"Backend unavailable"}"#
+        crate::proxy::http_backend_failure_status_and_body(error_class)
     };
     crate::retry::BackendResponse {
-        status_code: 502,
-        body: crate::retry::ResponseBody::buffered(error_body.as_bytes().to_vec()),
+        status_code,
+        body: crate::retry::ResponseBody::buffered(body.as_bytes().to_vec()),
         headers: HashMap::new(),
         // Funnel through `request_reached_wire` instead of
         // `e.is_connect() || e.is_timeout()` — the predicate-pair misses
         // TLS-handshake failures and reqwest-level timeouts that landed on
         // the connect side without surfacing as `is_connect()=true`. Every
         // dispatch path in the gateway must agree on the wire boundary
-        // (see `retry::request_reached_wire`).
+        // (see `retry::request_reached_wire`). Post-wire read/write
+        // deadline expiry is 504 with a timeout-specific body (#3922).
         connection_error: !crate::retry::request_reached_wire(error_class),
         backend_resolved_ip,
         error_class: Some(error_class),
@@ -1189,10 +1190,13 @@ async fn collect_reqwest_response_body_with_limit(
             }
             Err(error) => {
                 warn!("cross-protocol H3→HTTP: failed to read buffered response body: {error}");
+                let (status, class) = crate::proxy::eager_buffer_body_read_status_and_class(
+                    crate::retry::classify_reqwest_error(&error),
+                );
                 return Err((
-                    502,
-                    r#"{"error":"Backend response body read failed"}"#.as_bytes().to_vec(),
-                    Some(crate::retry::classify_reqwest_error(&error)),
+                    status,
+                    crate::proxy::eager_buffer_body_read_error_body(status),
+                    Some(class),
                 ));
             }
         }
@@ -8211,6 +8215,24 @@ where
         }
     }
 
+    // Unconditional post-relay fail-closed terminal (issue #3995). Every branch
+    // above that ends a COMMITTED response without landing a clean FIN is
+    // supposed to reset the send half, but "latch the termination" and "reset
+    // the stream" were two separate steps, so a branch that only broke out of
+    // the relay left the send half untouched — and `quinn::SendStream::drop`
+    // then implicitly `finish()`es it, handing a stalled client a normal end of
+    // response instead of an authorization failure. Re-asserting the reset here
+    // makes credential expiry a RESET no matter which branch observed it.
+    // `stop_stream` is idempotent (quinn rejects a redundant reset and h3
+    // discards the result), and the predicate is false for a cleanly finished
+    // body, so a successful `finish()` is never clobbered.
+    if crate::http3::stream_util::committed_response_requires_reset(
+        auth_termination.is_some(),
+        body_error_class.is_some(),
+        client_disconnected,
+    ) {
+        crate::http3::stream_util::abort_response_stream(stream);
+    }
     let body_completed = body_error_class.is_none() && !client_disconnected;
     (
         bytes_streamed,
@@ -8485,6 +8507,24 @@ where
         }
     }
 
+    // Unconditional post-relay fail-closed terminal (issue #3995). Every branch
+    // above that ends a COMMITTED response without landing a clean FIN is
+    // supposed to reset the send half, but "latch the termination" and "reset
+    // the stream" were two separate steps, so a branch that only broke out of
+    // the relay left the send half untouched — and `quinn::SendStream::drop`
+    // then implicitly `finish()`es it, handing a stalled client a normal end of
+    // response instead of an authorization failure. Re-asserting the reset here
+    // makes credential expiry a RESET no matter which branch observed it.
+    // `stop_stream` is idempotent (quinn rejects a redundant reset and h3
+    // discards the result), and the predicate is false for a cleanly finished
+    // body, so a successful `finish()` is never clobbered.
+    if crate::http3::stream_util::committed_response_requires_reset(
+        auth_termination.is_some(),
+        body_error_class.is_some(),
+        client_disconnected,
+    ) {
+        crate::http3::stream_util::abort_response_stream(stream);
+    }
     let body_completed = finished && body_error_class.is_none() && !client_disconnected;
     (
         bytes_streamed,

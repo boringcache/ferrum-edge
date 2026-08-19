@@ -1,11 +1,10 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use base64::Engine;
-use jsonwebtoken::{Algorithm, Validation, decode, decode_header};
+use jsonwebtoken::{Algorithm, Header, Validation, decode, decode_header};
 use serde_json::Value;
-use tracing::debug;
 
-use super::jwks_store::JwksKeyStore;
+use super::jwks_store::{CachedJwk, JwksKeyStore};
 
 pub struct JwtVerifyParams<'a> {
     pub issuer: Option<&'a str>,
@@ -15,33 +14,40 @@ pub struct JwtVerifyParams<'a> {
     pub validate_nbf: bool,
 }
 
+/// Verify a JWT against a trusted JWKS snapshot.
+///
+/// Key selection is exclusively the JWT header `kid`:
+/// - missing or empty `kid` fails closed
+/// - a `kid` absent from the current trusted map fails closed
+/// - a matching `kid` binds verification to that one key
+///
+/// There is no all-keys fallback. A token signed by a different published key
+/// is rejected even when that other key would verify the signature. Failures
+/// return `None` with no token, claim, key, or `kid` logging.
 pub async fn verify_jwt_with_jwks(
     token: &str,
     store: &JwksKeyStore,
     params: &JwtVerifyParams<'_>,
 ) -> Option<Value> {
     let all_keys = store.trusted_keys()?;
-
     let header = decode_header(token).ok()?;
+    let cached_key = key_for_header_kid(&header, &all_keys)?;
+    let validation = build_validation(cached_key.algorithm, params);
+    decode::<Value>(token, &cached_key.decoding_key, &validation)
+        .ok()
+        .map(|td| td.claims)
+}
 
-    if let Some(kid) = &header.kid {
-        if let Some(cached_key) = all_keys.get(kid) {
-            let validation = build_validation(cached_key.algorithm, params);
-            if let Ok(td) = decode::<Value>(token, &cached_key.decoding_key, &validation) {
-                return Some(td.claims);
-            }
-        }
-        debug!("JWKS key identifier did not select a valid key; trying the bounded key set");
-    }
-
-    for cached_key in all_keys.values() {
-        let validation = build_validation(cached_key.algorithm, params);
-        if let Ok(td) = decode::<Value>(token, &cached_key.decoding_key, &validation) {
-            return Some(td.claims);
-        }
-    }
-
-    None
+/// Bind verification to the single trusted key named by the JWT header `kid`.
+///
+/// Missing, empty, and unknown identifiers return `None`. The identifier itself
+/// is never logged.
+fn key_for_header_kid<'a>(
+    header: &Header,
+    keys: &'a HashMap<String, CachedJwk>,
+) -> Option<&'a CachedJwk> {
+    let kid = header.kid.as_deref().filter(|kid| !kid.is_empty())?;
+    keys.get(kid)
 }
 
 pub fn peek_unverified_issuer(token: &str) -> Option<String> {

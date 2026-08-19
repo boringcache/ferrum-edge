@@ -14588,6 +14588,7 @@ async fn arm_mesh_runtime_startup(
                 cert_path.clone(),
                 key_path.clone(),
                 env_config.dtls_client_ca_cert_path.clone(),
+                env_config.frontend_tls_live_reload_enabled,
             )
             .await;
     }
@@ -32364,7 +32365,7 @@ mod tests {
         );
         proxy_state
             .stream_listener_manager
-            .set_frontend_dtls_cert_key(dtls_cert, dtls_key, Some(dtls_ca))
+            .set_frontend_dtls_cert_key(dtls_cert, dtls_key, Some(dtls_ca), false)
             .await;
         proxy_state
             .stream_listener_manager

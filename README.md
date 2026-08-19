@@ -251,6 +251,7 @@ Operational note: all logging flows through bounded **non-blocking writers** (fi
 ### File Mode Config Format
 
 ```yaml
+version: "1"
 proxies:
   - id: "my-api"
     listen_path: "/api/v1"
@@ -258,8 +259,6 @@ proxies:
     backend_host: "backend-service"
     backend_port: 3000
     strip_listen_path: true
-    plugins:
-      - plugin_config_id: "log-plugin"
 
 consumers:
   - id: "user-1"

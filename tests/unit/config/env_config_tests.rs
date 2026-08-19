@@ -1137,6 +1137,80 @@ fn test_env_config_mesh_mode_gateway_svid_takes_precedence_over_ca_backend() {
     );
 }
 
+/// Issue #3927: the three `FERRUM_GATEWAY_SVID_*` sources are loaded together
+/// by `load_gateway_svid_bundle`, so a partial tuple is never a usable
+/// workload identity. `validate` must refuse it with the same
+/// together-or-not-at-all diagnostic startup uses, instead of falling through
+/// to the generic no-identity error (which points at a CA backend the operator
+/// did not ask for).
+#[test]
+fn test_env_config_mesh_rejects_incomplete_file_svid_tuple() {
+    with_env_vars(
+        &[
+            ("FERRUM_MODE", "mesh"),
+            ("FERRUM_DP_CP_GRPC_URLS", "http://cp:50051"),
+            (
+                "FERRUM_CP_DP_GRPC_JWT_SECRET",
+                "secret-padding-for-32-char-min!!",
+            ),
+            ("FERRUM_GATEWAY_SVID_CERT_PATH", "/tmp/ferrum-svid.crt"),
+            ("FERRUM_GATEWAY_SVID_KEY_PATH", "/tmp/ferrum-svid.key"),
+        ],
+        || {
+            remove_var("FERRUM_GATEWAY_SVID_TRUST_BUNDLE_PATH");
+            remove_var("FERRUM_MESH_PRODUCTION_MODE");
+            remove_var("FERRUM_MESH_CA_BACKEND");
+            remove_var("FERRUM_MESH_ALLOW_NO_CA");
+            let error = EnvConfig::from_env().expect_err("partial SVID tuple must fail");
+            assert!(
+                error.contains("file-based gateway SVID material is incomplete"),
+                "got: {error}"
+            );
+            for var in [
+                "FERRUM_GATEWAY_SVID_CERT_PATH",
+                "FERRUM_GATEWAY_SVID_KEY_PATH",
+                "FERRUM_GATEWAY_SVID_TRUST_BUNDLE_PATH",
+            ] {
+                assert!(error.contains(var), "diagnostic must name {var}: {error}");
+            }
+        },
+    );
+}
+
+/// The no-identity dev opt-out acknowledges "no SVID material at all"; it must
+/// not excuse a half-configured tuple that `ProxyState` construction would
+/// reject anyway (issue #3927). Without this, `validate` reports OK for a mesh
+/// that cannot start.
+#[test]
+fn test_env_config_mesh_incomplete_file_svid_tuple_not_excused_by_allow_no_ca() {
+    with_env_vars(
+        &[
+            ("FERRUM_MODE", "mesh"),
+            ("FERRUM_DP_CP_GRPC_URLS", "http://cp:50051"),
+            (
+                "FERRUM_CP_DP_GRPC_JWT_SECRET",
+                "secret-padding-for-32-char-min!!",
+            ),
+            (
+                "FERRUM_GATEWAY_SVID_TRUST_BUNDLE_PATH",
+                "/tmp/ferrum-svid-bundle.pem",
+            ),
+            ("FERRUM_MESH_ALLOW_NO_CA", "true"),
+        ],
+        || {
+            remove_var("FERRUM_GATEWAY_SVID_CERT_PATH");
+            remove_var("FERRUM_GATEWAY_SVID_KEY_PATH");
+            remove_var("FERRUM_MESH_PRODUCTION_MODE");
+            remove_var("FERRUM_MESH_CA_BACKEND");
+            let error = EnvConfig::from_env().expect_err("bundle-only tuple must fail");
+            assert!(
+                error.contains("file-based gateway SVID material is incomplete"),
+                "got: {error}"
+            );
+        },
+    );
+}
+
 #[test]
 fn test_env_config_mesh_workload_api_rejects_file_svid_override() {
     // Mesh startup deliberately suppresses automatic CA-backed issuance when
