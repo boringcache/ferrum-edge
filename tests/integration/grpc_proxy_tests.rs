@@ -2211,7 +2211,7 @@ async fn hmac_auth_rfc9530_content_digest_preserves_grpc_body_and_rejects_ambigu
     let ambiguous_authorization = format!(
         "hmac username=\"grpc-hmac-cd-user\", algorithm=\"hmac-sha256\", signature=\"{ambiguous_signature}\""
     );
-    let (ambiguous_status, _, _) = send_grpc_request_with_authority(
+    let (ambiguous_status, ambiguous_headers, _) = send_grpc_request_with_authority(
         gateway_addr,
         path,
         grpc_message,
@@ -2224,9 +2224,19 @@ async fn hmac_auth_rfc9530_content_digest_preserves_grpc_body_and_rejects_ambigu
     )
     .await
     .expect("ambiguous digest headers should complete as a rejection");
+    // A plugin reject on an `application/grpc` request is normalized to a
+    // trailers-only gRPC error, NOT an HTTP 401: the transport status stays
+    // 200 and the refusal is carried in `grpc-status`. Assert the trailer,
+    // which also proves the reject reached the client as a well-formed gRPC
+    // error rather than merely "not a success".
     assert_eq!(
-        ambiguous_status, 401,
-        "sending both Digest and Content-Digest must fail closed"
+        ambiguous_status, 200,
+        "gRPC rejections are trailers-only; the HTTP status stays 200"
+    );
+    assert_eq!(
+        ambiguous_headers.get("grpc-status").map(String::as_str),
+        Some("16"),
+        "sending both Digest and Content-Digest must fail closed as UNAUTHENTICATED"
     );
 }
 
