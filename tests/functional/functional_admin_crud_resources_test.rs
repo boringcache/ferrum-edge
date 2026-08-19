@@ -2182,6 +2182,12 @@ fn plugin_config_fixture(plugin_name: &str, dispatch_upstream_id: &str) -> Value
                 "grpc_services": ["a2a.v1.A2AService"]
             }
         }),
+        // A bare `{}` waf config is not admissible: `mode` defaults to `enforce`
+        // and the built-in pack is monitor-only, which admission rejects as
+        // having no reachable enforcement path (issue #3928). `mode: monitor` is
+        // the documented always-valid posture, so the CRUD matrix exercises
+        // create/read/update/delete rather than admission.
+        "waf" => json!({"mode": "monitor"}),
         "ws_message_size_limiting" => json!({"max_frame_bytes": 65536}),
         "ws_rate_limiting" => json!({"frames_per_second": 100}),
         "udp_rate_limiting" => json!({"datagrams_per_second": 1000}),

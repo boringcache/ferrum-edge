@@ -8,6 +8,7 @@ use tokio::net::UdpSocket;
 
 struct GeneratedCa {
     cert_pem: String,
+    cert_der: Vec<u8>,
     issuer: Issuer<'static, KeyPair>,
 }
 
@@ -27,8 +28,10 @@ fn generate_ca(cn: &str) -> GeneratedCa {
     params.key_usages.push(KeyUsagePurpose::CrlSign);
     let cert = params.self_signed(&key_pair).expect("self-sign CA");
     let cert_pem = cert.pem();
+    let cert_der = cert.der().to_vec();
     GeneratedCa {
         cert_pem,
+        cert_der,
         issuer: Issuer::new(params, key_pair),
     }
 }
@@ -46,8 +49,10 @@ fn generate_intermediate_ca(parent: &GeneratedCa, cn: &str) -> GeneratedCa {
     let cert = params
         .signed_by(&key_pair, &parent.issuer)
         .expect("sign intermediate");
+    let cert_der = cert.der().to_vec();
     GeneratedCa {
         cert_pem: cert.pem(),
+        cert_der,
         issuer: Issuer::new(params, key_pair),
     }
 }
@@ -61,6 +66,33 @@ fn generate_signed_cert(ca: &GeneratedCa, cn: &str, sans: &[&str]) -> GeneratedC
         .distinguished_name
         .push(rcgen::DnType::CommonName, cn);
     let cert = params.signed_by(&key_pair, &ca.issuer).expect("sign leaf");
+    GeneratedCert {
+        cert_pem: cert.pem(),
+        key_pem: key_pair.serialize_pem(),
+    }
+}
+
+/// Generate a leaf that exercises client-certificate path validation.
+///
+/// `WebPkiClientVerifier` requires the `clientAuth` purpose. Reusing the
+/// server-certificate fixture above would make both the trusted control and the
+/// untrusted-CA case fail before trust-anchor selection, leaving the latter
+/// assertion vacuous.
+fn generate_client_auth_cert(ca: &GeneratedCa, cn: &str, sans: &[&str]) -> GeneratedCert {
+    let key_pair =
+        KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).expect("generate client key");
+    let san_strings: Vec<String> = sans.iter().map(|s| s.to_string()).collect();
+    let mut params = CertificateParams::new(san_strings).expect("client leaf params");
+    params
+        .distinguished_name
+        .push(rcgen::DnType::CommonName, cn);
+    params.key_usages.push(KeyUsagePurpose::DigitalSignature);
+    params
+        .extended_key_usages
+        .push(rcgen::ExtendedKeyUsagePurpose::ClientAuth);
+    let cert = params
+        .signed_by(&key_pair, &ca.issuer)
+        .expect("sign client leaf");
     GeneratedCert {
         cert_pem: cert.pem(),
         key_pem: key_pair.serialize_pem(),
@@ -492,6 +524,7 @@ async fn test_dtls_client_server_handshake_and_echo() {
         dimpl_config: Arc::new(server_config),
         certificate: server_cert.into(),
         client_cert_verifier: None,
+        client_trust: None,
     };
 
     let server = Arc::new(
@@ -928,6 +961,7 @@ async fn test_dtls_server_accepts_strict_dtls13_client() {
         ),
         certificate: server_cert.into(),
         client_cert_verifier: None,
+        client_trust: None,
     };
 
     let server = Arc::new(
@@ -1029,6 +1063,7 @@ async fn test_dtls_server_close_releases_socket() {
         dimpl_config: Arc::new(dimpl::Config::builder().build().expect("build config")),
         certificate: server_cert.into(),
         client_cert_verifier: None,
+        client_trust: None,
     };
 
     let server = Arc::new(
@@ -1048,4 +1083,391 @@ async fn test_dtls_server_close_releases_socket() {
         .await
         .expect("server close should release UDP socket");
     drop(rebound);
+}
+
+struct Dtls12ClientOutcome {
+    /// Whether the client itself observed `Output::Connected` — whether the
+    /// server's final flight reached it and the handshake actually completed.
+    connected: bool,
+    echo: Option<Vec<u8>>,
+    /// Why the raw client stopped processing records, if it did. A refused
+    /// handshake may produce a fatal alert or an unreadable epoch-1 record;
+    /// neither is a transport failure of the test driver. An accepted control
+    /// that never reaches `Connected` must still surface this so a silent
+    /// `handle_packet` error cannot be mistaken for a timeout.
+    transport_error: Option<String>,
+    /// How many datagrams this client received from the server. Without it, a
+    /// listener that never answered and a listener that answered and then went
+    /// silent are indistinguishable in the failure message: both are
+    /// `connected == false, transport_error == None`.
+    server_datagrams: usize,
+}
+
+/// Drive a raw dimpl **DTLS 1.2** client presenting `certificate`.
+///
+/// The version is pinned deliberately. In DTLS 1.3 the server's Finished belongs
+/// to a flight sent before the client's certificate is even seen, so no server
+/// behaviour can leave that handshake incomplete; DTLS 1.2 is the version whose
+/// final flight follows client authentication, and it is the version the hosted
+/// NodeWaypoint probe pins with `openssl s_client -dtls1_2`. `Dtls::new_auto`
+/// would negotiate 1.3 against Ferrum's auto-sensing server and prove nothing.
+///
+/// A refused handshake is expected to yield either nothing at all or a record
+/// this client cannot process. Neither is a transport failure of the assertion:
+/// only `connected` answers the question being asked. `transport_error` is
+/// recorded so a later accepted control that stalls is diagnosable.
+async fn dtls12_client_handshake(
+    server_addr: std::net::SocketAddr,
+    certificate: dimpl::DtlsCertificateChain,
+    budget: Duration,
+    payload: Option<&[u8]>,
+) -> Result<Dtls12ClientOutcome, anyhow::Error> {
+    let socket = UdpSocket::bind("127.0.0.1:0").await?;
+    socket.connect(server_addr).await?;
+    dtls12_client_handshake_on(socket, certificate, budget, payload).await
+}
+
+/// Same driver as [`dtls12_client_handshake`], on a caller-owned connected
+/// socket. The refusal test reserves the accepted client's UDP port before the
+/// withdrawn peer starts so a leftover demux entry at a recycled ephemeral
+/// port cannot swallow the positive control.
+async fn dtls12_client_handshake_on(
+    socket: UdpSocket,
+    certificate: dimpl::DtlsCertificateChain,
+    budget: Duration,
+    payload: Option<&[u8]>,
+) -> Result<Dtls12ClientOutcome, anyhow::Error> {
+    // `use_server_cookie` is a SERVER-side knob (`dimpl::dtls12::server` /
+    // `dtls13::server` are its only readers), so setting it here never changed
+    // this client and only obscured which side of the fixture owned the cookie
+    // exchange. The client drives whatever the listener asks for, exactly as
+    // `openssl s_client -dtls1_2` does in the hosted NodeWaypoint probe.
+    let config = Arc::new(
+        dimpl::Config::builder()
+            .build()
+            .expect("build DTLS 1.2 client config"),
+    );
+    let mut client = dimpl::Dtls::new_12(config, certificate, Instant::now());
+    client.set_active(true);
+    client.handle_timeout(Instant::now())?;
+
+    let mut out_buf = vec![0u8; 4096];
+    let mut udp_buf = vec![0u8; 65536];
+    let mut next_timeout = None;
+    let mut connected = false;
+    let mut received = None;
+    let mut server_datagrams = 0usize;
+
+    drain_dtls_client_outputs(
+        &mut client,
+        &socket,
+        &mut out_buf,
+        &mut next_timeout,
+        &mut connected,
+        &mut received,
+    )
+    .await?;
+
+    let handshake_deadline = Instant::now() + budget;
+    let mut transport_ended = false;
+    let mut transport_error = None;
+    while Instant::now() < handshake_deadline && !connected && !transport_ended {
+        let remaining = handshake_deadline.saturating_duration_since(Instant::now());
+        let sleep_dur = next_timeout
+            .map(|t| t.saturating_duration_since(Instant::now()))
+            .unwrap_or(Duration::from_millis(100))
+            .min(remaining)
+            .min(Duration::from_millis(100));
+        tokio::select! {
+            result = socket.recv(&mut udp_buf) => {
+                let len = result?;
+                server_datagrams += 1;
+                if let Err(e) = client.handle_packet(&udp_buf[..len]) {
+                    transport_error = Some(e.to_string());
+                    transport_ended = true;
+                }
+            }
+            _ = tokio::time::sleep(sleep_dur) => {
+                if let Some(t) = next_timeout
+                    && Instant::now() >= t
+                {
+                    if let Err(e) = client.handle_timeout(Instant::now()) {
+                        transport_error = Some(e.to_string());
+                        transport_ended = true;
+                    }
+                    next_timeout = None;
+                }
+            }
+        }
+
+        drain_dtls_client_outputs(
+            &mut client,
+            &socket,
+            &mut out_buf,
+            &mut next_timeout,
+            &mut connected,
+            &mut received,
+        )
+        .await?;
+    }
+
+    if !connected {
+        return Ok(Dtls12ClientOutcome {
+            connected: false,
+            echo: None,
+            transport_error,
+            server_datagrams,
+        });
+    }
+
+    let Some(payload) = payload else {
+        return Ok(Dtls12ClientOutcome {
+            connected: true,
+            echo: None,
+            transport_error: None,
+            server_datagrams,
+        });
+    };
+
+    client.send_application_data(payload)?;
+    drain_dtls_client_outputs(
+        &mut client,
+        &socket,
+        &mut out_buf,
+        &mut next_timeout,
+        &mut connected,
+        &mut received,
+    )
+    .await?;
+
+    let echo_deadline = Instant::now() + budget;
+    while Instant::now() < echo_deadline && received.is_none() {
+        let remaining = echo_deadline.saturating_duration_since(Instant::now());
+        let sleep_dur = next_timeout
+            .map(|t| t.saturating_duration_since(Instant::now()))
+            .unwrap_or(Duration::from_millis(100))
+            .min(remaining)
+            .min(Duration::from_millis(100));
+        tokio::select! {
+            result = socket.recv(&mut udp_buf) => {
+                let len = result?;
+                server_datagrams += 1;
+                client.handle_packet(&udp_buf[..len])?;
+            }
+            _ = tokio::time::sleep(sleep_dur) => {
+                if let Some(t) = next_timeout
+                    && Instant::now() >= t
+                {
+                    client.handle_timeout(Instant::now())?;
+                    next_timeout = None;
+                }
+            }
+        }
+
+        drain_dtls_client_outputs(
+            &mut client,
+            &socket,
+            &mut out_buf,
+            &mut next_timeout,
+            &mut connected,
+            &mut received,
+        )
+        .await?;
+    }
+
+    Ok(Dtls12ClientOutcome {
+        connected: true,
+        echo: received,
+        transport_error: None,
+        server_datagrams,
+    })
+}
+
+/// Frontend DTLS mTLS must fail closed at the **protocol** boundary (issue #3857).
+///
+/// dimpl's DTLS 1.2 server queues its ChangeCipherSpec+Finished flight and only
+/// then pushes `Connected` onto the local-event queue `poll_output` pops first,
+/// so at the refusal site that flight exists but is unsent. A refusal that drains
+/// `poll_output` onto the socket therefore delivers it, and the peer reports a
+/// COMPLETED handshake (`SSL_is_init_finished`) before the alert queued behind it
+/// lands — an unauthenticated peer observing an established DTLS session, whatever
+/// the gateway does with it afterwards. This drives real sockets and asserts on
+/// the CLIENT's own view: a refused chain must never see `Output::Connected` and
+/// must never be delivered through `accept()`, while a certificate from the
+/// currently accepted CA must still complete and relay.
+#[tokio::test]
+async fn test_frontend_dtls_refuses_untrusted_client_without_completing_the_handshake() {
+    // The session driver deliberately records packet-processing failures at
+    // TRACE because malformed datagrams are hostile input in production. Keep
+    // this integration test diagnosable in hosted CI without raising the
+    // production log level or turning transient infrastructure failures into
+    // blind reruns.
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter("ferrum_edge::dtls=trace,dimpl=trace")
+        .with_test_writer()
+        .try_init();
+
+    let _ =
+        rustls::crypto::CryptoProvider::install_default(rustls::crypto::ring::default_provider());
+
+    let temp_dir = tempfile::TempDir::new().expect("temp dir");
+    let accepted_ca = generate_ca("DTLS accepted client CA");
+    let withdrawn_ca = generate_ca("DTLS withdrawn client CA");
+    let accepted_client = generate_client_auth_cert(&accepted_ca, "accepted-client", &["client-a"]);
+    let withdrawn_client =
+        generate_client_auth_cert(&withdrawn_ca, "withdrawn-client", &["client-b"]);
+    let accepted_chain = ferrum_edge::dtls::load_dtls_certificate(
+        &write_pem(&temp_dir, "accepted-client.pem", &accepted_client.cert_pem),
+        &write_pem(&temp_dir, "accepted-client.key", &accepted_client.key_pem),
+    )
+    .expect("load accepted client identity");
+    let withdrawn_chain = ferrum_edge::dtls::load_dtls_certificate(
+        &write_pem(
+            &temp_dir,
+            "withdrawn-client.pem",
+            &withdrawn_client.cert_pem,
+        ),
+        &write_pem(&temp_dir, "withdrawn-client.key", &withdrawn_client.key_pem),
+    )
+    .expect("load withdrawn client identity");
+
+    let accepted_ca_der = rustls::pki_types::CertificateDer::from(accepted_ca.cert_der.clone());
+    let mut roots = rustls::RootCertStore::empty();
+    roots.add(accepted_ca_der).expect("add accepted client CA");
+    let verifier = rustls::server::WebPkiClientVerifier::builder(Arc::new(roots))
+        .build()
+        .expect("build DTLS client verifier");
+
+    let server_cert =
+        dimpl::certificate::generate_self_signed_certificate().expect("generate server cert");
+    // Exactly the posture `dtls::build_frontend_dtls_config` produces for a
+    // listener with a client CA: `require_client_certificate(true)` on top of
+    // the builder defaults. The HelloVerifyRequest cookie exchange must NOT be
+    // disabled here. It is not cosmetic — it is the only frontend DTLS server
+    // configuration Ferrum ships, and it is what the hosted NodeWaypoint live
+    // gate handshakes against with `openssl s_client -dtls1_2` and a current-CA
+    // client certificate. Turning it off put this fixture on dimpl's
+    // auto-sense DTLS 1.2 FALLBACK path in a cookie-less, certificate-
+    // authenticated combination that neither Ferrum nor dimpl exercises
+    // anywhere else: the accepted control then never received the server's
+    // final flight, so it reported `connected == false` with no transport
+    // error, and the refusal assertions above passed vacuously because a
+    // listener that answers nothing also refuses everything.
+    let frontend_config = ferrum_edge::dtls::FrontendDtlsConfig {
+        dimpl_config: Arc::new(
+            dimpl::Config::builder()
+                .require_client_certificate(true)
+                .build()
+                .expect("build frontend DTLS config"),
+        ),
+        certificate: server_cert.into(),
+        client_cert_verifier: Some(verifier),
+        client_trust: None,
+    };
+
+    let server = Arc::new(
+        ferrum_edge::dtls::DtlsServer::bind(
+            "127.0.0.1:0".parse().expect("server bind address"),
+            frontend_config,
+        )
+        .await
+        .expect("bind mTLS DTLS server"),
+    );
+    let server_addr = server.local_addr();
+    let server_runner = server.clone();
+    let run_task = tokio::spawn(async move { server_runner.run().await });
+
+    let delivered = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let acceptor_delivered = delivered.clone();
+    let server_acceptor = server.clone();
+    let accept_task = tokio::spawn(async move {
+        while let Ok((conn, _addr)) = server_acceptor.accept().await {
+            acceptor_delivered.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            tokio::spawn(async move {
+                loop {
+                    match conn.recv().await {
+                        Ok(data) if !data.is_empty() => {
+                            if conn.send(&data).await.is_err() {
+                                break;
+                            }
+                        }
+                        _ => break,
+                    }
+                }
+            });
+        }
+    });
+
+    // Reserve the accepted client's UDP port before the withdrawn peer starts
+    // so a leftover demux session at a recycled ephemeral port cannot swallow
+    // the positive-control ClientHello.
+    let accepted_socket = UdpSocket::bind("127.0.0.1:0")
+        .await
+        .expect("reserve accepted client port");
+    accepted_socket
+        .connect(server_addr)
+        .await
+        .expect("connect accepted client");
+
+    let refused = dtls12_client_handshake(
+        server_addr,
+        withdrawn_chain,
+        Duration::from_secs(5),
+        Some(&b"withdrawn-must-not-relay"[..]),
+    )
+    .await
+    .expect("drive refused DTLS 1.2 client");
+    assert!(
+        !refused.connected,
+        "a client certificate the configured verifier refuses must not complete the \
+         frontend DTLS handshake"
+    );
+    assert!(
+        refused.echo.is_none(),
+        "a refused client must never receive relayed application data"
+    );
+    assert_eq!(
+        delivered.load(std::sync::atomic::Ordering::SeqCst),
+        0,
+        "a refused handshake must never be delivered through accept()"
+    );
+    // A listener that answered nothing at all would satisfy every assertion
+    // above without refusing anything. The refusal is only meaningful if this
+    // peer actually reached the certificate stage, which means it received the
+    // server's earlier flights first.
+    assert!(
+        refused.server_datagrams > 0,
+        "the refused peer must have been answered up to the certificate stage; a silent \
+         listener makes the refusal assertions vacuous (transport_error={:?})",
+        refused.transport_error
+    );
+
+    let admitted = dtls12_client_handshake_on(
+        accepted_socket,
+        accepted_chain,
+        Duration::from_secs(10),
+        Some(&b"accepted-ca-ok"[..]),
+    )
+    .await
+    .expect("drive accepted DTLS 1.2 client");
+    assert!(
+        admitted.connected,
+        "a certificate from the currently accepted client CA must still complete the \
+         handshake (transport_error={:?}, server_datagrams={})",
+        admitted.transport_error, admitted.server_datagrams
+    );
+    assert_eq!(
+        admitted.echo.as_deref(),
+        Some(&b"accepted-ca-ok"[..]),
+        "an admitted mTLS DTLS session must still relay application data"
+    );
+    assert_eq!(
+        delivered.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "exactly the admitted session reaches the proxy"
+    );
+
+    server.close().await;
+    accept_task.abort();
+    let _ = tokio::time::timeout(Duration::from_secs(5), run_task).await;
 }

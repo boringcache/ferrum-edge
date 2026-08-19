@@ -48,6 +48,7 @@ async fn spawn_dtls_server() -> (Arc<ferrum_edge::dtls::DtlsServer>, SocketAddr)
         dimpl_config: Arc::new(server_config),
         certificate: server_cert.into(),
         client_cert_verifier: None,
+        client_trust: None,
     };
     let server = Arc::new(
         ferrum_edge::dtls::DtlsServer::bind("127.0.0.1:0".parse().unwrap(), frontend)
@@ -1404,6 +1405,7 @@ async fn test_dtls_connection_send_rejects_oversized_plaintext() {
         dimpl_config: Arc::new(server_config),
         certificate: server_cert.into(),
         client_cert_verifier: None,
+        client_trust: None,
     };
     let server = Arc::new(
         ferrum_edge::dtls::DtlsServer::bind("127.0.0.1:0".parse().unwrap(), frontend)

@@ -46,9 +46,13 @@ default: deploy the WAF, watch what it flags, then enforce deliberately. It
 also means `mode: enforce` **alone does not block anything** — you must opt
 rules into enforcement. There are three ways:
 
-1. **`default_rule_action`** — bulk-set the action of every built-in rule.
-   `default_rule_action: "enforce"` enforces the whole pack (still subject to
-   `paranoia_level`; see below). `rule_modes` overrides still win per rule.
+1. **`default_rule_action`** — bulk-set the action of built-in rules that
+   inherit it. `default_rule_action: "enforce"` enforces the low-false-positive
+   core of the pack (still subject to `paranoia_level`; see below). Heuristic
+   encoding-evasion rules (`FE-ENCODING-001`, `FE-ENCODING-002`) stay
+   **monitor** under that bulk switch; only an explicit per-rule `rule_modes`
+   or `rule_overrides.action` entry promotes them. Other `rule_modes` overrides
+   still win per rule.
 2. **`rule_modes`** — set the action of individual rules by id:
    `{"FE-SQLI-001": "enforce"}`.
 3. **anomaly scoring** — keep rules in `monitor` and block on the aggregate
@@ -61,7 +65,9 @@ below), the recommended starting posture for active blocking is:
 { "mode": "enforce", "default_rule_action": "enforce", "paranoia_level": 1 }
 ```
 
-This enforces only the low-false-positive core of the rule pack.
+This enforces only the low-false-positive core of the rule pack. Encoding
+heuristics remain monitor-only under this posture; promote them with
+`rule_modes` after confirming they are clean for your traffic.
 
 ### Strict configuration admission
 
@@ -86,6 +92,17 @@ by a blanket `additionalProperties: false` on the map itself:
 `scoring.weights` accepts only the severity names `info` / `low` / `medium` /
 `high` / `critical`.
 
+`mode: enforce` is rejected at construction when no reachable enforcement path
+remains after `default_rule_action`, `rule_modes`, `rule_overrides`,
+`disabled_default_rules`, custom rules, paranoia filtering, and the request /
+response inspection toggles. Built-in rules are monitor-only unless opted in, so
+`mode: enforce` with only the default pack is not admitted. `mode: monitor`
+with zero enforcing rules remains valid. Anomaly scoring (`scoring.enabled`) and
+stream transport guards (`stream.tcp_require_tls`, enforce-action
+`stream.signatures`) are separate enforcement paths and satisfy admission
+without per-rule `action: enforce` when their corresponding inspection surface
+is enabled.
+
 ## Paranoia levels
 
 `paranoia_level` (1–4, default 1) gates which rules are active. Each rule has a
@@ -107,8 +124,16 @@ matching request and response bodies, the WAF also scans **decoded variants**:
 So a `<script>` written as `<script>`, `&lt;script&gt;`, or
 `%3Cscript%3E` in a body is still caught by the script-tag rule. Decoding is
 content-type-agnostic (an attacker controls the declared `Content-Type`), and
-bounded to a small number of variants. Query values are percent-decoded before
-matching as well.
+bounded to a small number of variants.
+
+Query **values** (each `&`/`=`-split component — never the structural
+delimiters, and never the request path) run through that same bounded layered
+percent-decode before matching, including reserved octets such as `%2f` /
+`%2F`. Path canonicalization still refuses encoded separators; that contract
+is not applied to query payload. At most three decode rounds are applied;
+deeper stacks are not fully reduced and are flagged as `encoding_evasion` on
+the raw URL/body rather than being decoded indefinitely. Decoding is
+inspection-only: the original query bytes are forwarded unchanged.
 
 The layered decode runs a bounded number of rounds (a cost guard against
 decompression-style blowups), so double- and triple-stacked encodings are fully
@@ -125,9 +150,13 @@ Note that body marker detection is a heuristic: a benign body that legitimately
 contains a literal encoded marker (e.g. `code=SAVE50%25`, a `%00` in free text,
 or `%c0%ae` in a paste) can raise `FE-ENCODING-001` or `FE-ENCODING-002`.
 This is why both rules default to **Monitor** (they record `waf.rule_hits`
-metadata rather than blocking) even when the WAF is in `enforce` mode —
-operators opt a rule into blocking explicitly via `rule_modes` once they have
-confirmed it is clean for their traffic.
+metadata rather than blocking) even under the recommended `mode: enforce` +
+`default_rule_action: enforce` posture — operators opt a rule into blocking
+explicitly via `rule_modes` (or `rule_overrides.action`) once they have
+confirmed it is clean for their traffic. Global `mode: monitor` or `disabled`
+still dominates: a promoted encoding rule only logs in monitor mode and is
+not evaluated when the plugin is disabled. `waf.action` / `waf.score` /
+stdout `action=` fields report that compile-time effective disposition.
 
 ## Rule targets
 
@@ -147,6 +176,16 @@ Runtime aliases map onto those targets: `request_headers` → `header_values`,
 
 `match_kind` is one of `regex` (default), `literal`, `contains`, `equals`,
 `luhn` (credit-card checksum; body targets only), or `cidr` (IP membership).
+Semantics:
+
+| Kind | Matching |
+| --- | --- |
+| `regex` | Operator-authored Rust regex. Case sensitivity follows the pattern; use `(?i)…` when you need folding. |
+| `literal` | Case-sensitive Unicode substring. `EVIL-LITERAL` does not match `evil-literal`; the value need not equal the whole field (unlike `equals`). |
+| `contains` | Case-insensitive substring (same substring semantics as `literal`, but folded). |
+| `equals` | Case-insensitive full-value match (anchored; does not prefix-match). |
+| `luhn` | Valid credit-card Luhn checksum on digit runs (body targets only). |
+| `cidr` | IP membership test. |
 
 ## Built-in rule pack
 
@@ -165,14 +204,14 @@ and `rule_overrides`. Categories:
 | `xpath_injection` | FE-XPATH-001, FE-XPATH-002 (L3, low value) | |
 | `ssti` | FE-SSTI-001 (broad, L2), FE-SSTI-002 (arithmetic probe, L1), FE-SSTI-003 (Java/Spring EL, L2) | |
 | `xss` | FE-XSS-001..005 plus `-B`/`-Q` body/query mirrors | script-tag and js-URL now cover both query and body |
-| `path_traversal` | FE-PATHTRAV-001..003, FE-PATHTRAV-001-B | now covers request bodies, not just the URL |
-| `lfi` / `rfi` | FE-LFI-001(+ -B), FE-RFI-001 (L2) | |
+| `path_traversal` | FE-PATHTRAV-001..003, FE-PATHTRAV-001-B | FE-PATHTRAV-001..003 (FullUrl) also scan percent-decoded query values (including `%2f`); 001-B covers request bodies. Category labels do not select scan targets. |
+| `lfi` / `rfi` | FE-LFI-001(+ -B), FE-RFI-001 (L2) | FE-LFI-001 (FullUrl) also inspects canonical query values; 001-B covers bodies. The `lfi` label itself does not. |
 | `ssrf` | FE-SSRF-001(+ -Q), FE-SSRF-002(+ -Q) | metadata/private-IP and dangerous schemes across body and query |
 | `xxe` | FE-XXE-001 | external-entity markers; no longer trips on `<!DOCTYPE html>` |
 | `deserialization` | FE-DESER-001..003 | Java / .NET / PHP markers |
 | `header_anomaly` | FE-HEADER-001..003 | control chars, method-override, header-borne injection (L2) |
 | `cookie_attack` | FE-COOKIE-001, FE-COOKIE-002 (Info, L3) | |
-| `encoding_evasion` / `parameter_pollution` / `method_abuse` | FE-ENCODING-001..002, FE-HPP-001, FE-METHOD-001 | |
+| `encoding_evasion` / `parameter_pollution` / `method_abuse` | FE-ENCODING-001..002, FE-HPP-001, FE-METHOD-001 | encoding heuristics stay monitor under bulk `default_rule_action: enforce`; HPP and method-abuse inherit bulk enforce |
 | stack trace / db error / source / fingerprint disclosure | FE-RESP-* | response-side; requires `response_inspection` |
 | `data_leak` | FE-DATA-LEAK-001..006 | credit card (Luhn), AWS/Stripe/GitHub keys, JWT (L2), private key |
 
@@ -222,6 +261,15 @@ Ferrum allows multiple scoped `waf` instances on one proxy. Anomaly scores are
   - `waf.scoring_instance` — identity of the instance that crossed its score
     threshold
 
+Those identities are the configured `plugin_configs[].id` in file, database, CP,
+and DP modes. File/DB/CP/DP construction never substitutes a process-local
+`standalone-<n>` label for a configured instance; that fallback exists only for
+direct constructors that have no resource id (tests and similar callers).
+Resource-id admission already rejects commas, equals signs, and other
+delimiter-breaking characters, so `waf.instance_scores` (`id=score,...`) and
+`waf.instances.<id>.score` stay unambiguous. Duplicate `(namespace, id)` plugin
+configs are refused at config load.
+
 Cross-instance aggregation is intentionally unsupported. If you want one
 combined scoring policy, configure a single WAF instance (or one shared
 `proxy_group`-scoped instance) rather than attaching multiple scoring-enabled
@@ -234,7 +282,11 @@ mode.
 
 `rule_overrides` tunes individual rules — **including built-ins** — without
 forking the rule pack. Attach false-positive filters, scope to paths, raise
-paranoia, change severity/score, or set a per-rule `action`:
+paranoia, change severity/score, or set a per-rule `action`. Per-rule
+`fp_filters` are unanchored regular expressions evaluated against the **complete
+inspected target value** after the rule matcher finds a hit — for example the
+full query value, header value, or `body_json_path` scalar string — not merely
+the substring that satisfied `contains`/`regex`/…:
 
 ```json
 {
@@ -292,6 +344,13 @@ unintended routes:
 }
 ```
 
+The `fp_filters` entry above is a regex, not a literal substring. Escape
+metacharacters as needed (`\\+` in JSON config for a literal `+` in
+`application/ld+json`). After the `contains` matcher hits on the selected
+`user.bio` string, the filter is checked against that **entire** bio value; a
+JSON-LD `<script type="application/ld+json">…</script>` block therefore
+suppresses the hit while an ordinary `<script>…</script>` payload still blocks.
+
 ## Body and response inspection
 
 Request-body inspection is on by default for `POST`/`PUT`/`PATCH` with an
@@ -327,12 +386,15 @@ gateway's own default body ceilings (`FERRUM_MAX_REQUEST_BODY_SIZE_BYTES` /
 anomaly `scoring` has an applicable rule reading that direction's body or at
 least one applicable `action: enforce` rule reads it — `body_text` /
 `body_json_path` for requests, `response_body` for responses, plus the
-body-scoped `FE-ENCODING-001` / `FE-ENCODING-002` specials, which read both. A
-rule is applicable only when its path, method, header, and consumer conditions
+body-scoped `FE-ENCODING-001` / `FE-ENCODING-002` specials when those rules
+are themselves enforce (they read both directions). A rule is applicable only
+when its path, method, header, and consumer conditions
 match the current request. A request-wide `global_exemptions.header_present`
 match also suppresses both rule hits and this fail-closed decision. Built-in
-rules are monitor-only unless you set `default_rule_action` or `rule_modes`, so
-a purely observational WAF (and any `mode: monitor` WAF) keeps prefix-scanning
+rules are monitor-only unless you set `default_rule_action` or `rule_modes`.
+Encoding-evasion specials additionally stay monitor under bulk
+`default_rule_action: enforce` until an explicit per-rule action promotes them,
+so a purely observational WAF (and any `mode: monitor` WAF) keeps prefix-scanning
 and never starts blocking. Requests and responses share one decision, so H1,
 H2, and H3 behave identically, and the request decision is made on the finalized
 backend-visible body — a request transformer that grows a body past the cap is
@@ -602,7 +664,12 @@ particular the server-first `first_bytes_unavailable` false-positive risk noted
 above, whose would-blocks carry no `waf.rule_hits` to infer from.
 
 `log_to_stdout` additionally emits a dedicated structured `warn!`
-(`target: "waf"`) per matched rule, independent of any logging plugin.
+(`target: "waf"`) per matched rule, independent of any logging plugin. Each
+event carries `action` as that rule's **effective direct outcome** after applying
+the global mode (`blocked`, `monitored`, or `disabled`) and `rule_action` as the
+configured rule action (`enforce`, `monitor`, or `disabled`). Aggregate anomaly
+scoring is evaluated after the per-rule events, so the final transaction
+`waf.action` can still be `blocked` when the score crosses its threshold.
 
 The per-instance anomaly score is carried in `waf.instances.<id>.score` (and
 `waf.score` when only one scoring instance contributed). Run in `monitor`
@@ -614,7 +681,7 @@ fire, then switch to `enforce`.
 | Field | Type | Default | Description |
 | --- | --- | --- | --- |
 | `mode` | enum | `enforce` | `enforce` / `monitor` / `disabled` |
-| `default_rule_action` | enum | _(unset)_ | bulk action for built-ins; `rule_modes` overrides win |
+| `default_rule_action` | enum | _(unset)_ | bulk action for built-ins that inherit it; encoding heuristics stay monitor until `rule_modes`; `rule_modes` overrides win |
 | `paranoia_level` | int 1–4 | `1` | activate rules with `paranoia_min <= level` |
 | `request_inspection` | bool | `true` | scan request metadata |
 | `request_body_inspection` | bool | `true` | scan request bodies |

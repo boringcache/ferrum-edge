@@ -10,8 +10,16 @@ The `ferrum-edge` binary must be on your shell's `PATH` to be invoked by name. A
 # From source
 sudo cp target/release/ferrum-edge /usr/local/bin/
 
-# From a pre-built release download
-sudo mv ferrum-edge /usr/local/bin/
+# From a pre-built release download (Linux x86_64 example)
+# Pin an explicit tag. GitHub /releases/latest skips prereleases.
+set -euo pipefail
+TAG=latest  # or replace with another explicit tag shown on the Releases page
+BASE="https://github.com/ferrum-edge/ferrum-edge/releases/download/${TAG}"
+curl -fsSLO "${BASE}/ferrum-edge-linux-x86_64"
+curl -fsSLO "${BASE}/ferrum-edge-linux-x86_64.sha256"
+sha256sum -c ferrum-edge-linux-x86_64.sha256
+chmod +x ferrum-edge-linux-x86_64
+sudo install -m 0755 ferrum-edge-linux-x86_64 /usr/local/bin/ferrum-edge
 
 # Verify
 ferrum-edge version
