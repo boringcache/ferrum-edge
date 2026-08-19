@@ -6618,6 +6618,21 @@ pub mod _test_support {
         )
     }
 
+    /// Issue #3942: ordinary unlimited direct-H2 must not wrap
+    /// `SizeLimitedIncoming` (the adapter treats `max_bytes = 0` as deny-all
+    /// and a `usize::MAX` wrap still costs a per-frame atomic + oneshot poll).
+    pub fn direct_h2_uses_limit_adapter(
+        max_request_body_bytes: usize,
+        needs_upload_completion_gate: bool,
+        observes_grpc_messages: bool,
+    ) -> bool {
+        crate::proxy::body::direct_h2_uses_limit_adapter(
+            max_request_body_bytes,
+            needs_upload_completion_gate,
+            observes_grpc_messages,
+        )
+    }
+
     pub fn request_may_have_body(method: &str, headers: &HashMap<String, String>) -> bool {
         crate::proxy::request_may_have_body(method, headers)
     }

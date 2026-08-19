@@ -49239,51 +49239,80 @@ async fn proxy_to_backend_http2(
     // bidirectional RPC streaming is unaffected.
     let needs_upload_completion_gate =
         effective_max_request_body_size_bytes > 0 || upload_auth_deadline.is_some();
-    let (body, body_completion_rx, mut upload_pump) = if needs_upload_completion_gate {
-        let (completion_tx, completion_rx) = tokio::sync::oneshot::channel();
-        let mut body = body::SizeLimitedIncoming::new_with_counter_and_completion(
-            body,
-            max_request_body_size,
-            Arc::clone(&body_size_exceeded),
-            Arc::clone(ctx_bytes_sent_observed),
-            completion_tx,
-            cancel_rx,
-        );
-        if let Some(messages) = observe_grpc.clone() {
-            body = body.with_grpc_message_counter(messages);
-        }
-        // Full upload lifecycle (#3815). Direct-H2 is the one H1/H2 dispatcher
-        // whose upload is scoped to the handler — the completion gate below
-        // already waits for the upload's terminal state before any early
-        // backend response is exposed — so its join point is ARMED for
-        // cancel-on-drop and explicitly `cancel_and_join()`ed at every bounded
-        // exit. Once that join returns, the pump task has published its
-        // outcome, which it does after dropping the inbound client body: no
-        // gateway-owned upload survives this function.
-        let (body, upload_pump) =
-            install_streaming_upload_authorization(body, upload_auth_deadline.as_ref());
-        (
-            body,
-            Some(completion_rx),
-            upload_pump.map(crate::proxy::upload_pump::UploadPumpJoin::cancel_on_drop),
-        )
-    } else {
-        let mut body = body::SizeLimitedIncoming::new_with_counter(
-            body,
-            max_request_body_size,
-            Arc::clone(&body_size_exceeded),
-            Arc::clone(ctx_bytes_sent_observed),
-        )
-        .with_cancel(cancel_rx);
-        if let Some(messages) = observe_grpc {
-            body = body.with_grpc_message_counter(messages);
-        }
-        // Unreachable with an authorization plan present
-        // (`needs_upload_completion_gate` is true whenever
-        // `upload_auth_deadline.is_some()`), so this arm is the unauthenticated
-        // hot path and installs neither timer nor pump.
-        (body, None, None)
-    };
+    // Issue #3942: the protocol bench forces both body limits to 0 on an
+    // unauthenticated POST /echo. Wrapping that path in SizeLimitedIncoming
+    // (mapping 0 → usize::MAX) adds a per-DATA-frame atomic + limit compare
+    // that scales with payload size. Keep the limiter when a real cap, an
+    // upload-completion gate, or gRPC message counting is required; otherwise
+    // poll Incoming plus the early-return cancel channel.
+    let use_limit_adapter = body::direct_h2_uses_limit_adapter(
+        effective_max_request_body_size_bytes,
+        needs_upload_completion_gate,
+        observe_grpc.is_some(),
+    );
+    let (body, body_completion_rx, mut upload_pump) =
+        if use_limit_adapter && needs_upload_completion_gate {
+            let (completion_tx, completion_rx) = tokio::sync::oneshot::channel();
+            let mut body = body::SizeLimitedIncoming::new_with_counter_and_completion(
+                body,
+                max_request_body_size,
+                Arc::clone(&body_size_exceeded),
+                Arc::clone(ctx_bytes_sent_observed),
+                completion_tx,
+                cancel_rx,
+            );
+            if let Some(messages) = observe_grpc.clone() {
+                body = body.with_grpc_message_counter(messages);
+            }
+            // Full upload lifecycle (#3815). Direct-H2 is the one H1/H2 dispatcher
+            // whose upload is scoped to the handler — the completion gate below
+            // already waits for the upload's terminal state before any early
+            // backend response is exposed — so its join point is ARMED for
+            // cancel-on-drop and explicitly `cancel_and_join()`ed at every bounded
+            // exit. Once that join returns, the pump task has published its
+            // outcome, which it does after dropping the inbound client body: no
+            // gateway-owned upload survives this function.
+            let (body, upload_pump) =
+                install_streaming_upload_authorization(body, upload_auth_deadline.as_ref());
+            (
+                body::DirectH2RequestBody::Limited(body),
+                Some(completion_rx),
+                upload_pump.map(crate::proxy::upload_pump::UploadPumpJoin::cancel_on_drop),
+            )
+        } else if let (true, Some(messages)) = (use_limit_adapter, observe_grpc) {
+            // gRPC message observation with no size cap and no auth deadline
+            // still needs the limiter's length-prefixed scanner.
+            let body = body::SizeLimitedIncoming::new_with_counter(
+                body,
+                max_request_body_size,
+                Arc::clone(&body_size_exceeded),
+                Arc::clone(ctx_bytes_sent_observed),
+            )
+            .with_cancel(cancel_rx)
+            .with_grpc_message_counter(messages);
+            (body::DirectH2RequestBody::Limited(body), None, None)
+        } else {
+            // Unlimited, unauthenticated, no gRPC observation: seed bytes_sent
+            // from Content-Length (Jun 19 direct-H2 accounting) and forward
+            // Incoming. Cancel stays armed so an early return after send_request
+            // still resets hyper's detached upload pipe. The same arm is the
+            // panic-free fallback if `direct_h2_uses_limit_adapter` ever drifts
+            // true without a gate or gRPC observer.
+            if let Some(cl) = headers
+                .get("content-length")
+                .and_then(|v| v.parse::<u64>().ok())
+            {
+                ctx_bytes_sent_observed.fetch_max(cl, std::sync::atomic::Ordering::Release);
+            }
+            (
+                body::DirectH2RequestBody::Passthrough {
+                    inner: body,
+                    cancel: Some(cancel_rx),
+                },
+                None,
+                None,
+            )
+        };
 
     // Set the URI
     parts.uri = uri;

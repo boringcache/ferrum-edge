@@ -917,10 +917,10 @@ fn test_no_match() {
 use async_trait::async_trait;
 use ferrum_edge::_test_support::{
     apply_request_body_plugins, can_dispatch_direct_http2_pool, can_use_direct_http2_pool,
-    extract_grpc_reject_message, finalize_plugin_rejection_parts_for_test,
-    finalized_upload_deadline_response_for_test, insert_grpc_error_metadata,
-    map_http_reject_status_to_grpc_status, normalize_reject_response, request_may_have_body,
-    set_grpc_deadline_budget_for_test,
+    direct_h2_uses_limit_adapter, extract_grpc_reject_message,
+    finalize_plugin_rejection_parts_for_test, finalized_upload_deadline_response_for_test,
+    insert_grpc_error_metadata, map_http_reject_status_to_grpc_status, normalize_reject_response,
+    request_may_have_body, set_grpc_deadline_budget_for_test,
 };
 use ferrum_edge::config::types::Consumer;
 use ferrum_edge::consumer_index::ConsumerIndex;
@@ -3844,6 +3844,51 @@ fn test_direct_http2_pool_dispatch_allows_nonzero_body_limits() {
         true, false, true, 10_485_760, 10_485_760
     ));
     assert!(!can_dispatch_direct_http2_pool(false, false, false, 0, 0));
+}
+
+/// Issue #3942: operator `FERRUM_MAX_REQUEST_BODY_SIZE_BYTES=0` is unlimited
+/// and must skip `SizeLimitedIncoming` on ordinary unauthenticated direct-H2.
+/// A real cap, an upload-completion gate, or gRPC message counting still
+/// takes the limiter so in-path 413 / gate / scanner stay intact.
+#[test]
+fn test_direct_h2_unlimited_skips_size_limited_incoming() {
+    assert!(
+        !direct_h2_uses_limit_adapter(0, false, false),
+        "bench-shaped unlimited unauthenticated POST must not wrap SizeLimitedIncoming"
+    );
+    assert!(
+        direct_h2_uses_limit_adapter(64, false, false),
+        "a nonzero request cap must still wrap SizeLimitedIncoming"
+    );
+    assert!(
+        direct_h2_uses_limit_adapter(0, true, false),
+        "upload-completion gate must still wrap SizeLimitedIncoming"
+    );
+    assert!(
+        direct_h2_uses_limit_adapter(0, false, true),
+        "gRPC message observation must still wrap SizeLimitedIncoming"
+    );
+}
+
+#[test]
+fn test_direct_h2_dispatch_uses_passthrough_body_when_unlimited() {
+    let source = include_str!("../../../src/proxy/mod.rs");
+    let dispatch = source
+        .split("async fn proxy_to_backend_http2(")
+        .nth(1)
+        .expect("direct-H2 dispatch");
+    assert!(
+        dispatch.contains("direct_h2_uses_limit_adapter("),
+        "direct-H2 upload must consult direct_h2_uses_limit_adapter"
+    );
+    assert!(
+        dispatch.contains("DirectH2RequestBody::Passthrough"),
+        "unlimited direct-H2 must construct DirectH2RequestBody::Passthrough"
+    );
+    assert!(
+        dispatch.contains("DirectH2RequestBody::Limited"),
+        "limited / gated direct-H2 must still wrap SizeLimitedIncoming"
+    );
 }
 
 #[test]

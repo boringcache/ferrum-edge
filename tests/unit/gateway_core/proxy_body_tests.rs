@@ -750,3 +750,31 @@ async fn pooled_backend_lease_is_retired_when_the_body_is_never_polled() {
     );
     assert_eq!(outcome.dropped(), 1);
 }
+
+/// Issue #3942: ordinary unlimited direct-H2 must poll `Incoming` through
+/// `DirectH2RequestBody::Passthrough` rather than wrapping
+/// `SizeLimitedIncoming` with a `usize::MAX` budget.
+#[test]
+fn test_direct_h2_request_body_passthrough_skips_size_limited_incoming() {
+    let source = include_str!("../../../src/proxy/body.rs");
+    assert!(
+        source.contains("enum DirectH2RequestBody"),
+        "ordinary direct-H2 pool body must be DirectH2RequestBody"
+    );
+    assert!(
+        source.contains("Limited(SizeLimitedIncoming)"),
+        "nonzero caps / upload gate / gRPC observation must still wrap SizeLimitedIncoming"
+    );
+    assert!(
+        source.contains("fn direct_h2_uses_limit_adapter"),
+        "adapter selection must stay a named predicate"
+    );
+    assert!(
+        source.contains("max_request_body_bytes > 0"),
+        "unlimited (operator 0) must skip the limiter"
+    );
+    assert!(
+        source.contains("needs_upload_completion_gate || observes_grpc_messages"),
+        "upload-completion gate and gRPC observation must still wrap SizeLimitedIncoming"
+    );
+}

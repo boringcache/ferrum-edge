@@ -881,14 +881,22 @@ fn test_direct_h2_dispatch_allows_default_nonzero_body_limits() {
 /// dispatch gate must not confuse that adapter contract with the operator
 /// spelling FERRUM_MAX_*_BODY_SIZE_BYTES=0 (unlimited): unlimited is still
 /// eligible for direct-H2, and a positive limit is also eligible because
-/// enforcement happens in-path after the gateway maps 0→unbounded.
+/// enforcement happens in-path. Issue #3942: unlimited ordinary direct-H2
+/// must skip the limiter entirely rather than wrapping `usize::MAX`.
 #[test]
 fn test_direct_h2_dispatch_unlimited_and_deny_all_semantics_are_distinct() {
-    use ferrum_edge::_test_support::can_dispatch_direct_http2_pool;
+    use ferrum_edge::_test_support::{
+        can_dispatch_direct_http2_pool, direct_h2_uses_limit_adapter,
+    };
 
     // Operator "unlimited" (both zero) — still eligible.
     assert!(can_dispatch_direct_http2_pool(true, false, false, 0, 0));
     // Positive limits — eligible; SizeLimitedIncoming sees the positive
     // budget (never a raw 0 from the unlimited spelling).
     assert!(can_dispatch_direct_http2_pool(true, false, false, 64, 64));
+    assert!(
+        !direct_h2_uses_limit_adapter(0, false, false),
+        "operator 0 must not wrap SizeLimitedIncoming on ordinary direct-H2"
+    );
+    assert!(direct_h2_uses_limit_adapter(64, false, false));
 }

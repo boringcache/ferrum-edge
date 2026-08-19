@@ -2406,6 +2406,81 @@ fn poll_upload_cancel(
     }
 }
 
+/// Whether ordinary direct-H2 must wrap the client upload in
+/// [`SizeLimitedIncoming`].
+///
+/// Operator `FERRUM_MAX_REQUEST_BODY_SIZE_BYTES=0` is unlimited. Wrapping
+/// that spelling as `usize::MAX` still pays a per-DATA-frame atomic and
+/// limit compare on every echo POST — a tax that scales with payload size
+/// and showed up as the Jun 19 → Aug 15 HTTP/2 regression (issue #3942).
+/// Skip the limiter when none of the enforcement / observation features
+/// are required; keep it whenever a real cap, an upload-completion gate,
+/// or gRPC message counting is on. Early-return cancel stays on the
+/// passthrough arm so hyper's detached pipe still resets.
+#[inline]
+pub(crate) fn direct_h2_uses_limit_adapter(
+    max_request_body_bytes: usize,
+    needs_upload_completion_gate: bool,
+    observes_grpc_messages: bool,
+) -> bool {
+    max_request_body_bytes > 0 || needs_upload_completion_gate || observes_grpc_messages
+}
+
+/// Request body for the ordinary direct-H2 pool ([`super::http2_pool::Http2Sender`]).
+///
+/// [`Self::Passthrough`] is the Jun 19 hot path: hyper polls `Incoming`
+/// (plus the early-return cancel oneshot that tears down the detached
+/// pipe). [`Self::Limited`] preserves in-path 413 / upload-gate /
+/// gRPC-message counting when those features are actually configured.
+pub enum DirectH2RequestBody {
+    Passthrough {
+        inner: Incoming,
+        cancel: Option<tokio::sync::oneshot::Receiver<()>>,
+    },
+    Limited(SizeLimitedIncoming),
+}
+
+impl http_body::Body for DirectH2RequestBody {
+    type Data = Bytes;
+    type Error = Box<dyn std::error::Error + Send + Sync>;
+
+    fn poll_frame(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
+        match self.get_mut() {
+            DirectH2RequestBody::Passthrough { inner, cancel } => {
+                if poll_upload_cancel(cancel, cx) == UploadCancelSignal::Cancelled {
+                    return Poll::Ready(Some(Err(
+                        "request body forwarding cancelled after upload timeout".into(),
+                    )));
+                }
+                match Pin::new(inner).poll_frame(cx) {
+                    Poll::Ready(Some(Ok(frame))) => Poll::Ready(Some(Ok(frame))),
+                    Poll::Ready(Some(Err(e))) => Poll::Ready(Some(Err(e.into()))),
+                    Poll::Ready(None) => Poll::Ready(None),
+                    Poll::Pending => Poll::Pending,
+                }
+            }
+            DirectH2RequestBody::Limited(limited) => Pin::new(limited).poll_frame(cx),
+        }
+    }
+
+    fn is_end_stream(&self) -> bool {
+        match self {
+            DirectH2RequestBody::Passthrough { inner, .. } => inner.is_end_stream(),
+            DirectH2RequestBody::Limited(limited) => limited.is_end_stream(),
+        }
+    }
+
+    fn size_hint(&self) -> http_body::SizeHint {
+        match self {
+            DirectH2RequestBody::Passthrough { inner, .. } => inner.size_hint(),
+            DirectH2RequestBody::Limited(limited) => limited.size_hint(),
+        }
+    }
+}
+
 /// Test hook: drive exactly one [`poll_upload_cancel`] with a no-op waker.
 ///
 /// Reached only through `crate::_test_support`, which the binary target does

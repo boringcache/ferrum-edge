@@ -83,7 +83,7 @@ Ordinary plain-HTTPS traffic prefers the multiplexed direct HTTP/2 pool whenever
 | Response body | Declared `Content-Length` over limit | `502` / `ResponseBodyTooLarge` before body bytes flow |
 | Response body | Unknown length / mid-stream | Size-limited H2 body adapters; post-commit stream termination after the limit |
 
-`SizeLimitedIncoming` treats `max_bytes = 0` as deny-all; the gateway maps the operator spelling `FERRUM_MAX_*_BODY_SIZE_BYTES=0` (unlimited) to an unbounded adapter budget before constructing the limiter.
+`SizeLimitedIncoming` treats `max_bytes = 0` as deny-all. A **nonzero** operator cap is passed to the limiter as that budget. Operator `0` (unlimited) on ordinary direct-H2 does **not** wrap `SizeLimitedIncoming`: the client `Incoming` is forwarded with only the early-return cancel channel, which is the Jun 19 hot path the HTTP/2 protocol bench uses (`FERRUM_MAX_*_BODY_SIZE_BYTES=0`, issue #3942). Mesh/HBONE pools that share a limiter-typed sender still map `0` to `usize::MAX` before constructing the adapter.
 
 Backend TLS SNI overrides use the same in-path enforcement. Combinations direct-H2 cannot serve (retry body replay, request-body-buffering plugins, `pool_enable_http2: false`) fall through to the reqwest HTTP/1.1 SNI dial when an SNI override is present; they are **admitted**, not rejected at config admission. A dial that genuinely cannot be constructed still fails closed at runtime with a `502` — see [DestinationRule TLS SNI](mesh.md).
 
