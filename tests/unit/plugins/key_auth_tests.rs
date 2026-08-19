@@ -45,8 +45,9 @@ fn context_with_materialized_raw_header(name: &str, value: &str) -> RequestConte
     ctx.identified_consumer = None;
 
     let mut raw = HeaderMap::new();
+    let header_name = http::HeaderName::from_bytes(name.as_bytes()).expect("valid header name");
     raw.insert(
-        name,
+        header_name,
         http::HeaderValue::from_bytes(value.as_bytes()).expect("valid header bytes"),
     );
     ctx.set_raw_headers(raw);
