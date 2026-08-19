@@ -3400,16 +3400,15 @@ pub struct EnvConfig {
     /// TCP listen backlog size for proxy listeners. Default: 2048.
     /// Higher values absorb connection bursts without SYN drops.
     pub tcp_listen_backlog: u32,
-    /// Number of parallel accept() loops per proxy listener port. Each loop binds
-    /// its own socket to the same address via SO_REUSEPORT, giving the kernel
-    /// separate accept queues to distribute SYN processing across — eliminating
-    /// the single socket lock bottleneck at high connection rates (50K+ new
-    /// conn/sec). This is orthogonal to `FERRUM_WORKER_THREADS` which controls
-    /// the tokio runtime thread pool for all async work; `accept_threads`
-    /// specifically parallelizes connection intake at the kernel level.
-    /// Default: 0 (auto-detect = available CPU cores). Set to 1 to disable
-    /// multi-listener. Only effective on Unix with SO_REUSEPORT (Linux 3.9+,
-    /// macOS, BSDs).
+    /// Number of parallel accept() loops per proxy listener port. Each extra
+    /// loop duplicates one exclusive listen socket (never `SO_REUSEPORT`), so
+    /// tokio can poll accept on several fds while the kernel still rejects a
+    /// second process binding the same TCP address/port (issue #3924). This is
+    /// orthogonal to `FERRUM_WORKER_THREADS` which controls the tokio runtime
+    /// thread pool for all async work; `accept_threads` specifically
+    /// parallelizes connection intake. Default: 0 (auto-detect = available CPU
+    /// cores). Set to 1 to disable multi-accept. Only effective on Unix;
+    /// non-Unix platforms warn and run one accept loop.
     pub accept_threads: usize,
     /// Frontend HTTP/2 per-stream flow-control window (bytes).
     /// Conservative default for untrusted clients; raise for benchmarking.

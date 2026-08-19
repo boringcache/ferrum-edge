@@ -3,8 +3,8 @@ use async_trait::async_trait;
 use dashmap::DashMap;
 use dashmap::mapref::entry::Entry;
 use std::cell::RefCell;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
+use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 use tokio::sync::{Semaphore, watch};
 
@@ -346,14 +346,139 @@ enum CreationNotify {
     Failed(SharedPoolCreateError),
 }
 
+/// Host / address / error text retained so a late live-request waiter can
+/// upgrade a probe-only DEBUG diagnostic to WARN without a second create.
+struct PendingEstablishmentLog {
+    host: String,
+    last_addr: String,
+    error: String,
+}
+
 struct PendingCreation {
     outcome_tx: watch::Sender<CreationNotify>,
+    /// Set when any live-request caller joins this coalesced create.
+    request_joined: AtomicBool,
+    /// Highest establishment-log rank claimed for this attempt:
+    /// 0=none, 1=debug, 2=warn, 3=error.
+    emitted_rank: AtomicU8,
+    log_context: OnceLock<PendingEstablishmentLog>,
+}
+
+/// Join handle for one coalesced [`GenericPool`] create attempt.
+///
+/// Cheap to clone (`Arc`). Dropping does not finish the attempt; the pool
+/// pending-entry lifecycle owns cleanup. Callers that need cross-joiner
+/// diagnostics (gRPC probe vs request logging) mark participation and claim
+/// a single bounded log rank here — no side map, no per-request heap besides
+/// the pending entry the pool already allocated.
+#[derive(Clone)]
+pub struct CoalescedCreateAttempt {
+    inner: Arc<PendingCreation>,
+}
+
+impl CoalescedCreateAttempt {
+    pub const LOG_RANK_DEBUG: u8 = 1;
+    pub const LOG_RANK_WARN: u8 = 2;
+    pub const LOG_RANK_ERROR: u8 = 3;
+
+    /// Isolated attempt for tests that drive log ranking without a pool.
+    pub fn new() -> Self {
+        Self {
+            inner: Arc::new(PendingCreation::new()),
+        }
+    }
+
+    /// Mark that a live request is participating in this create.
+    #[inline]
+    pub fn mark_request_participant(&self) {
+        self.inner.request_joined.store(true, Ordering::Release);
+    }
+
+    #[inline]
+    pub fn request_participant(&self) -> bool {
+        self.inner.request_joined.load(Ordering::Acquire)
+    }
+
+    /// Claim the right to emit `rank`. True iff this claim strictly upgrades
+    /// the highest rank already claimed for the attempt.
+    pub fn claim_log_rank(&self, rank: u8) -> bool {
+        loop {
+            let current = self.inner.emitted_rank.load(Ordering::Acquire);
+            if rank <= current {
+                return false;
+            }
+            if self
+                .inner
+                .emitted_rank
+                .compare_exchange_weak(current, rank, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+            {
+                return true;
+            }
+        }
+    }
+
+    /// Claim a severity upgrade only when the current rank is DEBUG.
+    ///
+    /// Waiters use this so a timeout/connect WARN emitted outside ranking
+    /// cannot be duplicated, while a probe-only DEBUG can still become WARN
+    /// if a live request joins after that DEBUG decision.
+    pub fn try_upgrade_from_debug(&self, rank: u8) -> bool {
+        loop {
+            let current = self.inner.emitted_rank.load(Ordering::Acquire);
+            if current != Self::LOG_RANK_DEBUG || rank <= current {
+                return false;
+            }
+            if self
+                .inner
+                .emitted_rank
+                .compare_exchange_weak(current, rank, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+            {
+                return true;
+            }
+        }
+    }
+
+    pub fn store_log_context(
+        &self,
+        host: impl Into<String>,
+        last_addr: impl Into<String>,
+        error: impl Into<String>,
+    ) {
+        let _ = self.inner.log_context.set(PendingEstablishmentLog {
+            host: host.into(),
+            last_addr: last_addr.into(),
+            error: error.into(),
+        });
+    }
+
+    pub fn log_context(&self) -> Option<(&str, &str, &str)> {
+        self.inner.log_context.get().map(|ctx| {
+            (
+                ctx.host.as_str(),
+                ctx.last_addr.as_str(),
+                ctx.error.as_str(),
+            )
+        })
+    }
+}
+
+impl Default for CoalescedCreateAttempt {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl PendingCreation {
     fn new() -> Self {
         let (outcome_tx, _outcome_rx) = watch::channel(CreationNotify::Pending);
-        Self { outcome_tx }
+        Self {
+            outcome_tx,
+            request_joined: AtomicBool::new(false),
+            emitted_rank: AtomicU8::new(0),
+            log_context: OnceLock::new(),
+        }
     }
 
     async fn wait(&self) -> CreationNotify {
@@ -608,6 +733,38 @@ impl<M: PoolManager> GenericPool<M> {
         Fut: std::future::Future<Output = std::result::Result<M::Connection, E>>,
         E: ShareablePoolCreateError + From<SharedPoolCreateError>,
     {
+        self.create_or_get_existing_owned_with_attempt(
+            key,
+            |_| {},
+            |_| {},
+            |key, _attempt| create(key),
+        )
+        .await
+    }
+
+    /// Like [`Self::create_or_get_existing_owned`], but exposes the coalesced
+    /// pending-attempt identity to every joiner.
+    ///
+    /// `on_join` runs for the creator and each waiter when they attach to this
+    /// pending entry (including re-election after cancellation).
+    /// `on_waiter_failure` runs for coalesced waiters that observe a broadcast
+    /// create failure, so a late joiner can upgrade a single diagnostic without
+    /// a per-waiter log storm. The `create` closure receives the same attempt
+    /// the waiters joined. Attempt state is dropped with the pending entry.
+    pub async fn create_or_get_existing_owned_with_attempt<C, Fut, E, J, W>(
+        &self,
+        key: String,
+        mut on_join: J,
+        mut on_waiter_failure: W,
+        create: C,
+    ) -> std::result::Result<M::Connection, E>
+    where
+        C: FnOnce(String, CoalescedCreateAttempt) -> Fut,
+        Fut: std::future::Future<Output = std::result::Result<M::Connection, E>>,
+        E: ShareablePoolCreateError + From<SharedPoolCreateError>,
+        J: FnMut(&CoalescedCreateAttempt),
+        W: FnMut(&CoalescedCreateAttempt),
+    {
         let mut create = Some(create);
 
         loop {
@@ -616,24 +773,32 @@ impl<M: PoolManager> GenericPool<M> {
             }
 
             let (pending, is_creator) = self.register_pending_creation(&key);
+            let attempt = CoalescedCreateAttempt {
+                inner: Arc::clone(&pending),
+            };
+            on_join(&attempt);
             if !is_creator {
                 // `watch` stores a durable outcome, so even a waiter that
                 // subscribes after the creator finishes will observe it and
                 // either return the shared failure or loop without hanging.
                 match pending.wait().await {
-                    CreationNotify::Failed(err) => return Err(E::from(err)),
+                    CreationNotify::Failed(err) => {
+                        on_waiter_failure(&attempt);
+                        return Err(E::from(err));
+                    }
                     CreationNotify::Finished | CreationNotify::Pending => continue,
                 }
             }
 
             let pending_guard = PendingCreationGuard::new(self, key.clone(), pending);
             let result = self
-                .create_after_recheck(
-                    key.clone(),
-                    create
+                .create_after_recheck(key.clone(), {
+                    let create = create
                         .take()
-                        .expect("create closure should only be consumed by the creator"),
-                )
+                        .expect("create closure should only be consumed by the creator");
+                    let attempt = attempt.clone();
+                    move |key| create(key, attempt)
+                })
                 .await;
             match result {
                 Ok(conn) => {
@@ -676,6 +841,11 @@ impl<M: PoolManager> GenericPool<M> {
         pending: Arc<PendingCreation>,
         err: SharedPoolCreateError,
     ) {
+        // Remove before publishing Failed so a request that arrives after this
+        // attempt completes cannot join the retired pending entry, consume a
+        // retry, and skip a fresh dial. Already-attached waiters keep their
+        // Arc and watch subscription, so they still observe the durable Failed
+        // outcome. There is no durable negative cache.
         self.pending_creations
             .remove_if(key, |_, current| Arc::ptr_eq(current, &pending));
         pending.finish_failed(err);

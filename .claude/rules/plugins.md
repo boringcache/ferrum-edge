@@ -80,10 +80,14 @@ paths:
   `Cache-Control: no-cache` / `no-store` refreshes (bare and argument-free, only
   when every meaningful member is such a refresh and only when
   `respect_no_cache` is enabled), and zero-length `Content-Length`
-  framing. A conditional revalidation, a pure client no-cache/no-store refresh,
-  and `Content-Length: 0` are addressed to an entry rather than selecting a
-  different one — keying the raw view would put each of them in a partition
-  the entry cannot be reached from and make the `Vary` index unreachable.
+  framing — and a gateway-minted `correlation_id` header whose live value still
+  matches private request provenance (issue #3929). Client-supplied correlation
+  values remain origin-visible dimensions; do not globally ignore `x-request-id`
+  or trust a client-spoofable metadata/header marker. A conditional
+  revalidation, a pure client no-cache/no-store refresh, and `Content-Length: 0`
+  are addressed to an entry rather than selecting a different one — keying the
+  raw view would put each of them in a partition the entry cannot be reached
+  from and make the `Vary` index unreachable.
   Unsupported precondition / range / pragma headers (`If-Match`,
   `If-Unmodified-Since`, `If-Range`, `Range`, `Pragma`), mixed / arbitrary /
   unrecognized or argument-bearing request `Cache-Control` content, and any
