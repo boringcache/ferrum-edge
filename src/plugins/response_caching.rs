@@ -1636,6 +1636,7 @@ impl ResponseCaching {
                 if let Some(base_key) = base_key.as_deref() {
                     let lookup_headers = self.restore_request_headers_view(ctx);
                     self.invalidate_zero_freshness_response(
+                        ctx,
                         base_key,
                         predict_key.as_deref(),
                         response_headers,
@@ -1836,8 +1837,11 @@ impl ResponseCaching {
     ///   implements (`If-None-Match` / `If-Modified-Since` revalidation,
     ///   pure honored bare request `Cache-Control: no-cache` / `no-store`
     ///   refreshes when `respect_no_cache` is enabled, and zero-length
-    ///   `Content-Length` framing). This prevents replay across unannounced
-    ///   tenant or policy headers even when an origin omits `Vary`. Unsupported
+    ///   `Content-Length` framing) and a gateway-minted correlation header
+    ///   whose live value still matches private request provenance. This
+    ///   prevents replay across unannounced tenant or policy headers even when
+    ///   an origin omits `Vary`, while still letting anonymous GETs share an
+    ///   entry when `correlation_id` mints a unique request id. Unsupported
     ///   precondition / range / pragma dimensions and mixed / arbitrary
     ///   `Cache-Control` content remain bound. The complete `Vary` tuple is
     ///   additionally appended by [`Self::extend_base_key_with_vary`].
@@ -1931,6 +1935,7 @@ impl ResponseCaching {
     /// even before the outer digest.
     fn extend_base_key_with_vary(
         &self,
+        ctx: &RequestContext,
         base_key: String,
         vary_headers: &[String],
         request_headers: &HashMap<String, String>,
@@ -1945,6 +1950,12 @@ impl ResponseCaching {
         for header in vary_headers {
             hasher.text("vary_name", header);
             match request_headers.get(header.as_str()) {
+                Some(value) if ctx.is_gateway_generated_correlation_header(header, value) => {
+                    // Omit only the minted unique value. The name stays in the
+                    // origin/operator Vary contract; treating presence as
+                    // absent keeps two generated ids on one entry.
+                    hasher.bool_value("vary_present", false);
+                }
                 None => hasher.bool_value("vary_present", false),
                 Some(value) => {
                     hasher.bool_value("vary_present", true);
@@ -2294,6 +2305,7 @@ impl ResponseCaching {
 
     fn invalidate_zero_freshness_response(
         &self,
+        ctx: &RequestContext,
         base_key: &str,
         predict_key: Option<&str>,
         response_headers: &HashMap<String, String>,
@@ -2308,6 +2320,7 @@ impl ResponseCaching {
                 self.merge_existing_vary_headers(base_key, &mut vary_headers);
                 self.merge_mandatory_sensitive_vary_headers(&mut vary_headers);
                 let response_key = self.extend_base_key_with_vary(
+                    ctx,
                     base_key.to_string(),
                     &vary_headers,
                     &lookup_headers.headers,
@@ -3140,7 +3153,7 @@ impl Plugin for ResponseCaching {
         // `Vary` and be replayed downstream to a credentialed request.
         self.merge_mandatory_sensitive_vary_headers(&mut vary_headers);
         let cache_key =
-            self.extend_base_key_with_vary(base_key.clone(), &vary_headers, headers, None);
+            self.extend_base_key_with_vary(ctx, base_key.clone(), &vary_headers, headers, None);
         // Store the full cache key (with Vary dimensions) so on_final_response_body
         // can mark the correct variant-specific key in the uncacheable predictor.
         ctx.metadata
@@ -3609,6 +3622,7 @@ impl Plugin for ResponseCaching {
             }
 
             let cache_key = self.extend_base_key_with_vary(
+                ctx,
                 base_key.clone(),
                 &vary_headers,
                 &lookup_headers.headers,

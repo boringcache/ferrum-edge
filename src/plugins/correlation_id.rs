@@ -225,12 +225,12 @@ impl Plugin for CorrelationId {
         ctx: &mut super::StreamConnectionContext,
     ) -> super::PluginResult {
         let id = Uuid::new_v4().to_string();
-        ctx.publish_correlation_id(&self.instance_metadata_key, id);
+        ctx.publish_correlation_id(&self.instance_metadata_key, &self.header_name, id, true);
         super::PluginResult::Continue
     }
 
     async fn on_request_received(&self, ctx: &mut RequestContext) -> PluginResult {
-        let request_id = if let Some(existing) = ctx.headers.get(&self.header_name) {
+        let (request_id, generated) = if let Some(existing) = ctx.headers.get(&self.header_name) {
             // Preserve the client-supplied id only when it is both within the
             // length cap AND made up of safe correlation-id characters. The
             // inbound value is untrusted and is reflected downstream, forwarded
@@ -242,23 +242,31 @@ impl Plugin for CorrelationId {
             // mirroring the over-length branch and the RFC 7230 strictness
             // already applied to `header_name`. (Finding #69.)
             if existing.len() <= 256 && is_valid_correlation_id(existing) {
-                existing.clone()
+                (existing.clone(), false)
             } else {
                 let id = Uuid::new_v4().to_string();
                 ctx.headers.insert(self.header_name.clone(), id.clone());
-                id
+                (id, true)
             }
         } else {
             let id = Uuid::new_v4().to_string();
             ctx.headers.insert(self.header_name.clone(), id.clone());
-            id
+            (id, true)
         };
 
         // Keep each authoritative instance value in private lifecycle state
         // across phase-separated execution. Public metadata is a compatibility
         // projection only. The first instance in configured lifecycle order
-        // also owns the canonical consumer-facing request ID.
-        ctx.publish_correlation_id(&self.instance_metadata_key, request_id);
+        // also owns the canonical consumer-facing request ID. Gateway-minted
+        // (omitted or rejected inbound) values are recorded as generated so
+        // `response_caching` can omit that header/value from the shared-cache
+        // key without trusting a client-spoofable metadata marker.
+        ctx.publish_correlation_id(
+            &self.instance_metadata_key,
+            &self.header_name,
+            request_id,
+            generated,
+        );
 
         PluginResult::Continue
     }
