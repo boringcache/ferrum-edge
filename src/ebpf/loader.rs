@@ -1559,7 +1559,6 @@ mod live_kernel_tests {
                 format!("0.0.0.0:{capture_port}").parse().unwrap(),
                 128,
                 None,
-                false,
                 true,
             )
             .map_err(|e| format!("bind the transparent capture listener: {e}"))?;

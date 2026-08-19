@@ -1289,6 +1289,8 @@ For the full extension contract, supported versions, validation rules, and worke
 
 Ferrum Edge classifies each HTTP-family backend target's protocol support (HTTP/1.1, HTTP/2 over TLS, HTTP/3, gRPC-over-TLS, h2c) at startup and on a periodic background refresh (`FERRUM_BACKEND_CAPABILITY_REFRESH_INTERVAL_SECS`, default 24h). The hot path consults this registry to decide whether to route plain HTTPS traffic through the native H3 pool, the direct HTTP/2 pool, or the generic reqwest path without per-request probing. See [CLAUDE.md — Backend Capability Registry](../CLAUDE.md) and [docs/http3.md](http3.md) for the underlying design.
 
+Plaintext HTTP backends are still probed for prior-knowledge h2c because gRPC is a runtime flavor, not a scheme — a single `http` origin may carry native gRPC. That probe uses the same pool handshake as live gRPC, but with explicit capability-probe context: an expected HTTP/1.1 classification miss (`h2c handshake failed`) is a debug-level event, including on SIGHUP refresh, and does not emit `WARN` at the documented default `FERRUM_LOG_LEVEL=warn`. Request-time gRPC establishment failures, probe dial timeouts, port exhaustion, and unexpected candidate connection/handshake failures remain `WARN`/`ERROR`. Secrets and credential metadata are never included in these lines.
+
 Two JWT-authenticated endpoints let operators inspect and force-refresh the registry at runtime.
 
 ### `GET /backend-capabilities`

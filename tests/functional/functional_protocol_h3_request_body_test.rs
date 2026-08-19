@@ -261,22 +261,21 @@ async fn functional_h3_request_body_zero_limit_forwards_large_post() {
     let backend_task = tokio::spawn(start_body_count_backend(backend_listener));
     sleep(Duration::from_millis(150)).await;
 
-    let https_reservation = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let https_port = https_reservation.local_addr().unwrap().port();
-    drop(https_reservation);
-
     let mut gateway = TestGateway::builder()
         .mode_file(build_config(backend_port))
         .log_level("warn")
         .capture_output()
         .env("FERRUM_ENABLE_HTTP3", "true")
-        .env("FERRUM_PROXY_HTTPS_PORT", https_port.to_string())
+        .env_ephemeral_port("FERRUM_PROXY_HTTPS_PORT")
         .env("FERRUM_FRONTEND_TLS_CERT_PATH", "tests/certs/server.crt")
         .env("FERRUM_FRONTEND_TLS_KEY_PATH", "tests/certs/server.key")
         .env("FERRUM_MAX_REQUEST_BODY_SIZE_BYTES", "0")
         .spawn()
         .await
         .expect("start gateway");
+    let https_port = gateway
+        .env_port("FERRUM_PROXY_HTTPS_PORT")
+        .expect("harness-allocated HTTPS port");
 
     let url = format!("https://localhost:{https_port}/upload");
     let body = Bytes::from(vec![b'a'; BODY_BYTES]);
@@ -328,10 +327,6 @@ async fn functional_h3_serverless_redirect_is_not_pre_proxy_approval() {
     let function_task = tokio::spawn(start_redirect_function(function_listener));
     sleep(Duration::from_millis(150)).await;
 
-    let https_reservation = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let https_port = https_reservation.local_addr().unwrap().port();
-    drop(https_reservation);
-
     let mut gateway = TestGateway::builder()
         .mode_file(build_serverless_redirect_config(
             backend_port,
@@ -340,12 +335,15 @@ async fn functional_h3_serverless_redirect_is_not_pre_proxy_approval() {
         .log_level("warn")
         .capture_output()
         .env("FERRUM_ENABLE_HTTP3", "true")
-        .env("FERRUM_PROXY_HTTPS_PORT", https_port.to_string())
+        .env_ephemeral_port("FERRUM_PROXY_HTTPS_PORT")
         .env("FERRUM_FRONTEND_TLS_CERT_PATH", "tests/certs/server.crt")
         .env("FERRUM_FRONTEND_TLS_KEY_PATH", "tests/certs/server.key")
         .spawn()
         .await
         .expect("start gateway");
+    let https_port = gateway
+        .env_port("FERRUM_PROXY_HTTPS_PORT")
+        .expect("harness-allocated HTTPS port");
 
     let url = format!("https://localhost:{https_port}/protected?name=alice%20bob");
     let (status, body) = h3_post_bytes(&url, Bytes::new())
@@ -389,22 +387,21 @@ async fn functional_h3_streaming_request_logs_request_body_bytes_via_cross_proto
     let backend_task = tokio::spawn(start_body_count_backend(backend_listener));
     sleep(Duration::from_millis(150)).await;
 
-    let https_reservation = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let https_port = https_reservation.local_addr().unwrap().port();
-    drop(https_reservation);
-
     let mut gateway = TestGateway::builder()
         .mode_file(build_config_with_stdout_logging(backend_port))
         .log_level("warn")
         .capture_output()
         .env("FERRUM_ENABLE_HTTP3", "true")
-        .env("FERRUM_PROXY_HTTPS_PORT", https_port.to_string())
+        .env_ephemeral_port("FERRUM_PROXY_HTTPS_PORT")
         .env("FERRUM_FRONTEND_TLS_CERT_PATH", "tests/certs/server.crt")
         .env("FERRUM_FRONTEND_TLS_KEY_PATH", "tests/certs/server.key")
         .env("FERRUM_MAX_REQUEST_BODY_SIZE_BYTES", "0")
         .spawn()
         .await
         .expect("start gateway");
+    let https_port = gateway
+        .env_port("FERRUM_PROXY_HTTPS_PORT")
+        .expect("harness-allocated HTTPS port");
 
     let url = format!("https://localhost:{https_port}/upload");
     let body = Bytes::from(vec![b'b'; 128 * 1024]);

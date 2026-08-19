@@ -163,15 +163,10 @@ async fn duplicate_member_body_is_rejected_over_http2_and_never_reaches_the_back
 #[tokio::test]
 async fn duplicate_member_body_is_rejected_over_http3_and_never_reaches_the_backend() {
     let backend = Backend::spawn().await;
-    let https_listener = TcpListener::bind("127.0.0.1:0")
-        .await
-        .expect("reserve https port");
-    let https_port = https_listener.local_addr().expect("https addr").port();
-    drop(https_listener);
 
     let mut gateway = duplicate_key_gateway_builder(backend.port)
         .env("FERRUM_ENABLE_HTTP3", "true")
-        .env("FERRUM_PROXY_HTTPS_PORT", https_port.to_string())
+        .env_ephemeral_port("FERRUM_PROXY_HTTPS_PORT")
         .env("FERRUM_FRONTEND_TLS_CERT_PATH", "tests/certs/server.crt")
         .env("FERRUM_FRONTEND_TLS_KEY_PATH", "tests/certs/server.key")
         .env("FERRUM_TLS_NO_VERIFY", "true")
@@ -182,6 +177,9 @@ async fn duplicate_member_body_is_rejected_over_http3_and_never_reaches_the_back
         .wait_for_proxy_port(Duration::from_secs(5))
         .await
         .expect("proxy port ready");
+    let https_port = gateway
+        .env_port("FERRUM_PROXY_HTTPS_PORT")
+        .expect("harness-allocated HTTPS port");
 
     let client = Http3Client::insecure().expect("h3 client");
     let url = format!("https://127.0.0.1:{https_port}/orders");

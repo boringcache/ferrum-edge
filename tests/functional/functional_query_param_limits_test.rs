@@ -12,7 +12,7 @@ use http_body_util::{BodyExt, Empty};
 use hyper::Request;
 use hyper_util::rt::{TokioExecutor, TokioIo};
 use std::time::Duration;
-use tokio::net::{TcpListener, TcpStream};
+use tokio::net::TcpStream;
 
 const MAX_QUERY_PARAMS: &str = "2";
 const EMPTY_SEGMENT_QUERY: &str = "a=1&&b=2&";
@@ -76,18 +76,13 @@ struct QueryLimitHarness {
 impl QueryLimitHarness {
     async fn spawn() -> Self {
         let echo = spawn_http_echo().await.expect("spawn echo backend");
-        let https_listener = TcpListener::bind("127.0.0.1:0")
-            .await
-            .expect("reserve https port");
-        let https_port = https_listener.local_addr().expect("https addr").port();
-        drop(https_listener);
 
         let gateway = TestGateway::builder()
             .mode_file(query_limit_config(echo.port))
             .log_level("warn")
             .env("FERRUM_MAX_QUERY_PARAMS", MAX_QUERY_PARAMS)
             .env("FERRUM_ENABLE_HTTP3", "true")
-            .env("FERRUM_PROXY_HTTPS_PORT", https_port.to_string())
+            .env_ephemeral_port("FERRUM_PROXY_HTTPS_PORT")
             .env("FERRUM_FRONTEND_TLS_CERT_PATH", "tests/certs/server.crt")
             .env("FERRUM_FRONTEND_TLS_KEY_PATH", "tests/certs/server.key")
             .spawn()
@@ -97,6 +92,9 @@ impl QueryLimitHarness {
             .wait_for_proxy_port(Duration::from_secs(5))
             .await
             .expect("proxy port ready");
+        let https_port = gateway
+            .env_port("FERRUM_PROXY_HTTPS_PORT")
+            .expect("harness-allocated HTTPS port");
 
         Self {
             gateway,

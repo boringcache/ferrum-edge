@@ -414,7 +414,7 @@ pub mod _test_support {
         )
     }
 
-    /// Public mirror of the crate-private TCP SO_REUSEPORT accept-loop peer class.
+    /// Public mirror of the crate-private TCP accept-loop peer class.
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     pub enum TcpAcceptLoopClass {
         Primary,
@@ -432,7 +432,7 @@ pub mod _test_support {
         }
     }
 
-    /// Supervise TCP SO_REUSEPORT accept-loop peers the same way production does.
+    /// Supervise TCP accept-loop peers the same way production does.
     pub async fn supervise_tcp_accept_loop_peers_for_test(
         peers: Vec<(
             TcpAcceptLoopClass,
@@ -445,6 +445,46 @@ pub mod _test_support {
             .map(|(class, handle)| (class.into_production(), handle))
             .collect();
         crate::proxy::tcp_proxy::supervise_tcp_accept_loop_peers(peers, cancel_siblings).await
+    }
+
+    /// Bind the production exclusive TCP proxy listener and duplicate it for
+    /// `accept_threads` intra-process workers (issue #3924).
+    pub fn bind_exclusive_proxy_accept_listeners_for_test(
+        addr: std::net::SocketAddr,
+        backlog: i32,
+        accept_threads: usize,
+    ) -> Result<Vec<tokio::net::TcpListener>, anyhow::Error> {
+        crate::proxy::bind_exclusive_proxy_accept_listeners(
+            addr,
+            backlog,
+            None,
+            accept_threads,
+            false,
+        )
+    }
+
+    /// Independent TCP listen bind that sets `SO_REUSEADDR` and, on Unix,
+    /// `SO_REUSEPORT` — the posture a second ferrum-edge process used before
+    /// exclusive bind (issue #3924).
+    pub fn try_foreign_reuseport_tcp_bind_for_test(
+        addr: std::net::SocketAddr,
+    ) -> std::io::Result<std::net::TcpListener> {
+        let socket = socket2::Socket::new(
+            if addr.is_ipv6() {
+                socket2::Domain::IPV6
+            } else {
+                socket2::Domain::IPV4
+            },
+            socket2::Type::STREAM,
+            Some(socket2::Protocol::TCP),
+        )?;
+        socket.set_reuse_address(true)?;
+        #[cfg(unix)]
+        socket.set_reuse_port(true)?;
+        socket.set_nonblocking(true)?;
+        socket.bind(&addr.into())?;
+        socket.listen(128)?;
+        Ok(socket.into())
     }
 
     /// Classify an unexpected DTLS recv-loop JoinHandle result the same way
@@ -685,6 +725,16 @@ pub mod _test_support {
             config,
             real_ip_header,
         )
+    }
+
+    /// Whether private request provenance records `name`/`value` as a
+    /// gateway-minted correlation header. Public metadata cannot set this.
+    pub fn is_gateway_generated_correlation_header_for_test(
+        ctx: &crate::plugins::RequestContext,
+        name: &str,
+        value: &str,
+    ) -> bool {
+        ctx.is_gateway_generated_correlation_header(name, value)
     }
 
     pub fn udp_dtls_disconnect_metadata_after_datagram_metadata_for_test(

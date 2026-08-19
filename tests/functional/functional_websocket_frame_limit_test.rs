@@ -5,7 +5,6 @@
 
 use crate::common::{TestGateway, TestGatewayBuilder};
 use crate::scaffolding::clients::{Http3Client, WebSocketOptions};
-use crate::scaffolding::reserve_colocated_tcp_udp;
 
 use futures_util::{SinkExt, StreamExt};
 use http::StatusCode;
@@ -146,15 +145,17 @@ async fn functional_websocket_global_frame_limit_sends_1009_to_both_peers() {
 async fn functional_websocket_frame_limit_h3_rejects_oversized_client_frame() {
     let (backend_port, backend_messages, _backend_closes, backend_task) =
         spawn_counting_ws_backend().await;
-    let https_port = reserve_https_port().await;
     let mut gateway = frame_limit_gateway_builder(backend_port)
         .env("FERRUM_ENABLE_HTTP3", "true")
-        .env("FERRUM_PROXY_HTTPS_PORT", https_port.to_string())
+        .env_ephemeral_port("FERRUM_PROXY_HTTPS_PORT")
         .env("FERRUM_FRONTEND_TLS_CERT_PATH", "tests/certs/server.crt")
         .env("FERRUM_FRONTEND_TLS_KEY_PATH", "tests/certs/server.key")
         .spawn()
         .await
         .expect("start H3 WebSocket frame-limit gateway");
+    let https_port = gateway
+        .env_port("FERRUM_PROXY_HTTPS_PORT")
+        .expect("harness-allocated HTTPS port");
 
     let client = Http3Client::insecure().expect("h3 client");
     let url = format!("https://localhost:{https_port}/ws");
@@ -339,15 +340,17 @@ async fn functional_ws_message_size_limit_h3_sends_1009_to_both_peers() {
     use crate::scaffolding::H3WebSocketFrame;
 
     let (backend_port, mut backend_closes, backend_task) = spawn_recording_close_ws_backend().await;
-    let https_port = reserve_https_port().await;
     let mut gateway = plugin_frame_limit_gateway_builder(backend_port)
         .env("FERRUM_ENABLE_HTTP3", "true")
-        .env("FERRUM_PROXY_HTTPS_PORT", https_port.to_string())
+        .env_ephemeral_port("FERRUM_PROXY_HTTPS_PORT")
         .env("FERRUM_FRONTEND_TLS_CERT_PATH", "tests/certs/server.crt")
         .env("FERRUM_FRONTEND_TLS_KEY_PATH", "tests/certs/server.key")
         .spawn()
         .await
         .expect("start H3 plugin frame-limit gateway");
+    let https_port = gateway
+        .env_port("FERRUM_PROXY_HTTPS_PORT")
+        .expect("harness-allocated HTTPS port");
 
     let client = Http3Client::insecure().expect("H3 client");
     let url = format!("https://localhost:{https_port}/ws");
@@ -683,17 +686,6 @@ async fn run_counting_ws_backend(
             }
         });
     }
-}
-
-async fn reserve_https_port() -> u16 {
-    let (tcp, udp) = reserve_colocated_tcp_udp()
-        .await
-        .expect("reserve colocated https port");
-    let port = tcp.port;
-    assert_eq!(port, udp.port);
-    drop(tcp);
-    drop(udp);
-    port
 }
 
 async fn retry_h3_websocket(
