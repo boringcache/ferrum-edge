@@ -349,19 +349,23 @@ async fn concurrent_writes_coalesce_and_both_become_live() {
     let (base, _admin_shutdown) = start_admin(state).await;
     let token = admin_token();
 
+    // Bind both payloads: `admin_json` borrows them, and the futures are not
+    // awaited until the `tokio::join!` below, which outlives a temporary.
+    let payload_a = proxy_payload("/coalesce-a");
+    let payload_b = proxy_payload("/coalesce-b");
     let post_a = admin_json(
         reqwest::Method::POST,
         &base,
         "/proxies",
         &token,
-        Some(&proxy_payload("/coalesce-a")),
+        Some(&payload_a),
     );
     let post_b = admin_json(
         reqwest::Method::POST,
         &base,
         "/proxies",
         &token,
-        Some(&proxy_payload("/coalesce-b")),
+        Some(&payload_b),
     );
     let ((status_a, body_a), (status_b, body_b)) =
         tokio::time::timeout(Duration::from_secs(5), async {
