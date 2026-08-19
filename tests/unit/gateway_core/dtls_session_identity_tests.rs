@@ -40,3 +40,103 @@ fn dtls_client_address_metadata_refusals_are_counted_and_rate_limited() {
         "the second record must report the refusals the limiter withheld"
     );
 }
+
+/// Handshake records that are not the initial ClientHello fragment must not
+/// open a frontend DTLS demux session. After a refused client certificate the
+/// peer retransmits Certificate/Finished (`content-type 0x16`); treating those
+/// as a new handshake reserved a slot that a later client at the same 4-tuple
+/// was then folded into.
+#[test]
+fn dtls_demux_rejects_non_client_hello_handshake_records() {
+    fn handshake_record(msg_type: u8, fragment_offset: u32) -> Vec<u8> {
+        let body = [0u8; 16];
+        // msg_type(1) + length(3) + message_seq(2) + fragment_offset(3) +
+        // fragment_length(3), then the fragment body.
+        let mut handshake = vec![
+            msg_type,
+            0,
+            0,
+            body.len() as u8,
+            0x00,
+            0x00,
+            ((fragment_offset >> 16) & 0xff) as u8,
+            ((fragment_offset >> 8) & 0xff) as u8,
+            (fragment_offset & 0xff) as u8,
+            0,
+            0,
+            body.len() as u8,
+        ];
+        handshake.extend_from_slice(&body);
+
+        // content_type(1) + version(2) + epoch(2) + sequence_number(6), then
+        // the record length and the handshake fragment.
+        let mut record = vec![
+            0x16, 0xfe, 0xfd, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01,
+        ];
+        record.extend_from_slice(&(handshake.len() as u16).to_be_bytes());
+        record.extend_from_slice(&handshake);
+        record
+    }
+
+    let opens = ferrum_edge::_test_support::dtls_datagram_opens_session_for_test;
+    assert!(
+        !opens(&[0x16; 12]),
+        "a truncated DTLS record header must not open a session"
+    );
+    assert!(
+        !opens(&[0x16; 32]),
+        "handshake content-type without a ClientHello header must not open a session"
+    );
+    assert!(
+        !opens(&handshake_record(0x0b, 0)),
+        "a Certificate record must not open a session for an unknown peer"
+    );
+    assert!(
+        !opens(&handshake_record(0x14, 0)),
+        "a Finished record must not open a session for an unknown peer"
+    );
+    assert!(
+        !opens(&handshake_record(0x01, 16)),
+        "a ClientHello continuation fragment must not open a session"
+    );
+    assert!(
+        opens(&handshake_record(0x01, 0)),
+        "the initial ClientHello fragment is the only datagram that opens a session"
+    );
+    let mut truncated = handshake_record(0x01, 0);
+    truncated.pop();
+    assert!(
+        !opens(&truncated),
+        "a record shorter than its declared length must not open a session"
+    );
+    let mut nonzero_epoch = handshake_record(0x01, 0);
+    nonzero_epoch[4] = 1;
+    assert!(
+        !opens(&nonzero_epoch),
+        "a ClientHello record outside epoch zero must not open a session"
+    );
+    let mut empty_fragment = handshake_record(0x01, 0);
+    empty_fragment[22..25].copy_from_slice(&[0, 0, 0]);
+    assert!(
+        !opens(&empty_fragment),
+        "an empty ClientHello fragment must not reserve a session"
+    );
+    let mut oversized_fragment = handshake_record(0x01, 0);
+    oversized_fragment[22..25].copy_from_slice(&[0, 0, 17]);
+    assert!(
+        !opens(&oversized_fragment),
+        "a fragment longer than the record payload must not open a session"
+    );
+    let mut fragment_exceeds_message = handshake_record(0x01, 0);
+    fragment_exceeds_message[14..17].copy_from_slice(&[0, 0, 15]);
+    assert!(
+        !opens(&fragment_exceeds_message),
+        "a fragment longer than its declared handshake message must not open a session"
+    );
+    let mut ccs = handshake_record(0x01, 0);
+    ccs[0] = 0x14;
+    assert!(
+        !opens(&ccs),
+        "ChangeCipherSpec must not open a session for an unknown peer"
+    );
+}

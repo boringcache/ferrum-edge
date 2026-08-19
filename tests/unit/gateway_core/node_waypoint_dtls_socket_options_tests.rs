@@ -50,6 +50,7 @@ fn frontend_config() -> FrontendDtlsConfig {
         dimpl_config: Arc::new(dimpl::Config::builder().build().expect("build dtls config")),
         certificate: certificate.into(),
         client_cert_verifier: None,
+        client_trust: None,
     }
 }
 
