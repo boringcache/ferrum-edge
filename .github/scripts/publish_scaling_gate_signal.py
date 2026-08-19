@@ -3,12 +3,12 @@
 
 When the weekly scale/load matrix is red, or the latest scaling-regression run
 on `main` is not a completed success within the freshness ceiling, this program
-upserts a GitHub issue labeled `launch-blocker` + `severity:high`. The current
+upserts a GitHub issue labeled `severity:high`. The current
 matrix result is authoritative for the scaling workflow itself: success closes,
 failure/cancel/timeout opens. Freshness inspects the latest run on `main` and
 must not treat an older success as green over a newer non-success. Only a
-latest completed success within the ceiling closes the issue. Launch-readiness
-therefore cannot stay green while the scaling gate is red or stale.
+latest completed success within the ceiling closes the issue, so a red or
+stale scaling gate always has an open, dated issue naming it.
 
 The program never grants itself extra credentials: it uses the job-scoped
 GITHUB_TOKEN with `issues: write` and `actions: read` only. It refuses
@@ -34,7 +34,7 @@ from typing import Any, Callable
 
 MARKER = "<!-- ferrum-scaling-gate-signal -->"
 ISSUE_TITLE = "[CI] Scheduled Scaling Regression is red or stale"
-ISSUE_LABELS = ("launch-blocker", "severity:high")
+ISSUE_LABELS = ("severity:high",)
 SIGNAL_AUTHOR = "github-actions[bot]"
 ISSUE_LIST_PER_PAGE = 30
 ISSUE_LIST_MAX_PAGES = 5
@@ -142,7 +142,7 @@ def issue_body(reason: str, run_url: str) -> str:
     return (
         f"{MARKER}\n"
         "The Scheduled Scaling Regression gate is red or stale. This issue is the\n"
-        "durable signal so a broken 10k/30k scale lane cannot silently look launch-ready.\n"
+        "durable signal so a broken 10k/30k scale lane cannot stay red unnoticed.\n"
         "\n"
         f"Reason: {reason}\n"
         f"Run: {run_url}\n"

@@ -200,7 +200,7 @@ def validate_freshness_text(text: str, failures: list[str]) -> None:
 
 def validate_signal_text(text: str, failures: list[str]) -> None:
     require("MAX_AGE_SECONDS = 8 * 24 * 60 * 60" in text, "signal must keep the 8-day ceiling", failures)
-    require('ISSUE_LABELS = ("launch-blocker", "severity:high")' in text, "signal must use launch-blocker labels", failures)
+    require('ISSUE_LABELS = ("severity:high",)' in text, "signal must label the issue severity:high", failures)
     require("ferrum-scaling-gate-signal" in text, "signal must use a stable issue marker", failures)
     require("pull_request" in text, "signal must refuse pull-request events", failures)
     require('ref == "refs/heads/main"' in text, "signal must mutate issues only on main", failures)
@@ -388,7 +388,7 @@ jobs:
 
     good_signal = """
 MAX_AGE_SECONDS = 8 * 24 * 60 * 60
-ISSUE_LABELS = ("launch-blocker", "severity:high")
+ISSUE_LABELS = ("severity:high",)
 ferrum-scaling-gate-signal
 pull_request
 ref == "refs/heads/main"
