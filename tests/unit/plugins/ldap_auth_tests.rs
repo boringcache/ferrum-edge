@@ -24,7 +24,9 @@ use std::sync::{
 };
 use std::time::Duration;
 
-use super::plugin_utils::{assert_continue, assert_reject};
+use super::plugin_utils::{
+    assert_continue, assert_reject, assert_reject_body, context_with_materialized_raw_header,
+};
 
 fn http_client() -> PluginHttpClient {
     PluginHttpClient::default()
@@ -2464,4 +2466,22 @@ fn test_filter_escape_preserves_utf8() {
     // Multi-byte characters and the metacharacter escaping must coexist.
     assert_eq!(escape_filter_value("café*"), "café\\2a");
     assert_eq!(escape_filter_value("naïve(user)"), "naïve\\28user\\29");
+}
+
+#[tokio::test]
+async fn test_ldap_auth_non_ascii_authorization_returns_invalid_not_missing() {
+    let plugin = LdapAuth::new(
+        &json!({"ldap_url": "ldap://127.0.0.1:389", "bind_dn_template": "uid={username},dc=example,dc=com"}),
+        &http_client(),
+    )
+    .unwrap();
+    let consumer_index = ConsumerIndex::new(&[]);
+    let mut ctx = context_with_materialized_raw_header(
+        "Authorization",
+        &format!("Basic dXNlcjpwYXNz\u{3000}"),
+    );
+
+    let result = plugin.authenticate(&mut ctx, &consumer_index).await;
+    assert_reject_body(result, r#"{"error":"Invalid Authorization header"}"#);
+    assert!(ctx.identified_consumer.is_none());
 }

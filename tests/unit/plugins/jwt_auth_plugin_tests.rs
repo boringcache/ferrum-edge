@@ -12,7 +12,9 @@ use ferrum_edge::config::types::Consumer;
 use serde_json::Value;
 use std::collections::HashMap;
 
-use super::plugin_utils::{assert_continue, assert_reject, create_test_consumer};
+use super::plugin_utils::{
+    assert_continue, assert_reject, assert_reject_body, context_with_materialized_raw_header,
+};
 
 fn make_ctx() -> RequestContext {
     RequestContext::new(
@@ -820,4 +822,36 @@ async fn test_jwt_auth_rejects_completely_empty_signature() {
 
     let result = plugin.authenticate(&mut ctx, &consumer_index).await;
     assert_reject(result, Some(401));
+}
+
+#[tokio::test]
+async fn test_jwt_auth_non_ascii_bearer_separator_authenticates() {
+    let plugin = JwtAuth::new(&json!({})).unwrap();
+    let consumer_index = ConsumerIndex::new(&[create_test_consumer()]);
+    let token = create_jwt_token(&json!({"sub": "testuser"}), "test-jwt-secret");
+    let mut ctx = context_with_materialized_raw_header(
+        "Authorization",
+        &format!("Bearer \u{3000}{token}"),
+    );
+
+    let result = plugin.authenticate(&mut ctx, &consumer_index).await;
+    assert_continue(result);
+    assert_eq!(
+        ctx.identified_consumer.as_ref().unwrap().username,
+        "testuser"
+    );
+}
+
+#[tokio::test]
+async fn test_jwt_auth_non_ascii_bearer_token_returns_invalid_not_missing() {
+    let plugin = JwtAuth::new(&json!({})).unwrap();
+    let consumer_index = ConsumerIndex::new(&[create_test_consumer()]);
+    let mut ctx = context_with_materialized_raw_header(
+        "Authorization",
+        "Bearer \u{3000}not-a-valid-jwt-token",
+    );
+
+    let result = plugin.authenticate(&mut ctx, &consumer_index).await;
+    assert_reject_body(result, r#"{"error":"Invalid JWT token"}"#);
+    assert!(ctx.identified_consumer.is_none());
 }

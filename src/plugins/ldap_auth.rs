@@ -67,6 +67,9 @@ use crate::tls::source::{CertSource, MaterialKind, load_material_blocking};
 
 use super::utils::PluginHttpClient;
 use super::utils::auth_flow::{self, AuthMechanism, ExtractedCredential, VerifyOutcome};
+use super::utils::header_extract::{
+    ConfiguredHeaderLookup, lookup_configured_header,
+};
 use super::{RequestContext, strip_auth_scheme};
 
 pub const LDAP_AUTH_DEFAULT_CACHE_TTL_SECONDS: u64 = 0;
@@ -1509,9 +1512,17 @@ impl AuthMechanism for LdapAuth {
     }
 
     fn extract(&self, ctx: &RequestContext) -> ExtractedCredential {
-        let auth_header = match ctx.headers.get("authorization") {
-            Some(header) => header,
-            None => return ExtractedCredential::Missing,
+        // Same contract as `basic_auth`: Basic credentials are base64 (visible
+        // ASCII). A present but non-materialized `Authorization` line is invalid,
+        // not missing.
+        let auth_header = match lookup_configured_header(ctx, "authorization", None) {
+            ConfiguredHeaderLookup::Absent => return ExtractedCredential::Missing,
+            ConfiguredHeaderLookup::PresentNonMaterialized => {
+                return ExtractedCredential::InvalidFormat(
+                    r#"{"error":"Invalid Authorization header"}"#.into(),
+                );
+            }
+            ConfiguredHeaderLookup::Value(header) => header,
         };
 
         let encoded = match strip_auth_scheme(auth_header, "Basic") {

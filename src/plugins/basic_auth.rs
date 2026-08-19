@@ -19,6 +19,9 @@ use crate::consumer_index::ConsumerIndex;
 use super::utils::auth_flow::{
     self, AuthMechanism, ExtractedCredential, VerifyOutcome, constant_time_eq,
 };
+use super::utils::header_extract::{
+    ConfiguredHeaderLookup, lookup_configured_header,
+};
 use super::{RequestContext, strip_auth_scheme};
 
 // A canonical stored Basic hash alone consumes this many serialized bytes,
@@ -200,8 +203,18 @@ impl AuthMechanism for BasicAuth {
     }
 
     fn extract(&self, ctx: &RequestContext) -> ExtractedCredential {
-        let Some(auth_header) = ctx.headers.get("authorization") else {
-            return ExtractedCredential::Missing;
+        // RFC 7617 `Authorization: Basic` credentials are base64 (visible ASCII).
+        // A present field line that `materialize_headers()` omitted is malformed,
+        // not absent — report invalid so operators are not pointed at a missing
+        // credential.
+        let auth_header = match lookup_configured_header(ctx, "authorization", None) {
+            ConfiguredHeaderLookup::Absent => return ExtractedCredential::Missing,
+            ConfiguredHeaderLookup::PresentNonMaterialized => {
+                return ExtractedCredential::InvalidFormat(
+                    r#"{"error":"Invalid Authorization header"}"#.into(),
+                );
+            }
+            ConfiguredHeaderLookup::Value(header) => header,
         };
 
         let scheme = auth_header

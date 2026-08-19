@@ -6,6 +6,7 @@ use ferrum_edge::config::types::{
 };
 use ferrum_edge::plugins::{Plugin, PluginResult, RequestContext};
 use hmac::{KeyInit, Mac};
+use http::HeaderMap;
 use serde_json::{Map, Value};
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -136,6 +137,77 @@ pub fn create_test_context() -> RequestContext {
     // Set a test consumer so access control plugin doesn't reject
     ctx.identified_consumer = Some(std::sync::Arc::new(create_test_consumer()));
     ctx
+}
+
+/// Build a request context whose raw header map contains `value`, then run
+/// `materialize_headers()` so non-visible-ASCII values stay out of `ctx.headers`.
+pub fn context_with_materialized_raw_header(name: &str, value: &str) -> RequestContext {
+    let mut ctx = RequestContext::new(
+        "127.0.0.1".to_string(),
+        "GET".to_string(),
+        "/test".to_string(),
+    );
+    ctx.headers.clear();
+    ctx.identified_consumer = None;
+
+    let mut raw = HeaderMap::new();
+    raw.insert(
+        name,
+        http::HeaderValue::from_bytes(value.as_bytes()).expect("valid header bytes"),
+    );
+    ctx.set_raw_headers(raw);
+    ctx.materialize_headers();
+    assert!(
+        !ctx.headers.contains_key(name.to_ascii_lowercase().as_str())
+            && !ctx.headers.contains_key(name),
+        "non-ASCII header values must stay out of the materialized map in this repro"
+    );
+    ctx
+}
+
+/// Build a request context from raw header bytes that `materialize_headers()`
+/// omits, then materialize the rest of the map.
+pub fn context_with_materialized_raw_header_bytes(
+    name: &str,
+    value: &[u8],
+) -> RequestContext {
+    let mut ctx = RequestContext::new(
+        "127.0.0.1".to_string(),
+        "GET".to_string(),
+        "/test".to_string(),
+    );
+    ctx.headers.clear();
+    ctx.identified_consumer = None;
+
+    let mut raw = HeaderMap::new();
+    raw.insert(
+        name,
+        http::HeaderValue::from_bytes(value).expect("valid header bytes"),
+    );
+    ctx.set_raw_headers(raw);
+    ctx.materialize_headers();
+    assert!(
+        !ctx.headers.contains_key(name.to_ascii_lowercase().as_str())
+            && !ctx.headers.contains_key(name),
+        "non-materializable header values must stay out of the materialized map in this repro"
+    );
+    ctx
+}
+
+/// Assert that a plugin result is Reject with the expected JSON body.
+#[allow(dead_code)]
+pub fn assert_reject_body(result: PluginResult, expected_body: &str) {
+    match result {
+        PluginResult::Reject {
+            status_code,
+            body,
+            ..
+        } => {
+            assert_eq!(status_code, 401);
+            assert_eq!(body, expected_body);
+        }
+        other => panic!("Expected Reject, got {other:?}"),
+    }
 }
 
 /// Create a test proxy with default configuration
