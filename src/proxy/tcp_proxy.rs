@@ -1835,7 +1835,7 @@ pub struct TcpListenerConfig {
     pub tcp_fastopen_enabled: bool,
     /// Listen backlog for the TCP stream proxy socket.
     pub tcp_listen_backlog: u32,
-    /// Number of SO_REUSEPORT accept loops for this stream proxy.
+    /// Number of duplicated exclusive-listen accept loops for this stream proxy.
     pub accept_threads: usize,
     /// Server-side TCP Fast Open queue length.
     pub tcp_fastopen_queue_len: u16,
@@ -1932,7 +1932,7 @@ struct TcpAcceptLoopState {
 /// Keeps reconcile/shutdown from hanging if a cancel signal is lost.
 const TCP_ACCEPT_PEER_DRAIN_TIMEOUT: Duration = Duration::from_secs(2);
 
-/// Which SO_REUSEPORT accept loop a supervised peer represents.
+/// Which accept loop a supervised peer represents.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum TcpAcceptLoopClass {
     Primary,
@@ -1988,29 +1988,29 @@ fn classify_tcp_accept_peer_exit(
 ) -> TcpAcceptPeerExit {
     match join_result {
         Ok(Ok(())) => TcpAcceptPeerExit::Clean,
-        Ok(Err(err)) => TcpAcceptPeerExit::Failed(err.context(format!(
-            "TCP SO_REUSEPORT accept loop {class} exited with error"
-        ))),
+        Ok(Err(err)) => TcpAcceptPeerExit::Failed(
+            err.context(format!("TCP accept loop {class} exited with error")),
+        ),
         Err(join_err) if join_err.is_cancelled() => {
             if teardown_started {
                 // Sibling abort after an earlier peer failure, or shutdown drain.
                 TcpAcceptPeerExit::Clean
             } else {
                 TcpAcceptPeerExit::Failed(anyhow::anyhow!(
-                    "TCP SO_REUSEPORT accept loop {class} was cancelled unexpectedly"
+                    "TCP accept loop {class} was cancelled unexpectedly"
                 ))
             }
         }
         Err(join_err) if join_err.is_panic() => TcpAcceptPeerExit::Failed(anyhow::anyhow!(
-            "TCP SO_REUSEPORT accept loop {class} panicked: {join_err}"
+            "TCP accept loop {class} panicked: {join_err}"
         )),
         Err(join_err) => TcpAcceptPeerExit::Failed(anyhow::anyhow!(
-            "TCP SO_REUSEPORT accept loop {class} failed to join: {join_err}"
+            "TCP accept loop {class} failed to join: {join_err}"
         )),
     }
 }
 
-/// Supervise primary + extra SO_REUSEPORT accept loops as peer components.
+/// Supervise primary + extra accept loops as peer components.
 ///
 /// The first unexpected exit cancels siblings, drains (then aborts) remaining
 /// tasks, and returns that failure. Clean shutdown-triggered exits return
@@ -2052,7 +2052,7 @@ pub(crate) async fn supervise_tcp_accept_loop_peers(
                         accept_loop = class.accept_loop_id(),
                         loop_class = class.label(),
                         error = %err,
-                        "TCP SO_REUSEPORT accept loop exited unexpectedly; tearing down sibling accept loops"
+                        "TCP accept loop exited unexpectedly; tearing down sibling accept loops"
                     );
                     first_error = Some(err);
                     if let Some(cancel) = cancel_siblings.take() {
@@ -2185,24 +2185,29 @@ pub async fn start_tcp_listener(cfg: TcpListenerConfig) -> Result<(), anyhow::Er
         if configured_accept_threads > 1 {
             warn!(
                 configured_accept_threads,
-                "FERRUM_ACCEPT_THREADS > 1 requires SO_REUSEPORT; using one TCP stream accept loop on this platform"
+                "FERRUM_ACCEPT_THREADS > 1 is Unix-only; using one TCP stream accept loop on this platform"
             );
         }
         1
     };
-    let reuse_port = actual_accept_threads > 1;
     let tfo_queue = if tcp_fastopen_enabled {
         Some(tcp_fastopen_queue_len)
     } else {
         None
     };
 
-    // Create the first listener up front; additional listeners bind below via
-    // SO_REUSEPORT so the kernel can distribute stream accepts across workers.
-    // Stream listeners are never the NodeWaypoint inbound relay, so they never
-    // bind transparent — only the mesh inbound listener opts in (issue #3287).
-    let first_listener =
-        crate::proxy::create_proxy_socket(addr, backlog, tfo_queue, reuse_port, false)?;
+    // One exclusive listen socket, duplicated for extra accept workers.
+    // Never SO_REUSEPORT: a second process must fail to bind this address
+    // (issue #3924). Stream listeners are never the NodeWaypoint inbound
+    // relay, so they never bind transparent — only the mesh inbound listener
+    // opts in (issue #3287).
+    let mut listeners = crate::proxy::bind_exclusive_proxy_accept_listeners(
+        addr,
+        backlog,
+        tfo_queue,
+        actual_accept_threads,
+        false,
+    )?;
 
     // Convert to Arc<str> so per-connection clones are a cheap pointer bump.
     let proxy_id: Arc<str> = Arc::from(proxy_id);
@@ -2262,16 +2267,9 @@ pub async fn start_tcp_listener(cfg: TcpListenerConfig) -> Result<(), anyhow::Er
         trusted_proxies,
     };
 
-    // Bind all extra sockets before spawning any accept loops. If one bind
-    // fails, every already-bound socket is dropped here and startup fails
-    // cleanly without leaving orphan listener tasks behind.
-    let mut listeners = Vec::with_capacity(actual_accept_threads);
-    listeners.push(first_listener);
-    for _ in 1..actual_accept_threads {
-        listeners.push(crate::proxy::create_proxy_socket(
-            addr, backlog, tfo_queue, reuse_port, false,
-        )?);
-    }
+    // Extra accept workers already hold duplicated fds of the exclusive
+    // listen socket. If duplication failed above, every socket was dropped
+    // and startup fails cleanly without orphan listener tasks.
 
     started.store(true, Ordering::Release);
     info!(
@@ -2283,7 +2281,7 @@ pub async fn start_tcp_listener(cfg: TcpListenerConfig) -> Result<(), anyhow::Er
     );
 
     // Single accept loop: keep the zero-spawn hot path. Multi-loop mode
-    // supervises primary + every SO_REUSEPORT peer concurrently so an
+    // supervises primary + every duplicated-fd peer concurrently so an
     // unexpected exit cannot silently reduce capacity while readiness stays
     // healthy (issue #3216).
     if listeners.len() == 1 {

@@ -225,7 +225,7 @@ Ferrum supports dynamic upstream target discovery through four providers, config
 ## High-Concurrency & Runtime Tuning
 
 - **jemalloc** memory allocator (Linux/macOS) for reduced fragmentation at scale
-- **Multi-listener SO_REUSEPORT** — N parallel accept loops per proxy port (auto-detects CPU cores via `FERRUM_ACCEPT_THREADS`), giving the kernel separate accept queues to eliminate single-socket lock bottleneck at high connection rates
+- **Exclusive multi-accept** — N parallel accept loops per proxy port on duplicated fds of one exclusive listen socket (auto-detects CPU cores via `FERRUM_ACCEPT_THREADS`). A second process cannot bind the same TCP proxy address/port; `SO_REUSEPORT` is never used for this fan-out
 - Configurable TCP listen backlog (default 2048) for burst absorption
 - Connection limit semaphore (default 100k) with graceful queuing under overload
 - Server-side HTTP/2 `max_concurrent_streams` (default 1000) to bound per-connection resource usage

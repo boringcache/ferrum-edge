@@ -18995,10 +18995,10 @@ pub async fn start_proxy_listener_with_tls(
 /// passes the live listener in, and the gateway adopts it without rebinding.
 ///
 /// Unlike [`start_proxy_listener_with_tls_and_signal`] this path is
-/// deliberately single-listener: SO_REUSEPORT/multi-accept-thread expansion
-/// requires the gateway to bind extra sockets itself, which the binary path
-/// does and the in-process path explicitly skips. Tests don't need 50k+
-/// conn/sec throughput — they need deterministic teardown.
+/// deliberately single-listener: extra accept workers duplicate one exclusive
+/// listen fd, which the binary path does after it binds. The in-process path
+/// adopts a caller-owned socket and skips that expansion. Tests don't need
+/// 50k+ conn/sec throughput — they need deterministic teardown.
 ///
 /// All other policy (overload guard, connection semaphore, TLS handshake,
 /// connection guard) is shared with the binary path.
@@ -19068,11 +19068,90 @@ pub async fn start_proxy_listener_with_bound_listener_and_mesh_direction(
     Ok(())
 }
 
-/// Create a bound TCP socket with SO_REUSEADDR and optional SO_REUSEPORT.
-/// Used by the multi-listener accept architecture where N sockets are bound
-/// to the same address, each with its own accept loop.
-/// `SO_REUSEPORT` is enabled only when `reuse_port` is true, which keeps
-/// single-listener sockets from being co-bound unnecessarily.
+/// Bind one exclusive TCP listen socket and duplicate it for intra-process
+/// accept workers (issue #3924).
+///
+/// `SO_REUSEPORT` is never set. A second unrelated process cannot join this
+/// address/port; the OS refuses its bind (`EADDRINUSE` on Unix and
+/// `WSAEADDRINUSE` or `WSAEACCES` on Windows). `FERRUM_ACCEPT_THREADS`
+/// concurrency is preserved by duplicating the single authoritative listener
+/// so each tokio accept task has its own fd/waker while still sharing one kernel
+/// listen socket. Do not replace this with a TOCTOU occupancy probe or a second
+/// independent bind.
+pub(crate) fn bind_exclusive_proxy_accept_listeners(
+    addr: SocketAddr,
+    backlog: i32,
+    tcp_fastopen_queue_len: Option<u16>,
+    accept_threads: usize,
+    transparent: bool,
+) -> Result<Vec<TcpListener>, anyhow::Error> {
+    let accept_threads = accept_threads.max(1);
+    let first = create_proxy_socket(addr, backlog, tcp_fastopen_queue_len, transparent)?;
+    if accept_threads == 1 {
+        return Ok(vec![first]);
+    }
+
+    let mut listeners = Vec::with_capacity(accept_threads);
+    listeners.push(first);
+    for index in 1..accept_threads {
+        let cloned = clone_proxy_listener(&listeners[0]).map_err(|err| {
+            err.context(format!(
+                "failed to duplicate exclusive TCP proxy listener on {addr} \
+                 for accept worker {index}"
+            ))
+        })?;
+        listeners.push(cloned);
+    }
+    Ok(listeners)
+}
+
+/// Duplicate a bound listen socket so another accept task can poll it.
+///
+/// The clone is a distinct fd (or Windows socket handle) pointing at the same
+/// kernel listen socket. Tokio stores one waker per fd, so workers must not
+/// share a single `TcpListener` via `Arc`.
+pub(crate) fn clone_proxy_listener(listener: &TcpListener) -> Result<TcpListener, anyhow::Error> {
+    clone_proxy_listener_inner(listener)
+        .map_err(|err| anyhow::anyhow!("failed to duplicate exclusive TCP proxy listener: {err}"))
+}
+
+#[cfg(unix)]
+fn clone_proxy_listener_inner(listener: &TcpListener) -> std::io::Result<TcpListener> {
+    use std::os::fd::AsFd;
+    let owned = listener.as_fd().try_clone_to_owned()?;
+    let std_listener = std::net::TcpListener::from(owned);
+    std_listener.set_nonblocking(true)?;
+    TcpListener::from_std(std_listener)
+}
+
+#[cfg(windows)]
+fn clone_proxy_listener_inner(listener: &TcpListener) -> std::io::Result<TcpListener> {
+    use std::os::windows::io::AsSocket;
+    let owned = listener.as_socket().try_clone_to_owned()?;
+    let std_listener = std::net::TcpListener::from(owned);
+    std_listener.set_nonblocking(true)?;
+    TcpListener::from_std(std_listener)
+}
+
+#[cfg(not(any(unix, windows)))]
+fn clone_proxy_listener_inner(_listener: &TcpListener) -> std::io::Result<TcpListener> {
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "duplicating a TCP listen socket is not supported on this platform",
+    ))
+}
+
+/// Create a bound TCP socket with an OS-native exclusive server posture.
+///
+/// Unix uses `SO_REUSEADDR` without `SO_REUSEPORT`. Windows must instead set
+/// `SO_EXCLUSIVEADDRUSE`: Winsock's `SO_REUSEADDR` lets another process
+/// forcibly co-bind the port and would recreate the traffic-splitting defect
+/// this factory closes.
+///
+/// The socket is exclusive at the kernel: another process cannot listen on the
+/// same TCP address/port, including one that requests a reuse option.
+/// Intra-process accept workers must [`clone_proxy_listener`] this fd rather
+/// than binding again. Used by HTTP, Gateway, and stream/TCP listeners.
 ///
 /// When `tcp_fastopen_queue_len` is `Some(n)`, enables TCP Fast Open on the
 /// listening socket (Linux only), allowing repeat clients with a cached TFO
@@ -19081,7 +19160,6 @@ pub(crate) fn create_proxy_socket(
     addr: SocketAddr,
     backlog: i32,
     tcp_fastopen_queue_len: Option<u16>,
-    reuse_port: bool,
     transparent: bool,
 ) -> Result<TcpListener, anyhow::Error> {
     let socket = socket2::Socket::new(
@@ -19094,16 +19172,17 @@ pub(crate) fn create_proxy_socket(
         Some(socket2::Protocol::TCP),
     )?;
 
-    // SO_REUSEADDR: allow rapid restart without TIME_WAIT blocking the port.
+    // Unix SO_REUSEADDR allows rapid restart without admitting an independent
+    // listener. Do not set SO_REUSEPORT: that lets a second ferrum-edge
+    // process bind the same proxy port and split traffic (issue #3924).
+    #[cfg(unix)]
     socket.set_reuse_address(true)?;
 
-    // SO_REUSEPORT: let the kernel distribute incoming connections across
-    // multiple listener tasks (Linux 3.9+, macOS, BSDs). This eliminates
-    // the single-thread accept() bottleneck at high connection rates.
-    #[cfg(unix)]
-    if reuse_port {
-        socket.set_reuse_port(true)?;
-    }
+    // Winsock SO_REUSEADDR has the opposite security posture: another process
+    // can forcibly co-bind the port and make delivery indeterminate. Server
+    // sockets therefore require SO_EXCLUSIVEADDRUSE before bind.
+    #[cfg(windows)]
+    set_windows_exclusive_addr_use(&socket)?;
 
     // IP_TRANSPARENT / IPV6_TRANSPARENT for the NodeWaypoint transparent
     // inbound CAPTURE listener (issue #3287). That listener is the only caller
@@ -19150,7 +19229,9 @@ pub(crate) fn create_proxy_socket(
     }
 
     socket.set_nonblocking(true)?;
-    socket.bind(&addr.into())?;
+    socket.bind(&addr.into()).map_err(|err| {
+        anyhow::anyhow!("failed to bind exclusive TCP proxy listener on {addr}: {err}")
+    })?;
 
     // TCP_FASTOPEN: enable TFO on the server socket after bind, before listen.
     // This allows repeat clients to send data in the SYN packet, saving 1 RTT.
@@ -19166,18 +19247,66 @@ pub(crate) fn create_proxy_socket(
         }
     }
 
-    socket.listen(backlog)?;
+    socket.listen(backlog).map_err(|err| {
+        anyhow::anyhow!("failed to listen on exclusive TCP proxy listener {addr}: {err}")
+    })?;
 
     Ok(TcpListener::from_std(socket.into())?)
 }
 
+#[cfg(windows)]
+#[link(name = "Ws2_32")]
+unsafe extern "system" {
+    #[link_name = "setsockopt"]
+    fn winsock_setsockopt(
+        socket: usize,
+        level: i32,
+        option_name: i32,
+        option_value: *const std::ffi::c_char,
+        option_len: i32,
+    ) -> i32;
+    #[link_name = "WSAGetLastError"]
+    fn winsock_last_error() -> i32;
+}
+
+#[cfg(windows)]
+fn set_windows_exclusive_addr_use(socket: &socket2::Socket) -> std::io::Result<()> {
+    use std::os::windows::io::AsRawSocket;
+
+    const SOL_SOCKET: i32 = 0xffff;
+    const SO_REUSEADDR: i32 = 0x0004;
+    const SO_EXCLUSIVEADDRUSE: i32 = !SO_REUSEADDR;
+    const SOCKET_ERROR: i32 = -1;
+
+    let enabled: i32 = 1;
+    // SAFETY: `socket` is live, `enabled` remains valid for the call, and the
+    // option length exactly describes that integer. Winsock requires this
+    // option before bind, which is where the caller invokes this helper.
+    let result = unsafe {
+        winsock_setsockopt(
+            socket.as_raw_socket() as usize,
+            SOL_SOCKET,
+            SO_EXCLUSIVEADDRUSE,
+            std::ptr::addr_of!(enabled).cast(),
+            std::mem::size_of::<i32>() as i32,
+        )
+    };
+    if result == SOCKET_ERROR {
+        // SAFETY: WSAGetLastError has no arguments and reads thread-local
+        // Winsock error state immediately after the failed call.
+        return Err(std::io::Error::from_raw_os_error(unsafe {
+            winsock_last_error()
+        }));
+    }
+    Ok(())
+}
+
 /// Start the proxy listener with an optional startup signal sent after bind.
 ///
-/// When `FERRUM_ACCEPT_THREADS > 1`, spawns N parallel accept loops each with
-/// its own socket bound to the same address via SO_REUSEPORT. The kernel
-/// distributes incoming connections across the N sockets, eliminating the
-/// single-thread accept() bottleneck at high connection rates (50k+ conn/sec).
-/// All N loops share the same connection semaphore for global limit enforcement.
+/// When `FERRUM_ACCEPT_THREADS > 1`, spawns N parallel accept loops on clones
+/// of one exclusive listen socket. A second process cannot bind the same
+/// address/port. All N loops share the same connection semaphore for global
+/// limit enforcement.
 pub async fn start_proxy_listener_with_tls_and_signal(
     addr: SocketAddr,
     state: ProxyState,
@@ -19835,12 +19964,11 @@ async fn start_proxy_listener_with_tls_source_and_signal(
         if configured_accept_threads > 1 {
             tracing::warn!(
                 configured_accept_threads,
-                "FERRUM_ACCEPT_THREADS > 1 requires SO_REUSEPORT; using one accept loop on this platform"
+                "FERRUM_ACCEPT_THREADS > 1 is Unix-only; using one accept loop on this platform"
             );
         }
         1
     };
-    let reuse_port = accept_threads > 1;
     let tfo_enabled = state
         .env_config
         .tcp_fastopen_enabled
@@ -19851,15 +19979,21 @@ async fn start_proxy_listener_with_tls_source_and_signal(
         None
     };
 
-    // Create the first listener — this one validates that the port is available.
+    // One exclusive listen socket — this validates that the port is available
+    // and cannot be joined by a second process. Extra accept workers receive
+    // duplicated fds of that socket (issue #3924).
     //
     // NEVER transparent here. `IP_TRANSPARENT` lets a socket bind and source
     // addresses that are not configured on this host, so it is granted to
     // exactly one listener — the NodeWaypoint inbound capture socket, which
     // opts in explicitly in `proxy::node_waypoint_ingress_capture` — and never
     // to a whole class of listeners on the strength of a process-wide env var.
-    let first_listener = create_proxy_socket(addr, backlog, tfo_queue, reuse_port, false)
-        .map_err(|err| err.context("Proxy listener bind failed"))?;
+    let mut listeners =
+        bind_exclusive_proxy_accept_listeners(addr, backlog, tfo_queue, accept_threads, false)
+            .map_err(|err| err.context("Proxy listener bind failed"))?;
+    let first_listener = listeners.pop().ok_or_else(|| {
+        anyhow::anyhow!("exclusive proxy listener set unexpectedly empty after bind")
+    })?;
 
     // Optional connection limit. Shared across all accept threads so the global
     // max_connections limit is enforced regardless of which thread accepted.
@@ -19877,16 +20011,14 @@ async fn start_proxy_listener_with_tls_source_and_signal(
         };
     let state = Arc::new(state);
 
-    if accept_threads > 1 {
-        // Multi-listener mode: spawn N-1 additional accept loops, each with its
-        // own socket bound to the same address via SO_REUSEPORT. The kernel
-        // distributes connections across all N sockets.
-        let mut handles = Vec::with_capacity(accept_threads);
+    if !listeners.is_empty() {
+        // Extra accept workers share the exclusive listen socket via dup'd
+        // fds. Spawn them before running the primary loop so a clone failure
+        // (already handled above) cannot leave orphan tasks behind.
+        let mut handles = Vec::with_capacity(listeners.len());
 
-        // Spawn additional listeners (threads 1..N-1)
-        for i in 1..accept_threads {
-            let listener = create_proxy_socket(addr, backlog, tfo_queue, reuse_port, false)
-                .map_err(|err| err.context("Proxy listener bind failed"))?;
+        for (offset, listener) in listeners.into_iter().enumerate() {
+            let i = offset + 1;
             let state = Arc::clone(&state);
             let tls_source = tls_source.clone();
             let semaphore = conn_semaphore.clone();
@@ -20033,7 +20165,7 @@ fn should_use_direct_pod_ip_http_route(
 }
 
 /// Accept loop that runs on a single listener socket. Multiple instances can
-/// run concurrently on the same address when SO_REUSEPORT is enabled.
+/// run concurrently on duplicated fds of one exclusive listen socket.
 #[allow(clippy::too_many_arguments)]
 async fn run_accept_loop(
     listener: TcpListener,
