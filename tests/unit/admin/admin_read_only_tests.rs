@@ -1133,12 +1133,27 @@ fn live_apply_handlers_capture_sequence_before_releasing_pins() {
             && !joined.contains("await_live_apply_after_commit("),
         "the post-drop sequence re-query helpers must not exist"
     );
+    // Count the boxed factory's CALL SITES rather than the bare substring: the
+    // factory's own name contains the inner helper's name, so a substring
+    // count conflates definitions, doc links, and calls. `..._boxed<` is the
+    // definition and `..._boxed(` is a call, so this counts calls only.
     assert_eq!(
         joined
-            .matches("complete_live_config_mutation_after_commit")
+            .matches("complete_live_config_mutation_after_commit_boxed(")
             .count(),
-        13,
-        "one two-phase helper plus twelve wired mutation completions"
+        12,
+        "twelve wired mutation completions, every one through the boxed factory"
+    );
+    // The inner async helper must have exactly one caller — the factory. Any
+    // handler awaiting it directly would put the whole future back into that
+    // handler's coroutine frame, which is what overflowed the stack in the
+    // admin-api coverage shard at opt-level 0.
+    assert_eq!(
+        joined
+            .matches("Box::pin(self.complete_live_config_mutation_after_commit(")
+            .count(),
+        1,
+        "only the inline(never) factory may construct the completion future"
     );
     assert!(
         !joined.contains("drop(_write_permit)"),
