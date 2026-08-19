@@ -605,6 +605,66 @@ pub struct RuntimeSnapshot {
     /// token, claim, certificate field, provider, or expiry value is recorded.
     pub authorization_lifetime: crate::proxy::auth_lifetime::StreamAuthLifetimeCounters,
     pub overload: Value,
+    /// Frontend client-CA / CRL trust generations and established-transport
+    /// retirement, one row per listener scope (issue #3857). Empty in a process
+    /// where no scope has accepted client-trust material. Every field is a
+    /// counter, a gauge, or the closed scope vocabulary — no certificate field,
+    /// serial, subject, fingerprint, or source path is representable here.
+    pub frontend_client_trust: Vec<FrontendClientTrustSnapshot>,
+}
+
+/// One listener scope's client-trust state.
+#[derive(Debug, Serialize)]
+pub struct FrontendClientTrustSnapshot {
+    /// Closed listener-scope vocabulary: `proxy_frontend`, `proxy_h3`,
+    /// `admin_https`, `frontend_dtls`.
+    pub scope: &'static str,
+    /// Monotonic generation currently in force.
+    pub generation: u64,
+    /// Generation at which client-certificate authority was last narrowed;
+    /// `0` when it never has been.
+    pub withdrawal_generation: u64,
+    /// Established client-certificate-authenticated transports currently
+    /// tracked for retirement.
+    pub tracked_connections: usize,
+    /// Accepted publications that armed the scope's baseline.
+    pub publications_armed: u64,
+    /// Accepted publications that were semantically identical to the last one.
+    pub publications_unchanged: u64,
+    /// Accepted publications that changed the material without narrowing it.
+    pub publications_advanced: u64,
+    /// Accepted publications that narrowed authority and moved the fence.
+    pub publications_withdrawn: u64,
+    /// Reload candidates refused; the last accepted generation, verifier and
+    /// sessions were retained.
+    pub rejected_candidates: u64,
+    /// Transports retired because their issuing CA left the client-CA bundle.
+    pub retired_client_ca_withdrawn: u64,
+    /// Transports retired because a CRL added a revocation.
+    pub retired_crl_changed: u64,
+    /// Requests / streams refused at the admission fence.
+    pub fenced_requests: u64,
+}
+
+fn build_frontend_client_trust_snapshot() -> Vec<FrontendClientTrustSnapshot> {
+    crate::tls::client_trust::snapshot()
+        .into_iter()
+        .filter(|row| row.armed)
+        .map(|row| FrontendClientTrustSnapshot {
+            scope: row.scope.label(),
+            generation: row.generation,
+            withdrawal_generation: row.withdrawal_generation,
+            tracked_connections: row.tracked_sessions,
+            publications_armed: row.publications[0],
+            publications_unchanged: row.publications[1],
+            publications_advanced: row.publications[2],
+            publications_withdrawn: row.publications[3],
+            rejected_candidates: row.rejected_candidates,
+            retired_client_ca_withdrawn: row.retirements[0],
+            retired_crl_changed: row.retirements[1],
+            fenced_requests: row.fenced,
+        })
+        .collect()
 }
 
 #[derive(Debug, Serialize)]
@@ -702,6 +762,7 @@ pub fn build_snapshot(
         replay_authority: crate::plugins::utils::replay_authority::counters(),
         authorization_lifetime: crate::proxy::auth_lifetime::counters(),
         overload: build_overload_snapshot(proxy_state),
+        frontend_client_trust: build_frontend_client_trust_snapshot(),
     }
 }
 

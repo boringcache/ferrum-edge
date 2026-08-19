@@ -23,7 +23,7 @@ use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::net::TcpStream;
 use tokio::sync::Mutex;
 use tokio_rustls::TlsConnector;
-use tracing::debug;
+use tracing::{debug, error};
 
 use crate::config::PoolConfig;
 use crate::config::types::{Proxy, UpstreamTarget};
@@ -36,7 +36,7 @@ use crate::modes::mesh::hbone::{
 use crate::proxy::mesh_trust_registry::{
     MeshTransportGate, MeshTransportKind, MeshTransportRegistration, MeshTrustRegistry,
 };
-use crate::retry::ErrorClass;
+use crate::retry::{ErrorClass, error_class_log_kind};
 use crate::tls::backend::BackendSvidGeneration;
 use crate::tls::spiffe::{SpiffeTlsError, build_spiffe_outbound_config};
 use arc_swap::ArcSwap;
@@ -169,7 +169,7 @@ pub enum HbonePoolError {
         #[source]
         source: std::io::Error,
     },
-    #[error("invalid HBONE server name {host}: {message}")]
+    #[error("invalid mesh TLS server name {host}: {message}")]
     InvalidServerName { host: String, message: String },
     #[error("invalid {HBONE_DIAL_HOST_TAG} tag '{value}' on mesh target: {message}")]
     InvalidDialHostTag { value: String, message: String },
@@ -330,6 +330,201 @@ impl HbonePoolError {
             | Self::TlsConfig(_) => true,
             Self::TlsHandshake { source, .. } => tls_handshake_is_capability_failure(source),
             _ => false,
+        }
+    }
+
+    /// A fixed, enumerated, redaction-safe public reason for this failure.
+    ///
+    /// Issue #3927: the client-visible body used to interpolate `Display`,
+    /// which leaks the peer address, the CONNECT authority, and the raw rustls
+    /// / SPIFFE verifier text (`invalid peer certificate: BadSignature`,
+    /// subject names, trust-domain values). Every arm here is a `&'static str`
+    /// chosen from the error VARIANT alone, so no host, address, SPIFFE ID,
+    /// certificate subject, trust root, key material, or source-error text can
+    /// reach a client through it. The same phrase is the operator-log
+    /// `error_phase`; production log records on this path never interpolate
+    /// `Display`. `Display` remains useful as the error value itself.
+    ///
+    /// Keep the reasons coarse: they name the phase that failed, never why the
+    /// peer rejected us.
+    pub fn public_reason(&self) -> &'static str {
+        match self {
+            Self::NoSvid | Self::NoLeafCert => "gateway identity unavailable",
+            Self::DnsLookup { .. } | Self::InvalidServerName { .. } => "DNS resolution failed",
+            Self::ConnectTimeout { .. } => "connect timed out",
+            Self::Connect { .. } => "TCP connect failed",
+            Self::InvalidDialHostTag { .. }
+            | Self::InvalidAuthorityHostTag { .. }
+            | Self::InvalidPeerSpiffeTag { .. } => "invalid mesh target metadata",
+            Self::TlsConfig(_) => "TLS configuration failed",
+            Self::TlsHandshake { .. } => "TLS handshake failed",
+            Self::H2Handshake { .. } => "HTTP/2 handshake failed",
+            Self::InvalidConnectRequest { .. } | Self::ConnectStream { .. } => {
+                "tunnel setup failed"
+            }
+            Self::ConnectRejected { .. } => "tunnel rejected by peer",
+            Self::TrustWithdrawn => "gateway trust authority withdrawn",
+            Self::MaxConnectionsExceeded { .. } => "backend connection limit reached",
+            Self::ExtendedConnectUnsupported { .. } => "peer does not support WebSocket tunneling",
+            Self::MissingCrossClusterSni
+            | Self::MissingCrossClusterTrustDomain
+            | Self::MissingCrossClusterAuthorityHost => "cross-cluster target misconfigured",
+        }
+    }
+
+    /// The peer's own CONNECT admission status, when the public body may carry
+    /// it. Only [`Self::ConnectRejected`] has one; every other variant returns
+    /// `None`, so no other failure can grow a numeric suffix.
+    ///
+    /// A three-digit HTTP status is the coarse outcome of the PEER's admission
+    /// decision — not an address, an identity, a certificate subject, or
+    /// verifier text — and it is the only thing that separates an
+    /// authorization denial (`403`) from a peer outage on an otherwise
+    /// identical tunnel refusal. The NodeWaypoint eBPF live gate
+    /// (`tests/k8s/node_waypoint_ebpf_live/run.sh`) matches on it to prove a
+    /// forged HBONE baggage assertion was refused by destination POLICY rather
+    /// than by any other transport failure, so collapsing it into the bare
+    /// reason would silently coarsen that security check.
+    pub fn public_status(&self) -> Option<u16> {
+        match self {
+            Self::ConnectRejected { status, .. } => Some(*status),
+            _ => None,
+        }
+    }
+}
+
+/// Which mesh transport a client-visible dispatch failure came from.
+///
+/// Issue #3927: the Sidecar SVID-mTLS pool and the Ambient HBONE pool share
+/// [`HbonePoolError`] because they share every failure shape, but they are not
+/// the same topology and must not describe themselves the same way to a
+/// client. A Sidecar outbound dial is plain HTTP/2 over mutual TLS to the peer
+/// sidecar's `:15006` inbound listener — there is no HBONE tunnel anywhere in
+/// it — so labeling its handshake failure "HBONE backend unavailable" sends the
+/// operator to debug a CONNECT tunnel that was never opened. Ambient/waypoint
+/// dispatch really does ride HTTP/2 CONNECT over `:15008` and keeps the HBONE
+/// wording.
+///
+/// The label only selects the fixed public noun; classification, retry
+/// accounting, and the closed-cardinality operator log fields are identical
+/// on both transports.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MeshTransportLabel {
+    /// Ambient / waypoint HTTP/2 CONNECT tunnel (`:15008`).
+    Hbone,
+    /// Sidecar SVID-mTLS to a peer sidecar's inbound listener (`:15006`).
+    SidecarMtls,
+}
+
+impl MeshTransportLabel {
+    /// Client-visible noun for a dispatch failure on this transport.
+    pub fn unavailable_noun(self) -> &'static str {
+        match self {
+            Self::Hbone => "HBONE backend unavailable",
+            Self::SidecarMtls => "Sidecar mTLS backend unavailable",
+        }
+    }
+
+    /// Fixed JSON error body for a dispatch failure with no further public
+    /// detail (a post-dial hyper error, where the cause is already in the log).
+    pub fn unavailable_body(self) -> &'static str {
+        match self {
+            Self::Hbone => r#"{"error":"HBONE backend unavailable"}"#,
+            Self::SidecarMtls => r#"{"error":"Sidecar mTLS backend unavailable"}"#,
+        }
+    }
+
+    /// Fixed JSON error body for a name-resolution failure on this transport.
+    pub fn dns_failure_body(self) -> &'static str {
+        match self {
+            Self::Hbone => r#"{"error":"DNS resolution for HBONE backend failed"}"#,
+            Self::SidecarMtls => r#"{"error":"DNS resolution for sidecar mTLS backend failed"}"#,
+        }
+    }
+
+    /// Fixed JSON error body carrying the enumerated public reason from
+    /// [`HbonePoolError::public_reason`], plus the peer's own admission status
+    /// where [`HbonePoolError::public_status`] reports one. Accept the typed
+    /// error rather than a caller-supplied string so the redaction boundary is
+    /// structural: a future call site cannot accidentally pass `Display` (or
+    /// another peer-derived value) into the client body.
+    pub fn unavailable_body_for_error(self, error: &HbonePoolError) -> String {
+        match error.public_status() {
+            // Peer-decided admission status only (see
+            // [`HbonePoolError::public_status`]); it is rendered from a `u16`,
+            // so it can carry no peer-controlled text into the JSON body.
+            Some(status) => format!(
+                r#"{{"error":"{}: {} with status {status}"}}"#,
+                self.unavailable_noun(),
+                error.public_reason()
+            ),
+            None => format!(
+                r#"{{"error":"{}: {}"}}"#,
+                self.unavailable_noun(),
+                error.public_reason()
+            ),
+        }
+    }
+
+    /// Operator-log noun for this transport. Used where the client-visible
+    /// surface is transport-neutral (body-ceiling refusals) but the log must
+    /// still name the right datapath.
+    pub fn log_noun(self) -> &'static str {
+        match self {
+            Self::Hbone => "HBONE",
+            Self::SidecarMtls => "Sidecar mTLS",
+        }
+    }
+
+    /// Fixed `error!` message for a dispatch failure on this transport.
+    pub fn dispatch_failure_log_message(self) -> &'static str {
+        match self {
+            Self::Hbone => "HBONE backend request failed",
+            Self::SidecarMtls => "Sidecar mTLS backend request failed",
+        }
+    }
+
+    /// Emit the operator `error!` record for a pool-setup failure on this
+    /// transport.
+    ///
+    /// Fields are closed-cardinality: `error_kind`, `error_phase` (from
+    /// [`HbonePoolError::public_reason`]), and `peer_status` only for
+    /// [`HbonePoolError::ConnectRejected`]. Never interpolates `Display`, so
+    /// a host, address, CONNECT authority, tag value, SPIFFE ID, certificate
+    /// subject/SAN/issuer/serial/fingerprint, trust root, key id, file path,
+    /// verifier message, or peer-controlled string cannot ride this record.
+    pub fn log_pool_error(self, proxy_id: &str, err: &HbonePoolError) {
+        let error_kind = error_class_log_kind(err.error_class());
+        let error_phase = err.public_reason();
+        match err.public_status() {
+            Some(peer_status) => {
+                error!(
+                    proxy_id = %proxy_id,
+                    error_kind,
+                    error_phase,
+                    peer_status,
+                    "{}",
+                    self.dispatch_failure_log_message()
+                );
+            }
+            None => {
+                error!(
+                    proxy_id = %proxy_id,
+                    error_kind,
+                    error_phase,
+                    "{}",
+                    self.dispatch_failure_log_message()
+                );
+            }
+        }
+    }
+
+    /// Fixed `error!` message for a tunneled/pooled HTTP failure after the
+    /// transport was established.
+    pub fn tunneled_failure_log_message(self) -> &'static str {
+        match self {
+            Self::Hbone => "HBONE tunneled HTTP request failed",
+            Self::SidecarMtls => "Sidecar mTLS HTTP request failed",
         }
     }
 }

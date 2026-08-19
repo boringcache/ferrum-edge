@@ -2284,6 +2284,14 @@ pub struct RequestContext {
     /// WebSocket takeover retains it so listener replacement/drain terminates
     /// upgraded sessions instead of only stopping new accepts.
     pub(crate) websocket_shutdown_rx: Option<tokio::sync::watch::Receiver<bool>>,
+    /// Frontend client-certificate trust session for the accepted connection
+    /// (issue #3857). Present only when the peer authenticated with a client
+    /// certificate on a listener whose trust domain has accepted material.
+    /// WebSocket takeover retains it so a CRL / client-CA withdrawal terminates
+    /// an already-upgraded session instead of only fencing new requests.
+    /// Carries no certificate field — only a scope, a generation, and a
+    /// cancellation latch.
+    pub(crate) client_trust_session: Option<crate::tls::ClientTrustSession>,
     /// SHA-256 of the exact SOAP representation accepted by an
     /// identity-establishing `soap_ws_security` policy. The final request-body
     /// hook compares this private proof with the bytes dispatched to the
@@ -3318,6 +3326,7 @@ impl RequestContext {
                 crate::proxy::auth_lifetime::StreamAuthTerminationLatch::default(),
             authorization_connection_closer: None,
             websocket_shutdown_rx: None,
+            client_trust_session: None,
             soap_ws_security_authenticated_body_digest: None,
             timestamp_received: Utc::now(),
             grpc_deadline_initialized: false,
@@ -4502,6 +4511,7 @@ impl RequestContext {
             authorization_termination_latch: self.authorization_termination_latch.clone(),
             authorization_connection_closer: self.authorization_connection_closer.clone(),
             websocket_shutdown_rx: self.websocket_shutdown_rx.clone(),
+            client_trust_session: self.client_trust_session.clone(),
             soap_ws_security_authenticated_body_digest: self
                 .soap_ws_security_authenticated_body_digest,
             timestamp_received: self.timestamp_received,
