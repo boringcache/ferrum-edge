@@ -2585,7 +2585,8 @@ async fn pooled_h2_goaway_canceled_send_retries_buffered_unary() {
         // make the gateway cold: with warmup off, `modes::file::serve` sets
         // `run_initial_refresh = true` and the backend-capability refresh task
         // immediately probes this plaintext backend via
-        // `ProxyState::probe_h2c` -> `grpc_pool.get_sender()`. That probe uses
+        // `ProxyState::probe_h2c` -> `grpc_pool.get_sender_for_capability_probe()`.
+        // That probe uses
         // a clone of this proxy whose only delta is a clamped connect timeout —
         // a field deliberately excluded from the pool key — so it lands on the
         // SAME single-shard gRPC pool entry the request path uses, and it is
@@ -2678,12 +2679,13 @@ async fn pooled_h2_goaway_canceled_send_retries_buffered_unary() {
 }
 
 /// Wait until the binary harness's startup h2c capability probe has finished
-/// `grpc_pool.get_sender()` and connection 0's scripted `AcceptRpc` is armed.
+/// `grpc_pool.get_sender_for_capability_probe()` and connection 0's scripted
+/// `AcceptRpc` is armed.
 ///
 /// With `FERRUM_POOL_WARMUP_ENABLED=false` the binary harness still gets
 /// `run_initial_refresh = true` (see `modes::file::serve`), so a spawned
 /// capability-refresh pass dials plaintext backends through the shared gRPC
-/// pool via `probe_h2c` → `get_sender()`. Under
+/// pool via `probe_h2c` → `get_sender_for_capability_probe()`. Under
 /// `FERRUM_POOL_HTTP2_CONNECTIONS_PER_HOST=1` that probe occupies the only
 /// shard and inserts a pooled sender the request path will reuse.
 ///

@@ -51,6 +51,7 @@
 mod common;
 
 mod consul;
+mod host_port_allocation;
 mod kafka;
 mod ldap;
 mod mysql;

@@ -22459,6 +22459,16 @@ components:
           type: string
           enum: [enforce, monitor, disabled]
           default: enforce
+          description: >-
+            Global WAF mode. enforce is rejected at construction when no
+            reachable enforcement path remains after default_rule_action,
+            rule_modes, rule_overrides, disabled rules, paranoia filtering,
+            and inspection-surface toggles. Built-in rules are monitor-only
+            unless opted in. Anomaly scoring, stream.tcp_require_tls,
+            enforce-action stream.signatures, and on_body_too_large: block
+            (when a body inspection hook can run) each satisfy admission
+            without per-rule action: enforce. monitor with zero enforcing
+            rules remains valid.
         default_rule_action:
           type: string
           enum: [enforce, monitor, disabled]
@@ -22518,6 +22528,10 @@ components:
             inspection lets a padded suffix carry blocked content past an
             enforcing rule. skip scans nothing. block rejects every oversize
             governed body while mode is enforce, otherwise scans the prefix.
+            Under mode: enforce, block is itself a reachable admission
+            enforcement path when a body inspection hook can run (HTTP bodies
+            and WebSocket application messages share this setting). fail_closed,
+            scan_truncated, and skip do not satisfy that gate.
         include_default_rules:
           type: boolean
           default: true
@@ -23781,7 +23795,10 @@ components:
             `Content-Type` header value. The default-body renderer classifies the
             media subtype exactly as `json`/`xml` or an RFC 6838 structured
             suffix (`+json`/`+xml`) after stripping parameters — not by arbitrary
-            substring match (so `application/notjson` is plain text).
+            substring match (so `application/notjson` is plain text). JSON types
+            pass a valid JSON `message` through as the body and fail safe to the
+            `{message,status_code}` envelope when it is not; XML and other types
+            keep their envelope or plain-text renderers.
         body:
           type: string
           description: >-
@@ -23793,11 +23810,19 @@ components:
           type: string
           default: Service unavailable
           description: >-
-            Used to build the default body when `body` is omitted. Rendered as a
-            JSON `message` field, an XML `<message>` element, or plain text
-            depending on `content_type`. JSON escaping and XML 1.0 character
-            validation/escaping are applied automatically; XML-invalid control
-            characters in `message` are rejected when XML rendering is selected.
+            Used to build the default body when `body` is omitted. JSON media
+            types (`json` or `+json` after parameter stripping) emit a complete,
+            unambiguous JSON `message` as the response body — the parsed value,
+            compactly serialized, not string-escaped inside an envelope. Objects,
+            arrays, strings, numbers, booleans, and null all pass through this
+            way. Malformed JSON, duplicate object member names, and other
+            parser-ambiguous documents fail safe into the legacy
+            `{"message":...,"status_code":...}` envelope so the response stays
+            valid JSON and construction never panics. XML media types wrap the
+            message in `<message>` (XML 1.0 character validation/escaping); other
+            types emit `message` as plain text. JSON escaping of envelope string
+            slots is applied automatically; XML-invalid control characters in
+            `message` are rejected when XML rendering is selected.
         trigger:
           type: object
           additionalProperties: false

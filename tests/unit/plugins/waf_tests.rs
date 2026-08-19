@@ -3278,6 +3278,86 @@ fn enforce_mode_rejects_unreachable_stream_enforce_signature() {
     assert!(err.contains("no enabled enforcement path"));
 }
 
+#[test]
+fn enforce_mode_allows_on_body_too_large_block_with_monitor_only_rules() {
+    // Resource-bound enforcement with observation-only rules is a real
+    // posture: `block` rejects oversize bodies because the mode is enforce.
+    Waf::new(&json!({
+        "mode": "enforce",
+        "on_body_too_large": "block"
+    }))
+    .unwrap();
+}
+
+#[test]
+fn enforce_mode_allows_on_body_too_large_block_with_monitor_body_rule() {
+    Waf::new(&json!({
+        "mode": "enforce",
+        "include_default_rules": false,
+        "on_body_too_large": "block",
+        "custom_rules": [monitor_request_body_rule()]
+    }))
+    .unwrap();
+}
+
+#[test]
+fn enforce_mode_rejects_on_body_too_large_skip() {
+    let err = Waf::new(&json!({
+        "mode": "enforce",
+        "on_body_too_large": "skip"
+    }))
+    .unwrap_err();
+    assert!(err.contains("no enabled enforcement path"));
+}
+
+#[test]
+fn enforce_mode_rejects_on_body_too_large_scan_truncated() {
+    let err = Waf::new(&json!({
+        "mode": "enforce",
+        "on_body_too_large": "scan_truncated"
+    }))
+    .unwrap_err();
+    assert!(err.contains("no enabled enforcement path"));
+}
+
+#[test]
+fn enforce_mode_rejects_on_body_too_large_block_without_body_inspection() {
+    // `block` only fires from the body-inspection hook. With both body
+    // surfaces off it cannot reject, so it must not satisfy the gate.
+    let err = Waf::new(&json!({
+        "mode": "enforce",
+        "on_body_too_large": "block",
+        "request_body_inspection": false,
+        "response_inspection": false,
+        "response_body_inspection": false
+    }))
+    .unwrap_err();
+    assert!(err.contains("no enabled enforcement path"));
+}
+
+#[test]
+fn enforce_mode_rejects_on_body_too_large_block_without_body_rules() {
+    // A query-only monitor rule never enters clamp_body, so `block` is not
+    // reachable even though the setting is present.
+    let err = Waf::new(&json!({
+        "mode": "enforce",
+        "include_default_rules": false,
+        "on_body_too_large": "block",
+        "custom_rules": [{
+            "id": "CUSTOM-QUERY-MONITOR",
+            "name": "query observer",
+            "category": "custom",
+            "severity": "high",
+            "target": "query_values",
+            "match_kind": "contains",
+            "pattern": "observe-only",
+            "action": "monitor"
+        }]
+    }))
+    .unwrap_err();
+    assert!(err.contains("no enabled enforcement path"));
+}
+
 #[tokio::test]
 async fn default_rule_action_enforce_blocks_built_in_rules() {
     // The crux of gap 1.1: a single switch flips the built-in pack from
@@ -5926,26 +6006,14 @@ async fn scan_truncated_opt_out_preserves_prefix_only_inspection() {
 #[tokio::test]
 async fn explicit_block_still_rejects_oversize_body_without_enforcing_body_rule() {
     // `block` keeps its stricter meaning: it does not narrow to the
-    // enforcing-policy predicate that `fail_closed` uses. The query sentinel is
-    // not a body rule; it only supplies the enforcement path `mode: enforce`
-    // now requires, so the oversized *body* still blocks on `block` alone.
+    // enforcing-policy predicate that `fail_closed` uses. Admission counts
+    // `on_body_too_large: block` itself as the enforcement path, so a
+    // monitor-only body rule is enough to enter the hook.
     let plugin = Waf::new(&json!({
         "include_default_rules": false,
         "max_scan_bytes": SCAN_CAP,
         "on_body_too_large": "block",
-        "custom_rules": [
-            monitor_request_body_rule(),
-            {
-                "id": "CUSTOM-QUERY-ENFORCE",
-                "name": "query sentinel",
-                "category": "custom",
-                "severity": "high",
-                "target": "query_values",
-                "match_kind": "contains",
-                "pattern": "never-matches",
-                "action": "enforce"
-            }
-        ]
+        "custom_rules": [monitor_request_body_rule()]
     }))
     .unwrap();
     let mut ctx = body_ctx();
