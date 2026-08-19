@@ -697,3 +697,287 @@ async fn dtls_server_multi_listener_live_swap_converges_on_same_generation() {
     left.close().await;
     right.close().await;
 }
+
+// ---------------------------------------------------------------------------
+// Coherent client-CA source read (issue #3857)
+// ---------------------------------------------------------------------------
+
+/// A client leaf carrying the `clientAuth` EKU, so `verify_client_cert` reaches
+/// path building and revocation instead of refusing on purpose alone.
+fn generate_client_leaf(
+    dir: &std::path::Path,
+    ca: &TestCa,
+    name: &str,
+    serial: u64,
+) -> (rustls::pki_types::CertificateDer<'static>, SerialNumber) {
+    ensure_crypto_provider();
+    let key_pair =
+        KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).expect("generate client key");
+    let serial = SerialNumber::from(serial);
+    let mut params = CertificateParams::new(Vec::<String>::new()).expect("client params");
+    params
+        .distinguished_name
+        .push(rcgen::DnType::CommonName, name);
+    params
+        .extended_key_usages
+        .push(rcgen::ExtendedKeyUsagePurpose::ClientAuth);
+    params.key_usages.push(KeyUsagePurpose::DigitalSignature);
+    params.serial_number = Some(serial.clone());
+    let cert = params
+        .signed_by(&key_pair, &ca.issuer)
+        .expect("sign client leaf");
+    // Written out purely so the fixture is inspectable alongside the rest.
+    let _ = write_pem(dir, &format!("{name}-cert.pem"), &cert.pem());
+    (cert.der().clone(), serial)
+}
+
+fn read_bytes(path: &std::path::Path) -> Vec<u8> {
+    std::fs::read(path).expect("read fixture bytes")
+}
+
+fn now() -> rustls::pki_types::UnixTime {
+    rustls::pki_types::UnixTime::now()
+}
+
+/// The DTLS frontend candidate must load its declared client-CA source EXACTLY
+/// ONCE and derive both the verifier's trust anchors and the published
+/// client-trust identity from those same bytes.
+///
+/// The regression this pins: reading the configured value twice — once to
+/// summarize the identity, once to build the root store — lets a rotation land
+/// in between, so the generation published describes anchors the verifier is
+/// not enforcing. Here one bundle PATH is rewritten between two builds, so
+/// "which read won" is the only thing that can distinguish the outcomes: each
+/// candidate's identity is asserted to be the summary of exactly the bytes its
+/// own verifier accepts.
+#[tokio::test]
+async fn frontend_dtls_candidate_identity_matches_the_bytes_its_verifier_was_built_from() {
+    ensure_crypto_provider();
+    let dir = tempfile::tempdir().expect("tempdir");
+    let server_ca = generate_test_ca(dir.path(), "coherent-server-ca");
+    let server =
+        generate_signed_material(dir.path(), &server_ca, "coherent-server", &["localhost"], 1);
+
+    let ca_a = generate_test_ca(dir.path(), "coherent-client-ca-a");
+    let ca_b = generate_test_ca(dir.path(), "coherent-client-ca-b");
+    let ca_a_bytes = read_bytes(&ca_a.path);
+    let ca_b_bytes = read_bytes(&ca_b.path);
+
+    // ONE bundle path whose CONTENT is what changes.
+    let bundle_path = dir.path().join("coherent-client-bundle.pem");
+    std::fs::write(&bundle_path, &ca_a_bytes).expect("seed bundle with CA A");
+
+    let candidate_a = ferrum_edge::dtls::build_frontend_dtls_config(
+        path_str(&server.cert_path),
+        path_str(&server.key_path),
+        Some(path_str(&bundle_path)),
+        &[],
+    )
+    .expect("build candidate over CA A");
+
+    std::fs::write(&bundle_path, &ca_b_bytes).expect("rotate bundle to CA B");
+
+    let candidate_b = ferrum_edge::dtls::build_frontend_dtls_config(
+        path_str(&server.cert_path),
+        path_str(&server.key_path),
+        Some(path_str(&bundle_path)),
+        &[],
+    )
+    .expect("build candidate over CA B");
+
+    let material_a = candidate_a
+        .client_trust
+        .clone()
+        .expect("a configured client CA yields a trust identity");
+    let material_b = candidate_b
+        .client_trust
+        .clone()
+        .expect("a configured client CA yields a trust identity");
+    assert_ne!(
+        material_a, material_b,
+        "two different client-CA bundles must produce different identities"
+    );
+
+    let (client_a_der, _) = generate_client_leaf(dir.path(), &ca_a, "coherent-client-a", 0x3857);
+    let verifier_a = candidate_a
+        .client_cert_verifier
+        .as_ref()
+        .expect("candidate A installs a verifier");
+    let verifier_b = candidate_b
+        .client_cert_verifier
+        .as_ref()
+        .expect("candidate B installs a verifier");
+    assert!(
+        verifier_a
+            .verify_client_cert(&client_a_der, &[], now())
+            .is_ok(),
+        "candidate A's verifier must accept a client issued under CA A"
+    );
+    assert!(
+        verifier_b
+            .verify_client_cert(&client_a_der, &[], now())
+            .is_err(),
+        "candidate B's verifier must refuse a client issued under CA A"
+    );
+
+    assert_eq!(
+        material_a,
+        ferrum_edge::tls::ClientTrustMaterial::from_parts(Some(&ca_a_bytes), &[])
+            .expect("summarize CA A"),
+        "candidate A's identity must summarize exactly the bytes its verifier trusts"
+    );
+    assert_eq!(
+        material_b,
+        ferrum_edge::tls::ClientTrustMaterial::from_parts(Some(&ca_b_bytes), &[])
+            .expect("summarize CA B"),
+        "candidate B's identity must summarize exactly the bytes its verifier trusts"
+    );
+}
+
+/// A client-CA source that is not a filesystem path must work, and must produce
+/// the same coherent verifier + identity pair.
+///
+/// A raw `std::fs::read` of the configured value silently could not: an inline
+/// PEM `FERRUM_DTLS_CLIENT_CA_CERT_SOURCE` would be treated as a filename and
+/// fail. Routing through `CertSource` is what makes it a source.
+#[tokio::test]
+async fn frontend_dtls_candidate_accepts_a_non_file_inline_client_ca_source() {
+    ensure_crypto_provider();
+    let dir = tempfile::tempdir().expect("tempdir");
+    let server_ca = generate_test_ca(dir.path(), "inline-server-ca");
+    let server =
+        generate_signed_material(dir.path(), &server_ca, "inline-server", &["localhost"], 1);
+    let client_ca = generate_test_ca(dir.path(), "inline-client-ca");
+    let inline_pem = String::from_utf8(read_bytes(&client_ca.path)).expect("client CA pem is utf8");
+    assert!(
+        inline_pem.starts_with("-----BEGIN "),
+        "the fixture must actually be inline PEM, not a path"
+    );
+
+    let candidate = ferrum_edge::dtls::build_frontend_dtls_config(
+        path_str(&server.cert_path),
+        path_str(&server.key_path),
+        Some(inline_pem.as_str()),
+        &[],
+    )
+    .expect("an inline PEM client-CA source must load");
+
+    let (client_der, _) = generate_client_leaf(dir.path(), &client_ca, "inline-client", 0x3858);
+    assert!(
+        candidate
+            .client_cert_verifier
+            .as_ref()
+            .expect("an inline source installs a verifier")
+            .verify_client_cert(&client_der, &[], now())
+            .is_ok(),
+        "the inline-sourced verifier must trust a client issued under that CA"
+    );
+    assert_eq!(
+        candidate
+            .client_trust
+            .expect("an inline source yields a trust identity"),
+        ferrum_edge::tls::ClientTrustMaterial::from_parts(Some(inline_pem.as_bytes()), &[])
+            .expect("summarize inline CA"),
+        "the identity must summarize the same inline bytes the verifier was built from"
+    );
+}
+
+/// The CRLs handed to the candidate are bound to the SAME identity: a client the
+/// verifier now refuses is a client the identity now reports as revoked.
+#[tokio::test]
+async fn frontend_dtls_candidate_binds_its_crls_to_the_same_identity() {
+    ensure_crypto_provider();
+    let dir = tempfile::tempdir().expect("tempdir");
+    let server_ca = generate_test_ca(dir.path(), "crl-server-ca");
+    let server = generate_signed_material(dir.path(), &server_ca, "crl-server", &["localhost"], 1);
+    let client_ca = generate_test_ca(dir.path(), "crl-client-ca");
+    let (client_der, client_serial) =
+        generate_client_leaf(dir.path(), &client_ca, "crl-client", 0x3859);
+
+    let without_crl = ferrum_edge::dtls::build_frontend_dtls_config(
+        path_str(&server.cert_path),
+        path_str(&server.key_path),
+        Some(path_str(&client_ca.path)),
+        &[],
+    )
+    .expect("build candidate without revocations");
+
+    let crls = build_crl(&client_ca, std::slice::from_ref(&client_serial));
+    let with_crl = ferrum_edge::dtls::build_frontend_dtls_config(
+        path_str(&server.cert_path),
+        path_str(&server.key_path),
+        Some(path_str(&client_ca.path)),
+        &crls,
+    )
+    .expect("build candidate with revocations");
+
+    let baseline = without_crl
+        .client_trust
+        .expect("identity present without revocations");
+    let revoking = with_crl
+        .client_trust
+        .expect("identity present with revocations");
+    assert_ne!(
+        baseline, revoking,
+        "adding a revocation must change the published identity"
+    );
+    assert_eq!(
+        revoking.withdrawal_relative_to(&baseline),
+        Some(ferrum_edge::tls::client_trust::ClientTrustRetirementReason::CrlChanged),
+        "the added revocation must read as a CRL withdrawal, not a lateral change"
+    );
+
+    assert!(
+        without_crl
+            .client_cert_verifier
+            .as_ref()
+            .expect("verifier present")
+            .verify_client_cert(&client_der, &[], now())
+            .is_ok(),
+        "the pre-revocation candidate must still accept the client"
+    );
+    assert!(
+        with_crl
+            .client_cert_verifier
+            .as_ref()
+            .expect("verifier present")
+            .verify_client_cert(&client_der, &[], now())
+            .is_err(),
+        "the same candidate's verifier must enforce the CRLs its identity describes"
+    );
+}
+
+/// A frontend DTLS listener with NO client-CA source performs no client
+/// authentication, so it must publish no client-trust identity at all — the
+/// input that keeps `ClientTrustScope::FrontendDtls` unarmed (issue #3857).
+#[tokio::test]
+async fn frontend_dtls_candidate_without_a_client_ca_publishes_no_identity() {
+    ensure_crypto_provider();
+    let dir = tempfile::tempdir().expect("tempdir");
+    let server_ca = generate_test_ca(dir.path(), "unarmed-server-ca");
+    let server =
+        generate_signed_material(dir.path(), &server_ca, "unarmed-server", &["localhost"], 1);
+    let orphan_ca = generate_test_ca(dir.path(), "unarmed-orphan-ca");
+    let (_orphan_der, orphan_serial) =
+        generate_client_leaf(dir.path(), &orphan_ca, "unarmed-orphan", 0x385a);
+
+    // Even with a non-empty CRL configured: a CRL alone does not make the
+    // listener authenticate clients, so nothing may be armed.
+    let crls = build_crl(&orphan_ca, std::slice::from_ref(&orphan_serial));
+    let candidate = ferrum_edge::dtls::build_frontend_dtls_config(
+        path_str(&server.cert_path),
+        path_str(&server.key_path),
+        None,
+        &crls,
+    )
+    .expect("build candidate without client authentication");
+
+    assert!(
+        candidate.client_cert_verifier.is_none(),
+        "a listener with no client-CA source must install no client verifier"
+    );
+    assert!(
+        candidate.client_trust.is_none(),
+        "a listener that authenticates no client certificate must publish no client-trust identity"
+    );
+}

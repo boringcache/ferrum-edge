@@ -106,6 +106,21 @@ pub enum StreamSetupKind {
     /// it must stay health-neutral — it never records a circuit-breaker or
     /// passive-health failure against the upstream.
     AuthorizationExpired,
+    /// An operator withdrew the frontend client-certificate trust decision this
+    /// stream was admitted under (a CRL now revokes the peer's certificate, or
+    /// its issuing CA left the client-CA bundle) while post-admission setup was
+    /// still running — DNS, retry backoff, backend connect/handshake, outbound
+    /// PROXY framing, or the inspected-prefix forward (issue #3857).
+    ///
+    /// Distinct from [`Self::AuthorizationExpired`], which is the admitted
+    /// credential reaching its own `notAfter`: the two are independent,
+    /// earliest-wins termination causes.
+    ///
+    /// Client-side and health-neutral for the same reason: withdrawing a trust
+    /// root is the operator's own local authorization decision, not evidence
+    /// about the upstream, so it never records a circuit-breaker or
+    /// passive-health failure against it.
+    ClientTrustWithdrawn,
 }
 
 impl StreamSetupKind {
@@ -125,7 +140,8 @@ impl StreamSetupKind {
             | Self::CircuitBreakerOpen
             | Self::BackendMaxConnectionsExceeded
             | Self::UnsupportedStreamPolicy
-            | Self::AuthorizationExpired => None,
+            | Self::AuthorizationExpired
+            | Self::ClientTrustWithdrawn => None,
         }
     }
 
@@ -149,6 +165,7 @@ impl StreamSetupKind {
             Self::RejectedByPlugin
                 | Self::ClientDisconnectedDuringAdmission
                 | Self::AuthorizationExpired
+                | Self::ClientTrustWithdrawn
         )
     }
 
@@ -198,6 +215,9 @@ impl StreamSetupKind {
                 crate::proxy::tcp_proxy::STREAM_ERR_UNSUPPORTED_STREAM_POLICY
             }
             Self::AuthorizationExpired => crate::proxy::tcp_proxy::STREAM_ERR_AUTHORIZATION_EXPIRED,
+            Self::ClientTrustWithdrawn => {
+                crate::proxy::tcp_proxy::STREAM_ERR_CLIENT_TRUST_WITHDRAWN
+            }
         }
     }
 }

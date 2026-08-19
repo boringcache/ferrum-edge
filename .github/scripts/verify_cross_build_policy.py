@@ -12100,12 +12100,13 @@ WORKFLOW_DIRECTORY_JOB_GENERATION_TRANSITIONS: tuple[
     # (issue #3907): shard-scoped coverage planning re-shapes the merge
     # aggregate (planned-shard artifact selection, plugin gate, planned-shard
     # outcome enforcement), pinned against its latest-main-merged branch
-    # grok/issue-3907-coverage-shards-r1.
+    # grok/issue-3907-coverage-shards-r1. Both generations include the current
+    # checksum-pinned taiki-e/install-action update.
     (
         "coverage.yml",
         "coverage-merge",
-        "d2480af21698fb3ad041b32b39587c949aeedec24746c8d5c8c63acd9f9d2fb6",
-        "34f5e1b022f1d01ac72d13c66256e11ff87c15135d775c03736e6701b2223a1c",
+        "5acba780094766b03f72059b8ac229c7bcc4a722ce0130060da7ed0d1ba5850f",
+        "28c3ff517027c36ba2ca7ce8a80adc43d2e8475e46c4d5cb0106819dd3f1c152",
     ),
 )
 
