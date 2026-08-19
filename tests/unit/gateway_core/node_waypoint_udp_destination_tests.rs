@@ -990,3 +990,52 @@ fn mixed_family_udp_upstream(
         ferrum_edge::health_check::HealthChecker::new(),
     )
 }
+
+#[test]
+fn stream_selection_all_unhealthy_active_health_still_selects() {
+    let (proxy, cache, health) = mixed_family_udp_upstream(&[
+        ("10.244.2.9", 15355),
+        ("10.244.2.10", 15355),
+    ]);
+    let snapshot = cache.load();
+    let upstream = proxy.upstream_id.as_deref().expect("upstream");
+    let upstream_key = ferrum_edge::config::db_backend::namespaced_runtime_key(
+        &proxy.namespace,
+        upstream,
+    );
+    for host in ["10.244.2.9", "10.244.2.10"] {
+        health.active_unhealthy_targets.insert(
+            format!("{upstream_key}::{host}:15355"),
+            1,
+        );
+    }
+    let selected = ferrum_edge::_test_support::resolve_udp_backend_target_for_destination_for_test(
+        &proxy,
+        &snapshot,
+        &health,
+        "hash",
+        None,
+    );
+    assert!(
+        selected.is_ok(),
+        "all-unhealthy active health must still select via LB fallback, got {selected:?}"
+    );
+}
+
+#[test]
+fn stream_selection_empty_upstream_is_no_healthy_targets() {
+    let (proxy, cache, health) = mixed_family_udp_upstream(&[]);
+    let snapshot = cache.load();
+    let err = ferrum_edge::_test_support::resolve_udp_backend_target_for_destination_for_test(
+        &proxy,
+        &snapshot,
+        &health,
+        "hash",
+        None,
+    )
+    .expect_err("empty upstream must fail selection");
+    assert!(
+        err.contains("No healthy targets"),
+        "empty pool must use NoHealthyTargets wording, got {err:?}"
+    );
+}

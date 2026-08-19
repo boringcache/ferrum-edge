@@ -69,15 +69,20 @@ pub enum StreamSetupKind {
     /// Client-side; used to cancel the delay without retaining the connection
     /// task. A graceful read-half close is not classified as a disconnect.
     ClientDisconnectedDuringAdmission,
-    /// Load balancer returned no healthy targets for the configured upstream.
-    /// Backend-side — the configured pool is empty or all targets are
-    /// failing active health checks.
+    /// Backend hostname could not be resolved during stream setup. Backend-side
+    /// and pre-wire: no SYN was sent. Maps to
+    /// [`crate::retry::ErrorClass::DnsLookupError`] so TCP/UDP DNS failures
+    /// grep the same class as HTTP/gRPC.
+    DnsLookup,
+    /// Load balancer returned no candidate for the configured upstream.
+    /// Backend-side — the pool is empty, the subset is empty, or no backend
+    /// shares the session destination's address family.
     ///
     /// Distinct from [`Self::CircuitBreakerOpen`]: this kind fires from the LB
-    /// selection layer when no candidate target is healthy; circuit-breaker
-    /// rejections fire from the per-proxy circuit breaker check (a separate
-    /// passive-health gate). Operators querying logs for "all targets bad"
-    /// should match either kind via the prefix wording or the typed enum.
+    /// selection layer when no candidate exists at all. An upstream whose
+    /// targets are all failing active health checks still selects a target
+    /// via the shared all-unhealthy fallback (`docs/load_balancing.md`); that
+    /// degraded dial is a later connect failure, not this kind.
     NoHealthyTargets,
     /// Per-proxy circuit breaker is open — the failure rate against the
     /// upstream exceeded the configured threshold and new connection
@@ -136,6 +141,7 @@ impl StreamSetupKind {
             Self::BackendTlsHandshake | Self::BackendDtlsHandshake => Some(TlsErrorSide::Backend),
             Self::RejectedByPlugin
             | Self::ClientDisconnectedDuringAdmission
+            | Self::DnsLookup
             | Self::NoHealthyTargets
             | Self::CircuitBreakerOpen
             | Self::BackendMaxConnectionsExceeded
@@ -206,6 +212,7 @@ impl StreamSetupKind {
             Self::ClientDisconnectedDuringAdmission => {
                 crate::proxy::tcp_proxy::STREAM_ERR_CLIENT_DISCONNECTED_DURING_ADMISSION
             }
+            Self::DnsLookup => crate::proxy::tcp_proxy::STREAM_ERR_DNS_LOOKUP_FAILED,
             Self::NoHealthyTargets => crate::proxy::tcp_proxy::STREAM_ERR_NO_HEALTHY_TARGETS,
             Self::CircuitBreakerOpen => crate::proxy::tcp_proxy::STREAM_ERR_CIRCUIT_BREAKER_OPEN,
             Self::BackendMaxConnectionsExceeded => {
@@ -295,6 +302,17 @@ impl StreamSetupError {
             source: Some(Box::new(source)),
         }
     }
+
+    /// Setup-phase DNS failure. Display is the legacy
+    /// `"DNS resolution failed for {host}: {source}"` wording so log
+    /// pipelines keyed on that prefix keep matching.
+    pub fn dns_lookup<E>(host: impl fmt::Display, source: E) -> Self
+    where
+        E: std::error::Error + Send + Sync + 'static,
+    {
+        let detail = format!("for {host}: {source}");
+        Self::with_source(StreamSetupKind::DnsLookup, detail, source)
+    }
 }
 
 impl fmt::Display for StreamSetupError {
@@ -345,6 +363,7 @@ mod tests {
             StreamSetupKind::ClientDisconnectedDuringAdmission.tls_side(),
             None
         );
+        assert_eq!(StreamSetupKind::DnsLookup.tls_side(), None);
         assert_eq!(StreamSetupKind::NoHealthyTargets.tls_side(), None);
         assert_eq!(StreamSetupKind::CircuitBreakerOpen.tls_side(), None);
         assert_eq!(
@@ -374,6 +393,7 @@ mod tests {
         for kind in [
             StreamSetupKind::BackendTlsHandshake,
             StreamSetupKind::BackendDtlsHandshake,
+            StreamSetupKind::DnsLookup,
             StreamSetupKind::NoHealthyTargets,
             StreamSetupKind::CircuitBreakerOpen,
             StreamSetupKind::BackendMaxConnectionsExceeded,
@@ -410,6 +430,10 @@ mod tests {
         assert_eq!(
             StreamSetupKind::ClientDisconnectedDuringAdmission.prefix(),
             "client disconnected during plugin admission"
+        );
+        assert_eq!(
+            StreamSetupKind::DnsLookup.prefix(),
+            "DNS resolution failed"
         );
         assert_eq!(
             StreamSetupKind::NoHealthyTargets.prefix(),
@@ -492,6 +516,18 @@ mod tests {
             !format!("{backend_dtls}").contains("failed :"),
             "DTLS legacy wording must use ': ' (no preceding space)"
         );
+
+        let inner = std::io::Error::other(
+            "DNS resolution returned no addresses for backend.local",
+        );
+        let dns = StreamSetupError::dns_lookup("backend.local", inner);
+        let displayed = format!("{dns}");
+        assert!(
+            displayed.starts_with("DNS resolution failed for backend.local: "),
+            "expected legacy DNS prefix in {displayed:?}"
+        );
+        assert!(displayed.contains("DNS resolution returned no addresses"));
+        assert_eq!(dns.kind, StreamSetupKind::DnsLookup);
     }
 
     #[test]

@@ -1,17 +1,22 @@
-use ferrum_edge::_test_support::{
-    StreamIoSide, bidirectional_copy_for_test, bidirectional_copy_for_test_with_timeouts,
-    classify_stream_error, disconnect_cause_for_failure, relay_failure_is_client_facing,
-    tcp_fault_admission_retry_delays_for_test, tcp_fault_admission_should_cancel_for_test,
-    tcp_stream_summary_from_clocks_for_test, wait_for_tcp_peer_reset_for_test,
-};
-use ferrum_edge::plugins::{Direction, DisconnectCause};
-use ferrum_edge::retry::ErrorClass;
 use std::collections::VecDeque;
 use std::io;
 use std::pin::Pin;
+use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
+
+use async_trait::async_trait;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
+
+use ferrum_edge::_test_support::{
+    StreamIoSide, bidirectional_copy_for_test, bidirectional_copy_for_test_with_timeouts,
+    classify_stream_error, disconnect_cause_for_failure, emit_udp_setup_failure_for_test,
+    relay_failure_is_client_facing, tcp_fault_admission_retry_delays_for_test,
+    tcp_fault_admission_should_cancel_for_test, tcp_stream_summary_from_clocks_for_test,
+    wait_for_tcp_peer_reset_for_test,
+};
+use ferrum_edge::plugins::{Direction, DisconnectCause, Plugin, StreamTransactionSummary};
+use ferrum_edge::retry::ErrorClass;
 
 #[test]
 fn test_tcp_fault_admission_requires_actual_socket_error() {
@@ -111,6 +116,22 @@ fn test_classify_stream_error_preserves_tls_failures() {
 fn test_classify_stream_error_preserves_dns_failures() {
     let error = anyhow::anyhow!("DNS resolution failed for backend.local: no record found");
     assert_eq!(classify_stream_error(&error), ErrorClass::DnsLookupError);
+
+    let live_wording = anyhow::anyhow!(
+        "DNS resolution failed for backend.local: {}",
+        "DNS resolution returned no addresses for backend.local"
+    );
+    assert_eq!(
+        classify_stream_error(&live_wording),
+        ErrorClass::DnsLookupError
+    );
+
+    let typed: anyhow::Error = ferrum_edge::proxy::stream_error::StreamSetupError::dns_lookup(
+        "backend.local",
+        std::io::Error::other("DNS resolution returned no addresses for backend.local"),
+    )
+    .into();
+    assert_eq!(classify_stream_error(&typed), ErrorClass::DnsLookupError);
 }
 
 // ── Test helpers for bidirectional_copy direction tracking ───────────────────
@@ -2073,6 +2094,38 @@ async fn test_bidirectional_copy_reclassifies_connection_reset_after_eof_as_grac
     );
 }
 
+/// rustls reports a peer TCP FIN that omitted `close_notify` as
+/// `UnexpectedEof` whose Display contains "without sending TLS close_notify".
+/// On the userspace copy path that is ordinary teardown, not `tls_error`.
+#[tokio::test]
+async fn test_bidirectional_copy_tls_close_without_notify_is_graceful() {
+    const RUSTLS_EOF: &str = "peer closed connection without sending TLS close_notify: \
+         https://docs.rs/rustls/latest/rustls/manual/_03_howto/index.html#unexpected-eof";
+    let client = ReadChunksThenErrorStream::new(
+        vec![b"REQUEST".to_vec()],
+        io::ErrorKind::UnexpectedEof,
+        RUSTLS_EOF,
+    );
+    let backend = ScriptedStream::new(
+        vec![b"RESPONSE".to_vec()],
+        vec![],
+        WriteOutcome::Accept,
+    );
+
+    let result =
+        bidirectional_copy_for_test(client, backend, TEST_IDLE_TIMEOUT, None, 8 * 1024).await;
+
+    assert!(
+        result.first_failure.is_none(),
+        "missing close_notify on a userspace TLS read must be clean EOF, got {:?}",
+        result.first_failure
+    );
+    assert!(
+        result.bytes_client_to_backend > 0 && result.bytes_backend_to_client > 0,
+        "happy-path session must have transferred bytes before teardown"
+    );
+}
+
 /// Negative control: if the first half errors BEFORE any EOF, the
 /// reclassification MUST NOT fire — a read error from the client is a
 /// genuine transport failure. This prevents the graceful-shutdown branch
@@ -2492,5 +2545,66 @@ fn tcp_stream_duration_uses_instant_not_wall_clock() {
     assert_eq!(
         forward.timestamp_disconnected,
         disconnected_wall_forward.to_rfc3339()
+    );
+}
+
+struct CaptureUdpSetupPlugin {
+    summaries: Arc<Mutex<Vec<StreamTransactionSummary>>>,
+}
+
+#[async_trait]
+impl Plugin for CaptureUdpSetupPlugin {
+    fn name(&self) -> &str {
+        "capture-udp-setup"
+    }
+
+    async fn on_stream_disconnect(&self, summary: &StreamTransactionSummary) {
+        self.summaries
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(summary.clone());
+    }
+}
+
+#[tokio::test]
+async fn test_udp_setup_dns_failure_emits_stream_summary() {
+    let captured = Arc::new(Mutex::new(Vec::new()));
+    let plugins: Vec<Arc<dyn Plugin>> = vec![Arc::new(CaptureUdpSetupPlugin {
+        summaries: Arc::clone(&captured),
+    })];
+    let error: anyhow::Error =
+        ferrum_edge::proxy::stream_error::StreamSetupError::dns_lookup(
+            "backend.local",
+            std::io::Error::other("DNS resolution returned no addresses for backend.local"),
+        )
+        .into();
+
+    emit_udp_setup_failure_for_test(
+        &plugins,
+        "ferrum",
+        "udp-proxy",
+        Some("UDP Proxy"),
+        "127.0.0.1",
+        "backend.local:5353",
+        "udp",
+        5353,
+        &error,
+    )
+    .await;
+
+    let summaries = captured.lock().unwrap_or_else(|e| e.into_inner());
+    assert_eq!(summaries.len(), 1);
+    let summary = &summaries[0];
+    assert_eq!(summary.protocol, "udp");
+    assert_eq!(summary.listen_port, 5353);
+    assert_eq!(summary.bytes_sent, 0);
+    assert_eq!(summary.bytes_received, 0);
+    assert_eq!(
+        summary.error_class,
+        Some(ErrorClass::DnsLookupError)
+    );
+    assert_eq!(
+        summary.disconnect_cause,
+        Some(DisconnectCause::BackendError)
     );
 }

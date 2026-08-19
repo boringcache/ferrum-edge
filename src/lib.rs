@@ -3030,6 +3030,39 @@ pub mod _test_support {
         crate::proxy::tcp_proxy::classify_stream_error(error)
     }
 
+    /// Drive the production UDP setup-failure emit path: a session that
+    /// never reached `sessions.insert` still builds a
+    /// `StreamTransactionSummary` and notifies logging plugins.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn emit_udp_setup_failure_for_test(
+        plugins: &[Arc<dyn Plugin>],
+        namespace: &str,
+        proxy_id: &str,
+        proxy_name: Option<&str>,
+        client_ip: &str,
+        backend_target: &str,
+        protocol: &str,
+        listen_port: u16,
+        error: &anyhow::Error,
+    ) {
+        crate::proxy::udp_proxy::emit_udp_setup_failure(
+            plugins,
+            crate::proxy::udp_proxy::UdpSetupFailureContext {
+                namespace,
+                proxy_id,
+                proxy_name,
+                client_ip,
+                backend_target,
+                protocol,
+                listen_port,
+                connected_wall_at: chrono::Utc::now(),
+                duration_ms: 0.0,
+                error,
+            },
+        )
+        .await;
+    }
+
     pub fn tcp_listener_proxy_for_test(
         config: &crate::config::types::GatewayConfig,
         proxy_namespace: &str,

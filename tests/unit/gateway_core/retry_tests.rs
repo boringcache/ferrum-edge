@@ -1153,7 +1153,47 @@ fn test_classify_boxed_error_typed_backend_dtls_error() {
 }
 
 #[test]
-fn test_classify_boxed_error_typed_no_healthy_targets() {
+fn test_classify_boxed_error_typed_dns_lookup() {
+    use ferrum_edge::proxy::stream_error::StreamSetupError;
+    let err: Box<dyn std::error::Error + Send + Sync> = Box::new(StreamSetupError::dns_lookup(
+        "backend.example.com",
+        std::io::Error::other("DNS resolution returned no addresses"),
+    ));
+    assert_eq!(classify_boxed_error(&*err), ErrorClass::DnsLookupError);
+}
+
+#[test]
+fn test_classify_boxed_error_live_dns_no_addresses_wording() {
+    let err: Box<dyn std::error::Error + Send + Sync> =
+        "DNS resolution returned no addresses for backend.local".into();
+    assert_eq!(classify_boxed_error(&*err), ErrorClass::DnsLookupError);
+}
+
+#[test]
+fn test_classify_boxed_error_tls_close_without_notify_is_connection_closed() {
+    use ferrum_edge::retry::TLS_CLOSE_WITHOUT_NOTIFY;
+    let io_err = std::io::Error::new(
+        std::io::ErrorKind::UnexpectedEof,
+        format!(
+            "peer closed connection {TLS_CLOSE_WITHOUT_NOTIFY}: \
+             https://docs.rs/rustls/latest/rustls/manual/_03_howto/index.html#unexpected-eof"
+        ),
+    );
+    assert_eq!(
+        classify_boxed_error(&io_err),
+        ErrorClass::ConnectionClosed
+    );
+    assert_ne!(classify_boxed_error(&io_err), ErrorClass::TlsError);
+}
+
+#[test]
+fn test_classify_boxed_setup_error_handshake_alert_is_tls_error() {
+    let rustls_err = rustls::Error::AlertReceived(rustls::AlertDescription::HandshakeFailure);
+    assert_eq!(
+        classify_boxed_setup_error(&rustls_err),
+        ErrorClass::TlsError
+    );
+}
     use ferrum_edge::proxy::stream_error::{StreamSetupError, StreamSetupKind};
     let err: Box<dyn std::error::Error + Send + Sync> = Box::new(StreamSetupError::new(
         StreamSetupKind::NoHealthyTargets,

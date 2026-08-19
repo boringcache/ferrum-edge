@@ -1749,6 +1749,61 @@ async fn emit_udp_stream_disconnect(
     }
 }
 
+/// Setup-phase UDP/DTLS failure that never published a session: DNS, plugin
+/// reject, empty pool, connect, and similar. A published session owns its
+/// own disconnect summary, so callers skip this when `sessions` already
+/// contains the key.
+pub(crate) struct UdpSetupFailureContext<'a> {
+    pub(crate) namespace: &'a str,
+    pub(crate) proxy_id: &'a str,
+    pub(crate) proxy_name: Option<&'a str>,
+    pub(crate) client_ip: &'a str,
+    pub(crate) backend_target: &'a str,
+    pub(crate) protocol: &'a str,
+    pub(crate) listen_port: u16,
+    pub(crate) connected_wall_at: chrono::DateTime<chrono::Utc>,
+    pub(crate) duration_ms: f64,
+    pub(crate) error: &'a anyhow::Error,
+}
+
+pub(crate) async fn emit_udp_setup_failure(
+    plugins: &[Arc<dyn Plugin>],
+    context: UdpSetupFailureContext<'_>,
+) {
+    let class = dtls_error_class(context.error);
+    let disconnect_cause = Some(dtls_disconnect_cause(context.error, &class));
+    let disconnect_direction = Some(dtls_disconnect_direction(context.error, &class));
+    let summary = StreamTransactionSummary {
+        namespace: context.namespace.to_string(),
+        proxy_id: context.proxy_id.to_string(),
+        proxy_lifecycle_generation: None,
+        plugin_trigger_decisions: Default::default(),
+        proxy_name: context.proxy_name.map(str::to_string),
+        client_ip: context.client_ip.to_string(),
+        consumer_username: None,
+        auth_method: None,
+        backend_target: context.backend_target.to_string(),
+        backend_resolved_ip: None,
+        protocol: context.protocol.to_string(),
+        listen_port: context.listen_port,
+        duration_ms: context.duration_ms,
+        bytes_sent: 0,
+        bytes_received: 0,
+        connection_error: Some(context.error.to_string()),
+        error_class: Some(class),
+        disconnect_direction,
+        disconnect_cause,
+        timestamp_connected: context.connected_wall_at.to_rfc3339(),
+        timestamp_disconnected: chrono::Utc::now().to_rfc3339(),
+        sni_hostname: None,
+        metadata: Default::default(),
+    };
+    crate::runtime_metrics::global_ref().record_stream_transaction(&summary);
+    for plugin in plugins {
+        plugin.on_stream_disconnect(&summary).await;
+    }
+}
+
 struct DtlsDisconnectContext<'a> {
     namespace: &'a str,
     proxy_id: &'a str,
@@ -3690,6 +3745,10 @@ fn spawn_new_session_datagram(
     session_key: UdpSessionKey,
 ) {
     let client_addr = identity.socket_peer;
+    let client_ip = udp_session_client_ip(identity.resolved());
+    let session_key_for_emit = session_key.clone();
+    let setup_started = Instant::now();
+    let connected_wall_at = chrono::Utc::now();
     tokio::spawn(async move {
         // The gate removes the pending entry (dropping any queued follow-up
         // datagrams wholesale) on every path that doesn't complete the
@@ -3750,6 +3809,44 @@ fn spawn_new_session_datagram(
                     error = %e,
                     "UDP session setup or initial forward failed"
                 );
+            }
+            // A published session owns its own disconnect summary. Setup
+            // failures that never reached `sessions.insert` must still emit
+            // so DNS / empty-pool / plugin-reject reach logging plugins.
+            if !sessions.contains_key(&session_key_for_emit) {
+                let epoch = request_epoch.load();
+                let plugins = epoch.plugin_cache.plugins_for_protocol(
+                    &proxy_namespace,
+                    &proxy_id,
+                    ProxyProtocol::Udp,
+                );
+                let proxy = epoch.proxy_by_namespaced_id(
+                    &proxy_namespace,
+                    &proxy_id,
+                );
+                let protocol = proxy
+                    .map(|p| p.effective_scheme().to_scheme_str())
+                    .unwrap_or("udp");
+                let backend_target = proxy
+                    .map(|p| format!("{}:{}", p.backend_host, p.backend_port))
+                    .unwrap_or_default();
+                let proxy_name = proxy.and_then(|p| p.name.as_deref());
+                emit_udp_setup_failure(
+                    plugins.as_slice(),
+                    UdpSetupFailureContext {
+                        namespace: &proxy_namespace,
+                        proxy_id: &proxy_id,
+                        proxy_name,
+                        client_ip: client_ip.as_ref(),
+                        backend_target: &backend_target,
+                        protocol,
+                        listen_port,
+                        connected_wall_at,
+                        duration_ms: setup_started.elapsed().as_millis() as f64,
+                        error: &e,
+                    },
+                )
+                .await;
             }
         }
     });
@@ -4968,23 +5065,33 @@ async fn start_dtls_frontend_listener(
                                     "DTLS client session ended: {}",
                                     e
                                 );
-                                let error_message = e.to_string();
-                                let err_class = dtls_error_class(e);
-                                // handle_dtls_client_inner can fail on
-                                // backend-side setup (DNS, backend UDP bind,
-                                // backend DTLS handshake) as well as
-                                // client-side session errors. The typed
-                                // `StreamSetupError` (when present) drives
-                                // both cause and direction; otherwise we fall
-                                // back to error-class inference.
-                                let cause = dtls_disconnect_cause(e, &err_class);
-                                let direction = dtls_disconnect_direction(e, &err_class);
-                                (
-                                    Some(error_message),
-                                    Some(err_class),
-                                    Some(cause),
-                                    Some(direction),
-                                )
+                                if crate::retry::error_is_tls_close_without_notify(
+                                    e.as_ref(),
+                                ) {
+                                    // Same userspace-rustls teardown as TCP:
+                                    // a missing `close_notify` is not a TLS
+                                    // handshake failure.
+                                    (
+                                        None,
+                                        None,
+                                        Some(
+                                            crate::plugins::DisconnectCause::GracefulShutdown,
+                                        ),
+                                        None,
+                                    )
+                                } else {
+                                    let error_message = e.to_string();
+                                    let err_class = dtls_error_class(e);
+                                    let cause = dtls_disconnect_cause(e, &err_class);
+                                    let direction =
+                                        dtls_disconnect_direction(e, &err_class);
+                                    (
+                                        Some(error_message),
+                                        Some(err_class),
+                                        Some(cause),
+                                        Some(direction),
+                                    )
+                                }
                             }
                         };
 
@@ -6396,11 +6503,7 @@ async fn handle_dtls_client_inner(
                     cb.record_failure(502, true, cb_is_half_open_probe);
                 }
             }
-            return Err(anyhow::anyhow!(
-                "DNS resolution failed for {}: {}",
-                backend_host,
-                e
-            ));
+            return Err(StreamSetupError::dns_lookup(&backend_host, e).into());
         }
     };
     let dtls_params = (proxy.effective_scheme() == BackendScheme::Dtls)
@@ -7271,11 +7374,7 @@ async fn create_session(
                     cb.record_failure(502, true, cb_is_half_open_probe);
                 }
             }
-            return Err(anyhow::anyhow!(
-                "DNS resolution failed for {}: {}",
-                backend_host,
-                e
-            ));
+            return Err(StreamSetupError::dns_lookup(&backend_host, e).into());
         }
     };
     let candidates = match session_key.destination {
