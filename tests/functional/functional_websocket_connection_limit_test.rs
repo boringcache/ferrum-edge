@@ -5,7 +5,6 @@
 
 use crate::common::{TestGateway, TestGatewayBuilder};
 use crate::scaffolding::clients::{Http3Client, WebSocketOptions};
-use crate::scaffolding::reserve_colocated_tcp_udp;
 
 use futures_util::{SinkExt, StreamExt};
 use http::StatusCode;
@@ -66,15 +65,17 @@ async fn functional_websocket_connection_limit_rejects_second_h1_upgrade() {
 #[tokio::test]
 async fn functional_websocket_connection_limit_rejects_second_h3_connect() {
     let (backend_port, backend_task) = spawn_ws_backend().await;
-    let https_port = reserve_https_port().await;
     let mut gateway = ws_limit_gateway_builder(backend_port)
         .env("FERRUM_ENABLE_HTTP3", "true")
-        .env("FERRUM_PROXY_HTTPS_PORT", https_port.to_string())
+        .env_ephemeral_port("FERRUM_PROXY_HTTPS_PORT")
         .env("FERRUM_FRONTEND_TLS_CERT_PATH", "tests/certs/server.crt")
         .env("FERRUM_FRONTEND_TLS_KEY_PATH", "tests/certs/server.key")
         .spawn()
         .await
         .expect("start H3 WebSocket limit gateway");
+    let https_port = gateway
+        .env_port("FERRUM_PROXY_HTTPS_PORT")
+        .expect("harness-allocated HTTPS port");
 
     let client = Http3Client::insecure().expect("h3 client");
     let url = format!("https://localhost:{https_port}/ws");
@@ -175,17 +176,6 @@ async fn run_ws_backend(listener: TcpListener) {
             }
         });
     }
-}
-
-async fn reserve_https_port() -> u16 {
-    let (tcp, udp) = reserve_colocated_tcp_udp()
-        .await
-        .expect("reserve colocated https port");
-    let port = tcp.port;
-    assert_eq!(port, udp.port);
-    drop(tcp);
-    drop(udp);
-    port
 }
 
 async fn retry_h3_websocket(
