@@ -199,6 +199,20 @@ struct RawResponse {
     body: String,
 }
 
+fn raw_header<'a>(resp: &'a RawResponse, name: &str) -> Option<&'a str> {
+    resp.headers
+        .iter()
+        .find(|(k, _)| k.eq_ignore_ascii_case(name))
+        .map(|(_, v)| v.as_str())
+}
+
+fn header_ci<'a>(headers: &'a [(String, String)], name: &str) -> Option<&'a str> {
+    headers
+        .iter()
+        .find(|(k, _)| k.eq_ignore_ascii_case(name))
+        .map(|(_, v)| v.as_str())
+}
+
 /// Send a pre-built raw HTTP request over a fresh TCP connection and parse the
 /// status line, headers, and body. Used when the request itself must violate
 /// HTTP framing (CL+TE, multi-Host, etc.) — `reqwest` refuses to emit these.
@@ -377,6 +391,16 @@ async fn send_h2_prior_knowledge(
     req: Request<Full<Bytes>>,
     label: &str,
 ) -> (u16, String) {
+    let (status, body_str, _) =
+        send_h2_prior_knowledge_with_headers(proxy_port, req, label).await;
+    (status, body_str)
+}
+
+async fn send_h2_prior_knowledge_with_headers(
+    proxy_port: u16,
+    req: Request<Full<Bytes>>,
+    label: &str,
+) -> (u16, String, Vec<(String, String)>) {
     let stream = TcpStream::connect(("127.0.0.1", proxy_port))
         .await
         .expect("connect");
@@ -395,6 +419,16 @@ async fn send_h2_prior_knowledge(
         .await
         .unwrap_or_else(|e| panic!("send {label}: {e}"));
     let status = resp.status().as_u16();
+    let headers = resp
+        .headers()
+        .iter()
+        .map(|(k, v)| {
+            (
+                k.as_str().to_string(),
+                v.to_str().unwrap_or("").to_string(),
+            )
+        })
+        .collect();
     let body = resp
         .into_body()
         .collect()
@@ -406,7 +440,7 @@ async fn send_h2_prior_knowledge(
     drop(sender);
     conn_task.abort();
 
-    (status, body_str)
+    (status, body_str, headers)
 }
 
 async fn send_h2_get(proxy_port: u16, uri: &str, headers: &[(&str, &str)]) -> (u16, String) {
@@ -1040,6 +1074,11 @@ async fn functional_protocol_validation_trace_rejected_http1() {
         "unexpected body: {}",
         resp.body
     );
+    assert_eq!(
+        raw_header(&resp, "allow"),
+        Some("GET, HEAD, POST, PUT, PATCH, DELETE, OPTIONS"),
+        "RFC 9110 requires Allow on 405"
+    );
 
     h.cleanup();
 }
@@ -1055,10 +1094,16 @@ async fn functional_protocol_validation_trace_rejected_http2() {
         .header("host", "example.com")
         .body(Full::new(Bytes::new()))
         .expect("build request");
-    let (status, body_str) = send_h2_prior_knowledge(h.proxy_port, req, "TRACE").await;
+    let (status, body_str, headers) =
+        send_h2_prior_knowledge_with_headers(h.proxy_port, req, "TRACE").await;
 
     assert_eq!(status, 405, "body={body_str}");
     assert!(body_str.contains("TRACE"), "unexpected body: {body_str}");
+    assert_eq!(
+        header_ci(&headers, "allow"),
+        Some("GET, HEAD, POST, PUT, PATCH, DELETE, OPTIONS"),
+        "RFC 9110 requires Allow on 405"
+    );
 
     h.cleanup();
 }
@@ -1573,6 +1618,13 @@ async fn functional_protocol_validation_trace_rejected_http3() {
         resp.body_text().contains("TRACE"),
         "unexpected body: {}",
         resp.body_text()
+    );
+    assert_eq!(
+        resp.headers
+            .get("allow")
+            .and_then(|v| v.to_str().ok()),
+        Some("GET, HEAD, POST, PUT, PATCH, DELETE, OPTIONS"),
+        "RFC 9110 requires Allow on 405"
     );
 
     gateway.shutdown();
@@ -2212,6 +2264,11 @@ async fn functional_protocol_validation_connect_rejected_http1() {
             "unexpected body: {}",
             resp.body
         );
+        assert_eq!(
+            raw_header(&resp, "allow"),
+            Some("GET, HEAD, POST, PUT, PATCH, DELETE, OPTIONS"),
+            "RFC 9110 requires Allow on 405"
+        );
     }
 
     h.cleanup();
@@ -2279,10 +2336,16 @@ async fn functional_protocol_validation_connect_rejected_http2_without_protocol(
         .uri("example.com:443")
         .body(Full::new(Bytes::new()))
         .expect("build H2 CONNECT request");
-    let (status, body_str) = send_h2_prior_knowledge(h.proxy_port, req, "CONNECT").await;
+    let (status, body_str, headers) =
+        send_h2_prior_knowledge_with_headers(h.proxy_port, req, "CONNECT").await;
 
     assert_eq!(status, 405, "body={body_str}");
     assert!(body_str.contains("CONNECT"), "unexpected body: {body_str}");
+    assert_eq!(
+        header_ci(&headers, "allow"),
+        Some("GET, HEAD, POST, PUT, PATCH, DELETE, OPTIONS"),
+        "RFC 9110 requires Allow on 405"
+    );
 
     h.cleanup();
 }
@@ -2333,11 +2396,17 @@ async fn functional_protocol_validation_connect_rejected_http2_non_websocket_pro
         .expect("build H2 Extended CONNECT request");
     req.extensions_mut()
         .insert(hyper::ext::Protocol::from_static("connect-udp"));
-    let (status, body_str) =
-        send_h2_prior_knowledge(h.proxy_port, req, "CONNECT connect-udp").await;
+    let (status, body_str, headers) =
+        send_h2_prior_knowledge_with_headers(h.proxy_port, req, "CONNECT connect-udp")
+            .await;
 
     assert_eq!(status, 405, "body={body_str}");
     assert!(body_str.contains("CONNECT"), "unexpected body: {body_str}");
+    assert_eq!(
+        header_ci(&headers, "allow"),
+        Some("GET, HEAD, POST, PUT, PATCH, DELETE, OPTIONS"),
+        "RFC 9110 requires Allow on 405"
+    );
 
     h.cleanup();
 }

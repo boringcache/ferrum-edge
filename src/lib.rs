@@ -1468,6 +1468,20 @@ pub mod _test_support {
         crate::proxy::http_backend_failure_status_and_body(class)
     }
 
+    pub fn x_gateway_error_for_backend_failure_for_test(
+        connection_error: bool,
+        status: u16,
+    ) -> Option<&'static str> {
+        crate::proxy::x_gateway_error_for_backend_failure(connection_error, status)
+    }
+
+    pub fn allow_header_from_allowed_methods_for_test(methods: &[String]) -> String {
+        crate::proxy::allow_header_from_allowed_methods(methods)
+    }
+
+    pub const PROTOCOL_LEVEL_405_ALLOW_FOR_TEST: &str =
+        crate::proxy::PROTOCOL_LEVEL_405_ALLOW;
+
     pub fn set_grpc_deadline_budget_for_test(
         ctx: &mut crate::plugins::RequestContext,
         budget_ms: Option<u64>,

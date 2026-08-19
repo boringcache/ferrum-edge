@@ -34,6 +34,7 @@ mod dtls_recv_loop_supervision_tests;
 mod dtls_session_identity_tests;
 mod early_upload_deadline_tests;
 mod error_classifier_tests;
+mod error_response_headers_tests;
 mod exclusive_proxy_bind_tests;
 mod forwarded_ownership_parity_tests;
 mod gateway_backend_lb_policy_tests;

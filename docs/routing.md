@@ -263,3 +263,16 @@ Both caches are bounded by `FERRUM_ROUTER_CACHE_MAX_ENTRIES` (default `0`, auto-
 | Config reload | Route table, generation, and pending listener admission published as one RequestEpoch; matching admission acknowledgement advances cache generation |
 
 All route table operations (sorting, regex compilation, host partitioning) happen at config load time, never on the request hot path. The request path uses one lock-free `RequestEpoch` load for the route table and its listener admission, followed by `DashMap::get()` for cached lookups.
+
+## HTTP method admission
+
+After a proxy is matched, `allowed_methods` (when configured) rejects any other method with **405 Method Not Allowed**. RFC 9110 §15.5.6 requires an `Allow` header listing the methods the resource currently supports. The gateway sets `Allow` to the proxy's configured methods, uppercased, in config order (stable, not sorted). HTTP/1.1, HTTP/2, and HTTP/3 share that formatting. Response-header plugins may decorate the 405, but they cannot remove or replace that gateway-owned `Allow` value.
+
+Two protocol-level filters run **before** route match and also return 405:
+
+| Request | Reason |
+|---------|--------|
+| `TRACE` | Cross-Site Tracing (XST) prevention |
+| Non-WebSocket `CONNECT` | No tunnel is established that would bypass proxy routing. On HTTP/3 this is plain CONNECT with no `:protocol`, or a registered `:protocol` this gateway does not implement (for example `webtransport`). RFC 9298 CONNECT-UDP is a separate profile (501 when disabled). |
+
+Those 405s carry a static `Allow: GET, HEAD, POST, PUT, PATCH, DELETE, OPTIONS`. TRACE and CONNECT are omitted because the same filter rejected them. There is no matched proxy yet, so `allowed_methods` cannot supply the list.

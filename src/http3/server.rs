@@ -2272,14 +2272,12 @@ async fn handle_h3_request(
     if method == "TRACE" {
         warn!("Rejected HTTP/3 TRACE request");
         record_h3_flavor_aware_reject(&state, http_flavor, 405);
-        send_h3_error_flavor_aware(
+        send_h3_protocol_method_not_allowed(
             &mut stream,
             http_flavor,
             grpc_web_response_content_type,
-            StatusCode::METHOD_NOT_ALLOWED,
+            &mut ctx,
             r#"{"error":"TRACE method is not allowed"}"#,
-            crate::proxy::grpc_proxy::grpc_status::UNIMPLEMENTED,
-            "TRACE method is not allowed",
         )
         .await?;
         return Ok(());
@@ -2297,14 +2295,12 @@ async fn handle_h3_request(
     if method == "CONNECT" && http_flavor != HttpFlavor::WebSocket && !is_connect_udp_request {
         warn!("Rejected unsupported HTTP/3 CONNECT request");
         record_h3_flavor_aware_reject(&state, http_flavor, 405);
-        send_h3_error_flavor_aware(
+        send_h3_protocol_method_not_allowed(
             &mut stream,
             http_flavor,
             grpc_web_response_content_type,
-            StatusCode::METHOD_NOT_ALLOWED,
+            &mut ctx,
             r#"{"error":"CONNECT method is not allowed"}"#,
-            crate::proxy::grpc_proxy::grpc_status::UNIMPLEMENTED,
-            "CONNECT method is not allowed",
         )
         .await?;
         return Ok(());
@@ -2690,7 +2686,7 @@ async fn handle_h3_request(
         && !allowed.iter().any(|m| m.eq_ignore_ascii_case(&method))
     {
         record_h3_flavor_aware_reject(&state, http_flavor, 405);
-        let allow_header = allowed.join(", ");
+        let allow_header = crate::proxy::allow_header_from_allowed_methods(allowed);
         let mut headers = HashMap::new();
         headers.insert("allow".to_string(), allow_header.clone());
         finalize_h3_gateway_error_headers(
@@ -5066,7 +5062,7 @@ async fn handle_h3_request(
                 let mut reject_body = Bytes::from_static(
                     br#"{"error":"Service temporarily unavailable (circuit breaker open)"}"#,
                 );
-                let mut rej_headers = HashMap::new();
+                let mut rej_headers = crate::proxy::circuit_breaker_open_reject_headers();
                 crate::proxy::apply_replaceable_after_proxy_hooks_to_rejection(
                     &plugins,
                     &mut ctx,
@@ -5095,6 +5091,11 @@ async fn handle_h3_request(
                         &mut rej_headers,
                         &mut reject_body,
                         initial_response_header_policy_plugins.as_ref(),
+                    );
+                } else {
+                    crate::proxy::restore_authoritative_gateway_error_header(
+                        &mut rej_headers,
+                        crate::proxy::X_GATEWAY_ERROR_CIRCUIT_BREAKER_OPEN,
                     );
                 }
                 let log_status_code = if deadline_replaced {
@@ -6477,28 +6478,23 @@ async fn handle_h3_request(
                         h3_backend_failure_status_body(&e)
                     };
                 let reject_status_code = reject_status.as_u16();
-                // Do NOT propagate a send error: record_backend_outcome below
-                // releases the LB active-connection count, so a `?` here would
-                // skip it and leak the count when the client disconnects during
-                // the reject write.
-                let _ = send_h3_response(&mut stream, reject_status, reject_body).await;
-
-                // Record outcome for CB/health even on failure.
-                // Frontend client aborts while uploading request bodies are
-                // client-caused and must not poison backend CB/passive health:
-                // h3_streaming_body_failure_outcome maps that case to
-                // (connection_error=false, ClientDisconnect), and the
-                // ClientDisconnect class is centrally suppressed in
-                // record_backend_outcome_inner — it routes the breaker to
-                // record_neutral() and skips both the least-latency sample and
-                // the passive-health report (so this 502 no longer records a
-                // passive failure even when 502 sits in unhealthy_status_codes).
                 let (outcome_connection_error, outcome_error_class) =
                     h3_streaming_body_failure_outcome(
                         is_client_request_body_disconnect,
                         e.is_read_timeout(),
                         h3_error_class,
                     );
+                // Do NOT propagate a send error: record_backend_outcome below
+                // releases the LB active-connection count, so a `?` here would
+                // skip it and leak the count when the client disconnects during
+                // the reject write.
+                let _ = send_h3_backend_failure_response(
+                    &mut stream,
+                    reject_status,
+                    reject_body,
+                    outcome_connection_error,
+                )
+                .await;
                 crate::proxy::backend_dispatch::record_backend_outcome(
                     &state,
                     &proxy,
@@ -8620,6 +8616,14 @@ async fn handle_h3_request(
             plugin_execution_ns += phase_start.elapsed().as_nanos() as u64;
         }
 
+        if !after_proxy_rejected {
+            crate::proxy::insert_x_gateway_error_for_backend_failure(
+                &mut response_headers,
+                !h3_request_on_wire,
+                response_status,
+            );
+        }
+
         // Sticky session cookie injection. The buffered variant also records the
         // cookie as gateway-owned so a committed-hook deadline cannot strip it.
         //
@@ -9816,6 +9820,19 @@ fn h3_backend_failure_status_body(
     (status, body)
 }
 
+fn h3_backend_failure_headers(
+    connection_error: bool,
+    status: u16,
+) -> HashMap<String, String> {
+    let mut headers = HashMap::new();
+    crate::proxy::insert_x_gateway_error_for_backend_failure(
+        &mut headers,
+        connection_error,
+        status,
+    );
+    headers
+}
+
 fn is_h3_client_request_body_disconnect(err_msg: &str) -> bool {
     let lower = err_msg.to_ascii_lowercase();
     // A malformed/undecodable client request-trailer block is a client-side
@@ -10093,7 +10110,10 @@ async fn proxy_to_backend_h3_refined_response(
                 return Ok(H3RefinedResponse::Buffered(H3BufferedDispatchResult {
                     status: reject_status.as_u16(),
                     body: Bytes::from_static(reject_body.as_bytes()),
-                    headers: HashMap::new(),
+                    headers: h3_backend_failure_headers(
+                        !request_on_wire,
+                        reject_status.as_u16(),
+                    ),
                     trailers: None,
                     error_class: Some(h3_error_class),
                     request_on_wire,
@@ -10107,9 +10127,14 @@ async fn proxy_to_backend_h3_refined_response(
             // disconnect in the result so the caller still records the outcome
             // and releases the connection — mirrors the size-limit / after_proxy
             // reject paths in `stream_h3_open_response_to_client`.
-            let reject_sent = send_h3_response(h3_stream, reject_status, reject_body)
-                .await
-                .is_ok();
+            let reject_sent = send_h3_backend_failure_response(
+                h3_stream,
+                reject_status,
+                reject_body,
+                !request_on_wire,
+            )
+            .await
+            .is_ok();
             return Ok(H3RefinedResponse::Streamed(
                 h3_backend_unavailable_stream_result(
                     reject_status.as_u16(),
@@ -10259,7 +10284,7 @@ async fn collect_h3_open_response_body(
                     return H3BufferedDispatchResult {
                         status,
                         body: Bytes::from_static(body.as_bytes()),
-                        headers: HashMap::new(),
+                        headers: h3_backend_failure_headers(false, status),
                         trailers: None,
                         error_class: Some(crate::retry::ErrorClass::ReadWriteTimeout),
                         request_on_wire: true,
@@ -10308,7 +10333,7 @@ async fn collect_h3_open_response_body(
                         body: Bytes::from_static(
                             br#"{"error":"HTTP/3 backend response truncated"}"#,
                         ),
-                        headers: HashMap::new(),
+                        headers: h3_backend_failure_headers(false, 502),
                         trailers: None,
                         error_class: Some(crate::retry::ErrorClass::ConnectionClosed),
                         request_on_wire: true,
@@ -10345,7 +10370,7 @@ async fn collect_h3_open_response_body(
                 return H3BufferedDispatchResult {
                     status,
                     body: Bytes::from_static(body.as_bytes()),
-                    headers: HashMap::new(),
+                    headers: h3_backend_failure_headers(false, status),
                     trailers: None,
                     error_class: Some(h3_error_class),
                     request_on_wire: true,
@@ -10379,11 +10404,12 @@ async fn collect_h3_open_response_body(
                     .backend_capabilities
                     .mark_h3_unsupported(proxy, upstream_target);
             }
-            let (status, body) = crate::proxy::http_backend_failure_status_and_body(h3_error_class);
+            let (status, body) =
+                crate::proxy::http_backend_failure_status_and_body(h3_error_class);
             return H3BufferedDispatchResult {
                 status,
                 body: Bytes::from_static(body.as_bytes()),
-                headers: HashMap::new(),
+                headers: h3_backend_failure_headers(false, status),
                 trailers: None,
                 error_class: Some(h3_error_class),
                 request_on_wire: true,
@@ -14444,9 +14470,14 @@ async fn proxy_to_backend_h3_streaming(
             // disconnects during the reject write. Report the disconnect so the
             // caller still records the outcome and releases the connection —
             // same contract as the size-limit / after_proxy reject paths below.
-            let reject_sent = send_h3_response(h3_stream, reject_status, reject_body)
-                .await
-                .is_ok();
+            let reject_sent = send_h3_backend_failure_response(
+                h3_stream,
+                reject_status,
+                reject_body,
+                !request_on_wire,
+            )
+            .await
+            .is_ok();
             // No backend response was received (pre-headers dispatch failure),
             // so backend_status is the gateway-synthesized reject status
             // (502 generic, 504 for a backend read timeout).
@@ -15067,7 +15098,7 @@ fn h3_buffered_result_from_backend_response(
             return H3BufferedDispatchResult {
                 status: 502,
                 body: Bytes::from_static(br#"{"error":"Backend unavailable"}"#),
-                headers: HashMap::new(),
+                headers: h3_backend_failure_headers(!request_on_wire, 502),
                 trailers: None,
                 error_class: Some(crate::retry::ErrorClass::ProtocolError),
                 request_on_wire,
@@ -15221,7 +15252,10 @@ async fn proxy_to_backend_h3(
             H3BufferedDispatchResult {
                 status: reject_status.as_u16(),
                 body: Bytes::from_static(reject_body.as_bytes()),
-                headers: HashMap::new(),
+                headers: h3_backend_failure_headers(
+                    !request_on_wire,
+                    reject_status.as_u16(),
+                ),
                 trailers: None,
                 error_class: Some(h3_error_class),
                 request_on_wire,
@@ -15261,6 +15295,69 @@ async fn send_h3_response_with_recv_halt(
         crate::http3::stream_util::halt_request_body(stream);
     }
     Ok(())
+}
+
+/// Protocol-level 405 (TRACE / non-WebSocket CONNECT) with the static RFC 9110
+/// `Allow` list. These filters run before a proxy is matched, so there is no
+/// per-route `allowed_methods` value.
+async fn send_h3_protocol_method_not_allowed(
+    stream: &mut RequestStream<h3_quinn::BidiStream<Bytes>, Bytes>,
+    flavor: HttpFlavor,
+    grpc_web_response_content_type: Option<&str>,
+    ctx: &mut RequestContext,
+    http_body: &'static str,
+) -> Result<(), anyhow::Error> {
+    let mut headers = HashMap::new();
+    headers.insert(
+        "allow".to_string(),
+        crate::proxy::PROTOCOL_LEVEL_405_ALLOW.to_string(),
+    );
+    if let Some(content_type) = grpc_web_response_content_type {
+        send_h3_grpc_web_reject(
+            stream,
+            &[],
+            ctx,
+            content_type,
+            StatusCode::METHOD_NOT_ALLOWED,
+            Bytes::from_static(http_body.as_bytes()),
+            &headers,
+        )
+        .await
+    } else {
+        send_h3_reject_flavor_aware(
+            stream,
+            flavor,
+            StatusCode::METHOD_NOT_ALLOWED,
+            Bytes::from_static(http_body.as_bytes()),
+            &headers,
+            RejectBodyDisposition::for_request(&ctx.method, 405),
+        )
+        .await
+    }
+}
+
+/// Gateway-synthesized backend-dispatch failure (502/504) with the same
+/// `X-Gateway-Error` token the H1/H2 builder attaches.
+async fn send_h3_backend_failure_response(
+    stream: &mut RequestStream<h3_quinn::BidiStream<Bytes>, Bytes>,
+    status: StatusCode,
+    body: &str,
+    connection_error: bool,
+) -> Result<(), anyhow::Error> {
+    let mut headers = HashMap::new();
+    crate::proxy::insert_x_gateway_error_for_backend_failure(
+        &mut headers,
+        connection_error,
+        status.as_u16(),
+    );
+    send_h3_finalized_reject_response(
+        stream,
+        status,
+        Bytes::from_static(body.as_bytes()),
+        &headers,
+        RejectBodyDisposition::WireBody,
+    )
+    .await
 }
 
 /// Send an HTTP/3 rejection response with custom headers. Same recv-half

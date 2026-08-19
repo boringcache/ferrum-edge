@@ -34,7 +34,7 @@ use crate::scaffolding::backends::{
 use crate::scaffolding::certs::TestCa;
 use crate::scaffolding::clients::{GetOptions, Http2Client, Http3Client};
 use crate::scaffolding::harness::GatewayHarness;
-use crate::scaffolding::ports::{reserve_colocated_tcp_udp, reserve_port};
+use crate::scaffolding::ports::{reserve_colocated_tcp_udp, reserve_port, unbound_port};
 use serde_json::{Value, json};
 use std::time::Duration;
 
@@ -414,6 +414,58 @@ async fn h3_probe_classifies_backend_without_quic_as_h3_unsupported() {
     );
 
     let _ = https_port;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore]
+async fn h3_cross_protocol_refused_connect_sets_x_gateway_error() {
+    const MAX_ATTEMPTS: u32 = 5;
+    let mut last_failure: Option<String> = None;
+    for attempt in 1..=MAX_ATTEMPTS {
+        let backend_port = unbound_port().await.expect("unbound port");
+        let yaml = crate::scaffolding::file_mode_yaml_for_backend(backend_port);
+        let (harness, _ca_pem, _https_port) =
+            spawn_h3_harness_with_explicit_https_port_and_config(yaml, false, None)
+                .await;
+        let resp = match h3_get(&harness, "/api/anything").await {
+            Ok(resp) => resp,
+            Err(err) => {
+                last_failure = Some(format!("attempt {attempt}: h3 get: {err}"));
+                continue;
+            }
+        };
+        if resp.status.as_u16() != 502 {
+            last_failure = Some(format!(
+                "attempt {attempt}: expected 502, got {} body={}",
+                resp.status,
+                resp.body_text()
+            ));
+            continue;
+        }
+        let gateway_error = resp
+            .headers
+            .get("x-gateway-error")
+            .and_then(|v| v.to_str().ok());
+        if gateway_error != Some("connection_failure") {
+            last_failure = Some(format!(
+                "attempt {attempt}: expected X-Gateway-Error=connection_failure, got {gateway_error:?} body={}",
+                resp.body_text()
+            ));
+            continue;
+        }
+        if resp.body_text() != r#"{"error":"Backend unavailable"}"# {
+            last_failure = Some(format!(
+                "attempt {attempt}: expected Backend unavailable, got {}",
+                resp.body_text()
+            ));
+            continue;
+        }
+        return;
+    }
+    panic!(
+        "h3 cross-protocol refused connect failed across {MAX_ATTEMPTS} attempts; last failure: {}",
+        last_failure.unwrap_or_else(|| "unknown".into())
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
