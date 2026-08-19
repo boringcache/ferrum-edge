@@ -480,12 +480,22 @@ async fn tcp_stream_accept_threads_two_binds_and_relays_connections() {
     let _backend_task = spawn_echo_backend(backend.into_listener()).await;
 
     // This exercises the real `start_tcp_listener` path where the first
-    // listener and one extra SO_REUSEPORT listener both bind before started=true.
-    // If the extra bind fails, the helper never observes started=true and retries
-    // until it panics with the attempted port.
+    // exclusive listener is duplicated for extra accept workers before
+    // started=true. A foreign SO_REUSEPORT bind must not join that port.
     let (listen_port, shutdown_tx, join, metrics) =
         spawn_fast_path_gateway_with_options(backend_port, Vec::new(), 2).await;
     let gateway_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), listen_port);
+
+    let foreign = ferrum_edge::_test_support::try_foreign_reuseport_tcp_bind_for_test(gateway_addr);
+    assert!(
+        foreign.is_err(),
+        "a second process must not join the exclusive TCP stream listener on \
+         {gateway_addr}: {foreign:?}"
+    );
+    assert!(
+        std::net::TcpListener::bind(gateway_addr).is_err(),
+        "SO_REUSEADDR-only foreign bind must also fail on {gateway_addr}"
+    );
 
     for payload in [b"one".as_slice(), b"two".as_slice(), b"three".as_slice()] {
         let conn = round_trip_through_gateway(gateway_addr, payload).await;

@@ -1563,9 +1563,10 @@ pub struct WsDisconnectContext {
 /// performs only the lock-free `OnceLock::get_or_init` fast path. `None` is
 /// cached as well, preserving fail-closed behavior for malformed identities.
 /// When embedded privately in [`RequestContext`], the same typed state also
-/// retains authoritative HTTP correlation values. Stream contexts keep their
-/// correlation lifecycle state separately so replacing this public cache to
-/// reparse a changed client IP cannot erase stream correlation ownership.
+/// retains authoritative HTTP correlation values and which of those values
+/// were gateway-minted. Stream contexts keep their correlation lifecycle
+/// state separately so replacing this public cache to reparse a changed
+/// client IP cannot erase stream correlation ownership.
 #[derive(Debug, Clone, Default)]
 pub struct CanonicalClientIpCache {
     value: OnceLock<Option<IpAddr>>,
@@ -1576,13 +1577,30 @@ pub struct CanonicalClientIpCache {
 pub(crate) struct CorrelationIdState {
     canonical: Option<String>,
     instances: HashMap<String, String>,
+    /// Gateway-minted correlation headers for this request: `(header name,
+    /// generated value)`. Bounded by the number of admitted `correlation_id`
+    /// instances on the chain (typically one). Not projected into public
+    /// metadata, logs, or response headers.
+    generated_headers: Vec<(String, String)>,
 }
 
 impl CorrelationIdState {
-    fn publish_correlation_id(&mut self, instance_key: &str, request_id: String) -> bool {
+    fn publish_correlation_id(
+        &mut self,
+        instance_key: &str,
+        header_name: &str,
+        request_id: String,
+        generated: bool,
+    ) -> bool {
         let publish_canonical = self.canonical.is_none();
         self.instances
             .insert(instance_key.to_string(), request_id.clone());
+        self.generated_headers
+            .retain(|(existing, _)| !existing.eq_ignore_ascii_case(header_name));
+        if generated {
+            self.generated_headers
+                .push((header_name.to_string(), request_id.clone()));
+        }
         if publish_canonical {
             self.canonical = Some(request_id);
         }
@@ -1595,6 +1613,12 @@ impl CorrelationIdState {
 
     fn canonical_correlation_id(&self) -> Option<&str> {
         self.canonical.as_deref()
+    }
+
+    fn is_generated_header(&self, name: &str, value: &str) -> bool {
+        self.generated_headers
+            .iter()
+            .any(|(header, generated)| header.eq_ignore_ascii_case(name) && generated == value)
     }
 
     pub(crate) fn project_correlation_ids(&self, metadata: &mut HashMap<String, String>) {
@@ -1628,9 +1652,19 @@ impl CanonicalClientIpCache {
         self.value.get().is_some()
     }
 
-    fn publish_correlation_id(&mut self, instance_key: &str, request_id: String) -> bool {
-        self.correlation_ids
-            .publish_correlation_id(instance_key, request_id)
+    fn publish_correlation_id(
+        &mut self,
+        instance_key: &str,
+        header_name: &str,
+        request_id: String,
+        generated: bool,
+    ) -> bool {
+        self.correlation_ids.publish_correlation_id(
+            instance_key,
+            header_name,
+            request_id,
+            generated,
+        )
     }
 
     fn correlation_id(&self, instance_key: &str) -> Option<&str> {
@@ -1639,6 +1673,10 @@ impl CanonicalClientIpCache {
 
     fn canonical_correlation_id(&self) -> Option<&str> {
         self.correlation_ids.canonical_correlation_id()
+    }
+
+    fn is_generated_header(&self, name: &str, value: &str) -> bool {
+        self.correlation_ids.is_generated_header(name, value)
     }
 
     fn project_correlation_ids(&self, metadata: &mut HashMap<String, String>) {
@@ -3431,16 +3469,37 @@ impl RequestContext {
         }
     }
 
-    pub(crate) fn publish_correlation_id(&mut self, instance_key: &str, request_id: String) {
-        let publish_canonical = self
-            .canonical_client_ip
-            .publish_correlation_id(instance_key, request_id.clone());
+    pub(crate) fn publish_correlation_id(
+        &mut self,
+        instance_key: &str,
+        header_name: &str,
+        request_id: String,
+        generated: bool,
+    ) {
+        let publish_canonical = self.canonical_client_ip.publish_correlation_id(
+            instance_key,
+            header_name,
+            request_id.clone(),
+            generated,
+        );
         self.metadata
             .insert(instance_key.to_string(), request_id.clone());
         if publish_canonical {
             self.metadata
                 .insert(REQUEST_ID_METADATA_KEY.to_string(), request_id);
         }
+    }
+
+    /// Whether `name` currently carries a gateway-minted correlation value.
+    ///
+    /// True only when a `correlation_id` instance generated `value` because the
+    /// client omitted a valid inbound field (or the inbound value was rejected
+    /// and replaced). Client-supplied values return false even when they look
+    /// like UUIDs. Private typed state — not public metadata and not a request
+    /// header marker — so a client cannot spoof generation to collapse cache
+    /// partitions.
+    pub(crate) fn is_gateway_generated_correlation_header(&self, name: &str, value: &str) -> bool {
+        self.canonical_client_ip.is_generated_header(name, value)
     }
 
     pub(crate) fn correlation_id(&self, instance_key: &str) -> Option<&str> {
@@ -7937,10 +7996,19 @@ impl StreamConnectionContext {
         self.canonical_client_ip.is_initialized()
     }
 
-    pub(crate) fn publish_correlation_id(&mut self, instance_key: &str, request_id: String) {
-        let publish_canonical = self
-            .correlation_ids
-            .publish_correlation_id(instance_key, request_id.clone());
+    pub(crate) fn publish_correlation_id(
+        &mut self,
+        instance_key: &str,
+        header_name: &str,
+        request_id: String,
+        generated: bool,
+    ) {
+        let publish_canonical = self.correlation_ids.publish_correlation_id(
+            instance_key,
+            header_name,
+            request_id.clone(),
+            generated,
+        );
         let metadata = self.metadata.get_or_insert_with(HashMap::new);
         metadata.insert(instance_key.to_string(), request_id.clone());
         if publish_canonical {

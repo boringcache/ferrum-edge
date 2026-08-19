@@ -2,15 +2,17 @@
 
 **Captured:** 2026-07-12 production-readiness epic (umbrella register).
 
-**Role:** Historical snapshot only — not the live product backlog.
+**Role:** Historical snapshot only — frozen 2026-07-12 checkbox register, not
+the live product backlog and not a live tracker. Do not refresh this file to
+chase GitHub issue state.
 
-**Current source of truth:** [`PRODUCTION_READINESS.md`](../../PRODUCTION_READINESS.md)
-(Current residual map) and the dedicated issues cited below.
+**Remaining open residuals:** [`PRODUCTION_READINESS.md`](../../PRODUCTION_READINESS.md)
+(Current residual map). That ledger is also human-maintained; there is no
+launch-readiness gate.
 
 GitHub issue [#2110](https://github.com/ferrum-edge/ferrum-edge/issues/2110)
-remains open as the historical register; use this file plus
-`PRODUCTION_READINESS.md` when screening agents or docs against the 2026-07-12
-checkbox list.
+is CLOSED (COMPLETED, 2026-07-28). Keep this file so screening agents or docs
+do not re-open completed rows from the issue body alone.
 
 Protected automation note: `tests/performance/mesh/README.md` is a frozen
 Trusted Cross surface (every path under `tests/performance/` is protected,
@@ -43,31 +45,37 @@ Current mesh HBONE/DNS perf status lives in
 | SPIFFE Workload API JWT-SVID mint/validate/bundles | Implemented by [#3675](https://github.com/ferrum-edge/ferrum-edge/pull/3675), resolving [#3617](https://github.com/ferrum-edge/ferrum-edge/issues/3617); empty bundle success removed and the SPIRE serving boundary documented |
 | EgressGateway UDP `ServiceEntry` materialization | Implemented — [#3263](https://github.com/ferrum-edge/ferrum-edge/issues/3263) (external UDP ports materialize a datagram-over-mesh destination allowlist consumed by the gateway's authenticated mesh CONNECT terminator, plus the source-side `Sidecar`/`Ambient` producer that originates the identity-pinned `udp` CONNECT; no UDP/DTLS listener, by design) |
 | Ambient UDP enrolled-destination round trip | Implemented — [#3621](https://github.com/ferrum-edge/ferrum-edge/issues/3621) (`functional_mesh_live_source_capture_udp_manager_hbone_round_trip` covers source-capture → HBONE → enrolled destination pod-netns relay; `node-waypoint-ebpf-live` independently proves the relay mark admits the backend datagram through the enrolled-pod `tc_inbound` guard while unmarked traffic stays closed) |
+| Live OIDC / OAuth2 introspection coverage | Implemented — [#3333](https://github.com/ferrum-edge/ferrum-edge/issues/3333) closed COMPLETED 2026-08-04 by [#3552](https://github.com/ferrum-edge/ferrum-edge/pull/3552) |
+| NodeWaypoint observability + promotion gates | Implemented — [#3334](https://github.com/ferrum-edge/ferrum-edge/issues/3334) closed COMPLETED 2026-07-29 by [#3388](https://github.com/ferrum-edge/ferrum-edge/pull/3388) (follow-up [#3427](https://github.com/ferrum-edge/ferrum-edge/pull/3427)) |
+| Vendored-patch upstream filing / retirement | Implemented — [#3335](https://github.com/ferrum-edge/ferrum-edge/issues/3335) closed COMPLETED 2026-07-30 by [#3446](https://github.com/ferrum-edge/ferrum-edge/pull/3446) (`docs/vendored-patch-lifecycle.json` + weekly `dependency-audit`) |
+| Mesh/SPIRE CA-health signal + startup contract | Implemented — [#3608](https://github.com/ferrum-edge/ferrum-edge/issues/3608) closed COMPLETED 2026-08-08 by [#3668](https://github.com/ferrum-edge/ferrum-edge/pull/3668) |
+| CNI ferrum-cni chaining uninstall/rollback | Implemented — [#3609](https://github.com/ferrum-edge/ferrum-edge/issues/3609) closed COMPLETED 2026-08-11 by [#3792](https://github.com/ferrum-edge/ferrum-edge/pull/3792) (ownership-scoped install/uninstall/rollback, chart pre-delete cleanup, hosted Rust+Helm gates, live kind lifecycle suite) |
+| Cross-region CP failover topology | Implemented — [#3610](https://github.com/ferrum-edge/ferrum-edge/issues/3610) closed COMPLETED 2026-08-08 by [#3640](https://github.com/ferrum-edge/ferrum-edge/pull/3640) |
+| CP/K8s authoritative mesh config revision | Implemented — [#3611](https://github.com/ferrum-edge/ferrum-edge/issues/3611) closed COMPLETED 2026-08-09 by [#3680](https://github.com/ferrum-edge/ferrum-edge/pull/3680) |
+| Gateway API port-aware route representation | Implemented — [#3612](https://github.com/ferrum-edge/ferrum-edge/issues/3612) closed COMPLETED 2026-08-09 by [#3677](https://github.com/ferrum-edge/ferrum-edge/pull/3677) (`GatewayApiListenerKey` identity, real per-listener socket binding + reload/withdrawal, per-listener cross-kind retention, `Conflicted` status for same-port incompatible-shape refusals) |
+| OIDC RP pending login state (HA) | Implemented — [#3613](https://github.com/ferrum-edge/ferrum-edge/issues/3613) closed COMPLETED 2026-08-08 by [#3672](https://github.com/ferrum-edge/ferrum-edge/pull/3672) |
+| `ai_stream_router` Anthropic multimodal content | Implemented — [#3616](https://github.com/ferrum-edge/ferrum-edge/issues/3616) closed COMPLETED 2026-08-08 by [#3641](https://github.com/ferrum-edge/ferrum-edge/pull/3641) |
+| TCP outbound PROXY protocol v2 | Implemented — [#3618](https://github.com/ferrum-edge/ferrum-edge/issues/3618) closed COMPLETED 2026-08-08 by [#3647](https://github.com/ferrum-edge/ferrum-edge/pull/3647) |
+| TCP/kTLS kernel splice (frontend-TLS relay) | Implemented — [#3619](https://github.com/ferrum-edge/ferrum-edge/issues/3619) closed COMPLETED 2026-08-09 by [#3670](https://github.com/ferrum-edge/ferrum-edge/pull/3670) |
+| HTTP/3 plain-HTTP/WebSocket to mesh-tagged targets | Implemented — [#3620](https://github.com/ferrum-edge/ferrum-edge/issues/3620) closed COMPLETED 2026-08-14 by [#3798](https://github.com/ferrum-edge/ferrum-edge/pull/3798) |
+| Direct-H2 in-path body-size limits | Implemented — [#3622](https://github.com/ferrum-edge/ferrum-edge/issues/3622) closed COMPLETED 2026-08-08 by [#3646](https://github.com/ferrum-edge/ferrum-edge/pull/3646) |
+| Admin read-only write audit logging | Implemented — [#3623](https://github.com/ferrum-edge/ferrum-edge/issues/3623) closed COMPLETED 2026-08-08 by [#3643](https://github.com/ferrum-edge/ferrum-edge/pull/3643) |
+| Env-only reads ignoring `ferrum.conf` | Implemented — [#3624](https://github.com/ferrum-edge/ferrum-edge/issues/3624) closed COMPLETED 2026-08-08 by [#3644](https://github.com/ferrum-edge/ferrum-edge/pull/3644) |
+| Gateway SVID auto-refresh (external/inline) | Implemented — [#3625](https://github.com/ferrum-edge/ferrum-edge/issues/3625) closed COMPLETED 2026-08-09 by [#3669](https://github.com/ferrum-edge/ferrum-edge/pull/3669) |
 
-## Live dedicated trackers (current backlog)
+## Dedicated-tracker table retired (frozen; not a live backlog)
 
-**Last reconciled:** 2026-08-06 (issue #3627; verified against `origin/main`).
+The 2026-08-06 dedicated-tracker table that presented itself as a current
+backlog is retired. Those rows are recorded as Implemented above. This file
+is not a live tracker and is not reconciled against GitHub on an ongoing
+basis.
 
-| Residual | Issue(s) | Notes |
-|---|---|---|
-| Mesh/HBONE/DNS perf baseline publication | [#3332](https://github.com/ferrum-edge/ferrum-edge/issues/3332) | Harnesses exist; `baseline.md` tables still `_TBD_` |
-| Live OIDC / OAuth2 introspection coverage | [#3333](https://github.com/ferrum-edge/ferrum-edge/issues/3333) | |
-| NodeWaypoint observability + promotion gates | [#3334](https://github.com/ferrum-edge/ferrum-edge/issues/3334) | |
-| Vendored-patch upstream filing / retirement | `docs/vendored-patch-lifecycle.json` + weekly `dependency-audit` | Replaces #3335 as the sole tracker |
-| Mesh/SPIRE CA-health signal + startup contract | [#3608](https://github.com/ferrum-edge/ferrum-edge/issues/3608) | |
-| CNI ferrum-cni chaining uninstall/rollback | [#3609](https://github.com/ferrum-edge/ferrum-edge/issues/3609) | Done — ownership-scoped install/uninstall/rollback, chart pre-delete cleanup, hosted Rust+Helm gates, and live kind lifecycle suite |
-| Cross-region CP failover topology | [#3610](https://github.com/ferrum-edge/ferrum-edge/issues/3610) | |
-| CP/K8s authoritative mesh config revision | [#3611](https://github.com/ferrum-edge/ferrum-edge/issues/3611) | |
-| Gateway API port-aware route representation | [#3612](https://github.com/ferrum-edge/ferrum-edge/issues/3612) | Done — `GatewayApiListenerKey` identity, real per-listener socket binding + reload/withdrawal, per-listener cross-kind retention, and `Conflicted` status for same-port incompatible-shape refusals |
-| OIDC RP pending login state (HA) | [#3613](https://github.com/ferrum-edge/ferrum-edge/issues/3613) | |
-| `ai_stream_router` Anthropic multimodal content | [#3616](https://github.com/ferrum-edge/ferrum-edge/issues/3616) | |
-| TCP outbound PROXY protocol v2 | [#3618](https://github.com/ferrum-edge/ferrum-edge/issues/3618) | |
-| TCP/kTLS kernel splice (frontend-TLS relay) | [#3619](https://github.com/ferrum-edge/ferrum-edge/issues/3619) | |
-| HTTP/3 plain-HTTP/WebSocket to mesh-tagged targets | [#3620](https://github.com/ferrum-edge/ferrum-edge/issues/3620) | |
-| Direct-H2 in-path body-size limits | [#3622](https://github.com/ferrum-edge/ferrum-edge/issues/3622) | |
-| Admin read-only write audit logging | [#3623](https://github.com/ferrum-edge/ferrum-edge/issues/3623) | |
-| Env-only reads ignoring `ferrum.conf` | [#3624](https://github.com/ferrum-edge/ferrum-edge/issues/3624) | |
-| Gateway SVID auto-refresh (external/inline) | [#3625](https://github.com/ferrum-edge/ferrum-edge/issues/3625) | |
+As of the 2026-08-18 residual-map reconcile, leftover OPEN residuals live only
+on [`PRODUCTION_READINESS.md`](../../PRODUCTION_READINESS.md): mesh/HBONE/DNS
+baseline publication ([#3332](https://github.com/ferrum-edge/ferrum-edge/issues/3332);
+harnesses exist, `baseline.md` tables still `_TBD_`) and the 2026-08-15 scheduled
+scaling CI tracker ([#3892](https://github.com/ferrum-edge/ferrum-edge/issues/3892);
+PR #3895 in flight).
 
 ## Documented deferrals without a dedicated issue (in-place docs)
 

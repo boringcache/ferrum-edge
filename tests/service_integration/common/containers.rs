@@ -10,7 +10,9 @@
 //! LocalStack): when Docker is not available the `start_*` helpers return
 //! `Err`, and callers print a skip notice and return rather than fail — except
 //! in CI, where a container that fails to start is a hard failure (see
-//! [`fail_in_ci_else_skip`]).
+//! [`fail_in_ci_else_skip`]). Host ports are pinned outside the kernel
+//! ephemeral range and start is retried only on bind collisions (see
+//! [`super::host_ports`]).
 
 #![allow(dead_code)] // helpers are used selectively per backend module
 
@@ -19,6 +21,8 @@ use std::time::Duration;
 use testcontainers::core::{ExecCommand, IntoContainerPort};
 use testcontainers::runners::AsyncRunner;
 use testcontainers::{ContainerAsync, GenericImage, ImageExt};
+
+use super::host_ports::{allocate_host_port, retry_on_host_port_collision};
 
 pub type BoxError = Box<dyn std::error::Error + Send + Sync>;
 
@@ -57,13 +61,18 @@ pub struct ConsulContainer {
 /// startup log line, so the helper does not depend on which stream Consul logs
 /// to.
 pub async fn start_consul_dev_container() -> Result<ConsulContainer, BoxError> {
-    let container = GenericImage::new("hashicorp/consul", "1.19")
-        .with_exposed_port(8500.tcp())
-        .with_cmd(["agent", "-dev", "-client", "0.0.0.0"])
-        .start()
-        .await?;
+    let (container, port) = retry_on_host_port_collision(|| async {
+        let host_port = allocate_host_port()?;
+        let container = GenericImage::new("hashicorp/consul", "1.19")
+            .with_exposed_port(8500.tcp())
+            .with_mapped_port(host_port, 8500.tcp())
+            .with_cmd(["agent", "-dev", "-client", "0.0.0.0"])
+            .start()
+            .await?;
+        Ok((container, host_port))
+    })
+    .await?;
 
-    let port = container.get_host_port_ipv4(8500.tcp()).await?;
     let addr = format!("http://127.0.0.1:{port}");
     let client = reqwest::Client::new();
 
@@ -137,21 +146,24 @@ pub struct OpenLdapContainer {
 /// (people, groups) is added afterwards via [`OpenLdapContainer::seed_ldif`] so
 /// every DN, password, and group membership is controlled by the test.
 pub async fn start_openldap_container() -> Result<OpenLdapContainer, BoxError> {
-    let container = GenericImage::new("osixia/openldap", "1.5.0")
-        .with_exposed_port(LDAP_CONTAINER_PORT.tcp())
-        // Readiness is confirmed by `seed_ldif`, which retries `ldapadd` until
-        // the final slapd is answering on TCP — so we do not have to match a
-        // startup log line/stream or race the first-boot bootstrap (which only
-        // serves the bootstrap directory over a private socket).
-        .with_env_var("LDAP_ORGANISATION", "Ferrum Test")
-        .with_env_var("LDAP_DOMAIN", "example.org")
-        .with_env_var("LDAP_ADMIN_PASSWORD", LDAP_ADMIN_PASSWORD)
-        .start()
-        .await?;
+    let (container, port) = retry_on_host_port_collision(|| async {
+        let host_port = allocate_host_port()?;
+        let container = GenericImage::new("osixia/openldap", "1.5.0")
+            .with_exposed_port(LDAP_CONTAINER_PORT.tcp())
+            .with_mapped_port(host_port, LDAP_CONTAINER_PORT.tcp())
+            // Readiness is confirmed by `seed_ldif`, which retries `ldapadd` until
+            // the final slapd is answering on TCP — so we do not have to match a
+            // startup log line/stream or race the first-boot bootstrap (which only
+            // serves the bootstrap directory over a private socket).
+            .with_env_var("LDAP_ORGANISATION", "Ferrum Test")
+            .with_env_var("LDAP_DOMAIN", "example.org")
+            .with_env_var("LDAP_ADMIN_PASSWORD", LDAP_ADMIN_PASSWORD)
+            .start()
+            .await?;
+        Ok((container, host_port))
+    })
+    .await?;
 
-    let port = container
-        .get_host_port_ipv4(LDAP_CONTAINER_PORT.tcp())
-        .await?;
     let url = format!("ldap://127.0.0.1:{port}");
 
     Ok(OpenLdapContainer {
@@ -250,22 +262,14 @@ impl ExecOutput {
 
 /// A single-node Redpanda broker with a host-routable Kafka listener.
 ///
-/// Advertised listeners need the host-mapped port up front, so the helper binds
-/// an ephemeral local port, pins that mapping, and advertises
-/// `127.0.0.1:<host-port>` on the external Kafka listener. Readiness is polled
-/// via librdkafka metadata (not a log line).
+/// Advertised listeners need the host-mapped port up front, so the helper
+/// allocates a host port outside the kernel ephemeral range, pins that mapping,
+/// and advertises `127.0.0.1:<host-port>` on the external Kafka listener.
+/// Readiness is polled via librdkafka metadata (not a log line).
 pub struct RedpandaContainer {
     container: ContainerAsync<GenericImage>,
     /// `127.0.0.1:<mapped-port>` — pass as `kafka_logging.broker_list`.
     pub bootstrap: String,
-}
-
-/// Bind an ephemeral localhost TCP port for a deterministic host→container map.
-pub fn free_localhost_port() -> Result<u16, BoxError> {
-    let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
-    let port = listener.local_addr()?.port();
-    drop(listener);
-    Ok(port)
 }
 
 /// Start a single-node Redpanda with auto-topic-create disabled.
@@ -273,34 +277,38 @@ pub fn free_localhost_port() -> Result<u16, BoxError> {
 /// Disabling auto-create keeps unknown-topic rejection deterministic for the
 /// real-broker acceptance suite.
 pub async fn start_redpanda_container() -> Result<RedpandaContainer, BoxError> {
-    let host_port = free_localhost_port()?;
-    let advertise = format!("internal://127.0.0.1:9092,external://127.0.0.1:{host_port}");
+    let (container, host_port) = retry_on_host_port_collision(|| async {
+        let host_port = allocate_host_port()?;
+        let advertise = format!("internal://127.0.0.1:9092,external://127.0.0.1:{host_port}");
 
-    let container = GenericImage::new("redpandadata/redpanda", "v24.2.4")
-        .with_exposed_port(9093.tcp())
-        .with_mapped_port(host_port, 9093.tcp())
-        .with_cmd([
-            "redpanda".to_string(),
-            "start".to_string(),
-            "--overprovisioned".to_string(),
-            "--smp".to_string(),
-            "1".to_string(),
-            "--memory".to_string(),
-            "512M".to_string(),
-            "--reserve-memory".to_string(),
-            "0M".to_string(),
-            "--node-id".to_string(),
-            "0".to_string(),
-            "--check=false".to_string(),
-            "--kafka-addr".to_string(),
-            "internal://0.0.0.0:9092,external://0.0.0.0:9093".to_string(),
-            "--advertise-kafka-addr".to_string(),
-            advertise,
-            "--set".to_string(),
-            "redpanda.auto_create_topics_enabled=false".to_string(),
-        ])
-        .start()
-        .await?;
+        let container = GenericImage::new("redpandadata/redpanda", "v24.2.4")
+            .with_exposed_port(9093.tcp())
+            .with_mapped_port(host_port, 9093.tcp())
+            .with_cmd([
+                "redpanda".to_string(),
+                "start".to_string(),
+                "--overprovisioned".to_string(),
+                "--smp".to_string(),
+                "1".to_string(),
+                "--memory".to_string(),
+                "512M".to_string(),
+                "--reserve-memory".to_string(),
+                "0M".to_string(),
+                "--node-id".to_string(),
+                "0".to_string(),
+                "--check=false".to_string(),
+                "--kafka-addr".to_string(),
+                "internal://0.0.0.0:9092,external://0.0.0.0:9093".to_string(),
+                "--advertise-kafka-addr".to_string(),
+                advertise,
+                "--set".to_string(),
+                "redpanda.auto_create_topics_enabled=false".to_string(),
+            ])
+            .start()
+            .await?;
+        Ok((container, host_port))
+    })
+    .await?;
 
     let bootstrap = format!("127.0.0.1:{host_port}");
     wait_redpanda_ready(&bootstrap).await?;

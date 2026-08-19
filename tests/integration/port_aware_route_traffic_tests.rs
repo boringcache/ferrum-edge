@@ -826,10 +826,9 @@ async fn listener_admission_is_generation_bound_before_reconcile_acknowledgement
 /// An HTTP↔HTTPS class flip must never leave the retiring plaintext accept
 /// loops running beside the new TLS ones.
 ///
-/// With `FERRUM_ACCEPT_THREADS > 1` every accept loop binds the same port
-/// through `SO_REUSEPORT`, so an overlap lets the kernel hand new connections
-/// to whichever generation it likes — plaintext or TLS. Once `reconcile()`
-/// returns, the plaintext generation must be gone.
+/// Extra accept workers share one exclusive listen socket, so a replacement
+/// bind would fail with EADDRINUSE until the old generation closes. Once
+/// `reconcile()` returns, the plaintext generation must be gone.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn an_http_to_https_class_flip_retires_the_plaintext_accept_loops_first() {
     use ferrum_edge::dns::{DnsCache, DnsConfig};
@@ -841,7 +840,7 @@ async fn an_http_to_https_class_flip_retires_the_plaintext_accept_loops_first() 
     let listener_port = reserve_free_port().await;
 
     let mut env = test_env_config(0, 0);
-    // The whole point: several SO_REUSEPORT accept loops per listener.
+    // Several duplicated exclusive-listen accept loops per listener.
     env.accept_threads = 4;
 
     let plaintext = config_with(vec![port_scoped_proxy(

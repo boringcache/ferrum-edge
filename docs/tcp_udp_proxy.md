@@ -1315,9 +1315,9 @@ Stream proxy connections track:
 - Connection errors
 - UDP `hook_ingress_drops` (listener counter): client→backend datagrams dropped when a session's bounded `on_udp_datagram` ingress queue is full or closed (fail closed; see [UDP Session Management](#udp-session-management))
 
-## TCP SO_REUSEPORT Accept-Loop Supervision
+## TCP Accept-Loop Supervision
 
-When `FERRUM_ACCEPT_THREADS > 1`, a TCP stream listener binds multiple sockets on the same address via `SO_REUSEPORT` and runs one accept loop per socket. Those loops are peer components of a single listener:
+When `FERRUM_ACCEPT_THREADS > 1`, a TCP stream listener binds **one exclusive** listen socket and duplicates that fd for extra accept workers (never `SO_REUSEPORT`; issue #3924). Those loops are peer components of a single listener:
 
 - Unexpected exit of any loop (ordinary error, panic, or unexpected cancellation) is observed immediately while the listener is live.
 - Failure policy is atomic: sibling loops are cancelled (and aborted if they ignore cancel), `started` is cleared, and the listener task returns a failure to `StreamListenerManager` so reconcile/readiness owners see the outage via the existing async bind-failure path rather than silently reduced accept capacity.

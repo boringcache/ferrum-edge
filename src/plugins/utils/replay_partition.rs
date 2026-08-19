@@ -35,15 +35,15 @@
 //!   ([`append_request_context_partition`]). Only hop-by-hop/framing fields
 //!   Ferrum provably regenerates are excluded; tracing and correlation headers
 //!   reach the origin and are bound. The shared HTTP cache
-//!   ([`append_response_cache_request_partition`]) excludes only the entry-
+//!   ([`append_response_cache_request_partition`]) excludes the entry-
 //!   operation headers whose semantics `response_caching` actually implements
 //!   (`If-None-Match`, `If-Modified-Since`, pure honored request
 //!   `Cache-Control: no-cache` / `no-store` refreshes with no arguments when
 //!   `respect_no_cache` is enabled, and single-field zero-length
-//!   `Content-Length`) while
-//!   conservatively binding every other representation and policy dimension,
-//!   including headers absent from `Vary`. Mixed Cache-Control members and
-//!   Cache-Control under `respect_no_cache: false` stay bound.
+//!   `Content-Length`) and, separately, a gateway-minted correlation header
+//!   whose current value still matches private request provenance (issue
+//!   #3929). Client-supplied correlation values stay bound. Mixed Cache-Control
+//!   members and Cache-Control under `respect_no_cache: false` stay bound.
 //!
 //! Every component is serialized with typed, length-framed fields
 //! ([`PartitionHasher`]) so no attacker-controlled byte can impersonate a field
@@ -728,6 +728,8 @@ pub fn append_request_context_partition(
 ///   such a refresh) — when `respect_no_cache` is enabled, bypass + store the
 ///   replacement under the same partition as the entry being refreshed
 /// * `Content-Length` — zero-length framing on an otherwise empty GET/HEAD
+/// * a gateway-minted correlation header whose live value still matches
+///   private request provenance (issue #3929)
 ///
 /// Unsupported precondition / cache-directive dimensions (`If-Match`,
 /// `If-Unmodified-Since`, `If-Range`, `Range`, `Pragma`, mixed / arbitrary /
@@ -735,6 +737,12 @@ pub fn append_request_context_partition(
 /// `respect_no_cache` is false) stay bound so they cannot share a replay key
 /// with a request that did not carry them. Labeling unimplemented semantics
 /// as "cache operations" would let a fresh HIT ignore a client precondition.
+///
+/// A gateway-minted correlation header is omitted only when private request
+/// provenance says this instance generated the live value because the client
+/// omitted a valid inbound field. Client-supplied values remain origin-visible
+/// dimensions. This is not a global `x-request-id` exemption and does not read
+/// public metadata.
 pub fn append_response_cache_request_partition(
     hasher: &mut PartitionHasher,
     ctx: &RequestContext,
@@ -743,6 +751,7 @@ pub fn append_response_cache_request_partition(
 ) {
     append_filtered_request_context_partition(hasher, ctx, request_headers, |name, value| {
         is_response_cache_entry_operation_header(name, value, respect_no_cache)
+            || ctx.is_gateway_generated_correlation_header(name, value)
     });
 }
 
