@@ -11,9 +11,7 @@
 //! suite (`scripted_backend_tests.rs`, `scripted_backend_h2_tests.rs`,
 //! `scripted_backend_h3_tests.rs`).
 
-use crate::scaffolding::backends::{
-    HttpStep, ScriptedHttp1Backend, ScriptedTcpBackend, TcpStep,
-};
+use crate::scaffolding::backends::{HttpStep, ScriptedHttp1Backend, ScriptedTcpBackend, TcpStep};
 use crate::scaffolding::file_mode_yaml_for_backend_with;
 use crate::scaffolding::harness::GatewayHarness;
 use crate::scaffolding::ports::reserve_port;
@@ -41,9 +39,7 @@ fn assert_timeout_envelope(elapsed: Duration, timeout_ms: u64) {
 }
 
 fn gateway_error_header(headers: &reqwest::header::HeaderMap) -> Option<&str> {
-    headers
-        .get("x-gateway-error")
-        .and_then(|v| v.to_str().ok())
+    headers.get("x-gateway-error").and_then(|v| v.to_str().ok())
 }
 
 fn timeout_overrides(read_ms: u64, write_ms: u64) -> serde_json::Value {
@@ -64,10 +60,8 @@ async fn in_process_backend_write_timeout_maps_to_504_backend_timeout() {
         .spawn()
         .expect("spawn");
 
-    let yaml = file_mode_yaml_for_backend_with(
-        backend_port,
-        timeout_overrides(8_000, WRITE_TIMEOUT_MS),
-    );
+    let yaml =
+        file_mode_yaml_for_backend_with(backend_port, timeout_overrides(8_000, WRITE_TIMEOUT_MS));
     let harness = GatewayHarness::builder()
         .mode_in_process()
         .file_config(yaml)
@@ -101,8 +95,7 @@ async fn in_process_backend_write_timeout_maps_to_504_backend_timeout() {
         "timeout must carry X-Gateway-Error=backend_timeout, body={body}"
     );
     assert_eq!(
-        body,
-        r#"{"error":"Backend timeout"}"#,
+        body, r#"{"error":"Backend timeout"}"#,
         "timeout body must be timeout-specific"
     );
     assert_timeout_envelope(elapsed, WRITE_TIMEOUT_MS);
@@ -119,10 +112,7 @@ async fn in_process_backend_write_timeout_zero_does_not_504() {
         .spawn()
         .expect("spawn");
 
-    let yaml = file_mode_yaml_for_backend_with(
-        backend_port,
-        timeout_overrides(8_000, 0),
-    );
+    let yaml = file_mode_yaml_for_backend_with(backend_port, timeout_overrides(8_000, 0));
     let harness = GatewayHarness::builder()
         .mode_in_process()
         .file_config(yaml)
@@ -186,10 +176,8 @@ async fn in_process_sse_stall_after_first_event_idles_until_read_timeout() {
         .spawn()
         .expect("spawn");
 
-    let yaml = file_mode_yaml_for_backend_with(
-        backend_port,
-        timeout_overrides(READ_TIMEOUT_MS, 5_000),
-    );
+    let yaml =
+        file_mode_yaml_for_backend_with(backend_port, timeout_overrides(READ_TIMEOUT_MS, 5_000));
     let harness = GatewayHarness::builder()
         .mode_in_process()
         .file_config(yaml)
@@ -230,15 +218,12 @@ async fn in_process_sse_stall_after_first_event_idles_until_read_timeout() {
     );
 
     let stall_started = Instant::now();
-    let rest = tokio::time::timeout(
-        Duration::from_secs(5),
-        async {
-            while let Some(item) = stream.next().await {
-                item?;
-            }
-            Ok::<(), reqwest::Error>(())
-        },
-    )
+    let rest = tokio::time::timeout(Duration::from_secs(5), async {
+        while let Some(item) = stream.next().await {
+            item?;
+        }
+        Ok::<(), reqwest::Error>(())
+    })
     .await;
     let stall_elapsed = stall_started.elapsed();
     match rest {
@@ -271,10 +256,8 @@ async fn in_process_progressing_sse_is_not_killed_by_idle_read_timeout() {
         .spawn()
         .expect("spawn");
 
-    let yaml = file_mode_yaml_for_backend_with(
-        backend_port,
-        timeout_overrides(READ_TIMEOUT_MS, 5_000),
-    );
+    let yaml =
+        file_mode_yaml_for_backend_with(backend_port, timeout_overrides(READ_TIMEOUT_MS, 5_000));
     let harness = GatewayHarness::builder()
         .mode_in_process()
         .file_config(yaml)
@@ -319,10 +302,7 @@ async fn in_process_sse_read_timeout_zero_stays_open_past_watermark() {
         .spawn()
         .expect("spawn");
 
-    let yaml = file_mode_yaml_for_backend_with(
-        backend_port,
-        timeout_overrides(0, 5_000),
-    );
+    let yaml = file_mode_yaml_for_backend_with(backend_port, timeout_overrides(0, 5_000));
     let harness = GatewayHarness::builder()
         .mode_in_process()
         .file_config(yaml)
@@ -352,8 +332,7 @@ async fn in_process_sse_read_timeout_zero_stays_open_past_watermark() {
         "first event missing from {first:?}"
     );
 
-    let next = tokio::time::timeout(Duration::from_millis(1_500), stream.next())
-    .await;
+    let next = tokio::time::timeout(Duration::from_millis(1_500), stream.next()).await;
     assert!(
         next.is_err(),
         "backend_read_timeout_ms=0 must keep the SSE stream open past 800ms; \

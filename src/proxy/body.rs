@@ -2073,11 +2073,8 @@ impl UploadSource {
         }
         match std::mem::replace(self, UploadSource::Exhausted) {
             UploadSource::Direct(incoming) if !http_body::Body::is_end_stream(&incoming) => {
-                let (source, join) = crate::proxy::upload_pump::spawn_upload_pump(
-                    incoming,
-                    plan,
-                    write_timeout_ms,
-                );
+                let (source, join) =
+                    crate::proxy::upload_pump::spawn_upload_pump(incoming, plan, write_timeout_ms);
                 *self = UploadSource::Pumped(source);
                 Some(join)
             }
@@ -4199,10 +4196,7 @@ where
     B: http_body::Body<Data = Bytes, Error = BoxError> + Send + Unpin + 'static,
 {
     if read_timeout_ms > 0 {
-        ProxyBody::streaming(Box::pin(IdleReadTimeoutBody::new(
-            body,
-            read_timeout_ms,
-        )))
+        ProxyBody::streaming(Box::pin(IdleReadTimeoutBody::new(body, read_timeout_ms)))
     } else {
         ProxyBody::streaming(Box::pin(body))
     }
@@ -4316,9 +4310,8 @@ pub(crate) async fn run_response_inspection(
     let mut stream = response.bytes_stream();
     let mut total_received: usize = 0;
     let read_timeout_active = read_timeout_ms > 0;
-    let read_deadline = tokio::time::sleep(std::time::Duration::from_millis(
-        read_timeout_ms.max(1),
-    ));
+    let read_deadline =
+        tokio::time::sleep(std::time::Duration::from_millis(read_timeout_ms.max(1)));
     tokio::pin!(read_deadline);
     loop {
         // Watch for client disconnect WHILE awaiting the next backend chunk: an
@@ -4332,8 +4325,7 @@ pub(crate) async fn run_response_inspection(
         // time is not charged against `backend_read_timeout_ms`.
         if read_timeout_active {
             read_deadline.as_mut().reset(
-                tokio::time::Instant::now()
-                    + std::time::Duration::from_millis(read_timeout_ms),
+                tokio::time::Instant::now() + std::time::Duration::from_millis(read_timeout_ms),
             );
         }
         let chunk = tokio::select! {

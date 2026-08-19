@@ -3463,12 +3463,7 @@ async fn h2_reqwest_backend_write_timeout_maps_to_504() {
         .expect("spawn");
 
     let write_timeout_ms: u64 = 800;
-    let yaml = http_timeout_access_log_yaml(
-        backend_port,
-        8_000,
-        write_timeout_ms,
-        Value::Null,
-    );
+    let yaml = http_timeout_access_log_yaml(backend_port, 8_000, write_timeout_ms, Value::Null);
     let harness = GatewayHarness::builder()
         .file_config(yaml)
         .log_level("info")
@@ -3611,12 +3606,7 @@ async fn h2_reqwest_sse_stall_after_first_event_classifies_read_write_timeout() 
         .expect("spawn");
 
     let read_timeout_ms: u64 = 800;
-    let yaml = http_timeout_access_log_yaml(
-        backend_port,
-        read_timeout_ms,
-        5_000,
-        Value::Null,
-    );
+    let yaml = http_timeout_access_log_yaml(backend_port, read_timeout_ms, 5_000, Value::Null);
     let harness = GatewayHarness::builder()
         .file_config(yaml)
         .log_level("info")
@@ -3658,9 +3648,7 @@ async fn h2_reqwest_sse_stall_after_first_event_classifies_read_write_timeout() 
     .await;
     let stall_elapsed = stall_started.elapsed();
     match rest {
-        Ok(Ok(())) => panic!(
-            "H2 SSE stall closed cleanly; stall_elapsed={stall_elapsed:?}"
-        ),
+        Ok(Ok(())) => panic!("H2 SSE stall closed cleanly; stall_elapsed={stall_elapsed:?}"),
         Ok(Err(_)) | Err(_) => {
             assert_timeout_envelope(stall_elapsed, read_timeout_ms);
         }
@@ -3756,9 +3744,7 @@ async fn h2_direct_sse_stall_after_first_event_classifies_read_write_timeout() {
     .await;
     let stall_elapsed = stall_started.elapsed();
     match rest {
-        Ok(Ok(())) => panic!(
-            "direct-H2 SSE stall closed cleanly; stall_elapsed={stall_elapsed:?}"
-        ),
+        Ok(Ok(())) => panic!("direct-H2 SSE stall closed cleanly; stall_elapsed={stall_elapsed:?}"),
         Ok(Err(_)) | Err(_) => {
             assert_timeout_envelope(stall_elapsed, read_timeout_ms);
         }

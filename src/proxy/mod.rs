@@ -40479,12 +40479,7 @@ async fn eager_collect_charged_backend_body(
     .map_err(EagerRetainFailure::Retain)?;
     let mut stream = response.bytes_stream();
     loop {
-        let chunk = match next_reqwest_chunk_idle(
-            &mut stream,
-            read_timeout_ms,
-        )
-        .await
-        {
+        let chunk = match next_reqwest_chunk_idle(&mut stream, read_timeout_ms).await {
             Ok(Some(chunk)) => chunk,
             Ok(None) => break,
             Err(()) => return Err(EagerRetainFailure::ReadTimeout),
@@ -40579,13 +40574,10 @@ fn buffered_backend_response_from_eager_collect(
             }
         }
         Err(EagerRetainFailure::ReadTimeout) => {
-            let (status_code, body) = http_backend_failure_status_and_body(
-                retry::ErrorClass::ReadWriteTimeout,
-            );
+            let (status_code, body) =
+                http_backend_failure_status_and_body(retry::ErrorClass::ReadWriteTimeout);
             warn!(
-                error_kind = retry::error_class_log_kind(
-                    retry::ErrorClass::ReadWriteTimeout
-                ),
+                error_kind = retry::error_class_log_kind(retry::ErrorClass::ReadWriteTimeout),
                 "Backend response body read timed out while buffering"
             );
             retry::BackendResponse {
@@ -43257,11 +43249,7 @@ async fn proxy_to_backend(
                 let collected = match collect_response_under_authorization(
                     request_ctx.grpc_deadline_at(),
                     send_auth_deadline.as_ref(),
-                    collect_response_with_limit(
-                        response,
-                        max_size,
-                        proxy.backend_read_timeout_ms,
-                    ),
+                    collect_response_with_limit(response, max_size, proxy.backend_read_timeout_ms),
                 )
                 .await
                 {
@@ -43390,11 +43378,7 @@ async fn proxy_to_backend(
                 let collected = match collect_response_under_authorization(
                     request_ctx.grpc_deadline_at(),
                     send_auth_deadline.as_ref(),
-                    collect_response_with_limit(
-                        response,
-                        max_size,
-                        proxy.backend_read_timeout_ms,
-                    ),
+                    collect_response_with_limit(response, max_size, proxy.backend_read_timeout_ms),
                 )
                 .await
                 {
@@ -43572,9 +43556,8 @@ impl BufferedCollectFailure {
     }
 
     fn read_timeout() -> Self {
-        let (status_code, body) = http_backend_failure_status_and_body(
-            retry::ErrorClass::ReadWriteTimeout,
-        );
+        let (status_code, body) =
+            http_backend_failure_status_and_body(retry::ErrorClass::ReadWriteTimeout);
         Self {
             status_code,
             body: body.as_bytes().to_vec(),
@@ -43624,12 +43607,7 @@ async fn collect_response_with_limit(
     );
     let mut stream = response.bytes_stream();
     loop {
-        let chunk_result = match next_reqwest_chunk_idle(
-            &mut stream,
-            read_timeout_ms,
-        )
-        .await
-        {
+        let chunk_result = match next_reqwest_chunk_idle(&mut stream, read_timeout_ms).await {
             Ok(Some(chunk)) => chunk,
             Ok(None) => break,
             Err(()) => return Err(BufferedCollectFailure::read_timeout()),
@@ -43672,12 +43650,7 @@ where
     if read_timeout_ms == 0 {
         return Ok(stream.next().await);
     }
-    match tokio::time::timeout(
-        Duration::from_millis(read_timeout_ms),
-        stream.next(),
-    )
-    .await
-    {
+    match tokio::time::timeout(Duration::from_millis(read_timeout_ms), stream.next()).await {
         Ok(item) => Ok(item),
         Err(_) => Err(()),
     }
@@ -49586,11 +49559,8 @@ async fn proxy_to_backend_http2(
         // `upload_auth_deadline.is_some()`). A live write timeout still
         // installs the pump so an unauthenticated upload cannot hang when
         // the backend never reads.
-        let (body, upload_pump) = install_streaming_upload_authorization(
-            body,
-            None,
-            proxy.backend_write_timeout_ms,
-        );
+        let (body, upload_pump) =
+            install_streaming_upload_authorization(body, None, proxy.backend_write_timeout_ms);
         (
             body,
             None,

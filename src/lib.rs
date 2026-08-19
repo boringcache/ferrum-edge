@@ -9008,11 +9008,7 @@ pub mod _test_support {
                 receiver,
                 released: std::sync::Arc::clone(&released),
             };
-            let (source, join) = crate::proxy::upload_pump::spawn_upload_pump(
-                body,
-                Some(plan),
-                0,
-            );
+            let (source, join) = crate::proxy::upload_pump::spawn_upload_pump(body, Some(plan), 0);
             Self {
                 feed: Some(feed),
                 source: Some(source),

@@ -174,10 +174,7 @@ pub(crate) const fn upload_pump_error_message(outcome: UploadPumpOutcome) -> &'s
 fn pump_terminal_error(outcome: UploadPumpOutcome) -> BoxError {
     let message = upload_pump_error_message(outcome);
     if outcome == UploadPumpOutcome::WriteTimeout {
-        Box::new(std::io::Error::new(
-            std::io::ErrorKind::TimedOut,
-            message,
-        ))
+        Box::new(std::io::Error::new(std::io::ErrorKind::TimedOut, message))
     } else {
         message.into()
     }
@@ -493,9 +490,7 @@ where
     let mut expiry = Box::pin(tokio::time::sleep_until(
         plan.as_ref()
             .map(|(deadline, _, _)| deadline.at)
-            .unwrap_or_else(|| {
-                tokio::time::Instant::now() + Duration::from_secs(86_400)
-            }),
+            .unwrap_or_else(|| tokio::time::Instant::now() + Duration::from_secs(86_400)),
     ));
     // Per-reserve idle bound. Reset at the start of each capacity wait so a
     // slow-but-progressing upload keeps the watermark fresh. Not polled while

@@ -4988,11 +4988,7 @@ fn has_read_write_timeout_class(logs: &str) -> bool {
         || logs.contains("\\\"error_class\\\":\\\"read_write_timeout\\\"")
 }
 
-fn h3_http_backend_timeout_yaml(
-    port: u16,
-    read_timeout_ms: u64,
-    write_timeout_ms: u64,
-) -> String {
+fn h3_http_backend_timeout_yaml(port: u16, read_timeout_ms: u64, write_timeout_ms: u64) -> String {
     to_file_mode_yaml(&json!({
         "version": "1",
         "proxies": [{
@@ -5035,8 +5031,7 @@ async fn h3_backend_write_timeout_maps_to_504() {
     let write_timeout_ms: u64 = 800;
     let yaml = h3_http_backend_timeout_yaml(backend_port, 8_000, write_timeout_ms);
     let (harness, _ca, https_port) =
-        spawn_h3_harness_with_explicit_https_port_and_config(yaml, false, None)
-            .await;
+        spawn_h3_harness_with_explicit_https_port_and_config(yaml, false, None).await;
     let client = Http3Client::insecure().expect("h3 client");
     let url = format!("https://127.0.0.1:{https_port}/api/twrite");
     let started = Instant::now();
@@ -5104,8 +5099,7 @@ async fn h3_sse_stall_after_first_event_classifies_read_write_timeout() {
     let read_timeout_ms: u64 = 800;
     let yaml = h3_http_backend_timeout_yaml(backend_port, read_timeout_ms, 5_000);
     let (harness, _ca, https_port) =
-        spawn_h3_harness_with_explicit_https_port_and_config(yaml, false, None)
-            .await;
+        spawn_h3_harness_with_explicit_https_port_and_config(yaml, false, None).await;
     let client = Http3Client::insecure().expect("h3 client");
     let url = format!("https://127.0.0.1:{https_port}/api/ssestall");
     let started = Instant::now();
@@ -5162,8 +5156,7 @@ async fn h3_progressing_sse_survives_idle_read_timeout() {
 
     let yaml = h3_http_backend_timeout_yaml(backend_port, 800, 5_000);
     let (_harness, _ca, https_port) =
-        spawn_h3_harness_with_explicit_https_port_and_config(yaml, false, None)
-            .await;
+        spawn_h3_harness_with_explicit_https_port_and_config(yaml, false, None).await;
     let client = Http3Client::insecure().expect("h3 client");
     let url = format!("https://127.0.0.1:{https_port}/api/ssetrickle");
     let resp = client.get(&url).await.expect("progressing SSE");

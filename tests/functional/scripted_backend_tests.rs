@@ -1657,11 +1657,7 @@ async fn h1_backend_write_timeout_maps_to_504_backend_timeout() {
         .expect("spawn");
 
     let write_timeout_ms: u64 = 800;
-    let yaml = file_mode_yaml_with_timeouts_and_access_log(
-        backend_port,
-        8_000,
-        write_timeout_ms,
-    );
+    let yaml = file_mode_yaml_with_timeouts_and_access_log(backend_port, 8_000, write_timeout_ms);
     let harness = GatewayHarness::builder()
         .file_config(yaml)
         .log_level("info")
@@ -1732,11 +1728,7 @@ async fn h1_sse_stall_after_first_event_classifies_read_write_timeout() {
         .expect("spawn");
 
     let read_timeout_ms: u64 = 800;
-    let yaml = file_mode_yaml_with_timeouts_and_access_log(
-        backend_port,
-        read_timeout_ms,
-        5_000,
-    );
+    let yaml = file_mode_yaml_with_timeouts_and_access_log(backend_port, read_timeout_ms, 5_000);
     let harness = GatewayHarness::builder()
         .file_config(yaml)
         .log_level("info")

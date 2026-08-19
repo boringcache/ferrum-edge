@@ -1174,11 +1174,8 @@ async fn collect_reqwest_response_body_with_limit(
         let chunk = if read_timeout_ms == 0 {
             response.chunk().await
         } else {
-            match tokio::time::timeout(
-                Duration::from_millis(read_timeout_ms),
-                response.chunk(),
-            )
-            .await
+            match tokio::time::timeout(Duration::from_millis(read_timeout_ms), response.chunk())
+                .await
             {
                 Ok(chunk) => chunk,
                 Err(_) => {
@@ -3293,12 +3290,7 @@ where
                                         std::io::ErrorKind::TimedOut,
                                         "backend request body write timeout",
                                     )),
-                                    (
-                                        rx,
-                                        reader_finished,
-                                        reader_done_notify,
-                                        write_timed_out,
-                                    ),
+                                    (rx, reader_finished, reader_done_notify, write_timed_out),
                                 ));
                             }
                             if reader_finished.load(Ordering::Acquire) && rx.is_empty() {
@@ -3368,9 +3360,8 @@ where
                         reader_done_notify_for_reader.notify_waiters();
                     };
                     let write_timeout_active = reader_write_timeout_ms > 0;
-                    let write_deadline = tokio::time::sleep(Duration::from_millis(
-                        reader_write_timeout_ms.max(1),
-                    ));
+                    let write_deadline =
+                        tokio::time::sleep(Duration::from_millis(reader_write_timeout_ms.max(1)));
                     tokio::pin!(write_deadline);
                     let mut total: usize = 0;
                     loop {
@@ -3510,9 +3501,8 @@ where
                     tokio::pin!(stream_cancelled);
                     let header_wait_ms = dispatch_proxy.backend_read_timeout_ms;
                     let header_wait_active = header_wait_ms > 0;
-                    let header_wait = tokio::time::sleep(Duration::from_millis(
-                        header_wait_ms.max(1),
-                    ));
+                    let header_wait =
+                        tokio::time::sleep(Duration::from_millis(header_wait_ms.max(1)));
                     tokio::pin!(header_wait);
                     let peer_closed = async {
                         if let Some(signal) = peer_signal.as_ref() {
@@ -3696,8 +3686,7 @@ where
                             bytes_sent,
                         )
                         .await?;
-                        outcome.backend_target =
-                            Some(strip_query_from_backend_url(&current_url));
+                        outcome.backend_target = Some(strip_query_from_backend_url(&current_url));
                         outcome.connection_error = false;
                         outcome.error_class = Some(ErrorClass::ReadWriteTimeout);
                         return Ok(outcome);
@@ -8220,9 +8209,8 @@ where
     let mut client_disconnected = false;
     let mut body_error_class: Option<ErrorClass> = None;
     let read_timeout_active = read_timeout_ms > 0;
-    let read_deadline = tokio::time::sleep(std::time::Duration::from_millis(
-        read_timeout_ms.max(1),
-    ));
+    let read_deadline =
+        tokio::time::sleep(std::time::Duration::from_millis(read_timeout_ms.max(1)));
     tokio::pin!(read_deadline);
     let mut just_received_backend_frame = false;
 
@@ -8269,8 +8257,7 @@ where
     'outer: loop {
         if read_timeout_active && just_received_backend_frame && coalesce_buf.is_empty() {
             read_deadline.as_mut().reset(
-                tokio::time::Instant::now()
-                    + std::time::Duration::from_millis(read_timeout_ms),
+                tokio::time::Instant::now() + std::time::Duration::from_millis(read_timeout_ms),
             );
             just_received_backend_frame = false;
         }
@@ -8484,9 +8471,8 @@ where
     tokio::pin!(auth_deadline_sleep);
     let mut auth_termination: Option<crate::proxy::auth_lifetime::StreamAuthTermination> = None;
     let read_timeout_active = read_timeout_ms > 0;
-    let read_deadline = tokio::time::sleep(std::time::Duration::from_millis(
-        read_timeout_ms.max(1),
-    ));
+    let read_deadline =
+        tokio::time::sleep(std::time::Duration::from_millis(read_timeout_ms.max(1)));
     tokio::pin!(read_deadline);
 
     // The ONE downstream-write seam for this relay (issue #3815) — the same
@@ -8533,8 +8519,7 @@ where
         // time is not charged against `backend_read_timeout_ms`.
         if read_timeout_active {
             read_deadline.as_mut().reset(
-                tokio::time::Instant::now()
-                    + std::time::Duration::from_millis(read_timeout_ms),
+                tokio::time::Instant::now() + std::time::Duration::from_millis(read_timeout_ms),
             );
         }
         // Race the backend chunk against the authorization deadline and the

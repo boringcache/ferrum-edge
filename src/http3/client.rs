@@ -568,20 +568,13 @@ where
     E: std::fmt::Display,
 {
     if backend_write_timeout_ms == 0 {
-        return fut.await.map_err(|e| {
-            H3PoolError::post_wire(anyhow::anyhow!("{op} failed: {e}"))
-        });
+        return fut
+            .await
+            .map_err(|e| H3PoolError::post_wire(anyhow::anyhow!("{op} failed: {e}")));
     }
-    match tokio::time::timeout(
-        Duration::from_millis(backend_write_timeout_ms),
-        fut,
-    )
-    .await
-    {
+    match tokio::time::timeout(Duration::from_millis(backend_write_timeout_ms), fut).await {
         Ok(Ok(value)) => Ok(value),
-        Ok(Err(e)) => Err(H3PoolError::post_wire(anyhow::anyhow!(
-            "{op} failed: {e}"
-        ))),
+        Ok(Err(e)) => Err(H3PoolError::post_wire(anyhow::anyhow!("{op} failed: {e}"))),
         Err(_) => Err(H3PoolError::write_timeout(anyhow::anyhow!(
             "backend request body write timeout after {backend_write_timeout_ms}ms"
         ))),
