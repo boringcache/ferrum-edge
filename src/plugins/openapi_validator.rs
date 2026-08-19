@@ -97,6 +97,10 @@ const SCALAR_CONVERSION_DETAIL: &str = "Unsupported scalar conversion for the su
 /// (`GHSA-5p2h-fq6q-gwh9`). Loggers already record the method and path in their
 /// own dedicated summary fields.
 const UNMATCHED_OPERATION_DETAIL: &str = "No OpenAPI operation matched this request";
+/// Fixed-cardinality title for the unknown-operation class. The request method
+/// and target are not interpolated for the same reasons as
+/// [`UNMATCHED_OPERATION_DETAIL`].
+const UNMATCHED_OPERATION_TITLE: &str = "Unknown OpenAPI operation";
 /// Fixed-cardinality media-refusal diagnostics. Neither echoes the received
 /// `Content-Type` nor any byte of the rejected body.
 const UNDECLARED_MEDIA_DETAIL: &str = "Request Content-Type is not declared for this operation";
@@ -919,7 +923,22 @@ impl OpenapiValidator {
         operation_label: Option<&str>,
         detail: String,
     ) -> PluginResult {
-        self.handle_violation_with_status(ctx, side, operation_label, detail, None)
+        self.handle_violation_with_status(ctx, side, operation_label, detail, None, None)
+    }
+
+    fn handle_unknown_operation_violation(
+        &self,
+        ctx: &mut RequestContext,
+        side: ValidationSide,
+    ) -> PluginResult {
+        self.handle_violation_with_status(
+            ctx,
+            side,
+            None,
+            UNMATCHED_OPERATION_DETAIL.to_string(),
+            None,
+            Some(UNMATCHED_OPERATION_TITLE),
+        )
     }
 
     /// `status_override` selects a protocol-appropriate status for a violation
@@ -942,6 +961,7 @@ impl OpenapiValidator {
         operation_label: Option<&str>,
         detail: String,
         status_override: Option<u16>,
+        title_override: Option<&'static str>,
     ) -> PluginResult {
         self.mark_mode(ctx);
         if let Some(label) = operation_label {
@@ -960,7 +980,7 @@ impl OpenapiValidator {
 
         match self.mode {
             EnforcementMode::Block => {
-                let (status_code, action, title) = match side {
+                let (status_code, action, default_title) = match side {
                     ValidationSide::Request => (
                         status_override.unwrap_or(self.request_error_status),
                         "rejected_request",
@@ -972,6 +992,7 @@ impl OpenapiValidator {
                         "Response body validation failed",
                     ),
                 };
+                let title = title_override.unwrap_or(default_title);
                 ctx.metadata
                     .insert("openapi_validator.action".to_string(), action.to_string());
                 PluginResult::Reject {
@@ -1094,12 +1115,7 @@ impl OpenapiValidator {
                 return PluginResult::Continue;
             }
             if self.fail_on_unknown_operation {
-                return self.handle_violation(
-                    ctx,
-                    ValidationSide::Request,
-                    None,
-                    UNMATCHED_OPERATION_DETAIL.to_string(),
-                );
+                return self.handle_unknown_operation_violation(ctx, ValidationSide::Request);
             }
             self.mark_skip(ctx, "no_match");
             return PluginResult::Continue;
@@ -1146,6 +1162,7 @@ impl OpenapiValidator {
                     MISSING_MEDIA_DETAIL.to_string()
                 },
                 Some(self.request_unsupported_media_status),
+                None,
             );
         }
         let Some(validator) = self.request_validator(operation, content_type) else {
@@ -1221,12 +1238,9 @@ impl Plugin for OpenapiValidator {
                 self.mark_operation(ctx, operation);
                 PluginResult::Continue
             }
-            None if self.fail_on_unknown_operation => self.handle_violation(
-                ctx,
-                ValidationSide::Request,
-                None,
-                UNMATCHED_OPERATION_DETAIL.to_string(),
-            ),
+            None if self.fail_on_unknown_operation => {
+                self.handle_unknown_operation_violation(ctx, ValidationSide::Request)
+            }
             None => {
                 self.mark_skip(ctx, "no_match");
                 PluginResult::Continue
@@ -1401,12 +1415,7 @@ impl Plugin for OpenapiValidator {
         }
         let Some(operation) = self.operation_for_context(ctx) else {
             if self.fail_on_unknown_operation {
-                return self.handle_violation(
-                    ctx,
-                    ValidationSide::Response,
-                    None,
-                    UNMATCHED_OPERATION_DETAIL.to_string(),
-                );
+                return self.handle_unknown_operation_violation(ctx, ValidationSide::Response);
             }
             self.mark_skip(ctx, "no_match");
             return PluginResult::Continue;

@@ -5,7 +5,10 @@ use ferrum_edge::plugins::utils::claim_resolver::{
     extract_claim_string, extract_claim_string_exact, extract_claim_values, parse_claim_path_value,
 };
 use ferrum_edge::plugins::utils::json_escape::escape_json_string;
-use ferrum_edge::plugins::utils::jwt_verifier::peek_unverified_issuer;
+use ferrum_edge::plugins::utils::jwks_store::JwksKeyStore;
+use ferrum_edge::plugins::utils::jwt_verifier::{
+    JwtVerifyParams, peek_unverified_issuer, verify_jwt_with_jwks,
+};
 use ferrum_edge::plugins::utils::query::{
     CanonicalQuery, QueryAmbiguity, canonical_query_for_policy, has_conflicting_duplicate_query_key,
 };
@@ -414,6 +417,99 @@ fn jwt_verifier_peeks_issuer_without_verifying_signature() {
 #[test]
 fn jwt_verifier_malformed_token_has_no_issuer() {
     assert!(peek_unverified_issuer("not.a.jwt.extra").is_none());
+}
+
+fn jwt_verify_params() -> JwtVerifyParams<'static> {
+    JwtVerifyParams {
+        issuer: None,
+        audiences: &[],
+        require_exp: true,
+        leeway_secs: 0,
+        validate_nbf: false,
+    }
+}
+
+fn two_key_store() -> JwksKeyStore {
+    let key1 = super::jwks_auth_support::build_rsa_jwks_from_pem_with_kid(
+        include_bytes!("../../../tests/fixtures/test_rsa_public.pem"),
+        "key-1",
+    );
+    let key2 = super::jwks_auth_support::build_rsa_jwks_from_pem_with_kid(
+        include_bytes!("../../../tests/fixtures/test_rsa_public_other.pem"),
+        "key-2",
+    );
+    let jwks = json!({
+        "keys": [key1["keys"][0].clone(), key2["keys"][0].clone()]
+    });
+    JwksKeyStore::from_inline_jwks(&jwks.to_string()).expect("inline JWKS")
+}
+
+#[tokio::test]
+async fn jwt_verifier_rejects_missing_kid_without_trying_other_keys() {
+    let token = super::jwks_auth_support::create_rs256_token_no_kid(
+        &json!({"sub": "user"}),
+        include_bytes!("../../../tests/fixtures/test_rsa_private.pem"),
+    );
+    assert!(
+        verify_jwt_with_jwks(&token, &two_key_store(), &jwt_verify_params())
+            .await
+            .is_none()
+    );
+}
+
+#[tokio::test]
+async fn jwt_verifier_rejects_empty_kid_without_trying_other_keys() {
+    let token = super::jwks_auth_support::create_rs256_token_with_kid(
+        &json!({"sub": "user"}),
+        include_bytes!("../../../tests/fixtures/test_rsa_private.pem"),
+        "",
+    );
+    assert!(
+        verify_jwt_with_jwks(&token, &two_key_store(), &jwt_verify_params())
+            .await
+            .is_none()
+    );
+}
+
+#[tokio::test]
+async fn jwt_verifier_rejects_unknown_kid_even_when_another_published_key_verifies() {
+    let token = super::jwks_auth_support::create_rs256_token_with_kid(
+        &json!({"sub": "user"}),
+        include_bytes!("../../../tests/fixtures/test_rsa_private.pem"),
+        "no-such-kid",
+    );
+    assert!(
+        verify_jwt_with_jwks(&token, &two_key_store(), &jwt_verify_params())
+            .await
+            .is_none()
+    );
+}
+
+#[tokio::test]
+async fn jwt_verifier_rejects_known_kid_signed_by_a_different_published_key() {
+    let token = super::jwks_auth_support::create_rs256_token_with_kid(
+        &json!({"sub": "user"}),
+        include_bytes!("../../../tests/fixtures/test_rsa_private_other.pem"),
+        "key-1",
+    );
+    assert!(
+        verify_jwt_with_jwks(&token, &two_key_store(), &jwt_verify_params())
+            .await
+            .is_none()
+    );
+}
+
+#[tokio::test]
+async fn jwt_verifier_accepts_matching_kid_and_key() {
+    let token = super::jwks_auth_support::create_rs256_token_with_kid(
+        &json!({"sub": "user"}),
+        include_bytes!("../../../tests/fixtures/test_rsa_private.pem"),
+        "key-1",
+    );
+    let claims = verify_jwt_with_jwks(&token, &two_key_store(), &jwt_verify_params())
+        .await
+        .expect("matching kid must verify");
+    assert_eq!(claims["sub"], "user");
 }
 
 fn ctx_with_header(name: &str, value: &str) -> RequestContext {

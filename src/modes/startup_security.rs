@@ -209,6 +209,21 @@ pub fn load_startup_security_with_scope(
                 try_load_frontend_tls(env_config, policy, &materials.crls)?
             }
         };
+
+        // A DP can intentionally own no frontend server certificate while CP
+        // supplies the Gateway certificate later. On that shape, runtime still
+        // loads and live-reloads the operator-owned client CA / CRL. Exercise
+        // the same refreshable trust-only startup load here so `validate` does
+        // not accept material that `run` will reject (issue #3857).
+        if env_config.mode == OperatingMode::DataPlane
+            && env_config.proxy_https_port != 0
+            && materials.frontend_tls.is_none()
+        {
+            let _ = crate::modes::tls_reload::prepare_dp_operator_client_trust(
+                env_config,
+                &materials.crls,
+            )?;
+        }
     }
 
     if scope.admin_tls {
@@ -224,7 +239,8 @@ pub fn load_startup_security_with_scope(
                     policy,
                     &materials.crls,
                     "Invalid node_agent admin TLS configuration",
-                )?;
+                )?
+                .map(|candidate| candidate.config);
             }
         } else {
             let policy = tls_policy_ref.ok_or_else(|| {
@@ -281,6 +297,54 @@ pub fn try_load_frontend_tls(
     tls_policy: &TlsPolicy,
     crls: &CrlList,
 ) -> Result<Option<Arc<rustls::ServerConfig>>, anyhow::Error> {
+    try_load_frontend_tls_candidate(env_config, tls_policy, crls)
+        .map(|candidate| candidate.map(|candidate| candidate.config))
+}
+
+/// The client-trust binding scope the proxy frontend `ServerConfig` is built
+/// with (issue #3857), or `None` when no generation can ever be published.
+///
+/// Binding a scope installs the live handshake verifier wrapper (which reports
+/// generation-neutral, i.e. empty, CertificateRequest CA-name hints) and
+/// disables TLS 1.3 resumption for mTLS listeners. Both are required once a
+/// withdrawal can land mid-life, and both are pure cost when it cannot.
+///
+/// The predicate is therefore the SAME one `modes::tls_reload` arms on
+/// ([`crate::modes::tls_reload::proxy_frontend_live_reload_can_arm`]), not the
+/// `FERRUM_FRONTEND_TLS_LIVE_RELOAD_ENABLED` flag alone: `prepare_proxy_frontend_tls`
+/// also returns unarmed when no cert/key pair is configured, and when every
+/// watched source is static inline PEM. Binding on the flag alone installed the
+/// wrapper — and so stripped the CertificateRequest CA-name hints a TLS 1.2
+/// client uses to select its certificate — on listeners where no generation
+/// could ever be published. A static mTLS listener keeps its pre-#3857
+/// CertificateRequest hints and session resumption exactly as before.
+fn proxy_frontend_handshake_scope(env_config: &EnvConfig) -> Option<tls::ClientTrustScope> {
+    crate::modes::tls_reload::proxy_frontend_live_reload_can_arm(env_config)
+        .then_some(tls::ClientTrustScope::ProxyFrontend)
+}
+
+/// [`proxy_frontend_handshake_scope`] for the admin HTTPS listener, over the
+/// `FERRUM_ADMIN_TLS_*` sources
+/// ([`crate::modes::tls_reload::admin_frontend_live_reload_can_arm`]). Admin
+/// live reload is governed by the same process-wide opt-in
+/// (`modes::tls_reload::prepare_admin_frontend_tls`) and by the same
+/// cert/key-configured and refreshable-source predicates.
+fn admin_https_handshake_scope(env_config: &EnvConfig) -> Option<tls::ClientTrustScope> {
+    crate::modes::tls_reload::admin_frontend_live_reload_can_arm(env_config)
+        .then_some(tls::ClientTrustScope::AdminHttps)
+}
+
+/// [`try_load_frontend_tls`] that also returns the accepted candidate's
+/// client-certificate verifier and trust identity (issue #3857).
+///
+/// Serving modes that arm a client-trust generation must use this: the baseline
+/// has to be the identity of the load whose `ServerConfig` the listeners
+/// actually serve, not of a later re-read of the same source.
+pub fn try_load_frontend_tls_candidate(
+    env_config: &EnvConfig,
+    tls_policy: &TlsPolicy,
+    crls: &CrlList,
+) -> Result<Option<tls::FrontendTlsCandidate>, anyhow::Error> {
     let (Some(cert_path), Some(key_path)) = (
         &env_config.frontend_tls_cert_path,
         &env_config.frontend_tls_key_path,
@@ -288,7 +352,7 @@ pub fn try_load_frontend_tls(
         return Ok(None);
     };
 
-    tls::load_tls_config_with_client_auth_and_ocsp(
+    tls::load_frontend_tls_candidate_from_paths(
         cert_path,
         key_path,
         env_config.frontend_tls_client_ca_bundle_path.as_deref(),
@@ -297,6 +361,7 @@ pub fn try_load_frontend_tls(
         tls_policy,
         env_config.tls_cert_expiry_warning_days,
         crls,
+        proxy_frontend_handshake_scope(env_config),
     )
     .map(Some)
     .map_err(|e| anyhow::anyhow!("Invalid TLS configuration: {}", e))
@@ -330,6 +395,19 @@ pub fn load_admin_tls_material(
     crls: &CrlList,
     error_label: &str,
 ) -> Result<Arc<rustls::ServerConfig>, anyhow::Error> {
+    load_admin_tls_candidate(env_config, tls_policy, crls, error_label)
+        .map(|candidate| candidate.config)
+}
+
+/// [`load_admin_tls_material`] that also returns the accepted candidate's
+/// client-certificate verifier and trust identity (issue #3857), for callers
+/// that arm the admin client-trust generation.
+pub fn load_admin_tls_candidate(
+    env_config: &EnvConfig,
+    tls_policy: &TlsPolicy,
+    crls: &CrlList,
+    error_label: &str,
+) -> Result<tls::FrontendTlsCandidate, anyhow::Error> {
     let (Some(admin_cert), Some(admin_key)) = (
         &env_config.admin_tls_cert_path,
         &env_config.admin_tls_key_path,
@@ -339,7 +417,7 @@ pub fn load_admin_tls_material(
         ));
     };
 
-    tls::load_tls_config_with_client_auth_and_ocsp(
+    tls::load_frontend_tls_candidate_from_paths(
         admin_cert,
         admin_key,
         env_config.admin_tls_client_ca_bundle_path.as_deref(),
@@ -348,6 +426,7 @@ pub fn load_admin_tls_material(
         tls_policy,
         env_config.tls_cert_expiry_warning_days,
         crls,
+        admin_https_handshake_scope(env_config),
     )
     .map_err(|e| anyhow::anyhow!("{}: {}", error_label, e))
 }
@@ -411,7 +490,7 @@ pub fn load_admin_https_tls_fail_closed(
     tls_policy: &TlsPolicy,
     crls: &CrlList,
     error_label: &str,
-) -> Result<Option<Arc<rustls::ServerConfig>>, anyhow::Error> {
+) -> Result<Option<tls::FrontendTlsCandidate>, anyhow::Error> {
     if env_config.admin_https_port == 0 {
         return Ok(None);
     }
@@ -438,7 +517,7 @@ pub fn load_admin_https_tls_fail_closed(
              missing — both must be configured together"
         )),
         (Some(_), Some(_)) => {
-            load_admin_tls_material(env_config, tls_policy, crls, error_label).map(Some)
+            load_admin_tls_candidate(env_config, tls_policy, crls, error_label).map(Some)
         }
     }
 }
@@ -465,14 +544,18 @@ pub fn plan_admin_https_listener(
         return Ok(AdminHttpsListenerPlan::DisabledByPort);
     }
 
-    let Some(tls_config) =
+    let Some(tls_candidate) =
         load_admin_https_tls_fail_closed(env_config, tls_policy, crls, error_label)?
     else {
         return Ok(AdminHttpsListenerPlan::DisabledByMissingTls);
     };
+    let tls_config = tls_candidate.config;
 
     let reload = crate::modes::tls_reload::prepare_admin_frontend_tls(
         tls_config.clone(),
+        // Baseline from the exact load that produced `tls_config` (issue
+        // #3857), never from a second read of the client-CA source.
+        Some(tls_candidate.client_trust),
         env_config,
         tls_policy,
         crls,

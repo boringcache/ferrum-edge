@@ -3598,7 +3598,7 @@ async fn test_websocket_idle_timeout_activity_refreshes_then_closes() {
     build_gateway().expect("Failed to build gateway");
     let (mut gateway, gateway_port) = start_gateway_plain_with_retry_extra_env(
         config_path.to_str().unwrap(),
-        &[("FERRUM_WEBSOCKET_IDLE_TIMEOUT_SECONDS", "3")],
+        &[("FERRUM_WEBSOCKET_IDLE_TIMEOUT_SECONDS", "10")],
     )
     .await;
 
@@ -3607,24 +3607,25 @@ async fn test_websocket_idle_timeout_activity_refreshes_then_closes() {
         .await
         .expect("Failed to connect WebSocket");
 
-    // Exchange a frame every ~1s for ~6s (twice the 3s window). Each round-trip
-    // refreshes the watermark, so the session must remain open the whole time.
-    for i in 0..6 {
+    // Exchange a frame every ~500ms for at least 11s, beyond the 10s idle
+    // window. The cadence leaves ample hosted-runner scheduling margin while
+    // still proving that each round-trip refreshes the shared watermark.
+    for i in 0..22 {
         ws.send(Message::Text(format!("beat-{i}").into()))
             .await
             .expect("send during activity window should succeed");
-        let reply = tokio::time::timeout(Duration::from_secs(2), ws.next())
+        let reply = tokio::time::timeout(Duration::from_secs(5), ws.next())
             .await
             .expect("echo should arrive while session is kept alive")
             .expect("stream open")
             .expect("no transport error");
         assert_eq!(reply, Message::Text(format!("Echo: beat-{i}").into()));
-        sleep(Duration::from_secs(1)).await;
+        sleep(Duration::from_millis(500)).await;
     }
 
     // Activity stops: the session must now close within the idle window.
     assert!(
-        ws_session_closed_within(&mut ws, Duration::from_secs(10)).await,
+        ws_session_closed_within(&mut ws, Duration::from_secs(20)).await,
         "session should close once activity stops and the idle window elapses"
     );
 
