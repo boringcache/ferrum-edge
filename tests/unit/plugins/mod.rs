@@ -1,5 +1,5 @@
 #[allow(dead_code)]
-mod plugin_utils;
+pub(crate) mod plugin_utils;
 
 mod mesh_route_dispatch_tests;
 

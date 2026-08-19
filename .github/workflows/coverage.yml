@@ -51,6 +51,9 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       mode: ${{ steps.plan.outputs.mode }}
+      shards: ${{ steps.plan.outputs.shards }}
+      shard-matrix: ${{ steps.plan.outputs.shard-matrix }}
+      plugin_gate: ${{ steps.plan.outputs.plugin_gate }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
         with:
@@ -58,6 +61,12 @@ jobs:
 
       - name: Validate coverage planner examples
         run: python3 .github/scripts/coverage_plan.py --self-test
+
+      - name: Validate coverage workflow contract
+        run: |
+          set -euo pipefail
+          python3 .github/scripts/verify_coverage_workflow.py --self-test
+          python3 .github/scripts/verify_coverage_workflow.py
 
       - id: plan
         name: Select coverage mode
@@ -69,7 +78,10 @@ jobs:
 
           if [ "$EVENT_NAME" = "pull_request" ]; then
             base_ref="origin/${BASE_REF}"
-            git diff --name-only --no-renames "${base_ref}...HEAD" > "$changed_files"
+            if ! git diff --name-only --no-renames "${base_ref}...HEAD" > "$changed_files"; then
+              echo "::warning::changed-file diff unavailable; failing closed to full coverage" >&2
+              : > "$changed_files"
+            fi
           elif [ "$EVENT_NAME" = "merge_group" ]; then
             if ! printf '%s' "$MERGE_BASE_SHA" | grep -Eq '^[0-9a-f]{40}$'; then
               echo "::error::merge_group base_sha missing or malformed" >&2
@@ -78,21 +90,29 @@ jobs:
             if ! git cat-file -e "${MERGE_BASE_SHA}^{commit}" 2>/dev/null; then
               git fetch --no-tags origin "${MERGE_BASE_SHA}"
             fi
-            git diff --name-only --no-renames "${MERGE_BASE_SHA}...HEAD" > "$changed_files"
+            if ! git diff --name-only --no-renames "${MERGE_BASE_SHA}...HEAD" > "$changed_files"; then
+              echo "::warning::changed-file diff unavailable; failing closed to full coverage" >&2
+              : > "$changed_files"
+            fi
           fi
 
           plan="$(python3 .github/scripts/coverage_plan.py \
             --event-name "$EVENT_NAME" \
-            --changed-files "$changed_files")"
-          mode="$(printf '%s\n' "$plan" | sed -n 's/^mode=//p')"
-          reason="$(printf '%s\n' "$plan" | sed -n 's/^reason=//p')"
-
-          echo "mode=$mode" >> "$GITHUB_OUTPUT"
+            --changed-files "$changed_files" \
+            --github-output "$GITHUB_OUTPUT")"
+          mode="$(printf '%s\n' "$plan" | sed -n 's/^mode=//p' | head -n1)"
+          reason="$(printf '%s\n' "$plan" | sed -n 's/^reason=//p' | head -n1)"
+          shards="$(printf '%s\n' "$plan" | sed -n 's/^shards=//p' | head -n1)"
+          plugin_gate="$(printf '%s\n' "$plan" | sed -n 's/^plugin_gate=//p' | head -n1)"
 
           {
             echo "## Coverage Plan"
             echo ""
             echo "Mode: **${mode}**"
+            echo ""
+            echo "Shards: \`${shards:-[]}\`"
+            echo ""
+            echo "Plugin gate: **${plugin_gate:-false}**"
             echo ""
             echo "${reason}"
             if [ -s "$changed_files" ]; then
@@ -112,7 +132,7 @@ jobs:
   coverage-shard:
     name: Coverage Shard (${{ matrix.shard }})
     needs: coverage-plan
-    if: needs.coverage-plan.outputs.mode == 'full'
+    if: needs.coverage-plan.outputs.mode != 'skip'
     runs-on: ubuntu-latest
     # A cold/partial-cache lib + unit_tests llvm-cov invocation can exceed the
     # old 45-minute budget even though warm shards normally finish sooner. Keep
@@ -131,90 +151,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        include:
-          - shard: lib-unit
-            kind: lib-unit
-            filters: ""
-          - shard: admin-api
-            kind: integration
-            filters: |
-              integration::admin_api_specs_handler_tests
-              integration::admin_db_api_specs_tests
-              integration::admin_audit_rbac_tests
-              integration::admin_backend_capabilities_tests
-              integration::admin_runtime_metrics_tests
-              integration::admin_observability_auth_tests
-          - shard: admin-config
-            kind: integration
-            filters: |
-              integration::admin_cached_config_tests
-              integration::admin_cross_namespace_refs_tests
-              integration::admin_mesh_config_drift_tests
-              integration::admin_mesh_egress_scope_tests
-              integration::admin_mesh_policy_denies_tests
-              integration::admin_mesh_runtime_overlay_tests
-              integration::admin_mesh_service_graph_tests
-              integration::admin_node_waypoint_identities_tests
-              integration::apply_incremental_outcome_tests
-              integration::log_schema_integration_tests
-              integration::log_schema_registry_tests
-              integration::deferred_log_tests
-          - shard: mesh-routing
-            kind: integration
-            filters: |
-              integration::mesh_l7_routing_tests
-              integration::mesh_l4_weighted_routing_tests
-              integration::mesh_topology_hbone_tests
-              integration::mesh_authz_e2e_tests
-              integration::mesh_authz_negative_match_tests
-              integration::mesh_service_waypoint_tests
-              integration::mesh_ew_egress_e2e_tests
-              integration::mesh_destination_rule_tls_tests
-              integration::mesh_destination_rule_locality_lb_tests
-              integration::mesh_destination_rule_port_policy_tests
-              integration::mesh_dr_service_entry_e2e_tests
-              integration::mesh_sidecar_e2e_tests
-          - shard: mesh-platform
-            kind: integration
-            filters: |
-              integration::k8s_controller_istio_status_cas_tests
-              integration::k8s_controller_istio_status_tests
-              integration::k8s_controller_status_snapshot_tests
-              integration::mesh_telemetry_k8s_provider_lookup_tests
-              integration::mesh_telemetry_tracing_tests
-              integration::mesh_federation_poller_tests
-              integration::mesh_proxy_config_tests
-              integration::mesh_outbound_registry_stream_tests
-              integration::mesh_runtime_overlay_consumers_tests
-              integration::mesh_peer_auth_live_reload_tests
-              integration::mesh_k8s_pod_discovery_tests
-              integration::mesh_hbone_tests
-              integration::mesh_bpf_metrics_scrape_tests
-              integration::cni_tests
-          - shard: protocols-data-plane
-            kind: integration
-            filters: |
-              integration::cp_dp_grpc_tests
-              integration::cp_multi_namespace_tests
-              integration::connection_pool_tests
-              integration::http2_pool_tests
-              integration::http3_integration_tests
-              integration::grpc_proxy_tests
-              integration::scripted_backend_smoke_tests
-              integration::dtls_integration_tests
-              integration::udp_fault_injection_tests
-              integration::backend_mtls_tests
-              integration::backend_tls_san_allow_list_tests
-              integration::frontend_tls_live_reload_tests
-              integration::tcp_frontend_tls_order_tests
-              integration::tcp_fast_path_l4_plugins_tests
-              integration::gateway_hbone_pool_tests
-              integration::gateway_svid_identity_tests
-              integration::graceful_shutdown_tests
-              integration::port_aware_route_traffic_tests
-              integration::db_full_load_snapshot_tests
-              integration::db_incremental_poll_tests
-              integration::db_offline_bootstrap_tests
+        include: ${{ fromJSON(needs.coverage-plan.outputs.shard-matrix) }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
 
@@ -314,7 +251,7 @@ jobs:
         run: exit 1
 
       - name: Fail when coverage mode is invalid
-        if: needs.coverage-plan.result == 'success' && !contains(fromJSON('["skip", "plugin", "full"]'), needs.coverage-plan.outputs.mode)
+        if: needs.coverage-plan.result == 'success' && !contains(fromJSON('["skip", "plugin", "shards", "full"]'), needs.coverage-plan.outputs.mode)
         run: exit 1
 
       - name: Skip coverage for unrelated changes
@@ -325,10 +262,11 @@ jobs:
             echo ""
             echo "No coverage-relevant files changed in this run."
             echo "Full coverage still runs on core source, proto/build-input, pushes to main, manual dispatch, and schedule."
+            echo "Classifiable pull-request and merge-group diffs run lib-unit plus the affected integration shards."
           } >> "$GITHUB_STEP_SUMMARY"
 
-      - name: Fail when full coverage shards fail
-        if: needs.coverage-plan.outputs.mode == 'full' && needs.coverage-shard.result != 'success'
+      - name: Fail when planned coverage shards fail
+        if: needs.coverage-plan.outputs.mode != 'skip' && needs.coverage-shard.result != 'success'
         run: exit 1
 
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
@@ -351,20 +289,8 @@ jobs:
         if: needs.coverage-plan.outputs.mode != 'skip'
         run: rustup component add llvm-tools-preview
 
-      - name: Run PR plugin coverage
-        if: needs.coverage-plan.outputs.mode == 'plugin'
-        run: |
-          set -euo pipefail
-          cargo llvm-cov clean --workspace
-          cargo llvm-cov --no-report \
-            --lib
-          cargo llvm-cov --no-report \
-            --test unit_tests
-        env:
-          RUST_BACKTRACE: 1
-
       - name: Download and extract coverage data
-        if: needs.coverage-plan.outputs.mode == 'full'
+        if: needs.coverage-plan.outputs.mode != 'skip'
         run: |
           set -euo pipefail
           # Each shard tar holds *.profraw plus the instrumented binaries with
@@ -374,10 +300,13 @@ jobs:
           # binary) are identical and simply overwrite. Download/extract one
           # artifact at a time so the runner never has all large shard archives
           # plus their extracted contents on disk simultaneously.
-          artifact_names="$(gh api "/repos/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}/artifacts" \
-            --paginate \
-            --jq '.artifacts[] | select(.name | startswith("coverage-data-")) | .name' \
-            | sort)"
+          #
+          # Only the planner's shard list is downloaded. Leftover coverage-data-*
+          # artifacts from a prior attempt of the same run must not join the
+          # merge, and a skipped/missing planned shard must not green the gate.
+          artifact_names="$(python3 .github/scripts/coverage_plan.py \
+            --emit-artifact-names \
+            --planned-shards "$PLANNED_SHARDS")"
           test -n "$artifact_names"
 
           while IFS= read -r artifact_name; do
@@ -420,6 +349,7 @@ jobs:
           test -n "$(find target/llvm-cov-target -name '*.profraw' -print -quit)"
         env:
           GH_TOKEN: ${{ github.token }}
+          PLANNED_SHARDS: ${{ needs.coverage-plan.outputs.shards }}
 
       - name: Generate coverage reports
         if: needs.coverage-plan.outputs.mode != 'skip'
@@ -496,7 +426,7 @@ jobs:
               --min-overall-line "$MIN_OVERALL_LINE_COVERAGE"
               --min-plugins-line "$MIN_PLUGINS_LINE_COVERAGE"
             )
-          else
+          elif [ "$PLUGIN_GATE" = "true" ]; then
             threshold_args+=(--min-changed-plugins-line "$MIN_CHANGED_PLUGIN_LINE_COVERAGE")
           fi
 
@@ -522,6 +452,7 @@ jobs:
             "${changed_base_args[@]}"
         env:
           COVERAGE_MODE: ${{ needs.coverage-plan.outputs.mode }}
+          PLUGIN_GATE: ${{ needs.coverage-plan.outputs.plugin_gate }}
           EVENT_NAME: ${{ github.event_name }}
           BASE_REF: ${{ github.base_ref }}
           MERGE_BASE_SHA: ${{ github.event.merge_group.base_sha }}
