@@ -106,26 +106,53 @@ overall or plugin coverage still fails the full default-branch gate.
 
 PR coverage is mode-aware:
 
-- Pull requests that touch plugin coverage-relevant files run a single
-  plugin-focused coverage job over `--lib` and `--test unit_tests`, then enforce
-  changed-line coverage for coverable `src/plugins/` lines. This mode is used
-  only when all coverage-relevant changes are plugin-scoped; mixed plugin and
-  core changes run full coverage.
-- Pull requests that touch core coverage-relevant files run the full coverage
-  shard matrix and enforce the overall and `src/plugins/` thresholds. This
-  includes `src/**`, `Cargo.toml`, `Cargo.lock`, `build.rs`, `proto/**`,
-  `ebpf/**`, `.cargo/**`, `rust-toolchain.toml`, and coverage workflow/script
-  changes.
+- Pull requests that touch only plugin coverage-relevant files keep the
+  plugin-specific mode: they run the `lib-unit` shard (`--lib` and
+  `--test unit_tests`) and the merge job reuses that shard's profraw/artifacts
+  instead of re-collecting coverage. The changed-line plugin gate still applies
+  to coverable `src/plugins/` lines. This mode is used only when all
+  coverage-relevant changes are plugin-scoped; mixed plugin and core changes
+  select the affected core shards and still enforce the plugin changed-line
+  gate when plugin files are in the diff.
+- Pull requests that touch classifiable core coverage-relevant files run an
+  explicit shard-scoped plan: `lib-unit` plus only the integration shards that
+  own the changed tree. Isolated trees stay narrow: `src/admin/**` selects the
+  admin-bearing shards, `src/modes/mesh/**` selects the mesh shards, and
+  protocol trees such as `src/http3/**` select the protocol data-plane shard.
+  Shared runtime trees select every integration family they feed rather than an
+  optimistic single shard: `src/config/**`, `src/config_delta.rs`,
+  `src/proxy/**`, `src/dns/**`, `src/grpc/**`, `src/identity/**`, `src/pool/**`,
+  `src/connection_pool.rs`, `src/xds/**`, and `src/modes/control_plane.rs`
+  select the full matrix. `src/tls/**` selects mesh plus protocol shards;
+  file, database, and data-plane mode files select admin plus protocol shards;
+  `src/config_sources/**` selects admin-config plus both mesh shards. The
+  required `Merge Coverage` check verifies that every
+  planned shard succeeded, that exactly those shard artifacts are present, and
+  that reports are still published. Partial shard reports do not enforce the
+  overall or `src/plugins/` floors because those floors are only meaningful on
+  the complete matrix.
 - Pull requests that touch neither plugin nor core coverage-relevant files keep
   the required `Merge Coverage` check as a fast no-op.
-- Pushes to `main`, manual dispatches, and scheduled runs still execute the full
-  coverage shard matrix and enforce the overall and `src/plugins/` thresholds.
+- Push to `main`, `schedule`, `workflow_dispatch`, empty or unavailable diffs,
+  coverage-controller edits, dependency/build-graph inputs (`Cargo.toml`,
+  `Cargo.lock`, `build.rs`, `proto/**`, `ebpf/**`, `.cargo/**`,
+  `rust-toolchain.toml`), unknown coverage-relevant paths, and malformed or
+  hostile changed-path transport fail closed to the full six-shard matrix and
+  still enforce the overall and `src/plugins/` thresholds. Classifiable paths
+  use the conservative repository-relative `[A-Za-z0-9._+@~ /-]` alphabet, so
+  Markdown controls cannot alter the Coverage Plan summary. A skipped planned
+  shard cannot green the merge aggregate.
+- Pushes to `main`, manual dispatches, and scheduled runs therefore keep
+  published main coverage complete and semantically unchanged.
 
 Plugin coverage-relevant paths are `src/plugins/**`, `src/plugin_cache.rs`,
 `tests/unit/plugins/**`,
 and `tests/functional/functional_redis_rate_limiting_test.rs`.
 The authoritative planner lives in `.github/scripts/coverage_plan.py` so the
-workflow and examples use one path decision table. On pull requests and
+workflow and examples use one path decision table. The coverage workflow
+verifier in `.github/scripts/verify_coverage_workflow.py` mechanically checks
+the matrix/aggregate contract, including exact planned shard outcomes, artifact
+presence, and required reporting. On pull requests and
 merge-queue groups, the `Coverage Plan` job collects changed files with
 `git diff --name-only --no-renames` so a rename's source and destination are
 both classified and a move into an irrelevant path cannot suppress a required

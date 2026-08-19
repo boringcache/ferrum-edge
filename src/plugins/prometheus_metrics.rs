@@ -2729,6 +2729,7 @@ impl MetricsRegistry {
         self.append_destination_active_request_prometheus(&mut output);
         self.append_dp_config_freshness_prometheus(&mut output);
         self.append_cp_dp_trust_reload_prometheus(&mut output);
+        self.append_frontend_client_trust_prometheus(&mut output);
         self.append_gateway_trust_retirement_prometheus(&mut output);
         self.append_gateway_listener_status_prometheus(&mut output);
         self.append_k8s_controller_prometheus(&mut output);
@@ -2775,6 +2776,23 @@ impl MetricsRegistry {
             &ns_label,
             crate::grpc::cp_trust_health::snapshot().as_ref(),
         );
+    }
+
+    /// Append the bounded frontend client-CA / CRL trust families (issue #3857).
+    ///
+    /// Kept off the render cache for the same reason as the CP/DP trust
+    /// families: the generation gauge and the retirement counters are the state
+    /// an operator watches DURING a revocation rollout, and a memoized body
+    /// would report a pre-withdrawal generation for up to the cache TTL —
+    /// exactly the window in which "did the CRL take effect?" is the question.
+    /// Emits nothing when no listener scope has accepted client-trust material.
+    fn append_frontend_client_trust_prometheus(&self, output: &mut String) {
+        let ns_label = self
+            .namespace_label
+            .read()
+            .map(|label| label.clone())
+            .unwrap_or_default();
+        crate::tls::client_trust::render_prometheus(output, &ns_label);
     }
 
     /// Append the bounded gateway-trust live-retirement families (issue #3859).
@@ -2995,6 +3013,7 @@ impl MetricsRegistry {
         self.append_destination_active_request_prometheus(&mut output);
         self.append_dp_config_freshness_prometheus(&mut output);
         self.append_cp_dp_trust_reload_prometheus(&mut output);
+        self.append_frontend_client_trust_prometheus(&mut output);
         self.append_gateway_trust_retirement_prometheus(&mut output);
         self.append_gateway_listener_status_prometheus(&mut output);
         self.append_k8s_controller_prometheus(&mut output);

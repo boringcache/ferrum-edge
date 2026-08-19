@@ -12,9 +12,12 @@
 //! frontend client-certificate authentication, because materializing the
 //! connection before the peer's `Certificate` flight would leave
 //! `peer_identity()` unknowable (see [`crate::http3::peer_identity`]).
-//! Session resumption is always enabled (saves 1 RTT on reconnects). Ordinary
-//! listeners use stateless rotating tickets; non-mTLS listeners with early data
-//! enabled use the bounded stateful cache rustls requires for server 0-RTT.
+//! Session resumption is enabled by default (saves 1 RTT on reconnects).
+//! Ordinary listeners use stateless rotating tickets; non-mTLS listeners with
+//! early data enabled use the bounded stateful cache rustls requires for server
+//! 0-RTT. An mTLS listener whose client-trust scope can advance under frontend
+//! live reload disables tickets and the stateful cache so resumption cannot
+//! outlive an accepted client-CA or CRL withdrawal.
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
@@ -377,9 +380,28 @@ pub struct Http3ListenerOptions {
 pub struct Http3FrontendTlsReload {
     /// Shared frontend TLS slot. The proxy HTTPS / H2 / H3 listeners read
     /// from the same slot so they observe the same rotated cert/key pair.
+    ///
+    /// Used only when [`Self::accepted_slot`] is absent — a slot that is not
+    /// fed by an accepted-candidate publisher (tests, or a DP without an
+    /// operator live-reload identity) carries the server config alone.
     pub tls_slot: crate::tls::SharedFrontendTls,
+    /// Accepted-candidate slot (issue #3857). When present this is the ONLY
+    /// thing the reload arm reads: one atomic load yields the `ServerConfig`,
+    /// the client-certificate verifier compiled into it, and the trust identity
+    /// of exactly the client-CA bytes and CRLs behind that verifier.
+    /// Reassembling those from separate reads is what let this listener install
+    /// one verifier and publish a generation describing another.
+    ///
+    /// File/database mode publish this from the operator reload pipeline. DP
+    /// mode publishes a pairing slot: CP server config (while CP material is
+    /// present) plus the latest accepted operator client-trust, as one Arc.
+    pub accepted_slot: Option<crate::tls::SharedAcceptedFrontendTls>,
     /// Revision counter bumped by the file-watch task after every successful
     /// reload. The H3 listener subscribes so it doesn't poll the slot.
+    ///
+    /// The counter is only a wakeup: several accepted revisions may coalesce
+    /// into one notification, so the arm always adopts whatever the accepted
+    /// slot holds *at that moment* and publishes that same value's identity.
     pub revision_rx: tokio::sync::watch::Receiver<u64>,
 }
 
@@ -417,6 +439,66 @@ pub async fn start_http3_listener(
     .await
 }
 
+/// Load the configured client-CA bundle and CRLs into one coherent
+/// [`crate::tls::AcceptedClientTrust`] (issue #3857).
+///
+/// Used only when no accepted candidate is published for this listener (H3
+/// startup, and a DP without an operator live-reload pairing slot). The client-CA
+/// source is read once and the verifier and the identity both come out of that
+/// single read, so what this listener installs and what it publishes always
+/// describe the same anchors and the same revocations.
+fn load_configured_h3_client_trust(
+    client_ca_bundle_path: Option<&str>,
+    client_crls: &CrlList,
+) -> Result<crate::tls::AcceptedClientTrust, anyhow::Error> {
+    match client_ca_bundle_path {
+        // Do NOT interpolate the source into the error: a client CA bundle can
+        // be configured as inline PEM (`CertSource::InlinePem`), so the "path"
+        // may itself be secret material. The inner error already carries the
+        // redacted source id.
+        Some(ca_path) => crate::tls::build_client_cert_verifier_candidate(ca_path, client_crls)
+            .map(|candidate| crate::tls::AcceptedClientTrust {
+                verifier: Some(candidate.verifier),
+                material: candidate.material,
+            })
+            .map_err(|e| {
+                anyhow::anyhow!(
+                    "HTTP/3 mTLS is configured but the client certificate verifier could not \
+                     be built: {}. Refusing to serve HTTP/3 without client authentication.",
+                    e
+                )
+            }),
+        // No verifier means this listener does not enforce the process-global
+        // CRL set. Keep the scope unarmed and do not attempt to summarize
+        // material that cannot affect H3 admission; doing so can make an
+        // otherwise valid non-mTLS H3 listener fail on an irrelevant CRL.
+        None => Ok(crate::tls::AcceptedClientTrust {
+            verifier: None,
+            material: crate::tls::ClientTrustMaterial::default(),
+        }),
+    }
+}
+
+/// Resolve the candidate a reload wakeup should adopt on a listener that has no
+/// accepted-candidate slot (tests, or a DP without operator live-reload pairing).
+///
+/// The client-CA bundle and CRLs are loaded here, once, so the verifier this
+/// listener installs and the identity it publishes still come from a single
+/// read. `Ok(None)` means the slot holds no config and the endpoint should be
+/// disabled; an `Err` means the configured client trust is unusable and the
+/// previous config must be retained.
+fn configured_h3_reload_candidate(
+    slot: Option<&crate::tls::SharedFrontendTls>,
+    client_ca_bundle_path: Option<&str>,
+    client_crls: &CrlList,
+) -> Result<Option<(Arc<rustls::ServerConfig>, crate::tls::AcceptedClientTrust)>, anyhow::Error> {
+    let Some(new_tls) = slot.and_then(|slot| slot.load_full().as_ref().clone()) else {
+        return Ok(None);
+    };
+    let client_trust = load_configured_h3_client_trust(client_ca_bundle_path, client_crls)?;
+    Ok(Some((new_tls, client_trust)))
+}
+
 /// Build a fresh `quinn::ServerConfig` from a rustls server config, the
 /// shared TLS policy, and the H3 transport tuning. Used at startup AND on
 /// every successful frontend TLS cert/key reload.
@@ -424,11 +506,24 @@ pub async fn start_http3_listener(
 /// Forces TLS 1.3 (RFC 9001), carries forward client-cert mTLS if configured,
 /// applies 0-RTT and session-ticket resumption from the gateway policy, and
 /// stamps the H3-only ALPN advertisement.
+///
+/// `client_trust` is the verifier this endpoint will enforce together with the
+/// identity of the material behind it; the caller installs that verifier, then
+/// adopts the returned config, then publishes exactly that identity.
+///
+/// `bind_live_verifier` mirrors "this listener can publish a client-trust
+/// generation at all" — i.e. it has a frontend TLS reload channel, the same
+/// first half of the startup `arm_client_trust` predicate. Only then is the
+/// live handshake wrapper installed (with its deliberately empty, and therefore
+/// generation-neutral, CertificateRequest CA-name hints) and TLS 1.3 resumption
+/// suppressed. Without a reload channel no generation can ever advance, so both
+/// would be pure cost on a static mTLS HTTP/3 listener (issue #3857).
 fn build_h3_quinn_server_config(
     tls_config: &Arc<rustls::ServerConfig>,
     tls_policy: &TlsPolicy,
-    client_ca_bundle_path: Option<&str>,
-    client_crls: &CrlList,
+    client_trust: &crate::tls::AcceptedClientTrust,
+    client_auth_configured: bool,
+    bind_live_verifier: bool,
     h3_config: &Http3ServerConfig,
 ) -> Result<quinn::ServerConfig, anyhow::Error> {
     // HTTP/3 (QUIC) requires TLS 1.3 — rebuild the server config with TLS 1.3 forced.
@@ -492,40 +587,42 @@ fn build_h3_quinn_server_config(
     // Reuse the cert chain and key from the original config.
     // Carry forward mTLS (client cert verification) if configured.
     //
-    // FAIL CLOSED: when a client CA bundle IS configured but the client-cert
-    // verifier cannot be built (missing / unreadable / invalid / empty CA
-    // bundle, or a transient read fault), return an error instead of silently
-    // downgrading to `with_no_client_auth()`. Silently dropping client auth
-    // would let HTTP/3 clients present no certificate to a listener the
-    // operator configured for mTLS. At startup the error aborts the H3
-    // listener; on a frontend TLS reload the caller keeps the previous,
+    // FAIL CLOSED: when a client CA bundle IS configured but the candidate
+    // carries no verifier (missing / unreadable / invalid / empty CA bundle, a
+    // transient read fault, or a snapshot that somehow lost it), return an error
+    // instead of silently downgrading to `with_no_client_auth()`. Silently
+    // dropping client auth would let HTTP/3 clients present no certificate to a
+    // listener the operator configured for mTLS. At startup the error aborts the
+    // H3 listener; on a frontend TLS reload the caller keeps the previous,
     // still-mTLS-protected server config (see the `Err` arm of the reload
     // handler). This mirrors the fail-closed contract of the H1/H2 frontend
     // path (`crate::tls::load_tls_config_with_client_auth*`) and the mesh
-    // inbound verifier — only an explicitly *unconfigured* client CA (the
-    // `else` branch) yields no client auth.
-    let mut server_tls_config = if let Some(ca_path) = client_ca_bundle_path {
-        // Do NOT interpolate `ca_path` into the error: a client CA bundle can be
-        // configured as inline PEM (`CertSource::InlinePem`), so the "path" may
-        // itself be secret material (e.g. a pasted private key in a malformed
-        // bundle). `build_client_cert_verifier` already surfaces the redacted
-        // source id (`CertSource::source_id()` -> `inline-pem:<redacted>`) in
-        // `e`, so the wrapper only adds operator-facing context.
-        let verifier =
-            crate::tls::build_client_cert_verifier(ca_path, client_crls).map_err(|e| {
-                anyhow::anyhow!(
-                    "HTTP/3 mTLS is configured but the client certificate verifier could not \
-                     be built: {}. Refusing to serve HTTP/3 without client authentication.",
-                    e
+    // inbound verifier — only an explicitly *unconfigured* client CA yields no
+    // client auth.
+    let mut server_tls_config = match (client_auth_configured, client_trust.verifier.clone()) {
+        (_, Some(verifier)) => {
+            let installed = if bind_live_verifier {
+                crate::tls::client_trust::bind_live_handshake_verifier(
+                    crate::tls::ClientTrustScope::ProxyH3,
+                    verifier,
                 )
-            })?;
-        h3_builder
-            .with_client_cert_verifier(verifier)
-            .with_cert_resolver(tls_config.cert_resolver.clone())
-    } else {
-        h3_builder
+            } else {
+                verifier
+            };
+            h3_builder
+                .with_client_cert_verifier(installed)
+                .with_cert_resolver(tls_config.cert_resolver.clone())
+        }
+        (true, None) => {
+            return Err(anyhow::anyhow!(
+                "HTTP/3 mTLS is configured but the accepted frontend TLS candidate carries no \
+                 client certificate verifier. Refusing to serve HTTP/3 without client \
+                 authentication."
+            ));
+        }
+        (false, None) => h3_builder
             .with_no_client_auth()
-            .with_cert_resolver(tls_config.cert_resolver.clone())
+            .with_cert_resolver(tls_config.cert_resolver.clone()),
     };
 
     server_tls_config.alpn_protocols = vec![b"h3".to_vec()];
@@ -541,10 +638,8 @@ fn build_h3_quinn_server_config(
     // and the 0.5-RTT application accept path are both disabled. Mapping here
     // keeps startup and live reload fail-closed: quinn rejects any other size,
     // so we never pass the policy's finite aspirational value through.
-    server_tls_config.max_early_data_size = quic_max_early_data_size(
-        tls_policy.early_data_max_size > 0,
-        client_ca_bundle_path.is_some(),
-    );
+    server_tls_config.max_early_data_size =
+        quic_max_early_data_size(tls_policy.early_data_max_size > 0, client_auth_configured);
 
     // Rustls accepts server early data only with stateful resumption, because
     // the stored session record carries the freshness/anti-replay inputs. Keep
@@ -567,6 +662,16 @@ fn build_h3_quinn_server_config(
     }
     server_tls_config.session_storage =
         rustls::server::ServerSessionMemoryCache::new(tls_policy.session_cache_size);
+    if client_trust.verifier.is_some() && bind_live_verifier {
+        // A QUIC session ticket does not re-run client-certificate
+        // verification, so once this listener can publish a withdrawal a
+        // resumed connection must still meet the accepted verifier. A listener
+        // with no reload channel can never publish one, and suppressing
+        // resumption there would only cost every mTLS HTTP/3 client a full
+        // handshake.
+        server_tls_config.send_tls13_tickets = 0;
+        server_tls_config.session_storage = Arc::new(rustls::server::NoServerSessionStorage {});
+    }
 
     let quic_server_config = QuicServerConfig::try_from(server_tls_config)
         .map_err(|e| anyhow::anyhow!("Failed to create QUIC server config: {}", e))?;
@@ -797,7 +902,33 @@ pub async fn start_http3_listener_with_signal(
         .as_ref()
         .is_some_and(|reload| reload.tls_slot.load_full().as_ref().is_none());
 
-    let endpoint = if start_disabled {
+    // Frontend client-certificate authentication is a property of the listener,
+    // not of an individual connection: a client-CA bundle is either configured
+    // for this listener or it is not, at startup and on every reload alike.
+    let client_auth_configured = client_ca_bundle_path.is_some();
+
+    // Whether this listener can ever publish a client-trust generation at all
+    // (issue #3857): only a listener with a frontend TLS reload channel adopts a
+    // later candidate, and that is the first half of the `arm_client_trust`
+    // predicate below. Without it the ProxyH3 scope stays unarmed for the whole
+    // process, so installing the live handshake wrapper (empty CertificateRequest
+    // CA-name hints) and suppressing QUIC resumption would be pure cost.
+    let client_trust_reload_active = frontend_tls_reload.is_some();
+
+    // The client trust the STARTUP endpoint config enforces, loaded coherently
+    // (issue #3857): one read of the client-CA source produces both the verifier
+    // installed below and the identity published for it. `None` in the disabled
+    // branch — nothing is installed there, so there is nothing to describe.
+    let startup_client_trust = if start_disabled {
+        None
+    } else {
+        Some(load_configured_h3_client_trust(
+            client_ca_bundle_path.as_deref(),
+            &client_crls,
+        )?)
+    };
+
+    let (endpoint, adopted_quic) = if start_disabled {
         let socket = std::net::UdpSocket::bind(addr)?;
         socket.set_nonblocking(true)?;
         let runtime = quinn::default_runtime()
@@ -805,13 +936,22 @@ pub async fn start_http3_listener_with_signal(
         let endpoint =
             quinn::Endpoint::new(quinn::EndpointConfig::default(), None, socket, runtime)?;
         info!("HTTP/3 listener started disabled until frontend TLS material is available");
-        endpoint
+        (
+            endpoint,
+            Arc::new(arc_swap::ArcSwap::from_pointee(
+                None::<Arc<quinn::ServerConfig>>,
+            )),
+        )
     } else {
+        let startup_client_trust = startup_client_trust.as_ref().ok_or_else(|| {
+            anyhow::anyhow!("internal error: HTTP/3 startup client trust missing")
+        })?;
         let server_config = build_h3_quinn_server_config(
             &tls_config,
             tls_policy,
-            client_ca_bundle_path.as_deref(),
-            &client_crls,
+            startup_client_trust,
+            client_auth_configured,
+            client_trust_reload_active,
             &h3_config,
         )?;
         // Quinn's `Endpoint::server` convenience constructor is gated on its
@@ -823,12 +963,45 @@ pub async fn start_http3_listener_with_signal(
         socket.set_nonblocking(true)?;
         let runtime = quinn::default_runtime()
             .ok_or_else(|| anyhow::anyhow!("HTTP/3 listener requires a Tokio runtime"))?;
-        quinn::Endpoint::new(
-            quinn::EndpointConfig::default(),
-            Some(server_config),
-            socket,
-            runtime,
-        )?
+        // Fallible bind/build is done. When this scope will be armed, bind the
+        // endpoint without a serving config, then expose `set_server_config`
+        // inside the rustls transaction so verifier, served config, and
+        // generation cannot interleave with a concurrent reload. Binding with
+        // `None` refuses handshakes until that transaction runs — fail-closed,
+        // not a certificate-less serving config.
+        let arm_client_trust =
+            client_trust_reload_active && startup_client_trust.verifier.is_some();
+        if arm_client_trust {
+            let endpoint =
+                quinn::Endpoint::new(quinn::EndpointConfig::default(), None, socket, runtime)?;
+            let adopted_quic = Arc::new(arc_swap::ArcSwap::from_pointee(
+                None::<Arc<quinn::ServerConfig>>,
+            ));
+            if let Some(verifier) = startup_client_trust.verifier.clone() {
+                let adopted_for_expose = Arc::clone(&adopted_quic);
+                crate::tls::client_trust::publish_accepted_rustls_candidate(
+                    crate::tls::ClientTrustScope::ProxyH3,
+                    startup_client_trust.material.clone(),
+                    verifier,
+                    || {
+                        adopted_for_expose.store(Arc::new(Some(Arc::new(server_config.clone()))));
+                        endpoint.set_server_config(Some(server_config.clone()));
+                    },
+                );
+            }
+            (endpoint, adopted_quic)
+        } else {
+            let adopted_quic = Arc::new(arc_swap::ArcSwap::from_pointee(Some(Arc::new(
+                server_config.clone(),
+            ))));
+            let endpoint = quinn::Endpoint::new(
+                quinn::EndpointConfig::default(),
+                Some(server_config),
+                socket,
+                runtime,
+            )?;
+            (endpoint, adopted_quic)
+        }
     };
     let bound_addr = endpoint.local_addr().ok();
     let local_addr = bound_addr.unwrap_or(addr);
@@ -854,13 +1027,9 @@ pub async fn start_http3_listener_with_signal(
     // the same QUIC handshake bound without reading `state.env_config` per-conn.
     // `Duration::ZERO` preserves the documented "0 disables" semantic.
     let handshake_timeout = h3_config.handshake_timeout;
-    // Frontend client-certificate authentication is a property of the listener,
-    // not of an individual connection: `build_h3_quinn_server_config` installs a
-    // client-cert verifier exactly when `client_ca_bundle_path` is set, and the
-    // reload path rebuilds with the same path. When it is set, the 0.5-RTT
-    // accept path is refused for every connection so peer identity is only ever
-    // read after handshake completion (issue #2938).
-    let client_auth_configured = client_ca_bundle_path.is_some();
+    // When client authentication is configured the 0.5-RTT accept path is
+    // refused for every connection so peer identity is only ever read after
+    // handshake completion (issue #2938).
     if client_auth_configured && !state.early_data_methods.is_empty() {
         warn!(
             "HTTP/3 0-RTT is disabled on this listener because frontend mTLS \
@@ -890,16 +1059,24 @@ pub async fn start_http3_listener_with_signal(
     // never wakes — combined with the `reload_active=false` gate the branch
     // is effectively dead.
     let (sentinel_tx, sentinel_rx) = tokio::sync::watch::channel(0u64);
-    let (mut reload_rx, reload_slot, reload_active) = match frontend_tls_reload {
+    let (mut reload_rx, reload_slot, reload_accepted, reload_active) = match frontend_tls_reload {
         Some(Http3FrontendTlsReload {
             tls_slot,
+            accepted_slot,
             revision_rx,
-        }) => (revision_rx, Some(tls_slot), true),
-        None => (sentinel_rx, None, false),
+        }) => (revision_rx, Some(tls_slot), accepted_slot, true),
+        None => (sentinel_rx, None, None, false),
     };
     // Tie the sentinel sender's lifetime to the loop so a `None` reload
     // input cannot accidentally trigger `.changed()` via channel close.
     let _sentinel_tx_keep_alive = sentinel_tx;
+
+    // The H3 client-trust scope is armed from the exact candidate this endpoint
+    // installed (issue #3857), before the accept loop admits its first Initial.
+    // When live reload is enabled the startup transaction above already
+    // published that identity together with `set_server_config`. Without a
+    // reload channel no generation can ever advance, so the scope stays
+    // unarmed.
 
     loop {
         tokio::select! {
@@ -914,6 +1091,7 @@ pub async fn start_http3_listener_with_signal(
                             continue;
                         }
                         let state = Arc::clone(&state);
+                        let adopted_quic = Arc::clone(&adopted_quic);
                         tokio::spawn(async move {
                             let _conn_guard =
                                 crate::overload::ConnectionGuard::new(&state.overload);
@@ -924,6 +1102,7 @@ pub async fn start_http3_listener_with_signal(
                                 frontend_listen_port,
                                 frontend_destination_ip,
                                 client_auth_configured,
+                                adopted_quic,
                             )
                             .await
                             {
@@ -944,11 +1123,53 @@ pub async fn start_http3_listener_with_signal(
                     continue;
                 }
                 let revision = *reload_rx.borrow();
-                let Some(slot) = reload_slot.as_ref() else {
-                    continue;
+                // Resolve ONE candidate: the `ServerConfig` this endpoint is
+                // about to adopt and the client trust it will enforce, as a
+                // single value (issue #3857).
+                //
+                // With an accepted slot this is one atomic load of one `Arc`,
+                // which is what makes the pairing exact under every race the
+                // old code lost: the revision counter can coalesce several
+                // accepted candidates into one wakeup, and the client-CA source
+                // can rotate again between this wakeup and the rebuild. Both are
+                // now harmless — whatever candidate is adopted is the candidate
+                // whose identity is published, and a candidate that arrives
+                // after this load simply wakes the arm again.
+                let adopted = match reload_accepted.as_ref() {
+                    Some(accepted_slot) => accepted_slot
+                        .load_full()
+                        .as_ref()
+                        .clone()
+                        .map(|accepted| (accepted.config.clone(), accepted.client_trust.clone())),
+                    // No accepted candidate is published for this listener; the
+                    // fallback loads the configured client trust coherently.
+                    None => match configured_h3_reload_candidate(
+                        reload_slot.as_ref(),
+                        reload_client_ca_bundle_path.as_deref(),
+                        &reload_client_crls,
+                    ) {
+                        Ok(candidate) => candidate,
+                        Err(error) => {
+                            // Retain the last-good verifier, material,
+                            // generation and sessions.
+                            crate::tls::client_trust::record_rejected_candidate(
+                                crate::tls::ClientTrustScope::ProxyH3,
+                            );
+                            warn!(
+                                revision,
+                                error = %error,
+                                "HTTP/3 listener could not load the configured client-certificate trust after frontend TLS reload; keeping previous config"
+                            );
+                            continue;
+                        }
+                    },
                 };
-                let new_tls = slot.load_full().as_ref().clone();
-                let Some(new_tls) = new_tls else {
+                let Some((new_tls, client_trust)) = adopted else {
+                    // Clear the config consulted by already-queued Incoming
+                    // handles before disabling the endpoint default. Otherwise
+                    // a task spawned just before this withdrawal could still
+                    // call `accept_with` on the previously adopted config.
+                    adopted_quic.store(Arc::new(None));
                     endpoint.set_server_config(None);
                     info!(
                         revision,
@@ -959,18 +1180,62 @@ pub async fn start_http3_listener_with_signal(
                 match build_h3_quinn_server_config(
                     &new_tls,
                     &reload_policy,
-                    reload_client_ca_bundle_path.as_deref(),
-                    &reload_client_crls,
+                    &client_trust,
+                    client_auth_configured,
+                    // This arm only runs on a listener that has a reload
+                    // channel, so the ProxyH3 scope is live-verifier bound.
+                    true,
                     &reload_h3_config,
                 ) {
                     Ok(server_config) => {
-                        endpoint.set_server_config(Some(server_config));
-                        info!(
-                            revision,
-                            "HTTP/3 listener server config swapped after frontend TLS reload"
-                        );
+                        // Fallible quinn rebuild succeeded. One rustls
+                        // transaction installs the live verifier, exposes this
+                        // exact candidate on the endpoint, then publishes
+                        // generation/fence so a concurrent reload cannot
+                        // cross-wire verifier/config/material.
+                        if let Some(verifier) = client_trust.verifier.clone() {
+                            let publication =
+                                crate::tls::client_trust::publish_accepted_rustls_candidate(
+                                    crate::tls::ClientTrustScope::ProxyH3,
+                                    client_trust.material.clone(),
+                                    verifier,
+                                    || {
+                                        adopted_quic.store(Arc::new(Some(Arc::new(
+                                            server_config.clone(),
+                                        ))));
+                                        endpoint.set_server_config(Some(server_config.clone()));
+                                    },
+                                );
+                            info!(
+                                revision,
+                                "HTTP/3 listener server config swapped after frontend TLS reload"
+                            );
+                            if publication.withdrew() {
+                                warn!(
+                                    revision,
+                                    generation = publication.generation,
+                                    reason = publication.reason.map(|reason| reason.label()),
+                                    retired_connections = publication.retired_sessions,
+                                    "Frontend client-certificate trust was withdrawn; established HTTP/3 client-certificate connections were retired"
+                                );
+                            }
+                        } else {
+                            adopted_quic
+                                .store(Arc::new(Some(Arc::new(server_config.clone()))));
+                            endpoint.set_server_config(Some(server_config));
+                            info!(
+                                revision,
+                                "HTTP/3 listener server config swapped after frontend TLS reload"
+                            );
+                        }
                     }
                     Err(error) => {
+                        // A refused candidate keeps the last-good H3 verifier,
+                        // material, generation and sessions. mTLS is never
+                        // downgraded on this path.
+                        crate::tls::client_trust::record_rejected_candidate(
+                            crate::tls::ClientTrustScope::ProxyH3,
+                        );
                         warn!(
                             revision,
                             error = %error,
@@ -985,6 +1250,7 @@ pub async fn start_http3_listener_with_signal(
                 // connections continue to serve in-flight streams. Without
                 // this, an immediate `endpoint.close()` would abort live
                 // requests with a CONNECTION_CLOSE frame mid-stream.
+                adopted_quic.store(Arc::new(None));
                 endpoint.set_server_config(None);
                 break;
             }
@@ -1092,7 +1358,66 @@ pub(crate) fn h3_client_identity(addr: SocketAddr) -> (SocketAddr, Arc<str>) {
     )
 }
 
+/// HTTP/3 error code used when a connection is retired because its frontend
+/// client-certificate trust decision was withdrawn (issue #3857).
+///
+/// `H3_REQUEST_REJECTED` (0x010B) is the RFC 9114 §8.1 code for "the server did
+/// not process the request", which is exactly the contract here: nothing further
+/// on this connection is admitted, and a client is free to reconnect — where it
+/// will meet the new verifier and be refused at the handshake if it is genuinely
+/// revoked. The reason phrase is a compiled-in literal carrying no certificate
+/// field, serial, subject, or generation.
+const H3_TRUST_WITHDRAWN_ERROR_CODE: u32 = 0x010B;
+const H3_TRUST_WITHDRAWN_REASON: &[u8] = b"client certificate trust withdrawn";
+
+/// Terminate a QUIC connection whose client-certificate trust was withdrawn.
+///
+/// `Connection::close` is quinn's ordinary application close: it emits a single
+/// CONNECTION_CLOSE, fails every open stream on the connection, and resolves the
+/// `PeerConnectionSignal` watch that in-flight request tasks already observe —
+/// so per-request guards, permits, and accounting complete exactly once through
+/// paths that already exist. Idempotent, so racing the accept-loop arm and the
+/// stream-admission fence cannot double-close.
+fn close_h3_connection_for_trust_withdrawal(connection: &quinn::Connection, peer: SocketAddr) {
+    connection.close(
+        quinn::VarInt::from_u32(H3_TRUST_WITHDRAWN_ERROR_CODE),
+        H3_TRUST_WITHDRAWN_REASON,
+    );
+    debug!(
+        peer = %peer,
+        "Retiring established HTTP/3 connection: frontend client-certificate trust was withdrawn"
+    );
+}
+
+/// Bind an HTTP/3 Incoming to the endpoint config stored before this scope's
+/// generation was published.
+///
+/// The H3 reload arm publishes one rustls transaction that installs the live
+/// verifier, stores `adopted_quic`, calls `Endpoint::set_server_config`, and
+/// then advances generation, all under the scope lock. Recapturing that slot
+/// immediately before `accept_with` binds the handshake to the candidate whose
+/// identity was published, rather than a QUIC `Incoming` that formed against a
+/// withdrawn snapshot. The rustls verifier inside that config is itself a live
+/// wrapper, so even a stale adopted snapshot still consults the published
+/// verifier (issue #3857).
+fn accept_h3_incoming(
+    incoming: quinn::Incoming,
+    adopted_quic: &arc_swap::ArcSwap<Option<Arc<quinn::ServerConfig>>>,
+) -> Result<Option<quinn::Connecting>, quinn::ConnectionError> {
+    match adopted_quic.load_full().as_ref().clone() {
+        Some(cfg) => incoming.accept_with(cfg).map(Some),
+        None => {
+            // The endpoint was disabled after this Initial was queued. Never
+            // fall back to the config captured by `Incoming`: it is exactly the
+            // withdrawn snapshot the adopted slot exists to supersede.
+            incoming.refuse();
+            Ok(None)
+        }
+    }
+}
+
 /// Handle a single HTTP/3 connection (may carry multiple streams/requests).
+#[allow(clippy::too_many_arguments)]
 async fn handle_h3_connection(
     connecting: quinn::Incoming,
     state: Arc<ProxyState>,
@@ -1100,6 +1425,7 @@ async fn handle_h3_connection(
     frontend_listen_port: Option<u16>,
     frontend_destination_ip: Option<std::net::IpAddr>,
     client_auth_configured: bool,
+    adopted_quic: Arc<arc_swap::ArcSwap<Option<Arc<quinn::ServerConfig>>>>,
 ) -> Result<(), anyhow::Error> {
     // 0-RTT is opt-in via `FERRUM_TLS_EARLY_DATA_METHODS` *and* is refused
     // outright when this listener does frontend client-certificate
@@ -1108,6 +1434,18 @@ async fn handle_h3_connection(
     // disables client early data for the same listener posture.
     let early_data_enabled =
         zero_rtt_admitted(!state.early_data_methods.is_empty(), client_auth_configured);
+
+    // Issue #3857. Capture the H3 client-trust generation BEFORE
+    // `Incoming::accept_with`. quinn binds the `ServerConfig` — and therefore
+    // the rustls client-certificate verifier this handshake runs — inside
+    // accept. The H3 reload arm publishes verifier, adopted config, and
+    // generation in one transaction, so recapturing that slot here and
+    // accepting after capture means a connection can never claim a generation
+    // newer than the candidate whose identity was published. The rustls
+    // verifier inside that config is a live wrapper, so a stale snapshot still
+    // consults the published verifier.
+    let client_trust_admission =
+        crate::tls::client_trust::capture(crate::tls::ClientTrustScope::ProxyH3);
 
     // Single coherent per-connection identity slot. Requests take one lock-free
     // snapshot, so the early-data flag and the peer certificate can never be
@@ -1130,7 +1468,12 @@ async fn handle_h3_connection(
     // (`accept_with_optional_timeout`) and DTLS (`DtlsServerLimits.handshake_timeout`)
     // frontends, all gated by `FERRUM_FRONTEND_TLS_HANDSHAKE_TIMEOUT_SECONDS`.
     let connection = if early_data_enabled {
-        let connecting = connecting.accept()?.into_0rtt();
+        let Some(connecting) = accept_h3_incoming(connecting, adopted_quic.as_ref())? else {
+            return Err(anyhow::anyhow!(
+                "HTTP/3 listener was disabled before the queued handshake was admitted"
+            ));
+        };
+        let connecting = connecting.into_0rtt();
         match connecting {
             Ok((conn, zero_rtt_accepted)) => {
                 let remote =
@@ -1201,7 +1544,11 @@ async fn handle_h3_connection(
         // explicit `.accept()?` here both surfaces address-validation errors
         // synchronously and gives us a typed `Connecting` future that
         // `tokio::time::timeout` can wrap directly.
-        let connecting = connecting.accept()?;
+        let Some(connecting) = accept_h3_incoming(connecting, adopted_quic.as_ref())? else {
+            return Err(anyhow::anyhow!(
+                "HTTP/3 listener was disabled before the queued handshake was admitted"
+            ));
+        };
         match await_with_optional_timeout(connecting, handshake_timeout).await {
             Ok(result) => result?,
             Err(_elapsed) => {
@@ -1245,6 +1592,36 @@ async fn handle_h3_connection(
     if handshake_completion_rx.is_none() {
         peer_identity.publish_handshake_result(true, quinn_peer_cert_chain(&connection));
     }
+    // Fail-closed live-verifier fence (issue #3857): even if this Incoming
+    // completed TLS against a stale endpoint snapshot, the peer chain must
+    // still satisfy the verifier published with the current generation.
+    // A missing chain on an armed listener is untrusted (session resumption
+    // does not re-verify). Close before stream admission so a reconnect
+    // cannot be established.
+    if let Some(admission) = client_trust_admission
+        && !crate::tls::client_trust::armed_handshake_der_chain_still_trusted(
+            admission.scope(),
+            quinn_peer_cert_chain(&connection).as_deref(),
+        )
+    {
+        close_h3_connection_for_trust_withdrawal(&connection, remote_addr);
+        return Err(anyhow::anyhow!(
+            "{}",
+            crate::tls::client_trust::TRUST_WITHDRAWN_REASON
+        ));
+    }
+    // Register the established QUIC transport against the H3 client-trust
+    // domain. The 0.5-RTT branch cannot be reached with client authentication
+    // configured (`zero_rtt_admitted` refuses it), so a certificate-bearing
+    // connection has always published its identity above by this point; a
+    // connection with no peer certificate holds no withdrawable trust decision
+    // and `register` returns `None` for it.
+    let client_cert_authenticated = peer_identity.snapshot().client_cert_der.is_some();
+    let client_trust_guard =
+        client_trust_admission.and_then(|admission| admission.register(client_cert_authenticated));
+    let client_trust_session = client_trust_guard
+        .as_ref()
+        .map(|guard| guard.session().clone());
     let frontend_sni_hostname = connection
         .handshake_data()
         .and_then(|data| data.downcast::<quinn::crypto::rustls::HandshakeData>().ok())
@@ -1305,6 +1682,12 @@ async fn handle_h3_connection(
         // buffered replayable stream snapshots the pre-handshake state. Only
         // after accept is Pending may successful handshake completion publish
         // the established identity for later 1-RTT streams.
+        // Issue #3857: a trust withdrawal must stop this connection from
+        // admitting further request streams without waiting for the client to
+        // reconnect. Racing it here means an idle multiplexed connection is torn
+        // down promptly instead of only when its next stream happens to arrive,
+        // and the stream-admission check below closes the remaining window where
+        // a stream was already ready when the withdrawal landed.
         let (accepted, handshake_succeeded) =
             if let Some(completion_rx) = handshake_completion_rx.as_mut() {
                 tokio::select! {
@@ -1313,9 +1696,30 @@ async fn handle_h3_connection(
                     completed = completion_rx => {
                         (None, Some(completed.unwrap_or_default()))
                     }
+                    _ = async {
+                        match client_trust_session.as_ref() {
+                            Some(session) => session.retired().await,
+                            None => std::future::pending().await,
+                        }
+                    } => {
+                        close_h3_connection_for_trust_withdrawal(&quinn_conn, canonical_peer);
+                        break;
+                    }
                 }
             } else {
-                (Some(h3_conn.accept().await), None)
+                tokio::select! {
+                    biased;
+                    accepted = h3_conn.accept() => (Some(accepted), None),
+                    _ = async {
+                        match client_trust_session.as_ref() {
+                            Some(session) => session.retired().await,
+                            None => std::future::pending().await,
+                        }
+                    } => {
+                        close_h3_connection_for_trust_withdrawal(&quinn_conn, canonical_peer);
+                        break;
+                    }
+                }
             };
 
         if let Some(handshake_succeeded) = handshake_succeeded {
@@ -1334,6 +1738,21 @@ async fn handle_h3_connection(
         };
         match accepted {
             Ok(Some(resolver)) => {
+                // Stream-admission fence (issue #3857). A stream can already be
+                // ready when the withdrawal lands, in which case `accept()` wins
+                // the biased race above; refuse it here, before the request task
+                // is spawned and therefore before routing, plugins, and any
+                // backend dispatch. The stream is dropped with the connection
+                // close rather than answered, so no accounting is started for
+                // work that was never authorized.
+                if let Some(session) = client_trust_session.as_ref()
+                    && session.is_retired()
+                {
+                    session.record_fenced();
+                    drop(resolver);
+                    close_h3_connection_for_trust_withdrawal(&quinn_conn, canonical_peer);
+                    break;
+                }
                 // Detect QUIC connection migration: compare SocketAddr (two integer
                 // fields) — zero allocation. Only re-format the IP string when the
                 // address actually changes, which is rare (mobile network handoff).
@@ -1368,6 +1787,7 @@ async fn handle_h3_connection(
                 let peer_spiffe_extraction_cache = identity.peer_spiffe_extraction_cache.clone();
                 let is_early_data = identity.is_early_data;
                 let peer_connection = peer_connection.clone();
+                let stream_client_trust = client_trust_session.clone();
                 tokio::spawn(async move {
                     match resolver.resolve_request().await {
                         Ok((req, stream)) => {
@@ -1386,6 +1806,7 @@ async fn handle_h3_connection(
                                 peer_spiffe_extraction_cache,
                                 is_early_data,
                                 peer_connection,
+                                stream_client_trust,
                             )
                             .await
                             {
@@ -1464,6 +1885,7 @@ async fn handle_h3_request(
     >,
     is_early_data: bool,
     peer_connection: crate::plugins::PeerConnectionSignal,
+    client_trust_session: Option<crate::tls::ClientTrustSession>,
 ) -> Result<(), anyhow::Error> {
     let start_time = std::time::Instant::now();
 
@@ -1601,6 +2023,32 @@ async fn handle_h3_request(
         detected_http_flavor
     };
 
+    // Frontend client-trust admission fence (HTTP/3, issue #3857). The
+    // connection accept loop checks immediately after accepting a ready stream,
+    // but resolving its request headers is asynchronous and the task is spawned
+    // independently. Re-check here to close the interval in which a withdrawal
+    // can land after that first check but before this handler starts routing or
+    // running plugins. The connection-level retirement concurrently closes QUIC;
+    // this response is best-effort and, either way, no withdrawn credential can
+    // reach policy or backend dispatch.
+    if let Some(session) = client_trust_session.as_ref()
+        && session.is_retired()
+    {
+        session.record_fenced();
+        record_h3_flavor_aware_reject(&state, http_flavor, 401);
+        send_h3_error_flavor_aware(
+            &mut stream,
+            http_flavor,
+            grpc_web_response_content_type,
+            http::StatusCode::UNAUTHORIZED,
+            r#"{"error":"Client certificate trust withdrawn"}"#,
+            crate::proxy::grpc_proxy::grpc_status::UNAUTHENTICATED,
+            "Client certificate trust withdrawn",
+        )
+        .await?;
+        return Ok(());
+    }
+
     // Global request admission control (HTTP/3). Single atomic load (~1ns).
     if state
         .overload
@@ -1673,6 +2121,10 @@ async fn handle_h3_request(
     ctx.tls_client_cert_chain_der = tls_client_cert_chain_der;
     ctx.mtls_auth_connection_cache = mtls_auth_connection_cache;
     ctx.peer_spiffe_extraction_cache = peer_spiffe_extraction_cache;
+    // Issue #3857: carried so an H3 WebSocket (RFC 9220 Extended CONNECT), which
+    // outlives this request, terminates when the connection's client-certificate
+    // trust decision is withdrawn.
+    ctx.client_trust_session = client_trust_session;
     // Lets deliberately parked work (injected fault delays) observe QUIC
     // connection close instead of holding this stream, its `RequestGuard`, and
     // its plugin snapshot until the timer expires.
@@ -9340,28 +9792,28 @@ fn classify_h3_error(e: &crate::http3::client::H3PoolError) -> crate::retry::Err
 }
 
 /// Select the client-facing status + JSON body for a native-H3 backend
-/// dispatch failure. A `backend_read_timeout_ms` deadline expiry maps to
-/// 504 `{"error":"Backend timeout"}` — matching the direct-H2 / HBONE /
-/// sidecar-mTLS read-timeout arms in `crate::proxy` — while every other
-/// failure keeps the generic 502 `{"error":"Backend unavailable"}`.
-/// The canonical H3 backend-failure body. Deliberately `&'static str`: the
-/// `send_h3_response` consumers want a string, and the buffered-dispatch
-/// consumers can reach `Bytes::from_static(..)` from the same static lifetime,
-/// so neither side has to copy the literal.
+/// dispatch failure. Classification is the shared HTTP-family mapper
+/// (`crate::proxy::http_backend_failure_status_and_body`): a
+/// `backend_read_timeout_ms` deadline expiry (`ReadWriteTimeout`) maps to
+/// 504 `{"error":"Backend timeout"}`, matching the reqwest / direct-H2 /
+/// HBONE / sidecar-mTLS arms, while every other failure keeps the generic
+/// 502 `{"error":"Backend unavailable"}`.
+///
+/// The body is deliberately `&'static str`: the `send_h3_response`
+/// consumers want a string, and the buffered-dispatch consumers can reach
+/// `Bytes::from_static(..)` from the same static lifetime, so neither side
+/// has to copy the literal.
 fn h3_backend_failure_status_body(
     e: &crate::http3::client::H3PoolError,
 ) -> (StatusCode, &'static str) {
-    if e.is_read_timeout() {
-        (
-            StatusCode::GATEWAY_TIMEOUT,
-            r#"{"error":"Backend timeout"}"#,
-        )
+    let (status_code, body) =
+        crate::proxy::http_backend_failure_status_and_body(classify_h3_error(e));
+    let status = if status_code == 504 {
+        StatusCode::GATEWAY_TIMEOUT
     } else {
-        (
-            StatusCode::BAD_GATEWAY,
-            r#"{"error":"Backend unavailable"}"#,
-        )
-    }
+        StatusCode::BAD_GATEWAY
+    };
+    (status, body)
 }
 
 fn is_h3_client_request_body_disconnect(err_msg: &str) -> bool {
@@ -9796,13 +10248,17 @@ async fn collect_h3_open_response_body(
                         timeout_ms = proxy.backend_read_timeout_ms,
                         "HTTP/3 backend buffered response read timed out (refined path)"
                     );
-                    // Read timeout: 504 Backend timeout (matching the
-                    // direct-H2 / HBONE read-timeout arms), classified as
-                    // ReadWriteTimeout. No capability downgrade — a stalled
-                    // backend has not proved it lost H3 support.
+                    // Read timeout: 504 Backend timeout via the shared
+                    // HTTP-family mapper (matching the direct-H2 / HBONE
+                    // read-timeout arms), classified as ReadWriteTimeout.
+                    // No capability downgrade — a stalled backend has not
+                    // proved it lost H3 support.
+                    let (status, body) = crate::proxy::http_backend_failure_status_and_body(
+                        crate::retry::ErrorClass::ReadWriteTimeout,
+                    );
                     return H3BufferedDispatchResult {
-                        status: 504,
-                        body: Bytes::from_static(br#"{"error":"Backend timeout"}"#),
+                        status,
+                        body: Bytes::from_static(body.as_bytes()),
                         headers: HashMap::new(),
                         trailers: None,
                         error_class: Some(crate::retry::ErrorClass::ReadWriteTimeout),
@@ -9884,9 +10340,11 @@ async fn collect_h3_open_response_body(
                         .backend_capabilities
                         .mark_h3_unsupported(proxy, upstream_target);
                 }
+                let (status, body) =
+                    crate::proxy::http_backend_failure_status_and_body(h3_error_class);
                 return H3BufferedDispatchResult {
-                    status: 502,
-                    body: Bytes::from_static(br#"{"error":"Backend unavailable"}"#),
+                    status,
+                    body: Bytes::from_static(body.as_bytes()),
                     headers: HashMap::new(),
                     trailers: None,
                     error_class: Some(h3_error_class),
@@ -9921,9 +10379,10 @@ async fn collect_h3_open_response_body(
                     .backend_capabilities
                     .mark_h3_unsupported(proxy, upstream_target);
             }
+            let (status, body) = crate::proxy::http_backend_failure_status_and_body(h3_error_class);
             return H3BufferedDispatchResult {
-                status: 502,
-                body: Bytes::from_static(br#"{"error":"Backend unavailable"}"#),
+                status,
+                body: Bytes::from_static(body.as_bytes()),
                 headers: HashMap::new(),
                 trailers: None,
                 error_class: Some(h3_error_class),
@@ -18260,14 +18719,23 @@ mod build_h3_quinn_server_config_mtls_tests {
         ca_path.to_string_lossy().into_owned()
     }
 
-    /// Drive `build_h3_quinn_server_config` with the given client CA bundle.
+    /// Drive the H3 startup path (coherent client-trust load, then config
+    /// build) with the given client CA bundle.
     fn build(client_ca: Option<&str>) -> Result<quinn::ServerConfig, anyhow::Error> {
         ensure_crypto_provider();
         let tls_config = test_server_config();
         let tls_policy = TlsPolicy::from_env_config(&EnvConfig::default()).expect("tls policy");
         let crls: CrlList = Arc::new(Vec::new());
         let h3_config = Http3ServerConfig::default();
-        build_h3_quinn_server_config(&tls_config, &tls_policy, client_ca, &crls, &h3_config)
+        let client_trust = super::load_configured_h3_client_trust(client_ca, &crls)?;
+        build_h3_quinn_server_config(
+            &tls_config,
+            &tls_policy,
+            &client_trust,
+            client_ca.is_some(),
+            true,
+            &h3_config,
+        )
     }
 
     #[test]
@@ -18329,5 +18797,18 @@ mod build_h3_quinn_server_config_mtls_tests {
             "H3 without a configured client CA must build (no client auth): {:?}",
             result.err()
         );
+    }
+
+    #[test]
+    fn no_client_ca_does_not_summarize_unenforced_crls() {
+        // A process-global CRL is irrelevant to an H3 listener that has no
+        // client verifier. The unarmed branch must not parse or publish that
+        // material as though H3 enforced it.
+        let crls: CrlList = Arc::new(vec![rustls::pki_types::CertificateRevocationListDer::from(
+            vec![0x30, 0x00],
+        )]);
+        let accepted = super::load_configured_h3_client_trust(None, &crls)
+            .expect("unenforced CRLs must not prevent non-mTLS H3 startup");
+        assert!(accepted.verifier.is_none());
     }
 }

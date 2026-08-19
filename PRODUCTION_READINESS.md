@@ -5,58 +5,19 @@ Method: four independent read-only audits (deferral markers, docs-vs-code truth,
 posture, ops/CI/release) → findings triaged → fixes implemented via reviewed PRs (codex
 review loop + full CI + orchestrator review on every PR) → merged.
 
-## Live launch gate (authoritative)
+## Live launch gate (removed)
 
-This section is the **only** current go/no-go launch signal. It is verified by
-`scripts/check_launch_readiness.py` against live paginated GitHub issue state,
-structured exemptions, and a redacted private-advisory count. Policy:
-[`docs/launch-blocker-policy.json`](docs/launch-blocker-policy.json),
-[`docs/launch-readiness.md`](docs/launch-readiness.md).
+The automated launch-readiness gate that used to own this section was removed
+(workflows `launch-readiness.yml`, `launch-integrity.yml`,
+`launch-advisory-trust.yml`, their verifiers, the blocker policy and exemption
+data, and the `validate-launch-readiness` job in `.github/workflows/release.yml`).
+Every blocker it tracked had been closed: its last evaluation on `main` reported
+`"blocking_issues": []` with `critical 0 / high 0 / medium 0`.
 
-A historical clean static audit (below) does **not** imply a clean live gate.
-
-The block below is a **reviewed snapshot**, never a source of truth. It is not
-evidence that any blocker is resolved: the gate recomputes the verdict from live
-data on every run and fails whenever the snapshot disagrees, whenever the verdict
-is not `PASS`, and whenever the live data cannot be established. Refresh it from
-the `Launch Readiness Gate` job output (the evaluated record carries the exact
-target SHA and as-of UTC) whenever the blocker set changes.
-
-<!-- launch-readiness:begin -->
-```json
-{
-  "verdict": "FAIL",
-  "policy_version": "2",
-  "classification_version": "launch-blocker-v2",
-  "launch_tier": "ga",
-  "private_blockers_redacted_count": 0,
-  "counts_by_severity": {
-    "critical": 1,
-    "high": 9,
-    "medium": 14
-  },
-  "notes": "Reviewed post-merge snapshot for PR #3806. The five configured label definitions exist and every open severity-classified launch blocker is backfilled with launch-blocker plus exactly one severity label. The 2026-08-12 live inventory is critical 2 / high 9 / medium 14 while #3801 remains open; this snapshot projects its completed closure via PR #3806, leaving critical 1 / high 9 / medium 14. #3332 is not launch-classified. Target SHA and as-of UTC come from the workflow's evaluated record; they are deliberately not asserted here."
-}
-```
-<!-- launch-readiness:end -->
-
-Hosted enforcement: `.github/workflows/launch-readiness.yml` (PR/`merge_group`/
-`main`/tag/schedule) and the release/tag job in `.github/workflows/release.yml`,
-which requires a computed `PASS` for the exact released commit. Only a computed
-`PASS` whose snapshot agrees exits zero: `FAIL` and `UNKNOWN` are both non-zero,
-so this check stays red while real launch blockers are open — that is the honest
-signal, not a defect. `UNKNOWN` covers a missing token, an API/rate-limit/
-pagination/schema failure, a configured blocker/exemption/severity label that is
-absent from or renamed in repository metadata, an open `tracked_blockers` entry
-that never received the `launch-blocker` label, an issue without exactly one
-severity label, a live severity label that contradicts the tracked contract, and
-missing/malformed/stale/future private-advisory input. The label vocabulary is
-proven to exist before any issue listing is trusted, and open issues are
-selected by the verified immutable blocker-label id rather than a name filter,
-so a missing or transiently renamed label can never be mistaken for a clean
-inventory.
-Private advisories contribute a redacted count only; setup and maintenance are
-described in [`docs/launch-readiness.md`](docs/launch-readiness.md).
+There is therefore **no automated go/no-go launch signal in this repository**.
+Release readiness is a human judgement, and a `v*` tag no longer requires a
+computed launch verdict or a private-advisory attestation. The historical
+evidence below is exactly that — historical — and was never a live verdict.
 
 <!-- launch-readiness:historical -->
 
@@ -134,8 +95,8 @@ reconciliations. They are **historical evidence**, not the live launch verdict.
 
 ## Needs human decision (historical note)
 
-Launch-blocking human decisions are represented only by the live gate above (and by
-structured entries in `docs/launch-exemptions.json`). This historical note must not be
+Launch-blocking human decisions are no longer represented by any automated gate
+or structured exemption file; both were removed. This historical note must not be
 read as a clean launch signal. Post-launch discretionary items that remain open should be
 tracked on their **dedicated** issues (not by treating #2110 as an unchanged
 snapshot). #2110 stays open only as the historical 2026-07-12 register; after

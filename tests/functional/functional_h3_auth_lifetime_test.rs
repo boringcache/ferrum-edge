@@ -1199,6 +1199,15 @@ async fn h3_auth_lifetime_stalled_plain_sse_headers_cannot_outlive_the_credentia
 //    coalescer and its own writes (`cross_protocol::stream_reqwest_response`).
 //    No `grpc-timeout` exists here either, so the authorization deadline is
 //    again the only bound.
+//
+//    The terminal is asserted to be a RESET, never a clean end of body: a
+//    graceful finish would let a stalled downstream read a normal end of
+//    response instead of an authorization failure. Because the backend never
+//    sends `end_stream`, a clean `None` here can only come from the gateway,
+//    and `quinn::SendStream::drop` implicitly `finish()`es any send half that
+//    was neither finished nor reset — so the relay must reset explicitly on
+//    every non-clean exit (issue #3995,
+//    `stream_util::committed_response_requires_reset`).
 // ────────────────────────────────────────────────────────────────────────────
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore]

@@ -915,6 +915,9 @@ struct DesiredStreamProxy {
     /// listener (issue #3861). Several may share one numeric port; the shared
     /// socket demultiplexes by exact local destination address.
     node_waypoint_udp_destination_member: bool,
+    /// Whether this member publishes at least one exact ClusterIP destination.
+    /// A headless member must use its individual direct-node-address listener.
+    node_waypoint_udp_has_destination_route: bool,
     /// Validated amplification factor encoded losslessly for cold-path listener
     /// drift detection. `None` is the explicit unlimited posture.
     udp_amplification_factor_bits: Option<u32>,
@@ -1017,12 +1020,18 @@ fn node_waypoint_udp_listener_key(port: u16) -> String {
 /// that port is already bound under `__nwudp_{port}`, shrinking to one
 /// remaining VIP claimant must keep the shared key: dissolving it stops the
 /// socket and races a rebind that can leave the survivor unbound (`EADDRINUSE`).
+/// A headless survivor has no exact destination route, so it must return to an
+/// individual listener rather than retaining an unusable shared router.
 #[inline]
 fn retain_shared_node_waypoint_udp_listener(
     member_count: usize,
     shared_listener_already_running: bool,
+    single_claimant_has_destination_route: bool,
 ) -> bool {
-    member_count > 1 || (member_count == 1 && shared_listener_already_running)
+    member_count > 1
+        || (member_count == 1
+            && shared_listener_already_running
+            && single_claimant_has_destination_route)
 }
 
 fn udp_amplification_restart_key_for_ids(
@@ -1854,11 +1863,16 @@ impl StreamListenerManager {
     /// After storing the source identity, validates and publishes one immutable
     /// generation (when the material loads), then reconciles stream listeners so
     /// any previously deferred UDP/DTLS listeners start against that generation.
+    /// `client_trust_reload_enabled` must match the process-wide frontend TLS
+    /// live-reload opt-in. Static DTLS still publishes its crypto generation but
+    /// leaves the retirement scope unarmed because no later trust generation can
+    /// be accepted without a restart.
     pub async fn set_frontend_dtls_cert_key(
         &self,
         cert_path: String,
         key_path: String,
         client_ca_cert_path: Option<String>,
+        client_trust_reload_enabled: bool,
     ) {
         self.frontend_dtls_material.store(Arc::new(Some((
             cert_path.clone(),
@@ -1872,7 +1886,9 @@ impl StreamListenerManager {
             &self.crls.load_full(),
         ) {
             Ok(config) => {
-                let _ = self.publish_frontend_dtls_generation(config).await;
+                let _ = self
+                    .publish_frontend_dtls_generation(config, client_trust_reload_enabled)
+                    .await;
             }
             Err(err) => {
                 warn!(
@@ -1990,6 +2006,12 @@ impl StreamListenerManager {
                 last_outcome: "rejected",
             })
         });
+        // Issue #3857: a refused candidate keeps the last accepted DTLS
+        // generation, its verifier and every live session; recording it against
+        // the trust scope makes "retained, not silently ignored" observable.
+        crate::tls::client_trust::record_rejected_candidate(
+            crate::tls::ClientTrustScope::FrontendDtls,
+        );
     }
 
     /// Publish one prevalidated immutable DTLS generation and live-swap it
@@ -1997,14 +2019,24 @@ impl StreamListenerManager {
     ///
     /// The generation is stored first so listeners created or restarted after
     /// this call receive exactly the same material. Existing sessions keep
-    /// their handshake snapshot; new handshakes use the accepted generation.
-    /// This method never rebuilds from sources — callers must validate the
-    /// complete candidate before invoking it.
+    /// their handshake snapshot, but the client-trust publication below
+    /// retires authenticated sessions when the accepted generation narrows
+    /// trust; new handshakes use the accepted generation. This method never
+    /// rebuilds from sources — callers must validate the complete candidate
+    /// before invoking it.
+    ///
+    /// `client_trust_reload_enabled=false` publishes and swaps the immutable
+    /// DTLS crypto generation without arming per-session client-trust tracking.
+    /// This preserves the documented zero-tracking static posture when frontend
+    /// live reload is disabled. A real reload and its startup baseline pass
+    /// `true`, so the first withdrawal compares against the material originally
+    /// served and retires every older authenticated session.
     ///
     /// Returns `(generation, swapped_listener_count)`.
     pub async fn publish_frontend_dtls_generation(
         &self,
         config: crate::dtls::FrontendDtlsConfig,
+        client_trust_reload_enabled: bool,
     ) -> (crate::dtls::FrontendDtlsGeneration, usize) {
         let _publish_guard = self.frontend_dtls_publish.lock().await;
         let generation = self
@@ -2030,6 +2062,27 @@ impl StreamListenerManager {
             swapped_dtls_listeners = swapped,
             "Published frontend DTLS material generation; new DTLS sessions use this generation"
         );
+        // Issue #3857. When live reload is enabled, publish the client-trust
+        // generation AFTER the material is live in every active `DtlsServer`, so
+        // a session that reads the new generation provably snapshotted the new
+        // verifier. Static DTLS and a generation with no client-certificate
+        // verification leave this scope unarmed and publish no trust identity.
+        if client_trust_reload_enabled && let Some(material) = accepted.config.client_trust.clone()
+        {
+            let publication = crate::tls::client_trust::publish_accepted_material(
+                crate::tls::ClientTrustScope::FrontendDtls,
+                material,
+            );
+            if publication.withdrew() {
+                warn!(
+                    dtls_generation = generation,
+                    trust_generation = publication.generation,
+                    reason = publication.reason.map(|reason| reason.label()),
+                    retired_sessions = publication.retired_sessions,
+                    "Frontend client-certificate trust was withdrawn; established DTLS client-certificate sessions were retired"
+                );
+            }
+        }
         ((*accepted).clone(), swapped)
     }
 
@@ -2251,6 +2304,13 @@ impl StreamListenerManager {
                                     .is_some_and(|m| !m.is_empty()),
                                 node_waypoint_udp_destination_member: p
                                     .joins_node_waypoint_udp_destination_plane(),
+                                node_waypoint_udp_has_destination_route: current_config
+                                    .node_waypoint_udp_destination_routes
+                                    .iter()
+                                    .any(|route| {
+                                        route.proxy.namespace == p.namespace
+                                            && route.proxy.id == p.id
+                                    }),
                                 udp_amplification_factor_bits: p
                                     .udp_max_response_amplification_factor
                                     .map(f32::to_bits),
@@ -2437,6 +2497,11 @@ impl StreamListenerManager {
             let keep_shared = retain_shared_node_waypoint_udp_listener(
                 ids.len(),
                 existing_shared_node_waypoint_udp_ports.contains(port),
+                ids.first().is_some_and(|id| {
+                    desired
+                        .get(id)
+                        .is_some_and(|entry| entry.node_waypoint_udp_has_destination_route)
+                }),
             );
             keep_shared
                 && !sni_groups.contains_key(port)
@@ -3219,6 +3284,13 @@ impl StreamListenerManager {
                         udp_pktinfo_enabled,
                         mesh_outbound_enforcement,
                         node_waypoint_udp_source_scoping,
+                        // Owner-scoped client-trust retirement domain for a
+                        // terminating DTLS listener (issue #3858): the same bit
+                        // that chose `dtls_owner` above, so the listener an
+                        // operator publication deliberately does not
+                        // reconfigure is also the listener whose sessions it
+                        // cannot retire.
+                        node_waypoint_udp_owner,
                         node_waypoint_udp_destinations,
                         datagram_client_address,
                     })

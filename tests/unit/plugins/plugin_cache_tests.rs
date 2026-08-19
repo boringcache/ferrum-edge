@@ -192,7 +192,7 @@ pub(crate) fn minimal_plugin_config(plugin_name: &str) -> serde_json::Value {
             json!({"rules": [{"operation": "add", "target": "header", "key": "x-test", "value": "1"}]})
         }
         "request_size_limiting" => json!({"max_bytes": 1048576}),
-        "waf" => json!({}),
+        "waf" => json!({ "mode": "monitor" }),
         "response_size_limiting" => json!({"max_bytes": 1048576}),
         "ws_message_size_limiting" => json!({"max_frame_bytes": 65536}),
         "ws_rate_limiting" => json!({"frames_per_second": 100}),
@@ -3741,6 +3741,279 @@ async fn request_mirror_cache_construction_preserves_plugin_config_id() {
         Some("mirror-stable-id"),
         "production PluginCache must pass the stable resource id"
     );
+}
+
+fn scoring_waf_plugin_config(
+    id: &str,
+    scope: PluginScope,
+    proxy_id: Option<&str>,
+    pattern: &str,
+    score: u32,
+    threshold: u32,
+) -> PluginConfig {
+    make_plugin_config_with_json(
+        id,
+        "waf",
+        json!({
+            "mode": "enforce",
+            "include_default_rules": false,
+            "scoring": {
+                "enabled": true,
+                "block_threshold": threshold,
+                "weights": { "info": 0, "low": 1, "medium": 2, "high": 3, "critical": 4 }
+            },
+            "custom_rules": [{
+                "id": format!("CUSTOM-{pattern}"),
+                "name": format!("match {pattern}"),
+                "category": "custom",
+                "severity": "low",
+                "target": "query_values",
+                "match_kind": "contains",
+                "pattern": pattern,
+                "action": "monitor",
+                "score": score
+            }]
+        }),
+        scope,
+        proxy_id,
+    )
+}
+
+fn scoring_waf_request(query: &str) -> RequestContext {
+    let mut ctx = RequestContext::new(
+        "203.0.113.10".to_string(),
+        "GET".to_string(),
+        "/search".to_string(),
+    );
+    ctx.set_raw_query_string(query.to_string());
+    ctx
+}
+
+async fn authorize_waf_plugins(
+    plugins: &[Arc<dyn Plugin>],
+    ctx: &mut RequestContext,
+) -> PluginResult {
+    let mut last = PluginResult::Continue;
+    for plugin in plugins.iter().filter(|plugin| plugin.name() == "waf") {
+        last = plugin.authorize(ctx).await;
+        if !matches!(last, PluginResult::Continue) {
+            return last;
+        }
+    }
+    last
+}
+
+fn assert_no_standalone_waf_identity(ctx: &RequestContext) {
+    let leaked: Vec<&str> = ctx
+        .metadata
+        .iter()
+        .filter(|(key, value)| {
+            key.contains("standalone-")
+                || value.contains("standalone-")
+                || key.starts_with("waf.instances.standalone-")
+        })
+        .map(|(key, _)| key.as_str())
+        .collect();
+    assert!(
+        leaked.is_empty(),
+        "configured WAF construction must not emit standalone-N identities, got {leaked:?} in {:?}",
+        ctx.metadata
+    );
+}
+
+#[tokio::test]
+async fn plugin_cache_uses_configured_waf_ids_for_isolated_scoring_metadata() {
+    // Issue #3940: two file/DB/CP/DP plugin_configs on one proxy must publish
+    // their resource ids, not process-local standalone-N surrogates. Isolation
+    // itself (5+5 at threshold 8) was already correct; the ids were not.
+    let config = make_config(
+        vec![make_proxy(
+            "p1",
+            "/search",
+            vec!["pc-multi-a", "pc-multi-b"],
+        )],
+        vec![
+            scoring_waf_plugin_config("pc-multi-a", PluginScope::Proxy, Some("p1"), "alpha", 5, 8),
+            scoring_waf_plugin_config("pc-multi-b", PluginScope::Proxy, Some("p1"), "beta", 5, 8),
+        ],
+    );
+    let cache = PluginCache::new(&config).expect("configured WAF cache");
+    let plugins = cache.get_plugins_for_protocol("ferrum", "p1", ProxyProtocol::Http);
+    let mut ctx = scoring_waf_request("q=alpha-beta");
+
+    assert!(matches!(
+        authorize_waf_plugins(&plugins, &mut ctx).await,
+        PluginResult::Continue
+    ));
+    assert_eq!(
+        ctx.metadata
+            .get("waf.instances.pc-multi-a.score")
+            .map(String::as_str),
+        Some("5")
+    );
+    assert_eq!(
+        ctx.metadata
+            .get("waf.instances.pc-multi-b.score")
+            .map(String::as_str),
+        Some("5")
+    );
+    assert_eq!(
+        ctx.metadata.get("waf.instance_scores").map(String::as_str),
+        Some("pc-multi-a=5,pc-multi-b=5")
+    );
+    assert!(
+        !ctx.metadata.contains_key("waf.score"),
+        "multi-instance transactions must not emit a conflated waf.score"
+    );
+    assert!(!ctx.metadata.contains_key("waf.block_reason"));
+    assert!(!ctx.metadata.contains_key("waf.scoring_instance"));
+    assert_no_standalone_waf_identity(&ctx);
+}
+
+#[tokio::test]
+async fn plugin_cache_waf_blocking_instance_owns_score_metadata() {
+    let config = make_config(
+        vec![make_proxy(
+            "p1",
+            "/search",
+            vec!["pc-multi-a", "pc-multi-b"],
+        )],
+        vec![
+            scoring_waf_plugin_config(
+                "pc-multi-a",
+                PluginScope::Proxy,
+                Some("p1"),
+                "needle",
+                5,
+                10,
+            ),
+            scoring_waf_plugin_config("pc-multi-b", PluginScope::Proxy, Some("p1"), "needle", 5, 4),
+        ],
+    );
+    let cache = PluginCache::new(&config).expect("configured WAF cache");
+    let plugins = cache.get_plugins_for_protocol("ferrum", "p1", ProxyProtocol::Http);
+    let mut ctx = scoring_waf_request("q=needle");
+
+    assert!(matches!(
+        authorize_waf_plugins(&plugins, &mut ctx).await,
+        PluginResult::Reject { .. }
+    ));
+    assert_eq!(
+        ctx.metadata
+            .get("waf.instances.pc-multi-a.score")
+            .map(String::as_str),
+        Some("5")
+    );
+    assert_eq!(
+        ctx.metadata
+            .get("waf.instances.pc-multi-b.score")
+            .map(String::as_str),
+        Some("5")
+    );
+    assert_eq!(
+        ctx.metadata.get("waf.block_reason").map(String::as_str),
+        Some("score")
+    );
+    assert_eq!(
+        ctx.metadata.get("waf.scoring_instance").map(String::as_str),
+        Some("pc-multi-b")
+    );
+    assert_eq!(
+        ctx.metadata.get("waf.instance_scores").map(String::as_str),
+        Some("pc-multi-a=5,pc-multi-b=5")
+    );
+    assert_no_standalone_waf_identity(&ctx);
+}
+
+#[tokio::test]
+async fn plugin_cache_waf_scoring_identity_survives_reload_and_replica_rebuild() {
+    let config = make_config(
+        vec![make_proxy("p1", "/search", vec!["pc-multi-a"])],
+        vec![scoring_waf_plugin_config(
+            "pc-multi-a",
+            PluginScope::Proxy,
+            Some("p1"),
+            "needle",
+            5,
+            10,
+        )],
+    );
+    let cache = PluginCache::new(&config).expect("configured WAF cache");
+    let replica = PluginCache::new(&config).expect("replica WAF cache");
+
+    async fn score_once(cache: &PluginCache) -> RequestContext {
+        let plugins = cache.get_plugins_for_protocol("ferrum", "p1", ProxyProtocol::Http);
+        let mut ctx = scoring_waf_request("q=needle");
+        assert!(matches!(
+            authorize_waf_plugins(&plugins, &mut ctx).await,
+            PluginResult::Continue
+        ));
+        ctx
+    }
+
+    let first = score_once(&cache).await;
+    cache.rebuild(&config).expect("WAF reload rebuild");
+    let after_reload = score_once(&cache).await;
+    let replica_ctx = score_once(&replica).await;
+
+    for ctx in [&first, &after_reload, &replica_ctx] {
+        assert_eq!(
+            ctx.metadata
+                .get("waf.instances.pc-multi-a.score")
+                .map(String::as_str),
+            Some("5")
+        );
+        assert_eq!(ctx.metadata.get("waf.score").map(String::as_str), Some("5"));
+        assert!(!ctx.metadata.contains_key("waf.instance_scores"));
+        assert_no_standalone_waf_identity(ctx);
+    }
+}
+
+#[tokio::test]
+async fn plugin_cache_global_waf_uses_configured_plugin_config_id() {
+    let config = make_config(
+        vec![make_proxy("p1", "/search", vec![])],
+        vec![scoring_waf_plugin_config(
+            "waf-global",
+            PluginScope::Global,
+            None,
+            "needle",
+            5,
+            10,
+        )],
+    );
+    let cache = PluginCache::new(&config).expect("global WAF cache");
+    let plugins = cache.get_plugins_for_protocol("ferrum", "p1", ProxyProtocol::Http);
+    assert!(
+        plugins.iter().any(|plugin| plugin.name() == "waf"),
+        "global WAF must attach without a proxy association"
+    );
+    let mut ctx = scoring_waf_request("q=needle");
+    assert!(matches!(
+        authorize_waf_plugins(&plugins, &mut ctx).await,
+        PluginResult::Continue
+    ));
+    assert_eq!(
+        ctx.metadata
+            .get("waf.instances.waf-global.score")
+            .map(String::as_str),
+        Some("5")
+    );
+    assert_no_standalone_waf_identity(&ctx);
+}
+
+#[test]
+fn plugin_cache_rejects_blank_waf_config_id() {
+    // Reaching the constructor error through PluginCache proves production
+    // routing passes `pc.id`; the identityless factory would admit this row
+    // with a standalone-N identity.
+    let plugin = scoring_waf_plugin_config("   ", PluginScope::Proxy, Some("p1"), "needle", 5, 10);
+    let config = make_config(vec![make_proxy("p1", "/search", vec!["   "])], vec![plugin]);
+    let error = match PluginCache::new(&config) {
+        Ok(_) => panic!("blank WAF identity must fail closed"),
+        Err(error) => error,
+    };
+    assert!(error.contains("invalid plugin config id"), "{error}");
 }
 
 #[test]
@@ -11134,7 +11407,7 @@ fn test_waf_sets_needs_final_request_body_context_capability() {
         vec![make_plugin_config_with_json(
             "ps1",
             "waf",
-            json!({}),
+            json!({ "mode": "monitor" }),
             PluginScope::Proxy,
             Some("p1"),
         )],
@@ -11151,8 +11424,13 @@ fn test_waf_sets_needs_final_request_body_context_capability() {
 
 #[test]
 fn test_priority_override_preserves_finalized_request_policy_capability() {
-    let mut waf =
-        make_plugin_config_with_json("ps1", "waf", json!({}), PluginScope::Proxy, Some("p1"));
+    let mut waf = make_plugin_config_with_json(
+        "ps1",
+        "waf",
+        json!({ "mode": "monitor" }),
+        PluginScope::Proxy,
+        Some("p1"),
+    );
     waf.priority_override = Some(2081);
     let config = make_config(vec![make_proxy("p1", "/api", vec!["ps1"])], vec![waf]);
     let cache = PluginCache::new(&config).unwrap();

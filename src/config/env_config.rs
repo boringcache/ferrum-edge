@@ -1621,11 +1621,12 @@ pub struct EnvConfig {
     /// DER OCSP response bytes, or a source URI resolving to DER bytes, to
     /// staple on frontend proxy TLS handshakes.
     pub frontend_tls_ocsp_response_source: Option<String>,
-    /// Opt in to live reload of frontend TLS cert/key sources for the proxy
-    /// HTTPS / H2 / H3 listeners, the admin HTTPS listener, and (in mesh
-    /// mode) the mesh inbound TLS listener. When `false` (the default)
-    /// cert/key sources are read once at startup and require a restart to
-    /// rotate. When `true`, a background watcher polls the configured sources
+    /// Opt in to live reload of frontend TLS/DTLS cert, key, client-CA, OCSP,
+    /// and CRL sources for the proxy HTTPS / H2 / H3 listeners, the admin
+    /// HTTPS listener, frontend DTLS listeners, and (in mesh mode) the mesh
+    /// inbound TLS listener. When `false` (the default), those sources are read
+    /// once at startup and require a restart to rotate. When `true`, a
+    /// background watcher polls the configured sources
     /// every [`frontend_tls_watch_interval_seconds`] seconds for file-backed
     /// sources or [`secret_refresh_interval_seconds`] seconds for provider-
     /// backed sources, then atomically
@@ -1634,12 +1635,15 @@ pub struct EnvConfig {
     /// validation (parse / expired / not-yet-valid / key mismatch) keeps
     /// the previous config and emits a `warn!` — the gateway never serves a
     /// known-bad config. In-flight TLS sessions keep their original
-    /// `ServerConfig`; only new handshakes pick up the new config.
-    /// Operator-supplied per-proxy backend TLS paths and the DTLS frontend
-    /// stay static under this knob.
+    /// `ServerConfig`, but an accepted client-CA or CRL narrowing retires
+    /// client-certificate-authenticated sessions through the live trust fence;
+    /// only new handshakes pick up the new config. Operator-supplied per-proxy
+    /// backend TLS paths stay outside this knob and follow the backend TLS
+    /// reload policy instead.
     pub frontend_tls_live_reload_enabled: bool,
-    /// Poll interval in seconds for the frontend TLS file-backed source watcher when
-    /// [`frontend_tls_live_reload_enabled`] is `true`. Defaults to `30`.
+    /// Poll interval in seconds for the frontend/admin TLS and DTLS file-backed
+    /// source watcher when [`frontend_tls_live_reload_enabled`] is `true`.
+    /// Defaults to `30`.
     /// Ignored when live reload is disabled. Clamped to a 1-second minimum
     /// so an accidental `0` does not busy-loop the filesystem.
     pub frontend_tls_watch_interval_seconds: u64,
@@ -6585,6 +6589,19 @@ impl EnvConfig {
                 if self.mesh_workload_api_enabled && any_file_workload_identity {
                     return Err(Self::WORKLOAD_API_FILE_SVID_UNSUPPORTED.to_string());
                 }
+                // A PARTIAL file-SVID tuple is a misconfiguration, not a
+                // fallback (issue #3927). `load_gateway_svid_bundle` already
+                // refuses it at `ProxyState` construction, but without this
+                // gate `validate` either reports the generic no-identity error
+                // (which sends the operator to add a CA backend they did not
+                // want) or — with `FERRUM_MESH_ALLOW_NO_CA=true` — reports OK
+                // for a mesh that cannot start. Fail here with the same
+                // together-or-not-at-all diagnostic run uses, so validate and
+                // startup agree and no partial tuple can be read as "identity
+                // is configured".
+                if any_file_workload_identity && !has_file_workload_identity {
+                    return Err(Self::FILE_SVID_TUPLE_INCOMPLETE.to_string());
+                }
                 let workload_spiffe_id = if mesh_ca_backend != crate::identity::ca::CaBackend::None
                     && !has_file_workload_identity
                 {
@@ -7572,6 +7589,15 @@ impl EnvConfig {
     /// Enabling the Workload API surface with no CA backend at all.
     const WORKLOAD_API_REQUIRES_CA_BACKEND: &str = "FERRUM_MESH_WORKLOAD_API_ENABLED=true requires FERRUM_MESH_CA_BACKEND so the Workload \
          API has an authority to mint SVIDs from";
+
+    /// A partially configured file-based gateway SVID tuple in `mesh` mode.
+    /// The three sources are loaded together by `load_gateway_svid_bundle`, so
+    /// naming some of them is never a usable identity (issue #3927).
+    const FILE_SVID_TUPLE_INCOMPLETE: &str = "file-based gateway SVID material is incomplete: FERRUM_GATEWAY_SVID_CERT_PATH, \
+         FERRUM_GATEWAY_SVID_KEY_PATH, and FERRUM_GATEWAY_SVID_TRUST_BUNDLE_PATH must be set \
+         together (a leaf without its key or trust bundle cannot present or verify an mTLS peer \
+         certificate). Set all three, or unset them all and configure \
+         FERRUM_MESH_CA_BACKEND with FERRUM_MESH_WORKLOAD_SPIFFE_ID";
 
     /// Enabling the Workload API while explicit file identity suppresses the
     /// automatic CA-backed issuer at mesh startup.

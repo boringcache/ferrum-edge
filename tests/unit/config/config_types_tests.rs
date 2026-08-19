@@ -1235,6 +1235,36 @@ fn scoped_mtls_auth_does_not_cross_namespaces() {
 }
 
 #[test]
+fn omitted_consumers_deserializes_as_empty_vec() {
+    let yaml = r#"
+version: "1"
+proxies: []
+plugin_configs: []
+"#;
+    let config: GatewayConfig = serde_yaml::from_str(yaml).expect("parses without consumers");
+    assert!(config.consumers.is_empty());
+}
+
+#[test]
+fn readme_file_mode_config_example_deserializes_and_validates() {
+    let docs = include_str!("../../../README.md");
+    let section = docs
+        .split("### File Mode Config Format")
+        .nth(1)
+        .expect("File Mode Config Format section exists");
+    let yaml = section
+        .split("```yaml")
+        .nth(1)
+        .and_then(|tail| tail.split("```").next())
+        .expect("section contains a YAML example");
+    let mut config: GatewayConfig = serde_yaml::from_str(yaml).expect("README YAML parses");
+
+    assert!(config.validate_all_fields(30).is_ok());
+    config.normalize_fields();
+    assert!(config.validate_plugin_references().is_ok());
+}
+
+#[test]
 fn frontend_tls_mtls_example_is_a_valid_gateway_config() {
     let docs = include_str!("../../../docs/frontend_tls.md");
     let section = docs
