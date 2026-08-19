@@ -80,7 +80,7 @@ Pull Request / Merge Queue group
                     ├─► Lint, dependency audit, vendored regressions
                     ├─► Fuzz smoke (property budgets on PRs; the six-target
                     │   libFuzzer budget on merge_group / push to main / manual)
-                    ├─► eBPF/netns live checks when planner marks relevant
+                    ├─► Per-suite eBPF kernel / netns-capture / two-cluster live checks when planner marks relevant
                     ├─► Planner-gated mesh / Helm / performance gates
                     └─► Five target release builds
     └─► Dedicated required checks (internally skip unrelated changes)
@@ -513,8 +513,43 @@ use the canned reason and never interpolate hostile paths.
 
 The same trusted planner emits fail-closed job outputs for Helm, the legacy
 multicluster deployment smoke, the sidecar deployment smoke, eBPF program
-builds, eBPF/netns live suites, Secret Backends (`run_secrets_backends`), and
-PKCS#11 SoftHSM (`run_pkcs11`). The deploy-only multicluster job remains a
+builds, three separate live suites (`run_ebpf_kernel_live`,
+`run_netns_capture_live`, `run_two_cluster_live`), Secret Backends
+(`run_secrets_backends`), and PKCS#11 SoftHSM (`run_pkcs11`). Each live job
+reads only its own output. Pattern lists are derived from the files those jobs actually
+compile and execute: kernel live is the BPF crate plus `src/ebpf/`, the
+node-agent ingress-redirect helpers, `src/capture/` (`should_fallback_to_iptables`
+via `kernel_probe`), and the loader-adjacent transparent bind
+(`src/proxy/mod.rs` `create_proxy_socket` + `src/socket_opts.rs`); netns
+capture live is the netns/TPROXY/SO_ORIGINAL_DST/UDP producer surfaces
+(`src/proxy/host_udp_capture_live_tests.rs`, `src/proxy/udp_placement_migration.rs`) plus
+the HBONE/mesh-runtime/MeshSubscribe/identity/TLS boundaries, backend dispatch,
+TCP relay, route selection, and mesh policy the source-capture e2e tests
+traverse; two-cluster live is mesh/HBONE/identity/SPIRE/east-west plus
+`SO_ORIGINAL_DST`, mesh trust withdrawal, backend dispatch, route selection,
+mesh policy, MeshSubscribe JWT helpers, the shared functional harness, and
+`two_cluster_spire.sh`. Shared compile inputs
+(`Cargo.lock`, `rust-toolchain.toml`, `.cargo/`, `vendor/`, `setup-rust-ci`)
+still fire every live gate. The functional harness file schedules netns and
+two-cluster only — kernel live tests live in `src/ebpf/loader.rs`, not that
+file. CP-side trust serving (`src/grpc/cp_trust.rs`) stays isolated from all
+three, while `src/grpc/cp_server.rs` schedules netns and two-cluster because it
+owns the default JWT issuer shared by their functional fixture and production
+MeshSubscribe client. The deliberate drops from the old `run_ebpf_live` union —
+`src/k8s_controller/**`, `src/service_discovery/**` (except `mesh.rs`),
+`src/grpc/{mod,cp_trust,cp_trust_health,configsync_lifecycle}.rs`,
+`src/modes/control_plane.rs`, and `src/plugins/prometheus_metrics.rs` — are not
+exercised by any of the three ci.yml live jobs and stay out of their gates;
+they are instead covered by the dedicated live workflows or the always-run
+cargo jobs. The shared `tests/k8s/lib/` Kind/SPIRE harness is likewise not a
+ci.yml live input: `node-waypoint-ebpf-live.yml` owns it through its
+`pull_request.paths` (`tests/k8s/lib/**`) and its scoped planner suite.
+Non-PR events, empty or unavailable diffs, and
+edits to `GATE_CONTROLLER_PATHS` (`pr_ci_plan.py`, `live_suite_path_filter.py`)
+force every gated suite on. Missing/invalid planner outputs fail closed to
+`true` in `CI Plan`. Non-mesh-plugin-only, admin-only, Dockerfile, and dedicated
+ambient-host-UDP/k8s-live paths do not schedule these three jobs. The
+deploy-only multicluster job remains a
 distinct packaging-and-rollout check; authoritative datapath coverage rides the
 dedicated `multicluster-federation-live.yml` workflow (path-filtered on PRs,
 force-run on every `main` push). PRs outside those curated path sets skip the
@@ -662,11 +697,12 @@ prove each rejection dimension) in the `Tests` aggregate.
 
 In full mode, the `Tests` aggregate waits for the planner/format checks, test
 shards, lint, dependency audit, vendored patch regressions,
-planner-gated Secret Backends / PKCS#11 / mesh / Helm gates, eBPF/netns gates,
-performance, and the cross-platform build matrix. When the planner marks
-`run_secrets_backends` or `run_pkcs11` false, the aggregate accepts a skipped
-Secret Backends or PKCS#11 job; when the planner marks either true, that job
-must succeed. In light mode it requires the planner to succeed
+planner-gated Secret Backends / PKCS#11 / mesh / Helm gates, per-suite eBPF
+kernel / netns-capture / two-cluster live gates, performance, and the
+cross-platform build matrix. When the planner marks `run_secrets_backends` or
+`run_pkcs11` false, the aggregate accepts a skipped Secret Backends or PKCS#11
+job; when the planner marks either true, that job must succeed. In light mode
+it requires the planner to succeed
 and accepts the planned heavy jobs as skipped. Pushes to `main` publish the
 `latest` prerelease and Docker images only after the full aggregate and build
 matrix pass.
@@ -876,6 +912,31 @@ nightly to build `ferrum-ebpf`, uses stable to run
 `cargo test -p ferrum-ebpf-common`, and uploads the compiled `ebpf-programs`
 artifact with 14-day retention. If this job is edited, preserve the intent that
 the shared-types test runs on stable Rust.
+
+#### 4b. eBPF / netns / two-cluster live jobs (`ci.yml`)
+
+**Runs**: `ubuntu-latest` (privileged), only when `CI Plan` marks the matching
+gate `true`
+
+These three jobs used to share one `run_ebpf_live` allow-list. They now have
+separate fail-closed planner outputs and the `Tests` aggregate enforces each
+with `require_planned_gate` against that job's own output:
+
+| Job | Planner output | Distinctive surfaces |
+|---|---|---|
+| `ebpf-live` | `run_ebpf_kernel_live` | `ebpf/`, `src/ebpf/`, `src/capture/`, `src/proxy/mod.rs`, `src/socket_opts.rs`, `src/modes/node_agent.rs`, `setup-bpf-linker` |
+| `netns-capture-live` | `run_netns_capture_live` | netns/UDP/TPROXY/SO_ORIGINAL_DST producers, `src/capture/`, HBONE pool/proxy, mesh runtime, MeshSubscribe (`src/grpc/mesh_*`, `auth.rs`, `cp_server.rs`, `dp_client.rs`), backend dispatch/TCP relay, routing/service discovery, mesh policy, identity, TLS, `mesh_trust_registry`, source-capture functional tests |
+| `two-cluster-mesh-live` | `run_two_cluster_live` | `src/modes/mesh/`, `src/identity/`, `src/tls/`, MeshSubscribe JWT/gRPC helpers (including `cp_server.rs`), backend dispatch/TCP relay, routing/service discovery, mesh policy, HBONE, east-west, `SO_ORIGINAL_DST`, `mesh_trust_registry`, `two_cluster_spire.sh` |
+
+All three also schedule on shared compile/CI inputs (`Cargo.toml`/`Cargo.lock`,
+`rust-toolchain.toml`, `.cargo/`, `vendor/`, `build.rs`, `.github/workflows/ci.yml`,
+and the rust-ci/sccache/fast-linker actions). `tests/functional/functional_mesh_mode_test.rs`
+schedules netns-capture live and two-cluster live only; kernel live does not
+run from that file because `ebpf-live` executes `ebpf::loader::live_kernel_tests`.
+Empty diffs, non-PR/`main`/manual events, and planner controller edits force
+every gate on. The dedicated `ambient-host-udp-live.yml` and
+`node-waypoint-ebpf-live.yml` workflows keep their own path filters; they are
+not part of these three `ci.yml` jobs.
 
 #### 5. NodeWaypoint eBPF Live Datapath Workflow
 
