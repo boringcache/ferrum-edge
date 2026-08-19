@@ -47,7 +47,7 @@ use crate::config::PoolConfig;
 use crate::config::types::{BackendScheme, Proxy};
 use crate::dns::{DnsCache, DnsConfig};
 use crate::plugins::{BufferedInitialResponseHeaderPolicyState, Plugin};
-use crate::pool::{GenericPool, PoolManager};
+use crate::pool::{CoalescedCreateAttempt, GenericPool, PoolManager};
 use crate::proxy::hbone_pool::HbonePoolError;
 use crate::proxy::headers::{
     is_backend_response_strip_header, merge_proxy_headers_and_strip_for_grpc,
@@ -746,6 +746,29 @@ impl GrpcConnectionPool {
         &self,
         proxy: &Proxy,
     ) -> Result<http2::SendRequest<GrpcBody>, GrpcProxyError> {
+        self.get_sender_with_purpose(proxy, GrpcEstablishmentPurpose::Request)
+            .await
+    }
+
+    /// Acquire a sender for startup/reload backend capability classification.
+    ///
+    /// Same pool and handshake as [`Self::get_sender`]. Probe purpose quiets
+    /// only an expected HTTP/1.1 h2c miss, and only when no live request
+    /// participates in the coalesced create. A request waiter on the same
+    /// pool key upgrades that attempt to the request-time WARN/ERROR.
+    pub async fn get_sender_for_capability_probe(
+        &self,
+        proxy: &Proxy,
+    ) -> Result<http2::SendRequest<GrpcBody>, GrpcProxyError> {
+        self.get_sender_with_purpose(proxy, GrpcEstablishmentPurpose::CapabilityProbe)
+            .await
+    }
+
+    async fn get_sender_with_purpose(
+        &self,
+        proxy: &Proxy,
+        purpose: GrpcEstablishmentPurpose,
+    ) -> Result<http2::SendRequest<GrpcBody>, GrpcProxyError> {
         let pool_config = self.pool.manager().global_pool_config.for_proxy(proxy);
         let shard_count = pool_config.http2_connections_per_host.max(1);
 
@@ -839,10 +862,17 @@ impl GrpcConnectionPool {
         let manager = Arc::clone(self.pool.manager());
         match self
             .pool
-            .create_or_get_existing_owned(selected_key, |key| async move {
-                let _ = key;
-                manager.create_connection(proxy, svid_generation).await
-            })
+            .create_or_get_existing_owned_with_attempt(
+                selected_key,
+                |attempt| note_grpc_establishment_join(attempt, purpose),
+                |attempt| note_grpc_establishment_waiter_failure(attempt, purpose),
+                |key, attempt| async move {
+                    let _ = key;
+                    manager
+                        .create_connection(proxy, svid_generation, purpose, Some(attempt))
+                        .await
+                },
+            )
             .await
         {
             Ok(sender) => Ok(sender),
@@ -931,6 +961,8 @@ impl GrpcPoolManager {
         &self,
         proxy: &Proxy,
         svid_generation: Option<u64>,
+        purpose: GrpcEstablishmentPurpose,
+        attempt: Option<CoalescedCreateAttempt>,
     ) -> Result<http2::SendRequest<GrpcBody>, GrpcProxyError> {
         let host = &proxy.backend_host;
         let port = proxy.backend_port;
@@ -1071,6 +1103,8 @@ impl GrpcPoolManager {
             .map(|(sender, _)| sender)
             .map_err(|error| match error {
                 crate::dns::CandidateConnectError::TimedOut { last_addr } => {
+                    // Timeouts stay WARN for both request-time dials and capability
+                    // probes: a hung origin is not an expected HTTP/1.1 miss.
                     warn!(
                         "gRPC: protocol establishment budget exhausted ({}ms) for backend {} \
                          (last={})",
@@ -1085,19 +1119,17 @@ impl GrpcPoolManager {
                     }
                 }
                 crate::dns::CandidateConnectError::Failed { last_addr, source } => {
-                    if crate::retry::is_port_exhaustion(&source) {
-                        tracing::error!(
-                            "gRPC: PORT EXHAUSTION connecting to backend {}: {} — \
-                             reduce outbound connection rate or increase net.ipv4.ip_local_port_range",
-                            last_addr,
-                            source
-                        );
-                    } else {
-                        warn!(
-                            "gRPC: all DNS candidates failed protocol establishment for backend {} \
-                             (last={}): {}",
-                            host, last_addr, source
-                        );
+                    match attempt {
+                        Some(attempt) => {
+                            log_grpc_coalesced_establishment_failure(
+                                &attempt, purpose, host, last_addr, &source,
+                            );
+                        }
+                        None => {
+                            log_grpc_protocol_establishment_failure(
+                                purpose, host, last_addr, &source,
+                            );
+                        }
                     }
                     source
                 }
@@ -1264,9 +1296,14 @@ impl PoolManager for GrpcPoolManager {
     }
 
     async fn create(&self, _key: &str, proxy: &Proxy) -> Result<http2::SendRequest<GrpcBody>> {
-        self.create_connection(proxy, self.svid_generation_for_proxy(proxy))
-            .await
-            .map_err(anyhow::Error::from)
+        self.create_connection(
+            proxy,
+            self.svid_generation_for_proxy(proxy),
+            GrpcEstablishmentPurpose::Request,
+            None,
+        )
+        .await
+        .map_err(anyhow::Error::from)
     }
 
     fn is_healthy(&self, conn: &Self::Connection) -> bool {
@@ -1338,6 +1375,173 @@ impl GrpcPoolManager {
             self.workload_svid_cert_path.as_deref(),
             self.current_svid_generation(),
         )
+    }
+}
+
+/// Why a gRPC HTTP/2 connection is being established.
+///
+/// Capability probes share the request-time pool and handshake, but an
+/// expected plaintext HTTP/1.1 classification miss must not be logged as a
+/// live gRPC outage. Request-time dials keep the existing WARN/ERROR surface.
+///
+/// Coalesced creates share one [`crate::pool::CoalescedCreateAttempt`]: if any live request
+/// participates in a failing attempt, request-time WARN/ERROR dominates even
+/// when a capability probe is the creator. Probe-only expected h2c misses stay
+/// DEBUG. A request that joins after a probe-only DEBUG may upgrade that one
+/// diagnostic once; waiters do not each emit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GrpcEstablishmentPurpose {
+    /// Live request-time gRPC dispatch, pool create, or any other production dial.
+    Request,
+    /// Startup, SIGHUP, or periodic backend capability classification.
+    CapabilityProbe,
+}
+
+/// Tracing severity for a gRPC protocol-establishment failure.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GrpcEstablishmentLogLevel {
+    Error,
+    Warn,
+    Debug,
+}
+
+impl GrpcEstablishmentLogLevel {
+    fn rank(self) -> u8 {
+        match self {
+            Self::Debug => CoalescedCreateAttempt::LOG_RANK_DEBUG,
+            Self::Warn => CoalescedCreateAttempt::LOG_RANK_WARN,
+            Self::Error => CoalescedCreateAttempt::LOG_RANK_ERROR,
+        }
+    }
+}
+
+/// Classify how loudly a gRPC establishment failure should be logged.
+///
+/// Port exhaustion is always `ERROR`. An expected h2c handshake miss during a
+/// capability probe is `DEBUG` (ordinary HTTP/1.1 origins). Timeouts, TLS
+/// failures, connect/DNS failures, and request-time gRPC misses stay `WARN`.
+pub fn grpc_establishment_failure_log_level(
+    purpose: GrpcEstablishmentPurpose,
+    error: &GrpcProxyError,
+) -> GrpcEstablishmentLogLevel {
+    if crate::retry::is_port_exhaustion(error) {
+        return GrpcEstablishmentLogLevel::Error;
+    }
+    match (purpose, error) {
+        (
+            GrpcEstablishmentPurpose::CapabilityProbe,
+            GrpcProxyError::BackendUnavailable {
+                kind: GrpcBackendUnavailableKind::H2cHandshake,
+                ..
+            },
+        ) => GrpcEstablishmentLogLevel::Debug,
+        _ => GrpcEstablishmentLogLevel::Warn,
+    }
+}
+
+/// Record live-request participation on a coalesced create join.
+pub fn note_grpc_establishment_join(
+    attempt: &CoalescedCreateAttempt,
+    purpose: GrpcEstablishmentPurpose,
+) {
+    if purpose == GrpcEstablishmentPurpose::Request {
+        attempt.mark_request_participant();
+    }
+}
+
+/// Upgrade a probe-only DEBUG if this waiter is a live request.
+pub fn note_grpc_establishment_waiter_failure(
+    attempt: &CoalescedCreateAttempt,
+    purpose: GrpcEstablishmentPurpose,
+) {
+    if purpose == GrpcEstablishmentPurpose::Request {
+        upgrade_grpc_coalesced_establishment_log(attempt);
+    }
+}
+
+/// Emit the establishment-failure diagnostic at the classified severity.
+///
+/// Messages name only host and socket address — never secrets, bearer tokens,
+/// cookies, or credential metadata.
+pub fn log_grpc_protocol_establishment_failure(
+    purpose: GrpcEstablishmentPurpose,
+    host: &str,
+    last_addr: impl std::fmt::Display,
+    error: &GrpcProxyError,
+) {
+    emit_grpc_establishment_failure(
+        grpc_establishment_failure_log_level(purpose, error),
+        host,
+        last_addr,
+        error,
+    );
+}
+
+/// Creator-side coalesced logger: one diagnostic per failed attempt, with
+/// request participation dominating probe-only DEBUG.
+pub fn log_grpc_coalesced_establishment_failure(
+    attempt: &CoalescedCreateAttempt,
+    purpose: GrpcEstablishmentPurpose,
+    host: &str,
+    last_addr: impl std::fmt::Display,
+    error: &GrpcProxyError,
+) {
+    note_grpc_establishment_join(attempt, purpose);
+    let last_addr = last_addr.to_string();
+    attempt.store_log_context(host, &last_addr, error.to_string());
+    let effective = if attempt.request_participant() {
+        GrpcEstablishmentPurpose::Request
+    } else {
+        purpose
+    };
+    let level = grpc_establishment_failure_log_level(effective, error);
+    if attempt.claim_log_rank(level.rank()) {
+        emit_grpc_establishment_failure(level, host, last_addr, error);
+    }
+}
+
+/// Late live-request upgrade of a probe-only DEBUG on the same attempt.
+pub fn upgrade_grpc_coalesced_establishment_log(attempt: &CoalescedCreateAttempt) {
+    let Some((host, last_addr, error)) = attempt.log_context() else {
+        return;
+    };
+    let host = host.to_owned();
+    let last_addr = last_addr.to_owned();
+    let error = error.to_owned();
+    if !attempt.try_upgrade_from_debug(GrpcEstablishmentLogLevel::Warn.rank()) {
+        return;
+    }
+    emit_grpc_establishment_failure(GrpcEstablishmentLogLevel::Warn, &host, last_addr, error);
+}
+
+fn emit_grpc_establishment_failure(
+    level: GrpcEstablishmentLogLevel,
+    host: &str,
+    last_addr: impl std::fmt::Display,
+    error: impl std::fmt::Display,
+) {
+    match level {
+        GrpcEstablishmentLogLevel::Error => {
+            error!(
+                "gRPC: PORT EXHAUSTION connecting to backend {}: {} — \
+                 reduce outbound connection rate or increase net.ipv4.ip_local_port_range",
+                last_addr, error
+            );
+        }
+        GrpcEstablishmentLogLevel::Debug => {
+            debug!(
+                "gRPC capability probe: expected h2c classification miss for backend {} \
+                 (last={}): {}",
+                host, last_addr, error
+            );
+        }
+        GrpcEstablishmentLogLevel::Warn => {
+            warn!(
+                "gRPC: all DNS candidates failed protocol establishment for backend {} \
+                 (last={}): {}",
+                host, last_addr, error
+            );
+        }
     }
 }
 
