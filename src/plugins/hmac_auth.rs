@@ -90,9 +90,9 @@
 //! Consumer credentials should include:
 //!   { "hmac_auth": { "secret": "<shared-secret>" } }
 
-use crate::fips::approved::{HmacSha256, HmacSha512, Sha256};
 #[cfg(test)]
 use crate::fips::approved::Sha512;
+use crate::fips::approved::{HmacSha256, HmacSha512, Sha256};
 use async_trait::async_trait;
 use base64::Engine as _;
 use serde_json::Value;
