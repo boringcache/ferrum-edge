@@ -5663,35 +5663,20 @@ async fn test_restore_file_mode_returns_503_no_database() {
     let (base_url, _shutdown) = start_test_admin(state).await;
     let token = generate_test_token(&tc);
 
-    let (status, body) = admin_post(
-        &base_url,
-        "/restore?confirm=true",
-        &token,
-        &json!({}),
-    )
-    .await;
+    let (status, body) = admin_post(&base_url, "/restore?confirm=true", &token, &json!({})).await;
     assert_eq!(
         status, 503,
         "file/DP restore must report no database, not read-only: {body:?}"
     );
     assert_eq!(body["error"], "No database");
 
-    let (status, body) = admin_post(
-        &base_url,
-        "/batch",
-        &token,
-        &json!({"proxies": []}),
-    )
-    .await;
+    let (status, body) = admin_post(&base_url, "/batch", &token, &json!({"proxies": []})).await;
     assert_eq!(
         status, 403,
         "other file-mode writes must stay read-only 403: {body:?}"
     );
     assert!(
-        body["error"]
-            .as_str()
-            .unwrap()
-            .contains("read-only"),
+        body["error"].as_str().unwrap().contains("read-only"),
         "batch in file mode must keep the generic RO body: {body:?}"
     );
 }
@@ -5724,10 +5709,7 @@ async fn test_restore_read_only_with_database_still_forbidden() {
         "database-mode read-only restore must not fall through to a write: {body:?}"
     );
     assert!(
-        body["error"]
-            .as_str()
-            .unwrap()
-            .contains("read-only"),
+        body["error"].as_str().unwrap().contains("read-only"),
         "genuine read-only restore must keep the 403 body: {body:?}"
     );
 }
@@ -5763,10 +5745,7 @@ async fn test_restore_rejects_omitted_resource_ids() {
         }),
     )
     .await;
-    assert_eq!(
-        status, 400,
-        "restore without ids must 400: {body:?}"
-    );
+    assert_eq!(status, 400, "restore without ids must 400: {body:?}");
     assert!(
         body["error"]
             .as_str()
@@ -5778,10 +5757,9 @@ async fn test_restore_rejects_omitted_resource_ids() {
         .as_array()
         .expect("validation_errors");
     assert!(
-        errors.iter().any(|e| e
-            .as_str()
-            .unwrap_or("")
-            .contains("POST /restore does not")),
+        errors
+            .iter()
+            .any(|e| e.as_str().unwrap_or("").contains("POST /restore does not")),
         "restore must explain that ids are required: {body:?}"
     );
 
@@ -5828,9 +5806,7 @@ async fn test_batch_rejects_unknown_envelope_keys() {
         "batch must name the unknown field: {body:?}"
     );
     assert!(
-        error.contains("updates")
-            || error.contains("deletes")
-            || error.contains("dry_run"),
+        error.contains("updates") || error.contains("deletes") || error.contains("dry_run"),
         "batch must reject unimplemented mutation verbs: {body:?}"
     );
 

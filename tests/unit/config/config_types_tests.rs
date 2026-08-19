@@ -5167,10 +5167,7 @@ fn proxy_deserializes_without_backend_host_when_upstream_id_is_set() {
     let proxy: Proxy = serde_json::from_str(json).unwrap();
     assert_eq!(proxy.backend_host, "");
     assert_eq!(proxy.backend_port, 0);
-    assert_eq!(
-        proxy.upstream_id.as_deref(),
-        Some("user-svc-upstream")
-    );
+    assert_eq!(proxy.upstream_id.as_deref(), Some("user-svc-upstream"));
     if let Err(errors) = proxy.validate_fields() {
         assert!(
             errors
