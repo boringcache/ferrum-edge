@@ -49,7 +49,7 @@ pub fn resolve_pod_cgroup_path_cached(cgroup_root: &str, pod_uid: &str) -> Optio
         &mut slot,
         cgroup_root,
         pod_uid,
-        |root, uid| resolve_pod_cgroup_path(root, uid),
+        resolve_pod_cgroup_path,
         |path| path.exists(),
     )
 }
