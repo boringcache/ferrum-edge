@@ -207,9 +207,8 @@ const CGROUP_TREE_MAX_VISITS: usize = 512;
 // walk and legitimate generations start being refused. The two constants live
 // in separate crates, so make the coupling a compile error rather than a doc
 // comment two people have to read.
-const _: () = assert!(
-    CGROUP_TREE_MAX_INODES == ferrum_ebpf_common::UDP_RELAY_CGROUP_MAX_ENTRIES as usize
-);
+const _: () =
+    assert!(CGROUP_TREE_MAX_INODES == ferrum_ebpf_common::UDP_RELAY_CGROUP_MAX_ENTRIES as usize);
 
 /// How many times [`collect_cgroup_tree`] restarts the walk after a descendant
 /// vanished (`ENOENT`) partway through it.
