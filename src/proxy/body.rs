@@ -2508,7 +2508,11 @@ impl http_body::Body for DirectH2RequestBody {
                         "request body forwarding cancelled after upload timeout".into(),
                     )));
                 }
-                match Pin::new(inner).poll_frame(cx) {
+                // `Incoming` implements BOTH this module's `FrameSource` and
+                // `http_body::Body`, so the call must name the trait (E0034).
+                // `http_body::Body` is the one whose error converts into
+                // `BoxError` below.
+                match http_body::Body::poll_frame(Pin::new(inner), cx) {
                     Poll::Ready(Some(Ok(frame))) => {
                         if let Some(data) = frame.data_ref() {
                             *seen = seen.saturating_add(data.len() as u64);
