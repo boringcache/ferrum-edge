@@ -7,6 +7,79 @@
 
 use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
+use std::sync::{Mutex, OnceLock};
+
+/// Single-entry memo for [`resolve_pod_cgroup_path_cached`].
+///
+/// Deliberately one slot, not a map: exactly one NodeWaypoint relay pod is
+/// resolved on a timer at any moment, so a single `(cgroup_root, pod_uid,
+/// path)` tuple is inherently bounded and cannot grow as pods churn.
+static RELAY_POD_CGROUP_PATH_MEMO: OnceLock<Mutex<Option<(String, String, PathBuf)>>> =
+    OnceLock::new();
+
+/// [`resolve_pod_cgroup_path`] for callers that resolve the SAME pod on a
+/// timer rather than once per pod event.
+///
+/// `resolve_pod_cgroup_path`'s six fast paths only cover the plain
+/// `kubepods.slice` / `kubepods` layouts. On the kubeadm/kind systemd layout
+/// (`kubelet.slice/kubelet-kubepods.slice/...`, pinned by
+/// `resolve_pod_cgroup_path_finds_kubelet_slice_systemd_pod`) every call falls
+/// through to `discover_pod_cgroup_paths`, a breadth-first walk bounded at
+/// `POD_CGROUP_DISCOVERY_MAX_DIRS` directories that does not early-exit on a
+/// match. The NodeWaypoint relay reconcile runs every
+/// `UDP_CAPTURE_READINESS_POLL` (250 ms), so calling the uncached resolver
+/// there costs thousands of directory reads per second, forever, on a
+/// steady-state node.
+///
+/// The memo is validated by a single `exists()` check before reuse. That is
+/// sound because the resolved path embeds the pod UID: if the pod's cgroup
+/// moves to a different parent slice the cached path stops existing and the
+/// walk is redone. Callers still re-run [`collect_cgroup_tree`] on the
+/// returned path every poll, so a container leaf that moves WITHIN the pod
+/// subtree is still detected — only the discovery is cached, never the inode
+/// set.
+pub fn resolve_pod_cgroup_path_cached(cgroup_root: &str, pod_uid: &str) -> Option<PathBuf> {
+    let memo = RELAY_POD_CGROUP_PATH_MEMO.get_or_init(|| Mutex::new(None));
+    let mut slot = match memo.lock() {
+        Ok(slot) => slot,
+        // A poisoned memo is a cache, not state: recover and keep serving.
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    resolve_pod_cgroup_path_with_memo(
+        &mut slot,
+        cgroup_root,
+        pod_uid,
+        |root, uid| resolve_pod_cgroup_path(root, uid),
+        |path| path.exists(),
+    )
+}
+
+/// Memo policy for [`resolve_pod_cgroup_path_cached`], with the slot, the
+/// resolver, and the liveness probe injected so the cache-hit, stale-path, and
+/// changed-identity transitions are testable without touching the process
+/// global or the real filesystem.
+fn resolve_pod_cgroup_path_with_memo(
+    slot: &mut Option<(String, String, PathBuf)>,
+    cgroup_root: &str,
+    pod_uid: &str,
+    mut resolve: impl FnMut(&str, &str) -> Option<PathBuf>,
+    mut still_exists: impl FnMut(&Path) -> bool,
+) -> Option<PathBuf> {
+    if let Some((cached_root, cached_uid, cached_path)) = slot.as_ref()
+        && cached_root == cgroup_root
+        && cached_uid == pod_uid
+        && still_exists(cached_path)
+    {
+        return Some(cached_path.clone());
+    }
+    let resolved = resolve(cgroup_root, pod_uid)?;
+    *slot = Some((
+        cgroup_root.to_string(),
+        pod_uid.to_string(),
+        resolved.clone(),
+    ));
+    Some(resolved)
+}
 
 /// Resolve the cgroup v2 path for a Kubernetes pod.
 ///
@@ -479,5 +552,113 @@ mod tests {
     fn collect_cgroup_tree_inodes_empty_for_missing_path() {
         let dir = tempfile::tempdir().unwrap();
         assert!(collect_cgroup_tree_inodes(&dir.path().join("does-not-exist")).is_empty());
+    }
+
+    /// The relay reconcile calls this on a 250 ms timer, and the uncached
+    /// resolver walks up to 4096 directories on the kubeadm/kind
+    /// `kubelet.slice` layout. A repeat call for the same live pod must not
+    /// re-walk.
+    #[test]
+    fn memoized_relay_path_reuses_a_live_entry_without_re_resolving() {
+        let mut slot = None;
+        let mut resolves = 0usize;
+        let mut resolve = |_root: &str, _uid: &str| {
+            resolves += 1;
+            Some(PathBuf::from("/sys/fs/cgroup/kubelet.slice/pod-a"))
+        };
+
+        let first =
+            resolve_pod_cgroup_path_with_memo(&mut slot, "/sys/fs/cgroup", "uid-a", &mut resolve, |_| true);
+        let second =
+            resolve_pod_cgroup_path_with_memo(&mut slot, "/sys/fs/cgroup", "uid-a", &mut resolve, |_| true);
+
+        assert_eq!(first, second);
+        assert_eq!(resolves, 1, "a live cached path must not be re-walked");
+    }
+
+    /// The cached path embeds the pod UID, so it stopping existing means the
+    /// pod's cgroup moved to a different parent slice. That must re-walk.
+    #[test]
+    fn memoized_relay_path_rewalks_when_the_cached_path_is_gone() {
+        let mut slot = Some((
+            "/sys/fs/cgroup".to_string(),
+            "uid-a".to_string(),
+            PathBuf::from("/sys/fs/cgroup/kubepods.slice/old"),
+        ));
+        let mut resolves = 0usize;
+        let resolved = resolve_pod_cgroup_path_with_memo(
+            &mut slot,
+            "/sys/fs/cgroup",
+            "uid-a",
+            |_root, _uid| {
+                resolves += 1;
+                Some(PathBuf::from("/sys/fs/cgroup/kubelet.slice/new"))
+            },
+            |_| false,
+        );
+
+        assert_eq!(resolved, Some(PathBuf::from("/sys/fs/cgroup/kubelet.slice/new")));
+        assert_eq!(resolves, 1);
+        assert_eq!(
+            slot.as_ref().map(|(_, _, path)| path.clone()),
+            Some(PathBuf::from("/sys/fs/cgroup/kubelet.slice/new")),
+            "the memo must adopt the new path"
+        );
+    }
+
+    /// A different relay identity (pod restart mints a new UID) must never be
+    /// served the previous pod's cgroup path, even while that path still
+    /// exists.
+    #[test]
+    fn memoized_relay_path_never_serves_a_different_identity() {
+        let mut slot = Some((
+            "/sys/fs/cgroup".to_string(),
+            "uid-a".to_string(),
+            PathBuf::from("/sys/fs/cgroup/kubepods.slice/pod-a"),
+        ));
+        let resolved = resolve_pod_cgroup_path_with_memo(
+            &mut slot,
+            "/sys/fs/cgroup",
+            "uid-b",
+            |_root, uid| Some(PathBuf::from(format!("/sys/fs/cgroup/kubepods.slice/{uid}"))),
+            |_| true,
+        );
+        assert_eq!(
+            resolved,
+            Some(PathBuf::from("/sys/fs/cgroup/kubepods.slice/uid-b"))
+        );
+
+        // Same UID, different cgroup root, is also a different identity.
+        let mut slot = Some((
+            "/sys/fs/cgroup".to_string(),
+            "uid-a".to_string(),
+            PathBuf::from("/sys/fs/cgroup/kubepods.slice/pod-a"),
+        ));
+        let resolved = resolve_pod_cgroup_path_with_memo(
+            &mut slot,
+            "/host/sys/fs/cgroup",
+            "uid-a",
+            |root, uid| Some(PathBuf::from(format!("{root}/kubepods.slice/{uid}"))),
+            |_| true,
+        );
+        assert_eq!(
+            resolved,
+            Some(PathBuf::from("/host/sys/fs/cgroup/kubepods.slice/uid-a"))
+        );
+    }
+
+    /// A resolver miss must not poison the memo with a stale entry.
+    #[test]
+    fn memoized_relay_path_leaves_the_slot_untouched_on_a_miss() {
+        let mut slot = None;
+        let resolved = resolve_pod_cgroup_path_with_memo(
+            &mut slot,
+            "/sys/fs/cgroup",
+            "uid-a",
+            |_root, _uid| None,
+            |_| true,
+        );
+        assert_eq!(resolved, None);
+        assert!(slot.is_none(), "a miss must not cache anything");
     }
 }

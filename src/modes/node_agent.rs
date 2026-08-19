@@ -6791,7 +6791,13 @@ fn resolve_node_waypoint_relay_cgroups(
         return Err("relay_identity_names_enrolled_pod");
     }
 
-    let Some(cgroup_path) = cgroup::resolve_pod_cgroup_path(&config.cgroup_root, pod_uid) else {
+    // Cached resolver: this runs on the `UDP_CAPTURE_READINESS_POLL` timer for
+    // the same relay pod, and the uncached one falls through to a bounded but
+    // unconditional 4096-directory walk on the kubeadm/kind `kubelet.slice`
+    // layout. The subtree walk below is NOT cached, so a container leaf that
+    // moves within the pod is still detected every poll.
+    let Some(cgroup_path) = cgroup::resolve_pod_cgroup_path_cached(&config.cgroup_root, pod_uid)
+    else {
         return Err("relay_cgroup_unresolved");
     };
     let walk = cgroup::collect_cgroup_tree(&cgroup_path);
