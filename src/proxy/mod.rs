@@ -23368,8 +23368,7 @@ pub(crate) const X_GATEWAY_ERROR_CIRCUIT_BREAKER_OPEN: &str = "circuit_breaker_o
 /// that run before a proxy is matched, so no per-route `allowed_methods`
 /// exists. TRACE and CONNECT are omitted because this same filter rejected
 /// them. Static so the reject path does not allocate the value.
-pub(crate) const PROTOCOL_LEVEL_405_ALLOW: &str =
-    "GET, HEAD, POST, PUT, PATCH, DELETE, OPTIONS";
+pub(crate) const PROTOCOL_LEVEL_405_ALLOW: &str = "GET, HEAD, POST, PUT, PATCH, DELETE, OPTIONS";
 
 /// Client-visible `X-Gateway-Error` value for an HTTP-family backend
 /// dispatch or status failure. `None` for non-5xx. Circuit-breaker-open
@@ -23397,8 +23396,7 @@ pub(crate) fn restore_authoritative_gateway_error_header(
     response_headers: &mut HashMap<String, String>,
     value: &'static str,
 ) {
-    response_headers
-        .retain(|name, _| !name.eq_ignore_ascii_case(X_GATEWAY_ERROR_HEADER));
+    response_headers.retain(|name, _| !name.eq_ignore_ascii_case(X_GATEWAY_ERROR_HEADER));
     response_headers.insert(X_GATEWAY_ERROR_HEADER.to_string(), value.to_string());
 }
 
@@ -23407,9 +23405,7 @@ pub(crate) fn insert_x_gateway_error_for_backend_failure(
     connection_error: bool,
     status: u16,
 ) {
-    if let Some(value) =
-        x_gateway_error_for_backend_failure(connection_error, status)
-    {
+    if let Some(value) = x_gateway_error_for_backend_failure(connection_error, status) {
         restore_authoritative_gateway_error_header(response_headers, value);
     }
 }
@@ -37532,10 +37528,9 @@ async fn handle_proxy_request_inner(
     //   X-Gateway-Error: connection_failure | backend_timeout | backend_error
     //     | circuit_breaker_open (open-breaker 503s use the reject path)
     //   X-Gateway-Upstream-Status: degraded (when routing via all-unhealthy fallback)
-    if let Some(value) = x_gateway_error_for_backend_failure(
-        backend_resp.connection_error,
-        response_status,
-    ) {
+    if let Some(value) =
+        x_gateway_error_for_backend_failure(backend_resp.connection_error, response_status)
+    {
         resp_builder = resp_builder.header("X-Gateway-Error", value);
     }
 

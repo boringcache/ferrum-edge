@@ -425,8 +425,7 @@ async fn h3_cross_protocol_refused_connect_sets_x_gateway_error() {
         let backend_port = unbound_port().await.expect("unbound port");
         let yaml = crate::scaffolding::file_mode_yaml_for_backend(backend_port);
         let (harness, _ca_pem, _https_port) =
-            spawn_h3_harness_with_explicit_https_port_and_config(yaml, false, None)
-                .await;
+            spawn_h3_harness_with_explicit_https_port_and_config(yaml, false, None).await;
         let resp = match h3_get(&harness, "/api/anything").await {
             Ok(resp) => resp,
             Err(err) => {

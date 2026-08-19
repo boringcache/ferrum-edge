@@ -3694,8 +3694,7 @@ where
                             bytes_sent,
                         )
                         .await?;
-                        outcome.backend_target =
-                            Some(strip_query_from_backend_url(&current_url));
+                        outcome.backend_target = Some(strip_query_from_backend_url(&current_url));
                         return Ok(outcome);
                     }
                 }
@@ -9348,8 +9347,8 @@ async fn write_classified_backend_dispatch_error<S>(
 where
     S: RecvStream + SendStream<Bytes>,
 {
-    let status = StatusCode::from_u16(attempt_result.status_code)
-        .unwrap_or(StatusCode::BAD_GATEWAY);
+    let status =
+        StatusCode::from_u16(attempt_result.status_code).unwrap_or(StatusCode::BAD_GATEWAY);
     let body = match &attempt_result.body {
         crate::retry::ResponseBody::Buffered(bytes) => bytes.clone(),
         crate::retry::ResponseBody::Streaming { .. }

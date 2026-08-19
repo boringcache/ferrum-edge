@@ -9820,10 +9820,7 @@ fn h3_backend_failure_status_body(
     (status, body)
 }
 
-fn h3_backend_failure_headers(
-    connection_error: bool,
-    status: u16,
-) -> HashMap<String, String> {
+fn h3_backend_failure_headers(connection_error: bool, status: u16) -> HashMap<String, String> {
     let mut headers = HashMap::new();
     crate::proxy::insert_x_gateway_error_for_backend_failure(
         &mut headers,
@@ -10110,10 +10107,7 @@ async fn proxy_to_backend_h3_refined_response(
                 return Ok(H3RefinedResponse::Buffered(H3BufferedDispatchResult {
                     status: reject_status.as_u16(),
                     body: Bytes::from_static(reject_body.as_bytes()),
-                    headers: h3_backend_failure_headers(
-                        !request_on_wire,
-                        reject_status.as_u16(),
-                    ),
+                    headers: h3_backend_failure_headers(!request_on_wire, reject_status.as_u16()),
                     trailers: None,
                     error_class: Some(h3_error_class),
                     request_on_wire,
@@ -10404,8 +10398,7 @@ async fn collect_h3_open_response_body(
                     .backend_capabilities
                     .mark_h3_unsupported(proxy, upstream_target);
             }
-            let (status, body) =
-                crate::proxy::http_backend_failure_status_and_body(h3_error_class);
+            let (status, body) = crate::proxy::http_backend_failure_status_and_body(h3_error_class);
             return H3BufferedDispatchResult {
                 status,
                 body: Bytes::from_static(body.as_bytes()),
@@ -15252,10 +15245,7 @@ async fn proxy_to_backend_h3(
             H3BufferedDispatchResult {
                 status: reject_status.as_u16(),
                 body: Bytes::from_static(reject_body.as_bytes()),
-                headers: h3_backend_failure_headers(
-                    !request_on_wire,
-                    reject_status.as_u16(),
-                ),
+                headers: h3_backend_failure_headers(!request_on_wire, reject_status.as_u16()),
                 trailers: None,
                 error_class: Some(h3_error_class),
                 request_on_wire,

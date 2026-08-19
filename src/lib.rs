@@ -1479,8 +1479,7 @@ pub mod _test_support {
         crate::proxy::allow_header_from_allowed_methods(methods)
     }
 
-    pub const PROTOCOL_LEVEL_405_ALLOW_FOR_TEST: &str =
-        crate::proxy::PROTOCOL_LEVEL_405_ALLOW;
+    pub const PROTOCOL_LEVEL_405_ALLOW_FOR_TEST: &str = crate::proxy::PROTOCOL_LEVEL_405_ALLOW;
 
     pub fn set_grpc_deadline_budget_for_test(
         ctx: &mut crate::plugins::RequestContext,

@@ -391,8 +391,7 @@ async fn send_h2_prior_knowledge(
     req: Request<Full<Bytes>>,
     label: &str,
 ) -> (u16, String) {
-    let (status, body_str, _) =
-        send_h2_prior_knowledge_with_headers(proxy_port, req, label).await;
+    let (status, body_str, _) = send_h2_prior_knowledge_with_headers(proxy_port, req, label).await;
     (status, body_str)
 }
 
@@ -422,12 +421,7 @@ async fn send_h2_prior_knowledge_with_headers(
     let headers = resp
         .headers()
         .iter()
-        .map(|(k, v)| {
-            (
-                k.as_str().to_string(),
-                v.to_str().unwrap_or("").to_string(),
-            )
-        })
+        .map(|(k, v)| (k.as_str().to_string(), v.to_str().unwrap_or("").to_string()))
         .collect();
     let body = resp
         .into_body()
@@ -1620,9 +1614,7 @@ async fn functional_protocol_validation_trace_rejected_http3() {
         resp.body_text()
     );
     assert_eq!(
-        resp.headers
-            .get("allow")
-            .and_then(|v| v.to_str().ok()),
+        resp.headers.get("allow").and_then(|v| v.to_str().ok()),
         Some("GET, HEAD, POST, PUT, PATCH, DELETE, OPTIONS"),
         "RFC 9110 requires Allow on 405"
     );
@@ -2397,8 +2389,7 @@ async fn functional_protocol_validation_connect_rejected_http2_non_websocket_pro
     req.extensions_mut()
         .insert(hyper::ext::Protocol::from_static("connect-udp"));
     let (status, body_str, headers) =
-        send_h2_prior_knowledge_with_headers(h.proxy_port, req, "CONNECT connect-udp")
-            .await;
+        send_h2_prior_knowledge_with_headers(h.proxy_port, req, "CONNECT connect-udp").await;
 
     assert_eq!(status, 405, "body={body_str}");
     assert!(body_str.contains("CONNECT"), "unexpected body: {body_str}");
