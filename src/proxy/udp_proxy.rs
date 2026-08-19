@@ -3820,10 +3820,7 @@ fn spawn_new_session_datagram(
                     &proxy_id,
                     ProxyProtocol::Udp,
                 );
-                let proxy = epoch.proxy_by_namespaced_id(
-                    &proxy_namespace,
-                    &proxy_id,
-                );
+                let proxy = epoch.proxy_by_namespaced_id(&proxy_namespace, &proxy_id);
                 let protocol = proxy
                     .map(|p| p.effective_scheme().to_scheme_str())
                     .unwrap_or("udp");

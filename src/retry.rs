@@ -652,9 +652,7 @@ fn classify_typed_chain(
                         ErrorClass::ConnectionClosed
                     });
                 }
-                std::io::ErrorKind::UnexpectedEof
-                    if error_is_tls_close_without_notify(io_err) =>
-                {
+                std::io::ErrorKind::UnexpectedEof if error_is_tls_close_without_notify(io_err) => {
                     // Peer TCP FIN without TLS `close_notify`. Extremely
                     // common teardown (Python `ssl`, many clients) — not a
                     // handshake failure. Post-wire `ConnectionClosed` so
@@ -806,8 +804,7 @@ fn classify_substring_fallback(error_str: &str, debug_str: &str) -> Option<Error
     // Peer omitted TLS `close_notify` on close. Must run BEFORE the TLS
     // token block: the rustls wording contains `" TLS "` inside
     // `"sending TLS close_notify"` and would otherwise become `TlsError`.
-    if error_str.contains(TLS_CLOSE_WITHOUT_NOTIFY)
-        || debug_str.contains(TLS_CLOSE_WITHOUT_NOTIFY)
+    if error_str.contains(TLS_CLOSE_WITHOUT_NOTIFY) || debug_str.contains(TLS_CLOSE_WITHOUT_NOTIFY)
     {
         return Some(ErrorClass::ConnectionClosed);
     }

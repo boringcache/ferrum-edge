@@ -431,10 +431,7 @@ mod tests {
             StreamSetupKind::ClientDisconnectedDuringAdmission.prefix(),
             "client disconnected during plugin admission"
         );
-        assert_eq!(
-            StreamSetupKind::DnsLookup.prefix(),
-            "DNS resolution failed"
-        );
+        assert_eq!(StreamSetupKind::DnsLookup.prefix(), "DNS resolution failed");
         assert_eq!(
             StreamSetupKind::NoHealthyTargets.prefix(),
             "No healthy targets"
@@ -517,9 +514,7 @@ mod tests {
             "DTLS legacy wording must use ': ' (no preceding space)"
         );
 
-        let inner = std::io::Error::other(
-            "DNS resolution returned no addresses for backend.local",
-        );
+        let inner = std::io::Error::other("DNS resolution returned no addresses for backend.local");
         let dns = StreamSetupError::dns_lookup("backend.local", inner);
         let displayed = format!("{dns}");
         assert!(
