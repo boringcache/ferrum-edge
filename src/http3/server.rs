@@ -15343,7 +15343,10 @@ async fn send_h3_backend_failure_response(
     send_h3_finalized_reject_response(
         stream,
         status,
-        Bytes::from_static(body.as_bytes()),
+        // `body` is a runtime `&str` — the classifier picks the message per
+        // failure — so it cannot be promoted to `&'static [u8]`. These are
+        // short fixed error bodies; a copy is the correct trade.
+        Bytes::copy_from_slice(body.as_bytes()),
         &headers,
         RejectBodyDisposition::WireBody,
     )
