@@ -1109,7 +1109,9 @@ impl OidcRelyingParty {
     }
 
     /// Validate an ID token's signature and `iss`/`aud`/`exp` against the
-    /// provider JWKS. Nonce and subject binding are layered on by the callers.
+    /// provider JWKS. The ID token header `kid` must select exactly one current
+    /// trusted key; missing, empty, and unknown identifiers fail closed with no
+    /// all-keys fallback. Nonce and subject binding are layered on by the callers.
     async fn verify_id_token_jwks(&self, id_token: &str) -> Result<Value, String> {
         let guard = self.provider.jwks_store.load();
         let Some(store) = guard.as_ref().as_ref().cloned() else {

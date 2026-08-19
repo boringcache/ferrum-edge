@@ -363,6 +363,24 @@ pub(crate) const STREAM_ERR_UNSUPPORTED_STREAM_POLICY: &str = "Unsupported strea
 /// credential, its subject, or its expiry instant.
 pub(crate) const STREAM_ERR_AUTHORIZATION_EXPIRED: &str =
     "Authenticated stream authorization lifetime elapsed during setup";
+/// An operator withdrew the frontend client-certificate trust decision this
+/// stream was admitted under, while post-admission setup was still running
+/// (issue #3857). A compiled-in literal: it names the contract, never the
+/// certificate, its subject, its serial, its issuer, or the generation.
+pub(crate) const STREAM_ERR_CLIENT_TRUST_WITHDRAWN: &str =
+    "Frontend client trust withdrawn during setup";
+/// Fixed detail suffix for every client-trust setup fence.
+///
+/// It states only what is true at EVERY fence. A withdrawal can land after a
+/// partially written outbound PROXY v2 header, or after the inspected-prefix
+/// forward already delivered the bytes it wrote before the fence fired, so
+/// "before any backend byte was written" was not a claim this refusal could
+/// make. What the fence does guarantee is that nothing FURTHER is written on
+/// the retired session's behalf: the in-flight stage is dropped and the relay
+/// never starts. Compiled-in and redacted: it names the contract, never the
+/// certificate, its subject, its serial, its issuer, or the generation.
+pub(crate) const STREAM_TRUST_WITHDRAWN_SETUP_DETAIL: &str =
+    "with no further backend bytes written";
 
 /// Run one post-admission setup stage under the admitted stream's absolute
 /// authorization deadline (issue #3816).
@@ -467,6 +485,279 @@ fn settle_stream_auth_setup_expiry(
         "before any backend byte was written".to_string(),
     )
     .into()
+}
+
+/// Why one post-admission TCP setup stage was interrupted.
+///
+/// The two causes are independent and earliest-wins: a credential can elapse
+/// while trust still stands, and an operator can withdraw trust long before the
+/// credential's own `notAfter`. When both are eligible at the same observation
+/// the withdrawal is reported, matching the biased ordering the WebSocket stop
+/// arbiter and the DTLS delivery fence already use — an authority decision the
+/// operator has already taken outranks a timer that merely also elapsed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum StreamSetupInterrupt {
+    /// The admitted credential's authorization lifetime elapsed (issue #3816).
+    AuthorizationExpired(crate::proxy::auth_lifetime::StreamAuthTermination),
+    /// The frontend client-certificate trust decision this transport was
+    /// admitted under was withdrawn (issue #3857).
+    TrustWithdrawn,
+}
+
+/// Run one post-admission setup stage under BOTH post-admission bounds: the
+/// admitted stream's absolute authorization deadline (issue #3816) and the
+/// established transport's client-trust retirement (issue #3857).
+///
+/// Registration happens immediately after the frontend handshake, but every
+/// stage between it and the first relayed byte — DNS resolution, retry backoff,
+/// backend connect, backend TLS handshake, outbound PROXY framing, and the
+/// inspected-prefix forward — is an await that the relay's `TrustFencedStream`
+/// cannot reach, because the client leg is not polled while they run. Without
+/// this wrapper a withdrawal that landed mid-setup retired the session while
+/// setup carried on and could still write to a backend on its behalf.
+///
+/// An already-visible withdrawal never polls `stage`. One that becomes ready
+/// together with `stage` wins the biased race, and dropping `stage` is what
+/// guarantees a half-completed dial, handshake, or write is abandoned rather
+/// than finished. An unregistered transport (no client certificate, or an
+/// unarmed scope) registers no retirement future at all and keeps the previous
+/// deadline-only behaviour byte for byte.
+pub(crate) async fn within_stream_setup_bounds<F>(
+    plan: Option<crate::proxy::auth_lifetime::StreamAuthDeadline>,
+    client_trust: Option<&crate::tls::ClientTrustSession>,
+    stage: F,
+) -> Result<F::Output, StreamSetupInterrupt>
+where
+    F: std::future::Future,
+{
+    let Some(session) = client_trust else {
+        return within_stream_auth_deadline(plan, stage)
+            .await
+            .map_err(StreamSetupInterrupt::AuthorizationExpired);
+    };
+    if session.is_retired() {
+        return Err(StreamSetupInterrupt::TrustWithdrawn);
+    }
+    tokio::select! {
+        biased;
+        _ = session.retired() => Err(StreamSetupInterrupt::TrustWithdrawn),
+        result = within_stream_auth_deadline(plan, stage) => {
+            result.map_err(StreamSetupInterrupt::AuthorizationExpired)
+        }
+    }
+}
+
+/// Wait out one connect-retry backoff under both post-admission bounds.
+///
+/// A backoff is the longest unattended setup wait there is — `retry_delay`
+/// grows with the attempt number — so a withdrawal must end it rather than
+/// waiting for the sleep to finish and the next attempt to fail.
+pub(crate) async fn retry_backoff_within_stream_setup_bounds(
+    plan: Option<crate::proxy::auth_lifetime::StreamAuthDeadline>,
+    client_trust: Option<&crate::tls::ClientTrustSession>,
+    delay: std::time::Duration,
+) -> Result<(), StreamSetupInterrupt> {
+    let Some(session) = client_trust else {
+        return retry_backoff_within_stream_auth_deadline(plan, delay)
+            .await
+            .map_err(StreamSetupInterrupt::AuthorizationExpired);
+    };
+    if session.is_retired() {
+        return Err(StreamSetupInterrupt::TrustWithdrawn);
+    }
+    tokio::select! {
+        biased;
+        _ = session.retired() => Err(StreamSetupInterrupt::TrustWithdrawn),
+        result = retry_backoff_within_stream_auth_deadline(plan, delay) => {
+            result.map_err(StreamSetupInterrupt::AuthorizationExpired)
+        }
+    }
+}
+
+/// Settle whichever post-admission bound ended setup, exactly once.
+pub(crate) fn settle_stream_setup_interrupt(
+    interrupt: StreamSetupInterrupt,
+    stream_ctx: &mut StreamConnectionContext,
+    expired: &AtomicBool,
+    client_trust: Option<&crate::tls::ClientTrustSession>,
+    trust_settled: &AtomicBool,
+) -> anyhow::Error {
+    match interrupt {
+        StreamSetupInterrupt::AuthorizationExpired(termination) => {
+            settle_stream_auth_setup_expiry(termination, stream_ctx, expired)
+        }
+        StreamSetupInterrupt::TrustWithdrawn => {
+            settle_stream_trust_withdrawal(client_trust, trust_settled)
+        }
+    }
+}
+
+/// Settle a client-trust withdrawal observed during admission or
+/// post-admission setup (issue #3857).
+///
+/// The fixed-cardinality fence counter is recorded once per connection — the
+/// latch is shared by every admission and setup fence, so repeated observations
+/// of the same withdrawal (a second stage, a re-check, the final pre-relay
+/// gate) cannot double-count it — and the returned error carries the typed
+/// [`StreamSetupKind::ClientTrustWithdrawn`], which is client-side. That keeps
+/// the refusal health-neutral: no circuit-breaker or passive-health failure is
+/// recorded against an upstream that did nothing wrong. Callers holding a
+/// claimed HALF_OPEN probe slot must still release it neutrally before
+/// returning this error.
+pub(crate) fn settle_stream_trust_withdrawal(
+    client_trust: Option<&crate::tls::ClientTrustSession>,
+    settled: &AtomicBool,
+) -> anyhow::Error {
+    if !settled.swap(true, Ordering::AcqRel)
+        && let Some(session) = client_trust
+    {
+        session.record_fenced();
+    }
+    StreamSetupError::new(
+        StreamSetupKind::ClientTrustWithdrawn,
+        STREAM_TRUST_WITHDRAWN_SETUP_DETAIL.to_string(),
+    )
+    .into()
+}
+
+/// The registered client-trust fence for one `on_stream_connect` chain: the
+/// session whose retirement must interrupt it, plus the connection's shared
+/// settlement latch (issue #3857).
+///
+/// Passed as `None` by the passthrough, plaintext, and kTLS chains — those
+/// transports register no withdrawable trust decision, poll no retirement
+/// future, and behave exactly as before.
+#[derive(Clone, Copy)]
+pub(crate) struct StreamConnectTrustFence<'a> {
+    session: &'a crate::tls::ClientTrustSession,
+    settled: &'a AtomicBool,
+}
+
+impl<'a> StreamConnectTrustFence<'a> {
+    pub(crate) fn new(
+        session: &'a crate::tls::ClientTrustSession,
+        settled: &'a AtomicBool,
+    ) -> Self {
+        Self { session, settled }
+    }
+}
+
+/// Resolve once `fence`'s session is retired; never resolve at all when the
+/// transport registered nothing.
+///
+/// Returning the fence is what lets the `tokio::select!` arm settle without
+/// re-matching an `Option` that the arm's own existence already proved.
+async fn stream_connect_trust_retired<'a>(
+    fence: Option<StreamConnectTrustFence<'a>>,
+) -> StreamConnectTrustFence<'a> {
+    match fence {
+        Some(fence) => {
+            fence.session.retired().await;
+            fence
+        }
+        // An unregistered transport parks here forever, so the arm is never
+        // taken and the chain runs exactly as it did before issue #3857.
+        None => std::future::pending().await,
+    }
+}
+
+/// Settle a client-trust withdrawal that interrupted the `on_stream_connect`
+/// chain, with the same lifecycle bookkeeping the reject and peer-reset arms
+/// already run (issue #3857).
+///
+/// The hook future has already been dropped by the caller's `select!`, so no
+/// later hook and no backend work runs. Here the admission permits every
+/// completed hook took are released, and the mesh opened/closed finalizer
+/// settles exactly once — under the metadata those completed hooks left, before
+/// the caller emits the disconnect summary — so a fence cannot leave a stream
+/// counted as opened and never closed. The connection's fixed-cardinality fence
+/// counter goes through the shared latch, so this observation and any later
+/// re-check settle it once between them.
+fn settle_stream_connect_trust_withdrawal(
+    stream_ctx: &mut StreamConnectionContext,
+    fence: StreamConnectTrustFence<'_>,
+) -> anyhow::Error {
+    stream_ctx.release_admission_permits();
+    crate::plugins::mesh::prometheus_helpers::finalize_mesh_tcp_opened_stream(stream_ctx);
+    settle_stream_trust_withdrawal(Some(fence.session), fence.settled)
+}
+
+/// Outcome of forwarding the decrypted opening prefix that first-bytes
+/// inspection consumed from a TLS-terminated client.
+pub(crate) enum PrefixForwardReject {
+    /// The frontend client-certificate trust decision was withdrawn. No
+    /// backend byte was written after the withdrawal became observable.
+    TrustWithdrawn,
+    /// The backend leg failed. Genuine backend evidence.
+    Io(std::io::Error),
+}
+
+/// Forward the decrypted inspection prefix to the backend behind the
+/// established transport's trust fence (issue #3857).
+///
+/// These are client APPLICATION bytes that were consumed from the TLS session
+/// before admission finished, so they are the one backend-visible side effect
+/// that is not covered by wrapping the client leg: they live in a plain buffer
+/// and are written straight to the backend. Writing them through
+/// [`crate::tls::TrustFencedStream`] re-checks the fence before EVERY poll of
+/// the underlying write, so a withdrawal that lands before the forward starts
+/// writes nothing at all, and one that races a write parked on a full socket
+/// buffer abandons the remainder instead of completing it.
+///
+/// The fence latch — not a re-read of the session — decides attribution, so a
+/// genuine backend write failure that merely coincided with a withdrawal is
+/// still reported as backend evidence.
+pub(crate) async fn forward_inspected_prefix_under_trust_fence<W>(
+    writer: &mut W,
+    prefix: &[u8],
+    client_trust: Option<&crate::tls::ClientTrustSession>,
+) -> Result<(), PrefixForwardReject>
+where
+    W: AsyncWrite + Unpin + ?Sized,
+{
+    use tokio::io::AsyncWriteExt;
+
+    let mut fenced = crate::tls::TrustFencedStream::new(writer, client_trust);
+    match fenced.write_all(prefix).await {
+        Ok(()) => Ok(()),
+        Err(error) => {
+            if fenced.fence_fired() {
+                Err(PrefixForwardReject::TrustWithdrawn)
+            } else {
+                Err(PrefixForwardReject::Io(error))
+            }
+        }
+    }
+}
+
+/// Forward the inspected prefix under BOTH post-admission bounds, with the
+/// per-write-poll trust fence inside them (issues #3816, #3857).
+///
+/// Two independent things are being enforced and they compose rather than
+/// substitute for one another. The OUTER
+/// [`within_stream_setup_bounds`] gives this await the same trust-first,
+/// earliest-wins pairing every other post-admission stage has, so an
+/// already-retired session whose credential also already elapsed reports the
+/// operator's withdrawal rather than the timer that merely also fired. The
+/// INNER [`forward_inspected_prefix_under_trust_fence`] is what re-checks the
+/// fence before every poll of the underlying write, which the outer bound —
+/// one race per await — cannot do, and what keeps an ordinary backend write
+/// failure attributable to the backend.
+pub(crate) async fn forward_inspected_prefix_within_stream_setup_bounds<W>(
+    plan: Option<crate::proxy::auth_lifetime::StreamAuthDeadline>,
+    client_trust: Option<&crate::tls::ClientTrustSession>,
+    writer: &mut W,
+    prefix: &[u8],
+) -> Result<Result<(), PrefixForwardReject>, StreamSetupInterrupt>
+where
+    W: AsyncWrite + Unpin + ?Sized,
+{
+    within_stream_setup_bounds(
+        plan,
+        client_trust,
+        forward_inspected_prefix_under_trust_fence(writer, prefix, client_trust),
+    )
+    .await
 }
 
 /// Effective authorization plan for an admitted TCP stream session, computed
@@ -1497,8 +1788,10 @@ pub struct TcpListenerConfig {
     /// Shared frontend TLS slot. The accept loop snapshots this per accept so
     /// a mesh PeerAuthentication live reload that swaps the slot is picked up
     /// on the next inbound TCP+TLS handshake without rebinding the listener.
-    /// In-flight TLS sessions keep the config they handshake with until they
-    /// end (rustls consults the `ServerConfig` only at handshake time).
+    /// In-flight TLS sessions keep the config they handshake with because
+    /// rustls consults the `ServerConfig` only at handshake time. An accepted
+    /// client-trust narrowing can separately retire authenticated sessions
+    /// through the live trust fence.
     pub frontend_tls_slot: Arc<arc_swap::ArcSwap<Option<Arc<rustls::ServerConfig>>>>,
     pub shutdown: watch::Receiver<bool>,
     /// Optional gateway-wide shutdown receiver (SIGTERM/SIGINT). When `Some`,
@@ -2123,7 +2416,7 @@ async fn run_tcp_accept_loop(
                 // this instant. Mesh PeerAuthentication live reload swaps this
                 // slot under us; in-flight handshakes complete with the
                 // snapshot they got.
-                let frontend_tls = state.frontend_tls_slot.load().as_ref().clone();
+                let frontend_tls_slot = state.frontend_tls_slot.clone();
                 let metrics = state.metrics.clone();
                 let backend_tls = state.backend_tls_cache.clone();
                 let cb_cache = state.circuit_breaker_cache.clone();
@@ -2344,6 +2637,7 @@ async fn run_tcp_accept_loop(
                     // `ArcSwap::load()` returns a `Guard` over `Arc<Option<Arc<...>>>`;
                     // pull the inner `Option<Arc<...>>` so the borrow is decoupled from
                     // the guard before the async await suspension.
+                    let frontend_tls = frontend_tls_slot.load().as_ref().clone();
                     let mesh_enforcement_snapshot =
                         mesh_outbound_enforcement.load_full().as_ref().clone();
                     let result = handle_tcp_connection(
@@ -2825,7 +3119,17 @@ async fn handle_tcp_connection(
     }
 }
 
-async fn run_tcp_stream_connect_plugins(
+/// How one `on_stream_connect` hook ended, before trust is considered.
+enum StreamConnectHookOutcome {
+    /// The hook returned a verdict.
+    Decided(PluginResult),
+    /// The accepted TCP peer reset while the fault-injection hook was still
+    /// delaying admission.
+    PeerReset,
+}
+
+#[allow(clippy::too_many_arguments)] // log labels + the transport's trust fence
+pub(crate) async fn run_tcp_stream_connect_plugins(
     plugins: &[Arc<dyn Plugin>],
     stream_ctx: &mut StreamConnectionContext,
     client_stream: &TcpStream,
@@ -2833,27 +3137,75 @@ async fn run_tcp_stream_connect_plugins(
     client_ip: IpAddr,
     connection_label: &'static str,
     rejection_detail: &'static str,
+    trust_fence: Option<StreamConnectTrustFence<'_>>,
 ) -> Result<(), anyhow::Error> {
     for plugin in plugins {
-        let result = if plugin.name() == "fault_injection" {
-            tokio::select! {
-                result = plugin.on_stream_connect(stream_ctx) => result,
-                () = wait_for_tcp_peer_reset(client_stream) => {
-                    stream_ctx.release_admission_permits();
-                    // Last completed hooks left the metadata that the eventual
-                    // disconnect summary will carry; finalize the TCP lifecycle
-                    // under it before returning so opened/closed stay balanced.
-                    crate::plugins::mesh::prometheus_helpers::finalize_mesh_tcp_opened_stream(
-                        stream_ctx,
-                    );
-                    return Err(StreamSetupError::new(
-                        StreamSetupKind::ClientDisconnectedDuringAdmission,
-                        connection_label,
-                    ).into());
+        // Withdrawal-first ordering, checked before the hook is even
+        // constructed: a session the operator already retired never STARTS
+        // another hook (issue #3857). Registration happens right after the
+        // frontend handshake — before decrypted first-byte inspection and
+        // before this chain — so without an interruptible chain a blocked or
+        // slow hook kept a retired session alive and executing until it
+        // returned.
+        if let Some(fence) = trust_fence
+            && fence.session.is_retired()
+        {
+            return Err(settle_stream_connect_trust_withdrawal(stream_ctx, fence));
+        }
+        // The hook (and, for `fault_injection`, its existing unbiased race
+        // against a peer reset) is driven as ONE future so the outer race can
+        // drop it whole. Dropping it mid-poll is what guarantees the retired
+        // session executes no further hook body and reaches no backend work.
+        //
+        // The race's verdict is carried OUT of the `select!` rather than acted
+        // on inside an arm: the hook future holds `stream_ctx`, and every
+        // settlement below needs it back.
+        let raced = {
+            let hook = async {
+                if plugin.name() == "fault_injection" {
+                    tokio::select! {
+                        result = plugin.on_stream_connect(stream_ctx) => {
+                            StreamConnectHookOutcome::Decided(result)
+                        }
+                        () = wait_for_tcp_peer_reset(client_stream) => {
+                            StreamConnectHookOutcome::PeerReset
+                        }
+                    }
+                } else {
+                    StreamConnectHookOutcome::Decided(plugin.on_stream_connect(stream_ctx).await)
                 }
+            };
+            // `biased`: a withdrawal that becomes visible in the same poll as
+            // the hook's completion is reported as the withdrawal, matching
+            // every other paired observation on this path.
+            tokio::select! {
+                biased;
+                fence = stream_connect_trust_retired(trust_fence) => Err(fence),
+                outcome = hook => Ok(outcome),
             }
-        } else {
-            plugin.on_stream_connect(stream_ctx).await
+        };
+        let outcome = match raced {
+            Ok(outcome) => outcome,
+            Err(fence) => {
+                return Err(settle_stream_connect_trust_withdrawal(stream_ctx, fence));
+            }
+        };
+        let result = match outcome {
+            StreamConnectHookOutcome::Decided(result) => result,
+            StreamConnectHookOutcome::PeerReset => {
+                stream_ctx.release_admission_permits();
+                // Last completed hooks left the metadata that the eventual
+                // disconnect summary will carry; finalize the TCP lifecycle
+                // under it before returning so opened/closed stay balanced.
+                crate::plugins::mesh::prometheus_helpers::finalize_mesh_tcp_opened_stream(
+                    stream_ctx,
+                );
+                return Err(StreamSetupError::new(
+                    StreamSetupKind::ClientDisconnectedDuringAdmission,
+                    connection_label,
+                )
+                .into());
+            }
         };
         if let PluginResult::Reject { .. } = result {
             stream_ctx.release_admission_permits();
@@ -2871,6 +3223,15 @@ async fn run_tcp_stream_connect_plugins(
                 StreamSetupError::new(StreamSetupKind::RejectedByPlugin, rejection_detail).into(),
             );
         }
+    }
+    // A withdrawal that landed as the last hook returned is settled here rather
+    // than being handed on as an accepted admission: the lifecycle bookkeeping
+    // is identical either way, and this is the last point at which the chain
+    // still owns it.
+    if let Some(fence) = trust_fence
+        && fence.session.is_retired()
+    {
+        return Err(settle_stream_connect_trust_withdrawal(stream_ctx, fence));
     }
     // Full chain accepted: mesh identity/tag/disable metadata is final for the
     // passthrough, TCP/TLS, and plaintext TCP paths. Non-mesh streams carry no
@@ -3424,6 +3785,9 @@ async fn handle_tcp_connection_inner(
                 remote_addr.ip(),
                 "TCP passthrough",
                 "(passthrough)",
+                // Passthrough never terminates TLS, so it registers no
+                // withdrawable client-trust decision.
+                None,
             )
             .await?;
         }
@@ -3875,7 +4239,47 @@ async fn handle_tcp_connection_inner(
     // (even when empty) means we read plaintext from the TLS session and must
     // therefore use a userspace relay (kTLS splice is no longer possible).
     let mut client_first_bytes_forward: Option<Vec<u8>> = None;
-    let client_stream = 'frontend_tls: {
+    // Issue #3857. Captured before the handshake runs, but — unlike the
+    // HTTPS/H2 and admin accept paths, which read the generation and only then
+    // load their slot — AFTER the accept loop already snapshotted
+    // `frontend_tls_slot` for this connection. The "captured generation is at
+    // or older than the material actually served" ordering therefore does NOT
+    // hold on this path: a publication landing between that snapshot and this
+    // read hands us the new generation beside the old `ServerConfig`, and the
+    // fence alone would then not retire this connection.
+    //
+    // What closes that window is the post-handshake re-verification against the
+    // live published verifier below (`armed_handshake_der_chain_still_trusted`).
+    // The publication transaction installs the live verifier BEFORE it advances
+    // the generation, so a connection that observed generation G is re-checked
+    // against a verifier at or newer than G: a credential withdrawn at or
+    // before G is refused there, and one withdrawn after G is still caught by
+    // the fence. That check is load-bearing here, not defence in depth — do not
+    // drop it without first capturing the generation ahead of the slot
+    // snapshot in `run_tcp_accept_loop`.
+    //
+    // `None` (and therefore zero per-connection cost) unless the proxy frontend
+    // trust domain has accepted material, which only happens under
+    // `FERRUM_FRONTEND_TLS_LIVE_RELOAD_ENABLED`.
+    //
+    // TCP+TLS shares the proxy HTTPS/H2 `ServerConfig`, so it is the same trust
+    // domain: an operator CRL or client-CA change retires both listener families
+    // together.
+    let client_trust_admission = if frontend_tls_config.is_some() {
+        crate::tls::client_trust::capture(crate::tls::ClientTrustScope::ProxyFrontend)
+    } else {
+        None
+    };
+    // Latches the ONE client-trust settlement for this connection (issue
+    // #3857). Every admission fence, every post-admission setup stage, and the
+    // final pre-relay gate settle through it, so the fixed-cardinality fence
+    // counter is recorded once no matter how many of them observe the same
+    // withdrawal.
+    let client_trust_settled = AtomicBool::new(false);
+    // Produced by the frontend-TLS setup block below and held for the
+    // entire relay so a successful admission deregisters exactly once on
+    // teardown (issue #3857). Plaintext and kTLS paths yield `None`.
+    let (client_stream, client_trust_guard) = 'frontend_tls: {
         let Some(tls_config) = frontend_tls_config else {
             // Plaintext client: peek (non-destructively) the opening bytes. These are
             // the application bytes on the wire, so they are fully L7-inspectable and
@@ -3898,10 +4302,12 @@ async fn handle_tcp_connection_inner(
                     remote_addr.ip(),
                     "TCP",
                     "(TCP)",
+                    // Plaintext: no frontend handshake, so nothing registered.
+                    None,
                 )
                 .await?;
             }
-            break 'frontend_tls ClientRelayStream::Plain(client_stream);
+            break 'frontend_tls (ClientRelayStream::Plain(client_stream), None);
         };
         // Linux kTLS handoff eligibility, decided before the handshake starts.
         // A plain backend is required (splice needs both ends raw), and a
@@ -3910,12 +4316,27 @@ async fn handle_tcp_connection_inner(
         // refuse — kernel/cipher probes, TLS 1.3, secret-extraction opt-in —
         // is decided inside `try_ktls_accept` while the socket is still
         // pristine, so a refusal costs nothing but a ClientHello peek.
+        //
+        // The kTLS fast path is additionally declined whenever this listener's
+        // client-trust domain is armed (issue #3857). A kernel-terminated leg is
+        // spliced, so there is no userspace poll seam at which a trust
+        // withdrawal could end the session; the buffered rustls relay is
+        // fence-aware and is used instead. Nothing is refused and no
+        // authentication is skipped — only the optional optimization is
+        // declined. The scope is armed only when the accepted frontend candidate
+        // actually performs verified client-certificate authentication, so a
+        // listener with no client-CA bundle (or with no-verify) keeps its
+        // existing kTLS eligibility unchanged even under live reload. Deciding
+        // it here, before the handshake, keeps the socket pristine.
+        // `ktls_handoff_eligible` also refuses when a configured stream plugin
+        // can admit an authenticated principal (issue #3816): splice cannot
+        // carry the authorization deadline.
         let ktls_eligible = ktls_handoff_eligible(
             ktls_enabled,
             is_backend_tls,
             scan_first_bytes_decrypted,
             plugins.as_ref(),
-        );
+        ) && client_trust_admission.is_none();
 
         // Frontend TLS failures return before any backend dispatch — no backend
         // circuit-breaker, pool, or socket interaction.
@@ -3984,12 +4405,17 @@ async fn handle_tcp_connection_inner(
                         remote_addr.ip(),
                         "TCP/TLS",
                         "(TCP/TLS)",
+                        // kTLS hands both sockets to the kernel and registers
+                        // no session; `ktls_handoff_eligible` already refuses
+                        // the handoff for any listener that can admit an
+                        // authenticated principal.
+                        None,
                     )
                     .await?;
                 }
 
                 let policy = accepted.confidentiality;
-                break 'frontend_tls ClientRelayStream::Ktls(accepted.stream, policy);
+                break 'frontend_tls (ClientRelayStream::Ktls(accepted.stream, policy), None);
             }
         };
 
@@ -4000,6 +4426,27 @@ async fn handle_tcp_connection_inner(
                 .map(|cert| cert.to_vec())
                 .collect::<Vec<Vec<u8>>>()
         });
+        // Fail-closed live-verifier fence (issue #3857). LOAD-BEARING on this
+        // path: the generation above was captured after the accept loop
+        // snapshotted the TLS slot, so a connection can hold a post-withdrawal
+        // generation while having handshaked against the withdrawn
+        // `ServerConfig`. Re-verifying the presented chain against the verifier
+        // published with that generation is what refuses it. A missing chain on
+        // an armed listener is untrusted (an armed proxy frontend scope means a
+        // client-CA bundle is configured, so client authentication is
+        // mandatory). Returns before registration, first-byte inspection, and
+        // the stream-connect chain.
+        if let Some(admission) = client_trust_admission
+            && !crate::tls::client_trust::armed_handshake_der_chain_still_trusted(
+                admission.scope(),
+                peer_chain_der.as_deref(),
+            )
+        {
+            return Err(anyhow::anyhow!(
+                "{}",
+                crate::tls::client_trust::TRUST_WITHDRAWN_REASON
+            ));
+        }
         let peer_cert_der = peer_chain_der
             .as_ref()
             .and_then(|certs| certs.first().cloned())
@@ -4020,6 +4467,21 @@ async fn handle_tcp_connection_inner(
             .server_name()
             .map(str::to_ascii_lowercase);
 
+        // Register immediately after the handshake exposes its verified peer
+        // certificate, before decrypted first-byte inspection or stream-connect
+        // plugins can admit work. Registration re-checks a withdrawal that
+        // raced the handshake; fail that already-retired admission here rather
+        // than letting it reach policy evaluation or backend selection.
+        let client_trust_guard = client_trust_admission
+            .and_then(|admission| admission.register(stream_ctx.tls_client_cert_der.is_some()));
+        let trust_session = client_trust_guard.as_ref().map(|guard| guard.session());
+        if trust_session.is_some_and(|session| session.is_retired()) {
+            return Err(settle_stream_trust_withdrawal(
+                trust_session,
+                &client_trust_settled,
+            ));
+        }
+
         // Mark the connection as TLS-terminated for any first-bytes-aware
         // plugin, even when we don't read application bytes below. This lets a
         // transport-shape guard like `tcp_require_tls` recognize the stream as
@@ -4038,15 +4500,36 @@ async fn handle_tcp_connection_inner(
         // Gated on the decrypted-specific signal: a transport-shape guard like
         // `tcp_require_tls` is already satisfied by the completed handshake, so
         // it must not trigger this blocking read on a server-first backend.
+        //
+        // Raced against retirement as well (issue #3857): this read waits for
+        // the client to speak, and `FERRUM_FRONTEND_TLS_HANDSHAKE_TIMEOUT_SECONDS`
+        // can be `0`, so a peer that says nothing would otherwise hold a retired
+        // session for as long as it liked. No authorization plan exists yet — it
+        // is derived from the post-admission context below — so the deadline
+        // input is `None` and a withdrawal is the only interruption possible.
+        // Dropping the read discards nothing that was accounted for.
         if scan_first_bytes_decrypted {
-            let prefix = read_decrypted_first_bytes(&mut tls_stream, sni_peek_timeout).await;
+            let read = read_decrypted_first_bytes(&mut tls_stream, sni_peek_timeout);
+            let prefix = match within_stream_setup_bounds(None, trust_session, read).await {
+                Ok(prefix) => prefix,
+                Err(_) => {
+                    return Err(settle_stream_trust_withdrawal(
+                        trust_session,
+                        &client_trust_settled,
+                    ));
+                }
+            };
             if !prefix.is_empty() {
                 stream_ctx.first_bytes = Some(bytes::Bytes::copy_from_slice(&prefix));
             }
             client_first_bytes_forward = Some(prefix);
         }
 
-        // Run on_stream_connect plugins after TLS handshake so client cert is available.
+        // Run on_stream_connect plugins after TLS handshake so client cert is
+        // available. The chain itself races this registered session's
+        // retirement (issue #3857): a blocked or slow hook is dropped mid-poll,
+        // no later hook runs, and the chain settles its own admission permits
+        // and mesh opened/closed finalizer before returning the typed refusal.
         if !plugins.is_empty() {
             run_tcp_stream_connect_plugins(
                 plugins.as_ref(),
@@ -4056,11 +4539,38 @@ async fn handle_tcp_connection_inner(
                 remote_addr.ip(),
                 "TCP/TLS",
                 "(TCP/TLS)",
+                trust_session
+                    .map(|session| StreamConnectTrustFence::new(session, &client_trust_settled)),
             )
             .await?;
         }
 
-        ClientRelayStream::Tls(Box::new(tls_stream))
+        // Backstop for a withdrawal that landed with no chain to interrupt (no
+        // configured stream plugin) or in the gap after the chain returned.
+        // Settled through the same lifecycle path so permits and the finalizer
+        // stay balanced however the fence is reached; the shared latch keeps
+        // the fence counter at one per connection. From here every
+        // post-admission setup stage runs under `within_stream_setup_bounds`,
+        // and the relay wrapper below handles every later withdrawal for the
+        // established session.
+        if let Some(session) = trust_session
+            && session.is_retired()
+        {
+            return Err(settle_stream_connect_trust_withdrawal(
+                stream_ctx,
+                StreamConnectTrustFence::new(session, &client_trust_settled),
+            ));
+        }
+
+        // Wrap the client leg so a withdrawal surfaces as an ordinary
+        // client-side transport failure (issue #3857). Routing it through the
+        // relay's own error path means byte counters, first-failure attribution,
+        // circuit-breaker classification, `on_stream_disconnect`, and the
+        // stream summary all complete exactly once through paths that already
+        // exist. A connection with no verified client certificate registered
+        // nothing above, so the wrapper is a pass-through.
+        let fenced = crate::tls::TrustFencedStream::new(tls_stream, trust_session);
+        (ClientRelayStream::Tls(Box::new(fenced)), client_trust_guard)
     };
 
     // Authorization lifetime for the admitted stream session (issue #3816).
@@ -4082,6 +4592,13 @@ async fn handle_tcp_connection_inner(
     // Unauthenticated stream connections get `None` and are unaffected.
     let stream_auth_deadline = admitted_stream_auth_deadline(stream_ctx, start);
     let stream_auth_expired = Arc::new(AtomicBool::new(false));
+
+    // The established transport's retirement handle (issue #3857), borrowed for
+    // every post-admission setup stage below. The guard itself stays alive for
+    // the whole relay, so the domain entry remains sweepable; this is only a
+    // reference to the session it registered. `None` for a plaintext, kTLS, or
+    // anonymous-TLS connection — those register nothing and pay nothing.
+    let client_trust_session = client_trust_guard.as_ref().map(|guard| guard.session());
 
     // Helper: record circuit breaker failure for the current target.
     let record_cb_failure =
@@ -4140,14 +4657,22 @@ async fn handle_tcp_connection_inner(
 
     let mut attempt = 0u32;
     let backend_addr = loop {
-        // Authorization lifetime (#3816): re-check at the top of EVERY attempt.
-        // Retries, backoff sleeps, and target rotation must not buy an admitted
-        // stream any additional authorized lifetime, so a credential that
-        // elapsed during the previous attempt refuses the next one before a
+        // Post-admission bounds: re-check at the top of EVERY attempt. Retries,
+        // backoff sleeps, and target rotation must not buy an admitted stream
+        // any additional authorized lifetime (#3816) — nor any authorized
+        // lifetime at all once the operator withdrew the trust decision that
+        // admitted it (#3857) — so either one refuses the next attempt before a
         // circuit-breaker probe slot is claimed, a target is selected, or a
-        // socket is dialed. No probe slot is outstanding at this point (each
-        // attempt settles its own before `continue`), so nothing has to be
-        // released here.
+        // socket is dialed. Trust is checked first: an authority decision
+        // outranks a timer that merely also elapsed. No probe slot is
+        // outstanding at this point (each attempt settles its own before
+        // `continue`), so nothing has to be released here.
+        if client_trust_session.is_some_and(|session| session.is_retired()) {
+            return Err(settle_stream_trust_withdrawal(
+                client_trust_session,
+                &client_trust_settled,
+            ));
+        }
         if let Some(termination) =
             crate::proxy::auth_lifetime::expired_authorization(stream_auth_deadline)
         {
@@ -4223,13 +4748,14 @@ async fn handle_tcp_connection_inner(
         }
 
         // Resolve backend IP via DNS, bounded by the admitted stream's
-        // authorization lifetime: a resolver that stalls (or a chain of
-        // resolver retries) must not carry an expired credential into a
-        // backend dial.
+        // authorization lifetime AND by its client-trust retirement: a resolver
+        // that stalls (or a chain of resolver retries) must not carry an expired
+        // credential — or a withdrawn trust decision — into a backend dial.
         // Awaited in its own statement so the resolver future (which borrows the
         // current target) is dropped before the retry arms below rotate it.
-        let resolved_candidates = within_stream_auth_deadline(
+        let resolved_candidates = within_stream_setup_bounds(
             stream_auth_deadline,
+            client_trust_session,
             dns_cache.resolve_candidates(
                 &current_host,
                 params.dns_override.as_deref(),
@@ -4238,16 +4764,18 @@ async fn handle_tcp_connection_inner(
         )
         .await;
         let candidates = match resolved_candidates {
-            Err(termination) => {
+            Err(interrupt) => {
                 // A HALF_OPEN probe slot claimed by `can_execute` above is
-                // released NEUTRALLY: an expired client credential is not a
-                // backend outcome, and leaking the slot would wedge the
-                // breaker in HALF_OPEN.
+                // released NEUTRALLY: neither an expired client credential nor
+                // a withdrawn client-trust decision is a backend outcome, and
+                // leaking the slot would wedge the breaker in HALF_OPEN.
                 record_cb_neutral(circuit_breaker_cache, proxy_id, &current_cb_info);
-                return Err(settle_stream_auth_setup_expiry(
-                    termination,
+                return Err(settle_stream_setup_interrupt(
+                    interrupt,
                     stream_ctx,
                     &stream_auth_expired,
+                    client_trust_session,
+                    &client_trust_settled,
                 ));
             }
             Ok(Ok(addresses)) => addresses,
@@ -4306,23 +4834,29 @@ async fn handle_tcp_connection_inner(
                     last_connect_err = Some(anyhow::anyhow!(err_msg));
                     attempt += 1;
                     // The backoff is part of the admitted session's setup, so
-                    // it is bounded by the same absolute plan every other setup
-                    // stage uses. No circuit-breaker settlement is owed here:
-                    // this attempt's outcome was already recorded above and
+                    // it is bounded by the same absolute plan — and the same
+                    // client-trust retirement — every other setup stage uses.
+                    // No circuit-breaker settlement is owed here: this attempt's
+                    // outcome was already recorded above and
                     // `current_cb_info.is_half_open_probe` was cleared for the
                     // next target, so no HALF_OPEN probe slot is held across
                     // the wait. Nothing has been written to a backend, so the
-                    // expiry is settled exactly once and returned.
+                    // interruption is settled exactly once and returned.
                     if let Some(ref retry_config) = params.retry {
                         let backoff = crate::retry::retry_delay(retry_config, attempt);
-                        if let Err(termination) =
-                            retry_backoff_within_stream_auth_deadline(stream_auth_deadline, backoff)
-                                .await
+                        if let Err(interrupt) = retry_backoff_within_stream_setup_bounds(
+                            stream_auth_deadline,
+                            client_trust_session,
+                            backoff,
+                        )
+                        .await
                         {
-                            return Err(settle_stream_auth_setup_expiry(
-                                termination,
+                            return Err(settle_stream_setup_interrupt(
+                                interrupt,
                                 stream_ctx,
                                 &stream_auth_expired,
+                                client_trust_session,
+                                &client_trust_settled,
                             ));
                         }
                     }
@@ -4405,23 +4939,29 @@ async fn handle_tcp_connection_inner(
                     );
                     attempt += 1;
                     // The backoff is part of the admitted session's setup, so
-                    // it is bounded by the same absolute plan every other setup
-                    // stage uses. No circuit-breaker settlement is owed here:
-                    // this attempt's outcome was already recorded above and
+                    // it is bounded by the same absolute plan — and the same
+                    // client-trust retirement — every other setup stage uses.
+                    // No circuit-breaker settlement is owed here: this attempt's
+                    // outcome was already recorded above and
                     // `current_cb_info.is_half_open_probe` was cleared for the
                     // next target, so no HALF_OPEN probe slot is held across
                     // the wait. Nothing has been written to a backend, so the
-                    // expiry is settled exactly once and returned.
+                    // interruption is settled exactly once and returned.
                     if let Some(ref retry_config) = params.retry {
                         let backoff = crate::retry::retry_delay(retry_config, attempt);
-                        if let Err(termination) =
-                            retry_backoff_within_stream_auth_deadline(stream_auth_deadline, backoff)
-                                .await
+                        if let Err(interrupt) = retry_backoff_within_stream_setup_bounds(
+                            stream_auth_deadline,
+                            client_trust_session,
+                            backoff,
+                        )
+                        .await
                         {
-                            return Err(settle_stream_auth_setup_expiry(
-                                termination,
+                            return Err(settle_stream_setup_interrupt(
+                                interrupt,
                                 stream_ctx,
                                 &stream_auth_expired,
+                                client_trust_session,
+                                &client_trust_settled,
                             ));
                         }
                     }
@@ -4483,24 +5023,28 @@ async fn handle_tcp_connection_inner(
         );
         // Bound the whole dial — TCP connect across every candidate, the
         // backend TLS handshake, and the outbound PROXY v2 header write — by
-        // the admitted stream's authorization lifetime. Cancelling the future
-        // at the deadline is what keeps the outbound PROXY header (the first
-        // backend-visible byte on a plain backend) from being written on behalf
-        // of an expired credential; a half-completed dial is dropped, closing
+        // the admitted stream's authorization lifetime and by its client-trust
+        // retirement. Cancelling the future at either bound is what keeps the
+        // outbound PROXY header (the first backend-visible byte on a plain
+        // backend) from being written on behalf of an expired credential or a
+        // withdrawn trust decision; a half-completed dial is dropped, closing
         // the socket, rather than finished.
         let bounded_connect =
-            within_stream_auth_deadline(stream_auth_deadline, connect_attempt).await;
+            within_stream_setup_bounds(stream_auth_deadline, client_trust_session, connect_attempt)
+                .await;
         let connect_result = match bounded_connect {
-            Err(termination) => {
+            Err(interrupt) => {
                 // Health-neutral: release the HALF_OPEN probe slot without
                 // recording a backend outcome. `backend_inflight_guard_attempt`
                 // is dropped by this return, so the per-target inflight slot is
                 // released too.
                 record_cb_neutral(circuit_breaker_cache, proxy_id, &current_cb_info);
-                return Err(settle_stream_auth_setup_expiry(
-                    termination,
+                return Err(settle_stream_setup_interrupt(
+                    interrupt,
                     stream_ctx,
                     &stream_auth_expired,
+                    client_trust_session,
+                    &client_trust_settled,
                 ));
             }
             Ok(result) => result.map_err(|error| match error {
@@ -4564,23 +5108,29 @@ async fn handle_tcp_connection_inner(
                     last_connect_err = Some(e);
                     attempt += 1;
                     // The backoff is part of the admitted session's setup, so
-                    // it is bounded by the same absolute plan every other setup
-                    // stage uses. No circuit-breaker settlement is owed here:
-                    // this attempt's outcome was already recorded above and
+                    // it is bounded by the same absolute plan — and the same
+                    // client-trust retirement — every other setup stage uses.
+                    // No circuit-breaker settlement is owed here: this attempt's
+                    // outcome was already recorded above and
                     // `current_cb_info.is_half_open_probe` was cleared for the
                     // next target, so no HALF_OPEN probe slot is held across
                     // the wait. Nothing has been written to a backend, so the
-                    // expiry is settled exactly once and returned.
+                    // interruption is settled exactly once and returned.
                     if let Some(ref retry_config) = params.retry {
                         let backoff = crate::retry::retry_delay(retry_config, attempt);
-                        if let Err(termination) =
-                            retry_backoff_within_stream_auth_deadline(stream_auth_deadline, backoff)
-                                .await
+                        if let Err(interrupt) = retry_backoff_within_stream_setup_bounds(
+                            stream_auth_deadline,
+                            client_trust_session,
+                            backoff,
+                        )
+                        .await
                         {
-                            return Err(settle_stream_auth_setup_expiry(
-                                termination,
+                            return Err(settle_stream_setup_interrupt(
+                                interrupt,
                                 stream_ctx,
                                 &stream_auth_expired,
+                                client_trust_session,
+                                &client_trust_settled,
                             ));
                         }
                     }
@@ -4601,47 +5151,90 @@ async fn handle_tcp_connection_inner(
     // so force the userspace relay for this connection.
     let forwarded_prefix_len = match client_first_bytes_forward.as_deref() {
         Some(prefix) if !prefix.is_empty() => {
-            use tokio::io::AsyncWriteExt;
-            // These are APPLICATION bytes from the client. They are the last
-            // thing written before the relay starts, so the authorization
-            // lifetime is enforced around the write itself: an already-elapsed
-            // credential never forwards them, and a write that parks on a
-            // non-reading backend is cancelled at the deadline.
-            let write_res = match within_stream_auth_deadline(stream_auth_deadline, async {
-                match &mut backend_stream {
-                    BackendStream::Tls(bs) => bs.write_all(prefix).await,
-                    BackendStream::Plain(bs) => bs.write_all(prefix).await,
-                }
-            })
-            .await
-            {
-                Err(termination) => {
+            // These are APPLICATION bytes from the client, held in a plain
+            // buffer since before admission finished — the one backend-visible
+            // side effect that wrapping the client leg cannot reach. Both
+            // post-admission bounds are therefore enforced around the write
+            // itself: an already-elapsed credential or an already-withdrawn
+            // trust decision never forwards them, a write that parks on a
+            // non-reading backend is cancelled at the deadline, and the trust
+            // fence is re-checked before every poll of the underlying write so
+            // a withdrawal racing the write abandons the remainder instead of
+            // completing it (issues #3816, #3857).
+            // One dynamic writer for both backend legs: the prefix forward runs
+            // once per connection on the cold setup path, so the indirection is
+            // free and the fence has a single implementation to reason about.
+            let writer: &mut (dyn AsyncWrite + Unpin + Send) = match &mut backend_stream {
+                BackendStream::Tls(bs) => bs.as_mut(),
+                BackendStream::Plain(bs) => bs,
+            };
+            // Driven through the SAME combined bound every other paired
+            // observation uses, so an already-retired session plus an
+            // already-elapsed credential reports the operator's withdrawal
+            // rather than the timer that merely also fired. The inner
+            // `TrustFencedStream` stays: the outer bound decides the cause once
+            // per await, the inner fence re-checks before every poll of the
+            // underlying write.
+            let bounded = forward_inspected_prefix_within_stream_setup_bounds(
+                stream_auth_deadline,
+                client_trust_session,
+                writer,
+                prefix,
+            )
+            .await;
+            let write_res = match bounded {
+                Err(interrupt) => {
                     // Settle the HALF_OPEN probe slot claimed for the connect
-                    // that succeeded above. Neutral: an expired client
-                    // credential is not a backend outcome, so the breaker,
-                    // passive health, and the adaptive buffer tracker are all
-                    // left untouched.
+                    // that succeeded above. Neutral: neither an expired client
+                    // credential nor a withdrawn client-trust decision is a
+                    // backend outcome, so the breaker, passive health, and the
+                    // adaptive buffer tracker are all left untouched.
                     record_cb_neutral(circuit_breaker_cache, proxy_id, &current_cb_info);
-                    return Err(settle_stream_auth_setup_expiry(
-                        termination,
+                    return Err(settle_stream_setup_interrupt(
+                        interrupt,
                         stream_ctx,
                         &stream_auth_expired,
+                        client_trust_session,
+                        &client_trust_settled,
                     ));
                 }
                 Ok(write_res) => write_res,
             };
-            write_res.map_err(|e| {
-                anyhow::anyhow!("failed forwarding inspected first bytes to backend: {e}")
-            })?;
+            match write_res {
+                Ok(()) => {}
+                Err(PrefixForwardReject::TrustWithdrawn) => {
+                    // Same neutral settlement as an expiry: a withdrawn client
+                    // trust decision is a local authorization event, never
+                    // evidence about the upstream.
+                    record_cb_neutral(circuit_breaker_cache, proxy_id, &current_cb_info);
+                    return Err(settle_stream_trust_withdrawal(
+                        client_trust_session,
+                        &client_trust_settled,
+                    ));
+                }
+                Err(PrefixForwardReject::Io(error)) => {
+                    return Err(anyhow::anyhow!(
+                        "failed forwarding inspected first bytes to backend: {error}"
+                    ));
+                }
+            }
             prefix.len() as u64
         }
         _ => 0,
     };
 
     // Final pre-relay gate. The dial, handshake, and prefix forward are each
-    // bounded above; this catches an authorization lifetime that elapsed in the
-    // gap between them (or one that was already elapsed when a stream with no
-    // inspected prefix reached here) before the relay moves a single byte.
+    // bounded above; this catches a bound that fired in the gap between them
+    // (or one that was already elapsed / already withdrawn when a stream with
+    // no inspected prefix reached here) before the relay moves a single byte.
+    // Trust first, for the same reason it leads every other pairing.
+    if client_trust_session.is_some_and(|session| session.is_retired()) {
+        record_cb_neutral(circuit_breaker_cache, proxy_id, &current_cb_info);
+        return Err(settle_stream_trust_withdrawal(
+            client_trust_session,
+            &client_trust_settled,
+        ));
+    }
     if let Some(termination) =
         crate::proxy::auth_lifetime::expired_authorization(stream_auth_deadline)
     {
@@ -6424,7 +7017,12 @@ enum BackendStream {
 /// Client-side stream after optional frontend TLS termination.
 enum ClientRelayStream {
     Plain(TcpStream),
-    Tls(Box<tokio_rustls::server::TlsStream<TcpStream>>),
+    /// Buffered userspace rustls termination, wrapped by
+    /// [`crate::tls::TrustFencedStream`] so a frontend client-certificate trust
+    /// withdrawal ends the session through the relay's ordinary failure path
+    /// (issue #3857). The wrapper is a transparent pass-through when the
+    /// connection holds no withdrawable trust decision.
+    Tls(Box<crate::tls::TrustFencedStream<tokio_rustls::server::TlsStream<TcpStream>>>),
     /// Frontend TLS terminated by the **kernel**: rustls handed its TLS 1.2
     /// traffic secrets to the kTLS ULP after an unbuffered handshake reached
     /// `WriteTraffic` (issue #3619). The socket now reads decrypted plaintext

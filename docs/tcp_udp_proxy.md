@@ -104,6 +104,38 @@ All combinations of frontend and backend encryption are supported:
 | `dtls` | Plain UDP | DTLS |
 | `dtls` + `frontend_tls: true` | DTLS | DTLS (full e2e) |
 
+### Withdrawn Client-Certificate Trust On Established Streams (issue #3857)
+
+A terminating stream listener that verifies client certificates joins a
+client-trust generation when `FERRUM_FRONTEND_TLS_LIVE_RELOAD_ENABLED=true`.
+TCP+TLS shares the proxy HTTPS trust domain
+(`FERRUM_FRONTEND_TLS_CLIENT_CA_BUNDLE_PATH` + `FERRUM_TLS_CRL_FILE_PATH`);
+frontend DTLS has its own (`FERRUM_DTLS_CLIENT_CA_CERT_PATH` + the same CRL
+source), whose declared client-CA source is read **once** through the shared
+`CertSource` abstraction — so `file://`, inline PEM, and provider URIs all work,
+the shared material-size ceiling applies, and the verifier and the published
+identity always describe the same bytes.
+
+When the operator revokes a certificate or removes its issuing CA:
+
+- an established **TCP+TLS** relay fails its client leg through the relay's
+  ordinary error path, so byte counters, first-failure attribution,
+  circuit-breaker classification, `on_stream_disconnect`, and the stream summary
+  all complete exactly once;
+- an established **UDP+DTLS** session ends through the same break the shutdown
+  path uses — the demux entry, the active-session counter, and its mirror all
+  release exactly once, and queued application data is deliberately **not**
+  flushed.
+
+A stream listener that performs no client-certificate authentication is never
+armed: nothing is tracked, no series is exported, and TCP+TLS keeps its ordinary
+kTLS eligibility. Arming is what declines the kTLS handoff — a kernel-terminated
+leg is spliced and has no userspace poll seam at which a withdrawal could end the
+session, so an armed listener is relayed on the fence-aware buffered `rustls`
+path instead. The decision is made from the peeked ClientHello, before the
+handshake, so the socket stays pristine. See
+[frontend_tls.md](frontend_tls.md#client-trust-generations-and-established-transport-retirement).
+
 ### TLS/DTLS Passthrough Mode
 
 Set `passthrough: true` to forward encrypted client bytes directly to the backend without terminating TLS or DTLS. The gateway peeks at the TLS/DTLS ClientHello to extract the SNI hostname for logging and metrics, but never decrypts application data.

@@ -3436,7 +3436,13 @@ forged_assertion_response_is_policy_rejection() {
     return
   fi
 
-  if [[ "$code" == "502" && "$body" == \{\"error\":\"HBONE\ backend\ unavailable:\ HBONE\ CONNECT\ rejected\ for\ *\ with\ status\ 403\"\} ]]; then
+  # Issue #3927 redacted the CONNECT authority out of the client body, so this
+  # is now an EXACT literal match rather than a glob over the peer address. The
+  # peer's own admission status is deliberately retained
+  # (`HbonePoolError::public_status`) so a destination POLICY denial stays
+  # distinguishable from any other tunnel refusal; do not relax this to the
+  # bare reason.
+  if [[ "$code" == "502" && "$body" == '{"error":"HBONE backend unavailable: tunnel rejected by peer with status 403"}' ]]; then
     return
   fi
 

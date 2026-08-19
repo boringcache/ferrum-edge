@@ -597,6 +597,10 @@ pub struct GatewayListenerHttp3 {
     /// Frontend TLS live-reload inputs, when the mode enabled reload. Held as
     /// parts because `Http3FrontendTlsReload` is built per listener.
     pub tls_slot: Option<crate::tls::SharedFrontendTls>,
+    /// Accepted-candidate slot for the same reload pipeline (issue #3857), so a
+    /// dynamic Gateway QUIC port adopts whole candidates exactly as the global
+    /// H3 listener does.
+    pub tls_accepted_slot: Option<crate::tls::SharedAcceptedFrontendTls>,
     pub tls_revision_rx: Option<watch::Receiver<u64>>,
 }
 
@@ -606,6 +610,7 @@ impl GatewayListenerHttp3 {
         let revision_rx = self.tls_revision_rx.clone()?;
         Some(crate::http3::server::Http3FrontendTlsReload {
             tls_slot,
+            accepted_slot: self.tls_accepted_slot.clone(),
             revision_rx,
         })
     }
@@ -2070,6 +2075,7 @@ mod tests {
             client_ca_bundle_path: None,
             client_crls: std::sync::Arc::new(Vec::new()),
             tls_slot: None,
+            tls_accepted_slot: None,
             tls_revision_rx: None,
         })
     }
