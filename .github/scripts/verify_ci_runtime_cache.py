@@ -12,7 +12,11 @@ the FIPS producer handoff as an immutable run artifact rather than an
 eviction-prone repository cache (attempt-wildcard consumer promotion with
 stable fallback isolation), rejection
 of ignored rust-cache `key` wiring, checksum-pinned sccache install without
-credential-exporting installers, same-run producer and immutable inter-run
+credential-exporting installers, a closed FIPS action-invocation allowlist
+with exact occurrence counts and checkout provenance (current repository,
+default ref, default root, persist-credentials: false) plus shell-only
+local actions so JavaScript toolkit carriers cannot reach
+the cache-credential environment, same-run producer and immutable inter-run
 artifact handoff warming, exact verified executable activation, empty
 SCCACHE_GHA_ENABLED persistence, fail-closed uncached fallback, hosted
 cache-token absence assertions, and Ambient production-image GHA cache-to
@@ -24,6 +28,7 @@ from __future__ import annotations
 import argparse
 import re
 import sys
+from collections import Counter
 from pathlib import Path
 
 from ci_runtime_plan import (
@@ -42,6 +47,7 @@ AMBIENT_WORKFLOW = REPO_ROOT / ".github" / "workflows" / "ambient-host-udp-live.
 DOCKERFILE = REPO_ROOT / "Dockerfile"
 SETUP_RUST = REPO_ROOT / ".github" / "actions" / "setup-rust-ci" / "action.yml"
 SETUP_SCCACHE = REPO_ROOT / ".github" / "actions" / "setup-sccache" / "action.yml"
+SETUP_FAST_LINKER = REPO_ROOT / ".github" / "actions" / "setup-fast-linker" / "action.yml"
 CI_CD_DOC = REPO_ROOT / "docs" / "ci_cd.md"
 FIPS_DOC = REPO_ROOT / "docs" / "fips.md"
 COVERAGE_WORKFLOW = REPO_ROOT / ".github" / "workflows" / "coverage.yml"
@@ -76,6 +82,68 @@ FIPS_HANDOFF_SOURCE_EXPR = (
     "${{ inputs.warm_source_run_id }}-${{ inputs.warm_source_run_attempt }}"
 )
 SCCACHE_EXPORTERS = ("mozilla-actions/sccache-action",)
+# Defense in depth only. Computed JavaScript (`core["export" + "Variable"]`)
+# does not contain this contiguous token; the closed FIPS uses allowlist and
+# shell-only local-action rule are the fail-closed gate.
+SCCACHE_EXPORT_VARIABLE_TOKEN = "exportVariable"
+# Exact pins/paths admitted in fips-build.yml, frozen with occurrence counts
+# from the checked workflow. Set membership is not enough: duplicating an
+# already-allowlisted JavaScript action must fail. JavaScript/docker/
+# reusable-workflow carriers cannot enter without an allowlist change.
+# actions/cache/save and actions/cache/restore are excluded: the FIPS
+# producer/test handoff is an immutable artifact, not a repository cache.
+FIPS_ALLOWED_ACTION_COUNTS = {
+    CHECKOUT: 7,
+    RUST_TOOLCHAIN: 5,
+    "./.github/actions/setup-sccache": 4,
+    "./.github/actions/setup-fast-linker": 4,
+    RUST_CACHE: 4,
+    DOWNLOAD_ARTIFACT: 5,
+    UPLOAD_ARTIFACT: 2,
+}
+FIPS_ALLOWED_ACTION_USES = frozenset(FIPS_ALLOWED_ACTION_COUNTS)
+FIPS_CHECKOUT_COUNT = FIPS_ALLOWED_ACTION_COUNTS[CHECKOUT]
+# Closed checkout `with:` contract: current repo, default ref, default root.
+CHECKOUT_ALLOWED_WITH_KEYS = frozenset({"persist-credentials", "fetch-depth"})
+CHECKOUT_REDIRECT_KEYS = frozenset({"repository", "ref", "path"})
+SHELL_ONLY_COMPOSITE = "composite"
+YAML_HEX_DIGITS = frozenset("0123456789abcdefABCDEF")
+YAML_DOUBLE_QUOTED_ESCAPES = {
+    "0": "\0",
+    "a": "\a",
+    "b": "\b",
+    "t": "\t",
+    "\t": "\t",
+    "n": "\n",
+    "v": "\v",
+    "f": "\f",
+    "r": "\r",
+    "e": "\x1b",
+    " ": " ",
+    '"': '"',
+    "/": "/",
+    "\\": "\\",
+    "N": "\x85",
+    "_": "\xa0",
+    "L": chr(0x2028),
+    "P": chr(0x2029),
+}
+# `<<` is a YAML merge key, not an identifier. Keep it in the key token so
+# block/flow merge spellings are parsed and rejected rather than skipped.
+YAML_KEY_TOKEN = r"'(?:[^']|'')*'|\"(?:[^\"\\]|\\.)*\"|<<|[A-Za-z0-9_.+-]+"
+YAML_MAPPING_LINE = re.compile(
+    rf"^(?P<lead>[ \t]*)(?P<dash>-[ \t]+)?(?P<key>{YAML_KEY_TOKEN})[ \t]*:(?P<value>.*)$"
+)
+YAML_FLOW_STEP = re.compile(r"^(?P<lead>[ \t]*)-[ \t]+(?P<flow>[\{\[].*)$")
+# YAML permits the chomping and indentation indicators in either order
+# (`|-2` and `|2-`). A valid indentation indicator is one digit from 1-9.
+YAML_BLOCK_SCALAR = re.compile(
+    r"^[|>](?:[+-](?:[1-9])?|[1-9][+-]?)?(?:[ \t]+(?:#.*)?)?$"
+)
+YAML_EXPLICIT_KEY = re.compile(r"^[ \t]*(?:-[ \t]+)?\?")
+YAML_SEQUENCE_ITEM = re.compile(r"^[ \t]*-[ \t]+(?P<item>.+)$")
+YAML_DOCUMENT_MARK = frozenset({"---", "..."})
+JS_ACTION_USING = re.compile(r"^node(?:\d+)?$", re.IGNORECASE)
 SCCACHE_PINNED_VERSION = "0.17.0"
 SCCACHE_RELEASE_DOWNLOAD = "https://github.com/mozilla/sccache/releases/download/"
 CREDENTIAL_ASSERT_VARS = (
@@ -660,7 +728,7 @@ def step_uses(step: str) -> str:
         match = re.search(r"(?m)^        uses:\s*(\S+)", step)
     if match is None:
         return ""
-    return match.group(1).split("#", 1)[0].strip()
+    return _yaml_strip_trailing_comment(match.group(1)).strip()
 
 
 def step_with(step: str) -> str:
@@ -773,6 +841,970 @@ def check_credential_absence_assertion(
     )
 
 
+def _decode_double_quoted_yaml(body: str) -> str | None:
+    decoded: list[str] = []
+    index = 0
+    while index < len(body):
+        character = body[index]
+        if character != "\\":
+            decoded.append(character)
+            index += 1
+            continue
+        index += 1
+        if index >= len(body):
+            return None
+        marker = body[index]
+        index += 1
+        if marker in {"x", "u", "U"}:
+            width = {"x": 2, "u": 4, "U": 8}[marker]
+            digits = body[index : index + width]
+            if len(digits) != width or any(digit not in YAML_HEX_DIGITS for digit in digits):
+                return None
+            index += width
+            try:
+                decoded.append(chr(int(digits, 16)))
+            except ValueError:
+                return None
+            continue
+        if marker == "\n":
+            while index < len(body) and body[index] in " \t":
+                index += 1
+            continue
+        decoded.append(YAML_DOUBLE_QUOTED_ESCAPES.get(marker, marker))
+    return "".join(decoded)
+
+
+def _decode_yaml_scalar(raw: str) -> str | None:
+    text = raw.strip()
+    if len(text) >= 2 and text[0] == text[-1] == "'":
+        return text[1:-1].replace("''", "'")
+    if len(text) >= 2 and text[0] == text[-1] == '"':
+        return _decode_double_quoted_yaml(text[1:-1])
+    if text[:1] in {"'", '"'}:
+        return None
+    return text
+
+
+def _yaml_comment_starts_at(text: str, index: int) -> bool:
+    """YAML 1.2: `#` starts a comment only at start-of-text or after whitespace.
+
+    `harmless#suffix` is plain-scalar data, not a comment. Treating every `#`
+    as a comment opener conceals later flow entries on the same line.
+    """
+
+    if index < 0 or index >= len(text) or text[index] != "#":
+        return False
+    if index == 0:
+        return True
+    return text[index - 1] in " \t\r\n"
+
+
+def _yaml_strip_trailing_comment(text: str) -> str:
+    quote: str | None = None
+    index = 0
+    while index < len(text):
+        character = text[index]
+        if quote == '"':
+            if character == "\\" and index + 1 < len(text):
+                index += 2
+                continue
+            if character == '"':
+                quote = None
+            index += 1
+            continue
+        if quote == "'":
+            if character == "'" and index + 1 < len(text) and text[index + 1] == "'":
+                index += 2
+                continue
+            if character == "'":
+                quote = None
+            index += 1
+            continue
+        if character in {"'", '"'}:
+            quote = character
+            index += 1
+            continue
+        if _yaml_comment_starts_at(text, index):
+            return text[:index]
+        index += 1
+    return text
+
+
+def _yaml_quotes_balanced(text: str) -> bool:
+    """Return False for unclosed quotes, including `\\` line-continuation."""
+
+    quote: str | None = None
+    index = 0
+    while index < len(text):
+        character = text[index]
+        if quote == '"':
+            if character == "\\" and index + 1 < len(text):
+                index += 2
+                continue
+            if character == "\\":
+                return False
+            if character == '"':
+                quote = None
+            index += 1
+            continue
+        if quote == "'":
+            if character == "'" and index + 1 < len(text) and text[index + 1] == "'":
+                index += 2
+                continue
+            if character == "'":
+                quote = None
+            index += 1
+            continue
+        if character in {"'", '"'}:
+            quote = character
+            index += 1
+            continue
+        if _yaml_comment_starts_at(text, index):
+            return quote is None
+        index += 1
+    return quote is None
+
+
+def _leading_yaml_node_properties(text: str) -> tuple[bool, str]:
+    """Split `&anchor` / `*alias` / `!tag` prefixes from a node.
+
+    An alias is a complete node. Anchors and tags may precede a collection or
+    scalar; the remainder is returned so callers can still parse `{...}` / `[...]`
+    after rejecting the indirect spelling.
+    """
+
+    remaining = text.lstrip(" \t")
+    had = False
+    while remaining:
+        marker = remaining[0]
+        if marker in {"&", "*"}:
+            had = True
+            index = 1
+            while index < len(remaining) and remaining[index] not in " \t,{}[]:#":
+                index += 1
+            if index == 1:
+                return True, remaining
+            remaining = remaining[index:].lstrip(" \t")
+            if marker == "*":
+                break
+            continue
+        if marker != "!":
+            break
+        had = True
+        index = 1
+        if index < len(remaining) and remaining[index] == "<":
+            end = remaining.find(">", index)
+            if end < 0:
+                return True, ""
+            index = end + 1
+        else:
+            while index < len(remaining) and remaining[index] not in " \t,{}[]:#":
+                index += 1
+        remaining = remaining[index:].lstrip(" \t")
+    return had, remaining
+
+
+def _skip_flow_comment(text: str, index: int) -> int:
+    while index < len(text) and text[index] != "\n":
+        index += 1
+    return index
+
+
+def _balanced_flow(text: str, start: int) -> tuple[str, int] | None:
+    if start >= len(text) or text[start] not in "{[":
+        return None
+    closers = {"{": "}", "[": "]"}
+    stack = [text[start]]
+    quote: str | None = None
+    index = start + 1
+    while index < len(text):
+        character = text[index]
+        if quote == '"':
+            if character == "\\" and index + 1 < len(text):
+                index += 2
+                continue
+            if character == '"':
+                quote = None
+            index += 1
+            continue
+        if quote == "'":
+            if character == "'" and index + 1 < len(text) and text[index + 1] == "'":
+                index += 2
+                continue
+            if character == "'":
+                quote = None
+            index += 1
+            continue
+        if character in {"'", '"'}:
+            quote = character
+            index += 1
+            continue
+        if _yaml_comment_starts_at(text, index):
+            index = _skip_flow_comment(text, index)
+            continue
+        if character in "{[":
+            stack.append(character)
+        elif character in "}]":
+            if not stack or closers[stack[-1]] != character:
+                return None
+            stack.pop()
+            if not stack:
+                return text[start : index + 1], index + 1
+        index += 1
+    return None
+
+
+def _split_flow_entries(inner: str) -> list[str] | None:
+    entries: list[str] = []
+    current: list[str] = []
+    depth = 0
+    quote: str | None = None
+    index = 0
+    while index < len(inner):
+        character = inner[index]
+        if quote == '"':
+            current.append(character)
+            if character == "\\" and index + 1 < len(inner):
+                current.append(inner[index + 1])
+                index += 2
+                continue
+            if character == '"':
+                quote = None
+            index += 1
+            continue
+        if quote == "'":
+            current.append(character)
+            if character == "'" and index + 1 < len(inner) and inner[index + 1] == "'":
+                current.append("'")
+                index += 2
+                continue
+            if character == "'":
+                quote = None
+            index += 1
+            continue
+        if character in {"'", '"'}:
+            quote = character
+            current.append(character)
+            index += 1
+            continue
+        if _yaml_comment_starts_at(inner, index):
+            index = _skip_flow_comment(inner, index)
+            continue
+        if character in "{[":
+            depth += 1
+        elif character in "}]":
+            depth -= 1
+            if depth < 0:
+                return None
+        elif character == "," and depth == 0:
+            entries.append("".join(current))
+            current = []
+            index += 1
+            continue
+        current.append(character)
+        index += 1
+    if quote is not None or depth != 0:
+        return None
+    entries.append("".join(current))
+    return entries
+
+
+def _parse_uses_value(raw: str) -> tuple[str | None, str | None]:
+    text = _yaml_strip_trailing_comment(raw).strip()
+    if not text:
+        return None, "empty uses value"
+    if text[0] in "*&!":
+        return None, "indirect uses value"
+    if YAML_BLOCK_SCALAR.match(text):
+        return None, "block-scalar uses value"
+    if text[0] in "{[":
+        return None, "collection uses value"
+    if "${{" in text:
+        return None, "dynamic uses value"
+    decoded = _decode_yaml_scalar(text)
+    if decoded is None:
+        return None, "unreadable uses spelling"
+    decoded = decoded.strip()
+    if not decoded or decoded[0] in "*&!" or "${{" in decoded or "\n" in decoded:
+        return None, "dynamic uses value"
+    return decoded, None
+
+
+def _record_mapping_pair(
+    raw_key: str,
+    raw_value: str,
+    uses: list[str],
+    using: list[str],
+    errors: list[str],
+) -> None:
+    key = _decode_yaml_scalar(raw_key)
+    if key is None:
+        errors.append("unreadable YAML key spelling")
+        return
+    if key == "<<":
+        errors.append("YAML merge key")
+        return
+    if key == "uses":
+        value, error = _parse_uses_value(raw_value)
+        if error:
+            errors.append(error)
+            return
+        if value is not None:
+            uses.append(value)
+        return
+    if key == "using":
+        value, error = _parse_uses_value(raw_value)
+        if error:
+            errors.append(error.replace("uses", "using"))
+            return
+        if value is not None:
+            using.append(value)
+
+
+def _record_flow_pairs(
+    pairs: list[tuple[str, str]],
+    flow_errors: list[str],
+    uses: list[str],
+    using: list[str],
+    errors: list[str],
+) -> None:
+    errors.extend(flow_errors)
+    for raw_key, raw_value in pairs:
+        _record_mapping_pair(raw_key, raw_value, uses, using, errors)
+
+
+def _collect_nested_flow_value(
+    value: str,
+    pairs: list[tuple[str, str]],
+    errors: list[str],
+) -> None:
+    had_props, remainder = _leading_yaml_node_properties(value)
+    if had_props:
+        errors.append("indirect or tagged YAML node")
+        value = remainder
+    if not value:
+        return
+    if value.startswith("?"):
+        errors.append("explicit YAML key")
+        return
+    if value.startswith("{"):
+        balanced = _balanced_flow(value, 0)
+        if balanced is None:
+            errors.append("unreadable nested flow mapping")
+            return
+        nested, nested_errors = _collect_flow_mapping_pairs(balanced[0])
+        pairs.extend(nested)
+        errors.extend(nested_errors)
+        return
+    if value.startswith("["):
+        balanced = _balanced_flow(value, 0)
+        if balanced is None:
+            errors.append("unreadable nested flow sequence")
+            return
+        nested, nested_errors = _collect_flow_sequence(balanced[0])
+        pairs.extend(nested)
+        errors.extend(nested_errors)
+
+
+def _collect_flow_mapping_pairs(flow: str) -> tuple[list[tuple[str, str]], list[str]]:
+    pairs: list[tuple[str, str]] = []
+    errors: list[str] = []
+    if not (flow.startswith("{") and flow.endswith("}")):
+        return [], ["unreadable flow mapping"]
+    entries = _split_flow_entries(flow[1:-1])
+    if entries is None:
+        return [], ["unreadable flow mapping"]
+    for entry in entries:
+        item = entry.strip()
+        if not item:
+            continue
+        had_props, item = _leading_yaml_node_properties(item)
+        if had_props:
+            errors.append("indirect or tagged YAML node")
+            if not item:
+                continue
+        if item.startswith("?"):
+            errors.append("explicit YAML key")
+            continue
+        match = re.match(rf"^({YAML_KEY_TOKEN})[ \t]*:(.*)$", item, re.DOTALL)
+        if match is None:
+            errors.append("unreadable flow mapping entry")
+            continue
+        pairs.append((match.group(1), match.group(2)))
+        _collect_nested_flow_value(match.group(2).strip(), pairs, errors)
+    return pairs, errors
+
+
+def _collect_flow_sequence(flow: str) -> tuple[list[tuple[str, str]], list[str]]:
+    pairs: list[tuple[str, str]] = []
+    errors: list[str] = []
+    if not (flow.startswith("[") and flow.endswith("]")):
+        return [], ["unreadable flow sequence"]
+    entries = _split_flow_entries(flow[1:-1])
+    if entries is None:
+        return [], ["unreadable flow sequence"]
+    for entry in entries:
+        item = entry.strip()
+        if not item:
+            continue
+        had_props, item = _leading_yaml_node_properties(item)
+        if had_props:
+            errors.append("indirect or tagged YAML node")
+            if not item:
+                continue
+        if item.startswith("?"):
+            errors.append("explicit YAML key")
+            continue
+        if item.startswith("{"):
+            balanced = _balanced_flow(item, 0)
+            if balanced is None:
+                errors.append("unreadable flow sequence mapping")
+                continue
+            nested, nested_errors = _collect_flow_mapping_pairs(balanced[0])
+            pairs.extend(nested)
+            errors.extend(nested_errors)
+            continue
+        if item.startswith("["):
+            balanced = _balanced_flow(item, 0)
+            if balanced is None:
+                errors.append("unreadable nested flow sequence")
+                continue
+            nested, nested_errors = _collect_flow_sequence(balanced[0])
+            pairs.extend(nested)
+            errors.extend(nested_errors)
+            continue
+        match = re.match(rf"^({YAML_KEY_TOKEN})[ \t]*:(.*)$", item, re.DOTALL)
+        if match is not None:
+            pairs.append((match.group(1), match.group(2)))
+            _collect_nested_flow_value(match.group(2).strip(), pairs, errors)
+            continue
+        if not _yaml_quotes_balanced(item):
+            errors.append("unreadable multiline YAML quoting")
+            continue
+        # Plain flow scalars (`[main]`) are not action carriers.
+    return pairs, errors
+
+
+def _scan_structural_text(
+    text: str,
+    uses: list[str],
+    using: list[str],
+    errors: list[str],
+) -> None:
+    item = text.strip()
+    if not item:
+        return
+    had_props, item = _leading_yaml_node_properties(item)
+    if had_props:
+        errors.append("indirect or tagged YAML node")
+        if not item:
+            return
+    if item.startswith("?"):
+        errors.append("explicit YAML key")
+        return
+    if item.startswith("{") or item.startswith("["):
+        balanced = _balanced_flow(item, 0)
+        if balanced is None:
+            errors.append("unreadable flow collection")
+            return
+        flow_text, _end = balanced
+        if flow_text.startswith("{"):
+            pairs, flow_errors = _collect_flow_mapping_pairs(flow_text)
+        else:
+            pairs, flow_errors = _collect_flow_sequence(flow_text)
+        _record_flow_pairs(pairs, flow_errors, uses, using, errors)
+        return
+    match = re.match(rf"^({YAML_KEY_TOKEN})[ \t]*:(.*)$", item, re.DOTALL)
+    if match is None:
+        errors.append("unreadable YAML structure")
+        return
+    _record_mapping_pair(match.group(1), match.group(2), uses, using, errors)
+    value = _yaml_strip_trailing_comment(match.group(2)).strip()
+    had_value_props, remainder = _leading_yaml_node_properties(value)
+    if had_value_props:
+        errors.append("indirect or tagged YAML node")
+        value = remainder
+    if value.startswith("{") or value.startswith("["):
+        _scan_structural_text(value, uses, using, errors)
+
+
+def _is_plain_sequence_scalar(item: str) -> bool:
+    text = _yaml_strip_trailing_comment(item).strip()
+    if not text:
+        return True
+    if not _yaml_quotes_balanced(text):
+        return False
+    had_props, remainder = _leading_yaml_node_properties(text)
+    if had_props or remainder[:1] in {"{", "[", "?"}:
+        return False
+    return re.match(rf"^(?:{YAML_KEY_TOKEN})[ \t]*:", remainder, re.DOTALL) is None
+
+
+def _yaml_mapping_key_indent(parsed: re.Match[str]) -> int:
+    """Indentation of a mapping key, not the compact sequence dash.
+
+    For `      - name: |`, the dash sits at column 6 while sibling keys such as
+    `uses:` are at column 8. Skipping a block scalar against the dash indent
+    would swallow those siblings as scalar body.
+    """
+
+    indent = len(parsed.group("lead"))
+    dash = parsed.group("dash")
+    if dash:
+        indent += len(dash)
+    return indent
+
+
+class _StepBucket:
+    """One YAML sequence mapping (typically a GHA step) plus its `with:` pairs."""
+
+    def __init__(self, key_indent: int | None) -> None:
+        self.key_indent = key_indent
+        self.uses: list[str] = []
+        self.using: list[str] = []
+        self.with_pairs: list[tuple[str, str]] = []
+        self.with_errors: list[str] = []
+        self.with_declarations = 0
+        self.collecting_with = False
+
+
+def _note_step_actions(
+    step: _StepBucket | None,
+    uses: list[str],
+    using: list[str],
+    uses_before: int,
+    using_before: int,
+) -> None:
+    if step is None:
+        return
+    step.uses.extend(uses[uses_before:])
+    step.using.extend(using[using_before:])
+
+
+def _parse_plain_action_scalar(raw: str, what: str) -> tuple[str | None, str | None]:
+    value, error = _parse_uses_value(raw)
+    if error:
+        return None, error.replace("uses", what)
+    return value, None
+
+
+def _attach_with_value(step: _StepBucket, raw_value: str) -> None:
+    step.with_declarations += 1
+    value = _yaml_strip_trailing_comment(raw_value).strip()
+    had_props, remainder = _leading_yaml_node_properties(value)
+    if had_props:
+        step.with_errors.append("indirect or tagged YAML node")
+        value = remainder
+    if not value:
+        return
+    if YAML_BLOCK_SCALAR.match(value):
+        step.with_errors.append("block-scalar with mapping")
+        return
+    if value.startswith("{"):
+        balanced = _balanced_flow(value, 0)
+        if balanced is None:
+            step.with_errors.append("unreadable with mapping")
+            return
+        pairs, errors = _collect_flow_mapping_pairs(balanced[0])
+        step.with_errors.extend(errors)
+        step.with_pairs.extend(pairs)
+        return
+    step.with_errors.append("unreadable with mapping")
+
+
+def _begin_step(steps: list[_StepBucket], key_indent: int | None) -> _StepBucket:
+    step = _StepBucket(key_indent)
+    steps.append(step)
+    return step
+
+
+def _skip_block_scalar(lines: list[str], start: int, parent_indent: int) -> int:
+    """Skip a block-scalar body: lines strictly more indented than the key.
+
+    `parent_indent` is the mapping-key column so compact sequence siblings
+    (`uses:` after `name: |`) terminate the scalar instead of being skipped.
+    """
+
+    index = start
+    while index < len(lines):
+        line = lines[index]
+        if not line.strip():
+            index += 1
+            continue
+        indent = len(line) - len(line.lstrip(" \t"))
+        if indent <= parent_indent:
+            break
+        index += 1
+    return index
+
+
+def _collect_multiline_flow(
+    lines: list[str], start_text: str, next_index: int
+) -> tuple[str | None, int]:
+    collected = [start_text]
+    cursor = next_index
+    blob = "\n".join(collected)
+    while _balanced_flow(blob, 0) is None and cursor < len(lines):
+        collected.append(lines[cursor])
+        blob = "\n".join(collected)
+        cursor += 1
+    balanced = _balanced_flow(blob, 0)
+    if balanced is None:
+        return None, next_index
+    return balanced[0], cursor
+
+
+def _scan_yaml_actions(
+    text: str,
+) -> tuple[list[str], list[str], list[str], list[_StepBucket]]:
+    """Extract `uses`/`using` values and sequence-item step mappings.
+
+    Block-scalar bodies (`run: |`, `description: >-`) are not YAML mappings, so
+    they are skipped using the mapping-key column (not the compact `- ` dash
+    column) so sibling keys remain visible. Flow mappings, unbraced flow pairs,
+    quoted/escaped keys, explicit keys, anchors, aliases, tags, merge keys, and
+    multiline quoted keys are parsed or rejected fail-closed. `#` is a comment
+    only when YAML would start one. This is not a full YAML implementation;
+    unreadable structure is a failure, not an admitted absence of actions.
+    """
+
+    uses: list[str] = []
+    using: list[str] = []
+    errors: list[str] = []
+    steps: list[_StepBucket] = []
+    current: _StepBucket | None = None
+    lines = text.splitlines()
+    index = 0
+    while index < len(lines):
+        line = lines[index]
+        stripped = line.lstrip(" \t")
+        if not stripped or stripped.startswith("#") or stripped in YAML_DOCUMENT_MARK:
+            index += 1
+            continue
+        if not _yaml_quotes_balanced(line):
+            errors.append("unreadable multiline YAML quoting")
+            index += 1
+            continue
+        explicit = YAML_EXPLICIT_KEY.match(line)
+        if explicit:
+            errors.append("explicit YAML key")
+            rest = line[explicit.end() :].lstrip(" \t")
+            uses_before = len(uses)
+            using_before = len(using)
+            if rest:
+                _scan_structural_text(rest, uses, using, errors)
+            _note_step_actions(current, uses, using, uses_before, using_before)
+            index += 1
+            continue
+        dash_item = YAML_SEQUENCE_ITEM.match(line)
+        content = dash_item.group("item") if dash_item else stripped
+        had_line_props, remainder = _leading_yaml_node_properties(content)
+        if had_line_props:
+            errors.append("indirect or tagged YAML node")
+            uses_before = len(uses)
+            using_before = len(using)
+            if remainder.startswith("{") or remainder.startswith("["):
+                flow_text, cursor = _collect_multiline_flow(
+                    lines, remainder, index + 1
+                )
+                if flow_text is None:
+                    errors.append("unreadable flow collection")
+                    index += 1
+                    continue
+                if flow_text.startswith("{"):
+                    pairs, flow_errors = _collect_flow_mapping_pairs(flow_text)
+                else:
+                    pairs, flow_errors = _collect_flow_sequence(flow_text)
+                current = _begin_step(steps, None)
+                _record_flow_pairs(pairs, flow_errors, uses, using, errors)
+                _note_step_actions(current, uses, using, uses_before, using_before)
+                for raw_key, raw_value in pairs:
+                    if _decode_yaml_scalar(raw_key) == "with":
+                        _attach_with_value(current, raw_value)
+                index = cursor
+                continue
+            if remainder:
+                if dash_item is not None:
+                    current = _begin_step(steps, None)
+                _scan_structural_text(remainder, uses, using, errors)
+                _note_step_actions(current, uses, using, uses_before, using_before)
+            index += 1
+            continue
+        if dash_item is not None and YAML_BLOCK_SCALAR.match(
+            _yaml_strip_trailing_comment(content).strip()
+        ):
+            # A standalone sequence scalar (`- |` / `- >2-`) is data, not a
+            # step mapping. Its body can contain text such as `uses: ...` and
+            # must not satisfy the closed action-count allowlist. The dash
+            # column is the sequence item's parent indentation; the scalar
+            # body is necessarily more indented than it.
+            sequence_indent = len(line) - len(stripped)
+            index = _skip_block_scalar(lines, index + 1, sequence_indent)
+            continue
+        flow_step = YAML_FLOW_STEP.match(line)
+        if flow_step:
+            flow_text, cursor = _collect_multiline_flow(
+                lines, line[flow_step.start("flow") :], index + 1
+            )
+            if flow_text is None:
+                errors.append("unreadable flow step")
+                index += 1
+                continue
+            if flow_text.startswith("{"):
+                pairs, flow_errors = _collect_flow_mapping_pairs(flow_text)
+            else:
+                pairs, flow_errors = _collect_flow_sequence(flow_text)
+            uses_before = len(uses)
+            using_before = len(using)
+            current = _begin_step(steps, None)
+            _record_flow_pairs(pairs, flow_errors, uses, using, errors)
+            _note_step_actions(current, uses, using, uses_before, using_before)
+            for raw_key, raw_value in pairs:
+                if _decode_yaml_scalar(raw_key) == "with":
+                    _attach_with_value(current, raw_value)
+            index = cursor
+            continue
+        parsed = YAML_MAPPING_LINE.match(line)
+        if parsed is None:
+            if dash_item is not None and _is_plain_sequence_scalar(dash_item.group("item")):
+                index += 1
+                continue
+            errors.append("unreadable YAML structure")
+            index += 1
+            continue
+        key_indent = _yaml_mapping_key_indent(parsed)
+        dash = parsed.group("dash")
+        decoded_key = _decode_yaml_scalar(parsed.group("key"))
+        if dash:
+            current = _begin_step(steps, key_indent)
+        elif current is not None:
+            if current.key_indent is not None and key_indent < current.key_indent:
+                current = None
+            elif current.key_indent is not None and key_indent == current.key_indent:
+                current.collecting_with = False
+        raw_value = parsed.group("value")
+        value = _yaml_strip_trailing_comment(raw_value).strip()
+        had_value_props, remainder = _leading_yaml_node_properties(value)
+        if had_value_props:
+            errors.append("indirect or tagged YAML node")
+        structural = remainder if had_value_props else value
+        uses_before = len(uses)
+        using_before = len(using)
+        if YAML_BLOCK_SCALAR.match(structural):
+            if decoded_key in {"uses", "using", "<<"}:
+                _record_mapping_pair(parsed.group("key"), raw_value, uses, using, errors)
+            _note_step_actions(current, uses, using, uses_before, using_before)
+            if (
+                current is not None
+                and current.collecting_with
+                and current.key_indent is not None
+                and key_indent > current.key_indent
+            ):
+                current.with_pairs.append((parsed.group("key"), raw_value))
+            if (
+                current is not None
+                and decoded_key == "with"
+                and current.key_indent is not None
+                and key_indent == current.key_indent
+            ):
+                current.with_declarations += 1
+                current.with_errors.append("block-scalar with mapping")
+            index = _skip_block_scalar(lines, index + 1, key_indent)
+            continue
+        if structural.startswith("{") or structural.startswith("["):
+            flow_text, cursor = _collect_multiline_flow(lines, structural, index + 1)
+            if flow_text is None:
+                errors.append("unreadable flow collection")
+                index += 1
+                continue
+            if decoded_key in {"uses", "using", "<<"}:
+                _record_mapping_pair(parsed.group("key"), raw_value, uses, using, errors)
+            if flow_text.startswith("{"):
+                pairs, flow_errors = _collect_flow_mapping_pairs(flow_text)
+            else:
+                pairs, flow_errors = _collect_flow_sequence(flow_text)
+            _record_flow_pairs(pairs, flow_errors, uses, using, errors)
+            _note_step_actions(current, uses, using, uses_before, using_before)
+            if (
+                current is not None
+                and decoded_key == "with"
+                and current.key_indent is not None
+                and key_indent == current.key_indent
+            ):
+                _attach_with_value(current, raw_value)
+            elif (
+                current is not None
+                and current.collecting_with
+                and current.key_indent is not None
+                and key_indent > current.key_indent
+            ):
+                current.with_pairs.append((parsed.group("key"), raw_value))
+            index = cursor
+            continue
+        _record_mapping_pair(parsed.group("key"), raw_value, uses, using, errors)
+        _note_step_actions(current, uses, using, uses_before, using_before)
+        if (
+            current is not None
+            and decoded_key == "with"
+            and current.key_indent is not None
+            and key_indent == current.key_indent
+        ):
+            current.with_declarations += 1
+            if not structural:
+                current.collecting_with = True
+            else:
+                current.with_errors.append("unreadable with mapping")
+        elif (
+            current is not None
+            and current.collecting_with
+            and current.key_indent is not None
+            and key_indent > current.key_indent
+        ):
+            current.with_pairs.append((parsed.group("key"), raw_value))
+        index += 1
+    return uses, using, errors, steps
+
+
+def scan_yaml_action_invocations(text: str) -> tuple[list[str], list[str], list[str]]:
+    uses, using, errors, _steps = _scan_yaml_actions(text)
+    return uses, using, errors
+
+
+def _is_inspectable_yaml_scalar(value: str) -> bool:
+    """True only for a YAML scalar the description carve-out may blank.
+
+    GitHub renders a string. Flow `{...}` / `[...]`, explicit `?` values,
+    compact nested sequences, malformed block indicators, and any other
+    structural or unreadable shape stay scanned. Nested `&anchor` properties
+    inside a flow collection are invisible to `_leading_yaml_node_properties`,
+    which only inspects the start of the node, so a flow value must never be
+    treated as rendered description prose.
+    """
+
+    if YAML_BLOCK_SCALAR.match(value):
+        return True
+    if not value:
+        return False
+    if value[0] in {"'", '"'}:
+        return _decode_yaml_scalar(value) is not None
+    if value[0] in "{[?|>":
+        return False
+    if value[0] == "-" and (len(value) == 1 or value[1] in " \t"):
+        return False
+    if not _yaml_quotes_balanced(value):
+        return False
+    return True
+
+
+def _is_root_description_key(parsed: re.Match[str], value: str) -> bool:
+    """True only for the root action/workflow metadata `description:` scalar.
+
+    `description` is metadata *at one schema location*: the document root of an
+    `action.yml` (or a workflow), where GitHub renders a string and nothing
+    evaluates it. A flow mapping, flow sequence, explicit `?` value, or any
+    other non-scalar shape is not that string. Relying on GitHub to reject a
+    non-string metadata value is not a fail-closed verifier boundary: nested
+    `&anchor` names inside `{carrier: &leak exportVariable}` are not leading
+    node properties, so blanking the collection would hide the token while
+    `env: {description: *leak}` could still feed it into executable data.
+
+    Everywhere else the same spelling is ordinary data whose value is read by
+    something: `env: {description: ...}` becomes `process.env.description`,
+    `with: {description: ...}` becomes `core.getInput('description')`, and an
+    arbitrary nested mapping can be consumed by any `run:` body that reads the
+    file. A carrier parked in one of those slots can rebuild the forbidden
+    property (`core[process.env.description]`) with no contiguous token left on
+    the line, so only the root key may be withheld from the scan.
+
+    Root means column zero with no compact-sequence dash: a `- description:`
+    item is a sequence entry, not the root mapping. The value must be an
+    inspectable scalar (plain, quoted, or a valid block-scalar indicator) and
+    must carry no leading `&anchor` / `*alias` / `!tag` node property, because
+    an anchored scalar is reachable by alias from an executable slot elsewhere
+    in the document.
+
+    Callers additionally exempt only the *first* such key: an Actions file is a
+    single YAML document with one root mapping, so a second root `description:`
+    is a duplicate key rather than more rendered metadata.
+    """
+
+    if parsed.group("lead") != "" or parsed.group("dash") is not None:
+        return False
+    if parsed.group("key") != "description":
+        return False
+    had_properties, remainder = _leading_yaml_node_properties(value)
+    if had_properties:
+        return False
+    return _is_inspectable_yaml_scalar(remainder)
+
+
+def _without_yaml_description_prose(text: str) -> str:
+    """Blank the root `description:` value only, keeping every other byte.
+
+    A document-root action/workflow `description:` is metadata. GitHub renders
+    that scalar; it is never a program, never a step, and never reaches a
+    JavaScript runtime, so documenting *which* toolkit call the trusted
+    installers refuse to make must not itself read as that call.
+    `setup-sccache/action.yml` is whole-file digest-frozen by the Cross build
+    policy, so the token rule cannot be made to depend on rewording that prose,
+    and its one occurrence is exactly that root scalar.
+
+    Nested `description:` keys — action inputs, `workflow_dispatch` inputs, step
+    mappings, `env:`, `with:`, or any other mapping — are *not* exempt. See
+    `_is_root_description_key`: those values are action-consumed data, not
+    rendered prose, and stripping them would let a carrier build the forbidden
+    property indirectly. A root flow mapping, flow sequence, explicit `?`
+    value, or any other non-scalar shape is likewise scanned: it is not
+    rendered string prose.
+
+    The walk uses the same block-scalar discipline as `_scan_yaml_actions`: a
+    `run:` (or any non-description) block-scalar body is stepped over without
+    being read, so a `description:`-shaped line *inside* a shell body cannot
+    blank the lines after it. Only the root description's own inspectable
+    scalar and its correctly delimited block body are blanked, only for the
+    unquoted, unaliased, untagged key spelling, and a body that cannot be
+    delimited is left in place — so the transform can only ever remove
+    root-rendered scalar prose, never an executable or structural slot.
+    Exactly one root `description:` is exempted per document; a second is a
+    duplicate key and stays scanned.
+    """
+
+    lines = text.splitlines()
+    index = 0
+    exempted_root = False
+    while index < len(lines):
+        line = lines[index]
+        stripped = line.lstrip(" \t")
+        sequence = YAML_SEQUENCE_ITEM.match(line)
+        if sequence is not None and YAML_BLOCK_SCALAR.match(
+            _yaml_strip_trailing_comment(sequence.group("item")).strip()
+        ):
+            # `- |` is inert sequence data, not a mapping. Step over its body.
+            index = _skip_block_scalar(
+                lines, index + 1, len(line) - len(stripped)
+            )
+            continue
+        parsed = YAML_MAPPING_LINE.match(line)
+        if parsed is None:
+            index += 1
+            continue
+        key_indent = _yaml_mapping_key_indent(parsed)
+        value = _yaml_strip_trailing_comment(parsed.group("value")).strip()
+        prose = not exempted_root and _is_root_description_key(parsed, value)
+        exempted_root = exempted_root or prose
+        if prose:
+            lines[index] = line[: parsed.start("value")]
+        index += 1
+        if not YAML_BLOCK_SCALAR.match(value):
+            continue
+        end = _skip_block_scalar(lines, index, key_indent)
+        if prose:
+            for body in range(index, end):
+                lines[body] = ""
+        index = end
+    return "\n".join(lines)
+
+
 def check_no_sccache_credential_exporter(
     text: str,
     source: str,
@@ -789,15 +1821,168 @@ def check_no_sccache_credential_exporter(
             failures,
         )
     require(
-        # Invocation-shaped match: `setup-sccache/action.yml` is whole-file
-        # digest-frozen under the Cross policy, and its description prose
-        # legitimately names the `core.exportVariable` API while documenting
-        # that no installer calling it is invoked. Only an actual call site
-        # (always followed by an argument list) is a credential leak.
-        "core.exportVariable(" not in text,
-        f"{source} must not call core.exportVariable (ACTIONS_RUNTIME_TOKEN leak)",
+        # Defense in depth: the contiguous token is insufficient against
+        # computed property forms. The allowlist/shell-only checks are the gate.
+        # Scanned over everything except the document-root `description:`
+        # metadata scalar, so the rule stays a superset of PR #3958's
+        # invocation-shaped match on every executable, data, and structural slot
+        # while the frozen installers can still document the credential boundary
+        # they enforce. Nested `description:` keys (inputs, `env:`, `with:`, any
+        # other mapping) and non-scalar root `description:` values are
+        # action-consumed or structural data and remain scanned.
+        SCCACHE_EXPORT_VARIABLE_TOKEN not in _without_yaml_description_prose(text),
+        f"{source} must not contain {SCCACHE_EXPORT_VARIABLE_TOKEN} "
+        "(ACTIONS_RUNTIME_TOKEN leak)",
         failures,
     )
+
+
+def _action_count_drift(
+    observed: Counter[str], expected: Counter[str]
+) -> tuple[list[str], list[str], list[str]]:
+    unknown = sorted(key for key in observed if key not in expected)
+    extra_counts: list[str] = []
+    missing_counts: list[str] = []
+    for key in sorted(set(observed) | set(expected)):
+        got = observed[key]
+        want = expected[key]
+        if got == want:
+            continue
+        item = f"{key} observed={got} expected={want}"
+        if got > want:
+            extra_counts.append(item)
+        else:
+            missing_counts.append(item)
+    return unknown, extra_counts, missing_counts
+
+
+def check_fips_checkout_provenance(
+    steps: list[_StepBucket],
+    uses: list[str],
+    source: str,
+    failures: list[str],
+) -> None:
+    checkout_uses = [item for item in uses if item == CHECKOUT]
+    checkout_steps = [step for step in steps if CHECKOUT in step.uses]
+    require(
+        len(checkout_uses) == FIPS_CHECKOUT_COUNT
+        and len(checkout_steps) == FIPS_CHECKOUT_COUNT,
+        f"{source} must invoke pinned actions/checkout exactly "
+        f"{FIPS_CHECKOUT_COUNT} times with inspectable step mappings; "
+        f"uses={len(checkout_uses)} steps={len(checkout_steps)}",
+        failures,
+    )
+    for step in checkout_steps:
+        require(
+            step.with_declarations == 1,
+            f"{source} checkout must declare exactly one inspectable with mapping "
+            f"(found {step.with_declarations})",
+            failures,
+        )
+        for error in step.with_errors:
+            failures.append(f"{source} checkout {error}")
+        persist: str | None = None
+        redirected: list[str] = []
+        extra: list[str] = []
+        seen: set[str] = set()
+        for raw_key, raw_value in step.with_pairs:
+            key = _decode_yaml_scalar(raw_key)
+            if key is None:
+                failures.append(f"{source} checkout has an unreadable with key")
+                continue
+            if key == "<<":
+                failures.append(f"{source} checkout with mapping uses a YAML merge key")
+                continue
+            parsed_value, error = _parse_plain_action_scalar(
+                raw_value, "checkout input"
+            )
+            if error:
+                failures.append(f"{source} checkout {error}")
+                continue
+            if key in seen:
+                failures.append(
+                    f"{source} checkout declares duplicate with key {key}"
+                )
+            seen.add(key)
+            if key in CHECKOUT_REDIRECT_KEYS:
+                redirected.append(key)
+            elif key not in CHECKOUT_ALLOWED_WITH_KEYS:
+                extra.append(key)
+            if key == "persist-credentials":
+                persist = parsed_value
+            elif key == "fetch-depth" and (
+                parsed_value is None or not parsed_value.isdigit()
+            ):
+                failures.append(
+                    f"{source} checkout fetch-depth must be a plain integer, "
+                    f"found {parsed_value!r}"
+                )
+        require(
+            persist == "false",
+            f"{source} checkout must set persist-credentials: false "
+            f"(found {persist!r})",
+            failures,
+        )
+        require(
+            not redirected and not extra,
+            f"{source} checkout must keep the current-repository/default-ref/"
+            f"default-root contract without repository/ref/path redirection; "
+            f"redirected={sorted(set(redirected))} extra={sorted(set(extra))}",
+            failures,
+        )
+
+
+def check_fips_action_allowlist(
+    text: str,
+    source: str,
+    failures: list[str],
+) -> None:
+    uses, using, errors, steps = _scan_yaml_actions(text)
+    for error in errors:
+        failures.append(f"{source} {error}")
+    require(
+        not using,
+        f"{source} must not declare an action runtime (`using:`); JavaScript "
+        f"carriers are refused: {using}",
+        failures,
+    )
+    observed = Counter(uses)
+    expected = Counter(FIPS_ALLOWED_ACTION_COUNTS)
+    unknown, extra_counts, missing_counts = _action_count_drift(observed, expected)
+    require(
+        not unknown and not extra_counts and not missing_counts and not errors,
+        f"{source} action uses must equal the closed FIPS allowlist with exact "
+        f"occurrence counts; rejected={unknown} extra=[{'; '.join(extra_counts)}] "
+        f"missing=[{'; '.join(missing_counts)}]",
+        failures,
+    )
+    check_fips_checkout_provenance(steps, uses, source, failures)
+
+
+def check_shell_only_local_action(
+    text: str,
+    source: str,
+    failures: list[str],
+) -> None:
+    uses, using, errors = scan_yaml_action_invocations(text)
+    for error in errors:
+        failures.append(f"{source} {error}")
+    require(
+        not uses and not errors,
+        f"{source} must not invoke nested actions; refused uses={uses}",
+        failures,
+    )
+    require(
+        using == [SHELL_ONLY_COMPOSITE],
+        f"{source} must remain a shell-only composite action; using={using}",
+        failures,
+    )
+    require(
+        not any(JS_ACTION_USING.fullmatch(value) for value in using),
+        f"{source} must not use a JavaScript action runtime",
+        failures,
+    )
+    check_no_sccache_credential_exporter(text, source, failures)
 
 
 def check_setup_sccache_verified_activation(
@@ -2617,6 +3802,7 @@ def check_fips(workflow: str, failures: list[str]) -> None:
         expected_count=1,
     )
     check_fips_producer_channel(workflow, failures)
+    check_fips_action_allowlist(workflow, "fips-build.yml", failures)
     check_no_sccache_credential_exporter(workflow, "fips-build.yml", failures)
     for job_body, job_name in (
         (compile_job, "fips-compile"),
@@ -2864,7 +4050,12 @@ def check_shared_actions(failures: list[str]) -> None:
         "setup-rust-ci must expose rust-cache hit/miss as an action output",
         failures,
     )
-    check_no_sccache_credential_exporter(sccache, "setup-sccache", failures)
+    check_shell_only_local_action(sccache, "setup-sccache", failures)
+    check_shell_only_local_action(
+        SETUP_FAST_LINKER.read_text(encoding="utf-8"),
+        "setup-fast-linker",
+        failures,
+    )
     check_credential_absence_assertion(sccache, "setup-sccache", failures)
     check_setup_sccache_verified_activation(sccache, "setup-sccache", failures)
     require(
@@ -3037,6 +4228,30 @@ def check_docs_and_coverage(failures: list[str]) -> None:
         "mozilla-actions/sccache-action" in ci_cd
         and "ACTIONS_RUNTIME_TOKEN" in ci_cd,
         "docs/ci_cd.md must name the rejected sccache installer and token boundary",
+        failures,
+    )
+    require(
+        "closed allowlist" in ci_cd.lower()
+        and "shell-only" in ci_cd.lower()
+        and "setup-fast-linker" in ci_cd
+        and "exportVariable" in ci_cd
+        and "defense" in ci_cd.lower()
+        and "occurrence counts" in ci_cd.lower()
+        and "persist-credentials" in ci_cd
+        and "repository" in ci_cd
+        and "default-ref" in ci_cd.lower(),
+        "docs/ci_cd.md must document the FIPS action allowlist, exact occurrence "
+        "counts, checkout provenance, shell-only local actions, and "
+        "defense-in-depth exportVariable token rule",
+        failures,
+    )
+    require(
+        "plain or quoted scalar" in ci_cd
+        and "non-scalar" in ci_cd.lower()
+        and "flow mapping" in ci_cd
+        and "flow sequence" in ci_cd,
+        "docs/ci_cd.md must document that the exportVariable description "
+        "carve-out is scalar-only and that non-scalar root values stay scanned",
         failures,
     )
     require(
@@ -3602,6 +4817,923 @@ def self_test() -> int:
     require(
         any("must not invoke credential-exporting installer" in item for item in exporter_failures),
         "self-test: mozilla-actions/sccache-action must fail",
+        failures,
+    )
+
+    real_fips = FIPS_WORKFLOW.read_text(encoding="utf-8")
+    real_sccache = SETUP_SCCACHE.read_text(encoding="utf-8")
+    real_linker = SETUP_FAST_LINKER.read_text(encoding="utf-8")
+    admitted_failures: list[str] = []
+    check_fips_action_allowlist(real_fips, "fips-build.yml", admitted_failures)
+    check_no_sccache_credential_exporter(real_fips, "fips-build.yml", admitted_failures)
+    check_shell_only_local_action(real_sccache, "setup-sccache", admitted_failures)
+    check_shell_only_local_action(real_linker, "setup-fast-linker", admitted_failures)
+    require(
+        not admitted_failures,
+        "self-test: current checked FIPS workflow and shell-only actions must "
+        "be admitted: " + "; ".join(admitted_failures),
+        failures,
+    )
+
+    computed_js = 'core["export" + "Variable"]("ACTIONS_RUNTIME_TOKEN", token)'
+    require(
+        SCCACHE_EXPORT_VARIABLE_TOKEN not in computed_js,
+        "self-test: computed-property fixture must not contain the contiguous token",
+        failures,
+    )
+    github_script = (
+        "actions/github-script@3d3c42e5aac5ba805825da76410c181273ba90b1"
+    )
+    setup_step = "      - uses: ./.github/actions/setup-sccache\n"
+    require(
+        setup_step in real_fips,
+        "self-test: fips-build.yml must still contain the setup-sccache step",
+        failures,
+    )
+
+    sequence_scalar_text = (
+        "paths:\n"
+        "  - |\n"
+        "      uses: actions/github-script@decoy\n"
+        "  - >2-\n"
+        "      using: node20\n"
+    )
+    scalar_uses, scalar_using, scalar_errors = scan_yaml_action_invocations(
+        sequence_scalar_text
+    )
+    require(
+        not scalar_uses and not scalar_using and not scalar_errors,
+        "self-test: standalone sequence block-scalar bodies must remain data, "
+        "not action-count carriers: "
+        f"uses={scalar_uses} using={scalar_using} errors={scalar_errors}",
+        failures,
+    )
+
+    scalar_count_decoy = real_fips.replace(
+        "    branches: [main]\n",
+        "    branches:\n"
+        "      - main\n"
+        "      - |\n"
+        "          uses: ./.github/actions/setup-sccache\n",
+        1,
+    ).replace(setup_step, "      - run: true\n", 1)
+    require(
+        "      - |\n          uses: ./.github/actions/setup-sccache\n"
+        in scalar_count_decoy
+        and scalar_count_decoy.count(setup_step) == real_fips.count(setup_step) - 1,
+        "self-test: sequence block-scalar decoy mutation must insert inert text "
+        "and remove exactly one real setup-sccache action",
+        failures,
+    )
+    scalar_count_failures: list[str] = []
+    check_fips_action_allowlist(
+        scalar_count_decoy,
+        "self-test-sequence-block-scalar-count-decoy",
+        scalar_count_failures,
+    )
+    require(
+        any(
+            "./.github/actions/setup-sccache observed=3 expected=4" in item
+            for item in scalar_count_failures
+        ),
+        "self-test: inert sequence block-scalar text must not replace a real "
+        f"allowlisted invocation: {scalar_count_failures}",
+        failures,
+    )
+
+    computed_block = real_fips.replace(
+        setup_step,
+        "      - uses: "
+        + github_script
+        + "\n        with:\n          script: "
+        + computed_js
+        + "\n"
+        + setup_step,
+        1,
+    )
+    computed_block_failures: list[str] = []
+    check_fips_action_allowlist(
+        computed_block, "self-test-computed-block", computed_block_failures
+    )
+    computed_token_failures: list[str] = []
+    check_no_sccache_credential_exporter(
+        computed_block, "self-test-computed-block-token", computed_token_failures
+    )
+    require(
+        any("closed FIPS allowlist" in item for item in computed_block_failures),
+        "self-test: computed-property github-script block uses must fail the "
+        f"allowlist: {computed_block_failures}",
+        failures,
+    )
+    require(
+        not computed_token_failures,
+        "self-test: computed-property payload must not be caught only by the "
+        "token rule: " + "; ".join(computed_token_failures),
+        failures,
+    )
+
+    computed_flow = real_fips.replace(
+        setup_step,
+        "      - {uses: "
+        + github_script
+        + ", with: {script: '"
+        + computed_js.replace("'", "''")
+        + "'}}\n"
+        + setup_step,
+        1,
+    )
+    computed_flow_failures: list[str] = []
+    check_fips_action_allowlist(
+        computed_flow, "self-test-computed-flow", computed_flow_failures
+    )
+    require(
+        any("closed FIPS allowlist" in item for item in computed_flow_failures),
+        "self-test: flow-form github-script uses must fail the allowlist: "
+        f"{computed_flow_failures}",
+        failures,
+    )
+
+    computed_seq = real_fips.replace(
+        setup_step,
+        "      - [{uses: "
+        + github_script
+        + ", with: {script: '"
+        + computed_js.replace("'", "''")
+        + "'}}]\n"
+        + setup_step,
+        1,
+    )
+    computed_seq_failures: list[str] = []
+    check_fips_action_allowlist(
+        computed_seq, "self-test-computed-sequence", computed_seq_failures
+    )
+    require(
+        any("closed FIPS allowlist" in item for item in computed_seq_failures),
+        "self-test: flow-sequence github-script uses must fail the allowlist: "
+        f"{computed_seq_failures}",
+        failures,
+    )
+
+    escaped_key = real_fips.replace(
+        setup_step,
+        '      - "\\u0075ses": ' + github_script + "\n" + setup_step,
+        1,
+    )
+    escaped_failures: list[str] = []
+    check_fips_action_allowlist(
+        escaped_key, "self-test-escaped-uses-key", escaped_failures
+    )
+    require(
+        any("closed FIPS allowlist" in item for item in escaped_failures),
+        "self-test: escaped uses key must fail the allowlist: "
+        f"{escaped_failures}",
+        failures,
+    )
+
+    alias_doc = "x-evil: &evil " + github_script + "\n" + real_fips.replace(
+        setup_step, "      - uses: *evil\n" + setup_step, 1
+    )
+    alias_failures: list[str] = []
+    check_fips_action_allowlist(alias_doc, "self-test-uses-alias", alias_failures)
+    require(
+        any("indirect uses value" in item for item in alias_failures),
+        f"self-test: aliased uses must fail closed: {alias_failures}",
+        failures,
+    )
+
+    block_scalar_uses = real_fips.replace(
+        setup_step,
+        "      - uses: |\n          " + github_script + "\n" + setup_step,
+        1,
+    )
+    block_scalar_failures: list[str] = []
+    check_fips_action_allowlist(
+        block_scalar_uses, "self-test-block-scalar-uses", block_scalar_failures
+    )
+    require(
+        any("block-scalar uses value" in item for item in block_scalar_failures),
+        f"self-test: block-scalar uses must fail closed: {block_scalar_failures}",
+        failures,
+    )
+
+    dynamic_uses = real_fips.replace(
+        setup_step,
+        "      - uses: ${{ env.ACTION }}\n" + setup_step,
+        1,
+    )
+    dynamic_failures: list[str] = []
+    check_fips_action_allowlist(
+        dynamic_uses, "self-test-dynamic-uses", dynamic_failures
+    )
+    require(
+        any("dynamic uses value" in item for item in dynamic_failures),
+        f"self-test: template uses must fail closed: {dynamic_failures}",
+        failures,
+    )
+
+    quoted_concat = real_fips.replace(
+        setup_step,
+        '      - uses: "actions/" + "github-script@'
+        + "3d3c42e5aac5ba805825da76410c181273ba90b1"
+        + '"\n'
+        + setup_step,
+        1,
+    )
+    concat_failures: list[str] = []
+    check_fips_action_allowlist(
+        quoted_concat, "self-test-concatenated-uses", concat_failures
+    )
+    require(
+        bool(concat_failures),
+        "self-test: concatenated uses spelling must fail closed: "
+        f"{concat_failures}",
+        failures,
+    )
+
+    chaining_payload = (
+        'core?.["export"+"Variable"].call(core, "ACTIONS_RUNTIME_TOKEN", token)'
+    )
+    require(
+        SCCACHE_EXPORT_VARIABLE_TOKEN not in chaining_payload,
+        "self-test: optional-chaining computed fixture must not contain the token",
+        failures,
+    )
+    chaining_doc = real_fips.replace(
+        setup_step,
+        "      - uses: "
+        + github_script
+        + "\n        with:\n          script: "
+        + chaining_payload
+        + "\n"
+        + setup_step,
+        1,
+    )
+    chaining_failures: list[str] = []
+    check_fips_action_allowlist(
+        chaining_doc, "self-test-optional-chaining-carrier", chaining_failures
+    )
+    require(
+        any("closed FIPS allowlist" in item for item in chaining_failures),
+        "self-test: optional-chaining/call JS carrier must fail the allowlist: "
+        f"{chaining_failures}",
+        failures,
+    )
+
+    unlisted_pin = real_fips.replace(
+        setup_step,
+        "      - uses: actions/setup-node@3d3c42e5aac5ba805825da76410c181273ba90b1\n"
+        + setup_step,
+        1,
+    )
+    unlisted_failures: list[str] = []
+    check_fips_action_allowlist(
+        unlisted_pin, "self-test-unlisted-pin", unlisted_failures
+    )
+    require(
+        any("closed FIPS allowlist" in item for item in unlisted_failures),
+        f"self-test: pinned action outside the allowlist must fail: {unlisted_failures}",
+        failures,
+    )
+
+    nested_js = real_sccache.replace(
+        "  using: composite\n  steps:\n",
+        "  using: composite\n  steps:\n"
+        "    - uses: "
+        + github_script
+        + "\n      with:\n        script: "
+        + computed_js
+        + "\n",
+        1,
+    )
+    nested_failures: list[str] = []
+    check_shell_only_local_action(
+        nested_js, "self-test-nested-js-action", nested_failures
+    )
+    require(
+        any("must not invoke nested actions" in item for item in nested_failures),
+        f"self-test: nested github-script in setup-sccache must fail: {nested_failures}",
+        failures,
+    )
+    require(
+        not any("must not contain exportVariable" in item for item in nested_failures),
+        "self-test: nested computed JS must fail structurally, not only via the token",
+        failures,
+    )
+
+    node_runtime = real_sccache.replace(
+        "  using: composite\n", "  using: node20\n", 1
+    )
+    node_failures: list[str] = []
+    check_shell_only_local_action(
+        node_runtime, "self-test-javascript-runtime", node_failures
+    )
+    require(
+        any("shell-only composite action" in item for item in node_failures)
+        or any("JavaScript action runtime" in item for item in node_failures),
+        f"self-test: JavaScript using: node20 must fail: {node_failures}",
+        failures,
+    )
+
+    linker_nested = real_linker.replace(
+        "  using: composite\n  steps:\n",
+        "  using: composite\n  steps:\n    - uses: " + github_script + "\n",
+        1,
+    )
+    linker_nested_failures: list[str] = []
+    check_shell_only_local_action(
+        linker_nested, "self-test-linker-nested-action", linker_nested_failures
+    )
+    require(
+        any("must not invoke nested actions" in item for item in linker_nested_failures),
+        "self-test: nested action in setup-fast-linker must fail: "
+        f"{linker_nested_failures}",
+        failures,
+    )
+
+    def fips_insert(snippet: str) -> str:
+        mutated = real_fips.replace(setup_step, snippet + setup_step, 1)
+        require(
+            setup_step in mutated and snippet.split("\n", 1)[0] in mutated,
+            "self-test: FIPS carrier mutation must insert into the real workflow "
+            f"without dropping setup-sccache: {snippet!r}",
+            failures,
+        )
+        return mutated
+
+    def require_fips_carrier(name: str, snippet: str, needles: tuple[str, ...]) -> None:
+        carrier_failures: list[str] = []
+        check_fips_action_allowlist(fips_insert(snippet), name, carrier_failures)
+        require(
+            any(any(needle in item for needle in needles) for item in carrier_failures),
+            f"self-test: {name} must fail closed {needles}: {carrier_failures}",
+            failures,
+        )
+
+    require_fips_carrier(
+        "self-test-block-merge-key",
+        "      - <<: *evil\n",
+        ("YAML merge key",),
+    )
+    require_fips_carrier(
+        "self-test-flow-merge-key",
+        "      - {<<: *evil}\n",
+        ("YAML merge key",),
+    )
+    require_fips_carrier(
+        "self-test-block-merge-mapping",
+        "      - <<: {uses: " + github_script + "}\n",
+        ("YAML merge key", "closed FIPS allowlist"),
+    )
+    require_fips_carrier(
+        "self-test-sequence-explicit-key",
+        "      - ? uses\n        : " + github_script + "\n",
+        ("explicit YAML key",),
+    )
+    require_fips_carrier(
+        "self-test-sequence-explicit-key-compact",
+        "      - ? uses: " + github_script + "\n",
+        ("explicit YAML key", "closed FIPS allowlist"),
+    )
+    require_fips_carrier(
+        "self-test-unbraced-flow-pair",
+        "      - [uses: " + github_script + "]\n",
+        ("closed FIPS allowlist",),
+    )
+    require_fips_carrier(
+        "self-test-unbraced-flow-pair-after-mapping",
+        "      - [{name: hidden}, uses: " + github_script + "]\n",
+        ("closed FIPS allowlist",),
+    )
+    require_fips_carrier(
+        "self-test-anchored-flow-step",
+        "      - &step {uses: " + github_script + "}\n",
+        ("indirect or tagged YAML node", "closed FIPS allowlist"),
+    )
+    require_fips_carrier(
+        "self-test-anchored-mapping-value",
+        "      - dummy: &step {uses: " + github_script + "}\n",
+        ("indirect or tagged YAML node", "closed FIPS allowlist"),
+    )
+    require_fips_carrier(
+        "self-test-tagged-flow-step",
+        "      - !!map {uses: " + github_script + "}\n",
+        ("indirect or tagged YAML node", "closed FIPS allowlist"),
+    )
+    require_fips_carrier(
+        "self-test-tagged-uses-key",
+        "      - !!str uses: " + github_script + "\n",
+        ("indirect or tagged YAML node", "closed FIPS allowlist"),
+    )
+    require_fips_carrier(
+        "self-test-alias-sequence-item",
+        "      - *evil\n",
+        ("indirect or tagged YAML node",),
+    )
+    require_fips_carrier(
+        "self-test-alias-as-key",
+        "      - *uk: " + github_script + "\n",
+        ("indirect or tagged YAML node",),
+    )
+    require_fips_carrier(
+        "self-test-multiline-quoted-uses-key",
+        '      - "\\\n        uses": ' + github_script + "\n",
+        ("unreadable multiline YAML quoting",),
+    )
+    require_fips_carrier(
+        "self-test-block-scalar-sibling-uses-literal",
+        "      - name: |\n"
+        "          harmless\n"
+        "        uses: " + github_script + "\n",
+        ("closed FIPS allowlist",),
+    )
+    require_fips_carrier(
+        "self-test-block-scalar-sibling-uses-folded",
+        "      - name: >-\n"
+        "          harmless\n"
+        "        uses: " + github_script + "\n",
+        ("closed FIPS allowlist",),
+    )
+    require_fips_carrier(
+        "self-test-plain-scalar-hash-flow",
+        "      - {name: harmless#suffix, uses: " + github_script + "\n"
+        "        }\n",
+        ("closed FIPS allowlist",),
+    )
+    require_fips_carrier(
+        "self-test-duplicate-checkout",
+        f"      - uses: {CHECKOUT} # v6\n"
+        "        with:\n"
+        "          persist-credentials: false\n",
+        ("occurrence counts", "observed="),
+    )
+    require_fips_carrier(
+        "self-test-duplicate-setup-sccache",
+        setup_step,
+        ("occurrence counts", "observed="),
+    )
+
+    comment_control = fips_insert(
+        "      - {name: harmless, # separated comment\n"
+        "        run: echo ok}\n"
+    )
+    comment_control_failures: list[str] = []
+    check_fips_action_allowlist(
+        comment_control,
+        "self-test-separated-comment-control",
+        comment_control_failures,
+    )
+    require(
+        not comment_control_failures,
+        "self-test: a whitespace-separated YAML comment must not hide or invent "
+        "action carriers: " + "; ".join(comment_control_failures),
+        failures,
+    )
+
+    checkout_with = "        with:\n          persist-credentials: false\n"
+    require(
+        checkout_with in real_fips and CHECKOUT in real_fips,
+        "self-test: fips-build.yml must still contain the admitted checkout with "
+        "persist-credentials: false",
+        failures,
+    )
+    repo_redirect = real_fips.replace(
+        checkout_with,
+        checkout_with + "          repository: evil/other-repo\n",
+        1,
+    )
+    require(
+        setup_step in repo_redirect and "persist-credentials: false" in repo_redirect,
+        "self-test: repository redirect mutation must keep original admitted "
+        "checkout and setup-sccache text",
+        failures,
+    )
+    repo_redirect_failures: list[str] = []
+    check_fips_action_allowlist(
+        repo_redirect, "self-test-checkout-repository-redirect", repo_redirect_failures
+    )
+    require(
+        any("repository/ref/path redirection" in item for item in repo_redirect_failures)
+        and any("repository" in item for item in repo_redirect_failures),
+        "self-test: checkout repository redirect must fail provenance: "
+        f"{repo_redirect_failures}",
+        failures,
+    )
+    path_redirect = real_fips.replace(
+        checkout_with,
+        checkout_with + "          path: .github/actions/setup-sccache\n",
+        1,
+    )
+    require(
+        setup_step in path_redirect
+        and "./.github/actions/setup-sccache" in path_redirect,
+        "self-test: path redirect mutation must keep original setup-sccache text",
+        failures,
+    )
+    path_redirect_failures: list[str] = []
+    check_fips_action_allowlist(
+        path_redirect, "self-test-checkout-path-redirect", path_redirect_failures
+    )
+    require(
+        any("repository/ref/path redirection" in item for item in path_redirect_failures)
+        and any("path" in item for item in path_redirect_failures),
+        "self-test: checkout path redirect must fail provenance: "
+        f"{path_redirect_failures}",
+        failures,
+    )
+    duplicate_with = real_fips.replace(
+        checkout_with,
+        checkout_with + "        with:\n          fetch-depth: 1\n",
+        1,
+    )
+    require(
+        setup_step in duplicate_with and duplicate_with.count(checkout_with) >= 1,
+        "self-test: duplicate checkout with mutation must keep the original "
+        "checkout provenance and setup-sccache text",
+        failures,
+    )
+    duplicate_with_failures: list[str] = []
+    check_fips_action_allowlist(
+        duplicate_with,
+        "self-test-checkout-duplicate-with",
+        duplicate_with_failures,
+    )
+    require(
+        any(
+            "exactly one inspectable with mapping" in item
+            for item in duplicate_with_failures
+        ),
+        "self-test: duplicate checkout with mappings must fail provenance: "
+        f"{duplicate_with_failures}",
+        failures,
+    )
+
+    def sccache_insert(snippet: str) -> str:
+        marker = "  using: composite\n  steps:\n"
+        mutated = real_sccache.replace(marker, marker + snippet, 1)
+        require(
+            marker in mutated and snippet.split("\n", 1)[0] in mutated,
+            "self-test: setup-sccache carrier mutation must keep using: composite "
+            f"and insert the carrier: {snippet!r}",
+            failures,
+        )
+        return mutated
+
+    def require_sccache_carrier(name: str, snippet: str, needles: tuple[str, ...]) -> None:
+        carrier_failures: list[str] = []
+        check_shell_only_local_action(sccache_insert(snippet), name, carrier_failures)
+        require(
+            any(any(needle in item for needle in needles) for item in carrier_failures),
+            f"self-test: {name} must fail closed {needles}: {carrier_failures}",
+            failures,
+        )
+        require(
+            not any("must not contain exportVariable" in item for item in carrier_failures),
+            f"self-test: {name} must fail structurally, not only via the token",
+            failures,
+        )
+
+    require_sccache_carrier(
+        "self-test-sccache-block-merge-key",
+        "    - <<: *evil\n",
+        ("YAML merge key",),
+    )
+    require_sccache_carrier(
+        "self-test-sccache-sequence-explicit-key",
+        "    - ? uses: " + github_script + "\n",
+        ("explicit YAML key", "must not invoke nested actions"),
+    )
+    require_sccache_carrier(
+        "self-test-sccache-unbraced-flow-pair",
+        "    - [uses: " + github_script + "]\n",
+        ("must not invoke nested actions",),
+    )
+    require_sccache_carrier(
+        "self-test-sccache-anchored-flow-step",
+        "    - &step {uses: " + github_script + "}\n",
+        ("indirect or tagged YAML node", "must not invoke nested actions"),
+    )
+    require_sccache_carrier(
+        "self-test-sccache-tagged-flow-step",
+        "    - !!map {uses: " + github_script + "}\n",
+        ("indirect or tagged YAML node", "must not invoke nested actions"),
+    )
+    require_sccache_carrier(
+        "self-test-sccache-multiline-quoted-uses-key",
+        '    - "\\\n      uses": ' + github_script + "\n",
+        ("unreadable multiline YAML quoting",),
+    )
+    require_sccache_carrier(
+        "self-test-sccache-block-scalar-sibling-uses-literal",
+        "    - name: |\n"
+        "        harmless\n"
+        "      uses: " + github_script + "\n",
+        ("must not invoke nested actions",),
+    )
+    require_sccache_carrier(
+        "self-test-sccache-block-scalar-sibling-uses-folded",
+        "    - name: >-\n"
+        "        harmless\n"
+        "      uses: " + github_script + "\n",
+        ("must not invoke nested actions",),
+    )
+    require_sccache_carrier(
+        "self-test-sccache-plain-scalar-hash-flow",
+        "    - {name: harmless#suffix, uses: " + github_script + "\n"
+        "      }\n",
+        ("must not invoke nested actions",),
+    )
+
+    sccache_comment_control = sccache_insert(
+        "    - {name: harmless, # separated comment\n"
+        "      run: echo ok}\n"
+    )
+    sccache_comment_failures: list[str] = []
+    check_shell_only_local_action(
+        sccache_comment_control,
+        "self-test-sccache-separated-comment-control",
+        sccache_comment_failures,
+    )
+    require(
+        not sccache_comment_failures,
+        "self-test: a whitespace-separated YAML comment in setup-sccache must "
+        "not invent nested actions: " + "; ".join(sccache_comment_failures),
+        failures,
+    )
+
+    export_variable_bypass_shapes = (
+        "core.exportVariable('ACTIONS_RUNTIME_TOKEN', token)",
+        "core.exportVariable ('ACTIONS_RUNTIME_TOKEN', token)",
+        "core.exportVariable\n('ACTIONS_RUNTIME_TOKEN', token)",
+        "core.exportVariable/* indirect */('ACTIONS_RUNTIME_TOKEN', token)",
+        'core["exportVariable"](\'ACTIONS_RUNTIME_TOKEN\', token)',
+        "core?.exportVariable('ACTIONS_RUNTIME_TOKEN', token)",
+        "core.exportVariable.call(core, 'ACTIONS_RUNTIME_TOKEN', token)",
+        "core.exportVariable.apply(core, ['ACTIONS_RUNTIME_TOKEN', token])",
+        "core.exportVariable.bind(core)('ACTIONS_RUNTIME_TOKEN', token)",
+        "const leak = core.exportVariable; leak('ACTIONS_RUNTIME_TOKEN', token)",
+        "const { exportVariable } = core; exportVariable('ACTIONS_RUNTIME_TOKEN', token)",
+        "(0, core.exportVariable)('ACTIONS_RUNTIME_TOKEN', token)",
+    )
+    for index, sample in enumerate(export_variable_bypass_shapes):
+        sample_failures: list[str] = []
+        check_no_sccache_credential_exporter(
+            sample,
+            f"self-test-export-variable-token-{index}",
+            sample_failures,
+        )
+        require(
+            any("must not contain exportVariable" in item for item in sample_failures),
+            f"self-test: exportVariable token must fail: {sample!r}",
+            failures,
+        )
+
+    export_variable_control_failures: list[str] = []
+    check_no_sccache_credential_exporter(
+        "This action does not persist cache-service credentials into GITHUB_ENV.",
+        "self-test-export-variable-control",
+        export_variable_control_failures,
+    )
+    require(
+        not export_variable_control_failures,
+        "self-test: credential-isolation prose without the token must pass: "
+        + "; ".join(export_variable_control_failures),
+        failures,
+    )
+
+    # The checked-in installer documents the exact toolkit call it refuses to
+    # make, and the Cross build policy freezes that file whole, so the token
+    # rule has to read the *root* `description:` as prose. Assert the real file
+    # still exercises the carve-out at exactly that one location; a silent
+    # reword would make it vacuous, and a nested occurrence would mean the
+    # frozen file now depends on an exemption the transform does not grant.
+    require(
+        SCCACHE_EXPORT_VARIABLE_TOKEN in real_sccache,
+        "self-test: setup-sccache description must still document the "
+        f"{SCCACHE_EXPORT_VARIABLE_TOKEN} boundary it refuses",
+        failures,
+    )
+    # The root `description:` key at column zero plus every line of its block
+    # body (indented, or blank). Nothing else in the file is exempt, so every
+    # occurrence of the token has to fall inside this span.
+    root_description_block = re.search(
+        r"(?m)^description:[^\n]*\n(?:(?:[ \t]+[^\n]*)?\n)*",
+        real_sccache,
+    )
+    root_description_hits = (
+        0
+        if root_description_block is None
+        else root_description_block.group(0).count(SCCACHE_EXPORT_VARIABLE_TOKEN)
+    )
+    require(
+        root_description_hits > 0
+        and root_description_hits
+        == real_sccache.count(SCCACHE_EXPORT_VARIABLE_TOKEN),
+        "self-test: every setup-sccache "
+        f"{SCCACHE_EXPORT_VARIABLE_TOKEN} occurrence must live in the root "
+        "description block; nested description keys are scanned, not exempt",
+        failures,
+    )
+
+    # Only the document-root metadata `description:` scalar is withheld from
+    # the scan: its plain or quoted scalar and its correctly delimited block
+    # body. Flow collections and other non-scalar shapes stay scanned.
+    description_prose_shapes = (
+        "description: >-\n"
+        "  Does not invoke an installer that `core.exportVariable`s\n"
+        "  ACTIONS_RUNTIME_TOKEN into GITHUB_ENV.\n"
+        "runs:\n"
+        "  using: composite\n",
+        "description: |\n"
+        "  core.exportVariable('ACTIONS_RUNTIME_TOKEN', token) is refused.\n"
+        "runs:\n"
+        "  using: composite\n",
+        "description: core.exportVariable is documented, never invoked\n"
+        "runs:\n"
+        "  using: composite\n",
+        'description: "core.exportVariable is documented, never invoked"\n'
+        "runs:\n"
+        "  using: composite\n",
+        "description: 'core.exportVariable is documented, never invoked'\n"
+        "runs:\n"
+        "  using: composite\n",
+        # Quoted scalars whose contents look like a flow collection are still
+        # strings GitHub renders, not YAML structure.
+        'description: "[exportVariable] is documented, never invoked"\n'
+        "runs:\n"
+        "  using: composite\n",
+        "description: '{carrier: exportVariable} is documented, never invoked'\n"
+        "runs:\n"
+        "  using: composite\n",
+    )
+    for index, sample in enumerate(description_prose_shapes):
+        prose_failures: list[str] = []
+        check_no_sccache_credential_exporter(
+            sample,
+            f"self-test-export-variable-description-{index}",
+            prose_failures,
+        )
+        require(
+            not prose_failures,
+            f"self-test: root description prose must not trip the token rule: "
+            f"{sample!r}: " + "; ".join(prose_failures),
+            failures,
+        )
+
+    # The carve-out is the root description value only. A carrier in any
+    # executable, data, or structural slot beside it — including a nested
+    # `description` key of any depth, which is action-consumed data rather than
+    # rendered metadata — must still fail.
+    description_adjacent_carriers = (
+        "description: >-\n"
+        "  Refuses core.exportVariable installers.\n"
+        "runs:\n"
+        "  using: composite\n"
+        "  steps:\n"
+        "    - shell: bash\n"
+        "      run: node -e 'core.exportVariable(\"ACTIONS_RUNTIME_TOKEN\", t)'\n",
+        "description: harmless\n"
+        "runs:\n"
+        "  steps:\n"
+        "    - run: |\n"
+        "        node -e 'const { exportVariable } = core; exportVariable(v, t)'\n",
+        '"description": core.exportVariable is quoted, so this is not prose\n',
+        "  description-suffix: core.exportVariable('ACTIONS_RUNTIME_TOKEN', t)\n",
+        # A `description:`-shaped line inside a shell body must not blank the
+        # rest of that body: the walk steps over `run:` scalars without reading
+        # them, so the pipeline below is still scanned.
+        "runs:\n"
+        "  steps:\n"
+        "    - shell: bash\n"
+        "      run: |\n"
+        "        description: |\n"
+        "          node -e 'core.exportVariable(\"ACTIONS_RUNTIME_TOKEN\", t)'\n",
+        # Same carrier under an inert standalone sequence scalar.
+        "notes:\n"
+        "  - |\n"
+        "    description: |\n"
+        "      core.exportVariable('ACTIONS_RUNTIME_TOKEN', t)\n",
+        # An action input `description` is `core.getInput('description')` to any
+        # JavaScript step in the same job, not rendered prose.
+        "inputs:\n"
+        "  version:\n"
+        "    description: rejected because it would exportVariable the token\n",
+        # Step-level compact-sequence `description` is an ordinary step key.
+        "      - name: documented step\n"
+        "        description: core[\"exportVariable\"] is never reached\n"
+        "        run: echo ok\n",
+        # A root-column sequence item is a sequence entry, not the root mapping.
+        "- description: core.exportVariable('ACTIONS_RUNTIME_TOKEN', t)\n",
+        # Arbitrary nested mapping: nothing marks this as rendered metadata.
+        "metadata:\n"
+        "  annotations:\n"
+        "    description: core.exportVariable('ACTIONS_RUNTIME_TOKEN', t)\n",
+        # Carrier construction through `env:`: the `run:` body never spells the
+        # property contiguously, it reads it out of the environment value. If
+        # `env.description` were blanked the whole leak would be invisible.
+        "runs:\n"
+        "  using: composite\n"
+        "  steps:\n"
+        "    - shell: bash\n"
+        "      env:\n"
+        "        description: exportVariable\n"
+        "      run: node -e "
+        "'core[process.env.description](\"ACTIONS_RUNTIME_TOKEN\", t)'\n",
+        # Same construction through a nested action's `with:` input.
+        "runs:\n"
+        "  using: composite\n"
+        "  steps:\n"
+        "    - uses: actions/github-script@v7\n"
+        "      with:\n"
+        "        description: exportVariable\n"
+        "        script: core[core.getInput('description')]('X', t)\n",
+        # An anchored root description is reachable by alias from an executable
+        # slot, so the node property disqualifies the carve-out.
+        "description: &leak exportVariable\n"
+        "runs:\n"
+        "  using: composite\n",
+        # Same for a tagged root description.
+        "description: !!str exportVariable\n"
+        "runs:\n"
+        "  using: composite\n",
+        # One root mapping means one root `description:`. A second is a
+        # duplicate key, not more rendered metadata, so it stays scanned.
+        "description: rendered metadata\n"
+        "description: exportVariable\n"
+        "runs:\n"
+        "  using: composite\n",
+        # A flow sequence is not rendered scalar prose.
+        "description: [exportVariable]\n"
+        "runs:\n"
+        "  using: composite\n",
+        # A flow mapping is not rendered scalar prose.
+        "description: {carrier: exportVariable}\n"
+        "runs:\n"
+        "  using: composite\n",
+        # Nested anchor inside a flow mapping, revived via alias. If the
+        # flow value were blanked, `*leak` would be the only remaining
+        # spelling and would not contain the contiguous token.
+        "description: {carrier: &leak exportVariable}\n"
+        "runs:\n"
+        "  using: composite\n"
+        "  steps:\n"
+        "    - env: {description: *leak}\n"
+        "      run: echo ok\n",
+        # Multiline flow: token on the opening line. The prose walker does
+        # not collect continuation lines, so blanking this line would hide
+        # the only occurrence.
+        "description: {carrier: exportVariable\n"
+        "}\n"
+        "runs:\n"
+        "  using: composite\n",
+        "description: [exportVariable\n"
+        "]\n"
+        "runs:\n"
+        "  using: composite\n",
+        # Continuation-line token: the walker must not start skipping flow
+        # bodies the way it skips block-scalar bodies.
+        "description: {\n"
+        "  carrier: exportVariable\n"
+        "}\n"
+        "runs:\n"
+        "  using: composite\n",
+        "description: [\n"
+        "  exportVariable]\n"
+        "runs:\n"
+        "  using: composite\n",
+        # Explicit complex value and compact nested sequence are not scalars.
+        "description: ? exportVariable\n"
+        "runs:\n"
+        "  using: composite\n",
+        "description: - exportVariable\n"
+        "runs:\n"
+        "  using: composite\n",
+    )
+    for index, sample in enumerate(description_adjacent_carriers):
+        adjacent_failures: list[str] = []
+        check_no_sccache_credential_exporter(
+            sample,
+            f"self-test-export-variable-adjacent-{index}",
+            adjacent_failures,
+        )
+        require(
+            any(
+                "must not contain exportVariable" in item
+                for item in adjacent_failures
+            ),
+            f"self-test: a carrier outside root description prose must fail: "
+            f"{sample!r}",
+            failures,
+        )
+
+    # A token-free flow value would pass the exporter check whether or not it
+    # was exempted. Assert the transform leaves it in the scanned text.
+    flow_kept = _without_yaml_description_prose(
+        "description: {carrier: harmless}\nruns:\n  using: composite\n"
+    )
+    require(
+        "{carrier: harmless}" in flow_kept,
+        "self-test: a token-free root flow description must stay scanned, "
+        f"not blanked: {flow_kept!r}",
         failures,
     )
 

@@ -429,7 +429,51 @@ rust-cache / the FIPS producer archive. Production-image cache restore and save 
 pinned `actions/cache/*` actions; PR-controlled `run:` steps only measure the
 restored directory and move the BuildKit local export. Workflows stay
 `permissions: contents: read`. Static checks live in
-`.github/scripts/verify_ci_runtime_cache.py`.
+`.github/scripts/verify_ci_runtime_cache.py`. The cache-credential gate is
+structural: `fips-build.yml` may invoke only a closed allowlist of pinned
+actions and the two local shell-only composites (`setup-sccache`,
+`setup-fast-linker`). Extracted `uses` must match that allowlist with exact
+occurrence counts, so inserting a duplicate of an already-admitted
+checkout, rust-cache, artifact, toolchain, or local action fails. Each
+`actions/checkout` step must keep the current-repository / default-ref /
+default-root contract: `persist-credentials: false` and no `repository`,
+`ref`, or `path` redirection (including equivalent quoted, escaped, or
+dynamic spellings). Each checkout has exactly one inspectable `with:` mapping,
+so duplicate-key shadowing cannot hide the effective inputs. Those local actions
+must remain `using: composite`
+with `run:` steps only — no nested `uses:`, so no inline or third-party
+JavaScript carrier can reach the Actions toolkit credential environment.
+Alternate YAML spellings of `uses` (flow mappings, unbraced flow pairs,
+quoted/escaped/multiline keys, explicit keys, anchors, aliases, tags,
+merge keys, block scalars, templates, compact-sequence siblings after a
+block scalar, and non-comment `#` data in plain flow scalars) are
+rejected fail-closed rather than treated as an absence of invocations.
+The contiguous
+`exportVariable` token deny remains defense in depth; it does not catch
+computed property forms such as `core["export" + "Variable"]` on its own.
+It is scanned over every slot except the **document-root** `description:`
+metadata **scalar**, which GitHub renders and never evaluates:
+`setup-sccache/action.yml` is whole-file digest-frozen by the Cross build
+policy, so the installer that enforces the credential boundary has to stay free
+to document the toolkit call it refuses. The carve-out is that one key at
+column zero — its plain or quoted scalar plus its correctly delimited block
+body — and nothing else. A root `description:` whose value is a flow mapping,
+flow sequence, explicit complex value, or any other non-scalar shape stays
+scanned: it is not rendered string prose, and a nested `&anchor` inside a flow
+collection is not a leading node property, so blanking it would hide the token
+while an alias could still feed it into executable data. Nested `description:`
+keys are **not** exempt: an action or
+`workflow_dispatch` input description is `core.getInput('description')`, an
+`env:`/`with:` entry is `process.env.description`, and any other nested mapping
+is data some `run:` body can read, so a carrier parked there could rebuild the
+forbidden property (`core[process.env.description]`) with no contiguous token
+left on the line. A root `description:` carrying a leading `&anchor`, `*alias`,
+or `!tag` is scanned too, because an anchored scalar is reachable by alias from
+an executable slot, and only the first root `description:` is exempted because a
+second one is a duplicate key rather than more rendered metadata. A
+`description:`-shaped line inside a `run:` body is stepped
+over as shell, a `- description:` item is a sequence entry rather than the root
+mapping, and quoted or suffixed key spellings keep the full scan.
 
 `node-waypoint-ebpf-live.yml` path-filtered `pull_request.paths` must be a
 **trigger superset** of every `production-dockerfile-smoke` sensitive input in
