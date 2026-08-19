@@ -1917,6 +1917,36 @@ jobs:
     needs: fips-compile
     runs-on: ubuntu-latest
     timeout-minutes: 90
+    # Issue #4018: `Precompile FIPS test binaries for consumers` is killed with
+    # `exit code 143` and "The runner has received a shutdown signal" on a large
+    # minority of runs. The log always ends the same way: the dependency graph
+    # finishes, the run goes silent for several minutes while Cargo builds the
+    # two large test binaries (`unit_tests` and `integration_tests` — the whole
+    # `ferrum-edge` crate plus every test module), and the runner dies mid-tail.
+    # No diagnostic is ever emitted because the process is killed rather than
+    # failing, which is exactly the signature of the hosted runner's memory
+    # ceiling rather than a compile error.
+    #
+    # `[profile.dev]` sets `debug = true` and the `test` profile inherits from
+    # `dev`, so every concurrent codegen thread in that tail holds a
+    # full-debuginfo LLVM module for a crate of that size. The two settings
+    # below attack the same peak from both directions: fewer concurrent
+    # threads, and a smaller footprint per thread. `CARGO_BUILD_JOBS` bounds the
+    # jobserver that rustc's own codegen threads draw from, so it caps
+    # parallelism WITHIN those two crates — which is where the tail is — and not
+    # merely the number of crates built side by side.
+    #
+    # `line-tables-only` keeps file and line in backtraces and drops only
+    # variable-level debuginfo. These binaries exist to be executed under exact
+    # test filters by the downstream FIPS consumers; nothing symbolicates locals
+    # from them.
+    env:
+      CARGO_BUILD_JOBS: "3"
+      # Set on BOTH profiles rather than relying on `test` inheriting from
+      # `dev`, so the override cannot silently miss the profile that actually
+      # builds these binaries.
+      CARGO_PROFILE_DEV_DEBUG: line-tables-only
+      CARGO_PROFILE_TEST_DEBUG: line-tables-only
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
         with:
@@ -2415,6 +2445,35 @@ jobs:
       # work overlaps claimed-profile and clippy jobs, then publish only
       # digest-bound copies through an immutable same-run artifact. Downstream
       # tests never ask Cargo to reconsider fresh-checkout mtimes.
+      # Headroom for whatever peak the two job-level `env` settings above do
+      # not remove (issue #4018). The hosted image ships a 4 GiB
+      # `/mnt/swapfile` on a partition with tens of GiB free.
+      #
+      # Deliberately best-effort rather than fail-closed. This step is
+      # insurance, not a correctness gate, and this workflow's text is frozen
+      # by `verify_cross_build_policy.py` under a single admitted generation
+      # digest — so a runner-image change that broke `swapoff` here would cost
+      # a second protected-path push to repair. It still cannot pass silently:
+      # any failure raises a warning annotation, and the resulting `SwapTotal`
+      # is always printed, so "the swap was never enlarged" is readable from
+      # the log rather than inferred.
+      - name: Enlarge runner swap for the test-binary codegen tail
+        run: |
+          set -uo pipefail
+          if sudo swapoff -a \
+            && sudo rm -f /mnt/swapfile \
+            && sudo fallocate -l 12G /mnt/swapfile \
+            && sudo chmod 600 /mnt/swapfile \
+            && sudo mkswap /mnt/swapfile \
+            && sudo swapon /mnt/swapfile; then
+            echo "Runner swap enlarged for the FIPS test-binary build."
+          else
+            echo "::warning::could not enlarge runner swap; continuing on whatever the image provides" >&2
+            sudo swapon -a || true
+          fi
+          awk '/^SwapTotal:/ {print "SwapTotal: " $2 " kB"}' /proc/meminfo
+          free -h
+
       - name: Precompile FIPS test binaries for consumers
         run: |
           python3 .github/scripts/ci_runtime_telemetry.py start --phase fips-test-build
