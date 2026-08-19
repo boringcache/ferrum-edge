@@ -38,6 +38,7 @@ FROZEN_FILTER_MODULES = {
     ADMIN_API_SHARD: {
         "integration::admin_api_specs_handler_tests",
         "integration::admin_db_api_specs_tests",
+        "integration::admin_db_live_apply_tests",
         "integration::admin_audit_rbac_tests",
         "integration::admin_backend_capabilities_tests",
         "integration::admin_runtime_metrics_tests",

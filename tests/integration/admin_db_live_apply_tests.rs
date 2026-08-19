@@ -81,8 +81,10 @@ fn proxy_payload(listen_path: &str) -> Value {
 fn proxy_state() -> ProxyState {
     let mut config = GatewayConfig::default();
     config.normalize_fields();
-    let mut env_config = ferrum_edge::config::EnvConfig::default();
-    env_config.mode = OperatingMode::Database;
+    let env_config = ferrum_edge::config::EnvConfig {
+        mode: OperatingMode::Database,
+        ..Default::default()
+    };
     let (state, _handles) = ProxyState::new(
         config,
         DnsCache::new(DnsConfig::default()),
@@ -184,6 +186,10 @@ async fn admin_json(
     (status, body)
 }
 
+// Mirrors the database-mode poll loop's own parameter set: store, namespace,
+// runtime state, apply coordinator, shutdown, and the three per-test knobs.
+// A params struct here would only rename the same eight values.
+#[allow(clippy::too_many_arguments)]
 fn spawn_authoritative_poller(
     store: Arc<DatabaseStore>,
     namespace: String,
@@ -220,20 +226,19 @@ fn spawn_authoritative_poller(
                         apply.nudge_if_waiters_pending();
                         continue;
                     }
-                    match store.load_incremental_config(&namespace, last_sequence).await {
-                        Ok(result) => {
-                            let next = result.sequence_cursor;
-                            match proxy_state.apply_incremental(result).await {
-                                ConfigApplyOutcome::Applied | ConfigApplyOutcome::Unchanged => {
-                                    last_sequence = next;
-                                    apply.record_accepted(next);
-                                }
-                                ConfigApplyOutcome::Rejected { .. } => {
-                                    apply.record_rejected(next);
-                                }
+                    if let Ok(result) =
+                        store.load_incremental_config(&namespace, last_sequence).await
+                    {
+                        let next = result.sequence_cursor;
+                        match proxy_state.apply_incremental(result).await {
+                            ConfigApplyOutcome::Applied | ConfigApplyOutcome::Unchanged => {
+                                last_sequence = next;
+                                apply.record_accepted(next);
+                            }
+                            ConfigApplyOutcome::Rejected { .. } => {
+                                apply.record_rejected(next);
                             }
                         }
-                        Err(_) => {}
                     }
                     polls_completed.fetch_add(1, Ordering::Relaxed);
                     apply.nudge_if_waiters_pending();
