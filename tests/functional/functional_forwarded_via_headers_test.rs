@@ -199,13 +199,7 @@ async fn functional_forwarded_via_default_adds_x_forwarded_and_via() {
 #[ignore]
 #[tokio::test]
 async fn functional_forwarded_via_trusted_peer_appends_inbound_xff() {
-    let harness = HeaderHarness::spawn(
-        true,
-        "ferrum-edge",
-        false,
-        Some("127.0.0.1"),
-    )
-    .await;
+    let harness = HeaderHarness::spawn(true, "ferrum-edge", false, Some("127.0.0.1")).await;
     let client = http1_client();
 
     let response = client

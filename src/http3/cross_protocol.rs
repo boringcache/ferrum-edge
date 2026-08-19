@@ -134,10 +134,9 @@ use crate::proxy::grpc_proxy::{
 use crate::proxy::headers::{
     ClientResponseFraming, GatewayOwnedResponseHeaders, PrePolicyResponseHeaders,
     RejectBodyDisposition, ResponseTrailerGovernance, TrailerSectionKind, apply_response_headers,
-    is_backend_response_strip_header, is_untrusted_real_ip_header,
-    parse_connection_listed_headers, reconcile_streaming_backend_trailers,
-    sanitize_backend_request_trailers, sanitize_client_response_headers_for_wire,
-    strip_response_hop_by_hop_trailers,
+    is_backend_response_strip_header, is_untrusted_real_ip_header, parse_connection_listed_headers,
+    reconcile_streaming_backend_trailers, sanitize_backend_request_trailers,
+    sanitize_client_response_headers_for_wire, strip_response_hop_by_hop_trailers,
 };
 use crate::request_epoch::RequestEpoch;
 use crate::retry::ErrorClass;
@@ -1019,10 +1018,8 @@ fn build_plain_request_builder(
 
     let original_host_header = proxy_headers.get("host").map(|s| s.as_str());
     let original_xff = proxy_headers.get("x-forwarded-for").map(|s| s.as_str());
-    let peer_trusted = crate::proxy::forwarding_peer_is_trusted(
-        xff_append_ip,
-        &state.trusted_proxies,
-    );
+    let peer_trusted =
+        crate::proxy::forwarding_peer_is_trusted(xff_append_ip, &state.trusted_proxies);
     for (k, v) in proxy_headers {
         match k.as_str() {
             "host" => {
@@ -4811,10 +4808,8 @@ fn build_h3_grpc_backend_headers(
 ) -> HeaderMap {
     let original_host_header = proxy_headers.get("host").map(|s| s.as_str());
     let original_xff = proxy_headers.get("x-forwarded-for").map(|s| s.as_str());
-    let peer_trusted = crate::proxy::forwarding_peer_is_trusted(
-        xff_append_ip,
-        &state.trusted_proxies,
-    );
+    let peer_trusted =
+        crate::proxy::forwarding_peer_is_trusted(xff_append_ip, &state.trusted_proxies);
     // Pre-size the HeaderMap — each source entry produces at most one output
     // and we add up to 5 forwarding headers; `HeaderMap::with_capacity`
     // clamps to the power-of-two bucket count so extra slack is cheap.
@@ -11689,11 +11684,8 @@ mod tests {
         let untrusted_state = minimal_proxy_state();
         let mut trusted_state = minimal_proxy_state();
         trusted_state.trusted_proxies = Arc::new(
-            crate::proxy::client_ip::TrustedProxies::parse_strict(
-                "10.0.0.7",
-                "test",
-            )
-            .expect("valid trusted proxy list"),
+            crate::proxy::client_ip::TrustedProxies::parse_strict("10.0.0.7", "test")
+                .expect("valid trusted proxy list"),
         );
         let proxy = minimal_proxy();
         let client = reqwest::Client::new();

@@ -47,12 +47,7 @@ fn empty_trust_list_drops_spoofed_inbound_xff() {
     // Default FERRUM_TRUSTED_PROXIES is empty: every peer is untrusted, so a
     // client-supplied chain must not appear in outbound XFF.
     assert_eq!(
-        build_xff_value_for_test(
-            Some("198.51.100.7"),
-            "192.0.2.6",
-            "192.0.2.6",
-            &none(),
-        ),
+        build_xff_value_for_test(Some("198.51.100.7"), "192.0.2.6", "192.0.2.6", &none(),),
         "192.0.2.6"
     );
     assert_eq!(
@@ -84,12 +79,7 @@ fn trusted_peer_appends_inbound_chain_including_multi_hop() {
 #[test]
 fn untrusted_peer_with_a_configured_trust_list_still_drops_spoofed_xff() {
     assert_eq!(
-        build_xff_value_for_test(
-            Some("6.6.6.6"),
-            "192.0.2.6",
-            "192.0.2.6",
-            &lb_trusted(),
-        ),
+        build_xff_value_for_test(Some("6.6.6.6"), "192.0.2.6", "192.0.2.6", &lb_trusted(),),
         "192.0.2.6"
     );
 }
@@ -128,10 +118,8 @@ fn websocket_and_grpc_drop_untrusted_xff_and_x_real_ip() {
     );
     raw_headers.insert("x-real-ip", http::HeaderValue::from_static("8.8.8.8"));
 
-    let websocket_headers = collect_forwardable_websocket_headers_for_test(
-        &raw_headers,
-        &proxy_headers,
-    );
+    let websocket_headers =
+        collect_forwardable_websocket_headers_for_test(&raw_headers, &proxy_headers);
     assert_eq!(
         header_values(&websocket_headers, "x-forwarded-for"),
         vec!["203.0.113.8"]
@@ -192,10 +180,8 @@ fn websocket_and_grpc_honor_trusted_peer_xff_chain() {
     );
     raw_headers.insert("x-real-ip", http::HeaderValue::from_static("1.1.1.1"));
 
-    let websocket_headers = collect_forwardable_websocket_headers_for_test(
-        &raw_headers,
-        &proxy_headers,
-    );
+    let websocket_headers =
+        collect_forwardable_websocket_headers_for_test(&raw_headers, &proxy_headers);
     assert_eq!(
         header_values(&websocket_headers, "x-forwarded-for"),
         vec!["1.1.1.1, 198.51.100.7, 10.0.0.7"]

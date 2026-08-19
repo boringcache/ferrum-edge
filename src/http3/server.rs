@@ -54,10 +54,10 @@ use crate::proxy::headers::{
     TrailerSectionKind, apply_response_headers, is_backend_request_strip_header,
     is_proxy_owned_forwarding_header, is_untrusted_real_ip_header,
     parse_connection_listed_from_str_map, preserved_response_content_length,
-    reconcile_backend_trailers_with_response_policy,
-    reconcile_streaming_backend_trailers, remove_content_length_header,
-    sanitize_backend_request_trailers, sanitize_client_response_headers_for_wire,
-    strip_client_response_hop_by_hop_headers, strip_response_hop_by_hop_trailers,
+    reconcile_backend_trailers_with_response_policy, reconcile_streaming_backend_trailers,
+    remove_content_length_header, sanitize_backend_request_trailers,
+    sanitize_client_response_headers_for_wire, strip_client_response_hop_by_hop_headers,
+    strip_response_hop_by_hop_trailers,
 };
 use crate::proxy::{
     ProxyState, apply_plugin_rejection_response, apply_reject_after_proxy_and_synthetic_body_hooks,
@@ -9559,10 +9559,8 @@ fn build_h3_backend_headers(
         .unwrap_or(proxy.backend_host.as_str());
 
     let connection_listed_strip = parse_connection_listed_from_str_map(headers);
-    let peer_trusted = crate::proxy::forwarding_peer_is_trusted(
-        xff_append_ip,
-        &state.trusted_proxies,
-    );
+    let peer_trusted =
+        crate::proxy::forwarding_peer_is_trusted(xff_append_ip, &state.trusted_proxies);
     for (k, v) in headers {
         match k.as_str() {
             "host" | ":authority" => {
@@ -18601,11 +18599,8 @@ mod build_h3_backend_headers_tests {
         let untrusted_state = minimal_proxy_state();
         let mut trusted_state = minimal_proxy_state();
         trusted_state.trusted_proxies = Arc::new(
-            crate::proxy::client_ip::TrustedProxies::parse_strict(
-                "10.0.0.7",
-                "test",
-            )
-            .expect("valid trusted proxy list"),
+            crate::proxy::client_ip::TrustedProxies::parse_strict("10.0.0.7", "test")
+                .expect("valid trusted proxy list"),
         );
         let proxy = minimal_proxy();
 

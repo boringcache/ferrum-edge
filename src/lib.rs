@@ -5762,12 +5762,7 @@ pub mod _test_support {
         peer_ip: &str,
         trusted_proxies: &crate::proxy::client_ip::TrustedProxies,
     ) -> String {
-        crate::proxy::build_xff_value(
-            existing_xff,
-            client_ip,
-            peer_ip,
-            trusted_proxies,
-        )
+        crate::proxy::build_xff_value(existing_xff, client_ip, peer_ip, trusted_proxies)
     }
 
     /// Canonical backend-visible query (transformer outbound + auth strips).

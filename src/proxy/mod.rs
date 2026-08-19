@@ -4529,13 +4529,8 @@ fn strip_proxy_owned_forwarding_headers(
     let to_remove: Vec<hyper::header::HeaderName> = headers
         .keys()
         .filter(|name| {
-            headers_mod::is_proxy_owned_forwarding_header(
-                name.as_str(),
-                add_forwarded_header,
-            ) || headers_mod::is_untrusted_real_ip_header(
-                name.as_str(),
-                peer_trusted,
-            )
+            headers_mod::is_proxy_owned_forwarding_header(name.as_str(), add_forwarded_header)
+                || headers_mod::is_untrusted_real_ip_header(name.as_str(), peer_trusted)
         })
         .cloned()
         .collect();
@@ -4600,7 +4595,8 @@ pub(crate) fn build_xff_value(
     // the configured trust set. An empty `FERRUM_TRUSTED_PROXIES` matches
     // no address, so the default edge deployment never forwards a
     // client-supplied chain.
-    let existing_xff = existing_xff.filter(|_| forwarding_peer_is_trusted(peer_ip, trusted_proxies));
+    let existing_xff =
+        existing_xff.filter(|_| forwarding_peer_is_trusted(peer_ip, trusted_proxies));
     match existing_xff {
         Some(xff) => {
             // Real-IP-header deployments: a trusted proxy can resolve the
@@ -5272,19 +5268,9 @@ pub(crate) fn apply_effective_backend_scheme_headers(
         name.eq_ignore_ascii_case("x-forwarded-for")
             .then_some(value.as_str())
     });
-    let xff_val = build_xff_value(
-        existing_xff,
-        client_ip,
-        peer_ip,
-        trusted_proxies,
-    );
-    let forwarded = add_forwarded_header.then(|| {
-        build_forwarded_value(
-            client_ip,
-            scheme,
-            headers.get("host").map(String::as_str),
-        )
-    });
+    let xff_val = build_xff_value(existing_xff, client_ip, peer_ip, trusted_proxies);
+    let forwarded = add_forwarded_header
+        .then(|| build_forwarded_value(client_ip, scheme, headers.get("host").map(String::as_str)));
     let peer_trusted = forwarding_peer_is_trusted(peer_ip, trusted_proxies);
     headers.retain(|name, _| {
         !name.eq_ignore_ascii_case("x-forwarded-for")
@@ -39162,10 +39148,7 @@ pub(crate) async fn proxy_to_backend_retry(
     // `parse_connection_listed_from_str_map` for the spec rationale and
     // smuggling defence.
     let connection_listed_strip = headers_mod::parse_connection_listed_from_str_map(headers);
-    let peer_trusted = forwarding_peer_is_trusted(
-        xff_append_ip,
-        &state.trusted_proxies,
-    );
+    let peer_trusted = forwarding_peer_is_trusted(xff_append_ip, &state.trusted_proxies);
     let remaining_grpc_timeout_header = request_ctx
         .grpc_deadline_at()
         .filter(|_| {
@@ -42353,10 +42336,7 @@ async fn proxy_to_backend(
     // (canonical predicate in `proxy::headers`). Also strip every header
     // NAMED in the request's `Connection` field.
     let connection_listed_strip = headers_mod::parse_connection_listed_from_str_map(headers);
-    let peer_trusted = forwarding_peer_is_trusted(
-        xff_append_ip,
-        &state.trusted_proxies,
-    );
+    let peer_trusted = forwarding_peer_is_trusted(xff_append_ip, &state.trusted_proxies);
     let remaining_grpc_timeout_header = request_ctx
         .grpc_deadline_at()
         .filter(|_| {
@@ -46531,10 +46511,7 @@ async fn proxy_to_backend_hbone_after_ready(
     strip_proxy_owned_forwarding_headers(
         &mut parts.headers,
         state.add_forwarded_header,
-        forwarding_peer_is_trusted(
-            xff_append_ip,
-            &state.trusted_proxies,
-        ),
+        forwarding_peer_is_trusted(xff_append_ip, &state.trusted_proxies),
     );
     if !proxy.preserve_host_header {
         parts.headers.remove(hyper::header::HOST);
@@ -47236,10 +47213,7 @@ async fn proxy_to_backend_unix(
     strip_proxy_owned_forwarding_headers(
         &mut parts.headers,
         state.add_forwarded_header,
-        forwarding_peer_is_trusted(
-            xff_append_ip,
-            &state.trusted_proxies,
-        ),
+        forwarding_peer_is_trusted(xff_append_ip, &state.trusted_proxies),
     );
     if !proxy.preserve_host_header {
         parts.headers.remove(hyper::header::HOST);
@@ -48732,10 +48706,7 @@ async fn proxy_to_backend_mesh_mtls_after_ready(
     strip_proxy_owned_forwarding_headers(
         &mut parts.headers,
         state.add_forwarded_header,
-        forwarding_peer_is_trusted(
-            xff_append_ip,
-            &state.trusted_proxies,
-        ),
+        forwarding_peer_is_trusted(xff_append_ip, &state.trusted_proxies),
     );
     // H2 carries the routing authority in the URI set above. A materialized
     // Host header would duplicate it and can trigger the peer's consistency
@@ -49539,10 +49510,7 @@ async fn proxy_to_backend_http2(
     parts.headers.clear();
     let effective_host = &proxy.backend_host;
     let connection_listed_strip = headers_mod::parse_connection_listed_from_str_map(headers);
-    let peer_trusted = forwarding_peer_is_trusted(
-        xff_append_ip,
-        &state.trusted_proxies,
-    );
+    let peer_trusted = forwarding_peer_is_trusted(xff_append_ip, &state.trusted_proxies);
     for (k, v) in headers {
         match k.as_str() {
             "host" => {
@@ -50173,10 +50141,7 @@ fn build_http3_backend_headers(
 ) -> Vec<(hyper::header::HeaderName, hyper::header::HeaderValue)> {
     let mut http3_headers = Vec::with_capacity(headers.len() + 5);
     let connection_listed_strip = headers_mod::parse_connection_listed_from_str_map(headers);
-    let peer_trusted = forwarding_peer_is_trusted(
-        ctx.xff_append_ip,
-        &state.trusted_proxies,
-    );
+    let peer_trusted = forwarding_peer_is_trusted(ctx.xff_append_ip, &state.trusted_proxies);
     for (name, value) in headers {
         match name.as_str() {
             n if headers_mod::is_backend_request_strip_header(n) => continue,
