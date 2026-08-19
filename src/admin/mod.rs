@@ -3280,8 +3280,7 @@ async fn handle_admin_request_inner(
             if let Some(resp) = require_admin_role(&auth, AdminRole::Operator) {
                 return Ok(resp);
             }
-            crud::handle_delete::<PluginConfig>(&state, &auth, id, &namespace, uri.query())
-                .await
+            crud::handle_delete::<PluginConfig>(&state, &auth, id, &namespace, uri.query()).await
         }
 
         // Upstreams CRUD

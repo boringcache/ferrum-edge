@@ -8164,9 +8164,8 @@ fn delete_proxy_cleanup_orphaned_upstream_query_has_openapi_parity() {
         .as_str()
         .expect("DELETE /upstreams/{id} description");
     assert!(
-        upstream_desc.contains(
-            "Upstream is referenced by one or more proxies and cannot be deleted"
-        ),
+        upstream_desc
+            .contains("Upstream is referenced by one or more proxies and cannot be deleted"),
         "DELETE /upstreams/{id} must name the proxy-reference 409: {upstream_desc}"
     );
     assert!(

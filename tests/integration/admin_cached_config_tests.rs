@@ -6762,19 +6762,11 @@ async fn test_delete_proxy_still_referenced_upstream_survives_with_or_without_fl
         let (status, body) = admin_post(&base_url, "/proxies", &token, &proxy_b).await;
         assert_eq!(status, 201, "Create proxy B failed: {:?}", body);
 
-        let (status, body) = admin_delete(
-            &base_url,
-            &format!("/proxies/{p1}{query}"),
-            &token,
-        )
-        .await;
+        let (status, body) =
+            admin_delete(&base_url, &format!("/proxies/{p1}{query}"), &token).await;
         assert_eq!(status, 204, "delete proxy A must succeed: {:?}", body);
-        let (status, _, _) = admin_get(
-            &base_url,
-            &format!("/upstreams/{upstream_id}"),
-            &token,
-        )
-        .await;
+        let (status, _, _) =
+            admin_get(&base_url, &format!("/upstreams/{upstream_id}"), &token).await;
         assert_eq!(
             status, 200,
             "shared upstream must survive deleting one referencer (query={query:?})"

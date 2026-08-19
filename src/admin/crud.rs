@@ -2279,9 +2279,7 @@ pub(crate) async fn handle_update<R: AdminResource>(
 /// orphan cleanup). Only the exact strings `true` and `false` are accepted;
 /// any other value is an error because this flag decides whether operator
 /// data is deleted.
-pub(crate) fn parse_cleanup_orphaned_upstream_query(
-    query: Option<&str>,
-) -> Result<bool, String> {
+pub(crate) fn parse_cleanup_orphaned_upstream_query(query: Option<&str>) -> Result<bool, String> {
     let Some(query) = query else {
         return Ok(true);
     };
