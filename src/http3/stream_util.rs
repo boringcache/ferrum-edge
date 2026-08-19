@@ -399,9 +399,32 @@ where
     stream.stop_stream(Code::H3_INTERNAL_ERROR);
 }
 
+/// Whether a COMMITTED H3 streaming response must leave its send half RESET.
+///
+/// Quinn implicitly `finish()`es a send stream that was neither finished nor
+/// reset when the stream is dropped (`quinn::SendStream::drop`). A relay that
+/// merely stops writing — because the credential's authorization lifetime
+/// elapsed, because the backend body failed, or because a downstream write
+/// never landed its FIN — therefore hands the client a clean end of body on the
+/// way out, which is indistinguishable from a complete response. RFC 9114 has
+/// no in-band way to retract a response whose HEADERS already committed, so the
+/// only honest terminal for those exits is `RESET_STREAM`.
+///
+/// Returns `false` only when the relay completed the body cleanly, so this can
+/// never clobber a successful `finish()` with a reset.
+#[inline]
+#[must_use]
+pub(crate) fn committed_response_requires_reset(
+    authorization_terminated: bool,
+    body_failed: bool,
+    client_disconnected: bool,
+) -> bool {
+    authorization_terminated || body_failed || client_disconnected
+}
+
 #[cfg(test)]
 mod tests {
-    use super::Code;
+    use super::{Code, committed_response_requires_reset};
 
     /// RFC 9114 §8.1 defines H3_NO_ERROR == 0x100. The halt helper
     /// must use exactly this code so peers treat the recv-half close
@@ -415,5 +438,33 @@ mod tests {
     #[test]
     fn response_abort_code_matches_rfc9114_h3_internal_error() {
         assert_eq!(Code::H3_INTERNAL_ERROR.value(), 0x102);
+    }
+
+    /// A credential-expiry termination on a committed response is a RESET,
+    /// unconditionally — whichever relay branch observed the expiry, and
+    /// whether or not the downstream write also failed. Quinn would otherwise
+    /// FIN the stream on drop and let a stalled client read a normal end of
+    /// response instead of an authorization failure (issue #3995).
+    #[test]
+    fn authorization_expiry_always_requires_a_reset() {
+        assert!(committed_response_requires_reset(true, false, false));
+        assert!(committed_response_requires_reset(true, true, false));
+        assert!(committed_response_requires_reset(true, false, true));
+        assert!(committed_response_requires_reset(true, true, true));
+    }
+
+    /// Truncation for any other reason is a reset too: a backend body error, a
+    /// response-size overflow, or a FIN that never reached the client must not
+    /// present as a complete body.
+    #[test]
+    fn truncated_committed_responses_require_a_reset() {
+        assert!(committed_response_requires_reset(false, true, false));
+        assert!(committed_response_requires_reset(false, false, true));
+    }
+
+    /// The one case that must NOT reset: the relay finished the body cleanly.
+    #[test]
+    fn a_cleanly_finished_response_is_never_reset() {
+        assert!(!committed_response_requires_reset(false, false, false));
     }
 }

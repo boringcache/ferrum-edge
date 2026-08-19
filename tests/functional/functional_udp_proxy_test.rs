@@ -1364,6 +1364,7 @@ async fn start_dtls_echo_server(port: u16) -> tokio::task::JoinHandle<()> {
             dimpl_config: std::sync::Arc::new(dimpl::Config::default()),
             certificate: cert.into(),
             client_cert_verifier: None,
+            client_trust: None,
         };
 
         let server = ferrum_edge::dtls::DtlsServer::bind(addr, frontend_config)

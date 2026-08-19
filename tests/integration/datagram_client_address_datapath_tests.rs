@@ -330,6 +330,7 @@ async fn try_spawn_gateway(
         udp_pktinfo_enabled: false,
         mesh_outbound_enforcement: empty_slot(),
         node_waypoint_udp_source_scoping: None,
+        node_waypoint_udp_owner: false,
         node_waypoint_udp_destinations: None,
         datagram_client_address: Some(gate),
     };
@@ -579,6 +580,7 @@ async fn authenticated_envelope_drives_the_live_dtls_demux_and_binds_identity() 
                 .expect("DTLS server certificate")
                 .into(),
             client_cert_verifier: None,
+            client_trust: None,
         };
         let attempt_drops = Arc::new(AtomicU64::new(0));
         // The DTLS receive boundary is its own protocol domain, so a valid

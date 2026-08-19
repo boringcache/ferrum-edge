@@ -3015,6 +3015,7 @@ pub struct GatewayConfig {
     /// Configuration schema version.
     pub version: String,
     pub proxies: Vec<Proxy>,
+    #[serde(default)]
     pub consumers: Vec<Consumer>,
     pub plugin_configs: Vec<PluginConfig>,
     #[serde(default)]

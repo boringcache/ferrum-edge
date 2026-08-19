@@ -84,7 +84,16 @@ pub(crate) const RETRY_ATTEMPTS: u32 = 3;
 // route-not-converged outcomes, bounded by this deadline.
 const CROSS_CLUSTER_CONVERGENCE_TIMEOUT: Duration = Duration::from_secs(15);
 const CROSS_CLUSTER_CONVERGENCE_POLL_INTERVAL: Duration = Duration::from_millis(500);
-const CROSS_CLUSTER_TLS_REJECTION_BODY: &str = "HBONE backend unavailable: TLS handshake failed";
+// Authoritative mesh-transport rejection markers on the cross-cluster egress
+// route. Sidecar (`:15006` SVID-mTLS) and Ambient (`:15008` HBONE) label their
+// dispatch failures with DIFFERENT fixed nouns on purpose (issue #3927): a
+// sidecar dial opens no CONNECT tunnel, so it must never claim HBONE. The
+// shared classifier accepts either topology's exact wording and nothing else,
+// so a bare setup `502` still reads as transient.
+const CROSS_CLUSTER_SIDECAR_TLS_REJECTION_BODY: &str =
+    "Sidecar mTLS backend unavailable: TLS handshake failed";
+const CROSS_CLUSTER_AMBIENT_TLS_REJECTION_BODY: &str =
+    "HBONE backend unavailable: TLS handshake failed";
 const CROSS_CLUSTER_WS_REJECTION_MARKER: &str =
     "authoritative cross-cluster WebSocket mTLS rejection";
 
@@ -421,6 +430,7 @@ fn mesh_port_is_reserved(port: u16) -> bool {
         .contains(&port)
 }
 
+#[cfg(not(target_os = "linux"))]
 async fn reserve_unique_mesh_port() -> u16 {
     loop {
         let reservation = reserve_port().await.expect("reserve unique mesh port");
@@ -433,6 +443,40 @@ async fn reserve_unique_mesh_port() -> u16 {
             return reservation.drop_and_take_port();
         }
     }
+}
+
+#[cfg(target_os = "linux")]
+/// Select a host-network listener port outside Linux's ephemeral source range.
+///
+/// Mesh startup opens its control-plane connection before every proxy listener
+/// has bound. Releasing an ordinary `127.0.0.1:0` reservation can therefore let
+/// that connection claim its own promised listener port and fail startup with
+/// `EADDRINUSE`. The netns allocator below already enforces this invariant.
+async fn reserve_unique_mesh_port() -> u16 {
+    let (ephemeral_first, ephemeral_last) =
+        ephemeral_port_range().expect("read host ephemeral port range");
+    for port in 10_240..=u16::MAX {
+        if (ephemeral_first..=ephemeral_last).contains(&port) || mesh_port_is_reserved(port) {
+            continue;
+        }
+        let listener = match std::net::TcpListener::bind(("0.0.0.0", port)) {
+            Ok(listener) => listener,
+            Err(error) if error.kind() == std::io::ErrorKind::AddrInUse => continue,
+            Err(error) => panic!("probe host mesh port {port}: {error}"),
+        };
+        let inserted = used_mesh_ports()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(port);
+        if inserted {
+            drop(listener);
+            return port;
+        }
+    }
+    panic!(
+        "no free host mesh port outside ephemeral range \
+         {ephemeral_first}-{ephemeral_last}"
+    );
 }
 
 /// Bind attempts [`bind_fixture_listener_where`] makes before giving up.
@@ -509,25 +553,37 @@ pub(crate) async fn reserve_mesh_ports() -> MeshPorts {
 }
 
 #[cfg(target_os = "linux")]
+fn parse_ephemeral_port_range(raw: &str, scope: &str) -> Result<(u16, u16), String> {
+    let mut fields = raw.split_whitespace();
+    let first = fields
+        .next()
+        .ok_or_else(|| format!("{scope} ephemeral port range is empty"))?
+        .parse::<u16>()
+        .map_err(|error| format!("parse {scope} ephemeral port range start: {error}"))?;
+    let last = fields
+        .next()
+        .ok_or_else(|| format!("{scope} ephemeral port range has no end"))?
+        .parse::<u16>()
+        .map_err(|error| format!("parse {scope} ephemeral port range end: {error}"))?;
+    if fields.next().is_some() || first > last {
+        return Err(format!("invalid {scope} ephemeral port range: {raw:?}"));
+    }
+    Ok((first, last))
+}
+
+#[cfg(target_os = "linux")]
+fn ephemeral_port_range() -> Result<(u16, u16), String> {
+    let raw = std::fs::read_to_string("/proc/sys/net/ipv4/ip_local_port_range")
+        .map_err(|error| format!("read host ephemeral port range: {error}"))?;
+    parse_ephemeral_port_range(&raw, "host")
+}
+
+#[cfg(target_os = "linux")]
 fn ephemeral_port_range_in_netns(pid: u32) -> Result<(u16, u16), String> {
     run_in_live_netns(pid, || {
         let raw = std::fs::read_to_string("/proc/sys/net/ipv4/ip_local_port_range")
             .map_err(|error| format!("read netns ephemeral port range: {error}"))?;
-        let mut fields = raw.split_whitespace();
-        let first = fields
-            .next()
-            .ok_or_else(|| "netns ephemeral port range is empty".to_string())?
-            .parse::<u16>()
-            .map_err(|error| format!("parse netns ephemeral port range start: {error}"))?;
-        let last = fields
-            .next()
-            .ok_or_else(|| "netns ephemeral port range has no end".to_string())?
-            .parse::<u16>()
-            .map_err(|error| format!("parse netns ephemeral port range end: {error}"))?;
-        if fields.next().is_some() || first > last {
-            return Err(format!("invalid netns ephemeral port range: {raw:?}"));
-        }
-        Ok((first, last))
+        parse_ephemeral_port_range(&raw, "netns")
     })
 }
 
@@ -1110,6 +1166,27 @@ async fn fixture_listeners_never_take_a_reserved_mesh_port() {
             "a fixture listener bound port {port}, which is already promised to a mesh gateway \
              subprocess — the gateway would fail startup with EADDRINUSE while a bare port probe \
              kept succeeding (issue #2132)"
+        );
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn host_mesh_ports_stay_outside_the_ephemeral_source_range() {
+    let (ephemeral_first, ephemeral_last) =
+        ephemeral_port_range().expect("read host ephemeral port range");
+    let ports = reserve_mesh_ports().await;
+    for (label, port) in [
+        ("inbound", ports.inbound),
+        ("outbound", ports.outbound),
+        ("hbone", ports.hbone),
+        ("egress", ports.egress),
+        ("east_west", ports.east_west),
+    ] {
+        assert!(
+            !(ephemeral_first..=ephemeral_last).contains(&port),
+            "mesh {label} port {port} must stay outside the host ephemeral source range \
+             {ephemeral_first}-{ephemeral_last}"
         );
     }
 }
@@ -5814,10 +5891,17 @@ async fn wait_for_cross_cluster_destination_ready(
     }
 }
 
+/// Whether a `502` body is one of the two authoritative cross-cluster
+/// mesh-transport TLS rejections (issue #3927 keeps them topology-specific).
+fn is_cross_cluster_tls_rejection(body: &str) -> bool {
+    body.contains(CROSS_CLUSTER_SIDECAR_TLS_REJECTION_BODY)
+        || body.contains(CROSS_CLUSTER_AMBIENT_TLS_REJECTION_BODY)
+}
+
 /// Classify one cross-cluster HTTP attempt into an AUTHORITATIVE routed response
 /// (`Ok`) versus a TRANSIENT setup / route-not-converged outcome (`Err`) to
 /// retry. The two authoritative outcomes are a `200` backend success and the
-/// live route's `502` `HBONE ... TLS handshake failed` mesh-mTLS rejection;
+/// live route's `502` topology-specific mesh-transport TLS rejection;
 /// everything else — a connection/TLS-handshake establishment error or the
 /// source gateway's route-miss / upstream-overflow statuses (404/503/bare 502)
 /// while its outbound slice is still materializing — is transient. The
@@ -5830,7 +5914,7 @@ fn classify_cross_cluster_http(
 ) -> Result<(u16, String), String> {
     match result {
         Ok((200, body)) => Ok((200, body)),
-        Ok((502, body)) if body.contains(CROSS_CLUSTER_TLS_REJECTION_BODY) => Ok((502, body)),
+        Ok((502, body)) if is_cross_cluster_tls_rejection(&body) => Ok((502, body)),
         Ok((status, body)) => Err(format!("route not converged: HTTP {status}: {body:?}")),
         Err(error) => Err(format!("request error: {error}")),
     }
@@ -5945,7 +6029,7 @@ async fn wait_for_authoritative_cross_cluster_grpc(
 /// True when a tungstenite handshake failure rendered by
 /// [`format_ws_handshake_error`] is a `502` upgrade failure — the shape of the
 /// live cross-cluster route's mesh-mTLS rejection. This matches on STATUS only.
-/// The JSON marker body ([`CROSS_CLUSTER_TLS_REJECTION_BODY`]) may be ABSENT
+/// The JSON marker body ([`is_cross_cluster_tls_rejection`]) may be ABSENT
 /// even on a genuine rejection: our patched tungstenite client fills
 /// `Error::Http`'s body from just the bytes already read after the response
 /// headers (`vendor/tungstenite-0.29.0-ferrum-patched/src/handshake/client.rs`),
@@ -5964,7 +6048,7 @@ fn cross_cluster_ws_error_is_502(error: &str) -> bool {
 /// path, the HTTP client drains the full response body, so
 /// [`classify_cross_cluster_http`] deterministically distinguishes the live
 /// route's authoritative `502` HBONE/mTLS handshake-failure rejection (body
-/// carries [`CROSS_CLUSTER_TLS_REJECTION_BODY`]) from transient route-apply
+/// carries [`is_cross_cluster_tls_rejection`]) from transient route-apply
 /// noise. Returns `true` ONLY for that authoritative `502` rejection; a `200`
 /// backend success or any transient route-miss / connection-setup outcome
 /// returns `false`, so the WebSocket `502` stays transient and the caller keeps
@@ -5985,7 +6069,7 @@ async fn cross_cluster_route_http_rejection_confirmed(outbound_port: u16) -> boo
 /// completed upgrade (`Ok`) and the live route's authoritative 502 backend-dial
 /// rejection are both returned immediately (the 502 as an `Err` carrying
 /// [`CROSS_CLUSTER_WS_REJECTION_MARKER`]). A `502` counts as the authoritative
-/// rejection when its body carries [`CROSS_CLUSTER_TLS_REJECTION_BODY`] OR, when
+/// rejection when its body carries [`is_cross_cluster_tls_rejection`] OR, when
 /// tungstenite surfaced the `502` status-only (body split into a later packet),
 /// when [`cross_cluster_route_http_rejection_confirmed`] corroborates it via the
 /// shared HTTP classifier on the same outbound route. Only route-miss / transient
@@ -6031,7 +6115,7 @@ async fn wait_for_authoritative_cross_cluster_ws_path(
                 // corroborates is transient route-apply noise and is retried, so
                 // a genuine rejection is never flaked away as a timeout and a
                 // transient setup `502` never manufactures a vacuous pass.
-                if error.contains(CROSS_CLUSTER_TLS_REJECTION_BODY)
+                if is_cross_cluster_tls_rejection(&error)
                     || cross_cluster_route_http_rejection_confirmed(outbound_port).await
                 {
                     return Err(format!("{CROSS_CLUSTER_WS_REJECTION_MARKER}: {error}"));
@@ -6679,6 +6763,25 @@ async fn functional_mesh_sidecar_cross_cluster_egress_rejects_untrusted_client()
         "no destination backend body may leak through an unverified cross-cluster mTLS \
          session: {body:?}\n{logs}"
     );
+    // Issue #3927: this dial is Sidecar SVID-mTLS to a peer inbound listener.
+    // No HTTP/2 CONNECT tunnel is ever opened on it, so the client-visible
+    // refusal must name the sidecar transport and must never say HBONE.
+    assert!(
+        body.contains(CROSS_CLUSTER_SIDECAR_TLS_REJECTION_BODY),
+        "a Sidecar SVID-mTLS refusal must carry the sidecar transport label: {body:?}\n{logs}"
+    );
+    assert!(
+        !body.contains("HBONE"),
+        "a Sidecar SVID-mTLS refusal must not be labeled HBONE: {body:?}\n{logs}"
+    );
+    // The public body stays generic: no peer address, SPIFFE ID, certificate
+    // subject, trust root, or raw rustls/SPIFFE verifier text.
+    for leaked in ["spiffe://", "BadSignature", "invalid peer certificate"] {
+        assert!(
+            !body.contains(leaked),
+            "mesh-mTLS refusal body leaked '{leaked}': {body:?}\n{logs}"
+        );
+    }
 }
 
 // ── Cross-cluster L7 app protocols (Sidecar mesh-mTLS): gRPC + WebSocket ──────
@@ -7827,6 +7930,19 @@ async fn functional_mesh_ambient_cross_cluster_egress_rejects_untrusted_client()
         "no destination backend body may leak through an unverified cross-cluster HBONE \
          session: {body:?}\n{logs}"
     );
+    // Issue #3927 in the other direction: an Ambient dial really does ride
+    // HTTP/2 CONNECT over the HBONE tunnel, so this path must KEEP the HBONE
+    // wording — the sidecar relabel may not bleed onto it.
+    assert!(
+        body.contains(CROSS_CLUSTER_AMBIENT_TLS_REJECTION_BODY),
+        "an Ambient HBONE refusal must keep the HBONE transport label: {body:?}\n{logs}"
+    );
+    for leaked in ["spiffe://", "BadSignature", "invalid peer certificate"] {
+        assert!(
+            !body.contains(leaked),
+            "HBONE refusal body leaked '{leaked}': {body:?}\n{logs}"
+        );
+    }
 }
 
 // ── Cross-cluster WebSocket (Ambient HBONE) ──────────────────────────────────
@@ -8918,7 +9034,7 @@ async fn mesh_websocket_echo_roundtrip_path(
 /// HTTP error response, INCLUDES the response body. `tokio_tungstenite`'s
 /// `Display` surfaces only the status line, dropping the JSON body that
 /// distinguishes the live route's authoritative mesh-mTLS rejection
-/// ([`CROSS_CLUSTER_TLS_REJECTION_BODY`]) from a bare setup `502`. Preserving the
+/// ([`is_cross_cluster_tls_rejection`]) from a bare setup `502`. Preserving the
 /// body lets the WS classifier stay symmetric with the HTTP one.
 fn format_ws_handshake_error(error: tokio_tungstenite::tungstenite::Error) -> String {
     use tokio_tungstenite::tungstenite::Error;

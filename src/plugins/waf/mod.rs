@@ -7,10 +7,13 @@
 //!
 //! Query scanning uses the raw query string even after the proxy pipeline has
 //! materialized the parsed query map, so duplicate raw pairs remain visible for
-//! HPP checks instead of being collapsed by `HashMap` parsing. Synthetic
-//! contexts without a raw query string fall back to the decoded
-//! `RequestContext::query_params` map for key/value scans and best-effort
-//! full-URL checks.
+//! HPP checks instead of being collapsed by `HashMap` parsing. Each `&`/`=`-
+//! split component is then run through a bounded canonical percent-decode
+//! (including `%2f`) shared by query-value rules and the built-in FullUrl
+//! FE-PATHTRAV/LFI signatures that opt into that mirror at compile time; the
+//! raw query bytes are never rewritten. Synthetic contexts without a raw query
+//! string fall back to the decoded `RequestContext::query_params` map for
+//! key/value scans and best-effort full-URL checks.
 
 mod decode;
 mod defaults;
@@ -32,8 +35,8 @@ use tracing::warn;
 use self::defaults::default_rules;
 use self::exemptions::CompiledExemptions;
 use self::rules::{
-    CompiledRules, RuleAction, RuleHit, Severity, WafRule, compile_rules, parse_custom_rule,
-    parse_rule_action, parse_rule_overrides,
+    CompiledRules, RuleAction, RuleHit, RuleTarget, Severity, WafRule, compile_rules,
+    parse_custom_rule, parse_rule_action, parse_rule_overrides,
 };
 use self::scan::ScanOutcome;
 use self::stream::{
@@ -359,7 +362,9 @@ impl Waf {
             .collect::<HashSet<_>>();
         let rule_modes = parse_rule_modes(object.get("rule_modes"))?;
         // Bulk action for built-in rules. Unset preserves the safe monitor-only
-        // default; `rule_modes` still overrides individual rules either way.
+        // default. Compile-time resolution in `compile_rules` skips bulk Enforce
+        // for OptInEnforce pack metadata (encoding heuristics); explicit
+        // `rule_modes` / `rule_overrides.action` still promote those rules.
         let default_rule_action = optional_string(object, "default_rule_action")?
             .map(|raw| parse_rule_action(&raw, "default_rule_action"))
             .transpose()?;
@@ -400,6 +405,20 @@ impl Waf {
             );
         }
 
+        let scoring = parse_scoring(object.get("scoring"))?;
+        validate_enforce_mode_has_enforcing_rules(
+            mode,
+            &compiled,
+            stream.as_ref(),
+            scoring.as_ref(),
+            WafInspectionSurfaces {
+                request: request_inspection,
+                request_body: request_body_inspection,
+                response: response_inspection,
+                response_body: response_body_inspection,
+            },
+        )?;
+
         let config = WafConfig {
             mode,
             paranoia_level,
@@ -435,7 +454,7 @@ impl Waf {
                 .unwrap_or_else(|| "application/json".to_string()),
             reject_body: optional_string(object, "reject_body")?
                 .unwrap_or_else(|| r#"{"error":"Forbidden"}"#.to_string()),
-            scoring: parse_scoring(object.get("scoring"))?,
+            scoring,
         };
         if !(400..=599).contains(&config.reject_status_code) {
             return Err("waf: 'reject_status_code' must be from 400 to 599".to_string());
@@ -457,6 +476,10 @@ impl Waf {
         } else {
             HTTP_FAMILY_PROTOCOLS
         };
+        // `instance_id` is a private per-request map key, never an operator-facing
+        // identity. Configured construction still mints a unique runtime key so
+        // duplicate-id accidents cannot merge sibling accumulators, while the
+        // published metadata identity below is the stable plugin-config id.
         let instance_id = NEXT_WAF_INSTANCE_ID.fetch_add(1, Ordering::Relaxed);
         let identity: Arc<str> = match config_id {
             Some(id) => {
@@ -677,13 +700,15 @@ impl Waf {
         if !self.config.log_to_stdout {
             return;
         }
+        let globally_enforcing = self.config.mode == GlobalMode::Enforce;
         for hit in hits {
             warn!(
                 target: "waf",
                 proxy = %proxy_id,
                 rule = %hit.id,
                 severity = %hit.severity.as_str(),
-                action = %hit.action.as_event_action(),
+                action = %hit.action.effective_log_action(globally_enforcing),
+                rule_action = %hit.action,
                 transport = %transport,
                 client_ip = %client_ip,
                 blocked = blocked,
@@ -907,6 +932,7 @@ impl Waf {
             return;
         }
         let rule = &self.compiled.rules[hit.rule_index];
+        let globally_enforcing = self.config.mode == GlobalMode::Enforce;
         warn!(
             target: "waf",
             proxy = %proxy_id(ctx),
@@ -914,7 +940,8 @@ impl Waf {
             rule_name = %rule.name,
             severity = %rule.severity.as_str(),
             category = %rule.category,
-            action = %rule.action.as_event_action(),
+            action = %rule.action.effective_log_action(globally_enforcing),
+            rule_action = %rule.action,
             target_field = %hit.target_name,
             client_ip = %ctx.client_ip,
             path = %ctx.path,
@@ -1859,6 +1886,70 @@ fn parse_too_large_action(raw: &str) -> Result<TooLargeAction, String> {
     }
 }
 
+#[derive(Clone, Copy)]
+struct WafInspectionSurfaces {
+    request: bool,
+    request_body: bool,
+    response: bool,
+    response_body: bool,
+}
+
+impl WafInspectionSurfaces {
+    fn inspects(self, target: &RuleTarget) -> bool {
+        match target {
+            RuleTarget::BodyText | RuleTarget::BodyJsonPath(_) => self.request && self.request_body,
+            RuleTarget::ResponseHeaders => self.response,
+            RuleTarget::ResponseBody => self.response && self.response_body,
+            _ => self.request,
+        }
+    }
+}
+
+/// Reject `mode: enforce` when no rule or separate enforcement path can block
+/// on a surface that is actually enabled. Built-in rules ship monitor-only
+/// unless opted in; anomaly scoring and stream transport guards are separate
+/// enforcement paths, but only when they have reachable input to inspect.
+fn validate_enforce_mode_has_enforcing_rules(
+    mode: GlobalMode,
+    compiled: &CompiledRules,
+    stream: Option<&StreamWafConfig>,
+    scoring: Option<&ScoringConfig>,
+    surfaces: WafInspectionSurfaces,
+) -> Result<(), String> {
+    if mode != GlobalMode::Enforce {
+        return Ok(());
+    }
+    if compiled
+        .rules
+        .iter()
+        .any(|rule| surfaces.inspects(&rule.target) && rule.action == RuleAction::Enforce)
+    {
+        return Ok(());
+    }
+    if scoring.is_some_and(|scoring| {
+        compiled.rules.iter().any(|rule| {
+            surfaces.inspects(&rule.target)
+                && rule.score.unwrap_or_else(|| scoring.weight(rule.severity)) > 0
+        })
+    }) {
+        return Ok(());
+    }
+    if stream.is_some_and(|cfg| {
+        cfg.tcp_require_tls
+            || (cfg.signatures.has_enforce_action()
+                && (cfg.inspect_tcp || cfg.inspect_udp || cfg.inspect_response))
+    }) {
+        return Ok(());
+    }
+    Err(
+        "waf: mode is 'enforce' but no enabled enforcement path can block traffic. Built-in \
+         rules are monitor-only by default; set 'default_rule_action' to 'enforce' or opt \
+         rules in via 'rule_modes' / custom_rules[].action, enable anomaly scoring over an \
+         inspected HTTP rule, or enable a stream enforcement rule"
+            .to_string(),
+    )
+}
+
 fn parse_scoring(value: Option<&Value>) -> Result<Option<ScoringConfig>, String> {
     let Some(value) = value else {
         return Ok(None);
@@ -2111,6 +2202,7 @@ mod tests {
     #[tokio::test]
     async fn scan_budget_timeout_block_action_rejects() {
         let plugin = Waf::new(&json!({
+            "mode": "monitor",
             "include_default_rules": false,
             "scan_budget_ms": 1,
             "on_scan_timeout": "block",
@@ -2154,7 +2246,7 @@ mod tests {
 
     #[test]
     fn cheap_scan_budget_flags_timeout() {
-        let plugin = Waf::new(&json!({ "scan_budget_ms": 1 })).unwrap();
+        let plugin = Waf::new(&json!({ "mode": "monitor", "scan_budget_ms": 1 })).unwrap();
         let outcome = plugin.run_cheap_with_budget(|| {
             std::thread::sleep(Duration::from_millis(5));
             ScanOutcome::default()
@@ -2164,7 +2256,7 @@ mod tests {
 
     #[test]
     fn cheap_scan_budget_zero_never_times_out() {
-        let plugin = Waf::new(&json!({ "scan_budget_ms": 0 })).unwrap();
+        let plugin = Waf::new(&json!({ "mode": "monitor", "scan_budget_ms": 0 })).unwrap();
         let outcome = plugin.run_cheap_with_budget(|| {
             std::thread::sleep(Duration::from_millis(2));
             ScanOutcome::default()

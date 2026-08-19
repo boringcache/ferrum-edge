@@ -23,7 +23,7 @@ Ferrum Edge accepts HTTP/3 client traffic on a dedicated QUIC listener and proxi
 
 ## Listener and enablement
 
-HTTP/3 is a separate QUIC listener alongside the main hyper HTTP server. QUIC mandates TLS 1.3 (RFC 9001), so the server forces TLS 1.3 regardless of `FERRUM_TLS_*` settings and advertises `h3` in ALPN. Session resumption is always enabled: ordinary listeners use stateless rotating tickets, while a non-mTLS listener with early data enabled uses the bounded stateful cache required by rustls for server 0-RTT. Early data (0-RTT) is controlled by `FERRUM_TLS_EARLY_DATA_METHODS` — when configured on a non-mTLS listener, the QUIC rustls config sets `max_early_data_size = u32::MAX` (the only enabled value quinn/rustls accept; a finite TLS early-data byte cap is not expressible on QUIC), `quinn::Connection::into_0rtt()` detects early data, and the gateway enforces per-method filtering. 0-RTT is **not** used when the H3 listener is configured for frontend mTLS (`FERRUM_FRONTEND_TLS_CLIENT_CA_BUNDLE_PATH`): QUIC rustls `max_early_data_size` is set to `0`, and the 0.5-RTT accept path that precedes client authentication is refused. Ordinary 1-RTT mTLS is unaffected; a startup warning records that early data is inert on that listener.
+HTTP/3 is a separate QUIC listener alongside the main hyper HTTP server. QUIC mandates TLS 1.3 (RFC 9001), so the server forces TLS 1.3 regardless of `FERRUM_TLS_*` settings and advertises `h3` in ALPN. Session resumption is enabled by default: ordinary listeners use stateless rotating tickets, while a non-mTLS listener with early data enabled uses the bounded stateful cache required by rustls for server 0-RTT. The narrow exception is an mTLS listener with `FERRUM_FRONTEND_TLS_LIVE_RELOAD_ENABLED=true`: tickets and the stateful cache are disabled so a resumed session cannot bypass fresh client-certificate verification after a client-CA or CRL withdrawal. Early data (0-RTT) is controlled by `FERRUM_TLS_EARLY_DATA_METHODS` — when configured on a non-mTLS listener, the QUIC rustls config sets `max_early_data_size = u32::MAX` (the only enabled value quinn/rustls accept; a finite TLS early-data byte cap is not expressible on QUIC), `quinn::Connection::into_0rtt()` detects early data, and the gateway enforces per-method filtering. 0-RTT is **not** used when the H3 listener is configured for frontend mTLS (`FERRUM_FRONTEND_TLS_CLIENT_CA_BUNDLE_PATH`): QUIC rustls `max_early_data_size` is set to `0`, and the 0.5-RTT accept path that precedes client authentication is refused. Ordinary 1-RTT mTLS is unaffected; a startup warning records that early data is inert on that listener.
 
 Enable the listener with:
 
@@ -33,6 +33,24 @@ FERRUM_PROXY_HTTPS_PORT=8443   # H3 shares the HTTPS port by convention
 FERRUM_FRONTEND_TLS_CERT_PATH=/path/to/cert.pem
 FERRUM_FRONTEND_TLS_KEY_PATH=/path/to/key.pem
 ```
+
+Under `FERRUM_FRONTEND_TLS_LIVE_RELOAD_ENABLED=true`, an mTLS H3 listener owns
+its own client-trust generation (`proxy_h3`). Because the QUIC endpoint applies a
+reload out of band, it adopts one whole accepted candidate — `ServerConfig`,
+client-certificate verifier, and the identity of the exact client-CA bytes and
+CRLs behind it — so the generation it publishes always describes what it is
+enforcing. When the operator withdraws that trust, established
+client-certificate-authenticated QUIC connections are closed with
+`H3_REQUEST_REJECTED` (`0x010B`) and an already-ready request stream is refused
+before its task is spawned. A listener with no client-CA bundle authenticates no
+client and stays unarmed, so nothing is tracked and 0-RTT admission is unchanged.
+See [frontend_tls.md](frontend_tls.md#client-trust-generations-and-established-transport-retirement).
+
+In DP mode, CP-delivered Gateway TLS owns the active server certificate while
+operator live reload still owns client trust. HTTP/3 adopts a single paired
+candidate (CP server config + accepted operator verifier/identity) rather than
+rebuilding trust from a startup CRL clone beside the CP certificate. Clearing
+CP material restores that latest accepted operator candidate.
 
 Gateway API TLS-class listener ports follow the same convention: each gets its
 own QUIC socket beside its TCP HTTPS listener when HTTP/3 is enabled. If a raw
