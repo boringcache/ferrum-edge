@@ -93,26 +93,17 @@ pub async fn start_listener(
     // `transparent = true` is passed only here. A transparent socket may bind
     // and source non-local addresses, so the capability stays scoped to the one
     // listener that provably needs it rather than being switched on process-wide.
-    let listener: TcpListener = super::create_proxy_socket(
-        addr,
-        CAPTURE_BACKLOG,
-        None,
-        // No SO_REUSEPORT: a single accept loop keeps `bpf_sk_assign`'s wildcard
-        // listener lookup unambiguous (the kernel would otherwise pick a
-        // reuseport group member by hash, which is fine for delivery but makes
-        // the live datapath test non-deterministic for no throughput gain — the
-        // capture path is per-pod inbound, not a fan-in edge listener).
-        false,
-        true,
-    )
-    .map_err(|e| {
-        anyhow::anyhow!(
-            "failed to bind the NodeWaypoint transparent inbound capture listener on {addr}: {e}. \
-             The eBPF tc ingress redirect steers captured inbound traffic at this port, so \
-             without it every enrolled pod's inbound traffic is dropped fail-closed. Ensure the \
-             container has NET_ADMIN (IP_TRANSPARENT) and the port is free."
-        )
-    })?;
+    // The shared factory is exclusive (never SO_REUSEPORT). A single accept loop
+    // also keeps `bpf_sk_assign`'s wildcard listener lookup unambiguous.
+    let listener: TcpListener = super::create_proxy_socket(addr, CAPTURE_BACKLOG, None, true)
+        .map_err(|e| {
+            anyhow::anyhow!(
+                "failed to bind the NodeWaypoint transparent inbound capture listener on {addr}: {e}. \
+                 The eBPF tc ingress redirect steers captured podIP:appPort traffic at this port, so \
+                 without it every enrolled pod's inbound traffic is dropped fail-closed. Ensure the \
+                 container has NET_ADMIN (IP_TRANSPARENT) and the port is free."
+            )
+        })?;
 
     info!(
         %addr,

@@ -402,9 +402,9 @@ impl TransformerRetryHarness {
         let harness = Self { gateway, backend };
         // Event-driven ownership proof: wait until *this* gateway dials *our*
         // backend (capability / warmup probe traffic is enough). A foreign
-        // SO_REUSEPORT sharer would never dial this listener. Clear probe
-        // captures before the semantic retry request so attempt counts stay
-        // exact.
+        // process cannot join this exclusive proxy bind, and would never dial
+        // this listener. Clear probe captures before the semantic retry
+        // request so attempt counts stay exact.
         harness
             .wait_for_backend_dial(Duration::from_secs(5))
             .await
