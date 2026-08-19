@@ -2483,13 +2483,13 @@ pub async fn run(
         let admin_https_shutdown = shutdown_tx.subscribe();
 
         // Load admin TLS configuration (shared with validate, issue #2976).
-        let admin_tls_config = match startup_security::load_admin_tls_material(
+        let admin_tls_candidate = match startup_security::load_admin_tls_candidate(
             &env_config,
             &tls_policy,
             &crls,
             "Invalid admin TLS configuration",
         ) {
-            Ok(config) => {
+            Ok(candidate) => {
                 if env_config.admin_tls_client_ca_bundle_path.is_some() {
                     info!(
                         "Admin TLS configuration loaded with client certificate verification (HTTPS with mTLS available)"
@@ -2503,7 +2503,7 @@ pub async fn run(
                         "Admin TLS configuration loaded without client certificate verification (HTTPS available)"
                     );
                 }
-                config
+                candidate
             }
             Err(e) => {
                 error!("Failed to load admin TLS configuration: {:#}", e);
@@ -2511,8 +2511,12 @@ pub async fn run(
             }
         };
 
+        let admin_tls_config = admin_tls_candidate.config;
         let admin_reload_handles = crate::modes::tls_reload::prepare_admin_frontend_tls(
             admin_tls_config.clone(),
+            // Baseline from the exact load that produced `admin_tls_config`
+            // (issue #3857), never from a second read of the client-CA source.
+            Some(admin_tls_candidate.client_trust),
             &env_config,
             &tls_policy,
             &crls,

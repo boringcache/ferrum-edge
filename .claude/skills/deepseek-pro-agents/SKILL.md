@@ -36,9 +36,9 @@ this provider has no effort tiers. Do not claim an effort level was applied.
 
 Non-negotiables:
 - The launcher pins **`alibaba-token-plan/deepseek-v4-pro-0813`** on the write-enabled `build`
-  agent and feeds the prompt on stdin (`opencode run --auto`). Pass
-  `--model alibaba-token-plan/<other>` only when the user asks for a different model on
-  that provider.
+  agent and feeds the prompt on stdin (`opencode run --auto`). This is a **hard pin**:
+  `--model` is refused (exit 2) unless it names exactly `alibaba-token-plan/deepseek-v4-pro-0813`.
+  No other Qwen/DeepSeek variant and no rolling alias can be dispatched from this skill.
 - The pin is the **dated snapshot** `-0813`, chosen for its limited-time discounted rate. The
   rolling `deepseek-v4-pro` alias also serves on this plan, so this is a cost choice, not an
   availability constraint. Re-pin only after re-validating.

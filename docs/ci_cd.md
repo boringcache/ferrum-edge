@@ -44,8 +44,6 @@ adding, removing, or materially changing a workflow.
 | `mesh-e2e-sidecar-live.yml` | Mesh E2E Sidecar Live Datapath | PRs, `merge_group`, push to `main`, manual | Release-blocking sidecar datapath validation; `Mesh E2E Sidecar Live` is directly required on PRs and merge-queue groups. |
 | `cross-build-policy.yml` | Cross Build Policy | `pull_request_target` for PRs to `main`, `merge_group` | Read-only trusted-base validation of every PR-controlled ARM64 Cross configuration and invocation surface on PRs; merge-group mode verifies the synthesized combined SHA with `contents: read` only. `Trusted Cross Build Policy` is directly required. |
 | `ambient-host-udp-live.yml` | Ambient Host UDP Live Kernel | Every PR, `merge_group`, manual | Privileged live-kernel gate for Ambient host-network UDP capture (`ProxyHostUdpBackend`), plus a production-image contract job that proves the chart-selected `-ebpf-tools` runtime can execute the shell/iptables tool set while `-ebpf` stays distroless; relevance is decided by a trusted-base classifier and `Ambient Host UDP Live` reports on every run. |
-| `launch-integrity.yml` | Launch Readiness Integrity | `pull_request_target` for PRs to `main`, `merge_group` | Read-only trusted-base validation that a candidate preserved the launch/release governance contract. Executable gate code (checker, readiness/release/integrity/advisory-trust workflows and verifiers) is byte-frozen to protected `main`; candidate-editable data (blocker policy, exemption schema, document markers, CODEOWNERS coverage) is structurally validated, and check-name/advisory-secret scanning covers every workflow including ones the candidate adds. It never computes a launch verdict, so open launch blockers keep it green. `Launch Readiness Integrity` is directly required. See [launch-readiness.md](launch-readiness.md). |
-| `launch-readiness.yml` | Launch Readiness | PRs, `merge_group`, push to `main`, `v*` tags, daily schedule, manual | Live go/no-go launch verdict (`Launch Readiness Gate`). Expected to stay red while real blockers are open; it is release-blocking, **not** a required PR context. |
 | `node-waypoint-ebpf-live.yml` | NodeWaypoint eBPF Live Datapath | Path-filtered PRs, manual | Live eBPF datapath validation in kind. |
 | `istio-status-cas-live.yml` | Istio Status CAS Live | Path-filtered PRs, manual | Kind/apiserver competing-writer proof that Ferrum's Istio status CAS preserves foreign and Ferrum-owned conditions. Not a required live-suite check. |
 | `multicluster-federation-live.yml` | Multicluster Federation Live Datapath | PRs, `merge_group`, push to `main`, manual | Release-blocking multicluster federation datapath validation; `Multicluster Federation Live` is directly required on PRs and merge-queue groups. |
@@ -70,9 +68,6 @@ adding, removing, or materially changing a workflow.
 
 ```
 Pull Request / Merge Queue group
-    ├─► Launch Readiness Integrity
-            ├─► PR: `pull_request_target`, trusted-base verifier, candidate tree as data
-            └─► Merge group: synthesized queue SHA, `contents: read`, no secrets
     ├─► Trusted Cross Build Policy
             ├─► PR: `pull_request_target`, base code only, PR tree as data
             └─► Merge group: synthesized queue SHA, `contents: read`, no secrets
@@ -121,14 +116,14 @@ app id `15368`):
 | `Multicluster Federation Live` | `.github/workflows/multicluster-federation-live.yml` | `gate` |
 | `Multicluster Poller Partition Live` | `.github/workflows/multicluster-poller-partition-live.yml` | `gate` |
 | `Ambient Host UDP Live` | `.github/workflows/ambient-host-udp-live.yml` | `gate` |
-| `Launch Readiness Integrity` | `.github/workflows/launch-integrity.yml` | `verify` |
 
-`Launch Readiness Gate` (from `launch-readiness.yml`) is deliberately **not** in
-this list: it is the live go/no-go verdict and stays red while any real launch
-blocker is open, so requiring it would deadlock blocker-fix pull requests. The
-merge control is the separate integrity context above; the go/no-go verdict
-remains release-blocking through `release.yml`'s `validate-launch-readiness`
-job. See [launch-readiness.md](launch-readiness.md).
+The launch-readiness governance lane (`launch-readiness.yml`,
+`launch-integrity.yml`, `launch-advisory-trust.yml`, their verifiers, the blocker
+policy/exemption data, and `release.yml`'s `validate-launch-readiness` job) was
+removed once every tracked blocker had closed. There is no automated go/no-go
+launch verdict, and a `v*` tag no longer requires one. `Launch Readiness
+Integrity` must also be dropped from the branch ruleset's required contexts, or
+pull requests will wait on a check that can never report.
 
 Each owner declares a `merge_group` (`types: [checks_requested]`) trigger in
 addition to its existing `pull_request` / `pull_request_target` / `push` /
@@ -484,7 +479,15 @@ every job gate on, and are omitted from the step summary rather than
 interpolated into Markdown. The same `--no-renames` fail-closed classification applies
 to `coverage.yml` coverage planning, `gateway-api-conformance.yml` relevance
 filtering, and the `performance-regression` path classifier on both
-`pull_request` and `merge_group` diffs. Merge-group planning diffs
+`pull_request` and `merge_group` diffs. Coverage planning is shard-scoped on
+classifiable pull-request and merge-group diffs: `lib-unit` always runs with the
+affected integration shards, plugin-only diffs keep the plugin gate but reuse
+the `lib-unit` profraw/artifacts, and push to `main`, schedule, dispatch, empty
+or unavailable diffs, controller edits, dependency/build-graph inputs, unknown
+paths, and malformed/hostile path transport fail closed to the full coverage
+matrix. The `Merge Coverage` aggregate verifies exact planned shard outcomes and
+artifact presence so a skipped shard cannot false-green the required check.
+Merge-group planning diffs
 `merge_group.base_sha...HEAD` and executes the planner from that base SHA so a
 queued planner edit cannot self-classify as light.
 Any unrecognized path, an empty/unavailable diff, a mixed code-and-docs change,

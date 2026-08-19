@@ -5,11 +5,12 @@ set -euo pipefail
 usage() {
   printf '%s\n' \
     'Usage: dispatch-agent.sh --worktree ABS_PATH --prompt-file ABS_PATH' \
-    '                         [--model alibaba-token-plan/<model>]' \
+    '                         [--model alibaba-token-plan/deepseek-v4-pro-0813]' \
     '                         [--effort medium|high|xhigh|max]' \
     '' \
-    'Defaults model to alibaba-token-plan/deepseek-v4-pro-0813. --model may select any' \
-    'alibaba-token-plan/* model declared in the operator opencode config.' \
+    'Pinned to alibaba-token-plan/deepseek-v4-pro-0813. --model is accepted only when' \
+    'it names that exact model; any other value is refused. The dated snapshot' \
+    'is the only variant this skill dispatches.' \
     '' \
     'Requires ALIBABA_TOKEN_PLAN_API_KEY (or ALIBABA_TOKEN_PLAN_API_KEY_FILE naming' \
     'a readable file holding it); the provider block in opencode.json resolves the' \
@@ -88,14 +89,17 @@ if [[ -n "$effort" ]]; then
   esac
 fi
 
-case "$model" in
-  alibaba-token-plan/*) ;;
-  *)
-    printf 'Invalid model: %s (must be an alibaba-token-plan/* model)\n' "$model" >&2
-    usage
-    exit 2
-    ;;
-esac
+# Hard pin: this skill dispatches exactly one model variant. --model survives only
+# for CLI parity with sibling skills and to let a caller restate the pin; it cannot
+# select a different Qwen/DeepSeek variant or a rolling alias.
+readonly PINNED_MODEL='alibaba-token-plan/deepseek-v4-pro-0813'
+if [[ "$model" != "$PINNED_MODEL" ]]; then
+  printf 'Refusing model: %s\n' "$model" >&2
+  printf 'This skill is pinned to %s and dispatches no other variant.\n' \
+    "$PINNED_MODEL" >&2
+  usage
+  exit 2
+fi
 
 if [[ "$worktree" != /* || ! -d "$worktree" ]]; then
   printf 'Worktree must be an existing absolute directory: %s\n' "${worktree:-<empty>}" >&2
