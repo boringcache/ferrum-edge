@@ -3617,6 +3617,34 @@ fn the_native_h3_grpc_precommit_terminal_is_unauthenticated_and_health_neutral()
     );
 }
 
+/// Body of the block `marker` opens, bounded by ITS matching close brace.
+///
+/// Bounding an arm with a far-away end marker instead makes the slice grow
+/// whenever unrelated code is inserted between the two. That is not
+/// hypothetical: the mid-body read-timeout arm added for issue #4055 calls
+/// `write_plain_gateway_error(` to emit its 504, nowhere near the
+/// authorization-expiry path, and a marker-bounded slice read that as this
+/// contract being violated. Brace matching keeps the assertion about the arm
+/// rather than about its neighbourhood, so a false positive here means the
+/// arm really did change.
+fn balanced_block_after<'a>(haystack: &'a str, marker: &str) -> Option<&'a str> {
+    let start = haystack.find(marker)? + marker.len();
+    let mut depth = 1usize;
+    for (offset, ch) in haystack[start..].char_indices() {
+        match ch {
+            '{' => depth += 1,
+            '}' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(&haystack[start..start + offset]);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
 /// Cross-protocol plain pre-commitment authorization expiry writes the fixed
 /// redacted 401 under a fresh gateway-owned grace, then resets if QUIC credit
 /// is withheld. The already-expired authorization instant must not race the
@@ -3632,13 +3660,8 @@ fn cross_protocol_plain_precommit_401_is_grace_bounded_and_health_neutral() {
         .next()
         .expect("bounded cross-protocol plain dispatcher");
 
-    let upload = dispatch
-        .split("if let Some(termination) = upload_auth_expired {")
-        .nth(1)
-        .expect("streaming upload authorization-expiry arm")
-        .split("record_plain_grpc_web_client_deadline(")
-        .next()
-        .expect("bounded streaming upload authorization-expiry arm");
+    let upload = balanced_block_after(dispatch, "if let Some(termination) = upload_auth_expired {")
+        .expect("streaming upload authorization-expiry arm");
     assert!(upload.contains("record_authorization_termination_once("));
     assert!(upload.contains("write_plain_authorization_expired_terminal("));
     assert!(
