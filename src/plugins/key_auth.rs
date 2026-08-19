@@ -137,11 +137,7 @@ impl KeyAuth {
 
     fn extract_key(&self, ctx: &RequestContext) -> Option<String> {
         if let Some(ref lower) = self.header_name_lower {
-            extract_configured_header_key(
-                ctx,
-                lower.as_str(),
-                self.header_name_original.as_deref(),
-            )
+            extract_configured_header_key(ctx, lower.as_str(), self.header_name_original.as_deref())
         } else if let Some(ref param) = self.query_param_name {
             ctx.query_params.get(param.as_str()).cloned()
         } else {

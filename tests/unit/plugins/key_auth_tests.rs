@@ -18,7 +18,10 @@ const UNICODE_API_KEY: &str = "ユニコード-api-key-value-32chars-min";
 
 fn create_unicode_key_consumer() -> Consumer {
     let mut keyauth = Map::new();
-    keyauth.insert("key".to_string(), Value::String(UNICODE_API_KEY.to_string()));
+    keyauth.insert(
+        "key".to_string(),
+        Value::String(UNICODE_API_KEY.to_string()),
+    );
     let mut credentials = HashMap::new();
     credentials.insert(
         "keyauth".to_string(),
@@ -59,9 +62,7 @@ fn context_with_materialized_raw_header(name: &str, value: &str) -> RequestConte
 fn assert_reject_body(result: PluginResult, expected_body: &str) {
     match result {
         PluginResult::Reject {
-            status_code,
-            body,
-            ..
+            status_code, body, ..
         } => {
             assert_eq!(status_code, 401);
             assert_eq!(body, expected_body);
@@ -591,10 +592,8 @@ async fn test_key_auth_unicode_api_key_authenticates_via_query() {
 async fn test_key_auth_wrong_unicode_api_key_returns_invalid_not_missing() {
     let plugin = KeyAuth::new(&json!({"key_location": "header:X-API-Key"})).unwrap();
     let consumer_index = ConsumerIndex::new(&[create_unicode_key_consumer()]);
-    let mut ctx = context_with_materialized_raw_header(
-        "X-API-Key",
-        "ユニコード-api-key-value-32chars-WRONG",
-    );
+    let mut ctx =
+        context_with_materialized_raw_header("X-API-Key", "ユニコード-api-key-value-32chars-WRONG");
 
     let result = plugin.authenticate(&mut ctx, &consumer_index).await;
     assert_reject_body(result, r#"{"error":"Invalid API key"}"#);
