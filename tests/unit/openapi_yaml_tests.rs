@@ -8127,7 +8127,7 @@ fn admin_referential_delete_conflicts_have_openapi_parity() {
         consumer_desc.contains(
             "Consumer is referenced by one or more access_control plugin_configs and cannot be deleted"
         ),
-        "DELETE /consumers/{id} 409 must name the access_control error string: {consumer_desc}"
+        "DELETE /consumers/{{id}} 409 must name the access_control error string: {consumer_desc}"
     );
 
     let upstream_409 = spec
@@ -8139,13 +8139,13 @@ fn admin_referential_delete_conflicts_have_openapi_parity() {
     assert!(
         upstream_desc
             .contains("Upstream is referenced by one or more proxies and cannot be deleted"),
-        "DELETE /upstreams/{id} 409 must name the proxy-reference error string: {upstream_desc}"
+        "DELETE /upstreams/{{id}} 409 must name the proxy-reference error string: {upstream_desc}"
     );
     assert!(
         upstream_desc.contains(
             "Upstream is referenced by a mesh_route_dispatch plugin_config and cannot be deleted"
         ),
-        "DELETE /upstreams/{id} 409 must name the mesh_route_dispatch error string: {upstream_desc}"
+        "DELETE /upstreams/{{id}} 409 must name the mesh_route_dispatch error string: {upstream_desc}"
     );
 
     let proxy_desc = spec["paths"]["/proxies/{id}"]["delete"]["description"]
@@ -8153,7 +8153,7 @@ fn admin_referential_delete_conflicts_have_openapi_parity() {
         .expect("DELETE /proxies/{id} description");
     assert!(
         proxy_desc.contains("hand-owned") && proxy_desc.contains("orphan-cleaned"),
-        "DELETE /proxies/{id} must document hand-owned upstream orphan cleanup: {proxy_desc}"
+        "DELETE /proxies/{{id}} must document hand-owned upstream orphan cleanup: {proxy_desc}"
     );
 }
 
