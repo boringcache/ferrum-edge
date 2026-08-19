@@ -137,23 +137,62 @@ impl KeyAuth {
 
     fn extract_key(&self, ctx: &RequestContext) -> Option<String> {
         if let Some(ref lower) = self.header_name_lower {
-            ctx.headers
-                .get(lower.as_str())
-                .or_else(|| {
-                    self.header_name_original
-                        .as_ref()
-                        .and_then(|orig| ctx.headers.get(orig.as_str()))
-                })
-                .cloned()
+            extract_configured_header_key(
+                ctx,
+                lower.as_str(),
+                self.header_name_original.as_deref(),
+            )
         } else if let Some(ref param) = self.query_param_name {
             ctx.query_params.get(param.as_str()).cloned()
         } else {
-            ctx.headers
-                .get("x-api-key")
-                .or_else(|| ctx.headers.get("X-API-Key"))
-                .cloned()
+            extract_configured_header_key(ctx, "x-api-key", Some("X-API-Key"))
         }
     }
+}
+
+/// Read a configured header credential from the materialized map, falling back
+/// to raw field-line bytes when `materialize_headers()` omitted a legal UTF-8
+/// value because `HeaderValue::to_str()` rejects non-ASCII bytes.
+fn extract_configured_header_key(
+    ctx: &RequestContext,
+    lower: &str,
+    original: Option<&str>,
+) -> Option<String> {
+    if let Some(value) = ctx
+        .headers
+        .get(lower)
+        .or_else(|| original.and_then(|orig| ctx.headers.get(orig)))
+    {
+        return Some(value.clone());
+    }
+
+    if !ctx.has_raw_headers() {
+        return None;
+    }
+
+    for name in [Some(lower), original] {
+        let Some(name) = name else {
+            continue;
+        };
+        let values: Vec<&[u8]> = ctx.raw_header_value_bytes(name).collect();
+        if values.is_empty() {
+            continue;
+        }
+        return raw_header_field_lines_to_utf8_string(name, &values);
+    }
+    None
+}
+
+fn raw_header_field_lines_to_utf8_string(name: &str, values: &[&[u8]]) -> Option<String> {
+    let separator = super::repeated_request_header_separator(name);
+    let mut out = String::new();
+    for (idx, bytes) in values.iter().enumerate() {
+        if idx > 0 {
+            out.push_str(separator);
+        }
+        out.push_str(std::str::from_utf8(bytes).ok()?);
+    }
+    Some(out)
 }
 
 #[async_trait]

@@ -1,12 +1,74 @@
 //! Tests for key_auth plugin
 
+use chrono::Utc;
 use ferrum_edge::ConsumerIndex;
-use ferrum_edge::plugins::{HTTP_FAMILY_PROTOCOLS, Plugin, key_auth::KeyAuth, priority};
-use serde_json::json;
+use ferrum_edge::config::types::{Consumer, default_namespace};
+use ferrum_edge::plugins::{
+    HTTP_FAMILY_PROTOCOLS, Plugin, PluginResult, RequestContext, key_auth::KeyAuth, priority,
+};
+use http::HeaderMap;
+use serde_json::{Map, Value, json};
+use std::collections::HashMap;
 
 use super::plugin_utils::{
     assert_continue, assert_reject, create_test_consumer, create_test_context,
 };
+
+const UNICODE_API_KEY: &str = "ユニコード-api-key-value-32chars-min";
+
+fn create_unicode_key_consumer() -> Consumer {
+    let mut keyauth = Map::new();
+    keyauth.insert("key".to_string(), Value::String(UNICODE_API_KEY.to_string()));
+    let mut credentials = HashMap::new();
+    credentials.insert(
+        "keyauth".to_string(),
+        Value::Array(vec![Value::Object(keyauth)]),
+    );
+    Consumer {
+        id: "consumer-unimap".to_string(),
+        namespace: default_namespace(),
+        username: "ユーザー".to_string(),
+        custom_id: None,
+        credentials,
+        acl_groups: Vec::new(),
+        created_at: Utc::now(),
+        updated_at: Utc::now(),
+    }
+}
+
+fn context_with_materialized_raw_header(name: &str, value: &str) -> RequestContext {
+    let mut ctx = create_test_context();
+    ctx.headers.clear();
+    ctx.identified_consumer = None;
+
+    let mut raw = HeaderMap::new();
+    raw.insert(
+        name,
+        http::HeaderValue::from_bytes(value.as_bytes()).expect("valid header bytes"),
+    );
+    ctx.set_raw_headers(raw);
+    ctx.materialize_headers();
+    assert!(
+        !ctx.headers.contains_key(name.to_ascii_lowercase().as_str())
+            && !ctx.headers.contains_key(name),
+        "non-ASCII header values must stay out of the materialized map in this repro"
+    );
+    ctx
+}
+
+fn assert_reject_body(result: PluginResult, expected_body: &str) {
+    match result {
+        PluginResult::Reject {
+            status_code,
+            body,
+            ..
+        } => {
+            assert_eq!(status_code, 401);
+            assert_eq!(body, expected_body);
+        }
+        other => panic!("Expected Reject, got {other:?}"),
+    }
+}
 
 #[tokio::test]
 async fn test_key_auth_plugin_creation() {
@@ -490,5 +552,51 @@ async fn test_key_auth_empty_key_does_not_match_any_consumer() {
 
     let result = plugin.authenticate(&mut ctx, &consumer_index).await;
     assert_reject(result, Some(401));
+    assert!(ctx.identified_consumer.is_none());
+}
+
+#[tokio::test]
+async fn test_key_auth_unicode_api_key_authenticates_via_header() {
+    let plugin = KeyAuth::new(&json!({"key_location": "header:X-API-Key"})).unwrap();
+    let consumer_index = ConsumerIndex::new(&[create_unicode_key_consumer()]);
+    let mut ctx = context_with_materialized_raw_header("X-API-Key", UNICODE_API_KEY);
+
+    let result = plugin.authenticate(&mut ctx, &consumer_index).await;
+    assert_continue(result);
+    assert_eq!(
+        ctx.identified_consumer.as_ref().unwrap().username,
+        "ユーザー"
+    );
+}
+
+#[tokio::test]
+async fn test_key_auth_unicode_api_key_authenticates_via_query() {
+    let plugin = KeyAuth::new(&json!({"key_location": "query:apikey"})).unwrap();
+    let consumer_index = ConsumerIndex::new(&[create_unicode_key_consumer()]);
+    let mut ctx = create_test_context();
+    ctx.headers.clear();
+    ctx.identified_consumer = None;
+    ctx.query_params
+        .insert("apikey".to_string(), UNICODE_API_KEY.to_string());
+
+    let result = plugin.authenticate(&mut ctx, &consumer_index).await;
+    assert_continue(result);
+    assert_eq!(
+        ctx.identified_consumer.as_ref().unwrap().username,
+        "ユーザー"
+    );
+}
+
+#[tokio::test]
+async fn test_key_auth_wrong_unicode_api_key_returns_invalid_not_missing() {
+    let plugin = KeyAuth::new(&json!({"key_location": "header:X-API-Key"})).unwrap();
+    let consumer_index = ConsumerIndex::new(&[create_unicode_key_consumer()]);
+    let mut ctx = context_with_materialized_raw_header(
+        "X-API-Key",
+        "ユニコード-api-key-value-32chars-WRONG",
+    );
+
+    let result = plugin.authenticate(&mut ctx, &consumer_index).await;
+    assert_reject_body(result, r#"{"error":"Invalid API key"}"#);
     assert!(ctx.identified_consumer.is_none());
 }
