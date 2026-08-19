@@ -629,12 +629,13 @@ fn classify_typed_chain(
                 return Some(ErrorClass::PortExhaustion);
             }
             // rustls often surfaces as `io::Error` wrapping `rustls::Error`
-            // as `source()`. Walk that inner chain *before* mapping the io
-            // kind: a TLS handshake that fails after TCP connect can look
-            // like `ConnectionReset` ("peer closed the TLS record layer")
-            // and must not take the connect-phase RST → `ConnectionRefused`
-            // collapse. Distinguish by typed rustls presence, not by
-            // string matching on "tls" / "refused".
+            // in `get_ref()`. `source()` skips that payload and returns
+            // the inner error's source instead. Walk `get_ref()` *before*
+            // mapping the io kind: a TLS handshake that fails after TCP
+            // connect can look like `ConnectionReset` ("peer closed the
+            // TLS record layer") and must not take the connect-phase RST
+            // → `ConnectionRefused` collapse. Distinguish by typed rustls
+            // presence, not by string matching on "tls" / "refused".
             if rustls_error_in_chain(
                 io_err as &(dyn std::error::Error + 'static),
             ) {
@@ -698,17 +699,31 @@ fn classify_typed_chain(
     None
 }
 
-/// True when a `rustls::Error` appears anywhere in `e`'s `source()` chain,
-/// including `e` itself.
+/// True when a `rustls::Error` appears anywhere in `e`'s chain, including
+/// `e` itself.
 ///
-/// Used to distinguish a TLS-layer failure wrapped as `io::Error` (TCP
+/// Distinguishes a TLS-layer failure wrapped as `io::Error` (TCP
 /// connected, handshake then failed) from a connect-phase RST that really
 /// is equivalent to ECONNREFUSED. Typed walk only — no Display matching.
+///
+/// `std::io::Error::source()` returns the *payload's* source, not the
+/// payload. A custom error passed to [`std::io::Error::new`] is reachable
+/// only via [`std::io::Error::get_ref`]. tokio-rustls / reqwest wrap
+/// handshake failures that way (often as `ErrorKind::ConnectionReset`),
+/// so walking `source()` alone would miss rustls and the connect-phase
+/// RST collapse would label a TLS handshake failure as
+/// `ConnectionRefused`.
 pub(crate) fn rustls_error_in_chain(e: &(dyn std::error::Error + 'static)) -> bool {
     let mut current = Some(e);
     while let Some(err) = current {
         if err.downcast_ref::<rustls::Error>().is_some() {
             return true;
+        }
+        if let Some(io_err) = err.downcast_ref::<std::io::Error>()
+            && let Some(inner) = io_err.get_ref()
+        {
+            current = Some(inner as &(dyn std::error::Error + 'static));
+            continue;
         }
         current = err.source();
     }
@@ -962,7 +977,7 @@ fn classify_boxed_with_phase(
 ///    - `is_timeout()` → `ConnectionTimeout`.
 ///    - [`classify_typed_chain`] with `phase_is_connect = true`. Connect-phase
 ///      RSTs collapse to `ConnectionRefused` unless a `rustls::Error` is in
-///      the io source chain (then `TlsError` — TCP connected, handshake
+///      `io::Error::get_ref()` (then `TlsError` — TCP connected, handshake
 ///      failed). rustls errors become `TlsError`; io errors map per-kind.
 ///      Every class here MUST satisfy `request_reached_wire == false` so
 ///      `retry_on_connect_failure` fires.

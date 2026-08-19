@@ -1408,9 +1408,9 @@ fn test_classify_boxed_setup_error_keeps_rustls_as_tls_error_pre_wire() {
 #[test]
 fn test_connect_phase_io_reset_wrapping_rustls_is_tls_error_not_refused() {
     // tokio-rustls / reqwest wrap handshake failures as io::Error
-    // (often ConnectionReset) with rustls::Error as source(). TCP
-    // connected; the failure is TLS. Must not take the connect-phase
-    // RST → ConnectionRefused collapse.
+    // (often ConnectionReset) with rustls::Error in get_ref(), not
+    // source(). TCP connected; the failure is TLS. Must not take the
+    // connect-phase RST → ConnectionRefused collapse.
     let io_err = std::io::Error::new(
         std::io::ErrorKind::ConnectionReset,
         rustls::Error::HandshakeNotComplete,

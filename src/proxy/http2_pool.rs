@@ -1149,9 +1149,10 @@ fn classify_io_error(
     if matches!(io_err.raw_os_error(), Some(99) | Some(49) | Some(10049)) {
         return Some(ErrorClass::PortExhaustion);
     }
-    // rustls-under-io is a TLS handshake/record failure, not a SYN-RST.
-    // Peek before the connect-phase RST collapse so a plaintext origin
-    // that resets during ClientHello classifies as TlsError.
+    // rustls-under-io (`io::Error::get_ref()`, not `source()`) is a TLS
+    // handshake/record failure, not a SYN-RST. Peek before the
+    // connect-phase RST collapse so a plaintext origin that resets
+    // during ClientHello classifies as TlsError.
     if crate::retry::rustls_error_in_chain(
         io_err as &(dyn std::error::Error + 'static),
     ) {

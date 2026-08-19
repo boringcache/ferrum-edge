@@ -17361,6 +17361,10 @@ pub(crate) fn ws_capacity_overflow_is_protocol_junk(size: usize) -> bool {
 /// A 64-bit length field that cannot fit in `u32` is `ProtocolError`. A
 /// real oversized frame or message stays `RequestBodyTooLarge` (client →
 /// backend) or `ResponseBodyTooLarge` (backend → client).
+///
+/// The relay inlines this mapping at each size-policy arm so
+/// `test_size_policy_rejections_use_explicit_error_classes` can pin the
+/// class names in source. Keep those arms in lockstep with this helper.
 pub(crate) fn ws_capacity_error_class(size: usize, client_to_backend: bool) -> retry::ErrorClass {
     if ws_capacity_overflow_is_protocol_junk(size) {
         retry::ErrorClass::ProtocolError
@@ -18502,7 +18506,11 @@ where
                                     Some(close),
                                 );
                                 send_bounded_ws_close(&mut backend_sink, close).await;
-                                ws_capacity_error_class(size, true)
+                                if ws_capacity_overflow_is_protocol_junk(size) {
+                                    retry::ErrorClass::ProtocolError
+                                } else {
+                                    retry::ErrorClass::RequestBodyTooLarge
+                                }
                             } else if let Some((close, limit_kind, size, max_size)) =
                                 EffectiveWsSizeLimits::global_capacity_close_for_error(&e)
                             {
@@ -18521,7 +18529,11 @@ where
                                     Some(close),
                                 );
                                 send_bounded_ws_close(&mut backend_sink, close).await;
-                                ws_capacity_error_class(size, true)
+                                if ws_capacity_overflow_is_protocol_junk(size) {
+                                    retry::ErrorClass::ProtocolError
+                                } else {
+                                    retry::ErrorClass::RequestBodyTooLarge
+                                }
                             } else if let Some((close, limit_kind)) =
                                 ws_fragment_policy_close_for_error(&e)
                             {
@@ -18809,7 +18821,11 @@ where
                                     Some(close),
                                 );
                                 send_bounded_ws_close(&mut ws_sink, close).await;
-                                ws_capacity_error_class(size, false)
+                                if ws_capacity_overflow_is_protocol_junk(size) {
+                                    retry::ErrorClass::ProtocolError
+                                } else {
+                                    retry::ErrorClass::ResponseBodyTooLarge
+                                }
                             } else if let Some((close, limit_kind, size, max_size)) =
                                 EffectiveWsSizeLimits::global_capacity_close_for_error(&e)
                             {
@@ -18828,7 +18844,11 @@ where
                                     Some(close),
                                 );
                                 send_bounded_ws_close(&mut ws_sink, close).await;
-                                ws_capacity_error_class(size, false)
+                                if ws_capacity_overflow_is_protocol_junk(size) {
+                                    retry::ErrorClass::ProtocolError
+                                } else {
+                                    retry::ErrorClass::ResponseBodyTooLarge
+                                }
                             } else if let Some((close, limit_kind)) =
                                 ws_fragment_policy_close_for_error(&e)
                             {

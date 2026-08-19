@@ -173,6 +173,9 @@ fn test_h2_pool_tls_marker_with_connection_reset_is_tls_error_not_refused() {
 
 #[test]
 fn test_h2_pool_io_reset_wrapping_rustls_is_tls_error_not_refused() {
+    // rustls lives in io::Error::get_ref(), not source(). A SYN-RST
+    // with the same ErrorKind and no rustls payload still collapses to
+    // ConnectionRefused.
     let io_err = io::Error::new(
         io::ErrorKind::ConnectionReset,
         rustls::Error::HandshakeNotComplete,
