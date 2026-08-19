@@ -8137,9 +8137,8 @@ fn admin_referential_delete_conflicts_have_openapi_parity() {
         .as_str()
         .expect("DELETE /upstreams/{id} 409 description");
     assert!(
-        upstream_desc.contains(
-            "Upstream is referenced by one or more proxies and cannot be deleted"
-        ),
+        upstream_desc
+            .contains("Upstream is referenced by one or more proxies and cannot be deleted"),
         "DELETE /upstreams/{id} 409 must name the proxy-reference error string: {upstream_desc}"
     );
     assert!(

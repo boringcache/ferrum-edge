@@ -3846,9 +3846,9 @@ impl DatabaseStore {
             .await?;
         // Scope the existence check to the caller's namespace (issue #2122):
         // consumer ids are only unique per namespace.
-        let existing: Option<AnyRow> = sqlx::query(&self.q(
-            "SELECT id, username FROM consumers WHERE id = ? AND namespace = ?",
-        ))
+        let existing: Option<AnyRow> = sqlx::query(
+            &self.q("SELECT id, username FROM consumers WHERE id = ? AND namespace = ?"),
+        )
         .bind(id)
         .bind(namespace)
         .fetch_optional(&mut *tx)
@@ -5041,9 +5041,9 @@ impl DatabaseStore {
         namespace: &str,
         username: &str,
     ) -> Result<Option<PluginConfig>, anyhow::Error> {
-        let rows: Vec<AnyRow> = sqlx::query(&self.q(
-            "SELECT * FROM plugin_configs WHERE plugin_name = ? AND namespace = ?",
-        ))
+        let rows: Vec<AnyRow> = sqlx::query(
+            &self.q("SELECT * FROM plugin_configs WHERE plugin_name = ? AND namespace = ?"),
+        )
         .bind("access_control")
         .bind(namespace)
         .fetch_all(&mut **tx)
