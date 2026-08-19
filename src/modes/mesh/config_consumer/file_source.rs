@@ -99,31 +99,7 @@ pub async fn load_mesh_slice_from_file_off_thread(
 pub fn read_mesh_config_document(
     path: &Path,
 ) -> Result<Box<crate::modes::mesh::config::MeshConfig>, anyhow::Error> {
-    if !path.exists() {
-        anyhow::bail!("mesh configuration file not found: {}", path.display());
-    }
-
-    // Mirror file mode's credential-hygiene warning: mesh documents can carry
-    // JWT issuer material and trust bundles.
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        if let Ok(metadata) = std::fs::metadata(path) {
-            let mode = metadata.permissions().mode();
-            if mode & 0o004 != 0 {
-                warn!(
-                    "Mesh config file {} is world-readable (mode {:o}). Consider restricting \
-                     permissions as it may contain trust material.",
-                    path.display(),
-                    mode & 0o777
-                );
-            }
-        }
-    }
-
-    let options = StableFileReadOptions::new(MAX_MESH_CONFIG_FILE_BYTES, "mesh configuration file");
-    let content = read_stable_file(path, options)
-        .map_err(|error| stable_file_error_anyhow(path, options, error))?;
+    let content = read_mesh_file_bytes(path)?;
 
     // Extension only; unknown/extensionless paths use YAML, which also admits
     // ordinary JSON without a separate full-document detection parse.
@@ -150,6 +126,96 @@ pub fn read_mesh_config_document(
     }
 
     Ok(document.mesh)
+}
+
+/// Bounded stable read of a localized mesh document. Shared by the real
+/// parser and the top-level shape probe so `validate` cannot admit a file the
+/// file source would later refuse (size, regularity, UTF-8, settle contract).
+fn read_mesh_file_bytes(path: &Path) -> Result<String, anyhow::Error> {
+    if !path.exists() {
+        anyhow::bail!("mesh configuration file not found: {}", path.display());
+    }
+
+    // Mirror file mode's credential-hygiene warning: mesh documents can carry
+    // JWT issuer material and trust bundles.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if let Ok(metadata) = std::fs::metadata(path) {
+            let mode = metadata.permissions().mode();
+            if mode & 0o004 != 0 {
+                warn!(
+                    "Mesh config file {} is world-readable (mode {:o}). Consider restricting \
+                     permissions as it may contain trust material.",
+                    path.display(),
+                    mode & 0o777
+                );
+            }
+        }
+    }
+
+    let options = StableFileReadOptions::new(MAX_MESH_CONFIG_FILE_BYTES, "mesh configuration file");
+    read_stable_file(path, options).map_err(|error| stable_file_error_anyhow(path, options, error))
+}
+
+/// Whether `path` is the localized `{version?, mesh}` document shape.
+///
+/// Shape-aware, not format-sniffing: format still follows the extension-only
+/// rule used by [`read_mesh_config_document`]. This inspects **top-level
+/// keys only** so an otherwise localized document with invalid inner mesh
+/// fields still selects file-protocol validation; inner validity stays with
+/// the real parser. Unknown top-level keys (`proxies`, …) and a missing
+/// `mesh` mapping return `Ok(false)`. I/O, regularity, size, and UTF-8
+/// failures are `Err` and use the same bounded reader as runtime.
+pub fn probe_localized_mesh_file_document(path: &Path) -> Result<bool, anyhow::Error> {
+    let content = read_mesh_file_bytes(path)?;
+    Ok(content_is_localized_mesh_slice(path, &content))
+}
+
+fn content_is_localized_mesh_slice(path: &Path, content: &str) -> bool {
+    let is_yaml = detect_json_or_yaml_extension(path);
+    if is_yaml {
+        if admit_yaml_alias_expansion(content).is_err() {
+            return false;
+        }
+        serde_yaml::from_str::<serde_yaml::Value>(content)
+            .ok()
+            .is_some_and(|value| yaml_value_is_localized_mesh_slice(&value))
+    } else {
+        serde_json::from_str::<serde_json::Value>(content)
+            .ok()
+            .is_some_and(|value| json_value_is_localized_mesh_slice(&value))
+    }
+}
+
+fn yaml_value_is_localized_mesh_slice(value: &serde_yaml::Value) -> bool {
+    let Some(mapping) = value.as_mapping() else {
+        return false;
+    };
+    let mut saw_mesh = false;
+    for (key, child) in mapping {
+        match key.as_str() {
+            Some("version") => {}
+            Some("mesh") if child.is_mapping() => saw_mesh = true,
+            _ => return false,
+        }
+    }
+    saw_mesh
+}
+
+fn json_value_is_localized_mesh_slice(value: &serde_json::Value) -> bool {
+    let Some(mapping) = value.as_object() else {
+        return false;
+    };
+    let mut saw_mesh = false;
+    for (key, child) in mapping {
+        match key.as_str() {
+            "version" => {}
+            "mesh" if child.is_object() => saw_mesh = true,
+            _ => return false,
+        }
+    }
+    saw_mesh
 }
 
 /// Wrap a mesh section in a [`GatewayConfig`] and run the same normalization +

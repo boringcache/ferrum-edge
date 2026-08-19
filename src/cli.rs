@@ -92,7 +92,8 @@ pub struct ValidateArgs {
     #[arg(short = 's', long = "settings")]
     pub settings: Option<PathBuf>,
 
-    /// Path to resources YAML/JSON (proxies, consumers, upstreams, plugins).
+    /// Path to resources YAML/JSON, or a localized `{version?, mesh}` slice when
+    /// validating mesh file protocol.
     #[arg(short = 'c', long = "spec")]
     pub spec: Option<PathBuf>,
 
@@ -850,7 +851,10 @@ fn report_field(env_key: &str, rendered: &str) -> String {
 /// Validate configuration without starting the gateway.
 pub fn execute_validate() -> Result<(), String> {
     use crate::config::{EnvConfig, OperatingMode, file_loader};
+    use crate::modes::mesh::MeshConfigProtocol;
     use crate::modes::startup_security::{StartupSecurityScope, load_startup_security};
+
+    crate::modes::mesh::validate::prepare_validate_file_source()?;
 
     let env_config =
         EnvConfig::from_env().map_err(|e| format!("Settings validation failed: {}", e))?;
@@ -918,8 +922,39 @@ pub fn execute_validate() -> Result<(), String> {
     // `run` fail-closes on before dialing. Validate must exercise the same
     // gate so a production plaintext ADS URL cannot report success.
     if env_config.mode == OperatingMode::Mesh {
-        crate::modes::mesh::MeshRuntimeConfig::from_env_config(&env_config)
+        let runtime = crate::modes::mesh::MeshRuntimeConfig::from_env_config(&env_config)
             .map_err(|e| format!("Mesh runtime validation failed: {e}"))?;
+        if runtime.config_protocol.requires_local_policy_document() {
+            let path = runtime.file_config_path.as_deref().ok_or_else(|| {
+                format!(
+                    "FERRUM_MESH_FILE_CONFIG_PATH is required when \
+                     FERRUM_MESH_CONFIG_PROTOCOL={}",
+                    runtime.config_protocol.as_str()
+                )
+            })?;
+            match runtime.config_protocol {
+                MeshConfigProtocol::File => {
+                    crate::modes::mesh::config_consumer::file_source::load_mesh_slice_from_file(
+                        std::path::Path::new(path),
+                        runtime.mesh_slice_request(),
+                    )
+                    .map_err(|e| format!("Mesh spec validation failed: {e}"))?;
+                }
+                MeshConfigProtocol::StockXds => {
+                    crate::modes::mesh::config_consumer::stock_xds_client::load_stock_policy_baseline(
+                        std::path::Path::new(path),
+                    )
+                    .map_err(|e| format!("Mesh spec validation failed: {e}"))?;
+                }
+                MeshConfigProtocol::Native | MeshConfigProtocol::Xds => {
+                    return Err("internal mesh validation protocol mismatch".to_string());
+                }
+            }
+            println!(
+                "Mesh spec ({}): OK",
+                report_field("FERRUM_MESH_FILE_CONFIG_PATH", path)
+            );
+        }
         println!("Mesh runtime: OK");
     }
 

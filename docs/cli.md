@@ -102,7 +102,7 @@ ferrum-edge validate [OPTIONS]
 | Flag | Short | Description |
 |------|-------|-------------|
 | `--settings <PATH>` | `-s` | Path to `ferrum.conf` (operational settings) |
-| `--spec <PATH>` | `-c` | Path to resources YAML/JSON |
+| `--spec <PATH>` | `-c` | Path to resources YAML/JSON, or a localized `{version?, mesh}` mesh slice when `-m mesh` selects file-protocol validation |
 | `--mode <MODE>` | `-m` | Operating mode: `database`, `file`, `cp`, `dp`, `mesh`, `injector`, `node_agent`, `migrate` |
 | `--verbose` | `-v` | Increase log verbosity (repeatable: `-v`=info, `-vv`=debug, `-vvv`=trace) |
 
@@ -159,6 +159,7 @@ The report withholds externally sourced values, not just the ones that appear in
    - Admin TLS material when admin HTTPS is enabled (`FERRUM_ADMIN_HTTPS_PORT != 0` and both admin cert/key paths are set). For `node_agent`, explicit nonzero HTTPS intent fails closed even when cert/key are missing; the inherited inactive default HTTPS port without TLS intent stays HTTP-only compatible.
    - DTLS frontend cert (+ optional client CA) expiry when both `FERRUM_DTLS_CERT_PATH` and `FERRUM_DTLS_KEY_PATH` are set (file/database/dp)
    - Does **not** bind sockets, spawn servers, mutate stores, mint random JWT secrets, or connect to a database/CP
+4. **Mesh runtime** (mesh mode) — the same `MeshRuntimeConfig` admission `run` uses (protocol, stock xDS transport posture, topology). When the protocol is `file`, or is inferred from a localized `{version?, mesh}` document, Ferrum CP URLs and CP/DP JWT credentials are **not** required. `-c/--spec` supplies the local policy document for `file` and `stock_xds` validation and does not require a duplicate `FERRUM_MESH_FILE_CONFIG_PATH`; stock xDS uses its stricter policy-only loader and rejects documents that declare control-plane-owned services or workloads. Inference is shape-aware only: a document whose top-level keys are an optional `version` plus a `mesh` mapping may select file validation; a gateway resources document does not. Format is still extension-based (no content sniffing), and the document is loaded through the same bounded file reader and `deny_unknown_fields` parser as startup. Explicit `native`/`xds` plus a localized slice spec, or distinct `--spec` and `FERRUM_MESH_FILE_CONFIG_PATH` values, fail closed with a fixed diagnostic. Identity/CA environment is still required — this does not weaken workload identity or production guardrails.
 
 ### Examples
 
@@ -171,6 +172,9 @@ ferrum-edge validate --settings /etc/ferrum/ferrum.conf --spec /etc/ferrum/resou
 
 # Validate a specific mode without mutating the shell environment
 ferrum-edge validate -m file -c resources.yaml
+
+# Validate a localized mesh slice without Ferrum CP URLs or JWT
+ferrum-edge validate -m mesh -c slice.yaml
 
 # Use in CI/CD pipeline
 ferrum-edge validate --spec resources.yaml || exit 1

@@ -55,7 +55,40 @@ returns green — the suite stays runnable on a developer machine with no Docker
 The skip/fail decision lives in `common::containers::fail_in_ci_else_skip`: in CI
 (`CI` env var set, which GitHub Actions sets automatically) a container that
 fails to start is a **hard failure**, so a broken image/setup fails the job
-rather than silently passing.
+rather than silently passing. Host-port bind collisions are retried with a
+fresh port (see below); they are not converted into skips.
+
+## Host port allocation (#3999)
+
+Every testcontainer in this suite that publishes a host port goes through
+`common/host_ports.rs`:
+
+| Container | Image ports mapped on the host |
+| --- | --- |
+| Consul | `8500` |
+| OpenLDAP | `389` |
+| Redpanda | `9093` (advertised Kafka listener) |
+| MySQL | `3306` |
+| Hydra | `4444` (public) and `4445` (admin); login/consent URLs also consume unique host ports so they cannot collide with the mapped listeners |
+
+Docker auto-assignment and `127.0.0.1:0` both land inside
+`/proc/sys/net/ipv4/ip_local_port_range`. The probe socket is then released, an
+unrelated ephemeral connection or sibling container can claim the number, and
+Docker fails with `port is already allocated` — the same bind-drop-rebind
+family as issue #3993.
+
+The allocator therefore:
+
+1. Probes candidate ports **outside** the kernel ephemeral source range (Linux:
+   `/proc/sys/net/ipv4/ip_local_port_range`; elsewhere the IANA dynamic range).
+2. Retries container start **only** when the error is a host-port bind
+   collision (`port is already allocated`, `address already in use`,
+   `EADDRINUSE`), with a fresh port each time and a bound attempt budget.
+3. Returns every other start failure immediately so an image-pull or wait
+   condition failure still hard-fails in CI.
+
+Do not pin a single fixed host port (that trades a race for a hard collision
+under parallel jobs) and do not blanket-retry unrelated container errors.
 
 ## Container images (free / OSS)
 
@@ -65,7 +98,7 @@ rather than silently passing.
 | OpenLDAP | `osixia/openldap:1.5.0` | base `dc=example,dc=org`; test tree seeded via `ldapadd` exec (readiness handled by retry) |
 | Redpanda | `redpandadata/redpanda:v24.2.4` | Kafka API on external listener `127.0.0.1:<mapped-port>`; auto-topic-create disabled; readiness via librdkafka metadata; topics created with `rpk` |
 | MySQL | `mysql:8.4` | isolated `ferrum` database; readiness polled with the same SQLx Any driver used by migrations/runtime persistence |
-| Hydra | `oryd/hydra:v2.2.0` | `serve all --dev` with `DSN=memory`; ephemeral host ports for public (4444) and admin (4445); opaque access tokens; clients seeded via admin API; login/consent accepted through admin challenge APIs (no external IdP). Readiness polled via OIDC discovery + admin API |
+| Hydra | `oryd/hydra:v2.2.0` | `serve all --dev` with `DSN=memory`; host ports allocated outside the ephemeral range for public (4444) and admin (4445); opaque access tokens; clients seeded via admin API; login/consent accepted through admin challenge APIs (no external IdP). Readiness polled via OIDC discovery + admin API |
 
 Readiness is confirmed by **active polling** (Consul leader endpoint; LDAP
 `ldapadd` retry; Redpanda metadata fetch; a MySQL connection; Hydra discovery),
@@ -194,7 +227,10 @@ cloud-SDK variant):
 
 1. Add a `start_<svc>_container()` (+ a small fixture struct) to
    `common/containers.rs` (or a dedicated `common/<svc>.rs` module as with
-   Hydra). Prefer **active readiness polling** over a log-line wait. Seed
+   Hydra). Pin every published host port with `allocate_host_port()` +
+   `with_mapped_port`, and wrap Docker `.start()` in
+   `retry_on_host_port_collision` so only bind collisions retry. Prefer
+   **active readiness polling** over a log-line wait. Seed
    fixtures via the container's API or an `exec` (see the Consul register
    helper, the LDAP `ldapadd` seeder, the Redpanda `rpk` helper, and the Hydra
    admin client seeder).

@@ -1532,20 +1532,19 @@ async fn functional_protocol_validation_trace_rejected_http3() {
     let echo_task = tokio::spawn(start_header_echo_server_on(echo_listener));
     sleep(Duration::from_millis(150)).await;
 
-    let https_reservation = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let https_port = https_reservation.local_addr().unwrap().port();
-    drop(https_reservation);
-
     let mut gateway = TestGateway::builder()
         .mode_file(build_config(echo_port, false))
         .log_level("warn")
         .env("FERRUM_ENABLE_HTTP3", "true")
-        .env("FERRUM_PROXY_HTTPS_PORT", https_port.to_string())
+        .env_ephemeral_port("FERRUM_PROXY_HTTPS_PORT")
         .env("FERRUM_FRONTEND_TLS_CERT_PATH", "tests/certs/server.crt")
         .env("FERRUM_FRONTEND_TLS_KEY_PATH", "tests/certs/server.key")
         .spawn()
         .await
         .expect("start gateway with h3");
+    let https_port = gateway
+        .env_port("FERRUM_PROXY_HTTPS_PORT")
+        .expect("harness-allocated HTTPS port");
 
     let client = Http3Client::insecure().expect("H3 client");
     let url = format!("https://localhost:{https_port}/");

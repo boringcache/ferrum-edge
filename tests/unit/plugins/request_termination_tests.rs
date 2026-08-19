@@ -349,6 +349,163 @@ async fn test_plain_text_response() {
     }
 }
 
+#[tokio::test]
+async fn test_json_object_message_is_emitted_as_body() {
+    // Issue #3930: content_type JSON + a JSON object message must not wrap the
+    // object inside the legacy {message,status_code} envelope.
+    let plugin = RequestTermination::new(&json!({
+        "status_code": 503,
+        "content_type": "application/json",
+        "message": r#"{"error":"scheduled-maintenance"}"#
+    }))
+    .unwrap();
+    let mut ctx = make_ctx("GET", "/");
+
+    match plugin.on_request_received(&mut ctx).await {
+        PluginResult::Reject {
+            status_code,
+            body,
+            headers,
+        } => {
+            assert_eq!(status_code, 503);
+            assert_eq!(headers.get("content-type").unwrap(), "application/json");
+            assert_eq!(body, r#"{"error":"scheduled-maintenance"}"#);
+            let parsed: serde_json::Value = serde_json::from_str(&body).unwrap();
+            assert_eq!(parsed["error"], "scheduled-maintenance");
+            assert!(parsed.get("message").is_none());
+            assert!(parsed.get("status_code").is_none());
+        }
+        other => panic!("Expected Reject, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn test_json_array_message_is_emitted_as_body() {
+    let plugin = RequestTermination::new(&json!({
+        "content_type": "application/hal+json; charset=utf-8",
+        "message": r#"[{"error":"scheduled-maintenance"}]"#
+    }))
+    .unwrap();
+    let mut ctx = make_ctx("GET", "/");
+
+    match plugin.on_request_received(&mut ctx).await {
+        PluginResult::Reject { body, headers, .. } => {
+            assert_eq!(
+                headers.get("content-type").unwrap(),
+                "application/hal+json; charset=utf-8"
+            );
+            assert_eq!(body, r#"[{"error":"scheduled-maintenance"}]"#);
+        }
+        other => panic!("Expected Reject, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn test_malformed_json_message_fails_safe_to_envelope() {
+    let plugin = RequestTermination::new(&json!({
+        "status_code": 503,
+        "content_type": "application/json",
+        "message": "{invalid"
+    }))
+    .expect("malformed JSON message must not panic or reject construction");
+    let mut ctx = make_ctx("GET", "/");
+
+    match plugin.on_request_received(&mut ctx).await {
+        PluginResult::Reject {
+            status_code,
+            body,
+            headers,
+        } => {
+            assert_eq!(status_code, 503);
+            assert_eq!(headers.get("content-type").unwrap(), "application/json");
+            let parsed: serde_json::Value =
+                serde_json::from_str(&body).expect("fail-safe body must be valid JSON");
+            assert_eq!(parsed["message"], "{invalid");
+            assert_eq!(parsed["status_code"], 503);
+        }
+        other => panic!("Expected Reject, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn test_duplicate_key_json_message_fails_safe_to_envelope() {
+    let plugin = RequestTermination::new(&json!({
+        "content_type": "application/json",
+        "message": r#"{"error":"first","error":"second"}"#
+    }))
+    .expect("duplicate-key JSON must not panic or reject construction");
+    let mut ctx = make_ctx("GET", "/");
+
+    match plugin.on_request_received(&mut ctx).await {
+        PluginResult::Reject { body, .. } => {
+            let parsed: serde_json::Value =
+                serde_json::from_str(&body).expect("fail-safe body must be valid JSON");
+            assert_eq!(parsed["message"], r#"{"error":"first","error":"second"}"#);
+            assert_eq!(parsed["status_code"], 503);
+        }
+        other => panic!("Expected Reject, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn test_pretty_printed_json_message_is_compacted() {
+    let plugin = RequestTermination::new(&json!({
+        "content_type": "application/json",
+        "message": "{\n  \"error\": \"scheduled-maintenance\"\n}"
+    }))
+    .unwrap();
+    let mut ctx = make_ctx("GET", "/");
+
+    match plugin.on_request_received(&mut ctx).await {
+        PluginResult::Reject { body, .. } => {
+            assert_eq!(body, r#"{"error":"scheduled-maintenance"}"#);
+        }
+        other => panic!("Expected Reject, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn test_json_looking_plain_text_is_not_parsed() {
+    // Non-JSON content types never parse `message` as JSON, even when the
+    // text would be a valid JSON object.
+    let plugin = RequestTermination::new(&json!({
+        "content_type": "text/plain",
+        "message": r#"{"error":"scheduled-maintenance"}"#
+    }))
+    .unwrap();
+    let mut ctx = make_ctx("GET", "/");
+
+    match plugin.on_request_received(&mut ctx).await {
+        PluginResult::Reject { body, headers, .. } => {
+            assert_eq!(headers.get("content-type").unwrap(), "text/plain");
+            assert_eq!(body, r#"{"error":"scheduled-maintenance"}"#);
+        }
+        other => panic!("Expected Reject, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn test_xml_json_looking_message_stays_in_xml_envelope() {
+    let plugin = RequestTermination::new(&json!({
+        "content_type": "application/xml",
+        "message": r#"{"error":"scheduled-maintenance"}"#
+    }))
+    .unwrap();
+    let mut ctx = make_ctx("GET", "/");
+
+    match plugin.on_request_received(&mut ctx).await {
+        PluginResult::Reject { body, headers, .. } => {
+            assert_eq!(headers.get("content-type").unwrap(), "application/xml");
+            assert!(body.contains("<?xml version=\"1.0\"?>"));
+            assert!(body.contains(
+                "<message>{&quot;error&quot;:&quot;scheduled-maintenance&quot;}</message>"
+            ));
+            assert!(body.contains("<status_code>503</status_code>"));
+        }
+        other => panic!("Expected Reject, got {other:?}"),
+    }
+}
+
 // === Path prefix trigger ===
 
 #[tokio::test]

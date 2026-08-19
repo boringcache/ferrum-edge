@@ -267,12 +267,10 @@ fn start_gateway_with_extra_env(
         .env("FERRUM_PROXY_HTTP_PORT", http_port.to_string())
         .env("FERRUM_ADMIN_HTTP_PORT", admin_http_port.to_string())
         .env("FERRUM_ADMIN_HTTPS_PORT", "0")
-        // Match the shared functional harness: the production auto-sized
-        // default enables SO_REUSEPORT, so parallel subprocess tests can join
-        // one released ephemeral proxy port and kernel-distribute a request to
-        // the wrong gateway. One accept socket makes the second binder fail
-        // and lets the retry loop choose a genuinely free port. An explicit
-        // test override below remains authoritative.
+        // Match the shared functional harness: production accept workers share
+        // one exclusive listen socket, so a colliding second binder fails
+        // closed. Pinning one accept task keeps the spawn retry's EADDRINUSE
+        // path simple. An explicit test override below remains authoritative.
         .env("FERRUM_ACCEPT_THREADS", "1")
         // Prove readiness through this exact child instead of accepting any
         // parallel gateway that happens to answer after bind/drop selection.
