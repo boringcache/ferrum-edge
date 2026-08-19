@@ -28,6 +28,7 @@ async fn test_stdout_logging_plugin_creation() {
     assert!(!plugin.is_auth_plugin());
     assert!(!plugin.requires_request_body_buffering());
     assert!(!plugin.requires_response_body_buffering());
+    assert!(plugin.requires_ws_disconnect_hooks());
 }
 
 #[tokio::test]

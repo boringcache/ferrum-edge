@@ -12,12 +12,12 @@ Every classifier funnels its result into [`crate::retry::ErrorClass`](../src/ret
 
 | Variant | Meaning | `request_reached_wire`? |
 |---|---|---|
-| `ConnectionRefused` | TCP connect refused (port not listening, firewall RST). Includes connect-phase RSTs (functionally indistinguishable from ECONNREFUSED). | `false` (pre-wire) |
+| `ConnectionRefused` | TCP connect refused (port not listening, firewall RST). Includes connect-phase RSTs (functionally indistinguishable from ECONNREFUSED). A TLS handshake that fails *after* TCP connect — including `rustls::Error` wrapped as `io::Error` with `ConnectionReset` — is **not** this class; that is `TlsError`. | `false` (pre-wire) |
 | `ConnectionTimeout` | TCP connect did not complete before the configured timeout. | `false` (pre-wire) |
 | `ConnectionReset` | Mid-stream RST received after the connection was established. | `true` (post-wire) |
-| `ConnectionClosed` | Peer sent FIN before a response was completed; broken pipe; aborted connection. | `true` (post-wire) |
+| `ConnectionClosed` | Peer sent FIN before a response was completed; broken pipe; aborted connection; post-connect `UnexpectedEof` / hyper incomplete message (truncated HTTP body). | `true` (post-wire) |
 | `DnsLookupError` | Hostname could not be resolved. | `false` (pre-wire) |
-| `TlsError` | TLS or DTLS handshake failed (certificate, ALPN, alert). | `false` (pre-wire) |
+| `TlsError` | TLS or DTLS handshake failed (certificate, ALPN, alert, rustls error under an `io::Error` after TCP connected). | `false` (pre-wire) |
 | `ReadWriteTimeout` | Backend read or write exceeded the per-direction watermark. | `true` (post-wire) |
 | `ProtocolError` | HTTP/2 or HTTP/3 protocol-level error after a stream is opened (stream reset, GOAWAY, RST_STREAM), or RFC 6455 WebSocket protocol violation. NOTE: gRPC h2c handshake failure classifies as `ConnectionRefused` (pre-wire), NOT `ProtocolError` — see the gRPC kind table below. | `true` (post-wire) |
 | `ResponseBodyTooLarge` | Backend response exceeded the configured maximum size. | `true` (post-wire) |
@@ -43,8 +43,8 @@ Each dispatcher hands its native error type to a classifier; every classifier re
 
 | Protocol | Classifier | Input | Technique |
 |---|---|---|---|
-| HTTP/1.1 (reqwest) | [`classify_reqwest_error`](../src/retry.rs) | `&reqwest::Error` | `is_connect()` / `is_timeout()` typed methods → typed source-chain walk for io/TLS/DNS → bounded substring fallback inside the `is_connect()` branch |
-| HTTP/2 (direct pool acquisition) | [`classify_http2_pool_error`](../src/proxy/http2_pool.rs) | `&Http2PoolError` (typed enum) | Pattern match on typed variants → typed source-chain walk (io/hyper/rustls) → minimal Display fallback |
+| HTTP/1.1 (reqwest) | [`classify_reqwest_error`](../src/retry.rs) | `&reqwest::Error` | `is_connect()` / `is_timeout()` typed methods → typed source-chain walk for io/TLS/DNS. Connect-phase RST/refused collapse to `ConnectionRefused` **unless** a `rustls::Error` is in the io source chain (then `TlsError`). Post-connect `UnexpectedEof` / incomplete message → `ConnectionClosed`. Bounded substring fallback inside the `is_connect()` branch |
+| HTTP/2 (direct pool acquisition) | [`classify_http2_pool_error`](../src/proxy/http2_pool.rs) | `&Http2PoolError` (typed enum) | Pattern match on typed variants. `BackendUnavailableSource::Tls` is a construction-site handshake-phase signal and classifies as `TlsError` (except TimedOut → `ConnectionTimeout` and port exhaustion). Other io walks peek rustls-under-io before the connect-phase RST collapse. |
 | HTTP/2 (pooled request send) | [`classify_pooled_h2_send_request_error`](../src/proxy/http2_pool.rs) | `&hyper::Error` | Hyper typed predicates → post-wire io source-chain walk → conservative `ProtocolError` fallback |
 | HTTP/3 (native pool) | [`classify_http3_error`](../src/http3/client.rs) | `&dyn Error` | Typed walk for `quinn::ConnectionError` / `quinn::ConnectError` / `io::Error` → anchored substring fallback for `h3::Error` Display |
 | gRPC | [`classify_grpc_proxy_error`](../src/retry.rs) | `&GrpcProxyError` (typed enum with kinds) | Pattern match on `BackendUnavailable.kind: GrpcBackendUnavailableKind` → typed `is_port_exhaustion` source walk → no message substring matching |
@@ -120,9 +120,15 @@ The eager-buffer path (`buffered_backend_response_from_body_read` in [`src/proxy
 
 A pre-wire class is impossible on the eager-buffer path (`classify_reqwest_error` only returns connect-class verdicts under `e.is_connect()`), but one is coerced to `ConnectionReset` anyway so the documented `connection_error == !request_reached_wire(error_class)` boundary holds even if the classifier changes. Dispatch-level failures keep their classified pre-wire label so `retry_on_connect_failure` can still rotate to another target.
 
+A backend FIN (or `UnexpectedEof`) before a complete HTTP body is `ConnectionClosed`. That class is post-wire, the same as the previous `RequestError` catch-all: `request_reached_wire` is `true` for both, so `BackendResponse::connection_error` stays `false` and `retry_on_connect_failure` does not replay the request. Non-idempotent methods are therefore not retried via the connect-failure path. Circuit-breaker accounting *does* change: `error_class_is_post_wire_backend_failure` includes `ConnectionClosed` and not `RequestError`, so a truncated body that had been a phantom success (HTTP 200 + catch-all class) now trips the breaker as a backend failure. When the public status is already 502 and 502 is in `failure_status_codes`, the breaker already trips via status.
+
 ## WebSocket graceful close
 
 [`classify_boxed_error`](../src/retry.rs) downcasts `tokio_tungstenite::tungstenite::Error::ConnectionClosed` and `Error::AlreadyClosed` to `ErrorClass::GracefulRemoteClose`. These represent an orderly RFC 6455 close (the peer sent a Close frame, or we wrote after observing one) and must NOT inflate transport-failure metrics. `Error::Protocol(_)` maps to `ErrorClass::ProtocolError`.
+
+A `Capacity` / `FrameTooLong` error whose advertised length cannot fit in 32 bits is treated as protocol junk (`ProtocolError`), not `RequestBodyTooLarge` / `ResponseBodyTooLarge`. Legitimate oversized frames under a configured ceiling keep the size-limit class and still send RFC 6455 Close 1009.
+
+Handshake failures already populate `TransactionSummary.error_class` on the HTTP `log()` row. After a successful 101, in-session faults are classified into `WsDisconnectContext.error_class`. `stdout_logging` implements `on_ws_disconnect` and writes a second HTTP-family `TransactionSummary` JSON line (status 101, `error_class` from the disconnect context, BASE schema) so operators grepping access logs for `error_class` see the session-end class. `filter.errors_only` matches because `is_terminal_failure` is true when `error_class` is set. This is not the `websocket_disconnect` capability family used by `ws_logging`.
 
 `GracefulRemoteClose` is shared with the HTTP/3 graceful-close path: operators see one label whether the peer closed an H3 connection with `H3_NO_ERROR` or a WS connection with a normal Close frame.
 

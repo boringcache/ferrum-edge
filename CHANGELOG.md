@@ -136,6 +136,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- HTTP backend error classification now labels three previously misleading
+  failure modes correctly. An HTTPS backend whose origin answers plaintext
+  (TLS handshake after TCP connect) is `tls_error`, not `connection_refused`.
+  The connect-phase RST/refused collapse is unchanged when no rustls error is
+  in the source chain. A backend FIN before a complete HTTP body is
+  `connection_closed`, not the `request_error` catch-all. WebSocket
+  post-upgrade protocol junk is `protocol_error`, a backend RST after upgrade
+  is `connection_reset`, and `stdout_logging` now writes the session-end
+  `error_class` on a 101 `TransactionSummary` via `on_ws_disconnect`.
+  `TlsError` remains pre-wire, so `retry_on_connect_failure` is unchanged
+  for the handshake case; `connection_closed` is post-wire like
+  `request_error`, so connect-failure retry still does not replay
+  non-idempotent requests.
+
 - WAF `mode: enforce` admission now counts `on_body_too_large: block` as a
   reachable enforcement path (issue #4006). That setting already rejected
   oversize governed HTTP bodies and WebSocket application messages whenever

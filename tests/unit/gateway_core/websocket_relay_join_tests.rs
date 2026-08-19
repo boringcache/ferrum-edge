@@ -492,6 +492,43 @@ fn test_global_capacity_close_for_error_selects_1009() {
     );
 }
 
+#[test]
+fn test_ws_capacity_error_class_junk_length_is_protocol_error() {
+    let junk = (u32::MAX as usize).saturating_add(1);
+    assert_eq!(
+        ferrum_edge::_test_support::ws_capacity_error_class_for_test(
+            junk,
+            true,
+        ),
+        ferrum_edge::retry::ErrorClass::ProtocolError
+    );
+    assert_eq!(
+        ferrum_edge::_test_support::ws_capacity_error_class_for_test(
+            junk,
+            false,
+        ),
+        ferrum_edge::retry::ErrorClass::ProtocolError
+    );
+}
+
+#[test]
+fn test_ws_capacity_error_class_real_oversize_stays_size_limit() {
+    assert_eq!(
+        ferrum_edge::_test_support::ws_capacity_error_class_for_test(
+            64,
+            true,
+        ),
+        ferrum_edge::retry::ErrorClass::RequestBodyTooLarge
+    );
+    assert_eq!(
+        ferrum_edge::_test_support::ws_capacity_error_class_for_test(
+            64,
+            false,
+        ),
+        ferrum_edge::retry::ErrorClass::ResponseBodyTooLarge
+    );
+}
+
 /// Idle-timeout arms must publish the shared policy Close before cancelling so
 /// both halves attempt a meaningful teardown instead of Close(None)/1006.
 #[test]

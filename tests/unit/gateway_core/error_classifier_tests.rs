@@ -150,6 +150,41 @@ fn test_h2_pool_typed_tls_source_is_tls_error() {
 }
 
 #[test]
+fn test_h2_pool_tls_marker_with_connection_reset_is_tls_error_not_refused() {
+    // Construction site already marked this as TLS. A RST during the
+    // handshake (plaintext origin answering ClientHello) must not collapse
+    // to ConnectionRefused.
+    let io_err = io::Error::new(
+        io::ErrorKind::ConnectionReset,
+        rustls::Error::HandshakeNotComplete,
+    );
+    let err = Http2PoolError::BackendUnavailable {
+        message: "TLS handshake failed".to_string(),
+        source: Some(BackendUnavailableSource::Tls(io_err)),
+    };
+    let class = classify_http2_pool_error(&err);
+    assert_eq!(class, ErrorClass::TlsError);
+    assert!(
+        !request_reached_wire(class),
+        "TlsError stays pre-wire, so retry_on_connect_failure is unchanged \
+         versus the previous ConnectionRefused label"
+    );
+}
+
+#[test]
+fn test_h2_pool_io_reset_wrapping_rustls_is_tls_error_not_refused() {
+    let io_err = io::Error::new(
+        io::ErrorKind::ConnectionReset,
+        rustls::Error::HandshakeNotComplete,
+    );
+    let err = Http2PoolError::BackendUnavailable {
+        message: "opaque".to_string(),
+        source: Some(BackendUnavailableSource::Io(io_err)),
+    };
+    assert_eq!(classify_http2_pool_error(&err), ErrorClass::TlsError);
+}
+
+#[test]
 fn test_h2_pool_dns_marker_classifies_as_dns_lookup() {
     // DNS resolution marker — no concrete typed source.
     let err = Http2PoolError::BackendUnavailable {
@@ -342,6 +377,18 @@ fn test_h3_quinn_reset() {
 fn test_h3_quinn_locally_closed() {
     let err = quinn::ConnectionError::LocallyClosed;
     assert_eq!(classify_http3_error(&err), ErrorClass::ConnectionClosed);
+}
+
+#[test]
+fn test_h3_io_unexpected_eof_is_connection_closed() {
+    let err = io::Error::new(
+        io::ErrorKind::UnexpectedEof,
+        "failed to fill whole buffer",
+    );
+    assert_eq!(
+        classify_http3_error(&err),
+        ErrorClass::ConnectionClosed
+    );
 }
 
 #[test]

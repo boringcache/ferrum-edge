@@ -18,10 +18,13 @@ use crate::scaffolding::backends::{
 use crate::scaffolding::certs::TestCa;
 use crate::scaffolding::harness::GatewayHarness;
 use crate::scaffolding::ports::{reserve_port, unbound_port};
-use crate::scaffolding::{file_mode_yaml_for_backend, file_mode_yaml_for_backend_with};
+use crate::scaffolding::{
+    file_mode_yaml_for_backend, file_mode_yaml_for_backend_with, to_file_mode_yaml,
+};
 use reqwest::StatusCode;
 use serde_json::json;
 use std::time::{Duration, Instant};
+use tokio::io::AsyncWriteExt;
 
 /// Fetch captured gateway logs and fail the test if they are empty — the
 /// harness silently returns an empty string when `capture_output()` was not
@@ -38,41 +41,49 @@ fn require_logs(harness: &GatewayHarness) -> String {
     logs
 }
 
-fn has_body_error_signal(logs: &str) -> bool {
-    // The gateway logs body-read errors as either a structured
-    // `body_error_class` (via stdout_logging) or a proxy-level
-    // "Failed to read backend response body" / "error decoding response
-    // body" warning when hyper notices the truncated Content-Length. Any
-    // of these prove the gateway noticed the incomplete body.
-    logs.contains("body_error_class")
-        || logs.contains("IncompleteBody")
-        || logs.contains("unexpected end of file")
-        || logs.contains("Incomplete")
-        || logs.contains("ClientDisconnect")
-        || logs.contains("Failed to read backend response body")
-        || logs.contains("error decoding response body")
+fn has_json_error_class(logs: &str, class: &str) -> bool {
+    let error_class = format!("\"error_class\":\"{class}\"");
+    let body_error_class = format!("\"body_error_class\":\"{class}\"");
+    logs.contains(&error_class) || logs.contains(&body_error_class)
 }
 
-async fn collect_body_error_logs(harness: &GatewayHarness) -> String {
-    if let Ok(url) = harness.admin_url("/health").parse::<reqwest::Url>() {
-        let client = reqwest::Client::builder()
-            .timeout(Duration::from_millis(500))
-            .build()
-            .expect("reqwest client");
-        for _ in 0..2 {
-            let _ = client.get(url.clone()).send().await;
-            tokio::time::sleep(Duration::from_millis(100)).await;
+fn file_mode_yaml_with_stdout_logging(port: u16, overrides: serde_json::Value) -> String {
+    let mut proxy = json!({
+        "id": "scripted",
+        "listen_path": "/api",
+        "backend_scheme": "http",
+        "backend_host": "127.0.0.1",
+        "backend_port": port,
+        "strip_listen_path": true,
+        "backend_connect_timeout_ms": 2000,
+        "backend_read_timeout_ms": 5000,
+        "backend_write_timeout_ms": 5000,
+    });
+    if let (Some(proxy_obj), Some(overrides_obj)) =
+        (proxy.as_object_mut(), overrides.as_object())
+    {
+        for (k, v) in overrides_obj {
+            proxy_obj.insert(k.clone(), v.clone());
         }
     }
+    let config = json!({
+        "version": "1",
+        "proxies": [proxy],
+        "consumers": [],
+        "upstreams": [],
+        "plugin_configs": [{
+            "id": "stdout-access",
+            "plugin_name": "stdout_logging",
+            "scope": "global",
+            "enabled": true,
+            "config": {},
+        }],
+    });
+    to_file_mode_yaml(&config)
+}
 
-    let deadline = Instant::now() + Duration::from_secs(5);
-    loop {
-        let logs = require_logs(harness);
-        if has_body_error_signal(&logs) || Instant::now() >= deadline {
-            return logs;
-        }
-        tokio::time::sleep(Duration::from_millis(100)).await;
-    }
+fn ws_proxy_url(harness: &GatewayHarness, path: &str) -> String {
+    harness.proxy_url(path).replacen("http://", "ws://", 1)
 }
 
 // ────────────────────────────────────────────────────────────────────────────
@@ -395,7 +406,7 @@ async fn backend_close_mid_body_populates_body_error_class() {
         .spawn()
         .expect("spawn backend");
 
-    let yaml = file_mode_yaml_for_backend(backend_port);
+    let yaml = file_mode_yaml_with_stdout_logging(backend_port, json!({}));
     let harness = GatewayHarness::builder()
         .file_config(yaml)
         .log_level("info")
@@ -422,11 +433,15 @@ async fn backend_close_mid_body_populates_body_error_class() {
         }
     }
 
-    let logs = collect_body_error_logs(&harness).await;
-    let has_body_error = has_body_error_signal(&logs);
+    let logs = harness
+        .wait_for_log_contains(
+            |logs| has_json_error_class(logs, "connection_closed"),
+            Duration::from_secs(8),
+        )
+        .await;
     assert!(
-        has_body_error,
-        "expected body-error signal in logs; got:\n{logs}"
+        has_json_error_class(&logs, "connection_closed"),
+        "truncated body must classify as connection_closed, not request_error; got:\n{logs}"
     );
 }
 
@@ -1562,4 +1577,150 @@ async fn a2a_retry_configured_json_agent_card_is_still_rewritten() {
     );
     backend.assert_no_matcher_mismatches().await;
     backend.assert_no_step_errors().await;
+}
+
+// ────────────────────────────────────────────────────────────────────────────
+// HTTPS backend against a plaintext origin → tls_error, not connection_refused.
+// ────────────────────────────────────────────────────────────────────────────
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore]
+async fn https_backend_plaintext_origin_classifies_as_tls_error() {
+    let reservation = reserve_port().await.expect("reserve port");
+    let backend_port = reservation.port;
+    let _backend = ScriptedTcpBackend::builder(reservation.into_listener())
+        .step(TcpStep::ReadExact(5))
+        .step(TcpStep::Write(
+            b"HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\n\r\n".to_vec(),
+        ))
+        .step(TcpStep::Drop)
+        .spawn()
+        .expect("spawn plaintext origin");
+
+    let yaml = file_mode_yaml_with_stdout_logging(
+        backend_port,
+        json!({
+            "backend_scheme": "https",
+            "backend_host": "localhost",
+            "backend_tls_verify_server_cert": false,
+        }),
+    );
+    let harness = GatewayHarness::builder()
+        .file_config(yaml)
+        .log_level("info")
+        .capture_output()
+        .spawn()
+        .await
+        .expect("spawn gateway");
+
+    let client = harness.http_client().expect("client");
+    let resp = client
+        .get(&harness.proxy_url("/api/tls"))
+        .await
+        .expect("gateway returns a response");
+    assert_eq!(resp.status, StatusCode::BAD_GATEWAY);
+
+    let logs = harness
+        .wait_for_log_contains(
+            |logs| has_json_error_class(logs, "tls_error"),
+            Duration::from_secs(8),
+        )
+        .await;
+    assert!(
+        has_json_error_class(&logs, "tls_error"),
+        "HTTPS to a plaintext origin must classify as tls_error; got:\n{logs}"
+    );
+    assert!(
+        !has_json_error_class(&logs, "connection_refused"),
+        "TLS handshake after TCP connect must not be labeled connection_refused; got:\n{logs}"
+    );
+}
+
+// ────────────────────────────────────────────────────────────────────────────
+// WebSocket post-upgrade protocol junk → protocol_error on TransactionSummary.
+// ────────────────────────────────────────────────────────────────────────────
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore]
+async fn websocket_post_upgrade_junk_sets_protocol_error_class() {
+    let reservation = reserve_port().await.expect("reserve port");
+    let backend_port = reservation.port;
+    let _backend = ScriptedHttp1Backend::builder(reservation.into_listener())
+        .step(HttpStep::ExpectRequest(RequestMatcher::any()))
+        .step(HttpStep::RespondWebSocketUpgrade)
+        .step(HttpStep::HoldUntilPeerClose)
+        .spawn()
+        .expect("spawn websocket backend");
+
+    let yaml = file_mode_yaml_with_stdout_logging(backend_port, json!({}));
+    let harness = GatewayHarness::builder()
+        .file_config(yaml)
+        .log_level("info")
+        .capture_output()
+        .spawn()
+        .await
+        .expect("spawn gateway");
+
+    let url = ws_proxy_url(&harness, "/api/chat");
+    let (ws, _) = tokio_tungstenite::connect_async(&url)
+        .await
+        .expect("websocket upgrade through gateway");
+    let mut raw = ws.into_inner();
+    raw.write_all(b"\x00\xffJUNKJUNKNOTAFRAME")
+        .await
+        .expect("write protocol junk");
+    let _ = raw.flush().await;
+    drop(raw);
+
+    let logs = harness
+        .wait_for_log_contains(
+            |logs| has_json_error_class(logs, "protocol_error"),
+            Duration::from_secs(8),
+        )
+        .await;
+    assert!(
+        has_json_error_class(&logs, "protocol_error"),
+        "post-upgrade WebSocket junk must set error_class=protocol_error; got:\n{logs}"
+    );
+}
+
+// ────────────────────────────────────────────────────────────────────────────
+// WebSocket backend RST after upgrade → connection_reset on TransactionSummary.
+// ────────────────────────────────────────────────────────────────────────────
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore]
+async fn websocket_backend_rst_after_upgrade_sets_connection_reset_class() {
+    let reservation = reserve_port().await.expect("reserve port");
+    let backend_port = reservation.port;
+    let _backend = ScriptedHttp1Backend::builder(reservation.into_listener())
+        .step(HttpStep::ExpectRequest(RequestMatcher::any()))
+        .step(HttpStep::RespondWebSocketUpgrade)
+        .step(HttpStep::Reset)
+        .spawn()
+        .expect("spawn websocket backend");
+
+    let yaml = file_mode_yaml_with_stdout_logging(backend_port, json!({}));
+    let harness = GatewayHarness::builder()
+        .file_config(yaml)
+        .log_level("info")
+        .capture_output()
+        .spawn()
+        .await
+        .expect("spawn gateway");
+
+    let url = ws_proxy_url(&harness, "/api/chat");
+    let (mut ws, _) = tokio_tungstenite::connect_async(&url)
+        .await
+        .expect("websocket upgrade through gateway");
+    let _ = futures_util::StreamExt::next(&mut ws).await;
+    drop(ws);
+
+    let logs = harness
+        .wait_for_log_contains(
+            |logs| has_json_error_class(logs, "connection_reset"),
+            Duration::from_secs(8),
+        )
+        .await;
+    assert!(
+        has_json_error_class(&logs, "connection_reset"),
+        "backend RST after WebSocket upgrade must set error_class=connection_reset; got:\n{logs}"
+    );
 }
