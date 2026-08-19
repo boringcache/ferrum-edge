@@ -304,6 +304,49 @@ fn an_unusable_relay_identity_is_refused_at_the_publisher() {
     }
 }
 
+/// A SET but unusable relay identity is distinguishable from an ABSENT one
+/// (issue #4021, follow-up 2).
+///
+/// Both normalize to `None` and both refuse every ACTIVE publication, but only
+/// one is an operator misconfiguration — and the startup `warn!` in
+/// `arm_mesh_runtime_startup` fires only when the env var is ABSENT. Without
+/// this distinction a mistyped `FERRUM_MESH_NODE_WAYPOINT_RELAY_POD_UID`
+/// leaves the operator with nothing but the steering reconcile's generic
+/// "active generation could not be published" while the UDP relay is
+/// permanently dark. The constructor emits its own `warn!` for this case; the
+/// flag is the observable half of that decision.
+#[test]
+fn a_set_but_rejected_relay_identity_is_distinguishable_from_an_absent_one() {
+    let registry = tempfile::tempdir().expect("registry dir");
+
+    assert!(
+        !RegistryDirReplySourcePublisher::new(registry.path(), None).relay_pod_uid_rejected(),
+        "an absent identity is not a rejected one; the startup warning already covers it"
+    );
+    assert!(
+        !RegistryDirReplySourcePublisher::new(registry.path(), Some(RELAY_POD_UID))
+            .relay_pod_uid_rejected(),
+        "an accepted identity must not report a rejection"
+    );
+
+    for uid in ["", "   ", "../escape", "a/b", "UPPER", "-lead", "trail-"] {
+        let publisher = RegistryDirReplySourcePublisher::new(registry.path(), Some(uid));
+        assert!(
+            publisher.relay_pod_uid_rejected(),
+            "a set-but-unusable relay identity ({uid:?}) must be reported as REJECTED, not \
+             silently indistinguishable from unset"
+        );
+    }
+
+    // A rejection must still leave the publication behavior of "no identity"
+    // exactly as it was: refuse ACTIVE, keep INACTIVE withdrawal provable.
+    let publisher = RegistryDirReplySourcePublisher::new(registry.path(), Some("UPPER"));
+    assert!(publisher.publish(&[], true).is_err());
+    publisher
+        .publish(&[], false)
+        .expect("withdrawal must stay provable with a rejected identity");
+}
+
 fn source(ip: &str, port: u16) -> NodeWaypointUdpSteerDestination {
     NodeWaypointUdpSteerDestination {
         ip: ip.parse::<IpAddr>().expect("reply source address"),

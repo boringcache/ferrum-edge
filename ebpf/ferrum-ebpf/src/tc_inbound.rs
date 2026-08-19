@@ -14,7 +14,9 @@
 //!
 //! The TCP arm admits `configured node source + relay socket mark`. Both of
 //! those are attributes of a packet, and under this datapath's threat model —
-//! a same-node workload holding `CAP_NET_ADMIN` in the HOST network namespace —
+//! a same-node workload in the HOST network namespace holding only
+//! SOCKET-level privilege (`CAP_NET_RAW` suffices for `IP_TRANSPARENT`, and
+//! for `SO_MARK` since Linux 5.17; `CAP_NET_ADMIN` grants both on any kernel) —
 //! both are attacker-chosen: `SO_MARK` sets the mark, and binding a node-local
 //! address (or `IP_TRANSPARENT` plus any address at all) sets the source. The
 //! same is true of an exact `(source address, source port)` reply-source claim:
@@ -48,6 +50,23 @@
 //! byte-for-byte unchanged: explicitly configured local node source IPs bypass
 //! the TCP guard with the relay mark, or for enrolled Kubernetes probe ports
 //! without it, and the TCP arm reads none of the three UDP maps.
+//!
+//! # What this guard does NOT claim (issue #4021)
+//!
+//! The threat model above is stated at SOCKET-level privilege deliberately:
+//! that is the strongest claim which holds on every kernel this loader
+//! supports, and it is exactly what the live forger pod exercises. An attacker
+//! who ALSO holds `CAP_NET_ADMIN` in the host netns gains no way to forge a
+//! cgroup id — the kernel stamps it at socket creation from the creating task
+//! — but where this classifier is attached through the legacy `clsact` qdisc
+//! rather than TCX, that attacker can `tc qdisc del dev <pod veth> clsact` and
+//! remove the guard outright, which needs no forgery at all. `attach_tc`
+//! (`src/ebpf/loader.rs`) calls aya's `SchedClassifier::attach`, which uses a
+//! TCX link on kernel >= 6.6 and falls back to netlink/`clsact` below it; on
+//! the TCX path a `CAP_NET_ADMIN`-only attacker cannot preempt this program,
+//! because loading a competing one requires `CAP_BPF`. So: cgroup-id forgery
+//! is refused on every supported kernel, while guard REMOVAL by a
+//! `CAP_NET_ADMIN` host-netns workload is out of scope below kernel 6.6.
 //!
 //! The same classifier closes Ambient UDP enrollment: pod-IP metadata is
 //! inserted with UDP-not-ready before registry publication, so pod-originated

@@ -32,10 +32,11 @@
 //! # The source tuple is not, and never was, a sender proof (issues #3956/#3957)
 //!
 //! A source address and a socket mark are both chosen by whoever emits the
-//! packet. A same-node workload holding `CAP_NET_ADMIN` in the HOST network
-//! namespace can `SO_MARK` the relay's mark and bind either a configured node
-//! address or — with `IP_TRANSPARENT` — a published Service ClusterIP, and so
-//! present the complete admission this map was originally the second half of.
+//! packet. A same-node workload in the HOST network namespace holding only
+//! SOCKET-level privilege (`CAP_NET_RAW` suffices for `IP_TRANSPARENT`, and for
+//! `SO_MARK` since Linux 5.17) can `SO_MARK` the relay's mark and bind either a
+//! configured node address or a published Service ClusterIP, and so present the
+//! complete admission this map was originally the second half of.
 //! Because the map is listener-wide, that replay works against ANY enrolled
 //! destination, not just the one whose Service was named.
 //!
@@ -620,6 +621,12 @@ pub struct RegistryDirReplySourcePublisher {
     /// proof is not opened), while an INACTIVE withdrawal generation still
     /// publishes so teardown stays reliable.
     relay_pod_uid: Option<String>,
+    /// Whether `FERRUM_MESH_NODE_WAYPOINT_RELAY_POD_UID` was SET but rejected,
+    /// as opposed to simply absent. Both leave `relay_pod_uid` `None` and both
+    /// refuse every ACTIVE publication, but only one of them is a
+    /// misconfiguration the operator can correct — and the startup diagnostic
+    /// in `arm_mesh_runtime_startup` only fires for the ABSENT case.
+    relay_pod_uid_rejected: bool,
     /// Secure-random process owner. `None` makes every publication fail closed;
     /// a predictable fallback could collide with a predecessor and let its
     /// acknowledgement satisfy this process.
@@ -647,18 +654,47 @@ impl RegistryDirReplySourcePublisher {
     /// becomes a refusal to authorize rather than a manifest the node-agent has
     /// to refuse later.
     pub fn new(registry_dir: impl AsRef<Path>, relay_pod_uid: Option<&str>) -> Self {
+        let accepted = relay_pod_uid
+            .map(str::trim)
+            .filter(|uid| !uid.is_empty())
+            .and_then(|uid| parse_relay_pod_uid(uid).flatten());
+        // A value that was SUPPLIED and rejected is a different operator
+        // problem from one that was never supplied, and the startup warning in
+        // `arm_mesh_runtime_startup` only covers the latter. Without this the
+        // only symptom of a mistyped UID is the steering reconcile's generic
+        // "active generation could not be published", while the UDP relay stays
+        // permanently dark. The rejected value is NOT logged: it is a pod
+        // identity, and it is exactly the shape this parser refused to let
+        // reach a filesystem path.
+        let rejected = relay_pod_uid.is_some() && accepted.is_none();
+        if rejected {
+            tracing::warn!(
+                "FERRUM_MESH_NODE_WAYPOINT_RELAY_POD_UID is set but is not a usable pod \
+                 identity, so it is treated as unset: the node-agent cannot resolve this \
+                 relay's cgroup and NodeWaypoint UDP/DTLS admission fails closed at the \
+                 pod-veth guard. It must be lowercase alphanumerics and interior dashes \
+                 only, at most {MAX_RELAY_POD_UID_CHARS} characters, exactly as the \
+                 downward API `metadata.uid` renders it."
+            );
+        }
         Self {
             dir: registry_dir
                 .as_ref()
                 .join(NODE_WAYPOINT_UDP_REPLY_SOURCE_DIR),
             owner: owner_token(),
-            relay_pod_uid: relay_pod_uid
-                .map(str::trim)
-                .filter(|uid| !uid.is_empty())
-                .and_then(|uid| parse_relay_pod_uid(uid).flatten()),
+            relay_pod_uid: accepted,
+            relay_pod_uid_rejected: rejected,
             next_sequence: AtomicU64::new(1),
             last: Mutex::new(None),
         }
+    }
+
+    /// Whether construction saw a relay pod UID that was SET but unusable.
+    ///
+    /// `false` for both an accepted identity and an absent one; the two absent
+    /// cases are what this distinguishes.
+    pub fn relay_pod_uid_rejected(&self) -> bool {
+        self.relay_pod_uid_rejected
     }
 }
 

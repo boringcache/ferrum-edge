@@ -525,9 +525,10 @@ NON-FORGEABLE sender proof the TCP arm does not have (issues #3956, #3957):
 `bpf_skb_cgroup_id()`, the cgroup-v2 id of the socket that generated the skb,
 must match `FERRUM_UDP_RELAY_CGROUPS` — the node-agent's own host-side rendering
 of the NodeWaypoint relay pod's cgroup subtree. A source address and a socket
-mark are both chosen by whoever emits the packet, so a same-node workload with
-`CAP_NET_ADMIN` in the host network namespace can present a trusted node source
-or (with `IP_TRANSPARENT`) a published Service ClusterIP together with the relay
+mark are both chosen by whoever emits the packet, so a same-node workload in the
+host network namespace holding only SOCKET-level privilege — `CAP_NET_RAW` is
+enough for `IP_TRANSPARENT`, and for `SO_MARK` since Linux 5.17 — can present a
+trusted node source or a published Service ClusterIP together with the relay
 mark; it cannot present a cgroup it is not running in. Only inside that proof do
 the two source lanes apply: the configured node source (the relay's backend
 dial) and an exact `(address, port)` entry in `FERRUM_UDP_REPLY_SOURCES` /
@@ -538,7 +539,25 @@ never a CIDR or a service range. All three maps sit behind the shared
 `FERRUM_UDP_REPLY_SOURCE_GATE`; stale or partial keys are inert while it is
 closed. The sender proof answers only on the tc EGRESS hook of the pod's
 host-side veth, where the relay's own datagrams still carry their socket;
-forwarded traffic and the tc INGRESS hook report zero and are refused. Packets sourced from explicitly configured trusted
+forwarded traffic and the tc INGRESS hook report zero and are refused.
+
+**Kernel floor for the sender proof.** `bpf_skb_cgroup_id()` is only a proof
+when the kernel reports a real per-socket cgroup. Before Linux **5.15**
+(commit `8520e224f547`, "bpf, cgroups: Fix cgroup v2 fallback on v1/v2 mixed
+mode"), mounting the cgroup-v1 `net_cls` or `net_prio` controller set
+`cgroup_sk_alloc_disabled`, so `sock_cgroup_ptr()` fell back to
+`&cgrp_dfl_root.cgrp` and `bpf_skb_cgroup_id()` reported the **root** cgroup id
+— typically `1` — for every socket on the node. That fails CLOSED (the root id
+is never inside the resolved relay pod slice, so nothing is admitted), but it
+fails closed with a symptom indistinguishable from a misresolved relay pod UID:
+no `relay_cgroup_*` refusal fires, every map looks correct, and relay datagrams
+simply vanish. The effective requirement for NodeWaypoint UDP/DTLS admission is
+therefore **kernel >= 5.15, OR no cgroup-v1 `net_cls`/`net_prio` controller
+mounted on the node**. `CONFIG_SOCK_CGROUP_DATA` is still required and is
+already implied by `CONFIG_CGROUP_BPF`, which the `connect4`/`connect6` hooks
+need.
+
+Packets sourced from explicitly configured trusted
 kubelet probe source IPs in `FERRUM_NODE_IPS` / `FERRUM_NODE_IPS6` can also reach
 enrolled pod TCP probe ports without the relay mark when those ports are derived
 into `FERRUM_NODE_PROBE_PORTS` / `FERRUM_NODE_PROBE_PORTS6` from the pod's

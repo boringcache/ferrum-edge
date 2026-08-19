@@ -13706,6 +13706,11 @@ async fn arm_mesh_runtime_startup(
                     &env_config.mesh_node_waypoint_pod_registry_dir,
                     env_config.mesh_node_waypoint_relay_pod_uid.as_deref(),
                 ));
+                // ABSENT only. A value that is SET but unrepresentable warns
+                // from `RegistryDirReplySourcePublisher::new` above, which is
+                // the one place that knows the parser rejected it (issue
+                // #4021) — the two cases are different operator problems and
+                // must not share one diagnostic.
                 if env_config.mesh_node_waypoint_relay_pod_uid.is_none() {
                     warn!(
                         "FERRUM_MESH_NODE_WAYPOINT_RELAY_POD_UID is unset; the node-agent cannot \

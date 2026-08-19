@@ -136,9 +136,11 @@ pub static FERRUM_UDP_REPLY_SOURCES6: HashMap<UdpReplySourceKey6, u8> =
 ///
 /// This is the NON-FORGEABLE half of UDP relay admission. Every other attribute
 /// the UDP arms consult — the socket mark, the source address, the source port —
-/// is chosen by whoever emits the packet, so a same-node workload holding
-/// `CAP_NET_ADMIN` in the HOST network namespace can present all of them at
-/// once. It cannot present this one: `bpf_skb_cgroup_id()` reads the cgroup of
+/// is chosen by whoever emits the packet, so a same-node workload in the HOST
+/// network namespace holding only SOCKET-level privilege (`CAP_NET_RAW`
+/// suffices for `IP_TRANSPARENT`, and for `SO_MARK` since Linux 5.17) can
+/// present all of them at once. It cannot present this one — nor can a
+/// `CAP_NET_ADMIN` holder: `bpf_skb_cgroup_id()` reads the cgroup of
 /// the SOCKET that generated the skb, which the kernel records at socket
 /// creation from the creating task's own cgroup. Producing a datagram that
 /// reports the waypoint's cgroup therefore requires already being a process
