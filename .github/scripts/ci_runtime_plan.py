@@ -63,9 +63,15 @@ SUITE_PATTERNS: dict[str, tuple[str, ...]] = {
         r"^\.github/actions/setup-fast-linker/",
         r"^\.github/actions/setup-rust-ci/",
     ),
-    # Kind/eBPF NodeWaypoint live datapath. Sensitive paths are the pre-#3888
-    # `pull_request.paths` set: the workflow trigger was a production-image
-    # superset, but this suite must not inherit that broadening.
+    # Kind/eBPF NodeWaypoint live datapath. Sensitive paths started as the
+    # pre-#3888 `pull_request.paths` set: the workflow trigger was a
+    # production-image superset, but this suite must not inherit that
+    # broadening. That historical set enumerated `src/proxy/` file by file and
+    # was already stale when #3888 froze it, so every NodeWaypoint datapath
+    # module added after it silently skipped the only gate that exercises it.
+    # `^src/proxy/node_waypoint_` is a prefix on purpose: those modules exist
+    # solely to implement this suite, so a new one must be sensitive by
+    # construction rather than by remembering to extend a list.
     #
     # Since #3908 this suite is the ONLY relevance authority for the live job:
     # `node-waypoint-ebpf-live.yml` carries no workflow-level `paths:` filter
@@ -112,10 +118,20 @@ SUITE_PATTERNS: dict[str, tuple[str, ...]] = {
         r"^src/plugins/prometheus_metrics\.rs$",
         r"^src/proxy/hbone_pool\.rs$",
         r"^src/proxy/mesh_tcp_egress\.rs$",
+        r"^src/proxy/mesh_tcp_inbound\.rs$",
         r"^src/proxy/mod\.rs$",
         r"^src/proxy/hbone_proxy\.rs$",
         r"^src/proxy/netns_capture\.rs$",
+        # Every `src/proxy/node_waypoint_*` module: ingress capture plus the
+        # UDP destination/identity/reply-source/steering modules that back the
+        # `node_waypoint.udp.*` and `node_waypoint.dtls.*` live assertions.
+        r"^src/proxy/node_waypoint_",
+        # Materializes the NodeWaypoint UDP/DTLS listeners and scopes DTLS
+        # reload by owner generation.
+        r"^src/proxy/stream_listener\.rs$",
         r"^src/proxy/tcp_proxy\.rs$",
+        # Carries NodeWaypoint UDP session destination and source scoping.
+        r"^src/proxy/udp_proxy\.rs$",
         r"^src/router_cache\.rs$",
         r"^src/socket_opts\.rs$",
         r"^charts/ferrum-mesh/",
@@ -481,10 +497,49 @@ def self_test() -> int:
         ("node-waypoint-ebpf-live", ["src/plugins/prometheus_metrics.rs"], True),
         ("node-waypoint-ebpf-live", ["src/proxy/hbone_pool.rs"], True),
         ("node-waypoint-ebpf-live", ["src/proxy/mesh_tcp_egress.rs"], True),
+        ("node-waypoint-ebpf-live", ["src/proxy/mesh_tcp_inbound.rs"], True),
         ("node-waypoint-ebpf-live", ["src/proxy/mod.rs"], True),
         ("node-waypoint-ebpf-live", ["src/proxy/hbone_proxy.rs"], True),
         ("node-waypoint-ebpf-live", ["src/proxy/netns_capture.rs"], True),
+        (
+            "node-waypoint-ebpf-live",
+            ["src/proxy/node_waypoint_ingress_capture.rs"],
+            True,
+        ),
+        (
+            "node-waypoint-ebpf-live",
+            ["src/proxy/node_waypoint_udp_destination.rs"],
+            True,
+        ),
+        (
+            "node-waypoint-ebpf-live",
+            ["src/proxy/node_waypoint_udp_identity.rs"],
+            True,
+        ),
+        (
+            "node-waypoint-ebpf-live",
+            ["src/proxy/node_waypoint_udp_reply_source.rs"],
+            True,
+        ),
+        (
+            "node-waypoint-ebpf-live",
+            ["src/proxy/node_waypoint_udp_steering.rs"],
+            True,
+        ),
+        # The prefix must also cover a NodeWaypoint proxy module that does not
+        # exist yet, which is the regression this pattern is here to prevent.
+        (
+            "node-waypoint-ebpf-live",
+            ["src/proxy/node_waypoint_not_yet_written.rs"],
+            True,
+        ),
+        ("node-waypoint-ebpf-live", ["src/proxy/stream_listener.rs"], True),
         ("node-waypoint-ebpf-live", ["src/proxy/tcp_proxy.rs"], True),
+        ("node-waypoint-ebpf-live", ["src/proxy/udp_proxy.rs"], True),
+        # The prefix must not swallow unrelated `src/proxy/` modules; those
+        # still skip the 120-minute Kind/eBPF job.
+        ("node-waypoint-ebpf-live", ["src/proxy/grpc_proxy.rs"], False),
+        ("node-waypoint-ebpf-live", ["src/proxy/headers.rs"], False),
         ("node-waypoint-ebpf-live", ["src/router_cache.rs"], True),
         ("node-waypoint-ebpf-live", ["src/socket_opts.rs"], True),
         ("node-waypoint-ebpf-live", ["ebpf/src/lib.rs"], True),

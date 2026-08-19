@@ -9238,6 +9238,17 @@ fn request_termination_schema_matches_strict_runtime_contract() {
         content_desc.contains("not by arbitrary substring match"),
         "content_type description must document exact/suffix classification (not arbitrary substring): {content_desc}"
     );
+    let message_desc = schema["properties"]["message"]["description"]
+        .as_str()
+        .unwrap_or_default();
+    assert!(
+        message_desc.contains("unambiguous JSON") || message_desc.contains("parsed value"),
+        "message description must document JSON passthrough: {message_desc}"
+    );
+    assert!(
+        message_desc.contains("envelope") && message_desc.contains("fail safe"),
+        "message description must document malformed-JSON envelope fail-safe: {message_desc}"
+    );
 
     for valid in [
         json!({}),
@@ -9251,6 +9262,14 @@ fn request_termination_schema_matches_strict_runtime_contract() {
         }),
         json!({
             "trigger": {"header": "x-maintenance", "header_value": "1"}
+        }),
+        json!({
+            "content_type": "application/json",
+            "message": "{\"error\":\"scheduled-maintenance\"}"
+        }),
+        json!({
+            "content_type": "application/json",
+            "message": "{invalid"
         }),
     ] {
         assert_component_validity(&spec, "RequestTerminationConfig", &valid, true);
@@ -9307,6 +9326,9 @@ fn request_termination_schema_matches_strict_runtime_contract() {
     assert!(guide.contains("`body: \"\"`"));
     assert!(guide.contains("XML 1.0"));
     assert!(guide.contains("individual field line"));
+    assert!(guide.contains("unambiguous JSON value"));
+    assert!(guide.contains("fail safe into that envelope"));
+    assert!(guide.contains(r#"message: '{"error":"scheduled-maintenance"}'"#));
 }
 
 #[test]

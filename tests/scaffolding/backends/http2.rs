@@ -563,7 +563,8 @@ impl ScriptedH2Backend {
     }
 
     /// Panic if any script step returned an error other than a known-benign
-    /// client disconnect (see [`is_benign_script_step_error`]).
+    /// client/probe disconnect (see [`is_benign_script_step_error`]), including
+    /// a peer that vanished during the pre-script H2 settings handshake.
     pub async fn assert_no_step_errors(&self) {
         let errs = self.step_errors().await;
         let unexpected: Vec<_> = errs
@@ -1151,9 +1152,17 @@ fn build_server_config_with_alpn(
     Ok(config)
 }
 
+/// Prefix for failures in [`run_h2_connection`] before the script starts — the
+/// H2 settings exchange on an accepted TCP/TLS stream.
+const H2_HANDSHAKE_FAILED_PREFIX: &str = "h2 handshake failed:";
+
 /// Substrings for client-disconnect errors scripted TLS/H2 backends may record
 /// when a peer vanishes mid-handshake or without a clean shutdown. Closed
 /// allowlist — do not broaden to swallow genuine protocol or translation errors.
+///
+/// H2 settings-handshake disconnects are handled separately by
+/// [`is_benign_h2_handshake_client_disconnect`] so an arbitrary `Broken pipe`
+/// inside a script step (for example `send_data:`) is never ignored.
 const BENIGN_SCRIPT_STEP_ERROR_SUBSTRINGS: &[&str] = &[
     // Peer closed TCP during the TLS handshake (pool probe / scheduling noise).
     "tls handshake eof",
@@ -1163,11 +1172,48 @@ const BENIGN_SCRIPT_STEP_ERROR_SUBSTRINGS: &[&str] = &[
     "Connection reset by peer",
 ];
 
+/// Exact std-IO display shapes for a pre-script H2 settings-handshake disconnect:
+/// `Broken pipe` or `Broken pipe (os error 32)`.
+const H2_HANDSHAKE_BENIGN_BROKEN_PIPE_EXACT: &str = "Broken pipe";
+const H2_HANDSHAKE_BENIGN_BROKEN_PIPE_OS_ERROR_PREFIX: &str = "Broken pipe (os error ";
+
+fn is_benign_h2_handshake_broken_pipe_detail(detail: &str) -> bool {
+    if detail == H2_HANDSHAKE_BENIGN_BROKEN_PIPE_EXACT {
+        return true;
+    }
+    let Some(rest) = detail.strip_prefix(H2_HANDSHAKE_BENIGN_BROKEN_PIPE_OS_ERROR_PREFIX) else {
+        return false;
+    };
+    if rest.is_empty() || !rest.ends_with(')') {
+        return false;
+    }
+    let digits = &rest[..rest.len() - 1];
+    !digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit())
+}
+
+/// Returns true when a pool probe or other short-lived client disappeared while
+/// the fixture was still in the pre-script H2 settings handshake. Startup
+/// cleanup on a doomed gateway can close that connection and surface as a broken
+/// pipe here even though the scripted stream under test later behaves normally.
+///
+/// Requires the handshake error prefix and a std-IO broken-pipe detail — a
+/// genuine protocol/translation failure that merely mentions `Broken pipe` later
+/// in unrelated text (or as a longer word such as `Broken pipeline`) must not
+/// be swallowed.
+fn is_benign_h2_handshake_client_disconnect(error: &str) -> bool {
+    if !error.starts_with(H2_HANDSHAKE_FAILED_PREFIX) {
+        return false;
+    }
+    let detail = error[H2_HANDSHAKE_FAILED_PREFIX.len()..].trim_start();
+    is_benign_h2_handshake_broken_pipe_detail(detail)
+}
+
 /// Returns true when `error` matches a known-benign client-disconnect shape.
 pub(crate) fn is_benign_script_step_error(error: &str) -> bool {
-    BENIGN_SCRIPT_STEP_ERROR_SUBSTRINGS
-        .iter()
-        .any(|needle| error.contains(needle))
+    is_benign_h2_handshake_client_disconnect(error)
+        || BENIGN_SCRIPT_STEP_ERROR_SUBSTRINGS
+            .iter()
+            .any(|needle| error.contains(needle))
 }
 
 #[cfg(test)]
@@ -1177,6 +1223,81 @@ mod tests {
     use h2::client as h2_client;
     use http::Request as HttpRequest;
     use tokio::net::TcpStream;
+
+    #[test]
+    fn benign_script_step_error_ignores_pre_script_h2_handshake_broken_pipe() {
+        assert!(is_benign_script_step_error(
+            "h2 handshake failed: Broken pipe (os error 32)"
+        ));
+        assert!(is_benign_script_step_error(
+            "h2 handshake failed: Broken pipe"
+        ));
+    }
+
+    #[test]
+    fn benign_script_step_error_rejects_broken_pipeline_h2_handshake_failure() {
+        assert!(!is_benign_script_step_error(
+            "h2 handshake failed: Broken pipeline protocol error"
+        ));
+    }
+
+    #[test]
+    fn benign_script_step_error_rejects_malformed_broken_pipe_h2_handshake_details() {
+        assert!(!is_benign_h2_handshake_broken_pipe_detail(
+            "Broken pipe (protocol error"
+        ));
+        assert!(!is_benign_h2_handshake_broken_pipe_detail("Broken pipe ("));
+        assert!(!is_benign_h2_handshake_broken_pipe_detail(
+            "Broken pipe (os error )"
+        ));
+        assert!(!is_benign_h2_handshake_broken_pipe_detail(
+            "Broken pipe (os error abc)"
+        ));
+        assert!(!is_benign_h2_handshake_broken_pipe_detail(
+            "Broken pipe (os error 32) trailing junk"
+        ));
+        assert!(!is_benign_script_step_error(
+            "h2 handshake failed: Broken pipe (protocol error"
+        ));
+        assert!(!is_benign_script_step_error(
+            "h2 handshake failed: Broken pipe ("
+        ));
+        assert!(!is_benign_script_step_error(
+            "h2 handshake failed: Broken pipe (os error )"
+        ));
+        assert!(!is_benign_script_step_error(
+            "h2 handshake failed: Broken pipe (os error abc)"
+        ));
+        assert!(!is_benign_script_step_error(
+            "h2 handshake failed: Broken pipe (os error 32) trailing junk"
+        ));
+    }
+
+    #[test]
+    fn benign_script_step_error_rejects_broken_pipe_in_script_step() {
+        assert!(!is_benign_script_step_error(
+            "send_data: Broken pipe (os error 32)"
+        ));
+    }
+
+    #[test]
+    fn benign_script_step_error_rejects_other_h2_handshake_failures() {
+        assert!(!is_benign_script_step_error(
+            "h2 handshake failed: connection error detected: frame with invalid size"
+        ));
+        assert!(!is_benign_script_step_error(
+            "h2 handshake failed: connection error detected: frame with invalid size; later Broken pipe (os error 32)"
+        ));
+    }
+
+    #[test]
+    fn benign_script_step_error_ignores_h2_handshake_connection_reset() {
+        // Pre-existing substring allowlist: every `Connection reset by peer`
+        // client disconnect is benign, including during the pre-script handshake.
+        assert!(is_benign_script_step_error(
+            "h2 handshake failed: Connection reset by peer (os error 54)"
+        ));
+    }
 
     /// Happy-path: respond with headers + data + trailers on h2c.
     #[tokio::test]

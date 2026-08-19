@@ -28,7 +28,7 @@ reconciliations. They are **historical evidence**, not the live launch verdict.
 
 | Gate | Historical status (epic / audit evidence) |
 |------|--------|
-| Feature set implemented or proven out of scope | Historical PASS — zero doc overclaims across README/FEATURES/62 docs; genuine deferrals documented with graceful behavior. Historical umbrella: #2110; live residuals: dedicated issues (see residual map; live gate above is authoritative) |
+| Feature set implemented or proven out of scope | Historical PASS — zero doc overclaims across README/FEATURES/62 docs; genuine deferrals documented with graceful behavior. Historical umbrella: #2110; later residuals: dedicated issues (see Current residual map; no automated launch gate) |
 | All deferral markers resolved or tracked | Historical PASS — ~259 raw markers triaged: 1 medium fixed (PR #2113), lows fixed (#2114) or tracked; completed epic rows reconciled below; live leftovers use dedicated issues |
 | Critical/high/medium bugs fixed | Historical static-audit evidence — 0 *new untracked* critical/high found in the 2026-07-12 audits; all 5 epic mediums fixed and merged. **Not** a claim about the current launch backlog |
 | Docs truthful vs code | Historical PASS — stale REFACTORING_PLAN.md retired, WEBSOCKET.md/admin_api.md corrected (PR #2112); config/openapi/plugin-priority parity verified clean |
@@ -97,40 +97,32 @@ reconciliations. They are **historical evidence**, not the live launch verdict.
 
 Launch-blocking human decisions are no longer represented by any automated gate
 or structured exemption file; both were removed. This historical note must not be
-read as a clean launch signal. Post-launch discretionary items that remain open should be
-tracked on their **dedicated** issues (not by treating #2110 as an unchanged
-snapshot). #2110 stays open only as the historical 2026-07-12 register; after
-docs reconciliation merges, root should retick/comment that register so completed
-rows (Helm chart, scheduled stress job, mixed k8s status ownership, WsDisconnect
-schema, closed #2008/#2013/#2475, TLS-SNI L4 support) are not re-opened from the
-issue body alone.
+read as a clean launch signal. Post-launch discretionary items that remain open
+are tracked on their **dedicated** issues (not by treating #2110 as an unchanged
+snapshot). GitHub issue #2110 is CLOSED (COMPLETED, 2026-07-28) and remains the
+historical 2026-07-12 register only via `docs/backlog/issue_2110_register.md`.
+Completed rows (Helm chart, scheduled stress job, mixed k8s status ownership,
+WsDisconnect schema, closed #2008/#2013/#2475, TLS-SNI L4 support) must not be
+re-opened from the issue body alone.
 
-## Current residual map (historical narrative; live gate is authoritative)
+## Current residual map
 
-**Last narrative reconciliation:** 2026-08-06 (issue #3627). Subsequent launch state is
-owned by the live gate / policy inventory, not by copying this table by hand.
+**Last narrative reconciliation:** 2026-08-18 (issue #3893). PR #4010 removed the
+launch-readiness workflows, verifiers, policy inventory, and the
+`validate-launch-readiness` release job. There is no live gate and no
+open-inventory artifact. This table is a human-maintained leftover ledger from
+the 2026-07-12 epic (plus the still-open 2026-08-15 CI tracker), not an automated
+go/no-go signal and not an inventory of every open GitHub issue.
 
-| Residual | Live issue(s) | Notes |
-|----------|---------------|-------|
-| EgressGateway UDP `ServiceEntry` materialization | #3263 | Explicit mesh product deferral |
-| Provenance-complete mesh/HBONE/DNS perf baselines | #3332 | Harnesses exist; baseline tables still `_TBD_` |
-| Live OIDC / OAuth2 introspection coverage | #3333 | |
-| NodeWaypoint observability + promotion gates | #3334 | |
-| Vendored-patch upstream filing / retirement | `docs/vendored-patch-lifecycle.json` + weekly `dependency-audit` | Repository-owned lifecycle inventory; closes #3335 |
-| Admin CRUD refactor (retired plan remainder) | #2110 (historical) | Discretionary; fold into future admin-surface work |
-| Mesh/SPIRE CA-health signal + startup contract | #3608 | Documented SPIRE contract vs runtime wiring |
-| Cross-region CP failover topology | #3610 | `multi_region_ha.md` vs CP rejection/failover fence |
-| CP/K8s authoritative mesh config revision | #3611 | DP stale-fallback gate inert in flagship K8s topology |
-| Gateway API port-aware route representation | #3612 | Done — per-listener identity, real listener binding, per-listener retention |
-| OIDC RP pending login state (HA) | #3613 | Process-local state breaks non-sticky multi-replica login |
-| `ai_stream_router` Anthropic multimodal content | #3616 | Silent drop vs Gemini fail-closed path |
-| TCP outbound PROXY protocol v2 | #3618 | Inbound only today |
-| TCP/kTLS kernel splice (frontend-TLS relay) | #3619 | Unbuffered rustls handshake leaves splice inert |
-| HTTP/3 plain-HTTP/WebSocket to mesh-tagged targets | #3620 | H3 retry rotation must skip fail-closed targets |
-| Direct-H2 in-path body-size limits | #3622 | Default nonzero limits still force reqwest path |
-| Admin read-only write audit logging | #3623 | Docs promise logging/counts that do not exist |
-| Env-only reads ignoring `ferrum.conf` | #3624 | `FERRUM_LOG_REDACT_METADATA_KEYS`, `FERRUM_NODE_ID`, validation-client gates |
-| Gateway SVID auto-refresh (external/inline) | #3625 | Static until restart or manual rotate |
+Rows below cite only issues that were OPEN when this reconcile ran (`gh issue
+view --json number,state,title`). Closed former residuals are recorded under
+Implemented since the epic. Ordinary post-launch bugs and CI trackers live on
+their dedicated issues.
+
+| Residual | Issue(s) | Notes |
+|----------|----------|-------|
+| Provenance-complete mesh/HBONE/DNS perf baselines | #3332 | OPEN — harnesses exist; hosted collection PRs have landed; checked-in `baseline.md` tables still `_TBD_`. No closing PR. |
+| Scheduled Scaling Regression red (JWT expiry / 503 retry) | #3892 | OPEN — 2026-08-15 CI tracker; PR #3895 in flight. Not claimed resolved. |
 
 **Implemented since the epic (do not re-open from stale checklists):** remote-discovery
 JWT audience binding (#2475); Ambient UDP capture producer + live source-capture e2e
@@ -146,4 +138,30 @@ adapter (#3299); pre-first-byte stream-router fallback (#3328 — explicit admis
 rejection); native-gRPC transcript capture (#3304); native SMTP/email notification
 channel (#3329); MongoDB replica-set change-stream wakeups (#3330); multicluster
 poller partition / last-good live gate (#3331); CNI chained-install lifecycle
-evidence including live kind install/uninstall recovery (#3609).
+evidence including live kind install/uninstall recovery (#3609). Admin CRUD
+refactor remainder from retired `REFACTORING_PLAN.md` is discretionary historical
+text in the #2110 register; #2110 itself is CLOSED and is not a live tracker.
+
+Moved off the residual map in the 2026-08-18 reconcile (all CLOSED / COMPLETED;
+closing PR from `closedByPullRequestsReferences`):
+
+| Residual | Closed | Closing PR |
+|----------|--------|------------|
+| EgressGateway UDP `ServiceEntry` materialization | #3263 (2026-08-08) | #3671 |
+| Live OIDC / OAuth2 introspection coverage | #3333 (2026-08-04) | #3552 |
+| NodeWaypoint observability + promotion gates | #3334 (2026-07-29) | #3388 (follow-up #3427) |
+| Vendored-patch upstream filing / retirement | #3335 (2026-07-30) | #3446 (`docs/vendored-patch-lifecycle.json` + weekly `dependency-audit`) |
+| Mesh/SPIRE CA-health signal + startup contract | #3608 (2026-08-08) | #3668 |
+| Cross-region CP failover topology | #3610 (2026-08-08) | #3640 |
+| CP/K8s authoritative mesh config revision | #3611 (2026-08-09) | #3680 |
+| Gateway API port-aware route representation | #3612 (2026-08-09) | #3677 |
+| OIDC RP pending login state (HA) | #3613 (2026-08-08) | #3672 |
+| `ai_stream_router` Anthropic multimodal content | #3616 (2026-08-08) | #3641 |
+| TCP outbound PROXY protocol v2 | #3618 (2026-08-08) | #3647 |
+| TCP/kTLS kernel splice (frontend-TLS relay) | #3619 (2026-08-09) | #3670 |
+| HTTP/3 plain-HTTP/WebSocket to mesh-tagged targets | #3620 (2026-08-14) | #3798 |
+| Direct-H2 in-path body-size limits | #3622 (2026-08-08) | #3646 |
+| Admin read-only write audit logging | #3623 (2026-08-08) | #3643 |
+| Env-only reads ignoring `ferrum.conf` | #3624 (2026-08-08) | #3644 |
+| Gateway SVID auto-refresh (external/inline) | #3625 (2026-08-09) | #3669 |
+| `stable_file` delete/recreate churn flake | #3891 (2026-08-17) | #3894 (2026-08-15 CI addition; not an epic residual) |

@@ -81,6 +81,13 @@ paths:
 - Every retry needs fresh ports and fresh temp dirs/DBs. Reusing killed SQLite can corrupt WAL.
 - Backend/echo server should hold its listener. Do not drop+rebind; pass pre-bound `TcpListener` to `start_echo_server_on()`.
 - `wait_for_health` returns `bool` or `Result`; it must not panic.
+- **Service-integration testcontainers** (`tests/service_integration/`) pin host
+  ports outside Linux `/proc/sys/net/ipv4/ip_local_port_range` and retry only
+  Docker `port is already allocated` / `address already in use` bind failures
+  with a fresh port (issue #3999; same family as #3993). Do not let Docker
+  auto-assign ephemeral host ports, and do not blanket-retry unrelated
+  container-start errors — a fixture that genuinely cannot start must still
+  fail in CI.
 - **Readiness for a spawned gateway must be bound to THAT CHILD, not to "some process accepts this port"** (issue #2132). A reservation has to be released before the subprocess binds it, so a competing listener can take that port; the child then dies with `Address already in use` while a bare port probe keeps succeeding, and the driver reports the competitor's connection reset as a datapath failure. `functional_mesh_mode_test.rs` is the reference implementation: `wait_for_gateway_listener` polls `Child::try_wait()` before and after each probe, and a `ChildExited` outcome consumes the bounded attempt.
 - **A fixture-owned server (control plane, echo backend) must not bind an ephemeral port already promised to a gateway subprocess.** Bind through a mesh-port-aware helper (`bind_fixture_listener`) that re-rolls, holding rejected listeners so the kernel cannot re-offer them. A `USED_MESH_PORTS`-style set alone only stops one reservation reusing another.
 - **An attempt whose gateway died mid-run is VOID**: retry with fresh ports/dirs/control planes instead of returning the resulting transport error. Never retry an observation from a healthy fixture — authoritative protocol responses and fail-closed security assertions must be made exactly once.

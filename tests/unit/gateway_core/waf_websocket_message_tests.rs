@@ -498,6 +498,9 @@ async fn oversize_message_skip_forwards_uninspected() {
 
 #[tokio::test]
 async fn oversize_message_block_action_closes_without_enforcing_rule() {
+    // `on_body_too_large: block` is itself the enforcement path: a monitor-only
+    // body rule is enough to bind the session, and the oversize close comes
+    // from `block` under `mode: enforce`, not from any rule hit.
     let plugins = vec![waf(json!({
         "include_default_rules": false,
         "max_scan_bytes": 16,
@@ -511,20 +514,6 @@ async fn oversize_message_block_action_closes_without_enforcing_rule() {
                 "match_kind": "contains",
                 "pattern": PROHIBITED,
                 "action": "monitor"
-            },
-            // `on_body_too_large: block` only rejects under the default
-            // `mode: enforce`, but enforce admission now requires a reachable
-            // enforcement path. This sentinel targets the query string, not the
-            // body, and never matches, so the oversize close below still comes
-            // from `block` alone and the assertion is unchanged.
-            {
-                "id": "CUSTOM-WS-ENFORCE-SENTINEL",
-                "name": "never matches",
-                "category": "custom",
-                "target": "query_values",
-                "match_kind": "contains",
-                "pattern": "ferrum-ws-sentinel-never-matches",
-                "action": "enforce"
             }
         ]
     }))];
