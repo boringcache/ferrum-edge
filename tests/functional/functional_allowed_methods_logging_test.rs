@@ -406,12 +406,6 @@ async fn functional_allowed_methods_405_logs_stdout_on_http3() {
     let (sink_a_port, sink_a) = start_http_logging_sink().await;
     let (sink_b_port, _sink_b) = start_http_logging_sink().await;
 
-    let https_listener = TcpListener::bind("127.0.0.1:0")
-        .await
-        .expect("reserve https port");
-    let https_port = https_listener.local_addr().expect("https addr").port();
-    drop(https_listener);
-
     let mut gateway = TestGateway::builder()
         .mode_file(build_logging_config(
             backend_port,
@@ -422,12 +416,15 @@ async fn functional_allowed_methods_405_logs_stdout_on_http3() {
         .log_level("warn")
         .capture_output()
         .env("FERRUM_ENABLE_HTTP3", "true")
-        .env("FERRUM_PROXY_HTTPS_PORT", https_port.to_string())
+        .env_ephemeral_port("FERRUM_PROXY_HTTPS_PORT")
         .env("FERRUM_FRONTEND_TLS_CERT_PATH", "tests/certs/server.crt")
         .env("FERRUM_FRONTEND_TLS_KEY_PATH", "tests/certs/server.key")
         .spawn()
         .await
         .expect("start h3 gateway");
+    let https_port = gateway
+        .env_port("FERRUM_PROXY_HTTPS_PORT")
+        .expect("harness-allocated HTTPS port");
 
     let client = Http3Client::insecure().expect("h3 client");
     let url = format!("https://localhost:{https_port}/allowed");

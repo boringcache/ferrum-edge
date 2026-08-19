@@ -101,7 +101,12 @@ with zero enforcing rules remains valid. Anomaly scoring (`scoring.enabled`) and
 stream transport guards (`stream.tcp_require_tls`, enforce-action
 `stream.signatures`) are separate enforcement paths and satisfy admission
 without per-rule `action: enforce` when their corresponding inspection surface
-is enabled.
+is enabled. `on_body_too_large: block` is also a reachable enforcement path
+when a body inspection hook can run: it rejects oversize governed HTTP bodies
+and WebSocket application messages under `mode: enforce` even if every rule
+stays monitor-only. `fail_closed` (the default), `scan_truncated`, and `skip`
+do not count, because they cannot reject unless some other enforcing body
+policy already exists.
 
 ## Paranoia levels
 

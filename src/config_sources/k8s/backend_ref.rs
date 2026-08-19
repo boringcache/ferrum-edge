@@ -367,8 +367,12 @@ pub(crate) fn message_is_unsupported_backend_protocol(message: &str) -> bool {
 /// Materialize one authorized, port-resolved backend into route backends.
 ///
 /// Service targets may expand onto ready EndpointSlice addresses when pod
-/// discovery is enabled. ServiceImport targets expand onto MCS-labeled
-/// EndpointSlices when present; otherwise they use ClusterSet DNS.
+/// discovery is enabled. When expansion is empty, ClusterIP Services fall
+/// back to Service DNS on `backendRefs[].port` (kube-proxy maps it), while
+/// headless Services fall back to Service DNS on `targetPort` because CoreDNS
+/// returns pod IPs that listen on the container port. ServiceImport targets
+/// expand onto MCS-labeled EndpointSlices when present; otherwise they use
+/// ClusterSet DNS.
 pub(crate) fn materialize_backend(
     acc: &K8sAccumulator,
     kind: BackendKind,
@@ -384,9 +388,12 @@ pub(crate) fn materialize_backend(
             if !endpoint_backends.is_empty() {
                 return endpoint_backends;
             }
+            // Headless Services resolve to pod IPs via DNS; dial targetPort.
+            // ClusterIP Services keep `port` so kube-proxy can DNAT it.
+            let dial_port = acc.service_dns_fallback_dial_port(namespace, name, port);
             vec![RouteBackend {
                 host: backend_dns_name(kind, name, namespace, &acc.options.cluster_domain),
-                port,
+                port: dial_port,
                 weight,
                 service_namespace: Some(namespace.to_string()),
                 service_name: Some(name.to_string()),

@@ -8,7 +8,13 @@
 //! The response body and `content-type` value are computed **once** at
 //! construction time so the request hot path only does string clones —
 //! no per-request `format!()`, no `String::replace()` chains, no JSON/XML
-//! escape work.
+//! parse or escape work.
+//!
+//! When `content_type` classifies as JSON and `message` is a complete,
+//! unambiguous JSON value, that value is the response body (not string-escaped
+//! inside the legacy `{message,status_code}` envelope). Malformed or
+//! parser-ambiguous JSON, and every non-JSON content type, keep the documented
+//! fail-safe renderer: JSON envelope, XML envelope, or plain text.
 //!
 //! Configuration must be a JSON object with only the documented keys.
 //! Unknown top-level or `trigger` keys are rejected. Status codes must be
@@ -87,10 +93,11 @@ impl RequestTermination {
             // renderer.
             raw_body
         } else {
+            let rendered_message = message.as_deref().unwrap_or("Service unavailable");
             if matches!(classify_media_type(&content_type), MediaType::Xml) {
-                validate_xml_1_0_message(message.as_deref().unwrap_or("Service unavailable"))?;
+                validate_xml_1_0_message(rendered_message)?;
             }
-            render_default_body(&content_type, status_code, message.as_deref())
+            render_default_body(&content_type, status_code, rendered_message)
         };
 
         let trigger = parse_trigger(config)?;
@@ -292,26 +299,51 @@ fn parse_trigger(config: &Map<String, Value>) -> Result<Trigger, String> {
 
 /// Render the default response body for a given content type. Performed once
 /// at construction time — never on the hot path.
-fn render_default_body(content_type: &str, status_code: u16, message: Option<&str>) -> String {
-    let msg = message.unwrap_or("Service unavailable");
-
+fn render_default_body(content_type: &str, status_code: u16, message: &str) -> String {
     match classify_media_type(content_type) {
-        MediaType::Json => {
-            // serde_json::to_string produces a fully-spec-compliant JSON string
-            // literal (quoted, with control chars / non-ASCII / backslashes / quotes
-            // all escaped). Infallible for `&str` input.
-            let encoded = serde_json::to_string(msg).unwrap_or_else(|_| "\"\"".to_string());
-            format!(r#"{{"message":{},"status_code":{}}}"#, encoded, status_code)
-        }
+        MediaType::Json => render_json_body(status_code, message),
         MediaType::Xml => {
-            let escaped = xml_escape(msg);
+            let escaped = xml_escape(message);
             format!(
                 r#"<?xml version="1.0"?><response><message>{}</message><status_code>{}</status_code></response>"#,
                 escaped, status_code
             )
         }
-        MediaType::Other => msg.to_string(),
+        MediaType::Other => message.to_string(),
     }
+}
+
+/// JSON default-body renderer.
+///
+/// A complete, unambiguous JSON `message` is emitted as the body (compact
+/// serialization of the parsed value). Anything else — malformed JSON,
+/// duplicate object members, scanner/parser divergence, or a plain-text
+/// phrase such as the default `"Service unavailable"` — fails safe into the
+/// legacy `{message,status_code}` envelope so the response remains valid JSON.
+fn render_json_body(status_code: u16, message: &str) -> String {
+    json_passthrough_body(message).unwrap_or_else(|| json_message_envelope(status_code, message))
+}
+
+/// Parse `message` as one JSON value and return its compact serialization.
+///
+/// Construction-time only. Duplicate-key and other parser-ambiguous documents
+/// are treated as not-passthrough so the emitted body cannot depend on which
+/// JSON parser a client uses. Never panics on hostile input.
+fn json_passthrough_body(message: &str) -> Option<String> {
+    if crate::util::json_dup_keys::str_ambiguity(message).is_some() {
+        return None;
+    }
+    let value: Value = serde_json::from_str(message).ok()?;
+    serde_json::to_string(&value).ok()
+}
+
+fn json_message_envelope(status_code: u16, message: &str) -> String {
+    // serde_json::to_string produces a fully-spec-compliant JSON string
+    // literal (quoted, with control chars / non-ASCII / backslashes / quotes
+    // all escaped). Infallible for `&str` input; the empty-string fallback
+    // keeps construction panic-free if that ever changes.
+    let encoded = serde_json::to_string(message).unwrap_or_else(|_| "\"\"".to_string());
+    format!(r#"{{"message":{},"status_code":{}}}"#, encoded, status_code)
 }
 
 enum MediaType {

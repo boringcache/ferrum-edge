@@ -7,9 +7,9 @@
 //! managed IdP.
 //!
 //! Login/consent are completed by intercepting Hydra's redirects and accepting
-//! challenges through the admin API (no separate consent container). Ports are
-//! ephemeral; readiness is polled. Secrets and tokens are never written to
-//! diagnostics.
+//! challenges through the admin API (no separate consent container). Host ports
+//! are allocated outside the kernel ephemeral range (#3999); readiness is
+//! polled. Secrets and tokens are never written to diagnostics.
 //!
 //! Loopback facades used by the suites:
 //! - introspection discovery facade (same-origin rewrite + upstream call counter)
@@ -30,7 +30,8 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::time::timeout;
 use url::Url;
 
-use super::containers::{BoxError, free_localhost_port};
+use super::containers::BoxError;
+use super::host_ports::{allocate_host_ports, retry_on_host_port_collision};
 
 /// Pinned Hydra image (public OSS). Bump deliberately with fixture review.
 pub const HYDRA_IMAGE: &str = "oryd/hydra";
@@ -117,11 +118,6 @@ pub struct TokenFacadeStats {
     pub other_grant_ok: AtomicU64,
 }
 
-/// Bind an ephemeral localhost TCP port (re-exported pattern from Redpanda).
-fn free_port() -> Result<u16, BoxError> {
-    free_localhost_port()
-}
-
 /// Start Hydra (`serve all --dev`) with memory DSN and host-mapped ports.
 ///
 /// `URLS_SELF_ISSUER` / login / consent use the pre-allocated host ports so
@@ -129,11 +125,13 @@ fn free_port() -> Result<u16, BoxError> {
 /// Login/consent URLs are intentional blackholes — the browser helper never
 /// GETs them; it parses `Location` and accepts challenges via the admin API.
 pub async fn start_hydra_container() -> Result<HydraContainer, BoxError> {
-    let public_port = free_port()?;
-    let admin_port = free_port()?;
-    // Blackhole ports for login/consent redirect targets (never listened on).
-    let login_port = free_port()?;
-    let consent_port = free_port()?;
+    let hydra = retry_on_host_port_collision(start_hydra_container_once).await?;
+    hydra.wait_ready().await?;
+    Ok(hydra)
+}
+
+async fn start_hydra_container_once() -> Result<HydraContainer, BoxError> {
+    let [public_port, admin_port, login_port, consent_port] = allocate_host_ports()?;
 
     let issuer = format!("http://127.0.0.1:{public_port}/");
     let login_url = format!("http://127.0.0.1:{login_port}/login");
@@ -179,7 +177,7 @@ pub async fn start_hydra_container() -> Result<HydraContainer, BoxError> {
         .timeout(Duration::from_secs(10))
         .build()?;
 
-    let hydra = HydraContainer {
+    Ok(HydraContainer {
         _container: container,
         public_url,
         admin_url,
@@ -188,9 +186,7 @@ pub async fn start_hydra_container() -> Result<HydraContainer, BoxError> {
         consent_url,
         client,
         isolation,
-    };
-    hydra.wait_ready().await?;
-    Ok(hydra)
+    })
 }
 
 impl HydraContainer {
