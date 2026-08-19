@@ -567,10 +567,20 @@ mod tests {
             Some(PathBuf::from("/sys/fs/cgroup/kubelet.slice/pod-a"))
         };
 
-        let first =
-            resolve_pod_cgroup_path_with_memo(&mut slot, "/sys/fs/cgroup", "uid-a", &mut resolve, |_| true);
-        let second =
-            resolve_pod_cgroup_path_with_memo(&mut slot, "/sys/fs/cgroup", "uid-a", &mut resolve, |_| true);
+        let first = resolve_pod_cgroup_path_with_memo(
+            &mut slot,
+            "/sys/fs/cgroup",
+            "uid-a",
+            &mut resolve,
+            |_| true,
+        );
+        let second = resolve_pod_cgroup_path_with_memo(
+            &mut slot,
+            "/sys/fs/cgroup",
+            "uid-a",
+            &mut resolve,
+            |_| true,
+        );
 
         assert_eq!(first, second);
         assert_eq!(resolves, 1, "a live cached path must not be re-walked");
@@ -597,7 +607,10 @@ mod tests {
             |_| false,
         );
 
-        assert_eq!(resolved, Some(PathBuf::from("/sys/fs/cgroup/kubelet.slice/new")));
+        assert_eq!(
+            resolved,
+            Some(PathBuf::from("/sys/fs/cgroup/kubelet.slice/new"))
+        );
         assert_eq!(resolves, 1);
         assert_eq!(
             slot.as_ref().map(|(_, _, path)| path.clone()),
@@ -620,7 +633,11 @@ mod tests {
             &mut slot,
             "/sys/fs/cgroup",
             "uid-b",
-            |_root, uid| Some(PathBuf::from(format!("/sys/fs/cgroup/kubepods.slice/{uid}"))),
+            |_root, uid| {
+                Some(PathBuf::from(format!(
+                    "/sys/fs/cgroup/kubepods.slice/{uid}"
+                )))
+            },
             |_| true,
         );
         assert_eq!(
