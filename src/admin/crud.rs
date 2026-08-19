@@ -1115,6 +1115,7 @@ async fn persist_delete_to_settlement<R: AdminResource>(
     context: OwnedWriteSettlementContext,
     id: String,
     recovery: OwnedLateDeleteRecovery<R>,
+    delete_query: R::DeleteQuery,
 ) -> DbResult<bool> {
     let OwnedWriteSettlementContext {
         db,
@@ -1127,7 +1128,7 @@ async fn persist_delete_to_settlement<R: AdminResource>(
     let success_db = db.clone();
     let result = match run_db_write_while_held(
         guard.as_ref(),
-        R::db_delete(db.as_ref(), &namespace, &id),
+        R::db_delete_from_request(db.as_ref(), &namespace, &id, delete_query),
     )
     .await
     {
@@ -2050,6 +2051,26 @@ pub(crate) trait AdminResource:
     async fn db_update(db: &dyn DatabaseBackend, resource: &Self) -> DbResult<bool>;
     async fn db_delete(db: &dyn DatabaseBackend, namespace: &str, id: &str) -> DbResult<bool>;
 
+    /// Extra query-string state for DELETE. Default is unused.
+    type DeleteQuery: Send + Sync + Clone + Default + 'static = ();
+
+    /// Parse resource-specific DELETE query parameters. Default ignores the
+    /// query string. Return `Err` for a 400 before any persistence.
+    fn parse_delete_query(_query: Option<&str>) -> Result<Self::DeleteQuery, String> {
+        Ok(Self::DeleteQuery::default())
+    }
+
+    /// Persist a DELETE using options parsed from the request query.
+    /// Default ignores `opts` and calls [`Self::db_delete`].
+    async fn db_delete_from_request(
+        db: &dyn DatabaseBackend,
+        namespace: &str,
+        id: &str,
+        _opts: Self::DeleteQuery,
+    ) -> DbResult<bool> {
+        Self::db_delete(db, namespace, id).await
+    }
+
     async fn compensate_late_delete(
         db: &dyn DatabaseBackend,
         _namespace: &str,
@@ -2252,11 +2273,51 @@ pub(crate) async fn handle_update<R: AdminResource>(
     handle_write::<R>(state, actor, body, namespace, WriteAction::Update { id }).await
 }
 
+/// Parse `cleanup_orphaned_upstream` from `DELETE /proxies/{id}`.
+///
+/// The parameter is absent → `true` (today's last-referenced hand-owned
+/// orphan cleanup). Only the exact strings `true` and `false` are accepted;
+/// any other value is an error because this flag decides whether operator
+/// data is deleted.
+pub(crate) fn parse_cleanup_orphaned_upstream_query(
+    query: Option<&str>,
+) -> Result<bool, String> {
+    let Some(query) = query else {
+        return Ok(true);
+    };
+    let mut parsed = None;
+    for (key, value) in url::form_urlencoded::parse(query.as_bytes()) {
+        if key.as_ref() != "cleanup_orphaned_upstream" {
+            continue;
+        }
+        let this = match value.as_ref() {
+            "true" => true,
+            "false" => false,
+            other => {
+                return Err(format!(
+                    "cleanup_orphaned_upstream must be 'true' or 'false', not '{other}'"
+                ));
+            }
+        };
+        if let Some(previous) = parsed
+            && previous != this
+        {
+            return Err(
+                "cleanup_orphaned_upstream was supplied more than once with conflicting values"
+                    .to_string(),
+            );
+        }
+        parsed = Some(this);
+    }
+    Ok(parsed.unwrap_or(true))
+}
+
 pub(crate) async fn handle_delete<R: AdminResource>(
     state: &AdminState,
     actor: &AuditActor,
     id: &str,
     namespace: &str,
+    query: Option<&str>,
 ) -> Result<Response<Full<Bytes>>, hyper::Error> {
     let _write_permit = match state.admit_write().await {
         Ok(permit) => permit,
@@ -2269,6 +2330,16 @@ pub(crate) async fn handle_delete<R: AdminResource>(
             &json!({"error": message}),
         ));
     }
+
+    let delete_query = match R::parse_delete_query(query) {
+        Ok(opts) => opts,
+        Err(message) => {
+            return Ok(super::json_response(
+                StatusCode::BAD_REQUEST,
+                &json!({"error": message}),
+            ));
+        }
+    };
 
     let db_arc = match state.db.as_ref() {
         Some(db) => db.clone(),
@@ -2366,6 +2437,7 @@ pub(crate) async fn handle_delete<R: AdminResource>(
             config: previous_snapshot,
             api_spec: previous_api_spec,
         },
+        delete_query,
     ))
     .await
     {
@@ -2905,6 +2977,8 @@ impl AdminResource for Upstream {
         db.delete_upstream(namespace, id).await
     }
 
+    type DeleteQuery = ();
+
     async fn check_uniqueness(
         db: &dyn DatabaseBackend,
         namespace: &str,
@@ -3157,6 +3231,8 @@ impl AdminResource for GatewayTrustBundleRecord {
         db.delete_gateway_trust_bundle(namespace, id).await
     }
 
+    type DeleteQuery = ();
+
     async fn check_uniqueness(
         db: &dyn DatabaseBackend,
         namespace: &str,
@@ -3298,6 +3374,8 @@ impl AdminResource for PluginConfig {
     async fn db_delete(db: &dyn DatabaseBackend, namespace: &str, id: &str) -> DbResult<bool> {
         db.delete_plugin_config(namespace, id).await
     }
+
+    type DeleteQuery = ();
 
     async fn compensate_late_delete(
         db: &dyn DatabaseBackend,
@@ -3776,6 +3854,22 @@ impl AdminResource for Proxy {
 
     async fn db_delete(db: &dyn DatabaseBackend, namespace: &str, id: &str) -> DbResult<bool> {
         db.delete_proxy(namespace, id).await
+    }
+
+    type DeleteQuery = bool;
+
+    fn parse_delete_query(query: Option<&str>) -> Result<bool, String> {
+        parse_cleanup_orphaned_upstream_query(query)
+    }
+
+    async fn db_delete_from_request(
+        db: &dyn DatabaseBackend,
+        namespace: &str,
+        id: &str,
+        cleanup_orphaned_upstream: bool,
+    ) -> DbResult<bool> {
+        db.delete_proxy_with_orphan_cleanup(namespace, id, cleanup_orphaned_upstream)
+            .await
     }
 
     async fn late_create_compensation_safe(
@@ -4406,6 +4500,8 @@ impl AdminResource for Consumer {
     async fn db_delete(db: &dyn DatabaseBackend, namespace: &str, id: &str) -> DbResult<bool> {
         db.delete_consumer(namespace, id).await
     }
+
+    type DeleteQuery = ();
 
     async fn check_uniqueness(
         db: &dyn DatabaseBackend,
