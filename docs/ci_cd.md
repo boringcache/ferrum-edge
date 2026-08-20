@@ -355,12 +355,17 @@ artifact handoff:
   look newer and invalidate its dependents.
 
   Cargo also includes the resolved `RUSTC_WRAPPER` executable identity in its
-  artifact hashes. The checksum-pinned sccache installer intentionally uses a
-  fresh runner-private path, which is safe for ordinary compiler caching but
-  cannot identify an exact `target/` tree across jobs. Each FIPS Cargo job
-  therefore stops that private wrapper and clears both wrapper variables before
-  any cache or Cargo operation; the immutable exact-target channel is the FIPS
-  compiler cache. These two controls keep Cargo from rebuilding
+  artifact hashes, and Swatinem/rust-cache hashes the wrapper environment into
+  its cache keys. The checksum-pinned sccache installer therefore publishes
+  `RUSTC_WRAPPER`/`CARGO_BUILD_RUSTC_WRAPPER` as a fixed action-owned path
+  under `${RUNNER_TEMP}/ferrum-sccache-bin/bin/` (still runner-local and never
+  on `PATH`), repopulating it only after the pinned archive passes its SHA-256
+  so stale binaries cannot be trusted. That wrapper-path determinism is
+  load-bearing for rust-cache key reuse across equivalent hosted jobs on the
+  same platform, but it still cannot identify an exact `target/` tree across
+  jobs. Each FIPS Cargo job therefore stops that wrapper and clears both wrapper
+  variables before any cache or Cargo operation; the immutable exact-target
+  channel is the FIPS compiler cache. These two controls keep Cargo from rebuilding
   content-identical outputs without allowing a partial, fork, cold,
   mismatched-tree, or runner-unique-compiler restore to masquerade as current.
   `force_cold_cache` skips both handoff download and upload. Run artifacts
@@ -420,8 +425,11 @@ aarch64 archives actually used by callers) and does **not** invoke
 `ACTIONS_RESULTS_URL` into `GITHUB_ENV`. A fail-closed assertion before cargo
 refuses to continue if those variables are present in a `run:` environment
 (values are never printed). The installer publishes an empty
-`FERRUM_SCCACHE_BIN` sentinel first, then sets `RUSTC_WRAPPER` to that
-checksum-verified path only; it never puts sccache on `PATH`. It persists
+`FERRUM_SCCACHE_BIN` sentinel first, discards any stale contents under
+`${RUNNER_TEMP}/ferrum-sccache-bin/`, then sets `RUSTC_WRAPPER` to the
+checksum-verified path only; it never puts sccache on `PATH`. Keeping that
+wrapper path deterministic across equivalent hosted jobs on the same platform
+is load-bearing for rust-cache key reuse. It persists
 `SCCACHE_GHA_ENABLED` as empty so a later step cannot re-enable the
 credential-bearing GHA backend. Install failure clears the rustc wrapper and
 continues uncached. Compiler outputs use a 2 GiB local directory persisted by

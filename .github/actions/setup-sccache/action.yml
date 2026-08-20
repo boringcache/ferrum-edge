@@ -19,6 +19,12 @@ description: >-
   `CARGO_BUILD_RUSTC_WRAPPER=` so cargo does not exec a missing binary.
   Build still proceeds without the compiler cache.
 
+  Swatinem/rust-cache hashes `RUSTC_WRAPPER` / `CARGO_BUILD_RUSTC_WRAPPER`
+  into its cache keys. The verified wrapper therefore installs to a fixed
+  action-owned directory under `${RUNNER_TEMP}/ferrum-sccache-bin/` (never on
+  `PATH`) instead of a random `mktemp` suffix. Each job still discards any
+  stale contents there before the pinned archive passes its SHA-256.
+
   The server idle timeout is disabled (`SCCACHE_IDLE_TIMEOUT=0`). The release
   build compiles the large `ferrum-edge` crate as one long rustc invocation
   that can exceed sccache's 600s default; with no new compile requests
@@ -128,10 +134,11 @@ runs:
           fi
         }
 
-        install_root="$(mktemp -d "${RUNNER_TEMP}/ferrum-sccache-bin.XXXXXX")"
+        install_root="${RUNNER_TEMP}/ferrum-sccache-bin"
         install_dir="${install_root}/bin"
         work_dir="$(mktemp -d "${RUNNER_TEMP}/ferrum-sccache.XXXXXX")"
         archive="${work_dir}/sccache.tar.gz"
+        rm -rf "$install_root"
         mkdir -p "$install_dir"
         trap 'rm -rf "$work_dir"' EXIT
 
@@ -169,7 +176,7 @@ runs:
         cp "$src" "$dest"
         chmod 0755 "$dest"
         echo "FERRUM_SCCACHE_BIN=${dest}" >> "$GITHUB_ENV"
-        echo "sccache v${SCCACHE_VERSION} (${triple}) installed to a verified runner-temporary path"
+        echo "sccache v${SCCACHE_VERSION} (${triple}) installed to a verified deterministic runner-local path"
 
     - name: Configure sccache
       shell: bash

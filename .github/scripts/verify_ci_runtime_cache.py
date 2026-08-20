@@ -1985,6 +1985,31 @@ def check_shell_only_local_action(
     check_no_sccache_credential_exporter(text, source, failures)
 
 
+def check_setup_sccache_deterministic_install_path(
+    text: str,
+    source: str,
+    failures: list[str],
+) -> None:
+    require(
+        'install_root="${RUNNER_TEMP}/ferrum-sccache-bin"' in text,
+        f"{source} must install sccache under a deterministic RUNNER_TEMP path "
+        "so rust-cache sees stable wrapper environment values",
+        failures,
+    )
+    require(
+        'mktemp -d "${RUNNER_TEMP}/ferrum-sccache-bin.XXXXXX"' not in text,
+        f"{source} must not install the verified wrapper under a random "
+        "mktemp directory",
+        failures,
+    )
+    require(
+        'rm -rf "$install_root"' in text,
+        f"{source} must discard stale install contents before the pinned archive "
+        "passes checksum verification",
+        failures,
+    )
+
+
 def check_setup_sccache_verified_activation(
     text: str,
     source: str,
@@ -4058,6 +4083,7 @@ def check_shared_actions(failures: list[str]) -> None:
     )
     check_credential_absence_assertion(sccache, "setup-sccache", failures)
     check_setup_sccache_verified_activation(sccache, "setup-sccache", failures)
+    check_setup_sccache_deterministic_install_path(sccache, "setup-sccache", failures)
     require(
         SCCACHE_RELEASE_DOWNLOAD in sccache,
         "setup-sccache must download a pinned mozilla/sccache GitHub release",
@@ -5777,6 +5803,38 @@ def self_test() -> int:
         not verified_failures,
         "self-test: exact verified sccache activation should pass: "
         + "; ".join(verified_failures),
+        failures,
+    )
+
+    random_install_failures: list[str] = []
+    check_setup_sccache_deterministic_install_path(
+        'install_root="$(mktemp -d "${RUNNER_TEMP}/ferrum-sccache-bin.XXXXXX")"\n',
+        "self-test-random-sccache-install",
+        random_install_failures,
+    )
+    require(
+        any("deterministic RUNNER_TEMP path" in item for item in random_install_failures)
+        and any("random mktemp directory" in item for item in random_install_failures),
+        "self-test: random ferrum-sccache-bin mktemp install path must fail",
+        failures,
+    )
+
+    deterministic_install = (
+        'install_root="${RUNNER_TEMP}/ferrum-sccache-bin"\n'
+        'install_dir="${install_root}/bin"\n'
+        'rm -rf "$install_root"\n'
+        'mkdir -p "$install_dir"\n'
+    )
+    deterministic_failures: list[str] = []
+    check_setup_sccache_deterministic_install_path(
+        deterministic_install,
+        "self-test-deterministic-sccache-install",
+        deterministic_failures,
+    )
+    require(
+        not deterministic_failures,
+        "self-test: deterministic sccache install path should pass: "
+        + "; ".join(deterministic_failures),
         failures,
     )
 
