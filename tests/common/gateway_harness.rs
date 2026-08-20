@@ -12,7 +12,10 @@
 //! # Invariants preserved from CLAUDE.md
 //!
 //! - **3-attempt retry** with fresh ports + fresh temp dir each attempt,
-//!   killing any surviving child before retrying.
+//!   killing any surviving child before retrying. File-mode startup does
+//!   not start backend capability refresh until the exclusive proxy bind
+//!   has succeeded (issue #4080), so an abandoned EADDRINUSE child cannot
+//!   consume a caller-owned scripted backend before the retry.
 //!   Callers that pin `FERRUM_PROXY_HTTP_PORT` / `FERRUM_ADMIN_HTTP_PORT` via
 //!   [`.env`](TestGatewayBuilder::env) keep that fixed value across attempts,
 //!   so a bind-drop-rebind reservation outside the harness defeats the retry.

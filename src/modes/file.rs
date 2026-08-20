@@ -104,6 +104,9 @@ pub struct ServeOptions {
     /// immediate probe is the only thing that populates the registry
     /// before the first periodic tick (default 24 h), without which
     /// HTTPS dispatch falls back to reqwest for the entire window.
+    /// Both the initial probe (when enabled) and the periodic loop start
+    /// only after required listeners have bound — a lost exclusive listen
+    /// must not dial caller-owned backends (issue #4080).
     ///
     /// In-process tests set this `true` to keep the harness "cold". The
     /// h2c probe that runs against HTTP backends opens a real connection
@@ -722,6 +725,9 @@ pub async fn run(
 ///   `shutdown_tx`.
 /// - Returns once every listener has bound (or adopted its pre-bound socket)
 ///   — the gateway is ready to take traffic before this function returns.
+///   Backend capability refresh (the optional immediate probe and the
+///   periodic loop) starts only after that bind barrier so a failed
+///   exclusive listen cannot mutate caller-owned backends (issue #4080).
 ///
 /// Stream proxy bind failures are still fatal here: this matches `run()`'s
 /// invariants and keeps tests honest about config typos.
@@ -882,10 +888,13 @@ pub async fn serve(
     // kicks off an immediate probe pass. In-process tests that want a
     // truly cold gateway set `skip_initial_capability_refresh` to opt
     // out of that probe (see `ServeOptions` docs).
+    //
+    // The task itself is started only after required listeners bind
+    // (below). Spawning it here let an EADDRINUSE child consume a
+    // caller-owned scripted backend before TestGateway retried with
+    // fresh ports (issue #4080).
     let run_initial_refresh =
         !env_config.pool_warmup_enabled && !prebound.skip_initial_capability_refresh;
-    proxy_state
-        .start_backend_capability_refresh_task(run_initial_refresh, Some(shutdown_tx.subscribe()));
 
     let per_ip_cleanup_handle =
         proxy_state.start_per_ip_cleanup_task(Some(shutdown_tx.subscribe()));
@@ -1629,6 +1638,16 @@ pub async fn serve(
         }
         return Err(e);
     }
+
+    // Required listeners are bound and `/health` is ready. Start capability
+    // refresh only on this committed-ready path so a lost bind cannot
+    // retain backend-side-effect work across harness retries.
+    serve_handles
+        .proxy_state
+        .start_backend_capability_refresh_task(
+            run_initial_refresh,
+            Some(serve_handles.shutdown_tx.subscribe()),
+        );
 
     Ok(serve_handles)
 }

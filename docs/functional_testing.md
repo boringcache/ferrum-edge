@@ -387,6 +387,13 @@ the test must verify:
   `TestGateway`'s pre-existing default). Tests that exercise the
   capability registry's first probe must opt in via
   `pool_warmup_enabled(true)`.
+- Binary file-mode startups with warmup off still run the initial
+  backend-capability refresh, but only after every required listener has
+  bound and `/health` is `ready`. An abandoned `EADDRINUSE` child is
+  shut down before that refresh starts, so TestGateway's fresh-port retry
+  cannot consume a caller-owned scripted backend (issue #4080). In-process
+  `serve()` uses the same bind barrier; the in-process harness additionally
+  sets `skip_initial_capability_refresh` when warmup is off.
 - The file-mode YAML loader's strict-loading rules apply identically —
   every top-level collection (`consumers`, `upstreams`,
   `plugin_configs`) must be present in the YAML even if empty.
