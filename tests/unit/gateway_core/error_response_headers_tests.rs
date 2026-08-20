@@ -161,12 +161,16 @@ fn h3_cross_protocol_classified_failures_keep_typed_gateway_error() {
     let mut classified_writes = 0usize;
     let mut search = cross;
     while let Some(idx) = search.find("reqwest_error_response_for_cross_protocol(") {
-        let end = (idx + 2800).min(search.len());
-        let window = &search[idx..end];
-        if window.contains("fn reqwest_error_response_for_cross_protocol") {
+        let suffix = &search[idx..];
+        if suffix.contains("fn reqwest_error_response_for_cross_protocol") {
             search = &search[idx + 1..];
             continue;
         }
+        let end = suffix
+            .find("return Ok(outcome);")
+            .expect("classified dispatch branch must return its written outcome")
+            + "return Ok(outcome);".len();
+        let window = &suffix[..end];
         assert!(
             window.contains("write_classified_backend_dispatch_error("),
             "classified H3→HTTP dispatch failure must write via write_classified_backend_dispatch_error"
