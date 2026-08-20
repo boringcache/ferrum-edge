@@ -49107,7 +49107,11 @@ async fn proxy_to_backend_mesh_mtls_after_ready(
                 trailers,
                 proxy.backend_write_timeout_ms,
             );
-            (parts, mesh_mtls_pool::MeshMtlsRequestBody::Replayable(body), upload_pump)
+            (
+                parts,
+                mesh_mtls_pool::MeshMtlsRequestBody::Replayable(body),
+                upload_pump,
+            )
         }
     };
     parts.uri = tunneled_uri;
